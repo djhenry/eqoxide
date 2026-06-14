@@ -344,6 +344,7 @@ impl<'a> LoginProtocol<'a> {
                     0x4c24, // OP_SPAWN_DOOR — door positions, handled visually elsewhere
                     0x5996, // unknown empty packet, keepalive variant
                     0x3eba, // OP_SEND_ZONE_POINTS — handled by apply_packet
+                    0x0fab, // OP_SpecialMesg — NPC dialogue, handled by apply_packet
                     0x7cba, // OP_ENTER_WORLD — world login flow
                     0x52a4, // OP_POST_ENTER_WORLD
                     0x04ec, // OP_EXPANSION_INFO

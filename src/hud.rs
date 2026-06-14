@@ -108,9 +108,73 @@ pub fn draw_hud(ctx: &egui::Context, scene: &SceneState, bot_id: &str) {
         });
 }
 
+/// Split dialogue text into `(segment, is_keyword)` runs, where keywords are the
+/// `[bracketed]` phrases EQ NPCs use for quest responses. Pure (no egui) so it can be
+/// unit-tested; the dialogue panel renders keyword runs highlighted.
+pub fn split_keywords(text: &str) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        if open > 0 {
+            out.push((rest[..open].to_string(), false));
+        }
+        if let Some(close_rel) = rest[open..].find(']') {
+            let close = open + close_rel;
+            out.push((rest[open..=close].to_string(), true));
+            rest = &rest[close + 1..];
+        } else {
+            out.push((rest[open..].to_string(), false));
+            rest = "";
+            break;
+        }
+    }
+    if !rest.is_empty() {
+        out.push((rest.to_string(), false));
+    }
+    out
+}
+
+/// Dedicated panel for NPC dialogue (kind "npc"), e.g. quest-giver responses to a hail.
+/// Bracketed [keywords] are highlighted so the player knows what to say next.
+pub fn draw_quest_dialogue(ctx: &egui::Context, scene: &SceneState) {
+    let visible: Vec<_> = scene.messages.iter()
+        .filter(|m| m.kind == "npc" && m.timestamp.elapsed().as_secs() < 45)
+        .collect();
+    if visible.is_empty() {
+        return;
+    }
+    egui::Window::new("NPC Dialogue")
+        .anchor(egui::Align2::CENTER_TOP, [0.0, 36.0])
+        .resizable(false)
+        .collapsible(false)
+        .min_width(420.0)
+        .max_width(560.0)
+        .frame(egui::Frame::none()
+            .fill(egui::Color32::from_black_alpha(200))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 150, 60)))
+            .inner_margin(egui::Margin::same(8.0)))
+        .show(ctx, |ui| {
+            for entry in &visible {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    for (seg, is_kw) in split_keywords(&entry.text) {
+                        let rt = egui::RichText::new(seg).size(13.0);
+                        let rt = if is_kw {
+                            rt.strong().color(egui::Color32::from_rgb(255, 225, 90))
+                        } else {
+                            rt.color(egui::Color32::from_rgb(225, 225, 205))
+                        };
+                        ui.label(rt);
+                    }
+                });
+            }
+        });
+}
+
 pub fn draw_message_log(ctx: &egui::Context, scene: &SceneState) {
     let visible: Vec<_> = scene.messages.iter()
-        .filter(|m| m.timestamp.elapsed().as_secs() < 20)
+        // NPC dialogue has its own panel (draw_quest_dialogue); keep it out of here.
+        .filter(|m| m.kind != "npc" && m.timestamp.elapsed().as_secs() < 20)
         .collect();
     if visible.is_empty() {
         return;
@@ -373,6 +437,26 @@ pub fn draw_labels(
 mod tests {
     use super::*;
     use crate::scene::{Billboard, SceneState};
+
+    #[test]
+    fn split_keywords_marks_bracketed_runs() {
+        let parts = split_keywords("Greetings. Are you [my contact]? Tell me about the [shipment].");
+        let kws: Vec<&str> = parts.iter().filter(|(_, k)| *k).map(|(s, _)| s.as_str()).collect();
+        assert_eq!(kws, vec!["[my contact]", "[shipment]"]);
+        // Reassembling the segments reproduces the original text exactly.
+        let joined: String = parts.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(joined, "Greetings. Are you [my contact]? Tell me about the [shipment].");
+    }
+
+    #[test]
+    fn split_keywords_handles_plain_and_unclosed() {
+        assert_eq!(split_keywords("plain text"), vec![("plain text".to_string(), false)]);
+        // An unclosed '[' is treated as literal text, not a keyword.
+        let parts = split_keywords("a [b");
+        assert!(parts.iter().all(|(_, k)| !*k), "unclosed bracket must not be a keyword");
+        let joined: String = parts.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(joined, "a [b");
+    }
 
     fn make_scene() -> SceneState {
         SceneState {

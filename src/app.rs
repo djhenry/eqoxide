@@ -472,6 +472,7 @@ impl App {
                 hud::draw_loading(ctx, current_zone);
             } else {
                 hud::draw_hud(ctx, scene, "EQ Observer");
+                hud::draw_quest_dialogue(ctx, scene);
                 hud::draw_message_log(ctx, scene);
                 hud::draw_labels(ctx, scene, view_proj, screen_w, screen_h, cam_eye, collision);
                 hud::draw_minimap(ctx, scene, zone_min, zone_max, minimap_zoom, minimap_full, zone_map);

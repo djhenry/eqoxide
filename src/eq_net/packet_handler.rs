@@ -25,6 +25,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_EXP_UPDATE           => apply_exp_update(gs, p),
         OP_LEVEL_UPDATE         => apply_level_update(gs, p),
         OP_CHANNEL_MESSAGE      => apply_channel_message(gs, p),
+        OP_SPECIAL_MESG         => apply_special_message(gs, p),
         OP_SEND_ZONE_POINTS           => apply_zone_points(gs, p),
         OP_REQUEST_CLIENT_ZONE_CHANGE => {
             if p.len() >= 74 {
@@ -179,6 +180,31 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
         .trim_end_matches('\0').to_string();
     if !sender.is_empty() {
         gs.log_msg("chat", &format!("<{}> {}", sender, msg));
+    }
+}
+
+/// OP_SpecialMesg — NPC dialogue / emotes, where quest text arrives.
+/// SpecialMesg_Struct: header[3] + msg_type(u32) + target_spawn_id(u32) +
+/// sayer(null-terminated, variable) + unknown[12] + message(null-terminated).
+/// Logged with kind "npc" so the quest dialogue panel can pick it out.
+fn apply_special_message(gs: &mut GameState, payload: &[u8]) {
+    if payload.len() < 12 { return; }
+    // sayer is a null-terminated string starting at offset 11.
+    let sayer_start = 11;
+    let rel_end = payload[sayer_start..].iter().position(|&b| b == 0);
+    let Some(rel_end) = rel_end else { return; };
+    let sayer = String::from_utf8_lossy(&payload[sayer_start..sayer_start + rel_end]).to_string();
+    // message follows sayer's null + 12 unknown bytes.
+    let msg_start = sayer_start + rel_end + 1 + 12;
+    if msg_start >= payload.len() { return; }
+    let msg = String::from_utf8_lossy(&payload[msg_start..])
+        .trim_end_matches('\0')
+        .to_string();
+    if msg.trim().is_empty() { return; }
+    if sayer.is_empty() {
+        gs.log_msg("npc", &msg);
+    } else {
+        gs.log_msg("npc", &format!("{} says, '{}'", sayer, msg));
     }
 }
 
