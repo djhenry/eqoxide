@@ -220,6 +220,21 @@ impl Collision {
     pub fn segment_blocked(&self, from: [f32; 3], to: [f32; 3]) -> bool {
         self.nearest_hit_t(from, to).map_or(false, |t| t < 0.92)
     }
+
+    /// Can the player step from `from` to `to` without crossing a wall?
+    ///
+    /// The ray is extended past `to` by `radius` so the player stops a little short of
+    /// the wall instead of clipping into it. Caller should pass points at roughly chest
+    /// height (a couple units above the feet) so knee-high floor lips and stair edges
+    /// don't read as walls. Returns `true` (clear) when there is no zone geometry loaded.
+    pub fn path_clear(&self, from: [f32; 3], to: [f32; 3], radius: f32) -> bool {
+        let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+        let dist = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        if dist < 1e-5 { return true; }
+        let ext = (dist + radius.max(0.0)) / dist;
+        let target = [from[0] + d[0] * ext, from[1] + d[1] * ext, from[2] + d[2] * ext];
+        self.nearest_hit_t(from, target).is_none()
+    }
 }
 
 impl ZoneAssets {
@@ -483,5 +498,36 @@ mod tests {
         let empty = Collision::build(&ZoneAssets { meshes: vec![], textures: vec![] }, 8.0);
         assert_eq!(empty.floor_z(0.0, 0.0, -99.0), -99.0);
         assert!(!empty.segment_blocked([0.0, 0.0, 0.0], [10.0, 0.0, 0.0]));
+        assert!(empty.path_clear([0.0, 0.0, 0.0], [10.0, 0.0, 0.0], 2.0),
+            "no geometry should never block movement");
+    }
+
+    /// Movement collision: walking toward the wall at east=5 is blocked; walking
+    /// parallel to it (along north) or away from it is clear.
+    #[test]
+    fn collision_path_clear_blocks_walking_into_wall() {
+        // Reuse a single vertical wall at east=5, north [0,10], height [0,10].
+        let wall = MeshData {
+            positions: vec![[5.0, 0.0, 0.0], [5.0, 0.0, 10.0], [5.0, 10.0, 10.0], [5.0, 10.0, 0.0]],
+            normals: vec![[1.0, 0.0, 0.0]; 4],
+            uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            texture_name: None,
+            base_color: [1.0; 4],
+            center: [0.0, 0.0, 0.0],
+        };
+        let col = Collision::build(&ZoneAssets { meshes: vec![wall], textures: vec![] }, 4.0);
+        let chest = 3.0_f32;
+
+        // Standing at east=3, stepping east toward the wall (to east=4.5) within the
+        // 2-unit radius reaches the wall at east=5 → blocked.
+        assert!(!col.path_clear([3.0, 5.0, chest], [4.5, 5.0, chest], 2.0),
+            "stepping into the wall should be blocked");
+        // Stepping along the wall (north) at east=3 is clear.
+        assert!(col.path_clear([3.0, 5.0, chest], [3.0, 7.0, chest], 2.0),
+            "sliding parallel to the wall should be clear");
+        // Stepping away from the wall (west) is clear.
+        assert!(col.path_clear([3.0, 5.0, chest], [1.5, 5.0, chest], 2.0),
+            "stepping away from the wall should be clear");
     }
 }

@@ -293,7 +293,36 @@ impl App {
                 de = de / len * MOVE_SPEED * dt;
                 dn = dn / len * MOVE_SPEED * dt;
                 let base = self.override_pos.unwrap_or(self.visual_player_pos);
-                let new_pos = [base[0] + de, base[1] + dn, base[2]];
+
+                // Collision: don't let the player walk through walls. Cast at chest
+                // height so low lips/stairs don't block. If the full move hits a wall,
+                // try sliding along each axis so the player glides along the surface
+                // instead of sticking. `clear` borrows collision immutably; NLL ends
+                // that borrow before the self-field writes below.
+                const PLAYER_RADIUS: f32 = 2.0;
+                let chest = base[2] + 3.0;
+                let col = self.collision.as_ref();
+                let clear = |mde: f32, mdn: f32| -> bool {
+                    match col {
+                        Some(c) => c.path_clear(
+                            [base[0], base[1], chest],
+                            [base[0] + mde, base[1] + mdn, chest],
+                            PLAYER_RADIUS,
+                        ),
+                        None => true,
+                    }
+                };
+                let (mde, mdn) = if clear(de, dn) {
+                    (de, dn)
+                } else if clear(de, 0.0) {
+                    (de, 0.0)
+                } else if clear(0.0, dn) {
+                    (0.0, dn)
+                } else {
+                    (0.0, 0.0) // boxed in — hold position
+                };
+
+                let new_pos = [base[0] + mde, base[1] + mdn, base[2]];
                 self.override_pos = Some(new_pos);
                 // Move camera focus with the player regardless of camera mode
                 // (ManualOrbit keeps focus fixed otherwise, so the player walks away).
