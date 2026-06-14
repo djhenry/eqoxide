@@ -1,0 +1,79 @@
+//! Application and EQ connection configuration, loaded from YAML files.
+
+use std::path::PathBuf;
+
+/// Renderer / HTTP server settings from `config.yaml`.
+pub struct AppConfig {
+    pub assets_path: PathBuf,
+    pub models_path: PathBuf,
+    pub http_port: u16,
+}
+
+impl AppConfig {
+    pub fn load() -> Self {
+        let cfg_text = std::fs::read_to_string("config.yaml").unwrap_or_else(|e| {
+            eprintln!("renderer: config.yaml not found ({}), using defaults", e);
+            String::new()
+        });
+        let cfg: serde_yaml::Value =
+            serde_yaml::from_str(&cfg_text).unwrap_or(serde_yaml::Value::Null);
+        let r = cfg.get("renderer");
+
+        let assets_path = r
+            .and_then(|v| v.get("assets_path"))
+            .and_then(|v| v.as_str())
+            .map(|p| PathBuf::from(shellexpand::tilde(p).into_owned()))
+            .unwrap_or_else(|| PathBuf::from("eq_assets"));
+
+        let models_path = r
+            .and_then(|v| v.get("models_path"))
+            .and_then(|v| v.as_str())
+            .map(|p| PathBuf::from(shellexpand::tilde(p).into_owned()))
+            .unwrap_or_else(|| PathBuf::from("eq_renderer/assets/models"));
+
+        let http_port = cfg
+            .get("http_port")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(8765) as u16;
+
+        AppConfig { assets_path, models_path, http_port }
+    }
+}
+
+/// EQ login credentials and server addresses, loaded from `~/git/eq-client-ref/config.yaml`.
+pub struct LoginConfig {
+    pub login_host:     String,
+    pub login_port:     u16,
+    pub world_port:     u16,
+    pub username:       String,
+    pub password:       String,
+    pub character_name: String,
+}
+
+impl LoginConfig {
+    pub fn load() -> Self {
+        let path = shellexpand::tilde("~/git/eq-client-ref/config.yaml").into_owned();
+        let cfg_text = std::fs::read_to_string(&path).unwrap_or_default();
+        let cfg: serde_yaml::Value =
+            serde_yaml::from_str(&cfg_text).unwrap_or(serde_yaml::Value::Null);
+
+        LoginConfig {
+            login_host: cfg
+                .get("server").and_then(|s| s.get("login_host")).and_then(|v| v.as_str())
+                .unwrap_or("127.0.0.1").to_string(),
+            login_port: cfg
+                .get("server").and_then(|s| s.get("login_port")).and_then(|v| v.as_u64())
+                .unwrap_or(5998) as u16,
+            world_port: 9000,
+            username: cfg
+                .get("account").and_then(|a| a.get("username")).and_then(|v| v.as_str())
+                .unwrap_or("testuser").to_string(),
+            password: cfg
+                .get("account").and_then(|a| a.get("password")).and_then(|v| v.as_str())
+                .unwrap_or("REDACTED").to_string(),
+            character_name: cfg
+                .get("account").and_then(|a| a.get("character_name")).and_then(|v| v.as_str())
+                .unwrap_or("Aiquestbot").to_string(),
+        }
+    }
+}

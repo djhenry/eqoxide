@@ -1,0 +1,12 @@
+# Rust build output
+/target
+
+# External / large game assets (EQ .s3d-derived data, glTF models) — sourced separately
+/assets
+
+# Runtime logs
+*.log
+
+# Local scheduled-task state (Claude Code cron)
+.claude/scheduled_tasks.json
+.claude/scheduled_tasks.lock

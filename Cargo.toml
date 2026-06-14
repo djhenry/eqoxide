@@ -1,0 +1,37 @@
+[package]
+name = "eq_renderer"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "eq_renderer"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["bmp", "png"] }
+pollster = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.29"
+wgpu = "22"
+winit = "0.30"
+egui = "0.29"
+egui-wgpu = "0.29"
+egui-winit = "0.29"
+libeq_pfs = { git = "https://github.com/cjab/libeq", package = "libeq_pfs" }
+libeq_wld = { git = "https://github.com/cjab/libeq", package = "libeq_wld" }
+serde_yaml = "0.9"
+shellexpand = "3"
+gltf = { version = "1", features = ["import"] }
+rand = "0.8"
+byteorder = "1.5"
+miniz_oxide = "0.8"
+des = "0.8"
+cbc = "0.1"
+axum = "0.7"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

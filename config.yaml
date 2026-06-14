@@ -1,0 +1,3 @@
+renderer:
+  assets_path: ~/eq_assets/EQ_Files
+  models_path: ~/git/eq-client-ref/.claude/worktrees/renderer-textures/eq_renderer/assets/models
