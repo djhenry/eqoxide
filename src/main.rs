@@ -37,6 +37,7 @@ fn main() {
     let entity_positions: http::EntityPositions = Arc::new(Mutex::new(HashMap::new()));
     let zone_points:      http::ZonePoints      = Arc::new(Mutex::new(Vec::new()));
     let zone_cross:       http::ZoneCrossReq    = Arc::new(Mutex::new(false));
+    let hail:             http::HailReq         = Arc::new(Mutex::new(None));
     let frame_req:        http::FrameReq        = Arc::new(Mutex::new(None));
 
     // EQ network task
@@ -45,10 +46,11 @@ fn main() {
     let ep  = entity_positions.clone();
     let zp  = zone_points.clone();
     let zc  = zone_cross.clone();
+    let hl  = hail.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
-            if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, zp, zc).await {
+            if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, zp, zc, hl).await {
                 eprintln!("EQ: fatal: {e}");
             }
         });
@@ -64,6 +66,7 @@ fn main() {
         entity_positions,
         zone_points,
         zone_cross,
+        hail,
         app_cfg.http_port,
     );
 

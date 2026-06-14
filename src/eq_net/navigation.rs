@@ -7,13 +7,37 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::GameState;
-use crate::http::{EntityPositions, GotoTarget, ZoneCrossReq, ZonePoints};
+use crate::http::{EntityPositions, GotoTarget, HailReq, ZoneCrossReq, ZonePoints};
+
+/// Build a Titanium `ChannelMessage_Struct` for the Say channel (used for NPC hails).
+///
+/// Layout (see EQEmu common/patches/titanium_structs.h):
+///   targetname[64] | sender[64] | language(u32) | chan_num(u32)
+///   | cm_unknown4[2](u32×2) | skill_in_language(u32) | message[var]\0
+/// chan_num 8 = ChatChannel_Say; the server delivers say text to NPCs within 200
+/// units, triggering EVENT_SAY (a "Hail, <name>" message fires the NPC's hail script).
+pub fn build_say_packet(sender: &str, target: &str, message: &str) -> Vec<u8> {
+    let mut buf = vec![0u8; 148 + message.len() + 1];
+    let t = target.as_bytes();
+    let tl = t.len().min(63);
+    buf[..tl].copy_from_slice(&t[..tl]);
+    let s = sender.as_bytes();
+    let sl = s.len().min(63);
+    buf[64..64 + sl].copy_from_slice(&s[..sl]);
+    // language @128 = 0 (CommonTongue), already zero.
+    buf[132..136].copy_from_slice(&8u32.to_le_bytes()); // chan_num = ChatChannel_Say
+    buf[144..148].copy_from_slice(&100u32.to_le_bytes()); // skill_in_language
+    let m = message.as_bytes();
+    buf[148..148 + m.len()].copy_from_slice(m);
+    buf
+}
 
 pub struct Navigator {
     goto_target:      GotoTarget,
     entity_positions: EntityPositions,
     zone_points:      ZonePoints,
     zone_cross:       ZoneCrossReq,
+    hail:             HailReq,
     position_seq:     u16,
     last_tick:        Instant,
 }
@@ -24,12 +48,14 @@ impl Navigator {
         entity_positions: EntityPositions,
         zone_points:      ZonePoints,
         zone_cross:       ZoneCrossReq,
+        hail:             HailReq,
     ) -> Self {
         Navigator {
             goto_target,
             entity_positions,
             zone_points,
             zone_cross,
+            hail,
             position_seq: 0,
             last_tick: Instant::now(),
         }
@@ -66,6 +92,16 @@ impl Navigator {
         };
         if do_cross {
             self.send_zone_change_packet(stream, gs);
+        }
+
+        // Check hail request — say "Hail, <name>" so a nearby NPC fires its hail script.
+        let hail_name = self.hail.lock().unwrap().take();
+        if let Some(name) = hail_name {
+            let msg = format!("Hail, {}", name);
+            let pkt = build_say_packet(&gs.player_name, &name, &msg);
+            eprintln!("EQ: hailing '{}' (say): {}", name, msg);
+            stream.send_app_packet(OP_CHANNEL_MESSAGE, &pkt);
+            gs.log_msg("chat", &format!("You say, '{}'", msg));
         }
 
         if self.last_tick.elapsed().as_millis() < 150 {
@@ -176,4 +212,36 @@ pub fn make_position_packet(spawn_id: u32, x: f32, y: f32, z: f32) -> AppPacket 
     buf[12..16].copy_from_slice(&z.to_le_bytes());
     buf[20..24].copy_from_slice(&x.to_le_bytes());
     AppPacket { opcode: OP_CLIENT_UPDATE, payload: buf.to_vec() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_say_packet_matches_titanium_layout() {
+        let p = build_say_packet("Aiquestbot", "Guard Phaeton", "Hail, Guard Phaeton");
+        // sender at offset 64
+        assert_eq!(&p[64..74], b"Aiquestbot");
+        // targetname at offset 0
+        assert_eq!(&p[0..13], b"Guard Phaeton");
+        // chan_num (u32 @132) == 8 (ChatChannel_Say)
+        assert_eq!(u32::from_le_bytes([p[132], p[133], p[134], p[135]]), 8);
+        // language (u32 @128) == 0 (CommonTongue)
+        assert_eq!(u32::from_le_bytes([p[128], p[129], p[130], p[131]]), 0);
+        // message begins at offset 148, null-terminated
+        let msg_end = 148 + "Hail, Guard Phaeton".len();
+        assert_eq!(&p[148..msg_end], b"Hail, Guard Phaeton");
+        assert_eq!(p[msg_end], 0, "message must be null-terminated");
+        assert_eq!(p.len(), msg_end + 1);
+    }
+
+    #[test]
+    fn build_say_packet_truncates_overlong_names() {
+        let long = "X".repeat(200);
+        let p = build_say_packet(&long, &long, "hi");
+        // sender/target fields are 64 bytes; name capped at 63 + null padding.
+        assert_eq!(p[63], 0, "targetname must stay null-terminated within 64 bytes");
+        assert_eq!(p[127], 0, "sender must stay null-terminated within 64 bytes");
+    }
 }

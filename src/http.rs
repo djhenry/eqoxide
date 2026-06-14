@@ -28,6 +28,10 @@ pub type ZonePoints = Arc<Mutex<Vec<crate::game_state::ZonePoint>>>;
 /// Set to true by POST /zone_cross; gameplay thread reads it once and sends OP_ZONE_CHANGE.
 pub type ZoneCrossReq = Arc<Mutex<bool>>;
 
+/// NPC name to hail, set by POST /hail; the nav thread reads it once and sends a
+/// "Hail, <name>" say packet so the NPC fires its hail/quest script.
+pub type HailReq = Arc<Mutex<Option<String>>>;
+
 /// Current zone name and id, updated on every OP_NEW_ZONE.
 pub type ZoneInfo = Arc<Mutex<(String, u16)>>;
 
@@ -40,6 +44,7 @@ struct HttpState {
     entity_positions: EntityPositions,
     zone_points:      ZonePoints,
     zone_cross:       ZoneCrossReq,
+    hail:             HailReq,
 }
 
 #[derive(serde::Deserialize)]
@@ -71,12 +76,13 @@ pub fn spawn_camera_server(
     entity_positions: EntityPositions,
     zone_points:      ZonePoints,
     zone_cross:       ZoneCrossReq,
+    hail:             HailReq,
     port:             u16,
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, zone_points, zone_cross };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, zone_points, zone_cross, hail };
             let app = Router::new()
                 .route("/camera", get(get_camera).post(post_camera))
                 .route("/camera/reset", post(post_camera_reset))
@@ -85,6 +91,7 @@ pub fn spawn_camera_server(
                 .route("/entities", get(get_entities))
                 .route("/zone_points", get(get_zone_points))
                 .route("/zone_cross", post(post_zone_cross))
+                .route("/hail", post(post_hail))
                 .with_state(state);
             let addr = format!("127.0.0.1:{port}");
             let listener = match tokio::net::TcpListener::bind(&addr).await {
@@ -198,6 +205,69 @@ async fn post_zone_cross(State(s): State<HttpState>) -> (StatusCode, String) {
     *s.zone_cross.lock().unwrap() = true;
     eprintln!("zone_cross: flagged for OP_ZONE_CHANGE send");
     (StatusCode::OK, "zone_cross request queued".into())
+}
+
+#[derive(serde::Deserialize)]
+struct HailBody {
+    /// NPC to hail (fuzzy-matched against /entities). Omit to hail the nearest NPC.
+    name: Option<String>,
+}
+
+/// Turn an entity key like "Guard_Phaeton000" into a display name "Guard Phaeton".
+fn clean_entity_name(raw: &str) -> String {
+    raw.trim_end_matches(|c: char| c.is_ascii_digit())
+        .replace('_', " ")
+        .trim()
+        .to_string()
+}
+
+/// POST /hail — say "Hail, <name>" so a nearby NPC fires its hail/quest script.
+/// Body: {"name":"Guard Phaeton"} (fuzzy) or {} to hail the nearest NPC.
+/// The NPC must be within ~200 units (server-enforced say range).
+async fn post_hail(
+    State(s): State<HttpState>,
+    body: Option<Json<HailBody>>,
+) -> (StatusCode, String) {
+    let requested = body.and_then(|Json(b)| b.name);
+    let positions = s.entity_positions.lock().unwrap();
+
+    let resolved: Option<String> = if let Some(name) = &requested {
+        // Exact (clean) match first, then fuzzy substring.
+        let nl = name.to_lowercase();
+        positions.keys()
+            .find(|k| clean_entity_name(k).to_lowercase() == nl)
+            .or_else(|| positions.keys().find(|k| k.to_lowercase().contains(&nl)))
+            .cloned()
+    } else {
+        // Nearest NPC to the player (camera focus = [east, north, height];
+        // entity stored as (server_x=north, server_y=east, z)).
+        let focus = s.snapshot.lock().unwrap().focus;
+        positions.iter()
+            .filter(|(k, _)| !k.contains("zone_controller"))
+            .map(|(k, &(nx, ey, _))| {
+                let de = ey - focus[0];
+                let dn = nx - focus[1];
+                (k.clone(), de * de + dn * dn)
+            })
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(k, _)| k)
+    };
+
+    match resolved {
+        Some(key) => {
+            let display = clean_entity_name(&key);
+            *s.hail.lock().unwrap() = Some(display.clone());
+            eprintln!("hail: queued hail to {:?}", display);
+            (StatusCode::OK, format!("hailing {}", display))
+        }
+        None => {
+            let msg = match &requested {
+                Some(n) => format!("No NPC matching {:?}", n),
+                None => "No NPCs known to hail".to_string(),
+            };
+            (StatusCode::NOT_FOUND, msg)
+        }
+    }
 }
 
 /// GET /frame — returns the current rendered frame as a PNG.
