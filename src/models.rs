@@ -527,6 +527,24 @@ mod tests {
         assert_eq!(race_to_archetype("UNKNOWN"), "creature");
     }
 
+    /// End-to-end: EQ race id → archetype model. Guards the run-10 fixes to the NPC race
+    /// table (Skeleton/Zombie/Wasp/Rat/Gnoll/Fish/Kobold were mapped to wrong creatures).
+    #[test]
+    fn npc_race_ids_map_to_sensible_archetypes() {
+        use crate::eq_net::protocol::eq_race_to_code;
+        let arch = |id: u32| race_to_archetype(eq_race_to_code(id));
+        assert_eq!(arch(60), "skeleton");  // Skeleton (was fish)
+        assert_eq!(arch(70), "zombie");    // Zombie (was bear)
+        assert_eq!(arch(109), "wasp");     // Wasp (was frog)
+        assert_eq!(arch(36), "rat");       // Giant Rat (was zombie)
+        assert_eq!(arch(39), "gnoll");     // Gnoll (was skeleton)
+        assert_eq!(arch(24), "fish");      // Fish (was creature/spider)
+        assert_eq!(arch(48), "gnoll");     // Kobold (was unmapped "FLY" → creature)
+        assert_eq!(arch(94), "dwarf");     // Kaladim Citizen (was creature/spider)
+        assert_eq!(arch(34), "bat");       // Giant Bat (was humanoid)
+        assert_eq!(arch(26), "frog");      // Froglok (was skeleton)
+    }
+
     #[test]
     fn race_to_archetype_case_insensitive() {
         assert_eq!(race_to_archetype("hum"), "humanoid");
