@@ -26,6 +26,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_LEVEL_UPDATE         => apply_level_update(gs, p),
         OP_CHANNEL_MESSAGE      => apply_channel_message(gs, p),
         OP_SPECIAL_MESG         => apply_special_message(gs, p),
+        OP_CONSIDER             => apply_consider(gs, p),
         OP_SEND_ZONE_POINTS           => apply_zone_points(gs, p),
         OP_REQUEST_CLIENT_ZONE_CHANGE => {
             if p.len() >= 74 {
@@ -183,6 +184,33 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
     }
 }
 
+/// Map a faction-con value (EQEmu FACTION_*, 1..=9) to the line EQ shows on /consider.
+pub fn consider_message(faction: u32) -> &'static str {
+    match faction {
+        1 => "regards you as an ally",
+        2 => "looks upon you warmly",
+        3 => "kindly regards you",
+        4 => "regards you amiably",
+        5 => "regards you indifferently",
+        6 => "looks your way apprehensively",
+        7 => "looks at you dubiously",
+        8 => "glares at you threateningly",
+        9 => "scowls at you, ready to attack",
+        _ => "regards you",
+    }
+}
+
+/// OP_Consider reply — the server's con of our target. Consider_Struct: playerid(u32) +
+/// targetid(u32) + faction(u32) + level(u32=con color) + ... We use targetid + faction.
+fn apply_consider(gs: &mut GameState, payload: &[u8]) {
+    if payload.len() < 12 { return; }
+    let target_id = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    let faction   = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
+    let name = gs.entities.get(&target_id).map(|e| e.name.clone())
+        .unwrap_or_else(|| "Your target".to_string());
+    gs.log_msg("combat", &format!("{} {}.", name, consider_message(faction)));
+}
+
 /// OP_SpecialMesg — NPC dialogue / emotes, where quest text arrives.
 /// SpecialMesg_Struct: header[3] + msg_type(u32) + target_spawn_id(u32) +
 /// sayer(null-terminated, variable) + unknown[12] + message(null-terminated).
@@ -285,4 +313,19 @@ pub fn register_spawn(gs: &mut GameState, spawn: Spawn_S) {
         heading,
         dead:     false,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::consider_message;
+
+    #[test]
+    fn consider_message_covers_faction_cons() {
+        assert_eq!(consider_message(9), "scowls at you, ready to attack");
+        assert_eq!(consider_message(5), "regards you indifferently");
+        assert_eq!(consider_message(1), "regards you as an ally");
+        // Out-of-range falls back to a neutral phrasing.
+        assert_eq!(consider_message(0), "regards you");
+        assert_eq!(consider_message(99), "regards you");
+    }
 }

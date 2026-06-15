@@ -134,9 +134,9 @@ pub fn split_keywords(text: &str) -> Vec<(String, bool)> {
     out
 }
 
-/// Name of the NPC nearest the player (for the Hail button). Skips level-0 placeholder
-/// spawns and the off-map zone controller. Pure, so it can be unit-tested.
-pub fn nearest_npc_name(scene: &SceneState) -> Option<String> {
+/// The NPC billboard nearest the player. Skips level-0 placeholder spawns and the
+/// off-map zone controller. Pure, so it can be unit-tested.
+pub fn nearest_npc(scene: &SceneState) -> Option<&crate::scene::Billboard> {
     let p = scene.player_pos; // [east, north, height]
     scene.billboards.iter()
         .filter(|b| b.level > 0 && !b.name.contains("zone_controller"))
@@ -146,7 +146,12 @@ pub fn nearest_npc_name(scene: &SceneState) -> Option<String> {
             (b, de * de + dn * dn)
         })
         .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(b, _)| crate::http::clean_entity_name(&b.name))
+        .map(|(b, _)| b)
+}
+
+/// Cleaned display name of the nearest NPC (for the Hail button).
+pub fn nearest_npc_name(scene: &SceneState) -> Option<String> {
+    nearest_npc(scene).map(|b| crate::http::clean_entity_name(&b.name))
 }
 
 /// Dedicated panel for NPC dialogue (kind "npc"), e.g. quest-giver responses to a hail.
@@ -199,6 +204,7 @@ pub fn draw_control_bar(
     scene:      &SceneState,
     hail:       &crate::http::HailReq,
     say:        &crate::http::SayReq,
+    target:     &crate::http::TargetReq,
     say_buffer: &mut String,
 ) {
     egui::Window::new("##controls")
@@ -211,13 +217,23 @@ pub fn draw_control_bar(
             .inner_margin(egui::Margin::symmetric(8.0, 4.0)))
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                let nearest = nearest_npc_name(scene);
-                let label = match &nearest {
-                    Some(n) => format!("Hail {}", n),
+                // Resolve the nearest NPC once (id for targeting, clean name for labels).
+                let nearest = nearest_npc(scene)
+                    .map(|b| (b.id, crate::http::clean_entity_name(&b.name)));
+
+                // Target nearest → OP_TargetCommand + auto-consider.
+                if ui.add_enabled(nearest.is_some(), egui::Button::new("Target nearest")).clicked() {
+                    if let Some((id, _)) = &nearest {
+                        *target.lock().unwrap() = Some(*id);
+                    }
+                }
+
+                let hail_label = match &nearest {
+                    Some((_, n)) => format!("Hail {}", n),
                     None => "Hail nearest".to_string(),
                 };
-                if ui.add_enabled(nearest.is_some(), egui::Button::new(label)).clicked() {
-                    if let Some(n) = nearest {
+                if ui.add_enabled(nearest.is_some(), egui::Button::new(hail_label)).clicked() {
+                    if let Some((_, n)) = nearest {
                         *hail.lock().unwrap() = Some(n);
                     }
                 }

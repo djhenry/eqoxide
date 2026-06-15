@@ -36,6 +36,10 @@ pub type HailReq = Arc<Mutex<Option<String>>>;
 /// reads it once and sends it on the Say channel (used for quest keyword follow-ups).
 pub type SayReq = Arc<Mutex<Option<String>>>;
 
+/// Spawn id to target, set by POST /target or the HUD "Target nearest" button; the nav
+/// thread reads it once, sends OP_TargetCommand + OP_Consider.
+pub type TargetReq = Arc<Mutex<Option<u32>>>;
+
 /// Current zone name and id, updated on every OP_NEW_ZONE.
 pub type ZoneInfo = Arc<Mutex<(String, u16)>>;
 
@@ -50,6 +54,7 @@ struct HttpState {
     zone_cross:       ZoneCrossReq,
     hail:             HailReq,
     say:              SayReq,
+    target:           TargetReq,
 }
 
 #[derive(serde::Deserialize)]
@@ -83,12 +88,13 @@ pub fn spawn_camera_server(
     zone_cross:       ZoneCrossReq,
     hail:             HailReq,
     say:              SayReq,
+    target:           TargetReq,
     port:             u16,
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, zone_points, zone_cross, hail, say };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, zone_points, zone_cross, hail, say, target };
             let app = Router::new()
                 .route("/camera", get(get_camera).post(post_camera))
                 .route("/camera/reset", post(post_camera_reset))
@@ -99,6 +105,7 @@ pub fn spawn_camera_server(
                 .route("/zone_cross", post(post_zone_cross))
                 .route("/hail", post(post_hail))
                 .route("/say", post(post_say))
+                .route("/target", post(post_target))
                 .with_state(state);
             let addr = format!("127.0.0.1:{port}");
             let listener = match tokio::net::TcpListener::bind(&addr).await {
@@ -298,6 +305,26 @@ async fn post_say(
     *s.say.lock().unwrap() = Some(text.clone());
     eprintln!("say: queued {:?}", text);
     (StatusCode::OK, format!("saying {}", text))
+}
+
+#[derive(serde::Deserialize)]
+struct TargetBody {
+    id: u32,
+}
+
+/// POST /target {"id":<spawn_id>} — target the spawn and auto-consider it. The con
+/// result comes back asynchronously as an OP_Consider reply (→ message log).
+async fn post_target(
+    State(s): State<HttpState>,
+    body: Result<Json<TargetBody>, axum::extract::rejection::JsonRejection>,
+) -> (StatusCode, String) {
+    let id = match body {
+        Ok(Json(b)) => b.id,
+        Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"id\":<spawn_id>}".into()),
+    };
+    *s.target.lock().unwrap() = Some(id);
+    eprintln!("target: queued spawn_id={}", id);
+    (StatusCode::OK, format!("targeting spawn {}", id))
 }
 
 /// GET /frame — returns the current rendered frame as a PNG.

@@ -7,7 +7,22 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::GameState;
-use crate::http::{EntityPositions, GotoTarget, HailReq, SayReq, ZoneCrossReq, ZonePoints};
+use crate::http::{EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, ZoneCrossReq, ZonePoints};
+
+/// OP_TargetCommand payload: ClientTarget_Struct = just the target spawn id (u32).
+pub fn build_target_packet(spawn_id: u32) -> Vec<u8> {
+    spawn_id.to_le_bytes().to_vec()
+}
+
+/// OP_Consider payload: Consider_Struct (28 bytes). The client fills playerid+targetid;
+/// the server replies with the same opcode carrying faction (con standing) + level
+/// (con color). Size must be exactly 28 or EQEmu rejects it.
+pub fn build_consider_packet(player_id: u32, target_id: u32) -> Vec<u8> {
+    let mut buf = vec![0u8; 28];
+    buf[0..4].copy_from_slice(&player_id.to_le_bytes());
+    buf[4..8].copy_from_slice(&target_id.to_le_bytes());
+    buf
+}
 
 /// Build a Titanium `ChannelMessage_Struct` for the Say channel (used for NPC hails).
 ///
@@ -39,6 +54,7 @@ pub struct Navigator {
     zone_cross:       ZoneCrossReq,
     hail:             HailReq,
     say:              SayReq,
+    target:           TargetReq,
     position_seq:     u16,
     last_tick:        Instant,
 }
@@ -51,6 +67,7 @@ impl Navigator {
         zone_cross:       ZoneCrossReq,
         hail:             HailReq,
         say:              SayReq,
+        target:           TargetReq,
     ) -> Self {
         Navigator {
             goto_target,
@@ -59,6 +76,7 @@ impl Navigator {
             zone_cross,
             hail,
             say,
+            target,
             position_seq: 0,
             last_tick: Instant::now(),
         }
@@ -114,6 +132,19 @@ impl Navigator {
             eprintln!("EQ: say: {}", text);
             stream.send_app_packet(OP_CHANNEL_MESSAGE, &pkt);
             gs.log_msg("chat", &format!("You say, '{}'", text));
+        }
+
+        // Check target request — set target + auto-consider it (con color comes back as
+        // an OP_CONSIDER reply, handled in packet_handler).
+        let target_id = self.target.lock().unwrap().take();
+        if let Some(id) = target_id {
+            gs.target_id = Some(id);
+            if let Some(e) = gs.entities.get(&id) {
+                gs.target_name = Some(e.name.clone());
+            }
+            stream.send_app_packet(OP_TARGET_COMMAND, &build_target_packet(id));
+            stream.send_app_packet(OP_CONSIDER, &build_consider_packet(gs.player_id, id));
+            eprintln!("EQ: target spawn_id={} + consider", id);
         }
 
         if self.last_tick.elapsed().as_millis() < 150 {
@@ -246,6 +277,19 @@ mod tests {
         assert_eq!(&p[148..msg_end], b"Hail, Guard Phaeton");
         assert_eq!(p[msg_end], 0, "message must be null-terminated");
         assert_eq!(p.len(), msg_end + 1);
+    }
+
+    #[test]
+    fn build_target_packet_is_spawn_id_le() {
+        assert_eq!(build_target_packet(0x12345678), vec![0x78, 0x56, 0x34, 0x12]);
+    }
+
+    #[test]
+    fn build_consider_packet_layout() {
+        let p = build_consider_packet(7, 42);
+        assert_eq!(p.len(), 28, "Consider_Struct must be exactly 28 bytes");
+        assert_eq!(u32::from_le_bytes([p[0], p[1], p[2], p[3]]), 7);
+        assert_eq!(u32::from_le_bytes([p[4], p[5], p[6], p[7]]), 42);
     }
 
     #[test]
