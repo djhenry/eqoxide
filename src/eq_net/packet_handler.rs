@@ -26,6 +26,8 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_LEVEL_UPDATE         => apply_level_update(gs, p),
         OP_CHANNEL_MESSAGE      => apply_channel_message(gs, p),
         OP_SPECIAL_MESG         => apply_special_message(gs, p),
+        OP_FORMATTED_MESSAGE    => apply_formatted_message(gs, p),
+        OP_SIMPLE_MESSAGE       => apply_simple_message(gs, p),
         OP_CONSIDER             => apply_consider(gs, p),
         OP_SEND_ZONE_POINTS           => apply_zone_points(gs, p),
         OP_REQUEST_CLIENT_ZONE_CHANGE => {
@@ -181,6 +183,37 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
         .trim_end_matches('\0').to_string();
     if !sender.is_empty() {
         gs.log_msg("chat", &format!("<{}> {}", sender, msg));
+    }
+}
+
+/// OP_FormattedMessage — eqstr-table text with arguments. Layout: unknown0(u32) +
+/// string_id(u32) + type(u32) + args (null-separated strings). Resolved via the eqstr
+/// table loaded at startup; if the table or id is missing, the raw args are shown.
+fn apply_formatted_message(gs: &mut GameState, payload: &[u8]) {
+    if payload.len() < 12 { return; }
+    let string_id = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    let args: Vec<String> = payload[12..]
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).to_string())
+        .collect();
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let text = crate::eqstr::format_id(string_id, &arg_refs)
+        .unwrap_or_else(|| arg_refs.join(" "));
+    if !text.trim().is_empty() {
+        gs.log_msg("system", &text);
+    }
+}
+
+/// OP_SimpleMessage — eqstr-table text, no arguments. Layout: string_id(u32) + color(u32)
+/// + unknown(u32).
+fn apply_simple_message(gs: &mut GameState, payload: &[u8]) {
+    if payload.len() < 8 { return; }
+    let string_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    if let Some(text) = crate::eqstr::format_id(string_id, &[]) {
+        if !text.trim().is_empty() {
+            gs.log_msg("system", &text);
+        }
     }
 }
 

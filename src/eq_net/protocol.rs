@@ -103,7 +103,13 @@ pub const OP_LEVEL_UPDATE: u16 = 0x6d44;
 pub const OP_CHANNEL_MESSAGE: u16 = 0x1004;
 /// NPC dialogue / emotes (quest text arrives here). SpecialMesg_Struct:
 /// header[3] | msg_type(u32) | target_spawn_id(u32) | sayer(\0) | unknown[12] | message(\0)
-pub const OP_SPECIAL_MESG: u16 = 0x0fab;
+/// Titanium wire opcode (per EQEmu utils/patches/patch_Titanium.conf).
+pub const OP_SPECIAL_MESG: u16 = 0x2372;
+/// eqstr-table message with %1..%9 args. FormattedMessage_Struct:
+/// unknown0(u32) | string_id(u32) | type(u32) | args (null-separated strings)
+pub const OP_FORMATTED_MESSAGE: u16 = 0x5a48;
+/// eqstr-table message, no args. SimpleMessage_Struct: string_id(u32) | color(u32) | unknown(u32)
+pub const OP_SIMPLE_MESSAGE: u16 = 0x673c;
 
 // ── Misc zone→client ──────────────────────────────────────────────────────
 

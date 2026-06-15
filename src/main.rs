@@ -7,6 +7,7 @@ mod camera_state;
 mod config;
 mod debug_zone;
 mod eq_net;
+mod eqstr;
 mod frame_capture;
 mod game_state;
 mod gpu;
@@ -26,6 +27,9 @@ use winit::event_loop::EventLoop;
 fn main() {
     let login_cfg = config::LoginConfig::load();
     let app_cfg   = config::AppConfig::load();
+
+    // Load the EQ string table for OP_FormattedMessage / OP_SimpleMessage rendering.
+    eqstr::load(&app_cfg.assets_path.join("eqstr_us.txt"));
 
     let camera_cmd: Arc<Mutex<Option<camera_state::CameraCmd>>> = Arc::new(Mutex::new(None));
     let camera_snapshot: Arc<Mutex<camera_state::CameraSnapshot>> = Arc::new(Mutex::new(
