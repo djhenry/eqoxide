@@ -40,6 +40,7 @@ fn main() {
     let hail:             http::HailReq         = Arc::new(Mutex::new(None));
     let say:              http::SayReq          = Arc::new(Mutex::new(None));
     let target:           http::TargetReq       = Arc::new(Mutex::new(None));
+    let shared_collision: assets::SharedCollision = Arc::new(std::sync::RwLock::new(None));
     let frame_req:        http::FrameReq        = Arc::new(Mutex::new(None));
 
     // EQ network task
@@ -51,10 +52,11 @@ fn main() {
     let hl  = hail.clone();
     let sy  = say.clone();
     let tg  = target.clone();
+    let sc  = shared_collision.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
-            if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, zp, zc, hl, sy, tg).await {
+            if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, zp, zc, hl, sy, tg, sc).await {
                 eprintln!("EQ: fatal: {e}");
             }
         });
@@ -92,6 +94,7 @@ fn main() {
         app_hail,
         app_say,
         app_target,
+        shared_collision,
     );
     event_loop.run_app(&mut application).expect("event loop run");
 }

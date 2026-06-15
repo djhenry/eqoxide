@@ -72,6 +72,7 @@ pub async fn run_login_flow(
     hail:             HailReq,
     say:              SayReq,
     target:           TargetReq,
+    collision:        crate::assets::SharedCollision,
 ) -> Result<(), String> {
     for attempt in 1..=max_retries {
         if attempt > 1 {
@@ -95,7 +96,7 @@ pub async fn run_login_flow(
                     eprintln!("NAV: {} zone points seeded", gs.zone_points.len());
                 }
                 let char_name = config.character_name.clone();
-                let navigator = Navigator::new(goto_target, entity_positions, zone_points, zone_cross, hail, say, target);
+                let navigator = Navigator::new(goto_target, entity_positions, zone_points, zone_cross, hail, say, target, collision);
                 run_gameplay_phase(stream, net_rx, app_tx, gs, char_name, navigator, world_creds).await;
                 return Ok(());
             }

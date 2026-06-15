@@ -74,7 +74,10 @@ pub struct App {
     // Frame capture for /frame API
     frame_req:    FrameReq,
     // Precomputed zone collision grid: floor grounding, camera collision, nameplate occlusion.
-    collision:    Option<assets::Collision>,
+    // Held as Arc and also published to `shared_collision` so the nav thread can read it.
+    collision:    Option<Arc<assets::Collision>>,
+    /// Shared slot the nav thread reads to gate /goto movement against walls.
+    shared_collision: assets::SharedCollision,
     /// Cache of the last terrain sample: (east, north, height). Avoids re-querying
     /// the grid each frame when the player hasn't moved horizontally.
     ground_cache: (f32, f32, f32),
@@ -99,6 +102,7 @@ impl App {
         hail:            crate::http::HailReq,
         say:             crate::http::SayReq,
         target:          crate::http::TargetReq,
+        shared_collision: assets::SharedCollision,
     ) -> Self {
         let mut game_state = GameState::new();
         game_state.player_name = character_name;
@@ -123,7 +127,7 @@ impl App {
             hail, say, target, say_buffer: String::new(),
             drag_active: false, last_cursor: winit::dpi::PhysicalPosition::new(0.0, 0.0),
             game_state, scene: SceneState::default(), app_rx, frame_req,
-            collision: None,
+            collision: None, shared_collision,
             ground_cache: (f32::NAN, f32::NAN, 0.0),
             prev_render_pos: [0.0, 0.0, 0.0],
             heading_target:  0.0,
@@ -135,7 +139,7 @@ impl App {
     /// unchanged when no zone geometry is loaded or no floor vertex is nearby.
     /// Result is cached and only recomputed after ~2 units of horizontal movement.
     fn ground_z(&mut self, east: f32, north: f32, fallback: f32) -> f32 {
-        let Some(col) = &self.collision else { return fallback; };
+        let Some(col) = self.collision.as_deref() else { return fallback; };
         let (ce, cn, ch) = self.ground_cache;
         if (ce - east).abs() < 2.0 && (cn - north).abs() < 2.0 {
             return ch;
@@ -169,13 +173,17 @@ impl App {
                 }
                 renderer.upload_zone_assets(&za);
                 eprintln!("renderer: loaded {} meshes for '{}'", renderer.gpu_meshes.len(), zone_name);
-                // Build the collision grid for grounding, camera collision, occlusion.
-                self.collision = Some(assets::Collision::build(&za, 32.0));
+                // Build the collision grid for grounding, camera collision, occlusion,
+                // and publish it for the nav thread to gate /goto movement.
+                let col = Arc::new(assets::Collision::build(&za, 32.0));
+                self.collision = Some(col.clone());
+                *self.shared_collision.write().unwrap() = Some(col);
             }
             Err(e) => {
                 eprintln!("renderer: zone '{}' not found ({}), using fallback", zone_name, e);
                 renderer.upload_zone_assets(&debug_zone::make_fallback_ground());
                 self.collision = None;
+                *self.shared_collision.write().unwrap() = None;
             }
         }
         // Load EQ zone map lines (.txt) for the minimap overlay.
@@ -401,7 +409,7 @@ impl App {
         // Camera collision: if a wall sits between the player and the eye, pull the eye
         // in to just before it so the view never ends up on the far side of geometry
         // (OpenEQ does the same with a ray query against its collision octree).
-        if let Some(col) = &self.collision {
+        if let Some(col) = self.collision.as_deref() {
             if let Some(t) = col.nearest_hit_t(cam_target, cam_eye) {
                 let frac = (t * 0.9).clamp(0.05, 1.0);
                 cam_eye = lerp3(cam_target, cam_eye, frac);
@@ -435,7 +443,7 @@ impl App {
             &mut enc, &view, renderer, self.loading, &self.current_zone, &self.scene,
             self.zone_min, self.zone_max, &mut self.minimap_zoom, &mut self.minimap_full,
             self.current_fps, self.zone_map.as_ref(),
-            cam_eye, self.collision.as_ref(),
+            cam_eye, self.collision.as_deref(),
             &self.hail, &self.say, &self.target, &mut self.say_buffer,
         );
 

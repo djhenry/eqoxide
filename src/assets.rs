@@ -60,6 +60,11 @@ impl ZoneAssets {
 /// raycast for grounding, segment raycast for camera collision and nameplate
 /// occlusion) visit only the grid cells their XY footprint overlaps instead of
 /// scanning every triangle each frame.
+/// Shared handle to the current zone's collision grid. The render thread builds it on
+/// zone load and publishes it here; the nav thread reads it to gate movement. Inner
+/// `Arc<Collision>` so both threads share one grid without cloning the triangle data.
+pub type SharedCollision = std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<Collision>>>>;
+
 pub struct Collision {
     tris:      Vec<[[f32; 3]; 3]>,
     cells:     Vec<Vec<u32>>,

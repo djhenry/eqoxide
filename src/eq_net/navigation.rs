@@ -55,6 +55,7 @@ pub struct Navigator {
     hail:             HailReq,
     say:              SayReq,
     target:           TargetReq,
+    collision:        crate::assets::SharedCollision,
     position_seq:     u16,
     last_tick:        Instant,
 }
@@ -68,6 +69,7 @@ impl Navigator {
         hail:             HailReq,
         say:              SayReq,
         target:           TargetReq,
+        collision:        crate::assets::SharedCollision,
     ) -> Self {
         Navigator {
             goto_target,
@@ -77,6 +79,7 @@ impl Navigator {
             hail,
             say,
             target,
+            collision,
             position_seq: 0,
             last_tick: Instant::now(),
         }
@@ -172,6 +175,22 @@ impl Navigator {
         let ny      = gs.player_y + dy / dist * step;
         let nz      = gs.player_z;
         let heading = dy.atan2(dx).to_degrees().rem_euclid(360.0);
+
+        // Collision: don't path through walls. Cast at chest height from the current
+        // position to the proposed step (world points are [east, north, height], so
+        // east = player_y / ny, north = player_x / nx). If blocked, stop and clear the
+        // goal — scripted /goto should route around buildings via the A* navpath tool.
+        if let Some(col) = self.collision.read().unwrap().clone() {
+            let chest = gs.player_z + 3.0;
+            let from = [gs.player_y, gs.player_x, chest];
+            let to   = [ny, nx, chest];
+            if !col.path_clear(from, to, 2.0) {
+                eprintln!("NAV: blocked by wall at ({:.1},{:.1}) — stopping", nx, ny);
+                gs.log_msg("zone", "Path blocked by a wall");
+                *self.goto_target.lock().unwrap() = None;
+                return;
+            }
+        }
 
         self.send_position_update(stream, gs, nx, ny, nz, heading);
 
