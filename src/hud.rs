@@ -493,6 +493,13 @@ pub fn draw_labels(
         };
         let label_line2 = format!("L{}  {}", b.level, hp_str);
 
+        // The current target's name is tinted by its consider color (set from the
+        // OP_Consider reply); everyone else stays white.
+        let name_color = match (b.is_target, scene.target_con) {
+            (true, Some([r, g, bl])) => egui::Color32::from_rgb(r, g, bl),
+            _ => egui::Color32::WHITE,
+        };
+
         egui::Area::new(egui::Id::new(("npc_label", i)))
             .fixed_pos(egui::pos2(sx - 35.0, sy - 80.0))
             .interactable(false)
@@ -503,7 +510,7 @@ pub fn draw_labels(
                     .show(ui, |ui| {
                         ui.label(egui::RichText::new(&b.name)
                             .size(12.0)
-                            .color(egui::Color32::WHITE));
+                            .color(name_color));
                         ui.label(egui::RichText::new(&label_line2)
                             .size(11.0)
                             .color(egui::Color32::WHITE));

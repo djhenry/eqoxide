@@ -72,6 +72,8 @@ pub struct GameState {
     pub target_id: Option<u32>,
     pub target_name: Option<String>,
     pub target_hp_pct: Option<f32>,
+    /// Consider color (RGB) of the current target, set from the OP_Consider reply.
+    pub target_con: Option<[u8; 3]>,
 
     // Zone exit points (populated by OP_SEND_ZONE_POINTS on zone entry)
     pub zone_points: Vec<ZonePoint>,

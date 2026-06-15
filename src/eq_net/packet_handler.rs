@@ -250,14 +250,33 @@ pub fn consider_message(faction: u32) -> &'static str {
     }
 }
 
+/// Map an EQEmu ConsiderColor (the OP_Consider reply's `level` field) to a nameplate RGB.
+/// Titanium remaps Gray→Green and White→WhiteTitanium server-side, but we cover all.
+pub fn con_color(level: u32) -> [u8; 3] {
+    match level {
+        2  => [ 90, 220,  90], // Green   — trivial
+        4  => [ 80, 120, 240], // DarkBlue
+        6  => [150, 150, 150], // Gray    — no exp
+        18 => [120, 200, 240], // LightBlue
+        10 | 20 => [235, 235, 235], // White / WhiteTitanium — even con
+        15 => [240, 230,  80], // Yellow  — slightly higher
+        13 => [240,  80,  80], // Red     — much higher / dangerous
+        _  => [235, 235, 235],
+    }
+}
+
 /// OP_Consider reply — the server's con of our target. Consider_Struct: playerid(u32) +
-/// targetid(u32) + faction(u32) + level(u32=con color) + ... We use targetid + faction.
+/// targetid(u32) + faction(u32) + level(u32 = con color) + cur_hp + ... Sets the target
+/// (so its nameplate highlights) plus the con-color tint and a /consider log line.
 fn apply_consider(gs: &mut GameState, payload: &[u8]) {
-    if payload.len() < 12 { return; }
+    if payload.len() < 16 { return; }
     let target_id = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
     let faction   = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
+    let level     = u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
     let name = gs.entities.get(&target_id).map(|e| e.name.clone())
         .unwrap_or_else(|| "Your target".to_string());
+    gs.target_id  = Some(target_id);
+    gs.target_con = Some(con_color(level));
     gs.log_msg("combat", &format!("{} {}.", name, consider_message(faction)));
 }
 
@@ -367,8 +386,17 @@ pub fn register_spawn(gs: &mut GameState, spawn: Spawn_S) {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_emote, consider_message};
+    use super::{apply_emote, con_color, consider_message};
     use crate::game_state::GameState;
+
+    #[test]
+    fn con_color_maps_levels() {
+        assert_eq!(con_color(2), [90, 220, 90]);    // green (trivial)
+        assert_eq!(con_color(13), [240, 80, 80]);   // red (dangerous)
+        assert_eq!(con_color(15), [240, 230, 80]);  // yellow
+        assert_eq!(con_color(20), con_color(10));   // WhiteTitanium == White
+        assert_eq!(con_color(999), [235, 235, 235]); // unknown → white
+    }
 
     #[test]
     fn consider_message_covers_faction_cons() {
