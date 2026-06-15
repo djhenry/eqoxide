@@ -416,7 +416,9 @@ pub fn register_spawn(gs: &mut GameState, spawn: Spawn_S) {
         level:    spawn.level as u32,
         is_npc,
         x, y, z,
-        hp_pct:   100.0,
+        // Spawn_Struct curHp is an HP *percent* (100 for players, up to ~110 for some
+        // NPCs), not absolute HP — so a damaged NPC spawns showing its real health.
+        hp_pct:   (spawn.curHp as f32).min(100.0),
         cur_hp:   spawn.curHp as i32,
         max_hp:   spawn.max_hp as i32,
         race:     eq_race_to_code(spawn.race).to_string(),
