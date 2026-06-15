@@ -118,6 +118,17 @@ pub fn draw_hud(ctx: &egui::Context, scene: &SceneState, bot_id: &str) {
                     .weak()
                     .monospace());
             });
+
+            // Row 3: character stats (only once a player profile has arrived).
+            if scene.stats.iter().any(|&s| s != 0) {
+                let [str_, sta, cha, dex, int_, agi, wis] = scene.stats;
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!(
+                        "STR {}  STA {}  AGI {}  DEX {}  WIS {}  INT {}  CHA {}",
+                        str_, sta, agi, dex, wis, int_, cha))
+                        .weak().monospace());
+                });
+            }
         });
 }
 

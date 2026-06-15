@@ -59,6 +59,8 @@ pub struct GameState {
     pub xp_pct: f32,
     /// Coin on hand (platinum, gold, silver, copper), from the player profile.
     pub coin: [u32; 4],
+    /// Stats (STR, STA, CHA, DEX, INT, AGI, WIS), from the player profile.
+    pub stats: [u32; 7],
 
     // Zone
     pub zone_name: String,
