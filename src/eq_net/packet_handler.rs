@@ -28,6 +28,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_SPECIAL_MESG         => apply_special_message(gs, p),
         OP_FORMATTED_MESSAGE    => apply_formatted_message(gs, p),
         OP_SIMPLE_MESSAGE       => apply_simple_message(gs, p),
+        OP_EMOTE                => apply_emote(gs, p),
         OP_CONSIDER             => apply_consider(gs, p),
         OP_SEND_ZONE_POINTS           => apply_zone_points(gs, p),
         OP_REQUEST_CLIENT_ZONE_CHANGE => {
@@ -205,6 +206,22 @@ fn apply_formatted_message(gs: &mut GameState, payload: &[u8]) {
     }
 }
 
+/// OP_Emote — world/NPC emote text (some quest flavor, often with [keywords]).
+/// Emote_Struct: type(u32) + message[1024]. type 0xffffffff = animation command (no
+/// useful text); only non-empty custom text is shown, in the NPC dialogue panel.
+fn apply_emote(gs: &mut GameState, payload: &[u8]) {
+    if payload.len() < 5 { return; }
+    let etype = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    if etype == 0xffff_ffff { return; } // /dance, /flip, etc. — animation only
+    let msg = String::from_utf8_lossy(&payload[4..])
+        .trim_end_matches('\0')
+        .trim()
+        .to_string();
+    if !msg.is_empty() {
+        gs.log_msg("npc", &msg);
+    }
+}
+
 /// OP_SimpleMessage — eqstr-table text, no arguments. Layout: string_id(u32) + color(u32)
 /// + unknown(u32).
 fn apply_simple_message(gs: &mut GameState, payload: &[u8]) {
@@ -350,7 +367,8 @@ pub fn register_spawn(gs: &mut GameState, spawn: Spawn_S) {
 
 #[cfg(test)]
 mod tests {
-    use super::consider_message;
+    use super::{apply_emote, consider_message};
+    use crate::game_state::GameState;
 
     #[test]
     fn consider_message_covers_faction_cons() {
@@ -360,5 +378,25 @@ mod tests {
         // Out-of-range falls back to a neutral phrasing.
         assert_eq!(consider_message(0), "regards you");
         assert_eq!(consider_message(99), "regards you");
+    }
+
+    fn emote_payload(etype: u32, msg: &str) -> Vec<u8> {
+        let mut p = etype.to_le_bytes().to_vec();
+        p.extend_from_slice(msg.as_bytes());
+        p.push(0);
+        p
+    }
+
+    #[test]
+    fn apply_emote_logs_custom_text_skips_animations() {
+        let mut gs = GameState::new();
+        apply_emote(&mut gs, &emote_payload(0, "Guard Phaeton beckons you closer."));
+        assert!(gs.messages.iter().any(|m| m.kind == "npc"
+            && m.text == "Guard Phaeton beckons you closer."));
+
+        // Animation-command emotes (0xffffffff) carry no useful text and are skipped.
+        let before = gs.messages.len();
+        apply_emote(&mut gs, &emote_payload(0xffff_ffff, ""));
+        assert_eq!(gs.messages.len(), before, "animation emote should not be logged");
     }
 }

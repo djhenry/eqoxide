@@ -110,6 +110,8 @@ pub const OP_SPECIAL_MESG: u16 = 0x2372;
 pub const OP_FORMATTED_MESSAGE: u16 = 0x5a48;
 /// eqstr-table message, no args. SimpleMessage_Struct: string_id(u32) | color(u32) | unknown(u32)
 pub const OP_SIMPLE_MESSAGE: u16 = 0x673c;
+/// World/NPC emote text (some quest flavor). Emote_Struct: type(u32) | message[1024]\0
+pub const OP_EMOTE: u16 = 0x547a;
 
 // ── Misc zone→client ──────────────────────────────────────────────────────
 

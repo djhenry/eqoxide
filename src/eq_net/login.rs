@@ -350,6 +350,7 @@ impl<'a> LoginProtocol<'a> {
                     0x2372, // OP_SpecialMesg — NPC dialogue, handled by apply_packet
                     0x5a48, // OP_FormattedMessage — eqstr text, handled by apply_packet
                     0x673c, // OP_SimpleMessage — eqstr text, handled by apply_packet
+                    0x547a, // OP_Emote — world/NPC emote, handled by apply_packet
                     0x7cba, // OP_ENTER_WORLD — world login flow
                     0x52a4, // OP_POST_ENTER_WORLD
                     0x04ec, // OP_EXPANSION_INFO
