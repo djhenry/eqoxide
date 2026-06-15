@@ -62,8 +62,7 @@ fn apply_delete_spawn(gs: &mut GameState, payload: &[u8]) {
 }
 
 fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
-    if payload.len() < SIZE_SPAWN_POSITION_UPDATE { return; }
-    let upd = unsafe { safe_read::<SpawnPositionUpdate_S>(payload) };
+    let Some(upd) = decode_position_update(payload) else { return; };
     let sid = upd.spawn_id as u32;
     if sid == gs.player_id {
         gs.player_x = upd.x;
@@ -73,6 +72,7 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         e.x = upd.x;
         e.y = upd.y;
         e.z = upd.z;
+        e.heading = upd.heading; // NPCs now face the direction the server reports
     }
 }
 

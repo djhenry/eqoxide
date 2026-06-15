@@ -309,7 +309,7 @@ pub const SIZE_ZONE_SERVER_INFO: usize = 130; // ZoneServerInfo_S (ip[128] + por
 pub const SIZE_CLIENT_ZONE_ENTRY: usize = 68; // ClientZoneEntry_S
 pub const SIZE_ENTER_WORLD: usize = 68;  // EnterWorld_S
 pub const SIZE_LOGIN_INFO: usize = 464;  // LoginInfo_S
-pub const SIZE_SPAWN_POSITION_UPDATE: usize = 30; // SpawnPositionUpdate_S
+pub const SIZE_SPAWN_POSITION_UPDATE: usize = 22; // PlayerPositionUpdateServer_Struct (bit-packed)
 pub const SIZE_HP_UPDATE: usize = 10;   // HPUpdate_S
 pub const SIZE_DEATH: usize = 32;       // Death_S
 pub const SIZE_ZONE_POINT_ENTRY: usize = 24; // ZonePointEntry_S
@@ -322,6 +322,32 @@ pub const SIZE_MONEY_ON_CORPSE: usize = 20; // MoneyOnCorpse_S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn position_update_round_trips() {
+        let pkt = encode_position_update(0x1234, 125.5, -340.25, 12.0);
+        assert_eq!(pkt.len(), SIZE_SPAWN_POSITION_UPDATE);
+        let d = decode_position_update(&pkt).expect("decode");
+        assert_eq!(d.spawn_id, 0x1234);
+        // EQ19 fixed-point: exact to 1/8 unit.
+        assert!((d.x - 125.5).abs() < 0.125, "x={}", d.x);
+        assert!((d.y - (-340.25)).abs() < 0.125, "y={}", d.y);
+        assert!((d.z - 12.0).abs() < 0.125, "z={}", d.z);
+    }
+
+    #[test]
+    fn position_update_decodes_negative_coords() {
+        // Negative coordinates must sign-extend out of the 19-bit field.
+        let d = decode_position_update(&encode_position_update(1, -500.0, -1.0, -7.5)).unwrap();
+        assert!((d.x - (-500.0)).abs() < 0.125);
+        assert!((d.y - (-1.0)).abs() < 0.125);
+        assert!((d.z - (-7.5)).abs() < 0.125);
+    }
+
+    #[test]
+    fn decode_position_update_rejects_short() {
+        assert!(decode_position_update(&[0u8; 10]).is_none());
+    }
 
     #[test]
     fn test_extract_spawn_position_zero() {
@@ -485,20 +511,56 @@ impl Spawn_S {
     }
 }
 
-/// Entity position update (30 bytes) — sent for every moving entity.
-#[repr(C, packed)]
-#[derive(Debug, Copy, Clone)]
-pub struct SpawnPositionUpdate_S {
+/// Decoded fields from the Titanium bit-packed server position update.
+pub struct PositionUpdate {
     pub spawn_id: u16,
-    pub delta_heading: i16,
-    pub y: f32,
-    pub delta_z: f32,
-    pub z: f32,
-    pub delta_x: f32,
-    pub x: f32,
-    pub delta_y: f32,
-    pub animation: u8,
-    pub heading: u8, // 0-255 mapped to 0-360
+    pub x: f32,       // server x (north)
+    pub y: f32,       // server y (east)
+    pub z: f32,       // height
+    pub heading: f32, // degrees, 0..360
+}
+
+#[inline]
+fn sext(v: u32, bits: u32) -> i32 {
+    let shift = 32 - bits;
+    ((v << shift) as i32) >> shift
+}
+
+/// Decode the 22-byte bit-packed Titanium PlayerPositionUpdateServer_Struct (OP_ClientUpdate).
+/// LE C-bitfields, allocated from the LSB of each u32 word:
+///   spawn_id(u16) | [delta_heading:10, x:19, pad:3] | [y:19, animation:10, pad:3]
+///   | [z:19, delta_y:13] | [delta_x:13, heading:12, pad:7] | [delta_z:13, pad:19].
+/// Coords are EQ19 fixed-point (value/8); heading is EQ12 (value/4 → 0..512 EQ units).
+pub fn decode_position_update(p: &[u8]) -> Option<PositionUpdate> {
+    if p.len() < SIZE_SPAWN_POSITION_UPDATE { return None; }
+    let spawn_id = u16::from_le_bytes([p[0], p[1]]);
+    let w1 = u32::from_le_bytes([p[2], p[3], p[4], p[5]]);
+    let w2 = u32::from_le_bytes([p[6], p[7], p[8], p[9]]);
+    let w3 = u32::from_le_bytes([p[10], p[11], p[12], p[13]]);
+    let w4 = u32::from_le_bytes([p[14], p[15], p[16], p[17]]);
+    let x = sext((w1 >> 10) & 0x7FFFF, 19) as f32 / 8.0;
+    let y = sext(w2 & 0x7FFFF, 19) as f32 / 8.0;
+    let z = sext(w3 & 0x7FFFF, 19) as f32 / 8.0;
+    let heading_units = ((w4 >> 13) & 0xFFF) as f32 / 4.0; // EQ12 → 0..512
+    let heading = (heading_units * 360.0 / 512.0).rem_euclid(360.0);
+    Some(PositionUpdate { spawn_id, x, y, z, heading })
+}
+
+/// Encode a minimal position update (deltas/animation/heading zero) in the same
+/// bit-packed wire format, for the nav thread's synthetic render-follow packet.
+/// Round-trips with `decode_position_update` (to EQ19 precision, 1/8 unit).
+pub fn encode_position_update(spawn_id: u16, x: f32, y: f32, z: f32) -> Vec<u8> {
+    let xp = ((x * 8.0) as i32 as u32) & 0x7FFFF;
+    let yp = ((y * 8.0) as i32 as u32) & 0x7FFFF;
+    let zp = ((z * 8.0) as i32 as u32) & 0x7FFFF;
+    let mut buf = Vec::with_capacity(SIZE_SPAWN_POSITION_UPDATE);
+    buf.extend_from_slice(&spawn_id.to_le_bytes());
+    buf.extend_from_slice(&(xp << 10).to_le_bytes()); // word1: delta_heading=0, x_pos
+    buf.extend_from_slice(&yp.to_le_bytes());          // word2: y_pos, animation=0
+    buf.extend_from_slice(&zp.to_le_bytes());          // word3: z_pos, delta_y=0
+    buf.extend_from_slice(&0u32.to_le_bytes());        // word4: delta_x/heading=0
+    buf.extend_from_slice(&0u32.to_le_bytes());        // word5: delta_z=0
+    buf
 }
 
 /// HP update (10 bytes).

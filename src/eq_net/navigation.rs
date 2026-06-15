@@ -288,18 +288,13 @@ impl Navigator {
 }
 
 /// Build a synthetic OP_CLIENT_UPDATE packet so the render loop can update
-/// `scene.player_pos` and keep the camera attached during navigation.
-///
-/// Layout mirrors SpawnPositionUpdate_S (30 bytes, server→client):
-///   spawn_id(u16) | delta_heading(i16) | y(f32) | delta_z(f32)
-///   z(f32) | delta_x(f32) | x(f32) | delta_y(f32) | animation(u8) | heading(u8)
+/// `scene.player_pos` and keep the camera attached during navigation. Uses the real
+/// Titanium bit-packed wire format so it decodes the same way as server updates.
 pub fn make_position_packet(spawn_id: u32, x: f32, y: f32, z: f32) -> AppPacket {
-    let mut buf = [0u8; 30];
-    buf[0..2].copy_from_slice(&(spawn_id as u16).to_le_bytes());
-    buf[4..8].copy_from_slice(&y.to_le_bytes());
-    buf[12..16].copy_from_slice(&z.to_le_bytes());
-    buf[20..24].copy_from_slice(&x.to_le_bytes());
-    AppPacket { opcode: OP_CLIENT_UPDATE, payload: buf.to_vec() }
+    AppPacket {
+        opcode: OP_CLIENT_UPDATE,
+        payload: encode_position_update(spawn_id as u16, x, y, z),
+    }
 }
 
 #[cfg(test)]
