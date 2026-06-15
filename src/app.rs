@@ -58,6 +58,11 @@ pub struct App {
     override_pos: Option<[f32; 3]>,
     /// Shared goto target — WASD writes here so the nav thread sends actual EQ packets.
     goto_target:  crate::http::GotoTarget,
+    /// Shared request slots written by HUD buttons; the nav thread drains and sends them.
+    hail:         crate::http::HailReq,
+    say:          crate::http::SayReq,
+    /// Text buffer for the HUD say box.
+    say_buffer:   String,
     // Mouse
     drag_active:  bool,
     last_cursor:  winit::dpi::PhysicalPosition<f64>,
@@ -90,6 +95,8 @@ impl App {
         app_rx:          tokio::sync::mpsc::UnboundedReceiver<AppPacket>,
         frame_req:       FrameReq,
         goto_target:     crate::http::GotoTarget,
+        hail:            crate::http::HailReq,
+        say:             crate::http::SayReq,
     ) -> Self {
         let mut game_state = GameState::new();
         game_state.player_name = character_name;
@@ -111,6 +118,7 @@ impl App {
             fps_timer: std::time::Instant::now(),
             current_fps: 0.0,
             keys_held: std::collections::HashSet::new(), override_pos: None, goto_target,
+            hail, say, say_buffer: String::new(),
             drag_active: false, last_cursor: winit::dpi::PhysicalPosition::new(0.0, 0.0),
             game_state, scene: SceneState::default(), app_rx, frame_req,
             collision: None,
@@ -426,6 +434,7 @@ impl App {
             self.zone_min, self.zone_max, &mut self.minimap_zoom, &mut self.minimap_full,
             self.current_fps, self.zone_map.as_ref(),
             cam_eye, self.collision.as_ref(),
+            &self.hail, &self.say, &mut self.say_buffer,
         );
 
         // Submit — associated function avoids reborrowing self.
@@ -457,6 +466,9 @@ impl App {
         zone_map:      Option<&zone_map::ZoneMap>,
         cam_eye:       [f32; 3],
         collision:     Option<&assets::Collision>,
+        hail:          &crate::http::HailReq,
+        say:           &crate::http::SayReq,
+        say_buffer:    &mut String,
     ) {
         let (Some(egui_state), Some(egui_renderer), Some(egui_ctx), Some(window)) =
             (egui_state, egui_renderer, egui_ctx, window) else { return };
@@ -472,10 +484,11 @@ impl App {
                 hud::draw_loading(ctx, current_zone);
             } else {
                 hud::draw_hud(ctx, scene, "EQ Observer");
-                hud::draw_quest_dialogue(ctx, scene);
+                hud::draw_quest_dialogue(ctx, scene, say);
                 hud::draw_message_log(ctx, scene);
                 hud::draw_labels(ctx, scene, view_proj, screen_w, screen_h, cam_eye, collision);
                 hud::draw_minimap(ctx, scene, zone_min, zone_max, minimap_zoom, minimap_full, zone_map);
+                hud::draw_control_bar(ctx, scene, hail, say, say_buffer);
             }
         });
         egui_state.handle_platform_output(window, full_output.platform_output);

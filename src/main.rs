@@ -38,6 +38,7 @@ fn main() {
     let zone_points:      http::ZonePoints      = Arc::new(Mutex::new(Vec::new()));
     let zone_cross:       http::ZoneCrossReq    = Arc::new(Mutex::new(false));
     let hail:             http::HailReq         = Arc::new(Mutex::new(None));
+    let say:              http::SayReq          = Arc::new(Mutex::new(None));
     let frame_req:        http::FrameReq        = Arc::new(Mutex::new(None));
 
     // EQ network task
@@ -47,10 +48,11 @@ fn main() {
     let zp  = zone_points.clone();
     let zc  = zone_cross.clone();
     let hl  = hail.clone();
+    let sy  = say.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
-            if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, zp, zc, hl).await {
+            if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, zp, zc, hl, sy).await {
                 eprintln!("EQ: fatal: {e}");
             }
         });
@@ -58,6 +60,8 @@ fn main() {
 
     // HTTP server
     let app_goto = goto_target.clone();
+    let app_hail = hail.clone();
+    let app_say  = say.clone();
     http::spawn_camera_server(
         camera_cmd.clone(),
         camera_snapshot.clone(),
@@ -67,6 +71,7 @@ fn main() {
         zone_points,
         zone_cross,
         hail,
+        say,
         app_cfg.http_port,
     );
 
@@ -80,6 +85,8 @@ fn main() {
         app_rx,
         frame_req,
         app_goto,
+        app_hail,
+        app_say,
     );
     event_loop.run_app(&mut application).expect("event loop run");
 }

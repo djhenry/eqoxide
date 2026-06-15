@@ -18,7 +18,7 @@ use crate::eq_net::packet_handler::apply_packet;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::GameState;
-use crate::http::{EntityPositions, GotoTarget, HailReq, ZoneCrossReq, ZonePoints};
+use crate::http::{EntityPositions, GotoTarget, HailReq, SayReq, ZoneCrossReq, ZonePoints};
 
 type DesCbcEnc = Encryptor<Des>;
 type DesCbcDec = Decryptor<Des>;
@@ -70,6 +70,7 @@ pub async fn run_login_flow(
     zone_points:      ZonePoints,
     zone_cross:       ZoneCrossReq,
     hail:             HailReq,
+    say:              SayReq,
 ) -> Result<(), String> {
     for attempt in 1..=max_retries {
         if attempt > 1 {
@@ -93,7 +94,7 @@ pub async fn run_login_flow(
                     eprintln!("NAV: {} zone points seeded", gs.zone_points.len());
                 }
                 let char_name = config.character_name.clone();
-                let navigator = Navigator::new(goto_target, entity_positions, zone_points, zone_cross, hail);
+                let navigator = Navigator::new(goto_target, entity_positions, zone_points, zone_cross, hail, say);
                 run_gameplay_phase(stream, net_rx, app_tx, gs, char_name, navigator, world_creds).await;
                 return Ok(());
             }

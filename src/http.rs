@@ -32,6 +32,10 @@ pub type ZoneCrossReq = Arc<Mutex<bool>>;
 /// "Hail, <name>" say packet so the NPC fires its hail/quest script.
 pub type HailReq = Arc<Mutex<Option<String>>>;
 
+/// Arbitrary Say-channel text, set by POST /say or a HUD button/keyword; the nav thread
+/// reads it once and sends it on the Say channel (used for quest keyword follow-ups).
+pub type SayReq = Arc<Mutex<Option<String>>>;
+
 /// Current zone name and id, updated on every OP_NEW_ZONE.
 pub type ZoneInfo = Arc<Mutex<(String, u16)>>;
 
@@ -45,6 +49,7 @@ struct HttpState {
     zone_points:      ZonePoints,
     zone_cross:       ZoneCrossReq,
     hail:             HailReq,
+    say:              SayReq,
 }
 
 #[derive(serde::Deserialize)]
@@ -77,12 +82,13 @@ pub fn spawn_camera_server(
     zone_points:      ZonePoints,
     zone_cross:       ZoneCrossReq,
     hail:             HailReq,
+    say:              SayReq,
     port:             u16,
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, zone_points, zone_cross, hail };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, zone_points, zone_cross, hail, say };
             let app = Router::new()
                 .route("/camera", get(get_camera).post(post_camera))
                 .route("/camera/reset", post(post_camera_reset))
@@ -92,6 +98,7 @@ pub fn spawn_camera_server(
                 .route("/zone_points", get(get_zone_points))
                 .route("/zone_cross", post(post_zone_cross))
                 .route("/hail", post(post_hail))
+                .route("/say", post(post_say))
                 .with_state(state);
             let addr = format!("127.0.0.1:{port}");
             let listener = match tokio::net::TcpListener::bind(&addr).await {
@@ -214,7 +221,7 @@ struct HailBody {
 }
 
 /// Turn an entity key like "Guard_Phaeton000" into a display name "Guard Phaeton".
-fn clean_entity_name(raw: &str) -> String {
+pub fn clean_entity_name(raw: &str) -> String {
     raw.trim_end_matches(|c: char| c.is_ascii_digit())
         .replace('_', " ")
         .trim()
@@ -268,6 +275,29 @@ async fn post_hail(
             (StatusCode::NOT_FOUND, msg)
         }
     }
+}
+
+#[derive(serde::Deserialize)]
+struct SayBody {
+    text: String,
+}
+
+/// POST /say {"text":"..."} — say arbitrary text on the Say channel. Used for quest
+/// keyword follow-ups (e.g. say "shipment" after an NPC mentions [shipment]).
+async fn post_say(
+    State(s): State<HttpState>,
+    body: Result<Json<SayBody>, axum::extract::rejection::JsonRejection>,
+) -> (StatusCode, String) {
+    let text = match body {
+        Ok(Json(b)) => b.text,
+        Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"text\":\"...\"}".into()),
+    };
+    if text.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "empty text".into());
+    }
+    *s.say.lock().unwrap() = Some(text.clone());
+    eprintln!("say: queued {:?}", text);
+    (StatusCode::OK, format!("saying {}", text))
 }
 
 /// GET /frame — returns the current rendered frame as a PNG.

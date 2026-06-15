@@ -134,9 +134,25 @@ pub fn split_keywords(text: &str) -> Vec<(String, bool)> {
     out
 }
 
+/// Name of the NPC nearest the player (for the Hail button). Skips level-0 placeholder
+/// spawns and the off-map zone controller. Pure, so it can be unit-tested.
+pub fn nearest_npc_name(scene: &SceneState) -> Option<String> {
+    let p = scene.player_pos; // [east, north, height]
+    scene.billboards.iter()
+        .filter(|b| b.level > 0 && !b.name.contains("zone_controller"))
+        .map(|b| {
+            let de = b.pos[0] - p[0];
+            let dn = b.pos[1] - p[1];
+            (b, de * de + dn * dn)
+        })
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(b, _)| crate::http::clean_entity_name(&b.name))
+}
+
 /// Dedicated panel for NPC dialogue (kind "npc"), e.g. quest-giver responses to a hail.
-/// Bracketed [keywords] are highlighted so the player knows what to say next.
-pub fn draw_quest_dialogue(ctx: &egui::Context, scene: &SceneState) {
+/// Bracketed [keywords] are highlighted and clickable — clicking one says it back so the
+/// player can follow a quest conversation without typing.
+pub fn draw_quest_dialogue(ctx: &egui::Context, scene: &SceneState, say: &crate::http::SayReq) {
     let visible: Vec<_> = scene.messages.iter()
         .filter(|m| m.kind == "npc" && m.timestamp.elapsed().as_secs() < 45)
         .collect();
@@ -158,16 +174,64 @@ pub fn draw_quest_dialogue(ctx: &egui::Context, scene: &SceneState) {
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     for (seg, is_kw) in split_keywords(&entry.text) {
-                        let rt = egui::RichText::new(seg).size(13.0);
-                        let rt = if is_kw {
-                            rt.strong().color(egui::Color32::from_rgb(255, 225, 90))
+                        if is_kw {
+                            let label = egui::Label::new(egui::RichText::new(&seg).size(13.0)
+                                .strong().color(egui::Color32::from_rgb(255, 225, 90)))
+                                .sense(egui::Sense::click());
+                            if ui.add(label).on_hover_text("Click to say this keyword").clicked() {
+                                let kw = seg.trim_start_matches('[').trim_end_matches(']').to_string();
+                                *say.lock().unwrap() = Some(kw);
+                            }
                         } else {
-                            rt.color(egui::Color32::from_rgb(225, 225, 205))
-                        };
-                        ui.label(rt);
+                            ui.label(egui::RichText::new(&seg).size(13.0)
+                                .color(egui::Color32::from_rgb(225, 225, 205)));
+                        }
                     }
                 });
             }
+        });
+}
+
+/// Floating control bar (bottom-center): Hail the nearest NPC and a say box for
+/// chatting / quest replies. Buttons write shared request slots the nav thread drains.
+pub fn draw_control_bar(
+    ctx:        &egui::Context,
+    scene:      &SceneState,
+    hail:       &crate::http::HailReq,
+    say:        &crate::http::SayReq,
+    say_buffer: &mut String,
+) {
+    egui::Window::new("##controls")
+        .title_bar(false)
+        .resizable(false)
+        .collapsible(false)
+        .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -30.0])
+        .frame(egui::Frame::none()
+            .fill(egui::Color32::from_black_alpha(170))
+            .inner_margin(egui::Margin::symmetric(8.0, 4.0)))
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let nearest = nearest_npc_name(scene);
+                let label = match &nearest {
+                    Some(n) => format!("Hail {}", n),
+                    None => "Hail nearest".to_string(),
+                };
+                if ui.add_enabled(nearest.is_some(), egui::Button::new(label)).clicked() {
+                    if let Some(n) = nearest {
+                        *hail.lock().unwrap() = Some(n);
+                    }
+                }
+                ui.separator();
+                ui.label("Say:");
+                let resp = ui.add(egui::TextEdit::singleline(say_buffer)
+                    .desired_width(260.0)
+                    .hint_text("message / quest keyword"));
+                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if (ui.button("Send").clicked() || enter) && !say_buffer.trim().is_empty() {
+                    *say.lock().unwrap() = Some(say_buffer.trim().to_string());
+                    say_buffer.clear();
+                }
+            });
         });
 }
 
@@ -446,6 +510,33 @@ mod tests {
         // Reassembling the segments reproduces the original text exactly.
         let joined: String = parts.iter().map(|(s, _)| s.as_str()).collect();
         assert_eq!(joined, "Greetings. Are you [my contact]? Tell me about the [shipment].");
+    }
+
+    fn bb(id: u32, name: &str, level: u32, pos: [f32; 3]) -> Billboard {
+        Billboard {
+            id, pos, level, hp_pct: 100.0, is_target: false, dead: false,
+            name: name.to_string(), race: String::new(), action: String::new(), heading: 0.0,
+        }
+    }
+
+    #[test]
+    fn nearest_npc_name_picks_closest_and_cleans_name() {
+        let mut scene = SceneState::default();
+        scene.player_pos = [0.0, 0.0, 0.0]; // [east, north, height]
+        scene.billboards = vec![
+            bb(1, "Far_Guard001", 5, [100.0, 0.0, 0.0]),
+            bb(2, "Guard_Phaeton000", 20, [5.0, 5.0, 0.0]), // closest
+            bb(3, "zone_controller000", 1, [1.0, 1.0, 0.0]), // skipped (controller)
+            bb(4, "Placeholder000", 0, [0.5, 0.5, 0.0]),     // skipped (level 0)
+        ];
+        assert_eq!(nearest_npc_name(&scene).as_deref(), Some("Guard Phaeton"));
+    }
+
+    #[test]
+    fn nearest_npc_name_none_when_no_real_npcs() {
+        let mut scene = SceneState::default();
+        scene.billboards = vec![bb(1, "zone_controller000", 1, [1.0, 1.0, 0.0])];
+        assert_eq!(nearest_npc_name(&scene), None);
     }
 
     #[test]

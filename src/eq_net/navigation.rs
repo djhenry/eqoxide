@@ -7,7 +7,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::GameState;
-use crate::http::{EntityPositions, GotoTarget, HailReq, ZoneCrossReq, ZonePoints};
+use crate::http::{EntityPositions, GotoTarget, HailReq, SayReq, ZoneCrossReq, ZonePoints};
 
 /// Build a Titanium `ChannelMessage_Struct` for the Say channel (used for NPC hails).
 ///
@@ -38,6 +38,7 @@ pub struct Navigator {
     zone_points:      ZonePoints,
     zone_cross:       ZoneCrossReq,
     hail:             HailReq,
+    say:              SayReq,
     position_seq:     u16,
     last_tick:        Instant,
 }
@@ -49,6 +50,7 @@ impl Navigator {
         zone_points:      ZonePoints,
         zone_cross:       ZoneCrossReq,
         hail:             HailReq,
+        say:              SayReq,
     ) -> Self {
         Navigator {
             goto_target,
@@ -56,6 +58,7 @@ impl Navigator {
             zone_points,
             zone_cross,
             hail,
+            say,
             position_seq: 0,
             last_tick: Instant::now(),
         }
@@ -102,6 +105,15 @@ impl Navigator {
             eprintln!("EQ: hailing '{}' (say): {}", name, msg);
             stream.send_app_packet(OP_CHANNEL_MESSAGE, &pkt);
             gs.log_msg("chat", &format!("You say, '{}'", msg));
+        }
+
+        // Check say request — arbitrary Say text (HUD say box / quest keyword follow-up).
+        let say_text = self.say.lock().unwrap().take();
+        if let Some(text) = say_text {
+            let pkt = build_say_packet(&gs.player_name, "", &text);
+            eprintln!("EQ: say: {}", text);
+            stream.send_app_packet(OP_CHANNEL_MESSAGE, &pkt);
+            gs.log_msg("chat", &format!("You say, '{}'", text));
         }
 
         if self.last_tick.elapsed().as_millis() < 150 {
