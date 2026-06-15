@@ -66,7 +66,20 @@ pub fn draw_hud(ctx: &egui::Context, scene: &SceneState, bot_id: &str) {
                     if scene.zone.is_empty() { "connecting…" } else { &scene.zone }
                 )).strong());
                 ui.separator();
-                ui.label(format!("{} (L{})", scene.player_name, scene.player_level));
+                let class_suffix = if scene.player_class.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", scene.player_class)
+                };
+                ui.label(format!("{} (L{}{})", scene.player_name, scene.player_level, class_suffix));
+
+                // Coin on hand (only once a profile has been received).
+                let [pp, gp, sp, cp] = scene.coin;
+                if pp | gp | sp | cp != 0 {
+                    ui.separator();
+                    ui.label(egui::RichText::new(format!("{}p {}g {}s {}c", pp, gp, sp, cp))
+                        .color(egui::Color32::from_rgb(225, 205, 120)));
+                }
 
                 let hp = scene.player_hp_pct;
                 let hp_color = if hp < 30.0 {

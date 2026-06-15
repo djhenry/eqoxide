@@ -133,12 +133,47 @@ fn apply_zone_entry(gs: &mut GameState, payload: &[u8]) {
     }
 }
 
+/// EQ class id (1..=16) → name. From EQEmu common/classes.h.
+pub fn class_name(id: u32) -> &'static str {
+    match id {
+        1 => "Warrior", 2 => "Cleric", 3 => "Paladin", 4 => "Ranger",
+        5 => "Shadow Knight", 6 => "Druid", 7 => "Monk", 8 => "Bard",
+        9 => "Rogue", 10 => "Shaman", 11 => "Necromancer", 12 => "Wizard",
+        13 => "Magician", 14 => "Enchanter", 15 => "Beastlord", 16 => "Berserker",
+        _ => "",
+    }
+}
+
+/// Useful fields parsed from the Titanium PlayerProfile_Struct.
+pub struct ProfileInfo {
+    pub level: u32,
+    pub class_id: u32,
+    pub coin: [u32; 4], // platinum, gold, silver, copper
+}
+
+/// Parse the Titanium PlayerProfile_Struct. Offsets from EQEmu
+/// common/patches/titanium_structs.h: class_ @12, level @20, currency @4428..4440.
+/// Returns None if the payload is too short to be a full profile.
+pub fn parse_player_profile(payload: &[u8]) -> Option<ProfileInfo> {
+    if payload.len() < 4444 { return None; }
+    let u32_at = |o: usize| u32::from_le_bytes([payload[o], payload[o + 1], payload[o + 2], payload[o + 3]]);
+    Some(ProfileInfo {
+        class_id: u32_at(12),
+        level:    payload[20] as u32,
+        coin:     [u32_at(4428), u32_at(4432), u32_at(4436), u32_at(4440)],
+    })
+}
+
 fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
-    if payload.len() > 104 {
-        let level = payload[104];
-        if (1..=65).contains(&level) {
-            gs.player_level = level as u32;
+    if let Some(p) = parse_player_profile(payload) {
+        if (1..=65).contains(&p.level) {
+            gs.player_level = p.level;
         }
+        let cls = class_name(p.class_id);
+        if !cls.is_empty() {
+            gs.player_class = cls.to_string();
+        }
+        gs.coin = p.coin;
     }
 }
 
@@ -386,8 +421,36 @@ pub fn register_spawn(gs: &mut GameState, spawn: Spawn_S) {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_emote, con_color, consider_message};
+    use super::{apply_emote, class_name, con_color, consider_message, parse_player_profile};
     use crate::game_state::GameState;
+
+    #[test]
+    fn class_name_maps_ids() {
+        assert_eq!(class_name(1), "Warrior");
+        assert_eq!(class_name(11), "Necromancer");
+        assert_eq!(class_name(16), "Berserker");
+        assert_eq!(class_name(0), "");
+        assert_eq!(class_name(99), "");
+    }
+
+    #[test]
+    fn parse_player_profile_reads_offsets() {
+        // Too short → None.
+        assert!(parse_player_profile(&[0u8; 100]).is_none());
+
+        let mut buf = vec![0u8; 5000];
+        buf[12..16].copy_from_slice(&9u32.to_le_bytes());   // class_ = Rogue
+        buf[20] = 12;                                        // level
+        buf[4428..4432].copy_from_slice(&5u32.to_le_bytes());   // platinum
+        buf[4432..4436].copy_from_slice(&3u32.to_le_bytes());   // gold
+        buf[4436..4440].copy_from_slice(&7u32.to_le_bytes());   // silver
+        buf[4440..4444].copy_from_slice(&9u32.to_le_bytes());   // copper
+        let p = parse_player_profile(&buf).unwrap();
+        assert_eq!(p.level, 12);
+        assert_eq!(p.class_id, 9);
+        assert_eq!(p.coin, [5, 3, 7, 9]);
+        assert_eq!(class_name(p.class_id), "Rogue");
+    }
 
     #[test]
     fn con_color_maps_levels() {

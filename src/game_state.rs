@@ -52,10 +52,13 @@ pub struct GameState {
     pub player_heading: f32,
     pub player_level: u32,
     pub player_race: String,
+    pub player_class: String,
     pub player_action: String,
     pub hp_pct: f32,
     pub mana_pct: f32,
     pub xp_pct: f32,
+    /// Coin on hand (platinum, gold, silver, copper), from the player profile.
+    pub coin: [u32; 4],
 
     // Zone
     pub zone_name: String,
