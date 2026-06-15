@@ -228,6 +228,13 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
     }
 }
 
+/// EQEmu sends GM-flagged accounts verbose quest/loot debug (e.g. each NPC's loot table:
+/// "[Loot] [AddLootDrop] NPC [...] Item (...) ... trivial min/max [0/0] npc min/max [0/0]").
+/// It floods the NPC dialogue panel and isn't player-facing, so drop it.
+fn is_debug_spam(msg: &str) -> bool {
+    msg.contains("AddLootDrop") || msg.contains("min/max") || msg.contains("[Loot]")
+}
+
 /// OP_FormattedMessage — eqstr-table text with arguments. Layout: unknown0(u32) +
 /// string_id(u32) + type(u32) + args (null-separated strings). Resolved via the eqstr
 /// table loaded at startup; if the table or id is missing, the raw args are shown.
@@ -242,7 +249,7 @@ fn apply_formatted_message(gs: &mut GameState, payload: &[u8]) {
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let text = crate::eqstr::format_id(string_id, &arg_refs)
         .unwrap_or_else(|| arg_refs.join(" "));
-    if !text.trim().is_empty() {
+    if !text.trim().is_empty() && !is_debug_spam(&text) {
         gs.log_msg("system", &text);
     }
 }
@@ -258,7 +265,7 @@ fn apply_emote(gs: &mut GameState, payload: &[u8]) {
         .trim_end_matches('\0')
         .trim()
         .to_string();
-    if !msg.is_empty() {
+    if !msg.is_empty() && !is_debug_spam(&msg) {
         gs.log_msg("npc", &msg);
     }
 }
@@ -269,7 +276,7 @@ fn apply_simple_message(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < 8 { return; }
     let string_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
     if let Some(text) = crate::eqstr::format_id(string_id, &[]) {
-        if !text.trim().is_empty() {
+        if !text.trim().is_empty() && !is_debug_spam(&text) {
             gs.log_msg("system", &text);
         }
     }
@@ -338,7 +345,7 @@ fn apply_special_message(gs: &mut GameState, payload: &[u8]) {
     let msg = String::from_utf8_lossy(&payload[msg_start..])
         .trim_end_matches('\0')
         .to_string();
-    if msg.trim().is_empty() { return; }
+    if msg.trim().is_empty() || is_debug_spam(&msg) { return; }
     if sayer.is_empty() {
         gs.log_msg("npc", &msg);
     } else {
@@ -462,6 +469,13 @@ mod tests {
         assert_eq!(p.stats[0], 75);  // STR
         assert_eq!(p.stats[6], 110); // WIS
         assert_eq!(class_name(p.class_id), "Rogue");
+    }
+
+    #[test]
+    fn is_debug_spam_filters_gm_loot_dumps() {
+        assert!(super::is_debug_spam(
+            "[Loot] [AddLootDrop] NPC [Guard_Tyrak000] Item (5019) ... trivial min/max [0/0]"));
+        assert!(!super::is_debug_spam("Greetings, traveler. Are you my [contact]?"));
     }
 
     #[test]

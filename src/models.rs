@@ -387,7 +387,7 @@ pub fn archetype_scale(archetype: &str) -> f32 {
     // EQ units ≈ feet. Target heights below; all scaled ~0.30× from prior debug-zone
     // calibration (which had humanoids at ~20 EQ units — 3× too tall for real zones).
     match archetype {
-        "humanoid" =>  7.0, // Adventurer:  y_bottom=0.00287 → ~4 EQ units (player model)
+        "humanoid" =>  3.5, // Adventurer:  y_bottom=0.00287 → ~2 EQ units (player model)
         "gnoll"    => 12.0, // Kenney gnoll:                 → ~6 EQ units
         "skeleton" =>  8.0, // Skeleton:    raw height 0.00511→ ~6 EQ units
         "zombie"   =>  8.0, // Zombie:      y_bottom=0.00380 → ~6 EQ units
