@@ -47,6 +47,28 @@ pub fn build_say_packet(sender: &str, target: &str, message: &str) -> Vec<u8> {
     buf
 }
 
+/// Choose a movement delta `(north, east)` from the desired `(full_n, full_e)` step,
+/// sliding along a single axis when the diagonal is blocked by a wall. Returns `None`
+/// only when fully boxed in. Cast at chest height (z+3) so low lips/stairs don't block.
+/// World points are `[east, north, height]`, so east = py/+se, north = px/+sn.
+pub fn slide_move(
+    col: &crate::assets::Collision,
+    px: f32, py: f32, z: f32,
+    full_n: f32, full_e: f32, radius: f32,
+) -> Option<(f32, f32)> {
+    let chest = z + 3.0;
+    let clear = |sn: f32, se: f32| col.path_clear([py, px, chest], [py + se, px + sn, chest], radius);
+    if clear(full_n, full_e) {
+        Some((full_n, full_e))
+    } else if clear(full_n, 0.0) {
+        Some((full_n, 0.0))
+    } else if clear(0.0, full_e) {
+        Some((0.0, full_e))
+    } else {
+        None
+    }
+}
+
 pub struct Navigator {
     goto_target:      GotoTarget,
     entity_positions: EntityPositions,
@@ -170,27 +192,31 @@ impl Navigator {
             return;
         }
 
-        let step    = 15.0_f32.min(dist);
-        let nx      = gs.player_x + dx / dist * step;
-        let ny      = gs.player_y + dy / dist * step;
-        let nz      = gs.player_z;
-        let heading = dy.atan2(dx).to_degrees().rem_euclid(360.0);
+        let step   = 15.0_f32.min(dist);
+        let full_n = dx / dist * step; // north component toward goal
+        let full_e = dy / dist * step; // east component toward goal
+        let nz     = gs.player_z;
 
-        // Collision: don't path through walls. Cast at chest height from the current
-        // position to the proposed step (world points are [east, north, height], so
-        // east = player_y / ny, north = player_x / nx). If blocked, stop and clear the
-        // goal — scripted /goto should route around buildings via the A* navpath tool.
-        if let Some(col) = self.collision.read().unwrap().clone() {
-            let chest = gs.player_z + 3.0;
-            let from = [gs.player_y, gs.player_x, chest];
-            let to   = [ny, nx, chest];
-            if !col.path_clear(from, to, 2.0) {
-                eprintln!("NAV: blocked by wall at ({:.1},{:.1}) — stopping", nx, ny);
+        // Collision: slide along walls instead of walking through them. Try the full
+        // step, then each axis alone; only stop (clear the goal) if fully boxed in.
+        let chosen = match self.collision.read().unwrap().clone() {
+            None    => Some((full_n, full_e)),
+            Some(c) => slide_move(&c, gs.player_x, gs.player_y, gs.player_z, full_n, full_e, 2.0),
+        };
+        let (mn, me) = match chosen {
+            Some(v) => v,
+            None => {
+                eprintln!("NAV: boxed in by walls near ({:.1},{:.1}) — stopping",
+                          gs.player_x, gs.player_y);
                 gs.log_msg("zone", "Path blocked by a wall");
                 *self.goto_target.lock().unwrap() = None;
                 return;
             }
-        }
+        };
+
+        let nx      = gs.player_x + mn;
+        let ny      = gs.player_y + me;
+        let heading = me.atan2(mn).to_degrees().rem_euclid(360.0);
 
         self.send_position_update(stream, gs, nx, ny, nz, heading);
 
@@ -296,6 +322,33 @@ mod tests {
         assert_eq!(&p[148..msg_end], b"Hail, Guard Phaeton");
         assert_eq!(p[msg_end], 0, "message must be null-terminated");
         assert_eq!(p.len(), msg_end + 1);
+    }
+
+    fn wall_collision() -> crate::assets::Collision {
+        // Vertical wall at east=5, north [0,10], height [0,10]; libeq pos = [east,height,north].
+        let wall = crate::assets::MeshData {
+            positions: vec![[5.0, 0.0, 0.0], [5.0, 0.0, 10.0], [5.0, 10.0, 10.0], [5.0, 10.0, 0.0]],
+            normals: vec![[1.0, 0.0, 0.0]; 4],
+            uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            texture_name: None,
+            base_color: [1.0; 4],
+            center: [0.0, 0.0, 0.0],
+        };
+        crate::assets::Collision::build(
+            &crate::assets::ZoneAssets { meshes: vec![wall], textures: vec![] }, 4.0)
+    }
+
+    #[test]
+    fn slide_move_slides_along_wall_when_diagonal_blocked() {
+        let col = wall_collision();
+        // Player at east=3, north=5, stepping toward the wall (east +2) and north (+2).
+        // The diagonal hits the wall at east=5, so it should slide to north-only.
+        let r = slide_move(&col, 5.0, 3.0, 0.0, 2.0, 2.0, 2.0);
+        assert_eq!(r, Some((2.0, 0.0)), "should slide along north, dropping the blocked east");
+
+        // Moving away from the wall (east -2) is unobstructed → full move.
+        assert_eq!(slide_move(&col, 5.0, 3.0, 0.0, 2.0, -2.0, 2.0), Some((2.0, -2.0)));
     }
 
     #[test]
