@@ -298,7 +298,13 @@ impl App {
         let surface_config = wgpu::SurfaceConfiguration {
             usage:   wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             format,  width: size.width.max(1), height: size.height.max(1),
-            present_mode: wgpu::PresentMode::Fifo, desired_maximum_frame_latency: 2,
+            // AutoNoVsync avoids Wayland compositor vsync timeouts when the window
+            // is not actively composited (e.g. idle/minimized), which would cause
+            // surface.get_current_texture() to block and time out, breaking /frame captures.
+            present_mode: caps.present_modes.iter().copied()
+                .find(|&m| m == wgpu::PresentMode::Mailbox)
+                .unwrap_or(wgpu::PresentMode::AutoNoVsync),
+            desired_maximum_frame_latency: 2,
             alpha_mode: caps.alpha_modes[0], view_formats: vec![],
         };
         surface.configure(&device, &surface_config);
@@ -627,6 +633,7 @@ impl App {
                 surface.configure(&renderer.device, &renderer.surface_config);
                 return;
             }
+            Err(wgpu::SurfaceError::Timeout) => return, // compositor throttling; retry next frame
             Err(e) => { eprintln!("surface error: {e}"); return; }
         };
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
