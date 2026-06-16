@@ -279,7 +279,7 @@ pub fn draw_control_bar(
 pub fn draw_message_log(ctx: &egui::Context, scene: &SceneState) {
     let visible: Vec<_> = scene.messages.iter()
         // NPC dialogue has its own panel (draw_quest_dialogue); keep it out of here.
-        .filter(|m| m.kind != "npc" && m.timestamp.elapsed().as_secs() < 12)
+        .filter(|m| m.kind != "npc" && m.timestamp.elapsed().as_secs() < 30)
         .collect();
     if visible.is_empty() {
         return;

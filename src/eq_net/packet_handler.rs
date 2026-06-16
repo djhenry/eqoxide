@@ -240,13 +240,31 @@ fn apply_level_update(gs: &mut GameState, payload: &[u8]) {
 }
 
 fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
-    if payload.len() < 140 { return; }
+    // ChannelMessage_Struct: targetname[64] + sender[64] + language(u32) +
+    // chan_num(u32) + cm_unknown4[u32×2] + skill_in_language(u32) + message[var]
+    // message starts at byte 148, not 140.
+    if payload.len() < 149 { return; }
     let sender = String::from_utf8_lossy(&payload[64..128])
         .trim_end_matches('\0').to_string();
-    let msg = String::from_utf8_lossy(&payload[140..])
-        .trim_end_matches('\0').to_string();
-    if !sender.is_empty() {
-        gs.log_msg("chat", &format!("<{}> {}", sender, msg));
+    let chan_num = u32::from_le_bytes([payload[132], payload[133], payload[134], payload[135]]);
+    let msg = String::from_utf8_lossy(&payload[148..])
+        .trim_end_matches('\0')
+        .to_string();
+    if msg.is_empty() { return; }
+
+    match chan_num {
+        // Channel 3 = zone chat, 5 = OOC, 7 = shout, 8 = say (NPC dialogue)
+        3 | 5 | 7 | 8 if !sender.is_empty() => {
+            gs.log_msg("chat", &format!("<{}> {}", sender, msg));
+        }
+        3 | 5 | 7 => {
+            // Zone-wide broadcasts without a sender (server messages like "An earthquake strikes!")
+            gs.log_msg("zone", &msg);
+        }
+        _ if !sender.is_empty() => {
+            gs.log_msg("chat", &format!("<{}> {}", sender, msg));
+        }
+        _ => {}
     }
 }
 
