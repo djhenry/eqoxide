@@ -74,6 +74,51 @@ The combat log (kind="combat") is too large and obtrusive. Make it look like the
 - `STOP_DIST` reduced from 5.0 to 2.0 so navigator stops within melee range and sends correct z position for LOS check.
 - Log evidence: `Aiquestbot hits a_rodent014 for 1 damage`, `a_rodent014 hits Aiquestbot for 7 damage`, `Aiquestbot misses a_rodent014 (type=4)`, `*** You have been slain! ***`
 
+### [x] 6. Filter CombatRecord and debug messages from NPC Dialogue
+**Goal:** The "NPC Dialogue" window was showing EQEmu server debug output like `[CombatRecord] [Stop] [Summary] Mob [a sewer rat] [Received] DPS [11] ...`.  
+**Done:** 2026-06-16 — Extended `is_debug_spam()` in `src/eq_net/packet_handler.rs` to also filter `[CombatRecord]`, `[EVENT_KILLED_MERIT]`, and `[EVENT_ITEM_GIVEN]` messages. These are server-side GM analytics, not player-facing dialogue. Verified: after combat, NPC Dialogue window stays hidden and only appears for real NPC speech/emotes.
+
+### [ ] 7. Auto-loot corpses after combat
+**Goal:** After killing a mob, automatically (or via button) loot all coins and items from the corpse.  
+**Protocol:**
+- Server sends `OP_BecomeCorpse` (0x4DBC from patch) when a mob dies and leaves a corpse; payload has the new corpse spawn_id  
+- Client sends `OP_LootRequest` (0x6f90) with the corpse spawn_id to open loot  
+- Server replies `OP_MoneyOnCorpse` (0x7fe4) with coin amounts (20 bytes: MoneyOnCorpse_S)
+- Server sends `OP_LootItem` (0x7081) for each lootable item  
+- Client sends `OP_LootItem` back to take each item, then `OP_EndLootRequest` (0x2316) when done  
+**Steps:**
+1. Add OP code constants to `src/eq_net/protocol.rs`
+2. In `packet_handler.rs`, handle `OP_BecomeCorpse` → store corpse spawn_ids in GameState  
+3. Add `OP_MoneyOnCorpse` handler → log coin pickup to "combat" message log  
+4. Add auto-loot: after `OP_BecomeCorpse`, send `OP_LootRequest` → then `OP_LootItem` for each item → `OP_EndLootRequest`  
+5. Log loot results in HUD message log (kind="loot")  
+**Key files:** `src/eq_net/protocol.rs`, `src/eq_net/packet_handler.rs`, `src/eq_net/gameplay.rs`  
+**Acceptance:** After killing a mob, coins and items automatically looted; loot summary appears in message log.
+
+### [ ] 8. HP/Mana regeneration — verify real-time updates between fights
+**Goal:** Confirm the HP and Mana bars update correctly as the player regenerates between fights, and verify death/corpse recovery works (player is sent to bind on death).  
+**Steps:**
+1. Enter combat, get hurt, disengage; watch HP% in HUD — does it count up?  
+2. Verify `OP_HP_UPDATE` packets arrive while regenerating (grep log for hp_update eprintln calls)  
+3. If HP doesn't regen, add an eprintln in `apply_hp_update` and check it's being called  
+4. After dying (`*** You have been slain! ***`), verify `OP_ZONE_PLAYER_TO_BIND` arrives and player reconnects to their bind point  
+5. Add handling if missing: on death, reset `auto_attack = false`; on `OP_ZONE_PLAYER_TO_BIND`, let it trigger a zone change (same as normal zone transition)  
+**Key files:** `src/eq_net/packet_handler.rs` (`apply_hp_update`, `apply_death`), `src/eq_net/gameplay.rs`  
+**Acceptance:** HP bar visibly increases between fights; dying sends player to bind point automatically.
+
+### [ ] 9. Minimap: color-code NPC dots by faction/type
+**Goal:** On the minimap, NPCs currently all appear as the same orange dot. Differentiate:
+- Green: friendly (con = ally/warmly/amiably) or PC
+- Orange: neutral (indifferent/apprehensive)
+- Red: hostile (dubious/threatening/KOS) or current combat target  
+**Steps:**
+1. In `src/hud.rs` `draw_minimap`, find where entity dots are painted (the orange dot loop)
+2. Pass `target_id` and entity faction info to the minimap dot renderer
+3. Color dots by: `is_target` = bright red, hostile = red, friendly = green, neutral = orange  
+4. Test by considering a few different NPCs and watching minimap dot colors change  
+**Key files:** `src/hud.rs` (`draw_minimap`), `src/game_state.rs` (Entity)  
+**Acceptance:** Different NPC types show different dot colors on the minimap; current target is bright red.
+
 ---
 
 ## Completed
@@ -83,10 +128,15 @@ The combat log (kind="combat") is too large and obtrusive. Make it look like the
 - Task 3: NPC spawn rendering fixed (2026-06-15)
 - Task 5: Melee combat verified working (2026-06-16)
 - Task 5a: Left-click targeting verified working (2026-06-16)
+- Task 6: CombatRecord debug messages filtered from NPC Dialogue (2026-06-16)
 
 ---
 
 ## Run Notes
+
+**2026-06-16 — CombatRecord filter + 4 new tasks added:**
+Extended `is_debug_spam()` to filter `[CombatRecord]`, `[EVENT_KILLED_MERIT]`, `[EVENT_ITEM_GIVEN]`.
+Added tasks 7 (auto-loot), 8 (HP regen verify), 9 (minimap color coding) to task queue.
 
 **2026-06-16 — Left-click targeting + frame capture fix:**
 Task 5a was already implemented in the previous session. Verified by code review and HTTP API test.

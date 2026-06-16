@@ -250,11 +250,17 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
     }
 }
 
-/// EQEmu sends GM-flagged accounts verbose quest/loot debug (e.g. each NPC's loot table:
-/// "[Loot] [AddLootDrop] NPC [...] Item (...) ... trivial min/max [0/0] npc min/max [0/0]").
-/// It floods the NPC dialogue panel and isn't player-facing, so drop it.
+/// EQEmu sends GM-flagged accounts verbose server-side debug messages that are not
+/// player-facing. These flood the NPC Dialogue panel and should be silently dropped.
+/// Examples: "[Loot] [AddLootDrop] ...", "[CombatRecord] [Stop] [Summary] ...",
+/// "[EVENT_KILLED_MERIT] ..." verbose combat/quest analytics.
 fn is_debug_spam(msg: &str) -> bool {
+    // Loot table debug
     msg.contains("AddLootDrop") || msg.contains("min/max") || msg.contains("[Loot]")
+    // Combat record analytics sent to GM accounts after each fight
+    || msg.contains("[CombatRecord]")
+    // Kill/event merit debug records
+    || msg.contains("[EVENT_KILLED_MERIT]") || msg.contains("[EVENT_ITEM_GIVEN]")
 }
 
 /// OP_FormattedMessage — eqstr-table text with arguments. Layout: unknown0(u32) +
