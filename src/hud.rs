@@ -53,8 +53,9 @@ pub fn draw_fps(ctx: &egui::Context, fps: f32) {
 }
 
 pub fn draw_hud(ctx: &egui::Context, scene: &SceneState, bot_id: &str) {
-    egui::Window::new(format!("EQ Observer — {bot_id}"))
+    egui::Window::new("##hud")
         .anchor(egui::Align2::LEFT_BOTTOM, [0.0, 0.0])
+        .title_bar(false)
         .resizable(false)
         .collapsible(false)
         .min_width(640.0)
@@ -278,7 +279,7 @@ pub fn draw_control_bar(
 pub fn draw_message_log(ctx: &egui::Context, scene: &SceneState) {
     let visible: Vec<_> = scene.messages.iter()
         // NPC dialogue has its own panel (draw_quest_dialogue); keep it out of here.
-        .filter(|m| m.kind != "npc" && m.timestamp.elapsed().as_secs() < 20)
+        .filter(|m| m.kind != "npc" && m.timestamp.elapsed().as_secs() < 12)
         .collect();
     if visible.is_empty() {
         return;
@@ -286,24 +287,25 @@ pub fn draw_message_log(ctx: &egui::Context, scene: &SceneState) {
 
     egui::Window::new("##msglog")
         .title_bar(false)
-        .anchor(egui::Align2::LEFT_BOTTOM, [0.0, -80.0])  // just above the HUD
+        .anchor(egui::Align2::LEFT_BOTTOM, [0.0, -60.0])  // just above the HUD
         .resizable(false)
         .collapsible(false)
         .min_width(480.0)
         .max_width(640.0)
         .frame(egui::Frame::none()
-            .fill(egui::Color32::from_black_alpha(140))
-            .inner_margin(egui::Margin::same(6.0)))
+            .fill(egui::Color32::TRANSPARENT)
+            .inner_margin(egui::Margin::same(4.0)))
         .show(ctx, |ui| {
+            ui.spacing_mut().item_spacing.y = 1.0;
             for entry in &visible {
                 let color = match entry.kind.as_str() {
-                    "combat"  => egui::Color32::from_rgb(255, 90,  90),
+                    "combat"  => egui::Color32::from_rgb(220, 110, 110),
                     "zone"    => egui::Color32::from_rgb(160, 160, 160),
                     "exp"     => egui::Color32::from_rgb(220, 175,  40),
                     "chat"    => egui::Color32::from_rgb(210, 210, 255),
                     _         => egui::Color32::from_rgb(200, 200, 200),
                 };
-                ui.label(egui::RichText::new(&entry.text).size(12.0).color(color));
+                ui.label(egui::RichText::new(&entry.text).size(11.0).color(color));
             }
         });
 }

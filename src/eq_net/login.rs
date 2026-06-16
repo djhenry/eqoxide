@@ -18,7 +18,7 @@ use crate::eq_net::packet_handler::apply_packet;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::GameState;
-use crate::http::{EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, ZoneCrossReq, ZonePoints};
+use crate::http::{AttackReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, ZoneCrossReq, ZonePoints};
 
 type DesCbcEnc = Encryptor<Des>;
 type DesCbcDec = Decryptor<Des>;
@@ -67,11 +67,13 @@ pub async fn run_login_flow(
     max_retries:      u32,
     goto_target:      GotoTarget,
     entity_positions: EntityPositions,
+    entity_ids:       EntityIds,
     zone_points:      ZonePoints,
     zone_cross:       ZoneCrossReq,
     hail:             HailReq,
     say:              SayReq,
     target:           TargetReq,
+    attack:           AttackReq,
     collision:        crate::assets::SharedCollision,
 ) -> Result<(), String> {
     for attempt in 1..=max_retries {
@@ -85,8 +87,10 @@ pub async fn run_login_flow(
                 // Seed /entities map with everything discovered during login.
                 {
                     let mut map = entity_positions.lock().unwrap();
-                    for e in gs.entities.values() {
+                    let mut ids = entity_ids.lock().unwrap();
+                    for (&id, e) in &gs.entities {
                         map.insert(e.name.clone(), (e.x, e.y, e.z));
+                        ids.insert(e.name.clone(), id);
                     }
                     eprintln!("NAV: entity map seeded with {} entities", map.len());
                 }
@@ -96,7 +100,7 @@ pub async fn run_login_flow(
                     eprintln!("NAV: {} zone points seeded", gs.zone_points.len());
                 }
                 let char_name = config.character_name.clone();
-                let navigator = Navigator::new(goto_target, entity_positions, zone_points, zone_cross, hail, say, target, collision);
+                let navigator = Navigator::new(goto_target, entity_positions, entity_ids, zone_points, zone_cross, hail, say, target, attack, collision);
                 run_gameplay_phase(stream, net_rx, app_tx, gs, char_name, navigator, world_creds).await;
                 return Ok(());
             }
@@ -158,6 +162,8 @@ async fn run_login_phase(
                     stream = EqStream::connect(&host, port, net_tx.clone())
                         .await
                         .map_err(|e| format!("Zone connection failed: {e}"))?;
+                    // Clear stale entities before zone entry so OP_ZONE_SPAWNS repopulates fresh.
+                    gs.entities.clear();
                     proto.on_zone_connected(&mut stream);
                 }
             }
@@ -232,7 +238,7 @@ impl<'a> LoginProtocol<'a> {
     }
 
     fn is_timed_out(&self) -> bool {
-        self.start_time.elapsed() > Duration::from_secs(60)
+        self.start_time.elapsed() > Duration::from_secs(120)
     }
 
     fn on_world_connected(&self, stream: &mut EqStream) {

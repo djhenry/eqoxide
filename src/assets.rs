@@ -144,34 +144,21 @@ impl Collision {
 
     /// Sample the floor height directly beneath `(east, north)`.
     ///
-    /// Returns the highest triangle the downward ray passes through that sits at or
-    /// (just) below `fallback`. Triangle-based, so vertical walls — whose XY
-    /// projection has ~zero area — can't pull the result up to wall height.
+    /// Casts a true downward ray using Möller–Trumbore so only surfaces *below*
+    /// the player are considered. Surfaces above the ray origin (bridges, balcony
+    /// undersides) have negative t and are never returned. Vertical walls produce
+    /// det ≈ 0 and are skipped, so standing next to a wall doesn't pull the floor
+    /// up to wall height.
     pub fn floor_z(&self, east: f32, north: f32, fallback: f32) -> f32 {
         if self.cols == 0 { return fallback; }
-        let tol = 2.0_f32;
-        let (c0, c1, r0, r1) = self.cell_range(east, north, east, north);
-        let mut best = f32::NEG_INFINITY;
-        for r in r0..=r1 {
-            for c in c0..=c1 {
-                for &ti in &self.cells[r * self.cols + c] {
-                    let t = &self.tris[ti as usize];
-                    let (ax, ay, az) = (t[0][0], t[0][1], t[0][2]);
-                    let (bx, by, bz) = (t[1][0], t[1][1], t[1][2]);
-                    let (cx, cy, cz) = (t[2][0], t[2][1], t[2][2]);
-                    let denom = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy);
-                    if denom.abs() < 1e-4 { continue; }
-                    let wa = ((by - cy) * (east - cx) + (cx - bx) * (north - cy)) / denom;
-                    let wb = ((cy - ay) * (east - cx) + (ax - cx) * (north - cy)) / denom;
-                    let wc = 1.0 - wa - wb;
-                    let edge = -1e-3;
-                    if wa < edge || wb < edge || wc < edge { continue; }
-                    let h = wa * az + wb * bz + wc * cz;
-                    if h <= fallback + tol && h > best { best = h; }
-                }
-            }
+        // Start 2 units above the player (absorbs server-z / visual-z discrepancy)
+        // and cast 100 units straight down — ample range for any EQ zone geometry.
+        let ray_start = [east, north, fallback + 2.0];
+        let ray_end   = [east, north, fallback - 100.0];
+        match self.nearest_hit_t(ray_start, ray_end) {
+            Some(t) => ray_start[2] + t * (ray_end[2] - ray_start[2]),
+            None    => fallback,
         }
-        if best == f32::NEG_INFINITY { fallback } else { best }
     }
 
     /// Nearest geometry hit along segment `from → to`, as fraction `t ∈ (0,1]`.

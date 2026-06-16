@@ -7,7 +7,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::GameState;
-use crate::http::{EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, ZoneCrossReq, ZonePoints};
+use crate::http::{AttackReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, ZoneCrossReq, ZonePoints};
 
 /// OP_TargetCommand payload: ClientTarget_Struct = just the target spawn id (u32).
 pub fn build_target_packet(spawn_id: u32) -> Vec<u8> {
@@ -72,11 +72,13 @@ pub fn slide_move(
 pub struct Navigator {
     goto_target:      GotoTarget,
     entity_positions: EntityPositions,
+    entity_ids:       EntityIds,
     zone_points:      ZonePoints,
     zone_cross:       ZoneCrossReq,
     hail:             HailReq,
     say:              SayReq,
     target:           TargetReq,
+    attack:           AttackReq,
     collision:        crate::assets::SharedCollision,
     position_seq:     u16,
     last_tick:        Instant,
@@ -86,21 +88,25 @@ impl Navigator {
     pub fn new(
         goto_target:      GotoTarget,
         entity_positions: EntityPositions,
+        entity_ids:       EntityIds,
         zone_points:      ZonePoints,
         zone_cross:       ZoneCrossReq,
         hail:             HailReq,
         say:              SayReq,
         target:           TargetReq,
+        attack:           AttackReq,
         collision:        crate::assets::SharedCollision,
     ) -> Self {
         Navigator {
             goto_target,
             entity_positions,
+            entity_ids,
             zone_points,
             zone_cross,
             hail,
             say,
             target,
+            attack,
             collision,
             position_seq: 0,
             last_tick: Instant::now(),
@@ -111,8 +117,13 @@ impl Navigator {
     /// (used by the HTTP /entities endpoint and /goto by-name lookup).
     pub fn sync_entities(&self, gs: &GameState) {
         let mut map = self.entity_positions.lock().unwrap();
-        for e in gs.entities.values() {
+        let mut ids = self.entity_ids.lock().unwrap();
+        // Full replace: clear stale entries so positions reflect the current zone only.
+        map.clear();
+        ids.clear();
+        for (&id, e) in &gs.entities {
             map.insert(e.name.clone(), (e.x, e.y, e.z));
+            ids.insert(e.name.clone(), id);
         }
     }
 
@@ -137,6 +148,36 @@ impl Navigator {
             if *flag { *flag = false; true } else { false }
         };
         if do_cross {
+            // Teleport to the nearest valid zone exit before sending OP_ZONE_CHANGE.
+            // This ensures the server finds a zone line in the position we report and
+            // routes us to the correct destination zone rather than keeping us here.
+            // Pick the zone_id=45 exit at (-175, 147) — this spawns us near the north-west
+            // part of qeynos where rodents and city NPCs are clustered. Fall back to
+            // any zone_id=45 exit, then zone_id=2, then any non-zero zone.
+            let exit_pos = {
+                let zps = self.zone_points.lock().unwrap();
+                zps.iter()
+                    .find(|zp| zp.zone_id == 45 && zp.server_x < 0.0)
+                    .or_else(|| zps.iter().find(|zp| zp.zone_id == 45))
+                    .or_else(|| zps.iter().find(|zp| zp.zone_id == 2))
+                    .or_else(|| zps.iter().find(|zp| zp.zone_id != 0))
+                    .map(|zp| (zp.zone_id, zp.server_x, zp.server_y, zp.server_z))
+            };
+            if let Some((dest_zone, tx, ty, tz)) = exit_pos {
+                eprintln!("zone_cross: warping to exit for zone_id={dest_zone} ({:.1},{:.1},{:.1})", tx, ty, tz);
+                let old_x = gs.player_x;
+                let old_y = gs.player_y;
+                let old_z = gs.player_z;
+                gs.player_x = tx;
+                gs.player_y = ty;
+                gs.player_z = tz;
+                // Send position update so server sees us at the zone exit.
+                let _ = app_tx.send(make_position_packet(gs.player_id, tx, ty, tz));
+                self.send_position_update(stream, gs, tx, ty, tz, 0.0);
+                // Restore original position if server rejects the warp; it will
+                // rubber-band us back anyway, so gs will be corrected by server reply.
+                let _ = (old_x, old_y, old_z); // suppress unused warning
+            }
             self.send_zone_change_packet(stream, gs);
         }
 
@@ -167,9 +208,18 @@ impl Navigator {
             if let Some(e) = gs.entities.get(&id) {
                 gs.target_name = Some(e.name.clone());
             }
-            stream.send_app_packet(OP_TARGET_COMMAND, &build_target_packet(id));
+            stream.send_app_packet(OP_TARGET_MOUSE, &build_target_packet(id));
             stream.send_app_packet(OP_CONSIDER, &build_consider_packet(gs.player_id, id));
             eprintln!("EQ: target spawn_id={} + consider", id);
+        }
+
+        // Check attack request — send OP_AUTO_ATTACK(1) to start, OP_AUTO_ATTACK(0) to stop.
+        // Server expects exactly 4 bytes; byte[0]=1 enables, byte[0]=0 disables.
+        let attack_req = self.attack.lock().unwrap().take();
+        if let Some(on) = attack_req {
+            let payload = [if on { 1u8 } else { 0u8 }, 0, 0, 0];
+            stream.send_app_packet(OP_AUTO_ATTACK, &payload);
+            eprintln!("EQ: auto-attack {}", if on { "ON" } else { "OFF" });
         }
 
         if self.last_tick.elapsed().as_millis() < 150 {
@@ -186,22 +236,37 @@ impl Navigator {
         let dy   = target.1 - gs.player_y;
         let dist = (dx * dx + dy * dy).sqrt();
 
-        if dist <= 10.0 {
+        // Stop when within 2 units of target. Melee range is ~14 units so we stop well
+        // within melee range, ensuring LOS succeeds even with nearby geometry.
+        const STOP_DIST: f32 = 2.0;
+        if dist <= STOP_DIST {
             eprintln!("NAV: arrived at ({:.1},{:.1})", target.0, target.1);
             *self.goto_target.lock().unwrap() = None;
+            // Send a final stationary position update so the server has a fresh position
+            // facing the target (heading toward it). Without this, the last packet may
+            // have had movement deltas and the server position can be stale.
+            // atan2(east_delta, north_delta): dx=east, dy=north. EQ 0=North.
+            let hdg = dx.atan2(dy).to_degrees().rem_euclid(360.0);
+            self.send_position_update(stream, gs, gs.player_x, gs.player_y, gs.player_z, hdg);
             return;
         }
 
-        let step   = 15.0_f32.min(dist);
+        // Cap step so we never overshoot past STOP_DIST from the target.
+        let step   = 10.0_f32.min(dist - STOP_DIST);
         let full_n = dx / dist * step; // north component toward goal
         let full_e = dy / dist * step; // east component toward goal
-        let nz     = gs.player_z;
+        // Use the z from goto_target rather than the stale spawn z stored in gs.player_z.
+        // WASD sets goto_target.2 to the visual floor height (grounded z from the app's
+        // ground snap), so this keeps the server and client z in sync and prevents the
+        // server from rubber-banding the player back when it sees them at the wrong height.
+        let nz = target.2;
 
         // Collision: slide along walls instead of walking through them. Try the full
         // step, then each axis alone; only stop (clear the goal) if fully boxed in.
+        // Use nz (correct floor z) not gs.player_z (stale spawn z) for chest height.
         let chosen = match self.collision.read().unwrap().clone() {
             None    => Some((full_n, full_e)),
-            Some(c) => slide_move(&c, gs.player_x, gs.player_y, gs.player_z, full_n, full_e, 2.0),
+            Some(c) => slide_move(&c, gs.player_x, gs.player_y, nz, full_n, full_e, 2.0),
         };
         let (mn, me) = match chosen {
             Some(v) => v,
@@ -216,12 +281,15 @@ impl Navigator {
 
         let nx      = gs.player_x + mn;
         let ny      = gs.player_y + me;
-        let heading = me.atan2(mn).to_degrees().rem_euclid(360.0);
+        // mn = east_delta, me = north_delta. EQ heading: 0=North, 90=East.
+        // atan2(east, north) gives 0 when moving north, 90 when moving east.
+        let heading = mn.atan2(me).to_degrees().rem_euclid(360.0);
 
         self.send_position_update(stream, gs, nx, ny, nz, heading);
 
         gs.player_x       = nx;
         gs.player_y       = ny;
+        gs.player_z       = nz;
         gs.player_heading = heading;
 
         // Synthetic server-side position packet so the render camera follows.
@@ -240,22 +308,26 @@ impl Navigator {
         let dz = z - gs.player_z;
         let moving = dx != 0.0 || dy != 0.0 || dz != 0.0;
         let anim: i32 = if moving { 1 } else { 0 };
-        // EQ uses 0-511 heading units
-        let eq_heading = ((heading * 512.0 / 360.0) as u16) & 0x1FF;
+        // EQ12 heading: 0-2047 per circle (EQEmu divides by 4 via EQ12toFloat → GetHeading 0-511)
+        let eq_heading = (heading * 2048.0 / 360.0) as u16 & 0x7FF;
 
         let mut buf = [0u8; 36];
         buf[0..2].copy_from_slice(&(gs.player_id as u16).to_le_bytes());
         buf[2..4].copy_from_slice(&self.position_seq.to_le_bytes());
         self.position_seq = self.position_seq.wrapping_add(1);
-        buf[4..8].copy_from_slice(&y.to_le_bytes());
+        // Titanium struct layout: y_pos=north=entity.y, x_pos=east=entity.x.
+        // Our x param = entity.x = GetX() = east; y param = entity.y = GetY() = north.
+        // delta_x = east delta = dx, delta_y = north delta = dy.
+        buf[4..8].copy_from_slice(&y.to_le_bytes());   // y_pos = north
         buf[8..12].copy_from_slice(&dz.to_le_bytes());
-        buf[12..16].copy_from_slice(&dx.to_le_bytes());
-        buf[16..20].copy_from_slice(&dy.to_le_bytes());
+        buf[12..16].copy_from_slice(&dx.to_le_bytes()); // delta_x = east_delta
+        buf[16..20].copy_from_slice(&dy.to_le_bytes()); // delta_y = north_delta
         buf[20..24].copy_from_slice(&anim.to_le_bytes());
-        buf[24..28].copy_from_slice(&x.to_le_bytes());
+        buf[24..28].copy_from_slice(&x.to_le_bytes());  // x_pos = east
         buf[28..32].copy_from_slice(&z.to_le_bytes());
         buf[32..34].copy_from_slice(&eq_heading.to_le_bytes());
 
+        eprintln!("POS: x={:.1} y={:.1} z={:.1} hdg={:.0} eq12_hdg={} anim={}", x, y, z, heading, eq_heading, anim);
         stream.send_app_packet(OP_CLIENT_UPDATE, &buf);
     }
 
@@ -271,10 +343,9 @@ impl Navigator {
         buf[64..66].copy_from_slice(&gs.zone_id.to_le_bytes());
         // instance_id = 0
         buf[66..68].copy_from_slice(&0u16.to_le_bytes());
-        // y = player_y (east/west = server_y)
-        buf[68..72].copy_from_slice(&gs.player_y.to_le_bytes());
-        // x = player_x (north/south = server_x)
-        buf[72..76].copy_from_slice(&gs.player_x.to_le_bytes());
+        // EQ ZoneChange y = north = server_x; x = east = server_y
+        buf[68..72].copy_from_slice(&gs.player_x.to_le_bytes());
+        buf[72..76].copy_from_slice(&gs.player_y.to_le_bytes());
         // z
         buf[76..80].copy_from_slice(&gs.player_z.to_le_bytes());
         // zone_reason = 0 (normal zone line crossing)

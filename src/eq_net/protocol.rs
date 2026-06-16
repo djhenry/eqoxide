@@ -91,6 +91,7 @@ pub const OP_DAMAGE: u16 = 0x5c78;
 pub const OP_AUTO_ATTACK: u16 = 0x5e55;
 pub const OP_AUTO_ATTACK2: u16 = 0x0701;
 pub const OP_TARGET_COMMAND: u16 = 0x1477;
+pub const OP_TARGET_MOUSE: u16   = 0x6c47; // sets server-side m_Target for combat
 pub const OP_CONSIDER: u16 = 0x65ca;
 
 // ── Gameplay: progression ─────────────────────────────────────────────────
@@ -303,7 +304,7 @@ pub fn eq_race_to_code(race_id: u32) -> &'static str {
 
 // ── Struct sizes ───────────────────────────────────────────────────────────
 
-pub const SIZE_SPAWN: usize = 252;       // Spawn_S
+pub const SIZE_SPAWN: usize = std::mem::size_of::<Spawn_S>(); // Titanium Spawn_Struct = 385 bytes
 pub const SIZE_NEW_ZONE: usize = 688;    // NewZone_S
 pub const SIZE_ZONE_SERVER_INFO: usize = 130; // ZoneServerInfo_S (ip[128] + port[2])
 pub const SIZE_CLIENT_ZONE_ENTRY: usize = 68; // ClientZoneEntry_S
@@ -491,10 +492,11 @@ pub struct Spawn_S {
     pub equip_chest2: u8,
     pub spawnId: u32,
     pub bounding_radius: f32,
-    pub IsMercenary: u8,
     pub equipment_tint: [u8; 36],
     pub lfg: u8,
 }
+
+const _: () = assert!(std::mem::size_of::<Spawn_S>() == 385, "Spawn_S must be 385 bytes (Titanium Spawn_Struct)");
 
 impl Spawn_S {
     pub fn name_str(&self) -> String {

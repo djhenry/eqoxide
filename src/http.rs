@@ -22,6 +22,9 @@ pub type GotoTarget = Arc<Mutex<Option<(f32, f32, f32)>>>;
 /// Live entity name → (x, y, z) map, updated by login.rs as packets arrive.
 pub type EntityPositions = Arc<Mutex<HashMap<String, (f32, f32, f32)>>>;
 
+/// Live entity name → spawn_id map (same keys as EntityPositions).
+pub type EntityIds = Arc<Mutex<HashMap<String, u32>>>;
+
 /// Zone exit points received in OP_SEND_ZONE_POINTS, exposed via GET /zone_points.
 pub type ZonePoints = Arc<Mutex<Vec<crate::game_state::ZonePoint>>>;
 
@@ -40,6 +43,10 @@ pub type SayReq = Arc<Mutex<Option<String>>>;
 /// thread reads it once, sends OP_TargetCommand + OP_Consider.
 pub type TargetReq = Arc<Mutex<Option<u32>>>;
 
+/// Auto-attack toggle — set to true by POST /attack, false by DELETE /attack.
+/// Nav thread reads it and sends OP_AUTO_ATTACK(1) or OP_AUTO_ATTACK(0).
+pub type AttackReq = Arc<Mutex<Option<bool>>>;
+
 /// Current zone name and id, updated on every OP_NEW_ZONE.
 pub type ZoneInfo = Arc<Mutex<(String, u16)>>;
 
@@ -50,11 +57,13 @@ struct HttpState {
     frame_req:        FrameReq,
     goto_target:      GotoTarget,
     entity_positions: EntityPositions,
+    entity_ids:       EntityIds,
     zone_points:      ZonePoints,
     zone_cross:       ZoneCrossReq,
     hail:             HailReq,
     say:              SayReq,
     target:           TargetReq,
+    attack:           AttackReq,
 }
 
 #[derive(serde::Deserialize)]
@@ -84,17 +93,19 @@ pub fn spawn_camera_server(
     frame_req:        FrameReq,
     goto_target:      GotoTarget,
     entity_positions: EntityPositions,
+    entity_ids:       EntityIds,
     zone_points:      ZonePoints,
     zone_cross:       ZoneCrossReq,
     hail:             HailReq,
     say:              SayReq,
     target:           TargetReq,
+    attack:           AttackReq,
     port:             u16,
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, zone_points, zone_cross, hail, say, target };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, hail, say, target, attack };
             let app = Router::new()
                 .route("/camera", get(get_camera).post(post_camera))
                 .route("/camera/reset", post(post_camera_reset))
@@ -106,6 +117,8 @@ pub fn spawn_camera_server(
                 .route("/hail", post(post_hail))
                 .route("/say", post(post_say))
                 .route("/target", post(post_target))
+                .route("/target/name", post(post_target_name))
+                .route("/attack", post(post_attack_on).delete(post_attack_off))
                 .with_state(state);
             let addr = format!("127.0.0.1:{port}");
             let listener = match tokio::net::TcpListener::bind(&addr).await {
@@ -325,6 +338,50 @@ async fn post_target(
     *s.target.lock().unwrap() = Some(id);
     eprintln!("target: queued spawn_id={}", id);
     (StatusCode::OK, format!("targeting spawn {}", id))
+}
+
+#[derive(serde::Deserialize)]
+struct TargetNameBody {
+    name: String,
+}
+
+/// POST /target/name {"name":"a rat"} — target a mob by (fuzzy) name. The nav thread
+/// resolves the name to a spawn_id via gs.entities and sends OP_TargetCommand.
+async fn post_target_name(
+    State(s): State<HttpState>,
+    body: Result<Json<TargetNameBody>, axum::extract::rejection::JsonRejection>,
+) -> (StatusCode, String) {
+    let name = match body {
+        Ok(Json(b)) => b.name,
+        Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"name\":\"...\"}".into()),
+    };
+    let ids = s.entity_ids.lock().unwrap();
+    let nl = name.to_lowercase();
+    let found = ids.iter()
+        .find(|(k, _)| clean_entity_name(k).to_lowercase().contains(&nl) || k.to_lowercase().contains(&nl))
+        .map(|(k, &id)| (k.clone(), id));
+    match found {
+        Some((key, id)) => {
+            *s.target.lock().unwrap() = Some(id);
+            eprintln!("target_name: {:?} → spawn_id={}", key, id);
+            (StatusCode::OK, format!("targeting {} (spawn_id={})", clean_entity_name(&key), id))
+        }
+        None => (StatusCode::NOT_FOUND, format!("no entity matching {:?}", name)),
+    }
+}
+
+/// POST /attack — enable auto-attack (sends OP_AUTO_ATTACK 1).
+async fn post_attack_on(State(s): State<HttpState>) -> (StatusCode, String) {
+    *s.attack.lock().unwrap() = Some(true);
+    eprintln!("attack: queued auto-attack ON");
+    (StatusCode::OK, "auto-attack ON".into())
+}
+
+/// DELETE /attack — disable auto-attack (sends OP_AUTO_ATTACK 0).
+async fn post_attack_off(State(s): State<HttpState>) -> (StatusCode, String) {
+    *s.attack.lock().unwrap() = Some(false);
+    eprintln!("attack: queued auto-attack OFF");
+    (StatusCode::OK, "auto-attack OFF".into())
 }
 
 /// GET /frame — returns the current rendered frame as a PNG.

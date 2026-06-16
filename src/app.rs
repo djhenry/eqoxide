@@ -9,6 +9,7 @@ use winit::{
     window::{Window, WindowAttributes},
 };
 
+use glam::Vec4Swizzles as _;
 use crate::camera_state::{lerp3, lerp_angle, CameraCmd, CameraSnapshot, CameraState};
 use crate::eq_net::packet_handler::apply_packet;
 use crate::eq_net::transport::AppPacket;
@@ -67,6 +68,13 @@ pub struct App {
     // Mouse
     drag_active:  bool,
     last_cursor:  winit::dpi::PhysicalPosition<f64>,
+    /// Cursor position when LMB was pressed — used to distinguish click from drag.
+    click_start:  Option<winit::dpi::PhysicalPosition<f64>>,
+    /// Cached view-projection matrix from last render frame, for 3D picking.
+    pick_view_proj: [[f32; 4]; 4],
+    pick_cam_eye:   [f32; 3],
+    pick_screen_w:  u32,
+    pick_screen_h:  u32,
     // EQ state
     game_state:   GameState,
     scene:        SceneState,
@@ -81,12 +89,20 @@ pub struct App {
     /// Cache of the last terrain sample: (east, north, height). Avoids re-querying
     /// the grid each frame when the player hasn't moved horizontally.
     ground_cache: (f32, f32, f32),
+    /// Most recent floor_z result. Used as the anchor for the next frame's floor_z query
+    /// so the player's visual height is self-consistent and can't be pulled up to a bridge
+    /// or ceiling just because the server placed them there.
+    last_grounded_z: f32,
     /// Render position last frame [east, north, z], used to derive facing from motion.
     prev_render_pos: [f32; 3],
     /// Where the player should face (EQ degrees, 0=north) — set from movement direction.
     heading_target:  f32,
     /// Smoothed facing actually used for rendering and camera-behind placement.
     visual_heading:  f32,
+    /// Vertical velocity in EQ units/s (positive = upward). Used for jump and fall physics.
+    vert_vel:   f32,
+    /// True when the player's feet are resting on solid geometry.
+    on_ground:  bool,
 }
 
 impl App {
@@ -126,12 +142,25 @@ impl App {
             keys_held: std::collections::HashSet::new(), override_pos: None, goto_target,
             hail, say, target, say_buffer: String::new(),
             drag_active: false, last_cursor: winit::dpi::PhysicalPosition::new(0.0, 0.0),
+            click_start: None,
+            pick_view_proj: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            pick_cam_eye: [0.0; 3],
+            pick_screen_w: 800,
+            pick_screen_h: 600,
             game_state, scene: SceneState::default(), app_rx, frame_req,
             collision: None, shared_collision,
             ground_cache: (f32::NAN, f32::NAN, 0.0),
+            last_grounded_z: 0.0,
             prev_render_pos: [0.0, 0.0, 0.0],
             heading_target:  0.0,
             visual_heading:  0.0,
+            vert_vel:  0.0,
+            on_ground: true,
         }
     }
 
@@ -141,15 +170,67 @@ impl App {
     fn ground_z(&mut self, east: f32, north: f32, fallback: f32) -> f32 {
         let Some(col) = self.collision.as_deref() else { return fallback; };
         let (ce, cn, ch) = self.ground_cache;
-        if (ce - east).abs() < 2.0 && (cn - north).abs() < 2.0 {
+        // Invalidate on horizontal movement OR when the anchor z shifted more than 3 units
+        // from the cached height (player changed levels without moving much horizontally).
+        if (ce - east).abs() < 2.0 && (cn - north).abs() < 2.0 && (ch - fallback).abs() < 3.0 {
             return ch;
         }
-        // floor_z returns the highest floor triangle beneath (east, north) at or below
-        // `fallback`. A floating player sits *above* the street, so the floor qualifies
-        // and we snap down to it; a correctly-placed player is unchanged.
         let h = col.floor_z(east, north, fallback);
         self.ground_cache = (east, north, h);
         h
+    }
+
+    /// Cast a ray from the camera through screen pixel `cursor` and return the
+    /// spawn_id of the closest entity whose bounding sphere it intersects.
+    fn pick_at(&self, cursor: winit::dpi::PhysicalPosition<f64>) -> Option<u32> {
+        let w = self.pick_screen_w as f32;
+        let h = self.pick_screen_h as f32;
+        if w < 1.0 || h < 1.0 { return None; }
+
+        // Convert cursor to NDC [-1, 1]  (Y flipped: screen-top = NDC +1)
+        let ndc_x =  2.0 * cursor.x as f32 / w - 1.0;
+        let ndc_y = -2.0 * cursor.y as f32 / h + 1.0;
+
+        // Unproject through the inverse VP to get near/far world points.
+        // WGPU depth range is [0, 1]; NDC z=0 = near plane, z=1 = far plane.
+        let vp = glam::Mat4::from_cols_array_2d(&self.pick_view_proj);
+        if vp.determinant().abs() < 1e-9 { return None; }
+        let inv = vp.inverse();
+
+        let near_h = inv * glam::Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
+        let far_h  = inv * glam::Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
+        if near_h.w.abs() < 1e-9 || far_h.w.abs() < 1e-9 { return None; }
+        let near_w = near_h.xyz() / near_h.w;
+        let far_w  = far_h.xyz()  / far_h.w;
+
+        let ray_origin = glam::Vec3::from(self.pick_cam_eye);
+        let dir_unnorm = far_w - near_w;
+        if dir_unnorm.length_squared() < 1e-9 { return None; }
+        let ray_dir = dir_unnorm.normalize();
+
+        // Test entities as bounding spheres in GPU world space [east, north, z].
+        // Entity GPU pos = [e.y, e.x, e.z] (scene.rs convention).
+        const SPHERE_R: f32 = 4.0;
+        let mut best_t  = f32::MAX;
+        let mut best_id = None;
+
+        for (&id, e) in &self.game_state.entities {
+            if e.dead { continue; }
+            // Lift sphere center to entity mid-body height.
+            let center = glam::Vec3::new(e.y, e.x, e.z + SPHERE_R * 0.75);
+            let oc = ray_origin - center;
+            let b  = oc.dot(ray_dir);
+            let c  = oc.dot(oc) - SPHERE_R * SPHERE_R;
+            let disc = b * b - c;
+            if disc < 0.0 { continue; }
+            let t = -b - disc.sqrt();
+            if t > 0.0 && t < best_t {
+                best_t  = t;
+                best_id = Some(id);
+            }
+        }
+
+        best_id
     }
 
     // ── Zone loading ──────────────────────────────────────────────────────────
@@ -165,6 +246,8 @@ impl App {
         }
         let s3d_path = self.assets_path.join(format!("{}.s3d", zone_name));
         self.ground_cache = (f32::NAN, f32::NAN, 0.0);
+        self.vert_vel  = 0.0;
+        self.on_ground = true;
         match assets::ZoneAssets::load(&s3d_path) {
             Ok(za) => {
                 if let Some((mn, mx)) = za.bounds_xy() {
@@ -286,26 +369,64 @@ impl App {
             self.fps_timer = now;
         }
 
-        // Keyboard WASD movement: move in camera-relative directions.
-        // W=forward, S=back, A=strafe-left, D=strafe-right.  R clears the override.
-        // az=0 → camera due east of focus, so forward = (-cos az, -sin az) in (east, north).
-        // right = (-sin az, cos az) — verified: at az=0 facing west, right is north(+Y). ✓
+        // Classic EQ control scheme:
+        //   A/D without LMB → rotate the player character (classic default: "Rotates the character")
+        //   A/D with LMB held → strafe left/right (LMB engages camera-orbit mode in our client)
+        //   W/S → always move forward/back in the current facing direction
+        //   R → reset camera to AutoFollow and clear any keyboard override
         //
         // override_pos [east, north, z] drives the visual immediately each frame.
         // goto_target  (server_x=north, server_y=east, server_z) is written so the nav
         // thread sends actual EQ position-update packets to the server.
+
+        // Determine A/D mode before the movement block so the heading block can use it.
+        let a_held = self.keys_held.contains(&KeyCode::KeyA);
+        let d_held = self.keys_held.contains(&KeyCode::KeyD);
+        // Rotate mode: LMB is up (not dragging camera). Strafe mode: LMB held.
+        let rotating = !self.drag_active && (a_held || d_held);
+
         {
             // EQ character run speed is ~35 EQ-units/sec; higher values trigger server rubber-band.
             const MOVE_SPEED: f32 = 35.0;
-            let az = self.camera.azimuth;
-            let (fwd_e, fwd_n) = (-az.cos(), -az.sin());
-            let (right_e, right_n) = (-az.sin(), az.cos());
+            // Classic EQ turn speed — about 3 full rotations per second feels right.
+            const TURN_SPEED: f32 = 120.0; // degrees per second
+
+            // Rotate mode: update heading directly and keep camera snapped behind the player.
+            if rotating {
+                if a_held { self.heading_target = (self.heading_target - TURN_SPEED * dt).rem_euclid(360.0); }
+                if d_held { self.heading_target = (self.heading_target + TURN_SPEED * dt).rem_euclid(360.0); }
+                // Keep the camera in AutoFollow so it tracks the new heading each frame.
+                self.camera.reset_to_follow();
+            }
+
+            // When rotating, derive forward/right from heading_target so W moves immediately
+            // in the direction the player is turning toward (no 1-frame camera lag).
+            // When strafing (LMB held), use the camera azimuth as before.
+            let (fwd_e, fwd_n, right_e, right_n) = if rotating {
+                let h = self.heading_target.to_radians();
+                // EQ heading: 0=north, 90=east → fwd=(sin h, cos h), right=(cos h, -sin h)
+                (h.sin(), h.cos(), h.cos(), -h.sin())
+            } else {
+                let az = self.camera.azimuth;
+                (-az.cos(), -az.sin(), -az.sin(), az.cos())
+            };
+
             let mut de = 0.0_f32;
             let mut dn = 0.0_f32;
-            if self.keys_held.contains(&KeyCode::KeyW) { de += fwd_e;   dn += fwd_n; }
-            if self.keys_held.contains(&KeyCode::KeyS) { de -= fwd_e;   dn -= fwd_n; }
-            if self.keys_held.contains(&KeyCode::KeyD) { de += right_e; dn += right_n; }
-            if self.keys_held.contains(&KeyCode::KeyA) { de -= right_e; dn -= right_n; }
+            if self.keys_held.contains(&KeyCode::KeyW) { de += fwd_e; dn += fwd_n; }
+            if self.keys_held.contains(&KeyCode::KeyS) { de -= fwd_e; dn -= fwd_n; }
+            // A/D strafe only when LMB is held (drag_active = strafe mode).
+            if self.drag_active {
+                if d_held { de += right_e; dn += right_n; }
+                if a_held { de -= right_e; dn -= right_n; }
+            }
+            // Jump: only from solid ground.
+            if self.keys_held.contains(&KeyCode::Space) && self.on_ground {
+                const JUMP_VELOCITY: f32 = 13.0;
+                self.vert_vel  = JUMP_VELOCITY;
+                self.on_ground = false;
+            }
+
             if de != 0.0 || dn != 0.0 {
                 let len = (de * de + dn * dn).sqrt();
                 de = de / len * MOVE_SPEED * dt;
@@ -340,48 +461,110 @@ impl App {
                     (0.0, 0.0) // boxed in — hold position
                 };
 
-                let new_pos = [base[0] + mde, base[1] + mdn, base[2]];
+                // Step-up: when on the ground, check if the floor at the new XY is
+                // higher than the current z (ramp or stair). Use a raised anchor so
+                // the ray starts above the step and can find the surface above us.
+                const STEP_HEIGHT: f32 = 3.0;
+                let new_e = base[0] + mde;
+                let new_n = base[1] + mdn;
+                let step_floor = if self.on_ground && (mde != 0.0 || mdn != 0.0) {
+                    self.ground_z(new_e, new_n, base[2] + STEP_HEIGHT)
+                } else {
+                    base[2]
+                };
+                let new_z = if self.on_ground
+                    && step_floor > base[2] + 0.1
+                    && step_floor - base[2] <= STEP_HEIGHT
+                {
+                    step_floor
+                } else {
+                    base[2]
+                };
+
+                let new_pos = [new_e, new_n, new_z];
                 self.override_pos = Some(new_pos);
                 // Move camera focus with the player regardless of camera mode
                 // (ManualOrbit keeps focus fixed otherwise, so the player walks away).
                 self.camera.focus = new_pos;
                 // server coords: x=north=pos[1], y=east=pos[0], z=height=pos[2]
                 *self.goto_target.lock().unwrap() = Some((new_pos[1], new_pos[0], new_pos[2]));
-            } else if self.override_pos.is_some() {
-                // Keys released: drop the visual override so server position takes over again.
+            } else if self.override_pos.is_some() && self.on_ground {
+                // Keys released while on ground: drop the visual override so server position takes over.
                 self.override_pos = None;
             }
         }
 
         // Lerp visual position toward the logical position so nav steps (150 ms / 15 units)
-        // glide rather than pop. Snap on teleports (>100 units gap).
+        // glide rather than pop. Snap on teleports (>100 XY units gap).
+        // Z is intentionally excluded from the lerp: server z (gs.player_z) is the spawn z
+        // and is never updated during movement, so lerping toward it would pull the player
+        // up into balconies/ceilings. Ground snap below is the sole authority on visual height.
         // When a keyboard override is active, use it directly instead of following the server.
         if let Some(op) = self.override_pos {
             self.visual_player_pos = op;
             self.scene.player_pos  = op;
         } else {
             let target = self.scene.player_pos;
-            let [dx, dy, dz] = [
-                target[0] - self.visual_player_pos[0],
-                target[1] - self.visual_player_pos[1],
-                target[2] - self.visual_player_pos[2],
-            ];
-            let dist = (dx * dx + dy * dy + dz * dz).sqrt();
-            if dist > 100.0 {
+            let dx = target[0] - self.visual_player_pos[0];
+            let dy = target[1] - self.visual_player_pos[1];
+            let xy_dist = (dx * dx + dy * dy).sqrt();
+            if xy_dist > 100.0 {
+                // Large XY teleport: snap position including z so ground snap initializes correctly.
                 self.visual_player_pos = target;
-            } else if dist > 0.01 {
+            } else if xy_dist > 0.01 {
                 let alpha = 1.0 - (-15.0_f32 * dt).exp();
-                self.visual_player_pos = lerp3(self.visual_player_pos, target, alpha);
+                self.visual_player_pos[0] += (target[0] - self.visual_player_pos[0]) * alpha;
+                self.visual_player_pos[1] += (target[1] - self.visual_player_pos[1]) * alpha;
+                // Z not lerped — ground snap owns it.
             }
             self.scene.player_pos = self.visual_player_pos;
         }
 
-        // Snap the player's render height to the zone floor. The server Z can sit a
-        // body-height above the rendered geometry, which leaves the model hovering.
+        // Vertical physics: fall under gravity, land on geometry, jump on spacebar.
+        // Replaces the old static ground-snap. The floor query uses the player's current z
+        // as anchor so balconies and ceilings above never read as the floor.
         {
+            const GRAVITY: f32       = 20.0; // EQ units/s²
+            const MAX_FALL: f32      = 50.0; // EQ units/s terminal velocity
+
             let p = self.scene.player_pos; // [east, north, z]
-            let grounded = self.ground_z(p[0], p[1], p[2]);
-            self.scene.player_pos[2] = grounded;
+            // floor_z with anchor = p[2]: ray_start = p[2]+2, finds surfaces at or below that.
+            // Balconies/ceilings above p[2]+2 have negative t and are never returned.
+            let floor = self.ground_z(p[0], p[1], p[2]);
+
+            let new_z = if self.on_ground {
+                if (floor - p[2]).abs() <= 0.5 {
+                    // Normal ground tracking: stay snapped to floor surface.
+                    floor
+                } else if floor > p[2] + 0.5 {
+                    // Floor is above us (edge case from geometry). Snap up.
+                    floor
+                } else {
+                    // Floor dropped away — walked off a ledge; start falling.
+                    self.on_ground = false;
+                    p[2]
+                }
+            } else {
+                // Airborne: integrate gravity.
+                self.vert_vel -= GRAVITY * dt;
+                self.vert_vel  = self.vert_vel.max(-MAX_FALL);
+                let candidate  = p[2] + self.vert_vel * dt;
+                if candidate <= floor {
+                    // Landed.
+                    self.vert_vel  = 0.0;
+                    self.on_ground = true;
+                    floor
+                } else {
+                    candidate
+                }
+            };
+
+            if self.on_ground { self.last_grounded_z = new_z; }
+            self.scene.player_pos[2]   = new_z;
+            self.camera.focus[2]       = new_z;
+            self.visual_player_pos[2]  = new_z;
+            // Keep override_pos z in sync so the next WASD base starts at the right height.
+            if let Some(ref mut op) = self.override_pos { op[2] = new_z; }
         }
 
         // Face the direction of travel. Server position updates for the player carry
@@ -390,15 +573,31 @@ impl App {
         {
             let de = self.scene.player_pos[0] - self.prev_render_pos[0]; // east
             let dn = self.scene.player_pos[1] - self.prev_render_pos[1]; // north
-            if de * de + dn * dn > 0.02 {
-                // EQ heading: 0 = north (+north), increasing clockwise toward east.
-                self.heading_target = de.atan2(dn).to_degrees().rem_euclid(360.0);
+            // Don't override heading_target from motion while A/D are rotating the player —
+            // rotation already sets it directly. When not rotating, derive from movement.
+            if !rotating && de * de + dn * dn > 0.02 {
+                let motion_deg = de.atan2(dn).to_degrees().rem_euclid(360.0);
+                // Guard against ~180° flips caused by the backward position-correction lerp
+                // that occurs when W is released and visual_player_pos snaps back toward the
+                // server position (which lags up to ~5 units behind the keyboard override).
+                // Legitimate heading changes per frame (forward motion, nav corners) are
+                // never near 180° from the current facing.
+                let diff = (motion_deg - self.visual_heading).rem_euclid(360.0);
+                if diff <= 90.0 || diff >= 270.0 {
+                    self.heading_target = motion_deg;
+                }
             }
             self.prev_render_pos = self.scene.player_pos;
-            let alpha = 1.0 - (-10.0_f32 * dt).exp();
-            let cur = self.visual_heading.to_radians();
-            let tgt = self.heading_target.to_radians();
-            self.visual_heading = lerp_angle(cur, tgt, alpha).to_degrees().rem_euclid(360.0);
+            // When rotating with A/D, snap visual_heading immediately for responsive feel.
+            // When following motion, lerp smoothly to avoid jitter from nav steps.
+            if rotating {
+                self.visual_heading = self.heading_target;
+            } else {
+                let alpha = 1.0 - (-10.0_f32 * dt).exp();
+                let cur = self.visual_heading.to_radians();
+                let tgt = self.heading_target.to_radians();
+                self.visual_heading = lerp_angle(cur, tgt, alpha).to_degrees().rem_euclid(360.0);
+            }
             self.scene.player_heading = self.visual_heading;
         }
 
@@ -436,6 +635,12 @@ impl App {
         );
 
         renderer.render_frame(&mut enc, &view, &self.scene, cam_eye, cam_target, dt);
+
+        // Cache picking data for the next mouse-click query.
+        self.pick_view_proj = renderer.last_view_proj;
+        self.pick_cam_eye   = renderer.last_cam_pos;
+        self.pick_screen_w  = renderer.surface_config.width;
+        self.pick_screen_h  = renderer.surface_config.height;
 
         // Egui pass — use associated function to avoid reborrowing self.
         Self::egui_pass(
@@ -621,7 +826,31 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
-                self.drag_active = state == ElementState::Pressed;
+                match state {
+                    ElementState::Pressed => {
+                        self.drag_active = true;
+                        self.click_start = Some(self.last_cursor);
+                    }
+                    ElementState::Released => {
+                        self.drag_active = false;
+                        if let Some(start) = self.click_start.take() {
+                            let dx = (self.last_cursor.x - start.x) as f32;
+                            let dy = (self.last_cursor.y - start.y) as f32;
+                            // Less than 5-pixel movement → treat as a click, not drag
+                            if dx * dx + dy * dy < 25.0 {
+                                if let Some(id) = self.pick_at(self.last_cursor) {
+                                    self.game_state.target_id   = Some(id);
+                                    self.game_state.target_con  = None;
+                                    if let Some(e) = self.game_state.entities.get(&id) {
+                                        self.game_state.target_name   = Some(e.name.clone());
+                                        self.game_state.target_hp_pct = Some(e.hp_pct);
+                                    }
+                                    *self.target.lock().unwrap() = Some(id);
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             WindowEvent::CursorMoved { position, .. } => {
@@ -646,7 +875,8 @@ impl ApplicationHandler for App {
                     match event.state {
                         ElementState::Pressed => {
                             match code {
-                                KeyCode::KeyW | KeyCode::KeyA | KeyCode::KeyS | KeyCode::KeyD => {
+                                KeyCode::KeyW | KeyCode::KeyA | KeyCode::KeyS | KeyCode::KeyD
+                                | KeyCode::Space => {
                                     self.keys_held.insert(code);
                                 }
                                 KeyCode::KeyR => {

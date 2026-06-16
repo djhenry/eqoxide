@@ -162,16 +162,19 @@ async fn reconnect_via_world(
         Err(e) => { eprintln!("EQ: world reconnect failed: {e}"); return false; }
     };
 
-    // Send OP_SEND_LOGIN_INFO: lsid\0ls_key\0 padded to SIZE_LOGIN_INFO bytes
+    // Send OP_SEND_LOGIN_INFO: lsid\0ls_key\0 padded to SIZE_LOGIN_INFO bytes.
+    // zoning=1 at byte 188 tells the world we're mid-zone-transfer, not a fresh login.
+    // Without this the world treats us as a fresh session and never sends OP_ZONE_SERVER_INFO.
     let lsid_str = format!("{}\0{}\0", creds.lsid, creds.ls_key);
     let mut login_info = vec![0u8; SIZE_LOGIN_INFO];
     let lb = lsid_str.as_bytes();
     login_info[..lb.len().min(64)].copy_from_slice(&lb[..lb.len().min(64)]);
+    login_info[188] = 1; // LoginInfo_S::zoning — signals zone transition reconnect
     world_stream.send_app_packet(OP_SEND_LOGIN_INFO, &login_info);
-    eprintln!("EQ: sent OP_SEND_LOGIN_INFO to world (lsid={})", creds.lsid);
+    eprintln!("EQ: sent OP_SEND_LOGIN_INFO to world (lsid={}, zoning=1)", creds.lsid);
 
     // Wait for OP_SEND_CHAR_INFO → send OP_ENTER_WORLD → wait for OP_ZONE_SERVER_INFO
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
     let mut char_info_sent = false;
     let mut zone_server: Option<(String, u16)> = None;
 
@@ -180,16 +183,19 @@ async fn reconnect_via_world(
         while let Ok(packet) = world_rx.try_recv() {
             let _ = app_tx.send(packet.clone());
             match packet.opcode {
-                OP_SEND_CHAR_INFO if !char_info_sent => {
+                // In a fresh-login reconnect, world sends OP_SEND_CHAR_INFO as the trigger.
+                // In a zoning=1 reconnect, world sends OP_APPROVE_WORLD (0x3c25) instead.
+                OP_SEND_CHAR_INFO | OP_APPROVE_WORLD if !char_info_sent => {
                     char_info_sent = true;
                     let mut enter_buf = vec![0u8; SIZE_ENTER_WORLD];
                     let nb = char_name.as_bytes();
                     enter_buf[..nb.len().min(64)].copy_from_slice(&nb[..nb.len().min(64)]);
                     world_stream.send_app_packet(OP_ENTER_WORLD, &enter_buf);
                     world_stream.send_app_packet(OP_POST_ENTER_WORLD, &[]);
-                    eprintln!("EQ: zone change: sent OP_ENTER_WORLD to world");
+                    eprintln!("EQ: zone change: sent OP_ENTER_WORLD to world (trigger=0x{:04x})", packet.opcode);
                 }
                 OP_ZONE_SERVER_INFO if packet.payload.len() >= SIZE_ZONE_SERVER_INFO => {
+
                     let info = unsafe { safe_read::<ZoneServerInfo_S>(&packet.payload) };
                     let port = info.port;
                     let ip   = String::from_utf8_lossy(&info.ip)
@@ -201,7 +207,9 @@ async fn reconnect_via_world(
                     eprintln!("EQ: zone change: world says new zone at {}:{}", ip, port);
                     zone_server = Some((ip, port));
                 }
-                _ => {}
+                _ => {
+                    eprintln!("EQ: zone change world: opcode 0x{:04x} ({} bytes)", packet.opcode, packet.payload.len());
+                }
             }
         }
         sleep(Duration::from_millis(10)).await;
@@ -245,6 +253,11 @@ async fn run_zone_entry_handshake(
     app_tx:  &UnboundedSender<AppPacket>,
     gs:      &mut GameState,
 ) {
+    // Clear stale entities now so OP_ZONE_SPAWNS can repopulate them.
+    // (OP_NEW_ZONE arrives AFTER OP_ZONE_SPAWNS in the Titanium server sequence, so
+    // we can't rely on apply_new_zone to do this reset.)
+    gs.entities.clear();
+
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let mut done_new_zone     = false;
     let mut done_weather      = false;

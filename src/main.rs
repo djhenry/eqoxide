@@ -39,11 +39,13 @@ fn main() {
     let (app_tx, app_rx) = tokio::sync::mpsc::unbounded_channel::<eq_net::AppPacket>();
     let goto_target:      http::GotoTarget      = Arc::new(Mutex::new(None));
     let entity_positions: http::EntityPositions = Arc::new(Mutex::new(HashMap::new()));
+    let entity_ids:       http::EntityIds       = Arc::new(Mutex::new(HashMap::new()));
     let zone_points:      http::ZonePoints      = Arc::new(Mutex::new(Vec::new()));
     let zone_cross:       http::ZoneCrossReq    = Arc::new(Mutex::new(false));
     let hail:             http::HailReq         = Arc::new(Mutex::new(None));
     let say:              http::SayReq          = Arc::new(Mutex::new(None));
     let target:           http::TargetReq       = Arc::new(Mutex::new(None));
+    let attack:           http::AttackReq       = Arc::new(Mutex::new(None));
     let shared_collision: assets::SharedCollision = Arc::new(std::sync::RwLock::new(None));
     let frame_req:        http::FrameReq        = Arc::new(Mutex::new(None));
 
@@ -51,16 +53,18 @@ fn main() {
     let character_name = login_cfg.character_name.clone();
     let gt  = goto_target.clone();
     let ep  = entity_positions.clone();
+    let ei  = entity_ids.clone();
     let zp  = zone_points.clone();
     let zc  = zone_cross.clone();
     let hl  = hail.clone();
     let sy  = say.clone();
     let tg  = target.clone();
+    let at  = attack.clone();
     let sc  = shared_collision.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
-            if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, zp, zc, hl, sy, tg, sc).await {
+            if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, zc, hl, sy, tg, at, sc).await {
                 eprintln!("EQ: fatal: {e}");
             }
         });
@@ -77,11 +81,13 @@ fn main() {
         frame_req.clone(),
         goto_target,
         entity_positions,
+        entity_ids,
         zone_points,
         zone_cross,
         hail,
         say,
         target,
+        attack,
         app_cfg.http_port,
     );
 

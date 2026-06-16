@@ -41,6 +41,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
             gs.log_msg("zone", "Zone change requested by server");
         }
         OP_ZONE_PLAYER_TO_BIND  => apply_bind_respawn(gs, p),
+        OP_DAMAGE               => apply_combat_damage(gs, p),
         _                       => {}
     }
 }
@@ -92,7 +93,6 @@ fn apply_new_zone(gs: &mut GameState, payload: &[u8]) {
     gs.safe_y    = zone.safe_y;
     gs.safe_z    = zone.safe_z;
     gs.zone_changed = true;
-    gs.entities.clear();
     gs.log_msg("zone", &format!("Entered {}", gs.zone_name));
 }
 
@@ -190,6 +190,7 @@ fn apply_death(gs: &mut GameState, payload: &[u8]) {
     if d_id == gs.player_id {
         gs.hp_pct    = 0.0;
         gs.strategy  = "Dead — waiting to respawn".into();
+        eprintln!("EQ: combat: *** You have been slain! ***");
         gs.log_msg("combat", "*** You have been slain! ***");
     } else {
         let name = gs.entities.get(&d_id).map(|e| e.name.clone());
@@ -198,6 +199,7 @@ fn apply_death(gs: &mut GameState, payload: &[u8]) {
                 e.dead   = true;
                 e.hp_pct = 0.0;
             }
+            eprintln!("EQ: combat: {} has been slain", name);
             gs.log_msg("combat", &format!("{} has been slain", name));
         }
     }
@@ -207,6 +209,26 @@ fn apply_exp_update(gs: &mut GameState, payload: &[u8]) {
     if payload.len() >= 4 {
         gs.log_msg("exp", "Experience gained");
     }
+}
+
+// CombatDamage_Struct (23 bytes): target(u16) source(u16) type(u8) spellid(u16) damage(u32) ...
+fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
+    if payload.len() < 11 { return; }
+    let target_id = u16::from_le_bytes([payload[0], payload[1]]) as u32;
+    let source_id = u16::from_le_bytes([payload[2], payload[3]]) as u32;
+    let damage    = u32::from_le_bytes([payload[7], payload[8], payload[9], payload[10]]);
+    let type_val  = payload[4];
+    let target_name = gs.entities.get(&target_id).map(|e| e.name.clone())
+        .unwrap_or_else(|| if target_id == gs.player_id { gs.player_name.clone() } else { format!("#{target_id}") });
+    let source_name = gs.entities.get(&source_id).map(|e| e.name.clone())
+        .unwrap_or_else(|| if source_id == gs.player_id { gs.player_name.clone() } else { format!("#{source_id}") });
+    let msg = if damage == 0 {
+        format!("{source_name} misses {target_name} (type={type_val})")
+    } else {
+        format!("{source_name} hits {target_name} for {damage} damage")
+    };
+    eprintln!("EQ: combat: {msg}");
+    gs.log_msg("combat", &msg);
 }
 
 fn apply_level_update(gs: &mut GameState, payload: &[u8]) {
@@ -325,7 +347,9 @@ fn apply_consider(gs: &mut GameState, payload: &[u8]) {
         .unwrap_or_else(|| "Your target".to_string());
     gs.target_id  = Some(target_id);
     gs.target_con = Some(con_color(level));
-    gs.log_msg("combat", &format!("{} {}.", name, consider_message(faction)));
+    let msg = format!("{} {}.", name, consider_message(faction));
+    eprintln!("EQ: consider: {msg}");
+    gs.log_msg("combat", &msg);
 }
 
 /// OP_SpecialMesg — NPC dialogue / emotes, where quest text arrives.
