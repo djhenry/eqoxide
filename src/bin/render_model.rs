@@ -1094,6 +1094,7 @@ fn render_frame(s: &mut ViewerState) {
         s.device.poll(wgpu::Maintain::Wait);
         let png = frame_capture::encode_frame_png(
             &slice.get_mapped_range(), w, h, row_pitch, s.surface_config.format,
+            Some(512),
         );
         let _ = tx.send(png);
     } else {

@@ -898,6 +898,7 @@ impl App {
             renderer.device.poll(wgpu::Maintain::Wait);
             let png = encode_frame_png(
                 &slice.get_mapped_range(), w, h, row_pitch, renderer.surface_config.format,
+                Some(512),
             );
             let _ = tx.send(png);
         } else {

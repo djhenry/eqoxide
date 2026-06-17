@@ -92,4 +92,7 @@ fn main() {
         testzone_mode,
     );
     event_loop.run_app(&mut application).expect("event loop run");
+    // Exit cleanly so KDE doesn't report a crash when background threads
+    // (EQ network, HTTP server) are still running at process teardown time.
+    std::process::exit(0);
 }
