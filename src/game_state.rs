@@ -22,6 +22,7 @@ pub struct Entity {
     pub spawn_id: u32,
     pub name: String,
     pub level: u32,
+    #[allow(dead_code)]
     pub is_npc: bool,
     pub x: f32,
     pub y: f32,
@@ -35,6 +36,7 @@ pub struct Entity {
 }
 
 impl Entity {
+    #[allow(dead_code)]
     pub fn dist_to(&self, x: f32, y: f32, z: f32) -> f32 {
         ((self.x - x).powi(2) + (self.y - y).powi(2) + (self.z - z).powi(2)).sqrt()
     }
@@ -88,6 +90,17 @@ pub struct GameState {
 
     // Strategy text for HUD
     pub strategy: String,
+
+    // Loot state
+    /// Corpse spawn_ids queued for auto-looting (populated by OP_BecomeCorpse).
+    pub pending_loot: VecDeque<u32>,
+    /// True while a loot session is open (LootRequest sent, waiting for server items).
+    pub loot_session_active: bool,
+    /// Updated each time the server sends a loot packet; used to time out the session.
+    pub loot_last_activity: Option<std::time::Instant>,
+    /// When the first corpse was pushed to pending_loot; used to delay LootRequest by
+    /// 500 ms so the server has time to register the corpse as lootable.
+    pub loot_queued_at: Option<std::time::Instant>,
 }
 
 impl GameState {
@@ -130,6 +143,7 @@ impl GameState {
         }
     }
 
+    #[allow(dead_code)]
     pub fn nearby_npcs(&self, max_dist: f32) -> Vec<&Entity> {
         let mut result: Vec<&Entity> = self
             .entities
@@ -147,5 +161,193 @@ impl GameState {
             da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
         });
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Entity, GameState};
+
+    fn make_entity(id: u32, name: &str, x: f32, y: f32, z: f32, is_npc: bool) -> Entity {
+        Entity {
+            spawn_id: id,
+            name: name.to_string(),
+            level: 1,
+            is_npc,
+            x,
+            y,
+            z,
+            hp_pct: 100.0,
+            cur_hp: 100,
+            max_hp: 100,
+            race: String::new(),
+            heading: 0.0,
+            dead: false,
+        }
+    }
+
+    // --- Entity::dist_to ---
+
+    #[test]
+    fn dist_to_3_4_0_gives_5() {
+        let e = make_entity(1, "mob", 3.0, 4.0, 0.0, true);
+        let d = e.dist_to(0.0, 0.0, 0.0);
+        assert!((d - 5.0).abs() < 1e-5, "expected 5.0, got {d}");
+    }
+
+    #[test]
+    fn dist_to_same_position_is_zero() {
+        let e = make_entity(1, "mob", 7.0, 8.0, 9.0, true);
+        let d = e.dist_to(7.0, 8.0, 9.0);
+        assert!((d - 0.0).abs() < 1e-5, "expected 0.0, got {d}");
+    }
+
+    // --- GameState::log_msg ---
+
+    #[test]
+    fn log_msg_preserves_kind_and_text() {
+        let mut gs = GameState::new();
+        gs.log_msg("chat", "hello world");
+        assert_eq!(gs.messages.len(), 1);
+        assert_eq!(gs.messages[0].kind, "chat");
+        assert_eq!(gs.messages[0].text, "hello world");
+    }
+
+    #[test]
+    fn log_msg_drops_oldest_when_full() {
+        let mut gs = GameState::new();
+        // Fill to exactly 50
+        for i in 0..50 {
+            gs.log_msg("kind", &format!("msg {i}"));
+        }
+        assert_eq!(gs.messages.len(), 50);
+        assert_eq!(gs.messages[0].text, "msg 0");
+
+        // Adding one more should drop "msg 0"
+        gs.log_msg("kind", "msg 50");
+        assert_eq!(gs.messages.len(), 50);
+        assert_eq!(gs.messages[0].text, "msg 1");
+        assert_eq!(gs.messages[49].text, "msg 50");
+    }
+
+    // --- GameState::upsert_entity / remove_entity ---
+
+    #[test]
+    fn upsert_then_remove_entity_gone() {
+        let mut gs = GameState::new();
+        gs.upsert_entity(make_entity(10, "goblin", 0.0, 0.0, 0.0, true));
+        assert!(gs.entities.contains_key(&10));
+        gs.remove_entity(10);
+        assert!(!gs.entities.contains_key(&10));
+    }
+
+    #[test]
+    fn remove_entity_clears_target_id() {
+        let mut gs = GameState::new();
+        gs.upsert_entity(make_entity(10, "goblin", 0.0, 0.0, 0.0, true));
+        gs.target_id = Some(10);
+        gs.remove_entity(10);
+        assert_eq!(gs.target_id, None);
+    }
+
+    #[test]
+    fn remove_entity_leaves_other_target_intact() {
+        let mut gs = GameState::new();
+        gs.upsert_entity(make_entity(10, "goblin", 0.0, 0.0, 0.0, true));
+        gs.upsert_entity(make_entity(11, "orc", 1.0, 0.0, 0.0, true));
+        gs.target_id = Some(11);
+        gs.remove_entity(10);
+        assert_eq!(gs.target_id, Some(11));
+    }
+
+    #[test]
+    fn upsert_overwrites_by_spawn_id() {
+        let mut gs = GameState::new();
+        gs.upsert_entity(make_entity(5, "original", 0.0, 0.0, 0.0, true));
+        gs.upsert_entity(make_entity(5, "updated", 1.0, 2.0, 3.0, true));
+        assert_eq!(gs.entities.len(), 1);
+        assert_eq!(gs.entities[&5].name, "updated");
+    }
+
+    // --- GameState::update_hp ---
+
+    #[test]
+    fn update_hp_player_sets_hp_pct() {
+        let mut gs = GameState::new();
+        gs.player_id = 99;
+        gs.update_hp(99, 75, 100);
+        assert!((gs.hp_pct - 75.0).abs() < 1e-4, "expected 75.0, got {}", gs.hp_pct);
+    }
+
+    #[test]
+    fn update_hp_entity_sets_hp_pct() {
+        let mut gs = GameState::new();
+        gs.upsert_entity(make_entity(7, "mob", 0.0, 0.0, 0.0, true));
+        gs.update_hp(7, 50, 200);
+        let e = &gs.entities[&7];
+        assert_eq!(e.cur_hp, 50);
+        assert_eq!(e.max_hp, 200);
+        assert!((e.hp_pct - 25.0).abs() < 1e-4, "expected 25.0, got {}", e.hp_pct);
+    }
+
+    #[test]
+    fn update_hp_max_zero_does_not_panic() {
+        let mut gs = GameState::new();
+        gs.player_id = 1;
+        // max_hp=0 → uses max(1) guard; cur_hp=0 → 0%
+        gs.update_hp(1, 0, 0);
+        assert!((gs.hp_pct - 0.0).abs() < 1e-4);
+    }
+
+    // --- GameState::nearby_npcs ---
+
+    #[test]
+    fn nearby_npcs_sorted_nearest_first() {
+        let mut gs = GameState::new();
+        gs.player_x = 0.0;
+        gs.player_y = 0.0;
+        gs.player_z = 0.0;
+        // dist = 5.0
+        gs.upsert_entity(make_entity(1, "far", 3.0, 4.0, 0.0, true));
+        // dist = 1.0
+        gs.upsert_entity(make_entity(2, "near", 1.0, 0.0, 0.0, true));
+        let npcs = gs.nearby_npcs(100.0);
+        assert_eq!(npcs.len(), 2);
+        assert_eq!(npcs[0].spawn_id, 2, "nearest should be id=2");
+        assert_eq!(npcs[1].spawn_id, 1, "farthest should be id=1");
+    }
+
+    #[test]
+    fn nearby_npcs_excludes_dead() {
+        let mut gs = GameState::new();
+        let mut dead = make_entity(1, "zombie", 0.0, 0.0, 0.0, true);
+        dead.dead = true;
+        gs.upsert_entity(dead);
+        assert!(gs.nearby_npcs(100.0).is_empty());
+    }
+
+    #[test]
+    fn nearby_npcs_excludes_corpses() {
+        let mut gs = GameState::new();
+        gs.upsert_entity(make_entity(1, "goblin's corpse", 0.0, 0.0, 0.0, true));
+        assert!(gs.nearby_npcs(100.0).is_empty());
+    }
+
+    #[test]
+    fn nearby_npcs_excludes_pcs() {
+        let mut gs = GameState::new();
+        gs.upsert_entity(make_entity(1, "Playerone", 0.0, 0.0, 0.0, false));
+        assert!(gs.nearby_npcs(100.0).is_empty());
+    }
+
+    #[test]
+    fn nearby_npcs_excludes_beyond_max_dist() {
+        let mut gs = GameState::new();
+        gs.player_x = 0.0;
+        gs.player_y = 0.0;
+        gs.player_z = 0.0;
+        // dist = 10.0, max_dist = 5.0 → excluded
+        gs.upsert_entity(make_entity(1, "faraway", 10.0, 0.0, 0.0, true));
+        assert!(gs.nearby_npcs(5.0).is_empty());
     }
 }

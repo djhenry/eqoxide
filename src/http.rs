@@ -48,6 +48,7 @@ pub type TargetReq = Arc<Mutex<Option<u32>>>;
 pub type AttackReq = Arc<Mutex<Option<bool>>>;
 
 /// Current zone name and id, updated on every OP_NEW_ZONE.
+#[allow(dead_code)]
 pub type ZoneInfo = Arc<Mutex<(String, u16)>>;
 
 #[derive(Clone)]
@@ -175,11 +176,21 @@ async fn post_goto(
 
     let target = if let Some(name) = &b.name {
         let positions = s.entity_positions.lock().unwrap();
-        match positions.get(name.as_str()).copied() {
+        let nl = name.to_lowercase();
+        // Exact key match first, then clean-name match, then substring fallback.
+        let matched = positions.get(name.as_str()).map(|&p| p)
+            .or_else(|| positions.iter()
+                .find(|(k, _)| clean_entity_name(k).to_lowercase() == nl)
+                .map(|(_, &p)| p))
+            .or_else(|| positions.iter()
+                .find(|(k, _)| clean_entity_name(k).to_lowercase().contains(&nl)
+                    || k.to_lowercase().contains(&nl))
+                .map(|(_, &p)| p));
+        match matched {
             Some(pos) => pos,
             None => {
                 let known: Vec<_> = positions.keys()
-                    .filter(|k| k.to_lowercase().contains(&name.to_lowercase()))
+                    .filter(|k| k.to_lowercase().contains(&nl))
                     .take(5)
                     .cloned()
                     .collect();

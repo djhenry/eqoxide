@@ -143,7 +143,7 @@ pub fn build_pipelines(
         layout: Some(&zone_layout),
         vertex: wgpu::VertexState {
             module: &zone_shader, entry_point: "vs_main",
-            buffers: &[vbl.clone()], compilation_options: Default::default(),
+            buffers: std::slice::from_ref(&vbl), compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
             module: &zone_shader, entry_point: "fs_main",
@@ -178,7 +178,7 @@ pub fn build_pipelines(
         layout: Some(&bb_layout),
         vertex: wgpu::VertexState {
             module: &bb_shader, entry_point: "vs_main",
-            buffers: &[vbl.clone()], compilation_options: Default::default(),
+            buffers: std::slice::from_ref(&vbl), compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
             module: &bb_shader, entry_point: "fs_main",

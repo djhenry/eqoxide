@@ -32,9 +32,10 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_CONSIDER             => apply_consider(gs, p),
         OP_SEND_ZONE_POINTS           => apply_zone_points(gs, p),
         OP_REQUEST_CLIENT_ZONE_CHANGE => {
-            if p.len() >= 74 {
-                let zone_id = u16::from_le_bytes([p[64], p[65]]);
-                eprintln!("EQ: OP_REQUEST_CLIENT_ZONE_CHANGE → zone_id={zone_id} ({} bytes)", p.len());
+            if p.len() >= 4 {
+                let zone_id = u16::from_le_bytes([p[0], p[1]]);
+                let instance_id = u16::from_le_bytes([p[2], p[3]]);
+                eprintln!("EQ: OP_REQUEST_CLIENT_ZONE_CHANGE → zone_id={zone_id} instance={instance_id} ({} bytes)", p.len());
             } else {
                 eprintln!("EQ: OP_REQUEST_CLIENT_ZONE_CHANGE ({} bytes)", p.len());
             }
@@ -42,6 +43,8 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         }
         OP_ZONE_PLAYER_TO_BIND  => apply_bind_respawn(gs, p),
         OP_DAMAGE               => apply_combat_damage(gs, p),
+        OP_BECOME_CORPSE        => apply_become_corpse(gs, p),
+        OP_MONEY_ON_CORPSE      => apply_money_on_corpse(gs, p),
         _                       => {}
     }
 }
@@ -51,6 +54,19 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
 fn apply_new_spawn(gs: &mut GameState, payload: &[u8]) {
     if payload.len() >= SIZE_SPAWN {
         let spawn = unsafe { safe_read::<Spawn_S>(payload) };
+        let name = spawn.name_str();
+        // If this new spawn is an NPC corpse, queue it for auto-looting.
+        // (Only fires if the server has loot tables; loot-empty mobs skip corpse creation.)
+        if spawn.NPC != 0 && name.to_lowercase().contains("corpse") {
+            let sid = spawn.spawnId;
+            eprintln!("EQ: NPC corpse spawned: id={} name={:?} → queuing for loot", sid, name);
+            gs.pending_loot.push_back(sid);
+            if gs.loot_queued_at.is_none() {
+                gs.loot_queued_at = Some(std::time::Instant::now());
+            }
+            gs.log_msg("combat", &format!("Corpse found: {} — auto-looting…",
+                name.replace("_corpse", "").replace('_', " ")));
+        }
         register_spawn(gs, spawn);
     }
 }
@@ -73,7 +89,10 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         e.x = upd.x;
         e.y = upd.y;
         e.z = upd.z;
-        e.heading = upd.heading; // NPCs now face the direction the server reports
+        e.heading = upd.heading;
+        eprintln!("EQ: npc_pos id={} name={} pos=({:.1},{:.1},{:.1})", sid, e.name, e.x, e.y, e.z);
+    } else {
+        eprintln!("EQ: npc_pos id={} NOT IN ENTITY MAP (known: {})", sid, gs.entities.len());
     }
 }
 
@@ -115,10 +134,11 @@ fn apply_zone_entry(gs: &mut GameState, payload: &[u8]) {
             continue;
         }
         if !gs.player_name.is_empty() && name == gs.player_name {
-            let (x, y, z, heading) = extract_spawn_position(
-                spawn.bitfield_pos1, spawn.bitfield_pos2,
-                spawn.bitfield_pos3, spawn.bitfield_pos4,
-            );
+            let bp1 = spawn.bitfield_pos1;
+            let bp2 = spawn.bitfield_pos2;
+            let bp3 = spawn.bitfield_pos3;
+            let bp4 = spawn.bitfield_pos4;
+            let (x, y, z, heading) = extract_spawn_position(bp1, bp2, bp3, bp4);
             gs.player_id      = spawn.spawnId;
             gs.player_x       = x;
             gs.player_y       = y;
@@ -126,8 +146,8 @@ fn apply_zone_entry(gs: &mut GameState, payload: &[u8]) {
             gs.player_heading = heading;
             gs.player_level   = spawn.level as u32;
             gs.player_race    = eq_race_to_code(spawn.race).to_string();
-            eprintln!("EQ: player located via OP_ZONE_ENTRY id={} pos=({:.1},{:.1},{:.1})",
-                      gs.player_id, x, y, z);
+            eprintln!("EQ: player via ZONE_ENTRY id={} pos=({:.1},{:.1},{:.1}) raw=({:#010x},{:#010x},{:#010x},{:#010x})",
+                      gs.player_id, x, y, z, bp1, bp2, bp3, bp4);
         }
         break;
     }
@@ -440,6 +460,45 @@ fn apply_bind_respawn(gs: &mut GameState, payload: &[u8]) {
     gs.log_msg("zone", "Respawning at bind point");
 }
 
+fn apply_become_corpse(gs: &mut GameState, payload: &[u8]) {
+    // OP_BECOME_CORPSE (0x4dbc): server sends when NPC dies with loot.
+    // Struct: unknown(4) + spawn_id(4) + y(4) + x(4) = 16 bytes observed on wire.
+    if payload.len() < 8 { return; }
+    let corpse_id = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    eprintln!("EQ: OP_BecomeCorpse corpse_id={}", corpse_id);
+    gs.pending_loot.push_back(corpse_id);
+    if gs.loot_queued_at.is_none() {
+        gs.loot_queued_at = Some(std::time::Instant::now());
+    }
+    gs.log_msg("combat", "Mob left a corpse — auto-looting...");
+}
+
+fn apply_money_on_corpse(gs: &mut GameState, payload: &[u8]) {
+    // MoneyOnCorpse_Struct: response(u8) + 3×pad + platinum(u32) + gold(u32) + silver(u32) + copper(u32)
+    if payload.len() < 20 { return; }
+    let response  = payload[0];
+    if response != 0 {
+        eprintln!("EQ: OP_MoneyOnCorpse denied (response={})", response);
+        return;
+    }
+    let platinum = u32::from_le_bytes([payload[4],  payload[5],  payload[6],  payload[7]]);
+    let gold     = u32::from_le_bytes([payload[8],  payload[9],  payload[10], payload[11]]);
+    let silver   = u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
+    let copper   = u32::from_le_bytes([payload[16], payload[17], payload[18], payload[19]]);
+    gs.loot_last_activity = Some(std::time::Instant::now());
+    if platinum > 0 || gold > 0 || silver > 0 || copper > 0 {
+        let mut parts = Vec::new();
+        if platinum > 0 { parts.push(format!("{}pp", platinum)); }
+        if gold     > 0 { parts.push(format!("{}gp", gold)); }
+        if silver   > 0 { parts.push(format!("{}sp", silver)); }
+        if copper   > 0 { parts.push(format!("{}cp", copper)); }
+        gs.log_msg("loot", &format!("Looted coins: {}", parts.join(", ")));
+        eprintln!("EQ: looted coins: {}", parts.join(", "));
+    } else {
+        eprintln!("EQ: no coins on corpse");
+    }
+}
+
 // ── Shared spawn registration ─────────────────────────────────────────────────
 
 /// Insert or update one spawn in `gs`. If it matches the player name the
@@ -563,5 +622,111 @@ mod tests {
         let before = gs.messages.len();
         apply_emote(&mut gs, &emote_payload(0xffff_ffff, ""));
         assert_eq!(gs.messages.len(), before, "animation emote should not be logged");
+    }
+
+    // --- is_debug_spam: new filter coverage ---
+
+    #[test]
+    fn is_debug_spam_filters_combat_record() {
+        assert!(super::is_debug_spam("[CombatRecord] [Stop] [Summary] Warrior hit 3 times"));
+    }
+
+    #[test]
+    fn is_debug_spam_filters_event_killed_merit() {
+        assert!(super::is_debug_spam("[EVENT_KILLED_MERIT] npc=Guard_Tyrak000 merit=5"));
+    }
+
+    #[test]
+    fn is_debug_spam_filters_event_item_given() {
+        assert!(super::is_debug_spam("[EVENT_ITEM_GIVEN] item=5019 to player=Testhero"));
+    }
+
+    #[test]
+    fn is_debug_spam_allows_contact_npc_speech() {
+        assert!(!super::is_debug_spam("Greetings, traveler. Are you my [contact]?"));
+    }
+
+    // --- apply_channel_message helpers and tests ---
+
+    fn make_chan_payload(sender: &str, chan_num: u32, msg: &str) -> Vec<u8> {
+        let mut buf = vec![0u8; 148 + msg.len() + 1];
+        // targetname at 0..64 (leave zeroed)
+        // sender at 64..128
+        let sb = sender.as_bytes();
+        let sl = sb.len().min(63);
+        buf[64..64 + sl].copy_from_slice(&sb[..sl]);
+        // chan_num at 132..136
+        buf[132..136].copy_from_slice(&chan_num.to_le_bytes());
+        // message at 148
+        let mb = msg.as_bytes();
+        buf[148..148 + mb.len()].copy_from_slice(mb);
+        buf
+    }
+
+    #[test]
+    fn apply_channel_message_zone_with_sender_logs_chat() {
+        let mut gs = GameState::new();
+        let payload = make_chan_payload("Soandso", 3, "Hello zone!");
+        super::apply_channel_message(&mut gs, &payload);
+        assert!(gs.messages.iter().any(|m| m.kind == "chat"
+            && m.text == "<Soandso> Hello zone!"));
+    }
+
+    #[test]
+    fn apply_channel_message_zone_without_sender_logs_zone() {
+        let mut gs = GameState::new();
+        let payload = make_chan_payload("", 3, "An earthquake strikes!");
+        super::apply_channel_message(&mut gs, &payload);
+        assert!(gs.messages.iter().any(|m| m.kind == "zone"
+            && m.text == "An earthquake strikes!"));
+    }
+
+    #[test]
+    fn apply_channel_message_say_with_sender_logs_chat() {
+        let mut gs = GameState::new();
+        let payload = make_chan_payload("Guard_Janior", 8, "Halt, adventurer!");
+        super::apply_channel_message(&mut gs, &payload);
+        assert!(gs.messages.iter().any(|m| m.kind == "chat"
+            && m.text == "<Guard_Janior> Halt, adventurer!"));
+    }
+
+    #[test]
+    fn apply_channel_message_too_short_logs_nothing() {
+        let mut gs = GameState::new();
+        super::apply_channel_message(&mut gs, &[0u8; 100]);
+        assert!(gs.messages.is_empty(), "short payload should produce no messages");
+    }
+
+    #[test]
+    fn apply_channel_message_empty_msg_logs_nothing() {
+        let mut gs = GameState::new();
+        // Build payload where message field is all zeros (empty after null-trim).
+        let payload = make_chan_payload("Soandso", 3, "");
+        super::apply_channel_message(&mut gs, &payload);
+        assert!(gs.messages.is_empty(), "empty message should produce no log entry");
+    }
+
+    // --- decode/encode position round-trip: NPC-relevant edge cases ---
+
+    #[test]
+    fn position_roundtrip_negative_z() {
+        use crate::eq_net::protocol::{decode_position_update, encode_position_update};
+        let pkt = encode_position_update(42, 100.0, 200.0, -15.5);
+        let d = decode_position_update(&pkt).expect("decode negative z");
+        assert_eq!(d.spawn_id, 42);
+        assert!((d.x - 100.0).abs() < 0.2);
+        assert!((d.y - 200.0).abs() < 0.2);
+        assert!((d.z - (-15.5)).abs() < 0.2);
+    }
+
+    #[test]
+    fn position_roundtrip_heading_near_360() {
+        use crate::eq_net::protocol::{decode_position_update, encode_position_update};
+        // EQ heading 511 ≈ 359° — near full circle, should survive encode/decode.
+        let pkt = encode_position_update(7, -250.0, 80.0, 3.0);
+        let d = decode_position_update(&pkt).expect("decode heading near 360");
+        assert_eq!(d.spawn_id, 7);
+        assert!((d.x - (-250.0)).abs() < 0.2);
+        assert!((d.y - 80.0).abs() < 0.2);
     }
 }

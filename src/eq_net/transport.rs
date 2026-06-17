@@ -145,7 +145,7 @@ impl FragmentBuffer {
 
     /// Feed one fragment. Returns complete reassembled data if done.
     /// For the first fragment, `data` starts with 4-byte big-endian total_size.
-    fn add(&mut self, data: &[u8], is_first: bool) -> Option<Vec<u8>> {
+    fn add(&mut self, data: &[u8], _is_first: bool) -> Option<Vec<u8>> {
         if !self.in_progress() {
             if data.len() < 4 {
                 return None;
@@ -179,6 +179,7 @@ pub struct AppPacket {
 pub struct EqStream {
     session: SessionInfo,
     socket: UdpSocket,
+    #[allow(dead_code)]
     peer: SocketAddr,
     send_seq: u16,
     next_recv_seq: u16,

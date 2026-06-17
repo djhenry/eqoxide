@@ -20,6 +20,17 @@ use crate::renderer::EqRenderer;
 use crate::scene::SceneState;
 use crate::{assets, debug_zone, hud, zone_map};
 
+/// Data produced by the background zone-load thread, ready for GPU upload on the main thread.
+struct PendingLoad {
+    zone_name: String,
+    /// None means the S3D failed to load; use the fallback ground plane instead.
+    assets:    Option<assets::ZoneAssets>,
+    collision: Option<Arc<assets::Collision>>,
+    zone_map:  Option<zone_map::ZoneMap>,
+    zone_min:  [f32; 2],
+    zone_max:  [f32; 2],
+}
+
 pub struct App {
     // Window & GPU (initialised in `resumed`)
     window:        Option<Arc<Window>>,
@@ -31,9 +42,13 @@ pub struct App {
     assets_path:   std::path::PathBuf,
     models_path:   std::path::PathBuf,
     // Zone state
-    current_zone:  String,
-    loading:       bool,
+    current_zone:   String,
+    loading:        bool,
     pending_reload: bool,
+    /// Current loading step shown to the user while loading == true.
+    load_status:    Arc<Mutex<String>>,
+    /// Background thread writes completed load data here; render loop drains it.
+    pending_load:   Arc<Mutex<Option<PendingLoad>>>,
     // Minimap
     zone_min:      [f32; 2],
     zone_max:      [f32; 2],
@@ -77,6 +92,9 @@ pub struct App {
     pick_screen_h:  u32,
     // EQ state
     game_state:   GameState,
+    /// Offline testzone mode — bypasses EQ server entirely.
+    #[allow(dead_code)]
+    testzone_mode: bool,
     scene:        SceneState,
     app_rx:       tokio::sync::mpsc::UnboundedReceiver<AppPacket>,
     // Frame capture for /frame API
@@ -119,14 +137,23 @@ impl App {
         say:             crate::http::SayReq,
         target:          crate::http::TargetReq,
         shared_collision: assets::SharedCollision,
+        testzone_mode:   bool,
     ) -> Self {
         let mut game_state = GameState::new();
         game_state.player_name = character_name;
+
+        if testzone_mode {
+            game_state.zone_name = "testzone".to_string();
+            game_state.zone_changed = true;
+            eprintln!("APP: --testzone mode, will load debug zone");
+        }
 
         App {
             window: None, gpu: None, egui_ctx: None, egui_state: None, egui_renderer: None,
             assets_path, models_path,
             current_zone: String::new(), loading: false, pending_reload: false,
+            load_status:  Arc::new(Mutex::new(String::new())),
+            pending_load: Arc::new(Mutex::new(None)),
             zone_min: [0.0; 2], zone_max: [0.0; 2],
             minimap_zoom: 1.0, minimap_full: false, zone_map: None,
             visual_player_pos: [0.0, 0.0, 0.0],
@@ -161,6 +188,7 @@ impl App {
             visual_heading:  0.0,
             vert_vel:  0.0,
             on_ground: true,
+            testzone_mode,
         }
     }
 
@@ -237,43 +265,87 @@ impl App {
 
     fn reload_zone(&mut self) {
         let zone_name = self.scene.zone.clone();
-        let Some((_, renderer)) = &mut self.gpu else { self.loading = false; return };
-        if zone_name == "testzone" {
-            renderer.upload_zone_assets(&debug_zone::make_debug_zone());
-            eprintln!("renderer: debug zone loaded ({} meshes)", renderer.gpu_meshes.len());
-            self.loading = false;
-            return;
-        }
-        let s3d_path = self.assets_path.join(format!("{}.s3d", zone_name));
+        if self.gpu.is_none() { self.loading = false; return; }
+
         self.ground_cache = (f32::NAN, f32::NAN, 0.0);
         self.vert_vel  = 0.0;
         self.on_ground = true;
-        match assets::ZoneAssets::load(&s3d_path) {
-            Ok(za) => {
-                if let Some((mn, mx)) = za.bounds_xy() {
-                    self.zone_min = mn;
-                    self.zone_max = mx;
-                }
-                renderer.upload_zone_assets(&za);
-                eprintln!("renderer: loaded {} meshes for '{}'", renderer.gpu_meshes.len(), zone_name);
-                // Build the collision grid for grounding, camera collision, occlusion,
-                // and publish it for the nav thread to gate /goto movement.
-                let col = Arc::new(assets::Collision::build(&za, 32.0));
-                self.collision = Some(col.clone());
-                *self.shared_collision.write().unwrap() = Some(col);
+
+        // testzone is assembled from in-memory debug data — handle it inline.
+        if zone_name == "testzone" {
+            if let Some((_, renderer)) = &mut self.gpu {
+                renderer.upload_zone_assets(&debug_zone::make_debug_zone());
+                eprintln!("renderer: debug zone loaded ({} meshes)", renderer.gpu_meshes.len());
             }
-            Err(e) => {
-                eprintln!("renderer: zone '{}' not found ({}), using fallback", zone_name, e);
-                renderer.upload_zone_assets(&debug_zone::make_fallback_ground());
-                self.collision = None;
-                *self.shared_collision.write().unwrap() = None;
+            self.loading = false;
+            return;
+        }
+
+        let s3d_path    = self.assets_path.join(format!("{}.s3d", zone_name));
+        let maps_dir    = self.assets_path.join("maps");
+        let load_status = self.load_status.clone();
+        let pending     = self.pending_load.clone();
+
+        *load_status.lock().unwrap() = "Opening S3D archive…".to_string();
+
+        std::thread::spawn(move || {
+            let set_status = |s: &str| { *load_status.lock().unwrap() = s.to_string(); };
+
+            set_status("Reading zone geometry…");
+            let (opt_assets, zone_min, zone_max) = match assets::ZoneAssets::load_all(&s3d_path) {
+                Ok(za) => {
+                    let (zone_min, zone_max) = if let Some((mn, mx)) = za.bounds_xy() {
+                        ([-mx[1], mn[0]], [-mn[1], mx[0]])
+                    } else {
+                        ([0.0f32; 2], [0.0f32; 2])
+                    };
+                    (Some(za), zone_min, zone_max)
+                }
+                Err(e) => {
+                    eprintln!("renderer: zone '{}' not found ({}), using fallback", zone_name, e);
+                    (None, [0.0f32; 2], [0.0f32; 2])
+                }
+            };
+
+            set_status("Building collision grid…");
+            let collision = opt_assets.as_ref()
+                .map(|za| Arc::new(assets::Collision::build(za, 32.0)));
+
+            set_status("Loading minimap…");
+            let zone_map = zone_map::ZoneMap::load(&maps_dir, &zone_name);
+
+            set_status("Uploading to GPU…");
+            *pending.lock().unwrap() = Some(PendingLoad {
+                zone_name, assets: opt_assets, collision, zone_map, zone_min, zone_max,
+            });
+        });
+    }
+
+    /// Called each frame to check whether the background load thread has finished.
+    /// If so, does the GPU upload (must be on the main thread) and clears `loading`.
+    fn maybe_finish_load(&mut self) {
+        let result = self.pending_load.lock().unwrap().take();
+        let Some(load) = result else { return };
+
+        if let Some((_, renderer)) = &mut self.gpu {
+            match load.assets {
+                Some(ref za) => {
+                    renderer.upload_zone_assets(za);
+                    eprintln!("renderer: uploaded {} meshes for '{}'", renderer.gpu_meshes.len(), load.zone_name);
+                }
+                None => {
+                    renderer.upload_zone_assets(&debug_zone::make_fallback_ground());
+                }
             }
         }
-        // Load EQ zone map lines (.txt) for the minimap overlay.
-        let maps_dir = self.assets_path.join("maps");
-        self.zone_map = zone_map::ZoneMap::load(&maps_dir, &zone_name);
 
-        self.loading = false;
+        self.zone_min  = load.zone_min;
+        self.zone_max  = load.zone_max;
+        self.collision = load.collision.clone();
+        *self.shared_collision.write().unwrap() = load.collision;
+        self.zone_map  = load.zone_map;
+        self.loading   = false;
+        *self.load_status.lock().unwrap() = String::new();
     }
 
     // ── GPU initialisation ────────────────────────────────────────────────────
@@ -314,7 +386,7 @@ impl App {
         );
         let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
         let mut renderer  = EqRenderer::new(device, queue, surface_config);
-        renderer.load_character_models(&self.models_path);
+        renderer.load_character_models(&self.models_path, &self.assets_path);
         self.egui_ctx      = Some(egui_ctx);
         self.egui_state    = Some(egui_state);
         self.egui_renderer = Some(egui_renderer);
@@ -330,6 +402,21 @@ impl App {
             apply_packet(&mut self.game_state, &packet);
         }
         self.scene = SceneState::from_game_state(&self.game_state);
+
+        // In the test zone, inject fake billboards so every loaded character model
+        // is rendered side-by-side for visual debugging.
+        if self.scene.zone == "testzone" {
+            self.scene.inject_test_billboards();
+        }
+
+        // Snap NPC billboards to terrain floor so they don't hover above geometry.
+        // NPCs get z from the server spawn/update packets; the player gets floor_z
+        // applied each frame. Apply the same grounding to entity billboards here.
+        if let Some(col) = &self.collision {
+            for b in &mut self.scene.billboards {
+                b.pos[2] = col.floor_z(b.pos[0], b.pos[1], b.pos[2]);
+            }
+        }
 
         // Detect movement from the logical (server-authoritative) position.
         // Nav steps fire every 150 ms; we latch "moving" for 250 ms so the
@@ -350,7 +437,14 @@ impl App {
         }
 
         // Snap camera to player on first valid spawn.
-        if !self.camera_initialized && self.game_state.player_id != 0 {
+        // In testzone there's no server, so init the camera immediately once the
+        // zone is loaded (billboards injected, GPU ready).
+        let should_init_cam = if self.scene.zone == "testzone" {
+            !self.camera_initialized && self.gpu.is_some() && !self.loading
+        } else {
+            !self.camera_initialized && self.game_state.player_id != 0
+        };
+        if should_init_cam {
             self.visual_player_pos = self.scene.player_pos;
             self.camera = CameraState::new(self.scene.player_pos, self.scene.player_heading);
             self.camera_initialized = true;
@@ -473,12 +567,19 @@ impl App {
                 const STEP_HEIGHT: f32 = 3.0;
                 let new_e = base[0] + mde;
                 let new_n = base[1] + mdn;
+                // When floor_z finds no geometry it returns the fallback unchanged.
+                // Guard against that: if step_floor == step_fallback the ray missed and
+                // we must NOT step up, otherwise the player gets launched into the sky
+                // one STEP_HEIGHT per frame whenever they walk over a gap in the mesh.
+                let step_fallback = base[2] + STEP_HEIGHT;
                 let step_floor = if self.on_ground && (mde != 0.0 || mdn != 0.0) {
-                    self.ground_z(new_e, new_n, base[2] + STEP_HEIGHT)
+                    self.ground_z(new_e, new_n, step_fallback)
                 } else {
                     base[2]
                 };
+                let geometry_hit = (step_floor - step_fallback).abs() > 0.05;
                 let new_z = if self.on_ground
+                    && geometry_hit
                     && step_floor > base[2] + 0.1
                     && step_floor - base[2] <= STEP_HEIGHT
                 {
@@ -611,13 +712,19 @@ impl App {
             if let Some(cmd) = lock.take() { self.camera.apply_cmd(cmd); }
         }
         let (mut cam_eye, cam_target) = self.camera.tick(dt, self.scene.player_pos, self.scene.player_heading);
-        // Camera collision: if a wall sits between the player and the eye, pull the eye
-        // in to just before it so the view never ends up on the far side of geometry
-        // (OpenEQ does the same with a ray query against its collision octree).
+        // Camera collision: iteratively pull the eye toward the target until
+        // the segment is clear.  A single pass fails in multi-story buildings
+        // where the eye lands between two floor slabs.
         if let Some(col) = self.collision.as_deref() {
-            if let Some(t) = col.nearest_hit_t(cam_target, cam_eye) {
-                let frac = (t * 0.9).clamp(0.05, 1.0);
-                cam_eye = lerp3(cam_target, cam_eye, frac);
+            for _ in 0..5 {
+                if let Some(t) = col.nearest_hit_t(cam_target, cam_eye) {
+                    let frac = (t * 0.85).clamp(0.05, 1.0);
+                    let new_eye = lerp3(cam_target, cam_eye, frac);
+                    if new_eye == cam_eye { break; }
+                    cam_eye = new_eye;
+                } else {
+                    break;
+                }
             }
         }
         if let Ok(mut snap) = self.camera_snapshot.lock() { *snap = self.camera.snapshot(); }
@@ -650,10 +757,12 @@ impl App {
         self.pick_screen_h  = renderer.surface_config.height;
 
         // Egui pass — use associated function to avoid reborrowing self.
+        let load_status_text = self.load_status.lock().unwrap().clone();
         Self::egui_pass(
             &mut self.egui_state, &mut self.egui_renderer, &self.egui_ctx, &self.window,
-            &mut enc, &view, renderer, self.loading, &self.current_zone, &self.scene,
-            self.zone_min, self.zone_max, &mut self.minimap_zoom, &mut self.minimap_full,
+            &mut enc, &view, renderer, self.loading, &self.current_zone, &load_status_text,
+            &self.scene, self.zone_min, self.zone_max,
+            &mut self.minimap_zoom, &mut self.minimap_full,
             self.current_fps, self.zone_map.as_ref(),
             cam_eye, self.collision.as_deref(),
             &self.hail, &self.say, &self.target, &mut self.say_buffer,
@@ -661,6 +770,15 @@ impl App {
 
         // Submit — associated function avoids reborrowing self.
         Self::submit_frame(&self.frame_req, enc, output, renderer);
+
+        if self.loading {
+            // Cap at 120 fps while loading so the background thread gets more CPU.
+            let frame_budget = std::time::Duration::from_micros(8_333);
+            let elapsed = now.elapsed();
+            if elapsed < frame_budget {
+                std::thread::sleep(frame_budget - elapsed);
+            }
+        }
 
         if let Some(w) = &self.window { w.request_redraw(); }
         // GPU borrow (renderer) is released here.
@@ -679,6 +797,7 @@ impl App {
         renderer:      &EqRenderer,
         loading:       bool,
         current_zone:  &str,
+        load_status:   &str,
         scene:         &SceneState,
         zone_min:      [f32; 2],
         zone_max:      [f32; 2],
@@ -704,7 +823,7 @@ impl App {
         let full_output = egui_ctx.run(raw_input, |ctx| {
             hud::draw_fps(ctx, current_fps);
             if loading {
-                hud::draw_loading(ctx, current_zone);
+                hud::draw_loading(ctx, current_zone, load_status);
             } else {
                 hud::draw_hud(ctx, scene, "EQ Observer");
                 hud::draw_quest_dialogue(ctx, scene, say);
@@ -830,6 +949,8 @@ impl ApplicationHandler for App {
                 if mem::take(&mut self.pending_reload) {
                     self.reload_zone();
                 }
+                // Check whether the background load thread finished; do GPU upload if so.
+                self.maybe_finish_load();
             }
 
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
@@ -886,7 +1007,7 @@ impl ApplicationHandler for App {
                                 | KeyCode::Space => {
                                     self.keys_held.insert(code);
                                 }
-                                KeyCode::KeyR => {
+                                KeyCode::KeyR | KeyCode::F9 => {
                                     self.camera.reset_to_follow();
                                     self.override_pos = None;
                                     *self.goto_target.lock().unwrap() = None;

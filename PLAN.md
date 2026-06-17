@@ -1,289 +1,106 @@
-# eq_client_lite: Rust GM Observer Client for EQEmu
+# Plan: Debug Test Zone — Character Model Rendering
 
-## Context
+## Problem
 
-`eq_client_lite` is a copy of `eq_renderer` modified to connect directly to the EQEmu server as a GM-level game client instead of receiving game state from a Python bot via Unix socket. It logs in as a GM character, uses GM commands to follow a target player (teleport + invisibility), receives real-time entity position updates via the EQ protocol, and renders the 3D scene — **zero server modifications required**.
+All character/NPC models (loaded from EQ `_chr.s3d` archives) render with arms and
+legs smashed together on top of each other. The debug zone ("testzone") currently
+only shows a ground plane + axis sticks — no character models are rendered at all,
+so there's no way to visually inspect or debug model rendering.
 
-The `aiquestbot` character will be promoted to GM status in the database.
+## Root Cause Analysis
 
-## Architecture
+The rendering pipeline for character models depends on `scene.billboards` — a list
+of Billboard structs with `race`, `pos`, `heading`, etc. Billboards are populated
+from `GameState.entities` which only has data when connected to a live EQ server.
+In testzone there's no server connection, so the billboard list is always empty and
+character models are never rendered.
 
+Even if billboards existed, the static entity pass (`encode_entity_pass`) and
+skinned entity pass (`encode_skinned_entity_pass`) both look up archetypes from
+billboard race strings. The `y_bottom` / `x_center` / `z_center` values computed
+during `load_from_chr_s3d` may also be incorrect for the EQ coordinate system
+(EQ: [east, height, north] vs rendering: [east, north, height]).
+
+## Plan
+
+### Step 1: Add test billboard injection in `app.rs`
+
+When zone == "testzone", after the scene is built from game_state, inject a
+hardcoded list of Billboard entries — one per loaded archetype — spaced out along
+the east axis so every model is visible side-by-side.
+
+Each billboard gets:
+- `race`: the EQ race code (e.g. "HUM", "ELF", "DWF", "GNL", "SKE", "ZOM", etc.)
+- `pos`: [east, north, z] with z=0 (ground level) and increasing east offset
+- `level`: 50 (high enough to avoid level-0 placeholder logic)
+- `action`: "idle" (standing still)
+- `heading`: 0 (facing north)
+- `id`: unique per archetype (1000+index to avoid collision with real spawn_ids)
+
+Location: `render_frame()` in `app.rs`, right after `self.scene = SceneState::from_game_state(...)`.
+
+### Step 2: Add `inject_test_billboards()` method to `SceneState`
+
+A helper function in `scene.rs` that populates `billboards` with one entry per
+loaded archetype. This keeps the test logic self-contained.
+
+### Step 3: Fix `y_bottom` for static chr.s3d models
+
+The `load_from_chr_s3d()` in `models.rs` computes `y_bottom` as:
+```rust
+let wy = p[1] + m.center[1]; // libeq: [east, height, north]
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                     EQEmu Server (unchanged)                 │
-│                                                              │
-│  Login Server (5998) ──► World Server (9000) ──► Zone Server│
-│  (auth)                   (char select,                      │
-│                           /goto, zoning)                     │
-└──────────────┬───────────────────────────────────────────────┘
-               │  EQ Protocol (UDP + XOR stream)
-               │  - Login with GM account
-               │  - Select character "aiquestbot"
-               │  - /goto <target_player>  (teleport to player)
-               │  - #hide_me               (invisible to others)
-               │  - Receive OP_SpawnPositionUpdate for entities
-               │  - Receive OP_NewSpawn / OP_DeleteSpawn
-               │
-               ▼
-┌──────────────────────────────────────────────────────────────┐
-│                    eq_client_lite (Rust)                     │
-│                                                              │
-│  ┌─────────────────┐    ┌─────────────────────────────────┐ │
-│  │  eq_protocol     │    │  renderer (from eq_renderer)    │ │
-│  │  - LoginClient   │───►│  - reads GameStateMsg from      │ │
-│  │  - WorldClient   │    │    BotMap (same as before)      │ │
-│  │  - ZoneClient    │    │  - renders zone + entities      │ │
-│  │  - XOR codec     │    │  - AutoFollows player           │ │
-│  │  - CRC32         │    │  - loads S3D zone geometry      │ │
-│  └─────────────────┘    └─────────────────────────────────┘ │
-│                                                              │
-│  Flow:                                                       │
-│  1. Connect → login → world → zone (select aiq[...]         │
-│  2. /goto <target> → teleport to player                      │
-│  3. Loop:                                                    │
-│     a. Receive spawn position updates from server            │
-│     b. Build GameStateMsg from EQ protocol data              │
-│     c. Insert into BotMap (same format as RendererClient)    │
-│     d. Renderer reads BotMap → renders frame                 │
-│     e. If player zones → detect via position change →        │
-│        /goto again                                           │
-│  4. Camera follows player automatically                      │
-└──────────────────────────────────────────────────────────────┘
-```
+This is correct (p[1] = height in S3D convention). But `y_bottom` is the distance
+from Y=0 to the model bottom. If the model's feet are at Y=5 and head at Y=20,
+`y_bottom` should be 5.0 (distance feet are below origin). The current code takes
+`y_min` (the minimum Y) and negates if negative — this gives 0 when the model sits
+at Y>=0, which means no vertical lift and the model is placed at ground level
+correctly. But the `visual_scale = 2.0 * y_bottom * arch_scale` formula needs
+`y_bottom` to be >0 for the model to have any visible size.
 
-## What Gets Reused From eq_renderer (Unchanged)
+**Bug**: For chr.s3d models where all vertex Y values are >= 0, `y_bottom` is 0,
+making `visual_scale = 0` and the model invisible (or infinitely thin).
 
-| Module | Purpose |
-|--------|---------|
-| `renderer.rs` | GPU rendering coordinator |
-| `pass.rs` | Render passes (sky, zone, billboard, entities) |
-| `pipeline.rs` | wgpu pipeline construction |
-| `gpu.rs` | GPU types and upload |
-| `assets.rs` | S3D/WLD zone geometry loading |
-| `models.rs` | glTF model loading |
-| `anim.rs` | Skeletal animation |
-| `camera.rs` | Camera math |
-| `camera_state.rs` | AutoFollow camera |
-| `scene.rs` | `GameStateMsg` → `SceneState` conversion |
-| `hud.rs` | egui HUD overlay |
-| `http.rs` | Axum HTTP camera control |
-| `billboard.rs` | Billboard geometry |
-| `debug_zone.rs` | Test zone |
-| `shaders/` | All WGSL shaders |
+**Fix**: Change y_bottom computation to measure the model's total height
+(max_y - min_y) rather than distance below origin. This gives the model a
+non-zero visual_scale.
 
-## What Gets Replaced/Modified
+### Step 4: Add debug logging to `load_character_models()`
 
-| Original | Replacement |
-|----------|-------------|
-| `ipc.rs` (Unix socket listener) | `eq_protocol/` module (EQ protocol client) |
-| `main.rs` (spawns IPC thread) | `main.rs` (spawns EQ protocol thread) |
+Print per-archetype diagnostic info: y_bottom, x_center, z_center, mesh count,
+vertex count, and whether it loaded as skinned or static. This helps identify
+which models have bad bounds.
 
-## New Module: `eq_protocol/`
+### Step 5: Build, test, and iterate
 
-A new directory `src/eq_protocol/` implementing the EQ client protocol in Rust:
+1. `cargo build --release` (auto-restarts client)
+2. Connect to testzone: the injected billboards appear as character models
+3. Check stderr for model loading diagnostics
+4. Use `/frame` API to capture screenshot and inspect rendering
+5. Adjust archetype_scale values or y_bottom fix as needed
 
-### `eq_protocol/mod.rs` — Connection orchestrator
-- `EqClient` struct that manages the full connection lifecycle:
-  1. Connect to login server (UDP 5998) → authenticate
-  2. Get world server address → connect to world (UDP)
-  3. Send `OP_SendLoginInfo` → get character list
-  4. Send `OP_EnterWorld` with character name
-  5. Receive `OP_ZoneServerInfo` → connect to zone server (UDP)
-  6. Send `OP_ZoneEntry` → receive spawns + position updates
-  7. Enter main loop: parse packets, build `GameStateMsg`, insert into `BotMap`
+### Step 6: Fix any remaining rendering issues
 
-### `eq_protocol/login.rs` — Login server protocol
-- UDP connection to port 5998
-- `OP_SessionRequest` / `OP_SessionResponse` (XOR key exchange)
-- `OP_Login` with DES-CBC encrypted credentials (zero key)
-- `OP_ServerListRequest` / `OP_PlayEverquestRequest` to get world server address
-
-### `eq_protocol/world.rs` — World server protocol
-- UDP connection to world server port
-- `OP_SendLoginInfo` (send account ID + session key)
-- `OP_EnterWorld` (select character)
-- `OP_ZoneServerInfo` reception (get zone server address)
-- GM command: send `OP_GMGoto` to teleport to target player
-- GM command: send `OP_GMHideMe` to become invisible
-
-### `eq_protocol/zone.rs` — Zone server protocol
-- UDP connection to zone server
-- `OP_ZoneEntry` (enter zone)
-- Parse `OP_ZoneSpawns` (bulk entity spawn data)
-- Parse `OP_NewSpawn` / `OP_DeleteSpawn` (entity appear/disappear)
-- Parse `OP_SpawnPositionUpdate` (entity position updates — the key data source)
-- Parse `OP_SpawnAppearance` (entity state changes)
-- Parse `OP_NewZone` (zone name for geometry loading)
-- Send `OP_ClientUpdate` (our own position updates as we teleport around)
-
-### `eq_protocol/codec.rs` — Protocol codec
-- Reliable UDP stream (sequence numbers, ACKs, retransmit)
-- XOR encoding/decoding (running key cipher)
-- CRC32 checksum
-- Zlib compression/decompression
-- Packet framing (combine, fragment, parse)
-
-### `eq_protocol/structs.rs` — Packet structures
-- All EQ protocol structs as Rust types with `#[derive(Pod, Zeroable)]` for bytemuck
-- `Spawn_Struct`, `PlayerPositionUpdateClient_Struct`, `PlayerPositionUpdateServer_Struct`, `LoginInfo`, etc.
-
-### `eq_protocol/opcodes.rs` — Opcode constants
-- All EQ protocol opcode values
-
-## Modified Files
-
-### `src/main.rs`
-**Before:** Spawns tokio thread running `ipc::spawn_multi_listener()` to read Unix socket.
-**After:** Spawns a thread running `EqClient::run()` that connects to the EQEmu server via EQ protocol and populates the `BotMap`.
-
-Key changes:
-1. Remove `use crate::ipc;` 
-2. Add `use crate::eq_protocol::EqClient;`
-3. Parse new CLI args: `--login-host`, `--login-port`, `--account`, `--password`, `--character`, `--target-player`
-4. Instead of spawning IPC listener, spawn:
-   ```std
-   let bot_map_clone = bot_map.clone();
-   std::thread::spawn(move || {
-       let mut client = EqClient::new(login_host, login_port, account, password, character, target_player);
-       client.run(bot_map_clone);
-   });
-   ```
-5. Everything else (winit loop, rendering, camera, HUD) stays identical
-
-### `Cargo.toml`
-Add dependencies:
-- `des = "0.8"` — DES-CBC encryption for login
-- `rand = "0.8"` — random connect codes
-- `byteorder = "1.5"` — byte-order conversion for protocol structs
-
-## Connection & Following Strategy
-
-### Phase 1: Connect and Enter World
-1. Connect to login server, authenticate, get world server address
-2. Connect to world server, send login info, get character list
-3. Enter world with the GM character
-4. Receive zone server address, connect to zone
-
-### Phase 2: Follow Target Player
-1. Send `OP_GMGoto` with target player's name → teleport to them
-2. Send `OP_GMHideMe` → become invisible
-3. Receive `OP_SpawnPositionUpdate` packets for all nearby entities
-4. Build `GameStateMsg` from spawn data + position updates
-
-### Phase 3: Cross-Zone Following
-When the target player zones:
-1. The player's spawn disappears (we stop receiving position updates for them)
-2. We detect this (no update for target's spawn_id within timeout)
-3. Send `OP_GMGoto` again → world server handles cross-zone teleport
-4. Server sends `OP_ZoneServerInfo` for new zone → we reconnect to new zone server
-5. Renderer detects `zone_changed` and loads new zone geometry
-6. Resume receiving position updates in new zone
-
-### Position Data Flow (Per Frame)
-```
-Zone Server → OP_SpawnPositionUpdate → eq_protocol/zone.rs
-  → Extract spawn_id, x, y, z, heading
-  → Update internal entity map
-  → Every 100ms: build GameStateMsg {
-      zone: current_zone_name,
-      zone_changed: detected_zone_change,
-      player: PlayerMsg { pos: [x, y, z], heading, name, level, hp_pct, race, action },
-      entities: Vec<EntityMsg> { id, name, pos, heading, race, is_npc, level, hp_pct, ... },
-      target: current_target,
-      messages: recent_chat/combat,
-    }
-  → bot_map.lock().unwrap().insert("default", msg)
-  → Renderer reads bot_map → renders frame
-```
-
-## Implementation Steps
-
-### Step 1: Project Setup
-- [x] Copy `eq_renderer` to `~/git/eq_client_lite/`
-- [ ] Update `Cargo.toml` with new dependencies (`des`, `rand`, `byteorder`)
-- [ ] Create `src/eq_protocol/` directory with module files
-- [ ] Update `main.rs` to declare `eq_protocol` module
-
-### Step 2: Protocol Codec (`codec.rs`)
-- [ ] Implement reliable UDP connection (UDP socket + sequence tracking)
-- [ ] Implement XOR encoding/decoding
-- [ ] Implement CRC32 checksum
-- [ ] Implement zlib compression/decompression
-- [ ] Implement packet combine/fragment reassembly
-- [ ] Unit test: encode/decode round-trip
-
-### Step 3: Login Client (`login.rs`)
-- [ ] Implement `OP_SessionRequest` / `OP_SessionResponse` handshake
-- [ ] Implement DES-CBC encryption (zero key) for credentials
-- [ ] Implement `OP_Login` → `OP_LoginAccepted` → extract session key
-- [ ] Implement `OP_ServerListRequest` → `OP_PlayEverquestRequest` → get world address
-- [ ] Integration test: connect to login server (if available)
-
-### Step 4: World Client (`world.rs`)
-- [ ] Implement `OP_SendLoginInfo` (send account ID + session key)
-- [ ] Parse `OP_SendCharInfo` (character list)
-- [ ] Implement `OP_EnterWorld` (select character)
-- [ ] Parse `OP_ZoneServerInfo` (get zone server address)
-- [ ] Implement `OP_GMGoto` (teleport to player)
-- [ ] Implement `OP_GMHideMe` (invisibility)
-
-### Step 5: Zone Client (`zone.rs`)
-- [ ] Implement `OP_ZoneEntry` (enter zone)
-- [ ] Parse `OP_ZoneSpawns` (bulk spawn data — initial entity state)
-- [ ] Parse `OP_NewSpawn` / `OP_DeleteSpawn` (entity lifecycle)
-- [ ] Parse `OP_SpawnPositionUpdate` (real-time position updates)
-- [ ] Parse `OP_NewZone` (zone name)
-- [ ] Build `GameStateMsg` from accumulated entity state
-- [ ] Insert into `BotMap`
-
-### Step 6: Main Loop Integration (`main.rs`)
-- [ ] Replace IPC thread with EQ protocol thread
-- [ ] Add CLI args for connection parameters
-- [ ] Wire up `EqClient` to populate `BotMap`
-- [ ] Test: renderer shows zone + entities from live server
-
-### Step 7: Cross-Zone Following
-- [ ] Detect target player zone-out (spawn disappears)
-- [ ] Re-send `OP_GMGoto` to follow to new zone
-- [ ] Handle zone server reconnect
-- [ ] Set `zone_changed: true` for one frame to trigger geometry reload
-
-### Step 8: Polish
-- [ ] Handle disconnections and reconnection
-- [ ] Add logging for protocol events
-- [ ] Add `/target` command support
-- [ ] Tweak camera for observer perspective
-
-## Files to Create
-
-| File | Purpose |
-|------|---------|
-| `src/eq_protocol/mod.rs` | `EqClient` — connection lifecycle, login→world→zone orchestration |
-| `src/eq_protocol/codec.rs` | Reliable UDP stream, XOR codec, CRC32, zlib compression |
-| `src/eq_protocol/login.rs` | Login server protocol (auth, DES encryption, server select) |
-| `src/eq_protocol/world.rs` | World server protocol (char select, enter world, GM commands) |
-| `src/eq_protocol/zone.rs` | Zone server protocol (spawn tracking, position updates, GameStateMsg builder) |
-| `src/eq_protocol/structs.rs` | EQ protocol packet structures as Rust types |
-| `src/eq_protocol/opcodes.rs` | All opcode constant definitions |
+Based on visual inspection:
+- If models are lying flat: the Y-up to Z-up conversion may be wrong for static
+  chr.s3d models (check `y_up=true` in entity_model_matrix_heading)
+- If models are too small/large: adjust `archetype_scale()` values
+- If models are offset: check x_center/z_center values
+- If textures are wrong: check texture binding in entity pass
 
 ## Files to Modify
 
 | File | Change |
 |------|--------|
-| `src/main.rs` | Replace IPC thread with EQ protocol thread, add CLI args |
-| `Cargo.toml` | Add `des`, `rand`, `byteorder` dependencies |
-
-## Files to Delete
-
-| File | Reason |
-|------|--------|
-| `src/ipc.rs` | Replaced by `eq_protocol/` — no more Unix socket |
+| `src/scene.rs` | Add `inject_test_billboards()` method |
+| `src/app.rs` | Call inject method when zone == "testzone" |
+| `src/models.rs` | Fix y_bottom for chr.s3d, add debug logging |
+| `src/models.rs` | Review/update archetype_scale values if needed |
 
 ## Verification
 
-1. **Build:** `cargo build` compiles without errors
-2. **Connect:** Run with valid credentials, verify login → world → zone connection
-3. **Observe:** Renderer shows the zone with player and NPC entities visible
-4. **Follow:** Target player moves, verify camera follows smoothly
-5. **Zone:** Target player zones, verify renderer follows to new zone
-6. **Invisible:** Verify other players cannot see the GM observer
+- `cargo build --release` succeeds
+- Client restarts and shows testzone with all character models standing upright
+- Models have correct proportions (not smashed, not stretched)
+- Models are grounded on the terrain plane
+- `/frame` endpoint returns a PNG showing the models correctly

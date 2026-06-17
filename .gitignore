@@ -10,3 +10,12 @@
 # Local scheduled-task state (Claude Code cron)
 .claude/scheduled_tasks.json
 .claude/scheduled_tasks.lock
+
+# Tools build output
+tools/output/
+tools/target/
+
+# Local config / scripts
+.opencode/
+opencode.json
+--out

@@ -49,6 +49,67 @@ pub struct SceneState {
 }
 
 impl SceneState {
+    /// Populate billboards with one entry per loaded archetype for the test zone.
+    /// Each model is placed side-by-side along the east axis so every archetype
+    /// can be visually inspected.
+    pub fn inject_test_billboards(&mut self) {
+        use crate::models::race_to_archetype;
+        use std::collections::HashSet;
+
+        // EQ race codes that map to distinct archetypes. Each entry is
+        // (race_code, archetype_key, name_label).
+        // Archetypes without converted GLB models are skipped at render time.
+        let archetypes: Vec<(&str, &str, &str)> = vec![
+            ("HUM", "humanoid",  "Humanoid"),
+            ("ELF", "elf",       "Elf"),
+            ("DWF", "dwarf",     "Dwarf"),
+            ("GNL", "gnoll",     "Gnoll"),
+            ("FRG", "frog",      "Frog"),
+            ("SKE", "skeleton",  "Skeleton"),
+            ("ZOM", "zombie",    "Zombie"),
+            ("BEA", "bear",      "Bear"),
+            ("WOL", "wolf",      "Wolf"),
+            ("RAT", "rat",       "Rat"),
+            ("SNA", "snake",     "Snake"),
+            ("BAT", "bat",       "Bat"),
+            ("BRD", "bird",      "Bird"),
+            ("WSP", "wasp",      "Wasp"),
+            ("WRM", "worm",      "Worm"),
+        ];
+
+        // Deduplicate archetypes (e.g. WOL/LIO/CAT all map to "wolf").
+        let mut seen = HashSet::new();
+        let mut unique: Vec<(&str, &str, &str)> = Vec::new();
+        for entry in &archetypes {
+            let arch = race_to_archetype(entry.0);
+            if seen.insert(arch) {
+                unique.push(*entry);
+            }
+        }
+
+        let spacing = 20.0_f32; // east spacing between models
+        let start_east = -((unique.len() as f32) * spacing * 0.5); // center around origin
+
+        for (i, &(race, _arch, label)) in unique.iter().enumerate() {
+            let east = start_east + i as f32 * spacing;
+            self.billboards.push(crate::scene::Billboard {
+                id:        1000 + i as u32,
+                pos:       [east, 0.0, 0.0], // [east, north, height]
+                level:     50,
+                hp_pct:    100.0,
+                is_target: false,
+                dead:      false,
+                name:      format!("Test_{}", label),
+                race:      race.to_string(),
+                action:    "idle".to_string(),
+                heading:   0.0,
+            });
+        }
+
+        eprintln!("testzone: injected {} billboards for character model inspection",
+                  self.billboards.len());
+    }
+
     /// Build SceneState from a live GameState snapshot.
     pub fn from_game_state(gs: &GameState) -> Self {
         let billboards = gs.entities.values().map(|e| Billboard {
@@ -109,8 +170,8 @@ impl Default for LogEntry {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::game_state::{GameState, Entity};
+    use super::SceneState;
+    use crate::game_state::{Entity, GameState};
 
     fn sample_state() -> GameState {
         let mut gs = GameState::new();
@@ -189,5 +250,102 @@ mod tests {
     fn from_game_state_zone_name() {
         let scene = SceneState::from_game_state(&sample_state());
         assert_eq!(scene.zone, "qeynoshills");
+    }
+
+    // --- Coordinate swap: player_pos ---
+
+    #[test]
+    fn player_pos_coordinate_swap() {
+        let mut gs = GameState::new();
+        gs.player_x = 100.0;
+        gs.player_y = 200.0;
+        gs.player_z = 50.0;
+        let scene = SceneState::from_game_state(&gs);
+        assert_eq!(
+            scene.player_pos,
+            [200.0, 100.0, 50.0],
+            "player_pos should be [server_y, server_x, server_z]"
+        );
+    }
+
+    // --- Coordinate swap: entity billboard pos ---
+
+    #[test]
+    fn billboard_pos_coordinate_swap() {
+        let mut gs = GameState::new();
+        gs.upsert_entity(Entity {
+            spawn_id: 1,
+            name: "test".into(),
+            level: 1,
+            is_npc: true,
+            x: 10.0,
+            y: 20.0,
+            z: 5.0,
+            hp_pct: 100.0,
+            cur_hp: 100,
+            max_hp: 100,
+            race: String::new(),
+            heading: 0.0,
+            dead: false,
+        });
+        let scene = SceneState::from_game_state(&gs);
+        assert_eq!(scene.billboards.len(), 1);
+        let b = &scene.billboards[0];
+        assert_eq!(b.pos[0], 20.0, "pos[0] should be server_y (east)");
+        assert_eq!(b.pos[1], 10.0, "pos[1] should be server_x (north)");
+        assert_eq!(b.pos[2], 5.0,  "pos[2] should be server_z (height)");
+    }
+
+    // --- is_target flag ---
+
+    #[test]
+    fn target_entity_has_is_target_true() {
+        let gs = sample_state(); // target_id = Some(42)
+        let scene = SceneState::from_game_state(&gs);
+        let targeted: Vec<_> = scene.billboards.iter().filter(|b| b.is_target).collect();
+        assert_eq!(targeted.len(), 1);
+        assert_eq!(targeted[0].id, 42);
+    }
+
+    #[test]
+    fn non_target_entities_have_is_target_false() {
+        let mut gs = sample_state();
+        // Add a second entity that is NOT the target
+        gs.upsert_entity(Entity {
+            spawn_id: 99,
+            name: "bystander".into(),
+            level: 2,
+            is_npc: true,
+            x: 5.0, y: 5.0, z: 0.0,
+            hp_pct: 100.0,
+            cur_hp: 100,
+            max_hp: 100,
+            race: String::new(),
+            heading: 0.0,
+            dead: false,
+        });
+        gs.target_id = Some(42);
+        let scene = SceneState::from_game_state(&gs);
+        for b in &scene.billboards {
+            if b.id == 42 {
+                assert!(b.is_target, "id=42 should be targeted");
+            } else {
+                assert!(!b.is_target, "id={} should not be targeted", b.id);
+            }
+        }
+    }
+
+    // --- Message count ---
+
+    #[test]
+    fn message_count_matches() {
+        let mut gs = GameState::new();
+        gs.log_msg("say", "hello");
+        gs.log_msg("tell", "world");
+        gs.log_msg("ooc", "third");
+        let scene = SceneState::from_game_state(&gs);
+        assert_eq!(scene.messages.len(), 3);
+        assert_eq!(scene.messages[0].text, "hello");
+        assert_eq!(scene.messages[2].text, "third");
     }
 }

@@ -1,30 +1,12 @@
-mod app;
-mod assets;
-mod anim;
-mod billboard;
-mod camera;
-mod camera_state;
-mod config;
-mod debug_zone;
-mod eq_net;
-mod eqstr;
-mod frame_capture;
-mod game_state;
-mod gpu;
-mod http;
-mod hud;
-mod models;
-mod pass;
-mod pipeline;
-mod renderer;
-mod scene;
-mod zone_map;
-
+use eq_renderer::{assets, camera_state, config, eq_net, eqstr, http};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use winit::event_loop::EventLoop;
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let testzone_mode = args.contains(&"--testzone".to_string());
+
     let login_cfg = config::LoginConfig::load();
     let app_cfg   = config::AppConfig::load();
 
@@ -49,26 +31,28 @@ fn main() {
     let shared_collision: assets::SharedCollision = Arc::new(std::sync::RwLock::new(None));
     let frame_req:        http::FrameReq        = Arc::new(Mutex::new(None));
 
-    // EQ network task
+    // EQ network task — skipped in --testzone mode (offline debug)
     let character_name = login_cfg.character_name.clone();
-    let gt  = goto_target.clone();
-    let ep  = entity_positions.clone();
-    let ei  = entity_ids.clone();
-    let zp  = zone_points.clone();
-    let zc  = zone_cross.clone();
-    let hl  = hail.clone();
-    let sy  = say.clone();
-    let tg  = target.clone();
-    let at  = attack.clone();
-    let sc  = shared_collision.clone();
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-        rt.block_on(async {
-            if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, zc, hl, sy, tg, at, sc).await {
-                eprintln!("EQ: fatal: {e}");
-            }
+    if !testzone_mode {
+        let gt  = goto_target.clone();
+        let ep  = entity_positions.clone();
+        let ei  = entity_ids.clone();
+        let zp  = zone_points.clone();
+        let zc  = zone_cross.clone();
+        let hl  = hail.clone();
+        let sy  = say.clone();
+        let tg  = target.clone();
+        let at  = attack.clone();
+        let sc  = shared_collision.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+            rt.block_on(async {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, zc, hl, sy, tg, at, sc).await {
+                    eprintln!("EQ: fatal: {e}");
+                }
+            });
         });
-    });
+    }
 
     // HTTP server
     let app_goto = goto_target.clone();
@@ -92,7 +76,7 @@ fn main() {
     );
 
     let event_loop = EventLoop::new().expect("event loop");
-    let mut application = app::App::new(
+    let mut application = eq_renderer::app::App::new(
         app_cfg.assets_path,
         app_cfg.models_path,
         character_name,
@@ -105,6 +89,7 @@ fn main() {
         app_say,
         app_target,
         shared_collision,
+        testzone_mode,
     );
     event_loop.run_app(&mut application).expect("event loop run");
 }

@@ -1,6 +1,7 @@
 /// EQ coordinate system: Z-up. North=+Y. East=+X. Heading 0=north, increases clockwise.
-
+///
 /// Third-person follow camera. Returns (camera_pos, look_target).
+#[allow(dead_code)]
 pub fn follow_camera(player_pos: [f32; 3], heading_deg: f32) -> ([f32; 3], [f32; 3]) {
     let angle = (90.0_f32 - heading_deg).to_radians();
     let back_dist = 80.0_f32;
@@ -25,6 +26,7 @@ pub fn look_at_perspective(
 
 /// Model matrix: translate to pos lifted by scale*0.5, yaw toward camera, uniform scale.
 /// Applies +90° X rotation to convert glTF Y-up models to EQ Z-up world space.
+#[allow(dead_code)]
 pub fn entity_model_matrix(pos: [f32; 3], cam_pos: [f32; 3], scale: f32) -> [[f32; 4]; 4] {
     entity_model_matrix_scaled(pos, cam_pos, scale, scale, [0.0, 0.0])
 }
@@ -37,6 +39,7 @@ pub fn entity_model_matrix(pos: [f32; 3], cam_pos: [f32; 3], scale: f32) -> [[f3
 /// in raw model space (before scale), so the rendered model is centered on the entity position.
 ///
 /// Pass center_xz = [0.0, 0.0] for models that are already origin-centered.
+#[allow(dead_code)]
 pub fn entity_model_matrix_scaled(
     pos: [f32; 3], cam_pos: [f32; 3], visual_scale: f32, mesh_scale: f32,
     center_xz: [f32; 2],
@@ -68,11 +71,11 @@ pub fn entity_model_matrix_scaled(
 /// yaw formula applies.
 pub fn entity_model_matrix_heading(
     pos: [f32; 3], heading_deg: f32, visual_scale: f32, mesh_scale: f32,
-    center_xz: [f32; 2], y_up: bool,
+    center_xz: [f32; 2], y_up: bool, y_bottom: f32,
 ) -> [[f32; 4]; 4] {
     let p      = glam::Vec3::from(pos);
     let yaw    = std::f32::consts::PI - heading_deg.to_radians();
-    let lifted = p + glam::Vec3::new(0.0, 0.0, visual_scale * 0.5);
+    let lifted = p + glam::Vec3::new(0.0, 0.0, visual_scale * 0.5 + y_bottom * mesh_scale);
     let x_rot  = if y_up { glam::Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2) }
                  else    { glam::Mat4::IDENTITY };
     // `center_xz` holds the two horizontal-axis centers in load order. The model's
@@ -106,7 +109,7 @@ pub fn project_to_screen(
         * glam::Vec4::new(world_pos[0], world_pos[1], world_pos[2], 1.0);
     if clip.w <= 0.0 { return None; }
     let ndc_z = clip.z / clip.w;
-    if ndc_z < 0.0 || ndc_z > 1.0 { return None; }
+    if !(0.0..=1.0).contains(&ndc_z) { return None; }
     Some([
         (clip.x / clip.w * 0.5 + 0.5) * screen_w as f32,
         (1.0 - (clip.y / clip.w * 0.5 + 0.5)) * screen_h as f32,
@@ -135,7 +138,7 @@ mod tests {
     #[test]
     fn static_model_y_up_axis_maps_to_world_up() {
         // y_up=true: a static model's +Y (its up axis) must convert to world +Z.
-        let m = entity_model_matrix_heading([0.0, 0.0, 0.0], 0.0, 0.0, 1.0, [0.0, 0.0], true);
+        let m = entity_model_matrix_heading([0.0, 0.0, 0.0], 0.0, 0.0, 1.0, [0.0, 0.0], true, 0.0);
         let up = apply(&m, [0.0, 1.0, 0.0]);
         assert!(up[2] > 0.9, "static +Y should map to world +Z (got {up:?})");
     }
@@ -145,7 +148,7 @@ mod tests {
         // y_up=false: a skinned model is already Z-up; its +Z must stay world +Z,
         // and its +Y must stay horizontal (NOT tip up). This guards the
         // double-rotation regression that laid characters flat on the ground.
-        let m = entity_model_matrix_heading([0.0, 0.0, 0.0], 0.0, 0.0, 1.0, [0.0, 0.0], false);
+        let m = entity_model_matrix_heading([0.0, 0.0, 0.0], 0.0, 0.0, 1.0, [0.0, 0.0], false, 0.0);
         let up = apply(&m, [0.0, 0.0, 1.0]);
         assert!(up[2] > 0.9, "skinned +Z should stay world +Z (got {up:?})");
         let fwd = apply(&m, [0.0, 1.0, 0.0]);
@@ -160,8 +163,8 @@ mod tests {
         // recentre values for an arbitrary vertex.
         let v = [0.004_f32, -0.003, 0.012];
         for y_up in [true, false] {
-            let m0 = entity_model_matrix_heading([0.0, 0.0, 0.0], 0.0, 1.0, 2600.0, [0.0, 0.0], y_up);
-            let m1 = entity_model_matrix_heading([0.0, 0.0, 0.0], 0.0, 1.0, 2600.0, [3.0, 5.0], y_up);
+            let m0 = entity_model_matrix_heading([0.0, 0.0, 0.0], 0.0, 1.0, 2600.0, [0.0, 0.0], y_up, 0.0);
+            let m1 = entity_model_matrix_heading([0.0, 0.0, 0.0], 0.0, 1.0, 2600.0, [3.0, 5.0], y_up, 0.0);
             let z0 = apply(&m0, v)[2];
             let z1 = apply(&m1, v)[2];
             assert!((z0 - z1).abs() < 1e-3,

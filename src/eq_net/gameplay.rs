@@ -7,7 +7,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::{Duration, sleep};
 
 use crate::eq_net::login::WorldCredentials;
-use crate::eq_net::navigation::Navigator;
+use crate::eq_net::navigation::{Navigator, make_position_packet};
 use crate::eq_net::packet_handler::apply_packet;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
@@ -44,10 +44,51 @@ pub async fn run_gameplay_phase(
             let _ = app_tx.send(packet.clone());
 
             match packet.opcode {
-                OP_REQUEST_CLIENT_ZONE_CHANGE if packet.payload.len() >= 74 => {
-                    // Server detected zone line crossing — echo OP_ZONE_CHANGE to confirm.
-                    s.send_app_packet(OP_ZONE_CHANGE, &packet.payload);
-                    eprintln!("EQ: OP_REQUEST_CLIENT_ZONE_CHANGE → echoed OP_ZONE_CHANGE");
+                // Server listed a lootable item — echo back immediately to take it.
+                OP_LOOT_ITEM => {
+                    gs.loot_last_activity = Some(std::time::Instant::now());
+                    gs.log_msg("loot", "Looting item...");
+                    s.send_app_packet(OP_LOOT_ITEM, &packet.payload);
+                    eprintln!("EQ: auto-loot: taking item (echoed OP_LootItem)");
+                }
+                OP_REQUEST_CLIENT_ZONE_CHANGE if packet.payload.len() >= 24 => {
+                    // Server wants us to move — either a zone transition or a same-zone teleport.
+                    // Parse RequestClientZoneChange_Struct (24 bytes):
+                    //   u16 zone_id, u16 instance_id, float y, float x, float z,
+                    //   float heading, u32 type
+                    // Wire layout: y at offset 4, x at offset 8 (Titanium struct)
+                    let zone_id     = u16::from_le_bytes([packet.payload[0], packet.payload[1]]);
+                    let instance_id = u16::from_le_bytes([packet.payload[2], packet.payload[3]]);
+                    let y = f32::from_le_bytes([packet.payload[4], packet.payload[5], packet.payload[6], packet.payload[7]]);
+                    let x = f32::from_le_bytes([packet.payload[8], packet.payload[9], packet.payload[10], packet.payload[11]]);
+                    let z = f32::from_le_bytes([packet.payload[12], packet.payload[13], packet.payload[14], packet.payload[15]]);
+
+                    if zone_id == gs.zone_id {
+                        // Same-zone teleport (e.g. #goto x y z, #zone 0).
+                        // The server expects the client to just move — it clears zone_mode
+                        // before we respond, so sending OP_ZONE_CHANGE would cause a cancel
+                        // and a spurious world reconnect (see zoning.cpp:1056-1068).
+                        // Wire y = server_y = east = gs.player_y; wire x = server_x = north = gs.player_x.
+                        gs.player_x = x;
+                        gs.player_y = y;
+                        gs.player_z = z;
+                        eprintln!("EQ: same-zone teleport → pos=({:.1},{:.1},{:.1})", x, y, z);
+                        // Send position update so the server knows where we are.
+                        let _ = app_tx.send(make_position_packet(gs.player_id, x, y, z));
+                    } else {
+                        // Cross-zone transition (#zone <name>): send OP_ZONE_CHANGE to
+                        // trigger the full zone-change protocol (world reconnect, etc.).
+                        let mut buf = [0u8; SIZE_ZONE_CHANGE];
+                        let nb = gs.player_name.as_bytes();
+                        buf[..nb.len().min(64)].copy_from_slice(&nb[..nb.len().min(64)]);
+                        buf[64..66].copy_from_slice(&zone_id.to_le_bytes());
+                        buf[66..68].copy_from_slice(&instance_id.to_le_bytes());
+                        buf[68..72].copy_from_slice(&y.to_le_bytes());
+                        buf[72..76].copy_from_slice(&x.to_le_bytes());
+                        buf[76..80].copy_from_slice(&z.to_le_bytes());
+                        s.send_app_packet(OP_ZONE_CHANGE, &buf);
+                        eprintln!("EQ: cross-zone OP_REQUEST_CLIENT_ZONE_CHANGE zone_id={zone_id} → sent OP_ZONE_CHANGE");
+                    }
                 }
                 OP_ZONE_CHANGE if packet.payload.len() >= 88 => {
                     let success = i32::from_le_bytes([
@@ -70,6 +111,39 @@ pub async fn run_gameplay_phase(
                     zone_redirect = Some((ip, info.port));
                 }
                 _ => {}
+            }
+        }
+
+        // ── Auto-loot ──────────────────────────────────────────────────────────
+        // Open next corpse 500ms after it was queued (delay lets server register the corpse).
+        if !gs.loot_session_active {
+            let ready = gs.loot_queued_at
+                .map(|t| t.elapsed().as_millis() >= 500)
+                .unwrap_or(false);
+            if ready {
+                if let Some(corpse_id) = gs.pending_loot.pop_front() {
+                    s.send_app_packet(OP_LOOT_REQUEST, &corpse_id.to_le_bytes());
+                    gs.loot_session_active = true;
+                    gs.loot_last_activity = Some(std::time::Instant::now());
+                    eprintln!("EQ: auto-loot: sent OP_LootRequest for corpse_id={}", corpse_id);
+                }
+                if gs.pending_loot.is_empty() {
+                    gs.loot_queued_at = None;
+                }
+            }
+        }
+        // Close session after 2 seconds of inactivity (all items have arrived)
+        if gs.loot_session_active {
+            if let Some(t) = gs.loot_last_activity {
+                if t.elapsed().as_secs_f32() > 2.0 {
+                    s.send_app_packet(OP_END_LOOT_REQUEST, &[]);
+                    gs.loot_session_active = false;
+                    gs.loot_last_activity = None;
+                    gs.log_msg("loot", "Looting complete");
+                    eprintln!("EQ: auto-loot: sent OP_EndLootRequest (session complete)");
+                    // Reset queued_at so the next corpse gets its own delay window.
+                    gs.loot_queued_at = gs.pending_loot.front().map(|_| std::time::Instant::now());
+                }
             }
         }
 
@@ -147,7 +221,7 @@ async fn reconnect_via_world(
     stream:      &mut Option<EqStream>,
     net_rx:      &mut Option<UnboundedReceiver<AppPacket>>,
     app_tx:      &UnboundedSender<AppPacket>,
-    gs:          &mut GameState,
+    _gs:         &mut GameState,
     char_name:   &str,
     creds:       &WorldCredentials,
 ) -> bool {

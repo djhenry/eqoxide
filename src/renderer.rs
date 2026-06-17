@@ -204,10 +204,12 @@ impl EqRenderer {
         self.zone_assets = Some(assets.clone());
     }
 
-    /// Load all archetype glTF models from `models_dir` and upload to GPU.
+    /// Load all archetype character models and upload to GPU.
+    /// Tries glTF files from `models_dir` first; falls back to EQ `_chr.s3d`
+    /// archives from `assets_path` if the glTF file is missing.
     /// Models with valid skins (joint_count ≤ 128) are loaded as Skinned; others as Static.
-    /// Missing files are logged and skipped; their archetype falls back to billboard rendering.
-    pub fn load_character_models(&mut self, models_dir: &std::path::Path) {
+    /// Missing models fall back to billboard rendering.
+    pub fn load_character_models(&mut self, models_dir: &std::path::Path, assets_path: &std::path::Path) {
         use crate::models::{ModelAsset, SkinnedMeshData};
         use wgpu::util::DeviceExt;
 
@@ -218,91 +220,130 @@ impl EqRenderer {
         ];
 
         for &key in ARCHETYPES {
-            let path = models_dir.join(format!("{}.glb", key));
-            match ModelAsset::load(&path) {
-                Ok(asset) => {
-                    let (_, tex_bgs) = upload_textures(
-                        &self.device, &self.queue, &asset.textures, &self.layouts.texture_bgl,
-                    );
-                    let tex_names: Vec<String> =
-                        asset.textures.iter().map(|t| t.name.clone()).collect();
+            // Try glTF first, then fall back to EQ _chr.s3d.
+            let gltf_path = models_dir.join(format!("{}.glb", key));
+            let asset = if gltf_path.exists() {
+                match ModelAsset::load(&gltf_path) {
+                    Ok(a) => Some(a),
+                    Err(e) => {
+                        eprintln!("renderer: glTF load failed for '{}': {}", key, e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
 
-                    let use_skinned = asset.skin.as_ref()
-                        .map_or(false, |s| s.joint_count > 0 && s.joint_count <= 128);
-
-                    let model = if use_skinned {
-                        let skin = asset.skin.unwrap();
-                        let meshes: Vec<GpuSkinnedMesh> = asset.meshes.iter()
-                            .zip(asset.skin_meshes.iter())
-                            .zip(asset.skinned_mesh_scales.iter())
-                            .filter_map(|((mesh, sd_opt), &mesh_node_scale)| {
-                                if mesh.positions.is_empty() || mesh.indices.is_empty() {
-                                    return None;
+            let asset = match asset {
+                Some(a) => a,
+                None => {
+                    // Fall back to EQ _chr.s3d archive.
+                    let chr_name = crate::models::archetype_to_chr_s3d(key);
+                    let chr_asset = chr_name.and_then(|name| {
+                        let path = assets_path.join(name);
+                        if path.exists() {
+                            match ModelAsset::load_from_chr_s3d(&path) {
+                                Ok(a) => Some(a),
+                                Err(e) => {
+                                    eprintln!("renderer: chr S3D load failed for '{}': {}", key, e);
+                                    None
                                 }
-                                let sd = sd_opt.as_ref();
-                                let vertices: Vec<SkinnedVertex> = mesh.positions.iter()
-                                    .enumerate()
-                                    .map(|(i, &p)| {
-                                        let nrm = mesh.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
-                                        let uv  = mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]);
-                                        let ji  = sd.and_then(|s: &SkinnedMeshData| s.joint_indices.get(i))
-                                                    .copied().unwrap_or([0u32; 4]);
-                                        let jw  = sd.and_then(|s: &SkinnedMeshData| s.joint_weights.get(i))
-                                                    .copied().unwrap_or([1.0, 0.0, 0.0, 0.0]);
-                                        SkinnedVertex { position: p, normal: nrm, uv,
-                                                        joint_indices: ji, joint_weights: jw }
-                                    })
-                                    .collect();
-                                let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                    label: None, contents: bytemuck::cast_slice(&vertices),
-                                    usage: wgpu::BufferUsages::VERTEX,
-                                });
-                                let ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                    label: None, contents: bytemuck::cast_slice(&mesh.indices),
-                                    usage: wgpu::BufferUsages::INDEX,
-                                });
-                                let texture_idx = mesh.texture_name.as_ref()
-                                    .and_then(|n| tex_names.iter().position(|t| t == n));
-                                Some(GpuSkinnedMesh { vertex_buf: vbuf, index_buf: ibuf,
-                                                       index_count: mesh.indices.len() as u32,
-                                                       texture_idx, base_color: mesh.base_color,
-                                                       mesh_node_scale })
+                            }
+                        } else {
+                            None
+                        }
+                    });
+                    match chr_asset {
+                        Some(a) => a,
+                        None => {
+                            eprintln!("renderer: no model for archetype '{}'", key);
+                            continue;
+                        }
+                    }
+                }
+            };
+            eprintln!("renderer: loaded '{}' — y_bottom={:.4} y_extent={:.4} x_center={:.4} z_center={:.4}",
+                key, asset.y_bottom, asset.y_extent, asset.x_center, asset.z_center);
+
+            let (_, tex_bgs) = upload_textures(
+                &self.device, &self.queue, &asset.textures, &self.layouts.texture_bgl,
+            );
+            let tex_names: Vec<String> =
+                asset.textures.iter().map(|t| t.name.clone()).collect();
+
+            let use_skinned = asset.skin.as_ref()
+                .is_some_and(|s| s.joint_count > 0 && s.joint_count <= 128);
+
+            let model = if use_skinned {
+                let skin = asset.skin.unwrap();
+                let meshes: Vec<GpuSkinnedMesh> = asset.meshes.iter()
+                    .zip(asset.skin_meshes.iter())
+                    .zip(asset.skinned_mesh_scales.iter())
+                    .filter_map(|((mesh, sd_opt), &mesh_node_scale)| {
+                        if mesh.positions.is_empty() || mesh.indices.is_empty() {
+                            return None;
+                        }
+                        let sd = sd_opt.as_ref();
+                        let vertices: Vec<SkinnedVertex> = mesh.positions.iter()
+                            .enumerate()
+                            .map(|(i, &p)| {
+                                let nrm = mesh.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
+                                let uv  = mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]);
+                                let ji  = sd.and_then(|s: &SkinnedMeshData| s.joint_indices.get(i))
+                                            .copied().unwrap_or([0u32; 4]);
+                                let jw  = sd.and_then(|s: &SkinnedMeshData| s.joint_weights.get(i))
+                                            .copied().unwrap_or([1.0, 0.0, 0.0, 0.0]);
+                                SkinnedVertex { position: p, normal: nrm, uv,
+                                                joint_indices: ji, joint_weights: jw }
                             })
                             .collect();
-                        eprintln!("renderer: loaded skinned model '{}' ({} joints, {} clips)",
-                                  key, skin.joint_count, skin.clips.len());
-                        GpuModel::Skinned(GpuSkinnedModel { meshes, texture_bind_groups: tex_bgs, skin, node_scale: asset.skinned_node_scale, y_bottom: asset.y_bottom, x_center: asset.x_center, z_center: asset.z_center })
-                    } else {
-                        let meshes: Vec<GpuMesh> = asset.meshes.iter().filter_map(|mesh| {
-                            if mesh.positions.is_empty() || mesh.indices.is_empty() { return None; }
-                            let vertices: Vec<Vertex> = mesh.positions.iter().enumerate()
-                                .map(|(i, &p)| {
-                                    let nrm = mesh.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
-                                    Vertex { position: p, normal: nrm,
-                                             uv: mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]) }
-                                }).collect();
-                            let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                label: None, contents: bytemuck::cast_slice(&vertices),
-                                usage: wgpu::BufferUsages::VERTEX,
-                            });
-                            let ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                label: None, contents: bytemuck::cast_slice(&mesh.indices),
-                                usage: wgpu::BufferUsages::INDEX,
-                            });
-                            let texture_idx = mesh.texture_name.as_ref()
-                                .and_then(|n| tex_names.iter().position(|t| t == n));
-                            Some(GpuMesh { vertex_buf: vbuf, index_buf: ibuf,
-                                           index_count: mesh.indices.len() as u32, texture_idx,
-                                           base_color: mesh.base_color })
+                        let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: None, contents: bytemuck::cast_slice(&vertices),
+                            usage: wgpu::BufferUsages::VERTEX,
+                        });
+                        let ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: None, contents: bytemuck::cast_slice(&mesh.indices),
+                            usage: wgpu::BufferUsages::INDEX,
+                        });
+                        let texture_idx = mesh.texture_name.as_ref()
+                            .and_then(|n| tex_names.iter().position(|t| t == n));
+                        Some(GpuSkinnedMesh { vertex_buf: vbuf, index_buf: ibuf,
+                                               index_count: mesh.indices.len() as u32,
+                                               texture_idx, base_color: mesh.base_color,
+                                               mesh_node_scale })
+                    })
+                    .collect();
+                eprintln!("renderer: loaded skinned model '{}' ({} joints, {} clips)",
+                          key, skin.joint_count, skin.clips.len());
+                GpuModel::Skinned(GpuSkinnedModel { meshes, texture_bind_groups: tex_bgs, skin, node_scale: asset.skinned_node_scale, y_bottom: asset.y_bottom, x_center: asset.x_center, z_center: asset.z_center })
+            } else {
+                let meshes: Vec<GpuMesh> = asset.meshes.iter().filter_map(|mesh| {
+                    if mesh.positions.is_empty() || mesh.indices.is_empty() { return None; }
+                    let vertices: Vec<Vertex> = mesh.positions.iter().enumerate()
+                        .map(|(i, &p)| {
+                            let nrm = mesh.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
+                            Vertex { position: p, normal: nrm,
+                                     uv: mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]) }
                         }).collect();
-                        eprintln!("renderer: loaded static model '{}'", key);
-                        GpuModel::Static(GpuStaticModel { meshes, texture_bind_groups: tex_bgs, y_bottom: asset.y_bottom, x_center: asset.x_center, z_center: asset.z_center })
-                    };
+                    let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None, contents: bytemuck::cast_slice(&vertices),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+                    let ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None, contents: bytemuck::cast_slice(&mesh.indices),
+                        usage: wgpu::BufferUsages::INDEX,
+                    });
+                    let texture_idx = mesh.texture_name.as_ref()
+                        .and_then(|n| tex_names.iter().position(|t| t == n));
+                    Some(GpuMesh { vertex_buf: vbuf, index_buf: ibuf,
+                                   index_count: mesh.indices.len() as u32, texture_idx,
+                                   base_color: mesh.base_color })
+                }).collect();
+                eprintln!("renderer: loaded static model '{}'", key);
+                GpuModel::Static(GpuStaticModel { meshes, texture_bind_groups: tex_bgs, y_bottom: asset.y_bottom, y_extent: asset.y_extent, x_center: asset.x_center, z_center: asset.z_center })
+            };
 
-                    self.gpu_character_models.insert(key, model);
-                }
-                Err(e) => eprintln!("renderer: skipping model '{}': {}", key, e),
-            }
+            self.gpu_character_models.insert(key, model);
         }
     }
 

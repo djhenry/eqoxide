@@ -146,15 +146,23 @@ impl Collision {
     ///
     /// Casts a true downward ray using Möller–Trumbore so only surfaces *below*
     /// the player are considered. Surfaces above the ray origin (bridges, balcony
-    /// undersides) have negative t and are never returned. Vertical walls produce
-    /// det ≈ 0 and are skipped, so standing next to a wall doesn't pull the floor
-    /// up to wall height.
+    /// undersides) have negative t and are never returned.
     pub fn floor_z(&self, east: f32, north: f32, fallback: f32) -> f32 {
         if self.cols == 0 { return fallback; }
-        // Start 2 units above the player (absorbs server-z / visual-z discrepancy)
-        // and cast 100 units straight down — ample range for any EQ zone geometry.
         let ray_start = [east, north, fallback + 2.0];
         let ray_end   = [east, north, fallback - 100.0];
+        match self.nearest_hit_t(ray_start, ray_end) {
+            Some(t) => ray_start[2] + t * (ray_end[2] - ray_start[2]),
+            None    => fallback,
+        }
+    }
+
+    /// Cast a ray upward from `(east, north, z_start)` and return the height
+    /// of the nearest ceiling hit, or `fallback` if none found.
+    pub fn ceiling_z(&self, east: f32, north: f32, z_start: f32, max_up: f32, fallback: f32) -> f32 {
+        if self.cols == 0 { return fallback; }
+        let ray_start = [east, north, z_start];
+        let ray_end   = [east, north, z_start + max_up];
         match self.nearest_hit_t(ray_start, ray_end) {
             Some(t) => ray_start[2] + t * (ray_end[2] - ray_start[2]),
             None    => fallback,
@@ -231,109 +239,123 @@ impl Collision {
 
 impl ZoneAssets {
     /// Load zone geometry and textures from an S3D archive.
+    /// Loads ALL .wld files in the archive (e.g. `qeytoqrg.wld`, `objects.wld`,
+    /// `lights.wld`) so buildings, trees, and light meshes are included.
     /// Skips unrecognised fragments with a warning instead of returning Err.
     pub fn load(s3d_path: &Path) -> Result<Self> {
-        // Step 1: Open the S3D archive with libeq_pfs.
         let file = std::fs::File::open(s3d_path)
             .with_context(|| format!("failed to open S3D archive: {}", s3d_path.display()))?;
         let mut pfs = libeq_pfs::PfsReader::open(file)
             .with_context(|| format!("failed to parse PFS archive: {}", s3d_path.display()))?;
 
-        // Step 2: Determine the .wld filename (same stem as the .s3d).
-        let stem = s3d_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .with_context(|| "S3D path has no file stem")?;
-        let wld_name = format!("{}.wld", stem);
-
-        // Step 3: Extract .wld bytes.
-        let wld_bytes = pfs
-            .get(&wld_name)
-            .with_context(|| format!("failed to read {} from archive", wld_name))?
-            .with_context(|| format!("{} not found inside archive", wld_name))?;
-
-        // Step 4: Parse the WLD file.
-        // NOTE: libeq_wld::load() calls Wld::load() which panics on parse error.
-        // Wrapping in catch_unwind is fragile, so we let the panic propagate.
-        let wld = libeq_wld::load(&wld_bytes)
-            .map_err(|e| anyhow::anyhow!("failed to parse WLD: {}", e))?;
-
-        // Step 5: Collect all filenames for texture lookup.
-        let filenames = pfs
+        let filenames: Vec<String> = pfs
             .filenames()
             .with_context(|| "failed to list archive filenames")?;
 
-        // Step 6: Build mesh data, splitting by primitive so each sub-mesh
-        // gets the correct material texture.  A single WLD mesh can use
-        // multiple materials (e.g. cobblestone + water + walls); the old
-        // code only took the first material and applied it everywhere.
+        // Find all .wld files in the archive.
+        let wld_files: Vec<&str> = filenames.iter()
+            .filter(|f| f.to_lowercase().ends_with(".wld"))
+            .map(|f| f.as_str())
+            .collect();
+
+        if wld_files.is_empty() {
+            anyhow::bail!("no .wld files found in {}", s3d_path.display());
+        }
+
         let mut meshes = Vec::new();
-        for mesh in wld.meshes() {
-            let all_positions = mesh.positions();
-            if all_positions.is_empty() {
-                continue;
-            }
+        for wld_name in &wld_files {
+            let wld_bytes = match pfs.get(wld_name) {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    eprintln!("warning: {} listed but not found in archive", wld_name);
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("warning: failed to read {}: {}", wld_name, e);
+                    continue;
+                }
+            };
 
-            let (cx, cy, cz) = mesh.center();
-            let all_normals = mesh.normals();
-            let all_uvs = mesh.texture_coordinates();
+            let wld = match libeq_wld::load(&wld_bytes) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("warning: failed to parse {}: {}", wld_name, e);
+                    continue;
+                }
+            };
 
-            for primitive in mesh.primitives() {
-                let prim_indices: Vec<u32> = primitive.indices();
-                if prim_indices.is_empty() {
+            for mesh in wld.meshes() {
+                let all_positions = mesh.positions();
+                if all_positions.is_empty() {
                     continue;
                 }
 
-                let positions: Vec<[f32; 3]> = prim_indices
-                    .iter()
-                    .map(|&i| {
-                        let p = all_positions[i as usize];
-                        [p[0], p[1], p[2]]
-                    })
-                    .collect();
-                let normals: Vec<[f32; 3]> = prim_indices
-                    .iter()
-                    .map(|&i| {
-                        all_normals
-                            .get(i as usize)
-                            .copied()
-                            .unwrap_or([0.0, 0.0, 1.0])
-                    })
-                    .collect();
-                let uvs: Vec<[f32; 2]> = prim_indices
-                    .iter()
-                    .map(|&i| {
-                        all_uvs
-                            .get(i as usize)
-                            .copied()
-                            .unwrap_or([0.0, 0.0])
-                    })
-                    .collect();
+                let (cx, cy, cz) = mesh.center();
+                let all_normals = mesh.normals();
+                let all_uvs = mesh.texture_coordinates();
 
-                let material = primitive.material();
-                let texture_name = material
-                    .base_color_texture()
-                    .and_then(|t| t.source());
+                for primitive in mesh.primitives() {
+                    let prim_indices: Vec<u32> = primitive.indices();
+                    if prim_indices.is_empty() {
+                        continue;
+                    }
 
-                meshes.push(MeshData {
-                    positions,
-                    normals,
-                    uvs,
-                    indices: (0..prim_indices.len() as u32).collect(),
-                    texture_name,
-                    base_color: [1.0, 1.0, 1.0, 1.0],
-                    center: [cx, cy, cz],
-                });
+                    let positions: Vec<[f32; 3]> = prim_indices
+                        .iter()
+                        .map(|&i| {
+                            let p = all_positions[i as usize];
+                            [p[0], p[1], p[2]]
+                        })
+                        .collect();
+                    let normals: Vec<[f32; 3]> = prim_indices
+                        .iter()
+                        .map(|&i| {
+                            all_normals
+                                .get(i as usize)
+                                .copied()
+                                .unwrap_or([0.0, 0.0, 1.0])
+                        })
+                        .collect();
+                    let uvs: Vec<[f32; 2]> = prim_indices
+                        .iter()
+                        .map(|&i| {
+                            all_uvs
+                                .get(i as usize)
+                                .copied()
+                                .unwrap_or([0.0, 0.0])
+                        })
+                        .collect();
+
+                    let material = primitive.material();
+                    let texture_name = material
+                        .base_color_texture()
+                        .and_then(|t| t.source());
+
+                    meshes.push(MeshData {
+                        positions,
+                        normals,
+                        uvs,
+                        indices: (0..prim_indices.len() as u32).collect(),
+                        texture_name,
+                        base_color: [1.0, 1.0, 1.0, 1.0],
+                        center: [cx, cy, cz],
+                    });
+                }
             }
         }
 
-        // Step 7: Load BMP textures from the archive.
+        // Load BMP and DDS textures from the archive.
         let mut textures = Vec::new();
         for filename in &filenames {
-            if !filename.to_lowercase().ends_with(".bmp") {
+            let lower = filename.to_lowercase();
+            let fmt = if lower.ends_with(".bmp") {
+                image::ImageFormat::Bmp
+            } else if lower.ends_with(".dds") {
+                image::ImageFormat::Dds
+            } else {
                 continue;
-            }
-            let bmp_bytes = match pfs.get(filename) {
+            };
+            let tex_bytes = match pfs.get(filename) {
                 Ok(Some(b)) => b,
                 Ok(None) => {
                     eprintln!("warning: texture {} listed but not found in archive", filename);
@@ -345,7 +367,7 @@ impl ZoneAssets {
                 }
             };
 
-            match image::load_from_memory_with_format(&bmp_bytes, image::ImageFormat::Bmp) {
+            match image::load_from_memory_with_format(&tex_bytes, fmt) {
                 Ok(img) => {
                     let rgba_img = img.to_rgba8();
                     let (width, height) = rgba_img.dimensions();
@@ -362,7 +384,43 @@ impl ZoneAssets {
             }
         }
 
+        eprintln!("zone_assets: loaded {} meshes, {} textures from {} ({} wld files)",
+                  meshes.len(), textures.len(), s3d_path.display(), wld_files.len());
         Ok(ZoneAssets { meshes, textures })
+    }
+
+    /// Load the base zone S3D plus the `_obj` S3D archive and merge all
+    /// meshes and textures.  The `_obj` archive contains buildings, trees,
+    /// campfires, signs and other static props that are placed in the zone.
+    pub fn load_all(s3d_path: &Path) -> Result<Self> {
+        let mut assets = Self::load(s3d_path)?;
+
+        // Try loading the companion _obj.s3d (same directory).
+        let stem = s3d_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let parent = s3d_path.parent().unwrap_or(Path::new("."));
+        let obj_path = parent.join(format!("{}_obj.s3d", stem));
+        if obj_path.exists() {
+            match Self::load(&obj_path) {
+                Ok(obj) => {
+                    eprintln!("zone_assets: merging {} meshes, {} textures from {}",
+                              obj.meshes.len(), obj.textures.len(), obj_path.display());
+                    assets.meshes.extend(obj.meshes);
+                    // Deduplicate textures by name to avoid GPU upload waste.
+                    let existing: std::collections::HashSet<String> =
+                        assets.textures.iter().map(|t| t.name.clone()).collect();
+                    for tex in obj.textures {
+                        if !existing.contains(&tex.name) {
+                            assets.textures.push(tex);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("zone_assets: failed to load {}: {}", obj_path.display(), e);
+                }
+            }
+        }
+
+        Ok(assets)
     }
 }
 

@@ -41,6 +41,7 @@ pub struct GpuSkinnedMesh {
     pub base_color:      [f32; 4],
     /// This mesh's node_scale from the glTF scene graph (may differ from the dominant scale
     /// stored on the model, e.g. weapon accessories vs the body mesh).
+    #[allow(dead_code)]
     pub mesh_node_scale: f32,
 }
 
@@ -58,6 +59,11 @@ pub struct GpuStaticModel {
     /// Distance from Y=0 to the bottom of the model in buffer vertex space.
     /// Used to compute the ground lift so models stand at Z=0 instead of floating or sinking.
     pub y_bottom:            f32,
+    /// Vertical extent of the model (max_y - min_y) in buffer vertex space.
+    /// Used to compute visual_scale: visual_scale = 2 * y_extent * arch_scale.
+    /// Separate from y_bottom because chr.s3d models may have vertices far above Y=0
+    /// (e.g. feet at Y=20), making y_bottom unreliable as a height proxy.
+    pub y_extent:            f32,
     pub x_center:            f32,
     pub z_center:            f32,
 }
@@ -73,6 +79,7 @@ pub struct GpuSkinnedModel {
     pub node_scale:          f32,
     /// Distance from Y=0 to the bottom of the model in raw (pre-node-scale) vertex space.
     /// Used to compute the ground lift: lift = y_bottom × mesh_scale.
+    #[allow(dead_code)]
     pub y_bottom:            f32,
     /// Center of the model in X and Z axes (raw pre-node-scale space, dominant-scale meshes).
     /// Applied as a centering correction so models render at their entity position, not offset.

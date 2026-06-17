@@ -52,7 +52,7 @@ pub fn draw_fps(ctx: &egui::Context, fps: f32) {
         });
 }
 
-pub fn draw_hud(ctx: &egui::Context, scene: &SceneState, bot_id: &str) {
+pub fn draw_hud(ctx: &egui::Context, scene: &SceneState, _bot_id: &str) {
     egui::Window::new("##hud")
         .anchor(egui::Align2::LEFT_BOTTOM, [0.0, 0.0])
         .title_bar(false)
@@ -175,6 +175,7 @@ pub fn nearest_npc(scene: &SceneState) -> Option<&crate::scene::Billboard> {
 }
 
 /// Cleaned display name of the nearest NPC (for the Hail button).
+#[allow(dead_code)]
 pub fn nearest_npc_name(scene: &SceneState) -> Option<String> {
     nearest_npc(scene).map(|b| crate::http::clean_entity_name(&b.name))
 }
@@ -322,8 +323,8 @@ pub fn draw_minimap(
     let zone_w = (zone_max[0] - zone_min[0]).max(1.0);
     let zone_h = (zone_max[1] - zone_min[1]).max(1.0);
 
-    // scene.player_pos is already [server_y=east, server_x=north, server_z] after GPU swap
-    let player_map = [scene.player_pos[0], scene.player_pos[1]];
+    // scene.player_pos = [east, north, height] (server_y=east at [0], server_x=north at [1]).
+    let player_map = [scene.player_pos[0], scene.player_pos[1]]; // [east, north]
 
     let map_px = if *fullscreen { 580.0_f32 } else { 200.0_f32 };
     let map_py = if *fullscreen { 580.0_f32 } else { 200.0_f32 };
@@ -425,10 +426,9 @@ pub fn draw_minimap(
                 gy += step;
             }
 
-            // Entity dots
+            // Entity dots — billboard.pos = [east, north, height] in GPU space.
             for b in &scene.billboards {
-                let em = [b.pos[0], b.pos[1]]; // b.pos is [east, north, height] after GPU swap
-                let sp = to_screen(em[0], em[1]);
+                let sp = to_screen(b.pos[0], b.pos[1]);
                 if !rect.contains(sp) { continue; }
                 let color = if b.dead {
                     egui::Color32::from_rgb(80, 80, 80)
@@ -471,13 +471,21 @@ pub fn draw_minimap(
         });
 }
 
-pub fn draw_loading(ctx: &egui::Context, zone: &str) {
+pub fn draw_loading(ctx: &egui::Context, zone: &str, status: &str) {
     egui::Area::new(egui::Id::new("loading"))
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
-            ui.label(egui::RichText::new(format!("Loading zone: {}…", zone))
-                .size(24.0)
-                .color(egui::Color32::WHITE));
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new(format!("Loading zone: {zone}"))
+                    .size(24.0)
+                    .color(egui::Color32::WHITE));
+                if !status.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(status)
+                        .size(16.0)
+                        .color(egui::Color32::from_gray(200)));
+                }
+            });
         });
 }
 

@@ -3,6 +3,8 @@
 //! Ported from the Python reference at eq_client/protocol/opcodes.py and
 //! eq_client/protocol/structs.py.
 
+#![allow(dead_code)]
+
 use std::mem;
 
 // ── Transport-layer opcodes ────────────────────────────────────────────────
@@ -93,6 +95,25 @@ pub const OP_AUTO_ATTACK2: u16 = 0x0701;
 pub const OP_TARGET_COMMAND: u16 = 0x1477;
 pub const OP_TARGET_MOUSE: u16   = 0x6c47; // sets server-side m_Target for combat
 pub const OP_CONSIDER: u16 = 0x65ca;
+
+// ── Gameplay: looting ─────────────────────────────────────────────────────
+
+/// Server → client when a mob dies and leaves a lootable corpse.
+/// Payload: BecomeCorpse_Struct = spawn_id(u32) + y(f32) + x(f32) + z(f32)
+/// OP_BECOME_CORPSE (0x4dbc): server → client when an NPC dies with loot.
+/// NOTE: 0x4839 appears at zone entry and seems to be a player-corpse location
+/// reminder, not NPC loot notification. Use 0x4dbc for NPC loot (requires the
+/// server to have loot tables populated — unlooted mobs don't trigger this).
+pub const OP_BECOME_CORPSE: u16    = 0x4dbc;
+/// Client → server to open a corpse for looting. Payload: corpse spawn_id (u32).
+pub const OP_LOOT_REQUEST: u16     = 0x6f90;
+/// Server → client with coin amounts on corpse. MoneyOnCorpse_Struct (20 bytes):
+/// response(u8) + 3×pad + platinum(u32) + gold(u32) + silver(u32) + copper(u32).
+pub const OP_MONEY_ON_CORPSE: u16  = 0x7fe4;
+/// Server → client: one packet per lootable item. Client echoes back to take it.
+pub const OP_LOOT_ITEM: u16        = 0x7081;
+/// Client → server to close a loot session.
+pub const OP_END_LOOT_REQUEST: u16 = 0x2316;
 
 // ── Gameplay: progression ─────────────────────────────────────────────────
 
@@ -319,6 +340,7 @@ pub const SIZE_CONSIDER: usize = 32;     // Consider_S
 pub const SIZE_EXP_UPDATE: usize = 4;   // ExpUpdate_S
 pub const SIZE_LEVEL_UPDATE: usize = 12; // LevelUpdate_S
 pub const SIZE_MONEY_ON_CORPSE: usize = 20; // MoneyOnCorpse_S
+pub const SIZE_ZONE_CHANGE: usize = 88;   // ZoneChange_Struct
 
 #[cfg(test)]
 mod tests {
@@ -423,6 +445,7 @@ mod tests {
 /// and ~100 other fields. We only parse the fields we need.
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
+#[allow(non_snake_case)]
 pub struct Spawn_S {
     pub unknown0000: u8,
     pub gm: u8,

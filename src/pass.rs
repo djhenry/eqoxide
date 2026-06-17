@@ -195,7 +195,7 @@ pub fn encode_player_pass(
                     if i >= PLAYER_UNIFORM_SLOTS { break; }
                     let mat = crate::camera::entity_model_matrix_heading(
                         scene.player_pos, scene.player_heading, visual_scale,
-                        dominant_mesh_scale, center_xz, false,
+                        dominant_mesh_scale, center_xz, true, lift_basis,
                     );
                     r.queue.write_buffer(
                         &r.entity_uniform_pool[i].0, 0,
@@ -243,10 +243,10 @@ pub fn encode_player_pass(
             }
             Some(GpuModel::Static(model)) => {
                 let arch_scale = archetype_scale(archetype);
-                let visual_scale = 2.0 * model.y_bottom * arch_scale;
+                let visual_scale = 2.0 * model.y_extent * arch_scale;
                 let mat = crate::camera::entity_model_matrix_heading(
                     scene.player_pos, scene.player_heading, visual_scale, arch_scale,
-                    [model.x_center, model.z_center], true,
+                    [model.x_center, model.z_center], true, model.y_bottom,
                 );
                 for (i, mesh) in model.meshes.iter().enumerate() {
                     if i >= PLAYER_UNIFORM_SLOTS { break; }
@@ -333,6 +333,76 @@ pub fn encode_player_pass(
     pass.draw_indexed(0..6, 0, 0..1);
 }
 
+/// Render a single static model with the given transform.
+/// This is the core rendering logic shared by the player pass, entity pass,
+/// and the standalone model viewer (`render_model`).
+///
+/// `model_matrix` is the full 4×4 model→world transform (from `entity_model_matrix_heading`).
+/// Uniform buffer slots are taken from `r.entity_uniform_pool[base_slot..]`.
+/// At most `max_meshes` meshes are drawn; pass `usize::MAX` for no limit.
+#[allow(clippy::too_many_arguments)]
+pub fn render_static_model(
+    r:            &EqRenderer,
+    encoder:      &mut wgpu::CommandEncoder,
+    view:         &wgpu::TextureView,
+    model:        &crate::gpu::GpuStaticModel,
+    model_matrix: [[f32; 4]; 4],
+    tint:         [f32; 4],
+    base_slot:    usize,
+    max_meshes:   usize,
+) {
+    use crate::gpu::EntityUniform;
+
+    let slot_count = r.entity_uniform_pool.len();
+    for (i, _mesh) in model.meshes.iter().enumerate() {
+        if i >= max_meshes { break; }
+        let slot = base_slot + i;
+        if slot >= slot_count { break; }
+        r.queue.write_buffer(
+            &r.entity_uniform_pool[slot].0, 0,
+            bytemuck::bytes_of(&EntityUniform { model: model_matrix, tint }),
+        );
+    }
+
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("static_model"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view, resolve_target: None,
+            ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+        })],
+        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+            view: &r.depth_view,
+            depth_ops: Some(wgpu::Operations {
+                load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store,
+            }),
+            stencil_ops: None,
+        }),
+        timestamp_writes: None, occlusion_query_set: None,
+    });
+    pass.set_pipeline(&r.pipelines.character);
+    pass.set_bind_group(0, &r.camera_uniform.bind_group, &[]);
+    pass.set_bind_group(1, &r.fallback_texture_bg, &[]);
+    let mut cur_tex: Option<usize> = None;
+    for (i, mesh) in model.meshes.iter().enumerate() {
+        if i >= max_meshes { break; }
+        let slot = base_slot + i;
+        if slot >= slot_count { break; }
+        pass.set_bind_group(2, &r.entity_uniform_pool[slot].1, &[]);
+        if mesh.texture_idx != cur_tex {
+            cur_tex = mesh.texture_idx;
+            let bg = match cur_tex {
+                Some(idx) if idx < model.texture_bind_groups.len() =>
+                    &model.texture_bind_groups[idx],
+                _ => &r.fallback_texture_bg,
+            };
+            pass.set_bind_group(1, bg, &[]);
+        }
+        pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+        pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+    }
+}
+
 /// Static glTF character model pass — all static-model entities in ONE render pass.
 /// Uses entity_uniform_pool[PLAYER_UNIFORM_SLOTS .. pool_len/2+PLAYER_UNIFORM_SLOTS).
 pub fn encode_entity_pass(
@@ -344,7 +414,7 @@ pub fn encode_entity_pass(
 ) {
     use crate::renderer::PLAYER_UNIFORM_SLOTS;
     use crate::models::{race_to_archetype, archetype_scale};
-    use crate::gpu::{EntityUniform, GpuModel};
+    use crate::gpu::GpuModel;
 
     struct DrawCmd { archetype: &'static str, mesh_idx: usize, uniform_slot: usize }
 
@@ -353,14 +423,24 @@ pub fn encode_entity_pass(
     let slot_end  = PLAYER_UNIFORM_SLOTS + pool_half;
     let mut slot  = PLAYER_UNIFORM_SLOTS;
 
+    let mut debug_logged = false;
+    let mut skipped = 0u32;
+    let mut rendered = 0u32;
     for b in &scene.billboards {
         if b.level == 0 { continue; }
         let archetype = race_to_archetype(&b.race);
-        let Some(GpuModel::Static(model)) = r.gpu_character_models.get(archetype) else { continue };
+        let Some(GpuModel::Static(model)) = r.gpu_character_models.get(archetype) else { skipped += 1; continue };
+        rendered += 1;
         let arch_scale   = archetype_scale(archetype);
-        let visual_scale = 2.0 * model.y_bottom * arch_scale;
+        let visual_scale = 2.0 * model.y_extent * arch_scale;
+        let lift = visual_scale * 0.5 + model.y_bottom * arch_scale;
+        if !debug_logged {
+            eprintln!("pass: billboard '{}' arch={} y_extent={:.4} y_bottom={:.4} arch_scale={:.2} visual_scale={:.4} lift={:.4} pos={:?}",
+                b.race, archetype, model.y_extent, model.y_bottom, arch_scale, visual_scale, lift, b.pos);
+            debug_logged = true;
+        }
         let mat = crate::camera::entity_model_matrix_heading(b.pos, b.heading, visual_scale, arch_scale,
-            [model.x_center, model.z_center], true);
+            [model.x_center, model.z_center], true, model.y_bottom);
         for (mesh_idx, mesh) in model.meshes.iter().enumerate() {
             if slot >= slot_end { break; }
             let tint: [f32; 4] = if b.dead { [0.5, 0.5, 0.5, 1.0] }
@@ -368,13 +448,14 @@ pub fn encode_entity_pass(
                                  else { mesh.base_color };
             r.queue.write_buffer(
                 &r.entity_uniform_pool[slot].0, 0,
-                bytemuck::bytes_of(&EntityUniform { model: mat, tint }),
+                bytemuck::bytes_of(&crate::gpu::EntityUniform { model: mat, tint }),
             );
             draws.push(DrawCmd { archetype, mesh_idx, uniform_slot: slot });
             slot += 1;
         }
         if slot >= slot_end { break; }
     }
+    eprintln!("pass: entity pass — {} draws, {} rendered, {} skipped (no model)", draws.len(), rendered, skipped);
     if draws.is_empty() { return; }
 
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -473,7 +554,7 @@ pub fn encode_skinned_entity_pass(
             if u_slot >= r.entity_uniform_pool.len() { break; }
             let mat = crate::camera::entity_model_matrix_heading(
                 b.pos, b.heading, visual_scale, dominant_scale,
-                [model.x_center, model.z_center], false,
+                [model.x_center, model.z_center], true, lift_basis,
             );
             let tint: [f32; 4] = if b.dead { [0.5, 0.5, 0.5, 1.0] }
                                  else if b.is_target { [1.0, 0.3, 0.3, 1.0] }

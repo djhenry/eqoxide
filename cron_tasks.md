@@ -78,7 +78,7 @@ The combat log (kind="combat") is too large and obtrusive. Make it look like the
 **Goal:** The "NPC Dialogue" window was showing EQEmu server debug output like `[CombatRecord] [Stop] [Summary] Mob [a sewer rat] [Received] DPS [11] ...`.  
 **Done:** 2026-06-16 — Extended `is_debug_spam()` in `src/eq_net/packet_handler.rs` to also filter `[CombatRecord]`, `[EVENT_KILLED_MERIT]`, and `[EVENT_ITEM_GIVEN]` messages. These are server-side GM analytics, not player-facing dialogue. Verified: after combat, NPC Dialogue window stays hidden and only appears for real NPC speech/emotes.
 
-### [ ] 7. Auto-loot corpses after combat
+### [~] 7. Auto-loot corpses after combat
 **Goal:** After killing a mob, automatically (or via button) loot all coins and items from the corpse.  
 **Protocol:**
 - Server sends `OP_BecomeCorpse` (0x4DBC from patch) when a mob dies and leaves a corpse; payload has the new corpse spawn_id  
@@ -86,14 +86,14 @@ The combat log (kind="combat") is too large and obtrusive. Make it look like the
 - Server replies `OP_MoneyOnCorpse` (0x7fe4) with coin amounts (20 bytes: MoneyOnCorpse_S)
 - Server sends `OP_LootItem` (0x7081) for each lootable item  
 - Client sends `OP_LootItem` back to take each item, then `OP_EndLootRequest` (0x2316) when done  
-**Steps:**
-1. Add OP code constants to `src/eq_net/protocol.rs`
-2. In `packet_handler.rs`, handle `OP_BecomeCorpse` → store corpse spawn_ids in GameState  
-3. Add `OP_MoneyOnCorpse` handler → log coin pickup to "combat" message log  
-4. Add auto-loot: after `OP_BecomeCorpse`, send `OP_LootRequest` → then `OP_LootItem` for each item → `OP_EndLootRequest`  
-5. Log loot results in HUD message log (kind="loot")  
-**Key files:** `src/eq_net/protocol.rs`, `src/eq_net/packet_handler.rs`, `src/eq_net/gameplay.rs`  
-**Acceptance:** After killing a mob, coins and items automatically looted; loot summary appears in message log.
+**Status (2026-06-16): BLOCKED — server has no NPC loot tables.** Implementation is complete:
+- `OP_BECOME_CORPSE` constant = 0x4dbc; struct layout: `unknown(4) + spawn_id(4) + y(4) + x(4) = 16 bytes`
+- Dual detection path: `apply_become_corpse` (handles OP_BECOME_CORPSE 0x4dbc) + `apply_new_spawn` (checks for "corpse" in NPC name via OP_NEW_SPAWN)
+- `GameState.pending_loot: VecDeque<u32>` + `loot_queued_at: Option<Instant>` for 500ms delay before LootRequest
+- `gameplay.rs` auto-loot loop: 500ms delay → OP_LootRequest → echo OP_LootItem packets back → 2s inactivity timeout → OP_EndLootRequest
+- **Blocked because:** this EQEmu instance has no loot tables; mobs despawn via OP_DELETE_SPAWN with no corpse created; 0x4dbc never arrives
+- **Also discovered:** opcode 0x4839 (16 bytes, always `00 00 00 00 0f 00 00 00 00 00 00 00 01 00 00 00`) appears at zone entry — suspected to be player-corpse location reminder, NOT NPC loot notification
+- **To test:** run against an EQEmu instance with loot tables populated (e.g., `peq` database); code should work as-is
 
 ### [ ] 8. HP/Mana regeneration — verify real-time updates between fights
 **Goal:** Confirm the HP and Mana bars update correctly as the player regenerates between fights, and verify death/corpse recovery works (player is sent to bind on death).  

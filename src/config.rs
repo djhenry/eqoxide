@@ -64,7 +64,9 @@ impl LoginConfig {
             login_port: cfg
                 .get("server").and_then(|s| s.get("login_port")).and_then(|v| v.as_u64())
                 .unwrap_or(5998) as u16,
-            world_port: 9000,
+            world_port: cfg
+                .get("server").and_then(|s| s.get("world_port")).and_then(|v| v.as_u64())
+                .unwrap_or(9000) as u16,
             username: cfg
                 .get("account").and_then(|a| a.get("username")).and_then(|v| v.as_str())
                 .unwrap_or("testuser").to_string(),

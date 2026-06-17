@@ -1,0 +1,26 @@
+[package]
+name = "s3d_to_gltf"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "s3d_to_gltf"
+path = "src/main.rs"
+
+[[bin]]
+name = "validate_glb"
+path = "src/validate_glb.rs"
+
+[[bin]]
+name = "diagnose_glb"
+path = "src/diagnose_glb.rs"
+
+[dependencies]
+anyhow = "1"
+libeq_pfs = { git = "https://github.com/cjab/libeq", package = "libeq_pfs" }
+libeq_wld = { git = "https://github.com/cjab/libeq", package = "libeq_wld" }
+image = { version = "0.25", default-features = false, features = ["bmp", "png", "dds"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+gltf = { version = "1", features = ["import"] }
+glam = "0.29"

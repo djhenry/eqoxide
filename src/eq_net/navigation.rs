@@ -343,9 +343,9 @@ impl Navigator {
         buf[64..66].copy_from_slice(&gs.zone_id.to_le_bytes());
         // instance_id = 0
         buf[66..68].copy_from_slice(&0u16.to_le_bytes());
-        // EQ ZoneChange y = north = server_x; x = east = server_y
-        buf[68..72].copy_from_slice(&gs.player_x.to_le_bytes());
-        buf[72..76].copy_from_slice(&gs.player_y.to_le_bytes());
+        // ZoneChange_Struct: y(server_y=east) at offset 68, x(server_x=north) at offset 72
+        buf[68..72].copy_from_slice(&gs.player_y.to_le_bytes());
+        buf[72..76].copy_from_slice(&gs.player_x.to_le_bytes());
         // z
         buf[76..80].copy_from_slice(&gs.player_z.to_le_bytes());
         // zone_reason = 0 (normal zone line crossing)

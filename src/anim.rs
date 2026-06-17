@@ -136,7 +136,9 @@ impl SkinData {
 
     /// Skin a probe vertex with the given skin matrices and return its render-space Z.
     pub fn probe_z(probe: &GroundProbe, skin: &[glam::Mat4]) -> f32 {
-        Self::skin_point(probe.pos, probe.joints, probe.weights, skin)[2]
+        // Models are Y-up (height = Y), so the "lowest" point used for grounding is
+        // the minimum Y of the posed skin, matching the static path's y_bottom.
+        Self::skin_point(probe.pos, probe.joints, probe.weights, skin)[1]
     }
 
     /// Skin matrices (global * inv_bind) at the bind/rest pose. Used at load time to

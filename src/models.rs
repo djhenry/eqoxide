@@ -24,6 +24,9 @@ pub struct ModelAsset {
     /// scale meshes only. For static models node_scale is baked in; for skinned models these are
     /// raw pre-node-scale positions.  Lift = y_bottom × mesh_scale (dominant).
     pub y_bottom:          f32,
+    /// Vertical extent of the model (max_y - min_y) in buffer vertex space.
+    /// Used for visual_scale: visual_scale = 2 × y_extent × arch_scale.
+    pub y_extent:          f32,
     /// Center of the model in the X and Z axes (raw pre-node-scale space, dominant meshes only).
     /// Used as a centering correction so models are rendered at their entity position rather than
     /// offset by the model's origin-to-center distance.
@@ -68,7 +71,7 @@ impl ModelAsset {
 
         // ── Skin: joint hierarchy + inverse bind matrices ─────────────────────
         let skin_opt = document.skins().next();
-        let (mut skin_data, joint_index_map) = if let Some(skin) = skin_opt {
+        let (mut skin_data, _joint_index_map) = if let Some(skin) = skin_opt {
             let joints: Vec<usize> = skin.joints().map(|n| n.index()).collect();
             let joint_count = joints.len();
 
@@ -311,17 +314,19 @@ impl ModelAsset {
             .collect();
 
         let y_min = dominant_positions.iter().map(|p| p[1]).fold(f32::MAX, f32::min);
+        let y_max = dominant_positions.iter().map(|p| p[1]).fold(f32::MIN, f32::max);
         let y_bottom = if y_min < 0.0 { -y_min } else { 0.0 };
+        let y_extent = if y_min < f32::MAX && y_max > f32::MIN { y_max - y_min } else { 0.0 };
 
         // Horizontal recentre offsets. `x_center`/`z_center` are the two non-height axes
         // in the load-order the render matrix expects (see entity_model_matrix_heading).
         //   - Static models keep their raw Y-up vertices: horizontal axes are raw X and Z.
-        //   - Skinned models render from the skinned (Z-up) vertices, so the horizontal
-        //     axes are the skinned X and Y — measuring raw mesh X/Z would shift the model
-        //     vertically once skinning reorients those axes (this buried the Skeleton).
+        //   - Skinned models are also Y-up (height = Y); their horizontal axes are the
+        //     skinned X and Z. Measure the posed (bind) skin points so attachment/eye
+        //     pieces don't skew the centre.
         let (x_center, z_center) = if let Some(sd) = skin_data.as_ref() {
             let skin = sd.bind_skin_matrices();
-            let (mut xmin, mut xmax, mut ymin, mut ymax) =
+            let (mut xmin, mut xmax, mut zmin, mut zmax) =
                 (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
             for (i, (mesh, sd_opt)) in meshes.iter().zip(skin_meshes.iter()).enumerate() {
                 if (skinned_mesh_scales[i] - skinned_node_scale).abs() >= skinned_node_scale * 0.5 {
@@ -332,13 +337,13 @@ impl ModelAsset {
                     let joints  = smesh.joint_indices.get(vi).copied().unwrap_or([0; 4]);
                     let weights = smesh.joint_weights.get(vi).copied().unwrap_or([1.0, 0.0, 0.0, 0.0]);
                     let p = crate::anim::SkinData::skin_point(*pos, joints, weights, &skin);
-                    if p[0].is_finite() && p[1].is_finite() {
+                    if p[0].is_finite() && p[2].is_finite() {
                         xmin = xmin.min(p[0]); xmax = xmax.max(p[0]);
-                        ymin = ymin.min(p[1]); ymax = ymax.max(p[1]);
+                        zmin = zmin.min(p[2]); zmax = zmax.max(p[2]);
                     }
                 }
             }
-            if xmin <= xmax { ((xmin + xmax) * 0.5, (ymin + ymax) * 0.5) } else { (0.0, 0.0) }
+            if xmin <= xmax { ((xmin + xmax) * 0.5, (zmin + zmax) * 0.5) } else { (0.0, 0.0) }
         } else {
             let x_min = dominant_positions.iter().map(|p| p[0]).fold(f32::MAX, f32::min);
             let x_max = dominant_positions.iter().map(|p| p[0]).fold(f32::MIN, f32::max);
@@ -348,7 +353,66 @@ impl ModelAsset {
             else { ((x_min + x_max) * 0.5, (z_min + z_max) * 0.5) }
         };
 
-        Ok(ModelAsset { meshes, textures, skin: skin_data, skin_meshes, skinned_node_scale, skinned_mesh_scales, y_bottom, x_center, z_center })
+        Ok(ModelAsset { meshes, textures, skin: skin_data, skin_meshes, skinned_node_scale, skinned_mesh_scales, y_bottom, y_extent, x_center, z_center })
+    }
+
+    /// Load a static character model from an EQ `_chr.s3d` archive.
+    /// Uses the WLD meshes and BMP/DDS textures inside the archive.
+    /// Returns a ModelAsset with no skin data (static mesh, no animation).
+    pub fn load_from_chr_s3d(s3d_path: &Path) -> Result<Self> {
+        let assets = crate::assets::ZoneAssets::load(s3d_path)
+            .with_context(|| format!("failed to load chr S3D: {}", s3d_path.display()))?;
+
+        if assets.meshes.is_empty() {
+            anyhow::bail!("no meshes found in {}", s3d_path.display());
+        }
+
+        // Compute y_bottom and y_extent from all mesh positions (world space).
+        let mut y_min = f32::MAX;
+        let mut y_max = f32::MIN;
+        for m in &assets.meshes {
+            for &p in &m.positions {
+                let wy = p[1] + m.center[1]; // libeq: [east, height, north]
+                if wy < y_min { y_min = wy; }
+                if wy > y_max { y_max = wy; }
+            }
+        }
+        let y_bottom = if y_min == f32::MAX { 0.0 } else { y_min };
+        let y_extent = if y_min < f32::MAX && y_max > f32::MIN { y_max - y_min } else { 0.0 };
+
+        // Compute x/z center from all mesh positions.
+        let (mut x_min, mut x_max) = (f32::MAX, f32::MIN);
+        let (mut z_min, mut z_max) = (f32::MAX, f32::MIN);
+        for m in &assets.meshes {
+            for &p in &m.positions {
+                let wx = p[0] + m.center[0];
+                let wz = p[2] + m.center[2];
+                if wx < x_min { x_min = wx; }
+                if wx > x_max { x_max = wx; }
+                if wz < z_min { z_min = wz; }
+                if wz > z_max { z_max = wz; }
+            }
+        }
+        let x_center = if x_min <= x_max { (x_min + x_max) * 0.5 } else { 0.0 };
+        let z_center = if z_min <= z_max { (z_min + z_max) * 0.5 } else { 0.0 };
+
+        let mesh_count = assets.meshes.len();
+        let tex_count = assets.textures.len();
+        eprintln!("models: loaded chr model from {} ({} meshes, {} textures)",
+                  s3d_path.display(), mesh_count, tex_count);
+
+        Ok(ModelAsset {
+            meshes:            assets.meshes,
+            textures:          assets.textures,
+            skin:              None,
+            skin_meshes:       vec![],
+            skinned_node_scale: 1.0,
+            skinned_mesh_scales: vec![1.0; mesh_count],
+            y_bottom,
+            y_extent,
+            x_center,
+            z_center,
+        })
     }
 }
 
@@ -377,6 +441,29 @@ pub fn race_to_archetype(race: &str) -> &'static str {
     }
 }
 
+/// Map an archetype key to the EQ `_chr.s3d` filename (without path).
+/// Returns `None` for archetypes that have no EQ character archive.
+pub fn archetype_to_chr_s3d(archetype: &str) -> Option<&'static str> {
+    match archetype {
+        "humanoid"  => Some("globalhom_chr.s3d"),  // human male
+        "elf"       => Some("globalelf_chr.s3d"),   // wood elf
+        "dwarf"     => Some("globaldwf_chr.s3d"),   // dwarf
+        "gnoll"     => Some("globalgnm_chr.s3d"),   // gnoll
+        "skeleton"  => None, // old WLD format (DmSprite), not convertible to glTF
+        "frog"      => Some("globalfroglok_chr.s3d"),// froglok
+        // global_chr.s3d is a combined archive (701 meshes for ALL races).
+        // Loading it as a single model produces a giant combined bounding box.
+        // These archetypes need per-race chr.s3d extraction to render correctly.
+        "zombie"    => None,
+        "rat"       => None,
+        "snake"     => None,
+        "bat"       => None,
+        "wolf"      => None,
+        "bear"      => None,
+        _           => None,
+    }
+}
+
 /// Fixed display scale (EQ units) for each glTF archetype.
 /// All models with node_scale=100 have that applied during loading, so these
 /// values reflect the effective post-scale model height in EQ units.
@@ -384,26 +471,26 @@ pub fn race_to_archetype(race: &str) -> &'static str {
 /// equals the desired total character height in EQ units (feet-to-head).
 /// Calibrated from actual GLTF vertex bounds; review after adding new models.
 pub fn archetype_scale(archetype: &str) -> f32 {
-    // EQ units ≈ feet. Target heights below; all scaled ~0.30× from prior debug-zone
-    // calibration (which had humanoids at ~20 EQ units — 3× too tall for real zones).
+    // EQ units ≈ feet. `height = y_extent * arch_scale` gives rendered model height.
+    // Calibrated from actual GLB vertex bounds; review after adding new models.
     match archetype {
-        "humanoid" =>  3.5, // Adventurer:  y_bottom=0.00287 → ~2 EQ units (player model)
-        "gnoll"    => 12.0, // Kenney gnoll:                 → ~6 EQ units
-        "skeleton" =>  8.0, // Skeleton:    raw height 0.00511→ ~6 EQ units
-        "zombie"   =>  8.0, // Zombie:      y_bottom=0.00380 → ~6 EQ units
-        "creature" =>  0.45,// Wolf spider: y_bottom=0.027   → ~2.4 EQ units
-        "rat"      =>  0.27,// Rat:         y_bottom=0.021   → ~1.2 EQ units
-        "snake"    =>  0.57,// Snake:       y_bottom=0.016   → ~1.8 EQ units
-        "frog"     =>  0.48,// Frog:        y_bottom=0.017   → ~1.5 EQ units
-        "wasp"     =>  0.63,// Wasp:        y_bottom=0.012   → ~1.5 EQ units
-        "wolf"     =>  1.2, // Wolf:        y_bottom=0.026   → ~3 EQ units
-        "bat"      =>  0.57,// Bat:         y_bottom=0.013   → ~1.5 EQ units
-        "bird"     =>  0.9, // Pigeon:      y_bottom=0.012   → ~2 EQ units
-        "worm"     =>  3.5, // Worm:        static prop      → ~1.5 EQ units
-        "fish"     =>  0.18,// Fish:        y_bottom=0.033   → ~1.2 EQ units
-        "bear"     =>  8.0, // Panda bear:  y_bottom=0.30    → ~5 EQ units
-        "dwarf"    =>  8.3, // Dwarf warrior: Z=[0,1.26] → 0.75× human height (measured)
-        "elf"      =>  0.10,// Adventurer2: y_bottom=0.287   → ~6 EQ units
+        "humanoid" =>  3.55, // y_extent=1.6902 → 6.0 EQ (human adult)
+        "elf"      =>  5.21, // y_extent=1.1526 → 6.0 EQ (human height)
+        "dwarf"    =>  2.55, // y_extent=1.7623 → 4.5 EQ (3/4 human)
+        "gnoll"    =>  3.01, // y_extent=1.6613 → 5.0 EQ (medium monster)
+        "skeleton" =>  3.55, // humanoid-scale undead
+        "zombie"   =>  3.55, // humanoid-scale undead
+        "creature" =>  0.45, // Wolf spider:     → ~2.4 EQ units
+        "rat"      =>  0.27, // Rat:             → ~1.2 EQ units
+        "snake"    =>  0.57, // Snake:           → ~1.8 EQ units
+        "frog"     =>  0.53, // y_extent=2.8574  → 1.5 EQ (small)
+        "wasp"     =>  0.63, // Wasp:            → ~1.5 EQ units
+        "wolf"     =>  1.2,  // Wolf:            → ~3 EQ units
+        "bat"      =>  0.57, // Bat:             → ~1.5 EQ units
+        "bird"     =>  0.9,  // Pigeon:          → ~2 EQ units
+        "worm"     =>  3.5,  // Worm:            → ~1.5 EQ units
+        "fish"     =>  0.18, // Fish:            → ~1.2 EQ units
+        "bear"     =>  8.0,  // Panda bear:      → ~5 EQ units
         _          =>  6.0,
     }
 }
