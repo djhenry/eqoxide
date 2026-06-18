@@ -34,6 +34,10 @@ pub type ZonePoints = Arc<Mutex<Vec<crate::game_state::ZonePoint>>>;
 ///   Some(id) → cross to a specific destination zone id.
 pub type ZoneCrossReq = Arc<Mutex<Option<u16>>>;
 
+/// Direct warp target set by POST /warp; the App reads it once and teleports
+/// the player to the exact coordinates, bypassing collision.
+pub type WarpReq = Arc<Mutex<Option<(f32, f32, f32)>>>;
+
 /// NPC name to hail, set by POST /hail; the nav thread reads it once and sends a
 /// "Hail, <name>" say packet so the NPC fires its hail/quest script.
 pub type HailReq = Arc<Mutex<Option<String>>>;
@@ -77,6 +81,7 @@ struct HttpState {
     entity_ids:       EntityIds,
     zone_points:      ZonePoints,
     zone_cross:       ZoneCrossReq,
+    warp:             WarpReq,
     hail:             HailReq,
     say:              SayReq,
     target:           TargetReq,
@@ -114,6 +119,7 @@ pub fn spawn_camera_server(
     entity_ids:       EntityIds,
     zone_points:      ZonePoints,
     zone_cross:       ZoneCrossReq,
+    warp:             WarpReq,
     hail:             HailReq,
     say:              SayReq,
     target:           TargetReq,
@@ -124,7 +130,7 @@ pub fn spawn_camera_server(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, hail, say, target, attack, player_info };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, player_info };
             let app = Router::new()
                 .route("/camera", get(get_camera).post(post_camera))
                 .route("/camera/reset", post(post_camera_reset))
@@ -133,6 +139,7 @@ pub fn spawn_camera_server(
                 .route("/entities", get(get_entities))
                 .route("/zone_points", get(get_zone_points))
                 .route("/zone_cross", post(post_zone_cross))
+                .route("/warp", post(post_warp))
                 .route("/hail", post(post_hail))
                 .route("/say", post(post_say))
                 .route("/target", post(post_target))
@@ -274,6 +281,23 @@ async fn post_zone_cross(
     *s.zone_cross.lock().unwrap() = Some(zone_id);
     eprintln!("zone_cross: flagged for OP_ZONE_CHANGE (target zone_id={zone_id})");
     (StatusCode::OK, format!("zone_cross request queued (zone_id={zone_id})"))
+}
+
+#[derive(serde::Deserialize)]
+struct WarpBody {
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+/// POST /warp — teleport directly to coordinates, bypassing collision.
+async fn post_warp(
+    State(s): State<HttpState>,
+    Json(body): Json<WarpBody>,
+) -> (StatusCode, String) {
+    *s.warp.lock().unwrap() = Some((body.x, body.y, body.z));
+    eprintln!("warp: queued to ({:.1}, {:.1}, {:.1})", body.x, body.y, body.z);
+    (StatusCode::OK, format!("warp queued to ({:.1}, {:.1}, {:.1})", body.x, body.y, body.z))
 }
 
 #[derive(serde::Deserialize)]

@@ -6,7 +6,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
-use crate::game_state::GameState;
+use crate::game_state::{GameState, ZonePoint};
 use crate::http::{AttackReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, ZoneCrossReq, ZonePoints};
 
 /// OP_TargetCommand payload: ClientTarget_Struct = just the target spawn id (u32).
@@ -96,6 +96,9 @@ pub struct Navigator {
     target:           TargetReq,
     attack:           AttackReq,
     collision:        crate::assets::SharedCollision,
+    maps_dir:         std::path::PathBuf,
+    current_zone:     String,
+    last_zone_cross:  Instant,
     position_seq:     u16,
     last_tick:        Instant,
 }
@@ -112,6 +115,7 @@ impl Navigator {
         target:           TargetReq,
         attack:           AttackReq,
         collision:        crate::assets::SharedCollision,
+        maps_dir:         std::path::PathBuf,
     ) -> Self {
         Navigator {
             goto_target,
@@ -124,6 +128,9 @@ impl Navigator {
             target,
             attack,
             collision,
+            maps_dir,
+            current_zone: String::new(),
+            last_zone_cross: Instant::now(),
             position_seq: 0,
             last_tick: Instant::now(),
         }
@@ -143,11 +150,58 @@ impl Navigator {
         }
     }
 
-    /// Copy zone exit points from `gs` into the shared zone_points map
-    /// (used by the HTTP /zone_points endpoint).
-    pub fn sync_zone_points(&self, gs: &GameState) {
-        if !gs.zone_points.is_empty() {
-            *self.zone_points.lock().unwrap() = gs.zone_points.clone();
+    /// Sync zone exit points from `gs` into the shared zone_points map.
+    /// On zone change, also loads map-label exits from disk as fallback zone points.
+    pub fn sync_zone_points(&mut self, gs: &GameState) {
+        // On zone change, load map labels from disk as fallback zone points.
+        if gs.zone_name != self.current_zone {
+            self.current_zone = gs.zone_name.clone();
+            let mut shared = self.zone_points.lock().unwrap();
+            // Start fresh with server entries.
+            shared.clear();
+            shared.extend(gs.zone_points.iter().cloned());
+            // Load map labels from disk.
+            if let Some(zm) = crate::zone_map::ZoneMap::load(&self.maps_dir, &gs.zone_name) {
+                let before = shared.len();
+                for label in &zm.labels {
+                    let lower = label.text.to_lowercase();
+                    if !lower.starts_with("to ") { continue; }
+                    let dest_zone_id: u16 = if lower.contains("north qeynos") || lower.contains("qeynos2") {
+                        2
+                    } else if lower.contains("south qeynos") {
+                        1 // qeynos south
+                    } else {
+                        0
+                    };
+                    if dest_zone_id == 0 { continue; }
+                    let dup = shared.iter().any(|zp| {
+                        zp.zone_id == dest_zone_id
+                            && ((zp.server_x - label.east).powi(2) + (zp.server_y - label.north).powi(2)) < 2500.0
+                    });
+                    if dup { continue; }
+                    shared.push(ZonePoint {
+                        iterator: u32::MAX,
+                        server_x: label.east,
+                        server_y: label.north,
+                        server_z: 0.0,
+                        heading: 0.0,
+                        zone_id: dest_zone_id,
+                    });
+                    eprintln!("zone_map: added exit '{}' at ({:.1}, {:.1}) → zone_id={}",
+                              label.text, label.east, label.north, dest_zone_id);
+                }
+                if shared.len() > before {
+                    eprintln!("zone_map: {} fallback exits added (total {})", shared.len() - before, shared.len());
+                }
+            }
+        } else {
+            // Same zone: update server entries but keep map labels.
+            let mut shared = self.zone_points.lock().unwrap();
+            let map_labels: Vec<_> = shared.drain(..)
+                .filter(|zp| zp.iterator == u32::MAX)
+                .collect();
+            shared.extend(gs.zone_points.iter().cloned());
+            shared.extend(map_labels);
         }
     }
 
@@ -190,6 +244,38 @@ impl Navigator {
             } else {
                 eprintln!("zone_cross: no zone line found for zone_id={want_zone}");
                 gs.log_msg("zone", "No zone line found to cross");
+            }
+        }
+
+        // Auto zone-cross: if the player is within range of a zone point, warp to
+        // it and send OP_ZONE_CHANGE automatically. Cooldown prevents looping.
+        {
+            const ZONE_LINE_DIST: f32 = 15.0;
+            const ZONE_LINE_DIST2: f32 = ZONE_LINE_DIST * ZONE_LINE_DIST;
+            const ZONE_CROSS_COOLDOWN_MS: u128 = 10000; // 10 seconds
+            if self.last_zone_cross.elapsed().as_millis() > ZONE_CROSS_COOLDOWN_MS {
+            const ZONE_LINE_DIST: f32 = 15.0;
+            const ZONE_LINE_DIST2: f32 = ZONE_LINE_DIST * ZONE_LINE_DIST;
+            let zps = self.zone_points.lock().unwrap();
+            let nearby = zps.iter()
+                .filter(|zp| zp.zone_id != 0)
+                .find(|zp| dist2(zp, gs) < ZONE_LINE_DIST2);
+            if let Some(zp) = nearby {
+                let dest = zp.zone_id;
+                let tx = zp.server_x;
+                let ty = zp.server_y;
+                let tz = zp.server_z;
+                drop(zps); // release lock before mutating gs
+                eprintln!("zone_cross: auto-triggered near zone_id={dest} at ({:.1},{:.1},{:.1})", tx, ty, tz);
+                gs.log_msg("zone", &format!("Crossing to zone {}", dest));
+                gs.player_x = tx;
+                gs.player_y = ty;
+                gs.player_z = tz;
+                let _ = app_tx.send(make_position_packet(gs.player_id, tx, ty, tz));
+                self.send_position_update(stream, gs, tx, ty, tz, gs.player_heading);
+                self.send_zone_change_packet(stream, gs);
+                self.last_zone_cross = Instant::now();
+            }
             }
         }
 

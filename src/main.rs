@@ -24,6 +24,7 @@ fn main() {
     let entity_ids:       http::EntityIds       = Arc::new(Mutex::new(HashMap::new()));
     let zone_points:      http::ZonePoints      = Arc::new(Mutex::new(Vec::new()));
     let zone_cross:       http::ZoneCrossReq    = Arc::new(Mutex::new(None));
+    let warp:             http::WarpReq         = Arc::new(Mutex::new(None));
     let hail:             http::HailReq         = Arc::new(Mutex::new(None));
     let say:              http::SayReq          = Arc::new(Mutex::new(None));
     let target:           http::TargetReq       = Arc::new(Mutex::new(None));
@@ -45,10 +46,11 @@ fn main() {
         let tg  = target.clone();
         let at  = attack.clone();
         let sc  = shared_collision.clone();
+        let md  = app_cfg.assets_path.join("maps");
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, zc, hl, sy, tg, at, sc).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, zc, hl, sy, tg, at, sc, md).await {
                     eprintln!("EQ: fatal: {e}");
                 }
             });
@@ -70,6 +72,7 @@ fn main() {
         entity_ids,
         zone_points,
         zone_cross,
+        warp.clone(),
         hail,
         say,
         target,
@@ -93,6 +96,7 @@ fn main() {
         app_target,
         shared_collision,
         app_player_info,
+        warp,
         testzone_mode,
     );
     event_loop.run_app(&mut application).expect("event loop run");

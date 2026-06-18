@@ -442,8 +442,6 @@ fn apply_zone_points(gs: &mut GameState, payload: &[u8]) {
     let mut i = offset;
     while i + SIZE_ZONE_POINT_ENTRY <= payload.len() {
         let e = unsafe { safe_read::<ZonePointEntry_S>(&payload[i..]) };
-        // Wire ZonePoint_Entry is Y-first {iterator, y, x, z, ...}; the values map
-        // directly to server GetY()/GetX() with no axis swap.
         gs.zone_points.push(ZonePoint {
             iterator: e.iterator,
             server_x: e.x,

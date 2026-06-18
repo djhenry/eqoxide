@@ -72,6 +72,8 @@ pub struct App {
     /// Free-fly position override in scene space [east, north, z].
     /// None = track server position; Some = keyboard-driven position.
     override_pos: Option<[f32; 3]>,
+    /// Frames remaining where override_pos is protected from being cleared by key release.
+    warp_cooldown: u32,
     /// Shared goto target — WASD writes here so the nav thread sends actual EQ packets.
     goto_target:  crate::http::GotoTarget,
     /// Shared request slots written by HUD buttons; the nav thread drains and sends them.
@@ -101,6 +103,7 @@ pub struct App {
     frame_req:    FrameReq,
     // Live player state for the /debug endpoint.
     player_info:  crate::http::PlayerInfo,
+    warp:         crate::http::WarpReq,
     // Precomputed zone collision grid: floor grounding, camera collision, nameplate occlusion.
     // Held as Arc and also published to `shared_collision` so the nav thread can read it.
     collision:    Option<Arc<assets::Collision>>,
@@ -142,6 +145,7 @@ impl App {
         target:          crate::http::TargetReq,
         shared_collision: assets::SharedCollision,
         player_info:     crate::http::PlayerInfo,
+        warp:            crate::http::WarpReq,
         testzone_mode:   bool,
     ) -> Self {
         let mut game_state = GameState::new();
@@ -171,7 +175,7 @@ impl App {
             fps_frame_count: 0,
             fps_timer: std::time::Instant::now(),
             current_fps: 0.0,
-            keys_held: std::collections::HashSet::new(), override_pos: None, goto_target,
+            keys_held: std::collections::HashSet::new(),             override_pos: None, warp_cooldown: 0, goto_target,
             hail, say, target, say_buffer: String::new(),
             drag_active: false, last_cursor: winit::dpi::PhysicalPosition::new(0.0, 0.0),
             click_start: None,
@@ -185,7 +189,7 @@ impl App {
             pick_screen_w: 800,
             pick_screen_h: 600,
             game_state, scene: SceneState::default(), app_rx, frame_req,
-            player_info, collision: None, shared_collision,
+            player_info, warp, collision: None, shared_collision,
             ground_cache: (f32::NAN, f32::NAN, 0.0),
             last_grounded_z: 0.0,
             prev_render_pos: [0.0, 0.0, 0.0],
@@ -408,17 +412,33 @@ impl App {
         while let Ok(packet) = self.app_rx.try_recv() {
             apply_packet(&mut self.game_state, &packet);
         }
+
+        // Process warp requests — teleport directly, bypassing collision.
+        let warp_req = self.warp.lock().unwrap().take();
+        if let Some((wx, wy, wz)) = warp_req {
+            self.game_state.player_x = wx;
+            self.game_state.player_y = wy;
+            self.game_state.player_z = wz;
+            self.override_pos = Some([wx, wy, wz]);
+            self.visual_player_pos = [wx, wy, wz];
+            self.heading_target = self.game_state.player_heading;
+            self.visual_heading = self.game_state.player_heading;
+            *self.goto_target.lock().unwrap() = Some((wx, wy, wz));
+            eprintln!("warp: teleported to ({:.1}, {:.1}, {:.1})", wx, wy, wz);
+        }
+
         self.scene = SceneState::from_game_state(&self.game_state);
 
         // Update shared player state for the /debug HTTP endpoint.
         {
             let gs = &self.game_state;
+            let pos = self.override_pos.unwrap_or([gs.player_x, gs.player_y, gs.player_z]);
             let h_cw = crate::eq_net::protocol::ccw_to_cw(gs.player_heading);
             *self.player_info.lock().unwrap() = crate::http::PlayerState {
                 zone:       gs.zone_name.clone(),
-                pos_east:   gs.player_x,
-                pos_north:  gs.player_y,
-                pos_up:     gs.player_z,
+                pos_east:   pos[0],
+                pos_north:  pos[1],
+                pos_up:     pos[2],
                 heading_ccw: gs.player_heading,
                 heading_cw:  h_cw,
                 server_corrections: gs.server_corrections,

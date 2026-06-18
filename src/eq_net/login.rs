@@ -75,6 +75,7 @@ pub async fn run_login_flow(
     target:           TargetReq,
     attack:           AttackReq,
     collision:        crate::assets::SharedCollision,
+    maps_dir:         std::path::PathBuf,
 ) -> Result<(), String> {
     for attempt in 1..=max_retries {
         if attempt > 1 {
@@ -100,7 +101,7 @@ pub async fn run_login_flow(
                     eprintln!("NAV: {} zone points seeded", gs.zone_points.len());
                 }
                 let char_name = config.character_name.clone();
-                let navigator = Navigator::new(goto_target, entity_positions, entity_ids, zone_points, zone_cross, hail, say, target, attack, collision);
+                let navigator = Navigator::new(goto_target, entity_positions, entity_ids, zone_points, zone_cross, hail, say, target, attack, collision, maps_dir);
                 run_gameplay_phase(stream, net_rx, app_tx, gs, char_name, navigator, world_creds).await;
                 return Ok(());
             }

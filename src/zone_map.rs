@@ -29,9 +29,8 @@ impl ZoneMap {
     /// layers, so all of them are merged here. Returns None only if the base file is
     /// missing.
     ///
-    /// EQ map .txt files (eqmaps/Brewall format) store coordinates as the *negation* of
-    /// the server position, X first: a record value pair `(a, b)` is `(-server_x, -server_y)`.
-    /// So server_x (east) = -a and server_y (north) = -b.
+    /// EQ map .txt files (eqmaps/Brewall format) store coordinates in server space:
+    /// (east, north) = (server_x, server_y). No negation needed.
     pub fn load(maps_dir: &Path, zone_name: &str) -> Option<Self> {
         let base = maps_dir.join(format!("{}.txt", zone_name));
         let text = std::fs::read_to_string(&base)
@@ -56,25 +55,24 @@ impl ZoneMap {
     }
 
     /// Parse one map file's `L` (line) and `P` (point/label) records into the given
-    /// vectors, applying the map→scene coordinate transform. Pure, for unit testing.
+    /// vectors. Coordinates are in server space (east, north).
     fn parse_into(text: &str, lines: &mut Vec<ZoneMapLine>, labels: &mut Vec<ZoneMapLabel>) {
         for line in text.lines() {
             let line = line.trim();
             if line.starts_with('L') {
-                // L x1, y1, z1, x2, y2, z2, r, g, b — values are (-server_x, -server_y).
+                // L x1, y1, z1, x2, y2, z2, r, g, b — values are (server_x, server_y).
                 let nums: Vec<f32> = line[1..].split(',')
                     .filter_map(|s| s.trim().parse().ok())
                     .collect();
                 if nums.len() >= 9 {
                     lines.push(ZoneMapLine {
-                        // east = server_x = -nums[0]; north = server_y = -nums[1].
-                        east1:  -nums[0], north1:  -nums[1],
-                        east2:  -nums[3], north2:  -nums[4],
+                        east1:  nums[0], north1:  nums[1],
+                        east2:  nums[3], north2:  nums[4],
                         r: nums[6] as u8, g: nums[7] as u8, b: nums[8] as u8,
                     });
                 }
             } else if line.starts_with('P') {
-                // P x, y, z, r, g, b, size, label — values are (-server_x, -server_y).
+                // P x, y, z, r, g, b, size, label — values are (server_x, server_y).
                 let rest = &line[1..];
                 if let Some(label_start) = rest.rfind(',') {
                     let text = rest[label_start + 1..].trim().replace('_', " ").to_string();
@@ -83,8 +81,8 @@ impl ZoneMap {
                         .collect();
                     if nums.len() >= 2 {
                         labels.push(ZoneMapLabel {
-                            east:  -nums[0],
-                            north: -nums[1],
+                            east:  nums[0],
+                            north: nums[1],
                             text,
                         });
                     }
@@ -109,15 +107,14 @@ P 100.0, 200.0, 0, 0, 0, 0, 3, North_Gate";
 
         assert_eq!(lines.len(), 1);
         let l = &lines[0];
-        // EQ map L record: -server_x, -server_y, z, ...
-        // → east = server_x = -nums[0], north = server_y = -nums[1]
-        assert_eq!((l.east1, l.north1), (-10.0, -20.0));
-        assert_eq!((l.east2, l.north2), (-30.0, -40.0));
+        // EQ map L record: values are in server space (east, north).
+        assert_eq!((l.east1, l.north1), (10.0, 20.0));
+        assert_eq!((l.east2, l.north2), (30.0, 40.0));
         assert_eq!((l.r, l.g, l.b), (255, 128, 0));
 
         assert_eq!(labels.len(), 1);
         let p = &labels[0];
-        assert_eq!((p.east, p.north), (-100.0, -200.0));
+        assert_eq!((p.east, p.north), (100.0, 200.0));
         assert_eq!(p.text, "North Gate"); // underscores → spaces
 
         // Layers append rather than replace.
