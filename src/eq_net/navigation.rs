@@ -47,26 +47,42 @@ pub fn build_say_packet(sender: &str, target: &str, message: &str) -> Vec<u8> {
     buf
 }
 
-/// Choose a movement delta `(north, east)` from the desired `(full_n, full_e)` step,
-/// sliding along a single axis when the diagonal is blocked by a wall. Returns `None`
+/// Choose a movement delta `(dx, dy)` from the desired `(full_dx, full_dy)` step,
+/// sliding along a single axis when the diagonal is blocked by a wall. `dx`/`dy` are
+/// in EQ server axes: dx = east (server_x), dy = north (server_y). Returns `None`
 /// only when fully boxed in. Cast at chest height (z+3) so low lips/stairs don't block.
-/// World points are `[east, north, height]`, so east = py/+se, north = px/+sn.
+/// Collision world points are `[east, north, height]` = `[server_x, server_y, server_z]`.
 pub fn slide_move(
     col: &crate::assets::Collision,
     px: f32, py: f32, z: f32,
-    full_n: f32, full_e: f32, radius: f32,
+    full_dx: f32, full_dy: f32, radius: f32,
 ) -> Option<(f32, f32)> {
     let chest = z + 3.0;
-    let clear = |sn: f32, se: f32| col.path_clear([py, px, chest], [py + se, px + sn, chest], radius);
-    if clear(full_n, full_e) {
-        Some((full_n, full_e))
-    } else if clear(full_n, 0.0) {
-        Some((full_n, 0.0))
-    } else if clear(0.0, full_e) {
-        Some((0.0, full_e))
+    let clear = |sx: f32, sy: f32| col.path_clear([px, py, chest], [px + sx, py + sy, chest], radius);
+    if clear(full_dx, full_dy) {
+        Some((full_dx, full_dy))
+    } else if clear(full_dx, 0.0) {
+        Some((full_dx, 0.0))
+    } else if clear(0.0, full_dy) {
+        Some((0.0, full_dy))
     } else {
         None
     }
+}
+
+/// EQ heading in degrees (0..360) for a movement delta in server axes.
+/// EQ convention: heading 0 faces +Y (north) and increases counter-clockwise
+/// (90 = -X = west, 180 = -Y = south, 270 = +X = east). A point at heading θ lies
+/// at (east, north) = (-sinθ, cosθ), so θ = atan2(-east, north).
+pub fn eq_heading(d_east: f32, d_north: f32) -> f32 {
+    (-d_east).atan2(d_north).to_degrees().rem_euclid(360.0)
+}
+
+/// Squared 2D distance from a zone point to the player's current position.
+fn dist2(zp: &crate::game_state::ZonePoint, gs: &GameState) -> f32 {
+    let dx = zp.server_x - gs.player_x;
+    let dy = zp.server_y - gs.player_y;
+    dx * dx + dy * dy
 }
 
 pub struct Navigator {
@@ -142,43 +158,39 @@ impl Navigator {
         gs:      &mut GameState,
         app_tx:  &UnboundedSender<AppPacket>,
     ) {
-        // Check zone_cross flag — send OP_ZONE_CHANGE if set.
-        let do_cross = {
-            let mut flag = self.zone_cross.lock().unwrap();
-            if *flag { *flag = false; true } else { false }
-        };
-        if do_cross {
-            // Teleport to the nearest valid zone exit before sending OP_ZONE_CHANGE.
-            // This ensures the server finds a zone line in the position we report and
-            // routes us to the correct destination zone rather than keeping us here.
-            // Pick the zone_id=45 exit at (-175, 147) — this spawns us near the north-west
-            // part of qeynos where rodents and city NPCs are clustered. Fall back to
-            // any zone_id=45 exit, then zone_id=2, then any non-zero zone.
-            let exit_pos = {
+        // Check zone-cross request — warp onto a zone line, then send OP_ZONE_CHANGE.
+        let cross_req = self.zone_cross.lock().unwrap().take();
+        if let Some(want_zone) = cross_req {
+            // Choose a zone line: the requested destination if given (want_zone != 0),
+            // otherwise the one nearest the player. Zone points are in server coords
+            // (server_x = east, server_y = north) — same frame as the player.
+            let exit = {
                 let zps = self.zone_points.lock().unwrap();
-                zps.iter()
-                    .find(|zp| zp.zone_id == 45 && zp.server_x < 0.0)
-                    .or_else(|| zps.iter().find(|zp| zp.zone_id == 45))
-                    .or_else(|| zps.iter().find(|zp| zp.zone_id == 2))
-                    .or_else(|| zps.iter().find(|zp| zp.zone_id != 0))
-                    .map(|zp| (zp.zone_id, zp.server_x, zp.server_y, zp.server_z))
+                let candidates = zps.iter().filter(|zp| zp.zone_id != 0);
+                if want_zone != 0 {
+                    candidates
+                        .filter(|zp| zp.zone_id == want_zone)
+                        .min_by(|a, b| dist2(a, gs).total_cmp(&dist2(b, gs)))
+                        .map(|zp| (zp.zone_id, zp.server_x, zp.server_y, zp.server_z))
+                } else {
+                    candidates
+                        .min_by(|a, b| dist2(a, gs).total_cmp(&dist2(b, gs)))
+                        .map(|zp| (zp.zone_id, zp.server_x, zp.server_y, zp.server_z))
+                }
             };
-            if let Some((dest_zone, tx, ty, tz)) = exit_pos {
-                eprintln!("zone_cross: warping to exit for zone_id={dest_zone} ({:.1},{:.1},{:.1})", tx, ty, tz);
-                let old_x = gs.player_x;
-                let old_y = gs.player_y;
-                let old_z = gs.player_z;
+            if let Some((dest_zone, tx, ty, tz)) = exit {
+                eprintln!("zone_cross: warping to zone line for zone_id={dest_zone} at ({:.1},{:.1},{:.1})", tx, ty, tz);
                 gs.player_x = tx;
                 gs.player_y = ty;
                 gs.player_z = tz;
-                // Send position update so server sees us at the zone exit.
+                // Report our position at the zone line so the server's zone-line check passes.
                 let _ = app_tx.send(make_position_packet(gs.player_id, tx, ty, tz));
                 self.send_position_update(stream, gs, tx, ty, tz, 0.0);
-                // Restore original position if server rejects the warp; it will
-                // rubber-band us back anyway, so gs will be corrected by server reply.
-                let _ = (old_x, old_y, old_z); // suppress unused warning
+                self.send_zone_change_packet(stream, gs);
+            } else {
+                eprintln!("zone_cross: no zone line found for zone_id={want_zone}");
+                gs.log_msg("zone", "No zone line found to cross");
             }
-            self.send_zone_change_packet(stream, gs);
         }
 
         // Check hail request — say "Hail, <name>" so a nearby NPC fires its hail script.
@@ -232,8 +244,8 @@ impl Navigator {
             None    => return,
         };
 
-        let dx   = target.0 - gs.player_x;
-        let dy   = target.1 - gs.player_y;
+        let dx   = target.0 - gs.player_x; // east  delta (server_x)
+        let dy   = target.1 - gs.player_y; // north delta (server_y)
         let dist = (dx * dx + dy * dy).sqrt();
 
         // Stop when within 2 units of target. Melee range is ~14 units so we stop well
@@ -242,19 +254,16 @@ impl Navigator {
         if dist <= STOP_DIST {
             eprintln!("NAV: arrived at ({:.1},{:.1})", target.0, target.1);
             *self.goto_target.lock().unwrap() = None;
-            // Send a final stationary position update so the server has a fresh position
-            // facing the target (heading toward it). Without this, the last packet may
-            // have had movement deltas and the server position can be stale.
-            // atan2(east_delta, north_delta): dx=east, dy=north. EQ 0=North.
-            let hdg = dx.atan2(dy).to_degrees().rem_euclid(360.0);
+            // Send a final stationary position update facing the target.
+            let hdg = eq_heading(dx, dy);
             self.send_position_update(stream, gs, gs.player_x, gs.player_y, gs.player_z, hdg);
             return;
         }
 
         // Cap step so we never overshoot past STOP_DIST from the target.
-        let step   = 10.0_f32.min(dist - STOP_DIST);
-        let full_n = dx / dist * step; // north component toward goal
-        let full_e = dy / dist * step; // east component toward goal
+        let step    = 10.0_f32.min(dist - STOP_DIST);
+        let full_dx = dx / dist * step; // east component toward goal
+        let full_dy = dy / dist * step; // north component toward goal
         // Use the z from goto_target rather than the stale spawn z stored in gs.player_z.
         // WASD sets goto_target.2 to the visual floor height (grounded z from the app's
         // ground snap), so this keeps the server and client z in sync and prevents the
@@ -265,10 +274,10 @@ impl Navigator {
         // step, then each axis alone; only stop (clear the goal) if fully boxed in.
         // Use nz (correct floor z) not gs.player_z (stale spawn z) for chest height.
         let chosen = match self.collision.read().unwrap().clone() {
-            None    => Some((full_n, full_e)),
-            Some(c) => slide_move(&c, gs.player_x, gs.player_y, nz, full_n, full_e, 2.0),
+            None    => Some((full_dx, full_dy)),
+            Some(c) => slide_move(&c, gs.player_x, gs.player_y, nz, full_dx, full_dy, 2.0),
         };
-        let (mn, me) = match chosen {
+        let (mdx, mdy) = match chosen {
             Some(v) => v,
             None => {
                 eprintln!("NAV: boxed in by walls near ({:.1},{:.1}) — stopping",
@@ -279,11 +288,9 @@ impl Navigator {
             }
         };
 
-        let nx      = gs.player_x + mn;
-        let ny      = gs.player_y + me;
-        // mn = east_delta, me = north_delta. EQ heading: 0=North, 90=East.
-        // atan2(east, north) gives 0 when moving north, 90 when moving east.
-        let heading = mn.atan2(me).to_degrees().rem_euclid(360.0);
+        let nx      = gs.player_x + mdx;
+        let ny      = gs.player_y + mdy;
+        let heading = eq_heading(mdx, mdy);
 
         self.send_position_update(stream, gs, nx, ny, nz, heading);
 
@@ -303,28 +310,31 @@ impl Navigator {
         x: f32, y: f32, z: f32,
         heading: f32,
     ) {
-        let dx = x - gs.player_x;
-        let dy = y - gs.player_y;
+        let dx = x - gs.player_x; // east  delta (server_x)
+        let dy = y - gs.player_y; // north delta (server_y)
         let dz = z - gs.player_z;
         let moving = dx != 0.0 || dy != 0.0 || dz != 0.0;
         let anim: i32 = if moving { 1 } else { 0 };
-        // EQ12 heading: 0-2047 per circle (EQEmu divides by 4 via EQ12toFloat → GetHeading 0-511)
-        let eq_heading = (heading * 2048.0 / 360.0) as u16 & 0x7FF;
+        // Internal heading is CCW (0=north, 90=west). The EQ wire (and server) expects
+        // CW (0=north, 90=east). Convert then pack into the 12-bit field:
+        // EQ_heading_cw_units = deg_cw * 512/360, heading_12bit = EQ_heading_cw_units * 8.
+        let h_cw = crate::eq_net::protocol::ccw_to_cw(heading);
+        let eq_heading = ((h_cw * 4096.0 / 360.0) as u16) & 0xFFF;
 
         let mut buf = [0u8; 36];
         buf[0..2].copy_from_slice(&(gs.player_id as u16).to_le_bytes());
         buf[2..4].copy_from_slice(&self.position_seq.to_le_bytes());
         self.position_seq = self.position_seq.wrapping_add(1);
-        // Titanium struct layout: y_pos=north=entity.y, x_pos=east=entity.x.
-        // Our x param = entity.x = GetX() = east; y param = entity.y = GetY() = north.
-        // delta_x = east delta = dx, delta_y = north delta = dy.
-        buf[4..8].copy_from_slice(&y.to_le_bytes());   // y_pos = north
-        buf[8..12].copy_from_slice(&dz.to_le_bytes());
-        buf[12..16].copy_from_slice(&dx.to_le_bytes()); // delta_x = east_delta
-        buf[16..20].copy_from_slice(&dy.to_le_bytes()); // delta_y = north_delta
+        // Titanium PlayerPositionUpdateClient_Struct: server x,y,z map directly to the
+        // wire's x_pos/y_pos/z_pos — no axis swap. y_pos@4, delta_x@12, delta_y@16,
+        // x_pos@24, z_pos@28, heading@32.
+        buf[4..8].copy_from_slice(&y.to_le_bytes());    // y_pos  = server_y (north)
+        buf[8..12].copy_from_slice(&dz.to_le_bytes());  // delta_z
+        buf[12..16].copy_from_slice(&dx.to_le_bytes()); // delta_x = east delta
+        buf[16..20].copy_from_slice(&dy.to_le_bytes()); // delta_y = north delta
         buf[20..24].copy_from_slice(&anim.to_le_bytes());
-        buf[24..28].copy_from_slice(&x.to_le_bytes());  // x_pos = east
-        buf[28..32].copy_from_slice(&z.to_le_bytes());
+        buf[24..28].copy_from_slice(&x.to_le_bytes());  // x_pos  = server_x (east)
+        buf[28..32].copy_from_slice(&z.to_le_bytes());  // z_pos  = server_z (height)
         buf[32..34].copy_from_slice(&eq_heading.to_le_bytes());
 
         eprintln!("POS: x={:.1} y={:.1} z={:.1} hdg={:.0} eq12_hdg={} anim={}", x, y, z, heading, eq_heading, anim);
@@ -343,7 +353,7 @@ impl Navigator {
         buf[64..66].copy_from_slice(&gs.zone_id.to_le_bytes());
         // instance_id = 0
         buf[66..68].copy_from_slice(&0u16.to_le_bytes());
-        // ZoneChange_Struct: y(server_y=east) at offset 68, x(server_x=north) at offset 72
+        // ZoneChange_Struct: y(server_y=north) @68, x(server_x=east) @72 — Y-first, no swap.
         buf[68..72].copy_from_slice(&gs.player_y.to_le_bytes());
         buf[72..76].copy_from_slice(&gs.player_x.to_le_bytes());
         // z
@@ -410,11 +420,12 @@ mod tests {
         let col = wall_collision();
         // Player at east=3, north=5, stepping toward the wall (east +2) and north (+2).
         // The diagonal hits the wall at east=5, so it should slide to north-only.
-        let r = slide_move(&col, 5.0, 3.0, 0.0, 2.0, 2.0, 2.0);
-        assert_eq!(r, Some((2.0, 0.0)), "should slide along north, dropping the blocked east");
+        // slide_move(col, px=east, py=north, z, full_dx=east, full_dy=north, radius)
+        let r = slide_move(&col, 3.0, 5.0, 0.0, 2.0, 2.0, 2.0);
+        assert_eq!(r, Some((0.0, 2.0)), "should slide along north, dropping the blocked east");
 
         // Moving away from the wall (east -2) is unobstructed → full move.
-        assert_eq!(slide_move(&col, 5.0, 3.0, 0.0, 2.0, -2.0, 2.0), Some((2.0, -2.0)));
+        assert_eq!(slide_move(&col, 3.0, 5.0, 0.0, -2.0, 2.0, 2.0), Some((-2.0, 2.0)));
     }
 
     #[test]

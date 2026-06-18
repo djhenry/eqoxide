@@ -99,6 +99,8 @@ pub struct App {
     app_rx:       tokio::sync::mpsc::UnboundedReceiver<AppPacket>,
     // Frame capture for /frame API
     frame_req:    FrameReq,
+    // Live player state for the /debug endpoint.
+    player_info:  crate::http::PlayerInfo,
     // Precomputed zone collision grid: floor grounding, camera collision, nameplate occlusion.
     // Held as Arc and also published to `shared_collision` so the nav thread can read it.
     collision:    Option<Arc<assets::Collision>>,
@@ -121,6 +123,8 @@ pub struct App {
     vert_vel:   f32,
     /// True when the player's feet are resting on solid geometry.
     on_ground:  bool,
+    /// F10 toggles an on-screen debug overlay (heading values, coords, corrections).
+    show_debug: bool,
 }
 
 impl App {
@@ -137,6 +141,7 @@ impl App {
         say:             crate::http::SayReq,
         target:          crate::http::TargetReq,
         shared_collision: assets::SharedCollision,
+        player_info:     crate::http::PlayerInfo,
         testzone_mode:   bool,
     ) -> Self {
         let mut game_state = GameState::new();
@@ -180,7 +185,7 @@ impl App {
             pick_screen_w: 800,
             pick_screen_h: 600,
             game_state, scene: SceneState::default(), app_rx, frame_req,
-            collision: None, shared_collision,
+            player_info, collision: None, shared_collision,
             ground_cache: (f32::NAN, f32::NAN, 0.0),
             last_grounded_z: 0.0,
             prev_render_pos: [0.0, 0.0, 0.0],
@@ -189,6 +194,7 @@ impl App {
             vert_vel:  0.0,
             on_ground: true,
             testzone_mode,
+            show_debug: false,
         }
     }
 
@@ -237,15 +243,15 @@ impl App {
         let ray_dir = dir_unnorm.normalize();
 
         // Test entities as bounding spheres in GPU world space [east, north, z].
-        // Entity GPU pos = [e.y, e.x, e.z] (scene.rs convention).
+        // Entity pos = [e.x=east, e.y=north] (game_state.rs).
         const SPHERE_R: f32 = 4.0;
         let mut best_t  = f32::MAX;
         let mut best_id = None;
 
         for (&id, e) in &self.game_state.entities {
             if e.dead { continue; }
-            // Lift sphere center to entity mid-body height.
-            let center = glam::Vec3::new(e.y, e.x, e.z + SPHERE_R * 0.75);
+            // Lift sphere center to entity mid-body height. Entity (x=east, y=north).
+            let center = glam::Vec3::new(e.x, e.y, e.z + SPHERE_R * 0.75);
             let oc = ray_origin - center;
             let b  = oc.dot(ray_dir);
             let c  = oc.dot(oc) - SPHERE_R * SPHERE_R;
@@ -295,7 +301,8 @@ impl App {
             let (opt_assets, zone_min, zone_max) = match assets::ZoneAssets::load_all(&s3d_path) {
                 Ok(za) => {
                     let (zone_min, zone_max) = if let Some((mn, mx)) = za.bounds_xy() {
-                        ([-mx[1], mn[0]], [-mn[1], mx[0]])
+                        // bounds_xy already returns [east, north] = [server_x, server_y].
+                        (mn, mx)
                     } else {
                         ([0.0f32; 2], [0.0f32; 2])
                     };
@@ -403,6 +410,21 @@ impl App {
         }
         self.scene = SceneState::from_game_state(&self.game_state);
 
+        // Update shared player state for the /debug HTTP endpoint.
+        {
+            let gs = &self.game_state;
+            let h_cw = crate::eq_net::protocol::ccw_to_cw(gs.player_heading);
+            *self.player_info.lock().unwrap() = crate::http::PlayerState {
+                zone:       gs.zone_name.clone(),
+                pos_east:   gs.player_x,
+                pos_north:  gs.player_y,
+                pos_up:     gs.player_z,
+                heading_ccw: gs.player_heading,
+                heading_cw:  h_cw,
+                server_corrections: gs.server_corrections,
+            };
+        }
+
         // In the test zone, inject fake billboards so every loaded character model
         // is rendered side-by-side for visual debugging.
         if self.scene.zone == "testzone" {
@@ -476,7 +498,7 @@ impl App {
         //   R → reset camera to AutoFollow and clear any keyboard override
         //
         // override_pos [east, north, z] drives the visual immediately each frame.
-        // goto_target  (server_x=north, server_y=east, server_z) is written so the nav
+        // goto_target (server_x=east, server_y=north, server_z) is written so the nav
         // thread sends actual EQ position-update packets to the server.
 
         // Determine A/D mode before the movement block so the heading block can use it.
@@ -492,9 +514,10 @@ impl App {
             const TURN_SPEED: f32 = 120.0; // degrees per second
 
             // Rotate mode: update heading directly and keep camera snapped behind the player.
+            // CCW heading: A (rotate left) → heading increases; D (rotate right) → heading decreases.
             if rotating {
-                if a_held { self.heading_target = (self.heading_target - TURN_SPEED * dt).rem_euclid(360.0); }
-                if d_held { self.heading_target = (self.heading_target + TURN_SPEED * dt).rem_euclid(360.0); }
+                if a_held { self.heading_target = (self.heading_target + TURN_SPEED * dt).rem_euclid(360.0); }
+                if d_held { self.heading_target = (self.heading_target - TURN_SPEED * dt).rem_euclid(360.0); }
                 // Keep the camera in AutoFollow so it tracks the new heading each frame.
                 self.camera.reset_to_follow();
             }
@@ -504,8 +527,9 @@ impl App {
             // When strafing (LMB held), use the camera azimuth as before.
             let (fwd_e, fwd_n, right_e, right_n) = if rotating {
                 let h = self.heading_target.to_radians();
-                // EQ heading: 0=north, 90=east → fwd=(sin h, cos h), right=(cos h, -sin h)
-                (h.sin(), h.cos(), h.cos(), -h.sin())
+                // EQ heading: 0=north(+Y), increases CCW (90=west). Forward unit vector
+                // (east,north) = (-sin h, cos h); right is forward rotated -90°.
+                (-h.sin(), h.cos(), h.cos(), h.sin())
             } else {
                 let az = self.camera.azimuth;
                 (-az.cos(), -az.sin(), -az.sin(), az.cos())
@@ -558,6 +582,9 @@ impl App {
                 } else if clear(0.0, dn) {
                     (0.0, dn)
                 } else {
+                    eprintln!("COLLISION: WASD fully blocked at ({:.1},{:.1}) heading {:.0}° tried ({:.2},{:.2})",
+                              base[0], base[1], self.heading_target, de, dn);
+                    self.game_state.log_msg("collision", &format!("Blocked by wall at ({:.0},{:.0})", base[0], base[1]));
                     (0.0, 0.0) // boxed in — hold position
                 };
 
@@ -593,8 +620,9 @@ impl App {
                 // Move camera focus with the player regardless of camera mode
                 // (ManualOrbit keeps focus fixed otherwise, so the player walks away).
                 self.camera.focus = new_pos;
-                // server coords: x=north=pos[1], y=east=pos[0], z=height=pos[2]
-                *self.goto_target.lock().unwrap() = Some((new_pos[1], new_pos[0], new_pos[2]));
+                // override/world pos = [east, north, z] = [server_x, server_y, server_z];
+                // goto_target is in server coords (server_x, server_y, server_z) — no swap.
+                *self.goto_target.lock().unwrap() = Some((new_pos[0], new_pos[1], new_pos[2]));
             } else if self.override_pos.is_some() && self.on_ground {
                 // Keys released while on ground: drop the visual override so server position takes over.
                 self.override_pos = None;
@@ -766,6 +794,7 @@ impl App {
             self.current_fps, self.zone_map.as_ref(),
             cam_eye, self.collision.as_deref(),
             &self.hail, &self.say, &self.target, &mut self.say_buffer,
+            self.show_debug, self.game_state.server_corrections,
         );
 
         // Submit — associated function avoids reborrowing self.
@@ -811,6 +840,8 @@ impl App {
         say:           &crate::http::SayReq,
         target:        &crate::http::TargetReq,
         say_buffer:    &mut String,
+        show_debug:    bool,
+        corrections:   u32,
     ) {
         let (Some(egui_state), Some(egui_renderer), Some(egui_ctx), Some(window)) =
             (egui_state, egui_renderer, egui_ctx, window) else { return };
@@ -831,6 +862,9 @@ impl App {
                 hud::draw_labels(ctx, scene, view_proj, screen_w, screen_h, cam_eye, collision);
                 hud::draw_minimap(ctx, scene, zone_min, zone_max, minimap_zoom, minimap_full, zone_map);
                 hud::draw_control_bar(ctx, scene, hail, say, target, say_buffer);
+                if show_debug {
+                    hud::draw_debug_overlay(ctx, scene.player_pos, scene.player_heading, current_zone, corrections);
+                }
             }
         });
         egui_state.handle_platform_output(window, full_output.platform_output);
@@ -1012,6 +1046,10 @@ impl ApplicationHandler for App {
                                     self.camera.reset_to_follow();
                                     self.override_pos = None;
                                     *self.goto_target.lock().unwrap() = None;
+                                }
+                                KeyCode::F10 => {
+                                    self.show_debug = !self.show_debug;
+                                    eprintln!("DEBUG: overlay {}", if self.show_debug { "ON" } else { "OFF" });
                                 }
                                 _ => {}
                             }

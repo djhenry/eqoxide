@@ -33,16 +33,16 @@ pub struct ZoneAssets {
 
 impl ZoneAssets {
     /// Compute the 2D bounding box of all mesh vertices.
-    /// Returns `([min_east, min_north], [max_east, max_north])` in map coordinates
-    /// (east = server_y = map_x, north = server_x = map_y).
-    /// libeq_wld convention: position = [east, height, north].
+    /// Returns `([min_east, min_north], [max_east, max_north])` in EQ world coords
+    /// (east = server_x, north = server_y).
+    /// libeq_wld position layout: [east, up, north] = [server_x, server_z, server_y].
     pub fn bounds_xy(&self) -> Option<([f32; 2], [f32; 2])> {
         let mut min = [f32::MAX; 2];
         let mut max = [f32::MIN; 2];
         for m in &self.meshes {
             for p in &m.positions {
-                let e = p[0] + m.center[0]; // east
-                let n = p[2] + m.center[2]; // north
+                let e = p[0] + m.center[0]; // east  = server_x
+                let n = p[2] + m.center[2]; // north = server_y
                 if e < min[0] { min[0] = e; }
                 if n < min[1] { min[1] = n; }
                 if e > max[0] { max[0] = e; }

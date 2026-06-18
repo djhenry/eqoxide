@@ -156,9 +156,20 @@ pub unsafe fn safe_read<T: Copy>(data: &[u8]) -> T {
 
 // ── Spawn_S bitfield position extraction ───────────────────────────────────
 
+/// Convert CW heading (0=north CW, 90=east, i.e. EQ wire convention) to CCW
+/// (0=north, 90=west, the internal convention used everywhere in this client).
+pub fn cw_to_ccw(cw: f32) -> f32 {
+    (360.0 - cw).rem_euclid(360.0)
+}
+
+/// Convert CCW heading back to CW (for sending to the EQ server).
+pub fn ccw_to_cw(ccw: f32) -> f32 {
+    (360.0 - ccw).rem_euclid(360.0)
+}
+
 /// Extract (x, y, z, heading) from a Spawn_S's bitfield blocks.
 /// EQ stores coords as 19-bit signed integers scaled by 1/8.
-/// Heading is 12-bit in EQ units (0-511 per circle), converted to degrees.
+/// Wire heading is EQ12 (0=north CW), converted to CCW degrees internally.
 pub fn extract_spawn_position(
     bitfield_pos1: u32,
     bitfield_pos2: u32,
@@ -175,7 +186,7 @@ pub fn extract_spawn_position(
         val as f32 / 8.0
     }
 
-    fn s12_to_degrees(bits: u32) -> f32 {
+    fn s12_to_degrees_cw(bits: u32) -> f32 {
         let bits = bits & 0xFFF;
         let val = if bits & 0x800 != 0 {
             bits as i32 - 0x1000
@@ -188,7 +199,8 @@ pub fn extract_spawn_position(
     let x = s19((bitfield_pos1 >> 10) & 0x7FFFF);
     let y = s19(bitfield_pos2 & 0x7FFFF);
     let z = s19(bitfield_pos3 & 0x7FFFF);
-    let heading = s12_to_degrees((bitfield_pos4 >> 13) & 0xFFF);
+    let heading_cw = s12_to_degrees_cw((bitfield_pos4 >> 13) & 0xFFF);
+    let heading = cw_to_ccw(heading_cw);
     (x, y, z, heading)
 }
 
@@ -383,11 +395,12 @@ mod tests {
 
     #[test]
     fn test_extract_spawn_position_known_values() {
-        // Construct bitfields for x=100.0, y=200.0, z=50.0, heading=180.0
+        // Construct bitfields for x=100.0, y=200.0, z=50.0, heading=180 (CW south)
         // x=100.0 → raw = 800 (100 * 8), placed at bits 10-28 of pos1
         // y=200.0 → raw = 1600 (200 * 8), placed at bits 0-18 of pos2
         // z=50.0  → raw = 400 (50 * 8), placed at bits 0-18 of pos3
-        // heading=180.0 → raw = 256 (180 * 512 / 360), placed at bits 13-24 of pos4
+        // heading_CW=180 → raw = 256 (180 * 512 / 360), placed at bits 13-24 of pos4
+        // cw_to_ccw(180) = 180 (south is the same in both conventions)
         let x_raw = (100.0 * 8.0) as u32; // 800
         let y_raw = (200.0 * 8.0) as u32; // 1600
         let z_raw = (50.0 * 8.0) as u32;  // 400
@@ -403,6 +416,20 @@ mod tests {
         assert!((y - 200.0).abs() < 0.125, "y={}", y);
         assert!((z - 50.0).abs() < 0.125, "z={}", z);
         assert!((heading - 180.0).abs() < 1.0, "heading={}", heading);
+    }
+
+    #[test]
+    fn test_cw_to_ccw_conversions() {
+        assert!((cw_to_ccw(0.0) - 0.0).abs() < 1e-5, "north same");
+        assert!((cw_to_ccw(90.0) - 270.0).abs() < 1e-5, "CW east → CCW 270 (east)");
+        assert!((cw_to_ccw(180.0) - 180.0).abs() < 1e-5, "south same");
+        assert!((cw_to_ccw(270.0) - 90.0).abs() < 1e-5, "CW west → CCW 90 (west)");
+        assert!((cw_to_ccw(360.0) - 0.0).abs() < 1e-5, "full circle wraps");
+        // Round-trip
+        for d in [0.0, 45.0, 90.0, 180.0, 270.0, 359.0] {
+            let round = cw_to_ccw(ccw_to_cw(d));
+            assert!((round - d).abs() < 1e-5, "round-trip failed at {d}: got {round}");
+        }
     }
 
     #[test]
@@ -555,7 +582,7 @@ fn sext(v: u32, bits: u32) -> i32 {
 /// LE C-bitfields, allocated from the LSB of each u32 word:
 ///   spawn_id(u16) | [delta_heading:10, x:19, pad:3] | [y:19, animation:10, pad:3]
 ///   | [z:19, delta_y:13] | [delta_x:13, heading:12, pad:7] | [delta_z:13, pad:19].
-/// Coords are EQ19 fixed-point (value/8); heading is EQ12 (value/4 → 0..512 EQ units).
+/// Coords are EQ19 fixed-point (value/8); wire heading is EQ12 CW, converted to CCW.
 pub fn decode_position_update(p: &[u8]) -> Option<PositionUpdate> {
     if p.len() < SIZE_SPAWN_POSITION_UPDATE { return None; }
     let spawn_id = u16::from_le_bytes([p[0], p[1]]);
@@ -567,7 +594,8 @@ pub fn decode_position_update(p: &[u8]) -> Option<PositionUpdate> {
     let y = sext(w2 & 0x7FFFF, 19) as f32 / 8.0;
     let z = sext(w3 & 0x7FFFF, 19) as f32 / 8.0;
     let heading_units = ((w4 >> 13) & 0xFFF) as f32 / 4.0; // EQ12 → 0..512
-    let heading = (heading_units * 360.0 / 512.0).rem_euclid(360.0);
+    let heading_cw = (heading_units * 360.0 / 512.0).rem_euclid(360.0);
+    let heading = cw_to_ccw(heading_cw);
     Some(PositionUpdate { spawn_id, x, y, z, heading })
 }
 

@@ -114,7 +114,7 @@ impl SceneState {
     pub fn from_game_state(gs: &GameState) -> Self {
         let billboards = gs.entities.values().map(|e| Billboard {
             id:        e.spawn_id,
-            pos:       [e.y, e.x, e.z], // GPU [east=server_y, north=server_x, height]
+            pos:       [e.x, e.y, e.z], // world = EQ [east=server_x, north=server_y, up=server_z]
             level:     e.level,
             hp_pct:    e.hp_pct,
             is_target: gs.target_id == Some(e.spawn_id),
@@ -134,9 +134,9 @@ impl SceneState {
         SceneState {
             zone: gs.zone_name.clone(),
             zone_changed: gs.zone_changed,
-            // Zone geometry is uploaded as GPU [east=server_y, north=server_x, height=server_z].
-            // Swap X/Y here so scene coordinates match GPU space throughout the render pipeline.
-            player_pos: [gs.player_y, gs.player_x, gs.player_z],
+            // World space is EQ native: [east=server_x, north=server_y, up=server_z].
+            // Zone geometry, entities and the player all share this one frame.
+            player_pos: [gs.player_x, gs.player_y, gs.player_z],
             player_heading: gs.player_heading,
             player_hp_pct: gs.hp_pct,
             player_mana_pct: gs.mana_pct,
@@ -214,7 +214,7 @@ mod tests {
     fn from_game_state_sets_player_fields() {
         let scene = SceneState::from_game_state(&sample_state());
         assert_eq!(scene.player_name, "Aethas");
-        assert_eq!(scene.player_pos, [2.0, 1.0, 3.0]); // [server_y, server_x, server_z] GPU order
+        assert_eq!(scene.player_pos, [1.0, 2.0, 3.0]); // EQ native [server_x, server_y, server_z]
         assert_eq!(scene.player_heading, 192.0);
     }
 
@@ -252,10 +252,10 @@ mod tests {
         assert_eq!(scene.zone, "qeynoshills");
     }
 
-    // --- Coordinate swap: player_pos ---
+    // --- Coordinate mapping: player_pos ---
 
     #[test]
-    fn player_pos_coordinate_swap() {
+    fn player_pos_coordinate_mapping() {
         let mut gs = GameState::new();
         gs.player_x = 100.0;
         gs.player_y = 200.0;
@@ -263,15 +263,15 @@ mod tests {
         let scene = SceneState::from_game_state(&gs);
         assert_eq!(
             scene.player_pos,
-            [200.0, 100.0, 50.0],
-            "player_pos should be [server_y, server_x, server_z]"
+            [100.0, 200.0, 50.0],
+            "player_pos is EQ native [server_x=east, server_y=north, server_z=up]"
         );
     }
 
-    // --- Coordinate swap: entity billboard pos ---
+    // --- Coordinate mapping: entity billboard pos ---
 
     #[test]
-    fn billboard_pos_coordinate_swap() {
+    fn billboard_pos_coordinate_mapping() {
         let mut gs = GameState::new();
         gs.upsert_entity(Entity {
             spawn_id: 1,
@@ -291,8 +291,8 @@ mod tests {
         let scene = SceneState::from_game_state(&gs);
         assert_eq!(scene.billboards.len(), 1);
         let b = &scene.billboards[0];
-        assert_eq!(b.pos[0], 20.0, "pos[0] should be server_y (east)");
-        assert_eq!(b.pos[1], 10.0, "pos[1] should be server_x (north)");
+        assert_eq!(b.pos[0], 10.0, "pos[0] should be server_x (east)");
+        assert_eq!(b.pos[1], 20.0, "pos[1] should be server_y (north)");
         assert_eq!(b.pos[2], 5.0,  "pos[2] should be server_z (height)");
     }
 

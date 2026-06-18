@@ -323,7 +323,7 @@ pub fn draw_minimap(
     let zone_w = (zone_max[0] - zone_min[0]).max(1.0);
     let zone_h = (zone_max[1] - zone_min[1]).max(1.0);
 
-    // scene.player_pos = [east, north, height] (server_y=east at [0], server_x=north at [1]).
+    // scene.player_pos = [east, north, height] = [server_x, server_y, server_z].
     let player_map = [scene.player_pos[0], scene.player_pos[1]]; // [east, north]
 
     let map_px = if *fullscreen { 580.0_f32 } else { 200.0_f32 };
@@ -468,6 +468,29 @@ pub fn draw_minimap(
                     egui::Color32::from_white_alpha(80),
                 );
             }
+        });
+}
+
+pub fn draw_debug_overlay(
+    ctx: &egui::Context,
+    player_pos: [f32; 3],
+    player_heading: f32,
+    zone: &str,
+    corrections: u32,
+) {
+    let h_cw = crate::eq_net::protocol::ccw_to_cw(player_heading);
+    let info = format!(
+        "DEBUG\nzone: {}\npos: ({:.1}, {:.1}, {:.1})\nheading CCW: {:.0}°  CW: {:.0}°\ncorrections: {}",
+        zone, player_pos[0], player_pos[1], player_pos[2], player_heading, h_cw, corrections
+    );
+    egui::Area::new(egui::Id::new("debug_overlay"))
+        .anchor(egui::Align2::LEFT_TOP, [8.0, 28.0])
+        .interactable(false)
+        .show(ctx, |ui| {
+            ui.label(egui::RichText::new(&info)
+                .monospace()
+                .size(11.0)
+                .color(egui::Color32::from_rgb(0, 255, 0)));
         });
 }
 

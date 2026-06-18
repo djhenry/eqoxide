@@ -4,13 +4,12 @@ use std::collections::VecDeque;
 use crate::scene::LogEntry;
 
 /// A zone exit point received in OP_SEND_ZONE_POINTS.
-/// EQ wire format names are swapped: struct field `y` = server_x (north),
-/// struct field `x` = server_y (east). We store in server convention.
+/// Stored in EQ server convention: server_x = east, server_y = north, server_z = up.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ZonePoint {
     pub iterator:  u32,
-    pub server_x:  f32,  // north  (wire field 'y')
-    pub server_y:  f32,  // east   (wire field 'x')
+    pub server_x:  f32,  // east  (wire field 'x')
+    pub server_y:  f32,  // north (wire field 'y')
     pub server_z:  f32,
     pub heading:   f32,
     pub zone_id:   u16,
@@ -90,6 +89,9 @@ pub struct GameState {
 
     // Strategy text for HUD
     pub strategy: String,
+
+    /// Count of server rubber-band corrections (position deltas > 5 units).
+    pub server_corrections: u32,
 
     // Loot state
     /// Corpse spawn_ids queued for auto-looting (populated by OP_BecomeCorpse).

@@ -37,10 +37,10 @@ pub fn compute_eye(azimuth: f32, elevation: f32, radius: f32, focus: [f32; 3]) -
 }
 
 /// Camera azimuth that places the camera behind a player facing `heading_deg`
-/// (EQ convention: 0=north/+Y, clockwise).
+/// (EQ convention: 0=north/+Y, CCW). Camera sits opposite the facing direction:
+///   az = heading_rad - π/2
 pub fn desired_azimuth(heading_deg: f32) -> f32 {
-    let h = heading_deg.to_radians();
-    f32::atan2(-h.cos(), -h.sin())
+    heading_deg.to_radians() - std::f32::consts::FRAC_PI_2
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
@@ -206,8 +206,17 @@ mod tests {
     }
 
     #[test]
-    fn desired_azimuth_heading_east_gives_west_camera() {
+    fn desired_azimuth_heading_west_gives_east_camera() {
+        // CCW heading 90 = west → camera behind = east
         let az = desired_azimuth(90.0);
+        let eye_dir_x = az.cos();
+        assert!(eye_dir_x > 0.9, "camera should be east of focus, got cos(az)={eye_dir_x}");
+    }
+
+    #[test]
+    fn desired_azimuth_heading_east_gives_west_camera() {
+        // CCW heading 270 = east → camera behind = west
+        let az = desired_azimuth(270.0);
         let eye_dir_x = az.cos();
         assert!(eye_dir_x < -0.9, "camera should be west of focus, got cos(az)={eye_dir_x}");
     }

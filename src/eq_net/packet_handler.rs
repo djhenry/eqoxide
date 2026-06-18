@@ -82,6 +82,15 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
     let Some(upd) = decode_position_update(payload) else { return; };
     let sid = upd.spawn_id as u32;
     if sid == gs.player_id {
+        let dx = upd.x - gs.player_x;
+        let dy = upd.y - gs.player_y;
+        let dz = upd.z - gs.player_z;
+        if dx * dx + dy * dy > 25.0 {
+            eprintln!("SERVER_CORRECT: player pos ({:.1},{:.1},{:.1}) → ({:.1},{:.1},{:.1}) delta ({:.1},{:.1},{:.1})",
+                      gs.player_x, gs.player_y, gs.player_z, upd.x, upd.y, upd.z, dx, dy, dz);
+            gs.log_msg("zone", &format!("Server corrected position by ({:.0},{:.0},{:.0})", dx, dy, dz));
+            gs.server_corrections = gs.server_corrections.wrapping_add(1);
+        }
         gs.player_x = upd.x;
         gs.player_y = upd.y;
         gs.player_z = upd.z;
@@ -433,11 +442,12 @@ fn apply_zone_points(gs: &mut GameState, payload: &[u8]) {
     let mut i = offset;
     while i + SIZE_ZONE_POINT_ENTRY <= payload.len() {
         let e = unsafe { safe_read::<ZonePointEntry_S>(&payload[i..]) };
-        // EQ wire convention: struct field y = north = server_x, field x = east = server_y
+        // Wire ZonePoint_Entry is Y-first {iterator, y, x, z, ...}; the values map
+        // directly to server GetY()/GetX() with no axis swap.
         gs.zone_points.push(ZonePoint {
             iterator: e.iterator,
-            server_x: e.y,
-            server_y: e.x,
+            server_x: e.x,
+            server_y: e.y,
             server_z: e.z,
             heading:  e.heading,
             zone_id:  e.zoneid,

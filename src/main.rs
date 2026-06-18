@@ -23,13 +23,14 @@ fn main() {
     let entity_positions: http::EntityPositions = Arc::new(Mutex::new(HashMap::new()));
     let entity_ids:       http::EntityIds       = Arc::new(Mutex::new(HashMap::new()));
     let zone_points:      http::ZonePoints      = Arc::new(Mutex::new(Vec::new()));
-    let zone_cross:       http::ZoneCrossReq    = Arc::new(Mutex::new(false));
+    let zone_cross:       http::ZoneCrossReq    = Arc::new(Mutex::new(None));
     let hail:             http::HailReq         = Arc::new(Mutex::new(None));
     let say:              http::SayReq          = Arc::new(Mutex::new(None));
     let target:           http::TargetReq       = Arc::new(Mutex::new(None));
     let attack:           http::AttackReq       = Arc::new(Mutex::new(None));
     let shared_collision: assets::SharedCollision = Arc::new(std::sync::RwLock::new(None));
     let frame_req:        http::FrameReq        = Arc::new(Mutex::new(None));
+    let player_info:      http::PlayerInfo      = Arc::new(Mutex::new(http::PlayerState::default()));
 
     // EQ network task — skipped in --testzone mode (offline debug)
     let character_name = login_cfg.character_name.clone();
@@ -59,6 +60,7 @@ fn main() {
     let app_hail   = hail.clone();
     let app_say    = say.clone();
     let app_target = target.clone();
+    let app_player_info = player_info.clone();
     http::spawn_camera_server(
         camera_cmd.clone(),
         camera_snapshot.clone(),
@@ -72,6 +74,7 @@ fn main() {
         say,
         target,
         attack,
+        player_info,
         app_cfg.http_port,
     );
 
@@ -89,6 +92,7 @@ fn main() {
         app_say,
         app_target,
         shared_collision,
+        app_player_info,
         testzone_mode,
     );
     event_loop.run_app(&mut application).expect("event loop run");

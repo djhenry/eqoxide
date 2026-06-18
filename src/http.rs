@@ -28,8 +28,11 @@ pub type EntityIds = Arc<Mutex<HashMap<String, u32>>>;
 /// Zone exit points received in OP_SEND_ZONE_POINTS, exposed via GET /zone_points.
 pub type ZonePoints = Arc<Mutex<Vec<crate::game_state::ZonePoint>>>;
 
-/// Set to true by POST /zone_cross; gameplay thread reads it once and sends OP_ZONE_CHANGE.
-pub type ZoneCrossReq = Arc<Mutex<bool>>;
+/// Zone-crossing request set by POST /zone_cross; gameplay thread reads it once,
+/// warps to the matching zone line and sends OP_ZONE_CHANGE.
+///   Some(0)  → cross the nearest zone line (any destination).
+///   Some(id) → cross to a specific destination zone id.
+pub type ZoneCrossReq = Arc<Mutex<Option<u16>>>;
 
 /// NPC name to hail, set by POST /hail; the nav thread reads it once and sends a
 /// "Hail, <name>" say packet so the NPC fires its hail/quest script.
@@ -51,6 +54,19 @@ pub type AttackReq = Arc<Mutex<Option<bool>>>;
 #[allow(dead_code)]
 pub type ZoneInfo = Arc<Mutex<(String, u16)>>;
 
+/// Live player state for the /debug endpoint.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct PlayerState {
+    pub zone:         String,
+    pub pos_east:     f32,
+    pub pos_north:    f32,
+    pub pos_up:       f32,
+    pub heading_ccw:  f32, // 0=north CCW
+    pub heading_cw:   f32, // 0=north CW (wire format)
+    pub server_corrections: u32,
+}
+pub type PlayerInfo = Arc<Mutex<PlayerState>>;
+
 #[derive(Clone)]
 struct HttpState {
     cmd_tx:           Arc<Mutex<Option<CameraCmd>>>,
@@ -65,6 +81,7 @@ struct HttpState {
     say:              SayReq,
     target:           TargetReq,
     attack:           AttackReq,
+    player_info:      PlayerInfo,
 }
 
 #[derive(serde::Deserialize)]
@@ -101,12 +118,13 @@ pub fn spawn_camera_server(
     say:              SayReq,
     target:           TargetReq,
     attack:           AttackReq,
+    player_info:      PlayerInfo,
     port:             u16,
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, hail, say, target, attack };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, hail, say, target, attack, player_info };
             let app = Router::new()
                 .route("/camera", get(get_camera).post(post_camera))
                 .route("/camera/reset", post(post_camera_reset))
@@ -120,6 +138,7 @@ pub fn spawn_camera_server(
                 .route("/target", post(post_target))
                 .route("/target/name", post(post_target_name))
                 .route("/attack", post(post_attack_on).delete(post_attack_off))
+                .route("/debug", get(get_debug))
                 .with_state(state);
             let addr = format!("127.0.0.1:{port}");
             let listener = match tokio::net::TcpListener::bind(&addr).await {
@@ -207,9 +226,10 @@ async fn post_goto(
             }
         }
     } else if let (Some(mx), Some(my)) = (b.map_x, b.map_y) {
-        // Map coords: map_x = server_y, map_y = server_x
-        let server_x = my;
-        let server_y = mx;
+        // Map coords match the eqmaps/Brewall .txt values, which are the negated
+        // server position: map_x = -server_x, map_y = -server_y.
+        let server_x = -mx;
+        let server_y = -my;
         let server_z = b.z.unwrap_or(3.75);
         eprintln!("goto: map ({:.1},{:.1}) → server ({:.1},{:.1})", mx, my, server_x, server_y);
         (server_x, server_y, server_z)
@@ -238,11 +258,22 @@ async fn get_zone_points(State(s): State<HttpState>) -> Json<Vec<crate::game_sta
     Json(s.zone_points.lock().unwrap().clone())
 }
 
-/// POST /zone_cross — signal the gameplay thread to send OP_ZONE_CHANGE at current position.
-async fn post_zone_cross(State(s): State<HttpState>) -> (StatusCode, String) {
-    *s.zone_cross.lock().unwrap() = true;
-    eprintln!("zone_cross: flagged for OP_ZONE_CHANGE send");
-    (StatusCode::OK, "zone_cross request queued".into())
+#[derive(serde::Deserialize, Default)]
+struct ZoneCrossBody {
+    /// Destination zone id to cross to. Omit (or 0) to take the nearest zone line.
+    zone_id: Option<u16>,
+}
+
+/// POST /zone_cross — warp to a zone line and send OP_ZONE_CHANGE.
+/// Body: {"zone_id": 1} to cross to a specific zone, or {} for the nearest line.
+async fn post_zone_cross(
+    State(s): State<HttpState>,
+    body: Option<Json<ZoneCrossBody>>,
+) -> (StatusCode, String) {
+    let zone_id = body.and_then(|Json(b)| b.zone_id).unwrap_or(0);
+    *s.zone_cross.lock().unwrap() = Some(zone_id);
+    eprintln!("zone_cross: flagged for OP_ZONE_CHANGE (target zone_id={zone_id})");
+    (StatusCode::OK, format!("zone_cross request queued (zone_id={zone_id})"))
 }
 
 #[derive(serde::Deserialize)]
@@ -277,14 +308,14 @@ async fn post_hail(
             .or_else(|| positions.keys().find(|k| k.to_lowercase().contains(&nl)))
             .cloned()
     } else {
-        // Nearest NPC to the player (camera focus = [east, north, height];
-        // entity stored as (server_x=north, server_y=east, z)).
+        // Nearest NPC to the player. Camera focus = [east, north, height] =
+        // [server_x, server_y, server_z]; entities stored as (server_x, server_y, z).
         let focus = s.snapshot.lock().unwrap().focus;
         positions.iter()
             .filter(|(k, _)| !k.contains("zone_controller"))
-            .map(|(k, &(nx, ey, _))| {
-                let de = ey - focus[0];
-                let dn = nx - focus[1];
+            .map(|(k, &(ex, ny, _))| {
+                let de = ex - focus[0];
+                let dn = ny - focus[1];
                 (k.clone(), de * de + dn * dn)
             })
             .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
@@ -393,6 +424,27 @@ async fn post_attack_off(State(s): State<HttpState>) -> (StatusCode, String) {
     *s.attack.lock().unwrap() = Some(false);
     eprintln!("attack: queued auto-attack OFF");
     (StatusCode::OK, "auto-attack OFF".into())
+}
+
+async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
+    let cam   = s.snapshot.lock().unwrap().clone();
+    let player = s.player_info.lock().unwrap().clone();
+    Json(serde_json::json!({
+        "player": {
+            "zone":       player.zone,
+            "pos":        [player.pos_east, player.pos_north, player.pos_up],
+            "heading_ccw": player.heading_ccw,
+            "heading_cw":  player.heading_cw,
+            "server_corrections": player.server_corrections,
+        },
+        "camera": {
+            "azimuth_deg":   cam.azimuth.to_degrees(),
+            "elevation_deg": cam.elevation.to_degrees(),
+            "radius":        cam.radius,
+            "focus":         cam.focus,
+            "mode":          cam.mode,
+        },
+    }))
 }
 
 /// GET /frame — returns the current rendered frame as a PNG.
