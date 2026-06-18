@@ -468,6 +468,8 @@ impl App {
         };
         if should_init_cam {
             self.visual_player_pos = self.scene.player_pos;
+            self.heading_target    = self.scene.player_heading;
+            self.visual_heading    = self.scene.player_heading;
             self.camera = CameraState::new(self.scene.player_pos, self.scene.player_heading);
             self.camera_initialized = true;
         }
@@ -711,7 +713,7 @@ impl App {
             // Don't override heading_target from motion while A/D are rotating the player —
             // rotation already sets it directly. When not rotating, derive from movement.
             if !rotating && de * de + dn * dn > 0.02 {
-                let motion_deg = de.atan2(dn).to_degrees().rem_euclid(360.0);
+                let motion_deg = (-de).atan2(dn).to_degrees().rem_euclid(360.0);
                 // Guard against ~180° flips caused by the backward position-correction lerp
                 // that occurs when W is released and visual_player_pos snaps back toward the
                 // server position (which lags up to ~5 units behind the keyboard override).

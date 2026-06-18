@@ -65,15 +65,14 @@ pub fn entity_model_matrix_scaled(
 ///     skinning math already lands them Z-up. Applying the conversion again would tip
 ///     them flat onto the ground (`y_up = false`).
 ///
-/// Heading is CCW (0=north, 90=west). With the X conversion the model's forward is -Y,
-/// so yaw = heading_rad − π places it along the CCW heading. Without the conversion
-/// (skinned) the forward is also -Y in the XY plane, so the same yaw formula applies.
+/// Heading is CCW (0=north, 90=west). The glTF models' front faces +X in local
+/// space, so yaw = heading_rad + π/2 rotates +X to the CCW heading direction.
 pub fn entity_model_matrix_heading(
     pos: [f32; 3], heading_deg: f32, visual_scale: f32, mesh_scale: f32,
     center_xz: [f32; 2], y_up: bool, y_bottom: f32,
 ) -> [[f32; 4]; 4] {
     let p      = glam::Vec3::from(pos);
-    let yaw    = heading_deg.to_radians() - std::f32::consts::PI;
+    let yaw    = heading_deg.to_radians() + std::f32::consts::FRAC_PI_2;
     let lifted = p + glam::Vec3::new(0.0, 0.0, visual_scale * 0.5 + y_bottom * mesh_scale);
     let x_rot  = if y_up { glam::Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2) }
                  else    { glam::Mat4::IDENTITY };
