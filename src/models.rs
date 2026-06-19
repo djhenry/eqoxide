@@ -510,7 +510,7 @@ pub fn race_to_archetype(race: &str) -> &'static str {
 /// Returns `None` for archetypes that have no EQ character archive.
 pub fn archetype_to_chr_s3d(archetype: &str) -> Option<&'static str> {
     match archetype {
-        "humanoid"  => Some("globalhom_chr.s3d"),  // human male
+        "humanoid"  => Some("globalhum_chr.s3d"),  // human male (globalhom is Halfling, not Human)
         "elf"       => Some("globalelf_chr.s3d"),   // wood elf
         "dwarf"     => Some("globaldwf_chr.s3d"),   // dwarf
         "gnoll"     => Some("globalgnm_chr.s3d"),   // gnoll
