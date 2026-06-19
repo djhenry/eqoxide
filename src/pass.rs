@@ -211,15 +211,16 @@ pub fn encode_player_pass(
                 // Write to pool slot 0 (reserved for player).
                 r.queue.write_buffer(&r.joint_buf_pool[0].0, 0, bytemuck::cast_slice(&joint_array));
 
-                let arch_scale = archetype_scale(archetype);
-                let dominant_mesh_scale = arch_scale * model.node_scale;
+                let target = crate::models::archetype_target_height(archetype);
+                let height = if model.true_height > 0.001 { model.true_height } else { 1.0 };
+                let dominant_mesh_scale = (target / height) * model.node_scale;
                 let lift_basis = match r.anim_states.get(&0) {
                     Some(state) if !model.skin.clips.is_empty() =>
                         -model.skin.lowest_skinned_z(state.clip_idx, state.time),
                     _ => -model.skin.bind_lowest_skinned_z(),
                 };
                 let visual_scale = 2.0 * lift_basis * dominant_mesh_scale;
-                let center_xz = [model.x_center, model.z_center];
+                let center_xz = [0.0_f32, 0.0]; // normalized models are pre-centered
 
                 for (i, mesh) in model.meshes.iter().enumerate() {
                     if i >= PLAYER_UNIFORM_SLOTS { break; }
@@ -538,7 +539,7 @@ pub fn encode_skinned_entity_pass(
     _cam_pos: [f32; 3],
 ) {
     use crate::renderer::PLAYER_UNIFORM_SLOTS;
-    use crate::models::{race_to_archetype, archetype_scale};
+    use crate::models::race_to_archetype;
     use crate::gpu::{EntityUniform, GpuModel};
 
     struct DrawCmd { archetype: &'static str, mesh_idx: usize, uniform_slot: usize, joint_slot: usize, equipment: [u32; 9] }
@@ -570,8 +571,9 @@ pub fn encode_skinned_entity_pass(
         for (i, m) in matrices.iter().enumerate().take(128) { joint_array[i] = *m; }
         r.queue.write_buffer(&r.joint_buf_pool[j_slot].0, 0, bytemuck::cast_slice(&joint_array));
 
-        let arch_scale        = archetype_scale(archetype);
-        let dominant_scale    = arch_scale * model.node_scale;
+        let target = crate::models::archetype_target_height(archetype);
+        let height = if model.true_height > 0.001 { model.true_height } else { 1.0 };
+        let dominant_scale    = (target / height) * model.node_scale;
         let lift_basis = if b.action != "dead" {
             match r.anim_states.get(&b.id) {
                 Some(state) if !model.skin.clips.is_empty() =>
@@ -587,7 +589,7 @@ pub fn encode_skinned_entity_pass(
             if u_slot >= r.entity_uniform_pool.len() { break; }
             let mat = crate::camera::entity_model_matrix_heading(
                 b.pos, b.heading, visual_scale, dominant_scale,
-                [model.x_center, model.z_center], true, 0.0,
+                [0.0_f32, 0.0], true, 0.0, // normalized models are pre-centered
             );
             let slot_meta = model.equip_slots[mesh_idx];
             let tint: [f32; 4] = if b.dead { [0.5, 0.5, 0.5, 1.0] }

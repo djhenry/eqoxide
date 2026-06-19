@@ -581,6 +581,20 @@ pub fn archetype_scale(archetype: &str) -> f32 {
     }
 }
 
+/// Target height in EQ units for each archetype, used to scale normalized skinned models
+/// so that `true_height` maps to the correct in-world visual height.
+/// EQ units ≈ feet. Values are initial calibration; fine-tune visually after loading.
+pub fn archetype_target_height(archetype: &str) -> f32 {
+    match archetype {
+        "humanoid" => 6.0, "elf" => 6.0, "dwarf" => 4.5, "gnoll" => 6.0,
+        "skeleton" => 6.0, "zombie" => 6.0, "frog" => 5.0,
+        "bear" => 6.0, "wolf" => 4.0, "rat" => 1.5, "snake" => 3.0,
+        "bat" => 2.0, "bird" => 2.0, "wasp" => 2.0, "worm" => 2.0,
+        "fish" => 1.5, "creature" => 4.0,
+        _ => 6.0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -723,6 +737,13 @@ mod tests {
         assert_eq!(race_to_archetype("hum"), "humanoid");
         assert_eq!(race_to_archetype("Gnl"), "gnoll");
         assert_eq!(race_to_archetype("rat"), "rat");
+    }
+
+    #[test]
+    fn target_heights_are_sane() {
+        assert!((archetype_target_height("humanoid") - 6.0).abs() < 0.01);
+        assert!(archetype_target_height("dwarf") < archetype_target_height("humanoid"));
+        assert!(archetype_target_height("unknown") > 0.0);
     }
 
     #[test]
