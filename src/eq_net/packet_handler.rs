@@ -592,7 +592,7 @@ pub fn register_spawn(gs: &mut GameState, spawn: Spawn_S) {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_emote, apply_player_profile, class_name, con_color, consider_message, parse_player_profile};
+    use super::{apply_emote, class_name, con_color, consider_message, parse_player_profile};
     use crate::game_state::GameState;
 
     #[test]
