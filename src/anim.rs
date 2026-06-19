@@ -197,6 +197,14 @@ impl SkinData {
                     && !n.contains("back") && !n.contains("left") && !n.contains("right")
                     && !n.contains("shoot")
             }),
+            "sitting" => self.clips.iter().position(|c| {
+                let n = c.name.to_lowercase();
+                n.contains("sit") && !n.contains("swim")
+            }),
+            "crouching" => self.clips.iter().position(|c| {
+                let n = c.name.to_lowercase();
+                n.contains("crouch")
+            }),
             // Idle/standing MUST be checked BEFORE the walking fallback — otherwise the
             // walk-first logic in the _ branch hijacks these actions.
             "idle" | "standing" | "wait" => {

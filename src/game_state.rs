@@ -37,6 +37,8 @@ pub struct Entity {
     pub gender: u8,
     pub helm: u8,
     pub showhelm: u8,
+    /// Server animation state (Animation::Standing=100, Sitting=110, Crouching=111, etc.)
+    pub animation: u32,
 }
 
 impl Entity {
@@ -195,6 +197,7 @@ mod tests {
             heading: 0.0,
             dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
+            animation: 0,
         }
     }
 

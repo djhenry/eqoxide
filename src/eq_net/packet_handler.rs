@@ -100,6 +100,7 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         e.y = upd.y;
         e.z = upd.z;
         e.heading = upd.heading;
+        e.animation = upd.animation;
         eprintln!("EQ: npc_pos id={} name={} pos=({:.1},{:.1},{:.1})", sid, e.name, e.x, e.y, e.z);
     } else {
         eprintln!("EQ: npc_pos id={} NOT IN ENTITY MAP (known: {})", sid, gs.entities.len());
@@ -505,9 +506,16 @@ pub fn apply_wear_change(gs: &mut GameState, p: &[u8]) {
     let spawn_id = wc.spawn_id as u32;
     let material = wc.material as u32;
     let color = wc.color; // [B, G, R, UseTint]
-    if let Some(e) = gs.entities.get_mut(&spawn_id) {
+    let tint = [color[2], color[1], color[0]]; // store RGB
+    // The local player is registered separately (not in `entities`), so a WearChange
+    // for the player's own spawn_id must update the player fields, or live equip/unequip
+    // (e.g. GM #gearup) never shows on the player until a re-zone re-parses the profile.
+    if spawn_id == gs.player_id {
+        gs.player_equipment[slot] = material;
+        gs.player_equipment_tint[slot] = tint;
+    } else if let Some(e) = gs.entities.get_mut(&spawn_id) {
         e.equipment[slot] = material;
-        e.equipment_tint[slot] = [color[2], color[1], color[0]]; // store RGB
+        e.equipment_tint[slot] = tint;
     }
 }
 
@@ -566,7 +574,8 @@ pub fn register_spawn(gs: &mut GameState, spawn: Spawn_S) {
         u32::from_le_bytes(spawn.equipment[i*4..i*4+4].try_into().unwrap())
     });
     let equipment_tint: [[u8; 3]; 9] = std::array::from_fn(|i| {
-        [spawn.equipment_tint[i*4], spawn.equipment_tint[i*4+1], spawn.equipment_tint[i*4+2]]
+        // Tint_Struct wire order is Blue, Green, Red; store as RGB (matches WearChange + profile).
+        [spawn.equipment_tint[i*4+2], spawn.equipment_tint[i*4+1], spawn.equipment_tint[i*4]]
     });
     gs.upsert_entity(Entity {
         spawn_id: spawn.spawnId,
@@ -587,6 +596,7 @@ pub fn register_spawn(gs: &mut GameState, spawn: Spawn_S) {
         gender: spawn.gender,
         helm: spawn.helm,
         showhelm: spawn.showhelm,
+        animation: spawn.StandState as u32,
     });
 }
 
@@ -783,6 +793,19 @@ mod tests {
         apply_wear_change(&mut gs, &[1, 2, 3]); // shorter than SIZE_WEAR_CHANGE; must not panic
     }
 
+    #[test]
+    fn apply_wear_change_updates_player_when_spawn_is_player() {
+        use super::apply_wear_change;
+        let mut gs = GameState::new();
+        gs.player_id = 7; // local player's spawn id
+        // spawn_id=7 (player), material=17, color B,G,R=(1,2,3), wear_slot_id=1 (chest)
+        let pkt = [7u8, 0, 17, 0, 1, 2, 3, 0xFF, 1];
+        apply_wear_change(&mut gs, &pkt);
+        assert_eq!(gs.player_equipment[1], 17);
+        assert_eq!(gs.player_equipment_tint[1], [3, 2, 1]); // stored RGB
+        assert!(gs.entities.is_empty(), "player must not be added to entities");
+    }
+
     // --- decode/encode position round-trip: NPC-relevant edge cases ---
 
     #[test]
@@ -834,7 +857,7 @@ mod tests {
         spawn.name[0] = b'O'; spawn.name[1] = b'r'; spawn.name[2] = b'c';
         // slot 1 (chest) material id = 17 (LE u32 at byte offset 4)
         spawn.equipment[4] = 17;
-        // slot 1 tint RGB = (10, 20, 30) at byte offset 4
+        // slot 1 wire bytes are BGR: Blue=10, Green=20, Red=30 at byte offset 4
         spawn.equipment_tint[4] = 10;
         spawn.equipment_tint[5] = 20;
         spawn.equipment_tint[6] = 30;
@@ -842,7 +865,7 @@ mod tests {
         register_spawn(&mut gs, spawn);
         let e = gs.entities.get(&7).expect("entity registered");
         assert_eq!(e.equipment[1], 17);
-        assert_eq!(e.equipment_tint[1], [10, 20, 30]);
+        assert_eq!(e.equipment_tint[1], [30, 20, 10]); // wire BGR [10,20,30] → stored RGB
         assert_eq!(e.gender, 1);
     }
 }

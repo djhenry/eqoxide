@@ -16,8 +16,11 @@ pub struct EntityAnimState {
 
 /// Pre-allocated entity uniform buffer slot count.
 /// Layout: [0..PLAYER_UNIFORM_SLOTS) = player, [PLAYER_UNIFORM_SLOTS..) = entities.
-pub const PLAYER_UNIFORM_SLOTS: usize = 16;
-pub const TOTAL_ENTITY_UNIFORM_SLOTS: usize = 4112; // 16 player + 4096 entity mesh draws
+// Character GLB models have up to 27 primitives (humanoid). The player draws one
+// uniform slot per mesh, so this MUST be >= the max mesh count or the player loses
+// its later primitives (head pieces + feet were dropped at the old value of 16).
+pub const PLAYER_UNIFORM_SLOTS: usize = 32;
+pub const TOTAL_ENTITY_UNIFORM_SLOTS: usize = 4128; // 32 player + 4096 entity mesh draws
 /// Pre-allocated joint buffer pool size. Slot 0 = player, 1..N = entities.
 pub const JOINT_BUF_SLOTS: usize = 512;
 /// Size of one joint buffer: 128 joints × mat4(64 bytes).
@@ -408,7 +411,9 @@ impl EqRenderer {
             };
             if prefix.is_empty() { continue; }
             for es in slots.iter().flatten() {
-                let key = equip_texture_name(prefix, &es.region, b.equipment[es.slot], es.variant);
+                let material = b.equipment[es.slot];
+                if material == 0 { continue; } // naked → baked texture, no swap
+                let key = equip_texture_name(prefix, &es.region, material, es.variant);
                 if !self.equipment_tex_cache.contains_key(&key) {
                     needed.push(key);
                 }
@@ -423,7 +428,9 @@ impl EqRenderer {
                 };
                 if !prefix.is_empty() {
                     for es in slots.iter().flatten() {
-                        let key = equip_texture_name(prefix, &es.region, scene.player_equipment[es.slot], es.variant);
+                        let material = scene.player_equipment[es.slot];
+                        if material == 0 { continue; } // naked → baked texture, no swap
+                        let key = equip_texture_name(prefix, &es.region, material, es.variant);
                         if !self.equipment_tex_cache.contains_key(&key) {
                             needed.push(key);
                         }

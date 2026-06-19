@@ -12,8 +12,14 @@ fn resolve_equip_tex<'a>(
     equipment:  &[u32; 9],
 ) -> &'a wgpu::BindGroup {
     if let Some(es) = slot {
-        if !prefix.is_empty() {
-            let key = crate::models::equip_texture_name(prefix, &es.region, equipment[es.slot], es.variant);
+        let material = equipment[es.slot];
+        // material 0 = naked/default: use the model's baked texture. The GLB bakes the
+        // "sk" skin textures (e.g. homhesk01), which do NOT match the numeric "00" texture
+        // names (homhe0001) — those are different graphics — so building a swap key for
+        // material 0 would override the correct skin with the wrong texture (head/feet
+        // rendering as missing/transparent).
+        if material != 0 && !prefix.is_empty() {
+            let key = crate::models::equip_texture_name(prefix, &es.region, material, es.variant);
             if let Some(Some(bg)) = r.equipment_tex_cache.get(&key) {
                 return bg;
             }
@@ -207,7 +213,11 @@ pub fn encode_player_pass(
 
                 let arch_scale = archetype_scale(archetype);
                 let dominant_mesh_scale = arch_scale * model.node_scale;
-                let lift_basis = -model.skin.bind_lowest_skinned_z();
+                let lift_basis = match r.anim_states.get(&0) {
+                    Some(state) if !model.skin.clips.is_empty() =>
+                        -model.skin.lowest_skinned_z(state.clip_idx, state.time),
+                    _ => -model.skin.bind_lowest_skinned_z(),
+                };
                 let visual_scale = 2.0 * lift_basis * dominant_mesh_scale;
                 let center_xz = [model.x_center, model.z_center];
 

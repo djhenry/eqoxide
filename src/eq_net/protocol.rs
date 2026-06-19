@@ -587,6 +587,7 @@ pub struct PositionUpdate {
     pub y: f32,       // server y (east)
     pub z: f32,       // height
     pub heading: f32, // degrees, 0..360
+    pub animation: u32, // Animation::Standing=100, Sitting=110, Crouching=111, etc.
 }
 
 #[inline]
@@ -613,7 +614,8 @@ pub fn decode_position_update(p: &[u8]) -> Option<PositionUpdate> {
     let heading_units = ((w4 >> 13) & 0xFFF) as f32 / 4.0; // EQ12 → 0..512
     let heading_cw = (heading_units * 360.0 / 512.0).rem_euclid(360.0);
     let heading = cw_to_ccw(heading_cw);
-    Some(PositionUpdate { spawn_id, x, y, z, heading })
+    let animation = (w2 >> 19) & 0x3FF; // 10-bit field: y:19, animation:10, pad:3
+    Some(PositionUpdate { spawn_id, x, y, z, heading, animation })
 }
 
 /// Encode a minimal position update (deltas/animation/heading zero) in the same
