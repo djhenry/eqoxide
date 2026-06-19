@@ -85,6 +85,10 @@ pub const OP_DELETE_SPAWN: u16 = 0x55bc;
 pub const OP_CLIENT_UPDATE: u16 = 0x14cb;
 pub const OP_SPAWN_APPEARANCE: u16 = 0x7c32;
 
+// ── Gameplay: equipment ───────────────────────────────────────────────────
+
+pub const OP_WEAR_CHANGE: u16 = 0x7441; // verified against patch_Titanium.conf
+
 // ── Gameplay: combat ──────────────────────────────────────────────────────
 
 pub const OP_HP_UPDATE: u16 = 0x3bcf;
@@ -353,6 +357,19 @@ pub const SIZE_EXP_UPDATE: usize = 4;   // ExpUpdate_S
 pub const SIZE_LEVEL_UPDATE: usize = 12; // LevelUpdate_S
 pub const SIZE_MONEY_ON_CORPSE: usize = 20; // MoneyOnCorpse_S
 pub const SIZE_ZONE_CHANGE: usize = 88;   // ZoneChange_Struct
+
+/// WearChange_Struct (Titanium, 9 bytes). Runtime equip/unequip of one slot.
+#[repr(C, packed)]
+#[derive(Debug, Copy, Clone)]
+#[allow(non_snake_case)]
+pub struct WearChange_S {
+    pub spawn_id: u16,
+    pub material: u16,
+    pub color: [u8; 4],   // Tint_Struct: Blue, Green, Red, UseTint
+    pub wear_slot_id: u8,
+}
+
+pub const SIZE_WEAR_CHANGE: usize = std::mem::size_of::<WearChange_S>();
 
 #[cfg(test)]
 mod tests {
