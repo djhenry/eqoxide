@@ -326,7 +326,7 @@ impl EqRenderer {
                     .unzip();
                 eprintln!("renderer: loaded skinned model '{}' ({} joints, {} clips)",
                           key, skin.joint_count, skin.clips.len());
-                GpuModel::Skinned(GpuSkinnedModel { meshes, texture_bind_groups: tex_bgs, skin, node_scale: asset.skinned_node_scale, y_bottom: asset.y_bottom, x_center: asset.x_center, z_center: asset.z_center, prefix: asset.prefix.clone(), equip_slots: skinned_slots })
+                GpuModel::Skinned(GpuSkinnedModel { meshes, texture_bind_groups: tex_bgs, skin, node_scale: asset.skinned_node_scale, y_bottom: asset.y_bottom, x_center: asset.x_center, z_center: asset.z_center, prefix: asset.prefix.clone(), equip_slots: skinned_slots, true_height: asset.true_height })
             } else {
                 let (meshes, static_slots): (Vec<GpuMesh>, Vec<Option<crate::models::EquipSlot>>) = asset.meshes.iter()
                     .zip(asset.equip_slots.iter())
@@ -353,7 +353,7 @@ impl EqRenderer {
                                    base_color: mesh.base_color }, slot))
                 }).unzip();
                 eprintln!("renderer: loaded static model '{}'", key);
-                GpuModel::Static(GpuStaticModel { meshes, texture_bind_groups: tex_bgs, y_bottom: asset.y_bottom, y_extent: asset.y_extent, x_center: asset.x_center, z_center: asset.z_center, prefix: asset.prefix.clone(), equip_slots: static_slots })
+                GpuModel::Static(GpuStaticModel { meshes, texture_bind_groups: tex_bgs, y_bottom: asset.y_bottom, y_extent: asset.y_extent, x_center: asset.x_center, z_center: asset.z_center, prefix: asset.prefix.clone(), equip_slots: static_slots, true_height: asset.true_height })
             };
 
             self.gpu_character_models.insert(key, model);

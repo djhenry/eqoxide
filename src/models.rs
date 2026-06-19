@@ -36,6 +36,10 @@ pub struct ModelAsset {
     pub prefix: String,
     /// Per-mesh equipment slot binding, parallel to `meshes`. `None` = not an armor slot.
     pub equip_slots: Vec<Option<EquipSlot>>,
+    /// True model height in EQ units, from the `eq_height` extras field written by the
+    /// converter into the glTF ROOT node. Falls back to `y_extent` (measured vertex bounds)
+    /// when the extras field is absent (e.g. chr.s3d static models).
+    pub true_height: f32,
 }
 
 impl ModelAsset {
@@ -72,6 +76,18 @@ impl ModelAsset {
         }
 
         let document = &gltf_doc.document;
+
+        // ── Read eq_height from the first node that carries it in extras ──────
+        // The converter writes this field into the ROOT node's extras so the loader
+        // can recover the true EQ-unit height without measuring raw vertex bounds.
+        let eq_height_from_extras: f32 = document.nodes()
+            .find_map(|n| {
+                let ex = n.extras().as_ref()?;
+                let v: serde_json::Value = serde_json::from_str(ex.get()).ok()?;
+                v.get("eq_height").and_then(|h| h.as_f64()).map(|h| h as f32)
+            })
+            .filter(|h| *h > 0.0)
+            .unwrap_or(0.0); // 0.0 = "use measured extent" sentinel; finalized below
 
         // ── Skin: joint hierarchy + inverse bind matrices ─────────────────────
         let skin_opt = document.skins().next();
@@ -364,7 +380,10 @@ impl ModelAsset {
             else { ((x_min + x_max) * 0.5, (z_min + z_max) * 0.5) }
         };
 
-        Ok(ModelAsset { meshes, textures, skin: skin_data, skin_meshes, skinned_node_scale, skinned_mesh_scales, y_bottom, y_extent, x_center, z_center, prefix: model_prefix, equip_slots })
+        // Finalize true_height: prefer eq_height from extras; fall back to measured y_extent.
+        let true_height = if eq_height_from_extras > 0.0 { eq_height_from_extras } else { y_extent };
+
+        Ok(ModelAsset { meshes, textures, skin: skin_data, skin_meshes, skinned_node_scale, skinned_mesh_scales, y_bottom, y_extent, x_center, z_center, prefix: model_prefix, equip_slots, true_height })
     }
 
     /// Load a static character model from an EQ `_chr.s3d` archive.
@@ -425,6 +444,8 @@ impl ModelAsset {
             z_center,
             prefix: String::new(),
             equip_slots: vec![None; mesh_count],
+            // chr.s3d models have no glTF extras; fall back to measured y_extent.
+            true_height: y_extent,
         })
     }
 }
@@ -766,6 +787,19 @@ mod tests {
     fn equip_texture_name_formats() {
         assert_eq!(equip_texture_name("hom", b"ch", 17, 1), "homch1701");
         assert_eq!(equip_texture_name("hom", b"ch", 0, 3),  "homch0003");
+    }
+
+    #[test]
+    #[ignore = "requires assets/models/humanoid.glb"]
+    fn humanoid_true_height_from_extras() {
+        let path = std::path::PathBuf::from(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/assets/models/humanoid.glb")
+        );
+        let asset = ModelAsset::load(&path).expect("load failed");
+        assert!(asset.true_height > 0.0,
+            "true_height must be positive, got {}", asset.true_height);
+        assert!(asset.true_height.is_finite(),
+            "true_height must be finite, got {}", asset.true_height);
     }
 
     #[test]

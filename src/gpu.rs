@@ -70,6 +70,9 @@ pub struct GpuStaticModel {
     pub prefix: String,
     /// Per-mesh equipment slot binding, parallel to `meshes`. `None` = not an armor slot.
     pub equip_slots: Vec<Option<crate::models::EquipSlot>>,
+    /// True model height in EQ units. From `eq_height` glTF extras if present; otherwise
+    /// the measured `y_extent`. Use this for scale calculations (Task 4).
+    pub true_height: f32,
 }
 
 /// Skinned (GPU-animated) character model with embedded SkinData.
@@ -93,6 +96,9 @@ pub struct GpuSkinnedModel {
     pub prefix: String,
     /// Per-mesh equipment slot binding, parallel to `meshes`. `None` = not an armor slot.
     pub equip_slots: Vec<Option<crate::models::EquipSlot>>,
+    /// True model height in EQ units. From `eq_height` glTF extras if present; otherwise
+    /// the measured `y_extent`. Use this for scale calculations (Task 4).
+    pub true_height: f32,
 }
 
 /// Unified character model — either static or skinned.
