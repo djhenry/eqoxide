@@ -195,7 +195,7 @@ pub fn encode_player_pass(
                     if i >= PLAYER_UNIFORM_SLOTS { break; }
                     let mat = crate::camera::entity_model_matrix_heading(
                         scene.player_pos, scene.player_heading, visual_scale,
-                        dominant_mesh_scale, center_xz, true, lift_basis,
+                        dominant_mesh_scale, center_xz, true, 0.0,
                     );
                     r.queue.write_buffer(
                         &r.entity_uniform_pool[i].0, 0,
@@ -554,7 +554,7 @@ pub fn encode_skinned_entity_pass(
             if u_slot >= r.entity_uniform_pool.len() { break; }
             let mat = crate::camera::entity_model_matrix_heading(
                 b.pos, b.heading, visual_scale, dominant_scale,
-                [model.x_center, model.z_center], true, lift_basis,
+                [model.x_center, model.z_center], true, 0.0,
             );
             let tint: [f32; 4] = if b.dead { [0.5, 0.5, 0.5, 1.0] }
                                  else if b.is_target { [1.0, 0.3, 0.3, 1.0] }
