@@ -1145,6 +1145,30 @@ fn write_glb_skinned(
     let rot_positions: Vec<[f32; 3]> = positions.iter().map(rot_p).collect();
     let rot_normals: Vec<[f32; 3]> = normals.iter().map(rot_p).collect();
 
+    // ── Translation normalization (EQ-native Z-up, BEFORE the Y-up rotation) ──────
+    // Compute the posed bind bbox over the un-rotated, EQ-native `positions`
+    // (z = height). Center the two horizontal axes (X, Y) and ground the height
+    // axis (feet to z = 0). The resulting `offset` is added to the skeleton root
+    // bone's rest translation and to every root-bone animation keyframe, but NOT to
+    // the inverse-bind matrices (those stay derived from the ORIGINAL skel.world).
+    // Because world (rest + every animated pose) carries +offset while the inverse-
+    // bind does not, the world-offset and inverse-bind-offset do NOT cancel, so the
+    // skinned result is uniformly translated by `offset` in bind pose and in every
+    // clip. eq_height is the height extent (offset preserves extent).
+    let (mut xmin, mut xmax) = (f32::MAX, f32::MIN);
+    let (mut ymin, mut ymax) = (f32::MAX, f32::MIN);
+    let (mut zmin, mut zmax) = (f32::MAX, f32::MIN);
+    for p in positions {
+        xmin = xmin.min(p[0]);
+        xmax = xmax.max(p[0]);
+        ymin = ymin.min(p[1]);
+        ymax = ymax.max(p[1]);
+        zmin = zmin.min(p[2]);
+        zmax = zmax.max(p[2]);
+    }
+    let eq_height = (zmax - zmin).max(0.0);
+    let offset = Vec3::new(-(xmin + xmax) * 0.5, -(ymin + ymax) * 0.5, -zmin);
+
     // Vertex attributes (shared across primitives).
     let (pmin, pmax) = compute_bounds_f32x3(&rot_positions);
     let pos_view = add_view(&mut buf, &mut views, &f32x3_bytes(&rot_positions), Some(34962));
@@ -1217,7 +1241,10 @@ fn write_glb_skinned(
     let rq_conj = rq.conjugate();
     let mut nodes: Vec<serde_json::Value> = Vec::with_capacity(n + 1);
     for i in 0..n {
-        let t = rq * skel.local_t[i];
+        // Root bone (index 0) carries the normalization offset (EQ-native), applied
+        // before the Y-up rotation. Children are relative to the root and inherit it.
+        let local_t = if i == 0 { skel.local_t[i] + offset } else { skel.local_t[i] };
+        let t = rq * local_t;
         let r = (rq * skel.local_r[i] * rq_conj).normalize();
         let mut node = serde_json::json!({
             "translation": [t.x, t.y, t.z],
@@ -1228,6 +1255,9 @@ fn write_glb_skinned(
         }
         nodes.push(node);
     }
+    // Record the model's true height (EQ-native height extent) on the skeleton root
+    // node so the renderer can scale/ground consistently. node 0 is the root joint.
+    nodes[0]["extras"] = serde_json::json!({ "eq_height": eq_height });
     let mesh_idx = n;
     nodes.push(serde_json::json!({ "name": "mesh", "mesh": 0, "skin": 0 }));
 
@@ -1260,10 +1290,13 @@ fn write_glb_skinned(
                 &mut accessors, t_view, 5126, times.len(), "SCALAR",
                 Some((serde_json::json!([0.0f32]), serde_json::json!([tmax]))),
             );
-            // Translation output (rotated into Y-up space).
+            // Translation output (rotated into Y-up space). The root bone (index 0)
+            // carries the normalization offset in EQ-native space, applied before
+            // the Y-up rotation — matching the root rest translation above. Clips
+            // with no root translation channel keep the offset rest value instead.
             let mut trb = Vec::with_capacity(frames.len() * 12);
             for (t, _) in frames {
-                let tt = rq * *t;
+                let tt = rq * (if bone == 0 { *t + offset } else { *t });
                 for c in [tt.x, tt.y, tt.z] {
                     trb.extend_from_slice(&c.to_le_bytes());
                 }
@@ -1707,4 +1740,27 @@ fn compute_bounds_f32x3(positions: &[[f32; 3]]) -> ([f32; 3], [f32; 3]) {
         }
     }
     (min, max)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires ~/eq_assets/EQ_Files/globalhum_chr.s3d"]
+    fn skinned_conversion_is_centered_grounded() {
+        let home = std::env::var("HOME").unwrap();
+        let inp = std::path::PathBuf::from(format!("{home}/eq_assets/EQ_Files/globalhum_chr.s3d"));
+        let out = std::path::PathBuf::from("/tmp/test_hum_norm.glb");
+        convert_s3d_to_glb_skinned(&inp, &out, None).unwrap();
+
+        // Re-parse with the gltf crate and confirm the root node carries a positive
+        // eq_height in its extras.
+        let (doc, _buffers, _images) = gltf::import(&out).unwrap();
+        let root = doc.nodes().next().expect("at least one node");
+        let extras = root.extras().as_ref().expect("root node extras present");
+        let v: serde_json::Value = serde_json::from_str(extras.get()).unwrap();
+        let eq_height = v["eq_height"].as_f64().expect("eq_height field present");
+        assert!(eq_height > 0.0, "eq_height should be > 0, got {eq_height}");
+    }
 }
