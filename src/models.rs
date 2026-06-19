@@ -446,7 +446,7 @@ pub fn region_to_slot(region: &str) -> Option<usize> {
 /// materials (eyes, attachments) or malformed names.
 pub fn parse_equip_material(name: &str) -> Option<(String, EquipSlot)> {
     let core = name.strip_suffix("_MDF").unwrap_or(name);
-    if core.len() < 9 || !core.is_char_boundary(9) {
+    if !core.is_ascii() || core.len() < 9 {
         return None;
     }
     let prefix = &core[0..3];
