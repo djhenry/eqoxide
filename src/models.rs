@@ -32,6 +32,10 @@ pub struct ModelAsset {
     /// offset by the model's origin-to-center distance.
     pub x_center:          f32,
     pub z_center:          f32,
+    /// Lowercase race+gender prefix from material names (e.g. "hom"). Empty if unknown.
+    pub prefix: String,
+    /// Per-mesh equipment slot binding, parallel to `meshes`. `None` = not an armor slot.
+    pub equip_slots: Vec<Option<EquipSlot>>,
 }
 
 impl ModelAsset {
@@ -202,6 +206,8 @@ impl ModelAsset {
         let mut meshes:             Vec<MeshData>               = Vec::new();
         let mut skin_meshes:        Vec<Option<SkinnedMeshData>> = Vec::new();
         let mut skinned_mesh_scales: Vec<f32>                   = Vec::new();
+        let mut equip_slots: Vec<Option<EquipSlot>> = Vec::new();
+        let mut model_prefix: String = String::new();
 
         for mesh in document.meshes() {
             let this_mesh_scale = if is_skinned {
@@ -271,6 +277,11 @@ impl ModelAsset {
                 });
                 skin_meshes.push(sd_opt);
                 skinned_mesh_scales.push(this_mesh_scale);
+                let parsed = primitive.material().name().and_then(parse_equip_material);
+                if model_prefix.is_empty() {
+                    if let Some((ref p, _)) = parsed { model_prefix = p.clone(); }
+                }
+                equip_slots.push(parsed.map(|(_, s)| s));
             }
         }
 
@@ -353,7 +364,7 @@ impl ModelAsset {
             else { ((x_min + x_max) * 0.5, (z_min + z_max) * 0.5) }
         };
 
-        Ok(ModelAsset { meshes, textures, skin: skin_data, skin_meshes, skinned_node_scale, skinned_mesh_scales, y_bottom, y_extent, x_center, z_center })
+        Ok(ModelAsset { meshes, textures, skin: skin_data, skin_meshes, skinned_node_scale, skinned_mesh_scales, y_bottom, y_extent, x_center, z_center, prefix: model_prefix, equip_slots })
     }
 
     /// Load a static character model from an EQ `_chr.s3d` archive.
@@ -412,6 +423,8 @@ impl ModelAsset {
             y_extent,
             x_center,
             z_center,
+            prefix: String::new(),
+            equip_slots: vec![None; mesh_count],
         })
     }
 }
@@ -753,5 +766,18 @@ mod tests {
     fn equip_texture_name_formats() {
         assert_eq!(equip_texture_name("hom", b"ch", 17, 1), "homch1701");
         assert_eq!(equip_texture_name("hom", b"ch", 0, 3),  "homch0003");
+    }
+
+    #[test]
+    #[ignore = "requires assets/models/humanoid.glb"]
+    fn humanoid_has_equip_slots_parallel_to_meshes() {
+        let path = std::path::PathBuf::from(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/assets/models/humanoid.glb"));
+        let asset = ModelAsset::load(&path).expect("load failed");
+        assert_eq!(asset.equip_slots.len(), asset.meshes.len(),
+            "equip_slots must be parallel to meshes");
+        assert_eq!(asset.prefix, "hom", "humanoid model prefix");
+        assert!(asset.equip_slots.iter().flatten().any(|s| s.slot == 1),
+            "expected at least one chest primitive");
     }
 }

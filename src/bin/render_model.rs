@@ -657,7 +657,9 @@ impl ApplicationHandler for ModelViewerApp {
         let (_, tex_bgs) = gpu::upload_textures(&device, &queue, &asset.textures, &layouts.texture_bgl);
         let tex_names: Vec<String> = asset.textures.iter().map(|t| t.name.clone()).collect();
 
-        let meshes: Vec<gpu::GpuMesh> = asset.meshes.iter().filter_map(|mesh| {
+        let (meshes, static_slots): (Vec<gpu::GpuMesh>, Vec<Option<eq_renderer::models::EquipSlot>>) = asset.meshes.iter()
+            .zip(asset.equip_slots.iter())
+            .filter_map(|(mesh, &slot)| {
             if mesh.positions.is_empty() || mesh.indices.is_empty() { return None; }
             let vertices: Vec<gpu::Vertex> = mesh.positions.iter().enumerate()
                 .map(|(i, &p)| {
@@ -672,15 +674,16 @@ impl ApplicationHandler for ModelViewerApp {
             });
             let texture_idx = mesh.texture_name.as_ref()
                 .and_then(|n| tex_names.iter().position(|t| t == n));
-            Some(gpu::GpuMesh { vertex_buf: vbuf, index_buf: ibuf,
+            Some((gpu::GpuMesh { vertex_buf: vbuf, index_buf: ibuf,
                                 index_count: mesh.indices.len() as u32, texture_idx,
-                                base_color: mesh.base_color })
-        }).collect();
+                                base_color: mesh.base_color }, slot))
+        }).unzip();
 
         let model = GpuStaticModel {
             meshes, texture_bind_groups: tex_bgs,
             y_bottom: asset.y_bottom, y_extent: asset.y_extent,
             x_center: asset.x_center, z_center: asset.z_center,
+            prefix: asset.prefix.clone(), equip_slots: static_slots,
         };
 
         // Pre-allocate uniform buffers (one per mesh).

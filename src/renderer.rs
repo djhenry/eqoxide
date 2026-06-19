@@ -276,10 +276,11 @@ impl EqRenderer {
 
             let model = if use_skinned {
                 let skin = asset.skin.unwrap();
-                let meshes: Vec<GpuSkinnedMesh> = asset.meshes.iter()
+                let (meshes, skinned_slots): (Vec<GpuSkinnedMesh>, Vec<Option<crate::models::EquipSlot>>) = asset.meshes.iter()
                     .zip(asset.skin_meshes.iter())
                     .zip(asset.skinned_mesh_scales.iter())
-                    .filter_map(|((mesh, sd_opt), &mesh_node_scale)| {
+                    .zip(asset.equip_slots.iter())
+                    .filter_map(|(((mesh, sd_opt), &mesh_node_scale), &slot)| {
                         if mesh.positions.is_empty() || mesh.indices.is_empty() {
                             return None;
                         }
@@ -307,17 +308,19 @@ impl EqRenderer {
                         });
                         let texture_idx = mesh.texture_name.as_ref()
                             .and_then(|n| tex_names.iter().position(|t| t == n));
-                        Some(GpuSkinnedMesh { vertex_buf: vbuf, index_buf: ibuf,
+                        Some((GpuSkinnedMesh { vertex_buf: vbuf, index_buf: ibuf,
                                                index_count: mesh.indices.len() as u32,
                                                texture_idx, base_color: mesh.base_color,
-                                               mesh_node_scale })
+                                               mesh_node_scale }, slot))
                     })
-                    .collect();
+                    .unzip();
                 eprintln!("renderer: loaded skinned model '{}' ({} joints, {} clips)",
                           key, skin.joint_count, skin.clips.len());
-                GpuModel::Skinned(GpuSkinnedModel { meshes, texture_bind_groups: tex_bgs, skin, node_scale: asset.skinned_node_scale, y_bottom: asset.y_bottom, x_center: asset.x_center, z_center: asset.z_center })
+                GpuModel::Skinned(GpuSkinnedModel { meshes, texture_bind_groups: tex_bgs, skin, node_scale: asset.skinned_node_scale, y_bottom: asset.y_bottom, x_center: asset.x_center, z_center: asset.z_center, prefix: asset.prefix.clone(), equip_slots: skinned_slots })
             } else {
-                let meshes: Vec<GpuMesh> = asset.meshes.iter().filter_map(|mesh| {
+                let (meshes, static_slots): (Vec<GpuMesh>, Vec<Option<crate::models::EquipSlot>>) = asset.meshes.iter()
+                    .zip(asset.equip_slots.iter())
+                    .filter_map(|(mesh, &slot)| {
                     if mesh.positions.is_empty() || mesh.indices.is_empty() { return None; }
                     let vertices: Vec<Vertex> = mesh.positions.iter().enumerate()
                         .map(|(i, &p)| {
@@ -335,12 +338,12 @@ impl EqRenderer {
                     });
                     let texture_idx = mesh.texture_name.as_ref()
                         .and_then(|n| tex_names.iter().position(|t| t == n));
-                    Some(GpuMesh { vertex_buf: vbuf, index_buf: ibuf,
+                    Some((GpuMesh { vertex_buf: vbuf, index_buf: ibuf,
                                    index_count: mesh.indices.len() as u32, texture_idx,
-                                   base_color: mesh.base_color })
-                }).collect();
+                                   base_color: mesh.base_color }, slot))
+                }).unzip();
                 eprintln!("renderer: loaded static model '{}'", key);
-                GpuModel::Static(GpuStaticModel { meshes, texture_bind_groups: tex_bgs, y_bottom: asset.y_bottom, y_extent: asset.y_extent, x_center: asset.x_center, z_center: asset.z_center })
+                GpuModel::Static(GpuStaticModel { meshes, texture_bind_groups: tex_bgs, y_bottom: asset.y_bottom, y_extent: asset.y_extent, x_center: asset.x_center, z_center: asset.z_center, prefix: asset.prefix.clone(), equip_slots: static_slots })
             };
 
             self.gpu_character_models.insert(key, model);
