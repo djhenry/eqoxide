@@ -532,6 +532,12 @@ pub fn register_spawn(gs: &mut GameState, spawn: Spawn_S) {
         return;
     }
 
+    let equipment: [u32; 9] = std::array::from_fn(|i| {
+        u32::from_le_bytes(spawn.equipment[i*4..i*4+4].try_into().unwrap())
+    });
+    let equipment_tint: [[u8; 3]; 9] = std::array::from_fn(|i| {
+        [spawn.equipment_tint[i*4], spawn.equipment_tint[i*4+1], spawn.equipment_tint[i*4+2]]
+    });
     gs.upsert_entity(Entity {
         spawn_id: spawn.spawnId,
         name,
@@ -546,6 +552,11 @@ pub fn register_spawn(gs: &mut GameState, spawn: Spawn_S) {
         race:     eq_race_to_code(spawn.race).to_string(),
         heading,
         dead:     false,
+        equipment,
+        equipment_tint,
+        gender: spawn.gender,
+        helm: spawn.helm,
+        showhelm: spawn.showhelm,
     });
 }
 
@@ -736,5 +747,30 @@ mod tests {
         assert_eq!(d.spawn_id, 7);
         assert!((d.x - (-250.0)).abs() < 0.2);
         assert!((d.y - 80.0).abs() < 0.2);
+    }
+
+    #[test]
+    fn register_spawn_parses_equipment_le() {
+        use crate::eq_net::protocol::Spawn_S;
+        use super::register_spawn;
+        let mut gs = GameState::new();
+        gs.player_name = "Someone Else".into();
+        let mut spawn: Spawn_S = unsafe { std::mem::zeroed() };
+        spawn.spawnId = 7;
+        spawn.NPC = 1;
+        spawn.level = 10;
+        spawn.name[0] = b'O'; spawn.name[1] = b'r'; spawn.name[2] = b'c';
+        // slot 1 (chest) material id = 17 (LE u32 at byte offset 4)
+        spawn.equipment[4] = 17;
+        // slot 1 tint RGB = (10, 20, 30) at byte offset 4
+        spawn.equipment_tint[4] = 10;
+        spawn.equipment_tint[5] = 20;
+        spawn.equipment_tint[6] = 30;
+        spawn.gender = 1;
+        register_spawn(&mut gs, spawn);
+        let e = gs.entities.get(&7).expect("entity registered");
+        assert_eq!(e.equipment[1], 17);
+        assert_eq!(e.equipment_tint[1], [10, 20, 30]);
+        assert_eq!(e.gender, 1);
     }
 }

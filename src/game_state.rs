@@ -32,6 +32,11 @@ pub struct Entity {
     pub race: String,
     pub heading: f32,
     pub dead: bool,
+    pub equipment: [u32; 9],
+    pub equipment_tint: [[u8; 3]; 9],
+    pub gender: u8,
+    pub helm: u8,
+    pub showhelm: u8,
 }
 
 impl Entity {
@@ -185,6 +190,7 @@ mod tests {
             race: String::new(),
             heading: 0.0,
             dead: false,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
         }
     }
 

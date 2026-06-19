@@ -205,6 +205,7 @@ mod tests {
             race: "GNL".into(),
             heading: 0.0,
             dead: false,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
         });
 
         gs
@@ -287,6 +288,7 @@ mod tests {
             race: String::new(),
             heading: 0.0,
             dead: false,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
         });
         let scene = SceneState::from_game_state(&gs);
         assert_eq!(scene.billboards.len(), 1);
@@ -323,6 +325,7 @@ mod tests {
             race: String::new(),
             heading: 0.0,
             dead: false,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
         });
         gs.target_id = Some(42);
         let scene = SceneState::from_game_state(&gs);
