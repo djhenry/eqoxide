@@ -1,6 +1,30 @@
 use crate::renderer::EqRenderer;
 use crate::scene::SceneState;
 
+/// Choose the bind group for one primitive: an equipment-swapped armor texture if
+/// available, else the primitive's baked GLB texture, else the white fallback.
+fn resolve_equip_tex<'a>(
+    r:          &'a EqRenderer,
+    baked_bgs:  &'a [wgpu::BindGroup],
+    baked_idx:  Option<usize>,
+    prefix:     &str,
+    slot:       Option<crate::models::EquipSlot>,
+    equipment:  &[u32; 9],
+) -> &'a wgpu::BindGroup {
+    if let Some(es) = slot {
+        if !prefix.is_empty() {
+            let key = crate::models::equip_texture_name(prefix, &es.region, equipment[es.slot], es.variant);
+            if let Some(Some(bg)) = r.equipment_tex_cache.get(&key) {
+                return bg;
+            }
+        }
+    }
+    match baked_idx {
+        Some(i) if i < baked_bgs.len() => &baked_bgs[i],
+        _ => &r.fallback_texture_bg,
+    }
+}
+
 /// Sky gradient background pass. MUST be called before all other passes.
 /// Fills the color buffer with the gradient; subsequent passes draw on top.
 /// No depth attachment — sky is purely a background layer.
@@ -183,11 +207,7 @@ pub fn encode_player_pass(
 
                 let arch_scale = archetype_scale(archetype);
                 let dominant_mesh_scale = arch_scale * model.node_scale;
-                let lift_basis = match r.anim_states.get(&0) {
-                    Some(state) if !model.skin.clips.is_empty() =>
-                        -model.skin.lowest_skinned_z(state.clip_idx, state.time),
-                    _ => -model.skin.bind_lowest_skinned_z(),
-                };
+                let lift_basis = -model.skin.bind_lowest_skinned_z();
                 let visual_scale = 2.0 * lift_basis * dominant_mesh_scale;
                 let center_xz = [model.x_center, model.z_center];
 
@@ -416,7 +436,7 @@ pub fn encode_entity_pass(
     use crate::models::{race_to_archetype, archetype_scale};
     use crate::gpu::GpuModel;
 
-    struct DrawCmd { archetype: &'static str, mesh_idx: usize, uniform_slot: usize }
+    struct DrawCmd { archetype: &'static str, mesh_idx: usize, uniform_slot: usize, equipment: [u32; 9] }
 
     let mut draws: Vec<DrawCmd> = Vec::new();
     let pool_half = r.entity_uniform_pool.len() / 2;
@@ -443,14 +463,23 @@ pub fn encode_entity_pass(
             [model.x_center, model.z_center], true, model.y_bottom);
         for (mesh_idx, mesh) in model.meshes.iter().enumerate() {
             if slot >= slot_end { break; }
+            let slot_meta = model.equip_slots[mesh_idx];
             let tint: [f32; 4] = if b.dead { [0.5, 0.5, 0.5, 1.0] }
                                  else if b.is_target { [1.0, 0.3, 0.3, 1.0] }
-                                 else { mesh.base_color };
+                                 else {
+                                     match slot_meta {
+                                         Some(es) if b.equipment_tint[es.slot] != [0, 0, 0] => {
+                                             let t = b.equipment_tint[es.slot];
+                                             [t[0] as f32 / 255.0, t[1] as f32 / 255.0, t[2] as f32 / 255.0, 1.0]
+                                         }
+                                         _ => mesh.base_color,
+                                     }
+                                 };
             r.queue.write_buffer(
                 &r.entity_uniform_pool[slot].0, 0,
                 bytemuck::bytes_of(&crate::gpu::EntityUniform { model: mat, tint }),
             );
-            draws.push(DrawCmd { archetype, mesh_idx, uniform_slot: slot });
+            draws.push(DrawCmd { archetype, mesh_idx, uniform_slot: slot, equipment: b.equipment });
             slot += 1;
         }
         if slot >= slot_end { break; }
@@ -475,19 +504,13 @@ pub fn encode_entity_pass(
     pass.set_bind_group(0, &r.camera_uniform.bind_group, &[]);
     pass.set_bind_group(1, &r.fallback_texture_bg, &[]);
 
-    let mut cur_tex: Option<usize> = None;
     for draw in &draws {
         let Some(GpuModel::Static(model)) = r.gpu_character_models.get(draw.archetype) else { continue };
         let mesh = &model.meshes[draw.mesh_idx];
         pass.set_bind_group(2, &r.entity_uniform_pool[draw.uniform_slot].1, &[]);
-        if mesh.texture_idx != cur_tex {
-            cur_tex = mesh.texture_idx;
-            let bg = match cur_tex {
-                Some(idx) if idx < model.texture_bind_groups.len() => &model.texture_bind_groups[idx],
-                _ => &r.fallback_texture_bg,
-            };
-            pass.set_bind_group(1, bg, &[]);
-        }
+        let bg = resolve_equip_tex(r, &model.texture_bind_groups, mesh.texture_idx,
+            &model.prefix, model.equip_slots[draw.mesh_idx], &draw.equipment);
+        pass.set_bind_group(1, bg, &[]);
         pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
         pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..mesh.index_count, 0, 0..1);
@@ -508,7 +531,7 @@ pub fn encode_skinned_entity_pass(
     use crate::models::{race_to_archetype, archetype_scale};
     use crate::gpu::{EntityUniform, GpuModel};
 
-    struct DrawCmd { archetype: &'static str, mesh_idx: usize, uniform_slot: usize, joint_slot: usize }
+    struct DrawCmd { archetype: &'static str, mesh_idx: usize, uniform_slot: usize, joint_slot: usize, equipment: [u32; 9] }
 
     let mut draws: Vec<DrawCmd> = Vec::new();
     let pool_half    = r.entity_uniform_pool.len() / 2;
@@ -556,14 +579,23 @@ pub fn encode_skinned_entity_pass(
                 b.pos, b.heading, visual_scale, dominant_scale,
                 [model.x_center, model.z_center], true, 0.0,
             );
+            let slot_meta = model.equip_slots[mesh_idx];
             let tint: [f32; 4] = if b.dead { [0.5, 0.5, 0.5, 1.0] }
                                  else if b.is_target { [1.0, 0.3, 0.3, 1.0] }
-                                 else { mesh.base_color };
+                                 else {
+                                     match slot_meta {
+                                         Some(es) if b.equipment_tint[es.slot] != [0, 0, 0] => {
+                                             let t = b.equipment_tint[es.slot];
+                                             [t[0] as f32 / 255.0, t[1] as f32 / 255.0, t[2] as f32 / 255.0, 1.0]
+                                         }
+                                         _ => mesh.base_color,
+                                     }
+                                 };
             r.queue.write_buffer(
                 &r.entity_uniform_pool[u_slot].0, 0,
                 bytemuck::bytes_of(&EntityUniform { model: mat, tint }),
             );
-            draws.push(DrawCmd { archetype, mesh_idx, uniform_slot: u_slot, joint_slot: j_slot });
+            draws.push(DrawCmd { archetype, mesh_idx, uniform_slot: u_slot, joint_slot: j_slot, equipment: b.equipment });
             u_slot += 1;
         }
         j_slot += 1;
@@ -588,7 +620,6 @@ pub fn encode_skinned_entity_pass(
     pass.set_bind_group(1, &r.fallback_texture_bg, &[]);
 
     let mut cur_joint = usize::MAX;
-    let mut cur_tex: Option<usize> = None;
     for draw in &draws {
         let Some(GpuModel::Skinned(model)) = r.gpu_character_models.get(draw.archetype) else { continue };
         let mesh = &model.meshes[draw.mesh_idx];
@@ -597,14 +628,9 @@ pub fn encode_skinned_entity_pass(
             cur_joint = draw.joint_slot;
         }
         pass.set_bind_group(2, &r.entity_uniform_pool[draw.uniform_slot].1, &[]);
-        if mesh.texture_idx != cur_tex {
-            cur_tex = mesh.texture_idx;
-            let bg = match cur_tex {
-                Some(idx) if idx < model.texture_bind_groups.len() => &model.texture_bind_groups[idx],
-                _ => &r.fallback_texture_bg,
-            };
-            pass.set_bind_group(1, bg, &[]);
-        }
+        let bg = resolve_equip_tex(r, &model.texture_bind_groups, mesh.texture_idx,
+            &model.prefix, model.equip_slots[draw.mesh_idx], &draw.equipment);
+        pass.set_bind_group(1, bg, &[]);
         pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
         pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..mesh.index_count, 0, 0..1);

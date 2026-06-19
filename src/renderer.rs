@@ -377,7 +377,6 @@ impl EqRenderer {
     }
 
     /// Load + upload one armor texture (trying .bmp then .dds). Returns its bind group.
-    #[allow(dead_code)] // wired in Task 8
     pub fn load_equip_texture(&self, base_name: &str) -> Option<wgpu::BindGroup> {
         for ext in ["bmp", "dds"] {
             let fname = format!("{}.{}", base_name, ext);
@@ -394,7 +393,6 @@ impl EqRenderer {
 
     /// Pre-pass (mutable): ensure every armor texture needed this frame is cached.
     /// Runs before the immutable render passes so they only do lookups.
-    #[allow(dead_code)] // wired in Task 8
     pub fn ensure_equipment_textures(&mut self, scene: &crate::scene::SceneState) {
         use crate::models::{race_to_archetype, equip_texture_name};
         use crate::gpu::GpuModel;
@@ -504,6 +502,8 @@ impl EqRenderer {
         let fwd   = (glam::Vec3::from(cam_target) - glam::Vec3::from(cam_eye)).normalize();
         let right = fwd.cross(glam::Vec3::Z).normalize();
         let up    = right.cross(fwd).normalize();
+
+        self.ensure_equipment_textures(scene);
 
         crate::pass::encode_sky_pass(self, encoder, view);
         crate::pass::encode_zone_pass(self, encoder, view, scene);
