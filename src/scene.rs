@@ -13,6 +13,8 @@ pub struct Billboard {
     pub race:      String,
     pub action:    String,
     pub heading:   f32,
+    pub equipment: [u32; 9],
+    pub equipment_tint: [[u8; 3]; 9],
 }
 
 /// A single entry in the message log.
@@ -103,6 +105,8 @@ impl SceneState {
                 race:      race.to_string(),
                 action:    "idle".to_string(),
                 heading:   0.0,
+                equipment:      [0; 9],
+                equipment_tint: [[0; 3]; 9],
             });
         }
 
@@ -123,6 +127,8 @@ impl SceneState {
             race:      e.race.clone(),
             action:    String::new(),
             heading:   e.heading,
+            equipment:      e.equipment,
+            equipment_tint: e.equipment_tint,
         }).collect();
 
         let messages = gs.messages.iter().map(|m| LogEntry {
@@ -336,6 +342,23 @@ mod tests {
                 assert!(!b.is_target, "id={} should not be targeted", b.id);
             }
         }
+    }
+
+    #[test]
+    fn from_game_state_propagates_equipment() {
+        let mut gs = GameState::new();
+        let mut e = Entity {
+            spawn_id: 5, name: "x".into(), level: 1, is_npc: true,
+            x: 0.0, y: 0.0, z: 0.0, hp_pct: 100.0, cur_hp: 1, max_hp: 1,
+            race: "HUM".into(), heading: 0.0, dead: false,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
+        };
+        e.equipment[1] = 17;
+        e.equipment_tint[1] = [9, 8, 7];
+        gs.upsert_entity(e);
+        let scene = SceneState::from_game_state(&gs);
+        assert_eq!(scene.billboards[0].equipment[1], 17);
+        assert_eq!(scene.billboards[0].equipment_tint[1], [9, 8, 7]);
     }
 
     // --- Message count ---
