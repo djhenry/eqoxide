@@ -48,6 +48,10 @@ pub struct SceneState {
     pub strategy: String,
     pub billboards: Vec<Billboard>,
     pub messages: Vec<LogEntry>,
+    /// Item material IDs for each equipment slot (0..9), from the player profile.
+    pub player_equipment: [u32; 9],
+    /// RGB tint for each equipment slot (0..9), from the player profile.
+    pub player_equipment_tint: [[u8; 3]; 9],
 }
 
 impl SceneState {
@@ -160,6 +164,8 @@ impl SceneState {
             strategy: gs.strategy.clone(),
             billboards,
             messages,
+            player_equipment: gs.player_equipment,
+            player_equipment_tint: gs.player_equipment_tint,
         }
     }
 }

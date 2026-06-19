@@ -414,7 +414,23 @@ impl EqRenderer {
                 }
             }
         }
-        // (player equipment is collected here once Task 9 adds scene.player_equipment)
+        if !scene.player_race.is_empty() {
+            let archetype = crate::models::race_to_archetype(&scene.player_race);
+            if let Some(model) = self.gpu_character_models.get(archetype) {
+                let (prefix, slots) = match model {
+                    GpuModel::Static(m)  => (&m.prefix, &m.equip_slots),
+                    GpuModel::Skinned(m) => (&m.prefix, &m.equip_slots),
+                };
+                if !prefix.is_empty() {
+                    for es in slots.iter().flatten() {
+                        let key = equip_texture_name(prefix, &es.region, scene.player_equipment[es.slot], es.variant);
+                        if !self.equipment_tex_cache.contains_key(&key) {
+                            needed.push(key);
+                        }
+                    }
+                }
+            }
+        }
         needed.sort();
         needed.dedup();
 

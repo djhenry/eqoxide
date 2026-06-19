@@ -67,6 +67,10 @@ pub struct GameState {
     pub coin: [u32; 4],
     /// Stats (STR, STA, CHA, DEX, INT, AGI, WIS), from the player profile.
     pub stats: [u32; 7],
+    /// Item material IDs for each equipment slot (0..9), from the player profile.
+    pub player_equipment: [u32; 9],
+    /// RGB tint for each equipment slot (0..9), from the player profile.
+    pub player_equipment_tint: [[u8; 3]; 9],
 
     // Zone
     pub zone_name: String,

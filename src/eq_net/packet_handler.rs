@@ -211,6 +211,19 @@ fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
         gs.coin = p.coin;
         gs.stats = p.stats;
     }
+
+    const ITEM_MATERIAL_OFF: usize = 188;
+    const ITEM_TINT_OFF: usize = 268;
+    if payload.len() >= ITEM_TINT_OFF + 9 * 4 {
+        for i in 0..9 {
+            let mo = ITEM_MATERIAL_OFF + i * 4;
+            gs.player_equipment[i] =
+                u32::from_le_bytes(payload[mo..mo + 4].try_into().unwrap());
+            let to = ITEM_TINT_OFF + i * 4;
+            // wire order B, G, R, UseTint → store RGB
+            gs.player_equipment_tint[i] = [payload[to + 2], payload[to + 1], payload[to]];
+        }
+    }
 }
 
 fn apply_death(gs: &mut GameState, payload: &[u8]) {
@@ -579,7 +592,7 @@ pub fn register_spawn(gs: &mut GameState, spawn: Spawn_S) {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_emote, class_name, con_color, consider_message, parse_player_profile};
+    use super::{apply_emote, apply_player_profile, class_name, con_color, consider_message, parse_player_profile};
     use crate::game_state::GameState;
 
     #[test]
@@ -792,6 +805,20 @@ mod tests {
         assert_eq!(d.spawn_id, 7);
         assert!((d.x - (-250.0)).abs() < 0.2);
         assert!((d.y - 80.0).abs() < 0.2);
+    }
+
+    #[test]
+    fn player_profile_parses_equipment() {
+        use super::apply_player_profile;
+        let mut gs = GameState::new();
+        let mut buf = vec![0u8; 5000];
+        // item_material[1] (chest) = 17 at offset 188 + 1*4 = 192
+        buf[192..196].copy_from_slice(&17u32.to_le_bytes());
+        // item_tint[1] RGB at offset 268 + 1*4 = 272 (wire B,G,R,UseTint)
+        buf[272] = 3; buf[273] = 2; buf[274] = 1; buf[275] = 0xFF;
+        apply_player_profile(&mut gs, &buf);
+        assert_eq!(gs.player_equipment[1], 17);
+        assert_eq!(gs.player_equipment_tint[1], [1, 2, 3]); // stored RGB
     }
 
     #[test]

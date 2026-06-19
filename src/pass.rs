@@ -217,9 +217,16 @@ pub fn encode_player_pass(
                         scene.player_pos, scene.player_heading, visual_scale,
                         dominant_mesh_scale, center_xz, true, 0.0,
                     );
+                    let tint = match model.equip_slots[i] {
+                        Some(ref es) if scene.player_equipment_tint[es.slot] != [0, 0, 0] => {
+                            let t = scene.player_equipment_tint[es.slot];
+                            [t[0] as f32 / 255.0, t[1] as f32 / 255.0, t[2] as f32 / 255.0, 1.0]
+                        }
+                        _ => mesh.base_color,
+                    };
                     r.queue.write_buffer(
                         &r.entity_uniform_pool[i].0, 0,
-                        bytemuck::bytes_of(&EntityUniform { model: mat, tint: mesh.base_color }),
+                        bytemuck::bytes_of(&EntityUniform { model: mat, tint }),
                     );
                 }
 
@@ -242,19 +249,12 @@ pub fn encode_player_pass(
                 pass.set_bind_group(0, &r.camera_uniform.bind_group, &[]);
                 pass.set_bind_group(1, &r.fallback_texture_bg, &[]);
                 pass.set_bind_group(3, &r.joint_buf_pool[0].1, &[]);
-                let mut cur_tex: Option<usize> = None;
                 for (i, mesh) in model.meshes.iter().enumerate() {
                     if i >= PLAYER_UNIFORM_SLOTS { break; }
                     pass.set_bind_group(2, &r.entity_uniform_pool[i].1, &[]);
-                    if mesh.texture_idx != cur_tex {
-                        cur_tex = mesh.texture_idx;
-                        let bg = match cur_tex {
-                            Some(idx) if idx < model.texture_bind_groups.len() =>
-                                &model.texture_bind_groups[idx],
-                            _ => &r.fallback_texture_bg,
-                        };
-                        pass.set_bind_group(1, bg, &[]);
-                    }
+                    let bg = resolve_equip_tex(r, &model.texture_bind_groups, mesh.texture_idx,
+                        &model.prefix, model.equip_slots[i].clone(), &scene.player_equipment);
+                    pass.set_bind_group(1, bg, &[]);
                     pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                     pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..mesh.index_count, 0, 0..1);
@@ -270,9 +270,16 @@ pub fn encode_player_pass(
                 );
                 for (i, mesh) in model.meshes.iter().enumerate() {
                     if i >= PLAYER_UNIFORM_SLOTS { break; }
+                    let tint = match model.equip_slots[i] {
+                        Some(ref es) if scene.player_equipment_tint[es.slot] != [0, 0, 0] => {
+                            let t = scene.player_equipment_tint[es.slot];
+                            [t[0] as f32 / 255.0, t[1] as f32 / 255.0, t[2] as f32 / 255.0, 1.0]
+                        }
+                        _ => mesh.base_color,
+                    };
                     r.queue.write_buffer(
                         &r.entity_uniform_pool[i].0, 0,
-                        bytemuck::bytes_of(&EntityUniform { model: mat, tint: mesh.base_color }),
+                        bytemuck::bytes_of(&EntityUniform { model: mat, tint }),
                     );
                 }
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -293,19 +300,12 @@ pub fn encode_player_pass(
                 pass.set_pipeline(&r.pipelines.character);
                 pass.set_bind_group(0, &r.camera_uniform.bind_group, &[]);
                 pass.set_bind_group(1, &r.fallback_texture_bg, &[]);
-                let mut cur_tex: Option<usize> = None;
                 for (i, mesh) in model.meshes.iter().enumerate() {
                     if i >= PLAYER_UNIFORM_SLOTS { break; }
                     pass.set_bind_group(2, &r.entity_uniform_pool[i].1, &[]);
-                    if mesh.texture_idx != cur_tex {
-                        cur_tex = mesh.texture_idx;
-                        let bg = match cur_tex {
-                            Some(idx) if idx < model.texture_bind_groups.len() =>
-                                &model.texture_bind_groups[idx],
-                            _ => &r.fallback_texture_bg,
-                        };
-                        pass.set_bind_group(1, bg, &[]);
-                    }
+                    let bg = resolve_equip_tex(r, &model.texture_bind_groups, mesh.texture_idx,
+                        &model.prefix, model.equip_slots[i].clone(), &scene.player_equipment);
+                    pass.set_bind_group(1, bg, &[]);
                     pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                     pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..mesh.index_count, 0, 0..1);
