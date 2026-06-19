@@ -416,6 +416,58 @@ impl ModelAsset {
     }
 }
 
+/// One body region's equipment-slot binding for a single mesh primitive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EquipSlot {
+    /// Equipment array index (0=head .. 6=feet).
+    pub slot: usize,
+    /// Lowercase 2-char body region code, e.g. `*b"ch"`.
+    pub region: [u8; 2],
+    /// Piece/variant number within the region.
+    pub variant: u8,
+}
+
+/// Map a 2-char body region code (case-insensitive) to an equipment slot index.
+pub fn region_to_slot(region: &str) -> Option<usize> {
+    match region.to_ascii_uppercase().as_str() {
+        "HE" => Some(0),
+        "CH" => Some(1),
+        "UA" => Some(2),
+        "FA" => Some(3),
+        "HN" => Some(4),
+        "LG" => Some(5),
+        "FT" => Some(6),
+        _ => None,
+    }
+}
+
+/// Parse a glTF material name like `HOMCH0001_MDF` into its lowercase race+gender
+/// prefix and the equipment slot it belongs to. Returns `None` for non-armor
+/// materials (eyes, attachments) or malformed names.
+pub fn parse_equip_material(name: &str) -> Option<(String, EquipSlot)> {
+    let core = name.strip_suffix("_MDF").unwrap_or(name);
+    if core.len() < 9 || !core.is_char_boundary(9) {
+        return None;
+    }
+    let prefix = &core[0..3];
+    let region = &core[3..5];
+    let digits = &core[5..9];
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let slot = region_to_slot(region)?;
+    let variant: u8 = digits[2..4].parse().ok()?;
+    let mut rc = [0u8; 2];
+    rc.copy_from_slice(region.to_ascii_lowercase().as_bytes());
+    Some((prefix.to_ascii_lowercase(), EquipSlot { slot, region: rc, variant }))
+}
+
+/// Build the lowercase armor texture base name (no extension) for a swap.
+pub fn equip_texture_name(prefix: &str, region: &[u8; 2], material: u32, variant: u8) -> String {
+    let region = std::str::from_utf8(region).unwrap_or("");
+    format!("{}{}{:02}{:02}", prefix, region, material, variant)
+}
+
 /// Map an EQ race string (case-insensitive) to a glTF archetype key.
 pub fn race_to_archetype(race: &str) -> &'static str {
     match race.to_uppercase().as_str() {
@@ -659,5 +711,47 @@ mod tests {
         assert!(archetype_scale("dwarf") > 0.0);
         assert!(archetype_scale("elf")   > 0.0);
         assert_eq!(archetype_scale("unknown"), 6.0);
+    }
+
+    #[test]
+    fn region_to_slot_maps_all_armor_regions() {
+        assert_eq!(region_to_slot("HE"), Some(0));
+        assert_eq!(region_to_slot("CH"), Some(1));
+        assert_eq!(region_to_slot("UA"), Some(2));
+        assert_eq!(region_to_slot("FA"), Some(3));
+        assert_eq!(region_to_slot("HN"), Some(4));
+        assert_eq!(region_to_slot("LG"), Some(5));
+        assert_eq!(region_to_slot("FT"), Some(6));
+        assert_eq!(region_to_slot("ch"), Some(1)); // case-insensitive
+        assert_eq!(region_to_slot("XX"), None);
+    }
+
+    #[test]
+    fn parse_equip_material_chest() {
+        let (prefix, es) = parse_equip_material("HOMCH0001_MDF").expect("should parse");
+        assert_eq!(prefix, "hom");
+        assert_eq!(es.slot, 1);
+        assert_eq!(&es.region, b"ch");
+        assert_eq!(es.variant, 1);
+    }
+
+    #[test]
+    fn parse_equip_material_head_variant() {
+        let (_, es) = parse_equip_material("HOMHE0007_MDF").unwrap();
+        assert_eq!(es.slot, 0);
+        assert_eq!(es.variant, 7);
+    }
+
+    #[test]
+    fn parse_equip_material_rejects_non_armor() {
+        assert!(parse_equip_material("HOFL_EYE_MDF").is_none());
+        assert!(parse_equip_material("HOMR_01_MDF").is_none());
+        assert!(parse_equip_material("short").is_none());
+    }
+
+    #[test]
+    fn equip_texture_name_formats() {
+        assert_eq!(equip_texture_name("hom", b"ch", 17, 1), "homch1701");
+        assert_eq!(equip_texture_name("hom", b"ch", 0, 3),  "homch0003");
     }
 }
