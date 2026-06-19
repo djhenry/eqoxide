@@ -586,7 +586,7 @@ pub fn archetype_scale(archetype: &str) -> f32 {
 /// EQ units ≈ feet. Values are initial calibration; fine-tune visually after loading.
 pub fn archetype_target_height(archetype: &str) -> f32 {
     match archetype {
-        "humanoid" => 6.0, "elf" => 6.0, "dwarf" => 4.5, "gnoll" => 6.0,
+        "humanoid" => 12.0, "elf" => 6.0, "dwarf" => 4.5, "gnoll" => 6.0,
         "skeleton" => 6.0, "zombie" => 6.0, "frog" => 5.0,
         "bear" => 6.0, "wolf" => 4.0, "rat" => 1.5, "snake" => 3.0,
         "bat" => 2.0, "bird" => 2.0, "wasp" => 2.0, "worm" => 2.0,
