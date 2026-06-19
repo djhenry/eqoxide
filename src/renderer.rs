@@ -46,6 +46,11 @@ pub struct EqRenderer {
     pub entity_uniform_pool: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
     /// Pre-allocated joint matrix buffers (reused every frame via write_buffer).
     pub joint_buf_pool:      Vec<(wgpu::Buffer, wgpu::BindGroup)>,
+    /// Lowercase armor texture filename → S3D archive containing it (built at startup).
+    pub equip_index: std::collections::HashMap<String, std::path::PathBuf>,
+    /// Cache of uploaded armor texture bind groups keyed by base name (no extension).
+    /// `None` = known-missing (negative cache) so we don't rescan every frame.
+    pub equipment_tex_cache: std::collections::HashMap<String, Option<wgpu::BindGroup>>,
 }
 
 impl EqRenderer {
@@ -127,6 +132,8 @@ impl EqRenderer {
             zone_assets: None,
             entity_uniform_pool,
             joint_buf_pool,
+            equip_index: std::collections::HashMap::new(),
+            equipment_tex_cache: std::collections::HashMap::new(),
         }
     }
 
@@ -347,6 +354,76 @@ impl EqRenderer {
             };
 
             self.gpu_character_models.insert(key, model);
+        }
+
+        // Index armor textures: shared velious sets (global17-23_amr) + each
+        // archetype's chr/chr2 archives (lower material numbers). No decoding here.
+        for n in 17..=23 {
+            crate::assets::index_s3d_textures(
+                &assets_path.join(format!("global{}_amr.s3d", n)), &mut self.equip_index);
+        }
+        for &key in ARCHETYPES {
+            if let Some(name) = crate::models::archetype_to_chr_s3d(key) {
+                crate::assets::index_s3d_textures(&assets_path.join(name), &mut self.equip_index);
+                // also the _chr2 companion if present
+                let chr2 = name.replace("_chr.s3d", "_chr2.s3d");
+                let chr2_path = assets_path.join(&chr2);
+                if chr2_path.exists() {
+                    crate::assets::index_s3d_textures(&chr2_path, &mut self.equip_index);
+                }
+            }
+        }
+        eprintln!("equip: indexed {} armor textures", self.equip_index.len());
+    }
+
+    /// Load + upload one armor texture (trying .bmp then .dds). Returns its bind group.
+    #[allow(dead_code)] // wired in Task 8
+    pub fn load_equip_texture(&self, base_name: &str) -> Option<wgpu::BindGroup> {
+        for ext in ["bmp", "dds"] {
+            let fname = format!("{}.{}", base_name, ext);
+            if let Some(arch) = self.equip_index.get(&fname) {
+                if let Some(tex) = crate::assets::load_one_texture_from_s3d(arch, &fname) {
+                    let (_gpu, mut bgs) = upload_textures(
+                        &self.device, &self.queue, &[tex], &self.layouts.texture_bgl);
+                    return bgs.pop();
+                }
+            }
+        }
+        None
+    }
+
+    /// Pre-pass (mutable): ensure every armor texture needed this frame is cached.
+    /// Runs before the immutable render passes so they only do lookups.
+    #[allow(dead_code)] // wired in Task 8
+    pub fn ensure_equipment_textures(&mut self, scene: &crate::scene::SceneState) {
+        use crate::models::{race_to_archetype, equip_texture_name};
+        use crate::gpu::GpuModel;
+
+        // Phase 1: collect needed base names (no mutation of the cache yet).
+        let mut needed: Vec<String> = Vec::new();
+        for b in &scene.billboards {
+            let archetype = race_to_archetype(&b.race);
+            let (prefix, slots) = match self.gpu_character_models.get(archetype) {
+                Some(GpuModel::Static(m))  => (&m.prefix, &m.equip_slots),
+                Some(GpuModel::Skinned(m)) => (&m.prefix, &m.equip_slots),
+                None => continue,
+            };
+            if prefix.is_empty() { continue; }
+            for es in slots.iter().flatten() {
+                let key = equip_texture_name(prefix, &es.region, b.equipment[es.slot], es.variant);
+                if !self.equipment_tex_cache.contains_key(&key) {
+                    needed.push(key);
+                }
+            }
+        }
+        // (player equipment is collected here once Task 9 adds scene.player_equipment)
+        needed.sort();
+        needed.dedup();
+
+        // Phase 2: load + upload (or mark missing).
+        for key in needed {
+            let bg = self.load_equip_texture(&key);
+            self.equipment_tex_cache.insert(key, bg);
         }
     }
 
