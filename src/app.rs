@@ -975,6 +975,10 @@ impl ApplicationHandler for App {
                 .create_window(WindowAttributes::default().with_title("EQ Observer"))
                 .expect("create window"),
         );
+        // Enable IME so the compositor delivers text input (KeyEvent.text / Ime events) to the
+        // chat box. Without this, winit 0.30 on Linux routes text through IME and egui never
+        // receives typed characters (the box focuses but stays empty).
+        window.set_ime_allowed(true);
         self.init_gpu(window);
     }
 
@@ -984,6 +988,12 @@ impl ApplicationHandler for App {
         _id:        winit::window::WindowId,
         event:      WindowEvent,
     ) {
+        // TEMP DEBUG: log keyboard text so we can see if the compositor delivers typed chars.
+        if let WindowEvent::KeyboardInput { event: ke, .. } = &event {
+            if ke.state == ElementState::Pressed {
+                eprintln!("KEYDBG phys={:?} text={:?} ime_allowed_set=true", ke.physical_key, ke.text);
+            }
+        }
         if let (Some(egui_state), Some(window)) = (&mut self.egui_state, &self.window) {
             if egui_state.on_window_event(window, &event).consumed { return; }
         }
