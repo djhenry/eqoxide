@@ -423,9 +423,14 @@ impl ModelAsset {
             }).collect()
         } else { vec![] };
 
-        // Robust feet height = 5th percentile of the idle-pose vertices' model-Y. Used to
-        // ground each skinned model by its own feet (excludes stray geometry below the feet).
-        let feet_offset: f32 = match skin_data.as_ref() {
+        // From the IDLE pose (what's actually rendered) measure two things over the dominant
+        // body meshes' model-Y:
+        //   - feet_offset = 5th percentile (robust feet; excludes stray geometry below the feet)
+        //   - idle_extent = full vertical extent
+        // Scaling by the idle extent (rather than eq_height = the BIND-pose extent) makes every
+        // model render at its archetype target height. eq_height is wrong when the idle pose
+        // differs from bind — e.g. a bat with wings spread (bind 3 → idle 15 → 5x oversized).
+        let (feet_offset, idle_extent): (f32, f32) = match skin_data.as_ref() {
             Some(sd) if !sd.clips.is_empty() => {
                 let idle = sd.clip_for_action("idle")
                     .or_else(|| sd.clip_for_action("walking")).unwrap_or(0);
@@ -442,13 +447,15 @@ impl ModelAsset {
                         if y.is_finite() { ys.push(y); }
                     }
                 }
-                if ys.is_empty() { 0.0 } else {
+                if ys.is_empty() { (0.0, 0.0) } else {
                     ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                    ys[((ys.len() - 1) as f32 * 0.05) as usize]
+                    (ys[((ys.len() - 1) as f32 * 0.05) as usize], ys[ys.len() - 1] - ys[0])
                 }
             }
-            _ => 0.0,
+            _ => (0.0, 0.0),
         };
+        // Prefer the measured idle extent for scaling; fall back to eq_height/measured bounds.
+        let true_height = if idle_extent > 0.001 { idle_extent } else { true_height };
 
         Ok(ModelAsset { meshes, textures, skin: skin_data, skin_meshes, skinned_node_scale, skinned_mesh_scales, y_bottom, y_extent, x_center, z_center, prefix: model_prefix, equip_slots, true_height, clip_bounds, feet_offset })
     }
@@ -1108,5 +1115,6 @@ mod tests {
             asset.meshes.len(), crate::renderer::PLAYER_UNIFORM_SLOTS);
     }
 }
+
 
 
