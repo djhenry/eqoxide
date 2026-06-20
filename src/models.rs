@@ -586,12 +586,14 @@ pub fn archetype_scale(archetype: &str) -> f32 {
 /// EQ units ≈ feet. Values are initial calibration; fine-tune visually after loading.
 pub fn archetype_target_height(archetype: &str) -> f32 {
     match archetype {
-        "humanoid" => 12.0, "elf" => 6.0, "dwarf" => 4.5, "gnoll" => 6.0,
-        "skeleton" => 6.0, "zombie" => 6.0, "frog" => 5.0,
-        "bear" => 6.0, "wolf" => 4.0, "rat" => 1.5, "snake" => 3.0,
-        "bat" => 2.0, "bird" => 2.0, "wasp" => 2.0, "worm" => 2.0,
-        "fish" => 1.5, "creature" => 4.0,
-        _ => 6.0,
+        // target == rendered EQ height; humanoid=12 calibrated to the doorway. Other
+        // human-height races match it; the rest are proportional (visually tune later).
+        "humanoid" => 12.0, "elf" => 12.0, "dwarf" => 9.0, "gnoll" => 12.0,
+        "skeleton" => 12.0, "zombie" => 12.0, "frog" => 10.0,
+        "bear" => 12.0, "wolf" => 8.0, "rat" => 3.0, "snake" => 6.0,
+        "bat" => 4.0, "bird" => 4.0, "wasp" => 4.0, "worm" => 4.0,
+        "fish" => 3.0, "creature" => 8.0,
+        _ => 12.0,
     }
 }
 
