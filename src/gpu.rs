@@ -73,6 +73,9 @@ pub struct GpuStaticModel {
     /// True model height in EQ units. From `eq_height` glTF extras if present; otherwise
     /// the measured `y_extent`. Use this for scale calculations (Task 4).
     pub true_height: f32,
+    /// Per-clip posed bounds (center_x, center_z, feet_floor), parallel to `skin.clips`.
+    /// Empty for static models. Recenter + ground from the current clip vs the bind pose.
+    pub clip_bounds: Vec<(f32, f32, f32)>,
 }
 
 /// Skinned (GPU-animated) character model with embedded SkinData.
@@ -99,6 +102,9 @@ pub struct GpuSkinnedModel {
     /// True model height in EQ units. From `eq_height` glTF extras if present; otherwise
     /// the measured `y_extent`. Use this for scale calculations (Task 4).
     pub true_height: f32,
+    /// Per-clip posed bounds (center_x, center_z, feet_floor), parallel to `skin.clips`.
+    /// Empty for static models. Recenter + ground from the current clip vs the bind pose.
+    pub clip_bounds: Vec<(f32, f32, f32)>,
 }
 
 /// Unified character model — either static or skinned.

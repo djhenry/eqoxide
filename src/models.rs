@@ -40,6 +40,11 @@ pub struct ModelAsset {
     /// converter into the glTF ROOT node. Falls back to `y_extent` (measured vertex bounds)
     /// when the extras field is absent (e.g. chr.s3d static models).
     pub true_height: f32,
+    /// Per-animation-clip posed bounds: (center_x [p0], center_z [p2], feet_floor [min p1]),
+    /// parallel to `skin.clips`. Used to recenter + ground from the CURRENT clip instead of
+    /// the bind pose (the live animation pose differs from bind, causing a static offset).
+    /// Empty for static/non-skinned models.
+    pub clip_bounds: Vec<(f32, f32, f32)>,
 }
 
 impl ModelAsset {
@@ -383,7 +388,37 @@ impl ModelAsset {
         // Finalize true_height: prefer eq_height from extras; fall back to measured y_extent.
         let true_height = if eq_height_from_extras > 0.0 { eq_height_from_extras } else { y_extent };
 
-        Ok(ModelAsset { meshes, textures, skin: skin_data, skin_meshes, skinned_node_scale, skinned_mesh_scales, y_bottom, y_extent, x_center, z_center, prefix: model_prefix, equip_slots, true_height })
+        // Per-clip posed bounds: recenter + ground from the CURRENT clip, not the bind pose.
+        // center axes (p0,p2) match x_center/z_center; floor (min p1) matches bind_lowest_skinned_z.
+        // Floor is the min over several sample times so it's stable within a clip (no walk bob).
+        let clip_bounds: Vec<(f32, f32, f32)> = if let Some(sd) = skin_data.as_ref() {
+            sd.clips.iter().enumerate().map(|(ci, clip)| {
+                let mats: Vec<glam::Mat4> = sd.evaluate(ci, 0.0).iter()
+                    .map(|m| glam::Mat4::from_cols_array_2d(m)).collect();
+                let (mut xmin, mut xmax, mut zmin, mut zmax) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+                for (i, (mesh, sd_opt)) in meshes.iter().zip(skin_meshes.iter()).enumerate() {
+                    if (skinned_mesh_scales[i] - skinned_node_scale).abs() >= skinned_node_scale * 0.5 { continue; }
+                    let Some(smesh) = sd_opt else { continue };
+                    for (vi, pos) in mesh.positions.iter().enumerate() {
+                        let joints  = smesh.joint_indices.get(vi).copied().unwrap_or([0; 4]);
+                        let weights = smesh.joint_weights.get(vi).copied().unwrap_or([1.0, 0.0, 0.0, 0.0]);
+                        let p = crate::anim::SkinData::skin_point(*pos, joints, weights, &mats);
+                        if p[0].is_finite() && p[2].is_finite() {
+                            xmin = xmin.min(p[0]); xmax = xmax.max(p[0]);
+                            zmin = zmin.min(p[2]); zmax = zmax.max(p[2]);
+                        }
+                    }
+                }
+                let cx = if xmin <= xmax { (xmin + xmax) * 0.5 } else { x_center };
+                let cz = if zmin <= zmax { (zmin + zmax) * 0.5 } else { z_center };
+                let dur = clip.duration.max(0.0001);
+                let floor = (0..6).map(|k| sd.lowest_skinned_z(ci, dur * (k as f32) / 6.0))
+                    .fold(f32::MAX, f32::min);
+                (cx, cz, floor)
+            }).collect()
+        } else { vec![] };
+
+        Ok(ModelAsset { meshes, textures, skin: skin_data, skin_meshes, skinned_node_scale, skinned_mesh_scales, y_bottom, y_extent, x_center, z_center, prefix: model_prefix, equip_slots, true_height, clip_bounds })
     }
 
     /// Load a static character model from an EQ `_chr.s3d` archive.
@@ -446,6 +481,7 @@ impl ModelAsset {
             equip_slots: vec![None; mesh_count],
             // chr.s3d models have no glTF extras; fall back to measured y_extent.
             true_height: y_extent,
+            clip_bounds: vec![], // static chr.s3d models have no clips
         })
     }
 }
@@ -792,6 +828,46 @@ mod tests {
         assert!((cx - pos[0]).abs() < 1.5, "x center {:.2} vs pos.x {:.2}", cx, pos[0]);
         assert!((cy - pos[1]).abs() < 1.5, "y center {:.2} vs pos.y {:.2}", cy, pos[1]);
         assert!((h - target).abs() < target * 0.3, "height {:.2} vs target {:.2}", h, target);
+    }
+
+    /// Same as above but for the ANIMATED idle pose using per-clip bounds — this is the
+    /// case the live player renders. Guards the fix for the static-offset bug (the idle
+    /// pose differs from bind, so bind-based recenter/grounding left the model offset).
+    #[test]
+    #[ignore = "requires assets/models/humanoid.glb"]
+    fn humanoid_idle_pose_grounds_and_centers() {
+        let p = std::path::PathBuf::from(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/assets/models/humanoid.glb"));
+        let a = ModelAsset::load(&p).expect("load");
+        let sk = a.skin.as_ref().expect("skin");
+        let idle = sk.clip_for_action("idle").or_else(|| sk.clip_for_action("walking")).unwrap_or(0);
+        let (cx, cz, floor) = a.clip_bounds[idle];
+        let target = archetype_target_height("humanoid");
+        let ms = (target / a.true_height) * a.skinned_node_scale;
+        let visual_scale = 2.0 * (-floor) * ms;
+        let pos = [100.0_f32, -200.0, 5.0];
+        let mat = crate::camera::entity_model_matrix_heading(pos, 0.0, visual_scale, ms, [cx, cz], true, 0.0);
+        let m = glam::Mat4::from_cols_array_2d(&mat);
+        let imats: Vec<glam::Mat4> = sk.evaluate(idle, 0.0).iter()
+            .map(|x| glam::Mat4::from_cols_array_2d(x)).collect();
+        let (mut mnx, mut mxx, mut mny, mut mxy, mut mnz, mut mxz) =
+            (f32::MAX, f32::MIN, f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+        for (mesh, sdo) in a.meshes.iter().zip(a.skin_meshes.iter()) {
+            if let Some(sd) = sdo {
+                for (vi, vp) in mesh.positions.iter().enumerate() {
+                    let local = crate::anim::SkinData::skin_point(*vp, sd.joint_indices[vi], sd.joint_weights[vi], &imats);
+                    let wp = m.transform_point3(glam::Vec3::from(local));
+                    mnx = mnx.min(wp.x); mxx = mxx.max(wp.x);
+                    mny = mny.min(wp.y); mxy = mxy.max(wp.y);
+                    mnz = mnz.min(wp.z); mxz = mxz.max(wp.z);
+                }
+            }
+        }
+        let (ccx, ccy, h) = ((mnx + mxx) * 0.5, (mny + mxy) * 0.5, mxz - mnz);
+        eprintln!("IDLE world center=({:.2},{:.2}) feet_z={:.2} height={:.2} (pos={:?})", ccx, ccy, mnz, h, pos);
+        assert!((mnz - pos[2]).abs() < 1.5, "idle feet z {:.2} should be ~pos.z {:.2}", mnz, pos[2]);
+        assert!((ccx - pos[0]).abs() < 1.5, "idle x center {:.2} vs pos.x {:.2}", ccx, pos[0]);
+        assert!((ccy - pos[1]).abs() < 1.5, "idle y center {:.2} vs pos.y {:.2}", ccy, pos[1]);
     }
 
     #[test]

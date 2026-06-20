@@ -685,6 +685,7 @@ impl ApplicationHandler for ModelViewerApp {
             x_center: asset.x_center, z_center: asset.z_center,
             prefix: asset.prefix.clone(), equip_slots: static_slots,
             true_height: asset.true_height,
+            clip_bounds: vec![],
         };
 
         // Pre-allocate uniform buffers (one per mesh).
