@@ -130,7 +130,7 @@ pub fn encode_billboard_pass(
             all_idxs.extend(idxs.iter().map(|i| i + base));
             continue;
         }
-        if r.gpu_character_models.contains_key(race_to_archetype(&b.race)) { continue; }
+        if r.model_for(race_to_archetype(&b.race), b.gender).is_some() { continue; }
         let (verts, idxs) = billboard_quad(
             b.pos, npc_size(b.level), npc_color(b.is_target, b.dead, b.hp_pct),
             cam_right, cam_up,
@@ -198,7 +198,7 @@ pub fn encode_player_pass(
     if !scene.player_race.is_empty() {
         let archetype = race_to_archetype(&scene.player_race);
 
-        match r.gpu_character_models.get(archetype) {
+        match r.model_for(archetype, scene.player_gender) {
             Some(GpuModel::Skinned(model)) => {
                 let matrices = match r.anim_states.get(&0) {
                     Some(state) if !model.skin.clips.is_empty() =>
@@ -447,7 +447,7 @@ pub fn encode_entity_pass(
     use crate::models::{race_to_archetype, archetype_scale};
     use crate::gpu::GpuModel;
 
-    struct DrawCmd { archetype: &'static str, mesh_idx: usize, uniform_slot: usize, equipment: [u32; 9] }
+    struct DrawCmd { archetype: &'static str, mesh_idx: usize, uniform_slot: usize, equipment: [u32; 9], gender: u8 }
 
     let mut draws: Vec<DrawCmd> = Vec::new();
     let pool_half = r.entity_uniform_pool.len() / 2;
@@ -460,7 +460,7 @@ pub fn encode_entity_pass(
     for b in &scene.billboards {
         if b.level == 0 { continue; }
         let archetype = race_to_archetype(&b.race);
-        let Some(GpuModel::Static(model)) = r.gpu_character_models.get(archetype) else { skipped += 1; continue };
+        let Some(GpuModel::Static(model)) = r.model_for(archetype, b.gender) else { skipped += 1; continue };
         rendered += 1;
         let arch_scale   = archetype_scale(archetype);
         let visual_scale = 2.0 * model.y_extent * arch_scale;
@@ -490,7 +490,7 @@ pub fn encode_entity_pass(
                 &r.entity_uniform_pool[slot].0, 0,
                 bytemuck::bytes_of(&crate::gpu::EntityUniform { model: mat, tint }),
             );
-            draws.push(DrawCmd { archetype, mesh_idx, uniform_slot: slot, equipment: b.equipment });
+            draws.push(DrawCmd { archetype, mesh_idx, uniform_slot: slot, equipment: b.equipment, gender: b.gender });
             slot += 1;
         }
         if slot >= slot_end { break; }
@@ -516,7 +516,7 @@ pub fn encode_entity_pass(
     pass.set_bind_group(1, &r.fallback_texture_bg, &[]);
 
     for draw in &draws {
-        let Some(GpuModel::Static(model)) = r.gpu_character_models.get(draw.archetype) else { continue };
+        let Some(GpuModel::Static(model)) = r.model_for(draw.archetype, draw.gender) else { continue };
         let mesh = &model.meshes[draw.mesh_idx];
         pass.set_bind_group(2, &r.entity_uniform_pool[draw.uniform_slot].1, &[]);
         let bg = resolve_equip_tex(r, &model.texture_bind_groups, mesh.texture_idx,
@@ -542,7 +542,7 @@ pub fn encode_skinned_entity_pass(
     use crate::models::race_to_archetype;
     use crate::gpu::{EntityUniform, GpuModel};
 
-    struct DrawCmd { archetype: &'static str, mesh_idx: usize, uniform_slot: usize, joint_slot: usize, equipment: [u32; 9] }
+    struct DrawCmd { archetype: &'static str, mesh_idx: usize, uniform_slot: usize, joint_slot: usize, equipment: [u32; 9], gender: u8 }
 
     let mut draws: Vec<DrawCmd> = Vec::new();
     let pool_half    = r.entity_uniform_pool.len() / 2;
@@ -555,7 +555,7 @@ pub fn encode_skinned_entity_pass(
     for b in &scene.billboards {
         if b.level == 0 { continue; }
         let archetype = race_to_archetype(&b.race);
-        let Some(GpuModel::Skinned(model)) = r.gpu_character_models.get(archetype) else { continue };
+        let Some(GpuModel::Skinned(model)) = r.model_for(archetype, b.gender) else { continue };
         if j_slot >= r.joint_buf_pool.len() { break; }
 
         let matrices: Vec<[[f32;4];4]> = if b.action == "dead" {
@@ -601,7 +601,7 @@ pub fn encode_skinned_entity_pass(
                 &r.entity_uniform_pool[u_slot].0, 0,
                 bytemuck::bytes_of(&EntityUniform { model: mat, tint }),
             );
-            draws.push(DrawCmd { archetype, mesh_idx, uniform_slot: u_slot, joint_slot: j_slot, equipment: b.equipment });
+            draws.push(DrawCmd { archetype, mesh_idx, uniform_slot: u_slot, joint_slot: j_slot, equipment: b.equipment, gender: b.gender });
             u_slot += 1;
         }
         j_slot += 1;
@@ -627,7 +627,7 @@ pub fn encode_skinned_entity_pass(
 
     let mut cur_joint = usize::MAX;
     for draw in &draws {
-        let Some(GpuModel::Skinned(model)) = r.gpu_character_models.get(draw.archetype) else { continue };
+        let Some(GpuModel::Skinned(model)) = r.model_for(draw.archetype, draw.gender) else { continue };
         let mesh = &model.meshes[draw.mesh_idx];
         if draw.joint_slot != cur_joint {
             pass.set_bind_group(3, &r.joint_buf_pool[draw.joint_slot].1, &[]);

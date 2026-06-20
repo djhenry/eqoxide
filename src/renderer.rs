@@ -38,7 +38,9 @@ pub struct EqRenderer {
     pub texture_names:       Vec<String>,
     pub texture_bind_groups: Vec<wgpu::BindGroup>,
     pub fallback_texture_bg: wgpu::BindGroup,
-    pub gpu_character_models: std::collections::HashMap<&'static str, crate::gpu::GpuModel>,
+    /// Character models keyed by (archetype, gender) — gender 0 = male, 1 = female.
+    /// Female variants are loaded from `<archetype>_f.glb` when present.
+    pub gpu_character_models: std::collections::HashMap<(&'static str, u8), crate::gpu::GpuModel>,
     pub anim_states:         std::collections::HashMap<u32, EntityAnimState>,
     pub last_view_proj:      [[f32; 4]; 4],
     pub last_cam_pos:        [f32; 3],
@@ -272,8 +274,20 @@ impl EqRenderer {
                     }
                 }
             };
-            eprintln!("renderer: loaded '{}' — y_bottom={:.4} y_extent={:.4} x_center={:.4} z_center={:.4}",
-                key, asset.y_bottom, asset.y_extent, asset.x_center, asset.z_center);
+
+            // Build the male model (gender 0) plus a female variant (gender 1) from
+            // `<archetype>_f.glb` when present. Each is stored under (archetype, gender).
+            let mut variants: Vec<(u8, ModelAsset)> = vec![(0, asset)];
+            let female_path = models_dir.join(format!("{}_f.glb", key));
+            if female_path.exists() {
+                match ModelAsset::load(&female_path) {
+                    Ok(fa) => variants.push((1, fa)),
+                    Err(e) => eprintln!("renderer: female glTF load failed for '{}': {}", key, e),
+                }
+            }
+            for (gender, asset) in variants {
+            eprintln!("renderer: loaded '{}' (gender {}) — y_bottom={:.4} y_extent={:.4} x_center={:.4} z_center={:.4}",
+                key, gender, asset.y_bottom, asset.y_extent, asset.x_center, asset.z_center);
 
             let (_, tex_bgs) = upload_textures(
                 &self.device, &self.queue, &asset.textures, &self.layouts.texture_bgl,
@@ -356,7 +370,8 @@ impl EqRenderer {
                 GpuModel::Static(GpuStaticModel { meshes, texture_bind_groups: tex_bgs, y_bottom: asset.y_bottom, y_extent: asset.y_extent, x_center: asset.x_center, z_center: asset.z_center, prefix: asset.prefix.clone(), equip_slots: static_slots, true_height: asset.true_height })
             };
 
-            self.gpu_character_models.insert(key, model);
+            self.gpu_character_models.insert((key, gender), model);
+            } // gender variants
         }
 
         // Index armor textures: shared velious sets (global17-23_amr) + each
@@ -377,6 +392,13 @@ impl EqRenderer {
             }
         }
         eprintln!("equip: indexed {} armor textures", self.equip_index.len());
+    }
+
+    /// Select a loaded character model for an archetype + gender, falling back to the
+    /// male (gender 0) variant when no female variant exists.
+    pub fn model_for(&self, archetype: &'static str, gender: u8) -> Option<&crate::gpu::GpuModel> {
+        self.gpu_character_models.get(&(archetype, gender))
+            .or_else(|| self.gpu_character_models.get(&(archetype, 0)))
     }
 
     /// Load + upload one armor texture (trying .bmp then .dds). Returns its bind group.
@@ -404,7 +426,7 @@ impl EqRenderer {
         let mut needed: Vec<String> = Vec::new();
         for b in &scene.billboards {
             let archetype = race_to_archetype(&b.race);
-            let (prefix, slots) = match self.gpu_character_models.get(archetype) {
+            let (prefix, slots) = match self.model_for(archetype, b.gender) {
                 Some(GpuModel::Static(m))  => (&m.prefix, &m.equip_slots),
                 Some(GpuModel::Skinned(m)) => (&m.prefix, &m.equip_slots),
                 None => continue,
@@ -421,7 +443,7 @@ impl EqRenderer {
         }
         if !scene.player_race.is_empty() {
             let archetype = crate::models::race_to_archetype(&scene.player_race);
-            if let Some(model) = self.gpu_character_models.get(archetype) {
+            if let Some(model) = self.model_for(archetype, scene.player_gender) {
                 let (prefix, slots) = match model {
                     GpuModel::Static(m)  => (&m.prefix, &m.equip_slots),
                     GpuModel::Skinned(m) => (&m.prefix, &m.equip_slots),
@@ -462,19 +484,23 @@ impl EqRenderer {
         use crate::gpu::GpuModel;
 
         // Animate NPCs and player (player uses reserved id=0)
-        let anim_targets: Vec<(u32, &str, &str)> = {
-            let mut v: Vec<(u32, &str, &str)> = scene.billboards.iter()
-                .map(|b| (b.id, b.race.as_str(), b.action.as_str()))
+        let anim_targets: Vec<(u32, &str, &str, u8)> = {
+            let mut v: Vec<(u32, &str, &str, u8)> = scene.billboards.iter()
+                .map(|b| (b.id, b.race.as_str(), b.action.as_str(), b.gender))
                 .collect();
             if !scene.player_race.is_empty() {
-                v.push((0, scene.player_race.as_str(), scene.player_action.as_str()));
+                v.push((0, scene.player_race.as_str(), scene.player_action.as_str(), scene.player_gender));
             }
             v
         };
 
-        for (id, race, action) in &anim_targets {
+        for (id, race, action, gender) in &anim_targets {
             let archetype = crate::models::race_to_archetype(race);
-            let Some(GpuModel::Skinned(skinned)) = self.gpu_character_models.get(archetype) else { continue };
+            // Direct field lookup (with female→male fallback) keeps the borrow disjoint
+            // from the `self.anim_states` mutation below; `model_for` would borrow all of self.
+            let model = self.gpu_character_models.get(&(archetype, *gender))
+                .or_else(|| self.gpu_character_models.get(&(archetype, 0)));
+            let Some(GpuModel::Skinned(skinned)) = model else { continue };
 
             let state = self.anim_states.entry(*id).or_insert_with(|| {
                 let clip_idx = skinned.skin.clip_for_action("walking").unwrap_or(0);
