@@ -1167,7 +1167,13 @@ fn write_glb_skinned(
         zmax = zmax.max(p[2]);
     }
     let eq_height = (zmax - zmin).max(0.0);
-    let offset = Vec3::new(-(xmin + xmax) * 0.5, -(ymin + ymax) * 0.5, -zmin);
+    // Conversion-time translation normalization was reverted: it offset the root bone in
+    // rest + every animation keyframe, but a single offset cannot center every clip (each
+    // has its own root baseline), which displaced the model during animation. Centering is
+    // now done at render time from measured bounds. Keep eq_height (height extent) for the
+    // renderer's target-height scaling; apply no skeleton offset.
+    let _ = (xmin, xmax, ymin, ymax);
+    let offset = Vec3::ZERO;
 
     // Vertex attributes (shared across primitives).
     let (pmin, pmax) = compute_bounds_f32x3(&rot_positions);

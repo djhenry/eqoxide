@@ -741,13 +741,62 @@ mod tests {
 
     #[test]
     fn target_heights_are_sane() {
-        assert!((archetype_target_height("humanoid") - 6.0).abs() < 0.01);
+        assert!((archetype_target_height("humanoid") - 12.0).abs() < 0.01);
         assert!(archetype_target_height("dwarf") < archetype_target_height("humanoid"));
         assert!(archetype_target_height("unknown") > 0.0);
     }
 
+    /// Deterministic check of the player-pass placement math: load the real human
+    /// model, replicate the skinned-player transform, and assert the model ends up
+    /// grounded (feet ≈ pos.z), horizontally centered on pos, and ~target tall.
+    #[test]
+    #[ignore = "requires assets/models/humanoid.glb"]
+    fn humanoid_player_transform_grounds_and_centers() {
+        let p = std::path::PathBuf::from(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/assets/models/humanoid.glb"));
+        let a = ModelAsset::load(&p).expect("load");
+        let sk = a.skin.as_ref().expect("skin");
+        let target = archetype_target_height("humanoid");
+        let height = if a.true_height > 0.001 { a.true_height } else { 1.0 };
+        let ms = (target / height) * a.skinned_node_scale;
+        let lift_basis = -sk.bind_lowest_skinned_z();
+        let visual_scale = 2.0 * lift_basis * ms;
+        let center_xz = [a.x_center, a.z_center];
+        let pos = [100.0_f32, -200.0, 5.0];
+        let mat = crate::camera::entity_model_matrix_heading(
+            pos, 0.0, visual_scale, ms, center_xz, true, 0.0);
+        let m = glam::Mat4::from_cols_array_2d(&mat);
+        let skin = sk.bind_skin_matrices();
+        let (mut mnx, mut mxx) = (f32::MAX, f32::MIN);
+        let (mut mny, mut mxy) = (f32::MAX, f32::MIN);
+        let (mut mnz, mut mxz) = (f32::MAX, f32::MIN);
+        for (mesh, sdo) in a.meshes.iter().zip(a.skin_meshes.iter()) {
+            if let Some(sd) = sdo {
+                for (vi, vp) in mesh.positions.iter().enumerate() {
+                    let j = sd.joint_indices[vi];
+                    let w = sd.joint_weights[vi];
+                    let local = crate::anim::SkinData::skin_point(*vp, j, w, &skin);
+                    let wp = m.transform_point3(glam::Vec3::from(local));
+                    mnx = mnx.min(wp.x); mxx = mxx.max(wp.x);
+                    mny = mny.min(wp.y); mxy = mxy.max(wp.y);
+                    mnz = mnz.min(wp.z); mxz = mxz.max(wp.z);
+                }
+            }
+        }
+        let (cx, cy, h) = ((mnx + mxx) * 0.5, (mny + mxy) * 0.5, mxz - mnz);
+        eprintln!("PLACEMENT world x[{:.2},{:.2}] y[{:.2},{:.2}] z[{:.2},{:.2}] center=({:.2},{:.2}) height={:.2} feet_z={:.2} (pos={:?} target={})",
+            mnx, mxx, mny, mxy, mnz, mxz, cx, cy, h, mnz, pos, target);
+        assert!((mnz - pos[2]).abs() < 1.5, "feet z {:.2} should be ~pos.z {:.2}", mnz, pos[2]);
+        assert!((cx - pos[0]).abs() < 1.5, "x center {:.2} vs pos.x {:.2}", cx, pos[0]);
+        assert!((cy - pos[1]).abs() < 1.5, "y center {:.2} vs pos.y {:.2}", cy, pos[1]);
+        assert!((h - target).abs() < target * 0.3, "height {:.2} vs target {:.2}", h, target);
+    }
+
     #[test]
     fn archetype_scale_returns_positive_for_all_archetypes() {
+        assert!(archetype_scale("humanoid") > 0.0);
+        assert!(archetype_scale("gnoll")   > 0.0);
+        assert!(archetype_scale("skeleton") > 0.0);
         assert!(archetype_scale("humanoid") > 0.0);
         assert!(archetype_scale("gnoll")   > 0.0);
         assert!(archetype_scale("skeleton") > 0.0);

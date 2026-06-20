@@ -220,7 +220,7 @@ pub fn encode_player_pass(
                     _ => -model.skin.bind_lowest_skinned_z(),
                 };
                 let visual_scale = 2.0 * lift_basis * dominant_mesh_scale;
-                let center_xz = [0.0_f32, 0.0]; // normalized models are pre-centered
+                let center_xz = [model.x_center, model.z_center]; // recenter from measured posed bounds
 
                 for (i, mesh) in model.meshes.iter().enumerate() {
                     if i >= PLAYER_UNIFORM_SLOTS { break; }
@@ -589,7 +589,7 @@ pub fn encode_skinned_entity_pass(
             if u_slot >= r.entity_uniform_pool.len() { break; }
             let mat = crate::camera::entity_model_matrix_heading(
                 b.pos, b.heading, visual_scale, dominant_scale,
-                [0.0_f32, 0.0], true, 0.0, // normalized models are pre-centered
+                [model.x_center, model.z_center], true, 0.0, // recenter from measured posed bounds
             );
             let slot_meta = model.equip_slots[mesh_idx];
             let tint: [f32; 4] = if b.dead { [0.5, 0.5, 0.5, 1.0] }
