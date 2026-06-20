@@ -383,6 +383,11 @@ impl EqRenderer {
             crate::assets::index_s3d_textures(
                 &assets_path.join(format!("global{}_amr.s3d", n)), &mut self.equip_index);
         }
+        // global_chr.s3d is the combined all-races base archive — it carries the low-material
+        // (00-04) body textures that the per-race *_chr archives can be missing (e.g. human is
+        // missing chest material 03). Index it for TEXTURES only (we never load it as a model).
+        crate::assets::index_s3d_textures(
+            &assets_path.join("global_chr.s3d"), &mut self.equip_index);
         for &key in ARCHETYPES {
             if let Some(name) = crate::models::archetype_to_chr_s3d(key) {
                 crate::assets::index_s3d_textures(&assets_path.join(name), &mut self.equip_index);
