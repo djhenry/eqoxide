@@ -419,7 +419,7 @@ impl EqRenderer {
     /// Pre-pass (mutable): ensure every armor texture needed this frame is cached.
     /// Runs before the immutable render passes so they only do lookups.
     pub fn ensure_equipment_textures(&mut self, scene: &crate::scene::SceneState) {
-        use crate::models::{race_to_archetype, equip_texture_name};
+        use crate::models::{race_to_archetype, equip_swap_key};
         use crate::gpu::GpuModel;
 
         // Phase 1: collect needed base names (no mutation of the cache yet).
@@ -433,11 +433,10 @@ impl EqRenderer {
             };
             if prefix.is_empty() { continue; }
             for es in slots.iter().flatten() {
-                let material = b.equipment[es.slot];
-                if material == 0 { continue; } // naked → baked texture, no swap
-                let key = equip_texture_name(prefix, &es.region, material, es.variant);
-                if !self.equipment_tex_cache.contains_key(&key) {
-                    needed.push(key);
+                if let Some(key) = equip_swap_key(prefix, *es, b.equipment[es.slot]) {
+                    if !self.equipment_tex_cache.contains_key(&key) {
+                        needed.push(key);
+                    }
                 }
             }
         }
@@ -450,11 +449,10 @@ impl EqRenderer {
                 };
                 if !prefix.is_empty() {
                     for es in slots.iter().flatten() {
-                        let material = scene.player_equipment[es.slot];
-                        if material == 0 { continue; } // naked → baked texture, no swap
-                        let key = equip_texture_name(prefix, &es.region, material, es.variant);
-                        if !self.equipment_tex_cache.contains_key(&key) {
-                            needed.push(key);
+                        if let Some(key) = equip_swap_key(prefix, *es, scene.player_equipment[es.slot]) {
+                            if !self.equipment_tex_cache.contains_key(&key) {
+                                needed.push(key);
+                            }
                         }
                     }
                 }

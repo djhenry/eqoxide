@@ -538,6 +538,18 @@ pub fn equip_texture_name(prefix: &str, region: &[u8; 2], material: u32, variant
     format!("{}{}{:02}{:02}", prefix, region, material, variant)
 }
 
+/// The armor-texture key for an equipped body slot, or `None` when the model's own
+/// baked texture should be used. Returns `None` for **material 0** (naked/default — the
+/// GLB bakes the skin texture, which does NOT match the numeric `..00..` name, so swapping
+/// material 0 would wrongly blank head/feet) and for models with no race prefix.
+/// Single source of truth shared by the render pass and the texture pre-pass.
+pub fn equip_swap_key(prefix: &str, slot: EquipSlot, material: u32) -> Option<String> {
+    if material == 0 || prefix.is_empty() {
+        return None;
+    }
+    Some(equip_texture_name(prefix, &slot.region, material, slot.variant))
+}
+
 /// Map an EQ race string (case-insensitive) to a glTF archetype key.
 pub fn race_to_archetype(race: &str) -> &'static str {
     match race.to_uppercase().as_str() {
@@ -674,8 +686,10 @@ mod tests {
             concat!(env!("CARGO_MANIFEST_DIR"), "/assets/models/humanoid.glb")
         );
         let asset = ModelAsset::load(&path).expect("load failed");
-        assert!((asset.skinned_node_scale - 100.0).abs() < 1.0,
-            "expected node_scale≈100, got {}", asset.skinned_node_scale);
+        // EQ-converted models have node_scale 1.0 (the old ≈100 was the Quaternius/CC0
+        // placeholder before the s3d_to_gltf pipeline). Just require a sane positive scale.
+        assert!(asset.skinned_node_scale > 0.0 && asset.skinned_node_scale.is_finite(),
+            "node_scale should be positive+finite, got {}", asset.skinned_node_scale);
         let skin = asset.skin.expect("humanoid must have a skin");
         assert!(skin.joint_count <= 128, "joint count {} exceeds shader limit", skin.joint_count);
         let idx = skin.clip_for_action("walking")
@@ -938,6 +952,26 @@ mod tests {
     }
 
     #[test]
+    fn equip_swap_key_armor_returns_name() {
+        let slot = EquipSlot { slot: 1, region: *b"ch", variant: 1 };
+        assert_eq!(equip_swap_key("hom", slot, 17).as_deref(), Some("homch1701"));
+    }
+
+    #[test]
+    fn equip_swap_key_material_zero_is_none() {
+        // material 0 = naked → use the baked skin texture, NOT a constructed key
+        // (this is the head/feet-disappearing bug fix).
+        let slot = EquipSlot { slot: 0, region: *b"he", variant: 1 };
+        assert_eq!(equip_swap_key("hom", slot, 0), None);
+    }
+
+    #[test]
+    fn equip_swap_key_empty_prefix_is_none() {
+        let slot = EquipSlot { slot: 1, region: *b"ch", variant: 1 };
+        assert_eq!(equip_swap_key("", slot, 17), None);
+    }
+
+    #[test]
     #[ignore = "requires assets/models/humanoid.glb"]
     fn humanoid_true_height_from_extras() {
         let path = std::path::PathBuf::from(
@@ -958,8 +992,37 @@ mod tests {
         let asset = ModelAsset::load(&path).expect("load failed");
         assert_eq!(asset.equip_slots.len(), asset.meshes.len(),
             "equip_slots must be parallel to meshes");
-        assert_eq!(asset.prefix, "hom", "humanoid model prefix");
+        // The humanoid archetype must be the HUMAN model (prefix "hum"), not the Halfling
+        // model "hom" — guards the wrong-source-archive regression (halfling feet on humans).
+        assert_eq!(asset.prefix, "hum", "humanoid model must be human (hum), not halfling (hom)");
         assert!(asset.equip_slots.iter().flatten().any(|s| s.slot == 1),
             "expected at least one chest primitive");
+    }
+
+    #[test]
+    #[ignore = "requires assets/models/humanoid.glb"]
+    fn humanoid_clip_bounds_parallel_to_clips() {
+        let path = std::path::PathBuf::from(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/assets/models/humanoid.glb"));
+        let asset = ModelAsset::load(&path).expect("load failed");
+        let skin = asset.skin.as_ref().expect("skinned humanoid");
+        assert_eq!(asset.clip_bounds.len(), skin.clips.len(),
+            "clip_bounds must be parallel to clips (recenter/grounding indexes by clip_idx)");
+        assert!(asset.clip_bounds.iter().all(|(cx, cz, f)| cx.is_finite() && cz.is_finite() && f.is_finite()),
+            "clip bounds must be finite");
+    }
+
+    #[test]
+    #[ignore = "requires assets/models/humanoid.glb"]
+    fn humanoid_mesh_count_fits_player_uniform_slots() {
+        let path = std::path::PathBuf::from(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/assets/models/humanoid.glb"));
+        let asset = ModelAsset::load(&path).expect("load failed");
+        // The player pass draws one uniform slot per mesh and breaks past
+        // PLAYER_UNIFORM_SLOTS — if the model has more meshes than slots, the player loses
+        // its later primitives (head/feet). Guards the 16→32 slot-cap fix.
+        assert!(asset.meshes.len() <= crate::renderer::PLAYER_UNIFORM_SLOTS,
+            "humanoid has {} meshes but PLAYER_UNIFORM_SLOTS is {}",
+            asset.meshes.len(), crate::renderer::PLAYER_UNIFORM_SLOTS);
     }
 }

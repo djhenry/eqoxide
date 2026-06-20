@@ -333,6 +333,33 @@ mod tests {
     }
 
     #[test]
+    fn bind_pose_returns_rest_skinning_not_identity() {
+        // Rest pose translates the joint while inv_bind is identity, so the rest skinning
+        // matrix is that translation — NOT identity. bind_pose() must reflect this; it used
+        // to return identity, which rendered the raw, un-posed (off-center) mesh.
+        let skin = SkinData {
+            joint_count: 1,
+            parents: vec![None],
+            inv_bind: vec![identity_mat()],
+            clips: vec![],
+            rest_translations: vec![[5.0, 0.0, 0.0]],
+            rest_rotations: vec![[0.0, 0.0, 0.0, 1.0]],
+            rest_scales: vec![[1.0; 3]],
+            ground_probes: vec![],
+        };
+        let bp = skin.bind_pose();
+        let bsm = skin.bind_skin_matrices();
+        assert_eq!(bp.len(), 1);
+        let m = glam::Mat4::from_cols_array_2d(&bp[0]);
+        assert!((m.w_axis.x - 5.0).abs() < 1e-4,
+            "bind_pose must carry the rest translation (5,0,0), not identity; got {:?}", m.w_axis);
+        // bind_pose must equal the real rest skinning matrices
+        let (a, b) = (m.to_cols_array(), bsm[0].to_cols_array());
+        assert!(a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < 1e-5),
+            "bind_pose must equal bind_skin_matrices");
+    }
+
+    #[test]
     fn evaluate_single_joint_at_keyframe_times() {
         let skin = single_translation_skin();
         let r0 = skin.evaluate(0, 0.0);

@@ -12,14 +12,8 @@ fn resolve_equip_tex<'a>(
     equipment:  &[u32; 9],
 ) -> &'a wgpu::BindGroup {
     if let Some(es) = slot {
-        let material = equipment[es.slot];
-        // material 0 = naked/default: use the model's baked texture. The GLB bakes the
-        // "sk" skin textures (e.g. homhesk01), which do NOT match the numeric "00" texture
-        // names (homhe0001) — those are different graphics — so building a swap key for
-        // material 0 would override the correct skin with the wrong texture (head/feet
-        // rendering as missing/transparent).
-        if material != 0 && !prefix.is_empty() {
-            let key = crate::models::equip_texture_name(prefix, &es.region, material, es.variant);
+        // equip_swap_key returns None for material 0 (naked → baked texture) / no prefix.
+        if let Some(key) = crate::models::equip_swap_key(prefix, es, equipment[es.slot]) {
             if let Some(Some(bg)) = r.equipment_tex_cache.get(&key) {
                 return bg;
             }
