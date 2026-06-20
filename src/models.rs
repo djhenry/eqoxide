@@ -884,6 +884,55 @@ mod tests {
         assert!((ccy - pos[1]).abs() < 1.5, "idle y center {:.2} vs pos.y {:.2}", ccy, pos[1]);
     }
 
+    /// The per-clip positioning fix must generalize to every race/gender model the user
+    /// sees on NPCs — not just the male human. Loads each present gendered model, evaluates
+    /// its idle clip, and asserts the rendered pose grounds (feet≈pos.z) and centers (xy≈pos).
+    #[test]
+    #[ignore = "requires assets/models/*.glb"]
+    fn gendered_models_idle_ground_and_center() {
+        let pos = [100.0_f32, -200.0, 5.0];
+        let mut checked = 0;
+        for (name, archetype) in [
+            ("humanoid", "humanoid"), ("humanoid_f", "humanoid"),
+            ("elf", "elf"), ("elf_f", "elf"),
+            ("dwarf", "dwarf"), ("dwarf_f", "dwarf"),
+        ] {
+            let path = std::path::PathBuf::from(
+                format!("{}/assets/models/{}.glb", env!("CARGO_MANIFEST_DIR"), name));
+            if !path.exists() { continue; }
+            let a = ModelAsset::load(&path).expect("load");
+            let sk = a.skin.as_ref().expect("skin");
+            let idle = sk.clip_for_action("idle").or_else(|| sk.clip_for_action("walking")).unwrap_or(0);
+            let (cxb, czb, floor) = a.clip_bounds[idle];
+            let target = archetype_target_height(archetype);
+            let ms = (target / a.true_height) * a.skinned_node_scale;
+            let visual_scale = 2.0 * (-floor) * ms;
+            let mat = crate::camera::entity_model_matrix_heading(pos, 0.0, visual_scale, ms, [cxb, czb], true, 0.0);
+            let m = glam::Mat4::from_cols_array_2d(&mat);
+            let imats: Vec<glam::Mat4> = sk.evaluate(idle, 0.0).iter()
+                .map(|x| glam::Mat4::from_cols_array_2d(x)).collect();
+            let (mut mnx, mut mxx, mut mny, mut mxy, mut mnz) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN, f32::MAX);
+            for (mesh, sdo) in a.meshes.iter().zip(a.skin_meshes.iter()) {
+                if let Some(sd) = sdo {
+                    for (vi, vp) in mesh.positions.iter().enumerate() {
+                        let local = crate::anim::SkinData::skin_point(*vp, sd.joint_indices[vi], sd.joint_weights[vi], &imats);
+                        let wp = m.transform_point3(glam::Vec3::from(local));
+                        mnx = mnx.min(wp.x); mxx = mxx.max(wp.x);
+                        mny = mny.min(wp.y); mxy = mxy.max(wp.y);
+                        mnz = mnz.min(wp.z);
+                    }
+                }
+            }
+            let (ccx, ccy) = ((mnx + mxx) * 0.5, (mny + mxy) * 0.5);
+            eprintln!("MODEL {name}: feet_z={:.2} center=({:.2},{:.2}) prefix={}", mnz, ccx, ccy, a.prefix);
+            assert!((mnz - pos[2]).abs() < 1.5, "{name} feet z {:.2} vs pos.z {:.2}", mnz, pos[2]);
+            assert!((ccx - pos[0]).abs() < 1.5, "{name} x center {:.2} vs pos.x {:.2}", ccx, pos[0]);
+            assert!((ccy - pos[1]).abs() < 1.5, "{name} y center {:.2} vs pos.y {:.2}", ccy, pos[1]);
+            checked += 1;
+        }
+        assert!(checked >= 1, "no gendered models found to check");
+    }
+
     #[test]
     fn archetype_scale_returns_positive_for_all_archetypes() {
         assert!(archetype_scale("humanoid") > 0.0);
