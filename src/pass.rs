@@ -115,15 +115,6 @@ pub fn encode_billboard_pass(
     let mut all_verts: Vec<crate::gpu::Vertex> = Vec::new();
     let mut all_idxs:  Vec<u32>                = Vec::new();
 
-    // TEMP DEBUG: XYZ axis gizmo at the player's collision point (where the model should
-    // be centered) — red=+X east, green=+Y north, blue=+Z up. Remove when position is fixed.
-    if !scene.player_race.is_empty() {
-        let (gv, gi) = crate::billboard::axis_gizmo(scene.player_pos, 12.0, scene.player_heading);
-        let base = all_verts.len() as u32;
-        all_verts.extend(gv);
-        all_idxs.extend(gi.iter().map(|i| i + base));
-    }
-
     for b in &scene.billboards {
         if b.level == 0 {
             // Level-0 placeholder spawns: draw a small red X on the ground
@@ -217,39 +208,17 @@ pub fn encode_player_pass(
                 let target = crate::models::archetype_target_height(archetype);
                 let height = if model.true_height > 0.001 { model.true_height } else { 1.0 };
                 let dominant_mesh_scale = (target / height) * model.node_scale;
-                // Recenter + ground from the CURRENT animation clip's posed bounds (the live
-                // pose differs from bind, causing a static offset). Bounds are per-clip min
-                // Recenter + ground from the CURRENT posed frame's ground probes (feet), so the
-                // body stays over `pos` and the lowest foot sits on the ground every frame —
-                // fixes the vertical float (clip-min grounding floated non-lowest frames) and
-                // the horizontal drift while walking (a static clip center didn't track the pose).
-                let (cx, cz, floor) = {
-                    let mg: Vec<glam::Mat4> = matrices.iter()
-                        .map(|m| glam::Mat4::from_cols_array_2d(m)).collect();
-                    let probes = &model.skin.ground_probes;
-                    if probes.is_empty() {
-                        (model.x_center, model.z_center, model.skin.bind_lowest_skinned_z())
-                    } else {
-                        let (mut xmn, mut xmx, mut zmn, mut zmx, mut ymn) =
-                            (f32::MAX, f32::MIN, f32::MAX, f32::MIN, f32::MAX);
-                        for p in probes {
-                            let lp = crate::anim::SkinData::skin_point(p.pos, p.joints, p.weights, &mg);
-                            xmn = xmn.min(lp[0]); xmx = xmx.max(lp[0]);
-                            zmn = zmn.min(lp[2]); zmx = zmx.max(lp[2]);
-                            ymn = ymn.min(lp[1]);
-                        }
-                        ((xmn + xmx) * 0.5, (zmn + zmx) * 0.5, ymn)
-                    }
-                };
-                let lift_basis = -floor;
-                let visual_scale = 2.0 * lift_basis * dominant_mesh_scale;
-                let center_xz = [cx, cz];
+                // Skinned EQ models are authored horizontally centered on the origin, so NO
+                // recenter (center_xz=[0,0]); the measured centers were unreliable and pushed
+                // the model off. Vertically the origin sits above the feet, so lift by a
+                // calibrated fraction of the target height to ground the feet (≈2.5 at target 12).
+                let visual_scale = 2.0 * target * crate::models::GROUND_LIFT_FRAC;
 
                 for (i, mesh) in model.meshes.iter().enumerate() {
                     if i >= PLAYER_UNIFORM_SLOTS { break; }
                     let mat = crate::camera::entity_model_matrix_heading(
                         scene.player_pos, scene.player_heading, visual_scale,
-                        dominant_mesh_scale, center_xz, true, 0.0,
+                        dominant_mesh_scale, [0.0, 0.0], true, 0.0,
                     );
                     let tint = match model.equip_slots[i] {
                         Some(ref es) if scene.player_equipment_tint[es.slot] != [0, 0, 0] => {
@@ -597,34 +566,15 @@ pub fn encode_skinned_entity_pass(
         let target = crate::models::archetype_target_height(archetype);
         let height = if model.true_height > 0.001 { model.true_height } else { 1.0 };
         let dominant_scale    = (target / height) * model.node_scale;
-        // Recenter + ground from the CURRENT posed frame's ground probes (same as the player
-        // pass) so NPCs are centered on their position and feet on the ground every frame.
-        let (cx, cz, floor) = {
-            let mg: Vec<glam::Mat4> = matrices.iter()
-                .map(|m| glam::Mat4::from_cols_array_2d(m)).collect();
-            let probes = &model.skin.ground_probes;
-            if probes.is_empty() {
-                (model.x_center, model.z_center, model.skin.bind_lowest_skinned_z())
-            } else {
-                let (mut xmn, mut xmx, mut zmn, mut zmx, mut ymn) =
-                    (f32::MAX, f32::MIN, f32::MAX, f32::MIN, f32::MAX);
-                for p in probes {
-                    let lp = crate::anim::SkinData::skin_point(p.pos, p.joints, p.weights, &mg);
-                    xmn = xmn.min(lp[0]); xmx = xmx.max(lp[0]);
-                    zmn = zmn.min(lp[2]); zmx = zmx.max(lp[2]);
-                    ymn = ymn.min(lp[1]);
-                }
-                ((xmn + xmx) * 0.5, (zmn + zmx) * 0.5, ymn)
-            }
-        };
-        let lift_basis = -floor;
-        let visual_scale = 2.0 * lift_basis * dominant_scale;
+        // Same placement as the player pass: no recenter (models are authored centered),
+        // lift by a calibrated fraction of target height to ground the feet.
+        let visual_scale = 2.0 * target * crate::models::GROUND_LIFT_FRAC;
 
         for (mesh_idx, mesh) in model.meshes.iter().enumerate() {
             if u_slot >= r.entity_uniform_pool.len() { break; }
             let mat = crate::camera::entity_model_matrix_heading(
                 b.pos, b.heading, visual_scale, dominant_scale,
-                [cx, cz], true, 0.0,
+                [0.0, 0.0], true, 0.0,
             );
             let slot_meta = model.equip_slots[mesh_idx];
             let tint: [f32; 4] = if b.dead { [0.5, 0.5, 0.5, 1.0] }

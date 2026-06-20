@@ -629,6 +629,12 @@ pub fn archetype_scale(archetype: &str) -> f32 {
     }
 }
 
+/// Fraction of the rendered target height to lift a skinned character so its feet sit on
+/// the ground. EQ models are authored with the origin above the feet (and have stray geometry
+/// below the visible feet, so a min-vertex measure overshoots); calibrated against the
+/// humanoid (≈2.5 at target 12). Scales with target so other races stay grounded.
+pub const GROUND_LIFT_FRAC: f32 = 0.208;
+
 /// Target height in EQ units for each archetype, used to scale normalized skinned models
 /// so that `true_height` maps to the correct in-world visual height.
 /// EQ units ≈ feet. Values are initial calibration; fine-tune visually after loading.
@@ -1075,3 +1081,4 @@ mod tests {
             asset.meshes.len(), crate::renderer::PLAYER_UNIFORM_SLOTS);
     }
 }
+
