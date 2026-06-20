@@ -214,11 +214,11 @@ pub fn encode_player_pass(
                 let target = crate::models::archetype_target_height(archetype);
                 let height = if model.true_height > 0.001 { model.true_height } else { 1.0 };
                 let dominant_mesh_scale = (target / height) * model.node_scale;
-                let lift_basis = match r.anim_states.get(&0) {
-                    Some(state) if !model.skin.clips.is_empty() =>
-                        -model.skin.lowest_skinned_z(state.clip_idx, state.time),
-                    _ => -model.skin.bind_lowest_skinned_z(),
-                };
+                // Constant bind-pose grounding: lift by the bind feet height so the body
+                // stays at a fixed height and the animation's foot motion is visible.
+                // (Per-frame lowest_skinned_z forced the lowest point to the ground every
+                // frame, bobbing the whole body up when both feet lift during a walk.)
+                let lift_basis = -model.skin.bind_lowest_skinned_z();
                 let visual_scale = 2.0 * lift_basis * dominant_mesh_scale;
                 let center_xz = [model.x_center, model.z_center]; // recenter from measured posed bounds
 
@@ -574,15 +574,9 @@ pub fn encode_skinned_entity_pass(
         let target = crate::models::archetype_target_height(archetype);
         let height = if model.true_height > 0.001 { model.true_height } else { 1.0 };
         let dominant_scale    = (target / height) * model.node_scale;
-        let lift_basis = if b.action != "dead" {
-            match r.anim_states.get(&b.id) {
-                Some(state) if !model.skin.clips.is_empty() =>
-                    -model.skin.lowest_skinned_z(state.clip_idx, state.time),
-                _ => -model.skin.bind_lowest_skinned_z(),
-            }
-        } else {
-            -model.skin.bind_lowest_skinned_z()
-        };
+        // Constant bind-pose grounding (see encode_player_pass): fixed body height,
+        // visible foot motion, no per-frame walk bob.
+        let lift_basis = -model.skin.bind_lowest_skinned_z();
         let visual_scale = 2.0 * lift_basis * dominant_scale;
 
         for (mesh_idx, mesh) in model.meshes.iter().enumerate() {
