@@ -251,7 +251,6 @@ pub fn encode_player_pass(
                         scene.player_pos, scene.player_heading, visual_scale,
                         dominant_mesh_scale, center_xz, true, 0.0,
                     );
-                    // (debug PMODEL print removed; per-frame recenter/ground verified via WORLD_BBOX)
                     let tint = match model.equip_slots[i] {
                         Some(ref es) if scene.player_equipment_tint[es.slot] != [0, 0, 0] => {
                             let t = scene.player_equipment_tint[es.slot];
@@ -598,11 +597,26 @@ pub fn encode_skinned_entity_pass(
         let target = crate::models::archetype_target_height(archetype);
         let height = if model.true_height > 0.001 { model.true_height } else { 1.0 };
         let dominant_scale    = (target / height) * model.node_scale;
-        // Recenter + ground from the current clip's posed bounds (see encode_player_pass);
-        // per-clip min feet → stable body height, no walk bob. Fall back to bind.
-        let (cx, cz, floor) = r.anim_states.get(&b.id)
-            .and_then(|s| model.clip_bounds.get(s.clip_idx).copied())
-            .unwrap_or((model.x_center, model.z_center, model.skin.bind_lowest_skinned_z()));
+        // Recenter + ground from the CURRENT posed frame's ground probes (same as the player
+        // pass) so NPCs are centered on their position and feet on the ground every frame.
+        let (cx, cz, floor) = {
+            let mg: Vec<glam::Mat4> = matrices.iter()
+                .map(|m| glam::Mat4::from_cols_array_2d(m)).collect();
+            let probes = &model.skin.ground_probes;
+            if probes.is_empty() {
+                (model.x_center, model.z_center, model.skin.bind_lowest_skinned_z())
+            } else {
+                let (mut xmn, mut xmx, mut zmn, mut zmx, mut ymn) =
+                    (f32::MAX, f32::MIN, f32::MAX, f32::MIN, f32::MAX);
+                for p in probes {
+                    let lp = crate::anim::SkinData::skin_point(p.pos, p.joints, p.weights, &mg);
+                    xmn = xmn.min(lp[0]); xmx = xmx.max(lp[0]);
+                    zmn = zmn.min(lp[2]); zmx = zmx.max(lp[2]);
+                    ymn = ymn.min(lp[1]);
+                }
+                ((xmn + xmx) * 0.5, (zmn + zmx) * 0.5, ymn)
+            }
+        };
         let lift_basis = -floor;
         let visual_scale = 2.0 * lift_basis * dominant_scale;
 

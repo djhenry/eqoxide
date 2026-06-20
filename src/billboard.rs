@@ -103,12 +103,12 @@ pub fn axis_gizmo(pos: [f32; 3], len: f32, heading_deg: f32) -> (Vec<Vertex>, Ve
     // small white cube at the exact origin point
     push_box(&mut verts, &mut idxs, [x - w, y - w, z - w], [x + w, y + w, z + w], [1.0, 1.0, 1.0]);
 
-    // TEMP DEBUG: yellow heading arrow on the ground, pointing the way the model is rotated.
-    // yaw matches entity_model_matrix_heading (heading + 90°); forward = rotZ(yaw) * +Y(north).
-    let yaw = heading_deg.to_radians() + std::f32::consts::FRAC_PI_2;
-    let (s, c) = yaw.sin_cos();
-    let (dx, dy) = (-s, c);            // world XY direction of the model's forward
-    let (px, py) = (-dy, dx);         // perpendicular (for arrow width)
+    // TEMP DEBUG: yellow heading arrow on the ground, pointing the character's facing.
+    // EQ heading 0 = north/+Y, CCW (see desired_azimuth): forward = (-sin h, cos h).
+    let h = heading_deg.to_radians();
+    let (sh, ch) = h.sin_cos();
+    let (dx, dy) = (-sh, ch);          // world XY facing direction
+    let (px, py) = (-dy, dx);          // perpendicular (for arrow width)
     let alen = len * 1.2;
     let aw = 1.2;
     let zf = z + 0.3;
@@ -124,6 +124,28 @@ pub fn axis_gizmo(pos: [f32; 3], len: f32, heading_deg: f32) -> (Vec<Vertex>, Ve
     verts.push(Vertex { position: [x + dx * shaft - px * aw * 2.2, y + dy * shaft - py * aw * 2.2, zf], normal: yc, uv: [0.0; 2] }); // 5 head-right
     verts.push(Vertex { position: [x + dx * alen, y + dy * alen, zf], normal: yc, uv: [0.0; 2] });      // 6 tip
     for i in [0u32,1,2, 1,3,2, 4,5,6] { idxs.push(base + i); }
+
+    // TEMP DEBUG: cyan wireframe box where the model SHOULD be — centered on pos, feet on the
+    // ground (z), rising to the target height (len). If the model is placed right it sits
+    // inside; offset/float makes it poke out. Drawn as 12 thin edge-boxes.
+    let hw = 4.0;            // half-width of the expected footprint
+    let ew = 0.15;          // edge thickness
+    let cy = [0.0, 1.0, 1.0];
+    let (x0, x1, y0, y1, z0, z1) = (x - hw, x + hw, y - hw, y + hw, z, z + len);
+    let mut edge = |a: [f32; 3], b: [f32; 3]| {
+        let mn = [a[0].min(b[0]) - ew, a[1].min(b[1]) - ew, a[2].min(b[2]) - ew];
+        let mx = [a[0].max(b[0]) + ew, a[1].max(b[1]) + ew, a[2].max(b[2]) + ew];
+        push_box(&mut verts, &mut idxs, mn, mx, cy);
+    };
+    // 4 verticals
+    edge([x0,y0,z0],[x0,y0,z1]); edge([x1,y0,z0],[x1,y0,z1]);
+    edge([x1,y1,z0],[x1,y1,z1]); edge([x0,y1,z0],[x0,y1,z1]);
+    // bottom rectangle
+    edge([x0,y0,z0],[x1,y0,z0]); edge([x1,y0,z0],[x1,y1,z0]);
+    edge([x1,y1,z0],[x0,y1,z0]); edge([x0,y1,z0],[x0,y0,z0]);
+    // top rectangle
+    edge([x0,y0,z1],[x1,y0,z1]); edge([x1,y0,z1],[x1,y1,z1]);
+    edge([x1,y1,z1],[x0,y1,z1]); edge([x0,y1,z1],[x0,y0,z1]);
     (verts, idxs)
 }
 
