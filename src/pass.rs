@@ -212,7 +212,8 @@ pub fn encode_player_pass(
                 // recenter (center_xz=[0,0]); the measured centers were unreliable and pushed
                 // the model off. Vertically the origin sits above the feet, so lift by a
                 // calibrated fraction of the target height to ground the feet (≈2.5 at target 12).
-                let visual_scale = 2.0 * target * crate::models::GROUND_LIFT_FRAC;
+                // Ground by the model's own feet: lift = -feet_offset * mesh_scale.
+                let visual_scale = -2.0 * model.feet_offset * dominant_mesh_scale;
 
                 for (i, mesh) in model.meshes.iter().enumerate() {
                     if i >= PLAYER_UNIFORM_SLOTS { break; }
@@ -568,7 +569,8 @@ pub fn encode_skinned_entity_pass(
         let dominant_scale    = (target / height) * model.node_scale;
         // Same placement as the player pass: no recenter (models are authored centered),
         // lift by a calibrated fraction of target height to ground the feet.
-        let visual_scale = 2.0 * target * crate::models::GROUND_LIFT_FRAC;
+        // Ground by the model's own feet: lift = -feet_offset * mesh_scale.
+        let visual_scale = -2.0 * model.feet_offset * dominant_scale;
 
         for (mesh_idx, mesh) in model.meshes.iter().enumerate() {
             if u_slot >= r.entity_uniform_pool.len() { break; }

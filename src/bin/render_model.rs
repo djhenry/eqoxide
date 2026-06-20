@@ -686,6 +686,7 @@ impl ApplicationHandler for ModelViewerApp {
             prefix: asset.prefix.clone(), equip_slots: static_slots,
             true_height: asset.true_height,
             clip_bounds: vec![],
+            feet_offset: 0.0,
         };
 
         // Pre-allocate uniform buffers (one per mesh).

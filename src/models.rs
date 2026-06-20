@@ -45,6 +45,11 @@ pub struct ModelAsset {
     /// the bind pose (the live animation pose differs from bind, causing a static offset).
     /// Empty for static/non-skinned models.
     pub clip_bounds: Vec<(f32, f32, f32)>,
+    /// Robust "feet" height (model-space Y, idle pose): the 5th percentile of the posed
+    /// vertices' Y, which excludes stray geometry that hangs below the visible feet. The
+    /// renderer grounds a skinned model by lifting `-feet_offset × mesh_scale`. Per-model
+    /// so every archetype grounds by its own feet (not a humanoid-tuned constant). 0 if no skin.
+    pub feet_offset: f32,
 }
 
 impl ModelAsset {
@@ -418,7 +423,34 @@ impl ModelAsset {
             }).collect()
         } else { vec![] };
 
-        Ok(ModelAsset { meshes, textures, skin: skin_data, skin_meshes, skinned_node_scale, skinned_mesh_scales, y_bottom, y_extent, x_center, z_center, prefix: model_prefix, equip_slots, true_height, clip_bounds })
+        // Robust feet height = 5th percentile of the idle-pose vertices' model-Y. Used to
+        // ground each skinned model by its own feet (excludes stray geometry below the feet).
+        let feet_offset: f32 = match skin_data.as_ref() {
+            Some(sd) if !sd.clips.is_empty() => {
+                let idle = sd.clip_for_action("idle")
+                    .or_else(|| sd.clip_for_action("walking")).unwrap_or(0);
+                let mats: Vec<glam::Mat4> = sd.evaluate(idle, 0.0).iter()
+                    .map(|m| glam::Mat4::from_cols_array_2d(m)).collect();
+                let mut ys: Vec<f32> = Vec::new();
+                for (i, (mesh, sd_opt)) in meshes.iter().zip(skin_meshes.iter()).enumerate() {
+                    if (skinned_mesh_scales[i] - skinned_node_scale).abs() >= skinned_node_scale * 0.5 { continue; }
+                    let Some(smesh) = sd_opt else { continue };
+                    for (vi, pos) in mesh.positions.iter().enumerate() {
+                        let joints  = smesh.joint_indices.get(vi).copied().unwrap_or([0; 4]);
+                        let weights = smesh.joint_weights.get(vi).copied().unwrap_or([1.0, 0.0, 0.0, 0.0]);
+                        let y = crate::anim::SkinData::skin_point(*pos, joints, weights, &mats)[1];
+                        if y.is_finite() { ys.push(y); }
+                    }
+                }
+                if ys.is_empty() { 0.0 } else {
+                    ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    ys[((ys.len() - 1) as f32 * 0.05) as usize]
+                }
+            }
+            _ => 0.0,
+        };
+
+        Ok(ModelAsset { meshes, textures, skin: skin_data, skin_meshes, skinned_node_scale, skinned_mesh_scales, y_bottom, y_extent, x_center, z_center, prefix: model_prefix, equip_slots, true_height, clip_bounds, feet_offset })
     }
 
     /// Load a static character model from an EQ `_chr.s3d` archive.
@@ -482,6 +514,7 @@ impl ModelAsset {
             // chr.s3d models have no glTF extras; fall back to measured y_extent.
             true_height: y_extent,
             clip_bounds: vec![], // static chr.s3d models have no clips
+            feet_offset: 0.0,
         })
     }
 }
@@ -628,12 +661,6 @@ pub fn archetype_scale(archetype: &str) -> f32 {
         _          =>  6.0,
     }
 }
-
-/// Fraction of the rendered target height to lift a skinned character so its feet sit on
-/// the ground. EQ models are authored with the origin above the feet (and have stray geometry
-/// below the visible feet, so a min-vertex measure overshoots); calibrated against the
-/// humanoid (≈2.5 at target 12). Scales with target so other races stay grounded.
-pub const GROUND_LIFT_FRAC: f32 = 0.208;
 
 /// Target height in EQ units for each archetype, used to scale normalized skinned models
 /// so that `true_height` maps to the correct in-world visual height.
@@ -1081,4 +1108,5 @@ mod tests {
             asset.meshes.len(), crate::renderer::PLAYER_UNIFORM_SLOTS);
     }
 }
+
 

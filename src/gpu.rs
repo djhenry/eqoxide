@@ -76,6 +76,9 @@ pub struct GpuStaticModel {
     /// Per-clip posed bounds (center_x, center_z, feet_floor), parallel to `skin.clips`.
     /// Empty for static models. Recenter + ground from the current clip vs the bind pose.
     pub clip_bounds: Vec<(f32, f32, f32)>,
+    /// Robust feet height (idle-pose model-Y 5th percentile); 0 for static. Grounding lifts
+    /// by `-feet_offset × mesh_scale` so each archetype sits on the floor by its own feet.
+    pub feet_offset: f32,
 }
 
 /// Skinned (GPU-animated) character model with embedded SkinData.
@@ -105,6 +108,9 @@ pub struct GpuSkinnedModel {
     /// Per-clip posed bounds (center_x, center_z, feet_floor), parallel to `skin.clips`.
     /// Empty for static models. Recenter + ground from the current clip vs the bind pose.
     pub clip_bounds: Vec<(f32, f32, f32)>,
+    /// Robust feet height (idle-pose model-Y 5th percentile); 0 for static. Grounding lifts
+    /// by `-feet_offset × mesh_scale` so each archetype sits on the floor by its own feet.
+    pub feet_offset: f32,
 }
 
 /// Unified character model — either static or skinned.
