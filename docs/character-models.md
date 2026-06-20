@@ -56,12 +56,15 @@ frame (we tried doing this at conversion time but it fought the animations — s
   at its archetype's `target` EQ height regardless of its raw authoring scale.
   `archetype_target_height` returns the desired **rendered** height; humanoid = 12 EQ
   (calibrated to the doorway), other human-height races match it, others proportional.
-- **Centering** — `entity_model_matrix_heading` recenters by the model's measured posed
-  horizontal centers (`center_xz = [x_center, z_center]`), computed in `ModelAsset::load`
-  from the skinned bind pose, so the model sits over the entity position.
-- **Grounding** — lift by the **constant** bind-pose feet height
-  (`bind_lowest_skinned_z`), so the body stays at a fixed height and the animation's foot
-  motion is visible (per-frame lowest-point grounding caused the body to bob up mid-stride).
+- **Centering + grounding (per current animation clip)** — recenter and ground from the
+  **current clip's** posed bounds, not the bind pose. `ModelAsset::load` precomputes, per
+  clip, `clip_bounds = (center_x, center_z, feet_floor)` (center axes p0/p2; floor = min
+  feet over sampled frames). The passes look these up by the live `clip_idx`:
+  `center_xz = (center_x, center_z)` and lift by `-feet_floor`. Per-clip (not per-frame)
+  bounds keep the body height stable within a clip → **no walk bob**; using the *current*
+  clip rather than bind fixes the static offset (the live idle pose differs from bind, so
+  bind-based recenter/grounding left the model offset forward/left/up). Falls back to the
+  bind values (`x_center`/`z_center`, `bind_lowest_skinned_z`) when a clip has no bounds.
 
 `bind_pose()` (`anim.rs`) returns the real rest skinning matrices (`global_rest *
 inverse_bind`), **not** identity — EQ meshes are authored off-pose, so identity would
