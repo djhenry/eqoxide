@@ -33,7 +33,7 @@ libeq_pfs = { git = "https://github.com/cjab/libeq", package = "libeq_pfs" }
 libeq_wld = { git = "https://github.com/cjab/libeq", package = "libeq_wld" }
 serde_yaml = "0.9"
 shellexpand = "3"
-gltf = { version = "1", features = ["import"] }
+gltf = { version = "1", features = ["import", "extras"] }
 rand = "0.8"
 byteorder = "1.5"
 miniz_oxide = "0.8"

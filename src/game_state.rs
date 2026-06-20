@@ -32,6 +32,13 @@ pub struct Entity {
     pub race: String,
     pub heading: f32,
     pub dead: bool,
+    pub equipment: [u32; 9],
+    pub equipment_tint: [[u8; 3]; 9],
+    pub gender: u8,
+    pub helm: u8,
+    pub showhelm: u8,
+    /// Server animation state (Animation::Standing=100, Sitting=110, Crouching=111, etc.)
+    pub animation: u32,
 }
 
 impl Entity {
@@ -54,6 +61,8 @@ pub struct GameState {
     pub player_level: u32,
     pub player_race: String,
     pub player_class: String,
+    /// 0 = male, 1 = female (selects the gender model variant).
+    pub player_gender: u8,
     pub player_action: String,
     pub hp_pct: f32,
     pub mana_pct: f32,
@@ -62,6 +71,10 @@ pub struct GameState {
     pub coin: [u32; 4],
     /// Stats (STR, STA, CHA, DEX, INT, AGI, WIS), from the player profile.
     pub stats: [u32; 7],
+    /// Item material IDs for each equipment slot (0..9), from the player profile.
+    pub player_equipment: [u32; 9],
+    /// RGB tint for each equipment slot (0..9), from the player profile.
+    pub player_equipment_tint: [[u8; 3]; 9],
 
     // Zone
     pub zone_name: String,
@@ -185,6 +198,8 @@ mod tests {
             race: String::new(),
             heading: 0.0,
             dead: false,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
+            animation: 0,
         }
     }
 

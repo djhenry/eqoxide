@@ -66,6 +66,13 @@ pub struct GpuStaticModel {
     pub y_extent:            f32,
     pub x_center:            f32,
     pub z_center:            f32,
+    /// Lowercase race+gender prefix from material names; empty if unknown.
+    pub prefix: String,
+    /// Per-mesh equipment slot binding, parallel to `meshes`. `None` = not an armor slot.
+    pub equip_slots: Vec<Option<crate::models::EquipSlot>>,
+    /// True model height in EQ units. From `eq_height` glTF extras if present; otherwise
+    /// the measured `y_extent`. Use this for scale calculations (Task 4).
+    pub true_height: f32,
 }
 
 /// Skinned (GPU-animated) character model with embedded SkinData.
@@ -85,6 +92,13 @@ pub struct GpuSkinnedModel {
     /// Applied as a centering correction so models render at their entity position, not offset.
     pub x_center:            f32,
     pub z_center:            f32,
+    /// Lowercase race+gender prefix from material names; empty if unknown.
+    pub prefix: String,
+    /// Per-mesh equipment slot binding, parallel to `meshes`. `None` = not an armor slot.
+    pub equip_slots: Vec<Option<crate::models::EquipSlot>>,
+    /// True model height in EQ units. From `eq_height` glTF extras if present; otherwise
+    /// the measured `y_extent`. Use this for scale calculations (Task 4).
+    pub true_height: f32,
 }
 
 /// Unified character model — either static or skinned.

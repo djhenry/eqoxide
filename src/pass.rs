@@ -1,6 +1,36 @@
 use crate::renderer::EqRenderer;
 use crate::scene::SceneState;
 
+/// Choose the bind group for one primitive: an equipment-swapped armor texture if
+/// available, else the primitive's baked GLB texture, else the white fallback.
+fn resolve_equip_tex<'a>(
+    r:          &'a EqRenderer,
+    baked_bgs:  &'a [wgpu::BindGroup],
+    baked_idx:  Option<usize>,
+    prefix:     &str,
+    slot:       Option<crate::models::EquipSlot>,
+    equipment:  &[u32; 9],
+) -> &'a wgpu::BindGroup {
+    if let Some(es) = slot {
+        let material = equipment[es.slot];
+        // material 0 = naked/default: use the model's baked texture. The GLB bakes the
+        // "sk" skin textures (e.g. homhesk01), which do NOT match the numeric "00" texture
+        // names (homhe0001) — those are different graphics — so building a swap key for
+        // material 0 would override the correct skin with the wrong texture (head/feet
+        // rendering as missing/transparent).
+        if material != 0 && !prefix.is_empty() {
+            let key = crate::models::equip_texture_name(prefix, &es.region, material, es.variant);
+            if let Some(Some(bg)) = r.equipment_tex_cache.get(&key) {
+                return bg;
+            }
+        }
+    }
+    match baked_idx {
+        Some(i) if i < baked_bgs.len() => &baked_bgs[i],
+        _ => &r.fallback_texture_bg,
+    }
+}
+
 /// Sky gradient background pass. MUST be called before all other passes.
 /// Fills the color buffer with the gradient; subsequent passes draw on top.
 /// No depth attachment — sky is purely a background layer.
@@ -100,7 +130,7 @@ pub fn encode_billboard_pass(
             all_idxs.extend(idxs.iter().map(|i| i + base));
             continue;
         }
-        if r.gpu_character_models.contains_key(race_to_archetype(&b.race)) { continue; }
+        if r.model_for(race_to_archetype(&b.race), b.gender).is_some() { continue; }
         let (verts, idxs) = billboard_quad(
             b.pos, npc_size(b.level), npc_color(b.is_target, b.dead, b.hp_pct),
             cam_right, cam_up,
@@ -168,7 +198,7 @@ pub fn encode_player_pass(
     if !scene.player_race.is_empty() {
         let archetype = race_to_archetype(&scene.player_race);
 
-        match r.gpu_character_models.get(archetype) {
+        match r.model_for(archetype, scene.player_gender) {
             Some(GpuModel::Skinned(model)) => {
                 let matrices = match r.anim_states.get(&0) {
                     Some(state) if !model.skin.clips.is_empty() =>
@@ -181,15 +211,16 @@ pub fn encode_player_pass(
                 // Write to pool slot 0 (reserved for player).
                 r.queue.write_buffer(&r.joint_buf_pool[0].0, 0, bytemuck::cast_slice(&joint_array));
 
-                let arch_scale = archetype_scale(archetype);
-                let dominant_mesh_scale = arch_scale * model.node_scale;
-                let lift_basis = match r.anim_states.get(&0) {
-                    Some(state) if !model.skin.clips.is_empty() =>
-                        -model.skin.lowest_skinned_z(state.clip_idx, state.time),
-                    _ => -model.skin.bind_lowest_skinned_z(),
-                };
+                let target = crate::models::archetype_target_height(archetype);
+                let height = if model.true_height > 0.001 { model.true_height } else { 1.0 };
+                let dominant_mesh_scale = (target / height) * model.node_scale;
+                // Constant bind-pose grounding: lift by the bind feet height so the body
+                // stays at a fixed height and the animation's foot motion is visible.
+                // (Per-frame lowest_skinned_z forced the lowest point to the ground every
+                // frame, bobbing the whole body up when both feet lift during a walk.)
+                let lift_basis = -model.skin.bind_lowest_skinned_z();
                 let visual_scale = 2.0 * lift_basis * dominant_mesh_scale;
-                let center_xz = [model.x_center, model.z_center];
+                let center_xz = [model.x_center, model.z_center]; // recenter from measured posed bounds
 
                 for (i, mesh) in model.meshes.iter().enumerate() {
                     if i >= PLAYER_UNIFORM_SLOTS { break; }
@@ -197,9 +228,16 @@ pub fn encode_player_pass(
                         scene.player_pos, scene.player_heading, visual_scale,
                         dominant_mesh_scale, center_xz, true, 0.0,
                     );
+                    let tint = match model.equip_slots[i] {
+                        Some(ref es) if scene.player_equipment_tint[es.slot] != [0, 0, 0] => {
+                            let t = scene.player_equipment_tint[es.slot];
+                            [t[0] as f32 / 255.0, t[1] as f32 / 255.0, t[2] as f32 / 255.0, 1.0]
+                        }
+                        _ => mesh.base_color,
+                    };
                     r.queue.write_buffer(
                         &r.entity_uniform_pool[i].0, 0,
-                        bytemuck::bytes_of(&EntityUniform { model: mat, tint: mesh.base_color }),
+                        bytemuck::bytes_of(&EntityUniform { model: mat, tint }),
                     );
                 }
 
@@ -222,19 +260,12 @@ pub fn encode_player_pass(
                 pass.set_bind_group(0, &r.camera_uniform.bind_group, &[]);
                 pass.set_bind_group(1, &r.fallback_texture_bg, &[]);
                 pass.set_bind_group(3, &r.joint_buf_pool[0].1, &[]);
-                let mut cur_tex: Option<usize> = None;
                 for (i, mesh) in model.meshes.iter().enumerate() {
                     if i >= PLAYER_UNIFORM_SLOTS { break; }
                     pass.set_bind_group(2, &r.entity_uniform_pool[i].1, &[]);
-                    if mesh.texture_idx != cur_tex {
-                        cur_tex = mesh.texture_idx;
-                        let bg = match cur_tex {
-                            Some(idx) if idx < model.texture_bind_groups.len() =>
-                                &model.texture_bind_groups[idx],
-                            _ => &r.fallback_texture_bg,
-                        };
-                        pass.set_bind_group(1, bg, &[]);
-                    }
+                    let bg = resolve_equip_tex(r, &model.texture_bind_groups, mesh.texture_idx,
+                        &model.prefix, model.equip_slots[i].clone(), &scene.player_equipment);
+                    pass.set_bind_group(1, bg, &[]);
                     pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                     pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..mesh.index_count, 0, 0..1);
@@ -250,9 +281,16 @@ pub fn encode_player_pass(
                 );
                 for (i, mesh) in model.meshes.iter().enumerate() {
                     if i >= PLAYER_UNIFORM_SLOTS { break; }
+                    let tint = match model.equip_slots[i] {
+                        Some(ref es) if scene.player_equipment_tint[es.slot] != [0, 0, 0] => {
+                            let t = scene.player_equipment_tint[es.slot];
+                            [t[0] as f32 / 255.0, t[1] as f32 / 255.0, t[2] as f32 / 255.0, 1.0]
+                        }
+                        _ => mesh.base_color,
+                    };
                     r.queue.write_buffer(
                         &r.entity_uniform_pool[i].0, 0,
-                        bytemuck::bytes_of(&EntityUniform { model: mat, tint: mesh.base_color }),
+                        bytemuck::bytes_of(&EntityUniform { model: mat, tint }),
                     );
                 }
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -273,19 +311,12 @@ pub fn encode_player_pass(
                 pass.set_pipeline(&r.pipelines.character);
                 pass.set_bind_group(0, &r.camera_uniform.bind_group, &[]);
                 pass.set_bind_group(1, &r.fallback_texture_bg, &[]);
-                let mut cur_tex: Option<usize> = None;
                 for (i, mesh) in model.meshes.iter().enumerate() {
                     if i >= PLAYER_UNIFORM_SLOTS { break; }
                     pass.set_bind_group(2, &r.entity_uniform_pool[i].1, &[]);
-                    if mesh.texture_idx != cur_tex {
-                        cur_tex = mesh.texture_idx;
-                        let bg = match cur_tex {
-                            Some(idx) if idx < model.texture_bind_groups.len() =>
-                                &model.texture_bind_groups[idx],
-                            _ => &r.fallback_texture_bg,
-                        };
-                        pass.set_bind_group(1, bg, &[]);
-                    }
+                    let bg = resolve_equip_tex(r, &model.texture_bind_groups, mesh.texture_idx,
+                        &model.prefix, model.equip_slots[i].clone(), &scene.player_equipment);
+                    pass.set_bind_group(1, bg, &[]);
                     pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                     pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..mesh.index_count, 0, 0..1);
@@ -416,7 +447,7 @@ pub fn encode_entity_pass(
     use crate::models::{race_to_archetype, archetype_scale};
     use crate::gpu::GpuModel;
 
-    struct DrawCmd { archetype: &'static str, mesh_idx: usize, uniform_slot: usize }
+    struct DrawCmd { archetype: &'static str, mesh_idx: usize, uniform_slot: usize, equipment: [u32; 9], gender: u8 }
 
     let mut draws: Vec<DrawCmd> = Vec::new();
     let pool_half = r.entity_uniform_pool.len() / 2;
@@ -429,7 +460,7 @@ pub fn encode_entity_pass(
     for b in &scene.billboards {
         if b.level == 0 { continue; }
         let archetype = race_to_archetype(&b.race);
-        let Some(GpuModel::Static(model)) = r.gpu_character_models.get(archetype) else { skipped += 1; continue };
+        let Some(GpuModel::Static(model)) = r.model_for(archetype, b.gender) else { skipped += 1; continue };
         rendered += 1;
         let arch_scale   = archetype_scale(archetype);
         let visual_scale = 2.0 * model.y_extent * arch_scale;
@@ -443,14 +474,23 @@ pub fn encode_entity_pass(
             [model.x_center, model.z_center], true, model.y_bottom);
         for (mesh_idx, mesh) in model.meshes.iter().enumerate() {
             if slot >= slot_end { break; }
+            let slot_meta = model.equip_slots[mesh_idx];
             let tint: [f32; 4] = if b.dead { [0.5, 0.5, 0.5, 1.0] }
                                  else if b.is_target { [1.0, 0.3, 0.3, 1.0] }
-                                 else { mesh.base_color };
+                                 else {
+                                     match slot_meta {
+                                         Some(es) if b.equipment_tint[es.slot] != [0, 0, 0] => {
+                                             let t = b.equipment_tint[es.slot];
+                                             [t[0] as f32 / 255.0, t[1] as f32 / 255.0, t[2] as f32 / 255.0, 1.0]
+                                         }
+                                         _ => mesh.base_color,
+                                     }
+                                 };
             r.queue.write_buffer(
                 &r.entity_uniform_pool[slot].0, 0,
                 bytemuck::bytes_of(&crate::gpu::EntityUniform { model: mat, tint }),
             );
-            draws.push(DrawCmd { archetype, mesh_idx, uniform_slot: slot });
+            draws.push(DrawCmd { archetype, mesh_idx, uniform_slot: slot, equipment: b.equipment, gender: b.gender });
             slot += 1;
         }
         if slot >= slot_end { break; }
@@ -475,19 +515,13 @@ pub fn encode_entity_pass(
     pass.set_bind_group(0, &r.camera_uniform.bind_group, &[]);
     pass.set_bind_group(1, &r.fallback_texture_bg, &[]);
 
-    let mut cur_tex: Option<usize> = None;
     for draw in &draws {
-        let Some(GpuModel::Static(model)) = r.gpu_character_models.get(draw.archetype) else { continue };
+        let Some(GpuModel::Static(model)) = r.model_for(draw.archetype, draw.gender) else { continue };
         let mesh = &model.meshes[draw.mesh_idx];
         pass.set_bind_group(2, &r.entity_uniform_pool[draw.uniform_slot].1, &[]);
-        if mesh.texture_idx != cur_tex {
-            cur_tex = mesh.texture_idx;
-            let bg = match cur_tex {
-                Some(idx) if idx < model.texture_bind_groups.len() => &model.texture_bind_groups[idx],
-                _ => &r.fallback_texture_bg,
-            };
-            pass.set_bind_group(1, bg, &[]);
-        }
+        let bg = resolve_equip_tex(r, &model.texture_bind_groups, mesh.texture_idx,
+            &model.prefix, model.equip_slots[draw.mesh_idx], &draw.equipment);
+        pass.set_bind_group(1, bg, &[]);
         pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
         pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..mesh.index_count, 0, 0..1);
@@ -505,10 +539,10 @@ pub fn encode_skinned_entity_pass(
     _cam_pos: [f32; 3],
 ) {
     use crate::renderer::PLAYER_UNIFORM_SLOTS;
-    use crate::models::{race_to_archetype, archetype_scale};
+    use crate::models::race_to_archetype;
     use crate::gpu::{EntityUniform, GpuModel};
 
-    struct DrawCmd { archetype: &'static str, mesh_idx: usize, uniform_slot: usize, joint_slot: usize }
+    struct DrawCmd { archetype: &'static str, mesh_idx: usize, uniform_slot: usize, joint_slot: usize, equipment: [u32; 9], gender: u8 }
 
     let mut draws: Vec<DrawCmd> = Vec::new();
     let pool_half    = r.entity_uniform_pool.len() / 2;
@@ -521,7 +555,7 @@ pub fn encode_skinned_entity_pass(
     for b in &scene.billboards {
         if b.level == 0 { continue; }
         let archetype = race_to_archetype(&b.race);
-        let Some(GpuModel::Skinned(model)) = r.gpu_character_models.get(archetype) else { continue };
+        let Some(GpuModel::Skinned(model)) = r.model_for(archetype, b.gender) else { continue };
         if j_slot >= r.joint_buf_pool.len() { break; }
 
         let matrices: Vec<[[f32;4];4]> = if b.action == "dead" {
@@ -537,33 +571,37 @@ pub fn encode_skinned_entity_pass(
         for (i, m) in matrices.iter().enumerate().take(128) { joint_array[i] = *m; }
         r.queue.write_buffer(&r.joint_buf_pool[j_slot].0, 0, bytemuck::cast_slice(&joint_array));
 
-        let arch_scale        = archetype_scale(archetype);
-        let dominant_scale    = arch_scale * model.node_scale;
-        let lift_basis = if b.action != "dead" {
-            match r.anim_states.get(&b.id) {
-                Some(state) if !model.skin.clips.is_empty() =>
-                    -model.skin.lowest_skinned_z(state.clip_idx, state.time),
-                _ => -model.skin.bind_lowest_skinned_z(),
-            }
-        } else {
-            -model.skin.bind_lowest_skinned_z()
-        };
+        let target = crate::models::archetype_target_height(archetype);
+        let height = if model.true_height > 0.001 { model.true_height } else { 1.0 };
+        let dominant_scale    = (target / height) * model.node_scale;
+        // Constant bind-pose grounding (see encode_player_pass): fixed body height,
+        // visible foot motion, no per-frame walk bob.
+        let lift_basis = -model.skin.bind_lowest_skinned_z();
         let visual_scale = 2.0 * lift_basis * dominant_scale;
 
         for (mesh_idx, mesh) in model.meshes.iter().enumerate() {
             if u_slot >= r.entity_uniform_pool.len() { break; }
             let mat = crate::camera::entity_model_matrix_heading(
                 b.pos, b.heading, visual_scale, dominant_scale,
-                [model.x_center, model.z_center], true, 0.0,
+                [model.x_center, model.z_center], true, 0.0, // recenter from measured posed bounds
             );
+            let slot_meta = model.equip_slots[mesh_idx];
             let tint: [f32; 4] = if b.dead { [0.5, 0.5, 0.5, 1.0] }
                                  else if b.is_target { [1.0, 0.3, 0.3, 1.0] }
-                                 else { mesh.base_color };
+                                 else {
+                                     match slot_meta {
+                                         Some(es) if b.equipment_tint[es.slot] != [0, 0, 0] => {
+                                             let t = b.equipment_tint[es.slot];
+                                             [t[0] as f32 / 255.0, t[1] as f32 / 255.0, t[2] as f32 / 255.0, 1.0]
+                                         }
+                                         _ => mesh.base_color,
+                                     }
+                                 };
             r.queue.write_buffer(
                 &r.entity_uniform_pool[u_slot].0, 0,
                 bytemuck::bytes_of(&EntityUniform { model: mat, tint }),
             );
-            draws.push(DrawCmd { archetype, mesh_idx, uniform_slot: u_slot, joint_slot: j_slot });
+            draws.push(DrawCmd { archetype, mesh_idx, uniform_slot: u_slot, joint_slot: j_slot, equipment: b.equipment, gender: b.gender });
             u_slot += 1;
         }
         j_slot += 1;
@@ -588,23 +626,17 @@ pub fn encode_skinned_entity_pass(
     pass.set_bind_group(1, &r.fallback_texture_bg, &[]);
 
     let mut cur_joint = usize::MAX;
-    let mut cur_tex: Option<usize> = None;
     for draw in &draws {
-        let Some(GpuModel::Skinned(model)) = r.gpu_character_models.get(draw.archetype) else { continue };
+        let Some(GpuModel::Skinned(model)) = r.model_for(draw.archetype, draw.gender) else { continue };
         let mesh = &model.meshes[draw.mesh_idx];
         if draw.joint_slot != cur_joint {
             pass.set_bind_group(3, &r.joint_buf_pool[draw.joint_slot].1, &[]);
             cur_joint = draw.joint_slot;
         }
         pass.set_bind_group(2, &r.entity_uniform_pool[draw.uniform_slot].1, &[]);
-        if mesh.texture_idx != cur_tex {
-            cur_tex = mesh.texture_idx;
-            let bg = match cur_tex {
-                Some(idx) if idx < model.texture_bind_groups.len() => &model.texture_bind_groups[idx],
-                _ => &r.fallback_texture_bg,
-            };
-            pass.set_bind_group(1, bg, &[]);
-        }
+        let bg = resolve_equip_tex(r, &model.texture_bind_groups, mesh.texture_idx,
+            &model.prefix, model.equip_slots[draw.mesh_idx], &draw.equipment);
+        pass.set_bind_group(1, bg, &[]);
         pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
         pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..mesh.index_count, 0, 0..1);

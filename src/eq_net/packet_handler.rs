@@ -45,6 +45,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_DAMAGE               => apply_combat_damage(gs, p),
         OP_BECOME_CORPSE        => apply_become_corpse(gs, p),
         OP_MONEY_ON_CORPSE      => apply_money_on_corpse(gs, p),
+        OP_WEAR_CHANGE          => apply_wear_change(gs, p),
         _                       => {}
     }
 }
@@ -99,6 +100,7 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         e.y = upd.y;
         e.z = upd.z;
         e.heading = upd.heading;
+        e.animation = upd.animation;
         eprintln!("EQ: npc_pos id={} name={} pos=({:.1},{:.1},{:.1})", sid, e.name, e.x, e.y, e.z);
     } else {
         eprintln!("EQ: npc_pos id={} NOT IN ENTITY MAP (known: {})", sid, gs.entities.len());
@@ -209,6 +211,19 @@ fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
         }
         gs.coin = p.coin;
         gs.stats = p.stats;
+    }
+
+    const ITEM_MATERIAL_OFF: usize = 188;
+    const ITEM_TINT_OFF: usize = 268;
+    if payload.len() >= ITEM_TINT_OFF + 9 * 4 {
+        for i in 0..9 {
+            let mo = ITEM_MATERIAL_OFF + i * 4;
+            gs.player_equipment[i] =
+                u32::from_le_bytes(payload[mo..mo + 4].try_into().unwrap());
+            let to = ITEM_TINT_OFF + i * 4;
+            // wire order B, G, R, UseTint → store RGB
+            gs.player_equipment_tint[i] = [payload[to + 2], payload[to + 1], payload[to]];
+        }
     }
 }
 
@@ -481,6 +496,29 @@ fn apply_become_corpse(gs: &mut GameState, payload: &[u8]) {
     gs.log_msg("combat", "Mob left a corpse — auto-looting...");
 }
 
+/// Apply a WearChange: update one equipment slot's material + tint on an entity.
+pub fn apply_wear_change(gs: &mut GameState, p: &[u8]) {
+    use crate::eq_net::protocol::{WearChange_S, SIZE_WEAR_CHANGE, safe_read};
+    if p.len() < SIZE_WEAR_CHANGE { return; }
+    let wc: WearChange_S = unsafe { safe_read(p) };
+    let slot = wc.wear_slot_id as usize;
+    if slot >= 9 { return; }
+    let spawn_id = wc.spawn_id as u32;
+    let material = wc.material as u32;
+    let color = wc.color; // [B, G, R, UseTint]
+    let tint = [color[2], color[1], color[0]]; // store RGB
+    // The local player is registered separately (not in `entities`), so a WearChange
+    // for the player's own spawn_id must update the player fields, or live equip/unequip
+    // (e.g. GM #gearup) never shows on the player until a re-zone re-parses the profile.
+    if spawn_id == gs.player_id {
+        gs.player_equipment[slot] = material;
+        gs.player_equipment_tint[slot] = tint;
+    } else if let Some(e) = gs.entities.get_mut(&spawn_id) {
+        e.equipment[slot] = material;
+        e.equipment_tint[slot] = tint;
+    }
+}
+
 fn apply_money_on_corpse(gs: &mut GameState, payload: &[u8]) {
     // MoneyOnCorpse_Struct: response(u8) + 3×pad + platinum(u32) + gold(u32) + silver(u32) + copper(u32)
     if payload.len() < 20 { return; }
@@ -527,11 +565,19 @@ pub fn register_spawn(gs: &mut GameState, spawn: Spawn_S) {
         gs.player_heading = heading;
         gs.player_level   = spawn.level as u32;
         gs.player_race    = eq_race_to_code(spawn.race).to_string();
+        gs.player_gender  = spawn.gender;
         let sid = spawn.spawnId;
         eprintln!("EQ: player spawn id={} pos=({:.1},{:.1},{:.1})", sid, x, y, z);
         return;
     }
 
+    let equipment: [u32; 9] = std::array::from_fn(|i| {
+        u32::from_le_bytes(spawn.equipment[i*4..i*4+4].try_into().unwrap())
+    });
+    let equipment_tint: [[u8; 3]; 9] = std::array::from_fn(|i| {
+        // Tint_Struct wire order is Blue, Green, Red; store as RGB (matches WearChange + profile).
+        [spawn.equipment_tint[i*4+2], spawn.equipment_tint[i*4+1], spawn.equipment_tint[i*4]]
+    });
     gs.upsert_entity(Entity {
         spawn_id: spawn.spawnId,
         name,
@@ -546,6 +592,12 @@ pub fn register_spawn(gs: &mut GameState, spawn: Spawn_S) {
         race:     eq_race_to_code(spawn.race).to_string(),
         heading,
         dead:     false,
+        equipment,
+        equipment_tint,
+        gender: spawn.gender,
+        helm: spawn.helm,
+        showhelm: spawn.showhelm,
+        animation: spawn.StandState as u32,
     });
 }
 
@@ -714,6 +766,47 @@ mod tests {
         assert!(gs.messages.is_empty(), "empty message should produce no log entry");
     }
 
+    #[test]
+    fn apply_wear_change_updates_one_slot() {
+        use super::{register_spawn, apply_wear_change};
+        use crate::eq_net::protocol::Spawn_S;
+        let mut gs = GameState::new();
+        gs.player_name = "Nobody".into();
+        let mut spawn: Spawn_S = unsafe { std::mem::zeroed() };
+        spawn.spawnId = 42; spawn.NPC = 1; spawn.level = 5;
+        spawn.name[0] = b'a';
+        register_spawn(&mut gs, spawn);
+
+        // spawn_id=42, material=17, color B,G,R=(1,2,3),UseTint=0xFF, wear_slot_id=1 (chest)
+        let pkt = [42u8, 0, 17, 0, 1, 2, 3, 0xFF, 1];
+        apply_wear_change(&mut gs, &pkt);
+
+        let e = gs.entities.get(&42).unwrap();
+        assert_eq!(e.equipment[1], 17);
+        assert_eq!(e.equipment_tint[1], [3, 2, 1]); // stored RGB
+        assert_eq!(e.equipment[0], 0, "other slots untouched");
+    }
+
+    #[test]
+    fn apply_wear_change_ignores_short_packet() {
+        use super::apply_wear_change;
+        let mut gs = GameState::new();
+        apply_wear_change(&mut gs, &[1, 2, 3]); // shorter than SIZE_WEAR_CHANGE; must not panic
+    }
+
+    #[test]
+    fn apply_wear_change_updates_player_when_spawn_is_player() {
+        use super::apply_wear_change;
+        let mut gs = GameState::new();
+        gs.player_id = 7; // local player's spawn id
+        // spawn_id=7 (player), material=17, color B,G,R=(1,2,3), wear_slot_id=1 (chest)
+        let pkt = [7u8, 0, 17, 0, 1, 2, 3, 0xFF, 1];
+        apply_wear_change(&mut gs, &pkt);
+        assert_eq!(gs.player_equipment[1], 17);
+        assert_eq!(gs.player_equipment_tint[1], [3, 2, 1]); // stored RGB
+        assert!(gs.entities.is_empty(), "player must not be added to entities");
+    }
+
     // --- decode/encode position round-trip: NPC-relevant edge cases ---
 
     #[test]
@@ -736,5 +829,44 @@ mod tests {
         assert_eq!(d.spawn_id, 7);
         assert!((d.x - (-250.0)).abs() < 0.2);
         assert!((d.y - 80.0).abs() < 0.2);
+    }
+
+    #[test]
+    fn player_profile_parses_equipment() {
+        use super::apply_player_profile;
+        let mut gs = GameState::new();
+        let mut buf = vec![0u8; 5000];
+        // item_material[1] (chest) = 17 at offset 188 + 1*4 = 192
+        buf[192..196].copy_from_slice(&17u32.to_le_bytes());
+        // item_tint[1] RGB at offset 268 + 1*4 = 272 (wire B,G,R,UseTint)
+        buf[272] = 3; buf[273] = 2; buf[274] = 1; buf[275] = 0xFF;
+        apply_player_profile(&mut gs, &buf);
+        assert_eq!(gs.player_equipment[1], 17);
+        assert_eq!(gs.player_equipment_tint[1], [1, 2, 3]); // stored RGB
+    }
+
+    #[test]
+    fn register_spawn_parses_equipment_le() {
+        use crate::eq_net::protocol::Spawn_S;
+        use super::register_spawn;
+        let mut gs = GameState::new();
+        gs.player_name = "Someone Else".into();
+        let mut spawn: Spawn_S = unsafe { std::mem::zeroed() };
+        spawn.spawnId = 7;
+        spawn.NPC = 1;
+        spawn.level = 10;
+        spawn.name[0] = b'O'; spawn.name[1] = b'r'; spawn.name[2] = b'c';
+        // slot 1 (chest) material id = 17 (LE u32 at byte offset 4)
+        spawn.equipment[4] = 17;
+        // slot 1 wire bytes are BGR: Blue=10, Green=20, Red=30 at byte offset 4
+        spawn.equipment_tint[4] = 10;
+        spawn.equipment_tint[5] = 20;
+        spawn.equipment_tint[6] = 30;
+        spawn.gender = 1;
+        register_spawn(&mut gs, spawn);
+        let e = gs.entities.get(&7).expect("entity registered");
+        assert_eq!(e.equipment[1], 17);
+        assert_eq!(e.equipment_tint[1], [30, 20, 10]); // wire BGR [10,20,30] → stored RGB
+        assert_eq!(e.gender, 1);
     }
 }

@@ -16,8 +16,11 @@ pub struct EntityAnimState {
 
 /// Pre-allocated entity uniform buffer slot count.
 /// Layout: [0..PLAYER_UNIFORM_SLOTS) = player, [PLAYER_UNIFORM_SLOTS..) = entities.
-pub const PLAYER_UNIFORM_SLOTS: usize = 16;
-pub const TOTAL_ENTITY_UNIFORM_SLOTS: usize = 4112; // 16 player + 4096 entity mesh draws
+// Character GLB models have up to 27 primitives (humanoid). The player draws one
+// uniform slot per mesh, so this MUST be >= the max mesh count or the player loses
+// its later primitives (head pieces + feet were dropped at the old value of 16).
+pub const PLAYER_UNIFORM_SLOTS: usize = 32;
+pub const TOTAL_ENTITY_UNIFORM_SLOTS: usize = 4128; // 32 player + 4096 entity mesh draws
 /// Pre-allocated joint buffer pool size. Slot 0 = player, 1..N = entities.
 pub const JOINT_BUF_SLOTS: usize = 512;
 /// Size of one joint buffer: 128 joints × mat4(64 bytes).
@@ -35,7 +38,9 @@ pub struct EqRenderer {
     pub texture_names:       Vec<String>,
     pub texture_bind_groups: Vec<wgpu::BindGroup>,
     pub fallback_texture_bg: wgpu::BindGroup,
-    pub gpu_character_models: std::collections::HashMap<&'static str, crate::gpu::GpuModel>,
+    /// Character models keyed by (archetype, gender) — gender 0 = male, 1 = female.
+    /// Female variants are loaded from `<archetype>_f.glb` when present.
+    pub gpu_character_models: std::collections::HashMap<(&'static str, u8), crate::gpu::GpuModel>,
     pub anim_states:         std::collections::HashMap<u32, EntityAnimState>,
     pub last_view_proj:      [[f32; 4]; 4],
     pub last_cam_pos:        [f32; 3],
@@ -46,6 +51,11 @@ pub struct EqRenderer {
     pub entity_uniform_pool: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
     /// Pre-allocated joint matrix buffers (reused every frame via write_buffer).
     pub joint_buf_pool:      Vec<(wgpu::Buffer, wgpu::BindGroup)>,
+    /// Lowercase armor texture filename → S3D archive containing it (built at startup).
+    pub equip_index: std::collections::HashMap<String, std::path::PathBuf>,
+    /// Cache of uploaded armor texture bind groups keyed by base name (no extension).
+    /// `None` = known-missing (negative cache) so we don't rescan every frame.
+    pub equipment_tex_cache: std::collections::HashMap<String, Option<wgpu::BindGroup>>,
 }
 
 impl EqRenderer {
@@ -127,6 +137,8 @@ impl EqRenderer {
             zone_assets: None,
             entity_uniform_pool,
             joint_buf_pool,
+            equip_index: std::collections::HashMap::new(),
+            equipment_tex_cache: std::collections::HashMap::new(),
         }
     }
 
@@ -262,8 +274,20 @@ impl EqRenderer {
                     }
                 }
             };
-            eprintln!("renderer: loaded '{}' — y_bottom={:.4} y_extent={:.4} x_center={:.4} z_center={:.4}",
-                key, asset.y_bottom, asset.y_extent, asset.x_center, asset.z_center);
+
+            // Build the male model (gender 0) plus a female variant (gender 1) from
+            // `<archetype>_f.glb` when present. Each is stored under (archetype, gender).
+            let mut variants: Vec<(u8, ModelAsset)> = vec![(0, asset)];
+            let female_path = models_dir.join(format!("{}_f.glb", key));
+            if female_path.exists() {
+                match ModelAsset::load(&female_path) {
+                    Ok(fa) => variants.push((1, fa)),
+                    Err(e) => eprintln!("renderer: female glTF load failed for '{}': {}", key, e),
+                }
+            }
+            for (gender, asset) in variants {
+            eprintln!("renderer: loaded '{}' (gender {}) — y_bottom={:.4} y_extent={:.4} x_center={:.4} z_center={:.4}",
+                key, gender, asset.y_bottom, asset.y_extent, asset.x_center, asset.z_center);
 
             let (_, tex_bgs) = upload_textures(
                 &self.device, &self.queue, &asset.textures, &self.layouts.texture_bgl,
@@ -276,10 +300,11 @@ impl EqRenderer {
 
             let model = if use_skinned {
                 let skin = asset.skin.unwrap();
-                let meshes: Vec<GpuSkinnedMesh> = asset.meshes.iter()
+                let (meshes, skinned_slots): (Vec<GpuSkinnedMesh>, Vec<Option<crate::models::EquipSlot>>) = asset.meshes.iter()
                     .zip(asset.skin_meshes.iter())
                     .zip(asset.skinned_mesh_scales.iter())
-                    .filter_map(|((mesh, sd_opt), &mesh_node_scale)| {
+                    .zip(asset.equip_slots.iter())
+                    .filter_map(|(((mesh, sd_opt), &mesh_node_scale), &slot)| {
                         if mesh.positions.is_empty() || mesh.indices.is_empty() {
                             return None;
                         }
@@ -307,17 +332,19 @@ impl EqRenderer {
                         });
                         let texture_idx = mesh.texture_name.as_ref()
                             .and_then(|n| tex_names.iter().position(|t| t == n));
-                        Some(GpuSkinnedMesh { vertex_buf: vbuf, index_buf: ibuf,
+                        Some((GpuSkinnedMesh { vertex_buf: vbuf, index_buf: ibuf,
                                                index_count: mesh.indices.len() as u32,
                                                texture_idx, base_color: mesh.base_color,
-                                               mesh_node_scale })
+                                               mesh_node_scale }, slot))
                     })
-                    .collect();
+                    .unzip();
                 eprintln!("renderer: loaded skinned model '{}' ({} joints, {} clips)",
                           key, skin.joint_count, skin.clips.len());
-                GpuModel::Skinned(GpuSkinnedModel { meshes, texture_bind_groups: tex_bgs, skin, node_scale: asset.skinned_node_scale, y_bottom: asset.y_bottom, x_center: asset.x_center, z_center: asset.z_center })
+                GpuModel::Skinned(GpuSkinnedModel { meshes, texture_bind_groups: tex_bgs, skin, node_scale: asset.skinned_node_scale, y_bottom: asset.y_bottom, x_center: asset.x_center, z_center: asset.z_center, prefix: asset.prefix.clone(), equip_slots: skinned_slots, true_height: asset.true_height })
             } else {
-                let meshes: Vec<GpuMesh> = asset.meshes.iter().filter_map(|mesh| {
+                let (meshes, static_slots): (Vec<GpuMesh>, Vec<Option<crate::models::EquipSlot>>) = asset.meshes.iter()
+                    .zip(asset.equip_slots.iter())
+                    .filter_map(|(mesh, &slot)| {
                     if mesh.positions.is_empty() || mesh.indices.is_empty() { return None; }
                     let vertices: Vec<Vertex> = mesh.positions.iter().enumerate()
                         .map(|(i, &p)| {
@@ -335,15 +362,111 @@ impl EqRenderer {
                     });
                     let texture_idx = mesh.texture_name.as_ref()
                         .and_then(|n| tex_names.iter().position(|t| t == n));
-                    Some(GpuMesh { vertex_buf: vbuf, index_buf: ibuf,
+                    Some((GpuMesh { vertex_buf: vbuf, index_buf: ibuf,
                                    index_count: mesh.indices.len() as u32, texture_idx,
-                                   base_color: mesh.base_color })
-                }).collect();
+                                   base_color: mesh.base_color }, slot))
+                }).unzip();
                 eprintln!("renderer: loaded static model '{}'", key);
-                GpuModel::Static(GpuStaticModel { meshes, texture_bind_groups: tex_bgs, y_bottom: asset.y_bottom, y_extent: asset.y_extent, x_center: asset.x_center, z_center: asset.z_center })
+                GpuModel::Static(GpuStaticModel { meshes, texture_bind_groups: tex_bgs, y_bottom: asset.y_bottom, y_extent: asset.y_extent, x_center: asset.x_center, z_center: asset.z_center, prefix: asset.prefix.clone(), equip_slots: static_slots, true_height: asset.true_height })
             };
 
-            self.gpu_character_models.insert(key, model);
+            self.gpu_character_models.insert((key, gender), model);
+            } // gender variants
+        }
+
+        // Index armor textures: shared velious sets (global17-23_amr) + each
+        // archetype's chr/chr2 archives (lower material numbers). No decoding here.
+        for n in 17..=23 {
+            crate::assets::index_s3d_textures(
+                &assets_path.join(format!("global{}_amr.s3d", n)), &mut self.equip_index);
+        }
+        for &key in ARCHETYPES {
+            if let Some(name) = crate::models::archetype_to_chr_s3d(key) {
+                crate::assets::index_s3d_textures(&assets_path.join(name), &mut self.equip_index);
+                // also the _chr2 companion if present
+                let chr2 = name.replace("_chr.s3d", "_chr2.s3d");
+                let chr2_path = assets_path.join(&chr2);
+                if chr2_path.exists() {
+                    crate::assets::index_s3d_textures(&chr2_path, &mut self.equip_index);
+                }
+            }
+        }
+        eprintln!("equip: indexed {} armor textures", self.equip_index.len());
+    }
+
+    /// Select a loaded character model for an archetype + gender, falling back to the
+    /// male (gender 0) variant when no female variant exists.
+    pub fn model_for(&self, archetype: &'static str, gender: u8) -> Option<&crate::gpu::GpuModel> {
+        self.gpu_character_models.get(&(archetype, gender))
+            .or_else(|| self.gpu_character_models.get(&(archetype, 0)))
+    }
+
+    /// Load + upload one armor texture (trying .bmp then .dds). Returns its bind group.
+    pub fn load_equip_texture(&self, base_name: &str) -> Option<wgpu::BindGroup> {
+        for ext in ["bmp", "dds"] {
+            let fname = format!("{}.{}", base_name, ext);
+            if let Some(arch) = self.equip_index.get(&fname) {
+                if let Some(tex) = crate::assets::load_one_texture_from_s3d(arch, &fname) {
+                    let (_gpu, mut bgs) = upload_textures(
+                        &self.device, &self.queue, &[tex], &self.layouts.texture_bgl);
+                    return bgs.pop();
+                }
+            }
+        }
+        None
+    }
+
+    /// Pre-pass (mutable): ensure every armor texture needed this frame is cached.
+    /// Runs before the immutable render passes so they only do lookups.
+    pub fn ensure_equipment_textures(&mut self, scene: &crate::scene::SceneState) {
+        use crate::models::{race_to_archetype, equip_texture_name};
+        use crate::gpu::GpuModel;
+
+        // Phase 1: collect needed base names (no mutation of the cache yet).
+        let mut needed: Vec<String> = Vec::new();
+        for b in &scene.billboards {
+            let archetype = race_to_archetype(&b.race);
+            let (prefix, slots) = match self.model_for(archetype, b.gender) {
+                Some(GpuModel::Static(m))  => (&m.prefix, &m.equip_slots),
+                Some(GpuModel::Skinned(m)) => (&m.prefix, &m.equip_slots),
+                None => continue,
+            };
+            if prefix.is_empty() { continue; }
+            for es in slots.iter().flatten() {
+                let material = b.equipment[es.slot];
+                if material == 0 { continue; } // naked → baked texture, no swap
+                let key = equip_texture_name(prefix, &es.region, material, es.variant);
+                if !self.equipment_tex_cache.contains_key(&key) {
+                    needed.push(key);
+                }
+            }
+        }
+        if !scene.player_race.is_empty() {
+            let archetype = crate::models::race_to_archetype(&scene.player_race);
+            if let Some(model) = self.model_for(archetype, scene.player_gender) {
+                let (prefix, slots) = match model {
+                    GpuModel::Static(m)  => (&m.prefix, &m.equip_slots),
+                    GpuModel::Skinned(m) => (&m.prefix, &m.equip_slots),
+                };
+                if !prefix.is_empty() {
+                    for es in slots.iter().flatten() {
+                        let material = scene.player_equipment[es.slot];
+                        if material == 0 { continue; } // naked → baked texture, no swap
+                        let key = equip_texture_name(prefix, &es.region, material, es.variant);
+                        if !self.equipment_tex_cache.contains_key(&key) {
+                            needed.push(key);
+                        }
+                    }
+                }
+            }
+        }
+        needed.sort();
+        needed.dedup();
+
+        // Phase 2: load + upload (or mark missing).
+        for key in needed {
+            let bg = self.load_equip_texture(&key);
+            self.equipment_tex_cache.insert(key, bg);
         }
     }
 
@@ -361,19 +484,23 @@ impl EqRenderer {
         use crate::gpu::GpuModel;
 
         // Animate NPCs and player (player uses reserved id=0)
-        let anim_targets: Vec<(u32, &str, &str)> = {
-            let mut v: Vec<(u32, &str, &str)> = scene.billboards.iter()
-                .map(|b| (b.id, b.race.as_str(), b.action.as_str()))
+        let anim_targets: Vec<(u32, &str, &str, u8)> = {
+            let mut v: Vec<(u32, &str, &str, u8)> = scene.billboards.iter()
+                .map(|b| (b.id, b.race.as_str(), b.action.as_str(), b.gender))
                 .collect();
             if !scene.player_race.is_empty() {
-                v.push((0, scene.player_race.as_str(), scene.player_action.as_str()));
+                v.push((0, scene.player_race.as_str(), scene.player_action.as_str(), scene.player_gender));
             }
             v
         };
 
-        for (id, race, action) in &anim_targets {
+        for (id, race, action, gender) in &anim_targets {
             let archetype = crate::models::race_to_archetype(race);
-            let Some(GpuModel::Skinned(skinned)) = self.gpu_character_models.get(archetype) else { continue };
+            // Direct field lookup (with female→male fallback) keeps the borrow disjoint
+            // from the `self.anim_states` mutation below; `model_for` would borrow all of self.
+            let model = self.gpu_character_models.get(&(archetype, *gender))
+                .or_else(|| self.gpu_character_models.get(&(archetype, 0)));
+            let Some(GpuModel::Skinned(skinned)) = model else { continue };
 
             let state = self.anim_states.entry(*id).or_insert_with(|| {
                 let clip_idx = skinned.skin.clip_for_action("walking").unwrap_or(0);
@@ -424,6 +551,8 @@ impl EqRenderer {
         let fwd   = (glam::Vec3::from(cam_target) - glam::Vec3::from(cam_eye)).normalize();
         let right = fwd.cross(glam::Vec3::Z).normalize();
         let up    = right.cross(fwd).normalize();
+
+        self.ensure_equipment_textures(scene);
 
         crate::pass::encode_sky_pass(self, encoder, view);
         crate::pass::encode_zone_pass(self, encoder, view, scene);

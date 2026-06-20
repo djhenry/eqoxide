@@ -13,6 +13,9 @@ pub struct Billboard {
     pub race:      String,
     pub action:    String,
     pub heading:   f32,
+    pub equipment: [u32; 9],
+    pub equipment_tint: [[u8; 3]; 9],
+    pub gender:    u8,
 }
 
 /// A single entry in the message log.
@@ -37,6 +40,7 @@ pub struct SceneState {
     pub player_level: u32,
     pub player_race: String,
     pub player_class: String,
+    pub player_gender: u8,
     pub coin: [u32; 4],
     pub stats: [u32; 7],
     pub player_action: String,
@@ -46,6 +50,10 @@ pub struct SceneState {
     pub strategy: String,
     pub billboards: Vec<Billboard>,
     pub messages: Vec<LogEntry>,
+    /// Item material IDs for each equipment slot (0..9), from the player profile.
+    pub player_equipment: [u32; 9],
+    /// RGB tint for each equipment slot (0..9), from the player profile.
+    pub player_equipment_tint: [[u8; 3]; 9],
 }
 
 impl SceneState {
@@ -103,6 +111,9 @@ impl SceneState {
                 race:      race.to_string(),
                 action:    "idle".to_string(),
                 heading:   0.0,
+                equipment:      [0; 9],
+                equipment_tint: [[0; 3]; 9],
+                gender:    0,
             });
         }
 
@@ -112,17 +123,35 @@ impl SceneState {
 
     /// Build SceneState from a live GameState snapshot.
     pub fn from_game_state(gs: &GameState) -> Self {
-        let billboards = gs.entities.values().map(|e| Billboard {
-            id:        e.spawn_id,
-            pos:       [e.x, e.y, e.z], // world = EQ [east=server_x, north=server_y, up=server_z]
-            level:     e.level,
-            hp_pct:    e.hp_pct,
-            is_target: gs.target_id == Some(e.spawn_id),
-            dead:      e.dead,
-            name:      e.name.clone(),
-            race:      e.race.clone(),
-            action:    String::new(),
-            heading:   e.heading,
+        let billboards = gs.entities.values().map(|e| {
+            // Map EQ Animation:: values to action strings for clip resolution.
+            // Animation constants from eq_constants.h: Standing=100, Freeze=102,
+            // Looting=105, Sitting=110, Crouching=111, Lying=115.
+            let action = match e.animation {
+                100 => "idle",       // Animation::Standing
+                102 => "idle",       // Animation::Freeze
+                110 => "sitting",    // Animation::Sitting
+                111 => "crouching",  // Animation::Crouching
+                105 => "idle",       // Animation::Looting (treat as idle)
+                115 => "dead",       // Animation::Lying
+                0   => "idle",       // default / standing
+                _   => "idle",       // safe default
+            };
+            Billboard {
+                id:        e.spawn_id,
+                pos:       [e.x, e.y, e.z],
+                level:     e.level,
+                hp_pct:    e.hp_pct,
+                is_target: gs.target_id == Some(e.spawn_id),
+                dead:      e.dead,
+                name:      e.name.clone(),
+                race:      e.race.clone(),
+                action:    action.to_string(),
+                heading:   e.heading,
+                equipment:      e.equipment,
+                equipment_tint: e.equipment_tint,
+                gender:    e.gender,
+            }
         }).collect();
 
         let messages = gs.messages.iter().map(|m| LogEntry {
@@ -145,6 +174,7 @@ impl SceneState {
             player_level: gs.player_level,
             player_race: gs.player_race.clone(),
             player_class: gs.player_class.clone(),
+            player_gender: gs.player_gender,
             coin: gs.coin,
             stats: gs.stats,
             player_action: gs.player_action.clone(),
@@ -154,6 +184,8 @@ impl SceneState {
             strategy: gs.strategy.clone(),
             billboards,
             messages,
+            player_equipment: gs.player_equipment,
+            player_equipment_tint: gs.player_equipment_tint,
         }
     }
 }
@@ -205,6 +237,8 @@ mod tests {
             race: "GNL".into(),
             heading: 0.0,
             dead: false,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
+            animation: 0,
         });
 
         gs
@@ -287,6 +321,8 @@ mod tests {
             race: String::new(),
             heading: 0.0,
             dead: false,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
+            animation: 0,
         });
         let scene = SceneState::from_game_state(&gs);
         assert_eq!(scene.billboards.len(), 1);
@@ -323,6 +359,8 @@ mod tests {
             race: String::new(),
             heading: 0.0,
             dead: false,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
+            animation: 0,
         });
         gs.target_id = Some(42);
         let scene = SceneState::from_game_state(&gs);
@@ -333,6 +371,41 @@ mod tests {
                 assert!(!b.is_target, "id={} should not be targeted", b.id);
             }
         }
+    }
+
+    #[test]
+    fn from_game_state_propagates_equipment() {
+        let mut gs = GameState::new();
+        let mut e = Entity {
+            spawn_id: 5, name: "x".into(), level: 1, is_npc: true,
+            x: 0.0, y: 0.0, z: 0.0, hp_pct: 100.0, cur_hp: 1, max_hp: 1,
+            race: "HUM".into(), heading: 0.0, dead: false,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
+            animation: 0,
+        };
+        e.equipment[1] = 17;
+        e.equipment_tint[1] = [9, 8, 7];
+        gs.upsert_entity(e);
+        let scene = SceneState::from_game_state(&gs);
+        assert_eq!(scene.billboards[0].equipment[1], 17);
+        assert_eq!(scene.billboards[0].equipment_tint[1], [9, 8, 7]);
+    }
+
+    #[test]
+    fn from_game_state_propagates_gender() {
+        let mut gs = GameState::new();
+        gs.player_gender = 1; // female player
+        let e = Entity {
+            spawn_id: 5, name: "x".into(), level: 1, is_npc: true,
+            x: 0.0, y: 0.0, z: 0.0, hp_pct: 100.0, cur_hp: 1, max_hp: 1,
+            race: "HUM".into(), heading: 0.0, dead: false,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 1, helm: 0, showhelm: 0,
+            animation: 0,
+        };
+        gs.upsert_entity(e);
+        let scene = SceneState::from_game_state(&gs);
+        assert_eq!(scene.billboards[0].gender, 1, "entity gender propagates to billboard");
+        assert_eq!(scene.player_gender, 1, "player gender propagates to scene");
     }
 
     // --- Message count ---

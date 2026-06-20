@@ -197,6 +197,14 @@ impl SkinData {
                     && !n.contains("back") && !n.contains("left") && !n.contains("right")
                     && !n.contains("shoot")
             }),
+            "sitting" => self.clips.iter().position(|c| {
+                let n = c.name.to_lowercase();
+                n.contains("sit") && !n.contains("swim")
+            }),
+            "crouching" => self.clips.iter().position(|c| {
+                let n = c.name.to_lowercase();
+                n.contains("crouch")
+            }),
             // Idle/standing MUST be checked BEFORE the walking fallback — otherwise the
             // walk-first logic in the _ branch hijacks these actions.
             "idle" | "standing" | "wait" => {
@@ -233,16 +241,14 @@ impl SkinData {
     }
 
     pub fn bind_pose(&self) -> Vec<[[f32; 4]; 4]> {
-        // Identity skin matrices = no deformation = rest pose.
-        // (inv_bind is NOT the right value here; it's the inverse of the bind-pose
-        // world transform, not the skinning matrix for the bind pose.)
-        let id = [
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ];
-        vec![id; self.joint_count]
+        // Proper rest-pose skinning matrices (global_rest * inv_bind), NOT identity.
+        // Identity only reproduces the rest pose for models whose raw mesh is already
+        // posed; EQ-converted meshes are authored off-pose, so identity renders the raw
+        // un-posed mesh (off-center). Use the same matrices the bounds are measured from.
+        self.bind_skin_matrices()
+            .iter()
+            .map(|m| m.to_cols_array_2d())
+            .collect()
     }
 }
 

@@ -32,6 +32,14 @@ pub struct ModelAsset {
     /// offset by the model's origin-to-center distance.
     pub x_center:          f32,
     pub z_center:          f32,
+    /// Lowercase race+gender prefix from material names (e.g. "hom"). Empty if unknown.
+    pub prefix: String,
+    /// Per-mesh equipment slot binding, parallel to `meshes`. `None` = not an armor slot.
+    pub equip_slots: Vec<Option<EquipSlot>>,
+    /// True model height in EQ units, from the `eq_height` extras field written by the
+    /// converter into the glTF ROOT node. Falls back to `y_extent` (measured vertex bounds)
+    /// when the extras field is absent (e.g. chr.s3d static models).
+    pub true_height: f32,
 }
 
 impl ModelAsset {
@@ -68,6 +76,18 @@ impl ModelAsset {
         }
 
         let document = &gltf_doc.document;
+
+        // ── Read eq_height from the first node that carries it in extras ──────
+        // The converter writes this field into the ROOT node's extras so the loader
+        // can recover the true EQ-unit height without measuring raw vertex bounds.
+        let eq_height_from_extras: f32 = document.nodes()
+            .find_map(|n| {
+                let ex = n.extras().as_ref()?;
+                let v: serde_json::Value = serde_json::from_str(ex.get()).ok()?;
+                v.get("eq_height").and_then(|h| h.as_f64()).map(|h| h as f32)
+            })
+            .filter(|h| *h > 0.0)
+            .unwrap_or(0.0); // 0.0 = "use measured extent" sentinel; finalized below
 
         // ── Skin: joint hierarchy + inverse bind matrices ─────────────────────
         let skin_opt = document.skins().next();
@@ -202,6 +222,8 @@ impl ModelAsset {
         let mut meshes:             Vec<MeshData>               = Vec::new();
         let mut skin_meshes:        Vec<Option<SkinnedMeshData>> = Vec::new();
         let mut skinned_mesh_scales: Vec<f32>                   = Vec::new();
+        let mut equip_slots: Vec<Option<EquipSlot>> = Vec::new();
+        let mut model_prefix: String = String::new();
 
         for mesh in document.meshes() {
             let this_mesh_scale = if is_skinned {
@@ -271,6 +293,11 @@ impl ModelAsset {
                 });
                 skin_meshes.push(sd_opt);
                 skinned_mesh_scales.push(this_mesh_scale);
+                let parsed = primitive.material().name().and_then(parse_equip_material);
+                if model_prefix.is_empty() {
+                    if let Some((ref p, _)) = parsed { model_prefix = p.clone(); }
+                }
+                equip_slots.push(parsed.map(|(_, s)| s));
             }
         }
 
@@ -353,7 +380,10 @@ impl ModelAsset {
             else { ((x_min + x_max) * 0.5, (z_min + z_max) * 0.5) }
         };
 
-        Ok(ModelAsset { meshes, textures, skin: skin_data, skin_meshes, skinned_node_scale, skinned_mesh_scales, y_bottom, y_extent, x_center, z_center })
+        // Finalize true_height: prefer eq_height from extras; fall back to measured y_extent.
+        let true_height = if eq_height_from_extras > 0.0 { eq_height_from_extras } else { y_extent };
+
+        Ok(ModelAsset { meshes, textures, skin: skin_data, skin_meshes, skinned_node_scale, skinned_mesh_scales, y_bottom, y_extent, x_center, z_center, prefix: model_prefix, equip_slots, true_height })
     }
 
     /// Load a static character model from an EQ `_chr.s3d` archive.
@@ -412,8 +442,64 @@ impl ModelAsset {
             y_extent,
             x_center,
             z_center,
+            prefix: String::new(),
+            equip_slots: vec![None; mesh_count],
+            // chr.s3d models have no glTF extras; fall back to measured y_extent.
+            true_height: y_extent,
         })
     }
+}
+
+/// One body region's equipment-slot binding for a single mesh primitive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EquipSlot {
+    /// Equipment array index (0=head .. 6=feet).
+    pub slot: usize,
+    /// Lowercase 2-char body region code, e.g. `*b"ch"`.
+    pub region: [u8; 2],
+    /// Piece/variant number within the region.
+    pub variant: u8,
+}
+
+/// Map a 2-char body region code (case-insensitive) to an equipment slot index.
+pub fn region_to_slot(region: &str) -> Option<usize> {
+    match region.to_ascii_uppercase().as_str() {
+        "HE" => Some(0),
+        "CH" => Some(1),
+        "UA" => Some(2),
+        "FA" => Some(3),
+        "HN" => Some(4),
+        "LG" => Some(5),
+        "FT" => Some(6),
+        _ => None,
+    }
+}
+
+/// Parse a glTF material name like `HOMCH0001_MDF` into its lowercase race+gender
+/// prefix and the equipment slot it belongs to. Returns `None` for non-armor
+/// materials (eyes, attachments) or malformed names.
+pub fn parse_equip_material(name: &str) -> Option<(String, EquipSlot)> {
+    let core = name.strip_suffix("_MDF").unwrap_or(name);
+    if !core.is_ascii() || core.len() < 9 {
+        return None;
+    }
+    let prefix = &core[0..3];
+    let region = &core[3..5];
+    let digits = &core[5..9];
+    if !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let slot = region_to_slot(region)?;
+    let variant: u8 = digits[2..4].parse().ok()?;
+    let mut rc = [0u8; 2];
+    rc.copy_from_slice(region.to_ascii_lowercase().as_bytes());
+    Some((prefix.to_ascii_lowercase(), EquipSlot { slot, region: rc, variant }))
+}
+
+/// Build the lowercase armor texture base name (no extension) for a swap.
+pub fn equip_texture_name(prefix: &str, region: &[u8; 2], material: u32, variant: u8) -> String {
+    let region = std::str::from_utf8(region).unwrap_or("");
+    format!("{}{}{:02}{:02}", prefix, region, material, variant)
 }
 
 /// Map an EQ race string (case-insensitive) to a glTF archetype key.
@@ -445,7 +531,7 @@ pub fn race_to_archetype(race: &str) -> &'static str {
 /// Returns `None` for archetypes that have no EQ character archive.
 pub fn archetype_to_chr_s3d(archetype: &str) -> Option<&'static str> {
     match archetype {
-        "humanoid"  => Some("globalhom_chr.s3d"),  // human male
+        "humanoid"  => Some("globalhum_chr.s3d"),  // human male (globalhom is Halfling, not Human)
         "elf"       => Some("globalelf_chr.s3d"),   // wood elf
         "dwarf"     => Some("globaldwf_chr.s3d"),   // dwarf
         "gnoll"     => Some("globalgnm_chr.s3d"),   // gnoll
@@ -492,6 +578,22 @@ pub fn archetype_scale(archetype: &str) -> f32 {
         "fish"     =>  0.18, // Fish:            → ~1.2 EQ units
         "bear"     =>  8.0,  // Panda bear:      → ~5 EQ units
         _          =>  6.0,
+    }
+}
+
+/// Target height in EQ units for each archetype, used to scale normalized skinned models
+/// so that `true_height` maps to the correct in-world visual height.
+/// EQ units ≈ feet. Values are initial calibration; fine-tune visually after loading.
+pub fn archetype_target_height(archetype: &str) -> f32 {
+    match archetype {
+        // target == rendered EQ height; humanoid=12 calibrated to the doorway. Other
+        // human-height races match it; the rest are proportional (visually tune later).
+        "humanoid" => 12.0, "elf" => 12.0, "dwarf" => 9.0, "gnoll" => 12.0,
+        "skeleton" => 12.0, "zombie" => 12.0, "frog" => 10.0,
+        "bear" => 12.0, "wolf" => 8.0, "rat" => 3.0, "snake" => 6.0,
+        "bat" => 4.0, "bird" => 4.0, "wasp" => 4.0, "worm" => 4.0,
+        "fish" => 3.0, "creature" => 8.0,
+        _ => 12.0,
     }
 }
 
@@ -640,7 +742,63 @@ mod tests {
     }
 
     #[test]
+    fn target_heights_are_sane() {
+        assert!((archetype_target_height("humanoid") - 12.0).abs() < 0.01);
+        assert!(archetype_target_height("dwarf") < archetype_target_height("humanoid"));
+        assert!(archetype_target_height("unknown") > 0.0);
+    }
+
+    /// Deterministic check of the player-pass placement math: load the real human
+    /// model, replicate the skinned-player transform, and assert the model ends up
+    /// grounded (feet ≈ pos.z), horizontally centered on pos, and ~target tall.
+    #[test]
+    #[ignore = "requires assets/models/humanoid.glb"]
+    fn humanoid_player_transform_grounds_and_centers() {
+        let p = std::path::PathBuf::from(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/assets/models/humanoid.glb"));
+        let a = ModelAsset::load(&p).expect("load");
+        let sk = a.skin.as_ref().expect("skin");
+        let target = archetype_target_height("humanoid");
+        let height = if a.true_height > 0.001 { a.true_height } else { 1.0 };
+        let ms = (target / height) * a.skinned_node_scale;
+        let lift_basis = -sk.bind_lowest_skinned_z();
+        let visual_scale = 2.0 * lift_basis * ms;
+        let center_xz = [a.x_center, a.z_center];
+        let pos = [100.0_f32, -200.0, 5.0];
+        let mat = crate::camera::entity_model_matrix_heading(
+            pos, 0.0, visual_scale, ms, center_xz, true, 0.0);
+        let m = glam::Mat4::from_cols_array_2d(&mat);
+        let skin = sk.bind_skin_matrices();
+        let (mut mnx, mut mxx) = (f32::MAX, f32::MIN);
+        let (mut mny, mut mxy) = (f32::MAX, f32::MIN);
+        let (mut mnz, mut mxz) = (f32::MAX, f32::MIN);
+        for (mesh, sdo) in a.meshes.iter().zip(a.skin_meshes.iter()) {
+            if let Some(sd) = sdo {
+                for (vi, vp) in mesh.positions.iter().enumerate() {
+                    let j = sd.joint_indices[vi];
+                    let w = sd.joint_weights[vi];
+                    let local = crate::anim::SkinData::skin_point(*vp, j, w, &skin);
+                    let wp = m.transform_point3(glam::Vec3::from(local));
+                    mnx = mnx.min(wp.x); mxx = mxx.max(wp.x);
+                    mny = mny.min(wp.y); mxy = mxy.max(wp.y);
+                    mnz = mnz.min(wp.z); mxz = mxz.max(wp.z);
+                }
+            }
+        }
+        let (cx, cy, h) = ((mnx + mxx) * 0.5, (mny + mxy) * 0.5, mxz - mnz);
+        eprintln!("PLACEMENT world x[{:.2},{:.2}] y[{:.2},{:.2}] z[{:.2},{:.2}] center=({:.2},{:.2}) height={:.2} feet_z={:.2} (pos={:?} target={})",
+            mnx, mxx, mny, mxy, mnz, mxz, cx, cy, h, mnz, pos, target);
+        assert!((mnz - pos[2]).abs() < 1.5, "feet z {:.2} should be ~pos.z {:.2}", mnz, pos[2]);
+        assert!((cx - pos[0]).abs() < 1.5, "x center {:.2} vs pos.x {:.2}", cx, pos[0]);
+        assert!((cy - pos[1]).abs() < 1.5, "y center {:.2} vs pos.y {:.2}", cy, pos[1]);
+        assert!((h - target).abs() < target * 0.3, "height {:.2} vs target {:.2}", h, target);
+    }
+
+    #[test]
     fn archetype_scale_returns_positive_for_all_archetypes() {
+        assert!(archetype_scale("humanoid") > 0.0);
+        assert!(archetype_scale("gnoll")   > 0.0);
+        assert!(archetype_scale("skeleton") > 0.0);
         assert!(archetype_scale("humanoid") > 0.0);
         assert!(archetype_scale("gnoll")   > 0.0);
         assert!(archetype_scale("skeleton") > 0.0);
@@ -659,5 +817,73 @@ mod tests {
         assert!(archetype_scale("dwarf") > 0.0);
         assert!(archetype_scale("elf")   > 0.0);
         assert_eq!(archetype_scale("unknown"), 6.0);
+    }
+
+    #[test]
+    fn region_to_slot_maps_all_armor_regions() {
+        assert_eq!(region_to_slot("HE"), Some(0));
+        assert_eq!(region_to_slot("CH"), Some(1));
+        assert_eq!(region_to_slot("UA"), Some(2));
+        assert_eq!(region_to_slot("FA"), Some(3));
+        assert_eq!(region_to_slot("HN"), Some(4));
+        assert_eq!(region_to_slot("LG"), Some(5));
+        assert_eq!(region_to_slot("FT"), Some(6));
+        assert_eq!(region_to_slot("ch"), Some(1)); // case-insensitive
+        assert_eq!(region_to_slot("XX"), None);
+    }
+
+    #[test]
+    fn parse_equip_material_chest() {
+        let (prefix, es) = parse_equip_material("HOMCH0001_MDF").expect("should parse");
+        assert_eq!(prefix, "hom");
+        assert_eq!(es.slot, 1);
+        assert_eq!(&es.region, b"ch");
+        assert_eq!(es.variant, 1);
+    }
+
+    #[test]
+    fn parse_equip_material_head_variant() {
+        let (_, es) = parse_equip_material("HOMHE0007_MDF").unwrap();
+        assert_eq!(es.slot, 0);
+        assert_eq!(es.variant, 7);
+    }
+
+    #[test]
+    fn parse_equip_material_rejects_non_armor() {
+        assert!(parse_equip_material("HOFL_EYE_MDF").is_none());
+        assert!(parse_equip_material("HOMR_01_MDF").is_none());
+        assert!(parse_equip_material("short").is_none());
+    }
+
+    #[test]
+    fn equip_texture_name_formats() {
+        assert_eq!(equip_texture_name("hom", b"ch", 17, 1), "homch1701");
+        assert_eq!(equip_texture_name("hom", b"ch", 0, 3),  "homch0003");
+    }
+
+    #[test]
+    #[ignore = "requires assets/models/humanoid.glb"]
+    fn humanoid_true_height_from_extras() {
+        let path = std::path::PathBuf::from(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/assets/models/humanoid.glb")
+        );
+        let asset = ModelAsset::load(&path).expect("load failed");
+        assert!(asset.true_height > 0.0,
+            "true_height must be positive, got {}", asset.true_height);
+        assert!(asset.true_height.is_finite(),
+            "true_height must be finite, got {}", asset.true_height);
+    }
+
+    #[test]
+    #[ignore = "requires assets/models/humanoid.glb"]
+    fn humanoid_has_equip_slots_parallel_to_meshes() {
+        let path = std::path::PathBuf::from(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/assets/models/humanoid.glb"));
+        let asset = ModelAsset::load(&path).expect("load failed");
+        assert_eq!(asset.equip_slots.len(), asset.meshes.len(),
+            "equip_slots must be parallel to meshes");
+        assert_eq!(asset.prefix, "hom", "humanoid model prefix");
+        assert!(asset.equip_slots.iter().flatten().any(|s| s.slot == 1),
+            "expected at least one chest primitive");
     }
 }
