@@ -21,7 +21,12 @@ pub fn look_at_perspective(
     let view = glam::Mat4::look_at_rh(
         glam::Vec3::from(pos), glam::Vec3::from(target), glam::Vec3::from(up),
     );
-    (proj * view).to_cols_array_2d()
+    // EQ coords are +X=west/+Y=north; our right-handed camera would draw +X (west) to screen
+    // right, producing a left-right mirrored world (clock-tower door on the wrong side). The
+    // whole scene (geometry + entities) is internally aligned, so we correct the *display* by
+    // negating clip-space X. Safe because all pipelines use cull_mode:None (no winding flip).
+    let flip = glam::Mat4::from_scale(glam::Vec3::new(-1.0, 1.0, 1.0));
+    (flip * proj * view).to_cols_array_2d()
 }
 
 /// Model matrix: translate to pos lifted by scale*0.5, yaw toward camera, uniform scale.
