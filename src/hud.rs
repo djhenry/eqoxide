@@ -266,6 +266,7 @@ pub fn draw_control_bar(
                 ui.separator();
                 ui.label("Say:");
                 let resp = ui.add(egui::TextEdit::singleline(say_buffer)
+                    .id(egui::Id::new("say_box"))   // stable ID so focus persists across frames
                     .desired_width(260.0)
                     .hint_text("message / quest keyword"));
                 let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
