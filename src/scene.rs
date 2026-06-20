@@ -15,6 +15,7 @@ pub struct Billboard {
     pub heading:   f32,
     pub equipment: [u32; 9],
     pub equipment_tint: [[u8; 3]; 9],
+    pub gender:    u8,
 }
 
 /// A single entry in the message log.
@@ -39,6 +40,7 @@ pub struct SceneState {
     pub player_level: u32,
     pub player_race: String,
     pub player_class: String,
+    pub player_gender: u8,
     pub coin: [u32; 4],
     pub stats: [u32; 7],
     pub player_action: String,
@@ -111,6 +113,7 @@ impl SceneState {
                 heading:   0.0,
                 equipment:      [0; 9],
                 equipment_tint: [[0; 3]; 9],
+                gender:    0,
             });
         }
 
@@ -147,6 +150,7 @@ impl SceneState {
                 heading:   e.heading,
                 equipment:      e.equipment,
                 equipment_tint: e.equipment_tint,
+                gender:    e.gender,
             }
         }).collect();
 
@@ -170,6 +174,7 @@ impl SceneState {
             player_level: gs.player_level,
             player_race: gs.player_race.clone(),
             player_class: gs.player_class.clone(),
+            player_gender: gs.player_gender,
             coin: gs.coin,
             stats: gs.stats,
             player_action: gs.player_action.clone(),
@@ -384,6 +389,23 @@ mod tests {
         let scene = SceneState::from_game_state(&gs);
         assert_eq!(scene.billboards[0].equipment[1], 17);
         assert_eq!(scene.billboards[0].equipment_tint[1], [9, 8, 7]);
+    }
+
+    #[test]
+    fn from_game_state_propagates_gender() {
+        let mut gs = GameState::new();
+        gs.player_gender = 1; // female player
+        let e = Entity {
+            spawn_id: 5, name: "x".into(), level: 1, is_npc: true,
+            x: 0.0, y: 0.0, z: 0.0, hp_pct: 100.0, cur_hp: 1, max_hp: 1,
+            race: "HUM".into(), heading: 0.0, dead: false,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 1, helm: 0, showhelm: 0,
+            animation: 0,
+        };
+        gs.upsert_entity(e);
+        let scene = SceneState::from_game_state(&gs);
+        assert_eq!(scene.billboards[0].gender, 1, "entity gender propagates to billboard");
+        assert_eq!(scene.player_gender, 1, "player gender propagates to scene");
     }
 
     // --- Message count ---

@@ -565,6 +565,7 @@ pub fn register_spawn(gs: &mut GameState, spawn: Spawn_S) {
         gs.player_heading = heading;
         gs.player_level   = spawn.level as u32;
         gs.player_race    = eq_race_to_code(spawn.race).to_string();
+        gs.player_gender  = spawn.gender;
         let sid = spawn.spawnId;
         eprintln!("EQ: player spawn id={} pos=({:.1},{:.1},{:.1})", sid, x, y, z);
         return;

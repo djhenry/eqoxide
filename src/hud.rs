@@ -596,7 +596,7 @@ mod tests {
         Billboard {
             id, pos, level, hp_pct: 100.0, is_target: false, dead: false,
             name: name.to_string(), race: String::new(), action: String::new(), heading: 0.0,
-            equipment: [0; 9], equipment_tint: [[0; 3]; 9],
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0,
         }
     }
 
@@ -651,6 +651,7 @@ mod tests {
                     heading: 0.0,
                     equipment: [0; 9],
                     equipment_tint: [[0; 3]; 9],
+                    gender: 0,
                 },
             ],
             ..Default::default()
