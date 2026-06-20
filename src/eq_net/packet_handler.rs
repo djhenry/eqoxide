@@ -157,8 +157,15 @@ fn apply_zone_entry(gs: &mut GameState, payload: &[u8]) {
             gs.player_heading = heading;
             gs.player_level   = spawn.level as u32;
             gs.player_race    = eq_race_to_code(spawn.race).to_string();
-            eprintln!("EQ: player via ZONE_ENTRY id={} pos=({:.1},{:.1},{:.1}) raw=({:#010x},{:#010x},{:#010x},{:#010x})",
-                      gs.player_id, x, y, z, bp1, bp2, bp3, bp4);
+            gs.player_gender  = spawn.gender;
+            for i in 0..9 {
+                gs.player_equipment[i] =
+                    u32::from_le_bytes(spawn.equipment[i*4..i*4+4].try_into().unwrap());
+                gs.player_equipment_tint[i] =
+                    [spawn.equipment_tint[i*4+2], spawn.equipment_tint[i*4+1], spawn.equipment_tint[i*4]];
+            }
+            eprintln!("EQ: player via ZONE_ENTRY id={} pos=({:.1},{:.1},{:.1}) equip={:?}",
+                      gs.player_id, x, y, z, gs.player_equipment);
         }
         break;
     }
@@ -215,14 +222,20 @@ fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
 
     const ITEM_MATERIAL_OFF: usize = 188;
     const ITEM_TINT_OFF: usize = 268;
+    // Note: EQEmu leaves the Titanium profile's item_material zeroed in practice; the worn
+    // materials arrive in the spawn packet (apply_zone_entry / register_spawn) + WearChange.
+    // This parse is kept as a fallback for servers that do populate it.
     if payload.len() >= ITEM_TINT_OFF + 9 * 4 {
         for i in 0..9 {
             let mo = ITEM_MATERIAL_OFF + i * 4;
-            gs.player_equipment[i] =
-                u32::from_le_bytes(payload[mo..mo + 4].try_into().unwrap());
-            let to = ITEM_TINT_OFF + i * 4;
-            // wire order B, G, R, UseTint → store RGB
-            gs.player_equipment_tint[i] = [payload[to + 2], payload[to + 1], payload[to]];
+            let mat = u32::from_le_bytes(payload[mo..mo + 4].try_into().unwrap());
+            // Only overwrite with a real material — never clobber spawn-supplied equipment
+            // with the profile's zeros (EQEmu leaves item_material empty).
+            if mat != 0 {
+                gs.player_equipment[i] = mat;
+                let to = ITEM_TINT_OFF + i * 4;
+                gs.player_equipment_tint[i] = [payload[to + 2], payload[to + 1], payload[to]];
+            }
         }
     }
 }
@@ -566,8 +579,17 @@ pub fn register_spawn(gs: &mut GameState, spawn: Spawn_S) {
         gs.player_level   = spawn.level as u32;
         gs.player_race    = eq_race_to_code(spawn.race).to_string();
         gs.player_gender  = spawn.gender;
+        // EQEmu leaves the PlayerProfile's item_material zeroed; the player's worn
+        // equipment materials/tints arrive in this spawn packet (and via WearChange),
+        // so parse them here or the player renders naked.
+        for i in 0..9 {
+            gs.player_equipment[i] =
+                u32::from_le_bytes(spawn.equipment[i*4..i*4+4].try_into().unwrap());
+            gs.player_equipment_tint[i] =
+                [spawn.equipment_tint[i*4+2], spawn.equipment_tint[i*4+1], spawn.equipment_tint[i*4]];
+        }
         let sid = spawn.spawnId;
-        eprintln!("EQ: player spawn id={} pos=({:.1},{:.1},{:.1})", sid, x, y, z);
+        eprintln!("EQ: player spawn id={} pos=({:.1},{:.1},{:.1}) equip={:?}", sid, x, y, z, gs.player_equipment);
         return;
     }
 
