@@ -3,6 +3,29 @@ use crate::scene::SceneState;
 
 /// Choose the bind group for one primitive: an equipment-swapped armor texture if
 /// available, else the primitive's baked GLB texture, else the white fallback.
+/// True if this armor mesh should be hidden: its exact equipped-material texture is missing,
+/// but a variant-01 sibling of the same region+material IS loaded. EQ body models are built
+/// from the material-0 (cloth) layout, which can have more chest "variant" pieces than an
+/// armor material ships textures for (e.g. the torso is variant 3, but material-3 chest only
+/// has variants 01/02). Those textureless pieces would otherwise render as bare body over the
+/// variant-01 armor piece. Hiding them lets the variant-01 armor texture show through. (When
+/// no sibling has a texture either — e.g. helm material 3 — nothing is hidden, so the part
+/// keeps its baked skin instead of vanishing.)
+fn equip_mesh_hidden(
+    r: &EqRenderer, prefix: &str,
+    slot: Option<crate::models::EquipSlot>, equipment: &[u32; 9],
+) -> bool {
+    let Some(es) = slot else { return false };
+    let mat = equipment[es.slot];
+    if mat == 0 || es.variant == 1 { return false; }
+    let exact_present = crate::models::equip_swap_key(prefix, es, mat)
+        .map(|k| matches!(r.equipment_tex_cache.get(&k), Some(Some(_)))).unwrap_or(false);
+    if exact_present { return false; }
+    let v1 = crate::models::EquipSlot { slot: es.slot, region: es.region, variant: 1 };
+    crate::models::equip_swap_key(prefix, v1, mat)
+        .map(|k| matches!(r.equipment_tex_cache.get(&k), Some(Some(_)))).unwrap_or(false)
+}
+
 fn resolve_equip_tex<'a>(
     r:          &'a EqRenderer,
     baked_bgs:  &'a [wgpu::BindGroup],
@@ -255,6 +278,7 @@ pub fn encode_player_pass(
                 pass.set_bind_group(3, &r.joint_buf_pool[0].1, &[]);
                 for (i, mesh) in model.meshes.iter().enumerate() {
                     if i >= PLAYER_UNIFORM_SLOTS { break; }
+                    if equip_mesh_hidden(r, &model.prefix, model.equip_slots[i], &scene.player_equipment) { continue; }
                     pass.set_bind_group(2, &r.entity_uniform_pool[i].1, &[]);
                     let bg = resolve_equip_tex(r, &model.texture_bind_groups, mesh.texture_idx,
                         &model.prefix, model.equip_slots[i].clone(), &scene.player_equipment);
@@ -511,6 +535,7 @@ pub fn encode_entity_pass(
     for draw in &draws {
         let Some(GpuModel::Static(model)) = r.model_for(draw.archetype, draw.gender) else { continue };
         let mesh = &model.meshes[draw.mesh_idx];
+        if equip_mesh_hidden(r, &model.prefix, model.equip_slots[draw.mesh_idx], &draw.equipment) { continue; }
         pass.set_bind_group(2, &r.entity_uniform_pool[draw.uniform_slot].1, &[]);
         let bg = resolve_equip_tex(r, &model.texture_bind_groups, mesh.texture_idx,
             &model.prefix, model.equip_slots[draw.mesh_idx], &draw.equipment);
@@ -626,6 +651,7 @@ pub fn encode_skinned_entity_pass(
             pass.set_bind_group(3, &r.joint_buf_pool[draw.joint_slot].1, &[]);
             cur_joint = draw.joint_slot;
         }
+        if equip_mesh_hidden(r, &model.prefix, model.equip_slots[draw.mesh_idx], &draw.equipment) { continue; }
         pass.set_bind_group(2, &r.entity_uniform_pool[draw.uniform_slot].1, &[]);
         let bg = resolve_equip_tex(r, &model.texture_bind_groups, mesh.texture_idx,
             &model.prefix, model.equip_slots[draw.mesh_idx], &draw.equipment);
