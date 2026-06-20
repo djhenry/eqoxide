@@ -5,11 +5,27 @@ How a zone's geometry gets on screen, and how placeable objects (buildings, etc.
 ## Terrain
 
 `ZoneAssets::load(<zone>.s3d)` reads the main zone `.wld`(s) via `libeq_wld` and extracts
-terrain meshes (positions/normals/uvs + per-mesh `center`) in **libeq space**
-`[east, height, north]`. `upload_zone_assets` maps each vertex to render world
-`[east, north, up]` via `position = [p0 + cx, p2 + cz, p1 + cy]` — the same frame as NPC/player
-server coordinates `[server_x = east, server_y = north, server_z = up]`, so terrain, objects,
-and entities all align.
+terrain meshes (positions/normals/uvs + per-mesh `center`) in **libeq space**. The two
+horizontal libeq axes map to the **server/world** frame as:
+
+```
+render.X (= server x) = libeq p[2] + center[2]
+render.Y (= server y) = libeq p[0] + center[0]
+render.Z (up)         = libeq p[1] + center[1]
+```
+
+i.e. `position = [p2 + cz, p0 + cx, p1 + cy]` in `upload_zone_assets`. The two horizontal
+axes are **swapped** relative to the naive `[p0, p2, p1]` — this was confirmed by aligning
+each zone's server safe-point/spawn coords with the geometry across qeynos/qeynos2/qcat/
+freportw (qcat is decisive: its safe `y=860` only fits the geometry's p0 extent). The same
+mapping is applied in `bounds_xy` (minimap) and `Collision::build` (grounding/walls) so
+terrain, placed objects, NPCs, and the player all share one frame.
+
+### History / the bug this fixed
+Earlier the mapping was `[p0, p2, p1]` (server x→p0, y→p2). That happened to look right in
+zones with small/symmetric coords (qeynos, gfaydark) but put NPCs and the player off the
+terrain in zones with large authored origins — most visibly **qeynos2**, where the player
+spawned well north of / outside the city. Swapping the two horizontal axes fixed it everywhere.
 
 ## Placeable objects (buildings, tents, forges, …)
 

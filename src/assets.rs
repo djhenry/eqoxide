@@ -41,8 +41,8 @@ impl ZoneAssets {
         let mut max = [f32::MIN; 2];
         for m in &self.meshes {
             for p in &m.positions {
-                let e = p[0] + m.center[0]; // east  = server_x
-                let n = p[2] + m.center[2]; // north = server_y
+                let e = p[2] + m.center[2]; // render.X = server_x = libeq p[2]
+                let n = p[0] + m.center[0]; // render.Y = server_y = libeq p[0]
                 if e < min[0] { min[0] = e; }
                 if n < min[1] { min[1] = n; }
                 if e > max[0] { max[0] = e; }
@@ -87,11 +87,11 @@ impl Collision {
                 let (ia, ib, ic) = (idx[k] as usize, idx[k + 1] as usize, idx[k + 2] as usize);
                 k += 3;
                 if ia >= pos.len() || ib >= pos.len() || ic >= pos.len() { continue; }
-                // libeq [east, height, north] -> world [east, north, height]
+                // libeq -> world: render.X = server_x = p[2], render.Y = server_y = p[0], up = p[1]
                 tris.push([
-                    [pos[ia][0] + m.center[0], pos[ia][2] + m.center[2], pos[ia][1] + m.center[1]],
-                    [pos[ib][0] + m.center[0], pos[ib][2] + m.center[2], pos[ib][1] + m.center[1]],
-                    [pos[ic][0] + m.center[0], pos[ic][2] + m.center[2], pos[ic][1] + m.center[1]],
+                    [pos[ia][2] + m.center[2], pos[ia][0] + m.center[0], pos[ia][1] + m.center[1]],
+                    [pos[ib][2] + m.center[2], pos[ib][0] + m.center[0], pos[ib][1] + m.center[1]],
+                    [pos[ic][2] + m.center[2], pos[ic][0] + m.center[0], pos[ic][1] + m.center[1]],
                 ]);
             }
         }
@@ -666,10 +666,10 @@ mod tests {
             base_color: [1.0; 4],
             center: [0.0, 0.0, 0.0],
         };
-        // Vertical wall at east=5, spanning north [0,10], height [0,10].
+        // Vertical wall at world east=5: libeq p2=5 (render.X), spanning north=p0 [0,10], height=p1 [0,10].
         let wall = MeshData {
-            positions: vec![[5.0, 0.0, 0.0], [5.0, 0.0, 10.0], [5.0, 10.0, 10.0], [5.0, 10.0, 0.0]],
-            normals: vec![[1.0, 0.0, 0.0]; 4],
+            positions: vec![[0.0, 0.0, 5.0], [10.0, 0.0, 5.0], [10.0, 10.0, 5.0], [0.0, 10.0, 5.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 4],
             uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3],
             texture_name: None,
@@ -717,10 +717,10 @@ mod tests {
     /// parallel to it (along north) or away from it is clear.
     #[test]
     fn collision_path_clear_blocks_walking_into_wall() {
-        // Reuse a single vertical wall at east=5, north [0,10], height [0,10].
+        // Vertical wall at world east=5: libeq p2=5 (render.X), north=p0 [0,10], height=p1 [0,10].
         let wall = MeshData {
-            positions: vec![[5.0, 0.0, 0.0], [5.0, 0.0, 10.0], [5.0, 10.0, 10.0], [5.0, 10.0, 0.0]],
-            normals: vec![[1.0, 0.0, 0.0]; 4],
+            positions: vec![[0.0, 0.0, 5.0], [10.0, 0.0, 5.0], [10.0, 10.0, 5.0], [0.0, 10.0, 5.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 4],
             uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3],
             texture_name: None,
@@ -742,3 +742,5 @@ mod tests {
             "stepping away from the wall should be clear");
     }
 }
+
+

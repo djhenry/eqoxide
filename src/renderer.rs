@@ -174,9 +174,12 @@ impl EqRenderer {
 
                 for (i, &p) in mesh.positions.iter().enumerate() {
                     let normal = mesh.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
+                    // libeq axes map to world as: render.X = server_x = p[2], render.Y = server_y
+                    // = p[0], render.Z (up) = p[1]. (The two horizontal axes are swapped vs the
+                    // old assumption; confirmed by zone safe-point/geometry alignment across zones.)
                     entry.0.push(Vertex {
-                        position: [p[0] + cx, p[2] + cz, p[1] + cy],
-                        normal:   [normal[0], normal[2], normal[1]],
+                        position: [p[2] + cz, p[0] + cx, p[1] + cy],
+                        normal:   [normal[2], normal[0], normal[1]],
                         uv:       mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
                     });
                 }
