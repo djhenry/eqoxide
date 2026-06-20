@@ -76,6 +76,57 @@ pub fn cross_marker(pos: [f32; 3], size: f32, color: [f32; 3]) -> (Vec<Vertex>, 
     (verts, idxs)
 }
 
+/// TEMP DEBUG: colored XYZ axis gizmo at `pos` (the point a model should be centered on).
+/// Red = +X (east), Green = +Y (north), Blue = +Z (up). Color is carried in `normal`
+/// (the billboard pipeline reads color from there). Lets us see a model's offset from
+/// where it ought to render. Remove when the position bug is resolved.
+pub fn axis_gizmo(pos: [f32; 3], len: f32, heading_deg: f32) -> (Vec<Vertex>, Vec<u32>) {
+    let w = 0.4;
+    let mut verts: Vec<Vertex> = Vec::new();
+    let mut idxs: Vec<u32> = Vec::new();
+    fn push_box(verts: &mut Vec<Vertex>, idxs: &mut Vec<u32>,
+                mn: [f32; 3], mx: [f32; 3], color: [f32; 3]) {
+        let base = verts.len() as u32;
+        let c = [
+            [mn[0],mn[1],mn[2]],[mx[0],mn[1],mn[2]],[mx[0],mx[1],mn[2]],[mn[0],mx[1],mn[2]],
+            [mn[0],mn[1],mx[2]],[mx[0],mn[1],mx[2]],[mx[0],mx[1],mx[2]],[mn[0],mx[1],mx[2]],
+        ];
+        for p in c { verts.push(Vertex { position: p, normal: color, uv: [0.0; 2] }); }
+        for f in [[0u32,2,1,0,3,2],[4,5,6,4,6,7],[0,1,5,0,5,4],[1,2,6,1,6,5],[2,3,7,2,7,6],[3,0,4,3,4,7]] {
+            for i in f { idxs.push(base + i); }
+        }
+    }
+    let [x, y, z] = pos;
+    push_box(&mut verts, &mut idxs, [x, y - w, z - w], [x + len, y + w, z + w], [1.0, 0.0, 0.0]); // +X red
+    push_box(&mut verts, &mut idxs, [x - w, y, z - w], [x + w, y + len, z + w], [0.0, 1.0, 0.0]); // +Y green
+    push_box(&mut verts, &mut idxs, [x - w, y - w, z], [x + w, y + w, z + len], [0.0, 0.0, 1.0]); // +Z up blue
+    // small white cube at the exact origin point
+    push_box(&mut verts, &mut idxs, [x - w, y - w, z - w], [x + w, y + w, z + w], [1.0, 1.0, 1.0]);
+
+    // TEMP DEBUG: yellow heading arrow on the ground, pointing the way the model is rotated.
+    // yaw matches entity_model_matrix_heading (heading + 90°); forward = rotZ(yaw) * +Y(north).
+    let yaw = heading_deg.to_radians() + std::f32::consts::FRAC_PI_2;
+    let (s, c) = yaw.sin_cos();
+    let (dx, dy) = (-s, c);            // world XY direction of the model's forward
+    let (px, py) = (-dy, dx);         // perpendicular (for arrow width)
+    let alen = len * 1.2;
+    let aw = 1.2;
+    let zf = z + 0.3;
+    let yc = [1.0, 1.0, 0.0];
+    let base = verts.len() as u32;
+    // shaft quad + triangular head as one flat arrow
+    let shaft = alen * 0.7;
+    verts.push(Vertex { position: [x + px * aw, y + py * aw, zf], normal: yc, uv: [0.0; 2] });          // 0 base-left
+    verts.push(Vertex { position: [x - px * aw, y - py * aw, zf], normal: yc, uv: [0.0; 2] });          // 1 base-right
+    verts.push(Vertex { position: [x + dx * shaft + px * aw, y + dy * shaft + py * aw, zf], normal: yc, uv: [0.0; 2] }); // 2
+    verts.push(Vertex { position: [x + dx * shaft - px * aw, y + dy * shaft - py * aw, zf], normal: yc, uv: [0.0; 2] }); // 3
+    verts.push(Vertex { position: [x + dx * shaft + px * aw * 2.2, y + dy * shaft + py * aw * 2.2, zf], normal: yc, uv: [0.0; 2] }); // 4 head-left
+    verts.push(Vertex { position: [x + dx * shaft - px * aw * 2.2, y + dy * shaft - py * aw * 2.2, zf], normal: yc, uv: [0.0; 2] }); // 5 head-right
+    verts.push(Vertex { position: [x + dx * alen, y + dy * alen, zf], normal: yc, uv: [0.0; 2] });      // 6 tip
+    for i in [0u32,1,2, 1,3,2, 4,5,6] { idxs.push(base + i); }
+    (verts, idxs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

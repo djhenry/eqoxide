@@ -108,15 +108,18 @@ impl CameraState {
     }
 
     /// Adjust azimuth and elevation from mouse drag (radians/pixel × pixel-delta).
+    /// DEBUG: elevation only guarded against the exact poles (gimbal flip), otherwise free.
     pub fn apply_orbit_delta(&mut self, daz: f32, del: f32) {
+        const POLE: f32 = std::f32::consts::FRAC_PI_2 - 0.001;
         self.azimuth   = (self.azimuth + daz).rem_euclid(std::f32::consts::TAU);
-        self.elevation = (self.elevation - del).clamp(ELEVATION_MIN, ELEVATION_MAX);
+        self.elevation = (self.elevation - del).clamp(-POLE, POLE);
         self.mode      = CameraMode::ManualOrbit;
     }
 
     /// Zoom by `factor` scroll lines (positive = zoom in).
+    /// DEBUG: radius unconstrained (any distance).
     pub fn apply_zoom(&mut self, factor: f32) {
-        self.radius = (self.radius * (1.0 - factor)).clamp(RADIUS_MIN, RADIUS_MAX);
+        self.radius = (self.radius * (1.0 - factor)).max(0.01);
         self.mode   = CameraMode::ManualOrbit;
     }
 
@@ -129,9 +132,10 @@ impl CameraState {
     pub fn apply_cmd(&mut self, cmd: CameraCmd) {
         match cmd {
             CameraCmd::Set { azimuth, elevation, radius, focus } => {
+                // DEBUG: unconstrained — any direction, distance, and focus point.
                 if let Some(az) = azimuth   { self.azimuth   = az; }
-                if let Some(el) = elevation { self.elevation = el.clamp(ELEVATION_MIN, ELEVATION_MAX); }
-                if let Some(r)  = radius    { self.radius    = r.clamp(RADIUS_MIN, RADIUS_MAX); }
+                if let Some(el) = elevation { self.elevation = el; }
+                if let Some(r)  = radius    { self.radius    = r; }
                 if let Some(f)  = focus     { self.focus     = f; }
                 self.mode       = CameraMode::ManualOrbit;
             }
@@ -269,13 +273,13 @@ mod tests {
     }
 
     #[test]
-    fn apply_cmd_set_clamps_out_of_range_elevation() {
+    fn apply_cmd_set_elevation_is_unconstrained() {
+        // DEBUG: /camera Set is intentionally unclamped so any angle is reachable.
         let mut cam = CameraState::new([0.0, 0.0, 0.0], 0.0);
         cam.apply_cmd(CameraCmd::Set {
             azimuth: None, elevation: Some(10.0), radius: None, focus: None,
         });
-        assert!(cam.elevation <= ELEVATION_MAX + 1e-5,
-            "elevation {:.3} exceeds max {:.3}", cam.elevation, ELEVATION_MAX);
+        assert_eq!(cam.elevation, 10.0, "Set should apply elevation verbatim (no clamp)");
     }
 
     #[test]

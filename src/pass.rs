@@ -115,6 +115,15 @@ pub fn encode_billboard_pass(
     let mut all_verts: Vec<crate::gpu::Vertex> = Vec::new();
     let mut all_idxs:  Vec<u32>                = Vec::new();
 
+    // TEMP DEBUG: XYZ axis gizmo at the player's collision point (where the model should
+    // be centered) — red=+X east, green=+Y north, blue=+Z up. Remove when position is fixed.
+    if !scene.player_race.is_empty() {
+        let (gv, gi) = crate::billboard::axis_gizmo(scene.player_pos, 12.0, scene.player_heading);
+        let base = all_verts.len() as u32;
+        all_verts.extend(gv);
+        all_idxs.extend(gi.iter().map(|i| i + base));
+    }
+
     for b in &scene.billboards {
         if b.level == 0 {
             // Level-0 placeholder spawns: draw a small red X on the ground
@@ -210,10 +219,28 @@ pub fn encode_player_pass(
                 let dominant_mesh_scale = (target / height) * model.node_scale;
                 // Recenter + ground from the CURRENT animation clip's posed bounds (the live
                 // pose differs from bind, causing a static offset). Bounds are per-clip min
-                // feet (stable within a clip → no walk bob). Fall back to bind when unavailable.
-                let (cx, cz, floor) = r.anim_states.get(&0)
-                    .and_then(|s| model.clip_bounds.get(s.clip_idx).copied())
-                    .unwrap_or((model.x_center, model.z_center, model.skin.bind_lowest_skinned_z()));
+                // Recenter + ground from the CURRENT posed frame's ground probes (feet), so the
+                // body stays over `pos` and the lowest foot sits on the ground every frame —
+                // fixes the vertical float (clip-min grounding floated non-lowest frames) and
+                // the horizontal drift while walking (a static clip center didn't track the pose).
+                let (cx, cz, floor) = {
+                    let mg: Vec<glam::Mat4> = matrices.iter()
+                        .map(|m| glam::Mat4::from_cols_array_2d(m)).collect();
+                    let probes = &model.skin.ground_probes;
+                    if probes.is_empty() {
+                        (model.x_center, model.z_center, model.skin.bind_lowest_skinned_z())
+                    } else {
+                        let (mut xmn, mut xmx, mut zmn, mut zmx, mut ymn) =
+                            (f32::MAX, f32::MIN, f32::MAX, f32::MIN, f32::MAX);
+                        for p in probes {
+                            let lp = crate::anim::SkinData::skin_point(p.pos, p.joints, p.weights, &mg);
+                            xmn = xmn.min(lp[0]); xmx = xmx.max(lp[0]);
+                            zmn = zmn.min(lp[2]); zmx = zmx.max(lp[2]);
+                            ymn = ymn.min(lp[1]);
+                        }
+                        ((xmn + xmx) * 0.5, (zmn + zmx) * 0.5, ymn)
+                    }
+                };
                 let lift_basis = -floor;
                 let visual_scale = 2.0 * lift_basis * dominant_mesh_scale;
                 let center_xz = [cx, cz];
@@ -224,6 +251,7 @@ pub fn encode_player_pass(
                         scene.player_pos, scene.player_heading, visual_scale,
                         dominant_mesh_scale, center_xz, true, 0.0,
                     );
+                    // (debug PMODEL print removed; per-frame recenter/ground verified via WORLD_BBOX)
                     let tint = match model.equip_slots[i] {
                         Some(ref es) if scene.player_equipment_tint[es.slot] != [0, 0, 0] => {
                             let t = scene.player_equipment_tint[es.slot];
