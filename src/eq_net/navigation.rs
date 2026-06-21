@@ -374,36 +374,26 @@ impl Navigator {
                 .map(|e| !e.dead && clear_to(e))
                 .unwrap_or(false);
             if !valid {
-                let mut best_clear: Option<(f32, u32)> = None;          // reachable now -> engage
-                let mut best_any: Option<(f32, (f32, f32, f32))> = None; // any mob -> roam toward it
+                // Engage the nearest reachable (clear-path) land mob within 200u. If none are
+                // reachable we simply idle and wait for a respawn rather than roam — qcat is a maze
+                // of sealed pockets, so roaming toward an out-of-pocket mob just strands her.
+                let mut best_clear: Option<(f32, u32)> = None;
                 for (id, e) in &gs.entities {
                     if e.dead || !e.is_npc { continue; }
                     let nl = e.name.to_ascii_lowercase();
                     if !(nl.starts_with("a_") || nl.starts_with("an_")) { continue; }
-                    // Skip fish — they sit in water a walking character can't path to, which would
-                    // otherwise be the "nearest" mob and strand the grinder at the water's edge.
-                    if nl.contains("fish") { continue; }
+                    if nl.contains("fish") { continue; } // water mobs a walker can't path to
                     let dx = e.x - gs.player_x;
                     let dy = e.y - gs.player_y;
                     let d2 = dx * dx + dy * dy;
-                    if d2 > 400.0 * 400.0 { continue; } // roam search radius
-                    if best_any.map(|(bd, _)| d2 < bd).unwrap_or(true) { best_any = Some((d2, (e.x, e.y, e.z))); }
-                    if d2 <= 200.0 * 200.0 && clear_to(e)
-                        && best_clear.map(|(bd, _)| d2 < bd).unwrap_or(true) {
-                        best_clear = Some((d2, *id));
-                    }
+                    if d2 > 200.0 * 200.0 || !clear_to(e) { continue; }
+                    if best_clear.map(|(bd, _)| d2 < bd).unwrap_or(true) { best_clear = Some((d2, *id)); }
                 }
                 drop(col);
                 if let Some((_, id)) = best_clear {
-                    // A reachable mob — target it and stop any roam walk; auto-engage will close in.
                     gs.target_id = Some(id);
                     if let Some(e) = gs.entities.get(&id) { gs.target_name = Some(e.name.clone()); }
                     stream.send_app_packet(OP_TARGET_MOUSE, &build_target_packet(id));
-                    *self.goto_target.lock().unwrap() = None;
-                } else if let Some((_, pos)) = best_any {
-                    // No reachable mob nearby: pathfind toward the nearest one so grinding continues.
-                    gs.target_id = None;
-                    *self.goto_target.lock().unwrap() = Some(pos);
                 }
             }
         }
