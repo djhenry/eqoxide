@@ -382,7 +382,6 @@ impl Navigator {
                     if e.dead || !e.is_npc { continue; }
                     let nl = e.name.to_ascii_lowercase();
                     if !(nl.starts_with("a_") || nl.starts_with("an_")) { continue; }
-                    if nl.contains("fish") { continue; } // water mobs a walker can't path to
                     let dx = e.x - gs.player_x;
                     let dy = e.y - gs.player_y;
                     let d2 = dx * dx + dy * dy;
