@@ -12,6 +12,31 @@ character_name fields).
 
 ---
 
+## 0. Finding quests (`tools/quest_finder.py`)
+
+EQEmu quests are **Lua scripts** in the server's `/opt/eqemu/data/quests/<zone>/<Npc_Name>.lua`
+(NOT in the DB), so you can't find them with SQL alone. Use the finder to discover quest givers,
+where they're spawned, what they want (turn-in item ids + names + counts), and the XP reward:
+
+```sh
+python3 tools/quest_finder.py --beginner          # curated low-level Qeynos turn-in quests
+python3 tools/quest_finder.py qeynos --turnins    # all turn-in givers in South Qeynos (+ qeynos2)
+python3 tools/quest_finder.py --npc Captain_Tillin # full script for one NPC
+```
+
+A turn-in quest = a giver with an `event_trade` block (`check_turn_in(...)`); the finder prints the
+required items and reward. Example beginner targets (verified spawned): **Captain_Tillin** in
+`qeynos` (-512,37,32) wants **Gnoll Fang (13915) x1-4** → up to 28000 XP; **Priestess_Caulria** in
+`qeynos2` (-604,-133,-10) wants rabid pelts. Dialogue/hail quests (no `event_trade`) are driven by
+hailing + saying `[keyword]`s.
+
+To actually *complete* a turn-in quest you need: reach + kill the mob → **loot** the item → reach
+the giver → **hand it in**. Looting and item hand-in (trade) are the gameplay actions being added
+for questing (`/loot`, `/give` — see the questing plan in `todo.md`). The hail/say flow for
+dialogue quests already exists (`docs/npc-interaction.md`).
+
+---
+
 ## 1. Creating + configuring a non-GM character (EQEmu DB)
 
 DB: `podman exec eqemu_mariadb_1 mariadb -uroot -prootpass peq`. Tables that matter:
