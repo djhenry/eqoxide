@@ -105,6 +105,12 @@ pub struct Navigator {
     /// Whether auto-attack is currently engaged (set by the /attack toggle). While true and a
     /// target is set, the nav thread keeps the player facing the target so melee swings land.
     auto_attack:      bool,
+    /// Cached A* waypoints for the current goto goal (routes around walls). `path_i` is the
+    /// current waypoint; `path_goal` is the goal these waypoints were computed for (recompute
+    /// when the goal changes). Empty path = straight-line fallback.
+    path:             Vec<[f32; 2]>,
+    path_i:           usize,
+    path_goal:        Option<(f32, f32, f32)>,
 }
 
 impl Navigator {
@@ -140,6 +146,9 @@ impl Navigator {
             position_seq: 0,
             last_tick: Instant::now(),
             auto_attack: false,
+            path: Vec::new(),
+            path_i: 0,
+            path_goal: None,
         }
     }
 
@@ -418,9 +427,40 @@ impl Navigator {
         }
 
         let goto = *self.goto_target.lock().unwrap(); // copy out so the lock is released
-        let target = match goto {
+        let goal = match goto {
             Some(t) => t,
-            None    => return,
+            None    => { self.path.clear(); self.path_goal = None; return }
+        };
+
+        // (Re)compute a wall-avoiding A* path when the goal changes. find_path returns
+        // waypoints (goal-inclusive); an empty path falls back to a straight line to the goal.
+        if self.path_goal != Some(goal) {
+            self.path_goal = Some(goal);
+            self.path_i = 0;
+            self.path = match self.collision.read().unwrap().as_ref() {
+                Some(c) => c
+                    .find_path([gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], 2.0)
+                    .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            eprintln!("NAV: path to ({:.0},{:.0}) = {} waypoints", goal.0, goal.1, self.path.len());
+        }
+
+        // Aim at the current waypoint; advance past any we've already reached. The final
+        // waypoint equals the goal, so reaching it falls through to the STOP_DIST arrival below.
+        let target = loop {
+            match self.path.get(self.path_i) {
+                Some(&wp) => {
+                    let wdx = wp[0] - gs.player_x;
+                    let wdy = wp[1] - gs.player_y;
+                    if (wdx * wdx + wdy * wdy).sqrt() <= 3.0 && self.path_i + 1 < self.path.len() {
+                        self.path_i += 1;
+                        continue;
+                    }
+                    break (wp[0], wp[1], goal.2);
+                }
+                None => break goal, // no path computed: straight-line to the goal
+            }
         };
 
         let dx   = target.0 - gs.player_x; // east  delta (server_x)
