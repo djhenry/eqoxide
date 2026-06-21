@@ -1,4 +1,6 @@
-// eq_renderer/src/anim.rs
+//! Skeletal animation data + sampling for character models: joint channels, clips, skin data, and
+//! evaluation of a clip at a time `t` into the per-joint skinning matrices the skinned shader uses.
+//! Also holds `GroundProbe`s used to center/ground a posed model (see `models.rs`).
 
 pub enum JointProperty { Translation, Rotation, Scale }
 

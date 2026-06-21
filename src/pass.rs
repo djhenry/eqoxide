@@ -1,3 +1,8 @@
+//! The per-frame render pass. Draws the zone terrain + placed objects, skinned characters (player
+//! and NPCs, with equipment-texture swaps), camera-facing billboards/nameplates, and the egui HUD.
+//! Reads GPU resources from `EqRenderer` and "what to draw" from `SceneState`. The armor-texture
+//! selection + `equip_mesh_hidden` logic here is documented in `docs/equipment-textures-findings.md`.
+
 use crate::renderer::EqRenderer;
 use crate::scene::SceneState;
 

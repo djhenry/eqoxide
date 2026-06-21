@@ -1,3 +1,7 @@
+//! Orbit/follow camera state: azimuth/elevation/radius with smoothing toward the player, mouse-drag
+//! and scroll input, and the `CameraCmd`/`CameraSnapshot` types shared with the HTTP `/camera`
+//! endpoint (the agent sets a command; the render loop applies it and publishes a snapshot back).
+
 pub const ELEVATION_MIN: f32 = 0.08727; // 5°
 pub const ELEVATION_MAX: f32 = 1.39626; // 80°
 pub const RADIUS_MIN:    f32 = 20.0;

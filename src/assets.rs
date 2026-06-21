@@ -1,3 +1,12 @@
+//! Zone + texture asset loading and spatial queries.
+//!
+//! Loads EQ `.s3d`/`.wld` archives via libeq into CPU-side `MeshData`/`TextureData`, instances
+//! placed objects (buildings, etc.) from the zone's ActorInstance fragments, and indexes equipment
+//! textures. Also builds the `Collision` grid and its queries — `floor_z` (grounding),
+//! `nearest_hit_t`/`segment_blocked` (camera + nameplate occlusion), `path_clear` (movement
+//! gating), and `find_path` (A* routing around walls). See `docs/zone-rendering.md` and
+//! `docs/collision-system.md`.
+
 use anyhow::{Context, Result};
 use std::path::Path;
 

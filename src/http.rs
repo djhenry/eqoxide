@@ -1,3 +1,11 @@
+//! The agent-facing HTTP/REST API (axum, port 8765).
+//!
+//! Endpoints: camera control + `/frame` capture, navigation (`/goto`, `/warp`), `/entities`,
+//! NPC/combat actions (`/hail`, `/say`, `/target`, `/target/name`, `/attack`, `/buy`), zone
+//! crossing (`/zone_cross`, `/zone_points`), and `/debug`. Most handlers just write a shared
+//! `Arc<Mutex<…>>` request slot (the `*Req` type aliases below) that the navigation thread drains
+//! each tick; reads come from snapshots the render/network threads publish. See `docs/http-api.md`.
+
 use axum::{
     Router,
     body::Body,

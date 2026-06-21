@@ -1,3 +1,6 @@
+//! Camera-facing quad geometry for billboards (nameplate backings / markers). The quad's vertex
+//! `normal` field is repurposed to carry the RGB color the billboard shader reads.
+
 use crate::gpu::Vertex;
 
 /// Camera-facing quad at `pos`. Returns 4 vertices + 6 indices.

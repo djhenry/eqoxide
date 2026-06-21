@@ -1,3 +1,11 @@
+//! Full-client entry point.
+//!
+//! Loads config + the EQ string table, creates the shared request slots (`Arc<Mutex<…>>`) and the
+//! mpsc packet channel, then starts the three concurrent halves: the EQ network thread
+//! (`run_login_flow`, skipped with `--testzone`), the HTTP API server, and the winit/wgpu render
+//! loop on the main thread. The request slots are the cross-thread glue — HTTP writes them, the nav
+//! thread drains them. `--testzone` runs the renderer offline (no server) for asset/zone debugging.
+
 use eq_renderer::{assets, camera_state, config, eq_net, eqstr, http};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

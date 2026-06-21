@@ -1,3 +1,7 @@
+//! `SceneState` — the render thread's per-frame snapshot of what to draw (entity billboards, player
+//! pose/position, recent messages, target info, …). Copied from the network-owned `GameState` once
+//! per frame so the render loop never blocks on or shares locks with the EQ network thread.
+
 use crate::game_state::GameState;
 
 /// Billboard for one entity in the scene.

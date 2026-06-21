@@ -1,3 +1,6 @@
+//! Parses EQ `.map` files (line segments + labels — the in-game map overlay) for a zone, used to
+//! draw the HUD minimap and to convert map coordinates for name/coordinate `/goto`.
+
 use std::path::Path;
 
 pub struct ZoneMapLine {

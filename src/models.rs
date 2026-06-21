@@ -1,3 +1,7 @@
+//! Character model loading from glTF/GLB: meshes + per-vertex skin weights, textures, the skeleton
+//! and animation clips, per-clip posed bounds (used to recenter + ground a model on its current
+//! pose rather than its bind pose), and archetype scale. See `docs/character-models.md`.
+
 use anyhow::{Context, Result};
 use std::path::Path;
 use crate::assets::{MeshData, TextureData};

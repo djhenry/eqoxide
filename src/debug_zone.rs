@@ -1,4 +1,6 @@
-// eq_renderer/src/debug_zone.rs
+//! Synthetic zone geometry for `--testzone` (offline rendering with no EQ server): a brown ground
+//! plane + colored XYZ axis sticks, for verifying the coordinate transform and model placement.
+
 // Synthetic zone geometry for "testzone" — brown ground plane + XYZ axis sticks.
 //
 // COORDINATE NOTE: upload_zone_assets converts [X, Y, Z] → GPU [X, Z, Y].

@@ -1,3 +1,7 @@
+//! Camera math: the EQ coordinate conventions, the third-person follow camera, the view/projection
+//! matrices (note the clip-space X flip that un-mirrors the world), and world→screen projection used
+//! to place nameplates/labels in the HUD.
+
 /// EQ coordinate system: Z-up. North=+Y. East=+X. Heading 0=north, increases CCW.
 ///
 /// Third-person follow camera. Returns (camera_pos, look_target).

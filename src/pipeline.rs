@@ -1,3 +1,6 @@
+//! wgpu bind-group layouts (camera, texture, entity, joints), the camera uniform, and the render
+//! pipelines + shaders for the zone, skinned-character, and billboard passes.
+
 use crate::gpu::Vertex;
 
 pub struct Layouts {

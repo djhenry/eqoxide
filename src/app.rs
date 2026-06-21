@@ -31,6 +31,11 @@ struct PendingLoad {
     zone_max:  [f32; 2],
 }
 
+/// The winit `ApplicationHandler` and root of the render half. Owns the window + GPU surface, the
+/// `EqRenderer`, the per-frame `SceneState`, camera state, input state, and the shared request
+/// slots / packet receiver that connect it to the HTTP and EQ-network threads. Its event-loop
+/// callbacks (`resumed`, `window_event`, `about_to_wait`) drive zone loading, per-frame update from
+/// incoming packets, camera follow, and drawing.
 pub struct App {
     // Window & GPU (initialised in `resumed`)
     window:        Option<Arc<Window>>,

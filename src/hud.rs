@@ -1,3 +1,8 @@
+//! The egui HUD: player stat bars, world-projected entity nameplates/labels (tinted by consider
+//! color), the NPC dialogue panel with clickable `[keyword]`s, the minimap, and the control bar
+//! (hail/say/target buttons + say box). Buttons write the same shared request slots the HTTP API
+//! uses. See `docs/npc-interaction.md`.
+
 use crate::camera::project_to_screen;
 use crate::scene::SceneState;
 use crate::zone_map::ZoneMap;

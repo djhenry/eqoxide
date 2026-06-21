@@ -1,3 +1,6 @@
+//! Low-level wgpu building blocks: vertex formats (`Vertex`, `SkinnedVertex`), GPU-side mesh/model/
+//! texture wrappers, and helpers to upload textures, build the depth buffer, and create bind groups.
+
 use crate::assets::TextureData;
 
 #[repr(C)]

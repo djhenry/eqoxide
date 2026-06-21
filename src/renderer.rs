@@ -1,9 +1,15 @@
+//! GPU resource owner for a loaded zone. `EqRenderer` uploads zone geometry, placed objects,
+//! character models, and textures into wgpu buffers/bind-groups and holds per-entity animation
+//! state. The actual per-frame draw calls live in `pass.rs`; pipelines/layouts in `pipeline.rs`.
+
 use crate::assets::ZoneAssets;
 use crate::gpu::{
     Vertex, GpuMesh, GpuModel, GpuStaticModel, GpuSkinnedModel, GpuSkinnedMesh, SkinnedVertex,
     upload_textures, create_depth_texture, build_fallback_texture_bg,
 };
 
+/// Per-entity animation playback state, tracked across frames (which clip, how far into it, and the
+/// last action that selected it).
 pub struct EntityAnimState {
     pub clip_idx:    usize,
     pub time:        f32,
@@ -26,6 +32,9 @@ pub const JOINT_BUF_SLOTS: usize = 512;
 /// Size of one joint buffer: 128 joints × mat4(64 bytes).
 pub const JOINT_BUF_BYTES: u64 = 128 * 64;
 
+/// All GPU resources for the currently-loaded zone: the wgpu device/queue/surface, uploaded zone +
+/// placed-object meshes, character models + textures, pipelines/layouts, and per-entity animation
+/// state. Rebuilt on each zone change; `pass.rs` reads it to issue the frame's draw calls.
 pub struct EqRenderer {
     pub device:              wgpu::Device,
     pub queue:               wgpu::Queue,
