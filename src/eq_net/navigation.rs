@@ -330,18 +330,37 @@ impl Navigator {
         }
         self.last_tick = Instant::now();
 
-        // While auto-attacking a target within melee range, face it and hold position so the
-        // server registers swings. Runs regardless of any pending goto, so combat engages after
-        // a /warp too (which otherwise leaves heading stale and the nav in its walk branch).
+        // Auto-engage: while auto-attacking, walk into melee range of the target and face it so
+        // the server registers swings. Closing the last few units via legit walking (not a held
+        // far-away face) is what makes melee actually land. Runs regardless of any pending goto.
         if self.auto_attack {
             if let Some(tid) = gs.target_id {
                 if let Some((ex, ey)) = gs.entities.get(&tid).map(|e| (e.x, e.y)) {
                     let dx = ex - gs.player_x;
                     let dy = ey - gs.player_y;
-                    let d2 = dx * dx + dy * dy;
-                    if d2 < 225.0 { // ~15u melee range: face the target and stop
-                        if d2 > 0.01 {
-                            let hdg = eq_heading(dx, dy);
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    if dist < 60.0 { // engage targets within ~60u
+                        const MELEE: f32 = 5.0;
+                        let hdg = if dist > 0.01 { eq_heading(dx, dy) } else { gs.player_heading };
+                        if dist > MELEE {
+                            // Step toward the target (collision-aware), facing it.
+                            let step = 8.0_f32.min(dist - MELEE);
+                            let fdx = dx / dist * step;
+                            let fdy = dy / dist * step;
+                            let nz = gs.player_z;
+                            let mv = match self.collision.read().unwrap().clone() {
+                                None    => Some((fdx, fdy)),
+                                Some(c) => slide_move(&c, gs.player_x, gs.player_y, nz, fdx, fdy, 2.0),
+                            };
+                            if let Some((mdx, mdy)) = mv {
+                                let nx = gs.player_x + mdx;
+                                let ny = gs.player_y + mdy;
+                                self.send_position_update(stream, gs, nx, ny, nz, hdg);
+                                gs.player_x = nx; gs.player_y = ny; gs.player_heading = hdg;
+                                let _ = app_tx.send(make_position_packet(gs.player_id, nx, ny, nz));
+                            }
+                        } else {
+                            // In melee range: hold and face the target.
                             self.send_position_update(stream, gs, gs.player_x, gs.player_y, gs.player_z, hdg);
                             gs.player_heading = hdg;
                         }
@@ -451,7 +470,6 @@ impl Navigator {
         buf[28..32].copy_from_slice(&z.to_le_bytes());  // z_pos  = server_z (height)
         buf[32..34].copy_from_slice(&eq_heading.to_le_bytes());
 
-        eprintln!("POS: x={:.1} y={:.1} z={:.1} hdg={:.0} eq12_hdg={} anim={}", x, y, z, heading, eq_heading, anim);
         stream.send_app_packet(OP_CLIENT_UPDATE, &buf);
     }
 
