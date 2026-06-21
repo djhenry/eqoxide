@@ -349,6 +349,7 @@ fn apply_death(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < SIZE_DEATH { return; }
     let d = unsafe { safe_read::<Death_S>(payload) };
     let d_id = d.spawn_id;
+    let killer_id = d.killer_id; // copy out of the packed struct
     if d_id == gs.player_id {
         gs.hp_pct    = 0.0;
         gs.strategy  = "Dead — waiting to respawn".into();
@@ -363,6 +364,16 @@ fn apply_death(gs: &mut GameState, payload: &[u8]) {
             }
             eprintln!("EQ: combat: {} has been slain", name);
             gs.log_msg("combat", &format!("{} has been slain", name));
+            // Auto-loot our OWN kills: the NPC corpse reuses the mob's spawn_id, and the server
+            // doesn't send OP_BecomeCorpse for these deaths — so queue the corpse here. The
+            // gameplay loop sends OP_LootRequest after a short delay (loot-empty corpses are a no-op).
+            if killer_id == gs.player_id {
+                gs.pending_loot.push_back(d_id);
+                if gs.loot_queued_at.is_none() {
+                    gs.loot_queued_at = Some(std::time::Instant::now());
+                }
+                eprintln!("EQ: auto-loot: queued corpse_id={} ({})", d_id, name);
+            }
         }
     }
 }
