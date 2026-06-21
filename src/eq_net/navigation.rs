@@ -330,6 +330,34 @@ impl Navigator {
         }
         self.last_tick = Instant::now();
 
+        // Auto-retarget: while auto-attacking, if the current target is gone or dead, pick the
+        // nearest trash mob (name starts "a_"/"an_", which excludes named guards/merchants/
+        // citizens) within ~200u, so grinding continues hands-free between kills.
+        if self.auto_attack {
+            let valid = gs.target_id
+                .and_then(|id| gs.entities.get(&id))
+                .map(|e| !e.dead)
+                .unwrap_or(false);
+            if !valid {
+                let mut best: Option<(f32, u32)> = None;
+                for (id, e) in &gs.entities {
+                    if e.dead || !e.is_npc { continue; }
+                    let nl = e.name.to_ascii_lowercase();
+                    if !(nl.starts_with("a_") || nl.starts_with("an_")) { continue; }
+                    let dx = e.x - gs.player_x;
+                    let dy = e.y - gs.player_y;
+                    let d2 = dx * dx + dy * dy;
+                    if d2 > 200.0 * 200.0 { continue; }
+                    if best.map(|(bd, _)| d2 < bd).unwrap_or(true) { best = Some((d2, *id)); }
+                }
+                if let Some((_, id)) = best {
+                    gs.target_id = Some(id);
+                    if let Some(e) = gs.entities.get(&id) { gs.target_name = Some(e.name.clone()); }
+                    stream.send_app_packet(OP_TARGET_MOUSE, &build_target_packet(id));
+                }
+            }
+        }
+
         // Auto-engage: while auto-attacking, walk into melee range of the target and face it so
         // the server registers swings. Closing the last few units via legit walking (not a held
         // far-away face) is what makes melee actually land. Runs regardless of any pending goto.
