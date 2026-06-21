@@ -380,6 +380,9 @@ impl Navigator {
                     if e.dead || !e.is_npc { continue; }
                     let nl = e.name.to_ascii_lowercase();
                     if !(nl.starts_with("a_") || nl.starts_with("an_")) { continue; }
+                    // Skip fish — they sit in water a walking character can't path to, which would
+                    // otherwise be the "nearest" mob and strand the grinder at the water's edge.
+                    if nl.contains("fish") { continue; }
                     let dx = e.x - gs.player_x;
                     let dy = e.y - gs.player_y;
                     let d2 = dx * dx + dy * dy;
