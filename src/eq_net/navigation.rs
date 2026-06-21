@@ -366,6 +366,7 @@ impl Navigator {
                 .map(|e| !e.dead)
                 .unwrap_or(false);
             if !valid {
+                let col = self.collision.read().unwrap();
                 let mut best: Option<(f32, u32)> = None;
                 for (id, e) in &gs.entities {
                     if e.dead || !e.is_npc { continue; }
@@ -375,8 +376,16 @@ impl Navigator {
                     let dy = e.y - gs.player_y;
                     let d2 = dx * dx + dy * dy;
                     if d2 > 200.0 * 200.0 { continue; }
+                    // Only target mobs with a clear path (chest height at the mob's level) so we
+                    // don't get stuck swinging at something across water or a wall ("too far").
+                    if let Some(c) = col.as_ref() {
+                        if !c.path_clear([gs.player_x, gs.player_y, e.z + 3.0], [e.x, e.y, e.z + 3.0], 2.0) {
+                            continue;
+                        }
+                    }
                     if best.map(|(bd, _)| d2 < bd).unwrap_or(true) { best = Some((d2, *id)); }
                 }
+                drop(col);
                 if let Some((_, id)) = best {
                     gs.target_id = Some(id);
                     if let Some(e) = gs.entities.get(&id) { gs.target_name = Some(e.name.clone()); }
