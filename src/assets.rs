@@ -256,32 +256,40 @@ impl Collision {
             [self.origin[0] + (c as f32 + 0.5) * self.cell_size,
              self.origin[1] + (r as f32 + 0.5) * self.cell_size]
         };
-        // floor_z casts its probe ray DOWN from (fallback + 2), so the fallback must sit ABOVE
-        // the working floor level; it returns the fallback unchanged when there's no floor.
-        let probe = start[2] + 50.0;
-        let floor_at = |c: i32, r: i32| -> Option<f32> {
+        // floor_z casts its probe ray DOWN from (fallback + 2) over ~100u, so we must probe near
+        // the working floor level. The probe FOLLOWS the terrain: each cell's floor is found
+        // relative to the floor of the cell we reached it from — so multi-level dungeons work even
+        // when the caller's start z is stale (the common case).
+        let floor_near = |c: i32, r: i32, ref_z: f32| -> Option<f32> {
             let p = center(c, r);
-            let z = self.floor_z(p[0], p[1], probe);
-            if (z - probe).abs() < 0.01 { None } else { Some(z) }
+            let fb = ref_z + 20.0;
+            let z = self.floor_z(p[0], p[1], fb);
+            if (z - fb).abs() < 0.01 { None } else { Some(z) }
         };
         let (sc, sr) = to_cell(start[0], start[1]);
         let (gc, gr) = to_cell(goal[0], goal[1]);
         if (sc, sr) == (gc, gr) { return Some(vec![[goal[0], goal[1]]]); }
-        const STEP_H: f32 = 12.0; // max floor-height change between adjacent cells
+        // The caller's z can be stale, so find the start floor by trying several reference levels.
+        let start_floor = [start[2], goal[2], 0.0, -60.0, -120.0]
+            .into_iter()
+            .find_map(|rz| floor_near(sc, sr, rz))
+            .unwrap_or(start[2]);
+        const STEP_H: f32 = 20.0; // max floor-height change between adjacent cells (allow stairs)
         const CHEST: f32 = 3.0;
-        const MAX_NODES: usize = 40_000;
+        const MAX_NODES: usize = 200_000;
         let idx = |c: i32, r: i32| (r * cols + c) as usize;
         let n = (cols * rows) as usize;
         let mut g_score = vec![f32::MAX; n];
         let mut came: Vec<i32> = vec![-1; n];
         let mut closed = vec![false; n];
+        let mut cell_floor = vec![f32::NAN; n]; // floor height each cell was reached at
         struct Node { f: f32, c: i32, r: i32 }
         impl PartialEq for Node { fn eq(&self, o: &Self) -> bool { self.f == o.f } }
         impl Eq for Node {}
         impl Ord for Node { fn cmp(&self, o: &Self) -> Ordering { o.f.partial_cmp(&self.f).unwrap_or(Ordering::Equal) } }
         impl PartialOrd for Node { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
         let h = |c: i32, r: i32| (((c - gc) as f32).powi(2) + ((r - gr) as f32).powi(2)).sqrt() * self.cell_size;
-        let start_floor = floor_at(sc, sr).unwrap_or(start[2]);
+        cell_floor[idx(sc, sr)] = start_floor;
         g_score[idx(sc, sr)] = 0.0;
         let mut heap = BinaryHeap::new();
         heap.push(Node { f: h(sc, sr), c: sc, r: sr });
@@ -294,13 +302,13 @@ impl Collision {
             if (c, r) == (gc, gr) { found = true; break; }
             expanded += 1;
             if expanded > MAX_NODES { break; }
-            let cz = floor_at(c, r).unwrap_or(start_floor);
+            let cz = cell_floor[ci];
             for (dc, dr) in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)] {
                 let (nc, nr) = (c + dc, r + dr);
                 if nc < 0 || nr < 0 || nc >= cols || nr >= rows { continue; }
                 let ni = idx(nc, nr);
                 if closed[ni] { continue; }
-                let nz = match floor_at(nc, nr) { Some(z) => z, None => continue };
+                let nz = match floor_near(nc, nr, cz) { Some(z) => z, None => continue };
                 if (nz - cz).abs() > STEP_H { continue; }
                 let a = center(c, r);
                 let b = center(nc, nr);
@@ -310,11 +318,16 @@ impl Collision {
                 if tentative < g_score[ni] {
                     g_score[ni] = tentative;
                     came[ni] = ci as i32;
+                    cell_floor[ni] = nz;
                     heap.push(Node { f: tentative + h(nc, nr), c: nc, r: nr });
                 }
             }
         }
-        if !found { return None; }
+        if !found {
+            eprintln!("find_path: no route (expanded={}, cap={}, start_floor={} goal_floor={:?})",
+                expanded, MAX_NODES, start_floor, floor_near(gc, gr, goal[2]));
+            return None;
+        }
         let mut path = Vec::new();
         let mut cur = idx(gc, gr) as i32;
         let start_i = idx(sc, sr) as i32;
