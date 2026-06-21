@@ -169,12 +169,48 @@ def beginner():
     print("\nRun `python3 tools/quest_finder.py qeynos --turnins` (and qeynos2) for the full list.")
 
 
+def export(zones, path="data/quests.json"):
+    """Write data/quests.json that the client loads to mark quest givers (golden '!') and serve
+    GET /quests. Keyed by zone -> clean NPC name (spaces, matching the client's clean_entity_name)."""
+    import json
+    import os
+    from collections import Counter
+    data = {}
+    for zone in zones:
+        spawned, by_id = spawned_npcs(zone)
+        givers = {}
+        for f in quest_scripts(zone):
+            name, rec = npc_for_script(f, spawned, by_id)
+            if not rec:  # only givers actually spawned in this zone
+                continue
+            sets, exp, hail, has_trade = summarize(zone, f)
+            ids = sorted({i for s in sets for i in s})
+            names = item_names(ids)
+            best = max(sets, key=len) if sets else []
+            c = Counter(best)
+            clean = (name or f[:-4]).replace("_", " ")
+            givers[clean] = {
+                "npc_id": rec[0],
+                "x": float(rec[1]), "y": float(rec[2]), "z": float(rec[3]),
+                "wanted": [[i, names.get(i, "?"), c[i]] for i in c],
+                "reward_xp": sorted(set(exp)),
+                "hail": hail.strip()[:200],
+                "turn_in": bool(sets) or has_trade,
+            }
+        data[zone] = givers
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    json.dump(data, open(path, "w"), indent=1)
+    print(f"wrote {path}: " + ", ".join(f"{z}={len(g)} givers" for z, g in data.items()))
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
     if not args:
         print(__doc__)
     elif args[0] == "--beginner":
         beginner()
+    elif args[0] == "--export":
+        export(args[1:] or ["qeynos", "qeynos2", "qcat", "qrg", "qeytoqrg"])
     elif args[0] == "--npc" and len(args) > 1:
         detail(args[1])
     else:

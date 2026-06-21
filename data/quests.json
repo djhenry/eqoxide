@@ -1,0 +1,3765 @@
+{
+ "qeynos": {
+  "Lanhern Firepride": {
+   "npc_id": "1155",
+   "x": -314.0,
+   "y": 190.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Good day, traveler! You look as though you are in need of [superior armor]. We here at Firepride's specialized in armor.",
+   "turn_in": true
+  },
+  "Golden Maiden": {
+   "npc_id": "1173",
+   "x": 277.0,
+   "y": 21.0,
+   "z": -20.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Anehan Treol": {
+   "npc_id": "1158",
+   "x": -119.0,
+   "y": 120.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     18021,
+     "Jusean's Report Request",
+     1
+    ]
+   ],
+   "reward_xp": [
+    200
+   ],
+   "hail": "",
+   "turn_in": true
+  },
+  "Barthal": {
+   "npc_id": "1115",
+   "x": -276.0,
+   "y": -32.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Hail,",
+   "turn_in": false
+  },
+  "Bassanio Weekin": {
+   "npc_id": "1095",
+   "x": -262.0,
+   "y": -31.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Go to the taverns if you're looking for talk.",
+   "turn_in": false
+  },
+  "Behroe Dlexon": {
+   "npc_id": "1000",
+   "x": -119.0,
+   "y": 120.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     18027,
+     "Letter to Behroe",
+     1
+    ]
+   ],
+   "reward_xp": [
+    250
+   ],
+   "hail": "",
+   "turn_in": true
+  },
+  "Belious Naliedin": {
+   "npc_id": "1125",
+   "x": -141.0,
+   "y": 509.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     13775,
+     "Unfinished Lute Body",
+     1
+    ],
+    [
+     13776,
+     "Unfinished Lute Neck",
+     1
+    ],
+    [
+     13777,
+     "Box of Lute Strings",
+     1
+    ],
+    [
+     13778,
+     "Fine Lute Tuners",
+     1
+    ]
+   ],
+   "reward_xp": [
+    100,
+    1000
+   ],
+   "hail": "Welcome, my name is Belious Naliedin of the League of Antonican Bards. A few years ago, I had finally saved up the money, and I bought this place. I settled in,",
+   "turn_in": true
+  },
+  "Brin Stolunger": {
+   "npc_id": "1063",
+   "x": -587.0,
+   "y": 81.0,
+   "z": 32.0,
+   "wanted": [
+    [
+     13399,
+     "Full Arena Sack",
+     1
+    ]
+   ],
+   "reward_xp": [
+    6000
+   ],
+   "hail": "",
+   "turn_in": true
+  },
+  "Bruno Barstomper": {
+   "npc_id": "1075",
+   "x": -230.0,
+   "y": -263.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Byjan Timbokker": {
+   "npc_id": "1140",
+   "x": -173.0,
+   "y": 197.0,
+   "z": 3.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Greetings!  Please do not ask me to donate to the Knights of Truth or the Priests of Life.  I have enough gold going to the city of Qeynos with all these new ta",
+   "turn_in": false
+  },
+  "Caleah Herblender": {
+   "npc_id": "1118",
+   "x": -555.0,
+   "y": 304.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     13071,
+     "Rat Whiskers",
+     1
+    ],
+    [
+     13069,
+     "Bat Fur",
+     1
+    ],
+    [
+     10307,
+     "Fire Beetle Eye",
+     1
+    ]
+   ],
+   "reward_xp": [
+    300
+   ],
+   "hail": "Greetings, and welcome to my humble little shop. I sell and trade various goods for my fellow wizards of the Order of Three. My assistants, Hanlore and Drawna,",
+   "turn_in": true
+  },
+  "Captain Rohand": {
+   "npc_id": "1101",
+   "x": -40.0,
+   "y": 15.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     13034,
+     "Brandy",
+     1
+    ]
+   ],
+   "reward_xp": [
+    10
+   ],
+   "hail": "Greetings, friend, and welcome to the Mermaid's Lure. Here, we sell fishing supplies and some imported goods from far-off lands. And, if you've got a few minute",
+   "turn_in": true
+  },
+  "Captain Tillin": {
+   "npc_id": "1068",
+   "x": -512.0,
+   "y": 37.0,
+   "z": 32.0,
+   "wanted": [
+    [
+     13915,
+     "Gnoll Fang",
+     4
+    ]
+   ],
+   "reward_xp": [
+    500,
+    7000,
+    14000,
+    21000,
+    28000
+   ],
+   "hail": "Hail,",
+   "turn_in": true
+  },
+  "Cassius Messus": {
+   "npc_id": "1160",
+   "x": -147.0,
+   "y": 517.0,
+   "z": 3.0,
+   "wanted": [
+    [
+     18803,
+     "Note To Cassius",
+     1
+    ]
+   ],
+   "reward_xp": [
+    100
+   ],
+   "hail": "Hail!  What do think of [Lisera]?  She aint' much to look at, but soon she will be singing again.",
+   "turn_in": true
+  },
+  "Chesgard Sydwen": {
+   "npc_id": "1044",
+   "x": -495.0,
+   "y": -282.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     12100,
+     "Bandit Sash",
+     1
+    ]
+   ],
+   "reward_xp": [
+    1500,
+    6200
+   ],
+   "hail": "Then I would urge you to attend daily services in the Temple of Thunder.  You are a [member of Thunder] are you not?  Or maybe I am mistaken and you are just [l",
+   "turn_in": true
+  },
+  "Daedet Losaren": {
+   "npc_id": "1067",
+   "x": -544.0,
+   "y": -176.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     13395,
+     "Beetle Eye Chest",
+     1
+    ]
+   ],
+   "reward_xp": [
+    200
+   ],
+   "hail": "So it is guidance you seek. You will begin on the bottom rung. There is much more to our temple than the bashing of foes. We will need you to [collect donations",
+   "turn_in": true
+  },
+  "Daenor Casthopur": {
+   "npc_id": "1053",
+   "x": -632.0,
+   "y": 282.0,
+   "z": 3.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Neclo Rheslar is an old friend of mine. Right now, he's out working in the Qeynos Hills. In fact, if you have some free time, you should go out and meet him. He",
+   "turn_in": true
+  },
+  "Danaria Hollin": {
+   "npc_id": "1066",
+   "x": -10.0,
+   "y": -238.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Greetings! Nice to meet someone with manners. I do not see how you people stand to live in this madhouse of ruffians. I would have left weeks ago if I were not",
+   "turn_in": true
+  },
+  "Den Magason": {
+   "npc_id": "1153",
+   "x": -48.0,
+   "y": 20.0,
+   "z": 17.0,
+   "wanted": [
+    [
+     13784,
+     "Package for Den",
+     1
+    ]
+   ],
+   "reward_xp": [
+    200
+   ],
+   "hail": "Oh, hey there.. How ya doing? My name's Den. I work for ol' [Rohand] here, unloading the [shipments] that come in from overseas.",
+   "turn_in": true
+  },
+  "Dionna": {
+   "npc_id": "1069",
+   "x": -346.0,
+   "y": 406.0,
+   "z": 3.0,
+   "wanted": [
+    [
+     13708,
+     "Note from Fabian",
+     1
+    ]
+   ],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": true
+  },
+  "Drawna Opimsor": {
+   "npc_id": "1051",
+   "x": -550.0,
+   "y": 303.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Earron Huntlan": {
+   "npc_id": "1106",
+   "x": -191.0,
+   "y": 254.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     18821,
+     "Scrap of Parchment",
+     1
+    ]
+   ],
+   "reward_xp": [],
+   "hail": "Greetings, thirsty adventurer! Please help yourself to the free salty snacks. We are here to serve you at the Lion's Main Tavern. Allow yourself to indulge from",
+   "turn_in": true
+  },
+  "Ebon Strongbear": {
+   "npc_id": "1130",
+   "x": -511.0,
+   "y": 75.0,
+   "z": 32.0,
+   "wanted": [
+    [
+     27421,
+     "Perfect Gnoll Skin",
+     3
+    ],
+    [
+     27422,
+     "Studded Coin Purse",
+     1
+    ]
+   ],
+   "reward_xp": [
+    100
+   ],
+   "hail": "Welcome. I am the champion of the Steel Warriors. There are none who can challenge me. I guide this brotherhood of Steel Warriors. From Qeynos to the trade city",
+   "turn_in": true
+  },
+  "Edvard Tommels": {
+   "npc_id": "1134",
+   "x": -496.0,
+   "y": 382.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     18504,
+     "Tanned Splitpaw Skin",
+     1
+    ],
+    [
+     18505,
+     "Tanned Split Paw Skin",
+     1
+    ],
+    [
+     18506,
+     "Tanned Split Paw Skin",
+     1
+    ],
+    [
+     18507,
+     "Tanned Split Paw Skin",
+     1
+    ]
+   ],
+   "reward_xp": [
+    5000
+   ],
+   "hail": "Oh good! I can add them to my collection. We are preparing to make books you know. Bring me any of the scrolls you find in the old Splitpaw lair, and I would be",
+   "turn_in": true
+  },
+  "Endric": {
+   "npc_id": "1080",
+   "x": -515.0,
+   "y": 363.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     13713,
+     "Small Tattered Dress",
+     1
+    ]
+   ],
+   "reward_xp": [
+    100
+   ],
+   "hail": "",
+   "turn_in": true
+  },
+  "Eracon Krengon": {
+   "npc_id": "1086",
+   "x": -448.0,
+   "y": 312.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     12620,
+     "Wanted Poster",
+     1
+    ]
+   ],
+   "reward_xp": [
+    100
+   ],
+   "hail": "",
+   "turn_in": true
+  },
+  "Eve Marsinger": {
+   "npc_id": "1131",
+   "x": -124.0,
+   "y": 527.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     18165,
+     "Pouch of Mail (Qeynos)",
+     1
+    ]
+   ],
+   "reward_xp": [
+    1550
+   ],
+   "hail": "'I have messages that need to go to - well, right now I have one that needs to go to Highpass. Will you [deliver] mail to [Highpass] for me?",
+   "turn_in": true
+  },
+  "Exterminator Rasmon": {
+   "npc_id": "1144",
+   "x": -408.0,
+   "y": 232.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     13071,
+     "Rat Whiskers",
+     4
+    ]
+   ],
+   "reward_xp": [
+    50
+   ],
+   "hail": "",
+   "turn_in": true
+  },
+  "Faren": {
+   "npc_id": "1159",
+   "x": 120.0,
+   "y": -173.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     13702,
+     "Wooden Fishing Tackle",
+     1
+    ]
+   ],
+   "reward_xp": [
+    200
+   ],
+   "hail": "Oh.. Hiya, I'm just out here fishing, since I can't find a job. I hope this [bait] I just bought catches me a big ol' fish.",
+   "turn_in": true
+  },
+  "Fhara Semhart": {
+   "npc_id": "1109",
+   "x": -80.0,
+   "y": 399.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Fish Ranamer": {
+   "npc_id": "1100",
+   "x": -269.0,
+   "y": -292.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Taxes?! Taxes?! Tax me right out of business is what you folks are doing! Take your taxes and get out of my pub! Unless, of course, you care to buy some drinks.",
+   "turn_in": true
+  },
+  "Gahlith Wrannstad": {
+   "npc_id": "1055",
+   "x": -670.0,
+   "y": 314.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     18718,
+     "Tattered Note",
+     1
+    ]
+   ],
+   "reward_xp": [
+    100
+   ],
+   "hail": "",
+   "turn_in": true
+  },
+  "Gahna Salbeen": {
+   "npc_id": "1120",
+   "x": -269.0,
+   "y": -24.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Greetings. This is a grand city. I plan to make much profit here.",
+   "turn_in": false
+  },
+  "Gash Flockwalker": {
+   "npc_id": "1138",
+   "x": -87.0,
+   "y": 369.0,
+   "z": 3.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Good day to you. Your city of stone walls is quite magnificent. Still, the glory of Surefall Glade puts this city to shame.",
+   "turn_in": false
+  },
+  "Gehna Solbenya": {
+   "npc_id": "1076",
+   "x": -428.0,
+   "y": -201.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     12101,
+     "Spectacle",
+     2
+    ]
+   ],
+   "reward_xp": [
+    500
+   ],
+   "hail": "If you are a young acolyte, you may [deliver blessings to the flock] and if you are a skilled cleric, we need you to [hunt bandit binders].",
+   "turn_in": true
+  },
+  "Gharin": {
+   "npc_id": "1081",
+   "x": -317.0,
+   "y": 465.0,
+   "z": 3.0,
+   "wanted": [
+    [
+     13799,
+     "Crow's Special Brew",
+     4
+    ]
+   ],
+   "reward_xp": [
+    8000
+   ],
+   "hail": "Good day! I see they have good stock for the future armies of Qeynos. I, myself, wish to be a soldier one day instead of doing this [job].",
+   "turn_in": true
+  },
+  "Ginleen Harltop": {
+   "npc_id": "1136",
+   "x": -439.0,
+   "y": 7.0,
+   "z": 32.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Hail!  Keep all combat to the center of the ring. So says [Ebon Strongbear].",
+   "turn_in": true
+  },
+  "Grahan Rothkar": {
+   "npc_id": "1064",
+   "x": -466.0,
+   "y": -31.0,
+   "z": -24.0,
+   "wanted": [
+    [
+     20031,
+     "Pen Key # 7",
+     1
+    ]
+   ],
+   "reward_xp": [
+    2000,
+    2550,
+    8000,
+    640800
+   ],
+   "hail": "Hail,",
+   "turn_in": true
+  },
+  "Guard Augos": {
+   "npc_id": "1306",
+   "x": -66.0,
+   "y": 183.0,
+   "z": 3.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Beren": {
+   "npc_id": "1090",
+   "x": -145.0,
+   "y": -247.0,
+   "z": 5.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "What do you want? Are you friends with that lousy [dwarf]?! You had better not be unless you want to spend the rest of the week bleeding!",
+   "turn_in": false
+  },
+  "Guard Calik": {
+   "npc_id": "1149",
+   "x": -32.0,
+   "y": -251.0,
+   "z": 6.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Corshin": {
+   "npc_id": "1091",
+   "x": -145.0,
+   "y": -200.0,
+   "z": 5.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "We think the bodies are washing out of the aqueducts beneath Qeynos. It is a dangerous place to go and Commander Bayle refuses to send regular patrols down ther",
+   "turn_in": false
+  },
+  "Guard Cyrillian": {
+   "npc_id": "1006",
+   "x": -117.0,
+   "y": 41.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Dunix": {
+   "npc_id": "1181",
+   "x": -402.0,
+   "y": 406.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Forbly": {
+   "npc_id": "1174",
+   "x": -117.0,
+   "y": 41.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Jerith": {
+   "npc_id": "1002",
+   "x": -402.0,
+   "y": 406.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Yes, sir!",
+   "turn_in": false
+  },
+  "Guard Kwint": {
+   "npc_id": "1151",
+   "x": -18.0,
+   "y": 76.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     18821,
+     "Scrap of Parchment",
+     1
+    ]
+   ],
+   "reward_xp": [
+    8000
+   ],
+   "hail": "",
+   "turn_in": true
+  },
+  "Guard Lasen": {
+   "npc_id": "1150",
+   "x": -653.0,
+   "y": 126.0,
+   "z": 6.0,
+   "wanted": [
+    [
+     13006,
+     "Water Flask",
+     1
+    ]
+   ],
+   "reward_xp": [],
+   "hail": "I wish it wasn't so blasted hot, I could really use some water.",
+   "turn_in": true
+  },
+  "Guard Mezzt": {
+   "npc_id": "1001",
+   "x": -83.0,
+   "y": 74.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Haawwwl. Whasnsuud grurffnunnnsuuuss.",
+   "turn_in": false
+  },
+  "Guard Naret": {
+   "npc_id": "1152",
+   "x": -66.0,
+   "y": 183.0,
+   "z": 3.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Oleph": {
+   "npc_id": "1307",
+   "x": -653.0,
+   "y": 126.0,
+   "z": 6.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Perin": {
+   "npc_id": "1308",
+   "x": -18.0,
+   "y": 76.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Hail! My name is Perin. If you had any smarts at all you would be careful who you talk to around here.",
+   "turn_in": false
+  },
+  "Guard Phaeton": {
+   "npc_id": "1189",
+   "x": -83.0,
+   "y": 74.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Quedal": {
+   "npc_id": "1309",
+   "x": -32.0,
+   "y": -251.0,
+   "z": 6.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Relam": {
+   "npc_id": "1148",
+   "x": -52.0,
+   "y": 553.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Tyrak": {
+   "npc_id": "1310",
+   "x": -52.0,
+   "y": 553.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Urius": {
+   "npc_id": "1200",
+   "x": -19.0,
+   "y": 77.0,
+   "z": 6.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Wenbie": {
+   "npc_id": "1147",
+   "x": -19.0,
+   "y": 77.0,
+   "z": 6.0,
+   "wanted": [
+    [
+     13014,
+     "Muffin",
+     4
+    ]
+   ],
+   "reward_xp": [
+    75
+   ],
+   "hail": "Oh, it will be easier for us both if I just show you where it is. Follow me. But be quick about it, because I have to get back to my patrol.",
+   "turn_in": true
+  },
+  "Hansl Bigroon": {
+   "npc_id": "1096",
+   "x": -353.0,
+   "y": 282.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Ah, yes! Traveling can be truly dangerous. Have you ever been to Erudin or do you not care for that place?",
+   "turn_in": false
+  },
+  "Indaria": {
+   "npc_id": "1082",
+   "x": -488.0,
+   "y": 312.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     13712,
+     "Doll",
+     1
+    ]
+   ],
+   "reward_xp": [
+    27440
+   ],
+   "hail": "Hello, have you seen my daughter?",
+   "turn_in": true
+  },
+  "Joffrey Clay": {
+   "npc_id": "1123",
+   "x": -142.0,
+   "y": 546.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Greetings, friend. My name is Joffrey. I'm trying to learn to play the [flute]. I'm also working on a new song I learned while I was visiting [Kelethin].",
+   "turn_in": true
+  },
+  "Juegile Sohgohm": {
+   "npc_id": "1061",
+   "x": -645.0,
+   "y": 330.0,
+   "z": 3.0,
+   "wanted": [
+    [
+     27431,
+     "Enchanted Book",
+     1
+    ]
+   ],
+   "reward_xp": [
+    5000
+   ],
+   "hail": "Why hello there",
+   "turn_in": true
+  },
+  "Jusean Evanesque": {
+   "npc_id": "1049",
+   "x": -123.0,
+   "y": 554.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     59023,
+     "Faded Songbook",
+     1
+    ]
+   ],
+   "reward_xp": [
+    500,
+    2500
+   ],
+   "hail": "Why, hello there,",
+   "turn_in": true
+  },
+  "Karn Tassen": {
+   "npc_id": "1110",
+   "x": -255.0,
+   "y": -165.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": true
+  },
+  "Kasine Paegra": {
+   "npc_id": "1045",
+   "x": -477.0,
+   "y": -246.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     13287,
+     "Order of Thunder",
+     1
+    ]
+   ],
+   "reward_xp": [],
+   "hail": "May the blessings of the Rainkeeper protect you in your travels. I am Kasine Paegra, keeper of the [Order of Thunder] medallions.",
+   "turn_in": true
+  },
+  "Kazlo Naedra": {
+   "npc_id": "1054",
+   "x": -633.0,
+   "y": 329.0,
+   "z": 3.0,
+   "wanted": [
+    [
+     18006,
+     "Blank Scroll Sheets",
+     1
+    ]
+   ],
+   "reward_xp": [
+    500
+   ],
+   "hail": "These blank sheets seem harder to find every month. All the local merchants are out of them. Hopefully, one of the merchants out in Surefall will have some.",
+   "turn_in": true
+  },
+  "Kinloc Flamepaw": {
+   "npc_id": "1122",
+   "x": -664.0,
+   "y": 308.0,
+   "z": 5.0,
+   "wanted": [
+    [
+     18719,
+     "Tattered Note",
+     1
+    ]
+   ],
+   "reward_xp": [
+    100
+   ],
+   "hail": "",
+   "turn_in": true
+  },
+  "Klieb Torne": {
+   "npc_id": "1071",
+   "x": -259.0,
+   "y": -301.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Heh? Why don't you mind your own business bub?! Buzz off!",
+   "turn_in": true
+  },
+  "Lieutenant Arathur": {
+   "npc_id": "1085",
+   "x": -86.0,
+   "y": 42.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Lomarc": {
+   "npc_id": "1190",
+   "x": -48.0,
+   "y": 20.0,
+   "z": 17.0,
+   "wanted": [],
+   "reward_xp": [
+    200
+   ],
+   "hail": "Do I know you? Don't stick your nose where it don't belong. It might just get cut off.",
+   "turn_in": true
+  },
+  "Lord Mrallon": {
+   "npc_id": "1029",
+   "x": -455.0,
+   "y": -145.0,
+   "z": 5.0,
+   "wanted": [
+    [
+     8919,
+     "Nyrein's Prayer",
+     1
+    ],
+    [
+     8951,
+     "Tempest Rune",
+     1
+    ]
+   ],
+   "reward_xp": [
+    1000
+   ],
+   "hail": "",
+   "turn_in": true
+  },
+  "Madame Serena": {
+   "npc_id": "1092",
+   "x": -64.0,
+   "y": -38.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [
+    100
+   ],
+   "hail": "",
+   "turn_in": true
+  },
+  "Mar Sedder": {
+   "npc_id": "1113",
+   "x": -87.0,
+   "y": 536.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Marlin Bizmite": {
+   "npc_id": "1003",
+   "x": 62.0,
+   "y": 12.0,
+   "z": -16.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Greetings, fellow fisherman. You must be a fisherman. You have the stench of one. If you are not, might I suggest this new pastime I have heard of? A bath!!",
+   "turn_in": false
+  },
+  "McNeal Jocub": {
+   "npc_id": "1099",
+   "x": -261.0,
+   "y": -244.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     10070,
+     "Moonstone",
+     4
+    ]
+   ],
+   "reward_xp": [
+    500
+   ],
+   "hail": "Good ta see ya! Now start showin' these poodlewalkers how a real fish drinks!",
+   "turn_in": true
+  },
+  "Menkes Tabolet": {
+   "npc_id": "1142",
+   "x": -84.0,
+   "y": -324.0,
+   "z": 5.0,
+   "wanted": [
+    [
+     13065,
+     "Rat Foot",
+     1
+    ],
+    [
+     13071,
+     "Rat Whiskers",
+     2
+    ],
+    [
+     13033,
+     "Honey Mead",
+     1
+    ]
+   ],
+   "reward_xp": [
+    200
+   ],
+   "hail": "Greetings, fine citizen of Qeynos, what can I make for you today?  How about a genuine, handmade [rat fur cap]?  Or maybe a lovely [rat pelt cape]?  Maybe you'd",
+   "turn_in": true
+  },
+  "Mespha Tevalian": {
+   "npc_id": "1059",
+   "x": -664.0,
+   "y": 320.0,
+   "z": 5.0,
+   "wanted": [
+    [
+     18720,
+     "Tattered Note",
+     1
+    ]
+   ],
+   "reward_xp": [
+    100
+   ],
+   "hail": "Greetings.. I am Mespha Tevalian, Master Enchantress of the Hall of Sorcery and the Order of Three. Here, we all study the three circles of magic, and lend our",
+   "turn_in": true
+  },
+  "Micc Koter": {
+   "npc_id": "1072",
+   "x": -268.0,
+   "y": -316.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     13034,
+     "Brandy",
+     1
+    ]
+   ],
+   "reward_xp": [],
+   "hail": "Some guy, don't know who he was, was in here claiming he had a lead where to find some information on the Paw of Opolla. I don't know anything about it except i",
+   "turn_in": true
+  },
+  "Moran Smith": {
+   "npc_id": "1078",
+   "x": -268.0,
+   "y": -38.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Greetings!!  Moran here.  I just love this city.  I traveled from Freeport to Qeynos to stay far from the [Freeport Militia].",
+   "turn_in": false
+  },
+  "Morty Prysmith": {
+   "npc_id": "1154",
+   "x": -277.0,
+   "y": -231.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": true
+  },
+  "Nesiff Tallaherd": {
+   "npc_id": "1098",
+   "x": -243.0,
+   "y": 440.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     13925,
+     "Crate of Defective Arrows",
+     1
+    ]
+   ],
+   "reward_xp": [
+    250,
+    8000
+   ],
+   "hail": "Guard Weleth is like a son to me. He is responsible for purchasing supplies for the Qeynos Guard. He buys arrows from me. He is usually stationed near the North",
+   "turn_in": true
+  },
+  "Nindle Hogster": {
+   "npc_id": "1191",
+   "x": 62.0,
+   "y": 12.0,
+   "z": -16.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Hello! You should take up fishing. It really relieves the stress that accompanies heavy adventuring.",
+   "turn_in": false
+  },
+  "Nostahla Westfend": {
+   "npc_id": "1121",
+   "x": -102.0,
+   "y": 36.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Greetings..  I am Nostahla Westfend, understudy of Gahlith, and Second Master Wizard of the Order of Three.",
+   "turn_in": false
+  },
+  "Rabley Trumend": {
+   "npc_id": "1129",
+   "x": -550.0,
+   "y": 35.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Buy something!!  This is no tavern!  I am not selling conversation!",
+   "turn_in": false
+  },
+  "Raz The Rat Misk": {
+   "npc_id": "1089",
+   "x": 38.0,
+   "y": -345.0,
+   "z": -13.0,
+   "wanted": [],
+   "reward_xp": [
+    200
+   ],
+   "hail": "Spare 3 gold so I can get a decent meal for once, master?",
+   "turn_in": true
+  },
+  "Renic Losaren": {
+   "npc_id": "1046",
+   "x": -441.0,
+   "y": -150.0,
+   "z": 7.0,
+   "wanted": [
+    [
+     18715,
+     "Tattered Note",
+     1
+    ]
+   ],
+   "reward_xp": [
+    100
+   ],
+   "hail": "I thought you might be one who was interested in the various different trades, but which one would suit you? Ahh, alas, it would be better to let you decide for",
+   "turn_in": true
+  },
+  "Runethar Hamest": {
+   "npc_id": "1128",
+   "x": -520.0,
+   "y": -150.0,
+   "z": 7.0,
+   "wanted": [
+    [
+     18809,
+     "Bayle List II",
+     1
+    ],
+    [
+     6357,
+     "Thunder Staff",
+     1
+    ]
+   ],
+   "reward_xp": [],
+   "hail": "Welcome to the Temple of Thunder. We are home to paladins and clerics who follow the ways of Karana. Do you [need guidance] or are you [already a follower of Ka",
+   "turn_in": true
+  },
+  "Sansa Nusk": {
+   "npc_id": "1124",
+   "x": -146.0,
+   "y": 557.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     13703,
+     "Bag of Troll Guts",
+     1
+    ]
+   ],
+   "reward_xp": [
+    100
+   ],
+   "hail": "Hello..  Welcome to the Wind Spirit's Song.  I'm Sansa, and I help out the local bards here.",
+   "turn_in": true
+  },
+  "Solani Dayadil": {
+   "npc_id": "1094",
+   "x": -260.0,
+   "y": -26.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "If you are a fellow merchant. I must warn you of the inevitable tax increase.  Antonius Bayle is soon to make a [deal] with the people of Surefall Glade.",
+   "turn_in": false
+  },
+  "Sollari Bekines": {
+   "npc_id": "1050",
+   "x": -158.0,
+   "y": 524.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     27423,
+     "Vial of Gnoll Blood",
+     2
+    ],
+    [
+     27424,
+     "Gnoll Pelvis",
+     2
+    ]
+   ],
+   "reward_xp": [
+    100
+   ],
+   "hail": "Hello, there! I am Sollari Bekines of the League of Antonican Bards. I am at your service to train you as best I can. There have been a number of young bards en",
+   "turn_in": true
+  },
+  "Soulbinder Novalu": {
+   "npc_id": "1033",
+   "x": -470.0,
+   "y": 287.0,
+   "z": 3.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Greetings",
+   "turn_in": true
+  },
+  "Sunsa Jocub": {
+   "npc_id": "1074",
+   "x": -276.0,
+   "y": -305.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": true
+  },
+  "Tabure Ahendle": {
+   "npc_id": "1088",
+   "x": -507.0,
+   "y": 65.0,
+   "z": 5.0,
+   "wanted": [
+    [
+     13424,
+     "Kobold Hide",
+     4
+    ]
+   ],
+   "reward_xp": [
+    100,
+    500
+   ],
+   "hail": "What have we here?  Perhaps a future Ebon Strongbear?  A [member of the Steel Warriors]?  If the way of the warrior is not to your liking, might I suggest joini",
+   "turn_in": true
+  },
+  "Tasya Huntlan": {
+   "npc_id": "1104",
+   "x": -69.0,
+   "y": 259.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Taxes? Oh, that time again huh? Here you are. Give Vicus our best. I hear he is under the weather.",
+   "turn_in": false
+  },
+  "Ton Firepride": {
+   "npc_id": "1119",
+   "x": -327.0,
+   "y": 173.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     13129,
+     "Hurrieta's Tunic",
+     1
+    ]
+   ],
+   "reward_xp": [
+    400
+   ],
+   "hail": "Greetings, adventurer!  A mighty warrior such as yourself deserves only the finest in armor and we here at Firepride's were trained by the finest dwarven smiths",
+   "turn_in": true
+  },
+  "Tralyn Marsinger": {
+   "npc_id": "1132",
+   "x": -123.0,
+   "y": 519.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [
+    1550
+   ],
+   "hail": "Incoming mail - very good! Please take this gold for your troubles.",
+   "turn_in": true
+  },
+  "Trumpy Irontoe": {
+   "npc_id": "1042",
+   "x": -261.0,
+   "y": -309.0,
+   "z": 2.0,
+   "wanted": [
+    [
+     13033,
+     "Honey Mead",
+     4
+    ]
+   ],
+   "reward_xp": [
+    200
+   ],
+   "hail": "<BURP!> Yeah. Gimme a.. <BURP!> er.. honey mead.",
+   "turn_in": true
+  },
+  "Umvera Dekash": {
+   "npc_id": "1143",
+   "x": -567.0,
+   "y": 318.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     18504,
+     "Tanned Splitpaw Skin",
+     1
+    ],
+    [
+     18505,
+     "Tanned Split Paw Skin",
+     1
+    ],
+    [
+     18506,
+     "Tanned Split Paw Skin",
+     1
+    ],
+    [
+     18507,
+     "Tanned Split Paw Skin",
+     1
+    ]
+   ],
+   "reward_xp": [
+    8000,
+    16000
+   ],
+   "hail": "Ah, so you do have half a wit about you! Very well. As you can clearly see, I am the librarian here. I keep track of all of the mystic tomes that enter this div",
+   "turn_in": true
+  },
+  "Unsar Koldhagon": {
+   "npc_id": "1057",
+   "x": -684.0,
+   "y": 286.0,
+   "z": 3.0,
+   "wanted": [
+    [
+     13071,
+     "Rat Whiskers",
+     1
+    ],
+    [
+     13070,
+     "Snake Scales",
+     1
+    ],
+    [
+     13068,
+     "Bat Wing",
+     2
+    ]
+   ],
+   "reward_xp": [
+    100
+   ],
+   "hail": "Ah, Unsar's Glory. . . Mind you, I haven't perfected it yet, but bring me some [rat whiskers], [snake scales], and two [bat wings], and I'll show you how it wor",
+   "turn_in": true
+  },
+  "Vansted Rohenga": {
+   "npc_id": "1127",
+   "x": -449.0,
+   "y": -192.0,
+   "z": 6.0,
+   "wanted": [
+    [
+     27416,
+     "Blackburrow Battle Plans",
+     1
+    ],
+    [
+     27405,
+     "Gnoll Backbone",
+     2
+    ]
+   ],
+   "reward_xp": [
+    1000
+   ],
+   "hail": "Well all young clerics of Karana are brought up from their first day of training to know and respect their practice. I have developed a number of exercises that",
+   "turn_in": true
+  },
+  "Vicus Nonad": {
+   "npc_id": "1047",
+   "x": -286.0,
+   "y": 288.0,
+   "z": 20.0,
+   "wanted": [
+    [
+     13181,
+     "Full Tax Collection Box",
+     1
+    ],
+    [
+     18009,
+     "List of Debtors",
+     1
+    ]
+   ],
+   "reward_xp": [
+    500
+   ],
+   "hail": "Oh, <cough> I am sorry, but it seems I have fallen a bit ill.  I was caught out in the rain the other day and my chills have gotten the best of me. <cough>  If",
+   "turn_in": true
+  },
+  "Voleen Tassen": {
+   "npc_id": "1111",
+   "x": -266.0,
+   "y": -192.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": true
+  },
+  "Warehnn Awlne": {
+   "npc_id": "1133",
+   "x": -36.0,
+   "y": -10.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Come to find out about the Wayfarers Brotherhood, hm? I think I saw you around here long ago. Because you are familiar to me, I will trust you with some [",
+   "turn_in": true
+  },
+  "Wolten Grafe": {
+   "npc_id": "1043",
+   "x": -553.0,
+   "y": -189.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     13882,
+     "Box of Bones",
+     1
+    ]
+   ],
+   "reward_xp": [
+    100,
+    500
+   ],
+   "hail": "Hail, noble",
+   "turn_in": true
+  },
+  "Wrin Liltin": {
+   "npc_id": "1139",
+   "x": -203.0,
+   "y": 96.0,
+   "z": 3.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "How are you doing this fine day?  I am sure you are an adventurer and I know adventurers are weighed down by excessive platinum coins.  Why not purchase somethi",
+   "turn_in": true
+  },
+  "Wylin Dodmil": {
+   "npc_id": "1137",
+   "x": -442.0,
+   "y": 78.0,
+   "z": -24.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Excuse me, but you should not be down in the pens.  There are very dangerous creatures kept here.  For the gladiator games, you know.",
+   "turn_in": true
+  },
+  "Xantomo Salmor": {
+   "npc_id": "1027",
+   "x": -445.0,
+   "y": 161.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "So be it. Sit back and enjoy the tale of twelve adventurous folk who traveled far to meet their fellows. The fellows that will soon be mentioned had faith in th",
+   "turn_in": false
+  },
+  "Yakem Oreslinger": {
+   "npc_id": "1030",
+   "x": -81.0,
+   "y": 541.0,
+   "z": 18.0,
+   "wanted": [
+    [
+     10952,
+     "Small Shipment of High Quality Ore",
+     1
+    ]
+   ],
+   "reward_xp": [
+    500
+   ],
+   "hail": "I need you to take this crate and fill it with either Small Bracks of Unrefined Ore or Large Bricks of Unrefined Ore then return it to me so that I may refine i",
+   "turn_in": true
+  },
+  "Zamel": {
+   "npc_id": "1079",
+   "x": -395.0,
+   "y": 149.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     13713,
+     "Small Tattered Dress",
+     1
+    ]
+   ],
+   "reward_xp": [
+    100
+   ],
+   "hail": "Aye, the aqueducts are a horrible place.  I have heard rumors of horrible [beasts] who live under the city in the water and just the other day, a child playing",
+   "turn_in": true
+  },
+  "a sewer rat": {
+   "npc_id": "1157",
+   "x": -313.0,
+   "y": -318.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "an investigator": {
+   "npc_id": "1031",
+   "x": -40.0,
+   "y": 163.0,
+   "z": 2.0,
+   "wanted": [
+    [
+     2369,
+     "Riley's Confession",
+     1
+    ],
+    [
+     2394,
+     "Willie's Confession",
+     1
+    ],
+    [
+     2279,
+     "Head of Donally Stultz",
+     1
+    ]
+   ],
+   "reward_xp": [
+    2000
+   ],
+   "hail": "The first suspect was last seen near the shop called Fireprides.",
+   "turn_in": true
+  },
+  "campday": {
+   "npc_id": "1315",
+   "x": 0.0,
+   "y": 0.0,
+   "z": 0.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "campnight": {
+   "npc_id": "1316",
+   "x": 0.0,
+   "y": 0.0,
+   "z": 0.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  }
+ },
+ "qeynos2": {
+  "Aenia Ghenson": {
+   "npc_id": "2096",
+   "x": -68.0,
+   "y": -89.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Why, hello there!  I'm Aenia, daughter of Dranom.  It's such a bore just sitting around here all day and night.  My father is soooooo overprotective! He never l",
+   "turn_in": false
+  },
+  "Artisan Tar Cordell": {
+   "npc_id": "2157",
+   "x": 395.0,
+   "y": 243.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     34997,
+     "Blessed Impression Book",
+     1
+    ]
+   ],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": true
+  },
+  "Artisan Vor Westrider": {
+   "npc_id": "2158",
+   "x": 190.0,
+   "y": 53.0,
+   "z": 3.0,
+   "wanted": [
+    [
+     34997,
+     "Blessed Impression Book",
+     1
+    ]
+   ],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": true
+  },
+  "Astaed Wemor": {
+   "npc_id": "2100",
+   "x": -471.0,
+   "y": -175.0,
+   "z": 34.0,
+   "wanted": [
+    [
+     18862,
+     "Tattered Note",
+     1
+    ]
+   ],
+   "reward_xp": [
+    1000,
+    4000
+   ],
+   "hail": "Greetings. I am Astaed Wemor of the Paladins of the Temple of Life. We are the defenders of the all-giving Prime Healer.  Are you [here to pray] or are you [her",
+   "turn_in": true
+  },
+  "Brohan Ironforge": {
+   "npc_id": "2057",
+   "x": -4.0,
+   "y": 107.0,
+   "z": 20.0,
+   "wanted": [
+    [
+     18863,
+     "Sealed Letter",
+     1
+    ]
+   ],
+   "reward_xp": [
+    1000
+   ],
+   "hail": "Please, leave me be alone. I have such sorrow in my heart.. I wish to be alone with my thoughts.",
+   "turn_in": true
+  },
+  "Camlend Serbold": {
+   "npc_id": "2092",
+   "x": -677.0,
+   "y": -206.0,
+   "z": -10.0,
+   "wanted": [
+    [
+     13324,
+     "Pestilence Scythe",
+     1
+    ],
+    [
+     13325,
+     "Decaying Heart",
+     1
+    ]
+   ],
+   "reward_xp": [
+    100,
+    1000
+   ],
+   "hail": "It has been a while,",
+   "turn_in": true
+  },
+  "Corporal Lancot": {
+   "npc_id": "2097",
+   "x": -503.0,
+   "y": -236.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Crow": {
+   "npc_id": "2063",
+   "x": 358.0,
+   "y": 91.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     17600,
+     "Tattered Leather Pouch",
+     1
+    ]
+   ],
+   "reward_xp": [
+    250
+   ],
+   "hail": "Welcome to Crow's! If you're thirsty, we have a fine selection of brews and ales.",
+   "turn_in": true
+  },
+  "Davloran Girionlis": {
+   "npc_id": "2043",
+   "x": -425.0,
+   "y": -228.0,
+   "z": 24.0,
+   "wanted": [
+    [
+     27399,
+     "Wisp Essence",
+     2
+    ],
+    [
+     27417,
+     "Flawless Gnoll Hides",
+     2
+    ]
+   ],
+   "reward_xp": [
+    100
+   ],
+   "hail": "Good day",
+   "turn_in": true
+  },
+  "Dranom Ghenson": {
+   "npc_id": "2095",
+   "x": -74.0,
+   "y": -88.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Aenia is my beautiful daughter.  Many so-called men have tried to win her hand in marriage, but none of them have been able to live up to my standards.  My daug",
+   "turn_in": false
+  },
+  "Dren Ironforge": {
+   "npc_id": "2070",
+   "x": 50.0,
+   "y": 20.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Welcome to Ironforge's.  We are the makers of all things fine. Would you care to view my wares, or have you come to learn the fine art of crafting [Antonian Wea",
+   "turn_in": false
+  },
+  "Drun Vorwig": {
+   "npc_id": "2150",
+   "x": 90.0,
+   "y": 280.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Come to find out about the Wayfarers Brotherhood, hm? I think I saw you around here long ago. Because you are familiar to me, I will trust you with some [",
+   "turn_in": true
+  },
+  "Enic Ruklin": {
+   "npc_id": "2039",
+   "x": -375.0,
+   "y": -34.0,
+   "z": 5.0,
+   "wanted": [
+    [
+     69929,
+     "Corrupted Koalindl's Heart",
+     1
+    ],
+    [
+     69930,
+     "Corrupted Koalindl's Heart",
+     1
+    ],
+    [
+     69931,
+     "Corrupted Koalindl's Heart",
+     1
+    ],
+    [
+     69932,
+     "Corrupted Koalindl's Heart",
+     1
+    ]
+   ],
+   "reward_xp": [
+    400
+   ],
+   "hail": "Hail! These are the sacred grounds of the Temple of Life. Please do not cause any disturbances while on our grounds. I would hate to have to hurt you. In the na",
+   "turn_in": true
+  },
+  "Exterminator Wintloag": {
+   "npc_id": "2099",
+   "x": 135.0,
+   "y": 202.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     13071,
+     "Rat Whiskers",
+     4
+    ]
+   ],
+   "reward_xp": [
+    50
+   ],
+   "hail": "",
+   "turn_in": true
+  },
+  "Faldor Hendrys": {
+   "npc_id": "2140",
+   "x": -134.0,
+   "y": -84.0,
+   "z": 3.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Felodius Sworddancer": {
+   "npc_id": "2060",
+   "x": -256.0,
+   "y": -106.0,
+   "z": 2.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "I could treat you to a story about an ogre legend!  Or perhaps you would like to hear a story about the [gnome] who cried kobold?",
+   "turn_in": false
+  },
+  "Filian Weagleross": {
+   "npc_id": "2042",
+   "x": -679.0,
+   "y": -109.0,
+   "z": -10.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Pleased to meet you",
+   "turn_in": true
+  },
+  "Fippy Darkpaw": {
+   "npc_id": "2119",
+   "x": 481.0,
+   "y": 1211.0,
+   "z": 3.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Flynn Merrington": {
+   "npc_id": "2091",
+   "x": 333.0,
+   "y": 39.0,
+   "z": 2.0,
+   "wanted": [
+    [
+     13122,
+     "Erud's Tonic",
+     1
+    ]
+   ],
+   "reward_xp": [
+    500
+   ],
+   "hail": "Oh look.. another gnoll pup. This bar is too rough for the likes of you. Why don't you try Fish's. We don't need any more regulars here, chump!",
+   "turn_in": true
+  },
+  "Gerault Takenmaul": {
+   "npc_id": "2065",
+   "x": 19.0,
+   "y": -64.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Hello.  Please feel free to browse.  We make the finest boots in all of Antonica.",
+   "turn_in": false
+  },
+  "Ghil Starn": {
+   "npc_id": "2084",
+   "x": 196.0,
+   "y": 157.0,
+   "z": -29.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "I'm Ghil.. I used to run a small business before I hooked up with Hanns. Together, we muscled our competition out of Qeynos. But I'm getting too old for the rou",
+   "turn_in": false
+  },
+  "Gibson Galliway": {
+   "npc_id": "2050",
+   "x": 270.0,
+   "y": 143.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     55006,
+     "Gibson's Ring",
+     1
+    ]
+   ],
+   "reward_xp": [
+    15000
+   ],
+   "hail": "Hello stranger. Welcome to Galliway's. Please excuse me. I am very [tired] right now.",
+   "turn_in": true
+  },
+  "Grarrax Darkpaw": {
+   "npc_id": "2103",
+   "x": 481.0,
+   "y": 1211.0,
+   "z": 3.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Aerryn": {
+   "npc_id": "2121",
+   "x": -36.0,
+   "y": -128.0,
+   "z": 3.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Buce": {
+   "npc_id": "2016",
+   "x": 304.0,
+   "y": 155.0,
+   "z": 3.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Greetings, citizen! While I have taken an oath to protect you. that does not mean I have to waste my breath talking to you.",
+   "turn_in": false
+  },
+  "Guard Deregan": {
+   "npc_id": "2117",
+   "x": 37.0,
+   "y": -83.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Drath": {
+   "npc_id": "2013",
+   "x": 165.0,
+   "y": 309.0,
+   "z": 48.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Elron": {
+   "npc_id": "2080",
+   "x": 56.0,
+   "y": 290.0,
+   "z": 48.0,
+   "wanted": [
+    [
+     13713,
+     "Small Tattered Dress",
+     1
+    ]
+   ],
+   "reward_xp": [
+    100
+   ],
+   "hail": "Greetings. I am sorry but I can't concentrate on my post and talk to you at the same time. Especially when I should be out searching for [Lucie]..  Please excus",
+   "turn_in": true
+  },
+  "Guard Erabb": {
+   "npc_id": "2120",
+   "x": 245.0,
+   "y": 164.0,
+   "z": 3.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Furithane": {
+   "npc_id": "2116",
+   "x": 65.0,
+   "y": 251.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Gehnus": {
+   "npc_id": "2093",
+   "x": 130.0,
+   "y": 312.0,
+   "z": 3.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Ginton": {
+   "npc_id": "2009",
+   "x": -36.0,
+   "y": -128.0,
+   "z": 3.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Have you noticed anything strange about Commander Bayle lately? I saw him talking to that trouble-making Irontoe the other day and one night late last week, whe",
+   "turn_in": false
+  },
+  "Guard Hewet": {
+   "npc_id": "2007",
+   "x": 200.0,
+   "y": 364.0,
+   "z": 3.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Hezlan": {
+   "npc_id": "2094",
+   "x": 101.0,
+   "y": 310.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "It isn't safe to be asking that kind of question. I just mind my business and do my job. You would, too, if you knew what was good for you.",
+   "turn_in": false
+  },
+  "Guard Imkar": {
+   "npc_id": "2113",
+   "x": 304.0,
+   "y": 155.0,
+   "z": 3.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "I really don't know yet.  I just know that chills shoot up and down my spine when I pass certain places on my patrol.  My mother was a gypsy and told me I had t",
+   "turn_in": false
+  },
+  "Guard Liben": {
+   "npc_id": "2122",
+   "x": 200.0,
+   "y": 364.0,
+   "z": 3.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Oh you know. the Circle.  The Circle of Unseen Hands is what they call themselves.  They are a bunch of thieves and murderers.  Just stay clear of them. if you",
+   "turn_in": false
+  },
+  "Guard Obyn": {
+   "npc_id": "2106",
+   "x": 65.0,
+   "y": 251.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Rashik": {
+   "npc_id": "2008",
+   "x": 137.0,
+   "y": 217.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Shorm": {
+   "npc_id": "2112",
+   "x": 137.0,
+   "y": 217.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Simkin": {
+   "npc_id": "2114",
+   "x": 377.0,
+   "y": 233.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Treitan": {
+   "npc_id": "2110",
+   "x": 202.0,
+   "y": 270.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Vaskif": {
+   "npc_id": "2115",
+   "x": 165.0,
+   "y": 309.0,
+   "z": 48.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Wefnin": {
+   "npc_id": "2012",
+   "x": 37.0,
+   "y": -83.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Weleth": {
+   "npc_id": "2079",
+   "x": 207.0,
+   "y": 217.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     18824,
+     "Slip of Parchment",
+     1
+    ]
+   ],
+   "reward_xp": [
+    8000
+   ],
+   "hail": "Oh, we just received a shipment of arrows from [Nesiff] in South Qeynos. The arrows in this box are missing their fletchings and I can't leave my patrol to take",
+   "turn_in": true
+  },
+  "Hanns Krieghor": {
+   "npc_id": "2074",
+   "x": 149.0,
+   "y": 31.0,
+   "z": -27.0,
+   "wanted": [
+    [
+     18708,
+     "Napkin From Crow's",
+     1
+    ]
+   ],
+   "reward_xp": [
+    100,
+    50000
+   ],
+   "hail": "My name is Hanns..  Do as I say. and we shall get along just fine.",
+   "turn_in": true
+  },
+  "Hurrieta Ironforge": {
+   "npc_id": "2038",
+   "x": -93.0,
+   "y": 130.0,
+   "z": 3.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "What are you doing back here?! I cannot stand it when the children allow their friends to run rampant on our estate. Please leave!",
+   "turn_in": false
+  },
+  "Jaylia the Faithful": {
+   "npc_id": "2053",
+   "x": 417.0,
+   "y": 106.0,
+   "z": 3.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "My parents provided me with a vast amount of knowledge.  I was taught the ways of the Holy Knights at the Temple of Thunder and the Temple of Life.  After the d",
+   "turn_in": false
+  },
+  "Jracol Brestiage": {
+   "npc_id": "2029",
+   "x": -854.0,
+   "y": 1118.0,
+   "z": 3.0,
+   "wanted": [
+    [
+     13903,
+     "Bent Playing Card",
+     1
+    ]
+   ],
+   "reward_xp": [
+    1000
+   ],
+   "hail": "You'd better run along, if ya know what's best for ya!",
+   "turn_in": true
+  },
+  "Kane Bayle": {
+   "npc_id": "2006",
+   "x": 202.0,
+   "y": 270.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Hail, citizen! I am afraid you are not allowed in this building. You will have to leave. Good day to you.",
+   "turn_in": true
+  },
+  "Knargon Lanenda": {
+   "npc_id": "2072",
+   "x": 185.0,
+   "y": 73.0,
+   "z": -29.0,
+   "wanted": [
+    [
+     18722,
+     "Sealed Note For Knargon",
+     1
+    ]
+   ],
+   "reward_xp": [
+    500
+   ],
+   "hail": "Hey..  What's up? My name's Knargon Lanenda. I just came over here from [Freeport] a couple of months ago. I used to run a big business importing goods from [Fa",
+   "turn_in": true
+  },
+  "Lashun Novashine": {
+   "npc_id": "2032",
+   "x": 314.0,
+   "y": 243.0,
+   "z": 18.0,
+   "wanted": [
+    [
+     13073,
+     "Bone Chips",
+     4
+    ]
+   ],
+   "reward_xp": [
+    1,
+    12
+   ],
+   "hail": "Greetings, people of Qeynos! Are you lost? Has the chaotic life of an adventurer left you empty and alone? Seek redemption in the glorious light of the Prime He",
+   "turn_in": true
+  },
+  "Leanon Ruksey": {
+   "npc_id": "2123",
+   "x": 127.0,
+   "y": 304.0,
+   "z": 48.0,
+   "wanted": [
+    [
+     18020,
+     "Jusean's Report Request",
+     1
+    ]
+   ],
+   "reward_xp": [
+    200
+   ],
+   "hail": "Ah..  good day. friend.  My name's Leanon Ruksey. loyal member of the League of Antonican Bards..  Qeynos Chapter. of course.  It's part of my job to keep up wi",
+   "turn_in": true
+  },
+  "Lieutenant Dagarok": {
+   "npc_id": "2020",
+   "x": 245.0,
+   "y": 164.0,
+   "z": 3.0,
+   "wanted": [
+    [
+     18824,
+     "Slip of Parchment",
+     1
+    ]
+   ],
+   "reward_xp": [
+    32000
+   ],
+   "hail": "How dare you disturb me! You people need to just mind your pathetic lives and leave the rest to us. Leave me now!",
+   "turn_in": true
+  },
+  "LuSun": {
+   "npc_id": "2077",
+   "x": 301.0,
+   "y": 342.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     18712,
+     "Note with Fist Insignia",
+     1
+    ]
+   ],
+   "reward_xp": [
+    100
+   ],
+   "hail": "Ah.. Greetings.. I am Lu'Sun, Guild Master of the Silent Fist Clan. Here, our goal is to train our body, mind, and soul to the peak of perfection.",
+   "turn_in": true
+  },
+  "Moodoro Finharn": {
+   "npc_id": "2040",
+   "x": 338.0,
+   "y": 165.0,
+   "z": 3.0,
+   "wanted": [
+    [
+     13118,
+     "Erud's Tonic",
+     1
+    ]
+   ],
+   "reward_xp": [
+    200
+   ],
+   "hail": "Greetings, fellow traveler! I gotta tell ya. I love this town. Especially Crow's. Although the crowd seems a bit shadier than other places of the sort.",
+   "turn_in": true
+  },
+  "Nerissa Clothspinner": {
+   "npc_id": "2036",
+   "x": 347.0,
+   "y": 83.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     13302,
+     "Monogrammed Cloth",
+     1
+    ]
+   ],
+   "reward_xp": [
+    3000
+   ],
+   "hail": "I cannot discuss such things with a person as young to the world as you are.",
+   "turn_in": true
+  },
+  "Nixx Darkpaw": {
+   "npc_id": "2127",
+   "x": 481.0,
+   "y": 1211.0,
+   "z": 3.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Nomsoe Jusagta": {
+   "npc_id": "2088",
+   "x": -261.0,
+   "y": -233.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Greetings and welcome to the Temple of Life! The healing of the world shall begin within. Let me know if you have seen a [new disciple of life]. I have a task w",
+   "turn_in": false
+  },
+  "Pelshia Thuxpire": {
+   "npc_id": "2073",
+   "x": 160.0,
+   "y": 69.0,
+   "z": -29.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Heya.. If you see anything you like, I'm sure we can make a deal.",
+   "turn_in": false
+  },
+  "Phin Esrinap": {
+   "npc_id": "2075",
+   "x": 330.0,
+   "y": 300.0,
+   "z": 18.0,
+   "wanted": [
+    [
+     13789,
+     "?",
+     4
+    ]
+   ],
+   "reward_xp": [
+    100,
+    200,
+    300,
+    1500
+   ],
+   "hail": "Hello, my name is Phin. Practice, practice, practice.. That's my motto. It is my responsibility to train our members, and help them to advance their skills and",
+   "turn_in": true
+  },
+  "Priestess Caulria": {
+   "npc_id": "2090",
+   "x": -604.0,
+   "y": -133.0,
+   "z": -10.0,
+   "wanted": [
+    [
+     13949,
+     "Diseased Wolf Pelt",
+     1
+    ]
+   ],
+   "reward_xp": [
+    500
+   ],
+   "hail": "Welcome to the holy Temple of Life. Your presence shows an interest in our ways. We are the followers of the [Prime Healer] and would gladly open our arms to an",
+   "turn_in": true
+  },
+  "Priestess Jahnda": {
+   "npc_id": "2078",
+   "x": -678.0,
+   "y": -59.0,
+   "z": -10.0,
+   "wanted": [
+    [
+     18714,
+     "Tattered Note",
+     1
+    ]
+   ],
+   "reward_xp": [
+    100
+   ],
+   "hail": "Welcome to the Temple of Life. where the will of Rodcet Nife, the Prime Healer, is carried out.  I am the High Priestess Jahnda.  If you require any training in",
+   "turn_in": true
+  },
+  "Quinon Hulleaf": {
+   "npc_id": "2027",
+   "x": 127.0,
+   "y": 304.0,
+   "z": 48.0,
+   "wanted": [
+    [
+     18020,
+     "Jusean's Report Request",
+     1
+    ]
+   ],
+   "reward_xp": [
+    200
+   ],
+   "hail": "",
+   "turn_in": true
+  },
+  "Reldin Harkolis": {
+   "npc_id": "2056",
+   "x": 206.0,
+   "y": 140.0,
+   "z": -29.0,
+   "wanted": [
+    [
+     19944,
+     "Sharpened Unseen Hands Dagger",
+     1
+    ],
+    [
+     13915,
+     "Gnoll Fang",
+     1
+    ],
+    [
+     19945,
+     "Large King Snake Skin",
+     1
+    ]
+   ],
+   "reward_xp": [],
+   "hail": "Hail",
+   "turn_in": true
+  },
+  "Renux Herkanor": {
+   "npc_id": "2033",
+   "x": 187.0,
+   "y": 16.0,
+   "z": -30.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": true
+  },
+  "Rineval Talyas": {
+   "npc_id": "2041",
+   "x": -347.0,
+   "y": 160.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     19071,
+     "Torn, Burnt Book",
+     1
+    ],
+    [
+     19070,
+     "Torn, Frost-covered Book",
+     1
+    ]
+   ],
+   "reward_xp": [],
+   "hail": "hello,",
+   "turn_in": true
+  },
+  "Rodgar the Tall": {
+   "npc_id": "2064",
+   "x": -7.0,
+   "y": -89.0,
+   "z": 18.0,
+   "wanted": [
+    [
+     13878,
+     "Pearl of Odus",
+     4
+    ]
+   ],
+   "reward_xp": [
+    2432
+   ],
+   "hail": "What is all this talk of Treant Wood? I can get you some. In about two months, I shall have a new stock. Perhaps I may have some to trade... if you do me a [fav",
+   "turn_in": true
+  },
+  "Roesager Thusten": {
+   "npc_id": "2059",
+   "x": -116.0,
+   "y": -128.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Hail.",
+   "turn_in": true
+  },
+  "Sabnie Blagard": {
+   "npc_id": "2083",
+   "x": 368.0,
+   "y": 82.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Greetings. thirsty traveler!  I recommend trying Crow's special brew.  It's the brew that put Qeynos on the map!",
+   "turn_in": false
+  },
+  "Sneed Galliway": {
+   "npc_id": "2067",
+   "x": 243.0,
+   "y": 132.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     13717,
+     "Rat Head",
+     1
+    ]
+   ],
+   "reward_xp": [
+    250
+   ],
+   "hail": "Shhh.. Keep it down. It seems I have a little rodent problem in my store. A mangy rat keeps digging into my crates of rations. He looks as if he is diseased. If",
+   "turn_in": true
+  },
+  "Suuspa Clanim": {
+   "npc_id": "2058",
+   "x": -629.0,
+   "y": -180.0,
+   "z": -11.0,
+   "wanted": [
+    [
+     13301,
+     "Rat Shaped Ring",
+     1
+    ]
+   ],
+   "reward_xp": [
+    1000
+   ],
+   "hail": "Welcome to the Temple of Life,",
+   "turn_in": true
+  },
+  "Svena Ironforge": {
+   "npc_id": "2068",
+   "x": 34.0,
+   "y": 60.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Welcome to Ironforge Jewelers. We are the finest jewelers this side of the Serpent's Spine.",
+   "turn_in": false
+  },
+  "The Fabled Fippy Darkpaw": {
+   "npc_id": "2148",
+   "x": 481.0,
+   "y": 1211.0,
+   "z": 3.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Togahn Sorast": {
+   "npc_id": "2087",
+   "x": 393.0,
+   "y": 290.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     10112,
+     "Orange Headband",
+     1
+    ],
+    [
+     13165,
+     "Head of Ghanex Drah",
+     1
+    ],
+    [
+     13166,
+     "Dareb's Skull",
+     1
+    ],
+    [
+     13167,
+     "Head of Shen",
+     1
+    ]
+   ],
+   "reward_xp": [
+    500,
+    1000
+   ],
+   "hail": "Greetings.. I am Second Master Togahn Sorast. I am here to teach the ways of our guild. For our more advanced members, I will give out [headbands] as a reward f",
+   "turn_in": true
+  },
+  "Tonmerk Plorsin": {
+   "npc_id": "2089",
+   "x": -693.0,
+   "y": -156.0,
+   "z": -11.0,
+   "wanted": [
+    [
+     16581,
+     "Bog Juice",
+     1
+    ],
+    [
+     13009,
+     "Bandages",
+     1
+    ]
+   ],
+   "reward_xp": [
+    0
+   ],
+   "hail": "Hello. child.  Welcome to the Temple of Life. Here. you may pay homage to the [Prime Healer]. [Rodcet Nife].  If you are in need of [healing] or require me to [",
+   "turn_in": true
+  },
+  "Tubal Weaver": {
+   "npc_id": "2062",
+   "x": 94.0,
+   "y": 217.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Whew. I am parched. I will be back in a few minutes.",
+   "turn_in": false
+  },
+  "Tyokan Mekase": {
+   "npc_id": "2004",
+   "x": -146.0,
+   "y": -161.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     13306,
+     "T.O.L. 2020",
+     1
+    ]
+   ],
+   "reward_xp": [],
+   "hail": "Please look around. We have many items exclusively for the members of the Temple of Life. We also have [scroll strongboxes]. If you are unsure of what an item i",
+   "turn_in": true
+  },
+  "Vegalys Keldrane": {
+   "npc_id": "2051",
+   "x": 200.0,
+   "y": 310.0,
+   "z": 48.0,
+   "wanted": [
+    [
+     2694,
+     "Seal of Vegalys",
+     1
+    ],
+    [
+     2392,
+     "Head of Azibelle Spavin",
+     1
+    ]
+   ],
+   "reward_xp": [
+    2000
+   ],
+   "hail": "Greetings to you, citizen. By order of the Council of Qeynos I have been given the duty of apprehending the individuals [responsible] for unleashing this terrib",
+   "turn_in": true
+  },
+  "Whysia Flock": {
+   "npc_id": "2111",
+   "x": -146.0,
+   "y": -161.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "The scroll strongboxes are kept here. They are used by the temple clerics to hold their valuable scrolls. I tend to the 30 and 40 numbered boxes and [Tyokan] de",
+   "turn_in": false
+  },
+  "Zannsin Resdinet": {
+   "npc_id": "2085",
+   "x": 163.0,
+   "y": 144.0,
+   "z": -29.0,
+   "wanted": [
+    [
+     18028,
+     "Message to Zannsin",
+     1
+    ]
+   ],
+   "reward_xp": [
+    500
+   ],
+   "hail": "Hey..  My name's Zannsin. but you can call me [Zan].",
+   "turn_in": true
+  },
+  "Ziska Ironforge": {
+   "npc_id": "2069",
+   "x": 60.0,
+   "y": 54.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Welcome to our home of the finest jewelers in all of Norrath.",
+   "turn_in": true
+  },
+  "a gruff voice": {
+   "npc_id": "2134",
+   "x": -1096.0,
+   "y": 1262.0,
+   "z": 3.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  }
+ },
+ "qcat": {
+  "Dollin Nusmag": {
+   "npc_id": "45127",
+   "x": -592.0,
+   "y": 409.0,
+   "z": -36.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Come to find out about the Wayfarers Brotherhood, hm? I think I saw you around here long ago. Because you are familiar to me, I will trust you with some [",
+   "turn_in": true
+  },
+  "an investigator": {
+   "npc_id": "45093",
+   "x": 18.0,
+   "y": 957.0,
+   "z": -39.0,
+   "wanted": [
+    [
+     2694,
+     "Seal of Vegalys",
+     1
+    ]
+   ],
+   "reward_xp": [],
+   "hail": "Vegalys sent you. I'm done for. Guard Helminth found a false wall. We stepped through it. We were ambushed. I didn't see where Helminth went. He disappeared. I",
+   "turn_in": true
+  }
+ },
+ "qrg": {
+  "Bren Treeclimber": {
+   "npc_id": "3027",
+   "x": -222.0,
+   "y": 664.0,
+   "z": 20.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Heh?  Oh.  Poachers are constantly after our bears for their valuable skins.  I wish those darn [Millers] would move on. Then, maybe, our bears would be left al",
+   "turn_in": false
+  },
+  "Corun Finisc": {
+   "npc_id": "3022",
+   "x": -192.0,
+   "y": 68.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     13231,
+     "Bottom of Broken Staff",
+     1
+    ],
+    [
+     13232,
+     "Top of Broken Staff",
+     1
+    ]
+   ],
+   "reward_xp": [
+    1500
+   ],
+   "hail": "Hello. My name is Corun Finisc and I am one of the Jaggedpine Treefolk. It is our divine responsibility to watch over and protect Surefall Glade and its [",
+   "turn_in": true
+  },
+  "Errin Pinewhisper": {
+   "npc_id": "3041",
+   "x": -7.0,
+   "y": 177.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     20104,
+     "Sharpened Pine Scout Sword",
+     1
+    ],
+    [
+     13915,
+     "Gnoll Fang",
+     1
+    ],
+    [
+     19945,
+     "Large King Snake Skin",
+     1
+    ]
+   ],
+   "reward_xp": [
+    5000,
+    10000
+   ],
+   "hail": "Welcome to Surefall Glade friend. I am Errin Pinewhisper, Ranger of Karana the Storm Lord. You will find worshipers of both Karana and Tunare residing here in h",
+   "turn_in": true
+  },
+  "Frenway Marthank": {
+   "npc_id": "3021",
+   "x": -303.0,
+   "y": -103.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     18809,
+     "Bayle List II",
+     1
+    ],
+    [
+     13912,
+     "Mammoth's Hide",
+     1
+    ]
+   ],
+   "reward_xp": [
+    500
+   ],
+   "hail": "Greetings. stranger. Please excuse my melancholy state.  I have had some [bad news] that has brought me great sorrow.",
+   "turn_in": true
+  },
+  "Gerael Woodone": {
+   "npc_id": "3034",
+   "x": -396.0,
+   "y": -177.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     18911,
+     "Tattered Cloth Note",
+     1
+    ]
+   ],
+   "reward_xp": [
+    200
+   ],
+   "hail": "That is splendid! I thought I would have to take the long journey to the western Plains of Karana myself. Here you are, my friend. Take this flask of nitrates t",
+   "turn_in": true
+  },
+  "Gillarian Naelev": {
+   "npc_id": "3025",
+   "x": -36.0,
+   "y": 179.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     13813,
+     "Gnoll Head",
+     1
+    ]
+   ],
+   "reward_xp": [
+    6000
+   ],
+   "hail": "Welcome, friend. Welcome to Surefall Glade. I need not remind you about [poaching], I hope",
+   "turn_in": true
+  },
+  "Gurrin Nitestorm": {
+   "npc_id": "3014",
+   "x": -57.0,
+   "y": 269.0,
+   "z": 2.0,
+   "wanted": [
+    [
+     8908,
+     "Writ of Thunder",
+     1
+    ],
+    [
+     8911,
+     "Silver Blade of Rot",
+     1
+    ]
+   ],
+   "reward_xp": [
+    1000
+   ],
+   "hail": "Greetings, traveler. I am Gurrin Nitestorm, priest of The Rainkeeper and blacksmith of the Jaggedpine. I am still somewhat lost in these foreign lands and altho",
+   "turn_in": true
+  },
+  "Hager Sureshot": {
+   "npc_id": "3032",
+   "x": 84.0,
+   "y": 108.0,
+   "z": 3.0,
+   "wanted": [
+    [
+     18709,
+     "Tattered Note",
+     1
+    ]
+   ],
+   "reward_xp": [
+    100,
+    1000
+   ],
+   "hail": "Greetings,",
+   "turn_in": true
+  },
+  "Jhaya Wyndrunner": {
+   "npc_id": "3015",
+   "x": -477.0,
+   "y": -321.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     8763,
+     "Black Rawhide Tunic",
+     1
+    ],
+    [
+     8762,
+     "Pouch of Polished Jade Stones",
+     1
+    ]
+   ],
+   "reward_xp": [
+    2000
+   ],
+   "hail": "Oh, hello there... I am Jhaya Wyndrunner; seamstress. druidic apprentice of The Rainkeeper, and native of the Jaggedpine Forest. It is a pleasure to make your a",
+   "turn_in": true
+  },
+  "Larsk Juton": {
+   "npc_id": "3024",
+   "x": -18.0,
+   "y": 244.0,
+   "z": 1.0,
+   "wanted": [
+    [
+     17970,
+     "Blackburrow Cask",
+     3
+    ]
+   ],
+   "reward_xp": [
+    200,
+    1000
+   ],
+   "hail": "",
+   "turn_in": true
+  },
+  "Lerian Wyndrunner": {
+   "npc_id": "3016",
+   "x": -342.0,
+   "y": -13.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     8879,
+     "Jaggedpine Panther Hide",
+     1
+    ],
+    [
+     8873,
+     "Shadowjade Fern Seeds",
+     1
+    ],
+    [
+     8878,
+     "Shadowjade Fern Leaves",
+     2
+    ]
+   ],
+   "reward_xp": [
+    2000
+   ],
+   "hail": "Aaaahh. . . I see that you have chosen to embark on the sacred path of the Jaggedpine. No doubt my dearest Cheyloh has sent you, and elseif she has placed her t",
+   "turn_in": true
+  },
+  "Mammoth": {
+   "npc_id": "3050",
+   "x": -179.0,
+   "y": 220.0,
+   "z": 2.0,
+   "wanted": [
+    [
+     12140,
+     "Regurgitonic",
+     1
+    ]
+   ],
+   "reward_xp": [
+    200
+   ],
+   "hail": "",
+   "turn_in": true
+  },
+  "Merdan Fleetfoot": {
+   "npc_id": "3017",
+   "x": -70.0,
+   "y": 243.0,
+   "z": 1.0,
+   "wanted": [
+    [
+     12774,
+     "Rose of Firiona",
+     1
+    ]
+   ],
+   "reward_xp": [],
+   "hail": "Yes Niera! Oh. Erm. Hi. I mean, uh. How are you?",
+   "turn_in": true
+  },
+  "Merona Castekin": {
+   "npc_id": "3023",
+   "x": -106.0,
+   "y": 138.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     18014,
+     "Torn Parchment",
+     1
+    ]
+   ],
+   "reward_xp": [
+    1000
+   ],
+   "hail": "Oh, hello! Welcome to Surefall Glade. Are you planning a trip to Qeynos? If you are, I could use some help finding my [brother].",
+   "turn_in": true
+  },
+  "Narwkend Falgon": {
+   "npc_id": "3057",
+   "x": -60.0,
+   "y": 180.0,
+   "z": 2.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Come to find out about the Wayfarers Brotherhood, hm? I think I saw you around here long ago. Because you are familiar to me, I will trust you with some [",
+   "turn_in": true
+  },
+  "Niera Farbreeze": {
+   "npc_id": "3018",
+   "x": -193.0,
+   "y": 107.0,
+   "z": 2.0,
+   "wanted": [
+    [
+     62838,
+     "Runed Skull",
+     1
+    ],
+    [
+     62849,
+     "Niera's Healing Notes",
+     1
+    ]
+   ],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": true
+  },
+  "Qaelin Hailstorm": {
+   "npc_id": "3042",
+   "x": 140.0,
+   "y": 176.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Welcome to Surefall Glade. I have the great honor of bestowing these small but powerful Marks of Karana to those who follow him. With it they can use fletching",
+   "turn_in": true
+  },
+  "Salmekia Treherth": {
+   "npc_id": "3037",
+   "x": -437.0,
+   "y": -220.0,
+   "z": 7.0,
+   "wanted": [
+    [
+     20259,
+     "Sharp Pine Druid Scimitar",
+     1
+    ],
+    [
+     13915,
+     "Gnoll Fang",
+     1
+    ],
+    [
+     19945,
+     "Large King Snake Skin",
+     1
+    ]
+   ],
+   "reward_xp": [
+    5000,
+    10000
+   ],
+   "hail": "You must use this specially prepared Curing Kit to craft the clothing. Each article of clothing requires different materials for its construction. Do you plan o",
+   "turn_in": true
+  },
+  "Sivina Lutewhisper": {
+   "npc_id": "3006",
+   "x": -64.0,
+   "y": 118.0,
+   "z": 4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "The League of Antonican Bards has a courier system made up of travelers and adventurers.  We pay good gold to anyone who will take messages from bards such as m",
+   "turn_in": false
+  },
+  "TeAnara": {
+   "npc_id": "3035",
+   "x": -441.0,
+   "y": -209.0,
+   "z": 7.0,
+   "wanted": [
+    [
+     18713,
+     "Tattered Note",
+     1
+    ]
+   ],
+   "reward_xp": [
+    100,
+    16000
+   ],
+   "hail": "Welcome, friend! I hope your stay in Surefall Glade will ease your mind and soothe your soul. While you are here, we ask you to abide by the [laws of the Jagged",
+   "turn_in": true
+  },
+  "Vesteri Nomanoi": {
+   "npc_id": "3038",
+   "x": -302.0,
+   "y": -122.0,
+   "z": 4.0,
+   "wanted": [
+    [
+     13864,
+     "Wooden Statue",
+     1
+    ]
+   ],
+   "reward_xp": [
+    250
+   ],
+   "hail": "I need you to take this claim check to Qeynos for me. Nesiff Talaherd is a woodcarver who owns a shop in South Qeynos. I am having him carve a small statue of T",
+   "turn_in": true
+  }
+ },
+ "qeytoqrg": {
+  "Axe Broadsmith": {
+   "npc_id": "4038",
+   "x": 962.0,
+   "y": 3773.0,
+   "z": -18.0,
+   "wanted": [
+    [
+     18893,
+     "Sealed Letter",
+     1
+    ]
+   ],
+   "reward_xp": [
+    2000,
+    6000
+   ],
+   "hail": "Greetings. The fishing is sparse here. You would fare better at [Lake Rathe].",
+   "turn_in": true
+  },
+  "Baobob Miller": {
+   "npc_id": "4055",
+   "x": 116.0,
+   "y": 5001.0,
+   "z": -4.0,
+   "wanted": [
+    [
+     13755,
+     "High Quality Wolf Skin",
+     1
+    ]
+   ],
+   "reward_xp": [
+    500
+   ],
+   "hail": "Hello, there. My name is Baobob Miller. My [sister] and I are the best tanners in all of Norath. Wolves are my specialty. A nice wolf skin [garment] would be th",
+   "turn_in": true
+  },
+  "Barn Bloodstone": {
+   "npc_id": "4203",
+   "x": -2239.0,
+   "y": 1432.0,
+   "z": 1.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Buzzlin Bornahm": {
+   "npc_id": "4149",
+   "x": -2239.0,
+   "y": 1432.0,
+   "z": 1.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Cethernee Vellestan": {
+   "npc_id": "4201",
+   "x": -1138.0,
+   "y": 3560.0,
+   "z": -1.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Chanda Miller": {
+   "npc_id": "4052",
+   "x": 105.0,
+   "y": 4995.0,
+   "z": -4.0,
+   "wanted": [
+    [
+     13752,
+     "High Quality Bear Skin",
+     1
+    ]
+   ],
+   "reward_xp": [
+    500
+   ],
+   "hail": "Um.. I do not know you. Please um.. leave me be.",
+   "turn_in": true
+  },
+  "Crumpy Irontoe": {
+   "npc_id": "4164",
+   "x": -2239.0,
+   "y": 1432.0,
+   "z": 1.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Gnasher Furgutt": {
+   "npc_id": "4181",
+   "x": 518.0,
+   "y": 1092.0,
+   "z": 40.0,
+   "wanted": [
+    [
+     18800,
+     "Tattered Note",
+     1
+    ]
+   ],
+   "reward_xp": [
+    200
+   ],
+   "hail": "Who are you? Did McNeal send you? If not, you would do yourself good to leave Gnasher alone. I have friends in high places.",
+   "turn_in": true
+  },
+  "Guard Bixby": {
+   "npc_id": "4063",
+   "x": 206.0,
+   "y": 5065.0,
+   "z": -4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Cheslin": {
+   "npc_id": "4081",
+   "x": -873.0,
+   "y": 1037.0,
+   "z": 34.0,
+   "wanted": [],
+   "reward_xp": [
+    1500
+   ],
+   "hail": "Hail, mighty adventurer! I am Guard Cheslin Sydwend and I am here to serve and protect. Feel safe when we Qeynos guards are on watch. We are the best!",
+   "turn_in": true
+  },
+  "Guard Chrighton": {
+   "npc_id": "4180",
+   "x": -905.0,
+   "y": 1052.0,
+   "z": 35.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Kellot": {
+   "npc_id": "4067",
+   "x": -905.0,
+   "y": 1052.0,
+   "z": 35.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Leopold": {
+   "npc_id": "4061",
+   "x": 94.0,
+   "y": 574.0,
+   "z": -2.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "Why, yes! I would love to donate to the Temple of Thunder. My father was a brave and noble member of that order. Here you are. You should ask Guard Cheslin also",
+   "turn_in": false
+  },
+  "Guard Miles": {
+   "npc_id": "4141",
+   "x": -849.0,
+   "y": 1056.0,
+   "z": 32.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Monroe": {
+   "npc_id": "4068",
+   "x": -849.0,
+   "y": 1056.0,
+   "z": 32.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Nash": {
+   "npc_id": "4066",
+   "x": 93.0,
+   "y": 493.0,
+   "z": -2.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Guard Philbin": {
+   "npc_id": "4062",
+   "x": 185.0,
+   "y": 5064.0,
+   "z": -4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Hefax Tinmar": {
+   "npc_id": "4142",
+   "x": -847.0,
+   "y": 1041.0,
+   "z": 32.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Holly Windstalker": {
+   "npc_id": "4057",
+   "x": 354.0,
+   "y": 3023.0,
+   "z": 41.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Konem Matse": {
+   "npc_id": "4072",
+   "x": 328.0,
+   "y": 1440.0,
+   "z": 6.0,
+   "wanted": [
+    [
+     18921,
+     "Message to Konem",
+     1
+    ]
+   ],
+   "reward_xp": [
+    1500
+   ],
+   "hail": "",
+   "turn_in": true
+  },
+  "Lamangao Fallstine": {
+   "npc_id": "4202",
+   "x": -830.0,
+   "y": 2038.0,
+   "z": -64.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Marton Sayer": {
+   "npc_id": "4065",
+   "x": 278.0,
+   "y": 1381.0,
+   "z": 8.0,
+   "wanted": [
+    [
+     8357,
+     "Gnoll's Eye",
+     1
+    ],
+    [
+     8356,
+     "Journal of Greater Enchantment",
+     1
+    ],
+    [
+     5416,
+     "Gnoll Slayer",
+     1
+    ]
+   ],
+   "reward_xp": [
+    500
+   ],
+   "hail": "Welcome. Please stock up on provisions, especially if you are headed toward the lair of the vile gnolls. If so, I wish you much luck and many gnoll pelts!! I al",
+   "turn_in": true
+  },
+  "Mira Sayer": {
+   "npc_id": "4064",
+   "x": 307.0,
+   "y": 1404.0,
+   "z": 8.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Mogan Delfin": {
+   "npc_id": "4069",
+   "x": -847.0,
+   "y": 1041.0,
+   "z": 32.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Neclo Rheslar": {
+   "npc_id": "4032",
+   "x": -680.0,
+   "y": 1041.0,
+   "z": 17.0,
+   "wanted": [
+    [
+     18823,
+     "Note to Neclo",
+     1
+    ]
+   ],
+   "reward_xp": [
+    1000
+   ],
+   "hail": "",
+   "turn_in": true
+  },
+  "Niclaus Ressinn": {
+   "npc_id": "4060",
+   "x": 1098.0,
+   "y": 111.0,
+   "z": -4.0,
+   "wanted": [
+    [
+     18970,
+     "Note to Niclaus",
+     1
+    ]
+   ],
+   "reward_xp": [],
+   "hail": "Hail.",
+   "turn_in": true
+  },
+  "Pemawen Vorana": {
+   "npc_id": "4200",
+   "x": 928.0,
+   "y": 4616.0,
+   "z": -16.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Rephas": {
+   "npc_id": "4037",
+   "x": 952.0,
+   "y": 3944.0,
+   "z": -20.0,
+   "wanted": [
+    [
+     13050,
+     "Giant Rat Ear",
+     4
+    ]
+   ],
+   "reward_xp": [
+    50,
+    200
+   ],
+   "hail": "Aagggh..  Get away from here..  Go, run..  Far away..  Or I shall call [Karana's] wrath upon you!",
+   "turn_in": true
+  },
+  "Rilca Leafrunner": {
+   "npc_id": "4054",
+   "x": 120.0,
+   "y": 4984.0,
+   "z": -4.0,
+   "wanted": [
+    [
+     15931,
+     "Marching Orders",
+     1
+    ],
+    [
+     15932,
+     "Invasion Plans",
+     1
+    ],
+    [
+     15933,
+     "Area Maps of Qeynos Hills",
+     1
+    ],
+    [
+     15934,
+     "Encryption Key",
+     1
+    ]
+   ],
+   "reward_xp": [
+    15000
+   ],
+   "hail": "Well, it seems that you have something of importance that you wish to speak to me about? No? Then perhaps you can do something [for me].",
+   "turn_in": true
+  },
+  "Sarri Modav": {
+   "npc_id": "4070",
+   "x": 1108.0,
+   "y": 355.0,
+   "z": -4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Sir Edwin Motte": {
+   "npc_id": "4077",
+   "x": -2239.0,
+   "y": 1432.0,
+   "z": 1.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Talym Shoontar": {
+   "npc_id": "4157",
+   "x": -2239.0,
+   "y": 1432.0,
+   "z": 1.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Tol Nicelot": {
+   "npc_id": "4205",
+   "x": -2239.0,
+   "y": 1432.0,
+   "z": 1.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Varsoon": {
+   "npc_id": "4171",
+   "x": -940.0,
+   "y": 4684.0,
+   "z": 43.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Waradern Skymoor": {
+   "npc_id": "4204",
+   "x": 50.0,
+   "y": 531.0,
+   "z": -4.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  },
+  "Wyle Bimlin": {
+   "npc_id": "4073",
+   "x": -2239.0,
+   "y": 1432.0,
+   "z": 1.0,
+   "wanted": [],
+   "reward_xp": [],
+   "hail": "",
+   "turn_in": false
+  }
+ }
+}

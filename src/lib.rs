@@ -37,4 +37,5 @@ pub mod frame_capture;
 pub mod game_state;
 pub mod http;
 pub mod hud;
+pub mod quests;
 pub mod zone_map;

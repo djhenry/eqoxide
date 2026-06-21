@@ -151,6 +151,7 @@ pub fn spawn_camera_server(
                 .route("/frame", get(get_frame))
                 .route("/goto", post(post_goto))
                 .route("/entities", get(get_entities))
+                .route("/quests", get(get_quests))
                 .route("/zone_points", get(get_zone_points))
                 .route("/zone_cross", post(post_zone_cross))
                 .route("/warp", post(post_warp))
@@ -273,6 +274,44 @@ async fn get_entities(State(s): State<HttpState>) -> Json<HashMap<String, [f32; 
         .map(|(k, &(x, y, z))| (k.clone(), [x, y, z]))
         .collect();
     Json(out)
+}
+
+/// GET /quests — the agent's "quests near me" view for the current zone. Lists quest givers
+/// (data/quests.json) with their location, distance from the player, whether they're currently
+/// loaded (in spawn range), what they want (turn-in items), and reward XP. NPCs here are the ones
+/// shown with a golden "!" in the HUD. Use it like an MMO quest tracker; combine with /entities +
+/// /goto to walk to a giver and (once implemented) /give to hand in. See docs/autonomous-play.md.
+async fn get_quests(State(s): State<HttpState>) -> Json<serde_json::Value> {
+    let player = s.player_info.lock().unwrap().clone();
+    let zone = player.zone.clone();
+    let (px, py) = (player.pos_east, player.pos_north);
+    // clean live names -> position, to flag loaded givers + use their live coords
+    let live: HashMap<String, (f32, f32, f32)> = s.entity_positions.lock().unwrap().iter()
+        .map(|(k, v)| (clean_entity_name(k), *v))
+        .collect();
+    let mut givers: Vec<serde_json::Value> = crate::quests::givers_in(&zone).into_iter()
+        .map(|(name, g)| {
+            let live_pos = live.get(&name).copied();
+            let pos = live_pos.map(|(x, y, z)| [x, y, z]).unwrap_or([g.x, g.y, g.z]);
+            let dist = ((pos[0] - px).powi(2) + (pos[1] - py).powi(2)).sqrt();
+            serde_json::json!({
+                "name": name,
+                "npc_id": g.npc_id,
+                "pos": pos,
+                "loaded": live_pos.is_some(),
+                "distance": dist.round(),
+                "turn_in": g.turn_in,
+                "wanted": g.wanted,
+                "reward_xp": g.reward_xp,
+                "hail": g.hail,
+            })
+        })
+        .collect();
+    givers.sort_by(|a, b| {
+        let (da, db) = (a["distance"].as_f64().unwrap_or(1e9), b["distance"].as_f64().unwrap_or(1e9));
+        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Json(serde_json::json!({ "zone": zone, "player": [px, py], "count": givers.len(), "quest_givers": givers }))
 }
 
 /// GET /zone_points — returns all zone exit points received from the server.
