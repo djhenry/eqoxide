@@ -30,10 +30,23 @@ required items and reward. Example beginner targets (verified spawned): **Captai
 `qeynos2` (-604,-133,-10) wants rabid pelts. Dialogue/hail quests (no `event_trade`) are driven by
 hailing + saying `[keyword]`s.
 
-To actually *complete* a turn-in quest you need: reach + kill the mob → **loot** the item → reach
-the giver → **hand it in**. Looting and item hand-in (trade) are the gameplay actions being added
-for questing (`/loot`, `/give` — see the questing plan in `todo.md`). The hail/say flow for
-dialogue quests already exists (`docs/npc-interaction.md`).
+### The quest experience for agents (MMO-style)
+
+Phase 1 (done): **discovery + indicators**.
+- `tools/quest_finder.py --export` bakes quest-giver data into `data/quests.json` (regenerate if the
+  server's quests change). The client loads it at startup (`src/quests.rs`).
+- The HUD draws a golden **"❗ quest"** over any NPC that has a quest (so you can SEE quest givers
+  in `/frame`, like a modern MMO). Note: in dense cities the nameplate may be occluded by buildings
+  (existing nameplate behavior) — `GET /quests` is the reliable readout.
+- `GET /quests` is your quest tracker: for the current zone it lists quest givers sorted by distance
+  with their location, `loaded` (in spawn range) flag, `turn_in` flag, `wanted` items (id, name,
+  count), `reward_xp`, and `hail` text. Workflow: `GET /quests` → pick one → `/goto` to it →
+  `/hail` to read the quest → gather items → return → hand in.
+
+To actually *complete* a turn-in quest you still need: reach + kill the mob → **loot** the item →
+reach the giver → **hand it in**. Looting (`/loot`) and item hand-in (`/give`) are the gameplay
+actions being added next (see the questing roadmap in `todo.md`). The hail/say flow for dialogue
+quests already exists (`docs/npc-interaction.md`).
 
 ---
 
