@@ -339,7 +339,7 @@ impl Navigator {
                     let dx = ex - gs.player_x;
                     let dy = ey - gs.player_y;
                     let dist = (dx * dx + dy * dy).sqrt();
-                    if dist < 60.0 { // engage targets within ~60u
+                    if dist < 200.0 { // engage targets within ~200u (sparse spawns; walk to them)
                         const MELEE: f32 = 5.0;
                         let hdg = if dist > 0.01 { eq_heading(dx, dy) } else { gs.player_heading };
                         if dist > MELEE {
