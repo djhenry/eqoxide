@@ -101,6 +101,9 @@ pub struct Navigator {
     last_zone_cross:  Instant,
     position_seq:     u16,
     last_tick:        Instant,
+    /// Whether auto-attack is currently engaged (set by the /attack toggle). While true and a
+    /// target is set, the nav thread keeps the player facing the target so melee swings land.
+    auto_attack:      bool,
 }
 
 impl Navigator {
@@ -133,6 +136,7 @@ impl Navigator {
             last_zone_cross: Instant::now(),
             position_seq: 0,
             last_tick: Instant::now(),
+            auto_attack: false,
         }
     }
 
@@ -315,6 +319,7 @@ impl Navigator {
         // Server expects exactly 4 bytes; byte[0]=1 enables, byte[0]=0 disables.
         let attack_req = self.attack.lock().unwrap().take();
         if let Some(on) = attack_req {
+            self.auto_attack = on;
             let payload = [if on { 1u8 } else { 0u8 }, 0, 0, 0];
             stream.send_app_packet(OP_AUTO_ATTACK, &payload);
             eprintln!("EQ: auto-attack {}", if on { "ON" } else { "OFF" });
@@ -325,7 +330,30 @@ impl Navigator {
         }
         self.last_tick = Instant::now();
 
-        let target = match *self.goto_target.lock().unwrap() {
+        // While auto-attacking a target within melee range, face it and hold position so the
+        // server registers swings. Runs regardless of any pending goto, so combat engages after
+        // a /warp too (which otherwise leaves heading stale and the nav in its walk branch).
+        if self.auto_attack {
+            if let Some(tid) = gs.target_id {
+                if let Some((ex, ey)) = gs.entities.get(&tid).map(|e| (e.x, e.y)) {
+                    let dx = ex - gs.player_x;
+                    let dy = ey - gs.player_y;
+                    let d2 = dx * dx + dy * dy;
+                    if d2 < 225.0 { // ~15u melee range: face the target and stop
+                        if d2 > 0.01 {
+                            let hdg = eq_heading(dx, dy);
+                            self.send_position_update(stream, gs, gs.player_x, gs.player_y, gs.player_z, hdg);
+                            gs.player_heading = hdg;
+                        }
+                        *self.goto_target.lock().unwrap() = None; // cancel any stale walk
+                        return;
+                    }
+                }
+            }
+        }
+
+        let goto = *self.goto_target.lock().unwrap(); // copy out so the lock is released
+        let target = match goto {
             Some(t) => t,
             None    => return,
         };
