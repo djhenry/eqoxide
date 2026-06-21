@@ -99,6 +99,9 @@ pub const OP_AUTO_ATTACK2: u16 = 0x0701;
 pub const OP_TARGET_COMMAND: u16 = 0x1477;
 pub const OP_TARGET_MOUSE: u16   = 0x6c47; // sets server-side m_Target for combat
 pub const OP_CONSIDER: u16 = 0x65ca;
+// Merchant/shop (Titanium): open a merchant, then buy an item from its inventory slot.
+pub const OP_SHOP_REQUEST: u16 = 0x45f9;     // MerchantClick_Struct (open/close)
+pub const OP_SHOP_PLAYER_BUY: u16 = 0x221e;  // Merchant_Sell_Struct (buy from slot)
 
 // ── Gameplay: looting ─────────────────────────────────────────────────────
 

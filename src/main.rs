@@ -29,6 +29,7 @@ fn main() {
     let say:              http::SayReq          = Arc::new(Mutex::new(None));
     let target:           http::TargetReq       = Arc::new(Mutex::new(None));
     let attack:           http::AttackReq       = Arc::new(Mutex::new(None));
+    let buy:              http::BuyReq          = Arc::new(Mutex::new(None));
     let shared_collision: assets::SharedCollision = Arc::new(std::sync::RwLock::new(None));
     let frame_req:        http::FrameReq        = Arc::new(Mutex::new(None));
     let player_info:      http::PlayerInfo      = Arc::new(Mutex::new(http::PlayerState::default()));
@@ -45,12 +46,13 @@ fn main() {
         let sy  = say.clone();
         let tg  = target.clone();
         let at  = attack.clone();
+        let by  = buy.clone();
         let sc  = shared_collision.clone();
         let md  = app_cfg.assets_path.join("maps");
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, zc, hl, sy, tg, at, sc, md).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, zc, hl, sy, tg, at, by, sc, md).await {
                     eprintln!("EQ: fatal: {e}");
                 }
             });
@@ -77,6 +79,7 @@ fn main() {
         say,
         target,
         attack,
+        buy,
         player_info,
         app_cfg.http_port,
     );

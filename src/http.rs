@@ -54,6 +54,10 @@ pub type TargetReq = Arc<Mutex<Option<u32>>>;
 /// Nav thread reads it and sends OP_AUTO_ATTACK(1) or OP_AUTO_ATTACK(0).
 pub type AttackReq = Arc<Mutex<Option<bool>>>;
 
+/// Buy request — (merchant spawn id, merchant inventory slot), set by POST /buy.
+/// Nav thread reads it and sends OP_ShopRequest (open) + OP_ShopPlayerBuy (buy that slot).
+pub type BuyReq = Arc<Mutex<Option<(u32, u32)>>>;
+
 /// Current zone name and id, updated on every OP_NEW_ZONE.
 #[allow(dead_code)]
 pub type ZoneInfo = Arc<Mutex<(String, u16)>>;
@@ -86,6 +90,7 @@ struct HttpState {
     say:              SayReq,
     target:           TargetReq,
     attack:           AttackReq,
+    buy:              BuyReq,
     player_info:      PlayerInfo,
 }
 
@@ -124,13 +129,14 @@ pub fn spawn_camera_server(
     say:              SayReq,
     target:           TargetReq,
     attack:           AttackReq,
+    buy:              BuyReq,
     player_info:      PlayerInfo,
     port:             u16,
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, player_info };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, buy, player_info };
             let app = Router::new()
                 .route("/camera", get(get_camera).post(post_camera))
                 .route("/camera/reset", post(post_camera_reset))
@@ -145,6 +151,7 @@ pub fn spawn_camera_server(
                 .route("/target", post(post_target))
                 .route("/target/name", post(post_target_name))
                 .route("/attack", post(post_attack_on).delete(post_attack_off))
+                .route("/buy", post(post_buy))
                 .route("/debug", get(get_debug))
                 .with_state(state);
             let addr = format!("127.0.0.1:{port}");
@@ -448,6 +455,40 @@ async fn post_attack_off(State(s): State<HttpState>) -> (StatusCode, String) {
     *s.attack.lock().unwrap() = Some(false);
     eprintln!("attack: queued auto-attack OFF");
     (StatusCode::OK, "auto-attack OFF".into())
+}
+
+#[derive(serde::Deserialize)]
+struct BuyBody {
+    /// Merchant NPC name (fuzzy-matched, like /target/name).
+    merchant: String,
+    /// Merchant inventory slot of the item to buy (from the merchantlist).
+    slot: u32,
+}
+
+/// POST /buy {"merchant":"<name>","slot":N} — open the named merchant and buy item slot N.
+/// Must be within ~200u of the merchant. The nav thread sends OP_ShopRequest then
+/// OP_ShopPlayerBuy.
+async fn post_buy(
+    State(s): State<HttpState>,
+    body: Result<Json<BuyBody>, axum::extract::rejection::JsonRejection>,
+) -> (StatusCode, String) {
+    let b = match body {
+        Ok(Json(b)) => b,
+        Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"merchant\":\"...\",\"slot\":N}".into()),
+    };
+    let ids = s.entity_ids.lock().unwrap();
+    let nl = b.merchant.to_lowercase();
+    let found = ids.iter()
+        .find(|(k, _)| clean_entity_name(k).to_lowercase().contains(&nl) || k.to_lowercase().contains(&nl))
+        .map(|(k, &id)| (k.clone(), id));
+    match found {
+        Some((key, id)) => {
+            *s.buy.lock().unwrap() = Some((id, b.slot));
+            eprintln!("buy: queued merchant {:?} (spawn_id={}) slot={}", key, id, b.slot);
+            (StatusCode::OK, format!("buying slot {} from {} (spawn_id={})", b.slot, clean_entity_name(&key), id))
+        }
+        None => (StatusCode::NOT_FOUND, format!("no merchant matching {:?}", b.merchant)),
+    }
 }
 
 async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {

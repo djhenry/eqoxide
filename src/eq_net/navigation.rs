@@ -7,7 +7,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::{GameState, ZonePoint};
-use crate::http::{AttackReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, ZoneCrossReq, ZonePoints};
+use crate::http::{AttackReq, BuyReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, ZoneCrossReq, ZonePoints};
 
 /// OP_TargetCommand payload: ClientTarget_Struct = just the target spawn id (u32).
 pub fn build_target_packet(spawn_id: u32) -> Vec<u8> {
@@ -95,6 +95,7 @@ pub struct Navigator {
     say:              SayReq,
     target:           TargetReq,
     attack:           AttackReq,
+    buy:              BuyReq,
     collision:        crate::assets::SharedCollision,
     maps_dir:         std::path::PathBuf,
     current_zone:     String,
@@ -117,6 +118,7 @@ impl Navigator {
         say:              SayReq,
         target:           TargetReq,
         attack:           AttackReq,
+        buy:              BuyReq,
         collision:        crate::assets::SharedCollision,
         maps_dir:         std::path::PathBuf,
     ) -> Self {
@@ -130,6 +132,7 @@ impl Navigator {
             say,
             target,
             attack,
+            buy,
             collision,
             maps_dir,
             current_zone: String::new(),
@@ -316,6 +319,28 @@ impl Navigator {
             let payload = [if on { 1u8 } else { 0u8 }, 0, 0, 0];
             stream.send_app_packet(OP_AUTO_ATTACK, &payload);
             eprintln!("EQ: auto-attack {}", if on { "ON" } else { "OFF" });
+        }
+
+        // Merchant buy: open the merchant (OP_ShopRequest) then buy its inventory slot
+        // (OP_ShopPlayerBuy). Sent in sequence — the server processes the open first so the
+        // merchant is open by the time the buy arrives. Must be within ~200u of the merchant.
+        let buy_req = self.buy.lock().unwrap().take();
+        if let Some((merchant_id, slot)) = buy_req {
+            // MerchantClick_Struct (24b): npc_id, player_id, command(1=open), rate, tab, unk.
+            let mut open = [0u8; 24];
+            open[0..4].copy_from_slice(&merchant_id.to_le_bytes());
+            open[4..8].copy_from_slice(&gs.player_id.to_le_bytes());
+            open[8..12].copy_from_slice(&1u32.to_le_bytes());
+            stream.send_app_packet(OP_SHOP_REQUEST, &open);
+            // Merchant_Sell_Struct (24b): npcid, playerid, itemslot, unknown12, quantity, price.
+            let mut buy = [0u8; 24];
+            buy[0..4].copy_from_slice(&merchant_id.to_le_bytes());
+            buy[4..8].copy_from_slice(&gs.player_id.to_le_bytes());
+            buy[8..12].copy_from_slice(&slot.to_le_bytes());
+            buy[16..20].copy_from_slice(&1u32.to_le_bytes()); // quantity = 1
+            stream.send_app_packet(OP_SHOP_PLAYER_BUY, &buy);
+            eprintln!("EQ: shop buy — merchant_id={} slot={} qty=1", merchant_id, slot);
+            gs.log_msg("merchant", &format!("Bought item (slot {})", slot));
         }
 
         if self.last_tick.elapsed().as_millis() < 150 {
