@@ -449,10 +449,12 @@ impl Navigator {
         let moving = dx != 0.0 || dy != 0.0 || dz != 0.0;
         let anim: i32 = if moving { 1 } else { 0 };
         // Internal heading is CCW (0=north, 90=west). The EQ wire (and server) expects
-        // CW (0=north, 90=east). Convert then pack into the 12-bit field:
-        // EQ_heading_cw_units = deg_cw * 512/360, heading_12bit = EQ_heading_cw_units * 8.
+        // CW (0=north, 90=east). The server decodes the wire heading via EQ12toFloat = wire/4,
+        // and EQ headings run 0..512 (= 0..360deg), so wire = EQ_units * 4 = deg_cw * 512/360 * 4
+        // = deg_cw * 2048/360. (Previously this used 4096/360 = 2x too large, so the server saw
+        // the wrong facing and melee never landed — IsFacingMob failed.)
         let h_cw = crate::eq_net::protocol::ccw_to_cw(heading);
-        let eq_heading = ((h_cw * 4096.0 / 360.0) as u16) & 0xFFF;
+        let eq_heading = ((h_cw * 2048.0 / 360.0) as u16) & 0xFFF;
 
         let mut buf = [0u8; 36];
         buf[0..2].copy_from_slice(&(gs.player_id as u16).to_le_bytes());
