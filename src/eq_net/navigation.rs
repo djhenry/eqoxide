@@ -361,13 +361,21 @@ impl Navigator {
         // nearest trash mob (name starts "a_"/"an_", which excludes named guards/merchants/
         // citizens) within ~200u, so grinding continues hands-free between kills.
         if self.auto_attack {
+            let col = self.collision.read().unwrap();
+            let clear_to = |e: &crate::game_state::Entity| -> bool {
+                col.as_ref().map_or(true, |c| {
+                    c.path_clear([gs.player_x, gs.player_y, e.z + 3.0], [e.x, e.y, e.z + 3.0], 2.0)
+                })
+            };
+            // The current target is valid only if alive AND still reachable in a straight line —
+            // otherwise drop it so we retarget or roam (don't get stuck swinging "too far").
             let valid = gs.target_id
                 .and_then(|id| gs.entities.get(&id))
-                .map(|e| !e.dead)
+                .map(|e| !e.dead && clear_to(e))
                 .unwrap_or(false);
             if !valid {
-                let col = self.collision.read().unwrap();
-                let mut best: Option<(f32, u32)> = None;
+                let mut best_clear: Option<(f32, u32)> = None;          // reachable now -> engage
+                let mut best_any: Option<(f32, (f32, f32, f32))> = None; // any mob -> roam toward it
                 for (id, e) in &gs.entities {
                     if e.dead || !e.is_npc { continue; }
                     let nl = e.name.to_ascii_lowercase();
@@ -375,21 +383,24 @@ impl Navigator {
                     let dx = e.x - gs.player_x;
                     let dy = e.y - gs.player_y;
                     let d2 = dx * dx + dy * dy;
-                    if d2 > 200.0 * 200.0 { continue; }
-                    // Only target mobs with a clear path (chest height at the mob's level) so we
-                    // don't get stuck swinging at something across water or a wall ("too far").
-                    if let Some(c) = col.as_ref() {
-                        if !c.path_clear([gs.player_x, gs.player_y, e.z + 3.0], [e.x, e.y, e.z + 3.0], 2.0) {
-                            continue;
-                        }
+                    if d2 > 400.0 * 400.0 { continue; } // roam search radius
+                    if best_any.map(|(bd, _)| d2 < bd).unwrap_or(true) { best_any = Some((d2, (e.x, e.y, e.z))); }
+                    if d2 <= 200.0 * 200.0 && clear_to(e)
+                        && best_clear.map(|(bd, _)| d2 < bd).unwrap_or(true) {
+                        best_clear = Some((d2, *id));
                     }
-                    if best.map(|(bd, _)| d2 < bd).unwrap_or(true) { best = Some((d2, *id)); }
                 }
                 drop(col);
-                if let Some((_, id)) = best {
+                if let Some((_, id)) = best_clear {
+                    // A reachable mob — target it and stop any roam walk; auto-engage will close in.
                     gs.target_id = Some(id);
                     if let Some(e) = gs.entities.get(&id) { gs.target_name = Some(e.name.clone()); }
                     stream.send_app_packet(OP_TARGET_MOUSE, &build_target_packet(id));
+                    *self.goto_target.lock().unwrap() = None;
+                } else if let Some((_, pos)) = best_any {
+                    // No reachable mob nearby: pathfind toward the nearest one so grinding continues.
+                    gs.target_id = None;
+                    *self.goto_target.lock().unwrap() = Some(pos);
                 }
             }
         }
