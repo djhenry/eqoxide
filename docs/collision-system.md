@@ -76,6 +76,25 @@ Movement gating. Extends the segment past `to` by `radius` so the player stops
 short of the wall instead of clipping into it. Returns `true` (clear) when no
 geometry is loaded.
 
+### `find_path(start, goal, radius) → Option<Vec<[east, north]>>`
+
+**Grid A\*** over the collision cells — routes *around* walls and returns cell-center waypoints
+(goal-inclusive), or `None` if no route / no geometry. This is what `/goto` uses (it walks the
+waypoints; `slide_move` only does the per-step move). Added 2026-06-21.
+
+- Walkable = a floor exists under the cell; an edge needs a small floor-height step (`STEP_H=20`)
+  and a clear chest-height `path_clear` between cell centers.
+- **Floor probe follows the terrain**: each cell's floor is probed relative to the floor of the
+  cell it was reached from (`floor_near`), and the start floor is found by trying several reference
+  levels — so multi-level dungeons work even when the caller's `start.z` is stale (a common bug:
+  `gs.player_z` is often the spawn z, not the real floor). Don't pass a bogus z and expect failure —
+  it self-corrects, but a wildly wrong z can still miss.
+- Capped at `MAX_NODES=200000`. Emits a `find_path: no route` diagnostic (expanded count + start/
+  goal floor) when it fails.
+- **Limitations**: can't path across **water** (no walkable floor — water mobs like fish are
+  unreachable) or through **doors / sealed pockets** (doors aren't in the collision; a room behind a
+  closed door is a disconnected component, so A* correctly finds no route). See `autonomous-play.md`.
+
 ---
 
 ## WASD Collision (app.rs)
@@ -97,9 +116,12 @@ don't block the move.
 
 ## Navigation Collision (navigation.rs)
 
-`slide_move()` implements the same three-attempt logic for the nav thread's
-automated `/goto` movement. Returns `None` only when fully boxed in, which
-logs "Path blocked by a wall" and clears the goto target.
+`/goto` first computes an A\* route via `find_path` (above) when the goal changes, then walks the
+waypoints. `slide_move()` implements the same three-attempt slide logic for each step (and for the
+combat auto-engage approach). It returns `None` only when fully boxed in (logs "Path blocked by a
+wall" and clears the goto). Because `find_path` routes around walls, the per-step slide rarely boxes
+in now — but the combat auto-engage still uses bare `slide_move`, so it only reaches mobs on a clear
+straight path (see `autonomous-play.md` §2/§5).
 
 ---
 

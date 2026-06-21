@@ -1,8 +1,11 @@
 # eq_client_lite — Architecture Overview
 
 A standalone Rust EverQuest Titanium observer/renderer. Connects directly to a local EQEmu
-server (login 127.0.0.1:5998) as a GM-level character, renders the zone in 3D via wgpu,
-and exposes a local HTTP API on port 8765 for agent scripting.
+server (login 127.0.0.1:5998), renders the zone in 3D via wgpu, and exposes a local HTTP API on
+port 8765 for agent scripting. It can log in either as a **GM observer** (the original use case)
+or as a **regular non-GM player character** that actually plays — fights, levels, travels, buys
+(see `autonomous-play.md`). The account/character is set in the login config; the renderer and API
+are identical either way.
 
 ---
 

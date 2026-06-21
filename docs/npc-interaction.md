@@ -4,6 +4,10 @@ All NPC interaction goes through shared-arc slots that the nav thread drains eac
 tick (150 ms). The render HUD writes the same slots via its buttons and the HTTP
 API writes them from external agents.
 
+> **Combat, auto-grind, and buying** (auto-attack, auto-engage/retarget, the facing requirement,
+> and merchant purchases) are covered in `autonomous-play.md`. This doc covers the
+> hail/say/target/consider conversation flow.
+
 ---
 
 ## Flow Summary
@@ -63,9 +67,12 @@ hud.rs renders dialogue panel / tinted nameplate
 - HTTP: `POST /target {"id": 1234}`
 - HUD: "Target nearest" button
 
+Also `POST /target/name {"name": "..."}` resolves a fuzzy name → spawn_id first.
+
 **What happens**:
 1. `Navigator::tick()` takes the spawn_id
-2. Sends `OP_TARGET_COMMAND` (4 bytes: spawn_id LE)
+2. Sends `OP_TARGET_MOUSE` (0x6c47, 4 bytes: spawn_id LE) — sets the server-side combat target
+   (`GetTarget()`); this is what melee/auto-attack swings at
 3. Immediately sends `OP_CONSIDER` (28 bytes: player_id + target_id + zeroes)
 4. EQEmu replies with `OP_CONSIDER` carrying faction + level + con color
 5. `packet_handler.rs: apply_consider()` stores `gs.target_id` and `gs.target_con`
