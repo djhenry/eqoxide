@@ -103,6 +103,11 @@ pub const OP_CONSIDER: u16 = 0x65ca;
 pub const OP_SHOP_REQUEST: u16 = 0x45f9;     // MerchantClick_Struct (open/close)
 pub const OP_SHOP_PLAYER_BUY: u16 = 0x221e;  // Merchant_Sell_Struct (buy from slot)
 
+// Native Task-system quest journal (server→client). Decoded into GameState.tasks for the quest log.
+pub const OP_TASK_DESCRIPTION: u16 = 0x5ef7; // a task's title/desc/reward (variable length)
+pub const OP_TASK_ACTIVITY: u16    = 0x682d; // one objective + progress (done/goal, variable length)
+pub const OP_COMPLETED_TASKS: u16  = 0x76a2; // list of completed task ids
+
 // ── Gameplay: looting ─────────────────────────────────────────────────────
 
 /// Server → client when a mob dies and leaves a lootable corpse.

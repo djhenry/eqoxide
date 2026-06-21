@@ -18,7 +18,7 @@ use crate::eq_net::packet_handler::apply_packet;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::GameState;
-use crate::http::{AttackReq, BuyReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, ZoneCrossReq, ZonePoints};
+use crate::http::{AttackReq, BuyReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
 
 type DesCbcEnc = Encryptor<Des>;
 type DesCbcDec = Decryptor<Des>;
@@ -69,6 +69,7 @@ pub async fn run_login_flow(
     entity_positions: EntityPositions,
     entity_ids:       EntityIds,
     zone_points:      ZonePoints,
+    task_log:         TaskLog,
     zone_cross:       ZoneCrossReq,
     hail:             HailReq,
     say:              SayReq,
@@ -102,7 +103,7 @@ pub async fn run_login_flow(
                     eprintln!("NAV: {} zone points seeded", gs.zone_points.len());
                 }
                 let char_name = config.character_name.clone();
-                let navigator = Navigator::new(goto_target, entity_positions, entity_ids, zone_points, zone_cross, hail, say, target, attack, buy, collision, maps_dir);
+                let navigator = Navigator::new(goto_target, entity_positions, entity_ids, zone_points, task_log, zone_cross, hail, say, target, attack, buy, collision, maps_dir);
                 run_gameplay_phase(stream, net_rx, app_tx, gs, char_name, navigator, world_creds).await;
                 return Ok(());
             }

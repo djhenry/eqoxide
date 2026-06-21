@@ -35,6 +35,7 @@ fn main() {
     let entity_positions: http::EntityPositions = Arc::new(Mutex::new(HashMap::new()));
     let entity_ids:       http::EntityIds       = Arc::new(Mutex::new(HashMap::new()));
     let zone_points:      http::ZonePoints      = Arc::new(Mutex::new(Vec::new()));
+    let task_log:         http::TaskLog         = Arc::new(Mutex::new(Vec::new()));
     let zone_cross:       http::ZoneCrossReq    = Arc::new(Mutex::new(None));
     let warp:             http::WarpReq         = Arc::new(Mutex::new(None));
     let hail:             http::HailReq         = Arc::new(Mutex::new(None));
@@ -53,6 +54,7 @@ fn main() {
         let ep  = entity_positions.clone();
         let ei  = entity_ids.clone();
         let zp  = zone_points.clone();
+        let tl  = task_log.clone();
         let zc  = zone_cross.clone();
         let hl  = hail.clone();
         let sy  = say.clone();
@@ -64,7 +66,7 @@ fn main() {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, zc, hl, sy, tg, at, by, sc, md).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, zc, hl, sy, tg, at, by, sc, md).await {
                     eprintln!("EQ: fatal: {e}");
                 }
             });
@@ -93,6 +95,7 @@ fn main() {
         attack,
         buy,
         player_info,
+        task_log,
         app_cfg.http_port,
     );
 

@@ -35,6 +35,8 @@ pub type EntityIds = Arc<Mutex<HashMap<String, u32>>>;
 
 /// Zone exit points received in OP_SEND_ZONE_POINTS, exposed via GET /zone_points.
 pub type ZonePoints = Arc<Mutex<Vec<crate::game_state::ZonePoint>>>;
+/// Native Task-system quest log, published from GameState.tasks each tick (for GET /quests/log).
+pub type TaskLog = Arc<Mutex<Vec<crate::game_state::ActiveTask>>>;
 
 /// Zone-crossing request set by POST /zone_cross; gameplay thread reads it once,
 /// warps to the matching zone line and sends OP_ZONE_CHANGE.
@@ -100,6 +102,7 @@ struct HttpState {
     attack:           AttackReq,
     buy:              BuyReq,
     player_info:      PlayerInfo,
+    task_log:         TaskLog,
 }
 
 #[derive(serde::Deserialize)]
@@ -139,12 +142,13 @@ pub fn spawn_camera_server(
     attack:           AttackReq,
     buy:              BuyReq,
     player_info:      PlayerInfo,
+    task_log:         TaskLog,
     port:             u16,
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, buy, player_info };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, buy, player_info, task_log };
             let app = Router::new()
                 .route("/camera", get(get_camera).post(post_camera))
                 .route("/camera/reset", post(post_camera_reset))
@@ -152,6 +156,7 @@ pub fn spawn_camera_server(
                 .route("/goto", post(post_goto))
                 .route("/entities", get(get_entities))
                 .route("/quests", get(get_quests))
+                .route("/quests/log", get(get_quest_log))
                 .route("/zone_points", get(get_zone_points))
                 .route("/zone_cross", post(post_zone_cross))
                 .route("/warp", post(post_warp))
@@ -312,6 +317,15 @@ async fn get_quests(State(s): State<HttpState>) -> Json<serde_json::Value> {
         da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
     });
     Json(serde_json::json!({ "zone": zone, "player": [px, py], "count": givers.len(), "quest_givers": givers }))
+}
+
+/// GET /quests/log — the player's NATIVE quest journal (EQ Task system), pushed by the server via
+/// OP_TaskDescription/OP_TaskActivity. Each task has a title, description, reward, and objectives
+/// with live progress (done_count/goal_count). Distinct from GET /quests (old-style Lua turn-in
+/// quests derived from the server scripts) — together they cover both kinds of EQ quests.
+async fn get_quest_log(State(s): State<HttpState>) -> Json<serde_json::Value> {
+    let tasks = s.task_log.lock().unwrap().clone();
+    Json(serde_json::json!({ "active_count": tasks.len(), "tasks": tasks }))
 }
 
 /// GET /zone_points — returns all zone exit points received from the server.

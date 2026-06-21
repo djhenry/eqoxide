@@ -7,7 +7,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::{GameState, ZonePoint};
-use crate::http::{AttackReq, BuyReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, ZoneCrossReq, ZonePoints};
+use crate::http::{AttackReq, BuyReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
 
 /// OP_TargetCommand payload: ClientTarget_Struct = just the target spawn id (u32).
 pub fn build_target_packet(spawn_id: u32) -> Vec<u8> {
@@ -90,6 +90,7 @@ pub struct Navigator {
     entity_positions: EntityPositions,
     entity_ids:       EntityIds,
     zone_points:      ZonePoints,
+    task_log:         TaskLog,
     zone_cross:       ZoneCrossReq,
     hail:             HailReq,
     say:              SayReq,
@@ -119,6 +120,7 @@ impl Navigator {
         entity_positions: EntityPositions,
         entity_ids:       EntityIds,
         zone_points:      ZonePoints,
+        task_log:         TaskLog,
         zone_cross:       ZoneCrossReq,
         hail:             HailReq,
         say:              SayReq,
@@ -133,6 +135,7 @@ impl Navigator {
             entity_positions,
             entity_ids,
             zone_points,
+            task_log,
             zone_cross,
             hail,
             say,
@@ -164,6 +167,15 @@ impl Navigator {
             map.insert(e.name.clone(), (e.x, e.y, e.z));
             ids.insert(e.name.clone(), id);
         }
+    }
+
+    /// Publish the native Task-system quest log from `gs` into the shared slot (GET /quests/log).
+    pub fn sync_tasks(&self, gs: &GameState) {
+        let mut log = self.task_log.lock().unwrap();
+        log.clear();
+        let mut tasks: Vec<_> = gs.tasks.values().cloned().collect();
+        tasks.sort_by_key(|t| t.task_id);
+        log.extend(tasks);
     }
 
     /// Sync zone exit points from `gs` into the shared zone_points map.

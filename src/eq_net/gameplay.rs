@@ -41,6 +41,7 @@ pub async fn run_gameplay_phase(
             apply_packet(&mut gs, &packet);
             navigator.sync_entities(&gs);
             navigator.sync_zone_points(&gs);
+            navigator.sync_tasks(&gs);
             let _ = app_tx.send(packet.clone());
 
             match packet.opcode {

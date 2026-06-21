@@ -48,6 +48,31 @@ impl Entity {
     }
 }
 
+/// One objective/step of a Task-system quest (from OP_TaskActivity). `done_count`/`goal_count`
+/// are the live progress (e.g. "kill 4 gnolls" -> goal 4, done 2).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct TaskActivity {
+    pub activity_id:   u32,
+    pub activity_type: u32,
+    /// The objective text — activity_name if present, else the mob/item the step targets.
+    pub target:        String,
+    pub done_count:    u32,
+    pub goal_count:    u32,
+}
+
+/// A Task-system quest in the player's journal (from OP_TaskDescription + OP_TaskActivity). This is
+/// EQ's *native* quest log (server-pushed), distinct from the old-style Lua turn-in quests surfaced
+/// by tools/quest_finder.py + GET /quests. See docs/autonomous-play.md.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ActiveTask {
+    pub task_id:     u32,
+    pub title:       String,
+    pub description: String,
+    pub xp_reward:   u32,
+    pub coin_reward: u32,
+    pub activities:  Vec<TaskActivity>,
+}
+
 /// All state the renderer needs for one frame.
 #[derive(Debug, Default, Clone)]
 pub struct GameState {
@@ -116,6 +141,12 @@ pub struct GameState {
     /// When the first corpse was pushed to pending_loot; used to delay LootRequest by
     /// 500 ms so the server has time to register the corpse as lootable.
     pub loot_queued_at: Option<std::time::Instant>,
+
+    // Quest log (native EQ Task system) — server-pushed via OP_TaskDescription / OP_TaskActivity.
+    /// Active task quests keyed by task_id, with their objectives + live progress.
+    pub tasks: std::collections::HashMap<u32, ActiveTask>,
+    /// Task ids the server reports as completed (OP_CompletedTasks).
+    pub completed_tasks: Vec<u32>,
 }
 
 impl GameState {

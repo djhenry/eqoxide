@@ -43,6 +43,17 @@ Phase 1 (done): **discovery + indicators**.
   count), `reward_xp`, and `hail` text. Workflow: `GET /quests` → pick one → `/goto` to it →
   `/hail` to read the quest → gather items → return → hand in.
 
+**Two kinds of EQ quests** — the client surfaces both:
+- **Old-style Lua turn-in/dialogue quests** (most classic Qeynos quests: Rat Whiskers, Gnoll Fangs,
+  the guild-note hand-in) have **no protocol representation** — they're emergent server Lua. The
+  golden "!" + `GET /quests` (derived from `data/quests.json`) are the only way to see them.
+- **Native Task-system quests** (LDoN+; present in Titanium) — the server pushes a real quest journal
+  (`OP_TaskDescription`/`OP_TaskActivity`/`OP_CompletedTasks`). The client decodes these into a live
+  journal: **`GET /quests/log`** returns active tasks with title, description, reward, and objectives
+  showing live progress (`done_count`/`goal_count`), plus completed task ids. The authentic "quest
+  added to my log, watch it tick up" experience. (OpenEQ decodes these structs but builds nothing on
+  them; packet-only clients can't see the old-style quests at all. See `docs/protocol-notes.md`.)
+
 To actually *complete* a turn-in quest you still need: reach + kill the mob → **loot** the item →
 reach the giver → **hand it in**. Looting (`/loot`) and item hand-in (`/give`) are the gameplay
 actions being added next (see the questing roadmap in `todo.md`). The hail/say flow for dialogue

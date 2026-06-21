@@ -46,7 +46,112 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_BECOME_CORPSE        => apply_become_corpse(gs, p),
         OP_MONEY_ON_CORPSE      => apply_money_on_corpse(gs, p),
         OP_WEAR_CHANGE          => apply_wear_change(gs, p),
+        OP_TASK_DESCRIPTION     => apply_task_description(gs, p),
+        OP_TASK_ACTIVITY        => apply_task_activity(gs, p),
+        OP_COMPLETED_TASKS      => apply_completed_tasks(gs, p),
         _                       => {}
+    }
+}
+
+// ── Native Task-system quest log (OP_TaskDescription / OP_TaskActivity / OP_CompletedTasks) ──────
+// These are variable-length, packed (no struct padding) wire records with embedded null-terminated
+// strings. Layouts cross-checked against EQEmu titanium.cpp ENCODE(OP_TaskDescription) + the
+// TaskActivity_Struct in eq_packet_structs.h. See docs/protocol-notes.md.
+
+/// Read a u32 LE at `*off`, advancing `off`. Returns 0 if out of bounds.
+fn rd_u32(p: &[u8], off: &mut usize) -> u32 {
+    if *off + 4 > p.len() { return 0; }
+    let v = u32::from_le_bytes([p[*off], p[*off + 1], p[*off + 2], p[*off + 3]]);
+    *off += 4;
+    v
+}
+
+/// Read a null-terminated string at `*off`, advancing `off` past the terminator.
+fn rd_cstr(p: &[u8], off: &mut usize) -> String {
+    let start = *off;
+    while *off < p.len() && p[*off] != 0 { *off += 1; }
+    let s = String::from_utf8_lossy(&p[start..*off]).into_owned();
+    if *off < p.len() { *off += 1; } // skip the null
+    s
+}
+
+/// OP_TaskDescription — a task's header + title + reward. Upserts into gs.tasks (preserving any
+/// activities already received for it). Layout: Header{seq,task_id,open_window:u8,task_type,
+/// reward_type}(17) + title cstr + Data1{duration,dur_code,start_time}(12) + desc cstr +
+/// Data2{has_rewards:u8,coin,xp,faction}(13) + reward cstr + itemlink cstr + Trailer(5).
+fn apply_task_description(gs: &mut GameState, p: &[u8]) {
+    let mut o = 0usize;
+    let _seq = rd_u32(p, &mut o);
+    let task_id = rd_u32(p, &mut o);
+    o += 1; // open_window u8
+    let _task_type = rd_u32(p, &mut o);
+    let _reward_type = rd_u32(p, &mut o);
+    let title = rd_cstr(p, &mut o);
+    let _duration = rd_u32(p, &mut o);
+    let _dur_code = rd_u32(p, &mut o);
+    let _start_time = rd_u32(p, &mut o);
+    let description = rd_cstr(p, &mut o);
+    o += 1; // has_rewards u8
+    let coin_reward = rd_u32(p, &mut o);
+    let xp_reward = rd_u32(p, &mut o);
+    let _faction = rd_u32(p, &mut o);
+    if task_id == 0 { return; }
+    let title_for_log = title.clone();
+    {
+        let task = gs.tasks.entry(task_id).or_default();
+        task.task_id = task_id;
+        task.title = title;
+        task.description = description;
+        task.xp_reward = xp_reward;
+        task.coin_reward = coin_reward;
+    }
+    gs.log_msg("quest", &format!("Quest accepted: {}", title_for_log));
+}
+
+/// OP_TaskActivity — one objective + live progress for a task. Layout: 8×u32 fixed
+/// (activity_count,id3,taskid,activity_id,unk,activity_type,unk,unk) + mob_name cstr + item_name
+/// cstr + goal_count u32 + 4×u32 unknown + activity_name cstr + done_count u32 (+ unknown).
+fn apply_task_activity(gs: &mut GameState, p: &[u8]) {
+    let mut o = 0usize;
+    let _activity_count = rd_u32(p, &mut o);
+    let _id3 = rd_u32(p, &mut o);
+    let task_id = rd_u32(p, &mut o);
+    let activity_id = rd_u32(p, &mut o);
+    let _unk16 = rd_u32(p, &mut o);
+    let activity_type = rd_u32(p, &mut o);
+    let _unk24 = rd_u32(p, &mut o);
+    let _unk28 = rd_u32(p, &mut o);
+    let mob_name = rd_cstr(p, &mut o);
+    let item_name = rd_cstr(p, &mut o);
+    let goal_count = rd_u32(p, &mut o);
+    o += 16; // 4 unknown u32s
+    let activity_name = rd_cstr(p, &mut o);
+    let done_count = rd_u32(p, &mut o);
+    if task_id == 0 { return; }
+    // Objective text: prefer the explicit name, else the mob/item the step targets.
+    let target = if !activity_name.is_empty() { activity_name }
+        else if !mob_name.is_empty() { mob_name }
+        else { item_name };
+    let task = gs.tasks.entry(task_id).or_default();
+    task.task_id = task_id;
+    let act = crate::game_state::TaskActivity { activity_id, activity_type, target, done_count, goal_count };
+    if let Some(existing) = task.activities.iter_mut().find(|a| a.activity_id == activity_id) {
+        *existing = act; // progress update
+    } else {
+        task.activities.push(act);
+        task.activities.sort_by_key(|a| a.activity_id);
+    }
+}
+
+/// OP_CompletedTasks — a count followed by completed task records; we just collect the task ids.
+fn apply_completed_tasks(gs: &mut GameState, p: &[u8]) {
+    let mut o = 0usize;
+    let count = rd_u32(p, &mut o).min(((p.len() / 4) as u32).max(1));
+    for _ in 0..count {
+        let id = rd_u32(p, &mut o);
+        if id != 0 && !gs.completed_tasks.contains(&id) {
+            gs.completed_tasks.push(id);
+        }
     }
 }
 
