@@ -236,15 +236,16 @@ impl Navigator {
                         .map(|zp| (zp.zone_id, zp.server_x, zp.server_y, zp.server_z))
                 }
             };
-            if let Some((dest_zone, tx, ty, tz)) = exit {
-                eprintln!("zone_cross: warping to zone line for zone_id={dest_zone} at ({:.1},{:.1},{:.1})", tx, ty, tz);
-                gs.player_x = tx;
-                gs.player_y = ty;
-                gs.player_z = tz;
-                // Report our position at the zone line so the server's zone-line check passes.
-                let _ = app_tx.send(make_position_packet(gs.player_id, tx, ty, tz));
-                self.send_position_update(stream, gs, tx, ty, tz, 0.0);
-                self.send_zone_change_packet(stream, gs);
+            if let Some((dest_zone, _tx, _ty, _tz)) = exit {
+                // Request the zone change to the DESTINATION zone. The server (ZoneUnsolicited)
+                // looks up the closest zone point matching this target zone near our tracked
+                // position and zones us there — so we send the player's real position (no warp;
+                // warping to the destination's arrival coords put us far from the source trigger
+                // and zoned us back to the same zone). The key is sending the TARGET zone id, not
+                // our current zone id.
+                eprintln!("zone_cross: requesting zone change to zone_id={dest_zone} from ({:.1},{:.1})",
+                          gs.player_x, gs.player_y);
+                self.send_zone_change_packet(stream, gs, dest_zone);
             } else {
                 eprintln!("zone_cross: no zone line found for zone_id={want_zone}");
                 gs.log_msg("zone", "No zone line found to cross");
@@ -266,18 +267,10 @@ impl Navigator {
                 .find(|zp| dist2(zp, gs) < ZONE_LINE_DIST2);
             if let Some(zp) = nearby {
                 let dest = zp.zone_id;
-                let tx = zp.server_x;
-                let ty = zp.server_y;
-                let tz = zp.server_z;
                 drop(zps); // release lock before mutating gs
-                eprintln!("zone_cross: auto-triggered near zone_id={dest} at ({:.1},{:.1},{:.1})", tx, ty, tz);
+                eprintln!("zone_cross: auto-triggered near a zone line to zone_id={dest}");
                 gs.log_msg("zone", &format!("Crossing to zone {}", dest));
-                gs.player_x = tx;
-                gs.player_y = ty;
-                gs.player_z = tz;
-                let _ = app_tx.send(make_position_packet(gs.player_id, tx, ty, tz));
-                self.send_position_update(stream, gs, tx, ty, tz, gs.player_heading);
-                self.send_zone_change_packet(stream, gs);
+                self.send_zone_change_packet(stream, gs, dest);
                 self.last_zone_cross = Instant::now();
             }
             }
@@ -503,16 +496,19 @@ impl Navigator {
         stream.send_app_packet(OP_CLIENT_UPDATE, &buf);
     }
 
-    /// Send OP_ZONE_CHANGE to request crossing a zone line.
-    /// ZoneChange_Struct (88 bytes): char_name[64] + zone_id(u16) + instance_id(u16)
+    /// Send OP_ZONE_CHANGE to request crossing a zone line to `target_zone_id`.
+    /// ZoneChange_Struct (88 bytes): char_name[64] + zoneID(u16) + instance_id(u16)
     ///   + y(f32) + x(f32) + z(f32) + zone_reason(u32) + success(i32=0)
-    fn send_zone_change_packet(&self, stream: &mut EqStream, gs: &GameState) {
+    /// NOTE: zoneID must be the DESTINATION zone, not our current zone — the server
+    /// (ZoneUnsolicited) reads it as the target and finds the matching zone point near our
+    /// tracked position. Sending our current zone made target==current → request cancelled.
+    fn send_zone_change_packet(&self, stream: &mut EqStream, gs: &GameState, target_zone_id: u16) {
         let mut buf = [0u8; 88];
         let name_bytes = gs.player_name.as_bytes();
         let name_len = name_bytes.len().min(64);
         buf[..name_len].copy_from_slice(&name_bytes[..name_len]);
-        // zone_id = current zone (tells server which zone_point table to look up)
-        buf[64..66].copy_from_slice(&gs.zone_id.to_le_bytes());
+        // zoneID = DESTINATION zone we want to travel to.
+        buf[64..66].copy_from_slice(&target_zone_id.to_le_bytes());
         // instance_id = 0
         buf[66..68].copy_from_slice(&0u16.to_le_bytes());
         // ZoneChange_Struct: y(server_y=north) @68, x(server_x=east) @72 — Y-first, no swap.
@@ -524,8 +520,8 @@ impl Navigator {
         buf[80..84].copy_from_slice(&0u32.to_le_bytes());
         // success = 0 (client→server request)
         buf[84..88].copy_from_slice(&0i32.to_le_bytes());
-        eprintln!("EQ: sending OP_ZONE_CHANGE from zone_id={} pos=({:.1},{:.1},{:.1})",
-                  gs.zone_id, gs.player_x, gs.player_y, gs.player_z);
+        eprintln!("EQ: sending OP_ZONE_CHANGE target_zone={} from current_zone={} pos=({:.1},{:.1},{:.1})",
+                  target_zone_id, gs.zone_id, gs.player_x, gs.player_y, gs.player_z);
         stream.send_app_packet(OP_ZONE_CHANGE, &buf);
     }
 }
