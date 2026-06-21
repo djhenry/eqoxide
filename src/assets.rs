@@ -235,6 +235,98 @@ impl Collision {
         let target = [from[0] + d[0] * ext, from[1] + d[1] * ext, from[2] + d[2] * ext];
         self.nearest_hit_t(from, target).is_none()
     }
+
+    /// A* over the collision grid: a walkable waypoint path from `start` to `goal` that routes
+    /// AROUND walls (slide_move only slides along one). Returns cell-center waypoints
+    /// `[east, north]` (start-exclusive, goal-inclusive) or None if no geometry / no route.
+    /// Walkability = a floor exists under the cell; an edge needs a small floor-height step and
+    /// a clear chest-height segment between cell centers.
+    pub fn find_path(&self, start: [f32; 3], goal: [f32; 3], radius: f32) -> Option<Vec<[f32; 2]>> {
+        use std::collections::BinaryHeap;
+        use std::cmp::Ordering;
+        if self.cols == 0 || self.rows == 0 { return None; }
+        let cols = self.cols as i32;
+        let rows = self.rows as i32;
+        let to_cell = |e: f32, n: f32| -> (i32, i32) {
+            let c = (((e - self.origin[0]) / self.cell_size) as i32).clamp(0, cols - 1);
+            let r = (((n - self.origin[1]) / self.cell_size) as i32).clamp(0, rows - 1);
+            (c, r)
+        };
+        let center = |c: i32, r: i32| -> [f32; 2] {
+            [self.origin[0] + (c as f32 + 0.5) * self.cell_size,
+             self.origin[1] + (r as f32 + 0.5) * self.cell_size]
+        };
+        // floor_z casts its probe ray DOWN from (fallback + 2), so the fallback must sit ABOVE
+        // the working floor level; it returns the fallback unchanged when there's no floor.
+        let probe = start[2] + 50.0;
+        let floor_at = |c: i32, r: i32| -> Option<f32> {
+            let p = center(c, r);
+            let z = self.floor_z(p[0], p[1], probe);
+            if (z - probe).abs() < 0.01 { None } else { Some(z) }
+        };
+        let (sc, sr) = to_cell(start[0], start[1]);
+        let (gc, gr) = to_cell(goal[0], goal[1]);
+        if (sc, sr) == (gc, gr) { return Some(vec![[goal[0], goal[1]]]); }
+        const STEP_H: f32 = 12.0; // max floor-height change between adjacent cells
+        const CHEST: f32 = 3.0;
+        const MAX_NODES: usize = 40_000;
+        let idx = |c: i32, r: i32| (r * cols + c) as usize;
+        let n = (cols * rows) as usize;
+        let mut g_score = vec![f32::MAX; n];
+        let mut came: Vec<i32> = vec![-1; n];
+        let mut closed = vec![false; n];
+        struct Node { f: f32, c: i32, r: i32 }
+        impl PartialEq for Node { fn eq(&self, o: &Self) -> bool { self.f == o.f } }
+        impl Eq for Node {}
+        impl Ord for Node { fn cmp(&self, o: &Self) -> Ordering { o.f.partial_cmp(&self.f).unwrap_or(Ordering::Equal) } }
+        impl PartialOrd for Node { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
+        let h = |c: i32, r: i32| (((c - gc) as f32).powi(2) + ((r - gr) as f32).powi(2)).sqrt() * self.cell_size;
+        let start_floor = floor_at(sc, sr).unwrap_or(start[2]);
+        g_score[idx(sc, sr)] = 0.0;
+        let mut heap = BinaryHeap::new();
+        heap.push(Node { f: h(sc, sr), c: sc, r: sr });
+        let mut expanded = 0usize;
+        let mut found = false;
+        while let Some(Node { c, r, .. }) = heap.pop() {
+            let ci = idx(c, r);
+            if closed[ci] { continue; }
+            closed[ci] = true;
+            if (c, r) == (gc, gr) { found = true; break; }
+            expanded += 1;
+            if expanded > MAX_NODES { break; }
+            let cz = floor_at(c, r).unwrap_or(start_floor);
+            for (dc, dr) in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)] {
+                let (nc, nr) = (c + dc, r + dr);
+                if nc < 0 || nr < 0 || nc >= cols || nr >= rows { continue; }
+                let ni = idx(nc, nr);
+                if closed[ni] { continue; }
+                let nz = match floor_at(nc, nr) { Some(z) => z, None => continue };
+                if (nz - cz).abs() > STEP_H { continue; }
+                let a = center(c, r);
+                let b = center(nc, nr);
+                if !self.path_clear([a[0], a[1], cz + CHEST], [b[0], b[1], nz + CHEST], radius) { continue; }
+                let step = (((dc * dc + dr * dr) as f32).sqrt()) * self.cell_size;
+                let tentative = g_score[ci] + step;
+                if tentative < g_score[ni] {
+                    g_score[ni] = tentative;
+                    came[ni] = ci as i32;
+                    heap.push(Node { f: tentative + h(nc, nr), c: nc, r: nr });
+                }
+            }
+        }
+        if !found { return None; }
+        let mut path = Vec::new();
+        let mut cur = idx(gc, gr) as i32;
+        let start_i = idx(sc, sr) as i32;
+        while cur != start_i && cur >= 0 {
+            let (c, r) = (cur % cols, cur / cols);
+            path.push(center(c, r));
+            cur = came[cur as usize];
+        }
+        path.reverse();
+        if let Some(last) = path.last_mut() { *last = [goal[0], goal[1]]; }
+        Some(path)
+    }
 }
 
 impl ZoneAssets {
@@ -696,6 +788,31 @@ mod tests {
         assert!(!empty.segment_blocked([0.0, 0.0, 0.0], [10.0, 0.0, 0.0]));
         assert!(empty.path_clear([0.0, 0.0, 0.0], [10.0, 0.0, 0.0], 2.0),
             "no geometry should never block movement");
+    }
+
+    #[test]
+    fn find_path_routes_around_a_partial_wall() {
+        // 20x20 floor at z=0.
+        let floor = MeshData {
+            positions: vec![[0.0, 0.0, 0.0], [20.0, 0.0, 0.0], [20.0, 0.0, 20.0], [0.0, 0.0, 20.0]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+        };
+        // Partial wall at world east=10, spanning north 0..14 (gap at north 14..20), height 0..10.
+        let wall = MeshData {
+            positions: vec![[0.0, 0.0, 10.0], [14.0, 0.0, 10.0], [14.0, 10.0, 10.0], [0.0, 10.0, 10.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+        };
+        let col = Collision::build(&ZoneAssets { meshes: vec![floor, wall], textures: vec![] }, 2.0);
+        // The direct line (5,5)->(15,5) crosses the wall (north 5 < 14) → blocked.
+        assert!(col.segment_blocked([5.0, 5.0, 3.0], [15.0, 5.0, 3.0]));
+        // find_path routes AROUND the wall through the northern gap.
+        let path = col.find_path([5.0, 5.0, 0.0], [15.0, 5.0, 0.0], 1.0)
+            .expect("a route around the wall should exist");
+        let last = *path.last().unwrap();
+        assert!((last[0] - 15.0).abs() < 1.5 && (last[1] - 5.0).abs() < 1.5, "ends at goal: {last:?}");
+        assert!(path.iter().any(|p| p[1] > 12.0), "path must detour north through the gap: {path:?}");
     }
 
     #[test]
