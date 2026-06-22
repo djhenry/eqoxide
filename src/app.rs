@@ -569,11 +569,15 @@ impl App {
             let mut dn = 0.0_f32;
             if self.keys_held.contains(&KeyCode::KeyW) { de += fwd_e; dn += fwd_n; }
             if self.keys_held.contains(&KeyCode::KeyS) { de -= fwd_e; dn -= fwd_n; }
-            // A/D strafe only when LMB is held (drag_active = strafe mode).
-            if self.drag_active {
-                if d_held { de += right_e; dn += right_n; }
-                if a_held { de -= right_e; dn -= right_n; }
-            }
+            // Strafe: Q = left, E = right (always); A/D strafe only while LMB (camera-orbit) is held.
+            // Under the X-mirrored render, screen-left strafe moves along +right_vec and screen-right
+            // along -right_vec — the same left/right reversal as the rotation fix above.
+            let q_held = self.keys_held.contains(&KeyCode::KeyQ);
+            let e_held = self.keys_held.contains(&KeyCode::KeyE);
+            let strafe_left  = q_held || (self.drag_active && a_held);
+            let strafe_right = e_held || (self.drag_active && d_held);
+            if strafe_left  { de += right_e; dn += right_n; }
+            if strafe_right { de -= right_e; dn -= right_n; }
             // Jump: only from solid ground.
             if self.keys_held.contains(&KeyCode::Space) && self.on_ground {
                 const JUMP_VELOCITY: f32 = 13.0;
@@ -1073,7 +1077,7 @@ impl ApplicationHandler for App {
                         ElementState::Pressed => {
                             match code {
                                 KeyCode::KeyW | KeyCode::KeyA | KeyCode::KeyS | KeyCode::KeyD
-                                | KeyCode::Space => {
+                                | KeyCode::KeyQ | KeyCode::KeyE | KeyCode::Space => {
                                     self.keys_held.insert(code);
                                 }
                                 KeyCode::KeyR | KeyCode::F9 => {
