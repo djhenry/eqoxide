@@ -7,15 +7,22 @@ use crate::camera::project_to_screen;
 use crate::scene::SceneState;
 use crate::zone_map::ZoneMap;
 
-/// Letterbox: adjust an anchored element's offset so HUD chrome sits on a 1920x1080 canvas centered
-/// in the window, instead of spreading to the window edges. The margin is the slack on the
-/// non-constraining axis (read from the zoomed screen rect, in points); on a 16:9 window it's 0, on
-/// a triple-monitor/ultrawide it keeps the HUD on the center region. Nameplates do NOT use this —
+/// HUD design reference (points). The layout is authored for 1920x1080; using a HALF reference here
+/// makes `set_zoom_factor` twice as large, so all HUD text/widgets render at 2x scale. Shared with
+/// the zoom calc in `app.rs::egui_pass`. Tune this single pair to change the global HUD size.
+pub const HUD_REF_W: f32 = 960.0;
+pub const HUD_REF_H: f32 = 540.0;
+
+/// Letterbox: adjust an anchored element's offset so HUD chrome sits on a HUD_REF_W x HUD_REF_H
+/// canvas centered in the window, instead of spreading to the window edges. The margin is the slack
+/// on the non-constraining axis (read from the zoomed screen rect, in points); when the window is
+/// narrower than the canvas the margin clamps to 0 (graceful fall back to edge-anchoring). On a
+/// triple-monitor/ultrawide it keeps the HUD on the center region. Nameplates do NOT use this —
 /// they track 3D mobs across the whole window. `align` is the element's own anchor alignment.
 fn canvas_off(ctx: &egui::Context, align: egui::Align2, base: [f32; 2]) -> [f32; 2] {
     let sr = ctx.screen_rect();
-    let mx = (sr.width() - 1920.0).max(0.0) * 0.5;
-    let my = (sr.height() - 1080.0).max(0.0) * 0.5;
+    let mx = (sr.width() - HUD_REF_W).max(0.0) * 0.5;
+    let my = (sr.height() - HUD_REF_H).max(0.0) * 0.5;
     let dx = match align.0[0] {
         egui::Align::Min => mx, egui::Align::Max => -mx, egui::Align::Center => 0.0,
     };

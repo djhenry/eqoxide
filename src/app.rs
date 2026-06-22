@@ -916,7 +916,8 @@ impl App {
         // DPI ppp so it's display-independent. Cached; only recomputed when the surface size changes.
         if (screen_w, screen_h) != *ui_zoom_size {
             let nppp = window.scale_factor() as f32;
-            *ui_zoom = ((screen_w as f32 / 1920.0).min(screen_h as f32 / 1080.0) / nppp).max(0.05);
+            let (rw, rh) = (hud::HUD_REF_W, hud::HUD_REF_H);
+            *ui_zoom = ((screen_w as f32 / rw).min(screen_h as f32 / rh) / nppp).max(0.05);
             *ui_zoom_size = (screen_w, screen_h);
         }
         egui_ctx.set_zoom_factor(*ui_zoom);
