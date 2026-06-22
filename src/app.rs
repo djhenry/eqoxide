@@ -485,7 +485,14 @@ impl App {
                 self.last_moved_at = std::time::Instant::now();
             }
             self.prev_logical_pos = lp;
-            self.scene.player_action = if self.last_moved_at.elapsed().as_millis() < 250 {
+            // A live combat swing (OP_Animation under the player's spawn id) overrides movement so
+            // her attacks animate; otherwise walk/idle from recent movement.
+            let pid = self.game_state.player_id;
+            let swinging = self.game_state.combat_anims.get(&pid)
+                .map_or(false, |(_, t)| t.elapsed() < crate::scene::COMBAT_SWING_WINDOW);
+            self.scene.player_action = if let Some((code, _)) = self.game_state.combat_anims.get(&pid).filter(|_| swinging) {
+                format!("C{:02}", code)
+            } else if self.last_moved_at.elapsed().as_millis() < 250 {
                 "walking".to_string()
             } else {
                 "idle".to_string()

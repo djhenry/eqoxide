@@ -233,6 +233,16 @@ impl SkinData {
                 });
                 neutral.or_else(any_idle).or_else(walk_fallback)
             }
+            // Combat swing codes like "C05" (OP_Animation action) → the matching C0N combat clip.
+            // Clip names are e.g. "C05B_combat"; prefer the full-body "B" variant.
+            a if a.len() == 3 && a.as_bytes()[0] == b'C' && a.as_bytes()[1] == b'0'
+                && a.as_bytes()[2].is_ascii_digit() => {
+                let pre = a.to_uppercase();
+                self.clips.iter().position(|c| {
+                    let n = c.name.to_uppercase();
+                    n.starts_with(&pre) && n[3..].starts_with('B')
+                }).or_else(|| self.clips.iter().position(|c| c.name.to_uppercase().starts_with(&pre)))
+            }
             _ => self.clips.iter().position(|c| {
                 let n = c.name.to_lowercase();
                 (n.contains("walking") || n.contains("walk"))

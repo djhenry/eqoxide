@@ -112,6 +112,10 @@ pub struct GameState {
     pub player_equipment: [u32; 9],
     /// RGB tint for each equipment slot (0..9), from the player profile.
     pub player_equipment_tint: [[u8; 3]; 9],
+    /// Transient one-shot combat swings, keyed by spawn_id (player uses gs.player_id): the EQ
+    /// animation action code (1=kick … 5=1H weapon … 8=hand-to-hand) + when it started. Set from
+    /// OP_Animation; the renderer plays clip C0{action} for a short window, then reverts to idle/walk.
+    pub combat_anims: std::collections::HashMap<u32, (u8, std::time::Instant)>,
 
     // Zone
     pub zone_name: String,

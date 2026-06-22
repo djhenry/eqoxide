@@ -51,7 +51,21 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_COMPLETED_TASKS      => apply_completed_tasks(gs, p),
         OP_CHAR_INVENTORY       => apply_char_inventory(gs, p),
         OP_ITEM_PACKET          => apply_item_packet(gs, p),
+        OP_ANIMATION            => apply_animation(gs, p),
         _                       => {}
+    }
+}
+
+/// OP_Animation — a spawn performs a one-shot animation. Animation_Struct: spawnid(u16) speed(u8)
+/// action(u8). We record COMBAT swings (action 1..=9: kick/pierce/slash/weapon/hand-to-hand) keyed
+/// by spawn_id (the player's own swings arrive under gs.player_id); the renderer plays clip
+/// C0{action} for a short window then reverts. Non-combat anim codes are ignored.
+fn apply_animation(gs: &mut GameState, p: &[u8]) {
+    if p.len() < 4 { return; }
+    let spawnid = u16::from_le_bytes([p[0], p[1]]) as u32;
+    let action  = p[3];
+    if (1..=9).contains(&action) {
+        gs.combat_anims.insert(spawnid, (action, std::time::Instant::now()));
     }
 }
 

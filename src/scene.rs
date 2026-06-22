@@ -4,6 +4,9 @@
 
 use crate::game_state::GameState;
 
+/// How long a one-shot combat swing (OP_Animation) plays before reverting to idle/walk. ~one swing.
+pub const COMBAT_SWING_WINDOW: std::time::Duration = std::time::Duration::from_millis(600);
+
 /// Billboard for one entity in the scene.
 #[derive(Debug, Clone)]
 pub struct Billboard {
@@ -133,15 +136,19 @@ impl SceneState {
             // Map EQ Animation:: values to action strings for clip resolution.
             // Animation constants from eq_constants.h: Standing=100, Freeze=102,
             // Looting=105, Sitting=110, Crouching=111, Lying=115.
-            let action = match e.animation {
-                100 => "idle",       // Animation::Standing
-                102 => "idle",       // Animation::Freeze
-                110 => "sitting",    // Animation::Sitting
-                111 => "crouching",  // Animation::Crouching
-                105 => "idle",       // Animation::Looting (treat as idle)
-                115 => "dead",       // Animation::Lying
-                0   => "idle",       // default / standing
-                _   => "idle",       // safe default
+            // A transient combat swing (OP_Animation) overrides the looping animation for a short
+            // window: action "C0{code}" resolves to the matching combat clip (C05 = 1H weapon, …).
+            let action: String = match gs.combat_anims.get(&e.spawn_id) {
+                Some((code, start)) if start.elapsed() < COMBAT_SWING_WINDOW => format!("C{:02}", code),
+                _ => match e.animation {
+                    100 => "idle",       // Animation::Standing
+                    102 => "idle",       // Animation::Freeze
+                    110 => "sitting",    // Animation::Sitting
+                    111 => "crouching",  // Animation::Crouching
+                    105 => "idle",       // Animation::Looting (treat as idle)
+                    115 => "dead",       // Animation::Lying
+                    _   => "idle",       // default / standing / safe default
+                }.to_string(),
             };
             Billboard {
                 id:        e.spawn_id,
@@ -152,7 +159,7 @@ impl SceneState {
                 dead:      e.dead,
                 name:      e.name.clone(),
                 race:      e.race.clone(),
-                action:    action.to_string(),
+                action:    action,
                 heading:   e.heading,
                 equipment:      e.equipment,
                 equipment_tint: e.equipment_tint,

@@ -85,6 +85,10 @@ pub const OP_NEW_SPAWN: u16 = 0x1860;
 pub const OP_DELETE_SPAWN: u16 = 0x55bc;
 pub const OP_CLIENT_UPDATE: u16 = 0x14cb;
 pub const OP_SPAWN_APPEARANCE: u16 = 0x7c32;
+/// Server → client: a spawn performs a one-shot animation (melee swing, kick, etc.).
+/// Animation_Struct: spawnid(u16) speed(u8) action(u8). action = anim code (1=kick, 2=1HPierce,
+/// 3=2HSlash, 4=2HWeapon, 5=1HWeapon, 7=tailrake/slam, 8=hand-to-hand) → combat clip C0{action}.
+pub const OP_ANIMATION: u16 = 0x2acf;
 
 // ── Gameplay: equipment ───────────────────────────────────────────────────
 
