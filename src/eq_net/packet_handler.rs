@@ -191,7 +191,12 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         let dx = upd.x - gs.player_x;
         let dy = upd.y - gs.player_y;
         let dz = upd.z - gs.player_z;
-        if dx * dx + dy * dy > 25.0 {
+        // Small deltas during movement are NORMAL client/server sync lag (≈ run speed × update
+        // interval, so up to ~6u) — they only adjust the logical position (the visual is driven by
+        // the WASD override / lerp), so they don't jerk the character. Only surface + count GENUINE
+        // corrections (anti-cheat snaps, wall clips, teleports), which are much larger.
+        const CORRECTION_SQ: f32 = 144.0; // 12u — above normal movement jitter, below real rubber-bands
+        if dx * dx + dy * dy > CORRECTION_SQ {
             eprintln!("SERVER_CORRECT: player pos ({:.1},{:.1},{:.1}) → ({:.1},{:.1},{:.1}) delta ({:.1},{:.1},{:.1})",
                       gs.player_x, gs.player_y, gs.player_z, upd.x, upd.y, upd.z, dx, dy, dz);
             gs.log_msg("zone", &format!("Server corrected position by ({:.0},{:.0},{:.0})", dx, dy, dz));
