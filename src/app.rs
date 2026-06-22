@@ -533,6 +533,15 @@ impl App {
         let d_held = self.keys_held.contains(&KeyCode::KeyD);
         // Rotate mode: LMB is up (not dragging camera). Strafe mode: LMB held.
         let rotating = !self.drag_active && (a_held || d_held);
+        // Any manual movement key held. When true, the player's facing is driven by heading_target
+        // (a/d rotation), NOT by motion direction — so strafing (Q/E, A/D+LMB) keeps facing forward
+        // instead of turning to face the sideways motion (which would feed back through the
+        // auto-follow camera into a spin). Motion-derived heading is only for nav-driven /goto.
+        let manual_move = a_held || d_held
+            || self.keys_held.contains(&KeyCode::KeyW)
+            || self.keys_held.contains(&KeyCode::KeyS)
+            || self.keys_held.contains(&KeyCode::KeyQ)
+            || self.keys_held.contains(&KeyCode::KeyE);
 
         {
             // EQ character run speed is ~35 EQ-units/sec; higher values trigger server rubber-band.
@@ -742,9 +751,11 @@ impl App {
         {
             let de = self.scene.player_pos[0] - self.prev_render_pos[0]; // east
             let dn = self.scene.player_pos[1] - self.prev_render_pos[1]; // north
-            // Don't override heading_target from motion while A/D are rotating the player —
-            // rotation already sets it directly. When not rotating, derive from movement.
-            if !rotating && de * de + dn * dn > 0.02 {
+            // Only derive heading from motion for NAV-driven movement (/goto), which carries no
+            // keyboard heading. For any manual movement, the facing is heading_target (set by a/d) —
+            // so strafing keeps facing forward instead of turning toward the sideways motion (which
+            // would swing the auto-follow camera and spin the view).
+            if !manual_move && de * de + dn * dn > 0.02 {
                 let motion_deg = (-de).atan2(dn).to_degrees().rem_euclid(360.0);
                 // Guard against ~180° flips caused by the backward position-correction lerp
                 // that occurs when W is released and visual_player_pos snaps back toward the
