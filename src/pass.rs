@@ -292,6 +292,49 @@ pub fn encode_player_pass(
                     pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..mesh.index_count, 0, 0..1);
                 }
+                drop(pass); // end the skinned pass before drawing the weapon
+
+                // ── Weapon in hand: draw the cached weapon model at the hand bone, posed by the
+                // current animation so it swings with combat. WEAPON_SCALE / orientation are tuned
+                // empirically via /frame (gequip weapon space vs the skinned bone space differ). ──
+                let wkey = scene.primary_weapon_idfile.to_uppercase();
+                if let Some(Some(weapon)) = r.weapon_cache.get(&wkey) {
+                    let (clip_i, t) = r.anim_states.get(&0).map(|s| (s.clip_idx, s.time)).unwrap_or((0, 0.0));
+                    const HAND_JOINT: usize = 53;   // elf_f right hand (primary); generalize via find_hand_joints
+                    const WEAPON_SCALE: f32 = 1.0;  // TUNE
+                    let pmat = glam::Mat4::from_cols_array_2d(&crate::camera::entity_model_matrix_heading(
+                        scene.player_pos, scene.player_heading, visual_scale, dominant_mesh_scale,
+                        [0.0, 0.0], true, 0.0));
+                    let hand = glam::Mat4::from_cols_array_2d(&model.skin.joint_world(clip_i, t, HAND_JOINT));
+                    let wlocal = glam::Mat4::from_scale(glam::Vec3::splat(WEAPON_SCALE));
+                    let wmat = (pmat * hand * wlocal).to_cols_array_2d();
+                    r.queue.write_buffer(&r.entity_uniform_pool[30].0, 0,
+                        bytemuck::bytes_of(&EntityUniform { model: wmat, tint: [1.0, 1.0, 1.0, 1.0] }));
+                    let mut wpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("player_weapon"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view, resolve_target: None,
+                            ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &r.depth_view,
+                            depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                            stencil_ops: None,
+                        }),
+                        timestamp_writes: None, occlusion_query_set: None,
+                    });
+                    wpass.set_pipeline(&r.pipelines.character);
+                    wpass.set_bind_group(0, &r.camera_uniform.bind_group, &[]);
+                    wpass.set_bind_group(2, &r.entity_uniform_pool[30].1, &[]);
+                    for mesh in &weapon.meshes {
+                        let bg = mesh.texture_idx.and_then(|ti| weapon.texture_bind_groups.get(ti))
+                            .unwrap_or(&r.fallback_texture_bg);
+                        wpass.set_bind_group(1, bg, &[]);
+                        wpass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                        wpass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                        wpass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                    }
+                }
                 return;
             }
             Some(GpuModel::Static(model)) => {
