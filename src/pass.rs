@@ -283,7 +283,7 @@ pub fn encode_player_pass(
                 pass.set_bind_group(3, &r.joint_buf_pool[0].1, &[]);
                 for (i, mesh) in model.meshes.iter().enumerate() {
                     if i >= PLAYER_UNIFORM_SLOTS { break; }
-                    if equip_mesh_hidden(r, &model.prefix, model.equip_slots[i], &scene.player_equipment) { continue; }
+                    if mesh.texture_idx.is_none() && equip_mesh_hidden(r, &model.prefix, model.equip_slots[i], &scene.player_equipment) { continue; }
                     pass.set_bind_group(2, &r.entity_uniform_pool[i].1, &[]);
                     let bg = resolve_equip_tex(r, &model.texture_bind_groups, mesh.texture_idx,
                         &model.prefix, model.equip_slots[i].clone(), &scene.player_equipment);
@@ -583,7 +583,7 @@ pub fn encode_entity_pass(
     for draw in &draws {
         let Some(GpuModel::Static(model)) = r.model_for(draw.archetype, draw.gender) else { continue };
         let mesh = &model.meshes[draw.mesh_idx];
-        if equip_mesh_hidden(r, &model.prefix, model.equip_slots[draw.mesh_idx], &draw.equipment) { continue; }
+        if mesh.texture_idx.is_none() && equip_mesh_hidden(r, &model.prefix, model.equip_slots[draw.mesh_idx], &draw.equipment) { continue; }
         pass.set_bind_group(2, &r.entity_uniform_pool[draw.uniform_slot].1, &[]);
         let bg = resolve_equip_tex(r, &model.texture_bind_groups, mesh.texture_idx,
             &model.prefix, model.equip_slots[draw.mesh_idx], &draw.equipment);
@@ -699,7 +699,7 @@ pub fn encode_skinned_entity_pass(
             pass.set_bind_group(3, &r.joint_buf_pool[draw.joint_slot].1, &[]);
             cur_joint = draw.joint_slot;
         }
-        if equip_mesh_hidden(r, &model.prefix, model.equip_slots[draw.mesh_idx], &draw.equipment) { continue; }
+        if mesh.texture_idx.is_none() && equip_mesh_hidden(r, &model.prefix, model.equip_slots[draw.mesh_idx], &draw.equipment) { continue; }
         pass.set_bind_group(2, &r.entity_uniform_pool[draw.uniform_slot].1, &[]);
         let bg = resolve_equip_tex(r, &model.texture_bind_groups, mesh.texture_idx,
             &model.prefix, model.equip_slots[draw.mesh_idx], &draw.equipment);
