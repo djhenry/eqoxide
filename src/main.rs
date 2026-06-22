@@ -15,7 +15,18 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let testzone_mode = args.contains(&"--testzone".to_string());
 
-    let login_cfg = config::LoginConfig::load();
+    // `--config <path>` selects the per-character login config; defaults to the eq-client-ref config.
+    let login_cfg_path = args
+        .iter()
+        .position(|a| a == "--config")
+        .and_then(|i| args.get(i + 1))
+        .map(|p| std::path::PathBuf::from(shellexpand::tilde(p).into_owned()))
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(shellexpand::tilde("~/git/eq-client-ref/config.yaml").into_owned())
+        });
+    eprintln!("renderer: loading login config from {}", login_cfg_path.display());
+
+    let login_cfg = config::LoginConfig::load(&login_cfg_path);
     let app_cfg   = config::AppConfig::load();
 
     // Load the EQ string table for OP_FormattedMessage / OP_SimpleMessage rendering.
@@ -44,6 +55,7 @@ fn main() {
     let attack:           http::AttackReq       = Arc::new(Mutex::new(None));
     let buy:              http::BuyReq          = Arc::new(Mutex::new(None));
     let move_req:         http::MoveReq         = Arc::new(Mutex::new(None));
+    let give:             http::GiveReq         = Arc::new(Mutex::new(None));
     let shared_collision: assets::SharedCollision = Arc::new(std::sync::RwLock::new(None));
     let frame_req:        http::FrameReq        = Arc::new(Mutex::new(None));
     let player_info:      http::PlayerInfo      = Arc::new(Mutex::new(http::PlayerState::default()));
@@ -63,12 +75,13 @@ fn main() {
         let at  = attack.clone();
         let by  = buy.clone();
         let mv  = move_req.clone();
+        let gv  = give.clone();
         let sc  = shared_collision.clone();
         let md  = app_cfg.assets_path.join("maps");
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, zc, hl, sy, tg, at, by, mv, sc, md).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, zc, hl, sy, tg, at, by, mv, gv, sc, md).await {
                     eprintln!("EQ: fatal: {e}");
                 }
             });
@@ -97,6 +110,7 @@ fn main() {
         attack,
         buy,
         move_req,
+        give,
         player_info,
         task_log,
         app_cfg.http_port,

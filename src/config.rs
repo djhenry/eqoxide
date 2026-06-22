@@ -1,6 +1,6 @@
 //! Application and EQ connection configuration, loaded from YAML files.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Renderer / HTTP server settings from `config.yaml`.
 pub struct AppConfig {
@@ -40,7 +40,8 @@ impl AppConfig {
     }
 }
 
-/// EQ login credentials and server addresses, loaded from `~/git/eq-client-ref/config.yaml`.
+/// EQ login credentials and server addresses, loaded from a per-character config file
+/// (default `~/git/eq-client-ref/config.yaml`, overridable via the `--config <path>` CLI flag).
 pub struct LoginConfig {
     pub login_host:     String,
     pub login_port:     u16,
@@ -51,9 +52,8 @@ pub struct LoginConfig {
 }
 
 impl LoginConfig {
-    pub fn load() -> Self {
-        let path = shellexpand::tilde("~/git/eq-client-ref/config.yaml").into_owned();
-        let cfg_text = std::fs::read_to_string(&path).unwrap_or_default();
+    pub fn load(path: &Path) -> Self {
+        let cfg_text = std::fs::read_to_string(path).unwrap_or_default();
         let cfg: serde_yaml::Value =
             serde_yaml::from_str(&cfg_text).unwrap_or(serde_yaml::Value::Null);
 
