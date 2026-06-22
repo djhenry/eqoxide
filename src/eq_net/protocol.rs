@@ -104,6 +104,9 @@ pub const OP_CONSIDER: u16 = 0x65ca;
 pub const OP_SHOP_REQUEST: u16 = 0x45f9;     // MerchantClick_Struct (open/close)
 pub const OP_SHOP_PLAYER_BUY: u16 = 0x221e;  // Merchant_Sell_Struct (buy from slot)
 
+// Move/equip/unequip an item between inventory slots (Titanium).
+pub const OP_MOVE_ITEM: u16 = 0x420f;        // MoveItem_Struct (from_slot,to_slot,number_in_stack)
+
 // Native Task-system quest journal (server→client). Decoded into GameState.tasks for the quest log.
 pub const OP_TASK_DESCRIPTION: u16 = 0x5ef7; // a task's title/desc/reward (variable length)
 pub const OP_TASK_ACTIVITY: u16    = 0x682d; // one objective + progress (done/goal, variable length)

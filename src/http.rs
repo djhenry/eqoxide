@@ -68,6 +68,11 @@ pub type AttackReq = Arc<Mutex<Option<bool>>>;
 /// Nav thread reads it and sends OP_ShopRequest (open) + OP_ShopPlayerBuy (buy that slot).
 pub type BuyReq = Arc<Mutex<Option<(u32, u32)>>>;
 
+/// Move-item request — (from_slot, to_slot), set by POST /move.
+/// Nav thread reads it and sends OP_MoveItem (MoveItem_Struct, number_in_stack=1).
+/// Used to equip/unequip/rearrange items (e.g. boots in bag slot 23 -> worn slot 19).
+pub type MoveReq = Arc<Mutex<Option<(u32, u32)>>>;
+
 /// Current zone name and id, updated on every OP_NEW_ZONE.
 #[allow(dead_code)]
 pub type ZoneInfo = Arc<Mutex<(String, u16)>>;
@@ -101,6 +106,7 @@ struct HttpState {
     target:           TargetReq,
     attack:           AttackReq,
     buy:              BuyReq,
+    move_req:         MoveReq,
     player_info:      PlayerInfo,
     task_log:         TaskLog,
 }
@@ -141,6 +147,7 @@ pub fn spawn_camera_server(
     target:           TargetReq,
     attack:           AttackReq,
     buy:              BuyReq,
+    move_req:         MoveReq,
     player_info:      PlayerInfo,
     task_log:         TaskLog,
     port:             u16,
@@ -148,7 +155,7 @@ pub fn spawn_camera_server(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, buy, player_info, task_log };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, buy, move_req, player_info, task_log };
             let app = Router::new()
                 .route("/camera", get(get_camera).post(post_camera))
                 .route("/camera/reset", post(post_camera_reset))
@@ -166,6 +173,7 @@ pub fn spawn_camera_server(
                 .route("/target/name", post(post_target_name))
                 .route("/attack", post(post_attack_on).delete(post_attack_off))
                 .route("/buy", post(post_buy))
+                .route("/move", post(post_move))
                 .route("/debug", get(get_debug))
                 .with_state(state);
             let addr = format!("127.0.0.1:{port}");
@@ -550,6 +558,30 @@ async fn post_buy(
         }
         None => (StatusCode::NOT_FOUND, format!("no merchant matching {:?}", b.merchant)),
     }
+}
+
+#[derive(serde::Deserialize)]
+struct MoveBody {
+    /// Source slot id (e.g. a general/bag slot like 23, or a worn slot to unequip).
+    from: u32,
+    /// Destination slot id (e.g. worn slot 19=Feet, 17=Chest; 30=cursor; 22-29 general).
+    to: u32,
+}
+
+/// POST /move {"from":N,"to":M} — move/equip/unequip an item between inventory slots.
+/// Nav thread sends OP_MoveItem (MoveItem_Struct, number_in_stack=1). Titanium slot ids:
+/// 0-21 worn, 22-29 general inventory, 30 cursor, 251+ bag contents.
+async fn post_move(
+    State(s): State<HttpState>,
+    body: Result<Json<MoveBody>, axum::extract::rejection::JsonRejection>,
+) -> (StatusCode, String) {
+    let b = match body {
+        Ok(Json(b)) => b,
+        Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"from\":N,\"to\":M}".into()),
+    };
+    *s.move_req.lock().unwrap() = Some((b.from, b.to));
+    eprintln!("move: queued from_slot={} to_slot={}", b.from, b.to);
+    (StatusCode::OK, format!("moving item from slot {} to slot {}", b.from, b.to))
 }
 
 async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {

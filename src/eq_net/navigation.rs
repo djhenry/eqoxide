@@ -7,7 +7,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::{GameState, ZonePoint};
-use crate::http::{AttackReq, BuyReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
+use crate::http::{AttackReq, BuyReq, MoveReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
 
 /// OP_TargetCommand payload: ClientTarget_Struct = just the target spawn id (u32).
 pub fn build_target_packet(spawn_id: u32) -> Vec<u8> {
@@ -97,6 +97,7 @@ pub struct Navigator {
     target:           TargetReq,
     attack:           AttackReq,
     buy:              BuyReq,
+    move_req:         MoveReq,
     collision:        crate::assets::SharedCollision,
     maps_dir:         std::path::PathBuf,
     current_zone:     String,
@@ -127,6 +128,7 @@ impl Navigator {
         target:           TargetReq,
         attack:           AttackReq,
         buy:              BuyReq,
+        move_req:         MoveReq,
         collision:        crate::assets::SharedCollision,
         maps_dir:         std::path::PathBuf,
     ) -> Self {
@@ -142,6 +144,7 @@ impl Navigator {
             target,
             attack,
             buy,
+            move_req,
             collision,
             maps_dir,
             current_zone: String::new(),
@@ -362,6 +365,20 @@ impl Navigator {
             stream.send_app_packet(OP_SHOP_PLAYER_BUY, &buy);
             eprintln!("EQ: shop buy — merchant_id={} slot={} qty=1", merchant_id, slot);
             gs.log_msg("merchant", &format!("Bought item (slot {})", slot));
+        }
+
+        // Move/equip/unequip an item between inventory slots (OP_MoveItem).
+        // MoveItem_Struct (12b): from_slot(u32), to_slot(u32), number_in_stack(u32).
+        // number_in_stack = 1 moves a single (non-stacked) item, e.g. equip boots to slot 19.
+        let move_req = self.move_req.lock().unwrap().take();
+        if let Some((from_slot, to_slot)) = move_req {
+            let mut buf = [0u8; 12];
+            buf[0..4].copy_from_slice(&from_slot.to_le_bytes());
+            buf[4..8].copy_from_slice(&to_slot.to_le_bytes());
+            buf[8..12].copy_from_slice(&1u32.to_le_bytes()); // number_in_stack = 1
+            stream.send_app_packet(OP_MOVE_ITEM, &buf);
+            eprintln!("EQ: move item — from_slot={} to_slot={} qty=1", from_slot, to_slot);
+            gs.log_msg("inventory", &format!("Moved item (slot {} -> {})", from_slot, to_slot));
         }
 
         if self.last_tick.elapsed().as_millis() < 150 {
