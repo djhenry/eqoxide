@@ -7,6 +7,24 @@ use crate::camera::project_to_screen;
 use crate::scene::SceneState;
 use crate::zone_map::ZoneMap;
 
+/// Letterbox: adjust an anchored element's offset so HUD chrome sits on a 1920x1080 canvas centered
+/// in the window, instead of spreading to the window edges. The margin is the slack on the
+/// non-constraining axis (read from the zoomed screen rect, in points); on a 16:9 window it's 0, on
+/// a triple-monitor/ultrawide it keeps the HUD on the center region. Nameplates do NOT use this —
+/// they track 3D mobs across the whole window. `align` is the element's own anchor alignment.
+fn canvas_off(ctx: &egui::Context, align: egui::Align2, base: [f32; 2]) -> [f32; 2] {
+    let sr = ctx.screen_rect();
+    let mx = (sr.width() - 1920.0).max(0.0) * 0.5;
+    let my = (sr.height() - 1080.0).max(0.0) * 0.5;
+    let dx = match align.0[0] {
+        egui::Align::Min => mx, egui::Align::Max => -mx, egui::Align::Center => 0.0,
+    };
+    let dy = match align.0[1] {
+        egui::Align::Min => my, egui::Align::Max => -my, egui::Align::Center => 0.0,
+    };
+    [base[0] + dx, base[1] + dy]
+}
+
 // ── Shared helper: draw a labelled stat bar ───────────────────────────────────
 
 fn stat_bar(
@@ -37,7 +55,7 @@ fn stat_bar(
 
 pub fn draw_fps(ctx: &egui::Context, fps: f32) {
     egui::Area::new(egui::Id::new("fps_counter"))
-        .anchor(egui::Align2::LEFT_TOP, [8.0, 8.0])
+        .anchor(egui::Align2::LEFT_TOP, canvas_off(ctx, egui::Align2::LEFT_TOP, [8.0, 8.0]))
         .interactable(false)
         .show(ctx, |ui| {
             let color = if fps >= 55.0 {
@@ -59,7 +77,7 @@ pub fn draw_fps(ctx: &egui::Context, fps: f32) {
 
 pub fn draw_hud(ctx: &egui::Context, scene: &SceneState, _bot_id: &str) {
     egui::Window::new("##hud")
-        .anchor(egui::Align2::LEFT_BOTTOM, [0.0, 0.0])
+        .anchor(egui::Align2::LEFT_BOTTOM, canvas_off(ctx, egui::Align2::LEFT_BOTTOM, [0.0, 0.0]))
         .title_bar(false)
         .resizable(false)
         .collapsible(false)
@@ -196,7 +214,7 @@ pub fn draw_quest_dialogue(ctx: &egui::Context, scene: &SceneState, say: &crate:
         return;
     }
     egui::Window::new("NPC Dialogue")
-        .anchor(egui::Align2::CENTER_TOP, [0.0, 36.0])
+        .anchor(egui::Align2::CENTER_TOP, canvas_off(ctx, egui::Align2::CENTER_TOP, [0.0, 36.0]))
         .resizable(false)
         .collapsible(false)
         .min_width(420.0)
@@ -241,7 +259,7 @@ const WORN_SLOTS: [(i32, &str); 22] = [
 pub fn draw_inventory(ctx: &egui::Context, scene: &SceneState, show: &mut bool) {
     // Top-left under the FPS counter, so it doesn't overlap the top-right minimap.
     egui::Area::new(egui::Id::new("inv_toggle"))
-        .anchor(egui::Align2::LEFT_TOP, [8.0, 34.0])
+        .anchor(egui::Align2::LEFT_TOP, canvas_off(ctx, egui::Align2::LEFT_TOP, [8.0, 34.0]))
         .show(ctx, |ui| {
             if ui.button("🎒 Inventory (I)").clicked() {
                 *show = !*show;
@@ -303,7 +321,7 @@ pub fn draw_control_bar(
         .resizable(false)
         .collapsible(false)
         // Bottom-right so it tiles beside the bottom-left status bar instead of overlapping it.
-        .anchor(egui::Align2::RIGHT_BOTTOM, [-8.0, -8.0])
+        .anchor(egui::Align2::RIGHT_BOTTOM, canvas_off(ctx, egui::Align2::RIGHT_BOTTOM, [-8.0, -8.0]))
         .frame(egui::Frame::none()
             .fill(egui::Color32::from_black_alpha(170))
             .inner_margin(egui::Margin::symmetric(8.0, 4.0)))
@@ -355,7 +373,7 @@ pub fn draw_message_log(ctx: &egui::Context, scene: &SceneState) {
 
     egui::Window::new("##msglog")
         .title_bar(false)
-        .anchor(egui::Align2::LEFT_BOTTOM, [0.0, -60.0])  // just above the HUD
+        .anchor(egui::Align2::LEFT_BOTTOM, canvas_off(ctx, egui::Align2::LEFT_BOTTOM, [0.0, -60.0]))  // just above the HUD
         .resizable(false)
         .collapsible(false)
         .min_width(480.0)
@@ -403,6 +421,7 @@ pub fn draw_minimap(
         (egui::Align2::RIGHT_TOP, [-10.0, 10.0])
     };
 
+    let offset = canvas_off(ctx, anchor, offset);
     egui::Window::new("##minimap")
         .title_bar(false)
         .anchor(anchor, offset)
@@ -551,7 +570,7 @@ pub fn draw_debug_overlay(
         zone, player_pos[0], player_pos[1], player_pos[2], player_heading, h_cw, corrections
     );
     egui::Area::new(egui::Id::new("debug_overlay"))
-        .anchor(egui::Align2::LEFT_TOP, [8.0, 28.0])
+        .anchor(egui::Align2::LEFT_TOP, canvas_off(ctx, egui::Align2::LEFT_TOP, [8.0, 28.0]))
         .interactable(false)
         .show(ctx, |ui| {
             ui.label(egui::RichText::new(&info)
