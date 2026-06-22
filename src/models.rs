@@ -588,7 +588,16 @@ pub fn equip_texture_name(prefix: &str, region: &[u8; 2], material: u32, variant
 /// material 0 would wrongly blank head/feet) and for models with no race prefix.
 /// Single source of truth shared by the render pass and the texture pre-pass.
 pub fn equip_swap_key(prefix: &str, slot: EquipSlot, material: u32) -> Option<String> {
-    if material == 0 || prefix.is_empty() {
+    if prefix.is_empty() {
+        return None;
+    }
+    // Material 0 = empty slot. For SKIN regions (head/hands/feet) that's bare skin → use the baked
+    // face/hands/feet texture (None). For BODY regions (chest/arms/forearm/legs) material 0 is the
+    // baseline CLOTH texture (variant 00, e.g. "elfch0001" — a clothed tunic), NOT skin: load it by
+    // name from the s3d like the original client does. EQ has no nude-torso texture, and the GLB's
+    // baked body texture is unreliable (it baked skin). See original-client
+    // analysis of the original client ("why a brand-new character is not naked").
+    if material == 0 && matches!(&slot.region, b"he" | b"hn" | b"ft") {
         return None;
     }
     Some(equip_texture_name(prefix, &slot.region, material, slot.variant))
