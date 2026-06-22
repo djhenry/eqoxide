@@ -694,6 +694,67 @@ pub fn load_one_texture_from_s3d(s3d_path: &Path, filename: &str) -> Option<Text
     Some(TextureData { name: lower, width, height, rgba: rgba.into_raw() })
 }
 
+/// Load a single held/world item model (e.g. "IT10649", from an item's IDFile) + its textures from
+/// the gequip*.s3d archives. Meshes are returned untransformed in libeq space so the caller can
+/// attach them to a hand bone. Returns None if the model isn't found in any gequip archive.
+pub fn load_weapon_model(assets_path: &Path, idfile: &str) -> Option<ZoneAssets> {
+    let want = idfile.trim().to_uppercase();
+    if want.is_empty() { return None; }
+    for arch in ["gequip.s3d", "gequip2.s3d", "gequip3.s3d", "gequip4.s3d",
+                 "gequip5.s3d", "gequip6.s3d", "gequip7.s3d", "gequip8.s3d"] {
+        let path = assets_path.join(arch);
+        let Ok(file) = std::fs::File::open(&path) else { continue };
+        let Ok(mut pfs) = libeq_pfs::PfsReader::open(file) else { continue };
+        let Ok(filenames) = pfs.filenames() else { continue };
+        for wn in filenames.iter().filter(|f| f.to_lowercase().ends_with(".wld")) {
+            let wld = match pfs.get(wn) { Ok(Some(b)) => match libeq_wld::load(&b) {
+                Ok(w) => w, Err(_) => continue }, _ => continue };
+            let mut meshes: Vec<MeshData> = Vec::new();
+            for mesh in wld.meshes() {
+                if !mesh.name().unwrap_or("").to_uppercase().starts_with(&want) { continue; }
+                let all_pos = mesh.positions();
+                if all_pos.is_empty() { continue; }
+                let (cx, cy, cz) = mesh.center();
+                let all_n = mesh.normals();
+                let all_uv = mesh.texture_coordinates();
+                for prim in mesh.primitives() {
+                    let idx: Vec<u32> = prim.indices();
+                    if idx.is_empty() { continue; }
+                    let positions = idx.iter().map(|&i| all_pos[i as usize]).collect();
+                    let normals = idx.iter().map(|&i| all_n.get(i as usize).copied().unwrap_or([0.0, 0.0, 1.0])).collect();
+                    let uvs = idx.iter().map(|&i| all_uv.get(i as usize).copied().unwrap_or([0.0, 0.0])).collect();
+                    let texture_name = prim.material().base_color_texture().and_then(|t| t.source());
+                    meshes.push(MeshData { positions, normals, uvs,
+                        indices: (0..idx.len() as u32).collect(),
+                        texture_name, base_color: [1.0; 4], center: [cx, cy, cz] });
+                }
+            }
+            if meshes.is_empty() { continue; }
+            // Load only the textures these meshes reference.
+            let want_tex: std::collections::HashSet<String> = meshes.iter()
+                .filter_map(|m| m.texture_name.clone()).map(|s| s.to_lowercase()).collect();
+            let mut textures = Vec::new();
+            for fname in &filenames {
+                let lower = fname.to_lowercase();
+                if !want_tex.contains(&lower) { continue; }
+                let fmt = if lower.ends_with(".bmp") { image::ImageFormat::Bmp }
+                          else if lower.ends_with(".dds") { image::ImageFormat::Dds } else { continue };
+                if let Ok(Some(tb)) = pfs.get(fname) {
+                    if let Ok(img) = image::load_from_memory_with_format(&tb, fmt) {
+                        let rgba = img.to_rgba8(); let (w, h) = rgba.dimensions();
+                        textures.push(TextureData { name: fname.clone(), width: w, height: h, rgba: rgba.into_raw() });
+                    }
+                }
+            }
+            eprintln!("weapon model: loaded '{}' — {} meshes, {} textures from {}",
+                      want, meshes.len(), textures.len(), arch);
+            return Some(ZoneAssets { meshes, textures });
+        }
+    }
+    eprintln!("weapon model: '{}' not found in any gequip*.s3d", want);
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
