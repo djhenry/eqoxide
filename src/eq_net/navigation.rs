@@ -369,15 +369,18 @@ impl Navigator {
 
         // Move/equip/unequip an item between inventory slots (OP_MoveItem).
         // MoveItem_Struct (12b): from_slot(u32), to_slot(u32), number_in_stack(u32).
-        // number_in_stack = 1 moves a single (non-stacked) item, e.g. equip boots to slot 19.
+        // number_in_stack MUST be 0 for a whole-item move (equip/unequip/rearrange): EQEmu's
+        // SwapItem rejects number_in_stack > 0 for any non-stackable item (inventory.cpp ~2025,
+        // "not a stackable item" -> SwapItemResync = the "Inventory Desyncronization" we hit). 0
+        // takes the direct-swap/equip path. (A count would only be for splitting a stack.)
         let move_req = self.move_req.lock().unwrap().take();
         if let Some((from_slot, to_slot)) = move_req {
             let mut buf = [0u8; 12];
             buf[0..4].copy_from_slice(&from_slot.to_le_bytes());
             buf[4..8].copy_from_slice(&to_slot.to_le_bytes());
-            buf[8..12].copy_from_slice(&1u32.to_le_bytes()); // number_in_stack = 1
+            buf[8..12].copy_from_slice(&0u32.to_le_bytes()); // number_in_stack = 0 (whole item)
             stream.send_app_packet(OP_MOVE_ITEM, &buf);
-            eprintln!("EQ: move item — from_slot={} to_slot={} qty=1", from_slot, to_slot);
+            eprintln!("EQ: move item — from_slot={} to_slot={} qty=0(whole)", from_slot, to_slot);
             gs.log_msg("inventory", &format!("Moved item (slot {} -> {})", from_slot, to_slot));
         }
 
