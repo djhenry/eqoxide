@@ -541,10 +541,13 @@ impl App {
             const TURN_SPEED: f32 = 120.0; // degrees per second
 
             // Rotate mode: update heading directly and keep camera snapped behind the player.
-            // CCW heading: A (rotate left) → heading increases; D (rotate right) → heading decreases.
+            // The world is rendered X-mirrored (the clip-space X flip in look_at_perspective that
+            // un-mirrors the zone geometry), which reverses on-screen left/right. So A must DECREASE
+            // heading and D increase it for rotation to LOOK correct (A = turn left on screen,
+            // D = turn right). Heading itself stays EQ-CCW; only the key→direction mapping flips.
             if rotating {
-                if a_held { self.heading_target = (self.heading_target + TURN_SPEED * dt).rem_euclid(360.0); }
-                if d_held { self.heading_target = (self.heading_target - TURN_SPEED * dt).rem_euclid(360.0); }
+                if a_held { self.heading_target = (self.heading_target - TURN_SPEED * dt).rem_euclid(360.0); }
+                if d_held { self.heading_target = (self.heading_target + TURN_SPEED * dt).rem_euclid(360.0); }
                 // Keep the camera in AutoFollow so it tracks the new heading each frame.
                 self.camera.reset_to_follow();
             }
