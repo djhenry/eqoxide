@@ -2,7 +2,8 @@
 
 A standalone Rust EverQuest Titanium observer/renderer. Connects directly to a local EQEmu
 server (login 127.0.0.1:5998), renders the zone in 3D via wgpu, and exposes a local HTTP API on
-port 8765 for agent scripting. It can log in either as a **GM observer** (the original use case)
+the next free port from 8765 (printed to stdout as `API_PORT=<port>`, so multiple instances can
+run at once — see `http-api.md`) for agent scripting. It can log in either as a **GM observer** (the original use case)
 or as a **regular non-GM player character** that actually plays — fights, levels, travels, buys
 (see `autonomous-play.md`). The account/character is set in the login config; the renderer and API
 are identical either way.
@@ -14,7 +15,7 @@ are identical either way.
 ```
 main thread          eq_net thread            HTTP thread
 ─────────────        ─────────────────        ───────────────────
-winit event loop     login.rs state machine   axum server (port 8765)
+winit event loop     login.rs state machine   axum server (next free port from 8765)
 wgpu rendering       packet_handler.rs        reads/writes shared Arcs:
 hud.rs (egui)        navigation.rs tick         GotoTarget, HailReq,
 app.rs WASD          gameplay.rs zone change     SayReq, TargetReq,
