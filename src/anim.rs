@@ -119,6 +119,25 @@ impl SkinData {
             .collect()
     }
 
+    /// World (model-space) transform of one joint at (clip, time) — for attaching a held item
+    /// (weapon) to a hand bone. Unlike `evaluate`, this is the raw global pose WITHOUT inv_bind,
+    /// so a model placed at the bone's transform follows the swing. Identity if `joint` is invalid.
+    pub fn joint_world(&self, clip_idx: usize, time: f32, joint: usize) -> [[f32; 4]; 4] {
+        self.joint_globals(clip_idx, time)
+            .get(joint).copied().unwrap_or(glam::Mat4::IDENTITY)
+            .to_cols_array_2d()
+    }
+
+    /// Bind-pose world position of each joint (translation of the inverse of inv_bind). Used to
+    /// locate attach bones (e.g. the right hand = an arm-chain extremity) when joint names are absent.
+    pub fn bind_joint_positions(&self) -> Vec<[f32; 3]> {
+        self.inv_bind.iter().map(|ib| {
+            let w = glam::Mat4::from_cols_array_2d(ib).inverse();
+            let t = w.w_axis;
+            [t.x, t.y, t.z]
+        }).collect()
+    }
+
     /// Skin a raw vertex with the given skin matrices, returning its full render-space
     /// position. This mirrors exactly what the vertex shader computes.
     pub fn skin_point(pos: [f32; 3], joints: [u32; 4], weights: [f32; 4],
