@@ -65,7 +65,6 @@ fn apply_animation(gs: &mut GameState, p: &[u8]) {
     let spawnid = u16::from_le_bytes([p[0], p[1]]) as u32;
     let action  = p[3];
     if (1..=9).contains(&action) {
-        eprintln!("EQ: OP_Animation spawn={} action={} (combat swing)", spawnid, action); // TEMP verify
         gs.combat_anims.insert(spawnid, (action, std::time::Instant::now()));
     }
 }
@@ -190,9 +189,6 @@ fn apply_char_inventory(gs: &mut GameState, p: &[u8]) {
     }
     if !items.is_empty() {
         eprintln!("EQ: char inventory: {} items", items.len());
-        for it in items.iter().filter(|i| i.slot == 13 || i.slot == 14) {
-            eprintln!("EQ:   worn weapon slot {} = {} (idfile {})", it.slot, it.name, it.idfile); // TEMP Phase2
-        }
         gs.inventory = items;
     }
 }
