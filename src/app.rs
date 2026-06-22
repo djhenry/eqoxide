@@ -135,6 +135,10 @@ pub struct App {
     show_debug: bool,
     /// Whether the inventory/equipment window is open (toggled by the HUD button or the I key).
     show_inventory: bool,
+    /// Cached global UI zoom factor (min(w/1920, h/1080) / dpi) and the surface size it was computed
+    /// for — recomputed only when the size changes, not every frame.
+    ui_zoom: f32,
+    ui_zoom_size: (u32, u32),
 }
 
 impl App {
@@ -207,6 +211,8 @@ impl App {
             testzone_mode,
             show_debug: false,
             show_inventory: false,
+            ui_zoom: 1.0,
+            ui_zoom_size: (0, 0),
         }
     }
 
@@ -843,6 +849,7 @@ impl App {
             cam_eye, self.collision.as_deref(),
             &self.hail, &self.say, &self.target, &mut self.say_buffer,
             &mut self.show_inventory,
+            &mut self.ui_zoom, &mut self.ui_zoom_size,
             self.show_debug, self.game_state.server_corrections,
         );
 
@@ -890,6 +897,8 @@ impl App {
         target:        &crate::http::TargetReq,
         say_buffer:    &mut String,
         show_inventory: &mut bool,
+        ui_zoom:       &mut f32,
+        ui_zoom_size:  &mut (u32, u32),
         show_debug:    bool,
         corrections:   u32,
     ) {
@@ -901,10 +910,16 @@ impl App {
         let screen_w  = renderer.surface_config.width;
         let screen_h  = renderer.surface_config.height;
 
-        // Scale the entire UI (text + widgets) with the window so it always fits and stays legible.
-        // Zoom is relative to a 1080 logical-px baseline; egui multiplies it by the native DPI ppp.
-        let logical_h = (screen_h as f32 / window.scale_factor() as f32).max(1.0);
-        egui_ctx.set_zoom_factor((logical_h / 1080.0).clamp(0.6, 1.6));
+        // Scale the entire UI (text + widgets) to a fixed 1920x1080 design layout by the CONSTRAINING
+        // window dimension: zoom = min(w/1920, h/1080) (the smaller ratio fits without overflow), so
+        // a 16:9 window matches 1:1 and other aspect ratios scale uniformly. Divided by the native
+        // DPI ppp so it's display-independent. Cached; only recomputed when the surface size changes.
+        if (screen_w, screen_h) != *ui_zoom_size {
+            let nppp = window.scale_factor() as f32;
+            *ui_zoom = ((screen_w as f32 / 1920.0).min(screen_h as f32 / 1080.0) / nppp).max(0.05);
+            *ui_zoom_size = (screen_w, screen_h);
+        }
+        egui_ctx.set_zoom_factor(*ui_zoom);
 
         let full_output = egui_ctx.run(raw_input, |ctx| {
             hud::draw_fps(ctx, current_fps);
