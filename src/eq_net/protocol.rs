@@ -68,6 +68,7 @@ pub const OP_NEW_ZONE: u16 = 0x0920;
 pub const OP_REQ_CLIENT_SPAWN: u16 = 0x0322;
 pub const OP_ZONE_SPAWNS: u16 = 0x2e78;
 pub const OP_CHAR_INVENTORY: u16 = 0x5394;
+pub const OP_ITEM_PACKET: u16 = 0x3397; // single item (loot/trade/give/summon), same serialization
 pub const OP_SET_SERVER_FILTER: u16 = 0x6563;
 pub const OP_REQ_NEW_ZONE: u16 = 0x7ac5;
 pub const OP_PLAYER_PROFILE: u16 = 0x75df;

@@ -58,6 +58,8 @@ pub struct SceneState {
     pub player_equipment: [u32; 9],
     /// RGB tint for each equipment slot (0..9), from the player profile.
     pub player_equipment_tint: [[u8; 3]; 9],
+    /// Player inventory + equipment items (for the inventory UI window).
+    pub inventory: Vec<crate::game_state::InvItem>,
 }
 
 impl SceneState {
@@ -190,6 +192,7 @@ impl SceneState {
             messages,
             player_equipment: gs.player_equipment,
             player_equipment_tint: gs.player_equipment_tint,
+            inventory: gs.inventory.clone(),
         }
     }
 }

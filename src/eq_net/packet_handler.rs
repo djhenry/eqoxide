@@ -49,6 +49,8 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_TASK_DESCRIPTION     => apply_task_description(gs, p),
         OP_TASK_ACTIVITY        => apply_task_activity(gs, p),
         OP_COMPLETED_TASKS      => apply_completed_tasks(gs, p),
+        OP_CHAR_INVENTORY       => apply_char_inventory(gs, p),
+        OP_ITEM_PACKET          => apply_item_packet(gs, p),
         _                       => {}
     }
 }
@@ -140,6 +142,53 @@ fn apply_task_activity(gs: &mut GameState, p: &[u8]) {
     } else {
         task.activities.push(act);
         task.activities.sort_by_key(|a| a.activity_id);
+    }
+}
+
+// ── Inventory (OP_CharInventory / OP_ItemPacket) ────────────────────────────────────────────────
+// Titanium serializes items as NULL-separated, pipe('|')-delimited TEXT (see EQEmu titanium.cpp
+// SerializeItem). Per item the fields are: [0]=stackcount [2]=slot ... then `"`+[11]=ItemClass
+// [12]=Name [13]=Lore [14]=IDFile [15]=item ID [22]=Icon. (Bag sub-items append after the parent's
+// own fields; we parse only the top-level fields, which come first.)
+
+/// Parse one pipe-delimited item record into an InvItem. None if it doesn't have the core fields.
+fn parse_inv_item(record: &str) -> Option<crate::game_state::InvItem> {
+    let f: Vec<&str> = record.split('|').collect();
+    if f.len() < 23 { return None; }
+    let slot: i32 = f[2].trim().parse().ok()?;
+    let name = f[12].trim().trim_start_matches('"').to_string();
+    let item_id: u32 = f[15].trim().parse().unwrap_or(0);
+    let icon: u32 = f[22].trim().parse().unwrap_or(0);
+    let charges: i32 = f[0].trim().parse().unwrap_or(1);
+    if name.is_empty() && item_id == 0 { return None; }
+    Some(crate::game_state::InvItem { slot, item_id, name, icon, charges: charges.max(1) })
+}
+
+/// OP_CharInventory — the full inventory + equipment as NULL-separated item records.
+fn apply_char_inventory(gs: &mut GameState, p: &[u8]) {
+    let text = String::from_utf8_lossy(p);
+    let mut items = Vec::new();
+    for record in text.split('\0') {
+        if record.trim().is_empty() { continue; }
+        if let Some(it) = parse_inv_item(record) { items.push(it); }
+    }
+    if !items.is_empty() {
+        eprintln!("EQ: char inventory: {} items", items.len());
+        gs.inventory = items;
+    }
+}
+
+/// OP_ItemPacket — a single item (loot/trade/summon). Upsert into the inventory by slot.
+fn apply_item_packet(gs: &mut GameState, p: &[u8]) {
+    // The single-item packet has a small fixed header before the serialized item; find the first
+    // record by skipping to the serialized text (split on NUL handles the trailing terminator).
+    let text = String::from_utf8_lossy(p);
+    for record in text.split('\0') {
+        if let Some(it) = parse_inv_item(record) {
+            gs.inventory.retain(|x| x.slot != it.slot);
+            gs.inventory.push(it);
+            break;
+        }
     }
 }
 

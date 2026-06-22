@@ -228,6 +228,65 @@ pub fn draw_quest_dialogue(ctx: &egui::Context, scene: &SceneState, say: &crate:
         });
 }
 
+/// Titanium worn-equipment slot ids → display labels (0-21).
+const WORN_SLOTS: [(i32, &str); 22] = [
+    (0, "Charm"), (1, "Ear"), (2, "Head"), (3, "Face"), (4, "Ear"), (5, "Neck"),
+    (6, "Shoulders"), (7, "Arms"), (8, "Back"), (9, "Wrist"), (10, "Wrist"), (11, "Range"),
+    (12, "Hands"), (13, "Primary"), (14, "Secondary"), (15, "Finger"), (16, "Finger"),
+    (17, "Chest"), (18, "Legs"), (19, "Feet"), (20, "Waist"), (21, "Ammo"),
+];
+
+/// Inventory/equipment window + a toggle button (top-right). `show` is owned by the App (toggled
+/// here or by the I key). Data comes from `scene.inventory` (decoded from OP_CharInventory).
+pub fn draw_inventory(ctx: &egui::Context, scene: &SceneState, show: &mut bool) {
+    egui::Area::new(egui::Id::new("inv_toggle"))
+        .anchor(egui::Align2::RIGHT_TOP, [-12.0, 12.0])
+        .show(ctx, |ui| {
+            if ui.button("🎒 Inventory (I)").clicked() {
+                *show = !*show;
+            }
+        });
+    if !*show {
+        return;
+    }
+    egui::Window::new("Inventory & Equipment")
+        .open(show)
+        .default_width(340.0)
+        .resizable(true)
+        .show(ctx, |ui| {
+            let inv = &scene.inventory;
+            ui.label(egui::RichText::new("Equipped").strong().size(14.0));
+            egui::Grid::new("equip_grid").num_columns(2).striped(true).show(ui, |ui| {
+                for (slot, label) in WORN_SLOTS {
+                    let item = inv.iter().find(|i| i.slot == slot);
+                    ui.label(label);
+                    match item {
+                        Some(i) => ui.label(egui::RichText::new(&i.name).color(egui::Color32::from_rgb(220, 220, 120))),
+                        None => ui.label(egui::RichText::new("—").weak()),
+                    };
+                    ui.end_row();
+                }
+            });
+            ui.separator();
+            ui.label(egui::RichText::new("Inventory").strong().size(14.0));
+            let mut bag: Vec<_> = inv.iter().filter(|i| i.slot >= 22).collect();
+            bag.sort_by_key(|i| i.slot);
+            if bag.is_empty() {
+                ui.label(egui::RichText::new("(empty)").weak());
+            }
+            for i in &bag {
+                let qty = if i.charges > 1 { format!(" x{}", i.charges) } else { String::new() };
+                ui.label(format!("• {}{}", i.name, qty));
+            }
+            ui.separator();
+            ui.label(format!("Coin: {}p {}g {}s {}c",
+                scene.coin[0], scene.coin[1], scene.coin[2], scene.coin[3]));
+            if inv.is_empty() {
+                ui.label(egui::RichText::new("(waiting for inventory from server…)").weak());
+            }
+        });
+}
+
 /// Floating control bar (bottom-center): Hail the nearest NPC and a say box for
 /// chatting / quest replies. Buttons write shared request slots the nav thread drains.
 pub fn draw_control_bar(

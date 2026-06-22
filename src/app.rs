@@ -133,6 +133,8 @@ pub struct App {
     on_ground:  bool,
     /// F10 toggles an on-screen debug overlay (heading values, coords, corrections).
     show_debug: bool,
+    /// Whether the inventory/equipment window is open (toggled by the HUD button or the I key).
+    show_inventory: bool,
 }
 
 impl App {
@@ -204,6 +206,7 @@ impl App {
             on_ground: true,
             testzone_mode,
             show_debug: false,
+            show_inventory: false,
         }
     }
 
@@ -839,6 +842,7 @@ impl App {
             self.current_fps, self.zone_map.as_ref(),
             cam_eye, self.collision.as_deref(),
             &self.hail, &self.say, &self.target, &mut self.say_buffer,
+            &mut self.show_inventory,
             self.show_debug, self.game_state.server_corrections,
         );
 
@@ -885,6 +889,7 @@ impl App {
         say:           &crate::http::SayReq,
         target:        &crate::http::TargetReq,
         say_buffer:    &mut String,
+        show_inventory: &mut bool,
         show_debug:    bool,
         corrections:   u32,
     ) {
@@ -907,6 +912,7 @@ impl App {
                 hud::draw_labels(ctx, scene, view_proj, screen_w, screen_h, cam_eye, collision);
                 hud::draw_minimap(ctx, scene, zone_min, zone_max, minimap_zoom, minimap_full, zone_map);
                 hud::draw_control_bar(ctx, scene, hail, say, target, say_buffer);
+                hud::draw_inventory(ctx, scene, show_inventory);
                 if show_debug {
                     hud::draw_debug_overlay(ctx, scene.player_pos, scene.player_heading, current_zone, corrections);
                 }
@@ -1099,6 +1105,9 @@ impl ApplicationHandler for App {
                                 KeyCode::F10 => {
                                     self.show_debug = !self.show_debug;
                                     eprintln!("DEBUG: overlay {}", if self.show_debug { "ON" } else { "OFF" });
+                                }
+                                KeyCode::KeyI => {
+                                    self.show_inventory = !self.show_inventory;
                                 }
                                 _ => {}
                             }

@@ -73,6 +73,18 @@ pub struct ActiveTask {
     pub activities:  Vec<TaskActivity>,
 }
 
+/// One item in the player's inventory/equipment (decoded from OP_CharInventory / OP_ItemPacket).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct InvItem {
+    /// Titanium slot id: 0-21 worn equipment, 22-29 general inventory, 30 cursor, 251+ bag contents.
+    pub slot:    i32,
+    pub item_id: u32,
+    pub name:    String,
+    pub icon:    u32,
+    /// Stack quantity / charges (1 for non-stackable).
+    pub charges: i32,
+}
+
 /// All state the renderer needs for one frame.
 #[derive(Debug, Default, Clone)]
 pub struct GameState {
@@ -147,6 +159,9 @@ pub struct GameState {
     pub tasks: std::collections::HashMap<u32, ActiveTask>,
     /// Task ids the server reports as completed (OP_CompletedTasks).
     pub completed_tasks: Vec<u32>,
+
+    /// Player inventory + equipment (decoded from OP_CharInventory / OP_ItemPacket).
+    pub inventory: Vec<InvItem>,
 }
 
 impl GameState {
