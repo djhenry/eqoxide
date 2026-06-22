@@ -174,17 +174,36 @@ pub fn spawn_camera_server(
                 .route("/attack", post(post_attack_on).delete(post_attack_off))
                 .route("/buy", post(post_buy))
                 .route("/inventory/move", post(post_move))
+                .route("/exit", post(post_exit))
                 .route("/debug", get(get_debug))
                 .with_state(state);
-            let addr = format!("127.0.0.1:{port}");
-            let listener = match tokio::net::TcpListener::bind(&addr).await {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("camera HTTP: failed to bind {addr}: {e} — camera API disabled");
+            // Scan upward from the configured base port so multiple client instances
+            // (e.g. one per worktree) each grab the next free port instead of colliding.
+            const MAX_TRIES: u16 = 50;
+            let mut bound = None;
+            for p in port..port.saturating_add(MAX_TRIES) {
+                if let Ok(l) = tokio::net::TcpListener::bind(("127.0.0.1", p)).await {
+                    bound = Some((l, p));
+                    break;
+                }
+            }
+            let (listener, bound_port) = match bound {
+                Some(found) => found,
+                None => {
+                    eprintln!(
+                        "camera HTTP: no free port in {}..{} — camera API disabled",
+                        port,
+                        port.saturating_add(MAX_TRIES)
+                    );
                     return;
                 }
             };
-            eprintln!("camera HTTP: http://{addr}");
+            // Machine-parseable line on stdout so a launching agent can discover the port.
+            // Flush explicitly: the render loop may never return, leaving stdout buffered.
+            use std::io::Write;
+            println!("API_PORT={bound_port}");
+            let _ = std::io::stdout().flush();
+            eprintln!("camera HTTP: http://127.0.0.1:{bound_port}");
             if let Err(e) = axum::serve(listener, app).await {
                 eprintln!("camera HTTP: server error: {e}");
             }
@@ -582,6 +601,19 @@ async fn post_move(
     *s.move_req.lock().unwrap() = Some((b.from, b.to));
     eprintln!("move: queued from_slot={} to_slot={}", b.from, b.to);
     (StatusCode::OK, format!("moving item from slot {} to slot {}", b.from, b.to))
+}
+
+/// POST /exit — cleanly shut down THIS client instance. Lets an agent restart its own
+/// client (to pick up changes) without `pkill`, which could kill another worktree's instance.
+/// Responds 200 first, then a detached task exits the process after a short delay so the
+/// HTTP response flushes. Uses the same `std::process::exit(0)` as the normal shutdown path.
+async fn post_exit() -> (StatusCode, &'static str) {
+    eprintln!("exit: shutdown requested via POST /exit");
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        std::process::exit(0);
+    });
+    (StatusCode::OK, "shutting down")
 }
 
 async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
