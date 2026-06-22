@@ -1,8 +1,9 @@
 //! The agent-facing HTTP/REST API (axum, port 8765).
 //!
 //! Endpoints: camera control + `/frame` capture, navigation (`/goto`, `/warp`), `/entities`,
-//! NPC/combat actions (`/hail`, `/say`, `/target`, `/target/name`, `/attack`, `/buy`), zone
-//! crossing (`/zone_cross`, `/zone_points`), and `/debug`. Most handlers just write a shared
+//! NPC/combat actions (`/hail`, `/say`, `/target`, `/target/name`, `/attack`, `/buy`, `/give`),
+//! inventory (`/inventory/move`), zone crossing (`/zone_cross`, `/zone_points`), and `/debug`.
+//! Most handlers just write a shared
 //! `Arc<Mutex<…>>` request slot (the `*Req` type aliases below) that the navigation thread drains
 //! each tick; reads come from snapshots the render/network threads publish. See `docs/http-api.md`.
 
@@ -73,6 +74,11 @@ pub type BuyReq = Arc<Mutex<Option<(u32, u32)>>>;
 /// Used to equip/unequip/rearrange items (e.g. boots in bag slot 23 -> worn slot 19).
 pub type MoveReq = Arc<Mutex<Option<(u32, u32)>>>;
 
+/// Give request — (npc_spawn_id, item_from_slot), set by POST /give.
+/// Nav thread runs the trade-window turn-in: puts the item on the cursor, sends OP_TradeRequest,
+/// waits for OP_TradeRequestAck, then moves the item into the NPC trade slot + OP_TradeAcceptClick.
+pub type GiveReq = Arc<Mutex<Option<(u32, u32)>>>;
+
 /// Current zone name and id, updated on every OP_NEW_ZONE.
 #[allow(dead_code)]
 pub type ZoneInfo = Arc<Mutex<(String, u16)>>;
@@ -107,6 +113,7 @@ struct HttpState {
     attack:           AttackReq,
     buy:              BuyReq,
     move_req:         MoveReq,
+    give:             GiveReq,
     player_info:      PlayerInfo,
     task_log:         TaskLog,
 }
@@ -148,6 +155,7 @@ pub fn spawn_camera_server(
     attack:           AttackReq,
     buy:              BuyReq,
     move_req:         MoveReq,
+    give:             GiveReq,
     player_info:      PlayerInfo,
     task_log:         TaskLog,
     port:             u16,
@@ -155,7 +163,7 @@ pub fn spawn_camera_server(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, buy, move_req, player_info, task_log };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, buy, move_req, give, player_info, task_log };
             let app = Router::new()
                 .route("/camera", get(get_camera).post(post_camera))
                 .route("/camera/reset", post(post_camera_reset))
@@ -174,6 +182,7 @@ pub fn spawn_camera_server(
                 .route("/attack", post(post_attack_on).delete(post_attack_off))
                 .route("/buy", post(post_buy))
                 .route("/inventory/move", post(post_move))
+                .route("/give", post(post_give))
                 .route("/exit", post(post_exit))
                 .route("/debug", get(get_debug))
                 .with_state(state);
@@ -601,6 +610,44 @@ async fn post_move(
     *s.move_req.lock().unwrap() = Some((b.from, b.to));
     eprintln!("move: queued from_slot={} to_slot={}", b.from, b.to);
     (StatusCode::OK, format!("moving item from slot {} to slot {}", b.from, b.to))
+}
+
+#[derive(serde::Deserialize)]
+struct GiveBody {
+    /// NPC name to hand the item to (fuzzy-matched, like /buy and /target/name).
+    npc: String,
+    /// Inventory slot holding the item to give (e.g. 23 for a general/bag slot, or 30 if it's
+    /// already on the cursor).
+    from: u32,
+}
+
+/// POST /give {"npc":"<name>","from":N} — hand inventory item in slot N to the named NPC and
+/// complete an EQ quest turn-in (trade-window flow). Must be within trade range of the NPC.
+/// The nav thread runs a multi-tick state machine: it puts the item on the cursor + sends
+/// OP_TradeRequest, waits for the server's OP_TradeRequestAck, then moves the item into the NPC
+/// trade slot + sends OP_TradeAcceptClick. The server replies OP_FinishTrade on completion; if no
+/// ack arrives within ~3s the give is aborted.
+async fn post_give(
+    State(s): State<HttpState>,
+    body: Result<Json<GiveBody>, axum::extract::rejection::JsonRejection>,
+) -> (StatusCode, String) {
+    let b = match body {
+        Ok(Json(b)) => b,
+        Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"npc\":\"...\",\"from\":N}".into()),
+    };
+    let ids = s.entity_ids.lock().unwrap();
+    let nl = b.npc.to_lowercase();
+    let found = ids.iter()
+        .find(|(k, _)| clean_entity_name(k).to_lowercase().contains(&nl) || k.to_lowercase().contains(&nl))
+        .map(|(k, &id)| (k.clone(), id));
+    match found {
+        Some((key, id)) => {
+            *s.give.lock().unwrap() = Some((id, b.from));
+            eprintln!("give: queued npc {:?} (spawn_id={}) from_slot={}", key, id, b.from);
+            (StatusCode::OK, format!("giving slot {} to {} (spawn_id={})", b.from, clean_entity_name(&key), id))
+        }
+        None => (StatusCode::NOT_FOUND, format!("no NPC matching {:?}", b.npc)),
+    }
 }
 
 /// POST /exit — cleanly shut down THIS client instance. Lets an agent restart its own

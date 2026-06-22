@@ -111,6 +111,18 @@ pub const OP_SHOP_PLAYER_BUY: u16 = 0x221e;  // Merchant_Sell_Struct (buy from s
 // Move/equip/unequip an item between inventory slots (Titanium).
 pub const OP_MOVE_ITEM: u16 = 0x420f;        // MoveItem_Struct (from_slot,to_slot,number_in_stack)
 
+// Trade window (Titanium): hand an item to an NPC for a quest turn-in. Sequence is
+//   C: OP_TradeRequest → S: OP_TradeRequestAck → C: OP_MoveItem(cursor→trade slot) +
+//   OP_TradeAcceptClick → S: OP_FinishTrade. See navigation.rs for the state machine.
+pub const OP_TRADE_REQUEST: u16      = 0x372f; // C->S, TradeRequest_Struct {to_mob_id, from_mob_id} (8b)
+pub const OP_TRADE_REQUEST_ACK: u16  = 0x4048; // S->C, server auto-sends; same 8-byte struct
+pub const OP_TRADE_ACCEPT_CLICK: u16 = 0x0065; // C->S, TradeAccept_Struct {from_mob_id, unknown4} (8b)
+pub const OP_FINISH_TRADE: u16       = 0x6014; // S->C, 0 bytes — turn-in completed
+pub const OP_CANCEL_TRADE: u16       = 0x2dc1; // C->S, abort the trade session (cleanup)
+// Titanium wire slot ids: cursor = 30, the NPC's first trade slot begins at 3000.
+pub const SLOT_CURSOR: u32           = 30;
+pub const SLOT_TRADE_BEGIN: u32      = 3000;
+
 // Native Task-system quest journal (server→client). Decoded into GameState.tasks for the quest log.
 pub const OP_TASK_DESCRIPTION: u16 = 0x5ef7; // a task's title/desc/reward (variable length)
 pub const OP_TASK_ACTIVITY: u16    = 0x682d; // one objective + progress (done/goal, variable length)

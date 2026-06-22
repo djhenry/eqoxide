@@ -51,6 +51,19 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_COMPLETED_TASKS      => apply_completed_tasks(gs, p),
         OP_CHAR_INVENTORY       => apply_char_inventory(gs, p),
         OP_ITEM_PACKET          => apply_item_packet(gs, p),
+        OP_TRADE_REQUEST_ACK    => {
+            // Server acknowledged our OP_TradeRequest — the trade session now exists. The give
+            // state machine (navigation.rs) waits on this before moving the item into the NPC slot.
+            gs.trade_ack_ready = true;
+            eprintln!("EQ: OP_TradeRequestAck — trade session open");
+        }
+        OP_FINISH_TRADE         => {
+            // Server finalized the trade (0-byte packet). For a quest turn-in this means the NPC
+            // accepted the item; if the item didn't match, the server returns it on the cursor
+            // via OP_ItemPacket (handled above), which we treat as a soft failure.
+            gs.log_msg("trade", "Trade complete");
+            eprintln!("EQ: give: turn-in complete (OP_FinishTrade)");
+        }
         OP_ANIMATION            => apply_animation(gs, p),
         _                       => {}
     }
