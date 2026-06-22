@@ -178,7 +178,7 @@ Requirements:
 
 Opcode (Titanium, from `patch_Titanium.conf`): `OP_MoveItem=0x420f`.
 
-`POST /move {"from":N,"to":M}` → nav sends one **`OP_MoveItem`** with `MoveItem_Struct` (12 bytes):
+`POST /inventory/move {"from":N,"to":M}` → nav sends one **`OP_MoveItem`** with `MoveItem_Struct` (12 bytes):
 `from_slot`(u32), `to_slot`(u32), `number_in_stack`(u32, =1 for a single non-stacked item).
 
 Slot ids (Titanium): **0-21** worn equipment, **22-29** general inventory, **30** cursor, **251+**

@@ -68,7 +68,7 @@ pub type AttackReq = Arc<Mutex<Option<bool>>>;
 /// Nav thread reads it and sends OP_ShopRequest (open) + OP_ShopPlayerBuy (buy that slot).
 pub type BuyReq = Arc<Mutex<Option<(u32, u32)>>>;
 
-/// Move-item request — (from_slot, to_slot), set by POST /move.
+/// Move-item request — (from_slot, to_slot), set by POST /inventory/move.
 /// Nav thread reads it and sends OP_MoveItem (MoveItem_Struct, number_in_stack=1).
 /// Used to equip/unequip/rearrange items (e.g. boots in bag slot 23 -> worn slot 19).
 pub type MoveReq = Arc<Mutex<Option<(u32, u32)>>>;
@@ -173,7 +173,7 @@ pub fn spawn_camera_server(
                 .route("/target/name", post(post_target_name))
                 .route("/attack", post(post_attack_on).delete(post_attack_off))
                 .route("/buy", post(post_buy))
-                .route("/move", post(post_move))
+                .route("/inventory/move", post(post_move))
                 .route("/debug", get(get_debug))
                 .with_state(state);
             let addr = format!("127.0.0.1:{port}");
@@ -568,7 +568,7 @@ struct MoveBody {
     to: u32,
 }
 
-/// POST /move {"from":N,"to":M} — move/equip/unequip an item between inventory slots.
+/// POST /inventory/move {"from":N,"to":M} — move/equip/unequip an item between inventory slots.
 /// Nav thread sends OP_MoveItem (MoveItem_Struct, number_in_stack=1). Titanium slot ids:
 /// 0-21 worn, 22-29 general inventory, 30 cursor, 251+ bag contents.
 async fn post_move(
