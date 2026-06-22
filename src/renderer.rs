@@ -65,6 +65,10 @@ pub struct EqRenderer {
     /// Cache of uploaded armor texture bind groups keyed by base name (no extension).
     /// `None` = known-missing (negative cache) so we don't rescan every frame.
     pub equipment_tex_cache: std::collections::HashMap<String, Option<wgpu::BindGroup>>,
+    /// Path to the EQ s3d assets (set in load_character_models) — used to load weapon models.
+    pub assets_path: std::path::PathBuf,
+    /// Held weapon models cached by IDFile. `None` = tried and not found (negative cache).
+    pub weapon_cache: std::collections::HashMap<String, Option<crate::gpu::GpuWeapon>>,
 }
 
 impl EqRenderer {
@@ -148,6 +152,8 @@ impl EqRenderer {
             joint_buf_pool,
             equip_index: std::collections::HashMap::new(),
             equipment_tex_cache: std::collections::HashMap::new(),
+            assets_path: std::path::PathBuf::new(),
+            weapon_cache: std::collections::HashMap::new(),
         }
     }
 
@@ -236,6 +242,7 @@ impl EqRenderer {
     pub fn load_character_models(&mut self, models_dir: &std::path::Path, assets_path: &std::path::Path) {
         use crate::models::{ModelAsset, SkinnedMeshData};
         use wgpu::util::DeviceExt;
+        self.assets_path = assets_path.to_path_buf(); // remembered for on-demand weapon-model loading
 
         const ARCHETYPES: &[&str] = &[
             "humanoid", "elf", "dwarf", "gnoll", "skeleton", "zombie",
@@ -433,6 +440,48 @@ impl EqRenderer {
         None
     }
 
+    /// Load + GPU-upload a held weapon model by IDFile (e.g. "IT10649") and cache it. Negative-cached
+    /// on miss so we don't rescan gequip every frame. Drawn at the hand bone by the player pass.
+    pub fn ensure_weapon(&mut self, idfile: &str) {
+        use wgpu::util::DeviceExt;
+        let key = idfile.trim().to_uppercase();
+        if key.is_empty() || self.weapon_cache.contains_key(&key) { return; }
+        let assets = match crate::assets::load_weapon_model(&self.assets_path, &key) {
+            Some(a) => a,
+            None => { self.weapon_cache.insert(key, None); return; }
+        };
+        let (_tex, bgs) = crate::gpu::upload_textures(
+            &self.device, &self.queue, &assets.textures, &self.layouts.texture_bgl);
+        let tex_names: Vec<String> = assets.textures.iter().map(|t| t.name.clone()).collect();
+        let mut meshes = Vec::new();
+        for m in &assets.meshes {
+            if m.positions.is_empty() || m.indices.is_empty() { continue; }
+            let [cx, cy, cz] = m.center;
+            // libeq [p0,p1,p2] -> render [p2,p0,p1] (same axis convention as zone/static meshes).
+            let verts: Vec<crate::gpu::Vertex> = m.positions.iter().enumerate().map(|(i, &p)| {
+                let n = m.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
+                crate::gpu::Vertex {
+                    position: [p[2] + cz, p[0] + cx, p[1] + cy],
+                    normal:   [n[2], n[0], n[1]],
+                    uv:       m.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
+                }
+            }).collect();
+            let texture_idx = m.texture_name.as_ref()
+                .and_then(|tn| tex_names.iter().position(|t| t == tn));
+            let vertex_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("weapon_vbuf"), contents: bytemuck::cast_slice(&verts),
+                usage: wgpu::BufferUsages::VERTEX });
+            let index_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("weapon_ibuf"), contents: bytemuck::cast_slice(&m.indices),
+                usage: wgpu::BufferUsages::INDEX });
+            meshes.push(crate::gpu::GpuMesh {
+                vertex_buf, index_buf, index_count: m.indices.len() as u32,
+                texture_idx, base_color: [1.0; 4] });
+        }
+        eprintln!("weapon: cached '{}' — {} gpu meshes, {} textures", key, meshes.len(), bgs.len());
+        self.weapon_cache.insert(key, Some(crate::gpu::GpuWeapon { meshes, texture_bind_groups: bgs }));
+    }
+
     /// Pre-pass (mutable): ensure every armor texture needed this frame is cached.
     /// Runs before the immutable render passes so they only do lookups.
     pub fn ensure_equipment_textures(&mut self, scene: &crate::scene::SceneState) {
@@ -568,6 +617,10 @@ impl EqRenderer {
         let up    = right.cross(fwd).normalize();
 
         self.ensure_equipment_textures(scene);
+        // Ensure the player's equipped weapon models are loaded (cached by IDFile).
+        let (wp, ws) = (scene.primary_weapon_idfile.clone(), scene.secondary_weapon_idfile.clone());
+        if !wp.is_empty() { self.ensure_weapon(&wp); }
+        if !ws.is_empty() { self.ensure_weapon(&ws); }
 
         crate::pass::encode_sky_pass(self, encoder, view);
         crate::pass::encode_zone_pass(self, encoder, view, scene);

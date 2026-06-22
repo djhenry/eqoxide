@@ -25,6 +25,14 @@ pub struct GpuMesh {
     pub base_color:  [f32; 4],
 }
 
+/// A held item (weapon) model loaded from gequip*.s3d, cached by IDFile and drawn at a hand bone
+/// with the static/character pipeline. `texture_bind_groups` is parallel to the textures; each
+/// mesh's `texture_idx` indexes into it.
+pub struct GpuWeapon {
+    pub meshes:              Vec<GpuMesh>,
+    pub texture_bind_groups: Vec<wgpu::BindGroup>,
+}
+
 /// Skinned mesh vertex — 64 bytes, Pod + Zeroable.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
