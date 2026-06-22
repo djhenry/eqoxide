@@ -250,7 +250,7 @@ impl Collision {
     /// `[east, north]` (start-exclusive, goal-inclusive) or None if no geometry / no route.
     /// Walkability = a floor exists under the cell; an edge needs a small floor-height step and
     /// a clear chest-height segment between cell centers.
-    pub fn find_path(&self, start: [f32; 3], goal: [f32; 3], radius: f32) -> Option<Vec<[f32; 2]>> {
+    pub fn find_path(&self, start: [f32; 3], goal: [f32; 3], radius: f32) -> Option<Vec<[f32; 3]>> {
         use std::collections::BinaryHeap;
         use std::cmp::Ordering;
         if self.cols == 0 || self.rows == 0 { return None; }
@@ -277,7 +277,7 @@ impl Collision {
         };
         let (sc, sr) = to_cell(start[0], start[1]);
         let (gc, gr) = to_cell(goal[0], goal[1]);
-        if (sc, sr) == (gc, gr) { return Some(vec![[goal[0], goal[1]]]); }
+        if (sc, sr) == (gc, gr) { return Some(vec![[goal[0], goal[1], goal[2]]]); }
         // The caller's z can be stale, so find the start floor by trying several reference levels.
         let start_floor = [start[2], goal[2], 0.0, -60.0, -120.0]
             .into_iter()
@@ -342,11 +342,14 @@ impl Collision {
         let start_i = idx(sc, sr) as i32;
         while cur != start_i && cur >= 0 {
             let (c, r) = (cur % cols, cur / cols);
-            path.push(center(c, r));
+            let ctr = center(c, r);
+            // Carry each waypoint's actual floor height so the walker moves + collision-checks at
+            // the right z while climbing/descending (instead of the goal's z, which clips walls).
+            path.push([ctr[0], ctr[1], cell_floor[cur as usize]]);
             cur = came[cur as usize];
         }
         path.reverse();
-        if let Some(last) = path.last_mut() { *last = [goal[0], goal[1]]; }
+        if let Some(last) = path.last_mut() { *last = [goal[0], goal[1], goal[2]]; }
         Some(path)
     }
 }

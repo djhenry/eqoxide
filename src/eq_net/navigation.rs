@@ -109,7 +109,7 @@ pub struct Navigator {
     /// Cached A* waypoints for the current goto goal (routes around walls). `path_i` is the
     /// current waypoint; `path_goal` is the goal these waypoints were computed for (recompute
     /// when the goal changes). Empty path = straight-line fallback.
-    path:             Vec<[f32; 2]>,
+    path:             Vec<[f32; 3]>,  // [east, north, floor_z] per waypoint
     path_i:           usize,
     path_goal:        Option<(f32, f32, f32)>,
 }
@@ -481,9 +481,13 @@ impl Navigator {
                         self.path_i += 1;
                         continue;
                     }
-                    break (wp[0], wp[1], goal.2);
+                    // Use the waypoint's OWN floor z, so the move + collision happen at the right
+                    // height while following a climbing/descending path (prevents clipping walls).
+                    break (wp[0], wp[1], wp[2]);
                 }
-                None => break goal, // no path computed: straight-line to the goal
+                // No path computed: straight-line toward the goal, but collision-check at the
+                // player's CURRENT height (not the goal's z) so we still can't clip walls.
+                None => break (goal.0, goal.1, gs.player_z),
             }
         };
 
