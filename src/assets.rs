@@ -254,16 +254,23 @@ impl Collision {
         use std::collections::BinaryHeap;
         use std::cmp::Ordering;
         if self.cols == 0 || self.rows == 0 { return None; }
-        let cols = self.cols as i32;
-        let rows = self.rows as i32;
+        // Navigate on a FINER grid than the collision broad-phase buckets (self.cell_size, ~32u).
+        // At 32u, cell centers fall inside walls in tight corridors, so A* sees a fragmented graph,
+        // finds no route, and the caller straight-lines into walls. An 8u nav grid keeps cell
+        // centers inside corridors so A* can actually route around them. (The collision triangle
+        // lookup via floor_z/path_clear works at any query point regardless of bucket size.)
+        const NAV_CELL: f32 = 8.0;
+        let cell = NAV_CELL;
+        let cols = (self.cols as f32 * self.cell_size / cell).ceil() as i32;
+        let rows = (self.rows as f32 * self.cell_size / cell).ceil() as i32;
         let to_cell = |e: f32, n: f32| -> (i32, i32) {
-            let c = (((e - self.origin[0]) / self.cell_size) as i32).clamp(0, cols - 1);
-            let r = (((n - self.origin[1]) / self.cell_size) as i32).clamp(0, rows - 1);
+            let c = (((e - self.origin[0]) / cell) as i32).clamp(0, cols - 1);
+            let r = (((n - self.origin[1]) / cell) as i32).clamp(0, rows - 1);
             (c, r)
         };
         let center = |c: i32, r: i32| -> [f32; 2] {
-            [self.origin[0] + (c as f32 + 0.5) * self.cell_size,
-             self.origin[1] + (r as f32 + 0.5) * self.cell_size]
+            [self.origin[0] + (c as f32 + 0.5) * cell,
+             self.origin[1] + (r as f32 + 0.5) * cell]
         };
         // floor_z casts its probe ray DOWN from (fallback + 2) over ~100u, so we must probe near
         // the working floor level. The probe FOLLOWS the terrain: each cell's floor is found
@@ -297,7 +304,7 @@ impl Collision {
         impl Eq for Node {}
         impl Ord for Node { fn cmp(&self, o: &Self) -> Ordering { o.f.partial_cmp(&self.f).unwrap_or(Ordering::Equal) } }
         impl PartialOrd for Node { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
-        let h = |c: i32, r: i32| (((c - gc) as f32).powi(2) + ((r - gr) as f32).powi(2)).sqrt() * self.cell_size;
+        let h = |c: i32, r: i32| (((c - gc) as f32).powi(2) + ((r - gr) as f32).powi(2)).sqrt() * cell;
         cell_floor[idx(sc, sr)] = start_floor;
         g_score[idx(sc, sr)] = 0.0;
         let mut heap = BinaryHeap::new();
@@ -322,7 +329,7 @@ impl Collision {
                 let a = center(c, r);
                 let b = center(nc, nr);
                 if !self.path_clear([a[0], a[1], cz + CHEST], [b[0], b[1], nz + CHEST], radius) { continue; }
-                let step = (((dc * dc + dr * dr) as f32).sqrt()) * self.cell_size;
+                let step = (((dc * dc + dr * dr) as f32).sqrt()) * cell;
                 let tentative = g_score[ci] + step;
                 if tentative < g_score[ni] {
                     g_score[ni] = tentative;
