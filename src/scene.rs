@@ -63,6 +63,10 @@ pub struct SceneState {
     pub player_equipment_tint: [[u8; 3]; 9],
     /// Player inventory + equipment items (for the inventory UI window).
     pub inventory: Vec<crate::game_state::InvItem>,
+    /// Equipped weapon held-model ids (IDFile, e.g. "IT10649"), for rendering weapons in hand.
+    /// Empty = nothing equipped in that slot. Primary = worn slot 13, secondary = slot 14.
+    pub primary_weapon_idfile: String,
+    pub secondary_weapon_idfile: String,
 }
 
 impl SceneState {
@@ -200,6 +204,10 @@ impl SceneState {
             player_equipment: gs.player_equipment,
             player_equipment_tint: gs.player_equipment_tint,
             inventory: gs.inventory.clone(),
+            primary_weapon_idfile: gs.inventory.iter().find(|i| i.slot == 13)
+                .map(|i| i.idfile.clone()).unwrap_or_default(),
+            secondary_weapon_idfile: gs.inventory.iter().find(|i| i.slot == 14)
+                .map(|i| i.idfile.clone()).unwrap_or_default(),
         }
     }
 }
