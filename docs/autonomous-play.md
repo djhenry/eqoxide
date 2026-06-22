@@ -174,6 +174,21 @@ Requirements:
 
 ---
 
+## 4b. Moving / equipping items
+
+Opcode (Titanium, from `patch_Titanium.conf`): `OP_MoveItem=0x420f`.
+
+`POST /move {"from":N,"to":M}` → nav sends one **`OP_MoveItem`** with `MoveItem_Struct` (12 bytes):
+`from_slot`(u32), `to_slot`(u32), `number_in_stack`(u32, =1 for a single non-stacked item).
+
+Slot ids (Titanium): **0-21** worn equipment, **22-29** general inventory, **30** cursor, **251+**
+bag contents. **Equipping = moving a bag/general-slot item to its worn slot**, e.g. boots → slot 19
+(Feet), a chest piece → slot 17 (Chest), a 1H weapon → slot 13 (Primary). Unequipping = move a worn
+slot to a free general slot (22-29). Read the current item→slot mapping from the decoded inventory
+(`GameState.inventory`) before issuing the move.
+
+---
+
 ## 5. Navigation / pathfinding (find_path)
 
 `Collision::find_path(start, goal, radius) -> Option<Vec<[east,north]>>` (`src/assets.rs`) is grid
