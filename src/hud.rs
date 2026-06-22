@@ -239,8 +239,9 @@ const WORN_SLOTS: [(i32, &str); 22] = [
 /// Inventory/equipment window + a toggle button (top-right). `show` is owned by the App (toggled
 /// here or by the I key). Data comes from `scene.inventory` (decoded from OP_CharInventory).
 pub fn draw_inventory(ctx: &egui::Context, scene: &SceneState, show: &mut bool) {
+    // Top-left under the FPS counter, so it doesn't overlap the top-right minimap.
     egui::Area::new(egui::Id::new("inv_toggle"))
-        .anchor(egui::Align2::RIGHT_TOP, [-12.0, 12.0])
+        .anchor(egui::Align2::LEFT_TOP, [8.0, 34.0])
         .show(ctx, |ui| {
             if ui.button("🎒 Inventory (I)").clicked() {
                 *show = !*show;
@@ -301,7 +302,8 @@ pub fn draw_control_bar(
         .title_bar(false)
         .resizable(false)
         .collapsible(false)
-        .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -30.0])
+        // Bottom-right so it tiles beside the bottom-left status bar instead of overlapping it.
+        .anchor(egui::Align2::RIGHT_BOTTOM, [-8.0, -8.0])
         .frame(egui::Frame::none()
             .fill(egui::Color32::from_black_alpha(170))
             .inner_margin(egui::Margin::symmetric(8.0, 4.0)))

@@ -901,6 +901,11 @@ impl App {
         let screen_w  = renderer.surface_config.width;
         let screen_h  = renderer.surface_config.height;
 
+        // Scale the entire UI (text + widgets) with the window so it always fits and stays legible.
+        // Zoom is relative to a 1080 logical-px baseline; egui multiplies it by the native DPI ppp.
+        let logical_h = (screen_h as f32 / window.scale_factor() as f32).max(1.0);
+        egui_ctx.set_zoom_factor((logical_h / 1080.0).clamp(0.6, 1.6));
+
         let full_output = egui_ctx.run(raw_input, |ctx| {
             hud::draw_fps(ctx, current_fps);
             if loading {
