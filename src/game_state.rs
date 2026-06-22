@@ -83,6 +83,8 @@ pub struct InvItem {
     pub icon:    u32,
     /// Stack quantity / charges (1 for non-stackable).
     pub charges: i32,
+    /// EQ IDFile (e.g. "IT63") — the held/world model id, used to render the weapon in hand.
+    pub idfile:  String,
 }
 
 /// All state the renderer needs for one frame.

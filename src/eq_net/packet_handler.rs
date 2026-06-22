@@ -65,6 +65,7 @@ fn apply_animation(gs: &mut GameState, p: &[u8]) {
     let spawnid = u16::from_le_bytes([p[0], p[1]]) as u32;
     let action  = p[3];
     if (1..=9).contains(&action) {
+        eprintln!("EQ: OP_Animation spawn={} action={} (combat swing)", spawnid, action); // TEMP verify
         gs.combat_anims.insert(spawnid, (action, std::time::Instant::now()));
     }
 }
@@ -171,11 +172,12 @@ fn parse_inv_item(record: &str) -> Option<crate::game_state::InvItem> {
     if f.len() < 23 { return None; }
     let slot: i32 = f[2].trim().parse().ok()?;
     let name = f[12].trim().trim_start_matches('"').to_string();
+    let idfile = f[14].trim().to_string(); // EQ IDFile (e.g. "IT63") = held/world model id
     let item_id: u32 = f[15].trim().parse().unwrap_or(0);
     let icon: u32 = f[22].trim().parse().unwrap_or(0);
     let charges: i32 = f[0].trim().parse().unwrap_or(1);
     if name.is_empty() && item_id == 0 { return None; }
-    Some(crate::game_state::InvItem { slot, item_id, name, icon, charges: charges.max(1) })
+    Some(crate::game_state::InvItem { slot, item_id, name, icon, charges: charges.max(1), idfile })
 }
 
 /// OP_CharInventory — the full inventory + equipment as NULL-separated item records.
@@ -188,6 +190,9 @@ fn apply_char_inventory(gs: &mut GameState, p: &[u8]) {
     }
     if !items.is_empty() {
         eprintln!("EQ: char inventory: {} items", items.len());
+        for it in items.iter().filter(|i| i.slot == 13 || i.slot == 14) {
+            eprintln!("EQ:   worn weapon slot {} = {} (idfile {})", it.slot, it.name, it.idfile); // TEMP Phase2
+        }
         gs.inventory = items;
     }
 }
