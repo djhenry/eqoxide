@@ -25,6 +25,20 @@ pub struct Billboard {
     pub gender:    u8,
 }
 
+/// A door to render this frame. Positions are in client convention [east=x, north=y, up=z].
+/// `heading` is EQ 0..512; `open_frac` is 0=closed..1=open (used by Task 9; closed for now).
+#[derive(Debug, Clone)]
+pub struct DoorRender {
+    pub door_id:   u8,
+    pub name:      String,
+    pub pos:       [f32; 3],
+    pub heading:   f32,
+    pub incline:   i32,
+    pub size:      u16,
+    pub opentype:  u8,
+    pub open_frac: f32,
+}
+
 /// A single entry in the message log.
 #[derive(Debug, Clone)]
 pub struct LogEntry {
@@ -56,6 +70,8 @@ pub struct SceneState {
     pub target_con: Option<[u8; 3]>,
     pub strategy: String,
     pub billboards: Vec<Billboard>,
+    /// Doors to render this frame, copied from `GameState::doors`.
+    pub doors: Vec<DoorRender>,
     pub messages: Vec<LogEntry>,
     /// Item material IDs for each equipment slot (0..9), from the player profile.
     pub player_equipment: [u32; 9],
@@ -181,6 +197,18 @@ impl SceneState {
             }
         }).collect();
 
+        let doors = gs.doors.values().map(|d| DoorRender {
+            door_id: d.door_id,
+            name:    d.name.clone(),
+            // Client convention [east=x, north=y, up=z] — same as entities/player.
+            pos:     [d.x, d.y, d.z],
+            heading: d.heading,
+            incline: d.incline,
+            size:    d.size,
+            opentype: d.opentype,
+            open_frac: d.open_frac,
+        }).collect();
+
         let messages = gs.messages.iter().map(|m| LogEntry {
             kind: m.kind.clone(),
             text: m.text.clone(),
@@ -210,6 +238,7 @@ impl SceneState {
             target_con: gs.target_con,
             strategy: gs.strategy.clone(),
             billboards,
+            doors,
             messages,
             player_equipment: gs.player_equipment,
             player_equipment_tint: gs.player_equipment_tint,
