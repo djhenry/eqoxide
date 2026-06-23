@@ -85,6 +85,11 @@ pub struct App {
     hail:         crate::http::HailReq,
     say:          crate::http::SayReq,
     target:       crate::http::TargetReq,
+    attack:       crate::http::AttackReq,
+    cast:         crate::http::CastReq,
+    sit:          crate::http::SitReq,
+    consider:     crate::http::ConsiderReq,
+    spells:       std::sync::Arc<crate::spells::SpellDb>,
     /// Text buffer for the HUD say box.
     say_buffer:   String,
     // Mouse
@@ -154,6 +159,11 @@ impl App {
         hail:            crate::http::HailReq,
         say:             crate::http::SayReq,
         target:          crate::http::TargetReq,
+        attack:          crate::http::AttackReq,
+        cast:            crate::http::CastReq,
+        sit:             crate::http::SitReq,
+        consider:        crate::http::ConsiderReq,
+        spells:          std::sync::Arc<crate::spells::SpellDb>,
         shared_collision: assets::SharedCollision,
         player_info:     crate::http::PlayerInfo,
         warp:            crate::http::WarpReq,
@@ -187,7 +197,7 @@ impl App {
             fps_timer: std::time::Instant::now(),
             current_fps: 0.0,
             keys_held: std::collections::HashSet::new(),             override_pos: None, warp_cooldown: 0, goto_target,
-            hail, say, target, say_buffer: String::new(),
+            hail, say, target, attack, cast, sit, consider, spells, say_buffer: String::new(),
             drag_active: false, last_cursor: winit::dpi::PhysicalPosition::new(0.0, 0.0),
             click_start: None,
             pick_view_proj: [
@@ -857,6 +867,7 @@ impl App {
             self.current_fps, self.zone_map.as_ref(),
             cam_eye, self.collision.as_deref(),
             &self.hail, &self.say, &self.target, &mut self.say_buffer,
+            &self.attack, &self.cast, &self.sit, &self.consider, &self.spells,
             &mut self.show_inventory,
             &mut self.ui_zoom, &mut self.ui_zoom_size,
             self.show_debug, self.game_state.server_corrections,
@@ -905,6 +916,11 @@ impl App {
         say:           &crate::http::SayReq,
         target:        &crate::http::TargetReq,
         say_buffer:    &mut String,
+        attack:        &crate::http::AttackReq,
+        cast:          &crate::http::CastReq,
+        sit:           &crate::http::SitReq,
+        consider:      &crate::http::ConsiderReq,
+        spells:        &crate::spells::SpellDb,
         show_inventory: &mut bool,
         ui_zoom:       &mut f32,
         ui_zoom_size:  &mut (u32, u32),
@@ -942,6 +958,7 @@ impl App {
                 hud::draw_labels(ctx, scene, view_proj, screen_w, screen_h, cam_eye, collision);
                 hud::draw_minimap(ctx, scene, zone_min, zone_max, minimap_zoom, minimap_full, zone_map);
                 hud::draw_control_bar(ctx, scene, hail, say, target, say_buffer);
+                hud::draw_action_grid(ctx, scene, spells, attack, cast, sit, target, consider);
                 hud::draw_inventory(ctx, scene, show_inventory);
                 if show_debug {
                     hud::draw_debug_overlay(ctx, scene.player_pos, scene.player_heading, current_zone, corrections);

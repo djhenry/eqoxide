@@ -369,6 +369,69 @@ pub fn draw_control_bar(
         });
 }
 
+/// Bottom-center action grid: attack toggle, sit/stand toggle, target/consider, and the 9
+/// memorized spell gems. Buttons write the same request slots the HTTP API uses.
+pub fn draw_action_grid(
+    ctx:      &egui::Context,
+    scene:    &SceneState,
+    spells:   &crate::spells::SpellDb,
+    attack:   &crate::http::AttackReq,
+    cast:     &crate::http::CastReq,
+    sit:      &crate::http::SitReq,
+    target:   &crate::http::TargetReq,
+    consider: &crate::http::ConsiderReq,
+) {
+    egui::Window::new("##actiongrid")
+        .title_bar(false).resizable(false).collapsible(false)
+        .anchor(egui::Align2::CENTER_BOTTOM, canvas_off(ctx, egui::Align2::CENTER_BOTTOM, [0.0, -8.0]))
+        .frame(egui::Frame::none()
+            .fill(egui::Color32::from_black_alpha(170))
+            .inner_margin(egui::Margin::symmetric(8.0, 4.0)))
+        .show(ctx, |ui| {
+            if let Some(c) = &scene.casting {
+                let frac = (c.started.elapsed().as_secs_f32()
+                    / (c.cast_ms.max(1) as f32 / 1000.0)).clamp(0.0, 1.0);
+                let label = spells.get(c.spell_id).map(|s| s.name.clone())
+                    .unwrap_or_else(|| format!("Spell {}", c.spell_id));
+                ui.add(egui::ProgressBar::new(frac).text(format!("Casting {label}")));
+            }
+            ui.horizontal(|ui| {
+                let atk = egui::Button::new("\u{2694} Attack")
+                    .fill(if scene.auto_attack { egui::Color32::from_rgb(150, 40, 40) }
+                          else { egui::Color32::from_gray(50) });
+                if ui.add(atk).clicked() {
+                    *attack.lock().unwrap() = Some(!scene.auto_attack);
+                }
+                let sit_label = if scene.sitting { "Stand" } else { "Sit" };
+                if ui.button(sit_label).clicked() {
+                    *sit.lock().unwrap() = Some(!scene.sitting);
+                }
+                let nearest = nearest_npc(scene).map(|b| b.id);
+                if ui.add_enabled(nearest.is_some(), egui::Button::new("Target")).clicked() {
+                    if let Some(id) = nearest { *target.lock().unwrap() = Some(id); }
+                }
+                if ui.add_enabled(scene.target_id.is_some(), egui::Button::new("Con")).clicked() {
+                    if let Some(id) = scene.target_id { *consider.lock().unwrap() = Some(id); }
+                }
+            });
+            ui.horizontal(|ui| {
+                for (gem, &spell_id) in scene.mem_spells.iter().enumerate() {
+                    let empty = spell_id == 0 || spell_id == 0xFFFF_FFFF;
+                    let label = if empty { "\u{2014}".to_string() }
+                        else { spells.get(spell_id).map(|s| s.name.clone())
+                                 .unwrap_or_else(|| format!("{spell_id}")) };
+                    let btn = egui::Button::new(egui::RichText::new(label).size(11.0))
+                        .min_size(egui::vec2(56.0, 28.0));
+                    if ui.add_enabled(!empty, btn).clicked() {
+                        *cast.lock().unwrap() = Some(crate::http::CastRequest {
+                            gem: gem as u8, target_id: None,
+                        });
+                    }
+                }
+            });
+        });
+}
+
 pub fn draw_message_log(ctx: &egui::Context, scene: &SceneState) {
     let visible: Vec<_> = scene.messages.iter()
         // NPC dialogue has its own panel (draw_quest_dialogue); keep it out of here.

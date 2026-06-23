@@ -103,6 +103,11 @@ fn main() {
     let app_hail   = hail.clone();
     let app_say    = say.clone();
     let app_target = target.clone();
+    let app_attack  = attack.clone();
+    let app_cast    = cast.clone();
+    let app_sit     = sit.clone();
+    let app_consider = consider.clone();
+    let app_spells  = spells.clone();
     let app_player_info = player_info.clone();
     http::spawn_camera_server(
         camera_cmd.clone(),
@@ -143,6 +148,11 @@ fn main() {
         app_hail,
         app_say,
         app_target,
+        app_attack,
+        app_cast,
+        app_sit,
+        app_consider,
+        app_spells,
         shared_collision,
         app_player_info,
         warp,

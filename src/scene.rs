@@ -75,6 +75,8 @@ pub struct SceneState {
     pub sitting: bool,
     /// True when auto-attack is enabled.
     pub auto_attack: bool,
+    /// The spawn_id of the current target, if any.
+    pub target_id: Option<u32>,
 }
 
 impl SceneState {
@@ -220,6 +222,7 @@ impl SceneState {
             casting: gs.casting.clone(),
             sitting: gs.sitting,
             auto_attack: gs.auto_attack,
+            target_id: gs.target_id,
         }
     }
 }
