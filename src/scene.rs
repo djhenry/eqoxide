@@ -219,7 +219,12 @@ impl SceneState {
             secondary_weapon_idfile: gs.inventory.iter().find(|i| i.slot == 14)
                 .map(|i| i.idfile.clone()).unwrap_or_default(),
             mem_spells: gs.mem_spells,
-            casting: gs.casting.clone(),
+            // Drop a stale cast bar: if the cast time has elapsed plus a grace window and the
+            // server never sent a terminal packet (OP_MemorizeSpell scribing=3 / OP_InterruptCast),
+            // stop showing "Casting …" forever. (Spec Risks: cast_ms + grace fallback.)
+            casting: gs.casting.clone().filter(|c| {
+                c.started.elapsed().as_millis() < c.cast_ms as u128 + 1500
+            }),
             sitting: gs.sitting,
             auto_attack: gs.auto_attack,
             target_id: gs.target_id,
