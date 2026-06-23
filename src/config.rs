@@ -7,6 +7,7 @@ pub struct AppConfig {
     pub assets_path: PathBuf,
     pub models_path: PathBuf,
     pub http_port: u16,
+    pub asset_server_url: String,
 }
 
 impl AppConfig {
@@ -15,8 +16,12 @@ impl AppConfig {
             eprintln!("renderer: config.yaml not found ({}), using defaults", e);
             String::new()
         });
+        Self::from_yaml_str(&cfg_text)
+    }
+
+    pub fn from_yaml_str(cfg_text: &str) -> Self {
         let cfg: serde_yaml::Value =
-            serde_yaml::from_str(&cfg_text).unwrap_or(serde_yaml::Value::Null);
+            serde_yaml::from_str(cfg_text).unwrap_or(serde_yaml::Value::Null);
         let r = cfg.get("renderer");
 
         let assets_path = r
@@ -36,7 +41,13 @@ impl AppConfig {
             .and_then(|v| v.as_u64())
             .unwrap_or(8765) as u16;
 
-        AppConfig { assets_path, models_path, http_port }
+        let asset_server_url = r
+            .and_then(|v| v.get("asset_server_url"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("http://localhost:8088")
+            .to_string();
+
+        AppConfig { assets_path, models_path, http_port, asset_server_url }
     }
 }
 
@@ -77,5 +88,21 @@ impl LoginConfig {
                 .get("account").and_then(|a| a.get("character_name")).and_then(|v| v.as_str())
                 .unwrap_or("Aiquestbot").to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod b1_config_tests {
+    use super::*;
+
+    #[test]
+    fn asset_server_url_defaults_and_overrides() {
+        let yaml_default = "renderer:\n  assets_path: /x\n";
+        let cfg = AppConfig::from_yaml_str(yaml_default);
+        assert_eq!(cfg.asset_server_url, "http://localhost:8088");
+
+        let yaml_set = "renderer:\n  asset_server_url: http://host:9999\n";
+        let cfg = AppConfig::from_yaml_str(yaml_set);
+        assert_eq!(cfg.asset_server_url, "http://host:9999");
     }
 }
