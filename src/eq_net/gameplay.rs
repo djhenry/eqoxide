@@ -3,6 +3,8 @@
 //! Handles zone transitions inline: when OP_ZONE_SERVER_INFO arrives the current
 //! zone stream is replaced with a new connection and the zone-entry handshake runs.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::{Duration, sleep};
 
@@ -24,6 +26,7 @@ pub async fn run_gameplay_phase(
     char_name:     String,
     mut navigator: Navigator,
     world_creds:   WorldCredentials,
+    shutdown:      Arc<AtomicBool>,
 ) {
     // Wrap in Option so Rust allows reassignment after zone transitions.
     let mut stream: Option<EqStream>                      = Some(stream_init);
@@ -34,6 +37,12 @@ pub async fn run_gameplay_phase(
         let s  = stream.as_mut().expect("stream always Some in loop");
         let rx = net_rx.as_mut().expect("net_rx always Some in loop");
         s.poll_recv();
+
+        // Relaxed: the flag is a self-contained shutdown signal with no happens-before
+        // dependency on other data published by the setter (/exit or window-close).
+        if shutdown.load(Ordering::Relaxed) {
+            perform_clean_shutdown(s, rx).await;
+        }
 
         let mut zone_redirect: Option<(String, u16)> = None;
         let mut world_reconnect_needed = false;
@@ -53,6 +62,15 @@ pub async fn run_gameplay_phase(
                     gs.log_msg("loot", "Looting item...");
                     s.send_app_packet(OP_LOOT_ITEM, &packet.payload);
                     eprintln!("EQ: auto-loot: taking item (echoed OP_LootItem)");
+                }
+                // Server booted us (typically another client logged in this same character).
+                // EQEmu's default is "second login wins"; the first client receives OP_GMKick.
+                // We're already kicked, so just disconnect the session and exit cleanly.
+                OP_GMKICK => {
+                    eprintln!("EQ: OP_GMKick — disconnected (character logged in elsewhere)");
+                    gs.log_msg("system", "Disconnected: this character was logged in from another location.");
+                    s.send_session_disconnect();
+                    std::process::exit(0);
                 }
                 OP_REQUEST_CLIENT_ZONE_CHANGE if packet.payload.len() >= 24 => {
                     // Server wants us to move — either a zone transition or a same-zone teleport.
@@ -216,6 +234,31 @@ pub async fn run_gameplay_phase(
 
         sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// Clean logout: send OP_Logout, briefly wait for OP_LogoutReply, send a session-layer
+/// disconnect, then exit the process. Never returns. EQEmu saves the character; the brief
+/// linkdead window is harmless because the next login DropClient-kicks the ghost.
+async fn perform_clean_shutdown(
+    s:  &mut EqStream,
+    rx: &mut UnboundedReceiver<AppPacket>,
+) -> ! {
+    eprintln!("EQ: clean shutdown requested — sending OP_Logout");
+    s.send_app_packet(OP_LOGOUT, &[]);
+    let deadline = std::time::Instant::now() + Duration::from_millis(300);
+    'wait: while std::time::Instant::now() < deadline {
+        s.poll_recv();
+        while let Ok(pkt) = rx.try_recv() {
+            if pkt.opcode == OP_LOGOUT_REPLY {
+                eprintln!("EQ: received OP_LogoutReply");
+                break 'wait;
+            }
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    s.send_session_disconnect();
+    eprintln!("EQ: sent OP_SessionDisconnect — exiting cleanly");
+    std::process::exit(0);
 }
 
 /// After OP_ZONE_CHANGE success=1: reconnect to world, get OP_ZONE_SERVER_INFO, connect to new zone.
