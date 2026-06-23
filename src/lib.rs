@@ -18,6 +18,7 @@
 pub mod anim;
 pub mod app;
 pub mod assets;
+pub mod asset_sync;
 pub mod billboard;
 pub mod camera;
 pub mod debug_zone;
