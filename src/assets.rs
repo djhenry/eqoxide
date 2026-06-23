@@ -691,6 +691,14 @@ pub fn load_one_texture_from_s3d(s3d_path: &Path, filename: &str) -> Option<Text
     let img = image::load_from_memory_with_format(&bytes, fmt).ok()?;
     let rgba = img.to_rgba8();
     let (width, height) = rgba.dimensions();
+    // Reject transparent "stub" textures: some chr archives (e.g. globalelf_chr.s3d) store an 8x8
+    // all-alpha-0 lowest-MIP placeholder DDS for body pieces that have no real cloth texture (e.g.
+    // elfua0002.dds, elfch0003.dds). Loading one makes that mesh render 100% transparent (invisible
+    // arms/back). Returning None lets the caller fall back to the opaque baked skin base — which is
+    // what the original client shows for those pieces at material 0. (eq-client-expert finding.)
+    if (width <= 8 && height <= 8) || rgba.pixels().all(|p| p.0[3] == 0) {
+        return None;
+    }
     Some(TextureData { name: lower, width, height, rgba: rgba.into_raw() })
 }
 
