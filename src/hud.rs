@@ -19,7 +19,7 @@ pub const HUD_REF_H: f32 = 540.0;
 /// narrower than the canvas the margin clamps to 0 (graceful fall back to edge-anchoring). On a
 /// triple-monitor/ultrawide it keeps the HUD on the center region. Nameplates do NOT use this —
 /// they track 3D mobs across the whole window. `align` is the element's own anchor alignment.
-fn canvas_off(ctx: &egui::Context, align: egui::Align2, base: [f32; 2]) -> [f32; 2] {
+pub(crate) fn canvas_off(ctx: &egui::Context, align: egui::Align2, base: [f32; 2]) -> [f32; 2] {
     let sr = ctx.screen_rect();
     let mx = (sr.width() - HUD_REF_W).max(0.0) * 0.5;
     let my = (sr.height() - HUD_REF_H).max(0.0) * 0.5;
