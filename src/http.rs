@@ -18,6 +18,7 @@ use axum::{
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::oneshot;
 use crate::camera_state::{CameraCmd, CameraSnapshot};
 
@@ -159,6 +160,7 @@ struct HttpState {
     spells:           std::sync::Arc<crate::spells::SpellDb>,
     player_info:      PlayerInfo,
     task_log:         TaskLog,
+    shutdown:         Arc<AtomicBool>,
 }
 
 #[derive(serde::Deserialize)]
@@ -208,12 +210,13 @@ pub fn spawn_camera_server(
     spells:           std::sync::Arc<crate::spells::SpellDb>,
     player_info:      PlayerInfo,
     task_log:         TaskLog,
+    shutdown:         Arc<AtomicBool>,
     port:             u16,
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, cast, sit, consider, buy, move_req, give, inventory, loot, messages, spells, player_info, task_log };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, cast, sit, consider, buy, move_req, give, inventory, loot, messages, spells, player_info, task_log, shutdown };
             let app = Router::new()
                 .route("/camera", get(get_camera).post(post_camera))
                 .route("/camera/reset", post(post_camera_reset))
@@ -849,17 +852,19 @@ async fn post_loot(
     }
 }
 
-/// POST /exit — cleanly shut down THIS client instance. Lets an agent restart its own
-/// client (to pick up changes) without `pkill`, which could kill another worktree's instance.
-/// Responds 200 first, then a detached task exits the process after a short delay so the
-/// HTTP response flushes. Uses the same `std::process::exit(0)` as the normal shutdown path.
-async fn post_exit() -> (StatusCode, &'static str) {
-    eprintln!("exit: shutdown requested via POST /exit");
+/// POST /exit — cleanly log this client out and shut down. Sets the shared shutdown flag, which
+/// the EQ network thread observes to send OP_Logout + OP_SessionDisconnect before exiting. A
+/// watchdog force-exits after 3s in case the network thread can't log out (not connected /
+/// --testzone), so the process always terminates.
+async fn post_exit(State(s): State<HttpState>) -> (StatusCode, &'static str) {
+    eprintln!("exit: clean shutdown requested via POST /exit");
+    s.shutdown.store(true, Ordering::Relaxed);
     tokio::spawn(async {
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        eprintln!("exit: watchdog timeout — forcing process exit");
         std::process::exit(0);
     });
-    (StatusCode::OK, "shutting down")
+    (StatusCode::OK, "logging out and shutting down")
 }
 
 async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
