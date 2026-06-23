@@ -6,6 +6,7 @@
 use crate::camera::project_to_screen;
 use crate::scene::SceneState;
 use crate::zone_map::ZoneMap;
+use crate::ui_layout::{managed_window, UiLayout, WindowSpec};
 
 /// HUD design reference (points). The layout is authored for 1920x1080; using a HALF reference here
 /// makes `set_zoom_factor` twice as large, so all HUD text/widgets render at 2x scale. Shared with
@@ -30,6 +31,22 @@ pub(crate) fn canvas_off(ctx: &egui::Context, align: egui::Align2, base: [f32; 2
         egui::Align::Min => my, egui::Align::Max => -my, egui::Align::Center => 0.0,
     };
     [base[0] + dx, base[1] + dy]
+}
+
+/// All managed (movable) HUD windows. Anchors/offsets reproduce the previous
+/// fixed layout, retuned so the windows no longer overlap on a 960x540 canvas.
+pub static WINDOW_SPECS: [WindowSpec; 7] = [
+    WindowSpec { id: "status_hud",   title: "Status",       default_anchor: egui::Align2::LEFT_BOTTOM,   default_offset: [0.0, 0.0],   default_size: None,                resizable: false },
+    WindowSpec { id: "message_log",  title: "Messages",     default_anchor: egui::Align2::LEFT_BOTTOM,   default_offset: [0.0, -64.0], default_size: Some([480.0, 120.0]), resizable: true  },
+    WindowSpec { id: "minimap",      title: "Map",          default_anchor: egui::Align2::RIGHT_TOP,     default_offset: [-10.0, 10.0],default_size: Some([200.0, 200.0]), resizable: true  },
+    WindowSpec { id: "control_bar",  title: "Controls",     default_anchor: egui::Align2::RIGHT_BOTTOM,  default_offset: [-8.0, -8.0], default_size: None,                resizable: false },
+    WindowSpec { id: "action_grid",  title: "Actions",      default_anchor: egui::Align2::CENTER_BOTTOM, default_offset: [0.0, -8.0],  default_size: None,                resizable: false },
+    WindowSpec { id: "inventory",    title: "Inventory",    default_anchor: egui::Align2::LEFT_TOP,      default_offset: [8.0, 90.0],  default_size: Some([340.0, 420.0]), resizable: true  },
+    WindowSpec { id: "npc_dialogue", title: "NPC Dialogue", default_anchor: egui::Align2::CENTER_TOP,    default_offset: [0.0, 36.0],  default_size: Some([460.0, 140.0]), resizable: true  },
+];
+
+fn spec(id: &str) -> &'static WindowSpec {
+    WINDOW_SPECS.iter().find(|s| s.id == id).expect("unknown window id")
 }
 
 // ── Shared helper: draw a labelled stat bar ───────────────────────────────────
@@ -107,84 +124,98 @@ pub fn draw_fps(ctx: &egui::Context, fps: f32) {
         });
 }
 
-pub fn draw_hud(ctx: &egui::Context, scene: &SceneState, _bot_id: &str) {
-    egui::Window::new("##hud")
-        .anchor(egui::Align2::LEFT_BOTTOM, canvas_off(ctx, egui::Align2::LEFT_BOTTOM, [0.0, 0.0]))
-        .title_bar(false)
-        .resizable(false)
-        .collapsible(false)
-        .min_width(640.0)
-        .show(ctx, |ui| {
-            // Row 1: Zone / player / HP / strategy / target
+pub fn draw_hud(ctx: &egui::Context, layout: &mut UiLayout, scene: &SceneState, _bot_id: &str) {
+    let base = egui::Frame::window(&ctx.style());
+    managed_window(ctx, layout, spec("status_hud"), base, |ui| {
+        ui.set_min_width(640.0);
+        // Row 1: Zone / player / HP / strategy / target
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!(
+                "Zone: {}",
+                if scene.zone.is_empty() { "connecting…" } else { &scene.zone }
+            )).strong());
+            ui.separator();
+            let class_suffix = if scene.player_class.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", scene.player_class)
+            };
+            ui.label(format!("{} (L{}{})", scene.player_name, scene.player_level, class_suffix));
+
+            // Coin on hand (only once a profile has been received).
+            let [pp, gp, sp, cp] = scene.coin;
+            if pp | gp | sp | cp != 0 {
+                ui.separator();
+                ui.label(egui::RichText::new(format!("{}p {}g {}s {}c", pp, gp, sp, cp))
+                    .color(egui::Color32::from_rgb(225, 205, 120)));
+            }
+
+            let hp = scene.player_hp_pct;
+            let hp_color = if hp < 30.0 {
+                egui::Color32::from_rgb(248, 81, 73)
+            } else if hp < 60.0 {
+                egui::Color32::from_rgb(255, 166, 87)
+            } else {
+                egui::Color32::from_rgb(63, 185, 80)
+            };
+            stat_bar(ui, "HP:", hp, 120.0, 10.0, hp_color);
+
+            ui.separator();
+            ui.label(egui::RichText::new(&scene.strategy).italics().weak());
+
+            if let (Some(name), Some(hp_pct)) = (&scene.target_name, scene.target_hp_pct) {
+                ui.separator();
+                ui.label(format!("→ {} ({:.0}%)", name, hp_pct));
+            }
+        });
+
+        // Row 2: Mana bar + XP bar + coordinates
+        ui.horizontal(|ui| {
+            stat_bar(ui, "Mana:",
+                scene.player_mana_pct, 120.0, 8.0,
+                egui::Color32::from_rgb(58, 120, 220),
+            );
+            ui.add_space(12.0);
+            stat_bar(ui, "XP:",
+                scene.player_xp_pct, 200.0, 8.0,
+                egui::Color32::from_rgb(200, 160, 40),
+            );
+            ui.add_space(12.0);
+            // scene.player_pos is [server_y=map_x, server_x=map_y, server_z] after GPU swap
+            let [sx, sy, sz] = scene.player_pos;
+            ui.label(egui::RichText::new(format!("map ({:.1}, {:.1}, {:.1})", sx, sy, sz))
+                .weak()
+                .monospace());
+        });
+
+        // Row 3: character stats (only once a player profile has arrived).
+        if scene.stats.iter().any(|&s| s != 0) {
+            let [str_, sta, cha, dex, int_, agi, wis] = scene.stats;
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(format!(
-                    "Zone: {}",
-                    if scene.zone.is_empty() { "connecting…" } else { &scene.zone }
-                )).strong());
-                ui.separator();
-                let class_suffix = if scene.player_class.is_empty() {
-                    String::new()
-                } else {
-                    format!(" {}", scene.player_class)
-                };
-                ui.label(format!("{} (L{}{})", scene.player_name, scene.player_level, class_suffix));
+                    "STR {}  STA {}  AGI {}  DEX {}  WIS {}  INT {}  CHA {}",
+                    str_, sta, agi, dex, wis, int_, cha))
+                    .weak().monospace());
+            });
+        }
+    });
+}
 
-                // Coin on hand (only once a profile has been received).
-                let [pp, gp, sp, cp] = scene.coin;
-                if pp | gp | sp | cp != 0 {
-                    ui.separator();
-                    ui.label(egui::RichText::new(format!("{}p {}g {}s {}c", pp, gp, sp, cp))
-                        .color(egui::Color32::from_rgb(225, 205, 120)));
+/// Small top-left "UI" menu: global Lock toggle + Reset all windows.
+/// Not a managed window (it must always be reachable).
+pub fn draw_ui_menu(ctx: &egui::Context, layout: &mut UiLayout) {
+    egui::Area::new(egui::Id::new("ui_menu"))
+        .anchor(egui::Align2::LEFT_TOP, canvas_off(ctx, egui::Align2::LEFT_TOP, [8.0, 34.0]))
+        .show(ctx, |ui| {
+            ui.menu_button("\u{2699} UI", |ui| {
+                let mut locked = layout.locked;
+                if ui.checkbox(&mut locked, "Lock windows (Ctrl+L)").clicked() {
+                    layout.locked = locked; layout.set_dirty_locked();
                 }
-
-                let hp = scene.player_hp_pct;
-                let hp_color = if hp < 30.0 {
-                    egui::Color32::from_rgb(248, 81, 73)
-                } else if hp < 60.0 {
-                    egui::Color32::from_rgb(255, 166, 87)
-                } else {
-                    egui::Color32::from_rgb(63, 185, 80)
-                };
-                stat_bar(ui, "HP:", hp, 120.0, 10.0, hp_color);
-
-                ui.separator();
-                ui.label(egui::RichText::new(&scene.strategy).italics().weak());
-
-                if let (Some(name), Some(hp_pct)) = (&scene.target_name, scene.target_hp_pct) {
-                    ui.separator();
-                    ui.label(format!("→ {} ({:.0}%)", name, hp_pct));
+                if ui.button("Reset all windows").clicked() {
+                    layout.reset_all(); ui.close_menu();
                 }
             });
-
-            // Row 2: Mana bar + XP bar + coordinates
-            ui.horizontal(|ui| {
-                stat_bar(ui, "Mana:",
-                    scene.player_mana_pct, 120.0, 8.0,
-                    egui::Color32::from_rgb(58, 120, 220),
-                );
-                ui.add_space(12.0);
-                stat_bar(ui, "XP:",
-                    scene.player_xp_pct, 200.0, 8.0,
-                    egui::Color32::from_rgb(200, 160, 40),
-                );
-                ui.add_space(12.0);
-                // scene.player_pos is [server_y=map_x, server_x=map_y, server_z] after GPU swap
-                let [sx, sy, sz] = scene.player_pos;
-                ui.label(egui::RichText::new(format!("map ({:.1}, {:.1}, {:.1})", sx, sy, sz))
-                    .weak()
-                    .monospace());
-            });
-
-            // Row 3: character stats (only once a player profile has arrived).
-            if scene.stats.iter().any(|&s| s != 0) {
-                let [str_, sta, cha, dex, int_, agi, wis] = scene.stats;
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(format!(
-                        "STR {}  STA {}  AGI {}  DEX {}  WIS {}  INT {}  CHA {}",
-                        str_, sta, agi, dex, wis, int_, cha))
-                        .weak().monospace());
-                });
-            }
         });
 }
 
@@ -238,44 +269,38 @@ pub fn nearest_npc_name(scene: &SceneState) -> Option<String> {
 /// Dedicated panel for NPC dialogue (kind "npc"), e.g. quest-giver responses to a hail.
 /// Bracketed [keywords] are highlighted and clickable — clicking one says it back so the
 /// player can follow a quest conversation without typing.
-pub fn draw_quest_dialogue(ctx: &egui::Context, scene: &SceneState, say: &crate::http::SayReq) {
+pub fn draw_quest_dialogue(ctx: &egui::Context, layout: &mut UiLayout, scene: &SceneState, say: &crate::http::SayReq) {
     let visible: Vec<_> = scene.messages.iter()
         .filter(|m| m.kind == "npc" && m.timestamp.elapsed().as_secs() < 45)
         .collect();
     if visible.is_empty() {
         return;
     }
-    egui::Window::new("NPC Dialogue")
-        .anchor(egui::Align2::CENTER_TOP, canvas_off(ctx, egui::Align2::CENTER_TOP, [0.0, 36.0]))
-        .resizable(false)
-        .collapsible(false)
-        .min_width(420.0)
-        .max_width(560.0)
-        .frame(egui::Frame::none()
-            .fill(egui::Color32::from_black_alpha(200))
-            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 150, 60)))
-            .inner_margin(egui::Margin::same(8.0)))
-        .show(ctx, |ui| {
-            for entry in &visible {
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    for (seg, is_kw) in split_keywords(&entry.text) {
-                        if is_kw {
-                            let label = egui::Label::new(egui::RichText::new(&seg).size(13.0)
-                                .strong().color(egui::Color32::from_rgb(255, 225, 90)))
-                                .sense(egui::Sense::click());
-                            if ui.add(label).on_hover_text("Click to say this keyword").clicked() {
-                                let kw = seg.trim_start_matches('[').trim_end_matches(']').to_string();
-                                *say.lock().unwrap() = Some(kw);
-                            }
-                        } else {
-                            ui.label(egui::RichText::new(&seg).size(13.0)
-                                .color(egui::Color32::from_rgb(225, 225, 205)));
+    let base = egui::Frame::none()
+        .fill(egui::Color32::from_black_alpha(200))
+        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 150, 60)))
+        .inner_margin(egui::Margin::same(8.0));
+    managed_window(ctx, layout, spec("npc_dialogue"), base, |ui| {
+        for entry in &visible {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                for (seg, is_kw) in split_keywords(&entry.text) {
+                    if is_kw {
+                        let label = egui::Label::new(egui::RichText::new(&seg).size(13.0)
+                            .strong().color(egui::Color32::from_rgb(255, 225, 90)))
+                            .sense(egui::Sense::click());
+                        if ui.add(label).on_hover_text("Click to say this keyword").clicked() {
+                            let kw = seg.trim_start_matches('[').trim_end_matches(']').to_string();
+                            *say.lock().unwrap() = Some(kw);
                         }
+                    } else {
+                        ui.label(egui::RichText::new(&seg).size(13.0)
+                            .color(egui::Color32::from_rgb(225, 225, 205)));
                     }
-                });
-            }
-        });
+                }
+            });
+        }
+    });
 }
 
 /// Titanium worn-equipment slot ids → display labels (0-21).
@@ -286,12 +311,12 @@ const WORN_SLOTS: [(i32, &str); 22] = [
     (17, "Chest"), (18, "Legs"), (19, "Feet"), (20, "Waist"), (21, "Ammo"),
 ];
 
-/// Inventory/equipment window + a toggle button (top-right). `show` is owned by the App (toggled
+/// Inventory/equipment window + a toggle button (top-left). `show` is owned by the App (toggled
 /// here or by the I key). Data comes from `scene.inventory` (decoded from OP_CharInventory).
-pub fn draw_inventory(ctx: &egui::Context, scene: &SceneState, show: &mut bool) {
-    // Top-left under the FPS counter, so it doesn't overlap the top-right minimap.
+pub fn draw_inventory(ctx: &egui::Context, layout: &mut UiLayout, scene: &SceneState, show: &mut bool) {
+    // Top-left under the UI menu, so it doesn't overlap it. Moved to [8.0, 60.0] (UI menu is at 34.0).
     egui::Area::new(egui::Id::new("inv_toggle"))
-        .anchor(egui::Align2::LEFT_TOP, canvas_off(ctx, egui::Align2::LEFT_TOP, [8.0, 34.0]))
+        .anchor(egui::Align2::LEFT_TOP, canvas_off(ctx, egui::Align2::LEFT_TOP, [8.0, 60.0]))
         .show(ctx, |ui| {
             if ui.button("🎒 Inventory (I)").clicked() {
                 *show = !*show;
@@ -300,104 +325,97 @@ pub fn draw_inventory(ctx: &egui::Context, scene: &SceneState, show: &mut bool) 
     if !*show {
         return;
     }
-    egui::Window::new("Inventory & Equipment")
-        .open(show)
-        .default_width(340.0)
-        .resizable(true)
-        .show(ctx, |ui| {
-            let inv = &scene.inventory;
-            ui.label(egui::RichText::new("Equipped").strong().size(14.0));
-            egui::Grid::new("equip_grid").num_columns(2).striped(true).show(ui, |ui| {
-                for (slot, label) in WORN_SLOTS {
-                    let item = inv.iter().find(|i| i.slot == slot);
-                    ui.label(label);
-                    match item {
-                        Some(i) => ui.label(egui::RichText::new(&i.name).color(egui::Color32::from_rgb(220, 220, 120))),
-                        None => ui.label(egui::RichText::new("—").weak()),
-                    };
-                    ui.end_row();
-                }
-            });
-            ui.separator();
-            ui.label(egui::RichText::new("Inventory").strong().size(14.0));
-            let mut bag: Vec<_> = inv.iter().filter(|i| i.slot >= 22).collect();
-            bag.sort_by_key(|i| i.slot);
-            if bag.is_empty() {
-                ui.label(egui::RichText::new("(empty)").weak());
-            }
-            for i in &bag {
-                let qty = if i.charges > 1 { format!(" x{}", i.charges) } else { String::new() };
-                ui.label(format!("• {}{}", i.name, qty));
-            }
-            ui.separator();
-            ui.label(format!("Coin: {}p {}g {}s {}c",
-                scene.coin[0], scene.coin[1], scene.coin[2], scene.coin[3]));
-            if inv.is_empty() {
-                ui.label(egui::RichText::new("(waiting for inventory from server…)").weak());
+    let base = egui::Frame::window(&ctx.style());
+    managed_window(ctx, layout, spec("inventory"), base, |ui| {
+        let inv = &scene.inventory;
+        ui.label(egui::RichText::new("Equipped").strong().size(14.0));
+        egui::Grid::new("equip_grid").num_columns(2).striped(true).show(ui, |ui| {
+            for (slot, label) in WORN_SLOTS {
+                let item = inv.iter().find(|i| i.slot == slot);
+                ui.label(label);
+                match item {
+                    Some(i) => ui.label(egui::RichText::new(&i.name).color(egui::Color32::from_rgb(220, 220, 120))),
+                    None => ui.label(egui::RichText::new("—").weak()),
+                };
+                ui.end_row();
             }
         });
+        ui.separator();
+        ui.label(egui::RichText::new("Inventory").strong().size(14.0));
+        let mut bag: Vec<_> = inv.iter().filter(|i| i.slot >= 22).collect();
+        bag.sort_by_key(|i| i.slot);
+        if bag.is_empty() {
+            ui.label(egui::RichText::new("(empty)").weak());
+        }
+        for i in &bag {
+            let qty = if i.charges > 1 { format!(" x{}", i.charges) } else { String::new() };
+            ui.label(format!("• {}{}", i.name, qty));
+        }
+        ui.separator();
+        ui.label(format!("Coin: {}p {}g {}s {}c",
+            scene.coin[0], scene.coin[1], scene.coin[2], scene.coin[3]));
+        if inv.is_empty() {
+            ui.label(egui::RichText::new("(waiting for inventory from server…)").weak());
+        }
+    });
 }
 
-/// Floating control bar (bottom-center): Hail the nearest NPC and a say box for
+/// Floating control bar (bottom-right): Hail the nearest NPC and a say box for
 /// chatting / quest replies. Buttons write shared request slots the nav thread drains.
 pub fn draw_control_bar(
     ctx:        &egui::Context,
+    layout:     &mut UiLayout,
     scene:      &SceneState,
     hail:       &crate::http::HailReq,
     say:        &crate::http::SayReq,
     target:     &crate::http::TargetReq,
     say_buffer: &mut String,
 ) {
-    egui::Window::new("##controls")
-        .title_bar(false)
-        .resizable(false)
-        .collapsible(false)
-        // Bottom-right so it tiles beside the bottom-left status bar instead of overlapping it.
-        .anchor(egui::Align2::RIGHT_BOTTOM, canvas_off(ctx, egui::Align2::RIGHT_BOTTOM, [-8.0, -8.0]))
-        .frame(egui::Frame::none()
-            .fill(egui::Color32::from_black_alpha(170))
-            .inner_margin(egui::Margin::symmetric(8.0, 4.0)))
-        .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                // Resolve the nearest NPC once (id for targeting, clean name for labels).
-                let nearest = nearest_npc(scene)
-                    .map(|b| (b.id, crate::http::clean_entity_name(&b.name)));
+    let base = egui::Frame::none()
+        .fill(egui::Color32::from_black_alpha(170))
+        .inner_margin(egui::Margin::symmetric(8.0, 4.0));
+    managed_window(ctx, layout, spec("control_bar"), base, |ui| {
+        ui.horizontal(|ui| {
+            // Resolve the nearest NPC once (id for targeting, clean name for labels).
+            let nearest = nearest_npc(scene)
+                .map(|b| (b.id, crate::http::clean_entity_name(&b.name)));
 
-                // Target nearest → OP_TargetCommand + auto-consider.
-                if ui.add_enabled(nearest.is_some(), egui::Button::new("Target nearest")).clicked() {
-                    if let Some((id, _)) = &nearest {
-                        *target.lock().unwrap() = Some(*id);
-                    }
+            // Target nearest → OP_TargetCommand + auto-consider.
+            if ui.add_enabled(nearest.is_some(), egui::Button::new("Target nearest")).clicked() {
+                if let Some((id, _)) = &nearest {
+                    *target.lock().unwrap() = Some(*id);
                 }
+            }
 
-                let hail_label = match &nearest {
-                    Some((_, n)) => format!("Hail {}", n),
-                    None => "Hail nearest".to_string(),
-                };
-                if ui.add_enabled(nearest.is_some(), egui::Button::new(hail_label)).clicked() {
-                    if let Some((_, n)) = nearest {
-                        *hail.lock().unwrap() = Some(n);
-                    }
+            let hail_label = match &nearest {
+                Some((_, n)) => format!("Hail {}", n),
+                None => "Hail nearest".to_string(),
+            };
+            if ui.add_enabled(nearest.is_some(), egui::Button::new(hail_label)).clicked() {
+                if let Some((_, n)) = nearest {
+                    *hail.lock().unwrap() = Some(n);
                 }
-                ui.separator();
-                ui.label("Say:");
-                let resp = ui.add(egui::TextEdit::singleline(say_buffer)
-                    .id(egui::Id::new("say_box"))   // stable ID so focus persists across frames
-                    .desired_width(260.0)
-                    .hint_text("message / quest keyword"));
-                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                if (ui.button("Send").clicked() || enter) && !say_buffer.trim().is_empty() {
-                    *say.lock().unwrap() = Some(say_buffer.trim().to_string());
-                    say_buffer.clear();
-                }
-            });
+            }
+            ui.separator();
+            ui.label("Say:");
+            let resp = ui.add(egui::TextEdit::singleline(say_buffer)
+                .id(egui::Id::new("say_box"))   // stable ID so focus persists across frames
+                .desired_width(260.0)
+                .hint_text("message / quest keyword"));
+            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if (ui.button("Send").clicked() || enter) && !say_buffer.trim().is_empty() {
+                *say.lock().unwrap() = Some(say_buffer.trim().to_string());
+                say_buffer.clear();
+            }
         });
+    });
 }
 
 /// Bottom-center action grid: attack toggle, sit/stand toggle, target/consider, and the 9
 /// memorized spell gems. Buttons write the same request slots the HTTP API uses.
 pub fn draw_action_grid(
     ctx:      &egui::Context,
+    layout:   &mut UiLayout,
     scene:    &SceneState,
     spells:   &crate::spells::SpellDb,
     icons:    &[egui::TextureHandle],
@@ -407,83 +425,80 @@ pub fn draw_action_grid(
     target:   &crate::http::TargetReq,
     consider: &crate::http::ConsiderReq,
 ) {
-    egui::Window::new("##actiongrid")
-        .title_bar(false).resizable(false).collapsible(false)
-        .anchor(egui::Align2::CENTER_BOTTOM, canvas_off(ctx, egui::Align2::CENTER_BOTTOM, [0.0, -8.0]))
-        .frame(egui::Frame::none()
-            .fill(egui::Color32::from_black_alpha(170))
-            .inner_margin(egui::Margin::symmetric(8.0, 4.0)))
-        .show(ctx, |ui| {
-            if let Some(c) = &scene.casting {
-                let frac = (c.started.elapsed().as_secs_f32()
-                    / (c.cast_ms.max(1) as f32 / 1000.0)).clamp(0.0, 1.0);
-                let label = spells.get(c.spell_id).map(|s| s.name.clone())
-                    .unwrap_or_else(|| format!("Spell {}", c.spell_id));
-                ui.add(egui::ProgressBar::new(frac).text(format!("Casting {label}")));
+    let base = egui::Frame::none()
+        .fill(egui::Color32::from_black_alpha(170))
+        .inner_margin(egui::Margin::symmetric(8.0, 4.0));
+    managed_window(ctx, layout, spec("action_grid"), base, |ui| {
+        if let Some(c) = &scene.casting {
+            let frac = (c.started.elapsed().as_secs_f32()
+                / (c.cast_ms.max(1) as f32 / 1000.0)).clamp(0.0, 1.0);
+            let label = spells.get(c.spell_id).map(|s| s.name.clone())
+                .unwrap_or_else(|| format!("Spell {}", c.spell_id));
+            ui.add(egui::ProgressBar::new(frac).text(format!("Casting {label}")));
+        }
+        ui.horizontal(|ui| {
+            let atk = egui::Button::new("\u{2694} Attack")
+                .fill(if scene.auto_attack { egui::Color32::from_rgb(150, 40, 40) }
+                      else { egui::Color32::from_gray(50) });
+            if ui.add(atk).clicked() {
+                *attack.lock().unwrap() = Some(!scene.auto_attack);
             }
-            ui.horizontal(|ui| {
-                let atk = egui::Button::new("\u{2694} Attack")
-                    .fill(if scene.auto_attack { egui::Color32::from_rgb(150, 40, 40) }
-                          else { egui::Color32::from_gray(50) });
-                if ui.add(atk).clicked() {
-                    *attack.lock().unwrap() = Some(!scene.auto_attack);
-                }
-                let sit_label = if scene.sitting { "Stand" } else { "Sit" };
-                if ui.button(sit_label).clicked() {
-                    *sit.lock().unwrap() = Some(!scene.sitting);
-                }
-                let nearest = nearest_npc(scene).map(|b| b.id);
-                if ui.add_enabled(nearest.is_some(), egui::Button::new("Target")).clicked() {
-                    if let Some(id) = nearest { *target.lock().unwrap() = Some(id); }
-                }
-                if ui.add_enabled(scene.target_id.is_some(), egui::Button::new("Con")).clicked() {
-                    if let Some(id) = scene.target_id { *consider.lock().unwrap() = Some(id); }
-                }
-            });
-            ui.horizontal(|ui| {
-                for (gem, &spell_id) in scene.mem_spells.iter().enumerate() {
-                    let empty = spell_id == 0 || spell_id == 0xFFFF_FFFF;
-                    // Icon path: non-empty gem + a loaded sheet for this spell's icon.
-                    if !empty {
-                        if let Some(info) = spells.get(spell_id) {
-                            let (sheet, col, row) = crate::spells::icon_cell(info.icon_id);
-                            if let Some(tex) = icons.get(sheet) {
-                                let cw = 1.0 / crate::spells::ICON_COLS as f32;
-                                let ch = 1.0 / crate::spells::ICON_ROWS as f32;
-                                let uv = egui::Rect::from_min_size(
-                                    egui::pos2(col as f32 * cw, row as f32 * ch),
-                                    egui::vec2(cw, ch));
-                                let img = egui::Image::new(egui::load::SizedTexture::from_handle(tex))
-                                    .uv(uv)
-                                    .fit_to_exact_size(egui::vec2(36.0, 36.0));
-                                let resp = ui.add(egui::ImageButton::new(img))
-                                    .on_hover_text(&info.name);
-                                if resp.clicked() {
-                                    *cast.lock().unwrap() = Some(crate::http::CastRequest {
-                                        gem: gem as u8, target_id: None,
-                                    });
-                                }
-                                continue;
+            let sit_label = if scene.sitting { "Stand" } else { "Sit" };
+            if ui.button(sit_label).clicked() {
+                *sit.lock().unwrap() = Some(!scene.sitting);
+            }
+            let nearest = nearest_npc(scene).map(|b| b.id);
+            if ui.add_enabled(nearest.is_some(), egui::Button::new("Target")).clicked() {
+                if let Some(id) = nearest { *target.lock().unwrap() = Some(id); }
+            }
+            if ui.add_enabled(scene.target_id.is_some(), egui::Button::new("Con")).clicked() {
+                if let Some(id) = scene.target_id { *consider.lock().unwrap() = Some(id); }
+            }
+        });
+        ui.horizontal(|ui| {
+            for (gem, &spell_id) in scene.mem_spells.iter().enumerate() {
+                let empty = spell_id == 0 || spell_id == 0xFFFF_FFFF;
+                // Icon path: non-empty gem + a loaded sheet for this spell's icon.
+                if !empty {
+                    if let Some(info) = spells.get(spell_id) {
+                        let (sheet, col, row) = crate::spells::icon_cell(info.icon_id);
+                        if let Some(tex) = icons.get(sheet) {
+                            let cw = 1.0 / crate::spells::ICON_COLS as f32;
+                            let ch = 1.0 / crate::spells::ICON_ROWS as f32;
+                            let uv = egui::Rect::from_min_size(
+                                egui::pos2(col as f32 * cw, row as f32 * ch),
+                                egui::vec2(cw, ch));
+                            let img = egui::Image::new(egui::load::SizedTexture::from_handle(tex))
+                                .uv(uv)
+                                .fit_to_exact_size(egui::vec2(36.0, 36.0));
+                            let resp = ui.add(egui::ImageButton::new(img))
+                                .on_hover_text(&info.name);
+                            if resp.clicked() {
+                                *cast.lock().unwrap() = Some(crate::http::CastRequest {
+                                    gem: gem as u8, target_id: None,
+                                });
                             }
+                            continue;
                         }
                     }
-                    // Text fallback: empty gem, or no icon sheet loaded.
-                    let label = if empty { "\u{2014}".to_string() }
-                        else { spells.get(spell_id).map(|s| s.name.clone())
-                                 .unwrap_or_else(|| format!("{spell_id}")) };
-                    let btn = egui::Button::new(egui::RichText::new(label).size(11.0))
-                        .min_size(egui::vec2(56.0, 28.0));
-                    if ui.add_enabled(!empty, btn).clicked() {
-                        *cast.lock().unwrap() = Some(crate::http::CastRequest {
-                            gem: gem as u8, target_id: None,
-                        });
-                    }
                 }
-            });
+                // Text fallback: empty gem, or no icon sheet loaded.
+                let label = if empty { "\u{2014}".to_string() }
+                    else { spells.get(spell_id).map(|s| s.name.clone())
+                             .unwrap_or_else(|| format!("{spell_id}")) };
+                let btn = egui::Button::new(egui::RichText::new(label).size(11.0))
+                    .min_size(egui::vec2(56.0, 28.0));
+                if ui.add_enabled(!empty, btn).clicked() {
+                    *cast.lock().unwrap() = Some(crate::http::CastRequest {
+                        gem: gem as u8, target_id: None,
+                    });
+                }
+            }
         });
+    });
 }
 
-pub fn draw_message_log(ctx: &egui::Context, scene: &SceneState) {
+pub fn draw_message_log(ctx: &egui::Context, layout: &mut UiLayout, scene: &SceneState) {
     let visible: Vec<_> = scene.messages.iter()
         // NPC dialogue has its own panel (draw_quest_dialogue); keep it out of here.
         .filter(|m| m.kind != "npc" && m.timestamp.elapsed().as_secs() < 30)
@@ -492,33 +507,27 @@ pub fn draw_message_log(ctx: &egui::Context, scene: &SceneState) {
         return;
     }
 
-    egui::Window::new("##msglog")
-        .title_bar(false)
-        .anchor(egui::Align2::LEFT_BOTTOM, canvas_off(ctx, egui::Align2::LEFT_BOTTOM, [0.0, -60.0]))  // just above the HUD
-        .resizable(false)
-        .collapsible(false)
-        .min_width(480.0)
-        .max_width(640.0)
-        .frame(egui::Frame::none()
-            .fill(egui::Color32::TRANSPARENT)
-            .inner_margin(egui::Margin::same(4.0)))
-        .show(ctx, |ui| {
-            ui.spacing_mut().item_spacing.y = 1.0;
-            for entry in &visible {
-                let color = match entry.kind.as_str() {
-                    "combat"  => egui::Color32::from_rgb(220, 110, 110),
-                    "zone"    => egui::Color32::from_rgb(160, 160, 160),
-                    "exp"     => egui::Color32::from_rgb(220, 175,  40),
-                    "chat"    => egui::Color32::from_rgb(210, 210, 255),
-                    _         => egui::Color32::from_rgb(200, 200, 200),
-                };
-                ui.label(egui::RichText::new(&entry.text).size(11.0).color(color));
-            }
-        });
+    let base = egui::Frame::none()
+        .fill(egui::Color32::TRANSPARENT)
+        .inner_margin(egui::Margin::same(4.0));
+    managed_window(ctx, layout, spec("message_log"), base, |ui| {
+        ui.spacing_mut().item_spacing.y = 1.0;
+        for entry in &visible {
+            let color = match entry.kind.as_str() {
+                "combat"  => egui::Color32::from_rgb(220, 110, 110),
+                "zone"    => egui::Color32::from_rgb(160, 160, 160),
+                "exp"     => egui::Color32::from_rgb(220, 175,  40),
+                "chat"    => egui::Color32::from_rgb(210, 210, 255),
+                _         => egui::Color32::from_rgb(200, 200, 200),
+            };
+            ui.label(egui::RichText::new(&entry.text).size(11.0).color(color));
+        }
+    });
 }
 
 pub fn draw_minimap(
     ctx:          &egui::Context,
+    layout:       &mut UiLayout,
     scene:        &SceneState,
     zone_min:     [f32; 2],  // [min_east, min_north] in map coords
     zone_max:     [f32; 2],  // [max_east, max_north] in map coords
@@ -536,146 +545,247 @@ pub fn draw_minimap(
     let map_py = if *fullscreen { 580.0_f32 } else { 200.0_f32 };
     let map_size = egui::Vec2::new(map_px, map_py);
 
-    let (anchor, offset) = if *fullscreen {
-        (egui::Align2::CENTER_CENTER, [0.0_f32, 0.0_f32])
-    } else {
-        (egui::Align2::RIGHT_TOP, [-10.0, 10.0])
-    };
+    // Fullscreen: use a NON-managed centered window (not draggable/persisted)
+    if *fullscreen {
+        let offset = canvas_off(ctx, egui::Align2::CENTER_CENTER, [0.0_f32, 0.0_f32]);
+        egui::Window::new("##minimap_full")
+            .title_bar(false)
+            .anchor(egui::Align2::CENTER_CENTER, offset)
+            .resizable(false)
+            .collapsible(false)
+            .frame(egui::Frame::none())
+            .show(ctx, |ui| {
+                let (resp, painter) = ui.allocate_painter(map_size, egui::Sense::click());
+                let rect = resp.rect;
 
-    let offset = canvas_off(ctx, anchor, offset);
-    egui::Window::new("##minimap")
-        .title_bar(false)
-        .anchor(anchor, offset)
-        .resizable(false)
-        .collapsible(false)
-        .frame(egui::Frame::none())
-        .show(ctx, |ui| {
-            let (resp, painter) = ui.allocate_painter(map_size, egui::Sense::click());
-            let rect = resp.rect;
-
-            // Scroll to zoom (only when hovered)
-            if resp.hovered() {
-                let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-                if scroll.abs() > 0.5 {
-                    *zoom = (*zoom * (1.0 + scroll * 0.005)).clamp(0.25, 8.0);
+                if resp.hovered() {
+                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                    if scroll.abs() > 0.5 {
+                        *zoom = (*zoom * (1.0 + scroll * 0.005)).clamp(0.25, 8.0);
+                    }
                 }
-            }
 
-            if resp.clicked() {
-                *fullscreen = !*fullscreen;
-            }
-
-            // Dark background
-            painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(210));
-
-            // Compute view extents: centre on player, scaled by zoom
-            let view_w = zone_w / *zoom;
-            let view_h = zone_h / *zoom;
-            let half_w = view_w * 0.5;
-            let half_h = view_h * 0.5;
-            // Guard: when zone not yet loaded (min==max==0), the clamp bounds would
-            // be inverted (min > max), causing a panic. Fall back to centering on player.
-            let cx = if zone_min[0] + half_w <= zone_max[0] - half_w {
-                player_map[0].clamp(zone_min[0] + half_w, zone_max[0] - half_w)
-            } else {
-                player_map[0]
-            };
-            let cy = if zone_min[1] + half_h <= zone_max[1] - half_h {
-                player_map[1].clamp(zone_min[1] + half_h, zone_max[1] - half_h)
-            } else {
-                player_map[1]
-            };
-            let view_left  = cx - half_w;
-            let view_bot   = cy - half_h;
-
-            // Map coord → screen pos.
-            // East (+) → right, North (+) → up (flip Y for screen).
-            let to_screen = |east: f32, north: f32| -> egui::Pos2 {
-                let nx = (east  - view_left) / view_w;
-                let ny = (north - view_bot)  / view_h;
-                egui::pos2(
-                    rect.min.x + nx * rect.width(),
-                    rect.max.y - ny * rect.height(),
-                )
-            };
-
-            // EQ zone map lines
-            if let Some(zm) = zone_map {
-                for line in &zm.lines {
-                    let p1 = to_screen(line.east1, line.north1);
-                    let p2 = to_screen(line.east2, line.north2);
-                    // Skip lines completely outside the view rect (both endpoints out)
-                    if !rect.contains(p1) && !rect.contains(p2) { continue; }
-                    let color = egui::Color32::from_rgba_unmultiplied(
-                        line.r, line.g, line.b, 180,
-                    );
-                    painter.line_segment([p1, p2], egui::Stroke::new(0.8, color));
+                if resp.clicked() {
+                    *fullscreen = !*fullscreen;
                 }
-            }
 
-            // Zone border grid tick marks (every 100 units)
-            let tick_stroke = egui::Stroke::new(0.5, egui::Color32::from_white_alpha(20));
-            let step = 100.0_f32;
-            let x_start = (view_left / step).ceil() * step;
-            let mut gx = x_start;
-            while gx <= view_left + view_w {
-                let sp = to_screen(gx, view_bot);
-                let ep = to_screen(gx, view_bot + view_h);
-                painter.line_segment([sp, ep], tick_stroke);
-                gx += step;
-            }
-            let y_start = (view_bot / step).ceil() * step;
-            let mut gy = y_start;
-            while gy <= view_bot + view_h {
-                let sp = to_screen(view_left, gy);
-                let ep = to_screen(view_left + view_w, gy);
-                painter.line_segment([sp, ep], tick_stroke);
-                gy += step;
-            }
+                painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(210));
 
-            // Entity dots — billboard.pos = [east, north, height] in GPU space.
-            for b in &scene.billboards {
-                let sp = to_screen(b.pos[0], b.pos[1]);
-                if !rect.contains(sp) { continue; }
-                let color = if b.dead {
-                    egui::Color32::from_rgb(80, 80, 80)
-                } else if b.is_target {
-                    egui::Color32::from_rgb(255, 80, 80)
+                let view_w = zone_w / *zoom;
+                let view_h = zone_h / *zoom;
+                let half_w = view_w * 0.5;
+                let half_h = view_h * 0.5;
+                let cx = if zone_min[0] + half_w <= zone_max[0] - half_w {
+                    player_map[0].clamp(zone_min[0] + half_w, zone_max[0] - half_w)
                 } else {
-                    egui::Color32::from_rgb(200, 100, 60)
+                    player_map[0]
                 };
-                let r = if *fullscreen { 4.0 } else { 3.0 };
-                painter.circle_filled(sp, r, color);
-            }
+                let cy = if zone_min[1] + half_h <= zone_max[1] - half_h {
+                    player_map[1].clamp(zone_min[1] + half_h, zone_max[1] - half_h)
+                } else {
+                    player_map[1]
+                };
+                let view_left  = cx - half_w;
+                let view_bot   = cy - half_h;
 
-            // Player dot + heading arrow
-            let pp = to_screen(player_map[0], player_map[1]);
-            painter.circle_filled(pp, if *fullscreen { 6.0 } else { 5.0 }, egui::Color32::from_rgb(80, 180, 255));
+                let to_screen = |east: f32, north: f32| -> egui::Pos2 {
+                    let nx = (east  - view_left) / view_w;
+                    let ny = (north - view_bot)  / view_h;
+                    egui::pos2(
+                        rect.min.x + nx * rect.width(),
+                        rect.max.y - ny * rect.height(),
+                    )
+                };
 
-            // EQ heading: 0 = north, clockwise. Screen: north = up (−screen_y).
-            let hr = scene.player_heading.to_radians();
-            let arrow_len = if *fullscreen { 16.0 } else { 10.0 };
-            let arrow_tip = egui::pos2(
-                pp.x + hr.sin() * arrow_len,
-                pp.y - hr.cos() * arrow_len,
-            );
-            painter.line_segment(
-                [pp, arrow_tip],
-                egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 180, 255)),
-            );
+                if let Some(zm) = zone_map {
+                    for line in &zm.lines {
+                        let p1 = to_screen(line.east1, line.north1);
+                        let p2 = to_screen(line.east2, line.north2);
+                        if !rect.contains(p1) && !rect.contains(p2) { continue; }
+                        let color = egui::Color32::from_rgba_unmultiplied(
+                            line.r, line.g, line.b, 180,
+                        );
+                        painter.line_segment([p1, p2], egui::Stroke::new(0.8, color));
+                    }
+                }
 
-            // Border + hint
-            painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 90, 120)));
-            if !*fullscreen {
-                painter.text(
-                    egui::pos2(rect.min.x + 4.0, rect.max.y - 14.0),
-                    egui::Align2::LEFT_BOTTOM,
-                    "scroll=zoom  click=fullscreen",
-                    egui::FontId::proportional(9.0),
-                    egui::Color32::from_white_alpha(80),
+                let tick_stroke = egui::Stroke::new(0.5, egui::Color32::from_white_alpha(20));
+                let step = 100.0_f32;
+                let x_start = (view_left / step).ceil() * step;
+                let mut gx = x_start;
+                while gx <= view_left + view_w {
+                    let sp = to_screen(gx, view_bot);
+                    let ep = to_screen(gx, view_bot + view_h);
+                    painter.line_segment([sp, ep], tick_stroke);
+                    gx += step;
+                }
+                let y_start = (view_bot / step).ceil() * step;
+                let mut gy = y_start;
+                while gy <= view_bot + view_h {
+                    let sp = to_screen(view_left, gy);
+                    let ep = to_screen(view_left + view_w, gy);
+                    painter.line_segment([sp, ep], tick_stroke);
+                    gy += step;
+                }
+
+                for b in &scene.billboards {
+                    let sp = to_screen(b.pos[0], b.pos[1]);
+                    if !rect.contains(sp) { continue; }
+                    let color = if b.dead {
+                        egui::Color32::from_rgb(80, 80, 80)
+                    } else if b.is_target {
+                        egui::Color32::from_rgb(255, 80, 80)
+                    } else {
+                        egui::Color32::from_rgb(200, 100, 60)
+                    };
+                    painter.circle_filled(sp, 4.0, color);
+                }
+
+                let pp = to_screen(player_map[0], player_map[1]);
+                painter.circle_filled(pp, 6.0, egui::Color32::from_rgb(80, 180, 255));
+
+                let hr = scene.player_heading.to_radians();
+                let arrow_len = 16.0;
+                let arrow_tip = egui::pos2(
+                    pp.x + hr.sin() * arrow_len,
+                    pp.y - hr.cos() * arrow_len,
                 );
+                painter.line_segment(
+                    [pp, arrow_tip],
+                    egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 180, 255)),
+                );
+
+                painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 90, 120)));
+            });
+        return;
+    }
+
+    // Small map: route through managed_window
+    let base = egui::Frame::none();
+    managed_window(ctx, layout, spec("minimap"), base, |ui| {
+        let (resp, painter) = ui.allocate_painter(map_size, egui::Sense::click());
+        let rect = resp.rect;
+
+        // Scroll to zoom (only when hovered)
+        if resp.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll.abs() > 0.5 {
+                *zoom = (*zoom * (1.0 + scroll * 0.005)).clamp(0.25, 8.0);
             }
-        });
+        }
+
+        if resp.clicked() {
+            *fullscreen = !*fullscreen;
+        }
+
+        // Dark background
+        painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(210));
+
+        // Compute view extents: centre on player, scaled by zoom
+        let view_w = zone_w / *zoom;
+        let view_h = zone_h / *zoom;
+        let half_w = view_w * 0.5;
+        let half_h = view_h * 0.5;
+        // Guard: when zone not yet loaded (min==max==0), the clamp bounds would
+        // be inverted (min > max), causing a panic. Fall back to centering on player.
+        let cx = if zone_min[0] + half_w <= zone_max[0] - half_w {
+            player_map[0].clamp(zone_min[0] + half_w, zone_max[0] - half_w)
+        } else {
+            player_map[0]
+        };
+        let cy = if zone_min[1] + half_h <= zone_max[1] - half_h {
+            player_map[1].clamp(zone_min[1] + half_h, zone_max[1] - half_h)
+        } else {
+            player_map[1]
+        };
+        let view_left  = cx - half_w;
+        let view_bot   = cy - half_h;
+
+        // Map coord → screen pos.
+        // East (+) → right, North (+) → up (flip Y for screen).
+        let to_screen = |east: f32, north: f32| -> egui::Pos2 {
+            let nx = (east  - view_left) / view_w;
+            let ny = (north - view_bot)  / view_h;
+            egui::pos2(
+                rect.min.x + nx * rect.width(),
+                rect.max.y - ny * rect.height(),
+            )
+        };
+
+        // EQ zone map lines
+        if let Some(zm) = zone_map {
+            for line in &zm.lines {
+                let p1 = to_screen(line.east1, line.north1);
+                let p2 = to_screen(line.east2, line.north2);
+                // Skip lines completely outside the view rect (both endpoints out)
+                if !rect.contains(p1) && !rect.contains(p2) { continue; }
+                let color = egui::Color32::from_rgba_unmultiplied(
+                    line.r, line.g, line.b, 180,
+                );
+                painter.line_segment([p1, p2], egui::Stroke::new(0.8, color));
+            }
+        }
+
+        // Zone border grid tick marks (every 100 units)
+        let tick_stroke = egui::Stroke::new(0.5, egui::Color32::from_white_alpha(20));
+        let step = 100.0_f32;
+        let x_start = (view_left / step).ceil() * step;
+        let mut gx = x_start;
+        while gx <= view_left + view_w {
+            let sp = to_screen(gx, view_bot);
+            let ep = to_screen(gx, view_bot + view_h);
+            painter.line_segment([sp, ep], tick_stroke);
+            gx += step;
+        }
+        let y_start = (view_bot / step).ceil() * step;
+        let mut gy = y_start;
+        while gy <= view_bot + view_h {
+            let sp = to_screen(view_left, gy);
+            let ep = to_screen(view_left + view_w, gy);
+            painter.line_segment([sp, ep], tick_stroke);
+            gy += step;
+        }
+
+        // Entity dots — billboard.pos = [east, north, height] in GPU space.
+        for b in &scene.billboards {
+            let sp = to_screen(b.pos[0], b.pos[1]);
+            if !rect.contains(sp) { continue; }
+            let color = if b.dead {
+                egui::Color32::from_rgb(80, 80, 80)
+            } else if b.is_target {
+                egui::Color32::from_rgb(255, 80, 80)
+            } else {
+                egui::Color32::from_rgb(200, 100, 60)
+            };
+            painter.circle_filled(sp, 3.0, color);
+        }
+
+        // Player dot + heading arrow
+        let pp = to_screen(player_map[0], player_map[1]);
+        painter.circle_filled(pp, 5.0, egui::Color32::from_rgb(80, 180, 255));
+
+        // EQ heading: 0 = north, clockwise. Screen: north = up (−screen_y).
+        let hr = scene.player_heading.to_radians();
+        let arrow_len = 10.0;
+        let arrow_tip = egui::pos2(
+            pp.x + hr.sin() * arrow_len,
+            pp.y - hr.cos() * arrow_len,
+        );
+        painter.line_segment(
+            [pp, arrow_tip],
+            egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 180, 255)),
+        );
+
+        // Border + hint
+        painter.rect_stroke(rect, 4.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 90, 120)));
+        painter.text(
+            egui::pos2(rect.min.x + 4.0, rect.max.y - 14.0),
+            egui::Align2::LEFT_BOTTOM,
+            "scroll=zoom  click=fullscreen",
+            egui::FontId::proportional(9.0),
+            egui::Color32::from_white_alpha(80),
+        );
+    });
 }
 
 pub fn draw_debug_overlay(
@@ -888,5 +998,22 @@ mod tests {
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             draw_labels(ctx, &make_scene(), identity, 800, 600, [0.0, 0.0, 0.0], None);
         });
+    }
+
+    #[test]
+    fn managed_hud_windows_do_not_panic() {
+        let ctx = egui::Context::default();
+        let scene = make_scene();
+        for locked in [false, true] {
+            let mut layout = crate::ui_layout::UiLayout::from_path(
+                std::env::temp_dir().join(format!("ui_layout___hud_smoke_{locked}.json")));
+            layout.locked = locked;
+            let say: crate::http::SayReq = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                draw_hud(ctx, &mut layout, &scene, "x");
+                draw_message_log(ctx, &mut layout, &scene);
+                draw_quest_dialogue(ctx, &mut layout, &scene, &say);
+            });
+        }
     }
 }
