@@ -140,6 +140,7 @@ fn main() {
     let app_sit     = sit.clone();
     let app_consider = consider.clone();
     let app_spells  = spells.clone();
+    let app_door_click = door_click.clone();
     let app_player_info = player_info.clone();
     http::spawn_camera_server(
         camera_cmd.clone(),
@@ -191,6 +192,7 @@ fn main() {
         app_sit,
         app_consider,
         app_spells,
+        app_door_click,
         shared_collision,
         app_player_info,
         warp,
