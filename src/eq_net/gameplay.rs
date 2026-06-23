@@ -42,6 +42,7 @@ pub async fn run_gameplay_phase(
             navigator.sync_entities(&gs);
             navigator.sync_zone_points(&gs);
             navigator.sync_tasks(&gs);
+            navigator.sync_inventory(&gs);
             let _ = app_tx.send(packet.clone());
 
             match packet.opcode {

@@ -56,6 +56,8 @@ fn main() {
     let buy:              http::BuyReq          = Arc::new(Mutex::new(None));
     let move_req:         http::MoveReq         = Arc::new(Mutex::new(None));
     let give:             http::GiveReq         = Arc::new(Mutex::new(None));
+    let inventory:        http::InventoryShared = Arc::new(Mutex::new(Vec::new()));
+    let loot:             http::LootReq         = Arc::new(Mutex::new(None));
     let shared_collision: assets::SharedCollision = Arc::new(std::sync::RwLock::new(None));
     let frame_req:        http::FrameReq        = Arc::new(Mutex::new(None));
     let player_info:      http::PlayerInfo      = Arc::new(Mutex::new(http::PlayerState::default()));
@@ -76,12 +78,14 @@ fn main() {
         let by  = buy.clone();
         let mv  = move_req.clone();
         let gv  = give.clone();
+        let iv  = inventory.clone();
+        let lt  = loot.clone();
         let sc  = shared_collision.clone();
         let md  = app_cfg.assets_path.join("maps");
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, zc, hl, sy, tg, at, by, mv, gv, sc, md).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, zc, hl, sy, tg, at, by, mv, gv, iv, lt, sc, md).await {
                     eprintln!("EQ: fatal: {e}");
                 }
             });
@@ -111,6 +115,8 @@ fn main() {
         buy,
         move_req,
         give,
+        inventory,
+        loot,
         player_info,
         task_log,
         app_cfg.http_port,
