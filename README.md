@@ -20,6 +20,45 @@ GUI child processes. Logs go to `/tmp/eq_client.log`. Server/credentials live in
 
 Offline asset/zone debugging (no server): `./target/release/eq_renderer --testzone`.
 
+### Choosing which character logs in
+
+The account + character to log in as is **not** a CLI name argument — it comes from the login
+config file. Pass it with `--config`:
+
+```sh
+./target/release/eq_renderer --config config-durgan.yaml   # logs in as character "Durgan"
+```
+
+With no `--config`, the client loads `~/git/eq-client-ref/config.yaml` (the default, character
+"Claude"). Each `config-<name>.yaml` in the repo root sets its own `account.username`,
+`account.password`, and `account.character_name` — for example `config-durgan.yaml` →
+`character_name: Durgan`. To run a different character, copy one of these files, edit those three
+fields (the account/character must already exist on the EQEmu server), and pass it to `--config`.
+
+```sh
+ls config-*.yaml      # available login profiles
+grep character_name config-*.yaml
+```
+
+### Launching from inside an agent harness (no interactive terminal)
+
+`dev-run.sh` assumes its own terminal. If you must launch from a Bash tool call (where the harness
+reaps GUI children), detach with `setsid` so the process survives, then read the printed
+`API_PORT=` line:
+
+```sh
+setsid bash -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 \
+  exec ./target/release/eq_renderer --config config-durgan.yaml' \
+  > /tmp/eq_durgan.log 2>&1 < /dev/null &
+disown
+sleep 12
+PORT=$(grep -m1 -oP 'API_PORT=\K[0-9]+' /tmp/eq_durgan.log)   # do not hardcode 8765
+grep -E "entering world as|sent ReqClientSpawn" /tmp/eq_durgan.log   # confirm zone-in
+```
+
+Requires the local EQEmu server (login `127.0.0.1:5998`) and a running X/Wayland session on
+display `:0`.
+
 ## Running multiple instances at once
 
 The client supports **several instances side by side** — e.g. one per git worktree, so multiple
