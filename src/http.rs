@@ -122,6 +122,9 @@ pub type ZoneInfo = Arc<Mutex<(String, u16)>>;
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct PlayerState {
     pub zone:         String,
+    pub race:         String, // 3-letter race code, e.g. "ELF" (Wood Elf)
+    pub class:        String, // class name, e.g. "Cleric"
+    pub level:        u32,
     pub pos_east:     f32,
     pub pos_north:    f32,
     pub pos_up:       f32,
@@ -873,6 +876,9 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "player": {
             "zone":       player.zone,
+            "race":       player.race,
+            "class":      player.class,
+            "level":      player.level,
             "pos":        [player.pos_east, player.pos_north, player.pos_up],
             "heading_ccw": player.heading_ccw,
             "heading_cw":  player.heading_cw,
