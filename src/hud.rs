@@ -813,7 +813,7 @@ pub fn draw_debug_overlay(
         });
 }
 
-pub fn draw_loading(ctx: &egui::Context, zone: &str, status: &str) {
+pub fn draw_loading(ctx: &egui::Context, zone: &str, status: &str, progress: Option<f32>) {
     egui::Area::new(egui::Id::new("loading"))
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .show(ctx, |ui| {
@@ -826,6 +826,11 @@ pub fn draw_loading(ctx: &egui::Context, zone: &str, status: &str) {
                     ui.label(egui::RichText::new(status)
                         .size(16.0)
                         .color(egui::Color32::from_gray(200)));
+                }
+                if let Some(frac) = progress {
+                    ui.add_space(8.0);
+                    ui.add(egui::ProgressBar::new(frac.clamp(0.0, 1.0))
+                        .desired_width(260.0));
                 }
             });
         });
