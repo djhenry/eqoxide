@@ -21,6 +21,10 @@ pub struct Pipelines {
     pub billboard: wgpu::RenderPipeline,
     pub character: wgpu::RenderPipeline,
     pub skinned:   wgpu::RenderPipeline,
+    /// Second-pass variant of `skinned` for the cloth/armor overlay layer: same shader, but
+    /// depth_compare = LessEqual and depth_write = false so the alpha-blended overlay composites
+    /// on top of the already-drawn opaque skin base at the same depth (Luclin two-layer body art).
+    pub skinned_overlay: wgpu::RenderPipeline,
 }
 
 /// Create the three bind group layouts used across all pipelines.
@@ -270,7 +274,7 @@ pub fn build_pipelines(
         layout: Some(&skinned_layout),
         vertex: wgpu::VertexState {
             module: &skinned_shader, entry_point: "vs_main",
-            buffers: &[skinned_vbl], compilation_options: Default::default(),
+            buffers: std::slice::from_ref(&skinned_vbl), compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
             module: &skinned_shader, entry_point: "fs_main",
@@ -285,7 +289,43 @@ pub fn build_pipelines(
             cull_mode: None,
             ..Default::default()
         },
-        depth_stencil: Some(depth),
+        depth_stencil: Some(depth.clone()),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None, cache: None,
+    });
+
+    // ── Skinned overlay pipeline (Luclin two-layer body: cloth/armor over skin) ──
+    // Identical to `skinned` except the depth state: LessEqual + no depth write, so the
+    // alpha-blended overlay draws on top of the opaque skin base already laid down at the
+    // same surface depth. Where the overlay's texel alpha is 0 (e.g. an exposed midriff in
+    // elfch0003), alpha blending leaves the skin showing through.
+    let skinned_overlay = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("skinned_overlay"),
+        layout: Some(&skinned_layout),
+        vertex: wgpu::VertexState {
+            module: &skinned_shader, entry_point: "vs_main",
+            buffers: std::slice::from_ref(&skinned_vbl), compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &skinned_shader, entry_point: "fs_main",
+            targets: &[Some(wgpu::ColorTargetState {
+                format, blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: false,
+            depth_compare: wgpu::CompareFunction::LessEqual,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
         multisample: wgpu::MultisampleState::default(),
         multiview: None, cache: None,
     });
@@ -327,7 +367,7 @@ pub fn build_pipelines(
         multiview: None, cache: None,
     });
 
-    Pipelines { sky, zone, billboard, character, skinned }
+    Pipelines { sky, zone, billboard, character, skinned, skinned_overlay }
 }
 
 #[cfg(test)]
