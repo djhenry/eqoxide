@@ -7,7 +7,18 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::{GameState, ZonePoint};
-use crate::http::{AttackReq, BuyReq, MoveReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
+use crate::http::{AttackReq, BuyReq, MoveReq, GiveReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
+
+/// Pending state of a quest turn-in (POST /give). The trade window spans multiple nav ticks:
+/// we send OP_TradeRequest, then must wait for the server's OP_TradeRequestAck before moving the
+/// item into the NPC trade slot. `ticks_waiting` counts nav ticks (~150ms each) for the timeout.
+struct GiveState {
+    npc_id:        u32,
+    ticks_waiting: u32,
+}
+
+/// ~3 second ack timeout, in nav ticks (tick gating is ~150ms → 20 ticks ≈ 3s).
+const GIVE_ACK_TIMEOUT_TICKS: u32 = 20;
 
 /// OP_TargetCommand payload: ClientTarget_Struct = just the target spawn id (u32).
 pub fn build_target_packet(spawn_id: u32) -> Vec<u8> {
@@ -98,6 +109,10 @@ pub struct Navigator {
     attack:           AttackReq,
     buy:              BuyReq,
     move_req:         MoveReq,
+    give:             GiveReq,
+    /// In-progress quest turn-in (POST /give), or None when idle. Drives the trade-window
+    /// state machine across nav ticks (request → wait for ack → move item + accept).
+    give_state:       Option<GiveState>,
     collision:        crate::assets::SharedCollision,
     maps_dir:         std::path::PathBuf,
     current_zone:     String,
@@ -129,6 +144,7 @@ impl Navigator {
         attack:           AttackReq,
         buy:              BuyReq,
         move_req:         MoveReq,
+        give:             GiveReq,
         collision:        crate::assets::SharedCollision,
         maps_dir:         std::path::PathBuf,
     ) -> Self {
@@ -145,6 +161,8 @@ impl Navigator {
             attack,
             buy,
             move_req,
+            give,
+            give_state: None,
             collision,
             maps_dir,
             current_zone: String::new(),
@@ -389,6 +407,12 @@ impl Navigator {
         }
         self.last_tick = Instant::now();
 
+        // Quest turn-in (POST /give) trade-window state machine. Spans multiple ticks: we must
+        // wait for the server's OP_TradeRequestAck (sets gs.trade_ack_ready) between sending the
+        // trade request and moving the item into the NPC trade slot. Run on the throttled ~150ms
+        // cadence so the per-tick ack timeout count matches the documented ~3s window.
+        self.tick_give(stream, gs);
+
         // Auto-retarget: while auto-attacking, if the current target is gone or dead, pick the
         // nearest trash mob (name starts "a_"/"an_", which excludes named guards/merchants/
         // citizens) within ~200u, so grinding continues hands-free between kills.
@@ -568,6 +592,69 @@ impl Navigator {
 
         // Synthetic server-side position packet so the render camera follows.
         let _ = app_tx.send(make_position_packet(gs.player_id, nx, ny, nz));
+    }
+
+    /// Advance the quest turn-in (POST /give) trade-window flow. The full sequence is:
+    ///   1. New give request: put the item on the cursor (OP_MoveItem from_slot→30, skip if it's
+    ///      already on the cursor), send OP_TradeRequest, and enter the "waiting for ack" state.
+    ///   2. The server replies OP_TradeRequestAck (→ gs.trade_ack_ready); only then may we move the
+    ///      cursor item into the NPC trade slot — the server rejects cursor→trade moves before the
+    ///      trade session exists.
+    ///   3. Ack seen: OP_MoveItem cursor(30)→trade slot(3000), then OP_TradeAcceptClick. Clear state.
+    /// The server then sends OP_FinishTrade (handled in packet_handler). If no ack arrives within
+    /// ~3s we abort and reset. Called every tick (not gated by the 150ms walk throttle).
+    fn tick_give(&mut self, stream: &mut EqStream, gs: &mut GameState) {
+        // Begin a new give request if one is queued and we're not already mid-trade.
+        if self.give_state.is_none() {
+            if let Some((npc_id, from_slot)) = self.give.lock().unwrap().take() {
+                // Step 1: put the item on the cursor (skip if it's already there).
+                if from_slot != SLOT_CURSOR {
+                    let mut mv = [0u8; 12];
+                    mv[0..4].copy_from_slice(&from_slot.to_le_bytes());
+                    mv[4..8].copy_from_slice(&SLOT_CURSOR.to_le_bytes());
+                    // number_in_stack = 0 → whole-item move (see the /inventory/move note above).
+                    stream.send_app_packet(OP_MOVE_ITEM, &mv);
+                }
+                // Send OP_TradeRequest { to_mob_id = npc, from_mob_id = player }.
+                let mut req = [0u8; 8];
+                req[0..4].copy_from_slice(&npc_id.to_le_bytes());
+                req[4..8].copy_from_slice(&gs.player_id.to_le_bytes());
+                stream.send_app_packet(OP_TRADE_REQUEST, &req);
+                gs.trade_ack_ready = false;
+                self.give_state = Some(GiveState { npc_id, ticks_waiting: 0 });
+                eprintln!("EQ: give: OP_TradeRequest to npc_id={} (item slot {})", npc_id, from_slot);
+                gs.log_msg("trade", "Offering item to NPC...");
+            }
+            return;
+        }
+
+        // Mid-trade: either the ack has arrived (advance) or we keep waiting (with a timeout).
+        if gs.trade_ack_ready {
+            let npc_id = self.give_state.as_ref().map(|g| g.npc_id).unwrap_or(0);
+            // Step 3: move the cursor item into the NPC's first trade slot, then accept.
+            let mut mv = [0u8; 12];
+            mv[0..4].copy_from_slice(&SLOT_CURSOR.to_le_bytes());
+            mv[4..8].copy_from_slice(&SLOT_TRADE_BEGIN.to_le_bytes());
+            // number_in_stack = 0 → whole-item move.
+            stream.send_app_packet(OP_MOVE_ITEM, &mv);
+            let mut accept = [0u8; 8];
+            accept[0..4].copy_from_slice(&gs.player_id.to_le_bytes());
+            // unknown4 = 0 (already zeroed).
+            stream.send_app_packet(OP_TRADE_ACCEPT_CLICK, &accept);
+            eprintln!("EQ: give: cursor→trade slot + OP_TradeAcceptClick (npc_id={})", npc_id);
+            self.give_state = None;
+            gs.trade_ack_ready = false;
+        } else if let Some(g) = self.give_state.as_mut() {
+            g.ticks_waiting += 1;
+            if g.ticks_waiting >= GIVE_ACK_TIMEOUT_TICKS {
+                // Abort: cancel the (possibly half-open) trade session and reset.
+                stream.send_app_packet(OP_CANCEL_TRADE, &[]);
+                eprintln!("EQ: give: no trade ack (timed out)");
+                gs.log_msg("trade", "Trade timed out (no NPC ack)");
+                self.give_state = None;
+                gs.trade_ack_ready = false;
+            }
+        }
     }
 
     fn send_position_update(

@@ -168,6 +168,11 @@ pub struct GameState {
 
     /// Player inventory + equipment (decoded from OP_CharInventory / OP_ItemPacket).
     pub inventory: Vec<InvItem>,
+
+    /// Set true when the server sends OP_TradeRequestAck — the trade session now exists, so the
+    /// nav thread may move the cursor item into the NPC trade slot and accept. Cleared once the
+    /// give state machine consumes it (or on timeout). See navigation.rs.
+    pub trade_ack_ready: bool,
 }
 
 impl GameState {
