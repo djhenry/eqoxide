@@ -87,6 +87,14 @@ pub struct InvItem {
     pub idfile:  String,
 }
 
+/// Active spell-cast in progress.
+#[derive(Debug, Clone)]
+pub struct CastState {
+    pub spell_id: u32,
+    pub started: std::time::Instant,
+    pub cast_ms: u32,
+}
+
 /// All state the renderer needs for one frame.
 #[derive(Debug, Default, Clone)]
 pub struct GameState {
@@ -173,6 +181,16 @@ pub struct GameState {
     /// nav thread may move the cursor item into the NPC trade slot and accept. Cleared once the
     /// give state machine consumes it (or on timeout). See navigation.rs.
     pub trade_ack_ready: bool,
+
+    // Spellcasting / posture
+    /// Memorized spell gem IDs (9 slots); 0xFFFF_FFFF = empty slot.
+    pub mem_spells: [u32; 9],
+    /// Active cast in progress (Some) or idle (None).
+    pub casting: Option<CastState>,
+    /// True when the player is sitting.
+    pub sitting: bool,
+    /// True when auto-attack is enabled.
+    pub auto_attack: bool,
 }
 
 impl GameState {

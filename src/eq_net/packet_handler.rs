@@ -6,7 +6,7 @@
 
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::AppPacket;
-use crate::game_state::{GameState, Entity, ZonePoint};
+use crate::game_state::{GameState, Entity, ZonePoint, CastState};
 
 /// Apply one EQ server packet to `gs`.
 pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
@@ -65,6 +65,10 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
             eprintln!("EQ: give: turn-in complete (OP_FinishTrade)");
         }
         OP_ANIMATION            => apply_animation(gs, p),
+        OP_BEGIN_CAST           => apply_begin_cast(gs, p),
+        OP_MANA_CHANGE          => apply_mana_change(gs, p),
+        OP_MEMORIZE_SPELL       => apply_memorize_spell(gs, p),
+        OP_INTERRUPT_CAST       => apply_interrupt_cast(gs, p),
         _                       => {}
     }
 }
@@ -436,6 +440,7 @@ fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
         }
         gs.coin = p.coin;
         gs.stats = p.stats;
+        gs.mem_spells = p.mem_spells;
     }
 
     const ITEM_MATERIAL_OFF: usize = 188;
@@ -455,6 +460,41 @@ fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
                 gs.player_equipment_tint[i] = [payload[to + 2], payload[to + 1], payload[to]];
             }
         }
+    }
+}
+
+pub fn apply_begin_cast(gs: &mut GameState, p: &[u8]) {
+    if let Some((_caster, spell_id, cast_ms)) = parse_begin_cast(p) {
+        gs.casting = Some(CastState {
+            spell_id: spell_id as u32,
+            started: std::time::Instant::now(),
+            cast_ms,
+        });
+    }
+}
+
+pub fn apply_mana_change(gs: &mut GameState, p: &[u8]) {
+    if let Some(_new_mana) = parse_mana_change(p) {
+        // mana_pct is updated from HP/mana update packets elsewhere; keepcasting handling:
+        // a mana change with the spell landing ends the optimistic cast bar.
+    }
+}
+
+pub fn apply_memorize_spell(gs: &mut GameState, p: &[u8]) {
+    if let Some((slot, spell_id, scribing)) = parse_memorize_spell(p) {
+        match scribing {
+            1 => { if (slot as usize) < 9 { gs.mem_spells[slot as usize] = spell_id; } }
+            2 => { if (slot as usize) < 9 { gs.mem_spells[slot as usize] = 0xFFFF_FFFF; } }
+            3 => { gs.casting = None; } // spellbar re-enable: cast finished
+            _ => {}
+        }
+    }
+}
+
+pub fn apply_interrupt_cast(gs: &mut GameState, p: &[u8]) {
+    if gs.casting.is_some() && parse_interrupt_cast(p).is_some() {
+        gs.casting = None;
+        gs.log_msg("combat", "Your spell is interrupted.");
     }
 }
 
@@ -855,7 +895,7 @@ pub fn register_spawn(gs: &mut GameState, spawn: Spawn_S) {
 #[cfg(test)]
 mod tests {
     use super::{apply_emote, class_name, con_color, consider_message, parse_player_profile,
-                parse_begin_cast, parse_mana_change, parse_memorize_spell, parse_interrupt_cast};
+                parse_begin_cast, parse_memorize_spell};
     use crate::game_state::GameState;
 
     #[test]
@@ -1125,6 +1165,18 @@ mod tests {
         assert_eq!(e.equipment[1], 17);
         assert_eq!(e.equipment_tint[1], [30, 20, 10]); // wire BGR [10,20,30] → stored RGB
         assert_eq!(e.gender, 1);
+    }
+
+    #[test]
+    fn begin_cast_sets_casting_state() {
+        let mut gs = crate::game_state::GameState::new();
+        let mut b = [0u8; 8];
+        b[2..4].copy_from_slice(&200u16.to_le_bytes());
+        b[4..8].copy_from_slice(&3000u32.to_le_bytes());
+        super::apply_begin_cast(&mut gs, &b.to_vec());
+        let c = gs.casting.as_ref().expect("casting set");
+        assert_eq!(c.spell_id, 200);
+        assert_eq!(c.cast_ms, 3000);
     }
 
     #[test]

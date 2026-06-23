@@ -67,6 +67,14 @@ pub struct SceneState {
     /// Empty = nothing equipped in that slot. Primary = worn slot 13, secondary = slot 14.
     pub primary_weapon_idfile: String,
     pub secondary_weapon_idfile: String,
+    /// Memorized spell gem IDs (9 slots); 0xFFFF_FFFF = empty slot.
+    pub mem_spells: [u32; 9],
+    /// Active cast in progress (Some) or idle (None).
+    pub casting: Option<crate::game_state::CastState>,
+    /// True when the player is sitting.
+    pub sitting: bool,
+    /// True when auto-attack is enabled.
+    pub auto_attack: bool,
 }
 
 impl SceneState {
@@ -208,6 +216,10 @@ impl SceneState {
                 .map(|i| i.idfile.clone()).unwrap_or_default(),
             secondary_weapon_idfile: gs.inventory.iter().find(|i| i.slot == 14)
                 .map(|i| i.idfile.clone()).unwrap_or_default(),
+            mem_spells: gs.mem_spells,
+            casting: gs.casting.clone(),
+            sitting: gs.sitting,
+            auto_attack: gs.auto_attack,
         }
     }
 }
