@@ -359,12 +359,10 @@ impl<'a> LoginProtocol<'a> {
                 PhaseResult::Done
             }
             op => {
-                // Suppress known noise: keepalive, ground spawns, doors, zone points
+                // Suppress known noise: keepalive, ground spawns, zone points
                 // (handled by apply_packet), world-login flow opcodes.
                 const SILENT: &[u16] = &[
-                    0x700d, // server keepalive/time-sync
                     0x0f47, // OP_GroundSpawn — ground item drops, no action needed
-                    0x4c24, // OP_SPAWN_DOOR — door positions, handled visually elsewhere
                     0x5996, // unknown empty packet, keepalive variant
                     0x3eba, // OP_SEND_ZONE_POINTS — handled by apply_packet
                     0x2372, // OP_SpecialMesg — NPC dialogue, handled by apply_packet
