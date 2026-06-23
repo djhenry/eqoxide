@@ -7,7 +7,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::{GameState, ZonePoint};
-use crate::http::{AttackReq, BuyReq, MoveReq, GiveReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
+use crate::http::{AttackReq, BuyReq, MoveReq, GiveReq, InventoryShared, LootReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
 
 /// Pending state of a quest turn-in (POST /give). The trade window spans multiple nav ticks:
 /// we send OP_TradeRequest, then must wait for the server's OP_TradeRequestAck before moving the
@@ -113,6 +113,10 @@ pub struct Navigator {
     /// In-progress quest turn-in (POST /give), or None when idle. Drives the trade-window
     /// state machine across nav ticks (request → wait for ack → move item + accept).
     give_state:       Option<GiveState>,
+    /// Shared inventory snapshot (published each tick for GET /inventory) and the pending
+    /// POST /loot corpse request (drained into gs.pending_loot to reuse the auto-loot loop).
+    inventory:        InventoryShared,
+    loot:             LootReq,
     collision:        crate::assets::SharedCollision,
     maps_dir:         std::path::PathBuf,
     current_zone:     String,
@@ -145,6 +149,8 @@ impl Navigator {
         buy:              BuyReq,
         move_req:         MoveReq,
         give:             GiveReq,
+        inventory:        InventoryShared,
+        loot:             LootReq,
         collision:        crate::assets::SharedCollision,
         maps_dir:         std::path::PathBuf,
     ) -> Self {
@@ -163,6 +169,8 @@ impl Navigator {
             move_req,
             give,
             give_state: None,
+            inventory,
+            loot,
             collision,
             maps_dir,
             current_zone: String::new(),
@@ -197,6 +205,13 @@ impl Navigator {
         let mut tasks: Vec<_> = gs.tasks.values().cloned().collect();
         tasks.sort_by_key(|t| t.task_id);
         log.extend(tasks);
+    }
+
+    /// Publish the player's inventory + equipment from `gs` into the shared slot (GET /inventory).
+    pub fn sync_inventory(&self, gs: &GameState) {
+        let mut inv = self.inventory.lock().unwrap();
+        inv.clear();
+        inv.extend(gs.inventory.iter().cloned());
     }
 
     /// Sync zone exit points from `gs` into the shared zone_points map.
@@ -261,6 +276,17 @@ impl Navigator {
         gs:      &mut GameState,
         app_tx:  &UnboundedSender<AppPacket>,
     ) {
+        // POST /loot: queue the requested corpse onto the existing auto-loot pipeline. The gameplay
+        // loop drains pending_loot — sends OP_LootRequest, echoes each OP_LootItem to take it, then
+        // OP_EndLootRequest. The 500ms delay (loot_queued_at) lets the server register the corpse.
+        if let Some(corpse_id) = self.loot.lock().unwrap().take() {
+            gs.pending_loot.push_back(corpse_id);
+            if gs.loot_queued_at.is_none() {
+                gs.loot_queued_at = Some(Instant::now());
+            }
+            eprintln!("loot: queued corpse_id={} for looting (via POST /loot)", corpse_id);
+        }
+
         // Check zone-cross request — warp onto a zone line, then send OP_ZONE_CHANGE.
         let cross_req = self.zone_cross.lock().unwrap().take();
         if let Some(want_zone) = cross_req {
