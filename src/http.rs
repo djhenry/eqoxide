@@ -10,7 +10,7 @@
 use axum::{
     Router,
     body::Body,
-    extract::State,
+    extract::{State, Query},
     http::{header, StatusCode},
     routing::{get, post},
     response::Response,
@@ -89,6 +89,21 @@ pub type InventoryShared = Arc<Mutex<Vec<crate::game_state::InvItem>>>;
 /// the corpse onto the existing auto-loot queue (OP_LootRequest → OP_LootItem echoes → OP_EndLootRequest).
 pub type LootReq = Arc<Mutex<Option<u32>>>;
 
+/// One machine-readable line from the in-game message log (GET /messages). `kind` is the channel
+/// ("npc" = NPC dialogue/emotes, "chat", "combat", "system", "exp", "loot", "trade", "zone", …);
+/// `keywords` are the `[bracketed]` quest reply words extracted from the text (say them back via
+/// POST /say to advance dialogue quests).
+#[derive(Clone, serde::Serialize)]
+pub struct MessageEntry {
+    pub kind:     String,
+    pub text:     String,
+    pub keywords: Vec<String>,
+}
+
+/// Live snapshot of the in-game message log, published each tick by the nav thread and read by
+/// GET /messages. Exposes NPC dialogue (kind "npc") as machine-readable text + keywords.
+pub type MessagesShared = Arc<Mutex<Vec<MessageEntry>>>;
+
 /// Current zone name and id, updated on every OP_NEW_ZONE.
 #[allow(dead_code)]
 pub type ZoneInfo = Arc<Mutex<(String, u16)>>;
@@ -126,6 +141,7 @@ struct HttpState {
     give:             GiveReq,
     inventory:        InventoryShared,
     loot:             LootReq,
+    messages:         MessagesShared,
     player_info:      PlayerInfo,
     task_log:         TaskLog,
 }
@@ -170,6 +186,7 @@ pub fn spawn_camera_server(
     give:             GiveReq,
     inventory:        InventoryShared,
     loot:             LootReq,
+    messages:         MessagesShared,
     player_info:      PlayerInfo,
     task_log:         TaskLog,
     port:             u16,
@@ -177,7 +194,7 @@ pub fn spawn_camera_server(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, buy, move_req, give, inventory, loot, player_info, task_log };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, buy, move_req, give, inventory, loot, messages, player_info, task_log };
             let app = Router::new()
                 .route("/camera", get(get_camera).post(post_camera))
                 .route("/camera/reset", post(post_camera_reset))
@@ -199,6 +216,7 @@ pub fn spawn_camera_server(
                 .route("/give", post(post_give))
                 .route("/inventory", get(get_inventory))
                 .route("/loot", post(post_loot))
+                .route("/messages", get(get_messages))
                 .route("/exit", post(post_exit))
                 .route("/debug", get(get_debug))
                 .with_state(state);
@@ -674,6 +692,29 @@ async fn post_give(
 async fn get_inventory(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let items = s.inventory.lock().unwrap().clone();
     Json(serde_json::json!({ "count": items.len(), "items": items }))
+}
+
+#[derive(serde::Deserialize)]
+struct MessagesQuery {
+    /// Filter to a single message channel, e.g. ?kind=npc for NPC dialogue only.
+    kind: Option<String>,
+}
+
+/// GET /messages — the in-game message log as machine-readable text (oldest→newest, last ~50
+/// lines), published each tick by the nav thread. This is how an agent reads **NPC dialogue**:
+/// each line has a `kind` ("npc" = NPC say/emote, plus "chat", "combat", "system", "exp", "loot",
+/// "trade", "zone"), the `text`, and any `[bracketed]` quest `keywords` to say back via POST /say.
+/// Filter with `?kind=npc` for dialogue only. Replaces having to OCR the /frame HUD panel.
+async fn get_messages(
+    State(s): State<HttpState>,
+    Query(q): Query<MessagesQuery>,
+) -> Json<serde_json::Value> {
+    let all = s.messages.lock().unwrap();
+    let filtered: Vec<&MessageEntry> = match &q.kind {
+        Some(k) => all.iter().filter(|m| m.kind == *k).collect(),
+        None    => all.iter().collect(),
+    };
+    Json(serde_json::json!({ "count": filtered.len(), "messages": filtered }))
 }
 
 #[derive(serde::Deserialize, Default)]
