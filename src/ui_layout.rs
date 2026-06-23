@@ -225,6 +225,8 @@ pub fn managed_window<R>(
     let mut win = egui::Window::new(spec.title)
         .title_bar(false)
         .collapsible(false)
+        // `constrain(true)` is our off-screen guard: egui keeps the window within
+        // screen_rect each frame, so we don't separately clamp stored positions.
         .constrain(true)
         .frame(frame)
         .movable(!locked)
@@ -252,7 +254,7 @@ pub fn managed_window<R>(
         // Drag/affordance strip + per-window menu, only when unlocked.
         if !locked {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(format!("\u{2059} {}", spec.title))
+                ui.label(egui::RichText::new(format!("\u{2630} {}", spec.title))
                     .size(10.0).weak());
             });
         }
