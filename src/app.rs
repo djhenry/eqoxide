@@ -577,6 +577,11 @@ impl App {
     // ── Render loop ───────────────────────────────────────────────────────────
 
     fn render_frame(&mut self) {
+        // Compute dt at the very top so it's available for animation before SceneState is built.
+        let now = std::time::Instant::now();
+        let dt  = (now - self.last_frame_time).as_secs_f32().min(0.1);
+        self.last_frame_time = now;
+
         // Drain EQ packets into game state.
         while let Ok(packet) = self.app_rx.try_recv() {
             apply_packet(&mut self.game_state, &packet);
@@ -594,6 +599,16 @@ impl App {
             self.visual_heading = self.game_state.player_heading;
             *self.goto_target.lock().unwrap() = Some((wx, wy, wz));
             eprintln!("warp: teleported to ({:.1}, {:.1}, {:.1})", wx, wy, wz);
+        }
+
+        // Ease each door's render fraction toward its server-authoritative open/close target.
+        {
+            let step = (dt / 0.5).min(1.0); // ~0.5s full travel
+            for d in self.game_state.doors.values_mut() {
+                let target = if d.is_open { 1.0_f32 } else { 0.0_f32 };
+                d.open_frac += (target - d.open_frac) * step;
+                if (d.open_frac - target).abs() < 0.001 { d.open_frac = target; }
+            }
         }
 
         self.scene = SceneState::from_game_state(&self.game_state);
@@ -681,9 +696,8 @@ impl App {
             self.current_zone  = self.scene.zone.clone();
         }
 
+        // `now` reused for FPS timer below; `dt` and `last_frame_time` already updated at top.
         let now = std::time::Instant::now();
-        let dt  = (now - self.last_frame_time).as_secs_f32().min(0.1);
-        self.last_frame_time = now;
 
         // FPS counter: average over 0.5s windows.
         self.fps_frame_count += 1;
