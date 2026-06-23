@@ -31,6 +31,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_EMOTE                => apply_emote(gs, p),
         OP_CONSIDER             => apply_consider(gs, p),
         OP_SEND_ZONE_POINTS           => apply_zone_points(gs, p),
+        OP_SPAWN_DOOR           => apply_spawn_doors(gs, p),
         OP_REQUEST_CLIENT_ZONE_CHANGE => {
             if p.len() >= 4 {
                 let zone_id = u16::from_le_bytes([p[0], p[1]]);
@@ -306,6 +307,7 @@ fn apply_hp_update(gs: &mut GameState, payload: &[u8]) {
 }
 
 fn apply_new_zone(gs: &mut GameState, payload: &[u8]) {
+    gs.doors.clear();
     if payload.len() < SIZE_NEW_ZONE { return; }
     let zone = unsafe { safe_read::<NewZone_S>(payload) };
     gs.zone_name = zone.zone_short_str();
@@ -756,6 +758,37 @@ fn apply_zone_points(gs: &mut GameState, payload: &[u8]) {
     }
 }
 
+/// OP_SpawnDoor — a header-less flat array of 80-byte Door_Struct records (max 500).
+/// Wire order is y(north) then x(east); we store client convention (x=east, y=north).
+fn apply_spawn_doors(gs: &mut GameState, p: &[u8]) {
+    const REC: usize = 80;
+    let rd_f32 = |b: &[u8], o: usize| f32::from_le_bytes([b[o], b[o+1], b[o+2], b[o+3]]);
+    let rd_u32 = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o+1], b[o+2], b[o+3]]);
+    let mut off = 0;
+    while off + REC <= p.len() {
+        let r = &p[off..off + REC];
+        let name_end = r[..32].iter().position(|&c| c == 0).unwrap_or(32);
+        let name = String::from_utf8_lossy(&r[..name_end]).into_owned();
+        let door = crate::game_state::Door {
+            door_id: r[60],
+            name,
+            y: rd_f32(r, 32),   // north (yPos)
+            x: rd_f32(r, 36),   // east  (xPos)
+            z: rd_f32(r, 40),
+            heading: rd_f32(r, 44),
+            incline: rd_u32(r, 48) as i32,
+            size: u16::from_le_bytes([r[52], r[53]]),
+            opentype: r[61],
+            invert_state: r[63] != 0,
+            is_open: r[62] != 0,   // state_at_spawn is already invert-adjusted
+            door_param: rd_u32(r, 64),
+            open_frac: if r[62] != 0 { 1.0 } else { 0.0 },
+        };
+        gs.upsert_door(door);
+        off += REC;
+    }
+}
+
 fn apply_bind_respawn(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < 20 { return; }
     gs.player_x = f32::from_le_bytes([payload[4],  payload[5],  payload[6],  payload[7]]);
@@ -1196,5 +1229,36 @@ mod tests {
         b[4..8].copy_from_slice(&200u32.to_le_bytes()); // spell_id
         b[8..12].copy_from_slice(&3u32.to_le_bytes());  // scribing = spellbar re-enable
         assert_eq!(parse_memorize_spell(&b), Some((2, 200, 3)));
+    }
+
+    #[test]
+    fn spawn_door_parses_one_record() {
+        use super::apply_spawn_doors;
+        let mut rec = [0u8; 80];
+        rec[..5].copy_from_slice(b"DOOR1");        // name @0
+        rec[32..36].copy_from_slice(&20.0f32.to_le_bytes()); // yPos(north) @32
+        rec[36..40].copy_from_slice(&10.0f32.to_le_bytes()); // xPos(east)  @36
+        rec[40..44].copy_from_slice(&5.0f32.to_le_bytes());  // zPos @40
+        rec[44..48].copy_from_slice(&128.0f32.to_le_bytes());// heading @44
+        rec[48..52].copy_from_slice(&0u32.to_le_bytes());    // incline @48
+        rec[52..54].copy_from_slice(&100u16.to_le_bytes());  // size @52
+        rec[60] = 7;   // door_id @60
+        rec[61] = 5;   // opentype @61
+        rec[62] = 0;   // state_at_spawn @62 (closed)
+        rec[63] = 0;   // invert_state @63
+        rec[64..68].copy_from_slice(&0u32.to_le_bytes());    // door_param @64
+
+        let mut gs = GameState::new();
+        apply_spawn_doors(&mut gs, &rec);
+
+        let d = gs.doors.get(&7).expect("door 7 present");
+        assert_eq!(d.name, "DOOR1");
+        assert_eq!(d.x, 10.0);   // east  <- xPos
+        assert_eq!(d.y, 20.0);   // north <- yPos
+        assert_eq!(d.z, 5.0);
+        assert_eq!(d.heading, 128.0);
+        assert_eq!(d.opentype, 5);
+        assert!(!d.is_open);
+        assert!(!d.invert_state);
     }
 }
