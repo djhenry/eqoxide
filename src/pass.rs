@@ -63,6 +63,39 @@ fn resolve_equip_tex<'a>(
     }
 }
 
+/// Skin-base bind group for a body mesh: the model's own baked texture (the Luclin skin layer the
+/// WLD material palette references by default), or the white fallback if the mesh has none.
+fn skin_base_tex<'a>(
+    r: &'a EqRenderer, baked_bgs: &'a [wgpu::BindGroup], baked_idx: Option<usize>,
+) -> &'a wgpu::BindGroup {
+    match baked_idx {
+        Some(i) if i < baked_bgs.len() => &baked_bgs[i],
+        _ => &r.fallback_texture_bg,
+    }
+}
+
+/// The cloth/armor OVERLAY bind group for a body slot, if a usable swapped texture is cached.
+/// Unlike `resolve_equip_tex`, this returns `None` (rather than the baked skin) when there is no
+/// overlay — material-0 skin regions, rejected transparent stubs, and missing textures. The
+/// two-pass renderer draws the skin base first, then this overlay alpha-blended on top, so a
+/// `None` here means bare skin shows (e.g. the elf-female exposed midriff).
+fn resolve_overlay_tex<'a>(
+    r: &'a EqRenderer, prefix: &str,
+    slot: Option<crate::models::EquipSlot>, equipment: &[u32; 9],
+) -> Option<&'a wgpu::BindGroup> {
+    let es = slot?;
+    let mat = equipment[es.slot];
+    if let Some(key) = crate::models::equip_swap_key(prefix, es.clone(), mat) {
+        if let Some(Some(bg)) = r.equipment_tex_cache.get(&key) { return Some(bg); }
+    }
+    if let Some(rmat) = crate::models::velious_material_fallback(mat) {
+        if let Some(key) = crate::models::equip_swap_key(prefix, es, rmat) {
+            if let Some(Some(bg)) = r.equipment_tex_cache.get(&key) { return Some(bg); }
+        }
+    }
+    None
+}
+
 /// Sky gradient background pass. MUST be called before all other passes.
 /// Fills the color buffer with the gradient; subsequent passes draw on top.
 /// No depth attachment — sky is purely a background layer.
@@ -291,13 +324,27 @@ pub fn encode_player_pass(
                 pass.set_bind_group(0, &r.camera_uniform.bind_group, &[]);
                 pass.set_bind_group(1, &r.fallback_texture_bg, &[]);
                 pass.set_bind_group(3, &r.joint_buf_pool[0].1, &[]);
+                // Two-layer Luclin body: pass 1 draws the opaque skin base (the model's baked
+                // texture) for every visible mesh; pass 2 composites the cloth/armor overlay on top
+                // (alpha-blended, LessEqual depth) so exposed skin shows where the overlay is
+                // transparent (e.g. the elf-female midriff). See docs/equipment-textures-findings.md.
                 for (i, mesh) in model.meshes.iter().enumerate() {
                     if i >= PLAYER_UNIFORM_SLOTS { break; }
                     if equip_mesh_hidden(r, &model.prefix, model.equip_slots[i], &scene.player_equipment) { continue; }
                     pass.set_bind_group(2, &r.entity_uniform_pool[i].1, &[]);
-                    let bg = resolve_equip_tex(r, &model.texture_bind_groups, mesh.texture_idx,
-                        &model.prefix, model.equip_slots[i].clone(), &scene.player_equipment);
-                    pass.set_bind_group(1, bg, &[]);
+                    pass.set_bind_group(1, skin_base_tex(r, &model.texture_bind_groups, mesh.texture_idx), &[]);
+                    pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                    pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                }
+                pass.set_pipeline(&r.pipelines.skinned_overlay);
+                for (i, mesh) in model.meshes.iter().enumerate() {
+                    if i >= PLAYER_UNIFORM_SLOTS { break; }
+                    if equip_mesh_hidden(r, &model.prefix, model.equip_slots[i], &scene.player_equipment) { continue; }
+                    let Some(overlay) = resolve_overlay_tex(r, &model.prefix,
+                        model.equip_slots[i].clone(), &scene.player_equipment) else { continue };
+                    pass.set_bind_group(2, &r.entity_uniform_pool[i].1, &[]);
+                    pass.set_bind_group(1, overlay, &[]);
                     pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
                     pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..mesh.index_count, 0, 0..1);
@@ -701,6 +748,9 @@ pub fn encode_skinned_entity_pass(
     pass.set_bind_group(0, &r.camera_uniform.bind_group, &[]);
     pass.set_bind_group(1, &r.fallback_texture_bg, &[]);
 
+    // Two-layer Luclin body (same as the player pass): pass 1 lays down the opaque skin base for
+    // every visible mesh; pass 2 composites the cloth/armor overlay on top, so skin shows through
+    // wherever the overlay is transparent.
     let mut cur_joint = usize::MAX;
     for draw in &draws {
         let Some(GpuModel::Skinned(model)) = r.model_for(draw.archetype, draw.gender) else { continue };
@@ -711,9 +761,25 @@ pub fn encode_skinned_entity_pass(
         }
         if equip_mesh_hidden(r, &model.prefix, model.equip_slots[draw.mesh_idx], &draw.equipment) { continue; }
         pass.set_bind_group(2, &r.entity_uniform_pool[draw.uniform_slot].1, &[]);
-        let bg = resolve_equip_tex(r, &model.texture_bind_groups, mesh.texture_idx,
-            &model.prefix, model.equip_slots[draw.mesh_idx], &draw.equipment);
-        pass.set_bind_group(1, bg, &[]);
+        pass.set_bind_group(1, skin_base_tex(r, &model.texture_bind_groups, mesh.texture_idx), &[]);
+        pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+        pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+    }
+    pass.set_pipeline(&r.pipelines.skinned_overlay);
+    cur_joint = usize::MAX;
+    for draw in &draws {
+        let Some(GpuModel::Skinned(model)) = r.model_for(draw.archetype, draw.gender) else { continue };
+        let mesh = &model.meshes[draw.mesh_idx];
+        if draw.joint_slot != cur_joint {
+            pass.set_bind_group(3, &r.joint_buf_pool[draw.joint_slot].1, &[]);
+            cur_joint = draw.joint_slot;
+        }
+        if equip_mesh_hidden(r, &model.prefix, model.equip_slots[draw.mesh_idx], &draw.equipment) { continue; }
+        let Some(overlay) = resolve_overlay_tex(r, &model.prefix,
+            model.equip_slots[draw.mesh_idx], &draw.equipment) else { continue };
+        pass.set_bind_group(2, &r.entity_uniform_pool[draw.uniform_slot].1, &[]);
+        pass.set_bind_group(1, overlay, &[]);
         pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
         pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..mesh.index_count, 0, 0..1);
