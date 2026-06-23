@@ -38,6 +38,8 @@ pub async fn run_gameplay_phase(
         let rx = net_rx.as_mut().expect("net_rx always Some in loop");
         s.poll_recv();
 
+        // Relaxed: the flag is a self-contained shutdown signal with no happens-before
+        // dependency on other data published by the setter (/exit or window-close).
         if shutdown.load(Ordering::Relaxed) {
             perform_clean_shutdown(s, rx).await;
         }
