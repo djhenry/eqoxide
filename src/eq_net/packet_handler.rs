@@ -375,6 +375,7 @@ pub struct ProfileInfo {
     pub class_id: u32,
     pub coin: [u32; 4],  // platinum, gold, silver, copper
     pub stats: [u32; 7], // STR, STA, CHA, DEX, INT, AGI, WIS
+    pub mem_spells: [u32; 9], // 9 memorized spell-gem ids; 0xFFFFFFFF = empty
 }
 
 /// Parse the Titanium PlayerProfile_Struct. Offsets from EQEmu
@@ -391,6 +392,11 @@ pub fn parse_player_profile(payload: &[u8]) -> Option<ProfileInfo> {
             u32_at(2252), u32_at(2256), u32_at(2260),
         ],
         coin: [u32_at(4428), u32_at(4432), u32_at(4436), u32_at(4440)],
+        mem_spells: {
+            let mut m = [0xFFFF_FFFFu32; 9];
+            for (i, slot) in m.iter_mut().enumerate() { *slot = u32_at(4360 + i * 4); }
+            m
+        },
     })
 }
 
@@ -849,6 +855,9 @@ mod tests {
         buf[4440..4444].copy_from_slice(&9u32.to_le_bytes());   // copper
         buf[2236..2240].copy_from_slice(&75u32.to_le_bytes());  // STR
         buf[2260..2264].copy_from_slice(&110u32.to_le_bytes()); // WIS
+        // mem_spells[0] @4360 = 200 (Minor Healing), mem_spells[1] @4364 = 0xFFFFFFFF (empty)
+        buf[4360..4364].copy_from_slice(&200u32.to_le_bytes());
+        buf[4364..4368].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
         let p = parse_player_profile(&buf).unwrap();
         assert_eq!(p.level, 12);
         assert_eq!(p.class_id, 9);
@@ -856,6 +865,8 @@ mod tests {
         assert_eq!(p.stats[0], 75);  // STR
         assert_eq!(p.stats[6], 110); // WIS
         assert_eq!(class_name(p.class_id), "Rogue");
+        assert_eq!(p.mem_spells[0], 200);
+        assert_eq!(p.mem_spells[1], 0xFFFF_FFFF);
     }
 
     #[test]
