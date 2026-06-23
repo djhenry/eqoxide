@@ -9,7 +9,7 @@
 use eq_renderer::{assets, camera_state, config, eq_net, eqstr, http};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use winit::event_loop::EventLoop;
 
 fn main() {
@@ -176,7 +176,11 @@ fn main() {
         testzone_mode,
     );
     event_loop.run_app(&mut application).expect("event loop run");
-    // Exit cleanly so KDE doesn't report a crash when background threads
-    // (EQ network, HTTP server) are still running at process teardown time.
+    // Window closed: ask the EQ network thread to log the character out cleanly. It will
+    // process::exit(0) once the logout is sent (usually <300ms). Sleep is an upper bound that
+    // the network thread normally cuts short; it only fully elapses when not connected
+    // (e.g. --testzone), where this fallback hard-exit terminates the process.
+    shutdown.store(true, Ordering::Relaxed);
+    std::thread::sleep(std::time::Duration::from_millis(1500));
     std::process::exit(0);
 }
