@@ -728,6 +728,82 @@ impl ZoneAssets {
 
 }
 
+/// Base object name shared by a model's mesh (`NAME_DMSPRITEDEF`) and its placement's
+/// ActorDef reference (`NAME_ACTORDEF`), used to match the two.
+fn object_base_name(n: &str) -> String {
+    let u = n.to_uppercase();
+    for suf in ["_DMSPRITEDEF", "_ACTORDEF", "_DMSPRITE", "_DEF"] {
+        if let Some(s) = u.strip_suffix(suf) {
+            return s.to_string();
+        }
+    }
+    u
+}
+
+/// Extract all mesh primitives from every `.wld` in a PFS archive.
+/// Returns `(object_base_name, MeshData)` pairs; vertices already include `mesh.center()`.
+/// Used by `load_object_models` to resolve door/object model geometry by name.
+fn read_object_meshes(s3d: &Path) -> Result<Vec<(String, MeshData)>> {
+    let file = std::fs::File::open(s3d)
+        .with_context(|| format!("open {}", s3d.display()))?;
+    let mut pfs = libeq_pfs::PfsReader::open(file)?;
+    let names: Vec<String> = pfs.filenames()?;
+    let mut out: Vec<(String, MeshData)> = Vec::new();
+    for wn in names.iter().filter(|f| f.to_lowercase().ends_with(".wld")) {
+        let bytes = match pfs.get(wn) { Ok(Some(b)) => b, _ => continue };
+        let wld = match libeq_wld::load(&bytes) { Ok(w) => w, Err(_) => continue };
+        for mesh in wld.meshes() {
+            let base = match mesh.name() { Some(n) => object_base_name(n), None => continue };
+            let all_pos = mesh.positions();
+            if all_pos.is_empty() { continue; }
+            let (cx, cy, cz) = mesh.center();
+            let all_nrm = mesh.normals();
+            let all_uv = mesh.texture_coordinates();
+            for prim in mesh.primitives() {
+                let idx: Vec<u32> = prim.indices();
+                if idx.is_empty() { continue; }
+                let positions: Vec<[f32; 3]> = idx.iter()
+                    .map(|&i| { let p = all_pos[i as usize]; [p[0] + cx, p[1] + cy, p[2] + cz] })
+                    .collect();
+                let normals: Vec<[f32; 3]> = idx.iter()
+                    .map(|&i| all_nrm.get(i as usize).copied().unwrap_or([0.0, 0.0, 1.0]))
+                    .collect();
+                let uvs: Vec<[f32; 2]> = idx.iter()
+                    .map(|&i| all_uv.get(i as usize).copied().unwrap_or([0.0, 0.0]))
+                    .collect();
+                let texture_name = prim.material().base_color_texture().and_then(|t| t.source());
+                out.push((base.clone(), MeshData {
+                    positions, normals, uvs,
+                    indices: (0..idx.len() as u32).collect(),
+                    texture_name, base_color: [1.0, 1.0, 1.0, 1.0], center: [0.0, 0.0, 0.0],
+                }));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Index object/door model meshes by uppercase base name from BOTH the main zone `.wld`(s)
+/// and the companion `_obj.wld`. Door models (e.g. `"DOOR1"`) may be defined in either
+/// archive. Meshes are returned in libeq space (vertices include `mesh.center()`).
+///
+/// Both archives are optional — if one is missing or fails to parse it is skipped silently.
+pub fn load_object_models(
+    main_s3d: &Path,
+    obj_s3d: &Path,
+) -> Result<std::collections::HashMap<String, Vec<MeshData>>> {
+    use std::collections::HashMap;
+    let mut models: HashMap<String, Vec<MeshData>> = HashMap::new();
+    for s3d in [obj_s3d, main_s3d] {
+        if !s3d.exists() { continue; }
+        let pairs = match read_object_meshes(s3d) { Ok(p) => p, Err(_) => continue };
+        for (base, mesh) in pairs {
+            models.entry(base.to_uppercase()).or_default().push(mesh);
+        }
+    }
+    Ok(models)
+}
+
 /// Index every BMP/DDS texture filename in an S3D archive to its path (lowercase keys).
 /// No decoding — cheap startup scan. Errors are logged and ignored.
 pub fn index_s3d_textures(
@@ -1031,6 +1107,23 @@ mod tests {
 
     /// Movement collision: walking toward the wall at east=5 is blocked; walking
     /// parallel to it (along north) or away from it is clear.
+    #[test]
+    #[ignore = "requires ~/eq_assets/EQ_Files/qeynos.s3d + qeynos_obj.s3d"]
+    fn loads_a_known_door_model() {
+        let ap = std::path::PathBuf::from(std::env::var("HOME").unwrap())
+            .join("eq_assets/EQ_Files");
+        let main = ap.join("qeynos.s3d");
+        let obj  = ap.join("qeynos_obj.s3d");
+        if !main.exists() { eprintln!("assets missing; skipping"); return; }
+        let models = load_object_models(&main, &obj).expect("load");
+        assert!(models.contains_key("DOOR1"), "DOOR1 not found; keys (sample): {:?}",
+                models.keys().filter(|k| k.contains("DOOR") || k.starts_with("PORT"))
+                      .collect::<Vec<_>>());
+        let meshes = &models["DOOR1"];
+        assert!(!meshes.is_empty(), "DOOR1 has no meshes");
+        assert!(meshes.iter().all(|m| !m.positions.is_empty()), "some DOOR1 mesh has no positions");
+    }
+
     #[test]
     fn collision_path_clear_blocks_walking_into_wall() {
         // Vertical wall at world east=5: libeq p2=5 (render.X), north=p0 [0,10], height=p1 [0,10].
