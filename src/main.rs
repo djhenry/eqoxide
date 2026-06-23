@@ -77,6 +77,7 @@ fn main() {
     let inventory:        http::InventoryShared = Arc::new(Mutex::new(Vec::new()));
     let loot:             http::LootReq         = Arc::new(Mutex::new(None));
     let door_click:       http::DoorClickReq    = Arc::new(Mutex::new(None));
+    let doors_shared:     http::DoorsShared     = Arc::new(Mutex::new(Vec::new()));
     let messages:         http::MessagesShared  = Arc::new(Mutex::new(Vec::new()));
     let cast:             http::CastReq         = Arc::new(Mutex::new(None));
     let sit:              http::SitReq          = Arc::new(Mutex::new(None));
@@ -111,6 +112,7 @@ fn main() {
         let iv  = inventory.clone();
         let lt  = loot.clone();
         let dc  = door_click.clone();
+        let ds  = doors_shared.clone();
         let mg  = messages.clone();
         let ca  = cast.clone();
         let st  = sit.clone();
@@ -121,7 +123,7 @@ fn main() {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, zc, hl, sy, tg, at, by, mv, gv, iv, lt, dc, mg, ca, st, co, sc, md, sd).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, zc, hl, sy, tg, at, by, mv, gv, iv, lt, dc, ds, mg, ca, st, co, sc, md, sd).await {
                     eprintln!("EQ: fatal: {e}");
                 }
             });
@@ -165,6 +167,8 @@ fn main() {
         spells.clone(),
         player_info,
         task_log,
+        door_click,
+        doors_shared,
         shutdown.clone(),
         app_cfg.http_port,
     );
