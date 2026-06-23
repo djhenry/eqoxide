@@ -466,6 +466,9 @@ impl App {
             let h_cw = crate::eq_net::protocol::ccw_to_cw(gs.player_heading);
             *self.player_info.lock().unwrap() = crate::http::PlayerState {
                 zone:       gs.zone_name.clone(),
+                race:       gs.player_race.clone(),
+                class:      gs.player_class.clone(),
+                level:      gs.player_level as u32,
                 pos_east:   pos[0],
                 pos_north:  pos[1],
                 pos_up:     pos[2],
