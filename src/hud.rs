@@ -60,6 +60,31 @@ fn stat_bar(
     ui.label(format!("{:.0}%", pct));
 }
 
+/// Load spells01..07.tga as egui textures. Returns [] if the directory/files are absent
+/// (graceful — gems fall back to text labels).
+pub fn load_spell_icons(ctx: &egui::Context) -> Vec<egui::TextureHandle> {
+    let dir = std::env::var("EQ_SPELL_ICONS_DIR")
+        .unwrap_or_else(|_| "~/git/original-client/uifiles/default".to_string());
+    let mut out = Vec::new();
+    for n in 1..=7 {
+        let path = format!("{dir}/spells0{n}.tga");
+        match image::open(&path) {
+            Ok(img) => {
+                let rgba = img.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                let tex = ctx.load_texture(
+                    format!("spellicons{n}"),
+                    egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba),
+                    egui::TextureOptions::NEAREST,
+                );
+                out.push(tex);
+            }
+            Err(_) => break,
+        }
+    }
+    out
+}
+
 pub fn draw_fps(ctx: &egui::Context, fps: f32) {
     egui::Area::new(egui::Id::new("fps_counter"))
         .anchor(egui::Align2::LEFT_TOP, canvas_off(ctx, egui::Align2::LEFT_TOP, [8.0, 8.0]))
@@ -375,6 +400,7 @@ pub fn draw_action_grid(
     ctx:      &egui::Context,
     scene:    &SceneState,
     spells:   &crate::spells::SpellDb,
+    icons:    &[egui::TextureHandle],
     attack:   &crate::http::AttackReq,
     cast:     &crate::http::CastReq,
     sit:      &crate::http::SitReq,
@@ -417,6 +443,31 @@ pub fn draw_action_grid(
             ui.horizontal(|ui| {
                 for (gem, &spell_id) in scene.mem_spells.iter().enumerate() {
                     let empty = spell_id == 0 || spell_id == 0xFFFF_FFFF;
+                    // Icon path: non-empty gem + a loaded sheet for this spell's icon.
+                    if !empty {
+                        if let Some(info) = spells.get(spell_id) {
+                            let (sheet, col, row) = crate::spells::icon_cell(info.icon_id);
+                            if let Some(tex) = icons.get(sheet) {
+                                let cw = 1.0 / crate::spells::ICON_COLS as f32;
+                                let ch = 1.0 / crate::spells::ICON_ROWS as f32;
+                                let uv = egui::Rect::from_min_size(
+                                    egui::pos2(col as f32 * cw, row as f32 * ch),
+                                    egui::vec2(cw, ch));
+                                let img = egui::Image::new(egui::load::SizedTexture::from_handle(tex))
+                                    .uv(uv)
+                                    .fit_to_exact_size(egui::vec2(36.0, 36.0));
+                                let resp = ui.add(egui::ImageButton::new(img))
+                                    .on_hover_text(&info.name);
+                                if resp.clicked() {
+                                    *cast.lock().unwrap() = Some(crate::http::CastRequest {
+                                        gem: gem as u8, target_id: None,
+                                    });
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    // Text fallback: empty gem, or no icon sheet loaded.
                     let label = if empty { "\u{2014}".to_string() }
                         else { spells.get(spell_id).map(|s| s.name.clone())
                                  .unwrap_or_else(|| format!("{spell_id}")) };

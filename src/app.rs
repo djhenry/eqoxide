@@ -140,6 +140,10 @@ pub struct App {
     show_debug: bool,
     /// Whether the inventory/equipment window is open (toggled by the HUD button or the I key).
     show_inventory: bool,
+    /// Cached egui textures for spell-gem icons (spells01..07.tga). Empty until first render.
+    spell_icons: Vec<egui::TextureHandle>,
+    /// True once `load_spell_icons` has been attempted (avoids retrying every frame after failure).
+    tried_icons: bool,
     /// Cached global UI zoom factor (min(w/1920, h/1080) / dpi) and the surface size it was computed
     /// for — recomputed only when the size changes, not every frame.
     ui_zoom: f32,
@@ -221,6 +225,8 @@ impl App {
             testzone_mode,
             show_debug: false,
             show_inventory: false,
+            spell_icons: Vec::new(),
+            tried_icons: false,
             ui_zoom: 1.0,
             ui_zoom_size: (0, 0),
         }
@@ -857,6 +863,14 @@ impl App {
         self.pick_screen_w  = renderer.surface_config.width;
         self.pick_screen_h  = renderer.surface_config.height;
 
+        // Lazily load spell-gem icon atlases (needs egui Context, only available at render time).
+        if !self.tried_icons {
+            if let Some(ctx) = &self.egui_ctx {
+                self.spell_icons = hud::load_spell_icons(ctx);
+                self.tried_icons = true;
+            }
+        }
+
         // Egui pass — use associated function to avoid reborrowing self.
         let load_status_text = self.load_status.lock().unwrap().clone();
         Self::egui_pass(
@@ -868,6 +882,7 @@ impl App {
             cam_eye, self.collision.as_deref(),
             &self.hail, &self.say, &self.target, &mut self.say_buffer,
             &self.attack, &self.cast, &self.sit, &self.consider, &self.spells,
+            &self.spell_icons,
             &mut self.show_inventory,
             &mut self.ui_zoom, &mut self.ui_zoom_size,
             self.show_debug, self.game_state.server_corrections,
@@ -921,6 +936,7 @@ impl App {
         sit:           &crate::http::SitReq,
         consider:      &crate::http::ConsiderReq,
         spells:        &crate::spells::SpellDb,
+        spell_icons:   &[egui::TextureHandle],
         show_inventory: &mut bool,
         ui_zoom:       &mut f32,
         ui_zoom_size:  &mut (u32, u32),
@@ -958,7 +974,7 @@ impl App {
                 hud::draw_labels(ctx, scene, view_proj, screen_w, screen_h, cam_eye, collision);
                 hud::draw_minimap(ctx, scene, zone_min, zone_max, minimap_zoom, minimap_full, zone_map);
                 hud::draw_control_bar(ctx, scene, hail, say, target, say_buffer);
-                hud::draw_action_grid(ctx, scene, spells, attack, cast, sit, target, consider);
+                hud::draw_action_grid(ctx, scene, spells, spell_icons, attack, cast, sit, target, consider);
                 hud::draw_inventory(ctx, scene, show_inventory);
                 if show_debug {
                     hud::draw_debug_overlay(ctx, scene.player_pos, scene.player_heading, current_zone, corrections);
