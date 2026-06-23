@@ -228,7 +228,10 @@ pub fn encode_door_pass(
         let key = door.name.to_uppercase();
         let mat = if r.door_models.contains_key(&key) {
             let scale = door.size as f32 / 100.0;
-            let yaw   = -(door.heading / 512.0) * std::f32::consts::TAU;
+            // Door heading is raw EQ units (0..512). Match the entity/player convention
+            // (camera::entity_model_matrix_heading): yaw = heading_deg.to_radians() + 90°,
+            // where heading_deg = units * 360/512, so heading*TAU/512 + FRAC_PI_2.
+            let yaw   = (door.heading / 512.0) * std::f32::consts::TAU + std::f32::consts::FRAC_PI_2;
             let placement = glam::Mat4::from_translation(glam::Vec3::from(door.pos))
                 * glam::Mat4::from_rotation_z(yaw)
                 * glam::Mat4::from_rotation_y((door.incline as f32 / 512.0) * std::f32::consts::TAU)
