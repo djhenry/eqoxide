@@ -400,6 +400,31 @@ pub fn parse_player_profile(payload: &[u8]) -> Option<ProfileInfo> {
     })
 }
 
+pub fn parse_begin_cast(p: &[u8]) -> Option<(u16, u16, u32)> {
+    if p.len() < 8 { return None; }
+    Some((
+        u16::from_le_bytes([p[0], p[1]]),
+        u16::from_le_bytes([p[2], p[3]]),
+        u32::from_le_bytes([p[4], p[5], p[6], p[7]]),
+    ))
+}
+
+pub fn parse_mana_change(p: &[u8]) -> Option<u32> {
+    if p.len() < 4 { return None; }
+    Some(u32::from_le_bytes([p[0], p[1], p[2], p[3]]))
+}
+
+pub fn parse_memorize_spell(p: &[u8]) -> Option<(u32, u32, u32)> {
+    if p.len() < 12 { return None; }
+    let r = |o: usize| u32::from_le_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]]);
+    Some((r(0), r(4), r(8)))
+}
+
+pub fn parse_interrupt_cast(p: &[u8]) -> Option<u32> {
+    if p.len() < 4 { return None; }
+    Some(u32::from_le_bytes([p[0], p[1], p[2], p[3]]))
+}
+
 fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
     if let Some(p) = parse_player_profile(payload) {
         if (1..=65).contains(&p.level) {
@@ -829,7 +854,8 @@ pub fn register_spawn(gs: &mut GameState, spawn: Spawn_S) {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_emote, class_name, con_color, consider_message, parse_player_profile};
+    use super::{apply_emote, class_name, con_color, consider_message, parse_player_profile,
+                parse_begin_cast, parse_mana_change, parse_memorize_spell, parse_interrupt_cast};
     use crate::game_state::GameState;
 
     #[test]
@@ -1099,5 +1125,24 @@ mod tests {
         assert_eq!(e.equipment[1], 17);
         assert_eq!(e.equipment_tint[1], [30, 20, 10]); // wire BGR [10,20,30] → stored RGB
         assert_eq!(e.gender, 1);
+    }
+
+    #[test]
+    fn parse_begin_cast_reads_fields() {
+        let mut b = [0u8; 8];
+        b[0..2].copy_from_slice(&55u16.to_le_bytes());   // caster
+        b[2..4].copy_from_slice(&200u16.to_le_bytes());  // spell
+        b[4..8].copy_from_slice(&3500u32.to_le_bytes()); // cast_time ms
+        assert_eq!(parse_begin_cast(&b), Some((55, 200, 3500)));
+        assert_eq!(parse_begin_cast(&[0u8; 4]), None);
+    }
+
+    #[test]
+    fn parse_memorize_spell_reads_slot_and_scribing() {
+        let mut b = [0u8; 16];
+        b[0..4].copy_from_slice(&2u32.to_le_bytes());   // slot
+        b[4..8].copy_from_slice(&200u32.to_le_bytes()); // spell_id
+        b[8..12].copy_from_slice(&3u32.to_le_bytes());  // scribing = spellbar re-enable
+        assert_eq!(parse_memorize_spell(&b), Some((2, 200, 3)));
     }
 }
