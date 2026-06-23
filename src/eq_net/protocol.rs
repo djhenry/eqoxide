@@ -104,6 +104,15 @@ pub const OP_AUTO_ATTACK2: u16 = 0x0701;
 pub const OP_TARGET_COMMAND: u16 = 0x1477;
 pub const OP_TARGET_MOUSE: u16   = 0x6c47; // sets server-side m_Target for combat
 pub const OP_CONSIDER: u16 = 0x65ca;
+
+// ── Gameplay: spellcasting ────────────────────────────────────────────────
+
+pub const OP_CAST_SPELL: u16 = 0x304b;
+pub const OP_BEGIN_CAST: u16 = 0x3990;
+pub const OP_MANA_CHANGE: u16 = 0x4839;
+pub const OP_MEMORIZE_SPELL: u16 = 0x308e;
+pub const OP_INTERRUPT_CAST: u16 = 0x0000; // native/pass-through value
+
 // Merchant/shop (Titanium): open a merchant, then buy an item from its inventory slot.
 pub const OP_SHOP_REQUEST: u16 = 0x45f9;     // MerchantClick_Struct (open/close)
 pub const OP_SHOP_PLAYER_BUY: u16 = 0x221e;  // Merchant_Sell_Struct (buy from slot)

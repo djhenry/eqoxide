@@ -35,6 +35,27 @@ pub fn build_consider_packet(player_id: u32, target_id: u32) -> Vec<u8> {
     buf
 }
 
+/// Titanium `CastSpell_Struct` (20 bytes): slot, spell_id, inventoryslot, target_id, unk[4].
+/// `slot` is the gem index 0-8 for a memorized-gem cast; inventoryslot 0xFFFF = gem cast.
+pub fn build_cast_packet(slot: u32, spell_id: u32, target_id: u32) -> Vec<u8> {
+    let mut buf = vec![0u8; 20];
+    buf[0..4].copy_from_slice(&slot.to_le_bytes());
+    buf[4..8].copy_from_slice(&spell_id.to_le_bytes());
+    buf[8..12].copy_from_slice(&0xFFFFu32.to_le_bytes());
+    buf[12..16].copy_from_slice(&target_id.to_le_bytes());
+    buf
+}
+
+/// Titanium `SpawnAppearance_Struct` (8 bytes): spawn_id(u16), type(u16), parameter(u32).
+/// For sit/stand: kind=14 (Animation), parameter=110 (sit) / 100 (stand).
+pub fn build_spawn_appearance_packet(spawn_id: u16, kind: u16, parameter: u32) -> Vec<u8> {
+    let mut buf = vec![0u8; 8];
+    buf[0..2].copy_from_slice(&spawn_id.to_le_bytes());
+    buf[2..4].copy_from_slice(&kind.to_le_bytes());
+    buf[4..8].copy_from_slice(&parameter.to_le_bytes());
+    buf
+}
+
 /// Build a Titanium `ChannelMessage_Struct` for the Say channel (used for NPC hails).
 ///
 /// Layout (see EQEmu common/patches/titanium_structs.h):
@@ -806,5 +827,27 @@ mod tests {
         // sender/target fields are 64 bytes; name capped at 63 + null padding.
         assert_eq!(p[63], 0, "targetname must stay null-terminated within 64 bytes");
         assert_eq!(p[127], 0, "sender must stay null-terminated within 64 bytes");
+    }
+
+    #[test]
+    fn cast_packet_layout() {
+        // gem 0, spell 200, target 1234 → [0, 200, 0xFFFF, 1234, 0] all u32 LE = 20 bytes.
+        let p = build_cast_packet(0, 200, 1234);
+        assert_eq!(p.len(), 20);
+        assert_eq!(&p[0..4], &0u32.to_le_bytes());
+        assert_eq!(&p[4..8], &200u32.to_le_bytes());
+        assert_eq!(&p[8..12], &0xFFFFu32.to_le_bytes());
+        assert_eq!(&p[12..16], &1234u32.to_le_bytes());
+        assert_eq!(&p[16..20], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn spawn_appearance_sit_layout() {
+        // self 77, type 14 (Animation), 110 (sit) → 8 bytes: u16 id, u16 type, u32 param.
+        let p = build_spawn_appearance_packet(77, 14, 110);
+        assert_eq!(p.len(), 8);
+        assert_eq!(&p[0..2], &77u16.to_le_bytes());
+        assert_eq!(&p[2..4], &14u16.to_le_bytes());
+        assert_eq!(&p[4..8], &110u32.to_le_bytes());
     }
 }
