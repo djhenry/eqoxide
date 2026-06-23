@@ -56,6 +56,19 @@ pub fn build_spawn_appearance_packet(spawn_id: u16, kind: u16, parameter: u32) -
     buf
 }
 
+/// OP_ClickDoor payload: ClickDoor_Struct (16 bytes). The lite client is an observer —
+/// picklockskill and item_id are 0; the server only uses doorid for lookup and reads
+/// skills/inventory from the Client object. player_id is our own spawn id (u16).
+pub fn build_click_door(door_id: u8, player_id: u32) -> Vec<u8> {
+    let mut buf = vec![0u8; 16];
+    buf[0] = door_id;                                       // doorid @0x00
+    // [1..4] action/unknown = 0
+    buf[4] = 0;                                             // picklockskill @0x04
+    // [8..12] item_id = 0
+    buf[12..14].copy_from_slice(&(player_id as u16).to_le_bytes()); // player_id @0x0c
+    buf
+}
+
 /// Build a Titanium `ChannelMessage_Struct` for the Say channel (used for NPC hails).
 ///
 /// Layout (see EQEmu common/patches/titanium_structs.h):
@@ -934,5 +947,21 @@ mod tests {
         assert_eq!(&p[0..2], &77u16.to_le_bytes());
         assert_eq!(&p[2..4], &14u16.to_le_bytes());
         assert_eq!(&p[4..8], &110u32.to_le_bytes());
+    }
+}
+
+#[cfg(test)]
+mod door_tests {
+    use super::*;
+
+    #[test]
+    fn click_door_layout() {
+        let pkt = build_click_door(7, 0x1234);
+        assert_eq!(pkt.len(), 16);
+        assert_eq!(pkt[0], 7);            // doorid @0
+        assert_eq!(pkt[4], 0);            // picklockskill @4 = 0 (observer)
+        assert_eq!(&pkt[8..12], &[0, 0, 0, 0]); // item_id @8 = 0
+        assert_eq!(&pkt[12..14], &0x1234u16.to_le_bytes()); // player_id @12
+        assert_eq!(&pkt[14..16], &[0, 0]); // trailing unknowns zero
     }
 }
