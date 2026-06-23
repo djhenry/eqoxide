@@ -225,13 +225,29 @@ pub fn encode_door_pass(
         if model_meshes.is_empty() { continue; }
 
         // Build the placement matrix. Fallback cube uses translate-only (no model orientation).
-        let mat = if r.door_models.contains_key(&door.name.to_uppercase()) {
+        let key = door.name.to_uppercase();
+        let mat = if r.door_models.contains_key(&key) {
             let scale = door.size as f32 / 100.0;
             let yaw   = -(door.heading / 512.0) * std::f32::consts::TAU;
-            glam::Mat4::from_translation(glam::Vec3::from(door.pos))
+            let placement = glam::Mat4::from_translation(glam::Vec3::from(door.pos))
                 * glam::Mat4::from_rotation_z(yaw)
                 * glam::Mat4::from_rotation_y((door.incline as f32 / 512.0) * std::f32::consts::TAU)
-                * glam::Mat4::from_scale(glam::Vec3::splat(scale))
+                * glam::Mat4::from_scale(glam::Vec3::splat(scale));
+
+            // Apply open animation in door-local model space (after scale).
+            let f = door.open_frac;
+            let local_open = match door.opentype {
+                100..=119 => glam::Mat4::from_translation(glam::vec3(0.0, 0.0, 10.0 * f)),
+                11..=15   => glam::Mat4::from_translation(glam::vec3(8.0 * f, 0.0, 0.0)),
+                _ => {
+                    // Hinged swing: rotate ~90° about the model's minimum-X edge.
+                    let hinge = r.door_hinge_x.get(&key).copied().unwrap_or(0.0);
+                    glam::Mat4::from_translation(glam::vec3(hinge, 0.0, 0.0))
+                        * glam::Mat4::from_rotation_z(f * std::f32::consts::FRAC_PI_2)
+                        * glam::Mat4::from_translation(glam::vec3(-hinge, 0.0, 0.0))
+                }
+            };
+            placement * local_open
         } else {
             glam::Mat4::from_translation(glam::Vec3::from(door.pos))
         };

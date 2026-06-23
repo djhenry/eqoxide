@@ -115,6 +115,9 @@ pub struct EqRenderer {
     /// Drawn untextured with the fallback texture + per-mesh base_color (object models from
     /// `load_object_models` do not carry decoded textures the way weapons do).
     pub door_models: std::collections::HashMap<String, crate::gpu::GpuWeapon>,
+    /// Minimum local-X coordinate (render-space width axis) for each door model, keyed by
+    /// UPPERCASE name. Used as the hinge pivot when animating swing-type doors (Task 9).
+    pub door_hinge_x: std::collections::HashMap<String, f32>,
     /// Dedicated per-frame uniform pool for door draws (kept separate from the entity pool to
     /// avoid frame-collision with the entity pass).
     pub door_uniform_pool: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
@@ -231,6 +234,7 @@ impl EqRenderer {
             assets_path: std::path::PathBuf::new(),
             weapon_cache: std::collections::HashMap::new(),
             door_models: std::collections::HashMap::new(),
+            door_hinge_x: std::collections::HashMap::new(),
             door_uniform_pool,
             warned_missing_doors: std::collections::HashSet::new(),
             door_fallback,
@@ -685,6 +689,7 @@ impl EqRenderer {
     pub fn load_door_models(&mut self, main_s3d: &std::path::Path, obj_s3d: &std::path::Path) {
         use wgpu::util::DeviceExt;
         self.door_models.clear();
+        self.door_hinge_x.clear();
         self.warned_missing_doors.clear();
 
         let models = match crate::assets::load_object_models(main_s3d, obj_s3d) {
@@ -697,14 +702,18 @@ impl EqRenderer {
 
         for (name, meshes) in models {
             let mut gpu_meshes = Vec::new();
+            let mut min_x = f32::MAX;
             for m in &meshes {
                 if m.positions.is_empty() || m.indices.is_empty() { continue; }
                 let [cx, cy, cz] = m.center;
                 // libeq [p0,p1,p2] -> render [p2,p0,p1] (same axis convention as weapons/zone).
                 let verts: Vec<Vertex> = m.positions.iter().enumerate().map(|(i, &p)| {
                     let n = m.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
+                    // Track minimum render-local X (width axis) for hinge pivot computation.
+                    let rx = p[2] + cz;
+                    if rx < min_x { min_x = rx; }
                     Vertex {
-                        position: [p[2] + cz, p[0] + cx, p[1] + cy],
+                        position: [rx, p[0] + cx, p[1] + cy],
                         normal:   [n[2], n[0], n[1]],
                         uv:       m.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
                     }
@@ -721,6 +730,9 @@ impl EqRenderer {
                     texture_idx: None, base_color: m.base_color });
             }
             if gpu_meshes.is_empty() { continue; }
+            // Store hinge pivot (minimum X in render-local space) for swing-door animation.
+            let hinge = if min_x == f32::MAX { 0.0 } else { min_x };
+            self.door_hinge_x.insert(name.to_uppercase(), hinge);
             // texture_bind_groups intentionally empty — doors render with the fallback texture.
             self.door_models.insert(name, crate::gpu::GpuWeapon {
                 meshes: gpu_meshes, texture_bind_groups: Vec::new() });
