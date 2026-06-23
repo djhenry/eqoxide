@@ -61,6 +61,15 @@ pub async fn run_gameplay_phase(
                     s.send_app_packet(OP_LOOT_ITEM, &packet.payload);
                     eprintln!("EQ: auto-loot: taking item (echoed OP_LootItem)");
                 }
+                // Server booted us (typically another client logged in this same character).
+                // EQEmu's default is "second login wins"; the first client receives OP_GMKick.
+                // We're already kicked, so just disconnect the session and exit cleanly.
+                OP_GMKICK => {
+                    eprintln!("EQ: OP_GMKick — disconnected (character logged in elsewhere)");
+                    gs.log_msg("system", "Disconnected: this character was logged in from another location.");
+                    s.send_session_disconnect();
+                    std::process::exit(0);
+                }
                 OP_REQUEST_CLIENT_ZONE_CHANGE if packet.payload.len() >= 24 => {
                     // Server wants us to move — either a zone transition or a same-zone teleport.
                     // Parse RequestClientZoneChange_Struct (24 bytes):
