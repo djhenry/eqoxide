@@ -473,7 +473,7 @@ pub fn apply_begin_cast(gs: &mut GameState, p: &[u8]) {
     }
 }
 
-pub fn apply_mana_change(gs: &mut GameState, p: &[u8]) {
+pub fn apply_mana_change(_gs: &mut GameState, p: &[u8]) {
     if let Some(_new_mana) = parse_mana_change(p) {
         // mana_pct is updated from HP/mana update packets elsewhere; keepcasting handling:
         // a mana change with the spell landing ends the optimistic cast bar.
