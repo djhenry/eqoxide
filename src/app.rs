@@ -140,6 +140,7 @@ pub struct App {
     show_debug: bool,
     /// Whether the inventory/equipment window is open (toggled by the HUD button or the I key).
     show_inventory: bool,
+    ui_layout: crate::ui_layout::UiLayout,
     /// Cached egui textures for spell-gem icons (spells01..07.tga). Empty until first render.
     spell_icons: Vec<egui::TextureHandle>,
     /// True once `load_spell_icons` has been attempted (avoids retrying every frame after failure).
@@ -173,6 +174,7 @@ impl App {
         warp:            crate::http::WarpReq,
         testzone_mode:   bool,
     ) -> Self {
+        let ui_layout = crate::ui_layout::UiLayout::load(&character_name);
         let mut game_state = GameState::new();
         game_state.player_name = character_name;
 
@@ -225,6 +227,7 @@ impl App {
             testzone_mode,
             show_debug: false,
             show_inventory: false,
+            ui_layout,
             spell_icons: Vec::new(),
             tried_icons: false,
             ui_zoom: 1.0,
@@ -877,7 +880,7 @@ impl App {
         // Egui pass — use associated function to avoid reborrowing self.
         let load_status_text = self.load_status.lock().unwrap().clone();
         Self::egui_pass(
-            &mut self.egui_state, &mut self.egui_renderer, &self.egui_ctx, &self.window,
+            &mut self.egui_state, &mut self.egui_renderer, &self.egui_ctx, &mut self.ui_layout, &self.window,
             &mut enc, &view, renderer, self.loading, &self.current_zone, &load_status_text,
             &self.scene, self.zone_min, self.zone_max,
             &mut self.minimap_zoom, &mut self.minimap_full,
@@ -914,6 +917,7 @@ impl App {
         egui_state:    &mut Option<egui_winit::State>,
         egui_renderer: &mut Option<egui_wgpu::Renderer>,
         egui_ctx:      &Option<egui::Context>,
+        ui_layout:     &mut crate::ui_layout::UiLayout,
         window:        &Option<Arc<Window>>,
         encoder:       &mut wgpu::CommandEncoder,
         view:          &wgpu::TextureView,
@@ -971,19 +975,22 @@ impl App {
             if loading {
                 hud::draw_loading(ctx, current_zone, load_status);
             } else {
-                hud::draw_hud(ctx, scene, "EQ Observer");
-                hud::draw_quest_dialogue(ctx, scene, say);
-                hud::draw_message_log(ctx, scene);
+                hud::draw_ui_menu(ctx, ui_layout);
+                hud::draw_hud(ctx, ui_layout, scene, "EQ Observer");
+                hud::draw_quest_dialogue(ctx, ui_layout, scene, say);
+                hud::draw_message_log(ctx, ui_layout, scene);
                 hud::draw_labels(ctx, scene, view_proj, screen_w, screen_h, cam_eye, collision);
-                hud::draw_minimap(ctx, scene, zone_min, zone_max, minimap_zoom, minimap_full, zone_map);
-                hud::draw_control_bar(ctx, scene, hail, say, target, say_buffer);
-                hud::draw_action_grid(ctx, scene, spells, spell_icons, attack, cast, sit, target, consider);
-                hud::draw_inventory(ctx, scene, show_inventory);
+                hud::draw_minimap(ctx, ui_layout, scene, zone_min, zone_max, minimap_zoom, minimap_full, zone_map);
+                hud::draw_control_bar(ctx, ui_layout, scene, hail, say, target, say_buffer);
+                hud::draw_action_grid(ctx, ui_layout, scene, spells, spell_icons, attack, cast, sit, target, consider);
+                hud::draw_inventory(ctx, ui_layout, scene, show_inventory);
                 if show_debug {
                     hud::draw_debug_overlay(ctx, scene.player_pos, scene.player_heading, current_zone, corrections);
                 }
             }
         });
+        ui_layout.end_frame();
+        ui_layout.maybe_save();
         egui_state.handle_platform_output(window, full_output.platform_output);
         // egui auto-enables IME when a text field is focused; on Linux that hands keystrokes
         // to the system IME (fcitx/ibus) which composes instead of delivering them, so the
@@ -1088,7 +1095,7 @@ impl ApplicationHandler for App {
         }
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => { self.ui_layout.save_now(); event_loop.exit(); }
 
             WindowEvent::Resized(size) => {
                 if let Some((surface, renderer)) = &mut self.gpu {
@@ -1174,6 +1181,13 @@ impl ApplicationHandler for App {
                                 }
                                 KeyCode::KeyI => {
                                     self.show_inventory = !self.show_inventory;
+                                }
+                                KeyCode::KeyL
+                                    if self.keys_held.contains(&KeyCode::ControlLeft)
+                                        || self.keys_held.contains(&KeyCode::ControlRight) =>
+                                {
+                                    self.ui_layout.locked = !self.ui_layout.locked;
+                                    self.ui_layout.set_dirty_locked();
                                 }
                                 _ => {}
                             }
