@@ -153,6 +153,15 @@ pub struct App {
     /// for — recomputed only when the size changes, not every frame.
     ui_zoom: f32,
     ui_zoom_size: (u32, u32),
+    /// Asset-sync progress fraction (0.0–1.0) shown on the loading screen; None when not syncing.
+    sync_progress: std::sync::Arc<std::sync::Mutex<Option<f32>>>,
+    /// Set to Some(Ok(())) when the common-model sync finishes, Some(Err(msg)) on failure.
+    sync_done: std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>,
+    /// True once character models have been loaded from the cache (guards one-time load).
+    models_loaded: bool,
+    asset_server_url: String,
+    asset_user: String,
+    asset_pass: String,
 }
 
 impl App {
@@ -178,6 +187,9 @@ impl App {
         warp:            crate::http::WarpReq,
         testzone_mode:   bool,
         shutdown:        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        asset_server_url: String,
+        asset_user:       String,
+        asset_pass:       String,
     ) -> Self {
         let ui_layout = crate::ui_layout::UiLayout::load(&character_name);
         let mut game_state = GameState::new();
@@ -237,6 +249,10 @@ impl App {
             tried_icons: false,
             ui_zoom: 1.0,
             ui_zoom_size: (0, 0),
+            sync_progress: Arc::new(Mutex::new(None)),
+            sync_done:     Arc::new(Mutex::new(None)),
+            models_loaded: false,
+            asset_server_url, asset_user, asset_pass,
         }
     }
 
@@ -397,6 +413,29 @@ impl App {
         *self.load_status.lock().unwrap() = String::new();
     }
 
+    /// Drains the asset-sync result on the main thread and loads character models
+    /// from the cache once the sync thread signals done.
+    fn poll_sync(&mut self) {
+        if self.models_loaded { return; }
+        let done = self.sync_done.lock().unwrap().take();
+        if let Some(result) = done {
+            match result {
+                Ok(()) => {
+                    if let Some((_, renderer)) = &mut self.gpu {
+                        renderer.load_character_models(&self.models_path, &self.assets_path);
+                    }
+                    self.models_loaded = true;
+                    self.loading = false;
+                    *self.sync_progress.lock().unwrap() = None;
+                }
+                Err(msg) => {
+                    *self.load_status.lock().unwrap() = msg;
+                    // stay on the loading screen showing the error; do not load blob fallback.
+                }
+            }
+        }
+    }
+
     // ── GPU initialisation ────────────────────────────────────────────────────
 
     fn init_gpu(&mut self, window: Arc<Window>) {
@@ -434,8 +473,59 @@ impl App {
             egui_ctx.clone(), egui::ViewportId::ROOT, &*window, None, None, None,
         );
         let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
-        let mut renderer  = EqRenderer::new(device, queue, surface_config);
-        renderer.load_character_models(&self.models_path, &self.assets_path);
+        let renderer  = EqRenderer::new(device, queue, surface_config);
+        // Resolve models to the cwd-independent XDG cache and sync the `common`
+        // set from the asset server before loading character models.
+        let cache = crate::asset_sync::CacheDirs::resolve();
+        self.models_path = cache.models_dir();
+        self.loading = true;
+        *self.load_status.lock().unwrap() = "Connecting to asset server…".to_string();
+
+        let url = self.asset_server_url.clone();
+        let user = self.asset_user.clone();
+        let pass = self.asset_pass.clone();
+        let status = self.load_status.clone();
+        let progress = self.sync_progress.clone();
+        let done = self.sync_done.clone();
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<()> {
+                let sync = crate::asset_sync::AssetSync::login(&url, &user, &pass)?;
+                *status.lock().unwrap() = "Verifying assets…".to_string();
+                crate::asset_sync::sync_set(&sync, "common", &cache, &mut |p| {
+                    match p.phase {
+                        crate::asset_sync::Phase::Verifying => {
+                            *status.lock().unwrap() = "Verifying assets…".to_string();
+                            *progress.lock().unwrap() = None;
+                        }
+                        crate::asset_sync::Phase::Downloading => {
+                            let mb = p.bytes as f64 / 1_048_576.0;
+                            *status.lock().unwrap() =
+                                format!("Downloading {}/{} ({:.1} MB)…", p.done, p.total, mb);
+                            let frac = if p.total > 0 { p.done as f32 / p.total as f32 } else { 1.0 };
+                            *progress.lock().unwrap() = Some(frac);
+                        }
+                    }
+                })?;
+                Ok(())
+            })();
+
+            // Fail loud unless the cache already satisfies us: if reassembled models
+            // exist, proceed; otherwise surface the error.
+            let satisfied = cache.models_dir().exists()
+                && std::fs::read_dir(cache.models_dir())
+                    .map(|mut d| d.any(|e| e.map(|e| e.path().extension().map_or(false, |x| x == "glb")).unwrap_or(false)))
+                    .unwrap_or(false);
+            let final_result = match result {
+                Ok(()) => Ok(()),
+                Err(e) if satisfied => {
+                    *status.lock().unwrap() =
+                        format!("Asset server unavailable ({e}); using cached models.");
+                    Ok(())
+                }
+                Err(e) => Err(format!("Asset sync failed and no cached models: {e}")),
+            };
+            *done.lock().unwrap() = Some(final_result);
+        });
         self.egui_ctx      = Some(egui_ctx);
         self.egui_state    = Some(egui_state);
         self.egui_renderer = Some(egui_renderer);
@@ -884,9 +974,11 @@ impl App {
 
         // Egui pass — use associated function to avoid reborrowing self.
         let load_status_text = self.load_status.lock().unwrap().clone();
+        let sync_frac = *self.sync_progress.lock().unwrap();
         Self::egui_pass(
             &mut self.egui_state, &mut self.egui_renderer, &self.egui_ctx, &mut self.ui_layout, &self.window,
             &mut enc, &view, renderer, self.loading, &self.current_zone, &load_status_text,
+            sync_frac,
             &self.scene, self.zone_min, self.zone_max,
             &mut self.minimap_zoom, &mut self.minimap_full,
             self.current_fps, self.zone_map.as_ref(),
@@ -930,6 +1022,7 @@ impl App {
         loading:       bool,
         current_zone:  &str,
         load_status:   &str,
+        sync_progress: Option<f32>,
         scene:         &SceneState,
         zone_min:      [f32; 2],
         zone_max:      [f32; 2],
@@ -978,7 +1071,7 @@ impl App {
         let full_output = egui_ctx.run(raw_input, |ctx| {
             hud::draw_fps(ctx, current_fps);
             if loading {
-                hud::draw_loading(ctx, current_zone, load_status, None);
+                hud::draw_loading(ctx, current_zone, load_status, sync_progress);
             } else {
                 hud::draw_ui_menu(ctx, ui_layout);
                 hud::draw_hud(ctx, ui_layout, scene, "EQ Observer");
@@ -1129,6 +1222,8 @@ impl ApplicationHandler for App {
                 }
                 // Check whether the background load thread finished; do GPU upload if so.
                 self.maybe_finish_load();
+                // Check whether the asset sync finished; load character models if so.
+                self.poll_sync();
             }
 
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {

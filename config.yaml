@@ -1,6 +1,3 @@
 renderer:
   assets_path: ~/eq_assets/EQ_Files
-  # BAND-AID: absolute (cwd-independent) so git worktrees render real glTF
-  # character models instead of falling back to the broken s3d "blob" path.
-  # Superseded by the eqoxide asset-sync XDG cache (Spec B).
-  models_path: ~/git/eq_client_lite/assets/models
+  asset_server_url: http://localhost:8088

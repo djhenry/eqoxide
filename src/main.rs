@@ -78,6 +78,9 @@ fn main() {
 
     // EQ network task — skipped in --testzone mode (offline debug)
     let character_name = login_cfg.character_name.clone();
+    let asset_user     = login_cfg.username.clone();
+    let asset_pass     = login_cfg.password.clone();
+    let asset_server_url = app_cfg.asset_server_url.clone();
     if !testzone_mode {
         let gt  = goto_target.clone();
         let ep  = entity_positions.clone();
@@ -175,6 +178,9 @@ fn main() {
         warp,
         testzone_mode,
         shutdown.clone(),
+        asset_server_url,
+        asset_user,
+        asset_pass,
     );
     event_loop.run_app(&mut application).expect("event loop run");
     // The event loop has now exited gracefully — either the window was closed, or a shutdown was
