@@ -7,7 +7,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::{GameState, ZonePoint};
-use crate::http::{AttackReq, BuyReq, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
+use crate::http::{AttackReq, BuyReq, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, CastReq, SitReq, ConsiderReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
 
 /// Pending state of a quest turn-in (POST /give). The trade window spans multiple nav ticks:
 /// we send OP_TradeRequest, then must wait for the server's OP_TradeRequestAck before moving the
@@ -32,6 +32,27 @@ pub fn build_consider_packet(player_id: u32, target_id: u32) -> Vec<u8> {
     let mut buf = vec![0u8; 28];
     buf[0..4].copy_from_slice(&player_id.to_le_bytes());
     buf[4..8].copy_from_slice(&target_id.to_le_bytes());
+    buf
+}
+
+/// Titanium `CastSpell_Struct` (20 bytes): slot, spell_id, inventoryslot, target_id, unk[4].
+/// `slot` is the gem index 0-8 for a memorized-gem cast; inventoryslot 0xFFFF = gem cast.
+pub fn build_cast_packet(slot: u32, spell_id: u32, target_id: u32) -> Vec<u8> {
+    let mut buf = vec![0u8; 20];
+    buf[0..4].copy_from_slice(&slot.to_le_bytes());
+    buf[4..8].copy_from_slice(&spell_id.to_le_bytes());
+    buf[8..12].copy_from_slice(&0xFFFFu32.to_le_bytes());
+    buf[12..16].copy_from_slice(&target_id.to_le_bytes());
+    buf
+}
+
+/// Titanium `SpawnAppearance_Struct` (8 bytes): spawn_id(u16), type(u16), parameter(u32).
+/// For sit/stand: kind=14 (Animation), parameter=110 (sit) / 100 (stand).
+pub fn build_spawn_appearance_packet(spawn_id: u16, kind: u16, parameter: u32) -> Vec<u8> {
+    let mut buf = vec![0u8; 8];
+    buf[0..2].copy_from_slice(&spawn_id.to_le_bytes());
+    buf[2..4].copy_from_slice(&kind.to_le_bytes());
+    buf[4..8].copy_from_slice(&parameter.to_le_bytes());
     buf
 }
 
@@ -110,6 +131,9 @@ pub struct Navigator {
     buy:              BuyReq,
     move_req:         MoveReq,
     give:             GiveReq,
+    cast:             CastReq,
+    sit:              SitReq,
+    consider:         ConsiderReq,
     /// In-progress quest turn-in (POST /give), or None when idle. Drives the trade-window
     /// state machine across nav ticks (request → wait for ack → move item + accept).
     give_state:       Option<GiveState>,
@@ -153,6 +177,9 @@ impl Navigator {
         inventory:        InventoryShared,
         loot:             LootReq,
         messages:         MessagesShared,
+        cast:             CastReq,
+        sit:              SitReq,
+        consider:         ConsiderReq,
         collision:        crate::assets::SharedCollision,
         maps_dir:         std::path::PathBuf,
     ) -> Self {
@@ -170,6 +197,9 @@ impl Navigator {
             buy,
             move_req,
             give,
+            cast,
+            sit,
+            consider,
             give_state: None,
             inventory,
             loot,
@@ -405,7 +435,38 @@ impl Navigator {
             self.auto_attack = on;
             let payload = [if on { 1u8 } else { 0u8 }, 0, 0, 0];
             stream.send_app_packet(OP_AUTO_ATTACK, &payload);
+            gs.auto_attack = on;
             eprintln!("EQ: auto-attack {}", if on { "ON" } else { "OFF" });
+        }
+
+        // Cast a memorized spell gem on a target (current target, or self if none).
+        let cast_req = self.cast.lock().unwrap().take();
+        if let Some(req) = cast_req {
+            let spell_id = gs.mem_spells.get(req.gem as usize).copied().unwrap_or(0xFFFF_FFFF);
+            if spell_id != 0xFFFF_FFFF {
+                let target = req.target_id.or(gs.target_id).unwrap_or(gs.player_id);
+                stream.send_app_packet(OP_CAST_SPELL, &build_cast_packet(req.gem as u32, spell_id, target));
+                eprintln!("EQ: cast gem={} spell={} target={}", req.gem, spell_id, target);
+            } else {
+                eprintln!("EQ: cast gem={} ignored — empty gem", req.gem);
+            }
+        }
+
+        // Sit / stand (OP_SpawnAppearance type=14, param 110/100).
+        let sit_req = self.sit.lock().unwrap().take();
+        if let Some(sit) = sit_req {
+            let param = if sit { 110u32 } else { 100u32 };
+            stream.send_app_packet(OP_SPAWN_APPEARANCE,
+                &build_spawn_appearance_packet(gs.player_id as u16, 14, param));
+            gs.sitting = sit;
+            eprintln!("EQ: {}", if sit { "sit" } else { "stand" });
+        }
+
+        // Standalone consider.
+        let con_req = self.consider.lock().unwrap().take();
+        if let Some(id) = con_req {
+            stream.send_app_packet(OP_CONSIDER, &build_consider_packet(gs.player_id, id));
+            eprintln!("EQ: consider spawn_id={}", id);
         }
 
         // Merchant buy: open the merchant (OP_ShopRequest) then buy its inventory slot
@@ -851,5 +912,27 @@ mod tests {
         // sender/target fields are 64 bytes; name capped at 63 + null padding.
         assert_eq!(p[63], 0, "targetname must stay null-terminated within 64 bytes");
         assert_eq!(p[127], 0, "sender must stay null-terminated within 64 bytes");
+    }
+
+    #[test]
+    fn cast_packet_layout() {
+        // gem 0, spell 200, target 1234 → [0, 200, 0xFFFF, 1234, 0] all u32 LE = 20 bytes.
+        let p = build_cast_packet(0, 200, 1234);
+        assert_eq!(p.len(), 20);
+        assert_eq!(&p[0..4], &0u32.to_le_bytes());
+        assert_eq!(&p[4..8], &200u32.to_le_bytes());
+        assert_eq!(&p[8..12], &0xFFFFu32.to_le_bytes());
+        assert_eq!(&p[12..16], &1234u32.to_le_bytes());
+        assert_eq!(&p[16..20], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn spawn_appearance_sit_layout() {
+        // self 77, type 14 (Animation), 110 (sit) → 8 bytes: u16 id, u16 type, u32 param.
+        let p = build_spawn_appearance_packet(77, 14, 110);
+        assert_eq!(p.len(), 8);
+        assert_eq!(&p[0..2], &77u16.to_le_bytes());
+        assert_eq!(&p[2..4], &14u16.to_le_bytes());
+        assert_eq!(&p[4..8], &110u32.to_le_bytes());
     }
 }

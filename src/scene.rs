@@ -67,6 +67,16 @@ pub struct SceneState {
     /// Empty = nothing equipped in that slot. Primary = worn slot 13, secondary = slot 14.
     pub primary_weapon_idfile: String,
     pub secondary_weapon_idfile: String,
+    /// Memorized spell gem IDs (9 slots); 0xFFFF_FFFF = empty slot.
+    pub mem_spells: [u32; 9],
+    /// Active cast in progress (Some) or idle (None).
+    pub casting: Option<crate::game_state::CastState>,
+    /// True when the player is sitting.
+    pub sitting: bool,
+    /// True when auto-attack is enabled.
+    pub auto_attack: bool,
+    /// The spawn_id of the current target, if any.
+    pub target_id: Option<u32>,
 }
 
 impl SceneState {
@@ -208,6 +218,16 @@ impl SceneState {
                 .map(|i| i.idfile.clone()).unwrap_or_default(),
             secondary_weapon_idfile: gs.inventory.iter().find(|i| i.slot == 14)
                 .map(|i| i.idfile.clone()).unwrap_or_default(),
+            mem_spells: gs.mem_spells,
+            // Drop a stale cast bar: if the cast time has elapsed plus a grace window and the
+            // server never sent a terminal packet (OP_MemorizeSpell scribing=3 / OP_InterruptCast),
+            // stop showing "Casting …" forever. (Spec Risks: cast_ms + grace fallback.)
+            casting: gs.casting.clone().filter(|c| {
+                c.started.elapsed().as_millis() < c.cast_ms as u128 + 1500
+            }),
+            sitting: gs.sitting,
+            auto_attack: gs.auto_attack,
+            target_id: gs.target_id,
         }
     }
 }

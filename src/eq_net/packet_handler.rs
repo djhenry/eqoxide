@@ -6,7 +6,7 @@
 
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::AppPacket;
-use crate::game_state::{GameState, Entity, ZonePoint};
+use crate::game_state::{GameState, Entity, ZonePoint, CastState};
 
 /// Apply one EQ server packet to `gs`.
 pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
@@ -65,6 +65,10 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
             eprintln!("EQ: give: turn-in complete (OP_FinishTrade)");
         }
         OP_ANIMATION            => apply_animation(gs, p),
+        OP_BEGIN_CAST           => apply_begin_cast(gs, p),
+        OP_MANA_CHANGE          => apply_mana_change(gs, p),
+        OP_MEMORIZE_SPELL       => apply_memorize_spell(gs, p),
+        OP_INTERRUPT_CAST       => apply_interrupt_cast(gs, p),
         _                       => {}
     }
 }
@@ -375,6 +379,7 @@ pub struct ProfileInfo {
     pub class_id: u32,
     pub coin: [u32; 4],  // platinum, gold, silver, copper
     pub stats: [u32; 7], // STR, STA, CHA, DEX, INT, AGI, WIS
+    pub mem_spells: [u32; 9], // 9 memorized spell-gem ids; 0xFFFFFFFF = empty
 }
 
 /// Parse the Titanium PlayerProfile_Struct. Offsets from EQEmu
@@ -391,7 +396,37 @@ pub fn parse_player_profile(payload: &[u8]) -> Option<ProfileInfo> {
             u32_at(2252), u32_at(2256), u32_at(2260),
         ],
         coin: [u32_at(4428), u32_at(4432), u32_at(4436), u32_at(4440)],
+        mem_spells: {
+            let mut m = [0xFFFF_FFFFu32; 9];
+            for (i, slot) in m.iter_mut().enumerate() { *slot = u32_at(4360 + i * 4); }
+            m
+        },
     })
+}
+
+pub fn parse_begin_cast(p: &[u8]) -> Option<(u16, u16, u32)> {
+    if p.len() < 8 { return None; }
+    Some((
+        u16::from_le_bytes([p[0], p[1]]),
+        u16::from_le_bytes([p[2], p[3]]),
+        u32::from_le_bytes([p[4], p[5], p[6], p[7]]),
+    ))
+}
+
+pub fn parse_mana_change(p: &[u8]) -> Option<u32> {
+    if p.len() < 4 { return None; }
+    Some(u32::from_le_bytes([p[0], p[1], p[2], p[3]]))
+}
+
+pub fn parse_memorize_spell(p: &[u8]) -> Option<(u32, u32, u32)> {
+    if p.len() < 12 { return None; }
+    let r = |o: usize| u32::from_le_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]]);
+    Some((r(0), r(4), r(8)))
+}
+
+pub fn parse_interrupt_cast(p: &[u8]) -> Option<u32> {
+    if p.len() < 4 { return None; }
+    Some(u32::from_le_bytes([p[0], p[1], p[2], p[3]]))
 }
 
 fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
@@ -405,6 +440,7 @@ fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
         }
         gs.coin = p.coin;
         gs.stats = p.stats;
+        gs.mem_spells = p.mem_spells;
     }
 
     const ITEM_MATERIAL_OFF: usize = 188;
@@ -424,6 +460,41 @@ fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
                 gs.player_equipment_tint[i] = [payload[to + 2], payload[to + 1], payload[to]];
             }
         }
+    }
+}
+
+pub fn apply_begin_cast(gs: &mut GameState, p: &[u8]) {
+    if let Some((_caster, spell_id, cast_ms)) = parse_begin_cast(p) {
+        gs.casting = Some(CastState {
+            spell_id: spell_id as u32,
+            started: std::time::Instant::now(),
+            cast_ms,
+        });
+    }
+}
+
+pub fn apply_mana_change(_gs: &mut GameState, p: &[u8]) {
+    if let Some(_new_mana) = parse_mana_change(p) {
+        // mana_pct is updated from HP/mana update packets elsewhere; keepcasting handling:
+        // a mana change with the spell landing ends the optimistic cast bar.
+    }
+}
+
+pub fn apply_memorize_spell(gs: &mut GameState, p: &[u8]) {
+    if let Some((slot, spell_id, scribing)) = parse_memorize_spell(p) {
+        match scribing {
+            1 => { if (slot as usize) < 9 { gs.mem_spells[slot as usize] = spell_id; } }
+            2 => { if (slot as usize) < 9 { gs.mem_spells[slot as usize] = 0xFFFF_FFFF; } }
+            3 => { gs.casting = None; } // spellbar re-enable: cast finished
+            _ => {}
+        }
+    }
+}
+
+pub fn apply_interrupt_cast(gs: &mut GameState, p: &[u8]) {
+    if gs.casting.is_some() && parse_interrupt_cast(p).is_some() {
+        gs.casting = None;
+        gs.log_msg("combat", "Your spell is interrupted.");
     }
 }
 
@@ -823,7 +894,8 @@ pub fn register_spawn(gs: &mut GameState, spawn: Spawn_S) {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_emote, class_name, con_color, consider_message, parse_player_profile};
+    use super::{apply_emote, class_name, con_color, consider_message, parse_player_profile,
+                parse_begin_cast, parse_memorize_spell};
     use crate::game_state::GameState;
 
     #[test]
@@ -849,6 +921,9 @@ mod tests {
         buf[4440..4444].copy_from_slice(&9u32.to_le_bytes());   // copper
         buf[2236..2240].copy_from_slice(&75u32.to_le_bytes());  // STR
         buf[2260..2264].copy_from_slice(&110u32.to_le_bytes()); // WIS
+        // mem_spells[0] @4360 = 200 (Minor Healing), mem_spells[1] @4364 = 0xFFFFFFFF (empty)
+        buf[4360..4364].copy_from_slice(&200u32.to_le_bytes());
+        buf[4364..4368].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
         let p = parse_player_profile(&buf).unwrap();
         assert_eq!(p.level, 12);
         assert_eq!(p.class_id, 9);
@@ -856,6 +931,8 @@ mod tests {
         assert_eq!(p.stats[0], 75);  // STR
         assert_eq!(p.stats[6], 110); // WIS
         assert_eq!(class_name(p.class_id), "Rogue");
+        assert_eq!(p.mem_spells[0], 200);
+        assert_eq!(p.mem_spells[1], 0xFFFF_FFFF);
     }
 
     #[test]
@@ -1088,5 +1165,36 @@ mod tests {
         assert_eq!(e.equipment[1], 17);
         assert_eq!(e.equipment_tint[1], [30, 20, 10]); // wire BGR [10,20,30] → stored RGB
         assert_eq!(e.gender, 1);
+    }
+
+    #[test]
+    fn begin_cast_sets_casting_state() {
+        let mut gs = crate::game_state::GameState::new();
+        let mut b = [0u8; 8];
+        b[2..4].copy_from_slice(&200u16.to_le_bytes());
+        b[4..8].copy_from_slice(&3000u32.to_le_bytes());
+        super::apply_begin_cast(&mut gs, &b.to_vec());
+        let c = gs.casting.as_ref().expect("casting set");
+        assert_eq!(c.spell_id, 200);
+        assert_eq!(c.cast_ms, 3000);
+    }
+
+    #[test]
+    fn parse_begin_cast_reads_fields() {
+        let mut b = [0u8; 8];
+        b[0..2].copy_from_slice(&55u16.to_le_bytes());   // caster
+        b[2..4].copy_from_slice(&200u16.to_le_bytes());  // spell
+        b[4..8].copy_from_slice(&3500u32.to_le_bytes()); // cast_time ms
+        assert_eq!(parse_begin_cast(&b), Some((55, 200, 3500)));
+        assert_eq!(parse_begin_cast(&[0u8; 4]), None);
+    }
+
+    #[test]
+    fn parse_memorize_spell_reads_slot_and_scribing() {
+        let mut b = [0u8; 16];
+        b[0..4].copy_from_slice(&2u32.to_le_bytes());   // slot
+        b[4..8].copy_from_slice(&200u32.to_le_bytes()); // spell_id
+        b[8..12].copy_from_slice(&3u32.to_le_bytes());  // scribing = spellbar re-enable
+        assert_eq!(parse_memorize_spell(&b), Some((2, 200, 3)));
     }
 }

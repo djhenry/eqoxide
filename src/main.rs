@@ -59,6 +59,13 @@ fn main() {
     let inventory:        http::InventoryShared = Arc::new(Mutex::new(Vec::new()));
     let loot:             http::LootReq         = Arc::new(Mutex::new(None));
     let messages:         http::MessagesShared  = Arc::new(Mutex::new(Vec::new()));
+    let cast:             http::CastReq         = Arc::new(Mutex::new(None));
+    let sit:              http::SitReq          = Arc::new(Mutex::new(None));
+    let consider:         http::ConsiderReq     = Arc::new(Mutex::new(None));
+    let spells_path = std::env::var("EQ_SPELLS_FILE")
+        .unwrap_or_else(|_| "~/git/original-client/spells_us.txt".to_string());
+    let spells: std::sync::Arc<eq_renderer::spells::SpellDb> =
+        std::sync::Arc::new(eq_renderer::spells::SpellDb::load(&spells_path));
     let shared_collision: assets::SharedCollision = Arc::new(std::sync::RwLock::new(None));
     let frame_req:        http::FrameReq        = Arc::new(Mutex::new(None));
     let player_info:      http::PlayerInfo      = Arc::new(Mutex::new(http::PlayerState::default()));
@@ -82,12 +89,15 @@ fn main() {
         let iv  = inventory.clone();
         let lt  = loot.clone();
         let mg  = messages.clone();
+        let ca  = cast.clone();
+        let st  = sit.clone();
+        let co  = consider.clone();
         let sc  = shared_collision.clone();
         let md  = app_cfg.assets_path.join("maps");
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, zc, hl, sy, tg, at, by, mv, gv, iv, lt, mg, sc, md).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, zc, hl, sy, tg, at, by, mv, gv, iv, lt, mg, ca, st, co, sc, md).await {
                     eprintln!("EQ: fatal: {e}");
                 }
             });
@@ -99,6 +109,11 @@ fn main() {
     let app_hail   = hail.clone();
     let app_say    = say.clone();
     let app_target = target.clone();
+    let app_attack  = attack.clone();
+    let app_cast    = cast.clone();
+    let app_sit     = sit.clone();
+    let app_consider = consider.clone();
+    let app_spells  = spells.clone();
     let app_player_info = player_info.clone();
     http::spawn_camera_server(
         camera_cmd.clone(),
@@ -114,12 +129,16 @@ fn main() {
         say,
         target,
         attack,
+        cast.clone(),
+        sit.clone(),
+        consider.clone(),
         buy,
         move_req,
         give,
         inventory,
         loot,
         messages,
+        spells.clone(),
         player_info,
         task_log,
         app_cfg.http_port,
@@ -138,6 +157,11 @@ fn main() {
         app_hail,
         app_say,
         app_target,
+        app_attack,
+        app_cast,
+        app_sit,
+        app_consider,
+        app_spells,
         shared_collision,
         app_player_info,
         warp,
