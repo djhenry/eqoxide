@@ -907,7 +907,7 @@ async fn get_doors(State(s): State<HttpState>) -> Json<Vec<DoorView>> {
 #[derive(serde::Deserialize)]
 struct DoorClickBody { door_id: Option<u8>, name: Option<String> }
 
-/// POST /doors/click {"door_id": N}  or  {"name": "DOOR1"} (nearest matching name).
+/// POST /doors/click {"door_id": N}  or  {"name": "DOOR1"} (exact case-insensitive name match).
 async fn post_door_click(
     State(s): State<HttpState>,
     body: axum::extract::Json<DoorClickBody>,

@@ -259,15 +259,6 @@ impl GameState {
         }
     }
 
-    /// Nearest door to a point (used by POST /doors/click {name}).
-    pub fn nearest_door(&self, x: f32, y: f32, z: f32) -> Option<&Door> {
-        self.doors.values().min_by(|a, b| {
-            let da = (a.x - x).powi(2) + (a.y - y).powi(2) + (a.z - z).powi(2);
-            let db = (b.x - x).powi(2) + (b.y - y).powi(2) + (b.z - z).powi(2);
-            da.total_cmp(&db)
-        })
-    }
-
     pub fn update_hp(&mut self, spawn_id: u32, cur_hp: i32, max_hp: i32) {
         if spawn_id == self.player_id {
             self.hp_pct = (cur_hp as f32 / max_hp.max(1) as f32) * 100.0;

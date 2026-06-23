@@ -696,7 +696,7 @@ impl App {
             self.current_zone  = self.scene.zone.clone();
         }
 
-        // `now` reused for FPS timer below; `dt` and `last_frame_time` already updated at top.
+        // Fresh `now` for the FPS timer; `dt` and `last_frame_time` were already updated at top.
         let now = std::time::Instant::now();
 
         // FPS counter: average over 0.5s windows.
