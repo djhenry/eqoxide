@@ -576,22 +576,12 @@ pub fn encode_entity_pass(
     let slot_end  = PLAYER_UNIFORM_SLOTS + pool_half;
     let mut slot  = PLAYER_UNIFORM_SLOTS;
 
-    let mut debug_logged = false;
-    let mut skipped = 0u32;
-    let mut rendered = 0u32;
     for b in &scene.billboards {
         if b.level == 0 { continue; }
         let archetype = race_to_archetype(&b.race);
-        let Some(GpuModel::Static(model)) = r.model_for(archetype, b.gender) else { skipped += 1; continue };
-        rendered += 1;
+        let Some(GpuModel::Static(model)) = r.model_for(archetype, b.gender) else { continue };
         let arch_scale   = archetype_scale(archetype);
         let visual_scale = 2.0 * model.y_extent * arch_scale;
-        let lift = visual_scale * 0.5 + model.y_bottom * arch_scale;
-        if !debug_logged {
-            eprintln!("pass: billboard '{}' arch={} y_extent={:.4} y_bottom={:.4} arch_scale={:.2} visual_scale={:.4} lift={:.4} pos={:?}",
-                b.race, archetype, model.y_extent, model.y_bottom, arch_scale, visual_scale, lift, b.pos);
-            debug_logged = true;
-        }
         let mat = crate::camera::entity_model_matrix_heading(b.pos, b.heading, visual_scale, arch_scale,
             [model.x_center, model.z_center], true, model.y_bottom);
         for (mesh_idx, mesh) in model.meshes.iter().enumerate() {
@@ -617,7 +607,6 @@ pub fn encode_entity_pass(
         }
         if slot >= slot_end { break; }
     }
-    eprintln!("pass: entity pass — {} draws, {} rendered, {} skipped (no model)", draws.len(), rendered, skipped);
     if draws.is_empty() { return; }
 
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
