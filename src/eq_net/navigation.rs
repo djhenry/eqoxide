@@ -7,7 +7,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::{GameState, ZonePoint};
-use crate::http::{AttackReq, BuyReq, MoveReq, GiveReq, InventoryShared, LootReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
+use crate::http::{AttackReq, BuyReq, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
 
 /// Pending state of a quest turn-in (POST /give). The trade window spans multiple nav ticks:
 /// we send OP_TradeRequest, then must wait for the server's OP_TradeRequestAck before moving the
@@ -117,6 +117,7 @@ pub struct Navigator {
     /// POST /loot corpse request (drained into gs.pending_loot to reuse the auto-loot loop).
     inventory:        InventoryShared,
     loot:             LootReq,
+    messages:         MessagesShared,
     collision:        crate::assets::SharedCollision,
     maps_dir:         std::path::PathBuf,
     current_zone:     String,
@@ -151,6 +152,7 @@ impl Navigator {
         give:             GiveReq,
         inventory:        InventoryShared,
         loot:             LootReq,
+        messages:         MessagesShared,
         collision:        crate::assets::SharedCollision,
         maps_dir:         std::path::PathBuf,
     ) -> Self {
@@ -171,6 +173,7 @@ impl Navigator {
             give_state: None,
             inventory,
             loot,
+            messages,
             collision,
             maps_dir,
             current_zone: String::new(),
@@ -212,6 +215,22 @@ impl Navigator {
         let mut inv = self.inventory.lock().unwrap();
         inv.clear();
         inv.extend(gs.inventory.iter().cloned());
+    }
+
+    /// Publish the in-game message log from `gs` into the shared slot (GET /messages), converting
+    /// each LogEntry into a serializable MessageEntry and extracting `[bracketed]` quest keywords
+    /// (the same splitter the HUD dialogue panel uses).
+    pub fn sync_messages(&self, gs: &GameState) {
+        let mut out = self.messages.lock().unwrap();
+        out.clear();
+        out.extend(gs.messages.iter().map(|m| {
+            let keywords = crate::hud::split_keywords(&m.text).into_iter()
+                .filter(|(_, is_kw)| *is_kw)
+                .map(|(seg, _)| seg.trim_matches(|c| c == '[' || c == ']').trim().to_string())
+                .filter(|k| !k.is_empty())
+                .collect();
+            crate::http::MessageEntry { kind: m.kind.clone(), text: m.text.clone(), keywords }
+        }));
     }
 
     /// Sync zone exit points from `gs` into the shared zone_points map.
