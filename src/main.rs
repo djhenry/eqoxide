@@ -9,6 +9,7 @@
 use eq_renderer::{assets, camera_state, config, eq_net, eqstr, http};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicBool;
 use winit::event_loop::EventLoop;
 
 fn main() {
@@ -42,6 +43,11 @@ fn main() {
     ));
 
     let (app_tx, app_rx) = tokio::sync::mpsc::unbounded_channel::<eq_net::AppPacket>();
+
+    // Shared clean-shutdown flag. Set by POST /exit and by window-close; observed by the
+    // EQ network thread, which performs the logout sequence and exits the process.
+    let shutdown: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
     let goto_target:      http::GotoTarget      = Arc::new(Mutex::new(None));
     let entity_positions: http::EntityPositions = Arc::new(Mutex::new(HashMap::new()));
     let entity_ids:       http::EntityIds       = Arc::new(Mutex::new(HashMap::new()));
@@ -93,11 +99,12 @@ fn main() {
         let st  = sit.clone();
         let co  = consider.clone();
         let sc  = shared_collision.clone();
+        let sd  = shutdown.clone();
         let md  = app_cfg.assets_path.join("maps");
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, zc, hl, sy, tg, at, by, mv, gv, iv, lt, mg, ca, st, co, sc, md).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, zc, hl, sy, tg, at, by, mv, gv, iv, lt, mg, ca, st, co, sc, md, sd).await {
                     eprintln!("EQ: fatal: {e}");
                 }
             });
@@ -141,6 +148,7 @@ fn main() {
         spells.clone(),
         player_info,
         task_log,
+        shutdown.clone(),
         app_cfg.http_port,
     );
 
