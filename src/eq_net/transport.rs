@@ -274,6 +274,15 @@ impl EqStream {
         self.send_raw(OP_KEEPALIVE, &[]);
     }
 
+    /// Send a session-layer disconnect (`OP_SessionDisconnect`, 0x05). Tells the EQStream peer
+    /// we are closing this session. Payload is the negotiated `connect_code` as a big-endian u32;
+    /// `append_crc` (called inside `send_raw`) appends the CRC. Sent as part of clean shutdown.
+    pub fn send_session_disconnect(&mut self) {
+        let mut payload = Vec::with_capacity(4);
+        payload.write_u32::<BigEndian>(self.session.connect_code).unwrap();
+        self.send_raw(OP_SESSION_DISC, &payload);
+    }
+
     // ── Internal send helpers ─────────────────────────────────────────────────
 
     fn send_raw(&mut self, opcode: u8, payload: &[u8]) {
