@@ -1167,7 +1167,8 @@ impl ApplicationHandler for App {
                         ElementState::Pressed => {
                             match code {
                                 KeyCode::KeyW | KeyCode::KeyA | KeyCode::KeyS | KeyCode::KeyD
-                                | KeyCode::KeyQ | KeyCode::KeyE | KeyCode::Space => {
+                                | KeyCode::KeyQ | KeyCode::KeyE | KeyCode::Space
+                                | KeyCode::ControlLeft | KeyCode::ControlRight => {
                                     self.keys_held.insert(code);
                                 }
                                 KeyCode::KeyR | KeyCode::F9 => {
