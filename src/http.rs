@@ -102,6 +102,8 @@ pub struct PlayerState {
     pub heading_ccw:  f32, // 0=north CCW
     pub heading_cw:   f32, // 0=north CW (wire format)
     pub server_corrections: u32,
+    pub mem_spells:   [u32; 9],
+    pub target_id:    Option<u32>,
 }
 pub type PlayerInfo = Arc<Mutex<PlayerState>>;
 
@@ -120,9 +122,13 @@ struct HttpState {
     say:              SayReq,
     target:           TargetReq,
     attack:           AttackReq,
+    cast:             CastReq,
+    sit:              SitReq,
+    consider:         ConsiderReq,
     buy:              BuyReq,
     move_req:         MoveReq,
     give:             GiveReq,
+    spells:           std::sync::Arc<crate::spells::SpellDb>,
     player_info:      PlayerInfo,
     task_log:         TaskLog,
 }
@@ -162,9 +168,13 @@ pub fn spawn_camera_server(
     say:              SayReq,
     target:           TargetReq,
     attack:           AttackReq,
+    cast:             CastReq,
+    sit:              SitReq,
+    consider:         ConsiderReq,
     buy:              BuyReq,
     move_req:         MoveReq,
     give:             GiveReq,
+    spells:           std::sync::Arc<crate::spells::SpellDb>,
     player_info:      PlayerInfo,
     task_log:         TaskLog,
     port:             u16,
@@ -172,7 +182,7 @@ pub fn spawn_camera_server(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, buy, move_req, give, player_info, task_log };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, cast, sit, consider, buy, move_req, give, spells, player_info, task_log };
             let app = Router::new()
                 .route("/camera", get(get_camera).post(post_camera))
                 .route("/camera/reset", post(post_camera_reset))
@@ -189,6 +199,11 @@ pub fn spawn_camera_server(
                 .route("/target", post(post_target))
                 .route("/target/name", post(post_target_name))
                 .route("/attack", post(post_attack_on).delete(post_attack_off))
+                .route("/cast", post(post_cast))
+                .route("/spells", get(get_spells))
+                .route("/sit", post(post_sit))
+                .route("/stand", post(post_stand))
+                .route("/consider", post(post_consider))
                 .route("/buy", post(post_buy))
                 .route("/inventory/move", post(post_move))
                 .route("/give", post(post_give))
@@ -561,6 +576,61 @@ async fn post_attack_off(State(s): State<HttpState>) -> (StatusCode, String) {
     *s.attack.lock().unwrap() = Some(false);
     eprintln!("attack: queued auto-attack OFF");
     (StatusCode::OK, "auto-attack OFF".into())
+}
+
+#[derive(serde::Deserialize)]
+struct CastBody { gem: Option<u8>, spell_id: Option<u32>, target_id: Option<u32> }
+
+/// POST /cast {"gem":0-8} | {"spell_id":N,"target_id":M?}
+async fn post_cast(State(s): State<HttpState>, body: Option<Json<CastBody>>) -> (StatusCode, String) {
+    let b = body.map(|Json(b)| b).unwrap_or(CastBody { gem: None, spell_id: None, target_id: None });
+    let mem = s.player_info.lock().unwrap().mem_spells;
+    let gem = if let Some(g) = b.gem {
+        g
+    } else if let Some(sid) = b.spell_id {
+        match mem.iter().position(|&x| x == sid) {
+            Some(i) => i as u8,
+            None => return (StatusCode::BAD_REQUEST, format!("spell {sid} is not memorized")),
+        }
+    } else {
+        return (StatusCode::BAD_REQUEST, "provide {\"gem\":0-8} or {\"spell_id\":N}".into());
+    };
+    if gem > 8 { return (StatusCode::BAD_REQUEST, "gem must be 0-8".into()); }
+    *s.cast.lock().unwrap() = Some(CastRequest { gem, target_id: b.target_id });
+    (StatusCode::OK, format!("cast queued (gem {gem})"))
+}
+
+/// GET /spells — the 9 memorized gems with names. Empty gem = spell id 0 or 0xFFFFFFFF.
+async fn get_spells(State(s): State<HttpState>) -> Json<serde_json::Value> {
+    let mem = s.player_info.lock().unwrap().mem_spells;
+    let gems: Vec<_> = mem.iter().enumerate().map(|(i, &id)| {
+        if id == 0 || id == 0xFFFF_FFFF {
+            serde_json::json!({ "gem": i, "spell_id": null, "name": null })
+        } else {
+            let name = s.spells.get(id).map(|x| x.name.clone());
+            serde_json::json!({ "gem": i, "spell_id": id, "name": name })
+        }
+    }).collect();
+    Json(serde_json::json!({ "gems": gems }))
+}
+
+async fn post_sit(State(s): State<HttpState>) -> (StatusCode, String) {
+    *s.sit.lock().unwrap() = Some(true);
+    (StatusCode::OK, "sit queued".into())
+}
+async fn post_stand(State(s): State<HttpState>) -> (StatusCode, String) {
+    *s.sit.lock().unwrap() = Some(false);
+    (StatusCode::OK, "stand queued".into())
+}
+
+#[derive(serde::Deserialize)]
+struct ConsiderBody { id: Option<u32> }
+async fn post_consider(State(s): State<HttpState>, body: Option<Json<ConsiderBody>>) -> (StatusCode, String) {
+    let id = body.and_then(|Json(b)| b.id).or(s.player_info.lock().unwrap().target_id);
+    match id {
+        Some(id) => { *s.consider.lock().unwrap() = Some(id); (StatusCode::OK, format!("consider {id} queued")) }
+        None => (StatusCode::BAD_REQUEST, "no target; provide {\"id\":N}".into()),
+    }
 }
 
 #[derive(serde::Deserialize)]

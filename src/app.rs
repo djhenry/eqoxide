@@ -456,6 +456,8 @@ impl App {
                 heading_ccw: gs.player_heading,
                 heading_cw:  h_cw,
                 server_corrections: gs.server_corrections,
+                mem_spells: gs.mem_spells,
+                target_id:  gs.target_id,
             };
         }
 

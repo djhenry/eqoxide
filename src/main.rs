@@ -59,6 +59,10 @@ fn main() {
     let cast:             http::CastReq         = Arc::new(Mutex::new(None));
     let sit:              http::SitReq          = Arc::new(Mutex::new(None));
     let consider:         http::ConsiderReq     = Arc::new(Mutex::new(None));
+    let spells_path = std::env::var("EQ_SPELLS_FILE")
+        .unwrap_or_else(|_| "~/git/original-client/spells_us.txt".to_string());
+    let spells: std::sync::Arc<eq_renderer::spells::SpellDb> =
+        std::sync::Arc::new(eq_renderer::spells::SpellDb::load(&spells_path));
     let shared_collision: assets::SharedCollision = Arc::new(std::sync::RwLock::new(None));
     let frame_req:        http::FrameReq        = Arc::new(Mutex::new(None));
     let player_info:      http::PlayerInfo      = Arc::new(Mutex::new(http::PlayerState::default()));
@@ -114,9 +118,13 @@ fn main() {
         say,
         target,
         attack,
+        cast.clone(),
+        sit.clone(),
+        consider.clone(),
         buy,
         move_req,
         give,
+        spells.clone(),
         player_info,
         task_log,
         app_cfg.http_port,
