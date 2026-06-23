@@ -106,6 +106,53 @@ pub fn reassemble(cache: &CacheDirs, entry: &FileEntry) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub trait Transport {
+    fn get_manifest(&self, set: &str) -> anyhow::Result<Manifest>;
+    fn get_chunk(&self, hash: &str) -> anyhow::Result<Vec<u8>>;
+}
+
+pub enum Phase {
+    Verifying,
+    Downloading,
+}
+
+pub struct SyncProgress {
+    pub phase: Phase,
+    pub done: usize,
+    pub total: usize,
+    pub bytes: u64,
+}
+
+pub fn sync_set(
+    t: &dyn Transport,
+    set: &str,
+    cache: &CacheDirs,
+    progress: &mut dyn FnMut(SyncProgress),
+) -> anyhow::Result<()> {
+    let manifest = t.get_manifest(set)?;
+    progress(SyncProgress { phase: Phase::Verifying, done: 0, total: 0, bytes: 0 });
+
+    let missing = missing_chunks(&manifest, cache);
+    let total = missing.len();
+    let mut bytes = 0u64;
+    for (i, hash) in missing.iter().enumerate() {
+        let data = t.get_chunk(hash)?;
+        // The server is content-addressed: a chunk's bytes must hash to its id.
+        let got = blake3_hex(&data);
+        if &got != hash {
+            anyhow::bail!("chunk {hash} content mismatch (got {got})");
+        }
+        cache.cas_put(&data)?;
+        bytes += data.len() as u64;
+        progress(SyncProgress { phase: Phase::Downloading, done: i + 1, total, bytes });
+    }
+
+    for entry in &manifest.files {
+        reassemble(cache, entry)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +233,78 @@ mod manifest_tests {
         let (mut m, _) = manifest_with(&cache);
         m.files[0].blake3 = "0".repeat(64); // wrong expected hash
         assert!(reassemble(&cache, &m.files[0]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    struct FakeTransport {
+        manifest: Manifest,
+        chunks: HashMap<String, Vec<u8>>,
+        chunk_calls: std::cell::RefCell<usize>,
+    }
+    impl Transport for FakeTransport {
+        fn get_manifest(&self, _set: &str) -> anyhow::Result<Manifest> {
+            Ok(self.manifest.clone())
+        }
+        fn get_chunk(&self, hash: &str) -> anyhow::Result<Vec<u8>> {
+            *self.chunk_calls.borrow_mut() += 1;
+            self.chunks.get(hash).cloned()
+                .ok_or_else(|| anyhow::anyhow!("no chunk {hash}"))
+        }
+    }
+
+    fn fixture() -> FakeTransport {
+        let a = vec![1u8; 10];
+        let b = vec![2u8; 20];
+        let ha = blake3_hex(&a);
+        let hb = blake3_hex(&b);
+        let mut whole = a.clone(); whole.extend_from_slice(&b);
+        let mut chunks = HashMap::new();
+        chunks.insert(ha.clone(), a);
+        chunks.insert(hb.clone(), b);
+        FakeTransport {
+            manifest: Manifest {
+                set: "common".into(), version: 1,
+                files: vec![FileEntry {
+                    path: "humanoid.glb".into(), size: whole.len() as u64,
+                    blake3: blake3_hex(&whole), chunks: vec![ha, hb],
+                }],
+            },
+            chunks,
+            chunk_calls: std::cell::RefCell::new(0),
+        }
+    }
+
+    #[test]
+    fn cold_then_warm_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = CacheDirs::with_root(dir.path());
+        let t = fixture();
+        let mut last = None;
+        sync_set(&t, "common", &cache, &mut |p| last = Some((p.done, p.total))).unwrap();
+        // cold: both chunks fetched, file reassembled
+        assert_eq!(*t.chunk_calls.borrow(), 2);
+        assert!(cache.models_dir().join("humanoid.glb").exists());
+        assert_eq!(last, Some((2, 2)));
+
+        // warm: nothing missing -> no further chunk fetches
+        let before = *t.chunk_calls.borrow();
+        sync_set(&t, "common", &cache, &mut |_| {}).unwrap();
+        assert_eq!(*t.chunk_calls.borrow(), before);
+    }
+
+    #[test]
+    fn rejects_chunk_with_wrong_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = CacheDirs::with_root(dir.path());
+        let mut t = fixture();
+        // corrupt one chunk's bytes so its content no longer matches its hash key
+        let key = t.manifest.files[0].chunks[0].clone();
+        t.chunks.insert(key, vec![9u8; 10]);
+        assert!(sync_set(&t, "common", &cache, &mut |_| {}).is_err());
     }
 }
