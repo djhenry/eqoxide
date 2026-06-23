@@ -7,7 +7,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::{GameState, ZonePoint};
-use crate::http::{AttackReq, BuyReq, DoorClickReq, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, CastReq, SitReq, ConsiderReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
+use crate::http::{AttackReq, BuyReq, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, CastReq, SitReq, ConsiderReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
 
 /// Pending state of a quest turn-in (POST /give). The trade window spans multiple nav ticks:
 /// we send OP_TradeRequest, then must wait for the server's OP_TradeRequestAck before moving the
@@ -155,6 +155,8 @@ pub struct Navigator {
     inventory:        InventoryShared,
     loot:             LootReq,
     door_click:       DoorClickReq,
+    /// Snapshot of the current zone's doors, published each tick for GET /doors.
+    doors_shared:     DoorsShared,
     messages:         MessagesShared,
     collision:        crate::assets::SharedCollision,
     maps_dir:         std::path::PathBuf,
@@ -191,6 +193,7 @@ impl Navigator {
         inventory:        InventoryShared,
         loot:             LootReq,
         door_click:       DoorClickReq,
+        doors_shared:     DoorsShared,
         messages:         MessagesShared,
         cast:             CastReq,
         sit:              SitReq,
@@ -219,6 +222,7 @@ impl Navigator {
             inventory,
             loot,
             door_click,
+            doors_shared,
             messages,
             collision,
             maps_dir,
@@ -276,6 +280,17 @@ impl Navigator {
                 .filter(|k| !k.is_empty())
                 .collect();
             crate::http::MessageEntry { kind: m.kind.clone(), text: m.text.clone(), keywords }
+        }));
+    }
+
+    /// Publish the current zone's doors from `gs` into the shared slot (GET /doors).
+    pub fn sync_doors(&self, gs: &GameState) {
+        let mut out = self.doors_shared.lock().unwrap();
+        out.clear();
+        out.extend(gs.doors.values().map(|d| crate::http::DoorView {
+            door_id: d.door_id, name: d.name.clone(),
+            x: d.x, y: d.y, z: d.z, heading: d.heading,
+            opentype: d.opentype, is_open: d.is_open,
         }));
     }
 
