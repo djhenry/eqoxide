@@ -978,7 +978,7 @@ impl App {
         let full_output = egui_ctx.run(raw_input, |ctx| {
             hud::draw_fps(ctx, current_fps);
             if loading {
-                hud::draw_loading(ctx, current_zone, load_status);
+                hud::draw_loading(ctx, current_zone, load_status, None);
             } else {
                 hud::draw_ui_menu(ctx, ui_layout);
                 hud::draw_hud(ctx, ui_layout, scene, "EQ Observer");
