@@ -111,6 +111,56 @@ pub trait Transport {
     fn get_chunk(&self, hash: &str) -> anyhow::Result<Vec<u8>>;
 }
 
+pub struct AssetSync {
+    base: String,
+    token: String,
+    agent: ureq::Agent,
+}
+
+impl AssetSync {
+    pub fn login(base: &str, username: &str, password: &str) -> anyhow::Result<Self> {
+        let agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(30))
+            .build();
+        let resp: serde_json::Value = agent
+            .post(&format!("{base}/auth"))
+            .send_json(serde_json::json!({ "username": username, "password": password }))
+            .map_err(|e| anyhow::anyhow!("asset auth failed: {e}"))?
+            .into_json()?;
+        let token = resp
+            .get("token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("no token in auth response"))?
+            .to_string();
+        Ok(Self { base: base.to_string(), token, agent })
+    }
+}
+
+impl Transport for AssetSync {
+    fn get_manifest(&self, set: &str) -> anyhow::Result<Manifest> {
+        let m: Manifest = self
+            .agent
+            .get(&format!("{}/manifest/{set}", self.base))
+            .set("Authorization", &format!("Bearer {}", self.token))
+            .call()
+            .map_err(|e| anyhow::anyhow!("manifest {set} failed: {e}"))?
+            .into_json()?;
+        Ok(m)
+    }
+
+    fn get_chunk(&self, hash: &str) -> anyhow::Result<Vec<u8>> {
+        let resp = self
+            .agent
+            .get(&format!("{}/chunk/{hash}", self.base))
+            .set("Authorization", &format!("Bearer {}", self.token))
+            .call()
+            .map_err(|e| anyhow::anyhow!("chunk {hash} failed: {e}"))?;
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut resp.into_reader(), &mut buf)?;
+        Ok(buf)
+    }
+}
+
 pub enum Phase {
     Verifying,
     Downloading,
