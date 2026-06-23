@@ -79,6 +79,16 @@ pub type MoveReq = Arc<Mutex<Option<(u32, u32)>>>;
 /// waits for OP_TradeRequestAck, then moves the item into the NPC trade slot + OP_TradeAcceptClick.
 pub type GiveReq = Arc<Mutex<Option<(u32, u32)>>>;
 
+/// Live snapshot of the player's inventory + equipment, published each tick by the nav thread
+/// and read by GET /inventory. Slots are Titanium **wire** ids (the same numbers /give and
+/// /inventory/move take — note these are one less than the EQEmu DB `inventory.slot_id` for
+/// general slots: DB 23-30 → wire 22-29).
+pub type InventoryShared = Arc<Mutex<Vec<crate::game_state::InvItem>>>;
+
+/// Loot request — a corpse spawn id, set by POST /loot. The nav thread reads it once and pushes
+/// the corpse onto the existing auto-loot queue (OP_LootRequest → OP_LootItem echoes → OP_EndLootRequest).
+pub type LootReq = Arc<Mutex<Option<u32>>>;
+
 /// Current zone name and id, updated on every OP_NEW_ZONE.
 #[allow(dead_code)]
 pub type ZoneInfo = Arc<Mutex<(String, u16)>>;
@@ -114,6 +124,8 @@ struct HttpState {
     buy:              BuyReq,
     move_req:         MoveReq,
     give:             GiveReq,
+    inventory:        InventoryShared,
+    loot:             LootReq,
     player_info:      PlayerInfo,
     task_log:         TaskLog,
 }
@@ -156,6 +168,8 @@ pub fn spawn_camera_server(
     buy:              BuyReq,
     move_req:         MoveReq,
     give:             GiveReq,
+    inventory:        InventoryShared,
+    loot:             LootReq,
     player_info:      PlayerInfo,
     task_log:         TaskLog,
     port:             u16,
@@ -163,7 +177,7 @@ pub fn spawn_camera_server(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, buy, move_req, give, player_info, task_log };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, buy, move_req, give, inventory, loot, player_info, task_log };
             let app = Router::new()
                 .route("/camera", get(get_camera).post(post_camera))
                 .route("/camera/reset", post(post_camera_reset))
@@ -183,6 +197,8 @@ pub fn spawn_camera_server(
                 .route("/buy", post(post_buy))
                 .route("/inventory/move", post(post_move))
                 .route("/give", post(post_give))
+                .route("/inventory", get(get_inventory))
+                .route("/loot", post(post_loot))
                 .route("/exit", post(post_exit))
                 .route("/debug", get(get_debug))
                 .with_state(state);
@@ -647,6 +663,69 @@ async fn post_give(
             (StatusCode::OK, format!("giving slot {} to {} (spawn_id={})", b.from, clean_entity_name(&key), id))
         }
         None => (StatusCode::NOT_FOUND, format!("no NPC matching {:?}", b.npc)),
+    }
+}
+
+/// GET /inventory — the player's current inventory + equipment, published each tick by the nav
+/// thread. Each item carries its Titanium **wire** slot (the number to pass to /give and
+/// /inventory/move — note general slots are one less than the EQEmu DB `inventory.slot_id`: DB
+/// 23-30 → wire 22-29), plus item_id, name, charges, icon, and idfile. Use this to discover which
+/// slot holds an item before giving/equipping it.
+async fn get_inventory(State(s): State<HttpState>) -> Json<serde_json::Value> {
+    let items = s.inventory.lock().unwrap().clone();
+    Json(serde_json::json!({ "count": items.len(), "items": items }))
+}
+
+#[derive(serde::Deserialize, Default)]
+struct LootBody {
+    /// Corpse spawn id to loot directly.
+    id:   Option<u32>,
+    /// Corpse name to fuzzy-match (corpses are named like "a_rat000's corpse").
+    name: Option<String>,
+}
+
+/// POST /loot — open a corpse and take all its items, reusing the auto-loot machinery
+/// (OP_LootRequest → echo each OP_LootItem → OP_EndLootRequest). Must be near the corpse; looted
+/// items land in inventory (see GET /inventory). Body: {"id":N} for a specific corpse spawn id,
+/// {"name":"..."} to fuzzy-match a corpse name, or {} for the nearest corpse.
+async fn post_loot(
+    State(s): State<HttpState>,
+    body: Option<Json<LootBody>>,
+) -> (StatusCode, String) {
+    let b = body.map(|Json(b)| b).unwrap_or_default();
+    // Resolve to a corpse spawn id: explicit id > fuzzy name > nearest corpse.
+    let resolved: Option<(String, u32)> = if let Some(id) = b.id {
+        let name = s.entity_ids.lock().unwrap().iter()
+            .find(|(_, &v)| v == id).map(|(k, _)| k.clone())
+            .unwrap_or_else(|| format!("spawn {}", id));
+        Some((name, id))
+    } else if let Some(name) = &b.name {
+        let ids = s.entity_ids.lock().unwrap();
+        let nl = name.to_lowercase();
+        ids.iter()
+            .find(|(k, _)| k.to_lowercase().contains(&nl) || clean_entity_name(k).to_lowercase().contains(&nl))
+            .map(|(k, &id)| (k.clone(), id))
+    } else {
+        // Nearest corpse to the player (camera focus = player pos).
+        let focus = s.snapshot.lock().unwrap().focus;
+        let positions = s.entity_positions.lock().unwrap();
+        let ids = s.entity_ids.lock().unwrap();
+        positions.iter()
+            .filter(|(k, _)| k.to_lowercase().contains("corpse"))
+            .map(|(k, &(x, y, _))| {
+                let (dx, dy) = (x - focus[0], y - focus[1]);
+                (k.clone(), dx * dx + dy * dy)
+            })
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .and_then(|(k, _)| ids.get(&k).map(|&id| (k, id)))
+    };
+    match resolved {
+        Some((name, id)) => {
+            *s.loot.lock().unwrap() = Some(id);
+            eprintln!("loot: queued corpse {:?} (spawn_id={})", name, id);
+            (StatusCode::OK, format!("looting {} (spawn_id={})", clean_entity_name(&name), id))
+        }
+        None => (StatusCode::NOT_FOUND, "no corpse found to loot".into()),
     }
 }
 
