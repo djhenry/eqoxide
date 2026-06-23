@@ -7,7 +7,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::{GameState, ZonePoint};
-use crate::http::{AttackReq, BuyReq, MoveReq, GiveReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
+use crate::http::{AttackReq, BuyReq, MoveReq, GiveReq, CastReq, SitReq, ConsiderReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
 
 /// Pending state of a quest turn-in (POST /give). The trade window spans multiple nav ticks:
 /// we send OP_TradeRequest, then must wait for the server's OP_TradeRequestAck before moving the
@@ -131,6 +131,9 @@ pub struct Navigator {
     buy:              BuyReq,
     move_req:         MoveReq,
     give:             GiveReq,
+    cast:             CastReq,
+    sit:              SitReq,
+    consider:         ConsiderReq,
     /// In-progress quest turn-in (POST /give), or None when idle. Drives the trade-window
     /// state machine across nav ticks (request → wait for ack → move item + accept).
     give_state:       Option<GiveState>,
@@ -166,6 +169,9 @@ impl Navigator {
         buy:              BuyReq,
         move_req:         MoveReq,
         give:             GiveReq,
+        cast:             CastReq,
+        sit:              SitReq,
+        consider:         ConsiderReq,
         collision:        crate::assets::SharedCollision,
         maps_dir:         std::path::PathBuf,
     ) -> Self {
@@ -183,6 +189,9 @@ impl Navigator {
             buy,
             move_req,
             give,
+            cast,
+            sit,
+            consider,
             give_state: None,
             collision,
             maps_dir,
@@ -381,7 +390,38 @@ impl Navigator {
             self.auto_attack = on;
             let payload = [if on { 1u8 } else { 0u8 }, 0, 0, 0];
             stream.send_app_packet(OP_AUTO_ATTACK, &payload);
+            gs.auto_attack = on;
             eprintln!("EQ: auto-attack {}", if on { "ON" } else { "OFF" });
+        }
+
+        // Cast a memorized spell gem on a target (current target, or self if none).
+        let cast_req = self.cast.lock().unwrap().take();
+        if let Some(req) = cast_req {
+            let spell_id = gs.mem_spells.get(req.gem as usize).copied().unwrap_or(0xFFFF_FFFF);
+            if spell_id != 0xFFFF_FFFF {
+                let target = req.target_id.or(gs.target_id).unwrap_or(gs.player_id);
+                stream.send_app_packet(OP_CAST_SPELL, &build_cast_packet(req.gem as u32, spell_id, target));
+                eprintln!("EQ: cast gem={} spell={} target={}", req.gem, spell_id, target);
+            } else {
+                eprintln!("EQ: cast gem={} ignored — empty gem", req.gem);
+            }
+        }
+
+        // Sit / stand (OP_SpawnAppearance type=14, param 110/100).
+        let sit_req = self.sit.lock().unwrap().take();
+        if let Some(sit) = sit_req {
+            let param = if sit { 110u32 } else { 100u32 };
+            stream.send_app_packet(OP_SPAWN_APPEARANCE,
+                &build_spawn_appearance_packet(gs.player_id as u16, 14, param));
+            gs.sitting = sit;
+            eprintln!("EQ: {}", if sit { "sit" } else { "stand" });
+        }
+
+        // Standalone consider.
+        let con_req = self.consider.lock().unwrap().take();
+        if let Some(id) = con_req {
+            stream.send_app_packet(OP_CONSIDER, &build_consider_packet(gs.player_id, id));
+            eprintln!("EQ: consider spawn_id={}", id);
         }
 
         // Merchant buy: open the merchant (OP_ShopRequest) then buy its inventory slot

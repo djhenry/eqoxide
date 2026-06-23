@@ -79,6 +79,15 @@ pub type MoveReq = Arc<Mutex<Option<(u32, u32)>>>;
 /// waits for OP_TradeRequestAck, then moves the item into the NPC trade slot + OP_TradeAcceptClick.
 pub type GiveReq = Arc<Mutex<Option<(u32, u32)>>>;
 
+#[derive(Clone, Copy)]
+pub struct CastRequest { pub gem: u8, pub target_id: Option<u32> }
+/// Cast a memorized gem (0-8) on an explicit target, else current target, else self.
+pub type CastReq = Arc<Mutex<Option<CastRequest>>>;
+/// Posture: Some(true)=sit, Some(false)=stand.
+pub type SitReq = Arc<Mutex<Option<bool>>>;
+/// Standalone consider of a spawn id.
+pub type ConsiderReq = Arc<Mutex<Option<u32>>>;
+
 /// Current zone name and id, updated on every OP_NEW_ZONE.
 #[allow(dead_code)]
 pub type ZoneInfo = Arc<Mutex<(String, u16)>>;
