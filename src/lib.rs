@@ -38,4 +38,5 @@ pub mod game_state;
 pub mod http;
 pub mod hud;
 pub mod quests;
+pub mod spells;
 pub mod zone_map;

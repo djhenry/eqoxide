@@ -60,6 +60,31 @@ fn stat_bar(
     ui.label(format!("{:.0}%", pct));
 }
 
+/// Load spells01..07.tga as egui textures. Returns [] if the directory/files are absent
+/// (graceful — gems fall back to text labels).
+pub fn load_spell_icons(ctx: &egui::Context) -> Vec<egui::TextureHandle> {
+    let dir = std::env::var("EQ_SPELL_ICONS_DIR")
+        .unwrap_or_else(|_| "~/git/original-client/uifiles/default".to_string());
+    let mut out = Vec::new();
+    for n in 1..=7 {
+        let path = format!("{dir}/spells0{n}.tga");
+        match image::open(&path) {
+            Ok(img) => {
+                let rgba = img.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                let tex = ctx.load_texture(
+                    format!("spellicons{n}"),
+                    egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba),
+                    egui::TextureOptions::NEAREST,
+                );
+                out.push(tex);
+            }
+            Err(_) => break,
+        }
+    }
+    out
+}
+
 pub fn draw_fps(ctx: &egui::Context, fps: f32) {
     egui::Area::new(egui::Id::new("fps_counter"))
         .anchor(egui::Align2::LEFT_TOP, canvas_off(ctx, egui::Align2::LEFT_TOP, [8.0, 8.0]))
@@ -364,6 +389,95 @@ pub fn draw_control_bar(
                 if (ui.button("Send").clicked() || enter) && !say_buffer.trim().is_empty() {
                     *say.lock().unwrap() = Some(say_buffer.trim().to_string());
                     say_buffer.clear();
+                }
+            });
+        });
+}
+
+/// Bottom-center action grid: attack toggle, sit/stand toggle, target/consider, and the 9
+/// memorized spell gems. Buttons write the same request slots the HTTP API uses.
+pub fn draw_action_grid(
+    ctx:      &egui::Context,
+    scene:    &SceneState,
+    spells:   &crate::spells::SpellDb,
+    icons:    &[egui::TextureHandle],
+    attack:   &crate::http::AttackReq,
+    cast:     &crate::http::CastReq,
+    sit:      &crate::http::SitReq,
+    target:   &crate::http::TargetReq,
+    consider: &crate::http::ConsiderReq,
+) {
+    egui::Window::new("##actiongrid")
+        .title_bar(false).resizable(false).collapsible(false)
+        .anchor(egui::Align2::CENTER_BOTTOM, canvas_off(ctx, egui::Align2::CENTER_BOTTOM, [0.0, -8.0]))
+        .frame(egui::Frame::none()
+            .fill(egui::Color32::from_black_alpha(170))
+            .inner_margin(egui::Margin::symmetric(8.0, 4.0)))
+        .show(ctx, |ui| {
+            if let Some(c) = &scene.casting {
+                let frac = (c.started.elapsed().as_secs_f32()
+                    / (c.cast_ms.max(1) as f32 / 1000.0)).clamp(0.0, 1.0);
+                let label = spells.get(c.spell_id).map(|s| s.name.clone())
+                    .unwrap_or_else(|| format!("Spell {}", c.spell_id));
+                ui.add(egui::ProgressBar::new(frac).text(format!("Casting {label}")));
+            }
+            ui.horizontal(|ui| {
+                let atk = egui::Button::new("\u{2694} Attack")
+                    .fill(if scene.auto_attack { egui::Color32::from_rgb(150, 40, 40) }
+                          else { egui::Color32::from_gray(50) });
+                if ui.add(atk).clicked() {
+                    *attack.lock().unwrap() = Some(!scene.auto_attack);
+                }
+                let sit_label = if scene.sitting { "Stand" } else { "Sit" };
+                if ui.button(sit_label).clicked() {
+                    *sit.lock().unwrap() = Some(!scene.sitting);
+                }
+                let nearest = nearest_npc(scene).map(|b| b.id);
+                if ui.add_enabled(nearest.is_some(), egui::Button::new("Target")).clicked() {
+                    if let Some(id) = nearest { *target.lock().unwrap() = Some(id); }
+                }
+                if ui.add_enabled(scene.target_id.is_some(), egui::Button::new("Con")).clicked() {
+                    if let Some(id) = scene.target_id { *consider.lock().unwrap() = Some(id); }
+                }
+            });
+            ui.horizontal(|ui| {
+                for (gem, &spell_id) in scene.mem_spells.iter().enumerate() {
+                    let empty = spell_id == 0 || spell_id == 0xFFFF_FFFF;
+                    // Icon path: non-empty gem + a loaded sheet for this spell's icon.
+                    if !empty {
+                        if let Some(info) = spells.get(spell_id) {
+                            let (sheet, col, row) = crate::spells::icon_cell(info.icon_id);
+                            if let Some(tex) = icons.get(sheet) {
+                                let cw = 1.0 / crate::spells::ICON_COLS as f32;
+                                let ch = 1.0 / crate::spells::ICON_ROWS as f32;
+                                let uv = egui::Rect::from_min_size(
+                                    egui::pos2(col as f32 * cw, row as f32 * ch),
+                                    egui::vec2(cw, ch));
+                                let img = egui::Image::new(egui::load::SizedTexture::from_handle(tex))
+                                    .uv(uv)
+                                    .fit_to_exact_size(egui::vec2(36.0, 36.0));
+                                let resp = ui.add(egui::ImageButton::new(img))
+                                    .on_hover_text(&info.name);
+                                if resp.clicked() {
+                                    *cast.lock().unwrap() = Some(crate::http::CastRequest {
+                                        gem: gem as u8, target_id: None,
+                                    });
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    // Text fallback: empty gem, or no icon sheet loaded.
+                    let label = if empty { "\u{2014}".to_string() }
+                        else { spells.get(spell_id).map(|s| s.name.clone())
+                                 .unwrap_or_else(|| format!("{spell_id}")) };
+                    let btn = egui::Button::new(egui::RichText::new(label).size(11.0))
+                        .min_size(egui::vec2(56.0, 28.0));
+                    if ui.add_enabled(!empty, btn).clicked() {
+                        *cast.lock().unwrap() = Some(crate::http::CastRequest {
+                            gem: gem as u8, target_id: None,
+                        });
+                    }
                 }
             });
         });
