@@ -660,10 +660,12 @@ pub fn draw_minimap(
         return;
     }
 
-    // Small map: route through managed_window
+    // Small map: route through managed_window. The canvas tracks the window's
+    // available width (square), so dragging the resize handle actually grows the map.
     let base = egui::Frame::none();
     managed_window(ctx, layout, spec("minimap"), base, |ui| {
-        let (resp, painter) = ui.allocate_painter(map_size, egui::Sense::click());
+        let side = ui.available_width().clamp(120.0, 1024.0);
+        let (resp, painter) = ui.allocate_painter(egui::Vec2::splat(side), egui::Sense::click());
         let rect = resp.rect;
 
         // Scroll to zoom (only when hovered)
