@@ -38,6 +38,9 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
                 let zone_id = u16::from_le_bytes([p[0], p[1]]);
                 let instance_id = u16::from_le_bytes([p[2], p[3]]);
                 eprintln!("EQ: OP_REQUEST_CLIENT_ZONE_CHANGE → zone_id={zone_id} instance={instance_id} ({} bytes)", p.len());
+                if zone_id != 0 && zone_id != gs.zone_id {
+                    gs.pending_server_zone = Some(zone_id);
+                }
             } else {
                 eprintln!("EQ: OP_REQUEST_CLIENT_ZONE_CHANGE ({} bytes)", p.len());
             }

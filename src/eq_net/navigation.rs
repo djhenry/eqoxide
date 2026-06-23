@@ -435,6 +435,14 @@ impl Navigator {
             }
         }
 
+        // Server-initiated zone change (portal door etc.): begin the normal zone-change
+        // handshake to the requested destination, reusing the zone-cross path.
+        if let Some(dest_zone) = gs.pending_server_zone.take() {
+            eprintln!("EQ: server-requested zone change → zone_id={dest_zone}");
+            self.send_zone_change_packet(stream, gs, dest_zone);
+            self.last_zone_cross = Instant::now();
+        }
+
         // Check hail request — say "Hail, <name>" so a nearby NPC fires its hail script.
         let hail_name = self.hail.lock().unwrap().take();
         if let Some(name) = hail_name {
