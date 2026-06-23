@@ -48,6 +48,25 @@ impl Entity {
     }
 }
 
+/// A zone door (from OP_SpawnDoor). Position is stored in client convention
+/// (x = east, y = north, z = up), converted from the wire's y-first order.
+#[derive(Debug, Clone)]
+pub struct Door {
+    pub door_id: u8,
+    pub name: String,        // model name, e.g. "DOOR1"
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub heading: f32,        // EQ heading (0..512)
+    pub incline: i32,
+    pub size: u16,           // 100 = normal scale
+    pub opentype: u8,
+    pub door_param: u32,
+    pub invert_state: bool,  // true = normally-open door
+    pub is_open: bool,       // authoritative, from server
+    pub open_frac: f32,      // render-only: eases 0..1 toward is_open
+}
+
 /// One objective/step of a Task-system quest (from OP_TaskActivity). `done_count`/`goal_count`
 /// are the live progress (e.g. "kill 4 gnolls" -> goal 4, done 2).
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -138,6 +157,9 @@ pub struct GameState {
     // Entities in zone (keyed by spawn_id)
     pub entities: std::collections::HashMap<u32, Entity>,
 
+    // Doors in zone (keyed by per-zone door_id), from OP_SpawnDoor.
+    pub doors: std::collections::HashMap<u8, Door>,
+
     // Target
     pub target_id: Option<u32>,
     pub target_name: Option<String>,
@@ -223,6 +245,26 @@ impl GameState {
         }
     }
 
+    pub fn upsert_door(&mut self, d: Door) {
+        self.doors.insert(d.door_id, d);
+    }
+
+    /// Apply a server door-state change. Unknown door ids are ignored.
+    pub fn set_door_open(&mut self, door_id: u8, open: bool) {
+        if let Some(d) = self.doors.get_mut(&door_id) {
+            d.is_open = open;
+        }
+    }
+
+    /// Nearest door to a point (used by POST /doors/click {name}).
+    pub fn nearest_door(&self, x: f32, y: f32, z: f32) -> Option<&Door> {
+        self.doors.values().min_by(|a, b| {
+            let da = (a.x - x).powi(2) + (a.y - y).powi(2) + (a.z - z).powi(2);
+            let db = (b.x - x).powi(2) + (b.y - y).powi(2) + (b.z - z).powi(2);
+            da.total_cmp(&db)
+        })
+    }
+
     pub fn update_hp(&mut self, spawn_id: u32, cur_hp: i32, max_hp: i32) {
         if spawn_id == self.player_id {
             self.hp_pct = (cur_hp as f32 / max_hp.max(1) as f32) * 100.0;
@@ -256,7 +298,7 @@ impl GameState {
 
 #[cfg(test)]
 mod tests {
-    use super::{Entity, GameState};
+    use super::{Door, Entity, GameState};
 
     fn make_entity(id: u32, name: &str, x: f32, y: f32, z: f32, is_npc: bool) -> Entity {
         Entity {
@@ -441,5 +483,25 @@ mod tests {
         // dist = 10.0, max_dist = 5.0 → excluded
         gs.upsert_entity(make_entity(1, "faraway", 10.0, 0.0, 0.0, true));
         assert!(gs.nearby_npcs(5.0).is_empty());
+    }
+
+    // --- Door state management ---
+
+    #[test]
+    fn door_open_state_round_trips() {
+        let mut gs = GameState::new();
+        gs.upsert_door(Door {
+            door_id: 3, name: "DOOR1".into(),
+            x: 10.0, y: 20.0, z: 5.0, heading: 0.0, incline: 0, size: 100,
+            opentype: 5, door_param: 0, invert_state: false,
+            is_open: false, open_frac: 0.0,
+        });
+        gs.set_door_open(3, true);
+        assert!(gs.doors.get(&3).unwrap().is_open);
+        gs.set_door_open(3, false);
+        assert!(!gs.doors.get(&3).unwrap().is_open);
+        // Unknown door id is ignored, not a panic.
+        gs.set_door_open(99, true);
+        assert!(gs.doors.get(&99).is_none());
     }
 }
