@@ -76,6 +76,7 @@ fn main() {
     let give:             http::GiveReq         = Arc::new(Mutex::new(None));
     let inventory:        http::InventoryShared = Arc::new(Mutex::new(Vec::new()));
     let loot:             http::LootReq         = Arc::new(Mutex::new(None));
+    let door_click:       http::DoorClickReq    = Arc::new(Mutex::new(None));
     let messages:         http::MessagesShared  = Arc::new(Mutex::new(Vec::new()));
     let cast:             http::CastReq         = Arc::new(Mutex::new(None));
     let sit:              http::SitReq          = Arc::new(Mutex::new(None));
@@ -109,6 +110,7 @@ fn main() {
         let gv  = give.clone();
         let iv  = inventory.clone();
         let lt  = loot.clone();
+        let dc  = door_click.clone();
         let mg  = messages.clone();
         let ca  = cast.clone();
         let st  = sit.clone();
@@ -119,7 +121,7 @@ fn main() {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, zc, hl, sy, tg, at, by, mv, gv, iv, lt, mg, ca, st, co, sc, md, sd).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, zc, hl, sy, tg, at, by, mv, gv, iv, lt, dc, mg, ca, st, co, sc, md, sd).await {
                     eprintln!("EQ: fatal: {e}");
                 }
             });

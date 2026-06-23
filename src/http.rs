@@ -114,6 +114,11 @@ pub type SitReq = Arc<Mutex<Option<bool>>>;
 /// Standalone consider of a spawn id.
 pub type ConsiderReq = Arc<Mutex<Option<u32>>>;
 
+/// Door-click request — a door_id, set by POST /doors/click or a human click in the 3D
+/// view. The nav thread reads it once and sends OP_ClickDoor. The door's visual state
+/// changes only when the server replies with OP_MoveDoor (server-authoritative).
+pub type DoorClickReq = Arc<Mutex<Option<u8>>>;
+
 /// Current zone name and id, updated on every OP_NEW_ZONE.
 #[allow(dead_code)]
 pub type ZoneInfo = Arc<Mutex<(String, u16)>>;

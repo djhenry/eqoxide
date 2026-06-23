@@ -7,7 +7,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::{GameState, ZonePoint};
-use crate::http::{AttackReq, BuyReq, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, CastReq, SitReq, ConsiderReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
+use crate::http::{AttackReq, BuyReq, DoorClickReq, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, CastReq, SitReq, ConsiderReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
 
 /// Pending state of a quest turn-in (POST /give). The trade window spans multiple nav ticks:
 /// we send OP_TradeRequest, then must wait for the server's OP_TradeRequestAck before moving the
@@ -154,6 +154,7 @@ pub struct Navigator {
     /// POST /loot corpse request (drained into gs.pending_loot to reuse the auto-loot loop).
     inventory:        InventoryShared,
     loot:             LootReq,
+    door_click:       DoorClickReq,
     messages:         MessagesShared,
     collision:        crate::assets::SharedCollision,
     maps_dir:         std::path::PathBuf,
@@ -189,6 +190,7 @@ impl Navigator {
         give:             GiveReq,
         inventory:        InventoryShared,
         loot:             LootReq,
+        door_click:       DoorClickReq,
         messages:         MessagesShared,
         cast:             CastReq,
         sit:              SitReq,
@@ -216,6 +218,7 @@ impl Navigator {
             give_state: None,
             inventory,
             loot,
+            door_click,
             messages,
             collision,
             maps_dir,
@@ -347,6 +350,14 @@ impl Navigator {
                 gs.loot_queued_at = Some(Instant::now());
             }
             eprintln!("loot: queued corpse_id={} for looting (via POST /loot)", corpse_id);
+        }
+
+        // POST /doors/click or a human door click: send OP_ClickDoor. The door opens
+        // visually only when the server replies with OP_MoveDoor.
+        if let Some(door_id) = self.door_click.lock().unwrap().take() {
+            stream.send_app_packet(OP_CLICK_DOOR, &build_click_door(door_id, gs.player_id));
+            eprintln!("EQ: click door_id={}", door_id);
+            gs.log_msg("door", &format!("Clicked door {}", door_id));
         }
 
         // Check zone-cross request — warp onto a zone line, then send OP_ZONE_CHANGE.
