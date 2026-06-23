@@ -40,10 +40,20 @@ fn resolve_equip_tex<'a>(
     equipment:  &[u32; 9],
 ) -> &'a wgpu::BindGroup {
     if let Some(es) = slot {
+        let mat = equipment[es.slot];
         // equip_swap_key returns None for material 0 (naked → baked texture) / no prefix.
-        if let Some(key) = crate::models::equip_swap_key(prefix, es, equipment[es.slot]) {
+        if let Some(key) = crate::models::equip_swap_key(prefix, es.clone(), mat) {
             if let Some(Some(bg)) = r.equipment_tex_cache.get(&key) {
                 return bg;
+            }
+        }
+        // Velious-range (17-23) fallback: the raw racial texture (e.g. elflg2301) often doesn't
+        // exist, so remap to the classic base tier (e.g. 23 → 1 leather) like the original client.
+        if let Some(rmat) = crate::models::velious_material_fallback(mat) {
+            if let Some(key) = crate::models::equip_swap_key(prefix, es, rmat) {
+                if let Some(Some(bg)) = r.equipment_tex_cache.get(&key) {
+                    return bg;
+                }
             }
         }
     }

@@ -603,6 +603,20 @@ pub fn equip_swap_key(prefix: &str, slot: EquipSlot, material: u32) -> Option<St
     Some(equip_texture_name(prefix, &slot.region, material, slot.variant))
 }
 
+/// Velious armor materials (17-23) reuse a classic base-tier texture when a race's Velious art isn't
+/// shipped (e.g. elves have no `elf*23` textures, only human/Iksar do). The original Titanium client
+/// remaps them (REDACTED-CLIENT client_fn): 17/20/23 → 1 (leather), 18/21 → 2 (chain), 19/22 → 3
+/// (plate). Returns the fallback material to try when the raw material's texture is missing, so e.g.
+/// material-23 cloth pants on an elf render as leather-look leggings instead of bare skin. (The
+/// wizard-only 23 → 4 case is omitted.)
+pub fn velious_material_fallback(material: u32) -> Option<u32> {
+    if (17..=23).contains(&material) {
+        Some(((material - 17) % 3) + 1)
+    } else {
+        None
+    }
+}
+
 /// Map an EQ race string (case-insensitive) to a glTF archetype key.
 pub fn race_to_archetype(race: &str) -> &'static str {
     match race.to_uppercase().as_str() {
