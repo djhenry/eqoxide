@@ -39,6 +39,21 @@ pub enum PickResult {
 }
 
 /// The winit `ApplicationHandler` and root of the render half. Owns the window + GPU surface, the
+/// Per-entity motion smoothing state. Server position updates (OP_ClientUpdate) arrive only
+/// a few times per second; we estimate each entity's velocity from the last two updates and
+/// dead-reckon its position forward so movement looks continuous and travels at the right pace,
+/// instead of snapping or easing toward a stale point in bursts.
+struct EntityMotion {
+    /// Smoothed position actually rendered [east, north, z].
+    display:     [f32; 3],
+    /// Most recent server position seen [east, north, z].
+    target:      [f32; 3],
+    /// Estimated velocity in units/sec, from the last two server positions.
+    vel:         [f32; 3],
+    /// When `target` last changed — the clock for dead-reckoning extrapolation.
+    last_update: std::time::Instant,
+}
+
 /// `EqRenderer`, the per-frame `SceneState`, camera state, input state, and the shared request
 /// slots / packet receiver that connect it to the HTTP and EQ-network threads. Its event-loop
 /// callbacks (`resumed`, `window_event`, `about_to_wait`) drive zone loading, per-frame update from
@@ -148,6 +163,8 @@ pub struct App {
     last_grounded_z: f32,
     /// Render position last frame [east, north, z], used to derive facing from motion.
     prev_render_pos: [f32; 3],
+    /// Per-entity motion smoothing state, keyed by spawn id. See [`EntityMotion`].
+    entity_motion: std::collections::HashMap<u32, EntityMotion>,
     /// Where the player should face (EQ degrees, 0=north) — set from movement direction.
     heading_target:  f32,
     /// Smoothed facing actually used for rendering and camera-behind placement.
@@ -258,6 +275,7 @@ impl App {
             ground_cache: (f32::NAN, f32::NAN, 0.0),
             last_grounded_z: 0.0,
             prev_render_pos: [0.0, 0.0, 0.0],
+            entity_motion: std::collections::HashMap::new(),
             heading_target:  0.0,
             visual_heading:  0.0,
             vert_vel:  0.0,
@@ -717,6 +735,66 @@ impl App {
         // is rendered side-by-side for visual debugging.
         if self.scene.zone == "testzone" {
             self.scene.inject_test_billboards();
+        }
+
+        // Smooth NPC movement. Server position updates (OP_ClientUpdate) arrive only a few
+        // times per second, so snapping each billboard to the latest packet looks choppy.
+        // Instead we estimate each entity's velocity from its last two server positions and
+        // dead-reckon it forward, so it travels continuously at its actual pace. Large
+        // horizontal jumps (spawns, teleports, server corrections) snap instead of sliding.
+        // Done before the floor-snap below so the ground height follows the smoothed position.
+        {
+            const SMOOTH_TAU: f32 = 0.10;          // ease toward the dead-reckoned point
+            const SNAP_DIST_SQ: f32 = 25.0 * 25.0; // beyond this horizontal gap, jump not slide
+            const EXTRAP_CAP: f32 = 0.30;          // seconds of forward prediction we trust
+            let now = std::time::Instant::now();
+            let live: std::collections::HashSet<u32> =
+                self.scene.billboards.iter().map(|b| b.id).collect();
+            self.entity_motion.retain(|id, _| live.contains(id));
+            let step = (dt / SMOOTH_TAU).min(1.0);
+            for b in &mut self.scene.billboards {
+                let target = b.pos;
+                let m = self.entity_motion.entry(b.id).or_insert_with(|| EntityMotion {
+                    display: target, target, vel: [0.0; 3], last_update: now,
+                });
+
+                // A changed server position is a fresh update: estimate velocity from the gap
+                // since the previous one (the "rate of travel" between the last two locations).
+                if target != m.target {
+                    let dx = target[0] - m.target[0];
+                    let dy = target[1] - m.target[1];
+                    if dx * dx + dy * dy >= SNAP_DIST_SQ {
+                        m.vel = [0.0; 3];      // teleport / correction — don't fling across the zone
+                        m.display = target;
+                    } else {
+                        let dt_upd = (now - m.last_update).as_secs_f32().clamp(0.05, 1.0);
+                        for i in 0..3 {
+                            m.vel[i] = (target[i] - m.target[i]) / dt_upd;
+                        }
+                    }
+                    m.target = target;
+                    m.last_update = now;
+                }
+
+                // Predict where the entity is now by extrapolating along its velocity. Cap the
+                // prediction window, and once updates stop arriving (the entity has stopped) bleed
+                // the velocity off so it settles on the last known position instead of drifting.
+                let t_since = (now - m.last_update).as_secs_f32();
+                if t_since > EXTRAP_CAP {
+                    let decay = (1.0 - dt * 6.0).max(0.0);
+                    for v in &mut m.vel { *v *= decay; }
+                }
+                let te = t_since.min(EXTRAP_CAP);
+                let mut predicted = m.target;
+                for i in 0..3 {
+                    predicted[i] += m.vel[i] * te;
+                }
+
+                for i in 0..3 {
+                    m.display[i] += (predicted[i] - m.display[i]) * step;
+                }
+                b.pos = m.display;
+            }
         }
 
         // Snap NPC billboards to terrain floor so they don't hover above geometry.
