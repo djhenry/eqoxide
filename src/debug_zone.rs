@@ -28,7 +28,7 @@ pub fn make_debug_zone() -> ZoneAssets {
         // EQ +Z up = S3D Y direction: tip at S3D (0,20,0)
         axis_box([-0.5, 0.5], [ 0.0,20.0], [-0.5, 0.5], "blue"),
     ];
-    ZoneAssets { meshes, textures }
+    ZoneAssets { terrain: meshes, objects: vec![], textures }
 }
 
 /// Fallback environment used when a zone's S3D file is missing.
@@ -36,7 +36,7 @@ pub fn make_debug_zone() -> ZoneAssets {
 pub fn make_fallback_ground() -> ZoneAssets {
     let textures = vec![grass_tex("grass")];
     let meshes = vec![ground_plane("grass")];
-    ZoneAssets { meshes, textures }
+    ZoneAssets { terrain: meshes, objects: vec![], textures }
 }
 
 fn solid_tex(name: &str, rgba: [u8; 4]) -> TextureData {

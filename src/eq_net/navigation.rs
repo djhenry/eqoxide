@@ -876,7 +876,7 @@ mod tests {
             center: [0.0, 0.0, 0.0],
         };
         crate::assets::Collision::build(
-            &crate::assets::ZoneAssets { meshes: vec![wall], textures: vec![] }, 4.0)
+            &crate::assets::ZoneAssets { terrain: vec![wall], objects: vec![], textures: vec![] }, 4.0)
     }
 
     #[test]

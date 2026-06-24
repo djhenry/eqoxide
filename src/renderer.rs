@@ -177,7 +177,10 @@ impl EqRenderer {
             // Key uses texture_idx only; base_color is averaged across merges (usually all [1,1,1,1]).
             let mut groups: HashMap<Option<usize>, (Vec<Vertex>, Vec<u32>)> = HashMap::new();
 
-            for mesh in &assets.meshes {
+            // Terrain plus CPU-expanded instanced objects (GPU instancing lands in Task 4).
+            let expanded = crate::assets::expand_objects(&assets.objects);
+            let source_count = assets.terrain.len() + expanded.len();
+            for mesh in assets.terrain.iter().chain(expanded.iter()) {
                 if mesh.positions.is_empty() || mesh.indices.is_empty() { continue; }
 
                 let texture_idx = mesh.texture_name.as_ref()
@@ -224,7 +227,7 @@ impl EqRenderer {
             }).collect();
 
             eprintln!("renderer: merged zone into {} draw calls (was {} source meshes)",
-                self.gpu_meshes.len(), assets.meshes.len());
+                self.gpu_meshes.len(), source_count);
         }
 
         // Sort merged meshes so same-texture groups are contiguous (they already are, but be safe).
@@ -454,7 +457,7 @@ impl EqRenderer {
             &self.device, &self.queue, &assets.textures, &self.layouts.texture_bgl);
         let tex_names: Vec<String> = assets.textures.iter().map(|t| t.name.clone()).collect();
         let mut meshes = Vec::new();
-        for m in &assets.meshes {
+        for m in &assets.terrain {
             if m.positions.is_empty() || m.indices.is_empty() { continue; }
             let [cx, cy, cz] = m.center;
             // libeq [p0,p1,p2] -> render [p2,p0,p1] (same axis convention as zone/static meshes).
