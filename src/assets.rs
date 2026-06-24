@@ -511,6 +511,54 @@ impl Collision {
         self.nearest_hit_t(from, target).is_none()
     }
 
+    /// ALL distinct walkable surface heights at `(east, north)` within `[ref_z - down, ref_z + up]`,
+    /// sorted high→low with near-duplicates (within 1u) merged. Unlike `nearest_floor` (one surface),
+    /// this exposes every floor in the column — essential for multi-level pathfinding where a ramp or
+    /// lower floor sits UNDER an upper ledge (so A* can choose to descend instead of always snapping
+    /// to the nearest/upper surface).
+    pub fn column_floors(&self, east: f32, north: f32, ref_z: f32, up: f32, down: f32) -> Vec<f32> {
+        if self.cols == 0 { return Vec::new(); }
+        let z_top = ref_z + up.max(0.0);
+        let z_bot = ref_z - down.max(0.0);
+        let dir_z = z_bot - z_top;
+        if dir_z.abs() < 1e-6 { return Vec::new(); }
+        let eps = 1e-6_f32;
+        let cross = |a: [f32; 3], b: [f32; 3]| [
+            a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0],
+        ];
+        let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let from = [east, north, z_top];
+        let dir = [0.0, 0.0, dir_z];
+        let (c0, c1, r0, r1) = self.cell_range(east, north, east, north);
+        let mut hits: Vec<f32> = Vec::new();
+        for r in r0..=r1 {
+            for c in c0..=c1 {
+                for &ti in &self.cells[r * self.cols + c] {
+                    let tri = &self.tris[ti as usize];
+                    let (v0, v1, v2) = (tri[0], tri[1], tri[2]);
+                    let e1 = [v1[0]-v0[0], v1[1]-v0[1], v1[2]-v0[2]];
+                    let e2 = [v2[0]-v0[0], v2[1]-v0[1], v2[2]-v0[2]];
+                    let p = cross(dir, e2);
+                    let det = dot(e1, p);
+                    if det.abs() < eps { continue; }
+                    let inv = 1.0 / det;
+                    let tvec = [from[0]-v0[0], from[1]-v0[1], from[2]-v0[2]];
+                    let u = dot(tvec, p) * inv;
+                    if u < 0.0 || u > 1.0 { continue; }
+                    let q = cross(tvec, e1);
+                    let v = dot(dir, q) * inv;
+                    if v < 0.0 || u + v > 1.0 { continue; }
+                    let t = dot(e2, q) * inv;
+                    if !(0.0..=1.0).contains(&t) { continue; }
+                    hits.push(z_top + t * dir_z);
+                }
+            }
+        }
+        hits.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)); // high→low
+        hits.dedup_by(|a, b| (*a - *b).abs() < 1.0);
+        hits
+    }
+
     /// A* over the collision grid: a walkable waypoint path from `start` to `goal` that routes
     /// AROUND walls (slide_move only slides along one). Returns cell-center waypoints
     /// `[east, north]` (start-exclusive, goal-inclusive) or None if no geometry / no route.
@@ -558,70 +606,83 @@ impl Collision {
             .into_iter()
             .find_map(|rz| floor_near(sc, sr, rz))
             .unwrap_or(start[2]);
-        const STEP_H: f32 = 20.0; // max floor-height change between adjacent cells (allow stairs)
+        const STEP_H: f32 = 20.0;        // max CLIMB between adjacent cells (stairs/ledge)
+        const MAX_STEP_DOWN: f32 = 60.0; // max DROP between adjacent cells (fall/hop down a level)
         const CHEST: f32 = 3.0;
         const MAX_NODES: usize = 200_000;
-        let idx = |c: i32, r: i32| (r * cols + c) as usize;
-        let n = (cols * rows) as usize;
-        let mut g_score = vec![f32::MAX; n];
-        let mut came: Vec<i32> = vec![-1; n];
-        let mut closed = vec![false; n];
-        let mut cell_floor = vec![f32::NAN; n]; // floor height each cell was reached at
-        struct Node { f: f32, c: i32, r: i32 }
+        // MULTI-FLOOR A*: the node is (cell, floor), not just cell — so a single cell can be visited
+        // at several heights (a ramp or lower floor sitting UNDER an upper ledge). Single-floor A*
+        // snapped every cell to the surface nearest the current z and could never step down onto a
+        // floor beneath an overhang, so overlapping multi-level zones (e.g. qcat's sewer under the
+        // upper walkway) were unreachable. Floor is quantized to 2u buckets for the hash key.
+        let qf = |z: f32| (z / 2.0).round() as i32;
+        type Key = (i32, i32, i32); // (col, row, floor_bucket)
+        let skey: Key = (sc, sr, qf(start_floor));
+        let mut g_score: std::collections::HashMap<Key, f32> = std::collections::HashMap::new();
+        let mut came:    std::collections::HashMap<Key, Key> = std::collections::HashMap::new();
+        let mut closed:  std::collections::HashSet<Key> = std::collections::HashSet::new();
+        let mut floor_of: std::collections::HashMap<Key, f32> = std::collections::HashMap::new();
+        struct Node { f: f32, c: i32, r: i32, fz: f32 }
         impl PartialEq for Node { fn eq(&self, o: &Self) -> bool { self.f == o.f } }
         impl Eq for Node {}
         impl Ord for Node { fn cmp(&self, o: &Self) -> Ordering { o.f.partial_cmp(&self.f).unwrap_or(Ordering::Equal) } }
         impl PartialOrd for Node { fn partial_cmp(&self, o: &Self) -> Option<Ordering> { Some(self.cmp(o)) } }
         let h = |c: i32, r: i32| (((c - gc) as f32).powi(2) + ((r - gr) as f32).powi(2)).sqrt() * cell;
-        cell_floor[idx(sc, sr)] = start_floor;
-        g_score[idx(sc, sr)] = 0.0;
+        g_score.insert(skey, 0.0);
+        floor_of.insert(skey, start_floor);
         let mut heap = BinaryHeap::new();
-        heap.push(Node { f: h(sc, sr), c: sc, r: sr });
+        heap.push(Node { f: h(sc, sr), c: sc, r: sr, fz: start_floor });
         let mut expanded = 0usize;
-        let mut found = false;
-        while let Some(Node { c, r, .. }) = heap.pop() {
-            let ci = idx(c, r);
-            if closed[ci] { continue; }
-            closed[ci] = true;
-            if (c, r) == (gc, gr) { found = true; break; }
+        let mut goal_key: Option<Key> = None;
+        while let Some(Node { c, r, fz, .. }) = heap.pop() {
+            let ckey = (c, r, qf(fz));
+            if !closed.insert(ckey) { continue; } // already expanded
+            if (c, r) == (gc, gr) { goal_key = Some(ckey); break; }
             expanded += 1;
             if expanded > MAX_NODES { break; }
-            let cz = cell_floor[ci];
+            let cz = fz;
+            let g_cur = *g_score.get(&ckey).unwrap_or(&f32::MAX);
+            let a = center(c, r);
             for (dc, dr) in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)] {
                 let (nc, nr) = (c + dc, r + dr);
                 if nc < 0 || nr < 0 || nc >= cols || nr >= rows { continue; }
-                let ni = idx(nc, nr);
-                if closed[ni] { continue; }
-                let nz = match floor_near(nc, nr, cz) { Some(z) => z, None => continue };
-                if (nz - cz).abs() > STEP_H { continue; }
-                let a = center(c, r);
                 let b = center(nc, nr);
-                if !self.path_clear([a[0], a[1], cz + CHEST], [b[0], b[1], nz + CHEST], radius) { continue; }
-                let step = (((dc * dc + dr * dr) as f32).sqrt()) * cell;
-                let tentative = g_score[ci] + step;
-                if tentative < g_score[ni] {
-                    g_score[ni] = tentative;
-                    came[ni] = ci as i32;
-                    cell_floor[ni] = nz;
-                    heap.push(Node { f: tentative + h(nc, nr), c: nc, r: nr });
+                // Consider EVERY surface in the neighbor column reachable by climbing <=STEP_H or
+                // dropping <=MAX_STEP_DOWN — this is what lets A* descend onto a lower floor under an
+                // overhang (the multi-level connection) instead of staying on the upper surface.
+                for nf in self.column_floors(b[0], b[1], cz, STEP_H, MAX_STEP_DOWN) {
+                    if nf - cz > STEP_H || cz - nf > MAX_STEP_DOWN { continue; }
+                    let nkey = (nc, nr, qf(nf));
+                    if closed.contains(&nkey) { continue; }
+                    if !self.path_clear([a[0], a[1], cz + CHEST], [b[0], b[1], nf + CHEST], radius) { continue; }
+                    let step = (((dc * dc + dr * dr) as f32).sqrt()) * cell + (nf - cz).abs() * 0.5;
+                    let tentative = g_cur + step;
+                    if tentative < *g_score.get(&nkey).unwrap_or(&f32::MAX) {
+                        g_score.insert(nkey, tentative);
+                        came.insert(nkey, ckey);
+                        floor_of.insert(nkey, nf);
+                        heap.push(Node { f: tentative + h(nc, nr), c: nc, r: nr, fz: nf });
+                    }
                 }
             }
         }
-        if !found {
-            tracing::info!("find_path: no route (expanded={}, cap={}, start_floor={} goal_floor={:?})",
-                expanded, MAX_NODES, start_floor, floor_near(gc, gr, goal[2]));
-            return None;
-        }
+        let goal_key = match goal_key {
+            Some(k) => k,
+            None => {
+                tracing::info!("find_path: no route (expanded={}, cap={}, start_floor={})",
+                    expanded, MAX_NODES, start_floor);
+                return None;
+            }
+        };
         let mut path = Vec::new();
-        let mut cur = idx(gc, gr) as i32;
-        let start_i = idx(sc, sr) as i32;
-        while cur != start_i && cur >= 0 {
-            let (c, r) = (cur % cols, cur / cols);
+        let mut cur = goal_key;
+        while cur != skey {
+            let (c, r, _) = cur;
             let ctr = center(c, r);
             // Carry each waypoint's actual floor height so the walker moves + collision-checks at
             // the right z while climbing/descending (instead of the goal's z, which clips walls).
-            path.push([ctr[0], ctr[1], cell_floor[cur as usize]]);
-            cur = came[cur as usize];
+            path.push([ctr[0], ctr[1], *floor_of.get(&cur).unwrap_or(&goal[2])]);
+            match came.get(&cur) { Some(&p) => cur = p, None => break }
         }
         path.reverse();
         if let Some(last) = path.last_mut() { *last = [goal[0], goal[1], goal[2]]; }
