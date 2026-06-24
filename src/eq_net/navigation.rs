@@ -331,11 +331,11 @@ impl Navigator {
                         heading: 0.0,
                         zone_id: dest_zone_id,
                     });
-                    eprintln!("zone_map: added exit '{}' at ({:.1}, {:.1}) → zone_id={}",
+                    tracing::info!("zone_map: added exit '{}' at ({:.1}, {:.1}) → zone_id={}",
                               label.text, label.east, label.north, dest_zone_id);
                 }
                 if shared.len() > before {
-                    eprintln!("zone_map: {} fallback exits added (total {})", shared.len() - before, shared.len());
+                    tracing::info!("zone_map: {} fallback exits added (total {})", shared.len() - before, shared.len());
                 }
             }
         } else {
@@ -364,14 +364,14 @@ impl Navigator {
             if gs.loot_queued_at.is_none() {
                 gs.loot_queued_at = Some(Instant::now());
             }
-            eprintln!("loot: queued corpse_id={} for looting (via POST /loot)", corpse_id);
+            tracing::info!("loot: queued corpse_id={} for looting (via POST /loot)", corpse_id);
         }
 
         // POST /doors/click or a human door click: send OP_ClickDoor. The door opens
         // visually only when the server replies with OP_MoveDoor.
         if let Some(door_id) = self.door_click.lock().unwrap().take() {
             stream.send_app_packet(OP_CLICK_DOOR, &build_click_door(door_id, gs.player_id));
-            eprintln!("EQ: click door_id={}", door_id);
+            tracing::info!("EQ: click door_id={}", door_id);
             gs.log_msg("door", &format!("Clicked door {}", door_id));
         }
 
@@ -402,11 +402,11 @@ impl Navigator {
                 // warping to the destination's arrival coords put us far from the source trigger
                 // and zoned us back to the same zone). The key is sending the TARGET zone id, not
                 // our current zone id.
-                eprintln!("zone_cross: requesting zone change to zone_id={dest_zone} from ({:.1},{:.1})",
+                tracing::info!("zone_cross: requesting zone change to zone_id={dest_zone} from ({:.1},{:.1})",
                           gs.player_x, gs.player_y);
                 self.send_zone_change_packet(stream, gs, dest_zone);
             } else {
-                eprintln!("zone_cross: no zone line found for zone_id={want_zone}");
+                tracing::info!("zone_cross: no zone line found for zone_id={want_zone}");
                 gs.log_msg("zone", "No zone line found to cross");
             }
         }
@@ -427,7 +427,7 @@ impl Navigator {
             if let Some(zp) = nearby {
                 let dest = zp.zone_id;
                 drop(zps); // release lock before mutating gs
-                eprintln!("zone_cross: auto-triggered near a zone line to zone_id={dest}");
+                tracing::info!("zone_cross: auto-triggered near a zone line to zone_id={dest}");
                 gs.log_msg("zone", &format!("Crossing to zone {}", dest));
                 self.send_zone_change_packet(stream, gs, dest);
                 self.last_zone_cross = Instant::now();
@@ -438,7 +438,7 @@ impl Navigator {
         // Server-initiated zone change (portal door etc.): begin the normal zone-change
         // handshake to the requested destination, reusing the zone-cross path.
         if let Some(dest_zone) = gs.pending_server_zone.take() {
-            eprintln!("EQ: server-requested zone change → zone_id={dest_zone}");
+            tracing::info!("EQ: server-requested zone change → zone_id={dest_zone}");
             self.send_zone_change_packet(stream, gs, dest_zone);
             self.last_zone_cross = Instant::now();
         }
@@ -448,7 +448,7 @@ impl Navigator {
         if let Some(name) = hail_name {
             let msg = format!("Hail, {}", name);
             let pkt = build_say_packet(&gs.player_name, &name, &msg);
-            eprintln!("EQ: hailing '{}' (say): {}", name, msg);
+            tracing::info!("EQ: hailing '{}' (say): {}", name, msg);
             stream.send_app_packet(OP_CHANNEL_MESSAGE, &pkt);
             gs.log_msg("chat", &format!("You say, '{}'", msg));
         }
@@ -457,7 +457,7 @@ impl Navigator {
         let say_text = self.say.lock().unwrap().take();
         if let Some(text) = say_text {
             let pkt = build_say_packet(&gs.player_name, "", &text);
-            eprintln!("EQ: say: {}", text);
+            tracing::info!("EQ: say: {}", text);
             stream.send_app_packet(OP_CHANNEL_MESSAGE, &pkt);
             gs.log_msg("chat", &format!("You say, '{}'", text));
         }
@@ -472,7 +472,7 @@ impl Navigator {
             }
             stream.send_app_packet(OP_TARGET_MOUSE, &build_target_packet(id));
             stream.send_app_packet(OP_CONSIDER, &build_consider_packet(gs.player_id, id));
-            eprintln!("EQ: target spawn_id={} + consider", id);
+            tracing::info!("EQ: target spawn_id={} + consider", id);
         }
 
         // Check attack request — send OP_AUTO_ATTACK(1) to start, OP_AUTO_ATTACK(0) to stop.
@@ -483,7 +483,7 @@ impl Navigator {
             let payload = [if on { 1u8 } else { 0u8 }, 0, 0, 0];
             stream.send_app_packet(OP_AUTO_ATTACK, &payload);
             gs.auto_attack = on;
-            eprintln!("EQ: auto-attack {}", if on { "ON" } else { "OFF" });
+            tracing::info!("EQ: auto-attack {}", if on { "ON" } else { "OFF" });
         }
 
         // Cast a memorized spell gem on a target (current target, or self if none).
@@ -493,9 +493,9 @@ impl Navigator {
             if spell_id != 0xFFFF_FFFF {
                 let target = req.target_id.or(gs.target_id).unwrap_or(gs.player_id);
                 stream.send_app_packet(OP_CAST_SPELL, &build_cast_packet(req.gem as u32, spell_id, target));
-                eprintln!("EQ: cast gem={} spell={} target={}", req.gem, spell_id, target);
+                tracing::info!("EQ: cast gem={} spell={} target={}", req.gem, spell_id, target);
             } else {
-                eprintln!("EQ: cast gem={} ignored — empty gem", req.gem);
+                tracing::info!("EQ: cast gem={} ignored — empty gem", req.gem);
             }
         }
 
@@ -506,14 +506,14 @@ impl Navigator {
             stream.send_app_packet(OP_SPAWN_APPEARANCE,
                 &build_spawn_appearance_packet(gs.player_id as u16, 14, param));
             gs.sitting = sit;
-            eprintln!("EQ: {}", if sit { "sit" } else { "stand" });
+            tracing::info!("EQ: {}", if sit { "sit" } else { "stand" });
         }
 
         // Standalone consider.
         let con_req = self.consider.lock().unwrap().take();
         if let Some(id) = con_req {
             stream.send_app_packet(OP_CONSIDER, &build_consider_packet(gs.player_id, id));
-            eprintln!("EQ: consider spawn_id={}", id);
+            tracing::info!("EQ: consider spawn_id={}", id);
         }
 
         // Merchant buy: open the merchant (OP_ShopRequest) then buy its inventory slot
@@ -534,7 +534,7 @@ impl Navigator {
             buy[8..12].copy_from_slice(&slot.to_le_bytes());
             buy[16..20].copy_from_slice(&1u32.to_le_bytes()); // quantity = 1
             stream.send_app_packet(OP_SHOP_PLAYER_BUY, &buy);
-            eprintln!("EQ: shop buy — merchant_id={} slot={} qty=1", merchant_id, slot);
+            tracing::info!("EQ: shop buy — merchant_id={} slot={} qty=1", merchant_id, slot);
             gs.log_msg("merchant", &format!("Bought item (slot {})", slot));
         }
 
@@ -551,7 +551,7 @@ impl Navigator {
             buf[4..8].copy_from_slice(&to_slot.to_le_bytes());
             buf[8..12].copy_from_slice(&0u32.to_le_bytes()); // number_in_stack = 0 (whole item)
             stream.send_app_packet(OP_MOVE_ITEM, &buf);
-            eprintln!("EQ: move item — from_slot={} to_slot={} qty=0(whole)", from_slot, to_slot);
+            tracing::info!("EQ: move item — from_slot={} to_slot={} qty=0(whole)", from_slot, to_slot);
             gs.log_msg("inventory", &format!("Moved item (slot {} -> {})", from_slot, to_slot));
         }
 
@@ -664,7 +664,7 @@ impl Navigator {
                     .unwrap_or_default(),
                 None => Vec::new(),
             };
-            eprintln!("NAV: path to ({:.0},{:.0}) = {} waypoints", goal.0, goal.1, self.path.len());
+            tracing::info!("NAV: path to ({:.0},{:.0}) = {} waypoints", goal.0, goal.1, self.path.len());
         }
 
         // Aim at the current waypoint; advance past any we've already reached. The final
@@ -696,7 +696,7 @@ impl Navigator {
         // within melee range, ensuring LOS succeeds even with nearby geometry.
         const STOP_DIST: f32 = 2.0;
         if dist <= STOP_DIST {
-            eprintln!("NAV: arrived at ({:.1},{:.1})", target.0, target.1);
+            tracing::info!("NAV: arrived at ({:.1},{:.1})", target.0, target.1);
             *self.goto_target.lock().unwrap() = None;
             // Send a final stationary position update facing the target.
             let hdg = eq_heading(dx, dy);
@@ -724,7 +724,7 @@ impl Navigator {
         let (mdx, mdy) = match chosen {
             Some(v) => v,
             None => {
-                eprintln!("NAV: boxed in by walls near ({:.1},{:.1}) — stopping",
+                tracing::info!("NAV: boxed in by walls near ({:.1},{:.1}) — stopping",
                           gs.player_x, gs.player_y);
                 gs.log_msg("zone", "Path blocked by a wall");
                 *self.goto_target.lock().unwrap() = None;
@@ -775,7 +775,7 @@ impl Navigator {
                 stream.send_app_packet(OP_TRADE_REQUEST, &req);
                 gs.trade_ack_ready = false;
                 self.give_state = Some(GiveState { npc_id, ticks_waiting: 0 });
-                eprintln!("EQ: give: OP_TradeRequest to npc_id={} (item slot {})", npc_id, from_slot);
+                tracing::info!("EQ: give: OP_TradeRequest to npc_id={} (item slot {})", npc_id, from_slot);
                 gs.log_msg("trade", "Offering item to NPC...");
             }
             return;
@@ -794,7 +794,7 @@ impl Navigator {
             accept[0..4].copy_from_slice(&gs.player_id.to_le_bytes());
             // unknown4 = 0 (already zeroed).
             stream.send_app_packet(OP_TRADE_ACCEPT_CLICK, &accept);
-            eprintln!("EQ: give: cursor→trade slot + OP_TradeAcceptClick (npc_id={})", npc_id);
+            tracing::info!("EQ: give: cursor→trade slot + OP_TradeAcceptClick (npc_id={})", npc_id);
             self.give_state = None;
             gs.trade_ack_ready = false;
         } else if let Some(g) = self.give_state.as_mut() {
@@ -802,7 +802,7 @@ impl Navigator {
             if g.ticks_waiting >= GIVE_ACK_TIMEOUT_TICKS {
                 // Abort: cancel the (possibly half-open) trade session and reset.
                 stream.send_app_packet(OP_CANCEL_TRADE, &[]);
-                eprintln!("EQ: give: no trade ack (timed out)");
+                tracing::warn!("EQ: give: no trade ack (timed out)");
                 gs.log_msg("trade", "Trade timed out (no NPC ack)");
                 self.give_state = None;
                 gs.trade_ack_ready = false;
@@ -873,7 +873,7 @@ impl Navigator {
         buf[80..84].copy_from_slice(&0u32.to_le_bytes());
         // success = 0 (client→server request)
         buf[84..88].copy_from_slice(&0i32.to_le_bytes());
-        eprintln!("EQ: sending OP_ZONE_CHANGE target_zone={} from current_zone={} pos=({:.1},{:.1},{:.1})",
+        tracing::info!("EQ: sending OP_ZONE_CHANGE target_zone={} from current_zone={} pos=({:.1},{:.1},{:.1})",
                   target_zone_id, gs.zone_id, gs.player_x, gs.player_y, gs.player_z);
         stream.send_app_packet(OP_ZONE_CHANGE, &buf);
     }

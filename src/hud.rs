@@ -124,6 +124,35 @@ pub fn draw_fps(ctx: &egui::Context, fps: f32) {
         });
 }
 
+/// `--profile` overlay: smoothed per-phase frame timings (update / 3D render / egui / submit) plus the
+/// total CPU-side frame cost and the wall-clock frame interval. Anchored top-left under the fps line.
+pub fn draw_profile(ctx: &egui::Context, p: &crate::profiling::FrameProfile) {
+    egui::Area::new(egui::Id::new("profile_overlay"))
+        .anchor(egui::Align2::LEFT_TOP, canvas_off(ctx, egui::Align2::LEFT_TOP, [8.0, 30.0]))
+        .interactable(false)
+        .show(ctx, |ui| {
+            let line = |ui: &mut egui::Ui, label: &str, ms: f32| {
+                ui.label(
+                    egui::RichText::new(format!("{label:<7}{ms:6.2} ms"))
+                        .monospace()
+                        .size(12.0)
+                        .color(egui::Color32::from_rgb(180, 220, 255)),
+                );
+            };
+            line(ui, "update", p.update_ms);
+            line(ui, "render", p.render_ms);
+            line(ui, "egui",   p.egui_ms);
+            line(ui, "submit", p.submit_ms);
+            line(ui, "cpu",    p.total_ms);
+            ui.label(
+                egui::RichText::new(format!("frame  {:6.2} ms", p.frame_ms))
+                    .monospace()
+                    .size(12.0)
+                    .color(egui::Color32::from_rgb(255, 220, 120)),
+            );
+        });
+}
+
 pub fn draw_hud(ctx: &egui::Context, layout: &mut UiLayout, scene: &SceneState, _bot_id: &str) {
     let base = egui::Frame::window(&ctx.style());
     managed_window(ctx, layout, spec("status_hud"), base, |ui| {

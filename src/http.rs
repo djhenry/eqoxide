@@ -288,7 +288,7 @@ pub fn spawn_camera_server(
             let (listener, bound_port) = match bound {
                 Some(found) => found,
                 None => {
-                    eprintln!(
+                    tracing::info!(
                         "camera HTTP: no free port in {}..{} — camera API disabled",
                         port,
                         port.saturating_add(MAX_TRIES)
@@ -299,11 +299,11 @@ pub fn spawn_camera_server(
             // Machine-parseable line on stdout so a launching agent can discover the port.
             // Flush explicitly: the render loop may never return, leaving stdout buffered.
             use std::io::Write;
-            println!("API_PORT={bound_port}");
+            tracing::info!("API_PORT={bound_port}");
             let _ = std::io::stdout().flush();
-            eprintln!("camera HTTP: http://127.0.0.1:{bound_port}");
+            tracing::info!("camera HTTP: http://127.0.0.1:{bound_port}");
             if let Err(e) = axum::serve(listener, app).await {
-                eprintln!("camera HTTP: server error: {e}");
+                tracing::error!("camera HTTP: server error: {e}");
             }
         });
     });
@@ -371,7 +371,7 @@ async fn post_goto(
                 }
                 match positions.get(&known[0]).copied() {
                     Some(pos) => {
-                        eprintln!("goto: fuzzy match {:?} → {:?}", name, known[0]);
+                        tracing::info!("goto: fuzzy match {:?} → {:?}", name, known[0]);
                         pos
                     }
                     None => return (StatusCode::NOT_FOUND, format!("No entity named {:?}", name)),
@@ -384,7 +384,7 @@ async fn post_goto(
         let server_x = -mx;
         let server_y = -my;
         let server_z = b.z.unwrap_or(3.75);
-        eprintln!("goto: map ({:.1},{:.1}) → server ({:.1},{:.1})", mx, my, server_x, server_y);
+        tracing::info!("goto: map ({:.1},{:.1}) → server ({:.1},{:.1})", mx, my, server_x, server_y);
         (server_x, server_y, server_z)
     } else if let (Some(x), Some(y), Some(z)) = (b.x, b.y, b.z) {
         (x, y, z)
@@ -393,7 +393,7 @@ async fn post_goto(
     };
 
     *s.goto_target.lock().unwrap() = Some(target);
-    eprintln!("goto: target set to ({:.1},{:.1},{:.1})", target.0, target.1, target.2);
+    tracing::info!("goto: target set to ({:.1},{:.1},{:.1})", target.0, target.1, target.2);
     (StatusCode::OK, format!("navigating to ({:.1},{:.1},{:.1})", target.0, target.1, target.2))
 }
 
@@ -472,7 +472,7 @@ async fn post_zone_cross(
 ) -> (StatusCode, String) {
     let zone_id = body.and_then(|Json(b)| b.zone_id).unwrap_or(0);
     *s.zone_cross.lock().unwrap() = Some(zone_id);
-    eprintln!("zone_cross: flagged for OP_ZONE_CHANGE (target zone_id={zone_id})");
+    tracing::info!("zone_cross: flagged for OP_ZONE_CHANGE (target zone_id={zone_id})");
     (StatusCode::OK, format!("zone_cross request queued (zone_id={zone_id})"))
 }
 
@@ -489,7 +489,7 @@ async fn post_warp(
     Json(body): Json<WarpBody>,
 ) -> (StatusCode, String) {
     *s.warp.lock().unwrap() = Some((body.x, body.y, body.z));
-    eprintln!("warp: queued to ({:.1}, {:.1}, {:.1})", body.x, body.y, body.z);
+    tracing::info!("warp: queued to ({:.1}, {:.1}, {:.1})", body.x, body.y, body.z);
     (StatusCode::OK, format!("warp queued to ({:.1}, {:.1}, {:.1})", body.x, body.y, body.z))
 }
 
@@ -541,10 +541,10 @@ async fn post_hail(
 
     match resolved {
         Some(key) => {
-            let display = clean_entity_name(&key);
-            *s.hail.lock().unwrap() = Some(display.clone());
-            eprintln!("hail: queued hail to {:?}", display);
-            (StatusCode::OK, format!("hailing {}", display))
+            let display_name = clean_entity_name(&key);
+            *s.hail.lock().unwrap() = Some(display_name.clone());
+            tracing::info!("hail: queued hail to {:?}", display_name);
+            (StatusCode::OK, format!("hailing {}", display_name))
         }
         None => {
             let msg = match &requested {
@@ -575,7 +575,7 @@ async fn post_say(
         return (StatusCode::BAD_REQUEST, "empty text".into());
     }
     *s.say.lock().unwrap() = Some(text.clone());
-    eprintln!("say: queued {:?}", text);
+    tracing::info!("say: queued {:?}", text);
     (StatusCode::OK, format!("saying {}", text))
 }
 
@@ -595,7 +595,7 @@ async fn post_target(
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"id\":<spawn_id>}".into()),
     };
     *s.target.lock().unwrap() = Some(id);
-    eprintln!("target: queued spawn_id={}", id);
+    tracing::info!("target: queued spawn_id={}", id);
     (StatusCode::OK, format!("targeting spawn {}", id))
 }
 
@@ -622,7 +622,7 @@ async fn post_target_name(
     match found {
         Some((key, id)) => {
             *s.target.lock().unwrap() = Some(id);
-            eprintln!("target_name: {:?} → spawn_id={}", key, id);
+            tracing::info!("target_name: {:?} → spawn_id={}", key, id);
             (StatusCode::OK, format!("targeting {} (spawn_id={})", clean_entity_name(&key), id))
         }
         None => (StatusCode::NOT_FOUND, format!("no entity matching {:?}", name)),
@@ -632,14 +632,14 @@ async fn post_target_name(
 /// POST /attack — enable auto-attack (sends OP_AUTO_ATTACK 1).
 async fn post_attack_on(State(s): State<HttpState>) -> (StatusCode, String) {
     *s.attack.lock().unwrap() = Some(true);
-    eprintln!("attack: queued auto-attack ON");
+    tracing::info!("attack: queued auto-attack ON");
     (StatusCode::OK, "auto-attack ON".into())
 }
 
 /// DELETE /attack — disable auto-attack (sends OP_AUTO_ATTACK 0).
 async fn post_attack_off(State(s): State<HttpState>) -> (StatusCode, String) {
     *s.attack.lock().unwrap() = Some(false);
-    eprintln!("attack: queued auto-attack OFF");
+    tracing::info!("attack: queued auto-attack OFF");
     (StatusCode::OK, "auto-attack OFF".into())
 }
 
@@ -725,7 +725,7 @@ async fn post_buy(
     match found {
         Some((key, id)) => {
             *s.buy.lock().unwrap() = Some((id, b.slot));
-            eprintln!("buy: queued merchant {:?} (spawn_id={}) slot={}", key, id, b.slot);
+            tracing::info!("buy: queued merchant {:?} (spawn_id={}) slot={}", key, id, b.slot);
             (StatusCode::OK, format!("buying slot {} from {} (spawn_id={})", b.slot, clean_entity_name(&key), id))
         }
         None => (StatusCode::NOT_FOUND, format!("no merchant matching {:?}", b.merchant)),
@@ -752,7 +752,7 @@ async fn post_move(
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"from\":N,\"to\":M}".into()),
     };
     *s.move_req.lock().unwrap() = Some((b.from, b.to));
-    eprintln!("move: queued from_slot={} to_slot={}", b.from, b.to);
+    tracing::info!("move: queued from_slot={} to_slot={}", b.from, b.to);
     (StatusCode::OK, format!("moving item from slot {} to slot {}", b.from, b.to))
 }
 
@@ -787,7 +787,7 @@ async fn post_give(
     match found {
         Some((key, id)) => {
             *s.give.lock().unwrap() = Some((id, b.from));
-            eprintln!("give: queued npc {:?} (spawn_id={}) from_slot={}", key, id, b.from);
+            tracing::info!("give: queued npc {:?} (spawn_id={}) from_slot={}", key, id, b.from);
             (StatusCode::OK, format!("giving slot {} to {} (spawn_id={})", b.from, clean_entity_name(&key), id))
         }
         None => (StatusCode::NOT_FOUND, format!("no NPC matching {:?}", b.npc)),
@@ -873,7 +873,7 @@ async fn post_loot(
     match resolved {
         Some((name, id)) => {
             *s.loot.lock().unwrap() = Some(id);
-            eprintln!("loot: queued corpse {:?} (spawn_id={})", name, id);
+            tracing::info!("loot: queued corpse {:?} (spawn_id={})", name, id);
             (StatusCode::OK, format!("looting {} (spawn_id={})", clean_entity_name(&name), id))
         }
         None => (StatusCode::NOT_FOUND, "no corpse found to loot".into()),
@@ -889,11 +889,11 @@ async fn post_loot(
 /// the render loop is wedged (and so can't process the flag); its `process::exit()` from this
 /// background thread can crash the Wayland teardown, which is why it is NOT the normal exit path.
 async fn post_exit(State(s): State<HttpState>) -> (StatusCode, &'static str) {
-    eprintln!("exit: clean shutdown requested via POST /exit");
+    tracing::info!("exit: clean shutdown requested via POST /exit");
     s.shutdown.store(true, Ordering::Relaxed);
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-        eprintln!("exit: watchdog timeout — render loop unresponsive, forcing process exit");
+        tracing::warn!("exit: watchdog timeout — render loop unresponsive, forcing process exit");
         std::process::exit(0);
     });
     (StatusCode::OK, "logging out and shutting down")

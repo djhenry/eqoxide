@@ -94,11 +94,11 @@ pub async fn run_login_flow(
 ) -> Result<(), String> {
     for attempt in 1..=max_retries {
         if attempt > 1 {
-            eprintln!("EQ: retry {}/{}", attempt, max_retries);
+            tracing::warn!("EQ: retry {}/{}", attempt, max_retries);
             sleep(Duration::from_secs(3)).await;
         }
         match run_login_phase(&config, &app_tx).await {
-            Err(e) => eprintln!("EQ: login failed (attempt {}): {}", attempt, e),
+            Err(e) => tracing::warn!("EQ: login failed (attempt {}): {}", attempt, e),
             Ok((stream, net_rx, gs, world_creds)) => {
                 // Seed /entities map with everything discovered during login.
                 {
@@ -108,12 +108,12 @@ pub async fn run_login_flow(
                         map.insert(e.name.clone(), (e.x, e.y, e.z));
                         ids.insert(e.name.clone(), id);
                     }
-                    eprintln!("NAV: entity map seeded with {} entities", map.len());
+                    tracing::info!("NAV: entity map seeded with {} entities", map.len());
                 }
                 // Seed zone points (in case OP_SEND_ZONE_POINTS arrived during login phase).
                 if !gs.zone_points.is_empty() {
                     *zone_points.lock().unwrap() = gs.zone_points.clone();
-                    eprintln!("NAV: {} zone points seeded", gs.zone_points.len());
+                    tracing::info!("NAV: {} zone points seeded", gs.zone_points.len());
                 }
                 let char_name = config.character_name.clone();
                 let navigator = Navigator::new(goto_target, entity_positions, entity_ids, zone_points, task_log, zone_cross, hail, say, target, attack, buy, move_req, give, inventory, loot, door_click, doors_shared, messages, cast, sit, consider, collision, maps_dir);
@@ -135,12 +135,12 @@ async fn run_login_phase(
 ) -> Result<(EqStream, UnboundedReceiver<AppPacket>, GameState, WorldCredentials), String> {
     let (net_tx, mut net_rx) = mpsc::unbounded_channel::<AppPacket>();
 
-    eprintln!("EQ: connecting to login server {}:{}", config.login_host, config.login_port);
+    tracing::info!("EQ: connecting to login server {}:{}", config.login_host, config.login_port);
     let mut stream = EqStream::connect(&config.login_host, config.login_port, net_tx.clone())
         .await
         .map_err(|e| format!("Login server connection failed: {e}"))?;
 
-    eprintln!("EQ: login session established — waiting for handshake");
+    tracing::info!("EQ: login session established — waiting for handshake");
     stream.send_app_packet(OP_SESSION_READY, &2u32.to_le_bytes());
 
     let mut proto = LoginProtocol::new(config);
@@ -165,7 +165,7 @@ async fn run_login_phase(
                 PhaseResult::ReconnectWorld { host, port } => {
                     drop(stream);
                     sleep(Duration::from_millis(100)).await;
-                    eprintln!("EQ: connecting to world {}:{}", host, port);
+                    tracing::info!("EQ: connecting to world {}:{}", host, port);
                     stream = EqStream::connect(&host, port, net_tx.clone())
                         .await
                         .map_err(|e| format!("World connection failed: {e}"))?;
@@ -174,7 +174,7 @@ async fn run_login_phase(
                 PhaseResult::ReconnectZone { host, port } => {
                     drop(stream);
                     sleep(Duration::from_millis(800)).await;
-                    eprintln!("EQ: connecting to zone {}:{}", host, port);
+                    tracing::info!("EQ: connecting to zone {}:{}", host, port);
                     stream = EqStream::connect(&host, port, net_tx.clone())
                         .await
                         .map_err(|e| format!("Zone connection failed: {e}"))?;
@@ -263,7 +263,7 @@ impl<'a> LoginProtocol<'a> {
         let lsid_bytes = lsid_str.as_bytes();
         login_info[..lsid_bytes.len().min(64)].copy_from_slice(&lsid_bytes[..lsid_bytes.len().min(64)]);
         stream.send_app_packet(OP_SEND_LOGIN_INFO, &login_info);
-        eprintln!("EQ: sent login info to world (lsid={} key={})", self.lsid, self.ls_key);
+        tracing::info!("EQ: sent login info to world (lsid={} key={})", self.lsid, self.ls_key);
     }
 
     fn on_zone_connected(&self, stream: &mut EqStream) {
@@ -271,7 +271,7 @@ impl<'a> LoginProtocol<'a> {
         let name_bytes = self.config.character_name.as_bytes();
         cze[4..4 + name_bytes.len().min(64)].copy_from_slice(&name_bytes[..name_bytes.len().min(64)]);
         stream.send_app_packet(OP_ZONE_ENTRY, &cze);
-        eprintln!("EQ: sent zone entry for '{}'", self.config.character_name);
+        tracing::info!("EQ: sent zone entry for '{}'", self.config.character_name);
     }
 
     /// Process one packet for login-protocol transitions.
@@ -332,7 +332,7 @@ impl<'a> LoginProtocol<'a> {
                     let spawn_id = spawn.spawnId;
                     let name     = spawn.name_str();
                     if !name.is_empty() && name.chars().all(|c| c.is_ascii() && (c.is_alphanumeric() || c == '_')) {
-                        eprintln!("EQ: server zone entry: spawn_id={} name={:?}", spawn_id, name);
+                        tracing::info!("EQ: server zone entry: spawn_id={} name={:?}", spawn_id, name);
                         // Use a local copy of gs for player_name; register_spawn needs &mut gs
                         // but we can't mutate here — the caller already called apply_packet
                         // which handled OP_ZONE_ENTRY.  Nothing extra to do.
@@ -344,20 +344,20 @@ impl<'a> LoginProtocol<'a> {
             OP_NEW_ZONE => {
                 // apply_packet already updated gs.zone_name; just send protocol response.
                 stream.send_app_packet(OP_REQ_CLIENT_SPAWN, &[]);
-                eprintln!("EQ: zone: {} — sent ReqClientSpawn", gs.zone_name);
+                tracing::info!("EQ: zone: {} — sent ReqClientSpawn", gs.zone_name);
                 PhaseResult::Continue
             }
             OP_WEATHER if !self.done_zone_weather => {
                 self.done_zone_weather = true;
                 stream.send_app_packet(OP_REQ_NEW_ZONE, &[]);
-                eprintln!("EQ: zone weather received — sent ReqNewZone");
+                tracing::info!("EQ: zone weather received — sent ReqNewZone");
                 PhaseResult::Continue
             }
             OP_SEND_EXP_ZONE_IN if !self.done_client_ready => {
                 self.done_client_ready = true;
                 stream.send_app_packet(OP_SEND_EXP_ZONE_IN, &[]);
                 stream.send_app_packet(OP_CLIENT_READY, &[]);
-                eprintln!("EQ: zone entry complete — gameplay starts");
+                tracing::info!("EQ: zone entry complete — gameplay starts");
                 PhaseResult::Done
             }
             op => {
@@ -378,7 +378,7 @@ impl<'a> LoginProtocol<'a> {
                     0x3c25, // OP_APPROVE_WORLD
                 ];
                 if !SILENT.contains(&op) {
-                    eprintln!("EQ: unhandled opcode 0x{:04x} ({} bytes)", op, packet.payload.len());
+                    tracing::info!("EQ: unhandled opcode 0x{:04x} ({} bytes)", op, packet.payload.len());
                 }
                 PhaseResult::Continue
             }
@@ -388,7 +388,7 @@ impl<'a> LoginProtocol<'a> {
     // ── Packet builders ───────────────────────────────────────────────────────
 
     fn send_credentials(&self, stream: &mut EqStream) {
-        eprintln!("EQ: sending credentials for '{}'", self.config.username);
+        tracing::info!("EQ: sending credentials for '{}'", self.config.username);
         let creds = format!("{}\0{}\0", self.config.username, self.config.password);
         let padded_len = ((creds.len() + 7) / 8) * 8;
         let mut creds_bytes = creds.into_bytes();
@@ -402,7 +402,7 @@ impl<'a> LoginProtocol<'a> {
 
     fn send_server_list_request(&self, stream: &mut EqStream) {
         stream.send_app_packet(OP_SERVER_LIST_REQUEST, &4u32.to_le_bytes());
-        eprintln!("EQ: requested server list");
+        tracing::info!("EQ: requested server list");
     }
 
     fn send_play_everquest(&self, stream: &mut EqStream) {
@@ -410,7 +410,7 @@ impl<'a> LoginProtocol<'a> {
         let mut payload = vec![5u8, 0, 0, 0,  0,  0,  0, 0, 0, 0];
         payload.extend_from_slice(&self.world_server_id.to_le_bytes());
         stream.send_app_packet(OP_PLAY_EVERQUEST_REQ, &payload);
-        eprintln!("EQ: sent play everquest request (server_id={})", self.world_server_id);
+        tracing::info!("EQ: sent play everquest request (server_id={})", self.world_server_id);
     }
 
     fn send_enter_world(&self, stream: &mut EqStream) {
@@ -419,7 +419,7 @@ impl<'a> LoginProtocol<'a> {
         buf[..name_bytes.len().min(64)].copy_from_slice(&name_bytes[..name_bytes.len().min(64)]);
         stream.send_app_packet(OP_ENTER_WORLD, &buf);
         stream.send_app_packet(OP_POST_ENTER_WORLD, &[]);
-        eprintln!("EQ: entering world as '{}'", self.config.character_name);
+        tracing::info!("EQ: entering world as '{}'", self.config.character_name);
     }
 
     // ── Packet parsers ────────────────────────────────────────────────────────
@@ -427,28 +427,28 @@ impl<'a> LoginProtocol<'a> {
     /// Returns false if the server rejected the credentials.
     fn parse_login_accepted(&mut self, payload: &[u8]) -> bool {
         if payload.len() < 10 {
-            eprintln!("EQ: LoginAccepted too short ({} bytes) — assuming success", payload.len());
+            tracing::info!("EQ: LoginAccepted too short ({} bytes) — assuming success", payload.len());
             self.lsid   = 1;
             self.ls_key = "0".to_string();
             return true;
         }
         let encrypted = &payload[10..];
         if encrypted.is_empty() {
-            eprintln!("EQ: LoginAccepted has no encrypted block — assuming success");
+            tracing::info!("EQ: LoginAccepted has no encrypted block — assuming success");
             self.lsid   = 1;
             self.ls_key = "0".to_string();
             return true;
         }
         let dec = des_decrypt(encrypted);
         if dec.len() < 12 {
-            eprintln!("EQ: decrypted LoginReply too short — assuming success");
+            tracing::info!("EQ: decrypted LoginReply too short — assuming success");
             self.lsid   = 1;
             self.ls_key = "0".to_string();
             return true;
         }
         if dec[0] == 0 {
             let err_id = u32::from_le_bytes([dec[1], dec[2], dec[3], dec[4]]);
-            eprintln!("EQ: login rejected (success=0, error_id={})", err_id);
+            tracing::error!("EQ: login rejected (success=0, error_id={})", err_id);
             return false;
         }
         self.lsid = i32::from_le_bytes([dec[8], dec[9], dec[10], dec[11]]);
@@ -456,7 +456,7 @@ impl<'a> LoginProtocol<'a> {
             .map(|p| p + 12).unwrap_or(dec.len());
         let key = String::from_utf8_lossy(&dec[12..key_end]).to_string();
         self.ls_key = if key.is_empty() { "0".to_string() } else { key };
-        eprintln!("EQ: login accepted: lsid={} key={}", self.lsid, self.ls_key);
+        tracing::info!("EQ: login accepted: lsid={} key={}", self.lsid, self.ls_key);
         true
     }
 
@@ -465,14 +465,14 @@ impl<'a> LoginProtocol<'a> {
         let mut offset = 16usize;
         if payload.len() < offset + 4 { offset = 15; }
         if payload.len() < offset + 4 {
-            eprintln!("EQ: server list too short");
+            tracing::info!("EQ: server list too short");
             self.world_server_id = 1;
             self.world_host = self.config.login_host.clone();
             return;
         }
         let count = i32::from_le_bytes([payload[offset], payload[offset+1], payload[offset+2], payload[offset+3]]);
         offset += 4;
-        eprintln!("EQ: server list: {} server(s)", count);
+        tracing::info!("EQ: server list: {} server(s)", count);
         if count <= 0 || offset >= payload.len() { return; }
 
         // First entry: ip_str\0 + server_type(4) + server_id(4) + name_str\0 + ...
@@ -487,7 +487,7 @@ impl<'a> LoginProtocol<'a> {
                 let name_end = payload[offset..].iter().position(|&b| b == 0)
                     .unwrap_or(payload.len() - offset);
                 let name = String::from_utf8_lossy(&payload[offset..offset + name_end]).to_string();
-                eprintln!("EQ: world server: id={} name={} host={}", server_id, name, world_host);
+                tracing::info!("EQ: world server: id={} name={} host={}", server_id, name, world_host);
                 self.world_server_id = server_id;
                 self.world_host = if world_host.is_empty() || world_host == "0.0.0.0" {
                     self.config.login_host.clone()

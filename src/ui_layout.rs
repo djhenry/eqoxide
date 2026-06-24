@@ -55,7 +55,7 @@ impl UiLayout {
             .ok()
             .and_then(|s| match serde_json::from_str::<Persisted>(&s) {
                 Ok(p) => Some(p),
-                Err(e) => { eprintln!("ui_layout: ignoring corrupt {}: {e}", path.display()); None }
+                Err(e) => { tracing::warn!("ui_layout: ignoring corrupt {}: {e}", path.display()); None }
             })
             .unwrap_or_default();
         UiLayout {
@@ -133,13 +133,13 @@ impl UiLayout {
         match serde_json::to_string_pretty(&persisted) {
             Ok(s) => {
                 if let Err(e) = std::fs::write(&self.path, s) {
-                    eprintln!("ui_layout: save failed ({}): {e}", self.path.display());
+                    tracing::warn!("ui_layout: save failed ({}): {e}", self.path.display());
                 } else {
                     self.dirty = false;
                     self.last_save = Instant::now();
                 }
             }
-            Err(e) => eprintln!("ui_layout: serialize failed: {e}"),
+            Err(e) => tracing::warn!("ui_layout: serialize failed: {e}"),
         }
     }
 
