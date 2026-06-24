@@ -120,7 +120,7 @@ impl ZoneAssets {
             let raw = match raw_images.get(i) {
                 Some(d) => d,
                 None => {
-                    eprintln!("zone glb: no pixel data for image {} ({})", i, img_name);
+                    tracing::info!("zone glb: no pixel data for image {} ({})", i, img_name);
                     continue;
                 }
             };
@@ -131,7 +131,7 @@ impl ZoneAssets {
                     .flat_map(|rgb| [rgb[0], rgb[1], rgb[2], 255u8])
                     .collect(),
                 _ => {
-                    eprintln!("zone glb: skipping image {} ({}) — unsupported format", i, img_name);
+                    tracing::info!("zone glb: skipping image {} ({}) — unsupported format", i, img_name);
                     continue;
                 }
             };
@@ -246,7 +246,7 @@ impl ZoneAssets {
         }
 
         let total_instances: usize = objects.iter().map(|o| o.instances.len()).sum();
-        eprintln!("zone_assets::from_glb: loaded {} terrain meshes, {} object models ({} instances), {} textures from {}",
+        tracing::info!("zone_assets::from_glb: loaded {} terrain meshes, {} object models ({} instances), {} textures from {}",
                   terrain.len(), objects.len(), total_instances, textures.len(), path.display());
         Ok(ZoneAssets { terrain, objects, textures })
     }
@@ -552,7 +552,7 @@ impl Collision {
             }
         }
         if !found {
-            eprintln!("find_path: no route (expanded={}, cap={}, start_floor={} goal_floor={:?})",
+            tracing::info!("find_path: no route (expanded={}, cap={}, start_floor={} goal_floor={:?})",
                 expanded, MAX_NODES, start_floor, floor_near(gc, gr, goal[2]));
             return None;
         }
@@ -603,11 +603,11 @@ impl ZoneAssets {
             let wld_bytes = match pfs.get(wld_name) {
                 Ok(Some(b)) => b,
                 Ok(None) => {
-                    eprintln!("warning: {} listed but not found in archive", wld_name);
+                    tracing::warn!("warning: {} listed but not found in archive", wld_name);
                     continue;
                 }
                 Err(e) => {
-                    eprintln!("warning: failed to read {}: {}", wld_name, e);
+                    tracing::warn!("warning: failed to read {}: {}", wld_name, e);
                     continue;
                 }
             };
@@ -615,7 +615,7 @@ impl ZoneAssets {
             let wld = match libeq_wld::load(&wld_bytes) {
                 Ok(w) => w,
                 Err(e) => {
-                    eprintln!("warning: failed to parse {}: {}", wld_name, e);
+                    tracing::warn!("warning: failed to parse {}: {}", wld_name, e);
                     continue;
                 }
             };
@@ -694,11 +694,11 @@ impl ZoneAssets {
             let tex_bytes = match pfs.get(filename) {
                 Ok(Some(b)) => b,
                 Ok(None) => {
-                    eprintln!("warning: texture {} listed but not found in archive", filename);
+                    tracing::warn!("warning: texture {} listed but not found in archive", filename);
                     continue;
                 }
                 Err(e) => {
-                    eprintln!("warning: failed to read texture {}: {}", filename, e);
+                    tracing::warn!("warning: failed to read texture {}: {}", filename, e);
                     continue;
                 }
             };
@@ -715,12 +715,12 @@ impl ZoneAssets {
                     });
                 }
                 Err(e) => {
-                    eprintln!("warning: failed to decode texture {}: {}", filename, e);
+                    tracing::warn!("warning: failed to decode texture {}: {}", filename, e);
                 }
             }
         }
 
-        eprintln!("zone_assets: loaded {} meshes, {} textures from {} ({} wld files)",
+        tracing::info!("zone_assets: loaded {} meshes, {} textures from {} ({} wld files)",
                   meshes.len(), textures.len(), s3d_path.display(), wld_files.len());
         // The .s3d path stays flat/terrain-only (local fallback); no instanced objects.
         Ok(ZoneAssets { terrain: meshes, objects: vec![], textures })
@@ -812,15 +812,15 @@ pub fn index_s3d_textures(
 ) {
     let file = match std::fs::File::open(s3d_path) {
         Ok(f) => f,
-        Err(e) => { eprintln!("equip: open {} failed: {}", s3d_path.display(), e); return; }
+        Err(e) => { tracing::warn!("equip: open {} failed: {}", s3d_path.display(), e); return; }
     };
     let mut pfs = match libeq_pfs::PfsReader::open(file) {
         Ok(p) => p,
-        Err(e) => { eprintln!("equip: pfs {} failed: {}", s3d_path.display(), e); return; }
+        Err(e) => { tracing::warn!("equip: pfs {} failed: {}", s3d_path.display(), e); return; }
     };
     let names = match pfs.filenames() {
         Ok(n) => n,
-        Err(e) => { eprintln!("equip: filenames {} failed: {}", s3d_path.display(), e); return; }
+        Err(e) => { tracing::warn!("equip: filenames {} failed: {}", s3d_path.display(), e); return; }
     };
     for name in names {
         let lower = name.to_lowercase();
@@ -912,12 +912,12 @@ pub fn load_weapon_model(assets_path: &Path, idfile: &str) -> Option<ZoneAssets>
                     }
                 }
             }
-            eprintln!("weapon model: loaded '{}' — {} meshes, {} textures from {}",
+            tracing::info!("weapon model: loaded '{}' — {} meshes, {} textures from {}",
                       want, meshes.len(), textures.len(), arch);
             return Some(ZoneAssets { terrain: meshes, objects: vec![], textures });
         }
     }
-    eprintln!("weapon model: '{}' not found in any gequip*.s3d", want);
+    tracing::warn!("weapon model: '{}' not found in any gequip*.s3d", want);
     None
 }
 
@@ -966,7 +966,7 @@ mod tests {
             let path = PathBuf::from(format!("~/eq_assets/EQ_Files/{}.s3d", zone));
             if !path.exists() { continue; }
             let assets = ZoneAssets::load(&path).expect("load failed");
-            println!("\n=== {} ({} meshes, {} textures) ===", zone, assets.terrain.len(), assets.textures.len());
+            tracing::info!("\n=== {} ({} meshes, {} textures) ===", zone, assets.terrain.len(), assets.textures.len());
             let (mut xmin, mut xmax) = (f32::MAX, f32::MIN);
             let (mut ymin, mut ymax) = (f32::MAX, f32::MIN);
             let (mut zmin, mut zmax) = (f32::MAX, f32::MIN);
@@ -988,20 +988,20 @@ mod tests {
                     wzmin = wzmin.min(z + m.center[2]); wzmax = wzmax.max(z + m.center[2]);
                 }
             }
-            println!("  total verts={} tris={}", total_verts, total_tris);
-            println!("  local X: {:.1}..{:.1}  Y: {:.1}..{:.1}  Z: {:.1}..{:.1}",
+            tracing::info!("  total verts={} tris={}", total_verts, total_tris);
+            tracing::info!("  local X: {:.1}..{:.1}  Y: {:.1}..{:.1}  Z: {:.1}..{:.1}",
                 xmin, xmax, ymin, ymax, zmin, zmax);
-            println!("  world X: {:.1}..{:.1}  Y: {:.1}..{:.1}  Z: {:.1}..{:.1}",
+            tracing::info!("  world X: {:.1}..{:.1}  Y: {:.1}..{:.1}  Z: {:.1}..{:.1}",
                 wxmin, wxmax, wymin, wymax, wzmin, wzmax);
-            println!("  world center: ({:.1}, {:.1}, {:.1})",
+            tracing::info!("  world center: ({:.1}, {:.1}, {:.1})",
                 (wxmin+wxmax)/2.0, (wymin+wymax)/2.0, (wzmin+wzmax)/2.0);
             // Print a sample mesh center to see if centers are non-zero
             if let Some(m) = assets.terrain.first() {
-                println!("  first mesh center: [{:.1}, {:.1}, {:.1}]",
+                tracing::info!("  first mesh center: [{:.1}, {:.1}, {:.1}]",
                     m.center[0], m.center[1], m.center[2]);
             }
             if let Some(t) = assets.textures.first() {
-                println!("  first texture: {} ({}x{})", t.name, t.width, t.height);
+                tracing::info!("  first texture: {} ({}x{})", t.name, t.width, t.height);
             }
         }
     }
@@ -1114,7 +1114,7 @@ mod tests {
             .join("eq_assets/EQ_Files");
         let main = ap.join("qeynos.s3d");
         let obj  = ap.join("qeynos_obj.s3d");
-        if !main.exists() { eprintln!("assets missing; skipping"); return; }
+        if !main.exists() { tracing::warn!("assets missing; skipping"); return; }
         let models = load_object_models(&main, &obj).expect("load");
         assert!(models.contains_key("DOOR1"), "DOOR1 not found; keys (sample): {:?}",
                 models.keys().filter(|k| k.contains("DOOR") || k.starts_with("PORT"))

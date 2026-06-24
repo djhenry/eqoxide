@@ -67,7 +67,7 @@ impl ModelAsset {
             .with_context(|| format!("failed to load glTF buffers: {}", path.display()))?;
         let raw_images = gltf::import_images(&gltf_doc.document, Some(base), &buffers);
         if let Err(ref e) = raw_images {
-            eprintln!("models: import_images failed for {}: {}", path.display(), e);
+            tracing::warn!("models: import_images failed for {}: {}", path.display(), e);
         }
         let images: Vec<gltf::image::Data> = raw_images.unwrap_or_default();
 
@@ -80,7 +80,7 @@ impl ModelAsset {
                     .flat_map(|rgb| [rgb[0], rgb[1], rgb[2], 255u8])
                     .collect(),
                 _ => {
-                    eprintln!("models: skipping image {} with unsupported format", i);
+                    tracing::info!("models: skipping image {} with unsupported format", i);
                     continue;
                 }
             };
@@ -506,7 +506,7 @@ impl ModelAsset {
 
         let mesh_count = assets.terrain.len();
         let tex_count = assets.textures.len();
-        eprintln!("models: loaded chr model from {} ({} meshes, {} textures)",
+        tracing::info!("models: loaded chr model from {} ({} meshes, {} textures)",
                   s3d_path.display(), mesh_count, tex_count);
 
         Ok(ModelAsset {
@@ -903,7 +903,7 @@ mod tests {
             }
         }
         let (cx, cy, h) = ((mnx + mxx) * 0.5, (mny + mxy) * 0.5, mxz - mnz);
-        eprintln!("PLACEMENT world x[{:.2},{:.2}] y[{:.2},{:.2}] z[{:.2},{:.2}] center=({:.2},{:.2}) height={:.2} feet_z={:.2} (pos={:?} target={})",
+        tracing::info!("PLACEMENT world x[{:.2},{:.2}] y[{:.2},{:.2}] z[{:.2},{:.2}] center=({:.2},{:.2}) height={:.2} feet_z={:.2} (pos={:?} target={})",
             mnx, mxx, mny, mxy, mnz, mxz, cx, cy, h, mnz, pos, target);
         assert!((mnz - pos[2]).abs() < 1.5, "feet z {:.2} should be ~pos.z {:.2}", mnz, pos[2]);
         assert!((cx - pos[0]).abs() < 1.5, "x center {:.2} vs pos.x {:.2}", cx, pos[0]);
@@ -945,7 +945,7 @@ mod tests {
             }
         }
         let (ccx, ccy, h) = ((mnx + mxx) * 0.5, (mny + mxy) * 0.5, mxz - mnz);
-        eprintln!("IDLE world center=({:.2},{:.2}) feet_z={:.2} height={:.2} (pos={:?})", ccx, ccy, mnz, h, pos);
+        tracing::info!("IDLE world center=({:.2},{:.2}) feet_z={:.2} height={:.2} (pos={:?})", ccx, ccy, mnz, h, pos);
         assert!((mnz - pos[2]).abs() < 1.5, "idle feet z {:.2} should be ~pos.z {:.2}", mnz, pos[2]);
         assert!((ccx - pos[0]).abs() < 1.5, "idle x center {:.2} vs pos.x {:.2}", ccx, pos[0]);
         assert!((ccy - pos[1]).abs() < 1.5, "idle y center {:.2} vs pos.y {:.2}", ccy, pos[1]);
@@ -991,7 +991,7 @@ mod tests {
                 }
             }
             let (ccx, ccy) = ((mnx + mxx) * 0.5, (mny + mxy) * 0.5);
-            eprintln!("MODEL {name}: feet_z={:.2} center=({:.2},{:.2}) prefix={}", mnz, ccx, ccy, a.prefix);
+            tracing::info!("MODEL {name}: feet_z={:.2} center=({:.2},{:.2}) prefix={}", mnz, ccx, ccy, a.prefix);
             assert!((mnz - pos[2]).abs() < 1.5, "{name} feet z {:.2} vs pos.z {:.2}", mnz, pos[2]);
             assert!((ccx - pos[0]).abs() < 1.5, "{name} x center {:.2} vs pos.x {:.2}", ccx, pos[0]);
             assert!((ccy - pos[1]).abs() < 1.5, "{name} y center {:.2} vs pos.y {:.2}", ccy, pos[1]);

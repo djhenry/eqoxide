@@ -156,7 +156,7 @@ impl SceneState {
             });
         }
 
-        eprintln!("testzone: injected {} billboards for character model inspection",
+        tracing::info!("testzone: injected {} billboards for character model inspection",
                   self.billboards.len());
     }
 

@@ -13,7 +13,7 @@ pub struct AppConfig {
 impl AppConfig {
     pub fn load() -> Self {
         let cfg_text = std::fs::read_to_string("config.yaml").unwrap_or_else(|e| {
-            eprintln!("renderer: config.yaml not found ({}), using defaults", e);
+            tracing::warn!("renderer: config.yaml not found ({}), using defaults", e);
             String::new()
         });
         Self::from_yaml_str(&cfg_text)

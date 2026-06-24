@@ -38,7 +38,7 @@ pub fn load(path: &std::path::Path) {
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
     let n: usize = data.values().map(|z| z.len()).sum();
-    eprintln!(
+    tracing::info!(
         "quests: loaded {} givers across {} zones from {}",
         n, data.len(), path.display()
     );

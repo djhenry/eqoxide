@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::ActiveEventLoop,
+    event_loop::{ActiveEventLoop, ControlFlow},
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowAttributes},
 };
@@ -79,6 +79,13 @@ pub struct App {
     fps_frame_count:    u32,
     fps_timer:          std::time::Instant,
     current_fps:        f32,
+    /// Event-driven scheduling: render at full rate until this instant, then drop to an idle poll.
+    /// Bumped forward by `wake()` whenever something happens (input, packet, animation in flight).
+    /// When `now >= active_until` and nothing is pending, the loop only wakes to poll the network
+    /// channel — so a still scene costs ~no CPU. See `about_to_wait`.
+    active_until:       std::time::Instant,
+    /// Smoothed per-phase frame timings for the `--profile` HUD overlay (only written when enabled).
+    frame_profile:      crate::profiling::FrameProfile,
     // Keyboard movement
     keys_held:    std::collections::HashSet<KeyCode>,
     /// Free-fly position override in scene space [east, north, z].
@@ -210,7 +217,7 @@ impl App {
         if testzone_mode {
             game_state.zone_name = "testzone".to_string();
             game_state.zone_changed = true;
-            eprintln!("APP: --testzone mode, will load debug zone");
+            tracing::info!("APP: --testzone mode, will load debug zone");
         }
 
         App {
@@ -231,6 +238,8 @@ impl App {
             fps_frame_count: 0,
             fps_timer: std::time::Instant::now(),
             current_fps: 0.0,
+            active_until: std::time::Instant::now(),
+            frame_profile: crate::profiling::FrameProfile::default(),
             keys_held: std::collections::HashSet::new(),             override_pos: None, warp_cooldown: 0, goto_target,
             hail, say, target, attack, cast, sit, consider, spells, door_click, say_buffer: String::new(),
             drag_active: false, last_cursor: winit::dpi::PhysicalPosition::new(0.0, 0.0),
@@ -368,7 +377,7 @@ impl App {
         if zone_name == "testzone" {
             if let Some((_, renderer)) = &mut self.gpu {
                 renderer.upload_zone_assets(&debug_zone::make_debug_zone());
-                eprintln!("renderer: debug zone loaded ({} meshes)", renderer.gpu_meshes.len());
+                tracing::info!("renderer: debug zone loaded ({} meshes)", renderer.gpu_meshes.len());
             }
             self.loading = false;
             return;
@@ -407,7 +416,7 @@ impl App {
                     let (mn, mx) = za.bounds_xy().unwrap_or(([0.0f32;2],[0.0f32;2]));
                     (Some(za), mn, mx)
                 }
-                Err(e) => { eprintln!("renderer: zone '{}' load failed: {}", zone_name, e); (None, [0.0f32;2],[0.0f32;2]) }
+                Err(e) => { tracing::warn!("renderer: zone '{}' load failed: {}", zone_name, e); (None, [0.0f32;2],[0.0f32;2]) }
             };
 
             set_status("Building collision grid…");
@@ -438,7 +447,7 @@ impl App {
             match load.assets {
                 Some(ref za) => {
                     renderer.upload_zone_assets(za);
-                    eprintln!("renderer: uploaded {} meshes for '{}'", renderer.gpu_meshes.len(), load.zone_name);
+                    tracing::info!("renderer: uploaded {} meshes for '{}'", renderer.gpu_meshes.len(), load.zone_name);
                     // Load this zone's door/object models for clickable-door rendering.
                     renderer.load_door_models(&door_s3d, &door_obj);
                 }
@@ -579,16 +588,83 @@ impl App {
 
     // ── Render loop ───────────────────────────────────────────────────────────
 
+    /// How long after the last activity to keep rendering at full rate before dropping to idle poll.
+    /// Covers animation tails (door swing, position glide, camera ease) and keeps input feeling crisp.
+    const ACTIVE_LINGER: std::time::Duration = std::time::Duration::from_millis(300);
+    /// Frame interval while active (~60 fps).
+    const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+    /// Idle wake cadence — just often enough to drain the network channel promptly without burning
+    /// CPU. A still scene wakes ~20×/sec, does a `try_recv` on an empty channel, and sleeps again.
+    const IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+    /// Mark the app active (render at full rate for `ACTIVE_LINGER`) and request a redraw now. Called
+    /// from input handlers and whenever `poll_external` finds pending work.
+    fn wake(&mut self) {
+        self.active_until = std::time::Instant::now() + Self::ACTIVE_LINGER;
+        if let Some(w) = &self.window { w.request_redraw(); }
+    }
+
+    /// Drain the EQ packet channel into game state and report whether anything warrants rendering.
+    /// Runs every `about_to_wait` (even idle ones) so the network keeps flowing without a render.
+    /// Returns true when visible state is changing or pending: queued packets, an active zone load,
+    /// player input/motion in flight, easing doors/position/heading, or a queued HTTP request that a
+    /// render must service (frame capture / camera / warp).
+    fn poll_external(&mut self) -> bool {
+        let mut activity = false;
+
+        // Drain all queued packets; any packet may move/spawn an entity, so treat as activity.
+        while let Ok(packet) = self.app_rx.try_recv() {
+            apply_packet(&mut self.game_state, &packet);
+            activity = true;
+        }
+
+        // Still loading a zone, or a reload is queued → keep rendering the progress screen.
+        if self.loading || self.pending_reload { activity = true; }
+
+        // A queued HTTP request that only a render frame can service.
+        if self.frame_req.lock().is_ok_and(|g| g.is_some()) { activity = true; }
+        if self.camera_cmd.lock().is_ok_and(|g| g.is_some()) { activity = true; }
+        if self.warp.lock().is_ok_and(|g| g.is_some()) { activity = true; }
+
+        // Player input / motion in flight (keys held, free-fly override active, or falling).
+        if !self.keys_held.is_empty() || self.override_pos.is_some() || !self.on_ground {
+            activity = true;
+        }
+
+        // Doors still easing toward their open/closed target.
+        if self.game_state.doors.values()
+            .any(|d| (d.open_frac - if d.is_open { 1.0 } else { 0.0 }).abs() > 0.001)
+        {
+            activity = true;
+        }
+
+        // Visual position still gliding toward the logical (server-authoritative) position.
+        let dx = self.game_state.player_x - self.visual_player_pos[0];
+        let dy = self.game_state.player_y - self.visual_player_pos[1];
+        if dx * dx + dy * dy > 0.01 { activity = true; }
+
+        // Heading still smoothing toward its target.
+        let hd = (self.heading_target - self.visual_heading).rem_euclid(360.0);
+        if hd > 0.05 && hd < 359.95 { activity = true; }
+
+        activity
+    }
+
     fn render_frame(&mut self) {
         // Compute dt at the very top so it's available for animation before SceneState is built.
         let now = std::time::Instant::now();
         let dt  = (now - self.last_frame_time).as_secs_f32().min(0.1);
         self.last_frame_time = now;
 
-        // Drain EQ packets into game state.
-        while let Ok(packet) = self.app_rx.try_recv() {
-            apply_packet(&mut self.game_state, &packet);
-        }
+        // Wall-clock since the previous rendered frame, for the profile overlay's "frame" / fps line.
+        // (`dt` above is clamped to 0.1; this is the unclamped real interval, which during idle waits
+        // can legitimately be long.)
+        let frame_ms = dt * 1000.0;
+        let prof_update = crate::profiling::Stopwatch::start();
+
+        // EQ packets are drained in `poll_external` (called from `about_to_wait` every wake) so the
+        // network keeps flowing even on idle frames that don't render. `game_state` is already current
+        // here.
 
         // Process warp requests — teleport directly, bypassing collision.
         let warp_req = self.warp.lock().unwrap().take();
@@ -601,7 +677,7 @@ impl App {
             self.heading_target = self.game_state.player_heading;
             self.visual_heading = self.game_state.player_heading;
             *self.goto_target.lock().unwrap() = Some((wx, wy, wz));
-            eprintln!("warp: teleported to ({:.1}, {:.1}, {:.1})", wx, wy, wz);
+            tracing::info!("warp: teleported to ({:.1}, {:.1}, {:.1})", wx, wy, wz);
         }
 
         // Ease each door's render fraction toward its server-authoritative open/close target.
@@ -818,7 +894,7 @@ impl App {
                 } else if clear(0.0, dn) {
                     (0.0, dn)
                 } else {
-                    eprintln!("COLLISION: WASD fully blocked at ({:.1},{:.1}) heading {:.0}° tried ({:.2},{:.2})",
+                    tracing::info!("COLLISION: WASD fully blocked at ({:.1},{:.1}) heading {:.0}° tried ({:.2},{:.2})",
                               base[0], base[1], self.heading_target, de, dn);
                     self.game_state.log_msg("collision", &format!("Blocked by wall at ({:.0},{:.0})", base[0], base[1]));
                     (0.0, 0.0) // boxed in — hold position
@@ -995,6 +1071,8 @@ impl App {
         }
         if let Ok(mut snap) = self.camera_snapshot.lock() { *snap = self.camera.snapshot(); }
 
+        let dur_update = prof_update.elapsed();
+
         // ── GPU work: renderer + egui share a command encoder ─────────────────
         // Use direct field access (not method calls on self) while the GPU
         // borrow is live so Rust can verify field-level disjointness.
@@ -1007,14 +1085,16 @@ impl App {
                 return;
             }
             Err(wgpu::SurfaceError::Timeout) => return, // compositor throttling; retry next frame
-            Err(e) => { eprintln!("surface error: {e}"); return; }
+            Err(e) => { tracing::error!("surface error: {e}"); return; }
         };
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut enc = renderer.device.create_command_encoder(
             &wgpu::CommandEncoderDescriptor { label: Some("frame") },
         );
 
+        let prof_render = crate::profiling::Stopwatch::start();
         renderer.render_frame(&mut enc, &view, &self.scene, cam_eye, cam_target, dt);
+        let dur_render = prof_render.elapsed();
 
         // Cache picking data for the next mouse-click query.
         self.pick_view_proj = renderer.last_view_proj;
@@ -1033,6 +1113,7 @@ impl App {
         // Egui pass — use associated function to avoid reborrowing self.
         let load_status_text = self.load_status.lock().unwrap().clone();
         let sync_frac = *self.sync_progress.lock().unwrap();
+        let prof_egui = crate::profiling::Stopwatch::start();
         Self::egui_pass(
             &mut self.egui_state, &mut self.egui_renderer, &self.egui_ctx, &mut self.ui_layout, &self.window,
             &mut enc, &view, renderer, self.loading, &self.current_zone, &load_status_text,
@@ -1047,21 +1128,30 @@ impl App {
             &mut self.show_inventory,
             &mut self.ui_zoom, &mut self.ui_zoom_size,
             self.show_debug, self.game_state.server_corrections,
+            &self.frame_profile,
         );
+        let dur_egui = prof_egui.elapsed();
 
         // Submit — associated function avoids reborrowing self.
+        let prof_submit = crate::profiling::Stopwatch::start();
         Self::submit_frame(&self.frame_req, enc, output, renderer);
+        let dur_submit = prof_submit.elapsed();
 
-        if self.loading {
-            // Cap at 120 fps while loading so the background thread gets more CPU.
-            let frame_budget = std::time::Duration::from_micros(8_333);
-            let elapsed = now.elapsed();
-            if elapsed < frame_budget {
-                std::thread::sleep(frame_budget - elapsed);
-            }
+        // Record per-phase timings for the --profile HUD overlay (cheap; only blended when enabled).
+        if crate::profiling::enabled() {
+            let sample = crate::profiling::FrameSample {
+                update: dur_update,
+                render: dur_render,
+                egui:   dur_egui,
+                submit: dur_submit,
+                total:  now.elapsed(),
+            };
+            self.frame_profile.blend(&sample, frame_ms);
         }
 
-        if let Some(w) = &self.window { w.request_redraw(); }
+        // NOTE: no `request_redraw()` here. The loop is event-driven — `about_to_wait` decides whether
+        // the next frame is needed (active animation/input/packets) and only then requests a redraw.
+        // A still scene therefore stops rendering and idle CPU drops to ~0. See `about_to_wait`/`wake`.
         // GPU borrow (renderer) is released here.
         // pending_reload is checked by window_event after render_frame returns.
     }
@@ -1106,6 +1196,7 @@ impl App {
         ui_zoom_size:  &mut (u32, u32),
         show_debug:    bool,
         corrections:   u32,
+        frame_profile: &crate::profiling::FrameProfile,
     ) {
         let (Some(egui_state), Some(egui_renderer), Some(egui_ctx), Some(window)) =
             (egui_state, egui_renderer, egui_ctx, window) else { return };
@@ -1129,6 +1220,9 @@ impl App {
 
         let full_output = egui_ctx.run(raw_input, |ctx| {
             hud::draw_fps(ctx, current_fps);
+            if crate::profiling::enabled() {
+                hud::draw_profile(ctx, frame_profile);
+            }
             if loading {
                 hud::draw_loading(ctx, current_zone, load_status, sync_progress);
             } else {
@@ -1239,15 +1333,43 @@ impl ApplicationHandler for App {
                 .expect("create window"),
         );
         self.init_gpu(window);
+        // Kick the event-driven loop: render the first frames so zone loading starts (in --testzone
+        // there are no network packets to trigger it). Once loading sets in, `poll_external` keeps the
+        // loop active on its own.
+        self.wake();
     }
 
-    /// Called each loop iteration before winit waits for events. If a shutdown was requested
-    /// (POST /exit or OP_GMKick set the flag), exit the event loop HERE on the main thread so
-    /// winit shuts down its Wayland clipboard worker cleanly. A background thread calling
-    /// `process::exit()` while that worker is live races its Wayland-object teardown → SIGSEGV.
+    /// Called each loop iteration before winit waits for events. Two jobs:
+    ///
+    /// 1. Honour shutdown: if a shutdown was requested (POST /exit or OP_GMKick set the flag), exit the
+    ///    event loop HERE on the main thread so winit shuts down its Wayland clipboard worker cleanly.
+    ///    A background thread calling `process::exit()` while that worker is live races its Wayland-
+    ///    object teardown → SIGSEGV.
+    ///
+    /// 2. Drive the event-driven render schedule: drain the network channel, and if anything is in
+    ///    flight (packets, input, animation, a queued request) render at ~60fps for a short linger
+    ///    window; otherwise drop to a cheap idle poll so a still scene costs ~no CPU. This replaces the
+    ///    old `ControlFlow::Poll` + unconditional `request_redraw()` busy loop that pegged a core even
+    ///    when the character stood still.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             event_loop.exit();
+            return;
+        }
+
+        // Drain packets + detect in-flight activity. Any activity extends the active render window.
+        if self.poll_external() {
+            self.active_until = std::time::Instant::now() + Self::ACTIVE_LINGER;
+        }
+
+        let now = std::time::Instant::now();
+        if now < self.active_until {
+            // Active: schedule another frame at ~60fps.
+            if let Some(w) = &self.window { w.request_redraw(); }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(now + Self::FRAME_INTERVAL));
+        } else {
+            // Idle: no render. Wake periodically only to poll the network channel; near-zero CPU.
+            event_loop.set_control_flow(ControlFlow::WaitUntil(now + Self::IDLE_POLL));
         }
     }
 
@@ -1257,8 +1379,32 @@ impl ApplicationHandler for App {
         _id:        winit::window::WindowId,
         event:      WindowEvent,
     ) {
-        if let (Some(egui_state), Some(window)) = (&mut self.egui_state, &self.window) {
-            if egui_state.on_window_event(window, &event).consumed { return; }
+        // Handle RedrawRequested FIRST — before egui sees it. egui's `on_window_event` returns
+        // `repaint = true` for a RedrawRequested, so feeding it there would call `wake()` →
+        // `request_redraw()` → another RedrawRequested … an unbreakable 60fps loop that defeats the
+        // whole event-driven scheme. Rendering also never needs egui to "consume" a redraw request.
+        if let WindowEvent::RedrawRequested = event {
+            self.render_frame();
+            // Defer zone reload until after the GPU borrow is fully released.
+            if mem::take(&mut self.pending_reload) {
+                self.reload_zone();
+            }
+            // Background load thread finished? Do the GPU upload. Asset sync finished? Load models.
+            self.maybe_finish_load();
+            self.poll_sync();
+            return;
+        }
+
+        // Let egui see the event first. If it wants a repaint (hover/focus/typing) or consumes the
+        // event, wake the loop so the UI updates; bail out on consumed events.
+        let egui_resp = if let (Some(egui_state), Some(window)) = (&mut self.egui_state, &self.window) {
+            Some(egui_state.on_window_event(window, &event))
+        } else {
+            None
+        };
+        if let Some(resp) = egui_resp {
+            if resp.repaint { self.wake(); }
+            if resp.consumed { return; }
         }
 
         match event {
@@ -1271,18 +1417,6 @@ impl ApplicationHandler for App {
                     surface.configure(&renderer.device, &renderer.surface_config);
                     renderer.recreate_depth_texture();
                 }
-            }
-
-            WindowEvent::RedrawRequested => {
-                self.render_frame();
-                // Defer zone reload until after GPU borrow is fully released.
-                if mem::take(&mut self.pending_reload) {
-                    self.reload_zone();
-                }
-                // Check whether the background load thread finished; do GPU upload if so.
-                self.maybe_finish_load();
-                // Check whether the asset sync finished; load character models if so.
-                self.poll_sync();
             }
 
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
@@ -1356,7 +1490,7 @@ impl ApplicationHandler for App {
                                 }
                                 KeyCode::F10 => {
                                     self.show_debug = !self.show_debug;
-                                    eprintln!("DEBUG: overlay {}", if self.show_debug { "ON" } else { "OFF" });
+                                    tracing::info!("DEBUG: overlay {}", if self.show_debug { "ON" } else { "OFF" });
                                 }
                                 KeyCode::KeyI => {
                                     self.show_inventory = !self.show_inventory;
@@ -1383,5 +1517,9 @@ impl ApplicationHandler for App {
 
             _ => {}
         }
+
+        // Any non-redraw event that reached here (input, resize, focus, …) may change what's drawn, so
+        // render at least one frame and keep the active window open briefly for follow-up animation.
+        self.wake();
     }
 }
