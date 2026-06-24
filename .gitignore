@@ -20,6 +20,9 @@ Zone_*.png
 # Claude Code workspace (agents, skills, settings, local state) — not published
 .claude/
 
+# Superpowers plans/specs — developer-local, not published
+docs/superpowers/
+
 # Tools build output
 tools/output/
 tools/target/
