@@ -87,10 +87,19 @@ The **`⚙ UI`** menu provides:
 
 Window layouts are **saved to disk** per character:
 
-**File location:** `ui_layout_<CharacterName>.json` in the process working directory.
+**File location:** `~/.config/eqoxide/ui_layout_<CharacterName>.json`
+
+The directory follows the XDG base-dir spec: it is `$XDG_CONFIG_HOME/eqoxide/` when
+`XDG_CONFIG_HOME` is set, otherwise `~/.config/eqoxide/`. The directory is created
+automatically on first save. (If it cannot be created, the client falls back to the
+process working directory.)
 
 Non-alphanumeric characters in the character name are **stripped** from the filename (e.g.,
 a character named "Cleric-Alt" saves to `ui_layout_ClericAlt.json`).
+
+**Migration:** older builds saved these files in the process working directory. On
+startup, any legacy `ui_layout_<CharacterName>.json` found in the working directory is
+automatically moved into `~/.config/eqoxide/` (unless a config-dir copy already exists).
 
 **Format** (JSON):
 
@@ -134,8 +143,8 @@ a character named "Cleric-Alt" saves to `ui_layout_ClericAlt.json`).
 - `size` — `[width, height]`, or `null` for default (non-resizable windows always show `null`)
 - `alpha` — opacity 0–255 (255 = opaque, 0 = invisible)
 
-**To reset all layouts:** Delete the `ui_layout_<CharacterName>.json` file. Next login will
-restore default positions.
+**To reset all layouts:** Delete the `~/.config/eqoxide/ui_layout_<CharacterName>.json`
+file. Next login will restore default positions.
 
 ---
 
