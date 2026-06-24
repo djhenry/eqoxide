@@ -1753,10 +1753,10 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "requires ~/eq_assets/EQ_Files/globalhum_chr.s3d"]
+    #[ignore = "requires extracted assets (set EQ_ASSETS_DIR): globalhum_chr.s3d"]
     fn skinned_conversion_is_centered_grounded() {
-        let home = std::env::var("HOME").unwrap();
-        let inp = std::path::PathBuf::from(format!("{home}/eq_assets/EQ_Files/globalhum_chr.s3d"));
+        let Some(dir) = std::env::var_os("EQ_ASSETS_DIR") else { return; };
+        let inp = std::path::PathBuf::from(dir).join("globalhum_chr.s3d");
         let out = std::path::PathBuf::from("/tmp/test_hum_norm.glb");
         convert_s3d_to_glb_skinned(&inp, &out, None).unwrap();
 

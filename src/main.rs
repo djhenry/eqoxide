@@ -89,8 +89,10 @@ fn main() {
     let cast:             http::CastReq         = Arc::new(Mutex::new(None));
     let sit:              http::SitReq          = Arc::new(Mutex::new(None));
     let consider:         http::ConsiderReq     = Arc::new(Mutex::new(None));
+    // spells_us.txt is an EQ data file; default to the configured assets dir,
+    // overridable via EQ_SPELLS_FILE.
     let spells_path = std::env::var("EQ_SPELLS_FILE")
-        .unwrap_or_else(|_| "~/git/original-client/spells_us.txt".to_string());
+        .unwrap_or_else(|_| app_cfg.assets_path.join("spells_us.txt").to_string_lossy().into_owned());
     let spells: std::sync::Arc<eq_renderer::spells::SpellDb> =
         std::sync::Arc::new(eq_renderer::spells::SpellDb::load(&spells_path));
     let shared_collision: assets::SharedCollision = Arc::new(std::sync::RwLock::new(None));

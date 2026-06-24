@@ -80,8 +80,10 @@ fn stat_bar(
 /// Load spells01..07.tga as egui textures. Returns [] if the directory/files are absent
 /// (graceful — gems fall back to text labels).
 pub fn load_spell_icons(ctx: &egui::Context) -> Vec<egui::TextureHandle> {
-    let dir = std::env::var("EQ_SPELL_ICONS_DIR")
-        .unwrap_or_else(|_| "~/git/original-client/uifiles/default".to_string());
+    // Spell-gem icons (spells01..07.tga) come from the EQ UI files. Point
+    // EQ_SPELL_ICONS_DIR at a directory containing them; absent that, gems fall
+    // back to text labels.
+    let Ok(dir) = std::env::var("EQ_SPELL_ICONS_DIR") else { return Vec::new(); };
     let mut out = Vec::new();
     for n in 1..=7 {
         let path = format!("{dir}/spells0{n}.tga");
