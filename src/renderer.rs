@@ -306,7 +306,7 @@ impl EqRenderer {
                 }
             }).collect();
 
-            eprintln!("renderer: merged zone into {} draw calls (was {} source meshes)",
+            tracing::info!("renderer: merged zone into {} draw calls (was {} source meshes)",
                 self.gpu_meshes.len(), source_count);
         }
 
@@ -362,7 +362,7 @@ impl EqRenderer {
                     });
                 }
             }
-            eprintln!("renderer: built {} instanced object meshes from {} models",
+            tracing::info!("renderer: built {} instanced object meshes from {} models",
                 instanced.len(), assets.objects.len());
             self.gpu_instanced = instanced;
         }
@@ -394,7 +394,7 @@ impl EqRenderer {
                 match ModelAsset::load(&gltf_path) {
                     Ok(a) => Some(a),
                     Err(e) => {
-                        eprintln!("renderer: glTF load failed for '{}': {}", key, e);
+                        tracing::warn!("renderer: glTF load failed for '{}': {}", key, e);
                         None
                     }
                 }
@@ -413,7 +413,7 @@ impl EqRenderer {
                             match ModelAsset::load_from_chr_s3d(&path) {
                                 Ok(a) => Some(a),
                                 Err(e) => {
-                                    eprintln!("renderer: chr S3D load failed for '{}': {}", key, e);
+                                    tracing::warn!("renderer: chr S3D load failed for '{}': {}", key, e);
                                     None
                                 }
                             }
@@ -424,7 +424,7 @@ impl EqRenderer {
                     match chr_asset {
                         Some(a) => a,
                         None => {
-                            eprintln!("renderer: no model for archetype '{}'", key);
+                            tracing::info!("renderer: no model for archetype '{}'", key);
                             continue;
                         }
                     }
@@ -438,11 +438,11 @@ impl EqRenderer {
             if female_path.exists() {
                 match ModelAsset::load(&female_path) {
                     Ok(fa) => variants.push((1, fa)),
-                    Err(e) => eprintln!("renderer: female glTF load failed for '{}': {}", key, e),
+                    Err(e) => tracing::warn!("renderer: female glTF load failed for '{}': {}", key, e),
                 }
             }
             for (gender, asset) in variants {
-            eprintln!("renderer: loaded '{}' (gender {}) — y_bottom={:.4} y_extent={:.4} x_center={:.4} z_center={:.4}",
+            tracing::info!("renderer: loaded '{}' (gender {}) — y_bottom={:.4} y_extent={:.4} x_center={:.4} z_center={:.4}",
                 key, gender, asset.y_bottom, asset.y_extent, asset.x_center, asset.z_center);
 
             let (_, tex_bgs) = upload_textures(
@@ -494,7 +494,7 @@ impl EqRenderer {
                                                mesh_node_scale }, slot))
                     })
                     .unzip();
-                eprintln!("renderer: loaded skinned model '{}' ({} joints, {} clips)",
+                tracing::info!("renderer: loaded skinned model '{}' ({} joints, {} clips)",
                           key, skin.joint_count, skin.clips.len());
                 GpuModel::Skinned(GpuSkinnedModel { meshes, texture_bind_groups: tex_bgs, skin, node_scale: asset.skinned_node_scale, y_bottom: asset.y_bottom, x_center: asset.x_center, z_center: asset.z_center, prefix: asset.prefix.clone(), equip_slots: skinned_slots, true_height: asset.true_height, clip_bounds: asset.clip_bounds.clone(), feet_offset: asset.feet_offset })
             } else {
@@ -522,7 +522,7 @@ impl EqRenderer {
                                    index_count: mesh.indices.len() as u32, texture_idx,
                                    base_color: mesh.base_color }, slot))
                 }).unzip();
-                eprintln!("renderer: loaded static model '{}'", key);
+                tracing::info!("renderer: loaded static model '{}'", key);
                 GpuModel::Static(GpuStaticModel { meshes, texture_bind_groups: tex_bgs, y_bottom: asset.y_bottom, y_extent: asset.y_extent, x_center: asset.x_center, z_center: asset.z_center, prefix: asset.prefix.clone(), equip_slots: static_slots, true_height: asset.true_height, clip_bounds: vec![], feet_offset: 0.0 })
             };
 
@@ -552,7 +552,7 @@ impl EqRenderer {
                 }
             }
         }
-        eprintln!("equip: indexed {} armor textures", self.equip_index.len());
+        tracing::info!("equip: indexed {} armor textures", self.equip_index.len());
     }
 
     /// Select a loaded character model for an archetype + gender, falling back to the
@@ -615,7 +615,7 @@ impl EqRenderer {
                 vertex_buf, index_buf, index_count: m.indices.len() as u32,
                 texture_idx, base_color: [1.0; 4] });
         }
-        eprintln!("weapon: cached '{}' — {} gpu meshes, {} textures", key, meshes.len(), bgs.len());
+        tracing::info!("weapon: cached '{}' — {} gpu meshes, {} textures", key, meshes.len(), bgs.len());
         self.weapon_cache.insert(key, Some(crate::gpu::GpuWeapon { meshes, texture_bind_groups: bgs }));
     }
 
@@ -690,7 +690,7 @@ impl EqRenderer {
         let models = match crate::assets::load_object_models(main_s3d, obj_s3d) {
             Ok(m) => m,
             Err(e) => {
-                eprintln!("doors: load_object_models failed ({}); doors will use fallback boxes", e);
+                tracing::warn!("doors: load_object_models failed ({}); doors will use fallback boxes", e);
                 return;
             }
         };
@@ -725,7 +725,7 @@ impl EqRenderer {
             self.door_models.insert(name, crate::gpu::GpuWeapon {
                 meshes: gpu_meshes, texture_bind_groups: Vec::new() });
         }
-        eprintln!("doors: loaded {} door/object models", self.door_models.len());
+        tracing::info!("doors: loaded {} door/object models", self.door_models.len());
     }
 
     /// Pre-pass (mutable): warn once per door whose model is missing from `door_models`.
@@ -737,7 +737,7 @@ impl EqRenderer {
             let key = door.name.to_uppercase();
             if !self.door_models.contains_key(&key)
                 && self.warned_missing_doors.insert(door.name.clone()) {
-                eprintln!("doors: missing model {:?} for door {} — using fallback box",
+                tracing::warn!("doors: missing model {:?} for door {} — using fallback box",
                           door.name, door.door_id);
             }
         }

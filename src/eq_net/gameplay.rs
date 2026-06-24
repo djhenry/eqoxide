@@ -65,13 +65,13 @@ pub async fn run_gameplay_phase(
                     gs.loot_last_activity = Some(std::time::Instant::now());
                     gs.log_msg("loot", "Looting item...");
                     s.send_app_packet(OP_LOOT_ITEM, &packet.payload);
-                    eprintln!("EQ: auto-loot: taking item (echoed OP_LootItem)");
+                    tracing::info!("EQ: auto-loot: taking item (echoed OP_LootItem)");
                 }
                 // Server booted us (typically another client logged in this same character).
                 // EQEmu's default is "second login wins"; the first client receives OP_GMKick.
                 // We're already kicked, so just disconnect the session and exit cleanly.
                 OP_GMKICK => {
-                    eprintln!("EQ: OP_GMKick — disconnected (character logged in elsewhere)");
+                    tracing::info!("EQ: OP_GMKick — disconnected (character logged in elsewhere)");
                     gs.log_msg("system", "Disconnected: this character was logged in from another location.");
                     s.send_session_disconnect();
                     // We're already booted, so no OP_Logout. Request shutdown: the render loop's
@@ -101,7 +101,7 @@ pub async fn run_gameplay_phase(
                         gs.player_x = x;
                         gs.player_y = y;
                         gs.player_z = z;
-                        eprintln!("EQ: same-zone teleport → pos=({:.1},{:.1},{:.1})", x, y, z);
+                        tracing::info!("EQ: same-zone teleport → pos=({:.1},{:.1},{:.1})", x, y, z);
                         // Send position update so the server knows where we are.
                         let _ = app_tx.send(make_position_packet(gs.player_id, x, y, z));
                     } else {
@@ -116,7 +116,7 @@ pub async fn run_gameplay_phase(
                         buf[72..76].copy_from_slice(&x.to_le_bytes());
                         buf[76..80].copy_from_slice(&z.to_le_bytes());
                         s.send_app_packet(OP_ZONE_CHANGE, &buf);
-                        eprintln!("EQ: cross-zone OP_REQUEST_CLIENT_ZONE_CHANGE zone_id={zone_id} → sent OP_ZONE_CHANGE");
+                        tracing::info!("EQ: cross-zone OP_REQUEST_CLIENT_ZONE_CHANGE zone_id={zone_id} → sent OP_ZONE_CHANGE");
                     }
                 }
                 OP_ZONE_CHANGE if packet.payload.len() >= 88 => {
@@ -124,7 +124,7 @@ pub async fn run_gameplay_phase(
                         packet.payload[84], packet.payload[85],
                         packet.payload[86], packet.payload[87],
                     ]);
-                    eprintln!("EQ: OP_ZONE_CHANGE server response success={success}");
+                    tracing::info!("EQ: OP_ZONE_CHANGE server response success={success}");
                     if success == 1 {
                         world_reconnect_needed = true;
                     }
@@ -154,7 +154,7 @@ pub async fn run_gameplay_phase(
                     s.send_app_packet(OP_LOOT_REQUEST, &corpse_id.to_le_bytes());
                     gs.loot_session_active = true;
                     gs.loot_last_activity = Some(std::time::Instant::now());
-                    eprintln!("EQ: auto-loot: sent OP_LootRequest for corpse_id={}", corpse_id);
+                    tracing::info!("EQ: auto-loot: sent OP_LootRequest for corpse_id={}", corpse_id);
                 }
                 if gs.pending_loot.is_empty() {
                     gs.loot_queued_at = None;
@@ -169,7 +169,7 @@ pub async fn run_gameplay_phase(
                     gs.loot_session_active = false;
                     gs.loot_last_activity = None;
                     gs.log_msg("loot", "Looting complete");
-                    eprintln!("EQ: auto-loot: sent OP_EndLootRequest (session complete)");
+                    tracing::info!("EQ: auto-loot: sent OP_EndLootRequest (session complete)");
                     // Reset queued_at so the next corpse gets its own delay window.
                     gs.loot_queued_at = gs.pending_loot.front().map(|_| std::time::Instant::now());
                 }
@@ -177,7 +177,7 @@ pub async fn run_gameplay_phase(
         }
 
         if world_reconnect_needed {
-            eprintln!("EQ: zone change approved — reconnecting to world for zone handoff");
+            tracing::info!("EQ: zone change approved — reconnecting to world for zone handoff");
             let ok = reconnect_via_world(
                 &mut stream, &mut net_rx, &app_tx, &mut gs, &char_name, &world_creds,
             ).await;
@@ -191,14 +191,14 @@ pub async fn run_gameplay_phase(
                 navigator.sync_zone_points(&gs);
                 last_keepalive = std::time::Instant::now();
             } else {
-                eprintln!("EQ: world reconnect failed — exiting gameplay");
+                tracing::warn!("EQ: world reconnect failed — exiting gameplay");
                 return;
             }
             continue;
         }
 
         if let Some((zone_ip, zone_port)) = zone_redirect {
-            eprintln!("EQ: zone transition → {}:{}", zone_ip, zone_port);
+            tracing::info!("EQ: zone transition → {}:{}", zone_ip, zone_port);
             let (new_tx, new_rx) = tokio::sync::mpsc::unbounded_channel::<AppPacket>();
             // Drop old connections (Option::take returns the value, dropping it).
             drop(stream.take());
@@ -213,7 +213,7 @@ pub async fn run_gameplay_phase(
                     let nb = char_name.as_bytes();
                     cze[4..4 + nb.len().min(64)].copy_from_slice(&nb[..nb.len().min(64)]);
                     s2.send_app_packet(OP_ZONE_ENTRY, &cze);
-                    eprintln!("EQ: sent zone entry for '{}'", char_name);
+                    tracing::info!("EQ: sent zone entry for '{}'", char_name);
                     run_zone_entry_handshake(
                         stream.as_mut().unwrap(),
                         net_rx.as_mut().unwrap(),
@@ -224,7 +224,7 @@ pub async fn run_gameplay_phase(
                     last_keepalive = std::time::Instant::now();
                 }
                 Err(e) => {
-                    eprintln!("EQ: zone transition connect failed: {e}");
+                    tracing::warn!("EQ: zone transition connect failed: {e}");
                     // Can't recover without a stream; exit gameplay phase.
                     return;
                 }
@@ -254,21 +254,21 @@ async fn perform_clean_shutdown(
     s:  &mut EqStream,
     rx: &mut UnboundedReceiver<AppPacket>,
 ) {
-    eprintln!("EQ: clean shutdown requested — sending OP_Logout");
+    tracing::info!("EQ: clean shutdown requested — sending OP_Logout");
     s.send_app_packet(OP_LOGOUT, &[]);
     let deadline = std::time::Instant::now() + Duration::from_millis(300);
     'wait: while std::time::Instant::now() < deadline {
         s.poll_recv();
         while let Ok(pkt) = rx.try_recv() {
             if pkt.opcode == OP_LOGOUT_REPLY {
-                eprintln!("EQ: received OP_LogoutReply");
+                tracing::info!("EQ: received OP_LogoutReply");
                 break 'wait;
             }
         }
         sleep(Duration::from_millis(10)).await;
     }
     s.send_session_disconnect();
-    eprintln!("EQ: sent OP_Logout + OP_SessionDisconnect (process exits on the main thread)");
+    tracing::info!("EQ: sent OP_Logout + OP_SessionDisconnect (process exits on the main thread)");
 }
 
 /// After OP_ZONE_CHANGE success=1: reconnect to world, get OP_ZONE_SERVER_INFO, connect to new zone.
@@ -286,10 +286,10 @@ async fn reconnect_via_world(
     sleep(Duration::from_millis(300)).await;
 
     let (world_tx, mut world_rx) = tokio::sync::mpsc::unbounded_channel::<AppPacket>();
-    eprintln!("EQ: reconnecting to world {}:{}", creds.world_host, creds.world_port);
+    tracing::info!("EQ: reconnecting to world {}:{}", creds.world_host, creds.world_port);
     let mut world_stream = match EqStream::connect(&creds.world_host, creds.world_port, world_tx).await {
         Ok(s) => s,
-        Err(e) => { eprintln!("EQ: world reconnect failed: {e}"); return false; }
+        Err(e) => { tracing::warn!("EQ: world reconnect failed: {e}"); return false; }
     };
 
     // Send OP_SEND_LOGIN_INFO: lsid\0ls_key\0 padded to SIZE_LOGIN_INFO bytes.
@@ -301,7 +301,7 @@ async fn reconnect_via_world(
     login_info[..lb.len().min(64)].copy_from_slice(&lb[..lb.len().min(64)]);
     login_info[188] = 1; // LoginInfo_S::zoning — signals zone transition reconnect
     world_stream.send_app_packet(OP_SEND_LOGIN_INFO, &login_info);
-    eprintln!("EQ: sent OP_SEND_LOGIN_INFO to world (lsid={}, zoning=1)", creds.lsid);
+    tracing::info!("EQ: sent OP_SEND_LOGIN_INFO to world (lsid={}, zoning=1)", creds.lsid);
 
     // Wait for OP_SEND_CHAR_INFO → send OP_ENTER_WORLD → wait for OP_ZONE_SERVER_INFO
     let deadline = std::time::Instant::now() + Duration::from_secs(90);
@@ -322,7 +322,7 @@ async fn reconnect_via_world(
                     enter_buf[..nb.len().min(64)].copy_from_slice(&nb[..nb.len().min(64)]);
                     world_stream.send_app_packet(OP_ENTER_WORLD, &enter_buf);
                     world_stream.send_app_packet(OP_POST_ENTER_WORLD, &[]);
-                    eprintln!("EQ: zone change: sent OP_ENTER_WORLD to world (trigger=0x{:04x})", packet.opcode);
+                    tracing::info!("EQ: zone change: sent OP_ENTER_WORLD to world (trigger=0x{:04x})", packet.opcode);
                 }
                 OP_ZONE_SERVER_INFO if packet.payload.len() >= SIZE_ZONE_SERVER_INFO => {
 
@@ -334,11 +334,11 @@ async fn reconnect_via_world(
                     let ip = if ip.is_empty() || ip == "0.0.0.0" {
                         creds.world_host.clone()
                     } else { ip };
-                    eprintln!("EQ: zone change: world says new zone at {}:{}", ip, port);
+                    tracing::info!("EQ: zone change: world says new zone at {}:{}", ip, port);
                     zone_server = Some((ip, port));
                 }
                 _ => {
-                    eprintln!("EQ: zone change world: opcode 0x{:04x} ({} bytes)", packet.opcode, packet.payload.len());
+                    tracing::info!("EQ: zone change world: opcode 0x{:04x} ({} bytes)", packet.opcode, packet.payload.len());
                 }
             }
         }
@@ -350,17 +350,17 @@ async fn reconnect_via_world(
     let (zone_ip, zone_port) = match zone_server {
         Some(s) => s,
         None => {
-            eprintln!("EQ: zone change: world did not send OP_ZONE_SERVER_INFO within 30s");
+            tracing::info!("EQ: zone change: world did not send OP_ZONE_SERVER_INFO within 30s");
             return false;
         }
     };
 
     sleep(Duration::from_millis(800)).await;
-    eprintln!("EQ: zone change: connecting to new zone {}:{}", zone_ip, zone_port);
+    tracing::info!("EQ: zone change: connecting to new zone {}:{}", zone_ip, zone_port);
     let (zone_tx, zone_rx) = tokio::sync::mpsc::unbounded_channel::<AppPacket>();
     let mut zone_stream = match EqStream::connect(&zone_ip, zone_port, zone_tx).await {
         Ok(s) => s,
-        Err(e) => { eprintln!("EQ: zone change: zone connect failed: {e}"); return false; }
+        Err(e) => { tracing::warn!("EQ: zone change: zone connect failed: {e}"); return false; }
     };
 
     // Send zone entry
@@ -368,7 +368,7 @@ async fn reconnect_via_world(
     let nb = char_name.as_bytes();
     cze[4..4 + nb.len().min(64)].copy_from_slice(&nb[..nb.len().min(64)]);
     zone_stream.send_app_packet(OP_ZONE_ENTRY, &cze);
-    eprintln!("EQ: zone change: sent OP_ZONE_ENTRY for '{}'", char_name);
+    tracing::info!("EQ: zone change: sent OP_ZONE_ENTRY for '{}'", char_name);
 
     *stream = Some(zone_stream);
     *net_rx = Some(zone_rx);
@@ -402,18 +402,18 @@ async fn run_zone_entry_handshake(
                 OP_NEW_ZONE if !done_new_zone => {
                     done_new_zone = true;
                     stream.send_app_packet(OP_REQ_CLIENT_SPAWN, &[]);
-                    eprintln!("EQ: new zone '{}' — sent ReqClientSpawn", gs.zone_name);
+                    tracing::info!("EQ: new zone '{}' — sent ReqClientSpawn", gs.zone_name);
                 }
                 OP_WEATHER if !done_weather => {
                     done_weather = true;
                     stream.send_app_packet(OP_REQ_NEW_ZONE, &[]);
-                    eprintln!("EQ: zone weather — sent ReqNewZone");
+                    tracing::info!("EQ: zone weather — sent ReqNewZone");
                 }
                 OP_SEND_EXP_ZONE_IN if !done_client_ready => {
                     done_client_ready = true;
                     stream.send_app_packet(OP_SEND_EXP_ZONE_IN, &[]);
                     stream.send_app_packet(OP_CLIENT_READY, &[]);
-                    eprintln!("EQ: zone transition complete — now in '{}'", gs.zone_name);
+                    tracing::info!("EQ: zone transition complete — now in '{}'", gs.zone_name);
                 }
                 _ => {}
             }
@@ -422,6 +422,6 @@ async fn run_zone_entry_handshake(
     }
 
     if !done_client_ready {
-        eprintln!("EQ: zone entry handshake timed out (new_zone={done_new_zone} weather={done_weather})");
+        tracing::warn!("EQ: zone entry handshake timed out (new_zone={done_new_zone} weather={done_weather})");
     }
 }

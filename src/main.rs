@@ -13,8 +13,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use winit::event_loop::EventLoop;
 
 fn main() {
+    eq_renderer::logging::init();
+
     let args: Vec<String> = std::env::args().collect();
     let testzone_mode = args.contains(&"--testzone".to_string());
+
+    // `--profile` (or EQ_PROFILE=1) enables the lightweight per-phase frame-timing HUD overlay.
+    let profile_mode = args.iter().any(|a| a == "--profile")
+        || std::env::var("EQ_PROFILE").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+    eq_renderer::profiling::set_enabled(profile_mode);
 
     // `--config <path>` selects the per-character login config; defaults to the eq-client-ref config.
     let login_cfg_path = args
@@ -25,7 +32,7 @@ fn main() {
         .unwrap_or_else(|| {
             std::path::PathBuf::from(shellexpand::tilde("~/git/eq-client-ref/config.yaml").into_owned())
         });
-    eprintln!("renderer: loading login config from {}", login_cfg_path.display());
+    tracing::info!("renderer: loading login config from {}", login_cfg_path.display());
 
     let login_cfg = config::LoginConfig::load(&login_cfg_path);
     let app_cfg   = config::AppConfig::load();
@@ -56,7 +63,7 @@ fn main() {
     // the network thread observes the flag and runs the OP_Logout sequence.
     for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
         if let Err(e) = signal_hook::flag::register(sig, Arc::clone(&shutdown)) {
-            eprintln!("warning: failed to register signal {sig} for clean shutdown: {e}");
+            tracing::warn!("warning: failed to register signal {sig} for clean shutdown: {e}");
         }
     }
 
@@ -124,7 +131,7 @@ fn main() {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
                 if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, zc, hl, sy, tg, at, by, mv, gv, iv, lt, dc, ds, mg, ca, st, co, sc, md, sd).await {
-                    eprintln!("EQ: fatal: {e}");
+                    tracing::error!("EQ: fatal: {e}");
                 }
             });
         });
