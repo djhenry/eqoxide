@@ -377,8 +377,7 @@ impl EqRenderer {
     /// Models with valid skins (joint_count ≤ 128) are loaded as Skinned; others as Static.
     /// Missing models fall back to billboard rendering.
     pub fn load_character_models(&mut self, models_dir: &std::path::Path, assets_path: &std::path::Path) {
-        use crate::models::{ModelAsset, SkinnedMeshData};
-        use wgpu::util::DeviceExt;
+        use crate::models::ModelAsset;
         self.assets_path = assets_path.to_path_buf(); // remembered for on-demand weapon-model loading
 
         const ARCHETYPES: &[&str] = &[
@@ -442,92 +441,28 @@ impl EqRenderer {
                 }
             }
             for (gender, asset) in variants {
-            tracing::info!("renderer: loaded '{}' (gender {}) — y_bottom={:.4} y_extent={:.4} x_center={:.4} z_center={:.4}",
-                key, gender, asset.y_bottom, asset.y_extent, asset.x_center, asset.z_center);
-
-            let (_, tex_bgs) = upload_textures(
-                &self.device, &self.queue, &asset.textures, &self.layouts.texture_bgl,
-            );
-            let tex_names: Vec<String> =
-                asset.textures.iter().map(|t| t.name.clone()).collect();
-
-            let use_skinned = asset.skin.as_ref()
-                .is_some_and(|s| s.joint_count > 0 && s.joint_count <= 128);
-
-            let model = if use_skinned {
-                let skin = asset.skin.unwrap();
-                let (meshes, skinned_slots): (Vec<GpuSkinnedMesh>, Vec<Option<crate::models::EquipSlot>>) = asset.meshes.iter()
-                    .zip(asset.skin_meshes.iter())
-                    .zip(asset.skinned_mesh_scales.iter())
-                    .zip(asset.equip_slots.iter())
-                    .filter_map(|(((mesh, sd_opt), &mesh_node_scale), &slot)| {
-                        if mesh.positions.is_empty() || mesh.indices.is_empty() {
-                            return None;
-                        }
-                        let sd = sd_opt.as_ref();
-                        let vertices: Vec<SkinnedVertex> = mesh.positions.iter()
-                            .enumerate()
-                            .map(|(i, &p)| {
-                                let nrm = mesh.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
-                                let uv  = mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]);
-                                let ji  = sd.and_then(|s: &SkinnedMeshData| s.joint_indices.get(i))
-                                            .copied().unwrap_or([0u32; 4]);
-                                let jw  = sd.and_then(|s: &SkinnedMeshData| s.joint_weights.get(i))
-                                            .copied().unwrap_or([1.0, 0.0, 0.0, 0.0]);
-                                SkinnedVertex { position: p, normal: nrm, uv,
-                                                joint_indices: ji, joint_weights: jw }
-                            })
-                            .collect();
-                        let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: None, contents: bytemuck::cast_slice(&vertices),
-                            usage: wgpu::BufferUsages::VERTEX,
-                        });
-                        let ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: None, contents: bytemuck::cast_slice(&mesh.indices),
-                            usage: wgpu::BufferUsages::INDEX,
-                        });
-                        let texture_idx = mesh.texture_name.as_ref()
-                            .and_then(|n| tex_names.iter().position(|t| t == n));
-                        Some((GpuSkinnedMesh { vertex_buf: vbuf, index_buf: ibuf,
-                                               index_count: mesh.indices.len() as u32,
-                                               texture_idx, base_color: mesh.base_color,
-                                               mesh_node_scale }, slot))
-                    })
-                    .unzip();
-                tracing::info!("renderer: loaded skinned model '{}' ({} joints, {} clips)",
-                          key, skin.joint_count, skin.clips.len());
-                GpuModel::Skinned(GpuSkinnedModel { meshes, texture_bind_groups: tex_bgs, skin, node_scale: asset.skinned_node_scale, y_bottom: asset.y_bottom, x_center: asset.x_center, z_center: asset.z_center, prefix: asset.prefix.clone(), equip_slots: skinned_slots, true_height: asset.true_height, clip_bounds: asset.clip_bounds.clone(), feet_offset: asset.feet_offset })
-            } else {
-                let (meshes, static_slots): (Vec<GpuMesh>, Vec<Option<crate::models::EquipSlot>>) = asset.meshes.iter()
-                    .zip(asset.equip_slots.iter())
-                    .filter_map(|(mesh, &slot)| {
-                    if mesh.positions.is_empty() || mesh.indices.is_empty() { return None; }
-                    let vertices: Vec<Vertex> = mesh.positions.iter().enumerate()
-                        .map(|(i, &p)| {
-                            let nrm = mesh.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
-                            Vertex { position: p, normal: nrm,
-                                     uv: mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]) }
-                        }).collect();
-                    let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: None, contents: bytemuck::cast_slice(&vertices),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    });
-                    let ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: None, contents: bytemuck::cast_slice(&mesh.indices),
-                        usage: wgpu::BufferUsages::INDEX,
-                    });
-                    let texture_idx = mesh.texture_name.as_ref()
-                        .and_then(|n| tex_names.iter().position(|t| t == n));
-                    Some((GpuMesh { vertex_buf: vbuf, index_buf: ibuf,
-                                   index_count: mesh.indices.len() as u32, texture_idx,
-                                   base_color: mesh.base_color }, slot))
-                }).unzip();
-                tracing::info!("renderer: loaded static model '{}'", key);
-                GpuModel::Static(GpuStaticModel { meshes, texture_bind_groups: tex_bgs, y_bottom: asset.y_bottom, y_extent: asset.y_extent, x_center: asset.x_center, z_center: asset.z_center, prefix: asset.prefix.clone(), equip_slots: static_slots, true_height: asset.true_height, clip_bounds: vec![], feet_offset: 0.0 })
-            };
-
-            self.gpu_character_models.insert((key, gender), model);
+                let model = self.build_character_model(key, asset);
+                self.gpu_character_models.insert((key, gender), model);
             } // gender variants
+        }
+
+        // Per-race character models (`race_<code>.glb`): each maps to exactly one
+        // race+gender, the gender baked into the code (see `models::race_model_basename`).
+        // There is no look-alike fallback — a race whose model file is absent simply
+        // does not render, so log each missing one ONCE here rather than per frame.
+        for &code in crate::models::PLAYABLE_RACE_MODELS {
+            let path = models_dir.join(format!("{code}.glb"));
+            if !path.exists() {
+                tracing::error!("renderer: missing character model '{code}.glb' — that race will not render");
+                continue;
+            }
+            match ModelAsset::load(&path) {
+                Ok(asset) => {
+                    let model = self.build_character_model(code, asset);
+                    self.gpu_character_models.insert((code, 0), model);
+                }
+                Err(e) => tracing::error!("renderer: failed to load character model '{code}.glb': {e}"),
+            }
         }
 
         // Index armor textures: shared velious sets (global17-23_amr) + each
@@ -555,11 +490,119 @@ impl EqRenderer {
         tracing::info!("equip: indexed {} armor textures", self.equip_index.len());
     }
 
+    /// Upload one `ModelAsset` to the GPU as a `GpuModel` (skinned when it has a
+    /// usable skin, else static). `label` is only used for log lines. Shared by the
+    /// archetype loader and the per-race (`race_<code>.glb`) loader.
+    fn build_character_model(&self, label: &str, asset: crate::models::ModelAsset) -> crate::gpu::GpuModel {
+        use wgpu::util::DeviceExt;
+        use crate::models::SkinnedMeshData;
+        tracing::info!("renderer: loaded '{}' — y_bottom={:.4} y_extent={:.4} x_center={:.4} z_center={:.4}",
+            label, asset.y_bottom, asset.y_extent, asset.x_center, asset.z_center);
+
+        let (_, tex_bgs) = upload_textures(
+            &self.device, &self.queue, &asset.textures, &self.layouts.texture_bgl,
+        );
+        let tex_names: Vec<String> =
+            asset.textures.iter().map(|t| t.name.clone()).collect();
+
+        let use_skinned = asset.skin.as_ref()
+            .is_some_and(|s| s.joint_count > 0 && s.joint_count <= 128);
+
+        if use_skinned {
+            let skin = asset.skin.unwrap();
+            let (meshes, skinned_slots): (Vec<GpuSkinnedMesh>, Vec<Option<crate::models::EquipSlot>>) = asset.meshes.iter()
+                .zip(asset.skin_meshes.iter())
+                .zip(asset.skinned_mesh_scales.iter())
+                .zip(asset.equip_slots.iter())
+                .filter_map(|(((mesh, sd_opt), &mesh_node_scale), &slot)| {
+                    if mesh.positions.is_empty() || mesh.indices.is_empty() {
+                        return None;
+                    }
+                    let sd = sd_opt.as_ref();
+                    let vertices: Vec<SkinnedVertex> = mesh.positions.iter()
+                        .enumerate()
+                        .map(|(i, &p)| {
+                            let nrm = mesh.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
+                            let uv  = mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]);
+                            let ji  = sd.and_then(|s: &SkinnedMeshData| s.joint_indices.get(i))
+                                        .copied().unwrap_or([0u32; 4]);
+                            let jw  = sd.and_then(|s: &SkinnedMeshData| s.joint_weights.get(i))
+                                        .copied().unwrap_or([1.0, 0.0, 0.0, 0.0]);
+                            SkinnedVertex { position: p, normal: nrm, uv,
+                                            joint_indices: ji, joint_weights: jw }
+                        })
+                        .collect();
+                    let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None, contents: bytemuck::cast_slice(&vertices),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+                    let ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: None, contents: bytemuck::cast_slice(&mesh.indices),
+                        usage: wgpu::BufferUsages::INDEX,
+                    });
+                    let texture_idx = mesh.texture_name.as_ref()
+                        .and_then(|n| tex_names.iter().position(|t| t == n));
+                    Some((GpuSkinnedMesh { vertex_buf: vbuf, index_buf: ibuf,
+                                           index_count: mesh.indices.len() as u32,
+                                           texture_idx, base_color: mesh.base_color,
+                                           mesh_node_scale }, slot))
+                })
+                .unzip();
+            tracing::info!("renderer: loaded skinned model '{}' ({} joints, {} clips)",
+                      label, skin.joint_count, skin.clips.len());
+            GpuModel::Skinned(GpuSkinnedModel { meshes, texture_bind_groups: tex_bgs, skin, node_scale: asset.skinned_node_scale, y_bottom: asset.y_bottom, x_center: asset.x_center, z_center: asset.z_center, prefix: asset.prefix.clone(), equip_slots: skinned_slots, true_height: asset.true_height, clip_bounds: asset.clip_bounds.clone(), feet_offset: asset.feet_offset })
+        } else {
+            let (meshes, static_slots): (Vec<GpuMesh>, Vec<Option<crate::models::EquipSlot>>) = asset.meshes.iter()
+                .zip(asset.equip_slots.iter())
+                .filter_map(|(mesh, &slot)| {
+                if mesh.positions.is_empty() || mesh.indices.is_empty() { return None; }
+                let vertices: Vec<Vertex> = mesh.positions.iter().enumerate()
+                    .map(|(i, &p)| {
+                        let nrm = mesh.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
+                        Vertex { position: p, normal: nrm,
+                                 uv: mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]) }
+                    }).collect();
+                let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None, contents: bytemuck::cast_slice(&vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                let ibuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: None, contents: bytemuck::cast_slice(&mesh.indices),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+                let texture_idx = mesh.texture_name.as_ref()
+                    .and_then(|n| tex_names.iter().position(|t| t == n));
+                Some((GpuMesh { vertex_buf: vbuf, index_buf: ibuf,
+                               index_count: mesh.indices.len() as u32, texture_idx,
+                               base_color: mesh.base_color }, slot))
+            }).unzip();
+            tracing::info!("renderer: loaded static model '{}'", label);
+            GpuModel::Static(GpuStaticModel { meshes, texture_bind_groups: tex_bgs, y_bottom: asset.y_bottom, y_extent: asset.y_extent, x_center: asset.x_center, z_center: asset.z_center, prefix: asset.prefix.clone(), equip_slots: static_slots, true_height: asset.true_height, clip_bounds: vec![], feet_offset: 0.0 })
+        }
+    }
+
     /// Select a loaded character model for an archetype + gender, falling back to the
     /// male (gender 0) variant when no female variant exists.
     pub fn model_for(&self, archetype: &'static str, gender: u8) -> Option<&crate::gpu::GpuModel> {
         self.gpu_character_models.get(&(archetype, gender))
             .or_else(|| self.gpu_character_models.get(&(archetype, 0)))
+    }
+
+    /// Select the character model a spawn of `race` + `gender` should render with.
+    /// Playable races resolve to their own `race_<code>` model and do NOT fall back
+    /// to an archetype, so a race whose model is missing returns `None` (rendered as
+    /// nothing). Monsters resolve to their archetype model (with female→male fallback).
+    pub fn character_model_for(&self, race: &str, gender: u8) -> Option<&crate::gpu::GpuModel> {
+        let (key, slot) = crate::models::character_model_key(race, gender);
+        self.model_by_key(key, slot)
+    }
+
+    /// Look up a character model by an already-resolved registry key + gender slot
+    /// (from `models::character_model_key`), with the female→male slot-0 fallback.
+    /// Lets a draw list cache the resolved key so every pass renders the same model.
+    pub fn model_by_key(&self, key: &'static str, slot: u8) -> Option<&crate::gpu::GpuModel> {
+        self.gpu_character_models.get(&(key, slot))
+            .or_else(|| self.gpu_character_models.get(&(key, 0)))
     }
 
     /// Load + upload one armor texture (trying .bmp then .dds). Returns its bind group.
@@ -622,14 +665,13 @@ impl EqRenderer {
     /// Pre-pass (mutable): ensure every armor texture needed this frame is cached.
     /// Runs before the immutable render passes so they only do lookups.
     pub fn ensure_equipment_textures(&mut self, scene: &crate::scene::SceneState) {
-        use crate::models::{race_to_archetype, equip_swap_key};
+        use crate::models::equip_swap_key;
         use crate::gpu::GpuModel;
 
         // Phase 1: collect needed base names (no mutation of the cache yet).
         let mut needed: Vec<String> = Vec::new();
         for b in &scene.billboards {
-            let archetype = race_to_archetype(&b.race);
-            let (prefix, slots) = match self.model_for(archetype, b.gender) {
+            let (prefix, slots) = match self.character_model_for(&b.race, b.gender) {
                 Some(GpuModel::Static(m))  => (&m.prefix, &m.equip_slots),
                 Some(GpuModel::Skinned(m)) => (&m.prefix, &m.equip_slots),
                 None => continue,
@@ -647,8 +689,7 @@ impl EqRenderer {
             }
         }
         if !scene.player_race.is_empty() {
-            let archetype = crate::models::race_to_archetype(&scene.player_race);
-            if let Some(model) = self.model_for(archetype, scene.player_gender) {
+            if let Some(model) = self.character_model_for(&scene.player_race, scene.player_gender) {
                 let (prefix, slots) = match model {
                     GpuModel::Static(m)  => (&m.prefix, &m.equip_slots),
                     GpuModel::Skinned(m) => (&m.prefix, &m.equip_slots),
@@ -768,11 +809,11 @@ impl EqRenderer {
         };
 
         for (id, race, action, gender) in &anim_targets {
-            let archetype = crate::models::race_to_archetype(race);
+            let (key, slot) = crate::models::character_model_key(race, *gender);
             // Direct field lookup (with female→male fallback) keeps the borrow disjoint
-            // from the `self.anim_states` mutation below; `model_for` would borrow all of self.
-            let model = self.gpu_character_models.get(&(archetype, *gender))
-                .or_else(|| self.gpu_character_models.get(&(archetype, 0)));
+            // from the `self.anim_states` mutation below; `character_model_for` would borrow all of self.
+            let model = self.gpu_character_models.get(&(key, slot))
+                .or_else(|| self.gpu_character_models.get(&(key, 0)));
             let Some(GpuModel::Skinned(skinned)) = model else { continue };
 
             let state = self.anim_states.entry(*id).or_insert_with(|| {

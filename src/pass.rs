@@ -299,7 +299,6 @@ pub fn encode_billboard_pass(
 ) {
     use wgpu::util::DeviceExt;
     use crate::billboard::{billboard_quad, cross_marker, npc_color, npc_size};
-    use crate::models::race_to_archetype;
 
     let mut all_verts: Vec<crate::gpu::Vertex> = Vec::new();
     let mut all_idxs:  Vec<u32>                = Vec::new();
@@ -313,7 +312,7 @@ pub fn encode_billboard_pass(
             all_idxs.extend(idxs.iter().map(|i| i + base));
             continue;
         }
-        if r.model_for(race_to_archetype(&b.race), b.gender).is_some() { continue; }
+        if r.character_model_for(&b.race, b.gender).is_some() { continue; }
         let (verts, idxs) = billboard_quad(
             b.pos, npc_size(b.level), npc_color(b.is_target, b.dead, b.hp_pct),
             cam_right, cam_up,
@@ -381,7 +380,7 @@ pub fn encode_player_pass(
     if !scene.player_race.is_empty() {
         let archetype = race_to_archetype(&scene.player_race);
 
-        match r.model_for(archetype, scene.player_gender) {
+        match r.character_model_for(&scene.player_race, scene.player_gender) {
             Some(GpuModel::Skinned(model)) => {
                 let matrices = match r.anim_states.get(&0) {
                     Some(state) if !model.skin.clips.is_empty() =>
@@ -394,7 +393,7 @@ pub fn encode_player_pass(
                 // Write to pool slot 0 (reserved for player).
                 r.queue.write_buffer(&r.joint_buf_pool[0].0, 0, bytemuck::cast_slice(&joint_array));
 
-                let target = crate::models::archetype_target_height(archetype);
+                let target = crate::models::target_height_for(&scene.player_race, archetype);
                 let height = if model.true_height > 0.001 { model.true_height } else { 1.0 };
                 let dominant_mesh_scale = (target / height) * model.node_scale;
                 // Skinned EQ models are authored horizontally centered on the origin, so NO
@@ -772,7 +771,7 @@ pub fn encode_skinned_entity_pass(
     use crate::models::race_to_archetype;
     use crate::gpu::{EntityUniform, GpuModel};
 
-    struct DrawCmd { archetype: &'static str, mesh_idx: usize, uniform_slot: usize, joint_slot: usize, equipment: [u32; 9], gender: u8 }
+    struct DrawCmd { model_key: &'static str, model_slot: u8, mesh_idx: usize, uniform_slot: usize, joint_slot: usize, equipment: [u32; 9] }
 
     let mut draws: Vec<DrawCmd> = Vec::new();
     let pool_half    = r.entity_uniform_pool.len() / 2;
@@ -785,7 +784,8 @@ pub fn encode_skinned_entity_pass(
     for b in &scene.billboards {
         if b.level == 0 { continue; }
         let archetype = race_to_archetype(&b.race);
-        let Some(GpuModel::Skinned(model)) = r.model_for(archetype, b.gender) else { continue };
+        let (model_key, model_slot) = crate::models::character_model_key(&b.race, b.gender);
+        let Some(GpuModel::Skinned(model)) = r.model_by_key(model_key, model_slot) else { continue };
         if j_slot >= r.joint_buf_pool.len() { break; }
 
         let matrices: Vec<[[f32;4];4]> = if b.action == "dead" {
@@ -801,7 +801,7 @@ pub fn encode_skinned_entity_pass(
         for (i, m) in matrices.iter().enumerate().take(128) { joint_array[i] = *m; }
         r.queue.write_buffer(&r.joint_buf_pool[j_slot].0, 0, bytemuck::cast_slice(&joint_array));
 
-        let target = crate::models::archetype_target_height(archetype);
+        let target = crate::models::target_height_for(&b.race, archetype);
         let height = if model.true_height > 0.001 { model.true_height } else { 1.0 };
         let dominant_scale    = (target / height) * model.node_scale;
         // Same placement as the player pass: no recenter (models are authored centered),
@@ -831,7 +831,7 @@ pub fn encode_skinned_entity_pass(
                 &r.entity_uniform_pool[u_slot].0, 0,
                 bytemuck::bytes_of(&EntityUniform { model: mat, tint }),
             );
-            draws.push(DrawCmd { archetype, mesh_idx, uniform_slot: u_slot, joint_slot: j_slot, equipment: b.equipment, gender: b.gender });
+            draws.push(DrawCmd { model_key, model_slot, mesh_idx, uniform_slot: u_slot, joint_slot: j_slot, equipment: b.equipment });
             u_slot += 1;
         }
         j_slot += 1;
@@ -860,7 +860,7 @@ pub fn encode_skinned_entity_pass(
     // wherever the overlay is transparent.
     let mut cur_joint = usize::MAX;
     for draw in &draws {
-        let Some(GpuModel::Skinned(model)) = r.model_for(draw.archetype, draw.gender) else { continue };
+        let Some(GpuModel::Skinned(model)) = r.model_by_key(draw.model_key, draw.model_slot) else { continue };
         let mesh = &model.meshes[draw.mesh_idx];
         if draw.joint_slot != cur_joint {
             pass.set_bind_group(3, &r.joint_buf_pool[draw.joint_slot].1, &[]);
@@ -876,7 +876,7 @@ pub fn encode_skinned_entity_pass(
     pass.set_pipeline(&r.pipelines.skinned_overlay);
     cur_joint = usize::MAX;
     for draw in &draws {
-        let Some(GpuModel::Skinned(model)) = r.model_for(draw.archetype, draw.gender) else { continue };
+        let Some(GpuModel::Skinned(model)) = r.model_by_key(draw.model_key, draw.model_slot) else { continue };
         let mesh = &model.meshes[draw.mesh_idx];
         if draw.joint_slot != cur_joint {
             pass.set_bind_group(3, &r.joint_buf_pool[draw.joint_slot].1, &[]);

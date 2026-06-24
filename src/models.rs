@@ -622,7 +622,7 @@ pub fn race_to_archetype(race: &str) -> &'static str {
     match race.to_uppercase().as_str() {
         "HUM" | "HFL" | "GNM" | "ERU" |
         "IKS" | "VAH" | "BAR" | "TRL" | "OGR"          => "humanoid",
-        "ELF" | "HEF" | "DKE"                           => "elf",
+        "ELF" | "HIE" | "HEF" | "DKE"                   => "elf",
         "DWF"                                            => "dwarf",
         "GNL" | "KOB" | "GOB" | "ORC"                   => "gnoll",
         "SKE"                                            => "skeleton",
@@ -709,6 +709,115 @@ pub fn archetype_target_height(archetype: &str) -> f32 {
         "bat" => 4.0, "bird" => 4.0, "wasp" => 4.0, "worm" => 4.0,
         "fish" => 3.0, "creature" => 8.0,
         _ => 12.0,
+    }
+}
+
+/// Per-race rendered height in the client's display units, for the **playable**
+/// races. Source of truth is EQEmu's `GetRaceGenderDefaultHeight`
+/// (`common/races.cpp`), which the Titanium client uses as the base height for
+/// player models (the wire `size` field is 0 for player spawns, so the client
+/// substitutes the race default). Heights there are in EQ feet; we render a
+/// 6.0-ft human at 12.0 display units, so these are `feet * 2.0`.
+///
+/// Male and female share the same base height (no gender modifier in the table).
+///
+/// Keyed on the 3-letter race code from `eq_race_to_code`, where High Elf is
+/// `"HIE"` and Half Elf is `"HEF"`.
+///
+/// Returns `None` for non-playable races (monsters), whose height comes from
+/// [`archetype_target_height`] instead.
+pub fn race_target_height(race: &str) -> Option<f32> {
+    // feet * 2.0  (human 6.0 ft -> 12.0 units)
+    Some(match race.to_uppercase().as_str() {
+        "HUM" => 12.0, // Human       6.0 ft
+        "BAR" => 14.0, // Barbarian   7.0 ft
+        "ERU" => 12.0, // Erudite     6.0 ft
+        "ELF" => 10.0, // Wood Elf    5.0 ft
+        "HIE" => 12.0, // High Elf    6.0 ft
+        "HEF" => 11.0, // Half Elf    5.5 ft
+        "DKE" => 10.0, // Dark Elf    5.0 ft
+        "DWF" =>  8.0, // Dwarf       4.0 ft
+        "TRL" => 16.0, // Troll       8.0 ft
+        "OGR" => 18.0, // Ogre        9.0 ft
+        "HFL" =>  7.0, // Halfling    3.5 ft
+        "GNM" =>  6.0, // Gnome       3.0 ft
+        "FRG" => 10.0, // Froglok     5.0 ft
+        "IKS" => 12.0, // Iksar       6.0 ft
+        "VAH" => 14.0, // Vah Shir    7.0 ft
+        _ => return None,
+    })
+}
+
+/// Rendered height in display units for a spawn of the given race code: the
+/// playable-race default ([`race_target_height`]) when known, else the archetype
+/// fallback ([`archetype_target_height`]) for monsters.
+pub fn target_height_for(race: &str, archetype: &str) -> f32 {
+    race_target_height(race).unwrap_or_else(|| archetype_target_height(archetype))
+}
+
+/// Every per-race character model the asset server produces (`race_<code>.glb`,
+/// one file per race+gender, gender encoded in the 3-letter code). Used at load
+/// time to register the models that are present and log the ones that are not.
+pub const PLAYABLE_RACE_MODELS: &[&str] = &[
+    "race_hum", "race_huf", // Human
+    "race_bam", "race_baf", // Barbarian
+    "race_erm", "race_erf", // Erudite
+    "race_elm", "race_elf", // Wood Elf
+    "race_him", "race_hif", // High Elf
+    "race_dam", "race_daf", // Dark Elf
+    "race_ham", "race_haf", // Half Elf
+    "race_dwm", "race_dwf", // Dwarf
+    "race_trm", "race_trf", // Troll
+    "race_ogm", "race_ogf", // Ogre
+    "race_hom", "race_hof", // Halfling
+    "race_gnm", "race_gnf", // Gnome
+    "race_ikm", "race_ikf", // Iksar
+    "race_kem", "race_kef", // Vah Shir
+    "race_pcfroglok",       // Froglok (single archive, both genders)
+];
+
+/// The dedicated `race_<code>.glb` model basename for a playable race + gender,
+/// or `None` for non-playable races (monsters) that render from an archetype
+/// model. `gender`: 0 = male, 1 = female (2 = neuter falls through to male).
+///
+/// This is the **canonical** per-race mapping — there is NO fallback to a
+/// look-alike race. A race whose model file is absent simply does not render
+/// (the caller logs the missing model once). Codes are EQ's own model prefixes
+/// from the Titanium client's `(race_id, gender)` table.
+///
+/// Keyed on the 3-letter race code from `eq_race_to_code`, where High Elf is
+/// `"HIE"` (HIM/HIF models) and Half Elf is `"HEF"` (HAM/HAF models).
+pub fn race_model_basename(race: &str, gender: u8) -> Option<&'static str> {
+    let f = gender == 1;
+    Some(match race.to_uppercase().as_str() {
+        "HUM" => if f { "race_huf" } else { "race_hum" }, // Human
+        "BAR" => if f { "race_baf" } else { "race_bam" }, // Barbarian
+        "ERU" => if f { "race_erf" } else { "race_erm" }, // Erudite
+        "ELF" => if f { "race_elf" } else { "race_elm" }, // Wood Elf
+        "HIE" => if f { "race_hif" } else { "race_him" }, // High Elf
+        "HEF" => if f { "race_haf" } else { "race_ham" }, // Half Elf
+        "DKE" => if f { "race_daf" } else { "race_dam" }, // Dark Elf
+        "DWF" => if f { "race_dwf" } else { "race_dwm" }, // Dwarf
+        "TRL" => if f { "race_trf" } else { "race_trm" }, // Troll
+        "OGR" => if f { "race_ogf" } else { "race_ogm" }, // Ogre
+        "HFL" => if f { "race_hof" } else { "race_hom" }, // Halfling
+        "GNM" => if f { "race_gnf" } else { "race_gnm" }, // Gnome
+        "IKS" => if f { "race_ikf" } else { "race_ikm" }, // Iksar
+        "VAH" => if f { "race_kef" } else { "race_kem" }, // Vah Shir
+        "FRG" => "race_pcfroglok",                        // Froglok
+        _ => return None,
+    })
+}
+
+/// The character-model registry key `(key, gender_slot)` a spawn should render
+/// with. Playable races resolve to their own `race_<code>` model with the gender
+/// baked into the code (slot 0); everything else resolves to an archetype model
+/// where the gender slot selects the female variant. There is no playable→archetype
+/// fallback: a playable race with no loaded model yields a key that simply misses.
+pub fn character_model_key(race: &str, gender: u8) -> (&'static str, u8) {
+    match race_model_basename(race, gender) {
+        Some(code) => (code, 0),
+        None => (race_to_archetype(race), gender),
     }
 }
 
@@ -863,6 +972,81 @@ mod tests {
         assert!((archetype_target_height("humanoid") - 12.0).abs() < 0.01);
         assert!(archetype_target_height("dwarf") < archetype_target_height("humanoid"));
         assert!(archetype_target_height("unknown") > 0.0);
+    }
+
+    #[test]
+    fn race_heights_match_eqemu_table() {
+        // human 6.0 ft -> 12.0 units (the calibration anchor)
+        assert_eq!(race_target_height("HUM"), Some(12.0));
+        // the reported discrepancy: wood/dark elves are 5/6 of a human, half elf 11/12
+        assert_eq!(race_target_height("ELF"), Some(10.0)); // wood elf
+        assert_eq!(race_target_height("DKE"), Some(10.0)); // dark elf
+        assert_eq!(race_target_height("HIE"), Some(12.0)); // high elf
+        assert_eq!(race_target_height("HEF"), Some(11.0)); // half elf
+        // extremes
+        assert_eq!(race_target_height("OGR"), Some(18.0));
+        assert_eq!(race_target_height("GNM"), Some(6.0));
+        // monsters are not in the playable table
+        assert_eq!(race_target_height("GNL"), None);
+        assert_eq!(race_target_height("RAT"), None);
+    }
+
+    #[test]
+    fn race_heights_are_case_insensitive() {
+        assert_eq!(race_target_height("elf"), race_target_height("ELF"));
+        assert_eq!(race_target_height("Hum"), Some(12.0));
+    }
+
+    #[test]
+    fn target_height_for_prefers_race_then_archetype() {
+        // wood elf uses its race height, not the "elf" archetype's 12.0
+        assert_eq!(target_height_for("ELF", "elf"), 10.0);
+        // a monster (gnoll) falls back to the archetype height
+        assert_eq!(target_height_for("GNL", "gnoll"), archetype_target_height("gnoll"));
+    }
+
+    #[test]
+    fn race_model_basename_maps_gender_and_race() {
+        assert_eq!(race_model_basename("HUM", 0), Some("race_hum"));
+        assert_eq!(race_model_basename("HUM", 1), Some("race_huf"));
+        assert_eq!(race_model_basename("ELF", 0), Some("race_elm")); // wood elf male
+        assert_eq!(race_model_basename("ELF", 1), Some("race_elf")); // wood elf female
+        assert_eq!(race_model_basename("OGR", 0), Some("race_ogm"));
+        assert_eq!(race_model_basename("HFL", 1), Some("race_hof")); // halfling female = HOF
+        assert_eq!(race_model_basename("VAH", 0), Some("race_kem")); // vah shir = KEM/KEF
+        // High Elf and Half Elf are distinct models, not collapsed
+        assert_eq!(race_model_basename("HIE", 0), Some("race_him")); // high elf male
+        assert_eq!(race_model_basename("HEF", 1), Some("race_haf")); // half elf female
+        assert_ne!(race_model_basename("HIE", 0), race_model_basename("HEF", 0));
+        assert_eq!(race_model_basename("FRG", 0), Some("race_pcfroglok"));
+        // neuter (2) renders as male
+        assert_eq!(race_model_basename("HUM", 2), Some("race_hum"));
+        // monsters have no dedicated playable model
+        assert_eq!(race_model_basename("GNL", 0), None);
+        assert_eq!(race_model_basename("RAT", 0), None);
+    }
+
+    #[test]
+    fn every_basename_is_a_registered_model() {
+        // Anything race_model_basename can return must be in the load list, or it
+        // would map to a key that is never loaded.
+        for race in ["HUM", "BAR", "ERU", "ELF", "HIE", "HEF", "DKE", "DWF",
+                     "TRL", "OGR", "HFL", "GNM", "IKS", "VAH", "FRG"] {
+            for g in 0..=1 {
+                let code = race_model_basename(race, g).unwrap();
+                assert!(PLAYABLE_RACE_MODELS.contains(&code),
+                    "{race} gender {g} -> {code} not in PLAYABLE_RACE_MODELS");
+            }
+        }
+    }
+
+    #[test]
+    fn character_model_key_playable_vs_monster() {
+        // playable race -> its own model, gender baked into the code (slot 0)
+        assert_eq!(character_model_key("ELF", 1), ("race_elf", 0));
+        assert_eq!(character_model_key("OGR", 0), ("race_ogm", 0));
+        // monster -> archetype key, gender slot preserved for the female variant
+        assert_eq!(character_model_key("GNL", 1), ("gnoll", 1));
     }
 
     /// Deterministic check of the player-pass placement math: load the real human
