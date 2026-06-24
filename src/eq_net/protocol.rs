@@ -254,7 +254,7 @@ pub fn extract_spawn_position(
 pub fn eq_race_to_code(race_id: u32) -> &'static str {
     match race_id {
         // Playable races
-        1 => "HUM", 2 => "BAR", 3 => "ERU", 4 => "ELF", 5 => "HEF", 6 => "DKE",
+        1 => "HUM", 2 => "BAR", 3 => "ERU", 4 => "ELF", 5 => "HIE", 6 => "DKE",
         7 => "HEF", 8 => "DWF", 9 => "TRL", 10 => "OGR", 11 => "HFL", 12 => "GNM",
         128 => "IKS", 522 => "VAH",
         // NPC races 13..=127 — best-fit to an available archetype model
@@ -495,6 +495,10 @@ mod tests {
         assert_eq!(eq_race_to_code(1), "HUM");
         assert_eq!(eq_race_to_code(4), "ELF");
         assert_eq!(eq_race_to_code(128), "IKS");
+        // High Elf (5) and Half Elf (7) must be distinct — they have different models.
+        assert_eq!(eq_race_to_code(5), "HIE"); // High Elf
+        assert_eq!(eq_race_to_code(7), "HEF"); // Half Elf
+        assert_ne!(eq_race_to_code(5), eq_race_to_code(7));
     }
 
     #[test]
