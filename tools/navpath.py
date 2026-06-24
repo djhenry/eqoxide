@@ -37,9 +37,11 @@ import os
 
 import requests
 
-EQ_NAV_PKG = os.path.expanduser("~/git/eq-client-ref")
-if EQ_NAV_PKG not in sys.path:
-    sys.path.insert(0, EQ_NAV_PKG)
+# navpath.py reuses the `eq_client.nav` package (S3D loader, navgrid, A* pathfinder).
+# Point EQ_NAV_PKG_PATH at the directory that contains that package.
+_nav_pkg = os.environ.get("EQ_NAV_PKG_PATH")
+if _nav_pkg and _nav_pkg not in sys.path:
+    sys.path.insert(0, _nav_pkg)
 
 from eq_client.nav.s3d import load_triangles
 from eq_client.nav.navgrid import build_navgrid

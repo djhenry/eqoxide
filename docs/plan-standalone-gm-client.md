@@ -12,7 +12,7 @@ binary that:
 3. Receives real-time entity position updates (`OP_CLIENT_UPDATE`) from the zone server
 4. Renders the scene in real-time via the existing wgpu renderer
 
-The Python EQ client in `~/git/eq-client-ref/eq_client/` is the reference implementation for
+A separate Python EQ client (the `eq_client` package) is the reference implementation for
 the protocol layer. Everything we need is already implemented there.
 
 ## Architecture
@@ -77,8 +77,8 @@ the protocol layer. Everything we need is already implemented there.
 
 ## New Module: `src/eq_net/`
 
-Ported from the Python reference at `~/git/eq-client-ref/eq_client/connection/stream.py`
-and `~/git/eq-client-ref/eq_client/protocol/`.
+Ported from the Python reference implementation (`eq_client/connection/stream.py`
+and `eq_client/protocol/`).
 
 ### `src/eq_net/mod.rs` — Public API
 
@@ -380,8 +380,8 @@ renderer:
 
 ## Decisions
 
-1. **Login credentials**: Read from `~/git/eq-client-ref/config.yaml` — same `server` and `account`
-   sections the Python bot uses. No separate config needed.
+1. **Login credentials**: Read from the per-character login config (`~/.config/eqoxide/`,
+   see README) — the same `server` and `account` sections the Python reference uses.
 
 2. **Reconnection strategy**: Auto-reconnect up to 3 times on any connection failure
    (login, world, or zone). After 3 failures, exit with an error message. Each retry

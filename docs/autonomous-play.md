@@ -7,8 +7,8 @@ on the local EQEmu server. Companion to `protocol-notes.md`, `http-api.md`, `col
 
 The client was originally a GM observer (see `architecture.md`); it now also runs as an ordinary
 player. The renderer/HTTP-API code is identical — only the logged-in account/character differs
-(set in the login config; the eq-client-ref helper at `../eq-client-ref/config.yaml` has account +
-character_name fields).
+(set in the per-character login config under `~/.config/eqoxide/`, which carries the
+account + character_name fields).
 
 ---
 

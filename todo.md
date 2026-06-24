@@ -219,7 +219,7 @@ deep subsystems unattended on a long session with unknown credit balance.
 ## NEW AUTONOMOUS LOOP: play as "Claude" (started 2026-06-20, Max plan — run continuously)
 Account (non-GM): login user `claude` / pass `REDACTED` (login_accounts password set to SHA512
 of the pw so the loginserver's mode-fallback verify accepts it — mode-14 SCrypt verify is broken
-without ENABLE_SECURITY). World account id=3 status=0. Config: ~/git/eq-client-ref/config.yaml.
+without ENABLE_SECURITY). World account id=3 status=0. Config: per-character login config (~/.config/eqoxide/).
 Character: **Claude** = Female Wood Elf Ranger (race 4, class 4, gender 1), char id 2, in qeynos
 (zone 1) — chosen non-male-human-warrior; female-elf model renders correctly (verified /frame).
 Restart client after config/DB changes via: `touch src/main.rs && cargo build --release` (dev-run.sh
