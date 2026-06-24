@@ -855,16 +855,20 @@ async fn post_loot(
     }
 }
 
-/// POST /exit — cleanly log this client out and shut down. Sets the shared shutdown flag, which
-/// the EQ network thread observes to send OP_Logout + OP_SessionDisconnect before exiting. A
-/// watchdog force-exits after 3s in case the network thread can't log out (not connected /
-/// --testzone), so the process always terminates.
+/// POST /exit — cleanly log this client out and shut down. Sets the shared shutdown flag. The
+/// render loop's `about_to_wait` observes it and exits the winit event loop on the MAIN thread,
+/// which tears down winit/Wayland cleanly and then exits the process (via `main`). The EQ network
+/// thread separately observes the flag to send OP_Logout + OP_SessionDisconnect, then idles.
+///
+/// The graceful path completes in ~1.5s. The watchdog below is a last resort that only fires if
+/// the render loop is wedged (and so can't process the flag); its `process::exit()` from this
+/// background thread can crash the Wayland teardown, which is why it is NOT the normal exit path.
 async fn post_exit(State(s): State<HttpState>) -> (StatusCode, &'static str) {
     eprintln!("exit: clean shutdown requested via POST /exit");
     s.shutdown.store(true, Ordering::Relaxed);
     tokio::spawn(async {
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        eprintln!("exit: watchdog timeout — forcing process exit");
+        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+        eprintln!("exit: watchdog timeout — render loop unresponsive, forcing process exit");
         std::process::exit(0);
     });
     (StatusCode::OK, "logging out and shutting down")
