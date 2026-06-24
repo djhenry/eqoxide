@@ -41,6 +41,128 @@ pub struct ZoneAssets {
 }
 
 impl ZoneAssets {
+    /// Load a server-baked zone GLB into the same `ZoneAssets` the renderer consumes.
+    ///
+    /// Each GLB image is named with the lowercased EQ texture filename (e.g. `qcat0001.bmp`).
+    /// `MeshData.texture_name` is set to that same image name so `upload_zone_assets` can link
+    /// meshes to textures by name.  Positions/normals/uvs/indices are read via the primitive
+    /// reader; `center` is set to `[0,0,0]` because GLB positions are already world-space
+    /// libeq coords (no axis change needed).
+    ///
+    /// Mirrors the glTF loading in `src/models.rs:63-78` (gltf::Gltf::from_reader,
+    /// import_buffers, import_images).
+    pub fn from_glb(path: &std::path::Path) -> anyhow::Result<Self> {
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("failed to open zone glb: {}", path.display()))?;
+        let gltf_doc = gltf::Gltf::from_reader(std::io::BufReader::new(file))
+            .with_context(|| format!("failed to parse zone glb: {}", path.display()))?;
+        let base = path.parent().unwrap_or_else(|| std::path::Path::new("./"));
+        let buffers = gltf::import_buffers(&gltf_doc.document, Some(base), gltf_doc.blob)
+            .with_context(|| format!("failed to load glb buffers: {}", path.display()))?;
+        let raw_images = gltf::import_images(&gltf_doc.document, Some(base), &buffers)
+            .unwrap_or_default();
+
+        let document = &gltf_doc.document;
+
+        // Build texture list: name = the image's name field (lowercased EQ filename like "qcat0001.bmp").
+        // Image index in the glTF == TextureData index — primitives reference by texture index → source image index.
+        let mut textures: Vec<TextureData> = Vec::new();
+        for (i, image) in document.images().enumerate() {
+            let img_name = image.name().unwrap_or("").to_string();
+            let raw = match raw_images.get(i) {
+                Some(d) => d,
+                None => {
+                    eprintln!("zone glb: no pixel data for image {} ({})", i, img_name);
+                    continue;
+                }
+            };
+            let rgba = match raw.format {
+                gltf::image::Format::R8G8B8A8 => raw.pixels.clone(),
+                gltf::image::Format::R8G8B8 => raw.pixels
+                    .chunks(3)
+                    .flat_map(|rgb| [rgb[0], rgb[1], rgb[2], 255u8])
+                    .collect(),
+                _ => {
+                    eprintln!("zone glb: skipping image {} ({}) — unsupported format", i, img_name);
+                    continue;
+                }
+            };
+            textures.push(TextureData {
+                name: img_name,
+                width: raw.width,
+                height: raw.height,
+                rgba,
+            });
+        }
+
+        // Build a map from gltf texture index → TextureData name (for mesh linkage).
+        // gltf texture → source image index → image name.
+        let tex_index_to_name: Vec<String> = document.textures()
+            .map(|t| {
+                let src = t.source().index();
+                document.images()
+                    .nth(src)
+                    .and_then(|img| img.name().map(|n| n.to_string()))
+                    .unwrap_or_default()
+            })
+            .collect();
+
+        // Build meshes: one MeshData per primitive across all meshes in the GLB.
+        let mut meshes: Vec<MeshData> = Vec::new();
+        for mesh in document.meshes() {
+            for primitive in mesh.primitives() {
+                let reader = primitive.reader(|b| Some(&buffers[b.index()]));
+
+                let positions: Vec<[f32; 3]> = match reader.read_positions() {
+                    Some(iter) => iter.collect(),
+                    None => continue,
+                };
+                if positions.is_empty() {
+                    continue;
+                }
+
+                let normals: Vec<[f32; 3]> = reader.read_normals()
+                    .map(|it| it.collect())
+                    .unwrap_or_else(|| vec![[0.0, 0.0, 1.0]; positions.len()]);
+
+                let uvs: Vec<[f32; 2]> = reader.read_tex_coords(0)
+                    .map(|tc| tc.into_f32().collect())
+                    .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
+
+                let indices: Vec<u32> = match reader.read_indices() {
+                    Some(iter) => iter.into_u32().collect(),
+                    None => (0..positions.len() as u32).collect(),
+                };
+
+                // Resolve texture name from the material's base-color texture.
+                let texture_name: Option<String> = primitive.material()
+                    .pbr_metallic_roughness()
+                    .base_color_texture()
+                    .and_then(|info| tex_index_to_name.get(info.texture().index()).cloned())
+                    .filter(|n| !n.is_empty());
+
+                let base_color = {
+                    let c = primitive.material().pbr_metallic_roughness().base_color_factor();
+                    c
+                };
+
+                meshes.push(MeshData {
+                    positions,
+                    normals,
+                    uvs,
+                    indices,
+                    texture_name,
+                    base_color,
+                    center: [0.0, 0.0, 0.0],
+                });
+            }
+        }
+
+        eprintln!("zone_assets::from_glb: loaded {} meshes, {} textures from {}",
+                  meshes.len(), textures.len(), path.display());
+        Ok(ZoneAssets { meshes, textures })
+    }
+
     /// Compute the 2D bounding box of all mesh vertices.
     /// Returns `([min_east, min_north], [max_east, max_north])` in EQ world coords
     /// (east = server_x, north = server_y).
@@ -761,6 +883,21 @@ pub fn load_weapon_model(assets_path: &Path, idfile: &str) -> Option<ZoneAssets>
     }
     eprintln!("weapon model: '{}' not found in any gequip*.s3d", want);
     None
+}
+
+#[cfg(test)]
+mod b2_glb_tests {
+    use super::*;
+    #[test]
+    #[ignore = "requires a baked zone glb at $ZONE_GLB"]
+    fn from_glb_links_meshes_to_textures() {
+        let p = std::env::var("ZONE_GLB").expect("set ZONE_GLB to a baked zone glb");
+        let za = ZoneAssets::from_glb(std::path::Path::new(&p)).unwrap();
+        assert!(!za.meshes.is_empty());
+        let tex_names: std::collections::HashSet<_> = za.textures.iter().map(|t| t.name.clone()).collect();
+        let linked = za.meshes.iter().filter(|m| m.texture_name.as_ref().map_or(false, |n| tex_names.contains(n))).count();
+        assert!(linked > 0, "at least some meshes must resolve their texture by name");
+    }
 }
 
 #[cfg(test)]
