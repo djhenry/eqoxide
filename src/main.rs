@@ -174,12 +174,14 @@ fn main() {
         app_player_info,
         warp,
         testzone_mode,
+        shutdown.clone(),
     );
     event_loop.run_app(&mut application).expect("event loop run");
-    // Window closed: ask the EQ network thread to log the character out cleanly. It will
-    // process::exit(0) once the logout is sent (usually <300ms). Sleep is an upper bound that
-    // the network thread normally cuts short; it only fully elapses when not connected
-    // (e.g. --testzone), where this fallback hard-exit terminates the process.
+    // The event loop has now exited gracefully — either the window was closed, or a shutdown was
+    // requested (POST /exit / OP_GMKick set the flag and `about_to_wait` called `event_loop.exit()`).
+    // Either way winit has torn down its Wayland clipboard worker on this (main) thread, so it is now
+    // safe to exit the process. Ensure the flag is set so the EQ network thread logs the character
+    // out (it idles after sending OP_Logout + OP_SessionDisconnect), give it a moment, then exit.
     shutdown.store(true, Ordering::Relaxed);
     std::thread::sleep(std::time::Duration::from_millis(1500));
     std::process::exit(0);

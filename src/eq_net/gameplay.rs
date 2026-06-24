@@ -42,6 +42,9 @@ pub async fn run_gameplay_phase(
         // dependency on other data published by the setter (/exit or window-close).
         if shutdown.load(Ordering::Relaxed) {
             perform_clean_shutdown(s, rx).await;
+            // Logout sent. Idle until the main thread exits the process (it owns the winit/Wayland
+            // teardown). Do NOT return — returning would let run_login_flow retry and reconnect.
+            loop { sleep(Duration::from_millis(200)).await; }
         }
 
         let mut zone_redirect: Option<(String, u16)> = None;
@@ -70,7 +73,11 @@ pub async fn run_gameplay_phase(
                     eprintln!("EQ: OP_GMKick — disconnected (character logged in elsewhere)");
                     gs.log_msg("system", "Disconnected: this character was logged in from another location.");
                     s.send_session_disconnect();
-                    std::process::exit(0);
+                    // We're already booted, so no OP_Logout. Request shutdown: the render loop's
+                    // `about_to_wait` exits the winit event loop on the main thread, which tears
+                    // down cleanly and exits the process. Idle here; do NOT return (avoids reconnect).
+                    shutdown.store(true, Ordering::Relaxed);
+                    loop { sleep(Duration::from_millis(200)).await; }
                 }
                 OP_REQUEST_CLIENT_ZONE_CHANGE if packet.payload.len() >= 24 => {
                     // Server wants us to move — either a zone transition or a same-zone teleport.
@@ -236,13 +243,16 @@ pub async fn run_gameplay_phase(
     }
 }
 
-/// Clean logout: send OP_Logout, briefly wait for OP_LogoutReply, send a session-layer
-/// disconnect, then exit the process. Never returns. EQEmu saves the character; the brief
-/// linkdead window is harmless because the next login DropClient-kicks the ghost.
+/// Clean logout: send OP_Logout, briefly wait for OP_LogoutReply, then send a session-layer
+/// disconnect. Returns when done — it does NOT exit the process. The actual process exit happens
+/// on the MAIN thread (the render loop's `about_to_wait` exits the winit event loop once the
+/// shutdown flag is set, then `main` exits), so the GPU/Wayland teardown is not raced by a
+/// background-thread `process::exit()`. EQEmu saves the character; the brief linkdead window is
+/// harmless because the next login DropClient-kicks the ghost.
 async fn perform_clean_shutdown(
     s:  &mut EqStream,
     rx: &mut UnboundedReceiver<AppPacket>,
-) -> ! {
+) {
     eprintln!("EQ: clean shutdown requested — sending OP_Logout");
     s.send_app_packet(OP_LOGOUT, &[]);
     let deadline = std::time::Instant::now() + Duration::from_millis(300);
@@ -257,8 +267,7 @@ async fn perform_clean_shutdown(
         sleep(Duration::from_millis(10)).await;
     }
     s.send_session_disconnect();
-    eprintln!("EQ: sent OP_SessionDisconnect — exiting cleanly");
-    std::process::exit(0);
+    eprintln!("EQ: sent OP_Logout + OP_SessionDisconnect (process exits on the main thread)");
 }
 
 /// After OP_ZONE_CHANGE success=1: reconnect to world, get OP_ZONE_SERVER_INFO, connect to new zone.
