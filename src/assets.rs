@@ -33,11 +33,61 @@ pub struct TextureData {
     pub rgba: Vec<u8>,
 }
 
+/// A reusable object model plus its per-placement instance transforms.
+///
+/// `meshes` are in model-local space (one entry per glTF primitive); each matrix in
+/// `instances` is a column-major 4×4 placing one copy of the model into world space.
+#[derive(Clone)]
+pub struct ObjectModel {
+    pub meshes: Vec<MeshData>,
+    /// Column-major 4×4 transforms, one per placement (`Mat4::from_cols_array_2d` form).
+    pub instances: Vec<[[f32; 4]; 4]>,
+}
+
 /// All CPU-side data for a zone, loaded from .s3d + .wld.
+///
+/// `terrain` is world-space static geometry (the zone shell). `objects` are instanced
+/// models placed multiple times; `expand_objects` flattens them into world-space meshes
+/// for the CPU render/collision paths until GPU instancing lands.
 #[derive(Clone)]
 pub struct ZoneAssets {
-    pub meshes: Vec<MeshData>,
+    pub terrain: Vec<MeshData>,
+    pub objects: Vec<ObjectModel>,
     pub textures: Vec<TextureData>,
+}
+
+/// Flatten instanced object models into world-space `MeshData`.
+///
+/// For each model, for each column-major instance matrix `M`, every position `p` is mapped
+/// to `M * vec4(p, 1)` and every normal by `M`'s upper-3×3. The result has `center: [0,0,0]`
+/// (positions are already absolute) and preserves `texture_name`/`base_color`.
+pub fn expand_objects(objects: &[ObjectModel]) -> Vec<MeshData> {
+    let mut out = Vec::new();
+    for model in objects {
+        for inst in &model.instances {
+            let m = glam::Mat4::from_cols_array_2d(inst);
+            for mesh in &model.meshes {
+                let positions: Vec<[f32; 3]> = mesh.positions.iter().map(|&p| {
+                    let v = m.transform_point3(glam::Vec3::from_array(p));
+                    [v.x, v.y, v.z]
+                }).collect();
+                let normals: Vec<[f32; 3]> = mesh.normals.iter().map(|&n| {
+                    let v = m.transform_vector3(glam::Vec3::from_array(n));
+                    [v.x, v.y, v.z]
+                }).collect();
+                out.push(MeshData {
+                    positions,
+                    normals,
+                    uvs: mesh.uvs.clone(),
+                    indices: mesh.indices.clone(),
+                    texture_name: mesh.texture_name.clone(),
+                    base_color: mesh.base_color,
+                    center: [0.0, 0.0, 0.0],
+                });
+            }
+        }
+    }
+    out
 }
 
 impl ZoneAssets {
@@ -52,9 +102,7 @@ impl ZoneAssets {
     /// Mirrors the glTF loading in `src/models.rs:63-78` (gltf::Gltf::from_reader,
     /// import_buffers, import_images).
     pub fn from_glb(path: &std::path::Path) -> anyhow::Result<Self> {
-        let file = std::fs::File::open(path)
-            .with_context(|| format!("failed to open zone glb: {}", path.display()))?;
-        let gltf_doc = gltf::Gltf::from_reader(std::io::BufReader::new(file))
+        let gltf_doc = gltf::Gltf::open(path)
             .with_context(|| format!("failed to parse zone glb: {}", path.display()))?;
         let base = path.parent().unwrap_or_else(|| std::path::Path::new("./"));
         let buffers = gltf::import_buffers(&gltf_doc.document, Some(base), gltf_doc.blob)
@@ -107,9 +155,9 @@ impl ZoneAssets {
             })
             .collect();
 
-        // Build meshes: one MeshData per primitive across all meshes in the GLB.
-        let mut meshes: Vec<MeshData> = Vec::new();
-        for mesh in document.meshes() {
+        // Read a gltf mesh's model-local primitives into MeshData (one per primitive).
+        let read_mesh = |mesh: &gltf::Mesh| -> Vec<MeshData> {
+            let mut out = Vec::new();
             for primitive in mesh.primitives() {
                 let reader = primitive.reader(|b| Some(&buffers[b.index()]));
 
@@ -143,7 +191,7 @@ impl ZoneAssets {
 
                 let base_color = primitive.material().pbr_metallic_roughness().base_color_factor();
 
-                meshes.push(MeshData {
+                out.push(MeshData {
                     positions,
                     normals,
                     uvs,
@@ -153,11 +201,54 @@ impl ZoneAssets {
                     center: [0.0, 0.0, 0.0],
                 });
             }
+            out
+        };
+
+        // Is a node's transform (approximately) the identity?
+        let is_identity = |m: &[[f32; 4]; 4]| -> bool {
+            const ID: [[f32; 4]; 4] =
+                [[1.,0.,0.,0.],[0.,1.,0.,0.],[0.,0.,1.,0.],[0.,0.,0.,1.]];
+            m.iter().zip(ID.iter())
+                .all(|(row, idr)| row.iter().zip(idr.iter()).all(|(a, b)| (a - b).abs() < 1e-5))
+        };
+
+        // Walk every scene node with a mesh: identity transform → terrain; non-identity →
+        // group by referenced mesh index into an ObjectModel (model-local meshes read once
+        // per mesh; node matrices accumulated as instances).
+        let mut terrain: Vec<MeshData> = Vec::new();
+        // mesh index → position in `objects`
+        let mut obj_index: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        let mut objects: Vec<ObjectModel> = Vec::new();
+
+        let nodes: Vec<gltf::Node> = match document.default_scene() {
+            Some(scene) => scene.nodes().collect(),
+            None => document.nodes().collect(),
+        };
+        // Flatten the node hierarchy (placement nodes are typically scene roots, but descend
+        // children defensively). Transforms are taken as the node's own local matrix.
+        let mut stack: Vec<gltf::Node> = nodes;
+        while let Some(node) = stack.pop() {
+            for child in node.children() {
+                stack.push(child);
+            }
+            let Some(mesh) = node.mesh() else { continue };
+            let matrix = node.transform().matrix();
+            if is_identity(&matrix) {
+                terrain.extend(read_mesh(&mesh));
+            } else {
+                let mi = mesh.index();
+                let slot = *obj_index.entry(mi).or_insert_with(|| {
+                    objects.push(ObjectModel { meshes: read_mesh(&mesh), instances: Vec::new() });
+                    objects.len() - 1
+                });
+                objects[slot].instances.push(matrix);
+            }
         }
 
-        eprintln!("zone_assets::from_glb: loaded {} meshes, {} textures from {}",
-                  meshes.len(), textures.len(), path.display());
-        Ok(ZoneAssets { meshes, textures })
+        let total_instances: usize = objects.iter().map(|o| o.instances.len()).sum();
+        eprintln!("zone_assets::from_glb: loaded {} terrain meshes, {} object models ({} instances), {} textures from {}",
+                  terrain.len(), objects.len(), total_instances, textures.len(), path.display());
+        Ok(ZoneAssets { terrain, objects, textures })
     }
 
     /// Compute the 2D bounding box of all mesh vertices.
@@ -167,7 +258,8 @@ impl ZoneAssets {
     pub fn bounds_xy(&self) -> Option<([f32; 2], [f32; 2])> {
         let mut min = [f32::MAX; 2];
         let mut max = [f32::MIN; 2];
-        for m in &self.meshes {
+        let expanded = expand_objects(&self.objects);
+        for m in self.terrain.iter().chain(expanded.iter()) {
             for p in &m.positions {
                 let e = p[2] + m.center[2]; // render.X = server_x = libeq p[2]
                 let n = p[0] + m.center[0]; // render.Y = server_y = libeq p[0]
@@ -207,7 +299,8 @@ impl Collision {
     pub fn build(assets: &ZoneAssets, cell_size: f32) -> Self {
         // Flatten every triangle into world space [east, north, height].
         let mut tris: Vec<[[f32; 3]; 3]> = Vec::new();
-        for m in &assets.meshes {
+        let expanded = expand_objects(&assets.objects);
+        for m in assets.terrain.iter().chain(expanded.iter()) {
             let pos = &m.positions;
             let idx = &m.indices;
             let mut k = 0;
@@ -629,7 +722,8 @@ impl ZoneAssets {
 
         eprintln!("zone_assets: loaded {} meshes, {} textures from {} ({} wld files)",
                   meshes.len(), textures.len(), s3d_path.display(), wld_files.len());
-        Ok(ZoneAssets { meshes, textures })
+        // The .s3d path stays flat/terrain-only (local fallback); no instanced objects.
+        Ok(ZoneAssets { terrain: meshes, objects: vec![], textures })
     }
 
     /// Load the base zone S3D plus the `_obj` S3D archive and merge all
@@ -659,7 +753,7 @@ impl ZoneAssets {
             // Place object models using the ActorInstance placements in the main zone .wld.
             // (Previously object meshes were merged at their origin → everything piled at 0,0,0.)
             match load_placed_objects(s3d_path, &obj_path) {
-                Ok(placed) => assets.meshes.extend(placed),
+                Ok(placed) => assets.terrain.extend(placed),
                 Err(e) => eprintln!("zone_assets: object placement failed for {}: {}", obj_path.display(), e),
             }
         }
@@ -875,7 +969,7 @@ pub fn load_weapon_model(assets_path: &Path, idfile: &str) -> Option<ZoneAssets>
             }
             eprintln!("weapon model: loaded '{}' — {} meshes, {} textures from {}",
                       want, meshes.len(), textures.len(), arch);
-            return Some(ZoneAssets { meshes, textures });
+            return Some(ZoneAssets { terrain: meshes, objects: vec![], textures });
         }
     }
     eprintln!("weapon model: '{}' not found in any gequip*.s3d", want);
@@ -890,9 +984,10 @@ mod b2_glb_tests {
     fn from_glb_links_meshes_to_textures() {
         let p = std::env::var("ZONE_GLB").expect("set ZONE_GLB to a baked zone glb");
         let za = ZoneAssets::from_glb(std::path::Path::new(&p)).unwrap();
-        assert!(!za.meshes.is_empty());
+        let all: Vec<MeshData> = za.terrain.iter().cloned().chain(expand_objects(&za.objects)).collect();
+        assert!(!all.is_empty());
         let tex_names: std::collections::HashSet<_> = za.textures.iter().map(|t| t.name.clone()).collect();
-        let linked = za.meshes.iter().filter(|m| m.texture_name.as_ref().map_or(false, |n| tex_names.contains(n))).count();
+        let linked = all.iter().filter(|m| m.texture_name.as_ref().map_or(false, |n| tex_names.contains(n))).count();
         assert!(linked > 0, "at least some meshes must resolve their texture by name");
     }
 }
@@ -916,7 +1011,7 @@ mod tests {
             return;
         }
         let assets = ZoneAssets::load(&path).expect("load failed");
-        assert!(!assets.meshes.is_empty(), "expected at least one mesh");
+        assert!(!assets.terrain.is_empty(), "expected at least one mesh");
     }
 
     #[test]
@@ -926,7 +1021,7 @@ mod tests {
             let path = PathBuf::from(format!("~/eq_assets/EQ_Files/{}.s3d", zone));
             if !path.exists() { continue; }
             let assets = ZoneAssets::load(&path).expect("load failed");
-            println!("\n=== {} ({} meshes, {} textures) ===", zone, assets.meshes.len(), assets.textures.len());
+            println!("\n=== {} ({} meshes, {} textures) ===", zone, assets.terrain.len(), assets.textures.len());
             let (mut xmin, mut xmax) = (f32::MAX, f32::MIN);
             let (mut ymin, mut ymax) = (f32::MAX, f32::MIN);
             let (mut zmin, mut zmax) = (f32::MAX, f32::MIN);
@@ -936,7 +1031,7 @@ mod tests {
             let (mut wxmin, mut wxmax) = (f32::MAX, f32::MIN);
             let (mut wymin, mut wymax) = (f32::MAX, f32::MIN);
             let (mut wzmin, mut wzmax) = (f32::MAX, f32::MIN);
-            for m in &assets.meshes {
+            for m in &assets.terrain {
                 total_verts += m.positions.len();
                 total_tris += m.indices.len() / 3;
                 for &[x, y, z] in &m.positions {
@@ -956,7 +1051,7 @@ mod tests {
             println!("  world center: ({:.1}, {:.1}, {:.1})",
                 (wxmin+wxmax)/2.0, (wymin+wymax)/2.0, (wzmin+wzmax)/2.0);
             // Print a sample mesh center to see if centers are non-zero
-            if let Some(m) = assets.meshes.first() {
+            if let Some(m) = assets.terrain.first() {
                 println!("  first mesh center: [{:.1}, {:.1}, {:.1}]",
                     m.center[0], m.center[1], m.center[2]);
             }
@@ -1003,7 +1098,7 @@ mod tests {
             base_color: [1.0; 4],
             center: [0.0, 0.0, 0.0],
         };
-        let assets = ZoneAssets { meshes: vec![floor, wall], textures: vec![] };
+        let assets = ZoneAssets { terrain: vec![floor, wall], objects: vec![], textures: vec![] };
         let col = Collision::build(&assets, 4.0);
 
         // Floor sampled under (3,3) is z=0, never the wall's height.
@@ -1018,7 +1113,7 @@ mod tests {
             "segment not reaching the wall should be clear");
 
         // Empty collision returns the fallback and never blocks.
-        let empty = Collision::build(&ZoneAssets { meshes: vec![], textures: vec![] }, 8.0);
+        let empty = Collision::build(&ZoneAssets { terrain: vec![], objects: vec![], textures: vec![] }, 8.0);
         assert_eq!(empty.floor_z(0.0, 0.0, -99.0), -99.0);
         assert!(!empty.segment_blocked([0.0, 0.0, 0.0], [10.0, 0.0, 0.0]));
         assert!(empty.path_clear([0.0, 0.0, 0.0], [10.0, 0.0, 0.0], 2.0),
@@ -1039,7 +1134,7 @@ mod tests {
             normals: vec![[0.0, 0.0, 1.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
         };
-        let col = Collision::build(&ZoneAssets { meshes: vec![floor, wall], textures: vec![] }, 2.0);
+        let col = Collision::build(&ZoneAssets { terrain: vec![floor, wall], objects: vec![], textures: vec![] }, 2.0);
         // The direct line (5,5)->(15,5) crosses the wall (north 5 < 14) → blocked.
         assert!(col.segment_blocked([5.0, 5.0, 3.0], [15.0, 5.0, 3.0]));
         // find_path routes AROUND the wall through the northern gap.
@@ -1079,7 +1174,7 @@ mod tests {
             base_color: [1.0; 4],
             center: [0.0, 0.0, 0.0],
         };
-        let col = Collision::build(&ZoneAssets { meshes: vec![wall], textures: vec![] }, 4.0);
+        let col = Collision::build(&ZoneAssets { terrain: vec![wall], objects: vec![], textures: vec![] }, 4.0);
         let chest = 3.0_f32;
 
         // Standing at east=3, stepping east toward the wall (to east=4.5) within the
@@ -1092,6 +1187,42 @@ mod tests {
         // Stepping away from the wall (west) is clear.
         assert!(col.path_clear([3.0, 5.0, chest], [1.5, 5.0, chest], 2.0),
             "stepping away from the wall should be clear");
+    }
+}
+
+#[cfg(test)]
+mod instanced_tests {
+    use super::*;
+    #[test]
+    fn expand_objects_applies_instance_matrices() {
+        let model = ObjectModel {
+            meshes: vec![MeshData {
+                positions: vec![[1.0,0.0,0.0]], normals: vec![[1.0,0.0,0.0]],
+                uvs: vec![[0.0,0.0]], indices: vec![0],
+                texture_name: Some("t.bmp".into()), base_color: [1.0;4], center: [0.0;3],
+            }],
+            // two instances: identity, and translate +10 in x (column-major: row3 col0..)
+            instances: vec![
+                [[1.,0.,0.,0.],[0.,1.,0.,0.],[0.,0.,1.,0.],[0.,0.,0.,1.]],
+                [[1.,0.,0.,0.],[0.,1.,0.,0.],[0.,0.,1.,0.],[10.,0.,0.,1.]],
+            ],
+        };
+        let out = expand_objects(std::slice::from_ref(&model));
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].positions[0], [1.0,0.0,0.0]);
+        assert_eq!(out[1].positions[0], [11.0,0.0,0.0]); // +10 x
+        assert_eq!(out[1].texture_name.as_deref(), Some("t.bmp"));
+    }
+
+    #[test]
+    #[ignore = "requires a baked instanced zone glb at $ZONE_GLB"]
+    fn from_glb_groups_instances() {
+        let p = std::env::var("ZONE_GLB").unwrap();
+        let za = ZoneAssets::from_glb(std::path::Path::new(&p)).unwrap();
+        assert!(!za.terrain.is_empty());
+        assert!(!za.objects.is_empty(), "expected object models");
+        let total_instances: usize = za.objects.iter().map(|o| o.instances.len()).sum();
+        assert!(total_instances >= za.objects.len(), "more placements than models");
     }
 }
 

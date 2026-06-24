@@ -471,14 +471,14 @@ impl ModelAsset {
         let assets = crate::assets::ZoneAssets::load(s3d_path)
             .with_context(|| format!("failed to load chr S3D: {}", s3d_path.display()))?;
 
-        if assets.meshes.is_empty() {
+        if assets.terrain.is_empty() {
             anyhow::bail!("no meshes found in {}", s3d_path.display());
         }
 
         // Compute y_bottom and y_extent from all mesh positions (world space).
         let mut y_min = f32::MAX;
         let mut y_max = f32::MIN;
-        for m in &assets.meshes {
+        for m in &assets.terrain {
             for &p in &m.positions {
                 let wy = p[1] + m.center[1]; // libeq: [east, height, north]
                 if wy < y_min { y_min = wy; }
@@ -491,7 +491,7 @@ impl ModelAsset {
         // Compute x/z center from all mesh positions.
         let (mut x_min, mut x_max) = (f32::MAX, f32::MIN);
         let (mut z_min, mut z_max) = (f32::MAX, f32::MIN);
-        for m in &assets.meshes {
+        for m in &assets.terrain {
             for &p in &m.positions {
                 let wx = p[0] + m.center[0];
                 let wz = p[2] + m.center[2];
@@ -504,13 +504,13 @@ impl ModelAsset {
         let x_center = if x_min <= x_max { (x_min + x_max) * 0.5 } else { 0.0 };
         let z_center = if z_min <= z_max { (z_min + z_max) * 0.5 } else { 0.0 };
 
-        let mesh_count = assets.meshes.len();
+        let mesh_count = assets.terrain.len();
         let tex_count = assets.textures.len();
         eprintln!("models: loaded chr model from {} ({} meshes, {} textures)",
                   s3d_path.display(), mesh_count, tex_count);
 
         Ok(ModelAsset {
-            meshes:            assets.meshes,
+            meshes:            assets.terrain,
             textures:          assets.textures,
             skin:              None,
             skin_meshes:       vec![],
