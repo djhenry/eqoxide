@@ -115,6 +115,12 @@ pub const OP_MANA_CHANGE: u16 = 0x4839;
 pub const OP_MEMORIZE_SPELL: u16 = 0x308e;
 pub const OP_INTERRUPT_CAST: u16 = 0x0000; // native/pass-through value
 
+// Pet control (Titanium): PetCommand_Struct { command:u32, target:u32 }. Command values from
+// EQEmu zone/common.h: PET_ATTACK=2, PET_GUARDHERE=5, PET_FOLLOWME=4(GetOwner), PET_BACKOFF=28.
+pub const OP_PET_COMMANDS: u16 = 0x10a1;
+pub const PET_ATTACK: u32 = 2;
+pub const PET_BACKOFF: u32 = 28;
+
 // Merchant/shop (Titanium): open a merchant, then buy an item from its inventory slot.
 pub const OP_SHOP_REQUEST: u16 = 0x45f9;     // MerchantClick_Struct (open/close)
 pub const OP_SHOP_PLAYER_BUY: u16 = 0x221e;  // Merchant_Sell_Struct (buy from slot)
