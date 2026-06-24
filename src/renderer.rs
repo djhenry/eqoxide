@@ -43,6 +43,9 @@ pub struct EqRenderer {
     pub pipelines:           crate::pipeline::Pipelines,
     pub camera_uniform:      crate::pipeline::CameraUniform,
     pub gpu_meshes:          Vec<crate::gpu::GpuMesh>,
+    /// GPU-instanced placed-object models: each model mesh uploaded once + an instance-transform
+    /// buffer, drawn with the `zone_instanced` pipeline.
+    pub gpu_instanced:       Vec<crate::gpu::GpuInstancedMesh>,
     pub gpu_textures:        Vec<crate::gpu::GpuTexture>,
     pub texture_names:       Vec<String>,
     pub texture_bind_groups: Vec<wgpu::BindGroup>,
@@ -133,6 +136,7 @@ impl EqRenderer {
             pipelines,
             camera_uniform,
             gpu_meshes: vec![],
+            gpu_instanced: vec![],
             gpu_textures: vec![],
             texture_names: vec![],
             texture_bind_groups: vec![],
@@ -177,10 +181,10 @@ impl EqRenderer {
             // Key uses texture_idx only; base_color is averaged across merges (usually all [1,1,1,1]).
             let mut groups: HashMap<Option<usize>, (Vec<Vertex>, Vec<u32>)> = HashMap::new();
 
-            // Terrain plus CPU-expanded instanced objects (GPU instancing lands in Task 4).
-            let expanded = crate::assets::expand_objects(&assets.objects);
-            let source_count = assets.terrain.len() + expanded.len();
-            for mesh in assets.terrain.iter().chain(expanded.iter()) {
+            // Terrain only — placed objects now go to the GPU-instanced path below
+            // (collision still uses terrain + expand_objects, unchanged).
+            let source_count = assets.terrain.len();
+            for mesh in assets.terrain.iter() {
                 if mesh.positions.is_empty() || mesh.indices.is_empty() { continue; }
 
                 let texture_idx = mesh.texture_name.as_ref()
@@ -232,6 +236,60 @@ impl EqRenderer {
 
         // Sort merged meshes so same-texture groups are contiguous (they already are, but be safe).
         self.gpu_meshes.sort_by_key(|m| m.texture_idx.map_or(usize::MAX, |i| i));
+
+        // Build GPU-instanced object models: each ObjectModel mesh is uploaded ONCE (in RAW
+        // libeq model-local space — the instanced shader applies the instance matrix and the
+        // libeq→render axis swizzle), plus a single instance-transform buffer for all placements.
+        {
+            let mut instanced: Vec<crate::gpu::GpuInstancedMesh> = Vec::new();
+            for model in &assets.objects {
+                if model.instances.is_empty() { continue; }
+                let instance_count = model.instances.len() as u32;
+                for mesh in &model.meshes {
+                    if mesh.positions.is_empty() || mesh.indices.is_empty() { continue; }
+                    // RAW positions/normals — NO axis swizzle (the shader does it). This differs
+                    // from the terrain merge, which swizzles CPU-side.
+                    let verts: Vec<Vertex> = mesh.positions.iter().enumerate().map(|(i, &p)| {
+                        let n = mesh.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
+                        Vertex {
+                            position: p,
+                            normal:   n,
+                            uv:       mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
+                        }
+                    }).collect();
+                    let vertex_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("object_vbuf"),
+                        contents: bytemuck::cast_slice(&verts),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+                    let index_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("object_ibuf"),
+                        contents: bytemuck::cast_slice(&mesh.indices),
+                        usage: wgpu::BufferUsages::INDEX,
+                    });
+                    let texture_idx = mesh.texture_name.as_ref()
+                        .and_then(|name| self.texture_names.iter().position(|t| t == name));
+                    // One instance buffer per mesh (wgpu::Buffer isn't Clone in this version;
+                    // all meshes of a model share the same instance set, but the buffer is tiny).
+                    let instance_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("object_instances"),
+                        contents: bytemuck::cast_slice(&model.instances),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    });
+                    instanced.push(crate::gpu::GpuInstancedMesh {
+                        vertex_buf,
+                        index_buf,
+                        index_count: mesh.indices.len() as u32,
+                        instance_buf,
+                        instance_count,
+                        texture_idx,
+                    });
+                }
+            }
+            eprintln!("renderer: built {} instanced object meshes from {} models",
+                instanced.len(), assets.objects.len());
+            self.gpu_instanced = instanced;
+        }
 
         // Retain CPU-side data for terrain height queries.
         self.zone_assets = Some(assets.clone());
