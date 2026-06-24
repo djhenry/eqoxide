@@ -168,6 +168,28 @@ pub fn encode_zone_pass(
         pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..mesh.index_count, 0, 0..1);
     }
+
+    // ── GPU-instanced placed objects ───────────────────────────────────────
+    pass.set_pipeline(&r.pipelines.zone_instanced);
+    pass.set_bind_group(0, &r.camera_uniform.bind_group, &[]);
+    pass.set_bind_group(1, &r.fallback_texture_bg, &[]);
+    let mut inst_tex: Option<usize> = None;
+    let mut inst_first = true;
+    for mesh in &r.gpu_instanced {
+        if inst_first || mesh.texture_idx != inst_tex {
+            inst_tex = mesh.texture_idx;
+            inst_first = false;
+            let bg = match inst_tex {
+                Some(idx) if idx < r.texture_bind_groups.len() => &r.texture_bind_groups[idx],
+                _ => &r.fallback_texture_bg,
+            };
+            pass.set_bind_group(1, bg, &[]);
+        }
+        pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+        pass.set_vertex_buffer(1, mesh.instance_buf.slice(..));
+        pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..mesh.index_count, 0, 0..mesh.instance_count);
+    }
 }
 
 /// Billboard pass for NPC entities that have no 3D model. Skipped if nothing to draw.

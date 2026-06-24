@@ -18,6 +18,7 @@ pub struct CameraUniform {
 pub struct Pipelines {
     pub sky:       wgpu::RenderPipeline,
     pub zone:      wgpu::RenderPipeline,
+    pub zone_instanced: wgpu::RenderPipeline,
     pub billboard: wgpu::RenderPipeline,
     pub character: wgpu::RenderPipeline,
     pub skinned:   wgpu::RenderPipeline,
@@ -163,6 +164,45 @@ pub fn build_pipelines(
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
             cull_mode: None,  // EQ zones are viewed from inside
+            ..Default::default()
+        },
+        depth_stencil: Some(depth.clone()),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None, cache: None,
+    });
+
+    // ── Zone instanced pipeline ────────────────────────────────────────────
+    // Same bind groups + targets as `zone`, but with a second (Instance step-mode)
+    // vertex buffer carrying a column-major 4×4 matrix as four Float32x4 attributes.
+    let instance_vbl = wgpu::VertexBufferLayout {
+        array_stride: 64,
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &wgpu::vertex_attr_array![
+            3 => Float32x4, 4 => Float32x4, 5 => Float32x4, 6 => Float32x4
+        ],
+    };
+    let zone_inst_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("zone_instanced"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/zone_instanced.wgsl").into()),
+    });
+    let zone_instanced = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("zone_instanced"),
+        layout: Some(&zone_layout),
+        vertex: wgpu::VertexState {
+            module: &zone_inst_shader, entry_point: "vs_main",
+            buffers: &[vbl.clone(), instance_vbl], compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &zone_inst_shader, entry_point: "fs_main",
+            targets: &[Some(wgpu::ColorTargetState {
+                format, blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            cull_mode: None,
             ..Default::default()
         },
         depth_stencil: Some(depth.clone()),
@@ -367,7 +407,7 @@ pub fn build_pipelines(
         multiview: None, cache: None,
     });
 
-    Pipelines { sky, zone, billboard, character, skinned, skinned_overlay }
+    Pipelines { sky, zone, zone_instanced, billboard, character, skinned, skinned_overlay }
 }
 
 #[cfg(test)]
@@ -396,6 +436,7 @@ mod tests {
         fn _check(p: &Pipelines) {
             let _: &wgpu::RenderPipeline = &p.sky;
             let _: &wgpu::RenderPipeline = &p.zone;
+            let _: &wgpu::RenderPipeline = &p.zone_instanced;
             let _: &wgpu::RenderPipeline = &p.billboard;
             let _: &wgpu::RenderPipeline = &p.character;
         }

@@ -25,6 +25,18 @@ pub struct GpuMesh {
     pub base_color:  [f32; 4],
 }
 
+/// A zone object model uploaded once and drawn instanced: one vertex/index buffer for the model
+/// mesh (in RAW libeq model-local space — the instanced shader applies the per-instance matrix and
+/// the libeq→render axis swizzle), plus an instance-transform buffer of column-major 4×4 matrices.
+pub struct GpuInstancedMesh {
+    pub vertex_buf:     wgpu::Buffer,
+    pub index_buf:      wgpu::Buffer,
+    pub index_count:    u32,
+    pub instance_buf:   wgpu::Buffer,   // contents: Vec<[[f32;4];4]> column-major
+    pub instance_count: u32,
+    pub texture_idx:    Option<usize>,
+}
+
 /// A held item (weapon) model loaded from gequip*.s3d, cached by IDFile and drawn at a hand bone
 /// with the static/character pipeline. `texture_bind_groups` is parallel to the textures; each
 /// mesh's `texture_idx` indexes into it.
