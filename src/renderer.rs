@@ -561,7 +561,7 @@ impl EqRenderer {
             if prefix.is_empty() { continue; }
             for es in slots.iter().flatten() {
                 let mat = b.equipment[es.slot];
-                for m in std::iter::once(mat).chain(crate::models::velious_material_fallback(mat)) {
+                for m in std::iter::once(mat).chain(crate::models::velious_material_fallback(mat)).chain(std::iter::once(0u32)) {
                     if let Some(key) = equip_swap_key(prefix, *es, m) {
                         if !self.equipment_tex_cache.contains_key(&key) {
                             needed.push(key);
@@ -580,7 +580,7 @@ impl EqRenderer {
                 if !prefix.is_empty() {
                     for es in slots.iter().flatten() {
                         let mat = scene.player_equipment[es.slot];
-                        for m in std::iter::once(mat).chain(crate::models::velious_material_fallback(mat)) {
+                        for m in std::iter::once(mat).chain(crate::models::velious_material_fallback(mat)).chain(std::iter::once(0u32)) {
                             if let Some(key) = equip_swap_key(prefix, *es, m) {
                                 if !self.equipment_tex_cache.contains_key(&key) {
                                     needed.push(key);
