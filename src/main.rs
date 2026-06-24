@@ -79,6 +79,9 @@ fn main() {
     let target:           http::TargetReq       = Arc::new(Mutex::new(None));
     let attack:           http::AttackReq       = Arc::new(Mutex::new(None));
     let buy:              http::BuyReq          = Arc::new(Mutex::new(None));
+    let sell:             http::SellReq         = Arc::new(Mutex::new(None));
+    let trade:            http::TradeReq        = Arc::new(Mutex::new(None));
+    let merchant:         http::MerchantShared  = Arc::new(Mutex::new(http::MerchantSnapshot::default()));
     let move_req:         http::MoveReq         = Arc::new(Mutex::new(None));
     let give:             http::GiveReq         = Arc::new(Mutex::new(None));
     let inventory:        http::InventoryShared = Arc::new(Mutex::new(Vec::new()));
@@ -116,6 +119,9 @@ fn main() {
         let tg  = target.clone();
         let at  = attack.clone();
         let by  = buy.clone();
+        let sl  = sell.clone();
+        let tr  = trade.clone();
+        let mc  = merchant.clone();
         let mv  = move_req.clone();
         let gv  = give.clone();
         let iv  = inventory.clone();
@@ -132,7 +138,7 @@ fn main() {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, zc, hl, sy, tg, at, by, mv, gv, iv, lt, dc, ds, mg, ca, st, co, sc, md, sd).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, zc, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, ca, st, co, sc, md, sd).await {
                     tracing::error!("EQ: fatal: {e}");
                 }
             });
@@ -148,6 +154,9 @@ fn main() {
     let app_cast    = cast.clone();
     let app_sit     = sit.clone();
     let app_consider = consider.clone();
+    let app_buy     = buy.clone();
+    let app_sell    = sell.clone();
+    let app_trade   = trade.clone();
     let app_spells  = spells.clone();
     let app_door_click = door_click.clone();
     let app_player_info = player_info.clone();
@@ -169,6 +178,9 @@ fn main() {
         sit.clone(),
         consider.clone(),
         buy,
+        sell,
+        trade,
+        merchant,
         move_req,
         give,
         inventory,
@@ -200,6 +212,9 @@ fn main() {
         app_cast,
         app_sit,
         app_consider,
+        app_buy,
+        app_sell,
+        app_trade,
         app_spells,
         app_door_click,
         shared_collision,

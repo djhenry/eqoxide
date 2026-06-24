@@ -70,6 +70,26 @@ pub type AttackReq = Arc<Mutex<Option<bool>>>;
 /// Nav thread reads it and sends OP_ShopRequest (open) + OP_ShopPlayerBuy (buy that slot).
 pub type BuyReq = Arc<Mutex<Option<(u32, u32)>>>;
 
+/// Sell request — (merchant spawn id, player inventory slot, quantity), set by POST /trade/sell.
+/// Nav thread reads it and sends OP_ShopRequest (open) + OP_ShopPlayerSell (sell that slot).
+pub type SellReq = Arc<Mutex<Option<(u32, u32, u32)>>>;
+
+/// Open/close a merchant window. `Open(merchant_id)` from POST /trade/open; `Close` from
+/// POST /trade/close. The nav thread sends OP_ShopRequest (command 1/0).
+#[derive(Clone, Copy)]
+pub enum TradeCmd { Open(u32), Close }
+pub type TradeReq = Arc<Mutex<Option<TradeCmd>>>;
+
+/// Live merchant-session snapshot published each nav tick, read by GET /trade/list and used for
+/// the HUD merchant window. `open` mirrors `GameState::merchant_open`.
+#[derive(Default, Clone, serde::Serialize)]
+pub struct MerchantSnapshot {
+    pub open: bool,
+    pub merchant_id: Option<u32>,
+    pub items: Vec<crate::game_state::MerchantItem>,
+}
+pub type MerchantShared = Arc<Mutex<MerchantSnapshot>>;
+
 /// Move-item request — (from_slot, to_slot), set by POST /inventory/move.
 /// Nav thread reads it and sends OP_MoveItem (MoveItem_Struct, number_in_stack=1).
 /// Used to equip/unequip/rearrange items (e.g. boots in bag slot 23 -> worn slot 19).
@@ -174,6 +194,9 @@ struct HttpState {
     sit:              SitReq,
     consider:         ConsiderReq,
     buy:              BuyReq,
+    sell:             SellReq,
+    trade:            TradeReq,
+    merchant:         MerchantShared,
     move_req:         MoveReq,
     give:             GiveReq,
     inventory:        InventoryShared,
@@ -226,6 +249,9 @@ pub fn spawn_camera_server(
     sit:              SitReq,
     consider:         ConsiderReq,
     buy:              BuyReq,
+    sell:             SellReq,
+    trade:            TradeReq,
+    merchant:         MerchantShared,
     move_req:         MoveReq,
     give:             GiveReq,
     inventory:        InventoryShared,
@@ -242,7 +268,7 @@ pub fn spawn_camera_server(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, cast, sit, consider, buy, move_req, give, inventory, loot, messages, spells, player_info, task_log, shutdown, door_click, doors_shared };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, cast, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, spells, player_info, task_log, shutdown, door_click, doors_shared };
             let app = Router::new()
                 .route("/camera", get(get_camera).post(post_camera))
                 .route("/camera/reset", post(post_camera_reset))
@@ -264,7 +290,14 @@ pub fn spawn_camera_server(
                 .route("/sit", post(post_sit))
                 .route("/stand", post(post_stand))
                 .route("/consider", post(post_consider))
+                // Vendor/trade API. /buy and /sell remain as back-compat aliases.
+                .route("/trade/buy", post(post_buy))
+                .route("/trade/sell", post(post_sell))
+                .route("/trade/open", post(post_trade_open))
+                .route("/trade/close", post(post_trade_close))
+                .route("/trade/list", get(get_trade_list))
                 .route("/buy", post(post_buy))
+                .route("/sell", post(post_sell))
                 .route("/inventory/move", post(post_move))
                 .route("/give", post(post_give))
                 .route("/inventory", get(get_inventory))
@@ -730,6 +763,94 @@ async fn post_buy(
         }
         None => (StatusCode::NOT_FOUND, format!("no merchant matching {:?}", b.merchant)),
     }
+}
+
+#[derive(serde::Deserialize)]
+struct SellBody {
+    /// Merchant NPC name (fuzzy-matched, like /buy).
+    merchant: String,
+    /// Player inventory slot of the item to sell (Titanium: 22-29 general, 251+ bag contents).
+    slot: u32,
+    /// Number to sell from the slot (stack count). Defaults to 1.
+    quantity: Option<u32>,
+}
+
+/// POST /sell {"merchant":"<name>","slot":N,"quantity":Q} — open the named merchant and sell the
+/// item in player inventory slot N (quantity Q, default 1). Must be within ~200u of the merchant.
+/// The nav thread sends OP_ShopRequest then OP_ShopPlayerSell (price computed server-side).
+async fn post_sell(
+    State(s): State<HttpState>,
+    body: Result<Json<SellBody>, axum::extract::rejection::JsonRejection>,
+) -> (StatusCode, String) {
+    let b = match body {
+        Ok(Json(b)) => b,
+        Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"merchant\":\"...\",\"slot\":N,\"quantity\":Q}".into()),
+    };
+    let qty = b.quantity.unwrap_or(1).max(1);
+    let ids = s.entity_ids.lock().unwrap();
+    let nl = b.merchant.to_lowercase();
+    let found = ids.iter()
+        .find(|(k, _)| clean_entity_name(k).to_lowercase().contains(&nl) || k.to_lowercase().contains(&nl))
+        .map(|(k, &id)| (k.clone(), id));
+    match found {
+        Some((key, id)) => {
+            *s.sell.lock().unwrap() = Some((id, b.slot, qty));
+            tracing::info!("sell: queued merchant {:?} (spawn_id={}) slot={} qty={}", key, id, b.slot, qty);
+            (StatusCode::OK, format!("selling slot {} x{} to {} (spawn_id={})", b.slot, qty, clean_entity_name(&key), id))
+        }
+        None => (StatusCode::NOT_FOUND, format!("no merchant matching {:?}", b.merchant)),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct TradeOpenBody {
+    /// Merchant NPC name (fuzzy-matched, like /trade/buy).
+    merchant: String,
+}
+
+/// POST /trade/open {"merchant":"<name>"} — open the named merchant's window (OP_ShopRequest).
+/// Must be within ~200u. The server replies Open (window opens, items arrive) or Close (refused,
+/// e.g. KOS faction); watch GET /trade/list `open` to see the result.
+async fn post_trade_open(
+    State(s): State<HttpState>,
+    body: Result<Json<TradeOpenBody>, axum::extract::rejection::JsonRejection>,
+) -> (StatusCode, String) {
+    let b = match body {
+        Ok(Json(b)) => b,
+        Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"merchant\":\"...\"}".into()),
+    };
+    let ids = s.entity_ids.lock().unwrap();
+    let nl = b.merchant.to_lowercase();
+    let found = ids.iter()
+        .find(|(k, _)| clean_entity_name(k).to_lowercase().contains(&nl) || k.to_lowercase().contains(&nl))
+        .map(|(k, &id)| (k.clone(), id));
+    match found {
+        Some((key, id)) => {
+            *s.trade.lock().unwrap() = Some(TradeCmd::Open(id));
+            tracing::info!("trade: queued open merchant {:?} (spawn_id={})", key, id);
+            (StatusCode::OK, format!("opening merchant {} (spawn_id={})", clean_entity_name(&key), id))
+        }
+        None => (StatusCode::NOT_FOUND, format!("no merchant matching {:?}", b.merchant)),
+    }
+}
+
+/// POST /trade/close — close the currently open merchant window (OP_ShopRequest command=Close).
+async fn post_trade_close(State(s): State<HttpState>) -> (StatusCode, String) {
+    *s.trade.lock().unwrap() = Some(TradeCmd::Close);
+    (StatusCode::OK, "closing merchant window".into())
+}
+
+/// GET /trade/list — the open merchant's offered items (for buying). Returns `{open, merchant_id,
+/// count, items:[{merchant_slot,item_id,name,icon,price,quantity}]}`. `open:false` means no
+/// merchant window is open (it was never opened, was closed, or the merchant refused, e.g. KOS).
+async fn get_trade_list(State(s): State<HttpState>) -> Json<serde_json::Value> {
+    let m = s.merchant.lock().unwrap();
+    Json(serde_json::json!({
+        "open": m.open,
+        "merchant_id": m.merchant_id,
+        "count": m.items.len(),
+        "items": m.items,
+    }))
 }
 
 #[derive(serde::Deserialize)]

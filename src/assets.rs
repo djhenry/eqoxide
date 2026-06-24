@@ -390,6 +390,60 @@ impl Collision {
         }
     }
 
+    /// Find the walkable floor height at `(east, north)` nearest to `ref_z`.
+    ///
+    /// Casts a vertical column over `[ref_z - down, ref_z + up]`, gathers EVERY triangle it
+    /// crosses, and returns the hit whose height is **closest to `ref_z`**. This is the surface
+    /// the player would actually stand on (or step to), and — unlike a single top-down ray —
+    /// it does NOT mistake an overhang/awning/bridge ABOVE the floor for the floor itself.
+    /// `up` bounds how far you can step UP onto a ledge; `down` how far you can drop. Returns
+    /// `None` when no surface exists in the band.
+    pub fn nearest_floor(&self, east: f32, north: f32, ref_z: f32, up: f32, down: f32) -> Option<f32> {
+        if self.cols == 0 { return None; }
+        let z_top = ref_z + up.max(0.0);
+        let z_bot = ref_z - down.max(0.0);
+        let from = [east, north, z_top];
+        let dir_z = z_bot - z_top; // negative (downward)
+        if dir_z.abs() < 1e-6 { return None; }
+        let eps = 1e-6_f32;
+        let cross = |a: [f32; 3], b: [f32; 3]| [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ];
+        let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let dir = [0.0, 0.0, dir_z];
+        let (c0, c1, r0, r1) = self.cell_range(east, north, east, north);
+        let mut best: Option<f32> = None;
+        for r in r0..=r1 {
+            for c in c0..=c1 {
+                for &ti in &self.cells[r * self.cols + c] {
+                    let tri = &self.tris[ti as usize];
+                    let (v0, v1, v2) = (tri[0], tri[1], tri[2]);
+                    let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
+                    let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
+                    let p = cross(dir, e2);
+                    let det = dot(e1, p);
+                    if det.abs() < eps { continue; }
+                    let inv = 1.0 / det;
+                    let tvec = [from[0] - v0[0], from[1] - v0[1], from[2] - v0[2]];
+                    let u = dot(tvec, p) * inv;
+                    if u < 0.0 || u > 1.0 { continue; }
+                    let q = cross(tvec, e1);
+                    let v = dot(dir, q) * inv;
+                    if v < 0.0 || u + v > 1.0 { continue; }
+                    let t = dot(e2, q) * inv;
+                    if !(0.0..=1.0).contains(&t) { continue; }
+                    let hit_z = z_top + t * dir_z;
+                    if best.map_or(true, |b| (hit_z - ref_z).abs() < (b - ref_z).abs()) {
+                        best = Some(hit_z);
+                    }
+                }
+            }
+        }
+        best
+    }
+
     /// Nearest geometry hit along segment `from → to`, as fraction `t ∈ (0,1]`.
     /// Both points are GPU world space `[east, north, height]`. Möller–Trumbore.
     pub fn nearest_hit_t(&self, from: [f32; 3], to: [f32; 3]) -> Option<f32> {
@@ -484,15 +538,17 @@ impl Collision {
             [self.origin[0] + (c as f32 + 0.5) * cell,
              self.origin[1] + (r as f32 + 0.5) * cell]
         };
-        // floor_z casts its probe ray DOWN from (fallback + 2) over ~100u, so we must probe near
-        // the working floor level. The probe FOLLOWS the terrain: each cell's floor is found
-        // relative to the floor of the cell we reached it from — so multi-level dungeons work even
-        // when the caller's start z is stale (the common case).
+        // The probe FOLLOWS the terrain: each cell's floor is found relative to the floor of the
+        // cell we reached it from (so multi-level dungeons work even when the caller's start z is
+        // stale, the common case). `nearest_floor` gathers ALL surfaces in the vertical column and
+        // snaps to the one closest to `ref_z` — so an overhang/awning/bridge ABOVE the walkable
+        // floor is never mistaken for the floor (the old single top-down ray grabbed the first hit
+        // and got trapped on ceiling geometry). `up` = max step-up onto a ledge; `down` = max drop.
+        const STEP_UP: f32 = 20.0;
+        const MAX_DROP: f32 = 100.0;
         let floor_near = |c: i32, r: i32, ref_z: f32| -> Option<f32> {
             let p = center(c, r);
-            let fb = ref_z + 20.0;
-            let z = self.floor_z(p[0], p[1], fb);
-            if (z - fb).abs() < 0.01 { None } else { Some(z) }
+            self.nearest_floor(p[0], p[1], ref_z, STEP_UP, MAX_DROP)
         };
         let (sc, sr) = to_cell(start[0], start[1]);
         let (gc, gr) = to_cell(goal[0], goal[1]);

@@ -106,6 +106,20 @@ pub struct InvItem {
     pub idfile:  String,
 }
 
+/// One item offered by an open merchant (decoded from OP_ItemPacket with PacketType=Merchant,
+/// sent by the server after a successful OP_ShopRequest). Drives `GET /trade/list` + the HUD
+/// merchant window. `merchant_slot` is the slot to pass to `POST /trade/buy`.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct MerchantItem {
+    pub merchant_slot: u32,
+    pub item_id: u32,
+    pub name:    String,
+    pub icon:    u32,
+    pub price:   u32,
+    /// Quantity the merchant stocks (-1 / large = effectively unlimited).
+    pub quantity: i32,
+}
+
 /// Active spell-cast in progress.
 #[derive(Debug, Clone)]
 pub struct CastState {
@@ -216,6 +230,14 @@ pub struct GameState {
     pub sitting: bool,
     /// True when auto-attack is enabled.
     pub auto_attack: bool,
+
+    // Merchant / trade session
+    /// `Some(merchant_entity_id)` while a merchant window is open (server accepted OP_ShopRequest
+    /// with command=Open); `None` when closed or the server rejected it (command=Close, e.g. KOS
+    /// faction). Drives the HUD merchant window's visibility + `GET /trade/list` `open` flag.
+    pub merchant_open: Option<u32>,
+    /// Items the open merchant offers (cleared on close). From OP_ItemPacket(PacketType=Merchant).
+    pub merchant_items: Vec<MerchantItem>,
 }
 
 impl GameState {

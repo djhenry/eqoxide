@@ -7,7 +7,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::{GameState, ZonePoint};
-use crate::http::{AttackReq, BuyReq, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, CastReq, SitReq, ConsiderReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
+use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, TradeCmd, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, CastReq, SitReq, ConsiderReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
 
 /// Pending state of a quest turn-in (POST /give). The trade window spans multiple nav ticks:
 /// we send OP_TradeRequest, then must wait for the server's OP_TradeRequestAck before moving the
@@ -142,6 +142,9 @@ pub struct Navigator {
     target:           TargetReq,
     attack:           AttackReq,
     buy:              BuyReq,
+    sell:             SellReq,
+    trade:            TradeReq,
+    merchant:         MerchantShared,
     move_req:         MoveReq,
     give:             GiveReq,
     cast:             CastReq,
@@ -188,6 +191,9 @@ impl Navigator {
         target:           TargetReq,
         attack:           AttackReq,
         buy:              BuyReq,
+        sell:             SellReq,
+        trade:            TradeReq,
+        merchant:         MerchantShared,
         move_req:         MoveReq,
         give:             GiveReq,
         inventory:        InventoryShared,
@@ -213,6 +219,9 @@ impl Navigator {
             target,
             attack,
             buy,
+            sell,
+            trade,
+            merchant,
             move_req,
             give,
             cast,
@@ -265,6 +274,16 @@ impl Navigator {
         let mut inv = self.inventory.lock().unwrap();
         inv.clear();
         inv.extend(gs.inventory.iter().cloned());
+    }
+
+    /// Publish the open-merchant session from `gs` into the shared slot (GET /trade/list + the HUD
+    /// merchant window).
+    pub fn sync_merchant(&self, gs: &GameState) {
+        let mut m = self.merchant.lock().unwrap();
+        m.open = gs.merchant_open.is_some();
+        m.merchant_id = gs.merchant_open;
+        m.items.clear();
+        m.items.extend(gs.merchant_items.iter().cloned());
     }
 
     /// Publish the in-game message log from `gs` into the shared slot (GET /messages), converting
@@ -521,8 +540,8 @@ impl Navigator {
         // merchant is open by the time the buy arrives. Must be within ~200u of the merchant.
         let buy_req = self.buy.lock().unwrap().take();
         if let Some((merchant_id, slot)) = buy_req {
-            // MerchantClick_Struct (24b): npc_id, player_id, command(1=open), rate, tab, unk.
-            let mut open = [0u8; 24];
+            // MerchantClick_Struct (16b): npc_id, player_id, command(1=open), rate.
+            let mut open = [0u8; 16]; // MerchantClick_Struct: npc_id, player_id, command, rate (16b)
             open[0..4].copy_from_slice(&merchant_id.to_le_bytes());
             open[4..8].copy_from_slice(&gs.player_id.to_le_bytes());
             open[8..12].copy_from_slice(&1u32.to_le_bytes());
@@ -536,6 +555,46 @@ impl Navigator {
             stream.send_app_packet(OP_SHOP_PLAYER_BUY, &buy);
             tracing::info!("EQ: shop buy — merchant_id={} slot={} qty=1", merchant_id, slot);
             gs.log_msg("merchant", &format!("Bought item (slot {})", slot));
+        }
+
+        // Merchant sell: open the merchant (OP_ShopRequest) then sell a player inventory slot
+        // (OP_ShopPlayerSell). Same sequencing as buy so the shop is open server-side first.
+        // Must be within ~200u of the merchant; the server computes the price (we send 0).
+        let sell_req = self.sell.lock().unwrap().take();
+        if let Some((merchant_id, slot, quantity)) = sell_req {
+            // MerchantClick_Struct (16b): npc_id, player_id, command(1=open), rate.
+            let mut open = [0u8; 16]; // MerchantClick_Struct: npc_id, player_id, command, rate (16b)
+            open[0..4].copy_from_slice(&merchant_id.to_le_bytes());
+            open[4..8].copy_from_slice(&gs.player_id.to_le_bytes());
+            open[8..12].copy_from_slice(&1u32.to_le_bytes());
+            stream.send_app_packet(OP_SHOP_REQUEST, &open);
+            // Merchant_Purchase_Struct (16b): npcid, itemslot(player slot), quantity, price.
+            let mut sell = [0u8; 16];
+            sell[0..4].copy_from_slice(&merchant_id.to_le_bytes());
+            sell[4..8].copy_from_slice(&slot.to_le_bytes());
+            sell[8..12].copy_from_slice(&quantity.to_le_bytes());
+            // price = 0: the server charges its own buy-back price.
+            stream.send_app_packet(OP_SHOP_PLAYER_SELL, &sell);
+            tracing::info!("EQ: shop sell — merchant_id={} slot={} qty={}", merchant_id, slot, quantity);
+            gs.log_msg("merchant", &format!("Sold item (slot {} x{})", slot, quantity));
+        }
+
+        // Open/close a merchant window (POST /trade/open, /trade/close). OP_ShopRequest with
+        // command=1 (open) or 0 (close). The server replies with OP_ShopRequest (Open/Close) +
+        // OP_ItemPacket(Merchant) items, decoded in packet_handler into gs.merchant_*.
+        let trade_req = self.trade.lock().unwrap().take();
+        if let Some(cmd) = trade_req {
+            let (merchant_id, command) = match cmd {
+                TradeCmd::Open(id) => (id, 1u32),
+                TradeCmd::Close    => (gs.merchant_open.unwrap_or(0), 0u32),
+            };
+            let mut open = [0u8; 16]; // MerchantClick_Struct: npc_id, player_id, command, rate (16b)
+            open[0..4].copy_from_slice(&merchant_id.to_le_bytes());
+            open[4..8].copy_from_slice(&gs.player_id.to_le_bytes());
+            open[8..12].copy_from_slice(&command.to_le_bytes());
+            stream.send_app_packet(OP_SHOP_REQUEST, &open);
+            tracing::info!("EQ: shop {} — merchant_id={}", if command == 1 { "open" } else { "close" }, merchant_id);
+            if command == 0 { gs.merchant_open = None; gs.merchant_items.clear(); }
         }
 
         // Move/equip/unequip an item between inventory slots (OP_MoveItem).

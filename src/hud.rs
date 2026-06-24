@@ -35,7 +35,7 @@ pub(crate) fn canvas_off(ctx: &egui::Context, align: egui::Align2, base: [f32; 2
 
 /// All managed (movable) HUD windows. Anchors/offsets reproduce the previous
 /// fixed layout, retuned so the windows no longer overlap on a 960x540 canvas.
-pub static WINDOW_SPECS: [WindowSpec; 7] = [
+pub static WINDOW_SPECS: [WindowSpec; 8] = [
     WindowSpec { id: "status_hud",   title: "Status",       default_anchor: egui::Align2::LEFT_BOTTOM,   default_offset: [0.0, 0.0],   default_size: None,                resizable: false },
     WindowSpec { id: "message_log",  title: "Messages",     default_anchor: egui::Align2::LEFT_BOTTOM,   default_offset: [0.0, -64.0], default_size: Some([480.0, 120.0]), resizable: true  },
     WindowSpec { id: "minimap",      title: "Map",          default_anchor: egui::Align2::RIGHT_TOP,     default_offset: [-10.0, 10.0],default_size: Some([200.0, 200.0]), resizable: true  },
@@ -43,6 +43,7 @@ pub static WINDOW_SPECS: [WindowSpec; 7] = [
     WindowSpec { id: "action_grid",  title: "Actions",      default_anchor: egui::Align2::CENTER_BOTTOM, default_offset: [0.0, -8.0],  default_size: None,                resizable: false },
     WindowSpec { id: "inventory",    title: "Inventory",    default_anchor: egui::Align2::LEFT_TOP,      default_offset: [8.0, 90.0],  default_size: Some([340.0, 420.0]), resizable: true  },
     WindowSpec { id: "npc_dialogue", title: "NPC Dialogue", default_anchor: egui::Align2::CENTER_TOP,    default_offset: [0.0, 36.0],  default_size: Some([460.0, 140.0]), resizable: true  },
+    WindowSpec { id: "merchant",     title: "Merchant",     default_anchor: egui::Align2::CENTER_CENTER, default_offset: [0.0, 0.0],   default_size: Some([420.0, 460.0]), resizable: true  },
 ];
 
 fn spec(id: &str) -> &'static WindowSpec {
@@ -525,6 +526,75 @@ pub fn draw_action_grid(
                     });
                 }
             }
+        });
+    });
+}
+
+/// Merchant window — shown only while a merchant session is open (`scene.merchant_open`). Left
+/// column: the merchant's wares with a Buy button each; right column: the player's general/bag
+/// inventory with a Sell button each. Buttons write the same request slots the `/trade/*` HTTP API
+/// uses (buy/sell/trade), so HUD and API stay in sync. A Close button ends the session.
+pub fn draw_merchant(
+    ctx:    &egui::Context,
+    layout: &mut UiLayout,
+    scene:  &SceneState,
+    buy:    &crate::http::BuyReq,
+    sell:   &crate::http::SellReq,
+    trade:  &crate::http::TradeReq,
+) {
+    let Some(merchant_id) = scene.merchant_open else { return };
+    let base = egui::Frame::none()
+        .fill(egui::Color32::from_black_alpha(220))
+        .inner_margin(egui::Margin::same(8.0));
+    managed_window(ctx, layout, spec("merchant"), base, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Merchant").strong().size(15.0));
+            if ui.button("Close").clicked() {
+                *trade.lock().unwrap() = Some(crate::http::TradeCmd::Close);
+            }
+        });
+        let coin = scene.coin;
+        ui.label(egui::RichText::new(format!(
+            "Your coin: {}p {}g {}s {}c", coin[0], coin[1], coin[2], coin[3]
+        )).size(11.0).color(egui::Color32::LIGHT_YELLOW));
+        ui.separator();
+        ui.columns(2, |cols| {
+            // ── Buy column: merchant wares ──
+            cols[0].label(egui::RichText::new("For sale").strong());
+            egui::ScrollArea::vertical().id_source("merch_buy").show(&mut cols[0], |ui| {
+                if scene.merchant_items.is_empty() {
+                    ui.label(egui::RichText::new("(no items / loading…)").weak().size(11.0));
+                }
+                for it in &scene.merchant_items {
+                    ui.horizontal(|ui| {
+                        let label = format!("{} ({}p{}g{}s{}c)",
+                            it.name,
+                            it.price / 1000, (it.price / 100) % 10,
+                            (it.price / 10) % 10, it.price % 10);
+                        if ui.add(egui::Button::new(egui::RichText::new("Buy").size(10.0))).clicked() {
+                            *buy.lock().unwrap() = Some((merchant_id, it.merchant_slot));
+                        }
+                        ui.label(egui::RichText::new(label).size(11.0));
+                    });
+                }
+            });
+            // ── Sell column: player's general/bag inventory (slot >= 22) ──
+            cols[1].label(egui::RichText::new("Your items").strong());
+            egui::ScrollArea::vertical().id_source("merch_sell").show(&mut cols[1], |ui| {
+                let sellable: Vec<_> = scene.inventory.iter().filter(|i| i.slot >= 22).collect();
+                if sellable.is_empty() {
+                    ui.label(egui::RichText::new("(nothing to sell)").weak().size(11.0));
+                }
+                for it in sellable {
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new(egui::RichText::new("Sell").size(10.0))).clicked() {
+                            *sell.lock().unwrap() = Some((merchant_id, it.slot as u32, it.charges.max(1) as u32));
+                        }
+                        let qty = if it.charges > 1 { format!(" x{}", it.charges) } else { String::new() };
+                        ui.label(egui::RichText::new(format!("{}{}", it.name, qty)).size(11.0));
+                    });
+                }
+            });
         });
     });
 }

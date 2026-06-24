@@ -118,6 +118,8 @@ pub const OP_INTERRUPT_CAST: u16 = 0x0000; // native/pass-through value
 // Merchant/shop (Titanium): open a merchant, then buy an item from its inventory slot.
 pub const OP_SHOP_REQUEST: u16 = 0x45f9;     // MerchantClick_Struct (open/close)
 pub const OP_SHOP_PLAYER_BUY: u16 = 0x221e;  // Merchant_Sell_Struct (buy from slot)
+pub const OP_SHOP_PLAYER_SELL: u16 = 0x0e13; // Merchant_Purchase_Struct (sell a player inventory slot)
+pub const OP_SHOP_END: u16 = 0x7e03;         // server confirms the merchant window closed
 
 // Move/equip/unequip an item between inventory slots (Titanium).
 pub const OP_MOVE_ITEM: u16 = 0x420f;        // MoveItem_Struct (from_slot,to_slot,number_in_stack)
