@@ -56,6 +56,7 @@ pub async fn run_gameplay_phase(
             navigator.sync_tasks(&gs);
             navigator.sync_inventory(&gs);
             navigator.sync_messages(&gs);
+            navigator.sync_doors(&gs);
             let _ = app_tx.send(packet.clone());
 
             match packet.opcode {

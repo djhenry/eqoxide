@@ -7,7 +7,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::{GameState, ZonePoint};
-use crate::http::{AttackReq, BuyReq, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, CastReq, SitReq, ConsiderReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
+use crate::http::{AttackReq, BuyReq, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, CastReq, SitReq, ConsiderReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
 
 /// Pending state of a quest turn-in (POST /give). The trade window spans multiple nav ticks:
 /// we send OP_TradeRequest, then must wait for the server's OP_TradeRequestAck before moving the
@@ -53,6 +53,19 @@ pub fn build_spawn_appearance_packet(spawn_id: u16, kind: u16, parameter: u32) -
     buf[0..2].copy_from_slice(&spawn_id.to_le_bytes());
     buf[2..4].copy_from_slice(&kind.to_le_bytes());
     buf[4..8].copy_from_slice(&parameter.to_le_bytes());
+    buf
+}
+
+/// OP_ClickDoor payload: ClickDoor_Struct (16 bytes). The lite client is an observer —
+/// picklockskill and item_id are 0; the server only uses doorid for lookup and reads
+/// skills/inventory from the Client object. player_id is our own spawn id (u16).
+pub fn build_click_door(door_id: u8, player_id: u32) -> Vec<u8> {
+    let mut buf = vec![0u8; 16];
+    buf[0] = door_id;                                       // doorid @0x00
+    // [1..4] action/unknown = 0
+    buf[4] = 0;                                             // picklockskill @0x04
+    // [8..12] item_id = 0
+    buf[12..14].copy_from_slice(&(player_id as u16).to_le_bytes()); // player_id @0x0c
     buf
 }
 
@@ -141,6 +154,9 @@ pub struct Navigator {
     /// POST /loot corpse request (drained into gs.pending_loot to reuse the auto-loot loop).
     inventory:        InventoryShared,
     loot:             LootReq,
+    door_click:       DoorClickReq,
+    /// Snapshot of the current zone's doors, published each tick for GET /doors.
+    doors_shared:     DoorsShared,
     messages:         MessagesShared,
     collision:        crate::assets::SharedCollision,
     maps_dir:         std::path::PathBuf,
@@ -176,6 +192,8 @@ impl Navigator {
         give:             GiveReq,
         inventory:        InventoryShared,
         loot:             LootReq,
+        door_click:       DoorClickReq,
+        doors_shared:     DoorsShared,
         messages:         MessagesShared,
         cast:             CastReq,
         sit:              SitReq,
@@ -203,6 +221,8 @@ impl Navigator {
             give_state: None,
             inventory,
             loot,
+            door_click,
+            doors_shared,
             messages,
             collision,
             maps_dir,
@@ -260,6 +280,17 @@ impl Navigator {
                 .filter(|k| !k.is_empty())
                 .collect();
             crate::http::MessageEntry { kind: m.kind.clone(), text: m.text.clone(), keywords }
+        }));
+    }
+
+    /// Publish the current zone's doors from `gs` into the shared slot (GET /doors).
+    pub fn sync_doors(&self, gs: &GameState) {
+        let mut out = self.doors_shared.lock().unwrap();
+        out.clear();
+        out.extend(gs.doors.values().map(|d| crate::http::DoorView {
+            door_id: d.door_id, name: d.name.clone(),
+            x: d.x, y: d.y, z: d.z, heading: d.heading,
+            opentype: d.opentype, is_open: d.is_open,
         }));
     }
 
@@ -336,6 +367,14 @@ impl Navigator {
             eprintln!("loot: queued corpse_id={} for looting (via POST /loot)", corpse_id);
         }
 
+        // POST /doors/click or a human door click: send OP_ClickDoor. The door opens
+        // visually only when the server replies with OP_MoveDoor.
+        if let Some(door_id) = self.door_click.lock().unwrap().take() {
+            stream.send_app_packet(OP_CLICK_DOOR, &build_click_door(door_id, gs.player_id));
+            eprintln!("EQ: click door_id={}", door_id);
+            gs.log_msg("door", &format!("Clicked door {}", door_id));
+        }
+
         // Check zone-cross request — warp onto a zone line, then send OP_ZONE_CHANGE.
         let cross_req = self.zone_cross.lock().unwrap().take();
         if let Some(want_zone) = cross_req {
@@ -394,6 +433,14 @@ impl Navigator {
                 self.last_zone_cross = Instant::now();
             }
             }
+        }
+
+        // Server-initiated zone change (portal door etc.): begin the normal zone-change
+        // handshake to the requested destination, reusing the zone-cross path.
+        if let Some(dest_zone) = gs.pending_server_zone.take() {
+            eprintln!("EQ: server-requested zone change → zone_id={dest_zone}");
+            self.send_zone_change_packet(stream, gs, dest_zone);
+            self.last_zone_cross = Instant::now();
         }
 
         // Check hail request — say "Hail, <name>" so a nearby NPC fires its hail script.
@@ -934,5 +981,21 @@ mod tests {
         assert_eq!(&p[0..2], &77u16.to_le_bytes());
         assert_eq!(&p[2..4], &14u16.to_le_bytes());
         assert_eq!(&p[4..8], &110u32.to_le_bytes());
+    }
+}
+
+#[cfg(test)]
+mod door_tests {
+    use super::*;
+
+    #[test]
+    fn click_door_layout() {
+        let pkt = build_click_door(7, 0x1234);
+        assert_eq!(pkt.len(), 16);
+        assert_eq!(pkt[0], 7);            // doorid @0
+        assert_eq!(pkt[4], 0);            // picklockskill @4 = 0 (observer)
+        assert_eq!(&pkt[8..12], &[0, 0, 0, 0]); // item_id @8 = 0
+        assert_eq!(&pkt[12..14], &0x1234u16.to_le_bytes()); // player_id @12
+        assert_eq!(&pkt[14..16], &[0, 0]); // trailing unknowns zero
     }
 }

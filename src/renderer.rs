@@ -29,8 +29,47 @@ pub const PLAYER_UNIFORM_SLOTS: usize = 32;
 pub const TOTAL_ENTITY_UNIFORM_SLOTS: usize = 4128; // 32 player + 4096 entity mesh draws
 /// Pre-allocated joint buffer pool size. Slot 0 = player, 1..N = entities.
 pub const JOINT_BUF_SLOTS: usize = 512;
+/// Dedicated uniform slot count for doors (one slot per door mesh draw this frame).
+/// Sized generously; far more than any zone's door count × meshes-per-door.
+pub const DOOR_UNIFORM_SLOTS: usize = 512;
 /// Size of one joint buffer: 128 joints × mat4(64 bytes).
 pub const JOINT_BUF_BYTES: u64 = 128 * 64;
+
+/// Build a unit cube GpuMesh (~2 units per side, centered at origin), used as the door
+/// fallback marker. Positions are already in render space; the door pass translates it to
+/// the door position via the per-draw model matrix.
+fn build_unit_cube(device: &wgpu::Device) -> GpuMesh {
+    use wgpu::util::DeviceExt;
+    const S: f32 = 1.0; // half-extent → ~2 unit cube
+    // 8 corners; normals are coarse (radial) — fallback box only, lighting need not be exact.
+    let corners: [[f32; 3]; 8] = [
+        [-S, -S, -S], [S, -S, -S], [S, S, -S], [-S, S, -S],
+        [-S, -S,  S], [S, -S,  S], [S, S,  S], [-S, S,  S],
+    ];
+    let verts: Vec<Vertex> = corners.iter().map(|&p| {
+        let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt().max(1e-6);
+        Vertex { position: p, normal: [p[0] / len, p[1] / len, p[2] / len], uv: [0.0, 0.0] }
+    }).collect();
+    // 12 triangles (two per face), CCW-ish; the fallback marker isn't backface-culled critically.
+    let indices: [u32; 36] = [
+        0, 1, 2, 0, 2, 3, // -Z
+        4, 6, 5, 4, 7, 6, // +Z
+        0, 4, 5, 0, 5, 1, // -Y
+        3, 2, 6, 3, 6, 7, // +Y
+        0, 3, 7, 0, 7, 4, // -X
+        1, 5, 6, 1, 6, 2, // +X
+    ];
+    let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("door_fallback_vbuf"), contents: bytemuck::cast_slice(&verts),
+        usage: wgpu::BufferUsages::VERTEX });
+    let index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("door_fallback_ibuf"), contents: bytemuck::cast_slice(&indices),
+        usage: wgpu::BufferUsages::INDEX });
+    GpuMesh {
+        vertex_buf, index_buf, index_count: indices.len() as u32,
+        texture_idx: None, base_color: [0.8, 0.2, 0.2, 1.0], // reddish so it's obviously a marker
+    }
+}
 
 /// All GPU resources for the currently-loaded zone: the wgpu device/queue/surface, uploaded zone +
 /// placed-object meshes, character models + textures, pipelines/layouts, and per-entity animation
@@ -72,6 +111,17 @@ pub struct EqRenderer {
     pub assets_path: std::path::PathBuf,
     /// Held weapon models cached by IDFile. `None` = tried and not found (negative cache).
     pub weapon_cache: std::collections::HashMap<String, Option<crate::gpu::GpuWeapon>>,
+    /// Door object models, keyed by UPPERCASE base name (e.g. "DOOR1"). Rebuilt per zone load.
+    /// Drawn untextured with the fallback texture + per-mesh base_color (object models from
+    /// `load_object_models` do not carry decoded textures the way weapons do).
+    pub door_models: std::collections::HashMap<String, crate::gpu::GpuWeapon>,
+    /// Dedicated per-frame uniform pool for door draws (kept separate from the entity pool to
+    /// avoid frame-collision with the entity pass).
+    pub door_uniform_pool: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
+    /// Door model names we've already warned about as missing (warn once per name).
+    warned_missing_doors: std::collections::HashSet<String>,
+    /// Unit cube (~2 units) drawn at a door's position when its model is missing.
+    pub door_fallback: Option<crate::gpu::GpuMesh>,
 }
 
 impl EqRenderer {
@@ -128,6 +178,28 @@ impl EqRenderer {
                 (buf, bg)
             }).collect();
 
+        // Pre-allocate the dedicated door uniform pool (mirrors the entity pool).
+        let door_uniform_pool: Vec<(wgpu::Buffer, wgpu::BindGroup)> =
+            (0..DOOR_UNIFORM_SLOTS).map(|_| {
+                let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label:              Some("door_uniform_pool"),
+                    size:               std::mem::size_of::<crate::gpu::EntityUniform>() as u64,
+                    usage:              wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label:  Some("door_uniform_pool_bg"),
+                    layout: &layouts.entity_bgl,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0, resource: buf.as_entire_binding(),
+                    }],
+                });
+                (buf, bg)
+            }).collect();
+
+        // Build the fallback door cube once (~2 units to a side, centered at origin).
+        let door_fallback = Some(build_unit_cube(&device));
+
         Self {
             device,
             queue,
@@ -158,6 +230,10 @@ impl EqRenderer {
             equipment_tex_cache: std::collections::HashMap::new(),
             assets_path: std::path::PathBuf::new(),
             weapon_cache: std::collections::HashMap::new(),
+            door_models: std::collections::HashMap::new(),
+            door_uniform_pool,
+            warned_missing_doors: std::collections::HashSet::new(),
+            door_fallback,
         }
     }
 
@@ -601,6 +677,72 @@ impl EqRenderer {
         }
     }
 
+    /// Load + GPU-upload the door/object models for a zone. Clears any previously loaded
+    /// door models first (zone reload). Models are uploaded with the same libeq→render axis
+    /// swap as weapons/zone meshes. Object models from `load_object_models` do not carry
+    /// decoded textures, so doors are drawn untextured (fallback texture + per-mesh base_color)
+    /// in `encode_door_pass`; geometry/placement correctness matters most this task.
+    pub fn load_door_models(&mut self, main_s3d: &std::path::Path, obj_s3d: &std::path::Path) {
+        use wgpu::util::DeviceExt;
+        self.door_models.clear();
+        self.warned_missing_doors.clear();
+
+        let models = match crate::assets::load_object_models(main_s3d, obj_s3d) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("doors: load_object_models failed ({}); doors will use fallback boxes", e);
+                return;
+            }
+        };
+
+        for (name, meshes) in models {
+            let mut gpu_meshes = Vec::new();
+            for m in &meshes {
+                if m.positions.is_empty() || m.indices.is_empty() { continue; }
+                let [cx, cy, cz] = m.center;
+                // libeq [p0,p1,p2] -> render [p2,p0,p1] (same axis convention as weapons/zone).
+                let verts: Vec<Vertex> = m.positions.iter().enumerate().map(|(i, &p)| {
+                    let n = m.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
+                    Vertex {
+                        position: [p[2] + cz, p[0] + cx, p[1] + cy],
+                        normal:   [n[2], n[0], n[1]],
+                        uv:       m.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
+                    }
+                }).collect();
+                let vertex_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("door_vbuf"), contents: bytemuck::cast_slice(&verts),
+                    usage: wgpu::BufferUsages::VERTEX });
+                let index_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("door_ibuf"), contents: bytemuck::cast_slice(&m.indices),
+                    usage: wgpu::BufferUsages::INDEX });
+                gpu_meshes.push(GpuMesh {
+                    vertex_buf, index_buf, index_count: m.indices.len() as u32,
+                    // No carried textures: draw untextured (texture_idx None -> fallback texture bg).
+                    texture_idx: None, base_color: m.base_color });
+            }
+            if gpu_meshes.is_empty() { continue; }
+            // texture_bind_groups intentionally empty — doors render with the fallback texture.
+            self.door_models.insert(name, crate::gpu::GpuWeapon {
+                meshes: gpu_meshes, texture_bind_groups: Vec::new() });
+        }
+        eprintln!("doors: loaded {} door/object models", self.door_models.len());
+    }
+
+    /// Pre-pass (mutable): warn once per door whose model is missing from `door_models`.
+    /// Runs before the immutable render passes (door names come from the live scene, so we
+    /// can only know which are missing once we have the scene). The draw pass itself stays
+    /// immutable and silently substitutes the fallback box.
+    pub fn note_missing_door_models(&mut self, scene: &crate::scene::SceneState) {
+        for door in &scene.doors {
+            let key = door.name.to_uppercase();
+            if !self.door_models.contains_key(&key)
+                && self.warned_missing_doors.insert(door.name.clone()) {
+                eprintln!("doors: missing model {:?} for door {} — using fallback box",
+                          door.name, door.door_id);
+            }
+        }
+    }
+
     /// Encode all render passes for one frame in correct depth order.
     /// Camera is computed here and stored on self for HUD label projection.
     pub fn render_frame(
@@ -684,6 +826,7 @@ impl EqRenderer {
         let up    = right.cross(fwd).normalize();
 
         self.ensure_equipment_textures(scene);
+        self.note_missing_door_models(scene);
         // Ensure the player's equipped weapon models are loaded (cached by IDFile).
         let (wp, ws) = (scene.primary_weapon_idfile.clone(), scene.secondary_weapon_idfile.clone());
         if !wp.is_empty() { self.ensure_weapon(&wp); }
@@ -691,6 +834,7 @@ impl EqRenderer {
 
         crate::pass::encode_sky_pass(self, encoder, view);
         crate::pass::encode_zone_pass(self, encoder, view, scene);
+        crate::pass::encode_door_pass(self, encoder, view, scene);
         crate::pass::encode_billboard_pass(self, encoder, view, scene,
                                            right.to_array(), up.to_array());
         crate::pass::encode_player_pass(self, encoder, view, scene,

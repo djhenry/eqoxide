@@ -31,6 +31,13 @@ struct PendingLoad {
     zone_max:  [f32; 2],
 }
 
+/// Result of a left-click pick test: the nearest entity or door the ray hit, if any.
+#[derive(Clone, Copy)]
+pub enum PickResult {
+    Entity(u32),
+    Door(u8),
+}
+
 /// The winit `ApplicationHandler` and root of the render half. Owns the window + GPU surface, the
 /// `EqRenderer`, the per-frame `SceneState`, camera state, input state, and the shared request
 /// slots / packet receiver that connect it to the HTTP and EQ-network threads. Its event-loop
@@ -90,6 +97,8 @@ pub struct App {
     sit:          crate::http::SitReq,
     consider:     crate::http::ConsiderReq,
     spells:       std::sync::Arc<crate::spells::SpellDb>,
+    /// Shared door-click request slot; the nav thread drains it and sends OP_ClickDoor.
+    door_click:   crate::http::DoorClickReq,
     /// Text buffer for the HUD say box.
     say_buffer:   String,
     // Mouse
@@ -182,6 +191,7 @@ impl App {
         sit:             crate::http::SitReq,
         consider:        crate::http::ConsiderReq,
         spells:          std::sync::Arc<crate::spells::SpellDb>,
+        door_click:      crate::http::DoorClickReq,
         shared_collision: assets::SharedCollision,
         player_info:     crate::http::PlayerInfo,
         warp:            crate::http::WarpReq,
@@ -220,7 +230,7 @@ impl App {
             fps_timer: std::time::Instant::now(),
             current_fps: 0.0,
             keys_held: std::collections::HashSet::new(),             override_pos: None, warp_cooldown: 0, goto_target,
-            hail, say, target, attack, cast, sit, consider, spells, say_buffer: String::new(),
+            hail, say, target, attack, cast, sit, consider, spells, door_click, say_buffer: String::new(),
             drag_active: false, last_cursor: winit::dpi::PhysicalPosition::new(0.0, 0.0),
             click_start: None,
             pick_view_proj: [
@@ -274,7 +284,7 @@ impl App {
 
     /// Cast a ray from the camera through screen pixel `cursor` and return the
     /// spawn_id of the closest entity whose bounding sphere it intersects.
-    fn pick_at(&self, cursor: winit::dpi::PhysicalPosition<f64>) -> Option<u32> {
+    fn pick_at(&self, cursor: winit::dpi::PhysicalPosition<f64>) -> Option<PickResult> {
         let w = self.pick_screen_w as f32;
         let h = self.pick_screen_h as f32;
         if w < 1.0 || h < 1.0 { return None; }
@@ -303,8 +313,8 @@ impl App {
         // Test entities as bounding spheres in GPU world space [east, north, z].
         // Entity pos = [e.x=east, e.y=north] (game_state.rs).
         const SPHERE_R: f32 = 4.0;
-        let mut best_t  = f32::MAX;
-        let mut best_id = None;
+        let mut best_t = f32::MAX;
+        let mut best: Option<PickResult> = None;
 
         for (&id, e) in &self.game_state.entities {
             if e.dead { continue; }
@@ -317,12 +327,28 @@ impl App {
             if disc < 0.0 { continue; }
             let t = -b - disc.sqrt();
             if t > 0.0 && t < best_t {
-                best_t  = t;
-                best_id = Some(id);
+                best_t = t;
+                best   = Some(PickResult::Entity(id));
             }
         }
 
-        best_id
+        // Doors as bounding spheres (center lifted ~2 units; radius ~person-sized).
+        const DOOR_R: f32 = 3.0;
+        for d in self.game_state.doors.values() {
+            let center = glam::Vec3::new(d.x, d.y, d.z + 2.0);
+            let oc = ray_origin - center;
+            let b  = oc.dot(ray_dir);
+            let c  = oc.dot(oc) - DOOR_R * DOOR_R;
+            let disc = b * b - c;
+            if disc < 0.0 { continue; }
+            let t = -b - disc.sqrt();
+            if t > 0.0 && t < best_t {
+                best_t = t;
+                best   = Some(PickResult::Door(d.door_id));
+            }
+        }
+
+        best
     }
 
     // ── Zone loading ──────────────────────────────────────────────────────────
@@ -401,11 +427,17 @@ impl App {
         let result = self.pending_load.lock().unwrap().take();
         let Some(load) = result else { return };
 
+        // Paths for this zone's door/object models (computed before the &mut self.gpu borrow).
+        let door_s3d = self.assets_path.join(format!("{}.s3d", load.zone_name));
+        let door_obj = self.assets_path.join(format!("{}_obj.s3d", load.zone_name));
+
         if let Some((_, renderer)) = &mut self.gpu {
             match load.assets {
                 Some(ref za) => {
                     renderer.upload_zone_assets(za);
                     eprintln!("renderer: uploaded {} meshes for '{}'", renderer.gpu_meshes.len(), load.zone_name);
+                    // Load this zone's door/object models for clickable-door rendering.
+                    renderer.load_door_models(&door_s3d, &door_obj);
                 }
                 None => {
                     renderer.upload_zone_assets(&debug_zone::make_fallback_ground());
@@ -545,6 +577,11 @@ impl App {
     // ── Render loop ───────────────────────────────────────────────────────────
 
     fn render_frame(&mut self) {
+        // Compute dt at the very top so it's available for animation before SceneState is built.
+        let now = std::time::Instant::now();
+        let dt  = (now - self.last_frame_time).as_secs_f32().min(0.1);
+        self.last_frame_time = now;
+
         // Drain EQ packets into game state.
         while let Ok(packet) = self.app_rx.try_recv() {
             apply_packet(&mut self.game_state, &packet);
@@ -562,6 +599,16 @@ impl App {
             self.visual_heading = self.game_state.player_heading;
             *self.goto_target.lock().unwrap() = Some((wx, wy, wz));
             eprintln!("warp: teleported to ({:.1}, {:.1}, {:.1})", wx, wy, wz);
+        }
+
+        // Ease each door's render fraction toward its server-authoritative open/close target.
+        {
+            let step = (dt / 0.5).min(1.0); // ~0.5s full travel
+            for d in self.game_state.doors.values_mut() {
+                let target = if d.is_open { 1.0_f32 } else { 0.0_f32 };
+                d.open_frac += (target - d.open_frac) * step;
+                if (d.open_frac - target).abs() < 0.001 { d.open_frac = target; }
+            }
         }
 
         self.scene = SceneState::from_game_state(&self.game_state);
@@ -649,9 +696,8 @@ impl App {
             self.current_zone  = self.scene.zone.clone();
         }
 
+        // Fresh `now` for the FPS timer; `dt` and `last_frame_time` were already updated at top.
         let now = std::time::Instant::now();
-        let dt  = (now - self.last_frame_time).as_secs_f32().min(0.1);
-        self.last_frame_time = now;
 
         // FPS counter: average over 0.5s windows.
         self.fps_frame_count += 1;
@@ -1248,14 +1294,23 @@ impl ApplicationHandler for App {
                             let dy = (self.last_cursor.y - start.y) as f32;
                             // Less than 5-pixel movement → treat as a click, not drag
                             if dx * dx + dy * dy < 25.0 {
-                                if let Some(id) = self.pick_at(self.last_cursor) {
-                                    self.game_state.target_id   = Some(id);
-                                    self.game_state.target_con  = None;
-                                    if let Some(e) = self.game_state.entities.get(&id) {
-                                        self.game_state.target_name   = Some(e.name.clone());
-                                        self.game_state.target_hp_pct = Some(e.hp_pct);
+                                match self.pick_at(self.last_cursor) {
+                                    Some(PickResult::Entity(id)) => {
+                                        self.game_state.target_id   = Some(id);
+                                        self.game_state.target_con  = None;
+                                        if let Some(e) = self.game_state.entities.get(&id) {
+                                            self.game_state.target_name   = Some(e.name.clone());
+                                            self.game_state.target_hp_pct = Some(e.hp_pct);
+                                        }
+                                        *self.target.lock().unwrap() = Some(id);
                                     }
-                                    *self.target.lock().unwrap() = Some(id);
+                                    Some(PickResult::Door(door_id)) => {
+                                        // Server-authoritative: only request the open; never set is_open locally.
+                                        *self.door_click.lock().unwrap() = Some(door_id);
+                                        self.game_state.log_msg("door",
+                                            &format!("Clicked door {}", door_id));
+                                    }
+                                    None => {}
                                 }
                             }
                         }
