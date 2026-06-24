@@ -60,12 +60,12 @@ impl ZoneAssets {
         let buffers = gltf::import_buffers(&gltf_doc.document, Some(base), gltf_doc.blob)
             .with_context(|| format!("failed to load glb buffers: {}", path.display()))?;
         let raw_images = gltf::import_images(&gltf_doc.document, Some(base), &buffers)
-            .unwrap_or_default();
+            .with_context(|| format!("failed to load glb images: {}", path.display()))?;
 
         let document = &gltf_doc.document;
 
         // Build texture list: name = the image's name field (lowercased EQ filename like "qcat0001.bmp").
-        // Image index in the glTF == TextureData index — primitives reference by texture index → source image index.
+        // Meshes link to textures by image NAME (via tex_index_to_name), not by index.
         let mut textures: Vec<TextureData> = Vec::new();
         for (i, image) in document.images().enumerate() {
             let img_name = image.name().unwrap_or("").to_string();
@@ -141,10 +141,7 @@ impl ZoneAssets {
                     .and_then(|info| tex_index_to_name.get(info.texture().index()).cloned())
                     .filter(|n| !n.is_empty());
 
-                let base_color = {
-                    let c = primitive.material().pbr_metallic_roughness().base_color_factor();
-                    c
-                };
+                let base_color = primitive.material().pbr_metallic_roughness().base_color_factor();
 
                 meshes.push(MeshData {
                     positions,
