@@ -17,9 +17,8 @@ config-*.yaml
 Zone_*.jpg
 Zone_*.png
 
-# Local scheduled-task state (Claude Code cron)
-.claude/scheduled_tasks.json
-.claude/scheduled_tasks.lock
+# Claude Code workspace (agents, skills, settings, local state) — not published
+.claude/
 
 # Tools build output
 tools/output/
