@@ -534,7 +534,20 @@ pub fn draw_minimap(
     zoom:         &mut f32,
     fullscreen:   &mut bool,
     zone_map:     Option<&ZoneMap>,
+    show:         &mut bool,
 ) {
+    // Toggle button (top-left), stacked below the UI menu (34) and Inventory (60).
+    egui::Area::new(egui::Id::new("map_toggle"))
+        .anchor(egui::Align2::LEFT_TOP, canvas_off(ctx, egui::Align2::LEFT_TOP, [8.0, 86.0]))
+        .show(ctx, |ui| {
+            if ui.button("\u{1f5fa} Map").clicked() {
+                *show = !*show;
+            }
+        });
+    if !*show {
+        return;
+    }
+
     let zone_w = (zone_max[0] - zone_min[0]).max(1.0);
     let zone_h = (zone_max[1] - zone_min[1]).max(1.0);
 

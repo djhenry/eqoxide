@@ -153,6 +153,8 @@ pub struct App {
     show_debug: bool,
     /// Whether the inventory/equipment window is open (toggled by the HUD button or the I key).
     show_inventory: bool,
+    /// Whether the map window is open (toggled by the HUD button or the M key). Defaults closed.
+    show_map: bool,
     ui_layout: crate::ui_layout::UiLayout,
     /// Cached egui textures for spell-gem icons (spells01..07.tga). Empty until first render.
     spell_icons: Vec<egui::TextureHandle>,
@@ -254,6 +256,7 @@ impl App {
             testzone_mode,
             show_debug: false,
             show_inventory: false,
+            show_map: false,
             ui_layout,
             spell_icons: Vec::new(),
             tried_icons: false,
@@ -1035,7 +1038,7 @@ impl App {
             &mut enc, &view, renderer, self.loading, &self.current_zone, &load_status_text,
             sync_frac,
             &self.scene, self.zone_min, self.zone_max,
-            &mut self.minimap_zoom, &mut self.minimap_full,
+            &mut self.minimap_zoom, &mut self.minimap_full, &mut self.show_map,
             self.current_fps, self.zone_map.as_ref(),
             cam_eye, self.collision.as_deref(),
             &self.hail, &self.say, &self.target, &mut self.say_buffer,
@@ -1083,6 +1086,7 @@ impl App {
         zone_max:      [f32; 2],
         minimap_zoom:  &mut f32,
         minimap_full:  &mut bool,
+        show_map:      &mut bool,
         current_fps:   f32,
         zone_map:      Option<&zone_map::ZoneMap>,
         cam_eye:       [f32; 3],
@@ -1133,7 +1137,7 @@ impl App {
                 hud::draw_quest_dialogue(ctx, ui_layout, scene, say);
                 hud::draw_message_log(ctx, ui_layout, scene);
                 hud::draw_labels(ctx, scene, view_proj, screen_w, screen_h, cam_eye, collision);
-                hud::draw_minimap(ctx, ui_layout, scene, zone_min, zone_max, minimap_zoom, minimap_full, zone_map);
+                hud::draw_minimap(ctx, ui_layout, scene, zone_min, zone_max, minimap_zoom, minimap_full, zone_map, show_map);
                 hud::draw_control_bar(ctx, ui_layout, scene, hail, say, target, say_buffer);
                 hud::draw_action_grid(ctx, ui_layout, scene, spells, spell_icons, attack, cast, sit, target, consider);
                 hud::draw_inventory(ctx, ui_layout, scene, show_inventory);
@@ -1356,6 +1360,9 @@ impl ApplicationHandler for App {
                                 }
                                 KeyCode::KeyI => {
                                     self.show_inventory = !self.show_inventory;
+                                }
+                                KeyCode::KeyM => {
+                                    self.show_map = !self.show_map;
                                 }
                                 KeyCode::KeyL
                                     if self.keys_held.contains(&KeyCode::ControlLeft)
