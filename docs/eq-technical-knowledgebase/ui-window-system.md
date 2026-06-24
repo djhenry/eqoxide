@@ -176,7 +176,7 @@ UISkin=default           ; which uifiles/ subdirectory to load (eqgame.exe)
 
 ## 6. Alpha / fading system
 
-Global settings stored in the UI config object (`client_var`):
+Global settings stored in the UI config object:
 - `GlobalAlpha` — default 0xFF (eqgame.exe)
 - `GlobalFadeDelay` — default 2000 ms (eqgame.exe)
 - `GlobalFadeDuration` — default 500 ms (eqgame.exe)
@@ -201,7 +201,7 @@ Moving the mouse back instantly restores `Alpha`.
 
 Each window stores `Locked=true/false` in its INI section (eqgame.exe).
 This is per-window lock, distinct from the global `LockWindows` flag in
-eqclient.ini.  The global lock (`client_var`) is checked in eqgame.exe.
+eqclient.ini.  The global lock flag is checked in eqgame.exe.
 
 There is also a chat-specific `ChatManager/LockedActiveWindow` key
 (eqgame.exe).

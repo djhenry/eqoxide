@@ -30,9 +30,9 @@ Sources:
 ### Camp to character select ("30-second camp")
 
 **Client sends:**
-1. `OP_Camp (0x78c1)` — 4-byte payload (`&client_var`; appears to be a short struct, exact contents unimportant for server; zero-fill is accepted). This triggers `camp_timer.Start(29000)` on the server.
-2. After 30 seconds, with the countdown running in the client's process loop, client sends `OP_Logout (0x61ff)` — zero-length payload (`0,0` args to `client_fn`).
-3. Client then calls `client_fn(client_var, 3000)` — a blocking wait (up to 3 s) for the stream to drain before moving to char-select.
+1. `OP_Camp (0x78c1)` — 4-byte payload (a small fixed struct; exact contents unimportant for the server; zero-fill is accepted). This triggers `camp_timer.Start(29000)` on the server.
+2. After 30 seconds, with the countdown running in the client's process loop, client sends `OP_Logout (0x61ff)` — zero-length payload.
+3. The client then blocks (up to ~3 s) waiting for the stream to drain before moving to char-select.
 
 **Server response (zone side):**
 - On `Handle_OP_Camp`: starts `camp_timer` for 29 000 ms (`client_packet.cpp:4294`).
@@ -91,7 +91,7 @@ When a second client logs in with the same LS account, two things happen:
 
 2. **DropClient** (same as orphan case): even if IP limits are not hit, `ZSList::DropClient` still broadcasts to evict the old zone client.
 
-**What the booted client sees:** `OP_GMKick (0x692c)` — a `GMKick_Struct` payload containing the character's name. The client sets `client_var = 0xfd` and `client_var = 1` and immediately begins the quit path (`eqgame.exe`).
+**What the booted client sees:** `OP_GMKick (0x692c)` — a `GMKick_Struct` payload containing the character's name. The client sets its internal disconnect flags and immediately begins the quit path.
 
 **Distinguishing live from linkdead:** EQEmu does not distinguish them differently for the DropClient path — both are evicted the same way. A live session will receive the `OP_GMKick`; an already-dead session (linkdead timer running) will just get `Kick()` set on the ghost and it will be cleaned up on next process tick.
 
