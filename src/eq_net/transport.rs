@@ -100,6 +100,47 @@ fn eq_decompress(data: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// Apply the two negotiated decode passes (the reverse order of `encode`). Shared by the
+/// reliable body decode (`EqStream::decode`) and the raw-app-packet decode.
+fn decode_passes(data: &[u8], pass1: u8, pass2: u8, key: u32) -> Option<Vec<u8>> {
+    let mut result = data.to_vec();
+    if pass2 == ENCODE_COMPRESSION {
+        result = eq_decompress(&result)?;
+    } else if pass2 == ENCODE_XOR {
+        result = decode_xor(&result, key);
+    }
+    if pass1 == ENCODE_COMPRESSION {
+        result = eq_decompress(&result)?;
+    } else if pass1 == ENCODE_XOR {
+        result = decode_xor(&result, key);
+    }
+    Some(result)
+}
+
+/// Decode a standalone RAW (unreliable) application packet — CRC already stripped — into
+/// its `(opcode, payload)`.
+///
+/// EQEmu sends high-frequency updates this way (`QueuePacket(.., ack_req=false)`), most
+/// importantly NPC position updates (`Mob::SendPosUpdate`). Such a datagram is NOT wrapped
+/// in `OP_Packet`/`OP_Fragment`; the datagram *is* the application packet. Its lead byte is
+/// the app opcode's low byte (always non-zero for our opcodes), which is how the wire
+/// distinguishes it from a protocol packet (those lead with `0x00`). The server leaves that
+/// first byte plain and runs the encode passes from offset 1
+/// (`ReliableStreamConnection::InternalSend`), so we decode `body[1..]` with the same passes
+/// and prepend the plain byte to recover `[opcode_lo, opcode_hi, payload…]`.
+fn decode_raw_app(body: &[u8], pass1: u8, pass2: u8, key: u32) -> Option<(u16, Vec<u8>)> {
+    if body.is_empty() {
+        return None;
+    }
+    let opcode_lo = body[0];
+    let decoded = decode_passes(&body[1..], pass1, pass2, key)?;
+    if decoded.is_empty() {
+        return None;
+    }
+    let opcode = (opcode_lo as u16) | ((decoded[0] as u16) << 8);
+    Some((opcode, decoded[1..].to_vec()))
+}
+
 // ── Session info ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -374,39 +415,44 @@ impl EqStream {
     }
 
     fn decode(&self, data: &[u8]) -> Option<Vec<u8>> {
-        let mut result = data.to_vec();
-        if self.session.encode_pass2 == ENCODE_COMPRESSION {
-            result = eq_decompress(&result)?;
-        } else if self.session.encode_pass2 == ENCODE_XOR {
-            result = decode_xor(&result, self.session.encode_key);
-        }
-        if self.session.encode_pass1 == ENCODE_COMPRESSION {
-            result = eq_decompress(&result)?;
-        } else if self.session.encode_pass1 == ENCODE_XOR {
-            result = decode_xor(&result, self.session.encode_key);
-        }
-        Some(result)
+        decode_passes(
+            data,
+            self.session.encode_pass1,
+            self.session.encode_pass2,
+            self.session.encode_key,
+        )
     }
 
     // ── Receive dispatch ──────────────────────────────────────────────────────
 
     fn on_raw_recv(&mut self, data: &[u8]) {
-        if data.len() < 2 {
+        // Strip the outer CRC that trails every datagram.
+        let body_end = data.len().saturating_sub(self.session.crc_bytes as usize);
+        let body = &data[..body_end];
+        if body.len() < 2 {
             return;
         }
-        let opcode = data[1];
-        let mut payload = data[2..].to_vec();
 
-        // Strip outer CRC
-        if self.session.crc_bytes == 4 && payload.len() >= 4 {
-            payload = payload[..payload.len() - 4].to_vec();
-        } else if self.session.crc_bytes == 2 && payload.len() >= 2 {
-            payload = payload[..payload.len() - 2].to_vec();
-        } else if self.session.crc_bytes == 1 && payload.len() >= 1 {
-            payload = payload[..payload.len() - 1].to_vec();
+        // Two datagram kinds share the wire (see ReliableStreamConnection::ProcessDecodedPacket):
+        //   lead byte 0x00 → a PROTOCOL packet; byte[1] is the protocol opcode
+        //                    (OP_Packet / OP_Fragment / OP_Combined / …).
+        //   lead byte != 0 → a RAW APPLICATION packet sent unreliably (ack_req=false). The
+        //                    bytes ARE the app packet (opcode = first 2 bytes LE). EQEmu sends
+        //                    NPC position updates this way; we used to read byte[1] as a
+        //                    protocol opcode, match nothing, and drop them — so NPCs never moved.
+        if body[0] != 0x00 {
+            if let Some((opcode, payload)) = decode_raw_app(
+                body,
+                self.session.encode_pass1,
+                self.session.encode_pass2,
+                self.session.encode_key,
+            ) {
+                let _ = self.app_tx.send(AppPacket { opcode, payload });
+            }
+            return;
         }
 
-        self.dispatch_transport(opcode, &payload);
+        self.dispatch_transport(body[1], &body[2..]);
     }
 
     fn dispatch_transport(&mut self, opcode: u8, payload: &[u8]) {
@@ -507,7 +553,15 @@ impl EqStream {
             }
             let sub = &payload[offset..offset + sub_len];
             if sub.len() >= 2 {
-                self.dispatch_transport(sub[1], &sub[2..]);
+                // OP_Combined mixes protocol and raw application sub-packets, distinguished by
+                // the same lead-byte rule. Sub-packets are already plaintext (the encode passes
+                // ran over the whole combined body, which `decode` above undid), so a raw app
+                // sub goes straight to the app layer — no per-sub decode.
+                if sub[0] == 0x00 {
+                    self.dispatch_transport(sub[1], &sub[2..]);
+                } else {
+                    self.dispatch_app(sub);
+                }
             }
             offset += sub_len;
         }
@@ -586,6 +640,52 @@ mod tests {
         let compressed = eq_compress(data);
         assert_eq!(compressed[0], 0xa5); // raw prefix for small data
         assert_eq!(&compressed[1..], data);
+    }
+
+    // ── Raw (unreliable) application packets ──────────────────────────────────
+    // EQEmu sends NPC position updates (Mob::SendPosUpdate → QueuePacket(.., ack_req=false))
+    // as RAW application packets: the datagram is NOT wrapped in OP_Packet/OP_Fragment. The
+    // first byte is the app opcode's low byte (left plain by the server's offset-1 encode);
+    // the remainder is encode-pass'd just like a reliable body. The non-zero lead byte is how
+    // the wire distinguishes these from protocol packets (which always lead with 0x00).
+
+    #[test]
+    fn raw_app_packet_decodes_uncompressed() {
+        // EncodeNone: the body is just the app packet [opcode_lo, opcode_hi, payload…].
+        let opcode: u16 = 0x14cb; // OP_ClientUpdate (Titanium)
+        let payload = [1u8, 2, 3, 4, 5];
+        let mut body = opcode.to_le_bytes().to_vec();
+        body.extend_from_slice(&payload);
+
+        let (op, pl) = decode_raw_app(&body, ENCODE_NONE, ENCODE_NONE, 0)
+            .expect("raw app packet should decode");
+        assert_eq!(op, 0x14cb);
+        assert_eq!(pl, payload);
+    }
+
+    #[test]
+    fn raw_app_packet_decodes_compressed() {
+        // With a compression pass the server leaves byte0 (opcode low) plain and encodes
+        // [opcode_hi, payload…] from offset 1, prepending a 0x5a/0xa5 flag.
+        let opcode: u16 = 0x14cb;
+        let payload: Vec<u8> = (0u8..40).collect(); // >30 bytes → exercise the zlib path
+        let mut plain_rest = vec![(opcode >> 8) as u8];
+        plain_rest.extend_from_slice(&payload);
+
+        let mut body = vec![(opcode & 0xff) as u8];
+        body.extend_from_slice(&eq_compress(&plain_rest));
+
+        let (op, pl) = decode_raw_app(&body, ENCODE_COMPRESSION, ENCODE_NONE, 0)
+            .expect("compressed raw app packet should decode");
+        assert_eq!(op, 0x14cb);
+        assert_eq!(pl, payload);
+    }
+
+    #[test]
+    fn raw_app_packet_rejects_empty() {
+        assert!(decode_raw_app(&[], ENCODE_NONE, ENCODE_NONE, 0).is_none());
+        // Lead byte only, nothing after it to carry opcode_hi.
+        assert!(decode_raw_app(&[0xcb], ENCODE_NONE, ENCODE_NONE, 0).is_none());
     }
 
     #[test]
