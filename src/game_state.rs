@@ -231,6 +231,10 @@ pub struct GameState {
     /// True when auto-attack is enabled.
     pub auto_attack: bool,
 
+    /// Spawn id of the player's own pet (a spawn whose petOwnerId == player_id, e.g. a summoned
+    /// necro pet), or None when she has no pet. Drives OP_PetCommands + auto-pet-combat.
+    pub pet_id: Option<u32>,
+
     // Merchant / trade session
     /// `Some(merchant_entity_id)` while a merchant window is open (server accepted OP_ShopRequest
     /// with command=Open); `None` when closed or the server rejected it (command=Close, e.g. KOS
@@ -267,6 +271,9 @@ impl GameState {
         self.entities.remove(&spawn_id);
         if self.target_id == Some(spawn_id) {
             self.target_id = None;
+        }
+        if self.pet_id == Some(spawn_id) {
+            self.pet_id = None; // pet died / despawned
         }
     }
 

@@ -46,6 +46,15 @@ pub fn build_cast_packet(slot: u32, spell_id: u32, target_id: u32) -> Vec<u8> {
     buf
 }
 
+/// Titanium `PetCommand_Struct` (8 bytes): command(u32), target(u32). e.g. PET_ATTACK + a mob
+/// spawn id sends the player's pet to attack it.
+pub fn build_pet_command(command: u32, target: u32) -> Vec<u8> {
+    let mut buf = vec![0u8; 8];
+    buf[0..4].copy_from_slice(&command.to_le_bytes());
+    buf[4..8].copy_from_slice(&target.to_le_bytes());
+    buf
+}
+
 /// Titanium `SpawnAppearance_Struct` (8 bytes): spawn_id(u16), type(u16), parameter(u32).
 /// For sit/stand: kind=14 (Animation), parameter=110 (sit) / 100 (stand).
 pub fn build_spawn_appearance_packet(spawn_id: u16, kind: u16, parameter: u32) -> Vec<u8> {
@@ -176,6 +185,9 @@ pub struct Navigator {
     path:             Vec<[f32; 3]>,  // [east, north, floor_z] per waypoint
     path_i:           usize,
     path_goal:        Option<(f32, f32, f32)>,
+    /// The spawn id the pet was last ordered to attack (avoids re-spamming OP_PetCommands every
+    /// tick). Reset when the target changes; see the auto-pet-combat block.
+    last_pet_target:  Option<u32>,
 }
 
 impl Navigator {
@@ -243,6 +255,7 @@ impl Navigator {
             path: Vec::new(),
             path_i: 0,
             path_goal: None,
+            last_pet_target: None,
         }
     }
 
@@ -663,6 +676,26 @@ impl Navigator {
                     stream.send_app_packet(OP_TARGET_MOUSE, &build_target_packet(id));
                 }
             }
+        }
+
+        // Auto-pet-combat: if the player has a pet (e.g. a summoned necro pet), send it to attack
+        // the current target. Only (re)issue PET_ATTACK when the target changes, so we don't spam
+        // OP_PetCommands every tick. The player's own melee auto-engage (below) still runs, which
+        // keeps her walking into loot range while the pet does the damage.
+        if self.auto_attack {
+            match (gs.pet_id, gs.target_id) {
+                (Some(pet), Some(tid)) => {
+                    let live = gs.entities.get(&tid).map(|e| !e.dead).unwrap_or(false);
+                    if live && self.last_pet_target != Some(tid) {
+                        stream.send_app_packet(OP_PET_COMMANDS, &build_pet_command(PET_ATTACK, tid));
+                        self.last_pet_target = Some(tid);
+                        tracing::info!("EQ: pet {pet} → attack target {tid}");
+                    }
+                }
+                _ => self.last_pet_target = None,
+            }
+        } else {
+            self.last_pet_target = None;
         }
 
         // Auto-engage: while auto-attacking, walk into melee range of the target and face it so

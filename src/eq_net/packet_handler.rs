@@ -986,6 +986,15 @@ pub fn register_spawn(gs: &mut GameState, spawn: Spawn_S) {
         return;
     }
 
+    // Track the player's own pet: a spawn whose petOwnerId points at us (e.g. a summoned necro
+    // pet). Drives OP_PetCommands + auto-pet-combat. Cleared in remove_entity on despawn/death.
+    let pet_owner = spawn.petOwnerId; // copy out of packed struct before use
+    let spawn_id_c = spawn.spawnId;
+    if gs.player_id != 0 && pet_owner == gs.player_id {
+        gs.pet_id = Some(spawn_id_c);
+        tracing::info!("EQ: player pet spawned id={spawn_id_c} name='{name}'");
+    }
+
     let equipment: [u32; 9] = std::array::from_fn(|i| {
         u32::from_le_bytes(spawn.equipment[i*4..i*4+4].try_into().unwrap())
     });
