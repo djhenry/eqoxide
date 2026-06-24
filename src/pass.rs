@@ -197,7 +197,8 @@ pub fn encode_zone_pass(
 /// not carry decoded textures; geometry/placement correctness matters most this task.
 ///
 /// Placement (closed): `m = translate(pos) * rotZ(yaw) * rotY(incline) * scale(size/100)`,
-/// `yaw = -(heading/512)*TAU`. `open_frac` is unused until Task 9.
+/// `yaw = heading*TAU/512 + FRAC_PI_2`. The door model's origin is the hinge edge (= door.pos),
+/// so the open animation swings about the origin.
 pub fn encode_door_pass(
     r:       &EqRenderer,
     encoder: &mut wgpu::CommandEncoder,
@@ -228,9 +229,9 @@ pub fn encode_door_pass(
         let key = door.name.to_uppercase();
         let mat = if r.door_models.contains_key(&key) {
             let scale = door.size as f32 / 100.0;
-            // Door heading is raw EQ units (0..512). Match the entity/player convention
-            // (camera::entity_model_matrix_heading): yaw = heading_deg.to_radians() + 90°,
-            // where heading_deg = units * 360/512, so heading*TAU/512 + FRAC_PI_2.
+            // Door heading is raw EQ units (0..512). The +90° offset (verified visually: doors
+            // face the correct way with it) matches the entity/player convention:
+            // yaw = heading*TAU/512 + FRAC_PI_2.
             let yaw   = (door.heading / 512.0) * std::f32::consts::TAU + std::f32::consts::FRAC_PI_2;
             let placement = glam::Mat4::from_translation(glam::Vec3::from(door.pos))
                 * glam::Mat4::from_rotation_z(yaw)
@@ -243,11 +244,9 @@ pub fn encode_door_pass(
                 100..=119 => glam::Mat4::from_translation(glam::vec3(0.0, 0.0, 10.0 * f)),
                 11..=15   => glam::Mat4::from_translation(glam::vec3(8.0 * f, 0.0, 0.0)),
                 _ => {
-                    // Hinged swing: rotate ~90° about the model's minimum-X edge.
-                    let hinge = r.door_hinge_x.get(&key).copied().unwrap_or(0.0);
-                    glam::Mat4::from_translation(glam::vec3(hinge, 0.0, 0.0))
-                        * glam::Mat4::from_rotation_z(f * std::f32::consts::FRAC_PI_2)
-                        * glam::Mat4::from_translation(glam::vec3(-hinge, 0.0, 0.0))
+                    // Hinged swing about the model origin (= door.pos = the hinge edge in EQ).
+                    // Negative angle swings the leaf outward (away from the player side).
+                    glam::Mat4::from_rotation_z(-f * std::f32::consts::FRAC_PI_2)
                 }
             };
             placement * local_open
