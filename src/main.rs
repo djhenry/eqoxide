@@ -90,6 +90,7 @@ fn main() {
     let doors_shared:     http::DoorsShared     = Arc::new(Mutex::new(Vec::new()));
     let messages:         http::MessagesShared  = Arc::new(Mutex::new(Vec::new()));
     let cast:             http::CastReq         = Arc::new(Mutex::new(None));
+    let mem_spell:        http::MemSpellReq     = Arc::new(Mutex::new(None));
     let sit:              http::SitReq          = Arc::new(Mutex::new(None));
     let consider:         http::ConsiderReq     = Arc::new(Mutex::new(None));
     // spells_us.txt is an EQ data file; default to the configured assets dir,
@@ -130,6 +131,7 @@ fn main() {
         let ds  = doors_shared.clone();
         let mg  = messages.clone();
         let ca  = cast.clone();
+        let ms  = mem_spell.clone();
         let st  = sit.clone();
         let co  = consider.clone();
         let sc  = shared_collision.clone();
@@ -138,7 +140,7 @@ fn main() {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, zc, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, ca, st, co, sc, md, sd).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, zc, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, ca, ms, st, co, sc, md, sd).await {
                     tracing::error!("EQ: fatal: {e}");
                 }
             });
@@ -175,6 +177,7 @@ fn main() {
         target,
         attack,
         cast.clone(),
+        mem_spell.clone(),
         sit.clone(),
         consider.clone(),
         buy,
