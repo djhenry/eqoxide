@@ -37,12 +37,12 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
             if p.len() >= 4 {
                 let zone_id = u16::from_le_bytes([p[0], p[1]]);
                 let instance_id = u16::from_le_bytes([p[2], p[3]]);
-                eprintln!("EQ: OP_REQUEST_CLIENT_ZONE_CHANGE → zone_id={zone_id} instance={instance_id} ({} bytes)", p.len());
+                tracing::info!("EQ: OP_REQUEST_CLIENT_ZONE_CHANGE → zone_id={zone_id} instance={instance_id} ({} bytes)", p.len());
                 if zone_id != 0 && zone_id != gs.zone_id {
                     gs.pending_server_zone = Some(zone_id);
                 }
             } else {
-                eprintln!("EQ: OP_REQUEST_CLIENT_ZONE_CHANGE ({} bytes)", p.len());
+                tracing::info!("EQ: OP_REQUEST_CLIENT_ZONE_CHANGE ({} bytes)", p.len());
             }
             gs.log_msg("zone", "Zone change requested by server");
         }
@@ -60,14 +60,14 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
             // Server acknowledged our OP_TradeRequest — the trade session now exists. The give
             // state machine (navigation.rs) waits on this before moving the item into the NPC slot.
             gs.trade_ack_ready = true;
-            eprintln!("EQ: OP_TradeRequestAck — trade session open");
+            tracing::info!("EQ: OP_TradeRequestAck — trade session open");
         }
         OP_FINISH_TRADE         => {
             // Server finalized the trade (0-byte packet). For a quest turn-in this means the NPC
             // accepted the item; if the item didn't match, the server returns it on the cursor
             // via OP_ItemPacket (handled above), which we treat as a soft failure.
             gs.log_msg("trade", "Trade complete");
-            eprintln!("EQ: give: turn-in complete (OP_FinishTrade)");
+            tracing::info!("EQ: give: turn-in complete (OP_FinishTrade)");
         }
         OP_ANIMATION            => apply_animation(gs, p),
         OP_BEGIN_CAST           => apply_begin_cast(gs, p),
@@ -210,7 +210,7 @@ fn apply_char_inventory(gs: &mut GameState, p: &[u8]) {
         if let Some(it) = parse_inv_item(record) { items.push(it); }
     }
     if !items.is_empty() {
-        eprintln!("EQ: char inventory: {} items", items.len());
+        tracing::info!("EQ: char inventory: {} items", items.len());
         gs.inventory = items;
     }
 }
@@ -251,7 +251,7 @@ fn apply_new_spawn(gs: &mut GameState, payload: &[u8]) {
         // (Only fires if the server has loot tables; loot-empty mobs skip corpse creation.)
         if spawn.NPC != 0 && name.to_lowercase().contains("corpse") {
             let sid = spawn.spawnId;
-            eprintln!("EQ: NPC corpse spawned: id={} name={:?} → queuing for loot", sid, name);
+            tracing::info!("EQ: NPC corpse spawned: id={} name={:?} → queuing for loot", sid, name);
             gs.pending_loot.push_back(sid);
             if gs.loot_queued_at.is_none() {
                 gs.loot_queued_at = Some(std::time::Instant::now());
@@ -283,7 +283,7 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         // corrections (anti-cheat snaps, wall clips, teleports), which are much larger.
         const CORRECTION_SQ: f32 = 144.0; // 12u — above normal movement jitter, below real rubber-bands
         if dx * dx + dy * dy > CORRECTION_SQ {
-            eprintln!("SERVER_CORRECT: player pos ({:.1},{:.1},{:.1}) → ({:.1},{:.1},{:.1}) delta ({:.1},{:.1},{:.1})",
+            tracing::info!("SERVER_CORRECT: player pos ({:.1},{:.1},{:.1}) → ({:.1},{:.1},{:.1}) delta ({:.1},{:.1},{:.1})",
                       gs.player_x, gs.player_y, gs.player_z, upd.x, upd.y, upd.z, dx, dy, dz);
             gs.log_msg("zone", &format!("Server corrected position by ({:.0},{:.0},{:.0})", dx, dy, dz));
             gs.server_corrections = gs.server_corrections.wrapping_add(1);
@@ -297,9 +297,9 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         e.z = upd.z;
         e.heading = upd.heading;
         e.animation = upd.animation;
-        eprintln!("EQ: npc_pos id={} name={} pos=({:.1},{:.1},{:.1})", sid, e.name, e.x, e.y, e.z);
+        tracing::info!("EQ: npc_pos id={} name={} pos=({:.1},{:.1},{:.1})", sid, e.name, e.x, e.y, e.z);
     } else {
-        eprintln!("EQ: npc_pos id={} NOT IN ENTITY MAP (known: {})", sid, gs.entities.len());
+        tracing::info!("EQ: npc_pos id={} NOT IN ENTITY MAP (known: {})", sid, gs.entities.len());
     }
 }
 
@@ -361,7 +361,7 @@ fn apply_zone_entry(gs: &mut GameState, payload: &[u8]) {
                 gs.player_equipment_tint[i] =
                     [spawn.equipment_tint[i*4+2], spawn.equipment_tint[i*4+1], spawn.equipment_tint[i*4]];
             }
-            eprintln!("EQ: player via ZONE_ENTRY id={} pos=({:.1},{:.1},{:.1}) equip={:?}",
+            tracing::info!("EQ: player via ZONE_ENTRY id={} pos=({:.1},{:.1},{:.1}) equip={:?}",
                       gs.player_id, x, y, z, gs.player_equipment);
         }
         break;
@@ -512,7 +512,7 @@ fn apply_death(gs: &mut GameState, payload: &[u8]) {
     if d_id == gs.player_id {
         gs.hp_pct    = 0.0;
         gs.strategy  = "Dead — waiting to respawn".into();
-        eprintln!("EQ: combat: *** You have been slain! ***");
+        tracing::info!("EQ: combat: *** You have been slain! ***");
         gs.log_msg("combat", "*** You have been slain! ***");
     } else {
         let name = gs.entities.get(&d_id).map(|e| e.name.clone());
@@ -521,7 +521,7 @@ fn apply_death(gs: &mut GameState, payload: &[u8]) {
                 e.dead   = true;
                 e.hp_pct = 0.0;
             }
-            eprintln!("EQ: combat: {} has been slain", name);
+            tracing::info!("EQ: combat: {} has been slain", name);
             gs.log_msg("combat", &format!("{} has been slain", name));
             // Auto-loot our OWN kills: the NPC corpse reuses the mob's spawn_id, and the server
             // doesn't send OP_BecomeCorpse for these deaths — so queue the corpse here. The
@@ -531,7 +531,7 @@ fn apply_death(gs: &mut GameState, payload: &[u8]) {
                 if gs.loot_queued_at.is_none() {
                     gs.loot_queued_at = Some(std::time::Instant::now());
                 }
-                eprintln!("EQ: auto-loot: queued corpse_id={} ({})", d_id, name);
+                tracing::info!("EQ: auto-loot: queued corpse_id={} ({})", d_id, name);
             }
         }
     }
@@ -559,7 +559,7 @@ fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
     } else {
         format!("{source_name} hits {target_name} for {damage} damage")
     };
-    eprintln!("EQ: combat: {msg}");
+    tracing::info!("EQ: combat: {msg}");
     gs.log_msg("combat", &msg);
 }
 
@@ -704,7 +704,7 @@ fn apply_consider(gs: &mut GameState, payload: &[u8]) {
     gs.target_id  = Some(target_id);
     gs.target_con = Some(con_color(level));
     let msg = format!("{} {}.", name, consider_message(faction));
-    eprintln!("EQ: consider: {msg}");
+    tracing::info!("EQ: consider: {msg}");
     gs.log_msg("combat", &msg);
 }
 
@@ -755,9 +755,9 @@ fn apply_zone_points(gs: &mut GameState, payload: &[u8]) {
         });
         i += SIZE_ZONE_POINT_ENTRY;
     }
-    eprintln!("EQ: {} zone exit points received:", gs.zone_points.len());
+    tracing::info!("EQ: {} zone exit points received:", gs.zone_points.len());
     for zp in &gs.zone_points {
-        eprintln!("  zone_id={} server_x={:.1} server_y={:.1} z={:.1} heading={:.1}",
+        tracing::info!("  zone_id={} server_x={:.1} server_y={:.1} z={:.1} heading={:.1}",
                   zp.zone_id, zp.server_x, zp.server_y, zp.server_z, zp.heading);
     }
 }
@@ -818,7 +818,7 @@ fn apply_become_corpse(gs: &mut GameState, payload: &[u8]) {
     // Struct: unknown(4) + spawn_id(4) + y(4) + x(4) = 16 bytes observed on wire.
     if payload.len() < 8 { return; }
     let corpse_id = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-    eprintln!("EQ: OP_BecomeCorpse corpse_id={}", corpse_id);
+    tracing::info!("EQ: OP_BecomeCorpse corpse_id={}", corpse_id);
     gs.pending_loot.push_back(corpse_id);
     if gs.loot_queued_at.is_none() {
         gs.loot_queued_at = Some(std::time::Instant::now());
@@ -854,7 +854,7 @@ fn apply_money_on_corpse(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < 20 { return; }
     let response  = payload[0];
     if response != 0 {
-        eprintln!("EQ: OP_MoneyOnCorpse denied (response={})", response);
+        tracing::warn!("EQ: OP_MoneyOnCorpse denied (response={})", response);
         return;
     }
     let platinum = u32::from_le_bytes([payload[4],  payload[5],  payload[6],  payload[7]]);
@@ -869,9 +869,9 @@ fn apply_money_on_corpse(gs: &mut GameState, payload: &[u8]) {
         if silver   > 0 { parts.push(format!("{}sp", silver)); }
         if copper   > 0 { parts.push(format!("{}cp", copper)); }
         gs.log_msg("loot", &format!("Looted coins: {}", parts.join(", ")));
-        eprintln!("EQ: looted coins: {}", parts.join(", "));
+        tracing::info!("EQ: looted coins: {}", parts.join(", "));
     } else {
-        eprintln!("EQ: no coins on corpse");
+        tracing::info!("EQ: no coins on corpse");
     }
 }
 
@@ -906,7 +906,7 @@ pub fn register_spawn(gs: &mut GameState, spawn: Spawn_S) {
                 [spawn.equipment_tint[i*4+2], spawn.equipment_tint[i*4+1], spawn.equipment_tint[i*4]];
         }
         let sid = spawn.spawnId;
-        eprintln!("EQ: player spawn id={} pos=({:.1},{:.1},{:.1}) equip={:?}", sid, x, y, z, gs.player_equipment);
+        tracing::info!("EQ: player spawn id={} pos=({:.1},{:.1},{:.1}) equip={:?}", sid, x, y, z, gs.player_equipment);
         return;
     }
 

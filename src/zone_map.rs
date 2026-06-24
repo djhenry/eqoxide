@@ -37,7 +37,7 @@ impl ZoneMap {
     pub fn load(maps_dir: &Path, zone_name: &str) -> Option<Self> {
         let base = maps_dir.join(format!("{}.txt", zone_name));
         let text = std::fs::read_to_string(&base)
-            .map_err(|e| eprintln!("zone_map: failed to load {:?}: {}", base, e))
+            .map_err(|e| tracing::warn!("zone_map: failed to load {:?}: {}", base, e))
             .ok()?;
 
         let mut lines  = Vec::new();
@@ -52,7 +52,7 @@ impl ZoneMap {
             }
         }
 
-        eprintln!("zone_map: loaded {} lines, {} labels for '{}' (base + layers)",
+        tracing::info!("zone_map: loaded {} lines, {} labels for '{}' (base + layers)",
                   lines.len(), labels.len(), zone_name);
         Some(ZoneMap { lines, labels })
     }

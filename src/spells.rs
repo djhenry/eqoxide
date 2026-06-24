@@ -25,7 +25,7 @@ impl SpellDb {
         match std::fs::read_to_string(path) {
             Ok(text) => Self::parse_str(&text),
             Err(e) => {
-                eprintln!("spells: could not read {path}: {e} (gems will show no name/icon)");
+                tracing::warn!("spells: could not read {path}: {e} (gems will show no name/icon)");
                 Self::empty()
             }
         }

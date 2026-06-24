@@ -32,9 +32,9 @@ pub fn load(path: &Path) {
             let map = parse(&text);
             let n = map.len();
             let _ = STRINGS.set(map);
-            eprintln!("eqstr: loaded {} strings from {}", n, path.display());
+            tracing::info!("eqstr: loaded {} strings from {}", n, path.display());
         }
-        Err(e) => eprintln!("eqstr: could not load {}: {}", path.display(), e),
+        Err(e) => tracing::warn!("eqstr: could not load {}: {}", path.display(), e),
     }
 }
 
