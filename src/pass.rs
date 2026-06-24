@@ -6,29 +6,18 @@
 use crate::renderer::EqRenderer;
 use crate::scene::SceneState;
 
-/// Choose the bind group for one primitive: an equipment-swapped armor texture if
-/// available, else the primitive's baked GLB texture, else the white fallback.
-/// True if this armor mesh should be hidden: its exact equipped-material texture is missing,
-/// but a variant-01 sibling of the same region+material IS loaded. EQ body models are built
-/// from the material-0 (cloth) layout, which can have more chest "variant" pieces than an
-/// armor material ships textures for (e.g. the torso is variant 3, but material-3 chest only
-/// has variants 01/02). Those textureless pieces would otherwise render as bare body over the
-/// variant-01 armor piece. Hiding them lets the variant-01 armor texture show through. (When
-/// no sibling has a texture either — e.g. helm material 3 — nothing is hidden, so the part
-/// keeps its baked skin instead of vanishing.)
+/// Vestigial: this used to HIDE an armor mesh whose exact material+variant texture was
+/// missing (e.g. the variant-03 main chest torso for an armor material that only ships
+/// variants 01/02). But the chest variant pieces are DISJOINT (zero shared verts), so
+/// hiding the textureless torso left a see-through hole (a "transparent chest") rather than
+/// revealing a sibling. `resolve_overlay_tex` now falls back to the material-0 base cloth
+/// for such pieces, so nothing ever needs hiding. Kept as a no-op so the call sites in the
+/// two-pass body draw stay readable; always returns false.
 fn equip_mesh_hidden(
-    r: &EqRenderer, prefix: &str,
-    slot: Option<crate::models::EquipSlot>, equipment: &[u32; 9],
+    _r: &EqRenderer, _prefix: &str,
+    _slot: Option<crate::models::EquipSlot>, _equipment: &[u32; 9],
 ) -> bool {
-    let Some(es) = slot else { return false };
-    let mat = equipment[es.slot];
-    if mat == 0 || es.variant == 1 { return false; }
-    let exact_present = crate::models::equip_swap_key(prefix, es, mat)
-        .map(|k| matches!(r.equipment_tex_cache.get(&k), Some(Some(_)))).unwrap_or(false);
-    if exact_present { return false; }
-    let v1 = crate::models::EquipSlot { slot: es.slot, region: es.region, variant: 1 };
-    crate::models::equip_swap_key(prefix, v1, mat)
-        .map(|k| matches!(r.equipment_tex_cache.get(&k), Some(Some(_)))).unwrap_or(false)
+    false
 }
 
 fn resolve_equip_tex<'a>(
@@ -89,7 +78,17 @@ fn resolve_overlay_tex<'a>(
         if let Some(Some(bg)) = r.equipment_tex_cache.get(&key) { return Some(bg); }
     }
     if let Some(rmat) = crate::models::velious_material_fallback(mat) {
-        if let Some(key) = crate::models::equip_swap_key(prefix, es, rmat) {
+        if let Some(key) = crate::models::equip_swap_key(prefix, es.clone(), rmat) {
+            if let Some(Some(bg)) = r.equipment_tex_cache.get(&key) { return Some(bg); }
+        }
+    }
+    // Base-cloth fallback: a body region whose armor material lacks a texture for THIS
+    // variant stays clothed instead of vanishing. The chest's disjoint variant pieces
+    // don't all ship per material (e.g. material 3 has chest variants 01/02 but not the
+    // main 03 torso), so without this the textureless piece would be hidden into a
+    // see-through hole. Skin regions (he/hn/ft) return None at material 0 → bare skin.
+    if mat != 0 {
+        if let Some(key) = crate::models::equip_swap_key(prefix, es, 0) {
             if let Some(Some(bg)) = r.equipment_tex_cache.get(&key) { return Some(bg); }
         }
     }
