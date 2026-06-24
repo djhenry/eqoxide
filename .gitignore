@@ -7,6 +7,9 @@
 # Runtime logs
 *.log
 
+# Per-character UI layout state written by the app at runtime
+ui_layout_*.json
+
 # Local scheduled-task state (Claude Code cron)
 .claude/scheduled_tasks.json
 .claude/scheduled_tasks.lock
