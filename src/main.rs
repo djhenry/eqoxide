@@ -23,15 +23,15 @@ fn main() {
         || std::env::var("EQ_PROFILE").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
     eq_renderer::profiling::set_enabled(profile_mode);
 
-    // `--config <path>` selects the per-character login config; defaults to the eq-client-ref config.
-    let login_cfg_path = args
+    // `--config <value>` selects the per-character login config (a path, a bare
+    // filename, or a profile name resolved under ~/.config/eqoxide/); see
+    // LoginConfig::resolve_path. Defaults to ~/.config/eqoxide/config.yaml.
+    let login_cfg_arg = args
         .iter()
         .position(|a| a == "--config")
         .and_then(|i| args.get(i + 1))
-        .map(|p| std::path::PathBuf::from(shellexpand::tilde(p).into_owned()))
-        .unwrap_or_else(|| {
-            std::path::PathBuf::from(shellexpand::tilde("~/git/eq-client-ref/config.yaml").into_owned())
-        });
+        .map(|s| s.as_str());
+    let login_cfg_path = config::LoginConfig::resolve_path(login_cfg_arg);
     tracing::info!("renderer: loading login config from {}", login_cfg_path.display());
 
     let login_cfg = config::LoginConfig::load(&login_cfg_path);

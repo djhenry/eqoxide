@@ -15,8 +15,9 @@ cargo build --release
 ```
 
 Run `dev-run.sh` in your **own terminal**, not from an agent/Bash tool call — the harness reaps
-GUI child processes. Logs go to `/tmp/eq_client.log`. Server/credentials live in
-`~/git/eq-client-ref/config.yaml`; renderer asset paths live in `./config.yaml`.
+GUI child processes. Logs go to `/tmp/eq_client.log`. Per-character server/credentials and
+renderer asset paths live in `~/.config/eqoxide/` (honoring `XDG_CONFIG_HOME`). Credential files
+are kept out of source control — copy a template into that directory and edit it locally.
 
 Offline asset/zone debugging (no server): `./target/release/eq_renderer --testzone`.
 
@@ -25,21 +26,25 @@ Add `--profile` (or `EQ_PROFILE=1`) for a per-phase frame-timing overlay; see `d
 ### Choosing which character logs in
 
 The account + character to log in as is **not** a CLI name argument — it comes from the login
-config file. Pass it with `--config`:
+config file. Login configs live in `~/.config/eqoxide/`. Pass one with `--config`:
 
 ```sh
-./target/release/eq_renderer --config config-durgan.yaml   # logs in as character "Durgan"
+./target/release/eq_renderer --config durgan   # ~/.config/eqoxide/config-durgan.yaml
 ```
 
-With no `--config`, the client loads `~/git/eq-client-ref/config.yaml` (the default, character
-"Claude"). Each `config-<name>.yaml` in the repo root sets its own `account.username`,
-`account.password`, and `account.character_name` — for example `config-durgan.yaml` →
-`character_name: Durgan`. To run a different character, copy one of these files, edit those three
-fields (the account/character must already exist on the EQEmu server), and pass it to `--config`.
+`--config` accepts:
+- a **profile name** (`durgan`) → `~/.config/eqoxide/config-durgan.yaml`
+- a **bare filename** (`config-durgan.yaml`) → looked up in `~/.config/eqoxide/`
+- an explicit **path** (`./foo.yaml`, `~/elsewhere/x.yaml`) → used as-is
+
+With no `--config`, the client loads `~/.config/eqoxide/config.yaml`. Each `config-<name>.yaml`
+sets its own `account.username`, `account.password`, and `account.character_name`. To add a
+character, copy an existing file in `~/.config/eqoxide/`, edit those three fields (the
+account/character must already exist on the EQEmu server), and pass its name to `--config`.
 
 ```sh
-ls config-*.yaml      # available login profiles
-grep character_name config-*.yaml
+ls ~/.config/eqoxide/config-*.yaml          # available login profiles
+grep character_name ~/.config/eqoxide/config-*.yaml
 ```
 
 ### Launching from inside an agent harness (no interactive terminal)
@@ -50,7 +55,7 @@ reaps GUI children), detach with `setsid` so the process survives, then read the
 
 ```sh
 setsid bash -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 \
-  exec ./target/release/eq_renderer --config config-durgan.yaml' \
+  exec ./target/release/eq_renderer --config durgan' \
   > /tmp/eq_durgan.log 2>&1 < /dev/null &
 disown
 sleep 12
