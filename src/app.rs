@@ -345,31 +345,40 @@ impl App {
             return;
         }
 
-        let s3d_path    = self.assets_path.join(format!("{}.s3d", zone_name));
         let maps_dir    = self.assets_path.join("maps");
         let load_status = self.load_status.clone();
         let pending     = self.pending_load.clone();
+        let url  = self.asset_server_url.clone();
+        let user = self.asset_user.clone();
+        let pass = self.asset_pass.clone();
 
-        *load_status.lock().unwrap() = "Opening S3D archive…".to_string();
+        *load_status.lock().unwrap() = "Connecting to asset server…".to_string();
 
         std::thread::spawn(move || {
             let set_status = |s: &str| { *load_status.lock().unwrap() = s.to_string(); };
 
-            set_status("Reading zone geometry…");
-            let (opt_assets, zone_min, zone_max) = match assets::ZoneAssets::load_all(&s3d_path) {
+            let cache = crate::asset_sync::CacheDirs::resolve();
+            set_status("Connecting to asset server…");
+            let loaded = (|| -> anyhow::Result<assets::ZoneAssets> {
+                let sync = crate::asset_sync::AssetSync::login(&url, &user, &pass)?;
+                set_status("Verifying zone assets…");
+                let dl_status = load_status.clone();
+                crate::asset_sync::sync_set(&sync, &format!("zone/{zone_name}"), &cache, &mut |p| {
+                    if matches!(p.phase, crate::asset_sync::Phase::Downloading) {
+                        let mb = p.bytes as f64 / 1_048_576.0;
+                        *dl_status.lock().unwrap() =
+                            format!("Downloading zone {}/{} ({:.1} MB)…", p.done, p.total, mb);
+                    }
+                })?;
+                set_status("Reading zone geometry…");
+                assets::ZoneAssets::from_glb(&cache.models_dir().join(format!("{zone_name}.glb")))
+            })();
+            let (opt_assets, zone_min, zone_max) = match loaded {
                 Ok(za) => {
-                    let (zone_min, zone_max) = if let Some((mn, mx)) = za.bounds_xy() {
-                        // bounds_xy already returns [east, north] = [server_x, server_y].
-                        (mn, mx)
-                    } else {
-                        ([0.0f32; 2], [0.0f32; 2])
-                    };
-                    (Some(za), zone_min, zone_max)
+                    let (mn, mx) = za.bounds_xy().unwrap_or(([0.0f32;2],[0.0f32;2]));
+                    (Some(za), mn, mx)
                 }
-                Err(e) => {
-                    eprintln!("renderer: zone '{}' not found ({}), using fallback", zone_name, e);
-                    (None, [0.0f32; 2], [0.0f32; 2])
-                }
+                Err(e) => { eprintln!("renderer: zone '{}' load failed: {}", zone_name, e); (None, [0.0f32;2],[0.0f32;2]) }
             };
 
             set_status("Building collision grid…");
