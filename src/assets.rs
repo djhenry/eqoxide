@@ -948,10 +948,16 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Directory of extracted EQ `.s3d` files for the `#[ignore]`d asset tests
+    /// below. Set `EQ_ASSETS_DIR` to run them; otherwise they skip.
+    fn assets_dir() -> Option<PathBuf> {
+        std::env::var_os("EQ_ASSETS_DIR").map(PathBuf::from)
+    }
+
     #[test]
-    #[ignore = "requires real extracted assets at ~/eq_assets/EQ_Files/qcat.s3d"]
+    #[ignore = "requires real extracted assets (set EQ_ASSETS_DIR)"]
     fn load_real_zone_has_meshes() {
-        let path = PathBuf::from("~/eq_assets/EQ_Files/qcat.s3d");
+        let Some(path) = assets_dir().map(|d| d.join("qcat.s3d")) else { return; };
         if !path.exists() {
             return;
         }
@@ -960,56 +966,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "diagnostic: dumps mesh bounds for qcat and qeynos zones"]
-    fn dump_zone_bounds() {
-        for zone in &["qcat", "qeynos", "qeynos2"] {
-            let path = PathBuf::from(format!("~/eq_assets/EQ_Files/{}.s3d", zone));
-            if !path.exists() { continue; }
-            let assets = ZoneAssets::load(&path).expect("load failed");
-            tracing::info!("\n=== {} ({} meshes, {} textures) ===", zone, assets.terrain.len(), assets.textures.len());
-            let (mut xmin, mut xmax) = (f32::MAX, f32::MIN);
-            let (mut ymin, mut ymax) = (f32::MAX, f32::MIN);
-            let (mut zmin, mut zmax) = (f32::MAX, f32::MIN);
-            let mut total_verts = 0usize;
-            let mut total_tris = 0usize;
-            // Also track world bounds (local + center)
-            let (mut wxmin, mut wxmax) = (f32::MAX, f32::MIN);
-            let (mut wymin, mut wymax) = (f32::MAX, f32::MIN);
-            let (mut wzmin, mut wzmax) = (f32::MAX, f32::MIN);
-            for m in &assets.terrain {
-                total_verts += m.positions.len();
-                total_tris += m.indices.len() / 3;
-                for &[x, y, z] in &m.positions {
-                    xmin = xmin.min(x); xmax = xmax.max(x);
-                    ymin = ymin.min(y); ymax = ymax.max(y);
-                    zmin = zmin.min(z); zmax = zmax.max(z);
-                    wxmin = wxmin.min(x + m.center[0]); wxmax = wxmax.max(x + m.center[0]);
-                    wymin = wymin.min(y + m.center[1]); wymax = wymax.max(y + m.center[1]);
-                    wzmin = wzmin.min(z + m.center[2]); wzmax = wzmax.max(z + m.center[2]);
-                }
-            }
-            tracing::info!("  total verts={} tris={}", total_verts, total_tris);
-            tracing::info!("  local X: {:.1}..{:.1}  Y: {:.1}..{:.1}  Z: {:.1}..{:.1}",
-                xmin, xmax, ymin, ymax, zmin, zmax);
-            tracing::info!("  world X: {:.1}..{:.1}  Y: {:.1}..{:.1}  Z: {:.1}..{:.1}",
-                wxmin, wxmax, wymin, wymax, wzmin, wzmax);
-            tracing::info!("  world center: ({:.1}, {:.1}, {:.1})",
-                (wxmin+wxmax)/2.0, (wymin+wymax)/2.0, (wzmin+wzmax)/2.0);
-            // Print a sample mesh center to see if centers are non-zero
-            if let Some(m) = assets.terrain.first() {
-                tracing::info!("  first mesh center: [{:.1}, {:.1}, {:.1}]",
-                    m.center[0], m.center[1], m.center[2]);
-            }
-            if let Some(t) = assets.textures.first() {
-                tracing::info!("  first texture: {} ({}x{})", t.name, t.width, t.height);
-            }
-        }
-    }
-
-    #[test]
-    #[ignore = "requires real extracted assets"]
+    #[ignore = "requires real extracted assets (set EQ_ASSETS_DIR)"]
     fn collision_floor_z_returns_terrain_height() {
-        let path = PathBuf::from("~/eq_assets/EQ_Files/qeynos2.s3d");
+        let Some(path) = assets_dir().map(|d| d.join("qeynos2.s3d")) else { return; };
         if !path.exists() { return; }
         let assets = ZoneAssets::load(&path).expect("load failed");
         let col = Collision::build(&assets, 32.0);
@@ -1091,11 +1050,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires ~/eq_assets/EQ_Files/global17_amr.s3d"]
+    #[ignore = "requires extracted assets (set EQ_ASSETS_DIR): global17_amr.s3d"]
     fn index_and_load_one_armor_texture() {
         use std::collections::HashMap;
-        let p = std::path::PathBuf::from(
-            format!("{}/eq_assets/EQ_Files/global17_amr.s3d", std::env::var("HOME").unwrap()));
+        let Some(p) = assets_dir().map(|d| d.join("global17_amr.s3d")) else { return; };
         let mut idx: HashMap<String, std::path::PathBuf> = HashMap::new();
         index_s3d_textures(&p, &mut idx);
         assert!(idx.contains_key("homch1701.bmp"), "expected human male chest armor 17");
@@ -1108,10 +1066,9 @@ mod tests {
     /// Movement collision: walking toward the wall at east=5 is blocked; walking
     /// parallel to it (along north) or away from it is clear.
     #[test]
-    #[ignore = "requires ~/eq_assets/EQ_Files/qeynos.s3d + qeynos_obj.s3d"]
+    #[ignore = "requires extracted assets (set EQ_ASSETS_DIR): qeynos.s3d + qeynos_obj.s3d"]
     fn loads_a_known_door_model() {
-        let ap = std::path::PathBuf::from(std::env::var("HOME").unwrap())
-            .join("eq_assets/EQ_Files");
+        let Some(ap) = assets_dir() else { return; };
         let main = ap.join("qeynos.s3d");
         let obj  = ap.join("qeynos_obj.s3d");
         if !main.exists() { tracing::warn!("assets missing; skipping"); return; }
