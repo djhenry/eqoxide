@@ -191,6 +191,103 @@ pub fn encode_zone_pass(
     }
 }
 
+/// Draw the zone's doors (closed state). Each door uses its object model if loaded, else a
+/// reddish fallback cube at the door position. Per-door model matrix lets Task 9 animate opens.
+/// Doors render untextured (fallback texture + per-mesh base_color) — `load_object_models` does
+/// not carry decoded textures; geometry/placement correctness matters most this task.
+///
+/// Placement (closed): `m = translate(pos) * rotZ(yaw) * rotY(incline) * scale(size/100)`,
+/// `yaw = heading*TAU/512 + FRAC_PI_2`. The door model's origin is the hinge edge (= door.pos),
+/// so the open animation swings about the origin.
+pub fn encode_door_pass(
+    r:       &EqRenderer,
+    encoder: &mut wgpu::CommandEncoder,
+    view:    &wgpu::TextureView,
+    scene:   &SceneState,
+) {
+    use crate::gpu::EntityUniform;
+    if scene.doors.is_empty() { return; }
+
+    // Phase 1: assign a uniform slot per door, write its model matrix, and record what to draw.
+    // (slot_idx, &GpuMesh) — meshes of the same door share that door's slot/matrix.
+    let mut draws: Vec<(usize, &crate::gpu::GpuMesh)> = Vec::new();
+    let mut slot = 0usize;
+    for door in &scene.doors {
+        if slot >= r.door_uniform_pool.len() { break; }
+
+        let model_meshes: Vec<&crate::gpu::GpuMesh> =
+            match r.door_models.get(&door.name.to_uppercase()) {
+                Some(w) => w.meshes.iter().collect(),
+                None    => match &r.door_fallback {
+                    Some(cube) => vec![cube],
+                    None       => continue,
+                },
+            };
+        if model_meshes.is_empty() { continue; }
+
+        // Build the placement matrix. Fallback cube uses translate-only (no model orientation).
+        let key = door.name.to_uppercase();
+        let mat = if r.door_models.contains_key(&key) {
+            let scale = door.size as f32 / 100.0;
+            // Door heading is raw EQ units (0..512). The +90° offset (verified visually: doors
+            // face the correct way with it) matches the entity/player convention:
+            // yaw = heading*TAU/512 + FRAC_PI_2.
+            let yaw   = (door.heading / 512.0) * std::f32::consts::TAU + std::f32::consts::FRAC_PI_2;
+            let placement = glam::Mat4::from_translation(glam::Vec3::from(door.pos))
+                * glam::Mat4::from_rotation_z(yaw)
+                * glam::Mat4::from_rotation_y((door.incline as f32 / 512.0) * std::f32::consts::TAU)
+                * glam::Mat4::from_scale(glam::Vec3::splat(scale));
+
+            // Apply open animation in door-local model space (after scale).
+            let f = door.open_frac;
+            let local_open = match door.opentype {
+                100..=119 => glam::Mat4::from_translation(glam::vec3(0.0, 0.0, 10.0 * f)),
+                11..=15   => glam::Mat4::from_translation(glam::vec3(8.0 * f, 0.0, 0.0)),
+                _ => {
+                    // Hinged swing about the model origin (= door.pos = the hinge edge in EQ).
+                    // Negative angle swings the leaf outward (away from the player side).
+                    glam::Mat4::from_rotation_z(-f * std::f32::consts::FRAC_PI_2)
+                }
+            };
+            placement * local_open
+        } else {
+            glam::Mat4::from_translation(glam::Vec3::from(door.pos))
+        };
+
+        r.queue.write_buffer(&r.door_uniform_pool[slot].0, 0,
+            bytemuck::bytes_of(&EntityUniform { model: mat.to_cols_array_2d(), tint: [1.0; 4] }));
+        for mesh in model_meshes {
+            draws.push((slot, mesh));
+        }
+        slot += 1;
+    }
+    if draws.is_empty() { return; }
+
+    // Phase 2: one render pass, drawing every recorded door mesh.
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("doors"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view, resolve_target: None,
+            ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+        })],
+        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+            view: &r.depth_view,
+            depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+            stencil_ops: None,
+        }),
+        timestamp_writes: None, occlusion_query_set: None,
+    });
+    pass.set_pipeline(&r.pipelines.character);
+    pass.set_bind_group(0, &r.camera_uniform.bind_group, &[]);
+    pass.set_bind_group(1, &r.fallback_texture_bg, &[]);
+    for (slot_idx, mesh) in draws {
+        pass.set_bind_group(2, &r.door_uniform_pool[slot_idx].1, &[]);
+        pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+        pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+    }
+}
+
 /// Billboard pass for NPC entities that have no 3D model. Skipped if nothing to draw.
 pub fn encode_billboard_pass(
     r:         &EqRenderer,

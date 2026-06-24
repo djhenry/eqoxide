@@ -114,6 +114,25 @@ pub type SitReq = Arc<Mutex<Option<bool>>>;
 /// Standalone consider of a spawn id.
 pub type ConsiderReq = Arc<Mutex<Option<u32>>>;
 
+/// Door-click request — a door_id, set by POST /doors/click or a human click in the 3D
+/// view. The nav thread reads it once and sends OP_ClickDoor. The door's visual state
+/// changes only when the server replies with OP_MoveDoor (server-authoritative).
+pub type DoorClickReq = Arc<Mutex<Option<u8>>>;
+
+#[derive(Clone, serde::Serialize)]
+pub struct DoorView {
+    pub door_id:  u8,
+    pub name:     String,
+    pub x:        f32,
+    pub y:        f32,
+    pub z:        f32,
+    pub heading:  f32,
+    pub opentype: u8,
+    pub is_open:  bool,
+}
+/// Snapshot of the current zone's doors, published each nav tick for GET /doors.
+pub type DoorsShared = Arc<Mutex<Vec<DoorView>>>;
+
 /// Current zone name and id, updated on every OP_NEW_ZONE.
 #[allow(dead_code)]
 pub type ZoneInfo = Arc<Mutex<(String, u16)>>;
@@ -163,6 +182,8 @@ struct HttpState {
     spells:           std::sync::Arc<crate::spells::SpellDb>,
     player_info:      PlayerInfo,
     task_log:         TaskLog,
+    door_click:       DoorClickReq,
+    doors_shared:     DoorsShared,
     shutdown:         Arc<AtomicBool>,
 }
 
@@ -213,13 +234,15 @@ pub fn spawn_camera_server(
     spells:           std::sync::Arc<crate::spells::SpellDb>,
     player_info:      PlayerInfo,
     task_log:         TaskLog,
+    door_click:       DoorClickReq,
+    doors_shared:     DoorsShared,
     shutdown:         Arc<AtomicBool>,
     port:             u16,
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, cast, sit, consider, buy, move_req, give, inventory, loot, messages, spells, player_info, task_log, shutdown };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, cast, sit, consider, buy, move_req, give, inventory, loot, messages, spells, player_info, task_log, shutdown, door_click, doors_shared };
             let app = Router::new()
                 .route("/camera", get(get_camera).post(post_camera))
                 .route("/camera/reset", post(post_camera_reset))
@@ -247,6 +270,8 @@ pub fn spawn_camera_server(
                 .route("/inventory", get(get_inventory))
                 .route("/loot", post(post_loot))
                 .route("/messages", get(get_messages))
+                .route("/doors", get(get_doors))
+                .route("/doors/click", post(post_door_click))
                 .route("/exit", post(post_exit))
                 .route("/debug", get(get_debug))
                 .with_state(state);
@@ -872,6 +897,39 @@ async fn post_exit(State(s): State<HttpState>) -> (StatusCode, &'static str) {
         std::process::exit(0);
     });
     (StatusCode::OK, "logging out and shutting down")
+}
+
+/// GET /doors — list the current zone's doors (id, name, position, opentype, open state).
+async fn get_doors(State(s): State<HttpState>) -> Json<Vec<DoorView>> {
+    Json(s.doors_shared.lock().unwrap().clone())
+}
+
+#[derive(serde::Deserialize)]
+struct DoorClickBody { door_id: Option<u8>, name: Option<String> }
+
+/// POST /doors/click {"door_id": N}  or  {"name": "DOOR1"} (exact case-insensitive name match).
+async fn post_door_click(
+    State(s): State<HttpState>,
+    body: axum::extract::Json<DoorClickBody>,
+) -> (StatusCode, String) {
+    let id = if let Some(id) = body.door_id {
+        Some(id)
+    } else if let Some(name) = &body.name {
+        let up = name.to_uppercase();
+        s.doors_shared.lock().unwrap().iter()
+            .find(|d| d.name.to_uppercase() == up)
+            .map(|d| d.door_id)
+    } else {
+        None
+    };
+    match id {
+        Some(id) => {
+            *s.door_click.lock().unwrap() = Some(id);
+            (StatusCode::OK, format!("clicking door {}", id))
+        }
+        None => (StatusCode::BAD_REQUEST,
+                 "provide {\"door_id\":N} or {\"name\":\"...\"}".into()),
+    }
 }
 
 async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {

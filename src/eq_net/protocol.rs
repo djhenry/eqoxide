@@ -76,6 +76,8 @@ pub const OP_TIME_OF_DAY: u16 = 0x1580;
 pub const OP_WEATHER: u16 = 0x254d;
 pub const OP_SEND_ZONE_POINTS: u16 = 0x3eba;
 pub const OP_SPAWN_DOOR: u16 = 0x4c24;
+pub const OP_MOVE_DOOR: u16 = 0x700d;   // S->C MoveDoor_Struct {door_id u8, action u8}
+pub const OP_CLICK_DOOR: u16 = 0x043b;  // C->S ClickDoor_Struct (16 bytes)
 pub const OP_SEND_EXP_ZONE_IN: u16 = 0x0587;
 pub const OP_CLIENT_READY: u16 = 0x5e20;
 
