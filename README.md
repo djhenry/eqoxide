@@ -20,6 +20,8 @@ GUI child processes. Logs go to `/tmp/eq_client.log`. Server/credentials live in
 
 Offline asset/zone debugging (no server): `./target/release/eq_renderer --testzone`.
 
+Add `--profile` (or `EQ_PROFILE=1`) for a per-phase frame-timing overlay; see `docs/dev-workflow.md`.
+
 ### Choosing which character logs in
 
 The account + character to log in as is **not** a CLI name argument — it comes from the login
