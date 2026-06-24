@@ -107,6 +107,10 @@ pub struct App {
     /// Offline testzone mode — bypasses EQ server entirely.
     #[allow(dead_code)]
     testzone_mode: bool,
+    /// Set by every shutdown path (POST /exit, OP_GMKick). Observed in `about_to_wait` to exit the
+    /// winit event loop on the MAIN thread, so winit tears down its Wayland clipboard worker cleanly
+    /// — instead of a background thread calling `process::exit()` and racing that teardown (SIGSEGV).
+    shutdown:     std::sync::Arc<std::sync::atomic::AtomicBool>,
     scene:        SceneState,
     app_rx:       tokio::sync::mpsc::UnboundedReceiver<AppPacket>,
     // Frame capture for /frame API
@@ -172,6 +176,7 @@ impl App {
         player_info:     crate::http::PlayerInfo,
         warp:            crate::http::WarpReq,
         testzone_mode:   bool,
+        shutdown:        std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         let mut game_state = GameState::new();
         game_state.player_name = character_name;
@@ -214,7 +219,7 @@ impl App {
             pick_screen_w: 800,
             pick_screen_h: 600,
             game_state, scene: SceneState::default(), app_rx, frame_req,
-            player_info, warp, collision: None, shared_collision,
+            player_info, warp, shutdown, collision: None, shared_collision,
             ground_cache: (f32::NAN, f32::NAN, 0.0),
             last_grounded_z: 0.0,
             prev_render_pos: [0.0, 0.0, 0.0],
@@ -1075,6 +1080,16 @@ impl ApplicationHandler for App {
                 .expect("create window"),
         );
         self.init_gpu(window);
+    }
+
+    /// Called each loop iteration before winit waits for events. If a shutdown was requested
+    /// (POST /exit or OP_GMKick set the flag), exit the event loop HERE on the main thread so
+    /// winit shuts down its Wayland clipboard worker cleanly. A background thread calling
+    /// `process::exit()` while that worker is live races its Wayland-object teardown → SIGSEGV.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            event_loop.exit();
+        }
     }
 
     fn window_event(
