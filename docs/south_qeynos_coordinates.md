@@ -42,8 +42,8 @@ Current HUD shows server (x, y). Should show map (server_y, server_x) so it matc
 
 ## South Qeynos Landmarks
 
-Map image: `south_qeynos_map.png`
 Map coordinate labels: X=200 (west/left) to X=-600 (east/right), Y=600 (north/top) to Y=-200 (south/bottom)
+(The landmark numbers below correspond to a standard EQ-Atlas-style South Qeynos map — not redistributed here.)
 
 | # | Location | Description |
 |---|----------|-------------|

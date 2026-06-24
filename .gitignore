@@ -10,6 +10,13 @@
 # Per-character UI layout state written by the app at runtime
 ui_layout_*.json
 
+# Per-character login configs with credentials — live in ~/.config/eqoxide/
+config-*.yaml
+
+# EQ-Atlas / fan zone maps and other third-party game-derived images
+Zone_*.jpg
+Zone_*.png
+
 # Local scheduled-task state (Claude Code cron)
 .claude/scheduled_tasks.json
 .claude/scheduled_tasks.lock

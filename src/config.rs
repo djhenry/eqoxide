@@ -2,6 +2,20 @@
 
 use std::path::{Path, PathBuf};
 
+/// Directory where eqoxide stores its config and cached per-character login
+/// credentials: `~/.config/eqoxide/` (honoring `XDG_CONFIG_HOME` via the `dirs`
+/// crate). Created on demand; on failure we fall back to the working directory.
+pub fn config_dir() -> PathBuf {
+    let dir = dirs::config_dir()
+        .map(|c| c.join("eqoxide"))
+        .unwrap_or_else(|| PathBuf::from("."));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!("config: could not create {} ({e}), using cwd", dir.display());
+        return PathBuf::from(".");
+    }
+    dir
+}
+
 /// Renderer / HTTP server settings from `config.yaml`.
 pub struct AppConfig {
     pub assets_path: PathBuf,
@@ -12,10 +26,15 @@ pub struct AppConfig {
 
 impl AppConfig {
     pub fn load() -> Self {
-        let cfg_text = std::fs::read_to_string("config.yaml").unwrap_or_else(|e| {
-            tracing::warn!("renderer: config.yaml not found ({}), using defaults", e);
-            String::new()
-        });
+        // Prefer ~/.config/eqoxide/config.yaml; fall back to ./config.yaml for back-compat.
+        let primary = config_dir().join("config.yaml");
+        let cfg_text = std::fs::read_to_string(&primary)
+            .or_else(|_| std::fs::read_to_string("config.yaml"))
+            .unwrap_or_else(|e| {
+                tracing::warn!("renderer: no config.yaml in {} or cwd ({}), using defaults",
+                    primary.display(), e);
+                String::new()
+            });
         Self::from_yaml_str(&cfg_text)
     }
 
@@ -51,8 +70,9 @@ impl AppConfig {
     }
 }
 
-/// EQ login credentials and server addresses, loaded from a per-character config file
-/// (default `~/git/eq-client-ref/config.yaml`, overridable via the `--config <path>` CLI flag).
+/// EQ login credentials and server addresses, loaded from a per-character config
+/// file in `~/.config/eqoxide/`. Selected via the `--config <value>` CLI flag (see
+/// [`LoginConfig::resolve_path`]); defaults to `~/.config/eqoxide/config.yaml`.
 pub struct LoginConfig {
     pub login_host:     String,
     pub login_port:     u16,
@@ -63,6 +83,23 @@ pub struct LoginConfig {
 }
 
 impl LoginConfig {
+    /// Resolve the `--config <value>` argument to a config-file path:
+    /// - `None` → `~/.config/eqoxide/config.yaml`
+    /// - a value containing a path separator (or `~`) → used as a literal path
+    /// - a bare filename ending in `.yaml`/`.yml` → looked up in `~/.config/eqoxide/`
+    /// - any other bare word (a profile name) → `~/.config/eqoxide/config-<name>.yaml`
+    pub fn resolve_path(arg: Option<&str>) -> PathBuf {
+        let Some(v) = arg else { return config_dir().join("config.yaml"); };
+        let expanded = shellexpand::tilde(v).into_owned();
+        if expanded.contains('/') {
+            PathBuf::from(expanded)
+        } else if expanded.ends_with(".yaml") || expanded.ends_with(".yml") {
+            config_dir().join(expanded)
+        } else {
+            config_dir().join(format!("config-{expanded}.yaml"))
+        }
+    }
+
     pub fn load(path: &Path) -> Self {
         let cfg_text = std::fs::read_to_string(path).unwrap_or_default();
         let cfg: serde_yaml::Value =

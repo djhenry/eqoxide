@@ -39,20 +39,6 @@ pub struct UiLayout {
     reset_all:     bool,
 }
 
-/// Directory where window-layout preferences are persisted: `~/.config/eqoxide/`
-/// (honoring `XDG_CONFIG_HOME` via the `dirs` crate). The directory is created if
-/// missing; on failure we fall back to the current working directory.
-pub(crate) fn config_dir() -> PathBuf {
-    let dir = dirs::config_dir()
-        .map(|c| c.join("eqoxide"))
-        .unwrap_or_else(|| PathBuf::from("."));
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("ui_layout: could not create {}: {e}", dir.display());
-        return PathBuf::from(".");
-    }
-    dir
-}
-
 /// Strip characters that are unsafe in a filename.
 pub(crate) fn sanitize(name: &str) -> String {
     name.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect()
@@ -61,7 +47,7 @@ pub(crate) fn sanitize(name: &str) -> String {
 impl UiLayout {
     pub fn load(character_name: &str) -> Self {
         let file = format!("ui_layout_{}.json", sanitize(character_name));
-        let dest = config_dir().join(&file);
+        let dest = crate::config::config_dir().join(&file);
         // One-time migration: older builds saved layouts in the working directory.
         // If a legacy file exists there and we don't already have one in the config
         // dir, move it into place.
