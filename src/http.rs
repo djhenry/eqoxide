@@ -129,6 +129,10 @@ pub type MessagesShared = Arc<Mutex<Vec<MessageEntry>>>;
 pub struct CastRequest { pub gem: u8, pub target_id: Option<u32> }
 /// Cast a memorized gem (0-8) on an explicit target, else current target, else self.
 pub type CastReq = Arc<Mutex<Option<CastRequest>>>;
+/// Scribe/memorize request — (slot, spell_id, scribing): scribing 0 = scribe a scroll into the
+/// spellbook at book `slot`; 1 = memorize a known spell into gem `slot` (0-8). Set by POST
+/// /scribe and POST /memorize; the nav thread sends OP_MemorizeSpell.
+pub type MemSpellReq = Arc<Mutex<Option<(u32, u32, u32)>>>;
 /// Posture: Some(true)=sit, Some(false)=stand.
 pub type SitReq = Arc<Mutex<Option<bool>>>;
 /// Standalone consider of a spawn id.
@@ -191,6 +195,7 @@ struct HttpState {
     target:           TargetReq,
     attack:           AttackReq,
     cast:             CastReq,
+    mem_spell:        MemSpellReq,
     sit:              SitReq,
     consider:         ConsiderReq,
     buy:              BuyReq,
@@ -246,6 +251,7 @@ pub fn spawn_camera_server(
     target:           TargetReq,
     attack:           AttackReq,
     cast:             CastReq,
+    mem_spell:        MemSpellReq,
     sit:              SitReq,
     consider:         ConsiderReq,
     buy:              BuyReq,
@@ -268,7 +274,7 @@ pub fn spawn_camera_server(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, cast, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, spells, player_info, task_log, shutdown, door_click, doors_shared };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, spells, player_info, task_log, shutdown, door_click, doors_shared };
             let app = Router::new()
                 .route("/camera", get(get_camera).post(post_camera))
                 .route("/camera/reset", post(post_camera_reset))
@@ -286,6 +292,8 @@ pub fn spawn_camera_server(
                 .route("/target/name", post(post_target_name))
                 .route("/attack", post(post_attack_on).delete(post_attack_off))
                 .route("/cast", post(post_cast))
+                .route("/scribe", post(post_scribe))
+                .route("/memorize", post(post_memorize))
                 .route("/spells", get(get_spells))
                 .route("/sit", post(post_sit))
                 .route("/stand", post(post_stand))
@@ -696,6 +704,37 @@ async fn post_cast(State(s): State<HttpState>, body: Option<Json<CastBody>>) -> 
     if gem > 8 { return (StatusCode::BAD_REQUEST, "gem must be 0-8".into()); }
     *s.cast.lock().unwrap() = Some(CastRequest { gem, target_id: b.target_id });
     (StatusCode::OK, format!("cast queued (gem {gem})"))
+}
+
+#[derive(serde::Deserialize)]
+struct ScribeBody { spell_id: u32, slot: Option<u32> }
+
+/// POST /scribe {"spell_id":N,"slot":B?} — scribe a spell scroll (in inventory) into the spellbook
+/// at book slot B (default 0). Sends OP_MemorizeSpell with scribing=0. The server validates you
+/// hold the scroll and consumes it.
+async fn post_scribe(
+    State(s): State<HttpState>,
+    body: Result<Json<ScribeBody>, axum::extract::rejection::JsonRejection>,
+) -> (StatusCode, String) {
+    let b = match body { Ok(Json(b)) => b, Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"spell_id\":N,\"slot\":B?}".into()) };
+    let slot = b.slot.unwrap_or(0);
+    *s.mem_spell.lock().unwrap() = Some((slot, b.spell_id, 0));
+    (StatusCode::OK, format!("scribing spell {} into book slot {}", b.spell_id, slot))
+}
+
+#[derive(serde::Deserialize)]
+struct MemorizeBody { spell_id: u32, gem: u32 }
+
+/// POST /memorize {"spell_id":N,"gem":0-8} — memorize a known (scribed) spell into a gem.
+/// Sends OP_MemorizeSpell with scribing=1.
+async fn post_memorize(
+    State(s): State<HttpState>,
+    body: Result<Json<MemorizeBody>, axum::extract::rejection::JsonRejection>,
+) -> (StatusCode, String) {
+    let b = match body { Ok(Json(b)) => b, Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"spell_id\":N,\"gem\":0-8}".into()) };
+    if b.gem > 8 { return (StatusCode::BAD_REQUEST, "gem must be 0-8".into()); }
+    *s.mem_spell.lock().unwrap() = Some((b.gem, b.spell_id, 1));
+    (StatusCode::OK, format!("memorizing spell {} into gem {}", b.spell_id, b.gem))
 }
 
 /// GET /spells — the 9 memorized gems with names. Empty gem = spell id 0 or 0xFFFFFFFF.

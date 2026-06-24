@@ -7,7 +7,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::{GameState, ZonePoint};
-use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, TradeCmd, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, CastReq, SitReq, ConsiderReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
+use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, TradeCmd, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, CastReq, MemSpellReq, SitReq, ConsiderReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
 
 /// Pending state of a quest turn-in (POST /give). The trade window spans multiple nav ticks:
 /// we send OP_TradeRequest, then must wait for the server's OP_TradeRequestAck before moving the
@@ -43,6 +43,17 @@ pub fn build_cast_packet(slot: u32, spell_id: u32, target_id: u32) -> Vec<u8> {
     buf[4..8].copy_from_slice(&spell_id.to_le_bytes());
     buf[8..12].copy_from_slice(&0xFFFFu32.to_le_bytes());
     buf[12..16].copy_from_slice(&target_id.to_le_bytes());
+    buf
+}
+
+/// Titanium `MemorizeSpell_Struct` (16 bytes): slot, spell_id, scribing, reduction.
+/// scribing: 0 = scribe a scroll into the spellbook at `slot`; 1 = memorize a known spell into
+/// gem `slot` (0-8); 2 = un-memorize.
+pub fn build_memorize_packet(slot: u32, spell_id: u32, scribing: u32) -> Vec<u8> {
+    let mut buf = vec![0u8; 16];
+    buf[0..4].copy_from_slice(&slot.to_le_bytes());
+    buf[4..8].copy_from_slice(&spell_id.to_le_bytes());
+    buf[8..12].copy_from_slice(&scribing.to_le_bytes());
     buf
 }
 
@@ -157,6 +168,7 @@ pub struct Navigator {
     move_req:         MoveReq,
     give:             GiveReq,
     cast:             CastReq,
+    mem_spell:        MemSpellReq,
     sit:              SitReq,
     consider:         ConsiderReq,
     /// In-progress quest turn-in (POST /give), or None when idle. Drives the trade-window
@@ -214,6 +226,7 @@ impl Navigator {
         doors_shared:     DoorsShared,
         messages:         MessagesShared,
         cast:             CastReq,
+        mem_spell:        MemSpellReq,
         sit:              SitReq,
         consider:         ConsiderReq,
         collision:        crate::assets::SharedCollision,
@@ -237,6 +250,7 @@ impl Navigator {
             move_req,
             give,
             cast,
+            mem_spell,
             sit,
             consider,
             give_state: None,
@@ -531,6 +545,17 @@ impl Navigator {
             }
         }
 
+        // Scribe a scroll into the spellbook (scribing=0) or memorize a known spell into a gem
+        // (scribing=1) — OP_MemorizeSpell. The server validates (you hold the scroll / know the
+        // spell) and pushes OP_MemorizeSpell back, which updates gs.mem_spells for the gem case.
+        let mem_req = self.mem_spell.lock().unwrap().take();
+        if let Some((slot, spell_id, scribing)) = mem_req {
+            stream.send_app_packet(OP_MEMORIZE_SPELL, &build_memorize_packet(slot, spell_id, scribing));
+            let what = match scribing { 0 => "scribe", 1 => "memorize", _ => "unmem" };
+            tracing::info!("EQ: {what} spell={spell_id} slot={slot}");
+            gs.log_msg("spell", &format!("{what} spell {spell_id} (slot {slot})"));
+        }
+
         // Sit / stand (OP_SpawnAppearance type=14, param 110/100).
         let sit_req = self.sit.lock().unwrap().take();
         if let Some(sit) = sit_req {
@@ -682,17 +707,34 @@ impl Navigator {
         // the current target. Only (re)issue PET_ATTACK when the target changes, so we don't spam
         // OP_PetCommands every tick. The player's own melee auto-engage (below) still runs, which
         // keeps her walking into loot range while the pet does the damage.
-        if self.auto_attack {
-            match (gs.pet_id, gs.target_id) {
-                (Some(pet), Some(tid)) => {
-                    let live = gs.entities.get(&tid).map(|e| !e.dead).unwrap_or(false);
-                    if live && self.last_pet_target != Some(tid) {
-                        stream.send_app_packet(OP_PET_COMMANDS, &build_pet_command(PET_ATTACK, tid));
-                        self.last_pet_target = Some(tid);
-                        tracing::info!("EQ: pet {pet} → attack target {tid}");
+        if let Some(pet) = gs.pet_id {
+            // Engage only a reasonably-close LIVE target (<=200u) so the pet doesn't run across the
+            // zone after a distant mob and lose itself. When there's no such target (idle, or the
+            // mob died), recall the pet with PET_BACKOFF so it returns to the owner instead of
+            // wandering off — the previous version left it chasing and it dropped out of view.
+            let engage = if self.auto_attack {
+                gs.target_id
+                    .and_then(|tid| gs.entities.get(&tid).map(|e| (tid, e)))
+                    .filter(|(_, e)| {
+                        let dx = e.x - gs.player_x; let dy = e.y - gs.player_y;
+                        !e.dead && dx * dx + dy * dy <= 200.0 * 200.0
+                    })
+                    .map(|(tid, _)| tid)
+            } else { None };
+            match engage {
+                Some(tid) if self.last_pet_target != Some(tid) => {
+                    stream.send_app_packet(OP_PET_COMMANDS, &build_pet_command(PET_ATTACK, tid));
+                    self.last_pet_target = Some(tid);
+                    tracing::info!("EQ: pet {pet} → attack target {tid}");
+                }
+                Some(_) => {} // already attacking this target
+                None => {
+                    if self.last_pet_target.is_some() {
+                        stream.send_app_packet(OP_PET_COMMANDS, &build_pet_command(PET_BACKOFF, 0));
+                        self.last_pet_target = None;
+                        tracing::info!("EQ: pet {pet} → back off (no target)");
                     }
                 }
-                _ => self.last_pet_target = None,
             }
         } else {
             self.last_pet_target = None;
