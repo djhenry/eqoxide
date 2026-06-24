@@ -20,7 +20,7 @@ use crate::eq_net::packet_handler::apply_packet;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::GameState;
-use crate::http::{AttackReq, BuyReq, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, CastReq, SitReq, ConsiderReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
+use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, CastReq, SitReq, ConsiderReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
 
 type DesCbcEnc = Encryptor<Des>;
 type DesCbcDec = Decryptor<Des>;
@@ -78,6 +78,9 @@ pub async fn run_login_flow(
     target:           TargetReq,
     attack:           AttackReq,
     buy:              BuyReq,
+    sell:             SellReq,
+    trade:            TradeReq,
+    merchant:         MerchantShared,
     move_req:         MoveReq,
     give:             GiveReq,
     inventory:        InventoryShared,
@@ -116,7 +119,7 @@ pub async fn run_login_flow(
                     tracing::info!("NAV: {} zone points seeded", gs.zone_points.len());
                 }
                 let char_name = config.character_name.clone();
-                let navigator = Navigator::new(goto_target, entity_positions, entity_ids, zone_points, task_log, zone_cross, hail, say, target, attack, buy, move_req, give, inventory, loot, door_click, doors_shared, messages, cast, sit, consider, collision, maps_dir);
+                let navigator = Navigator::new(goto_target, entity_positions, entity_ids, zone_points, task_log, zone_cross, hail, say, target, attack, buy, sell, trade, merchant, move_req, give, inventory, loot, door_click, doors_shared, messages, cast, sit, consider, collision, maps_dir);
                 run_gameplay_phase(stream, net_rx, app_tx, gs, char_name, navigator, world_creds, shutdown.clone()).await;
                 return Ok(());
             }

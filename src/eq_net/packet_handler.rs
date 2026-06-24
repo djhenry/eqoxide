@@ -56,6 +56,14 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_COMPLETED_TASKS      => apply_completed_tasks(gs, p),
         OP_CHAR_INVENTORY       => apply_char_inventory(gs, p),
         OP_ITEM_PACKET          => apply_item_packet(gs, p),
+        OP_SHOP_REQUEST         => apply_shop_request(gs, p),
+        OP_SHOP_PLAYER_SELL     => apply_shop_player_sell(gs, p),
+        OP_SHOP_END             => {
+            // Server confirmed the merchant window closed.
+            gs.merchant_open = None;
+            gs.merchant_items.clear();
+            tracing::info!("EQ: merchant window closed (OP_ShopEnd)");
+        }
         OP_TRADE_REQUEST_ACK    => {
             // Server acknowledged our OP_TradeRequest — the trade session now exists. The give
             // state machine (navigation.rs) waits on this before moving the item into the NPC slot.
@@ -215,17 +223,85 @@ fn apply_char_inventory(gs: &mut GameState, p: &[u8]) {
     }
 }
 
-/// OP_ItemPacket — a single item (loot/trade/summon). Upsert into the inventory by slot.
+/// OP_ItemPacket — a single item. The 4-byte header is the `ItemPacketType` (Titanium): 0x64 =
+/// Merchant (an item the open merchant offers), 0x66 = Loot, 0x69 = CharInventory, etc. Merchant
+/// items are routed to `gs.merchant_items` (for `GET /trade/list` + the HUD merchant window);
+/// everything else upserts into the player inventory by slot.
 fn apply_item_packet(gs: &mut GameState, p: &[u8]) {
-    // The single-item packet has a small fixed header before the serialized item; find the first
-    // record by skipping to the serialized text (split on NUL handles the trailing terminator).
+    const ITEM_PACKET_MERCHANT: u8 = 0x64;
+    let packet_type = p.first().copied().unwrap_or(0);
     let text = String::from_utf8_lossy(p);
     for record in text.split('\0') {
-        if let Some(it) = parse_inv_item(record) {
+        if packet_type == ITEM_PACKET_MERCHANT {
+            if let Some(mi) = parse_merchant_item(record) {
+                gs.merchant_items.retain(|x| x.merchant_slot != mi.merchant_slot);
+                gs.merchant_items.push(mi);
+                gs.merchant_items.sort_by_key(|m| m.merchant_slot);
+                break;
+            }
+        } else if let Some(it) = parse_inv_item(record) {
             gs.inventory.retain(|x| x.slot != it.slot);
             gs.inventory.push(it);
             break;
         }
+    }
+}
+
+/// Parse one pipe-delimited MERCHANT item record. Field indices (from EQEmu titanium.cpp
+/// SerializeItem): [2]=merchant slot, [3]=merchant price, [4]=merchant count, [12]=Name,
+/// [15]=item id, [22]=Icon. None if it doesn't have the core fields.
+fn parse_merchant_item(record: &str) -> Option<crate::game_state::MerchantItem> {
+    let f: Vec<&str> = record.split('|').collect();
+    if f.len() < 23 { return None; }
+    let merchant_slot: u32 = f[2].trim().parse().ok()?;
+    let price: u32 = f[3].trim().parse().unwrap_or(0);
+    let quantity: i32 = f[4].trim().parse().unwrap_or(0);
+    let name = f[12].trim().trim_start_matches('"').to_string();
+    let item_id: u32 = f[15].trim().parse().unwrap_or(0);
+    let icon: u32 = f[22].trim().parse().unwrap_or(0);
+    if name.is_empty() && item_id == 0 { return None; }
+    Some(crate::game_state::MerchantItem { merchant_slot, item_id, name, icon, price, quantity })
+}
+
+/// OP_ShopPlayerSell (server→client echo) — confirms a sale completed. Merchant_Purchase_Struct:
+/// npcid @0, itemslot @4 (the WIRE slot, server-translated back), quantity @8, price @12. The
+/// server has already removed the item from the player; mirror that in `gs.inventory` so the
+/// display + `GET /inventory` refresh (otherwise sold items linger and look like a failed sale).
+fn apply_shop_player_sell(gs: &mut GameState, p: &[u8]) {
+    if p.len() < 16 { return; }
+    let itemslot = u32::from_le_bytes([p[4], p[5], p[6], p[7]]) as i32;
+    let quantity = u32::from_le_bytes([p[8], p[9], p[10], p[11]]) as i32;
+    let price    = u32::from_le_bytes([p[12], p[13], p[14], p[15]]);
+    if let Some(idx) = gs.inventory.iter().position(|i| i.slot == itemslot) {
+        let it = &mut gs.inventory[idx];
+        let sold_name = it.name.clone();
+        if quantity <= 0 || it.charges <= quantity {
+            gs.inventory.remove(idx);
+        } else {
+            it.charges -= quantity;
+        }
+        gs.log_msg("merchant", &format!("Sold {} x{} for {}c", sold_name, quantity.max(1), price));
+        tracing::info!("EQ: sale confirmed — slot={itemslot} qty={quantity} price={price}");
+    }
+}
+
+/// OP_ShopRequest (server→client echo) — the merchant accepted (command=Open=1) or rejected
+/// (command=Close=0, e.g. KOS faction / busy) the window. MerchantClick_Struct: npc_id(u32) @0,
+/// player_id(u32) @4, command(u32) @8. Opens/closes the HUD merchant window + `/trade` session.
+fn apply_shop_request(gs: &mut GameState, p: &[u8]) {
+    if p.len() < 12 { return; }
+    let npc_id = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+    let command = u32::from_le_bytes([p[8], p[9], p[10], p[11]]);
+    if command == 1 {
+        gs.merchant_open = Some(npc_id);
+        gs.merchant_items.clear(); // fresh list arrives via OP_ItemPacket(Merchant)
+        gs.log_msg("merchant", "Merchant window opened");
+        tracing::info!("EQ: merchant window opened (npc_id={npc_id})");
+    } else {
+        gs.merchant_open = None;
+        gs.merchant_items.clear();
+        gs.log_msg("merchant", "Merchant won't trade (window closed)");
+        tracing::info!("EQ: merchant window closed/refused (npc_id={npc_id}, command={command})");
     }
 }
 

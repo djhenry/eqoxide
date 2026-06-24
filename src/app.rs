@@ -118,6 +118,10 @@ pub struct App {
     cast:         crate::http::CastReq,
     sit:          crate::http::SitReq,
     consider:     crate::http::ConsiderReq,
+    /// Merchant buy/sell/open-close request slots written by the HUD merchant window.
+    buy:          crate::http::BuyReq,
+    sell:         crate::http::SellReq,
+    trade:        crate::http::TradeReq,
     spells:       std::sync::Arc<crate::spells::SpellDb>,
     /// Shared door-click request slot; the nav thread drains it and sends OP_ClickDoor.
     door_click:   crate::http::DoorClickReq,
@@ -216,6 +220,9 @@ impl App {
         cast:            crate::http::CastReq,
         sit:             crate::http::SitReq,
         consider:        crate::http::ConsiderReq,
+        buy:             crate::http::BuyReq,
+        sell:            crate::http::SellReq,
+        trade:           crate::http::TradeReq,
         spells:          std::sync::Arc<crate::spells::SpellDb>,
         door_click:      crate::http::DoorClickReq,
         shared_collision: assets::SharedCollision,
@@ -258,7 +265,7 @@ impl App {
             active_until: std::time::Instant::now(),
             frame_profile: crate::profiling::FrameProfile::default(),
             keys_held: std::collections::HashSet::new(),             override_pos: None, warp_cooldown: 0, goto_target,
-            hail, say, target, attack, cast, sit, consider, spells, door_click, say_buffer: String::new(),
+            hail, say, target, attack, cast, sit, consider, buy, sell, trade, spells, door_click, say_buffer: String::new(),
             drag_active: false, last_cursor: winit::dpi::PhysicalPosition::new(0.0, 0.0),
             click_start: None,
             pick_view_proj: [
@@ -1202,6 +1209,7 @@ impl App {
             cam_eye, self.collision.as_deref(),
             &self.hail, &self.say, &self.target, &mut self.say_buffer,
             &self.attack, &self.cast, &self.sit, &self.consider, &self.spells,
+            &self.buy, &self.sell, &self.trade,
             &self.spell_icons,
             &mut self.show_inventory,
             &mut self.ui_zoom, &mut self.ui_zoom_size,
@@ -1268,6 +1276,9 @@ impl App {
         sit:           &crate::http::SitReq,
         consider:      &crate::http::ConsiderReq,
         spells:        &crate::spells::SpellDb,
+        buy:           &crate::http::BuyReq,
+        sell:          &crate::http::SellReq,
+        trade:         &crate::http::TradeReq,
         spell_icons:   &[egui::TextureHandle],
         show_inventory: &mut bool,
         ui_zoom:       &mut f32,
@@ -1313,6 +1324,7 @@ impl App {
                 hud::draw_control_bar(ctx, ui_layout, scene, hail, say, target, say_buffer);
                 hud::draw_action_grid(ctx, ui_layout, scene, spells, spell_icons, attack, cast, sit, target, consider);
                 hud::draw_inventory(ctx, ui_layout, scene, show_inventory);
+                hud::draw_merchant(ctx, ui_layout, scene, buy, sell, trade);
                 if show_debug {
                     hud::draw_debug_overlay(ctx, scene.player_pos, scene.player_heading, current_zone, corrections);
                 }

@@ -93,6 +93,10 @@ pub struct SceneState {
     pub auto_attack: bool,
     /// The spawn_id of the current target, if any.
     pub target_id: Option<u32>,
+    /// `Some(merchant_entity_id)` while a merchant window is open; drives the HUD merchant window.
+    pub merchant_open: Option<u32>,
+    /// Items the open merchant offers (for the merchant window's buy list).
+    pub merchant_items: Vec<crate::game_state::MerchantItem>,
 }
 
 impl SceneState {
@@ -257,6 +261,8 @@ impl SceneState {
             sitting: gs.sitting,
             auto_attack: gs.auto_attack,
             target_id: gs.target_id,
+            merchant_open: gs.merchant_open,
+            merchant_items: gs.merchant_items.clone(),
         }
     }
 }
