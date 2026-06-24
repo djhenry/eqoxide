@@ -48,6 +48,18 @@ fn main() {
     // EQ network thread, which performs the logout sequence and exits the process.
     let shutdown: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
+    // Route SIGTERM/SIGINT into the same clean-shutdown flag so a killed process (e.g.
+    // `timeout N ./eq_renderer`, Ctrl-C, or `kill <pid>`) logs out cleanly instead of dropping
+    // its UDP stream. A sudden drop leaves the character LINKDEAD on the server for
+    // Zone:ClientLinkdeadMS (90s) before it can be re-logged; a clean OP_Logout removes it
+    // immediately. signal-hook's handler only stores into the AtomicBool (async-signal-safe);
+    // the network thread observes the flag and runs the OP_Logout sequence.
+    for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
+        if let Err(e) = signal_hook::flag::register(sig, Arc::clone(&shutdown)) {
+            eprintln!("warning: failed to register signal {sig} for clean shutdown: {e}");
+        }
+    }
+
     let goto_target:      http::GotoTarget      = Arc::new(Mutex::new(None));
     let entity_positions: http::EntityPositions = Arc::new(Mutex::new(HashMap::new()));
     let entity_ids:       http::EntityIds       = Arc::new(Mutex::new(HashMap::new()));
