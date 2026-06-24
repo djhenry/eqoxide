@@ -751,10 +751,16 @@ impl Navigator {
                     let dist = (dx * dx + dy * dy).sqrt();
                     if dist < 200.0 { // engage targets within ~200u (sparse spawns; walk to them)
                         const MELEE: f32 = 5.0;
+                        const PET_STANDOFF: f32 = 25.0; // pet classes hang back and let the pet tank
+                        // With a pet, DON'T walk into melee — the pet holds aggro (PET_ATTACK) and a
+                        // squishy caster who closes to melee just gets killed (a level-1 necro died
+                        // to a level-4 skeleton this way). Stand off ~25u: out of the mob's melee but
+                        // close enough to loot the corpse after the pet kills it.
+                        let engage = if gs.pet_id.is_some() { PET_STANDOFF } else { MELEE };
                         let hdg = if dist > 0.01 { eq_heading(dx, dy) } else { gs.player_heading };
-                        if dist > MELEE {
+                        if dist > engage {
                             // Step toward the target (collision-aware), facing it.
-                            let step = 8.0_f32.min(dist - MELEE);
+                            let step = 8.0_f32.min(dist - engage);
                             let fdx = dx / dist * step;
                             let fdy = dy / dist * step;
                             let nz = gs.player_z;
