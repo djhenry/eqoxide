@@ -595,8 +595,8 @@ pub fn equip_swap_key(prefix: &str, slot: EquipSlot, material: u32) -> Option<St
     // face/hands/feet texture (None). For BODY regions (chest/arms/forearm/legs) material 0 is the
     // baseline CLOTH texture (variant 00, e.g. "elfch0001" — a clothed tunic), NOT skin: load it by
     // name from the s3d like the original client does. EQ has no nude-torso texture, and the GLB's
-    // baked body texture is unreliable (it baked skin). See original-client
-    // analysis of the original client ("why a brand-new character is not naked").
+    // baked body texture is unreliable (it baked skin). This matches the behavior of the
+    // original Titanium game client ("why a brand-new character is not naked").
     if material == 0 && matches!(&slot.region, b"he" | b"hn" | b"ft") {
         return None;
     }
@@ -605,7 +605,7 @@ pub fn equip_swap_key(prefix: &str, slot: EquipSlot, material: u32) -> Option<St
 
 /// Velious armor materials (17-23) reuse a classic base-tier texture when a race's Velious art isn't
 /// shipped (e.g. elves have no `elf*23` textures, only human/Iksar do). The original Titanium client
-/// remaps them (eqgame.exe client_fn): 17/20/23 → 1 (leather), 18/21 → 2 (chain), 19/22 → 3
+/// remaps them (observed behavior of the original Titanium `eqgame.exe`): 17/20/23 → 1 (leather), 18/21 → 2 (chain), 19/22 → 3
 /// (plate). Returns the fallback material to try when the raw material's texture is missing, so e.g.
 /// material-23 cloth pants on an elf render as leather-look leggings instead of bare skin. (The
 /// wizard-only 23 → 4 case is omitted.)
