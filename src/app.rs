@@ -435,6 +435,10 @@ impl App {
                             format!("Downloading zone {}/{} ({:.1} MB)…", p.done, p.total, mb);
                     }
                 })?;
+                // Door/object models for clickable doors come from the asset server's
+                // "zonedoors/<zone>" set (the raw <zone>_obj.s3d) into the cache — never ~/eq_assets.
+                // Best-effort: if it's absent, load_door_models falls back to plain boxes.
+                let _ = crate::asset_sync::sync_set(&sync, &format!("zonedoors/{zone_name}"), &cache, &mut |_| {});
                 set_status("Reading zone geometry…");
                 assets::ZoneAssets::from_glb(&cache.models_dir().join(format!("{zone_name}.glb")))
             })();
@@ -472,9 +476,12 @@ impl App {
         let result = self.pending_load.lock().unwrap().take();
         let Some(load) = result else { return };
 
-        // Paths for this zone's door/object models (computed before the &mut self.gpu borrow).
-        let door_s3d = self.assets_path.join(format!("{}.s3d", load.zone_name));
-        let door_obj = self.assets_path.join(format!("{}_obj.s3d", load.zone_name));
+        // Paths for this zone's door/object models — from the asset-server cache ("zonedoors/<zone>"
+        // set), not ~/eq_assets. The main .s3d usually isn't cached (only _obj is served); that's
+        // fine — load_object_models skips a missing file and door objects live in _obj.s3d.
+        let cache_models = crate::asset_sync::CacheDirs::resolve().models_dir();
+        let door_s3d = cache_models.join(format!("{}.s3d", load.zone_name));
+        let door_obj = cache_models.join(format!("{}_obj.s3d", load.zone_name));
 
         if let Some((_, renderer)) = &mut self.gpu {
             match load.assets {
@@ -508,7 +515,9 @@ impl App {
             match result {
                 Ok(()) => {
                     if let Some((_, renderer)) = &mut self.gpu {
-                        renderer.load_character_models(&self.models_path, &self.assets_path);
+                        // Both args are the cache now (equip/weapon S3Ds come from the "gameequip"
+                        // set in the cache); the 2nd arg is ignored but kept for signature stability.
+                        renderer.load_character_models(&self.models_path, &self.models_path);
                     }
                     self.models_loaded = true;
                     self.loading = false;
