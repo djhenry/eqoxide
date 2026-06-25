@@ -408,7 +408,9 @@ impl App {
             return;
         }
 
-        let maps_dir    = self.assets_path.join("maps");
+        // Zone maps (minimap) + water regions come from the asset server's "gamedata" set in the
+        // local cache (synced at startup), not from ~/eq_assets.
+        let maps_dir    = crate::asset_sync::CacheDirs::resolve().models_dir().join("maps");
         let load_status = self.load_status.clone();
         let pending     = self.pending_load.clone();
         let url  = self.asset_server_url.clone();
