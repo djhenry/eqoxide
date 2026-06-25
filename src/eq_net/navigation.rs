@@ -496,8 +496,6 @@ impl Navigator {
         // Auto zone-cross: if the player is within range of a zone point, warp to
         // it and send OP_ZONE_CHANGE automatically. Cooldown prevents looping.
         {
-            const ZONE_LINE_DIST: f32 = 15.0;
-            const ZONE_LINE_DIST2: f32 = ZONE_LINE_DIST * ZONE_LINE_DIST;
             const ZONE_CROSS_COOLDOWN_MS: u128 = 10000; // 10 seconds
             if self.last_zone_cross.elapsed().as_millis() > ZONE_CROSS_COOLDOWN_MS {
             const ZONE_LINE_DIST: f32 = 15.0;
