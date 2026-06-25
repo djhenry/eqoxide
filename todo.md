@@ -3,6 +3,21 @@
 Active work + bite-sized tasks for smaller agents to continue if the main session stops.
 Keep this updated as tasks complete.
 
+## TODO: move remaining ~/eq_assets binary deps to the asset server
+
+The TEXT game data (eqstr_us.txt, spells_us.txt, zone maps + water .wtr) now comes from the asset
+server's "gamedata" set (see build_gamedata_from_raw in eqoxide_asset_server), synced to the cache
+at startup — the client no longer reads those from ~/eq_assets. STILL reading ~/eq_assets at runtime
+(binary, original game content):
+- Equipment textures: renderer.rs indexes global*_amr.s3d / global_chr.s3d / <zone>_chr2.s3d via
+  `assets_path` (index_s3d_textures) to texture worn armor.
+- Weapon models: assets.rs `load_weapon_model` loads `<idfile>.s3d` (e.g. IT10649.s3d) from
+  `assets_path` to render held weapons.
+To fully drop the ~/eq_assets (and ~/git/NostalgiaEQ-Client) runtime dependency, serve these as
+derived assets too (e.g. a "gameequip" set of armor textures + per-weapon GLBs from the asset
+server, synced to the cache), then point renderer.rs/assets.rs at the cache instead of `assets_path`.
+Zone terrain GLBs + character models already come from the asset server ("zone/*" + "common" sets).
+
 ## TODO: exhaustive fall-damage testing (controlled-fall nav)
 
 Controlled-fall navigation + native fall rate (app.rs gravity/terminal 120/128) + client-side fall
