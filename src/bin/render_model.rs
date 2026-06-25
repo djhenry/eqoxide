@@ -493,6 +493,77 @@ fn main() {
     event_loop.run_app(&mut app).expect("event loop run");
 }
 
+/// Packed vertex for the skin_probe compute shader (std430 scalar layout, 44 bytes).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct ProbeVtx {
+    px: f32, py: f32, pz: f32,
+    j0: u32, j1: u32, j2: u32, j3: u32,
+    w0: f32, w1: f32, w2: f32, w3: f32,
+}
+
+/// Run the GPU skinning math (skin_probe.wgsl — identical to the vertex shader) over
+/// `cpu_verts` with `matrices`, read back the result, and return the model-Y extent.
+/// This is the ground-truth GPU-skinned size, to compare against the CPU (skin_point).
+fn gpu_skin_y_extent(
+    device: &wgpu::Device, queue: &wgpu::Queue,
+    matrices: &[[[f32; 4]; 4]],
+    cpu_verts: &[([f32; 3], [u32; 4], [f32; 4])],
+) -> f32 {
+    use wgpu::util::DeviceExt;
+    let n = cpu_verts.len();
+    if n == 0 { return 0.0; }
+    // Joint uniform buffer (128 mat4).
+    let id4 = [[1f32,0.,0.,0.],[0.,1.,0.,0.],[0.,0.,1.,0.],[0.,0.,0.,1.]];
+    let mut joint_array = [id4; 128];
+    for (i, m) in matrices.iter().enumerate().take(128) { joint_array[i] = *m; }
+    let joints_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("probe_joints"), contents: bytemuck::cast_slice(&joint_array),
+        usage: wgpu::BufferUsages::UNIFORM });
+    let verts: Vec<ProbeVtx> = cpu_verts.iter().map(|(p, j, w)| ProbeVtx {
+        px: p[0], py: p[1], pz: p[2], j0: j[0], j1: j[1], j2: j[2], j3: j[3],
+        w0: w[0], w1: w[1], w2: w[2], w3: w[3] }).collect();
+    let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("probe_verts"), contents: bytemuck::cast_slice(&verts),
+        usage: wgpu::BufferUsages::STORAGE });
+    let out_size = (n * 16) as u64;
+    let obuf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("probe_out"), size: out_size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("probe_staging"), size: out_size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("skin_probe"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/skin_probe.wgsl").into()) });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("skin_probe"), layout: None, module: &module, entry_point: "main",
+        compilation_options: Default::default(), cache: None });
+    let bgl = pipeline.get_bind_group_layout(0);
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None, layout: &bgl, entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: joints_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: vbuf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: obuf.as_entire_binding() },
+        ] });
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    {
+        let mut cpass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+        cpass.set_pipeline(&pipeline);
+        cpass.set_bind_group(0, &bg, &[]);
+        cpass.dispatch_workgroups(((n + 63) / 64) as u32, 1, 1);
+    }
+    enc.copy_buffer_to_buffer(&obuf, 0, &staging, 0, out_size);
+    queue.submit(std::iter::once(enc.finish()));
+    staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    device.poll(wgpu::Maintain::Wait);
+    let data = staging.slice(..).get_mapped_range();
+    let floats: &[f32] = bytemuck::cast_slice(&data);
+    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+    for k in 0..n { let y = floats[k * 4 + 1]; if y.is_finite() { lo = lo.min(y); hi = hi.max(y); } }
+    hi - lo
+}
+
 /// Skinned-mode render state — mirrors the client's `encode_skinned_entity_pass`.
 struct SkinnedView {
     model:      GpuSkinnedModel,
@@ -502,6 +573,11 @@ struct SkinnedView {
     arch:       String,
     anim_time:  f32,
     last:       std::time::Instant,
+    /// CPU copy of (position, joint_indices, joint_weights) for every skinned vertex,
+    /// so we can re-skin on the CPU with the EXACT joint matrices the GPU uses each
+    /// frame and compare against the visible GPU size (root-cause instrumentation).
+    cpu_verts:  Vec<([f32; 3], [u32; 4], [f32; 4])>,
+    dbg_done:   bool,
 }
 
 struct ModelViewerApp {
@@ -808,8 +884,32 @@ impl ApplicationHandler for ModelViewerApp {
                     eprintln!("render_model[skinned]: race={r} arch={} clips={} true_h={:.3} node_scale={:.3} target={:.2} -> scale={:.4}",
                         self.arch_name, smodel.skin.clips.len(), smodel.true_height, smodel.node_scale, tgt,
                         (tgt / smodel.true_height.max(0.001)) * smodel.node_scale);
+                    // Flatten the GPU's exact vertex inputs (matches the filter above).
+                    let mut cpu_verts: Vec<([f32;3],[u32;4],[f32;4])> = Vec::new();
+                    for (mesh, sd_opt) in asset.meshes.iter().zip(asset.skin_meshes.iter()) {
+                        if mesh.positions.is_empty() || mesh.indices.is_empty() { continue; }
+                        let sd = sd_opt.as_ref();
+                        for (i, &p) in mesh.positions.iter().enumerate() {
+                            let ji = sd.and_then(|s: &SkinnedMeshData| s.joint_indices.get(i)).copied().unwrap_or([0u32;4]);
+                            let jw = sd.and_then(|s: &SkinnedMeshData| s.joint_weights.get(i)).copied().unwrap_or([1.0,0.0,0.0,0.0]);
+                            cpu_verts.push((p, ji, jw));
+                        }
+                    }
+                    // GPU readback: run the real GPU skinning math over the same verts +
+                    // frame-0 matrices and measure the result. If this != the CPU extent,
+                    // the GPU pipeline itself diverges.
+                    {
+                        let idle0 = smodel.skin.clip_for_action("idle")
+                            .or_else(|| smodel.skin.clip_for_action("walking")).unwrap_or(0);
+                        let m0 = smodel.skin.evaluate(idle0, 0.0);
+                        let gpu_ext = gpu_skin_y_extent(&device, &queue, &m0, &cpu_verts);
+                        let scale = tgt / smodel.true_height.max(0.001) * smodel.node_scale;
+                        eprintln!("render_model[skinned] GPU-PROBE: gpu_skinned_y_extent={:.3} (cpu={:.3}) -> GPU rendered≈{:.2} ft",
+                            gpu_ext, smodel.true_height, gpu_ext * scale);
+                    }
                     Some(SkinnedView { model: smodel, joints_buf, joints_bg, race: r,
-                        arch: self.arch_name.clone(), anim_time: 0.0, last: std::time::Instant::now() })
+                        arch: self.arch_name.clone(), anim_time: 0.0, last: std::time::Instant::now(),
+                        cpu_verts, dbg_done: false })
                 }
                 _ => { eprintln!("render_model: --race given but model has no usable skin; falling back to static"); None }
             }
@@ -1073,9 +1173,35 @@ fn render_frame(s: &mut ViewerState) {
         let mut joint_array = [id4; 128];
         for (i, m) in matrices.iter().enumerate().take(128) { joint_array[i] = *m; }
         s.queue.write_buffer(&sk.joints_buf, 0, bytemuck::cast_slice(&joint_array));
+        // One-shot: CPU-skin the GPU's EXACT vertex inputs with the GPU's EXACT joint
+        // matrices for THIS frame. If this differs from the visible GPU size, the bug is
+        // in the GPU pipeline downstream of the skinning math (not the pose/scale).
         let m = camera::entity_model_matrix_heading(
             [0.0, 0.0, 0.0], 0.0, vscale, dominant, [0.0, 0.0], true, 0.0,
         );
+        if !sk.dbg_done {
+            sk.dbg_done = true;
+            use glam::Mat4;
+            let mats: Vec<Mat4> = matrices.iter().map(|mm| Mat4::from_cols_array_2d(mm)).collect();
+            // Outlier check on the skinned model-Y: if the full max-min extent is much larger
+            // than the p0.5..p99.5 body, stray verts are inflating true_height (the root cause
+            // of the male-model half-size bug, now fixed in models.rs by using the robust extent).
+            let mut ys: Vec<f32> = Vec::with_capacity(sk.cpu_verts.len());
+            for (p, ji, jw) in &sk.cpu_verts {
+                let sp = eq_renderer::anim::SkinData::skin_point(*p, *ji, *jw, &mats);
+                if sp[1].is_finite() { ys.push(sp[1]); }
+            }
+            ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let n = ys.len();
+            let pct = |q: f32| ys[((n as f32 - 1.0) * q) as usize];
+            // If max-min (true_height) >> p99-p01, the AABB is inflated by outlier verts,
+            // and the visible BODY renders at body_extent/true_height of target.
+            let full = ys[n-1] - ys[0];
+            let p99_01 = pct(0.99) - pct(0.01);
+            let p995_005 = pct(0.995) - pct(0.005);
+            eprintln!("render_model[skinned] OUTLIER-CHECK: verts={} full_extent={:.3} p1..p99={:.3} p0.5..p99.5={:.3}  body/full={:.3} (if <<1, stray verts inflate true_height)",
+                n, full, p99_01, p995_005, p99_01 / full.max(0.001));
+        }
         (vscale, m, target * 0.5)
     } else {
         let vscale = 2.0 * s.model.y_extent * s.arch_scale;
