@@ -3,20 +3,22 @@
 Active work + bite-sized tasks for smaller agents to continue if the main session stops.
 Keep this updated as tasks complete.
 
-## TODO: move remaining ~/eq_assets binary deps to the asset server
+## DONE: client no longer reads ~/eq_assets at runtime (all assets via the asset server)
 
-The TEXT game data (eqstr_us.txt, spells_us.txt, zone maps + water .wtr) now comes from the asset
-server's "gamedata" set (see build_gamedata_from_raw in eqoxide_asset_server), synced to the cache
-at startup — the client no longer reads those from ~/eq_assets. STILL reading ~/eq_assets at runtime
-(binary, original game content):
-- Equipment textures: renderer.rs indexes global*_amr.s3d / global_chr.s3d / <zone>_chr2.s3d via
-  `assets_path` (index_s3d_textures) to texture worn armor.
-- Weapon models: assets.rs `load_weapon_model` loads `<idfile>.s3d` (e.g. IT10649.s3d) from
-  `assets_path` to render held weapons.
-To fully drop the ~/eq_assets (and ~/git/NostalgiaEQ-Client) runtime dependency, serve these as
-derived assets too (e.g. a "gameequip" set of armor textures + per-weapon GLBs from the asset
-server, synced to the cache), then point renderer.rs/assets.rs at the cache instead of `assets_path`.
-Zone terrain GLBs + character models already come from the asset server ("zone/*" + "common" sets).
+Everything the client loads now comes from the asset-server cache, not ~/eq_assets:
+- text game data → "gamedata" set (eqstr/spells/maps + water .wtr)
+- character models + zone terrain → "common" + "zone/*" sets
+- worn-armor textures + held-weapon S3Ds → "gameequip" set (build_gameequip_from_raw)
+- clickable-door object models → per-zone "zonedoors/<short>" set (build_zonedoors_from_raw)
+renderer.rs/app.rs repointed to the cache; App.assets_path is now vestigial (stored, never read for
+files — could be removed from config/App::new in a cleanup). Loose ends:
+- zonedoors published only for the IN-USE zones (qcat, qeynos, qeynos2, qeytoqrg, qrg). Other zones'
+  doors fall back to plain boxes until a full `eqoxide-assets build --raw` (which now publishes
+  zonedoors for every zone). Run a full bake to cover all zones.
+- gameequip is served RAW S3D (client still parses S3D from the cache). A future size optimization
+  could serve DERIVED armor textures (PNG) + per-weapon GLBs instead.
+- Weapon-model load from the cache verified by inspection (self.assets_path -> cache); not yet seen
+  live in combat (equip-texture index + door models WERE verified live: 4045 textures, 16 qcat doors).
 
 ## TODO: exhaustive fall-damage testing (controlled-fall nav)
 
