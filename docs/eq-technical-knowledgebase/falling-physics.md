@@ -16,7 +16,7 @@ The **client** runs the fall damage logic in `FUN_00420dec` (VA 0x420dec,
 `decompiled/ghidra/eqgame.exe.c:29228`), then sends `OP_EnvDamage` opcode
 `0x31b3` (confirmed in `EQEmu/utils/patches/patch_Titanium.conf`).
 
-**Consequence for eq_client_lite:** The Rust client MUST compute fall damage
+**Consequence for eqoxide:** The Rust client MUST compute fall damage
 and send `OP_EnvDamage` itself. The server will not impose it automatically
 from position updates.
 
@@ -171,7 +171,7 @@ Gravity (from actor vtable) remains opaque. The best observable bound:
 
 ---
 
-## Recommendation for eq_client_lite
+## Recommendation for eqoxide
 
 ### Fall Rate (Q1)
 

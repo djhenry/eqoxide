@@ -99,7 +99,7 @@ factor.  The scale factor is computed as `desired_height / model_intrinsic_heigh
 There is no separate per-race base size table in the client; the `size` field IS the
 target rendered height.
 
-## Recommendation for eq_client_lite
+## Recommendation for eqoxide
 
 **The spawn `size` field is the absolute target height in EQ world units.**
 
@@ -153,10 +153,10 @@ Typical doorway heights in human-scale zones (Qeynos, Freeport, etc.) are
 approximately 7-8 EQ feet, i.e. just taller than a 6.0-unit Human. A door model's
 world-space size is determined by its WLD geometry; the `.zon` placement record
 carries an integer `size` that the Rust client applies as `size as f32 / 100.0`
-(eq_client_lite `src/pass.rs:231`) — identical to how the real client scales door
+(eqoxide `src/pass.rs:231`) — identical to how the real client scales door
 placeables.
 
-## The ×2 Bug in eq_client_lite (archetype_target_height)
+## The ×2 Bug in eqoxide (archetype_target_height)
 
 ### What the bug is
 
@@ -216,7 +216,7 @@ Pragmatic near-term fix: change `archetype_target_height("humanoid")` from 12.0 
 and `"elf"` from 12.0 to 5.0 for Wood Elf / Dark Elf, 6.0 for High Elf, etc.  This
 will halve all skinned character heights relative to doorways and zone geometry.
 
-## Current Status in eq_client_lite
+## Current Status in eqoxide
 
 - `archetype_target_height("humanoid") = 12.0`, `archetype_target_height("elf") = 12.0`
   (`src/models.rs:706`) — this is **wrong**; both are 2× the correct EQ feet values.

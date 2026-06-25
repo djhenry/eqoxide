@@ -220,7 +220,7 @@ of mouse handling to fully confirm).
 
 ---
 
-## Recommendation for eq_client_lite
+## Recommendation for eqoxide
 
 Minimum viable HUD window system to match Titanium behavior:
 

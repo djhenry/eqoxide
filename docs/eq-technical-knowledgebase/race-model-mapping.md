@@ -91,7 +91,7 @@ with ACTORDEF `HUF_ACTORDEF` for female and `HUM_ACTORDEF` for male.
 All 30 character archives (15 races × 2 genders) are confirmed present in
 `/home/dhenry/eq_assets/EQ_Files/`.
 
-## What This Means for eq_client_lite
+## What This Means for eqoxide
 
 ### Current (wrong) mapping in `src/models.rs`
 
@@ -101,7 +101,7 @@ All 30 character archives (15 races × 2 genders) are confirmed present in
 
 This is wrong. In the real Titanium client, every race has its own distinct skeleton and mesh.
 
-### Correct race → archive mapping for eq_client_lite
+### Correct race → archive mapping for eqoxide
 
 Each entry should map `(race_id, gender)` to its own `s3d_to_gltf`-converted `.glb` file:
 
@@ -160,7 +160,7 @@ Priority = visual impact of wrong model (most different from human):
 
 Each playable race also has a `global<code>_chr2.s3d` secondary archive. These contain
 additional WLD model data (likely alternate armor meshes). The client loads `_chr2` first,
-then `_chr`. For eq_client_lite's s3d_to_gltf pipeline, `_chr2` may not be needed for
+then `_chr`. For eqoxide's s3d_to_gltf pipeline, `_chr2` may not be needed for
 the base skeleton/pose — investigate if conversion is incomplete without it.
 
 ## global_chr.s3d

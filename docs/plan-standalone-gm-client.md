@@ -2,7 +2,7 @@
 
 ## Context
 
-The `eq_renderer` (Rust/wgpu 3D viewer) currently runs as a standalone desktop app that
+The `eqoxide` (Rust/wgpu 3D viewer) currently runs as a standalone desktop app that
 receives game state from a Python bot via Unix domain socket. The goal is to eliminate the
 Unix socket IPC and the Python bot entirely, converting this crate into a single standalone
 binary that:
@@ -31,7 +31,7 @@ the protocol layer. Everything we need is already implemented there.
                          │ UDP (EQ protocol)
                          ▼
 ┌──────────────────────────────────────────────────────────────┐
-│              eq_renderer (modified, standalone)               │
+│              eqoxide (modified, standalone)               │
 │                                                              │
 │  ┌─────────────┐   ┌──────────────┐   ┌──────────────────┐ │
 │  │ eq_net       │──▶│ GameState    │──▶│ SceneState       │ │
@@ -335,7 +335,7 @@ eq_net:
 # Kept (renderer still needs these):
 renderer:
   assets_path: "~/eq_assets"
-  models_path: "~/eq_renderer/assets/models"
+  models_path: "~/eqoxide/assets/models"
 ```
 
 ## Implementation Order

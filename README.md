@@ -1,4 +1,4 @@
-# eq_client_lite
+# eqoxide
 
 A standalone Rust EverQuest **Titanium** observer/renderer. It connects directly to a local
 EQEmu server, renders the zone in 3D (wgpu), and exposes a local **HTTP API** so an agent (or
@@ -77,11 +77,11 @@ cargo build --release
 ```
 
 Run `dev-run.sh` in your **own terminal**, not from an agent/Bash tool call — the harness reaps
-GUI child processes. Logs go to `/tmp/eq_client.log`. Per-character server/credentials and
+GUI child processes. Logs go to `/tmp/eqoxide.log`. Per-character server/credentials and
 renderer asset paths live in `~/.config/eqoxide/` (honoring `XDG_CONFIG_HOME`). Credential files
 are kept out of source control — copy a template into that directory and edit it locally.
 
-Offline asset/zone debugging (no server): `./target/release/eq_renderer --testzone`.
+Offline asset/zone debugging (no server): `./target/release/eqoxide --testzone`.
 
 Add `--profile` (or `EQ_PROFILE=1`) for a per-phase frame-timing overlay; see `docs/dev-workflow.md`.
 
@@ -91,7 +91,7 @@ The account + character to log in as is **not** a CLI name argument — it comes
 config file. Login configs live in `~/.config/eqoxide/`. Pass one with `--config`:
 
 ```sh
-./target/release/eq_renderer --config durgan   # ~/.config/eqoxide/config-durgan.yaml
+./target/release/eqoxide --config durgan   # ~/.config/eqoxide/config-durgan.yaml
 ```
 
 `--config` accepts:
@@ -117,7 +117,7 @@ reaps GUI children), detach with `setsid` so the process survives, then read the
 
 ```sh
 setsid bash -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 \
-  exec ./target/release/eq_renderer --config durgan' \
+  exec ./target/release/eqoxide --config durgan' \
   > /tmp/eq_durgan.log 2>&1 < /dev/null &
 disown
 sleep 12
@@ -136,18 +136,18 @@ agents can work on different features simultaneously without interfering.
 - **Auto-port binding.** Each instance binds the **next free** HTTP API port starting at
   `config.yaml` `http_port` (default **8765**), scanning upward: 8765, 8766, 8767, …
 - **Port is printed to stdout.** On launch the client prints a single parseable line (also in
-  `/tmp/eq_client.log`). **Always read this — do not hardcode 8765:**
+  `/tmp/eqoxide.log`). **Always read this — do not hardcode 8765:**
 
   ```
   API_PORT=8766
   ```
 
   ```sh
-  PORT=$(grep -m1 -oP 'API_PORT=\K[0-9]+' /tmp/eq_client.log)
+  PORT=$(grep -m1 -oP 'API_PORT=\K[0-9]+' /tmp/eqoxide.log)
   curl "http://127.0.0.1:$PORT/debug"
   ```
 
-- **Shut down your own instance with `POST /exit`** — never `pkill eq_renderer`, which could
+- **Shut down your own instance with `POST /exit`** — never `pkill eqoxide`, which could
   kill another worktree's client. `/exit` cleanly stops only the instance on the port you call:
 
   ```sh

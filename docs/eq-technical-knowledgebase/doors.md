@@ -225,7 +225,7 @@ work across distance — the server just skips the quest event, not the door act
 
 ---
 
-## 8. eq_client_lite Current State
+## 8. eqoxide Current State
 
 - `OP_SPAWN_DOOR = 0x4c24` defined in `src/eq_net/protocol.rs:78`
 - 0x4c24 is silenced (not parsed) in `src/eq_net/login.rs:364` — logged as "handled visually elsewhere" but not actually handled yet

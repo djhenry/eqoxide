@@ -114,7 +114,7 @@ During the 90-second window the character remains in-world as a linkdead NPC (AI
 
 ---
 
-## Recommendation for eq_client_lite
+## Recommendation for eqoxide
 
 ### On clean exit / ctrl-c / SIGTERM:
 

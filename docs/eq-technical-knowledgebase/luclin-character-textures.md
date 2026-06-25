@@ -61,7 +61,7 @@ elfchsk03.dds.
 | elffa (forearm) piece 1 | elffa0001.dds | 8x8 DXT5 | 100% alpha-0 | Stub — pure skin |
 | elffa (forearm) piece 2 | elffa0002.dds | 8x8 DXT5 | 100% alpha-0 | Stub — pure skin |
 
-Arms at material 0 are 100% pure skin — all overlay stubs. The eq_client_lite "reject transparent
+Arms at material 0 are 100% pure skin — all overlay stubs. The eqoxide "reject transparent
 stub" arm fix is correct: those 8x8 stubs should be skipped and baked skin rendered instead.
 
 ## Material 1+ (armor/leather) 
@@ -85,7 +85,7 @@ The problematic case (elfch0003.dds) is NOT a stub — it is a real 256x256 DXT5
 pixels. The correct fix is not to reject it, but to render it as an alpha-masked overlay on top of
 the skin base (elfchsk03.dds).
 
-## Recommended Rendering for eq_client_lite
+## Recommended Rendering for eqoxide
 
 For any Luclin character mesh piece at any material:
 
