@@ -117,6 +117,12 @@ pub const OP_INTERRUPT_CAST: u16 = 0x0000; // native/pass-through value
 
 // Pet control (Titanium): PetCommand_Struct { command:u32, target:u32 }. Command values from
 // EQEmu zone/common.h: PET_ATTACK=2, PET_GUARDHERE=5, PET_FOLLOWME=4(GetOwner), PET_BACKOFF=28.
+// Environmental (fall/lava/drown) damage — CLIENT-COMPUTED in native EQ; the server only validates
+// and applies it. EnvDamage2_Struct (31b): id@0, damage(u32)@6, dmgtype(u8)@22 (0xFC=falling),
+// constant(u16)@27=0xFFFF. See docs/eq-technical-knowledgebase/falling-physics.md.
+pub const OP_ENV_DAMAGE: u16 = 0x31b3;
+pub const DMGTYPE_FALLING: u8 = 0xFC;
+
 pub const OP_PET_COMMANDS: u16 = 0x10a1;
 pub const PET_ATTACK: u32 = 2;
 pub const PET_BACKOFF: u32 = 28;
