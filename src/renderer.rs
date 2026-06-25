@@ -26,7 +26,11 @@ pub struct EntityAnimState {
 // uniform slot per mesh, so this MUST be >= the max mesh count or the player loses
 // its later primitives (head pieces + feet were dropped at the old value of 16).
 pub const PLAYER_UNIFORM_SLOTS: usize = 32;
-pub const TOTAL_ENTITY_UNIFORM_SLOTS: usize = 4128; // 32 player + 4096 entity mesh draws
+// 32 player + entity mesh draws, split half static / half skinned. At ~27 meshes per
+// humanoid, the skinned half (TOTAL/2 - 32) bounds how many character spawns can draw:
+// 8224 -> ~4080 skinned slots -> ~150 NPCs. Crowded zones (Qeynos ~190 spawns) exceed
+// this, so the skinned pass renders NEAREST-first and the overflow falls back to nameplates.
+pub const TOTAL_ENTITY_UNIFORM_SLOTS: usize = 8224;
 /// Pre-allocated joint buffer pool size. Slot 0 = player, 1..N = entities.
 pub const JOINT_BUF_SLOTS: usize = 512;
 /// Dedicated uniform slot count for doors (one slot per door mesh draw this frame).

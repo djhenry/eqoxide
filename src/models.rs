@@ -696,28 +696,32 @@ pub fn archetype_scale(archetype: &str) -> f32 {
     }
 }
 
-/// Target height in EQ units for each archetype, used to scale normalized skinned models
-/// so that `true_height` maps to the correct in-world visual height.
-/// EQ units ≈ feet. Values are initial calibration; fine-tune visually after loading.
+/// Target rendered height in **EQ world feet** for each archetype, used to scale
+/// normalized skinned models so the model's `true_height` maps to this in-world
+/// height. EQ world units ARE feet — the same space as zone/terrain/door geometry
+/// — so the value here is the character's literal height (a 6 ft human fits under a
+/// ~7-8 ft doorway). Only the monster archetypes use this now; playable races take
+/// their height from [`race_target_height`].
 pub fn archetype_target_height(archetype: &str) -> f32 {
     match archetype {
-        // target == rendered EQ height; humanoid=12 calibrated to the doorway. Other
-        // human-height races match it; the rest are proportional (visually tune later).
-        "humanoid" => 12.0, "elf" => 12.0, "dwarf" => 9.0, "gnoll" => 12.0,
-        "skeleton" => 12.0, "zombie" => 12.0, "frog" => 10.0,
-        "bear" => 12.0, "wolf" => 8.0, "rat" => 3.0, "snake" => 6.0,
-        "bat" => 4.0, "bird" => 4.0, "wasp" => 4.0, "worm" => 4.0,
-        "fish" => 3.0, "creature" => 8.0,
-        _ => 12.0,
+        // Rendered height in EQ feet. Human-ish NPC archetypes are 6.0 (matches a
+        // default human); the rest are roughly proportional (visually tune later).
+        "humanoid" => 6.0, "elf" => 6.0, "dwarf" => 4.5, "gnoll" => 6.0,
+        "skeleton" => 6.0, "zombie" => 6.0, "frog" => 5.0,
+        "bear" => 6.0, "wolf" => 4.0, "rat" => 1.5, "snake" => 3.0,
+        "bat" => 2.0, "bird" => 2.0, "wasp" => 2.0, "worm" => 2.0,
+        "fish" => 1.5, "creature" => 4.0,
+        _ => 6.0,
     }
 }
 
-/// Per-race rendered height in the client's display units, for the **playable**
-/// races. Source of truth is EQEmu's `GetRaceGenderDefaultHeight`
-/// (`common/races.cpp`), which the Titanium client uses as the base height for
-/// player models (the wire `size` field is 0 for player spawns, so the client
-/// substitutes the race default). Heights there are in EQ feet; we render a
-/// 6.0-ft human at 12.0 display units, so these are `feet * 2.0`.
+/// Per-race rendered height in **EQ world feet**, for the **playable** races.
+/// These are exactly EQEmu's `GetRaceGenderDefaultHeight` (`common/races.cpp`),
+/// which the Titanium client uses as the base height for player models (the wire
+/// `size` field is 0 for player spawns, so the client substitutes the race
+/// default). EQ world units are feet — the same space as zone/terrain/door
+/// geometry — so a character renders at exactly this height (a 6 ft human fits
+/// under a ~7-8 ft doorway). NO display-unit multiplier.
 ///
 /// Male and female share the same base height (no gender modifier in the table).
 ///
@@ -727,23 +731,23 @@ pub fn archetype_target_height(archetype: &str) -> f32 {
 /// Returns `None` for non-playable races (monsters), whose height comes from
 /// [`archetype_target_height`] instead.
 pub fn race_target_height(race: &str) -> Option<f32> {
-    // feet * 2.0  (human 6.0 ft -> 12.0 units)
+    // EQ feet (== GetRaceGenderDefaultHeight; world units are feet).
     Some(match race.to_uppercase().as_str() {
-        "HUM" => 12.0, // Human       6.0 ft
-        "BAR" => 14.0, // Barbarian   7.0 ft
-        "ERU" => 12.0, // Erudite     6.0 ft
-        "ELF" => 10.0, // Wood Elf    5.0 ft
-        "HIE" => 12.0, // High Elf    6.0 ft
-        "HEF" => 11.0, // Half Elf    5.5 ft
-        "DKE" => 10.0, // Dark Elf    5.0 ft
-        "DWF" =>  8.0, // Dwarf       4.0 ft
-        "TRL" => 16.0, // Troll       8.0 ft
-        "OGR" => 18.0, // Ogre        9.0 ft
-        "HFL" =>  7.0, // Halfling    3.5 ft
-        "GNM" =>  6.0, // Gnome       3.0 ft
-        "FRG" => 10.0, // Froglok     5.0 ft
-        "IKS" => 12.0, // Iksar       6.0 ft
-        "VAH" => 14.0, // Vah Shir    7.0 ft
+        "HUM" => 6.0, // Human       6.0 ft
+        "BAR" => 7.0, // Barbarian   7.0 ft
+        "ERU" => 6.0, // Erudite     6.0 ft
+        "ELF" => 5.0, // Wood Elf    5.0 ft
+        "HIE" => 6.0, // High Elf    6.0 ft
+        "HEF" => 5.5, // Half Elf    5.5 ft
+        "DKE" => 5.0, // Dark Elf    5.0 ft
+        "DWF" => 4.0, // Dwarf       4.0 ft
+        "TRL" => 8.0, // Troll       8.0 ft
+        "OGR" => 9.0, // Ogre        9.0 ft
+        "HFL" => 3.5, // Halfling    3.5 ft
+        "GNM" => 3.0, // Gnome       3.0 ft
+        "FRG" => 5.0, // Froglok     5.0 ft
+        "IKS" => 6.0, // Iksar       6.0 ft
+        "VAH" => 7.0, // Vah Shir    7.0 ft
         _ => return None,
     })
 }
@@ -969,23 +973,24 @@ mod tests {
 
     #[test]
     fn target_heights_are_sane() {
-        assert!((archetype_target_height("humanoid") - 12.0).abs() < 0.01);
+        // Heights are raw EQ feet (world units == zone units). A human is 6 ft.
+        assert!((archetype_target_height("humanoid") - 6.0).abs() < 0.01);
         assert!(archetype_target_height("dwarf") < archetype_target_height("humanoid"));
         assert!(archetype_target_height("unknown") > 0.0);
     }
 
     #[test]
     fn race_heights_match_eqemu_table() {
-        // human 6.0 ft -> 12.0 units (the calibration anchor)
-        assert_eq!(race_target_height("HUM"), Some(12.0));
-        // the reported discrepancy: wood/dark elves are 5/6 of a human, half elf 11/12
-        assert_eq!(race_target_height("ELF"), Some(10.0)); // wood elf
-        assert_eq!(race_target_height("DKE"), Some(10.0)); // dark elf
-        assert_eq!(race_target_height("HIE"), Some(12.0)); // high elf
-        assert_eq!(race_target_height("HEF"), Some(11.0)); // half elf
+        // Raw EQ feet from GetRaceGenderDefaultHeight — a 6 ft human fits doorways.
+        assert_eq!(race_target_height("HUM"), Some(6.0));
+        // the reported discrepancy: wood/dark elves are 5/6 of a human, half elf 5.5
+        assert_eq!(race_target_height("ELF"), Some(5.0)); // wood elf
+        assert_eq!(race_target_height("DKE"), Some(5.0)); // dark elf
+        assert_eq!(race_target_height("HIE"), Some(6.0)); // high elf
+        assert_eq!(race_target_height("HEF"), Some(5.5)); // half elf
         // extremes
-        assert_eq!(race_target_height("OGR"), Some(18.0));
-        assert_eq!(race_target_height("GNM"), Some(6.0));
+        assert_eq!(race_target_height("OGR"), Some(9.0));
+        assert_eq!(race_target_height("GNM"), Some(3.0));
         // monsters are not in the playable table
         assert_eq!(race_target_height("GNL"), None);
         assert_eq!(race_target_height("RAT"), None);
@@ -994,13 +999,13 @@ mod tests {
     #[test]
     fn race_heights_are_case_insensitive() {
         assert_eq!(race_target_height("elf"), race_target_height("ELF"));
-        assert_eq!(race_target_height("Hum"), Some(12.0));
+        assert_eq!(race_target_height("Hum"), Some(6.0));
     }
 
     #[test]
     fn target_height_for_prefers_race_then_archetype() {
-        // wood elf uses its race height, not the "elf" archetype's 12.0
-        assert_eq!(target_height_for("ELF", "elf"), 10.0);
+        // wood elf uses its race height (5.0 ft), not the "elf" archetype's 6.0
+        assert_eq!(target_height_for("ELF", "elf"), 5.0);
         // a monster (gnoll) falls back to the archetype height
         assert_eq!(target_height_for("GNL", "gnoll"), archetype_target_height("gnoll"));
     }
