@@ -15,23 +15,76 @@ use winit::event_loop::EventLoop;
 fn main() {
     eq_renderer::logging::init();
 
+    // Parse + STRICTLY validate CLI args. We error out (with help) on anything malformed or
+    // unrecognized rather than silently falling back to defaults — a silent fallback once made the
+    // client log into the wrong account when --config pointed at a missing file.
+    const USAGE: &str = "\
+eq_renderer — EverQuest (Titanium) client
+
+USAGE:
+    eq_renderer [OPTIONS]
+
+OPTIONS:
+    --config <name|path>   Per-character login config. A profile name resolves to
+                           ~/.config/eqoxide/config-<name>.yaml; a *.yaml/*.yml filename resolves
+                           under ~/.config/eqoxide/; a value with a '/' is used as a literal path.
+                           Omit to use the default ~/.config/eqoxide/config.yaml.
+    --testzone             Run the renderer offline (no server) for asset/zone debugging.
+    --profile              Enable the per-phase frame-timing HUD overlay.
+    -h, --help             Show this help and exit.
+";
     let args: Vec<String> = std::env::args().collect();
-    let testzone_mode = args.contains(&"--testzone".to_string());
+    let mut testzone_mode = false;
+    let mut profile_flag  = false;
+    let mut login_cfg_arg: Option<String> = None;
+    let mut idx = 1; // skip argv[0] (program name)
+    while idx < args.len() {
+        let arg = args[idx].as_str();
+        match arg {
+            "--testzone" => testzone_mode = true,
+            "--profile"  => profile_flag  = true,
+            "-h" | "--help" => { print!("{USAGE}"); std::process::exit(0); }
+            // accept both "--config <value>" and "--config=<value>"
+            _ if arg == "--config" || arg.starts_with("--config=") => {
+                let value = if let Some(v) = arg.strip_prefix("--config=") {
+                    v.to_string()
+                } else {
+                    match args.get(idx + 1) {
+                        Some(v) if !v.starts_with('-') => { idx += 1; v.clone() }
+                        _ => {
+                            eprintln!("error: --config requires a value (a profile name or config file path)\n\n{USAGE}");
+                            std::process::exit(2);
+                        }
+                    }
+                };
+                if value.is_empty() {
+                    eprintln!("error: --config requires a non-empty value\n\n{USAGE}");
+                    std::process::exit(2);
+                }
+                login_cfg_arg = Some(value);
+            }
+            other => {
+                eprintln!("error: unrecognized argument '{other}'\n\n{USAGE}");
+                std::process::exit(2);
+            }
+        }
+        idx += 1;
+    }
 
     // `--profile` (or EQ_PROFILE=1) enables the lightweight per-phase frame-timing HUD overlay.
-    let profile_mode = args.iter().any(|a| a == "--profile")
+    let profile_mode = profile_flag
         || std::env::var("EQ_PROFILE").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
     eq_renderer::profiling::set_enabled(profile_mode);
 
-    // `--config <value>` selects the per-character login config (a path, a bare
-    // filename, or a profile name resolved under ~/.config/eqoxide/); see
-    // LoginConfig::resolve_path. Defaults to ~/.config/eqoxide/config.yaml.
-    let login_cfg_arg = args
-        .iter()
-        .position(|a| a == "--config")
-        .and_then(|i| args.get(i + 1))
-        .map(|s| s.as_str());
-    let login_cfg_path = config::LoginConfig::resolve_path(login_cfg_arg);
+    // Resolve the login config. When --config is given the resolved file MUST exist — we never fall
+    // back to the default config in that case. The default ~/.config/eqoxide/config.yaml is used
+    // only when --config is omitted.
+    let login_cfg_path = config::LoginConfig::resolve_path(login_cfg_arg.as_deref());
+    if login_cfg_arg.is_some() && !login_cfg_path.exists() {
+        eprintln!("error: config file not found for --config {}: {}\n\n{USAGE}",
+            login_cfg_arg.as_deref().unwrap_or(""), login_cfg_path.display());
+        std::process::exit(2);
+    }
     tracing::info!("renderer: loading login config from {}", login_cfg_path.display());
 
     let login_cfg = config::LoginConfig::load(&login_cfg_path);
