@@ -66,7 +66,6 @@ pub struct App {
     egui_state:    Option<egui_winit::State>,
     egui_renderer: Option<egui_wgpu::Renderer>,
     // Asset paths
-    assets_path:   std::path::PathBuf,
     models_path:   std::path::PathBuf,
     // Zone state
     current_zone:   String,
@@ -106,8 +105,6 @@ pub struct App {
     /// Free-fly position override in scene space [east, north, z].
     /// None = track server position; Some = keyboard-driven position.
     override_pos: Option<[f32; 3]>,
-    /// Frames remaining where override_pos is protected from being cleared by key release.
-    warp_cooldown: u32,
     /// Shared goto target — WASD writes here so the nav thread sends actual EQ packets.
     goto_target:  crate::http::GotoTarget,
     /// Shared request slots written by HUD buttons; the nav thread drains and sends them.
@@ -205,7 +202,9 @@ pub struct App {
 
 impl App {
     pub fn new(
-        assets_path:     std::path::PathBuf,
+        // Vestigial: everything now loads via models_path / the asset cache.
+        // Kept for call-site stability (mirrors renderer::load_character_models).
+        _assets_path:    std::path::PathBuf,
         models_path:     std::path::PathBuf,
         character_name:  String,
         camera_cmd:      Arc<Mutex<Option<CameraCmd>>>,
@@ -246,7 +245,7 @@ impl App {
 
         App {
             window: None, gpu: None, egui_ctx: None, egui_state: None, egui_renderer: None,
-            assets_path, models_path,
+            models_path,
             current_zone: String::new(), loading: false, pending_reload: false,
             load_status:  Arc::new(Mutex::new(String::new())),
             pending_load: Arc::new(Mutex::new(None)),
@@ -264,7 +263,7 @@ impl App {
             current_fps: 0.0,
             active_until: std::time::Instant::now(),
             frame_profile: crate::profiling::FrameProfile::default(),
-            keys_held: std::collections::HashSet::new(),             override_pos: None, warp_cooldown: 0, goto_target,
+            keys_held: std::collections::HashSet::new(),             override_pos: None, goto_target,
             hail, say, target, attack, cast, sit, consider, buy, sell, trade, spells, door_click, say_buffer: String::new(),
             drag_active: false, last_cursor: winit::dpi::PhysicalPosition::new(0.0, 0.0),
             click_start: None,

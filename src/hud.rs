@@ -561,7 +561,7 @@ pub fn draw_merchant(
         ui.columns(2, |cols| {
             // ── Buy column: merchant wares ──
             cols[0].label(egui::RichText::new("For sale").strong());
-            egui::ScrollArea::vertical().id_source("merch_buy").show(&mut cols[0], |ui| {
+            egui::ScrollArea::vertical().id_salt("merch_buy").show(&mut cols[0], |ui| {
                 if scene.merchant_items.is_empty() {
                     ui.label(egui::RichText::new("(no items / loading…)").weak().size(11.0));
                 }
@@ -580,7 +580,7 @@ pub fn draw_merchant(
             });
             // ── Sell column: player's general/bag inventory (slot >= 22) ──
             cols[1].label(egui::RichText::new("Your items").strong());
-            egui::ScrollArea::vertical().id_source("merch_sell").show(&mut cols[1], |ui| {
+            egui::ScrollArea::vertical().id_salt("merch_sell").show(&mut cols[1], |ui| {
                 let sellable: Vec<_> = scene.inventory.iter().filter(|i| i.slot >= 22).collect();
                 if sellable.is_empty() {
                     ui.label(egui::RichText::new("(nothing to sell)").weak().size(11.0));

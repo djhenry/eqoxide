@@ -623,10 +623,8 @@ struct ViewerState {
     marker_cube_ibuf: Option<wgpu::Buffer>,
     marker_uniforms:  Vec<(wgpu::Buffer, wgpu::BindGroup)>,
 
-    // Parts mode: per-mesh material names and bounds
+    // Parts mode
     parts_mode:      bool,
-    mesh_names:      Vec<String>,
-    mesh_centers:    Vec<[f32; 3]>,
 
     // Orbit camera state
     azimuth:   f32,
@@ -1040,10 +1038,8 @@ impl ApplicationHandler for ModelViewerApp {
         // Read per-mesh info for parts mode.
         let mesh_info = read_mesh_info(&self.model_path);
         let mut mesh_names = Vec::new();
-        let mut mesh_centers = Vec::new();
         for (i, (name, center)) in mesh_info.iter().enumerate() {
             mesh_names.push(name.clone());
-            mesh_centers.push(*center);
             if self.parts_mode {
                 eprintln!("  mesh {}: '{}' center=({:.3}, {:.3}, {:.3})", i, name, center[0], center[1], center[2]);
             }
@@ -1067,7 +1063,7 @@ impl ApplicationHandler for ModelViewerApp {
             pipelines, wireframe_pipeline, camera_uniform, fallback_bg, depth_view,
             model, arch_scale, uniform_pool, wireframe_indices, skinned,
             markers, marker_cube_vbuf, marker_cube_ibuf, marker_uniforms,
-            parts_mode: self.parts_mode, mesh_names, mesh_centers,
+            parts_mode: self.parts_mode,
             azimuth: 180.0, elevation: 20.0, distance: parts_distance, dragging: false,
             shared_camera: self.shared_camera.clone(),
             shared_wire: self.shared_wire.clone(),

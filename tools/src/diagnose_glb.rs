@@ -58,16 +58,6 @@ fn main() {
                 None => vec![],
             };
 
-            // Read normals
-            let all_normals: Vec<[f32; 3]> = reader.read_normals()
-                .map(|n| n.collect())
-                .unwrap_or_default();
-
-            // Read UVs
-            let all_uvs: Vec<[f32; 2]> = reader.read_tex_coords(0)
-                .map(|tc| tc.into_f32().collect())
-                .unwrap_or_default();
-
             // Compute bounds using ONLY the indexed vertices
             let (mut px0, mut px1) = (f32::MAX, f32::MIN);
             let (mut py0, mut py1) = (f32::MAX, f32::MIN);
