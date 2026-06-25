@@ -359,8 +359,8 @@ pub fn encode_billboard_pass(
     pass.draw_indexed(0..idx_count, 0, 0..1);
 }
 
-/// Player pass. Renders a 3D model when scene.player_race maps to a loaded archetype;
-/// falls back to a blue billboard when no race is set or no model is loaded.
+/// Player pass. Renders a 3D model when scene.player_race maps to a loaded archetype.
+/// Draws nothing if no race is set or no model is loaded.
 ///
 /// Uses entity_uniform_pool[0..PLAYER_UNIFORM_SLOTS) and joint_buf_pool[0] (player slot).
 /// The entity passes must use pool slots >= PLAYER_UNIFORM_SLOTS to avoid overlap.
@@ -369,10 +369,7 @@ pub fn encode_player_pass(
     encoder:   &mut wgpu::CommandEncoder,
     view:      &wgpu::TextureView,
     scene:     &SceneState,
-    cam_right: [f32; 3],
-    cam_up:    [f32; 3],
 ) {
-    use wgpu::util::DeviceExt;
     use crate::renderer::PLAYER_UNIFORM_SLOTS;
     use crate::models::{race_to_archetype, archetype_scale};
     use crate::gpu::{EntityUniform, GpuModel};
@@ -565,42 +562,6 @@ pub fn encode_player_pass(
             None => {}
         }
     }
-
-    // Fallback: blue billboard.
-    use crate::billboard::billboard_quad;
-    let (verts, idxs) = billboard_quad(
-        scene.player_pos, 8.0, [0.34, 0.65, 1.0], cam_right, cam_up,
-    );
-    let vbuf = r.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("player_vbuf"),
-        contents: bytemuck::cast_slice(&verts),
-        usage: wgpu::BufferUsages::VERTEX,
-    });
-    let ibuf = r.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("player_ibuf"),
-        contents: bytemuck::cast_slice(&idxs),
-        usage: wgpu::BufferUsages::INDEX,
-    });
-    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label: Some("player"),
-        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-            view, resolve_target: None,
-            ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-        })],
-        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-            view: &r.depth_view,
-            depth_ops: Some(wgpu::Operations {
-                load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store,
-            }),
-            stencil_ops: None,
-        }),
-        timestamp_writes: None, occlusion_query_set: None,
-    });
-    pass.set_pipeline(&r.pipelines.billboard);
-    pass.set_bind_group(0, &r.camera_uniform.bind_group, &[]);
-    pass.set_vertex_buffer(0, vbuf.slice(..));
-    pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
-    pass.draw_indexed(0..6, 0, 0..1);
 }
 
 /// Render a single static model with the given transform.
@@ -949,8 +910,6 @@ mod tests {
             &mut wgpu::CommandEncoder,
             &wgpu::TextureView,
             &crate::scene::SceneState,
-            [f32; 3],
-            [f32; 3],
         ) = encode_player_pass;
     }
 

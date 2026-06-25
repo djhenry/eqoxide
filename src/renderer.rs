@@ -885,8 +885,7 @@ impl EqRenderer {
         crate::pass::encode_door_pass(self, encoder, view, scene);
         crate::pass::encode_billboard_pass(self, encoder, view, scene,
                                            right.to_array(), up.to_array());
-        crate::pass::encode_player_pass(self, encoder, view, scene,
-                                        right.to_array(), up.to_array());
+        crate::pass::encode_player_pass(self, encoder, view, scene);
         crate::pass::encode_entity_pass(self, encoder, view, scene, cam_eye);
         crate::pass::encode_skinned_entity_pass(self, encoder, view, scene, cam_eye);
     }
