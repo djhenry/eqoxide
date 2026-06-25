@@ -292,6 +292,9 @@ pub struct Collision {
     cell_size: f32,
     cols:      usize,
     rows:      usize,
+    /// Optional water-region map (from the zone's `.wtr`). When present, find_path may DESCEND
+    /// through water (swim down a canal/shaft) to a lower floor that has no walkable connection.
+    water:     Option<std::sync::Arc<crate::water_map::WaterMap>>,
 }
 
 impl Collision {
@@ -330,7 +333,7 @@ impl Collision {
         }
         let cell_size = cell_size.max(1.0);
         if tris.is_empty() || min[0] == f32::MAX {
-            return Collision { tris, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0 };
+            return Collision { tris, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0, water: None };
         }
         let cols = (((max[0] - min[0]) / cell_size).ceil() as usize + 1).max(1);
         let rows = (((max[1] - min[1]) / cell_size).ceil() as usize + 1).max(1);
@@ -351,7 +354,12 @@ impl Collision {
                 }
             }
         }
-        Collision { tris, cells, origin: min, cell_size, cols, rows }
+        Collision { tris, cells, origin: min, cell_size, cols, rows, water: None }
+    }
+
+    /// Attach a zone water map so find_path can route swim descents. Call after `build`.
+    pub fn set_water(&mut self, water: Option<std::sync::Arc<crate::water_map::WaterMap>>) {
+        self.water = water;
     }
 
     #[inline]
@@ -662,6 +670,34 @@ impl Collision {
                         came.insert(nkey, ckey);
                         floor_of.insert(nkey, nf);
                         heap.push(Node { f: tentative + h(nc, nr), c: nc, r: nr, fz: nf });
+                    }
+                }
+                // WATER DESCENT: if the neighbor column holds water below the current floor, allow
+                // dropping/swimming down to the floor beneath it even past MAX_STEP_DOWN and without
+                // a clear chest-height walking segment — you fall into the water and sink/swim. This
+                // connects an upper walkway to a flooded lower level (e.g. qcat's canal → sewer).
+                if let Some(water) = &self.water {
+                    // Is there water somewhere in the column between here and far below?
+                    let has_water = (1..=12).any(|k| water.is_water(b[0], b[1], cz - k as f32 * 8.0));
+                    if has_water {
+                        // Take the deepest floor in a deep probe that sits in/just under water.
+                        for nf in self.column_floors(b[0], b[1], cz, STEP_H, 200.0) {
+                            if nf >= cz - 1.0 { continue; } // descents only (the normal loop above
+                            // handles same-level/climbs; a walkable shallow drop it already added)
+                            // require the column at/just above this floor to be water (a real swim
+                            // landing, not a dry lethal fall)
+                            if !water.is_water(b[0], b[1], nf + 3.0) && !water.is_water(b[0], b[1], nf + 12.0) { continue; }
+                            let nkey = (nc, nr, qf(nf));
+                            if closed.contains(&nkey) { continue; }
+                            let step = (((dc * dc + dr * dr) as f32).sqrt()) * cell + (cz - nf) * 0.5;
+                            let tentative = g_cur + step;
+                            if tentative < *g_score.get(&nkey).unwrap_or(&f32::MAX) {
+                                g_score.insert(nkey, tentative);
+                                came.insert(nkey, ckey);
+                                floor_of.insert(nkey, nf);
+                                heap.push(Node { f: tentative + h(nc, nr), c: nc, r: nr, fz: nf });
+                            }
+                        }
                     }
                 }
             }
