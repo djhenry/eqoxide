@@ -6,6 +6,68 @@ any script) can drive the client — move, hail NPCs, target, fight, buy, captur
 It can log in as a **GM observer** or as a **regular player character** that actually plays
 (see [`docs/autonomous-play.md`](docs/autonomous-play.md)).
 
+## Feature status
+
+Legend: ✅ **working** (implemented & verified) · 🟡 **in progress** · 🔵 **planned** · 🐞 **known bug/limitation**
+
+### Connection, session & travel
+| Feature | Status | Notes |
+|---|---|---|
+| Login as GM observer | ✅ | Direct connect to local EQEmu (login `127.0.0.1:5998`) |
+| Login as a regular player character | ✅ | Plays for real; per-character config in `~/.config/eqoxide/` |
+| Multiple instances side-by-side | ✅ | Auto-binds next free HTTP port from 8765; prints `API_PORT=` |
+| Graceful shutdown (`POST /exit`) | ✅ | Per-instance; never `pkill` |
+| Zone-line travel (`POST /zone_cross`) | ✅ | Sends target zone id; verified both ways (e.g. qcat↔qeynos) |
+| Auto walk-into a zone line | 🐞 | Rarely fires — server sends arrival, not trigger, coords; use `/zone_cross` |
+| Derived-asset sync from `eqoxide_asset_server` | ✅ | Models, textures, string table, maps fetched over HTTP into XDG cache |
+
+### Rendering
+| Feature | Status | Notes |
+|---|---|---|
+| Zone terrain + placed objects/buildings | ✅ | ActorInstance placements; NPCs sit among buildings |
+| Per-race + per-gender character models | ✅ | All 15 playable races, skinned animation, idle/walk/combat clips |
+| Correct relative race sizes (EQ feet) | ✅ | From `GetRaceGenderDefaultHeight`; robust true_height (no stray-vert inflation) |
+| Equipment **armor** textures | ✅ | Material-driven swaps, tint, WearChange |
+| **Weapon** models in hand + swing animation | ✅ | Verified on elf-female; NPC weapons & generic hand-joint = follow-up |
+| Doors: clickable, animated, portal-zoning | ✅ | Geometry/placement correct; **untextured** (texture pass pending) |
+| Smooth NPC movement (velocity dead-reckoning) | ✅ | Receives unreliable position updates |
+| Frame capture (`GET /frame` → PNG) | ✅ | Used for visual verification |
+| World handedness / left-right mirror | ✅ | Fixed (clip-space X + A/D controls) |
+| Helms / hair / head armor | 🔵 | Attached-model subsystem not built yet |
+| Outdoor-zone vertical placement | 🐞 | Some outdoor zones (e.g. qeytoqrg) render terrain with a Z offset |
+
+### Gameplay & automation (HTTP API)
+| Feature | Status | Notes |
+|---|---|---|
+| Movement: walk `POST /goto` (A* pathfinding) | ✅ | Routes around walls within connected areas; stalls across closed doors |
+| Movement: teleport `POST /warp` | ✅ | Anti-cheat capped (~50–95u/hop); small hops from a synced state |
+| Combat: auto-attack / auto-face / auto-retarget | ✅ | Heading-scale fix made melee land; hands-free grinding works |
+| Spell casting (`POST /cast`, gems, cast bar) | ✅ | `OP_CastSpell` + begin/mana/interrupt feedback |
+| Scribe / memorize spells (`POST /scribe`, `/memorize`) | ✅ | |
+| Pets: tracking, auto-pet-combat, recall | ✅ | `OP_PetCommands`; squishy classes stand off |
+| Target / consider / hail / say | ✅ | `/target`, `/target/name`, `/consider`, `/hail`, `/say` |
+| Merchant buy / sell / trade window | ✅ | `/buy`, `/sell`, `/trade/*`; live-verified buy (item + coin) |
+| Loot corpses (`POST /loot`) | ✅ | Auto-loot queues own kills; takes listed items |
+| Quest hand-in (`POST /give`) + quest log (`/quests`) | ✅ | Trade items to an NPC for turn-ins |
+| Inventory read / move (`GET /inventory`, `/inventory/move`) | ✅ | |
+| Doors API (`GET /doors`, `POST /doors/click`) | ✅ | |
+| Water-region detection + swim navigation | ✅ | `.wtr` BSP; swim-descent in `find_path` |
+| Controlled-fall navigation + fall damage | 🟡 | Drop off ledges to a lower floor + client-side `OP_EnvDamage`; not yet exhaustively live-tested (curve tuning, water/levitate negation) |
+
+### HUD / UI
+| Feature | Status | Notes |
+|---|---|---|
+| Movable / resizable / persistent windows | ✅ | Per-character `ui_layout_<Name>.json`; `Ctrl+L` lock |
+| Action grid (attack, sit/stand, target, consider, spell gems) | ✅ | Real TGA gem icons + cast bar |
+| Map window (toggle, `M` key) | ✅ | Closeable; default closed |
+
+### Offline / dev tooling
+| Feature | Status | Notes |
+|---|---|---|
+| `--testzone` offline zone/asset debugging (no server) | ✅ | |
+| `render_model --race <CODE>` skinned model viewer | ✅ | Renders a character exactly like the client (login-free); GPU skinning readback diagnostic |
+| `--profile` / `EQ_PROFILE=1` frame-timing overlay | ✅ | Per-phase timings; see `docs/dev-workflow.md` |
+
 ## Build & Run
 
 ```sh
