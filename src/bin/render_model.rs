@@ -43,8 +43,8 @@ use wgpu::util::DeviceExt;
 
 use eq_renderer::camera;
 use eq_renderer::frame_capture;
-use eq_renderer::gpu::{self, GpuStaticModel, EntityUniform};
-use eq_renderer::models::ModelAsset;
+use eq_renderer::gpu::{self, GpuStaticModel, GpuSkinnedModel, GpuSkinnedMesh, SkinnedVertex, EntityUniform};
+use eq_renderer::models::{ModelAsset, SkinnedMeshData};
 use eq_renderer::pipeline;
 
 /// A colored marker at a body-part center for visual debugging.
@@ -333,8 +333,14 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
         eprintln!("Usage: render_model <model.glb> [--arch <archetype>] [--port <port>] [--markers] [--parts]");
+        eprintln!("       render_model --race <CODE> [--gender 0|1] [--port <port>]");
         eprintln!();
         eprintln!("Standalone glTF model viewer for debugging character model rendering.");
+        eprintln!();
+        eprintln!("--race mode retrieves race_<code>.glb from the XDG asset cache and renders it");
+        eprintln!("SKINNED with the live client's scale path (target_height_for / true_height /");
+        eprintln!("idle animation) — reproduces in-game character sizing without login. Codes:");
+        eprintln!("  HUM BAR ERU ELF HIE HEF DKE DWF TRL OGR HFL GNM IKS VAH FRG");
         eprintln!("Orbit camera: left-drag to rotate, scroll to zoom.");
         eprintln!();
         eprintln!("Options:");
@@ -354,11 +360,26 @@ fn main() {
         std::process::exit(0);
     }
 
-    let model_path = PathBuf::from(&args[0]);
-    let arch_name = args.iter().position(|a| a == "--arch")
-        .and_then(|i| args.get(i + 1))
-        .cloned()
-        .unwrap_or_else(|| "humanoid".to_string());
+    // `--race <CODE> [--gender 0|1]` mode: retrieve and render the character exactly
+    // like the live client — resolve race_<code>.glb from the XDG asset cache (the same
+    // models the client syncs), and render skinned with the client's scale path. This
+    // reproduces in-game character sizing without the login/zone flow.
+    let race: Option<String> = args.iter().position(|a| a == "--race")
+        .and_then(|i| args.get(i + 1)).cloned();
+    let gender: u8 = args.iter().position(|a| a == "--gender")
+        .and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    let (model_path, arch_name) = if let Some(ref r) = race {
+        let base = eq_renderer::models::race_model_basename(r, gender).unwrap_or("race_hum");
+        let p = eq_renderer::asset_sync::CacheDirs::resolve().models_dir().join(format!("{base}.glb"));
+        eprintln!("render_model: --race {r} gender {gender} -> {} ({})", base, p.display());
+        (p, eq_renderer::models::race_to_archetype(r).to_string())
+    } else {
+        let arch = args.iter().position(|a| a == "--arch")
+            .and_then(|i| args.get(i + 1)).cloned()
+            .unwrap_or_else(|| "humanoid".to_string());
+        (PathBuf::from(&args[0]), arch)
+    };
     let port: u16 = args.iter().position(|a| a == "--port")
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse().ok())
@@ -370,7 +391,11 @@ fn main() {
     // Default to azimuth 180 so the viewer faces the character's FRONT. Models face
     // -X at heading 0 (the follow camera sits behind the player in-game, so you
     // normally see the back); for inspecting a model we want the front.
-    let shared_camera: SharedCamera     = Arc::new(Mutex::new(SharedCameraState { azimuth: 180.0, elevation: 20.0, distance: 30.0 }));
+    // In --race mode the character is only ~6 ft tall, so start the orbit camera close.
+    let init_distance = if let Some(ref r) = race {
+        eq_renderer::models::target_height_for(r, &arch_name) * 3.0
+    } else { 30.0 };
+    let shared_camera: SharedCamera     = Arc::new(Mutex::new(SharedCameraState { azimuth: 180.0, elevation: 20.0, distance: init_distance }));
     let shared_wire:   SharedWireframe  = Arc::new(Mutex::new(false));
     let shared_window: SharedWindow     = Arc::new(Mutex::new(None));
 
@@ -463,13 +488,28 @@ fn main() {
     }
 
     let event_loop = EventLoop::new().expect("event loop");
-    let mut app = ModelViewerApp::new(model_path, arch_name, shared_camera, shared_wire, frame_req, shared_window, show_markers, parts_mode);
+    let _ = gender;
+    let mut app = ModelViewerApp::new(model_path, arch_name, race, shared_camera, shared_wire, frame_req, shared_window, show_markers, parts_mode);
     event_loop.run_app(&mut app).expect("event loop run");
+}
+
+/// Skinned-mode render state — mirrors the client's `encode_skinned_entity_pass`.
+struct SkinnedView {
+    model:      GpuSkinnedModel,
+    joints_buf: wgpu::Buffer,
+    joints_bg:  wgpu::BindGroup,
+    race:       String,
+    arch:       String,
+    anim_time:  f32,
+    last:       std::time::Instant,
 }
 
 struct ModelViewerApp {
     model_path:     PathBuf,
     arch_name:      String,
+    /// When set, render skinned with the client's race-driven scale (matches the live
+    /// client). The 3-letter race code (e.g. "HUM") drives target_height_for.
+    race:           Option<String>,
     shared_camera:  SharedCamera,
     shared_wire:    SharedWireframe,
     frame_req:      FrameReq,
@@ -493,6 +533,10 @@ struct ViewerState {
     model:           GpuStaticModel,
     arch_scale:      f32,
     uniform_pool:    Vec<(wgpu::Buffer, wgpu::BindGroup)>,
+    /// Set in `--race` mode: render the character SKINNED exactly like the live client
+    /// (race-driven `target_height_for` / `true_height` scale, idle animation, skinned
+    /// pipeline). When present, render_frame uses this instead of the static path.
+    skinned:         Option<SkinnedView>,
 
     // Wireframe: line-segment index buffers (one per mesh)
     wireframe_indices: Vec<(wgpu::Buffer, u32)>,
@@ -522,11 +566,11 @@ struct ViewerState {
 
 impl ModelViewerApp {
     fn new(
-        model_path: PathBuf, arch_name: String,
+        model_path: PathBuf, arch_name: String, race: Option<String>,
         shared_camera: SharedCamera, shared_wire: SharedWireframe, frame_req: FrameReq,
         shared_window: SharedWindow, show_markers: bool, parts_mode: bool,
     ) -> Self {
-        Self { model_path, arch_name, shared_camera, shared_wire, frame_req, shared_window, show_markers, parts_mode, state: None }
+        Self { model_path, arch_name, race, shared_camera, shared_wire, frame_req, shared_window, show_markers, parts_mode, state: None }
     }
 }
 
@@ -641,7 +685,7 @@ impl ApplicationHandler for ModelViewerApp {
         };
 
         // Load the model.
-        let asset = match ModelAsset::load(&self.model_path) {
+        let mut asset = match ModelAsset::load(&self.model_path) {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("render_model: failed to load {}: {e}", self.model_path.display());
@@ -688,6 +732,88 @@ impl ApplicationHandler for ModelViewerApp {
             clip_bounds: vec![],
             feet_offset: 0.0,
         };
+
+        // --race mode: build a SKINNED model identical to the live client's, so we
+        // render the character exactly as in-game (skeleton-driven, idle animation,
+        // race-driven scale). The static `model` above is left unused in this mode.
+        let skinned: Option<SkinnedView> = if self.race.is_some() {
+            let skin = std::mem::take(&mut asset.skin);
+            match skin {
+                Some(skin) if skin.joint_count > 0 && skin.joint_count <= 128 => {
+                    let (_, sk_tex_bgs) = gpu::upload_textures(&device, &queue, &asset.textures, &layouts.texture_bgl);
+                    let (smeshes, sslots): (Vec<GpuSkinnedMesh>, Vec<Option<eq_renderer::models::EquipSlot>>) =
+                        asset.meshes.iter()
+                            .zip(asset.skin_meshes.iter())
+                            .zip(asset.skinned_mesh_scales.iter())
+                            .zip(asset.equip_slots.iter())
+                            .filter_map(|(((mesh, sd_opt), &mesh_node_scale), &slot)| {
+                                if mesh.positions.is_empty() || mesh.indices.is_empty() { return None; }
+                                let sd = sd_opt.as_ref();
+                                let vertices: Vec<SkinnedVertex> = mesh.positions.iter().enumerate().map(|(i, &p)| {
+                                    let nrm = mesh.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
+                                    let uv  = mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]);
+                                    let ji  = sd.and_then(|s: &SkinnedMeshData| s.joint_indices.get(i)).copied().unwrap_or([0u32; 4]);
+                                    let jw  = sd.and_then(|s: &SkinnedMeshData| s.joint_weights.get(i)).copied().unwrap_or([1.0, 0.0, 0.0, 0.0]);
+                                    SkinnedVertex { position: p, normal: nrm, uv, joint_indices: ji, joint_weights: jw }
+                                }).collect();
+                                let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                    label: None, contents: bytemuck::cast_slice(&vertices), usage: wgpu::BufferUsages::VERTEX });
+                                let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                                    label: None, contents: bytemuck::cast_slice(&mesh.indices), usage: wgpu::BufferUsages::INDEX });
+                                let texture_idx = mesh.texture_name.as_ref().and_then(|n| tex_names.iter().position(|t| t == n));
+                                Some((GpuSkinnedMesh { vertex_buf: vbuf, index_buf: ibuf,
+                                    index_count: mesh.indices.len() as u32, texture_idx,
+                                    base_color: mesh.base_color, mesh_node_scale }, slot))
+                            }).unzip();
+                    let smodel = GpuSkinnedModel {
+                        meshes: smeshes, texture_bind_groups: sk_tex_bgs, skin,
+                        node_scale: asset.skinned_node_scale, y_bottom: asset.y_bottom,
+                        x_center: asset.x_center, z_center: asset.z_center,
+                        prefix: asset.prefix.clone(), equip_slots: sslots,
+                        true_height: asset.true_height, clip_bounds: asset.clip_bounds.clone(),
+                        feet_offset: asset.feet_offset,
+                    };
+                    let joints_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("render_model_joints"), size: 128 * 64,
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false });
+                    let joints_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("render_model_joints_bg"), layout: &layouts.joints_bgl,
+                        entries: &[wgpu::BindGroupEntry { binding: 0, resource: joints_buf.as_entire_binding() }] });
+                    let r = self.race.clone().unwrap();
+                    let tgt = eq_renderer::models::target_height_for(&r, &self.arch_name);
+                    // CPU skinned AABB at the idle pose (frame 0) — should EXACTLY match what the
+                    // GPU renders (skin_point mirrors the shader). If this != the visible GPU size,
+                    // the divergence is in the joint buffer / shader, not the scale math.
+                    {
+                        use glam::Mat4;
+                        let idle = smodel.skin.clip_for_action("idle")
+                            .or_else(|| smodel.skin.clip_for_action("walking")).unwrap_or(0);
+                        let mats: Vec<Mat4> = smodel.skin.evaluate(idle, 0.0).iter()
+                            .map(|m| Mat4::from_cols_array_2d(m)).collect();
+                        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+                        for (mesh, sd) in asset.meshes.iter().zip(asset.skin_meshes.iter()) {
+                            let Some(sd) = sd else { continue };
+                            for (vi, p) in mesh.positions.iter().enumerate() {
+                                let j = sd.joint_indices.get(vi).copied().unwrap_or([0;4]);
+                                let w = sd.joint_weights.get(vi).copied().unwrap_or([1.0,0.0,0.0,0.0]);
+                                let y = eq_renderer::anim::SkinData::skin_point(*p, j, w, &mats)[1];
+                                if y.is_finite() { lo = lo.min(y); hi = hi.max(y); }
+                            }
+                        }
+                        eprintln!("render_model[skinned] CPU-AABB: joints={} idle_clip={} cpu_skinned_y_extent={:.3} (true_h={:.3}) -> rendered≈{:.2} ft",
+                            smodel.skin.joint_count, idle, hi - lo, smodel.true_height,
+                            (hi - lo) * (tgt / smodel.true_height.max(0.001)) * smodel.node_scale);
+                    }
+                    eprintln!("render_model[skinned]: race={r} arch={} clips={} true_h={:.3} node_scale={:.3} target={:.2} -> scale={:.4}",
+                        self.arch_name, smodel.skin.clips.len(), smodel.true_height, smodel.node_scale, tgt,
+                        (tgt / smodel.true_height.max(0.001)) * smodel.node_scale);
+                    Some(SkinnedView { model: smodel, joints_buf, joints_bg, race: r,
+                        arch: self.arch_name.clone(), anim_time: 0.0, last: std::time::Instant::now() })
+                }
+                _ => { eprintln!("render_model: --race given but model has no usable skin; falling back to static"); None }
+            }
+        } else { None };
 
         // Pre-allocate uniform buffers (one per mesh).
         let uniform_pool: Vec<(wgpu::Buffer, wgpu::BindGroup)> = model.meshes.iter().map(|_| {
@@ -823,8 +949,12 @@ impl ApplicationHandler for ModelViewerApp {
             }
         }
 
-        // In parts mode, zoom camera out to fit all separated parts.
-        let parts_distance = if self.parts_mode {
+        // In parts mode, zoom camera out to fit all separated parts. In skinned
+        // (--race) mode the model is ~target feet tall (e.g. 6), so frame it at ~3×.
+        let parts_distance = if skinned.is_some() {
+            eq_renderer::models::target_height_for(
+                self.race.as_deref().unwrap_or("HUM"), &self.arch_name) * 3.0
+        } else if self.parts_mode {
             let n = mesh_names.len().max(1) as f32;
             let spacing = 2.0 * asset.y_extent;
             n * spacing * 1.5
@@ -835,7 +965,7 @@ impl ApplicationHandler for ModelViewerApp {
         self.state = Some(ViewerState {
             window: window.clone(), device, queue, surface, surface_config,
             pipelines, wireframe_pipeline, camera_uniform, fallback_bg, depth_view,
-            model, arch_scale, uniform_pool, wireframe_indices,
+            model, arch_scale, uniform_pool, wireframe_indices, skinned,
             markers, marker_cube_vbuf, marker_cube_ibuf, marker_uniforms,
             parts_mode: self.parts_mode, mesh_names, mesh_centers,
             azimuth: 180.0, elevation: 20.0, distance: parts_distance, dragging: false,
@@ -917,12 +1047,45 @@ fn render_frame(s: &mut ViewerState) {
     let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
     let mut encoder = s.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
-    // Model matrix — same transform as the main client's entity pass.
-    let visual_scale = 2.0 * s.model.y_extent * s.arch_scale;
-    let mat = camera::entity_model_matrix_heading(
-        [0.0, 0.0, 0.0], 0.0, visual_scale, s.arch_scale,
-        [s.model.x_center, s.model.z_center], true, s.model.y_bottom,
-    );
+    // Model matrix. In --race (skinned) mode we replicate the client's
+    // encode_skinned_entity_pass EXACTLY: scale = target_height_for(race)/true_height ×
+    // node_scale, grounded by feet_offset, posed by the idle animation. Otherwise the
+    // legacy static path (archetype_scale).
+    let (visual_scale, mat, lift) = if let Some(sk) = s.skinned.as_mut() {
+        let now = std::time::Instant::now();
+        let dt = (now - sk.last).as_secs_f32();
+        sk.last = now;
+        let target = eq_renderer::models::target_height_for(&sk.race, &sk.arch);
+        let height = if sk.model.true_height > 0.001 { sk.model.true_height } else { 1.0 };
+        let dominant = (target / height) * sk.model.node_scale;
+        let vscale = -2.0 * sk.model.feet_offset * dominant;
+        // Idle animation pose → joint matrices (same fallback order as the client).
+        let idle = sk.model.skin.clip_for_action("idle")
+            .or_else(|| sk.model.skin.clip_for_action("walking")).unwrap_or(0);
+        let dur = sk.model.skin.clips.get(idle).map(|c| c.duration).unwrap_or(0.0).max(0.0001);
+        sk.anim_time = (sk.anim_time + dt) % dur;
+        let matrices = if sk.model.skin.clips.is_empty() {
+            sk.model.skin.bind_pose()
+        } else {
+            sk.model.skin.evaluate(idle, sk.anim_time)
+        };
+        let id4 = [[1f32,0.,0.,0.],[0.,1.,0.,0.],[0.,0.,1.,0.],[0.,0.,0.,1.]];
+        let mut joint_array = [id4; 128];
+        for (i, m) in matrices.iter().enumerate().take(128) { joint_array[i] = *m; }
+        s.queue.write_buffer(&sk.joints_buf, 0, bytemuck::cast_slice(&joint_array));
+        let m = camera::entity_model_matrix_heading(
+            [0.0, 0.0, 0.0], 0.0, vscale, dominant, [0.0, 0.0], true, 0.0,
+        );
+        (vscale, m, target * 0.5)
+    } else {
+        let vscale = 2.0 * s.model.y_extent * s.arch_scale;
+        let m = camera::entity_model_matrix_heading(
+            [0.0, 0.0, 0.0], 0.0, vscale, s.arch_scale,
+            [s.model.x_center, s.model.z_center], true, s.model.y_bottom,
+        );
+        let lift = vscale * 0.5 + s.model.y_bottom * s.arch_scale;
+        (vscale, m, lift)
+    };
 
     // Orbit camera: spherical → Cartesian, looking at model center.
     let az = s.azimuth.to_radians();
@@ -932,7 +1095,6 @@ fn render_frame(s: &mut ViewerState) {
         az.sin() * el.cos() * s.distance,
         el.sin() * s.distance,
     );
-    let lift = visual_scale * 0.5 + s.model.y_bottom * s.arch_scale;
     let target = glam::Vec3::new(0.0, 0.0, lift);
 
     let aspect = s.surface_config.width as f32 / s.surface_config.height as f32;
@@ -942,21 +1104,29 @@ fn render_frame(s: &mut ViewerState) {
     s.queue.write_buffer(&s.camera_uniform.buf, 0, bytemuck::cast_slice(&vp));
 
     // Write entity uniform for each mesh.
-    // In parts mode, offset each mesh along X so they render side-by-side.
-    let n_meshes = s.model.meshes.len() as f32;
-    let parts_spacing = if s.parts_mode { 2.0 * s.model.y_extent } else { 0.0 };
-    for (i, (mesh, (buf, _))) in s.model.meshes.iter().zip(s.uniform_pool.iter()).enumerate() {
-        let mesh_mat = if s.parts_mode {
-            let offset_x = (i as f32 - n_meshes * 0.5) * parts_spacing;
-            (glam::Mat4::from_cols_array_2d(&mat)
-                * glam::Mat4::from_translation(glam::Vec3::new(offset_x, 0.0, 0.0)))
-                .to_cols_array_2d()
-        } else {
-            mat
-        };
-        s.queue.write_buffer(buf, 0, bytemuck::bytes_of(&EntityUniform {
-            model: mesh_mat, tint: mesh.base_color,
-        }));
+    if let Some(sk) = s.skinned.as_ref() {
+        for (mesh, (buf, _)) in sk.model.meshes.iter().zip(s.uniform_pool.iter()) {
+            s.queue.write_buffer(buf, 0, bytemuck::bytes_of(&EntityUniform {
+                model: mat, tint: mesh.base_color,
+            }));
+        }
+    } else {
+        // In parts mode, offset each mesh along X so they render side-by-side.
+        let n_meshes = s.model.meshes.len() as f32;
+        let parts_spacing = if s.parts_mode { 2.0 * s.model.y_extent } else { 0.0 };
+        for (i, (mesh, (buf, _))) in s.model.meshes.iter().zip(s.uniform_pool.iter()).enumerate() {
+            let mesh_mat = if s.parts_mode {
+                let offset_x = (i as f32 - n_meshes * 0.5) * parts_spacing;
+                (glam::Mat4::from_cols_array_2d(&mat)
+                    * glam::Mat4::from_translation(glam::Vec3::new(offset_x, 0.0, 0.0)))
+                    .to_cols_array_2d()
+            } else {
+                mat
+            };
+            s.queue.write_buffer(buf, 0, bytemuck::bytes_of(&EntityUniform {
+                model: mesh_mat, tint: mesh.base_color,
+            }));
+        }
     }
 
     // Clear to dark gray background.
@@ -981,11 +1151,41 @@ fn render_frame(s: &mut ViewerState) {
         });
     }
 
-    // Choose pipeline: wireframe or textured.
-    let pipeline = if wireframe { &s.wireframe_pipeline } else { &s.pipelines.character };
+    // Skinned (--race) mode: draw with the client's skinned pipeline + joint matrices.
+    if let Some(sk) = s.skinned.as_ref() {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("model_skinned"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view, resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &s.depth_view,
+                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None, occlusion_query_set: None,
+        });
+        pass.set_pipeline(&s.pipelines.skinned);
+        pass.set_bind_group(0, &s.camera_uniform.bind_group, &[]);
+        pass.set_bind_group(3, &sk.joints_bg, &[]);
+        for (i, mesh) in sk.model.meshes.iter().enumerate() {
+            if i >= s.uniform_pool.len() { break; }
+            pass.set_bind_group(2, &s.uniform_pool[i].1, &[]);
+            let bg = match mesh.texture_idx {
+                Some(idx) if idx < sk.model.texture_bind_groups.len() => &sk.model.texture_bind_groups[idx],
+                _ => &s.fallback_bg,
+            };
+            pass.set_bind_group(1, bg, &[]);
+            pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+            pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+        }
+    }
 
-    // Draw all meshes.
-    {
+    // Legacy static draw (skipped in --race skinned mode).
+    if s.skinned.is_none() {
+        let pipeline = if wireframe { &s.wireframe_pipeline } else { &s.pipelines.character };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("model"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
