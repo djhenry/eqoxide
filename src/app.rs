@@ -1062,8 +1062,11 @@ impl App {
         // Replaces the old static ground-snap. The floor query uses the player's current z
         // as anchor so balconies and ceilings above never read as the floor.
         {
-            const GRAVITY: f32       = 20.0; // EQ units/s²
-            const MAX_FALL: f32      = 50.0; // EQ units/s terminal velocity
+            // Native Titanium fall: internal z-velocity clamps at ±128 EQ/s, and the outgoing
+            // position packet's delta_z caps at 12.8/update (~10 Hz → ~128 EQ/s terminal). The old
+            // 50/20 guess fell far too slowly. (eq-client-expert; docs/.../falling-physics.md.)
+            const GRAVITY: f32       = 120.0; // EQ units/s² (reaches ~128 terminal in ~1s)
+            const MAX_FALL: f32      = 128.0; // EQ units/s terminal velocity (native internal clamp)
 
             let p = self.scene.player_pos; // [east, north, z]
             // floor_z with anchor = p[2]: ray_start = p[2]+2, finds surfaces at or below that.

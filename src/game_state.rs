@@ -145,6 +145,9 @@ pub struct GameState {
     pub player_gender: u8,
     pub player_action: String,
     pub hp_pct: f32,
+    /// Player's absolute current/max HP (from OP_HP_UPDATE), used for the lethal-fall guard.
+    pub cur_hp: i32,
+    pub max_hp: i32,
     pub mana_pct: f32,
     pub xp_pct: f32,
     /// Coin on hand (platinum, gold, silver, copper), from the player profile.
@@ -291,6 +294,8 @@ impl GameState {
     pub fn update_hp(&mut self, spawn_id: u32, cur_hp: i32, max_hp: i32) {
         if spawn_id == self.player_id {
             self.hp_pct = (cur_hp as f32 / max_hp.max(1) as f32) * 100.0;
+            self.cur_hp = cur_hp;
+            self.max_hp = max_hp;
         } else if let Some(e) = self.entities.get_mut(&spawn_id) {
             e.cur_hp = cur_hp;
             e.max_hp = max_hp;

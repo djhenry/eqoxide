@@ -57,6 +57,36 @@ pub fn build_memorize_packet(slot: u32, spell_id: u32, scribing: u32) -> Vec<u8>
     buf
 }
 
+/// Native Titanium fall damage for a fall of `height` EQ units. Fall damage is CLIENT-computed in
+/// EQ (the server only validates OP_EnvDamage). Model: impact velocity = min(terminal,
+/// sqrt(2·g·h)) converted to the client's internal per-update z-velocity units (~5-13); then
+/// `fall_score = |z_vel| − 4` (char_counter≈0, no safe-fall skill): ≤0 → no damage, ≥9 → lethal
+/// (20000), else a roll in `[0, score²·10]`. Returns (rolled_damage, max_damage). See
+/// docs/eq-technical-knowledgebase/falling-physics.md.
+pub fn fall_damage(height: f32) -> (u32, u32) {
+    const GRAVITY: f32 = 120.0;   // matches the renderer's fall physics
+    const TERMINAL: f32 = 128.0;  // native internal z-velocity clamp
+    const HZ: f32 = 10.0;         // native position-update rate the formula is calibrated to
+    let v = (2.0 * GRAVITY * height.max(0.0)).sqrt().min(TERMINAL);
+    let score = v / HZ - 4.0;
+    if score <= 0.0 { return (0, 0); }
+    if score >= 9.0 { return (20_000, 20_000); }
+    let max = (score * score * 10.0) as u32;
+    let roll = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos()).unwrap_or(0);
+    (if max == 0 { 0 } else { roll % (max + 1) }, max)
+}
+
+/// Titanium `EnvDamage2_Struct` (31 bytes): id@0, damage(u32)@6, dmgtype(u8)@22, constant(u16)@27.
+pub fn build_env_damage_packet(player_id: u32, damage: u32, dmgtype: u8) -> Vec<u8> {
+    let mut buf = vec![0u8; 31];
+    buf[0..4].copy_from_slice(&player_id.to_le_bytes());
+    buf[6..10].copy_from_slice(&damage.to_le_bytes());
+    buf[22] = dmgtype;
+    buf[27..29].copy_from_slice(&0xFFFFu16.to_le_bytes());
+    buf
+}
+
 /// Titanium `PetCommand_Struct` (8 bytes): command(u32), target(u32). e.g. PET_ATTACK + a mob
 /// spawn id sends the player's pet to attack it.
 pub fn build_pet_command(command: u32, target: u32) -> Vec<u8> {
@@ -200,6 +230,10 @@ pub struct Navigator {
     /// The spawn id the pet was last ordered to attack (avoids re-spamming OP_PetCommands every
     /// tick). Reset when the target changes; see the auto-pet-combat block.
     last_pet_target:  Option<u32>,
+    /// `Some(landing_z)` while a controlled fall is in progress (the walker descends at the native
+    /// rate until reaching it, then applies fall damage); `fall_start_z` is where the fall began.
+    falling:          Option<f32>,
+    fall_start_z:     f32,
 }
 
 impl Navigator {
@@ -270,6 +304,8 @@ impl Navigator {
             path_i: 0,
             path_goal: None,
             last_pet_target: None,
+            falling: None,
+            fall_start_z: 0.0,
         }
     }
 
@@ -787,6 +823,31 @@ impl Navigator {
             }
         }
 
+        // Controlled fall in progress: descend at the native rate until landed, then apply native
+        // fall damage (client-computed in EQ; the server only validates OP_EnvDamage). Takes
+        // priority over normal walking so the descent isn't interrupted.
+        if let Some(land_z) = self.falling {
+            const FALL_STEP: f32 = 12.0; // ~native per-update descent (under the 12.8 wire cap)
+            let next_z = (gs.player_z - FALL_STEP).max(land_z);
+            let hdg = gs.player_heading;
+            self.send_position_update(stream, gs, gs.player_x, gs.player_y, next_z, hdg);
+            let _ = app_tx.send(make_position_packet(gs.player_id, gs.player_x, gs.player_y, next_z));
+            gs.player_z = next_z;
+            if next_z <= land_z + 0.5 {
+                let height = (self.fall_start_z - land_z).max(0.0);
+                self.falling = None;
+                let (dmg, _max) = fall_damage(height);
+                if dmg > 0 {
+                    stream.send_app_packet(OP_ENV_DAMAGE, &build_env_damage_packet(gs.player_id, dmg, DMGTYPE_FALLING));
+                    gs.cur_hp = (gs.cur_hp - dmg as i32).max(0);
+                    gs.log_msg("combat", &format!("Fell {:.0}u — {} fall damage", height, dmg));
+                    tracing::info!("EQ: fall damage {dmg} (fell {height:.0}u)");
+                }
+                tracing::info!("NAV: landed at z={:.1} after {:.0}u fall", land_z, height);
+            }
+            return;
+        }
+
         let goto = *self.goto_target.lock().unwrap(); // copy out so the lock is released
         let goal = match goto {
             Some(t) => t,
@@ -832,6 +893,27 @@ impl Navigator {
         let dy   = target.1 - gs.player_y; // north delta (server_y)
         let dist = (dx * dx + dy * dy).sqrt();
 
+        // Controlled-fall waypoint: a big single-step drop the walker can't walk down (find_path's
+        // last-resort fall edge). Walk to the edge at the CURRENT height, then begin a controlled
+        // fall. Refuse if the fall's native damage would likely be lethal — fall damage is
+        // client-applied, so an unguarded drop can suicide a squishy character.
+        const FALL_TRIGGER: f32 = 18.0; // bigger than a stair/ledge step (the walk STEP_H is 20)
+        let drop_to_target = gs.player_z - target.2;
+        if drop_to_target > FALL_TRIGGER && dist <= STOP_DIST + 8.0 {
+            let (_, max_dmg) = fall_damage(drop_to_target);
+            if gs.cur_hp > 0 && max_dmg >= gs.cur_hp as u32 {
+                tracing::info!("NAV: fall of {:.0}u (up to {} dmg) would exceed {} hp — stopping at ledge",
+                    drop_to_target, max_dmg, gs.cur_hp);
+                gs.log_msg("zone", "Fall too dangerous (HP too low) — stopped at the ledge");
+                *self.goto_target.lock().unwrap() = None;
+                return;
+            }
+            self.falling = Some(target.2);
+            self.fall_start_z = gs.player_z;
+            tracing::info!("NAV: stepping off a {:.0}u drop — controlled fall begins", drop_to_target);
+            return;
+        }
+
         // Stop when within 2 units of target. Melee range is ~14 units so we stop well
         // within melee range, ensuring LOS succeeds even with nearby geometry.
         const STOP_DIST: f32 = 2.0;
@@ -852,7 +934,9 @@ impl Navigator {
         // WASD sets goto_target.2 to the visual floor height (grounded z from the app's
         // ground snap), so this keeps the server and client z in sync and prevents the
         // server from rubber-banding the player back when it sees them at the wrong height.
-        let nz = target.2;
+        // While approaching a controlled-fall waypoint, stay at the current height (walk to the
+        // edge) instead of snapping down to the landing z; the fall is handled above on arrival.
+        let nz = if drop_to_target > FALL_TRIGGER { gs.player_z } else { target.2 };
 
         // Collision: slide along walls instead of walking through them. Try the full
         // step, then each axis alone; only stop (clear the goal) if fully boxed in.
