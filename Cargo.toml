@@ -40,7 +40,6 @@ miniz_oxide = "0.8"
 des = "0.8"
 cbc = "0.1"
 axum = "0.7"
-png = "0.17"
 ureq = { version = "2", features = ["json"] }
 blake3 = "1"
 dirs = "5"
@@ -50,7 +49,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"
-tower = { version = "0.5", features = ["util"] }
 
 [workspace]
 members = ["tools"]
