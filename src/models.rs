@@ -430,10 +430,15 @@ impl ModelAsset {
         // From the IDLE pose (what's actually rendered) measure two things over the dominant
         // body meshes' model-Y:
         //   - feet_offset = 5th percentile (robust feet; excludes stray geometry below the feet)
-        //   - idle_extent = full vertical extent
+        //   - idle_extent = ROBUST vertical extent (0.5th..99.5th percentile)
         // Scaling by the idle extent (rather than eq_height = the BIND-pose extent) makes every
         // model render at its archetype target height. eq_height is wrong when the idle pose
         // differs from bind — e.g. a bat with wings spread (bind 3 → idle 15 → 5x oversized).
+        // The extent MUST be robust to outliers: some models (notably the male Human/Barbarian/
+        // Erudite Luclin meshes) carry a handful of stray vertices far above the head, so the raw
+        // max-min is ~2× the real body. Using the full extent there halves the visible body
+        // (true_height inflated → scale halved). The 0.5/99.5 percentiles track the body and drop
+        // the strays. (Verified: race_hum body = p0.5..p99.5 ≈ 6.5, full max-min ≈ 11.6.)
         let (feet_offset, idle_extent): (f32, f32) = match skin_data.as_ref() {
             Some(sd) if !sd.clips.is_empty() => {
                 let idle = sd.clip_for_action("idle")
@@ -453,7 +458,10 @@ impl ModelAsset {
                 }
                 if ys.is_empty() { (0.0, 0.0) } else {
                     ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                    (ys[((ys.len() - 1) as f32 * 0.05) as usize], ys[ys.len() - 1] - ys[0])
+                    let last = (ys.len() - 1) as f32;
+                    let p = |q: f32| ys[(last * q) as usize];
+                    // feet_offset: 5th pct (robust low). extent: 0.5th..99.5th pct (drops strays).
+                    (p(0.05), p(0.995) - p(0.005))
                 }
             }
             _ => (0.0, 0.0),
