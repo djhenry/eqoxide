@@ -781,12 +781,27 @@ pub fn encode_skinned_entity_pass(
 
     let id4 = [[1f32,0.,0.,0.],[0.,1.,0.,0.],[0.,0.,1.,0.],[0.,0.,0.,1.]];
 
-    for b in &scene.billboards {
-        if b.level == 0 { continue; }
+    // Each humanoid model is ~27 meshes, so the uniform/joint pools can't hold every
+    // spawn in a crowded zone. Render NEAREST-first so the NPCs around the player always
+    // draw, and only draw a model that fits ENTIRELY in the remaining pool (no partial,
+    // shrunken-looking bodies). Distant overflow spawns fall back to their nameplate.
+    let pp = scene.player_pos;
+    let mut order: Vec<&crate::scene::Billboard> =
+        scene.billboards.iter().filter(|b| b.level != 0).collect();
+    order.sort_by(|a, b| {
+        let da = (a.pos[0]-pp[0]).powi(2) + (a.pos[1]-pp[1]).powi(2) + (a.pos[2]-pp[2]).powi(2);
+        let db = (b.pos[0]-pp[0]).powi(2) + (b.pos[1]-pp[1]).powi(2) + (b.pos[2]-pp[2]).powi(2);
+        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    for b in order {
         let archetype = race_to_archetype(&b.race);
         let (model_key, model_slot) = crate::models::character_model_key(&b.race, b.gender);
         let Some(GpuModel::Skinned(model)) = r.model_by_key(model_key, model_slot) else { continue };
-        if j_slot >= r.joint_buf_pool.len() { break; }
+        // Skip (don't break) if this model doesn't fully fit — a later, smaller model
+        // (e.g. an 8-mesh rat) may still fit in the remaining slots.
+        if j_slot >= r.joint_buf_pool.len() { continue; }
+        if u_slot + model.meshes.len() > r.entity_uniform_pool.len() { continue; }
 
         let matrices: Vec<[[f32;4];4]> = if b.action == "dead" {
             model.skin.bind_pose()
@@ -810,7 +825,6 @@ pub fn encode_skinned_entity_pass(
         let visual_scale = -2.0 * model.feet_offset * dominant_scale;
 
         for (mesh_idx, mesh) in model.meshes.iter().enumerate() {
-            if u_slot >= r.entity_uniform_pool.len() { break; }
             let mat = crate::camera::entity_model_matrix_heading(
                 b.pos, b.heading, visual_scale, dominant_scale,
                 [0.0, 0.0], true, 0.0,
