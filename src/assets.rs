@@ -700,6 +700,37 @@ impl Collision {
                         }
                     }
                 }
+
+                // CONTROLLED FALL: step off a ledge / through a hole and fall to the floor below.
+                // Allowed when (a) you can move horizontally off the edge at your CURRENT height (open
+                // air beyond the ledge reads as clear), and (b) there's a landing floor within
+                // MAX_FALL below. This is how levels joined by a drop (no walkable ramp, e.g. qcat's
+                // dry sewer) connect. It's directional (you fall DOWN); climbing back needs a real
+                // path. A per-unit fall cost makes A* prefer walking/stairs when a route exists.
+                const MAX_FALL: f32 = 120.0;
+                if self.path_clear([a[0], a[1], cz + CHEST], [b[0], b[1], cz + CHEST], radius) {
+                    // The first surface you'd land on falling at b = highest floor below a real-step
+                    // drop. (column_floors returns high→low, so `find` gives the first landing.)
+                    if let Some(nf) = self.column_floors(b[0], b[1], cz, 0.0, MAX_FALL)
+                        .into_iter().find(|&z| z < cz - STEP_H)
+                    {
+                        let nkey = (nc, nr, qf(nf));
+                        if !closed.contains(&nkey) {
+                            // Huge flat cost: a controlled fall is a LAST RESORT. A* will only take
+                            // it when there's no walkable route to the goal (e.g. a sealed lower
+                            // level), never as a 2D "shortcut" that dives into a pit and climbs back.
+                            const FALL_PENALTY: f32 = 50_000.0;
+                            let step = FALL_PENALTY + (cz - nf) * 2.0;
+                            let tentative = g_cur + step;
+                            if tentative < *g_score.get(&nkey).unwrap_or(&f32::MAX) {
+                                g_score.insert(nkey, tentative);
+                                came.insert(nkey, ckey);
+                                floor_of.insert(nkey, nf);
+                                heap.push(Node { f: tentative + h(nc, nr), c: nc, r: nr, fz: nf });
+                            }
+                        }
+                    }
+                }
             }
         }
         let goal_key = match goal_key {
