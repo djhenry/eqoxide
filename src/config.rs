@@ -53,7 +53,7 @@ impl AppConfig {
             .and_then(|v| v.get("models_path"))
             .and_then(|v| v.as_str())
             .map(|p| PathBuf::from(shellexpand::tilde(p).into_owned()))
-            .unwrap_or_else(|| PathBuf::from("eq_renderer/assets/models"));
+            .unwrap_or_else(|| PathBuf::from("eqoxide/assets/models"));
 
         let http_port = cfg
             .get("http_port")

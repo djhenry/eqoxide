@@ -17,7 +17,7 @@ impl CacheDirs {
     pub fn resolve() -> Self {
         let root = dirs::data_dir()
             .unwrap_or_else(|| PathBuf::from("."))
-            .join("eq_client_lite")
+            .join("eqoxide")
             .join("assets");
         CacheDirs { root }
     }
@@ -212,7 +212,7 @@ mod tests {
         let c = CacheDirs::resolve();
         let data = dirs::data_dir().unwrap();
         assert!(c.root.starts_with(&data), "{:?} not under {:?}", c.root, data);
-        assert!(c.root.ends_with("eq_client_lite/assets"));
+        assert!(c.root.ends_with("eqoxide/assets"));
     }
 
     #[test]

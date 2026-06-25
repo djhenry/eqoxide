@@ -2,7 +2,7 @@
 //! http://localhost:8088) with account $ASSET_USER/$ASSET_PASS.
 //! Run: ASSET_USER=claude ASSET_PASS=REDACTED cargo test --test asset_sync_live -- --ignored
 
-use eq_renderer::asset_sync::{AssetSync, Transport};
+use eqoxide::asset_sync::{AssetSync, Transport};
 
 #[test]
 #[ignore]

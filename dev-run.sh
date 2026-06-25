@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# dev-run.sh — run the eq_client_lite renderer and auto-restart it whenever the
+# dev-run.sh — run the eqoxide renderer and auto-restart it whenever the
 # compiled binary changes (i.e. whenever a new `cargo build` lands).
 #
 # Run this in YOUR OWN terminal (not inside the Claude/agent harness — the harness
@@ -9,20 +9,20 @@
 # (http://localhost:8765) and GET /frame to evaluate visual changes.
 #
 # Usage:
-#   ./dev-run.sh              # release build (default): target/release/eq_renderer
-#   ./dev-run.sh debug        # debug build:             target/debug/eq_renderer
-#   BIN=/path/to/eq_renderer ./dev-run.sh
+#   ./dev-run.sh              # release build (default): target/release/eqoxide
+#   ./dev-run.sh debug        # debug build:             target/debug/eqoxide
+#   BIN=/path/to/eqoxide ./dev-run.sh
 #
 # Env (auto-defaulted if unset): DISPLAY, WAYLAND_DISPLAY, XDG_RUNTIME_DIR, RUST_LOG
-# Log: /tmp/eq_client.log  (the agent reads this)
+# Log: /tmp/eqoxide.log  (the agent reads this)
 
 set -u
 
 # ── Config ────────────────────────────────────────────────────────────────────
 PROFILE="${1:-release}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN="${BIN:-$REPO_DIR/target/$PROFILE/eq_renderer}"
-LOG="${LOG:-/tmp/eq_client.log}"
+BIN="${BIN:-$REPO_DIR/target/$PROFILE/eqoxide}"
+LOG="${LOG:-/tmp/eqoxide.log}"
 POLL_SECS="${POLL_SECS:-2}"
 
 # Display/session env — only set defaults if the caller hasn't.
