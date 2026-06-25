@@ -143,6 +143,10 @@ pub struct App {
     /// winit event loop on the MAIN thread, so winit tears down its Wayland clipboard worker cleanly
     /// — instead of a background thread calling `process::exit()` and racing that teardown (SIGSEGV).
     shutdown:     std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Camp command slot (HUD Camp button writes a Toggle here) and the published camp deadline the
+    /// HUD reads for its countdown. The gameplay loop owns the camp logic; see `gameplay::camp_apply`.
+    camp:         crate::http::CampReq,
+    camp_until:   crate::http::CampUntil,
     scene:        SceneState,
     app_rx:       tokio::sync::mpsc::UnboundedReceiver<AppPacket>,
     // Frame capture for /frame API
@@ -229,6 +233,8 @@ impl App {
         warp:            crate::http::WarpReq,
         testzone_mode:   bool,
         shutdown:        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        camp:            crate::http::CampReq,
+        camp_until:      crate::http::CampUntil,
         asset_server_url: String,
         asset_user:       String,
         asset_pass:       String,
@@ -277,7 +283,7 @@ impl App {
             pick_screen_w: 800,
             pick_screen_h: 600,
             game_state, scene: SceneState::default(), app_rx, frame_req,
-            player_info, warp, shutdown, collision: None, shared_collision,
+            player_info, warp, shutdown, camp, camp_until, collision: None, shared_collision,
             ground_cache: (f32::NAN, f32::NAN, 0.0),
             last_grounded_z: 0.0,
             prev_render_pos: [0.0, 0.0, 0.0],
@@ -1234,6 +1240,7 @@ impl App {
             &mut self.ui_zoom, &mut self.ui_zoom_size,
             self.show_debug, self.game_state.server_corrections,
             &self.frame_profile,
+            &self.camp, &self.camp_until,
         );
         let dur_egui = prof_egui.elapsed();
 
@@ -1305,6 +1312,8 @@ impl App {
         show_debug:    bool,
         corrections:   u32,
         frame_profile: &crate::profiling::FrameProfile,
+        camp:          &crate::http::CampReq,
+        camp_until:    &crate::http::CampUntil,
     ) {
         let (Some(egui_state), Some(egui_renderer), Some(egui_ctx), Some(window)) =
             (egui_state, egui_renderer, egui_ctx, window) else { return };
@@ -1340,7 +1349,7 @@ impl App {
                 hud::draw_message_log(ctx, ui_layout, scene);
                 hud::draw_labels(ctx, scene, view_proj, screen_w, screen_h, cam_eye, collision);
                 hud::draw_minimap(ctx, ui_layout, scene, zone_min, zone_max, minimap_zoom, minimap_full, zone_map, show_map);
-                hud::draw_control_bar(ctx, ui_layout, scene, hail, say, target, say_buffer);
+                hud::draw_control_bar(ctx, ui_layout, scene, hail, say, target, say_buffer, camp, camp_until);
                 hud::draw_action_grid(ctx, ui_layout, scene, spells, spell_icons, attack, cast, sit, target, consider);
                 hud::draw_inventory(ctx, ui_layout, scene, show_inventory);
                 hud::draw_merchant(ctx, ui_layout, scene, buy, sell, trade);
@@ -1468,6 +1477,12 @@ impl ApplicationHandler for App {
 
         // Drain packets + detect in-flight activity. Any activity extends the active render window.
         if self.poll_external() {
+            self.active_until = std::time::Instant::now() + Self::ACTIVE_LINGER;
+        }
+
+        // Keep rendering while a camp is in progress so the HUD countdown ticks smoothly even in a
+        // still scene (the event-driven loop would otherwise idle between sparse packets).
+        if self.camp_until.lock().unwrap().is_some() {
             self.active_until = std::time::Instant::now() + Self::ACTIVE_LINGER;
         }
 

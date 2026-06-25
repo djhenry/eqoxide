@@ -18,7 +18,6 @@ use axum::{
 };
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::oneshot;
 use crate::camera_state::{CameraCmd, CameraSnapshot};
 
@@ -79,6 +78,20 @@ pub type SellReq = Arc<Mutex<Option<(u32, u32, u32)>>>;
 #[derive(Clone, Copy)]
 pub enum TradeCmd { Open(u32), Close }
 pub type TradeReq = Arc<Mutex<Option<TradeCmd>>>;
+
+/// Camp command, written by POST /exit, POST /camp, the HUD Camp button, and the `/camp` chat
+/// keyword. The gameplay loop drains it: `Start` begins a camp if one isn't running (idempotent —
+/// used by /exit so a double request doesn't cancel); `Toggle` starts a camp or cancels the one in
+/// progress (used by the button / chat command). A completed camp shuts the client down cleanly
+/// (no linkdead) once the server's ~29s camp timer has elapsed. See `gameplay::camp_apply`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CampCmd { Start, Toggle }
+pub type CampReq = Arc<Mutex<Option<CampCmd>>>;
+
+/// Published camp state: `Some(deadline)` while a camp is in progress (the instant the client will
+/// disconnect), `None` otherwise. Set by the gameplay loop; read by the HUD for the countdown and
+/// by handlers to know whether a camp is already running.
+pub type CampUntil = Arc<Mutex<Option<std::time::Instant>>>;
 
 /// Live merchant-session snapshot published each nav tick, read by GET /trade/list and used for
 /// the HUD merchant window. `open` mirrors `GameState::merchant_open`.
@@ -212,7 +225,8 @@ struct HttpState {
     task_log:         TaskLog,
     door_click:       DoorClickReq,
     doors_shared:     DoorsShared,
-    shutdown:         Arc<AtomicBool>,
+    camp:             CampReq,
+    camp_until:       CampUntil,
 }
 
 #[derive(serde::Deserialize)]
@@ -268,13 +282,14 @@ pub fn spawn_camera_server(
     task_log:         TaskLog,
     door_click:       DoorClickReq,
     doors_shared:     DoorsShared,
-    shutdown:         Arc<AtomicBool>,
+    camp:             CampReq,
+    camp_until:       CampUntil,
     port:             u16,
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, spells, player_info, task_log, shutdown, door_click, doors_shared };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, spells, player_info, task_log, door_click, doors_shared, camp, camp_until };
             let app = Router::new()
                 .route("/camera", get(get_camera).post(post_camera))
                 .route("/camera/reset", post(post_camera_reset))
@@ -314,6 +329,7 @@ pub fn spawn_camera_server(
                 .route("/doors", get(get_doors))
                 .route("/doors/click", post(post_door_click))
                 .route("/exit", post(post_exit))
+                .route("/camp", post(post_camp))
                 .route("/debug", get(get_debug))
                 .with_state(state);
             // Scan upward from the configured base port so multiple client instances
@@ -1040,23 +1056,38 @@ async fn post_loot(
     }
 }
 
-/// POST /exit — cleanly log this client out and shut down. Sets the shared shutdown flag. The
-/// render loop's `about_to_wait` observes it and exits the winit event loop on the MAIN thread,
-/// which tears down winit/Wayland cleanly and then exits the process (via `main`). The EQ network
-/// thread separately observes the flag to send OP_Logout + OP_SessionDisconnect, then idles.
+/// POST /exit — camp out, then cleanly shut down. Requests a camp (`CampCmd::Start`, idempotent):
+/// the gameplay loop sends OP_Camp, stays connected ~30s for EQEmu's camp timer to set `instalog`,
+/// then sets the shutdown flag so the disconnect leaves NO linkdead ghost (instant re-login). The
+/// render loop's `about_to_wait` then exits the winit event loop on the MAIN thread and the process
+/// exits via `main`.
 ///
-/// The graceful path completes in ~1.5s. The watchdog below is a last resort that only fires if
-/// the render loop is wedged (and so can't process the flag); its `process::exit()` from this
-/// background thread can crash the Wayland teardown, which is why it is NOT the normal exit path.
+/// The watchdog is a last resort if the gameplay/render loop is wedged. It must outlast the camp
+/// (CAMP_DURATION ≈ 30s) so it never force-kills mid-camp (which WOULD linkdead); 45s gives margin.
 async fn post_exit(State(s): State<HttpState>) -> (StatusCode, &'static str) {
-    tracing::info!("exit: clean shutdown requested via POST /exit");
-    s.shutdown.store(true, Ordering::Relaxed);
+    tracing::info!("exit: camp-and-shutdown requested via POST /exit");
+    *s.camp.lock().unwrap() = Some(CampCmd::Start);
     tokio::spawn(async {
-        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-        tracing::warn!("exit: watchdog timeout — render loop unresponsive, forcing process exit");
+        tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+        tracing::warn!("exit: watchdog timeout — loop unresponsive, forcing process exit");
         std::process::exit(0);
     });
-    (StatusCode::OK, "logging out and shutting down")
+    (StatusCode::OK, "camping out, then shutting down (~30s)")
+}
+
+/// POST /camp — toggle a camp. Starts a camp if none is running, or cancels the one in progress
+/// (same as the HUD Camp button and the `/camp` chat keyword). A completed camp shuts the client
+/// down cleanly with no linkdead; a cancel keeps the client in-world.
+async fn post_camp(State(s): State<HttpState>) -> (StatusCode, &'static str) {
+    let camping = s.camp_until.lock().unwrap().is_some();
+    *s.camp.lock().unwrap() = Some(CampCmd::Toggle);
+    if camping {
+        tracing::info!("camp: cancel requested via POST /camp");
+        (StatusCode::OK, "cancelling camp")
+    } else {
+        tracing::info!("camp: start requested via POST /camp");
+        (StatusCode::OK, "camping out (~30s), then shutting down")
+    }
 }
 
 /// GET /doors — list the current zone's doors (id, name, position, opentype, open state).

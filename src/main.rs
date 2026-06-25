@@ -128,9 +128,14 @@ OPTIONS:
 
     let (app_tx, app_rx) = tokio::sync::mpsc::unbounded_channel::<eq_net::AppPacket>();
 
-    // Shared clean-shutdown flag. Set by POST /exit and by window-close; observed by the
-    // EQ network thread, which performs the logout sequence and exits the process.
+    // Shared clean-shutdown flag. Set by window-close, a completed camp, and signals; observed by
+    // the EQ network thread, which performs the logout sequence and exits the process.
     let shutdown: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
+    // Camp slots. `camp` carries a pending camp command (/exit, /camp, HUD button, `/camp` chat);
+    // `camp_until` is the published camp deadline (Some while camping) for the HUD countdown.
+    let camp:       http::CampReq   = Arc::new(Mutex::new(None));
+    let camp_until: http::CampUntil = Arc::new(Mutex::new(None));
 
     // Route SIGTERM/SIGINT into the same clean-shutdown flag so a killed process (e.g.
     // `timeout N ./eqoxide`, Ctrl-C, or `kill <pid>`) logs out cleanly instead of dropping
@@ -213,11 +218,13 @@ OPTIONS:
         let co  = consider.clone();
         let sc  = shared_collision.clone();
         let sd  = shutdown.clone();
+        let cp  = camp.clone();
+        let cu  = camp_until.clone();
         let md  = data_dir.join("maps");
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, zc, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, ca, ms, st, co, sc, md, sd).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, zc, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, ca, ms, st, co, sc, md, sd, cp, cu).await {
                     tracing::error!("EQ: fatal: {e}");
                 }
             });
@@ -271,7 +278,8 @@ OPTIONS:
         task_log,
         door_click,
         doors_shared,
-        shutdown.clone(),
+        camp.clone(),
+        camp_until.clone(),
         app_cfg.http_port,
     );
 
@@ -302,6 +310,8 @@ OPTIONS:
         warp,
         testzone_mode,
         shutdown.clone(),
+        camp.clone(),
+        camp_until.clone(),
         asset_server_url,
         asset_user,
         asset_pass,
