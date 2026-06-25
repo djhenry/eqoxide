@@ -2,7 +2,7 @@
 ///
 /// This binary loads a `.glb` file and renders it in an orbit camera window,
 /// using the same pipeline, shaders, and model loading code as the full EQ
-/// client (`eq_renderer`). It is decoupled from the zone, HUD, networking,
+/// client (`eqoxide`). It is decoupled from the zone, HUD, networking,
 /// and game state — only the rendering subsystem is used.
 ///
 /// # Usage
@@ -41,11 +41,11 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId, WindowAttributes};
 use wgpu::util::DeviceExt;
 
-use eq_renderer::camera;
-use eq_renderer::frame_capture;
-use eq_renderer::gpu::{self, GpuStaticModel, GpuSkinnedModel, GpuSkinnedMesh, SkinnedVertex, EntityUniform};
-use eq_renderer::models::{ModelAsset, SkinnedMeshData};
-use eq_renderer::pipeline;
+use eqoxide::camera;
+use eqoxide::frame_capture;
+use eqoxide::gpu::{self, GpuStaticModel, GpuSkinnedModel, GpuSkinnedMesh, SkinnedVertex, EntityUniform};
+use eqoxide::models::{ModelAsset, SkinnedMeshData};
+use eqoxide::pipeline;
 
 /// A colored marker at a body-part center for visual debugging.
 #[derive(Clone, Debug)]
@@ -370,10 +370,10 @@ fn main() {
         .and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let (model_path, arch_name) = if let Some(ref r) = race {
-        let base = eq_renderer::models::race_model_basename(r, gender).unwrap_or("race_hum");
-        let p = eq_renderer::asset_sync::CacheDirs::resolve().models_dir().join(format!("{base}.glb"));
+        let base = eqoxide::models::race_model_basename(r, gender).unwrap_or("race_hum");
+        let p = eqoxide::asset_sync::CacheDirs::resolve().models_dir().join(format!("{base}.glb"));
         eprintln!("render_model: --race {r} gender {gender} -> {} ({})", base, p.display());
-        (p, eq_renderer::models::race_to_archetype(r).to_string())
+        (p, eqoxide::models::race_to_archetype(r).to_string())
     } else {
         let arch = args.iter().position(|a| a == "--arch")
             .and_then(|i| args.get(i + 1)).cloned()
@@ -393,7 +393,7 @@ fn main() {
     // normally see the back); for inspecting a model we want the front.
     // In --race mode the character is only ~6 ft tall, so start the orbit camera close.
     let init_distance = if let Some(ref r) = race {
-        eq_renderer::models::target_height_for(r, &arch_name) * 3.0
+        eqoxide::models::target_height_for(r, &arch_name) * 3.0
     } else { 30.0 };
     let shared_camera: SharedCamera     = Arc::new(Mutex::new(SharedCameraState { azimuth: 180.0, elevation: 20.0, distance: init_distance }));
     let shared_wire:   SharedWireframe  = Arc::new(Mutex::new(false));
@@ -772,12 +772,12 @@ impl ApplicationHandler for ModelViewerApp {
             self.model_path.display(), asset.meshes.len(),
             asset.y_bottom, asset.y_extent, asset.x_center, asset.z_center);
 
-        let arch_scale = eq_renderer::models::archetype_scale(&self.arch_name);
+        let arch_scale = eqoxide::models::archetype_scale(&self.arch_name);
 
         let (_, tex_bgs) = gpu::upload_textures(&device, &queue, &asset.textures, &layouts.texture_bgl);
         let tex_names: Vec<String> = asset.textures.iter().map(|t| t.name.clone()).collect();
 
-        let (meshes, static_slots): (Vec<gpu::GpuMesh>, Vec<Option<eq_renderer::models::EquipSlot>>) = asset.meshes.iter()
+        let (meshes, static_slots): (Vec<gpu::GpuMesh>, Vec<Option<eqoxide::models::EquipSlot>>) = asset.meshes.iter()
             .zip(asset.equip_slots.iter())
             .filter_map(|(mesh, &slot)| {
             if mesh.positions.is_empty() || mesh.indices.is_empty() { return None; }
@@ -817,7 +817,7 @@ impl ApplicationHandler for ModelViewerApp {
             match skin {
                 Some(skin) if skin.joint_count > 0 && skin.joint_count <= 128 => {
                     let (_, sk_tex_bgs) = gpu::upload_textures(&device, &queue, &asset.textures, &layouts.texture_bgl);
-                    let (smeshes, sslots): (Vec<GpuSkinnedMesh>, Vec<Option<eq_renderer::models::EquipSlot>>) =
+                    let (smeshes, sslots): (Vec<GpuSkinnedMesh>, Vec<Option<eqoxide::models::EquipSlot>>) =
                         asset.meshes.iter()
                             .zip(asset.skin_meshes.iter())
                             .zip(asset.skinned_mesh_scales.iter())
@@ -857,7 +857,7 @@ impl ApplicationHandler for ModelViewerApp {
                         label: Some("render_model_joints_bg"), layout: &layouts.joints_bgl,
                         entries: &[wgpu::BindGroupEntry { binding: 0, resource: joints_buf.as_entire_binding() }] });
                     let r = self.race.clone().unwrap();
-                    let tgt = eq_renderer::models::target_height_for(&r, &self.arch_name);
+                    let tgt = eqoxide::models::target_height_for(&r, &self.arch_name);
                     // CPU skinned AABB at the idle pose (frame 0) — should EXACTLY match what the
                     // GPU renders (skin_point mirrors the shader). If this != the visible GPU size,
                     // the divergence is in the joint buffer / shader, not the scale math.
@@ -873,7 +873,7 @@ impl ApplicationHandler for ModelViewerApp {
                             for (vi, p) in mesh.positions.iter().enumerate() {
                                 let j = sd.joint_indices.get(vi).copied().unwrap_or([0;4]);
                                 let w = sd.joint_weights.get(vi).copied().unwrap_or([1.0,0.0,0.0,0.0]);
-                                let y = eq_renderer::anim::SkinData::skin_point(*p, j, w, &mats)[1];
+                                let y = eqoxide::anim::SkinData::skin_point(*p, j, w, &mats)[1];
                                 if y.is_finite() { lo = lo.min(y); hi = hi.max(y); }
                             }
                         }
@@ -1052,7 +1052,7 @@ impl ApplicationHandler for ModelViewerApp {
         // In parts mode, zoom camera out to fit all separated parts. In skinned
         // (--race) mode the model is ~target feet tall (e.g. 6), so frame it at ~3×.
         let parts_distance = if skinned.is_some() {
-            eq_renderer::models::target_height_for(
+            eqoxide::models::target_height_for(
                 self.race.as_deref().unwrap_or("HUM"), &self.arch_name) * 3.0
         } else if self.parts_mode {
             let n = mesh_names.len().max(1) as f32;
@@ -1155,7 +1155,7 @@ fn render_frame(s: &mut ViewerState) {
         let now = std::time::Instant::now();
         let dt = (now - sk.last).as_secs_f32();
         sk.last = now;
-        let target = eq_renderer::models::target_height_for(&sk.race, &sk.arch);
+        let target = eqoxide::models::target_height_for(&sk.race, &sk.arch);
         let height = if sk.model.true_height > 0.001 { sk.model.true_height } else { 1.0 };
         let dominant = (target / height) * sk.model.node_scale;
         let vscale = -2.0 * sk.model.feet_offset * dominant;
@@ -1188,7 +1188,7 @@ fn render_frame(s: &mut ViewerState) {
             // of the male-model half-size bug, now fixed in models.rs by using the robust extent).
             let mut ys: Vec<f32> = Vec::with_capacity(sk.cpu_verts.len());
             for (p, ji, jw) in &sk.cpu_verts {
-                let sp = eq_renderer::anim::SkinData::skin_point(*p, *ji, *jw, &mats);
+                let sp = eqoxide::anim::SkinData::skin_point(*p, *ji, *jw, &mats);
                 if sp[1].is_finite() { ys.push(sp[1]); }
             }
             ys.sort_by(|a, b| a.partial_cmp(b).unwrap());

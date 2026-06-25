@@ -1,14 +1,14 @@
 [package]
-name = "eq_renderer"
+name = "eqoxide"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "eq_renderer"
+name = "eqoxide"
 path = "src/lib.rs"
 
 [[bin]]
-name = "eq_renderer"
+name = "eqoxide"
 path = "src/main.rs"
 
 [[bin]]

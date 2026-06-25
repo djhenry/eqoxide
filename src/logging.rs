@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! EQ_LOG=debug                 # everything at debug and above
-//! EQ_LOG=info,eq_renderer::eq_net=debug   # net subsystem chattier than the rest
+//! EQ_LOG=info,eqoxide::eq_net=debug   # net subsystem chattier than the rest
 //! EQ_LOG=warn                  # quiet: only warnings and errors
 //! ```
 //!

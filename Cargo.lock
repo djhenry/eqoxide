@@ -819,7 +819,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "483440db0b7993cf77a20314f08311dbe95675092405518c0677aa08c151a3ea"
 
 [[package]]
-name = "eq_renderer"
+name = "eqoxide"
 version = "0.1.0"
 dependencies = [
  "anyhow",

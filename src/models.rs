@@ -844,7 +844,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires bundled model at eq_renderer/assets/models/humanoid.glb"]
+    #[ignore = "requires bundled model at eqoxide/assets/models/humanoid.glb"]
     fn load_humanoid_has_meshes() {
         let path = std::path::PathBuf::from(
             concat!(env!("CARGO_MANIFEST_DIR"), "/assets/models/humanoid.glb")
@@ -854,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires bundled model at eq_renderer/assets/models/creature.glb"]
+    #[ignore = "requires bundled model at eqoxide/assets/models/creature.glb"]
     fn load_creature_has_skin_and_clips() {
         let path = std::path::PathBuf::from(
             concat!(env!("CARGO_MANIFEST_DIR"), "/assets/models/creature.glb")
@@ -868,7 +868,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires bundled model at eq_renderer/assets/models/humanoid.glb"]
+    #[ignore = "requires bundled model at eqoxide/assets/models/humanoid.glb"]
     fn humanoid_has_walk_clip_and_node_scale() {
         let path = std::path::PathBuf::from(
             concat!(env!("CARGO_MANIFEST_DIR"), "/assets/models/humanoid.glb")
@@ -888,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires bundled model at eq_renderer/assets/models/humanoid.glb"]
+    #[ignore = "requires bundled model at eqoxide/assets/models/humanoid.glb"]
     fn humanoid_evaluate_produces_finite_matrices() {
         let path = std::path::PathBuf::from(
             concat!(env!("CARGO_MANIFEST_DIR"), "/assets/models/humanoid.glb")
@@ -911,7 +911,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires bundled model at eq_renderer/assets/models/humanoid.glb"]
+    #[ignore = "requires bundled model at eqoxide/assets/models/humanoid.glb"]
     fn humanoid_joint_indices_in_bounds() {
         let path = std::path::PathBuf::from(
             concat!(env!("CARGO_MANIFEST_DIR"), "/assets/models/humanoid.glb")

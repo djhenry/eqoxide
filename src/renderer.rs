@@ -907,7 +907,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn eq_renderer_uses_pipeline_types() {
+    fn eqoxide_uses_pipeline_types() {
         fn _check(r: &EqRenderer) {
             let _: &crate::pipeline::Layouts      = &r.layouts;
             let _: &crate::pipeline::Pipelines    = &r.pipelines;
