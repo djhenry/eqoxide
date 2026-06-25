@@ -20,7 +20,7 @@ use crate::eq_net::packet_handler::apply_packet;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::GameState;
-use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, CastReq, MemSpellReq, SitReq, ConsiderReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
+use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, CastReq, MemSpellReq, SitReq, ConsiderReq, CampReq, CampUntil, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
 
 type DesCbcEnc = Encryptor<Des>;
 type DesCbcDec = Decryptor<Des>;
@@ -95,6 +95,8 @@ pub async fn run_login_flow(
     collision:        crate::assets::SharedCollision,
     maps_dir:         std::path::PathBuf,
     shutdown:         Arc<AtomicBool>,
+    camp:             CampReq,
+    camp_until:       CampUntil,
 ) -> Result<(), String> {
     for attempt in 1..=max_retries {
         if attempt > 1 {
@@ -120,8 +122,8 @@ pub async fn run_login_flow(
                     tracing::info!("NAV: {} zone points seeded", gs.zone_points.len());
                 }
                 let char_name = config.character_name.clone();
-                let navigator = Navigator::new(goto_target, entity_positions, entity_ids, zone_points, task_log, zone_cross, hail, say, target, attack, buy, sell, trade, merchant, move_req, give, inventory, loot, door_click, doors_shared, messages, cast, mem_spell, sit, consider, collision, maps_dir);
-                run_gameplay_phase(stream, net_rx, app_tx, gs, char_name, navigator, world_creds, shutdown.clone()).await;
+                let navigator = Navigator::new(goto_target, entity_positions, entity_ids, zone_points, task_log, zone_cross, hail, say, target, attack, buy, sell, trade, merchant, move_req, give, inventory, loot, door_click, doors_shared, messages, cast, mem_spell, sit, consider, collision, maps_dir, camp.clone());
+                run_gameplay_phase(stream, net_rx, app_tx, gs, char_name, navigator, world_creds, shutdown.clone(), camp.clone(), camp_until.clone()).await;
                 return Ok(());
             }
         }
