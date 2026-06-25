@@ -1,0 +1,8 @@
+# Cache compilation artifacts across builds with sccache.
+[build]
+rustc-wrapper = "sccache"
+
+# Use the mold linker for faster link times.
+# gcc (Fedora's default cc) supports -fuse-ld=mold directly, so no clang needed.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
