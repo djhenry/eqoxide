@@ -20,7 +20,6 @@ anyhow = "1"
 libeq_pfs = { git = "https://github.com/cjab/libeq", package = "libeq_pfs" }
 libeq_wld = { git = "https://github.com/cjab/libeq", package = "libeq_wld" }
 image = { version = "0.25", default-features = false, features = ["bmp", "png", "dds"] }
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 gltf = { version = "1", features = ["import", "extras"] }
 glam = "0.29"
