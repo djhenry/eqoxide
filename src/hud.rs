@@ -402,6 +402,8 @@ pub fn draw_control_bar(
     say:        &crate::http::SayReq,
     target:     &crate::http::TargetReq,
     say_buffer: &mut String,
+    camp:       &crate::http::CampReq,
+    camp_until: &crate::http::CampUntil,
 ) {
     let base = egui::Frame::none()
         .fill(egui::Color32::from_black_alpha(170))
@@ -428,6 +430,20 @@ pub fn draw_control_bar(
                     *hail.lock().unwrap() = Some(n);
                 }
             }
+
+            // Camp button. While a camp is in progress its label shows the countdown and a second
+            // click cancels it (Toggle); otherwise it starts a camp. The gameplay loop owns the
+            // actual OP_Camp / cancel + the clean shutdown once the timer elapses.
+            let remaining = camp_until.lock().unwrap()
+                .map(|d| d.saturating_duration_since(std::time::Instant::now()).as_secs());
+            let camp_label = match remaining {
+                Some(secs) => format!("Cancel camp ({}s)", secs),
+                None       => "Camp".to_string(),
+            };
+            if ui.button(camp_label).clicked() {
+                *camp.lock().unwrap() = Some(crate::http::CampCmd::Toggle);
+            }
+
             ui.separator();
             ui.label("Say:");
             let resp = ui.add(egui::TextEdit::singleline(say_buffer)

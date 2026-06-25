@@ -7,7 +7,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::{GameState, ZonePoint};
-use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, TradeCmd, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, CastReq, MemSpellReq, SitReq, ConsiderReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
+use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, TradeCmd, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, CastReq, MemSpellReq, SitReq, ConsiderReq, CampReq, CampCmd, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
 
 /// Pending state of a quest turn-in (POST /give). The trade window spans multiple nav ticks:
 /// we send OP_TradeRequest, then must wait for the server's OP_TradeRequestAck before moving the
@@ -201,6 +201,9 @@ pub struct Navigator {
     mem_spell:        MemSpellReq,
     sit:              SitReq,
     consider:         ConsiderReq,
+    /// Camp request slot, shared with the gameplay loop. The nav thread only WRITES it — when the
+    /// `/camp` chat keyword is typed it pushes a `Toggle` here instead of sending the text as Say.
+    camp:             CampReq,
     /// In-progress quest turn-in (POST /give), or None when idle. Drives the trade-window
     /// state machine across nav ticks (request → wait for ack → move item + accept).
     give_state:       Option<GiveState>,
@@ -265,6 +268,7 @@ impl Navigator {
         consider:         ConsiderReq,
         collision:        crate::assets::SharedCollision,
         maps_dir:         std::path::PathBuf,
+        camp:             CampReq,
     ) -> Self {
         Navigator {
             goto_target,
@@ -287,6 +291,7 @@ impl Navigator {
             mem_spell,
             sit,
             consider,
+            camp,
             give_state: None,
             inventory,
             loot,
@@ -538,10 +543,17 @@ impl Navigator {
         // Check say request — arbitrary Say text (HUD say box / quest keyword follow-up).
         let say_text = self.say.lock().unwrap().take();
         if let Some(text) = say_text {
-            let pkt = build_say_packet(&gs.player_name, "", &text);
-            tracing::info!("EQ: say: {}", text);
-            stream.send_app_packet(OP_CHANNEL_MESSAGE, &pkt);
-            gs.log_msg("chat", &format!("You say, '{}'", text));
+            // The `/camp` chat keyword is a local command, not Say text: toggle a camp instead of
+            // broadcasting it. The gameplay loop drains the camp slot and runs the camp/cancel.
+            if text.trim().eq_ignore_ascii_case("/camp") {
+                *self.camp.lock().unwrap() = Some(CampCmd::Toggle);
+                tracing::info!("EQ: /camp chat command — toggling camp");
+            } else {
+                let pkt = build_say_packet(&gs.player_name, "", &text);
+                tracing::info!("EQ: say: {}", text);
+                stream.send_app_packet(OP_CHANNEL_MESSAGE, &pkt);
+                gs.log_msg("chat", &format!("You say, '{}'", text));
+            }
         }
 
         // Check target request — set target + auto-consider it (con color comes back as

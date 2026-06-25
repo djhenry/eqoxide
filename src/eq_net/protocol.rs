@@ -200,6 +200,9 @@ pub const OP_REQUEST_CLIENT_ZONE_CHANGE: u16 = 0x7834;
 pub const OP_LOGOUT: u16 = 0x61ff;
 pub const OP_LOGOUT_REPLY: u16 = 0x48c2; // zone → client, ack of OP_Logout
 pub const OP_GMKICK: u16 = 0x692c;       // zone → client, we were booted (e.g. logged in elsewhere)
+pub const OP_CAMP: u16 = 0x78c1;         // client → zone, begin camp; server arms a 29s timer then
+                                         // removes the char cleanly (no linkdead). Cancelled by a
+                                         // Standing OP_SpawnAppearance. See docs / EQEmu Handle_OP_Camp.
 
 // ── Struct definitions ────────────────────────────────────────────────────
 

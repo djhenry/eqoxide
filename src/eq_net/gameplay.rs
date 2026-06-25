@@ -27,6 +27,8 @@ pub async fn run_gameplay_phase(
     mut navigator: Navigator,
     world_creds:   WorldCredentials,
     shutdown:      Arc<AtomicBool>,
+    camp:          crate::http::CampReq,
+    camp_until:    crate::http::CampUntil,
 ) {
     // Wrap in Option so Rust allows reassignment after zone transitions.
     let mut stream: Option<EqStream>                      = Some(stream_init);
@@ -45,6 +47,45 @@ pub async fn run_gameplay_phase(
             // Logout sent. Idle until the main thread exits the process (it owns the winit/Wayland
             // teardown). Do NOT return — returning would let run_login_flow retry and reconnect.
             loop { sleep(Duration::from_millis(200)).await; }
+        }
+
+        // ── Camp ─────────────────────────────────────────────────────────────
+        // Drain a camp command (from /exit, /camp, the HUD button, or the `/camp` chat keyword)
+        // and start/cancel the camp. `OP_Camp` arms EQEmu's ~29s camp timer; we keep the session
+        // alive (keepalives below still fire) until CAMP_DURATION elapses, then set `shutdown` so
+        // the disconnect is clean (the server has set `instalog`, so no linkdead). Cancelling sends
+        // a Standing `OP_SpawnAppearance`, which disables the server-side camp timer.
+        if let Some(cmd) = camp.lock().unwrap().take() {
+            let now      = std::time::Instant::now();
+            let current  = *camp_until.lock().unwrap();
+            let (next, action) = camp_apply(cmd, current, now, CAMP_DURATION);
+            *camp_until.lock().unwrap() = next;
+            use crate::eq_net::navigation::build_spawn_appearance_packet;
+            match action {
+                CampAction::Started => {
+                    s.send_app_packet(OP_CAMP, &[]);
+                    // Sit, like the real client — camping is a seated action and standing cancels it.
+                    s.send_app_packet(OP_SPAWN_APPEARANCE,
+                        &build_spawn_appearance_packet(gs.player_id as u16, 14, 110));
+                    gs.sitting = true;
+                    gs.log_msg("system", "Camping to desktop...");
+                    tracing::info!("EQ: camp started — clean shutdown in {}s", CAMP_DURATION.as_secs());
+                }
+                CampAction::Cancelled => {
+                    // Standing both cancels the server camp timer and stands the character back up.
+                    s.send_app_packet(OP_SPAWN_APPEARANCE,
+                        &build_spawn_appearance_packet(gs.player_id as u16, 14, 100));
+                    gs.sitting = false;
+                    gs.log_msg("system", "Camp cancelled.");
+                    tracing::info!("EQ: camp cancelled");
+                }
+                CampAction::NoOp => {}
+            }
+        }
+        // Camp deadline reached → request a clean shutdown (handled at the top of the next loop).
+        if camp_expired(*camp_until.lock().unwrap(), std::time::Instant::now()) {
+            tracing::info!("EQ: camp complete — disconnecting cleanly (no linkdead)");
+            shutdown.store(true, Ordering::Relaxed);
         }
 
         let mut zone_redirect: Option<(String, u16)> = None;
@@ -424,5 +465,110 @@ async fn run_zone_entry_handshake(
 
     if !done_client_ready {
         tracing::warn!("EQ: zone entry handshake timed out (new_zone={done_new_zone} weather={done_weather})");
+    }
+}
+
+// ── Camp ────────────────────────────────────────────────────────────────────────
+//
+// Camping is the only clean way off the server: `OP_Camp` arms a ~29s timer in EQEmu
+// (`Handle_OP_Camp`), after which the character is saved + removed with NO linkdead. The client
+// must stay connected (keepalives flowing) until that timer fires, then disconnect. We wait
+// `CAMP_DURATION` (just over the server's 29s) before triggering shutdown. A camp can be cancelled
+// before then by toggling it — server-side a Standing `OP_SpawnAppearance` disables the camp timer.
+
+/// How long the client stays connected after `OP_Camp` before disconnecting. Must exceed EQEmu's
+/// 29s server-side camp timer so `instalog` is set first (otherwise the disconnect is linkdead).
+pub const CAMP_DURATION: Duration = Duration::from_secs(30);
+
+/// The action a camp command resolves to, given the current camp state.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum CampAction {
+    /// A camp was not running and now begins — send `OP_Camp`.
+    Started,
+    /// A camp was running and is now cancelled — send a Standing `OP_SpawnAppearance`.
+    Cancelled,
+    /// `Start` while already camping — do nothing (idempotent, used by /exit).
+    NoOp,
+}
+
+/// Pure decision for a camp command. `current` is the live camp deadline (`None` = not camping).
+/// Returns the new deadline state and the action to take. `Toggle` starts or cancels; `Start` only
+/// ever starts (never cancels an in-progress camp), so repeated /exit calls don't abort the camp.
+pub fn camp_apply(
+    cmd: crate::http::CampCmd,
+    current: Option<std::time::Instant>,
+    now: std::time::Instant,
+    dur: Duration,
+) -> (Option<std::time::Instant>, CampAction) {
+    use crate::http::CampCmd;
+    match (cmd, current) {
+        (_, None)                  => (Some(now + dur), CampAction::Started),
+        (CampCmd::Toggle, Some(_)) => (None, CampAction::Cancelled),
+        (CampCmd::Start, Some(d))  => (Some(d), CampAction::NoOp),
+    }
+}
+
+/// Whether an in-progress camp has reached its disconnect deadline.
+pub fn camp_expired(current: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    matches!(current, Some(d) if now >= d)
+}
+
+#[cfg(test)]
+mod camp_tests {
+    use super::*;
+    use crate::http::CampCmd;
+    use std::time::{Duration as Dur, Instant};
+
+    #[test]
+    fn start_when_idle_begins_camp() {
+        let now = Instant::now();
+        let (next, action) = camp_apply(CampCmd::Start, None, now, Dur::from_secs(30));
+        assert_eq!(action, CampAction::Started);
+        assert_eq!(next, Some(now + Dur::from_secs(30)));
+    }
+
+    #[test]
+    fn toggle_when_idle_begins_camp() {
+        let now = Instant::now();
+        let (next, action) = camp_apply(CampCmd::Toggle, None, now, Dur::from_secs(30));
+        assert_eq!(action, CampAction::Started);
+        assert_eq!(next, Some(now + Dur::from_secs(30)));
+    }
+
+    #[test]
+    fn toggle_while_camping_cancels() {
+        let now = Instant::now();
+        let deadline = now + Dur::from_secs(10);
+        let (next, action) = camp_apply(CampCmd::Toggle, Some(deadline), now, Dur::from_secs(30));
+        assert_eq!(action, CampAction::Cancelled);
+        assert_eq!(next, None);
+    }
+
+    #[test]
+    fn start_while_camping_is_noop_and_keeps_deadline() {
+        // /exit calling Start twice must not cancel or extend the running camp.
+        let now = Instant::now();
+        let deadline = now + Dur::from_secs(10);
+        let (next, action) = camp_apply(CampCmd::Start, Some(deadline), now, Dur::from_secs(30));
+        assert_eq!(action, CampAction::NoOp);
+        assert_eq!(next, Some(deadline));
+    }
+
+    #[test]
+    fn not_expired_before_deadline() {
+        let now = Instant::now();
+        assert!(!camp_expired(Some(now + Dur::from_secs(5)), now));
+    }
+
+    #[test]
+    fn expired_at_or_after_deadline() {
+        let now = Instant::now();
+        assert!(camp_expired(Some(now - Dur::from_millis(1)), now));
+        assert!(camp_expired(Some(now), now));
+    }
+
+    #[test]
+    fn idle_never_expires() {
+        assert!(!camp_expired(None, Instant::now()));
     }
 }
