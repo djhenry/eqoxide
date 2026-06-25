@@ -16,10 +16,10 @@ in a separate user terminal.
 ./dev-run.sh debug
 
 # Override binary path:
-BIN=/path/to/eq_renderer ./dev-run.sh
+BIN=/path/to/eqoxide ./dev-run.sh
 ```
 
-`dev-run.sh` watches `target/release/eq_renderer` (mtime + size). When a new
+`dev-run.sh` watches `target/release/eqoxide` (mtime + size). When a new
 build is detected and has settled (same signature for two polls), it kills the old
 client and starts the new one automatically. It also relaunches on crash.
 
@@ -31,8 +31,8 @@ The login config (which account/character to log in as) defaults to
 `~/.config/eqoxide/`), or an explicit path:
 
 ```sh
-./target/debug/eq_renderer --config durgan      # ~/.config/eqoxide/config-durgan.yaml
-./target/debug/eq_renderer --config claude
+./target/debug/eqoxide --config durgan      # ~/.config/eqoxide/config-durgan.yaml
+./target/debug/eqoxide --config claude
 ```
 
 Per-character config files (`config-durgan.yaml`, `config-claude.yaml`, `config-aiquestbot.yaml`)
@@ -44,12 +44,12 @@ multi-instance support — see `http-api.md`).
 **To fully stop / log the character out** (e.g. to keep the client down, or to edit
 `character_data` position in the DB without it being clobbered), you must kill the **dev-run
 watcher** too — otherwise it auto-relaunches the renderer within seconds. Find it with
-`pgrep -af dev-run.sh | grep -v 'bash -c'` and kill that PID, then `pkill -x eq_renderer`; confirm
+`pgrep -af dev-run.sh | grep -v 'bash -c'` and kill that PID, then `pkill -x eqoxide`; confirm
 with `ps`. Relaunching the client soon after resumes the *linkdead* zone session at the old
 position — wait > ~90s (past `Zone:ClientLinkdeadMS`) before a DB position edit will stick. See
 `autonomous-play.md` §6.
 
-Logs: `/tmp/eq_client.log` (truncated on each launch).
+Logs: `/tmp/eqoxide.log` (truncated on each launch).
 
 ### Frame profiling (`--profile`)
 
@@ -57,7 +57,7 @@ Pass `--profile` (or set `EQ_PROFILE=1`) to turn on a lightweight per-phase fram
 drawn top-left under the fps counter:
 
 ```sh
-./target/debug/eq_renderer --testzone --profile
+./target/debug/eqoxide --testzone --profile
 EQ_PROFILE=1 ./dev-run.sh debug
 ```
 
@@ -78,7 +78,7 @@ The client binds the **next free** HTTP API port starting at `config.yaml` `http
 (default 8765), scanning upward (8765, 8766, 8767…). This lets several instances — e.g.
 one per git worktree, for working on multiple features at once — run side by side without
 colliding. **Do not assume port 8765.** On launch the client prints the port it bound to
-**stdout** (also captured in `/tmp/eq_client.log`):
+**stdout** (also captured in `/tmp/eqoxide.log`):
 
 ```
 API_PORT=8766
@@ -87,11 +87,11 @@ API_PORT=8766
 Capture it instead of hardcoding:
 
 ```sh
-PORT=$(grep -m1 -oP 'API_PORT=\K[0-9]+' /tmp/eq_client.log)
+PORT=$(grep -m1 -oP 'API_PORT=\K[0-9]+' /tmp/eqoxide.log)
 curl "http://127.0.0.1:$PORT/debug"
 ```
 
-**To restart your own instance, use `POST /exit`** — never `pkill eq_renderer`, which would
+**To restart your own instance, use `POST /exit`** — never `pkill eqoxide`, which would
 also kill another worktree's client. It cleanly exits only the instance on the port you call:
 
 ```sh
@@ -117,7 +117,7 @@ See `http-api.md` for both the port-discovery convention and the `/exit` endpoin
 ## Checking the Log
 
 ```sh
-tail -50 /tmp/eq_client.log
+tail -50 /tmp/eqoxide.log
 ```
 
 Logging goes through the `tracing` framework. Verbosity is set by an env filter, in precedence order
@@ -128,7 +128,7 @@ RUST_LOG=debug ./dev-run.sh
 # or, client-only without affecting other RUST_LOG-aware tools:
 EQ_LOG=debug ./dev-run.sh
 # per-subsystem, e.g. chatty network but quiet elsewhere:
-EQ_LOG=info,eq_renderer::eq_net=debug ./dev-run.sh
+EQ_LOG=info,eqoxide::eq_net=debug ./dev-run.sh
 ```
 
 Key log lines to watch:

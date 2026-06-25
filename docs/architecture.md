@@ -1,4 +1,4 @@
-# eq_client_lite — Architecture Overview
+# eqoxide — Architecture Overview
 
 A standalone Rust EverQuest Titanium observer/renderer. Connects directly to a local EQEmu
 server (login 127.0.0.1:5998), renders the zone in 3D via wgpu, and exposes a local HTTP API on

@@ -596,7 +596,7 @@ GOAL: weapons render in hand + combat swing animations. Driven by a cron loop wh
    /frame (sword visible in hand; swings with the C-clip).
 
 ### Loop control
-- Each fire: make concrete progress, build+test, commit. Verify with /frame + /tmp/eq_client.log.
+- Each fire: make concrete progress, build+test, commit. Verify with /frame + /tmp/eqoxide.log.
 - When BOTH phases verified done: CronList -> CronDelete this job -> post final summary -> stop.
 - Stop + CronDelete if credits < ~5% (autonomous-run-credit-guard).
 

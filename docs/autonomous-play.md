@@ -118,7 +118,7 @@ fix for any client-initiated melee.
 
 ### Verifying combat
 Client logs outgoing hits as `EQ: combat: Claude hits <mob> for N damage` and kills as
-`<mob> has been slain` in `/tmp/eq_client.log`. The client does NOT expose HP via `/debug`; use the
+`<mob> has been slain` in `/tmp/eqoxide.log`. The client does NOT expose HP via `/debug`; use the
 combat log + `/entities` (mob despawns on death) + a level/exp DB read. EQEmu combat logging is OFF
 by default, so the zone log won't show swings.
 

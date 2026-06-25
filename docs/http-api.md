@@ -155,7 +155,7 @@ Enable / disable **auto-attack** (`OP_AUTO_ATTACK` 1/0). While enabled, the nav 
 and auto-retargets: it walks into melee range of the current target and **faces it each tick** (the
 server only registers swings when facing — see `protocol-notes.md`), then on kill it retargets the
 nearest reachable trash mob (`a_`/`an_` names) within 200u, idling for respawns if none are reachable.
-This is the hands-free grinding loop. Verify kills via `/tmp/eq_client.log` (`has been slain`).
+This is the hands-free grinding loop. Verify kills via `/tmp/eqoxide.log` (`has been slain`).
 
 ## Actions & Spells
 
@@ -243,7 +243,7 @@ across a few ticks: `OP_MoveItem` (item→cursor) → `OP_TradeRequest` → *wai
 → `OP_MoveItem` (cursor→trade slot 3000) → `OP_TradeAcceptClick`; the server replies `OP_FinishTrade`
 (with a ~3s ack timeout that aborts via `OP_CancelTrade`). On success the NPC's quest script consumes
 the item (and may hand back a reward on the cursor); a rejected hand-in returns the item to the
-cursor. Watch `/tmp/eq_client.log` for `give: turn-in complete (OP_FinishTrade)`. Verified live:
+cursor. Watch `/tmp/eqoxide.log` for `give: turn-in complete (OP_FinishTrade)`. Verified live:
 Durgan (Dwarf Rogue) handed the "Small, Folded Note" to guildmaster Mater and received the "Ruined
 Miner's Tunic" in return. See `autonomous-play.md`.
 
@@ -273,7 +273,7 @@ Open a corpse and take all of its items, reusing the auto-loot pipeline (`OP_Loo
 ```
 
 Returns `200` with the queued corpse, `404` if no corpse matches. The nav thread pushes the corpse
-onto the loot queue; watch `/tmp/eq_client.log` for `loot: queued corpse_id=… (via POST /loot)` then
+onto the loot queue; watch `/tmp/eqoxide.log` for `loot: queued corpse_id=… (via POST /loot)` then
 `auto-loot: sent OP_LootRequest`. You can only loot corpses you have rights to (your own kills);
 others return a server denial. (The client also auto-loots your own kills without this call — `/loot`
 is for looting a specific corpse on demand.)
@@ -332,7 +332,7 @@ Returns camera + live player state:
 Cleanly shuts down **this** client instance (`std::process::exit(0)`). Returns `200 "shutting down"`,
 then exits ~150ms later so the response flushes. Use this to restart your own client to pick up a
 rebuild — it targets only the instance on the port you call, so it won't kill another worktree's
-client the way `pkill eq_renderer` would.
+client the way `pkill eqoxide` would.
 ```
 curl -X POST http://127.0.0.1:8766/exit
 ```
