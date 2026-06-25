@@ -3,10 +3,10 @@
 # dev-run.sh — run the eqoxide renderer and auto-restart it whenever the
 # compiled binary changes (i.e. whenever a new `cargo build` lands).
 #
-# Run this in YOUR OWN terminal (not inside the Claude/agent harness — the harness
-# reaps GUI child processes). It keeps the client alive across rebuilds so the agent
-# can rebuild, let this script relaunch, then drive the client via the HTTP API
-# (http://localhost:8765) and GET /frame to evaluate visual changes.
+# Run this in your own terminal (or let the agent launch it via Bash) to keep the
+# client alive across rebuilds. After each `cargo build --release`, this script
+# detects the new binary and relaunches automatically. The agent can also launch
+# eqoxide directly without this script when auto-restart is not needed.
 #
 # Usage:
 #   ./dev-run.sh              # release build (default): target/release/eqoxide
