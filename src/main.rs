@@ -102,11 +102,15 @@ OPTIONS:
             &app_cfg.asset_server_url, &login_cfg.username, &login_cfg.password)
         {
             Ok(sync) => {
-                if let Err(e) = eq_renderer::asset_sync::sync_set(&sync, "gamedata", &cache, &mut |_| {}) {
-                    tracing::warn!("gamedata sync failed: {e} — string table / spells / maps may be unavailable");
+                // gamedata = string table / spells / maps; gameequip = worn-armor texture + held-
+                // weapon S3D archives. Both land in the cache so nothing is read from ~/eq_assets.
+                for set in ["gamedata", "gameequip"] {
+                    if let Err(e) = eq_renderer::asset_sync::sync_set(&sync, set, &cache, &mut |_| {}) {
+                        tracing::warn!("{set} sync failed: {e} — related assets may be unavailable");
+                    }
                 }
             }
-            Err(e) => tracing::warn!("asset server login failed: {e} — gamedata not synced"),
+            Err(e) => tracing::warn!("asset server login failed: {e} — game data/equip not synced"),
         }
     }
 

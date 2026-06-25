@@ -376,13 +376,16 @@ impl EqRenderer {
     }
 
     /// Load all archetype character models and upload to GPU.
-    /// Tries glTF files from `models_dir` first; falls back to EQ `_chr.s3d`
-    /// archives from `assets_path` if the glTF file is missing.
+    /// Tries glTF files from `models_dir` (the asset-server cache) first; falls back to EQ `_chr.s3d`
+    /// archives ALSO from the cache (the "gameequip" set), never from ~/eq_assets.
     /// Models with valid skins (joint_count ≤ 128) are loaded as Skinned; others as Static.
     /// Missing models fall back to billboard rendering.
-    pub fn load_character_models(&mut self, models_dir: &std::path::Path, assets_path: &std::path::Path) {
+    /// `_assets_path` is unused (everything now comes from the cache); kept for call-site stability.
+    pub fn load_character_models(&mut self, models_dir: &std::path::Path, _assets_path: &std::path::Path) {
         use crate::models::ModelAsset;
-        self.assets_path = assets_path.to_path_buf(); // remembered for on-demand weapon-model loading
+        // Worn-armor textures + held-weapon S3Ds come from the asset-server cache ("gameequip" set),
+        // not ~/eq_assets. Weapon loading (ensure_weapon) reads from here too.
+        self.assets_path = models_dir.to_path_buf();
 
         const ARCHETYPES: &[&str] = &[
             "humanoid", "elf", "dwarf", "gnoll", "skeleton", "zombie",
@@ -411,7 +414,7 @@ impl EqRenderer {
                     // Fall back to EQ _chr.s3d archive.
                     let chr_name = crate::models::archetype_to_chr_s3d(key);
                     let chr_asset = chr_name.and_then(|name| {
-                        let path = assets_path.join(name);
+                        let path = models_dir.join(name);
                         if path.exists() {
                             match ModelAsset::load_from_chr_s3d(&path) {
                                 Ok(a) => Some(a),
@@ -473,19 +476,19 @@ impl EqRenderer {
         // archetype's chr/chr2 archives (lower material numbers). No decoding here.
         for n in 17..=23 {
             crate::assets::index_s3d_textures(
-                &assets_path.join(format!("global{}_amr.s3d", n)), &mut self.equip_index);
+                &models_dir.join(format!("global{}_amr.s3d", n)), &mut self.equip_index);
         }
         // global_chr.s3d is the combined all-races base archive — it carries the low-material
         // (00-04) body textures that the per-race *_chr archives can be missing (e.g. human is
         // missing chest material 03). Index it for TEXTURES only (we never load it as a model).
         crate::assets::index_s3d_textures(
-            &assets_path.join("global_chr.s3d"), &mut self.equip_index);
+            &models_dir.join("global_chr.s3d"), &mut self.equip_index);
         for &key in ARCHETYPES {
             if let Some(name) = crate::models::archetype_to_chr_s3d(key) {
-                crate::assets::index_s3d_textures(&assets_path.join(name), &mut self.equip_index);
+                crate::assets::index_s3d_textures(&models_dir.join(name), &mut self.equip_index);
                 // also the _chr2 companion if present
                 let chr2 = name.replace("_chr.s3d", "_chr2.s3d");
-                let chr2_path = assets_path.join(&chr2);
+                let chr2_path = models_dir.join(&chr2);
                 if chr2_path.exists() {
                     crate::assets::index_s3d_textures(&chr2_path, &mut self.equip_index);
                 }
