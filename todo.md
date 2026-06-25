@@ -3,6 +3,24 @@
 Active work + bite-sized tasks for smaller agents to continue if the main session stops.
 Keep this updated as tasks complete.
 
+## TODO: exhaustive fall-damage testing (controlled-fall nav)
+
+Controlled-fall navigation + native fall rate (app.rs gravity/terminal 120/128) + client-side fall
+damage (OP_EnvDamage 0x31b3, `fall_damage(height)` in navigation.rs) + a lethal-fall guard landed
+on `main` (was branch worktree-necro-combat). Verified offline (qcat dry sewer routes 56–88 wp) +
+unit tests, but NOT exhaustively live. Still to do:
+- Live-test an actual controlled-fall descent end-to-end with a character that can SURVIVE the drop
+  (Keebler L1/20hp's guard correctly refuses the ~42u qcat drop, max ~364 dmg — need a mid-level
+  char or a shorter drop). Confirm: server accepts the descending position updates (no rubber-band),
+  the bot lands in the qcat lower sewer, OP_EnvDamage is accepted and HP drops by the sent amount.
+- Validate the fall-damage curve vs the real client across drop heights (10/20/30/42/60u); tune
+  GRAVITY/HZ in `fall_damage` if magnitudes diverge from native.
+- Check water/levitate negation: a fall ending in water (or with Levitate) should take 0 — confirm
+  we don't send OP_EnvDamage in those cases (currently we always send on a dry controlled-fall).
+- Decide whether WASD (human) ledge-falls should also send OP_EnvDamage (currently only the nav
+  controlled-fall path does).
+See docs/eq-technical-knowledgebase/falling-physics.md.
+
 ## COMPLETE: Clickable & animated doors + agent API (branch worktree-zone-portal-objects)
 
 Parse OP_SpawnDoor on zone-in; render with real models (from `_obj.s3d`) + fallback box.
