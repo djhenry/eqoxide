@@ -1,8 +1,19 @@
-//! Player navigation: walk toward a target position in 15-unit steps at 150 ms
-//! intervals, sending EQ movement packets and notifying the render loop.
+//! Player navigation: walk toward a target position in capped steps at 150 ms intervals,
+//! sending EQ movement packets and notifying the render loop.
 
 use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
+
+/// Nav tick interval (ms). Steps are gated to fire no more often than this.
+const NAV_TICK_MS: u128 = 150;
+/// Native Titanium base run speed in EQ units/second (runspeed 0.7 → 44 u/s; 10 Hz updates of
+/// 4.4 u each). Per eq-client-expert, see docs/eq-technical-knowledgebase/player-movement-speed.md.
+/// We must NOT move faster than this: even where THIS server tolerates it, others rubber-band or
+/// reject motion the real client can't produce.
+const RUN_SPEED: f32 = 44.0;
+/// Max distance to move per nav tick. `RUN_SPEED * tick_seconds`; the >=150 ms gate guarantees the
+/// realized speed never exceeds RUN_SPEED.
+const NAV_STEP: f32 = RUN_SPEED * (NAV_TICK_MS as f32 / 1000.0); // 44 * 0.150 = 6.6 units
 
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
@@ -698,7 +709,7 @@ impl Navigator {
             gs.log_msg("inventory", &format!("Moved item (slot {} -> {})", from_slot, to_slot));
         }
 
-        if self.last_tick.elapsed().as_millis() < 150 {
+        if self.last_tick.elapsed().as_millis() < NAV_TICK_MS {
             return;
         }
         self.last_tick = Instant::now();
@@ -805,8 +816,9 @@ impl Navigator {
                         let engage = if gs.pet_id.is_some() { PET_STANDOFF } else { MELEE };
                         let hdg = if dist > 0.01 { eq_heading(dx, dy) } else { gs.player_heading };
                         if dist > engage {
-                            // Step toward the target (collision-aware), facing it.
-                            let step = 8.0_f32.min(dist - engage);
+                            // Step toward the target (collision-aware), facing it. Capped to the
+                            // native run speed like the main walk step.
+                            let step = NAV_STEP.min(dist - engage);
                             let fdx = dx / dist * step;
                             let fdy = dy / dist * step;
                             let nz = gs.player_z;
@@ -936,8 +948,8 @@ impl Navigator {
             return;
         }
 
-        // Cap step so we never overshoot past STOP_DIST from the target.
-        let step    = 10.0_f32.min(dist - STOP_DIST);
+        // Cap step to the native run speed (and never overshoot past STOP_DIST from the target).
+        let step    = NAV_STEP.min(dist - STOP_DIST);
         let full_dx = dx / dist * step; // east component toward goal
         let full_dy = dy / dist * step; // north component toward goal
         // Use the z from goto_target rather than the stale spawn z stored in gs.player_z.

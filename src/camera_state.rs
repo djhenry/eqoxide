@@ -102,16 +102,15 @@ impl CameraState {
     pub fn tick(&mut self, dt: f32, player_pos: [f32; 3], heading_deg: f32) -> ([f32; 3], [f32; 3]) {
         let des_az = desired_azimuth(heading_deg);
 
-        match self.mode {
-            CameraMode::ManualOrbit => {}
-            CameraMode::AutoFollow => {
-                // Follow the player's position and swing behind their heading, but DON'T touch
-                // elevation/radius — the user's chosen tilt and zoom persist across movement.
-                // Only reset_to_follow (F9/R/HTTP reset) restores the default tilt and zoom.
-                let alpha     = 1.0 - (-FOLLOW_RATE * dt).exp();
-                self.focus    = lerp3(self.focus, player_pos, alpha);
-                self.azimuth  = des_az;
-            }
+        // The focus ALWAYS tracks the player's position, in either mode — the camera stays
+        // centered on the character while it walks (a ManualOrbit camera must not be left behind
+        // during /goto nav). Orbit mode only governs the view *angles*, not the look-at point.
+        let alpha  = 1.0 - (-FOLLOW_RATE * dt).exp();
+        self.focus = lerp3(self.focus, player_pos, alpha);
+        // AutoFollow additionally swings the camera behind the heading. ManualOrbit preserves the
+        // user's chosen azimuth/elevation/radius (only F9/R/HTTP reset restores the defaults).
+        if self.mode == CameraMode::AutoFollow {
+            self.azimuth = des_az;
         }
 
         let eye = compute_eye(self.azimuth, self.elevation, self.radius, self.focus);
