@@ -15,6 +15,14 @@ fn anim_now_ms() -> u64 {
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
+/// Entity draw distance (EQ units, measured from the player). Beyond this an NPC's 3D
+/// model is not drawn — it's a distant speck. Combined with a frustum test, this caps
+/// the per-frame entity work in densely-populated zones (e.g. gfaydark, ~400 spawns).
+const ENTITY_DRAW_DIST: f32 = 500.0;
+/// NDC slack for the frustum test so a tall model whose feet sit just off-screen still
+/// draws (the culled position is the feet; the body extends upward).
+const ENTITY_CULL_MARGIN: f32 = 0.5;
+
 /// Vestigial: this used to HIDE an armor mesh whose exact material+variant texture was
 /// missing (e.g. the variant-03 main chest torso for an armor material that only ships
 /// variants 01/02). But the chest variant pieces are DISJOINT (zero shared verts), so
@@ -702,6 +710,8 @@ pub fn encode_entity_pass(
 
     for b in &scene.billboards {
         if b.level == 0 { continue; }
+        if !crate::camera::entity_in_view(b.pos, scene.player_pos, r.last_view_proj,
+                                          ENTITY_DRAW_DIST, ENTITY_CULL_MARGIN) { continue; }
         let archetype = race_to_archetype(&b.race);
         let Some(GpuModel::Static(model)) = r.model_for(archetype, b.gender) else { continue };
         let arch_scale   = archetype_scale(archetype);
@@ -802,6 +812,8 @@ pub fn encode_skinned_entity_pass(
     });
 
     for b in order {
+        if !crate::camera::entity_in_view(b.pos, scene.player_pos, r.last_view_proj,
+                                          ENTITY_DRAW_DIST, ENTITY_CULL_MARGIN) { continue; }
         let archetype = race_to_archetype(&b.race);
         let (model_key, model_slot) = crate::models::character_model_key(&b.race, b.gender);
         let Some(GpuModel::Skinned(model)) = r.model_by_key(model_key, model_slot) else { continue };

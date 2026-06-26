@@ -123,6 +123,47 @@ pub fn project_to_screen(
     ])
 }
 
+/// Visibility test for entity culling. Returns true if an entity standing at `pos`
+/// (its feet) should be rendered, given the player position and the view-projection
+/// matrix. Culls in two cheap ways:
+///   * Distance: farther than `max_dist` from `player_pos` (3D) → not drawn.
+///   * Frustum:  behind the camera, beyond the far plane, or outside the NDC box
+///     (with `margin` slack on x/y so a tall model whose feet sit just off-screen
+///     is still drawn; the position is the feet, the body extends upward/sideways).
+///
+/// `margin` is in NDC units (1.0 = a full half-screen of slack).
+pub fn entity_in_view(
+    pos:        [f32; 3],
+    player_pos: [f32; 3],
+    view_proj:  [[f32; 4]; 4],
+    max_dist:   f32,
+    margin:     f32,
+) -> bool {
+    let dx = pos[0] - player_pos[0];
+    let dy = pos[1] - player_pos[1];
+    let dz = pos[2] - player_pos[2];
+    if dx * dx + dy * dy + dz * dz > max_dist * max_dist {
+        return false;
+    }
+
+    let clip = glam::Mat4::from_cols_array_2d(&view_proj)
+        * glam::Vec4::new(pos[0], pos[1], pos[2], 1.0);
+    if clip.w <= 0.0 {
+        return false; // behind the camera
+    }
+    let inv_w = 1.0 / clip.w;
+    let ndc_x = clip.x * inv_w;
+    let ndc_y = clip.y * inv_w;
+    let ndc_z = clip.z * inv_w;
+    // Far-plane cull (ndc_z > 1). Don't cull on the near side: a tall model whose
+    // feet are behind the near plane can still be visible, and the w<=0 test above
+    // already removes anything truly behind the camera.
+    if ndc_z > 1.0 {
+        return false;
+    }
+    ndc_x.abs() <= 1.0 + margin && ndc_y.abs() <= 1.0 + margin
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,6 +259,38 @@ mod tests {
             60.0, 1.0, 0.1, 100.0,
         );
         assert!(project_to_screen([0.0, 0.0, 20.0], vp, 800, 600).is_none());
+    }
+
+    fn cull_vp() -> [[f32; 4]; 4] {
+        // Camera at +Z looking at origin (mirrors the project_to_screen tests).
+        look_at_perspective([0.0, 0.0, 5.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0],
+                            60.0, 1.0, 0.1, 1000.0)
+    }
+
+    #[test]
+    fn entity_in_view_centered_is_visible() {
+        assert!(entity_in_view([0.0, 0.0, 0.0], [0.0, 0.0, 0.0], cull_vp(), 500.0, 0.5));
+    }
+
+    #[test]
+    fn entity_in_view_beyond_draw_distance_is_culled() {
+        // In the frustum direction but past max_dist → culled by distance.
+        let far = [0.0, 0.0, -600.0];
+        assert!(!entity_in_view(far, [0.0, 0.0, 0.0], cull_vp(), 500.0, 0.5));
+    }
+
+    #[test]
+    fn entity_in_view_behind_camera_is_culled() {
+        // Near enough in distance, but behind the camera (camera looks toward -Z).
+        let behind = [0.0, 0.0, 20.0];
+        assert!(!entity_in_view(behind, [0.0, 0.0, 18.0], cull_vp(), 500.0, 0.5));
+    }
+
+    #[test]
+    fn entity_in_view_far_to_the_side_is_culled() {
+        // Close in distance but way off to the side (outside frustum x).
+        let side = [50.0, 0.0, 0.0];
+        assert!(!entity_in_view(side, [0.0, 0.0, 0.0], cull_vp(), 500.0, 0.5));
     }
 
     #[test]
