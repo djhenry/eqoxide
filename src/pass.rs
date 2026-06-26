@@ -6,6 +6,15 @@
 use crate::renderer::EqRenderer;
 use crate::scene::SceneState;
 
+/// Milliseconds since the first call — the clock that drives animated zone textures
+/// (fire/water/lava). Process-global so every frame shares one monotonic timeline.
+fn anim_now_ms() -> u64 {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
 /// Vestigial: this used to HIDE an armor mesh whose exact material+variant texture was
 /// missing (e.g. the variant-03 main chest torso for an armor material that only ships
 /// variants 01/02). But the chest variant pieces are DISJOINT (zero shared verts), so
@@ -150,45 +159,82 @@ pub fn encode_zone_pass(
         occlusion_query_set: None,
     });
 
-    pass.set_pipeline(&r.pipelines.zone);
-    pass.set_bind_group(0, &r.camera_uniform.bind_group, &[]);
-    pass.set_bind_group(1, &r.fallback_texture_bg, &[]);
-    let mut current_tex: Option<usize> = None;
-    for mesh in &r.gpu_meshes {
-        if mesh.texture_idx != current_tex {
-            current_tex = mesh.texture_idx;
-            let bg = match current_tex {
-                Some(idx) => &r.texture_bind_groups[idx],
-                None      => &r.fallback_texture_bg,
-            };
-            pass.set_bind_group(1, bg, &[]);
+    use crate::assets::RenderMode;
+    let tex_bg = |idx: Option<usize>| -> &wgpu::BindGroup {
+        match idx {
+            Some(i) if i < r.texture_bind_groups.len() => &r.texture_bind_groups[i],
+            _ => &r.fallback_texture_bg,
         }
-        pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-        pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-    }
+    };
+    // Wall-clock ms since process start, for cycling animated textures (fire/water/lava).
+    let now_ms = anim_now_ms();
+    // The texture a mesh should bind this frame: its current animation frame if animated,
+    // else its static texture. The per-loop texture cache naturally rebinds when it advances.
+    let frame_tex = |tex: Option<usize>, anim: &Option<(u32, Vec<usize>)>| -> Option<usize> {
+        match anim {
+            Some((ms, frames)) if !frames.is_empty() => {
+                Some(frames[(now_ms / (*ms).max(1) as u64) as usize % frames.len()])
+            }
+            _ => tex,
+        }
+    };
+
+    // Draw the static terrain meshes whose render_mode is in `modes`, with `pipeline`.
+    // Opaque + masked share the opaque pipeline (masked discards in-shader, depth-write
+    // on); blend/additive run after with their own depth-write-off pipelines.
+    let mut draw_static = |pass: &mut wgpu::RenderPass<'_>, pipeline, modes: &[RenderMode]| {
+        let mut bound = false;
+        let mut current_tex: Option<usize> = None;
+        for mesh in &r.gpu_meshes {
+            if !modes.contains(&mesh.render_mode) { continue; }
+            let etex = frame_tex(mesh.texture_idx, &mesh.anim);
+            if !bound {
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &r.camera_uniform.bind_group, &[]);
+                pass.set_bind_group(1, tex_bg(etex), &[]);
+                current_tex = etex;
+                bound = true;
+            } else if etex != current_tex {
+                current_tex = etex;
+                pass.set_bind_group(1, tex_bg(current_tex), &[]);
+            }
+            pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+            pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+        }
+    };
+    draw_static(&mut pass, &r.pipelines.zone, &[RenderMode::Opaque, RenderMode::Masked]);
 
     // ── GPU-instanced placed objects ───────────────────────────────────────
-    pass.set_pipeline(&r.pipelines.zone_instanced);
-    pass.set_bind_group(0, &r.camera_uniform.bind_group, &[]);
-    pass.set_bind_group(1, &r.fallback_texture_bg, &[]);
-    let mut inst_tex: Option<usize> = None;
-    let mut inst_first = true;
-    for mesh in &r.gpu_instanced {
-        if inst_first || mesh.texture_idx != inst_tex {
-            inst_tex = mesh.texture_idx;
-            inst_first = false;
-            let bg = match inst_tex {
-                Some(idx) if idx < r.texture_bind_groups.len() => &r.texture_bind_groups[idx],
-                _ => &r.fallback_texture_bg,
-            };
-            pass.set_bind_group(1, bg, &[]);
+    let mut draw_instanced = |pass: &mut wgpu::RenderPass<'_>, pipeline, modes: &[RenderMode]| {
+        let mut bound = false;
+        let mut current_tex: Option<usize> = None;
+        for mesh in &r.gpu_instanced {
+            if !modes.contains(&mesh.render_mode) { continue; }
+            let etex = frame_tex(mesh.texture_idx, &mesh.anim);
+            if !bound {
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &r.camera_uniform.bind_group, &[]);
+                pass.set_bind_group(1, tex_bg(etex), &[]);
+                current_tex = etex;
+                bound = true;
+            } else if etex != current_tex {
+                current_tex = etex;
+                pass.set_bind_group(1, tex_bg(current_tex), &[]);
+            }
+            pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+            pass.set_vertex_buffer(1, mesh.instance_buf.slice(..));
+            pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, 0..mesh.instance_count);
         }
-        pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-        pass.set_vertex_buffer(1, mesh.instance_buf.slice(..));
-        pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..mesh.index_count, 0, 0..mesh.instance_count);
-    }
+    };
+    draw_instanced(&mut pass, &r.pipelines.zone_instanced, &[RenderMode::Opaque, RenderMode::Masked]);
+
+    // ── Transparent passes (after all opaque/masked, depth-write off) ───────
+    draw_static(&mut pass, &r.pipelines.zone_blend, &[RenderMode::Blend]);
+    draw_instanced(&mut pass, &r.pipelines.zone_instanced_blend, &[RenderMode::Blend]);
+    draw_static(&mut pass, &r.pipelines.zone_additive, &[RenderMode::Additive]);
+    draw_instanced(&mut pass, &r.pipelines.zone_instanced_additive, &[RenderMode::Additive]);
 }
 
 /// Draw the zone's doors (closed state). Each door uses its object model if loaded, else a

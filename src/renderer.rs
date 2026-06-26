@@ -42,6 +42,16 @@ pub const JOINT_BUF_BYTES: u64 = 128 * 64;
 /// Build a unit cube GpuMesh (~2 units per side, centered at origin), used as the door
 /// fallback marker. Positions are already in render space; the door pass translates it to
 /// the door position via the per-draw model matrix.
+/// Resolve a mesh's animated-texture spec `(ms, frame names)` into `(ms, frame texture
+/// indices)` against the loaded texture list. Returns `None` if fewer than 2 frames resolve.
+fn resolve_anim(anim: &Option<(u32, Vec<String>)>, texture_names: &[String]) -> Option<(u32, Vec<usize>)> {
+    let (ms, names) = anim.as_ref()?;
+    let idxs: Vec<usize> = names.iter()
+        .filter_map(|n| texture_names.iter().position(|t| t == n))
+        .collect();
+    (idxs.len() >= 2).then(|| (*ms, idxs))
+}
+
 fn build_unit_cube(device: &wgpu::Device) -> GpuMesh {
     use wgpu::util::DeviceExt;
     const S: f32 = 1.0; // half-extent → ~2 unit cube
@@ -72,6 +82,7 @@ fn build_unit_cube(device: &wgpu::Device) -> GpuMesh {
     GpuMesh {
         vertex_buf, index_buf, index_count: indices.len() as u32,
         texture_idx: None, base_color: [0.8, 0.2, 0.2, 1.0], // reddish so it's obviously a marker
+        render_mode: crate::assets::RenderMode::Opaque, anim: None,
     }
 }
 
@@ -257,9 +268,12 @@ impl EqRenderer {
         // draw calls from 8500 → ~100, which is the primary source of the frame-time budget.
         {
             use std::collections::HashMap;
-            // (texture_idx, base_color_as_u32) → (accumulated vertices, accumulated indices)
-            // Key uses texture_idx only; base_color is averaged across merges (usually all [1,1,1,1]).
-            let mut groups: HashMap<Option<usize>, (Vec<Vertex>, Vec<u32>)> = HashMap::new();
+            // (texture_idx, render_mode) → (accumulated vertices, accumulated indices).
+            // render_mode is part of the key so each draw call has a single blend mode
+            // (opaque/masked/blend/additive) and routes to the matching pipeline.
+            let mut groups: HashMap<(Option<usize>, crate::assets::RenderMode), (Vec<Vertex>, Vec<u32>)> = HashMap::new();
+            // Resolved animated-texture frames per group (same texture ⇒ same anim).
+            let mut anim_by_group: HashMap<(Option<usize>, crate::assets::RenderMode), Option<(u32, Vec<usize>)>> = HashMap::new();
 
             // Terrain only — placed objects now go to the GPU-instanced path below
             // (collision still uses terrain + expand_objects, unchanged).
@@ -270,8 +284,12 @@ impl EqRenderer {
                 let texture_idx = mesh.texture_name.as_ref()
                     .and_then(|n| self.texture_names.iter().position(|t| t == n));
 
+                let gkey = (texture_idx, mesh.render_mode);
+                anim_by_group.entry(gkey.clone())
+                    .or_insert_with(|| resolve_anim(&mesh.anim, &self.texture_names));
+
                 let [cx, cy, cz] = mesh.center;
-                let entry = groups.entry(texture_idx).or_default();
+                let entry = groups.entry(gkey).or_default();
                 let base = entry.0.len() as u32;
 
                 for (i, &p) in mesh.positions.iter().enumerate() {
@@ -290,7 +308,8 @@ impl EqRenderer {
                 }
             }
 
-            self.gpu_meshes = groups.into_iter().map(|(texture_idx, (verts, idxs))| {
+            self.gpu_meshes = groups.into_iter().map(|((texture_idx, render_mode), (verts, idxs))| {
+                let anim = anim_by_group.get(&(texture_idx, render_mode)).cloned().flatten();
                 let vertex_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: None,
                     contents: bytemuck::cast_slice(&verts),
@@ -307,6 +326,8 @@ impl EqRenderer {
                     index_count: idxs.len() as u32,
                     texture_idx,
                     base_color: [1.0, 1.0, 1.0, 1.0],
+                    render_mode,
+                    anim,
                 }
             }).collect();
 
@@ -363,6 +384,8 @@ impl EqRenderer {
                         instance_buf,
                         instance_count,
                         texture_idx,
+                        render_mode: mesh.render_mode,
+                        anim: resolve_anim(&mesh.anim, &self.texture_names),
                     });
                 }
             }
@@ -581,7 +604,8 @@ impl EqRenderer {
                     .and_then(|n| tex_names.iter().position(|t| t == n));
                 Some((GpuMesh { vertex_buf: vbuf, index_buf: ibuf,
                                index_count: mesh.indices.len() as u32, texture_idx,
-                               base_color: mesh.base_color }, slot))
+                               base_color: mesh.base_color,
+                               render_mode: crate::assets::RenderMode::Opaque, anim: None }, slot))
             }).unzip();
             tracing::info!("renderer: loaded static model '{}'", label);
             GpuModel::Static(GpuStaticModel { meshes, texture_bind_groups: tex_bgs, y_bottom: asset.y_bottom, y_extent: asset.y_extent, x_center: asset.x_center, z_center: asset.z_center, prefix: asset.prefix.clone(), equip_slots: static_slots, true_height: asset.true_height, clip_bounds: vec![], feet_offset: 0.0 })
@@ -663,7 +687,8 @@ impl EqRenderer {
                 usage: wgpu::BufferUsages::INDEX });
             meshes.push(crate::gpu::GpuMesh {
                 vertex_buf, index_buf, index_count: m.indices.len() as u32,
-                texture_idx, base_color: [1.0; 4] });
+                texture_idx, base_color: [1.0; 4],
+                render_mode: crate::assets::RenderMode::Opaque, anim: None });
         }
         tracing::info!("weapon: cached '{}' — {} gpu meshes, {} textures", key, meshes.len(), bgs.len());
         self.weapon_cache.insert(key, Some(crate::gpu::GpuWeapon { meshes, texture_bind_groups: bgs }));
@@ -766,7 +791,8 @@ impl EqRenderer {
                 gpu_meshes.push(GpuMesh {
                     vertex_buf, index_buf, index_count: m.indices.len() as u32,
                     // No carried textures: draw untextured (texture_idx None -> fallback texture bg).
-                    texture_idx: None, base_color: m.base_color });
+                    texture_idx: None, base_color: m.base_color,
+                    render_mode: crate::assets::RenderMode::Opaque, anim: None });
             }
             if gpu_meshes.is_empty() { continue; }
             // texture_bind_groups intentionally empty — doors render with the fallback texture.

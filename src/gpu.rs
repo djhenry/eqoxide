@@ -23,6 +23,11 @@ pub struct GpuMesh {
     pub index_count: u32,
     pub texture_idx: Option<usize>,
     pub base_color:  [f32; 4],
+    /// Transparency/blend mode — selects which zone pipeline draws this mesh.
+    pub render_mode: crate::assets::RenderMode,
+    /// Animated texture: `(interval_ms, frame texture-bind-group indices)`. The pass
+    /// binds `frames[(now_ms/interval) % frames.len()]` instead of `texture_idx`.
+    pub anim: Option<(u32, Vec<usize>)>,
 }
 
 /// A zone object model uploaded once and drawn instanced: one vertex/index buffer for the model
@@ -35,6 +40,10 @@ pub struct GpuInstancedMesh {
     pub instance_buf:   wgpu::Buffer,   // contents: Vec<[[f32;4];4]> column-major
     pub instance_count: u32,
     pub texture_idx:    Option<usize>,
+    /// Transparency/blend mode — selects which instanced zone pipeline draws this.
+    pub render_mode:    crate::assets::RenderMode,
+    /// Animated texture: `(interval_ms, frame texture-bind-group indices)`.
+    pub anim:           Option<(u32, Vec<usize>)>,
 }
 
 /// A held item (weapon) model loaded from gequip*.s3d, cached by IDFile and drawn at a hand bone
