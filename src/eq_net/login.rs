@@ -13,7 +13,7 @@ use cbc::{Decryptor, Encryptor};
 use des::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::NoPadding};
 use des::Des;
 
-use crate::config::LoginConfig;
+use crate::config::{CharacterCreate, LoginConfig};
 use crate::eq_net::gameplay::{run_gameplay_phase};
 use crate::eq_net::navigation::Navigator;
 use crate::eq_net::packet_handler::apply_packet;
@@ -233,6 +233,10 @@ struct LoginProtocol<'a> {
     done_server_list:      bool,
     done_play_everquest:   bool,
     done_char_info:        bool,
+    // Character-creation handshake (only used when `config.create` is set and the
+    // configured character is missing from the OP_SendCharInfo char-select list).
+    awaiting_name_approval: bool,
+    create_attempted:       bool,
     done_zone_server_info: bool,
     done_zone_entry:       bool,
     done_client_ready:     bool,
@@ -251,6 +255,8 @@ impl<'a> LoginProtocol<'a> {
             done_server_list:      false,
             done_play_everquest:   false,
             done_char_info:        false,
+            awaiting_name_approval: false,
+            create_attempted:       false,
             done_zone_server_info: false,
             done_zone_entry:       false,
             done_client_ready:     false,
@@ -313,8 +319,45 @@ impl<'a> LoginProtocol<'a> {
                 PhaseResult::ReconnectWorld { host, port: self.config.world_port }
             }
             OP_SEND_CHAR_INFO if !self.done_char_info => {
-                self.done_char_info = true;
-                self.send_enter_world(stream);
+                let name = &self.config.character_name;
+                if char_in_list(&packet.payload, name) {
+                    // Character exists on the account — enter world as normal.
+                    self.done_char_info = true;
+                    self.send_enter_world(stream);
+                    PhaseResult::Continue
+                } else if let Some(cc) = &self.config.create {
+                    // Not on the account: run the create handshake, unless we
+                    // already tried (and the fresh list still lacks the char).
+                    if self.create_attempted {
+                        return PhaseResult::Error(format!(
+                            "character '{}' still missing after create attempt", name));
+                    }
+                    self.create_attempted = true;
+                    self.awaiting_name_approval = true;
+                    let pkt = build_approve_name(name, cc.race, cc.class);
+                    stream.send_app_packet(OP_APPROVE_NAME, &pkt);
+                    tracing::info!("EQ: char '{}' not found — requesting name approval (race={} class={})",
+                        name, cc.race, cc.class);
+                    PhaseResult::Continue
+                } else {
+                    PhaseResult::Error(format!(
+                        "character '{}' not on account and no character_create config", name))
+                }
+            }
+            OP_APPROVE_NAME if self.awaiting_name_approval => {
+                self.awaiting_name_approval = false;
+                let approved = packet.payload.first().copied().unwrap_or(0) == 1;
+                if !approved {
+                    return PhaseResult::Error(format!(
+                        "server rejected character name '{}'", self.config.character_name));
+                }
+                let cc = self.config.create.as_ref().expect("create set while awaiting approval");
+                let pkt = build_char_create(cc);
+                stream.send_app_packet(OP_CHARACTER_CREATE, &pkt);
+                tracing::info!("EQ: name approved — sent OP_CharacterCreate for '{}' (race={} class={} deity={} zone={})",
+                    self.config.character_name, cc.race, cc.class, cc.deity, cc.start_zone);
+                // Server replies with a fresh OP_SendCharInfo (success) handled above,
+                // or OP_ApproveName{0} (failure) which the arm above turns into an error.
                 PhaseResult::Continue
             }
             OP_ZONE_SERVER_INFO if !self.done_zone_server_info => {
@@ -504,5 +547,125 @@ impl<'a> LoginProtocol<'a> {
         }
         if self.world_server_id == 0 { self.world_server_id = 1; }
         if self.world_host.is_empty() { self.world_host = self.config.login_host.clone(); }
+    }
+}
+
+// ── Character-creation helpers ─────────────────────────────────────────────────
+
+/// Normalize a character name to Titanium's convention: first letter uppercase,
+/// the rest lowercase (the native client enforces this on the create screen).
+fn normalize_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for (i, c) in name.chars().enumerate() {
+        if i == 0 { out.extend(c.to_uppercase()); }
+        else      { out.extend(c.to_lowercase()); }
+    }
+    out
+}
+
+/// True if `name` appears as a null-terminated entry in an OP_SendCharInfo
+/// payload (CharacterSelect_Struct holds up to 10 fixed-width name buffers).
+/// Case-insensitive; the trailing NUL guards against prefix collisions.
+fn char_in_list(payload: &[u8], name: &str) -> bool {
+    let needle = name.as_bytes();
+    if needle.is_empty() { return false; }
+    payload.windows(needle.len() + 1)
+        .any(|w| w[needle.len()] == 0 && w[..needle.len()].eq_ignore_ascii_case(needle))
+}
+
+/// Build the 72-byte NameApproval_Struct (OP_ApproveName): name[64] + race u32 + class u32.
+fn build_approve_name(name: &str, race: u32, class: u32) -> Vec<u8> {
+    let mut buf = vec![0u8; 72];
+    let nm = normalize_name(name);
+    let b  = nm.as_bytes();
+    let n  = b.len().min(63); // leave room for the NUL terminator
+    buf[..n].copy_from_slice(&b[..n]);
+    buf[64..68].copy_from_slice(&race.to_le_bytes());
+    buf[68..72].copy_from_slice(&class.to_le_bytes());
+    buf
+}
+
+/// Build the 80-byte Titanium CharCreate_Struct (OP_CharacterCreate): 20 little-endian
+/// u32 fields in wire order. No name field — the name was sent via OP_ApproveName.
+fn build_char_create(cc: &CharacterCreate) -> Vec<u8> {
+    let fields: [u32; 20] = [
+        cc.class,      // 0x00 class_
+        cc.haircolor,  // 0x04 haircolor
+        cc.beardcolor, // 0x08 beardcolor
+        cc.beard,      // 0x0C beard
+        cc.gender,     // 0x10 gender
+        cc.race,       // 0x14 race
+        cc.start_zone, // 0x18 start_zone
+        cc.hairstyle,  // 0x1C hairstyle
+        cc.deity,      // 0x20 deity
+        cc.str_,       // 0x24 STR
+        cc.sta,        // 0x28 STA
+        cc.agi,        // 0x2C AGI
+        cc.dex,        // 0x30 DEX
+        cc.wis,        // 0x34 WIS
+        cc.int_,       // 0x38 INT
+        cc.cha,        // 0x3C CHA
+        cc.face,       // 0x40 face
+        cc.eyecolor1,  // 0x44 eyecolor1
+        cc.eyecolor2,  // 0x48 eyecolor2
+        0,             // 0x4C tutorial (0 = normal)
+    ];
+    let mut buf = Vec::with_capacity(80);
+    for f in fields { buf.extend_from_slice(&f.to_le_bytes()); }
+    buf
+}
+
+#[cfg(test)]
+mod charcreate_tests {
+    use super::*;
+
+    fn de_sk() -> CharacterCreate {
+        // Dark Elf (6) Shadow Knight (5), validated stats summing to 582.
+        CharacterCreate {
+            race: 6, class: 5, gender: 0, deity: 206, start_zone: 5,
+            str_: 70, sta: 70, agi: 90, dex: 75, wis: 83, int_: 129, cha: 65,
+            face: 0, hairstyle: 0, haircolor: 0, beard: 0, beardcolor: 0,
+            eyecolor1: 0, eyecolor2: 0,
+        }
+    }
+
+    #[test]
+    fn approve_name_layout() {
+        let pkt = build_approve_name("mordeth", 6, 5);
+        assert_eq!(pkt.len(), 72);
+        assert_eq!(&pkt[..7], b"Mordeth");      // normalized capitalization
+        assert_eq!(pkt[7], 0);                  // NUL-terminated
+        assert_eq!(u32::from_le_bytes(pkt[64..68].try_into().unwrap()), 6);
+        assert_eq!(u32::from_le_bytes(pkt[68..72].try_into().unwrap()), 5);
+    }
+
+    #[test]
+    fn char_create_layout_and_stat_total() {
+        let cc = de_sk();
+        let pkt = build_char_create(&cc);
+        assert_eq!(pkt.len(), 80);
+        let f = |i: usize| u32::from_le_bytes(pkt[i*4..i*4+4].try_into().unwrap());
+        assert_eq!(f(0), 5);    // class
+        assert_eq!(f(4), 0);    // gender
+        assert_eq!(f(5), 6);    // race
+        assert_eq!(f(6), 5);    // start_zone (Neriak)
+        assert_eq!(f(8), 206);  // deity (Innoruuk)
+        assert_eq!(f(19), 0);   // tutorial
+        // Stats occupy fields 9..=15 and must total exactly 582 for DE SK.
+        let total: u32 = (9..=15).map(f).sum();
+        assert_eq!(total, 582);
+    }
+
+    #[test]
+    fn char_in_list_matches_exact_only() {
+        // Two fixed-width name buffers: "Durgan\0..." then "Mordeth\0...".
+        let mut payload = vec![0u8; 128];
+        payload[..6].copy_from_slice(b"Durgan");
+        payload[64..71].copy_from_slice(b"Mordeth");
+        assert!(char_in_list(&payload, "Mordeth"));
+        assert!(char_in_list(&payload, "mordeth"));   // case-insensitive
+        assert!(char_in_list(&payload, "Durgan"));
+        assert!(!char_in_list(&payload, "Mord"));     // prefix must not match
+        assert!(!char_in_list(&payload, "Katie"));
     }
 }
