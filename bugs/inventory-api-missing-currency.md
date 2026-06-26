@@ -36,4 +36,7 @@ it to the `/inventory` (and/or `/debug`) JSON. The values already exist in
 `game_state`; this is a plumbing/serialization addition, not new protocol work.
 
 ## Status
-Open
+Fixed — `GET /inventory` and `GET /debug` now include a `currency` object
+`{platinum, gold, silver, copper}`, published from `gs.coin` via `PlayerState`.
+Verified live: Mordeth's API currency matches the server's `character_currency`
+row (0/0/0/0 — a fresh L1, which also explains why he couldn't buy wine).
