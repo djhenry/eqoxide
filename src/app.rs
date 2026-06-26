@@ -694,6 +694,15 @@ impl App {
         let hd = (self.heading_target - self.visual_heading).rem_euclid(360.0);
         if hd > 0.05 && hd < 359.95 { activity = true; }
 
+        // Character animations (idle/walk/etc.) loop continuously. Keep rendering while any is in
+        // flight so they actually PLAY, instead of freezing on a single frame whenever the scene is
+        // otherwise still (no packets/input) — which made standing characters look frozen in a
+        // static pose. `animate` is false for held poses (sitting, dead, idle-on-a-walk-fallback),
+        // so a truly motionless scene still drops to the idle poll.
+        if self.gpu.as_ref().is_some_and(|(_, r)| r.anim_states.values().any(|s| s.animate)) {
+            activity = true;
+        }
+
         activity
     }
 
