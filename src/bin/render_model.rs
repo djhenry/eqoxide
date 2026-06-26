@@ -794,7 +794,8 @@ impl ApplicationHandler for ModelViewerApp {
                 .and_then(|n| tex_names.iter().position(|t| t == n));
             Some((gpu::GpuMesh { vertex_buf: vbuf, index_buf: ibuf,
                                 index_count: mesh.indices.len() as u32, texture_idx,
-                                base_color: mesh.base_color }, slot))
+                                base_color: mesh.base_color,
+                                render_mode: eqoxide::assets::RenderMode::Opaque, anim: None }, slot))
         }).unzip();
 
         let model = GpuStaticModel {

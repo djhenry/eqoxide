@@ -34,5 +34,19 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let light = max(dot(normalize(in.normal), normalize(vec3<f32>(0.5, 1.0, 0.3))), 0.1);
     let texel = textureSample(t_diffuse, s_diffuse, in.uv);
+    // Alpha-test cutout for masked materials (foliage/branches): EQ opaque textures
+    // decode to alpha 1.0, so this only discards keyed-transparent texels.
+    if (texel.a < 0.5) {
+        discard;
+    }
+    return vec4<f32>(texel.rgb * light, texel.a);
+}
+
+// Blended/additive instanced surfaces: no alpha-test discard (opacity baked into
+// the texture alpha). The pipeline supplies the blend equation.
+@fragment
+fn fs_blend(in: VertexOutput) -> @location(0) vec4<f32> {
+    let light = max(dot(normalize(in.normal), normalize(vec3<f32>(0.5, 1.0, 0.3))), 0.1);
+    let texel = textureSample(t_diffuse, s_diffuse, in.uv);
     return vec4<f32>(texel.rgb * light, texel.a);
 }

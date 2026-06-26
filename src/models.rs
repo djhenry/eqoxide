@@ -304,6 +304,7 @@ impl ModelAsset {
                 meshes.push(MeshData {
                     positions, normals, uvs, indices, texture_name, base_color,
                     center: [0.0, 0.0, 0.0],
+                    render_mode: crate::assets::RenderMode::Opaque, anim: None,
                 });
                 skin_meshes.push(sd_opt);
                 skinned_mesh_scales.push(this_mesh_scale);

@@ -10,6 +10,56 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
+/// Parse a glTF material's `extras` JSON (the asset server's `eqAdditive` / `eqAnim`).
+fn material_extras(material: &gltf::Material) -> Option<serde_json::Value> {
+    material
+        .extras()
+        .as_ref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw.get()).ok())
+}
+
+/// True if the material carries `extras: { "eqAdditive": true }` (EQ fire/glow surface).
+fn material_is_additive(material: &gltf::Material) -> bool {
+    material_extras(material)
+        .and_then(|v| v.get("eqAdditive").and_then(|b| b.as_bool()))
+        .unwrap_or(false)
+}
+
+/// Read the material's animated-texture spec from `extras.eqAnim`, if present:
+/// `(frame_interval_ms, frame image names)`.
+fn material_anim(material: &gltf::Material) -> Option<(u32, Vec<String>)> {
+    let v = material_extras(material)?;
+    let a = v.get("eqAnim")?;
+    let ms = a.get("ms")?.as_u64()? as u32;
+    let frames: Vec<String> = a
+        .get("frames")?
+        .as_array()?
+        .iter()
+        .filter_map(|f| f.as_str().map(|s| s.to_string()))
+        .collect();
+    if frames.len() < 2 {
+        return None;
+    }
+    Some((ms, frames))
+}
+
+/// How a zone primitive is blended, derived from the glTF material's `alphaMode`
+/// (plus the `extras.eqAdditive` flag the asset server emits for EQ additive surfaces).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum RenderMode {
+    /// Fully opaque (the vast majority of zone geometry).
+    #[default]
+    Opaque,
+    /// Alpha-test cutout (foliage/branches): drawn in the opaque pass, fragments
+    /// with texture alpha < 0.5 are discarded.
+    Masked,
+    /// Standard src-alpha blend (semi-transparent surfaces). Opacity is baked into
+    /// the texture alpha by the asset server.
+    Blend,
+    /// Additive blend (EQ fire/glow): dst + src, no occlusion.
+    Additive,
+}
+
 /// CPU-side mesh data ready for GPU upload.
 #[derive(Clone)]
 pub struct MeshData {
@@ -22,6 +72,12 @@ pub struct MeshData {
     pub base_color: [f32; 4],
     /// World-space offset: add to each position to get absolute coordinates.
     pub center: [f32; 3],
+    /// Transparency/blend mode from the glTF material's `alphaMode` (+ additive extras).
+    pub render_mode: RenderMode,
+    /// EQ animated texture: `(frame_interval_ms, frame image names incl. frame 0)`,
+    /// from the material's `extras.eqAnim`. The renderer cycles these frames. `None`
+    /// for static textures.
+    pub anim: Option<(u32, Vec<String>)>,
 }
 
 /// CPU-side texture data ready for GPU upload.
@@ -83,6 +139,8 @@ pub fn expand_objects(objects: &[ObjectModel]) -> Vec<MeshData> {
                     texture_name: mesh.texture_name.clone(),
                     base_color: mesh.base_color,
                     center: [0.0, 0.0, 0.0],
+                    render_mode: mesh.render_mode,
+                    anim: mesh.anim.clone(),
                 });
             }
         }
@@ -189,7 +247,23 @@ impl ZoneAssets {
                     .and_then(|info| tex_index_to_name.get(info.texture().index()).cloned())
                     .filter(|n| !n.is_empty());
 
-                let base_color = primitive.material().pbr_metallic_roughness().base_color_factor();
+                let material = primitive.material();
+                let base_color = material.pbr_metallic_roughness().base_color_factor();
+
+                // Map glTF alphaMode (+ the asset server's `eqAdditive` extra) to a render mode.
+                let render_mode = match material.alpha_mode() {
+                    gltf::material::AlphaMode::Opaque => RenderMode::Opaque,
+                    gltf::material::AlphaMode::Mask => RenderMode::Masked,
+                    gltf::material::AlphaMode::Blend => {
+                        if material_is_additive(&material) {
+                            RenderMode::Additive
+                        } else {
+                            RenderMode::Blend
+                        }
+                    }
+                };
+
+                let anim = material_anim(&material);
 
                 out.push(MeshData {
                     positions,
@@ -199,6 +273,8 @@ impl ZoneAssets {
                     texture_name,
                     base_color,
                     center: [0.0, 0.0, 0.0],
+                    render_mode,
+                    anim,
                 });
             }
             out
@@ -859,6 +935,7 @@ impl ZoneAssets {
                         texture_name,
                         base_color: [1.0, 1.0, 1.0, 1.0],
                         center: [cx, cy, cz],
+                        render_mode: RenderMode::Opaque, anim: None,
                     });
                 }
             }
@@ -960,6 +1037,7 @@ fn read_object_meshes(s3d: &Path) -> Result<Vec<(String, MeshData)>> {
                     positions, normals, uvs,
                     indices: (0..idx.len() as u32).collect(),
                     texture_name, base_color: [1.0, 1.0, 1.0, 1.0], center: [0.0, 0.0, 0.0],
+                    render_mode: RenderMode::Opaque, anim: None,
                 }));
             }
         }
@@ -1076,7 +1154,8 @@ pub fn load_weapon_model(assets_path: &Path, idfile: &str) -> Option<ZoneAssets>
                     let texture_name = prim.material().base_color_texture().and_then(|t| t.source());
                     meshes.push(MeshData { positions, normals, uvs,
                         indices: (0..idx.len() as u32).collect(),
-                        texture_name, base_color: [1.0; 4], center: [cx, cy, cz] });
+                        texture_name, base_color: [1.0; 4], center: [cx, cy, cz],
+                        render_mode: RenderMode::Opaque, anim: None });
                 }
             }
             if meshes.is_empty() { continue; }
@@ -1175,6 +1254,7 @@ mod tests {
             texture_name: None,
             base_color: [1.0; 4],
             center: [0.0, 0.0, 0.0],
+            render_mode: RenderMode::Opaque, anim: None,
         };
         // Vertical wall at world east=5: libeq p2=5 (render.X), spanning north=p0 [0,10], height=p1 [0,10].
         let wall = MeshData {
@@ -1185,6 +1265,7 @@ mod tests {
             texture_name: None,
             base_color: [1.0; 4],
             center: [0.0, 0.0, 0.0],
+            render_mode: RenderMode::Opaque, anim: None,
         };
         let assets = ZoneAssets { terrain: vec![floor, wall], objects: vec![], textures: vec![] };
         let col = Collision::build(&assets, 4.0);
@@ -1215,12 +1296,14 @@ mod tests {
             positions: vec![[0.0, 0.0, 0.0], [20.0, 0.0, 0.0], [20.0, 0.0, 20.0], [0.0, 0.0, 20.0]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
         };
         // Partial wall at world east=10, spanning north 0..14 (gap at north 14..20), height 0..10.
         let wall = MeshData {
             positions: vec![[0.0, 0.0, 10.0], [14.0, 0.0, 10.0], [14.0, 10.0, 10.0], [0.0, 10.0, 10.0]],
             normals: vec![[0.0, 0.0, 1.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
         };
         let col = Collision::build(&ZoneAssets { terrain: vec![floor, wall], objects: vec![], textures: vec![] }, 2.0);
         // The direct line (5,5)->(15,5) crosses the wall (north 5 < 14) → blocked.
@@ -1276,6 +1359,7 @@ mod tests {
             texture_name: None,
             base_color: [1.0; 4],
             center: [0.0, 0.0, 0.0],
+            render_mode: RenderMode::Opaque, anim: None,
         };
         let col = Collision::build(&ZoneAssets { terrain: vec![wall], objects: vec![], textures: vec![] }, 4.0);
         let chest = 3.0_f32;
@@ -1303,6 +1387,7 @@ mod instanced_tests {
                 positions: vec![[1.0,0.0,0.0]], normals: vec![[1.0,0.0,0.0]],
                 uvs: vec![[0.0,0.0]], indices: vec![0],
                 texture_name: Some("t.bmp".into()), base_color: [1.0;4], center: [0.0;3],
+                render_mode: RenderMode::Opaque, anim: None,
             }],
             // two instances: identity, and translate +10 in x (column-major: row3 col0..)
             instances: vec![

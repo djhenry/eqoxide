@@ -1155,6 +1155,7 @@ mod tests {
             texture_name: None,
             base_color: [1.0; 4],
             center: [0.0, 0.0, 0.0],
+            render_mode: crate::assets::RenderMode::Opaque, anim: None,
         };
         crate::assets::Collision::build(
             &crate::assets::ZoneAssets { terrain: vec![wall], objects: vec![], textures: vec![] }, 4.0)

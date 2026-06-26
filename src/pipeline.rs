@@ -19,6 +19,12 @@ pub struct Pipelines {
     pub sky:       wgpu::RenderPipeline,
     pub zone:      wgpu::RenderPipeline,
     pub zone_instanced: wgpu::RenderPipeline,
+    /// Transparent zone variants drawn after the opaque pass (depth-write off):
+    /// `*_blend` = src-alpha blend, `*_additive` = additive fire/glow.
+    pub zone_blend: wgpu::RenderPipeline,
+    pub zone_additive: wgpu::RenderPipeline,
+    pub zone_instanced_blend: wgpu::RenderPipeline,
+    pub zone_instanced_additive: wgpu::RenderPipeline,
     pub billboard: wgpu::RenderPipeline,
     pub character: wgpu::RenderPipeline,
     pub skinned:   wgpu::RenderPipeline,
@@ -190,7 +196,7 @@ pub fn build_pipelines(
         layout: Some(&zone_layout),
         vertex: wgpu::VertexState {
             module: &zone_inst_shader, entry_point: "vs_main",
-            buffers: &[vbl.clone(), instance_vbl], compilation_options: Default::default(),
+            buffers: &[vbl.clone(), instance_vbl.clone()], compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
             module: &zone_inst_shader, entry_point: "fs_main",
@@ -206,6 +212,121 @@ pub fn build_pipelines(
             ..Default::default()
         },
         depth_stencil: Some(depth.clone()),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None, cache: None,
+    });
+
+    // ── Transparent zone pipelines (blend + additive, static + instanced) ──────
+    // Drawn after the opaque/masked pass with depth-write OFF (so they don't occlude
+    // each other or geometry behind them). They use the zone shaders' `fs_blend` entry
+    // (no alpha-test discard). Blend opacity is baked into the texture alpha by the
+    // asset server; additive fire/glow uses pure src+dst add (black texels add nothing).
+    let transparent_depth = wgpu::DepthStencilState {
+        depth_write_enabled: false,
+        depth_compare: wgpu::CompareFunction::LessEqual,
+        ..depth.clone()
+    };
+    let additive_blend = wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        },
+    };
+
+    let zone_blend = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("zone_blend"),
+        layout: Some(&zone_layout),
+        vertex: wgpu::VertexState {
+            module: &zone_shader, entry_point: "vs_main",
+            buffers: std::slice::from_ref(&vbl), compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &zone_shader, entry_point: "fs_blend",
+            targets: &[Some(wgpu::ColorTargetState {
+                format, blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default()
+        },
+        depth_stencil: Some(transparent_depth.clone()),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None, cache: None,
+    });
+
+    let zone_additive = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("zone_additive"),
+        layout: Some(&zone_layout),
+        vertex: wgpu::VertexState {
+            module: &zone_shader, entry_point: "vs_main",
+            buffers: std::slice::from_ref(&vbl), compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &zone_shader, entry_point: "fs_blend",
+            targets: &[Some(wgpu::ColorTargetState {
+                format, blend: Some(additive_blend),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default()
+        },
+        depth_stencil: Some(transparent_depth.clone()),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None, cache: None,
+    });
+
+    let zone_instanced_blend = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("zone_instanced_blend"),
+        layout: Some(&zone_layout),
+        vertex: wgpu::VertexState {
+            module: &zone_inst_shader, entry_point: "vs_main",
+            buffers: &[vbl.clone(), instance_vbl.clone()], compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &zone_inst_shader, entry_point: "fs_blend",
+            targets: &[Some(wgpu::ColorTargetState {
+                format, blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default()
+        },
+        depth_stencil: Some(transparent_depth.clone()),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None, cache: None,
+    });
+
+    let zone_instanced_additive = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("zone_instanced_additive"),
+        layout: Some(&zone_layout),
+        vertex: wgpu::VertexState {
+            module: &zone_inst_shader, entry_point: "vs_main",
+            buffers: &[vbl.clone(), instance_vbl.clone()], compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &zone_inst_shader, entry_point: "fs_blend",
+            targets: &[Some(wgpu::ColorTargetState {
+                format, blend: Some(additive_blend),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default()
+        },
+        depth_stencil: Some(transparent_depth.clone()),
         multisample: wgpu::MultisampleState::default(),
         multiview: None, cache: None,
     });
@@ -407,7 +528,11 @@ pub fn build_pipelines(
         multiview: None, cache: None,
     });
 
-    Pipelines { sky, zone, zone_instanced, billboard, character, skinned, skinned_overlay }
+    Pipelines {
+        sky, zone, zone_instanced,
+        zone_blend, zone_additive, zone_instanced_blend, zone_instanced_additive,
+        billboard, character, skinned, skinned_overlay,
+    }
 }
 
 #[cfg(test)]
