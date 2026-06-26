@@ -14,3 +14,4 @@ expected vs. actual, observations/diagnosis, suspected root cause, and status.
 | [Neriak Third Gate library pathing stall](neriakc-library-pathing-stall.md) | Medium | Open |
 | [NPC rat movement jerky despite lerp](npc-rat-movement-jerky-despite-lerp.md) | Low | Open |
 | [/inventory API missing currency amounts](inventory-api-missing-currency.md) | Low-Med | Open |
+| [New goto/warp/manual move doesn't cancel navigation](new-movement-does-not-cancel-navigation.md) | Medium | Open |
