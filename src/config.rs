@@ -80,6 +80,65 @@ pub struct LoginConfig {
     pub username:       String,
     pub password:       String,
     pub character_name: String,
+    /// When set and `character_name` is not already on the account's
+    /// char-select list, the client creates the character via the normal
+    /// OP_ApproveName → OP_CharacterCreate handshake before entering world.
+    pub create:         Option<CharacterCreate>,
+}
+
+/// Appearance + stat allocation for creating a new character. Mirrors the
+/// fields the native Titanium character-creation screen sends in
+/// CharCreate_Struct. Stats must satisfy the server's per-class/race floors
+/// and total; cosmetic fields default to 0.
+#[derive(Clone, Debug)]
+pub struct CharacterCreate {
+    pub race:       u32,
+    pub class:      u32,
+    pub gender:     u32, // 0=male, 1=female
+    pub deity:      u32,
+    pub start_zone: u32, // StartZoneIndex (e.g. 5 = Neriak)
+    pub str_:       u32,
+    pub sta:        u32,
+    pub agi:        u32,
+    pub dex:        u32,
+    pub wis:        u32,
+    pub int_:       u32,
+    pub cha:        u32,
+    pub face:       u32,
+    pub hairstyle:  u32,
+    pub haircolor:  u32,
+    pub beard:      u32,
+    pub beardcolor: u32,
+    pub eyecolor1:  u32,
+    pub eyecolor2:  u32,
+}
+
+impl CharacterCreate {
+    fn from_yaml(cfg: &serde_yaml::Value) -> Option<Self> {
+        let c = cfg.get("character_create")?;
+        let u = |k: &str, d: u32| c.get(k).and_then(|x| x.as_u64()).map(|n| n as u32).unwrap_or(d);
+        Some(CharacterCreate {
+            race:       u("race", 0),
+            class:      u("class", 0),
+            gender:     u("gender", 0),
+            deity:      u("deity", 0),
+            start_zone: u("start_zone", 0),
+            str_:       u("str", 0),
+            sta:        u("sta", 0),
+            agi:        u("agi", 0),
+            dex:        u("dex", 0),
+            wis:        u("wis", 0),
+            int_:       u("int", 0),
+            cha:        u("cha", 0),
+            face:       u("face", 0),
+            hairstyle:  u("hairstyle", 0),
+            haircolor:  u("haircolor", 0),
+            beard:      u("beard", 0),
+            beardcolor: u("beardcolor", 0),
+            eyecolor1:  u("eyecolor1", 0),
+            eyecolor2:  u("eyecolor2", 0),
+        })
+    }
 }
 
 impl LoginConfig {
@@ -124,6 +183,7 @@ impl LoginConfig {
             character_name: cfg
                 .get("account").and_then(|a| a.get("character_name")).and_then(|v| v.as_str())
                 .unwrap_or("Aiquestbot").to_string(),
+            create: CharacterCreate::from_yaml(&cfg),
         }
     }
 }

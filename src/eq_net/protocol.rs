@@ -50,6 +50,8 @@ pub const OP_APPROVE_WORLD: u16 = 0x3c25;
 pub const OP_LOG_SERVER: u16 = 0x0fa6;
 pub const OP_MOTD: u16 = 0x024d;
 pub const OP_SEND_CHAR_INFO: u16 = 0x4513;
+pub const OP_APPROVE_NAME: u16 = 0x3ea6;      // C->S NameApproval_Struct (72B); S->C 1 byte (1=ok,0=reject)
+pub const OP_CHARACTER_CREATE: u16 = 0x10b2;  // C->S CharCreate_Struct (Titanium wire = 80B)
 pub const OP_ENTER_WORLD: u16 = 0x7cba;
 pub const OP_POST_ENTER_WORLD: u16 = 0x52a4;
 pub const OP_ZONE_SERVER_INFO: u16 = 0x61b6;
