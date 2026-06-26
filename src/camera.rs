@@ -123,6 +123,23 @@ pub fn project_to_screen(
     ])
 }
 
+/// Unit movement direction for mouse-look "drive" mode, in world [east, north, z].
+///
+/// Horizontal component is the camera's forward look direction (toward the focus):
+/// `(-cos az, -sin az)`. When `vertical` is true (player swimming in water), the result
+/// is the full 3D look direction so the player swims up/down by the camera pitch; the
+/// vertical term is `-sin(el)` (the eye sits `+sin(el)` above the focus, so the look
+/// direction points down by that much). When `vertical` is false the z term is 0 and the
+/// player moves horizontally only. The returned vector is unit length in both cases.
+pub fn camera_move_dir(azimuth: f32, elevation: f32, vertical: bool) -> [f32; 3] {
+    if vertical {
+        let (sin_el, cos_el) = elevation.sin_cos();
+        [-cos_el * azimuth.cos(), -cos_el * azimuth.sin(), -sin_el]
+    } else {
+        [-azimuth.cos(), -azimuth.sin(), 0.0]
+    }
+}
+
 /// Visibility test for entity culling. Returns true if an entity standing at `pos`
 /// (its feet) should be rendered, given the player position and the view-projection
 /// matrix. Culls in two cheap ways:
@@ -284,6 +301,35 @@ mod tests {
         // Near enough in distance, but behind the camera (camera looks toward -Z).
         let behind = [0.0, 0.0, 20.0];
         assert!(!entity_in_view(behind, [0.0, 0.0, 18.0], cull_vp(), 500.0, 0.5));
+    }
+
+    #[test]
+    fn camera_move_dir_horizontal_is_unit_and_flat() {
+        let d = camera_move_dir(0.7, 0.5, false);
+        assert!((d[2]).abs() < 1e-6, "horizontal move must have no z");
+        let len = (d[0]*d[0] + d[1]*d[1] + d[2]*d[2]).sqrt();
+        assert!((len - 1.0).abs() < 1e-5, "len={len}");
+    }
+
+    #[test]
+    fn camera_move_dir_vertical_is_unit_3d() {
+        let d = camera_move_dir(0.7, 0.5, true);
+        let len = (d[0]*d[0] + d[1]*d[1] + d[2]*d[2]).sqrt();
+        assert!((len - 1.0).abs() < 1e-5, "len={len}");
+    }
+
+    #[test]
+    fn camera_move_dir_positive_elevation_points_down() {
+        // Eye above focus (el>0) => looking down => swim direction has negative z.
+        let d = camera_move_dir(0.0, 0.6, true);
+        assert!(d[2] < 0.0, "expected downward z, got {}", d[2]);
+    }
+
+    #[test]
+    fn camera_move_dir_negative_elevation_points_up() {
+        // Eye below focus (el<0) => looking up => swim up.
+        let d = camera_move_dir(0.0, -0.6, true);
+        assert!(d[2] > 0.0, "expected upward z, got {}", d[2]);
     }
 
     #[test]

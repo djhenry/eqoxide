@@ -47,6 +47,13 @@ pub fn desired_azimuth(heading_deg: f32) -> f32 {
     heading_deg.to_radians() - std::f32::consts::FRAC_PI_2
 }
 
+/// Inverse of [`desired_azimuth`]: the heading (EQ degrees, CCW) a character must face
+/// to be looking in the camera's horizontal direction. Used by mouse-look "drive" mode,
+/// where the character's heading is slaved to the camera while LMB + a move key are held.
+pub fn heading_deg_from_azimuth(azimuth: f32) -> f32 {
+    (azimuth + std::f32::consts::FRAC_PI_2).to_degrees().rem_euclid(360.0)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CameraMode { AutoFollow, ManualOrbit }
@@ -136,11 +143,13 @@ impl CameraState {
         self.radius    = DESIRED_RADIUS;
     }
 
-    /// Re-engage heading-follow (camera swings behind the player) while PRESERVING the
-    /// user's chosen tilt and zoom. Used when rotating the character with A/D so the
-    /// camera tracks the new heading without snapping elevation/radius back.
-    pub fn follow_heading(&mut self) {
-        self.mode = CameraMode::AutoFollow;
+    /// Rotate the camera rigidly with the character's heading by `d_az` radians, preserving
+    /// its current relative offset (it does NOT snap behind). Used when rotating with A/D
+    /// (no mouse button): the character and camera turn together. Switches to ManualOrbit so
+    /// the AutoFollow tick won't re-derive azimuth from heading and undo this.
+    pub fn rotate_with_heading(&mut self, d_az: f32) {
+        self.azimuth = (self.azimuth + d_az).rem_euclid(std::f32::consts::TAU);
+        self.mode    = CameraMode::ManualOrbit;
     }
 
     /// Apply an HTTP command to the camera state.
@@ -277,15 +286,14 @@ mod tests {
 
     #[test]
     fn autofollow_tick_preserves_manual_tilt_and_zoom() {
-        // After zooming/tilting then re-engaging follow, movement must NOT snap tilt/zoom back.
+        // After zooming/tilting, movement must NOT snap tilt/zoom back.
         let mut cam = CameraState::new([0.0, 0.0, 0.0], 0.0);
         cam.elevation = 0.9;
         cam.radius    = 150.0;
-        cam.follow_heading(); // back to AutoFollow without resetting tilt/zoom
+        cam.mode      = CameraMode::AutoFollow;
         cam.tick(0.016, [10.0, 10.0, 0.0], 90.0); // player moves + turns
         assert!((cam.elevation - 0.9).abs() < 1e-6, "tilt snapped back: {}", cam.elevation);
         assert!((cam.radius - 150.0).abs() < 1e-6, "zoom snapped back: {}", cam.radius);
-        assert_eq!(cam.mode, CameraMode::AutoFollow);
     }
 
     #[test]
@@ -300,15 +308,28 @@ mod tests {
     }
 
     #[test]
-    fn follow_heading_keeps_tilt_and_zoom() {
+    fn rotate_with_heading_preserves_relative_offset_and_tiltzoom() {
+        // A/D rotation: camera azimuth turns by the same delta as the heading, keeping its
+        // relative offset, and tilt/zoom are untouched.
         let mut cam = CameraState::new([0.0, 0.0, 0.0], 0.0);
-        cam.apply_orbit_delta(0.3, 0.2);
-        cam.apply_zoom(-0.5);
-        let (el, r) = (cam.elevation, cam.radius);
-        cam.follow_heading();
-        assert_eq!(cam.mode, CameraMode::AutoFollow);
+        cam.apply_orbit_delta(0.3, 0.2); // user orbited to some offset
+        let (az0, el, r) = (cam.azimuth, cam.elevation, cam.radius);
+        let d = 0.25_f32;
+        cam.rotate_with_heading(d);
+        assert!((cam.azimuth - (az0 + d).rem_euclid(std::f32::consts::TAU)).abs() < 1e-6);
+        assert_eq!(cam.mode, CameraMode::ManualOrbit);
         assert!((cam.elevation - el).abs() < 1e-6);
         assert!((cam.radius - r).abs() < 1e-6);
+    }
+
+    #[test]
+    fn heading_azimuth_round_trips() {
+        for h in [0.0_f32, 30.0, 90.0, 200.0, 359.0] {
+            let az = desired_azimuth(h);
+            let back = heading_deg_from_azimuth(az);
+            let diff = (back - h).rem_euclid(360.0);
+            assert!(diff < 1e-3 || diff > 360.0 - 1e-3, "h={h} -> {back}");
+        }
     }
 
     #[test]
