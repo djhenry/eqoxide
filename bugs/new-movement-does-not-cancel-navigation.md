@@ -42,4 +42,11 @@ path/target. Fix: have a new `/goto` replace the path, have `/warp` clear the
 active nav target, and have manual movement input cancel auto-nav.
 
 ## Status
-Open
+Fixed (branch `worktree-mordeth`). The `/warp` slot is now consumed by the NAV
+thread, which performs a real teleport (jump position + send a position update +
+clear the A* path + clear `goto_target`) instead of the app writing the warp
+coords into `goto_target` (which made the nav *walk* there and stall). Manual
+movement (WASD/QE keydown) now clears `goto_target` so it cancels an active
+/goto; a new `/goto` already replaces the target. Verified live: a `/warp` issued
+mid-`/goto` teleports to the exact coords and holds (no drag-back); navigation is
+cancelled.

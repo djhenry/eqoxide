@@ -18,7 +18,7 @@ const NAV_STEP: f32 = RUN_SPEED * (NAV_TICK_MS as f32 / 1000.0); // 44 * 0.150 =
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::{GameState, ZonePoint};
-use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, TradeCmd, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, CastReq, MemSpellReq, SitReq, ConsiderReq, CampReq, CampCmd, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints};
+use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, TradeCmd, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, CastReq, MemSpellReq, SitReq, ConsiderReq, CampReq, CampCmd, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, WarpReq, ZoneCrossReq, ZonePoints};
 
 /// Pending state of a quest turn-in (POST /give). The trade window spans multiple nav ticks:
 /// we send OP_TradeRequest, then must wait for the server's OP_TradeRequestAck before moving the
@@ -198,6 +198,9 @@ pub struct Navigator {
     zone_points:      ZonePoints,
     task_log:         TaskLog,
     zone_cross:       ZoneCrossReq,
+    /// Direct teleport request (POST /warp). The nav thread jumps the player to these coords,
+    /// sends a position update so the server agrees, and cancels any in-progress /goto.
+    warp:             WarpReq,
     hail:             HailReq,
     say:              SayReq,
     target:           TargetReq,
@@ -258,6 +261,7 @@ impl Navigator {
         zone_points:      ZonePoints,
         task_log:         TaskLog,
         zone_cross:       ZoneCrossReq,
+        warp:             WarpReq,
         hail:             HailReq,
         say:              SayReq,
         target:           TargetReq,
@@ -288,6 +292,7 @@ impl Navigator {
             zone_points,
             task_log,
             zone_cross,
+            warp,
             hail,
             say,
             target,
@@ -867,6 +872,24 @@ impl Navigator {
                 }
                 tracing::info!("NAV: landed at z={:.1} after {:.0}u fall", land_z, height);
             }
+            return;
+        }
+
+        // Direct teleport (POST /warp): jump to the coords and tell the server, then CANCEL any
+        // in-progress navigation. Unlike a /goto this does not path or walk, so it can't be dragged
+        // back by a stalled walk (the old behavior wrote the warp coords into goto_target, which
+        // made the nav thread try to *walk* there and stall). A teleport also stops a controlled fall.
+        let warp_req = self.warp.lock().unwrap().take();
+        if let Some((wx, wy, wz)) = warp_req {
+            gs.player_x = wx;
+            gs.player_y = wy;
+            gs.player_z = wz;
+            self.falling = None;
+            self.path.clear();
+            self.path_goal = None;
+            *self.goto_target.lock().unwrap() = None;
+            self.send_position_update(stream, gs, wx, wy, wz, gs.player_heading);
+            tracing::info!("NAV: teleport (warp) to ({:.1},{:.1},{:.1}) — navigation cancelled", wx, wy, wz);
             return;
         }
 
