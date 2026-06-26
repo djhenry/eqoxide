@@ -907,17 +907,23 @@ impl App {
         // Determine A/D mode before the movement block so the heading block can use it.
         let a_held = self.keys_held.contains(&KeyCode::KeyA);
         let d_held = self.keys_held.contains(&KeyCode::KeyD);
+        let w_held = self.keys_held.contains(&KeyCode::KeyW);
+        let s_held = self.keys_held.contains(&KeyCode::KeyS);
+        let q_held = self.keys_held.contains(&KeyCode::KeyQ);
+        let e_held = self.keys_held.contains(&KeyCode::KeyE);
         // Rotate mode: LMB is up (not dragging camera). Strafe mode: LMB held.
         let rotating = !self.drag_active && (a_held || d_held);
         // Any manual movement key held. When true, the player's facing is driven by heading_target
-        // (a/d rotation), NOT by motion direction — so strafing (Q/E, A/D+LMB) keeps facing forward
-        // instead of turning to face the sideways motion (which would feed back through the
-        // auto-follow camera into a spin). Motion-derived heading is only for nav-driven /goto.
-        let manual_move = a_held || d_held
-            || self.keys_held.contains(&KeyCode::KeyW)
-            || self.keys_held.contains(&KeyCode::KeyS)
-            || self.keys_held.contains(&KeyCode::KeyQ)
-            || self.keys_held.contains(&KeyCode::KeyE);
+        // (a/d rotation or mouse-look), NOT by motion direction — so strafing keeps facing forward
+        // instead of turning to face the sideways motion. Motion-derived heading is only for /goto.
+        let manual_move = a_held || d_held || w_held || s_held || q_held || e_held;
+        // Mouse-look "drive": LMB held AND a movement key held -> the character's heading is slaved
+        // to the camera each frame (steer with the mouse). With LMB held but no move key, the mouse
+        // just orbits the camera (handled in input) and the heading is left alone.
+        let lmb_drive = self.drag_active && manual_move;
+        // Swim (vertical movement) only while driving forward/back AND standing in a water region.
+        let in_water = self.collision.as_ref().is_some_and(|c| c.in_water(self.scene.player_pos));
+        let swimming = lmb_drive && in_water && (w_held || s_held);
 
         {
             // EQ character run speed is ~35 EQ-units/sec; higher values trigger server rubber-band.
@@ -931,35 +937,40 @@ impl App {
             // heading and D increase it for rotation to LOOK correct (A = turn left on screen,
             // D = turn right). Heading itself stays EQ-CCW; only the key→direction mapping flips.
             if rotating {
-                if a_held { self.heading_target = (self.heading_target - TURN_SPEED * dt).rem_euclid(360.0); }
-                if d_held { self.heading_target = (self.heading_target + TURN_SPEED * dt).rem_euclid(360.0); }
-                // Keep the camera tracking the new heading each frame, but preserve the
-                // user's tilt/zoom (only F9/R resets those).
-                self.camera.follow_heading();
+                let mut dh = 0.0;
+                if a_held { dh -= TURN_SPEED * dt; }
+                if d_held { dh += TURN_SPEED * dt; }
+                self.heading_target = (self.heading_target + dh).rem_euclid(360.0);
+                // Rotate the camera rigidly WITH the heading by the same delta, preserving its
+                // current relative offset (it does NOT snap behind). Only F9/R resets to behind.
+                self.camera.rotate_with_heading(dh.to_radians());
             }
 
-            // When rotating, derive forward/right from heading_target so W moves immediately
-            // in the direction the player is turning toward (no 1-frame camera lag).
-            // When strafing (LMB held), use the camera azimuth as before.
-            let (fwd_e, fwd_n, right_e, right_n) = if rotating {
-                let h = self.heading_target.to_radians();
-                // EQ heading: 0=north(+Y), increases CCW (90=west). Forward unit vector
-                // (east,north) = (-sin h, cos h); right is forward rotated -90°.
-                (-h.sin(), h.cos(), h.cos(), h.sin())
-            } else {
+            // Forward basis. In mouse-look drive mode the heading is slaved to the camera and W/S
+            // move along the camera direction (with a vertical term when swimming). Otherwise W/S
+            // move along the character's own heading. Strafe is always perpendicular to the heading.
+            let (fwd_e, fwd_n, fwd_z) = if lmb_drive {
                 let az = self.camera.azimuth;
-                (-az.cos(), -az.sin(), -az.sin(), az.cos())
+                self.heading_target = crate::camera_state::heading_deg_from_azimuth(az);
+                let d = crate::camera::camera_move_dir(az, self.camera.elevation, swimming);
+                (d[0], d[1], d[2])
+            } else {
+                let h = self.heading_target.to_radians();
+                // EQ heading: 0=north(+Y), increases CCW (90=west). Forward = (-sin h, cos h).
+                (-h.sin(), h.cos(), 0.0)
             };
+            // Right (strafe) vector: forward rotated -90° around the heading, always horizontal.
+            let h = self.heading_target.to_radians();
+            let (right_e, right_n) = (h.cos(), h.sin());
 
             let mut de = 0.0_f32;
             let mut dn = 0.0_f32;
-            if self.keys_held.contains(&KeyCode::KeyW) { de += fwd_e; dn += fwd_n; }
-            if self.keys_held.contains(&KeyCode::KeyS) { de -= fwd_e; dn -= fwd_n; }
+            let mut dz = 0.0_f32;
+            if w_held { de += fwd_e; dn += fwd_n; dz += fwd_z; }
+            if s_held { de -= fwd_e; dn -= fwd_n; dz -= fwd_z; }
             // Strafe: Q = left, E = right (always); A/D strafe only while LMB (camera-orbit) is held.
             // Under the X-mirrored render, screen-left strafe moves along +right_vec and screen-right
             // along -right_vec — the same left/right reversal as the rotation fix above.
-            let q_held = self.keys_held.contains(&KeyCode::KeyQ);
-            let e_held = self.keys_held.contains(&KeyCode::KeyE);
             let strafe_left  = q_held || (self.drag_active && a_held);
             let strafe_right = e_held || (self.drag_active && d_held);
             if strafe_left  { de += right_e; dn += right_n; }
@@ -971,10 +982,12 @@ impl App {
                 self.on_ground = false;
             }
 
-            if de != 0.0 || dn != 0.0 {
-                let len = (de * de + dn * dn).sqrt();
+            if de != 0.0 || dn != 0.0 || dz != 0.0 {
+                // Normalise over 3D so a diagonal swim isn't faster than a flat walk.
+                let len = (de * de + dn * dn + dz * dz).sqrt();
                 de = de / len * MOVE_SPEED * dt;
                 dn = dn / len * MOVE_SPEED * dt;
+                dz = dz / len * MOVE_SPEED * dt;
                 let base = self.override_pos.unwrap_or(self.visual_player_pos);
 
                 // Collision: don't let the player walk through walls. Cast at chest
@@ -1025,7 +1038,12 @@ impl App {
                     base[2]
                 };
                 let geometry_hit = (step_floor - step_fallback).abs() > 0.05;
-                let new_z = if self.on_ground
+                let new_z = if swimming {
+                    // Swimming: move freely in Z by the camera pitch; bypass terrain step-up and
+                    // gravity (the gravity block below is gated on !swimming).
+                    self.on_ground = false;
+                    base[2] + dz
+                } else if self.on_ground
                     && geometry_hit
                     && step_floor > base[2] + 0.1
                     && step_floor - base[2] <= STEP_HEIGHT
@@ -1078,7 +1096,8 @@ impl App {
         // Vertical physics: fall under gravity, land on geometry, jump on spacebar.
         // Replaces the old static ground-snap. The floor query uses the player's current z
         // as anchor so balconies and ceilings above never read as the floor.
-        {
+        // Skipped while swimming, which owns Z directly (camera-pitch driven).
+        if !swimming {
             // Native Titanium fall: internal z-velocity clamps at ±128 EQ/s, and the outgoing
             // position packet's delta_z caps at 12.8/update (~10 Hz → ~128 EQ/s terminal). The old
             // 50/20 guess fell far too slowly. (eq-client-expert; docs/.../falling-physics.md.)
@@ -1148,9 +1167,9 @@ impl App {
                 }
             }
             self.prev_render_pos = self.scene.player_pos;
-            // When rotating with A/D, snap visual_heading immediately for responsive feel.
-            // When following motion, lerp smoothly to avoid jitter from nav steps.
-            if rotating {
+            // When rotating with A/D or steering with the mouse (drive), snap visual_heading
+            // immediately for responsive feel. When following motion, lerp to avoid nav jitter.
+            if rotating || lmb_drive {
                 self.visual_heading = self.heading_target;
             } else {
                 let alpha = 1.0 - (-10.0_f32 * dt).exp();
