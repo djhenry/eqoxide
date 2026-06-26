@@ -247,8 +247,8 @@ pub fn encode_zone_pass(
 
 /// Draw the zone's doors (closed state). Each door uses its object model if loaded, else a
 /// reddish fallback cube at the door position. Per-door model matrix lets Task 9 animate opens.
-/// Doors render untextured (fallback texture + per-mesh base_color) — `load_object_models` does
-/// not carry decoded textures; geometry/placement correctness matters most this task.
+/// Each mesh binds its decoded texture from the shared `door_textures` (by `texture_idx`),
+/// falling back to the white placeholder only when a model/texture is missing.
 ///
 /// Placement (closed): `m = translate(pos) * rotZ(yaw) * rotY(incline) * scale(size/100)`,
 /// `yaw = heading*TAU/512 + FRAC_PI_2`. The door model's origin is the hinge edge (= door.pos),
@@ -264,7 +264,8 @@ pub fn encode_door_pass(
 
     // Phase 1: assign a uniform slot per door, write its model matrix, and record what to draw.
     // (slot_idx, &GpuMesh) — meshes of the same door share that door's slot/matrix.
-    let mut draws: Vec<(usize, &crate::gpu::GpuMesh)> = Vec::new();
+    // (slot, mesh, texture bind group) — None texture falls back to the white placeholder.
+    let mut draws: Vec<(usize, &crate::gpu::GpuMesh, Option<&wgpu::BindGroup>)> = Vec::new();
     let mut slot = 0usize;
     for door in &scene.doors {
         if slot >= r.door_uniform_pool.len() { break; }
@@ -311,7 +312,10 @@ pub fn encode_door_pass(
         r.queue.write_buffer(&r.door_uniform_pool[slot].0, 0,
             bytemuck::bytes_of(&EntityUniform { model: mat.to_cols_array_2d(), tint: [1.0; 4] }));
         for mesh in model_meshes {
-            draws.push((slot, mesh));
+            // Resolve the mesh's decoded texture from the shared door texture set; the fallback
+            // cube has texture_idx None -> white placeholder.
+            let tex_bg = mesh.texture_idx.and_then(|i| r.door_textures.get(i));
+            draws.push((slot, mesh, tex_bg));
         }
         slot += 1;
     }
@@ -333,8 +337,8 @@ pub fn encode_door_pass(
     });
     pass.set_pipeline(&r.pipelines.character);
     pass.set_bind_group(0, &r.camera_uniform.bind_group, &[]);
-    pass.set_bind_group(1, &r.fallback_texture_bg, &[]);
-    for (slot_idx, mesh) in draws {
+    for (slot_idx, mesh, tex_bg) in draws {
+        pass.set_bind_group(1, tex_bg.unwrap_or(&r.fallback_texture_bg), &[]);
         pass.set_bind_group(2, &r.door_uniform_pool[slot_idx].1, &[]);
         pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
         pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
