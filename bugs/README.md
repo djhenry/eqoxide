@@ -13,3 +13,4 @@ expected vs. actual, observations/diagnosis, suspected root cause, and status.
 | [Inventory view desync after turn-in / cursor move](inventory-view-desync-after-turnin-cursor-move.md) | Medium | Open |
 | [Neriak Third Gate library pathing stall](neriakc-library-pathing-stall.md) | Medium | Open |
 | [NPC rat movement jerky despite lerp](npc-rat-movement-jerky-despite-lerp.md) | Low | Open |
+| [/inventory API missing currency amounts](inventory-api-missing-currency.md) | Low-Med | Open |
