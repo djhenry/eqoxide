@@ -197,6 +197,7 @@ OPTIONS:
         let zp  = zone_points.clone();
         let tl  = task_log.clone();
         let zc  = zone_cross.clone();
+        let wp  = warp.clone();
         let hl  = hail.clone();
         let sy  = say.clone();
         let tg  = target.clone();
@@ -224,7 +225,7 @@ OPTIONS:
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, zc, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, ca, ms, st, co, sc, md, sd, cp, cu).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, zc, wp, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, ca, ms, st, co, sc, md, sd, cp, cu).await {
                     tracing::error!("EQ: fatal: {e}");
                 }
             });

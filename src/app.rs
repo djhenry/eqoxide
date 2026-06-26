@@ -743,18 +743,19 @@ impl App {
         // network keeps flowing even on idle frames that don't render. `game_state` is already current
         // here.
 
-        // Process warp requests — teleport directly, bypassing collision.
-        let warp_req = self.warp.lock().unwrap().take();
-        if let Some((wx, wy, wz)) = warp_req {
+        // Warp (POST /warp) is handled authoritatively by the NAV thread (see navigation.rs),
+        // which teleports the server-side position AND cancels any in-progress /goto. We only
+        // PEEK it here for instant local visual feedback (clearing any WASD override so the
+        // render follows the new server position); the nav thread is the slot's sole consumer.
+        // The old code instead wrote the warp coords into goto_target, which made the nav thread
+        // try to *walk* there and stall — a warp could then be dragged back to a stuck path.
+        let warp_peek = *self.warp.lock().unwrap();
+        if let Some((wx, wy, wz)) = warp_peek {
             self.game_state.player_x = wx;
             self.game_state.player_y = wy;
             self.game_state.player_z = wz;
-            self.override_pos = Some([wx, wy, wz]);
             self.visual_player_pos = [wx, wy, wz];
-            self.heading_target = self.game_state.player_heading;
-            self.visual_heading = self.game_state.player_heading;
-            *self.goto_target.lock().unwrap() = Some((wx, wy, wz));
-            tracing::info!("warp: teleported to ({:.1}, {:.1}, {:.1})", wx, wy, wz);
+            self.override_pos = None;
         }
 
         // Ease each door's render fraction toward its server-authoritative open/close target.
@@ -1697,6 +1698,13 @@ impl ApplicationHandler for App {
                                 | KeyCode::KeyQ | KeyCode::KeyE | KeyCode::Space
                                 | KeyCode::ControlLeft | KeyCode::ControlRight => {
                                     self.keys_held.insert(code);
+                                    // Manual movement cancels any in-progress /goto so WASD takes
+                                    // over immediately (jump/crouch don't count as movement).
+                                    if matches!(code, KeyCode::KeyW | KeyCode::KeyA | KeyCode::KeyS
+                                        | KeyCode::KeyD | KeyCode::KeyQ | KeyCode::KeyE)
+                                    {
+                                        *self.goto_target.lock().unwrap() = None;
+                                    }
                                 }
                                 KeyCode::KeyR | KeyCode::F9 => {
                                     self.camera.reset_to_follow();
