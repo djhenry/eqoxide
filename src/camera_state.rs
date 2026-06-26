@@ -6,7 +6,7 @@ pub const ELEVATION_MIN: f32 = 0.08727; // 5°
 pub const ELEVATION_MAX: f32 = 1.39626; // 80°
 pub const RADIUS_MIN:    f32 = 20.0;
 pub const RADIUS_MAX:    f32 = 500.0;
-const DESIRED_ELEVATION: f32 = 0.69813; // 40°
+const DESIRED_ELEVATION: f32 = 0.34907; // 20° (default tilt; restored only by F9/R/reset)
 const DESIRED_RADIUS:    f32 = 80.0;
 /// How high above the player's feet the camera looks. Humanoids are ~20 EQ units
 /// tall, so 5 units targets roughly the mid-torso.
@@ -98,11 +98,12 @@ impl CameraState {
         match self.mode {
             CameraMode::ManualOrbit => {}
             CameraMode::AutoFollow => {
+                // Follow the player's position and swing behind their heading, but DON'T touch
+                // elevation/radius — the user's chosen tilt and zoom persist across movement.
+                // Only reset_to_follow (F9/R/HTTP reset) restores the default tilt and zoom.
                 let alpha     = 1.0 - (-FOLLOW_RATE * dt).exp();
                 self.focus    = lerp3(self.focus, player_pos, alpha);
                 self.azimuth  = des_az;
-                self.elevation = DESIRED_ELEVATION;
-                self.radius   = DESIRED_RADIUS;
             }
         }
 
@@ -127,8 +128,18 @@ impl CameraState {
         self.mode   = CameraMode::ManualOrbit;
     }
 
-    /// Instantly snap back to AutoFollow (R/F9 key or HTTP reset).
+    /// Full reset (R/F9 key or HTTP reset): re-enter AutoFollow AND restore the default
+    /// tilt and zoom. This is the ONLY path that snaps elevation/radius back to defaults.
     pub fn reset_to_follow(&mut self) {
+        self.mode      = CameraMode::AutoFollow;
+        self.elevation = DESIRED_ELEVATION;
+        self.radius    = DESIRED_RADIUS;
+    }
+
+    /// Re-engage heading-follow (camera swings behind the player) while PRESERVING the
+    /// user's chosen tilt and zoom. Used when rotating the character with A/D so the
+    /// camera tracks the new heading without snapping elevation/radius back.
+    pub fn follow_heading(&mut self) {
         self.mode = CameraMode::AutoFollow;
     }
 
@@ -262,6 +273,47 @@ mod tests {
         assert_eq!(cam.mode, CameraMode::ManualOrbit);
         cam.reset_to_follow();
         assert_eq!(cam.mode, CameraMode::AutoFollow);
+    }
+
+    #[test]
+    fn autofollow_tick_preserves_manual_tilt_and_zoom() {
+        // After zooming/tilting then re-engaging follow, movement must NOT snap tilt/zoom back.
+        let mut cam = CameraState::new([0.0, 0.0, 0.0], 0.0);
+        cam.elevation = 0.9;
+        cam.radius    = 150.0;
+        cam.follow_heading(); // back to AutoFollow without resetting tilt/zoom
+        cam.tick(0.016, [10.0, 10.0, 0.0], 90.0); // player moves + turns
+        assert!((cam.elevation - 0.9).abs() < 1e-6, "tilt snapped back: {}", cam.elevation);
+        assert!((cam.radius - 150.0).abs() < 1e-6, "zoom snapped back: {}", cam.radius);
+        assert_eq!(cam.mode, CameraMode::AutoFollow);
+    }
+
+    #[test]
+    fn reset_to_follow_restores_default_tilt_and_zoom() {
+        // F9/R is the ONLY path that restores defaults.
+        let mut cam = CameraState::new([0.0, 0.0, 0.0], 0.0);
+        cam.elevation = 0.9;
+        cam.radius    = 150.0;
+        cam.reset_to_follow();
+        assert!((cam.elevation - DESIRED_ELEVATION).abs() < 1e-6);
+        assert!((cam.radius - DESIRED_RADIUS).abs() < 1e-6);
+    }
+
+    #[test]
+    fn follow_heading_keeps_tilt_and_zoom() {
+        let mut cam = CameraState::new([0.0, 0.0, 0.0], 0.0);
+        cam.apply_orbit_delta(0.3, 0.2);
+        cam.apply_zoom(-0.5);
+        let (el, r) = (cam.elevation, cam.radius);
+        cam.follow_heading();
+        assert_eq!(cam.mode, CameraMode::AutoFollow);
+        assert!((cam.elevation - el).abs() < 1e-6);
+        assert!((cam.radius - r).abs() < 1e-6);
+    }
+
+    #[test]
+    fn default_elevation_is_twenty_degrees() {
+        assert!((DESIRED_ELEVATION - 20.0_f32.to_radians()).abs() < 1e-4);
     }
 
     #[test]
