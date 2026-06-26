@@ -89,6 +89,10 @@ pub struct App {
     camera_cmd:         Arc<Mutex<Option<CameraCmd>>>,
     camera_snapshot:    Arc<Mutex<CameraSnapshot>>,
     camera_initialized: bool,
+    /// Set on every zone change. While true, the first frame with loaded collision settles the
+    /// player onto the NEAREST floor (above or below), fixing zone-ins where the zone-point z is
+    /// below the actual floor (the per-frame snap only probes downward and can't lift them).
+    needs_reground:     bool,
     last_frame_time:    std::time::Instant,
     fps_frame_count:    u32,
     fps_timer:          std::time::Instant,
@@ -263,6 +267,7 @@ impl App {
             camera: CameraState::new([0.0, 0.0, 0.0], 0.0),
             camera_cmd, camera_snapshot,
             camera_initialized: false,
+            needs_reground: false,
             last_frame_time: std::time::Instant::now(),
             fps_frame_count: 0,
             fps_timer: std::time::Instant::now(),
@@ -905,6 +910,14 @@ impl App {
             self.loading       = true;
             self.pending_reload = true;
             self.current_zone  = self.scene.zone.clone();
+            // Drop the OLD zone's collision immediately so nothing grounds against or collides with
+            // stale geometry while the new zone loads (the player is already at new-zone coords).
+            // The new collision is swapped in atomically when the load completes.
+            self.collision = None;
+            *self.shared_collision.write().unwrap() = None;
+            // The new zone's floor may sit above the zone-point spawn z; settle onto it once
+            // collision loads (see the reground block in the vertical-physics section below).
+            self.needs_reground = true;
         }
 
         // Fresh `now` for the FPS timer; `dt` and `last_frame_time` were already updated at top.
@@ -1128,6 +1141,38 @@ impl App {
             // 50/20 guess fell far too slowly. (eq-client-expert; docs/.../falling-physics.md.)
             const GRAVITY: f32       = 120.0; // EQ units/s² (reaches ~128 terminal in ~1s)
             const MAX_FALL: f32      = 128.0; // EQ units/s terminal velocity (native internal clamp)
+
+            // One-shot reground after a zone change: the zone-point spawn z can be well BELOW the
+            // zone's floor, and the downward-only ground-snap below can't lift the player (it would
+            // leave them buried). ONLY when the player is actually below the floor (no floor found
+            // beneath them) do we lift to the nearest floor above; a normal spawn at/above a floor
+            // is left to the regular gravity/snap. Gated on !loading so it runs against the NEW
+            // zone's collision (swapped in atomically with loading=false), never the old zone's.
+            if self.needs_reground && !self.loading {
+                if let Some(c) = self.collision.as_deref() {
+                    let pp = self.scene.player_pos;
+                    // floor_z returns the fallback (== pp[2]) when no surface is found below.
+                    let no_floor_below = (c.floor_z(pp[0], pp[1], pp[2]) - pp[2]).abs() < 0.01;
+                    if no_floor_below {
+                        // Buried: find the floor above (generous up band) and lift onto it.
+                        const REGROUND_UP: f32 = 200.0;
+                        if let Some(f) = c.nearest_floor(pp[0], pp[1], pp[2], REGROUND_UP, 0.0) {
+                            self.scene.player_pos[2]  = f;
+                            self.visual_player_pos[2] = f;
+                            self.camera.focus[2]      = f;
+                            if let Some(ref mut op) = self.override_pos { op[2] = f; }
+                            self.vert_vel  = 0.0;
+                            self.on_ground = true;
+                            self.needs_reground = false;
+                            tracing::info!("zone-in: regrounded player from {:.1} up to floor z={:.1}", pp[2], f);
+                        }
+                        // else: collision not ready / no floor found yet — retry next frame.
+                    } else {
+                        // Already at/above a floor — let normal physics settle; nothing to recover.
+                        self.needs_reground = false;
+                    }
+                }
+            }
 
             let p = self.scene.player_pos; // [east, north, z]
             // floor_z with anchor = p[2]: ray_start = p[2]+2, finds surfaces at or below that.
