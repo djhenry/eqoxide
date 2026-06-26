@@ -130,9 +130,13 @@ pub struct EqRenderer {
     /// Held weapon models cached by IDFile. `None` = tried and not found (negative cache).
     pub weapon_cache: std::collections::HashMap<String, Option<crate::gpu::GpuWeapon>>,
     /// Door object models, keyed by UPPERCASE base name (e.g. "DOOR1"). Rebuilt per zone load.
-    /// Drawn untextured with the fallback texture + per-mesh base_color (object models from
-    /// `load_object_models` do not carry decoded textures the way weapons do).
     pub door_models: std::collections::HashMap<String, crate::gpu::GpuWeapon>,
+    /// Shared decoded textures for ALL door models in the current zone. A door mesh's
+    /// `texture_idx` indexes into this; `None` (or out of range) draws the white fallback.
+    pub door_textures: Vec<wgpu::BindGroup>,
+    /// Per-door-model local-space AABB (min, max) in render space (pre-placement), used to
+    /// build a click hit-box that matches the door's real size instead of a tiny sphere.
+    pub door_bounds: std::collections::HashMap<String, ([f32; 3], [f32; 3])>,
     /// Dedicated per-frame uniform pool for door draws (kept separate from the entity pool to
     /// avoid frame-collision with the entity pass).
     pub door_uniform_pool: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
@@ -249,6 +253,8 @@ impl EqRenderer {
             assets_path: std::path::PathBuf::new(),
             weapon_cache: std::collections::HashMap::new(),
             door_models: std::collections::HashMap::new(),
+            door_textures: Vec::new(),
+            door_bounds: std::collections::HashMap::new(),
             door_uniform_pool,
             warned_missing_doors: std::collections::HashSet::new(),
             door_fallback,
@@ -755,15 +761,16 @@ impl EqRenderer {
 
     /// Load + GPU-upload the door/object models for a zone. Clears any previously loaded
     /// door models first (zone reload). Models are uploaded with the same libeq→render axis
-    /// swap as weapons/zone meshes. Object models from `load_object_models` do not carry
-    /// decoded textures, so doors are drawn untextured (fallback texture + per-mesh base_color)
-    /// in `encode_door_pass`; geometry/placement correctness matters most this task.
+    /// swap as weapons/zone meshes. Textures from `load_object_models` are uploaded into the
+    /// shared `door_textures` and linked per mesh by `texture_idx`. Per-model local AABBs are
+    /// recorded in `door_bounds` for click-picking.
     pub fn load_door_models(&mut self, main_s3d: &std::path::Path, obj_s3d: &std::path::Path) {
         use wgpu::util::DeviceExt;
         self.door_models.clear();
+        self.door_bounds.clear();
         self.warned_missing_doors.clear();
 
-        let models = match crate::assets::load_object_models(main_s3d, obj_s3d) {
+        let (models, textures) = match crate::assets::load_object_models(main_s3d, obj_s3d) {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!("doors: load_object_models failed ({}); doors will use fallback boxes", e);
@@ -771,8 +778,17 @@ impl EqRenderer {
             }
         };
 
+        // Upload the door textures once into the shared `door_textures`; meshes reference them
+        // by global index (texture_idx). wgpu::BindGroup isn't Clone, so we keep one shared set.
+        let (_tex, door_bgs) = crate::gpu::upload_textures(
+            &self.device, &self.queue, &textures, &self.layouts.texture_bgl);
+        let tex_names: Vec<String> = textures.iter().map(|t| t.name.clone()).collect();
+        self.door_textures = door_bgs;
+
         for (name, meshes) in models {
             let mut gpu_meshes = Vec::new();
+            let mut bmin = [f32::MAX; 3];
+            let mut bmax = [f32::MIN; 3];
             for m in &meshes {
                 if m.positions.is_empty() || m.indices.is_empty() { continue; }
                 let [cx, cy, cz] = m.center;
@@ -785,20 +801,27 @@ impl EqRenderer {
                         uv:       m.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
                     }
                 }).collect();
+                for v in &verts {
+                    for k in 0..3 { bmin[k] = bmin[k].min(v.position[k]); bmax[k] = bmax[k].max(v.position[k]); }
+                }
                 let vertex_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("door_vbuf"), contents: bytemuck::cast_slice(&verts),
                     usage: wgpu::BufferUsages::VERTEX });
                 let index_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("door_ibuf"), contents: bytemuck::cast_slice(&m.indices),
                     usage: wgpu::BufferUsages::INDEX });
+                // Link the mesh to its decoded texture by name (lowercased); None -> fallback white.
+                let texture_idx = m.texture_name.as_ref()
+                    .and_then(|tn| tex_names.iter().position(|t| t == &tn.to_lowercase()));
                 gpu_meshes.push(GpuMesh {
                     vertex_buf, index_buf, index_count: m.indices.len() as u32,
-                    // No carried textures: draw untextured (texture_idx None -> fallback texture bg).
-                    texture_idx: None, base_color: m.base_color,
+                    texture_idx, base_color: m.base_color,
                     render_mode: crate::assets::RenderMode::Opaque, anim: None });
             }
             if gpu_meshes.is_empty() { continue; }
-            // texture_bind_groups intentionally empty — doors render with the fallback texture.
+            self.door_bounds.insert(name.clone(), (bmin, bmax));
+            // texture_bind_groups stays empty: textures are shared via self.door_textures and
+            // referenced by each mesh's (global) texture_idx.
             self.door_models.insert(name, crate::gpu::GpuWeapon {
                 meshes: gpu_meshes, texture_bind_groups: Vec::new() });
         }

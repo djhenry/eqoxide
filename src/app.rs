@@ -374,19 +374,35 @@ impl App {
             }
         }
 
-        // Doors as bounding spheres (center lifted ~2 units; radius ~person-sized).
-        const DOOR_R: f32 = 3.0;
+        // Doors: test against the door's real, oriented bounding box so the click target matches
+        // the rendered door (the old 3-unit sphere was far smaller than most doors). Bounds come
+        // from the loaded door model (render-space local AABB); missing models use a small default
+        // cube matching the fallback box. The box is placed exactly like encode_door_pass:
+        // T(pos) * Rz(yaw) * S(size/100). Incline is ignored for picking (negligible).
+        let door_bounds = self.gpu.as_ref().map(|(_, r)| &r.door_bounds);
+        const DEFAULT_DOOR_AABB: ([f32; 3], [f32; 3]) = ([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]);
         for d in self.game_state.doors.values() {
-            let center = glam::Vec3::new(d.x, d.y, d.z + 2.0);
-            let oc = ray_origin - center;
-            let b  = oc.dot(ray_dir);
-            let c  = oc.dot(oc) - DOOR_R * DOOR_R;
-            let disc = b * b - c;
-            if disc < 0.0 { continue; }
-            let t = -b - disc.sqrt();
-            if t > 0.0 && t < best_t {
-                best_t = t;
-                best   = Some(PickResult::Door(d.door_id));
+            let (bmin, bmax) = door_bounds
+                .and_then(|b| b.get(&d.name.to_uppercase()))
+                .copied()
+                .unwrap_or(DEFAULT_DOOR_AABB);
+            let scale = (d.size as f32 / 100.0).max(1e-3);
+            let yaw   = (d.heading / 512.0) * std::f32::consts::TAU + std::f32::consts::FRAC_PI_2;
+            let placement = glam::Mat4::from_translation(glam::Vec3::new(d.x, d.y, d.z))
+                * glam::Mat4::from_rotation_z(yaw)
+                * glam::Mat4::from_scale(glam::Vec3::splat(scale));
+            let inv = placement.inverse();
+            let lo  = inv.transform_point3(ray_origin);
+            let ld  = inv.transform_vector3(ray_dir);
+            if let Some(t_local) = crate::camera::ray_aabb(lo.to_array(), ld.to_array(), bmin, bmax) {
+                // Convert the local-space hit back to a world-space distance for fair comparison
+                // with the entity hits above (local `dir` is unnormalised by the inverse scale).
+                let world_hit = placement.transform_point3(lo + ld * t_local);
+                let t_world = (world_hit - ray_origin).dot(ray_dir);
+                if t_world > 0.0 && t_world < best_t {
+                    best_t = t_world;
+                    best   = Some(PickResult::Door(d.door_id));
+                }
             }
         }
 

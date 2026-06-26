@@ -1059,17 +1059,33 @@ fn read_object_meshes(s3d: &Path) -> Result<Vec<(String, MeshData)>> {
 pub fn load_object_models(
     main_s3d: &Path,
     obj_s3d: &Path,
-) -> Result<std::collections::HashMap<String, Vec<MeshData>>> {
-    use std::collections::HashMap;
+) -> Result<(std::collections::HashMap<String, Vec<MeshData>>, Vec<TextureData>)> {
+    use std::collections::{HashMap, HashSet};
     let mut models: HashMap<String, Vec<MeshData>> = HashMap::new();
+    let mut textures: Vec<TextureData> = Vec::new();
+    let mut seen_tex: HashSet<String> = HashSet::new();
     for s3d in [obj_s3d, main_s3d] {
         if !s3d.exists() { continue; }
         let pairs = match read_object_meshes(s3d) { Ok(p) => p, Err(_) => continue };
+        // Decode each referenced texture from THIS archive (door bitmaps live alongside the
+        // meshes that use them, like weapons in gequip*.s3d). Deduped by name; a name not yet
+        // loaded is retried against the next archive.
+        for (_base, mesh) in &pairs {
+            if let Some(tn) = &mesh.texture_name {
+                let lower = tn.to_lowercase();
+                if !seen_tex.contains(&lower) {
+                    if let Some(td) = load_one_texture_from_s3d(s3d, &lower) {
+                        seen_tex.insert(lower);
+                        textures.push(td);
+                    }
+                }
+            }
+        }
         for (base, mesh) in pairs {
             models.entry(base.to_uppercase()).or_default().push(mesh);
         }
     }
-    Ok(models)
+    Ok((models, textures))
 }
 
 /// Index every BMP/DDS texture filename in an S3D archive to its path (lowercase keys).
@@ -1345,7 +1361,7 @@ mod tests {
         let main = ap.join("qeynos.s3d");
         let obj  = ap.join("qeynos_obj.s3d");
         if !main.exists() { tracing::warn!("assets missing; skipping"); return; }
-        let models = load_object_models(&main, &obj).expect("load");
+        let (models, _textures) = load_object_models(&main, &obj).expect("load");
         assert!(models.contains_key("DOOR1"), "DOOR1 not found; keys (sample): {:?}",
                 models.keys().filter(|k| k.contains("DOOR") || k.starts_with("PORT"))
                       .collect::<Vec<_>>());

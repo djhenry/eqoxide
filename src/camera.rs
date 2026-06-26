@@ -140,6 +140,31 @@ pub fn camera_move_dir(azimuth: f32, elevation: f32, vertical: bool) -> [f32; 3]
     }
 }
 
+/// Ray vs axis-aligned box (slab method). Returns the nearest non-negative hit distance `t`
+/// (parameter along `dir`, which need NOT be unit length), or `None` if the ray misses or the
+/// box is entirely behind the origin. If the origin is inside the box, returns 0. Used for
+/// door click-picking: transform the world ray into a door's local space, then test its AABB.
+pub fn ray_aabb(origin: [f32; 3], dir: [f32; 3], min: [f32; 3], max: [f32; 3]) -> Option<f32> {
+    let mut tmin = f32::NEG_INFINITY;
+    let mut tmax = f32::INFINITY;
+    for k in 0..3 {
+        if dir[k].abs() < 1e-9 {
+            // Ray parallel to this slab: miss unless the origin is within the slab.
+            if origin[k] < min[k] || origin[k] > max[k] { return None; }
+        } else {
+            let inv = 1.0 / dir[k];
+            let mut t1 = (min[k] - origin[k]) * inv;
+            let mut t2 = (max[k] - origin[k]) * inv;
+            if t1 > t2 { std::mem::swap(&mut t1, &mut t2); }
+            tmin = tmin.max(t1);
+            tmax = tmax.min(t2);
+            if tmin > tmax { return None; }
+        }
+    }
+    if tmax < 0.0 { return None; }
+    Some(tmin.max(0.0))
+}
+
 /// Visibility test for entity culling. Returns true if an entity standing at `pos`
 /// (its feet) should be rendered, given the player position and the view-projection
 /// matrix. Culls in two cheap ways:
@@ -287,6 +312,43 @@ mod tests {
     #[test]
     fn entity_in_view_centered_is_visible() {
         assert!(entity_in_view([0.0, 0.0, 0.0], [0.0, 0.0, 0.0], cull_vp(), 500.0, 0.5));
+    }
+
+    #[test]
+    fn ray_aabb_hits_box_ahead() {
+        // Ray from -10 on X heading +X into a unit box at origin: enters at x=-1 => t=9.
+        let t = ray_aabb([-10.0, 0.0, 0.0], [1.0, 0.0, 0.0], [-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]);
+        assert!(t.is_some());
+        assert!((t.unwrap() - 9.0).abs() < 1e-4, "t={:?}", t);
+    }
+
+    #[test]
+    fn ray_aabb_misses_box_to_the_side() {
+        // Parallel offset above the box on Z: never enters.
+        let t = ray_aabb([-10.0, 0.0, 5.0], [1.0, 0.0, 0.0], [-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]);
+        assert!(t.is_none(), "expected miss, got {:?}", t);
+    }
+
+    #[test]
+    fn ray_aabb_box_behind_origin_is_none() {
+        // Box is behind the ray (heading +X away from a box at negative X).
+        let t = ray_aabb([10.0, 0.0, 0.0], [1.0, 0.0, 0.0], [-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]);
+        assert!(t.is_none(), "expected none, got {:?}", t);
+    }
+
+    #[test]
+    fn ray_aabb_origin_inside_returns_zero() {
+        let t = ray_aabb([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]);
+        assert_eq!(t, Some(0.0));
+    }
+
+    #[test]
+    fn ray_aabb_larger_box_is_easier_to_hit_than_small() {
+        // A glancing ray that misses a small box hits a tall one (the door-size fix in miniature).
+        let origin = [-10.0, 0.0, 3.0];
+        let dir = [1.0, 0.0, 0.0];
+        assert!(ray_aabb(origin, dir, [-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]).is_none());
+        assert!(ray_aabb(origin, dir, [-1.0, -1.0, -8.0], [1.0, 1.0, 8.0]).is_some());
     }
 
     #[test]
