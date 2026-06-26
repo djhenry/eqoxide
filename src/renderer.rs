@@ -18,6 +18,9 @@ pub struct EntityAnimState {
     /// models with no real idle, e.g. the Skeleton). We freeze such clips at a
     /// static frame so the character stands still instead of walking in place.
     pub animate:     bool,
+    /// Idle-cycle phase: incremented each time an idle clip completes a loop, used to alternate
+    /// the neutral stand with periodic fidget animations (see `SkinData::idle_clip_for_phase`).
+    pub idle_phase:  u32,
 }
 
 /// Pre-allocated entity uniform buffer slot count.
@@ -823,13 +826,21 @@ impl EqRenderer {
                 .or_else(|| self.gpu_character_models.get(&(key, 0)));
             let Some(GpuModel::Skinned(skinned)) = model else { continue };
 
+            let is_idle = matches!(*action, "idle" | "standing" | "wait");
+
             let state = self.anim_states.entry(*id).or_insert_with(|| {
                 let clip_idx = skinned.skin.clip_for_action("walking").unwrap_or(0);
-                EntityAnimState { clip_idx, time: 0.0, last_action: String::new(), animate: true }
+                EntityAnimState { clip_idx, time: 0.0, last_action: String::new(), animate: true, idle_phase: 0 }
             });
 
             if *action != state.last_action {
-                state.clip_idx    = skinned.skin.clip_for_action(action).unwrap_or(0);
+                // Idle starts on its neutral stand (phase 0); other actions resolve their clip directly.
+                state.idle_phase  = 0;
+                state.clip_idx    = if is_idle {
+                    skinned.skin.idle_clip_for_phase(0)
+                } else {
+                    skinned.skin.clip_for_action(action)
+                }.unwrap_or(0);
                 state.time        = 0.0;
                 state.last_action = action.to_string();
                 state.animate     = skinned.skin.action_animates(action, state.clip_idx);
@@ -847,7 +858,21 @@ impl EqRenderer {
             if state.animate && *action != "dead" && !skinned.skin.clips.is_empty() {
                 let dur = skinned.skin.clips[state.clip_idx].duration;
                 if dur > 0.0 {
-                    state.time = (state.time + dt) % dur;
+                    let next = state.time + dt;
+                    if next >= dur {
+                        state.time = next % dur;
+                        // On each completed idle loop, advance the cycle so the character
+                        // alternates the neutral stand with periodic fidgets (like native).
+                        if is_idle {
+                            state.idle_phase = state.idle_phase.wrapping_add(1);
+                            if let Some(ci) = skinned.skin.idle_clip_for_phase(state.idle_phase) {
+                                state.clip_idx = ci;
+                                state.animate = skinned.skin.action_animates(action, ci);
+                            }
+                        }
+                    } else {
+                        state.time = next;
+                    }
                 }
             }
         }

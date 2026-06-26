@@ -847,7 +847,11 @@ fn anim_label(code3: &str) -> Option<&'static str> {
         "P03" => "crouch",
         "P06" => "kneel",
         "P07" => "swim_idle",
-        "O01" | "O02" | "O03" => "idle",
+        // Only O01/O02 are standing idle fidgets ("standby"/"standby2"). O03 is a low
+        // crouched/looting pose, NOT a standing idle — keep it out of the "idle" label so the
+        // client's idle cycle never selects it. Confirmed vs the Titanium client + EQEmu.
+        "O01" | "O02" => "idle",
+        "O03" => "looting",
         c if c.starts_with('C') => "combat",
         "D05" => "death",
         c if c.starts_with('D') => "hit",
