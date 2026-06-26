@@ -46,5 +46,24 @@ Note: the mismatch between the EQEmu zone-point `server_z` and the client's
 rendered/collision floor height is the trigger; the one-directional snap is what
 makes it unrecoverable.
 
+## Resolution
+Two complementary fixes (branch `worktree-zone-in-z-fix`):
+
+1. **Clear the old zone's collision on zone change** (the primary fix). The
+   ground-snap was querying the *previous* zone's collision while the player
+   already stood at new-zone coordinates, so it never found the real floor and
+   left the player at the raw spawn z. `App` now drops `collision` /
+   `shared_collision` the instant a zone change is detected; the new zone's
+   collision is swapped in atomically when the load completes.
+2. **One-shot reground for genuinely-below-floor spawns** (safety net). After a
+   zone change, the first frame with loaded collision checks whether there is no
+   floor *below* the player; if so it lifts them to the nearest floor *above*
+   (`Collision::nearest_floor` with an upward band) instead of only probing
+   downward.
+
+Verified live: two gfaydark→felwithea round-trips — the player now stands on the
+floor at the zone-in (was buried to the chest). Also caught a small gfaydark
+below-floor spawn (`-3.8 → 0.0`).
+
 ## Status
-Open — assigned for fix.
+Fixed — branch `worktree-zone-in-z-fix`.

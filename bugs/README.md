@@ -9,4 +9,4 @@ expected vs. actual, observations/diagnosis, suspected root cause, and status.
 | Bug | Severity | Status |
 |-----|----------|--------|
 | [gfaydark platform pathing stall](gfaydark-platform-pathing-stall.md) | Medium | Open |
-| [Zone-in below-floor burial](zone-in-below-floor-burial.md) | Medium | Open |
+| [Zone-in below-floor burial](zone-in-below-floor-burial.md) | Medium | Fixed |

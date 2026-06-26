@@ -1311,6 +1311,34 @@ mod tests {
             "no geometry should never block movement");
     }
 
+    /// Zone-in reground premise: a player spawned BELOW the floor must be recoverable.
+    /// `floor_z` only probes downward and can't see a floor above; `nearest_floor` with an
+    /// upward band finds it. (Mirrors the felwithe zone-in burial: spawn z=4, floor ~20.)
+    #[test]
+    fn nearest_floor_finds_floor_above_a_below_floor_spawn() {
+        // Floor quad at height z=10 spanning east/north [0,10]; libeq pos = [east, height, north].
+        let floor = MeshData {
+            positions: vec![[0.0, 10.0, 0.0], [10.0, 10.0, 0.0], [10.0, 10.0, 10.0], [0.0, 10.0, 10.0]],
+            normals: vec![[0.0, 1.0, 0.0]; 4],
+            uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            texture_name: None,
+            base_color: [1.0; 4],
+            center: [0.0, 0.0, 0.0],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let col = Collision::build(&ZoneAssets { terrain: vec![floor], objects: vec![], textures: vec![] }, 4.0);
+
+        // Player "spawned" at z=2, 8 units BELOW the floor at z=10.
+        // Downward-only floor_z can't reach it -> returns the fallback unchanged (buried).
+        assert!((col.floor_z(3.0, 3.0, 2.0) - 2.0).abs() < 1e-3,
+            "floor_z should not find a floor above the anchor");
+        // nearest_floor with an upward band finds the floor at z=10 and lifts the player.
+        let f = col.nearest_floor(3.0, 3.0, 2.0, 80.0, 300.0);
+        assert!(f.is_some(), "nearest_floor should find the floor above");
+        assert!((f.unwrap() - 10.0).abs() < 1e-3, "expected floor z=10, got {:?}", f);
+    }
+
     #[test]
     fn find_path_routes_around_a_partial_wall() {
         // 20x20 floor at z=0.
