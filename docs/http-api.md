@@ -253,8 +253,11 @@ The player's current inventory + equipment (published each tick).
 ```json
 { "count": 1, "items": [
   { "slot": 30, "item_id": 13516, "name": "Ruined Miner's Tunic*", "charges": 1, "icon": 678, "idfile": "IT63" }
-] }
+], "currency": { "platinum": 0, "gold": 0, "silver": 0, "copper": 0 } }
 ```
+
+`currency` is the coin on hand (from the player profile). The same `currency` object is also on
+`GET /debug` under `player`. Use it to check affordability before a `/buy`.
 
 `slot` is the Titanium **wire** slot — the exact number to pass to `/give` and `/inventory/move`
 (see the wire-slot warning above; it's one less than the EQEmu DB `slot_id` for general slots). Use

@@ -189,8 +189,20 @@ pub struct PlayerState {
     pub server_corrections: u32,
     pub mem_spells:   [u32; 9],
     pub target_id:    Option<u32>,
+    /// Coin on hand: [platinum, gold, silver, copper], from the player profile.
+    pub coin:         [u32; 4],
 }
 pub type PlayerInfo = Arc<Mutex<PlayerState>>;
+
+/// Render coin `[platinum, gold, silver, copper]` as a JSON object for the API.
+fn currency_json(coin: [u32; 4]) -> serde_json::Value {
+    serde_json::json!({
+        "platinum": coin[0],
+        "gold":     coin[1],
+        "silver":   coin[2],
+        "copper":   coin[3],
+    })
+}
 
 #[derive(Clone)]
 struct HttpState {
@@ -977,7 +989,12 @@ async fn post_give(
 /// slot holds an item before giving/equipping it.
 async fn get_inventory(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let items = s.inventory.lock().unwrap().clone();
-    Json(serde_json::json!({ "count": items.len(), "items": items }))
+    let coin  = s.player_info.lock().unwrap().coin;
+    Json(serde_json::json!({
+        "count": items.len(),
+        "items": items,
+        "currency": currency_json(coin),
+    }))
 }
 
 #[derive(serde::Deserialize)]
@@ -1136,6 +1153,7 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             "heading_ccw": player.heading_ccw,
             "heading_cw":  player.heading_cw,
             "server_corrections": player.server_corrections,
+            "currency":    currency_json(player.coin),
         },
         "camera": {
             "azimuth_deg":   cam.azimuth.to_degrees(),
@@ -1163,5 +1181,26 @@ async fn get_frame(State(s): State<HttpState>) -> Response {
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .body(Body::from("renderer not ready"))
             .unwrap(),
+    }
+}
+
+#[cfg(test)]
+mod currency_tests {
+    use super::currency_json;
+
+    #[test]
+    fn currency_json_maps_coin_slots_to_named_fields() {
+        let v = currency_json([12, 3, 45, 6]);
+        assert_eq!(v["platinum"], 12);
+        assert_eq!(v["gold"], 3);
+        assert_eq!(v["silver"], 45);
+        assert_eq!(v["copper"], 6);
+    }
+
+    #[test]
+    fn currency_json_all_zero() {
+        let v = currency_json([0, 0, 0, 0]);
+        assert_eq!(v["platinum"], 0);
+        assert_eq!(v["copper"], 0);
     }
 }

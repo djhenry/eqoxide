@@ -787,6 +787,7 @@ impl App {
                 server_corrections: gs.server_corrections,
                 mem_spells: gs.mem_spells,
                 target_id:  gs.target_id,
+                coin:       gs.coin,
             };
         }
 
