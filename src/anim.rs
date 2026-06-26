@@ -271,6 +271,42 @@ impl SkinData {
         }
     }
 
+    /// Lively idle "fidget" animations (look around, shift weight, etc.) that the native client
+    /// plays periodically over the near-static neutral stand. Excludes the neutral idle, held
+    /// poses, and held-item variants. Prefers the full-body "A" variant over the upper-body "B".
+    pub fn idle_fidget_clips(&self) -> Vec<usize> {
+        let base = self.clip_for_action("idle"); // the neutral stand — not itself a fidget
+        self.clips.iter().enumerate().filter_map(|(i, c)| {
+            if Some(i) == base { return None; }
+            let n = c.name.to_lowercase();
+            let is_idle = n.contains("idle")
+                && !n.contains("neutral")  // the near-static base stand handled by clip_for_action
+                && !n.contains("swim") && !n.contains("crouch") && !n.contains("sitting")
+                && !n.contains("gun") && !n.contains("sword") && !n.contains("pistol")
+                && !n.contains("torch");
+            // Skip the upper-body-only "B" duplicate (code is 3 chars, then 'A'/'B').
+            let is_a = !matches!(n.as_bytes().get(3), Some(&b'b'));
+            (is_idle && is_a).then_some(i)
+        }).collect()
+    }
+
+    /// The idle clip to show for a given cycle `phase` (incremented each time the current idle clip
+    /// finishes a loop). Mostly the neutral stand; every 3rd phase a fidget, rotating through the
+    /// fidget set — so a character stands quietly with an occasional idle animation, like native.
+    /// Falls back to the plain idle clip when the model has no fidgets.
+    pub fn idle_clip_for_phase(&self, phase: u32) -> Option<usize> {
+        let neutral = self.clip_for_action("idle");
+        let fidgets = self.idle_fidget_clips();
+        if fidgets.is_empty() {
+            return neutral;
+        }
+        if phase % 3 == 2 {
+            Some(fidgets[(phase as usize / 3) % fidgets.len()])
+        } else {
+            neutral
+        }
+    }
+
     pub fn bind_pose(&self) -> Vec<[[f32; 4]; 4]> {
         // Proper rest-pose skinning matrices (global_rest * inv_bind), NOT identity.
         // Identity only reproduces the rest pose for models whose raw mesh is already
@@ -481,5 +517,55 @@ mod tests {
         let skin = action_skin(); // clip 0 is "Spider_Idle"
         assert!(skin.action_animates("idle", 0), "a real idle clip should animate");
         assert!(skin.action_animates("walking", 1), "walking should animate");
+    }
+
+    /// A humanoid-style skin with the EQ idle clip naming: a neutral stand plus O-series fidgets
+    /// (A and B variants) and a walk, mirroring `race_elf.glb`.
+    fn humanoid_idle_skin() -> SkinData {
+        let names = [
+            "P01A_idle_neutral", "O01A_idle", "O01B_idle", "O02A_idle", "O02B_idle",
+            "O03A_idle", "O03B_idle", "L01A_walk",
+        ];
+        let (rest_translations, rest_rotations, rest_scales) = default_rest(3);
+        SkinData {
+            joint_count: 3,
+            parents: vec![None, Some(0), Some(1)],
+            inv_bind: vec![identity_mat(); 3],
+            clips: names.iter().map(|n| AnimClip {
+                name: n.to_string(), duration: 2.0, channels: vec![make_channel(0)],
+            }).collect(),
+            rest_translations, rest_rotations, rest_scales,
+            ground_probes: vec![],
+        }
+    }
+
+    #[test]
+    fn idle_fidget_clips_are_the_a_variant_o_series() {
+        let skin = humanoid_idle_skin();
+        // O01A_idle=1, O02A_idle=3, O03A_idle=5 — the A-variant fidgets, not neutral, not B, not walk.
+        assert_eq!(skin.idle_fidget_clips(), vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn idle_phase_cycles_neutral_then_fidget() {
+        let skin = humanoid_idle_skin();
+        let neutral = skin.clip_for_action("idle"); // P01A_idle_neutral = 0
+        assert_eq!(neutral, Some(0));
+        // Two neutral phases, then a fidget, rotating through O01A/O02A/O03A.
+        assert_eq!(skin.idle_clip_for_phase(0), Some(0), "phase 0 → neutral");
+        assert_eq!(skin.idle_clip_for_phase(1), Some(0), "phase 1 → neutral");
+        assert_eq!(skin.idle_clip_for_phase(2), Some(1), "phase 2 → fidget O01A");
+        assert_eq!(skin.idle_clip_for_phase(3), Some(0), "phase 3 → neutral");
+        assert_eq!(skin.idle_clip_for_phase(5), Some(3), "phase 5 → fidget O02A");
+        assert_eq!(skin.idle_clip_for_phase(8), Some(5), "phase 8 → fidget O03A");
+        assert_eq!(skin.idle_clip_for_phase(11), Some(1), "phase 11 → fidget wraps to O01A");
+    }
+
+    #[test]
+    fn idle_phase_falls_back_to_neutral_without_fidgets() {
+        let skin = action_skin(); // only Spider_Idle (no O-series fidgets)
+        assert!(skin.idle_fidget_clips().is_empty());
+        assert_eq!(skin.idle_clip_for_phase(2), skin.clip_for_action("idle"),
+            "no fidgets → always the plain idle clip");
     }
 }
