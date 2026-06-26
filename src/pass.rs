@@ -190,7 +190,7 @@ pub fn encode_zone_pass(
     // Draw the static terrain meshes whose render_mode is in `modes`, with `pipeline`.
     // Opaque + masked share the opaque pipeline (masked discards in-shader, depth-write
     // on); blend/additive run after with their own depth-write-off pipelines.
-    let mut draw_static = |pass: &mut wgpu::RenderPass<'_>, pipeline, modes: &[RenderMode]| {
+    let draw_static = |pass: &mut wgpu::RenderPass<'_>, pipeline, modes: &[RenderMode]| {
         let mut bound = false;
         let mut current_tex: Option<usize> = None;
         for mesh in &r.gpu_meshes {
@@ -214,7 +214,7 @@ pub fn encode_zone_pass(
     draw_static(&mut pass, &r.pipelines.zone, &[RenderMode::Opaque, RenderMode::Masked]);
 
     // ── GPU-instanced placed objects ───────────────────────────────────────
-    let mut draw_instanced = |pass: &mut wgpu::RenderPass<'_>, pipeline, modes: &[RenderMode]| {
+    let draw_instanced = |pass: &mut wgpu::RenderPass<'_>, pipeline, modes: &[RenderMode]| {
         let mut bound = false;
         let mut current_tex: Option<usize> = None;
         for mesh in &r.gpu_instanced {
