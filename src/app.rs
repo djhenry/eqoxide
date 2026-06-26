@@ -933,8 +933,9 @@ impl App {
             if rotating {
                 if a_held { self.heading_target = (self.heading_target - TURN_SPEED * dt).rem_euclid(360.0); }
                 if d_held { self.heading_target = (self.heading_target + TURN_SPEED * dt).rem_euclid(360.0); }
-                // Keep the camera in AutoFollow so it tracks the new heading each frame.
-                self.camera.reset_to_follow();
+                // Keep the camera tracking the new heading each frame, but preserve the
+                // user's tilt/zoom (only F9/R resets those).
+                self.camera.follow_heading();
             }
 
             // When rotating, derive forward/right from heading_target so W moves immediately
