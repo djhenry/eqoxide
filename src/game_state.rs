@@ -37,6 +37,12 @@ pub struct Entity {
     pub gender: u8,
     pub helm: u8,
     pub showhelm: u8,
+    /// Face variant (0-indexed from Spawn_Struct `face`).  The rendered face primitive
+    /// has `eq_part_index == face + 1`.
+    pub face: u8,
+    /// Hair style (from Spawn_Struct `hairstyle`).  0 = bald.  Rendered hair primitive
+    /// has `eq_part_index == hairstyle` (when > 0).
+    pub hairstyle: u8,
     /// Server animation state (Animation::Standing=100, Sitting=110, Crouching=111, etc.)
     pub animation: u32,
 }
@@ -145,6 +151,10 @@ pub struct GameState {
     pub player_class: String,
     /// 0 = male, 1 = female (selects the gender model variant).
     pub player_gender: u8,
+    /// Player face variant (0-indexed from PlayerProfile `face`, offset 00898).
+    pub player_face: u8,
+    /// Player hair style (from PlayerProfile `hairstyle`, offset 00896). 0 = bald.
+    pub player_hairstyle: u8,
     pub player_action: String,
     pub hp_pct: f32,
     /// Player's absolute current/max HP (from OP_HP_UPDATE), used for the lethal-fall guard.
@@ -346,6 +356,7 @@ mod tests {
             heading: 0.0,
             dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
+            face: 0, hairstyle: 0,
             animation: 0,
         }
     }
