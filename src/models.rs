@@ -7,41 +7,35 @@ use std::path::Path;
 use crate::assets::{MeshData, TextureData};
 use crate::anim::{AnimClip, GroundProbe, JointChannel, JointProperty, SkinData};
 
-/// Which head-appearance part a primitive represents.  Emitted by the converter in
-/// `primitive.extras` for humanoid GLBs: `{ "eq_head_part": "face"|"hair", "eq_part_index": N }`.
-/// Body/eye primitives carry no extras and are represented by `None` in `ModelAsset::head_parts`.
+/// A head primitive belonging to a specific hairstyle variant.  Emitted by the converter in
+/// `primitive.extras` as `{ "eq_hairstyle": H }` on the scalp regions whose texture swaps by
+/// hairstyle (H=0 = bald base; H=1..7 = hair painted on the scalp).  Body, eyes, ears and the
+/// fixed head regions carry no extras and are `None` in `ModelAsset::head_parts` (always drawn).
+///
+/// (Luclin face is driven by skeletal bone positions, not texture — there are no face-variant
+/// textures — so `face` no longer selects a primitive.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeadPart {
-    /// Face variant N (1-indexed, matching `eq_part_index`).  Spawn `face` is 0-indexed,
-    /// so visible face = `Face(spawn.face + 1)`.
-    Face(u8),
-    /// Hair style N (1-indexed, matching `eq_part_index`).  Visible when `spawn.hairstyle == N`
-    /// and `N > 0`; hairstyle 0 means bald (all hair hidden).
-    Hair(u8),
+    /// Renders the scalp region for hairstyle `H`; visible only when `hairstyle == H`.
+    HairstyleVariant(u8),
 }
 
-/// Returns whether a mesh primitive should be rendered given its head-part tag and the
-/// character's face/hairstyle.
+/// Whether a mesh primitive should render given its head-part tag and the character's hairstyle.
+/// - `None` (body, eyes, ears, fixed head regions): always visible.
+/// - `HairstyleVariant(H)`: visible only when `hairstyle == H` (H=0 bald is the default).
 ///
-/// Rules:
-/// - `None` (body/eyes): always visible.
-/// - `Face(N)`: visible when `face + 1 == N`.
-/// - `Hair(N)`: visible when `hairstyle > 0 && hairstyle == N`.
-///
-/// The `_default_hidden` parameter reflects the converter's `eq_default_hidden` flag (used to
-/// describe the initial no-spawn-data state). It is not needed here because face=0/hairstyle=0
-/// (the `Entity` defaults) already produce the correct initial visibility — face 1 visible, all
-/// hair hidden — via the spawn-based matching rules above.
+/// `_face` is retained in the signature (callers pass the spawn `face`) but is unused: Luclin
+/// has no face-variant textures.  `_default_hidden` is likewise unneeded — the default
+/// `hairstyle == 0` already selects the bald variant via the match below.
 pub fn head_part_visible(
     part: Option<HeadPart>,
     _default_hidden: bool,
-    face: u8,
+    _face: u8,
     hairstyle: u8,
 ) -> bool {
     match part {
         None => true,
-        Some(HeadPart::Face(idx)) => idx == face.saturating_add(1),
-        Some(HeadPart::Hair(idx)) => hairstyle > 0 && idx == hairstyle,
+        Some(HeadPart::HairstyleVariant(h)) => h == hairstyle,
     }
 }
 
@@ -359,19 +353,15 @@ impl ModelAsset {
                 }
                 equip_slots.push(parsed.map(|(_, s)| s));
 
-                // Parse head-part extras (face/hair visibility tags emitted by the converter).
+                // Parse head-part extras: the converter tags hairstyle-swappable scalp regions
+                // with `{ "eq_hairstyle": H }`. Untagged primitives (body/eyes/ears/fixed head)
+                // stay `None` and always render.
                 let head_tag: Option<(HeadPart, bool)> = primitive.extras().as_ref().and_then(|ex| {
                     let v: serde_json::Value = serde_json::from_str(ex.get()).ok()?;
-                    let part_name  = v.get("eq_head_part")?.as_str()?;
-                    let part_index = v.get("eq_part_index")?.as_u64()? as u8;
+                    let h = v.get("eq_hairstyle")?.as_u64()? as u8;
                     let dflt_hidden = v.get("eq_default_hidden")
                         .and_then(|h| h.as_bool()).unwrap_or(false);
-                    let part = match part_name {
-                        "face" => HeadPart::Face(part_index),
-                        "hair" => HeadPart::Hair(part_index),
-                        _ => return None,
-                    };
-                    Some((part, dflt_hidden))
+                    Some((HeadPart::HairstyleVariant(h), dflt_hidden))
                 });
                 head_parts.push(head_tag.map(|(p, _)| p));
                 head_default_hidden.push(head_tag.map(|(_, h)| h).unwrap_or(false));
@@ -1409,49 +1399,43 @@ mod tests {
 
     #[test]
     fn head_part_visible_untagged_always_visible() {
-        // body/eye primitives have no tag → always visible regardless of face/hairstyle
+        // body/eye/ear/fixed-head primitives have no tag → always visible
         assert!(head_part_visible(None, false, 0, 0));
         assert!(head_part_visible(None, true,  7, 7));
         assert!(head_part_visible(None, false, 3, 5));
     }
 
     #[test]
-    fn head_part_visible_correct_face_shows() {
-        // face=2 (0-indexed) → show primitive with eq_part_index 3
-        assert!(head_part_visible(Some(HeadPart::Face(3)), false, 2, 0));
-    }
-
-    #[test]
-    fn head_part_visible_wrong_faces_hidden() {
-        // face=0 → only Face(1) visible; Face(2..8) hidden
-        for idx in 2u8..=8 {
-            assert!(!head_part_visible(Some(HeadPart::Face(idx)), true, 0, 0),
-                "Face({idx}) should be hidden when face=0");
-        }
-        assert!( head_part_visible(Some(HeadPart::Face(1)), false, 0, 0));
-    }
-
-    #[test]
-    fn head_part_visible_hairstyle_zero_hides_all_hair() {
-        for idx in 1u8..=7 {
-            assert!(!head_part_visible(Some(HeadPart::Hair(idx)), true, 0, 0),
-                "Hair({idx}) should be hidden when hairstyle=0 (bald)");
+    fn head_part_visible_hairstyle_zero_shows_only_bald() {
+        // default hairstyle 0 → only the H=0 (bald) scalp variant renders
+        assert!( head_part_visible(Some(HeadPart::HairstyleVariant(0)), false, 0, 0));
+        for h in 1u8..=7 {
+            assert!(!head_part_visible(Some(HeadPart::HairstyleVariant(h)), true, 0, 0),
+                "HairstyleVariant({h}) should be hidden when hairstyle=0");
         }
     }
 
     #[test]
-    fn head_part_visible_hairstyle_n_shows_hair_n() {
-        // hairstyle=3 → Hair(3) visible, others hidden
-        assert!( head_part_visible(Some(HeadPart::Hair(3)), true, 0, 3));
-        assert!(!head_part_visible(Some(HeadPart::Hair(1)), true, 0, 3));
-        assert!(!head_part_visible(Some(HeadPart::Hair(2)), true, 0, 3));
-        assert!(!head_part_visible(Some(HeadPart::Hair(4)), true, 0, 3));
+    fn head_part_visible_hairstyle_n_shows_only_n() {
+        // hairstyle=3 → only the H=3 scalp variant renders; bald and others hidden
+        assert!( head_part_visible(Some(HeadPart::HairstyleVariant(3)), true, 0, 3));
+        for h in [0u8, 1, 2, 4, 7] {
+            assert!(!head_part_visible(Some(HeadPart::HairstyleVariant(h)), false, 0, 3),
+                "HairstyleVariant({h}) should be hidden when hairstyle=3");
+        }
     }
 
     #[test]
-    fn head_part_visible_default_hidden_flag_ignored_when_face_matches() {
-        // default_hidden=true on face 1, but face=0 → face+1==1 → visible anyway
-        assert!(head_part_visible(Some(HeadPart::Face(1)), true, 0, 0));
+    fn head_part_visible_ignores_face() {
+        // face no longer selects a primitive (Luclin face is skeletal) — any face value works
+        assert!(head_part_visible(Some(HeadPart::HairstyleVariant(2)), false, 5, 2));
+        assert!(head_part_visible(Some(HeadPart::HairstyleVariant(2)), false, 0, 2));
+    }
+
+    #[test]
+    fn head_part_visible_default_hidden_flag_ignored_when_hairstyle_matches() {
+        // default_hidden=true on the H=0 variant, but hairstyle=0 matches → visible anyway
+        assert!(head_part_visible(Some(HeadPart::HairstyleVariant(0)), true, 0, 0));
     }
 }
 

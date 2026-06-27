@@ -327,6 +327,9 @@ type SharedWindow = Arc<Mutex<Option<Arc<Window>>>>;
 /// The skinned draw loop reads these and applies `models::head_part_visible`.
 static SEL_FACE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 static SEL_HAIR: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// Camera target height bias as a percentage (0 = model center, 100 = top of model). Lets the
+/// orbit camera focus on the HEAD for face/hair inspection. Set via `POST /head {"target":N}`.
+static SEL_TARGET: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct SharedCameraState {
@@ -482,13 +485,15 @@ fn main() {
                 }
 
                 #[derive(serde::Deserialize)]
-                struct HeadBody { face: Option<u8>, hairstyle: Option<u8> }
+                struct HeadBody { face: Option<u8>, hairstyle: Option<u8>, target: Option<u32> }
                 async fn post_head(Json(body): Json<HeadBody>) -> String {
                     if let Some(f) = body.face { SEL_FACE.store(f, std::sync::atomic::Ordering::Relaxed); }
                     if let Some(h) = body.hairstyle { SEL_HAIR.store(h, std::sync::atomic::Ordering::Relaxed); }
-                    format!("face={} hairstyle={}",
+                    if let Some(t) = body.target { SEL_TARGET.store(t.min(100), std::sync::atomic::Ordering::Relaxed); }
+                    format!("face={} hairstyle={} target={}",
                         SEL_FACE.load(std::sync::atomic::Ordering::Relaxed),
-                        SEL_HAIR.load(std::sync::atomic::Ordering::Relaxed))
+                        SEL_HAIR.load(std::sync::atomic::Ordering::Relaxed),
+                        SEL_TARGET.load(std::sync::atomic::Ordering::Relaxed))
                 }
 
                 let app = Router::new()
@@ -1262,7 +1267,11 @@ fn render_frame(s: &mut ViewerState) {
         az.sin() * el.cos() * s.distance,
         el.sin() * s.distance,
     );
-    let target = glam::Vec3::new(0.0, 0.0, lift);
+    // Bias the look-at point upward toward the head (SEL_TARGET% of the half-height) so the
+    // head can be inspected close-up; default 0 = model center.
+    let target_bias = SEL_TARGET.load(std::sync::atomic::Ordering::Relaxed) as f32 / 100.0;
+    let half_height = s.model.y_extent * s.arch_scale; // = vscale * 0.5
+    let target = glam::Vec3::new(0.0, 0.0, lift + target_bias * half_height);
 
     let aspect = s.surface_config.width as f32 / s.surface_config.height as f32;
     let vp = camera::look_at_perspective(
