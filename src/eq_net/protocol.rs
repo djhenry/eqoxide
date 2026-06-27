@@ -218,7 +218,7 @@ pub unsafe fn safe_read<T: Copy>(data: &[u8]) -> T {
     std::ptr::read_unaligned(buf.as_ptr() as *const T)
 }
 
-// ── Spawn_S bitfield position extraction ───────────────────────────────────
+// ── Heading conversion helpers ─────────────────────────────────────────────
 
 /// Convert CW heading (0=north CW, 90=east, i.e. EQ wire convention) to CCW
 /// (0=north, 90=west, the internal convention used everywhere in this client).
@@ -231,9 +231,18 @@ pub fn ccw_to_cw(ccw: f32) -> f32 {
     (360.0 - ccw).rem_euclid(360.0)
 }
 
-/// Extract (x, y, z, heading) from a Spawn_S's bitfield blocks.
+// ── Titanium Spawn_S bitfield position extraction (LEGACY — not used in RoF2) ─
+
+/// Extract (x, y, z, heading) from a **Titanium** Spawn_S's bitfield blocks.
+/// Titanium layout (5 words):
+///   word1: deltaHeading:10, x:19, pad:3
+///   word2: y:19, animation:10, pad:3
+///   word3: z:19, deltaY:13
+///   word4: deltaX:13, heading:12, pad:7
 /// EQ stores coords as 19-bit signed integers scaled by 1/8.
 /// Wire heading is EQ12 (0=north CW), converted to CCW degrees internally.
+/// NOTE: This function is preserved for the unit tests; RoF2 production code
+/// uses `parse_rof2_spawn` which handles position internally.
 pub fn extract_spawn_position(
     bitfield_pos1: u32,
     bitfield_pos2: u32,
@@ -266,6 +275,296 @@ pub fn extract_spawn_position(
     let heading_cw = s12_to_degrees_cw((bitfield_pos4 >> 13) & 0xFFF);
     let heading = cw_to_ccw(heading_cw);
     (x, y, z, heading)
+}
+
+// ── RoF2 spawn stream parser ───────────────────────────────────────────────
+
+/// Parsed fields from a single RoF2 variable-length spawn entry.
+/// Returned by `parse_rof2_spawn` from the wire stream; consumed by `register_spawn`.
+/// Source: `~/git/EQEmu/common/patches/rof2.cpp` ENCODE(OP_ZoneSpawns) encoding order.
+#[derive(Debug, Clone)]
+pub struct SpawnInfo {
+    pub spawn_id:        u32,
+    pub name:            String,
+    pub last_name:       String,
+    pub level:           u8,
+    pub npc:             u8,   // 0=player, 1=npc, 2=pc_corpse, 3=npc_corpse
+    pub gender:          u8,
+    pub race:            u32,
+    pub class_:          u8,
+    pub body_type:       u32,
+    pub cur_hp:          u8,   // HP percent (100 = full)
+    pub helm:            u8,
+    pub show_helm:       bool,
+    pub stand_state:     u8,   // 0x64 = normal standing
+    pub pet_owner_id:    u32,
+    pub player_state:    u32,
+    pub x:               f32,
+    pub y:               f32,
+    pub z:               f32,
+    pub heading:         f32,  // degrees, CCW (0=north, 90=west)
+    pub animation:       u32,
+    pub equipment:       [u32; 9],       // Texture_Struct.Material per slot (0-8)
+    pub equipment_tint:  [[u8; 3]; 9],   // RGB tint per slot
+}
+
+/// Parse one RoF2 spawn record from the front of `buf`.
+/// Returns `Some((info, bytes_consumed))` on success, `None` if the buffer is too
+/// short to hold a complete spawn.
+///
+/// Wire layout (variable-length, from rof2.cpp ENCODE(OP_ZoneSpawns)):
+///   name\0 | spawnId(u32) | level(u8) | bounding(f32) | NPC(u8)
+///   | Bitfields(u32) | OtherData(u8) | unk3(f32) | unk4(f32)
+///   | props_count(u8) [| bodytype(u32) if count>0]
+///   | curHp haircolor beardcolor eyecolor1 eyecolor2 hairstyle beard (7×u8)
+///   | drakkin_heritage/tattoo/details (3×u32)
+///   | equip_chest2 material variation helm (4×u8)
+///   | size(f32) face(u8) walkspeed(f32) runspeed(f32) race(u32)
+///   | holding(u8) deity(u32) guildID(u32) guildrank(u32)
+///   | class_ pvp StandState light flymode (5×u8)
+///   | lastName\0 | aatitle(u32) | guild_show(u8) | TempPet(u8)
+///   | petOwnerId(u32) | FindBits(u8) | PlayerState(u32)
+///   | NpcTintIdx PrimaryTintIdx SecondaryTintIdx unk unk (5×u32)
+///   | [TintProfile(36) + Equipment(180) for playable races, or 60 bytes for NPCs]
+///   | Position(20) = 5×u32 with RoF2 bit layout
+///   | [title\0 if OtherData & 0x10] | [suffix\0 if OtherData & 0x20]
+///   | unknown20(8) | IsMercenary(u8) | RealEstateItemGuid(17)
+///   | RealEstateID(u32) | RealEstateItemID(u32) | padding(29)
+///
+/// RoF2 Spawn_Struct_Position (20 bytes, rof2_structs.h):
+///   word0: angle:12, y:19, pad:1
+///   word1: deltaZ:13, deltaX:13, pad:6
+///   word2: x:19, heading:12, pad:1
+///   word3: deltaHeading:10, z:19, pad:3
+///   word4: animation:10, deltaY:13, pad:9
+pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
+    let mut p = 0usize;
+
+    macro_rules! need {
+        ($n:expr) => {
+            if p + $n > buf.len() { return None; }
+        };
+    }
+    macro_rules! rd_u8 {
+        () => {{ need!(1); let v = buf[p]; p += 1; v }};
+    }
+    macro_rules! rd_u32 {
+        () => {{
+            need!(4);
+            let v = u32::from_le_bytes([buf[p], buf[p+1], buf[p+2], buf[p+3]]);
+            p += 4; v
+        }};
+    }
+    macro_rules! rd_f32 {
+        () => {{ let v = f32::from_le_bytes([buf[p], buf[p+1], buf[p+2], buf[p+3]]); p += 4; v }};
+    }
+    macro_rules! rd_cstr {
+        () => {{
+            let start = p;
+            while p < buf.len() && buf[p] != 0 { p += 1; }
+            let s = if buf[p..].first() == Some(&0) {
+                let raw = &buf[start..p];
+                if raw.iter().all(|&b| b >= 0x20 && b < 0x7f) {
+                    String::from_utf8_lossy(raw).into_owned()
+                } else { String::new() }
+            } else { return None; };
+            p += 1; // null terminator
+            s
+        }};
+    }
+    macro_rules! skip {
+        ($n:expr) => {{ need!($n); p += $n; }};
+    }
+
+    // 1. name (null-terminated)
+    let name = rd_cstr!();
+
+    // 2. spawnId (u32)
+    let spawn_id = rd_u32!();
+    // 3. level (u8)
+    let level = rd_u8!();
+    // 4. bounding_radius (f32) — eye height approximation
+    need!(4); rd_f32!();
+    // 5. NPC (u8): 0=player,1=npc,2=pc_corpse,3=npc_corpse
+    let npc = rd_u8!();
+
+    // 6. Spawn_Struct_Bitfields (u32, 4 bytes):
+    //   bits  0-1  : gender
+    //   bit   2    : ispet
+    //   bit   3    : afk
+    //   bits  4-5  : anon
+    //   bit   6    : gm
+    //   bit   7    : sneak
+    //   bit   8    : lfg
+    //   bit   9    : betabuffed
+    //   bits 10-21 : invis (12-bit)
+    //   bit  22    : linkdead
+    //   bit  23    : showhelm
+    //   bits 24-31 : trader/targetable/etc.
+    need!(4);
+    let bitfields = u32::from_le_bytes([buf[p], buf[p+1], buf[p+2], buf[p+3]]);
+    p += 4;
+    let gender   = (bitfields & 0x3) as u8;
+    let show_helm = (bitfields >> 23) & 1 != 0;
+
+    // 7. OtherData (u8): bit4=has_title, bit5=has_suffix
+    let other_data = rd_u8!();
+
+    // 8-9. unknown3/unknown4 (2×f32)
+    skip!(8);
+
+    // 10. properties_count (u8)
+    let props_count = rd_u8!();
+    // 11. bodytype (u32) — only present if count > 0
+    let body_type = if props_count > 0 { rd_u32!() } else { 0 };
+
+    // 12-18. curHp haircolor beardcolor eyecolor1 eyecolor2 hairstyle beard (7×u8)
+    let cur_hp = rd_u8!();
+    skip!(6); // haircolor..beard
+
+    // 19-21. drakkin_heritage/tattoo/details (3×u32)
+    skip!(12);
+
+    // 22-25. equip_chest2, material(0), variation(0), helm (4×u8)
+    skip!(3); // equip_chest2, material, variation
+    let helm = rd_u8!();
+
+    // 26. size (f32)
+    skip!(4);
+    // 27. face (u8)
+    skip!(1);
+    // 28-29. walkspeed/runspeed (2×f32)
+    skip!(8);
+    // 30. race (u32)
+    let race = rd_u32!();
+
+    // 31. holding (u8)
+    skip!(1);
+    // 32-34. deity guildID guildrank (3×u32)
+    skip!(12);
+    // 35. class_ (u8)
+    let class_ = rd_u8!();
+    // 36. pvp (u8)
+    skip!(1);
+    // 37. StandState (u8)
+    let stand_state = rd_u8!();
+    // 38-39. light flymode (2×u8)
+    skip!(2);
+
+    // 40. lastName (null-terminated)
+    let last_name = rd_cstr!();
+
+    // 41. aatitle (u32)
+    skip!(4);
+    // 42. guild_show (u8)
+    skip!(1);
+    // 43. TempPet (u8)
+    skip!(1);
+    // 44. petOwnerId (u32)
+    let pet_owner_id = rd_u32!();
+    // 45. FindBits (u8)
+    skip!(1);
+    // 46. PlayerState (u32)
+    let player_state = rd_u32!();
+    // 47-51. NpcTintIndex PrimaryTintIndex SecondaryTintIndex unk unk (5×u32)
+    skip!(20);
+
+    // Equipment section — format depends on race.
+    // Playable condition (from rof2.cpp): NPC==0 || race<=12 || race in {128,130,330,522}
+    // Playable → 36B TintProfile + 180B Equipment (9×Texture_Struct@20B each).
+    // Non-playable → 60B: 5 u32s (zeroed) + Primary.Material(u32) + 4 u32s(0)
+    //                     + Secondary.Material(u32) + 4 u32s(0).
+    let is_playable = npc == 0
+        || race <= 12
+        || race == 128   // Iksar
+        || race == 130   // VahShir
+        || race == 330   // Froglok2
+        || race == 522;  // Drakkin
+
+    let mut equipment       = [0u32; 9];
+    let mut equipment_tint  = [[0u8; 3]; 9];
+
+    if is_playable {
+        // TintProfile: 9 × Tint_Struct (Blue,Green,Red,UseTint = 4 bytes each = 36 bytes)
+        need!(36);
+        for i in 0..9usize {
+            let b = p + i * 4;
+            // Wire: Blue=buf[b], Green=buf[b+1], Red=buf[b+2]; store as RGB
+            equipment_tint[i] = [buf[b+2], buf[b+1], buf[b]];
+        }
+        p += 36;
+
+        // Equipment: 9 × Texture_Struct (Material u32 + 4×u32 padding = 20 bytes each)
+        need!(180);
+        for i in 0..9usize {
+            let b = p + i * 20;
+            equipment[i] = u32::from_le_bytes([buf[b], buf[b+1], buf[b+2], buf[b+3]]);
+        }
+        p += 180;
+    } else {
+        // Non-playable: 3 × Texture_Struct in abbreviated form (only Material fields used).
+        // Layout: 5 zeros(u32) | Primary.Material(u32) | 4 zeros(u32)
+        //       | Secondary.Material(u32) | 4 zeros(u32)  = 15 u32s = 60 bytes.
+        need!(60);
+        equipment[7] = u32::from_le_bytes([buf[p+20], buf[p+21], buf[p+22], buf[p+23]]);
+        equipment[8] = u32::from_le_bytes([buf[p+40], buf[p+41], buf[p+42], buf[p+43]]);
+        p += 60;
+    }
+
+    // Position: Spawn_Struct_Position (5×u32 = 20 bytes)
+    // word0: angle:12, y:19, pad:1
+    // word1: deltaZ:13, deltaX:13, pad:6
+    // word2: x:19, heading:12, pad:1
+    // word3: deltaHeading:10, z:19, pad:3
+    // word4: animation:10, deltaY:13, pad:9
+    need!(20);
+    let w0 = u32::from_le_bytes([buf[p],   buf[p+1],  buf[p+2],  buf[p+3]]);
+    let w2 = u32::from_le_bytes([buf[p+8], buf[p+9],  buf[p+10], buf[p+11]]);
+    let w3 = u32::from_le_bytes([buf[p+12],buf[p+13], buf[p+14], buf[p+15]]);
+    let w4 = u32::from_le_bytes([buf[p+16],buf[p+17], buf[p+18], buf[p+19]]);
+    p += 20;
+
+    // y: signed 19-bit at bits 12-30 of word0
+    let y = sext((w0 >> 12) & 0x7FFFF, 19) as f32 / 8.0;
+    // x: signed 19-bit at bits 0-18 of word2
+    let x = sext(w2 & 0x7FFFF, 19) as f32 / 8.0;
+    // heading: unsigned 12-bit at bits 19-30 of word2 (0..511 = 0..360° CW)
+    let heading_cw = ((w2 >> 19) & 0xFFF) as f32 * (360.0 / 512.0);
+    let heading = cw_to_ccw(heading_cw);
+    // z: signed 19-bit at bits 10-28 of word3
+    let z = sext((w3 >> 10) & 0x7FFFF, 19) as f32 / 8.0;
+    // animation: unsigned 10-bit at bits 0-9 of word4
+    let animation = w4 & 0x3FF;
+
+    // Optional title (OtherData & 0x10 = bit4)
+    if other_data & 0x10 != 0 {
+        while p < buf.len() && buf[p] != 0 { p += 1; }
+        if p < buf.len() { p += 1; }
+    }
+    // Optional suffix (OtherData & 0x20 = bit5)
+    if other_data & 0x20 != 0 {
+        while p < buf.len() && buf[p] != 0 { p += 1; }
+        if p < buf.len() { p += 1; }
+    }
+
+    // unknown20: 2 ints (SplineID etc.)
+    skip!(8);
+    // IsMercenary (u8)
+    skip!(1);
+    // RealEstateItemGuid: "0000000000000000\0" = 17 bytes
+    skip!(17);
+    // RealEstateID (u32) + RealEstateItemID (u32) = 8 bytes
+    skip!(8);
+    // 29 zero bytes (PhysicsEffects placeholder)
+    skip!(29);
+
+    Some((SpawnInfo {
+        spawn_id, name, last_name, level, npc, gender, race, class_,
+        body_type, cur_hp, helm, show_helm, stand_state,
+        pet_owner_id, player_state,
+        x, y, z, heading, animation,
+        equipment, equipment_tint,
+    }, p))
 }
 
 // ── Race ID → renderer code mapping ────────────────────────────────────────
@@ -401,13 +700,17 @@ pub fn eq_race_to_code(race_id: u32) -> &'static str {
 
 // ── Struct sizes ───────────────────────────────────────────────────────────
 
-pub const SIZE_SPAWN: usize = std::mem::size_of::<Spawn_S>(); // Titanium Spawn_Struct = 385 bytes
-pub const SIZE_NEW_ZONE: usize = 688;    // NewZone_S
+// RoF2 spawn packets are variable-length; there is no fixed SIZE_SPAWN.
+// The minimum possible spawn (empty name + empty lastName + non-playable race) is ~266 bytes;
+// any payload below that will return None from parse_rof2_spawn.
+pub const SIZE_NEW_ZONE: usize = 948;    // RoF2 NewZone_Struct (rof2_structs.h)
 pub const SIZE_ZONE_SERVER_INFO: usize = 130; // ZoneServerInfo_S (ip[128] + port[2])
 pub const SIZE_CLIENT_ZONE_ENTRY: usize = 76; // ClientZoneEntry_S (RoF2: u32 + char[64] + u32 + u32)
 pub const SIZE_ENTER_WORLD: usize = 68;  // EnterWorld_S
 pub const SIZE_LOGIN_INFO: usize = 464;  // LoginInfo_S
-pub const SIZE_SPAWN_POSITION_UPDATE: usize = 22; // PlayerPositionUpdateServer_Struct (bit-packed)
+/// RoF2 PlayerPositionUpdateServer_Struct = 24 bytes (adds vehicle_id u16 vs Titanium's 22).
+/// rof2_structs.h: spawn_id(u16)+vehicle_id(u16)+5×bit-packed-u32 = 2+2+20 = 24.
+pub const SIZE_SPAWN_POSITION_UPDATE: usize = 24;
 pub const SIZE_HP_UPDATE: usize = 10;   // HPUpdate_S
 pub const SIZE_DEATH: usize = 32;       // Death_S
 pub const SIZE_ZONE_POINT_ENTRY: usize = 24; // ZonePointEntry_S
@@ -456,6 +759,19 @@ mod tests {
     }
 
     #[test]
+    fn rof2_new_zone_size() {
+        // RoF2 NewZone_Struct = 948 bytes (rof2_structs.h).
+        assert_eq!(SIZE_NEW_ZONE, 948);
+        assert_eq!(std::mem::size_of::<NewZone_S>(), 948);
+    }
+
+    #[test]
+    fn rof2_spawn_position_update_size() {
+        // RoF2 PlayerPositionUpdateServer_Struct = 24 bytes (spawn_id u16 + vehicle_id u16 + 5×u32).
+        assert_eq!(SIZE_SPAWN_POSITION_UPDATE, 24);
+    }
+
+    #[test]
     fn rof2_login_info_size() {
         // RoF2 LoginInfo_Struct: login_info[64] + unknown064[124] + zoning(u8) + unknown189[275] = 464.
         assert_eq!(SIZE_LOGIN_INFO, 464);
@@ -478,8 +794,9 @@ mod tests {
 
     #[test]
     fn position_update_round_trips() {
+        // RoF2 PlayerPositionUpdateServer_Struct: 24 bytes.
         let pkt = encode_position_update(0x1234, 125.5, -340.25, 12.0);
-        assert_eq!(pkt.len(), SIZE_SPAWN_POSITION_UPDATE);
+        assert_eq!(pkt.len(), SIZE_SPAWN_POSITION_UPDATE, "RoF2 position update must be 24 bytes");
         let d = decode_position_update(&pkt).expect("decode");
         assert_eq!(d.spawn_id, 0x1234);
         // EQ19 fixed-point: exact to 1/8 unit.
@@ -499,11 +816,17 @@ mod tests {
 
     #[test]
     fn decode_position_update_rejects_short() {
+        // RoF2 struct needs 24 bytes minimum.
         assert!(decode_position_update(&[0u8; 10]).is_none());
+        assert!(decode_position_update(&[0u8; 23]).is_none());
+        assert!(decode_position_update(&[0u8; 24]).is_some());
     }
+
+    // -- Titanium legacy extract_spawn_position (kept for reference/documentation) --
 
     #[test]
     fn test_extract_spawn_position_zero() {
+        // Titanium bitfield extract: all zeros → origin.
         let (x, y, z, heading) = extract_spawn_position(0, 0, 0, 0);
         assert_eq!(x, 0.0);
         assert_eq!(y, 0.0);
@@ -513,27 +836,140 @@ mod tests {
 
     #[test]
     fn test_extract_spawn_position_known_values() {
-        // Construct bitfields for x=100.0, y=200.0, z=50.0, heading=180 (CW south)
-        // x=100.0 → raw = 800 (100 * 8), placed at bits 10-28 of pos1
-        // y=200.0 → raw = 1600 (200 * 8), placed at bits 0-18 of pos2
-        // z=50.0  → raw = 400 (50 * 8), placed at bits 0-18 of pos3
-        // heading_CW=180 → raw = 256 (180 * 512 / 360), placed at bits 13-24 of pos4
-        // cw_to_ccw(180) = 180 (south is the same in both conventions)
+        // Titanium bitfield: x@word1[10-28], y@word2[0-18], z@word3[0-18], heading@word4[13-24].
         let x_raw = (100.0 * 8.0) as u32; // 800
         let y_raw = (200.0 * 8.0) as u32; // 1600
         let z_raw = (50.0 * 8.0) as u32;  // 400
         let h_raw = (180.0 * 512.0 / 360.0) as u32; // 256
-
         let pos1 = x_raw << 10;
         let pos2 = y_raw;
         let pos3 = z_raw;
         let pos4 = h_raw << 13;
-
         let (x, y, z, heading) = extract_spawn_position(pos1, pos2, pos3, pos4);
         assert!((x - 100.0).abs() < 0.125, "x={}", x);
         assert!((y - 200.0).abs() < 0.125, "y={}", y);
         assert!((z - 50.0).abs() < 0.125, "z={}", z);
         assert!((heading - 180.0).abs() < 1.0, "heading={}", heading);
+    }
+
+    // -- RoF2 parse_rof2_spawn round-trip --
+
+    /// Build a minimal valid RoF2 spawn byte buffer for a non-playable NPC.
+    fn build_npc_spawn_buf(name: &str, spawn_id: u32, race: u32,
+                            x: f32, y: f32, z: f32) -> Vec<u8> {
+        let mut b = Vec::new();
+        // name\0
+        b.extend_from_slice(name.as_bytes()); b.push(0);
+        // spawnId(u32) level(u8) bounding(f32) NPC(u8)
+        b.extend_from_slice(&spawn_id.to_le_bytes());
+        b.push(20); // level
+        b.extend_from_slice(&5.0f32.to_le_bytes()); // bounding
+        b.push(1); // NPC=1
+        // Bitfields(u32): gender=0, showhelm at bit23
+        b.extend_from_slice(&(1u32 << 23).to_le_bytes());
+        // OtherData(u8)=0, unk3(f32)=-1, unk4(f32)=0
+        b.push(0);
+        b.extend_from_slice(&(-1.0f32).to_le_bytes());
+        b.extend_from_slice(&0.0f32.to_le_bytes());
+        // props_count(u8)=1, bodytype(u32)=1
+        b.push(1); b.extend_from_slice(&1u32.to_le_bytes());
+        // curHp(u8)+6×u8 (hair..beard)
+        b.push(80); // curHp = 80%
+        b.extend_from_slice(&[0u8; 6]);
+        // drakkin_heritage/tattoo/details (3×u32)
+        b.extend_from_slice(&[0u8; 12]);
+        // equip_chest2, material, variation, helm(u8=5)
+        b.extend_from_slice(&[0, 0, 0, 5]);
+        // size(f32), face(u8), walkspeed(f32), runspeed(f32), race(u32)
+        b.extend_from_slice(&6.0f32.to_le_bytes());
+        b.push(0);
+        b.extend_from_slice(&0.35f32.to_le_bytes());
+        b.extend_from_slice(&0.7f32.to_le_bytes());
+        b.extend_from_slice(&race.to_le_bytes());
+        // holding(u8), deity(u32), guildID(u32), guildrank(u32)
+        b.push(0); b.extend_from_slice(&[0u8; 12]);
+        // class_(u8)=1, pvp(u8)=0, StandState(u8)=100, light(u8)=0, flymode(u8)=0
+        b.extend_from_slice(&[1, 0, 100, 0, 0]);
+        // lastName\0 (empty)
+        b.push(0);
+        // aatitle(u32)=0, guild_show(u8)=0, TempPet(u8)=0
+        b.extend_from_slice(&[0u8; 6]);
+        // petOwnerId(u32)=0, FindBits(u8)=0, PlayerState(u32)=64
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.push(0);
+        b.extend_from_slice(&64u32.to_le_bytes());
+        // NpcTintIndex..unk2 (5×u32 = 20 bytes)
+        b.extend_from_slice(&[0u8; 20]);
+        // Non-playable equipment (60 bytes): 5 zeros + Primary.Material(99) + 4 zeros
+        //   + Secondary.Material(88) + 4 zeros
+        b.extend_from_slice(&[0u8; 20]);           // 5 u32s zeros
+        b.extend_from_slice(&99u32.to_le_bytes()); // Primary.Material = 99
+        b.extend_from_slice(&[0u8; 16]);           // 4 u32s zeros
+        b.extend_from_slice(&88u32.to_le_bytes()); // Secondary.Material = 88
+        b.extend_from_slice(&[0u8; 16]);           // 4 u32s zeros
+        // Spawn_Struct_Position (20 bytes = 5×u32):
+        //   word0: angle:12=0, y:19, pad:1  → y at bits 12-30
+        //   word1: deltas = 0
+        //   word2: x:19, heading:12=0, pad:1 → x at bits 0-18
+        //   word3: deltaHdg:10=0, z:19, pad:3 → z at bits 10-28
+        //   word4: animation:10=100, deltaY:13=0, pad:9
+        let yp = ((y * 8.0) as i32 as u32) & 0x7FFFF;
+        let xp = ((x * 8.0) as i32 as u32) & 0x7FFFF;
+        let zp = ((z * 8.0) as i32 as u32) & 0x7FFFF;
+        b.extend_from_slice(&(yp << 12).to_le_bytes()); // word0
+        b.extend_from_slice(&0u32.to_le_bytes());        // word1
+        b.extend_from_slice(&xp.to_le_bytes());          // word2
+        b.extend_from_slice(&(zp << 10).to_le_bytes());  // word3
+        b.extend_from_slice(&100u32.to_le_bytes());       // word4: animation=100
+        // No title/suffix (OtherData=0)
+        // unknown20(8), IsMercenary(u8)=0, RealEstateItemGuid(17)="0000000000000000\0"
+        b.extend_from_slice(&[0u8; 8]);
+        b.push(0);
+        b.extend_from_slice(b"0000000000000000\0");
+        // RealEstateID(u32), RealEstateItemID(u32)
+        b.extend_from_slice(&0xffffffffu32.to_le_bytes());
+        b.extend_from_slice(&0xffffffffu32.to_le_bytes());
+        // 29 zero bytes
+        b.extend_from_slice(&[0u8; 29]);
+        b
+    }
+
+    #[test]
+    fn parse_rof2_spawn_npc_round_trip() {
+        use super::parse_rof2_spawn;
+        let buf = build_npc_spawn_buf("Orc_Guard", 42, 54, 100.0, -200.0, 12.5);
+        let (info, consumed) = parse_rof2_spawn(&buf).expect("parse must succeed");
+        assert_eq!(consumed, buf.len(), "must consume exactly the full buffer");
+        assert_eq!(info.spawn_id, 42);
+        assert_eq!(info.name, "Orc_Guard");
+        assert_eq!(info.level, 20);
+        assert_eq!(info.npc, 1);
+        assert_eq!(info.race, 54);
+        assert_eq!(info.cur_hp, 80);
+        assert_eq!(info.helm, 5);
+        assert!(info.show_helm, "bit23 in bitfields → showhelm=true");
+        assert_eq!(info.stand_state, 100);
+        // Coordinates (EQ19 precision, 1/8 unit)
+        assert!((info.x - 100.0).abs() < 0.125, "x={}", info.x);
+        assert!((info.y - (-200.0)).abs() < 0.125, "y={}", info.y);
+        assert!((info.z - 12.5).abs() < 0.125, "z={}", info.z);
+        // Non-playable equipment: Primary@[7]=99, Secondary@[8]=88
+        assert_eq!(info.equipment[7], 99, "primary weapon material");
+        assert_eq!(info.equipment[8], 88, "secondary weapon material");
+        assert_eq!(info.equipment[0], 0, "armor slots zero for non-playable");
+        // Animation from word4 bits 0-9
+        assert_eq!(info.animation, 100);
+    }
+
+    #[test]
+    fn parse_rof2_spawn_rejects_truncated() {
+        use super::parse_rof2_spawn;
+        let buf = build_npc_spawn_buf("Orc", 1, 54, 0.0, 0.0, 0.0);
+        // Every truncation of the buffer must return None.
+        for trunc in 0..buf.len() - 1 {
+            assert!(parse_rof2_spawn(&buf[..trunc]).is_none(),
+                "should reject buffer truncated to {trunc} bytes");
+        }
     }
 
     #[test]
@@ -588,102 +1024,9 @@ mod tests {
 }
 
 // ── Packed struct definitions ──────────────────────────────────────────────
-// All structs are repr(C, packed) matching EQEmu's Titanium protocol layout.
-
-/// Core spawn struct (252 bytes). Contains bitfield-encoded position, name, level,
-/// and ~100 other fields. We only parse the fields we need.
-#[repr(C, packed)]
-#[derive(Debug, Copy, Clone)]
-#[allow(non_snake_case)]
-pub struct Spawn_S {
-    pub unknown0000: u8,
-    pub gm: u8,
-    pub unknown0003: u8,
-    pub aatitle: u8,
-    pub unknown0004: u8,
-    pub anon: u8,
-    pub face: u8,
-    pub name: [u8; 64],
-    pub deity: u16,
-    pub unknown0073: u16,
-    pub size: f32,
-    pub unknown0079: u32,
-    pub NPC: u8,
-    pub invis: u8,
-    pub haircolor: u8,
-    pub curHp: u8,
-    pub max_hp: u8,
-    pub findable: u8,
-    pub unknown0089: [u8; 5],
-    // Position bitfield block: 16 bytes covering x, y, z, heading, deltas, animation
-    pub bitfield_pos1: u32, // deltaHeading:10, x:19, pad:3
-    pub bitfield_pos2: u32, // y:19, animation:10, pad:3
-    pub bitfield_pos3: u32, // z:19, deltaY:13
-    pub bitfield_pos4: u32, // deltaX:13, heading:12, pad:7
-    pub bitfield_pos5: u32, // deltaZ:13, pad:19
-    pub eyecolor1: u8,
-    pub unknown0115: [u8; 11],
-    pub StandState: u8,
-    pub drakkin_heritage: u32,
-    pub drakkin_tattoo: u32,
-    pub drakkin_details: u32,
-    pub showhelm: u8,
-    pub unknown0140: [u8; 4],
-    pub is_npc: u8,
-    pub hairstyle: u8,
-    pub beard: u8,
-    pub unknown0147: [u8; 4],
-    pub level: u8,
-    pub PlayerState: u32,
-    pub beardcolor: u8,
-    pub suffix: [u8; 32],
-    pub petOwnerId: u32,
-    pub guildrank: u8,
-    pub unknown0194: [u8; 3],
-    pub equipment: [u8; 36],
-    pub runspeed: f32,
-    pub afk: u8,
-    pub guildID: u32,
-    pub title: [u8; 32],
-    pub unknown0274: u8,
-    pub set_to_0xFF: [u8; 8],
-    pub helm: u8,
-    pub race: u32,
-    pub unknown0288: u32,
-    pub lastName: [u8; 32],
-    pub walkspeed: f32,
-    pub unknown0328: u8,
-    pub is_pet: u8,
-    pub light: u8,
-    pub class_: u8,
-    pub eyecolor2: u8,
-    pub flymode: u8,
-    pub gender: u8,
-    pub bodytype: u8,
-    pub unknown0336: [u8; 3],
-    pub equip_chest2: u8,
-    pub spawnId: u32,
-    pub bounding_radius: f32,
-    pub equipment_tint: [u8; 36],
-    pub lfg: u8,
-}
-
-const _: () = assert!(std::mem::size_of::<Spawn_S>() == 385, "Spawn_S must be 385 bytes (Titanium Spawn_Struct)");
-
-impl Spawn_S {
-    pub fn name_str(&self) -> String {
-        // Truncate at first null byte — the field is 64 bytes but the string
-        // ends at the first \0; bytes after it are uninitialised padding.
-        let end = self.name.iter().position(|&b| b == 0).unwrap_or(self.name.len());
-        let slice = &self.name[..end];
-        // Reject anything with non-printable or non-ASCII bytes (binary garbage).
-        if slice.iter().all(|&b| b >= 0x20 && b < 0x7f) {
-            String::from_utf8_lossy(slice).into_owned()
-        } else {
-            String::new()
-        }
-    }
-}
+// Structs below are repr(C, packed) matching EQEmu's RoF2 protocol layout.
+// NOTE: The Titanium Spawn_S fixed-size struct has been removed.  RoF2 spawns
+// use a variable-length wire format; use `parse_rof2_spawn` to decode them.
 
 /// Decoded fields from the Titanium bit-packed server position update.
 pub struct PositionUpdate {
@@ -701,42 +1044,60 @@ fn sext(v: u32, bits: u32) -> i32 {
     ((v << shift) as i32) >> shift
 }
 
-/// Decode the 22-byte bit-packed Titanium PlayerPositionUpdateServer_Struct (OP_ClientUpdate).
-/// LE C-bitfields, allocated from the LSB of each u32 word:
-///   spawn_id(u16) | [delta_heading:10, x:19, pad:3] | [y:19, animation:10, pad:3]
-///   | [z:19, delta_y:13] | [delta_x:13, heading:12, pad:7] | [delta_z:13, pad:19].
-/// Coords are EQ19 fixed-point (value/8); wire heading is EQ12 CW, converted to CCW.
+/// Decode the 24-byte bit-packed RoF2 PlayerPositionUpdateServer_Struct (OP_ClientUpdate).
+/// Wire layout (rof2_structs.h):
+///   spawn_id(u16) | vehicle_id(u16)
+///   | word0[padding:12, y:19, pad:1]
+///   | word1[deltaZ:13, deltaX:13, pad:6]
+///   | word2[x:19, heading:12, pad:1]
+///   | word3[deltaHeading:10, z:19, pad:3]
+///   | word4[animation:10, deltaY:13, pad:9]
+/// Coords are EQ19 fixed-point (value/8); heading is unsigned 12-bit CW (0..511=0..360°).
 pub fn decode_position_update(p: &[u8]) -> Option<PositionUpdate> {
     if p.len() < SIZE_SPAWN_POSITION_UPDATE { return None; }
     let spawn_id = u16::from_le_bytes([p[0], p[1]]);
-    let w1 = u32::from_le_bytes([p[2], p[3], p[4], p[5]]);
-    let w2 = u32::from_le_bytes([p[6], p[7], p[8], p[9]]);
-    let w3 = u32::from_le_bytes([p[10], p[11], p[12], p[13]]);
-    let w4 = u32::from_le_bytes([p[14], p[15], p[16], p[17]]);
-    let x = sext((w1 >> 10) & 0x7FFFF, 19) as f32 / 8.0;
-    let y = sext(w2 & 0x7FFFF, 19) as f32 / 8.0;
-    let z = sext(w3 & 0x7FFFF, 19) as f32 / 8.0;
-    let heading_units = ((w4 >> 13) & 0xFFF) as f32 / 4.0; // EQ12 → 0..512
-    let heading_cw = (heading_units * 360.0 / 512.0).rem_euclid(360.0);
+    // p[2..4] = vehicle_id (skip)
+    let w0 = u32::from_le_bytes([p[4],  p[5],  p[6],  p[7]]);
+    // w1 at p[8..12] — deltas only, not needed for position
+    let w2 = u32::from_le_bytes([p[12], p[13], p[14], p[15]]);
+    let w3 = u32::from_le_bytes([p[16], p[17], p[18], p[19]]);
+    let w4 = u32::from_le_bytes([p[20], p[21], p[22], p[23]]);
+    // y: signed 19-bit at bits 12-30 of word0
+    let y = sext((w0 >> 12) & 0x7FFFF, 19) as f32 / 8.0;
+    // x: signed 19-bit at bits 0-18 of word2
+    let x = sext(w2 & 0x7FFFF, 19) as f32 / 8.0;
+    // heading: unsigned 12-bit at bits 19-30 of word2 (0..511 = 0..360° CW)
+    let heading_cw = ((w2 >> 19) & 0xFFF) as f32 * (360.0 / 512.0);
     let heading = cw_to_ccw(heading_cw);
-    let animation = (w2 >> 19) & 0x3FF; // 10-bit field: y:19, animation:10, pad:3
+    // z: signed 19-bit at bits 10-28 of word3
+    let z = sext((w3 >> 10) & 0x7FFFF, 19) as f32 / 8.0;
+    // animation: unsigned 10-bit at bits 0-9 of word4
+    let animation = w4 & 0x3FF;
     Some(PositionUpdate { spawn_id, x, y, z, heading, animation })
 }
 
-/// Encode a minimal position update (deltas/animation/heading zero) in the same
-/// bit-packed wire format, for the nav thread's synthetic render-follow packet.
-/// Round-trips with `decode_position_update` (to EQ19 precision, 1/8 unit).
+/// Encode a minimal position update (deltas/animation/heading zero) in the RoF2
+/// PlayerPositionUpdateServer_Struct wire format (24 bytes), for the nav thread's
+/// synthetic render-follow packet.  Round-trips with `decode_position_update`.
 pub fn encode_position_update(spawn_id: u16, x: f32, y: f32, z: f32) -> Vec<u8> {
     let xp = ((x * 8.0) as i32 as u32) & 0x7FFFF;
     let yp = ((y * 8.0) as i32 as u32) & 0x7FFFF;
     let zp = ((z * 8.0) as i32 as u32) & 0x7FFFF;
+    // word0: angle(12)=0, y(19), pad(1)=0  → y at bits 12-30
+    let w0 = yp << 12;
+    // word1: deltas = 0
+    // word2: x(19), heading(12)=0, pad(1)=0 → x at bits 0-18
+    let w2 = xp;
+    // word3: deltaHeading(10)=0, z(19), pad(3)=0 → z at bits 10-28
+    let w3 = zp << 10;
     let mut buf = Vec::with_capacity(SIZE_SPAWN_POSITION_UPDATE);
-    buf.extend_from_slice(&spawn_id.to_le_bytes());
-    buf.extend_from_slice(&(xp << 10).to_le_bytes()); // word1: delta_heading=0, x_pos
-    buf.extend_from_slice(&yp.to_le_bytes());          // word2: y_pos, animation=0
-    buf.extend_from_slice(&zp.to_le_bytes());          // word3: z_pos, delta_y=0
-    buf.extend_from_slice(&0u32.to_le_bytes());        // word4: delta_x/heading=0
-    buf.extend_from_slice(&0u32.to_le_bytes());        // word5: delta_z=0
+    buf.extend_from_slice(&spawn_id.to_le_bytes()); // bytes 0-1: spawn_id
+    buf.extend_from_slice(&0u16.to_le_bytes());      // bytes 2-3: vehicle_id = 0
+    buf.extend_from_slice(&w0.to_le_bytes());         // bytes 4-7:  word0 (y)
+    buf.extend_from_slice(&0u32.to_le_bytes());       // bytes 8-11: word1 (deltas=0)
+    buf.extend_from_slice(&w2.to_le_bytes());         // bytes 12-15: word2 (x)
+    buf.extend_from_slice(&w3.to_le_bytes());         // bytes 16-19: word3 (z)
+    buf.extend_from_slice(&0u32.to_le_bytes());       // bytes 20-23: word4 (anim/deltaY=0)
     buf
 }
 
@@ -763,49 +1124,61 @@ pub struct Death_S {
     pub unknown028: u32,
 }
 
-/// Zone info (688 bytes) — sent on zone entry.
+/// Zone info (948 bytes) — RoF2 NewZone_Struct (rof2_structs.h).
+/// Only the fields needed by apply_new_zone are named; the rest are padding.
+/// Field offsets verified against rof2_structs.h struct definition.
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
 pub struct NewZone_S {
-    pub char_name: [u8; 64],
-    pub zone_short: [u8; 32],
-    pub zone_long: [u8; 278],
-    pub ztype: u8,
-    pub fog_red: [u8; 4],
-    pub fog_green: [u8; 4],
-    pub fog_blue: [u8; 4],
-    pub unknown323: u8,
-    pub fog_minclip: [f32; 4],
-    pub fog_maxclip: [f32; 4],
-    pub gravity: f32,
-    pub time_type: u8,
-    pub rain_chance: [u8; 4],
-    pub rain_duration: [u8; 4],
-    pub snow_chance: [u8; 4],
-    pub snow_duration: [u8; 4],
-    pub unknown360: [u8; 33],
-    pub sky: u8,
-    pub unknown331: [u8; 13],
-    pub zone_exp_mult: f32,
-    pub safe_y: f32,
-    pub safe_x: f32,
-    pub safe_z: f32,
-    pub max_z: f32,
-    pub underworld: f32,
-    pub minclip: f32,
-    pub maxclip: f32,
-    pub unknown_end: [u8; 84],
-    pub zone_short2: [u8; 68],
-    pub unknown672: [u8; 12],
-    pub zone_id: u16,
-    pub zone_instance: u16,
+    pub char_name:            [u8; 64],   // 0
+    pub zone_short_name:      [u8; 128],  // 64   (was 32 in Titanium)
+    pub zone_long_name:       [u8; 128],  // 192
+    pub zone_desc:            [u8; 150],  // 320  (5×30)
+    pub ztype:                u8,         // 470
+    pub fog_red:              [u8; 4],    // 471
+    pub fog_green:            [u8; 4],    // 475
+    pub fog_blue:             [u8; 4],    // 479
+    pub unknown483:           u8,         // 483
+    pub fog_minclip:          [f32; 4],   // 484
+    pub fog_maxclip:          [f32; 4],   // 500
+    pub gravity:              f32,        // 516
+    pub time_type:            u8,         // 520
+    pub rain_chance:          [u8; 4],    // 521
+    pub rain_duration:        [u8; 4],    // 525
+    pub snow_chance:          [u8; 4],    // 529
+    pub snow_duration:        [u8; 4],    // 533
+    pub unknown537:           [u8; 32],   // 537
+    pub zone_timezone:        u8,         // 569
+    pub sky:                  u8,         // 570
+    pub unknown571:           u8,         // 571
+    pub water_midi:           u32,        // 572
+    pub day_midi:             u32,        // 576
+    pub night_midi:           u32,        // 580
+    pub zone_exp_multiplier:  f32,        // 584
+    pub safe_y:               f32,        // 588
+    pub safe_x:               f32,        // 592
+    pub safe_z:               f32,        // 596
+    pub min_z:                f32,        // 600
+    pub max_z:                f32,        // 604
+    pub underworld:           f32,        // 608
+    pub minclip:              f32,        // 612
+    pub maxclip:              f32,        // 616
+    pub _pad_620_852:         [u8; 232],  // 620..852 (ForageLow…many fields)
+    pub zone_id:              u16,        // 852
+    pub zone_instance:        u16,        // 854
+    pub _pad_856_948:         [u8; 92],   // 856..948 (remaining fields)
 }
+
+const _: () = assert!(
+    std::mem::size_of::<NewZone_S>() == 948,
+    "NewZone_S must be 948 bytes (RoF2 NewZone_Struct)"
+);
 
 impl NewZone_S {
     pub fn zone_short_str(&self) -> String {
-        String::from_utf8_lossy(&self.zone_short)
-            .trim_end_matches('\0')
-            .to_string()
+        let end = self.zone_short_name.iter().position(|&b| b == 0)
+            .unwrap_or(self.zone_short_name.len());
+        String::from_utf8_lossy(&self.zone_short_name[..end]).into_owned()
     }
 }
 

@@ -1096,25 +1096,32 @@ impl Navigator {
         // and EQ headings run 0..512 (= 0..360deg), so wire = EQ_units * 4 = deg_cw * 512/360 * 4
         // = deg_cw * 2048/360. (Previously this used 4096/360 = 2x too large, so the server saw
         // the wrong facing and melee never landed — IsFacingMob failed.)
+        // Internal heading is CCW (0=north, 90=west). EQ wire expects CW (0=north, 90=east).
+        // EQEmu decodes wire heading via EQ12toFloat = wire/4; full circle = 512 EQ units.
+        // So wire = cw_degrees * 512/360 * 4 = cw_degrees * 2048/360.
         let h_cw = crate::eq_net::protocol::ccw_to_cw(heading);
-        let eq_heading = ((h_cw * 2048.0 / 360.0) as u16) & 0xFFF;
+        let eq_heading = ((h_cw * 2048.0 / 360.0) as u32) & 0xFFF;
 
-        let mut buf = [0u8; 36];
-        buf[0..2].copy_from_slice(&(gs.player_id as u16).to_le_bytes());
-        buf[2..4].copy_from_slice(&self.position_seq.to_le_bytes());
+        // RoF2 PlayerPositionUpdateClient_Struct (rof2_structs.h, 46 bytes):
+        //   0: sequence(u16)  2: spawn_id(u16)  4: vehicle_id(u16)=0
+        //   6: unknown[4]=0   10: delta_x(f32)  14: heading(u32 field, bits 0-11)
+        //  18: x_pos(f32)     22: delta_z(f32)  26: z_pos(f32)  30: y_pos(f32)
+        //  34: animation(u32 field, bits 0-9)   38: delta_y(f32)
+        //  42: delta_heading(u32 field, bits 0-9 signed) = 0
+        let mut buf = [0u8; 46];
+        buf[0..2].copy_from_slice(&self.position_seq.to_le_bytes()); // sequence
         self.position_seq = self.position_seq.wrapping_add(1);
-        // Titanium PlayerPositionUpdateClient_Struct: server x,y,z map directly to the
-        // wire's x_pos/y_pos/z_pos — no axis swap. y_pos@4, delta_x@12, delta_y@16,
-        // x_pos@24, z_pos@28, heading@32.
-        buf[4..8].copy_from_slice(&y.to_le_bytes());    // y_pos  = server_y (north)
-        buf[8..12].copy_from_slice(&dz.to_le_bytes());  // delta_z
-        buf[12..16].copy_from_slice(&dx.to_le_bytes()); // delta_x = east delta
-        buf[16..20].copy_from_slice(&dy.to_le_bytes()); // delta_y = north delta
-        buf[20..24].copy_from_slice(&anim.to_le_bytes());
-        buf[24..28].copy_from_slice(&x.to_le_bytes());  // x_pos  = server_x (east)
-        buf[28..32].copy_from_slice(&z.to_le_bytes());  // z_pos  = server_z (height)
-        buf[32..34].copy_from_slice(&eq_heading.to_le_bytes());
-
+        buf[2..4].copy_from_slice(&(gs.player_id as u16).to_le_bytes()); // spawn_id
+        // vehicle_id = 0 at [4..6], unknown[4] = 0 at [6..10] (already zeroed)
+        buf[10..14].copy_from_slice(&dx.to_le_bytes());   // delta_x
+        buf[14..18].copy_from_slice(&eq_heading.to_le_bytes()); // heading (12-bit in u32)
+        buf[18..22].copy_from_slice(&x.to_le_bytes());    // x_pos (server east)
+        buf[22..26].copy_from_slice(&dz.to_le_bytes());   // delta_z
+        buf[26..30].copy_from_slice(&z.to_le_bytes());    // z_pos (height)
+        buf[30..34].copy_from_slice(&y.to_le_bytes());    // y_pos (server north)
+        buf[34..38].copy_from_slice(&anim.to_le_bytes()); // animation (10-bit in u32)
+        buf[38..42].copy_from_slice(&dy.to_le_bytes());   // delta_y
+        // delta_heading at [42..46] = 0 (already zeroed)
         stream.send_app_packet(OP_CLIENT_UPDATE, &buf);
     }
 

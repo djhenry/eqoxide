@@ -320,13 +320,11 @@ fn apply_completed_tasks(gs: &mut GameState, p: &[u8]) {
 // ── Per-opcode helpers ────────────────────────────────────────────────────────
 
 fn apply_new_spawn(gs: &mut GameState, payload: &[u8]) {
-    if payload.len() >= SIZE_SPAWN {
-        let spawn = unsafe { safe_read::<Spawn_S>(payload) };
-        let name = spawn.name_str();
+    if let Some((info, _)) = parse_rof2_spawn(payload) {
+        let name = info.name.clone();
         // If this new spawn is an NPC corpse, queue it for auto-looting.
-        // (Only fires if the server has loot tables; loot-empty mobs skip corpse creation.)
-        if spawn.NPC != 0 && name.to_lowercase().contains("corpse") {
-            let sid = spawn.spawnId;
+        if info.npc != 0 && name.to_lowercase().contains("corpse") {
+            let sid = info.spawn_id;
             tracing::info!("EQ: NPC corpse spawned: id={} name={:?} → queuing for loot", sid, name);
             gs.pending_loot.push_back(sid);
             if gs.loot_queued_at.is_none() {
@@ -335,7 +333,7 @@ fn apply_new_spawn(gs: &mut GameState, payload: &[u8]) {
             gs.log_msg("combat", &format!("Corpse found: {} — auto-looting…",
                 name.replace("_corpse", "").replace('_', " ")));
         }
-        register_spawn(gs, spawn);
+        register_spawn(gs, info);
     }
 }
 
@@ -389,58 +387,57 @@ fn apply_hp_update(gs: &mut GameState, payload: &[u8]) {
 fn apply_new_zone(gs: &mut GameState, payload: &[u8]) {
     gs.doors.clear();
     if payload.len() < SIZE_NEW_ZONE { return; }
-    let zone = unsafe { safe_read::<NewZone_S>(payload) };
-    gs.zone_name = zone.zone_short_str();
-    gs.zone_id   = zone.zone_id;
-    gs.safe_x    = zone.safe_x;
-    gs.safe_y    = zone.safe_y;
-    gs.safe_z    = zone.safe_z;
+    // RoF2 NewZone_Struct (rof2_structs.h, 948 bytes). Use direct byte offsets
+    // to avoid struct-padding issues with the packed 948-byte layout.
+    // zone_short_name[128] @ offset 64
+    let zs_end = 64 + payload[64..192].iter().position(|&b| b == 0).unwrap_or(128);
+    gs.zone_name = String::from_utf8_lossy(&payload[64..zs_end]).into_owned();
+    // safe_y @ 588, safe_x @ 592, safe_z @ 596
+    gs.safe_y = f32::from_le_bytes([payload[588], payload[589], payload[590], payload[591]]);
+    gs.safe_x = f32::from_le_bytes([payload[592], payload[593], payload[594], payload[595]]);
+    gs.safe_z = f32::from_le_bytes([payload[596], payload[597], payload[598], payload[599]]);
+    // zone_id @ 852
+    gs.zone_id = u16::from_le_bytes([payload[852], payload[853]]);
     gs.zone_changed = true;
     gs.log_msg("zone", &format!("Entered {}", gs.zone_name));
 }
 
 fn apply_zone_spawns(gs: &mut GameState, payload: &[u8]) {
-    let mut offset = 0;
-    while offset + SIZE_SPAWN <= payload.len() {
-        let spawn = unsafe { safe_read::<Spawn_S>(&payload[offset..]) };
-        register_spawn(gs, spawn);
-        offset += SIZE_SPAWN;
+    // RoF2 OP_ZoneSpawns: stream of variable-length spawn records.
+    let mut offset = 0usize;
+    while offset < payload.len() {
+        match parse_rof2_spawn(&payload[offset..]) {
+            Some((info, consumed)) => {
+                register_spawn(gs, info);
+                offset += consumed;
+            }
+            None => break,
+        }
     }
 }
 
 fn apply_zone_entry(gs: &mut GameState, payload: &[u8]) {
-    // Server echoes our own Spawn_S back with a possible 0-, 2-, or 4-byte prefix.
-    for offset in [0usize, 2, 4] {
-        if payload.len() < offset + SIZE_SPAWN { continue; }
-        let spawn = unsafe { safe_read::<Spawn_S>(&payload[offset..]) };
-        let name = spawn.name_str();
+    // RoF2 OP_ZoneEntry uses the same variable-length spawn encoding as OP_ZoneSpawns
+    // (via ENCODE_FORWARD). Parse the first spawn record from the payload.
+    if let Some((info, _)) = parse_rof2_spawn(payload) {
+        let name = &info.name;
         if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            continue;
+            return;
         }
-        if !gs.player_name.is_empty() && name == gs.player_name {
-            let bp1 = spawn.bitfield_pos1;
-            let bp2 = spawn.bitfield_pos2;
-            let bp3 = spawn.bitfield_pos3;
-            let bp4 = spawn.bitfield_pos4;
-            let (x, y, z, heading) = extract_spawn_position(bp1, bp2, bp3, bp4);
-            gs.player_id      = spawn.spawnId;
-            gs.player_x       = x;
-            gs.player_y       = y;
-            gs.player_z       = z;
-            gs.player_heading = heading;
-            gs.player_level   = spawn.level as u32;
-            gs.player_race    = eq_race_to_code(spawn.race).to_string();
-            gs.player_gender  = spawn.gender;
-            for i in 0..9 {
-                gs.player_equipment[i] =
-                    u32::from_le_bytes(spawn.equipment[i*4..i*4+4].try_into().unwrap());
-                gs.player_equipment_tint[i] =
-                    [spawn.equipment_tint[i*4+2], spawn.equipment_tint[i*4+1], spawn.equipment_tint[i*4]];
-            }
+        if !gs.player_name.is_empty() && *name == gs.player_name {
+            gs.player_id      = info.spawn_id;
+            gs.player_x       = info.x;
+            gs.player_y       = info.y;
+            gs.player_z       = info.z;
+            gs.player_heading = info.heading;
+            gs.player_level   = info.level as u32;
+            gs.player_race    = eq_race_to_code(info.race).to_string();
+            gs.player_gender  = info.gender;
+            gs.player_equipment      = info.equipment;
+            gs.player_equipment_tint = info.equipment_tint;
             tracing::info!("EQ: player via ZONE_ENTRY id={} pos=({:.1},{:.1},{:.1}) equip={:?}",
-                      gs.player_id, x, y, z, gs.player_equipment);
+                      gs.player_id, info.x, info.y, info.z, gs.player_equipment);
         }
-        break;
     }
 }
 
@@ -955,73 +952,50 @@ fn apply_money_on_corpse(gs: &mut GameState, payload: &[u8]) {
 
 /// Insert or update one spawn in `gs`. If it matches the player name the
 /// player fields are updated instead and the spawn is NOT added to entities.
-pub fn register_spawn(gs: &mut GameState, spawn: Spawn_S) {
-    let (x, y, z, heading) = extract_spawn_position(
-        spawn.bitfield_pos1, spawn.bitfield_pos2,
-        spawn.bitfield_pos3, spawn.bitfield_pos4,
-    );
-    let name    = spawn.name_str();
-    let is_npc  = spawn.NPC != 0;
+pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
+    let is_npc = info.npc != 0;
 
-    if !is_npc && !gs.player_name.is_empty() && name == gs.player_name {
-        gs.player_id      = spawn.spawnId;
-        gs.player_x       = x;
-        gs.player_y       = y;
-        gs.player_z       = z;
-        gs.player_heading = heading;
-        gs.player_level   = spawn.level as u32;
-        gs.player_race    = eq_race_to_code(spawn.race).to_string();
-        gs.player_gender  = spawn.gender;
-        // EQEmu leaves the PlayerProfile's item_material zeroed; the player's worn
-        // equipment materials/tints arrive in this spawn packet (and via WearChange),
-        // so parse them here or the player renders naked.
-        for i in 0..9 {
-            gs.player_equipment[i] =
-                u32::from_le_bytes(spawn.equipment[i*4..i*4+4].try_into().unwrap());
-            gs.player_equipment_tint[i] =
-                [spawn.equipment_tint[i*4+2], spawn.equipment_tint[i*4+1], spawn.equipment_tint[i*4]];
-        }
-        let sid = spawn.spawnId;
-        tracing::info!("EQ: player spawn id={} pos=({:.1},{:.1},{:.1}) equip={:?}", sid, x, y, z, gs.player_equipment);
+    if !is_npc && !gs.player_name.is_empty() && info.name == gs.player_name {
+        gs.player_id      = info.spawn_id;
+        gs.player_x       = info.x;
+        gs.player_y       = info.y;
+        gs.player_z       = info.z;
+        gs.player_heading = info.heading;
+        gs.player_level   = info.level as u32;
+        gs.player_race    = eq_race_to_code(info.race).to_string();
+        gs.player_gender  = info.gender;
+        gs.player_equipment      = info.equipment;
+        gs.player_equipment_tint = info.equipment_tint;
+        tracing::info!("EQ: player spawn id={} pos=({:.1},{:.1},{:.1}) equip={:?}",
+            info.spawn_id, info.x, info.y, info.z, gs.player_equipment);
         return;
     }
 
-    // Track the player's own pet: a spawn whose petOwnerId points at us (e.g. a summoned necro
-    // pet). Drives OP_PetCommands + auto-pet-combat. Cleared in remove_entity on despawn/death.
-    let pet_owner = spawn.petOwnerId; // copy out of packed struct before use
-    let spawn_id_c = spawn.spawnId;
-    if gs.player_id != 0 && pet_owner == gs.player_id {
-        gs.pet_id = Some(spawn_id_c);
-        tracing::info!("EQ: player pet spawned id={spawn_id_c} name='{name}'");
+    // Track the player's own pet (necro/mage/etc.) via petOwnerId.
+    if gs.player_id != 0 && info.pet_owner_id == gs.player_id {
+        gs.pet_id = Some(info.spawn_id);
+        tracing::info!("EQ: player pet spawned id={} name='{}'", info.spawn_id, info.name);
     }
 
-    let equipment: [u32; 9] = std::array::from_fn(|i| {
-        u32::from_le_bytes(spawn.equipment[i*4..i*4+4].try_into().unwrap())
-    });
-    let equipment_tint: [[u8; 3]; 9] = std::array::from_fn(|i| {
-        // Tint_Struct wire order is Blue, Green, Red; store as RGB (matches WearChange + profile).
-        [spawn.equipment_tint[i*4+2], spawn.equipment_tint[i*4+1], spawn.equipment_tint[i*4]]
-    });
     gs.upsert_entity(Entity {
-        spawn_id: spawn.spawnId,
-        name,
-        level:    spawn.level as u32,
+        spawn_id:       info.spawn_id,
+        name:           info.name,
+        level:          info.level as u32,
         is_npc,
-        x, y, z,
-        // Spawn_Struct curHp is an HP *percent* (100 for players, up to ~110 for some
-        // NPCs), not absolute HP — so a damaged NPC spawns showing its real health.
-        hp_pct:   (spawn.curHp as f32).min(100.0),
-        cur_hp:   spawn.curHp as i32,
-        max_hp:   spawn.max_hp as i32,
-        race:     eq_race_to_code(spawn.race).to_string(),
-        heading,
-        dead:     false,
-        equipment,
-        equipment_tint,
-        gender: spawn.gender,
-        helm: spawn.helm,
-        showhelm: spawn.showhelm,
-        animation: spawn.StandState as u32,
+        x: info.x, y: info.y, z: info.z,
+        // curHp in RoF2 Spawn_Struct is an HP percent (0..100), same as Titanium.
+        hp_pct:         (info.cur_hp as f32).min(100.0),
+        cur_hp:         info.cur_hp as i32,
+        max_hp:         100, // RoF2 spawn has no separate max_hp; treat as percent
+        race:           eq_race_to_code(info.race).to_string(),
+        heading:        info.heading,
+        dead:           false,
+        equipment:      info.equipment,
+        equipment_tint: info.equipment_tint,
+        gender:         info.gender,
+        helm:           info.helm,
+        showhelm:       info.show_helm as u8,
+        animation:      info.stand_state as u32,
     });
 }
 
@@ -1199,13 +1173,18 @@ mod tests {
     #[test]
     fn apply_wear_change_updates_one_slot() {
         use super::{register_spawn, apply_wear_change};
-        use crate::eq_net::protocol::Spawn_S;
+        use crate::eq_net::protocol::SpawnInfo;
         let mut gs = GameState::new();
         gs.player_name = "Nobody".into();
-        let mut spawn: Spawn_S = unsafe { std::mem::zeroed() };
-        spawn.spawnId = 42; spawn.NPC = 1; spawn.level = 5;
-        spawn.name[0] = b'a';
-        register_spawn(&mut gs, spawn);
+        let info = SpawnInfo {
+            spawn_id: 42, name: "a".into(), last_name: String::new(),
+            level: 5, npc: 1, gender: 0, race: 54, class_: 1, body_type: 1,
+            cur_hp: 100, helm: 0, show_helm: false, stand_state: 100,
+            pet_owner_id: 0, player_state: 64,
+            x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100,
+            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9],
+        };
+        register_spawn(&mut gs, info);
 
         // spawn_id=42, material=17, color B,G,R=(1,2,3),UseTint=0xFF, wear_slot_id=1 (chest)
         let pkt = [42u8, 0, 17, 0, 1, 2, 3, 0xFF, 1];
@@ -1277,26 +1256,26 @@ mod tests {
 
     #[test]
     fn register_spawn_parses_equipment_le() {
-        use crate::eq_net::protocol::Spawn_S;
+        use crate::eq_net::protocol::SpawnInfo;
         use super::register_spawn;
         let mut gs = GameState::new();
         gs.player_name = "Someone Else".into();
-        let mut spawn: Spawn_S = unsafe { std::mem::zeroed() };
-        spawn.spawnId = 7;
-        spawn.NPC = 1;
-        spawn.level = 10;
-        spawn.name[0] = b'O'; spawn.name[1] = b'r'; spawn.name[2] = b'c';
-        // slot 1 (chest) material id = 17 (LE u32 at byte offset 4)
-        spawn.equipment[4] = 17;
-        // slot 1 wire bytes are BGR: Blue=10, Green=20, Red=30 at byte offset 4
-        spawn.equipment_tint[4] = 10;
-        spawn.equipment_tint[5] = 20;
-        spawn.equipment_tint[6] = 30;
-        spawn.gender = 1;
-        register_spawn(&mut gs, spawn);
+        let mut equipment = [0u32; 9];
+        equipment[1] = 17; // chest material
+        let mut equipment_tint = [[0u8; 3]; 9];
+        equipment_tint[1] = [30, 20, 10]; // RGB (already in RGB order for SpawnInfo)
+        let info = SpawnInfo {
+            spawn_id: 7, name: "Orc".into(), last_name: String::new(),
+            level: 10, npc: 1, gender: 1, race: 54, class_: 1, body_type: 1,
+            cur_hp: 100, helm: 0, show_helm: false, stand_state: 100,
+            pet_owner_id: 0, player_state: 64,
+            x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100,
+            equipment, equipment_tint,
+        };
+        register_spawn(&mut gs, info);
         let e = gs.entities.get(&7).expect("entity registered");
         assert_eq!(e.equipment[1], 17);
-        assert_eq!(e.equipment_tint[1], [30, 20, 10]); // wire BGR [10,20,30] → stored RGB
+        assert_eq!(e.equipment_tint[1], [30, 20, 10]); // stored RGB
         assert_eq!(e.gender, 1);
     }
 
