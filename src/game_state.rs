@@ -282,6 +282,19 @@ impl GameState {
         self.entities.insert(e.spawn_id, e);
     }
 
+    /// Deduct `copper` from on-hand coin and redistribute the remaining total into
+    /// platinum/gold/silver/copper (1pp=10gp=100sp=1000cp). Returns false (no change) if funds are
+    /// insufficient. Used for merchant buys, which the server takes client-side (update_client=false)
+    /// without sending an OP_MoneyUpdate — so the HUD coin would otherwise stay stale.
+    pub fn spend_coin(&mut self, copper: u64) -> bool {
+        let total = self.coin[0] as u64 * 1000 + self.coin[1] as u64 * 100
+                  + self.coin[2] as u64 * 10  + self.coin[3] as u64;
+        if copper > total { return false; }
+        let r = total - copper;
+        self.coin = [(r / 1000) as u32, ((r % 1000) / 100) as u32, ((r % 100) / 10) as u32, (r % 10) as u32];
+        true
+    }
+
     pub fn remove_entity(&mut self, spawn_id: u32) {
         self.entities.remove(&spawn_id);
         if self.target_id == Some(spawn_id) {
@@ -386,6 +399,24 @@ mod tests {
         assert_eq!(gs.messages.len(), 1);
         assert_eq!(gs.messages[0].kind, "chat");
         assert_eq!(gs.messages[0].text, "hello world");
+    }
+
+    #[test]
+    fn spend_coin_redistributes_and_guards_funds() {
+        let mut gs = GameState::new();
+        gs.coin = [84, 9, 13, 8]; // = 84*1000 + 9*100 + 13*10 + 8 = 85038 copper
+        // Spend 1c -> 85037 -> 85p 0g 3s 7c (the unnormalized 13s gets consolidated)
+        assert!(gs.spend_coin(1));
+        assert_eq!(gs.coin, [85, 0, 3, 7]);
+        // Spend a full plat (1000c) -> 84037 -> 84p 0g 3s 7c
+        assert!(gs.spend_coin(1000));
+        assert_eq!(gs.coin, [84, 0, 3, 7]);
+        // Insufficient funds: no change, returns false
+        assert!(!gs.spend_coin(10_000_000));
+        assert_eq!(gs.coin, [84, 0, 3, 7]);
+        // Spend everything (84037 copper)
+        assert!(gs.spend_coin(84_037));
+        assert_eq!(gs.coin, [0, 0, 0, 0]);
     }
 
     #[test]
