@@ -25,6 +25,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_EXP_UPDATE           => apply_exp_update(gs, p),
         OP_LEVEL_UPDATE         => apply_level_update(gs, p),
         OP_CHANNEL_MESSAGE      => apply_channel_message(gs, p),
+        OP_SET_CHAT_SERVER      => apply_set_chat_server(gs, p),
         OP_SPECIAL_MESG         => apply_special_message(gs, p),
         OP_FORMATTED_MESSAGE    => apply_formatted_message(gs, p),
         OP_SIMPLE_MESSAGE       => apply_simple_message(gs, p),
@@ -705,6 +706,19 @@ fn apply_level_update(gs: &mut GameState, payload: &[u8]) {
     let level = lu.level;
     gs.player_level = level;
     gs.log_msg("exp", &format!("*** Level {}! ***", level));
+}
+
+/// OP_SetChatServer — the UCS (chat server) address + mail key, sent at zone-in. Capture it so the
+/// UCS link can connect for cross-zone tells/OOC. (Connection/login is built on top of this.)
+fn apply_set_chat_server(gs: &mut GameState, payload: &[u8]) {
+    match crate::eq_net::ucs::parse_set_chat_server(payload) {
+        Some(info) => {
+            tracing::info!("UCS: chat server {}:{} mailbox='{}' type='{}'",
+                info.host, info.port, info.mailbox, info.conn_type);
+            gs.ucs = Some(info);
+        }
+        None => tracing::warn!("UCS: could not parse OP_SetChatServer payload ({} bytes)", payload.len()),
+    }
 }
 
 fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {

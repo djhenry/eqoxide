@@ -222,6 +222,9 @@ pub struct GameState {
     pub chat_events:  VecDeque<ChatLogEvent>,
     pub next_chat_id: u64,
 
+    // UCS (chat server) connection params from OP_SetChatServer; Some once received at zone-in.
+    pub ucs: Option<crate::eq_net::ucs::UcsInfo>,
+
     // Strategy text for HUD
     pub strategy: String,
 
