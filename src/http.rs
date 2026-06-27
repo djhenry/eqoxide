@@ -297,6 +297,9 @@ pub fn spawn_camera_server(
     camp:             CampReq,
     camp_until:       CampUntil,
     port:             u16,
+    // When `Some`, an already-bound listener from `--api-port` (exact port, no scan).
+    // When `None`, scan upward from `port` for the first free port.
+    exact_listener:   Option<std::net::TcpListener>,
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
@@ -344,25 +347,33 @@ pub fn spawn_camera_server(
                 .route("/camp", post(post_camp))
                 .route("/debug", get(get_debug))
                 .with_state(state);
-            // Scan upward from the configured base port so multiple client instances
-            // (e.g. one per worktree) each grab the next free port instead of colliding.
-            const MAX_TRIES: u16 = 50;
-            let mut bound = None;
-            for p in port..port.saturating_add(MAX_TRIES) {
-                if let Ok(l) = tokio::net::TcpListener::bind(("127.0.0.1", p)).await {
-                    bound = Some((l, p));
-                    break;
+            let (listener, bound_port) = if let Some(std_l) = exact_listener {
+                // --api-port: use the listener main already bound to the exact requested port.
+                std_l.set_nonblocking(true).expect("set api-port listener non-blocking");
+                let l = tokio::net::TcpListener::from_std(std_l).expect("adopt api-port listener");
+                let p = l.local_addr().map(|a| a.port()).unwrap_or(port);
+                (l, p)
+            } else {
+                // Scan upward from the configured base port so multiple client instances
+                // (e.g. one per worktree) each grab the next free port instead of colliding.
+                const MAX_TRIES: u16 = 50;
+                let mut bound = None;
+                for p in port..port.saturating_add(MAX_TRIES) {
+                    if let Ok(l) = tokio::net::TcpListener::bind(("127.0.0.1", p)).await {
+                        bound = Some((l, p));
+                        break;
+                    }
                 }
-            }
-            let (listener, bound_port) = match bound {
-                Some(found) => found,
-                None => {
-                    tracing::info!(
-                        "camera HTTP: no free port in {}..{} — camera API disabled",
-                        port,
-                        port.saturating_add(MAX_TRIES)
-                    );
-                    return;
+                match bound {
+                    Some(found) => found,
+                    None => {
+                        tracing::info!(
+                            "camera HTTP: no free port in {}..{} — camera API disabled",
+                            port,
+                            port.saturating_add(MAX_TRIES)
+                        );
+                        return;
+                    }
                 }
             };
             // Machine-parseable line on stdout so a launching agent can discover the port.

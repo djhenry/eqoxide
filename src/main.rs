@@ -31,12 +31,17 @@ OPTIONS:
                            Omit to use the default ~/.config/eqoxide/config.yaml.
     --testzone             Run the renderer offline (no server) for asset/zone debugging.
     --profile              Enable the per-phase frame-timing HUD overlay.
+    --api-port <N>         Bind the agent HTTP API to exactly TCP port N (1-65535), instead of
+                           scanning upward from the config base port. The launch's API is
+                           disabled if N is already in use. Use a port you've reserved via a
+                           /tmp lockfile so concurrent test clients don't collide.
     -h, --help             Show this help and exit.
 ";
     let args: Vec<String> = std::env::args().collect();
     let mut testzone_mode = false;
     let mut profile_flag  = false;
     let mut login_cfg_arg: Option<String> = None;
+    let mut api_port_arg: Option<u16> = None;
     let mut idx = 1; // skip argv[0] (program name)
     while idx < args.len() {
         let arg = args[idx].as_str();
@@ -62,6 +67,27 @@ OPTIONS:
                     std::process::exit(2);
                 }
                 login_cfg_arg = Some(value);
+            }
+            // accept both "--api-port <value>" and "--api-port=<value>"
+            _ if arg == "--api-port" || arg.starts_with("--api-port=") => {
+                let value = if let Some(v) = arg.strip_prefix("--api-port=") {
+                    v.to_string()
+                } else {
+                    match args.get(idx + 1) {
+                        Some(v) if !v.starts_with('-') => { idx += 1; v.clone() }
+                        _ => {
+                            eprintln!("error: --api-port requires a value (a TCP port 1-65535)\n\n{USAGE}");
+                            std::process::exit(2);
+                        }
+                    }
+                };
+                match value.parse::<u16>() {
+                    Ok(p) if p > 0 => api_port_arg = Some(p),
+                    _ => {
+                        eprintln!("error: --api-port must be a number 1-65535, got '{value}'\n\n{USAGE}");
+                        std::process::exit(2);
+                    }
+                }
             }
             other => {
                 eprintln!("error: unrecognized argument '{other}'\n\n{USAGE}");
@@ -247,6 +273,19 @@ OPTIONS:
     let app_spells  = spells.clone();
     let app_door_click = door_click.clone();
     let app_player_info = player_info.clone();
+    // --api-port N: bind exactly N now and FAIL THE LAUNCH if it's taken (don't open a window with
+    // a dead API). The bound listener is handed to the server thread so there's no re-bind race.
+    // Without --api-port, pass None and let the server scan upward from the config base port.
+    let exact_listener: Option<std::net::TcpListener> = match api_port_arg {
+        Some(p) => match std::net::TcpListener::bind(("127.0.0.1", p)) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!("error: --api-port {p} is unavailable ({e}). Free the port or choose another.");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
     http::spawn_camera_server(
         camera_cmd.clone(),
         camera_snapshot.clone(),
@@ -282,6 +321,7 @@ OPTIONS:
         camp.clone(),
         camp_until.clone(),
         app_cfg.http_port,
+        exact_listener,
     );
 
     let event_loop = EventLoop::new().expect("event loop");
