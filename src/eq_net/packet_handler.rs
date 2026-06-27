@@ -86,14 +86,18 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
     }
 }
 
-/// OP_Animation — a spawn performs a one-shot animation. Animation_Struct: spawnid(u16) speed(u8)
-/// action(u8). We record COMBAT swings (action 1..=9: kick/pierce/slash/weapon/hand-to-hand) keyed
+/// OP_Animation — a spawn performs a one-shot animation.
+/// RoF2 Animation_Struct (rof2_structs.h):
+///   /*00*/ uint16 spawnid
+///   /*02*/ uint8  action   ← byte 2
+///   /*03*/ uint8  speed    ← byte 3
+/// We record COMBAT swings (action 1..=9: kick/pierce/slash/weapon/hand-to-hand) keyed
 /// by spawn_id (the player's own swings arrive under gs.player_id); the renderer plays clip
 /// C0{action} for a short window then reverts. Non-combat anim codes are ignored.
 fn apply_animation(gs: &mut GameState, p: &[u8]) {
     if p.len() < 4 { return; }
     let spawnid = u16::from_le_bytes([p[0], p[1]]) as u32;
-    let action  = p[3];
+    let action  = p[2];   // RoF2: action at byte 2 (was p[3]=speed — off-by-one)
     if (1..=9).contains(&action) {
         gs.combat_anims.insert(spawnid, (action, std::time::Instant::now()));
     }
@@ -606,6 +610,17 @@ pub fn apply_interrupt_cast(gs: &mut GameState, p: &[u8]) {
     }
 }
 
+/// RoF2 Death_Struct wire layout (eq_packet_structs.h — no ENCODE in rof2.cpp so server sends raw):
+///   /*000*/ uint32 spawn_id     — dying entity's spawn id
+///   /*004*/ uint32 killer_id
+///   /*008*/ uint32 corpseid
+///   /*012*/ uint32 bindzoneid
+///   /*016*/ uint32 spell_id
+///   /*020*/ uint32 attack_skill
+///   /*024*/ uint32 damage
+///   /*028*/ uint32 unknown028
+/// (Note: rof2_structs.h swaps attack_skill/bindzoneid at offsets 12/20 vs eq_packet_structs.h,
+/// but since OP_Death has no encode, the wire always uses the eq_packet_structs.h ordering.)
 fn apply_death(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < SIZE_DEATH { return; }
     let d = unsafe { safe_read::<Death_S>(payload) };
@@ -620,8 +635,9 @@ fn apply_death(gs: &mut GameState, payload: &[u8]) {
         let name = gs.entities.get(&d_id).map(|e| e.name.clone());
         if let Some(name) = name {
             if let Some(e) = gs.entities.get_mut(&d_id) {
-                e.dead   = true;
-                e.hp_pct = 0.0;
+                e.dead      = true;
+                e.hp_pct    = 0.0;
+                e.animation = 115; // Animation::Lying — triggers "dead" clip in scene renderer
             }
             tracing::info!("EQ: combat: {} has been slain", name);
             gs.log_msg("combat", &format!("{} has been slain", name));
@@ -918,10 +934,14 @@ fn apply_bind_respawn(gs: &mut GameState, payload: &[u8]) {
 }
 
 fn apply_become_corpse(gs: &mut GameState, payload: &[u8]) {
-    // OP_BECOME_CORPSE (0x4dbc): server sends when NPC dies with loot.
-    // Struct: unknown(4) + spawn_id(4) + y(4) + x(4) = 16 bytes observed on wire.
-    if payload.len() < 8 { return; }
-    let corpse_id = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    // OP_BECOME_CORPSE: server sends on player death (to trigger corpse + rebind).
+    // RoF2 BecomeCorpse_Struct (rof2_structs.h / eq_packet_structs.h — no ENCODE):
+    //   /*00*/ uint32 spawn_id   ← corpse's spawn id at byte 0 (Titanium comment was wrong: no 4-byte prefix)
+    //   /*04*/ float  y
+    //   /*08*/ float  x
+    //   /*12*/ float  z          → total 16 bytes
+    if payload.len() < 4 { return; }
+    let corpse_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
     tracing::info!("EQ: OP_BecomeCorpse corpse_id={}", corpse_id);
     gs.pending_loot.push_back(corpse_id);
     if gs.loot_queued_at.is_none() {
@@ -1562,5 +1582,88 @@ mod tests {
         assert_eq!(gs.player_level, 35);
         assert_eq!(gs.player_gender, 1);
         assert_eq!(gs.player_race, "ELF");
+    }
+
+    // ── RoF2 Animation_Struct byte-layout tests ──────────────────────────────────────────────────
+
+    /// RoF2 Animation_Struct (rof2_structs.h):
+    ///   /*00*/ uint16 spawnid
+    ///   /*02*/ uint8  action   ← combat swing code (1–9)
+    ///   /*03*/ uint8  speed
+    /// Regression: old code read p[3] (speed) instead of p[2] (action), so combat anims never fired.
+    #[test]
+    fn apply_animation_reads_action_from_byte2_not_byte3() {
+        use super::apply_animation;
+        let mut gs = GameState::new();
+        // Build a 4-byte Animation_Struct: spawnid=55 (LE u16), action=5, speed=50
+        let pkt: [u8; 4] = [
+            55, 0,   // spawnid = 55 (LE)
+            5,       // action  = 5  (at byte 2)
+            50,      // speed   = 50 (at byte 3) — must NOT be used as action
+        ];
+        apply_animation(&mut gs, &pkt);
+        let entry = gs.combat_anims.get(&55).expect("combat anim must be recorded for spawnid=55");
+        assert_eq!(entry.0, 5, "action code must be 5 (byte 2), not 50 (byte 3 speed)");
+    }
+
+    /// Speed=50 is NOT in the valid action range 1..=9, so no anim should be recorded.
+    /// If we had read p[3]=50 instead of p[2]=5, the combat_anim would never fire.
+    #[test]
+    fn apply_animation_speed_byte_does_not_trigger_anim() {
+        use super::apply_animation;
+        let mut gs = GameState::new();
+        // action=0 (non-combat), speed=5 (in range 1..=9 — must NOT be used as action)
+        let pkt: [u8; 4] = [10, 0, 0, 5];
+        apply_animation(&mut gs, &pkt);
+        assert!(gs.combat_anims.is_empty(), "non-combat action=0 must not create an anim entry");
+    }
+
+    // ── RoF2 Death_Struct byte-layout tests ─────────────────────────────────────────────────────
+
+    /// RoF2 / eq_packet_structs.h Death_Struct (no ENCODE in rof2.cpp — wire is server's layout):
+    ///   /*000*/ uint32 spawn_id    ← the dying entity's id
+    ///   /*004*/ uint32 killer_id
+    ///   ... (32 bytes total)
+    /// The handler must: (a) mark the correct entity dead, (b) set animation=115 (Lying).
+    #[test]
+    fn apply_death_marks_npc_dead_and_sets_lying_animation() {
+        use super::apply_death;
+        use crate::game_state::Entity;
+        let mut gs = GameState::new();
+        gs.player_id = 1;
+        // Register an NPC entity with id=42
+        gs.entities.insert(42, Entity {
+            spawn_id: 42, name: "Orc Pawn".into(),
+            x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100,
+            level: 5, is_npc: true, gender: 0, race: "ORC".into(),
+            cur_hp: 50, max_hp: 100, hp_pct: 50.0,
+            dead: false,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9],
+            helm: 0, showhelm: 0,
+        });
+        // Build a 32-byte Death_Struct payload: spawn_id=42, killer_id=1 (player)
+        let mut pkt = [0u8; 32];
+        pkt[0..4].copy_from_slice(&42u32.to_le_bytes());  // spawn_id  (bytes 0-3)
+        pkt[4..8].copy_from_slice(&1u32.to_le_bytes());   // killer_id (bytes 4-7)
+        apply_death(&mut gs, &pkt);
+        let e = gs.entities.get(&42).expect("entity must remain in map after death");
+        assert!(e.dead, "entity must be marked dead");
+        assert_eq!(e.hp_pct, 0.0, "hp_pct must be zeroed");
+        assert_eq!(e.animation, 115, "animation must be set to 115 (Lying) for dead clip");
+        // Auto-loot queued for player's own kill
+        assert!(gs.pending_loot.contains(&42), "corpse id must be queued for auto-loot");
+    }
+
+    /// Sanity: OP_Death for the player's own id must NOT touch entities or animation=115.
+    #[test]
+    fn apply_death_player_self_death_sets_hp_zero_not_entity() {
+        use super::apply_death;
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+        let mut pkt = [0u8; 32];
+        pkt[0..4].copy_from_slice(&7u32.to_le_bytes());  // spawn_id = player
+        apply_death(&mut gs, &pkt);
+        assert_eq!(gs.hp_pct, 0.0, "player hp_pct must be zeroed on self-death");
+        assert!(gs.entities.is_empty(), "entities map must be untouched on player self-death");
     }
 }
