@@ -107,6 +107,20 @@ pub fn build_pet_command(command: u32, target: u32) -> Vec<u8> {
     buf
 }
 
+/// RoF2 `MerchantClick_Struct` (24 bytes): npc_id@0, player_id@4, command@8 (1=open, 0=close),
+/// rate@12, **tab_display@16** (bitmask — b001 = Purchase/Sell tab), unknown02@20 (-1 from client).
+/// Titanium was 16 bytes with no tab_display; without tab_display set the RoF2 server opens the
+/// window but sends NO merchant inventory, so it must be 1.
+fn merchant_click(npc_id: u32, player_id: u32, command: u32) -> [u8; 24] {
+    let mut b = [0u8; 24];
+    b[0..4].copy_from_slice(&npc_id.to_le_bytes());
+    b[4..8].copy_from_slice(&player_id.to_le_bytes());
+    b[8..12].copy_from_slice(&command.to_le_bytes());
+    b[16..20].copy_from_slice(&1i32.to_le_bytes());    // tab_display = Purchase/Sell
+    b[20..24].copy_from_slice(&(-1i32).to_le_bytes());  // unknown02 = -1 (client value)
+    b
+}
+
 /// Titanium `SpawnAppearance_Struct` (8 bytes): spawn_id(u16), type(u16), parameter(u32).
 /// For sit/stand: kind=14 (Animation), parameter=110 (sit) / 100 (stand).
 pub fn build_spawn_appearance_packet(spawn_id: u16, kind: u16, parameter: u32) -> Vec<u8> {
@@ -640,11 +654,7 @@ impl Navigator {
         // merchant is open by the time the buy arrives. Must be within ~200u of the merchant.
         let buy_req = self.buy.lock().unwrap().take();
         if let Some((merchant_id, slot)) = buy_req {
-            // MerchantClick_Struct (16b): npc_id, player_id, command(1=open), rate.
-            let mut open = [0u8; 16]; // MerchantClick_Struct: npc_id, player_id, command, rate (16b)
-            open[0..4].copy_from_slice(&merchant_id.to_le_bytes());
-            open[4..8].copy_from_slice(&gs.player_id.to_le_bytes());
-            open[8..12].copy_from_slice(&1u32.to_le_bytes());
+            let open = merchant_click(merchant_id, gs.player_id, 1);
             stream.send_app_packet(OP_SHOP_REQUEST, &open);
             // Merchant_Sell_Struct (24b): npcid, playerid, itemslot, unknown12, quantity, price.
             let mut buy = [0u8; 24];
@@ -662,11 +672,7 @@ impl Navigator {
         // Must be within ~200u of the merchant; the server computes the price (we send 0).
         let sell_req = self.sell.lock().unwrap().take();
         if let Some((merchant_id, slot, quantity)) = sell_req {
-            // MerchantClick_Struct (16b): npc_id, player_id, command(1=open), rate.
-            let mut open = [0u8; 16]; // MerchantClick_Struct: npc_id, player_id, command, rate (16b)
-            open[0..4].copy_from_slice(&merchant_id.to_le_bytes());
-            open[4..8].copy_from_slice(&gs.player_id.to_le_bytes());
-            open[8..12].copy_from_slice(&1u32.to_le_bytes());
+            let open = merchant_click(merchant_id, gs.player_id, 1);
             stream.send_app_packet(OP_SHOP_REQUEST, &open);
             // Merchant_Purchase_Struct (16b): npcid, itemslot(player slot), quantity, price.
             let mut sell = [0u8; 16];
@@ -688,10 +694,7 @@ impl Navigator {
                 TradeCmd::Open(id) => (id, 1u32),
                 TradeCmd::Close    => (gs.merchant_open.unwrap_or(0), 0u32),
             };
-            let mut open = [0u8; 16]; // MerchantClick_Struct: npc_id, player_id, command, rate (16b)
-            open[0..4].copy_from_slice(&merchant_id.to_le_bytes());
-            open[4..8].copy_from_slice(&gs.player_id.to_le_bytes());
-            open[8..12].copy_from_slice(&command.to_le_bytes());
+            let open = merchant_click(merchant_id, gs.player_id, command);
             stream.send_app_packet(OP_SHOP_REQUEST, &open);
             tracing::info!("EQ: shop {} — merchant_id={}", if command == 1 { "open" } else { "close" }, merchant_id);
             if command == 0 { gs.merchant_open = None; gs.merchant_items.clear(); }
