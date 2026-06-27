@@ -18,3 +18,4 @@ expected vs. actual, observations/diagnosis, suspected root cause, and status.
 | [Char creation sends Titanium struct under RoF2 (80 vs 96)](charcreate-titanium-struct-under-rof2.md) | High | Fixed |
 | [Player currency decodes to garbage values (RoF2)](inventory-currency-garbage-values-rof2.md) | Medium | Open |
 | [Auto-combat ignores adds — player dies unanswered](auto-combat-ignores-adds-player-dies.md) | High | Open |
+| [No death/respawn handling — stuck as corpse](no-death-respawn-handling-stuck-corpse.md) | High | Open |
