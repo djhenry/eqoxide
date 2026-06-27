@@ -38,6 +38,8 @@ pub struct RoF2Item {
     pub price:          u32,
     /// Merchant stock count (header.merchant_slot for merchant items).
     pub merchant_count: u32,
+    /// Number of items in this stack (1 for non-stackable). The display quantity.
+    pub stacksize:      u32,
     pub charges:        u32,
     pub id:             u32,
     pub icon:           u32,
@@ -97,6 +99,11 @@ pub fn parse_rof2_item(buf: &[u8]) -> Option<(RoF2Item, usize)> {
     let u32a = |o: usize| u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
 
     // ── A. ItemSerializationHeader (77 bytes) ──────────────────────────────────
+    // For a STACKABLE item, `stacksize` (@17) is the number in the stack (rof2.cpp:6453 sets
+    // it to inst->GetCharges()); `charges` (@56) is only 0/1 for stackables. For a charged
+    // non-stackable item (wand) `charges` holds the charge count. So the slot QUANTITY is
+    // `stacksize` — reading `charges` made every stack display as 1.
+    let stacksize      = u32a(17);
     let slot_type      = buf[25];
     let main_slot      = u16a(26);
     let sub_slot       = u16a(28);
@@ -187,7 +194,7 @@ pub fn parse_rof2_item(buf: &[u8]) -> Option<(RoF2Item, usize)> {
         off += sub_len;
     }
 
-    Some((RoF2Item { slot_type, main_slot, sub_slot, price, merchant_count, charges,
+    Some((RoF2Item { slot_type, main_slot, sub_slot, price, merchant_count, stacksize, charges,
                      id, icon, name, idfile }, off))
 }
 

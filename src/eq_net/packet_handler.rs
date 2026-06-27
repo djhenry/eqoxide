@@ -221,7 +221,7 @@ fn apply_char_inventory(gs: &mut GameState, p: &[u8]) {
             item_id: item.id,
             name:    item.name,
             icon:    item.icon,
-            charges: (item.charges as i32).max(1),
+            charges: (item.stacksize as i32).max(1), // stack quantity lives in stacksize, not charges
             idfile:  item.idfile,
         });
         off += consumed;
@@ -265,7 +265,7 @@ fn apply_item_packet(gs: &mut GameState, p: &[u8]) {
             item_id: item.id,
             name:    item.name,
             icon:    item.icon,
-            charges: (item.charges as i32).max(1),
+            charges: (item.stacksize as i32).max(1), // stack quantity lives in stacksize, not charges
             idfile:  item.idfile,
         };
         gs.inventory.retain(|x| x.slot != it.slot);
