@@ -150,7 +150,7 @@ pub const OP_TRADE_ACCEPT_CLICK: u16 = 0x69e2; // RoF2: OP_TradeAcceptClick; C->
 pub const OP_FINISH_TRADE: u16       = 0x3993; // RoF2: OP_FinishTrade; S->C, 0 bytes — turn-in completed
 pub const OP_CANCEL_TRADE: u16       = 0x354c; // RoF2: OP_CancelTrade; C->S, abort the trade session (cleanup)
 // Wire slot ids: cursor = 30, the NPC's first trade slot begins at 3000.
-pub const SLOT_CURSOR: u32           = 30;
+pub const SLOT_CURSOR: u32           = 33; // RoF2 cursor slot (Titanium was 30)
 pub const SLOT_TRADE_BEGIN: u32      = 3000;
 
 // Native Task-system quest journal (server→client). Decoded into GameState.tasks for the quest log.
