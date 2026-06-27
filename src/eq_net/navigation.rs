@@ -18,7 +18,7 @@ const NAV_STEP: f32 = RUN_SPEED * (NAV_TICK_MS as f32 / 1000.0); // 44 * 0.150 =
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::{GameState, ZonePoint};
-use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, TradeCmd, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, CastReq, MemSpellReq, SitReq, ConsiderReq, CampReq, CampCmd, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, WarpReq, ZoneCrossReq, ZonePoints};
+use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, TradeCmd, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, ChatEventsShared, ChatSendShared, CastReq, MemSpellReq, SitReq, ConsiderReq, CampReq, CampCmd, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, WarpReq, ZoneCrossReq, ZonePoints};
 
 /// Pending state of a quest turn-in (POST /give). The trade window spans multiple nav ticks:
 /// we send OP_TradeRequest, then must wait for the server's OP_TradeRequestAck before moving the
@@ -152,6 +152,13 @@ pub fn build_click_door(door_id: u8, player_id: u32) -> Vec<u8> {
 /// chan_num 8 = ChatChannel_Say; the server delivers say text to NPCs within 200
 /// units, triggering EVENT_SAY (a "Hail, <name>" message fires the NPC's hail script).
 pub fn build_say_packet(sender: &str, target: &str, message: &str) -> Vec<u8> {
+    build_channel_message(sender, target, 8, message) // chan_num 8 = ChatChannel_Say
+}
+
+/// Build a `ChannelMessage_Struct` for an arbitrary chat channel. `target` is the recipient
+/// for directed channels (tell), empty for broadcasts (ooc/shout/group). EQEmu ChatChannel:
+/// 2 group, 3 shout, 5 OOC, 7 tell, 8 say.
+pub fn build_channel_message(sender: &str, target: &str, chan_num: u32, message: &str) -> Vec<u8> {
     let mut buf = vec![0u8; 148 + message.len() + 1];
     let t = target.as_bytes();
     let tl = t.len().min(63);
@@ -160,7 +167,7 @@ pub fn build_say_packet(sender: &str, target: &str, message: &str) -> Vec<u8> {
     let sl = s.len().min(63);
     buf[64..64 + sl].copy_from_slice(&s[..sl]);
     // language @128 = 0 (CommonTongue), already zero.
-    buf[132..136].copy_from_slice(&8u32.to_le_bytes()); // chan_num = ChatChannel_Say
+    buf[132..136].copy_from_slice(&chan_num.to_le_bytes());
     buf[144..148].copy_from_slice(&100u32.to_le_bytes()); // skill_in_language
     let m = message.as_bytes();
     buf[148..148 + m.len()].copy_from_slice(m);
@@ -243,6 +250,8 @@ pub struct Navigator {
     /// Snapshot of the current zone's doors, published each tick for GET /doors.
     doors_shared:     DoorsShared,
     messages:         MessagesShared,
+    chat_events:      ChatEventsShared,
+    chat_send:        ChatSendShared,
     collision:        crate::assets::SharedCollision,
     maps_dir:         std::path::PathBuf,
     current_zone:     String,
@@ -291,6 +300,8 @@ impl Navigator {
         door_click:       DoorClickReq,
         doors_shared:     DoorsShared,
         messages:         MessagesShared,
+        chat_events:      ChatEventsShared,
+        chat_send:        ChatSendShared,
         cast:             CastReq,
         mem_spell:        MemSpellReq,
         sit:              SitReq,
@@ -328,6 +339,8 @@ impl Navigator {
             door_click,
             doors_shared,
             messages,
+            chat_events,
+            chat_send,
             collision,
             maps_dir,
             current_zone: String::new(),
@@ -397,6 +410,14 @@ impl Navigator {
                 .filter(|k| !k.is_empty())
                 .collect();
             crate::http::MessageEntry { kind: m.kind.clone(), text: m.text.clone(), keywords }
+        }));
+        drop(out);
+        // Publish inter-agent chat events (GET /events), preserving their stable monotonic ids.
+        let mut ev = self.chat_events.lock().unwrap();
+        ev.clear();
+        ev.extend(gs.chat_events.iter().map(|e| crate::http::ChatEvent {
+            id: e.id, from: e.from.clone(), channel: e.channel.clone(),
+            directed: e.directed, text: e.text.clone(),
         }));
     }
 
@@ -582,6 +603,20 @@ impl Navigator {
                 stream.send_app_packet(OP_CHANNEL_MESSAGE, &pkt);
                 gs.log_msg("chat", &format!("You say, '{}'", text));
             }
+        }
+
+        // Drain queued outgoing chat (POST /tell|/ooc|/shout|/group): build + send OP_ChannelMessage.
+        let outgoing: Vec<crate::http::ChatSend> = {
+            let mut q = self.chat_send.lock().unwrap();
+            std::mem::take(&mut *q)
+        };
+        for c in outgoing {
+            let pkt = build_channel_message(&gs.player_name, &c.to, c.chan, &c.text);
+            stream.send_app_packet(OP_CHANNEL_MESSAGE, &pkt);
+            let label = match c.chan { 7 => format!("tell {}", c.to), 5 => "ooc".into(),
+                                       3 => "shout".into(), 2 => "group".into(), n => format!("chan{n}") };
+            tracing::info!("EQ: {} -> {}", label, c.text);
+            gs.log_msg("chat", &format!("You {}: {}", label, c.text));
         }
 
         // Check target request — set target + auto-consider it (con color comes back as
