@@ -15,3 +15,4 @@ expected vs. actual, observations/diagnosis, suspected root cause, and status.
 | [NPC rat movement jerky despite lerp](npc-rat-movement-jerky-despite-lerp.md) | Low | Open |
 | [/inventory API missing currency amounts](inventory-api-missing-currency.md) | Low-Med | Fixed |
 | [New goto/warp/manual move doesn't cancel navigation](new-movement-does-not-cancel-navigation.md) | Medium | Fixed |
+| [Char creation sends Titanium struct under RoF2 (80 vs 96)](charcreate-titanium-struct-under-rof2.md) | High | Fixed |

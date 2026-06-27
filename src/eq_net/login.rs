@@ -580,32 +580,40 @@ fn build_approve_name(name: &str, race: u32, class: u32) -> Vec<u8> {
     buf
 }
 
-/// Build the 80-byte Titanium CharCreate_Struct (OP_CharacterCreate): 20 little-endian
+/// Build the 96-byte RoF2 CharCreate_Struct (OP_CharacterCreate): 24 little-endian
 /// u32 fields in wire order. No name field — the name was sent via OP_ApproveName.
 fn build_char_create(cc: &CharacterCreate) -> Vec<u8> {
-    let fields: [u32; 20] = [
-        cc.class,      // 0x00 class_
-        cc.haircolor,  // 0x04 haircolor
-        cc.beardcolor, // 0x08 beardcolor
-        cc.beard,      // 0x0C beard
-        cc.gender,     // 0x10 gender
-        cc.race,       // 0x14 race
-        cc.start_zone, // 0x18 start_zone
-        cc.hairstyle,  // 0x1C hairstyle
-        cc.deity,      // 0x20 deity
-        cc.str_,       // 0x24 STR
-        cc.sta,        // 0x28 STA
-        cc.agi,        // 0x2C AGI
-        cc.dex,        // 0x30 DEX
-        cc.wis,        // 0x34 WIS
-        cc.int_,       // 0x38 INT
-        cc.cha,        // 0x3C CHA
-        cc.face,       // 0x40 face
-        cc.eyecolor1,  // 0x44 eyecolor1
-        cc.eyecolor2,  // 0x48 eyecolor2
-        0,             // 0x4C tutorial (0 = normal)
+    // RoF2 CharCreate_Struct = 96 bytes (24 x u32). The server negotiates RoF2 (we parse RoF2
+    // spawns/items) and rejects the old Titanium 80-byte layout for wrong size. Field order is
+    // from EQEmu common/patches/rof2_structs.h CharCreate_Struct — DIFFERENT from Titanium:
+    // drakkin_* and unknown0092 are new, and the stats move after the appearance block.
+    let fields: [u32; 24] = [
+        cc.gender,     // 0x00 gender
+        cc.race,       // 0x04 race
+        cc.class,      // 0x08 class_
+        cc.deity,      // 0x0C deity
+        cc.start_zone, // 0x10 start_zone
+        cc.haircolor,  // 0x14 haircolor
+        cc.beard,      // 0x18 beard
+        cc.beardcolor, // 0x1C beardcolor
+        cc.hairstyle,  // 0x20 hairstyle
+        cc.face,       // 0x24 face
+        cc.eyecolor1,  // 0x28 eyecolor1
+        cc.eyecolor2,  // 0x2C eyecolor2
+        0,             // 0x30 drakkin_heritage (non-Drakkin: 0)
+        0,             // 0x34 drakkin_tattoo
+        0,             // 0x38 drakkin_details
+        cc.str_,       // 0x3C STR
+        cc.sta,        // 0x40 STA
+        cc.agi,        // 0x44 AGI
+        cc.dex,        // 0x48 DEX
+        cc.wis,        // 0x4C WIS
+        cc.int_,       // 0x50 INT
+        cc.cha,        // 0x54 CHA
+        0,             // 0x58 tutorial (0 = normal)
+        0,             // 0x5C unknown0092
     ];
-    let mut buf = Vec::with_capacity(80);
+    let mut buf = Vec::with_capacity(96);
     for f in fields { buf.extend_from_slice(&f.to_le_bytes()); }
     buf
 }
@@ -636,18 +644,22 @@ mod charcreate_tests {
 
     #[test]
     fn char_create_layout_and_stat_total() {
+        // RoF2 layout: 96 bytes (24 x u32), order gender,race,class,deity,start_zone, hair/face
+        // block, drakkin_*, then STR..CHA, tutorial, unknown0092.
         let cc = de_sk();
         let pkt = build_char_create(&cc);
-        assert_eq!(pkt.len(), 80);
+        assert_eq!(pkt.len(), 96, "RoF2 CharCreate_Struct must be 96 bytes");
         let f = |i: usize| u32::from_le_bytes(pkt[i*4..i*4+4].try_into().unwrap());
-        assert_eq!(f(0), 5);    // class
-        assert_eq!(f(4), 0);    // gender
-        assert_eq!(f(5), 6);    // race
-        assert_eq!(f(6), 5);    // start_zone (Neriak)
-        assert_eq!(f(8), 206);  // deity (Innoruuk)
-        assert_eq!(f(19), 0);   // tutorial
-        // Stats occupy fields 9..=15 and must total exactly 582 for DE SK.
-        let total: u32 = (9..=15).map(f).sum();
+        assert_eq!(f(0), 0);    // gender
+        assert_eq!(f(1), 6);    // race (Dark Elf)
+        assert_eq!(f(2), 5);    // class (Shadow Knight)
+        assert_eq!(f(3), 206);  // deity (Innoruuk)
+        assert_eq!(f(4), 5);    // start_zone (Neriak)
+        assert_eq!(f(12), 0);   // drakkin_heritage (non-Drakkin)
+        assert_eq!(f(22), 0);   // tutorial
+        assert_eq!(f(23), 0);   // unknown0092
+        // Stats occupy fields 15..=21 and must total exactly 582 for DE SK.
+        let total: u32 = (15..=21).map(f).sum();
         assert_eq!(total, 582);
     }
 
