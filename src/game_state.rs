@@ -95,7 +95,9 @@ pub struct ActiveTask {
 /// One item in the player's inventory/equipment (decoded from OP_CharInventory / OP_ItemPacket).
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct InvItem {
-    /// Titanium slot id: 0-21 worn equipment, 22-29 general inventory, 30 cursor, 251+ bag contents.
+    /// RoF2 wire slot id: equipment 0-22, general-inventory 23-32, cursor 33 (rof2_limits.h).
+    /// Stored as-is from the server's OP_CharInventory / OP_ItemPacket main_slot field so that
+    /// client→server packets (MoveItem, Merchant_Purchase) can send the same value back.
     pub slot:    i32,
     pub item_id: u32,
     pub name:    String,

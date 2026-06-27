@@ -194,36 +194,44 @@ fn apply_task_activity(gs: &mut GameState, p: &[u8]) {
 }
 
 // ── Inventory (OP_CharInventory / OP_ItemPacket) ────────────────────────────────────────────────
-// Titanium serializes items as NULL-separated, pipe('|')-delimited TEXT (see EQEmu titanium.cpp
-// SerializeItem). Per item the fields are: [0]=stackcount [2]=slot ... then `"`+[11]=ItemClass
-// [12]=Name [13]=Lore [14]=IDFile [15]=item ID [22]=Icon. (Bag sub-items append after the parent's
-// own fields; we parse only the top-level fields, which come first.)
+// RoF2 serializes items as packed binary blobs — NOT the old Titanium pipe-delimited text.
+// OP_CharInventory wire format (rof2.cpp:1043 ENCODE(OP_CharInventory)):
+//   uint32 item_count  — 0 → 4-byte zero packet
+//   [item_count × SerializeItem output back-to-back, no padding]
+// Each item is parsed by crate::eq_net::item::parse_rof2_item which returns (RoF2Item, consumed).
+// Slot numbers are RoF2 wire slots: equipment 0-22, general-inv 23-32, cursor 33 (rof2_limits.h).
+// We store them directly in InvItem.slot, consistent with how apply_item_packet already works.
 
-/// Parse one pipe-delimited item record into an InvItem. None if it doesn't have the core fields.
-fn parse_inv_item(record: &str) -> Option<crate::game_state::InvItem> {
-    let f: Vec<&str> = record.split('|').collect();
-    if f.len() < 23 { return None; }
-    let slot: i32 = f[2].trim().parse().ok()?;
-    let name = f[12].trim().trim_start_matches('"').to_string();
-    let idfile = f[14].trim().to_string(); // EQ IDFile (e.g. "IT63") = held/world model id
-    let item_id: u32 = f[15].trim().parse().unwrap_or(0);
-    let icon: u32 = f[22].trim().parse().unwrap_or(0);
-    let charges: i32 = f[0].trim().parse().unwrap_or(1);
-    if name.is_empty() && item_id == 0 { return None; }
-    Some(crate::game_state::InvItem { slot, item_id, name, icon, charges: charges.max(1), idfile })
-}
-
-/// OP_CharInventory — the full inventory + equipment as NULL-separated item records.
+/// OP_CharInventory — the full player inventory + equipment, binary-serialized in RoF2 format.
+/// Reads `uint32 item_count` then N back-to-back SerializeItem blobs, replacing gs.inventory.
 fn apply_char_inventory(gs: &mut GameState, p: &[u8]) {
-    let text = String::from_utf8_lossy(p);
-    let mut items = Vec::new();
-    for record in text.split('\0') {
-        if record.trim().is_empty() { continue; }
-        if let Some(it) = parse_inv_item(record) { items.push(it); }
+    if p.len() < 4 { return; }
+    let item_count = u32::from_le_bytes([p[0], p[1], p[2], p[3]]) as usize;
+    if item_count == 0 { return; }
+    let mut off = 4usize;
+    let mut items = Vec::with_capacity(item_count);
+    for _ in 0..item_count {
+        if off >= p.len() { break; }
+        let Some((item, consumed)) = crate::eq_net::item::parse_rof2_item(&p[off..]) else {
+            tracing::warn!("EQ: OP_CharInventory: failed to parse item at offset {off}; stopping");
+            break;
+        };
+        items.push(crate::game_state::InvItem {
+            slot:    item.main_slot as i32,
+            item_id: item.id,
+            name:    item.name,
+            icon:    item.icon,
+            charges: (item.charges as i32).max(1),
+            idfile:  item.idfile,
+        });
+        off += consumed;
     }
     if !items.is_empty() {
-        tracing::info!("EQ: char inventory: {} items", items.len());
-        gs.inventory = items;
+        tracing::info!("EQ: OP_CharInventory: {} items loaded", items.len());
+        for it in &items {
+            gs.inventory.retain(|x| x.slot != it.slot);
+        }
+        gs.inventory.extend(items);
     }
 }
 
@@ -238,7 +246,7 @@ fn apply_item_packet(gs: &mut GameState, p: &[u8]) {
     const ITEM_PACKET_MERCHANT: u32 = 0x64;
     if p.len() < 4 { return; }
     let packet_type = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
-    let Some(item) = crate::eq_net::item::parse_rof2_item(&p[4..]) else { return; };
+    let Some((item, _)) = crate::eq_net::item::parse_rof2_item(&p[4..]) else { return; };
     if packet_type == ITEM_PACKET_MERCHANT {
         let mi = crate::game_state::MerchantItem {
             merchant_slot: item.main_slot as u32,
@@ -1052,8 +1060,9 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
 #[cfg(test)]
 mod tests {
     use super::{apply_emote, class_name, con_color, consider_message, parse_player_profile,
-                parse_begin_cast, parse_memorize_spell};
+                parse_begin_cast, parse_memorize_spell, apply_char_inventory};
     use crate::game_state::GameState;
+    use crate::eq_net::item::tests::{fixture, fixture2};
 
     #[test]
     fn class_name_maps_ids() {
@@ -1603,6 +1612,57 @@ mod tests {
         apply_animation(&mut gs, &pkt);
         let entry = gs.combat_anims.get(&55).expect("combat anim must be recorded for spawnid=55");
         assert_eq!(entry.0, 5, "action code must be 5 (byte 2), not 50 (byte 3 speed)");
+    }
+
+    // ── OP_CharInventory (RoF2 binary) ──────────────────────────────────────────────────────────
+
+    /// Build a valid OP_CharInventory payload: uint32 count + N item blobs concatenated.
+    fn build_char_inventory(items: &[Vec<u8>]) -> Vec<u8> {
+        let mut buf = (items.len() as u32).to_le_bytes().to_vec();
+        for item in items { buf.extend_from_slice(item); }
+        buf
+    }
+
+    #[test]
+    fn apply_char_inventory_loads_two_items_at_correct_slots() {
+        let mut gs = GameState::new();
+        let payload = build_char_inventory(&[fixture(), fixture2()]);
+        apply_char_inventory(&mut gs, &payload);
+        // fixture()  → id=1001, main_slot=23 (RoF2 general slot 1)
+        // fixture2() → id=2002, main_slot=24 (RoF2 general slot 2), same name
+        assert_eq!(gs.inventory.len(), 2, "exactly two items must land in inventory");
+        let item1 = gs.inventory.iter().find(|i| i.slot == 23).expect("item at slot 23");
+        assert_eq!(item1.item_id, 1001);
+        assert_eq!(item1.icon, 678);
+        assert_eq!(item1.name, "Cloth Cap");
+        let item2 = gs.inventory.iter().find(|i| i.slot == 24).expect("item at slot 24");
+        assert_eq!(item2.item_id, 2002);
+        assert_eq!(item2.icon, 999);
+    }
+
+    #[test]
+    fn apply_char_inventory_ignores_zero_count() {
+        let mut gs = GameState::new();
+        // Push a dummy item so we can verify inventory is untouched
+        gs.inventory.push(crate::game_state::InvItem {
+            slot: 99, item_id: 1, name: "existing".into(), icon: 1, charges: 1, idfile: "IT1".into()
+        });
+        let payload = 0u32.to_le_bytes().to_vec(); // count = 0
+        apply_char_inventory(&mut gs, &payload);
+        assert_eq!(gs.inventory.len(), 1, "zero-count packet must not clear inventory");
+    }
+
+    #[test]
+    fn apply_char_inventory_upserts_by_slot() {
+        // Second call with same slot should replace, not duplicate.
+        let mut gs = GameState::new();
+        let payload1 = build_char_inventory(&[fixture()]);
+        apply_char_inventory(&mut gs, &payload1);
+        assert_eq!(gs.inventory.len(), 1);
+        // Send same slot again (fixture uses slot 23)
+        let payload2 = build_char_inventory(&[fixture()]);
+        apply_char_inventory(&mut gs, &payload2);
+        assert_eq!(gs.inventory.len(), 1, "duplicate slot must upsert, not append");
     }
 
     /// Speed=50 is NOT in the valid action range 1..=9, so no anim should be recorded.
