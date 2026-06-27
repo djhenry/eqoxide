@@ -645,12 +645,14 @@ fn apply_exp_update(gs: &mut GameState, payload: &[u8]) {
     }
 }
 
-// CombatDamage_Struct (23 bytes): target(u16) source(u16) type(u8) spellid(u16) damage(u32) ...
+// RoF2 CombatDamage_Struct (rof2_structs.h): target(u16)@0 source(u16)@2 type(u8)@4
+// spellid(u32)@5 damage(int32)@9 force(f32)@13 ... (RoF2 widened spellid to u32, so damage is
+// at offset 9, not Titanium's 7 — reading it at 7 gave damage<<16, i.e. every value ×65536).
 fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
-    if payload.len() < 11 { return; }
+    if payload.len() < 13 { return; }
     let target_id = u16::from_le_bytes([payload[0], payload[1]]) as u32;
     let source_id = u16::from_le_bytes([payload[2], payload[3]]) as u32;
-    let damage    = u32::from_le_bytes([payload[7], payload[8], payload[9], payload[10]]);
+    let damage    = i32::from_le_bytes([payload[9], payload[10], payload[11], payload[12]]);
     let type_val  = payload[4];
     let target_name = gs.entities.get(&target_id).map(|e| e.name.clone())
         .unwrap_or_else(|| if target_id == gs.player_id { gs.player_name.clone() } else { format!("#{target_id}") });
