@@ -417,27 +417,15 @@ fn apply_zone_spawns(gs: &mut GameState, payload: &[u8]) {
 }
 
 fn apply_zone_entry(gs: &mut GameState, payload: &[u8]) {
-    // RoF2 OP_ZoneEntry uses the same variable-length spawn encoding as OP_ZoneSpawns
-    // (via ENCODE_FORWARD). Parse the first spawn record from the payload.
+    // RoF2: OP_ZoneEntry is sent ONCE PER SPAWN (not just for the player). EQEmu's
+    // ENCODE(OP_ZoneEntry) forwards directly to ENCODE(OP_ZoneSpawns), which emits
+    // one new EQApplicationPacket(OP_ZoneEntry, ...) containing a single Spawn_Struct
+    // for each entity in the zone (rof2.cpp:4542/4575/4660). Register every one of
+    // them; `register_spawn` handles player-self detection internally.
     if let Some((info, _)) = parse_rof2_spawn(payload) {
-        let name = &info.name;
-        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            return;
-        }
-        if !gs.player_name.is_empty() && *name == gs.player_name {
-            gs.player_id      = info.spawn_id;
-            gs.player_x       = info.x;
-            gs.player_y       = info.y;
-            gs.player_z       = info.z;
-            gs.player_heading = info.heading;
-            gs.player_level   = info.level as u32;
-            gs.player_race    = eq_race_to_code(info.race).to_string();
-            gs.player_gender  = info.gender;
-            gs.player_equipment      = info.equipment;
-            gs.player_equipment_tint = info.equipment_tint;
-            tracing::info!("EQ: player via ZONE_ENTRY id={} pos=({:.1},{:.1},{:.1}) equip={:?}",
-                      gs.player_id, info.x, info.y, info.z, gs.player_equipment);
-        }
+        tracing::debug!("EQ: ZONE_ENTRY spawn id={} name='{}' npc={} pos=({:.1},{:.1},{:.1})",
+            info.spawn_id, info.name, info.npc, info.x, info.y, info.z);
+        register_spawn(gs, info);
     }
 }
 
@@ -452,7 +440,7 @@ pub fn class_name(id: u32) -> &'static str {
     }
 }
 
-/// Useful fields parsed from the Titanium PlayerProfile_Struct.
+/// Useful fields parsed from the RoF2 PlayerProfile_Struct wire packet.
 pub struct ProfileInfo {
     pub level: u32,
     pub class_id: u32,
@@ -461,26 +449,50 @@ pub struct ProfileInfo {
     pub mem_spells: [u32; 9], // 9 memorized spell-gem ids; 0xFFFFFFFF = empty
 }
 
-/// Parse the Titanium PlayerProfile_Struct. Offsets from EQEmu
-/// common/patches/titanium_structs.h: class_ @12, level @20, stats @2236..2260,
-/// currency @4428..4440. Returns None if the payload is too short to be a full profile.
+/// Parse the RoF2 PlayerProfile_Struct wire packet for the fields needed by the HUD/API.
+///
+/// All byte offsets are from EQEmu common/patches/rof2.cpp ENCODE(OP_PlayerProfile) —
+/// the encode uses sequential WriteUInt32/WriteFloat/WriteUInt8 calls without padding,
+/// so these are WIRE offsets (not struct compiler offsets):
+///
+///   @16:   gender (u8)
+///   @17:   race (u32)
+///   @21:   class_ (u8)
+///   @22:   level (u8)
+///   @184:  equipment[9] visual slots — Texture_Struct (20B each), first u32 = Material
+///          Slots: helm(0) chest(1) arms(2) wrists(3) hands(4) legs(5) feet(6) primary(7) secondary(8)
+///   @808:  tint_count (u32) = 9
+///   @812:  item_tint[9] — Tint_Struct (4B each): Blue(u8), Green(u8), Red(u8), UseTint(u8)
+///   @952:  STR(u32), STA@956, CHA@960, DEX@964, INT@968, AGI@972, WIS@976
+///   @1008: aa_count(u32)=300, aa_array[300]×12B  — (passes through to other fixed fields)
+///   @9380: mem_spell_count(u32)=16
+///   @9384: mem_spells[16] (int32 each; 0xFFFF_FFFF = empty gem)
+///   @12869: platinum(u32), gold@12873, silver@12877, copper@12881
+///
+/// Returns None if the payload is too short to contain even the basic stats block (@976).
+/// Coin and mem_spells default to zeros/empty when the payload is shorter than their offsets.
 pub fn parse_player_profile(payload: &[u8]) -> Option<ProfileInfo> {
-    if payload.len() < 4444 { return None; }
+    // Minimum: WIS at @976 needs @976+4 = @980 bytes.
+    if payload.len() < 980 { return None; }
     let u32_at = |o: usize| u32::from_le_bytes([payload[o], payload[o + 1], payload[o + 2], payload[o + 3]]);
-    Some(ProfileInfo {
-        class_id: u32_at(12),
-        level:    payload[20] as u32,
-        stats: [
-            u32_at(2236), u32_at(2240), u32_at(2244), u32_at(2248),
-            u32_at(2252), u32_at(2256), u32_at(2260),
-        ],
-        coin: [u32_at(4428), u32_at(4432), u32_at(4436), u32_at(4440)],
-        mem_spells: {
-            let mut m = [0xFFFF_FFFFu32; 9];
-            for (i, slot) in m.iter_mut().enumerate() { *slot = u32_at(4360 + i * 4); }
-            m
-        },
-    })
+    let class_id = payload[21] as u32;
+    let level    = payload[22] as u32;
+    let stats = [
+        u32_at(952), u32_at(956), u32_at(960), u32_at(964),
+        u32_at(968), u32_at(972), u32_at(976),
+    ];
+    // mem_spells[0..9]: first 9 of the 16 spell gem slots at @9384
+    // (rof2_structs.h /*09384*/ int32 mem_spells[SPELL_GEM_COUNT=16])
+    let mem_spells = if payload.len() >= 9384 + 9 * 4 {
+        let mut m = [0xFFFF_FFFFu32; 9];
+        for (i, slot) in m.iter_mut().enumerate() { *slot = u32_at(9384 + i * 4); }
+        m
+    } else { [0xFFFF_FFFFu32; 9] };
+    // coin at @12869 (rof2_structs.h /*12869*/ uint32 platinum)
+    let coin = if payload.len() >= 12885 {
+        [u32_at(12869), u32_at(12873), u32_at(12877), u32_at(12881)]
+    } else { [0u32; 4] };
+    Some(ProfileInfo { level, class_id, stats, coin, mem_spells })
 }
 
 pub fn parse_begin_cast(p: &[u8]) -> Option<(u16, u16, u32)> {
@@ -509,34 +521,51 @@ pub fn parse_interrupt_cast(p: &[u8]) -> Option<u32> {
 }
 
 fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
+    // ── RoF2 PlayerProfile early fixed fields ──────────────────────────────────
+    // rof2.cpp ENCODE(OP_PlayerProfile) / rof2_structs.h:
+    //   @16: gender(u8), @17: race(u32), @21: class_(u8), @22: level(u8)
+    if payload.len() >= 23 {
+        let gender   = payload[16];
+        let race     = u32::from_le_bytes([payload[17], payload[18], payload[19], payload[20]]);
+        let class_id = payload[21] as u32;
+        let level    = payload[22] as u32;
+        gs.player_gender = gender;
+        let race_code = eq_race_to_code(race).to_string();
+        if !race_code.is_empty() { gs.player_race = race_code; }
+        let cls = class_name(class_id);
+        if !cls.is_empty() { gs.player_class = cls.to_string(); }
+        if (1..=65).contains(&level) { gs.player_level = level; }
+        tracing::info!("EQ: PlayerProfile: level={} class={} race={} gender={}",
+            level, cls, race, gender);
+    }
+
+    // ── Stats, coin, mem_spells (fixed offsets, no variable-length content before them) ──
     if let Some(p) = parse_player_profile(payload) {
-        if (1..=65).contains(&p.level) {
-            gs.player_level = p.level;
-        }
-        let cls = class_name(p.class_id);
-        if !cls.is_empty() {
-            gs.player_class = cls.to_string();
-        }
         gs.coin = p.coin;
         gs.stats = p.stats;
         gs.mem_spells = p.mem_spells;
     }
 
-    const ITEM_MATERIAL_OFF: usize = 188;
-    const ITEM_TINT_OFF: usize = 268;
-    // Note: EQEmu leaves the Titanium profile's item_material zeroed in practice; the worn
-    // materials arrive in the spawn packet (apply_zone_entry / register_spawn) + WearChange.
-    // This parse is kept as a fallback for servers that do populate it.
-    if payload.len() >= ITEM_TINT_OFF + 9 * 4 {
-        for i in 0..9 {
-            let mo = ITEM_MATERIAL_OFF + i * 4;
-            let mat = u32::from_le_bytes(payload[mo..mo + 4].try_into().unwrap());
-            // Only overwrite with a real material — never clobber spawn-supplied equipment
-            // with the profile's zeros (EQEmu leaves item_material empty).
-            if mat != 0 {
-                gs.player_equipment[i] = mat;
-                let to = ITEM_TINT_OFF + i * 4;
-                gs.player_equipment_tint[i] = [payload[to + 2], payload[to + 1], payload[to]];
+    // ── Equipment materials @184 + i*20, tints @812 + i*4 ──────────────────────
+    // rof2.cpp writes 9 Texture_Struct entries (20B each) starting at @184 for visual
+    // slots (helm..secondary). Tint_Struct[9] written at @812 as Color(u32) BGRA each.
+    // rof2_structs.h: /*00184*/ Texture_Struct equip_helmet .. equip_secondary,
+    //                 /*00812*/ TintProfile item_tint (9 × Tint_Struct)
+    // Only overwrite with a real material — spawn's materials take precedence over profile
+    // zeros (EQEmu often leaves equipment2 zeroed on zone-in, relying on WearChange later).
+    let u32_at = |o: usize| u32::from_le_bytes([payload[o], payload[o+1], payload[o+2], payload[o+3]]);
+    for i in 0..9usize {
+        let mo = 184 + i * 20;
+        if mo + 4 <= payload.len() {
+            let mat = u32_at(mo);
+            if mat != 0 { gs.player_equipment[i] = mat; }
+        }
+        let to = 812 + i * 4;
+        if to + 4 <= payload.len() {
+            // Tint_Struct: Blue=byte0, Green=byte1, Red=byte2, UseTint=byte3 → store as RGB
+            let (b_b, g_b, r_b) = (payload[to], payload[to+1], payload[to+2]);
+            if r_b != 0 || g_b != 0 || b_b != 0 {
+                gs.player_equipment_tint[i] = [r_b, g_b, b_b];
             }
         }
     }
@@ -1016,21 +1045,28 @@ mod tests {
 
     #[test]
     fn parse_player_profile_reads_offsets() {
-        // Too short → None.
+        // Too short → None (need at least @980 for WIS).
         assert!(parse_player_profile(&[0u8; 100]).is_none());
+        assert!(parse_player_profile(&[0u8; 979]).is_none());
 
-        let mut buf = vec![0u8; 5000];
-        buf[12..16].copy_from_slice(&9u32.to_le_bytes());   // class_ = Rogue
-        buf[20] = 12;                                        // level
-        buf[4428..4432].copy_from_slice(&5u32.to_le_bytes());   // platinum
-        buf[4432..4436].copy_from_slice(&3u32.to_le_bytes());   // gold
-        buf[4436..4440].copy_from_slice(&7u32.to_le_bytes());   // silver
-        buf[4440..4444].copy_from_slice(&9u32.to_le_bytes());   // copper
-        buf[2236..2240].copy_from_slice(&75u32.to_le_bytes());  // STR
-        buf[2260..2264].copy_from_slice(&110u32.to_le_bytes()); // WIS
-        // mem_spells[0] @4360 = 200 (Minor Healing), mem_spells[1] @4364 = 0xFFFFFFFF (empty)
-        buf[4360..4364].copy_from_slice(&200u32.to_le_bytes());
-        buf[4364..4368].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        // RoF2 PlayerProfile wire offsets (from rof2.cpp ENCODE(OP_PlayerProfile)):
+        //   @21: class_, @22: level
+        //   @952: STR, @976: WIS
+        //   @9384: mem_spells[0..9]
+        //   @12869: platinum, @12873: gold, @12877: silver, @12881: copper
+        let mut buf = vec![0u8; 14000];
+        buf[21] = 9;   // class_ = Rogue
+        buf[22] = 12;  // level
+        buf[952..956].copy_from_slice(&75u32.to_le_bytes());    // STR
+        buf[976..980].copy_from_slice(&110u32.to_le_bytes());   // WIS
+        // mem_spells[0] @9384 = 200 (Minor Healing), mem_spells[1] @9388 = 0xFFFFFFFF (empty)
+        buf[9384..9388].copy_from_slice(&200u32.to_le_bytes());
+        buf[9388..9392].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        // platinum/gold/silver/copper @12869..12885
+        buf[12869..12873].copy_from_slice(&5u32.to_le_bytes());  // platinum
+        buf[12873..12877].copy_from_slice(&3u32.to_le_bytes());  // gold
+        buf[12877..12881].copy_from_slice(&7u32.to_le_bytes());  // silver
+        buf[12881..12885].copy_from_slice(&9u32.to_le_bytes());  // copper
         let p = parse_player_profile(&buf).unwrap();
         assert_eq!(p.level, 12);
         assert_eq!(p.class_id, 9);
@@ -1244,11 +1280,12 @@ mod tests {
     fn player_profile_parses_equipment() {
         use super::apply_player_profile;
         let mut gs = GameState::new();
+        // RoF2 PlayerProfile equipment offsets (rof2.cpp ENCODE(OP_PlayerProfile)):
+        //   equipment[1] (chest) Material @204 = @184 + 1*20
+        //   item_tint[1] (chest) Color @816 = @812 + 1*4, wire: B,G,R,UseTint
         let mut buf = vec![0u8; 5000];
-        // item_material[1] (chest) = 17 at offset 188 + 1*4 = 192
-        buf[192..196].copy_from_slice(&17u32.to_le_bytes());
-        // item_tint[1] RGB at offset 268 + 1*4 = 272 (wire B,G,R,UseTint)
-        buf[272] = 3; buf[273] = 2; buf[274] = 1; buf[275] = 0xFF;
+        buf[204..208].copy_from_slice(&17u32.to_le_bytes()); // chest material
+        buf[816] = 3; buf[817] = 2; buf[818] = 1; buf[819] = 0xFF; // B,G,R,UseTint
         apply_player_profile(&mut gs, &buf);
         assert_eq!(gs.player_equipment[1], 17);
         assert_eq!(gs.player_equipment_tint[1], [1, 2, 3]); // stored RGB
@@ -1364,5 +1401,164 @@ mod tests {
         assert!(!gs.doors.get(&2).unwrap().is_open);
         apply_move_door(&mut gs, &[2, 0x03]);
         assert!(gs.doors.get(&2).unwrap().is_open);
+    }
+
+    // ── Phase 2b: OP_ZoneEntry registers spawns + PlayerProfile identity ─────
+
+    /// Reuse the NPC spawn buffer builder from protocol.rs tests via the public
+    /// parse_rof2_spawn + register_spawn pipeline. This is the canonical RoF2 test:
+    /// each OP_ZoneEntry carries one Spawn_Struct, and every such packet must land
+    /// in gs.entities (or update the player, if name matches).
+    #[test]
+    fn zone_entry_registers_npc_spawn() {
+        use crate::eq_net::protocol::parse_rof2_spawn;
+        use super::apply_zone_entry;
+
+        // Build a minimal NPC spawn buffer (same as protocol.rs helper).
+        fn build_npc_buf(name: &str, id: u32, x: f32, y: f32, z: f32) -> Vec<u8> {
+            let mut b = Vec::new();
+            b.extend_from_slice(name.as_bytes()); b.push(0);
+            b.extend_from_slice(&id.to_le_bytes());
+            b.push(10); // level
+            b.extend_from_slice(&5.0f32.to_le_bytes()); // bounding
+            b.push(1); // NPC=1
+            b.extend_from_slice(&0u32.to_le_bytes()); // bitfields
+            b.push(0); // OtherData
+            b.extend_from_slice(&0.0f32.to_le_bytes()); // unk3
+            b.extend_from_slice(&0.0f32.to_le_bytes()); // unk4
+            b.push(1); b.extend_from_slice(&1u32.to_le_bytes()); // props_count=1, bodytype=1
+            b.push(100); // curHp
+            b.extend_from_slice(&[0u8; 6]); // hair..beard
+            b.extend_from_slice(&[0u8; 12]); // drakkin
+            b.extend_from_slice(&[0, 0, 0, 0]); // equip_chest2..helm
+            b.extend_from_slice(&6.0f32.to_le_bytes()); // size
+            b.push(0); // face
+            b.extend_from_slice(&0.35f32.to_le_bytes()); // walkspeed
+            b.extend_from_slice(&0.7f32.to_le_bytes());  // runspeed
+            b.extend_from_slice(&54u32.to_le_bytes()); // race=54 (gnoll — non-playable, >12)
+            b.push(0); b.extend_from_slice(&[0u8; 12]); // holding, deity, guild, rank
+            b.extend_from_slice(&[1, 0, 100, 0, 0]); // class_, pvp, StandState, light, fly
+            b.push(0); // lastName\0
+            b.extend_from_slice(&[0u8; 6]); // aatitle, guild_show, TempPet
+            b.extend_from_slice(&0u32.to_le_bytes()); // petOwnerId
+            b.push(0); // FindBits
+            b.extend_from_slice(&64u32.to_le_bytes()); // PlayerState
+            b.extend_from_slice(&[0u8; 20]); // NpcTintIndex..unk (5×u32)
+            // Non-playable equipment block (60 bytes): 5×u32 zeros, Primary.Material, 4×u32, Secondary.Material, 4×u32
+            b.extend_from_slice(&[0u8; 60]);
+            // Position (20 bytes): encode x/y/z at correct bit positions
+            let yp = ((y * 8.0) as i32 as u32) & 0x7FFFF;
+            let xp = ((x * 8.0) as i32 as u32) & 0x7FFFF;
+            let zp = ((z * 8.0) as i32 as u32) & 0x7FFFF;
+            b.extend_from_slice(&(yp << 12).to_le_bytes()); // word0: y
+            b.extend_from_slice(&0u32.to_le_bytes());        // word1: deltas
+            b.extend_from_slice(&xp.to_le_bytes());          // word2: x
+            b.extend_from_slice(&(zp << 10).to_le_bytes());  // word3: z
+            b.extend_from_slice(&100u32.to_le_bytes());       // word4: animation=100
+            b.extend_from_slice(&[0u8; 8]); // unknown20
+            b.push(0); // IsMercenary
+            b.extend_from_slice(b"0000000000000000\0"); // RealEstateItemGuid (17B)
+            b.extend_from_slice(&0xffffffffu32.to_le_bytes()); // RealEstateID
+            b.extend_from_slice(&0xffffffffu32.to_le_bytes()); // RealEstateItemID
+            b.extend_from_slice(&[0u8; 29]); // padding
+            b
+        }
+
+        let buf = build_npc_buf("a_gnoll", 77, 150.0, -100.0, 5.0);
+
+        // 1. parse_rof2_spawn extracts sane values
+        let (info, consumed) = parse_rof2_spawn(&buf).expect("parse must succeed");
+        assert_eq!(consumed, buf.len());
+        assert_eq!(info.name, "a_gnoll");
+        assert_eq!(info.spawn_id, 77);
+        assert!((info.x - 150.0).abs() < 0.2, "x={}", info.x);
+        assert!((info.y - (-100.0)).abs() < 0.2, "y={}", info.y);
+        assert!((info.z - 5.0).abs() < 0.2, "z={}", info.z);
+
+        // 2. apply_zone_entry routes it to register_spawn → appears in entities
+        let mut gs = GameState::new();
+        gs.player_name = "Someone_Else".into(); // make sure it's not mistaken for player
+        apply_zone_entry(&mut gs, &buf);
+        let e = gs.entities.get(&77).expect("NPC must be in entities after OP_ZoneEntry");
+        assert_eq!(e.name, "a_gnoll");
+        assert!((e.x - 150.0).abs() < 0.2);
+        assert!((e.y - (-100.0)).abs() < 0.2);
+    }
+
+    #[test]
+    fn zone_entry_updates_player_when_name_matches() {
+        use super::apply_zone_entry;
+
+        fn build_npc_buf(name: &str, id: u32, x: f32, y: f32, z: f32) -> Vec<u8> {
+            let mut b = Vec::new();
+            b.extend_from_slice(name.as_bytes()); b.push(0);
+            b.extend_from_slice(&id.to_le_bytes());
+            b.push(10); b.extend_from_slice(&5.0f32.to_le_bytes()); b.push(0); // level, bounding, NPC=0 (PC)
+            b.extend_from_slice(&0u32.to_le_bytes()); // bitfields (gender=0)
+            b.push(0); // OtherData
+            b.extend_from_slice(&0.0f32.to_le_bytes()); b.extend_from_slice(&0.0f32.to_le_bytes()); // unk3,unk4
+            b.push(1); b.extend_from_slice(&1u32.to_le_bytes()); // props_count=1, bodytype
+            b.push(100); b.extend_from_slice(&[0u8; 6]); // curHp, hair..beard
+            b.extend_from_slice(&[0u8; 12]); // drakkin
+            b.extend_from_slice(&[0u8; 4]); // equip_chest2..helm
+            b.extend_from_slice(&6.0f32.to_le_bytes()); b.push(0); // size, face
+            b.extend_from_slice(&0.35f32.to_le_bytes()); b.extend_from_slice(&0.7f32.to_le_bytes()); // speeds
+            b.extend_from_slice(&1u32.to_le_bytes()); // race=1 HUM (playable)
+            b.push(0); b.extend_from_slice(&[0u8; 12]); // holding, deity, guild, rank
+            b.extend_from_slice(&[1, 0, 100, 0, 0]); // class_, pvp, StandState, light, fly
+            b.push(0); // lastName\0
+            b.extend_from_slice(&[0u8; 6]); // aatitle, guild_show, TempPet
+            b.extend_from_slice(&0u32.to_le_bytes()); // petOwnerId
+            b.push(0); b.extend_from_slice(&64u32.to_le_bytes()); // FindBits, PlayerState
+            b.extend_from_slice(&[0u8; 20]); // 5×u32 tint indices
+            // Playable race → TintProfile(36) + Equipment(180) = 216 bytes
+            b.extend_from_slice(&[0u8; 36]); // TintProfile
+            b.extend_from_slice(&[0u8; 180]); // Equipment
+            // Position (20 bytes)
+            let yp = ((y * 8.0) as i32 as u32) & 0x7FFFF;
+            let xp = ((x * 8.0) as i32 as u32) & 0x7FFFF;
+            let zp = ((z * 8.0) as i32 as u32) & 0x7FFFF;
+            b.extend_from_slice(&(yp << 12).to_le_bytes());
+            b.extend_from_slice(&0u32.to_le_bytes());
+            b.extend_from_slice(&xp.to_le_bytes());
+            b.extend_from_slice(&(zp << 10).to_le_bytes());
+            b.extend_from_slice(&100u32.to_le_bytes());
+            // Tail
+            b.extend_from_slice(&[0u8; 8]); b.push(0);
+            b.extend_from_slice(b"0000000000000000\0");
+            b.extend_from_slice(&0xffffffffu32.to_le_bytes());
+            b.extend_from_slice(&0xffffffffu32.to_le_bytes());
+            b.extend_from_slice(&[0u8; 29]);
+            b
+        }
+
+        let mut gs = GameState::new();
+        gs.player_name = "Frodo".into();
+        let buf = build_npc_buf("Frodo", 12, 200.0, -50.0, 10.0);
+        apply_zone_entry(&mut gs, &buf);
+
+        // Player self-spawn must NOT land in entities
+        assert!(gs.entities.is_empty(), "player self-spawn must not be in entities");
+        assert_eq!(gs.player_id, 12);
+        assert!((gs.player_x - 200.0).abs() < 0.2);
+        assert!((gs.player_y - (-50.0)).abs() < 0.2);
+        assert!((gs.player_z - 10.0).abs() < 0.2);
+    }
+
+    #[test]
+    fn player_profile_sets_class_and_race() {
+        use super::apply_player_profile;
+        let mut gs = GameState::new();
+        // RoF2: class_ @21, level @22, gender @16, race @17
+        let mut buf = vec![0u8; 1000];
+        buf[16] = 1;   // gender = female
+        buf[17..21].copy_from_slice(&4u32.to_le_bytes()); // race = 4 (wood elf)
+        buf[21] = 4;   // class_ = 4 (Ranger)
+        buf[22] = 35;  // level
+        apply_player_profile(&mut gs, &buf);
+        assert_eq!(gs.player_class, "Ranger");
+        assert_eq!(gs.player_level, 35);
+        assert_eq!(gs.player_gender, 1);
+        assert_eq!(gs.player_race, "ELF");
     }
 }
