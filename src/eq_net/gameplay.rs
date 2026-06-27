@@ -356,7 +356,7 @@ async fn reconnect_via_world(
             let _ = app_tx.send(packet.clone());
             match packet.opcode {
                 // In a fresh-login reconnect, world sends OP_SEND_CHAR_INFO as the trigger.
-                // In a zoning=1 reconnect, world sends OP_APPROVE_WORLD (0x3c25) instead.
+                // In a zoning=1 reconnect, world sends OP_APPROVE_WORLD (RoF2: 0x7499) instead.
                 OP_SEND_CHAR_INFO | OP_APPROVE_WORLD if !char_info_sent => {
                     char_info_sent = true;
                     let mut enter_buf = vec![0u8; SIZE_ENTER_WORLD];
