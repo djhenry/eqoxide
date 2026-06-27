@@ -48,4 +48,4 @@ send/receive tells + OOC over it (`OP_Mail` / chat opcodes). Then route `/tell`/
 when the target isn't in our zone, and ingest UCS chat into the same `chat_events` feed.
 
 ## Status
-Open — discovered while building the agent-chat feature (`worktree-agent-chat`).
+In progress — branch `worktree-ucs-chat-link`.
