@@ -713,7 +713,7 @@ pub const SIZE_LOGIN_INFO: usize = 464;  // LoginInfo_S
 pub const SIZE_SPAWN_POSITION_UPDATE: usize = 24;
 pub const SIZE_HP_UPDATE: usize = 10;   // HPUpdate_S
 pub const SIZE_DEATH: usize = 32;       // Death_S
-pub const SIZE_ZONE_POINT_ENTRY: usize = 24; // ZonePointEntry_S
+pub const SIZE_ZONE_POINT_ENTRY: usize = 32; // RoF2 ZonePoint_Entry (was 24 — misaligned)
 pub const SIZE_SPAWN_APPEARANCE: usize = 8; // SpawnAppearance_S
 pub const SIZE_CONSIDER: usize = 32;     // Consider_S
 pub const SIZE_EXP_UPDATE: usize = 4;   // ExpUpdate_S
@@ -1201,6 +1201,10 @@ pub struct ZonePointEntry_S {
     pub heading: f32,
     pub zoneid: u16,
     pub zoneinstance: u16,
+    // RoF2 ZonePoint_Entry is 32 bytes (two trailing u32s); omitting them misaligned every entry
+    // after the first by 8 bytes, scrambling zone ids/coords. See rof2_structs.h ZonePoint_Entry.
+    pub unknown024: u32,
+    pub unknown028: u32,
 }
 
 /// Spawn appearance change (8 bytes).
