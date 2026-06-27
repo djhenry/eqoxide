@@ -176,6 +176,11 @@ pub struct App {
     prev_render_pos: [f32; 3],
     /// Per-entity motion smoothing state, keyed by spawn id. See [`EntityMotion`].
     entity_motion: std::collections::HashMap<u32, EntityMotion>,
+    /// Estimated nav-driven speed for the visual player position glide (units/s).
+    /// Measured from consecutive logical position changes; defaults to RUN_SPEED.
+    player_nav_speed: f32,
+    /// When the logical player position last changed, for speed estimation.
+    last_player_nav_update: std::time::Instant,
     /// Where the player should face (EQ degrees, 0=north) — set from movement direction.
     heading_target:  f32,
     /// Smoothed facing actually used for rendering and camera-behind placement.
@@ -295,6 +300,8 @@ impl App {
             last_grounded_z: 0.0,
             prev_render_pos: [0.0, 0.0, 0.0],
             entity_motion: std::collections::HashMap::new(),
+            player_nav_speed: 44.0, // default to RUN_SPEED until first measurement
+            last_player_nav_update: std::time::Instant::now(),
             heading_target:  0.0,
             visual_heading:  0.0,
             vert_vel:  0.0,
@@ -850,6 +857,15 @@ impl App {
                     for i in 0..3 { m.display[i] += to[i] * f; }
                 }
                 b.pos = m.display;
+
+                // Override "idle" action with "walking" when the entity is actively moving
+                // toward its server target. Preserves dead / combat / sitting overrides —
+                // only replaces "idle" (the default for all non-dead, non-swinging entities
+                // from scene.rs, since the server animation field is always "Standing" while
+                // an NPC moves between update packets).
+                if b.action == "idle" && m.speed > 0.5 && d > 1e-4 {
+                    b.action = "walking".to_string();
+                }
             }
         }
 
@@ -869,16 +885,24 @@ impl App {
             let lp = [self.game_state.player_x, self.game_state.player_y, self.game_state.player_z];
             let dx = lp[0] - self.prev_logical_pos[0];
             let dy = lp[1] - self.prev_logical_pos[1];
-            if dx * dx + dy * dy > 0.01 {
+            let nav_dist = (dx * dx + dy * dy).sqrt();
+            if nav_dist > 0.01 {
+                // Estimate nav-driven speed from the distance moved over the elapsed interval.
+                // Clamped to [50ms, 500ms] so a stale first frame doesn't spike the estimate.
+                let dt_upd = (now - self.last_player_nav_update).as_secs_f32().clamp(0.05, 0.5);
+                self.player_nav_speed = nav_dist / dt_upd;
+                self.last_player_nav_update = now;
                 self.last_moved_at = std::time::Instant::now();
             }
             self.prev_logical_pos = lp;
-            // A live combat swing (OP_Animation under the player's spawn id) overrides movement so
-            // her attacks animate; otherwise walk/idle from recent movement.
+            // Priority: dead > combat swing > walking > idle.
             let pid = self.game_state.player_id;
+            let player_dead = self.game_state.cur_hp <= 0 && self.game_state.max_hp > 0;
             let swinging = self.game_state.combat_anims.get(&pid)
                 .map_or(false, |(_, t)| t.elapsed() < crate::scene::COMBAT_SWING_WINDOW);
-            self.scene.player_action = if let Some((code, _)) = self.game_state.combat_anims.get(&pid).filter(|_| swinging) {
+            self.scene.player_action = if player_dead {
+                "dead".to_string()
+            } else if let Some((code, _)) = self.game_state.combat_anims.get(&pid).filter(|_| swinging) {
                 format!("C{:02}", code)
             } else if self.last_moved_at.elapsed().as_millis() < 250 {
                 "walking".to_string()
@@ -1120,9 +1144,14 @@ impl App {
                 // Large XY teleport: snap position including z so ground snap initializes correctly.
                 self.visual_player_pos = target;
             } else if xy_dist > 0.01 {
-                let alpha = 1.0 - (-15.0_f32 * dt).exp();
-                self.visual_player_pos[0] += (target[0] - self.visual_player_pos[0]) * alpha;
-                self.visual_player_pos[1] += (target[1] - self.visual_player_pos[1]) * alpha;
+                // Speed-based glide: move the visual position toward the logical position at the
+                // estimated nav pace, clamped so it never overshoots. This makes /goto travel
+                // continuous — at RUN_SPEED (~44 u/s) the visual exactly keeps up with the
+                // 6.6-unit nav steps every 150 ms, with no stutter between steps.
+                let move_d = (self.player_nav_speed * dt).min(xy_dist);
+                let f = move_d / xy_dist;
+                self.visual_player_pos[0] += (target[0] - self.visual_player_pos[0]) * f;
+                self.visual_player_pos[1] += (target[1] - self.visual_player_pos[1]) * f;
                 // Z not lerped — ground snap owns it.
             }
             self.scene.player_pos = self.visual_player_pos;
@@ -1232,6 +1261,14 @@ impl App {
                 if diff <= 90.0 || diff >= 270.0 {
                     self.heading_target = motion_deg;
                 }
+            }
+            // For nav-driven movement (/goto, auto-engage) use the nav thread's authoritative
+            // heading directly: it is set from the direction of each movement step and is more
+            // reliable than motion-vector derivation (the visual glide introduces a lag that
+            // can misalign heading at corners or during the first frame of a new step).
+            // Only applies when there is recent movement and no keyboard input.
+            if !manual_move && self.last_moved_at.elapsed().as_millis() < 300 {
+                self.heading_target = self.game_state.player_heading;
             }
             self.prev_render_pos = self.scene.player_pos;
             // When rotating with A/D or steering with the mouse (drive), snap visual_heading

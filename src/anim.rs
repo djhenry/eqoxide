@@ -211,7 +211,12 @@ impl SkinData {
 
     pub fn clip_for_action(&self, action: &str) -> Option<usize> {
         match action {
-            "dead" => None,
+            // Death: find the D05-family death clip (name contains "death" or starts with "d05").
+            // Returns None when no such clip exists so the caller can fall back to bind pose.
+            "dead" => self.clips.iter().position(|c| {
+                let n = c.name.to_lowercase();
+                n.contains("death") || n.starts_with("d05")
+            }),
             "running" => self.clips.iter().position(|c| {
                 let n = c.name.to_lowercase();
                 (n.contains("run") || n.contains("running"))
@@ -452,6 +457,22 @@ mod tests {
         assert!((r0[0][3][0] - r2[0][3][0]).abs() < 1e-5, "t=2.0 should equal t=0.0");
     }
 
+    fn death_skin() -> SkinData {
+        // EQ D05-family death clip plus idle and walk, mirroring a typical converted GLB.
+        let names = ["D05A_death", "P01A_idle_neutral", "L01A_walk"];
+        let (rest_translations, rest_rotations, rest_scales) = default_rest(3);
+        SkinData {
+            joint_count: 3,
+            parents: vec![None, Some(0), Some(1)],
+            inv_bind: vec![identity_mat(); 3],
+            clips: names.iter().map(|n| AnimClip {
+                name: n.to_string(), duration: 2.0, channels: vec![make_channel(0)],
+            }).collect(),
+            rest_translations, rest_rotations, rest_scales,
+            ground_probes: vec![],
+        }
+    }
+
     #[test]
     fn clip_for_action_known_actions() {
         let skin = action_skin();
@@ -461,8 +482,31 @@ mod tests {
         assert_eq!(skin.clip_for_action("walking"),      Some(1), "walking → Spider_Walking");
         assert_eq!(skin.clip_for_action(""),             Some(1), "'' → Spider_Walking (default)");
         assert_eq!(skin.clip_for_action("running"),      Some(2), "running → Spider_Running");
-        assert_eq!(skin.clip_for_action("dead"),         None,    "dead → None (bind pose)");
+        // action_skin has no death clip → still returns None (bind-pose fallback).
+        assert_eq!(skin.clip_for_action("dead"),         None,    "no death clip → None");
         assert_eq!(skin.clip_for_action("attack"),       Some(1), "unknown → Spider_Walking");
+    }
+
+    #[test]
+    fn clip_for_action_dead_resolves_to_death_clip() {
+        let skin = death_skin();
+        // D05A_death is clip 0; "dead" must find it.
+        assert_eq!(skin.clip_for_action("dead"), Some(0), "dead → D05A_death clip (index 0)");
+    }
+
+    #[test]
+    fn clip_for_action_dead_fallback_when_no_death_clip() {
+        let skin = action_skin(); // Spider_{Idle,Walking,Running,...} — no death clip
+        assert_eq!(skin.clip_for_action("dead"), None,
+            "model with no death clip should return None so caller falls back to bind pose");
+    }
+
+    #[test]
+    fn action_animates_returns_true_for_dead_with_death_clip() {
+        let skin = death_skin();
+        let ci = skin.clip_for_action("dead").unwrap();
+        assert!(skin.action_animates("dead", ci),
+            "dead action with a real death clip should animate (play-once)");
     }
 
     #[test]
