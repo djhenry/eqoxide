@@ -50,6 +50,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_DAMAGE               => apply_combat_damage(gs, p),
         OP_BECOME_CORPSE        => apply_become_corpse(gs, p),
         OP_MONEY_ON_CORPSE      => apply_money_on_corpse(gs, p),
+        OP_MONEY_UPDATE         => apply_money_update(gs, p),
         OP_WEAR_CHANGE          => apply_wear_change(gs, p),
         OP_TASK_DESCRIPTION     => apply_task_description(gs, p),
         OP_TASK_ACTIVITY        => apply_task_activity(gs, p),
@@ -1003,6 +1004,13 @@ fn apply_money_on_corpse(gs: &mut GameState, payload: &[u8]) {
     let copper   = u32::from_le_bytes([payload[16], payload[17], payload[18], payload[19]]);
     gs.loot_last_activity = Some(std::time::Instant::now());
     if platinum > 0 || gold > 0 || silver > 0 || copper > 0 {
+        // Add the looted coins to the on-hand total for the HUD. Corpse loot calls the server's
+        // AddMoneyToPP with update_client=false (verified in EQEmu), so it does NOT also send an
+        // OP_MoneyUpdate — this is the only coin notification for loot, so we must add here.
+        gs.coin[0] = gs.coin[0].saturating_add(platinum);
+        gs.coin[1] = gs.coin[1].saturating_add(gold);
+        gs.coin[2] = gs.coin[2].saturating_add(silver);
+        gs.coin[3] = gs.coin[3].saturating_add(copper);
         let mut parts = Vec::new();
         if platinum > 0 { parts.push(format!("{}pp", platinum)); }
         if gold     > 0 { parts.push(format!("{}gp", gold)); }
@@ -1013,6 +1021,19 @@ fn apply_money_on_corpse(gs: &mut GameState, payload: &[u8]) {
     } else {
         tracing::info!("EQ: no coins on corpse");
     }
+}
+
+/// OP_MoneyUpdate — the server's authoritative NEW coin total after a change that it tracks
+/// server-side (trade completion, quest reward, trader sell, etc.). Without handling this the HUD
+/// coin stayed stuck at the login-profile value. (Loot uses OP_MoneyOnCorpse; merchant *buys* are
+/// deducted client-side — see the /buy path — because the server takes the money with
+/// update_client=false and sends nothing.)
+fn apply_money_update(gs: &mut GameState, payload: &[u8]) {
+    // MoneyUpdate_Struct (16 bytes): platinum/gold/silver/copper as int32.
+    if payload.len() < 16 { return; }
+    let rd = |o: usize| i32::from_le_bytes([payload[o], payload[o + 1], payload[o + 2], payload[o + 3]]).max(0) as u32;
+    gs.coin = [rd(0), rd(4), rd(8), rd(12)];
+    tracing::info!("EQ: money update -> {}p {}g {}s {}c", gs.coin[0], gs.coin[1], gs.coin[2], gs.coin[3]);
 }
 
 // ── Shared spawn registration ─────────────────────────────────────────────────
@@ -1073,8 +1094,31 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
 #[cfg(test)]
 mod tests {
     use super::{apply_emote, class_name, con_color, consider_message, parse_player_profile,
-                parse_begin_cast, parse_memorize_spell, apply_char_inventory};
+                parse_begin_cast, parse_memorize_spell, apply_char_inventory,
+                apply_money_update, apply_money_on_corpse};
     use crate::game_state::GameState;
+
+    #[test]
+    fn money_update_sets_coin_total() {
+        let mut gs = GameState::new();
+        gs.coin = [1, 2, 3, 4];
+        // MoneyUpdate_Struct: platinum=84 gold=9 silver=13 copper=8 (i32 LE)
+        let mut p = Vec::new();
+        for v in [84i32, 9, 13, 8] { p.extend_from_slice(&v.to_le_bytes()); }
+        apply_money_update(&mut gs, &p);
+        assert_eq!(gs.coin, [84, 9, 13, 8]);
+    }
+
+    #[test]
+    fn money_on_corpse_adds_looted_coin() {
+        let mut gs = GameState::new();
+        gs.coin = [10, 0, 5, 0];
+        // MoneyOnCorpse_Struct: response(0)+3pad + platinum=2 gold=1 silver=0 copper=3 (u32 LE)
+        let mut p = vec![0u8; 4];
+        for v in [2u32, 1, 0, 3] { p.extend_from_slice(&v.to_le_bytes()); }
+        apply_money_on_corpse(&mut gs, &p);
+        assert_eq!(gs.coin, [12, 1, 5, 3]); // added on top of existing
+    }
     use crate::eq_net::item::tests::{fixture, fixture2};
 
     #[test]
