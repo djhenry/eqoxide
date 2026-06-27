@@ -712,6 +712,8 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
     // chan_num(u32) + cm_unknown4[u32×2] + skill_in_language(u32) + message[var]
     // message starts at byte 148, not 140.
     if payload.len() < 149 { return; }
+    let targetname = String::from_utf8_lossy(&payload[0..64])
+        .trim_end_matches('\0').to_string();
     let sender = String::from_utf8_lossy(&payload[64..128])
         .trim_end_matches('\0').to_string();
     let chan_num = u32::from_le_bytes([payload[132], payload[133], payload[134], payload[135]]);
@@ -720,19 +722,31 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
         .to_string();
     if msg.is_empty() { return; }
 
-    match chan_num {
-        // Channel 3 = zone chat, 5 = OOC, 7 = shout, 8 = say (NPC dialogue)
-        3 | 5 | 7 | 8 if !sender.is_empty() => {
-            gs.log_msg("chat", &format!("<{}> {}", sender, msg));
+    // EQEmu ChatChannel: 0 guild, 2 group, 3 shout, 4 auction, 5 OOC, 6 broadcast, 7 tell,
+    // 8 say, 11 gmsay. The inter-agent channels are ALSO recorded as structured chat events for
+    // the GET /events feed; `say` (8) is NPC dialogue / local say and stays in the message log only.
+    let event_channel = match chan_num {
+        7  => Some("tell"),
+        5  => Some("ooc"),
+        3  => Some("shout"),
+        2  => Some("group"),
+        11 => Some("gmsay"),
+        _  => None,
+    };
+    if let Some(ch) = event_channel {
+        if !sender.is_empty() {
+            // `directed` = addressed specifically to us: a /tell to our name, or any GM message.
+            let directed = (ch == "tell" && targetname.eq_ignore_ascii_case(&gs.player_name))
+                        || ch == "gmsay";
+            gs.push_chat_event(&sender, ch, directed, &msg);
         }
-        3 | 5 | 7 => {
-            // Zone-wide broadcasts without a sender (server messages like "An earthquake strikes!")
-            gs.log_msg("zone", &msg);
-        }
-        _ if !sender.is_empty() => {
-            gs.log_msg("chat", &format!("<{}> {}", sender, msg));
-        }
-        _ => {}
+    }
+
+    if !sender.is_empty() {
+        gs.log_msg("chat", &format!("<{}> {}", sender, msg));
+    } else {
+        // Zone-wide broadcasts without a sender (server messages like "An earthquake strikes!").
+        gs.log_msg("zone", &msg);
     }
 }
 
@@ -1231,6 +1245,48 @@ mod tests {
         super::apply_channel_message(&mut gs, &payload);
         assert!(gs.messages.iter().any(|m| m.kind == "chat"
             && m.text == "<Guard_Janior> Halt, adventurer!"));
+        // Say (NPC dialogue) is NOT an inter-agent chat event.
+        assert!(gs.chat_events.is_empty(), "say must not produce a chat event");
+    }
+
+    fn make_tell(sender: &str, target: &str, msg: &str) -> Vec<u8> {
+        let mut buf = make_chan_payload(sender, 7, msg); // chan 7 = tell
+        let t = target.as_bytes();
+        let tl = t.len().min(63);
+        buf[..tl].copy_from_slice(&t[..tl]);
+        buf
+    }
+
+    #[test]
+    fn apply_channel_message_tell_to_me_is_directed_event() {
+        let mut gs = GameState::new();
+        gs.player_name = "Mordeth".to_string();
+        super::apply_channel_message(&mut gs, &make_tell("Garrik", "Mordeth", "you stuck?"));
+        let e = gs.chat_events.back().expect("a chat event");
+        assert_eq!(e.channel, "tell");
+        assert_eq!(e.from, "Garrik");
+        assert!(e.directed, "a tell addressed to us is directed");
+        assert_eq!(e.text, "you stuck?");
+    }
+
+    #[test]
+    fn apply_channel_message_tell_to_someone_else_not_directed() {
+        let mut gs = GameState::new();
+        gs.player_name = "Mordeth".to_string();
+        super::apply_channel_message(&mut gs, &make_tell("Garrik", "Katie", "hi"));
+        let e = gs.chat_events.back().expect("a chat event");
+        assert_eq!(e.channel, "tell");
+        assert!(!e.directed, "a tell to someone else is not directed at us");
+    }
+
+    #[test]
+    fn apply_channel_message_ooc_is_undirected_event() {
+        let mut gs = GameState::new();
+        gs.player_name = "Mordeth".to_string();
+        super::apply_channel_message(&mut gs, &make_chan_payload("Garrik", 5, "any GM around?"));
+        let e = gs.chat_events.back().expect("a chat event");
+        assert_eq!(e.channel, "ooc");
+        assert!(!e.directed);
     }
 
     #[test]

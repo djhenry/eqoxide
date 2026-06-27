@@ -136,6 +136,19 @@ pub struct CastState {
     pub cast_ms: u32,
 }
 
+/// One inter-agent chat event (tell/ooc/shout/group/gmsay) received from another player or a GM.
+/// `directed` = this message was addressed specifically to us (a /tell to our name, or a GM message).
+/// `id` is monotonic per session so an agent can poll `/events?since=<id>` without missing or
+/// re-seeing messages. NPC dialogue (say channel) is NOT recorded here — it stays in `messages`.
+#[derive(Debug, Default, Clone)]
+pub struct ChatLogEvent {
+    pub id:       u64,
+    pub from:     String,
+    pub channel:  String,  // "tell" | "ooc" | "shout" | "group" | "gmsay"
+    pub directed: bool,
+    pub text:     String,
+}
+
 /// All state the renderer needs for one frame.
 #[derive(Debug, Default, Clone)]
 pub struct GameState {
@@ -204,6 +217,10 @@ pub struct GameState {
 
     // Message log (ring buffer)
     pub messages: VecDeque<LogEntry>,
+
+    // Inter-agent chat events (tells/ooc/shout/group/gmsay) for the GET /events feed.
+    pub chat_events:  VecDeque<ChatLogEvent>,
+    pub next_chat_id: u64,
 
     // Strategy text for HUD
     pub strategy: String,
@@ -275,6 +292,19 @@ impl GameState {
             kind: kind.to_string(),
             text: text.to_string(),
             timestamp: std::time::Instant::now(),
+        });
+    }
+
+    /// Record an inter-agent chat event (tell/ooc/shout/group/gmsay) for the GET /events feed,
+    /// assigning the next monotonic id. Capped to the most recent 200 events.
+    pub fn push_chat_event(&mut self, from: &str, channel: &str, directed: bool, text: &str) {
+        let id = self.next_chat_id;
+        self.next_chat_id += 1;
+        if self.chat_events.len() >= 200 {
+            self.chat_events.pop_front();
+        }
+        self.chat_events.push_back(ChatLogEvent {
+            id, from: from.to_string(), channel: channel.to_string(), directed, text: text.to_string(),
         });
     }
 

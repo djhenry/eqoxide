@@ -138,6 +138,35 @@ pub struct MessageEntry {
 /// GET /messages. Exposes NPC dialogue (kind "npc") as machine-readable text + keywords.
 pub type MessagesShared = Arc<Mutex<Vec<MessageEntry>>>;
 
+/// One inter-agent chat event exposed by GET /events (tell/ooc/shout/group/gmsay). `id` is a
+/// monotonic cursor; `directed` = addressed specifically to us (a /tell to our name, or a GM
+/// message). Agents poll `/events?since=<id>` (optionally long-poll with `wait=`) to be notified.
+#[derive(Clone, serde::Serialize)]
+pub struct ChatEvent {
+    pub id:       u64,
+    pub from:     String,
+    pub channel:  String,
+    pub directed: bool,
+    pub text:     String,
+}
+
+/// Live snapshot of inter-agent chat events, published each tick by the nav thread, read by
+/// GET /events. Ordered by ascending `id`.
+pub type ChatEventsShared = Arc<Mutex<Vec<ChatEvent>>>;
+
+/// One queued outgoing chat message, set by POST /tell|/ooc|/shout|/group and drained by the nav
+/// thread, which builds + sends the `OP_ChannelMessage`. `to` is the recipient for /tell (chan 7),
+/// empty for broadcasts. `chan` is the EQ ChatChannel number.
+#[derive(Clone)]
+pub struct ChatSend {
+    pub chan: u32,
+    pub to:   String,
+    pub text: String,
+}
+
+/// Outgoing chat queue (FIFO), written by the /tell|/ooc|/shout|/group endpoints.
+pub type ChatSendShared = Arc<Mutex<Vec<ChatSend>>>;
+
 #[derive(Clone, Copy)]
 pub struct CastRequest { pub gem: u8, pub target_id: Option<u32> }
 /// Cast a memorized gem (0-8) on an explicit target, else current target, else self.
@@ -232,6 +261,8 @@ struct HttpState {
     inventory:        InventoryShared,
     loot:             LootReq,
     messages:         MessagesShared,
+    chat_events:      ChatEventsShared,
+    chat_send:        ChatSendShared,
     spells:           std::sync::Arc<crate::spells::SpellDb>,
     player_info:      PlayerInfo,
     task_log:         TaskLog,
@@ -289,6 +320,8 @@ pub fn spawn_camera_server(
     inventory:        InventoryShared,
     loot:             LootReq,
     messages:         MessagesShared,
+    chat_events:      ChatEventsShared,
+    chat_send:        ChatSendShared,
     spells:           std::sync::Arc<crate::spells::SpellDb>,
     player_info:      PlayerInfo,
     task_log:         TaskLog,
@@ -304,7 +337,7 @@ pub fn spawn_camera_server(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, spells, player_info, task_log, door_click, doors_shared, camp, camp_until };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, chat_events, chat_send, spells, player_info, task_log, door_click, doors_shared, camp, camp_until };
             let app = Router::new()
                 .route("/camera", get(get_camera).post(post_camera))
                 .route("/camera/reset", post(post_camera_reset))
@@ -341,6 +374,11 @@ pub fn spawn_camera_server(
                 .route("/inventory", get(get_inventory))
                 .route("/loot", post(post_loot))
                 .route("/messages", get(get_messages))
+                .route("/events", get(get_events))
+                .route("/tell", post(post_tell))
+                .route("/ooc", post(post_ooc))
+                .route("/shout", post(post_shout))
+                .route("/group", post(post_group))
                 .route("/doors", get(get_doors))
                 .route("/doors/click", post(post_door_click))
                 .route("/exit", post(post_exit))
@@ -1029,6 +1067,86 @@ async fn get_messages(
         None    => all.iter().collect(),
     };
     Json(serde_json::json!({ "count": filtered.len(), "messages": filtered }))
+}
+
+#[derive(serde::Deserialize, Default)]
+struct EventsQuery {
+    /// Return only events with id greater than this cursor (default 0 = all).
+    since:    Option<u64>,
+    /// Long-poll: block up to this many seconds (capped at 30) for a new event before returning.
+    wait:     Option<u64>,
+    /// 1 = only messages addressed specifically to you (a /tell to your name, or a GM message).
+    directed: Option<u8>,
+}
+
+/// GET /events — the inter-agent chat feed (tells/ooc/shout/group/gmsay) as structured events.
+///
+/// This is how an agent becomes aware of a whisper meant for it. Pass `?since=<last_id>` to get
+/// only new events; use the response's `last_id` as your next cursor. `?wait=<secs>` long-polls —
+/// the request blocks (up to ~30s) until a new event arrives, so an agent can "listen" without
+/// busy-polling (run it in a loop). `?directed=1` returns only messages addressed specifically to
+/// you. Each event: `{id, from, channel, directed, text}`.
+async fn get_events(
+    State(s): State<HttpState>,
+    Query(q): Query<EventsQuery>,
+) -> Json<serde_json::Value> {
+    let since         = q.since.unwrap_or(0);
+    let directed_only = q.directed.unwrap_or(0) != 0;
+    let wait          = q.wait.unwrap_or(0).min(30);
+    let deadline      = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+    loop {
+        let (events, last_id) = {
+            let all = s.chat_events.lock().unwrap();
+            let last_id = all.last().map(|e| e.id).unwrap_or(since).max(since);
+            let evs: Vec<ChatEvent> = all.iter()
+                .filter(|e| e.id > since && (!directed_only || e.directed))
+                .cloned().collect();
+            (evs, last_id)
+        };
+        if !events.is_empty() || std::time::Instant::now() >= deadline {
+            return Json(serde_json::json!({
+                "count": events.len(), "last_id": last_id, "events": events,
+            }));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct TellBody { to: String, text: String }
+
+/// POST /tell {"to","text"} — send a directed whisper to one character (EQ /tell, chan 7).
+/// The recipient's client receives it as a `directed` event on GET /events.
+async fn post_tell(State(s): State<HttpState>, Json(b): Json<TellBody>) -> (StatusCode, String) {
+    if b.to.trim().is_empty() || b.text.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "tell requires non-empty 'to' and 'text'".into());
+    }
+    s.chat_send.lock().unwrap().push(ChatSend { chan: 7, to: b.to.clone(), text: b.text });
+    (StatusCode::OK, format!("tell queued to {}", b.to))
+}
+
+#[derive(serde::Deserialize)]
+struct TextBody { text: String }
+
+/// POST /ooc {"text"} — zone-wide out-of-character broadcast (chan 5).
+async fn post_ooc(State(s): State<HttpState>, Json(b): Json<TextBody>) -> (StatusCode, String) {
+    if b.text.trim().is_empty() { return (StatusCode::BAD_REQUEST, "ooc requires 'text'".into()); }
+    s.chat_send.lock().unwrap().push(ChatSend { chan: 5, to: String::new(), text: b.text });
+    (StatusCode::OK, "ooc queued".into())
+}
+
+/// POST /shout {"text"} — zone-wide shout (chan 3).
+async fn post_shout(State(s): State<HttpState>, Json(b): Json<TextBody>) -> (StatusCode, String) {
+    if b.text.trim().is_empty() { return (StatusCode::BAD_REQUEST, "shout requires 'text'".into()); }
+    s.chat_send.lock().unwrap().push(ChatSend { chan: 3, to: String::new(), text: b.text });
+    (StatusCode::OK, "shout queued".into())
+}
+
+/// POST /group {"text"} — group-channel message (chan 2; only seen by your group).
+async fn post_group(State(s): State<HttpState>, Json(b): Json<TextBody>) -> (StatusCode, String) {
+    if b.text.trim().is_empty() { return (StatusCode::BAD_REQUEST, "group requires 'text'".into()); }
+    s.chat_send.lock().unwrap().push(ChatSend { chan: 2, to: String::new(), text: b.text });
+    (StatusCode::OK, "group queued".into())
 }
 
 #[derive(serde::Deserialize, Default)]
