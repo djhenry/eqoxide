@@ -413,19 +413,19 @@ impl<'a> LoginProtocol<'a> {
             op => {
                 // Suppress known noise: keepalive, ground spawns, zone points
                 // (handled by apply_packet), world-login flow opcodes.
+                // RoF2 opcode values from patch_RoF2.conf.
                 const SILENT: &[u16] = &[
-                    0x0f47, // OP_GroundSpawn — ground item drops, no action needed
-                    0x5996, // unknown empty packet, keepalive variant
-                    0x3eba, // OP_SEND_ZONE_POINTS — handled by apply_packet
-                    0x2372, // OP_SpecialMesg — NPC dialogue, handled by apply_packet
-                    0x5a48, // OP_FormattedMessage — eqstr text, handled by apply_packet
-                    0x673c, // OP_SimpleMessage — eqstr text, handled by apply_packet
-                    0x547a, // OP_Emote — world/NPC emote, handled by apply_packet
-                    0x7cba, // OP_ENTER_WORLD — world login flow
-                    0x52a4, // OP_POST_ENTER_WORLD
-                    0x04ec, // OP_EXPANSION_INFO
-                    0x0fa6, // OP_LOG_SERVER
-                    0x3c25, // OP_APPROVE_WORLD
+                    0x6fca, // OP_GroundSpawn (RoF2) — ground item drops, no action needed
+                    OP_SEND_ZONE_POINTS, // handled by apply_packet
+                    OP_SPECIAL_MESG,     // NPC dialogue, handled by apply_packet
+                    OP_FORMATTED_MESSAGE, // eqstr text, handled by apply_packet
+                    OP_SIMPLE_MESSAGE,   // eqstr text, handled by apply_packet
+                    OP_EMOTE,            // world/NPC emote, handled by apply_packet
+                    OP_ENTER_WORLD,      // world login flow
+                    OP_POST_ENTER_WORLD,
+                    OP_EXPANSION_INFO,
+                    OP_LOG_SERVER,
+                    OP_APPROVE_WORLD,
                 ];
                 if !SILENT.contains(&op) {
                     tracing::info!("EQ: unhandled opcode 0x{:04x} ({} bytes)", op, packet.payload.len());

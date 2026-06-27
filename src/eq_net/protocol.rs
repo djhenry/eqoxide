@@ -1,7 +1,7 @@
-//! EQ protocol opcodes and struct definitions for Titanium client (port 5998).
+//! EQ protocol opcodes and struct definitions for RoF2 client.
 //!
-//! Ported from the Python reference at eq_client/protocol/opcodes.py and
-//! eq_client/protocol/structs.py.
+//! Application opcodes (u16) are sourced from ~/git/EQEmu/utils/patches/patch_RoF2.conf.
+//! Transport-layer opcodes (u8) are protocol-layer constants identical across all patches.
 
 #![allow(dead_code)]
 
@@ -33,176 +33,176 @@ pub const ENCODE_COMPRESSION: u8 = 1;
 pub const ENCODE_XOR: u8 = 4;
 
 // ── Login server opcodes ──────────────────────────────────────────────────
+// These are login-server-specific opcodes not present in the world/zone opcode table.
+// patch_RoF2.conf lists them all as 0x0000 (unused/unknown in zone context).
+// Keeping Titanium login-server values until the login-server layer is separately migrated.
 
-pub const OP_SESSION_READY: u16 = 0x0001;
-pub const OP_LOGIN: u16 = 0x0002;
-pub const OP_SERVER_LIST_REQUEST: u16 = 0x0004;
-pub const OP_PLAY_EVERQUEST_REQ: u16 = 0x000d;
-pub const OP_CHAT_MESSAGE: u16 = 0x0016;
-pub const OP_LOGIN_ACCEPTED: u16 = 0x0017;
-pub const OP_SERVER_LIST_RESPONSE: u16 = 0x0018;
-pub const OP_PLAY_EVERQUEST_RESP: u16 = 0x0021;
+pub const OP_SESSION_READY: u16 = 0x0001; // RoF2: NO MATCH IN CONF — needs manual resolution (login-server protocol opcode)
+pub const OP_LOGIN: u16 = 0x0002; // RoF2: NO MATCH IN CONF — needs manual resolution (login-server protocol opcode)
+pub const OP_SERVER_LIST_REQUEST: u16 = 0x0004; // RoF2: NO MATCH IN CONF — needs manual resolution (login-server protocol opcode)
+pub const OP_PLAY_EVERQUEST_REQ: u16 = 0x000d; // RoF2: NO MATCH IN CONF — needs manual resolution (login-server protocol opcode)
+pub const OP_CHAT_MESSAGE: u16 = 0x0016; // RoF2: NO MATCH IN CONF — needs manual resolution (login-server protocol opcode)
+pub const OP_LOGIN_ACCEPTED: u16 = 0x0017; // RoF2: NO MATCH IN CONF — needs manual resolution (login-server protocol opcode)
+pub const OP_SERVER_LIST_RESPONSE: u16 = 0x0018; // RoF2: NO MATCH IN CONF — needs manual resolution (login-server protocol opcode)
+pub const OP_PLAY_EVERQUEST_RESP: u16 = 0x0021; // RoF2: NO MATCH IN CONF — needs manual resolution (login-server protocol opcode)
 
 // ── World server opcodes ──────────────────────────────────────────────────
 
-pub const OP_SEND_LOGIN_INFO: u16 = 0x4dd0;
-pub const OP_APPROVE_WORLD: u16 = 0x3c25;
-pub const OP_LOG_SERVER: u16 = 0x0fa6;
-pub const OP_MOTD: u16 = 0x024d;
-pub const OP_SEND_CHAR_INFO: u16 = 0x4513;
-pub const OP_APPROVE_NAME: u16 = 0x3ea6;      // C->S NameApproval_Struct (72B); S->C 1 byte (1=ok,0=reject)
-pub const OP_CHARACTER_CREATE: u16 = 0x10b2;  // C->S CharCreate_Struct (Titanium wire = 80B)
-pub const OP_ENTER_WORLD: u16 = 0x7cba;
-pub const OP_POST_ENTER_WORLD: u16 = 0x52a4;
-pub const OP_ZONE_SERVER_INFO: u16 = 0x61b6;
-pub const OP_WORLD_COMPLETE: u16 = 0x509d;
-pub const OP_WORLD_CLIENT_READY: u16 = 0x5e99;
-pub const OP_EXPANSION_INFO: u16 = 0x04ec;
-pub const OP_WORLD_CRC1: u16 = 0x5072;
-pub const OP_WORLD_CRC2: u16 = 0x5b18;
-pub const OP_GUILD_LIST: u16 = 0x6957;
+pub const OP_SEND_LOGIN_INFO: u16 = 0x7a09;   // RoF2: OP_SendLoginInfo
+pub const OP_APPROVE_WORLD: u16 = 0x7499;     // RoF2: OP_ApproveWorld
+pub const OP_LOG_SERVER: u16 = 0x7ceb;        // RoF2: OP_LogServer
+pub const OP_MOTD: u16 = 0x0c22;              // RoF2: OP_MOTD
+pub const OP_SEND_CHAR_INFO: u16 = 0x00d2;    // RoF2: OP_SendCharInfo
+pub const OP_APPROVE_NAME: u16 = 0x56a2;      // RoF2: OP_ApproveName; C->S NameApproval_Struct (72B); S->C 1 byte (1=ok,0=reject)
+pub const OP_CHARACTER_CREATE: u16 = 0x6bbf;  // RoF2: OP_CharacterCreate; C->S CharCreate_Struct (wire = 80B)
+pub const OP_ENTER_WORLD: u16 = 0x578f;       // RoF2: OP_EnterWorld
+pub const OP_POST_ENTER_WORLD: u16 = 0x6259;  // RoF2: OP_PostEnterWorld
+pub const OP_ZONE_SERVER_INFO: u16 = 0x4c44;  // RoF2: OP_ZoneServerInfo
+pub const OP_WORLD_COMPLETE: u16 = 0x4493;    // RoF2: OP_WorldComplete
+pub const OP_WORLD_CLIENT_READY: u16 = 0x23c1; // RoF2: OP_WorldClientReady
+pub const OP_EXPANSION_INFO: u16 = 0x590d;    // RoF2: OP_ExpansionInfo
+pub const OP_WORLD_CRC1: u16 = 0x0f13;        // RoF2: OP_World_Client_CRC1
+pub const OP_WORLD_CRC2: u16 = 0x4b8d;        // RoF2: OP_World_Client_CRC2
+pub const OP_GUILD_LIST: u16 = 0x507a;        // RoF2: OP_GuildsList
 
 // ── Zone server opcodes ───────────────────────────────────────────────────
 
-pub const OP_ZONE_ENTRY: u16 = 0x7213;
-pub const OP_ACK_PACKET: u16 = 0x7752;
-pub const OP_NEW_ZONE: u16 = 0x0920;
-pub const OP_REQ_CLIENT_SPAWN: u16 = 0x0322;
-pub const OP_ZONE_SPAWNS: u16 = 0x2e78;
-pub const OP_CHAR_INVENTORY: u16 = 0x5394;
-pub const OP_ITEM_PACKET: u16 = 0x3397; // single item (loot/trade/give/summon), same serialization
-pub const OP_SET_SERVER_FILTER: u16 = 0x6563;
-pub const OP_REQ_NEW_ZONE: u16 = 0x7ac5;
-pub const OP_PLAYER_PROFILE: u16 = 0x75df;
-pub const OP_TIME_OF_DAY: u16 = 0x1580;
-pub const OP_WEATHER: u16 = 0x254d;
-pub const OP_SEND_ZONE_POINTS: u16 = 0x3eba;
-pub const OP_SPAWN_DOOR: u16 = 0x4c24;
-pub const OP_MOVE_DOOR: u16 = 0x700d;   // S->C MoveDoor_Struct {door_id u8, action u8}
-pub const OP_CLICK_DOOR: u16 = 0x043b;  // C->S ClickDoor_Struct (16 bytes)
-pub const OP_SEND_EXP_ZONE_IN: u16 = 0x0587;
-pub const OP_CLIENT_READY: u16 = 0x5e20;
+pub const OP_ZONE_ENTRY: u16 = 0x5089;        // RoF2: OP_ZoneEntry
+pub const OP_ACK_PACKET: u16 = 0x471d;        // RoF2: OP_AckPacket
+pub const OP_NEW_ZONE: u16 = 0x1795;          // RoF2: OP_NewZone
+pub const OP_REQ_CLIENT_SPAWN: u16 = 0x35fa;  // RoF2: OP_ReqClientSpawn
+pub const OP_ZONE_SPAWNS: u16 = 0x5237;       // RoF2: OP_ZoneSpawns
+pub const OP_CHAR_INVENTORY: u16 = 0x5ca6;    // RoF2: OP_CharInventory
+pub const OP_ITEM_PACKET: u16 = 0x368e;       // RoF2: OP_ItemPacket; single item (loot/trade/give/summon)
+pub const OP_SET_SERVER_FILTER: u16 = 0x444d; // RoF2: OP_SetServerFilter
+pub const OP_REQ_NEW_ZONE: u16 = 0x7887;      // RoF2: OP_ReqNewZone
+pub const OP_PLAYER_PROFILE: u16 = 0x6506;    // RoF2: OP_PlayerProfile
+pub const OP_TIME_OF_DAY: u16 = 0x5070;       // RoF2: OP_TimeOfDay
+pub const OP_WEATHER: u16 = 0x661e;           // RoF2: OP_Weather
+pub const OP_SEND_ZONE_POINTS: u16 = 0x69a4;  // RoF2: OP_SendZonepoints
+pub const OP_SPAWN_DOOR: u16 = 0x7291;        // RoF2: OP_SpawnDoor
+pub const OP_MOVE_DOOR: u16 = 0x08e8;         // RoF2: OP_MoveDoor; S->C MoveDoor_Struct {door_id u8, action u8}
+pub const OP_CLICK_DOOR: u16 = 0x3a8f;        // RoF2: OP_ClickDoor; C->S ClickDoor_Struct (16 bytes)
+pub const OP_SEND_EXP_ZONE_IN: u16 = 0x5f8e;  // RoF2: OP_SendExpZonein
+pub const OP_CLIENT_READY: u16 = 0x345d;      // RoF2: OP_ClientReady
 
 // ── Gameplay: spawns & positions ──────────────────────────────────────────
 
-pub const OP_NEW_SPAWN: u16 = 0x1860;
-pub const OP_DELETE_SPAWN: u16 = 0x55bc;
-pub const OP_CLIENT_UPDATE: u16 = 0x14cb;
-pub const OP_SPAWN_APPEARANCE: u16 = 0x7c32;
+pub const OP_NEW_SPAWN: u16 = 0x6097;         // RoF2: OP_NewSpawn
+pub const OP_DELETE_SPAWN: u16 = 0x7280;      // RoF2: OP_DeleteSpawn
+pub const OP_CLIENT_UPDATE: u16 = 0x7dfc;     // RoF2: OP_ClientUpdate
+pub const OP_SPAWN_APPEARANCE: u16 = 0x0971;  // RoF2: OP_SpawnAppearance
 /// Server → client: a spawn performs a one-shot animation (melee swing, kick, etc.).
 /// Animation_Struct: spawnid(u16) speed(u8) action(u8). action = anim code (1=kick, 2=1HPierce,
 /// 3=2HSlash, 4=2HWeapon, 5=1HWeapon, 7=tailrake/slam, 8=hand-to-hand) → combat clip C0{action}.
-pub const OP_ANIMATION: u16 = 0x2acf;
+pub const OP_ANIMATION: u16 = 0x7177;         // RoF2: OP_Animation
 
 // ── Gameplay: equipment ───────────────────────────────────────────────────
 
-pub const OP_WEAR_CHANGE: u16 = 0x7441; // verified against patch_Titanium.conf
+pub const OP_WEAR_CHANGE: u16 = 0x7994; // RoF2: OP_WearChange
 
 // ── Gameplay: combat ──────────────────────────────────────────────────────
 
-pub const OP_HP_UPDATE: u16 = 0x3bcf;
-pub const OP_DEATH: u16 = 0x6160;
-pub const OP_DAMAGE: u16 = 0x5c78;
-pub const OP_AUTO_ATTACK: u16 = 0x5e55;
-pub const OP_AUTO_ATTACK2: u16 = 0x0701;
-pub const OP_TARGET_COMMAND: u16 = 0x1477;
-pub const OP_TARGET_MOUSE: u16   = 0x6c47; // sets server-side m_Target for combat
-pub const OP_CONSIDER: u16 = 0x65ca;
+pub const OP_HP_UPDATE: u16 = 0x2828;         // RoF2: OP_HPUpdate
+pub const OP_DEATH: u16 = 0x6517;             // RoF2: OP_Death
+pub const OP_DAMAGE: u16 = 0x6f15;            // RoF2: OP_Damage
+pub const OP_AUTO_ATTACK: u16 = 0x109d;       // RoF2: OP_AutoAttack
+pub const OP_AUTO_ATTACK2: u16 = 0x3526;      // RoF2: OP_AutoAttack2
+pub const OP_TARGET_COMMAND: u16 = 0x58e2;    // RoF2: OP_TargetCommand
+pub const OP_TARGET_MOUSE: u16   = 0x075d;    // RoF2: OP_TargetMouse; sets server-side m_Target for combat
+pub const OP_CONSIDER: u16 = 0x742b;          // RoF2: OP_Consider
 
 // ── Gameplay: spellcasting ────────────────────────────────────────────────
 
-pub const OP_CAST_SPELL: u16 = 0x304b;
-pub const OP_BEGIN_CAST: u16 = 0x3990;
-pub const OP_MANA_CHANGE: u16 = 0x4839;
-pub const OP_MEMORIZE_SPELL: u16 = 0x308e;
-pub const OP_INTERRUPT_CAST: u16 = 0x0000; // native/pass-through value
+pub const OP_CAST_SPELL: u16 = 0x1287;        // RoF2: OP_CastSpell
+pub const OP_BEGIN_CAST: u16 = 0x318f;        // RoF2: OP_BeginCast
+pub const OP_MANA_CHANGE: u16 = 0x5467;       // RoF2: OP_ManaChange
+pub const OP_MEMORIZE_SPELL: u16 = 0x217c;    // RoF2: OP_MemorizeSpell
+pub const OP_INTERRUPT_CAST: u16 = 0x048c;    // RoF2: OP_InterruptCast
 
-// Pet control (Titanium): PetCommand_Struct { command:u32, target:u32 }. Command values from
+// Pet control: PetCommand_Struct { command:u32, target:u32 }. Command values from
 // EQEmu zone/common.h: PET_ATTACK=2, PET_GUARDHERE=5, PET_FOLLOWME=4(GetOwner), PET_BACKOFF=28.
 // Environmental (fall/lava/drown) damage — CLIENT-COMPUTED in native EQ; the server only validates
 // and applies it. EnvDamage2_Struct (31b): id@0, damage(u32)@6, dmgtype(u8)@22 (0xFC=falling),
 // constant(u16)@27=0xFFFF. See docs/eq-technical-knowledgebase/falling-physics.md.
-pub const OP_ENV_DAMAGE: u16 = 0x31b3;
+pub const OP_ENV_DAMAGE: u16 = 0x51fd;        // RoF2: OP_EnvDamage
 pub const DMGTYPE_FALLING: u8 = 0xFC;
 
-pub const OP_PET_COMMANDS: u16 = 0x10a1;
+pub const OP_PET_COMMANDS: u16 = 0x0159;      // RoF2: OP_PetCommands
 pub const PET_ATTACK: u32 = 2;
 pub const PET_BACKOFF: u32 = 28;
 
-// Merchant/shop (Titanium): open a merchant, then buy an item from its inventory slot.
-pub const OP_SHOP_REQUEST: u16 = 0x45f9;     // MerchantClick_Struct (open/close)
-pub const OP_SHOP_PLAYER_BUY: u16 = 0x221e;  // Merchant_Sell_Struct (buy from slot)
-pub const OP_SHOP_PLAYER_SELL: u16 = 0x0e13; // Merchant_Purchase_Struct (sell a player inventory slot)
-pub const OP_SHOP_END: u16 = 0x7e03;         // server confirms the merchant window closed
+// Merchant/shop: open a merchant, then buy an item from its inventory slot.
+pub const OP_SHOP_REQUEST: u16 = 0x4fed;      // RoF2: OP_ShopRequest; MerchantClick_Struct (open/close)
+pub const OP_SHOP_PLAYER_BUY: u16 = 0x0ddd;  // RoF2: OP_ShopPlayerBuy; Merchant_Sell_Struct (buy from slot)
+pub const OP_SHOP_PLAYER_SELL: u16 = 0x791b;  // RoF2: OP_ShopPlayerSell; Merchant_Purchase_Struct (sell a player inventory slot)
+pub const OP_SHOP_END: u16 = 0x30a8;          // RoF2: OP_ShopEnd; server confirms the merchant window closed
 
-// Move/equip/unequip an item between inventory slots (Titanium).
-pub const OP_MOVE_ITEM: u16 = 0x420f;        // MoveItem_Struct (from_slot,to_slot,number_in_stack)
+// Move/equip/unequip an item between inventory slots.
+pub const OP_MOVE_ITEM: u16 = 0x32ee;         // RoF2: OP_MoveItem; MoveItem_Struct (from_slot,to_slot,number_in_stack)
 
-// Trade window (Titanium): hand an item to an NPC for a quest turn-in. Sequence is
+// Trade window: hand an item to an NPC for a quest turn-in. Sequence is
 //   C: OP_TradeRequest → S: OP_TradeRequestAck → C: OP_MoveItem(cursor→trade slot) +
 //   OP_TradeAcceptClick → S: OP_FinishTrade. See navigation.rs for the state machine.
-pub const OP_TRADE_REQUEST: u16      = 0x372f; // C->S, TradeRequest_Struct {to_mob_id, from_mob_id} (8b)
-pub const OP_TRADE_REQUEST_ACK: u16  = 0x4048; // S->C, server auto-sends; same 8-byte struct
-pub const OP_TRADE_ACCEPT_CLICK: u16 = 0x0065; // C->S, TradeAccept_Struct {from_mob_id, unknown4} (8b)
-pub const OP_FINISH_TRADE: u16       = 0x6014; // S->C, 0 bytes — turn-in completed
-pub const OP_CANCEL_TRADE: u16       = 0x2dc1; // C->S, abort the trade session (cleanup)
-// Titanium wire slot ids: cursor = 30, the NPC's first trade slot begins at 3000.
+pub const OP_TRADE_REQUEST: u16      = 0x77b5; // RoF2: OP_TradeRequest; C->S, TradeRequest_Struct {to_mob_id, from_mob_id} (8b)
+pub const OP_TRADE_REQUEST_ACK: u16  = 0x14bf; // RoF2: OP_TradeRequestAck; S->C, server auto-sends; same 8-byte struct
+pub const OP_TRADE_ACCEPT_CLICK: u16 = 0x69e2; // RoF2: OP_TradeAcceptClick; C->S, TradeAccept_Struct {from_mob_id, unknown4} (8b)
+pub const OP_FINISH_TRADE: u16       = 0x3993; // RoF2: OP_FinishTrade; S->C, 0 bytes — turn-in completed
+pub const OP_CANCEL_TRADE: u16       = 0x354c; // RoF2: OP_CancelTrade; C->S, abort the trade session (cleanup)
+// Wire slot ids: cursor = 30, the NPC's first trade slot begins at 3000.
 pub const SLOT_CURSOR: u32           = 30;
 pub const SLOT_TRADE_BEGIN: u32      = 3000;
 
 // Native Task-system quest journal (server→client). Decoded into GameState.tasks for the quest log.
-pub const OP_TASK_DESCRIPTION: u16 = 0x5ef7; // a task's title/desc/reward (variable length)
-pub const OP_TASK_ACTIVITY: u16    = 0x682d; // one objective + progress (done/goal, variable length)
-pub const OP_COMPLETED_TASKS: u16  = 0x76a2; // list of completed task ids
+pub const OP_TASK_DESCRIPTION: u16 = 0x3714; // RoF2: OP_TaskDescription; a task's title/desc/reward (variable length)
+pub const OP_TASK_ACTIVITY: u16    = 0x08d3; // RoF2: OP_TaskActivity; one objective + progress (done/goal, variable length)
+pub const OP_COMPLETED_TASKS: u16  = 0x4eba; // RoF2: OP_CompletedTasks; list of completed task ids
 
 // ── Gameplay: looting ─────────────────────────────────────────────────────
 
 /// Server → client when a mob dies and leaves a lootable corpse.
 /// Payload: BecomeCorpse_Struct = spawn_id(u32) + y(f32) + x(f32) + z(f32)
-/// OP_BECOME_CORPSE (0x4dbc): server → client when an NPC dies with loot.
-/// NOTE: 0x4839 appears at zone entry and seems to be a player-corpse location
-/// reminder, not NPC loot notification. Use 0x4dbc for NPC loot (requires the
-/// server to have loot tables populated — unlooted mobs don't trigger this).
-pub const OP_BECOME_CORPSE: u16    = 0x4dbc;
+/// NOTE: OP_BecomeCorpse=0x0000 in patch_RoF2.conf (commented "# Unused?");
+/// keeping current value pending investigation of how RoF2 signals corpse lootability.
+pub const OP_BECOME_CORPSE: u16    = 0x4dbc; // RoF2: NO MATCH IN CONF — needs manual resolution (OP_BecomeCorpse=0x0000 in conf)
 /// Client → server to open a corpse for looting. Payload: corpse spawn_id (u32).
-pub const OP_LOOT_REQUEST: u16     = 0x6f90;
+pub const OP_LOOT_REQUEST: u16     = 0x0adf; // RoF2: OP_LootRequest
 /// Server → client with coin amounts on corpse. MoneyOnCorpse_Struct (20 bytes):
 /// response(u8) + 3×pad + platinum(u32) + gold(u32) + silver(u32) + copper(u32).
-pub const OP_MONEY_ON_CORPSE: u16  = 0x7fe4;
+pub const OP_MONEY_ON_CORPSE: u16  = 0x5f44; // RoF2: OP_MoneyOnCorpse
 /// Server → client: one packet per lootable item. Client echoes back to take it.
-pub const OP_LOOT_ITEM: u16        = 0x7081;
+pub const OP_LOOT_ITEM: u16        = 0x4dc9; // RoF2: OP_LootItem
 /// Client → server to close a loot session.
-pub const OP_END_LOOT_REQUEST: u16 = 0x2316;
+pub const OP_END_LOOT_REQUEST: u16 = 0x30f7; // RoF2: OP_EndLootRequest
 
 // ── Gameplay: progression ─────────────────────────────────────────────────
 
-pub const OP_EXP_UPDATE: u16 = 0x5ecd;
-pub const OP_LEVEL_UPDATE: u16 = 0x6d44;
+pub const OP_EXP_UPDATE: u16 = 0x20ed;    // RoF2: OP_ExpUpdate
+pub const OP_LEVEL_UPDATE: u16 = 0x1eec;  // RoF2: OP_LevelUpdate
 
 // ── Chat ──────────────────────────────────────────────────────────────────
 
-pub const OP_CHANNEL_MESSAGE: u16 = 0x1004;
+pub const OP_CHANNEL_MESSAGE: u16 = 0x2b2d;   // RoF2: OP_ChannelMessage
 /// NPC dialogue / emotes (quest text arrives here). SpecialMesg_Struct:
 /// header[3] | msg_type(u32) | target_spawn_id(u32) | sayer(\0) | unknown[12] | message(\0)
-/// Titanium wire opcode (per EQEmu utils/patches/patch_Titanium.conf).
-pub const OP_SPECIAL_MESG: u16 = 0x2372;
+pub const OP_SPECIAL_MESG: u16 = 0x0083;       // RoF2: OP_SpecialMesg
 /// eqstr-table message with %1..%9 args. FormattedMessage_Struct:
 /// unknown0(u32) | string_id(u32) | type(u32) | args (null-separated strings)
-pub const OP_FORMATTED_MESSAGE: u16 = 0x5a48;
+pub const OP_FORMATTED_MESSAGE: u16 = 0x1024;  // RoF2: OP_FormattedMessage
 /// eqstr-table message, no args. SimpleMessage_Struct: string_id(u32) | color(u32) | unknown(u32)
-pub const OP_SIMPLE_MESSAGE: u16 = 0x673c;
+pub const OP_SIMPLE_MESSAGE: u16 = 0x213f;     // RoF2: OP_SimpleMessage
 /// World/NPC emote text (some quest flavor). Emote_Struct: type(u32) | message[1024]\0
-pub const OP_EMOTE: u16 = 0x547a;
+pub const OP_EMOTE: u16 = 0x373b;              // RoF2: OP_Emote
 
 // ── Misc zone→client ──────────────────────────────────────────────────────
 
-pub const OP_ZONE_PLAYER_TO_BIND: u16 = 0x385e;
-pub const OP_ZONE_CHANGE: u16 = 0x5dd8;
-pub const OP_REQUEST_CLIENT_ZONE_CHANGE: u16 = 0x7834;
-pub const OP_LOGOUT: u16 = 0x61ff;
-pub const OP_LOGOUT_REPLY: u16 = 0x48c2; // zone → client, ack of OP_Logout
-pub const OP_GMKICK: u16 = 0x692c;       // zone → client, we were booted (e.g. logged in elsewhere)
-pub const OP_CAMP: u16 = 0x78c1;         // client → zone, begin camp; server arms a 29s timer then
+pub const OP_ZONE_PLAYER_TO_BIND: u16 = 0x08d8;  // RoF2: OP_ZonePlayerToBind
+pub const OP_ZONE_CHANGE: u16 = 0x2d18;            // RoF2: OP_ZoneChange
+pub const OP_REQUEST_CLIENT_ZONE_CHANGE: u16 = 0x3fcf; // RoF2: OP_RequestClientZoneChange
+pub const OP_LOGOUT: u16 = 0x4ac6;                 // RoF2: OP_Logout
+pub const OP_LOGOUT_REPLY: u16 = 0x48c2; // RoF2: NO MATCH IN CONF — needs manual resolution (OP_LogoutReply=0x0000 in conf)
+pub const OP_GMKICK: u16 = 0x26a7;       // RoF2: OP_GMKick; zone → client, we were booted (e.g. logged in elsewhere)
+pub const OP_CAMP: u16 = 0x28ec;         // RoF2: OP_Camp; client → zone, begin camp; server arms a 29s timer then
                                          // removes the char cleanly (no linkdead). Cancelled by a
                                          // Standing OP_SpawnAppearance. See docs / EQEmu Handle_OP_Camp.
 
@@ -404,7 +404,7 @@ pub fn eq_race_to_code(race_id: u32) -> &'static str {
 pub const SIZE_SPAWN: usize = std::mem::size_of::<Spawn_S>(); // Titanium Spawn_Struct = 385 bytes
 pub const SIZE_NEW_ZONE: usize = 688;    // NewZone_S
 pub const SIZE_ZONE_SERVER_INFO: usize = 130; // ZoneServerInfo_S (ip[128] + port[2])
-pub const SIZE_CLIENT_ZONE_ENTRY: usize = 68; // ClientZoneEntry_S
+pub const SIZE_CLIENT_ZONE_ENTRY: usize = 76; // ClientZoneEntry_S (RoF2: u32 + char[64] + u32 + u32)
 pub const SIZE_ENTER_WORLD: usize = 68;  // EnterWorld_S
 pub const SIZE_LOGIN_INFO: usize = 464;  // LoginInfo_S
 pub const SIZE_SPAWN_POSITION_UPDATE: usize = 22; // PlayerPositionUpdateServer_Struct (bit-packed)
@@ -434,6 +434,47 @@ pub const SIZE_WEAR_CHANGE: usize = std::mem::size_of::<WearChange_S>();
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── RoF2 Phase 1: opcode table + handshake size guards ────────────────────
+
+    #[test]
+    fn rof2_handshake_opcodes_match_conf() {
+        // Verify critical handshake opcodes against patch_RoF2.conf values.
+        // If any of these fail, the server will not identify us as RoF2.
+        assert_eq!(OP_SEND_LOGIN_INFO, 0x7a09, "OP_SendLoginInfo (world stream identifier)");
+        assert_eq!(OP_ZONE_ENTRY,      0x5089, "OP_ZoneEntry (zone stream identifier)");
+        assert_eq!(OP_NEW_ZONE,        0x1795, "OP_NewZone");
+        assert_eq!(OP_CLIENT_UPDATE,   0x7dfc, "OP_ClientUpdate");
+    }
+
+    #[test]
+    fn rof2_client_zone_entry_size() {
+        // RoF2 ClientZoneEntry_Struct = uint32 + char[64] + uint32 + uint32 = 76 bytes.
+        // The server signature check requires exactly 76 bytes; 68 → identify-fail.
+        assert_eq!(SIZE_CLIENT_ZONE_ENTRY, 76);
+        assert_eq!(std::mem::size_of::<ClientZoneEntry_S>(), 76);
+    }
+
+    #[test]
+    fn rof2_login_info_size() {
+        // RoF2 LoginInfo_Struct: login_info[64] + unknown064[124] + zoning(u8) + unknown189[275] = 464.
+        assert_eq!(SIZE_LOGIN_INFO, 464);
+        assert_eq!(std::mem::size_of::<LoginInfo_S>(), 464);
+    }
+
+    #[test]
+    fn rof2_zone_entry_builder_writes_name_at_offset_4() {
+        // Verify on_zone_connected layout: unknown00(u32) at [0..4], name at [4..68], zeros at [68..76].
+        let char_name = "Mordeth";
+        let mut cze = vec![0u8; SIZE_CLIENT_ZONE_ENTRY];
+        let nb = char_name.as_bytes();
+        cze[4..4 + nb.len().min(64)].copy_from_slice(&nb[..nb.len().min(64)]);
+        assert_eq!(cze.len(), 76);
+        assert_eq!(&cze[0..4], &[0u8; 4], "unknown00 must be zero");
+        assert_eq!(&cze[4..11], char_name.as_bytes(), "name at offset 4");
+        assert_eq!(cze[11], 0, "NUL terminator after name");
+        assert_eq!(&cze[68..76], &[0u8; 8], "unknown68+unknown72 must be zero");
+    }
 
     #[test]
     fn position_update_round_trips() {
@@ -842,13 +883,19 @@ pub struct MoneyOnCorpse_S {
     pub copper: u32,
 }
 
-/// Client zone entry (68 bytes) — sent when entering a zone.
+/// Client zone entry (76 bytes) — sent when entering a zone.
+/// RoF2 rof2_structs.h ClientZoneEntry_Struct: unknown00(u32) + char_name[64] + unknown68(u32) + unknown72(u32).
+/// The server signature check requires exactly 76 bytes for RoF2 identification.
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
 pub struct ClientZoneEntry_S {
     pub unknown00: u32,
     pub char_name: [u8; 64],
+    pub unknown68: u32,
+    pub unknown72: u32,
 }
+
+const _: () = assert!(std::mem::size_of::<ClientZoneEntry_S>() == 76, "ClientZoneEntry_S must be 76 bytes (RoF2)");
 
 /// Enter world (68 bytes) — character select.
 #[repr(C, packed)]
