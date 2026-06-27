@@ -327,9 +327,10 @@ type SharedWindow = Arc<Mutex<Option<Arc<Window>>>>;
 /// The skinned draw loop reads these and applies `models::head_part_visible`.
 static SEL_FACE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 static SEL_HAIR: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-/// Camera target height bias as a percentage (0 = model center, 100 = top of model). Lets the
-/// orbit camera focus on the HEAD for face/hair inspection. Set via `POST /head {"target":N}`.
-static SEL_TARGET: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Camera focus height as a percentage of model height (0 = feet, 50 = center, 100 = top of head).
+/// The orbit camera keeps this point centered, so ~85-95 frames the head for face/hair inspection.
+/// Set via `POST /head {"target":N}`.
+static SEL_TARGET: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(50);
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct SharedCameraState {
@@ -1259,23 +1260,24 @@ fn render_frame(s: &mut ViewerState) {
         (vscale, m, lift)
     };
 
-    // Orbit camera: spherical → Cartesian, looking at model center.
+    // Orbit camera: the eye orbits AROUND the focus point, so the focus stays centered in
+    // frame at every angle/zoom and `distance` is the true distance from the focus (smaller =
+    // closer). `target` (0..100) biases the focus up the model height (50 = center, ~90 = head)
+    // for close-up face/hair inspection; it no longer pushes the model off-screen.
     let az = s.azimuth.to_radians();
     let el = s.elevation.to_radians();
-    let eye = glam::Vec3::new(
-        az.cos() * el.cos() * s.distance,
-        az.sin() * el.cos() * s.distance,
-        el.sin() * s.distance,
-    );
-    // Bias the look-at point upward toward the head (SEL_TARGET% of the half-height) so the
-    // head can be inspected close-up; default 0 = model center.
     let target_bias = SEL_TARGET.load(std::sync::atomic::Ordering::Relaxed) as f32 / 100.0;
-    let half_height = s.model.y_extent * s.arch_scale; // = vscale * 0.5
-    let target = glam::Vec3::new(0.0, 0.0, lift + target_bias * half_height);
+    // The model is grounded (bottom at z=0, top at z=`visual_scale` — the ACTUAL rendered height
+    // for whichever path produced it), so the focus walks the true height directly: 0=feet,
+    // 0.5=center, 1.0=top of head. `lift` is the render's own grounding offset (unused here).
+    let _ = lift;
+    let focus = glam::Vec3::new(0.0, 0.0, target_bias * visual_scale);
+    let dir = glam::Vec3::new(az.cos() * el.cos(), az.sin() * el.cos(), el.sin());
+    let eye = focus + dir * s.distance;
 
     let aspect = s.surface_config.width as f32 / s.surface_config.height as f32;
     let vp = camera::look_at_perspective(
-        eye.to_array(), target.to_array(), [0.0, 0.0, 1.0], 60.0, aspect, 0.1, 1000.0,
+        eye.to_array(), focus.to_array(), [0.0, 0.0, 1.0], 60.0, aspect, 0.1, 1000.0,
     );
     s.queue.write_buffer(&s.camera_uniform.buf, 0, bytemuck::cast_slice(&vp));
 
