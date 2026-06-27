@@ -826,14 +826,15 @@ pub fn encode_skinned_entity_pass(
         if j_slot >= r.joint_buf_pool.len() { continue; }
         if u_slot + model.meshes.len() > r.entity_uniform_pool.len() { continue; }
 
-        let matrices: Vec<[[f32;4];4]> = if b.action == "dead" {
-            model.skin.bind_pose()
-        } else {
-            match r.anim_states.get(&b.id) {
-                Some(state) if !model.skin.clips.is_empty() =>
-                    model.skin.evaluate(state.clip_idx, state.time),
-                _ => model.skin.bind_pose(),
-            }
+        // Use the animation state's clip and time for all actions including "dead":
+        // the renderer plays the D05 death clip once and holds the last frame.
+        // When no death clip exists the sentinel clip_idx (usize::MAX) is out of range
+        // so the bind-pose fallback fires automatically — standing corpse as before.
+        let matrices: Vec<[[f32;4];4]> = match r.anim_states.get(&b.id) {
+            Some(state) if !model.skin.clips.is_empty()
+                        && state.clip_idx < model.skin.clips.len() =>
+                model.skin.evaluate(state.clip_idx, state.time),
+            _ => model.skin.bind_pose(),
         };
         let mut joint_array = [id4; 128];
         for (i, m) in matrices.iter().enumerate().take(128) { joint_array[i] = *m; }

@@ -884,31 +884,53 @@ impl EqRenderer {
 
             if *action != state.last_action {
                 // Idle starts on its neutral stand (phase 0); other actions resolve their clip directly.
+                // Dead: try to find the D05 death clip; use usize::MAX as a sentinel when none exists
+                // so the pass falls back to bind pose instead of accidentally playing clip 0.
                 state.idle_phase  = 0;
-                state.clip_idx    = if is_idle {
-                    skinned.skin.idle_clip_for_phase(0)
-                } else {
-                    skinned.skin.clip_for_action(action)
-                }.unwrap_or(0);
                 state.time        = 0.0;
                 state.last_action = action.to_string();
-                state.animate     = skinned.skin.action_animates(action, state.clip_idx);
+                if *action == "dead" {
+                    match skinned.skin.clip_for_action("dead") {
+                        Some(ci) => {
+                            state.clip_idx = ci;
+                            state.animate  = true;  // play once, renderer clamps at end
+                        }
+                        None => {
+                            state.clip_idx = usize::MAX; // sentinel: no death clip → bind pose
+                            state.animate  = false;
+                        }
+                    }
+                } else if is_idle {
+                    state.clip_idx = skinned.skin.idle_clip_for_phase(0).unwrap_or(0);
+                    state.animate  = skinned.skin.action_animates(action, state.clip_idx);
+                } else {
+                    state.clip_idx = skinned.skin.clip_for_action(action).unwrap_or(0);
+                    state.animate  = skinned.skin.action_animates(action, state.clip_idx);
+                }
             }
 
             // Guard against a clip_idx carried over from a different model: the same id
             // can switch archetype while keeping the same action string (so the check
             // above is skipped), leaving an index that is out of range for the new,
             // smaller skeleton. Re-resolve against the current model's clip set.
-            if state.clip_idx >= skinned.skin.clips.len() {
+            // Skip re-resolution for dead entities: usize::MAX is the intentional "no death
+            // clip" sentinel and must not be overwritten with clip 0.
+            if state.clip_idx >= skinned.skin.clips.len() && *action != "dead" {
                 state.clip_idx = skinned.skin.clip_for_action(action).unwrap_or(0);
                 state.animate  = skinned.skin.action_animates(action, state.clip_idx);
             }
 
-            if state.animate && *action != "dead" && !skinned.skin.clips.is_empty() {
+            // Advance animation time. Dead plays once then holds at the final frame;
+            // all other actions loop, with idle cycling through fidgets.
+            if state.animate && state.clip_idx < skinned.skin.clips.len() && !skinned.skin.clips.is_empty() {
                 let dur = skinned.skin.clips[state.clip_idx].duration;
                 if dur > 0.0 {
                     let next = state.time + dt;
-                    if next >= dur {
+                    if *action == "dead" {
+                        // Play once: clamp time to duration so evaluate() returns the last frame.
+                        state.time = next.min(dur);
+                        if next >= dur { state.animate = false; } // done; hold pose
+                    } else if next >= dur {
                         state.time = next % dur;
                         // On each completed idle loop, advance the cycle so the character
                         // alternates the neutral stand with periodic fidgets (like native).
