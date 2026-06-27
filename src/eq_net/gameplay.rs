@@ -149,22 +149,24 @@ pub async fn run_gameplay_phase(
                     } else {
                         // Cross-zone transition (#zone <name>): send OP_ZONE_CHANGE to
                         // trigger the full zone-change protocol (world reconnect, etc.).
+                        // RoF2 ZoneChange_Struct (100B): y/x/z at @76/@80/@84 (8 bytes later than Titanium).
                         let mut buf = [0u8; SIZE_ZONE_CHANGE];
                         let nb = gs.player_name.as_bytes();
                         buf[..nb.len().min(64)].copy_from_slice(&nb[..nb.len().min(64)]);
                         buf[64..66].copy_from_slice(&zone_id.to_le_bytes());
                         buf[66..68].copy_from_slice(&instance_id.to_le_bytes());
-                        buf[68..72].copy_from_slice(&y.to_le_bytes());
-                        buf[72..76].copy_from_slice(&x.to_le_bytes());
-                        buf[76..80].copy_from_slice(&z.to_le_bytes());
+                        buf[76..80].copy_from_slice(&y.to_le_bytes());
+                        buf[80..84].copy_from_slice(&x.to_le_bytes());
+                        buf[84..88].copy_from_slice(&z.to_le_bytes());
                         s.send_app_packet(OP_ZONE_CHANGE, &buf);
                         tracing::info!("EQ: cross-zone OP_REQUEST_CLIENT_ZONE_CHANGE zone_id={zone_id} → sent OP_ZONE_CHANGE");
                     }
                 }
-                OP_ZONE_CHANGE if packet.payload.len() >= 88 => {
+                OP_ZONE_CHANGE if packet.payload.len() >= 96 => {
+                    // RoF2 ZoneChange_Struct: success is an i32 at offset 92 (was 84 in Titanium).
                     let success = i32::from_le_bytes([
-                        packet.payload[84], packet.payload[85],
-                        packet.payload[86], packet.payload[87],
+                        packet.payload[92], packet.payload[93],
+                        packet.payload[94], packet.payload[95],
                     ]);
                     tracing::info!("EQ: OP_ZONE_CHANGE server response success={success}");
                     if success == 1 {
