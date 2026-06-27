@@ -719,7 +719,7 @@ pub const SIZE_CONSIDER: usize = 32;     // Consider_S
 pub const SIZE_EXP_UPDATE: usize = 4;   // ExpUpdate_S
 pub const SIZE_LEVEL_UPDATE: usize = 12; // LevelUpdate_S
 pub const SIZE_MONEY_ON_CORPSE: usize = 20; // MoneyOnCorpse_S
-pub const SIZE_ZONE_CHANGE: usize = 88;   // ZoneChange_Struct
+pub const SIZE_ZONE_CHANGE: usize = 100;  // RoF2 ZoneChange_Struct (was 88; success@92)
 
 /// WearChange_Struct (Titanium, 9 bytes). Runtime equip/unequip of one slot.
 #[repr(C, packed)]

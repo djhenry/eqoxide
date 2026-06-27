@@ -1132,23 +1132,22 @@ impl Navigator {
     /// (ZoneUnsolicited) reads it as the target and finds the matching zone point near our
     /// tracked position. Sending our current zone made target==current → request cancelled.
     fn send_zone_change_packet(&self, stream: &mut EqStream, gs: &GameState, target_zone_id: u16) {
-        let mut buf = [0u8; 88];
+        // RoF2 ZoneChange_Struct is 100 bytes (rof2_structs.h): char_name[64], zoneID@64,
+        // instanceID@66, Unknown068@68, Unknown072@72, y@76, x@80, z@84, zone_reason@88,
+        // success@92, Unknown096@96. (Titanium put y/x/z at @68/@72/@76 — 8 bytes earlier — which
+        // made the RoF2 server read garbage coords and silently ignore the zone-change request.)
+        let mut buf = [0u8; 100];
         let name_bytes = gs.player_name.as_bytes();
         let name_len = name_bytes.len().min(64);
         buf[..name_len].copy_from_slice(&name_bytes[..name_len]);
-        // zoneID = DESTINATION zone we want to travel to.
-        buf[64..66].copy_from_slice(&target_zone_id.to_le_bytes());
-        // instance_id = 0
-        buf[66..68].copy_from_slice(&0u16.to_le_bytes());
-        // ZoneChange_Struct: y(server_y=north) @68, x(server_x=east) @72 — Y-first, no swap.
-        buf[68..72].copy_from_slice(&gs.player_y.to_le_bytes());
-        buf[72..76].copy_from_slice(&gs.player_x.to_le_bytes());
-        // z
-        buf[76..80].copy_from_slice(&gs.player_z.to_le_bytes());
-        // zone_reason = 0 (normal zone line crossing)
-        buf[80..84].copy_from_slice(&0u32.to_le_bytes());
-        // success = 0 (client→server request)
-        buf[84..88].copy_from_slice(&0i32.to_le_bytes());
+        buf[64..66].copy_from_slice(&target_zone_id.to_le_bytes());   // zoneID = destination
+        buf[66..68].copy_from_slice(&0u16.to_le_bytes());             // instanceID = 0
+        // @68..76 Unknown068/Unknown072 left zero.
+        buf[76..80].copy_from_slice(&gs.player_y.to_le_bytes());      // y (north)
+        buf[80..84].copy_from_slice(&gs.player_x.to_le_bytes());      // x (east)
+        buf[84..88].copy_from_slice(&gs.player_z.to_le_bytes());      // z
+        buf[88..92].copy_from_slice(&0u32.to_le_bytes());             // zone_reason = 0
+        buf[92..96].copy_from_slice(&0i32.to_le_bytes());             // success = 0 (request)
         tracing::info!("EQ: sending OP_ZONE_CHANGE target_zone={} from current_zone={} pos=({:.1},{:.1},{:.1})",
                   target_zone_id, gs.zone_id, gs.player_x, gs.player_y, gs.player_z);
         stream.send_app_packet(OP_ZONE_CHANGE, &buf);
