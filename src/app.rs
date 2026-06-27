@@ -48,9 +48,11 @@ struct EntityMotion {
     display:     [f32; 3],
     /// Most recent server position seen [east, north, z].
     target:      [f32; 3],
-    /// Estimated velocity in units/sec, from the last two server positions.
-    vel:         [f32; 3],
-    /// When `target` last changed — the clock for dead-reckoning extrapolation.
+    /// Estimated travel pace in units/sec, from the last two server positions. We move `display`
+    /// toward `target` at this pace (never overshooting) so the entity glides between sparse
+    /// updates at its actual speed instead of lurching to each one and waiting.
+    speed:       f32,
+    /// When `target` last changed — used to measure the real per-update interval.
     last_update: std::time::Instant,
 }
 
@@ -805,54 +807,47 @@ impl App {
         // horizontal jumps (spawns, teleports, server corrections) snap instead of sliding.
         // Done before the floor-snap below so the ground height follows the smoothed position.
         {
-            const SMOOTH_TAU: f32 = 0.10;          // ease toward the dead-reckoned point
             const SNAP_DIST_SQ: f32 = 25.0 * 25.0; // beyond this horizontal gap, jump not slide
-            const EXTRAP_CAP: f32 = 0.30;          // seconds of forward prediction we trust
+            const MAX_UPD: f32 = 4.0;              // cap on the measured update interval. RoF2 NPCs
+                                                   // send a position only ~every 2.7s; the old 1.0s
+                                                   // cap made the pace estimate ~3x too high, so the
+                                                   // entity lurched to each point then waited.
             let now = std::time::Instant::now();
             let live: std::collections::HashSet<u32> =
                 self.scene.billboards.iter().map(|b| b.id).collect();
             self.entity_motion.retain(|id, _| live.contains(id));
-            let step = (dt / SMOOTH_TAU).min(1.0);
             for b in &mut self.scene.billboards {
                 let target = b.pos;
                 let m = self.entity_motion.entry(b.id).or_insert_with(|| EntityMotion {
-                    display: target, target, vel: [0.0; 3], last_update: now,
+                    display: target, target, speed: 0.0, last_update: now,
                 });
 
-                // A changed server position is a fresh update: estimate velocity from the gap
-                // since the previous one (the "rate of travel" between the last two locations).
+                // A changed server position is a fresh update: estimate the travel pace from the
+                // distance moved since the previous one over the real elapsed interval.
                 if target != m.target {
                     let dx = target[0] - m.target[0];
                     let dy = target[1] - m.target[1];
+                    let dz = target[2] - m.target[2];
                     if dx * dx + dy * dy >= SNAP_DIST_SQ {
-                        m.vel = [0.0; 3];      // teleport / correction — don't fling across the zone
+                        m.speed = 0.0;          // teleport / correction — snap, don't slide across
                         m.display = target;
                     } else {
-                        let dt_upd = (now - m.last_update).as_secs_f32().clamp(0.05, 1.0);
-                        for i in 0..3 {
-                            m.vel[i] = (target[i] - m.target[i]) / dt_upd;
-                        }
+                        let dt_upd = (now - m.last_update).as_secs_f32().clamp(0.05, MAX_UPD);
+                        m.speed = (dx * dx + dy * dy + dz * dz).sqrt() / dt_upd;
                     }
                     m.target = target;
                     m.last_update = now;
                 }
 
-                // Predict where the entity is now by extrapolating along its velocity. Cap the
-                // prediction window, and once updates stop arriving (the entity has stopped) bleed
-                // the velocity off so it settles on the last known position instead of drifting.
-                let t_since = (now - m.last_update).as_secs_f32();
-                if t_since > EXTRAP_CAP {
-                    let decay = (1.0 - dt * 6.0).max(0.0);
-                    for v in &mut m.vel { *v *= decay; }
-                }
-                let te = t_since.min(EXTRAP_CAP);
-                let mut predicted = m.target;
-                for i in 0..3 {
-                    predicted[i] += m.vel[i] * te;
-                }
-
-                for i in 0..3 {
-                    m.display[i] += (predicted[i] - m.display[i]) * step;
+                // Glide the rendered position toward the latest server position at that pace, never
+                // overshooting: a moving entity travels smoothly over the whole update gap and a
+                // stopped one settles cleanly (no extrapolation drift past its last point).
+                let to = [target[0] - m.display[0], target[1] - m.display[1], target[2] - m.display[2]];
+                let d = (to[0] * to[0] + to[1] * to[1] + to[2] * to[2]).sqrt();
+                if d > 1e-4 {
+                    let move_d = (m.speed * dt).min(d);
+                    let f = move_d / d;
+                    for i in 0..3 { m.display[i] += to[i] * f; }
                 }
                 b.pos = m.display;
             }
