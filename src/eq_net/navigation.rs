@@ -656,12 +656,14 @@ impl Navigator {
         if let Some((merchant_id, slot)) = buy_req {
             let open = merchant_click(merchant_id, gs.player_id, 1);
             stream.send_app_packet(OP_SHOP_REQUEST, &open);
-            // Merchant_Sell_Struct (24b): npcid, playerid, itemslot, unknown12, quantity, price.
-            let mut buy = [0u8; 24];
+            // RoF2 Merchant_Sell_Struct (32b): npcid@0, playerid@4, itemslot@8, unknown12@12,
+            // quantity@16, unknown20@20, price@24, unknown28@28. (Titanium was 24b with price@20;
+            // the RoF2 server DECODEs an exact 32 bytes, so a short packet was silently dropped.)
+            let mut buy = [0u8; 32];
             buy[0..4].copy_from_slice(&merchant_id.to_le_bytes());
             buy[4..8].copy_from_slice(&gs.player_id.to_le_bytes());
             buy[8..12].copy_from_slice(&slot.to_le_bytes());
-            buy[16..20].copy_from_slice(&1u32.to_le_bytes()); // quantity = 1
+            buy[16..20].copy_from_slice(&1u32.to_le_bytes()); // quantity = 1 (server sets the price)
             stream.send_app_packet(OP_SHOP_PLAYER_BUY, &buy);
             tracing::info!("EQ: shop buy — merchant_id={} slot={} qty=1", merchant_id, slot);
             gs.log_msg("merchant", &format!("Bought item (slot {})", slot));
