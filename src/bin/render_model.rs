@@ -322,6 +322,12 @@ type SharedCamera = Arc<Mutex<SharedCameraState>>;
 type SharedWireframe = Arc<Mutex<bool>>;
 type SharedWindow = Arc<Mutex<Option<Arc<Window>>>>;
 
+/// Live head-part selection (0-indexed face, 0-indexed hairstyle: 0=bald) for iterating on
+/// face/hair rendering. Set at launch by `--face N`/`--hairstyle N` and live via `POST /head`.
+/// The skinned draw loop reads these and applies `models::head_part_visible`.
+static SEL_FACE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static SEL_HAIR: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct SharedCameraState {
     azimuth:   f32,
@@ -386,6 +392,13 @@ fn main() {
         .unwrap_or(8766);
     let show_markers = args.contains(&"--markers".to_string());
     let parts_mode   = args.contains(&"--parts".to_string());
+    // Head-part selection for face/hair iteration (0-indexed; hairstyle 0 = bald).
+    if let Some(f) = args.iter().position(|a| a == "--face").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()) {
+        SEL_FACE.store(f, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(h) = args.iter().position(|a| a == "--hairstyle").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()) {
+        SEL_HAIR.store(h, std::sync::atomic::Ordering::Relaxed);
+    }
 
     let frame_req:     FrameReq         = Arc::new(Mutex::new(None));
     // Default to azimuth 180 so the viewer faces the character's FRONT. Models face
@@ -468,10 +481,21 @@ fn main() {
                     StatusCode::OK
                 }
 
+                #[derive(serde::Deserialize)]
+                struct HeadBody { face: Option<u8>, hairstyle: Option<u8> }
+                async fn post_head(Json(body): Json<HeadBody>) -> String {
+                    if let Some(f) = body.face { SEL_FACE.store(f, std::sync::atomic::Ordering::Relaxed); }
+                    if let Some(h) = body.hairstyle { SEL_HAIR.store(h, std::sync::atomic::Ordering::Relaxed); }
+                    format!("face={} hairstyle={}",
+                        SEL_FACE.load(std::sync::atomic::Ordering::Relaxed),
+                        SEL_HAIR.load(std::sync::atomic::Ordering::Relaxed))
+                }
+
                 let app = Router::new()
                     .route("/camera", get(get_camera).post(post_camera))
                     .route("/frame", get(get_frame))
                     .route("/wireframe", get(get_wireframe).post(post_wireframe))
+                    .route("/head", axum::routing::post(post_head))
                     .with_state(state);
 
                 let addr = format!("127.0.0.1:{port}");
@@ -1312,8 +1336,16 @@ fn render_frame(s: &mut ViewerState) {
         pass.set_pipeline(&s.pipelines.skinned);
         pass.set_bind_group(0, &s.camera_uniform.bind_group, &[]);
         pass.set_bind_group(3, &sk.joints_bg, &[]);
+        let sel_face = SEL_FACE.load(std::sync::atomic::Ordering::Relaxed);
+        let sel_hair = SEL_HAIR.load(std::sync::atomic::Ordering::Relaxed);
         for (i, mesh) in sk.model.meshes.iter().enumerate() {
             if i >= s.uniform_pool.len() { break; }
+            // Apply the same face/hair head-part selection the game client uses, so we can
+            // iterate on hair rendering here (much faster than the full game-client cycle).
+            if i < sk.model.head_parts.len() && !eqoxide::models::head_part_visible(
+                sk.model.head_parts[i], sk.model.head_default_hidden[i], sel_face, sel_hair) {
+                continue;
+            }
             pass.set_bind_group(2, &s.uniform_pool[i].1, &[]);
             let bg = match mesh.texture_idx {
                 Some(idx) if idx < sk.model.texture_bind_groups.len() => &sk.model.texture_bind_groups[idx],
