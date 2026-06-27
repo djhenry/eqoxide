@@ -170,19 +170,27 @@ impl SceneState {
             // Map EQ Animation:: values to action strings for clip resolution.
             // Animation constants from eq_constants.h: Standing=100, Freeze=102,
             // Looting=105, Sitting=110, Crouching=111, Lying=115.
-            // A transient combat swing (OP_Animation) overrides the looping animation for a short
-            // window: action "C0{code}" resolves to the matching combat clip (C05 = 1H weapon, …).
-            let action: String = match gs.combat_anims.get(&e.spawn_id) {
-                Some((code, start)) if start.elapsed() < COMBAT_SWING_WINDOW => format!("C{:02}", code),
-                _ => match e.animation {
-                    100 => "idle",       // Animation::Standing
-                    102 => "idle",       // Animation::Freeze
-                    110 => "sitting",    // Animation::Sitting
-                    111 => "crouching",  // Animation::Crouching
-                    105 => "idle",       // Animation::Looting (treat as idle)
-                    115 => "dead",       // Animation::Lying
-                    _   => "idle",       // default / standing / safe default
-                }.to_string(),
+            // Dead entities always use the "dead" clip — no combat swing can override.
+            // (apply_death sets e.animation=115, but guard here in case the animation
+            // field is stale from a race or a future code path that forgets to update it.)
+            let action: String = if e.dead {
+                "dead".to_string()
+            } else {
+                // A transient combat swing (OP_Animation) overrides the looping animation for a
+                // short window: action "C0{code}" resolves to the matching combat clip (C05 = 1H
+                // weapon, …).
+                match gs.combat_anims.get(&e.spawn_id) {
+                    Some((code, start)) if start.elapsed() < COMBAT_SWING_WINDOW => format!("C{:02}", code),
+                    _ => match e.animation {
+                        100 => "idle",       // Animation::Standing
+                        102 => "idle",       // Animation::Freeze
+                        110 => "sitting",    // Animation::Sitting
+                        111 => "crouching",  // Animation::Crouching
+                        105 => "idle",       // Animation::Looting (treat as idle)
+                        115 => "dead",       // Animation::Lying
+                        _   => "idle",       // default / standing / safe default
+                    }.to_string(),
+                }
             };
             Billboard {
                 id:        e.spawn_id,
