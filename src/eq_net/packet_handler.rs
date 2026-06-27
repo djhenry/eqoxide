@@ -232,40 +232,39 @@ fn apply_char_inventory(gs: &mut GameState, p: &[u8]) {
 /// items are routed to `gs.merchant_items` (for `GET /trade/list` + the HUD merchant window);
 /// everything else upserts into the player inventory by slot.
 fn apply_item_packet(gs: &mut GameState, p: &[u8]) {
-    const ITEM_PACKET_MERCHANT: u8 = 0x64;
-    let packet_type = p.first().copied().unwrap_or(0);
-    let text = String::from_utf8_lossy(p);
-    for record in text.split('\0') {
-        if packet_type == ITEM_PACKET_MERCHANT {
-            if let Some(mi) = parse_merchant_item(record) {
-                gs.merchant_items.retain(|x| x.merchant_slot != mi.merchant_slot);
-                gs.merchant_items.push(mi);
-                gs.merchant_items.sort_by_key(|m| m.merchant_slot);
-                break;
-            }
-        } else if let Some(it) = parse_inv_item(record) {
-            gs.inventory.retain(|x| x.slot != it.slot);
-            gs.inventory.push(it);
-            break;
-        }
+    // RoF2 OP_ItemPacket: ItemPacket_Struct = PacketType (u32) + one binary-serialized item.
+    // (Titanium sent pipe-delimited text; RoF2 uses the packed SerializeItem format — see
+    // crate::eq_net::item.) 0x64 = Merchant, others (0x66 Loot, 0x69 CharInventory…) are items.
+    const ITEM_PACKET_MERCHANT: u32 = 0x64;
+    if p.len() < 4 { return; }
+    let packet_type = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+    let Some(item) = crate::eq_net::item::parse_rof2_item(&p[4..]) else { return; };
+    if packet_type == ITEM_PACKET_MERCHANT {
+        let mi = crate::game_state::MerchantItem {
+            merchant_slot: item.main_slot as u32,
+            item_id:       item.id,
+            name:          item.name,
+            icon:          item.icon,
+            price:         item.price,
+            quantity:      item.merchant_count as i32,
+        };
+        gs.merchant_items.retain(|x| x.merchant_slot != mi.merchant_slot);
+        gs.merchant_items.push(mi);
+        gs.merchant_items.sort_by_key(|m| m.merchant_slot);
+    } else {
+        let it = crate::game_state::InvItem {
+            slot:    item.main_slot as i32,
+            item_id: item.id,
+            name:    item.name,
+            icon:    item.icon,
+            charges: (item.charges as i32).max(1),
+            idfile:  item.idfile,
+        };
+        gs.inventory.retain(|x| x.slot != it.slot);
+        gs.inventory.push(it);
     }
 }
 
-/// Parse one pipe-delimited MERCHANT item record. Field indices (from EQEmu titanium.cpp
-/// SerializeItem): [2]=merchant slot, [3]=merchant price, [4]=merchant count, [12]=Name,
-/// [15]=item id, [22]=Icon. None if it doesn't have the core fields.
-fn parse_merchant_item(record: &str) -> Option<crate::game_state::MerchantItem> {
-    let f: Vec<&str> = record.split('|').collect();
-    if f.len() < 23 { return None; }
-    let merchant_slot: u32 = f[2].trim().parse().ok()?;
-    let price: u32 = f[3].trim().parse().unwrap_or(0);
-    let quantity: i32 = f[4].trim().parse().unwrap_or(0);
-    let name = f[12].trim().trim_start_matches('"').to_string();
-    let item_id: u32 = f[15].trim().parse().unwrap_or(0);
-    let icon: u32 = f[22].trim().parse().unwrap_or(0);
-    if name.is_empty() && item_id == 0 { return None; }
-    Some(crate::game_state::MerchantItem { merchant_slot, item_id, name, icon, price, quantity })
-}
 
 /// OP_ShopPlayerSell (server→client echo) — confirms a sale completed. Merchant_Purchase_Struct:
 /// npcid @0, itemslot @4 (the WIRE slot, server-translated back), quantity @8, price @12. The
