@@ -375,18 +375,12 @@ impl<'a> LoginProtocol<'a> {
             }
             OP_ZONE_ENTRY if !self.done_zone_entry => {
                 self.done_zone_entry = true;
-                // Server echoes back the player's own Spawn_S; register it.
-                for offset in [0usize, 2, 4] {
-                    if packet.payload.len() < offset + SIZE_SPAWN { continue; }
-                    let spawn    = unsafe { safe_read::<Spawn_S>(&packet.payload[offset..]) };
-                    let spawn_id = spawn.spawnId;
-                    let name     = spawn.name_str();
-                    if !name.is_empty() && name.chars().all(|c| c.is_ascii() && (c.is_alphanumeric() || c == '_')) {
-                        tracing::info!("EQ: server zone entry: spawn_id={} name={:?}", spawn_id, name);
-                        // Use a local copy of gs for player_name; register_spawn needs &mut gs
-                        // but we can't mutate here — the caller already called apply_packet
-                        // which handled OP_ZONE_ENTRY.  Nothing extra to do.
-                        break;
+                // Server echoes back the player's own spawn in RoF2 variable-length format.
+                // apply_packet already handled OP_ZONE_ENTRY; just log the spawn for debugging.
+                if let Some((info, _)) = parse_rof2_spawn(&packet.payload) {
+                    if !info.name.is_empty() {
+                        tracing::info!("EQ: server zone entry: spawn_id={} name={:?}",
+                            info.spawn_id, info.name);
                     }
                 }
                 PhaseResult::Continue
