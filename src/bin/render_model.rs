@@ -775,10 +775,16 @@ impl ApplicationHandler for ModelViewerApp {
         let (_, tex_bgs) = gpu::upload_textures(&device, &queue, &asset.textures, &layouts.texture_bgl);
         let tex_names: Vec<String> = asset.textures.iter().map(|t| t.name.clone()).collect();
 
-        let (meshes, static_slots): (Vec<gpu::GpuMesh>, Vec<Option<eqoxide::models::EquipSlot>>) = asset.meshes.iter()
-            .zip(asset.equip_slots.iter())
-            .filter_map(|(mesh, &slot)| {
-            if mesh.positions.is_empty() || mesh.indices.is_empty() { return None; }
+        let mut meshes: Vec<gpu::GpuMesh>                              = Vec::new();
+        let mut static_slots: Vec<Option<eqoxide::models::EquipSlot>> = Vec::new();
+        let mut static_head_parts: Vec<Option<eqoxide::models::HeadPart>> = Vec::new();
+        let mut static_head_hidden: Vec<bool>                         = Vec::new();
+        for (mesh, (&slot, (&hp, &dh))) in asset.meshes.iter()
+            .zip(asset.equip_slots.iter()
+                .zip(asset.head_parts.iter()
+                    .zip(asset.head_default_hidden.iter())))
+        {
+            if mesh.positions.is_empty() || mesh.indices.is_empty() { continue; }
             let vertices: Vec<gpu::Vertex> = mesh.positions.iter().enumerate()
                 .map(|(i, &p)| {
                     let nrm = mesh.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
@@ -792,17 +798,22 @@ impl ApplicationHandler for ModelViewerApp {
             });
             let texture_idx = mesh.texture_name.as_ref()
                 .and_then(|n| tex_names.iter().position(|t| t == n));
-            Some((gpu::GpuMesh { vertex_buf: vbuf, index_buf: ibuf,
-                                index_count: mesh.indices.len() as u32, texture_idx,
-                                base_color: mesh.base_color,
-                                render_mode: eqoxide::assets::RenderMode::Opaque, anim: None }, slot))
-        }).unzip();
+            meshes.push(gpu::GpuMesh { vertex_buf: vbuf, index_buf: ibuf,
+                            index_count: mesh.indices.len() as u32, texture_idx,
+                            base_color: mesh.base_color,
+                            render_mode: eqoxide::assets::RenderMode::Opaque, anim: None });
+            static_slots.push(slot);
+            static_head_parts.push(hp);
+            static_head_hidden.push(dh);
+        }
 
         let model = GpuStaticModel {
             meshes, texture_bind_groups: tex_bgs,
             y_bottom: asset.y_bottom, y_extent: asset.y_extent,
             x_center: asset.x_center, z_center: asset.z_center,
             prefix: asset.prefix.clone(), equip_slots: static_slots,
+            head_parts: static_head_parts,
+            head_default_hidden: static_head_hidden,
             true_height: asset.true_height,
             clip_bounds: vec![],
             feet_offset: 0.0,
@@ -816,35 +827,44 @@ impl ApplicationHandler for ModelViewerApp {
             match skin {
                 Some(skin) if skin.joint_count > 0 && skin.joint_count <= 128 => {
                     let (_, sk_tex_bgs) = gpu::upload_textures(&device, &queue, &asset.textures, &layouts.texture_bgl);
-                    let (smeshes, sslots): (Vec<GpuSkinnedMesh>, Vec<Option<eqoxide::models::EquipSlot>>) =
-                        asset.meshes.iter()
-                            .zip(asset.skin_meshes.iter())
-                            .zip(asset.skinned_mesh_scales.iter())
-                            .zip(asset.equip_slots.iter())
-                            .filter_map(|(((mesh, sd_opt), &mesh_node_scale), &slot)| {
-                                if mesh.positions.is_empty() || mesh.indices.is_empty() { return None; }
-                                let sd = sd_opt.as_ref();
-                                let vertices: Vec<SkinnedVertex> = mesh.positions.iter().enumerate().map(|(i, &p)| {
-                                    let nrm = mesh.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
-                                    let uv  = mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]);
-                                    let ji  = sd.and_then(|s: &SkinnedMeshData| s.joint_indices.get(i)).copied().unwrap_or([0u32; 4]);
-                                    let jw  = sd.and_then(|s: &SkinnedMeshData| s.joint_weights.get(i)).copied().unwrap_or([1.0, 0.0, 0.0, 0.0]);
-                                    SkinnedVertex { position: p, normal: nrm, uv, joint_indices: ji, joint_weights: jw }
-                                }).collect();
-                                let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                    label: None, contents: bytemuck::cast_slice(&vertices), usage: wgpu::BufferUsages::VERTEX });
-                                let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                                    label: None, contents: bytemuck::cast_slice(&mesh.indices), usage: wgpu::BufferUsages::INDEX });
-                                let texture_idx = mesh.texture_name.as_ref().and_then(|n| tex_names.iter().position(|t| t == n));
-                                Some((GpuSkinnedMesh { vertex_buf: vbuf, index_buf: ibuf,
-                                    index_count: mesh.indices.len() as u32, texture_idx,
-                                    base_color: mesh.base_color, mesh_node_scale }, slot))
-                            }).unzip();
+                    let mut smeshes: Vec<GpuSkinnedMesh>                          = Vec::new();
+                    let mut sslots: Vec<Option<eqoxide::models::EquipSlot>>       = Vec::new();
+                    let mut shead_parts: Vec<Option<eqoxide::models::HeadPart>>   = Vec::new();
+                    let mut shead_hidden: Vec<bool>                               = Vec::new();
+                    for (((mesh, sd_opt), &mesh_node_scale), (&slot, (&hp, &dh))) in asset.meshes.iter()
+                        .zip(asset.skin_meshes.iter())
+                        .zip(asset.skinned_mesh_scales.iter())
+                        .zip(asset.equip_slots.iter()
+                            .zip(asset.head_parts.iter()
+                                .zip(asset.head_default_hidden.iter())))
+                    {
+                        if mesh.positions.is_empty() || mesh.indices.is_empty() { continue; }
+                        let sd = sd_opt.as_ref();
+                        let vertices: Vec<SkinnedVertex> = mesh.positions.iter().enumerate().map(|(i, &p)| {
+                            let nrm = mesh.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
+                            let uv  = mesh.uvs.get(i).copied().unwrap_or([0.0, 0.0]);
+                            let ji  = sd.and_then(|s: &SkinnedMeshData| s.joint_indices.get(i)).copied().unwrap_or([0u32; 4]);
+                            let jw  = sd.and_then(|s: &SkinnedMeshData| s.joint_weights.get(i)).copied().unwrap_or([1.0, 0.0, 0.0, 0.0]);
+                            SkinnedVertex { position: p, normal: nrm, uv, joint_indices: ji, joint_weights: jw }
+                        }).collect();
+                        let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: None, contents: bytemuck::cast_slice(&vertices), usage: wgpu::BufferUsages::VERTEX });
+                        let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: None, contents: bytemuck::cast_slice(&mesh.indices), usage: wgpu::BufferUsages::INDEX });
+                        let texture_idx = mesh.texture_name.as_ref().and_then(|n| tex_names.iter().position(|t| t == n));
+                        smeshes.push(GpuSkinnedMesh { vertex_buf: vbuf, index_buf: ibuf,
+                            index_count: mesh.indices.len() as u32, texture_idx,
+                            base_color: mesh.base_color, mesh_node_scale });
+                        sslots.push(slot);
+                        shead_parts.push(hp);
+                        shead_hidden.push(dh);
+                    }
                     let smodel = GpuSkinnedModel {
                         meshes: smeshes, texture_bind_groups: sk_tex_bgs, skin,
                         node_scale: asset.skinned_node_scale, y_bottom: asset.y_bottom,
                         x_center: asset.x_center, z_center: asset.z_center,
                         prefix: asset.prefix.clone(), equip_slots: sslots,
+                        head_parts: shead_parts, head_default_hidden: shead_hidden,
                         true_height: asset.true_height, clip_bounds: asset.clip_bounds.clone(),
                         feet_offset: asset.feet_offset,
                     };

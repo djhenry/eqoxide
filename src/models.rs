@@ -7,6 +7,44 @@ use std::path::Path;
 use crate::assets::{MeshData, TextureData};
 use crate::anim::{AnimClip, GroundProbe, JointChannel, JointProperty, SkinData};
 
+/// Which head-appearance part a primitive represents.  Emitted by the converter in
+/// `primitive.extras` for humanoid GLBs: `{ "eq_head_part": "face"|"hair", "eq_part_index": N }`.
+/// Body/eye primitives carry no extras and are represented by `None` in `ModelAsset::head_parts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadPart {
+    /// Face variant N (1-indexed, matching `eq_part_index`).  Spawn `face` is 0-indexed,
+    /// so visible face = `Face(spawn.face + 1)`.
+    Face(u8),
+    /// Hair style N (1-indexed, matching `eq_part_index`).  Visible when `spawn.hairstyle == N`
+    /// and `N > 0`; hairstyle 0 means bald (all hair hidden).
+    Hair(u8),
+}
+
+/// Returns whether a mesh primitive should be rendered given its head-part tag and the
+/// character's face/hairstyle.
+///
+/// Rules:
+/// - `None` (body/eyes): always visible.
+/// - `Face(N)`: visible when `face + 1 == N`.
+/// - `Hair(N)`: visible when `hairstyle > 0 && hairstyle == N`.
+///
+/// The `_default_hidden` parameter reflects the converter's `eq_default_hidden` flag (used to
+/// describe the initial no-spawn-data state). It is not needed here because face=0/hairstyle=0
+/// (the `Entity` defaults) already produce the correct initial visibility — face 1 visible, all
+/// hair hidden — via the spawn-based matching rules above.
+pub fn head_part_visible(
+    part: Option<HeadPart>,
+    _default_hidden: bool,
+    face: u8,
+    hairstyle: u8,
+) -> bool {
+    match part {
+        None => true,
+        Some(HeadPart::Face(idx)) => idx == face.saturating_add(1),
+        Some(HeadPart::Hair(idx)) => hairstyle > 0 && idx == hairstyle,
+    }
+}
+
 /// Per-vertex joint skinning data for one mesh primitive (parallel to MeshData positions).
 pub struct SkinnedMeshData {
     pub joint_indices: Vec<[u32; 4]>,
@@ -40,6 +78,11 @@ pub struct ModelAsset {
     pub prefix: String,
     /// Per-mesh equipment slot binding, parallel to `meshes`. `None` = not an armor slot.
     pub equip_slots: Vec<Option<EquipSlot>>,
+    /// Per-mesh head-appearance tag, parallel to `meshes`. `None` = body/eyes (always visible).
+    pub head_parts: Vec<Option<HeadPart>>,
+    /// Per-mesh default-hidden flag from the converter's `eq_default_hidden` extras field.
+    /// Parallel to `meshes`. Used alongside `head_parts` by `head_part_visible`.
+    pub head_default_hidden: Vec<bool>,
     /// True model height in EQ units, from the `eq_height` extras field written by the
     /// converter into the glTF ROOT node. Falls back to `y_extent` (measured vertex bounds)
     /// when the extras field is absent (e.g. chr.s3d static models).
@@ -237,6 +280,8 @@ impl ModelAsset {
         let mut skin_meshes:        Vec<Option<SkinnedMeshData>> = Vec::new();
         let mut skinned_mesh_scales: Vec<f32>                   = Vec::new();
         let mut equip_slots: Vec<Option<EquipSlot>> = Vec::new();
+        let mut head_parts: Vec<Option<HeadPart>> = Vec::new();
+        let mut head_default_hidden: Vec<bool> = Vec::new();
         let mut model_prefix: String = String::new();
 
         for mesh in document.meshes() {
@@ -313,6 +358,23 @@ impl ModelAsset {
                     if let Some((ref p, _)) = parsed { model_prefix = p.clone(); }
                 }
                 equip_slots.push(parsed.map(|(_, s)| s));
+
+                // Parse head-part extras (face/hair visibility tags emitted by the converter).
+                let head_tag: Option<(HeadPart, bool)> = primitive.extras().as_ref().and_then(|ex| {
+                    let v: serde_json::Value = serde_json::from_str(ex.get()).ok()?;
+                    let part_name  = v.get("eq_head_part")?.as_str()?;
+                    let part_index = v.get("eq_part_index")?.as_u64()? as u8;
+                    let dflt_hidden = v.get("eq_default_hidden")
+                        .and_then(|h| h.as_bool()).unwrap_or(false);
+                    let part = match part_name {
+                        "face" => HeadPart::Face(part_index),
+                        "hair" => HeadPart::Hair(part_index),
+                        _ => return None,
+                    };
+                    Some((part, dflt_hidden))
+                });
+                head_parts.push(head_tag.map(|(p, _)| p));
+                head_default_hidden.push(head_tag.map(|(_, h)| h).unwrap_or(false));
             }
         }
 
@@ -470,7 +532,7 @@ impl ModelAsset {
         // Prefer the measured idle extent for scaling; fall back to eq_height/measured bounds.
         let true_height = if idle_extent > 0.001 { idle_extent } else { true_height };
 
-        Ok(ModelAsset { meshes, textures, skin: skin_data, skin_meshes, skinned_node_scale, skinned_mesh_scales, y_bottom, y_extent, x_center, z_center, prefix: model_prefix, equip_slots, true_height, clip_bounds, feet_offset })
+        Ok(ModelAsset { meshes, textures, skin: skin_data, skin_meshes, skinned_node_scale, skinned_mesh_scales, y_bottom, y_extent, x_center, z_center, prefix: model_prefix, equip_slots, head_parts, head_default_hidden, true_height, clip_bounds, feet_offset })
     }
 
     /// Load a static character model from an EQ `_chr.s3d` archive.
@@ -531,6 +593,9 @@ impl ModelAsset {
             z_center,
             prefix: String::new(),
             equip_slots: vec![None; mesh_count],
+            // chr.s3d models have no glTF extras — no head-part tags.
+            head_parts:         vec![None; mesh_count],
+            head_default_hidden: vec![false; mesh_count],
             // chr.s3d models have no glTF extras; fall back to measured y_extent.
             true_height: y_extent,
             clip_bounds: vec![], // static chr.s3d models have no clips
@@ -1338,6 +1403,55 @@ mod tests {
         assert!(asset.meshes.len() <= crate::renderer::PLAYER_UNIFORM_SLOTS,
             "humanoid has {} meshes but PLAYER_UNIFORM_SLOTS is {}",
             asset.meshes.len(), crate::renderer::PLAYER_UNIFORM_SLOTS);
+    }
+
+    // ── head_part_visible truth table ───────────────────────────────────────
+
+    #[test]
+    fn head_part_visible_untagged_always_visible() {
+        // body/eye primitives have no tag → always visible regardless of face/hairstyle
+        assert!(head_part_visible(None, false, 0, 0));
+        assert!(head_part_visible(None, true,  7, 7));
+        assert!(head_part_visible(None, false, 3, 5));
+    }
+
+    #[test]
+    fn head_part_visible_correct_face_shows() {
+        // face=2 (0-indexed) → show primitive with eq_part_index 3
+        assert!(head_part_visible(Some(HeadPart::Face(3)), false, 2, 0));
+    }
+
+    #[test]
+    fn head_part_visible_wrong_faces_hidden() {
+        // face=0 → only Face(1) visible; Face(2..8) hidden
+        for idx in 2u8..=8 {
+            assert!(!head_part_visible(Some(HeadPart::Face(idx)), true, 0, 0),
+                "Face({idx}) should be hidden when face=0");
+        }
+        assert!( head_part_visible(Some(HeadPart::Face(1)), false, 0, 0));
+    }
+
+    #[test]
+    fn head_part_visible_hairstyle_zero_hides_all_hair() {
+        for idx in 1u8..=7 {
+            assert!(!head_part_visible(Some(HeadPart::Hair(idx)), true, 0, 0),
+                "Hair({idx}) should be hidden when hairstyle=0 (bald)");
+        }
+    }
+
+    #[test]
+    fn head_part_visible_hairstyle_n_shows_hair_n() {
+        // hairstyle=3 → Hair(3) visible, others hidden
+        assert!( head_part_visible(Some(HeadPart::Hair(3)), true, 0, 3));
+        assert!(!head_part_visible(Some(HeadPart::Hair(1)), true, 0, 3));
+        assert!(!head_part_visible(Some(HeadPart::Hair(2)), true, 0, 3));
+        assert!(!head_part_visible(Some(HeadPart::Hair(4)), true, 0, 3));
+    }
+
+    #[test]
+    fn head_part_visible_default_hidden_flag_ignored_when_face_matches() {
+        // default_hidden=true on face 1, but face=0 → face+1==1 → visible anyway
+        assert!(head_part_visible(Some(HeadPart::Face(1)), true, 0, 0));
     }
 }
 

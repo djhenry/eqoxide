@@ -296,6 +296,12 @@ pub struct SpawnInfo {
     pub cur_hp:          u8,   // HP percent (100 = full)
     pub helm:            u8,
     pub show_helm:       bool,
+    /// Face variant (0-indexed from the `face` wire byte after `size`).
+    /// Rendered face has `eq_part_index == face + 1`.
+    pub face:            u8,
+    /// Hair style (from the `hairstyle` wire byte in the curHp..beard block).
+    /// 0 = bald (all hair primitives hidden).
+    pub hairstyle:       u8,
     pub stand_state:     u8,   // 0x64 = normal standing
     pub pet_owner_id:    u32,
     pub player_state:    u32,
@@ -420,7 +426,9 @@ pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
 
     // 12-18. curHp haircolor beardcolor eyecolor1 eyecolor2 hairstyle beard (7×u8)
     let cur_hp = rd_u8!();
-    skip!(6); // haircolor..beard
+    skip!(4); // haircolor beardcolor eyecolor1 eyecolor2
+    let hairstyle = rd_u8!(); // hairstyle (0-indexed; 0=bald)
+    skip!(1); // beard
 
     // 19-21. drakkin_heritage/tattoo/details (3×u32)
     skip!(12);
@@ -431,8 +439,8 @@ pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
 
     // 26. size (f32)
     skip!(4);
-    // 27. face (u8)
-    skip!(1);
+    // 27. face (u8) — 0-indexed; rendered face = eq_part_index face+1
+    let face = rd_u8!();
     // 28-29. walkspeed/runspeed (2×f32)
     skip!(8);
     // 30. race (u32)
@@ -560,7 +568,7 @@ pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
 
     Some((SpawnInfo {
         spawn_id, name, last_name, level, npc, gender, race, class_,
-        body_type, cur_hp, helm, show_helm, stand_state,
+        body_type, cur_hp, helm, show_helm, face, hairstyle, stand_state,
         pet_owner_id, player_state,
         x, y, z, heading, animation,
         equipment, equipment_tint,

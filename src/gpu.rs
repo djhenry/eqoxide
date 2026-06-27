@@ -102,6 +102,10 @@ pub struct GpuStaticModel {
     pub prefix: String,
     /// Per-mesh equipment slot binding, parallel to `meshes`. `None` = not an armor slot.
     pub equip_slots: Vec<Option<crate::models::EquipSlot>>,
+    /// Per-mesh head-appearance tag, parallel to `meshes`. `None` = body/eyes (always visible).
+    pub head_parts: Vec<Option<crate::models::HeadPart>>,
+    /// Per-mesh default-hidden flag from the converter's `eq_default_hidden` extras field.
+    pub head_default_hidden: Vec<bool>,
     /// True model height in EQ units. From `eq_height` glTF extras if present; otherwise
     /// the measured `y_extent`. Use this for scale calculations (Task 4).
     pub true_height: f32,
@@ -134,6 +138,10 @@ pub struct GpuSkinnedModel {
     pub prefix: String,
     /// Per-mesh equipment slot binding, parallel to `meshes`. `None` = not an armor slot.
     pub equip_slots: Vec<Option<crate::models::EquipSlot>>,
+    /// Per-mesh head-appearance tag, parallel to `meshes`. `None` = body/eyes (always visible).
+    pub head_parts: Vec<Option<crate::models::HeadPart>>,
+    /// Per-mesh default-hidden flag from the converter's `eq_default_hidden` extras field.
+    pub head_default_hidden: Vec<bool>,
     /// True model height in EQ units. From `eq_height` glTF extras if present; otherwise
     /// the measured `y_extent`. Use this for scale calculations (Task 4).
     pub true_height: f32,
