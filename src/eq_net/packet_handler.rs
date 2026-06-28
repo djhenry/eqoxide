@@ -721,18 +721,27 @@ fn apply_set_chat_server(gs: &mut GameState, payload: &[u8]) {
     }
 }
 
+/// Read a NUL-terminated string from the front of `buf`, returning the string (without the
+/// terminator) and the slice following it. Returns `None` if there is no NUL byte.
+fn read_cstr(buf: &[u8]) -> Option<(String, &[u8])> {
+    let nul = buf.iter().position(|&b| b == 0)?;
+    let s = String::from_utf8_lossy(&buf[..nul]).to_string();
+    Some((s, &buf[nul + 1..]))
+}
+
 fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
-    // ChannelMessage_Struct: targetname[64] + sender[64] + language(u32) +
-    // chan_num(u32) + cm_unknown4[u32×2] + skill_in_language(u32) + message[var]
-    // message starts at byte 148, not 140.
-    if payload.len() < 149 { return; }
-    let targetname = String::from_utf8_lossy(&payload[0..64])
-        .trim_end_matches('\0').to_string();
-    let sender = String::from_utf8_lossy(&payload[64..128])
-        .trim_end_matches('\0').to_string();
-    let chan_num = u32::from_le_bytes([payload[132], payload[133], payload[134], payload[135]]);
-    let msg = String::from_utf8_lossy(&payload[148..])
-        .trim_end_matches('\0')
+    // RoF2 OP_ChannelMessage is a variable-length, NUL-terminated wire format — NOT the
+    // fixed Titanium struct. See EQEmu common/patches/rof2.cpp ENCODE(OP_ChannelMessage):
+    //   sender\0 | target\0 | u32 unknown | u32 language | u32 chan_num
+    //   | u32 unknown | u8 unknown | u32 skill_in_language | message\0 | (trailing unknowns)
+    let (sender, rest) = match read_cstr(payload) { Some(v) => v, None => return };
+    let (targetname, rest) = match read_cstr(rest) { Some(v) => v, None => return };
+    // After the two strings: 4 (unk) + 4 (lang) + 4 (chan) + 4 (unk) + 1 (unk) + 4 (skill) = 21
+    // bytes, then the NUL-terminated message.
+    if rest.len() < 21 { return; }
+    let chan_num = u32::from_le_bytes([rest[8], rest[9], rest[10], rest[11]]);
+    let msg = String::from_utf8_lossy(&rest[21..])
+        .split('\0').next().unwrap_or("")
         .to_string();
     if msg.is_empty() { return; }
 
@@ -1219,19 +1228,25 @@ mod tests {
 
     // --- apply_channel_message helpers and tests ---
 
-    fn make_chan_payload(sender: &str, chan_num: u32, msg: &str) -> Vec<u8> {
-        let mut buf = vec![0u8; 148 + msg.len() + 1];
-        // targetname at 0..64 (leave zeroed)
-        // sender at 64..128
-        let sb = sender.as_bytes();
-        let sl = sb.len().min(63);
-        buf[64..64 + sl].copy_from_slice(&sb[..sl]);
-        // chan_num at 132..136
-        buf[132..136].copy_from_slice(&chan_num.to_le_bytes());
-        // message at 148
-        let mb = msg.as_bytes();
-        buf[148..148 + mb.len()].copy_from_slice(mb);
+    // Build a RoF2 OP_ChannelMessage wire packet (server->client), matching
+    // rof2.cpp ENCODE(OP_ChannelMessage): sender\0 target\0 u32 unk | u32 lang |
+    // u32 chan | u32 unk | u8 unk | u32 skill | message\0.
+    fn make_chan_payload_to(sender: &str, target: &str, chan_num: u32, msg: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(sender.as_bytes()); buf.push(0);
+        buf.extend_from_slice(target.as_bytes()); buf.push(0);
+        buf.extend_from_slice(&0u32.to_le_bytes());      // unknown
+        buf.extend_from_slice(&0u32.to_le_bytes());      // language
+        buf.extend_from_slice(&chan_num.to_le_bytes());  // chan_num
+        buf.extend_from_slice(&0u32.to_le_bytes());      // unknown
+        buf.push(0);                                     // unknown u8
+        buf.extend_from_slice(&0u32.to_le_bytes());      // skill_in_language
+        buf.extend_from_slice(msg.as_bytes()); buf.push(0);
         buf
+    }
+
+    fn make_chan_payload(sender: &str, chan_num: u32, msg: &str) -> Vec<u8> {
+        make_chan_payload_to(sender, "", chan_num, msg)
     }
 
     #[test]
@@ -1264,11 +1279,7 @@ mod tests {
     }
 
     fn make_tell(sender: &str, target: &str, msg: &str) -> Vec<u8> {
-        let mut buf = make_chan_payload(sender, 7, msg); // chan 7 = tell
-        let t = target.as_bytes();
-        let tl = t.len().min(63);
-        buf[..tl].copy_from_slice(&t[..tl]);
-        buf
+        make_chan_payload_to(sender, target, 7, msg) // chan 7 = tell
     }
 
     #[test]

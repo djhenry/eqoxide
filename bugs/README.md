@@ -19,4 +19,4 @@ expected vs. actual, observations/diagnosis, suspected root cause, and status.
 | [Player currency decodes to garbage values (RoF2)](inventory-currency-garbage-values-rof2.md) | Medium | Open |
 | [Auto-combat ignores adds — player dies unanswered](auto-combat-ignores-adds-player-dies.md) | High | Open |
 | [No death/respawn handling — stuck as corpse](no-death-respawn-handling-stuck-corpse.md) | High | Open |
-| [Cross-zone tells/OOC need the UCS chat server](cross-zone-chat-needs-ucs.md) | Medium | In progress |
+| [Cross-zone tells/OOC dropped — RoF2 OP_ChannelMessage wire format](cross-zone-chat-needs-ucs.md) | Medium | Fixed |
