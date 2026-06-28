@@ -144,33 +144,34 @@ pub fn build_click_door(door_id: u8, player_id: u32) -> Vec<u8> {
     buf
 }
 
-/// Build a Titanium `ChannelMessage_Struct` for the Say channel (used for NPC hails).
-///
-/// Layout (see EQEmu common/patches/titanium_structs.h):
-///   targetname[64] | sender[64] | language(u32) | chan_num(u32)
-///   | cm_unknown4[2](u32×2) | skill_in_language(u32) | message[var]\0
+/// Build a RoF2 `OP_ChannelMessage` for the Say channel (used for NPC hails).
 /// chan_num 8 = ChatChannel_Say; the server delivers say text to NPCs within 200
 /// units, triggering EVENT_SAY (a "Hail, <name>" message fires the NPC's hail script).
 pub fn build_say_packet(sender: &str, target: &str, message: &str) -> Vec<u8> {
     build_channel_message(sender, target, 8, message) // chan_num 8 = ChatChannel_Say
 }
 
-/// Build a `ChannelMessage_Struct` for an arbitrary chat channel. `target` is the recipient
+/// Build an `OP_ChannelMessage` for an arbitrary chat channel. `target` is the recipient
 /// for directed channels (tell), empty for broadcasts (ooc/shout/group). EQEmu ChatChannel:
 /// 2 group, 3 shout, 5 OOC, 7 tell, 8 say.
+///
+/// RoF2 uses a **variable-length, NUL-terminated** wire format — NOT the fixed Titanium
+/// `ChannelMessage_Struct`. See EQEmu `common/patches/rof2.cpp` `DECODE(OP_ChannelMessage)`:
+///   sender\0 | target\0 | u32 unknown | u32 language | u32 chan_num
+///   | u32 unknown | u8 unknown | u32 skill_in_language | message\0
+/// Sending the fixed 64-byte-field struct makes the server read an empty target + garbage
+/// chan_num, so tells/OOC are silently dropped (no cross-zone routing).
 pub fn build_channel_message(sender: &str, target: &str, chan_num: u32, message: &str) -> Vec<u8> {
-    let mut buf = vec![0u8; 148 + message.len() + 1];
-    let t = target.as_bytes();
-    let tl = t.len().min(63);
-    buf[..tl].copy_from_slice(&t[..tl]);
-    let s = sender.as_bytes();
-    let sl = s.len().min(63);
-    buf[64..64 + sl].copy_from_slice(&s[..sl]);
-    // language @128 = 0 (CommonTongue), already zero.
-    buf[132..136].copy_from_slice(&chan_num.to_le_bytes());
-    buf[144..148].copy_from_slice(&100u32.to_le_bytes()); // skill_in_language
-    let m = message.as_bytes();
-    buf[148..148 + m.len()].copy_from_slice(m);
+    let mut buf = Vec::with_capacity(sender.len() + target.len() + message.len() + 24);
+    buf.extend_from_slice(sender.as_bytes()); buf.push(0);
+    buf.extend_from_slice(target.as_bytes()); buf.push(0);
+    buf.extend_from_slice(&0u32.to_le_bytes());      // unknown
+    buf.extend_from_slice(&0u32.to_le_bytes());      // language = CommonTongue
+    buf.extend_from_slice(&chan_num.to_le_bytes());  // chan_num
+    buf.extend_from_slice(&0u32.to_le_bytes());      // unknown
+    buf.push(0);                                     // unknown (u8)
+    buf.extend_from_slice(&100u32.to_le_bytes());    // skill_in_language
+    buf.extend_from_slice(message.as_bytes()); buf.push(0);
     buf
 }
 
@@ -1209,19 +1210,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_say_packet_matches_titanium_layout() {
+    fn build_say_packet_matches_rof2_layout() {
+        // RoF2 wire: sender\0 target\0 u32 unk | u32 lang | u32 chan | u32 unk | u8 unk |
+        //            u32 skill | message\0   (see rof2.cpp DECODE(OP_ChannelMessage))
         let p = build_say_packet("Aiquestbot", "Guard Phaeton", "Hail, Guard Phaeton");
-        // sender at offset 64
-        assert_eq!(&p[64..74], b"Aiquestbot");
-        // targetname at offset 0
-        assert_eq!(&p[0..13], b"Guard Phaeton");
-        // chan_num (u32 @132) == 8 (ChatChannel_Say)
-        assert_eq!(u32::from_le_bytes([p[132], p[133], p[134], p[135]]), 8);
-        // language (u32 @128) == 0 (CommonTongue)
-        assert_eq!(u32::from_le_bytes([p[128], p[129], p[130], p[131]]), 0);
-        // message begins at offset 148, null-terminated
-        let msg_end = 148 + "Hail, Guard Phaeton".len();
-        assert_eq!(&p[148..msg_end], b"Hail, Guard Phaeton");
+        let mut o = 0;
+        assert_eq!(&p[o..o + 10], b"Aiquestbot"); o += 10;
+        assert_eq!(p[o], 0, "sender NUL-terminated"); o += 1;
+        assert_eq!(&p[o..o + 13], b"Guard Phaeton"); o += 13;
+        assert_eq!(p[o], 0, "target NUL-terminated"); o += 1;
+        assert_eq!(u32::from_le_bytes([p[o], p[o+1], p[o+2], p[o+3]]), 0, "unknown"); o += 4;
+        assert_eq!(u32::from_le_bytes([p[o], p[o+1], p[o+2], p[o+3]]), 0, "language=CommonTongue"); o += 4;
+        assert_eq!(u32::from_le_bytes([p[o], p[o+1], p[o+2], p[o+3]]), 8, "chan_num=Say"); o += 4;
+        o += 4;            // unknown u32
+        o += 1;            // unknown u8
+        o += 4;            // skill_in_language
+        let msg_end = o + "Hail, Guard Phaeton".len();
+        assert_eq!(&p[o..msg_end], b"Hail, Guard Phaeton");
         assert_eq!(p[msg_end], 0, "message must be null-terminated");
         assert_eq!(p.len(), msg_end + 1);
     }
@@ -1269,12 +1274,12 @@ mod tests {
     }
 
     #[test]
-    fn build_say_packet_truncates_overlong_names() {
-        let long = "X".repeat(200);
-        let p = build_say_packet(&long, &long, "hi");
-        // sender/target fields are 64 bytes; name capped at 63 + null padding.
-        assert_eq!(p[63], 0, "targetname must stay null-terminated within 64 bytes");
-        assert_eq!(p[127], 0, "sender must stay null-terminated within 64 bytes");
+    fn build_say_packet_names_are_nul_terminated() {
+        // RoF2 names are variable-length cstrings (no fixed 64-byte field). Verify both the
+        // sender and target are emitted whole and each terminated by a single NUL.
+        let p = build_say_packet("Aiquestbot", "Guard Phaeton", "hi");
+        assert_eq!(p[10], 0, "sender NUL-terminated after 'Aiquestbot'");
+        assert_eq!(p[11 + 13], 0, "target NUL-terminated after 'Guard Phaeton'");
     }
 
     #[test]
