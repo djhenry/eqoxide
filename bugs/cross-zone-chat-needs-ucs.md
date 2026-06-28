@@ -1,51 +1,67 @@
-# Cross-zone tells / OOC not delivered — RoF2 routes them through the UCS chat server
+# Cross-zone tells / OOC not delivered — RoF2 OP_ChannelMessage wire format was wrong (RESOLVED)
 
-**Summary:** The new chat commands send `OP_ChannelMessage` to the zone server, which works for
-same-zone, zone-routed chat (say, and same-zone tells). But **cross-zone** tells (and OOC/auction)
-under RoF2 are routed through the separate **Universal Chat Service (UCS)** server, which the
-eqoxide client does not connect to — so an agent in zone A whispering an agent in zone B is never
-delivered.
+**Summary:** Cross-zone (and in fact *all*) chat sent via `OP_ChannelMessage` was silently dropped
+by the server because the client encoded the **Titanium fixed-layout `ChannelMessage_Struct`**
+(`targetname[64] | sender[64] | …`), but RoF2 uses a completely different **variable-length,
+NUL-terminated** wire format. The server's RoF2 `DECODE(OP_ChannelMessage)` read our 64-byte padded
+fields as garbage → empty target + wrong `chan_num` → the tell/OOC was never routed.
 
-**Severity:** Medium (blocks the cross-zone GM-helps-player use case; same-zone chat works).
+> **Note:** the original diagnosis below (cross-zone chat needs the UCS server) was **wrong**.
+> Cross-zone **tells** and server-wide **OOC/auction** route through the **world server**, not UCS.
+> UCS is only for named/numbered chat channels (`/join`), mail, and the buddy list. See the
+> "Actual root cause" section.
 
-## Steps to reproduce
+**Severity:** Medium (blocked the cross-zone GM-helps-player use case). **Status: FIXED.**
+
+## Steps to reproduce (pre-fix)
 1. Launch two clients as different characters in **different zones** (e.g. Claude in `arena`,
    Durgan in `kaladimb`), each with its own `--api-port`.
 2. `POST /tell {"to":"Claude","text":"..."}` on Durgan's client.
-3. `GET /events` on Claude's client.
+3. `GET /events` / `GET /messages` on Claude's client → nothing arrives.
 
-## Expected
-Claude's `/events` shows a `directed` tell from Durgan.
+## Actual root cause (2026-06-28)
+RoF2's `OP_ChannelMessage` is **not** the Titanium `ChannelMessage_Struct`. Per EQEmu
+`common/patches/rof2.cpp` `ENCODE`/`DECODE(OP_ChannelMessage)`, the wire format (both directions) is:
 
-## Actual
-Nothing arrives. Each client only sees its **own** outgoing tell (the local echo
-`"You tell X: ..."`). The recipient's `/messages` and `/events` never show the incoming tell.
+```
+sender\0 | target\0 | u32 unknown | u32 language | u32 chan_num
+         | u32 unknown | u8 unknown | u32 skill_in_language | message\0
+```
 
-## Diagnosis notes (2026-06-27)
-- The outgoing packet format is correct: the `ChannelMessage_Struct` is **byte-identical** between
-  Titanium and RoF2 (`targetname[64]` @0, `sender[64]` @64, `chan_num` @132, `message` @148 — see
-  `EQEmu/common/patches/{titanium,rof2}_structs.h`), and `/say` (chan 8) works (NPCs respond), so
-  the server reads our `chan_num` + message fine.
-- Incoming `OP_ChannelMessage` parsing works: live NPC `say` dialogue shows in `/messages`, and the
-  tell classification is unit-tested in `apply_channel_message`.
-- The server is running a **UCS** server (`/opt/eqemu/data/logs/ucs.log`). In RoF2, cross-zone
-  tells, OOC, and auction route through UCS (a distinct TCP connection + `OP_Mail`-family opcodes),
-  not the zone's `OP_ChannelMessage`. The client never connects to UCS, so those messages are
-  dropped on the routing side.
+(note: **sender first**, then target — the opposite order of the Titanium struct, and all
+variable-length cstrings rather than fixed 64-byte fields).
 
-## Suspected root cause
-The client doesn't establish the UCS (mail/chat) connection that RoF2 uses for cross-zone chat.
-Same-zone messages are delivered by the zone server directly, so they work; cross-zone needs UCS.
+The client was sending the Titanium struct, so the server's DECODE parsed `sender="Claude"` (our
+targetname field), `target=""` (the NUL padding), and a garbage `chan_num` from the middle of the
+sender padding. With an empty target and wrong channel, `Client::ChannelMessageReceived`
+(zone/client.cpp) never relayed the tell. The **incoming** parser (`apply_channel_message`) had the
+same fixed-struct assumption, so even server→client chat would have been misparsed.
 
-## What already works (this worktree's feature)
-- `POST /tell|/ooc|/shout|/group` (verified: packets sent, local echo confirms).
-- `GET /events` structured feed + long-poll + `directed` flag (the "for me" awareness API).
-- Incoming tell/ooc/shout/group/gmsay classification → events (unit-tested).
+### How the cross-zone routing actually works (no UCS involved)
+- **Tell** (chan 7) → `worldserver.SendChannelMessage(…, ChatChannel_Tell, …)` → world
+  `ClientList::FindCharacter(deliverto)` → delivers a normal `OP_ChannelMessage` to the recipient's
+  zone (`world/zoneserver.cpp` `ServerOP_ChannelMessage`).
+- **OOC / Auction** (chan 5 / 4) → if `ServerWideOOC` / `ServerWideAuction` rule is on →
+  `worldserver.SendChannelMessage` (world broadcast); otherwise local-zone only.
+- **Shout** (chan 3) → local zone only (`entity_list.ChannelMessage`); cross-zone shout doesn't exist.
+- **UCS** only handles `OP_MailLogin` + `OP_Mail` (named channels via `/join`, mail, buddy list).
 
-## Fix sketch (follow-on)
-Connect to the UCS server during login (world handshake gives the UCS host/port), authenticate, and
-send/receive tells + OOC over it (`OP_Mail` / chat opcodes). Then route `/tell`/`/ooc` through UCS
-when the target isn't in our zone, and ingest UCS chat into the same `chat_events` feed.
+## The fix
+`src/eq_net/navigation.rs::build_channel_message` and
+`src/eq_net/packet_handler.rs::apply_channel_message` now emit/parse the RoF2 variable-length
+format (with a `read_cstr` helper). Unit tests updated to the RoF2 layout.
 
-## Status
-Open — discovered while building the agent-chat feature (`worktree-agent-chat`).
+## Verified live (2026-06-28)
+Two clients, Claude in `arena` + Durgan in `kaladimb`:
+- Durgan → Claude tell → Claude `/events`: `{"channel":"tell","directed":true,"from":"Durgan",…}` ✓
+- Claude → Durgan tell → Durgan `/events`: `{"channel":"tell","directed":true,"from":"Claude",…}` ✓
+- Claude OOC → Durgan `/events`: `{"channel":"ooc","directed":false,"from":"Claude",…}` ✓ (cross-zone)
+
+## Follow-ons (separate, lower priority)
+- **UCS link** (the `worktree-ucs-chat-link` step 1 `OP_SetChatServer` parse): still valid, but only
+  buys **named/numbered chat channels + mail + buddy list**, not tells/OOC. Build only if those are
+  wanted. Note the UCS port advertised by this server (`7778`) is outside the eqemu container's
+  mapped UDP range (`7000-7400`) — would need a port-map change to connect.
+- **Cosmetic:** the server's RoF2 `DECODE` does `emu->sender = Target`, and the server also sends a
+  `TellEcho` of our own outgoing tell, so a sender currently sees both the local "You tell X: …"
+  echo and a server `<Self> …` line. Harmless duplicate; de-dupe later if it's noisy.
