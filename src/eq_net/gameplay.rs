@@ -145,7 +145,7 @@ pub async fn run_gameplay_phase(
                         gs.player_z = z;
                         tracing::info!("EQ: same-zone teleport → pos=({:.1},{:.1},{:.1})", x, y, z);
                         // Send position update so the server knows where we are.
-                        let _ = app_tx.send(make_position_packet(gs.player_id, x, y, z));
+                        let _ = app_tx.send(make_position_packet(gs.player_id, x, y, z, gs.player_heading));
                     } else {
                         // Cross-zone transition (#zone <name>): send OP_ZONE_CHANGE to
                         // trigger the full zone-change protocol (world reconnect, etc.).

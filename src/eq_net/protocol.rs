@@ -803,7 +803,7 @@ mod tests {
     #[test]
     fn position_update_round_trips() {
         // RoF2 PlayerPositionUpdateServer_Struct: 24 bytes.
-        let pkt = encode_position_update(0x1234, 125.5, -340.25, 12.0);
+        let pkt = encode_position_update(0x1234, 125.5, -340.25, 12.0, 270.0);
         assert_eq!(pkt.len(), SIZE_SPAWN_POSITION_UPDATE, "RoF2 position update must be 24 bytes");
         let d = decode_position_update(&pkt).expect("decode");
         assert_eq!(d.spawn_id, 0x1234);
@@ -811,12 +811,14 @@ mod tests {
         assert!((d.x - 125.5).abs() < 0.125, "x={}", d.x);
         assert!((d.y - (-340.25)).abs() < 0.125, "y={}", d.y);
         assert!((d.z - 12.0).abs() < 0.125, "z={}", d.z);
+        // Heading (EQ-CCW degrees) round-trips within the 512-step wire quantization (~0.7°).
+        assert!((d.heading - 270.0).abs() < 1.0, "heading={}", d.heading);
     }
 
     #[test]
     fn position_update_decodes_negative_coords() {
         // Negative coordinates must sign-extend out of the 19-bit field.
-        let d = decode_position_update(&encode_position_update(1, -500.0, -1.0, -7.5)).unwrap();
+        let d = decode_position_update(&encode_position_update(1, -500.0, -1.0, -7.5, 0.0)).unwrap();
         assert!((d.x - (-500.0)).abs() < 0.125);
         assert!((d.y - (-1.0)).abs() < 0.125);
         assert!((d.z - (-7.5)).abs() < 0.125);
@@ -1084,18 +1086,24 @@ pub fn decode_position_update(p: &[u8]) -> Option<PositionUpdate> {
     Some(PositionUpdate { spawn_id, x, y, z, heading, animation })
 }
 
-/// Encode a minimal position update (deltas/animation/heading zero) in the RoF2
+/// Encode a minimal position update (deltas/animation zero) in the RoF2
 /// PlayerPositionUpdateServer_Struct wire format (24 bytes), for the nav thread's
-/// synthetic render-follow packet.  Round-trips with `decode_position_update`.
-pub fn encode_position_update(spawn_id: u16, x: f32, y: f32, z: f32) -> Vec<u8> {
+/// synthetic render-follow packet.  `heading` is EQ-CCW degrees (the same convention
+/// as `gs.player_heading`); it is packed so `decode_position_update` recovers it,
+/// letting the render loop face the player along the nav step direction.
+/// Round-trips with `decode_position_update`.
+pub fn encode_position_update(spawn_id: u16, x: f32, y: f32, z: f32, heading: f32) -> Vec<u8> {
     let xp = ((x * 8.0) as i32 as u32) & 0x7FFFF;
     let yp = ((y * 8.0) as i32 as u32) & 0x7FFFF;
     let zp = ((z * 8.0) as i32 as u32) & 0x7FFFF;
+    // Heading is sent CW on the wire as a 9-bit-scale value (0..512 = 0..360°), mirroring
+    // the `* 360/512` in decode_position_update.
+    let hp = ((ccw_to_cw(heading) * (512.0 / 360.0)).round() as i32 as u32) & 0xFFF;
     // word0: angle(12)=0, y(19), pad(1)=0  → y at bits 12-30
     let w0 = yp << 12;
     // word1: deltas = 0
-    // word2: x(19), heading(12)=0, pad(1)=0 → x at bits 0-18
-    let w2 = xp;
+    // word2: x(19), heading(12), pad(1)=0 → x at bits 0-18, heading at bits 19-30
+    let w2 = xp | (hp << 19);
     // word3: deltaHeading(10)=0, z(19), pad(3)=0 → z at bits 10-28
     let w3 = zp << 10;
     let mut buf = Vec::with_capacity(SIZE_SPAWN_POSITION_UPDATE);
