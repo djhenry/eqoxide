@@ -876,7 +876,7 @@ impl Navigator {
                                 let ny = gs.player_y + mdy;
                                 self.send_position_update(stream, gs, nx, ny, nz, hdg);
                                 gs.player_x = nx; gs.player_y = ny; gs.player_heading = hdg;
-                                let _ = app_tx.send(make_position_packet(gs.player_id, nx, ny, nz));
+                                let _ = app_tx.send(make_position_packet(gs.player_id, nx, ny, nz, hdg));
                             }
                         } else {
                             // In melee range: hold and face the target.
@@ -898,7 +898,7 @@ impl Navigator {
             let next_z = (gs.player_z - FALL_STEP).max(land_z);
             let hdg = gs.player_heading;
             self.send_position_update(stream, gs, gs.player_x, gs.player_y, next_z, hdg);
-            let _ = app_tx.send(make_position_packet(gs.player_id, gs.player_x, gs.player_y, next_z));
+            let _ = app_tx.send(make_position_packet(gs.player_id, gs.player_x, gs.player_y, next_z, hdg));
             gs.player_z = next_z;
             if next_z <= land_z + 0.5 {
                 let height = (self.fall_start_z - land_z).max(0.0);
@@ -1052,8 +1052,10 @@ impl Navigator {
         gs.player_z       = nz;
         gs.player_heading = heading;
 
-        // Synthetic server-side position packet so the render camera follows.
-        let _ = app_tx.send(make_position_packet(gs.player_id, nx, ny, nz));
+        // Synthetic server-side position packet so the render camera follows — carries the
+        // step heading so the render loop faces the player along the path (Block B in app.rs
+        // reads gs.player_heading, which this packet keeps live).
+        let _ = app_tx.send(make_position_packet(gs.player_id, nx, ny, nz, heading));
     }
 
     /// Advance the quest turn-in (POST /give) trade-window flow. The full sequence is:
@@ -1197,10 +1199,13 @@ impl Navigator {
 /// Build a synthetic OP_CLIENT_UPDATE packet so the render loop can update
 /// `scene.player_pos` and keep the camera attached during navigation. Uses the real
 /// Titanium bit-packed wire format so it decodes the same way as server updates.
-pub fn make_position_packet(spawn_id: u32, x: f32, y: f32, z: f32) -> AppPacket {
+/// `heading` (EQ-CCW degrees) carries the nav step direction so the render loop faces
+/// the player along the path — server position updates for the player carry no usable
+/// heading, so this synthetic packet is the only channel that delivers it.
+pub fn make_position_packet(spawn_id: u32, x: f32, y: f32, z: f32, heading: f32) -> AppPacket {
     AppPacket {
         opcode: OP_CLIENT_UPDATE,
-        payload: encode_position_update(spawn_id as u16, x, y, z),
+        payload: encode_position_update(spawn_id as u16, x, y, z, heading),
     }
 }
 

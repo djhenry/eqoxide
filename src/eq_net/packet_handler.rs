@@ -376,6 +376,10 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         gs.player_x = upd.x;
         gs.player_y = upd.y;
         gs.player_z = upd.z;
+        // Keep the player's heading live. The nav thread's synthetic position packets carry the
+        // step direction here (make_position_packet); without this the render loop's Block B
+        // (app.rs) snaps facing back to the stale spawn heading during /goto.
+        gs.player_heading = upd.heading;
     } else if let Some(e) = gs.entities.get_mut(&sid) {
         e.x = upd.x;
         e.y = upd.y;
@@ -1356,7 +1360,7 @@ mod tests {
     #[test]
     fn position_roundtrip_negative_z() {
         use crate::eq_net::protocol::{decode_position_update, encode_position_update};
-        let pkt = encode_position_update(42, 100.0, 200.0, -15.5);
+        let pkt = encode_position_update(42, 100.0, 200.0, -15.5, 0.0);
         let d = decode_position_update(&pkt).expect("decode negative z");
         assert_eq!(d.spawn_id, 42);
         assert!((d.x - 100.0).abs() < 0.2);
@@ -1367,12 +1371,15 @@ mod tests {
     #[test]
     fn position_roundtrip_heading_near_360() {
         use crate::eq_net::protocol::{decode_position_update, encode_position_update};
-        // EQ heading 511 ≈ 359° — near full circle, should survive encode/decode.
-        let pkt = encode_position_update(7, -250.0, 80.0, 3.0);
+        // A heading near a full circle should survive encode/decode (CCW convention).
+        let pkt = encode_position_update(7, -250.0, 80.0, 3.0, 359.0);
         let d = decode_position_update(&pkt).expect("decode heading near 360");
         assert_eq!(d.spawn_id, 7);
         assert!((d.x - (-250.0)).abs() < 0.2);
         assert!((d.y - 80.0).abs() < 0.2);
+        // 359° wraps to ~0 within wire quantization; accept either end of the circle.
+        let dh = (d.heading - 359.0).rem_euclid(360.0);
+        assert!(dh < 1.0 || dh > 359.0, "heading={}", d.heading);
     }
 
     #[test]

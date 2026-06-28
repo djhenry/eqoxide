@@ -1266,6 +1266,9 @@ impl App {
             // heading directly: it is set from the direction of each movement step and is more
             // reliable than motion-vector derivation (the visual glide introduces a lag that
             // can misalign heading at corners or during the first frame of a new step).
+            // `game_state.player_heading` is kept live by the nav thread's synthetic position
+            // packets (make_position_packet → apply_position_update); without that it would be
+            // the stale spawn heading and this would snap the facing away from travel.
             // Only applies when there is recent movement and no keyboard input.
             if !manual_move && self.last_moved_at.elapsed().as_millis() < 300 {
                 self.heading_target = self.game_state.player_heading;
