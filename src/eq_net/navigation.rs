@@ -228,6 +228,42 @@ pub fn slide_move(
     }
 }
 
+/// Minimum distance (units) the walker must close toward its current aim for a tick to
+/// count as progress. Below this, the tick is "no progress" (sliding sideways, wedged).
+const NAV_PROGRESS_EPS: f32 = 1.0;
+/// Consecutive no-progress nav ticks (~150 ms each) before the walker is declared stuck.
+/// ~3 s — long enough to ride out a brief wall-slide, short enough to recover quickly.
+const NAV_STUCK_TICKS: u32 = 20;
+
+/// What the no-progress detector decided after a nav step.
+#[derive(Debug, PartialEq, Eq)]
+enum StuckAction {
+    /// Still making (or recently made) progress — keep walking the current waypoint.
+    Continue,
+    /// No progress for NAV_STUCK_TICKS — the caller should recover (skip waypoint or stop).
+    Recover,
+}
+
+/// No-progress detector for the path walker. `dist` is the current straight-line distance
+/// to the aim point; `best` is the smallest distance seen since the detector last reset;
+/// `stuck_ticks` is the running count of consecutive no-progress ticks. Closing more than
+/// `NAV_PROGRESS_EPS` resets the counter and records the new best; otherwise the counter
+/// accumulates until it reaches `NAV_STUCK_TICKS`, which yields `Recover` (and resets, so
+/// recovery starts with a fresh window). Returns the action plus the `(best, stuck_ticks)`
+/// the caller should store.
+fn nav_progress(dist: f32, best: f32, stuck_ticks: u32) -> (StuckAction, f32, u32) {
+    if dist + NAV_PROGRESS_EPS < best {
+        (StuckAction::Continue, dist, 0)
+    } else {
+        let n = stuck_ticks + 1;
+        if n >= NAV_STUCK_TICKS {
+            (StuckAction::Recover, f32::MAX, 0)
+        } else {
+            (StuckAction::Continue, best, n)
+        }
+    }
+}
+
 /// EQ heading in degrees (0..360) for a movement delta in server axes.
 /// EQ convention: heading 0 faces +Y (north) and increases counter-clockwise
 /// (90 = -X = west, 180 = -Y = south, 270 = +X = east). A point at heading θ lies
@@ -305,6 +341,14 @@ pub struct Navigator {
     /// rate until reaching it, then applies fall damage); `fall_start_z` is where the fall began.
     falling:          Option<f32>,
     fall_start_z:     f32,
+    /// No-progress detector for the path walker (see `nav_progress`). `stuck_best` is the
+    /// closest distance reached toward the current aim, `stuck_ticks` the consecutive
+    /// no-progress ticks, and `stuck_i` the `path_i` the detector is tracking (so it resets
+    /// when the aim waypoint changes). Without this the walker can wedge into geometry and
+    /// slide in place forever with no stop log (gfaydark/neriakc stalls, #4/#2).
+    stuck_best:       f32,
+    stuck_ticks:      u32,
+    stuck_i:          usize,
 }
 
 impl Navigator {
@@ -385,6 +429,9 @@ impl Navigator {
             last_pet_target: None,
             falling: None,
             fall_start_z: 0.0,
+            stuck_best: f32::MAX,
+            stuck_ticks: 0,
+            stuck_i: 0,
         }
     }
 
@@ -1018,6 +1065,9 @@ impl Navigator {
         if self.path_goal != Some(goal) {
             self.path_goal = Some(goal);
             self.path_i = 0;
+            self.stuck_i = 0;
+            self.stuck_best = f32::MAX;
+            self.stuck_ticks = 0;
             self.path = match self.collision.read().unwrap().as_ref() {
                 Some(c) => c
                     .find_path([gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], 2.0)
@@ -1083,6 +1133,42 @@ impl Navigator {
             let hdg = eq_heading(dx, dy);
             self.send_position_update(stream, gs, gs.player_x, gs.player_y, gs.player_z, hdg);
             return;
+        }
+
+        // No-progress (stuck) detection. The only stops above are arrival and a controlled
+        // fall; below, the sole stop is being fully boxed in (slide_move -> None). But a
+        // sliding step can make ~zero net progress indefinitely — the avatar wedges into
+        // tight platform/corridor geometry and slide_move keeps returning a perpendicular,
+        // non-advancing step. That is a SILENT permanent stall (gfaydark #4, neriakc #2):
+        // none of the three stop logs ever fire. Track progress toward the current aim and,
+        // after NAV_STUCK_TICKS without closing distance, recover: skip to the next waypoint
+        // to route past the snag, or — if this is the last/only waypoint — stop with a log.
+        if self.path_i != self.stuck_i {
+            self.stuck_i = self.path_i;
+            self.stuck_best = f32::MAX;
+            self.stuck_ticks = 0;
+        }
+        match nav_progress(dist, self.stuck_best, self.stuck_ticks) {
+            (StuckAction::Continue, best, ticks) => {
+                self.stuck_best = best;
+                self.stuck_ticks = ticks;
+            }
+            (StuckAction::Recover, best, ticks) => {
+                self.stuck_best = best;
+                self.stuck_ticks = ticks;
+                if self.path_i + 1 < self.path.len() {
+                    tracing::info!("NAV: no progress toward waypoint {} near ({:.1},{:.1}) — skipping to next",
+                        self.path_i, gs.player_x, gs.player_y);
+                    self.path_i += 1;
+                    self.stuck_i = self.path_i;
+                    return;
+                }
+                tracing::info!("NAV: stalled (no progress) near ({:.1},{:.1}) — stopping",
+                    gs.player_x, gs.player_y);
+                gs.log_msg("zone", "Path stalled — stopped");
+                *self.goto_target.lock().unwrap() = None;
+                return;
+            }
         }
 
         // Cap step to the native run speed (and never overshoot past STOP_DIST from the target).
@@ -1375,6 +1461,38 @@ mod tests {
 
         // Moving away from the wall (east -2) is unobstructed → full move.
         assert_eq!(slide_move(&col, 3.0, 5.0, 0.0, -2.0, 2.0, 2.0), Some((-2.0, 2.0)));
+    }
+
+    #[test]
+    fn nav_progress_resets_counter_when_closing_distance() {
+        // Closed from best=20 to dist=10 (>EPS) → progress: counter resets, best updates.
+        assert_eq!(nav_progress(10.0, 20.0, 5), (StuckAction::Continue, 10.0, 0));
+    }
+
+    #[test]
+    fn nav_progress_accumulates_when_not_closing() {
+        // dist not better than best (equal) → no progress: counter increments, best held.
+        assert_eq!(nav_progress(10.0, 10.0, 5), (StuckAction::Continue, 10.0, 6));
+        // dist worse than best (moved away) → still no progress.
+        assert_eq!(nav_progress(12.0, 10.0, 5), (StuckAction::Continue, 10.0, 6));
+    }
+
+    #[test]
+    fn nav_progress_tiny_gain_below_eps_is_not_progress() {
+        // Closed only 0.5u (< EPS=1.0) → not counted as progress; counter still climbs.
+        assert_eq!(nav_progress(9.5, 10.0, 5), (StuckAction::Continue, 10.0, 6));
+    }
+
+    #[test]
+    fn nav_progress_recovers_at_stuck_threshold() {
+        // One tick short of the threshold: still Continue.
+        let (a, _, _) = nav_progress(10.0, 10.0, NAV_STUCK_TICKS as u32 - 2);
+        assert_eq!(a, StuckAction::Continue);
+        // The tick that reaches NAV_STUCK_TICKS no-progress ticks → Recover, counter reset.
+        assert_eq!(
+            nav_progress(10.0, 10.0, NAV_STUCK_TICKS - 1),
+            (StuckAction::Recover, f32::MAX, 0)
+        );
     }
 
     #[test]
