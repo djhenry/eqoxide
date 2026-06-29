@@ -734,9 +734,14 @@ async fn post_target_name(
     };
     let ids = s.entity_ids.lock().unwrap();
     let nl = name.to_lowercase();
-    let found = ids.iter()
-        .find(|(k, _)| clean_entity_name(k).to_lowercase().contains(&nl) || k.to_lowercase().contains(&nl))
+    let exact = ids.iter()
+        .find(|(k, _)| clean_entity_name(k).to_lowercase() == nl)
         .map(|(k, &id)| (k.clone(), id));
+    let found = exact.or_else(|| {
+        ids.iter()
+            .find(|(k, _)| clean_entity_name(k).to_lowercase().contains(&nl) || k.to_lowercase().contains(&nl))
+            .map(|(k, &id)| (k.clone(), id))
+    });
     match found {
         Some((key, id)) => {
             *s.target.lock().unwrap() = Some(id);
