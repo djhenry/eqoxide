@@ -36,4 +36,4 @@ possibly other zones). Re-bake the missing zones into the volume and restart the
 zones are missing beyond poknowledge.)
 
 ## Status
-Open
+Migrated to GitHub issue https://github.com/djhenry/eqoxide_asset_server/issues/1 (in-repo tracker deprecated).
