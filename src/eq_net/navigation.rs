@@ -36,6 +36,36 @@ pub fn build_target_packet(spawn_id: u32) -> Vec<u8> {
     spawn_id.to_le_bytes().to_vec()
 }
 
+/// Auto-combat target priority. Prefers the mob currently attacking the player (an add that aggros
+/// mid-fight) so the player fights back instead of being beaten unanswered — but keeps the current
+/// target when it is itself one of the attackers, so two adds don't cause target thrash. Falls back
+/// to a still-valid current target, then the nearest reachable trash mob.
+///
+/// - `current_valid`: the current target is alive and reachable.
+/// - `current_is_attacker`: the current target has swung at the player recently.
+/// - `attacker`: a recent attacker that is alive + reachable (the add to engage), if any.
+pub fn pick_combat_target(
+    current: Option<u32>,
+    current_valid: bool,
+    current_is_attacker: bool,
+    attacker: Option<u32>,
+    nearest_trash: Option<u32>,
+) -> Option<u32> {
+    // Already fighting one of our attackers — stay on it (don't thrash to a second add).
+    if current_valid && current_is_attacker {
+        return current;
+    }
+    // An add is hitting us and isn't our current target — engage it.
+    if let Some(a) = attacker {
+        return Some(a);
+    }
+    // Nobody attacking us; finish the current target if it's still good, else pick fresh trash.
+    if current_valid {
+        return current;
+    }
+    nearest_trash
+}
+
 /// OP_Consider payload: Consider_Struct (28 bytes). The client fills playerid+targetid;
 /// the server replies with the same opcode carrying faction (con standing) + level
 /// (con color). Size must be exactly 28 or EQEmu rejects it.
@@ -785,27 +815,43 @@ impl Navigator {
         // cadence so the per-tick ack timeout count matches the documented ~3s window.
         self.tick_give(stream, gs);
 
-        // Auto-retarget: while auto-attacking, if the current target is gone or dead, pick the
-        // nearest trash mob (name starts "a_"/"an_", which excludes named guards/merchants/
-        // citizens) within ~200u, so grinding continues hands-free between kills.
+        // Auto-target: while auto-attacking, pick who to fight each tick. Priority (see
+        // `pick_combat_target`): a mob that is actively attacking the player (engage adds instead of
+        // tanking them unanswered) > a still-valid current target > the nearest reachable trash mob
+        // (name starts "a_"/"an_", excluding named guards/merchants/citizens) within ~200u, so
+        // grinding continues hands-free between kills.
         if self.auto_attack {
+            // Drop attackers that haven't swung at us in a while so a long-dead aggressor or one
+            // we've out-run doesn't keep pulling target priority.
+            const ATTACKER_TTL: std::time::Duration = std::time::Duration::from_secs(6);
+            gs.recent_attackers.retain(|_, t| t.elapsed() < ATTACKER_TTL);
+
             let col = self.collision.read().unwrap();
             let clear_to = |e: &crate::game_state::Entity| -> bool {
                 col.as_ref().map_or(true, |c| {
                     c.path_clear([gs.player_x, gs.player_y, e.z + 3.0], [e.x, e.y, e.z + 3.0], 2.0)
                 })
             };
+            let alive_reachable = |id: u32| -> bool {
+                gs.entities.get(&id).map(|e| !e.dead && e.is_npc && clear_to(e)).unwrap_or(false)
+            };
+
+            let current = gs.target_id;
             // The current target is valid only if alive AND still reachable in a straight line —
             // otherwise drop it so we retarget or roam (don't get stuck swinging "too far").
-            let valid = gs.target_id
-                .and_then(|id| gs.entities.get(&id))
-                .map(|e| !e.dead && clear_to(e))
-                .unwrap_or(false);
-            if !valid {
-                // Engage the nearest reachable (clear-path) land mob within 200u. If none are
-                // reachable we simply idle and wait for a respawn rather than roam — qcat is a maze
-                // of sealed pockets, so roaming toward an out-of-pocket mob just strands her.
-                let mut best_clear: Option<(f32, u32)> = None;
+            let current_valid = current.map(|id| alive_reachable(id)).unwrap_or(false);
+            let current_is_attacker = current.map(|id| gs.recent_attackers.contains_key(&id)).unwrap_or(false);
+
+            // The add to engage: the most-recent attacker that is alive + reachable and isn't already
+            // our current target. (If the current target is the attacker, `pick_combat_target` keeps it.)
+            let attacker = gs.recent_attackers.iter()
+                .filter(|(id, _)| Some(**id) != current && alive_reachable(**id))
+                .max_by_key(|(_, t)| **t)
+                .map(|(id, _)| *id);
+
+            // Nearest reachable trash, only needed as the fallback (no attacker, no valid current).
+            let nearest_trash = if attacker.is_none() && !current_valid {
+                let mut best: Option<(f32, u32)> = None;
                 for (id, e) in &gs.entities {
                     if e.dead || !e.is_npc { continue; }
                     let nl = e.name.to_ascii_lowercase();
@@ -814,10 +860,18 @@ impl Navigator {
                     let dy = e.y - gs.player_y;
                     let d2 = dx * dx + dy * dy;
                     if d2 > 200.0 * 200.0 || !clear_to(e) { continue; }
-                    if best_clear.map(|(bd, _)| d2 < bd).unwrap_or(true) { best_clear = Some((d2, *id)); }
+                    if best.map(|(bd, _)| d2 < bd).unwrap_or(true) { best = Some((d2, *id)); }
                 }
-                drop(col);
-                if let Some((_, id)) = best_clear {
+                best.map(|(_, id)| id)
+            } else { None };
+            drop(col);
+
+            let desired = pick_combat_target(current, current_valid, current_is_attacker, attacker, nearest_trash);
+            // Only send a target packet when the choice actually changes (avoid per-tick spam). If
+            // `desired` is None we keep the current target and idle, matching the old behaviour of
+            // waiting for a respawn rather than roaming out of a sealed pocket.
+            if let Some(id) = desired {
+                if Some(id) != current {
                     gs.target_id = Some(id);
                     if let Some(e) = gs.entities.get(&id) { gs.target_name = Some(e.name.clone()); }
                     stream.send_app_packet(OP_TARGET_MOUSE, &build_target_packet(id));
@@ -1234,6 +1288,43 @@ pub fn make_position_packet(spawn_id: u32, x: f32, y: f32, z: f32, heading: f32)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_combat_engages_add_attacking_player() {
+        // Fighting rat #10 (valid, but NOT hitting us); rat #20 aggros and hits us → switch to #20.
+        assert_eq!(
+            pick_combat_target(Some(10), true, false, Some(20), Some(99)),
+            Some(20),
+        );
+    }
+
+    #[test]
+    fn auto_combat_keeps_current_when_it_is_the_attacker() {
+        // Current target is one of the mobs hitting us → stay on it; don't thrash to a second add.
+        assert_eq!(
+            pick_combat_target(Some(10), true, true, Some(20), Some(99)),
+            Some(10),
+        );
+    }
+
+    #[test]
+    fn auto_combat_retargets_attacker_when_current_dead() {
+        // Current target died; an add is on us → engage the add, not the nearest trash.
+        assert_eq!(
+            pick_combat_target(Some(10), false, false, Some(20), Some(99)),
+            Some(20),
+        );
+    }
+
+    #[test]
+    fn auto_combat_falls_back_to_nearest_trash() {
+        // No attacker, current invalid → nearest trash (existing grind behavior).
+        assert_eq!(pick_combat_target(Some(10), false, false, None, Some(99)), Some(99));
+        // No attacker, current still valid, nobody hitting us → finish current.
+        assert_eq!(pick_combat_target(Some(10), true, false, None, Some(99)), Some(10));
+        // Nothing to do.
+        assert_eq!(pick_combat_target(None, false, false, None, None), None);
+    }
 
     #[test]
     fn build_say_packet_matches_rof2_layout() {
