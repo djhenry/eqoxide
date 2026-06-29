@@ -184,7 +184,11 @@ pub type CastReq = Arc<Mutex<Option<CastRequest>>>;
 /// Scribe/memorize request — (slot, spell_id, scribing): scribing 0 = scribe a scroll into the
 /// spellbook at book `slot`; 1 = memorize a known spell into gem `slot` (0-8). Set by POST
 /// /v1/combat/scribe and POST /v1/combat/memorize; the nav thread sends OP_MemorizeSpell.
-pub type MemSpellReq = Arc<Mutex<Option<(u32, u32, u32)>>>;
+/// Tuple = `(slot, spell_id, scribing, from_slot)`. `from_slot` is only used for scribing (0): the
+/// RoF2 server scribes only the scroll on the CURSOR, so the nav thread first moves the scroll from
+/// `from_slot` → cursor (OP_MoveItem) before the scribe packet. `None` = scroll already on cursor
+/// (or memorize/un-mem, which need no move). See eqoxide#11.
+pub type MemSpellReq = Arc<Mutex<Option<(u32, u32, u32, Option<u32>)>>>;
 /// Posture: Some(true)=sit, Some(false)=stand.
 pub type SitReq = Arc<Mutex<Option<bool>>>;
 /// Standalone consider of a spawn id.
