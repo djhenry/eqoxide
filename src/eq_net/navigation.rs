@@ -87,14 +87,27 @@ pub fn build_cast_packet(slot: u32, spell_id: u32, target_id: u32) -> Vec<u8> {
     buf
 }
 
-/// Titanium `MemorizeSpell_Struct` (16 bytes): slot, spell_id, scribing, reduction.
+/// `MemorizeSpell_Struct` (16 bytes): slot, spell_id, scribing, reduction. Identical layout under
+/// Titanium and RoF2 (verified against EQEmu rof2_structs.h — no ENCODE), opcode 0x217c.
 /// scribing: 0 = scribe a scroll into the spellbook at `slot`; 1 = memorize a known spell into
-/// gem `slot` (0-8); 2 = un-memorize.
+/// gem `slot` (0-8); 2 = un-memorize. NOTE: scribing (0) only works if the scroll is on the CURSOR
+/// (the server reads `m_inv[slotCursor]`); the caller must move it there first. See eqoxide#11.
 pub fn build_memorize_packet(slot: u32, spell_id: u32, scribing: u32) -> Vec<u8> {
     let mut buf = vec![0u8; 16];
     buf[0..4].copy_from_slice(&slot.to_le_bytes());
     buf[4..8].copy_from_slice(&spell_id.to_le_bytes());
     buf[8..12].copy_from_slice(&scribing.to_le_bytes());
+    buf
+}
+
+/// `MoveItem_Struct` (12 bytes): from_slot, to_slot, number_in_stack. number_in_stack = 0 for a
+/// whole-item move (equip/cursor/rearrange); a count would split a stack. See the inline note at
+/// the /inventory/move handler for why 0 (not 1) is required for non-stackables.
+pub fn build_move_item(from_slot: u32, to_slot: u32) -> [u8; 12] {
+    let mut buf = [0u8; 12];
+    buf[0..4].copy_from_slice(&from_slot.to_le_bytes());
+    buf[4..8].copy_from_slice(&to_slot.to_le_bytes());
+    buf[8..12].copy_from_slice(&0u32.to_le_bytes());
     buf
 }
 
@@ -738,7 +751,20 @@ impl Navigator {
         // (scribing=1) — OP_MemorizeSpell. The server validates (you hold the scroll / know the
         // spell) and pushes OP_MemorizeSpell back, which updates gs.mem_spells for the gem case.
         let mem_req = self.mem_spell.lock().unwrap().take();
-        if let Some((slot, spell_id, scribing)) = mem_req {
+        if let Some((slot, spell_id, scribing, from)) = mem_req {
+            // Scribing (0) only takes effect on the scroll sitting on the CURSOR: the RoF2 server
+            // reads m_inv[slotCursor] and ignores the packet otherwise (silent fail, eqoxide#11).
+            // So move the scroll from its inventory slot → cursor first (same tick; the server
+            // processes packets in order, so the cursor holds the scroll when the scribe arrives).
+            if scribing == 0 {
+                if let Some(from_slot) = from {
+                    if from_slot != SLOT_CURSOR {
+                        stream.send_app_packet(OP_MOVE_ITEM, &build_move_item(from_slot, SLOT_CURSOR));
+                        gs.move_item(from_slot as i32, SLOT_CURSOR as i32); // mirror locally
+                        tracing::info!("EQ: scribe — moved scroll slot {} → cursor", from_slot);
+                    }
+                }
+            }
             stream.send_app_packet(OP_MEMORIZE_SPELL, &build_memorize_packet(slot, spell_id, scribing));
             let what = match scribing { 0 => "scribe", 1 => "memorize", _ => "unmem" };
             tracing::info!("EQ: {what} spell={spell_id} slot={slot}");
@@ -1553,5 +1579,16 @@ mod door_tests {
         assert_eq!(&pkt[8..12], &[0, 0, 0, 0]); // item_id @8 = 0
         assert_eq!(&pkt[12..14], &0x1234u16.to_le_bytes()); // player_id @12
         assert_eq!(&pkt[14..16], &[0, 0]); // trailing unknowns zero
+    }
+
+    #[test]
+    fn move_item_layout_is_from_to_zero() {
+        // MoveItem_Struct: from_slot, to_slot, number_in_stack(=0 whole item). Used by the scribe
+        // flow to put the scroll on the cursor (slot 33) before OP_MemorizeSpell. (eqoxide#11)
+        let pkt = build_move_item(23, SLOT_CURSOR);
+        assert_eq!(pkt.len(), 12);
+        assert_eq!(u32::from_le_bytes(pkt[0..4].try_into().unwrap()), 23);
+        assert_eq!(u32::from_le_bytes(pkt[4..8].try_into().unwrap()), SLOT_CURSOR);
+        assert_eq!(u32::from_le_bytes(pkt[8..12].try_into().unwrap()), 0, "whole-item move");
     }
 }

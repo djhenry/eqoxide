@@ -128,22 +128,27 @@ async fn post_memorize(
 ) -> (StatusCode, String) {
     let b = match body { Ok(Json(b)) => b, Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"spell_id\":N,\"gem\":0-8}".into()) };
     if b.gem > 8 { return (StatusCode::BAD_REQUEST, "gem must be 0-8".into()); }
-    *s.mem_spell.lock().unwrap() = Some((b.gem, b.spell_id, 1));
+    *s.mem_spell.lock().unwrap() = Some((b.gem, b.spell_id, 1, None));
     (StatusCode::OK, format!("memorizing spell {} into gem {}", b.spell_id, b.gem))
 }
 
 #[derive(serde::Deserialize)]
-struct ScribeBody { spell_id: u32, slot: Option<u32> }
+struct ScribeBody { spell_id: u32, slot: Option<u32>, from: Option<u32> }
 
-/// POST /v1/combat/scribe {"spell_id":N,"slot":B?} — scribe a spell scroll (in inventory) into the
-/// spellbook at book slot B (default 0). Sends OP_MemorizeSpell with scribing=0. The server
-/// validates you hold the scroll and consumes it.
+/// POST /v1/combat/scribe {"spell_id":N,"from":S,"slot":B?} — scribe a spell scroll into the
+/// spellbook at book slot B (default 0). `from` is the scroll's current inventory wire slot (from
+/// GET /v1/observe/inventory): the RoF2 server scribes only the scroll on the CURSOR, so the nav
+/// thread moves `from` → cursor (OP_MoveItem) before sending OP_MemorizeSpell scribing=0, which
+/// consumes the scroll. Omit `from` only if the scroll is already on the cursor. See eqoxide#11.
 async fn post_scribe(
     State(s): State<HttpState>,
     body: Result<Json<ScribeBody>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, String) {
-    let b = match body { Ok(Json(b)) => b, Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"spell_id\":N,\"slot\":B?}".into()) };
+    let b = match body { Ok(Json(b)) => b, Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"spell_id\":N,\"from\":S,\"slot\":B?}".into()) };
     let slot = b.slot.unwrap_or(0);
-    *s.mem_spell.lock().unwrap() = Some((slot, b.spell_id, 0));
-    (StatusCode::OK, format!("scribing spell {} into book slot {}", b.spell_id, slot))
+    *s.mem_spell.lock().unwrap() = Some((slot, b.spell_id, 0, b.from));
+    (StatusCode::OK, match b.from {
+        Some(f) => format!("scribing spell {} into book slot {} (scroll from slot {})", b.spell_id, slot, f),
+        None    => format!("scribing spell {} into book slot {} (scroll assumed on cursor)", b.spell_id, slot),
+    })
 }
