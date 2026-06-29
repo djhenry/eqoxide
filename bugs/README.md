@@ -20,3 +20,5 @@ expected vs. actual, observations/diagnosis, suspected root cause, and status.
 | [Auto-combat ignores adds — player dies unanswered](auto-combat-ignores-adds-player-dies.md) | High | Open |
 | [No death/respawn handling — stuck as corpse](no-death-respawn-handling-stuck-corpse.md) | High | Fixed |
 | [Cross-zone tells/OOC dropped — RoF2 OP_ChannelMessage wire format](cross-zone-chat-needs-ucs.md) | Medium | Fixed |
+| [Zone terrain GLB missing from asset server (404)](zone-glb-not-baked-404.md) | Medium | Open |
+| [Door spawn names decode to garbage / empty in arena](door-spawn-garbage-names-arena.md) | Low | Open |
