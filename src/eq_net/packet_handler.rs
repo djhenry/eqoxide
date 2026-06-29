@@ -419,7 +419,12 @@ fn apply_new_zone(gs: &mut GameState, payload: &[u8]) {
     // zone_id @ 852
     gs.zone_id = u16::from_le_bytes([payload[852], payload[853]]);
     gs.zone_changed = true;
-    gs.log_msg("zone", &format!("Entered {}", gs.zone_name));
+    let entered = format!("Entered {}", gs.zone_name);
+    gs.log_msg("zone", &entered);
+    // Also surface zone changes on the inter-agent event feed (GET /v1/chat/events) so an agent
+    // driving the client hears "I just zoned" through the same channel as tells/OOC — including
+    // server-initiated zone changes and cross-zone respawns. `directed` so it isn't filtered as noise.
+    gs.push_chat_event("system", "zone", true, &entered);
 }
 
 fn apply_zone_spawns(gs: &mut GameState, payload: &[u8]) {

@@ -307,8 +307,10 @@ impl GameState {
     /// Record an inter-agent chat event (tell/ooc/shout/group/gmsay) for the GET /events feed,
     /// assigning the next monotonic id. Capped to the most recent 200 events.
     pub fn push_chat_event(&mut self, from: &str, channel: &str, directed: bool, text: &str) {
-        let id = self.next_chat_id;
+        // Ids are 1-based: the events endpoint filters `id > since` with `since=0` as the default
+        // "haven't seen anything" cursor, so a 0-id first event would be permanently invisible.
         self.next_chat_id += 1;
+        let id = self.next_chat_id;
         if self.chat_events.len() >= 200 {
             self.chat_events.pop_front();
         }
