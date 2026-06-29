@@ -668,8 +668,19 @@ impl Navigator {
             // Deduct the cost from on-hand coin for the HUD: the server takes the money with
             // update_client=false (Handle_OP_ShopPlayerBuy → TakeMoneyFromPP) and sends no
             // OP_MoneyUpdate, so the displayed coin would otherwise stay stale after a purchase.
+            // spend_coin here only updates *this* (network-thread) GameState; the HUD / HTTP coin
+            // is published from the render thread's separate GameState, which is fed solely by
+            // packets through app_tx. So after deducting, synthesize an OP_MoneyUpdate carrying the
+            // new total and route it through app_tx — apply_money_update applies it on the render
+            // copy, keeping the HUD in sync (mirrors how real money packets reach both copies).
             let price = gs.merchant_items.iter().find(|m| m.merchant_slot == slot).map(|m| m.price);
-            if let Some(p) = price { gs.spend_coin(p as u64); }
+            if let Some(p) = price {
+                if gs.spend_coin(p as u64) {
+                    let mut money = Vec::with_capacity(16);
+                    for v in gs.coin { money.extend_from_slice(&(v as i32).to_le_bytes()); }
+                    let _ = app_tx.send(AppPacket { opcode: OP_MONEY_UPDATE, payload: money });
+                }
+            }
             tracing::info!("EQ: shop buy — merchant_id={} slot={} qty=1 cost={}", merchant_id, slot, price.unwrap_or(0));
             gs.log_msg("merchant", &format!("Bought item (slot {})", slot));
         }
