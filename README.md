@@ -1,5 +1,7 @@
 # eqoxide
 
+[![Asset server: eqoxide_asset_server](https://img.shields.io/badge/asset%20server-eqoxide__asset__server-blue?logo=github)](https://github.com/djhenry/eqoxide_asset_server)
+
 A standalone Rust EverQuest **Titanium** observer/renderer. It connects directly to a local
 EQEmu server, renders the zone in 3D (wgpu), and exposes a local **HTTP API** so an agent (or
 any script) can drive the client — move, hail NPCs, target, fight, buy, capture frames, and more.
