@@ -64,7 +64,7 @@ map_x  = server_y  (east)
 map_y  = server_x  (north)
 ```
 
-So `POST /goto {"map_x": 150, "map_y": 200}` translates to `server_x=200, server_y=150`.
+So `POST /v1/navigate/goto {"map_x": 150, "map_y": 200}` translates to `server_x=200, server_y=150`.
 
 libeq_wld mesh positions are `[east, height, north]` — note height is the middle
 element, not the last. Collision code converts to `[east, north, height]` for GPU world space.

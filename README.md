@@ -18,9 +18,9 @@ Legend: ✅ **working** (implemented & verified) · 🟡 **in progress** · 🔵
 | Login as GM observer | ✅ | Direct connect to local EQEmu (login `127.0.0.1:5998`) |
 | Login as a regular player character | ✅ | Plays for real; per-character config in `~/.config/eqoxide/` |
 | Multiple instances side-by-side | ✅ | Auto-binds next free HTTP port from 8765; prints `API_PORT=` |
-| Graceful shutdown (`POST /exit`) | ✅ | Per-instance; never `pkill` |
-| Zone-line travel (`POST /zone_cross`) | ✅ | Sends target zone id; verified both ways (e.g. qcat↔qeynos) |
-| Auto walk-into a zone line | 🐞 | Rarely fires — server sends arrival, not trigger, coords; use `/zone_cross` |
+| Graceful shutdown (`POST /v1/lifecycle/exit`) | ✅ | Per-instance; never `pkill` |
+| Zone-line travel (`POST /v1/navigate/zone_cross`) | ✅ | Sends target zone id; verified both ways (e.g. qcat↔qeynos) |
+| Auto walk-into a zone line | 🐞 | Rarely fires — server sends arrival, not trigger, coords; use `/v1/navigate/zone_cross` |
 | Derived-asset sync from `eqoxide_asset_server` | ✅ | Models, textures, string table, maps fetched over HTTP into XDG cache |
 
 ### Rendering
@@ -33,7 +33,7 @@ Legend: ✅ **working** (implemented & verified) · 🟡 **in progress** · 🔵
 | **Weapon** models in hand + swing animation | ✅ | Verified on elf-female; NPC weapons & generic hand-joint = follow-up |
 | Doors: clickable, animated, portal-zoning | ✅ | Geometry/placement correct; **untextured** (texture pass pending) |
 | Smooth NPC movement (velocity dead-reckoning) | ✅ | Receives unreliable position updates |
-| Frame capture (`GET /frame` → PNG) | ✅ | Used for visual verification |
+| Frame capture (`GET /v1/observe/frame` → PNG) | ✅ | Used for visual verification |
 | World handedness / left-right mirror | ✅ | Fixed (clip-space X + A/D controls) |
 | Helms / hair / head armor | 🔵 | Attached-model subsystem not built yet |
 | Outdoor-zone vertical placement | 🐞 | Some outdoor zones (e.g. qeytoqrg) render terrain with a Z offset |
@@ -41,18 +41,18 @@ Legend: ✅ **working** (implemented & verified) · 🟡 **in progress** · 🔵
 ### Gameplay & automation (HTTP API)
 | Feature | Status | Notes |
 |---|---|---|
-| Movement: walk `POST /goto` (A* pathfinding) | ✅ | Routes around walls within connected areas; stalls across closed doors |
-| Movement: teleport `POST /warp` | ✅ | Anti-cheat capped (~50–95u/hop); small hops from a synced state |
+| Movement: walk `POST /v1/navigate/goto` (A* pathfinding) | ✅ | Routes around walls within connected areas; stalls across closed doors |
+| Movement: teleport `POST /v1/navigate/warp` | ✅ | Anti-cheat capped (~50–95u/hop); small hops from a synced state |
 | Combat: auto-attack / auto-face / auto-retarget | ✅ | Heading-scale fix made melee land; hands-free grinding works |
-| Spell casting (`POST /cast`, gems, cast bar) | ✅ | `OP_CastSpell` + begin/mana/interrupt feedback |
-| Scribe / memorize spells (`POST /scribe`, `/memorize`) | ✅ | |
+| Spell casting (`POST /v1/combat/cast`, gems, cast bar) | ✅ | `OP_CastSpell` + begin/mana/interrupt feedback |
+| Scribe / memorize spells (`POST /v1/combat/scribe`, `/v1/combat/memorize`) | ✅ | |
 | Pets: tracking, auto-pet-combat, recall | ✅ | `OP_PetCommands`; squishy classes stand off |
-| Target / consider / hail / say | ✅ | `/target`, `/target/name`, `/consider`, `/hail`, `/say` |
-| Merchant buy / sell / trade window | ✅ | `/buy`, `/sell`, `/trade/*`; live-verified buy (item + coin) |
-| Loot corpses (`POST /loot`) | ✅ | Auto-loot queues own kills; takes listed items |
-| Quest hand-in (`POST /give`) + quest log (`/quests`) | ✅ | Trade items to an NPC for turn-ins |
-| Inventory read / move (`GET /inventory`, `/inventory/move`) | ✅ | |
-| Doors API (`GET /doors`, `POST /doors/click`) | ✅ | |
+| Target / consider / hail / say | ✅ | `/v1/combat/target`, `/v1/combat/target/name`, `/v1/combat/consider`, `/v1/interact/hail`, `/v1/interact/say` |
+| Merchant buy / sell / trade window | ✅ | `/v1/merchant/buy`, `/v1/merchant/sell`, `/trade/*`; live-verified buy (item + coin) |
+| Loot corpses (`POST /v1/interact/loot`) | ✅ | Auto-loot queues own kills; takes listed items |
+| Quest hand-in (`POST /v1/interact/give`) + quest log (`/v1/observe/quests`) | ✅ | Trade items to an NPC for turn-ins |
+| Inventory read / move (`GET /v1/observe/inventory`, `/v1/inventory/move`) | ✅ | |
+| Doors API (`GET /v1/observe/doors`, `POST /v1/interact/click_door`) | ✅ | |
 | Water-region detection + swim navigation | ✅ | `.wtr` BSP; swim-descent in `find_path` |
 | Controlled-fall navigation + fall damage | 🟡 | Drop off ledges to a lower floor + client-side `OP_EnvDamage`; not yet exhaustively live-tested (curve tuning, water/levitate negation) |
 
@@ -149,8 +149,8 @@ agents can work on different features simultaneously without interfering.
   curl "http://127.0.0.1:$PORT/debug"
   ```
 
-- **Shut down your own instance with `POST /exit`** — never `pkill eqoxide`, which could
-  kill another worktree's client. `/exit` cleanly stops only the instance on the port you call:
+- **Shut down your own instance with `POST /v1/lifecycle/exit`** — never `pkill eqoxide`, which could
+  kill another worktree's client. `/v1/lifecycle/exit` cleanly stops only the instance on the port you call:
 
   ```sh
   curl -X POST "http://127.0.0.1:$PORT/exit"     # 200 "shutting down", then the process exits
@@ -162,7 +162,7 @@ See [`docs/http-api.md`](docs/http-api.md) for the full endpoint reference and
 ## Documentation
 
 - [`docs/architecture.md`](docs/architecture.md) — thread model, shared types, data flow
-- [`docs/http-api.md`](docs/http-api.md) — REST API reference (port discovery, `/exit`, all endpoints)
+- [`docs/http-api.md`](docs/http-api.md) — REST API reference (port discovery, `/v1/lifecycle/exit`, all endpoints)
 - [`docs/dev-workflow.md`](docs/dev-workflow.md) — building, running, multi-instance, verify loop
 - [`docs/autonomous-play.md`](docs/autonomous-play.md) — playing as a real character
 - [`docs/protocol-notes.md`](docs/protocol-notes.md) — EQ/Titanium wire protocol notes

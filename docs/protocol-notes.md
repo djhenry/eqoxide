@@ -30,7 +30,7 @@ offsets, and opcodes are cross-checked against:
 | `OP_EMOTE` | `0x547a` | server→client | Emote/action text |
 | `OP_CHANNEL_MESSAGE` | `0x4126` | client→server | Chat; chan_num=8 for Say |
 | `OP_TARGET_COMMAND` | `0x1477` | client→server | Set target (alt) |
-| `OP_TARGET_MOUSE` | `0x6c47` | client→server | **Set combat target** (4-byte spawn_id) — this is what `/target` uses; sets server-side `GetTarget()` for melee |
+| `OP_TARGET_MOUSE` | `0x6c47` | client→server | **Set combat target** (4-byte spawn_id) — this is what `/v1/combat/target` uses; sets server-side `GetTarget()` for melee |
 | `OP_CONSIDER` | `0x65ca` | both | Send=28-byte request; recv=con reply |
 | `OP_AUTO_ATTACK` | `0x5e55` | client→server | 4 bytes; `[1,0,0,0]`=on, `[0,…]`=off |
 | `OP_ZONE_CHANGE` | `0x5dd8` | client→server | Request zone crossing (88 bytes). **zoneID field = DESTINATION zone**, not current (see Zone Crossing below) |
@@ -81,7 +81,7 @@ EQEmu gates a client's melee swing (`zone/client_process.cpp` ~line 398) on ALL 
 passes only when `|HeadingAngleToMob - GetHeading()| <= 80` EQ-units (~56°).
 
 Implications for any client-driven combat:
-- The combat **target** must be set server-side — send `OP_TARGET_MOUSE` (the client `/target` does).
+- The combat **target** must be set server-side — send `OP_TARGET_MOUSE` (the client `/v1/combat/target` does).
 - The player must **face** the target — send correct-scaled heading in position updates (see above).
   The nav `auto_attack` loop re-faces the target every tick for this reason.
 - Must be in melee **range** (and LOS) — get adjacent (~5u) on the same floor level (mind z; a mob
@@ -115,7 +115,7 @@ that target near the player's tracked position; its range check compares linear 
 
 EQ's built-in quest journal (LDoN+, present in Titanium). Server-pushed for *task* quests only —
 old-style Lua turn-in quests (Rat Whiskers, Gnoll Fangs) send NONE of these. Decoded in
-`packet_handler.rs` into `GameState.tasks` (→ `GET /quests/log`). All are **variable-length, packed**
+`packet_handler.rs` into `GameState.tasks` (→ `GET /v1/observe/quests/log`). All are **variable-length, packed**
 (no struct padding) with embedded null-terminated strings; offsets verified vs EQEmu
 `titanium.cpp ENCODE(OP_TaskDescription)` + `eq_packet_structs.h`.
 

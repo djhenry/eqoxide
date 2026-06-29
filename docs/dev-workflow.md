@@ -38,7 +38,7 @@ The login config (which account/character to log in as) defaults to
 Per-character config files (`config-durgan.yaml`, `config-claude.yaml`, `config-aiquestbot.yaml`)
 live in `~/.config/eqoxide/` and carry just the `server:` + `account:` blocks. They are **not**
 checked into source control (they hold credentials). This lets multiple worktrees/agents each run
-their own character from a shared, per-user config dir (pairs with the auto-port + `/exit`
+their own character from a shared, per-user config dir (pairs with the auto-port + `/v1/lifecycle/exit`
 multi-instance support — see `http-api.md`).
 
 **To fully stop / log the character out** (e.g. to keep the client down, or to edit
@@ -91,14 +91,14 @@ PORT=$(grep -m1 -oP 'API_PORT=\K[0-9]+' /tmp/eqoxide.log)
 curl "http://127.0.0.1:$PORT/debug"
 ```
 
-**To restart your own instance, use `POST /exit`** — never `pkill eqoxide`, which would
+**To restart your own instance, use `POST /v1/lifecycle/exit`** — never `pkill eqoxide`, which would
 also kill another worktree's client. It cleanly exits only the instance on the port you call:
 
 ```sh
 curl -X POST "http://127.0.0.1:$PORT/exit"
 ```
 
-See `http-api.md` for both the port-discovery convention and the `/exit` endpoint.
+See `http-api.md` for both the port-discovery convention and the `/v1/lifecycle/exit` endpoint.
 
 ---
 
@@ -135,7 +135,7 @@ Key log lines to watch:
 - `API_PORT=<port>` — the HTTP API port this instance bound (may not be 8765; see *API Port Discovery*)
 - `camera HTTP: http://127.0.0.1:<port>` — server is up
 - `eqstr: loaded N strings` — string table loaded
-- `NAV: arrived at (…)` — /goto completed
+- `NAV: arrived at (…)` — /v1/navigate/goto completed
 - `EQ: hailing '…'` — hail packet sent
 - `EQ: say: …` — say packet sent
 - `WARN … unhandled opcode` — new packet type to handle
