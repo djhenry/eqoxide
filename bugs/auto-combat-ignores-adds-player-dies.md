@@ -53,5 +53,22 @@ nearest-reachable trash. An add that aggros mid-fight is never engaged, and with
 bail-out the player tanks it to death. Fix: prefer the mob attacking the player when retargeting,
 and/or disengage at low HP. (HP awareness is itself missing.)
 
+## Fix (branch worktree-auto-combat-adds)
+Confirmed root cause: `apply_combat_damage` parsed the attacker (`source_id`) but discarded it, and
+the nav auto-target step (navigation.rs) only retargeted when the current target died, then to the
+nearest trash mob — so an add hitting the player was never engaged.
+- `game_state.rs`: added `recent_attackers: HashMap<spawn_id, Instant>`.
+- `packet_handler.rs`: `apply_combat_damage` records each NPC that swings at the player (hit OR miss).
+- `navigation.rs`: new pure `pick_combat_target()` — priority: a mob currently attacking the player
+  > a still-valid current target > nearest reachable trash; keeps the current target when it is
+  itself an attacker (so two adds don't thrash). Attackers age out after 6s. 4 unit tests; 288 pass.
+
+Live (Campy, qeynos): confirmed the player auto-engages and fights back against the mob attacking
+her. A clean multi-add SWITCH could not be staged live (L1 char does ~0 dmg, can't survive, only one
+mob aggroed, navpath stalls) — the switch is covered by unit tests. Merged as-is per maintainer.
+
+Out of scope (follow-ups): low-HP disengage/flee; player melee showing "-5 damage"; `/debug`
+target_id not synced from the nav thread to the render thread (shows None during combat).
+
 ## Status
-Open
+Fixed (retarget-to-attacker; low-HP flee deferred)

@@ -17,7 +17,7 @@ expected vs. actual, observations/diagnosis, suspected root cause, and status.
 | [New goto/warp/manual move doesn't cancel navigation](new-movement-does-not-cancel-navigation.md) | Medium | Fixed |
 | [Char creation sends Titanium struct under RoF2 (80 vs 96)](charcreate-titanium-struct-under-rof2.md) | High | Fixed |
 | [Player currency decodes to garbage values (RoF2)](inventory-currency-garbage-values-rof2.md) | Medium | Fixed |
-| [Auto-combat ignores adds — player dies unanswered](auto-combat-ignores-adds-player-dies.md) | High | Open |
+| [Auto-combat ignores adds — player dies unanswered](auto-combat-ignores-adds-player-dies.md) | High | Fixed |
 | [No death/respawn handling — stuck as corpse](no-death-respawn-handling-stuck-corpse.md) | High | Fixed |
 | [Cross-zone tells/OOC dropped — RoF2 OP_ChannelMessage wire format](cross-zone-chat-needs-ucs.md) | Medium | Fixed |
 | [Zone terrain GLB missing from asset server (404)](zone-glb-not-baked-404.md) | Medium | Open |
