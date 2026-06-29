@@ -16,7 +16,7 @@
 | [Inventory view desync after turn-in / cursor move](inventory-view-desync-after-turnin-cursor-move.md) | Medium | Fixed |
 | [Neriak Third Gate library pathing stall](neriakc-library-pathing-stall.md) | Medium | Migrated → [eqoxide#2](https://github.com/djhenry/eqoxide/issues/2) |
 | [NPC rat movement jerky despite lerp](npc-rat-movement-jerky-despite-lerp.md) | Low | Migrated → [eqoxide#1](https://github.com/djhenry/eqoxide/issues/1) |
-| [/inventory API missing currency amounts](inventory-api-missing-currency.md) | Low-Med | Fixed |
+| [/v1/observe/inventory API missing currency amounts](inventory-api-missing-currency.md) | Low-Med | Fixed |
 | [New goto/warp/manual move doesn't cancel navigation](new-movement-does-not-cancel-navigation.md) | Medium | Fixed |
 | [Char creation sends Titanium struct under RoF2 (80 vs 96)](charcreate-titanium-struct-under-rof2.md) | High | Fixed |
 | [Player currency decodes to garbage values (RoF2)](inventory-currency-garbage-values-rof2.md) | Medium | Fixed |

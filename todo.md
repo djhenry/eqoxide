@@ -72,7 +72,7 @@ Follow-ups (not blocking):
 - **Mana % shows 0** — `apply_mana_change` is a no-op; `mana_pct` isn't populated for the
   player. Wire mana% (needs max-mana from profile) so the HUD mana bar + cast gating work.
 - **No `POST /v1/combat/target` "nearest"** — HTTP `/v1/combat/target` needs an explicit `{id}`; the HUD Target
-  button uses nearest-NPC. Consider a `/target/nearest` convenience for agents.
+  button uses nearest-NPC. Consider a `/v1/combat/target/nearest` convenience for agents.
 - Spell **icon grid geometry** is `ICON_COLS/ROWS = 6` in `src/spells.rs` — looked correct
   live; revisit if any icon looks sliced.
 - Out of scope (future): disciplines, clicky items, AA abilities, spellbook→gem memorize UI.

@@ -10,7 +10,7 @@ of seconds with zero response until the player dies.
 
 ## Steps to reproduce
 1. Brogan (L1 Human Warrior, ~50 HP) grinding rats in South Qeynos with auto-attack ON
-   (`/target/name a_rodent` → `/attack`).
+   (`/v1/combat/target/name a_rodent` → `/v1/combat/attack`).
 2. While auto-combat is killing one rat, a second rodent (`a_rodent009`) aggros and starts
    attacking Brogan.
 3. Observe the combat log: the add hits Brogan repeatedly with **no "Brogan hits <add>"** lines.
@@ -67,7 +67,7 @@ Live (Campy, qeynos): confirmed the player auto-engages and fights back against 
 her. A clean multi-add SWITCH could not be staged live (L1 char does ~0 dmg, can't survive, only one
 mob aggroed, navpath stalls) — the switch is covered by unit tests. Merged as-is per maintainer.
 
-Out of scope (follow-ups): low-HP disengage/flee; player melee showing "-5 damage"; `/debug`
+Out of scope (follow-ups): low-HP disengage/flee; player melee showing "-5 damage"; `/v1/observe/debug`
 target_id not synced from the nav thread to the render thread (shows None during combat).
 
 ## Status

@@ -67,7 +67,7 @@ Make the server identify us as RoF2 and exchange the login→world→zone handsh
 ### Phase 3 — Inventory + items
 - RoF2 inventory slot map (larger; different ranges) and the RoF2 **item serialization**
   (different from Titanium's). Update `OP_CharInventory`, `OP_ItemPacket`, the slot math, and
-  any `/inventory`/`/give`/`/trade` wire code.
+  any `/v1/observe/inventory`/`/v1/interact/give`/`/trade` wire code.
 - **Done when:** inventory reads correctly and equip/give/merchant flows work.
 
 ### Phase 4 — Appearance + wearchange + spell/combat opcodes

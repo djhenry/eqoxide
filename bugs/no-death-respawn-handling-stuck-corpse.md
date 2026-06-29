@@ -21,9 +21,9 @@ re-enables control, and auto-combat can resume — like the real client where yo
 ## Actual
 - After the slain message there are **no further log lines** for the player (no respawn, no
   unhandled opcode, no position change).
-- `/debug` shows the player frozen at the **death location** (`-383,45,32`), NOT the bind
+- `/v1/observe/debug` shows the player frozen at the **death location** (`-383,45,32`), NOT the bind
   (`-510,57,32`).
-- `/target/name` + `/attack` produce no swings — a rodent 5u away at the same z is ignored because
+- `/v1/combat/target/name` + `/v1/combat/attack` produce no swings — a rodent 5u away at the same z is ignored because
   the player is dead.
 - The session is dead-in-place until it eventually logs out. (In two earlier deaths the client
   issued a `clean shutdown requested — sending OP_Logout` ~90s after death; in a third it just sat
@@ -69,7 +69,7 @@ only missing piece is sending the reply.
 ## Live test (2026-06-29, GM-assisted) — IMPORTANT NUANCE
 A GM (Aiquestbot) summoned Campy to qeynos and slew her twice. BOTH deaths recovered correctly via
 the **direct `OP_ZonePlayerToBind` path** (existing `apply_bind_respawn`): "*** You have been
-slain! ***" → "Respawning at bind point" → alive at bind (0,10,5), movable (verified via /goto).
+slain! ***" → "Respawning at bind point" → alive at bind (0,10,5), movable (verified via /v1/navigate/goto).
 The new `OP_RespawnWindow` handler fired **0 times** — this server has
 `RuleB(Character, RespawnFromHover)` **OFF**, so it sends `OP_ZonePlayerToBind` directly and never
 sends `OP_RespawnWindow (0x0ecb)`.

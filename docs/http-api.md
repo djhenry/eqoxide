@@ -11,7 +11,7 @@ All routes are **versioned and grouped**: `/<version>/<group>/<action>`. The cur
 
 | Group | Purpose |
 |-------|---------|
-| `observe`   | read-only world/player state (incl. the `/frame` screenshot) |
+| `observe`   | read-only world/player state (incl. the `/v1/observe/frame` screenshot) |
 | `navigate`  | movement: goto / warp / zone cross |
 | `combat`    | targeting, auto-attack, consider, spell scribe/memorize/cast |
 | `interact`  | hail, say, loot, give (turn-in), doors, sit/stand |
@@ -94,7 +94,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 | `POST /v1/merchant/buy` | `{"merchant":"Name","slot":N}` | Open the merchant and buy item slot N. |
 | `POST /v1/merchant/sell` | `{"merchant":"Name","slot":N,"quantity":Q?}` | Sell player inventory slot N (qty default 1). |
 
-> Note: the old flat aliases `/buy`, `/sell`, `/trade/*` are gone — use the `/v1/merchant/*` paths.
+> Note: the old flat aliases `/v1/merchant/buy`, `/v1/merchant/sell`, `/trade/*` are gone — use the `/v1/merchant/*` paths.
 
 ---
 
@@ -115,7 +115,7 @@ The bus an agent polls for "what just happened, as soon as it happened". Every e
 - `category` — top-level bucket: `chat` | `combat` | `navigate` | `system`.
 - `kind` — sub-type within the category (e.g. chat→tell/ooc/shout/group/gmsay, navigate→zone,
   combat→slain/attacked).
-- `directed` — concerns *you* specifically (a /tell to your name, a GM message, your own zone change
+- `directed` — concerns *you* specifically (a /v1/chat/tell to your name, a GM message, your own zone change
   or death).
 
 | Route | Query | Description |

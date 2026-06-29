@@ -1,6 +1,6 @@
 # gfaydark platform pathing stall
 
-**Summary:** Agent auto-walk (`/goto`) stalls partway across the Greater Faydark
+**Summary:** Agent auto-walk (`/v1/navigate/goto`) stalls partway across the Greater Faydark
 (Kelethin) tree platforms — the character stops making progress well short of the
 target and never reaches it.
 
@@ -12,9 +12,9 @@ still works).
 ## Steps to reproduce
 1. Launch the client and zone into `gfaydark` (the player spawns up on the
    Kelethin platforms, z ≈ 72).
-2. `POST /goto {"x":200,"y":40,"z":4}` (toward the North Felwithe zone line, or
+2. `POST /v1/navigate/goto {"x":200,"y":40,"z":4}` (toward the North Felwithe zone line, or
    any target a few hundred units away across the platforms).
-3. Watch the position via `GET /debug`.
+3. Watch the position via `GET /v1/observe/debug`.
 
 ## Expected
 The character walks the full path to the target (or reports `NAV: arrived` /
@@ -28,7 +28,7 @@ log line is emitted — it just stalls silently.
 Observed example (2026-06-26):
 - Start `(473, 239, 72)` → walked to `(340, 149, 85)` then stopped, still
   **177 units** from the `(200, 40)` zone line.
-- A second `/goto` from `(466, 237)` advanced only ~6 units to `(473, 238)` then
+- A second `/v1/navigate/goto` from `(466, 237)` advanced only ~6 units to `(473, 238)` then
   stalled again.
 - Note the z climbed 72 → 85 mid-walk, suggesting it was traversing a
   ramp/platform when it got stuck.

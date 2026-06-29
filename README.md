@@ -146,14 +146,14 @@ agents can work on different features simultaneously without interfering.
 
   ```sh
   PORT=$(grep -m1 -oP 'API_PORT=\K[0-9]+' /tmp/eqoxide.log)
-  curl "http://127.0.0.1:$PORT/debug"
+  curl "http://127.0.0.1:$PORT/v1/observe/debug"
   ```
 
 - **Shut down your own instance with `POST /v1/lifecycle/exit`** — never `pkill eqoxide`, which could
   kill another worktree's client. `/v1/lifecycle/exit` cleanly stops only the instance on the port you call:
 
   ```sh
-  curl -X POST "http://127.0.0.1:$PORT/exit"     # 200 "shutting down", then the process exits
+  curl -X POST "http://127.0.0.1:$PORT/v1/lifecycle/exit"     # 200 "shutting down", then the process exits
   ```
 
 See [`docs/http-api.md`](docs/http-api.md) for the full endpoint reference and

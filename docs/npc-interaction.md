@@ -133,19 +133,19 @@ NPC Dialogue panel. Matching strings: `"AddLootDrop"`, `"min/max"`, `"[Loot]"`.
 
 ```sh
 # Walk to an NPC
-curl -X POST localhost:8765/goto -H 'Content-Type: application/json' \
+curl -X POST localhost:8765/v1/navigate/goto -H 'Content-Type: application/json' \
      -d '{"name":"Lanhern Firepride"}'
 sleep 6
 
 # Hail it
-curl -X POST localhost:8765/hail -H 'Content-Type: application/json' \
+curl -X POST localhost:8765/v1/interact/hail -H 'Content-Type: application/json' \
      -d '{"name":"Lanhern Firepride"}'
 sleep 2
 
 # Capture what it said
-curl -s localhost:8765/frame -o /tmp/dialogue.png
+curl -s localhost:8765/v1/observe/frame -o /tmp/dialogue.png
 
 # Follow up the [shipment] keyword
-curl -X POST localhost:8765/say -H 'Content-Type: application/json' \
+curl -X POST localhost:8765/v1/interact/say -H 'Content-Type: application/json' \
      -d '{"text":"shipment"}'
 ```
