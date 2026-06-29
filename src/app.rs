@@ -927,7 +927,15 @@ impl App {
             self.camera_initialized = true;
         }
 
-        if self.scene.zone_changed && self.scene.zone != self.current_zone {
+        // Trigger a zone (re)load whenever the zone we're standing in differs from the zone whose
+        // geometry is currently loaded. We deliberately do NOT gate on the transient
+        // `scene.zone_changed` edge flag: OP_NewZone sets it and OP_Weather clears it, and both
+        // packets often arrive in the same `poll_external` drain — so the true→false transition can
+        // happen entirely between two scene snapshots and never be observed here, leaving the player
+        // in a terrain-less void (since `current_zone` then never advances). Comparing against the
+        // durable `current_zone` (what we've actually loaded) is a level condition that can't be
+        // missed by drain timing. See `zone_needs_reload`.
+        if zone_needs_reload(&self.scene.zone, &self.current_zone) {
             self.loading       = true;
             self.pending_reload = true;
             self.current_zone  = self.scene.zone.clone();
@@ -1779,5 +1787,47 @@ impl ApplicationHandler for App {
         // Any non-redraw event that reached here (input, resize, focus, …) may change what's drawn, so
         // render at least one frame and keep the active window open briefly for follow-up animation.
         self.wake();
+    }
+}
+
+/// Decide whether the zone geometry must be (re)loaded.
+///
+/// `scene_zone` is the zone the player is currently standing in (from the latest scene snapshot);
+/// `current_zone` is the zone whose geometry we last started loading. A reload is needed exactly
+/// when they differ — a durable *level* condition that, unlike the transient `zone_changed` edge
+/// flag, cannot be missed by packet-drain timing (see the call site for the race this avoids).
+///
+/// An empty `scene_zone` (no zone yet, or a transient reset) never triggers a load: there is no
+/// `<empty>.glb` to fetch, and loading it would only blow away real terrain for a fallback plane.
+fn zone_needs_reload(scene_zone: &str, current_zone: &str) -> bool {
+    !scene_zone.is_empty() && scene_zone != current_zone
+}
+
+#[cfg(test)]
+mod tests {
+    use super::zone_needs_reload;
+
+    #[test]
+    fn first_zone_in_triggers_load() {
+        // current_zone starts empty; arriving in a real zone must load it.
+        assert!(zone_needs_reload("arena", ""));
+    }
+
+    #[test]
+    fn changing_zones_triggers_load() {
+        assert!(zone_needs_reload("gfaydark", "arena"));
+    }
+
+    #[test]
+    fn same_zone_does_not_reload() {
+        // Already loaded: re-snapshotting the same zone must not thrash a reload.
+        assert!(!zone_needs_reload("arena", "arena"));
+    }
+
+    #[test]
+    fn empty_scene_zone_never_loads() {
+        // No zone yet / transient reset: don't try to fetch `<empty>.glb` over a loaded zone.
+        assert!(!zone_needs_reload("", ""));
+        assert!(!zone_needs_reload("", "arena"));
     }
 }
