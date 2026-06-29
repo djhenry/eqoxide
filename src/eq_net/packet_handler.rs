@@ -971,10 +971,15 @@ fn apply_zone_points(gs: &mut GameState, payload: &[u8]) {
     }
 }
 
-/// OP_SpawnDoor — a header-less flat array of 80-byte Door_Struct records (max 500).
+/// OP_SpawnDoor — a header-less flat array of Door_Struct records (max 500).
+/// RoF2 records are 100 bytes: the server's internal 80-byte Door_Struct is ENCODE-expanded
+/// to the 100-byte RoF2 client struct (EQEmu `ENCODE(OP_SpawnDoor)`), which appends 20 bytes
+/// of RoF2-only trailing fields after `door_param`. The fields we read all sit in the first
+/// 80 bytes (identical in both structs); only the per-record STRIDE differs, so an 80-byte
+/// stride drifts every record after the first and decodes garbage/empty names.
 /// Wire order is y(north) then x(east); we store client convention (x=east, y=north).
 fn apply_spawn_doors(gs: &mut GameState, p: &[u8]) {
-    const REC: usize = 80;
+    const REC: usize = 100;
     let rd_f32 = |b: &[u8], o: usize| f32::from_le_bytes([b[o], b[o+1], b[o+2], b[o+3]]);
     let rd_u32 = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o+1], b[o+2], b[o+3]]);
     let mut off = 0;
@@ -1561,7 +1566,7 @@ mod tests {
     #[test]
     fn spawn_door_parses_one_record() {
         use super::apply_spawn_doors;
-        let mut rec = [0u8; 80];
+        let mut rec = [0u8; 100];                  // RoF2 Door_Struct is 100 bytes
         rec[..5].copy_from_slice(b"DOOR1");        // name @0
         rec[32..36].copy_from_slice(&20.0f32.to_le_bytes()); // yPos(north) @32
         rec[36..40].copy_from_slice(&10.0f32.to_le_bytes()); // xPos(east)  @36
@@ -1587,6 +1592,32 @@ mod tests {
         assert_eq!(d.opentype, 5);
         assert!(!d.is_open);
         assert!(!d.invert_state);
+    }
+
+    #[test]
+    fn spawn_door_parses_multiple_records_without_drift() {
+        // RoF2 sends 100-byte Door_Struct records (the server's 80-byte struct is ENCODE-
+        // expanded to 100 for the client). Parsing with the wrong stride drifts each record
+        // after the first, so the 2nd+ doors decode garbage/empty names. Two records guard it.
+        use super::apply_spawn_doors;
+        const REC: usize = 100;
+        let mut build = |name: &[u8], door_id: u8| -> [u8; REC] {
+            let mut r = [0u8; REC];
+            r[..name.len()].copy_from_slice(name); // name @0
+            r[60] = door_id;                        // door_id @60
+            r[61] = 5;                              // opentype @61
+            r
+        };
+        let mut p = Vec::new();
+        p.extend_from_slice(&build(b"DOORONE", 7));
+        p.extend_from_slice(&build(b"DOORTWO", 9));
+
+        let mut gs = GameState::new();
+        apply_spawn_doors(&mut gs, &p);
+
+        assert_eq!(gs.doors.get(&7).expect("door 7 present").name, "DOORONE");
+        assert_eq!(gs.doors.get(&9).expect("door 9 present").name, "DOORTWO");
+        assert_eq!(gs.doors.len(), 2, "exactly two doors, no phantom drifted records");
     }
 
     #[test]
