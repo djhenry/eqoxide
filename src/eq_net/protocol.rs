@@ -170,6 +170,10 @@ pub const OP_LOOT_REQUEST: u16     = 0x0adf; // RoF2: OP_LootRequest
 /// Server → client with coin amounts on corpse. MoneyOnCorpse_Struct (20 bytes):
 /// response(u8) + 3×pad + platinum(u32) + gold(u32) + silver(u32) + copper(u32).
 pub const OP_MONEY_ON_CORPSE: u16  = 0x5f44; // RoF2: OP_MoneyOnCorpse
+/// Server → client with the player's NEW total coin after any change (buy/sell/loot/etc).
+/// MoneyUpdate_Struct (16 bytes): platinum(i32) gold(i32) silver(i32) copper(i32). Without
+/// handling this, the HUD coin display stays stuck at the login-profile value.
+pub const OP_MONEY_UPDATE: u16     = 0x640c; // RoF2: OP_MoneyUpdate
 /// Server → client: one packet per lootable item. Client echoes back to take it.
 pub const OP_LOOT_ITEM: u16        = 0x4dc9; // RoF2: OP_LootItem
 /// Client → server to close a loot session.
