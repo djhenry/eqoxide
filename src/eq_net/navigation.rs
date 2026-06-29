@@ -767,6 +767,9 @@ impl Navigator {
             buf[4..8].copy_from_slice(&to_slot.to_le_bytes());
             buf[8..12].copy_from_slice(&0u32.to_le_bytes()); // number_in_stack = 0 (whole item)
             stream.send_app_packet(OP_MOVE_ITEM, &buf);
+            // EQEmu applies the move silently (no echo), so mirror it into our snapshot or
+            // /inventory goes stale and the next move corrupts it (phantom items).
+            gs.move_item(from_slot as i32, to_slot as i32);
             tracing::info!("EQ: move item — from_slot={} to_slot={} qty=0(whole)", from_slot, to_slot);
             gs.log_msg("inventory", &format!("Moved item (slot {} -> {})", from_slot, to_slot));
         }
@@ -1095,6 +1098,7 @@ impl Navigator {
                     mv[4..8].copy_from_slice(&SLOT_CURSOR.to_le_bytes());
                     // number_in_stack = 0 → whole-item move (see the /inventory/move note above).
                     stream.send_app_packet(OP_MOVE_ITEM, &mv);
+                    gs.move_item(from_slot as i32, SLOT_CURSOR as i32); // mirror locally
                 }
                 // Send OP_TradeRequest { to_mob_id = npc, from_mob_id = player }.
                 let mut req = [0u8; 8];
@@ -1118,6 +1122,7 @@ impl Navigator {
             mv[4..8].copy_from_slice(&SLOT_TRADE_BEGIN.to_le_bytes());
             // number_in_stack = 0 → whole-item move.
             stream.send_app_packet(OP_MOVE_ITEM, &mv);
+            gs.move_item(SLOT_CURSOR as i32, SLOT_TRADE_BEGIN as i32); // mirror locally
             let mut accept = [0u8; 8];
             accept[0..4].copy_from_slice(&gs.player_id.to_le_bytes());
             // unknown4 = 0 (already zeroed).
