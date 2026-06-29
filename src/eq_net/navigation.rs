@@ -443,12 +443,12 @@ impl Navigator {
             crate::http::MessageEntry { kind: m.kind.clone(), text: m.text.clone(), keywords }
         }));
         drop(out);
-        // Publish inter-agent chat events (GET /events), preserving their stable monotonic ids.
+        // Publish async events (GET /v1/events/*), preserving their stable monotonic ids.
         let mut ev = self.chat_events.lock().unwrap();
         ev.clear();
-        ev.extend(gs.chat_events.iter().map(|e| crate::http::ChatEvent {
-            id: e.id, from: e.from.clone(), channel: e.channel.clone(),
-            directed: e.directed, text: e.text.clone(),
+        ev.extend(gs.chat_events.iter().map(|e| crate::http::Event {
+            id: e.id, category: e.category.clone(), kind: e.kind.clone(),
+            from: e.from.clone(), directed: e.directed, text: e.text.clone(),
         }));
     }
 

@@ -136,15 +136,19 @@ pub struct CastState {
     pub cast_ms: u32,
 }
 
-/// One inter-agent chat event (tell/ooc/shout/group/gmsay) received from another player or a GM.
-/// `directed` = this message was addressed specifically to us (a /tell to our name, or a GM message).
-/// `id` is monotonic per session so an agent can poll `/events?since=<id>` without missing or
-/// re-seeing messages. NPC dialogue (say channel) is NOT recorded here — it stays in `messages`.
+/// One async game event the agent should know about as soon as it happens — surfaced via the
+/// `/v1/events/*` feed. `category` is the top-level bucket the events API filters on
+/// ("chat" | "combat" | "navigate" | "system"); `kind` is the sub-type within it (e.g. chat →
+/// tell/ooc/shout/group/gmsay, navigate → zone, combat → slain/attacked). `directed` = addressed
+/// specifically to us (a /tell to our name, a GM message, or something happening to *us*). `id` is
+/// monotonic (1-based) per session so an agent can poll `?since=<id>` without missing or re-seeing
+/// events. NPC dialogue (say channel) is NOT recorded here — it stays in `messages`.
 #[derive(Debug, Default, Clone)]
 pub struct ChatLogEvent {
     pub id:       u64,
+    pub category: String,  // "chat" | "combat" | "navigate" | "system"
+    pub kind:     String,  // sub-type, e.g. "tell"/"ooc"/"zone"/"slain"/"attacked"
     pub from:     String,
-    pub channel:  String,  // "tell" | "ooc" | "shout" | "group" | "gmsay"
     pub directed: bool,
     pub text:     String,
 }
@@ -306,7 +310,10 @@ impl GameState {
 
     /// Record an inter-agent chat event (tell/ooc/shout/group/gmsay) for the GET /events feed,
     /// assigning the next monotonic id. Capped to the most recent 200 events.
-    pub fn push_chat_event(&mut self, from: &str, channel: &str, directed: bool, text: &str) {
+    /// Record an async event onto the `/v1/events/*` feed. `category` is the top-level bucket
+    /// (chat/combat/navigate/system); `kind` the sub-type; `from` the originator ("" / "system" for
+    /// non-player events); `directed` whether it concerns us specifically.
+    pub fn push_event(&mut self, category: &str, kind: &str, from: &str, directed: bool, text: &str) {
         // Ids are 1-based: the events endpoint filters `id > since` with `since=0` as the default
         // "haven't seen anything" cursor, so a 0-id first event would be permanently invisible.
         self.next_chat_id += 1;
@@ -315,7 +322,12 @@ impl GameState {
             self.chat_events.pop_front();
         }
         self.chat_events.push_back(ChatLogEvent {
-            id, from: from.to_string(), channel: channel.to_string(), directed, text: text.to_string(),
+            id,
+            category: category.to_string(),
+            kind: kind.to_string(),
+            from: from.to_string(),
+            directed,
+            text: text.to_string(),
         });
     }
 
