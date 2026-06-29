@@ -59,12 +59,31 @@ in the chest slot.
   item updates* (post-trade `OP_MoveItem` / item-delete / cursor updates) into the
   published `/inventory` snapshot.
 
-## Suspected root cause
-(unconfirmed) The inventory snapshot is built from the initial `OP_CharInventory`
-and is not incrementally updated by the server packets that follow a trade
-turn-in and cursor/worn moves (e.g. `OP_MoveItem` echoes, item-delete, cursor
-push/pop). Stale slots then feed the next move, producing phantom/garbage entries.
-A fresh login (new `OP_CharInventory`) would resync the view to the correct state.
+## Root cause (confirmed)
+`gs.inventory` was only ever mutated by full `OP_CharInventory` loads and single-item
+`OP_ItemPacket` upserts; item *moves* were never applied. `OP_MoveItem` is **send-only** —
+EQEmu inventory moves are client-authoritative: the server validates the client's `OP_MoveItem`,
+updates the server inventory, and sends **no echo** (the real client already moved the item in its
+own UI). eqoxide has no such UI, so the move was lost from its snapshot. On a quest turn-in the
+server takes the handed-in items via `m_inv.PopItem` (`zone/trading.cpp`) — also with no per-item
+packet — while returned/reward items come back as `OP_ItemPacket` on the cursor. So the note
+lingered, the reward's slot was wrong, and a move computed against the stale view corrupted it into
+phantom items.
+
+## Fix
+- `GameState::move_item(from,to)` mirrors a whole-item move locally (swap if the destination is
+  occupied, no-op from empty), wired into the `/inventory/move` send and both give-flow moves.
+- `GameState::clear_trade_slots()` drops items left in the NPC trade slots (3000-3007) on
+  `OP_FinishTrade`. Reward/returned items keep arriving via `OP_ItemPacket` (already handled).
+See `src/game_state.rs`, `src/eq_net/navigation.rs`, `src/eq_net/packet_handler.rs`.
+
+## Verification
+Live (Mordeth, neriakc, real wire slots): unequip/re-equip (17↔25), bag move (27→28), and a
+**cursor** round-trip (28↔33) all reflect in `/inventory` immediately with no phantom items and no
+server desync; a second move no longer corrupts the view. Unit tests cover move relocate/swap/guard
+and trade-slot clearing. The end-to-end accepted turn-in (note consumed → `OP_FinishTrade` → slot
+cleared) is unit-tested + derived from the server source but was not re-run live — the test
+character had already consumed its note and the server was too DB-saturated to create a fresh one.
 
 ## Status
-Open
+Fixed

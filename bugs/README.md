@@ -10,7 +10,7 @@ expected vs. actual, observations/diagnosis, suspected root cause, and status.
 |-----|----------|--------|
 | [gfaydark platform pathing stall](gfaydark-platform-pathing-stall.md) | Medium | Open |
 | [Zone-in below-floor burial](zone-in-below-floor-burial.md) | Medium | Fixed |
-| [Inventory view desync after turn-in / cursor move](inventory-view-desync-after-turnin-cursor-move.md) | Medium | Open |
+| [Inventory view desync after turn-in / cursor move](inventory-view-desync-after-turnin-cursor-move.md) | Medium | Fixed |
 | [Neriak Third Gate library pathing stall](neriakc-library-pathing-stall.md) | Medium | Open |
 | [NPC rat movement jerky despite lerp](npc-rat-movement-jerky-despite-lerp.md) | Low | Open |
 | [/inventory API missing currency amounts](inventory-api-missing-currency.md) | Low-Med | Fixed |
