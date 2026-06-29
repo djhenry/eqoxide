@@ -76,6 +76,9 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
             // Server finalized the trade (0-byte packet). For a quest turn-in this means the NPC
             // accepted the item; if the item didn't match, the server returns it on the cursor
             // via OP_ItemPacket (handled above), which we treat as a soft failure.
+            // The server consumed the handed-in items via m_inv.PopItem (zone/trading.cpp) with no
+            // per-item packet, so clear our mirrored trade slots now that the turn-in is finalized.
+            gs.clear_trade_slots();
             gs.log_msg("trade", "Trade complete");
             tracing::info!("EQ: give: turn-in complete (OP_FinishTrade)");
         }
