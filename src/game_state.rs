@@ -328,6 +328,30 @@ impl GameState {
         true
     }
 
+    /// Mirror a client-authoritative whole-item move (OP_MoveItem) into the local snapshot.
+    /// EQEmu applies inventory moves silently — it validates the client's OP_MoveItem and updates
+    /// the server inventory but sends no echo (the real client already moved the item in its own
+    /// UI). eqoxide has no such UI, so it must apply the move to `gs.inventory` itself or the
+    /// `/inventory` view goes stale (and a later move computed against the stale view corrupts it).
+    /// If `to` is occupied the two items swap slots (matches EQEmu SwapItem); moving from an empty
+    /// slot is a no-op. `from`/`to` are RoF2 wire slots, the same space `gs.inventory` is keyed on.
+    pub fn move_item(&mut self, from: i32, to: i32) {
+        if from == to { return; }
+        let Some(from_idx) = self.inventory.iter().position(|i| i.slot == from) else { return; };
+        if let Some(to_idx) = self.inventory.iter().position(|i| i.slot == to) {
+            self.inventory[to_idx].slot = from; // occupied destination → swap
+        }
+        self.inventory[from_idx].slot = to;
+    }
+
+    /// Drop any items still sitting in the NPC trade slots (RoF2 3000-3007). On a quest turn-in the
+    /// server takes the handed-in items via `m_inv.PopItem` (zone/trading.cpp) with no client
+    /// packet, so once the trade completes the client must clear its own trade slots. Items the NPC
+    /// returns (or rewards) come back separately as OP_ItemPacket on the cursor.
+    pub fn clear_trade_slots(&mut self) {
+        self.inventory.retain(|i| !(3000..=3007).contains(&i.slot));
+    }
+
     pub fn remove_entity(&mut self, spawn_id: u32) {
         self.entities.remove(&spawn_id);
         if self.target_id == Some(spawn_id) {
@@ -450,6 +474,42 @@ mod tests {
         // Spend everything (84037 copper)
         assert!(gs.spend_coin(84_037));
         assert_eq!(gs.coin, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn move_item_relocates_swaps_and_guards() {
+        use super::InvItem;
+        let mut gs = GameState::new();
+        let mk = |slot: i32, id: u32| InvItem { slot, item_id: id, ..Default::default() };
+        gs.inventory = vec![mk(24, 100), mk(17, 200)]; // bag slot 24 + worn chest 17
+
+        // Move into an EMPTY slot relocates the item.
+        gs.move_item(24, 30); // bag -> cursor (empty)
+        assert_eq!(gs.inventory.iter().find(|i| i.item_id == 100).unwrap().slot, 30);
+        assert!(gs.inventory.iter().all(|i| i.slot != 24), "source slot now empty");
+
+        // Move into an OCCUPIED slot swaps the two items (EQEmu SwapItem semantics).
+        gs.move_item(30, 17); // cursor item -> worn chest (occupied by id 200)
+        assert_eq!(gs.inventory.iter().find(|i| i.item_id == 100).unwrap().slot, 17);
+        assert_eq!(gs.inventory.iter().find(|i| i.item_id == 200).unwrap().slot, 30);
+        assert_eq!(gs.inventory.len(), 2, "swap must not create or drop items");
+
+        // Move FROM an empty slot is a no-op.
+        gs.move_item(99, 23);
+        assert_eq!(gs.inventory.len(), 2);
+        assert!(gs.inventory.iter().all(|i| i.slot != 23));
+    }
+
+    #[test]
+    fn clear_trade_slots_removes_handed_in_items() {
+        use super::InvItem;
+        let mut gs = GameState::new();
+        let mk = |slot: i32, id: u32| InvItem { slot, item_id: id, ..Default::default() };
+        // Two items sitting in NPC trade slots (handed in) + one normal bag item.
+        gs.inventory = vec![mk(3000, 100), mk(3001, 101), mk(24, 200)];
+        gs.clear_trade_slots();
+        assert_eq!(gs.inventory.len(), 1, "both trade-slot items consumed");
+        assert_eq!(gs.inventory[0].slot, 24, "non-trade item untouched");
     }
 
     #[test]
