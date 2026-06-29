@@ -51,6 +51,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_DAMAGE               => apply_combat_damage(gs, p),
         OP_BECOME_CORPSE        => apply_become_corpse(gs, p),
         OP_MONEY_ON_CORPSE      => apply_money_on_corpse(gs, p),
+        OP_MONEY_UPDATE         => apply_money_update(gs, p),
         OP_WEAR_CHANGE          => apply_wear_change(gs, p),
         OP_TASK_DESCRIPTION     => apply_task_description(gs, p),
         OP_TASK_ACTIVITY        => apply_task_activity(gs, p),
@@ -497,16 +498,25 @@ pub fn parse_player_profile(payload: &[u8]) -> Option<ProfileInfo> {
         u32_at(952), u32_at(956), u32_at(960), u32_at(964),
         u32_at(968), u32_at(972), u32_at(976),
     ];
-    // mem_spells[0..9]: first 9 of the 16 spell gem slots at @9384
-    // (rof2_structs.h /*09384*/ int32 mem_spells[SPELL_GEM_COUNT=16])
-    let mem_spells = if payload.len() >= 9384 + 9 * 4 {
+    // NOTE on offsets past @952: RoF2 *streams* OP_PlayerProfile (rof2.cpp
+    // ENCODE(OP_PlayerProfile)), so the rof2_structs.h struct offsets are only
+    // valid up to `disciplines`. ENCODE writes structs::MAX_PP_DISCIPLINES = 300
+    // disciplines, but the struct reserves only 200 (/*05124*/ disciplines, 800B),
+    // a 100-entry / +400-byte undercount. Every field after disciplines therefore
+    // sits 400 bytes later on the wire than its struct comment claims.
+    // (Stats @952 and earlier are *before* disciplines, so they stay correct.)
+
+    // mem_spells[0..9]: first 9 of the 16 spell gem slots.
+    // rof2_structs.h /*09384*/ + 400 = @9784.
+    let mem_spells = if payload.len() >= 9784 + 9 * 4 {
         let mut m = [0xFFFF_FFFFu32; 9];
-        for (i, slot) in m.iter_mut().enumerate() { *slot = u32_at(9384 + i * 4); }
+        for (i, slot) in m.iter_mut().enumerate() { *slot = u32_at(9784 + i * 4); }
         m
     } else { [0xFFFF_FFFFu32; 9] };
-    // coin at @12869 (rof2_structs.h /*12869*/ uint32 platinum)
-    let coin = if payload.len() >= 12885 {
-        [u32_at(12869), u32_at(12873), u32_at(12877), u32_at(12881)]
+    // coin: rof2_structs.h /*12869*/ platinum + 400 = @13269 (gold 13273, silver
+    // 13277, copper 13281). Reading @12869 landed in the buff array → garbage coin.
+    let coin = if payload.len() >= 13285 {
+        [u32_at(13269), u32_at(13273), u32_at(13277), u32_at(13281)]
     } else { [0u32; 4] };
     Some(ProfileInfo { level, class_id, stats, coin, mem_spells })
 }
@@ -1044,6 +1054,13 @@ fn apply_money_on_corpse(gs: &mut GameState, payload: &[u8]) {
     let copper   = u32::from_le_bytes([payload[16], payload[17], payload[18], payload[19]]);
     gs.loot_last_activity = Some(std::time::Instant::now());
     if platinum > 0 || gold > 0 || silver > 0 || copper > 0 {
+        // Add the looted coins to the on-hand total for the HUD. Corpse loot calls the server's
+        // AddMoneyToPP with update_client=false (verified in EQEmu), so it does NOT also send an
+        // OP_MoneyUpdate — this is the only coin notification for loot, so we must add here.
+        gs.coin[0] = gs.coin[0].saturating_add(platinum);
+        gs.coin[1] = gs.coin[1].saturating_add(gold);
+        gs.coin[2] = gs.coin[2].saturating_add(silver);
+        gs.coin[3] = gs.coin[3].saturating_add(copper);
         let mut parts = Vec::new();
         if platinum > 0 { parts.push(format!("{}pp", platinum)); }
         if gold     > 0 { parts.push(format!("{}gp", gold)); }
@@ -1054,6 +1071,19 @@ fn apply_money_on_corpse(gs: &mut GameState, payload: &[u8]) {
     } else {
         tracing::info!("EQ: no coins on corpse");
     }
+}
+
+/// OP_MoneyUpdate — the server's authoritative NEW coin total after a change that it tracks
+/// server-side (trade completion, quest reward, trader sell, etc.). Without handling this the HUD
+/// coin stayed stuck at the login-profile value. (Loot uses OP_MoneyOnCorpse; merchant *buys* are
+/// deducted client-side — see the /buy path — because the server takes the money with
+/// update_client=false and sends nothing.)
+fn apply_money_update(gs: &mut GameState, payload: &[u8]) {
+    // MoneyUpdate_Struct (16 bytes): platinum/gold/silver/copper as int32.
+    if payload.len() < 16 { return; }
+    let rd = |o: usize| i32::from_le_bytes([payload[o], payload[o + 1], payload[o + 2], payload[o + 3]]).max(0) as u32;
+    gs.coin = [rd(0), rd(4), rd(8), rd(12)];
+    tracing::info!("EQ: money update -> {}p {}g {}s {}c", gs.coin[0], gs.coin[1], gs.coin[2], gs.coin[3]);
 }
 
 // ── Shared spawn registration ─────────────────────────────────────────────────
@@ -1114,8 +1144,31 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
 #[cfg(test)]
 mod tests {
     use super::{apply_emote, class_name, con_color, consider_message, parse_player_profile,
-                parse_begin_cast, parse_memorize_spell, apply_char_inventory};
+                parse_begin_cast, parse_memorize_spell, apply_char_inventory,
+                apply_money_update, apply_money_on_corpse};
     use crate::game_state::GameState;
+
+    #[test]
+    fn money_update_sets_coin_total() {
+        let mut gs = GameState::new();
+        gs.coin = [1, 2, 3, 4];
+        // MoneyUpdate_Struct: platinum=84 gold=9 silver=13 copper=8 (i32 LE)
+        let mut p = Vec::new();
+        for v in [84i32, 9, 13, 8] { p.extend_from_slice(&v.to_le_bytes()); }
+        apply_money_update(&mut gs, &p);
+        assert_eq!(gs.coin, [84, 9, 13, 8]);
+    }
+
+    #[test]
+    fn money_on_corpse_adds_looted_coin() {
+        let mut gs = GameState::new();
+        gs.coin = [10, 0, 5, 0];
+        // MoneyOnCorpse_Struct: response(0)+3pad + platinum=2 gold=1 silver=0 copper=3 (u32 LE)
+        let mut p = vec![0u8; 4];
+        for v in [2u32, 1, 0, 3] { p.extend_from_slice(&v.to_le_bytes()); }
+        apply_money_on_corpse(&mut gs, &p);
+        assert_eq!(gs.coin, [12, 1, 5, 3]); // added on top of existing
+    }
     use crate::eq_net::item::tests::{fixture, fixture2};
 
     #[test]
@@ -1133,24 +1186,26 @@ mod tests {
         assert!(parse_player_profile(&[0u8; 100]).is_none());
         assert!(parse_player_profile(&[0u8; 979]).is_none());
 
-        // RoF2 PlayerProfile wire offsets (from rof2.cpp ENCODE(OP_PlayerProfile)):
+        // RoF2 PlayerProfile wire offsets. The stream (rof2.cpp ENCODE) writes 300
+        // disciplines vs the 200 the struct reserves, so fields after disciplines are
+        // +400 bytes vs their rof2_structs.h comment:
         //   @21: class_, @22: level
-        //   @952: STR, @976: WIS
-        //   @9384: mem_spells[0..9]
-        //   @12869: platinum, @12873: gold, @12877: silver, @12881: copper
+        //   @952: STR, @976: WIS  (before disciplines → struct offset is correct)
+        //   @9784: mem_spells[0..9]      (struct /*09384*/ + 400)
+        //   @13269: platinum .. @13281: copper  (struct /*12869*/ + 400)
         let mut buf = vec![0u8; 14000];
         buf[21] = 9;   // class_ = Rogue
         buf[22] = 12;  // level
         buf[952..956].copy_from_slice(&75u32.to_le_bytes());    // STR
         buf[976..980].copy_from_slice(&110u32.to_le_bytes());   // WIS
-        // mem_spells[0] @9384 = 200 (Minor Healing), mem_spells[1] @9388 = 0xFFFFFFFF (empty)
-        buf[9384..9388].copy_from_slice(&200u32.to_le_bytes());
-        buf[9388..9392].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-        // platinum/gold/silver/copper @12869..12885
-        buf[12869..12873].copy_from_slice(&5u32.to_le_bytes());  // platinum
-        buf[12873..12877].copy_from_slice(&3u32.to_le_bytes());  // gold
-        buf[12877..12881].copy_from_slice(&7u32.to_le_bytes());  // silver
-        buf[12881..12885].copy_from_slice(&9u32.to_le_bytes());  // copper
+        // mem_spells[0] @9784 = 200 (Minor Healing), mem_spells[1] @9788 = 0xFFFFFFFF (empty)
+        buf[9784..9788].copy_from_slice(&200u32.to_le_bytes());
+        buf[9788..9792].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        // platinum/gold/silver/copper @13269..13285
+        buf[13269..13273].copy_from_slice(&5u32.to_le_bytes());  // platinum
+        buf[13273..13277].copy_from_slice(&3u32.to_le_bytes());  // gold
+        buf[13277..13281].copy_from_slice(&7u32.to_le_bytes());  // silver
+        buf[13281..13285].copy_from_slice(&9u32.to_le_bytes());  // copper
         let p = parse_player_profile(&buf).unwrap();
         assert_eq!(p.level, 12);
         assert_eq!(p.class_id, 9);
