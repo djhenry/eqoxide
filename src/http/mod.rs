@@ -23,6 +23,7 @@ mod interact;
 mod merchant;
 mod inventory;
 mod chat;
+mod events;
 mod camera;
 mod lifecycle;
 
@@ -144,22 +145,24 @@ pub struct MessageEntry {
 /// GET /v1/observe/messages. Exposes NPC dialogue (kind "npc") as machine-readable text + keywords.
 pub type MessagesShared = Arc<Mutex<Vec<MessageEntry>>>;
 
-/// One inter-agent chat event exposed by GET /v1/chat/events (tell/ooc/shout/group/gmsay/zone).
-/// `id` is a monotonic cursor; `directed` = addressed specifically to us (a /tell to our name, a GM
-/// message, or a zone change). Agents poll `/v1/chat/events?since=<id>` (optionally long-poll with
-/// `wait=`) to be notified.
+/// One async game event exposed by the `GET /v1/events/*` feed. `category` is the top-level bucket
+/// the events API filters on (chat/combat/navigate/system); `kind` is the sub-type
+/// (tell/ooc/shout/group/gmsay/zone/slain/attacked/…). `id` is a 1-based monotonic cursor;
+/// `directed` = concerns us specifically (a /tell to our name, a GM message, a zone change, our own
+/// death). Agents poll `/v1/events/{all,<category>}?since=<id>` (optionally long-poll with `wait=`).
 #[derive(Clone, serde::Serialize)]
-pub struct ChatEvent {
+pub struct Event {
     pub id:       u64,
+    pub category: String,
+    pub kind:     String,
     pub from:     String,
-    pub channel:  String,
     pub directed: bool,
     pub text:     String,
 }
 
-/// Live snapshot of inter-agent chat events, published each tick by the nav thread, read by
-/// GET /v1/chat/events. Ordered by ascending `id`.
-pub type ChatEventsShared = Arc<Mutex<Vec<ChatEvent>>>;
+/// Live snapshot of async events, published each tick by the nav thread, read by the
+/// `GET /v1/events/*` endpoints. Ordered by ascending `id`.
+pub type ChatEventsShared = Arc<Mutex<Vec<Event>>>;
 
 /// One queued outgoing chat message, set by POST /v1/chat/{tell,ooc,shout,group} and drained by the
 /// nav thread, which builds + sends the `OP_ChannelMessage`. `to` is the recipient for /tell (chan
@@ -342,6 +345,7 @@ pub fn spawn_camera_server(
                 .nest("/v1/merchant",  merchant::router())
                 .nest("/v1/inventory", inventory::router())
                 .nest("/v1/chat",      chat::router())
+                .nest("/v1/events",    events::router())
                 .nest("/v1/camera",    camera::router())
                 .nest("/v1/lifecycle", lifecycle::router())
                 .with_state(state);

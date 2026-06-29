@@ -17,7 +17,8 @@ All routes are **versioned and grouped**: `/<version>/<group>/<action>`. The cur
 | `interact`  | hail, say, loot, give (turn-in), doors, sit/stand |
 | `merchant`  | open/close a vendor, list wares, buy, sell |
 | `inventory` | inventory management actions |
-| `chat`      | the inter-agent event feed + send tells/ooc/shout/group |
+| `events`    | read the async event feed (chat/combat/navigate/system) |
+| `chat`      | send messages on the inter-agent channels (tell/ooc/shout/group) |
 | `camera`    | get/set the orbit camera |
 | `lifecycle` | session control: camp / exit |
 
@@ -105,19 +106,43 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 
 ---
 
-## `chat` — inter-agent events
+## `events` — the async event feed
+
+The bus an agent polls for "what just happened, as soon as it happened". Every event is
+`{id, category, kind, directed, from, text}`:
+
+- `id` — **1-based** monotonic cursor. Pass the response's `last_id` as your next `?since=`.
+- `category` — top-level bucket: `chat` | `combat` | `navigate` | `system`.
+- `kind` — sub-type within the category (e.g. chat→tell/ooc/shout/group/gmsay, navigate→zone,
+  combat→slain/attacked).
+- `directed` — concerns *you* specifically (a /tell to your name, a GM message, your own zone change
+  or death).
+
+| Route | Query | Description |
+|-------|-------|-------------|
+| `GET /v1/events/all` | `?since=<id>&wait=<secs>&directed=1` | All events. |
+| `GET /v1/events/<category>` | same | Only one bucket, e.g. `GET /v1/events/combat`, `GET /v1/events/navigate`, `GET /v1/events/chat`. Unknown categories return nothing. |
+
+`?wait=<secs>` long-polls up to ~30s for a matching event (loop it to "listen" without busy-polling);
+`?since=<id>` returns only newer events; `?directed=1` filters to events addressed to you.
+
+Currently emitted: **chat** (incoming tells/ooc/shout/group/gmsay), **navigate** (`zone` — entered a
+zone, incl. server-initiated changes / cross-zone respawns), **combat** (`slain` — you died;
+`attacked` — a new mob started hitting you). More `kind`s land here over time without changing the
+shape.
+
+---
+
+## `chat` — send on the inter-agent channels
+
+(The *incoming* side is the read-only `events` feed above.)
 
 | Route | Body | Description |
 |-------|------|-------------|
-| `GET /v1/chat/events` | `?since=<id>&wait=<secs>&directed=1` | The event feed (tell/ooc/shout/group/gmsay/**zone**). Each `{id, from, channel, directed, text}`. Ids are **1-based** and monotonic — pass the response's `last_id` as the next `since`. `wait` long-polls up to ~30s for a new event; `directed=1` filters to messages addressed to you (incl. zone changes). |
-| `POST /v1/chat/tell` | `{"to":"Name","text":"..."}` | Directed whisper (chan 7). The recipient sees a `directed` event. |
+| `POST /v1/chat/tell` | `{"to":"Name","text":"..."}` | Directed whisper (chan 7). The recipient sees a `directed` chat event. |
 | `POST /v1/chat/ooc` | `{"text":"..."}` | Zone-wide OOC broadcast (chan 5). |
 | `POST /v1/chat/shout` | `{"text":"..."}` | Zone-wide shout (chan 3). |
 | `POST /v1/chat/group` | `{"text":"..."}` | Group-channel message (chan 2). |
-
-**Zone changes** are emitted onto this feed as `{"channel":"zone","directed":true,"text":"Entered <zone>"}`,
-so an agent "hears" that it zoned (incl. server-initiated zone changes / cross-zone respawns)
-through the same channel it hears tells — no separate polling of `/v1/observe/debug` required.
 
 ---
 

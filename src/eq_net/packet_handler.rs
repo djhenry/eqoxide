@@ -421,10 +421,10 @@ fn apply_new_zone(gs: &mut GameState, payload: &[u8]) {
     gs.zone_changed = true;
     let entered = format!("Entered {}", gs.zone_name);
     gs.log_msg("zone", &entered);
-    // Also surface zone changes on the inter-agent event feed (GET /v1/chat/events) so an agent
-    // driving the client hears "I just zoned" through the same channel as tells/OOC — including
-    // server-initiated zone changes and cross-zone respawns. `directed` so it isn't filtered as noise.
-    gs.push_chat_event("system", "zone", true, &entered);
+    // Surface zone changes on the async event feed (GET /v1/events/navigate or /all) so an agent
+    // driving the client hears "I just zoned" as soon as it happens — including server-initiated
+    // zone changes and cross-zone respawns. `directed` since it concerns us.
+    gs.push_event("navigate", "zone", "system", true, &entered);
 }
 
 fn apply_zone_spawns(gs: &mut GameState, payload: &[u8]) {
@@ -670,6 +670,8 @@ fn apply_death(gs: &mut GameState, payload: &[u8]) {
         gs.strategy  = "Dead — waiting to respawn".into();
         tracing::info!("EQ: combat: *** You have been slain! ***");
         gs.log_msg("combat", "*** You have been slain! ***");
+        // Async combat event so an agent learns of its own death immediately (GET /v1/events/combat).
+        gs.push_event("combat", "slain", "", true, "*** You have been slain! ***");
     } else {
         let name = gs.entities.get(&d_id).map(|e| e.name.clone());
         if let Some(name) = name {
@@ -724,6 +726,12 @@ fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
     // Remember who is swinging at us (hit OR miss) so auto-combat can engage an add that aggros
     // mid-fight instead of tanking it unanswered. Only NPC attackers on the player count.
     if target_id == gs.player_id && source_id != gs.player_id && gs.entities.contains_key(&source_id) {
+        // Emit an async "attacked" event only when a NEW mob starts hitting us (not already a recent
+        // attacker), so an agent is notified once when something aggros — not on every swing.
+        if !gs.recent_attackers.contains_key(&source_id) {
+            gs.push_event("combat", "attacked", &source_name, true,
+                &format!("{source_name} is attacking you"));
+        }
         gs.recent_attackers.insert(source_id, std::time::Instant::now());
     }
 }
@@ -789,7 +797,7 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
             // `directed` = addressed specifically to us: a /tell to our name, or any GM message.
             let directed = (ch == "tell" && targetname.eq_ignore_ascii_case(&gs.player_name))
                         || ch == "gmsay";
-            gs.push_chat_event(&sender, ch, directed, &msg);
+            gs.push_event("chat", ch, &sender, directed, &msg);
         }
     }
 
@@ -1361,7 +1369,8 @@ mod tests {
         gs.player_name = "Mordeth".to_string();
         super::apply_channel_message(&mut gs, &make_tell("Garrik", "Mordeth", "you stuck?"));
         let e = gs.chat_events.back().expect("a chat event");
-        assert_eq!(e.channel, "tell");
+        assert_eq!(e.category, "chat");
+        assert_eq!(e.kind, "tell");
         assert_eq!(e.from, "Garrik");
         assert!(e.directed, "a tell addressed to us is directed");
         assert_eq!(e.text, "you stuck?");
@@ -1373,7 +1382,8 @@ mod tests {
         gs.player_name = "Mordeth".to_string();
         super::apply_channel_message(&mut gs, &make_tell("Garrik", "Katie", "hi"));
         let e = gs.chat_events.back().expect("a chat event");
-        assert_eq!(e.channel, "tell");
+        assert_eq!(e.category, "chat");
+        assert_eq!(e.kind, "tell");
         assert!(!e.directed, "a tell to someone else is not directed at us");
     }
 
@@ -1383,7 +1393,8 @@ mod tests {
         gs.player_name = "Mordeth".to_string();
         super::apply_channel_message(&mut gs, &make_chan_payload("Garrik", 5, "any GM around?"));
         let e = gs.chat_events.back().expect("a chat event");
-        assert_eq!(e.channel, "ooc");
+        assert_eq!(e.category, "chat");
+        assert_eq!(e.kind, "ooc");
         assert!(!e.directed);
     }
 
