@@ -33,7 +33,7 @@ hud.rs renders dialogue panel / tinted nameplate
 **Trigger**: `HailReq = Arc<Mutex<Option<String>>>` — set to the NPC's display name.
 
 **How to invoke**:
-- HTTP: `POST /hail {"name": "Guard Phaeton"}` or `{}` for nearest
+- HTTP: `POST /v1/interact/hail {"name": "Guard Phaeton"}` or `{}` for nearest
 - HUD: "Hail \<name\>" button in the control bar
 
 **What happens**:
@@ -51,7 +51,7 @@ hud.rs renders dialogue panel / tinted nameplate
 **Trigger**: `SayReq = Arc<Mutex<Option<String>>>` — set to the text to say.
 
 **How to invoke**:
-- HTTP: `POST /say {"text": "shipment"}`
+- HTTP: `POST /v1/interact/say {"text": "shipment"}`
 - HUD: type in the Say box and press Enter or "Send"
 - HUD: click a `[keyword]` in the NPC Dialogue panel (auto-strips brackets)
 
@@ -64,10 +64,10 @@ hud.rs renders dialogue panel / tinted nameplate
 **Trigger**: `TargetReq = Arc<Mutex<Option<u32>>>` — set to the spawn_id.
 
 **How to invoke**:
-- HTTP: `POST /target {"id": 1234}`
+- HTTP: `POST /v1/combat/target {"id": 1234}`
 - HUD: "Target nearest" button
 
-Also `POST /target/name {"name": "..."}` resolves a fuzzy name → spawn_id first.
+Also `POST /v1/combat/target/name {"name": "..."}` resolves a fuzzy name → spawn_id first.
 
 **What happens**:
 1. `Navigator::tick()` takes the spawn_id

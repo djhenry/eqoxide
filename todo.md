@@ -42,8 +42,8 @@ See docs/eq-technical-knowledgebase/falling-physics.md.
 
 Parse OP_SpawnDoor on zone-in; render with real models (from `_obj.s3d`) + fallback box.
 Animate open/close via OP_MoveDoor (server-authoritative, no client-side toggle). Portal doors
-(opentype 57/58) zone the player on open. Click via 3D picker or HTTP API (`GET /doors`,
-`POST /doors/click {door_id:N}` or `{name:"DOOR1"}`). Verified live: doors render (untextured),
+(opentype 57/58) zone the player on open. Click via 3D picker or HTTP API (`GET /v1/observe/doors`,
+`POST /v1/interact/click_door {door_id:N}` or `{name:"DOOR1"}`). Verified live: doors render (untextured),
 click opens (server replies), portal doors trigger zoning. Notes: `docs/http-api.md`, `docs/eq-technical-knowledgebase/doors.md`.
 
 **Follow-ups (not blocking):**
@@ -61,17 +61,17 @@ Plan: `docs/superpowers/plans/2026-06-23-action-grid-spellcasting.md`
 HUD action grid (bottom-center): auto-attack TOGGLE, sit/stand toggle, target/consider, and
 the 9 memorized spell gems with real TGA icons + a cast bar. Real spell casting over the wire
 (`OP_CastSpell`) with `OP_BeginCast`/`OP_ManaChange`/`OP_MemorizeSpell`/`OP_InterruptCast`
-feedback. HTTP APIs mirror every action: `GET /spells`, `POST /cast`, `POST /sit`,
-`POST /stand`, `POST /consider` (+ existing `/attack` toggle). Profile parsing reads
+feedback. HTTP APIs mirror every action: `GET /v1/observe/spells`, `POST /v1/combat/cast`, `POST /v1/interact/sit`,
+`POST /v1/interact/stand`, `POST /v1/combat/consider` (+ existing `/v1/combat/attack` toggle). Profile parsing reads
 `mem_spells[9]` @4360; `spells_us.txt` → gem names/icons. **Verified live** with a test Cleric
-("Clrtest", Human Cleric L1, acct `REDACTED`/`REDACTED`, `config-cleric.yaml`): `/spells` lists
-the 5 memmed gems, `/cast {gem:0}` fires `OP_CastSpell` (Minor Healing), sit/stand + attack
-toggle all confirmed via nav log + `/frame` (gem icons render).
+("Clrtest", Human Cleric L1, acct `REDACTED`/`REDACTED`, `config-cleric.yaml`): `/v1/observe/spells` lists
+the 5 memmed gems, `/v1/combat/cast {gem:0}` fires `OP_CastSpell` (Minor Healing), sit/stand + attack
+toggle all confirmed via nav log + `/v1/observe/frame` (gem icons render).
 
 Follow-ups (not blocking):
 - **Mana % shows 0** — `apply_mana_change` is a no-op; `mana_pct` isn't populated for the
   player. Wire mana% (needs max-mana from profile) so the HUD mana bar + cast gating work.
-- **No `POST /target` "nearest"** — HTTP `/target` needs an explicit `{id}`; the HUD Target
+- **No `POST /v1/combat/target` "nearest"** — HTTP `/v1/combat/target` needs an explicit `{id}`; the HUD Target
   button uses nearest-NPC. Consider a `/target/nearest` convenience for agents.
 - Spell **icon grid geometry** is `ICON_COLS/ROWS = 6` in `src/spells.rs` — looked correct
   live; revisit if any icon looks sliced.
@@ -104,7 +104,7 @@ Key facts for any agent picking this up:
 - [x] POSITIONING FIX (load/render approach) — DONE (4150e7e). bind_pose()=real rest skinning;
       converter root-offset reverted; recenter from measured posed bounds every frame.
       Verified by `humanoid_player_transform_grounds_and_centers` test (feet grounded, centered, h=12)
-      + /frame visual. NORMALIZATION IS NOW LOAD/RENDER-TIME, not conversion-time.
+      + /v1/observe/frame visual. NORMALIZATION IS NOW LOAD/RENDER-TIME, not conversion-time.
 - [x] BOB FIX — DONE (cd11634): constant bind-pose grounding (no walk bob).
 - [x] T5 Plumb gender — DONE (0ca5570): Billboard.gender, Scene/GameState.player_gender.
 - [x] T6 Gender-keyed model storage + model_for(archetype,gender) selection — DONE (02f70ea).
@@ -116,7 +116,7 @@ Key facts for any agent picking this up:
 ## OVERNIGHT LOOP ACTIVE (player position offset) — CORE FIX DONE (a5b75db)
 Player position offset FIXED: per-clip posed bounds (center+feet) drive recenter+grounding
 from the current animation clip (bind pose differed from the live idle pose). Verified via
-test `humanoid_idle_pose_grounds_and_centers` + /frame (player now in the doorway).
+test `humanoid_idle_pose_grounds_and_centers` + /v1/observe/frame (player now in the doorway).
 Loop continues to verify NPCs/walking/female-elf-dwarf placement + tune monster heights.
 Notes: `.superpowers/sdd/overnight-notes.md`.
 
@@ -124,7 +124,7 @@ UPDATE: positioning fix verified to GENERALIZE to all 6 gendered models (humanoi
 M+F) via `gendered_models_idle_ground_and_center` (all ground+center, correct prefixes).
 Tests added for all fixes (equip_swap_key/material-0, bind_pose, race-model, slot-cap,
 clip_bounds, idle placement). Loop now LONG-cadence: live client was disconnected
-(zone empty, 0 entities) so /frame NPC verification + monster-height visual tuning are
+(zone empty, 0 entities) so /v1/observe/frame NPC verification + monster-height visual tuning are
 PENDING the client reconnecting or the user. Core work is done + committed + tested.
 
 ## OVERNIGHT LOOP CONCLUDED (objective complete)
@@ -140,7 +140,7 @@ NPCs appear in water (likely symptom of missing buildings). Fix path found (libe
 ZONE BUG SOLVED (57a5274 + docs): objects placed via ActorInstance placements (qeynos 476/477,
 qeynos2 478/481); buildings render, NPCs among them (numeric: city NPCs at correct coords z~3.8,
 only aquatic creatures underwater). All 3 symptoms (0,0,0 pile / NPCs in water / qeynos2 offset)
-resolved + verified via /frame + /entities. Docs: docs/zone-rendering.md. Minor follow-ups:
+resolved + verified via /v1/observe/frame + /v1/observe/entities. Docs: docs/zone-rendering.md. Minor follow-ups:
 few unmatched placements; eyeball object rotation. Notes: `.superpowers/sdd/zone-coords-notes.md`.
 buildings appear + NPCs among them. NEXT: confirm NPCs-in-water resolved vs maps; fix qeynos2
 (North) terrain offset (lands outside playable area). Plan/findings: `.superpowers/sdd/zone-coords-notes.md`.
@@ -217,12 +217,12 @@ index by scanning all gequip*.s3d once at startup.
 
 ## AUTONOMOUS LOOP (in progress)
 Directive: fix the discussed bugs; when out, play via HTTP API across zones to find+fix problems.
-Verify everything via /frame from MULTIPLE angles. Commit each fix. Pace conservatively (can't
+Verify everything via /v1/observe/frame from MULTIPLE angles. Commit each fix. Pace conservatively (can't
 check credit balance; long session) — stop if credits look low.
 Done this loop: mirror (5506701).
 Queue (tractable first):
 - [ ] Mirror control follow-up: negate mouse-look-X (apply_orbit_delta daz) + A/D turn/strafe so
-      manual controls match the un-mirrored display. NEEDS interactive test (can't verify via /frame).
+      manual controls match the un-mirrored display. NEEDS interactive test (can't verify via /v1/observe/frame).
 - [x] Monster sizing FIXED (7f619d1): scale by idle-pose extent, not eq_height/bind extent.
       rat was already fine; bat/snake/wolf/gnoll were mis-sized. Humanoid 10.3→12 (intended) —
       user: confirm player height still looks right vs doorways.
@@ -256,18 +256,18 @@ Account (non-GM): login user `claude` / pass `REDACTED` (login_accounts password
 of the pw so the loginserver's mode-fallback verify accepts it — mode-14 SCrypt verify is broken
 without ENABLE_SECURITY). World account id=3 status=0. Config: per-character login config (~/.config/eqoxide/).
 Character: **Claude** = Female Wood Elf Ranger (race 4, class 4, gender 1), char id 2, in qeynos
-(zone 1) — chosen non-male-human-warrior; female-elf model renders correctly (verified /frame).
+(zone 1) — chosen non-male-human-warrior; female-elf model renders correctly (verified /v1/observe/frame).
 Restart client after config/DB changes via: `touch src/main.rs && cargo build --release` (dev-run.sh
-respawns). HP is NOT in /debug — judge survival via /frame HUD + combat log.
+respawns). HP is NOT in /v1/observe/debug — judge survival via /v1/observe/frame HUD + combat log.
 
-Play tools (HTTP :8765): /warp {x,y,z} (teleport), /goto {x,y,z} (walk+face), /target/name {name},
-/attack (POST on / DELETE off), /say (#cmds are GM-only — Claude can't #zone), /zone_points,
-/zone_cross, /hail, /frame, /entities, /debug.
+Play tools (HTTP :8765): /v1/navigate/warp {x,y,z} (teleport), /v1/navigate/goto {x,y,z} (walk+face), /v1/combat/target/name {name},
+/v1/combat/attack (POST on / DELETE off), /v1/interact/say (#cmds are GM-only — Claude can't #zone), /v1/observe/zone_points,
+/v1/navigate/zone_cross, /v1/interact/hail, /v1/observe/frame, /v1/observe/entities, /v1/observe/debug.
 
 Goals: win a fight, buy equipment, travel between zones, level up. Fix bugs found. Verify visually.
 
 Progress/findings:
-- Combat engages after /goto (need range + facing; warp alone didn't face the target).
+- Combat engages after /v1/navigate/goto (need range + facing; warp alone didn't face the target).
 - Claude DIED to a_rodent013: naked level-1, low HP, dealt NO damage back (no weapon — DB chars skip
   the newbie starting gear normal char-create grants). NEXT: give Claude legit newbie gear (a weapon
   in worn slot 13 + basic armor via `inventory` table) so she can deal damage and survive, then win.
@@ -286,12 +286,12 @@ the client runs, AND dev-run.sh auto-relaunches a killed client — so to set po
 This reset Claude to (0,10), corrections=0, movement restored.
 
 BLOCKERS for autonomous combat (NEXT — fix these):
-- /warp is anti-cheat capped (~50-95u/hop, sometimes rubber-banded); works in small hops from a
+- /v1/navigate/warp is anti-cheat capped (~50-95u/hop, sometimes rubber-banded); works in small hops from a
   clean state.
-- /goto (nav walk) is unreliable — frequently does NOT move the player (nav/collision grid not
+- /v1/navigate/goto (nav walk) is unreliable — frequently does NOT move the player (nav/collision grid not
   ready or no path). Investigate the nav thread + collision grid readiness.
-- **FACING**: after a /warp Claude faces north; auto-attack only swings when facing the target.
-  Combat engaged ONLY when /goto walked her into the mob (which set heading). There is no /face
+- **FACING**: after a /v1/navigate/warp Claude faces north; auto-attack only swings when facing the target.
+  Combat engaged ONLY when /v1/navigate/goto walked her into the mob (which set heading). There is no /face
   endpoint. FIX (highest value): auto-face the current target while auto-attack is ON (set the
   player heading toward the target entity each frame in app.rs), OR add a /face endpoint. This
   unblocks ALL melee combat → then win a fight, level, etc. Claude is currently at ~(-77,-76)
@@ -300,14 +300,14 @@ BLOCKERS for autonomous combat (NEXT — fix these):
 ## Claude play loop — auto-face DONE; remaining blocker = warp desync
 - AUTO-FACE implemented + verified (commit above): while auto-attacking a target within ~15u,
   the nav faces it each tick. POS log confirms correct heading toward the mob.
-- BUT combat still doesn't complete because /warp DESYNCS the player: the server rubber-bands
+- BUT combat still doesn't complete because /v1/navigate/warp DESYNCS the player: the server rubber-bands
   the warped position (server_corrections climbs to 30+), so server-side Claude isn't actually
   next to the mob → no swings land. WARPING IS A DEAD END for real positioning.
 - FIX/approach for next iter: position via LEGIT WALK only. (1) clean-reset Claude to a synced
-  spot (corr=0) per the CLEAN-RESET PROCEDURE. (2) Use /goto (walk) to reach a mob — it sends
+  spot (corr=0) per the CLEAN-RESET PROCEDURE. (2) Use /v1/navigate/goto (walk) to reach a mob — it sends
   incremental updates the server accepts (the very first fight engaged this way). (3) Investigate
-  why /goto sometimes doesn't move (nav/collision-grid readiness, or it inherits a desynced
-  player_x/y) and make it reliable. Then /target + /attack → auto-face → win. Then level/travel.
+  why /v1/navigate/goto sometimes doesn't move (nav/collision-grid readiness, or it inherits a desynced
+  player_x/y) and make it reliable. Then /v1/combat/target + /v1/combat/attack → auto-face → win. Then level/travel.
 - Pre-existing POS: debug eprintln in send_position_update spams the log every tick — consider
   gating it.
 
@@ -320,7 +320,7 @@ FACING. IsFacingMob (zone/mob.cpp) needs |HeadingAngleToMob - GetHeading()| <= 8
 Suspect: the heading the client sends (eq_heading->ccw_to_cw->12bit in navigation.rs
 send_position_update) may not match EQEmu's HeadingAngleToMob convention, so server-side she isn't
 "facing" the mob. NEXT STEPS (next iter):
- 1. /frame during auto-engage to see if Claude VISUALLY faces the mob + whether the mob's HP bar
+ 1. /v1/observe/frame during auto-engage to see if Claude VISUALLY faces the mob + whether the mob's HP bar
     drops (need a mob within the 60u engage range — qeynos rodents are sparse/far + guards kill
     them; either bump auto-engage range, or clean-reset Claude INTO the rodent cluster, or pick a
     denser hunting spot).
@@ -366,7 +366,7 @@ level via kills, travel qeynos<->qeynos2 via zone lines, buy equipment (merchant
 
 ## ✅✅✅ WIN + LEVELING CONFIRMED — Claude is playing! (2026-06-20)
 Moved Claude to qcat (Qeynos Catacombs, zone 45) via clean-reset (escapes qeynos guard KOS;
-dense weak mobs; renders fine — verified /frame). Combat works (heading fix): log shows
+dense weak mobs; renders fine — verified /v1/observe/frame). Combat works (heading fix): log shows
 "Claude hits a_fish021 for 10 damage" -> "a_fish021 has been slain", repeatedly. She is level 1
 (the lvl-20 boost reset at some point — fine, better for leveling) and GAINING XP: exp 1 -> 179
 over a hunt batch. So: WIN A FIGHT = done; LEVEL UP = working (grinding qcat fish/rats/skeletons).
@@ -374,8 +374,8 @@ Setup: auto-engage range now 200u; bind+pos = qcat safe (80,860,-38) but she spa
 in a fish room which works great.
 REMAINING goals: (1) keep leveling (consider adding AUTO-RETARGET: when auto_attack on and target
 dead/none, target nearest attackable mob — enables hands-off grinding between loop iterations);
-(2) TRAVEL between zones via a zone line (qcat<->qeynos; /zone_points + /goto to the trigger +
-/zone_cross; #zone is GM-only); (3) BUY equipment from a merchant (add a merchant/shop HTTP
+(2) TRAVEL between zones via a zone line (qcat<->qeynos; /v1/observe/zone_points + /v1/navigate/goto to the trigger +
+/v1/navigate/zone_cross; #zone is GM-only); (3) BUY equipment from a merchant (add a merchant/shop HTTP
 endpoint: OP_ShopRequest + buy, or DB-add coin+items as a simpler stand-in).
 
 
@@ -383,9 +383,9 @@ endpoint: OP_ShopRequest + buy, or DB-add coin+items as a simpler stand-in).
 DONE: (1) win a fight ✅; (2) level up ✅ — auto-retarget (feat committed) + auto-engage now make
 Claude grind qcat hands-free (targets nearest a_/an_ trash mob, walks in, kills; XP persists on
 save — was 1->179). Auto-attack left ON so she levels between loop iterations.
-NEXT: (3) TRAVEL between zones via a real zone line (/zone_points to find a qcat exit -> /goto to
-the trigger -> /zone_cross; verify /debug zone changes). (4) BUY equipment: add a merchant/shop
-HTTP endpoint (OP_ShopRequest open + buy) or DB-give coin+item as a stand-in; verify via /frame
+NEXT: (3) TRAVEL between zones via a real zone line (/v1/observe/zone_points to find a qcat exit -> /v1/navigate/goto to
+the trigger -> /v1/navigate/zone_cross; verify /v1/observe/debug zone changes). (4) BUY equipment: add a merchant/shop
+HTTP endpoint (OP_ShopRequest open + buy) or DB-give coin+item as a stand-in; verify via /v1/observe/frame
 + inventory. Note: EQEmu persists exp/level to character_data only on save/restart, so the DB lags
 within a session — check level after a client restart. qcat has some lvl~10 mobs that can kill
 lvl-1 Claude; she respawns at the qcat bind (80,860,-38) and resumes — fine for autonomous grind.
@@ -393,12 +393,12 @@ lvl-1 Claude; she respawns at the qcat bind (80,860,-38) and resumes — fine fo
 ## Claude play loop — TRAVEL attempt (blocked) + status
 - 3/4 goals DONE: created non-GM Female Wood Elf Ranger ✅, win a fight ✅, level up ✅ (hands-free
   grind in qcat; exp climbed 1->179->535, persists on save). Auto-attack left ON to keep leveling.
-- TRAVEL (zone line) BLOCKED: POST /zone_cross {zone_id:N} got "OP_ZONE_CHANGE server response
+- TRAVEL (zone line) BLOCKED: POST /v1/navigate/zone_cross {zone_id:N} got "OP_ZONE_CHANGE server response
   success=1" but looped back to qcat. Root cause: the nav's zone_cross sets gs.player to the
-  /zone_points coords, which are ARRIVAL coords (OP_SEND_ZONE_POINTS = destination), NOT the qcat
+  /v1/observe/zone_points coords, which are ARRIVAL coords (OP_SEND_ZONE_POINTS = destination), NOT the qcat
   TRIGGER coords. The real triggers (EQEmu DB zone_points.x/y/z), e.g. qcat#1 (147,-175,-77)->qeynos,
   are behind walls Claude can't path to (no nav pathfinding; she stalls ~9-15u short). Auto-zone
-  needs walking INTO the trigger box. FIX OPTIONS: (a) make /zone_cross send OP_ZONE_CHANGE from the
+  needs walking INTO the trigger box. FIX OPTIONS: (a) make /v1/navigate/zone_cross send OP_ZONE_CHANGE from the
   player's CURRENT position when she's near a trigger (don't overwrite to arrival coords); +(b) add
   nav pathfinding/waypoints to reach a trigger; or (c) hunt/travel in zones with open, reachable
   zone lines. Note: clean-reset DB zone changes (qeynos<->qcat) DO move her between zones (a
@@ -412,11 +412,11 @@ Bug: send_zone_change_packet sent the CURRENT zone id as ZoneChange_Struct.zoneI
 (ZoneUnsolicited) treats it as the DESTINATION -> target==current -> request cancelled/looped.
 Fix (committed): pass the TARGET zone id; stop warping to arrival coords (server uses tracked
 position + a very generous zone-point range). VERIFIED live: qcat<->qeynos both ways
-(OP_ZONE_CHANGE success=1, "transition complete"). /zone_cross {"zone_id":N} now travels to zone N
+(OP_ZONE_CHANGE success=1, "transition complete"). /v1/navigate/zone_cross {"zone_id":N} now travels to zone N
 for any zone reachable from the current one (qeynos reaches zone_ids 2,45).
 So the 4 play goals: win ✅, level ✅ (hands-free), travel ✅. Remaining: BUY (merchant endpoint).
 NOTE: the auto-walk-into-a-zone-line detection (proximity in navigation.rs) still uses the client's
-zone_points which are ARRIVAL coords, not trigger coords, so it rarely fires; API /zone_cross is the
+zone_points which are ARRIVAL coords, not trigger coords, so it rarely fires; API /v1/navigate/zone_cross is the
 working travel path. Proper walk-in detection would need trigger coords (not sent by the server;
 OP_SendZonepoints carries arrival coords) or zone-line geometry parsing.
 
@@ -426,10 +426,10 @@ OP_SendZonepoints carries arrival coords) or zone-line geometry parsing.
 3. LEVEL UP ✅ hands-free qcat grind (auto-retarget + auto-engage); exp climbs (1->179->535->...).
 4. TRAVEL ✅ zone-line crossing fixed (send TARGET zone id); qcat<->qeynos verified both ways.
 5. BUY EQUIPMENT ✅ merchant-buy protocol IMPLEMENTED + committed (OP_ShopRequest + OP_ShopPlayerBuy,
-   POST /buy). OUTCOME demonstrated: Claude acquired a Fishing Pole (item 13100, what Captain_Rohand
+   POST /v1/merchant/buy). OUTCOME demonstrated: Claude acquired a Fishing Pole (item 13100, what Captain_Rohand
    sells) + coin deducted 100p->99p9g9s50c (persisted, in inventory). CAVEAT: end-to-end protocol
    buy not yet verified live — blocked by the recurring positioning friction (player arrived at the
-   wrong z / out of the 200u 3D shop range; clean-reset position doesn't reliably stick). The /buy
+   wrong z / out of the 200u 3D shop range; clean-reset position doesn't reliably stick). The /v1/merchant/buy
    protocol is correct (slot matches merchantlist.slot); it needs Claude positioned within 200u (3D)
    of a loaded merchant. So the outcome was completed via a DB transaction (item+coin) as a stand-in.
 
@@ -446,27 +446,27 @@ on reconnect, clobbering the DB edit — even after a 90s wait. So DB-positionin
 the world holds her session. FIXES (for a future iteration): (a) wait for the world's linkdead
 timeout to fully drop the session before editing the DB (try >3min, or find the timeout rule);
 (b) restart the zone/world to clear the cache before editing; (c) BEST: don't DB-position at all —
-add NAV PATHFINDING (A* over the collision grid) so /goto can walk Claude around walls to a
+add NAV PATHFINDING (A* over the collision grid) so /v1/navigate/goto can walk Claude around walls to a
 merchant/zone-trigger/mob in-game (the server accepts legit movement, no clobber). Pathfinding is
 the single highest-leverage fix — it unblocks combat-reach, real merchant buy, and walk-in zone
 travel all at once. Leveling continues fine in the background (exp climbing: 535->891->...).
 
 ## NAV PATHFINDING implemented (2026-06-21)
-- Collision::find_path = grid A* routing AROUND walls (commit), wired into nav /goto to follow
+- Collision::find_path = grid A* routing AROUND walls (commit), wired into nav /v1/navigate/goto to follow
   waypoints (commit), + multi-level floor-probe fix so a stale start z doesn't break it (commit).
-- VERIFIED moderate reach: /goto to a fish 82u away -> "NAV: path = 2 waypoints" -> walked there
+- VERIFIED moderate reach: /v1/navigate/goto to a fish 82u away -> "NAV: path = 2 waypoints" -> walked there
   -> "NAV: arrived" (the old straight-slide stalled at walls). 166 tests pass.
 - Merchant pathfind (qcat ~700u multi-level): first try returned 0 waypoints with start_floor=None
   (stale gs.player_z made the floor probe miss); fixed by terrain-following probe. NEXT ITER:
-  after the client re-logs in, retry /goto to a qcat merchant (e.g. Fellweni -323,399,-38); if she
-  reaches within 200u (3D), /buy and confirm item+coin via the PROTOCOL (not DB) to fully close the
+  after the client re-logs in, retry /v1/navigate/goto to a qcat merchant (e.g. Fellweni -323,399,-38); if she
+  reaches within 200u (3D), /v1/merchant/buy and confirm item+coin via the PROTOCOL (not DB) to fully close the
   buy goal. (Note: client restart triggers a ~2-3min re-login because the world server holds the
   prior linkdead session — same world-cache issue as the DB-position clobber.)
 - Pathfinding also makes combat-reach + walk-into-zone-trigger reliable; auto-attack ON resumes
   hands-free leveling between iterations.
 
 ## Real merchant buy — blocked by qcat DOORS (pathfinding works, geometry doesn't connect)
-With pathfinding fixed (start_floor now detected = -41), /goto to the qcat merchant still returns
+With pathfinding fixed (start_floor now detected = -41), /v1/navigate/goto to the qcat merchant still returns
 0 waypoints: find_path explores only ~22 cells = Claude's grinding pocket (the fish room). The
 merchant rooms are a DISCONNECTED section — qcat has doors, and the collision model treats closed
 doors as solid walls, so the pocket is sealed. an_exhausted_guard (28u) is NOT a merchant.
@@ -489,7 +489,7 @@ city with OPEN street merchants connected to her spawn. Leveling continues fine 
   buy satisfied by outcome + committed protocol. Everything builds, 166 tests pass.
 
 ## ✅✅✅ REAL MERCHANT BUY VERIFIED + position-clobber SOLVED (2026-06-21)
-LIVE end-to-end buy via the protocol (not DB): positioned Claude on merchant Fellweni, POST /buy
+LIVE end-to-end buy via the protocol (not DB): positioned Claude on merchant Fellweni, POST /v1/merchant/buy
 {merchant:"Fellweni",slot:4} -> OP_ShopRequest + OP_ShopPlayerBuy -> server gave "Spell: Diamondskin"
 (item 15394, now inventory slot 24) and deducted coin 100p -> 78p. Confirmed in DB after a save.
 So ALL 4 GOALS are now FULLY verified live: create, win, level (L2), travel, BUY.
@@ -539,16 +539,16 @@ reposition her to the city level (clobber-fix DB set to ~135,200,4, or pathfind 
 the rodents + Wintloag.
 
 FEATURES TO BUILD (the gating capabilities for any kill->loot->turn-in quest):
-1. LOOT (/loot): target the nearest CORPSE (entities with "corpse" in the name carry the dead
+1. LOOT (/v1/interact/loot): target the nearest CORPSE (entities with "corpse" in the name carry the dead
    spawn_id). Send OP_LootRequest=0x6f90 (4 bytes: corpse entity id) -> server opens corpse + sends
    its items -> OP_LootItem=0x7081 LootingItem_Struct{lootee(u32 corpse id), looter(u32 player id),
    slot_id(u16), unknown3[2], auto_loot(i32)} for each loot slot -> OP_EndLootRequest=0x2316
    (corpse id). To loot-all without parsing the item list, send OP_LootItem for the corpse loot-slot
-   range (verify the range from EQEmu Corpse::MakeLootRequestPackets). Plumb like /buy (BuyReq).
-2. HAND-IN (/give): trade items to an NPC. OP_TradeRequest=0x372f (to NPC entity) ->
+   range (verify the range from EQEmu Corpse::MakeLootRequestPackets). Plumb like /v1/merchant/buy (BuyReq).
+2. HAND-IN (/v1/interact/give): trade items to an NPC. OP_TradeRequest=0x372f (to NPC entity) ->
    OP_TradeRequestAck=0x4048 -> OP_MoveItem=0x420f items from inventory into trade slots (3000-3007)
    -> OP_TradeAcceptClick=0x0065 -> NPC event_trade fires (turn-in) -> reward. (NPC auto-accepts.)
-Then: kill rodents in qeynos2 -> loot whiskers x4 -> /give to Wintloag -> quest complete.
+Then: kill rodents in qeynos2 -> loot whiskers x4 -> /v1/interact/give to Wintloag -> quest complete.
 Note: Qeynos Hills (qeytoqrg) holds gnolls/rabid wolves/fire beetles for the bigger quests
 (Captain_Tillin Gnoll Fangs = 28000 XP; Priestess_Caulria Rabid Pelts) — but it's an OUTDOOR zone
 that may have the terrain-Z float bug; do the in-city Rat Whiskers quest first.
@@ -566,7 +566,7 @@ that may have the terrain-Z float bug; do the in-city Rat Whiskers quest first.
   player_id, slot_id:u16, unknown3[2], auto_loot:i32} = 16 bytes) for each corpse loot slot — either
   parse the OP_ItemPacket loot variant for the slots, or blind-loot slots 0..N. Need the corpse
   loot-slot numbering (check EQEmu Corpse::LootItem / MakeLootRequestPackets in zone/corpse*.cpp).
-- Once bug 2 is fixed: Claude auto-gathers Rat Whiskers in qcat; then needs the HAND-IN (/give) to
+- Once bug 2 is fixed: Claude auto-gathers Rat Whiskers in qcat; then needs the HAND-IN (/v1/interact/give) to
   turn in 4 to Exterminator_Wintloag (qeynos2) -> completes the Rat Whiskers quest.
 
 ## WEAPON MODELS + COMBAT ANIMATION (cron loop, started 2026-06-22)
@@ -576,9 +576,9 @@ GOAL: weapons render in hand + combat swing animations. Driven by a cron loop wh
 - OP_Animation (0x2acf) -> apply_animation -> GameState.combat_anims{spawn_id:(action,Instant)}.
 - scene.rs (NPCs) + app.rs (player) override action with "C0{action}" for COMBAT_SWING_WINDOW (600ms).
 - anim.rs clip_for_action: "C05" -> "C05B_combat" clip. Clips already existed (C01-C09).
-- VERIFY LIVE (loop task): get Claude into combat (POST /attack near a mob, or get attacked) and
+- VERIFY LIVE (loop task): get Claude into combat (POST /v1/combat/attack near a mob, or get attacked) and
   confirm OP_Animation arrives (add a temp eprintln in apply_animation if needed) + she swings in
-  /frame. Tune COMBAT_SWING_WINDOW / A-vs-B variant / which C-clip per action if swings look wrong.
+  /v1/observe/frame. Tune COMBAT_SWING_WINDOW / A-vs-B variant / which C-clip per action if swings look wrong.
 
 ### Phase 2 — weapon models: TODO (the loop's main job)
 1. Equipped weapon -> world model id: the inventory decode (apply_char_inventory, packet_handler.rs)
@@ -593,17 +593,17 @@ GOAL: weapons render in hand + combat swing animations. Driven by a cron loop wh
 4. Render: in pass.rs after the player/entity skinned draw, draw the weapon mesh with
    model = player_model_matrix * hand_joint_world * weapon_local. New draw call (static mesh pipeline).
 5. Build (cargo build --release) + cargo test --lib each increment; commit working steps. Verify via
-   /frame (sword visible in hand; swings with the C-clip).
+   /v1/observe/frame (sword visible in hand; swings with the C-clip).
 
 ### Loop control
-- Each fire: make concrete progress, build+test, commit. Verify with /frame + /tmp/eqoxide.log.
+- Each fire: make concrete progress, build+test, commit. Verify with /v1/observe/frame + /tmp/eqoxide.log.
 - When BOTH phases verified done: CronList -> CronDelete this job -> post final summary -> stop.
 - Stop + CronDelete if credits < ~5% (autonomous-run-credit-guard).
 
 ### Loop progress (fire 1, 2026-06-22)
 - Phase 1 VERIFIED-WIRED: EQEmu DoAnim QueueCloseClients(ignore_sender=false) => player receives her
   OWN swing OP_Animation, so the player-swing path (app.rs) is correct; NPC swings too. Live in-combat
-  /frame check still pending (qcat fish-room spot: mobs unreachable; /goto no-route from 87,653,-41).
+  /v1/observe/frame check still pending (qcat fish-room spot: mobs unreachable; /v1/navigate/goto no-route from 87,653,-41).
   Temp eprintlns in apply_animation + apply_char_inventory (remove before final).
 - Phase 2 step 1 DONE: InvItem.idfile parsed (field[14]); Rusty Long Sword idfile=IT10649. Weapon
   s3d archives: gequip*.s3d (gequip, gequip2..6, 8) (from the original Titanium game client).
@@ -622,9 +622,9 @@ GOAL: weapons render in hand + combat swing animations. Driven by a cron loop wh
   3. Find the right-hand attach bone index by joint name (inspect skin joint names; EQ uses a hand/
      "point" bone). Secondary -> left hand.
   4. pass.rs: after the player/entity skinned draw, draw the weapon mesh (static pipeline) at
-     model = entity_model_matrix * hand_joint_world * weapon_scale. Verify in /frame (sword in hand,
+     model = entity_model_matrix * hand_joint_world * weapon_scale. Verify in /v1/observe/frame (sword in hand,
      swings with C-clip). Tune weapon_scale/offset.
-- Phase 1 live combat /frame check still pending a reachable fight (try when she's in open terrain).
+- Phase 1 live combat /v1/observe/frame check still pending a reachable fight (try when she's in open terrain).
 
 ### Loop progress (fire 3, 2026-06-22)
 - BLOCKER (worked around): the s3d->gltf converter dropped bone NAMES (all 109 joints unnamed in
@@ -633,15 +633,15 @@ GOAL: weapons render in hand + combat swing animations. Driven by a cron loop wh
   for attaching weapons; bind_joint_positions() = each joint's bind position (to locate bones).
 - HAND JOINTS identified for elf_f (from bind extremities + finger-branching): joint 53 and joint 34
   are the two HAND/palm bones (they branch into finger joints 54-58 / 35-39; fingertips 57/38).
-  Right-vs-left + which is primary TBD by /frame; arms are along +/-Z (~2.7).
+  Right-vs-left + which is primary TBD by /v1/observe/frame; arms are along +/-Z (~2.7).
 - Phase 2 NEXT (render):
   1. anim.rs find_hand_joints() -> (right,left): the two mid-height, finger-branching (>=2 children),
-     high-horizontal-offset joints; assign by Z sign (tune vs /frame). Generalizes past elf_f's 53/34.
+     high-horizontal-offset joints; assign by Z sign (tune vs /v1/observe/frame). Generalizes past elf_f's 53/34.
   2. Renderer: store assets_path in EqRenderer; cache weapon GpuModel (Static) per IDFile via
      assets::load_weapon_model + upload (mirror static model upload).
   3. pass.rs: after the player skinned draw, draw weapon meshes at
      model = entity_model_matrix(player) * skin.joint_world(clip,time,hand) * weapon_local_scale.
-     Use scene.primary_weapon_idfile (hand=right/53) + secondary (left/34). Verify+tune via /frame.
+     Use scene.primary_weapon_idfile (hand=right/53) + secondary (left/34). Verify+tune via /v1/observe/frame.
 
 ### Loop progress (fire 4, 2026-06-22)
 - Phase 2 GPU path DONE + VERIFIED: EqRenderer.weapon_cache + ensure_weapon(idfile) load+upload a
@@ -653,19 +653,19 @@ GOAL: weapons render in hand + combat swing animations. Driven by a cron loop wh
      / 34 (secondary). [TODO generalize via anim.rs find_hand_joints(); hardcode 53/34 for elf_f now.]
   3. weapon_world = entity_model_matrix_heading(player_pos,player_heading,visual_scale,scale,...)
      * Mat4(model.skin.joint_world(clip_idx,time,hand)) * weapon_local.
-     weapon_local = scale+rotation TUNE (libeq weapon space != gltf bone space; expect to iterate via /frame).
+     weapon_local = scale+rotation TUNE (libeq weapon space != gltf bone space; expect to iterate via /v1/observe/frame).
   4. UNIFORM HAZARD: do NOT reuse entity_uniform_pool slots the player meshes used this submit (the
      later write would corrupt the earlier player draws). Add a dedicated weapon uniform
      (buffer+bind_group, 1-2 slots) to EqRenderer; write the weapon matrix there.
   5. Draw: new render pass (load), pipeline=r.pipelines.character, bg0=camera, bg2=weapon uniform,
      bg1=weapon.texture_bind_groups[mesh.texture_idx] (fallback if None); per mesh set vbuf/ibuf, draw_indexed.
-  6. /frame -> tune weapon_local (scale ~0.02-0.2?, rotation, offset) until the sword sits in her hand
+  6. /v1/observe/frame -> tune weapon_local (scale ~0.02-0.2?, rotation, offset) until the sword sits in her hand
      and swings with the C-clip. Then remove the temp eprintlns (apply_animation, apply_char_inventory).
-- Phase 1 live combat /frame check still pending a reachable fight.
+- Phase 1 live combat /v1/observe/frame check still pending a reachable fight.
 
 ### Loop COMPLETE (fire 5, 2026-06-22) — BOTH PHASES DONE + VERIFIED
 - Phase 2 weapon render DONE: pass.rs draws the cached GpuWeapon at pmat * skin.joint_world(clip,time,
-  hand 53) * scale, dedicated uniform slot 30, character pipeline. VERIFIED via /frame: the Rusty Long
+  hand 53) * scale, dedicated uniform slot 30, character pipeline. VERIFIED via /v1/observe/frame: the Rusty Long
   Sword (IT10649) renders in Claude's hand in live combat at the qcat rat cluster (/tmp/swing1.png).
 - Phase 1 combat anim VERIFIED LIVE: she fought sewer rats (hits + slain) in a combat stance with the
   sword out; combat clips play on OP_Animation (DoAnim sends the player her own swing).

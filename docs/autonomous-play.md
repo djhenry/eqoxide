@@ -36,26 +36,26 @@ Phase 1 (done): **discovery + indicators**.
 - `tools/quest_finder.py --export` bakes quest-giver data into `data/quests.json` (regenerate if the
   server's quests change). The client loads it at startup (`src/quests.rs`).
 - The HUD draws a golden **"❗ quest"** over any NPC that has a quest (so you can SEE quest givers
-  in `/frame`, like a modern MMO). Note: in dense cities the nameplate may be occluded by buildings
-  (existing nameplate behavior) — `GET /quests` is the reliable readout.
-- `GET /quests` is your quest tracker: for the current zone it lists quest givers sorted by distance
+  in `/v1/observe/frame`, like a modern MMO). Note: in dense cities the nameplate may be occluded by buildings
+  (existing nameplate behavior) — `GET /v1/observe/quests` is the reliable readout.
+- `GET /v1/observe/quests` is your quest tracker: for the current zone it lists quest givers sorted by distance
   with their location, `loaded` (in spawn range) flag, `turn_in` flag, `wanted` items (id, name,
-  count), `reward_xp`, and `hail` text. Workflow: `GET /quests` → pick one → `/goto` to it →
-  `/hail` to read the quest → gather items → return → hand in.
+  count), `reward_xp`, and `hail` text. Workflow: `GET /v1/observe/quests` → pick one → `/v1/navigate/goto` to it →
+  `/v1/interact/hail` to read the quest → gather items → return → hand in.
 
 **Two kinds of EQ quests** — the client surfaces both:
 - **Old-style Lua turn-in/dialogue quests** (most classic Qeynos quests: Rat Whiskers, Gnoll Fangs,
   the guild-note hand-in) have **no protocol representation** — they're emergent server Lua. The
-  golden "!" + `GET /quests` (derived from `data/quests.json`) are the only way to see them.
+  golden "!" + `GET /v1/observe/quests` (derived from `data/quests.json`) are the only way to see them.
 - **Native Task-system quests** (LDoN+; present in Titanium) — the server pushes a real quest journal
   (`OP_TaskDescription`/`OP_TaskActivity`/`OP_CompletedTasks`). The client decodes these into a live
-  journal: **`GET /quests/log`** returns active tasks with title, description, reward, and objectives
+  journal: **`GET /v1/observe/quests/log`** returns active tasks with title, description, reward, and objectives
   showing live progress (`done_count`/`goal_count`), plus completed task ids. The authentic "quest
   added to my log, watch it tick up" experience. (OpenEQ decodes these structs but builds nothing on
   them; packet-only clients can't see the old-style quests at all. See `docs/protocol-notes.md`.)
 
 To actually *complete* a turn-in quest you still need: reach + kill the mob → **loot** the item →
-reach the giver → **hand it in**. Looting (`/loot`) and item hand-in (`/give`) are the gameplay
+reach the giver → **hand it in**. Looting (`/v1/interact/loot`) and item hand-in (`/v1/interact/give`) are the gameplay
 actions being added next (see the questing roadmap in `todo.md`). The hail/say flow for dialogue
 quests already exists (`docs/npc-interaction.md`).
 
@@ -83,7 +83,7 @@ DB: `podman exec eqemu_mariadb_1 mariadb -uroot -prootpass peq`. Tables that mat
   slot if the character can't equip it there.)
 
 `#zone` / `#goto` / GM warp are **GM-only** — a non-GM character cannot use them. Move via legit
-walking (`/goto` pathfinding), the warp endpoint (anti-cheat capped), or DB edits during a clean
+walking (`/v1/navigate/goto` pathfinding), the warp endpoint (anti-cheat capped), or DB edits during a clean
 logout (see §6).
 
 ---
@@ -118,8 +118,8 @@ fix for any client-initiated melee.
 
 ### Verifying combat
 Client logs outgoing hits as `EQ: combat: Claude hits <mob> for N damage` and kills as
-`<mob> has been slain` in `/tmp/eqoxide.log`. The client does NOT expose HP via `/debug`; use the
-combat log + `/entities` (mob despawns on death) + a level/exp DB read. EQEmu combat logging is OFF
+`<mob> has been slain` in `/tmp/eqoxide.log`. The client does NOT expose HP via `/v1/observe/debug`; use the
+combat log + `/v1/observe/entities` (mob despawns on death) + a level/exp DB read. EQEmu combat logging is OFF
 by default, so the zone log won't show swings.
 
 ---
@@ -132,20 +132,20 @@ by default, so the zone log won't show swings.
 → the request was cancelled / looped back to the same zone. Fixed: pass the destination zone id.
 
 ### How zone crossing actually works here
-- `GET /zone_points` returns the points from `OP_SEND_ZONE_POINTS`, but those coords are the
+- `GET /v1/observe/zone_points` returns the points from `OP_SEND_ZONE_POINTS`, but those coords are the
   **ARRIVAL** coords (where you land in the destination), **NOT** the in-zone trigger to walk into.
-  So don't `/goto` them.
-- `POST /zone_cross {"zone_id": N}` → the nav sends `OP_ZONE_CHANGE` with zoneID=N from the player's
+  So don't `/v1/navigate/goto` them.
+- `POST /v1/navigate/zone_cross {"zone_id": N}` → the nav sends `OP_ZONE_CHANGE` with zoneID=N from the player's
   current position. The server's `GetClosestZonePoint(GetPosition(), N, range)` finds the matching
   zone point. The range check compares **linear distance to a squared max** (`zone/zone.cpp`,
   effectively a no-op), so position barely matters — being within ~400u just avoids a cheat-flag
   warning (which logs, doesn't block). So you can travel to any zone reachable from the current one
   without precisely reaching a trigger.
-- Verified both directions: qcat(45) ↔ qeynos(1). Check the result with `GET /debug` `zone`.
-- Reachable target zones = the distinct `zone_id`s in `/zone_points`.
+- Verified both directions: qcat(45) ↔ qeynos(1). Check the result with `GET /v1/observe/debug` `zone`.
+- Reachable target zones = the distinct `zone_id`s in `/v1/observe/zone_points`.
 
 The classic "walk into the zone-line geometry" auto-cross is NOT implemented (the client lacks the
-trigger-box coords; only arrival coords are sent). Use `/zone_cross {zone_id}`.
+trigger-box coords; only arrival coords are sent). Use `/v1/navigate/zone_cross {zone_id}`.
 
 ---
 
@@ -154,7 +154,7 @@ trigger-box coords; only arrival coords are sent). Use `/zone_cross {zone_id}`.
 Opcodes (Titanium, from `patch_Titanium.conf`, verified to match this server):
 `OP_ShopRequest=0x45f9`, `OP_ShopPlayerBuy=0x221e`, `OP_ShopEnd=0x7e03`.
 
-Flow (`POST /buy {"merchant":"<name>","slot":N}` → nav sends both in sequence):
+Flow (`POST /v1/merchant/buy {"merchant":"<name>","slot":N}` → nav sends both in sequence):
 1. **`OP_ShopRequest`** with `MerchantClick_Struct` (24 bytes): `npc_id`(entity/spawn id),
    `player_id`, `command`=1 (open), `rate`(f32), `tab_display`(i32), `unknown020`(i32). Opens the
    merchant server-side.
@@ -178,7 +178,7 @@ Requirements:
 
 Opcode (Titanium, from `patch_Titanium.conf`): `OP_MoveItem=0x420f`.
 
-`POST /inventory/move {"from":N,"to":M}` → nav sends one **`OP_MoveItem`** with `MoveItem_Struct` (12 bytes):
+`POST /v1/inventory/move {"from":N,"to":M}` → nav sends one **`OP_MoveItem`** with `MoveItem_Struct` (12 bytes):
 `from_slot`(u32), `to_slot`(u32), `number_in_stack`(u32, =1 for a single non-stacked item).
 
 Slot ids (Titanium): **0-21** worn equipment, **22-29** general inventory, **30** cursor, **251+**
@@ -193,7 +193,7 @@ slot to a free general slot (22-29). Read the current item→slot mapping from t
 
 `Collision::find_path(start, goal, radius) -> Option<Vec<[east,north]>>` (`src/assets.rs`) is grid
 A* over the collision grid (production cell_size **32**). It routes AROUND walls, unlike `slide_move`
-(which only slides along one wall and stalls at corners). `/goto` computes a path when the goal
+(which only slides along one wall and stalls at corners). `/v1/navigate/goto` computes a path when the goal
 changes and walks the waypoints; the per-step move + the combat auto-engage still use `slide_move`.
 
 Floor handling: the per-cell floor is probed **relative to the floor of the cell it was reached from**
@@ -238,10 +238,10 @@ at z≈-40** (where surface fish are reachable); the **pit bottom z≈-76** leav
 
 ## 7. Movement constraints for a non-GM character
 
-- **`/warp`** (teleport): anti-cheat capped (~tens of u/hop) and the server rubber-bands it
-  (`server_corrections` in `/debug` climbs); warping through walls is rejected. Unreliable for real
-  positioning — prefer `/goto` (pathfinding) or the DB clean-reset (§6).
-- **`/goto`**: legit incremental walking the server accepts (no rubber-band). Now routes around walls
+- **`/v1/navigate/warp`** (teleport): anti-cheat capped (~tens of u/hop) and the server rubber-bands it
+  (`server_corrections` in `/v1/observe/debug` climbs); warping through walls is rejected. Unreliable for real
+  positioning — prefer `/v1/navigate/goto` (pathfinding) or the DB clean-reset (§6).
+- **`/v1/navigate/goto`**: legit incremental walking the server accepts (no rubber-band). Now routes around walls
   via `find_path`. The reliable movement primitive.
 - City **guards** are tough and gang up; attacking one aggros others and can make you KOS to that
   guard faction (resets on a fresh login / no persistent `faction_values` here). Fine for testing,
