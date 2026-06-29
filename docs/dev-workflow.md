@@ -88,14 +88,14 @@ Capture it instead of hardcoding:
 
 ```sh
 PORT=$(grep -m1 -oP 'API_PORT=\K[0-9]+' /tmp/eqoxide.log)
-curl "http://127.0.0.1:$PORT/debug"
+curl "http://127.0.0.1:$PORT/v1/observe/debug"
 ```
 
 **To restart your own instance, use `POST /v1/lifecycle/exit`** — never `pkill eqoxide`, which would
 also kill another worktree's client. It cleanly exits only the instance on the port you call:
 
 ```sh
-curl -X POST "http://127.0.0.1:$PORT/exit"
+curl -X POST "http://127.0.0.1:$PORT/v1/lifecycle/exit"
 ```
 
 See `http-api.md` for both the port-discovery convention and the `/v1/lifecycle/exit` endpoint.
@@ -107,7 +107,7 @@ See `http-api.md` for both the port-discovery convention and the `/v1/lifecycle/
 1. Make a code change
 2. `cargo build --release` (or `cargo test` first)
 3. `dev-run.sh` detects the new binary and restarts the client within ~4 seconds
-4. `curl "http://127.0.0.1:$PORT/frame" -o /tmp/frame.png` to capture the current screen
+4. `curl "http://127.0.0.1:$PORT/v1/observe/frame" -o /tmp/frame.png` to capture the current screen
    (`PORT` from the `API_PORT=` line — see *API Port Discovery* above; single-instance dev
    defaults to 8765)
 5. Read `/tmp/frame.png` with the image viewer or the `Read` tool to inspect visually

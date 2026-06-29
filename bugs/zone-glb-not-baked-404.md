@@ -8,7 +8,7 @@
 
 ## Steps to reproduce
 1. Launch client (`--config claude`), zone into `arena`.
-2. `curl -X POST http://127.0.0.1:$PORT/zone_cross -d '{"zone_id":202}'` (poknowledge).
+2. `curl -X POST http://127.0.0.1:$PORT/v1/navigate/zone_cross -d '{"zone_id":202}'` (poknowledge).
 3. Watch `/tmp/eqoxide-*.log`.
 
 ## Expected

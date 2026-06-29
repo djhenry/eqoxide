@@ -1,8 +1,8 @@
 # Player currency decodes to garbage values (RoF2 player profile)
 
 **Summary:** A freshly created character with **zero coin** reports nonsense currency from the
-client — `platinum: 2147483648` (0x80000000) and `gold: 119012671` — in both `/debug` and
-`/inventory`, while the DB has no `character_currency` row (i.e. 0/0/0/0).
+client — `platinum: 2147483648` (0x80000000) and `gold: 119012671` — in both `/v1/observe/debug` and
+`/v1/observe/inventory`, while the DB has no `character_currency` row (i.e. 0/0/0/0).
 
 **Severity:** Medium (coin is unusable/misleading; would break any buy/sell budgeting logic)
 
@@ -12,8 +12,8 @@ client — `platinum: 2147483648` (0x80000000) and `gold: 119012671` — in both
 1. Create a fresh character (e.g. Brogan, Human Warrior) — see
    `.claude/skills/eq-character-creation`. New chars get no `character_currency` row.
 2. Zone in, then read currency:
-   - `curl -s "http://127.0.0.1:$PORT/debug"   | python3 -c "import sys,json;print(json.load(sys.stdin)['player']['currency'])"`
-   - `curl -s "http://127.0.0.1:$PORT/inventory"| python3 -c "import sys,json;print(json.load(sys.stdin)['currency'])"`
+   - `curl -s "http://127.0.0.1:$PORT/v1/observe/debug"   | python3 -c "import sys,json;print(json.load(sys.stdin)['player']['currency'])"`
+   - `curl -s "http://127.0.0.1:$PORT/v1/observe/inventory"| python3 -c "import sys,json;print(json.load(sys.stdin)['currency'])"`
 
 ## Expected
 `{'copper': 0, 'silver': 0, 'gold': 0, 'platinum': 0}` (matches the DB — no currency row).
@@ -23,7 +23,7 @@ client — `platinum: 2147483648` (0x80000000) and `gold: 119012671` — in both
 DB truth: `SELECT platinum,gold,silver,copper FROM character_currency WHERE id=16;` → no row (NULL/0).
 
 ## Diagnosis notes
-- Both `/debug` and `/inventory` share one source (the decoded player profile), so the error is in
+- Both `/v1/observe/debug` and `/v1/observe/inventory` share one source (the decoded player profile), so the error is in
   the profile decode, not the HTTP layer.
 - `copper` and `silver` read 0 (correct); only `gold` and `platinum` are garbage — suggests the
   currency field **offsets** into the RoF2 `PlayerProfile_Struct` are off, so platinum/gold read

@@ -16,8 +16,8 @@ fields as garbage → empty target + wrong `chan_num` → the tell/OOC was never
 ## Steps to reproduce (pre-fix)
 1. Launch two clients as different characters in **different zones** (e.g. Claude in `arena`,
    Durgan in `kaladimb`), each with its own `--api-port`.
-2. `POST /tell {"to":"Claude","text":"..."}` on Durgan's client.
-3. `GET /events` / `GET /messages` on Claude's client → nothing arrives.
+2. `POST /v1/chat/tell {"to":"Claude","text":"..."}` on Durgan's client.
+3. `GET /v1/events/all` / `GET /v1/observe/messages` on Claude's client → nothing arrives.
 
 ## Actual root cause (2026-06-28)
 RoF2's `OP_ChannelMessage` is **not** the Titanium `ChannelMessage_Struct`. Per EQEmu
@@ -53,9 +53,9 @@ format (with a `read_cstr` helper). Unit tests updated to the RoF2 layout.
 
 ## Verified live (2026-06-28)
 Two clients, Claude in `arena` + Durgan in `kaladimb`:
-- Durgan → Claude tell → Claude `/events`: `{"channel":"tell","directed":true,"from":"Durgan",…}` ✓
-- Claude → Durgan tell → Durgan `/events`: `{"channel":"tell","directed":true,"from":"Claude",…}` ✓
-- Claude OOC → Durgan `/events`: `{"channel":"ooc","directed":false,"from":"Claude",…}` ✓ (cross-zone)
+- Durgan → Claude tell → Claude `/v1/events/all`: `{"channel":"tell","directed":true,"from":"Durgan",…}` ✓
+- Claude → Durgan tell → Durgan `/v1/events/all`: `{"channel":"tell","directed":true,"from":"Claude",…}` ✓
+- Claude OOC → Durgan `/v1/events/all`: `{"channel":"ooc","directed":false,"from":"Claude",…}` ✓ (cross-zone)
 
 ## Follow-ons (separate, lower priority)
 - **UCS link** (the `worktree-ucs-chat-link` step 1 `OP_SetChatServer` parse): still valid, but only

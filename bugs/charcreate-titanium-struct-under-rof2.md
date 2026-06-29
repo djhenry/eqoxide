@@ -14,7 +14,7 @@ created (name-reservation row stays all-zeros, client never enters world).
    (e.g. `~/.config/eqoxide/config-garrik.yaml`, Human Warrior, Qeynos).
 2. Launch: `./target/release/eqoxide --config garrik`.
 3. Client logs: `name approved — sent OP_CharacterCreate for 'Garrik'` then nothing further
-   (no new `OP_SendCharInfo`, never enters world; `GET /debug` shows empty zone/level 0).
+   (no new `OP_SendCharInfo`, never enters world; `GET /v1/observe/debug` shows empty zone/level 0).
 4. Server world log shows:
    `[World] [Netcode] Wrong size on incoming [OP_CharacterCreate] (structs::CharCreate_Struct): Got [80], expected [96]`
 5. DB `character_data` has a row for the name with all fields = 0 (the OP_ApproveName

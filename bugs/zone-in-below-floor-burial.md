@@ -11,9 +11,9 @@ does not reliably recover it.)
 
 ## Steps to reproduce
 1. Be in `gfaydark` near the North Felwithe zone line.
-2. Cross to Felwithe: `POST /zone_cross {"zone_id":61}` (or walk through the zone
+2. Cross to Felwithe: `POST /v1/navigate/zone_cross {"zone_id":61}` (or walk through the zone
    line).
-3. Observe the player after the zone loads: `GET /debug` and a `GET /frame`.
+3. Observe the player after the zone loads: `GET /v1/observe/debug` and a `GET /v1/observe/frame`.
 
 ## Expected
 The player stands on the Felwithe floor with feet on the ground.
@@ -24,8 +24,8 @@ rendered **buried to the chest** — the floor surface sits at shoulder height.
 `z` stays at `4.0` while idle and does not self-correct.
 
 ## Diagnosis notes (2026-06-26)
-- `z` stayed exactly `4.0` while idle and after a short `/goto` nudge.
-- `POST /warp {"x":200,"y":40,"z":20}` → the player then stands **correctly on
+- `z` stayed exactly `4.0` while idle and after a short `/v1/navigate/goto` nudge.
+- `POST /v1/navigate/warp {"x":200,"y":40,"z":20}` → the player then stands **correctly on
   the floor** and remains at z ≈ 20. So the actual floor at `(200,40)` is roughly
   z ≈ 18–20, i.e. **~16 units above the zone-in z of 4**.
 - Warping *above* the floor lets the snap work; spawning *below* it does not.
