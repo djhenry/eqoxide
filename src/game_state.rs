@@ -208,6 +208,12 @@ pub struct GameState {
     // Target
     pub target_id: Option<u32>,
     pub target_name: Option<String>,
+    /// NPCs that have recently swung at the player (hit or miss), keyed by spawn id → time of the
+    /// last swing. Auto-combat uses this to engage an add that aggros mid-fight instead of letting
+    /// it beat the player unanswered, while keeping the current target if it is also attacking us
+    /// (so two adds don't cause target thrash). Set in `apply_combat_damage`; read + pruned by the
+    /// nav auto-retarget.
+    pub recent_attackers: std::collections::HashMap<u32, std::time::Instant>,
     pub target_hp_pct: Option<f32>,
     /// Consider color (RGB) of the current target, set from the OP_Consider reply.
     pub target_con: Option<[u8; 3]>,

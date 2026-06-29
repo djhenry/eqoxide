@@ -715,6 +715,12 @@ fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
     };
     tracing::info!("EQ: combat: {msg}");
     gs.log_msg("combat", &msg);
+
+    // Remember who is swinging at us (hit OR miss) so auto-combat can engage an add that aggros
+    // mid-fight instead of tanking it unanswered. Only NPC attackers on the player count.
+    if target_id == gs.player_id && source_id != gs.player_id && gs.entities.contains_key(&source_id) {
+        gs.recent_attackers.insert(source_id, std::time::Instant::now());
+    }
 }
 
 fn apply_level_update(gs: &mut GameState, payload: &[u8]) {
