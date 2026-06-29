@@ -37,4 +37,4 @@ causing the name field to read past/short for some records. Alternatively, benig
 in server data. Verify against the RoF2 door struct before changing parsing.
 
 ## Status
-Open
+Migrated to GitHub issue https://github.com/djhenry/eqoxide/issues/3 (in-repo tracker deprecated).

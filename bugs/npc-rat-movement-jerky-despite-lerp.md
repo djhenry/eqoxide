@@ -38,4 +38,4 @@ NPC movement updates are consumed, and/or lerp toward a predicted position over
 the expected update interval rather than snapping to each received point.
 
 ## Status
-Open
+Migrated to GitHub issue https://github.com/djhenry/eqoxide/issues/1 (in-repo tracker deprecated).

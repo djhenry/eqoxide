@@ -42,4 +42,4 @@ geometry (narrow Neriak passages, the moat, the elevated library). Probably shar
 a root cause with the gfaydark platform stall; worth fixing together.
 
 ## Status
-Open
+Migrated to GitHub issue https://github.com/djhenry/eqoxide/issues/2 (in-repo tracker deprecated).

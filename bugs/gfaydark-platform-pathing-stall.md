@@ -48,4 +48,4 @@ in gfaydark — likely the same family of issues noted in the nav floor-fix work
 (overhangs mistaken for floor / unable to descend between levels).
 
 ## Status
-Open — not yet investigated in depth.
+Migrated to GitHub issue https://github.com/djhenry/eqoxide/issues/4 (in-repo tracker deprecated).
