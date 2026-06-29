@@ -594,7 +594,9 @@ fn build_char_create(cc: &CharacterCreate) -> Vec<u8> {
         cc.race,       // 0x04 race
         cc.class,      // 0x08 class_
         cc.deity,      // 0x0C deity
-        cc.start_zone, // 0x10 start_zone
+        cc.start_zone, // 0x10 start_zone — a ZONE_ID (not a Titanium StartZoneIndex). RoF2's
+                       // CheckCharCreateInfoSoF matches this against char_create_combinations.start_zone
+                       // (zone_ids); sending a 0..13 index is rejected → silent create loop. See eqoxide#5.
         cc.haircolor,  // 0x14 haircolor
         cc.beard,      // 0x18 beard
         cc.beardcolor, // 0x1C beardcolor
@@ -626,8 +628,10 @@ mod charcreate_tests {
 
     fn de_sk() -> CharacterCreate {
         // Dark Elf (6) Shadow Knight (5), validated stats summing to 582.
+        // start_zone is a ZONE_ID: 42 = neriakc (a valid Dark Elf start city); a StartZoneIndex
+        // such as 5 would be rejected by RoF2's CheckCharCreateInfoSoF. See eqoxide#5.
         CharacterCreate {
-            race: 6, class: 5, gender: 0, deity: 206, start_zone: 5,
+            race: 6, class: 5, gender: 0, deity: 206, start_zone: 42,
             str_: 70, sta: 70, agi: 90, dex: 75, wis: 83, int_: 129, cha: 65,
             face: 0, hairstyle: 0, haircolor: 0, beard: 0, beardcolor: 0,
             eyecolor1: 0, eyecolor2: 0,
@@ -656,7 +660,7 @@ mod charcreate_tests {
         assert_eq!(f(1), 6);    // race (Dark Elf)
         assert_eq!(f(2), 5);    // class (Shadow Knight)
         assert_eq!(f(3), 206);  // deity (Innoruuk)
-        assert_eq!(f(4), 5);    // start_zone (Neriak)
+        assert_eq!(f(4), 42);   // start_zone = zone_id (42 = neriakc), NOT a StartZoneIndex
         assert_eq!(f(12), 0);   // drakkin_heritage (non-Drakkin)
         assert_eq!(f(22), 0);   // tutorial
         assert_eq!(f(23), 0);   // unknown0092

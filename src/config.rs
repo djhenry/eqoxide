@@ -96,7 +96,11 @@ pub struct CharacterCreate {
     pub class:      u32,
     pub gender:     u32, // 0=male, 1=female
     pub deity:      u32,
-    pub start_zone: u32, // StartZoneIndex (e.g. 5 = Neriak)
+    pub start_zone: u32, // start-city ZONE_ID, NOT a StartZoneIndex. RoF2 validates this against
+                         // char_create_combinations.start_zone (a zone_id) via CheckCharCreateInfoSoF,
+                         // so it must be the chosen start city's zoneidnumber valid for this
+                         // race/class/deity (e.g. 42 = neriakc or 394 = crescent for a Dark Elf
+                         // Necromancer). A Titanium StartZoneIndex (0..13) is rejected. See eqoxide#5.
     pub str_:       u32,
     pub sta:        u32,
     pub agi:        u32,
