@@ -43,5 +43,29 @@ re-enables control, and auto-combat can resume — like the real client where yo
 corpse. Fix: on self-death, present/auto-answer the respawn window (choose bind), reset player
 state to alive at the returned location, and re-enable the nav/auto-combat.
 
+## Root cause (CONFIRMED against EQEmu source ~/git/EQEmu)
+The suspected cause above is correct. The server's death flow (zone/attack.cpp `Client::Death` →
+`SendRespawnBinds`, zone/client.cpp:5565) sends **`OP_RespawnWindow` (RoF2 `0x0ecb`)** right after
+`OP_Death` and holds the player as a hovering corpse until the client replies. The client must
+answer with a **4-byte option index** (`Handle_OP_RespawnWindow`, client_packet.cpp:13664 — size
+must be 4); the server populates **option 0 = "Bind Location"** (pushed to the front in
+`SendRespawnBinds`). With the hover auto-respawn timer disabled/long, a client that never replies
+stays a corpse indefinitely — exactly the symptom. eqoxide never mapped `0x0ecb`, so the window was
+silently unhandled (no "unhandled opcode" line because that logs below the configured level).
+
+After the reply (`HandleRespawnFromHover(0)`, client_process.cpp:2126) the server sends
+`OP_ZonePlayerToBind` + `RestoreHealth`/`SendHPUpdate` + `ClearHover`→`OP_ZoneEntry` (re-spawn),
+all already handled by eqoxide (`apply_bind_respawn`, `apply_hp_update`, `register_spawn`). So the
+only missing piece is sending the reply.
+
+## Fix (branch worktree-death-respawn)
+- `protocol.rs`: define `OP_RESPAWN_WINDOW = 0x0ecb` + `build_respawn_select`/`respawn_window_reply`
+  helpers (unit-tested).
+- `gameplay.rs`: on inbound `OP_RESPAWN_WINDOW`, auto-select option 0 (bind) and send the 4-byte
+  reply, mirroring the existing `OP_LOOT_ITEM` echo; clear the "waiting to respawn" strategy. The
+  rest of the respawn (position, HP, re-spawn) self-heals through existing handlers.
+- 282 unit tests pass. NOT yet live-validated (requires actually dying; Campy was in the `arena`
+  training zone with no hostiles). Verified end-to-end against EQEmu source instead.
+
 ## Status
-Open
+Fix implemented (pending live death validation)

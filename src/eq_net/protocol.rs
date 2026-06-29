@@ -201,6 +201,26 @@ pub const OP_EMOTE: u16 = 0x373b;              // RoF2: OP_Emote
 // ── Misc zone→client ──────────────────────────────────────────────────────
 
 pub const OP_ZONE_PLAYER_TO_BIND: u16 = 0x08d8;  // RoF2: OP_ZonePlayerToBind
+/// Server → client after OP_Death: opens the "respawn from death" hover window with a list of
+/// respawn options (bind, rez, …). The server holds the player as a hovering corpse until the
+/// client replies with a 4-byte option index; with the hover auto-respawn rule off/long, never
+/// replying leaves the player stuck as a corpse. Reply via `build_respawn_select`.
+pub const OP_RESPAWN_WINDOW: u16 = 0x0ecb;       // RoF2: OP_RespawnWindow
+
+/// Build the client's OP_RespawnWindow reply: a 4-byte little-endian option index. The server
+/// populates option 0 as "Bind Location" (pushed to the front in SendRespawnBinds), so 0 = respawn
+/// at bind. `respawn_window_reply` validates an inbound window before choosing this.
+pub fn build_respawn_select(option: u32) -> [u8; 4] {
+    option.to_le_bytes()
+}
+
+/// Given an inbound OP_RespawnWindow payload, produce the client's reply selecting the bind option
+/// (index 0). Returns `None` if the payload is too short to be a valid window (header is four u32:
+/// initial_selection, hover_timer_ms, unknown, num_options), so a malformed packet isn't answered.
+pub fn respawn_window_reply(payload: &[u8]) -> Option<[u8; 4]> {
+    if payload.len() < 16 { return None; }
+    Some(build_respawn_select(0))
+}
 pub const OP_ZONE_CHANGE: u16 = 0x2d18;            // RoF2: OP_ZoneChange
 pub const OP_REQUEST_CLIENT_ZONE_CHANGE: u16 = 0x3fcf; // RoF2: OP_RequestClientZoneChange
 pub const OP_LOGOUT: u16 = 0x4ac6;                 // RoF2: OP_Logout
@@ -802,6 +822,22 @@ mod tests {
         assert_eq!(&cze[4..11], char_name.as_bytes(), "name at offset 4");
         assert_eq!(cze[11], 0, "NUL terminator after name");
         assert_eq!(&cze[68..76], &[0u8; 8], "unknown68+unknown72 must be zero");
+    }
+
+    #[test]
+    fn respawn_reply_selects_bind_for_valid_window() {
+        // 4-u32 header (initial_sel, hover_timer, unknown, num_options) + at least one option.
+        let window = vec![0u8; 16 + 26];
+        // Client must answer with a 4-byte option index; 0 = "Bind Location".
+        assert_eq!(respawn_window_reply(&window), Some([0, 0, 0, 0]));
+        assert_eq!(build_respawn_select(0), [0, 0, 0, 0]);
+        assert_eq!(build_respawn_select(2), [2, 0, 0, 0]);
+    }
+
+    #[test]
+    fn respawn_reply_ignores_malformed_window() {
+        // Too short to be a valid window header — don't answer.
+        assert_eq!(respawn_window_reply(&[0u8; 8]), None);
     }
 
     #[test]

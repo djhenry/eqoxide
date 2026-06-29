@@ -109,6 +109,23 @@ pub async fn run_gameplay_phase(
                     s.send_app_packet(OP_LOOT_ITEM, &packet.payload);
                     tracing::info!("EQ: auto-loot: taking item (echoed OP_LootItem)");
                 }
+                // Player died: the server opened the respawn hover window and holds us as a
+                // corpse until we pick an option. Auto-select 0 ("Bind Location") so an unattended
+                // session recovers instead of being stuck dead-in-place. The server then sends
+                // OP_ZonePlayerToBind + an HP update + a fresh OP_ZoneEntry self-spawn, which the
+                // existing handlers apply (position → bind, HP → alive, re-spawn), so no further
+                // client state reset is needed beyond clearing the "waiting to respawn" strategy.
+                OP_RESPAWN_WINDOW => {
+                    if let Some(reply) = respawn_window_reply(&packet.payload) {
+                        s.send_app_packet(OP_RESPAWN_WINDOW, &reply);
+                        gs.strategy = "Respawning at bind...".into();
+                        gs.log_msg("combat", "Respawning at bind point.");
+                        tracing::info!("EQ: respawn window — auto-selected bind (option 0)");
+                    } else {
+                        tracing::warn!("EQ: OP_RespawnWindow too short ({} bytes) — not answered",
+                            packet.payload.len());
+                    }
+                }
                 // Server booted us (typically another client logged in this same character).
                 // EQEmu's default is "second login wins"; the first client receives OP_GMKick.
                 // We're already kicked, so just disconnect the session and exit cleanly.
