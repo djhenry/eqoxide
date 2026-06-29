@@ -64,8 +64,28 @@ only missing piece is sending the reply.
 - `gameplay.rs`: on inbound `OP_RESPAWN_WINDOW`, auto-select option 0 (bind) and send the 4-byte
   reply, mirroring the existing `OP_LOOT_ITEM` echo; clear the "waiting to respawn" strategy. The
   rest of the respawn (position, HP, re-spawn) self-heals through existing handlers.
-- 282 unit tests pass. NOT yet live-validated (requires actually dying; Campy was in the `arena`
-  training zone with no hostiles). Verified end-to-end against EQEmu source instead.
+- 282 unit tests pass.
+
+## Live test (2026-06-29, GM-assisted) — IMPORTANT NUANCE
+A GM (Aiquestbot) summoned Campy to qeynos and slew her twice. BOTH deaths recovered correctly via
+the **direct `OP_ZonePlayerToBind` path** (existing `apply_bind_respawn`): "*** You have been
+slain! ***" → "Respawning at bind point" → alive at bind (0,10,5), movable (verified via /goto).
+The new `OP_RespawnWindow` handler fired **0 times** — this server has
+`RuleB(Character, RespawnFromHover)` **OFF**, so it sends `OP_ZonePlayerToBind` directly and never
+sends `OP_RespawnWindow (0x0ecb)`.
+
+Implications:
+- On the current server the user-visible "stuck corpse" symptom does NOT reproduce — death/respawn
+  already works via the direct-bind handler (which predates this bug report, commit 49bfce0). So
+  either the server's RespawnFromHover rule changed since the report, or the original stuck death
+  occurred under different conditions (natural mob death with hover ON).
+- This fix (answer `OP_RespawnWindow`) is correct + verified against EQEmu source and is
+  non-regressive (both live deaths recovered fine with it present), but its code path is only
+  exercised when `RespawnFromHover` is ON. It is defensive/future-proofing for that config.
+- To LIVE-validate the hover path, enable `Character:RespawnFromHover` on the server (`#rules set`
+  or DB + `#reload rules`) and die again — then expect the log line "respawn window — auto-selected
+  bind (option 0)".
 
 ## Status
-Fix implemented (pending live death validation)
+Fix implemented (source-verified, non-regressive); direct-bind death works live. Hover-path
+(this fix's code path) not yet live-exercised — server rule RespawnFromHover is off.
