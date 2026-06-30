@@ -392,9 +392,9 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         e.z = upd.z;
         e.heading = upd.heading;
         e.animation = upd.animation;
-        tracing::info!("EQ: npc_pos id={} name={} pos=({:.1},{:.1},{:.1})", sid, e.name, e.x, e.y, e.z);
+        tracing::debug!("EQ: npc_pos id={} name={} pos=({:.1},{:.1},{:.1})", sid, e.name, e.x, e.y, e.z);
     } else {
-        tracing::info!("EQ: npc_pos id={} NOT IN ENTITY MAP (known: {})", sid, gs.entities.len());
+        tracing::debug!("EQ: npc_pos id={} NOT IN ENTITY MAP (known: {})", sid, gs.entities.len());
     }
 }
 
