@@ -34,6 +34,18 @@ pub type FrameReq = Arc<Mutex<Option<oneshot::Sender<Vec<u8>>>>>;
 /// Target position for the navigation system. Set by /goto, cleared on arrival.
 pub type GotoTarget = Arc<Mutex<Option<(f32, f32, f32)>>>;
 
+/// Authoritative controller snapshot published by the render thread each frame and read by the nav
+/// thread to stream OP_ClientUpdate (design §2). Single source of position truth.
+pub type ControllerShared = Arc<Mutex<crate::movement::ControllerView>>;
+
+/// The `/goto` planner's per-frame movement intent. The nav planner writes `Some` while walking a
+/// path and `None` when idle/arrived; the render controller consumes it when no WASD key is held.
+pub type NavIntent = Arc<Mutex<Option<crate::movement::MoveIntent>>>;
+
+/// A large (>12u) server position correction the nav thread hands to the render controller to apply
+/// (teleport). Small deltas are ignored — the controller is authoritative (design §3.4).
+pub type PosCorrection = Arc<Mutex<Option<[f32; 3]>>>;
+
 /// Live entity name → (x, y, z) map, updated by login.rs as packets arrive.
 pub type EntityPositions = Arc<Mutex<HashMap<String, (f32, f32, f32)>>>;
 
