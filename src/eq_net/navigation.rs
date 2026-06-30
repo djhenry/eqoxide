@@ -100,14 +100,35 @@ pub fn build_memorize_packet(slot: u32, spell_id: u32, scribing: u32) -> Vec<u8>
     buf
 }
 
-/// `MoveItem_Struct` (12 bytes): from_slot, to_slot, number_in_stack. number_in_stack = 0 for a
-/// whole-item move (equip/cursor/rearrange); a count would split a stack. See the inline note at
-/// the /inventory/move handler for why 0 (not 1) is required for non-stackables.
-pub fn build_move_item(from_slot: u32, to_slot: u32) -> [u8; 12] {
-    let mut buf = [0u8; 12];
-    buf[0..4].copy_from_slice(&from_slot.to_le_bytes());
-    buf[4..8].copy_from_slice(&to_slot.to_le_bytes());
-    buf[8..12].copy_from_slice(&0u32.to_le_bytes());
+/// Encode one RoF2 `InventorySlot_Struct` (12 bytes) for a flat *possessions* slot — equipment
+/// 0-22, general inventory 23-32, cursor 33. RoF2 does NOT send a bare slot int; it sends a
+/// structured record {Type(i16), Unknown02, Slot(i16), SubIndex(i16), AugIndex(i16), Unknown01}
+/// which the server decodes via RoF2ToServerSlot (common/patches/rof2.cpp). For a top-level
+/// possessions slot: Type = typePossessions (0), Slot = the flat slot, SubIndex = SLOT_INVALID (-1),
+/// AugIndex = SOCKET_INVALID (-1). AugIndex MUST be in [-1, 6) or the server rejects the whole slot
+/// as SLOT_INVALID. (Bank/trade/world slots use other Type values + offsets; not handled here.)
+fn rof2_possessions_slot(slot: u32) -> [u8; 12] {
+    let mut s = [0u8; 12];
+    s[0..2].copy_from_slice(&0i16.to_le_bytes());          // Type = typePossessions
+    s[2..4].copy_from_slice(&0i16.to_le_bytes());          // Unknown02
+    s[4..6].copy_from_slice(&(slot as i16).to_le_bytes()); // Slot
+    s[6..8].copy_from_slice(&(-1i16).to_le_bytes());       // SubIndex = SLOT_INVALID (top-level)
+    s[8..10].copy_from_slice(&(-1i16).to_le_bytes());      // AugIndex = SOCKET_INVALID
+    s[10..12].copy_from_slice(&0i16.to_le_bytes());        // Unknown01
+    s
+}
+
+/// RoF2 `MoveItem_Struct` (28 bytes): from_slot(InventorySlot_Struct,12) + to_slot(…,12) +
+/// number_in_stack(u32). NOTE: unlike Titanium's 3×u32 flat struct, RoF2 slots are *structured*
+/// (see [`rof2_possessions_slot`]); a flat 12-byte packet fails the server's DECODE_LENGTH_EXACT and
+/// the move is silently dropped — that was the real eqoxide#11 scribe failure (the scroll never
+/// reached the cursor, so OP_MemorizeSpell scribing=0 saw an empty cursor). number_in_stack = 0 for
+/// a whole-item move (equip/cursor/rearrange); a count would split a stack. Possessions slots only.
+pub fn build_move_item(from_slot: u32, to_slot: u32) -> [u8; 28] {
+    let mut buf = [0u8; 28];
+    buf[0..12].copy_from_slice(&rof2_possessions_slot(from_slot));
+    buf[12..24].copy_from_slice(&rof2_possessions_slot(to_slot));
+    buf[24..28].copy_from_slice(&0u32.to_le_bytes()); // number_in_stack = 0 (whole item)
     buf
 }
 
@@ -865,11 +886,9 @@ impl Navigator {
         // takes the direct-swap/equip path. (A count would only be for splitting a stack.)
         let move_req = self.move_req.lock().unwrap().take();
         if let Some((from_slot, to_slot)) = move_req {
-            let mut buf = [0u8; 12];
-            buf[0..4].copy_from_slice(&from_slot.to_le_bytes());
-            buf[4..8].copy_from_slice(&to_slot.to_le_bytes());
-            buf[8..12].copy_from_slice(&0u32.to_le_bytes()); // number_in_stack = 0 (whole item)
-            stream.send_app_packet(OP_MOVE_ITEM, &buf);
+            // build_move_item emits the structured 28-byte RoF2 MoveItem_Struct; a flat 12-byte
+            // packet is silently dropped by the server (see build_move_item / eqoxide#11).
+            stream.send_app_packet(OP_MOVE_ITEM, &build_move_item(from_slot, to_slot));
             // EQEmu applies the move silently (no echo), so mirror it into our snapshot or
             // /inventory goes stale and the next move corrupts it (phantom items).
             gs.move_item(from_slot as i32, to_slot as i32);
@@ -1258,6 +1277,11 @@ impl Navigator {
         if self.give_state.is_none() {
             if let Some((npc_id, from_slot)) = self.give.lock().unwrap().take() {
                 // Step 1: put the item on the cursor (skip if it's already there).
+                // FIXME(eqoxide#11 follow-up): this give/trade flow still emits the legacy flat
+                // 12-byte MoveItem. Like the scribe path, the server silently drops it (RoF2 wants
+                // the 28-byte structured MoveItem_Struct — see build_move_item). The cursor→trade
+                // step below also needs RoF2 typeTrade slot encoding, so the whole give flow must be
+                // ported together; left as a matched pair here to not half-fix it.
                 if from_slot != SLOT_CURSOR {
                     let mut mv = [0u8; 12];
                     mv[0..4].copy_from_slice(&from_slot.to_le_bytes());
@@ -1582,13 +1606,25 @@ mod door_tests {
     }
 
     #[test]
-    fn move_item_layout_is_from_to_zero() {
-        // MoveItem_Struct: from_slot, to_slot, number_in_stack(=0 whole item). Used by the scribe
-        // flow to put the scroll on the cursor (slot 33) before OP_MemorizeSpell. (eqoxide#11)
+    fn move_item_is_rof2_28byte_structured_slots() {
+        // RoF2 MoveItem_Struct = from_slot(InventorySlot_Struct,12) + to_slot(…,12) +
+        // number_in_stack(u32) = 28 bytes. Each slot is structured {Type, Unk02, Slot, SubIndex,
+        // AugIndex, Unk01}, NOT a bare int — the server's RoF2ToServerSlot reads these fields and a
+        // flat 12-byte packet fails DECODE_LENGTH_EXACT (silently dropped → the eqoxide#11 scribe
+        // failure: the scroll never reached the cursor). Used by the scribe flow to move a scroll
+        // from general slot 23 → cursor (33) before OP_MemorizeSpell.
         let pkt = build_move_item(23, SLOT_CURSOR);
-        assert_eq!(pkt.len(), 12);
-        assert_eq!(u32::from_le_bytes(pkt[0..4].try_into().unwrap()), 23);
-        assert_eq!(u32::from_le_bytes(pkt[4..8].try_into().unwrap()), SLOT_CURSOR);
-        assert_eq!(u32::from_le_bytes(pkt[8..12].try_into().unwrap()), 0, "whole-item move");
+        assert_eq!(pkt.len(), 28);
+        // from_slot: Type=typePossessions(0), Slot=23, SubIndex/AugIndex=SLOT_INVALID(-1)
+        assert_eq!(i16::from_le_bytes([pkt[0], pkt[1]]), 0, "from Type=typePossessions");
+        assert_eq!(i16::from_le_bytes([pkt[4], pkt[5]]), 23, "from Slot");
+        assert_eq!(i16::from_le_bytes([pkt[6], pkt[7]]), -1, "from SubIndex=SLOT_INVALID");
+        assert_eq!(i16::from_le_bytes([pkt[8], pkt[9]]), -1, "from AugIndex=SOCKET_INVALID");
+        // to_slot (offset +12): Type=typePossessions(0), Slot=cursor(33)
+        assert_eq!(i16::from_le_bytes([pkt[12], pkt[13]]), 0, "to Type=typePossessions");
+        assert_eq!(i16::from_le_bytes([pkt[16], pkt[17]]), SLOT_CURSOR as i16, "to Slot=cursor");
+        assert_eq!(i16::from_le_bytes([pkt[18], pkt[19]]), -1, "to SubIndex=SLOT_INVALID");
+        // number_in_stack = 0 (whole-item move; a count would split a stack)
+        assert_eq!(u32::from_le_bytes(pkt[24..28].try_into().unwrap()), 0, "whole-item move");
     }
 }
