@@ -21,9 +21,12 @@ impl SpellDb {
     pub fn empty() -> Self { Self::default() }
 
     /// Load from a `spells_us.txt` path. Missing/unreadable file → empty db (graceful).
+    /// Classic EQ `spells_us.txt` is Latin-1/Windows-1252 (accented spell names), NOT UTF-8, so a
+    /// strict `read_to_string` bails on the first non-ASCII byte ("stream did not contain valid
+    /// UTF-8"). Read raw bytes and decode as Latin-1 instead (eqoxide#7).
     pub fn load(path: &str) -> Self {
-        match std::fs::read_to_string(path) {
-            Ok(text) => Self::parse_str(&text),
+        match std::fs::read(path) {
+            Ok(bytes) => Self::parse_str(&latin1_to_string(&bytes)),
             Err(e) => {
                 tracing::warn!("spells: could not read {path}: {e} (gems will show no name/icon)");
                 Self::empty()
@@ -45,6 +48,13 @@ impl SpellDb {
     }
 
     pub fn get(&self, id: u32) -> Option<&SpellInfo> { self.by_id.get(&id) }
+}
+
+/// Decode bytes as Latin-1 (ISO-8859-1): each byte 0x00–0xFF maps to the identical Unicode
+/// codepoint U+0000–U+00FF. Lossless for Latin-1 content and never fails — unlike strict UTF-8,
+/// which rejects classic EQ text tables on their first accented byte.
+pub fn latin1_to_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| b as char).collect()
 }
 
 /// Flat 1-based icon index → (sheet, col, row). icon 0 is treated as index 1.
@@ -80,6 +90,29 @@ mod tests {
         assert_eq!(db.get(200).map(|s| s.icon_id), Some(35));
         assert_eq!(db.get(5).map(|s| s.name.as_str()), Some("Cloak"));
         assert!(db.get(0).is_none(), "zero-id lines are skipped");
+    }
+
+    #[test]
+    fn latin1_decodes_high_bytes_without_failing() {
+        // 0xE9 = é, 0xF1 = ñ in Latin-1; these are invalid UTF-8 lead bytes on their own, which is
+        // exactly what made read_to_string bail on spells_us.txt (eqoxide#7).
+        assert_eq!(latin1_to_string(&[0x45, 0xE9, 0x70, 0xF1]), "Eépñ");
+    }
+
+    #[test]
+    fn parse_handles_latin1_accented_spell_name() {
+        // A spell line whose name carries a Latin-1 byte (0xE9 = é) must decode, not blank out.
+        let mut f = vec!["0"; 150];
+        f[0] = "300"; f[144] = "42";
+        let line = f.join("^");
+        let mut bytes = line.into_bytes();
+        // splice the name "Fé" into col1 (between the first and second carets)
+        let first_caret = bytes.iter().position(|&b| b == b'^').unwrap();
+        let second_caret = first_caret + 1 + bytes[first_caret + 1..].iter().position(|&b| b == b'^').unwrap();
+        bytes.splice(first_caret + 1..second_caret, vec![b'F', 0xE9]);
+
+        let db = SpellDb::parse_str(&latin1_to_string(&bytes));
+        assert_eq!(db.get(300).map(|s| s.name.as_str()), Some("Fé"));
     }
 
     #[test]
