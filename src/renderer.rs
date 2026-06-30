@@ -702,9 +702,18 @@ impl EqRenderer {
             Some(m) => m.clone(),
             None => { self.weapon_cache.insert(key, None); return; }
         };
+        // Collect only the texture names this weapon's meshes actually reference, then
+        // upload just those — not all ~29 MB of textures from the full weapons.glb.
+        let referenced: std::collections::HashSet<String> = weapon_meshes.iter()
+            .filter_map(|m| m.texture_name.as_ref().map(|n| n.to_lowercase()))
+            .collect();
+        let want_tex: Vec<crate::assets::TextureData> = self.weapon_tex.iter()
+            .filter(|t| referenced.contains(&t.name.to_lowercase()))
+            .cloned()
+            .collect();
         let (_tex, bgs) = crate::gpu::upload_textures(
-            &self.device, &self.queue, &self.weapon_tex, &self.layouts.texture_bgl);
-        let tex_names: Vec<String> = self.weapon_tex.iter().map(|t| t.name.clone()).collect();
+            &self.device, &self.queue, &want_tex, &self.layouts.texture_bgl);
+        let tex_names: Vec<String> = want_tex.iter().map(|t| t.name.clone()).collect();
         let mut meshes = Vec::new();
         for m in &weapon_meshes {
             if m.positions.is_empty() || m.indices.is_empty() { continue; }
