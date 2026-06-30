@@ -776,19 +776,19 @@ impl EqRenderer {
 
     /// Load + GPU-upload the door/object models for a zone. Clears any previously loaded
     /// door models first (zone reload). Models are uploaded with the same libeq→render axis
-    /// swap as weapons/zone meshes. Textures from `load_object_models` are uploaded into the
-    /// shared `door_textures` and linked per mesh by `texture_idx`. Per-model local AABBs are
+    /// swap as weapons/zone meshes. Textures from the GLB are uploaded into the shared
+    /// `door_textures` and linked per mesh by `texture_idx`. Per-model local AABBs are
     /// recorded in `door_bounds` for click-picking.
-    pub fn load_door_models(&mut self, main_s3d: &std::path::Path, obj_s3d: &std::path::Path) {
+    pub fn load_door_models(&mut self, doors_glb: &std::path::Path) {
         use wgpu::util::DeviceExt;
         self.door_models.clear();
         self.door_bounds.clear();
         self.warned_missing_doors.clear();
 
-        let (models, textures) = match crate::assets::load_object_models(main_s3d, obj_s3d) {
+        let (models, textures) = match crate::assets::ZoneAssets::object_models_from_glb(doors_glb) {
             Ok(m) => m,
             Err(e) => {
-                tracing::warn!("doors: load_object_models failed ({}); doors will use fallback boxes", e);
+                tracing::warn!("doors: load {} failed ({}); fallback boxes", doors_glb.display(), e);
                 return;
             }
         };
