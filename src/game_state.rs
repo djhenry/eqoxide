@@ -178,6 +178,12 @@ pub struct GameState {
     pub cur_hp: i32,
     pub max_hp: i32,
     pub mana_pct: f32,
+    /// Player's absolute current/max mana. Seeded from the PlayerProfile (no max in the profile, so
+    /// max is seeded = cur at zone-in) and updated from OP_ManaChange, which carries only the new
+    /// current mana — so `max_mana` is a high-water-mark (accurate once the char has been at full
+    /// mana, i.e. immediately at zone-in for a rested caster). See `set_mana`. (eqoxide#27)
+    pub cur_mana: i32,
+    pub max_mana: i32,
     pub xp_pct: f32,
     /// Coin on hand (platinum, gold, silver, copper), from the player profile.
     pub coin: [u32; 4],
@@ -405,6 +411,17 @@ impl GameState {
         }
     }
 
+    /// Set the player's current mana and recompute `mana_pct`. The mana wire (PlayerProfile seed,
+    /// OP_ManaChange) carries only the *current* mana — there is no max in either — so `max_mana`
+    /// is tracked as a high-water-mark: it grows to the largest current mana seen. At zone-in a
+    /// rested caster is at full mana, so the seed sets the correct max; spending then lowers the
+    /// percent. (eqoxide#27)
+    pub fn set_mana(&mut self, cur_mana: i32) {
+        self.cur_mana = cur_mana;
+        if cur_mana > self.max_mana { self.max_mana = cur_mana; }
+        self.mana_pct = (cur_mana as f32 / self.max_mana.max(1) as f32) * 100.0;
+    }
+
     #[allow(dead_code)]
     pub fn nearby_npcs(&self, max_dist: f32) -> Vec<&Entity> {
         let mut result: Vec<&Entity> = self
@@ -596,6 +613,24 @@ mod tests {
         gs.player_id = 99;
         gs.update_hp(99, 75, 100);
         assert!((gs.hp_pct - 75.0).abs() < 1e-4, "expected 75.0, got {}", gs.hp_pct);
+    }
+
+    #[test]
+    fn set_mana_seeds_max_then_tracks_spending() {
+        let mut gs = GameState::new();
+        // First call (seed at zone-in, full mana): max grows from 0 to cur → 100%.
+        gs.set_mana(500);
+        assert_eq!(gs.cur_mana, 500);
+        assert_eq!(gs.max_mana, 500, "max seeded from first (full) value");
+        assert!((gs.mana_pct - 100.0).abs() < 1e-4);
+        // Spending lowers cur, max held → percent drops.
+        gs.set_mana(200);
+        assert_eq!(gs.max_mana, 500, "spending must not lower the high-water max");
+        assert!((gs.mana_pct - 40.0).abs() < 1e-4, "200/500 = 40%, got {}", gs.mana_pct);
+        // Regen above the prior max grows the high-water mark (e.g. seeded while not full).
+        gs.set_mana(600);
+        assert_eq!(gs.max_mana, 600);
+        assert!((gs.mana_pct - 100.0).abs() < 1e-4);
     }
 
     #[test]
