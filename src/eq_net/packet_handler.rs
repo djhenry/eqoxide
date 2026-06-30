@@ -490,6 +490,10 @@ pub struct ProfileInfo {
     pub coin: [u32; 4],  // platinum, gold, silver, copper
     pub stats: [u32; 7], // STR, STA, CHA, DEX, INT, AGI, WIS
     pub mem_spells: [u32; 9], // 9 memorized spell-gem ids; 0xFFFFFFFF = empty
+    /// Current HP from the profile (rof2_structs.h /*00948*/ cur_hp; before `disciplines` so the
+    /// struct offset is correct). The profile carries no max_hp (it's derived), so the caller seeds
+    /// max_hp = cur_hp (full at zone-in) until the first real OP_HPUpdate. (eqoxide#19)
+    pub cur_hp: u32,
 }
 
 /// Parse the RoF2 PlayerProfile_Struct wire packet for the fields needed by the HUD/API.
@@ -544,7 +548,10 @@ pub fn parse_player_profile(payload: &[u8]) -> Option<ProfileInfo> {
     let coin = if payload.len() >= 13285 {
         [u32_at(13269), u32_at(13273), u32_at(13277), u32_at(13281)]
     } else { [0u32; 4] };
-    Some(ProfileInfo { level, class_id, stats, coin, mem_spells })
+    // cur_hp: rof2_structs.h /*00948*/ — before `disciplines`, so the struct offset is correct
+    // (same reliable region as stats@952). The len>=980 check above already guarantees @948 is read.
+    let cur_hp = u32_at(948);
+    Some(ProfileInfo { level, class_id, stats, coin, mem_spells, cur_hp })
 }
 
 pub fn parse_begin_cast(p: &[u8]) -> Option<(u16, u16, u32)> {
@@ -596,6 +603,17 @@ fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
         gs.coin = p.coin;
         gs.stats = p.stats;
         gs.mem_spells = p.mem_spells;
+        // Seed the player's own HP. The server only sends a self OP_HPUpdate when HP *changes*
+        // (EQEmu Mob::SendHPUpdate), so without this the player's hp stays 0/0 at full health
+        // forever — the HUD/API show no health (eqoxide#19). The profile has no max_hp (derived),
+        // so use cur_hp as the initial max (full at zone-in); the first real OP_HPUpdate then
+        // supplies the true max. Don't clobber a max already learned from an OP_HPUpdate.
+        if p.cur_hp > 0 {
+            gs.cur_hp = p.cur_hp as i32;
+            if gs.max_hp <= 0 { gs.max_hp = p.cur_hp as i32; }
+            gs.hp_pct = (gs.cur_hp as f32 / gs.max_hp.max(1) as f32) * 100.0;
+            tracing::info!("EQ: PlayerProfile: seeded hp={}/{} ({:.0}%)", gs.cur_hp, gs.max_hp, gs.hp_pct);
+        }
     }
 
     // ── Face + hair style (rof2_structs.h PlayerProfile_Struct) ────────────────
@@ -1272,6 +1290,7 @@ mod tests {
         let mut buf = vec![0u8; 14000];
         buf[21] = 9;   // class_ = Rogue
         buf[22] = 12;  // level
+        buf[948..952].copy_from_slice(&1234u32.to_le_bytes());  // cur_hp @948 (before disciplines)
         buf[952..956].copy_from_slice(&75u32.to_le_bytes());    // STR
         buf[976..980].copy_from_slice(&110u32.to_le_bytes());   // WIS
         // mem_spells[0] @9784 = 200 (Minor Healing), mem_spells[1] @9788 = 0xFFFFFFFF (empty)
@@ -1288,6 +1307,7 @@ mod tests {
         assert_eq!(p.coin, [5, 3, 7, 9]);
         assert_eq!(p.stats[0], 75);  // STR
         assert_eq!(p.stats[6], 110); // WIS
+        assert_eq!(p.cur_hp, 1234);  // cur_hp @948
         assert_eq!(class_name(p.class_id), "Rogue");
         assert_eq!(p.mem_spells[0], 200);
         assert_eq!(p.mem_spells[1], 0xFFFF_FFFF);
@@ -1851,6 +1871,31 @@ mod tests {
         assert_eq!(gs.player_level, 35);
         assert_eq!(gs.player_gender, 1);
         assert_eq!(gs.player_race, "ELF");
+    }
+
+    #[test]
+    fn player_profile_seeds_player_hp() {
+        use super::apply_player_profile;
+        // The server only sends a self OP_HPUpdate on HP *change*, so the profile must seed the
+        // player's hp or it stays 0/0 at full health (eqoxide#19). cur_hp @948; no max in the
+        // profile → seed max = cur (full at zone-in) → 100%.
+        let mut gs = GameState::new();
+        let mut buf = vec![0u8; 1000];
+        buf[21] = 1;  // class (warrior) — len/offset sanity
+        buf[22] = 10; // level
+        buf[948..952].copy_from_slice(&850u32.to_le_bytes()); // cur_hp
+        apply_player_profile(&mut gs, &buf);
+        assert_eq!(gs.cur_hp, 850);
+        assert_eq!(gs.max_hp, 850, "max seeded from cur (full at zone-in)");
+        assert!((gs.hp_pct - 100.0).abs() < 1e-3, "full health = 100%, got {}", gs.hp_pct);
+
+        // A real OP_HPUpdate supplies the true max; a later profile updates cur but must NOT
+        // clobber the learned max (so the percent stays accurate).
+        gs.update_hp(gs.player_id, 600, 1000); // player_id == 0 by default → player branch
+        apply_player_profile(&mut gs, &buf);   // profile again: cur=850, max stays 1000
+        assert_eq!(gs.max_hp, 1000, "must not overwrite a max learned from OP_HPUpdate");
+        assert_eq!(gs.cur_hp, 850);
+        assert!((gs.hp_pct - 85.0).abs() < 1e-3, "850/1000 = 85%, got {}", gs.hp_pct);
     }
 
     // ── RoF2 Animation_Struct byte-layout tests ──────────────────────────────────────────────────
