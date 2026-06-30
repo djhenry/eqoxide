@@ -125,10 +125,14 @@ pub struct EqRenderer {
     /// Cache of uploaded armor texture bind groups keyed by base name (no extension).
     /// `None` = known-missing (negative cache) so we don't rescan every frame.
     pub equipment_tex_cache: std::collections::HashMap<String, Option<wgpu::BindGroup>>,
-    /// Path to the EQ s3d assets (set in load_character_models) — used to load weapon models.
+    /// Path to the EQ s3d assets (set in load_character_models).
     pub assets_path: std::path::PathBuf,
     /// Held weapon models cached by IDFile. `None` = tried and not found (negative cache).
     pub weapon_cache: std::collections::HashMap<String, Option<crate::gpu::GpuWeapon>>,
+    /// Pre-decoded weapon meshes by UPPERCASE IDFile key, loaded once from weapons.glb.
+    pub weapon_lib: std::collections::HashMap<String, Vec<crate::assets::MeshData>>,
+    /// CPU-decoded textures for all weapons, loaded once from weapons.glb.
+    pub weapon_tex: Vec<crate::assets::TextureData>,
     /// Door object models, keyed by UPPERCASE base name (e.g. "DOOR1"). Rebuilt per zone load.
     pub door_models: std::collections::HashMap<String, crate::gpu::GpuWeapon>,
     /// Shared decoded textures for ALL door models in the current zone. A door mesh's
@@ -252,6 +256,8 @@ impl EqRenderer {
             equipment_tex_cache: std::collections::HashMap::new(),
             assets_path: std::path::PathBuf::new(),
             weapon_cache: std::collections::HashMap::new(),
+            weapon_lib: std::collections::HashMap::new(),
+            weapon_tex: Vec::new(),
             door_models: std::collections::HashMap::new(),
             door_textures: Vec::new(),
             door_bounds: std::collections::HashMap::new(),
@@ -527,6 +533,14 @@ impl EqRenderer {
             }
         }
         tracing::info!("equip: indexed {} armor textures", self.equip_index.len());
+
+        let weapons_glb = models_dir.join("weapons.glb");
+        if weapons_glb.exists() {
+            match crate::assets::ZoneAssets::object_models_from_glb(&weapons_glb) {
+                Ok((m, t)) => { self.weapon_tex = t; self.weapon_lib = m; }
+                Err(e) => tracing::warn!("weapons: load {} failed: {}", weapons_glb.display(), e),
+            }
+        }
     }
 
     /// Upload one `ModelAsset` to the GPU as a `GpuModel` (skinned when it has a
@@ -675,21 +689,24 @@ impl EqRenderer {
         None
     }
 
-    /// Load + GPU-upload a held weapon model by IDFile (e.g. "IT10649") and cache it. Negative-cached
-    /// on miss so we don't rescan gequip every frame. Drawn at the hand bone by the player pass.
+    /// GPU-upload a held weapon model by IDFile (e.g. "IT10649") from the pre-loaded
+    /// `weapon_lib` (populated from weapons.glb at startup) and cache it. Negative-cached
+    /// on miss so we don't re-check every frame. Drawn at the hand bone by the player pass.
     pub fn ensure_weapon(&mut self, idfile: &str) {
         use wgpu::util::DeviceExt;
         let key = idfile.trim().to_uppercase();
         if key.is_empty() || self.weapon_cache.contains_key(&key) { return; }
-        let assets = match crate::assets::load_weapon_model(&self.assets_path, &key) {
-            Some(a) => a,
+        // Clone the mesh list so we can release the borrow on self.weapon_lib before
+        // mutably borrowing self.device / self.queue / self.weapon_cache below.
+        let weapon_meshes = match self.weapon_lib.get(&key) {
+            Some(m) => m.clone(),
             None => { self.weapon_cache.insert(key, None); return; }
         };
         let (_tex, bgs) = crate::gpu::upload_textures(
-            &self.device, &self.queue, &assets.textures, &self.layouts.texture_bgl);
-        let tex_names: Vec<String> = assets.textures.iter().map(|t| t.name.clone()).collect();
+            &self.device, &self.queue, &self.weapon_tex, &self.layouts.texture_bgl);
+        let tex_names: Vec<String> = self.weapon_tex.iter().map(|t| t.name.clone()).collect();
         let mut meshes = Vec::new();
-        for m in &assets.terrain {
+        for m in &weapon_meshes {
             if m.positions.is_empty() || m.indices.is_empty() { continue; }
             let [cx, cy, cz] = m.center;
             // libeq [p0,p1,p2] -> render [p2,p0,p1] (same axis convention as zone/static meshes).
@@ -702,7 +719,7 @@ impl EqRenderer {
                 }
             }).collect();
             let texture_idx = m.texture_name.as_ref()
-                .and_then(|tn| tex_names.iter().position(|t| t == tn));
+                .and_then(|tn| tex_names.iter().position(|t| t == &tn.to_lowercase()));
             let vertex_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("weapon_vbuf"), contents: bytemuck::cast_slice(&verts),
                 usage: wgpu::BufferUsages::VERTEX });
