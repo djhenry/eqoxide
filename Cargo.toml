@@ -29,8 +29,6 @@ winit = "0.30"
 egui = "0.29"
 egui-wgpu = "0.29"
 egui-winit = "0.29"
-libeq_pfs = { git = "https://github.com/cjab/libeq", package = "libeq_pfs" }
-libeq_wld = { git = "https://github.com/cjab/libeq", package = "libeq_wld" }
 serde_yaml = "0.9"
 shellexpand = "3"
 gltf = { version = "1", features = ["import", "extras"] }

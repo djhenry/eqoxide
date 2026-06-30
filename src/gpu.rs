@@ -31,8 +31,8 @@ pub struct GpuMesh {
 }
 
 /// A zone object model uploaded once and drawn instanced: one vertex/index buffer for the model
-/// mesh (in RAW libeq model-local space — the instanced shader applies the per-instance matrix and
-/// the libeq→render axis swizzle), plus an instance-transform buffer of column-major 4×4 matrices.
+/// mesh (in raw EQ model-local space — the instanced shader applies the per-instance matrix and
+/// the EQ→render axis swizzle), plus an instance-transform buffer of column-major 4×4 matrices.
 pub struct GpuInstancedMesh {
     pub vertex_buf:     wgpu::Buffer,
     pub index_buf:      wgpu::Buffer,

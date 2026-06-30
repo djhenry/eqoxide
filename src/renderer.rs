@@ -120,15 +120,17 @@ pub struct EqRenderer {
     pub entity_uniform_pool: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
     /// Pre-allocated joint matrix buffers (reused every frame via write_buffer).
     pub joint_buf_pool:      Vec<(wgpu::Buffer, wgpu::BindGroup)>,
-    /// Lowercase armor texture filename → S3D archive containing it (built at startup).
-    pub equip_index: std::collections::HashMap<String, std::path::PathBuf>,
     /// Cache of uploaded armor texture bind groups keyed by base name (no extension).
     /// `None` = known-missing (negative cache) so we don't rescan every frame.
     pub equipment_tex_cache: std::collections::HashMap<String, Option<wgpu::BindGroup>>,
-    /// Path to the EQ s3d assets (set in load_character_models) — used to load weapon models.
+    /// Path to the EQ s3d assets (set in load_character_models).
     pub assets_path: std::path::PathBuf,
     /// Held weapon models cached by IDFile. `None` = tried and not found (negative cache).
     pub weapon_cache: std::collections::HashMap<String, Option<crate::gpu::GpuWeapon>>,
+    /// Pre-decoded weapon meshes by UPPERCASE IDFile key, loaded once from weapons.glb.
+    pub weapon_lib: std::collections::HashMap<String, Vec<crate::assets::MeshData>>,
+    /// CPU-decoded textures for all weapons, loaded once from weapons.glb.
+    pub weapon_tex: Vec<crate::assets::TextureData>,
     /// Door object models, keyed by UPPERCASE base name (e.g. "DOOR1"). Rebuilt per zone load.
     pub door_models: std::collections::HashMap<String, crate::gpu::GpuWeapon>,
     /// Shared decoded textures for ALL door models in the current zone. A door mesh's
@@ -248,10 +250,11 @@ impl EqRenderer {
             zone_assets: None,
             entity_uniform_pool,
             joint_buf_pool,
-            equip_index: std::collections::HashMap::new(),
             equipment_tex_cache: std::collections::HashMap::new(),
             assets_path: std::path::PathBuf::new(),
             weapon_cache: std::collections::HashMap::new(),
+            weapon_lib: std::collections::HashMap::new(),
+            weapon_tex: Vec::new(),
             door_models: std::collections::HashMap::new(),
             door_textures: Vec::new(),
             door_bounds: std::collections::HashMap::new(),
@@ -303,9 +306,10 @@ impl EqRenderer {
 
                 for (i, &p) in mesh.positions.iter().enumerate() {
                     let normal = mesh.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
-                    // libeq axes map to world as: render.X = server_x = p[2], render.Y = server_y
-                    // = p[0], render.Z (up) = p[1]. (The two horizontal axes are swapped vs the
-                    // old assumption; confirmed by zone safe-point/geometry alignment across zones.)
+                    // EQ WLD axis layout: [east, up, north] → render [p2, p0, p1].
+                    // render.X = server_x = p[2], render.Y = server_y = p[0], render.Z (up) = p[1].
+                    // (The two horizontal axes are swapped vs the old assumption; confirmed by zone
+                    // safe-point/geometry alignment across zones.)
                     entry.0.push(Vertex {
                         position: [p[2] + cz, p[0] + cx, p[1] + cy],
                         normal:   [normal[2], normal[0], normal[1]],
@@ -347,9 +351,9 @@ impl EqRenderer {
         // Sort merged meshes so same-texture groups are contiguous (they already are, but be safe).
         self.gpu_meshes.sort_by_key(|m| m.texture_idx.map_or(usize::MAX, |i| i));
 
-        // Build GPU-instanced object models: each ObjectModel mesh is uploaded ONCE (in RAW
-        // libeq model-local space — the instanced shader applies the instance matrix and the
-        // libeq→render axis swizzle), plus a single instance-transform buffer for all placements.
+        // Build GPU-instanced object models: each ObjectModel mesh is uploaded ONCE (in raw
+        // EQ model-local space — the instanced shader applies the instance matrix and the
+        // EQ→render axis swizzle), plus a single instance-transform buffer for all placements.
         {
             let mut instanced: Vec<crate::gpu::GpuInstancedMesh> = Vec::new();
             for model in &assets.objects {
@@ -426,47 +430,18 @@ impl EqRenderer {
         ];
 
         for &key in ARCHETYPES {
-            // Try glTF first, then fall back to EQ _chr.s3d.
             let gltf_path = models_dir.join(format!("{}.glb", key));
             let asset = if gltf_path.exists() {
                 match ModelAsset::load(&gltf_path) {
-                    Ok(a) => Some(a),
+                    Ok(a) => a,
                     Err(e) => {
-                        tracing::warn!("renderer: glTF load failed for '{}': {}", key, e);
-                        None
+                        tracing::error!("renderer: glTF load failed for '{}': {}", key, e);
+                        continue;
                     }
                 }
             } else {
-                None
-            };
-
-            let asset = match asset {
-                Some(a) => a,
-                None => {
-                    // Fall back to EQ _chr.s3d archive.
-                    let chr_name = crate::models::archetype_to_chr_s3d(key);
-                    let chr_asset = chr_name.and_then(|name| {
-                        let path = models_dir.join(name);
-                        if path.exists() {
-                            match ModelAsset::load_from_chr_s3d(&path) {
-                                Ok(a) => Some(a),
-                                Err(e) => {
-                                    tracing::warn!("renderer: chr S3D load failed for '{}': {}", key, e);
-                                    None
-                                }
-                            }
-                        } else {
-                            None
-                        }
-                    });
-                    match chr_asset {
-                        Some(a) => a,
-                        None => {
-                            tracing::info!("renderer: no model for archetype '{}'", key);
-                            continue;
-                        }
-                    }
-                }
+                tracing::error!("renderer: no GLB found for archetype '{}' at {}", key, gltf_path.display());
+                continue;
             };
 
             // Build the male model (gender 0) plus a female variant (gender 1) from
@@ -504,29 +479,13 @@ impl EqRenderer {
             }
         }
 
-        // Index armor textures: shared velious sets (global17-23_amr) + each
-        // archetype's chr/chr2 archives (lower material numbers). No decoding here.
-        for n in 17..=23 {
-            crate::assets::index_s3d_textures(
-                &models_dir.join(format!("global{}_amr.s3d", n)), &mut self.equip_index);
-        }
-        // global_chr.s3d is the combined all-races base archive — it carries the low-material
-        // (00-04) body textures that the per-race *_chr archives can be missing (e.g. human is
-        // missing chest material 03). Index it for TEXTURES only (we never load it as a model).
-        crate::assets::index_s3d_textures(
-            &models_dir.join("global_chr.s3d"), &mut self.equip_index);
-        for &key in ARCHETYPES {
-            if let Some(name) = crate::models::archetype_to_chr_s3d(key) {
-                crate::assets::index_s3d_textures(&models_dir.join(name), &mut self.equip_index);
-                // also the _chr2 companion if present
-                let chr2 = name.replace("_chr.s3d", "_chr2.s3d");
-                let chr2_path = models_dir.join(&chr2);
-                if chr2_path.exists() {
-                    crate::assets::index_s3d_textures(&chr2_path, &mut self.equip_index);
-                }
+        let weapons_glb = models_dir.join("weapons.glb");
+        if weapons_glb.exists() {
+            match crate::assets::ZoneAssets::object_models_from_glb(&weapons_glb) {
+                Ok((m, t)) => { self.weapon_tex = t; self.weapon_lib = m; }
+                Err(e) => tracing::warn!("weapons: load {} failed: {}", weapons_glb.display(), e),
             }
         }
-        tracing::info!("equip: indexed {} armor textures", self.equip_index.len());
     }
 
     /// Upload one `ModelAsset` to the GPU as a `GpuModel` (skinned when it has a
@@ -660,39 +619,53 @@ impl EqRenderer {
             .or_else(|| self.gpu_character_models.get(&(key, 0)))
     }
 
-    /// Load + upload one armor texture (trying .bmp then .dds). Returns its bind group.
+    /// Load + upload one armor texture from the equiptex PNG cache. Returns its bind group.
     pub fn load_equip_texture(&self, base_name: &str) -> Option<wgpu::BindGroup> {
-        for ext in ["bmp", "dds"] {
-            let fname = format!("{}.{}", base_name, ext);
-            if let Some(arch) = self.equip_index.get(&fname) {
-                if let Some(tex) = crate::assets::load_one_texture_from_s3d(arch, &fname) {
-                    let (_gpu, mut bgs) = upload_textures(
-                        &self.device, &self.queue, &[tex], &self.layouts.texture_bgl);
-                    return bgs.pop();
-                }
-            }
-        }
-        None
+        let path = self.assets_path.join(format!("equiptex/{}.png", base_name.to_lowercase()));
+        let bytes = std::fs::read(&path).ok()?;
+        let img = image::load_from_memory(&bytes).ok()?;
+        let rgba = img.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        let tex = crate::assets::TextureData {
+            name: base_name.to_lowercase(),
+            width,
+            height,
+            rgba: rgba.into_raw(),
+        };
+        let (_gpu, mut bgs) = upload_textures(&self.device, &self.queue, &[tex], &self.layouts.texture_bgl);
+        bgs.pop()
     }
 
-    /// Load + GPU-upload a held weapon model by IDFile (e.g. "IT10649") and cache it. Negative-cached
-    /// on miss so we don't rescan gequip every frame. Drawn at the hand bone by the player pass.
+    /// GPU-upload a held weapon model by IDFile (e.g. "IT10649") from the pre-loaded
+    /// `weapon_lib` (populated from weapons.glb at startup) and cache it. Negative-cached
+    /// on miss so we don't re-check every frame. Drawn at the hand bone by the player pass.
     pub fn ensure_weapon(&mut self, idfile: &str) {
         use wgpu::util::DeviceExt;
         let key = idfile.trim().to_uppercase();
         if key.is_empty() || self.weapon_cache.contains_key(&key) { return; }
-        let assets = match crate::assets::load_weapon_model(&self.assets_path, &key) {
-            Some(a) => a,
+        // Clone the mesh list so we can release the borrow on self.weapon_lib before
+        // mutably borrowing self.device / self.queue / self.weapon_cache below.
+        let weapon_meshes = match self.weapon_lib.get(&key) {
+            Some(m) => m.clone(),
             None => { self.weapon_cache.insert(key, None); return; }
         };
+        // Collect only the texture names this weapon's meshes actually reference, then
+        // upload just those — not all ~29 MB of textures from the full weapons.glb.
+        let referenced: std::collections::HashSet<String> = weapon_meshes.iter()
+            .filter_map(|m| m.texture_name.as_ref().map(|n| n.to_lowercase()))
+            .collect();
+        let want_tex: Vec<crate::assets::TextureData> = self.weapon_tex.iter()
+            .filter(|t| referenced.contains(&t.name.to_lowercase()))
+            .cloned()
+            .collect();
         let (_tex, bgs) = crate::gpu::upload_textures(
-            &self.device, &self.queue, &assets.textures, &self.layouts.texture_bgl);
-        let tex_names: Vec<String> = assets.textures.iter().map(|t| t.name.clone()).collect();
+            &self.device, &self.queue, &want_tex, &self.layouts.texture_bgl);
+        let tex_names: Vec<String> = want_tex.iter().map(|t| t.name.clone()).collect();
         let mut meshes = Vec::new();
-        for m in &assets.terrain {
+        for m in &weapon_meshes {
             if m.positions.is_empty() || m.indices.is_empty() { continue; }
             let [cx, cy, cz] = m.center;
-            // libeq [p0,p1,p2] -> render [p2,p0,p1] (same axis convention as zone/static meshes).
+            // EQ WLD [p0,p1,p2] -> render [p2,p0,p1] (same axis convention as zone/static meshes).
             let verts: Vec<crate::gpu::Vertex> = m.positions.iter().enumerate().map(|(i, &p)| {
                 let n = m.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
                 crate::gpu::Vertex {
@@ -702,7 +675,7 @@ impl EqRenderer {
                 }
             }).collect();
             let texture_idx = m.texture_name.as_ref()
-                .and_then(|tn| tex_names.iter().position(|t| t == tn));
+                .and_then(|tn| tex_names.iter().position(|t| t == &tn.to_lowercase()));
             let vertex_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("weapon_vbuf"), contents: bytemuck::cast_slice(&verts),
                 usage: wgpu::BufferUsages::VERTEX });
@@ -775,20 +748,20 @@ impl EqRenderer {
     }
 
     /// Load + GPU-upload the door/object models for a zone. Clears any previously loaded
-    /// door models first (zone reload). Models are uploaded with the same libeq→render axis
-    /// swap as weapons/zone meshes. Textures from `load_object_models` are uploaded into the
-    /// shared `door_textures` and linked per mesh by `texture_idx`. Per-model local AABBs are
+    /// door models first (zone reload). Models are uploaded with the same EQ→render axis
+    /// swap as weapons/zone meshes. Textures from the GLB are uploaded into the shared
+    /// `door_textures` and linked per mesh by `texture_idx`. Per-model local AABBs are
     /// recorded in `door_bounds` for click-picking.
-    pub fn load_door_models(&mut self, main_s3d: &std::path::Path, obj_s3d: &std::path::Path) {
+    pub fn load_door_models(&mut self, doors_glb: &std::path::Path) {
         use wgpu::util::DeviceExt;
         self.door_models.clear();
         self.door_bounds.clear();
         self.warned_missing_doors.clear();
 
-        let (models, textures) = match crate::assets::load_object_models(main_s3d, obj_s3d) {
+        let (models, textures) = match crate::assets::ZoneAssets::object_models_from_glb(doors_glb) {
             Ok(m) => m,
             Err(e) => {
-                tracing::warn!("doors: load_object_models failed ({}); doors will use fallback boxes", e);
+                tracing::warn!("doors: load {} failed ({}); fallback boxes", doors_glb.display(), e);
                 return;
             }
         };
@@ -807,7 +780,7 @@ impl EqRenderer {
             for m in &meshes {
                 if m.positions.is_empty() || m.indices.is_empty() { continue; }
                 let [cx, cy, cz] = m.center;
-                // libeq [p0,p1,p2] -> render [p2,p0,p1] (same axis convention as weapons/zone).
+                // EQ WLD [p0,p1,p2] -> render [p2,p0,p1] (same axis convention as weapons/zone).
                 let verts: Vec<Vertex> = m.positions.iter().enumerate().map(|(i, &p)| {
                     let n = m.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
                     Vertex {
