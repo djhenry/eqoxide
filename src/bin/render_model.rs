@@ -1267,11 +1267,18 @@ fn render_frame(s: &mut ViewerState) {
     let az = s.azimuth.to_radians();
     let el = s.elevation.to_radians();
     let target_bias = SEL_TARGET.load(std::sync::atomic::Ordering::Relaxed) as f32 / 100.0;
-    // The model is grounded (bottom at z=0, top at z=`visual_scale` — the ACTUAL rendered height
-    // for whichever path produced it), so the focus walks the true height directly: 0=feet,
-    // 0.5=center, 1.0=top of head. `lift` is the render's own grounding offset (unused here).
+    // The model is grounded with feet at z=0, so the focus walks the rendered height: 0=feet,
+    // 0.5=center, 1.0=top of head. In skinned (--race) mode the body is scaled to render at
+    // `target_height_for` feet tall (head ≈ z=target), so use THAT as the focus span — the
+    // static-path `visual_scale` here is `-2·feet_offset·dominant`, which lands near half the
+    // real height (so target=100 only reached mid-body). For the static path, `visual_scale`
+    // already IS the grounded top-of-head height. `lift` is the render's grounding offset (unused).
     let _ = lift;
-    let focus = glam::Vec3::new(0.0, 0.0, target_bias * visual_scale);
+    let focus_height = match s.skinned.as_ref() {
+        Some(sk) => eqoxide::models::target_height_for(&sk.race, &sk.arch),
+        None => visual_scale,
+    };
+    let focus = glam::Vec3::new(0.0, 0.0, target_bias * focus_height);
     let dir = glam::Vec3::new(az.cos() * el.cos(), az.sin() * el.cos(), el.sin());
     let eye = focus + dir * s.distance;
 
