@@ -132,6 +132,31 @@ pub fn build_move_item(from_slot: u32, to_slot: u32) -> [u8; 28] {
     buf
 }
 
+/// Encode a RoF2 trade-window slot — `Type = typeTrade` (3), not `typePossessions`. The server maps
+/// `{Type:3, Slot:i}` to `EQ::invslot::TRADE_BEGIN (3000) + i` (rof2.cpp `RoF2ToServerSlot`), so
+/// `index = 0` is the NPC's first trade slot. SubIndex/AugIndex = SLOT_INVALID (-1). (eqoxide#26)
+fn rof2_trade_slot(index: u32) -> [u8; 12] {
+    let mut s = [0u8; 12];
+    s[0..2].copy_from_slice(&3i16.to_le_bytes());           // Type = typeTrade
+    s[2..4].copy_from_slice(&0i16.to_le_bytes());           // Unknown02
+    s[4..6].copy_from_slice(&(index as i16).to_le_bytes()); // Slot = trade index
+    s[6..8].copy_from_slice(&(-1i16).to_le_bytes());        // SubIndex = SLOT_INVALID
+    s[8..10].copy_from_slice(&(-1i16).to_le_bytes());       // AugIndex = SOCKET_INVALID
+    s[10..12].copy_from_slice(&0i16.to_le_bytes());         // Unknown01
+    s
+}
+
+/// 28-byte RoF2 `MoveItem_Struct` from a *possessions* slot (e.g. the cursor) into a *trade-window*
+/// slot. Quest turn-ins need this for the cursor→NPC-trade move — `build_move_item` can't be used
+/// (it encodes both ends as possessions); the destination must be `typeTrade`. (eqoxide#26)
+pub fn build_move_item_to_trade(from_slot: u32, trade_index: u32) -> [u8; 28] {
+    let mut buf = [0u8; 28];
+    buf[0..12].copy_from_slice(&rof2_possessions_slot(from_slot));
+    buf[12..24].copy_from_slice(&rof2_trade_slot(trade_index));
+    buf[24..28].copy_from_slice(&0u32.to_le_bytes()); // number_in_stack = 0 (whole item)
+    buf
+}
+
 /// Native Titanium fall damage for a fall of `height` EQ units. Fall damage is CLIENT-computed in
 /// EQ (the server only validates OP_EnvDamage). Model: impact velocity = min(terminal,
 /// sqrt(2·g·h)) converted to the client's internal per-update z-velocity units (~5-13); then
@@ -1279,18 +1304,11 @@ impl Navigator {
         // Begin a new give request if one is queued and we're not already mid-trade.
         if self.give_state.is_none() {
             if let Some((npc_id, from_slot)) = self.give.lock().unwrap().take() {
-                // Step 1: put the item on the cursor (skip if it's already there).
-                // FIXME(eqoxide#11 follow-up): this give/trade flow still emits the legacy flat
-                // 12-byte MoveItem. Like the scribe path, the server silently drops it (RoF2 wants
-                // the 28-byte structured MoveItem_Struct — see build_move_item). The cursor→trade
-                // step below also needs RoF2 typeTrade slot encoding, so the whole give flow must be
-                // ported together; left as a matched pair here to not half-fix it.
+                // Step 1: put the item on the cursor (skip if it's already there). Uses the 28-byte
+                // structured RoF2 MoveItem (build_move_item) — a flat 12-byte packet is silently
+                // dropped by the server's DECODE_LENGTH_EXACT, so the item never moves. (eqoxide#26)
                 if from_slot != SLOT_CURSOR {
-                    let mut mv = [0u8; 12];
-                    mv[0..4].copy_from_slice(&from_slot.to_le_bytes());
-                    mv[4..8].copy_from_slice(&SLOT_CURSOR.to_le_bytes());
-                    // number_in_stack = 0 → whole-item move (see the /inventory/move note above).
-                    stream.send_app_packet(OP_MOVE_ITEM, &mv);
+                    stream.send_app_packet(OP_MOVE_ITEM, &build_move_item(from_slot, SLOT_CURSOR));
                     gs.move_item(from_slot as i32, SLOT_CURSOR as i32); // mirror locally
                 }
                 // Send OP_TradeRequest { to_mob_id = npc, from_mob_id = player }.
@@ -1309,12 +1327,11 @@ impl Navigator {
         // Mid-trade: either the ack has arrived (advance) or we keep waiting (with a timeout).
         if gs.trade_ack_ready {
             let npc_id = self.give_state.as_ref().map(|g| g.npc_id).unwrap_or(0);
-            // Step 3: move the cursor item into the NPC's first trade slot, then accept.
-            let mut mv = [0u8; 12];
-            mv[0..4].copy_from_slice(&SLOT_CURSOR.to_le_bytes());
-            mv[4..8].copy_from_slice(&SLOT_TRADE_BEGIN.to_le_bytes());
-            // number_in_stack = 0 → whole-item move.
-            stream.send_app_packet(OP_MOVE_ITEM, &mv);
+            // Step 3: move the cursor item into the NPC's first trade slot (index 0 → server slot
+            // SLOT_TRADE_BEGIN), then accept. The destination is a typeTrade slot, so this needs the
+            // 28-byte structured move with trade-slot encoding — not build_move_item (possessions
+            // only) and not a flat 12-byte packet (silently dropped). (eqoxide#26)
+            stream.send_app_packet(OP_MOVE_ITEM, &build_move_item_to_trade(SLOT_CURSOR, 0));
             gs.move_item(SLOT_CURSOR as i32, SLOT_TRADE_BEGIN as i32); // mirror locally
             let mut accept = [0u8; 8];
             accept[0..4].copy_from_slice(&gs.player_id.to_le_bytes());
@@ -1628,6 +1645,24 @@ mod door_tests {
         assert_eq!(i16::from_le_bytes([pkt[16], pkt[17]]), SLOT_CURSOR as i16, "to Slot=cursor");
         assert_eq!(i16::from_le_bytes([pkt[18], pkt[19]]), -1, "to SubIndex=SLOT_INVALID");
         // number_in_stack = 0 (whole-item move; a count would split a stack)
+        assert_eq!(u32::from_le_bytes(pkt[24..28].try_into().unwrap()), 0, "whole-item move");
+    }
+
+    #[test]
+    fn move_item_to_trade_encodes_typetrade_destination() {
+        // Quest turn-in cursor→NPC-trade move: from = cursor (possessions), to = trade slot 0.
+        // The destination must be Type=typeTrade(3), Slot=0 (server maps to TRADE_BEGIN+0=3000);
+        // a possessions encoding (Type 0) or a flat packet fails server-side. (eqoxide#26)
+        let pkt = build_move_item_to_trade(SLOT_CURSOR, 0);
+        assert_eq!(pkt.len(), 28);
+        // from_slot: possessions cursor
+        assert_eq!(i16::from_le_bytes([pkt[0], pkt[1]]), 0, "from Type=typePossessions");
+        assert_eq!(i16::from_le_bytes([pkt[4], pkt[5]]), SLOT_CURSOR as i16, "from Slot=cursor");
+        // to_slot (offset +12): Type=typeTrade(3), Slot=0
+        assert_eq!(i16::from_le_bytes([pkt[12], pkt[13]]), 3, "to Type=typeTrade");
+        assert_eq!(i16::from_le_bytes([pkt[16], pkt[17]]), 0, "to Slot=trade index 0");
+        assert_eq!(i16::from_le_bytes([pkt[18], pkt[19]]), -1, "to SubIndex=SLOT_INVALID");
+        assert_eq!(i16::from_le_bytes([pkt[20], pkt[21]]), -1, "to AugIndex=SOCKET_INVALID");
         assert_eq!(u32::from_le_bytes(pkt[24..28].try_into().unwrap()), 0, "whole-item move");
     }
 }
