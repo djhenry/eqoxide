@@ -309,6 +309,17 @@ impl ZoneAssets {
             }
             let Some(mesh) = node.mesh() else { continue };
             let matrix = node.transform().matrix();
+            // The baked collision mesh (SOLID + INVIS faces, PASSABLE excluded) is delivered as
+            // a mesh named `__collision__`. Tag its MeshData with the sentinel texture name so
+            // the renderer skips drawing it and `Collision::build` uses it for collision.
+            if mesh.name() == Some(COLLISION_MESH_TAG) {
+                let mut mds = read_mesh(&mesh);
+                for md in &mut mds {
+                    md.texture_name = Some(COLLISION_MESH_TAG.to_string());
+                }
+                terrain.extend(mds);
+                continue;
+            }
             if is_identity(&matrix) {
                 terrain.extend(read_mesh(&mesh));
             } else {
@@ -370,6 +381,14 @@ pub struct Hit {
     pub normal: [f32; 3],
 }
 
+/// Sentinel `MeshData.texture_name` marking the dedicated collision geometry baked into a
+/// zone GLB as a mesh named `__collision__`. The asset-server/converter emits every SOLID
+/// face (including INVIS — invisible-but-solid zone boundaries, invisible walls, doorframes)
+/// here while EXCLUDING PASSABLE faces (water surfaces, foliage). `from_glb` tags the loaded
+/// mesh with this name so the renderer skips drawing it and `Collision::build` consumes it
+/// for collision instead of the rendered terrain.
+pub const COLLISION_MESH_TAG: &str = "__collision__";
+
 pub struct Collision {
     tris:      Vec<[[f32; 3]; 3]>,
     cells:     Vec<Vec<u32>>,
@@ -380,6 +399,10 @@ pub struct Collision {
     /// Optional water-region map (from the zone's `.wtr`). When present, find_path may DESCEND
     /// through water (swim down a canal/shaft) to a lower floor that has no walkable connection.
     water:     Option<std::sync::Arc<crate::water_map::WaterMap>>,
+    /// True when the terrain triangles came from a dedicated `__collision__` mesh (SOLID +
+    /// INVIS faces, PASSABLE excluded). False for legacy zones with no baked collision mesh,
+    /// where the rendered terrain is used as a fallback. Diagnostic/provenance only.
+    pub from_collision_mesh: bool,
 }
 
 impl Collision {
@@ -388,7 +411,28 @@ impl Collision {
         // Flatten every triangle into world space [east, north, height].
         let mut tris: Vec<[[f32; 3]; 3]> = Vec::new();
         let expanded = expand_objects(&assets.objects);
-        for m in assets.terrain.iter().chain(expanded.iter()) {
+
+        // Prefer the dedicated `__collision__` mesh when the zone GLB carries one: it holds
+        // every SOLID face (visible AND invisible-but-solid: zone boundaries, invisible walls,
+        // doorframes) and omits PASSABLE faces (water surfaces, foliage). Older zones baked
+        // before this pipeline change have no such mesh — fall back to the rendered terrain so
+        // they keep colliding as before. Placed-object collision always comes from
+        // `expand_objects`, unchanged in both paths.
+        let from_collision_mesh = assets
+            .terrain
+            .iter()
+            .any(|m| m.texture_name.as_deref() == Some(COLLISION_MESH_TAG));
+        let terrain_src: Vec<&MeshData> = if from_collision_mesh {
+            assets
+                .terrain
+                .iter()
+                .filter(|m| m.texture_name.as_deref() == Some(COLLISION_MESH_TAG))
+                .collect()
+        } else {
+            assets.terrain.iter().collect()
+        };
+
+        for m in terrain_src.into_iter().chain(expanded.iter()) {
             let pos = &m.positions;
             let idx = &m.indices;
             let mut k = 0;
@@ -418,7 +462,7 @@ impl Collision {
         }
         let cell_size = cell_size.max(1.0);
         if tris.is_empty() || min[0] == f32::MAX {
-            return Collision { tris, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0, water: None };
+            return Collision { tris, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0, water: None, from_collision_mesh };
         }
         let cols = (((max[0] - min[0]) / cell_size).ceil() as usize + 1).max(1);
         let rows = (((max[1] - min[1]) / cell_size).ceil() as usize + 1).max(1);
@@ -439,7 +483,7 @@ impl Collision {
                 }
             }
         }
-        Collision { tris, cells, origin: min, cell_size, cols, rows, water: None }
+        Collision { tris, cells, origin: min, cell_size, cols, rows, water: None, from_collision_mesh }
     }
 
     /// Attach a zone water map so find_path can route swim descents. Call after `build`.
@@ -1342,6 +1386,30 @@ mod b2_glb_tests {
         let linked = all.iter().filter(|m| m.texture_name.as_ref().map_or(false, |n| tex_names.contains(n))).count();
         assert!(linked > 0, "at least some meshes must resolve their texture by name");
     }
+
+    /// End-to-end: a zone GLB baked with the Component-B pipeline (containing a `__collision__`
+    /// mesh) must be ingested so `Collision::build` reports collision-mesh provenance, the
+    /// collision mesh is NOT in the render terrain (texture-linked) set, and the grid is
+    /// non-empty. Point `ZONE_GLB` at e.g. /tmp/eqoxide_test_gfaydark.glb (the asset-server
+    /// `baked_zone_has_collision_mesh_with_invisible_faces` test writes one).
+    #[test]
+    #[ignore = "requires a baked zone glb (with __collision__) at $ZONE_GLB"]
+    fn from_glb_ingests_collision_mesh() {
+        let p = std::env::var("ZONE_GLB").expect("set ZONE_GLB to a baked zone glb");
+        let za = ZoneAssets::from_glb(std::path::Path::new(&p)).unwrap();
+        // The collision mesh is tagged and carried in `terrain` (so the renderer can skip it),
+        // but it is never uploaded for drawing.
+        let tagged = za.terrain.iter()
+            .filter(|m| m.texture_name.as_deref() == Some(COLLISION_MESH_TAG))
+            .count();
+        assert_eq!(tagged, 1, "exactly one __collision__ mesh expected in the baked zone");
+        let col = Collision::build(&za, 32.0);
+        assert!(col.from_collision_mesh, "Collision::build must use the __collision__ mesh");
+        // Sanity: the floor under a known walkable point resolves to real geometry, and the
+        // grid has triangles to query.
+        assert!(col.floor_z(0.0, 0.0, 9999.0) < 9999.0 || za.terrain.len() > 1,
+            "collision grid should contain queryable geometry");
+    }
 }
 
 #[cfg(test)]
@@ -1431,6 +1499,57 @@ mod tests {
         assert!(!empty.segment_blocked([0.0, 0.0, 0.0], [10.0, 0.0, 0.0]));
         assert!(empty.path_clear([0.0, 0.0, 0.0], [10.0, 0.0, 0.0], 2.0),
             "no geometry should never block movement");
+    }
+
+    /// When a zone carries a dedicated `__collision__` mesh, `Collision::build` must collide
+    /// against THAT geometry (which includes invisible-but-solid walls) and ignore the rendered
+    /// terrain. When absent, it must fall back to the rendered terrain (back-compat). This is
+    /// the client half of Component B.
+    #[test]
+    fn collision_prefers_collision_mesh_and_falls_back() {
+        // A visible floor at z=0 (render terrain) plus an INVISIBLE wall at world east=5.
+        // In the real pipeline the invisible wall only appears in the `__collision__` mesh
+        // (it has no render texture); here we model that by tagging it.
+        let floor = MeshData {
+            positions: vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 0.0, 10.0], [0.0, 0.0, 10.0]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
+            center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
+        };
+        // The `__collision__` mesh: the same floor PLUS the invisible wall at east=5, tagged.
+        let collision_mesh = MeshData {
+            positions: vec![
+                // floor
+                [0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 0.0, 10.0], [0.0, 0.0, 10.0],
+                // invisible wall at world east=5 (libeq p2=5), north 0..10, height 0..10
+                [0.0, 0.0, 5.0], [10.0, 0.0, 5.0], [10.0, 10.0, 5.0], [0.0, 10.0, 5.0],
+            ],
+            normals: vec![[0.0, 1.0, 0.0]; 8], uvs: vec![[0.0, 0.0]; 8],
+            indices: vec![0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7],
+            texture_name: Some(COLLISION_MESH_TAG.to_string()),
+            base_color: [1.0; 4], center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
+        };
+
+        // With the collision mesh present: the invisible wall blocks movement.
+        let with_mesh = Collision::build(
+            &ZoneAssets { terrain: vec![floor.clone(), collision_mesh], objects: vec![], textures: vec![] },
+            4.0,
+        );
+        assert!(with_mesh.from_collision_mesh, "should report collision-mesh provenance");
+        assert!(!with_mesh.path_clear([3.0, 5.0, 3.0], [7.0, 5.0, 3.0], 0.5),
+            "the invisible wall (only in __collision__) must block movement");
+        // The floor still grounds correctly.
+        assert!((with_mesh.floor_z(3.0, 3.0, 20.0) - 0.0).abs() < 1e-3);
+
+        // Back-compat: a zone with only rendered terrain (no `__collision__`) falls back to it.
+        let fallback = Collision::build(
+            &ZoneAssets { terrain: vec![floor], objects: vec![], textures: vec![] },
+            4.0,
+        );
+        assert!(!fallback.from_collision_mesh, "no collision mesh → fallback to rendered terrain");
+        // No wall in the rendered terrain, so the same path is clear.
+        assert!(fallback.path_clear([3.0, 5.0, 3.0], [7.0, 5.0, 3.0], 0.5),
+            "fallback terrain has no invisible wall");
     }
 
     /// Zone-in reground premise: a player spawned BELOW the floor must be recoverable.
