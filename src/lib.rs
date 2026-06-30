@@ -26,6 +26,7 @@ pub mod debug_zone;
 pub mod gpu;
 pub mod logging;
 pub mod models;
+pub mod movement;
 pub mod profiling;
 pub mod pass;
 pub mod pipeline;
