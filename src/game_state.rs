@@ -178,6 +178,11 @@ pub struct GameState {
     pub cur_hp: i32,
     pub max_hp: i32,
     pub mana_pct: f32,
+    /// Player's absolute current/max mana. The profile carries current mana (@944) but no max
+    /// (it's derived from level/class/WIS/INT + items), and there is no max-mana packet — so
+    /// `max_mana` is seeded = cur at zone-in and kept as a high-water mark in `update_mana`.
+    pub cur_mana: i32,
+    pub max_mana: i32,
     pub xp_pct: f32,
     /// Coin on hand (platinum, gold, silver, copper), from the player profile.
     pub coin: [u32; 4],
@@ -405,6 +410,16 @@ impl GameState {
         }
     }
 
+    /// Update the player's current mana and recompute `mana_pct`. Because the profile gives no
+    /// max mana and no packet ever does, `max_mana` is a high-water mark: it rises to whatever the
+    /// largest current mana we have seen is (so a zone-in below full, then regen, still yields a
+    /// sane 0–100% as mana climbs past the seed). (eqoxide#27, the mana analogue of #19's HP seed.)
+    pub fn update_mana(&mut self, cur_mana: i32) {
+        self.cur_mana = cur_mana;
+        if cur_mana > self.max_mana { self.max_mana = cur_mana; }
+        self.mana_pct = (cur_mana as f32 / self.max_mana.max(1) as f32) * 100.0;
+    }
+
     #[allow(dead_code)]
     pub fn nearby_npcs(&self, max_dist: f32) -> Vec<&Entity> {
         let mut result: Vec<&Entity> = self
@@ -616,6 +631,39 @@ mod tests {
         // max_hp=0 → uses max(1) guard; cur_hp=0 → 0%
         gs.update_hp(1, 0, 0);
         assert!((gs.hp_pct - 0.0).abs() < 1e-4);
+    }
+
+    // --- GameState::update_mana (eqoxide#27) ---
+
+    #[test]
+    fn update_mana_seed_sets_full_then_partial() {
+        let mut gs = GameState::new();
+        // First call (zone-in seed): max is unset (0) → becomes cur → 100%.
+        gs.update_mana(120);
+        assert_eq!(gs.cur_mana, 120);
+        assert_eq!(gs.max_mana, 120);
+        assert!((gs.mana_pct - 100.0).abs() < 1e-4, "seed should be 100%, got {}", gs.mana_pct);
+        // Spend mana: cur drops, max holds → percent falls.
+        gs.update_mana(60);
+        assert_eq!(gs.max_mana, 120);
+        assert!((gs.mana_pct - 50.0).abs() < 1e-4, "expected 50%, got {}", gs.mana_pct);
+    }
+
+    #[test]
+    fn update_mana_high_water_mark_raises_max() {
+        let mut gs = GameState::new();
+        // Zone in below full (seed max = 80), then regen past the seed: max rises to keep <=100%.
+        gs.update_mana(80);
+        gs.update_mana(150);
+        assert_eq!(gs.max_mana, 150, "max should rise to the high-water mark");
+        assert!((gs.mana_pct - 100.0).abs() < 1e-4, "expected 100%, got {}", gs.mana_pct);
+    }
+
+    #[test]
+    fn update_mana_zero_does_not_panic() {
+        let mut gs = GameState::new();
+        gs.update_mana(0); // max stays 0 → max(1) guard → 0%
+        assert!((gs.mana_pct - 0.0).abs() < 1e-4);
     }
 
     // --- GameState::nearby_npcs ---

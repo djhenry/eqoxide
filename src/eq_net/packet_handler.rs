@@ -494,6 +494,10 @@ pub struct ProfileInfo {
     /// struct offset is correct). The profile carries no max_hp (it's derived), so the caller seeds
     /// max_hp = cur_hp (full at zone-in) until the first real OP_HPUpdate. (eqoxide#19)
     pub cur_hp: u32,
+    /// Current mana from the profile (rof2_structs.h /*00944*/ mana; immediately before cur_hp@948,
+    /// so it shares the same reliable pre-`disciplines` region). No max-mana on the wire — the
+    /// caller seeds max=cur and keeps a high-water mark. (eqoxide#27)
+    pub cur_mana: u32,
 }
 
 /// Parse the RoF2 PlayerProfile_Struct wire packet for the fields needed by the HUD/API.
@@ -551,7 +555,9 @@ pub fn parse_player_profile(payload: &[u8]) -> Option<ProfileInfo> {
     // cur_hp: rof2_structs.h /*00948*/ — before `disciplines`, so the struct offset is correct
     // (same reliable region as stats@952). The len>=980 check above already guarantees @948 is read.
     let cur_hp = u32_at(948);
-    Some(ProfileInfo { level, class_id, stats, coin, mem_spells, cur_hp })
+    // mana: rof2_structs.h /*00944*/ — also before `disciplines` (reliable). @944+4 = @948 ≤ 980. (#27)
+    let cur_mana = u32_at(944);
+    Some(ProfileInfo { level, class_id, stats, coin, mem_spells, cur_hp, cur_mana })
 }
 
 pub fn parse_begin_cast(p: &[u8]) -> Option<(u16, u16, u32)> {
@@ -614,6 +620,13 @@ fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
             gs.hp_pct = (gs.cur_hp as f32 / gs.max_hp.max(1) as f32) * 100.0;
             tracing::info!("EQ: PlayerProfile: seeded hp={}/{} ({:.0}%)", gs.cur_hp, gs.max_hp, gs.hp_pct);
         }
+        // Seed mana the same way (eqoxide#27): the server sends OP_ManaChange only when mana
+        // *changes*, so without this a caster's mana stays 0 forever. No max-mana on the wire →
+        // update_mana seeds max=cur (full at zone-in) and keeps it as a high-water mark.
+        if p.cur_mana > 0 {
+            gs.update_mana(p.cur_mana as i32);
+            tracing::info!("EQ: PlayerProfile: seeded mana={}/{} ({:.0}%)", gs.cur_mana, gs.max_mana, gs.mana_pct);
+        }
     }
 
     // ── Face + hair style (rof2_structs.h PlayerProfile_Struct) ────────────────
@@ -660,10 +673,11 @@ pub fn apply_begin_cast(gs: &mut GameState, p: &[u8]) {
     }
 }
 
-pub fn apply_mana_change(_gs: &mut GameState, p: &[u8]) {
-    if let Some(_new_mana) = parse_mana_change(p) {
-        // mana_pct is updated from HP/mana update packets elsewhere; keepcasting handling:
-        // a mana change with the spell landing ends the optimistic cast bar.
+pub fn apply_mana_change(gs: &mut GameState, p: &[u8]) {
+    // ManaChange_Struct.new_mana@0 (rof2_structs.h) — the server's live mana value after a cast /
+    // regen tick. Wire it into game_state so the HUD/API mana bar tracks real mana (eqoxide#27).
+    if let Some(new_mana) = parse_mana_change(p) {
+        gs.update_mana(new_mana as i32);
     }
 }
 
@@ -1290,6 +1304,7 @@ mod tests {
         let mut buf = vec![0u8; 14000];
         buf[21] = 9;   // class_ = Rogue
         buf[22] = 12;  // level
+        buf[944..948].copy_from_slice(&456u32.to_le_bytes());   // mana @944 (before disciplines)
         buf[948..952].copy_from_slice(&1234u32.to_le_bytes());  // cur_hp @948 (before disciplines)
         buf[952..956].copy_from_slice(&75u32.to_le_bytes());    // STR
         buf[976..980].copy_from_slice(&110u32.to_le_bytes());   // WIS
@@ -1308,9 +1323,26 @@ mod tests {
         assert_eq!(p.stats[0], 75);  // STR
         assert_eq!(p.stats[6], 110); // WIS
         assert_eq!(p.cur_hp, 1234);  // cur_hp @948
+        assert_eq!(p.cur_mana, 456); // mana @944 (eqoxide#27)
         assert_eq!(class_name(p.class_id), "Rogue");
         assert_eq!(p.mem_spells[0], 200);
         assert_eq!(p.mem_spells[1], 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn apply_mana_change_updates_mana_pct() {
+        // The update path (eqoxide#27): an OP_ManaChange (ManaChange_Struct.new_mana@0) must move
+        // the player's mana_pct. Seed a max first (zone-in full), then spend.
+        use super::apply_mana_change;
+        let mut gs = GameState::new();
+        gs.update_mana(100); // seed: max=100, cur=100, 100%
+        // ManaChange_Struct: new_mana@0=40, stamina@4, spell_id@8, keepcasting@12, slot@16 — 20 bytes.
+        let mut buf = [0u8; 20];
+        buf[0..4].copy_from_slice(&40u32.to_le_bytes());
+        apply_mana_change(&mut gs, &buf);
+        assert_eq!(gs.cur_mana, 40);
+        assert_eq!(gs.max_mana, 100, "max holds as the high-water mark");
+        assert!((gs.mana_pct - 40.0).abs() < 1e-4, "expected 40%, got {}", gs.mana_pct);
     }
 
     #[test]
