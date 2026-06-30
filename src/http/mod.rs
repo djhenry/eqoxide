@@ -230,6 +230,16 @@ pub struct PlayerState {
     pub target_id:    Option<u32>,
     /// Coin on hand: [platinum, gold, silver, copper], from the player profile.
     pub coin:         [u32; 4],
+    /// Vitals — same values the HUD renders. Percentages are 0–100. Lets an API consumer make
+    /// flee/heal/leveling decisions instead of scraping the message log. (eqoxide#9)
+    pub hp_pct:        f32,
+    pub cur_hp:        i32,
+    pub max_hp:        i32,
+    pub mana_pct:      f32,
+    pub xp_pct:        f32,
+    /// Current target's display name and HP percent (0–100), or None when nothing is targeted.
+    pub target_name:   Option<String>,
+    pub target_hp_pct: Option<f32>,
 }
 pub type PlayerInfo = Arc<Mutex<PlayerState>>;
 
