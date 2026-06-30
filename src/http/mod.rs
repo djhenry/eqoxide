@@ -252,6 +252,8 @@ pub struct PlayerState {
     pub cur_hp:        i32,
     pub max_hp:        i32,
     pub mana_pct:      f32,
+    pub cur_mana:      i32,
+    pub max_mana:      i32,
     pub xp_pct:        f32,
     /// Current target's display name and HP percent (0–100), or None when nothing is targeted.
     pub target_name:   Option<String>,
