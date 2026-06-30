@@ -454,6 +454,9 @@ pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
 
     // 12-18. curHp haircolor beardcolor eyecolor1 eyecolor2 hairstyle beard (7×u8)
     let cur_hp = rd_u8!();
+    // haircolor/beardcolor are deliberately not consumed: on classic humhe* heads (what we
+    // render) the real RoF2 client never tints by haircolor — hair color is baked into the
+    // hairstyle texture. The tint table is Luclin-head-only; see crate::head. eyecolor1/2 unused.
     skip!(4); // haircolor beardcolor eyecolor1 eyecolor2
     let hairstyle = rd_u8!(); // hairstyle (0-indexed; 0=bald)
     skip!(1); // beard

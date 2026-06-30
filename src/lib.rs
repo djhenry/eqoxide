@@ -24,6 +24,7 @@ pub mod billboard;
 pub mod camera;
 pub mod debug_zone;
 pub mod gpu;
+pub mod head;
 pub mod logging;
 pub mod models;
 pub mod movement;
