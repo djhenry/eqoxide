@@ -1,14 +1,13 @@
 //! Zone + texture asset loading and spatial queries.
 //!
-//! Loads EQ `.s3d`/`.wld` archives via libeq into CPU-side `MeshData`/`TextureData`, instances
+//! Loads EQ zone GLB/PNG assets into CPU-side `MeshData`/`TextureData`, instances
 //! placed objects (buildings, etc.) from the zone's ActorInstance fragments, and indexes equipment
 //! textures. Also builds the `Collision` grid and its queries — `floor_z` (grounding),
 //! `nearest_hit_t`/`segment_blocked` (camera + nameplate occlusion), `path_clear` (movement
 //! gating), and `find_path` (A* routing around walls). See `docs/zone-rendering.md` and
 //! `docs/collision-system.md`.
 
-use anyhow::{Context, Result};
-use std::path::Path;
+use anyhow::Context;
 
 /// Parse a glTF material's `extras` JSON (the asset server's `eqAdditive` / `eqAnim`).
 fn material_extras(material: &gltf::Material) -> Option<serde_json::Value> {
@@ -155,7 +154,7 @@ impl ZoneAssets {
     /// `MeshData.texture_name` is set to that same image name so `upload_zone_assets` can link
     /// meshes to textures by name.  Positions/normals/uvs/indices are read via the primitive
     /// reader; `center` is set to `[0,0,0]` because GLB positions are already world-space
-    /// libeq coords (no axis change needed).
+    /// EQ coords (no axis change needed).
     ///
     /// Mirrors the glTF loading in `src/models.rs:63-78` (gltf::Gltf::from_reader,
     /// import_buffers, import_images).
@@ -387,15 +386,15 @@ impl ZoneAssets {
     /// Compute the 2D bounding box of all mesh vertices.
     /// Returns `([min_east, min_north], [max_east, max_north])` in EQ world coords
     /// (east = server_x, north = server_y).
-    /// libeq_wld position layout: [east, up, north] = [server_x, server_z, server_y].
+    /// EQ WLD position layout: [east, up, north] = [server_x, server_z, server_y].
     pub fn bounds_xy(&self) -> Option<([f32; 2], [f32; 2])> {
         let mut min = [f32::MAX; 2];
         let mut max = [f32::MIN; 2];
         let expanded = expand_objects(&self.objects);
         for m in self.terrain.iter().chain(expanded.iter()) {
             for p in &m.positions {
-                let e = p[2] + m.center[2]; // render.X = server_x = libeq p[2]
-                let n = p[0] + m.center[0]; // render.Y = server_y = libeq p[0]
+                let e = p[2] + m.center[2]; // render.X = server_x = EQ p[2]
+                let n = p[0] + m.center[0]; // render.Y = server_y = EQ p[0]
                 if e < min[0] { min[0] = e; }
                 if n < min[1] { min[1] = n; }
                 if e > max[0] { max[0] = e; }
@@ -444,7 +443,7 @@ impl Collision {
                 let (ia, ib, ic) = (idx[k] as usize, idx[k + 1] as usize, idx[k + 2] as usize);
                 k += 3;
                 if ia >= pos.len() || ib >= pos.len() || ic >= pos.len() { continue; }
-                // libeq -> world: render.X = server_x = p[2], render.Y = server_y = p[0], up = p[1]
+                // EQ WLD -> world: render.X = server_x = p[2], render.Y = server_y = p[0], up = p[1]
                 tris.push([
                     [pos[ia][2] + m.center[2], pos[ia][0] + m.center[0], pos[ia][1] + m.center[1]],
                     [pos[ib][2] + m.center[2], pos[ib][0] + m.center[0], pos[ib][1] + m.center[1]],
@@ -896,161 +895,6 @@ impl Collision {
     }
 }
 
-impl ZoneAssets {
-    /// Load zone geometry and textures from an S3D archive.
-    /// Loads ALL .wld files in the archive (e.g. `qeytoqrg.wld`, `objects.wld`,
-    /// `lights.wld`) so buildings, trees, and light meshes are included.
-    /// Skips unrecognised fragments with a warning instead of returning Err.
-    pub fn load(s3d_path: &Path) -> Result<Self> {
-        let file = std::fs::File::open(s3d_path)
-            .with_context(|| format!("failed to open S3D archive: {}", s3d_path.display()))?;
-        let mut pfs = libeq_pfs::PfsReader::open(file)
-            .with_context(|| format!("failed to parse PFS archive: {}", s3d_path.display()))?;
-
-        let filenames: Vec<String> = pfs
-            .filenames()
-            .with_context(|| "failed to list archive filenames")?;
-
-        // Find all .wld files in the archive.
-        let wld_files: Vec<&str> = filenames.iter()
-            .filter(|f| f.to_lowercase().ends_with(".wld"))
-            .map(|f| f.as_str())
-            .collect();
-
-        if wld_files.is_empty() {
-            anyhow::bail!("no .wld files found in {}", s3d_path.display());
-        }
-
-        let mut meshes = Vec::new();
-        for wld_name in &wld_files {
-            let wld_bytes = match pfs.get(wld_name) {
-                Ok(Some(b)) => b,
-                Ok(None) => {
-                    tracing::warn!("warning: {} listed but not found in archive", wld_name);
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!("warning: failed to read {}: {}", wld_name, e);
-                    continue;
-                }
-            };
-
-            let wld = match libeq_wld::load(&wld_bytes) {
-                Ok(w) => w,
-                Err(e) => {
-                    tracing::warn!("warning: failed to parse {}: {}", wld_name, e);
-                    continue;
-                }
-            };
-
-            for mesh in wld.meshes() {
-                let all_positions = mesh.positions();
-                if all_positions.is_empty() {
-                    continue;
-                }
-
-                let (cx, cy, cz) = mesh.center();
-                let all_normals = mesh.normals();
-                let all_uvs = mesh.texture_coordinates();
-
-                for primitive in mesh.primitives() {
-                    let prim_indices: Vec<u32> = primitive.indices();
-                    if prim_indices.is_empty() {
-                        continue;
-                    }
-
-                    let positions: Vec<[f32; 3]> = prim_indices
-                        .iter()
-                        .map(|&i| {
-                            let p = all_positions[i as usize];
-                            [p[0], p[1], p[2]]
-                        })
-                        .collect();
-                    let normals: Vec<[f32; 3]> = prim_indices
-                        .iter()
-                        .map(|&i| {
-                            all_normals
-                                .get(i as usize)
-                                .copied()
-                                .unwrap_or([0.0, 0.0, 1.0])
-                        })
-                        .collect();
-                    let uvs: Vec<[f32; 2]> = prim_indices
-                        .iter()
-                        .map(|&i| {
-                            all_uvs
-                                .get(i as usize)
-                                .copied()
-                                .unwrap_or([0.0, 0.0])
-                        })
-                        .collect();
-
-                    let material = primitive.material();
-                    let texture_name = material
-                        .base_color_texture()
-                        .and_then(|t| t.source());
-
-                    meshes.push(MeshData {
-                        positions,
-                        normals,
-                        uvs,
-                        indices: (0..prim_indices.len() as u32).collect(),
-                        texture_name,
-                        base_color: [1.0, 1.0, 1.0, 1.0],
-                        center: [cx, cy, cz],
-                        render_mode: RenderMode::Opaque, anim: None,
-                    });
-                }
-            }
-        }
-
-        // Load BMP and DDS textures from the archive.
-        let mut textures = Vec::new();
-        for filename in &filenames {
-            let lower = filename.to_lowercase();
-            let fmt = if lower.ends_with(".bmp") {
-                image::ImageFormat::Bmp
-            } else if lower.ends_with(".dds") {
-                image::ImageFormat::Dds
-            } else {
-                continue;
-            };
-            let tex_bytes = match pfs.get(filename) {
-                Ok(Some(b)) => b,
-                Ok(None) => {
-                    tracing::warn!("warning: texture {} listed but not found in archive", filename);
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!("warning: failed to read texture {}: {}", filename, e);
-                    continue;
-                }
-            };
-
-            match image::load_from_memory_with_format(&tex_bytes, fmt) {
-                Ok(img) => {
-                    let rgba_img = img.to_rgba8();
-                    let (width, height) = rgba_img.dimensions();
-                    textures.push(TextureData {
-                        name: filename.clone(),
-                        width,
-                        height,
-                        rgba: rgba_img.into_raw(),
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!("warning: failed to decode texture {}: {}", filename, e);
-                }
-            }
-        }
-
-        tracing::info!("zone_assets: loaded {} meshes, {} textures from {} ({} wld files)",
-                  meshes.len(), textures.len(), s3d_path.display(), wld_files.len());
-        // The .s3d path stays flat/terrain-only (local fallback); no instanced objects.
-        Ok(ZoneAssets { terrain: meshes, objects: vec![], textures })
-    }
-
-}
 
 #[cfg(test)]
 mod b2_glb_tests {
@@ -1088,49 +932,12 @@ mod door_glb_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    #[test]
-    fn load_returns_err_on_missing_file() {
-        let result = ZoneAssets::load(Path::new("/nonexistent/path.s3d"));
-        assert!(result.is_err());
-    }
-
-    /// Directory of extracted EQ `.s3d` files for the `#[ignore]`d asset tests
-    /// below. Set `EQ_ASSETS_DIR` to run them; otherwise they skip.
-    fn assets_dir() -> Option<PathBuf> {
-        std::env::var_os("EQ_ASSETS_DIR").map(PathBuf::from)
-    }
-
-    #[test]
-    #[ignore = "requires real extracted assets (set EQ_ASSETS_DIR)"]
-    fn load_real_zone_has_meshes() {
-        let Some(path) = assets_dir().map(|d| d.join("qcat.s3d")) else { return; };
-        if !path.exists() {
-            return;
-        }
-        let assets = ZoneAssets::load(&path).expect("load failed");
-        assert!(!assets.terrain.is_empty(), "expected at least one mesh");
-    }
-
-    #[test]
-    #[ignore = "requires real extracted assets (set EQ_ASSETS_DIR)"]
-    fn collision_floor_z_returns_terrain_height() {
-        let Some(path) = assets_dir().map(|d| d.join("qeynos2.s3d")) else { return; };
-        if !path.exists() { return; }
-        let assets = ZoneAssets::load(&path).expect("load failed");
-        let col = Collision::build(&assets, 32.0);
-
-        // Player at qeynos2 waypoint: east=90, north=175 — floor sits around -21..-33.
-        let h = col.floor_z(90.0, 175.0, 0.0);
-        assert!(h < 0.0 && h > -50.0, "unexpected terrain height: {}", h);
-    }
 
     /// A single horizontal floor quad + one vertical wall: the floor raycast must
     /// return the floor height (not the wall), and a ray crossing the wall must hit.
     #[test]
     fn collision_grid_floor_and_occlusion() {
-        // Floor quad at z=0 spanning east/north [0,10]; libeq pos = [east, height, north].
+        // Floor quad at z=0 spanning east/north [0,10]; EQ WLD pos = [east, height, north].
         let floor = MeshData {
             positions: vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 0.0, 10.0], [0.0, 0.0, 10.0]],
             normals: vec![[0.0, 1.0, 0.0]; 4],
@@ -1141,7 +948,7 @@ mod tests {
             center: [0.0, 0.0, 0.0],
             render_mode: RenderMode::Opaque, anim: None,
         };
-        // Vertical wall at world east=5: libeq p2=5 (render.X), spanning north=p0 [0,10], height=p1 [0,10].
+        // Vertical wall at world east=5: EQ p2=5 (render.X), spanning north=p0 [0,10], height=p1 [0,10].
         let wall = MeshData {
             positions: vec![[0.0, 0.0, 5.0], [10.0, 0.0, 5.0], [10.0, 10.0, 5.0], [0.0, 10.0, 5.0]],
             normals: vec![[0.0, 0.0, 1.0]; 4],
@@ -1179,7 +986,7 @@ mod tests {
     /// upward band finds it. (Mirrors the felwithe zone-in burial: spawn z=4, floor ~20.)
     #[test]
     fn nearest_floor_finds_floor_above_a_below_floor_spawn() {
-        // Floor quad at height z=10 spanning east/north [0,10]; libeq pos = [east, height, north].
+        // Floor quad at height z=10 spanning east/north [0,10]; EQ WLD pos = [east, height, north].
         let floor = MeshData {
             positions: vec![[0.0, 10.0, 0.0], [10.0, 10.0, 0.0], [10.0, 10.0, 10.0], [0.0, 10.0, 10.0]],
             normals: vec![[0.0, 1.0, 0.0]; 4],
@@ -1231,7 +1038,7 @@ mod tests {
 
     #[test]
     fn collision_path_clear_blocks_walking_into_wall() {
-        // Vertical wall at world east=5: libeq p2=5 (render.X), north=p0 [0,10], height=p1 [0,10].
+        // Vertical wall at world east=5: EQ p2=5 (render.X), north=p0 [0,10], height=p1 [0,10].
         let wall = MeshData {
             positions: vec![[0.0, 0.0, 5.0], [10.0, 0.0, 5.0], [10.0, 10.0, 5.0], [0.0, 10.0, 5.0]],
             normals: vec![[0.0, 0.0, 1.0]; 4],

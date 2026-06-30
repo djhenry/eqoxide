@@ -836,8 +836,6 @@ dependencies = [
  "glam",
  "gltf",
  "image",
- "libeq_pfs",
- "libeq_wld",
  "miniz_oxide",
  "pollster",
  "rand",

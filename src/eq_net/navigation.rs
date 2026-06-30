@@ -1438,7 +1438,7 @@ mod tests {
     }
 
     fn wall_collision() -> crate::assets::Collision {
-        // Vertical wall at world east=5: libeq p2=5 (render.X), north=p0 [0,10], height=p1 [0,10].
+        // Vertical wall at world east=5: EQ p2=5 (render.X), north=p0 [0,10], height=p1 [0,10].
         let wall = crate::assets::MeshData {
             positions: vec![[0.0, 0.0, 5.0], [10.0, 0.0, 5.0], [10.0, 10.0, 5.0], [0.0, 10.0, 5.0]],
             normals: vec![[0.0, 0.0, 1.0]; 4],
