@@ -81,14 +81,24 @@ pub fn build_consider_packet(player_id: u32, target_id: u32) -> Vec<u8> {
     buf
 }
 
-/// Titanium `CastSpell_Struct` (20 bytes): slot, spell_id, inventoryslot, target_id, unk[4].
-/// `slot` is the gem index 0-8 for a memorized-gem cast; inventoryslot 0xFFFF = gem cast.
+/// RoF2 `CastSpell_Struct` (44 bytes, rof2_structs.h): slot(u32), spell_id(u32),
+/// inventory_slot(InventorySlot_Struct, 12B), target_id(u32), cs_unknown[2](u32), y/x/z_pos(f32).
+/// The client targets RoF2; the old Titanium 20-byte layout failed the server's
+/// DECODE_LENGTH_EXACT and every cast was silently dropped — no spell ever landed (eqoxide#42).
+///
+/// `slot` is the gem index 0-8 (RoF2 CastingSlot::Gem1..Gem9 == server enum, passes through). For a
+/// normal memorized-gem cast the server reads only slot/spell_id/target_id and IGNORES
+/// inventory_slot (that's for Item/Potion clicky casts), so inventory_slot is sent as an INVALID
+/// structured slot (all -1 → RoF2ToServerSlot = SLOT_INVALID). y/x/z are the cast position, only
+/// used by ground-targeted AE spells; 0 is fine for single-target casts.
 pub fn build_cast_packet(slot: u32, spell_id: u32, target_id: u32) -> Vec<u8> {
-    let mut buf = vec![0u8; 20];
+    let mut buf = vec![0u8; 44];
     buf[0..4].copy_from_slice(&slot.to_le_bytes());
     buf[4..8].copy_from_slice(&spell_id.to_le_bytes());
-    buf[8..12].copy_from_slice(&0xFFFFu32.to_le_bytes());
-    buf[12..16].copy_from_slice(&target_id.to_le_bytes());
+    // inventory_slot @8..20: InventorySlot_Struct all -1 (no clicky item → SLOT_INVALID server-side).
+    for b in &mut buf[8..20] { *b = 0xFF; }
+    buf[20..24].copy_from_slice(&target_id.to_le_bytes());
+    // cs_unknown[2] @24..32 = 0; y_pos@32 / x_pos@36 / z_pos@40 = 0.0 (already zeroed).
     buf
 }
 
@@ -1641,14 +1651,17 @@ mod tests {
 
     #[test]
     fn cast_packet_layout() {
-        // gem 0, spell 200, target 1234 → [0, 200, 0xFFFF, 1234, 0] all u32 LE = 20 bytes.
-        let p = build_cast_packet(0, 200, 1234);
-        assert_eq!(p.len(), 20);
-        assert_eq!(&p[0..4], &0u32.to_le_bytes());
-        assert_eq!(&p[4..8], &200u32.to_le_bytes());
-        assert_eq!(&p[8..12], &0xFFFFu32.to_le_bytes());
-        assert_eq!(&p[12..16], &1234u32.to_le_bytes());
-        assert_eq!(&p[16..20], &[0, 0, 0, 0]);
+        // RoF2 CastSpell_Struct = 44 bytes (eqoxide#42). gem 1, spell 93, target 27.
+        // slot@0, spell_id@4, inventory_slot@8..20 (all -1 = invalid/no-item), target_id@20,
+        // cs_unknown@24..32, y/x/z@32..44 all 0. A 20-byte Titanium packet was dropped by the
+        // server's DECODE_LENGTH_EXACT — that was the "no spell ever casts" bug.
+        let p = build_cast_packet(1, 93, 27);
+        assert_eq!(p.len(), 44, "RoF2 CastSpell_Struct is 44 bytes");
+        assert_eq!(&p[0..4], &1u32.to_le_bytes(), "slot (gem)");
+        assert_eq!(&p[4..8], &93u32.to_le_bytes(), "spell_id");
+        assert_eq!(&p[8..20], &[0xFFu8; 12], "inventory_slot = all -1 (no clicky item)");
+        assert_eq!(&p[20..24], &27u32.to_le_bytes(), "target_id");
+        assert_eq!(&p[24..44], &[0u8; 20], "cs_unknown + y/x/z position = 0");
     }
 
     #[test]
