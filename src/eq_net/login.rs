@@ -107,7 +107,10 @@ pub async fn run_login_flow(
             sleep(Duration::from_secs(3)).await;
         }
         match run_login_phase(&config, &app_tx).await {
-            Err(e) => tracing::warn!("EQ: login failed (attempt {}): {}", attempt, e),
+            // A server-rejected create can't succeed on retry — surface it and stop now so the
+            // user sees the real reason instead of an endless "Login timed out" loop. (#6)
+            Err(LoginError::Fatal(e)) => return Err(e),
+            Err(LoginError::Retryable(e)) => tracing::warn!("EQ: login failed (attempt {}): {}", attempt, e),
             Ok((stream, net_rx, gs, world_creds)) => {
                 // Seed /entities map with everything discovered during login.
                 {
@@ -141,7 +144,7 @@ pub async fn run_login_flow(
 async fn run_login_phase(
     config: &LoginConfig,
     app_tx: &mpsc::UnboundedSender<AppPacket>,
-) -> Result<(EqStream, UnboundedReceiver<AppPacket>, GameState, WorldCredentials), String> {
+) -> Result<(EqStream, UnboundedReceiver<AppPacket>, GameState, WorldCredentials), LoginError> {
     let (net_tx, mut net_rx) = mpsc::unbounded_channel::<AppPacket>();
 
     tracing::info!("EQ: connecting to login server {}:{}", config.login_host, config.login_port);
@@ -170,7 +173,8 @@ async fn run_login_phase(
             match proto.handle(&packet, &mut stream, &gs) {
                 PhaseResult::Continue                => {}
                 PhaseResult::Done                    => break 'login,
-                PhaseResult::Error(e)                => return Err(e),
+                PhaseResult::Error(e)                => return Err(LoginError::Retryable(e)),
+                PhaseResult::Fatal(e)                => return Err(LoginError::Fatal(e)),
                 PhaseResult::ReconnectWorld { host, port } => {
                     drop(stream);
                     sleep(Duration::from_millis(100)).await;
@@ -197,7 +201,7 @@ async fn run_login_phase(
         sleep(Duration::from_millis(10)).await;
 
         if proto.is_timed_out() {
-            return Err("Login timed out".to_string());
+            return Err(LoginError::Retryable("Login timed out".to_string()));
         }
     }
 
@@ -216,8 +220,30 @@ enum PhaseResult {
     Continue,
     Done,
     Error(String),
+    /// Unrecoverable handshake failure — retrying with the same config can't succeed (e.g. the
+    /// server rejected character creation for an invalid combo). Stops the retry loop. (eqoxide#6)
+    Fatal(String),
     ReconnectWorld { host: String, port: u16 },
     ReconnectZone  { host: String, port: u16 },
+}
+
+/// Outcome of one login attempt. `Retryable` errors (timeouts, transient connection drops) are
+/// retried; `Fatal` errors (a server-rejected create) break the retry loop immediately so the user
+/// sees the real reason instead of an endless "Login timed out". `?` on a `String` maps to
+/// `Retryable` via the `From` impl, so existing connection error sites are unchanged.
+enum LoginError {
+    Retryable(String),
+    Fatal(String),
+}
+
+impl From<String> for LoginError {
+    fn from(s: String) -> Self { LoginError::Retryable(s) }
+}
+
+impl std::fmt::Display for LoginError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self { LoginError::Retryable(s) | LoginError::Fatal(s) => f.write_str(s) }
+    }
 }
 
 /// Tracks only the login-protocol handshake state.
@@ -240,6 +266,11 @@ struct LoginProtocol<'a> {
     // configured character is missing from the OP_SendCharInfo char-select list).
     awaiting_name_approval: bool,
     create_attempted:       bool,
+    /// True after OP_CharacterCreate is sent, while we await the server's verdict. Success arrives
+    /// as a fresh OP_SendCharInfo; FAILURE arrives as OP_ApproveName{0} (EQEmu world/client.cpp),
+    /// which — since `awaiting_name_approval` is already false by then — would otherwise be ignored
+    /// and the client would hang/timeout. This flag routes that reply to a Fatal error. (eqoxide#6)
+    awaiting_create_result: bool,
     done_zone_server_info: bool,
     done_zone_entry:       bool,
     done_client_ready:     bool,
@@ -259,6 +290,7 @@ impl<'a> LoginProtocol<'a> {
             done_play_everquest:   false,
             done_char_info:        false,
             awaiting_name_approval: false,
+            awaiting_create_result: false,
             create_attempted:       false,
             done_zone_server_info: false,
             done_zone_entry:       false,
@@ -326,14 +358,18 @@ impl<'a> LoginProtocol<'a> {
                 if char_in_list(&packet.payload, name) {
                     // Character exists on the account — enter world as normal.
                     self.done_char_info = true;
+                    self.awaiting_create_result = false; // create succeeded (char now in the list)
                     self.send_enter_world(stream);
                     PhaseResult::Continue
                 } else if let Some(cc) = &self.config.create {
                     // Not on the account: run the create handshake, unless we
                     // already tried (and the fresh list still lacks the char).
                     if self.create_attempted {
-                        return PhaseResult::Error(format!(
-                            "character '{}' still missing after create attempt", name));
+                        return PhaseResult::Fatal(format!(
+                            "character '{}' still missing after a create attempt — the server \
+                             rejected creation. Check the character_create block in your config \
+                             (valid race/class/deity combo, stats total, and start_zone = a zone_id).",
+                            name));
                     }
                     self.create_attempted = true;
                     self.awaiting_name_approval = true;
@@ -357,11 +393,28 @@ impl<'a> LoginProtocol<'a> {
                 let cc = self.config.create.as_ref().expect("create set while awaiting approval");
                 let pkt = build_char_create(cc);
                 stream.send_app_packet(OP_CHARACTER_CREATE, &pkt);
+                self.awaiting_create_result = true;
                 tracing::info!("EQ: name approved — sent OP_CharacterCreate for '{}' (race={} class={} deity={} zone={})",
                     self.config.character_name, cc.race, cc.class, cc.deity, cc.start_zone);
-                // Server replies with a fresh OP_SendCharInfo (success) handled above,
-                // or OP_ApproveName{0} (failure) which the arm above turns into an error.
+                // Server replies with a fresh OP_SendCharInfo (success) or OP_ApproveName{0}
+                // (failure) — the latter is caught by the awaiting_create_result arm below.
                 PhaseResult::Continue
+            }
+            // Create verdict: after OP_CharacterCreate, an OP_ApproveName reply means FAILURE
+            // (success comes as OP_SendCharInfo). EQEmu sends OP_ApproveName{0} when
+            // CheckCharCreateInfoSoF rejects the combo. Surface a clear, actionable Fatal error
+            // and stop retrying — the same config will be rejected every time. (eqoxide#6)
+            OP_APPROVE_NAME if self.awaiting_create_result => {
+                self.awaiting_create_result = false;
+                PhaseResult::Fatal(format!(
+                    "server rejected character creation for '{}' (race={} class={} deity={} \
+                     start_zone={}). The combo is invalid, the stats don't total, or start_zone \
+                     isn't a valid zone_id for it. Fix the character_create block in your config.",
+                    self.config.character_name,
+                    self.config.create.as_ref().map(|c| c.race).unwrap_or(0),
+                    self.config.create.as_ref().map(|c| c.class).unwrap_or(0),
+                    self.config.create.as_ref().map(|c| c.deity).unwrap_or(0),
+                    self.config.create.as_ref().map(|c| c.start_zone).unwrap_or(0)))
             }
             OP_ZONE_SERVER_INFO if !self.done_zone_server_info => {
                 self.done_zone_server_info = true;
@@ -676,5 +729,16 @@ mod charcreate_tests {
         assert!(char_in_list(&payload, "Durgan"));
         assert!(!char_in_list(&payload, "Mord"));     // prefix must not match
         assert!(!char_in_list(&payload, "Katie"));
+    }
+
+    #[test]
+    fn login_error_from_string_is_retryable() {
+        // The `?` operator on connection/timeout error sites yields String -> LoginError via this
+        // From impl; it MUST map to Retryable so transient failures still retry. Only an explicit
+        // PhaseResult::Fatal (server-rejected create) stops the loop. (eqoxide#6)
+        let e: super::LoginError = "World connection failed".to_string().into();
+        assert!(matches!(e, super::LoginError::Retryable(_)));
+        assert_eq!(e.to_string(), "World connection failed");
+        assert_eq!(super::LoginError::Fatal("rejected".into()).to_string(), "rejected");
     }
 }
