@@ -306,9 +306,10 @@ impl EqRenderer {
 
                 for (i, &p) in mesh.positions.iter().enumerate() {
                     let normal = mesh.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
-                    // libeq axes map to world as: render.X = server_x = p[2], render.Y = server_y
-                    // = p[0], render.Z (up) = p[1]. (The two horizontal axes are swapped vs the
-                    // old assumption; confirmed by zone safe-point/geometry alignment across zones.)
+                    // EQ WLD axis layout: [east, up, north] → render [p2, p0, p1].
+                    // render.X = server_x = p[2], render.Y = server_y = p[0], render.Z (up) = p[1].
+                    // (The two horizontal axes are swapped vs the old assumption; confirmed by zone
+                    // safe-point/geometry alignment across zones.)
                     entry.0.push(Vertex {
                         position: [p[2] + cz, p[0] + cx, p[1] + cy],
                         normal:   [normal[2], normal[0], normal[1]],
@@ -350,9 +351,9 @@ impl EqRenderer {
         // Sort merged meshes so same-texture groups are contiguous (they already are, but be safe).
         self.gpu_meshes.sort_by_key(|m| m.texture_idx.map_or(usize::MAX, |i| i));
 
-        // Build GPU-instanced object models: each ObjectModel mesh is uploaded ONCE (in RAW
-        // libeq model-local space — the instanced shader applies the instance matrix and the
-        // libeq→render axis swizzle), plus a single instance-transform buffer for all placements.
+        // Build GPU-instanced object models: each ObjectModel mesh is uploaded ONCE (in raw
+        // EQ model-local space — the instanced shader applies the instance matrix and the
+        // EQ→render axis swizzle), plus a single instance-transform buffer for all placements.
         {
             let mut instanced: Vec<crate::gpu::GpuInstancedMesh> = Vec::new();
             for model in &assets.objects {
@@ -429,47 +430,18 @@ impl EqRenderer {
         ];
 
         for &key in ARCHETYPES {
-            // Try glTF first, then fall back to EQ _chr.s3d.
             let gltf_path = models_dir.join(format!("{}.glb", key));
             let asset = if gltf_path.exists() {
                 match ModelAsset::load(&gltf_path) {
-                    Ok(a) => Some(a),
+                    Ok(a) => a,
                     Err(e) => {
-                        tracing::warn!("renderer: glTF load failed for '{}': {}", key, e);
-                        None
+                        tracing::error!("renderer: glTF load failed for '{}': {}", key, e);
+                        continue;
                     }
                 }
             } else {
-                None
-            };
-
-            let asset = match asset {
-                Some(a) => a,
-                None => {
-                    // Fall back to EQ _chr.s3d archive.
-                    let chr_name = crate::models::archetype_to_chr_s3d(key);
-                    let chr_asset = chr_name.and_then(|name| {
-                        let path = models_dir.join(name);
-                        if path.exists() {
-                            match ModelAsset::load_from_chr_s3d(&path) {
-                                Ok(a) => Some(a),
-                                Err(e) => {
-                                    tracing::warn!("renderer: chr S3D load failed for '{}': {}", key, e);
-                                    None
-                                }
-                            }
-                        } else {
-                            None
-                        }
-                    });
-                    match chr_asset {
-                        Some(a) => a,
-                        None => {
-                            tracing::info!("renderer: no model for archetype '{}'", key);
-                            continue;
-                        }
-                    }
-                }
+                tracing::error!("renderer: no GLB found for archetype '{}' at {}", key, gltf_path.display());
+                continue;
             };
 
             // Build the male model (gender 0) plus a female variant (gender 1) from
@@ -693,7 +665,7 @@ impl EqRenderer {
         for m in &weapon_meshes {
             if m.positions.is_empty() || m.indices.is_empty() { continue; }
             let [cx, cy, cz] = m.center;
-            // libeq [p0,p1,p2] -> render [p2,p0,p1] (same axis convention as zone/static meshes).
+            // EQ WLD [p0,p1,p2] -> render [p2,p0,p1] (same axis convention as zone/static meshes).
             let verts: Vec<crate::gpu::Vertex> = m.positions.iter().enumerate().map(|(i, &p)| {
                 let n = m.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
                 crate::gpu::Vertex {
@@ -776,7 +748,7 @@ impl EqRenderer {
     }
 
     /// Load + GPU-upload the door/object models for a zone. Clears any previously loaded
-    /// door models first (zone reload). Models are uploaded with the same libeq→render axis
+    /// door models first (zone reload). Models are uploaded with the same EQ→render axis
     /// swap as weapons/zone meshes. Textures from the GLB are uploaded into the shared
     /// `door_textures` and linked per mesh by `texture_idx`. Per-model local AABBs are
     /// recorded in `door_bounds` for click-picking.
@@ -808,7 +780,7 @@ impl EqRenderer {
             for m in &meshes {
                 if m.positions.is_empty() || m.indices.is_empty() { continue; }
                 let [cx, cy, cz] = m.center;
-                // libeq [p0,p1,p2] -> render [p2,p0,p1] (same axis convention as weapons/zone).
+                // EQ WLD [p0,p1,p2] -> render [p2,p0,p1] (same axis convention as weapons/zone).
                 let verts: Vec<Vertex> = m.positions.iter().enumerate().map(|(i, &p)| {
                     let n = m.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
                     Vertex {

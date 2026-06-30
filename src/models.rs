@@ -525,73 +525,6 @@ impl ModelAsset {
         Ok(ModelAsset { meshes, textures, skin: skin_data, skin_meshes, skinned_node_scale, skinned_mesh_scales, y_bottom, y_extent, x_center, z_center, prefix: model_prefix, equip_slots, head_parts, head_default_hidden, true_height, clip_bounds, feet_offset })
     }
 
-    /// Load a static character model from an EQ `_chr.s3d` archive.
-    /// Uses the WLD meshes and BMP/DDS textures inside the archive.
-    /// Returns a ModelAsset with no skin data (static mesh, no animation).
-    pub fn load_from_chr_s3d(s3d_path: &Path) -> Result<Self> {
-        let assets = crate::assets::ZoneAssets::load(s3d_path)
-            .with_context(|| format!("failed to load chr S3D: {}", s3d_path.display()))?;
-
-        if assets.terrain.is_empty() {
-            anyhow::bail!("no meshes found in {}", s3d_path.display());
-        }
-
-        // Compute y_bottom and y_extent from all mesh positions (world space).
-        let mut y_min = f32::MAX;
-        let mut y_max = f32::MIN;
-        for m in &assets.terrain {
-            for &p in &m.positions {
-                let wy = p[1] + m.center[1]; // libeq: [east, height, north]
-                if wy < y_min { y_min = wy; }
-                if wy > y_max { y_max = wy; }
-            }
-        }
-        let y_bottom = if y_min == f32::MAX { 0.0 } else { y_min };
-        let y_extent = if y_min < f32::MAX && y_max > f32::MIN { y_max - y_min } else { 0.0 };
-
-        // Compute x/z center from all mesh positions.
-        let (mut x_min, mut x_max) = (f32::MAX, f32::MIN);
-        let (mut z_min, mut z_max) = (f32::MAX, f32::MIN);
-        for m in &assets.terrain {
-            for &p in &m.positions {
-                let wx = p[0] + m.center[0];
-                let wz = p[2] + m.center[2];
-                if wx < x_min { x_min = wx; }
-                if wx > x_max { x_max = wx; }
-                if wz < z_min { z_min = wz; }
-                if wz > z_max { z_max = wz; }
-            }
-        }
-        let x_center = if x_min <= x_max { (x_min + x_max) * 0.5 } else { 0.0 };
-        let z_center = if z_min <= z_max { (z_min + z_max) * 0.5 } else { 0.0 };
-
-        let mesh_count = assets.terrain.len();
-        let tex_count = assets.textures.len();
-        tracing::info!("models: loaded chr model from {} ({} meshes, {} textures)",
-                  s3d_path.display(), mesh_count, tex_count);
-
-        Ok(ModelAsset {
-            meshes:            assets.terrain,
-            textures:          assets.textures,
-            skin:              None,
-            skin_meshes:       vec![],
-            skinned_node_scale: 1.0,
-            skinned_mesh_scales: vec![1.0; mesh_count],
-            y_bottom,
-            y_extent,
-            x_center,
-            z_center,
-            prefix: String::new(),
-            equip_slots: vec![None; mesh_count],
-            // chr.s3d models have no glTF extras — no head-part tags.
-            head_parts:         vec![None; mesh_count],
-            head_default_hidden: vec![false; mesh_count],
-            // chr.s3d models have no glTF extras; fall back to measured y_extent.
-            true_height: y_extent,
-            clip_bounds: vec![], // static chr.s3d models have no clips
-            feet_offset: 0.0,
-        })
-    }
 }
 
 /// One body region's equipment-slot binding for a single mesh primitive.
@@ -703,29 +636,6 @@ pub fn race_to_archetype(race: &str) -> &'static str {
         "WRM"                                            => "worm",
         "FIS"                                            => "fish",
         _                                                => "creature",
-    }
-}
-
-/// Map an archetype key to the EQ `_chr.s3d` filename (without path).
-/// Returns `None` for archetypes that have no EQ character archive.
-pub fn archetype_to_chr_s3d(archetype: &str) -> Option<&'static str> {
-    match archetype {
-        "humanoid"  => Some("globalhum_chr.s3d"),  // human male (globalhom is Halfling, not Human)
-        "elf"       => Some("globalelf_chr.s3d"),   // wood elf
-        "dwarf"     => Some("globaldwf_chr.s3d"),   // dwarf
-        "gnoll"     => Some("globalgnm_chr.s3d"),   // gnoll
-        "skeleton"  => None, // old WLD format (DmSprite), not convertible to glTF
-        "frog"      => Some("globalfroglok_chr.s3d"),// froglok
-        // global_chr.s3d is a combined archive (701 meshes for ALL races).
-        // Loading it as a single model produces a giant combined bounding box.
-        // These archetypes need per-race chr.s3d extraction to render correctly.
-        "zombie"    => None,
-        "rat"       => None,
-        "snake"     => None,
-        "bat"       => None,
-        "wolf"      => None,
-        "bear"      => None,
-        _           => None,
     }
 }
 
