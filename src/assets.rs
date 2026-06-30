@@ -327,6 +327,63 @@ impl ZoneAssets {
         Ok(ZoneAssets { terrain, objects, textures })
     }
 
+    /// Load a door/object GLB into model-local meshes keyed by UPPERCASE glTF mesh name,
+    /// plus decoded textures. Placement is applied by the caller from live door state.
+    pub fn object_models_from_glb(
+        path: &std::path::Path,
+    ) -> anyhow::Result<(std::collections::HashMap<String, Vec<MeshData>>, Vec<TextureData>)> {
+        let g = gltf::Gltf::open(path)
+            .with_context(|| format!("open door glb: {}", path.display()))?;
+        let base = path.parent().unwrap_or_else(|| std::path::Path::new("./"));
+        let buffers = gltf::import_buffers(&g.document, Some(base), g.blob)?;
+        let raw_images = gltf::import_images(&g.document, Some(base), &buffers)?;
+        let doc = &g.document;
+
+        let mut textures: Vec<TextureData> = Vec::new();
+        for (i, image) in doc.images().enumerate() {
+            let name = image.name().unwrap_or("").to_string();
+            let Some(raw) = raw_images.get(i) else { continue };
+            let rgba = match raw.format {
+                gltf::image::Format::R8G8B8A8 => raw.pixels.clone(),
+                gltf::image::Format::R8G8B8 => raw.pixels.chunks(3)
+                    .flat_map(|c| [c[0], c[1], c[2], 255]).collect(),
+                _ => continue,
+            };
+            textures.push(TextureData { name, width: raw.width, height: raw.height, rgba });
+        }
+        let tex_index_to_name: Vec<String> = doc.textures().map(|t| {
+            doc.images().nth(t.source().index()).and_then(|im| im.name().map(|n| n.to_string())).unwrap_or_default()
+        }).collect();
+
+        let mut models: std::collections::HashMap<String, Vec<MeshData>> = std::collections::HashMap::new();
+        for mesh in doc.meshes() {
+            let Some(name) = mesh.name() else { continue };
+            let key = name.to_uppercase();
+            let mut out: Vec<MeshData> = Vec::new();
+            for primitive in mesh.primitives() {
+                let reader = primitive.reader(|b| Some(&buffers[b.index()]));
+                let Some(positions) = reader.read_positions().map(|i| i.collect::<Vec<[f32;3]>>()) else { continue };
+                if positions.is_empty() { continue; }
+                let normals = reader.read_normals().map(|i| i.collect())
+                    .unwrap_or_else(|| vec![[0.0,0.0,1.0]; positions.len()]);
+                let uvs = reader.read_tex_coords(0).map(|t| t.into_f32().collect())
+                    .unwrap_or_else(|| vec![[0.0,0.0]; positions.len()]);
+                let indices = reader.read_indices().map(|i| i.into_u32().collect())
+                    .unwrap_or_else(|| (0..positions.len() as u32).collect());
+                let texture_name = primitive.material().pbr_metallic_roughness().base_color_texture()
+                    .and_then(|info| tex_index_to_name.get(info.texture().index()).cloned())
+                    .filter(|n| !n.is_empty());
+                let base_color = primitive.material().pbr_metallic_roughness().base_color_factor();
+                out.push(MeshData {
+                    positions, normals, uvs, indices, texture_name, base_color,
+                    center: [0.0,0.0,0.0], render_mode: RenderMode::Opaque, anim: None,
+                });
+            }
+            if !out.is_empty() { models.entry(key).or_default().extend(out); }
+        }
+        Ok((models, textures))
+    }
+
     /// Compute the 2D bounding box of all mesh vertices.
     /// Returns `([min_east, min_north], [max_east, max_north])` in EQ world coords
     /// (east = server_x, north = server_y).
@@ -1219,6 +1276,23 @@ mod b2_glb_tests {
         let tex_names: std::collections::HashSet<_> = za.textures.iter().map(|t| t.name.clone()).collect();
         let linked = all.iter().filter(|m| m.texture_name.as_ref().map_or(false, |n| tex_names.contains(n))).count();
         assert!(linked > 0, "at least some meshes must resolve their texture by name");
+    }
+}
+
+#[cfg(test)]
+mod door_glb_tests {
+    use super::*;
+    #[test]
+    #[ignore = "requires a baked <zone>_doors.glb at $DOORS_GLB"]
+    fn loads_named_door_models() {
+        let p = std::env::var("DOORS_GLB").expect("set DOORS_GLB");
+        let (models, textures) = ZoneAssets::object_models_from_glb(std::path::Path::new(&p)).unwrap();
+        assert!(!models.is_empty(), "expected named door models");
+        assert!(models.keys().all(|k| k == &k.to_uppercase()), "keys are uppercase base names");
+        let tex: std::collections::HashSet<_> = textures.iter().map(|t| t.name.clone()).collect();
+        let linked = models.values().flatten()
+            .filter(|m| m.texture_name.as_ref().map_or(false, |n| tex.contains(&n.to_lowercase()))).count();
+        assert!(linked > 0, "some door meshes resolve textures by name");
     }
 }
 
