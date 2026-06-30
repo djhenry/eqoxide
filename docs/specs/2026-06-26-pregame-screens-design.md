@@ -148,7 +148,14 @@ Innoruuk=206, Karana=207, MithanielMarr=208, Prexus=209, Quellious=210, RallosZe
 SolusekRo=213, TheTribunal=214, Tunare=215, Veeshan=216. (Per-class deity lists in the knowledgebase
 doc; deity not enforced server-side, so the per-class list is a UI nicety.)
 
-### StartZoneIndex (the `start_zone` wire value, 0–13) and per-race start cities
+### Start city → `start_zone` wire value (a ZONE_ID under RoF2) and per-race start cities
+> ⚠ **The `start_zone` wire value is a ZONE_ID, not the Titanium StartZoneIndex 0–13.** RoF2's
+> `CheckCharCreateInfoSoF` matches `cc->start_zone` against `char_create_combinations.start_zone`
+> (zone_ids), so the UI must resolve the chosen start city to a **zoneidnumber valid for that
+> race/class/deity** (e.g. Dark Elf Necromancer → 42 `neriakc` or 394 `crescent`). Sending the raw
+> 0–13 index makes the server reject every create (eqoxide#5). The map index→zone_id is per-combo
+> (the same index can resolve to different neriak sub-zones), so resolve it from
+> `char_create_combinations`, not a fixed table. The index table below is for the city picker only.
 ```
 0 Odus(erudnext; paineel if deity=203)  7 Oggok          | Human    1,4      Dwarf    8
 1 Qeynos(qeynos2)                        8 Kaladim        | Barb     2        Troll    6
@@ -187,10 +194,13 @@ Beastlord→WIS, Berserker→STA. Appearance defaults all 0, gender male.
   code** (`build_approve_name` in `login.rs`) uses `name[64] @0, race u32 @64, class u32 @68` and the
   server accepted it (created "Mordeth" with the correct name). **Trust the working layout** (name at
   offset 0); only the name + race materially matter to the server. Re-verify if changing.
-- **`OP_CharacterCreate` (0x10b2), 80B, C→S.** 20 LE u32 in order: class, haircolor, beardcolor,
-  beard, gender, race, start_zone, hairstyle, deity, STR, STA, AGI, DEX, WIS, INT, CHA, face,
-  eyecolor1, eyecolor2, tutorial. (Already implemented as `build_char_create`.) Success = server
-  resends `OP_SendCharInfo`; failure = `OP_ApproveName{0}`.
+- **`OP_CharacterCreate` (0x10b2), RoF2 96B (24 LE u32), C→S.** ⚠ The 80B/20-u32 Titanium layout
+  below is NOT what we send — the live `build_char_create` (`login.rs`) emits the RoF2 96-byte
+  struct in order: gender, race, class, deity, **start_zone (zone_id)**, haircolor, beard,
+  beardcolor, hairstyle, face, eyecolor1, eyecolor2, drakkin_heritage/tattoo/details, STR, STA,
+  AGI, DEX, WIS, INT, CHA, tutorial, unknown0092. (Titanium order was: class, haircolor, beardcolor,
+  beard, gender, race, start_zone, hairstyle, deity, STR..CHA, face, eyecolor1/2, tutorial.) Success
+  = server resends `OP_SendCharInfo`; failure = `OP_ApproveName{0}`.
 - **`OP_SendCharInfo` (0x4513), 1704B fixed, S→C.** 10 fixed slots (Titanium hard-caps at 8 but emits
   10); empty slot `Name == "<none>"`. Struct-of-arrays layout (offsets in the knowledgebase doc): per
   slot Race, Class, Level, Zone, Gender, Face, HairStyle/HairColor/Beard/BeardColor, EyeColor1/2,
