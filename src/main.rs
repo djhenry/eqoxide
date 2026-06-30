@@ -212,6 +212,12 @@ OPTIONS:
     let shared_collision: assets::SharedCollision = Arc::new(std::sync::RwLock::new(None));
     let frame_req:        http::FrameReq        = Arc::new(Mutex::new(None));
     let player_info:      http::PlayerInfo      = Arc::new(Mutex::new(http::PlayerState::default()));
+    // Single-authority movement (Component A): the render thread owns the CharacterController and
+    // publishes `controller_view`; the nav thread streams it and writes `nav_intent` for /goto;
+    // `pos_correction` hands a server correction back to the controller.
+    let controller_view:  http::ControllerShared = Arc::new(Mutex::new(eqoxide::movement::ControllerView::default()));
+    let nav_intent:       http::NavIntent        = Arc::new(Mutex::new(None));
+    let pos_correction:   http::PosCorrection     = Arc::new(Mutex::new(None));
 
     // EQ network task — skipped in --testzone mode (offline debug)
     let character_name = login_cfg.character_name.clone();
@@ -251,11 +257,14 @@ OPTIONS:
         let sd  = shutdown.clone();
         let cp  = camp.clone();
         let cu  = camp_until.clone();
+        let cv  = controller_view.clone();
+        let ni  = nav_intent.clone();
+        let pc  = pos_correction.clone();
         let md  = data_dir.join("maps");
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, zc, wp, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, cev, csd, ca, ms, st, co, sc, md, sd, cp, cu).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, zc, wp, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, cev, csd, ca, ms, st, co, sc, md, sd, cp, cu, cv, ni, pc).await {
                     tracing::error!("EQ: fatal: {e}");
                 }
             });
@@ -362,6 +371,9 @@ OPTIONS:
         asset_server_url,
         asset_user,
         asset_pass,
+        controller_view,
+        nav_intent,
+        pos_correction,
     );
     event_loop.run_app(&mut application).expect("event loop run");
     // The event loop has now exited gracefully — either the window was closed, or a shutdown was

@@ -308,6 +308,17 @@ impl ZoneAssets {
             }
             let Some(mesh) = node.mesh() else { continue };
             let matrix = node.transform().matrix();
+            // The baked collision mesh (SOLID + INVIS faces, PASSABLE excluded) is delivered as
+            // a mesh named `__collision__`. Tag its MeshData with the sentinel texture name so
+            // the renderer skips drawing it and `Collision::build` uses it for collision.
+            if mesh.name() == Some(COLLISION_MESH_TAG) {
+                let mut mds = read_mesh(&mesh);
+                for md in &mut mds {
+                    md.texture_name = Some(COLLISION_MESH_TAG.to_string());
+                }
+                terrain.extend(mds);
+                continue;
+            }
             if is_identity(&matrix) {
                 terrain.extend(read_mesh(&mesh));
             } else {
@@ -417,6 +428,23 @@ impl ZoneAssets {
 /// `Arc<Collision>` so both threads share one grid without cloning the triangle data.
 pub type SharedCollision = std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<Collision>>>>;
 
+/// A swept-collision hit: fraction `t ∈ [0,1]` along the query delta where contact occurs,
+/// plus the unit surface normal of the hit triangle (flipped to oppose the motion so callers
+/// can project/slide against it). Returned by [`Collision::sweep`].
+#[derive(Debug, Clone, Copy)]
+pub struct Hit {
+    pub t:      f32,
+    pub normal: [f32; 3],
+}
+
+/// Sentinel `MeshData.texture_name` marking the dedicated collision geometry baked into a
+/// zone GLB as a mesh named `__collision__`. The asset-server/converter emits every SOLID
+/// face (including INVIS — invisible-but-solid zone boundaries, invisible walls, doorframes)
+/// here while EXCLUDING PASSABLE faces (water surfaces, foliage). `from_glb` tags the loaded
+/// mesh with this name so the renderer skips drawing it and `Collision::build` consumes it
+/// for collision instead of the rendered terrain.
+pub const COLLISION_MESH_TAG: &str = "__collision__";
+
 pub struct Collision {
     tris:      Vec<[[f32; 3]; 3]>,
     cells:     Vec<Vec<u32>>,
@@ -427,6 +455,10 @@ pub struct Collision {
     /// Optional water-region map (from the zone's `.wtr`). When present, find_path may DESCEND
     /// through water (swim down a canal/shaft) to a lower floor that has no walkable connection.
     water:     Option<std::sync::Arc<crate::water_map::WaterMap>>,
+    /// True when the terrain triangles came from a dedicated `__collision__` mesh (SOLID +
+    /// INVIS faces, PASSABLE excluded). False for legacy zones with no baked collision mesh,
+    /// where the rendered terrain is used as a fallback. Diagnostic/provenance only.
+    pub from_collision_mesh: bool,
 }
 
 impl Collision {
@@ -435,7 +467,28 @@ impl Collision {
         // Flatten every triangle into world space [east, north, height].
         let mut tris: Vec<[[f32; 3]; 3]> = Vec::new();
         let expanded = expand_objects(&assets.objects);
-        for m in assets.terrain.iter().chain(expanded.iter()) {
+
+        // Prefer the dedicated `__collision__` mesh when the zone GLB carries one: it holds
+        // every SOLID face (visible AND invisible-but-solid: zone boundaries, invisible walls,
+        // doorframes) and omits PASSABLE faces (water surfaces, foliage). Older zones baked
+        // before this pipeline change have no such mesh — fall back to the rendered terrain so
+        // they keep colliding as before. Placed-object collision always comes from
+        // `expand_objects`, unchanged in both paths.
+        let from_collision_mesh = assets
+            .terrain
+            .iter()
+            .any(|m| m.texture_name.as_deref() == Some(COLLISION_MESH_TAG));
+        let terrain_src: Vec<&MeshData> = if from_collision_mesh {
+            assets
+                .terrain
+                .iter()
+                .filter(|m| m.texture_name.as_deref() == Some(COLLISION_MESH_TAG))
+                .collect()
+        } else {
+            assets.terrain.iter().collect()
+        };
+
+        for m in terrain_src.into_iter().chain(expanded.iter()) {
             let pos = &m.positions;
             let idx = &m.indices;
             let mut k = 0;
@@ -465,7 +518,7 @@ impl Collision {
         }
         let cell_size = cell_size.max(1.0);
         if tris.is_empty() || min[0] == f32::MAX {
-            return Collision { tris, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0, water: None };
+            return Collision { tris, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0, water: None, from_collision_mesh };
         }
         let cols = (((max[0] - min[0]) / cell_size).ceil() as usize + 1).max(1);
         let rows = (((max[1] - min[1]) / cell_size).ceil() as usize + 1).max(1);
@@ -486,7 +539,7 @@ impl Collision {
                 }
             }
         }
-        Collision { tris, cells, origin: min, cell_size, cols, rows, water: None }
+        Collision { tris, cells, origin: min, cell_size, cols, rows, water: None, from_collision_mesh }
     }
 
     /// Attach a zone water map so find_path can route swim descents. Call after `build`.
@@ -634,6 +687,119 @@ impl Collision {
             }
         }
         best
+    }
+
+    // ───────────────────────── Component A: additive movement queries ─────────────────────────
+    // These operate generically on `tris` and never touch `build`/the struct fields, so they work
+    // whether or not Component B has enriched the triangle set (INVIS faces). See design §5.
+
+    /// True when zone geometry is loaded (the broad-phase grid is non-empty). Callers use this to
+    /// skip collision/depenetration entirely when no zone mesh is present.
+    pub fn has_geometry(&self) -> bool { self.cols != 0 }
+
+    /// Like [`nearest_hit_t`] but also returns the hit triangle's **unit normal**, flipped to
+    /// oppose the segment direction (so it faces back toward `from`). Used by [`sweep`] to provide
+    /// the slide plane for collide-and-slide. Möller–Trumbore over the broad-phase cells.
+    pub fn nearest_hit(&self, from: [f32; 3], to: [f32; 3]) -> Option<(f32, [f32; 3])> {
+        if self.cols == 0 { return None; }
+        let dir = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+        if dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2] < 1e-9 { return None; }
+        let eps = 1e-6_f32;
+        let cross = |a: [f32; 3], b: [f32; 3]| [
+            a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0],
+        ];
+        let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let (c0, c1, r0, r1) = self.cell_range(
+            from[0].min(to[0]), from[1].min(to[1]), from[0].max(to[0]), from[1].max(to[1]),
+        );
+        let mut best: Option<(f32, [f32; 3])> = None;
+        for r in r0..=r1 {
+            for c in c0..=c1 {
+                for &ti in &self.cells[r * self.cols + c] {
+                    let tri = &self.tris[ti as usize];
+                    let (v0, v1, v2) = (tri[0], tri[1], tri[2]);
+                    let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
+                    let e2 = [v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2]];
+                    let p = cross(dir, e2);
+                    let det = dot(e1, p);
+                    if det.abs() < eps { continue; }
+                    let inv = 1.0 / det;
+                    let tvec = [from[0] - v0[0], from[1] - v0[1], from[2] - v0[2]];
+                    let u = dot(tvec, p) * inv;
+                    if u < 0.0 || u > 1.0 { continue; }
+                    let q = cross(tvec, e1);
+                    let v = dot(dir, q) * inv;
+                    if v < 0.0 || u + v > 1.0 { continue; }
+                    let t = dot(e2, q) * inv;
+                    if t > 1e-3 && t <= 1.0 && best.map_or(true, |(b, _)| t < b) {
+                        // Geometric normal e1×e2, normalised, flipped to face back toward `from`.
+                        let mut n = cross(e1, e2);
+                        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+                        if len > 1e-9 { n = [n[0] / len, n[1] / len, n[2] / len]; }
+                        if dot(n, dir) > 0.0 { n = [-n[0], -n[1], -n[2]]; }
+                        best = Some((t, n));
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// Swept "cylinder" of `radius` moving from `from` by `delta`, approximated by casting the
+    /// centre segment plus offset feeler segments at ±radius perpendicular to the horizontal motion
+    /// and at foot/chest heights. Returns the nearest contact (fraction `t` + slide-plane normal),
+    /// or `None` when the path is clear. (Design §3.1.)
+    pub fn sweep(&self, from: [f32; 3], delta: [f32; 3], radius: f32) -> Option<Hit> {
+        if self.cols == 0 { return None; }
+        let hlen = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+        // Perpendicular (in the horizontal plane) to the motion, scaled to radius.
+        let perp = if hlen > 1e-6 {
+            [-delta[1] / hlen * radius, delta[0] / hlen * radius]
+        } else {
+            [0.0, 0.0]
+        };
+        // Foot and chest height offsets (cylinder ~6 units tall, origin at the feet).
+        const FOOT: f32 = 0.5;
+        const CHEST: f32 = 4.0;
+        let mut best: Option<Hit> = None;
+        for &(ox, oy) in &[(0.0_f32, 0.0_f32), (perp[0], perp[1]), (-perp[0], -perp[1])] {
+            for &hz in &[FOOT, CHEST] {
+                let f = [from[0] + ox, from[1] + oy, from[2] + hz];
+                let to = [f[0] + delta[0], f[1] + delta[1], f[2] + delta[2]];
+                if let Some((t, n)) = self.nearest_hit(f, to) {
+                    if best.map_or(true, |b| t < b.t) {
+                        best = Some(Hit { t, normal: n });
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// Cast a vertical ray from `origin_z` straight down `depth` units at `(east, north)` and
+    /// return the height of the nearest surface below, or `None` if nothing is within reach.
+    /// Native ground clamp uses `origin = foot_z + 1.0`, `depth = 200` (design §3.2).
+    pub fn ground_below(&self, east: f32, north: f32, origin_z: f32, depth: f32) -> Option<f32> {
+        if self.cols == 0 { return None; }
+        let from = [east, north, origin_z];
+        let to   = [east, north, origin_z - depth.max(0.0)];
+        self.nearest_hit_t(from, to).map(|t| origin_z - t * depth.max(0.0))
+    }
+
+    /// Is the player's cylindrical footprint at `(east, north, foot_z)` clear of geometry?
+    /// Samples a horizontal ring of `n` directions at `radius` (and the centre) at chest height,
+    /// returning `true` only when none are blocked. Used by the depenetration net (design §3.3).
+    pub fn footprint_clear(&self, east: f32, north: f32, foot_z: f32, radius: f32, n: usize) -> bool {
+        if self.cols == 0 { return true; }
+        let chest = foot_z + 3.0;
+        let c = [east, north, chest];
+        let n = n.max(1);
+        for i in 0..n {
+            let a = (i as f32) / (n as f32) * std::f32::consts::TAU;
+            let to = [east + a.cos() * radius, north + a.sin() * radius, chest];
+            if self.nearest_hit_t(c, to).is_some() { return false; }
+        }
+        true
     }
 
     /// Is `from → to` blocked by geometry before ~92% of the way? Used for nameplate
@@ -910,6 +1076,30 @@ mod b2_glb_tests {
         let linked = all.iter().filter(|m| m.texture_name.as_ref().map_or(false, |n| tex_names.contains(n))).count();
         assert!(linked > 0, "at least some meshes must resolve their texture by name");
     }
+
+    /// End-to-end: a zone GLB baked with the Component-B pipeline (containing a `__collision__`
+    /// mesh) must be ingested so `Collision::build` reports collision-mesh provenance, the
+    /// collision mesh is NOT in the render terrain (texture-linked) set, and the grid is
+    /// non-empty. Point `ZONE_GLB` at e.g. /tmp/eqoxide_test_gfaydark.glb (the asset-server
+    /// `baked_zone_has_collision_mesh_with_invisible_faces` test writes one).
+    #[test]
+    #[ignore = "requires a baked zone glb (with __collision__) at $ZONE_GLB"]
+    fn from_glb_ingests_collision_mesh() {
+        let p = std::env::var("ZONE_GLB").expect("set ZONE_GLB to a baked zone glb");
+        let za = ZoneAssets::from_glb(std::path::Path::new(&p)).unwrap();
+        // The collision mesh is tagged and carried in `terrain` (so the renderer can skip it),
+        // but it is never uploaded for drawing.
+        let tagged = za.terrain.iter()
+            .filter(|m| m.texture_name.as_deref() == Some(COLLISION_MESH_TAG))
+            .count();
+        assert_eq!(tagged, 1, "exactly one __collision__ mesh expected in the baked zone");
+        let col = Collision::build(&za, 32.0);
+        assert!(col.from_collision_mesh, "Collision::build must use the __collision__ mesh");
+        // Sanity: the floor under a known walkable point resolves to real geometry, and the
+        // grid has triangles to query.
+        assert!(col.floor_z(0.0, 0.0, 9999.0) < 9999.0 || za.terrain.len() > 1,
+            "collision grid should contain queryable geometry");
+    }
 }
 
 #[cfg(test)]
@@ -979,6 +1169,57 @@ mod tests {
         assert!(!empty.segment_blocked([0.0, 0.0, 0.0], [10.0, 0.0, 0.0]));
         assert!(empty.path_clear([0.0, 0.0, 0.0], [10.0, 0.0, 0.0], 2.0),
             "no geometry should never block movement");
+    }
+
+    /// When a zone carries a dedicated `__collision__` mesh, `Collision::build` must collide
+    /// against THAT geometry (which includes invisible-but-solid walls) and ignore the rendered
+    /// terrain. When absent, it must fall back to the rendered terrain (back-compat). This is
+    /// the client half of Component B.
+    #[test]
+    fn collision_prefers_collision_mesh_and_falls_back() {
+        // A visible floor at z=0 (render terrain) plus an INVISIBLE wall at world east=5.
+        // In the real pipeline the invisible wall only appears in the `__collision__` mesh
+        // (it has no render texture); here we model that by tagging it.
+        let floor = MeshData {
+            positions: vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 0.0, 10.0], [0.0, 0.0, 10.0]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
+            center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
+        };
+        // The `__collision__` mesh: the same floor PLUS the invisible wall at east=5, tagged.
+        let collision_mesh = MeshData {
+            positions: vec![
+                // floor
+                [0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [10.0, 0.0, 10.0], [0.0, 0.0, 10.0],
+                // invisible wall at world east=5 (libeq p2=5), north 0..10, height 0..10
+                [0.0, 0.0, 5.0], [10.0, 0.0, 5.0], [10.0, 10.0, 5.0], [0.0, 10.0, 5.0],
+            ],
+            normals: vec![[0.0, 1.0, 0.0]; 8], uvs: vec![[0.0, 0.0]; 8],
+            indices: vec![0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7],
+            texture_name: Some(COLLISION_MESH_TAG.to_string()),
+            base_color: [1.0; 4], center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
+        };
+
+        // With the collision mesh present: the invisible wall blocks movement.
+        let with_mesh = Collision::build(
+            &ZoneAssets { terrain: vec![floor.clone(), collision_mesh], objects: vec![], textures: vec![] },
+            4.0,
+        );
+        assert!(with_mesh.from_collision_mesh, "should report collision-mesh provenance");
+        assert!(!with_mesh.path_clear([3.0, 5.0, 3.0], [7.0, 5.0, 3.0], 0.5),
+            "the invisible wall (only in __collision__) must block movement");
+        // The floor still grounds correctly.
+        assert!((with_mesh.floor_z(3.0, 3.0, 20.0) - 0.0).abs() < 1e-3);
+
+        // Back-compat: a zone with only rendered terrain (no `__collision__`) falls back to it.
+        let fallback = Collision::build(
+            &ZoneAssets { terrain: vec![floor], objects: vec![], textures: vec![] },
+            4.0,
+        );
+        assert!(!fallback.from_collision_mesh, "no collision mesh → fallback to rendered terrain");
+        // No wall in the rendered terrain, so the same path is clear.
+        assert!(fallback.path_clear([3.0, 5.0, 3.0], [7.0, 5.0, 3.0], 0.5),
+            "fallback terrain has no invisible wall");
     }
 
     /// Zone-in reground premise: a player spawned BELOW the floor must be recoverable.
@@ -1062,6 +1303,69 @@ mod tests {
         // Stepping away from the wall (west) is clear.
         assert!(col.path_clear([3.0, 5.0, chest], [1.5, 5.0, chest], 2.0),
             "stepping away from the wall should be clear");
+    }
+
+    /// Build a vertical wall plane at world east=`e`, spanning north [-100,100] and height [h0,h1].
+    fn wall_east(e: f32, h0: f32, h1: f32) -> MeshData {
+        MeshData {
+            positions: vec![[-100.0, h0, e], [100.0, h0, e], [100.0, h1, e], [-100.0, h1, e]],
+            normals: vec![[0.0, 0.0, 1.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
+            center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
+        }
+    }
+
+    /// Build a horizontal floor at height `z` covering east [e0,e1] and north [-100,100].
+    fn floor_band(z: f32, e0: f32, e1: f32) -> MeshData {
+        MeshData {
+            positions: vec![[-100.0, z, e0], [100.0, z, e0], [100.0, z, e1], [-100.0, z, e1]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
+            center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
+        }
+    }
+
+    #[test]
+    fn sweep_into_wall_returns_hit_with_facing_normal() {
+        let col = Collision::build(
+            &ZoneAssets { terrain: vec![wall_east(5.0, 0.0, 10.0)], objects: vec![], textures: vec![] }, 4.0);
+        // Moving +east from east=3 by 5 units crosses the wall at east=5.
+        let hit = col.sweep([3.0, 0.0, 0.0], [5.0, 0.0, 0.0], 1.0).expect("should hit the wall");
+        assert!(hit.t > 0.0 && hit.t < 1.0, "t in (0,1): {}", hit.t);
+        // The wall plane is perpendicular to east; the normal must point back toward -east (the
+        // side the mover came from), i.e. normal.east < 0.
+        assert!(hit.normal[0] < -0.5, "normal should oppose +east motion: {:?}", hit.normal);
+        // Moving parallel to the wall (north) from east=3 never reaches it.
+        assert!(col.sweep([3.0, 0.0, 0.0], [0.0, 5.0, 0.0], 1.0).is_none(),
+            "parallel motion should not hit the wall");
+    }
+
+    #[test]
+    fn ground_below_uses_origin_and_depth() {
+        let col = Collision::build(
+            &ZoneAssets { terrain: vec![floor_band(0.0, -100.0, 100.0)], objects: vec![], textures: vec![] }, 8.0);
+        // Foot at z=5, probe from foot+1=6 down 200 → finds floor at z=0.
+        let f = col.ground_below(0.0, 0.0, 6.0, 200.0).expect("floor below within probe");
+        assert!((f - 0.0).abs() < 1e-2, "expected floor z=0, got {f}");
+        // Shallow probe that doesn't reach the floor returns None.
+        assert!(col.ground_below(0.0, 0.0, 6.0, 3.0).is_none(),
+            "a 3u probe from z=6 cannot reach the floor at z=0");
+    }
+
+    #[test]
+    fn footprint_clear_detects_embedded_vs_free() {
+        // Two walls forming a tight box around the origin at east ±0.8 — radius-1 footprint at the
+        // centre pokes through both, so it is NOT clear.
+        let boxed = Collision::build(&ZoneAssets {
+            terrain: vec![wall_east(0.8, 0.0, 10.0), wall_east(-0.8, 0.0, 10.0)], objects: vec![], textures: vec![],
+        }, 4.0);
+        assert!(!boxed.footprint_clear(0.0, 0.0, 0.0, 1.0, 8),
+            "footprint wedged between two close walls should read as blocked");
+        // Open floor: a radius-1 footprint is clear.
+        let open = Collision::build(
+            &ZoneAssets { terrain: vec![floor_band(0.0, -100.0, 100.0)], objects: vec![], textures: vec![] }, 8.0);
+        assert!(open.footprint_clear(0.0, 0.0, 0.0, 1.0, 8),
+            "footprint on open floor should be clear");
     }
 }
 

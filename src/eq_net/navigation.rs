@@ -11,14 +11,19 @@ const NAV_TICK_MS: u128 = 150;
 /// We must NOT move faster than this: even where THIS server tolerates it, others rubber-band or
 /// reject motion the real client can't produce.
 const RUN_SPEED: f32 = 44.0;
-/// Max distance to move per nav tick. `RUN_SPEED * tick_seconds`; the >=150 ms gate guarantees the
-/// realized speed never exceeds RUN_SPEED.
-const NAV_STEP: f32 = RUN_SPEED * (NAV_TICK_MS as f32 / 1000.0); // 44 * 0.150 = 6.6 units
-
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::{GameState, ZonePoint};
-use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, TradeCmd, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, ChatEventsShared, ChatSendShared, CastReq, MemSpellReq, SitReq, ConsiderReq, CampReq, CampCmd, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, WarpReq, ZoneCrossReq, ZonePoints};
+use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, TradeCmd, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, ChatEventsShared, ChatSendShared, CastReq, MemSpellReq, SitReq, ConsiderReq, CampReq, CampCmd, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, WarpReq, ZoneCrossReq, ZonePoints, ControllerShared, NavIntent, PosCorrection};
+use crate::movement::MoveIntent;
+
+/// Min interval (ms) between OP_ClientUpdate sends while moving (native `0x118` = 280 ms).
+const POS_SEND_MOVING_MS: u128 = 280;
+/// Forced keepalive interval (ms) when idle (native `0x514` = 1300 ms).
+const POS_SEND_KEEPALIVE_MS: u128 = 1300;
+/// A >12u jump in the network gs player position between ticks that we did NOT stream is a genuine
+/// server correction (anti-cheat snap / teleport), handed to the render controller to apply.
+const CORRECTION_SQ: f32 = 144.0;
 
 /// Pending state of a quest turn-in (POST /give). The trade window spans multiple nav ticks:
 /// we send OP_TradeRequest, then must wait for the server's OP_TradeRequestAck before moving the
@@ -383,6 +388,17 @@ pub struct Navigator {
     stuck_best:       f32,
     stuck_ticks:      u32,
     stuck_i:          usize,
+    /// Single-authority controller integration (design §2). `controller_view` is the render
+    /// thread's authoritative position snapshot we stream to the server; `nav_intent` is the
+    /// `/goto` planner's per-frame wish written for the render controller; `pos_correction` hands a
+    /// genuine server correction back to the controller.
+    controller_view:  ControllerShared,
+    nav_intent:       NavIntent,
+    pos_correction:   PosCorrection,
+    /// Last position we streamed, and the last-send timestamp (for the 280 ms / 1300 ms cadence).
+    last_streamed:    [f32; 3],
+    last_pos_send:    Instant,
+    streamed_init:    bool,
 }
 
 impl Navigator {
@@ -418,6 +434,9 @@ impl Navigator {
         collision:        crate::assets::SharedCollision,
         maps_dir:         std::path::PathBuf,
         camp:             CampReq,
+        controller_view:  ControllerShared,
+        nav_intent:       NavIntent,
+        pos_correction:   PosCorrection,
     ) -> Self {
         Navigator {
             goto_target,
@@ -466,6 +485,12 @@ impl Navigator {
             stuck_best: f32::MAX,
             stuck_ticks: 0,
             stuck_i: 0,
+            controller_view,
+            nav_intent,
+            pos_correction,
+            last_streamed: [0.0, 0.0, 0.0],
+            last_pos_send: Instant::now(),
+            streamed_init: false,
         }
     }
 
@@ -899,6 +924,10 @@ impl Navigator {
             gs.log_msg("inventory", &format!("Moved item (slot {} -> {})", from_slot, to_slot));
         }
 
+        // Stream the controller's authoritative position to the server every tick at native cadence
+        // (independent of the 150 ms planner gate below). This is the single position authority.
+        self.stream_position(stream, gs);
+
         if self.last_tick.elapsed().as_millis() < NAV_TICK_MS {
             return;
         }
@@ -1029,28 +1058,21 @@ impl Navigator {
                         // close enough to loot the corpse after the pet kills it.
                         let engage = if gs.pet_id.is_some() { PET_STANDOFF } else { MELEE };
                         let hdg = if dist > 0.01 { eq_heading(dx, dy) } else { gs.player_heading };
+                        gs.player_heading = hdg;
                         if dist > engage {
-                            // Step toward the target (collision-aware), facing it. Capped to the
-                            // native run speed like the main walk step.
-                            let step = NAV_STEP.min(dist - engage);
-                            let fdx = dx / dist * step;
-                            let fdy = dy / dist * step;
-                            let nz = gs.player_z;
-                            let mv = match self.collision.read().unwrap().clone() {
-                                None    => Some((fdx, fdy)),
-                                Some(c) => slide_move(&c, gs.player_x, gs.player_y, nz, fdx, fdy, 2.0),
-                            };
-                            if let Some((mdx, mdy)) = mv {
-                                let nx = gs.player_x + mdx;
-                                let ny = gs.player_y + mdy;
-                                self.send_position_update(stream, gs, nx, ny, nz, hdg);
-                                gs.player_x = nx; gs.player_y = ny; gs.player_heading = hdg;
-                                let _ = app_tx.send(make_position_packet(gs.player_id, nx, ny, nz, hdg));
-                            }
+                            // Drive the controller toward the target (it owns collide-and-slide).
+                            *self.nav_intent.lock().unwrap() = Some(MoveIntent {
+                                wish_dir:    [dx / dist, dy / dist],
+                                wish_vspeed: 0.0,
+                                jump:        false,
+                                want_swim:   false,
+                                speed:       RUN_SPEED,
+                            });
                         } else {
-                            // In melee range: hold and face the target.
+                            // In melee range: stop the controller and face the target so swings land
+                            // (IsFacingMob). The explicit send keeps the server's facing current.
+                            *self.nav_intent.lock().unwrap() = None;
                             self.send_position_update(stream, gs, gs.player_x, gs.player_y, gs.player_z, hdg);
-                            gs.player_heading = hdg;
                         }
                         *self.goto_target.lock().unwrap() = None; // cancel any stale walk
                         return;
@@ -1097,6 +1119,12 @@ impl Navigator {
             self.path.clear();
             self.path_goal = None;
             *self.goto_target.lock().unwrap() = None;
+            *self.nav_intent.lock().unwrap() = None;
+            // Hand the teleport to the render controller (single authority) and keep the streamer's
+            // tracking in sync so it isn't re-flagged as a server correction next tick.
+            *self.pos_correction.lock().unwrap() = Some([wx, wy, wz]);
+            self.last_streamed = [wx, wy, wz];
+            self.last_pos_send = Instant::now();
             self.send_position_update(stream, gs, wx, wy, wz, gs.player_heading);
             tracing::info!("NAV: teleport (warp) to ({:.1},{:.1},{:.1}) — navigation cancelled", wx, wy, wz);
             return;
@@ -1116,9 +1144,12 @@ impl Navigator {
             self.stuck_i = 0;
             self.stuck_best = f32::MAX;
             self.stuck_ticks = 0;
+            // Route with the native collision radius (1.0, was 2.0): the 2× radius boxed the player
+            // out of gaps the native client threads, causing "boxed in by walls" / platform stalls
+            // (issues #22/#13/#2). Collide-and-slide in the controller keeps it off walls.
             self.path = match self.collision.read().unwrap().as_ref() {
                 Some(c) => c
-                    .find_path([gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], 2.0)
+                    .find_path([gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], crate::movement::PLAYER_RADIUS)
                     .unwrap_or_default(),
                 None => Vec::new(),
             };
@@ -1177,9 +1208,9 @@ impl Navigator {
         if dist <= STOP_DIST {
             tracing::info!("NAV: arrived at ({:.1},{:.1})", target.0, target.1);
             *self.goto_target.lock().unwrap() = None;
-            // Send a final stationary position update facing the target.
-            let hdg = eq_heading(dx, dy);
-            self.send_position_update(stream, gs, gs.player_x, gs.player_y, gs.player_z, hdg);
+            *self.nav_intent.lock().unwrap() = None; // stop driving the controller
+            // Face the target on arrival.
+            gs.player_heading = eq_heading(dx, dy);
             return;
         }
 
@@ -1215,55 +1246,25 @@ impl Navigator {
                     gs.player_x, gs.player_y);
                 gs.log_msg("zone", "Path stalled — stopped");
                 *self.goto_target.lock().unwrap() = None;
+                *self.nav_intent.lock().unwrap() = None;
                 return;
             }
         }
 
-        // Cap step to the native run speed (and never overshoot past STOP_DIST from the target).
-        let step    = NAV_STEP.min(dist - STOP_DIST);
-        let full_dx = dx / dist * step; // east component toward goal
-        let full_dy = dy / dist * step; // north component toward goal
-        // Use the z from goto_target rather than the stale spawn z stored in gs.player_z.
-        // WASD sets goto_target.2 to the visual floor height (grounded z from the app's
-        // ground snap), so this keeps the server and client z in sync and prevents the
-        // server from rubber-banding the player back when it sees them at the wrong height.
-        // While approaching a controlled-fall waypoint, stay at the current height (walk to the
-        // edge) instead of snapping down to the landing z; the fall is handled above on arrival.
-        let nz = if drop_to_target > FALL_TRIGGER { gs.player_z } else { target.2 };
-
-        // Collision: slide along walls instead of walking through them. Try the full
-        // step, then each axis alone; only stop (clear the goal) if fully boxed in.
-        // Use nz (correct floor z) not gs.player_z (stale spawn z) for chest height.
-        let chosen = match self.collision.read().unwrap().clone() {
-            None    => Some((full_dx, full_dy)),
-            Some(c) => slide_move(&c, gs.player_x, gs.player_y, nz, full_dx, full_dy, 2.0),
-        };
-        let (mdx, mdy) = match chosen {
-            Some(v) => v,
-            None => {
-                tracing::info!("NAV: boxed in by walls near ({:.1},{:.1}) — stopping",
-                          gs.player_x, gs.player_y);
-                gs.log_msg("zone", "Path blocked by a wall");
-                *self.goto_target.lock().unwrap() = None;
-                return;
-            }
-        };
-
-        let nx      = gs.player_x + mdx;
-        let ny      = gs.player_y + mdy;
-        let heading = eq_heading(mdx, mdy);
-
-        self.send_position_update(stream, gs, nx, ny, nz, heading);
-
-        gs.player_x       = nx;
-        gs.player_y       = ny;
-        gs.player_z       = nz;
+        // Planner (design §3.5): the walker no longer slides or writes positions. It emits a
+        // MoveIntent toward the current waypoint; the render-thread CharacterController owns
+        // collide-and-slide, step-up, gravity and the authoritative position. The streamer
+        // (stream_position) sends that position to the server. Heading is set from the aim so the
+        // render facing and the streamed heading agree.
+        let heading = eq_heading(dx, dy);
         gs.player_heading = heading;
-
-        // Synthetic server-side position packet so the render camera follows — carries the
-        // step heading so the render loop faces the player along the path (Block B in app.rs
-        // reads gs.player_heading, which this packet keeps live).
-        let _ = app_tx.send(make_position_packet(gs.player_id, nx, ny, nz, heading));
+        *self.nav_intent.lock().unwrap() = Some(MoveIntent {
+            wish_dir:    [dx / dist, dy / dist],
+            wish_vspeed: 0.0,
+            jump:        false,
+            want_swim:   false,
+            speed:       RUN_SPEED,
+        });
     }
 
     /// Advance the quest turn-in (POST /give) trade-window flow. The full sequence is:
@@ -1334,6 +1335,52 @@ impl Navigator {
                 gs.trade_ack_ready = false;
             }
         }
+    }
+
+    /// Stream the render controller's authoritative position to the server at native cadence
+    /// (design §2/§3.4). Runs every tick (not gated by the 150 ms planner). Mirrors the controller's
+    /// position into the network `gs` so combat/targeting see the live position, detects genuine
+    /// server corrections (>12u jumps the server pushed) and forwards them to the controller, and
+    /// sends OP_ClientUpdate at ≤280 ms while moving with a forced 1300 ms keepalive when idle.
+    fn stream_position(&mut self, stream: &mut EqStream, gs: &mut GameState) {
+        let view = *self.controller_view.lock().unwrap();
+        // Don't stream/mirror until the render controller has spawned (else we'd push origin).
+        if !view.initialized { return; }
+        // A controlled fall owns the Z descent + fall-damage; let it stream, don't fight it here.
+        if self.falling.is_some() { return; }
+        let gp = [gs.player_x, gs.player_y, gs.player_z];
+        if !self.streamed_init {
+            self.last_streamed = gp;
+            self.last_pos_send = Instant::now();
+            self.streamed_init = true;
+            return;
+        }
+        // Genuine server correction: the network gs player jumped (an incoming server packet moved
+        // us) far from what we last mirrored. Hand it to the controller; adopt and re-stream it.
+        let cd = [gp[0] - self.last_streamed[0], gp[1] - self.last_streamed[1]];
+        if cd[0] * cd[0] + cd[1] * cd[1] > CORRECTION_SQ {
+            tracing::info!("NAV: server correction → handing controller new pos ({:.1},{:.1},{:.1})", gp[0], gp[1], gp[2]);
+            *self.pos_correction.lock().unwrap() = Some(gp);
+            self.send_position_update(stream, gs, gp[0], gp[1], gp[2], gs.player_heading);
+            self.last_streamed = gp;
+            self.last_pos_send = Instant::now();
+            return;
+        }
+        // Normal: stream the controller's position at cadence, then mirror into gs for game logic.
+        let pos = view.pos;
+        let since = self.last_pos_send.elapsed().as_millis();
+        let d = [pos[0] - self.last_streamed[0], pos[1] - self.last_streamed[1], pos[2] - self.last_streamed[2]];
+        let moved = d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > 0.01;
+        if (moved && since >= POS_SEND_MOVING_MS) || since >= POS_SEND_KEEPALIVE_MS {
+            // send_position_update derives deltas from the still-old gs.player_*, so call it first.
+            self.send_position_update(stream, gs, pos[0], pos[1], pos[2], view.heading);
+            self.last_pos_send = Instant::now();
+        }
+        gs.player_x = pos[0];
+        gs.player_y = pos[1];
+        gs.player_z = pos[2];
+        gs.player_heading = view.heading;
+        self.last_streamed = pos;
     }
 
     fn send_position_update(
