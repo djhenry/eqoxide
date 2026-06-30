@@ -798,6 +798,17 @@ impl App {
                 mem_spells: gs.mem_spells,
                 target_id:  gs.target_id,
                 coin:       gs.coin,
+                hp_pct:        gs.hp_pct,
+                cur_hp:        gs.cur_hp,
+                max_hp:        gs.max_hp,
+                mana_pct:      gs.mana_pct,
+                xp_pct:        gs.xp_pct,
+                // Prefer the live entity (its hp_pct tracks combat via OP_HP_UPDATE); fall back to
+                // the target snapshot stored at target time if the entity is gone.
+                target_name:   gs.target_id.and_then(|id| gs.entities.get(&id)).map(|e| e.name.clone())
+                                   .or_else(|| gs.target_name.clone()),
+                target_hp_pct: gs.target_id.and_then(|id| gs.entities.get(&id)).map(|e| e.hp_pct)
+                                   .or(gs.target_hp_pct),
             };
         }
 

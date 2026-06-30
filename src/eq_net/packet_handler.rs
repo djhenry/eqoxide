@@ -16,6 +16,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_DELETE_SPAWN         => apply_delete_spawn(gs, p),
         OP_CLIENT_UPDATE        => apply_position_update(gs, p),
         OP_HP_UPDATE            => apply_hp_update(gs, p),
+        OP_TARGET_MOUSE         => apply_set_target(gs, p), // synthetic (nav → render gs); see fn doc
         OP_NEW_ZONE             => apply_new_zone(gs, p),
         OP_ZONE_SPAWNS          => apply_zone_spawns(gs, p),
         OP_ZONE_ENTRY           => apply_zone_entry(gs, p),
@@ -401,6 +402,23 @@ fn apply_hp_update(gs: &mut GameState, payload: &[u8]) {
     if payload.len() >= SIZE_HP_UPDATE {
         let hp = unsafe { safe_read::<HPUpdate_S>(payload) };
         gs.update_hp(hp.spawn_id as u32, hp.cur_hp as i32, hp.max_hp);
+    }
+}
+
+/// Synthetic packet (OP_TARGET_MOUSE on the app_tx channel, NOT from the server): the nav thread
+/// emits this when a /v1/combat/target request sets the target, so the render GameState — which
+/// backs the HUD and HTTP API — learns the target_id (a client-initiated change that otherwise
+/// only reaches the network GameState). Payload is the 4-byte LE spawn_id (build_target_packet).
+/// target_name/_hp_pct are seeded from the entity here and kept live in app.rs from the entity list.
+/// See the two-GameState split note. (eqoxide#9)
+fn apply_set_target(gs: &mut GameState, payload: &[u8]) {
+    if payload.len() < 4 { return; }
+    let id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    gs.target_id = Some(id);
+    gs.target_con = None;
+    match gs.entities.get(&id) {
+        Some(e) => { gs.target_name = Some(e.name.clone()); gs.target_hp_pct = Some(e.hp_pct); }
+        None    => { gs.target_name = None; gs.target_hp_pct = None; }
     }
 }
 
@@ -1167,8 +1185,39 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
 mod tests {
     use super::{apply_emote, class_name, con_color, consider_message, parse_player_profile,
                 parse_begin_cast, parse_memorize_spell, apply_char_inventory,
-                apply_money_update, apply_money_on_corpse};
-    use crate::game_state::GameState;
+                apply_money_update, apply_money_on_corpse, apply_set_target};
+    use crate::game_state::{GameState, Entity};
+
+    fn test_entity(id: u32, name: &str, hp_pct: f32) -> Entity {
+        Entity {
+            spawn_id: id, name: name.to_string(), level: 1, is_npc: true,
+            x: 0.0, y: 0.0, z: 0.0, hp_pct, cur_hp: 100, max_hp: 100,
+            race: String::new(), heading: 0.0, dead: false,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
+            face: 0, hairstyle: 0, animation: 0,
+        }
+    }
+
+    #[test]
+    fn apply_set_target_sets_render_target_from_entity() {
+        // Synthetic OP_TARGET_MOUSE (nav -> render gs) carries the 4-byte LE spawn_id; the render
+        // gs should adopt the target and seed name/hp from the entity list. (eqoxide#9)
+        let mut gs = GameState::new();
+        gs.upsert_entity(test_entity(332, "Merchant Kwein", 80.0));
+        apply_set_target(&mut gs, &332u32.to_le_bytes());
+        assert_eq!(gs.target_id, Some(332));
+        assert_eq!(gs.target_name.as_deref(), Some("Merchant Kwein"));
+        assert_eq!(gs.target_hp_pct, Some(80.0));
+    }
+
+    #[test]
+    fn apply_set_target_unknown_entity_sets_id_only() {
+        let mut gs = GameState::new();
+        apply_set_target(&mut gs, &7u32.to_le_bytes());
+        assert_eq!(gs.target_id, Some(7));
+        assert_eq!(gs.target_name, None);
+        assert_eq!(gs.target_hp_pct, None);
+    }
 
     #[test]
     fn money_update_sets_coin_total() {

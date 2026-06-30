@@ -707,6 +707,9 @@ impl Navigator {
             }
             stream.send_app_packet(OP_TARGET_MOUSE, &build_target_packet(id));
             stream.send_app_packet(OP_CONSIDER, &build_consider_packet(gs.player_id, id));
+            // Mirror the target into the RENDER GameState (HUD/HTTP) via a synthetic app packet —
+            // this is a client-initiated change, so it won't otherwise reach the render side. (#9)
+            let _ = app_tx.send(AppPacket { opcode: OP_TARGET_MOUSE, payload: build_target_packet(id) });
             tracing::info!("EQ: target spawn_id={} + consider", id);
         }
 
