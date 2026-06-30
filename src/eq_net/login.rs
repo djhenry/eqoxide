@@ -100,6 +100,9 @@ pub async fn run_login_flow(
     shutdown:         Arc<AtomicBool>,
     camp:             CampReq,
     camp_until:       CampUntil,
+    controller_view:  crate::http::ControllerShared,
+    nav_intent:       crate::http::NavIntent,
+    pos_correction:   crate::http::PosCorrection,
 ) -> Result<(), String> {
     for attempt in 1..=max_retries {
         if attempt > 1 {
@@ -128,7 +131,7 @@ pub async fn run_login_flow(
                     tracing::info!("NAV: {} zone points seeded", gs.zone_points.len());
                 }
                 let char_name = config.character_name.clone();
-                let navigator = Navigator::new(goto_target, entity_positions, entity_ids, zone_points, task_log, zone_cross, warp, hail, say, target, attack, buy, sell, trade, merchant, move_req, give, inventory, loot, door_click, doors_shared, messages, chat_events, chat_send, cast, mem_spell, sit, consider, collision, maps_dir, camp.clone());
+                let navigator = Navigator::new(goto_target, entity_positions, entity_ids, zone_points, task_log, zone_cross, warp, hail, say, target, attack, buy, sell, trade, merchant, move_req, give, inventory, loot, door_click, doors_shared, messages, chat_events, chat_send, cast, mem_spell, sit, consider, collision, maps_dir, camp.clone(), controller_view, nav_intent, pos_correction);
                 run_gameplay_phase(stream, net_rx, app_tx, gs, char_name, navigator, world_creds, shutdown.clone(), camp.clone(), camp_until.clone()).await;
                 return Ok(());
             }
