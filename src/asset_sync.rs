@@ -57,6 +57,35 @@ impl CacheDirs {
         }
         Ok(hash)
     }
+
+    // ── per-set synced digest (the staleness cursor) ──────────────────────────
+    // Stored in the same cache root as the reassembled files, so clearing the cache clears both —
+    // a recorded digest therefore always corresponds to files that are actually present.
+    fn synced_path(&self) -> PathBuf {
+        self.root.join("synced.json")
+    }
+
+    fn load_synced(&self) -> std::collections::HashMap<String, String> {
+        std::fs::read(self.synced_path())
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    /// The digest last successfully synced for `set`, if any (missing/malformed file → `None`).
+    pub fn synced_digest(&self, set: &str) -> Option<String> {
+        self.load_synced().get(set).cloned()
+    }
+
+    /// Record `digest` as the last-synced identity for `set` (call only after a successful sync).
+    pub fn set_synced_digest(&self, set: &str, digest: &str) {
+        let mut map = self.load_synced();
+        map.insert(set.to_string(), digest.to_string());
+        if let Ok(bytes) = serde_json::to_vec_pretty(&map) {
+            let _ = std::fs::create_dir_all(&self.root);
+            let _ = std::fs::write(self.synced_path(), bytes);
+        }
+    }
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -70,8 +99,25 @@ pub struct FileEntry {
 #[derive(Deserialize, Clone, Debug)]
 pub struct Manifest {
     pub set: String,
-    pub version: u64,
+    /// Content identity of the set (see `set_digest`). The client records the last-synced digest
+    /// per set and skips a set whose digest is unchanged — correct across servers with diverging assets.
+    pub digest: String,
     pub files: Vec<FileEntry>,
+}
+
+/// The set's content identity: blake3 over the files sorted by path, each contributing
+/// `"{path}\0{blake3}\n"`. MUST stay byte-identical to the server's `ManifestStore::set_digest`.
+pub fn set_digest(files: &[FileEntry]) -> String {
+    let mut sorted: Vec<&FileEntry> = files.iter().collect();
+    sorted.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut h = blake3::Hasher::new();
+    for f in sorted {
+        h.update(f.path.as_bytes());
+        h.update(b"\0");
+        h.update(f.blake3.as_bytes());
+        h.update(b"\n");
+    }
+    h.finalize().to_hex().to_string()
 }
 
 pub fn missing_chunks(manifest: &Manifest, cache: &CacheDirs) -> Vec<String> {
@@ -106,8 +152,15 @@ pub fn reassemble(cache: &CacheDirs, entry: &FileEntry) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Result of a conditional manifest fetch. `Unchanged` (HTTP 304) means the client's stored digest
+/// still matches the server, so the whole set can be skipped.
+pub enum ManifestFetch {
+    Unchanged,
+    Changed(Manifest),
+}
+
 pub trait Transport {
-    fn get_manifest(&self, set: &str) -> anyhow::Result<Manifest>;
+    fn get_manifest(&self, set: &str, if_none_match: Option<&str>) -> anyhow::Result<ManifestFetch>;
     fn get_chunk(&self, hash: &str) -> anyhow::Result<Vec<u8>>;
 }
 
@@ -137,15 +190,25 @@ impl AssetSync {
 }
 
 impl Transport for AssetSync {
-    fn get_manifest(&self, set: &str) -> anyhow::Result<Manifest> {
-        let m: Manifest = self
+    fn get_manifest(&self, set: &str, if_none_match: Option<&str>) -> anyhow::Result<ManifestFetch> {
+        let mut req = self
             .agent
             .get(&format!("{}/manifest/{set}", self.base))
-            .set("Authorization", &format!("Bearer {}", self.token))
-            .call()
-            .map_err(|e| anyhow::anyhow!("manifest {set} failed: {e}"))?
-            .into_json()?;
-        Ok(m)
+            .set("Authorization", &format!("Bearer {}", self.token));
+        if let Some(d) = if_none_match {
+            req = req.set("If-None-Match", &format!("\"{d}\""));
+        }
+        // ureq returns 2xx/3xx as Ok and 4xx/5xx as Err(Status). 304 can surface either way
+        // depending on version — handle both.
+        let resp = match req.call() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(304, _)) => return Ok(ManifestFetch::Unchanged),
+            Err(e) => return Err(anyhow::anyhow!("manifest {set} failed: {e}")),
+        };
+        if resp.status() == 304 {
+            return Ok(ManifestFetch::Unchanged);
+        }
+        Ok(ManifestFetch::Changed(resp.into_json()?))
     }
 
     fn get_chunk(&self, hash: &str) -> anyhow::Result<Vec<u8>> {
@@ -179,7 +242,16 @@ pub fn sync_set(
     cache: &CacheDirs,
     progress: &mut dyn FnMut(SyncProgress),
 ) -> anyhow::Result<()> {
-    let manifest = t.get_manifest(set)?;
+    let prev = cache.synced_digest(set);
+    let manifest = match t.get_manifest(set, prev.as_deref())? {
+        ManifestFetch::Unchanged => return Ok(()), // identical to what we already have — skip
+        ManifestFetch::Changed(m) => m,
+    };
+    // Defense against a lying/corrupt server: the manifest must hash to its claimed digest.
+    let recomputed = set_digest(&manifest.files);
+    if recomputed != manifest.digest {
+        anyhow::bail!("manifest digest mismatch for {set}: claimed {} got {recomputed}", manifest.digest);
+    }
     progress(SyncProgress { phase: Phase::Verifying, done: 0, total: 0, bytes: 0 });
 
     let missing = missing_chunks(&manifest, cache);
@@ -200,6 +272,8 @@ pub fn sync_set(
     for entry in &manifest.files {
         reassemble(cache, entry)?;
     }
+    // Record the synced identity so a future unchanged fetch (304) can skip the whole set.
+    cache.set_synced_digest(set, &manifest.digest);
     Ok(())
 }
 
@@ -239,16 +313,13 @@ mod manifest_tests {
         let hb = cache.cas_put(&part_b).unwrap();
         let mut whole = part_a.clone();
         whole.extend_from_slice(&part_b);
-        let m = Manifest {
-            set: "common".into(),
-            version: 1,
-            files: vec![FileEntry {
-                path: "humanoid.glb".into(),
-                size: whole.len() as u64,
-                blake3: blake3_hex(&whole),
-                chunks: vec![ha, hb],
-            }],
-        };
+        let files = vec![FileEntry {
+            path: "humanoid.glb".into(),
+            size: whole.len() as u64,
+            blake3: blake3_hex(&whole),
+            chunks: vec![ha, hb],
+        }];
+        let m = Manifest { set: "common".into(), digest: set_digest(&files), files };
         (m, whole)
     }
 
@@ -297,8 +368,12 @@ mod sync_tests {
         chunk_calls: std::cell::RefCell<usize>,
     }
     impl Transport for FakeTransport {
-        fn get_manifest(&self, _set: &str) -> anyhow::Result<Manifest> {
-            Ok(self.manifest.clone())
+        // Mirrors the real server: 304 (Unchanged) when the client's If-None-Match equals the digest.
+        fn get_manifest(&self, _set: &str, inm: Option<&str>) -> anyhow::Result<ManifestFetch> {
+            if inm == Some(self.manifest.digest.as_str()) {
+                return Ok(ManifestFetch::Unchanged);
+            }
+            Ok(ManifestFetch::Changed(self.manifest.clone()))
         }
         fn get_chunk(&self, hash: &str) -> anyhow::Result<Vec<u8>> {
             *self.chunk_calls.borrow_mut() += 1;
@@ -316,17 +391,59 @@ mod sync_tests {
         let mut chunks = HashMap::new();
         chunks.insert(ha.clone(), a);
         chunks.insert(hb.clone(), b);
+        let files = vec![FileEntry {
+            path: "humanoid.glb".into(), size: whole.len() as u64,
+            blake3: blake3_hex(&whole), chunks: vec![ha, hb],
+        }];
         FakeTransport {
-            manifest: Manifest {
-                set: "common".into(), version: 1,
-                files: vec![FileEntry {
-                    path: "humanoid.glb".into(), size: whole.len() as u64,
-                    blake3: blake3_hex(&whole), chunks: vec![ha, hb],
-                }],
-            },
+            manifest: Manifest { set: "common".into(), digest: set_digest(&files), files },
             chunks,
             chunk_calls: std::cell::RefCell::new(0),
         }
+    }
+
+    #[test]
+    fn set_digest_is_order_independent() {
+        let f = |p: &str, b: &str| FileEntry { path: p.into(), size: 1, blake3: b.into(), chunks: vec![] };
+        let a = vec![f("b", "22"), f("a", "11")];
+        let mut rev = a.clone(); rev.reverse();
+        assert_eq!(set_digest(&a), set_digest(&rev));
+        assert_eq!(set_digest(&a).len(), 64);
+    }
+
+    #[test]
+    fn synced_digest_round_trips_and_tolerates_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = CacheDirs::with_root(dir.path());
+        assert_eq!(c.synced_digest("zone/qeynos"), None);
+        c.set_synced_digest("zone/qeynos", "abc123");
+        c.set_synced_digest("gamedata", "def456");
+        assert_eq!(c.synced_digest("zone/qeynos").as_deref(), Some("abc123"));
+        assert_eq!(c.synced_digest("gamedata").as_deref(), Some("def456"));
+    }
+
+    #[test]
+    fn unchanged_after_first_sync_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = CacheDirs::with_root(dir.path());
+        let t = fixture();
+        sync_set(&t, "common", &cache, &mut |_| {}).unwrap();
+        assert_eq!(cache.synced_digest("common").as_deref(), Some(t.manifest.digest.as_str()));
+        // Delete the reassembled file; an Unchanged (304) sync must NOT touch it (true skip).
+        std::fs::remove_file(cache.models_dir().join("humanoid.glb")).unwrap();
+        let before = *t.chunk_calls.borrow();
+        sync_set(&t, "common", &cache, &mut |_| {}).unwrap();
+        assert_eq!(*t.chunk_calls.borrow(), before, "Unchanged must not fetch chunks");
+        assert!(!cache.models_dir().join("humanoid.glb").exists(), "Unchanged must skip reassembly");
+    }
+
+    #[test]
+    fn rejects_manifest_with_wrong_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = CacheDirs::with_root(dir.path());
+        let mut t = fixture();
+        t.manifest.digest = "0".repeat(64); // no longer matches its files
+        assert!(sync_set(&t, "common", &cache, &mut |_| {}).is_err());
     }
 
     #[test]
