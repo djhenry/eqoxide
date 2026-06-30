@@ -120,8 +120,6 @@ pub struct EqRenderer {
     pub entity_uniform_pool: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
     /// Pre-allocated joint matrix buffers (reused every frame via write_buffer).
     pub joint_buf_pool:      Vec<(wgpu::Buffer, wgpu::BindGroup)>,
-    /// Lowercase armor texture filename → S3D archive containing it (built at startup).
-    pub equip_index: std::collections::HashMap<String, std::path::PathBuf>,
     /// Cache of uploaded armor texture bind groups keyed by base name (no extension).
     /// `None` = known-missing (negative cache) so we don't rescan every frame.
     pub equipment_tex_cache: std::collections::HashMap<String, Option<wgpu::BindGroup>>,
@@ -252,7 +250,6 @@ impl EqRenderer {
             zone_assets: None,
             entity_uniform_pool,
             joint_buf_pool,
-            equip_index: std::collections::HashMap::new(),
             equipment_tex_cache: std::collections::HashMap::new(),
             assets_path: std::path::PathBuf::new(),
             weapon_cache: std::collections::HashMap::new(),
@@ -510,30 +507,6 @@ impl EqRenderer {
             }
         }
 
-        // Index armor textures: shared velious sets (global17-23_amr) + each
-        // archetype's chr/chr2 archives (lower material numbers). No decoding here.
-        for n in 17..=23 {
-            crate::assets::index_s3d_textures(
-                &models_dir.join(format!("global{}_amr.s3d", n)), &mut self.equip_index);
-        }
-        // global_chr.s3d is the combined all-races base archive — it carries the low-material
-        // (00-04) body textures that the per-race *_chr archives can be missing (e.g. human is
-        // missing chest material 03). Index it for TEXTURES only (we never load it as a model).
-        crate::assets::index_s3d_textures(
-            &models_dir.join("global_chr.s3d"), &mut self.equip_index);
-        for &key in ARCHETYPES {
-            if let Some(name) = crate::models::archetype_to_chr_s3d(key) {
-                crate::assets::index_s3d_textures(&models_dir.join(name), &mut self.equip_index);
-                // also the _chr2 companion if present
-                let chr2 = name.replace("_chr.s3d", "_chr2.s3d");
-                let chr2_path = models_dir.join(&chr2);
-                if chr2_path.exists() {
-                    crate::assets::index_s3d_textures(&chr2_path, &mut self.equip_index);
-                }
-            }
-        }
-        tracing::info!("equip: indexed {} armor textures", self.equip_index.len());
-
         let weapons_glb = models_dir.join("weapons.glb");
         if weapons_glb.exists() {
             match crate::assets::ZoneAssets::object_models_from_glb(&weapons_glb) {
@@ -674,19 +647,21 @@ impl EqRenderer {
             .or_else(|| self.gpu_character_models.get(&(key, 0)))
     }
 
-    /// Load + upload one armor texture (trying .bmp then .dds). Returns its bind group.
+    /// Load + upload one armor texture from the equiptex PNG cache. Returns its bind group.
     pub fn load_equip_texture(&self, base_name: &str) -> Option<wgpu::BindGroup> {
-        for ext in ["bmp", "dds"] {
-            let fname = format!("{}.{}", base_name, ext);
-            if let Some(arch) = self.equip_index.get(&fname) {
-                if let Some(tex) = crate::assets::load_one_texture_from_s3d(arch, &fname) {
-                    let (_gpu, mut bgs) = upload_textures(
-                        &self.device, &self.queue, &[tex], &self.layouts.texture_bgl);
-                    return bgs.pop();
-                }
-            }
-        }
-        None
+        let path = self.assets_path.join(format!("equiptex/{}.png", base_name.to_lowercase()));
+        let bytes = std::fs::read(&path).ok()?;
+        let img = image::load_from_memory(&bytes).ok()?;
+        let rgba = img.to_rgba8();
+        let (width, height) = rgba.dimensions();
+        let tex = crate::assets::TextureData {
+            name: base_name.to_lowercase(),
+            width,
+            height,
+            rgba: rgba.into_raw(),
+        };
+        let (_gpu, mut bgs) = upload_textures(&self.device, &self.queue, &[tex], &self.layouts.texture_bgl);
+        bgs.pop()
     }
 
     /// GPU-upload a held weapon model by IDFile (e.g. "IT10649") from the pre-loaded

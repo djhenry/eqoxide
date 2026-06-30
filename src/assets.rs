@@ -1052,63 +1052,6 @@ impl ZoneAssets {
 
 }
 
-/// Index every BMP/DDS texture filename in an S3D archive to its path (lowercase keys).
-/// No decoding — cheap startup scan. Errors are logged and ignored.
-pub fn index_s3d_textures(
-    s3d_path: &Path,
-    out: &mut std::collections::HashMap<String, std::path::PathBuf>,
-) {
-    let file = match std::fs::File::open(s3d_path) {
-        Ok(f) => f,
-        Err(e) => { tracing::warn!("equip: open {} failed: {}", s3d_path.display(), e); return; }
-    };
-    let mut pfs = match libeq_pfs::PfsReader::open(file) {
-        Ok(p) => p,
-        Err(e) => { tracing::warn!("equip: pfs {} failed: {}", s3d_path.display(), e); return; }
-    };
-    let names = match pfs.filenames() {
-        Ok(n) => n,
-        Err(e) => { tracing::warn!("equip: filenames {} failed: {}", s3d_path.display(), e); return; }
-    };
-    for name in names {
-        let lower = name.to_lowercase();
-        if lower.ends_with(".bmp") || lower.ends_with(".dds") {
-            out.entry(lower).or_insert_with(|| s3d_path.to_path_buf());
-        }
-    }
-}
-
-/// Read and decode a single named texture from an S3D archive.
-pub fn load_one_texture_from_s3d(s3d_path: &Path, filename: &str) -> Option<TextureData> {
-    let file = std::fs::File::open(s3d_path).ok()?;
-    let mut pfs = libeq_pfs::PfsReader::open(file).ok()?;
-    let lower = filename.to_lowercase();
-    let fmt = if lower.ends_with(".bmp") {
-        image::ImageFormat::Bmp
-    } else if lower.ends_with(".dds") {
-        image::ImageFormat::Dds
-    } else {
-        return None;
-    };
-    // PFS lookups are case-sensitive; find the real archive name case-insensitively.
-    let names = pfs.filenames().ok()?;
-    let real = names.into_iter().find(|n| n.to_lowercase() == lower)?;
-    let bytes = pfs.get(&real).ok()??;
-    let img = image::load_from_memory_with_format(&bytes, fmt).ok()?;
-    let rgba = img.to_rgba8();
-    let (width, height) = rgba.dimensions();
-    // Reject transparent "stub" textures: some chr archives (e.g. globalelf_chr.s3d) store an 8x8
-    // all-alpha-0 lowest-MIP placeholder DDS for body pieces that have no real cloth texture (e.g.
-    // elfua0002.dds, elfch0003.dds). Loading one makes that mesh render 100% transparent (invisible
-    // arms/back). Returning None lets the caller fall back to the opaque baked skin base — which is
-    // what the original client shows for those pieces at material 0. (eq-client-expert finding.)
-    if (width <= 8 && height <= 8) || rgba.pixels().all(|p| p.0[3] == 0) {
-        return None;
-    }
-    Some(TextureData { name: lower, width, height, rgba: rgba.into_raw() })
-}
-
-
 #[cfg(test)]
 mod b2_glb_tests {
     use super::*;
@@ -1284,20 +1227,6 @@ mod tests {
         let last = *path.last().unwrap();
         assert!((last[0] - 15.0).abs() < 1.5 && (last[1] - 5.0).abs() < 1.5, "ends at goal: {last:?}");
         assert!(path.iter().any(|p| p[1] > 12.0), "path must detour north through the gap: {path:?}");
-    }
-
-    #[test]
-    #[ignore = "requires extracted assets (set EQ_ASSETS_DIR): global17_amr.s3d"]
-    fn index_and_load_one_armor_texture() {
-        use std::collections::HashMap;
-        let Some(p) = assets_dir().map(|d| d.join("global17_amr.s3d")) else { return; };
-        let mut idx: HashMap<String, std::path::PathBuf> = HashMap::new();
-        index_s3d_textures(&p, &mut idx);
-        assert!(idx.contains_key("homch1701.bmp"), "expected human male chest armor 17");
-        let tex = load_one_texture_from_s3d(idx.get("homch1701.bmp").unwrap(), "homch1701.bmp");
-        let tex = tex.expect("decode failed");
-        assert!(tex.width > 0 && tex.height > 0);
-        assert_eq!(tex.rgba.len(), (tex.width * tex.height * 4) as usize);
     }
 
     #[test]
