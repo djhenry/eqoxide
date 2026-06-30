@@ -796,6 +796,8 @@ impl App {
                 cur_hp:        gs.cur_hp,
                 max_hp:        gs.max_hp,
                 mana_pct:      gs.mana_pct,
+                cur_mana:      gs.cur_mana,
+                max_mana:      gs.max_mana,
                 xp_pct:        gs.xp_pct,
                 // Prefer the live entity (its hp_pct tracks combat via OP_HP_UPDATE); fall back to
                 // the target snapshot stored at target time if the entity is gone.
