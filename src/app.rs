@@ -511,12 +511,10 @@ impl App {
         let result = self.pending_load.lock().unwrap().take();
         let Some(load) = result else { return };
 
-        // Paths for this zone's door/object models — from the asset-server cache ("zonedoors/<zone>"
-        // set), not ~/eq_assets. The main .s3d usually isn't cached (only _obj is served); that's
-        // fine — load_object_models skips a missing file and door objects live in _obj.s3d.
+        // Path for this zone's door/object models — from the asset-server cache ("zonedoors/<zone>"
+        // set), as a pre-baked GLB. Best-effort: if absent, load_door_models falls back to boxes.
         let cache_models = crate::asset_sync::CacheDirs::resolve().models_dir();
-        let door_s3d = cache_models.join(format!("{}.s3d", load.zone_name));
-        let door_obj = cache_models.join(format!("{}_obj.s3d", load.zone_name));
+        let door_glb = cache_models.join(format!("{}_doors.glb", load.zone_name));
 
         if let Some((_, renderer)) = &mut self.gpu {
             match load.assets {
@@ -524,7 +522,7 @@ impl App {
                     renderer.upload_zone_assets(za);
                     tracing::info!("renderer: uploaded {} meshes for '{}'", renderer.gpu_meshes.len(), load.zone_name);
                     // Load this zone's door/object models for clickable-door rendering.
-                    renderer.load_door_models(&door_s3d, &door_obj);
+                    renderer.load_door_models(&door_glb);
                 }
                 None => {
                     renderer.upload_zone_assets(&debug_zone::make_fallback_ground());
