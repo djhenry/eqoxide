@@ -48,6 +48,18 @@ pub struct MoveIntent {
     pub speed:       f32,
 }
 
+/// A read-only snapshot of the controller the render thread publishes each frame for the nav
+/// thread to stream to the server (design §2 "Threading"). `heading` is EQ-CCW degrees.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ControllerView {
+    pub pos:     [f32; 3],
+    pub heading: f32,
+    pub moving:  bool,
+    /// False until the render thread has spawned and seeded the controller. The nav streamer must
+    /// not mirror/stream a default (origin) position before this is set.
+    pub initialized: bool,
+}
+
 /// Sole owner of the local player's physical state. Position is `[east, north, z]` (server coords,
 /// `z` = feet).
 pub struct CharacterController {

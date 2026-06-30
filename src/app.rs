@@ -108,10 +108,18 @@ pub struct App {
     frame_profile:      crate::profiling::FrameProfile,
     // Keyboard movement
     keys_held:    std::collections::HashSet<KeyCode>,
-    /// Free-fly position override in scene space [east, north, z].
-    /// None = track server position; Some = keyboard-driven position.
-    override_pos: Option<[f32; 3]>,
-    /// Shared goto target — WASD writes here so the nav thread sends actual EQ packets.
+    /// Single-authority character controller (Component A): sole owner of the local player's
+    /// physical state. Its position drives both the render and (via `controller_view`) the server
+    /// stream. Replaces the old `override_pos` dual-authority that caused WASD rubber-banding.
+    controller:       crate::movement::CharacterController,
+    /// Snapshot published each frame for the nav thread to stream.
+    controller_view:  crate::http::ControllerShared,
+    /// The nav planner's /goto movement intent, consumed when no WASD key is held.
+    nav_intent:       crate::http::NavIntent,
+    /// A large server correction handed over by the nav streamer; applied to the controller.
+    pos_correction:   crate::http::PosCorrection,
+    /// Shared goto target — set by HTTP /navigate; cleared by the render thread on manual WASD
+    /// (so manual movement cancels navigation). WASD no longer writes a target here.
     goto_target:  crate::http::GotoTarget,
     /// Shared request slots written by HUD buttons; the nav thread drains and sends them.
     hail:         crate::http::HailReq,
@@ -165,9 +173,6 @@ pub struct App {
     collision:    Option<Arc<assets::Collision>>,
     /// Shared slot the nav thread reads to gate /goto movement against walls.
     shared_collision: assets::SharedCollision,
-    /// Cache of the last terrain sample: (east, north, height). Avoids re-querying
-    /// the grid each frame when the player hasn't moved horizontally.
-    ground_cache: (f32, f32, f32),
     /// Most recent floor_z result. Used as the anchor for the next frame's floor_z query
     /// so the player's visual height is self-consistent and can't be pulled up to a bridge
     /// or ceiling just because the server placed them there.
@@ -249,6 +254,9 @@ impl App {
         asset_server_url: String,
         asset_user:       String,
         asset_pass:       String,
+        controller_view:  crate::http::ControllerShared,
+        nav_intent:       crate::http::NavIntent,
+        pos_correction:   crate::http::PosCorrection,
     ) -> Self {
         let ui_layout = crate::ui_layout::UiLayout::load(&character_name);
         let mut game_state = GameState::new();
@@ -281,7 +289,10 @@ impl App {
             current_fps: 0.0,
             active_until: std::time::Instant::now(),
             frame_profile: crate::profiling::FrameProfile::default(),
-            keys_held: std::collections::HashSet::new(),             override_pos: None, goto_target,
+            keys_held: std::collections::HashSet::new(),
+            controller: crate::movement::CharacterController::new([0.0, 0.0, 0.0]),
+            controller_view, nav_intent, pos_correction,
+            goto_target,
             hail, say, target, attack, cast, sit, consider, buy, sell, trade, spells, door_click, say_buffer: String::new(),
             drag_active: false, last_cursor: winit::dpi::PhysicalPosition::new(0.0, 0.0),
             click_start: None,
@@ -296,7 +307,6 @@ impl App {
             pick_screen_h: 600,
             game_state, scene: SceneState::default(), app_rx, frame_req,
             player_info, warp, shutdown, camp, camp_until, collision: None, shared_collision,
-            ground_cache: (f32::NAN, f32::NAN, 0.0),
             last_grounded_z: 0.0,
             prev_render_pos: [0.0, 0.0, 0.0],
             entity_motion: std::collections::HashMap::new(),
@@ -320,22 +330,6 @@ impl App {
             models_loaded: false,
             asset_server_url, asset_user, asset_pass,
         }
-    }
-
-    /// Snap a render Z to the zone floor beneath `(east, north)`. Returns `fallback`
-    /// unchanged when no zone geometry is loaded or no floor vertex is nearby.
-    /// Result is cached and only recomputed after ~2 units of horizontal movement.
-    fn ground_z(&mut self, east: f32, north: f32, fallback: f32) -> f32 {
-        let Some(col) = self.collision.as_deref() else { return fallback; };
-        let (ce, cn, ch) = self.ground_cache;
-        // Invalidate on horizontal movement OR when the anchor z shifted more than 3 units
-        // from the cached height (player changed levels without moving much horizontally).
-        if (ce - east).abs() < 2.0 && (cn - north).abs() < 2.0 && (ch - fallback).abs() < 3.0 {
-            return ch;
-        }
-        let h = col.floor_z(east, north, fallback);
-        self.ground_cache = (east, north, h);
-        h
     }
 
     /// Cast a ray from the camera through screen pixel `cursor` and return the
@@ -429,7 +423,6 @@ impl App {
         let zone_name = self.scene.zone.clone();
         if self.gpu.is_none() { self.loading = false; return; }
 
-        self.ground_cache = (f32::NAN, f32::NAN, 0.0);
         self.vert_vel  = 0.0;
         self.on_ground = true;
 
@@ -704,7 +697,8 @@ impl App {
         if self.warp.lock().is_ok_and(|g| g.is_some()) { activity = true; }
 
         // Player input / motion in flight (keys held, free-fly override active, or falling).
-        if !self.keys_held.is_empty() || self.override_pos.is_some() || !self.on_ground {
+        let nav_driving = self.nav_intent.lock().map(|g| g.is_some()).unwrap_or(false);
+        if !self.keys_held.is_empty() || nav_driving || !self.on_ground {
             activity = true;
         }
 
@@ -764,7 +758,9 @@ impl App {
             self.game_state.player_y = wy;
             self.game_state.player_z = wz;
             self.visual_player_pos = [wx, wy, wz];
-            self.override_pos = None;
+            // Single authority: teleport the controller for instant local feedback (the nav thread
+            // is the slot's sole consumer and also hands us the same coords via pos_correction).
+            self.controller.teleport([wx, wy, wz]);
         }
 
         // Ease each door's render fraction toward its server-authoritative open/close target.
@@ -782,7 +778,7 @@ impl App {
         // Update shared player state for the /debug HTTP endpoint.
         {
             let gs = &self.game_state;
-            let pos = self.override_pos.unwrap_or([gs.player_x, gs.player_y, gs.player_z]);
+            let pos = if self.camera_initialized { self.controller.pos } else { [gs.player_x, gs.player_y, gs.player_z] };
             let h_cw = crate::eq_net::protocol::ccw_to_cw(gs.player_heading);
             *self.player_info.lock().unwrap() = crate::http::PlayerState {
                 zone:       gs.zone_name.clone(),
@@ -936,6 +932,15 @@ impl App {
             self.visual_heading    = self.scene.player_heading;
             self.camera = CameraState::new(self.scene.player_pos, self.scene.player_heading);
             self.camera_initialized = true;
+            // Seed the single-authority controller at the spawn position and mark it live so the nav
+            // streamer begins mirroring/streaming it.
+            self.controller.teleport(self.scene.player_pos);
+            if let Ok(mut v) = self.controller_view.lock() {
+                v.pos = self.scene.player_pos;
+                v.heading = self.scene.player_heading;
+                v.moving = false;
+                v.initialized = true;
+            }
         }
 
         // Trigger a zone (re)load whenever the zone we're standing in differs from the zone whose
@@ -1053,211 +1058,86 @@ impl App {
             let strafe_right = e_held || (self.drag_active && d_held);
             if strafe_left  { de += right_e; dn += right_n; }
             if strafe_right { de -= right_e; dn -= right_n; }
-            // Jump: only from solid ground.
-            if self.keys_held.contains(&KeyCode::Space) && self.on_ground {
-                const JUMP_VELOCITY: f32 = 13.0;
-                self.vert_vel  = JUMP_VELOCITY;
-                self.on_ground = false;
+            // Translate keys into a MoveIntent; the controller owns jump/gravity/collision/step-up.
+            let wasd_active = de != 0.0 || dn != 0.0 || dz != 0.0;
+            if wasd_active {
+                // Manual movement CANCELS any in-progress /goto (native behavior; fixes the
+                // "can't override a stalled nav" bug) before steering the controller this frame.
+                *self.goto_target.lock().unwrap() = None;
+                *self.nav_intent.lock().unwrap() = None;
+            }
+            let space = self.keys_held.contains(&KeyCode::Space);
+            let intent = if wasd_active || space {
+                crate::movement::MoveIntent {
+                    wish_dir:    [de, dn],
+                    wish_vspeed: if swimming { dz * MOVE_SPEED } else { 0.0 },
+                    jump:        space,
+                    want_swim:   swimming,
+                    speed:       MOVE_SPEED,
+                }
+            } else {
+                // No manual input → follow the nav planner's /goto intent (if any).
+                self.nav_intent.lock().unwrap().unwrap_or_default()
+            };
+
+            // Apply a large server correction handed over by the nav streamer (design §3.4).
+            if let Some(corr) = self.pos_correction.lock().unwrap().take() {
+                self.controller.teleport(corr);
             }
 
-            if de != 0.0 || dn != 0.0 || dz != 0.0 {
-                // Normalise over 3D so a diagonal swim isn't faster than a flat walk.
-                let len = (de * de + dn * dn + dz * dz).sqrt();
-                de = de / len * MOVE_SPEED * dt;
-                dn = dn / len * MOVE_SPEED * dt;
-                dz = dz / len * MOVE_SPEED * dt;
-                let base = self.override_pos.unwrap_or(self.visual_player_pos);
-
-                // Collision: don't let the player walk through walls. Cast at chest
-                // height so low lips/stairs don't block. If the full move hits a wall,
-                // try sliding along each axis so the player glides along the surface
-                // instead of sticking. `clear` borrows collision immutably; NLL ends
-                // that borrow before the self-field writes below.
-                const PLAYER_RADIUS: f32 = 2.0;
-                let chest = base[2] + 3.0;
-                let col = self.collision.as_ref();
-                let clear = |mde: f32, mdn: f32| -> bool {
-                    match col {
-                        Some(c) => c.path_clear(
-                            [base[0], base[1], chest],
-                            [base[0] + mde, base[1] + mdn, chest],
-                            PLAYER_RADIUS,
-                        ),
-                        None => true,
-                    }
-                };
-                let (mde, mdn) = if clear(de, dn) {
-                    (de, dn)
-                } else if clear(de, 0.0) {
-                    (de, 0.0)
-                } else if clear(0.0, dn) {
-                    (0.0, dn)
-                } else {
-                    tracing::info!("COLLISION: WASD fully blocked at ({:.1},{:.1}) heading {:.0}° tried ({:.2},{:.2})",
-                              base[0], base[1], self.heading_target, de, dn);
-                    self.game_state.log_msg("collision", &format!("Blocked by wall at ({:.0},{:.0})", base[0], base[1]));
-                    (0.0, 0.0) // boxed in — hold position
-                };
-
-                // Step-up: when on the ground, check if the floor at the new XY is
-                // higher than the current z (ramp or stair). Use a raised anchor so
-                // the ray starts above the step and can find the surface above us.
-                const STEP_HEIGHT: f32 = 3.0;
-                let new_e = base[0] + mde;
-                let new_n = base[1] + mdn;
-                // When floor_z finds no geometry it returns the fallback unchanged.
-                // Guard against that: if step_floor == step_fallback the ray missed and
-                // we must NOT step up, otherwise the player gets launched into the sky
-                // one STEP_HEIGHT per frame whenever they walk over a gap in the mesh.
-                let step_fallback = base[2] + STEP_HEIGHT;
-                let step_floor = if self.on_ground && (mde != 0.0 || mdn != 0.0) {
-                    self.ground_z(new_e, new_n, step_fallback)
-                } else {
-                    base[2]
-                };
-                let geometry_hit = (step_floor - step_fallback).abs() > 0.05;
-                let new_z = if swimming {
-                    // Swimming: move freely in Z by the camera pitch; bypass terrain step-up and
-                    // gravity (the gravity block below is gated on !swimming).
-                    self.on_ground = false;
-                    base[2] + dz
-                } else if self.on_ground
-                    && geometry_hit
-                    && step_floor > base[2] + 0.1
-                    && step_floor - base[2] <= STEP_HEIGHT
-                {
-                    step_floor
-                } else {
-                    base[2]
-                };
-
-                let new_pos = [new_e, new_n, new_z];
-                self.override_pos = Some(new_pos);
-                // Move camera focus with the player regardless of camera mode
-                // (ManualOrbit keeps focus fixed otherwise, so the player walks away).
-                self.camera.focus = new_pos;
-                // override/world pos = [east, north, z] = [server_x, server_y, server_z];
-                // goto_target is in server coords (server_x, server_y, server_z) — no swap.
-                *self.goto_target.lock().unwrap() = Some((new_pos[0], new_pos[1], new_pos[2]));
-            } else if self.override_pos.is_some() && self.on_ground {
-                // Keys released while on ground: drop the visual override so server position takes over.
-                self.override_pos = None;
-            }
-        }
-
-        // Lerp visual position toward the logical position so nav steps (150 ms / 15 units)
-        // glide rather than pop. Snap on teleports (>100 XY units gap).
-        // Z is intentionally excluded from the lerp: server z (gs.player_z) is the spawn z
-        // and is never updated during movement, so lerping toward it would pull the player
-        // up into balconies/ceilings. Ground snap below is the sole authority on visual height.
-        // When a keyboard override is active, use it directly instead of following the server.
-        if let Some(op) = self.override_pos {
-            self.visual_player_pos = op;
-            self.scene.player_pos  = op;
-        } else {
-            let target = self.scene.player_pos;
-            let dx = target[0] - self.visual_player_pos[0];
-            let dy = target[1] - self.visual_player_pos[1];
-            let xy_dist = (dx * dx + dy * dy).sqrt();
-            if xy_dist > 100.0 {
-                // Large XY teleport: snap position including z so ground snap initializes correctly.
-                self.visual_player_pos = target;
-            } else if xy_dist > 0.01 {
-                // Speed-based glide: move the visual position toward the logical position at the
-                // estimated nav pace, clamped so it never overshoots. This makes /goto travel
-                // continuous — at RUN_SPEED (~44 u/s) the visual exactly keeps up with the
-                // 6.6-unit nav steps every 150 ms, with no stutter between steps.
-                let move_d = (self.player_nav_speed * dt).min(xy_dist);
-                let f = move_d / xy_dist;
-                self.visual_player_pos[0] += (target[0] - self.visual_player_pos[0]) * f;
-                self.visual_player_pos[1] += (target[1] - self.visual_player_pos[1]) * f;
-                // Z not lerped — ground snap owns it.
-            }
-            self.scene.player_pos = self.visual_player_pos;
-        }
-
-        // Vertical physics: fall under gravity, land on geometry, jump on spacebar.
-        // Replaces the old static ground-snap. The floor query uses the player's current z
-        // as anchor so balconies and ceilings above never read as the floor.
-        // Skipped while swimming, which owns Z directly (camera-pitch driven).
-        if !swimming {
-            // Native Titanium fall: internal z-velocity clamps at ±128 EQ/s, and the outgoing
-            // position packet's delta_z caps at 12.8/update (~10 Hz → ~128 EQ/s terminal). The old
-            // 50/20 guess fell far too slowly. (eq-client-expert; docs/.../falling-physics.md.)
-            const GRAVITY: f32       = 120.0; // EQ units/s² (reaches ~128 terminal in ~1s)
-            const MAX_FALL: f32      = 128.0; // EQ units/s terminal velocity (native internal clamp)
-
-            // One-shot reground after a zone change: the zone-point spawn z can be well BELOW the
-            // zone's floor, and the downward-only ground-snap below can't lift the player (it would
-            // leave them buried). ONLY when the player is actually below the floor (no floor found
-            // beneath them) do we lift to the nearest floor above; a normal spawn at/above a floor
-            // is left to the regular gravity/snap. Gated on !loading so it runs against the NEW
-            // zone's collision (swapped in atomically with loading=false), never the old zone's.
+            // One-shot reground after a zone change: if the controller spawned below the floor, lift
+            // it onto the nearest floor once the new zone's collision is loaded.
             if self.needs_reground && !self.loading {
                 if let Some(c) = self.collision.as_deref() {
-                    let pp = self.scene.player_pos;
-                    // floor_z returns the fallback (== pp[2]) when no surface is found below.
-                    let no_floor_below = (c.floor_z(pp[0], pp[1], pp[2]) - pp[2]).abs() < 0.01;
-                    if no_floor_below {
-                        // Buried: find the floor above (generous up band) and lift onto it.
-                        const REGROUND_UP: f32 = 200.0;
-                        if let Some(f) = c.nearest_floor(pp[0], pp[1], pp[2], REGROUND_UP, 0.0) {
-                            self.scene.player_pos[2]  = f;
-                            self.visual_player_pos[2] = f;
-                            self.camera.focus[2]      = f;
-                            if let Some(ref mut op) = self.override_pos { op[2] = f; }
-                            self.vert_vel  = 0.0;
-                            self.on_ground = true;
+                    let p = self.controller.pos;
+                    if c.ground_below(p[0], p[1], p[2] + 1.0, 200.0).is_none() {
+                        if let Some(f) = c.nearest_floor(p[0], p[1], p[2], 200.0, 0.0) {
+                            self.controller.teleport([p[0], p[1], f]);
+                            self.controller.on_ground = true;
                             self.needs_reground = false;
-                            tracing::info!("zone-in: regrounded player from {:.1} up to floor z={:.1}", pp[2], f);
+                            tracing::info!("zone-in: regrounded controller to floor z={:.1}", f);
                         }
-                        // else: collision not ready / no floor found yet — retry next frame.
                     } else {
-                        // Already at/above a floor — let normal physics settle; nothing to recover.
                         self.needs_reground = false;
                     }
                 }
             }
 
-            let p = self.scene.player_pos; // [east, north, z]
-            // floor_z with anchor = p[2]: ray_start = p[2]+2, finds surfaces at or below that.
-            // Balconies/ceilings above p[2]+2 have negative t and are never returned.
-            let floor = self.ground_z(p[0], p[1], p[2]);
-
-            let new_z = if self.on_ground {
-                if (floor - p[2]).abs() <= 0.5 {
-                    // Normal ground tracking: stay snapped to floor surface.
-                    floor
-                } else if floor > p[2] + 0.5 {
-                    // Floor is above us (edge case from geometry). Snap up.
-                    floor
-                } else {
-                    // Floor dropped away — walked off a ledge; start falling.
-                    self.on_ground = false;
-                    p[2]
+            // Integrate the controller (sole position authority). Step only once spawned and with
+            // collision loaded; otherwise hold position so we don't fall through a loading void.
+            if self.camera_initialized {
+                if let Some(c) = self.collision.as_deref() {
+                    self.controller.step(intent, dt, c);
                 }
-            } else {
-                // Airborne: integrate gravity.
-                self.vert_vel -= GRAVITY * dt;
-                self.vert_vel  = self.vert_vel.max(-MAX_FALL);
-                let candidate  = p[2] + self.vert_vel * dt;
-                if candidate <= floor {
-                    // Landed.
-                    self.vert_vel  = 0.0;
-                    self.on_ground = true;
-                    floor
-                } else {
-                    candidate
-                }
-            };
+            }
+            let cpos = self.controller.pos;
+            self.on_ground         = self.controller.on_ground;
+            self.vert_vel          = self.controller.vel_z;
+            self.visual_player_pos = cpos;
+            self.scene.player_pos  = cpos;
+            self.camera.focus      = cpos;
+            // Mirror into the render GameState so HUD/picking/distance see the live position.
+            self.game_state.player_x = cpos[0];
+            self.game_state.player_y = cpos[1];
+            self.game_state.player_z = cpos[2];
+            if self.on_ground { self.last_grounded_z = cpos[2]; }
 
-            if self.on_ground { self.last_grounded_z = new_z; }
-            self.scene.player_pos[2]   = new_z;
-            self.camera.focus[2]       = new_z;
-            self.visual_player_pos[2]  = new_z;
-            // Keep override_pos z in sync so the next WASD base starts at the right height.
-            if let Some(ref mut op) = self.override_pos { op[2] = new_z; }
+            // Heading for nav-driven movement: face the planner's wish_dir (the render gs heading is
+            // no longer kept live by synthetic packets). Manual facing is set by the heading block.
+            if !manual_move {
+                let wd = intent.wish_dir;
+                if wd[0] * wd[0] + wd[1] * wd[1] > 1e-4 {
+                    self.heading_target = (-wd[0]).atan2(wd[1]).to_degrees().rem_euclid(360.0);
+                }
+            }
         }
+
+        // (Removed) The old visual-vs-logical position glide is gone: with a single position
+        // authority the controller's position IS the render position, so there is no trailing
+        // server position to lerp toward and no key-release snap-back (the rubber-band fix).
+
+        // Vertical physics (gravity, ground clamp, jump, swim) now lives in the CharacterController,
+        // integrated in the single-authority movement block above. Nothing to do here.
 
         // Face the direction of travel. Server position updates for the player carry
         // no heading, so derive it from frame-to-frame motion and smooth it. The camera
@@ -1281,17 +1161,8 @@ impl App {
                     self.heading_target = motion_deg;
                 }
             }
-            // For nav-driven movement (/goto, auto-engage) use the nav thread's authoritative
-            // heading directly: it is set from the direction of each movement step and is more
-            // reliable than motion-vector derivation (the visual glide introduces a lag that
-            // can misalign heading at corners or during the first frame of a new step).
-            // `game_state.player_heading` is kept live by the nav thread's synthetic position
-            // packets (make_position_packet → apply_position_update); without that it would be
-            // the stale spawn heading and this would snap the facing away from travel.
-            // Only applies when there is recent movement and no keyboard input.
-            if !manual_move && self.last_moved_at.elapsed().as_millis() < 300 {
-                self.heading_target = self.game_state.player_heading;
-            }
+            // (Nav-driven heading is set from the planner's wish_dir in the movement block above —
+            // the render gs heading is no longer kept live by synthetic packets.)
             self.prev_render_pos = self.scene.player_pos;
             // When rotating with A/D or steering with the mouse (drive), snap visual_heading
             // immediately for responsive feel. When following motion, lerp to avoid nav jitter.
@@ -1762,7 +1633,6 @@ impl ApplicationHandler for App {
                                 }
                                 KeyCode::KeyR | KeyCode::F9 => {
                                     self.camera.reset_to_follow();
-                                    self.override_pos = None;
                                     *self.goto_target.lock().unwrap() = None;
                                 }
                                 KeyCode::F10 => {
