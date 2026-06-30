@@ -1130,6 +1130,18 @@ impl App {
                     self.heading_target = (-wd[0]).atan2(wd[1]).to_degrees().rem_euclid(360.0);
                 }
             }
+
+            // Publish the controller's live position to the shared view EVERY frame. The nav thread
+            // reads this to stream the position to the server AND to mirror into the network gs that
+            // the /goto planner tracks progress against. Without this per-frame publish the view stays
+            // frozen at the spawn position (set once at camera-init): the planner sees no progress,
+            // skips every waypoint, and keeps driving the controller into a wall.
+            if let Ok(mut v) = self.controller_view.lock() {
+                v.pos = cpos;
+                v.heading = self.heading_target;
+                v.moving = intent.wish_dir[0] != 0.0 || intent.wish_dir[1] != 0.0 || !self.on_ground;
+                v.initialized = true;
+            }
         }
 
         // (Removed) The old visual-vs-logical position glide is gone: with a single position
