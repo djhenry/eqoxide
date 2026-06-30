@@ -169,6 +169,13 @@ fn convert_s3d_to_glb(input: &Path, output: &Path) -> Result<()> {
     let mut merged_normals: Vec<[f32; 3]> = Vec::new();
     let mut merged_uvs: Vec<[f32; 2]> = Vec::new();
     let mut merged_primitives: Vec<PrimitiveData> = Vec::new();
+    // SOLID-face indices for the dedicated `__collision__` mesh. libeq's
+    // `Mesh::collision_indices()` keeps every face whose flag bit 0x0010 is CLEAR — i.e. all
+    // SOLID faces, INCLUDING invisible-but-solid ones (zone boundaries, invisible walls,
+    // doorframes), while dropping PASSABLE faces (water surfaces, foliage). See libeq
+    // `DmSpriteDef2FaceEntry::flags` (0x0010 = "player can pass through"). These reference the
+    // merged vertex buffer, so the collision mesh shares the render POSITION accessor.
+    let mut merged_collision_indices: Vec<u32> = Vec::new();
     let mut texture_map: HashMap<String, usize> = HashMap::new();
     let mut materials: Vec<MaterialData> = Vec::new();
     let mut textures: Vec<TextureData> = Vec::new();
@@ -308,6 +315,21 @@ fn convert_s3d_to_glb(input: &Path, output: &Path) -> Result<()> {
                 prim_count += 1;
             }
 
+            // Collect SOLID faces (incl. invisible-but-solid) for the collision mesh, offset
+            // into the merged buffer. Drop the same placeholder/outlier vertices the render
+            // path drops so the two stay consistent (for zone meshes `outliers` is all-false).
+            for tri in mesh.collision_indices().chunks_exact(3) {
+                let drop = tri
+                    .iter()
+                    .any(|&i| outliers.get(i as usize).copied().unwrap_or(false));
+                if drop {
+                    continue;
+                }
+                for &i in tri {
+                    merged_collision_indices.push(i + index_offset);
+                }
+            }
+
             if prim_count > 0 {
                 eprintln!("  mesh '{}': {} verts, {} primitives (offset={})",
                     mesh_name, all_positions.len(), prim_count, index_offset);
@@ -330,15 +352,16 @@ fn convert_s3d_to_glb(input: &Path, output: &Path) -> Result<()> {
     }];
 
     eprintln!(
-        "  merged {} WLD meshes into 1 glTF mesh ({} verts, {} prims), {} materials, {} textures",
+        "  merged {} WLD meshes into 1 glTF mesh ({} verts, {} prims), {} materials, {} textures, {} collision tris",
         total_wld_meshes,
         all_meshes[0].positions.len(),
         all_meshes[0].primitives.len(),
         materials.len(),
-        textures.len()
+        textures.len(),
+        merged_collision_indices.len() / 3,
     );
 
-    write_glb(output, &all_meshes, &materials, &textures)
+    write_glb(output, &all_meshes, &materials, &textures, &merged_collision_indices)
 }
 
 fn get_or_create_material(
@@ -1504,6 +1527,7 @@ fn write_glb(
     meshes: &[MeshData],
     materials: &[MaterialData],
     textures: &[TextureData],
+    collision_indices: &[u32],
 ) -> Result<()> {
     let mut buffer_data: Vec<u8> = Vec::new();
     let mut buffer_views: Vec<serde_json::Value> = Vec::new();
@@ -1513,6 +1537,8 @@ fn write_glb(
     let mut gltf_materials: Vec<serde_json::Value> = Vec::new();
     let mut gltf_meshes: Vec<serde_json::Value> = Vec::new();
     let mut nodes: Vec<serde_json::Value> = Vec::new();
+    // POSITION accessor of the (single) combined render mesh; the `__collision__` mesh shares it.
+    let mut combined_pos_acc: Option<usize> = None;
 
     // Add textures as images
     for tex in textures {
@@ -1590,6 +1616,7 @@ fn write_glb(
             "max": pos_max,
         }));
         attributes.insert("POSITION".to_string(), serde_json::json!(pos_acc_idx));
+        combined_pos_acc = Some(pos_acc_idx);
 
         // Normals (shared across all primitives)
         let norm_offset = buffer_data.len() as u32;
@@ -1681,6 +1708,43 @@ fn write_glb(
         }));
     }
 
+    // Dedicated collision mesh: a `__collision__` mesh whose single primitive shares the render
+    // mesh's POSITION accessor and carries only the SOLID-face indices (incl. invisible-but-solid
+    // faces; PASSABLE faces excluded). The client tags it and routes it to collision instead of
+    // rendering it. u32 indices (5125) so large terrain collision sets never wrap past 65 535.
+    if let (Some(pos_acc), false) = (combined_pos_acc, collision_indices.is_empty()) {
+        let idx_offset = buffer_data.len() as u32;
+        for &i in collision_indices {
+            buffer_data.extend_from_slice(&i.to_le_bytes());
+        }
+        while buffer_data.len() % 4 != 0 {
+            buffer_data.push(0);
+        }
+        let idx_view_idx = buffer_views.len();
+        buffer_views.push(serde_json::json!({
+            "buffer": 0,
+            "byteOffset": idx_offset,
+            "byteLength": collision_indices.len() * 4,
+            "target": 34963,
+        }));
+        let idx_acc_idx = accessors.len();
+        accessors.push(serde_json::json!({
+            "bufferView": idx_view_idx,
+            "componentType": 5125,
+            "count": collision_indices.len(),
+            "type": "SCALAR",
+        }));
+        let mesh_idx = gltf_meshes.len();
+        gltf_meshes.push(serde_json::json!({
+            "name": "__collision__",
+            "primitives": [{
+                "attributes": { "POSITION": pos_acc },
+                "indices": idx_acc_idx,
+            }],
+        }));
+        nodes.push(serde_json::json!({ "name": "__collision__", "mesh": mesh_idx }));
+    }
+
     // Pad buffer to 4 bytes
     while buffer_data.len() % 4 != 0 {
         buffer_data.push(0);
@@ -1752,9 +1816,42 @@ fn compute_bounds_f32x3(positions: &[[f32; 3]]) -> ([f32; 3], [f32; 3]) {
     (min, max)
 }
 
+/// The collision classifier for a WLD face flag, mirroring libeq `Mesh::collision_indices()`:
+/// a face is SOLID (collidable) when flag bit 0x0010 is CLEAR. Bit 0x0010 marks PASSABLE faces
+/// (water surfaces, foliage — "player can pass through", per libeq `DmSpriteDef2FaceEntry`).
+/// Visibility is a *material* property, not a face flag: an invisible-but-solid face (zone
+/// boundary, invisible wall) still has 0x0010 clear and is therefore included in collision.
+#[cfg(test)]
+fn face_is_solid(flags: u16) -> bool {
+    flags & 0x0010 == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spec: one visible-solid + one INVIS-solid + one PASSABLE face must yield a collision set
+    /// of exactly the two SOLID faces. The INVIS face is visually distinct (different material)
+    /// but collides identically; only the PASSABLE (0x0010) face is excluded.
+    #[test]
+    fn collision_set_is_the_two_solid_faces() {
+        // (flag, label) — render-distinct but collision is purely flag-driven.
+        let faces: [(u16, &str); 3] = [
+            (0x0000, "visible-solid"),
+            (0x0000, "invis-solid"),   // invisible material, but face flag still solid
+            (0x0010, "passable"),      // water/foliage — excluded from collision
+        ];
+        let solid: Vec<&str> = faces
+            .iter()
+            .filter(|(f, _)| face_is_solid(*f))
+            .map(|(_, l)| *l)
+            .collect();
+        assert_eq!(solid, vec!["visible-solid", "invis-solid"]);
+        assert_eq!(solid.len(), 2, "exactly the two SOLID faces collide");
+        assert!(!face_is_solid(0x0010), "PASSABLE faces never collide");
+        // Other unrelated flag bits do not make a face passable.
+        assert!(face_is_solid(0x0001), "non-passable flag bits stay solid");
+    }
 
     #[test]
     #[ignore = "requires extracted assets (set EQ_ASSETS_DIR): globalhum_chr.s3d"]

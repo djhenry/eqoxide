@@ -289,6 +289,9 @@ impl EqRenderer {
             let source_count = assets.terrain.len();
             for mesh in assets.terrain.iter() {
                 if mesh.positions.is_empty() || mesh.indices.is_empty() { continue; }
+                // The dedicated `__collision__` mesh is invisible collision geometry, not
+                // drawable terrain — skip uploading it (it has no real texture).
+                if mesh.texture_name.as_deref() == Some(crate::assets::COLLISION_MESH_TAG) { continue; }
 
                 let texture_idx = mesh.texture_name.as_ref()
                     .and_then(|n| self.texture_names.iter().position(|t| t == n));
