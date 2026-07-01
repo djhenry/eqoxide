@@ -964,6 +964,18 @@ fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
             }
         }
     }
+
+    // ── Skills @04616 (rof2 PlayerProfile_Struct skills[100]) ──────────────────────
+    // Only the first NUM_SKILLS ids are real; the rest is wire padding. Exposed via
+    // GET /v1/observe/skills and raised by the trainer API (eqoxide#99).
+    let mut sk = vec![0u32; crate::skills::NUM_SKILLS];
+    for (i, slot) in sk.iter_mut().enumerate() {
+        let so = 4616 + i * 4;
+        if so + 4 <= payload.len() {
+            *slot = u32_at(so);
+        }
+    }
+    gs.player_skills = sk;
 }
 
 pub fn apply_begin_cast(gs: &mut GameState, p: &[u8]) {

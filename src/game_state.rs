@@ -345,6 +345,11 @@ pub struct GameState {
     // Spellcasting / posture
     /// Memorized spell gem IDs (9 slots); 0xFFFF_FFFF = empty slot.
     pub mem_spells: [u32; 9],
+    /// Player skill values by skill id (0..77), from PlayerProfile `skills[]` (eqoxide#99).
+    /// 0 = untrained; empty until the first PlayerProfile arrives. Exposed via GET
+    /// /v1/observe/skills; the trainer raises these. (Vec, not `[u32; 77]`: arrays > 32 don't
+    /// derive Default/Serialize.)
+    pub player_skills: Vec<u32>,
     /// Active cast in progress (Some) or idle (None).
     pub casting: Option<CastState>,
     /// True when the player is sitting.
