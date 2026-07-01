@@ -17,6 +17,7 @@ use tokio::sync::oneshot;
 use crate::camera_state::{CameraCmd, CameraSnapshot};
 
 mod observe;
+mod quests;
 mod navigate;
 mod combat;
 mod interact;
@@ -388,6 +389,7 @@ pub fn spawn_camera_server(
             // relative paths; nesting prefixes them. Shared state is applied once at the end.
             let app = Router::new()
                 .nest("/v1/observe",   observe::router())
+                .nest("/v1/quests",    quests::router())
                 .nest("/v1/navigate",  navigate::router())
                 .nest("/v1/combat",    combat::router())
                 .nest("/v1/interact",  interact::router())

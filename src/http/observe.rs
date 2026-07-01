@@ -22,8 +22,6 @@ pub(super) fn router() -> Router<HttpState> {
         .route("/spells", get(get_spells))
         .route("/doors", get(get_doors))
         .route("/zone_points", get(get_zone_points))
-        .route("/quests", get(get_quests))
-        .route("/quests/log", get(get_quest_log))
 }
 
 async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
@@ -149,50 +147,4 @@ async fn get_doors(State(s): State<HttpState>) -> Json<Vec<DoorView>> {
 /// GET /v1/observe/zone_points — returns all zone exit points received from the server.
 async fn get_zone_points(State(s): State<HttpState>) -> Json<Vec<crate::game_state::ZonePoint>> {
     Json(s.zone_points.lock().unwrap().clone())
-}
-
-/// GET /v1/observe/quests — the agent's "quests near me" view for the current zone. Lists quest
-/// givers (data/quests.json) with location, distance, whether they're loaded (in spawn range), what
-/// they want (turn-in items), and reward XP. Combine with /observe/entities + /navigate/goto to walk
-/// to a giver and /interact/give to hand in. See docs/autonomous-play.md.
-async fn get_quests(State(s): State<HttpState>) -> Json<serde_json::Value> {
-    let player = s.player_info.lock().unwrap().clone();
-    let zone = player.zone.clone();
-    let (px, py) = (player.pos_east, player.pos_north);
-    // clean live names -> position, to flag loaded givers + use their live coords
-    let live: HashMap<String, (f32, f32, f32)> = s.entity_positions.lock().unwrap().iter()
-        .map(|(k, v)| (clean_entity_name(k), *v))
-        .collect();
-    let mut givers: Vec<serde_json::Value> = crate::quests::givers_in(&zone).into_iter()
-        .map(|(name, g)| {
-            let live_pos = live.get(&name).copied();
-            let pos = live_pos.map(|(x, y, z)| [x, y, z]).unwrap_or([g.x, g.y, g.z]);
-            let dist = ((pos[0] - px).powi(2) + (pos[1] - py).powi(2)).sqrt();
-            serde_json::json!({
-                "name": name,
-                "npc_id": g.npc_id,
-                "pos": pos,
-                "loaded": live_pos.is_some(),
-                "distance": dist.round(),
-                "turn_in": g.turn_in,
-                "wanted": g.wanted,
-                "reward_xp": g.reward_xp,
-                "hail": g.hail,
-            })
-        })
-        .collect();
-    givers.sort_by(|a, b| {
-        let (da, db) = (a["distance"].as_f64().unwrap_or(1e9), b["distance"].as_f64().unwrap_or(1e9));
-        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    Json(serde_json::json!({ "zone": zone, "player": [px, py], "count": givers.len(), "quest_givers": givers }))
-}
-
-/// GET /v1/observe/quests/log — the player's NATIVE quest journal (EQ Task system), pushed by the
-/// server via OP_TaskDescription/OP_TaskActivity. Each task has a title, description, reward, and
-/// objectives with live progress (done_count/goal_count). Distinct from /observe/quests (old-style
-/// Lua turn-in quests) — together they cover both kinds of EQ quests.
-async fn get_quest_log(State(s): State<HttpState>) -> Json<serde_json::Value> {
-    let tasks = s.task_log.lock().unwrap().clone();
-    Json(serde_json::json!({ "active_count": tasks.len(), "tasks": tasks }))
 }
