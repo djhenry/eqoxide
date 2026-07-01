@@ -28,8 +28,12 @@ const GROUND_DEPTH: f32 = 200.0;
 /// Gravity / terminal fall (matches the renderer's prior physics + falling-physics.md).
 const GRAVITY: f32 = 120.0;
 const MAX_FALL: f32 = 128.0;
-/// Jump impulse for the free-WASD Space jump (preserved from the old WASD block; ~0.7u peak).
-pub const JUMP_VELOCITY: f32 = 13.0;
+/// Jump impulse for the free-WASD Space jump. Peak height = v²/(2·GRAVITY); at 31 that's ~4.0u —
+/// enough to clear/mount low ledges, steps and small crates (well above the 2u step-up), matching
+/// the reference RoF2 client's usable jump. The old value (13 → only ~0.7u peak, "barely leaves
+/// the ground") was a placeholder carried over from the pre-controller WASD block (eqoxide#92).
+/// (Exact RoF2 parity of the impulse is worth a decompile/live check; 4u restores a usable jump.)
+pub const JUMP_VELOCITY: f32 = 31.0;
 /// Vertical impulse for a nav auto-hop over a low fence/cart rail. Peak height = v²/(2·GRAVITY);
 /// at 44 that clears ~8u, enough for the low pen fences that block `/goto` (#41). Only used in nav
 /// mode (`MoveIntent::allow_hop`), so it never affects the native WASD jump feel.
@@ -454,6 +458,27 @@ mod tests {
         for _ in 0..40 { nav.step(nav_intent, 0.05, &geo()); }
         assert!(nav.pos[0] > 6.0, "nav should hop past the fence: east={}", nav.pos[0]);
         assert!(nav.pos[2].abs() < 0.5, "nav should land back on the flat floor z=0: {}", nav.pos[2]);
+    }
+
+    #[test]
+    fn jump_reaches_a_usable_height() {
+        // eqoxide#92: a Space jump must clear/mount low ledges (peak well above the 2u step-up),
+        // not the old ~0.7u placeholder that "barely leaves the ground".
+        let c = col(vec![floor(0.0, -100.0, 100.0)]); // flat ground at z=0
+        let mut ctrl = CharacterController::new([0.0, 0.0, 0.0]);
+        ctrl.on_ground = true;
+        let dt = 1.0 / 60.0;
+        // Launch (jump only on the first frame — holding it must not re-launch mid-air).
+        ctrl.step(MoveIntent { jump: true, ..Default::default() }, dt, &c);
+        let mut peak = ctrl.pos[2];
+        for _ in 0..180 {
+            ctrl.step(MoveIntent::default(), dt, &c);
+            peak = peak.max(ctrl.pos[2]);
+            if ctrl.on_ground { break; }
+        }
+        assert!(peak > 3.0, "jump should clear a small ledge (peak > 3u), got {peak}");
+        assert!(peak < 6.0, "jump should be a hop, not a launch (peak < 6u), got {peak}");
+        assert!(ctrl.pos[2].abs() < 0.6, "should land back on the ground, got z={}", ctrl.pos[2]);
     }
 
     #[test]
