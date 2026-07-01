@@ -795,6 +795,8 @@ impl App {
                 heading_cw:  h_cw,
                 server_corrections: gs.server_corrections,
                 mem_spells: gs.mem_spells,
+                skills:     gs.player_skills.clone(),
+                player_id:  gs.player_id,
                 target_id:  gs.target_id,
                 coin:       gs.coin,
                 hp_pct:        gs.hp_pct,
@@ -921,7 +923,9 @@ impl App {
                 self.last_moved_at = std::time::Instant::now();
             }
             self.prev_logical_pos = lp;
-            // Priority: dead > combat swing > walking > idle.
+            // Priority: dead > combat swing > walking > sitting > idle. Combat and
+            // movement override sitting (classic EQ stands you up when you attack or
+            // move); sitting only replaces the plain idle clip. (eqoxide#53)
             let pid = self.game_state.player_id;
             let player_dead = self.game_state.cur_hp <= 0 && self.game_state.max_hp > 0;
             let swinging = self.game_state.combat_anims.get(&pid)
@@ -932,6 +936,8 @@ impl App {
                 format!("C{:02}", code)
             } else if self.last_moved_at.elapsed().as_millis() < 250 {
                 "walking".to_string()
+            } else if self.game_state.sitting {
+                "sitting".to_string()
             } else {
                 "idle".to_string()
             };
@@ -1403,6 +1409,7 @@ impl App {
                 hud::draw_control_bar(ctx, ui_layout, scene, hail, say, target, say_buffer, camp, camp_until);
                 hud::draw_action_grid(ctx, ui_layout, scene, spells, spell_icons, attack, cast, sit, target, consider);
                 hud::draw_inventory(ctx, ui_layout, scene, show_inventory);
+                hud::draw_group_roster(ctx, ui_layout, scene);
                 hud::draw_merchant(ctx, ui_layout, scene, buy, sell, trade);
                 if show_debug {
                     hud::draw_debug_overlay(ctx, scene.player_pos, scene.player_heading, current_zone, corrections);

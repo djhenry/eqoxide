@@ -642,7 +642,10 @@ fn pose_skinned_mesh(
                 i, b, v.x, v.y, v.z, v.length(), w.x, w.y, w.z, bt.x, bt.y, bt.z
             );
         }
-        positions.push([w.x, w.z, w.y]);
+        // EQ Z-up → glTF Y-up is Rx(−90°): [x, z, −y]. The old [x, z, y] was a
+        // REFLECTION (det −1): it mirrored left/right and inverted every normal
+        // (inward-facing → wrong lighting / "inverted" look). (eqoxide#87)
+        positions.push([w.x, w.z, -w.y]);
 
         let n = frag
             .vertex_normals
@@ -650,7 +653,7 @@ fn pose_skinned_mesh(
             .map(|n| Vec3::new(n.0 as f32 / 127.0, n.1 as f32 / 127.0, n.2 as f32 / 127.0))
             .unwrap_or(Vec3::Y);
         let nw = m.transform_vector3(n).normalize_or_zero();
-        normals.push([nw.x, nw.z, nw.y]);
+        normals.push([nw.x, nw.z, -nw.y]);
     }
     let outliers = detect_outliers(&positions);
     if debug {
@@ -923,7 +926,7 @@ fn gather_skinned_geo(frag: &DmSpriteDef2, skel: &Skel) -> Option<SkinnedGeo> {
         let v = Vec3::new(p.0 as f32 * scale, p.1 as f32 * scale, p.2 as f32 * scale);
         let w = skel.world[b].transform_point3(v);
         positions.push([w.x, w.y, w.z]); // EQ-native bind pose
-        posed_for_outlier.push([w.x, w.z, w.y]);
+        posed_for_outlier.push([w.x, w.z, -w.y]); // match the static Rx(−90°) swap (#87); detection-only
         let n = frag
             .vertex_normals
             .get(i)

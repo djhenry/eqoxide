@@ -35,13 +35,14 @@ pub(crate) fn canvas_off(ctx: &egui::Context, align: egui::Align2, base: [f32; 2
 
 /// All managed (movable) HUD windows. Anchors/offsets reproduce the previous
 /// fixed layout, retuned so the windows no longer overlap on a 960x540 canvas.
-pub static WINDOW_SPECS: [WindowSpec; 8] = [
+pub static WINDOW_SPECS: [WindowSpec; 9] = [
     WindowSpec { id: "status_hud",   title: "Status",       default_anchor: egui::Align2::LEFT_BOTTOM,   default_offset: [0.0, 0.0],   default_size: None,                resizable: false },
     WindowSpec { id: "message_log",  title: "Messages",     default_anchor: egui::Align2::LEFT_BOTTOM,   default_offset: [0.0, -64.0], default_size: Some([480.0, 120.0]), resizable: true  },
     WindowSpec { id: "minimap",      title: "Map",          default_anchor: egui::Align2::RIGHT_TOP,     default_offset: [-10.0, 10.0],default_size: Some([200.0, 200.0]), resizable: true  },
     WindowSpec { id: "control_bar",  title: "Controls",     default_anchor: egui::Align2::RIGHT_BOTTOM,  default_offset: [-8.0, -8.0], default_size: None,                resizable: false },
     WindowSpec { id: "action_grid",  title: "Actions",      default_anchor: egui::Align2::CENTER_BOTTOM, default_offset: [0.0, -8.0],  default_size: None,                resizable: false },
     WindowSpec { id: "inventory",    title: "Inventory",    default_anchor: egui::Align2::LEFT_TOP,      default_offset: [8.0, 90.0],  default_size: Some([340.0, 420.0]), resizable: true  },
+    WindowSpec { id: "group_roster", title: "Group",        default_anchor: egui::Align2::RIGHT_TOP,     default_offset: [-10.0, 220.0], default_size: Some([220.0, 160.0]), resizable: true  },
     WindowSpec { id: "npc_dialogue", title: "NPC Dialogue", default_anchor: egui::Align2::CENTER_TOP,    default_offset: [0.0, 36.0],  default_size: Some([460.0, 140.0]), resizable: true  },
     WindowSpec { id: "merchant",     title: "Merchant",     default_anchor: egui::Align2::CENTER_CENTER, default_offset: [0.0, 0.0],   default_size: Some([420.0, 460.0]), resizable: true  },
 ];
@@ -411,6 +412,33 @@ pub fn draw_inventory(ctx: &egui::Context, layout: &mut UiLayout, scene: &SceneS
             scene.coin[0], scene.coin[1], scene.coin[2], scene.coin[3]));
         if inv.is_empty() {
             ui.label(egui::RichText::new("(waiting for inventory from server…)").weak());
+        }
+    });
+}
+
+/// Always-on group roster panel (RIGHT_TOP, below the minimap). Hidden entirely when not
+/// grouped. Shows each member's name, level, leader/role badges, and an HP% bar — HP comes from
+/// the same OP_MobHealth pathway used for targetable mobs (see GameState.group_members /
+/// Navigator::sync_group), so it lags real-time HP by up to one server health-update tick, same
+/// as any other entity's HP bar in this client.
+pub fn draw_group_roster(ctx: &egui::Context, layout: &mut UiLayout, scene: &SceneState) {
+    if scene.group_members.is_empty() {
+        return;
+    }
+    let base = egui::Frame::window(&ctx.style());
+    managed_window(ctx, layout, spec("group_roster"), base, |ui| {
+        for m in &scene.group_members {
+            let mut label = m.name.clone();
+            if m.is_leader { label.push_str(" 👑"); }
+            if m.tank { label.push_str(" [T]"); }
+            if m.assist { label.push_str(" [A]"); }
+            if m.puller { label.push_str(" [P]"); }
+            if m.offline { label.push_str(" (offline)"); }
+            ui.label(format!("{label} (lvl {})", m.level));
+            let hp_pct = if m.name == scene.player_name { scene.player_hp_pct } else {
+                scene.billboards.iter().find(|b| b.name == m.name).map(|b| b.hp_pct).unwrap_or(0.0)
+            };
+            stat_bar(ui, "HP", hp_pct, 140.0, 10.0, egui::Color32::from_rgb(180, 40, 40));
         }
     });
 }
@@ -1085,7 +1113,7 @@ mod tests {
             id, pos, level, hp_pct: 100.0, is_target: false, dead: false,
             name: name.to_string(), race: String::new(), action: String::new(), heading: 0.0,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0,
-            face: 0, hairstyle: 0,
+            face: 0, hairstyle: 0, haircolor: 0, helm: 0, showhelm: 0,
         }
     }
 
@@ -1143,6 +1171,9 @@ mod tests {
                     gender: 0,
                     face: 0,
                     hairstyle: 0,
+                    haircolor: 0,
+                    helm: 0,
+                    showhelm: 0,
                 },
             ],
             ..Default::default()

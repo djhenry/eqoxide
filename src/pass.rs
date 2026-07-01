@@ -109,6 +109,18 @@ fn resolve_overlay_tex<'a>(
             if let Some(Some(bg)) = r.equipment_tex_cache.get(&key) { return Some(bg); }
         }
     }
+    // Final base-cloth fallback: a BODY piece whose exact variant's baseline-cloth texture was
+    // never extracted still renders clothed by borrowing variant-01 of the same region. The male
+    // equip-texture sets are incomplete (e.g. wood-elf male ships elmch0001/0002 but NOT elmch0003,
+    // and only variant-01 of the arms) where the female set is complete — so without this, male
+    // humanoids rendered bare on exactly those pieces while females looked fine. Skin regions
+    // (he/hn/ft) are excluded so bare hands/head/feet stay skin. (eqoxide#82)
+    if !matches!(&es.region, b"he" | b"hn" | b"ft") && es.variant != 1 {
+        let base = crate::models::EquipSlot { variant: 1, ..es };
+        if let Some(key) = crate::models::equip_swap_key(prefix, base, 0) {
+            if let Some(Some(bg)) = r.equipment_tex_cache.get(&key) { return Some(bg); }
+        }
+    }
     None
 }
 
@@ -471,6 +483,9 @@ pub fn encode_player_pass(
                         }
                         _ => mesh.base_color,
                     };
+                    // Runtime-tint synthetic hair shells by the player's hair color (eqoxide#98).
+                    let tint = crate::models::head_part_tint(model.head_parts[i], scene.player_haircolor)
+                        .unwrap_or(tint);
                     r.queue.write_buffer(
                         &r.entity_uniform_pool[i].0, 0,
                         bytemuck::bytes_of(&EntityUniform { model: mat, tint }),
@@ -590,6 +605,9 @@ pub fn encode_player_pass(
                         }
                         _ => mesh.base_color,
                     };
+                    // Runtime-tint synthetic hair shells by the player's hair color (eqoxide#98).
+                    let tint = crate::models::head_part_tint(model.head_parts[i], scene.player_haircolor)
+                        .unwrap_or(tint);
                     r.queue.write_buffer(
                         &r.entity_uniform_pool[i].0, 0,
                         bytemuck::bytes_of(&EntityUniform { model: mat, tint }),
@@ -713,7 +731,7 @@ pub fn encode_entity_pass(
     use crate::models::{race_to_archetype, archetype_scale};
     use crate::gpu::GpuModel;
 
-    struct DrawCmd { archetype: &'static str, mesh_idx: usize, uniform_slot: usize, equipment: [u32; 9], gender: u8, face: u8, hairstyle: u8 }
+    struct DrawCmd { archetype: &'static str, mesh_idx: usize, uniform_slot: usize, equipment: [u32; 9], gender: u8, face: u8, hairstyle: u8, helm: u32, showhelm: u8 }
 
     let mut draws: Vec<DrawCmd> = Vec::new();
     let pool_half = r.entity_uniform_pool.len() / 2;
@@ -744,11 +762,16 @@ pub fn encode_entity_pass(
                                          _ => mesh.base_color,
                                      }
                                  };
+            // Runtime-tint synthetic hair shells by the NPC's hair color (eqoxide#98) — unless the
+            // whole model is dead-greyed or target-highlighted (those overrides win).
+            let tint = if !b.dead && !b.is_target {
+                crate::models::head_part_tint(model.head_parts[mesh_idx], b.haircolor).unwrap_or(tint)
+            } else { tint };
             r.queue.write_buffer(
                 &r.entity_uniform_pool[slot].0, 0,
                 bytemuck::bytes_of(&crate::gpu::EntityUniform { model: mat, tint }),
             );
-            draws.push(DrawCmd { archetype, mesh_idx, uniform_slot: slot, equipment: b.equipment, gender: b.gender, face: b.face, hairstyle: b.hairstyle });
+            draws.push(DrawCmd { archetype, mesh_idx, uniform_slot: slot, equipment: b.equipment, gender: b.gender, face: b.face, hairstyle: b.hairstyle, helm: b.helm, showhelm: b.showhelm });
             slot += 1;
         }
         if slot >= slot_end { break; }
@@ -780,6 +803,8 @@ pub fn encode_entity_pass(
             model.head_parts[draw.mesh_idx],
             model.head_default_hidden[draw.mesh_idx],
             draw.face, draw.hairstyle,
+        ) || crate::models::hair_hidden_by_helm(
+            model.head_parts[draw.mesh_idx], draw.showhelm, draw.helm,
         ) { continue; }
         pass.set_bind_group(2, &r.entity_uniform_pool[draw.uniform_slot].1, &[]);
         let bg = resolve_equip_tex(r, &model.texture_bind_groups, mesh.texture_idx,
@@ -805,7 +830,7 @@ pub fn encode_skinned_entity_pass(
     use crate::models::race_to_archetype;
     use crate::gpu::{EntityUniform, GpuModel};
 
-    struct DrawCmd { model_key: &'static str, model_slot: u8, mesh_idx: usize, uniform_slot: usize, joint_slot: usize, equipment: [u32; 9], face: u8, hairstyle: u8 }
+    struct DrawCmd { model_key: &'static str, model_slot: u8, mesh_idx: usize, uniform_slot: usize, joint_slot: usize, equipment: [u32; 9], face: u8, hairstyle: u8, helm: u32, showhelm: u8 }
 
     let mut draws: Vec<DrawCmd> = Vec::new();
     let pool_half    = r.entity_uniform_pool.len() / 2;
@@ -878,11 +903,16 @@ pub fn encode_skinned_entity_pass(
                                          _ => mesh.base_color,
                                      }
                                  };
+            // Runtime-tint synthetic hair shells by the NPC's hair color (eqoxide#98) — unless the
+            // whole model is dead-greyed or target-highlighted (those overrides win).
+            let tint = if !b.dead && !b.is_target {
+                crate::models::head_part_tint(model.head_parts[mesh_idx], b.haircolor).unwrap_or(tint)
+            } else { tint };
             r.queue.write_buffer(
                 &r.entity_uniform_pool[u_slot].0, 0,
                 bytemuck::bytes_of(&EntityUniform { model: mat, tint }),
             );
-            draws.push(DrawCmd { model_key, model_slot, mesh_idx, uniform_slot: u_slot, joint_slot: j_slot, equipment: b.equipment, face: b.face, hairstyle: b.hairstyle });
+            draws.push(DrawCmd { model_key, model_slot, mesh_idx, uniform_slot: u_slot, joint_slot: j_slot, equipment: b.equipment, face: b.face, hairstyle: b.hairstyle, helm: b.helm, showhelm: b.showhelm });
             u_slot += 1;
         }
         j_slot += 1;
@@ -922,6 +952,8 @@ pub fn encode_skinned_entity_pass(
             model.head_parts[draw.mesh_idx],
             model.head_default_hidden[draw.mesh_idx],
             draw.face, draw.hairstyle,
+        ) || crate::models::hair_hidden_by_helm(
+            model.head_parts[draw.mesh_idx], draw.showhelm, draw.helm,
         ) { continue; }
         pass.set_bind_group(2, &r.entity_uniform_pool[draw.uniform_slot].1, &[]);
         pass.set_bind_group(1, skin_base_tex(r, &model.texture_bind_groups, mesh.texture_idx), &[]);
@@ -943,6 +975,8 @@ pub fn encode_skinned_entity_pass(
             model.head_parts[draw.mesh_idx],
             model.head_default_hidden[draw.mesh_idx],
             draw.face, draw.hairstyle,
+        ) || crate::models::hair_hidden_by_helm(
+            model.head_parts[draw.mesh_idx], draw.showhelm, draw.helm,
         ) { continue; }
         let Some(overlay) = resolve_overlay_tex(r, &model.prefix,
             model.equip_slots[draw.mesh_idx], &draw.equipment) else { continue };

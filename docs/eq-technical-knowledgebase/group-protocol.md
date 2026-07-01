@@ -81,14 +81,24 @@ struct GroupGeneric_Struct {
 /*0148*/
 };
 ```
-Used on the wire for `OP_GroupDisbandYou`/`OP_GroupDisbandOther`. `OP_GroupDisband` (client→server,
-the leave/kick request) is NOT translated by any RoF2 ENCODE/DECODE override — it uses the
-**common** (non-RoF2-namespaced) `GroupGeneric_Struct` from `common/eq_packet_structs.h:2485-2488`,
-which is only 128 bytes (just `name1[64]`, `name2[64]`, no trailing uint32s). Confirm this 128 vs
-148 split with a packet capture before hard-coding a size for `OP_GroupDisband` specifically —
-`Client::Handle_OP_GroupDisband` validates against `sizeof(GroupGeneric_Struct)`
-(`zone/client_packet.cpp:7197`), which resolves to the **common** 128-byte struct in that
-translation unit (zone code includes `common/eq_packet_structs.h`, not the rof2 patch namespace).
+Used on the wire for `OP_GroupDisbandYou`/`OP_GroupDisbandOther`. **CONFIRMED LIVE (task-6
+validation, 2026-07-01) against a running EQEmu RoF2 zone server:** `OP_GroupDisband`
+(client→server, the leave/kick/decline-cleanup request) also uses this same 148-byte
+RoF2-namespaced `GroupGeneric_Struct` (`name1[64]`, `name2[64]`, 5 trailing zero uint32s) — NOT
+the common 128-byte struct this doc previously guessed at. Sending a 128-byte payload was
+observed to be silently rejected server-side:
+```
+[Zone] [Netcode] Wrong size on incoming [OP_GroupDisband] (structs::GroupGeneric_Struct): Got [128], expected [148]
+[Zone] [Packet C->S] [OP_Unknown] [0x4c10] Size [130]
+```
+(the extra 2 bytes are the opcode header). The server logged the packet as `OP_Unknown` and
+dropped it entirely — no roster change, no error surfaced to the client, no crash. eqoxide's
+`build_group_disband()` in `src/eq_net/navigation.rs` was fixed to emit 148 bytes; see
+`docs/eq-technical-knowledgebase/... ` task-6 report for the full repro. The earlier theory that
+`zone/client_packet.cpp:7197`'s `sizeof(GroupGeneric_Struct)` resolves to the common 128-byte
+struct in the zone translation unit is contradicted by this live evidence — either the zone
+binary in this build pulls in the RoF2-namespaced struct after all, or a different check path is
+in play. Trust the live packet capture over the static-analysis inference here.
 
 ### GroupCancel_Struct (decline) — 152 bytes (`rof2_structs.h:2587-2593`)
 ```c
@@ -355,14 +365,17 @@ binding themselves beyond the initial roster snapshot's member names).
    `OP_PlayerProfile` — a fixed-`repr(C)` struct will not parse it; needs a byte-cursor
    reader honoring the `VARSTRUCT_ENCODE_STRING`/NUL-terminated-string + fixed-field interleaving
    documented in §2.
-4. **`OP_GroupDisband` size mismatch risk**: the RoF2 wire (`rof2_structs.h`) does NOT override
-   `GroupGeneric_Struct`'s size for this specific client→server opcode (no `ENCODE`/`DECODE`
-   handler for `OP_GroupDisband` exists in `rof2.cpp` at all — grep found zero matches), so the
-   client must send the **common** 128-byte `GroupGeneric_Struct` (`name1[64]`, `name2[64]`, no
-   trailing uint32s), not the RoF2-namespaced 148-byte one used for `OP_GroupInvite`/
-  `OP_GroupFollow`/etc. Verify this with a packet capture before hardcoding — flagged as the single
-  highest-risk struct-size gotcha in this whole subsystem, directly analogous to the RoF2 door
-  80-vs-100-byte bug eqoxide already hit (`eq-rof2-door-struct` in the top-level notes).
+4. **`OP_GroupDisband` size — RESOLVED, was the single highest-risk struct-size gotcha in this
+   subsystem, directly analogous to the RoF2 door 80-vs-100-byte bug (`eq-rof2-door-struct`).**
+   The static-analysis inference (no `ENCODE`/`DECODE` handler for `OP_GroupDisband` in
+   `rof2.cpp` -> must be the common 128-byte `GroupGeneric_Struct`) was **confirmed wrong by a
+   live packet capture** during task-6 validation (2026-07-01): the running EQEmu zone server
+   rejected a 128-byte `OP_GroupDisband` payload with `Wrong size on incoming [OP_GroupDisband]
+   (structs::GroupGeneric_Struct): Got [128], expected [148]`, logged it as `OP_Unknown`, and
+   silently dropped it (no crash, no error to client, no roster change on either side). The
+   client must send the **148-byte RoF2-namespaced** `GroupGeneric_Struct` (`name1[64]`,
+   `name2[64]`, 5 trailing zero uint32s) for this opcode too -- same shape as `OP_GroupInvite`/
+   `OP_GroupFollow`. Fixed in `build_group_disband()` (`src/eq_net/navigation.rs`).
 5. **`OP_GroupCancelInvite`'s RoF2 hex value is listed as `0x0000`** in `patch_RoF2.conf:539` —
    unlike other `0x0000` entries in that file which usually mean "not remapped for this client",
    this one has full `ENCODE`/`DECODE` handlers implemented in `rof2.cpp`, so the `0x0000` is

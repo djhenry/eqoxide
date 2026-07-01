@@ -176,6 +176,7 @@ OPTIONS:
     }
 
     let goto_target:      http::GotoTarget      = Arc::new(Mutex::new(None));
+    let goto_entity:      http::GotoEntity      = Arc::new(Mutex::new(None));
     let entity_positions: http::EntityPositions = Arc::new(Mutex::new(HashMap::new()));
     let entity_ids:       http::EntityIds       = Arc::new(Mutex::new(HashMap::new()));
     let zone_points:      http::ZonePoints      = Arc::new(Mutex::new(Vec::new()));
@@ -184,6 +185,13 @@ OPTIONS:
     let completed_tasks_shared: http::CompletedTasksShared = Arc::new(Mutex::new(Vec::new()));
     let accept_task:           http::AcceptTaskReq        = Arc::new(Mutex::new(None));
     let cancel_task:           http::CancelTaskReq        = Arc::new(Mutex::new(None));
+    let group:             http::GroupShared         = Arc::new(Mutex::new(http::GroupSnapshot::default()));
+    let group_invite:      http::GroupInviteReq      = Arc::new(Mutex::new(None));
+    let group_accept:      http::GroupAcceptReq      = Arc::new(Mutex::new(None));
+    let group_decline:     http::GroupDeclineReq     = Arc::new(Mutex::new(None));
+    let group_leave:       http::GroupLeaveReq       = Arc::new(Mutex::new(None));
+    let group_kick:        http::GroupKickReq        = Arc::new(Mutex::new(None));
+    let group_make_leader: http::GroupMakeLeaderReq  = Arc::new(Mutex::new(None));
     let zone_cross:       http::ZoneCrossReq    = Arc::new(Mutex::new(None));
     let warp:             http::WarpReq         = Arc::new(Mutex::new(None));
     let hail:             http::HailReq         = Arc::new(Mutex::new(None));
@@ -213,6 +221,8 @@ OPTIONS:
         .unwrap_or_else(|_| data_dir.join("spells_us.txt").to_string_lossy().into_owned());
     let spells: std::sync::Arc<eqoxide::spells::SpellDb> =
         std::sync::Arc::new(eqoxide::spells::SpellDb::load(&spells_path));
+    // Publish globally so the nav thread can resolve spell target types for self-cast (eqoxide#95).
+    eqoxide::spells::set_global(spells.clone());
     let shared_collision: assets::SharedCollision = Arc::new(std::sync::RwLock::new(None));
     let frame_req:        http::FrameReq        = Arc::new(Mutex::new(None));
     let player_info:      http::PlayerInfo      = Arc::new(Mutex::new(http::PlayerState::default()));
@@ -230,6 +240,7 @@ OPTIONS:
     let asset_server_url = app_cfg.asset_server_url.clone();
     if !testzone_mode {
         let gt  = goto_target.clone();
+        let ge  = goto_entity.clone();
         let ep  = entity_positions.clone();
         let ei  = entity_ids.clone();
         let zp  = zone_points.clone();
@@ -238,6 +249,13 @@ OPTIONS:
         let cts = completed_tasks_shared.clone();
         let atk = accept_task.clone();
         let ctk = cancel_task.clone();
+        let gr  = group.clone();
+        let gi  = group_invite.clone();
+        let ga  = group_accept.clone();
+        let gd  = group_decline.clone();
+        let gl  = group_leave.clone();
+        let gk  = group_kick.clone();
+        let gml = group_make_leader.clone();
         let zc  = zone_cross.clone();
         let wp  = warp.clone();
         let hl  = hail.clone();
@@ -272,7 +290,7 @@ OPTIONS:
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, tos, cts, atk, ctk, zc, wp, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, cev, csd, ca, ms, st, co, sc, md, sd, cp, cu, cv, ni, pc).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, ga, gd, gl, gk, gml, zc, wp, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, cev, csd, ca, ms, st, co, sc, md, sd, cp, cu, cv, ni, pc).await {
                     tracing::error!("EQ: fatal: {e}");
                 }
             });
@@ -312,6 +330,7 @@ OPTIONS:
         camera_snapshot.clone(),
         frame_req.clone(),
         goto_target,
+        goto_entity,
         entity_positions,
         entity_ids,
         zone_points,
@@ -343,6 +362,13 @@ OPTIONS:
         completed_tasks_shared,
         accept_task,
         cancel_task,
+        group,
+        group_invite,
+        group_accept,
+        group_decline,
+        group_leave,
+        group_kick,
+        group_make_leader,
         door_click,
         doors_shared,
         camp.clone(),

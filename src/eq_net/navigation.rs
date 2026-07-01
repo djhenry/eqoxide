@@ -276,6 +276,57 @@ pub fn build_cancel_task(sequence_number: u32) -> Vec<u8> {
     buf
 }
 
+/// OP_GroupInvite payload: GroupInvite_Struct (148 bytes): invitee_name[64], inviter_name[64],
+/// then 5 unknown/zero-filled u32s.
+pub fn build_group_invite(invitee_name: &str, inviter_name: &str) -> [u8; 148] {
+    let mut buf = [0u8; 148];
+    let n = invitee_name.as_bytes().len().min(63);
+    buf[0..n].copy_from_slice(&invitee_name.as_bytes()[..n]);
+    let n2 = inviter_name.as_bytes().len().min(63);
+    buf[64..64 + n2].copy_from_slice(&inviter_name.as_bytes()[..n2]);
+    buf
+}
+
+/// OP_GroupFollow payload (accepting an invite): GroupFollow_Struct (152 bytes): name1=inviter[64],
+/// name2=invitee(us)[64], then 6 unknown/zero-filled u32s.
+pub fn build_group_follow(inviter_name: &str, invitee_name: &str) -> [u8; 152] {
+    let mut buf = [0u8; 152];
+    let n = inviter_name.as_bytes().len().min(63);
+    buf[0..n].copy_from_slice(&inviter_name.as_bytes()[..n]);
+    let n2 = invitee_name.as_bytes().len().min(63);
+    buf[64..64 + n2].copy_from_slice(&invitee_name.as_bytes()[..n2]);
+    buf
+}
+
+/// OP_GroupDisband payload (leave/kick/decline-cleanup). CONFIRMED LIVE (2026-07-01, task-6
+/// validation pass) against a running EQEmu RoF2 zone server: the doc's inferred 128-byte
+/// "common" GroupGeneric_Struct is WRONG for this opcode — the server logged
+/// `Wrong size on incoming [OP_GroupDisband] (structs::GroupGeneric_Struct): Got [128], expected
+/// [148]` and silently dropped the packet (no roster change, no disband on either side). The
+/// server actually wants the 148-byte RoF2-namespaced struct (same shape as GroupInvite_Struct):
+/// name1[64], name2[64], then 5 trailing zero uint32s. `own_name` is the acting player's own
+/// name; `target_name` is who's being removed (self for leave/decline, the kicked member's name
+/// for a kick).
+pub fn build_group_disband(own_name: &str, target_name: &str) -> [u8; 148] {
+    let mut buf = [0u8; 148];
+    let n = own_name.as_bytes().len().min(63);
+    buf[0..n].copy_from_slice(&own_name.as_bytes()[..n]);
+    let n2 = target_name.as_bytes().len().min(63);
+    buf[64..64 + n2].copy_from_slice(&target_name.as_bytes()[..n2]);
+    buf
+}
+
+/// OP_GroupMakeLeader payload: GroupMakeLeader_Struct (456 bytes): Unknown000(u32)=0,
+/// CurrentLeader[64], NewLeader[64], Unknown072[324]=0. Only NewLeader is read server-side.
+pub fn build_group_make_leader(current_leader: &str, new_leader: &str) -> [u8; 456] {
+    let mut buf = [0u8; 456];
+    let n = current_leader.as_bytes().len().min(63);
+    buf[4..4 + n].copy_from_slice(&current_leader.as_bytes()[..n]);
+    let n2 = new_leader.as_bytes().len().min(63);
+    buf[68..68 + n2].copy_from_slice(&new_leader.as_bytes()[..n2]);
+    buf
+}
+
 /// Build a RoF2 `OP_ChannelMessage` for the Say channel (used for NPC hails).
 /// chan_num 8 = ChatChannel_Say; the server delivers say text to NPCs within 200
 /// units, triggering EVENT_SAY (a "Hail, <name>" message fires the NPC's hail script).
@@ -355,6 +406,7 @@ fn dist2(zp: &crate::game_state::ZonePoint, gs: &GameState) -> f32 {
 
 pub struct Navigator {
     goto_target:      GotoTarget,
+    goto_entity:      crate::http::GotoEntity,
     entity_positions: EntityPositions,
     entity_ids:       EntityIds,
     zone_points:      ZonePoints,
@@ -363,6 +415,13 @@ pub struct Navigator {
     completed_tasks_shared: crate::http::CompletedTasksShared,
     accept_task:           crate::http::AcceptTaskReq,
     cancel_task:           crate::http::CancelTaskReq,
+    group:             crate::http::GroupShared,
+    group_invite:      crate::http::GroupInviteReq,
+    group_accept:      crate::http::GroupAcceptReq,
+    group_decline:     crate::http::GroupDeclineReq,
+    group_leave:       crate::http::GroupLeaveReq,
+    group_kick:        crate::http::GroupKickReq,
+    group_make_leader: crate::http::GroupMakeLeaderReq,
     zone_cross:       ZoneCrossReq,
     /// Direct teleport request (POST /warp). The nav thread jumps the player to these coords,
     /// sends a position update so the server agrees, and cancels any in-progress /goto.
@@ -446,6 +505,7 @@ pub struct Navigator {
 impl Navigator {
     pub fn new(
         goto_target:      GotoTarget,
+        goto_entity:      crate::http::GotoEntity,
         entity_positions: EntityPositions,
         entity_ids:       EntityIds,
         zone_points:      ZonePoints,
@@ -454,6 +514,13 @@ impl Navigator {
         completed_tasks_shared: crate::http::CompletedTasksShared,
         accept_task:           crate::http::AcceptTaskReq,
         cancel_task:           crate::http::CancelTaskReq,
+        group:             crate::http::GroupShared,
+        group_invite:      crate::http::GroupInviteReq,
+        group_accept:      crate::http::GroupAcceptReq,
+        group_decline:     crate::http::GroupDeclineReq,
+        group_leave:       crate::http::GroupLeaveReq,
+        group_kick:        crate::http::GroupKickReq,
+        group_make_leader: crate::http::GroupMakeLeaderReq,
         zone_cross:       ZoneCrossReq,
         warp:             WarpReq,
         hail:             HailReq,
@@ -486,6 +553,7 @@ impl Navigator {
     ) -> Self {
         Navigator {
             goto_target,
+            goto_entity,
             entity_positions,
             entity_ids,
             zone_points,
@@ -494,6 +562,13 @@ impl Navigator {
             completed_tasks_shared,
             accept_task,
             cancel_task,
+            group,
+            group_invite,
+            group_accept,
+            group_decline,
+            group_leave,
+            group_kick,
+            group_make_leader,
             zone_cross,
             warp,
             hail,
@@ -576,6 +651,32 @@ impl Navigator {
         let mut completed = self.completed_tasks_shared.lock().unwrap();
         completed.clear();
         completed.extend(gs.completed_task_history.iter().cloned());
+    }
+
+    /// Publish the group roster from `gs` into the shared slot (GET /v1/group/roster + the UI
+    /// roster panel). Looks up each other member's HP% from `gs.entities` by name (group
+    /// membership is what unlocks receiving another mob's OP_MobHealth percent, so this reuses
+    /// existing Entity.hp_pct rather than needing a new opcode); the player's own HP% comes
+    /// directly from `gs.hp_pct` since the player is never in `gs.entities`.
+    pub fn sync_group(&self, gs: &GameState) {
+        let mut g = self.group.lock().unwrap();
+        g.leader = gs.group_leader.clone();
+        g.pending_invite = gs.pending_invite.clone();
+        g.you_are_leader = !gs.player_name.is_empty() && gs.group_leader == gs.player_name;
+        g.members = gs.group_members.iter().map(|m| {
+            let hp_pct = if m.name == gs.player_name {
+                gs.hp_pct
+            } else {
+                gs.entities.values().find(|e| e.name == m.name).map(|e| e.hp_pct).unwrap_or(0.0)
+            };
+            crate::http::GroupMemberView {
+                // m.level from OP_GroupUpdateB is a server placeholder (70/65); resolve the real
+                // level from our profile / the member's spawn instead. (eqoxide#104)
+                name: m.name.clone(), level: gs.group_member_level(&m.name),
+                is_leader: m.is_leader, is_merc: m.is_merc,
+                tank: m.tank, assist: m.assist, puller: m.puller, offline: m.offline, hp_pct,
+            }
+        }).collect();
     }
 
     /// Publish the player's inventory + equipment from `gs` into the shared slot (GET /inventory).
@@ -756,6 +857,56 @@ impl Navigator {
             }
         }
 
+        // POST /v1/group/invite {"name":"X"}: send OP_GroupInvite.
+        if let Some(target) = self.group_invite.lock().unwrap().take() {
+            stream.send_app_packet(OP_GROUP_INVITE, &build_group_invite(&target, &gs.player_name));
+            tracing::info!("EQ: group: invited {target}");
+            gs.log_msg("group", &format!("Invited {target} to group"));
+        }
+
+        // POST /v1/group/accept: send OP_GroupFollow. Optimistically clear pending_invite now —
+        // the real roster confirmation arrives via OP_GroupUpdateB/OP_GroupAcknowledge.
+        if self.group_accept.lock().unwrap().take().is_some() {
+            if let Some(inviter) = gs.pending_invite.take() {
+                stream.send_app_packet(OP_GROUP_FOLLOW, &build_group_follow(&inviter, &gs.player_name));
+                tracing::info!("EQ: group: accepted invite from {inviter}");
+                gs.log_msg("group", &format!("Accepted group invite from {inviter}"));
+            }
+        }
+
+        // POST /v1/group/decline: RoF2 has no working OP_GroupCancelInvite, so send a defensive
+        // OP_GroupDisband(self, self) cleanup instead.
+        if self.group_decline.lock().unwrap().take().is_some() {
+            if let Some(inviter) = gs.pending_invite.take() {
+                stream.send_app_packet(OP_GROUP_DISBAND, &build_group_disband(&gs.player_name, &gs.player_name));
+                tracing::info!("EQ: group: declined invite from {inviter}");
+                gs.log_msg("group", &format!("Declined group invite from {inviter}"));
+            }
+        }
+
+        // POST /v1/group/leave: send OP_GroupDisband(self, self). If leader with < 3 members this
+        // fully disbands the group server-side (no auto handoff — see Global Constraints).
+        if self.group_leave.lock().unwrap().take().is_some() {
+            stream.send_app_packet(OP_GROUP_DISBAND, &build_group_disband(&gs.player_name, &gs.player_name));
+            tracing::info!("EQ: group: left group");
+            gs.log_msg("group", "Left group");
+        }
+
+        // POST /v1/group/kick {"name":"X"}: send OP_GroupDisband(self, target). HTTP layer already
+        // validated leadership + membership before queuing this.
+        if let Some(target) = self.group_kick.lock().unwrap().take() {
+            stream.send_app_packet(OP_GROUP_DISBAND, &build_group_disband(&gs.player_name, &target));
+            tracing::info!("EQ: group: kicked {target}");
+            gs.log_msg("group", &format!("Kicked {target} from group"));
+        }
+
+        // POST /v1/group/makeleader {"name":"X"}: send OP_GroupMakeLeader.
+        if let Some(target) = self.group_make_leader.lock().unwrap().take() {
+            stream.send_app_packet(OP_GROUP_MAKE_LEADER, &build_group_make_leader(&gs.group_leader, &target));
+            tracing::info!("EQ: group: transferring leadership to {target}");
+            gs.log_msg("group", &format!("Transferred group leadership to {target}"));
+        }
+
         // Check zone-cross request — warp onto a zone line, then send OP_ZONE_CHANGE.
         let cross_req = self.zone_cross.lock().unwrap().take();
         if let Some(want_zone) = cross_req {
@@ -889,12 +1040,29 @@ impl Navigator {
             tracing::info!("EQ: auto-attack {}", if on { "ON" } else { "OFF" });
         }
 
-        // Cast a memorized spell gem on a target (current target, or self if none).
+        // Cast a memorized spell gem. Target priority: an explicit API target > the current target
+        // > self. `Some(0)` is not a real spawn (the "clear target" sentinel), so collapse it to
+        // "none" here or the self-fallback never fires. For BENEFICIAL spells (heals/buffs) that
+        // aren't aimed at a friendly target, cast on the caster instead of a hostile/stale mob —
+        // matching the real RoF2 client, which self-targets heals/buffs. (eqoxide#95)
         let cast_req = self.cast.lock().unwrap().take();
         if let Some(req) = cast_req {
             let spell_id = gs.mem_spells.get(req.gem as usize).copied().unwrap_or(0xFFFF_FFFF);
             if spell_id != 0xFFFF_FFFF {
-                let target = req.target_id.or(gs.target_id).unwrap_or(gs.player_id);
+                let explicit = req.target_id.filter(|&t| t != 0);
+                let current  = gs.target_id.filter(|&t| t != 0);
+                let mut target = explicit.or(current).unwrap_or(gs.player_id);
+                if let Some(db) = crate::spells::global() {
+                    if db.is_self_only(spell_id) {
+                        target = gs.player_id; // ST_SELF: always the caster
+                    } else if explicit.is_none() && db.is_beneficial(spell_id) {
+                        // Keep an explicitly-chosen friendly (PC) target for group heals; otherwise
+                        // (no target, cleared, or a hostile NPC) land the buff/heal on ourselves.
+                        let friendly = target == gs.player_id
+                            || gs.entities.get(&target).map_or(false, |e| !e.is_npc);
+                        if !friendly { target = gs.player_id; }
+                    }
+                }
                 stream.send_app_packet(OP_CAST_SPELL, &build_cast_packet(req.gem as u32, spell_id, target));
                 tracing::info!("EQ: cast gem={} spell={} target={}", req.gem, spell_id, target);
             } else {
@@ -930,9 +1098,14 @@ impl Navigator {
         let sit_req = self.sit.lock().unwrap().take();
         if let Some(sit) = sit_req {
             let param = if sit { 110u32 } else { 100u32 };
-            stream.send_app_packet(OP_SPAWN_APPEARANCE,
-                &build_spawn_appearance_packet(gs.player_id as u16, 14, param));
+            let payload = build_spawn_appearance_packet(gs.player_id as u16, 14, param);
+            stream.send_app_packet(OP_SPAWN_APPEARANCE, &payload);
             gs.sitting = sit;
+            // Bridge to the RENDER GameState so the player's OWN sit animation plays. A client-
+            // initiated sit sets only the nav-thread `gs.sitting`; the render loop reads its separate
+            // GameState, updated solely from `app_tx`. Mirror the appearance through a synthetic
+            // packet (apply_spawn_appearance), same pattern as the target/money bridges. (#53)
+            let _ = app_tx.send(AppPacket { opcode: OP_SPAWN_APPEARANCE, payload });
             tracing::info!("EQ: {}", if sit { "sit" } else { "stand" });
         }
 
@@ -1245,11 +1418,32 @@ impl Navigator {
             if self.goto_target.lock().unwrap().take().is_some() {
                 tracing::info!("NAV: player is dead — abandoning /goto");
             }
+            *self.goto_entity.lock().unwrap() = None; // drop any chase too
             self.path.clear();
             self.path_goal = None;
             self.path_i = 0;
             *self.nav_intent.lock().unwrap() = None; // stop driving the controller
             return;
+        }
+
+        // Chase (eqoxide#88): when /goto targets a named ENTITY, re-resolve its CURRENT position each
+        // tick and follow it, instead of pathing to a one-time snapshot. Roaming mobs move, and their
+        // client position is frozen (stale) until they come within the server's ~300u update range —
+        // so as the player approaches the stale spot and the mob enters range, its real position is
+        // revealed here and the walk homes in on it. If goto_target was cleared (WASD/warp/arrival)
+        // while a chase name lingers, the chase is over; if the entity left view, stop cleanly.
+        {
+            let chase = self.goto_entity.lock().unwrap().clone();
+            if let Some(name) = chase {
+                if self.goto_target.lock().unwrap().is_none() {
+                    *self.goto_entity.lock().unwrap() = None; // cancelled elsewhere
+                } else if let Some(&pos) = self.entity_positions.lock().unwrap().get(&name) {
+                    *self.goto_target.lock().unwrap() = Some(pos); // follow the entity's latest position
+                } else {
+                    *self.goto_target.lock().unwrap() = None; // entity despawned / left view
+                    *self.goto_entity.lock().unwrap() = None;
+                }
+            }
         }
 
         let goto = *self.goto_target.lock().unwrap(); // copy out so the lock is released
@@ -1636,6 +1830,90 @@ pub fn make_position_packet(spawn_id: u32, x: f32, y: f32, z: f32, heading: f32)
 mod tests {
     use super::*;
 
+    /// Build a minimal Navigator for unit tests that only exercise a single `sync_*`/tick method —
+    /// every other shared slot gets an empty/default placeholder.
+    fn test_navigator(group: crate::http::GroupShared) -> Navigator {
+        Navigator::new(
+            Default::default(), // goto_target
+            Default::default(), // goto_entity
+            Default::default(), // entity_positions
+            Default::default(), // entity_ids
+            Default::default(), // zone_points
+            Default::default(), // task_log
+            Default::default(), // task_offers_shared
+            Default::default(), // completed_tasks_shared
+            Default::default(), // accept_task
+            Default::default(), // cancel_task
+            group,               // group
+            Default::default(), // group_invite
+            Default::default(), // group_accept
+            Default::default(), // group_decline
+            Default::default(), // group_leave
+            Default::default(), // group_kick
+            Default::default(), // group_make_leader
+            Default::default(), // zone_cross
+            Default::default(), // warp
+            Default::default(), // hail
+            Default::default(), // say
+            Default::default(), // target
+            Default::default(), // attack
+            Default::default(), // buy
+            Default::default(), // sell
+            Default::default(), // trade
+            Default::default(), // merchant
+            Default::default(), // move_req
+            Default::default(), // give
+            Default::default(), // inventory
+            Default::default(), // loot
+            Default::default(), // door_click
+            Default::default(), // doors_shared
+            Default::default(), // messages
+            Default::default(), // chat_events
+            Default::default(), // chat_send
+            Default::default(), // cast
+            Default::default(), // mem_spell
+            Default::default(), // sit
+            Default::default(), // consider
+            Default::default(), // collision
+            std::path::PathBuf::new(), // maps_dir
+            Default::default(), // camp
+            Default::default(), // controller_view
+            Default::default(), // nav_intent
+            Default::default(), // pos_correction
+        )
+    }
+
+    #[test]
+    fn sync_group_publishes_own_and_other_member_hp_pct() {
+        use crate::game_state::{Entity, GroupMember};
+        let mut gs = GameState::new();
+        gs.player_name = "Aldric".into();
+        gs.hp_pct = 88.0;
+        gs.group_leader = "Aldric".into();
+        gs.group_members = vec![
+            GroupMember { name: "Aldric".into(), is_leader: true, level: 10, ..Default::default() },
+            GroupMember { name: "Sariel".into(), level: 8, ..Default::default() },
+        ];
+        gs.upsert_entity(Entity {
+            spawn_id: 99, name: "Sariel".into(), level: 8, is_npc: false,
+            x: 0.0, y: 0.0, z: 0.0, hp_pct: 42.0, cur_hp: 42, max_hp: 100, race: "HUM".into(),
+            heading: 0.0, dead: false, equipment: [0; 9], equipment_tint: [[0; 3]; 9],
+            gender: 0, helm: 0, showhelm: 0, face: 0, hairstyle: 0, haircolor: 0, animation: 100,
+        });
+
+        let group: crate::http::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::http::GroupSnapshot::default()));
+        let nav = test_navigator(group.clone());
+        nav.sync_group(&gs);
+
+        let snap = group.lock().unwrap();
+        assert_eq!(snap.leader, "Aldric");
+        assert!(snap.you_are_leader);
+        let aldric = snap.members.iter().find(|m| m.name == "Aldric").unwrap();
+        assert_eq!(aldric.hp_pct, 88.0); // own HP comes from gs.hp_pct, not gs.entities
+        let sariel = snap.members.iter().find(|m| m.name == "Sariel").unwrap();
+        assert_eq!(sariel.hp_pct, 42.0); // other member's HP comes from the matching Entity
+    }
+
     #[test]
     fn build_accept_new_task_layout() {
         let b = build_accept_new_task(42, 9001);
@@ -1650,6 +1928,46 @@ mod tests {
         assert_eq!(b.len(), 8);
         assert_eq!(u32::from_le_bytes([b[0], b[1], b[2], b[3]]), 3);
         assert_eq!(u32::from_le_bytes([b[4], b[5], b[6], b[7]]), 2); // TaskType::Quest
+    }
+
+    #[test]
+    fn build_group_invite_layout() {
+        let b = build_group_invite("Sariel", "Aldric");
+        assert_eq!(b.len(), 148);
+        assert_eq!(&b[0..6], b"Sariel");
+        assert_eq!(b[6], 0); // NUL after the name within the 64-byte field
+        assert_eq!(&b[64..70], b"Aldric");
+    }
+
+    #[test]
+    fn build_group_follow_layout() {
+        let b = build_group_follow("Aldric", "Sariel");
+        assert_eq!(b.len(), 152);
+        assert_eq!(&b[0..6], b"Aldric");
+        assert_eq!(&b[64..70], b"Sariel");
+    }
+
+    #[test]
+    fn build_group_disband_layout_is_148_bytes_confirmed_live() {
+        // CONFIRMED against a running EQEmu RoF2 zone server (task-6 live validation, 2026-07-01):
+        // the doc's inferred 128-byte COMMON GroupGeneric_Struct was wrong for this build — the
+        // server rejected it ("Wrong size on incoming [OP_GroupDisband] ... Got [128], expected
+        // [148]") and silently dropped leave/kick/decline packets. It wants the 148-byte
+        // RoF2-namespaced struct (name1[64], name2[64], 5 trailing zero uint32s), like GroupInvite.
+        let b = build_group_disband("Aldric", "Sariel");
+        assert_eq!(b.len(), 148);
+        assert_eq!(&b[0..6], b"Aldric");
+        assert_eq!(&b[64..70], b"Sariel");
+        assert!(b[128..148].iter().all(|&x| x == 0), "trailing 20 bytes (5 u32s) must be zero-filled");
+    }
+
+    #[test]
+    fn build_group_make_leader_layout() {
+        let b = build_group_make_leader("Aldric", "Sariel");
+        assert_eq!(b.len(), 456);
+        assert_eq!(&b[0..4], &0u32.to_le_bytes()); // Unknown000
+        assert_eq!(&b[4..10], b"Aldric");           // CurrentLeader @4
+        assert_eq!(&b[68..74], b"Sariel");          // NewLeader @68
     }
 
     #[test]

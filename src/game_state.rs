@@ -43,6 +43,8 @@ pub struct Entity {
     /// Hair style (from Spawn_Struct `hairstyle`).  0 = bald.  Rendered hair primitive
     /// has `eq_part_index == hairstyle` (when > 0).
     pub hairstyle: u8,
+    /// Hair color index (Spawn_Struct `haircolor`, 0-23). Runtime-tints synthetic hair shells only.
+    pub haircolor: u8,
     /// Server animation state (Animation::Standing=100, Sitting=110, Crouching=111, etc.)
     pub animation: u32,
 }
@@ -195,6 +197,21 @@ pub struct ChatLogEvent {
     pub text:     String,
 }
 
+/// One member of the player's current group (from OP_GroupUpdateB/OP_GroupUpdate/
+/// OP_GroupLeaderChange). `tank`/`assist`/`puller` are read-only role badges the server pushes —
+/// eqoxide does not expose a way to set them (v1 scope).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GroupMember {
+    pub name: String,
+    pub level: u32,
+    pub is_leader: bool,
+    pub is_merc: bool,
+    pub tank: bool,
+    pub assist: bool,
+    pub puller: bool,
+    pub offline: bool,
+}
+
 /// All state the renderer needs for one frame.
 #[derive(Debug, Default, Clone)]
 pub struct GameState {
@@ -214,6 +231,9 @@ pub struct GameState {
     pub player_face: u8,
     /// Player hair style (from PlayerProfile `hairstyle`, offset 00896). 0 = bald.
     pub player_hairstyle: u8,
+    /// Player hair color (PlayerProfile `haircolor`, offset 00888). Runtime-tints hair shells only.
+    /// (Player hair is not helm-hidden — the player's `showhelm` flag isn't tracked; NPCs are.)
+    pub player_haircolor: u8,
     pub player_action: String,
     pub hp_pct: f32,
     /// Player's absolute current/max HP (from OP_HP_UPDATE), used for the lethal-fall guard.
@@ -325,6 +345,11 @@ pub struct GameState {
     // Spellcasting / posture
     /// Memorized spell gem IDs (9 slots); 0xFFFF_FFFF = empty slot.
     pub mem_spells: [u32; 9],
+    /// Player skill values by skill id (0..77), from PlayerProfile `skills[]` (eqoxide#99).
+    /// 0 = untrained; empty until the first PlayerProfile arrives. Exposed via GET
+    /// /v1/observe/skills; the trainer raises these. (Vec, not `[u32; 77]`: arrays > 32 don't
+    /// derive Default/Serialize.)
+    pub player_skills: Vec<u32>,
     /// Active cast in progress (Some) or idle (None).
     pub casting: Option<CastState>,
     /// True when the player is sitting.
@@ -349,6 +374,15 @@ pub struct GameState {
     pub merchant_open: Option<u32>,
     /// Items the open merchant offers (cleared on close). From OP_ItemPacket(PacketType=Merchant).
     pub merchant_items: Vec<MerchantItem>,
+
+    /// Current group roster (empty = not grouped). Full-replaced by OP_GroupUpdateB, incrementally
+    /// updated by OP_GroupUpdate/OP_GroupDisbandOther/OP_GroupLeaderChange.
+    pub group_members: Vec<GroupMember>,
+    /// Current group leader's name ("" if unknown/not grouped).
+    pub group_leader: String,
+    /// Inviter's name while an incoming invite awaits accept/decline via POST
+    /// /v1/group/accept|decline. None when there's no open invite.
+    pub pending_invite: Option<String>,
 }
 
 impl GameState {
@@ -368,6 +402,18 @@ impl GameState {
             text: text.to_string(),
             timestamp: std::time::Instant::now(),
         });
+    }
+
+    /// Resolve a group member's real level. The RoF2 OP_GroupUpdateB packet carries a hardcoded
+    /// placeholder level (EQEmu's encoder writes 0x46=70 for the leader and 0x41=65 for every other
+    /// member — not the real value, eqoxide#104), so take the level from our own profile (self) or
+    /// the member's spawn in the entity list. Returns 0 (unknown) when the member isn't in the zone.
+    pub fn group_member_level(&self, name: &str) -> u32 {
+        if !self.player_name.is_empty() && name == self.player_name {
+            self.player_level
+        } else {
+            self.entities.values().find(|e| e.name == name).map(|e| e.level).unwrap_or(0)
+        }
     }
 
     /// Record an inter-agent chat event (tell/ooc/shout/group/gmsay) for the GET /events feed,
@@ -545,7 +591,7 @@ mod tests {
             heading: 0.0,
             dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
-            face: 0, hairstyle: 0,
+            face: 0, hairstyle: 0, haircolor: 0,
             animation: 0,
         }
     }
@@ -871,6 +917,21 @@ mod tests {
         assert_eq!(entry.task_id, 0);
         assert_eq!(entry.title, "");
         assert_eq!(entry.completed_time, 0);
+    }
+
+    #[test]
+    fn group_member_level_resolves_from_profile_and_entities() {
+        // OP_GroupUpdateB sends placeholder levels (70/65); the resolver ignores those and reads
+        // the real level from the profile (self) or the member's spawn (others). (eqoxide#104)
+        let mut gs = GameState::new();
+        gs.player_name = "Me".into();
+        gs.player_level = 12;
+        let mut ally = make_entity(2, "Ally", 0.0, 0.0, 0.0, false);
+        ally.level = 47;
+        gs.upsert_entity(ally);
+        assert_eq!(gs.group_member_level("Me"), 12, "self → player_level");
+        assert_eq!(gs.group_member_level("Ally"), 47, "other in zone → entity level");
+        assert_eq!(gs.group_member_level("OutOfZone"), 0, "unknown member → 0");
     }
 
     #[test]

@@ -33,6 +33,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_SIMPLE_MESSAGE       => apply_simple_message(gs, p),
         OP_EMOTE                => apply_emote(gs, p),
         OP_CONSIDER             => apply_consider(gs, p),
+        OP_SPAWN_APPEARANCE     => apply_spawn_appearance(gs, p),
         OP_SEND_ZONE_POINTS           => apply_zone_points(gs, p),
         OP_SPAWN_DOOR           => apply_spawn_doors(gs, p),
         OP_MOVE_DOOR            => apply_move_door(gs, p),
@@ -59,6 +60,13 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_TASK_ACTIVITY        => apply_task_activity(gs, p),
         OP_COMPLETED_TASKS      => apply_completed_tasks(gs, p),
         OP_TASK_SELECT_WINDOW   => apply_task_select_window(gs, p),
+        OP_GROUP_UPDATE_B       => apply_group_update_b(gs, p),
+        OP_GROUP_UPDATE         => apply_group_join(gs, p),
+        OP_GROUP_DISBAND_YOU    => apply_group_disband_you(gs, p),
+        OP_GROUP_DISBAND_OTHER  => apply_group_disband_other(gs, p),
+        OP_GROUP_LEADER_CHANGE  => apply_group_leader_change(gs, p),
+        OP_GROUP_INVITE         => apply_group_invite(gs, p),
+        OP_GROUP_ACKNOWLEDGE    => apply_group_acknowledge(gs, p),
         OP_CHAR_INVENTORY       => apply_char_inventory(gs, p),
         OP_ITEM_PACKET          => apply_item_packet(gs, p),
         OP_SHOP_REQUEST         => apply_shop_request(gs, p),
@@ -139,6 +147,29 @@ fn rd_u8(p: &[u8], off: &mut usize) -> u8 {
     let v = p[*off];
     *off += 1;
     v
+}
+
+/// Read a u16 LE at `*off`, advancing `off`. Returns 0 if out of bounds.
+fn rd_u16(p: &[u8], off: &mut usize) -> u16 {
+    if *off + 2 > p.len() { return 0; }
+    let v = u16::from_le_bytes([p[*off], p[*off + 1]]);
+    *off += 2;
+    v
+}
+
+/// Read a fixed-width `len`-byte field at `*off` as a string, stopping at the first embedded NUL
+/// (or the field's end if there isn't one), advancing `off` by exactly `len` regardless of the
+/// packet's actual length (clamped to `p.len()` so this never panics on a truncated packet). Used
+/// for the Group* structs' `name[64]`-style fixed fields, unlike `rd_cstr`'s variable-length
+/// NUL-terminated fields used by the Task-system packets.
+fn rd_fixed_cstr(p: &[u8], off: &mut usize, len: usize) -> String {
+    let start = (*off).min(p.len());
+    let end = (*off + len).min(p.len());
+    let slice = &p[start..end];
+    let nul = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+    let s = String::from_utf8_lossy(&slice[..nul]).into_owned();
+    *off += len;
+    s
 }
 
 /// Extract the display name from an EQ saylink. `EQ::SayLinkEngine::GenerateLink()` (EQEmu
@@ -229,6 +260,138 @@ fn apply_task_activity(gs: &mut GameState, p: &[u8]) {
         task.activities.push(act);
         task.activities.sort_by_key(|a| a.activity_id);
     }
+}
+
+// ── Group management (OP_GroupInvite / OP_GroupFollow / OP_GroupUpdate[B] / OP_GroupDisband* /
+// OP_GroupLeaderChange / OP_GroupAcknowledge) ───────────────────────────────────────────────────
+// Server-authoritative: every inbound packet here is the server confirming or announcing a group
+// change; eqoxide never applies a roster change locally before one of these arrives. See
+// docs/eq-technical-knowledgebase/group-protocol.md for full struct layouts and source citations.
+
+/// OP_GroupUpdateB — full personalized roster snapshot, sent at group founding and on refresh.
+/// Streamed/variable layout (mirrors OP_PlayerProfile's streaming quirk): header
+/// (group_id_or_unused: u32, member_count: u32, leader_name: cstr) then member_count records of
+/// (member_index: u32, member_name: cstr, is_merc_flag: u16, merc_owner_name: cstr, level: u32,
+/// tank_flag: u8, assist_flag: u8, puller_flag: u8, offline_flag: u32, timestamp: u32).
+/// Full-replaces gs.group_members/group_leader.
+fn apply_group_update_b(gs: &mut GameState, p: &[u8]) {
+    let mut o = 0usize;
+    let _group_id = rd_u32(p, &mut o);
+    let member_count = rd_u32(p, &mut o);
+    let leader_name = rd_cstr(p, &mut o);
+    let mut members = Vec::new();
+    for _ in 0..member_count {
+        if o >= p.len() { break; } // truncated packet — stop instead of reading zeroed garbage
+        let _member_index = rd_u32(p, &mut o);
+        let member_name = rd_cstr(p, &mut o);
+        let is_merc = rd_u16(p, &mut o) != 0;
+        let _merc_owner_name = rd_cstr(p, &mut o);
+        let level = rd_u32(p, &mut o);
+        let tank = rd_u8(p, &mut o) != 0;
+        let assist = rd_u8(p, &mut o) != 0;
+        let puller = rd_u8(p, &mut o) != 0;
+        let offline = rd_u32(p, &mut o) != 0;
+        let _timestamp = rd_u32(p, &mut o);
+        if member_name.is_empty() { continue; }
+        let is_leader = !leader_name.is_empty() && member_name == leader_name;
+        members.push(crate::game_state::GroupMember {
+            name: member_name, level, is_leader, is_merc, tank, assist, puller, offline,
+        });
+    }
+    gs.group_leader = leader_name;
+    gs.group_members = members;
+    gs.log_msg("group", "Group roster updated");
+}
+
+/// OP_GroupUpdate — an incremental "member joined" notice sent to EVERY existing member (EQEmu
+/// `Group::AddMember` queues it to all slots). RoF2 `GroupJoin_Struct` (148 bytes) uses FIXED-width
+/// char arrays, NOT NUL-terminated variable fields: owner_name[64]@0, membername[64]@64, merc u8@128,
+/// padding[3]@129, level u32@132, unknown[12]@136. Reading the names as sequential `rd_cstr` (as
+/// before) advanced only past owner_name's NUL — landing inside the zero padding — so membername came
+/// back EMPTY and the append was skipped, leaving existing members blind to later joiners (#101).
+fn apply_group_join(gs: &mut GameState, p: &[u8]) {
+    let mut o = 0usize;
+    let _owner_name = rd_fixed_cstr(p, &mut o, 64);
+    let member_name = rd_fixed_cstr(p, &mut o, 64);
+    let is_merc = rd_u8(p, &mut o) != 0;
+    o += 3; // padding
+    let level = rd_u32(p, &mut o);
+    if member_name.is_empty() { return; }
+    if gs.group_members.iter().any(|m| m.name == member_name) { return; } // already known
+    gs.group_members.push(crate::game_state::GroupMember {
+        name: member_name.clone(), level, is_merc, ..Default::default()
+    });
+    gs.push_event("group", "member_joined", &member_name, false, &format!("{member_name} joined the group"));
+    gs.log_msg("group", &format!("{member_name} joined the group"));
+}
+
+/// OP_GroupDisbandYou — the server telling US we left/were kicked/the group disbanded. 148-byte
+/// common GroupGeneric_Struct, but we don't need its fields — the opcode alone means "clear
+/// everything".
+fn apply_group_disband_you(gs: &mut GameState, _p: &[u8]) {
+    gs.group_members.clear();
+    gs.group_leader.clear();
+    gs.pending_invite = None;
+    gs.push_event("group", "disbanded", "", true, "You are no longer in a group");
+    gs.log_msg("group", "Group disbanded");
+}
+
+/// OP_GroupDisbandOther — someone else left/was removed. 148-byte common GroupGeneric_Struct:
+/// name1[64], name2[64]. Which field carries the departing member isn't documented in the
+/// decompile; we defensively remove whichever of the two names is a CURRENT roster member (and
+/// no-op with a warning if neither matches) rather than guessing wrong and corrupting state.
+fn apply_group_disband_other(gs: &mut GameState, p: &[u8]) {
+    let mut o = 0usize;
+    let name1 = rd_fixed_cstr(p, &mut o, 64);
+    let name2 = rd_fixed_cstr(p, &mut o, 64);
+    let removed = if gs.group_members.iter().any(|m| m.name == name1) {
+        Some(name1.clone())
+    } else if gs.group_members.iter().any(|m| m.name == name2) {
+        Some(name2.clone())
+    } else {
+        None
+    };
+    match removed {
+        Some(name) => {
+            gs.group_members.retain(|m| m.name != name);
+            gs.push_event("group", "member_left", &name, false, &format!("{name} left the group"));
+            gs.log_msg("group", &format!("{name} left the group"));
+        }
+        None => tracing::warn!("EQ: OP_GroupDisbandOther: neither '{name1}' nor '{name2}' matched a current group member"),
+    }
+}
+
+/// OP_GroupLeaderChange — leader name push. 148-byte common struct: Unknown000[64],
+/// LeaderName[64], Unknown128[20].
+fn apply_group_leader_change(gs: &mut GameState, p: &[u8]) {
+    let mut o = 64usize; // skip Unknown000[64]
+    let leader_name = rd_fixed_cstr(p, &mut o, 64);
+    if leader_name.is_empty() { return; }
+    gs.group_leader = leader_name.clone();
+    for m in gs.group_members.iter_mut() {
+        m.is_leader = m.name == leader_name;
+    }
+    gs.push_event("group", "leader_changed", &leader_name, false, &format!("{leader_name} is now the group leader"));
+    gs.log_msg("group", &format!("{leader_name} is now the group leader"));
+}
+
+/// OP_GroupInvite (received) — 148-byte GroupInvite_Struct: invitee_name[64], inviter_name[64],
+/// then 5 unknown/zero-filled u32s. Only acts when we are the invitee (should always be true for
+/// an inbound invite, but guards against a stray/misrouted packet).
+fn apply_group_invite(gs: &mut GameState, p: &[u8]) {
+    let mut o = 0usize;
+    let invitee_name = rd_fixed_cstr(p, &mut o, 64);
+    let inviter_name = rd_fixed_cstr(p, &mut o, 64);
+    if invitee_name != gs.player_name { return; }
+    gs.pending_invite = Some(inviter_name.clone());
+    gs.push_event("group", "invite_received", &inviter_name, true, &format!("{inviter_name} invited you to a group"));
+    gs.log_msg("group", &format!("{inviter_name} invited you to a group"));
+}
+
+/// OP_GroupAcknowledge — 4-byte, no fields. Server→client only; purely a "you joined" UI trigger.
+fn apply_group_acknowledge(gs: &mut GameState, _p: &[u8]) {
+    gs.push_event("group", "joined", "", true, "You have joined the group");
+    gs.log_msg("group", "Joined group");
 }
 
 // ── Inventory (OP_CharInventory / OP_ItemPacket) ────────────────────────────────────────────────
@@ -777,8 +940,9 @@ fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
     if payload.len() >= 899 {
         gs.player_hairstyle = payload[896];
         gs.player_face      = payload[898];
-        tracing::debug!("EQ: PlayerProfile: face={} hairstyle={}",
-            gs.player_face, gs.player_hairstyle);
+        gs.player_haircolor = payload[888]; // rof2 PlayerProfile_Struct /*00888*/ haircolor (u8)
+        tracing::debug!("EQ: PlayerProfile: face={} hairstyle={} haircolor={}",
+            gs.player_face, gs.player_hairstyle, gs.player_haircolor);
     }
 
     // ── Equipment materials @184 + i*20, tints @812 + i*4 ──────────────────────
@@ -804,6 +968,18 @@ fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
             }
         }
     }
+
+    // ── Skills @04616 (rof2 PlayerProfile_Struct skills[100]) ──────────────────────
+    // Only the first NUM_SKILLS ids are real; the rest is wire padding. Exposed via
+    // GET /v1/observe/skills and raised by the trainer API (eqoxide#99).
+    let mut sk = vec![0u32; crate::skills::NUM_SKILLS];
+    for (i, slot) in sk.iter_mut().enumerate() {
+        let so = 4616 + i * 4;
+        if so + 4 <= payload.len() {
+            *slot = u32_at(so);
+        }
+    }
+    gs.player_skills = sk;
 }
 
 pub fn apply_begin_cast(gs: &mut GameState, p: &[u8]) {
@@ -1171,6 +1347,27 @@ fn apply_consider(gs: &mut GameState, payload: &[u8]) {
     gs.log_msg("combat", &msg);
 }
 
+/// OP_SpawnAppearance render-side handler: `{ id: u16, kind: u16, param: u32 }`.
+///
+/// We only consume the ANIMATION appearance (kind 14) for OUR OWN player, mapping param 110→sitting,
+/// 100→standing. A client-initiated sit/stand is issued on the nav thread, which sets the *nav*
+/// GameState's `sitting` and mirrors the same appearance packet here through `app_tx` (like the
+/// target/money bridges) — without this handler the render GameState's `sitting` never flips, so the
+/// player's own sit animation never plays (#53, the two-GameState split). Server broadcasts of the
+/// same opcode also land here. Other kinds / other spawns are ignored (their pose comes from spawn
+/// and scene state).
+fn apply_spawn_appearance(gs: &mut GameState, payload: &[u8]) {
+    if payload.len() < 8 { return; }
+    let id    = u16::from_le_bytes([payload[0], payload[1]]) as u32;
+    let kind  = u16::from_le_bytes([payload[2], payload[3]]);
+    let param = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    const ANIMATION: u16 = 14;
+    const SITTING:   u32 = 110;
+    if kind == ANIMATION && id == gs.player_id {
+        gs.sitting = param == SITTING;
+    }
+}
+
 /// OP_SpecialMesg — NPC dialogue / emotes, where quest text arrives.
 /// SpecialMesg_Struct: header[3] + msg_type(u32) + target_spawn_id(u32) +
 /// sayer(null-terminated, variable) + unknown[12] + message(null-terminated).
@@ -1424,6 +1621,7 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
         showhelm:       info.show_helm as u8,
         face:           info.face,
         hairstyle:      info.hairstyle,
+        haircolor:      info.haircolor,
         animation:      info.stand_state as u32,
     });
 }
@@ -1432,9 +1630,11 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
 mod tests {
     use super::{apply_emote, apply_death, class_name, con_color, consider_message, parse_player_profile,
                 parse_begin_cast, parse_memorize_spell, apply_char_inventory,
-                apply_money_update, apply_money_on_corpse, apply_set_target,
+                apply_money_update, apply_money_on_corpse, apply_set_target, apply_spawn_appearance,
                 extract_saylink_text, apply_task_description, apply_completed_tasks, apply_task_select_window,
-                strip_say_links, SAY_LINK_BODY_SIZE, SIZE_DEATH};
+                strip_say_links, SAY_LINK_BODY_SIZE, SIZE_DEATH,
+                rd_u16, rd_fixed_cstr, apply_group_update_b, apply_group_join, apply_group_disband_you,
+                apply_group_disband_other, apply_group_leader_change, apply_group_invite, apply_group_acknowledge};
     use crate::game_state::{GameState, Entity, TaskStatus};
 
     /// Build a RoF2 saylink: 0x12 + 56-char body + display text + 0x12.
@@ -1519,7 +1719,7 @@ mod tests {
             x: 0.0, y: 0.0, z: 0.0, hp_pct, cur_hp: 100, max_hp: 100,
             race: String::new(), heading: 0.0, dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
-            face: 0, hairstyle: 0, animation: 0,
+            face: 0, hairstyle: 0, haircolor: 0, animation: 0,
         }
     }
 
@@ -1582,6 +1782,24 @@ mod tests {
         assert_eq!(gs.inventory.iter().find(|x| x.item_id == 9131).unwrap().slot, 26,
             "new loot goes to the first free general slot");
         assert_eq!(gs.inventory.len(), 4);
+    }
+
+    #[test]
+    fn apply_spawn_appearance_toggles_player_sitting() {
+        // The synthetic bridge (nav -> render gs) for a client-initiated sit must flip the RENDER
+        // gs.sitting so the player's own sit animation plays. (eqoxide#53, two-GameState split)
+        let mut gs = GameState::new();
+        gs.player_id = 77;
+        // kind 14 (Animation), param 110 (sit) for our own id -> sitting.
+        apply_spawn_appearance(&mut gs, &crate::eq_net::navigation::build_spawn_appearance_packet(77, 14, 110));
+        assert!(gs.sitting, "sit appearance for our player must set render sitting");
+        // param 100 (stand) -> not sitting.
+        apply_spawn_appearance(&mut gs, &crate::eq_net::navigation::build_spawn_appearance_packet(77, 14, 100));
+        assert!(!gs.sitting, "stand appearance clears render sitting");
+        // Another spawn's sit must NOT change our flag.
+        apply_spawn_appearance(&mut gs, &crate::eq_net::navigation::build_spawn_appearance_packet(77, 14, 110));
+        apply_spawn_appearance(&mut gs, &crate::eq_net::navigation::build_spawn_appearance_packet(999, 14, 100));
+        assert!(gs.sitting, "another spawn's stand must not clear our sitting");
     }
 
     #[test]
@@ -1862,7 +2080,7 @@ mod tests {
         let info = SpawnInfo {
             spawn_id: 42, name: "a".into(), last_name: String::new(),
             level: 5, npc: 1, gender: 0, race: 54, class_: 1, body_type: 1,
-            cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, stand_state: 100,
+            cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0, stand_state: 100,
             pet_owner_id: 0, player_state: 64,
             x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100,
             equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9],
@@ -1954,7 +2172,7 @@ mod tests {
         let info = SpawnInfo {
             spawn_id: 7, name: "Orc".into(), last_name: String::new(),
             level: 10, npc: 1, gender: 1, race: 54, class_: 1, body_type: 1,
-            cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, stand_state: 100,
+            cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0, stand_state: 100,
             pet_owner_id: 0, player_state: 64,
             x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100,
             equipment, equipment_tint,
@@ -2550,7 +2768,7 @@ mod tests {
             dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9],
             helm: 0, showhelm: 0,
-            face: 0, hairstyle: 0,
+            face: 0, hairstyle: 0, haircolor: 0,
         });
         // Build a 32-byte Death_Struct payload: spawn_id=42, killer_id=1 (player)
         let mut pkt = [0u8; 32];
@@ -2614,5 +2832,179 @@ mod tests {
         apply_death(&mut gs, &pkt);
         assert_eq!(gs.hp_pct, 0.0, "player hp_pct must be zeroed on self-death");
         assert!(gs.entities.is_empty(), "entities map must be untouched on player self-death");
+    }
+
+    fn build_group_update_b(leader: &str, members: &[(&str, u32, bool, bool, bool, bool, bool)]) -> Vec<u8> {
+        // members: (name, level, is_merc, tank, assist, puller, offline)
+        let mut p = Vec::new();
+        p.extend_from_slice(&0u32.to_le_bytes()); // group_id_or_unused
+        p.extend_from_slice(&(members.len() as u32).to_le_bytes());
+        p.extend_from_slice(leader.as_bytes()); p.push(0);
+        for (name, level, is_merc, tank, assist, puller, offline) in members {
+            p.extend_from_slice(&0u32.to_le_bytes()); // member_index
+            p.extend_from_slice(name.as_bytes()); p.push(0);
+            p.extend_from_slice(&(*is_merc as u16).to_le_bytes());
+            p.push(0); // merc_owner_name (empty cstr)
+            p.extend_from_slice(&level.to_le_bytes());
+            p.push(*tank as u8);
+            p.push(*assist as u8);
+            p.push(*puller as u8);
+            p.extend_from_slice(&(*offline as u32).to_le_bytes());
+            p.extend_from_slice(&0u32.to_le_bytes()); // timestamp
+        }
+        p
+    }
+
+    #[test]
+    fn apply_group_update_b_replaces_roster_and_marks_leader() {
+        let mut gs = GameState::new();
+        let p = build_group_update_b("Aldric", &[
+            ("Aldric", 10, false, true, false, false, false),
+            ("Sariel", 8, false, false, true, false, false),
+        ]);
+        apply_group_update_b(&mut gs, &p);
+        assert_eq!(gs.group_leader, "Aldric");
+        assert_eq!(gs.group_members.len(), 2);
+        let aldric = gs.group_members.iter().find(|m| m.name == "Aldric").unwrap();
+        assert!(aldric.is_leader);
+        assert!(aldric.tank);
+        assert_eq!(aldric.level, 10);
+        let sariel = gs.group_members.iter().find(|m| m.name == "Sariel").unwrap();
+        assert!(!sariel.is_leader);
+        assert!(sariel.assist);
+    }
+
+    #[test]
+    fn apply_group_update_b_handles_truncated_packet_without_panicking() {
+        let mut gs = GameState::new();
+        let p = 5u32.to_le_bytes().to_vec(); // claims 5 members but buffer ends immediately
+        apply_group_update_b(&mut gs, &p);
+        assert!(gs.group_members.iter().all(|m| m.name.is_empty()) || gs.group_members.len() <= 5);
+    }
+
+    // Build the REAL RoF2 GroupJoin_Struct wire (148 bytes): fixed char[64] name fields, not cstrs.
+    fn build_group_join(owner: &str, member: &str, level: u32) -> Vec<u8> {
+        let mut p = vec![0u8; 148];
+        let o = owner.as_bytes();
+        p[0..o.len().min(63)].copy_from_slice(&o[..o.len().min(63)]);   // owner_name[64] @ 0
+        let m = member.as_bytes();
+        p[64..64 + m.len().min(63)].copy_from_slice(&m[..m.len().min(63)]); // membername[64] @ 64
+        // merc @128 = 0; padding @129..132; level @132
+        p[132..136].copy_from_slice(&level.to_le_bytes());
+        p
+    }
+
+    #[test]
+    fn apply_group_join_appends_new_member_once() {
+        let mut gs = GameState::new();
+        let p = build_group_join("Aldric", "Sariel", 8);
+        apply_group_join(&mut gs, &p);
+        apply_group_join(&mut gs, &p); // duplicate arrival must not double-add
+        assert_eq!(gs.group_members.len(), 1);
+        assert_eq!(gs.group_members[0].name, "Sariel");
+        assert_eq!(gs.group_members[0].level, 8);
+    }
+
+    #[test]
+    fn existing_member_learns_about_a_later_joiner() {
+        // The #101 desync: an already-present member (Elaria, who joined with a {Sylvaris, Elaria}
+        // roster) receives OP_GroupUpdate when Fenwick joins later. With the fixed-offset parse she
+        // must append Fenwick; the old sequential-cstr parse read an empty name and dropped it,
+        // leaving her blind to everyone who joined after her.
+        let mut gs = GameState::new();
+        gs.group_members = vec![
+            crate::game_state::GroupMember { name: "Sylvaris".into(), is_leader: true, ..Default::default() },
+            crate::game_state::GroupMember { name: "Elaria".into(), ..Default::default() },
+        ];
+        apply_group_join(&mut gs, &build_group_join("Sylvaris", "Fenwick", 12));
+        let names: Vec<_> = gs.group_members.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"Fenwick"), "existing member must learn the later joiner: {names:?}");
+        assert_eq!(gs.group_members.len(), 3);
+        assert_eq!(gs.group_members.iter().find(|m| m.name == "Fenwick").unwrap().level, 12);
+    }
+
+    fn fixed_name_pair(name1: &str, name2: &str) -> Vec<u8> {
+        let mut p = vec![0u8; 128];
+        let n1 = name1.as_bytes();
+        p[0..n1.len()].copy_from_slice(n1);
+        let n2 = name2.as_bytes();
+        p[64..64 + n2.len()].copy_from_slice(n2);
+        p
+    }
+
+    #[test]
+    fn apply_group_disband_other_removes_whichever_name_is_a_current_member() {
+        let mut gs = GameState::new();
+        gs.group_members.push(crate::game_state::GroupMember { name: "Sariel".into(), ..Default::default() });
+        gs.group_members.push(crate::game_state::GroupMember { name: "Aldric".into(), ..Default::default() });
+        // name1 = the departing member, name2 = something unrelated.
+        let p = fixed_name_pair("Sariel", "Unrelated");
+        apply_group_disband_other(&mut gs, &p);
+        assert_eq!(gs.group_members.len(), 1);
+        assert_eq!(gs.group_members[0].name, "Aldric");
+    }
+
+    #[test]
+    fn apply_group_disband_other_no_op_when_neither_name_matches() {
+        let mut gs = GameState::new();
+        gs.group_members.push(crate::game_state::GroupMember { name: "Aldric".into(), ..Default::default() });
+        let p = fixed_name_pair("Nobody", "AlsoNobody");
+        apply_group_disband_other(&mut gs, &p);
+        assert_eq!(gs.group_members.len(), 1);
+    }
+
+    #[test]
+    fn apply_group_disband_you_clears_group_state() {
+        let mut gs = GameState::new();
+        gs.group_members.push(crate::game_state::GroupMember { name: "Aldric".into(), ..Default::default() });
+        gs.group_leader = "Aldric".into();
+        gs.pending_invite = Some("Someone".into());
+        apply_group_disband_you(&mut gs, &[]);
+        assert!(gs.group_members.is_empty());
+        assert!(gs.group_leader.is_empty());
+        assert!(gs.pending_invite.is_none());
+    }
+
+    #[test]
+    fn apply_group_leader_change_updates_leader_and_flags() {
+        let mut gs = GameState::new();
+        gs.group_members.push(crate::game_state::GroupMember { name: "Aldric".into(), is_leader: true, ..Default::default() });
+        gs.group_members.push(crate::game_state::GroupMember { name: "Sariel".into(), ..Default::default() });
+        let mut p = vec![0u8; 148];
+        let name = b"Sariel";
+        p[64..64 + name.len()].copy_from_slice(name); // LeaderName at offset 64
+        apply_group_leader_change(&mut gs, &p);
+        assert_eq!(gs.group_leader, "Sariel");
+        assert!(gs.group_members.iter().find(|m| m.name == "Sariel").unwrap().is_leader);
+        assert!(!gs.group_members.iter().find(|m| m.name == "Aldric").unwrap().is_leader);
+    }
+
+    #[test]
+    fn apply_group_invite_sets_pending_invite_when_addressed_to_us() {
+        let mut gs = GameState::new();
+        gs.player_name = "Aldric".into();
+        let mut p = vec![0u8; 148];
+        p[0..6].copy_from_slice(b"Aldric");
+        p[64..70].copy_from_slice(b"Sariel");
+        apply_group_invite(&mut gs, &p);
+        assert_eq!(gs.pending_invite, Some("Sariel".to_string()));
+        assert_eq!(gs.chat_events.back().unwrap().kind, "invite_received");
+    }
+
+    #[test]
+    fn apply_group_invite_ignores_invite_addressed_to_someone_else() {
+        let mut gs = GameState::new();
+        gs.player_name = "Aldric".into();
+        let mut p = vec![0u8; 148];
+        p[0..6].copy_from_slice(b"Sariel"); // invitee is someone else
+        apply_group_invite(&mut gs, &p);
+        assert!(gs.pending_invite.is_none());
+    }
+
+    #[test]
+    fn apply_group_acknowledge_pushes_joined_event() {
+        let mut gs = GameState::new();
+        apply_group_acknowledge(&mut gs, &[]);
+        assert_eq!(gs.chat_events.back().unwrap().kind, "joined");
     }
 }
