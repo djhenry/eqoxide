@@ -784,6 +784,7 @@ impl App {
             let pos = if self.camera_initialized { self.controller.pos } else { [gs.player_x, gs.player_y, gs.player_z] };
             let h_cw = crate::eq_net::protocol::ccw_to_cw(gs.player_heading);
             *self.player_info.lock().unwrap() = crate::http::PlayerState {
+                name:       gs.player_name.clone(),
                 zone:       gs.zone_name.clone(),
                 race:       gs.player_race.clone(),
                 class:      gs.player_class.clone(),
