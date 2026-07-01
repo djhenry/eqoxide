@@ -350,6 +350,12 @@ pub struct GameState {
     /// /v1/observe/skills; the trainer raises these. (Vec, not `[u32; 77]`: arrays > 32 don't
     /// derive Default/Serialize.)
     pub player_skills: Vec<u32>,
+    /// Open guildmaster-training window: the trainer NPC's spawn id, set when the server replies to
+    /// OP_GMTraining, cleared on close. `None` = no trainer window open (eqoxide#99).
+    pub trainer_open: Option<u32>,
+    /// Skill CAPS the open trainer offers, by skill id (0..77), from the OP_GMTraining reply's
+    /// `skills[]`. `cap == 0` = the class can't train that skill here; trainable = cap > current.
+    pub trainer_skills: Vec<u32>,
     /// Active cast in progress (Some) or idle (None).
     pub casting: Option<CastState>,
     /// True when the player is sitting.

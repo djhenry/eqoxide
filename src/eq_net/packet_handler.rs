@@ -60,6 +60,8 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_TASK_ACTIVITY        => apply_task_activity(gs, p),
         OP_COMPLETED_TASKS      => apply_completed_tasks(gs, p),
         OP_TASK_SELECT_WINDOW   => apply_task_select_window(gs, p),
+        OP_GM_TRAINING          => apply_gm_training(gs, p),
+        OP_SKILL_UPDATE         => apply_skill_update(gs, p),
         OP_GROUP_UPDATE_B       => apply_group_update_b(gs, p),
         OP_GROUP_UPDATE         => apply_group_join(gs, p),
         OP_GROUP_DISBAND_YOU    => apply_group_disband_you(gs, p),
@@ -369,6 +371,39 @@ fn apply_group_leader_change(gs: &mut GameState, p: &[u8]) {
     }
     gs.push_event("group", "leader_changed", &leader_name, false, &format!("{leader_name} is now the group leader"));
     gs.log_msg("group", &format!("{leader_name} is now the group leader"));
+}
+
+/// OP_GMTraining reply — the guildmaster's offered skill CAPS. GMTrainee_Struct: npcid u32@0,
+/// playerid u32@4, then `skills[100]` u32 @8 = the value the trainer will raise each skill to
+/// (0 = the class can't train it here). Opens the training window; trainable = cap > current
+/// (eqoxide#99). The client sent all-zero skills; the server overwrote them with the caps.
+fn apply_gm_training(gs: &mut GameState, p: &[u8]) {
+    if p.len() < 8 { return; }
+    let npcid = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+    let mut caps = vec![0u32; crate::skills::NUM_SKILLS];
+    for (i, c) in caps.iter_mut().enumerate() {
+        let o = 8 + i * 4;
+        if o + 4 <= p.len() { *c = u32::from_le_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]]); }
+    }
+    gs.trainer_open = Some(npcid);
+    gs.trainer_skills = caps;
+    gs.log_msg("trainer", "Training window opened");
+}
+
+/// OP_SkillUpdate — one skill's new value (after training or skill-ups). SkillUpdate_Struct:
+/// skillId u32@0, value u32@4. Reflects the change into gs.player_skills so /v1/observe/skills and
+/// /v1/trainer/list stay current (eqoxide#99).
+fn apply_skill_update(gs: &mut GameState, p: &[u8]) {
+    if p.len() < 8 { return; }
+    let id = u32::from_le_bytes([p[0], p[1], p[2], p[3]]) as usize;
+    let val = u32::from_le_bytes([p[4], p[5], p[6], p[7]]);
+    if gs.player_skills.len() < crate::skills::NUM_SKILLS {
+        gs.player_skills = vec![0u32; crate::skills::NUM_SKILLS];
+    }
+    if id < gs.player_skills.len() {
+        gs.player_skills[id] = val;
+        gs.log_msg("trainer", &format!("Skill {} raised to {}", crate::skills::skill_name(id as u32).unwrap_or("?"), val));
+    }
 }
 
 /// OP_GroupInvite (received) — 148-byte GroupInvite_Struct: invitee_name[64], inviter_name[64],

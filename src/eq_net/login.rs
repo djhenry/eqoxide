@@ -79,6 +79,8 @@ pub async fn run_login_flow(
     cancel_task:           CancelTaskReq,
     group:             crate::http::GroupShared,
     group_invite:      crate::http::GroupInviteReq,
+    trainer_open_req:  crate::http::TrainerOpenReq,
+    trainer_train_req: crate::http::TrainerTrainReq,
     group_accept:      crate::http::GroupAcceptReq,
     group_decline:     crate::http::GroupDeclineReq,
     group_leave:       crate::http::GroupLeaveReq,
@@ -143,7 +145,7 @@ pub async fn run_login_flow(
                     tracing::info!("NAV: {} zone points seeded", gs.zone_points.len());
                 }
                 let char_name = config.character_name.clone();
-                let navigator = Navigator::new(goto_target, goto_entity, entity_positions, entity_ids, zone_points, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, group_accept, group_decline, group_leave, group_kick, group_make_leader, zone_cross, warp, hail, say, target, attack, buy, sell, trade, merchant, move_req, give, inventory, loot, door_click, doors_shared, messages, chat_events, chat_send, cast, mem_spell, sit, consider, collision, maps_dir, camp.clone(), controller_view, nav_intent, pos_correction);
+                let navigator = Navigator::new(goto_target, goto_entity, entity_positions, entity_ids, zone_points, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, zone_cross, warp, hail, say, target, attack, buy, sell, trade, merchant, move_req, give, inventory, loot, door_click, doors_shared, messages, chat_events, chat_send, cast, mem_spell, sit, consider, collision, maps_dir, camp.clone(), controller_view, nav_intent, pos_correction);
                 run_gameplay_phase(stream, net_rx, app_tx, gs, char_name, navigator, world_creds, shutdown.clone(), camp.clone(), camp_until.clone()).await;
                 return Ok(());
             }
