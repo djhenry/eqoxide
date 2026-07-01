@@ -757,7 +757,7 @@ pub const SIZE_DEATH: usize = 32;       // Death_S
 pub const SIZE_ZONE_POINT_ENTRY: usize = 32; // RoF2 ZonePoint_Entry (was 24 — misaligned)
 pub const SIZE_SPAWN_APPEARANCE: usize = 8; // SpawnAppearance_S
 pub const SIZE_CONSIDER: usize = 32;     // Consider_S
-pub const SIZE_EXP_UPDATE: usize = 4;   // ExpUpdate_S
+pub const SIZE_EXP_UPDATE: usize = 8;   // ExpUpdate_S (exp + aaxp)
 pub const SIZE_LEVEL_UPDATE: usize = 12; // LevelUpdate_S
 pub const SIZE_MONEY_ON_CORPSE: usize = 20; // MoneyOnCorpse_S
 pub const SIZE_ZONE_CHANGE: usize = 100;  // RoF2 ZoneChange_Struct (was 88; success@92)
@@ -1312,11 +1312,17 @@ pub struct Consider_S {
     pub unknown3: [u8; 3],
 }
 
-/// Experience update (4 bytes).
+/// Experience update (8 bytes), RoF2 `ExpUpdate_Struct`
+/// (`common/eq_packet_structs.h`). `exp` is progress through the *current* level
+/// as a ratio out of 330 — the server computes it as
+/// `330 * (m_pp.exp - EXPForLevel(lvl)) / (EXPForLevel(lvl+1) - EXPForLevel(lvl))`
+/// (`Client::SendExpZonein` / `Client::SetEXP`). `aaxp` is AA experience, unused
+/// here. Convert to a 0-100 percentage with `exp / 330 * 100`. See eqoxide#48.
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
 pub struct ExpUpdate_S {
     pub exp: u32,
+    pub aaxp: u32,
 }
 
 /// Level update (12 bytes).
