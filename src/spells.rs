@@ -2,14 +2,22 @@
 //! map an icon index to a sprite-sheet cell. Used to label/icon the memorized spell gems.
 
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 pub const ICON_COLS: usize = 6; // per-sheet grid; confirmed visually in Task 9
 pub const ICON_ROWS: usize = 6;
 const ICONS_PER_SHEET: usize = ICON_COLS * ICON_ROWS;
 
+/// SpellTargetType (EQEmu common/spdat.h) value for a self-only spell — always lands on the caster.
+pub const ST_SELF: u8 = 6;
+
 pub struct SpellInfo {
     pub name: String,
     pub icon_id: u32,
+    /// good_effect (spells_us.txt col 83): 0 = detrimental, 1 = beneficial, 2 = beneficial group-only.
+    pub good_effect: i8,
+    /// SpellTargetType (col 98): who the spell can be cast on (ST_SELF=6, ST_Target=5, ST_Group=41…).
+    pub target_type: u8,
 }
 
 #[derive(Default)]
@@ -17,8 +25,29 @@ pub struct SpellDb {
     by_id: HashMap<u32, SpellInfo>,
 }
 
+/// Process-global spell table, set once at startup (mirrors the eqstr table). Lets the nav thread
+/// resolve a spell's target type for self-cast decisions without threading the Arc through the
+/// login → Navigator arg chain. (eqoxide#95)
+static GLOBAL: OnceLock<Arc<SpellDb>> = OnceLock::new();
+
+/// Publish the loaded spell table globally (idempotent — first call wins).
+pub fn set_global(db: Arc<SpellDb>) { let _ = GLOBAL.set(db); }
+
+/// The global spell table, or `None` if it wasn't loaded (e.g. missing spells_us.txt).
+pub fn global() -> Option<&'static Arc<SpellDb>> { GLOBAL.get() }
+
 impl SpellDb {
     pub fn empty() -> Self { Self::default() }
+
+    /// A self-only spell (ST_SELF) always targets the caster, regardless of the current target.
+    pub fn is_self_only(&self, id: u32) -> bool {
+        self.get(id).map_or(false, |s| s.target_type == ST_SELF)
+    }
+
+    /// Beneficial spells (heals/buffs) should land on a friendly target (or self), never a mob.
+    pub fn is_beneficial(&self, id: u32) -> bool {
+        self.get(id).map_or(false, |s| s.good_effect != 0)
+    }
 
     /// Load from a `spells_us.txt` path. Missing/unreadable file → empty db (graceful).
     /// Classic EQ `spells_us.txt` is Latin-1/Windows-1252 (accented spell names), NOT UTF-8, so a
@@ -42,7 +71,12 @@ impl SpellDb {
             let id: u32 = match cols[0].trim().parse() { Ok(n) if n != 0 => n, _ => continue };
             let name = cols[1].trim().to_string();
             let icon_id = cols[144].trim().parse().unwrap_or(0);
-            by_id.insert(id, SpellInfo { name, icon_id });
+            // col 83 = good_effect (beneficial flag), col 98 = target_type (EQEmu spdat.h field
+            // ordinals, same numbering as col144=new_icon). Default to detrimental/target on parse
+            // failure so an unknown spell keeps the old current-target behavior. (eqoxide#95)
+            let good_effect = cols[83].trim().parse().unwrap_or(0);
+            let target_type = cols[98].trim().parse().unwrap_or(0);
+            by_id.insert(id, SpellInfo { name, icon_id, good_effect, target_type });
         }
         Self { by_id }
     }
@@ -90,6 +124,25 @@ mod tests {
         assert_eq!(db.get(200).map(|s| s.icon_id), Some(35));
         assert_eq!(db.get(5).map(|s| s.name.as_str()), Some("Cloak"));
         assert!(db.get(0).is_none(), "zero-id lines are skipped");
+    }
+
+    #[test]
+    fn parses_good_effect_and_target_type_for_self_cast() {
+        // col83 = good_effect, col98 = target_type (ST_SELF=6, ST_Target=5).
+        let mut heal = vec!["0"; 150];         // Minor Healing: beneficial, single-target friendly
+        heal[0] = "200"; heal[1] = "Minor Healing"; heal[83] = "1"; heal[98] = "5"; heal[144] = "35";
+        let mut skin = vec!["0"; 150];         // Skin like Wood: beneficial, self-only
+        skin[0] = "26"; skin[1] = "Skin like Wood"; skin[83] = "1"; skin[98] = "6"; skin[144] = "10";
+        let mut nuke = vec!["0"; 150];         // a detrimental nuke
+        nuke[0] = "300"; nuke[1] = "Lightning Bolt"; nuke[83] = "0"; nuke[98] = "5"; nuke[144] = "9";
+        let text = [heal, skin, nuke].map(|f| f.join("^")).join("\n");
+
+        let db = SpellDb::parse_str(&text);
+        assert!(db.is_beneficial(200) && !db.is_self_only(200), "heal: beneficial, not self-only");
+        assert!(db.is_beneficial(26) && db.is_self_only(26), "Skin like Wood: beneficial + self-only");
+        assert!(!db.is_beneficial(300) && !db.is_self_only(300), "nuke: detrimental");
+        // Unknown spell → conservative (keep current-target behavior).
+        assert!(!db.is_beneficial(9999) && !db.is_self_only(9999));
     }
 
     #[test]

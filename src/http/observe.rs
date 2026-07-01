@@ -45,6 +45,7 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             "mana":        player.cur_mana,
             "mana_max":    player.max_mana,
             "xp_pct":      player.xp_pct,
+            "spawn_id":    player.player_id,
             "target_id":   player.target_id,
             "target_name": player.target_name,
             "target_hp_pct": player.target_hp_pct,

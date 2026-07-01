@@ -795,6 +795,7 @@ impl App {
                 heading_cw:  h_cw,
                 server_corrections: gs.server_corrections,
                 mem_spells: gs.mem_spells,
+                player_id:  gs.player_id,
                 target_id:  gs.target_id,
                 coin:       gs.coin,
                 hp_pct:        gs.hp_pct,

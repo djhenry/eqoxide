@@ -892,12 +892,29 @@ impl Navigator {
             tracing::info!("EQ: auto-attack {}", if on { "ON" } else { "OFF" });
         }
 
-        // Cast a memorized spell gem on a target (current target, or self if none).
+        // Cast a memorized spell gem. Target priority: an explicit API target > the current target
+        // > self. `Some(0)` is not a real spawn (the "clear target" sentinel), so collapse it to
+        // "none" here or the self-fallback never fires. For BENEFICIAL spells (heals/buffs) that
+        // aren't aimed at a friendly target, cast on the caster instead of a hostile/stale mob —
+        // matching the real RoF2 client, which self-targets heals/buffs. (eqoxide#95)
         let cast_req = self.cast.lock().unwrap().take();
         if let Some(req) = cast_req {
             let spell_id = gs.mem_spells.get(req.gem as usize).copied().unwrap_or(0xFFFF_FFFF);
             if spell_id != 0xFFFF_FFFF {
-                let target = req.target_id.or(gs.target_id).unwrap_or(gs.player_id);
+                let explicit = req.target_id.filter(|&t| t != 0);
+                let current  = gs.target_id.filter(|&t| t != 0);
+                let mut target = explicit.or(current).unwrap_or(gs.player_id);
+                if let Some(db) = crate::spells::global() {
+                    if db.is_self_only(spell_id) {
+                        target = gs.player_id; // ST_SELF: always the caster
+                    } else if explicit.is_none() && db.is_beneficial(spell_id) {
+                        // Keep an explicitly-chosen friendly (PC) target for group heals; otherwise
+                        // (no target, cleared, or a hostile NPC) land the buff/heal on ourselves.
+                        let friendly = target == gs.player_id
+                            || gs.entities.get(&target).map_or(false, |e| !e.is_npc);
+                        if !friendly { target = gs.player_id; }
+                    }
+                }
                 stream.send_app_packet(OP_CAST_SPELL, &build_cast_packet(req.gem as u32, spell_id, target));
                 tracing::info!("EQ: cast gem={} spell={} target={}", req.gem, spell_id, target);
             } else {
