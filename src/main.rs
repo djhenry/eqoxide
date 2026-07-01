@@ -214,6 +214,8 @@ OPTIONS:
         .unwrap_or_else(|_| data_dir.join("spells_us.txt").to_string_lossy().into_owned());
     let spells: std::sync::Arc<eqoxide::spells::SpellDb> =
         std::sync::Arc::new(eqoxide::spells::SpellDb::load(&spells_path));
+    // Publish globally so the nav thread can resolve spell target types for self-cast (eqoxide#95).
+    eqoxide::spells::set_global(spells.clone());
     let shared_collision: assets::SharedCollision = Arc::new(std::sync::RwLock::new(None));
     let frame_req:        http::FrameReq        = Arc::new(Mutex::new(None));
     let player_info:      http::PlayerInfo      = Arc::new(Mutex::new(http::PlayerState::default()));
