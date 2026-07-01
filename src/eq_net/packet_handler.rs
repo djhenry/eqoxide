@@ -788,6 +788,15 @@ fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
     tracing::info!("EQ: combat: {msg}");
     gs.log_msg("combat", &msg);
 
+    // Optimistic local HP (eqoxide#55): apply damage the player TOOK immediately so the HUD/API
+    // react per-hit instead of pinning at the last server value until the next OP_HPUpdate (which
+    // then reconciles the authoritative HP). `damage`@9 is the same reliable field shown above; only
+    // real hits (>0) reduce HP, clamped at 0. Guarded on a known max so the percent stays sane.
+    if target_id == gs.player_id && damage > 0 && gs.max_hp > 0 {
+        gs.cur_hp = (gs.cur_hp - damage).max(0);
+        gs.hp_pct = (gs.cur_hp as f32 / gs.max_hp.max(1) as f32) * 100.0;
+    }
+
     // Remember who is swinging at us (hit OR miss) so auto-combat can engage an add that aggros
     // mid-fight instead of tanking it unanswered. Only NPC attackers on the player count.
     if target_id == gs.player_id && source_id != gs.player_id && gs.entities.contains_key(&source_id) {
@@ -1248,6 +1257,36 @@ mod tests {
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
             face: 0, hairstyle: 0, animation: 0,
         }
+    }
+
+    #[test]
+    fn combat_damage_to_player_decrements_local_hp() {
+        // eqoxide#55: a hit on the player should optimistically reduce local HP between OP_HPUpdates.
+        use super::apply_combat_damage;
+        // CombatDamage_Struct: target@0(u16) source@2(u16) type@4(u8) spellid@5(u32) damage@9(i32).
+        let dmg = |target: u16, source: u16, damage: i32| -> [u8; 13] {
+            let mut b = [0u8; 13];
+            b[0..2].copy_from_slice(&target.to_le_bytes());
+            b[2..4].copy_from_slice(&source.to_le_bytes());
+            b[9..13].copy_from_slice(&damage.to_le_bytes());
+            b
+        };
+        let mut gs = GameState::new();
+        gs.player_id = 7; gs.cur_hp = 100; gs.max_hp = 100; gs.hp_pct = 100.0;
+
+        apply_combat_damage(&mut gs, &dmg(7, 99, 14)); // mob hits player for 14
+        assert_eq!(gs.cur_hp, 86, "player HP should drop by the hit");
+        assert!((gs.hp_pct - 86.0).abs() < 1e-4, "hp_pct recomputed: {}", gs.hp_pct);
+
+        apply_combat_damage(&mut gs, &dmg(7, 99, 0)); // a miss
+        assert_eq!(gs.cur_hp, 86, "a miss must not change HP");
+
+        apply_combat_damage(&mut gs, &dmg(99, 7, 50)); // player hits an NPC
+        assert_eq!(gs.cur_hp, 86, "damage to an NPC must not change the player's HP");
+
+        apply_combat_damage(&mut gs, &dmg(7, 99, 9999)); // lethal hit
+        assert_eq!(gs.cur_hp, 0, "HP clamps at 0");
+        assert!((gs.hp_pct - 0.0).abs() < 1e-4);
     }
 
     #[test]
