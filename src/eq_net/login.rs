@@ -68,6 +68,7 @@ pub async fn run_login_flow(
     app_tx:           mpsc::UnboundedSender<AppPacket>,
     max_retries:      u32,
     goto_target:      GotoTarget,
+    goto_entity:      crate::http::GotoEntity,
     entity_positions: EntityPositions,
     entity_ids:       EntityIds,
     zone_points:      ZonePoints,
@@ -142,7 +143,7 @@ pub async fn run_login_flow(
                     tracing::info!("NAV: {} zone points seeded", gs.zone_points.len());
                 }
                 let char_name = config.character_name.clone();
-                let navigator = Navigator::new(goto_target, entity_positions, entity_ids, zone_points, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, group_accept, group_decline, group_leave, group_kick, group_make_leader, zone_cross, warp, hail, say, target, attack, buy, sell, trade, merchant, move_req, give, inventory, loot, door_click, doors_shared, messages, chat_events, chat_send, cast, mem_spell, sit, consider, collision, maps_dir, camp.clone(), controller_view, nav_intent, pos_correction);
+                let navigator = Navigator::new(goto_target, goto_entity, entity_positions, entity_ids, zone_points, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, group_accept, group_decline, group_leave, group_kick, group_make_leader, zone_cross, warp, hail, say, target, attack, buy, sell, trade, merchant, move_req, give, inventory, loot, door_click, doors_shared, messages, chat_events, chat_send, cast, mem_spell, sit, consider, collision, maps_dir, camp.clone(), controller_view, nav_intent, pos_correction);
                 run_gameplay_phase(stream, net_rx, app_tx, gs, char_name, navigator, world_creds, shutdown.clone(), camp.clone(), camp_until.clone()).await;
                 return Ok(());
             }

@@ -406,6 +406,7 @@ fn dist2(zp: &crate::game_state::ZonePoint, gs: &GameState) -> f32 {
 
 pub struct Navigator {
     goto_target:      GotoTarget,
+    goto_entity:      crate::http::GotoEntity,
     entity_positions: EntityPositions,
     entity_ids:       EntityIds,
     zone_points:      ZonePoints,
@@ -504,6 +505,7 @@ pub struct Navigator {
 impl Navigator {
     pub fn new(
         goto_target:      GotoTarget,
+        goto_entity:      crate::http::GotoEntity,
         entity_positions: EntityPositions,
         entity_ids:       EntityIds,
         zone_points:      ZonePoints,
@@ -551,6 +553,7 @@ impl Navigator {
     ) -> Self {
         Navigator {
             goto_target,
+            goto_entity,
             entity_positions,
             entity_ids,
             zone_points,
@@ -1075,9 +1078,14 @@ impl Navigator {
         let sit_req = self.sit.lock().unwrap().take();
         if let Some(sit) = sit_req {
             let param = if sit { 110u32 } else { 100u32 };
-            stream.send_app_packet(OP_SPAWN_APPEARANCE,
-                &build_spawn_appearance_packet(gs.player_id as u16, 14, param));
+            let payload = build_spawn_appearance_packet(gs.player_id as u16, 14, param);
+            stream.send_app_packet(OP_SPAWN_APPEARANCE, &payload);
             gs.sitting = sit;
+            // Bridge to the RENDER GameState so the player's OWN sit animation plays. A client-
+            // initiated sit sets only the nav-thread `gs.sitting`; the render loop reads its separate
+            // GameState, updated solely from `app_tx`. Mirror the appearance through a synthetic
+            // packet (apply_spawn_appearance), same pattern as the target/money bridges. (#53)
+            let _ = app_tx.send(AppPacket { opcode: OP_SPAWN_APPEARANCE, payload });
             tracing::info!("EQ: {}", if sit { "sit" } else { "stand" });
         }
 
@@ -1390,11 +1398,32 @@ impl Navigator {
             if self.goto_target.lock().unwrap().take().is_some() {
                 tracing::info!("NAV: player is dead — abandoning /goto");
             }
+            *self.goto_entity.lock().unwrap() = None; // drop any chase too
             self.path.clear();
             self.path_goal = None;
             self.path_i = 0;
             *self.nav_intent.lock().unwrap() = None; // stop driving the controller
             return;
+        }
+
+        // Chase (eqoxide#88): when /goto targets a named ENTITY, re-resolve its CURRENT position each
+        // tick and follow it, instead of pathing to a one-time snapshot. Roaming mobs move, and their
+        // client position is frozen (stale) until they come within the server's ~300u update range —
+        // so as the player approaches the stale spot and the mob enters range, its real position is
+        // revealed here and the walk homes in on it. If goto_target was cleared (WASD/warp/arrival)
+        // while a chase name lingers, the chase is over; if the entity left view, stop cleanly.
+        {
+            let chase = self.goto_entity.lock().unwrap().clone();
+            if let Some(name) = chase {
+                if self.goto_target.lock().unwrap().is_none() {
+                    *self.goto_entity.lock().unwrap() = None; // cancelled elsewhere
+                } else if let Some(&pos) = self.entity_positions.lock().unwrap().get(&name) {
+                    *self.goto_target.lock().unwrap() = Some(pos); // follow the entity's latest position
+                } else {
+                    *self.goto_target.lock().unwrap() = None; // entity despawned / left view
+                    *self.goto_entity.lock().unwrap() = None;
+                }
+            }
         }
 
         let goto = *self.goto_target.lock().unwrap(); // copy out so the lock is released
@@ -1786,6 +1815,7 @@ mod tests {
     fn test_navigator(group: crate::http::GroupShared) -> Navigator {
         Navigator::new(
             Default::default(), // goto_target
+            Default::default(), // goto_entity
             Default::default(), // entity_positions
             Default::default(), // entity_ids
             Default::default(), // zone_points
