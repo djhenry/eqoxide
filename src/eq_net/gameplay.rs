@@ -110,6 +110,22 @@ pub async fn run_gameplay_phase(
             let _ = app_tx.send(packet.clone());
 
             match packet.opcode {
+                // Another player is asking to trade with us: the server forwards their
+                // OP_TradeRequest { to_mob_id = us, from_mob_id = initiator }. Our give/turn-in
+                // flow only implemented the initiator side, so incoming PC trade requests were
+                // never acked and the initiator timed out (eqoxide#38). Auto-accept by replying
+                // OP_TradeRequestAck with the ids swapped (to = initiator, from = us), mirroring
+                // the server's NPC auto-ack, which opens the trade session.
+                OP_TRADE_REQUEST if packet.payload.len() >= 8 => {
+                    let to_mob_id = u32::from_le_bytes(packet.payload[0..4].try_into().unwrap());
+                    let from_mob_id = u32::from_le_bytes(packet.payload[4..8].try_into().unwrap());
+                    if to_mob_id == gs.player_id {
+                        s.send_app_packet(OP_TRADE_REQUEST_ACK,
+                            &build_trade_request(from_mob_id, gs.player_id));
+                        gs.log_msg("trade", "Accepting incoming trade request.");
+                        tracing::info!("EQ: trade: acked incoming OP_TradeRequest from mob_id={}", from_mob_id);
+                    }
+                }
                 // Server listed a lootable item — echo back immediately to take it.
                 OP_LOOT_ITEM => {
                     gs.loot_last_activity = Some(std::time::Instant::now());
