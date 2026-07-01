@@ -921,7 +921,9 @@ impl App {
                 self.last_moved_at = std::time::Instant::now();
             }
             self.prev_logical_pos = lp;
-            // Priority: dead > combat swing > walking > idle.
+            // Priority: dead > combat swing > walking > sitting > idle. Combat and
+            // movement override sitting (classic EQ stands you up when you attack or
+            // move); sitting only replaces the plain idle clip. (eqoxide#53)
             let pid = self.game_state.player_id;
             let player_dead = self.game_state.cur_hp <= 0 && self.game_state.max_hp > 0;
             let swinging = self.game_state.combat_anims.get(&pid)
@@ -932,6 +934,8 @@ impl App {
                 format!("C{:02}", code)
             } else if self.last_moved_at.elapsed().as_millis() < 250 {
                 "walking".to_string()
+            } else if self.game_state.sitting {
+                "sitting".to_string()
             } else {
                 "idle".to_string()
             };
