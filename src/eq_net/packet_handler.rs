@@ -762,7 +762,9 @@ fn apply_death(gs: &mut GameState, payload: &[u8]) {
 }
 
 fn apply_exp_update(gs: &mut GameState, payload: &[u8]) {
-    if payload.len() >= 4 {
+    if payload.len() >= SIZE_EXP_UPDATE {
+        let eu = unsafe { safe_read::<ExpUpdate_S>(payload) };
+        gs.set_xp(eu.exp);
         gs.log_msg("exp", "Experience gained");
     }
 }
