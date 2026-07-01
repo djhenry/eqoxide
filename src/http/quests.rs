@@ -148,6 +148,7 @@ mod tests {
             })),
             frame_req: Arc::new(Mutex::new(None)),
             goto_target: Arc::new(Mutex::new(None)),
+            goto_entity: Arc::new(Mutex::new(None)),
             entity_positions: Arc::new(Mutex::new(HashMap::new())),
             entity_ids: Arc::new(Mutex::new(HashMap::new())),
             zone_points: Arc::new(Mutex::new(Vec::new())),
