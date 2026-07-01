@@ -1177,6 +1177,20 @@ impl Navigator {
             return;
         }
 
+        // Dead men don't walk (eqoxide#61): once the player is slain, abandon any /goto instead of
+        // advancing a corpse through waypoint after waypoint ("no progress… skipping" forever). The
+        // route is cleared, so a later respawn/relog starts fresh rather than resuming the old path.
+        if gs.player_dead {
+            if self.goto_target.lock().unwrap().take().is_some() {
+                tracing::info!("NAV: player is dead — abandoning /goto");
+            }
+            self.path.clear();
+            self.path_goal = None;
+            self.path_i = 0;
+            *self.nav_intent.lock().unwrap() = None; // stop driving the controller
+            return;
+        }
+
         let goto = *self.goto_target.lock().unwrap(); // copy out so the lock is released
         let goal = match goto {
             Some(t) => t,
