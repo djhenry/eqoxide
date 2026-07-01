@@ -13,8 +13,14 @@ use crate::assets::Collision;
 pub const PLAYER_RADIUS: f32 = 1.0;
 /// Skin width kept between the cylinder and the surface after a swept hit.
 const SKIN: f32 = 0.05;
-/// Native step-up height (`_DAT_009c58e8 = 2.0f`).
+/// Native step-up height (`_DAT_009c58e8 = 2.0f`). Used for free WASD movement.
 const STEP_UP: f32 = 2.0;
+/// Step-up height the `/goto` planner permits (via [`MoveIntent::climb`]). Matches `find_path`'s
+/// edge-climb cap (`Collision::find_path` `STEP_H = 20.0`): whatever A* routes over as a connected
+/// walkable ledge, the controller can then actually climb — so it no longer wedges on the small
+/// fences/cart lips that gate penned content (#41). The floor-existence guard in `try_step_up`
+/// still only mounts a real surface, so this is not a wall-scaling cheat.
+pub const NAV_CLIMB: f32 = 20.0;
 /// Ground-probe origin above the feet (`_DAT_009c3390 = 1.0f`).
 const GROUND_ORIGIN: f32 = 1.0;
 /// Ground-probe downward range (`_DAT_009c58e4 = 200.0f`).
@@ -22,8 +28,22 @@ const GROUND_DEPTH: f32 = 200.0;
 /// Gravity / terminal fall (matches the renderer's prior physics + falling-physics.md).
 const GRAVITY: f32 = 120.0;
 const MAX_FALL: f32 = 128.0;
-/// Jump impulse (preserved from the old WASD block).
+/// Jump impulse for the free-WASD Space jump (preserved from the old WASD block; ~0.7u peak).
 pub const JUMP_VELOCITY: f32 = 13.0;
+/// Vertical impulse for a nav auto-hop over a low fence/cart rail. Peak height = v²/(2·GRAVITY);
+/// at 44 that clears ~8u, enough for the low pen fences that block `/goto` (#41). Only used in nav
+/// mode (`MoveIntent::allow_hop`), so it never affects the native WASD jump feel.
+const NAV_HOP_VELOCITY: f32 = 44.0;
+/// How far ahead (in the move direction) a nav-hop probes for walkable floor beyond the barrier.
+const HOP_REACH: f32 = 5.0;
+/// Vertical band for the "floor just beyond" probe: the far floor must be within `+UP/-DOWN` of the
+/// current foot height — a low fence (≈ level both sides), not a wall (far floor much higher, no
+/// floor in band) or a ledge/cliff (far floor far below → would launch us off; don't hop).
+const HOP_PROBE_UP: f32 = 3.0;
+const HOP_PROBE_DOWN: f32 = 4.0;
+/// Min seconds between nav auto-hops, so a barrier we can't actually clear doesn't become a
+/// jump-in-place loop (the nav stuck-skip then routes around it instead).
+const HOP_COOLDOWN: f32 = 0.8;
 /// Max collide-and-slide iterations per move.
 const MAX_SLIDE_ITERS: usize = 3;
 /// Vertical tolerance for "still standing on the same floor".
@@ -46,6 +66,18 @@ pub struct MoveIntent {
     pub jump:        bool,
     pub want_swim:   bool,
     pub speed:       f32,
+    /// Max step-up height the controller may climb this move, in EQ units. `0` (default) uses the
+    /// native [`STEP_UP`] (2.0) — correct for free WASD, which must NOT be able to scale walls. The
+    /// `/goto` planner raises it to [`NAV_CLIMB`] so the controller can surmount the small lips
+    /// (fences/cart edges) that `find_path` already routed over (its edge-climb cap is the same).
+    /// Without this the path leads over a lip the 2u step can't clear and the player wedges (#41).
+    pub climb:       f32,
+    /// One-shot request to hop a low barrier (fence/cart) this tick. The `/goto` planner sets it once
+    /// its own net-progress stall detection fires (the controller can't see net progress — sliding
+    /// ALONG a fence looks like good per-frame motion). The controller hops only if it's grounded,
+    /// off cooldown, and a near-level landing exists just beyond ([`can_hop`]). Free WASD leaves it
+    /// `false` (a player walking into a wall shouldn't auto-jump). Fixes the Halas sled-pen (#41).
+    pub hop:         bool,
 }
 
 /// A read-only snapshot of the controller the render thread publishes each frame for the nav
@@ -71,6 +103,8 @@ pub struct CharacterController {
     good:          std::collections::VecDeque<[f32; 3]>,
     good_timer:    f32,
     stuck_time:    f32,
+    /// Seconds until another nav auto-hop is allowed (prevents jump-spamming a wall we can't clear).
+    hop_cooldown:  f32,
 }
 
 #[inline]
@@ -79,7 +113,8 @@ fn hlen(d: [f32; 3]) -> f32 { (d[0] * d[0] + d[1] * d[1]).sqrt() }
 impl CharacterController {
     pub fn new(pos: [f32; 3]) -> Self {
         Self { pos, vel_z: 0.0, on_ground: false, in_water: false,
-               good: std::collections::VecDeque::new(), good_timer: 0.0, stuck_time: 0.0 }
+               good: std::collections::VecDeque::new(), good_timer: 0.0, stuck_time: 0.0,
+               hop_cooldown: 0.0 }
     }
 
     /// Hard-set the position (zone-in, /warp, large server correction). Clears velocity & stuck.
@@ -100,6 +135,7 @@ impl CharacterController {
 
         self.in_water = col.in_water(self.pos);
         let swimming = intent.want_swim && self.in_water;
+        if self.hop_cooldown > 0.0 { self.hop_cooldown = (self.hop_cooldown - dt).max(0.0); }
 
         // ── Horizontal: collide-and-slide, with step-up when blocked on the ground. ──
         let throttle = (intent.wish_dir[0] * intent.wish_dir[0] + intent.wish_dir[1] * intent.wish_dir[1]).sqrt();
@@ -113,12 +149,28 @@ impl CharacterController {
             let low_prog = hlen([low_pos[0] - self.pos[0], low_pos[1] - self.pos[1], 0.0]);
             let mut applied = [low_pos[0], low_pos[1], self.pos[2]];
             let mut stepped = false;
+            // Free WASD uses the native 2u step; the nav planner raises `climb` to NAV_CLIMB so the
+            // controller can follow find_path over fence/cart lips it routed across (#41).
+            let max_step = STEP_UP.max(intent.climb);
             if self.on_ground && low_hit && low_prog + 0.01 < hlen(wish) {
-                if let Some(step) = self.try_step_up(wish, col) {
+                if let Some(step) = self.try_step_up(wish, max_step, col) {
                     if hlen([step[0] - self.pos[0], step[1] - self.pos[1], 0.0]) > low_prog + 0.05 {
                         applied = step;
                         stepped = true;
                     }
+                }
+                // Step-up couldn't cross it. If nav allows, and we're wedged ~head-on (not sliding
+                // along a wall) against a thin barrier with walkable floor just beyond, hop over it
+                // (a fence has flat floor both sides, so there's nothing to step UP onto). The
+                // airborne collide-and-slide below carries us forward over the rail (#41).
+                if !stepped
+                    && intent.hop
+                    && self.hop_cooldown <= 0.0
+                    && self.can_hop(wish, col)
+                {
+                    self.vel_z = NAV_HOP_VELOCITY;
+                    self.on_ground = false;
+                    self.hop_cooldown = HOP_COOLDOWN;
                 }
             }
             self.pos[0] = applied[0];
@@ -210,15 +262,36 @@ impl CharacterController {
     /// Step-offset climb (design §3.2): raise the cylinder by `STEP_UP`, sweep again, and — only if
     /// a floor exists to stand on at the raised destination (the no-geometry-gap guard) — return the
     /// stepped-up `[east, north, floor_z]`. `None` = no valid step (taller-than-2u wall or a gap).
-    fn try_step_up(&self, wish: [f32; 3], col: &Collision) -> Option<[f32; 3]> {
-        let raised = [self.pos[0], self.pos[1], self.pos[2] + STEP_UP];
+    fn try_step_up(&self, wish: [f32; 3], max_step: f32, col: &Collision) -> Option<[f32; 3]> {
+        let raised = [self.pos[0], self.pos[1], self.pos[2] + max_step];
         let (hi, _) = self.slide(raised, wish, col);
-        // Probe for a floor near the raised destination, within the step band.
-        let f = col.ground_below(hi[0], hi[1], self.pos[2] + STEP_UP + GROUND_ORIGIN, STEP_UP + GROUND_ORIGIN + GROUND_SNAP_TOL)?;
-        if f >= self.pos[2] - GROUND_SNAP_TOL && f - self.pos[2] <= STEP_UP + GROUND_SNAP_TOL {
+        // Probe for a floor near the raised destination, within the step band. The slide above only
+        // makes progress when there is open space over the lip, so we never "climb" into solid wall;
+        // and a floor must exist here to stand on, so a taller bare wall still returns None.
+        let f = col.ground_below(hi[0], hi[1], self.pos[2] + max_step + GROUND_ORIGIN, max_step + GROUND_ORIGIN + GROUND_SNAP_TOL)?;
+        if f >= self.pos[2] - GROUND_SNAP_TOL && f - self.pos[2] <= max_step + GROUND_SNAP_TOL {
             Some([hi[0], hi[1], f])
         } else {
             None
+        }
+    }
+
+    /// Is the wedged-against barrier a *hoppable* fence — i.e. is there walkable floor `HOP_REACH`
+    /// ahead in the move direction, at roughly the current foot height? True → a low rail with flat
+    /// floor beyond (hop over it). False → no floor in band ahead, meaning a real wall (far floor
+    /// much higher or absent) or a ledge/cliff (far floor far below); don't hop in either case (#41).
+    fn can_hop(&self, wish: [f32; 3], col: &Collision) -> bool {
+        let len = hlen(wish);
+        if len < 1e-4 { return false; }
+        let px = self.pos[0] + wish[0] / len * HOP_REACH;
+        let py = self.pos[1] + wish[1] / len * HOP_REACH;
+        // Use nearest_floor (whole-column) rather than a single down-ray: a cart/fence can be TALLER
+        // than the probe origin, which makes a down-ray miss its top and report garbage. nearest_floor
+        // returns the surface closest to our CURRENT height — i.e. the low ground/slope to land on,
+        // not the cart top — so we only hop toward a near-level landing, never up a wall or off a cliff.
+        match col.nearest_floor(px, py, self.pos[2], HOP_PROBE_UP, HOP_PROBE_DOWN) {
+            Some(f) => f - self.pos[2] <= HOP_PROBE_UP && self.pos[2] - f <= HOP_PROBE_DOWN,
+            None => false,
         }
     }
 
@@ -301,7 +374,8 @@ mod tests {
         Collision::build(&ZoneAssets { terrain: meshes, objects: vec![], textures: vec![] }, 4.0)
     }
     fn walk(speed: f32, dir: [f32; 2]) -> MoveIntent {
-        MoveIntent { wish_dir: dir, wish_vspeed: 0.0, jump: false, want_swim: false, speed }
+        MoveIntent { wish_dir: dir, wish_vspeed: 0.0, jump: false, want_swim: false, speed,
+                     climb: 0.0, hop: false }
     }
 
     #[test]
@@ -335,6 +409,51 @@ mod tests {
         ctrl.step(walk(35.0, [1.0, 0.0]), 0.2, &c);
         assert!(ctrl.pos[0] < 4.1, "a 3u wall must block (no step-up): east={}", ctrl.pos[0]);
         assert!((ctrl.pos[2] - 0.0).abs() < 0.3, "should stay at floor z=0: {}", ctrl.pos[2]);
+    }
+
+    #[test]
+    fn nav_climb_surmounts_a_fence_lip_that_walk_cannot() {
+        // A 6u lip (fence/cart) the native 2u step can't clear but find_path routes over: floor z=0,
+        // a 6u riser at east=5, floor z=6 beyond. This is the Halas sled-dog pen case (#41).
+        let geo = || col(vec![floor(0.0, -100.0, 5.0), wall(5.0, 0.0, 6.0), floor(6.0, 5.0, 100.0)]);
+
+        // Free WASD (climb=0 → native 2u step): blocked at the lip, stays at z=0.
+        let mut wasd = CharacterController::new([3.0, 0.0, 0.0]);
+        wasd.on_ground = true;
+        for _ in 0..5 { wasd.step(walk(35.0, [1.0, 0.0]), 0.1, &geo()); }
+        assert!(wasd.pos[0] < 5.1, "WASD must NOT scale a 6u lip: east={}", wasd.pos[0]);
+        assert!(wasd.pos[2] < 1.0, "WASD should stay at floor z=0: {}", wasd.pos[2]);
+
+        // Nav (climb=NAV_CLIMB): climbs the lip and stands on the z=6 surface inside the pen.
+        let nav_intent = MoveIntent { wish_dir: [1.0, 0.0], wish_vspeed: 0.0, jump: false,
+            want_swim: false, speed: 35.0, climb: NAV_CLIMB, hop: false };
+        let mut nav = CharacterController::new([3.0, 0.0, 0.0]);
+        nav.on_ground = true;
+        for _ in 0..5 { nav.step(nav_intent, 0.1, &geo()); }
+        assert!(nav.pos[0] > 5.0, "nav should climb past the lip edge: east={}", nav.pos[0]);
+        assert!((nav.pos[2] - 6.0).abs() < 0.3, "nav should stand on the 6u ledge: {}", nav.pos[2]);
+    }
+
+    #[test]
+    fn nav_hops_a_thin_fence_with_flat_floor_both_sides() {
+        // The Halas sled-pen case (#41): a thin upright fence (z=0..5) with FLAT floor z=0 on both
+        // sides — step-up can't cross it (no higher floor to step onto), only a jump-over works.
+        let geo = || col(vec![floor(0.0, -100.0, 100.0), wall(5.0, 0.0, 5.0)]);
+
+        // Free WASD (allow_hop=false): blocked at the fence, never crosses.
+        let mut wasd = CharacterController::new([2.0, 0.0, 0.0]);
+        wasd.on_ground = true;
+        for _ in 0..40 { wasd.step(walk(35.0, [1.0, 0.0]), 0.05, &geo()); }
+        assert!(wasd.pos[0] < 5.0, "WASD must NOT cross the fence: east={}", wasd.pos[0]);
+
+        // Nav with hop commanded: hops the fence and lands on the flat floor beyond (z≈0, east>5).
+        let nav_intent = MoveIntent { wish_dir: [1.0, 0.0], wish_vspeed: 0.0, jump: false,
+            want_swim: false, speed: 35.0, climb: NAV_CLIMB, hop: true };
+        let mut nav = CharacterController::new([2.0, 0.0, 0.0]);
+        nav.on_ground = true;
+        for _ in 0..40 { nav.step(nav_intent, 0.05, &geo()); }
+        assert!(nav.pos[0] > 6.0, "nav should hop past the fence: east={}", nav.pos[0]);
+        assert!(nav.pos[2].abs() < 0.5, "nav should land back on the flat floor z=0: {}", nav.pos[2]);
     }
 
     #[test]
