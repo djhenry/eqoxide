@@ -150,6 +150,27 @@ pub async fn run_gameplay_phase(
                             packet.payload.len());
                     }
                 }
+                // Death respawn: EQEmu (with RespawnFromHover off) sends OP_ZonePlayerToBind and
+                // then holds us in a ZoneToBindPoint "zoning" state, waiting for the client to
+                // reply with OP_ZoneChange to finalize the respawn (Client::GoToDeath →
+                // MovePC(ZoneToBindPoint), completed by Handle_OP_ZoneChange). Without that reply
+                // the server leaves us half-zoned and silently drops all auto-attack/combat until
+                // a full relog. apply_bind_respawn already moved us locally; here we complete the
+                // handshake. bind_zone_id == 0 is the server's "same zone" marker → reply with the
+                // current zone id. The server's OP_ZoneChange response (handled below) then drives
+                // the reconnect/re-entry exactly like a normal zone change. (eqoxide#75)
+                OP_ZONE_PLAYER_TO_BIND if packet.payload.len() >= 20 => {
+                    let p = &packet.payload;
+                    let bind_zone_id = u16::from_le_bytes([p[0], p[1]]);
+                    let instance_id  = u16::from_le_bytes([p[2], p[3]]);
+                    let bx = f32::from_le_bytes([p[4],  p[5],  p[6],  p[7]]);
+                    let by = f32::from_le_bytes([p[8],  p[9],  p[10], p[11]]);
+                    let bz = f32::from_le_bytes([p[12], p[13], p[14], p[15]]);
+                    let target_zone = if bind_zone_id != 0 { bind_zone_id } else { gs.zone_id };
+                    s.send_app_packet(OP_ZONE_CHANGE,
+                        &build_zone_change(&gs.player_name, target_zone, instance_id, bx, by, bz));
+                    tracing::info!("EQ: bind respawn — sent OP_ZoneChange to finalize respawn (zone_id={target_zone})");
+                }
                 // Server booted us (typically another client logged in this same character).
                 // EQEmu's default is "second login wins"; the first client receives OP_GMKick.
                 // We're already kicked, so just disconnect the session and exit cleanly.
@@ -190,16 +211,8 @@ pub async fn run_gameplay_phase(
                     } else {
                         // Cross-zone transition (#zone <name>): send OP_ZONE_CHANGE to
                         // trigger the full zone-change protocol (world reconnect, etc.).
-                        // RoF2 ZoneChange_Struct (100B): y/x/z at @76/@80/@84 (8 bytes later than Titanium).
-                        let mut buf = [0u8; SIZE_ZONE_CHANGE];
-                        let nb = gs.player_name.as_bytes();
-                        buf[..nb.len().min(64)].copy_from_slice(&nb[..nb.len().min(64)]);
-                        buf[64..66].copy_from_slice(&zone_id.to_le_bytes());
-                        buf[66..68].copy_from_slice(&instance_id.to_le_bytes());
-                        buf[76..80].copy_from_slice(&y.to_le_bytes());
-                        buf[80..84].copy_from_slice(&x.to_le_bytes());
-                        buf[84..88].copy_from_slice(&z.to_le_bytes());
-                        s.send_app_packet(OP_ZONE_CHANGE, &buf);
+                        s.send_app_packet(OP_ZONE_CHANGE,
+                            &build_zone_change(&gs.player_name, zone_id, instance_id, x, y, z));
                         tracing::info!("EQ: cross-zone OP_REQUEST_CLIENT_ZONE_CHANGE zone_id={zone_id} → sent OP_ZONE_CHANGE");
                     }
                 }
