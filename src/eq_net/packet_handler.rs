@@ -386,7 +386,13 @@ fn apply_completed_tasks(gs: &mut GameState, p: &[u8]) {
 /// rather than guess at the layout and desync/garble subsequent offers in the same packet.
 fn apply_task_select_window(gs: &mut GameState, p: &[u8]) {
     let mut o = 0usize;
+    // Each entry is at least 23 bytes (task_id u32 + reward_multiplier f32 + duration u32 +
+    // duration_code u32 + title cstr≥1 + desc cstr≥1 + has_rewards u8 + element_count u32).
+    // Header is 12 bytes (task_count u32 + type u32 + task_giver u32). Clamp the count so a
+    // malformed/truncated packet can't request unbounded allocation.
     let task_count = rd_u32(p, &mut o);
+    let max_entries = (p.len().saturating_sub(12) as u32) / 23;
+    let task_count = task_count.min(max_entries);
     let _sel_type = rd_u32(p, &mut o);
     let task_giver = rd_u32(p, &mut o);
     let mut offers = Vec::with_capacity(task_count as usize);
@@ -2236,6 +2242,16 @@ mod tests {
         ]);
         apply_task_select_window(&mut gs, &p);
         assert!(gs.task_offers.is_empty(), "must not guess at the nested ActivityInformation layout");
+    }
+
+    #[test]
+    fn apply_task_select_window_handles_truncated_packet_without_hanging() {
+        let mut gs = GameState::new();
+        // task_count says 100000 entries but the buffer only has the count field — must not hang
+        // or panic; rd_u32/rd_cstr degrade to 0/empty on out-of-bounds reads.
+        let p = 100000u32.to_le_bytes().to_vec();
+        apply_task_select_window(&mut gs, &p);
+        assert!(gs.task_offers.is_empty());
     }
 
     // ── RoF2 Death_Struct byte-layout tests ─────────────────────────────────────────────────────
