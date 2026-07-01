@@ -269,6 +269,8 @@ pub struct PlayerState {
     pub heading_cw:   f32, // 0=north CW (wire format)
     pub server_corrections: u32,
     pub mem_spells:   [u32; 9],
+    /// The player's own spawn id (for scripting a self-target). (eqoxide#95)
+    pub player_id:    u32,
     pub target_id:    Option<u32>,
     /// Coin on hand: [platinum, gold, silver, copper], from the player profile.
     pub coin:         [u32; 4],
