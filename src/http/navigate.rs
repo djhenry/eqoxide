@@ -107,14 +107,57 @@ struct ZoneCrossBody {
     zone_id: Option<u16>,
 }
 
+/// Sorted, de-duplicated set of zone_ids reachable via a zone line from the current zone.
+fn reachable_zone_ids(zps: &[crate::game_state::ZonePoint]) -> Vec<u16> {
+    let mut ids: Vec<u16> = zps.iter().map(|zp| zp.zone_id).filter(|&z| z != 0).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 /// POST /v1/navigate/zone_cross — warp to a zone line and send OP_ZONE_CHANGE.
 /// Body: {"zone_id": 1} to cross to a specific zone, or {} for the nearest line.
+///
+/// A specific `zone_id` that has no zone line from the current zone is REJECTED with 400 (and the
+/// list of reachable zone_ids) instead of silently doing nothing / crossing a nearby line — so the
+/// caller knows the destination wasn't honored (eqoxide#47).
 async fn post_zone_cross(
     State(s): State<HttpState>,
     body: Option<Json<ZoneCrossBody>>,
 ) -> (StatusCode, String) {
     let zone_id = body.and_then(|Json(b)| b.zone_id).unwrap_or(0);
+    if zone_id != 0 {
+        let reachable = reachable_zone_ids(&s.zone_points.lock().unwrap());
+        if !reachable.contains(&zone_id) {
+            let msg = if reachable.is_empty() {
+                format!("zone_id {zone_id} is not reachable: no zone lines are known for the current \
+                         zone yet (still loading, or this zone has none)")
+            } else {
+                format!("zone_id {zone_id} is not reachable from the current zone; reachable zone_ids: {reachable:?}")
+            };
+            tracing::info!("zone_cross: rejected unreachable zone_id={zone_id} (reachable={reachable:?})");
+            return (StatusCode::BAD_REQUEST, msg);
+        }
+    }
     *s.zone_cross.lock().unwrap() = Some(zone_id);
     tracing::info!("zone_cross: flagged for OP_ZONE_CHANGE (target zone_id={zone_id})");
     (StatusCode::OK, format!("zone_cross request queued (zone_id={zone_id})"))
+}
+
+#[cfg(test)]
+mod zone_cross_tests {
+    use super::reachable_zone_ids;
+    use crate::game_state::ZonePoint;
+    fn zp(zone_id: u16) -> ZonePoint {
+        ZonePoint { iterator: 0, server_x: 0.0, server_y: 0.0, server_z: 0.0, heading: 0.0, zone_id }
+    }
+    #[test]
+    fn reachable_ids_are_sorted_deduped_and_drop_zero() {
+        // Two lines to zone 9, one to zone 1, and a 0 (nearest-line sentinel) that must be excluded.
+        let zps = vec![zp(9), zp(1), zp(9), zp(0)];
+        let r = reachable_zone_ids(&zps);
+        assert_eq!(r, vec![1, 9], "sorted, de-duplicated, no 0: {r:?}");
+        assert!(!r.contains(&24), "an unconnected zone (24) is not reachable");
+        assert!(reachable_zone_ids(&[]).is_empty(), "no zone points → nothing reachable");
+    }
 }
