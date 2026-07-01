@@ -27,6 +27,11 @@ pub struct Billboard {
     pub face:      u8,
     /// Hair style from Spawn_Struct `hairstyle`. 0 = bald.
     pub hairstyle: u8,
+    /// Hair color index — runtime-tints synthetic hair shells only (eqoxide#98).
+    pub haircolor: u8,
+    /// Helm material + show-helm flag, for hiding hair shells under a worn helm.
+    pub helm:      u32,
+    pub showhelm:  u8,
 }
 
 /// A door to render this frame. Positions are in client convention [east=x, north=y, up=z].
@@ -70,6 +75,8 @@ pub struct SceneState {
     pub player_face: u8,
     /// Player hair style (from PlayerProfile, offset 00896). 0 = bald.
     pub player_hairstyle: u8,
+    /// Player hair color — runtime-tints the player's synthetic hair shells only (eqoxide#98).
+    pub player_haircolor: u8,
     pub coin: [u32; 4],
     pub stats: [u32; 7],
     pub player_action: String,
@@ -174,6 +181,9 @@ impl SceneState {
                 gender:    0,
                 face:      0,
                 hairstyle: 0,
+                haircolor: 0,
+                helm:      0,
+                showhelm:  0,
             });
         }
 
@@ -225,6 +235,9 @@ impl SceneState {
                 gender:    e.gender,
                 face:      e.face,
                 hairstyle: e.hairstyle,
+                haircolor: e.haircolor,
+                helm:      e.helm as u32,
+                showhelm:  e.showhelm,
             }
         }).collect();
 
@@ -263,6 +276,7 @@ impl SceneState {
             player_gender: gs.player_gender,
             player_face: gs.player_face,
             player_hairstyle: gs.player_hairstyle,
+            player_haircolor: gs.player_haircolor,
             coin: gs.coin,
             stats: gs.stats,
             player_action: gs.player_action.clone(),
@@ -347,7 +361,7 @@ mod tests {
             heading: 0.0,
             dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
-            face: 0, hairstyle: 0,
+            face: 0, hairstyle: 0, haircolor: 0,
             animation: 0,
         });
 
@@ -432,7 +446,7 @@ mod tests {
             heading: 0.0,
             dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
-            face: 0, hairstyle: 0,
+            face: 0, hairstyle: 0, haircolor: 0,
             animation: 0,
         });
         let scene = SceneState::from_game_state(&gs);
@@ -471,7 +485,7 @@ mod tests {
             heading: 0.0,
             dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
-            face: 0, hairstyle: 0,
+            face: 0, hairstyle: 0, haircolor: 0,
             animation: 0,
         });
         gs.target_id = Some(42);
@@ -493,7 +507,7 @@ mod tests {
             x: 0.0, y: 0.0, z: 0.0, hp_pct: 100.0, cur_hp: 1, max_hp: 1,
             race: "HUM".into(), heading: 0.0, dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
-            face: 0, hairstyle: 0,
+            face: 0, hairstyle: 0, haircolor: 0,
             animation: 0,
         };
         e.equipment[1] = 17;
@@ -513,7 +527,7 @@ mod tests {
             x: 0.0, y: 0.0, z: 0.0, hp_pct: 100.0, cur_hp: 1, max_hp: 1,
             race: "HUM".into(), heading: 0.0, dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 1, helm: 0, showhelm: 0,
-            face: 0, hairstyle: 0,
+            face: 0, hairstyle: 0, haircolor: 0,
             animation: 0,
         };
         gs.upsert_entity(e);

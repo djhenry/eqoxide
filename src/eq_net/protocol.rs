@@ -360,6 +360,9 @@ pub struct SpawnInfo {
     /// Hair style (from the `hairstyle` wire byte in the curHp..beard block).
     /// 0 = bald (all hair primitives hidden).
     pub hairstyle:       u8,
+    /// Hair color index (0-23; >=24 → no tint). Only used to runtime-tint synthetic hair shells
+    /// ([`crate::models::HeadPart::Hair`]); classic textured hair ignores it (eqoxide#98).
+    pub haircolor:       u8,
     pub stand_state:     u8,   // 0x64 = normal standing
     pub pet_owner_id:    u32,
     pub player_state:    u32,
@@ -484,10 +487,12 @@ pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
 
     // 12-18. curHp haircolor beardcolor eyecolor1 eyecolor2 hairstyle beard (7×u8)
     let cur_hp = rd_u8!();
-    // haircolor/beardcolor are deliberately not consumed: on classic humhe* heads (what we
-    // render) the real RoF2 client never tints by haircolor — hair color is baked into the
-    // hairstyle texture. The tint table is Luclin-head-only; see crate::head. eyecolor1/2 unused.
-    skip!(4); // haircolor beardcolor eyecolor1 eyecolor2
+    // haircolor is consumed to runtime-tint the synthetic hair SHELLS asset-server #8 emits
+    // (eqoxide#98) — those grey shells are NOT baked-color like classic humhe* hair, so the client
+    // must tint them. Classic textured scalp regions remain untinted regardless (see crate::head
+    // and HeadPart::HairstyleVariant vs Hair). beardcolor/eyecolor1/2 stay unused.
+    let haircolor = rd_u8!();
+    skip!(3); // beardcolor eyecolor1 eyecolor2
     let hairstyle = rd_u8!(); // hairstyle (0-indexed; 0=bald)
     skip!(1); // beard
 
@@ -629,7 +634,7 @@ pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
 
     Some((SpawnInfo {
         spawn_id, name, last_name, level, npc, gender, race, class_,
-        body_type, cur_hp, helm, show_helm, face, hairstyle, stand_state,
+        body_type, cur_hp, helm, show_helm, face, hairstyle, haircolor, stand_state,
         pet_owner_id, player_state,
         x, y, z, heading, animation,
         equipment, equipment_tint,

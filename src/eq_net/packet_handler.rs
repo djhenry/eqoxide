@@ -936,8 +936,9 @@ fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
     if payload.len() >= 899 {
         gs.player_hairstyle = payload[896];
         gs.player_face      = payload[898];
-        tracing::debug!("EQ: PlayerProfile: face={} hairstyle={}",
-            gs.player_face, gs.player_hairstyle);
+        gs.player_haircolor = payload[888]; // rof2 PlayerProfile_Struct /*00888*/ haircolor (u8)
+        tracing::debug!("EQ: PlayerProfile: face={} hairstyle={} haircolor={}",
+            gs.player_face, gs.player_hairstyle, gs.player_haircolor);
     }
 
     // ── Equipment materials @184 + i*20, tints @812 + i*4 ──────────────────────
@@ -1604,6 +1605,7 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
         showhelm:       info.show_helm as u8,
         face:           info.face,
         hairstyle:      info.hairstyle,
+        haircolor:      info.haircolor,
         animation:      info.stand_state as u32,
     });
 }
@@ -1701,7 +1703,7 @@ mod tests {
             x: 0.0, y: 0.0, z: 0.0, hp_pct, cur_hp: 100, max_hp: 100,
             race: String::new(), heading: 0.0, dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
-            face: 0, hairstyle: 0, animation: 0,
+            face: 0, hairstyle: 0, haircolor: 0, animation: 0,
         }
     }
 
@@ -2062,7 +2064,7 @@ mod tests {
         let info = SpawnInfo {
             spawn_id: 42, name: "a".into(), last_name: String::new(),
             level: 5, npc: 1, gender: 0, race: 54, class_: 1, body_type: 1,
-            cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, stand_state: 100,
+            cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0, stand_state: 100,
             pet_owner_id: 0, player_state: 64,
             x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100,
             equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9],
@@ -2154,7 +2156,7 @@ mod tests {
         let info = SpawnInfo {
             spawn_id: 7, name: "Orc".into(), last_name: String::new(),
             level: 10, npc: 1, gender: 1, race: 54, class_: 1, body_type: 1,
-            cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, stand_state: 100,
+            cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0, stand_state: 100,
             pet_owner_id: 0, player_state: 64,
             x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100,
             equipment, equipment_tint,
@@ -2750,7 +2752,7 @@ mod tests {
             dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9],
             helm: 0, showhelm: 0,
-            face: 0, hairstyle: 0,
+            face: 0, hairstyle: 0, haircolor: 0,
         });
         // Build a 32-byte Death_Struct payload: spawn_id=42, killer_id=1 (player)
         let mut pkt = [0u8; 32];
