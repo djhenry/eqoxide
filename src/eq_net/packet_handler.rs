@@ -33,6 +33,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_SIMPLE_MESSAGE       => apply_simple_message(gs, p),
         OP_EMOTE                => apply_emote(gs, p),
         OP_CONSIDER             => apply_consider(gs, p),
+        OP_SPAWN_APPEARANCE     => apply_spawn_appearance(gs, p),
         OP_SEND_ZONE_POINTS           => apply_zone_points(gs, p),
         OP_SPAWN_DOOR           => apply_spawn_doors(gs, p),
         OP_MOVE_DOOR            => apply_move_door(gs, p),
@@ -1171,6 +1172,27 @@ fn apply_consider(gs: &mut GameState, payload: &[u8]) {
     gs.log_msg("combat", &msg);
 }
 
+/// OP_SpawnAppearance render-side handler: `{ id: u16, kind: u16, param: u32 }`.
+///
+/// We only consume the ANIMATION appearance (kind 14) for OUR OWN player, mapping param 110→sitting,
+/// 100→standing. A client-initiated sit/stand is issued on the nav thread, which sets the *nav*
+/// GameState's `sitting` and mirrors the same appearance packet here through `app_tx` (like the
+/// target/money bridges) — without this handler the render GameState's `sitting` never flips, so the
+/// player's own sit animation never plays (#53, the two-GameState split). Server broadcasts of the
+/// same opcode also land here. Other kinds / other spawns are ignored (their pose comes from spawn
+/// and scene state).
+fn apply_spawn_appearance(gs: &mut GameState, payload: &[u8]) {
+    if payload.len() < 8 { return; }
+    let id    = u16::from_le_bytes([payload[0], payload[1]]) as u32;
+    let kind  = u16::from_le_bytes([payload[2], payload[3]]);
+    let param = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    const ANIMATION: u16 = 14;
+    const SITTING:   u32 = 110;
+    if kind == ANIMATION && id == gs.player_id {
+        gs.sitting = param == SITTING;
+    }
+}
+
 /// OP_SpecialMesg — NPC dialogue / emotes, where quest text arrives.
 /// SpecialMesg_Struct: header[3] + msg_type(u32) + target_spawn_id(u32) +
 /// sayer(null-terminated, variable) + unknown[12] + message(null-terminated).
@@ -1432,7 +1454,7 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
 mod tests {
     use super::{apply_emote, apply_death, class_name, con_color, consider_message, parse_player_profile,
                 parse_begin_cast, parse_memorize_spell, apply_char_inventory,
-                apply_money_update, apply_money_on_corpse, apply_set_target,
+                apply_money_update, apply_money_on_corpse, apply_set_target, apply_spawn_appearance,
                 extract_saylink_text, apply_task_description, apply_completed_tasks, apply_task_select_window,
                 strip_say_links, SAY_LINK_BODY_SIZE, SIZE_DEATH};
     use crate::game_state::{GameState, Entity, TaskStatus};
@@ -1582,6 +1604,24 @@ mod tests {
         assert_eq!(gs.inventory.iter().find(|x| x.item_id == 9131).unwrap().slot, 26,
             "new loot goes to the first free general slot");
         assert_eq!(gs.inventory.len(), 4);
+    }
+
+    #[test]
+    fn apply_spawn_appearance_toggles_player_sitting() {
+        // The synthetic bridge (nav -> render gs) for a client-initiated sit must flip the RENDER
+        // gs.sitting so the player's own sit animation plays. (eqoxide#53, two-GameState split)
+        let mut gs = GameState::new();
+        gs.player_id = 77;
+        // kind 14 (Animation), param 110 (sit) for our own id -> sitting.
+        apply_spawn_appearance(&mut gs, &crate::eq_net::navigation::build_spawn_appearance_packet(77, 14, 110));
+        assert!(gs.sitting, "sit appearance for our player must set render sitting");
+        // param 100 (stand) -> not sitting.
+        apply_spawn_appearance(&mut gs, &crate::eq_net::navigation::build_spawn_appearance_packet(77, 14, 100));
+        assert!(!gs.sitting, "stand appearance clears render sitting");
+        // Another spawn's sit must NOT change our flag.
+        apply_spawn_appearance(&mut gs, &crate::eq_net::navigation::build_spawn_appearance_packet(77, 14, 110));
+        apply_spawn_appearance(&mut gs, &crate::eq_net::navigation::build_spawn_appearance_packet(999, 14, 100));
+        assert!(gs.sitting, "another spawn's stand must not clear our sitting");
     }
 
     #[test]
