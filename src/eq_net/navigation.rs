@@ -1255,10 +1255,33 @@ impl Navigator {
             return;
         }
 
+        // Dead men don't walk (eqoxide#61): once the player is slain, abandon any /goto instead of
+        // advancing a corpse through waypoint after waypoint ("no progress… skipping" forever). The
+        // route is cleared, so a later respawn/relog starts fresh rather than resuming the old path.
+        if gs.player_dead {
+            if self.goto_target.lock().unwrap().take().is_some() {
+                tracing::info!("NAV: player is dead — abandoning /goto");
+            }
+            self.path.clear();
+            self.path_goal = None;
+            self.path_i = 0;
+            *self.nav_intent.lock().unwrap() = None; // stop driving the controller
+            return;
+        }
+
         let goto = *self.goto_target.lock().unwrap(); // copy out so the lock is released
         let goal = match goto {
             Some(t) => t,
-            None    => { self.path.clear(); self.path_goal = None; return }
+            // No active /goto ⇒ the controller must not be nav-driven. Clearing nav_intent here is the
+            // catch-all for the invariant "no goto ⇒ no nav movement": any stop that cleared
+            // goto_target without also clearing nav_intent would otherwise leave the controller
+            // walking the last wish_dir forever (eqoxide#71). Harmless when already None.
+            None    => {
+                self.path.clear();
+                self.path_goal = None;
+                *self.nav_intent.lock().unwrap() = None;
+                return;
+            }
         };
 
         // (Re)compute a wall-avoiding A* path when the goal changes. find_path returns
@@ -1272,9 +1295,21 @@ impl Navigator {
             // Route with the native collision radius (1.0, was 2.0): the 2× radius boxed the player
             // out of gaps the native client threads, causing "boxed in by walls" / platform stalls
             // (issues #22/#13/#2). Collide-and-slide in the controller keeps it off walls.
+            // Aggro-avoidance (#67): route AROUND live NPC camps so a long goto doesn't plow through
+            // a mob group and get the player killed. Exclude NPCs near the GOAL — you're walking TO
+            // the destination (often a target mob), so its own camp must not be avoided.
+            const NEAR_GOAL_SQ: f32 = 55.0 * 55.0;
+            let avoid: Vec<[f32; 2]> = gs.entities.values()
+                .filter(|e| e.is_npc && !e.dead)
+                .filter(|e| {
+                    let (dx, dy) = (e.x - goal.0, e.y - goal.1);
+                    dx * dx + dy * dy > NEAR_GOAL_SQ
+                })
+                .map(|e| [e.x, e.y])
+                .collect();
             self.path = match self.collision.read().unwrap().as_ref() {
                 Some(c) => c
-                    .find_path([gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], crate::movement::PLAYER_RADIUS)
+                    .find_path([gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], crate::movement::PLAYER_RADIUS, &avoid)
                     .unwrap_or_default(),
                 None => Vec::new(),
             };
@@ -1319,6 +1354,8 @@ impl Navigator {
                     drop_to_target, max_dmg, gs.cur_hp);
                 gs.log_msg("zone", "Fall too dangerous (HP too low) — stopped at the ledge");
                 *self.goto_target.lock().unwrap() = None;
+                *self.nav_intent.lock().unwrap() = None; // else the controller keeps walking the last
+                // wish_dir forever — drifting 1000s of units with no nav activity (eqoxide#71).
                 return;
             }
             self.falling = Some(target.2);

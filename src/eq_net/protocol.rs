@@ -103,7 +103,8 @@ pub const OP_WEAR_CHANGE: u16 = 0x7994; // RoF2: OP_WearChange
 
 // ── Gameplay: combat ──────────────────────────────────────────────────────
 
-pub const OP_HP_UPDATE: u16 = 0x2828;         // RoF2: OP_HPUpdate
+pub const OP_HP_UPDATE: u16 = 0x2828;         // RoF2: OP_HPUpdate (full cur/max, self+group only)
+pub const OP_MOB_HEALTH: u16 = 0x37b1;        // RoF2: OP_MobHealth (percent-only, to everyone targeting the mob)
 pub const OP_DEATH: u16 = 0x6517;             // RoF2: OP_Death
 pub const OP_DAMAGE: u16 = 0x6f15;            // RoF2: OP_Damage
 pub const OP_AUTO_ATTACK: u16 = 0x109d;       // RoF2: OP_AutoAttack
@@ -149,6 +150,15 @@ pub const OP_TRADE_REQUEST_ACK: u16  = 0x14bf; // RoF2: OP_TradeRequestAck; S->C
 pub const OP_TRADE_ACCEPT_CLICK: u16 = 0x69e2; // RoF2: OP_TradeAcceptClick; C->S, TradeAccept_Struct {from_mob_id, unknown4} (8b)
 pub const OP_FINISH_TRADE: u16       = 0x3993; // RoF2: OP_FinishTrade; S->C, 0 bytes — turn-in completed
 pub const OP_CANCEL_TRADE: u16       = 0x354c; // RoF2: OP_CancelTrade; C->S, abort the trade session (cleanup)
+
+/// Build an 8-byte `TradeRequest_Struct { to_mob_id, from_mob_id }` (also the wire form
+/// of OP_TradeRequestAck). Used both to initiate a trade and to accept an incoming one.
+pub fn build_trade_request(to_mob_id: u32, from_mob_id: u32) -> [u8; 8] {
+    let mut buf = [0u8; 8];
+    buf[0..4].copy_from_slice(&to_mob_id.to_le_bytes());
+    buf[4..8].copy_from_slice(&from_mob_id.to_le_bytes());
+    buf
+}
 // Wire slot ids: cursor = 30, the NPC's first trade slot begins at 3000.
 pub const SLOT_CURSOR: u32           = 33; // RoF2 cursor slot (Titanium was 30)
 pub const SLOT_TRADE_BEGIN: u32      = 3000;
@@ -754,14 +764,35 @@ pub const SIZE_LOGIN_INFO: usize = 464;  // LoginInfo_S
 /// rof2_structs.h: spawn_id(u16)+vehicle_id(u16)+5×bit-packed-u32 = 2+2+20 = 24.
 pub const SIZE_SPAWN_POSITION_UPDATE: usize = 24;
 pub const SIZE_HP_UPDATE: usize = 10;   // HPUpdate_S
+pub const SIZE_MOB_HEALTH: usize = 3;   // MobHealth_S (SpawnHPUpdate_Struct2)
 pub const SIZE_DEATH: usize = 32;       // Death_S
 pub const SIZE_ZONE_POINT_ENTRY: usize = 32; // RoF2 ZonePoint_Entry (was 24 — misaligned)
 pub const SIZE_SPAWN_APPEARANCE: usize = 8; // SpawnAppearance_S
 pub const SIZE_CONSIDER: usize = 32;     // Consider_S
-pub const SIZE_EXP_UPDATE: usize = 4;   // ExpUpdate_S
+pub const SIZE_EXP_UPDATE: usize = 8;   // ExpUpdate_S (exp + aaxp)
 pub const SIZE_LEVEL_UPDATE: usize = 12; // LevelUpdate_S
 pub const SIZE_MONEY_ON_CORPSE: usize = 20; // MoneyOnCorpse_S
 pub const SIZE_ZONE_CHANGE: usize = 100;  // RoF2 ZoneChange_Struct (was 88; success@92)
+
+/// Build a client→server OP_ZoneChange packet (RoF2 ZoneChange_Struct, 100B):
+/// char_name@0, zone_id@64, instance_id@66, then y@76, x@80, z@84 (RoF2 puts the
+/// coords 8 bytes later than Titanium). Used both for a normal cross-zone transition
+/// and to finalize a death/bind respawn (the server holds us in a ZoneToBindPoint
+/// zoning state until it receives this — eqoxide#75).
+pub fn build_zone_change(name: &str, zone_id: u16, instance_id: u16, x: f32, y: f32, z: f32)
+    -> [u8; SIZE_ZONE_CHANGE]
+{
+    let mut buf = [0u8; SIZE_ZONE_CHANGE];
+    let nb = name.as_bytes();
+    let n = nb.len().min(64);
+    buf[..n].copy_from_slice(&nb[..n]);
+    buf[64..66].copy_from_slice(&zone_id.to_le_bytes());
+    buf[66..68].copy_from_slice(&instance_id.to_le_bytes());
+    buf[76..80].copy_from_slice(&y.to_le_bytes());
+    buf[80..84].copy_from_slice(&x.to_le_bytes());
+    buf[84..88].copy_from_slice(&z.to_le_bytes());
+    buf
+}
 
 /// WearChange_Struct (Titanium, 9 bytes). Runtime equip/unequip of one slot.
 #[repr(C, packed)]
@@ -835,6 +866,18 @@ mod tests {
     }
 
     #[test]
+    fn build_zone_change_layout() {
+        let p = build_zone_change("Katie", 54, 0, 1.0, 2.0, 3.0);
+        assert_eq!(p.len(), SIZE_ZONE_CHANGE);
+        assert_eq!(&p[..5], b"Katie");
+        assert_eq!(u16::from_le_bytes([p[64], p[65]]), 54);   // zone_id
+        assert_eq!(u16::from_le_bytes([p[66], p[67]]), 0);    // instance_id
+        assert_eq!(f32::from_le_bytes([p[76], p[77], p[78], p[79]]), 2.0); // y
+        assert_eq!(f32::from_le_bytes([p[80], p[81], p[82], p[83]]), 1.0); // x
+        assert_eq!(f32::from_le_bytes([p[84], p[85], p[86], p[87]]), 3.0); // z
+    }
+
+    #[test]
     fn respawn_reply_selects_bind_for_valid_window() {
         // 4-u32 header (initial_sel, hover_timer, unknown, num_options) + at least one option.
         let window = vec![0u8; 16 + 26];
@@ -842,6 +885,18 @@ mod tests {
         assert_eq!(respawn_window_reply(&window), Some([0, 0, 0, 0]));
         assert_eq!(build_respawn_select(0), [0, 0, 0, 0]);
         assert_eq!(build_respawn_select(2), [2, 0, 0, 0]);
+    }
+
+    #[test]
+    fn build_trade_request_packs_ids_le() {
+        // to_mob_id at [0..4], from_mob_id at [4..8], little-endian.
+        assert_eq!(build_trade_request(0x0102, 0x0304),
+                   [0x02, 0x01, 0x00, 0x00, 0x04, 0x03, 0x00, 0x00]);
+        // Accepting an incoming request swaps the ids (to = initiator, from = us).
+        let (initiator, me) = (260u32, 42u32);
+        let ack = build_trade_request(initiator, me);
+        assert_eq!(u32::from_le_bytes(ack[0..4].try_into().unwrap()), initiator);
+        assert_eq!(u32::from_le_bytes(ack[4..8].try_into().unwrap()), me);
     }
 
     #[test]
@@ -1167,13 +1222,30 @@ pub fn encode_position_update(spawn_id: u16, x: f32, y: f32, z: f32, heading: f3
     buf
 }
 
-/// HP update (10 bytes).
+/// HP update (10 bytes). Field order matches the RoF2 wire struct
+/// `SpawnHPUpdate_Struct` (spawn_id, cur_hp, max_hp) — see eqoxide#45. The three
+/// fields total 10 bytes either way, so a byte-length check never caught the
+/// earlier mis-ordering; getting the order right is what makes `spawn_id` parse
+/// from the correct offset.
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
 pub struct HPUpdate_S {
+    pub spawn_id: i16,
     pub cur_hp: u32,
     pub max_hp: i32,
+}
+
+/// Percent-only HP update (3 bytes), RoF2 `SpawnHPUpdate_Struct2`
+/// (`common/patches/rof2_structs.h`). Sent via OP_MobHealth to every client that
+/// has the mob targeted (or on their x-target) — the compact update a client gets
+/// for a mob it is merely fighting but not grouped with. `hp` is a 0-100 HP
+/// percentage (`Mob::CreateHPPacket` writes `GetHPRatio()`), not an absolute value.
+/// See eqoxide#51.
+#[repr(C, packed)]
+#[derive(Debug, Copy, Clone)]
+pub struct MobHealth_S {
     pub spawn_id: i16,
+    pub hp: u8,
 }
 
 /// Death notification (32 bytes).
@@ -1296,11 +1368,17 @@ pub struct Consider_S {
     pub unknown3: [u8; 3],
 }
 
-/// Experience update (4 bytes).
+/// Experience update (8 bytes), RoF2 `ExpUpdate_Struct`
+/// (`common/eq_packet_structs.h`). `exp` is progress through the *current* level
+/// as a ratio out of 330 — the server computes it as
+/// `330 * (m_pp.exp - EXPForLevel(lvl)) / (EXPForLevel(lvl+1) - EXPForLevel(lvl))`
+/// (`Client::SendExpZonein` / `Client::SetEXP`). `aaxp` is AA experience, unused
+/// here. Convert to a 0-100 percentage with `exp / 330 * 100`. See eqoxide#48.
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
 pub struct ExpUpdate_S {
     pub exp: u32,
+    pub aaxp: u32,
 }
 
 /// Level update (12 bytes).

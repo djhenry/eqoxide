@@ -105,6 +105,29 @@ pub fn load_spell_icons(ctx: &egui::Context) -> Vec<egui::TextureHandle> {
     out
 }
 
+/// A top-center red banner shown when the server connection has gone silent (#8), so a frozen/dead
+/// session is visible to a human player instead of looking like a normal idle scene.
+pub fn draw_connection_banner(ctx: &egui::Context, disconnected: bool) {
+    if !disconnected { return; }
+    egui::Area::new(egui::Id::new("connection_banner"))
+        .anchor(egui::Align2::CENTER_TOP, canvas_off(ctx, egui::Align2::CENTER_TOP, [0.0, 6.0]))
+        .interactable(false)
+        .show(ctx, |ui| {
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(140, 20, 20))
+                .inner_margin(egui::Margin::symmetric(12.0, 6.0))
+                .rounding(4.0)
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new("⚠ Connection lost — server not responding")
+                            .size(16.0)
+                            .color(egui::Color32::WHITE)
+                            .strong(),
+                    );
+                });
+        });
+}
+
 pub fn draw_fps(ctx: &egui::Context, fps: f32) {
     egui::Area::new(egui::Id::new("fps_counter"))
         .anchor(egui::Align2::LEFT_TOP, canvas_off(ctx, egui::Align2::LEFT_TOP, [8.0, 8.0]))
