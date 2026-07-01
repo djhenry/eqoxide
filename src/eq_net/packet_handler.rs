@@ -140,11 +140,22 @@ fn rd_u8(p: &[u8], off: &mut usize) -> u8 {
     v
 }
 
-/// Extract the display name from an EQ saylink (`\x12<id>...\x12<Name>\x12`); returns the raw
-/// string unchanged if it isn't link-formatted (e.g. empty string for "no reward item").
+/// RoF2's `SAY_LINK_BODY_SIZE` (rof2_limits.h) — fixed-width hex body (item id, augments,
+/// evolving/ornament/hash fields) that precedes the display name inside a saylink.
+const SAY_LINK_BODY_SIZE: usize = 56;
+
+/// Extract the display name from an EQ saylink. `EQ::SayLinkEngine::GenerateLink()` (EQEmu
+/// common/say_link.cpp) emits exactly two `\x12` delimiters: `\x12<56-char body><Name>\x12` — the
+/// body and name are one concatenated segment, not separately delimited. Returns the raw string
+/// unchanged if it isn't link-formatted (e.g. empty string for "no reward item") or the body is
+/// shorter than SAY_LINK_BODY_SIZE.
 fn extract_saylink_text(s: &str) -> String {
     let parts: Vec<&str> = s.split('\x12').collect();
-    if parts.len() >= 4 { parts[2].to_string() } else { s.to_string() }
+    if parts.len() >= 3 {
+        parts[1].get(SAY_LINK_BODY_SIZE..).unwrap_or("").to_string()
+    } else {
+        s.to_string()
+    }
 }
 
 /// OP_TaskDescription — a task's header + title + reward. Upserts into gs.tasks (preserving any
@@ -1309,7 +1320,8 @@ mod tests {
     use super::{apply_emote, class_name, con_color, consider_message, parse_player_profile,
                 parse_begin_cast, parse_memorize_spell, apply_char_inventory,
                 apply_money_update, apply_money_on_corpse, apply_set_target,
-                extract_saylink_text, apply_task_description, apply_completed_tasks, apply_task_select_window};
+                extract_saylink_text, apply_task_description, apply_completed_tasks, apply_task_select_window,
+                SAY_LINK_BODY_SIZE};
     use crate::game_state::{GameState, Entity, TaskStatus};
 
     fn test_entity(id: u32, name: &str, hp_pct: f32) -> Entity {
@@ -2113,7 +2125,17 @@ mod tests {
 
     #[test]
     fn extract_saylink_text_strips_link_markup() {
-        assert_eq!(extract_saylink_text("\x121234567\x12Rusty Dagger\x12"), "Rusty Dagger");
+        // Real EQEmu format (say_link.cpp GenerateLink): one \x12-delimited segment holding a
+        // fixed 56-char hex body immediately followed by the item name, closed by a second \x12.
+        let body = "0".repeat(SAY_LINK_BODY_SIZE);
+        let link = format!("\x12{body}Rusty Dagger\x12");
+        assert_eq!(extract_saylink_text(&link), "Rusty Dagger");
+    }
+
+    #[test]
+    fn extract_saylink_text_handles_short_body_without_panicking() {
+        // Malformed/truncated link shorter than the fixed body size must not panic.
+        assert_eq!(extract_saylink_text("\x12short\x12"), "");
     }
 
     #[test]
@@ -2146,7 +2168,9 @@ mod tests {
     #[test]
     fn apply_task_description_parses_reward_item_and_sequence_number() {
         let mut gs = GameState::new();
-        let p = build_task_description(3, 500, "Kill Rats", "Kill 5 rats", 10, 200, "reward!", "\x1299999\x12Rusty Dagger\x12");
+        let body = "0".repeat(SAY_LINK_BODY_SIZE);
+        let item_link = format!("\x12{body}Rusty Dagger\x12");
+        let p = build_task_description(3, 500, "Kill Rats", "Kill 5 rats", 10, 200, "reward!", &item_link);
         apply_task_description(&mut gs, &p);
         let task = gs.tasks.get(&500).expect("task inserted");
         assert_eq!(task.sequence_number, 3);
