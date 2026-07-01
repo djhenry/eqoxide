@@ -150,6 +150,15 @@ pub const OP_TRADE_REQUEST_ACK: u16  = 0x14bf; // RoF2: OP_TradeRequestAck; S->C
 pub const OP_TRADE_ACCEPT_CLICK: u16 = 0x69e2; // RoF2: OP_TradeAcceptClick; C->S, TradeAccept_Struct {from_mob_id, unknown4} (8b)
 pub const OP_FINISH_TRADE: u16       = 0x3993; // RoF2: OP_FinishTrade; S->C, 0 bytes — turn-in completed
 pub const OP_CANCEL_TRADE: u16       = 0x354c; // RoF2: OP_CancelTrade; C->S, abort the trade session (cleanup)
+
+/// Build an 8-byte `TradeRequest_Struct { to_mob_id, from_mob_id }` (also the wire form
+/// of OP_TradeRequestAck). Used both to initiate a trade and to accept an incoming one.
+pub fn build_trade_request(to_mob_id: u32, from_mob_id: u32) -> [u8; 8] {
+    let mut buf = [0u8; 8];
+    buf[0..4].copy_from_slice(&to_mob_id.to_le_bytes());
+    buf[4..8].copy_from_slice(&from_mob_id.to_le_bytes());
+    buf
+}
 // Wire slot ids: cursor = 30, the NPC's first trade slot begins at 3000.
 pub const SLOT_CURSOR: u32           = 33; // RoF2 cursor slot (Titanium was 30)
 pub const SLOT_TRADE_BEGIN: u32      = 3000;
@@ -841,6 +850,18 @@ mod tests {
         assert_eq!(respawn_window_reply(&window), Some([0, 0, 0, 0]));
         assert_eq!(build_respawn_select(0), [0, 0, 0, 0]);
         assert_eq!(build_respawn_select(2), [2, 0, 0, 0]);
+    }
+
+    #[test]
+    fn build_trade_request_packs_ids_le() {
+        // to_mob_id at [0..4], from_mob_id at [4..8], little-endian.
+        assert_eq!(build_trade_request(0x0102, 0x0304),
+                   [0x02, 0x01, 0x00, 0x00, 0x04, 0x03, 0x00, 0x00]);
+        // Accepting an incoming request swaps the ids (to = initiator, from = us).
+        let (initiator, me) = (260u32, 42u32);
+        let ack = build_trade_request(initiator, me);
+        assert_eq!(u32::from_le_bytes(ack[0..4].try_into().unwrap()), initiator);
+        assert_eq!(u32::from_le_bytes(ack[4..8].try_into().unwrap()), me);
     }
 
     #[test]
