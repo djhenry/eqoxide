@@ -298,13 +298,17 @@ pub fn build_group_follow(inviter_name: &str, invitee_name: &str) -> [u8; 152] {
     buf
 }
 
-/// OP_GroupDisband payload (leave/kick/decline-cleanup). NOTE: this opcode uses the COMMON
-/// (non-RoF2-namespaced) GroupGeneric_Struct — only 128 bytes: name1[64], name2[64], NO trailing
-/// u32s, unlike the 148-byte version used for the other Group opcodes. `own_name` is the acting
-/// player's own name; `target_name` is who's being removed (self for leave/decline, the kicked
-/// member's name for a kick).
-pub fn build_group_disband(own_name: &str, target_name: &str) -> [u8; 128] {
-    let mut buf = [0u8; 128];
+/// OP_GroupDisband payload (leave/kick/decline-cleanup). CONFIRMED LIVE (2026-07-01, task-6
+/// validation pass) against a running EQEmu RoF2 zone server: the doc's inferred 128-byte
+/// "common" GroupGeneric_Struct is WRONG for this opcode — the server logged
+/// `Wrong size on incoming [OP_GroupDisband] (structs::GroupGeneric_Struct): Got [128], expected
+/// [148]` and silently dropped the packet (no roster change, no disband on either side). The
+/// server actually wants the 148-byte RoF2-namespaced struct (same shape as GroupInvite_Struct):
+/// name1[64], name2[64], then 5 trailing zero uint32s. `own_name` is the acting player's own
+/// name; `target_name` is who's being removed (self for leave/decline, the kicked member's name
+/// for a kick).
+pub fn build_group_disband(own_name: &str, target_name: &str) -> [u8; 148] {
+    let mut buf = [0u8; 148];
     let n = own_name.as_bytes().len().min(63);
     buf[0..n].copy_from_slice(&own_name.as_bytes()[..n]);
     let n2 = target_name.as_bytes().len().min(63);
@@ -1894,13 +1898,17 @@ mod tests {
     }
 
     #[test]
-    fn build_group_disband_layout_is_128_bytes_not_148() {
-        // The single highest-risk byte-layout detail in this feature: this specific opcode uses the
-        // COMMON (non-RoF2-namespaced) 128-byte GroupGeneric_Struct, unlike every other Group opcode.
+    fn build_group_disband_layout_is_148_bytes_confirmed_live() {
+        // CONFIRMED against a running EQEmu RoF2 zone server (task-6 live validation, 2026-07-01):
+        // the doc's inferred 128-byte COMMON GroupGeneric_Struct was wrong for this build — the
+        // server rejected it ("Wrong size on incoming [OP_GroupDisband] ... Got [128], expected
+        // [148]") and silently dropped leave/kick/decline packets. It wants the 148-byte
+        // RoF2-namespaced struct (name1[64], name2[64], 5 trailing zero uint32s), like GroupInvite.
         let b = build_group_disband("Aldric", "Sariel");
-        assert_eq!(b.len(), 128);
+        assert_eq!(b.len(), 148);
         assert_eq!(&b[0..6], b"Aldric");
         assert_eq!(&b[64..70], b"Sariel");
+        assert!(b[128..148].iter().all(|&x| x == 0), "trailing 20 bytes (5 u32s) must be zero-filled");
     }
 
     #[test]
