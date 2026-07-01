@@ -33,20 +33,24 @@ async fn post_goto(
         Err(_) => return (StatusCode::BAD_REQUEST, "invalid JSON".into()),
     };
 
+    // For a name-goto we capture the matched entity KEY (not just its position) so the walker can
+    // CHASE it — re-resolve its current position each tick (eqoxide#88). Coordinate gotos leave it None.
+    let mut entity_key: Option<String> = None;
     let target = if let Some(name) = &b.name {
         let positions = s.entity_positions.lock().unwrap();
         let nl = name.to_lowercase();
-        // Exact key match first, then clean-name match, then substring fallback.
-        let matched = positions.get(name.as_str()).map(|&p| p)
+        // Exact key match first, then clean-name match, then substring fallback — capturing the KEY.
+        let matched: Option<(String, (f32, f32, f32))> =
+            positions.get_key_value(name.as_str()).map(|(k, &p)| (k.clone(), p))
             .or_else(|| positions.iter()
                 .find(|(k, _)| clean_entity_name(k).to_lowercase() == nl)
-                .map(|(_, &p)| p))
+                .map(|(k, &p)| (k.clone(), p)))
             .or_else(|| positions.iter()
                 .find(|(k, _)| clean_entity_name(k).to_lowercase().contains(&nl)
                     || k.to_lowercase().contains(&nl))
-                .map(|(_, &p)| p));
+                .map(|(k, &p)| (k.clone(), p)));
         match matched {
-            Some(pos) => pos,
+            Some((key, pos)) => { entity_key = Some(key); pos }
             None => {
                 let known: Vec<_> = positions.keys()
                     .filter(|k| k.to_lowercase().contains(&nl))
@@ -59,6 +63,7 @@ async fn post_goto(
                 match positions.get(&known[0]).copied() {
                     Some(pos) => {
                         tracing::info!("goto: fuzzy match {:?} → {:?}", name, known[0]);
+                        entity_key = Some(known[0].clone());
                         pos
                     }
                     None => return (StatusCode::NOT_FOUND, format!("No entity named {:?}", name)),
@@ -79,8 +84,14 @@ async fn post_goto(
         return (StatusCode::BAD_REQUEST, "provide 'name', 'map_x'+'map_y', or 'x'+'y'+'z'".into());
     };
 
+    // Set the position FIRST, then the chase key, so the walker never sees a lingering chase name
+    // with no target (which it would read as a cancellation). None here also cancels a prior chase.
     *s.goto_target.lock().unwrap() = Some(target);
-    tracing::info!("goto: target set to ({:.1},{:.1},{:.1})", target.0, target.1, target.2);
+    *s.goto_entity.lock().unwrap() = entity_key.clone();
+    match &entity_key {
+        Some(k) => tracing::info!("goto: chasing entity {:?} from ({:.1},{:.1},{:.1})", k, target.0, target.1, target.2),
+        None    => tracing::info!("goto: target set to ({:.1},{:.1},{:.1})", target.0, target.1, target.2),
+    }
     (StatusCode::OK, format!("navigating to ({:.1},{:.1},{:.1})", target.0, target.1, target.2))
 }
 
