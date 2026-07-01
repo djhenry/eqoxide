@@ -17,6 +17,12 @@ use crate::game_state::GameState;
 
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
+/// Respawn safety-net (eqoxide#50): if the player has been dead this long without the
+/// server opening/honoring the respawn window, proactively request a bind respawn.
+const RESPAWN_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often to re-send the bind-respawn request while still stuck dead.
+const RESPAWN_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Consume the zone stream and run the gameplay loop indefinitely.
 pub async fn run_gameplay_phase(
     stream_init:   EqStream,
@@ -34,6 +40,8 @@ pub async fn run_gameplay_phase(
     let mut stream: Option<EqStream>                      = Some(stream_init);
     let mut net_rx: Option<UnboundedReceiver<AppPacket>>  = Some(net_rx_init);
     let mut last_keepalive = std::time::Instant::now();
+    // Last time the respawn safety-net re-sent a bind-respawn request (eqoxide#50).
+    let mut last_respawn_retry: Option<std::time::Instant> = None;
 
     loop {
         let s  = stream.as_mut().expect("stream always Some in loop");
@@ -297,6 +305,29 @@ pub async fn run_gameplay_phase(
         if last_keepalive.elapsed() > KEEPALIVE_INTERVAL {
             s.send_keepalive();
             last_keepalive = std::time::Instant::now();
+        }
+
+        // Respawn safety-net (eqoxide#50): the server intermittently fails to send
+        // OP_RespawnWindow — or sends it but never applies the follow-up respawn —
+        // leaving the character stuck dead in place. If we've been dead past
+        // RESPAWN_TIMEOUT, proactively send the bind-respawn reply (option 0) and keep
+        // retrying every RESPAWN_RETRY_INTERVAL. Harmless if the server isn't holding a
+        // window (it just ignores the reply); player_dead_since clears once HP returns.
+        match gs.player_dead_since {
+            Some(dead_since)
+                if dead_since.elapsed() > RESPAWN_TIMEOUT
+                    && last_respawn_retry.map_or(true, |t| t.elapsed() > RESPAWN_RETRY_INTERVAL) =>
+            {
+                s.send_app_packet(OP_RESPAWN_WINDOW, &build_respawn_select(0));
+                gs.log_msg("combat", "No respawn — re-requesting bind respawn.");
+                tracing::warn!(
+                    "EQ: respawn safety-net — sent bind respawn (dead {}s, no recovery)",
+                    dead_since.elapsed().as_secs()
+                );
+                last_respawn_retry = Some(std::time::Instant::now());
+            }
+            None => last_respawn_retry = None,
+            _ => {}
         }
 
         navigator.tick(s, &mut gs, &app_tx);
