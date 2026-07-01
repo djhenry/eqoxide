@@ -33,6 +33,7 @@ pub mod pass;
 pub mod pipeline;
 pub mod renderer;
 pub mod scene;
+pub mod skills;
 
 // Modules only needed by the full client binary.
 pub mod camera_state;

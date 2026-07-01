@@ -20,6 +20,7 @@ pub(super) fn router() -> Router<HttpState> {
         .route("/inventory", get(get_inventory))
         .route("/messages", get(get_messages))
         .route("/spells", get(get_spells))
+        .route("/skills", get(get_skills))
         .route("/doors", get(get_doors))
         .route("/zone_points", get(get_zone_points))
 }
@@ -140,6 +141,18 @@ async fn get_spells(State(s): State<HttpState>) -> Json<serde_json::Value> {
         }
     }).collect();
     Json(serde_json::json!({ "gems": gems }))
+}
+
+/// GET /v1/observe/skills — the player's skills with current values (eqoxide#99). `value == 0`
+/// means untrained. Ids/names are the RoF2 skill enum (`crate::skills`); an agent uses this to
+/// decide what to train at a guildmaster and to notice when a skill is capped.
+async fn get_skills(State(s): State<HttpState>) -> Json<serde_json::Value> {
+    let skills = s.player_info.lock().unwrap().skills.clone();
+    let list: Vec<_> = (0..crate::skills::NUM_SKILLS).map(|id| {
+        let value = skills.get(id).copied().unwrap_or(0);
+        serde_json::json!({ "id": id, "name": crate::skills::skill_name(id as u32), "value": value })
+    }).collect();
+    Json(serde_json::json!({ "skills": list }))
 }
 
 /// GET /v1/observe/doors — list the current zone's doors (id, name, position, opentype, open state).
