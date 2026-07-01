@@ -195,6 +195,21 @@ pub struct ChatLogEvent {
     pub text:     String,
 }
 
+/// One member of the player's current group (from OP_GroupUpdateB/OP_GroupUpdate/
+/// OP_GroupLeaderChange). `tank`/`assist`/`puller` are read-only role badges the server pushes —
+/// eqoxide does not expose a way to set them (v1 scope).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GroupMember {
+    pub name: String,
+    pub level: u32,
+    pub is_leader: bool,
+    pub is_merc: bool,
+    pub tank: bool,
+    pub assist: bool,
+    pub puller: bool,
+    pub offline: bool,
+}
+
 /// All state the renderer needs for one frame.
 #[derive(Debug, Default, Clone)]
 pub struct GameState {
@@ -349,6 +364,15 @@ pub struct GameState {
     pub merchant_open: Option<u32>,
     /// Items the open merchant offers (cleared on close). From OP_ItemPacket(PacketType=Merchant).
     pub merchant_items: Vec<MerchantItem>,
+
+    /// Current group roster (empty = not grouped). Full-replaced by OP_GroupUpdateB, incrementally
+    /// updated by OP_GroupUpdate/OP_GroupDisbandOther/OP_GroupLeaderChange.
+    pub group_members: Vec<GroupMember>,
+    /// Current group leader's name ("" if unknown/not grouped).
+    pub group_leader: String,
+    /// Inviter's name while an incoming invite awaits accept/decline via POST
+    /// /v1/group/accept|decline. None when there's no open invite.
+    pub pending_invite: Option<String>,
 }
 
 impl GameState {
