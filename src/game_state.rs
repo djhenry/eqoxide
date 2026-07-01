@@ -43,6 +43,8 @@ pub struct Entity {
     /// Hair style (from Spawn_Struct `hairstyle`).  0 = bald.  Rendered hair primitive
     /// has `eq_part_index == hairstyle` (when > 0).
     pub hairstyle: u8,
+    /// Hair color index (Spawn_Struct `haircolor`, 0-23). Runtime-tints synthetic hair shells only.
+    pub haircolor: u8,
     /// Server animation state (Animation::Standing=100, Sitting=110, Crouching=111, etc.)
     pub animation: u32,
 }
@@ -229,6 +231,9 @@ pub struct GameState {
     pub player_face: u8,
     /// Player hair style (from PlayerProfile `hairstyle`, offset 00896). 0 = bald.
     pub player_hairstyle: u8,
+    /// Player hair color (PlayerProfile `haircolor`, offset 00888). Runtime-tints hair shells only.
+    /// (Player hair is not helm-hidden — the player's `showhelm` flag isn't tracked; NPCs are.)
+    pub player_haircolor: u8,
     pub player_action: String,
     pub hp_pct: f32,
     /// Player's absolute current/max HP (from OP_HP_UPDATE), used for the lethal-fall guard.
@@ -569,7 +574,7 @@ mod tests {
             heading: 0.0,
             dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
-            face: 0, hairstyle: 0,
+            face: 0, hairstyle: 0, haircolor: 0,
             animation: 0,
         }
     }
