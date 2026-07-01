@@ -130,13 +130,13 @@ async fn post_cancel(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
 
-    fn empty_state() -> HttpState {
+    pub(crate) fn empty_state() -> HttpState {
         HttpState {
             cmd_tx: Arc::new(Mutex::new(None)),
             snapshot: Arc::new(Mutex::new(crate::camera_state::CameraSnapshot {
@@ -184,6 +184,13 @@ mod tests {
             doors_shared: Arc::new(Mutex::new(Vec::new())),
             camp: Arc::new(Mutex::new(None)),
             camp_until: Arc::new(Mutex::new(None)),
+            group:             Arc::new(Mutex::new(GroupSnapshot::default())),
+            group_invite:      Arc::new(Mutex::new(None)),
+            group_accept:      Arc::new(Mutex::new(None)),
+            group_decline:     Arc::new(Mutex::new(None)),
+            group_leave:       Arc::new(Mutex::new(None)),
+            group_kick:        Arc::new(Mutex::new(None)),
+            group_make_leader: Arc::new(Mutex::new(None)),
         }
     }
 
