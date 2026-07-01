@@ -930,9 +930,14 @@ impl Navigator {
         let sit_req = self.sit.lock().unwrap().take();
         if let Some(sit) = sit_req {
             let param = if sit { 110u32 } else { 100u32 };
-            stream.send_app_packet(OP_SPAWN_APPEARANCE,
-                &build_spawn_appearance_packet(gs.player_id as u16, 14, param));
+            let payload = build_spawn_appearance_packet(gs.player_id as u16, 14, param);
+            stream.send_app_packet(OP_SPAWN_APPEARANCE, &payload);
             gs.sitting = sit;
+            // Bridge to the RENDER GameState so the player's OWN sit animation plays. A client-
+            // initiated sit sets only the nav-thread `gs.sitting`; the render loop reads its separate
+            // GameState, updated solely from `app_tx`. Mirror the appearance through a synthetic
+            // packet (apply_spawn_appearance), same pattern as the target/money bridges. (#53)
+            let _ = app_tx.send(AppPacket { opcode: OP_SPAWN_APPEARANCE, payload });
             tracing::info!("EQ: {}", if sit { "sit" } else { "stand" });
         }
 
