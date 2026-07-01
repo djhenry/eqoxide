@@ -1403,6 +1403,7 @@ impl App {
                 hud::draw_control_bar(ctx, ui_layout, scene, hail, say, target, say_buffer, camp, camp_until);
                 hud::draw_action_grid(ctx, ui_layout, scene, spells, spell_icons, attack, cast, sit, target, consider);
                 hud::draw_inventory(ctx, ui_layout, scene, show_inventory);
+                hud::draw_group_roster(ctx, ui_layout, scene);
                 hud::draw_merchant(ctx, ui_layout, scene, buy, sell, trade);
                 if show_debug {
                     hud::draw_debug_overlay(ctx, scene.player_pos, scene.player_heading, current_zone, corrections);
