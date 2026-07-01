@@ -109,6 +109,18 @@ fn resolve_overlay_tex<'a>(
             if let Some(Some(bg)) = r.equipment_tex_cache.get(&key) { return Some(bg); }
         }
     }
+    // Final base-cloth fallback: a BODY piece whose exact variant's baseline-cloth texture was
+    // never extracted still renders clothed by borrowing variant-01 of the same region. The male
+    // equip-texture sets are incomplete (e.g. wood-elf male ships elmch0001/0002 but NOT elmch0003,
+    // and only variant-01 of the arms) where the female set is complete — so without this, male
+    // humanoids rendered bare on exactly those pieces while females looked fine. Skin regions
+    // (he/hn/ft) are excluded so bare hands/head/feet stay skin. (eqoxide#82)
+    if !matches!(&es.region, b"he" | b"hn" | b"ft") && es.variant != 1 {
+        let base = crate::models::EquipSlot { variant: 1, ..es };
+        if let Some(key) = crate::models::equip_swap_key(prefix, base, 0) {
+            if let Some(Some(bg)) = r.equipment_tex_cache.get(&key) { return Some(bg); }
+        }
+    }
     None
 }
 
