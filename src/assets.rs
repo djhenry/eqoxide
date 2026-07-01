@@ -913,6 +913,14 @@ impl Collision {
         let (sc, sr) = to_cell(start[0], start[1]);
         let (gc, gr) = to_cell(goal[0], goal[1]);
         if (sc, sr) == (gc, gr) { return Some(vec![[goal[0], goal[1], goal[2]]]); }
+        // The goal's TIER: the walkable surface at the goal XY nearest the requested goal z. On a
+        // zone with stacked levels (neriakc, a walkway over a lower floor) the goal cell exists at
+        // several heights; A* must finish on the one the caller asked for, else it routes the whole
+        // approach along the wrong tier and the walker stalls / lands a level off (#35). A generous
+        // ±STEP_UP band resolves the tier even if goal z is a little off the exact floor.
+        let goal_floor = self.nearest_floor(goal[0], goal[1], goal[2], STEP_UP, STEP_UP)
+            .unwrap_or(goal[2]);
+        const GOAL_TIER_TOL: f32 = 8.0; // reached floor within this of goal_floor == the right tier
         // The caller's z can be stale, so find the start floor by trying several reference levels.
         let start_floor = [start[2], goal[2], 0.0, -60.0, -120.0]
             .into_iter()
@@ -946,10 +954,21 @@ impl Collision {
         heap.push(Node { f: h(sc, sr), c: sc, r: sr, fz: start_floor });
         let mut expanded = 0usize;
         let mut goal_key: Option<Key> = None;
+        // A goal-cell node reached at the WRONG tier — kept as a last resort so we never regress to
+        // "no route" when the requested tier is unreachable (better a wrong-tier path than none).
+        let mut goal_fallback: Option<Key> = None;
         while let Some(Node { c, r, fz, .. }) = heap.pop() {
             let ckey = (c, r, qf(fz));
             if !closed.insert(ckey) { continue; } // already expanded
-            if (c, r) == (gc, gr) { goal_key = Some(ckey); break; }
+            if (c, r) == (gc, gr) {
+                if (fz - goal_floor).abs() <= GOAL_TIER_TOL {
+                    goal_key = Some(ckey); // reached the goal cell on the requested tier — done
+                    break;
+                }
+                // Wrong tier: remember the first (cheapest) one, but keep searching — the right tier
+                // may be reachable by climbing to it at an adjacent cell. Fall through and expand.
+                if goal_fallback.is_none() { goal_fallback = Some(ckey); }
+            }
             expanded += 1;
             if expanded > MAX_NODES { break; }
             let cz = fz;
@@ -1037,11 +1056,13 @@ impl Collision {
                 }
             }
         }
-        let goal_key = match goal_key {
+        // Prefer the requested tier; fall back to a wrong-tier goal only if the right tier is
+        // unreachable (keeps the old "reach the goal cell at all" behaviour as a floor).
+        let goal_key = match goal_key.or(goal_fallback) {
             Some(k) => k,
             None => {
-                tracing::info!("find_path: no route (expanded={}, cap={}, start_floor={})",
-                    expanded, MAX_NODES, start_floor);
+                tracing::info!("find_path: no route (expanded={}, cap={}, start_floor={}, goal_floor={})",
+                    expanded, MAX_NODES, start_floor, goal_floor);
                 return None;
             }
         };
