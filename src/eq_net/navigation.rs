@@ -1217,9 +1217,21 @@ impl Navigator {
             // Route with the native collision radius (1.0, was 2.0): the 2× radius boxed the player
             // out of gaps the native client threads, causing "boxed in by walls" / platform stalls
             // (issues #22/#13/#2). Collide-and-slide in the controller keeps it off walls.
+            // Aggro-avoidance (#67): route AROUND live NPC camps so a long goto doesn't plow through
+            // a mob group and get the player killed. Exclude NPCs near the GOAL — you're walking TO
+            // the destination (often a target mob), so its own camp must not be avoided.
+            const NEAR_GOAL_SQ: f32 = 55.0 * 55.0;
+            let avoid: Vec<[f32; 2]> = gs.entities.values()
+                .filter(|e| e.is_npc && !e.dead)
+                .filter(|e| {
+                    let (dx, dy) = (e.x - goal.0, e.y - goal.1);
+                    dx * dx + dy * dy > NEAR_GOAL_SQ
+                })
+                .map(|e| [e.x, e.y])
+                .collect();
             self.path = match self.collision.read().unwrap().as_ref() {
                 Some(c) => c
-                    .find_path([gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], crate::movement::PLAYER_RADIUS)
+                    .find_path([gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], crate::movement::PLAYER_RADIUS, &avoid)
                     .unwrap_or_default(),
                 None => Vec::new(),
             };
