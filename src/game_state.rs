@@ -244,6 +244,10 @@ pub struct GameState {
     // Strategy text for HUD
     pub strategy: String,
 
+    /// True from the moment the PLAYER is slain until HP is restored (revive / respawn / heal).
+    /// The nav walker checks this to stop driving a corpse toward a stale /goto (eqoxide#61).
+    pub player_dead: bool,
+
     /// Count of server rubber-band corrections (position deltas > 5 units).
     pub server_corrections: u32,
 
@@ -404,6 +408,7 @@ impl GameState {
             self.hp_pct = (cur_hp as f32 / max_hp.max(1) as f32) * 100.0;
             self.cur_hp = cur_hp;
             self.max_hp = max_hp;
+            if cur_hp > 0 { self.player_dead = false; } // revived / healed above 0
         } else if let Some(e) = self.entities.get_mut(&spawn_id) {
             e.cur_hp = cur_hp;
             e.max_hp = max_hp;

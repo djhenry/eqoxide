@@ -666,6 +666,7 @@ fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
             gs.cur_hp = p.cur_hp as i32;
             if gs.max_hp <= 0 { gs.max_hp = p.cur_hp as i32; }
             gs.hp_pct = (gs.cur_hp as f32 / gs.max_hp.max(1) as f32) * 100.0;
+            gs.player_dead = false; // a profile with HP means we're alive (respawn/zone-in) — #61
             tracing::info!("EQ: PlayerProfile: seeded hp={}/{} ({:.0}%)", gs.cur_hp, gs.max_hp, gs.hp_pct);
         }
         // Seed mana the same way (eqoxide#27): no max in the profile, so set_mana seeds max = cur
@@ -768,6 +769,7 @@ fn apply_death(gs: &mut GameState, payload: &[u8]) {
     let killer_id = d.killer_id; // copy out of the packed struct
     if d_id == gs.player_id {
         gs.hp_pct    = 0.0;
+        gs.player_dead = true; // nav walker checks this and clears any stale /goto (eqoxide#61)
         gs.strategy  = "Dead — waiting to respawn".into();
         tracing::info!("EQ: combat: *** You have been slain! ***");
         gs.log_msg("combat", "*** You have been slain! ***");
@@ -2241,6 +2243,25 @@ mod tests {
         assert_eq!(e.animation, 115, "animation must be set to 115 (Lying) for dead clip");
         // Auto-loot queued for player's own kill
         assert!(gs.pending_loot.contains(&42), "corpse id must be queued for auto-loot");
+    }
+
+    #[test]
+    fn player_death_sets_dead_flag_and_revive_clears_it() {
+        // eqoxide#61: the nav walker keys on gs.player_dead to abandon a stale /goto.
+        use super::apply_death;
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+        gs.player_dead = false;
+        // Death_Struct: spawn_id@0 = the player, killer_id@4.
+        let mut pkt = [0u8; 32];
+        pkt[0..4].copy_from_slice(&7u32.to_le_bytes());
+        pkt[4..8].copy_from_slice(&99u32.to_le_bytes());
+        apply_death(&mut gs, &pkt);
+        assert!(gs.player_dead, "player death must set player_dead");
+        assert_eq!(gs.hp_pct, 0.0);
+        // Revive / heal above 0 clears it (respawn also clears via the profile HP seed).
+        gs.update_hp(7, 40, 100);
+        assert!(!gs.player_dead, "restoring HP must clear player_dead");
     }
 
     /// Sanity: OP_Death for the player's own id must NOT touch entities or animation=115.
