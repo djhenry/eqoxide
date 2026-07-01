@@ -283,6 +283,12 @@ pub struct GameState {
     pub casting: Option<CastState>,
     /// True when the player is sitting.
     pub sitting: bool,
+    /// When the player's own death was first observed (OP_Death for our spawn), or None
+    /// while alive. Used to (a) dedupe the duplicate OP_Death the server sometimes sends
+    /// and (b) drive the respawn safety-net that re-requests a bind respawn when the
+    /// server never opens (or never honors) the respawn window. Cleared once HP is
+    /// restored. Transient recovery bookkeeping. (eqoxide#50)
+    pub player_dead_since: Option<std::time::Instant>,
     /// True when auto-attack is enabled.
     pub auto_attack: bool,
 
@@ -408,7 +414,11 @@ impl GameState {
             self.hp_pct = (cur_hp as f32 / max_hp.max(1) as f32) * 100.0;
             self.cur_hp = cur_hp;
             self.max_hp = max_hp;
-            if cur_hp > 0 { self.player_dead = false; } // revived / healed above 0
+            // Alive again → clear the death/respawn bookkeeping. (eqoxide#61, #50)
+            if cur_hp > 0 {
+                self.player_dead = false;       // revived / healed above 0
+                self.player_dead_since = None;  // clear the respawn safety-net timer
+            }
         } else if let Some(e) = self.entities.get_mut(&spawn_id) {
             e.cur_hp = cur_hp;
             e.max_hp = max_hp;
