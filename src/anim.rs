@@ -209,6 +209,13 @@ impl SkinData {
         }
     }
 
+    /// Held poses (dead, sitting, crouching/kneeling) play their entry transition ONCE and then
+    /// HOLD the final frame — like the native client — instead of looping the stand→pose
+    /// transition endlessly (eqoxide#83). The final frame of the transition clip is the resting pose.
+    pub fn is_held_pose(action: &str) -> bool {
+        matches!(action, "dead" | "sitting" | "crouching")
+    }
+
     pub fn clip_for_action(&self, action: &str) -> Option<usize> {
         match action {
             // Death: find the D05-family death clip (name contains "death" or starts with "d05").
@@ -492,6 +499,17 @@ mod tests {
         let skin = death_skin();
         // D05A_death is clip 0; "dead" must find it.
         assert_eq!(skin.clip_for_action("dead"), Some(0), "dead → D05A_death clip (index 0)");
+    }
+
+    #[test]
+    fn held_poses_are_classified_for_play_once_hold() {
+        // eqoxide#83: dead/sitting/crouching hold their final frame; motions loop.
+        for a in ["dead", "sitting", "crouching"] {
+            assert!(SkinData::is_held_pose(a), "{a} should be a held pose");
+        }
+        for a in ["idle", "standing", "walking", "running", "wait"] {
+            assert!(!SkinData::is_held_pose(a), "{a} must NOT be a held pose (it loops/animates)");
+        }
     }
 
     #[test]
