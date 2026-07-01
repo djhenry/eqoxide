@@ -410,6 +410,13 @@ pub struct Navigator {
     completed_tasks_shared: crate::http::CompletedTasksShared,
     accept_task:           crate::http::AcceptTaskReq,
     cancel_task:           crate::http::CancelTaskReq,
+    group:             crate::http::GroupShared,
+    group_invite:      crate::http::GroupInviteReq,
+    group_accept:      crate::http::GroupAcceptReq,
+    group_decline:     crate::http::GroupDeclineReq,
+    group_leave:       crate::http::GroupLeaveReq,
+    group_kick:        crate::http::GroupKickReq,
+    group_make_leader: crate::http::GroupMakeLeaderReq,
     zone_cross:       ZoneCrossReq,
     /// Direct teleport request (POST /warp). The nav thread jumps the player to these coords,
     /// sends a position update so the server agrees, and cancels any in-progress /goto.
@@ -501,6 +508,13 @@ impl Navigator {
         completed_tasks_shared: crate::http::CompletedTasksShared,
         accept_task:           crate::http::AcceptTaskReq,
         cancel_task:           crate::http::CancelTaskReq,
+        group:             crate::http::GroupShared,
+        group_invite:      crate::http::GroupInviteReq,
+        group_accept:      crate::http::GroupAcceptReq,
+        group_decline:     crate::http::GroupDeclineReq,
+        group_leave:       crate::http::GroupLeaveReq,
+        group_kick:        crate::http::GroupKickReq,
+        group_make_leader: crate::http::GroupMakeLeaderReq,
         zone_cross:       ZoneCrossReq,
         warp:             WarpReq,
         hail:             HailReq,
@@ -541,6 +555,13 @@ impl Navigator {
             completed_tasks_shared,
             accept_task,
             cancel_task,
+            group,
+            group_invite,
+            group_accept,
+            group_decline,
+            group_leave,
+            group_kick,
+            group_make_leader,
             zone_cross,
             warp,
             hail,
@@ -623,6 +644,29 @@ impl Navigator {
         let mut completed = self.completed_tasks_shared.lock().unwrap();
         completed.clear();
         completed.extend(gs.completed_task_history.iter().cloned());
+    }
+
+    /// Publish the group roster from `gs` into the shared slot (GET /v1/group/roster + the UI
+    /// roster panel). Looks up each other member's HP% from `gs.entities` by name (group
+    /// membership is what unlocks receiving another mob's OP_MobHealth percent, so this reuses
+    /// existing Entity.hp_pct rather than needing a new opcode); the player's own HP% comes
+    /// directly from `gs.hp_pct` since the player is never in `gs.entities`.
+    pub fn sync_group(&self, gs: &GameState) {
+        let mut g = self.group.lock().unwrap();
+        g.leader = gs.group_leader.clone();
+        g.pending_invite = gs.pending_invite.clone();
+        g.you_are_leader = !gs.player_name.is_empty() && gs.group_leader == gs.player_name;
+        g.members = gs.group_members.iter().map(|m| {
+            let hp_pct = if m.name == gs.player_name {
+                gs.hp_pct
+            } else {
+                gs.entities.values().find(|e| e.name == m.name).map(|e| e.hp_pct).unwrap_or(0.0)
+            };
+            crate::http::GroupMemberView {
+                name: m.name.clone(), level: m.level, is_leader: m.is_leader, is_merc: m.is_merc,
+                tank: m.tank, assist: m.assist, puller: m.puller, offline: m.offline, hp_pct,
+            }
+        }).collect();
     }
 
     /// Publish the player's inventory + equipment from `gs` into the shared slot (GET /inventory).
@@ -801,6 +845,56 @@ impl Navigator {
             } else {
                 tracing::warn!("EQ: quests: cancel requested for unknown task_id={task_id} — ignoring");
             }
+        }
+
+        // POST /v1/group/invite {"name":"X"}: send OP_GroupInvite.
+        if let Some(target) = self.group_invite.lock().unwrap().take() {
+            stream.send_app_packet(OP_GROUP_INVITE, &build_group_invite(&target, &gs.player_name));
+            tracing::info!("EQ: group: invited {target}");
+            gs.log_msg("group", &format!("Invited {target} to group"));
+        }
+
+        // POST /v1/group/accept: send OP_GroupFollow. Optimistically clear pending_invite now —
+        // the real roster confirmation arrives via OP_GroupUpdateB/OP_GroupAcknowledge.
+        if self.group_accept.lock().unwrap().take().is_some() {
+            if let Some(inviter) = gs.pending_invite.take() {
+                stream.send_app_packet(OP_GROUP_FOLLOW, &build_group_follow(&inviter, &gs.player_name));
+                tracing::info!("EQ: group: accepted invite from {inviter}");
+                gs.log_msg("group", &format!("Accepted group invite from {inviter}"));
+            }
+        }
+
+        // POST /v1/group/decline: RoF2 has no working OP_GroupCancelInvite, so send a defensive
+        // OP_GroupDisband(self, self) cleanup instead.
+        if self.group_decline.lock().unwrap().take().is_some() {
+            if let Some(inviter) = gs.pending_invite.take() {
+                stream.send_app_packet(OP_GROUP_DISBAND, &build_group_disband(&gs.player_name, &gs.player_name));
+                tracing::info!("EQ: group: declined invite from {inviter}");
+                gs.log_msg("group", &format!("Declined group invite from {inviter}"));
+            }
+        }
+
+        // POST /v1/group/leave: send OP_GroupDisband(self, self). If leader with < 3 members this
+        // fully disbands the group server-side (no auto handoff — see Global Constraints).
+        if self.group_leave.lock().unwrap().take().is_some() {
+            stream.send_app_packet(OP_GROUP_DISBAND, &build_group_disband(&gs.player_name, &gs.player_name));
+            tracing::info!("EQ: group: left group");
+            gs.log_msg("group", "Left group");
+        }
+
+        // POST /v1/group/kick {"name":"X"}: send OP_GroupDisband(self, target). HTTP layer already
+        // validated leadership + membership before queuing this.
+        if let Some(target) = self.group_kick.lock().unwrap().take() {
+            stream.send_app_packet(OP_GROUP_DISBAND, &build_group_disband(&gs.player_name, &target));
+            tracing::info!("EQ: group: kicked {target}");
+            gs.log_msg("group", &format!("Kicked {target} from group"));
+        }
+
+        // POST /v1/group/makeleader {"name":"X"}: send OP_GroupMakeLeader.
+        if let Some(target) = self.group_make_leader.lock().unwrap().take() {
+            stream.send_app_packet(OP_GROUP_MAKE_LEADER, &build_group_make_leader(&gs.group_leader, &target));
+            tracing::info!("EQ: group: transferring leadership to {target}");
+            gs.log_msg("group", &format!("Transferred group leadership to {target}"));
         }
 
         // Check zone-cross request — warp onto a zone line, then send OP_ZONE_CHANGE.
@@ -1682,6 +1776,89 @@ pub fn make_position_packet(spawn_id: u32, x: f32, y: f32, z: f32, heading: f32)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a minimal Navigator for unit tests that only exercise a single `sync_*`/tick method —
+    /// every other shared slot gets an empty/default placeholder.
+    fn test_navigator(group: crate::http::GroupShared) -> Navigator {
+        Navigator::new(
+            Default::default(), // goto_target
+            Default::default(), // entity_positions
+            Default::default(), // entity_ids
+            Default::default(), // zone_points
+            Default::default(), // task_log
+            Default::default(), // task_offers_shared
+            Default::default(), // completed_tasks_shared
+            Default::default(), // accept_task
+            Default::default(), // cancel_task
+            group,               // group
+            Default::default(), // group_invite
+            Default::default(), // group_accept
+            Default::default(), // group_decline
+            Default::default(), // group_leave
+            Default::default(), // group_kick
+            Default::default(), // group_make_leader
+            Default::default(), // zone_cross
+            Default::default(), // warp
+            Default::default(), // hail
+            Default::default(), // say
+            Default::default(), // target
+            Default::default(), // attack
+            Default::default(), // buy
+            Default::default(), // sell
+            Default::default(), // trade
+            Default::default(), // merchant
+            Default::default(), // move_req
+            Default::default(), // give
+            Default::default(), // inventory
+            Default::default(), // loot
+            Default::default(), // door_click
+            Default::default(), // doors_shared
+            Default::default(), // messages
+            Default::default(), // chat_events
+            Default::default(), // chat_send
+            Default::default(), // cast
+            Default::default(), // mem_spell
+            Default::default(), // sit
+            Default::default(), // consider
+            Default::default(), // collision
+            std::path::PathBuf::new(), // maps_dir
+            Default::default(), // camp
+            Default::default(), // controller_view
+            Default::default(), // nav_intent
+            Default::default(), // pos_correction
+        )
+    }
+
+    #[test]
+    fn sync_group_publishes_own_and_other_member_hp_pct() {
+        use crate::game_state::{Entity, GroupMember};
+        let mut gs = GameState::new();
+        gs.player_name = "Aldric".into();
+        gs.hp_pct = 88.0;
+        gs.group_leader = "Aldric".into();
+        gs.group_members = vec![
+            GroupMember { name: "Aldric".into(), is_leader: true, level: 10, ..Default::default() },
+            GroupMember { name: "Sariel".into(), level: 8, ..Default::default() },
+        ];
+        gs.upsert_entity(Entity {
+            spawn_id: 99, name: "Sariel".into(), level: 8, is_npc: false,
+            x: 0.0, y: 0.0, z: 0.0, hp_pct: 42.0, cur_hp: 42, max_hp: 100, race: "HUM".into(),
+            heading: 0.0, dead: false, equipment: [0; 9], equipment_tint: [[0; 3]; 9],
+            gender: 0, helm: 0, showhelm: 0, face: 0, hairstyle: 0, animation: 100,
+        });
+
+        let group: crate::http::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::http::GroupSnapshot::default()));
+        let nav = test_navigator(group.clone());
+        nav.sync_group(&gs);
+
+        let snap = group.lock().unwrap();
+        assert_eq!(snap.leader, "Aldric");
+        assert!(snap.you_are_leader);
+        let aldric = snap.members.iter().find(|m| m.name == "Aldric").unwrap();
+        assert_eq!(aldric.hp_pct, 88.0); // own HP comes from gs.hp_pct, not gs.entities
+        let sariel = snap.members.iter().find(|m| m.name == "Sariel").unwrap();
+        assert_eq!(sariel.hp_pct, 42.0); // other member's HP comes from the matching Entity
+    }
 
     #[test]
     fn build_accept_new_task_layout() {

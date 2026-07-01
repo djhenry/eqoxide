@@ -184,6 +184,13 @@ OPTIONS:
     let completed_tasks_shared: http::CompletedTasksShared = Arc::new(Mutex::new(Vec::new()));
     let accept_task:           http::AcceptTaskReq        = Arc::new(Mutex::new(None));
     let cancel_task:           http::CancelTaskReq        = Arc::new(Mutex::new(None));
+    let group:             http::GroupShared         = Arc::new(Mutex::new(http::GroupSnapshot::default()));
+    let group_invite:      http::GroupInviteReq      = Arc::new(Mutex::new(None));
+    let group_accept:      http::GroupAcceptReq      = Arc::new(Mutex::new(None));
+    let group_decline:     http::GroupDeclineReq     = Arc::new(Mutex::new(None));
+    let group_leave:       http::GroupLeaveReq       = Arc::new(Mutex::new(None));
+    let group_kick:        http::GroupKickReq        = Arc::new(Mutex::new(None));
+    let group_make_leader: http::GroupMakeLeaderReq  = Arc::new(Mutex::new(None));
     let zone_cross:       http::ZoneCrossReq    = Arc::new(Mutex::new(None));
     let warp:             http::WarpReq         = Arc::new(Mutex::new(None));
     let hail:             http::HailReq         = Arc::new(Mutex::new(None));
@@ -238,6 +245,13 @@ OPTIONS:
         let cts = completed_tasks_shared.clone();
         let atk = accept_task.clone();
         let ctk = cancel_task.clone();
+        let gr  = group.clone();
+        let gi  = group_invite.clone();
+        let ga  = group_accept.clone();
+        let gd  = group_decline.clone();
+        let gl  = group_leave.clone();
+        let gk  = group_kick.clone();
+        let gml = group_make_leader.clone();
         let zc  = zone_cross.clone();
         let wp  = warp.clone();
         let hl  = hail.clone();
@@ -272,7 +286,7 @@ OPTIONS:
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, tos, cts, atk, ctk, zc, wp, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, cev, csd, ca, ms, st, co, sc, md, sd, cp, cu, cv, ni, pc).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, ga, gd, gl, gk, gml, zc, wp, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, cev, csd, ca, ms, st, co, sc, md, sd, cp, cu, cv, ni, pc).await {
                     tracing::error!("EQ: fatal: {e}");
                 }
             });
@@ -343,6 +357,13 @@ OPTIONS:
         completed_tasks_shared,
         accept_task,
         cancel_task,
+        group,
+        group_invite,
+        group_accept,
+        group_decline,
+        group_leave,
+        group_kick,
+        group_make_leader,
         door_click,
         doors_shared,
         camp.clone(),
