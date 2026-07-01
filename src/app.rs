@@ -163,6 +163,10 @@ pub struct App {
     camp_until:   crate::http::CampUntil,
     scene:        SceneState,
     app_rx:       tokio::sync::mpsc::UnboundedReceiver<AppPacket>,
+    /// When an inbound server packet was last applied. Feeds the connection-health signal
+    /// (`connected`/`last_packet_age_ms`) so a dead/frozen server is distinguishable from an idle
+    /// one instead of the world silently freezing (eqoxide#8).
+    last_inbound: std::time::Instant,
     // Frame capture for /frame API
     frame_req:    FrameReq,
     // Live player state for the /debug endpoint.
@@ -305,7 +309,7 @@ impl App {
             pick_cam_eye: [0.0; 3],
             pick_screen_w: 800,
             pick_screen_h: 600,
-            game_state, scene: SceneState::default(), app_rx, frame_req,
+            game_state, scene: SceneState::default(), app_rx, last_inbound: std::time::Instant::now(), frame_req,
             player_info, warp, shutdown, camp, camp_until, collision: None, shared_collision,
             last_grounded_z: 0.0,
             prev_render_pos: [0.0, 0.0, 0.0],
@@ -683,6 +687,7 @@ impl App {
         // Drain all queued packets; any packet may move/spawn an entity, so treat as activity.
         while let Ok(packet) = self.app_rx.try_recv() {
             apply_packet(&mut self.game_state, &packet);
+            self.last_inbound = std::time::Instant::now(); // connection-health heartbeat (#8)
             activity = true;
         }
 
@@ -805,8 +810,14 @@ impl App {
                                    .or_else(|| gs.target_name.clone()),
                 target_hp_pct: gs.target_id.and_then(|id| gs.entities.get(&id)).map(|e| e.hp_pct)
                                    .or(gs.target_hp_pct),
+                // Connection health (#8): time since the last inbound server packet. `connected`
+                // flips false after CONN_STALE_SECS of silence — the world is frozen, not idle.
+                last_packet_age_ms: self.last_inbound.elapsed().as_millis() as u64,
+                connected:          self.last_inbound.elapsed().as_secs() < crate::http::CONN_STALE_SECS,
             };
         }
+        // Mirror the health state into the scene so the HUD can show a "connection lost" banner (#8).
+        self.scene.disconnected = self.last_inbound.elapsed().as_secs() >= crate::http::CONN_STALE_SECS;
 
         // In the test zone, inject fake billboards so every loaded character model
         // is rendered side-by-side for visual debugging.
@@ -1368,6 +1379,7 @@ impl App {
 
         let full_output = egui_ctx.run(raw_input, |ctx| {
             hud::draw_fps(ctx, current_fps);
+            hud::draw_connection_banner(ctx, scene.disconnected);
             if crate::profiling::enabled() {
                 hud::draw_profile(ctx, frame_profile);
             }
