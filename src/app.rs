@@ -832,7 +832,14 @@ impl App {
         // horizontal jumps (spawns, teleports, server corrections) snap instead of sliding.
         // Done before the floor-snap below so the ground height follows the smoothed position.
         {
-            const SNAP_DIST_SQ: f32 = 25.0 * 25.0; // beyond this horizontal gap, jump not slide
+            // Snap (jump instead of slide) only on an implausibly fast jump — a real teleport /
+            // server correction — judged by the IMPLIED speed, not raw distance. RoF2 streams NPC
+            // positions sparsely and irregularly, so ordinary movement routinely covers 25-90+
+            // units between updates (measured in neriakc: median ~10 u/s, p99 ~19 u/s, essentially
+            // all < 100 u/s). The old 25-unit distance cutoff snapped ~23% of real moves into
+            // visible instant lurches; keying off implied speed lets those slide while still
+            // snapping genuine teleports (>TELEPORT_SPEED). (eqoxide#1)
+            const TELEPORT_SPEED: f32 = 100.0;     // u/s; above this an update is a teleport, not motion
             const MAX_UPD: f32 = 4.0;              // cap on the measured update interval. RoF2 NPCs
                                                    // send a position only ~every 2.7s; the old 1.0s
                                                    // cap made the pace estimate ~3x too high, so the
@@ -853,12 +860,13 @@ impl App {
                     let dx = target[0] - m.target[0];
                     let dy = target[1] - m.target[1];
                     let dz = target[2] - m.target[2];
-                    if dx * dx + dy * dy >= SNAP_DIST_SQ {
+                    let dt_upd = (now - m.last_update).as_secs_f32().clamp(0.05, MAX_UPD);
+                    let horiz = (dx * dx + dy * dy).sqrt();
+                    if horiz / dt_upd > TELEPORT_SPEED {
                         m.speed = 0.0;          // teleport / correction — snap, don't slide across
                         m.display = target;
                     } else {
-                        let dt_upd = (now - m.last_update).as_secs_f32().clamp(0.05, MAX_UPD);
-                        m.speed = (dx * dx + dy * dy + dz * dz).sqrt() / dt_upd;
+                        m.speed = (horiz * horiz + dz * dz).sqrt() / dt_upd;
                     }
                     m.target = target;
                     m.last_update = now;

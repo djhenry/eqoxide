@@ -911,14 +911,17 @@ impl EqRenderer {
                 state.animate  = skinned.skin.action_animates(action, state.clip_idx);
             }
 
-            // Advance animation time. Dead plays once then holds at the final frame;
-            // all other actions loop, with idle cycling through fidgets.
+            // Advance animation time. Held poses (dead, sitting, crouching) play their entry
+            // transition once then hold at the final frame; all other actions loop, with idle
+            // cycling through fidgets. (Previously only "dead" held — sit/kneel looped the
+            // stand→pose transition forever, eqoxide#83.)
             if state.animate && state.clip_idx < skinned.skin.clips.len() && !skinned.skin.clips.is_empty() {
                 let dur = skinned.skin.clips[state.clip_idx].duration;
                 if dur > 0.0 {
                     let next = state.time + dt;
-                    if *action == "dead" {
-                        // Play once: clamp time to duration so evaluate() returns the last frame.
+                    if crate::anim::SkinData::is_held_pose(action) {
+                        // Play once: clamp time to duration so evaluate() returns the last frame
+                        // (the resting seated/kneeling/dead pose), then stop animating and hold.
                         state.time = next.min(dur);
                         if next >= dur { state.animate = false; } // done; hold pose
                     } else if next >= dur {

@@ -460,23 +460,26 @@ fn dag_track_def<'a>(doc: &'a WldDoc, dag: &Dag) -> Option<&'a TrackDef> {
     doc.get(&track.reference)
 }
 
+/// Decode a WLD FrameTransform rotation into a unit quaternion. The four stored i16s are the
+/// quaternion (x, y, z, w) where `w` is the "rotate_denominator" — and it can legitimately be **0**,
+/// which is a valid **180° rotation**, NOT identity. The old `if denominator != 0 { … } else
+/// { IDENTITY }` guard silently dropped those flips: the wolf's rear hind-leg-top bones store
+/// x/y numerators with w=0, so they came out un-rotated and the whole rear half rendered
+/// inverted/upside-down (eqoxide#40). Only all-four-zero (unnormalizable) is a genuine identity.
+fn decode_frame_rotation(x: i16, y: i16, z: i16, w: i16) -> Quat {
+    let q = Quat::from_xyzw(x as f32, y as f32, z as f32, w as f32);
+    if q.length_squared() > 1e-12 { q.normalize() } else { Quat::IDENTITY }
+}
+
 /// Decode a single animation frame (translation, rotation) in EQ-native space.
 /// New-format (FrameTransform): rotation quaternion = (x,y,z,denominator) normalized,
 /// translation = shift_xyz / shift_denominator. Legacy format stores floats directly.
 fn frame_trs(td: &TrackDef, frame: usize) -> (Vec3, Quat) {
     if let Some(frames) = &td.frame_transforms {
         if let Some(f) = frames.get(frame).or_else(|| frames.first()) {
-            let rot = if f.rotate_denominator != 0 {
-                Quat::from_xyzw(
-                    f.rotate_x_numerator as f32,
-                    f.rotate_y_numerator as f32,
-                    f.rotate_z_numerator as f32,
-                    f.rotate_denominator as f32,
-                )
-                .normalize()
-            } else {
-                Quat::IDENTITY
-            };
+            let rot = decode_frame_rotation(
+                f.rotate_x_numerator, f.rotate_y_numerator, f.rotate_z_numerator, f.rotate_denominator,
+            );
             let trans = if f.shift_denominator != 0 {
                 let d = f.shift_denominator as f32;
                 Vec3::new(
@@ -1869,5 +1872,22 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(extras.get()).unwrap();
         let eq_height = v["eq_height"].as_f64().expect("eq_height field present");
         assert!(eq_height > 0.0, "eq_height should be > 0, got {eq_height}");
+    }
+
+    /// eqoxide#40: a FrameTransform with W (rotate_denominator) = 0 but non-zero x/y numerators is a
+    /// valid 180° rotation, NOT identity. The wolf's rear leg-top bones (raw 8714,13874,0,0) hit this
+    /// and were left un-rotated, flipping the whole rear half.
+    #[test]
+    fn frame_rotation_with_zero_denominator_is_180_not_identity() {
+        let q = decode_frame_rotation(8714, 13874, 0, 0); // WOLLLEGTOP frame 0
+        assert!(q.w.abs() < 1e-3, "W ≈ 0 (180° rotation), got w={}", q.w);
+        assert!((q.length() - 1.0).abs() < 1e-4, "must be a unit quaternion");
+        let (_axis, angle) = q.to_axis_angle();
+        assert!((angle.to_degrees() - 180.0).abs() < 1.0, "≈180°, got {}", angle.to_degrees());
+        // Genuinely-absent rotation (all four zero) is the only identity case.
+        assert_eq!(decode_frame_rotation(0, 0, 0, 0), Quat::IDENTITY);
+        // A normal (denominator ≠ 0) rotation still normalizes correctly.
+        let n = decode_frame_rotation(0, 0, 143, 16383);
+        assert!((n.length() - 1.0).abs() < 1e-4 && n.w > 0.99, "normal small rotation: {n:?}");
     }
 }
