@@ -670,7 +670,10 @@ impl Navigator {
                 gs.entities.values().find(|e| e.name == m.name).map(|e| e.hp_pct).unwrap_or(0.0)
             };
             crate::http::GroupMemberView {
-                name: m.name.clone(), level: m.level, is_leader: m.is_leader, is_merc: m.is_merc,
+                // m.level from OP_GroupUpdateB is a server placeholder (70/65); resolve the real
+                // level from our profile / the member's spawn instead. (eqoxide#104)
+                name: m.name.clone(), level: gs.group_member_level(&m.name),
+                is_leader: m.is_leader, is_merc: m.is_merc,
                 tank: m.tank, assist: m.assist, puller: m.puller, offline: m.offline, hp_pct,
             }
         }).collect();
