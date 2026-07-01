@@ -77,6 +77,9 @@ pub struct SceneState {
     pub target_hp_pct: Option<f32>,
     pub target_con: Option<[u8; 3]>,
     pub strategy: String,
+    /// True when no server packet has arrived for a while — drives the HUD "connection lost"
+    /// banner so a frozen/dead server is visible to a human player, not silently idle (#8).
+    pub disconnected: bool,
     pub billboards: Vec<Billboard>,
     /// Doors to render this frame, copied from `GameState::doors`.
     pub doors: Vec<DoorRender>,
@@ -263,6 +266,7 @@ impl SceneState {
             target_hp_pct: gs.target_hp_pct,
             target_con: gs.target_con,
             strategy: gs.strategy.clone(),
+            disconnected: false, // set per-frame in app.rs from last_inbound (#8)
             billboards,
             doors,
             messages,
