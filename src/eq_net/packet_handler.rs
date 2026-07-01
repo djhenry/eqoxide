@@ -275,9 +275,45 @@ fn apply_item_packet(gs: &mut GameState, p: &[u8]) {
             charges: (item.stacksize as i32).max(1), // stack quantity lives in stacksize, not charges
             idfile:  item.idfile,
         };
-        gs.inventory.retain(|x| x.slot != it.slot);
-        gs.inventory.push(it);
+        const ITEM_PACKET_LOOT: u32 = 0x66;
+        if packet_type == ITEM_PACKET_LOOT {
+            // A Loot item's `main_slot` is NOT a safe inventory destination — it collides with
+            // occupied general-inventory wire slots and would evict a real item (eqoxide#56).
+            apply_looted_item(gs, it);
+        } else {
+            // OP_CharInventory / equip / cursor etc.: `main_slot` IS the authoritative slot.
+            gs.inventory.retain(|x| x.slot != it.slot);
+            gs.inventory.push(it);
+        }
     }
+}
+
+/// General-inventory wire slots (rof2_limits.h): 23..=32. Loot lands here (or a bag, not modelled).
+const GENERAL_BEGIN: i32 = 23;
+const GENERAL_END:   i32 = 32;
+
+/// Place a freshly-looted item into the client inventory model WITHOUT trusting the loot packet's
+/// `main_slot` (eqoxide#56). Merge into an existing stack of the same item in general inventory, else
+/// drop it into the first free general slot. The server holds the authoritative inventory and a
+/// resync (OP_CharInventory on relog / next sync) reconciles anything approximate here.
+fn apply_looted_item(gs: &mut GameState, mut it: crate::game_state::InvItem) {
+    // Stack-merge: same item already sitting in a general-inventory slot → add to its quantity.
+    // Restricted to general slots so we never merge into an EQUIPPED item that shares the id.
+    if let Some(stack) = gs.inventory.iter_mut()
+        .find(|x| x.item_id == it.item_id && (GENERAL_BEGIN..=GENERAL_END).contains(&x.slot))
+    {
+        stack.charges = stack.charges.saturating_add(it.charges.max(1));
+        return;
+    }
+    // Otherwise the first free general slot (never an occupied one → no eviction).
+    let occupied: std::collections::HashSet<i32> = gs.inventory.iter().map(|x| x.slot).collect();
+    if let Some(free) = (GENERAL_BEGIN..=GENERAL_END).find(|s| !occupied.contains(s)) {
+        it.slot = free;
+    }
+    // else: general inventory full (item really went to a bag) — leave main_slot as a best effort;
+    // the next server inventory sync corrects it. Don't retain-evict here.
+    gs.inventory.retain(|x| x.slot != it.slot);
+    gs.inventory.push(it);
 }
 
 
@@ -1289,6 +1325,37 @@ mod tests {
         apply_combat_damage(&mut gs, &dmg(7, 99, 9999)); // lethal hit
         assert_eq!(gs.cur_hp, 0, "HP clamps at 0");
         assert!((gs.hp_pct - 0.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn looted_item_places_in_free_slot_and_stacks_never_overwrites() {
+        // eqoxide#56: loot must not evict an occupied slot, and stackable loot should merge.
+        use super::apply_looted_item;
+        use crate::game_state::InvItem;
+        let inv = |slot: i32, id: u32, ch: i32| InvItem {
+            slot, item_id: id, name: String::new(), icon: 0, charges: ch, idfile: String::new(),
+        };
+        let mut gs = GameState::new();
+        // Skin of Milk x20 @23, Bread Cakes x20 @24, Rat Whiskers x1 @25.
+        gs.inventory = vec![inv(23, 9990, 20), inv(24, 9991, 20), inv(25, 13071, 1)];
+
+        // Loot another Rat Whiskers; the packet's main_slot bogusly names an occupied slot (23).
+        apply_looted_item(&mut gs, inv(23, 13071, 1));
+        assert_eq!(gs.inventory.iter().find(|x| x.slot == 23).map(|x| x.item_id), Some(9990),
+            "Skin of Milk must not be overwritten");
+        assert_eq!(gs.inventory.iter().find(|x| x.slot == 24).map(|x| x.item_id), Some(9991),
+            "Bread Cakes must not be overwritten");
+        let rw: Vec<_> = gs.inventory.iter().filter(|x| x.item_id == 13071).collect();
+        assert_eq!(rw.len(), 1, "Rat Whiskers should stack into one slot, not split");
+        assert_eq!(rw[0].charges, 2, "stack quantity should merge to 2");
+
+        // Loot a brand-new item with a bogus main_slot (24) → first FREE general slot (26).
+        apply_looted_item(&mut gs, inv(24, 9131, 1));
+        assert_eq!(gs.inventory.iter().find(|x| x.slot == 24).map(|x| x.item_id), Some(9991),
+            "Bread Cakes still untouched");
+        assert_eq!(gs.inventory.iter().find(|x| x.item_id == 9131).unwrap().slot, 26,
+            "new loot goes to the first free general slot");
+        assert_eq!(gs.inventory.len(), 4);
     }
 
     #[test]
