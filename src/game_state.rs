@@ -85,9 +85,20 @@ pub struct TaskActivity {
     pub goal_count:    u32,
 }
 
+/// Lifecycle state of a Task-system quest, from `OP_TaskDescription`'s implicit "active" arrival
+/// or `OP_CompletedTasks`'/`OP_CancelTask`'s explicit signal. Defaults to Active because a task
+/// only exists in `gs.tasks` once the server has told us about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub enum TaskStatus {
+    #[default]
+    Active,
+    Completed,
+    Cancelled,
+}
+
 /// A Task-system quest in the player's journal (from OP_TaskDescription + OP_TaskActivity). This is
 /// EQ's *native* quest log (server-pushed), distinct from the old-style Lua turn-in quests surfaced
-/// by tools/quest_finder.py + GET /quests. See docs/autonomous-play.md.
+/// by tools/quest_finder.py + GET /v1/quests/givers. See docs/autonomous-play.md.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct ActiveTask {
     pub task_id:     u32,
@@ -95,7 +106,38 @@ pub struct ActiveTask {
     pub description: String,
     pub xp_reward:   u32,
     pub coin_reward: u32,
+    /// Reward item name, parsed from OP_TaskDescription's item_link cstr (EQ saylink markup
+    /// stripped). Empty if the task has no item reward.
+    pub reward_item_text: String,
+    pub status: TaskStatus,
+    /// The journal display-order slot EQEmu calls `SequenceNumber` (0 = first task, 1 = second,
+    /// ...). `OP_CancelTask` addresses a task by this, not by task_id — see `TaskStatus`.
+    pub sequence_number: u32,
     pub activities:  Vec<TaskActivity>,
+}
+
+/// One task offered by an open task-selector window (from `OP_TaskSelectWindow`, sent when an NPC
+/// script calls `tasksetselector` instead of auto-granting via `assigntask`). No content on this
+/// server's live scripts uses the selector path today, but the protocol path is real.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct TaskOffer {
+    pub task_id: u32,
+    /// The offering NPC's entity id — required by `OP_AcceptNewTask`'s `task_master_id` field.
+    pub npc_id: u32,
+    pub title: String,
+    pub description: String,
+    /// Whether the task has rewards. No numeric/text reward info exists at offer time — only
+    /// `OP_TaskDescription` (sent after acceptance) carries the actual reward amounts.
+    pub has_rewards: bool,
+}
+
+/// One entry from the player's completed-task history (`OP_CompletedTasks`).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct CompletedTaskEntry {
+    pub task_id: u32,
+    pub title: String,
+    /// Unix time the task was completed, as sent by the server.
+    pub completed_time: u32,
 }
 
 /// One item in the player's inventory/equipment (decoded from OP_CharInventory / OP_ItemPacket).
@@ -259,10 +301,14 @@ pub struct GameState {
     pub loot_queued_at: Option<std::time::Instant>,
 
     // Quest log (native EQ Task system) — server-pushed via OP_TaskDescription / OP_TaskActivity.
-    /// Active task quests keyed by task_id, with their objectives + live progress.
+    /// All task quests keyed by task_id (any status), with their objectives + live progress.
     pub tasks: std::collections::HashMap<u32, ActiveTask>,
-    /// Task ids the server reports as completed (OP_CompletedTasks).
-    pub completed_tasks: Vec<u32>,
+    /// Pending offers from an open task-selector window (OP_TaskSelectWindow). Replaced wholesale
+    /// on each new window; cleared after an accept/decline is sent.
+    pub task_offers: Vec<TaskOffer>,
+    /// Completed-task history with titles, from OP_CompletedTasks (server sends the full record,
+    /// not bare ids — see `apply_completed_tasks`).
+    pub completed_task_history: Vec<CompletedTaskEntry>,
 
     /// Player inventory + equipment (decoded from OP_CharInventory / OP_ItemPacket).
     pub inventory: Vec<InvItem>,
@@ -723,5 +769,44 @@ mod tests {
         // Unknown door id is ignored, not a panic.
         gs.set_door_open(99, true);
         assert!(gs.doors.get(&99).is_none());
+    }
+
+    // --- TaskStatus and quest structures ---
+
+    #[test]
+    fn task_status_default_is_active() {
+        use super::TaskStatus;
+        let status = TaskStatus::default();
+        assert_eq!(status, TaskStatus::Active);
+    }
+
+    #[test]
+    fn task_offer_can_be_constructed_via_default() {
+        use super::TaskOffer;
+        let offer = TaskOffer::default();
+        assert_eq!(offer.task_id, 0);
+        assert_eq!(offer.npc_id, 0);
+        assert_eq!(offer.title, "");
+        assert_eq!(offer.description, "");
+        assert!(!offer.has_rewards);
+    }
+
+    #[test]
+    fn completed_task_entry_can_be_constructed_via_default() {
+        use super::CompletedTaskEntry;
+        let entry = CompletedTaskEntry::default();
+        assert_eq!(entry.task_id, 0);
+        assert_eq!(entry.title, "");
+        assert_eq!(entry.completed_time, 0);
+    }
+
+    #[test]
+    fn active_task_extended_fields_default() {
+        use super::{ActiveTask, TaskStatus};
+        let task = ActiveTask::default();
+        assert_eq!(task.task_id, 0);
+        assert_eq!(task.reward_item_text, "");
+        assert_eq!(task.status, TaskStatus::Active);
+        assert_eq!(task.sequence_number, 0);
     }
 }
