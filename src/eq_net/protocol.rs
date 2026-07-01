@@ -771,6 +771,26 @@ pub const SIZE_LEVEL_UPDATE: usize = 12; // LevelUpdate_S
 pub const SIZE_MONEY_ON_CORPSE: usize = 20; // MoneyOnCorpse_S
 pub const SIZE_ZONE_CHANGE: usize = 100;  // RoF2 ZoneChange_Struct (was 88; success@92)
 
+/// Build a client→server OP_ZoneChange packet (RoF2 ZoneChange_Struct, 100B):
+/// char_name@0, zone_id@64, instance_id@66, then y@76, x@80, z@84 (RoF2 puts the
+/// coords 8 bytes later than Titanium). Used both for a normal cross-zone transition
+/// and to finalize a death/bind respawn (the server holds us in a ZoneToBindPoint
+/// zoning state until it receives this — eqoxide#75).
+pub fn build_zone_change(name: &str, zone_id: u16, instance_id: u16, x: f32, y: f32, z: f32)
+    -> [u8; SIZE_ZONE_CHANGE]
+{
+    let mut buf = [0u8; SIZE_ZONE_CHANGE];
+    let nb = name.as_bytes();
+    let n = nb.len().min(64);
+    buf[..n].copy_from_slice(&nb[..n]);
+    buf[64..66].copy_from_slice(&zone_id.to_le_bytes());
+    buf[66..68].copy_from_slice(&instance_id.to_le_bytes());
+    buf[76..80].copy_from_slice(&y.to_le_bytes());
+    buf[80..84].copy_from_slice(&x.to_le_bytes());
+    buf[84..88].copy_from_slice(&z.to_le_bytes());
+    buf
+}
+
 /// WearChange_Struct (Titanium, 9 bytes). Runtime equip/unequip of one slot.
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
@@ -840,6 +860,18 @@ mod tests {
         assert_eq!(&cze[4..11], char_name.as_bytes(), "name at offset 4");
         assert_eq!(cze[11], 0, "NUL terminator after name");
         assert_eq!(&cze[68..76], &[0u8; 8], "unknown68+unknown72 must be zero");
+    }
+
+    #[test]
+    fn build_zone_change_layout() {
+        let p = build_zone_change("Katie", 54, 0, 1.0, 2.0, 3.0);
+        assert_eq!(p.len(), SIZE_ZONE_CHANGE);
+        assert_eq!(&p[..5], b"Katie");
+        assert_eq!(u16::from_le_bytes([p[64], p[65]]), 54);   // zone_id
+        assert_eq!(u16::from_le_bytes([p[66], p[67]]), 0);    // instance_id
+        assert_eq!(f32::from_le_bytes([p[76], p[77], p[78], p[79]]), 2.0); // y
+        assert_eq!(f32::from_le_bytes([p[80], p[81], p[82], p[83]]), 1.0); // x
+        assert_eq!(f32::from_le_bytes([p[84], p[85], p[86], p[87]]), 3.0); // z
     }
 
     #[test]
