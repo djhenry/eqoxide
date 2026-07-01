@@ -404,6 +404,18 @@ impl GameState {
         });
     }
 
+    /// Resolve a group member's real level. The RoF2 OP_GroupUpdateB packet carries a hardcoded
+    /// placeholder level (EQEmu's encoder writes 0x46=70 for the leader and 0x41=65 for every other
+    /// member — not the real value, eqoxide#104), so take the level from our own profile (self) or
+    /// the member's spawn in the entity list. Returns 0 (unknown) when the member isn't in the zone.
+    pub fn group_member_level(&self, name: &str) -> u32 {
+        if !self.player_name.is_empty() && name == self.player_name {
+            self.player_level
+        } else {
+            self.entities.values().find(|e| e.name == name).map(|e| e.level).unwrap_or(0)
+        }
+    }
+
     /// Record an inter-agent chat event (tell/ooc/shout/group/gmsay) for the GET /events feed,
     /// assigning the next monotonic id. Capped to the most recent 200 events.
     /// Record an async event onto the `/v1/events/*` feed. `category` is the top-level bucket
@@ -905,6 +917,21 @@ mod tests {
         assert_eq!(entry.task_id, 0);
         assert_eq!(entry.title, "");
         assert_eq!(entry.completed_time, 0);
+    }
+
+    #[test]
+    fn group_member_level_resolves_from_profile_and_entities() {
+        // OP_GroupUpdateB sends placeholder levels (70/65); the resolver ignores those and reads
+        // the real level from the profile (self) or the member's spawn (others). (eqoxide#104)
+        let mut gs = GameState::new();
+        gs.player_name = "Me".into();
+        gs.player_level = 12;
+        let mut ally = make_entity(2, "Ally", 0.0, 0.0, 0.0, false);
+        ally.level = 47;
+        gs.upsert_entity(ally);
+        assert_eq!(gs.group_member_level("Me"), 12, "self → player_level");
+        assert_eq!(gs.group_member_level("Ally"), 47, "other in zone → entity level");
+        assert_eq!(gs.group_member_level("OutOfZone"), 0, "unknown member → 0");
     }
 
     #[test]
