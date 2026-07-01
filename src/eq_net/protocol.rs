@@ -91,6 +91,7 @@ pub const OP_CLIENT_READY: u16 = 0x345d;      // RoF2: OP_ClientReady
 pub const OP_NEW_SPAWN: u16 = 0x6097;         // RoF2: OP_NewSpawn
 pub const OP_DELETE_SPAWN: u16 = 0x7280;      // RoF2: OP_DeleteSpawn
 pub const OP_CLIENT_UPDATE: u16 = 0x7dfc;     // RoF2: OP_ClientUpdate
+pub const OP_FLOAT_LIST_THING: u16 = 0x46c6;  // RoF2: OP_FloatListThing (movement history; anti-MQGhost)
 pub const OP_SPAWN_APPEARANCE: u16 = 0x0971;  // RoF2: OP_SpawnAppearance
 /// Server → client: a spawn performs a one-shot animation (melee swing, kick, etc.).
 /// Animation_Struct: spawnid(u16) speed(u8) action(u8). action = anim code (1=kick, 2=1HPierce,
