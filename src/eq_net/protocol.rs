@@ -103,7 +103,8 @@ pub const OP_WEAR_CHANGE: u16 = 0x7994; // RoF2: OP_WearChange
 
 // ── Gameplay: combat ──────────────────────────────────────────────────────
 
-pub const OP_HP_UPDATE: u16 = 0x2828;         // RoF2: OP_HPUpdate
+pub const OP_HP_UPDATE: u16 = 0x2828;         // RoF2: OP_HPUpdate (full cur/max, self+group only)
+pub const OP_MOB_HEALTH: u16 = 0x37b1;        // RoF2: OP_MobHealth (percent-only, to everyone targeting the mob)
 pub const OP_DEATH: u16 = 0x6517;             // RoF2: OP_Death
 pub const OP_DAMAGE: u16 = 0x6f15;            // RoF2: OP_Damage
 pub const OP_AUTO_ATTACK: u16 = 0x109d;       // RoF2: OP_AutoAttack
@@ -751,6 +752,7 @@ pub const SIZE_LOGIN_INFO: usize = 464;  // LoginInfo_S
 /// rof2_structs.h: spawn_id(u16)+vehicle_id(u16)+5×bit-packed-u32 = 2+2+20 = 24.
 pub const SIZE_SPAWN_POSITION_UPDATE: usize = 24;
 pub const SIZE_HP_UPDATE: usize = 10;   // HPUpdate_S
+pub const SIZE_MOB_HEALTH: usize = 3;   // MobHealth_S (SpawnHPUpdate_Struct2)
 pub const SIZE_DEATH: usize = 32;       // Death_S
 pub const SIZE_ZONE_POINT_ENTRY: usize = 32; // RoF2 ZonePoint_Entry (was 24 — misaligned)
 pub const SIZE_SPAWN_APPEARANCE: usize = 8; // SpawnAppearance_S
@@ -1175,6 +1177,19 @@ pub struct HPUpdate_S {
     pub spawn_id: i16,
     pub cur_hp: u32,
     pub max_hp: i32,
+}
+
+/// Percent-only HP update (3 bytes), RoF2 `SpawnHPUpdate_Struct2`
+/// (`common/patches/rof2_structs.h`). Sent via OP_MobHealth to every client that
+/// has the mob targeted (or on their x-target) — the compact update a client gets
+/// for a mob it is merely fighting but not grouped with. `hp` is a 0-100 HP
+/// percentage (`Mob::CreateHPPacket` writes `GetHPRatio()`), not an absolute value.
+/// See eqoxide#51.
+#[repr(C, packed)]
+#[derive(Debug, Copy, Clone)]
+pub struct MobHealth_S {
+    pub spawn_id: i16,
+    pub hp: u8,
 }
 
 /// Death notification (32 bytes).
