@@ -16,6 +16,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_DELETE_SPAWN         => apply_delete_spawn(gs, p),
         OP_CLIENT_UPDATE        => apply_position_update(gs, p),
         OP_HP_UPDATE            => apply_hp_update(gs, p),
+        OP_MOB_HEALTH           => apply_mob_health(gs, p),
         OP_TARGET_MOUSE         => apply_set_target(gs, p), // synthetic (nav → render gs); see fn doc
         OP_NEW_ZONE             => apply_new_zone(gs, p),
         OP_ZONE_SPAWNS          => apply_zone_spawns(gs, p),
@@ -402,6 +403,17 @@ fn apply_hp_update(gs: &mut GameState, payload: &[u8]) {
     if payload.len() >= SIZE_HP_UPDATE {
         let hp = unsafe { safe_read::<HPUpdate_S>(payload) };
         gs.update_hp(hp.spawn_id as u32, hp.cur_hp as i32, hp.max_hp);
+    }
+}
+
+/// OP_MobHealth: percent-only HP for a mob you have targeted/x-targeted but aren't
+/// grouped with (the server only sends the full OP_HPUpdate to self/group/pet).
+/// Without this, a fought mob's `hp_pct` — and thus `target_hp_pct` — stays frozen
+/// at its seeded value the whole fight. (eqoxide#51)
+fn apply_mob_health(gs: &mut GameState, payload: &[u8]) {
+    if payload.len() >= SIZE_MOB_HEALTH {
+        let mh = unsafe { safe_read::<MobHealth_S>(payload) };
+        gs.update_hp_pct(mh.spawn_id as u32, mh.hp as f32);
     }
 }
 

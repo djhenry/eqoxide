@@ -411,6 +411,20 @@ impl GameState {
         }
     }
 
+    /// Apply a percent-only HP update (OP_MobHealth / `SpawnHPUpdate_Struct2`). A mob
+    /// you are fighting but not grouped with only sends its HP as a 0-100 percentage,
+    /// so there is no absolute cur/max to record — just its `hp_pct`. The target HUD
+    /// readout (`target_hp_pct`) follows `entities[id].hp_pct`, so this is what makes a
+    /// fought mob's health bar move. Don't touch the player's own bar here: the player
+    /// gets a full OP_HPUpdate with real cur/max, which is strictly better. (eqoxide#51)
+    pub fn update_hp_pct(&mut self, spawn_id: u32, hp_pct: f32) {
+        if spawn_id != self.player_id {
+            if let Some(e) = self.entities.get_mut(&spawn_id) {
+                e.hp_pct = hp_pct;
+            }
+        }
+    }
+
     /// Set the player's current mana and recompute `mana_pct`. The mana wire (PlayerProfile seed,
     /// OP_ManaChange) carries only the *current* mana — there is no max in either — so `max_mana`
     /// is tracked as a high-water-mark: it grows to the largest current mana seen. At zone-in a
@@ -642,6 +656,30 @@ mod tests {
         assert_eq!(e.cur_hp, 50);
         assert_eq!(e.max_hp, 200);
         assert!((e.hp_pct - 25.0).abs() < 1e-4, "expected 25.0, got {}", e.hp_pct);
+    }
+
+    #[test]
+    fn update_hp_pct_sets_entity_percent_only() {
+        // OP_MobHealth carries only a 0-100 percentage: hp_pct moves, cur/max untouched.
+        let mut gs = GameState::new();
+        gs.upsert_entity(make_entity(7, "mob", 0.0, 0.0, 0.0, true));
+        gs.update_hp(7, 50, 200); // seed cur/max via a full update first
+        gs.update_hp_pct(7, 40.0);
+        let e = &gs.entities[&7];
+        assert!((e.hp_pct - 40.0).abs() < 1e-4, "expected 40.0, got {}", e.hp_pct);
+        assert_eq!(e.cur_hp, 50, "percent-only update must not touch cur_hp");
+        assert_eq!(e.max_hp, 200, "percent-only update must not touch max_hp");
+    }
+
+    #[test]
+    fn update_hp_pct_ignores_player_self() {
+        // The player has a better full OP_HPUpdate path; a percent-only update must not
+        // clobber the player's own bar.
+        let mut gs = GameState::new();
+        gs.player_id = 1;
+        gs.hp_pct = 88.0;
+        gs.update_hp_pct(1, 5.0);
+        assert!((gs.hp_pct - 88.0).abs() < 1e-4, "player hp_pct must be untouched");
     }
 
     #[test]
