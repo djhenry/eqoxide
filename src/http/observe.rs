@@ -50,6 +50,8 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             "target_id":   player.target_id,
             "target_name": player.target_name,
             "target_hp_pct": player.target_hp_pct,
+            "connected":   player.connected,
+            "last_packet_age_ms": player.last_packet_age_ms,
         },
         "camera": {
             "azimuth_deg":   cam.azimuth.to_degrees(),
