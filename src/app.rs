@@ -1074,6 +1074,8 @@ impl App {
                     jump:        space,
                     want_swim:   swimming,
                     speed:       MOVE_SPEED,
+                    climb:       0.0,   // free WASD uses the native 2u step (no wall-climbing)
+                    hop:         false, // and does not auto-hop barriers (Space is the manual jump)
                 }
             } else {
                 // No manual input → follow the nav planner's /goto intent (if any).
