@@ -330,45 +330,13 @@ pub fn slide_move(
     }
 }
 
-/// Minimum distance (units) the walker must close toward its current aim for a tick to
-/// count as progress. Below this, the tick is "no progress" (sliding sideways, wedged).
-const NAV_PROGRESS_EPS: f32 = 1.0;
-/// Consecutive no-progress nav ticks (~150 ms each) before the walker is declared stuck.
-/// ~3 s — long enough to ride out a brief wall-slide, short enough to recover quickly.
+/// Consecutive no-progress nav ticks (~150 ms each) before the pure-pursuit walker is declared
+/// stuck and re-paths. ~3 s — long enough to ride out a brief wall-slide, short enough to recover.
 const NAV_STUCK_TICKS: u32 = 20;
 /// After this many consecutive no-progress ticks (well before the `NAV_STUCK_TICKS` give-up), the
 /// walker commands the controller to hop — net progress has stalled, which is the real "wedged
 /// against a fence/cart" signal (sliding along it still looks like motion frame-to-frame). (#41)
 const NAV_HOP_TICKS: u32 = 6;
-
-/// What the no-progress detector decided after a nav step.
-#[derive(Debug, PartialEq, Eq)]
-enum StuckAction {
-    /// Still making (or recently made) progress — keep walking the current waypoint.
-    Continue,
-    /// No progress for NAV_STUCK_TICKS — the caller should recover (skip waypoint or stop).
-    Recover,
-}
-
-/// No-progress detector for the path walker. `dist` is the current straight-line distance
-/// to the aim point; `best` is the smallest distance seen since the detector last reset;
-/// `stuck_ticks` is the running count of consecutive no-progress ticks. Closing more than
-/// `NAV_PROGRESS_EPS` resets the counter and records the new best; otherwise the counter
-/// accumulates until it reaches `NAV_STUCK_TICKS`, which yields `Recover` (and resets, so
-/// recovery starts with a fresh window). Returns the action plus the `(best, stuck_ticks)`
-/// the caller should store.
-fn nav_progress(dist: f32, best: f32, stuck_ticks: u32) -> (StuckAction, f32, u32) {
-    if dist + NAV_PROGRESS_EPS < best {
-        (StuckAction::Continue, dist, 0)
-    } else {
-        let n = stuck_ticks + 1;
-        if n >= NAV_STUCK_TICKS {
-            (StuckAction::Recover, f32::MAX, 0)
-        } else {
-            (StuckAction::Continue, best, n)
-        }
-    }
-}
 
 /// EQ heading in degrees (0..360) for a movement delta in server axes.
 /// EQ convention: heading 0 faces +Y (north) and increases counter-clockwise
@@ -459,6 +427,9 @@ pub struct Navigator {
     stuck_best:       f32,
     stuck_ticks:      u32,
     stuck_i:          usize,
+    /// Consecutive stall-recovery re-paths for the current goal; capped so a truly unreachable
+    /// snag stops instead of re-pathing forever.
+    nav_repaths:      u32,
     /// Single-authority controller integration (design §2). `controller_view` is the render
     /// thread's authoritative position snapshot we stream to the server; `nav_intent` is the
     /// `/goto` planner's per-frame wish written for the render controller; `pos_correction` hands a
@@ -564,6 +535,7 @@ impl Navigator {
             stuck_best: f32::MAX,
             stuck_ticks: 0,
             stuck_i: 0,
+            nav_repaths: 0,
             controller_view,
             nav_intent,
             pos_correction,
@@ -711,6 +683,17 @@ impl Navigator {
             shared.extend(gs.zone_points.iter().cloned());
             shared.extend(map_labels);
         }
+    }
+
+    /// Live NPC-camp positions to route AROUND (aggro-avoidance, #67), excluding NPCs near the
+    /// goal (you're walking TO the destination, often a target mob, so its own camp isn't avoided).
+    fn aggro_avoid(gs: &GameState, goal: (f32, f32, f32)) -> Vec<[f32; 2]> {
+        const NEAR_GOAL_SQ: f32 = 55.0 * 55.0;
+        gs.entities.values()
+            .filter(|e| e.is_npc && !e.dead)
+            .filter(|e| { let (dx, dy) = (e.x - goal.0, e.y - goal.1); dx * dx + dy * dy > NEAR_GOAL_SQ })
+            .map(|e| [e.x, e.y])
+            .collect()
     }
 
     /// Advance one navigation tick (no-op if fewer than 150 ms have elapsed).
@@ -1292,21 +1275,14 @@ impl Navigator {
             self.stuck_i = 0;
             self.stuck_best = f32::MAX;
             self.stuck_ticks = 0;
+            self.nav_repaths = 0;
             // Route with the native collision radius (1.0, was 2.0): the 2× radius boxed the player
             // out of gaps the native client threads, causing "boxed in by walls" / platform stalls
             // (issues #22/#13/#2). Collide-and-slide in the controller keeps it off walls.
             // Aggro-avoidance (#67): route AROUND live NPC camps so a long goto doesn't plow through
             // a mob group and get the player killed. Exclude NPCs near the GOAL — you're walking TO
             // the destination (often a target mob), so its own camp must not be avoided.
-            const NEAR_GOAL_SQ: f32 = 55.0 * 55.0;
-            let avoid: Vec<[f32; 2]> = gs.entities.values()
-                .filter(|e| e.is_npc && !e.dead)
-                .filter(|e| {
-                    let (dx, dy) = (e.x - goal.0, e.y - goal.1);
-                    dx * dx + dy * dy > NEAR_GOAL_SQ
-                })
-                .map(|e| [e.x, e.y])
-                .collect();
+            let avoid = Self::aggro_avoid(gs, goal);
             self.path = match self.collision.read().unwrap().as_ref() {
                 Some(c) => c
                     .find_path([gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], crate::movement::PLAYER_RADIUS, &avoid)
@@ -1316,25 +1292,47 @@ impl Navigator {
             tracing::info!("NAV: path to ({:.0},{:.0}) = {} waypoints", goal.0, goal.1, self.path.len());
         }
 
-        // Aim at the current waypoint; advance past any we've already reached. The final
-        // waypoint equals the goal, so reaching it falls through to the STOP_DIST arrival below.
-        let target = loop {
-            match self.path.get(self.path_i) {
-                Some(&wp) => {
-                    let wdx = wp[0] - gs.player_x;
-                    let wdy = wp[1] - gs.player_y;
-                    if (wdx * wdx + wdy * wdy).sqrt() <= 3.0 && self.path_i + 1 < self.path.len() {
-                        self.path_i += 1;
-                        continue;
+        // PURE-PURSUIT path following. Chasing each discrete waypoint made the walker OVERSHOOT it
+        // (~6.6u/tick at RUN_SPEED vs a 3u arrival radius), oscillate at turns, and drift off the
+        // path line into walls — the silent neriakc #2 / gfaydark #4 stall. Instead we steer toward
+        // a look-ahead point ON the path line, so the avatar hugs the route through tight turns.
+        const LOOK_AHEAD: f32 = 5.0;
+        let px = gs.player_x;
+        let py = gs.player_y;
+        // Advance the active segment while our projection onto it has passed its end.
+        while self.path_i + 2 < self.path.len() {
+            let (a, b) = (self.path[self.path_i], self.path[self.path_i + 1]);
+            let ab = [b[0] - a[0], b[1] - a[1]];
+            let l2 = ab[0] * ab[0] + ab[1] * ab[1];
+            let t = if l2 < 1e-6 { 1.0 } else { ((px - a[0]) * ab[0] + (py - a[1]) * ab[1]) / l2 };
+            if t >= 1.0 { self.path_i += 1; } else { break; }
+        }
+        let have_path = !self.path.is_empty();
+        let target = if let Some(&a) = self.path.get(self.path_i) {
+            let b = self.path.get(self.path_i + 1).copied().unwrap_or(a);
+            let ab = [b[0] - a[0], b[1] - a[1]];
+            let l2 = ab[0] * ab[0] + ab[1] * ab[1];
+            let t = if l2 < 1e-6 { 0.0 } else { (((px - a[0]) * ab[0] + (py - a[1]) * ab[1]) / l2).clamp(0.0, 1.0) };
+            let mut cur = [a[0] + ab[0] * t, a[1] + ab[1] * t];
+            let (mut rem, mut i, mut cz) = (LOOK_AHEAD, self.path_i, b[2]);
+            let carrot = loop {
+                match self.path.get(i + 1).copied() {
+                    Some(bp) => {
+                        cz = bp[2];
+                        let d = [bp[0] - cur[0], bp[1] - cur[1]];
+                        let dl = (d[0] * d[0] + d[1] * d[1]).sqrt();
+                        if dl >= rem || i + 2 >= self.path.len() {
+                            break if dl < 1e-6 { cur } else { [cur[0] + d[0] * (rem / dl).min(1.0), cur[1] + d[1] * (rem / dl).min(1.0)] };
+                        }
+                        rem -= dl; cur = [bp[0], bp[1]]; i += 1;
                     }
-                    // Use the waypoint's OWN floor z, so the move + collision happen at the right
-                    // height while following a climbing/descending path (prevents clipping walls).
-                    break (wp[0], wp[1], wp[2]);
+                    None => break cur,
                 }
-                // No path computed: straight-line toward the goal, but collision-check at the
-                // player's CURRENT height (not the goal's z) so we still can't clip walls.
-                None => break (goal.0, goal.1, gs.player_z),
-            }
+            };
+            (carrot[0], carrot[1], cz)
+        } else {
+            // No path computed: straight-line toward the goal at the player's CURRENT height.
+            (goal.0, goal.1, gs.player_z)
         };
 
         let dx   = target.0 - gs.player_x; // east  delta (server_x)
@@ -1364,52 +1362,58 @@ impl Navigator {
             return;
         }
 
-        // Stop when within 2 units of target. Melee range is ~14 units so we stop well
-        // within melee range, ensuring LOS succeeds even with nearby geometry.
+        // Arrival: measure distance to the FINAL goal, not the look-ahead carrot (which always leads
+        // by ~LOOK_AHEAD). Melee range is ~14u, so stopping within 2u keeps us well inside it.
         const STOP_DIST: f32 = 2.0;
-        if dist <= STOP_DIST {
-            tracing::info!("NAV: arrived at ({:.1},{:.1})", target.0, target.1);
+        let gdx = goal.0 - gs.player_x;
+        let gdy = goal.1 - gs.player_y;
+        let gdist = (gdx * gdx + gdy * gdy).sqrt();
+        if gdist <= STOP_DIST {
+            tracing::info!("NAV: arrived at ({:.1},{:.1})", goal.0, goal.1);
             *self.goto_target.lock().unwrap() = None;
             *self.nav_intent.lock().unwrap() = None; // stop driving the controller
-            // Face the target on arrival.
-            gs.player_heading = eq_heading(dx, dy);
+            gs.player_heading = eq_heading(gdx, gdy);
             return;
         }
 
-        // No-progress (stuck) detection. The only stops above are arrival and a controlled
-        // fall; below, the sole stop is being fully boxed in (slide_move -> None). But a
-        // sliding step can make ~zero net progress indefinitely — the avatar wedges into
-        // tight platform/corridor geometry and slide_move keeps returning a perpendicular,
-        // non-advancing step. That is a SILENT permanent stall (gfaydark #4, neriakc #2):
-        // none of the three stop logs ever fire. Track progress toward the current aim and,
-        // after NAV_STUCK_TICKS without closing distance, recover: skip to the next waypoint
-        // to route past the snag, or — if this is the last/only waypoint — stop with a log.
-        if self.path_i != self.stuck_i {
-            self.stuck_i = self.path_i;
-            self.stuck_best = f32::MAX;
-            self.stuck_ticks = 0;
-        }
-        match nav_progress(dist, self.stuck_best, self.stuck_ticks) {
-            (StuckAction::Continue, best, ticks) => {
-                self.stuck_best = best;
-                self.stuck_ticks = ticks;
-            }
-            (StuckAction::Recover, best, ticks) => {
-                self.stuck_best = best;
-                self.stuck_ticks = ticks;
-                if self.path_i + 1 < self.path.len() {
-                    tracing::info!("NAV: no progress toward waypoint {} near ({:.1},{:.1}) — skipping to next",
-                        self.path_i, gs.player_x, gs.player_y);
-                    self.path_i += 1;
-                    self.stuck_i = self.path_i;
-                    return;
+        // Progress-based stall detection. Pure-pursuit advances `path_i` steadily as the avatar moves
+        // along the route; if it has NOT advanced for NAV_STUCK_TICKS we're genuinely wedged (or the
+        // route crosses a spot the capsule controller can't track). Recover by re-pathing from the
+        // ACTUAL position onto a route the controller can follow; cap re-paths so a truly unreachable
+        // snag stops instead of looping. (A straight-line goto with no path skips this.)
+        if have_path {
+            if self.path_i > self.stuck_i {
+                self.stuck_i = self.path_i;
+                self.stuck_ticks = 0;
+            } else {
+                self.stuck_ticks += 1;
+                if self.stuck_ticks >= NAV_STUCK_TICKS {
+                    self.stuck_ticks = 0;
+                    let avoid = Self::aggro_avoid(gs, goal);
+                    let fresh = if self.nav_repaths < 8 {
+                        self.collision.read().unwrap().as_ref().and_then(|c|
+                            c.find_path([gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], crate::movement::PLAYER_RADIUS, &avoid))
+                    } else { None };
+                    match fresh {
+                        Some(np) if np.len() > 1 => {
+                            self.nav_repaths += 1;
+                            tracing::info!("NAV: no progress near ({:.1},{:.1}) — re-pathing ({} wp, attempt {})",
+                                gs.player_x, gs.player_y, np.len(), self.nav_repaths);
+                            self.path = np;
+                            self.path_i = 0;
+                            self.stuck_i = 0;
+                            return;
+                        }
+                        _ => {
+                            tracing::info!("NAV: stalled (no progress) near ({:.1},{:.1}) — stopping",
+                                gs.player_x, gs.player_y);
+                            gs.log_msg("zone", "Path stalled — stopped");
+                            *self.goto_target.lock().unwrap() = None;
+                            *self.nav_intent.lock().unwrap() = None;
+                            return;
+                        }
+                    }
                 }
-                tracing::info!("NAV: stalled (no progress) near ({:.1},{:.1}) — stopping",
-                    gs.player_x, gs.player_y);
-                gs.log_msg("zone", "Path stalled — stopped");
-                *self.goto_target.lock().unwrap() = None;
-                *self.nav_intent.lock().unwrap() = None;
-                return;
             }
         }
 
@@ -1734,38 +1738,6 @@ mod tests {
 
         // Moving away from the wall (east -2) is unobstructed → full move.
         assert_eq!(slide_move(&col, 3.0, 5.0, 0.0, -2.0, 2.0, 2.0), Some((-2.0, 2.0)));
-    }
-
-    #[test]
-    fn nav_progress_resets_counter_when_closing_distance() {
-        // Closed from best=20 to dist=10 (>EPS) → progress: counter resets, best updates.
-        assert_eq!(nav_progress(10.0, 20.0, 5), (StuckAction::Continue, 10.0, 0));
-    }
-
-    #[test]
-    fn nav_progress_accumulates_when_not_closing() {
-        // dist not better than best (equal) → no progress: counter increments, best held.
-        assert_eq!(nav_progress(10.0, 10.0, 5), (StuckAction::Continue, 10.0, 6));
-        // dist worse than best (moved away) → still no progress.
-        assert_eq!(nav_progress(12.0, 10.0, 5), (StuckAction::Continue, 10.0, 6));
-    }
-
-    #[test]
-    fn nav_progress_tiny_gain_below_eps_is_not_progress() {
-        // Closed only 0.5u (< EPS=1.0) → not counted as progress; counter still climbs.
-        assert_eq!(nav_progress(9.5, 10.0, 5), (StuckAction::Continue, 10.0, 6));
-    }
-
-    #[test]
-    fn nav_progress_recovers_at_stuck_threshold() {
-        // One tick short of the threshold: still Continue.
-        let (a, _, _) = nav_progress(10.0, 10.0, NAV_STUCK_TICKS as u32 - 2);
-        assert_eq!(a, StuckAction::Continue);
-        // The tick that reaches NAV_STUCK_TICKS no-progress ticks → Recover, counter reset.
-        assert_eq!(
-            nav_progress(10.0, 10.0, NAV_STUCK_TICKS - 1),
-            (StuckAction::Recover, f32::MAX, 0)
-        );
     }
 
     #[test]
