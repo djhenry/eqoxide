@@ -892,6 +892,8 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
         .split('\0').next().unwrap_or("")
         .to_string();
     if msg.is_empty() { return; }
+    // NPC dialogue may embed saylink hyperlinks; show only the readable label.
+    let msg = strip_say_links(&msg);
 
     // EQEmu ChatChannel: 0 guild, 2 group, 3 shout, 4 auction, 5 OOC, 6 broadcast, 7 tell,
     // 8 say, 11 gmsay. The inter-agent channels are ALSO recorded as structured chat events for
@@ -919,6 +921,37 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
         // Zone-wide broadcasts without a sender (server messages like "An earthquake strikes!").
         gs.log_msg("zone", &msg);
     }
+}
+
+/// RoF2 saylink body length (`SAY_LINK_BODY_SIZE`, EQEmu `common/patches/rof2_limits.h`).
+const SAY_LINK_BODY_SIZE: usize = 56;
+
+/// Strip EQ "saylink" framing from chat text, leaving only the human-readable label.
+///
+/// On the wire a saylink is `\x12` + a fixed 56-char body (the numeric link id/prefix)
+/// + the display text + `\x12` (RoF2). The real client renders only the display text
+/// (underlined/clickable); we have no link UI, so we show it as plain text. Text outside
+/// any `\x12...\x12` pair passes through unchanged. This mirrors EQEmu's
+/// `Strings::Split(msg, '\x12')` handling: splitting on the control byte yields plain
+/// text at even indices and link contents (body+text) at odd indices. A malformed or
+/// short link segment is kept as-is (minus the control byte) so we never eat real text.
+/// (eqoxide#46)
+fn strip_say_links(s: &str) -> String {
+    if !s.contains('\x12') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    for (i, seg) in s.split('\x12').enumerate() {
+        if i & 1 == 1 && seg.len() > SAY_LINK_BODY_SIZE {
+            // Link content: drop the fixed-length body, keep the trailing display text.
+            // Body is ASCII (hex digits), so byte offset 56 is a valid UTF-8 boundary.
+            out.push_str(&seg[SAY_LINK_BODY_SIZE..]);
+        } else {
+            // Plain text (even index) or a too-short/malformed link body — keep verbatim.
+            out.push_str(seg);
+        }
+    }
+    out
 }
 
 /// EQEmu sends GM-flagged accounts verbose server-side debug messages that are not
@@ -960,10 +993,11 @@ fn apply_emote(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < 5 { return; }
     let etype = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
     if etype == 0xffff_ffff { return; } // /dance, /flip, etc. — animation only
-    let msg = String::from_utf8_lossy(&payload[4..])
-        .trim_end_matches('\0')
-        .trim()
-        .to_string();
+    let msg = strip_say_links(
+        String::from_utf8_lossy(&payload[4..])
+            .trim_end_matches('\0')
+            .trim(),
+    );
     if !msg.is_empty() && !is_debug_spam(&msg) {
         gs.log_msg("npc", &msg);
     }
@@ -1046,6 +1080,7 @@ fn apply_special_message(gs: &mut GameState, payload: &[u8]) {
     let msg = String::from_utf8_lossy(&payload[msg_start..])
         .trim_end_matches('\0')
         .to_string();
+    let msg = strip_say_links(&msg);
     if msg.trim().is_empty() || is_debug_spam(&msg) { return; }
     if sayer.is_empty() {
         gs.log_msg("npc", &msg);
@@ -1284,8 +1319,34 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
 mod tests {
     use super::{apply_emote, class_name, con_color, consider_message, parse_player_profile,
                 parse_begin_cast, parse_memorize_spell, apply_char_inventory,
-                apply_money_update, apply_money_on_corpse, apply_set_target};
+                apply_money_update, apply_money_on_corpse, apply_set_target,
+                strip_say_links, SAY_LINK_BODY_SIZE};
     use crate::game_state::{GameState, Entity};
+
+    /// Build a RoF2 saylink: 0x12 + 56-char body + display text + 0x12.
+    fn saylink(body_seed: char, text: &str) -> String {
+        let body: String = std::iter::repeat(body_seed).take(SAY_LINK_BODY_SIZE).collect();
+        format!("\u{12}{}{}\u{12}", body, text)
+    }
+
+    #[test]
+    fn strip_say_links_extracts_label() {
+        let msg = format!("Are you {} to begin?", saylink('0', "[ready]"));
+        assert_eq!(strip_say_links(&msg), "Are you [ready] to begin?");
+    }
+
+    #[test]
+    fn strip_say_links_handles_multiple_and_plain() {
+        assert_eq!(strip_say_links("no links here"), "no links here");
+        let msg = format!("{} and {}", saylink('a', "first"), saylink('b', "second"));
+        assert_eq!(strip_say_links(&msg), "first and second");
+    }
+
+    #[test]
+    fn strip_say_links_short_body_kept_verbatim() {
+        // A control byte with too-short a body (malformed) must not eat text.
+        assert_eq!(strip_say_links("a\u{12}short\u{12}b"), "ashortb");
+    }
 
     fn test_entity(id: u32, name: &str, hp_pct: f32) -> Entity {
         Entity {
