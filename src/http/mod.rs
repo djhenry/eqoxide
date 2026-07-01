@@ -299,6 +299,8 @@ pub const CONN_STALE_SECS: u64 = 15;
 /// Live player state for the /v1/observe/debug endpoint.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct PlayerState {
+    /// The player's own character name — so `/v1/observe/debug` identifies which char it drives (#109).
+    pub name:         String,
     pub zone:         String,
     pub race:         String, // 3-letter race code, e.g. "ELF" (Wood Elf)
     pub class:        String, // class name, e.g. "Cleric"
