@@ -37,21 +37,23 @@ Phase 1 (done): **discovery + indicators**.
   server's quests change). The client loads it at startup (`src/quests.rs`).
 - The HUD draws a golden **"❗ quest"** over any NPC that has a quest (so you can SEE quest givers
   in `/v1/observe/frame`, like a modern MMO). Note: in dense cities the nameplate may be occluded by buildings
-  (existing nameplate behavior) — `GET /v1/observe/quests` is the reliable readout.
-- `GET /v1/observe/quests` is your quest tracker: for the current zone it lists quest givers sorted by distance
+  (existing nameplate behavior) — `GET /v1/quests/givers` is the reliable readout.
+- `GET /v1/quests/givers` is your quest tracker: for the current zone it lists quest givers sorted by distance
   with their location, `loaded` (in spawn range) flag, `turn_in` flag, `wanted` items (id, name,
-  count), `reward_xp`, and `hail` text. Workflow: `GET /v1/observe/quests` → pick one → `/v1/navigate/goto` to it →
+  count), `reward_xp`, and `hail` text. Workflow: `GET /v1/quests/givers` → pick one → `/v1/navigate/goto` to it →
   `/v1/interact/hail` to read the quest → gather items → return → hand in.
 
 **Two kinds of EQ quests** — the client surfaces both:
 - **Old-style Lua turn-in/dialogue quests** (most classic Qeynos quests: Rat Whiskers, Gnoll Fangs,
   the guild-note hand-in) have **no protocol representation** — they're emergent server Lua. The
-  golden "!" + `GET /v1/observe/quests` (derived from `data/quests.json`) are the only way to see them.
+  golden "!" + `GET /v1/quests/givers` (derived from `data/quests.json`) are the only way to see them.
 - **Native Task-system quests** (LDoN+; present in Titanium) — the server pushes a real quest journal
   (`OP_TaskDescription`/`OP_TaskActivity`/`OP_CompletedTasks`). The client decodes these into a live
-  journal: **`GET /v1/observe/quests/log`** returns active tasks with title, description, reward, and objectives
+  journal: **`GET /v1/quests/log`** returns active tasks with title, description, reward, and objectives
   showing live progress (`done_count`/`goal_count`), plus completed task ids. The authentic "quest
-  added to my log, watch it tick up" experience. (OpenEQ decodes these structs but builds nothing on
+  added to my log, watch it tick up" experience. Completed tasks move to `GET /v1/quests/completed` (with title + time); `POST /v1/quests/cancel`
+  abandons an active task; `GET /v1/quests/offers` + `POST /v1/quests/accept`/`/decline` handle the
+  (rare) case where an NPC presents a choice of tasks instead of auto-granting one. (OpenEQ decodes these structs but builds nothing on
   them; packet-only clients can't see the old-style quests at all. See `docs/protocol-notes.md`.)
 
 To actually *complete* a turn-in quest you still need: reach + kill the mob → **loot** the item →

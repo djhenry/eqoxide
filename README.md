@@ -50,7 +50,7 @@ Legend: ✅ **working** (implemented & verified) · 🟡 **in progress** · 🔵
 | Target / consider / hail / say | ✅ | `/v1/combat/target`, `/v1/combat/target/name`, `/v1/combat/consider`, `/v1/interact/hail`, `/v1/interact/say` |
 | Merchant buy / sell / trade window | ✅ | `/v1/merchant/buy`, `/v1/merchant/sell`, `/trade/*`; live-verified buy (item + coin) |
 | Loot corpses (`POST /v1/interact/loot`) | ✅ | Auto-loot queues own kills; takes listed items |
-| Quest hand-in (`POST /v1/interact/give`) + quest log (`/v1/observe/quests`) | ✅ | Trade items to an NPC for turn-ins |
+| Quest hand-in (`POST /v1/interact/give`) + quest log (`/v1/quests/log`) | ✅ | Trade items to an NPC for turn-ins; also: completed history, task offer/accept/cancel |
 | Inventory read / move (`GET /v1/observe/inventory`, `/v1/inventory/move`) | ✅ | |
 | Doors API (`GET /v1/observe/doors`, `POST /v1/interact/click_door`) | ✅ | |
 | Water-region detection + swim navigation | ✅ | `.wtr` BSP; swim-descent in `find_path` |
