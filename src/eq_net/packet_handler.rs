@@ -1178,6 +1178,11 @@ fn apply_bind_respawn(gs: &mut GameState, payload: &[u8]) {
     gs.player_x = f32::from_le_bytes([payload[4],  payload[5],  payload[6],  payload[7]]);
     gs.player_y = f32::from_le_bytes([payload[8],  payload[9],  payload[10], payload[11]]);
     gs.player_z = f32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
+    // Real EQ revives a bind-respawned character at FULL HP. `apply_death` zeroed hp_pct and left
+    // cur_hp/max_hp stale, so without this the HUD/API show a dead-but-full contradiction
+    // (hp/hp_max full, hp_pct 0) until some later OP_HPUpdate happens to reconcile it (eqoxide#68).
+    let full = gs.max_hp.max(1);
+    gs.update_hp(gs.player_id, full, full); // cur=max → hp_pct=100, consistent with hp/hp_max
     gs.strategy = "Respawning...".into();
     gs.log_msg("zone", "Respawning at bind point");
 }
@@ -2284,6 +2289,25 @@ mod tests {
         // Revive / heal above 0 clears it (respawn also clears via the profile HP seed).
         gs.update_hp(7, 40, 100);
         assert!(!gs.player_dead, "restoring HP must clear player_dead");
+    }
+
+    #[test]
+    fn bind_respawn_restores_full_hp_and_position() {
+        // eqoxide#68: after death (hp_pct=0, cur/max stale), a bind-respawn must revive at full HP.
+        use super::apply_bind_respawn;
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+        gs.hp_pct = 0.0; gs.cur_hp = 34; gs.max_hp = 34; // post-death contradiction (full hp, 0 pct)
+        // OP_ZONE_PLAYER_TO_BIND payload: x@4, y@8, z@12 (needs len >= 20).
+        let mut pkt = [0u8; 20];
+        pkt[4..8].copy_from_slice(&100.0f32.to_le_bytes());
+        pkt[8..12].copy_from_slice(&200.0f32.to_le_bytes());
+        pkt[12..16].copy_from_slice(&(-5.0f32).to_le_bytes());
+        apply_bind_respawn(&mut gs, &pkt);
+        assert_eq!(gs.cur_hp, 34, "cur_hp stays at max");
+        assert!((gs.hp_pct - 100.0).abs() < 1e-4, "hp_pct restored to full, got {}", gs.hp_pct);
+        assert!((gs.player_x - 100.0).abs() < 1e-4 && (gs.player_y - 200.0).abs() < 1e-4,
+            "position moved to the bind point");
     }
 
     /// Sanity: OP_Death for the player's own id must NOT touch entities or animation=115.
