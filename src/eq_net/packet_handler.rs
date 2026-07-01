@@ -770,6 +770,12 @@ fn apply_death(gs: &mut GameState, payload: &[u8]) {
     if d_id == gs.player_id {
         gs.hp_pct    = 0.0;
         gs.player_dead = true; // nav walker checks this and clears any stale /goto (eqoxide#61)
+        // Zero cur_hp too: the self-render path derives the dead pose from
+        // `cur_hp <= 0 && max_hp > 0` (app.rs), and the death packet — not an
+        // OP_HPUpdate — is the authoritative "you died" signal. Without this the
+        // player's own model keeps standing. Respawn reseeds cur_hp from the fresh
+        // PlayerProfile, so the avatar stands back up automatically. (eqoxide#44)
+        gs.cur_hp    = 0;
         gs.strategy  = "Dead — waiting to respawn".into();
         tracing::info!("EQ: combat: *** You have been slain! ***");
         gs.log_msg("combat", "*** You have been slain! ***");
@@ -1319,10 +1325,10 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_emote, class_name, con_color, consider_message, parse_player_profile,
+    use super::{apply_emote, apply_death, class_name, con_color, consider_message, parse_player_profile,
                 parse_begin_cast, parse_memorize_spell, apply_char_inventory,
                 apply_money_update, apply_money_on_corpse, apply_set_target,
-                strip_say_links, SAY_LINK_BODY_SIZE};
+                strip_say_links, SAY_LINK_BODY_SIZE, SIZE_DEATH};
     use crate::game_state::{GameState, Entity};
 
     /// Build a RoF2 saylink: 0x12 + 56-char body + display text + 0x12.
@@ -1348,6 +1354,22 @@ mod tests {
     fn strip_say_links_short_body_kept_verbatim() {
         // A control byte with too-short a body (malformed) must not eat text.
         assert_eq!(strip_say_links("a\u{12}short\u{12}b"), "ashortb");
+    }
+
+    #[test]
+    fn apply_death_of_self_zeroes_cur_hp_for_dead_pose() {
+        // The self-render path derives the dead pose from cur_hp<=0 && max_hp>0,
+        // so a self death packet must zero cur_hp (not just hp_pct). (eqoxide#44)
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        gs.cur_hp = 30;
+        gs.max_hp = 30;
+        let mut payload = vec![0u8; SIZE_DEATH];
+        payload[0..4].copy_from_slice(&42u32.to_le_bytes()); // spawn_id = player
+        apply_death(&mut gs, &payload);
+        assert_eq!(gs.cur_hp, 0, "self death must zero cur_hp so the dead pose triggers");
+        assert!((gs.hp_pct - 0.0).abs() < 1e-4);
+        assert!(gs.cur_hp <= 0 && gs.max_hp > 0, "player_dead condition must hold");
     }
 
     fn test_entity(id: u32, name: &str, hp_pct: f32) -> Entity {
