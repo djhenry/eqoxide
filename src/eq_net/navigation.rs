@@ -314,6 +314,10 @@ const NAV_PROGRESS_EPS: f32 = 1.0;
 /// Consecutive no-progress nav ticks (~150 ms each) before the walker is declared stuck.
 /// ~3 s — long enough to ride out a brief wall-slide, short enough to recover quickly.
 const NAV_STUCK_TICKS: u32 = 20;
+/// After this many consecutive no-progress ticks (well before the `NAV_STUCK_TICKS` give-up), the
+/// walker commands the controller to hop — net progress has stalled, which is the real "wedged
+/// against a fence/cart" signal (sliding along it still looks like motion frame-to-frame). (#41)
+const NAV_HOP_TICKS: u32 = 6;
 
 /// What the no-progress detector decided after a nav step.
 #[derive(Debug, PartialEq, Eq)]
@@ -1108,6 +1112,8 @@ impl Navigator {
                                 jump:        false,
                                 want_swim:   false,
                                 speed:       RUN_SPEED,
+                                climb:       crate::movement::NAV_CLIMB, // surmount fence/cart lips find_path routed over (#41)
+                                hop:         false,                      // melee approach: no auto-hop
                             });
                         } else {
                             // In melee range: stop the controller and face the target so swings land
@@ -1305,6 +1311,10 @@ impl Navigator {
             jump:        false,
             want_swim:   false,
             speed:       RUN_SPEED,
+            climb:       crate::movement::NAV_CLIMB, // surmount fence/cart lips find_path routed over (#41)
+            // Net progress has stalled toward this waypoint → ask the controller to hop the barrier
+            // (it only does if grounded, off cooldown, and a near-level landing exists beyond). (#41)
+            hop:         self.stuck_ticks >= NAV_HOP_TICKS,
         });
     }
 
