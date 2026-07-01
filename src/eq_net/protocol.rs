@@ -171,6 +171,22 @@ pub const OP_TASK_SELECT_WINDOW:   u16 = 0x705b; // RoF2: OP_TaskSelectWindow; a
 pub const OP_ACCEPT_NEW_TASK:      u16 = 0x0a23; // RoF2: OP_AcceptNewTask; AcceptNewTask_Struct (12B, send)
 pub const OP_CANCEL_TASK:          u16 = 0x39f0; // RoF2: OP_CancelTask; CancelTask_Struct (8B, send)
 
+// Group management (invite/leave/kick/roster). Opcodes cross-checked against the live EQEmu
+// server's own utils/patches/patch_RoF2.conf. See docs/eq-technical-knowledgebase/group-protocol.md.
+pub const OP_GROUP_INVITE: u16        = 0x6110; // C→S send / S→C deliver; GroupInvite_Struct (148B)
+pub const OP_GROUP_FOLLOW: u16        = 0x1649; // C→S accept; GroupFollow_Struct (152B)
+pub const OP_GROUP_FOLLOW2: u16       = 0x2060; // S→C relay of the same struct
+pub const OP_GROUP_UPDATE: u16        = 0x3abb; // S→C incremental join notice; GroupJoin_Struct (148B)
+pub const OP_GROUP_UPDATE_B: u16      = 0x6194; // S→C full roster snapshot; streamed/variable
+// C→S leave/kick/decline-cleanup. NOTE: 128 bytes here (common GroupGeneric_Struct, no RoF2
+// override for this specific opcode) — NOT the 148-byte version used by the other Group opcodes.
+pub const OP_GROUP_DISBAND: u16       = 0x4c10;
+pub const OP_GROUP_DISBAND_YOU: u16   = 0x1ae5;   // S→C — you left/were kicked; 148B
+pub const OP_GROUP_DISBAND_OTHER: u16 = 0x74da;   // S→C — someone else left/was removed; 148B
+pub const OP_GROUP_LEADER_CHANGE: u16 = 0x21b4;   // S→C leader name push; 148B common struct
+pub const OP_GROUP_ACKNOWLEDGE: u16   = 0x7323;   // S→C only — "you joined" trigger; 4B, no fields
+pub const OP_GROUP_MAKE_LEADER: u16   = 0x4229;   // C→S /makeleader; GroupMakeLeader_Struct (456B)
+
 // ── Gameplay: looting ─────────────────────────────────────────────────────
 
 /// Server → client when a mob dies and leaves a lootable corpse.
