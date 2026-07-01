@@ -57,6 +57,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_TASK_DESCRIPTION     => apply_task_description(gs, p),
         OP_TASK_ACTIVITY        => apply_task_activity(gs, p),
         OP_COMPLETED_TASKS      => apply_completed_tasks(gs, p),
+        OP_TASK_SELECT_WINDOW   => apply_task_select_window(gs, p),
         OP_CHAR_INVENTORY       => apply_char_inventory(gs, p),
         OP_ITEM_PACKET          => apply_item_packet(gs, p),
         OP_SHOP_REQUEST         => apply_shop_request(gs, p),
@@ -372,6 +373,42 @@ fn apply_completed_tasks(gs: &mut GameState, p: &[u8]) {
             gs.completed_task_history.push(crate::game_state::CompletedTaskEntry { task_id, title, completed_time });
         }
     }
+}
+
+/// OP_TaskSelectWindow — a set of task offers from an open selector window (an NPC script called
+/// `tasksetselector` instead of auto-granting via `assigntask`; no content on this server's live
+/// scripts uses this path, but it's a genuine protocol case). Layout: header{task_count,type,
+/// task_giver}(12) then per task: task_id, reward_multiplier(f32, unused), duration, duration_code,
+/// title cstr, description cstr, has_rewards u8, element_count u32 ("initial active elements").
+/// `element_count` is 0 for every offer this server's content can produce; if a future task sends a
+/// nonzero count, its nested ActivityInformation::SerializeSelector payload is variable-length and
+/// not modeled here — stop parsing this packet (leaving gs.task_offers untouched) and log a warning
+/// rather than guess at the layout and desync/garble subsequent offers in the same packet.
+fn apply_task_select_window(gs: &mut GameState, p: &[u8]) {
+    let mut o = 0usize;
+    let task_count = rd_u32(p, &mut o);
+    let _sel_type = rd_u32(p, &mut o);
+    let task_giver = rd_u32(p, &mut o);
+    let mut offers = Vec::with_capacity(task_count as usize);
+    for _ in 0..task_count {
+        let task_id = rd_u32(p, &mut o);
+        o += 4; // reward_multiplier f32 (unused)
+        let _duration = rd_u32(p, &mut o);
+        let _duration_code = rd_u32(p, &mut o);
+        let title = rd_cstr(p, &mut o);
+        let description = rd_cstr(p, &mut o);
+        let has_rewards = rd_u8(p, &mut o) != 0;
+        let element_count = rd_u32(p, &mut o);
+        if element_count != 0 {
+            tracing::warn!(
+                "EQ: OP_TaskSelectWindow: task_id={task_id} has element_count={element_count} \
+                 (nested ActivityInformation not modeled) — bailing out of this packet"
+            );
+            return;
+        }
+        offers.push(crate::game_state::TaskOffer { task_id, npc_id: task_giver, title, description, has_rewards });
+    }
+    gs.task_offers = offers;
 }
 
 // ── Per-opcode helpers ────────────────────────────────────────────────────────
@@ -1266,7 +1303,7 @@ mod tests {
     use super::{apply_emote, class_name, con_color, consider_message, parse_player_profile,
                 parse_begin_cast, parse_memorize_spell, apply_char_inventory,
                 apply_money_update, apply_money_on_corpse, apply_set_target,
-                extract_saylink_text, apply_task_description, apply_completed_tasks};
+                extract_saylink_text, apply_task_description, apply_completed_tasks, apply_task_select_window};
     use crate::game_state::{GameState, Entity, TaskStatus};
 
     fn test_entity(id: u32, name: &str, hp_pct: f32) -> Entity {
@@ -2155,6 +2192,50 @@ mod tests {
         let p = 5u32.to_le_bytes().to_vec();
         apply_completed_tasks(&mut gs, &p);
         assert!(gs.completed_task_history.is_empty());
+    }
+
+    fn build_task_select_window(task_giver: u32, tasks: &[(u32, &str, &str, bool, u32)]) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&(tasks.len() as u32).to_le_bytes()); // task_count
+        p.extend_from_slice(&2u32.to_le_bytes());                 // type = Quest
+        p.extend_from_slice(&task_giver.to_le_bytes());
+        for (task_id, title, desc, has_rewards, element_count) in tasks {
+            p.extend_from_slice(&task_id.to_le_bytes());
+            p.extend_from_slice(&0f32.to_le_bytes());   // reward_multiplier
+            p.extend_from_slice(&0u32.to_le_bytes());   // duration
+            p.extend_from_slice(&0u32.to_le_bytes());   // duration_code
+            p.extend_from_slice(title.as_bytes()); p.push(0);
+            p.extend_from_slice(desc.as_bytes()); p.push(0);
+            p.push(if *has_rewards { 1 } else { 0 });
+            p.extend_from_slice(&element_count.to_le_bytes());
+        }
+        p
+    }
+
+    #[test]
+    fn apply_task_select_window_parses_offers() {
+        let mut gs = GameState::new();
+        let p = build_task_select_window(9001, &[
+            (10, "Offer One", "Do a thing", true, 0),
+            (11, "Offer Two", "Do another thing", false, 0),
+        ]);
+        apply_task_select_window(&mut gs, &p);
+        assert_eq!(gs.task_offers.len(), 2);
+        assert_eq!(gs.task_offers[0].task_id, 10);
+        assert_eq!(gs.task_offers[0].npc_id, 9001);
+        assert_eq!(gs.task_offers[0].title, "Offer One");
+        assert!(gs.task_offers[0].has_rewards);
+        assert!(!gs.task_offers[1].has_rewards);
+    }
+
+    #[test]
+    fn apply_task_select_window_bails_out_on_nonzero_element_count() {
+        let mut gs = GameState::new();
+        let p = build_task_select_window(9001, &[
+            (10, "Offer One", "Do a thing", true, 2), // unmodeled nested elements
+        ]);
+        apply_task_select_window(&mut gs, &p);
+        assert!(gs.task_offers.is_empty(), "must not guess at the nested ActivityInformation layout");
     }
 
     // ── RoF2 Death_Struct byte-layout tests ─────────────────────────────────────────────────────
