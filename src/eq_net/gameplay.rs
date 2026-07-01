@@ -17,6 +17,12 @@ use crate::game_state::GameState;
 
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
+/// Respawn safety-net (eqoxide#50): if the player has been dead this long without the
+/// server opening/honoring the respawn window, proactively request a bind respawn.
+const RESPAWN_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often to re-send the bind-respawn request while still stuck dead.
+const RESPAWN_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Consume the zone stream and run the gameplay loop indefinitely.
 pub async fn run_gameplay_phase(
     stream_init:   EqStream,
@@ -34,6 +40,8 @@ pub async fn run_gameplay_phase(
     let mut stream: Option<EqStream>                      = Some(stream_init);
     let mut net_rx: Option<UnboundedReceiver<AppPacket>>  = Some(net_rx_init);
     let mut last_keepalive = std::time::Instant::now();
+    // Last time the respawn safety-net re-sent a bind-respawn request (eqoxide#50).
+    let mut last_respawn_retry: Option<std::time::Instant> = None;
 
     loop {
         let s  = stream.as_mut().expect("stream always Some in loop");
@@ -102,6 +110,22 @@ pub async fn run_gameplay_phase(
             let _ = app_tx.send(packet.clone());
 
             match packet.opcode {
+                // Another player is asking to trade with us: the server forwards their
+                // OP_TradeRequest { to_mob_id = us, from_mob_id = initiator }. Our give/turn-in
+                // flow only implemented the initiator side, so incoming PC trade requests were
+                // never acked and the initiator timed out (eqoxide#38). Auto-accept by replying
+                // OP_TradeRequestAck with the ids swapped (to = initiator, from = us), mirroring
+                // the server's NPC auto-ack, which opens the trade session.
+                OP_TRADE_REQUEST if packet.payload.len() >= 8 => {
+                    let to_mob_id = u32::from_le_bytes(packet.payload[0..4].try_into().unwrap());
+                    let from_mob_id = u32::from_le_bytes(packet.payload[4..8].try_into().unwrap());
+                    if to_mob_id == gs.player_id {
+                        s.send_app_packet(OP_TRADE_REQUEST_ACK,
+                            &build_trade_request(from_mob_id, gs.player_id));
+                        gs.log_msg("trade", "Accepting incoming trade request.");
+                        tracing::info!("EQ: trade: acked incoming OP_TradeRequest from mob_id={}", from_mob_id);
+                    }
+                }
                 // Server listed a lootable item — echo back immediately to take it.
                 OP_LOOT_ITEM => {
                     gs.loot_last_activity = Some(std::time::Instant::now());
@@ -125,6 +149,27 @@ pub async fn run_gameplay_phase(
                         tracing::warn!("EQ: OP_RespawnWindow too short ({} bytes) — not answered",
                             packet.payload.len());
                     }
+                }
+                // Death respawn: EQEmu (with RespawnFromHover off) sends OP_ZonePlayerToBind and
+                // then holds us in a ZoneToBindPoint "zoning" state, waiting for the client to
+                // reply with OP_ZoneChange to finalize the respawn (Client::GoToDeath →
+                // MovePC(ZoneToBindPoint), completed by Handle_OP_ZoneChange). Without that reply
+                // the server leaves us half-zoned and silently drops all auto-attack/combat until
+                // a full relog. apply_bind_respawn already moved us locally; here we complete the
+                // handshake. bind_zone_id == 0 is the server's "same zone" marker → reply with the
+                // current zone id. The server's OP_ZoneChange response (handled below) then drives
+                // the reconnect/re-entry exactly like a normal zone change. (eqoxide#75)
+                OP_ZONE_PLAYER_TO_BIND if packet.payload.len() >= 20 => {
+                    let p = &packet.payload;
+                    let bind_zone_id = u16::from_le_bytes([p[0], p[1]]);
+                    let instance_id  = u16::from_le_bytes([p[2], p[3]]);
+                    let bx = f32::from_le_bytes([p[4],  p[5],  p[6],  p[7]]);
+                    let by = f32::from_le_bytes([p[8],  p[9],  p[10], p[11]]);
+                    let bz = f32::from_le_bytes([p[12], p[13], p[14], p[15]]);
+                    let target_zone = if bind_zone_id != 0 { bind_zone_id } else { gs.zone_id };
+                    s.send_app_packet(OP_ZONE_CHANGE,
+                        &build_zone_change(&gs.player_name, target_zone, instance_id, bx, by, bz));
+                    tracing::info!("EQ: bind respawn — sent OP_ZoneChange to finalize respawn (zone_id={target_zone})");
                 }
                 // Server booted us (typically another client logged in this same character).
                 // EQEmu's default is "second login wins"; the first client receives OP_GMKick.
@@ -166,16 +211,8 @@ pub async fn run_gameplay_phase(
                     } else {
                         // Cross-zone transition (#zone <name>): send OP_ZONE_CHANGE to
                         // trigger the full zone-change protocol (world reconnect, etc.).
-                        // RoF2 ZoneChange_Struct (100B): y/x/z at @76/@80/@84 (8 bytes later than Titanium).
-                        let mut buf = [0u8; SIZE_ZONE_CHANGE];
-                        let nb = gs.player_name.as_bytes();
-                        buf[..nb.len().min(64)].copy_from_slice(&nb[..nb.len().min(64)]);
-                        buf[64..66].copy_from_slice(&zone_id.to_le_bytes());
-                        buf[66..68].copy_from_slice(&instance_id.to_le_bytes());
-                        buf[76..80].copy_from_slice(&y.to_le_bytes());
-                        buf[80..84].copy_from_slice(&x.to_le_bytes());
-                        buf[84..88].copy_from_slice(&z.to_le_bytes());
-                        s.send_app_packet(OP_ZONE_CHANGE, &buf);
+                        s.send_app_packet(OP_ZONE_CHANGE,
+                            &build_zone_change(&gs.player_name, zone_id, instance_id, x, y, z));
                         tracing::info!("EQ: cross-zone OP_REQUEST_CLIENT_ZONE_CHANGE zone_id={zone_id} → sent OP_ZONE_CHANGE");
                     }
                 }
@@ -297,6 +334,29 @@ pub async fn run_gameplay_phase(
         if last_keepalive.elapsed() > KEEPALIVE_INTERVAL {
             s.send_keepalive();
             last_keepalive = std::time::Instant::now();
+        }
+
+        // Respawn safety-net (eqoxide#50): the server intermittently fails to send
+        // OP_RespawnWindow — or sends it but never applies the follow-up respawn —
+        // leaving the character stuck dead in place. If we've been dead past
+        // RESPAWN_TIMEOUT, proactively send the bind-respawn reply (option 0) and keep
+        // retrying every RESPAWN_RETRY_INTERVAL. Harmless if the server isn't holding a
+        // window (it just ignores the reply); player_dead_since clears once HP returns.
+        match gs.player_dead_since {
+            Some(dead_since)
+                if dead_since.elapsed() > RESPAWN_TIMEOUT
+                    && last_respawn_retry.map_or(true, |t| t.elapsed() > RESPAWN_RETRY_INTERVAL) =>
+            {
+                s.send_app_packet(OP_RESPAWN_WINDOW, &build_respawn_select(0));
+                gs.log_msg("combat", "No respawn — re-requesting bind respawn.");
+                tracing::warn!(
+                    "EQ: respawn safety-net — sent bind respawn (dead {}s, no recovery)",
+                    dead_since.elapsed().as_secs()
+                );
+                last_respawn_retry = Some(std::time::Instant::now());
+            }
+            None => last_respawn_retry = None,
+            _ => {}
         }
 
         navigator.tick(s, &mut gs, &app_tx);

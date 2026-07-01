@@ -243,6 +243,11 @@ pub type DoorsShared = Arc<Mutex<Vec<DoorView>>>;
 #[allow(dead_code)]
 pub type ZoneInfo = Arc<Mutex<(String, u16)>>;
 
+/// Seconds without any inbound server packet after which the session is reported disconnected
+/// (`connected: false`). Generous enough to ride out normal quiet spells; short enough that a
+/// dead/frozen server is caught within a few seconds (eqoxide#8).
+pub const CONN_STALE_SECS: u64 = 15;
+
 /// Live player state for the /v1/observe/debug endpoint.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct PlayerState {
@@ -272,6 +277,12 @@ pub struct PlayerState {
     /// Current target's display name and HP percent (0–100), or None when nothing is targeted.
     pub target_name:   Option<String>,
     pub target_hp_pct: Option<f32>,
+    /// Milliseconds since the last inbound server packet (connection-health signal, #8).
+    pub last_packet_age_ms: u64,
+    /// False when no server packet has arrived for [`CONN_STALE_SECS`] — the session is
+    /// dead/frozen rather than merely idle. Recomputed from `last_packet_age_ms` every frame (the
+    /// derived Default is a transient `false` before the first snapshot).
+    pub connected:          bool,
 }
 pub type PlayerInfo = Arc<Mutex<PlayerState>>;
 

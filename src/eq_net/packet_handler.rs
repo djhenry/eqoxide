@@ -16,6 +16,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_DELETE_SPAWN         => apply_delete_spawn(gs, p),
         OP_CLIENT_UPDATE        => apply_position_update(gs, p),
         OP_HP_UPDATE            => apply_hp_update(gs, p),
+        OP_MOB_HEALTH           => apply_mob_health(gs, p),
         OP_TARGET_MOUSE         => apply_set_target(gs, p), // synthetic (nav → render gs); see fn doc
         OP_NEW_ZONE             => apply_new_zone(gs, p),
         OP_ZONE_SPAWNS          => apply_zone_spawns(gs, p),
@@ -139,10 +140,6 @@ fn rd_u8(p: &[u8], off: &mut usize) -> u8 {
     *off += 1;
     v
 }
-
-/// RoF2's `SAY_LINK_BODY_SIZE` (rof2_limits.h) — fixed-width hex body (item id, augments,
-/// evolving/ornament/hash fields) that precedes the display name inside a saylink.
-const SAY_LINK_BODY_SIZE: usize = 56;
 
 /// Extract the display name from an EQ saylink. `EQ::SayLinkEngine::GenerateLink()` (EQEmu
 /// common/say_link.cpp) emits exactly two `\x12` delimiters: `\x12<56-char body><Name>\x12` — the
@@ -309,9 +306,45 @@ fn apply_item_packet(gs: &mut GameState, p: &[u8]) {
             charges: (item.stacksize as i32).max(1), // stack quantity lives in stacksize, not charges
             idfile:  item.idfile,
         };
-        gs.inventory.retain(|x| x.slot != it.slot);
-        gs.inventory.push(it);
+        const ITEM_PACKET_LOOT: u32 = 0x66;
+        if packet_type == ITEM_PACKET_LOOT {
+            // A Loot item's `main_slot` is NOT a safe inventory destination — it collides with
+            // occupied general-inventory wire slots and would evict a real item (eqoxide#56).
+            apply_looted_item(gs, it);
+        } else {
+            // OP_CharInventory / equip / cursor etc.: `main_slot` IS the authoritative slot.
+            gs.inventory.retain(|x| x.slot != it.slot);
+            gs.inventory.push(it);
+        }
     }
+}
+
+/// General-inventory wire slots (rof2_limits.h): 23..=32. Loot lands here (or a bag, not modelled).
+const GENERAL_BEGIN: i32 = 23;
+const GENERAL_END:   i32 = 32;
+
+/// Place a freshly-looted item into the client inventory model WITHOUT trusting the loot packet's
+/// `main_slot` (eqoxide#56). Merge into an existing stack of the same item in general inventory, else
+/// drop it into the first free general slot. The server holds the authoritative inventory and a
+/// resync (OP_CharInventory on relog / next sync) reconciles anything approximate here.
+fn apply_looted_item(gs: &mut GameState, mut it: crate::game_state::InvItem) {
+    // Stack-merge: same item already sitting in a general-inventory slot → add to its quantity.
+    // Restricted to general slots so we never merge into an EQUIPPED item that shares the id.
+    if let Some(stack) = gs.inventory.iter_mut()
+        .find(|x| x.item_id == it.item_id && (GENERAL_BEGIN..=GENERAL_END).contains(&x.slot))
+    {
+        stack.charges = stack.charges.saturating_add(it.charges.max(1));
+        return;
+    }
+    // Otherwise the first free general slot (never an occupied one → no eviction).
+    let occupied: std::collections::HashSet<i32> = gs.inventory.iter().map(|x| x.slot).collect();
+    if let Some(free) = (GENERAL_BEGIN..=GENERAL_END).find(|s| !occupied.contains(s)) {
+        it.slot = free;
+    }
+    // else: general inventory full (item really went to a bag) — leave main_slot as a best effort;
+    // the next server inventory sync corrects it. Don't retain-evict here.
+    gs.inventory.retain(|x| x.slot != it.slot);
+    gs.inventory.push(it);
 }
 
 
@@ -496,6 +529,17 @@ fn apply_hp_update(gs: &mut GameState, payload: &[u8]) {
     if payload.len() >= SIZE_HP_UPDATE {
         let hp = unsafe { safe_read::<HPUpdate_S>(payload) };
         gs.update_hp(hp.spawn_id as u32, hp.cur_hp as i32, hp.max_hp);
+    }
+}
+
+/// OP_MobHealth: percent-only HP for a mob you have targeted/x-targeted but aren't
+/// grouped with (the server only sends the full OP_HPUpdate to self/group/pet).
+/// Without this, a fought mob's `hp_pct` — and thus `target_hp_pct` — stays frozen
+/// at its seeded value the whole fight. (eqoxide#51)
+fn apply_mob_health(gs: &mut GameState, payload: &[u8]) {
+    if payload.len() >= SIZE_MOB_HEALTH {
+        let mh = unsafe { safe_read::<MobHealth_S>(payload) };
+        gs.update_hp_pct(mh.spawn_id as u32, mh.hp as f32);
     }
 }
 
@@ -712,6 +756,9 @@ fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
             gs.cur_hp = p.cur_hp as i32;
             if gs.max_hp <= 0 { gs.max_hp = p.cur_hp as i32; }
             gs.hp_pct = (gs.cur_hp as f32 / gs.max_hp.max(1) as f32) * 100.0;
+            // A profile with HP means we're alive (respawn/zone-in) → clear death bookkeeping.
+            gs.player_dead = false;         // nav walker / dead pose (eqoxide#61)
+            gs.player_dead_since = None;    // respawn safety-net timer (eqoxide#50)
             tracing::info!("EQ: PlayerProfile: seeded hp={}/{} ({:.0}%)", gs.cur_hp, gs.max_hp, gs.hp_pct);
         }
         // Seed mana the same way (eqoxide#27): no max in the profile, so set_mana seeds max = cur
@@ -813,7 +860,22 @@ fn apply_death(gs: &mut GameState, payload: &[u8]) {
     let d_id = d.spawn_id;
     let killer_id = d.killer_id; // copy out of the packed struct
     if d_id == gs.player_id {
+        // The server sometimes delivers OP_Death for our own spawn twice in quick
+        // succession; ignore the duplicate so we don't double-log the slain message or
+        // restart the respawn safety-net timer. player_dead_since is cleared once we're
+        // alive again (HP restored), so a genuine later death is still processed. (eqoxide#50)
+        if gs.player_dead_since.is_some() {
+            return;
+        }
+        gs.player_dead_since = Some(std::time::Instant::now());
         gs.hp_pct    = 0.0;
+        gs.player_dead = true; // nav walker checks this and clears any stale /goto (eqoxide#61)
+        // Zero cur_hp too: the self-render path derives the dead pose from
+        // `cur_hp <= 0 && max_hp > 0` (app.rs), and the death packet — not an
+        // OP_HPUpdate — is the authoritative "you died" signal. Without this the
+        // player's own model keeps standing. Respawn reseeds cur_hp from the fresh
+        // PlayerProfile, so the avatar stands back up automatically. (eqoxide#44)
+        gs.cur_hp    = 0;
         gs.strategy  = "Dead — waiting to respawn".into();
         tracing::info!("EQ: combat: *** You have been slain! ***");
         gs.log_msg("combat", "*** You have been slain! ***");
@@ -844,7 +906,9 @@ fn apply_death(gs: &mut GameState, payload: &[u8]) {
 }
 
 fn apply_exp_update(gs: &mut GameState, payload: &[u8]) {
-    if payload.len() >= 4 {
+    if payload.len() >= SIZE_EXP_UPDATE {
+        let eu = unsafe { safe_read::<ExpUpdate_S>(payload) };
+        gs.set_xp(eu.exp);
         gs.log_msg("exp", "Experience gained");
     }
 }
@@ -869,6 +933,15 @@ fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
     };
     tracing::info!("EQ: combat: {msg}");
     gs.log_msg("combat", &msg);
+
+    // Optimistic local HP (eqoxide#55): apply damage the player TOOK immediately so the HUD/API
+    // react per-hit instead of pinning at the last server value until the next OP_HPUpdate (which
+    // then reconciles the authoritative HP). `damage`@9 is the same reliable field shown above; only
+    // real hits (>0) reduce HP, clamped at 0. Guarded on a known max so the percent stays sane.
+    if target_id == gs.player_id && damage > 0 && gs.max_hp > 0 {
+        gs.cur_hp = (gs.cur_hp - damage).max(0);
+        gs.hp_pct = (gs.cur_hp as f32 / gs.max_hp.max(1) as f32) * 100.0;
+    }
 
     // Remember who is swinging at us (hit OR miss) so auto-combat can engage an add that aggros
     // mid-fight instead of tanking it unanswered. Only NPC attackers on the player count.
@@ -927,6 +1000,8 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
         .split('\0').next().unwrap_or("")
         .to_string();
     if msg.is_empty() { return; }
+    // NPC dialogue may embed saylink hyperlinks; show only the readable label.
+    let msg = strip_say_links(&msg);
 
     // EQEmu ChatChannel: 0 guild, 2 group, 3 shout, 4 auction, 5 OOC, 6 broadcast, 7 tell,
     // 8 say, 11 gmsay. The inter-agent channels are ALSO recorded as structured chat events for
@@ -954,6 +1029,37 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
         // Zone-wide broadcasts without a sender (server messages like "An earthquake strikes!").
         gs.log_msg("zone", &msg);
     }
+}
+
+/// RoF2 saylink body length (`SAY_LINK_BODY_SIZE`, EQEmu `common/patches/rof2_limits.h`).
+const SAY_LINK_BODY_SIZE: usize = 56;
+
+/// Strip EQ "saylink" framing from chat text, leaving only the human-readable label.
+///
+/// On the wire a saylink is `\x12` + a fixed 56-char body (the numeric link id/prefix)
+/// + the display text + `\x12` (RoF2). The real client renders only the display text
+/// (underlined/clickable); we have no link UI, so we show it as plain text. Text outside
+/// any `\x12...\x12` pair passes through unchanged. This mirrors EQEmu's
+/// `Strings::Split(msg, '\x12')` handling: splitting on the control byte yields plain
+/// text at even indices and link contents (body+text) at odd indices. A malformed or
+/// short link segment is kept as-is (minus the control byte) so we never eat real text.
+/// (eqoxide#46)
+fn strip_say_links(s: &str) -> String {
+    if !s.contains('\x12') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    for (i, seg) in s.split('\x12').enumerate() {
+        if i & 1 == 1 && seg.len() > SAY_LINK_BODY_SIZE {
+            // Link content: drop the fixed-length body, keep the trailing display text.
+            // Body is ASCII (hex digits), so byte offset 56 is a valid UTF-8 boundary.
+            out.push_str(&seg[SAY_LINK_BODY_SIZE..]);
+        } else {
+            // Plain text (even index) or a too-short/malformed link body — keep verbatim.
+            out.push_str(seg);
+        }
+    }
+    out
 }
 
 /// EQEmu sends GM-flagged accounts verbose server-side debug messages that are not
@@ -995,10 +1101,11 @@ fn apply_emote(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < 5 { return; }
     let etype = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
     if etype == 0xffff_ffff { return; } // /dance, /flip, etc. — animation only
-    let msg = String::from_utf8_lossy(&payload[4..])
-        .trim_end_matches('\0')
-        .trim()
-        .to_string();
+    let msg = strip_say_links(
+        String::from_utf8_lossy(&payload[4..])
+            .trim_end_matches('\0')
+            .trim(),
+    );
     if !msg.is_empty() && !is_debug_spam(&msg) {
         gs.log_msg("npc", &msg);
     }
@@ -1081,6 +1188,7 @@ fn apply_special_message(gs: &mut GameState, payload: &[u8]) {
     let msg = String::from_utf8_lossy(&payload[msg_start..])
         .trim_end_matches('\0')
         .to_string();
+    let msg = strip_say_links(&msg);
     if msg.trim().is_empty() || is_debug_spam(&msg) { return; }
     if sayer.is_empty() {
         gs.log_msg("npc", &msg);
@@ -1170,6 +1278,11 @@ fn apply_bind_respawn(gs: &mut GameState, payload: &[u8]) {
     gs.player_x = f32::from_le_bytes([payload[4],  payload[5],  payload[6],  payload[7]]);
     gs.player_y = f32::from_le_bytes([payload[8],  payload[9],  payload[10], payload[11]]);
     gs.player_z = f32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
+    // Real EQ revives a bind-respawned character at FULL HP. `apply_death` zeroed hp_pct and left
+    // cur_hp/max_hp stale, so without this the HUD/API show a dead-but-full contradiction
+    // (hp/hp_max full, hp_pct 0) until some later OP_HPUpdate happens to reconcile it (eqoxide#68).
+    let full = gs.max_hp.max(1);
+    gs.update_hp(gs.player_id, full, full); // cur=max → hp_pct=100, consistent with hp/hp_max
     gs.strategy = "Respawning...".into();
     gs.log_msg("zone", "Respawning at bind point");
 }
@@ -1317,12 +1430,88 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_emote, class_name, con_color, consider_message, parse_player_profile,
+    use super::{apply_emote, apply_death, class_name, con_color, consider_message, parse_player_profile,
                 parse_begin_cast, parse_memorize_spell, apply_char_inventory,
                 apply_money_update, apply_money_on_corpse, apply_set_target,
                 extract_saylink_text, apply_task_description, apply_completed_tasks, apply_task_select_window,
-                SAY_LINK_BODY_SIZE};
+                strip_say_links, SAY_LINK_BODY_SIZE, SIZE_DEATH};
     use crate::game_state::{GameState, Entity, TaskStatus};
+
+    /// Build a RoF2 saylink: 0x12 + 56-char body + display text + 0x12.
+    fn saylink(body_seed: char, text: &str) -> String {
+        let body: String = std::iter::repeat(body_seed).take(SAY_LINK_BODY_SIZE).collect();
+        format!("\u{12}{}{}\u{12}", body, text)
+    }
+
+    #[test]
+    fn strip_say_links_extracts_label() {
+        let msg = format!("Are you {} to begin?", saylink('0', "[ready]"));
+        assert_eq!(strip_say_links(&msg), "Are you [ready] to begin?");
+    }
+
+    #[test]
+    fn strip_say_links_handles_multiple_and_plain() {
+        assert_eq!(strip_say_links("no links here"), "no links here");
+        let msg = format!("{} and {}", saylink('a', "first"), saylink('b', "second"));
+        assert_eq!(strip_say_links(&msg), "first and second");
+    }
+
+    #[test]
+    fn strip_say_links_short_body_kept_verbatim() {
+        // A control byte with too-short a body (malformed) must not eat text.
+        assert_eq!(strip_say_links("a\u{12}short\u{12}b"), "ashortb");
+    }
+
+    #[test]
+    fn apply_death_of_self_zeroes_cur_hp_for_dead_pose() {
+        // The self-render path derives the dead pose from cur_hp<=0 && max_hp>0,
+        // so a self death packet must zero cur_hp (not just hp_pct). (eqoxide#44)
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        gs.cur_hp = 30;
+        gs.max_hp = 30;
+        let mut payload = vec![0u8; SIZE_DEATH];
+        payload[0..4].copy_from_slice(&42u32.to_le_bytes()); // spawn_id = player
+        apply_death(&mut gs, &payload);
+        assert_eq!(gs.cur_hp, 0, "self death must zero cur_hp so the dead pose triggers");
+        assert!((gs.hp_pct - 0.0).abs() < 1e-4);
+        assert!(gs.cur_hp <= 0 && gs.max_hp > 0, "player_dead condition must hold");
+    }
+
+    fn self_death_payload(player_id: u32) -> Vec<u8> {
+        let mut p = vec![0u8; SIZE_DEATH];
+        p[0..4].copy_from_slice(&player_id.to_le_bytes()); // spawn_id = player
+        p
+    }
+
+    #[test]
+    fn apply_death_dedupes_duplicate_self_death() {
+        // The server sometimes double-delivers OP_Death; the second must be ignored so we
+        // don't double-log or restart the respawn timer, but player_dead_since is set once.
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        apply_death(&mut gs, &self_death_payload(42));
+        let first = gs.player_dead_since;
+        assert!(first.is_some(), "first self death sets player_dead_since");
+        let slain_count = gs.messages.iter().filter(|m| m.text.contains("slain")).count();
+        assert_eq!(slain_count, 1);
+
+        apply_death(&mut gs, &self_death_payload(42)); // duplicate
+        assert_eq!(gs.player_dead_since, first, "duplicate must not restart the timer");
+        let slain_count = gs.messages.iter().filter(|m| m.text.contains("slain")).count();
+        assert_eq!(slain_count, 1, "duplicate death must not log a second slain message");
+    }
+
+    #[test]
+    fn update_hp_alive_clears_death_bookkeeping() {
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        apply_death(&mut gs, &self_death_payload(42));
+        assert!(gs.player_dead_since.is_some());
+        // Respawn HP restore → clears the safety-net flag.
+        gs.update_hp(42, 36, 36);
+        assert!(gs.player_dead_since.is_none(), "restoring HP clears player_dead_since");
+    }
 
     fn test_entity(id: u32, name: &str, hp_pct: f32) -> Entity {
         Entity {
@@ -1332,6 +1521,67 @@ mod tests {
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
             face: 0, hairstyle: 0, animation: 0,
         }
+    }
+
+    #[test]
+    fn combat_damage_to_player_decrements_local_hp() {
+        // eqoxide#55: a hit on the player should optimistically reduce local HP between OP_HPUpdates.
+        use super::apply_combat_damage;
+        // CombatDamage_Struct: target@0(u16) source@2(u16) type@4(u8) spellid@5(u32) damage@9(i32).
+        let dmg = |target: u16, source: u16, damage: i32| -> [u8; 13] {
+            let mut b = [0u8; 13];
+            b[0..2].copy_from_slice(&target.to_le_bytes());
+            b[2..4].copy_from_slice(&source.to_le_bytes());
+            b[9..13].copy_from_slice(&damage.to_le_bytes());
+            b
+        };
+        let mut gs = GameState::new();
+        gs.player_id = 7; gs.cur_hp = 100; gs.max_hp = 100; gs.hp_pct = 100.0;
+
+        apply_combat_damage(&mut gs, &dmg(7, 99, 14)); // mob hits player for 14
+        assert_eq!(gs.cur_hp, 86, "player HP should drop by the hit");
+        assert!((gs.hp_pct - 86.0).abs() < 1e-4, "hp_pct recomputed: {}", gs.hp_pct);
+
+        apply_combat_damage(&mut gs, &dmg(7, 99, 0)); // a miss
+        assert_eq!(gs.cur_hp, 86, "a miss must not change HP");
+
+        apply_combat_damage(&mut gs, &dmg(99, 7, 50)); // player hits an NPC
+        assert_eq!(gs.cur_hp, 86, "damage to an NPC must not change the player's HP");
+
+        apply_combat_damage(&mut gs, &dmg(7, 99, 9999)); // lethal hit
+        assert_eq!(gs.cur_hp, 0, "HP clamps at 0");
+        assert!((gs.hp_pct - 0.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn looted_item_places_in_free_slot_and_stacks_never_overwrites() {
+        // eqoxide#56: loot must not evict an occupied slot, and stackable loot should merge.
+        use super::apply_looted_item;
+        use crate::game_state::InvItem;
+        let inv = |slot: i32, id: u32, ch: i32| InvItem {
+            slot, item_id: id, name: String::new(), icon: 0, charges: ch, idfile: String::new(),
+        };
+        let mut gs = GameState::new();
+        // Skin of Milk x20 @23, Bread Cakes x20 @24, Rat Whiskers x1 @25.
+        gs.inventory = vec![inv(23, 9990, 20), inv(24, 9991, 20), inv(25, 13071, 1)];
+
+        // Loot another Rat Whiskers; the packet's main_slot bogusly names an occupied slot (23).
+        apply_looted_item(&mut gs, inv(23, 13071, 1));
+        assert_eq!(gs.inventory.iter().find(|x| x.slot == 23).map(|x| x.item_id), Some(9990),
+            "Skin of Milk must not be overwritten");
+        assert_eq!(gs.inventory.iter().find(|x| x.slot == 24).map(|x| x.item_id), Some(9991),
+            "Bread Cakes must not be overwritten");
+        let rw: Vec<_> = gs.inventory.iter().filter(|x| x.item_id == 13071).collect();
+        assert_eq!(rw.len(), 1, "Rat Whiskers should stack into one slot, not split");
+        assert_eq!(rw[0].charges, 2, "stack quantity should merge to 2");
+
+        // Loot a brand-new item with a bogus main_slot (24) → first FREE general slot (26).
+        apply_looted_item(&mut gs, inv(24, 9131, 1));
+        assert_eq!(gs.inventory.iter().find(|x| x.slot == 24).map(|x| x.item_id), Some(9991),
+            "Bread Cakes still untouched");
+        assert_eq!(gs.inventory.iter().find(|x| x.item_id == 9131).unwrap().slot, 26,
+            "new loot goes to the first free general slot");
+        assert_eq!(gs.inventory.len(), 4);
     }
 
     #[test]
@@ -2313,6 +2563,44 @@ mod tests {
         assert_eq!(e.animation, 115, "animation must be set to 115 (Lying) for dead clip");
         // Auto-loot queued for player's own kill
         assert!(gs.pending_loot.contains(&42), "corpse id must be queued for auto-loot");
+    }
+
+    #[test]
+    fn player_death_sets_dead_flag_and_revive_clears_it() {
+        // eqoxide#61: the nav walker keys on gs.player_dead to abandon a stale /goto.
+        use super::apply_death;
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+        gs.player_dead = false;
+        // Death_Struct: spawn_id@0 = the player, killer_id@4.
+        let mut pkt = [0u8; 32];
+        pkt[0..4].copy_from_slice(&7u32.to_le_bytes());
+        pkt[4..8].copy_from_slice(&99u32.to_le_bytes());
+        apply_death(&mut gs, &pkt);
+        assert!(gs.player_dead, "player death must set player_dead");
+        assert_eq!(gs.hp_pct, 0.0);
+        // Revive / heal above 0 clears it (respawn also clears via the profile HP seed).
+        gs.update_hp(7, 40, 100);
+        assert!(!gs.player_dead, "restoring HP must clear player_dead");
+    }
+
+    #[test]
+    fn bind_respawn_restores_full_hp_and_position() {
+        // eqoxide#68: after death (hp_pct=0, cur/max stale), a bind-respawn must revive at full HP.
+        use super::apply_bind_respawn;
+        let mut gs = GameState::new();
+        gs.player_id = 7;
+        gs.hp_pct = 0.0; gs.cur_hp = 34; gs.max_hp = 34; // post-death contradiction (full hp, 0 pct)
+        // OP_ZONE_PLAYER_TO_BIND payload: x@4, y@8, z@12 (needs len >= 20).
+        let mut pkt = [0u8; 20];
+        pkt[4..8].copy_from_slice(&100.0f32.to_le_bytes());
+        pkt[8..12].copy_from_slice(&200.0f32.to_le_bytes());
+        pkt[12..16].copy_from_slice(&(-5.0f32).to_le_bytes());
+        apply_bind_respawn(&mut gs, &pkt);
+        assert_eq!(gs.cur_hp, 34, "cur_hp stays at max");
+        assert!((gs.hp_pct - 100.0).abs() < 1e-4, "hp_pct restored to full, got {}", gs.hp_pct);
+        assert!((gs.player_x - 100.0).abs() < 1e-4 && (gs.player_y - 200.0).abs() < 1e-4,
+            "position moved to the bind point");
     }
 
     /// Sanity: OP_Death for the player's own id must NOT touch entities or animation=115.

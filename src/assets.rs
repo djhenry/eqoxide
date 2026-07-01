@@ -876,7 +876,9 @@ impl Collision {
     /// `[east, north]` (start-exclusive, goal-inclusive) or None if no geometry / no route.
     /// Walkability = a floor exists under the cell; an edge needs a small floor-height step and
     /// a clear chest-height segment between cell centers.
-    pub fn find_path(&self, start: [f32; 3], goal: [f32; 3], radius: f32) -> Option<Vec<[f32; 3]>> {
+    /// `avoid` is a set of XY points (nearby NPC positions) the route should skirt — see the
+    /// aggro-avoidance note below (#67). Pass `&[]` for a pure geometric route.
+    pub fn find_path(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]]) -> Option<Vec<[f32; 3]>> {
         use std::collections::BinaryHeap;
         use std::cmp::Ordering;
         if self.cols == 0 || self.rows == 0 { return None; }
@@ -930,6 +932,23 @@ impl Collision {
         const MAX_STEP_DOWN: f32 = 60.0; // max DROP between adjacent cells (fall/hop down a level)
         const CHEST: f32 = 3.0;
         const MAX_NODES: usize = 200_000;
+        // Aggro-avoidance (#67): softly bias A* AWAY from cells near NPCs so long routes skirt mob
+        // camps instead of plowing through them and getting the player killed. Proactive (before
+        // aggro) and faction-agnostic — the client has no broad faction data, so it avoids ALL
+        // nearby NPCs; the penalty is MILD and fades to 0 at AGGRO_RADIUS, so a route is only
+        // nudged around a camp when a clear alternative exists — it never becomes "no route".
+        const AGGRO_RADIUS: f32 = 50.0;  // ~ a low-level mob's aggro range
+        const AGGRO_PENALTY: f32 = 60.0; // max extra step cost right at an NPC; 0 at the radius edge
+        let aggro_cost = |x: f32, y: f32| -> f32 {
+            let mut worst = 0.0f32;
+            for p in avoid {
+                let d2 = (x - p[0]) * (x - p[0]) + (y - p[1]) * (y - p[1]);
+                if d2 < AGGRO_RADIUS * AGGRO_RADIUS {
+                    worst = worst.max(AGGRO_PENALTY * (1.0 - d2.sqrt() / AGGRO_RADIUS));
+                }
+            }
+            worst
+        };
         // MULTI-FLOOR A*: the node is (cell, floor), not just cell — so a single cell can be visited
         // at several heights (a ramp or lower floor sitting UNDER an upper ledge). Single-floor A*
         // snapped every cell to the surface nearest the current z and could never step down onto a
@@ -986,7 +1005,8 @@ impl Collision {
                     let nkey = (nc, nr, qf(nf));
                     if closed.contains(&nkey) { continue; }
                     if !self.path_clear([a[0], a[1], cz + CHEST], [b[0], b[1], nf + CHEST], radius) { continue; }
-                    let step = (((dc * dc + dr * dr) as f32).sqrt()) * cell + (nf - cz).abs() * 0.5;
+                    let step = (((dc * dc + dr * dr) as f32).sqrt()) * cell + (nf - cz).abs() * 0.5
+                        + aggro_cost(b[0], b[1]);
                     let tentative = g_cur + step;
                     if tentative < *g_score.get(&nkey).unwrap_or(&f32::MAX) {
                         g_score.insert(nkey, tentative);
@@ -1291,11 +1311,41 @@ mod tests {
         // The direct line (5,5)->(15,5) crosses the wall (north 5 < 14) → blocked.
         assert!(col.segment_blocked([5.0, 5.0, 3.0], [15.0, 5.0, 3.0]));
         // find_path routes AROUND the wall through the northern gap.
-        let path = col.find_path([5.0, 5.0, 0.0], [15.0, 5.0, 0.0], 1.0)
+        let path = col.find_path([5.0, 5.0, 0.0], [15.0, 5.0, 0.0], 1.0, &[])
             .expect("a route around the wall should exist");
         let last = *path.last().unwrap();
         assert!((last[0] - 15.0).abs() < 1.5 && (last[1] - 5.0).abs() < 1.5, "ends at goal: {last:?}");
         assert!(path.iter().any(|p| p[1] > 12.0), "path must detour north through the gap: {path:?}");
+    }
+
+    #[test]
+    fn find_path_skirts_npc_camps_when_given_avoid_points() {
+        // Big open floor (no walls) so routing is driven purely by the aggro cost (#67).
+        let floor = MeshData {
+            positions: vec![[0.0, 0.0, 0.0], [200.0, 0.0, 0.0], [200.0, 0.0, 200.0], [0.0, 0.0, 200.0]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let col = Collision::build(&ZoneAssets { terrain: vec![floor], objects: vec![], textures: vec![] }, 16.0);
+        let start = [20.0, 100.0, 0.0];
+        let goal  = [180.0, 100.0, 0.0];
+        // An NPC sitting dead-centre on the straight route.
+        let npc = [[100.0, 100.0f32]];
+        let min_to_npc = |path: &[[f32; 3]]| path.iter()
+            .map(|w| ((w[0] - npc[0][0]).powi(2) + (w[1] - npc[0][1]).powi(2)).sqrt())
+            .fold(f32::MAX, f32::min);
+
+        let direct = col.find_path(start, goal, 1.0, &[]).expect("open route exists");
+        let skirt  = col.find_path(start, goal, 1.0, &npc).expect("aggro route still exists (mild penalty)");
+
+        // The plain route runs right past the NPC; the aggro route bows away from it.
+        assert!(min_to_npc(&direct) < 10.0, "plain route passes through the NPC: {}", min_to_npc(&direct));
+        assert!(min_to_npc(&skirt) > min_to_npc(&direct) + 8.0,
+            "aggro route should skirt the NPC (min dist {} vs {})", min_to_npc(&skirt), min_to_npc(&direct));
+        // …and still arrive.
+        let last = *skirt.last().unwrap();
+        assert!((last[0] - goal[0]).abs() < 3.0 && (last[1] - goal[1]).abs() < 3.0, "reaches goal: {last:?}");
     }
 
     #[test]

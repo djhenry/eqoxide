@@ -286,6 +286,10 @@ pub struct GameState {
     // Strategy text for HUD
     pub strategy: String,
 
+    /// True from the moment the PLAYER is slain until HP is restored (revive / respawn / heal).
+    /// The nav walker checks this to stop driving a corpse toward a stale /goto (eqoxide#61).
+    pub player_dead: bool,
+
     /// Count of server rubber-band corrections (position deltas > 5 units).
     pub server_corrections: u32,
 
@@ -325,6 +329,12 @@ pub struct GameState {
     pub casting: Option<CastState>,
     /// True when the player is sitting.
     pub sitting: bool,
+    /// When the player's own death was first observed (OP_Death for our spawn), or None
+    /// while alive. Used to (a) dedupe the duplicate OP_Death the server sometimes sends
+    /// and (b) drive the respawn safety-net that re-requests a bind respawn when the
+    /// server never opens (or never honors) the respawn window. Cleared once HP is
+    /// restored. Transient recovery bookkeeping. (eqoxide#50)
+    pub player_dead_since: Option<std::time::Instant>,
     /// True when auto-attack is enabled.
     pub auto_attack: bool,
 
@@ -450,11 +460,37 @@ impl GameState {
             self.hp_pct = (cur_hp as f32 / max_hp.max(1) as f32) * 100.0;
             self.cur_hp = cur_hp;
             self.max_hp = max_hp;
+            // Alive again → clear the death/respawn bookkeeping. (eqoxide#61, #50)
+            if cur_hp > 0 {
+                self.player_dead = false;       // revived / healed above 0
+                self.player_dead_since = None;  // clear the respawn safety-net timer
+            }
         } else if let Some(e) = self.entities.get_mut(&spawn_id) {
             e.cur_hp = cur_hp;
             e.max_hp = max_hp;
             e.hp_pct = (cur_hp as f32 / max_hp.max(1) as f32) * 100.0;
         }
+    }
+
+    /// Apply a percent-only HP update (OP_MobHealth / `SpawnHPUpdate_Struct2`). A mob
+    /// you are fighting but not grouped with only sends its HP as a 0-100 percentage,
+    /// so there is no absolute cur/max to record — just its `hp_pct`. The target HUD
+    /// readout (`target_hp_pct`) follows `entities[id].hp_pct`, so this is what makes a
+    /// fought mob's health bar move. Don't touch the player's own bar here: the player
+    /// gets a full OP_HPUpdate with real cur/max, which is strictly better. (eqoxide#51)
+    pub fn update_hp_pct(&mut self, spawn_id: u32, hp_pct: f32) {
+        if spawn_id != self.player_id {
+            if let Some(e) = self.entities.get_mut(&spawn_id) {
+                e.hp_pct = hp_pct;
+            }
+        }
+    }
+
+    /// Set `xp_pct` from an OP_ExpUpdate `exp` field, a 0-330 ratio of progress
+    /// through the current level. Convert to a 0-100 percentage and clamp (a
+    /// freshly-leveled character can momentarily report slightly over 330). (eqoxide#48)
+    pub fn set_xp(&mut self, exp_ratio: u32) {
+        self.xp_pct = (exp_ratio as f32 / 330.0 * 100.0).clamp(0.0, 100.0);
     }
 
     /// Set the player's current mana and recompute `mana_pct`. The mana wire (PlayerProfile seed,
@@ -691,12 +727,49 @@ mod tests {
     }
 
     #[test]
+    fn update_hp_pct_sets_entity_percent_only() {
+        // OP_MobHealth carries only a 0-100 percentage: hp_pct moves, cur/max untouched.
+        let mut gs = GameState::new();
+        gs.upsert_entity(make_entity(7, "mob", 0.0, 0.0, 0.0, true));
+        gs.update_hp(7, 50, 200); // seed cur/max via a full update first
+        gs.update_hp_pct(7, 40.0);
+        let e = &gs.entities[&7];
+        assert!((e.hp_pct - 40.0).abs() < 1e-4, "expected 40.0, got {}", e.hp_pct);
+        assert_eq!(e.cur_hp, 50, "percent-only update must not touch cur_hp");
+        assert_eq!(e.max_hp, 200, "percent-only update must not touch max_hp");
+    }
+
+    #[test]
+    fn update_hp_pct_ignores_player_self() {
+        // The player has a better full OP_HPUpdate path; a percent-only update must not
+        // clobber the player's own bar.
+        let mut gs = GameState::new();
+        gs.player_id = 1;
+        gs.hp_pct = 88.0;
+        gs.update_hp_pct(1, 5.0);
+        assert!((gs.hp_pct - 88.0).abs() < 1e-4, "player hp_pct must be untouched");
+    }
+
+    #[test]
     fn update_hp_max_zero_does_not_panic() {
         let mut gs = GameState::new();
         gs.player_id = 1;
         // max_hp=0 → uses max(1) guard; cur_hp=0 → 0%
         gs.update_hp(1, 0, 0);
         assert!((gs.hp_pct - 0.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn set_xp_converts_330_ratio_to_percent() {
+        let mut gs = GameState::new();
+        gs.set_xp(0);
+        assert!((gs.xp_pct - 0.0).abs() < 1e-4);
+        gs.set_xp(165); // half-way through the level
+        assert!((gs.xp_pct - 50.0).abs() < 1e-3, "expected 50.0, got {}", gs.xp_pct);
+        gs.set_xp(330); // full → clamps to 100
+        assert!((gs.xp_pct - 100.0).abs() < 1e-4);
+        gs.set_xp(400); // over-range guard
+        assert!((gs.xp_pct - 100.0).abs() < 1e-4);
     }
 
     // --- GameState::nearby_npcs ---
