@@ -108,6 +108,10 @@ pub struct SceneState {
     pub merchant_open: Option<u32>,
     /// Items the open merchant offers (for the merchant window's buy list).
     pub merchant_items: Vec<crate::game_state::MerchantItem>,
+    /// Current group roster (empty = not grouped), for the always-on roster panel.
+    pub group_members: Vec<crate::game_state::GroupMember>,
+    /// Current group leader's name ("" if unknown/not grouped).
+    pub group_leader: String,
 }
 
 impl SceneState {
@@ -289,6 +293,8 @@ impl SceneState {
             target_id: gs.target_id,
             merchant_open: gs.merchant_open,
             merchant_items: gs.merchant_items.clone(),
+            group_members: gs.group_members.clone(),
+            group_leader: gs.group_leader.clone(),
         }
     }
 }
@@ -528,5 +534,21 @@ mod tests {
         assert_eq!(scene.messages.len(), 3);
         assert_eq!(scene.messages[0].text, "hello");
         assert_eq!(scene.messages[2].text, "third");
+    }
+
+    #[test]
+    fn from_game_state_copies_group_roster() {
+        use crate::game_state::GroupMember;
+        let mut gs = sample_state();
+        gs.player_name = "Aldric".into();
+        gs.group_leader = "Aldric".into();
+        gs.group_members = vec![
+            GroupMember { name: "Aldric".into(), is_leader: true, level: 10, ..Default::default() },
+            GroupMember { name: "Sariel".into(), level: 8, ..Default::default() },
+        ];
+        let scene = SceneState::from_game_state(&gs);
+        assert_eq!(scene.group_leader, "Aldric");
+        assert_eq!(scene.group_members.len(), 2);
+        assert_eq!(scene.group_members[1].name, "Sariel");
     }
 }
