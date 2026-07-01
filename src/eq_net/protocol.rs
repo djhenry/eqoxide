@@ -178,8 +178,9 @@ pub const OP_GROUP_FOLLOW: u16        = 0x1649; // C→S accept; GroupFollow_Str
 pub const OP_GROUP_FOLLOW2: u16       = 0x2060; // S→C relay of the same struct
 pub const OP_GROUP_UPDATE: u16        = 0x3abb; // S→C incremental join notice; GroupJoin_Struct (148B)
 pub const OP_GROUP_UPDATE_B: u16      = 0x6194; // S→C full roster snapshot; streamed/variable
-// C→S leave/kick/decline-cleanup. NOTE: 128 bytes here (common GroupGeneric_Struct, no RoF2
-// override for this specific opcode) — NOT the 148-byte version used by the other Group opcodes.
+// C→S leave/kick/decline-cleanup; 148B RoF2-namespaced struct, same shape as OP_GroupInvite
+// (name1[64], name2[64], 5 trailing zero u32s) — confirmed live against a running EQEmu zone
+// server (task-6 validation); an earlier 128-byte static-analysis inference was wrong.
 pub const OP_GROUP_DISBAND: u16       = 0x4c10;
 pub const OP_GROUP_DISBAND_YOU: u16   = 0x1ae5;   // S→C — you left/were kicked; 148B
 pub const OP_GROUP_DISBAND_OTHER: u16 = 0x74da;   // S→C — someone else left/was removed; 148B
