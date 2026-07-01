@@ -276,6 +276,53 @@ pub fn build_cancel_task(sequence_number: u32) -> Vec<u8> {
     buf
 }
 
+/// OP_GroupInvite payload: GroupInvite_Struct (148 bytes): invitee_name[64], inviter_name[64],
+/// then 5 unknown/zero-filled u32s.
+pub fn build_group_invite(invitee_name: &str, inviter_name: &str) -> [u8; 148] {
+    let mut buf = [0u8; 148];
+    let n = invitee_name.as_bytes().len().min(63);
+    buf[0..n].copy_from_slice(&invitee_name.as_bytes()[..n]);
+    let n2 = inviter_name.as_bytes().len().min(63);
+    buf[64..64 + n2].copy_from_slice(&inviter_name.as_bytes()[..n2]);
+    buf
+}
+
+/// OP_GroupFollow payload (accepting an invite): GroupFollow_Struct (152 bytes): name1=inviter[64],
+/// name2=invitee(us)[64], then 6 unknown/zero-filled u32s.
+pub fn build_group_follow(inviter_name: &str, invitee_name: &str) -> [u8; 152] {
+    let mut buf = [0u8; 152];
+    let n = inviter_name.as_bytes().len().min(63);
+    buf[0..n].copy_from_slice(&inviter_name.as_bytes()[..n]);
+    let n2 = invitee_name.as_bytes().len().min(63);
+    buf[64..64 + n2].copy_from_slice(&invitee_name.as_bytes()[..n2]);
+    buf
+}
+
+/// OP_GroupDisband payload (leave/kick/decline-cleanup). NOTE: this opcode uses the COMMON
+/// (non-RoF2-namespaced) GroupGeneric_Struct — only 128 bytes: name1[64], name2[64], NO trailing
+/// u32s, unlike the 148-byte version used for the other Group opcodes. `own_name` is the acting
+/// player's own name; `target_name` is who's being removed (self for leave/decline, the kicked
+/// member's name for a kick).
+pub fn build_group_disband(own_name: &str, target_name: &str) -> [u8; 128] {
+    let mut buf = [0u8; 128];
+    let n = own_name.as_bytes().len().min(63);
+    buf[0..n].copy_from_slice(&own_name.as_bytes()[..n]);
+    let n2 = target_name.as_bytes().len().min(63);
+    buf[64..64 + n2].copy_from_slice(&target_name.as_bytes()[..n2]);
+    buf
+}
+
+/// OP_GroupMakeLeader payload: GroupMakeLeader_Struct (456 bytes): Unknown000(u32)=0,
+/// CurrentLeader[64], NewLeader[64], Unknown072[324]=0. Only NewLeader is read server-side.
+pub fn build_group_make_leader(current_leader: &str, new_leader: &str) -> [u8; 456] {
+    let mut buf = [0u8; 456];
+    let n = current_leader.as_bytes().len().min(63);
+    buf[4..4 + n].copy_from_slice(&current_leader.as_bytes()[..n]);
+    let n2 = new_leader.as_bytes().len().min(63);
+    buf[68..68 + n2].copy_from_slice(&new_leader.as_bytes()[..n2]);
+    buf
+}
+
 /// Build a RoF2 `OP_ChannelMessage` for the Say channel (used for NPC hails).
 /// chan_num 8 = ChatChannel_Say; the server delivers say text to NPCs within 200
 /// units, triggering EVENT_SAY (a "Hail, <name>" message fires the NPC's hail script).
@@ -1650,6 +1697,42 @@ mod tests {
         assert_eq!(b.len(), 8);
         assert_eq!(u32::from_le_bytes([b[0], b[1], b[2], b[3]]), 3);
         assert_eq!(u32::from_le_bytes([b[4], b[5], b[6], b[7]]), 2); // TaskType::Quest
+    }
+
+    #[test]
+    fn build_group_invite_layout() {
+        let b = build_group_invite("Sariel", "Aldric");
+        assert_eq!(b.len(), 148);
+        assert_eq!(&b[0..6], b"Sariel");
+        assert_eq!(b[6], 0); // NUL after the name within the 64-byte field
+        assert_eq!(&b[64..70], b"Aldric");
+    }
+
+    #[test]
+    fn build_group_follow_layout() {
+        let b = build_group_follow("Aldric", "Sariel");
+        assert_eq!(b.len(), 152);
+        assert_eq!(&b[0..6], b"Aldric");
+        assert_eq!(&b[64..70], b"Sariel");
+    }
+
+    #[test]
+    fn build_group_disband_layout_is_128_bytes_not_148() {
+        // The single highest-risk byte-layout detail in this feature: this specific opcode uses the
+        // COMMON (non-RoF2-namespaced) 128-byte GroupGeneric_Struct, unlike every other Group opcode.
+        let b = build_group_disband("Aldric", "Sariel");
+        assert_eq!(b.len(), 128);
+        assert_eq!(&b[0..6], b"Aldric");
+        assert_eq!(&b[64..70], b"Sariel");
+    }
+
+    #[test]
+    fn build_group_make_leader_layout() {
+        let b = build_group_make_leader("Aldric", "Sariel");
+        assert_eq!(b.len(), 456);
+        assert_eq!(&b[0..4], &0u32.to_le_bytes()); // Unknown000
+        assert_eq!(&b[4..10], b"Aldric");           // CurrentLeader @4
+        assert_eq!(&b[68..74], b"Sariel");          // NewLeader @68
     }
 
     #[test]
