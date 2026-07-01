@@ -38,23 +38,48 @@ pub fn load(path: &Path) {
     }
 }
 
-/// Substitute `%1`..`%9` in `template` with `args` (1-indexed). Missing args become "".
+/// Substitute placeholders in `template` with `args` (1-indexed). Missing args become "".
+///
+/// Handles both plain positional tokens `%1`..`%9` and letter-prefixed variants
+/// `%<L><n>` such as `%B1` / `%T3`, where `L` is an EQ format-code letter (e.g. `B`
+/// bold, `T` an indirect string lookup in the real client). RoF2 still passes the
+/// argument values positionally, so we resolve every `%<L><n>` to the nth arg — the
+/// same as `%<n>`. Without this the prefixed tokens leaked verbatim into chat
+/// (e.g. `You have gained the ability "%B1(1)" ... %T3.`). See eqoxide#59.
+///
 /// Pure and unit-tested — the core of formatted-message rendering.
 pub fn substitute(template: &str, args: &[&str]) -> String {
+    let chars: Vec<char> = template.chars().collect();
     let mut out = String::with_capacity(template.len());
-    let mut chars = template.chars().peekable();
-    while let Some(c) = chars.next() {
+    let push_arg = |out: &mut String, d: char| {
+        let idx = d as usize - '1' as usize;
+        out.push_str(args.get(idx).copied().unwrap_or(""));
+    };
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
         if c == '%' {
-            if let Some(&d) = chars.peek() {
+            // Plain positional: %1..%9
+            if let Some(&d) = chars.get(i + 1) {
                 if ('1'..='9').contains(&d) {
-                    chars.next();
-                    let idx = d as usize - '1' as usize;
-                    out.push_str(args.get(idx).copied().unwrap_or(""));
+                    push_arg(&mut out, d);
+                    i += 2;
                     continue;
+                }
+                // Letter-prefixed positional: %B1, %T3, ... (letter then 1-based index).
+                if d.is_ascii_alphabetic() {
+                    if let Some(&d2) = chars.get(i + 2) {
+                        if ('1'..='9').contains(&d2) {
+                            push_arg(&mut out, d2);
+                            i += 3;
+                            continue;
+                        }
+                    }
                 }
             }
         }
         out.push(c);
+        i += 1;
     }
     out.trim().to_string()
 }
@@ -86,5 +111,25 @@ mod tests {
         assert_eq!(substitute("Hi %1%2", &["there"]), "Hi there");
         // A bare % or %0 is left as-is.
         assert_eq!(substitute("100% done", &[]), "100% done");
+    }
+
+    #[test]
+    fn substitute_resolves_letter_prefixed_tokens() {
+        // The observed skill-gain message: %B1 → arg1, %2 → arg2, %T3 → arg3.
+        let out = substitute(
+            r#"You have gained the ability "%B1(1)" at a cost of %2 ability %T3."#,
+            &["Kick", "0", "points"],
+        );
+        assert_eq!(out, r#"You have gained the ability "Kick(1)" at a cost of 0 ability points."#);
+        // %T1 as a lone token resolves to arg1.
+        assert_eq!(substitute("You have gained the ability to use %T1.", &["Slam"]),
+                   "You have gained the ability to use Slam.");
+    }
+
+    #[test]
+    fn substitute_letter_without_index_is_literal() {
+        // A lone `%B` (no digit) or a non-token letter must not be swallowed.
+        assert_eq!(substitute("grade %B for effort", &["x"]), "grade %B for effort");
+        assert_eq!(substitute("50% B1 off", &["x"]), "50% B1 off");
     }
 }
