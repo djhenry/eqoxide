@@ -795,6 +795,7 @@ impl App {
                 heading_cw:  h_cw,
                 server_corrections: gs.server_corrections,
                 mem_spells: gs.mem_spells,
+                skills:     gs.player_skills.clone(),
                 player_id:  gs.player_id,
                 target_id:  gs.target_id,
                 coin:       gs.coin,

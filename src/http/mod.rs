@@ -310,6 +310,8 @@ pub struct PlayerState {
     pub heading_cw:   f32, // 0=north CW (wire format)
     pub server_corrections: u32,
     pub mem_spells:   [u32; 9],
+    /// Player skill values by skill id (0..77), for GET /v1/observe/skills (eqoxide#99).
+    pub skills:       Vec<u32>,
     /// The player's own spawn id (for scripting a self-target). (eqoxide#95)
     pub player_id:    u32,
     pub target_id:    Option<u32>,
