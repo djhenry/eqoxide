@@ -1164,13 +1164,17 @@ pub fn encode_position_update(spawn_id: u16, x: f32, y: f32, z: f32, heading: f3
     buf
 }
 
-/// HP update (10 bytes).
+/// HP update (10 bytes). Field order matches the RoF2 wire struct
+/// `SpawnHPUpdate_Struct` (spawn_id, cur_hp, max_hp) — see eqoxide#45. The three
+/// fields total 10 bytes either way, so a byte-length check never caught the
+/// earlier mis-ordering; getting the order right is what makes `spawn_id` parse
+/// from the correct offset.
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
 pub struct HPUpdate_S {
+    pub spawn_id: i16,
     pub cur_hp: u32,
     pub max_hp: i32,
-    pub spawn_id: i16,
 }
 
 /// Death notification (32 bytes).
