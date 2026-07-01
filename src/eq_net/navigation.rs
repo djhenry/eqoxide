@@ -1194,7 +1194,16 @@ impl Navigator {
         let goto = *self.goto_target.lock().unwrap(); // copy out so the lock is released
         let goal = match goto {
             Some(t) => t,
-            None    => { self.path.clear(); self.path_goal = None; return }
+            // No active /goto ⇒ the controller must not be nav-driven. Clearing nav_intent here is the
+            // catch-all for the invariant "no goto ⇒ no nav movement": any stop that cleared
+            // goto_target without also clearing nav_intent would otherwise leave the controller
+            // walking the last wish_dir forever (eqoxide#71). Harmless when already None.
+            None    => {
+                self.path.clear();
+                self.path_goal = None;
+                *self.nav_intent.lock().unwrap() = None;
+                return;
+            }
         };
 
         // (Re)compute a wall-avoiding A* path when the goal changes. find_path returns
@@ -1255,6 +1264,8 @@ impl Navigator {
                     drop_to_target, max_dmg, gs.cur_hp);
                 gs.log_msg("zone", "Fall too dangerous (HP too low) — stopped at the ledge");
                 *self.goto_target.lock().unwrap() = None;
+                *self.nav_intent.lock().unwrap() = None; // else the controller keeps walking the last
+                // wish_dir forever — drifting 1000s of units with no nav activity (eqoxide#71).
                 return;
             }
             self.falling = Some(target.2);
