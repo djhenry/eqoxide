@@ -467,6 +467,13 @@ impl<'a> LoginProtocol<'a> {
                 // (handled by apply_packet), world-login flow opcodes.
                 // RoF2 opcode values from patch_RoF2.conf.
                 const SILENT: &[u16] = &[
+                    // Char-select world chatter — informational packets sent to every client;
+                    // this headless client renders no char-select/guild/membership UI, so
+                    // dropping them is correct (eqoxide#20). Values from patch_RoF2.conf.
+                    0x507a, // OP_GuildsList — guild dropdown list
+                    0x5475, // OP_SendMaxCharacters — character-slot count
+                    0x7acc, // OP_SendMembership — gold/silver account status
+                    0x057b, // OP_SendMembershipDetails — membership feature matrix
                     0x6fca, // OP_GroundSpawn (RoF2) — ground item drops, no action needed
                     OP_SEND_ZONE_POINTS, // handled by apply_packet
                     OP_SPECIAL_MESG,     // NPC dialogue, handled by apply_packet
