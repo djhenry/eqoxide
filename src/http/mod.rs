@@ -35,6 +35,13 @@ pub type FrameReq = Arc<Mutex<Option<oneshot::Sender<Vec<u8>>>>>;
 /// Target position for the navigation system. Set by /goto, cleared on arrival.
 pub type GotoTarget = Arc<Mutex<Option<(f32, f32, f32)>>>;
 
+/// When /goto targets a named ENTITY, this holds its `entity_positions` key so the nav walker can
+/// re-resolve the entity's CURRENT position each tick and CHASE it — roaming mobs move (and their
+/// client position is stale until they come within the server's update range), so pathing to a
+/// one-time snapshot lands nowhere near them (eqoxide#88). `None` for coordinate gotos. Cleared
+/// on arrival/stop alongside `goto_target`.
+pub type GotoEntity = Arc<Mutex<Option<String>>>;
+
 /// Authoritative controller snapshot published by the render thread each frame and read by the nav
 /// thread to stream OP_ClientUpdate (design §2). Single source of position truth.
 pub type ControllerShared = Arc<Mutex<crate::movement::ControllerView>>;
@@ -310,6 +317,7 @@ pub(crate) struct HttpState {
     pub(crate) snapshot:         Arc<Mutex<CameraSnapshot>>,
     pub(crate) frame_req:        FrameReq,
     pub(crate) goto_target:      GotoTarget,
+    pub(crate) goto_entity:      GotoEntity,
     pub(crate) entity_positions: EntityPositions,
     pub(crate) entity_ids:       EntityIds,
     pub(crate) zone_points:      ZonePoints,
@@ -352,6 +360,7 @@ pub fn spawn_camera_server(
     snapshot:         Arc<Mutex<CameraSnapshot>>,
     frame_req:        FrameReq,
     goto_target:      GotoTarget,
+    goto_entity:      GotoEntity,
     entity_positions: EntityPositions,
     entity_ids:       EntityIds,
     zone_points:      ZonePoints,
@@ -395,7 +404,7 @@ pub fn spawn_camera_server(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, door_click, doors_shared, camp, camp_until };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, door_click, doors_shared, camp, camp_until };
             // Versioned + grouped routes: /v1/<group>/<action>. Each group's `router()` defines
             // relative paths; nesting prefixes them. Shared state is applied once at the end.
             let app = Router::new()
