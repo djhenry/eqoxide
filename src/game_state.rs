@@ -425,6 +425,13 @@ impl GameState {
         }
     }
 
+    /// Set `xp_pct` from an OP_ExpUpdate `exp` field, a 0-330 ratio of progress
+    /// through the current level. Convert to a 0-100 percentage and clamp (a
+    /// freshly-leveled character can momentarily report slightly over 330). (eqoxide#48)
+    pub fn set_xp(&mut self, exp_ratio: u32) {
+        self.xp_pct = (exp_ratio as f32 / 330.0 * 100.0).clamp(0.0, 100.0);
+    }
+
     /// Set the player's current mana and recompute `mana_pct`. The mana wire (PlayerProfile seed,
     /// OP_ManaChange) carries only the *current* mana — there is no max in either — so `max_mana`
     /// is tracked as a high-water-mark: it grows to the largest current mana seen. At zone-in a
@@ -689,6 +696,19 @@ mod tests {
         // max_hp=0 → uses max(1) guard; cur_hp=0 → 0%
         gs.update_hp(1, 0, 0);
         assert!((gs.hp_pct - 0.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn set_xp_converts_330_ratio_to_percent() {
+        let mut gs = GameState::new();
+        gs.set_xp(0);
+        assert!((gs.xp_pct - 0.0).abs() < 1e-4);
+        gs.set_xp(165); // half-way through the level
+        assert!((gs.xp_pct - 50.0).abs() < 1e-3, "expected 50.0, got {}", gs.xp_pct);
+        gs.set_xp(330); // full → clamps to 100
+        assert!((gs.xp_pct - 100.0).abs() < 1e-4);
+        gs.set_xp(400); // over-range guard
+        assert!((gs.xp_pct - 100.0).abs() < 1e-4);
     }
 
     // --- GameState::nearby_npcs ---
