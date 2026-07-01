@@ -18,6 +18,7 @@ use crate::camera_state::{CameraCmd, CameraSnapshot};
 
 mod observe;
 mod quests;
+mod group;
 mod navigate;
 mod combat;
 mod interact;
@@ -70,6 +71,46 @@ pub type AcceptTaskReq = Arc<Mutex<Option<u32>>>;
 /// once, looks up the task's sequence_number in gs.tasks, and sends OP_CancelTask
 /// (CancelTask_Struct).
 pub type CancelTaskReq = Arc<Mutex<Option<u32>>>;
+
+/// One group member's live view for GET /v1/group/roster (role badges are read-only display
+/// flags pushed by the server — not settable via this API in v1).
+#[derive(Clone, serde::Serialize)]
+pub struct GroupMemberView {
+    pub name:     String,
+    pub level:    u32,
+    pub is_leader: bool,
+    pub is_merc:  bool,
+    pub tank:     bool,
+    pub assist:   bool,
+    pub puller:   bool,
+    pub offline:  bool,
+    pub hp_pct:   f32,
+}
+
+/// Published each nav tick from GameState.group_members/group_leader/pending_invite (GET
+/// /v1/group/roster, and the UI roster panel). `you_are_leader` is precomputed at publish time
+/// (gs.player_name == gs.group_leader) so handlers don't need the player's own name separately.
+#[derive(Clone, Default)]
+pub struct GroupSnapshot {
+    pub members:         Vec<GroupMemberView>,
+    pub leader:           String,
+    pub pending_invite:   Option<String>,
+    pub you_are_leader:   bool,
+}
+pub type GroupShared = Arc<Mutex<GroupSnapshot>>;
+
+/// POST /v1/group/invite target name. Drained by the nav tick loop, which sends OP_GroupInvite.
+pub type GroupInviteReq = Arc<Mutex<Option<String>>>;
+/// POST /v1/group/accept trigger — accepts gs.pending_invite. One-shot: `Some(())` then drained.
+pub type GroupAcceptReq = Arc<Mutex<Option<()>>>;
+/// POST /v1/group/decline trigger — declines gs.pending_invite via a defensive OP_GroupDisband.
+pub type GroupDeclineReq = Arc<Mutex<Option<()>>>;
+/// POST /v1/group/leave trigger — sends OP_GroupDisband(self, self).
+pub type GroupLeaveReq = Arc<Mutex<Option<()>>>;
+/// POST /v1/group/kick target member name. Sends OP_GroupDisband(self, target).
+pub type GroupKickReq = Arc<Mutex<Option<String>>>;
+/// POST /v1/group/makeleader target member name. Sends OP_GroupMakeLeader.
+pub type GroupMakeLeaderReq = Arc<Mutex<Option<String>>>;
 
 /// Zone-crossing request set by POST /v1/navigate/zone_cross; gameplay thread reads it once,
 /// warps to the matching zone line and sends OP_ZONE_CHANGE.
@@ -341,6 +382,13 @@ pub(crate) struct HttpState {
     pub(crate) completed_tasks_shared: CompletedTasksShared,
     pub(crate) accept_task:           AcceptTaskReq,
     pub(crate) cancel_task:           CancelTaskReq,
+    pub(crate) group:             GroupShared,
+    pub(crate) group_invite:      GroupInviteReq,
+    pub(crate) group_accept:      GroupAcceptReq,
+    pub(crate) group_decline:     GroupDeclineReq,
+    pub(crate) group_leave:       GroupLeaveReq,
+    pub(crate) group_kick:        GroupKickReq,
+    pub(crate) group_make_leader: GroupMakeLeaderReq,
     pub(crate) door_click:       DoorClickReq,
     pub(crate) doors_shared:     DoorsShared,
     pub(crate) camp:             CampReq,
@@ -383,6 +431,13 @@ pub fn spawn_camera_server(
     completed_tasks_shared: CompletedTasksShared,
     accept_task:           AcceptTaskReq,
     cancel_task:           CancelTaskReq,
+    group:             GroupShared,
+    group_invite:      GroupInviteReq,
+    group_accept:      GroupAcceptReq,
+    group_decline:     GroupDeclineReq,
+    group_leave:       GroupLeaveReq,
+    group_kick:        GroupKickReq,
+    group_make_leader: GroupMakeLeaderReq,
     door_click:       DoorClickReq,
     doors_shared:     DoorsShared,
     camp:             CampReq,
@@ -395,12 +450,13 @@ pub fn spawn_camera_server(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, door_click, doors_shared, camp, camp_until };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until };
             // Versioned + grouped routes: /v1/<group>/<action>. Each group's `router()` defines
             // relative paths; nesting prefixes them. Shared state is applied once at the end.
             let app = Router::new()
                 .nest("/v1/observe",   observe::router())
                 .nest("/v1/quests",    quests::router())
+                .nest("/v1/group",     group::router())
                 .nest("/v1/navigate",  navigate::router())
                 .nest("/v1/combat",    combat::router())
                 .nest("/v1/interact",  interact::router())
