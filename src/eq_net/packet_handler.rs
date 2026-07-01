@@ -666,7 +666,9 @@ fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
             gs.cur_hp = p.cur_hp as i32;
             if gs.max_hp <= 0 { gs.max_hp = p.cur_hp as i32; }
             gs.hp_pct = (gs.cur_hp as f32 / gs.max_hp.max(1) as f32) * 100.0;
-            gs.player_dead = false; // a profile with HP means we're alive (respawn/zone-in) — #61
+            // A profile with HP means we're alive (respawn/zone-in) → clear death bookkeeping.
+            gs.player_dead = false;         // nav walker / dead pose (eqoxide#61)
+            gs.player_dead_since = None;    // respawn safety-net timer (eqoxide#50)
             tracing::info!("EQ: PlayerProfile: seeded hp={}/{} ({:.0}%)", gs.cur_hp, gs.max_hp, gs.hp_pct);
         }
         // Seed mana the same way (eqoxide#27): no max in the profile, so set_mana seeds max = cur
@@ -768,6 +770,14 @@ fn apply_death(gs: &mut GameState, payload: &[u8]) {
     let d_id = d.spawn_id;
     let killer_id = d.killer_id; // copy out of the packed struct
     if d_id == gs.player_id {
+        // The server sometimes delivers OP_Death for our own spawn twice in quick
+        // succession; ignore the duplicate so we don't double-log the slain message or
+        // restart the respawn safety-net timer. player_dead_since is cleared once we're
+        // alive again (HP restored), so a genuine later death is still processed. (eqoxide#50)
+        if gs.player_dead_since.is_some() {
+            return;
+        }
+        gs.player_dead_since = Some(std::time::Instant::now());
         gs.hp_pct    = 0.0;
         gs.player_dead = true; // nav walker checks this and clears any stale /goto (eqoxide#61)
         // Zero cur_hp too: the self-render path derives the dead pose from
@@ -1375,6 +1385,41 @@ mod tests {
         assert_eq!(gs.cur_hp, 0, "self death must zero cur_hp so the dead pose triggers");
         assert!((gs.hp_pct - 0.0).abs() < 1e-4);
         assert!(gs.cur_hp <= 0 && gs.max_hp > 0, "player_dead condition must hold");
+    }
+
+    fn self_death_payload(player_id: u32) -> Vec<u8> {
+        let mut p = vec![0u8; SIZE_DEATH];
+        p[0..4].copy_from_slice(&player_id.to_le_bytes()); // spawn_id = player
+        p
+    }
+
+    #[test]
+    fn apply_death_dedupes_duplicate_self_death() {
+        // The server sometimes double-delivers OP_Death; the second must be ignored so we
+        // don't double-log or restart the respawn timer, but player_dead_since is set once.
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        apply_death(&mut gs, &self_death_payload(42));
+        let first = gs.player_dead_since;
+        assert!(first.is_some(), "first self death sets player_dead_since");
+        let slain_count = gs.messages.iter().filter(|m| m.text.contains("slain")).count();
+        assert_eq!(slain_count, 1);
+
+        apply_death(&mut gs, &self_death_payload(42)); // duplicate
+        assert_eq!(gs.player_dead_since, first, "duplicate must not restart the timer");
+        let slain_count = gs.messages.iter().filter(|m| m.text.contains("slain")).count();
+        assert_eq!(slain_count, 1, "duplicate death must not log a second slain message");
+    }
+
+    #[test]
+    fn update_hp_alive_clears_death_bookkeeping() {
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        apply_death(&mut gs, &self_death_payload(42));
+        assert!(gs.player_dead_since.is_some());
+        // Respawn HP restore → clears the safety-net flag.
+        gs.update_hp(42, 36, 36);
+        assert!(gs.player_dead_since.is_none(), "restoring HP clears player_dead_since");
     }
 
     fn test_entity(id: u32, name: &str, hp_pct: f32) -> Entity {
