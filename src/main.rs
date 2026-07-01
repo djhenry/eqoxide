@@ -176,6 +176,7 @@ OPTIONS:
     }
 
     let goto_target:      http::GotoTarget      = Arc::new(Mutex::new(None));
+    let goto_entity:      http::GotoEntity      = Arc::new(Mutex::new(None));
     let entity_positions: http::EntityPositions = Arc::new(Mutex::new(HashMap::new()));
     let entity_ids:       http::EntityIds       = Arc::new(Mutex::new(HashMap::new()));
     let zone_points:      http::ZonePoints      = Arc::new(Mutex::new(Vec::new()));
@@ -230,6 +231,7 @@ OPTIONS:
     let asset_server_url = app_cfg.asset_server_url.clone();
     if !testzone_mode {
         let gt  = goto_target.clone();
+        let ge  = goto_entity.clone();
         let ep  = entity_positions.clone();
         let ei  = entity_ids.clone();
         let zp  = zone_points.clone();
@@ -272,7 +274,7 @@ OPTIONS:
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, tos, cts, atk, ctk, zc, wp, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, cev, csd, ca, ms, st, co, sc, md, sd, cp, cu, cv, ni, pc).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ge, ep, ei, zp, tl, tos, cts, atk, ctk, zc, wp, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, cev, csd, ca, ms, st, co, sc, md, sd, cp, cu, cv, ni, pc).await {
                     tracing::error!("EQ: fatal: {e}");
                 }
             });
@@ -312,6 +314,7 @@ OPTIONS:
         camera_snapshot.clone(),
         frame_req.clone(),
         goto_target,
+        goto_entity,
         entity_positions,
         entity_ids,
         zone_points,
