@@ -115,7 +115,7 @@ that target near the player's tracked position; its range check compares linear 
 
 EQ's built-in quest journal (LDoN+, present in Titanium). Server-pushed for *task* quests only —
 old-style Lua turn-in quests (Rat Whiskers, Gnoll Fangs) send NONE of these. Decoded in
-`packet_handler.rs` into `GameState.tasks` (→ `GET /v1/observe/quests/log`). All are **variable-length, packed**
+`packet_handler.rs` into `GameState.tasks` (→ `GET /v1/quests/log`). All are **variable-length, packed**
 (no struct padding) with embedded null-terminated strings; offsets verified vs EQEmu
 `titanium.cpp ENCODE(OP_TaskDescription)` + `eq_packet_structs.h`.
 

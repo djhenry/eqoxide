@@ -254,6 +254,28 @@ pub fn build_click_door(door_id: u8, player_id: u32) -> Vec<u8> {
     buf
 }
 
+/// OP_AcceptNewTask payload: AcceptNewTask_Struct (12 bytes, all u32): unknown00, task_id
+/// (0 = decline all pending offers), task_master_id (the offering NPC's entity id; irrelevant for
+/// a decline — only task_id==0 matters per the struct's own EQEmu comment).
+pub fn build_accept_new_task(task_id: u32, task_master_id: u32) -> Vec<u8> {
+    let mut buf = vec![0u8; 12];
+    // buf[0..4] unknown00 = 0
+    buf[4..8].copy_from_slice(&task_id.to_le_bytes());
+    buf[8..12].copy_from_slice(&task_master_id.to_le_bytes());
+    buf
+}
+
+/// OP_CancelTask payload: CancelTask_Struct (8 bytes, both u32): SequenceNumber (the task's
+/// journal display-order slot, NOT its task_id — see ClientTaskState::CancelTask), type
+/// (TaskType — 2 = Quest, the only type this server's content grants).
+pub fn build_cancel_task(sequence_number: u32) -> Vec<u8> {
+    const TASK_TYPE_QUEST: u32 = 2;
+    let mut buf = vec![0u8; 8];
+    buf[0..4].copy_from_slice(&sequence_number.to_le_bytes());
+    buf[4..8].copy_from_slice(&TASK_TYPE_QUEST.to_le_bytes());
+    buf
+}
+
 /// Build a RoF2 `OP_ChannelMessage` for the Say channel (used for NPC hails).
 /// chan_num 8 = ChatChannel_Say; the server delivers say text to NPCs within 200
 /// units, triggering EVENT_SAY (a "Hail, <name>" message fires the NPC's hail script).
@@ -369,6 +391,10 @@ pub struct Navigator {
     entity_ids:       EntityIds,
     zone_points:      ZonePoints,
     task_log:         TaskLog,
+    task_offers_shared:    crate::http::TaskOffersShared,
+    completed_tasks_shared: crate::http::CompletedTasksShared,
+    accept_task:           crate::http::AcceptTaskReq,
+    cancel_task:           crate::http::CancelTaskReq,
     zone_cross:       ZoneCrossReq,
     /// Direct teleport request (POST /warp). The nav thread jumps the player to these coords,
     /// sends a position update so the server agrees, and cancels any in-progress /goto.
@@ -453,6 +479,10 @@ impl Navigator {
         entity_ids:       EntityIds,
         zone_points:      ZonePoints,
         task_log:         TaskLog,
+        task_offers_shared:    crate::http::TaskOffersShared,
+        completed_tasks_shared: crate::http::CompletedTasksShared,
+        accept_task:           crate::http::AcceptTaskReq,
+        cancel_task:           crate::http::CancelTaskReq,
         zone_cross:       ZoneCrossReq,
         warp:             WarpReq,
         hail:             HailReq,
@@ -489,6 +519,10 @@ impl Navigator {
             entity_ids,
             zone_points,
             task_log,
+            task_offers_shared,
+            completed_tasks_shared,
+            accept_task,
+            cancel_task,
             zone_cross,
             warp,
             hail,
@@ -560,6 +594,16 @@ impl Navigator {
         let mut tasks: Vec<_> = gs.tasks.values().cloned().collect();
         tasks.sort_by_key(|t| t.task_id);
         log.extend(tasks);
+        drop(log);
+
+        let mut offers = self.task_offers_shared.lock().unwrap();
+        offers.clear();
+        offers.extend(gs.task_offers.iter().cloned());
+        drop(offers);
+
+        let mut completed = self.completed_tasks_shared.lock().unwrap();
+        completed.clear();
+        completed.extend(gs.completed_task_history.iter().cloned());
     }
 
     /// Publish the player's inventory + equipment from `gs` into the shared slot (GET /inventory).
@@ -693,6 +737,40 @@ impl Navigator {
             stream.send_app_packet(OP_CLICK_DOOR, &build_click_door(door_id, gs.player_id));
             tracing::info!("EQ: click door_id={}", door_id);
             gs.log_msg("door", &format!("Clicked door {}", door_id));
+        }
+
+        // POST /v1/quests/accept ({"task_id":N}) or /decline (task_id=0): send OP_AcceptNewTask.
+        // For a real accept, look up the offering NPC's id from gs.task_offers (task_master_id is
+        // required by the struct); a decline sends task_master_id=0 (irrelevant when task_id==0).
+        // Either way, the selector window is done with — clear all pending offers.
+        if let Some(task_id) = self.accept_task.lock().unwrap().take() {
+            let task_master_id = if task_id == 0 {
+                0
+            } else {
+                gs.task_offers.iter().find(|o| o.task_id == task_id).map(|o| o.npc_id).unwrap_or(0)
+            };
+            stream.send_app_packet(OP_ACCEPT_NEW_TASK, &build_accept_new_task(task_id, task_master_id));
+            if task_id == 0 {
+                tracing::info!("EQ: quests: declined all pending task offers");
+                gs.log_msg("quest", "Declined task offer(s)");
+            } else {
+                tracing::info!("EQ: quests: accepted task_id={task_id} task_master_id={task_master_id}");
+                gs.log_msg("quest", "Accepted task offer");
+            }
+            gs.task_offers.clear();
+        }
+
+        // POST /v1/quests/cancel ({"task_id":N}): abandon an active task. OP_CancelTask addresses
+        // the task by its journal sequence_number, not task_id — see build_cancel_task.
+        if let Some(task_id) = self.cancel_task.lock().unwrap().take() {
+            if let Some(task) = gs.tasks.get(&task_id) {
+                let seq = task.sequence_number;
+                stream.send_app_packet(OP_CANCEL_TASK, &build_cancel_task(seq));
+                tracing::info!("EQ: quests: cancelled task_id={task_id} sequence_number={seq}");
+                gs.log_msg("quest", "Cancelled task");
+            } else {
+                tracing::warn!("EQ: quests: cancel requested for unknown task_id={task_id} — ignoring");
+            }
         }
 
         // Check zone-cross request — warp onto a zone line, then send OP_ZONE_CHANGE.
@@ -1553,6 +1631,22 @@ pub fn make_position_packet(spawn_id: u32, x: f32, y: f32, z: f32, heading: f32)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_accept_new_task_layout() {
+        let b = build_accept_new_task(42, 9001);
+        assert_eq!(b.len(), 12);
+        assert_eq!(u32::from_le_bytes([b[4], b[5], b[6], b[7]]), 42);
+        assert_eq!(u32::from_le_bytes([b[8], b[9], b[10], b[11]]), 9001);
+    }
+
+    #[test]
+    fn build_cancel_task_layout() {
+        let b = build_cancel_task(3);
+        assert_eq!(b.len(), 8);
+        assert_eq!(u32::from_le_bytes([b[0], b[1], b[2], b[3]]), 3);
+        assert_eq!(u32::from_le_bytes([b[4], b[5], b[6], b[7]]), 2); // TaskType::Quest
+    }
 
     #[test]
     fn auto_combat_engages_add_attacking_player() {

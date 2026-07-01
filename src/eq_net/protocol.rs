@@ -166,7 +166,10 @@ pub const SLOT_TRADE_BEGIN: u32      = 3000;
 // Native Task-system quest journal (server→client). Decoded into GameState.tasks for the quest log.
 pub const OP_TASK_DESCRIPTION: u16 = 0x3714; // RoF2: OP_TaskDescription; a task's title/desc/reward (variable length)
 pub const OP_TASK_ACTIVITY: u16    = 0x08d3; // RoF2: OP_TaskActivity; one objective + progress (done/goal, variable length)
-pub const OP_COMPLETED_TASKS: u16  = 0x4eba; // RoF2: OP_CompletedTasks; list of completed task ids
+pub const OP_COMPLETED_TASKS: u16  = 0x4eba; // RoF2: OP_CompletedTasks; full records (id + title + completed_time), not a bare id list
+pub const OP_TASK_SELECT_WINDOW:   u16 = 0x705b; // RoF2: OP_TaskSelectWindow; a set of task offers (recv)
+pub const OP_ACCEPT_NEW_TASK:      u16 = 0x0a23; // RoF2: OP_AcceptNewTask; AcceptNewTask_Struct (12B, send)
+pub const OP_CANCEL_TASK:          u16 = 0x39f0; // RoF2: OP_CancelTask; CancelTask_Struct (8B, send)
 
 // ── Gameplay: looting ─────────────────────────────────────────────────────
 

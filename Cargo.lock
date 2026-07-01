@@ -846,6 +846,7 @@ dependencies = [
  "signal-hook",
  "tempfile",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "ureq",

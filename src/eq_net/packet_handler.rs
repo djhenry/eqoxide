@@ -58,6 +58,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_TASK_DESCRIPTION     => apply_task_description(gs, p),
         OP_TASK_ACTIVITY        => apply_task_activity(gs, p),
         OP_COMPLETED_TASKS      => apply_completed_tasks(gs, p),
+        OP_TASK_SELECT_WINDOW   => apply_task_select_window(gs, p),
         OP_CHAR_INVENTORY       => apply_char_inventory(gs, p),
         OP_ITEM_PACKET          => apply_item_packet(gs, p),
         OP_SHOP_REQUEST         => apply_shop_request(gs, p),
@@ -132,13 +133,37 @@ fn rd_cstr(p: &[u8], off: &mut usize) -> String {
     s
 }
 
+/// Read one byte at `*off`, advancing `off`. Returns 0 if out of bounds.
+fn rd_u8(p: &[u8], off: &mut usize) -> u8 {
+    if *off >= p.len() { return 0; }
+    let v = p[*off];
+    *off += 1;
+    v
+}
+
+/// Extract the display name from an EQ saylink. `EQ::SayLinkEngine::GenerateLink()` (EQEmu
+/// common/say_link.cpp) emits exactly two `\x12` delimiters: `\x12<56-char body><Name>\x12` — the
+/// body and name are one concatenated segment, not separately delimited. Returns the raw string
+/// unchanged if it isn't link-formatted (e.g. empty string for "no reward item") or the body is
+/// shorter than SAY_LINK_BODY_SIZE.
+fn extract_saylink_text(s: &str) -> String {
+    let parts: Vec<&str> = s.split('\x12').collect();
+    if parts.len() >= 3 {
+        parts[1].get(SAY_LINK_BODY_SIZE..).unwrap_or("").to_string()
+    } else {
+        s.to_string()
+    }
+}
+
 /// OP_TaskDescription — a task's header + title + reward. Upserts into gs.tasks (preserving any
 /// activities already received for it). Layout: Header{seq,task_id,open_window:u8,task_type,
 /// reward_type}(17) + title cstr + Data1{duration,dur_code,start_time}(12) + desc cstr +
-/// Data2{has_rewards:u8,coin,xp,faction}(13) + reward cstr + itemlink cstr + Trailer(5).
+/// Data2{has_rewards:u8,coin,xp,faction}(13) + reward_text cstr + item_link cstr + Trailer(4).
+/// `sequence_number` (the header's SequenceNumber) is kept — OP_CancelTask addresses a task by it.
+/// `reward_item_text` is the item name extracted from item_link's EQ saylink markup.
 fn apply_task_description(gs: &mut GameState, p: &[u8]) {
     let mut o = 0usize;
-    let _seq = rd_u32(p, &mut o);
+    let sequence_number = rd_u32(p, &mut o);
     let task_id = rd_u32(p, &mut o);
     o += 1; // open_window u8
     let _task_type = rd_u32(p, &mut o);
@@ -152,15 +177,21 @@ fn apply_task_description(gs: &mut GameState, p: &[u8]) {
     let coin_reward = rd_u32(p, &mut o);
     let xp_reward = rd_u32(p, &mut o);
     let _faction = rd_u32(p, &mut o);
+    let _reward_text = rd_cstr(p, &mut o);
+    let item_link = rd_cstr(p, &mut o);
+    let reward_item_text = extract_saylink_text(&item_link);
     if task_id == 0 { return; }
     let title_for_log = title.clone();
     {
         let task = gs.tasks.entry(task_id).or_default();
         task.task_id = task_id;
+        task.sequence_number = sequence_number;
         task.title = title;
         task.description = description;
         task.xp_reward = xp_reward;
         task.coin_reward = coin_reward;
+        task.reward_item_text = reward_item_text;
+        task.status = crate::game_state::TaskStatus::Active;
     }
     gs.log_msg("quest", &format!("Quest accepted: {}", title_for_log));
 }
@@ -359,16 +390,75 @@ fn apply_shop_request(gs: &mut GameState, p: &[u8]) {
     }
 }
 
-/// OP_CompletedTasks — a count followed by completed task records; we just collect the task ids.
+/// OP_CompletedTasks — count then per-entry {task_id, title cstr, completed_time}. The server
+/// sends the full record here (not bare ids — the previous flat-u32-array parse was a bug that
+/// desynced after the first entry). Flips the matching gs.tasks entry to Completed (inserting a
+/// stub if we never saw its OP_TaskDescription, so the id isn't silently lost) and upserts
+/// gs.completed_task_history with the title/time the packet already carries.
 fn apply_completed_tasks(gs: &mut GameState, p: &[u8]) {
     let mut o = 0usize;
-    let count = rd_u32(p, &mut o).min(((p.len() / 4) as u32).max(1));
+    // Each entry is at least 9 bytes (task_id u32 + empty-title null byte + completed_time u32);
+    // clamp so a malformed/truncated count can't spin the loop needlessly.
+    let count = rd_u32(p, &mut o).min((p.len() as u32 / 9).max(1));
     for _ in 0..count {
-        let id = rd_u32(p, &mut o);
-        if id != 0 && !gs.completed_tasks.contains(&id) {
-            gs.completed_tasks.push(id);
+        let task_id = rd_u32(p, &mut o);
+        let title = rd_cstr(p, &mut o);
+        let completed_time = rd_u32(p, &mut o);
+        if task_id == 0 { continue; }
+        let task = gs.tasks.entry(task_id).or_insert_with(|| crate::game_state::ActiveTask {
+            task_id, ..Default::default()
+        });
+        task.status = crate::game_state::TaskStatus::Completed;
+        if task.title.is_empty() { task.title = title.clone(); }
+        if let Some(existing) = gs.completed_task_history.iter_mut().find(|e| e.task_id == task_id) {
+            existing.title = title;
+            existing.completed_time = completed_time;
+        } else {
+            gs.completed_task_history.push(crate::game_state::CompletedTaskEntry { task_id, title, completed_time });
         }
     }
+}
+
+/// OP_TaskSelectWindow — a set of task offers from an open selector window (an NPC script called
+/// `tasksetselector` instead of auto-granting via `assigntask`; no content on this server's live
+/// scripts uses this path, but it's a genuine protocol case). Layout: header{task_count,type,
+/// task_giver}(12) then per task: task_id, reward_multiplier(f32, unused), duration, duration_code,
+/// title cstr, description cstr, has_rewards u8, element_count u32 ("initial active elements").
+/// `element_count` is 0 for every offer this server's content can produce; if a future task sends a
+/// nonzero count, its nested ActivityInformation::SerializeSelector payload is variable-length and
+/// not modeled here — stop parsing this packet (leaving gs.task_offers untouched) and log a warning
+/// rather than guess at the layout and desync/garble subsequent offers in the same packet.
+fn apply_task_select_window(gs: &mut GameState, p: &[u8]) {
+    let mut o = 0usize;
+    // Each entry is at least 23 bytes (task_id u32 + reward_multiplier f32 + duration u32 +
+    // duration_code u32 + title cstr≥1 + desc cstr≥1 + has_rewards u8 + element_count u32).
+    // Header is 12 bytes (task_count u32 + type u32 + task_giver u32). Clamp the count so a
+    // malformed/truncated packet can't request unbounded allocation.
+    let task_count = rd_u32(p, &mut o);
+    let max_entries = (p.len().saturating_sub(12) as u32) / 23;
+    let task_count = task_count.min(max_entries);
+    let _sel_type = rd_u32(p, &mut o);
+    let task_giver = rd_u32(p, &mut o);
+    let mut offers = Vec::with_capacity(task_count as usize);
+    for _ in 0..task_count {
+        let task_id = rd_u32(p, &mut o);
+        o += 4; // reward_multiplier f32 (unused)
+        let _duration = rd_u32(p, &mut o);
+        let _duration_code = rd_u32(p, &mut o);
+        let title = rd_cstr(p, &mut o);
+        let description = rd_cstr(p, &mut o);
+        let has_rewards = rd_u8(p, &mut o) != 0;
+        let element_count = rd_u32(p, &mut o);
+        if element_count != 0 {
+            tracing::warn!(
+                "EQ: OP_TaskSelectWindow: task_id={task_id} has element_count={element_count} \
+                 (nested ActivityInformation not modeled) — bailing out of this packet"
+            );
+            return;
+        }
+        offers.push(crate::game_state::TaskOffer { task_id, npc_id: task_giver, title, description, has_rewards });
+    }
+    gs.task_offers = offers;
 }
 
 // ── Per-opcode helpers ────────────────────────────────────────────────────────
@@ -1343,8 +1433,9 @@ mod tests {
     use super::{apply_emote, apply_death, class_name, con_color, consider_message, parse_player_profile,
                 parse_begin_cast, parse_memorize_spell, apply_char_inventory,
                 apply_money_update, apply_money_on_corpse, apply_set_target,
+                extract_saylink_text, apply_task_description, apply_completed_tasks, apply_task_select_window,
                 strip_say_links, SAY_LINK_BODY_SIZE, SIZE_DEATH};
-    use crate::game_state::{GameState, Entity};
+    use crate::game_state::{GameState, Entity, TaskStatus};
 
     /// Build a RoF2 saylink: 0x12 + 56-char body + display text + 0x12.
     fn saylink(body_seed: char, text: &str) -> String {
@@ -2278,6 +2369,163 @@ mod tests {
         let pkt: [u8; 4] = [10, 0, 0, 5];
         apply_animation(&mut gs, &pkt);
         assert!(gs.combat_anims.is_empty(), "non-combat action=0 must not create an anim entry");
+    }
+
+    // ── OP_TaskDescription / OP_CompletedTasks tests ──────────────────────────────────────────────
+
+    #[test]
+    fn extract_saylink_text_strips_link_markup() {
+        // Real EQEmu format (say_link.cpp GenerateLink): one \x12-delimited segment holding a
+        // fixed 56-char hex body immediately followed by the item name, closed by a second \x12.
+        let body = "0".repeat(SAY_LINK_BODY_SIZE);
+        let link = format!("\x12{body}Rusty Dagger\x12");
+        assert_eq!(extract_saylink_text(&link), "Rusty Dagger");
+    }
+
+    #[test]
+    fn extract_saylink_text_handles_short_body_without_panicking() {
+        // Malformed/truncated link shorter than the fixed body size must not panic.
+        assert_eq!(extract_saylink_text("\x12short\x12"), "");
+    }
+
+    #[test]
+    fn extract_saylink_text_passes_through_plain_string() {
+        assert_eq!(extract_saylink_text(""), "");
+        assert_eq!(extract_saylink_text("not a link"), "not a link");
+    }
+
+    fn build_task_description(seq: u32, task_id: u32, title: &str, desc: &str, coin: u32, xp: u32, reward_text: &str, item_link: &str) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&seq.to_le_bytes());
+        p.extend_from_slice(&task_id.to_le_bytes());
+        p.push(0); // open_window
+        p.extend_from_slice(&0u32.to_le_bytes()); // task_type
+        p.extend_from_slice(&0u32.to_le_bytes()); // reward_type
+        p.extend_from_slice(title.as_bytes()); p.push(0);
+        p.extend_from_slice(&0u32.to_le_bytes()); // duration
+        p.extend_from_slice(&0u32.to_le_bytes()); // dur_code
+        p.extend_from_slice(&0u32.to_le_bytes()); // start_time
+        p.extend_from_slice(desc.as_bytes()); p.push(0);
+        p.push(1); // has_rewards
+        p.extend_from_slice(&coin.to_le_bytes());
+        p.extend_from_slice(&xp.to_le_bytes());
+        p.extend_from_slice(&0u32.to_le_bytes()); // faction
+        p.extend_from_slice(reward_text.as_bytes()); p.push(0);
+        p.extend_from_slice(item_link.as_bytes()); p.push(0);
+        p
+    }
+
+    #[test]
+    fn apply_task_description_parses_reward_item_and_sequence_number() {
+        let mut gs = GameState::new();
+        let body = "0".repeat(SAY_LINK_BODY_SIZE);
+        let item_link = format!("\x12{body}Rusty Dagger\x12");
+        let p = build_task_description(3, 500, "Kill Rats", "Kill 5 rats", 10, 200, "reward!", &item_link);
+        apply_task_description(&mut gs, &p);
+        let task = gs.tasks.get(&500).expect("task inserted");
+        assert_eq!(task.sequence_number, 3);
+        assert_eq!(task.title, "Kill Rats");
+        assert_eq!(task.coin_reward, 10);
+        assert_eq!(task.xp_reward, 200);
+        assert_eq!(task.reward_item_text, "Rusty Dagger");
+        assert_eq!(task.status, TaskStatus::Active);
+    }
+
+    fn build_completed_tasks(entries: &[(u32, &str, u32)]) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for (id, title, time) in entries {
+            p.extend_from_slice(&id.to_le_bytes());
+            p.extend_from_slice(title.as_bytes()); p.push(0);
+            p.extend_from_slice(&time.to_le_bytes());
+        }
+        p
+    }
+
+    #[test]
+    fn apply_completed_tasks_parses_title_and_flips_status() {
+        let mut gs = GameState::new();
+        // Task 500 was already in the journal (arrived via OP_TaskDescription earlier).
+        gs.tasks.insert(500, crate::game_state::ActiveTask {
+            task_id: 500, title: "Kill Rats".into(), status: TaskStatus::Active, ..Default::default()
+        });
+        let p = build_completed_tasks(&[(500, "Kill Rats", 1_700_000_000), (501, "Deliver Note", 1_700_000_100)]);
+        apply_completed_tasks(&mut gs, &p);
+
+        assert_eq!(gs.tasks.get(&500).unwrap().status, TaskStatus::Completed);
+        // Task 501 was never seen via OP_TaskDescription — inserted as a stub, still flipped.
+        let stub = gs.tasks.get(&501).expect("stub inserted for unseen completed task");
+        assert_eq!(stub.status, TaskStatus::Completed);
+        assert_eq!(stub.title, "Deliver Note");
+
+        assert_eq!(gs.completed_task_history.len(), 2);
+        assert_eq!(gs.completed_task_history[0].title, "Kill Rats");
+        assert_eq!(gs.completed_task_history[0].completed_time, 1_700_000_000);
+        assert_eq!(gs.completed_task_history[1].task_id, 501);
+    }
+
+    #[test]
+    fn apply_completed_tasks_handles_truncated_packet_without_hanging() {
+        let mut gs = GameState::new();
+        // count says 5 entries but the buffer only has the count field — must not loop forever
+        // or panic; rd_u32/rd_cstr degrade to 0/empty on out-of-bounds reads.
+        let p = 5u32.to_le_bytes().to_vec();
+        apply_completed_tasks(&mut gs, &p);
+        assert!(gs.completed_task_history.is_empty());
+    }
+
+    fn build_task_select_window(task_giver: u32, tasks: &[(u32, &str, &str, bool, u32)]) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&(tasks.len() as u32).to_le_bytes()); // task_count
+        p.extend_from_slice(&2u32.to_le_bytes());                 // type = Quest
+        p.extend_from_slice(&task_giver.to_le_bytes());
+        for (task_id, title, desc, has_rewards, element_count) in tasks {
+            p.extend_from_slice(&task_id.to_le_bytes());
+            p.extend_from_slice(&0f32.to_le_bytes());   // reward_multiplier
+            p.extend_from_slice(&0u32.to_le_bytes());   // duration
+            p.extend_from_slice(&0u32.to_le_bytes());   // duration_code
+            p.extend_from_slice(title.as_bytes()); p.push(0);
+            p.extend_from_slice(desc.as_bytes()); p.push(0);
+            p.push(if *has_rewards { 1 } else { 0 });
+            p.extend_from_slice(&element_count.to_le_bytes());
+        }
+        p
+    }
+
+    #[test]
+    fn apply_task_select_window_parses_offers() {
+        let mut gs = GameState::new();
+        let p = build_task_select_window(9001, &[
+            (10, "Offer One", "Do a thing", true, 0),
+            (11, "Offer Two", "Do another thing", false, 0),
+        ]);
+        apply_task_select_window(&mut gs, &p);
+        assert_eq!(gs.task_offers.len(), 2);
+        assert_eq!(gs.task_offers[0].task_id, 10);
+        assert_eq!(gs.task_offers[0].npc_id, 9001);
+        assert_eq!(gs.task_offers[0].title, "Offer One");
+        assert!(gs.task_offers[0].has_rewards);
+        assert!(!gs.task_offers[1].has_rewards);
+    }
+
+    #[test]
+    fn apply_task_select_window_bails_out_on_nonzero_element_count() {
+        let mut gs = GameState::new();
+        let p = build_task_select_window(9001, &[
+            (10, "Offer One", "Do a thing", true, 2), // unmodeled nested elements
+        ]);
+        apply_task_select_window(&mut gs, &p);
+        assert!(gs.task_offers.is_empty(), "must not guess at the nested ActivityInformation layout");
+    }
+
+    #[test]
+    fn apply_task_select_window_handles_truncated_packet_without_hanging() {
+        let mut gs = GameState::new();
+        // task_count says 100000 entries but the buffer only has the count field — must not hang
+        // or panic; rd_u32/rd_cstr degrade to 0/empty on out-of-bounds reads.
+        let p = 100000u32.to_le_bytes().to_vec();
+        apply_task_select_window(&mut gs, &p);
+        assert!(gs.task_offers.is_empty());
     }
 
     // ── RoF2 Death_Struct byte-layout tests ─────────────────────────────────────────────────────

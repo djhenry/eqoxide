@@ -180,6 +180,10 @@ OPTIONS:
     let entity_ids:       http::EntityIds       = Arc::new(Mutex::new(HashMap::new()));
     let zone_points:      http::ZonePoints      = Arc::new(Mutex::new(Vec::new()));
     let task_log:         http::TaskLog         = Arc::new(Mutex::new(Vec::new()));
+    let task_offers_shared:    http::TaskOffersShared    = Arc::new(Mutex::new(Vec::new()));
+    let completed_tasks_shared: http::CompletedTasksShared = Arc::new(Mutex::new(Vec::new()));
+    let accept_task:           http::AcceptTaskReq        = Arc::new(Mutex::new(None));
+    let cancel_task:           http::CancelTaskReq        = Arc::new(Mutex::new(None));
     let zone_cross:       http::ZoneCrossReq    = Arc::new(Mutex::new(None));
     let warp:             http::WarpReq         = Arc::new(Mutex::new(None));
     let hail:             http::HailReq         = Arc::new(Mutex::new(None));
@@ -230,6 +234,10 @@ OPTIONS:
         let ei  = entity_ids.clone();
         let zp  = zone_points.clone();
         let tl  = task_log.clone();
+        let tos = task_offers_shared.clone();
+        let cts = completed_tasks_shared.clone();
+        let atk = accept_task.clone();
+        let ctk = cancel_task.clone();
         let zc  = zone_cross.clone();
         let wp  = warp.clone();
         let hl  = hail.clone();
@@ -264,7 +272,7 @@ OPTIONS:
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, zc, wp, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, cev, csd, ca, ms, st, co, sc, md, sd, cp, cu, cv, ni, pc).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ep, ei, zp, tl, tos, cts, atk, ctk, zc, wp, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, cev, csd, ca, ms, st, co, sc, md, sd, cp, cu, cv, ni, pc).await {
                     tracing::error!("EQ: fatal: {e}");
                 }
             });
@@ -331,6 +339,10 @@ OPTIONS:
         spells.clone(),
         player_info,
         task_log,
+        task_offers_shared,
+        completed_tasks_shared,
+        accept_task,
+        cancel_task,
         door_click,
         doors_shared,
         camp.clone(),

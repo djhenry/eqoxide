@@ -17,6 +17,7 @@ use tokio::sync::oneshot;
 use crate::camera_state::{CameraCmd, CameraSnapshot};
 
 mod observe;
+mod quests;
 mod navigate;
 mod combat;
 mod interact;
@@ -56,6 +57,19 @@ pub type EntityIds = Arc<Mutex<HashMap<String, u32>>>;
 pub type ZonePoints = Arc<Mutex<Vec<crate::game_state::ZonePoint>>>;
 /// Native Task-system quest log, published from GameState.tasks each tick (GET /v1/observe/quests/log).
 pub type TaskLog = Arc<Mutex<Vec<crate::game_state::ActiveTask>>>;
+
+/// Pending offers from an open task-selector window, published each tick (GET /v1/quests/offers).
+pub type TaskOffersShared = Arc<Mutex<Vec<crate::game_state::TaskOffer>>>;
+/// Completed-task history with titles, published each tick (GET /v1/quests/completed).
+pub type CompletedTasksShared = Arc<Mutex<Vec<crate::game_state::CompletedTaskEntry>>>;
+/// Accept/decline a pending task offer, set by POST /v1/quests/accept ({"task_id":N}) or
+/// POST /v1/quests/decline (task_id=0). The nav thread reads it once and sends
+/// OP_AcceptNewTask (AcceptNewTask_Struct), looking up the offering NPC's id from gs.task_offers.
+pub type AcceptTaskReq = Arc<Mutex<Option<u32>>>;
+/// Abandon an active task, set by POST /v1/quests/cancel ({"task_id":N}). The nav thread reads it
+/// once, looks up the task's sequence_number in gs.tasks, and sends OP_CancelTask
+/// (CancelTask_Struct).
+pub type CancelTaskReq = Arc<Mutex<Option<u32>>>;
 
 /// Zone-crossing request set by POST /v1/navigate/zone_cross; gameplay thread reads it once,
 /// warps to the matching zone line and sends OP_ZONE_CHANGE.
@@ -323,6 +337,10 @@ pub(crate) struct HttpState {
     pub(crate) spells:           std::sync::Arc<crate::spells::SpellDb>,
     pub(crate) player_info:      PlayerInfo,
     pub(crate) task_log:         TaskLog,
+    pub(crate) task_offers_shared:    TaskOffersShared,
+    pub(crate) completed_tasks_shared: CompletedTasksShared,
+    pub(crate) accept_task:           AcceptTaskReq,
+    pub(crate) cancel_task:           CancelTaskReq,
     pub(crate) door_click:       DoorClickReq,
     pub(crate) doors_shared:     DoorsShared,
     pub(crate) camp:             CampReq,
@@ -361,6 +379,10 @@ pub fn spawn_camera_server(
     spells:           std::sync::Arc<crate::spells::SpellDb>,
     player_info:      PlayerInfo,
     task_log:         TaskLog,
+    task_offers_shared:    TaskOffersShared,
+    completed_tasks_shared: CompletedTasksShared,
+    accept_task:           AcceptTaskReq,
+    cancel_task:           CancelTaskReq,
     door_click:       DoorClickReq,
     doors_shared:     DoorsShared,
     camp:             CampReq,
@@ -373,11 +395,12 @@ pub fn spawn_camera_server(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, chat_events, chat_send, spells, player_info, task_log, door_click, doors_shared, camp, camp_until };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, door_click, doors_shared, camp, camp_until };
             // Versioned + grouped routes: /v1/<group>/<action>. Each group's `router()` defines
             // relative paths; nesting prefixes them. Shared state is applied once at the end.
             let app = Router::new()
                 .nest("/v1/observe",   observe::router())
+                .nest("/v1/quests",    quests::router())
                 .nest("/v1/navigate",  navigate::router())
                 .nest("/v1/combat",    combat::router())
                 .nest("/v1/interact",  interact::router())
