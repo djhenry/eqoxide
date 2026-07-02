@@ -18,6 +18,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_HP_UPDATE            => apply_hp_update(gs, p),
         OP_MOB_HEALTH           => apply_mob_health(gs, p),
         OP_TARGET_MOUSE         => apply_set_target(gs, p), // synthetic (nav → render gs); see fn doc
+        OP_MOVE_ITEM            => apply_move_item(gs, p),  // synthetic (nav → render gs); see fn doc
         OP_NEW_ZONE             => apply_new_zone(gs, p),
         OP_ZONE_SPAWNS          => apply_zone_spawns(gs, p),
         OP_ZONE_ENTRY           => apply_zone_entry(gs, p),
@@ -761,6 +762,20 @@ fn apply_mob_health(gs: &mut GameState, payload: &[u8]) {
 /// only reaches the network GameState). Payload is the 4-byte LE spawn_id (build_target_packet).
 /// target_name/_hp_pct are seeded from the entity here and kept live in app.rs from the entity list.
 /// See the two-GameState split note. (eqoxide#9)
+/// Synthetic OP_MoveItem (nav → render gs). `/v1/inventory/move` sends the real 28-byte move to the
+/// server (which applies it silently, no echo) and updates the network gs; the render gs would
+/// otherwise only learn of it on the next OP_CharInventory (relog/zone), leaving held-item models
+/// stale. The nav thread mirrors the move here via app_tx so `scene.*_weapon_idfile` refresh within
+/// a frame. Payload is a synthetic 8 bytes: from_slot(i32 LE) + to_slot(i32 LE) — NOT the 28-byte
+/// wire MoveItem_Struct (the server never sends OP_MoveItem to the client, so this is unambiguous).
+/// (eqoxide#141, same render/network GameState split as #9.)
+fn apply_move_item(gs: &mut GameState, payload: &[u8]) {
+    if payload.len() < 8 { return; }
+    let from = i32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let to   = i32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    gs.move_item(from, to);
+}
+
 fn apply_set_target(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < 4 { return; }
     let id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
@@ -1734,7 +1749,7 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
 mod tests {
     use super::{apply_emote, apply_death, class_name, con_color, consider_message, parse_player_profile,
                 parse_begin_cast, parse_memorize_spell, apply_char_inventory,
-                apply_money_update, apply_money_on_corpse, apply_set_target, apply_spawn_appearance,
+                apply_money_update, apply_money_on_corpse, apply_set_target, apply_move_item, apply_spawn_appearance,
                 extract_saylink_text, apply_task_description, apply_completed_tasks, apply_task_select_window,
                 strip_say_links, SAY_LINK_BODY_SIZE, SIZE_DEATH,
                 rd_u16, rd_fixed_cstr, apply_group_update_b, apply_group_join, apply_group_disband_you,
@@ -1916,6 +1931,27 @@ mod tests {
         assert_eq!(gs.target_id, Some(332));
         assert_eq!(gs.target_name.as_deref(), Some("Merchant Kwein"));
         assert_eq!(gs.target_hp_pct, Some(80.0));
+    }
+
+    #[test]
+    fn apply_move_item_equips_held_weapon_in_render_gs() {
+        // Synthetic OP_MoveItem (nav -> render gs): 8-byte from(i32 LE) + to(i32 LE). Equipping a
+        // weapon from the cursor (33) to the off hand (14) must move it in the render gs so the
+        // scene derives the held model from slot 14 without a relog. (eqoxide#141)
+        let mut gs = GameState::new();
+        gs.inventory.push(crate::game_state::InvItem {
+            slot: 33, item_id: 9023, name: "Qeynos Kite Shield".into(), idfile: "IT63".into(),
+            ..Default::default()
+        });
+        let mut mv = [0u8; 8];
+        mv[0..4].copy_from_slice(&33i32.to_le_bytes());
+        mv[4..8].copy_from_slice(&14i32.to_le_bytes());
+        apply_move_item(&mut gs, &mv);
+        assert_eq!(gs.inventory.iter().find(|i| i.slot == 14).map(|i| i.idfile.as_str()), Some("IT63"));
+        assert!(gs.inventory.iter().all(|i| i.slot != 33), "cursor slot vacated");
+        // A too-short payload is ignored (no panic, no change).
+        apply_move_item(&mut gs, &[0u8; 4]);
+        assert_eq!(gs.inventory.iter().find(|i| i.slot == 14).map(|i| i.idfile.as_str()), Some("IT63"));
     }
 
     #[test]
