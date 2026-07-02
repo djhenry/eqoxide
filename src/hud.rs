@@ -1213,10 +1213,11 @@ mod tests {
                 std::env::temp_dir().join(format!("ui_layout___hud_smoke_{locked}.json")));
             layout.locked = locked;
             let say: crate::http::SayReq = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let dialogue_click: crate::http::DialogueClickReq = std::sync::Arc::new(std::sync::Mutex::new(None));
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 draw_hud(ctx, &mut layout, &scene, "x");
                 draw_message_log(ctx, &mut layout, &scene);
-                draw_quest_dialogue(ctx, &mut layout, &scene, &say);
+                draw_quest_dialogue(ctx, &mut layout, &scene, &say, &dialogue_click);
             });
         }
     }
