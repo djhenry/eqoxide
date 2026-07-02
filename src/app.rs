@@ -203,6 +203,8 @@ pub struct App {
     show_debug: bool,
     /// Whether the inventory/equipment window is open (toggled by the HUD button or the I key).
     show_inventory: bool,
+    /// Whether the Task Window (native quest log) is open (toggled by the HUD button or the T key, #144).
+    show_tasks: bool,
     /// Whether the map window is open (toggled by the HUD button or the M key). Defaults closed.
     show_map: bool,
     ui_layout: crate::ui_layout::UiLayout,
@@ -324,6 +326,7 @@ impl App {
             testzone_mode,
             show_debug: false,
             show_inventory: false,
+            show_tasks: false,
             show_map: false,
             ui_layout,
             spell_icons: Vec::new(),
@@ -1306,6 +1309,7 @@ impl App {
             &self.buy, &self.sell, &self.trade,
             &self.spell_icons,
             &mut self.show_inventory,
+            &mut self.show_tasks,
             &mut self.ui_zoom, &mut self.ui_zoom_size,
             self.show_debug, self.game_state.server_corrections,
             &self.frame_profile,
@@ -1377,6 +1381,7 @@ impl App {
         trade:         &crate::http::TradeReq,
         spell_icons:   &[egui::TextureHandle],
         show_inventory: &mut bool,
+        show_tasks:     &mut bool,
         ui_zoom:       &mut f32,
         ui_zoom_size:  &mut (u32, u32),
         show_debug:    bool,
@@ -1423,6 +1428,7 @@ impl App {
                 hud::draw_control_bar(ctx, ui_layout, scene, hail, say, target, say_buffer, camp, camp_until);
                 hud::draw_action_grid(ctx, ui_layout, scene, spells, spell_icons, attack, cast, sit, target, consider);
                 hud::draw_inventory(ctx, ui_layout, scene, show_inventory);
+                hud::draw_task_window(ctx, ui_layout, scene, show_tasks);
                 hud::draw_group_roster(ctx, ui_layout, scene);
                 hud::draw_merchant(ctx, ui_layout, scene, buy, sell, trade);
                 if show_debug {
@@ -1696,6 +1702,9 @@ impl ApplicationHandler for App {
                                 }
                                 KeyCode::KeyI => {
                                     self.show_inventory = !self.show_inventory;
+                                }
+                                KeyCode::KeyT => {
+                                    self.show_tasks = !self.show_tasks;
                                 }
                                 KeyCode::KeyM => {
                                     self.show_map = !self.show_map;

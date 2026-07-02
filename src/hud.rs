@@ -35,7 +35,7 @@ pub(crate) fn canvas_off(ctx: &egui::Context, align: egui::Align2, base: [f32; 2
 
 /// All managed (movable) HUD windows. Anchors/offsets reproduce the previous
 /// fixed layout, retuned so the windows no longer overlap on a 960x540 canvas.
-pub static WINDOW_SPECS: [WindowSpec; 9] = [
+pub static WINDOW_SPECS: [WindowSpec; 10] = [
     WindowSpec { id: "status_hud",   title: "Status",       default_anchor: egui::Align2::LEFT_BOTTOM,   default_offset: [0.0, 0.0],   default_size: None,                resizable: false },
     WindowSpec { id: "message_log",  title: "Messages",     default_anchor: egui::Align2::LEFT_BOTTOM,   default_offset: [0.0, -64.0], default_size: Some([480.0, 120.0]), resizable: true  },
     WindowSpec { id: "minimap",      title: "Map",          default_anchor: egui::Align2::RIGHT_TOP,     default_offset: [-10.0, 10.0],default_size: Some([200.0, 200.0]), resizable: true  },
@@ -45,6 +45,7 @@ pub static WINDOW_SPECS: [WindowSpec; 9] = [
     WindowSpec { id: "group_roster", title: "Group",        default_anchor: egui::Align2::RIGHT_TOP,     default_offset: [-10.0, 220.0], default_size: Some([220.0, 160.0]), resizable: true  },
     WindowSpec { id: "npc_dialogue", title: "NPC Dialogue", default_anchor: egui::Align2::CENTER_TOP,    default_offset: [0.0, 36.0],  default_size: Some([460.0, 140.0]), resizable: true  },
     WindowSpec { id: "merchant",     title: "Merchant",     default_anchor: egui::Align2::CENTER_CENTER, default_offset: [0.0, 0.0],   default_size: Some([420.0, 460.0]), resizable: true  },
+    WindowSpec { id: "task_window",  title: "Tasks",        default_anchor: egui::Align2::RIGHT_TOP,     default_offset: [-10.0, 400.0], default_size: Some([360.0, 420.0]), resizable: true  },
 ];
 
 fn spec(id: &str) -> &'static WindowSpec {
@@ -423,6 +424,104 @@ pub fn draw_inventory(ctx: &egui::Context, layout: &mut UiLayout, scene: &SceneS
         if inv.is_empty() {
             ui.label(egui::RichText::new("(waiting for inventory from server…)").weak());
         }
+    });
+}
+
+/// Format one task objective as "target  done/goal" (e.g. "Kill a rat  3/10"). Single-step
+/// objectives (goal ≤ 1, e.g. "Speak to X") show just the target; completion is conveyed by colour.
+/// Pure so it can be unit-tested. (#144)
+pub fn objective_label(a: &crate::game_state::TaskActivity) -> String {
+    if a.goal_count > 1 {
+        format!("{}  {}/{}", a.target, a.done_count.min(a.goal_count), a.goal_count)
+    } else {
+        a.target.clone()
+    }
+}
+
+/// An objective is complete once its done-count reaches its goal (a single-step objective has
+/// goal 1). Pure/unit-testable.
+pub fn objective_done(a: &crate::game_state::TaskActivity) -> bool {
+    a.done_count >= a.goal_count.max(1)
+}
+
+/// Format a unix-epoch second as a `YYYY-MM-DD` UTC date (no date-lib dependency). Uses Howard
+/// Hinnant's civil-from-days algorithm. `0` (unknown time) renders empty. Pure/unit-testable. (#144)
+pub fn fmt_epoch_day(secs: u32) -> String {
+    if secs == 0 { return String::new(); }
+    let days = (secs / 86_400) as i64;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;                              // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);        // [0, 365]
+    let mp = (5 * doy + 2) / 153;                             // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1;                     // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };            // [1, 12]
+    let year = if m <= 2 { y + 1 } else { y };
+    format!("{:04}-{:02}-{:02}", year, m, d)
+}
+
+/// Task Window (#144) — the native Task-system quest log for human players. A toggle button plus a
+/// panel listing each active task's title, reward, description, and objectives (as `target done/
+/// goal`, completed ones in green), followed by the completed-quest history. Data is server-pushed
+/// (OP_TaskDescription/OP_TaskActivity/OP_CompletedTasks) and already drives GET /v1/quests/*.
+pub fn draw_task_window(ctx: &egui::Context, layout: &mut UiLayout, scene: &SceneState, show: &mut bool) {
+    egui::Area::new(egui::Id::new("task_toggle"))
+        .anchor(egui::Align2::LEFT_TOP, canvas_off(ctx, egui::Align2::LEFT_TOP, [8.0, 90.0]))
+        .show(ctx, |ui| {
+            let n = scene.tasks.len();
+            if ui.button(format!("📋 Tasks ({}) (T)", n)).clicked() {
+                *show = !*show;
+            }
+        });
+    if !*show {
+        return;
+    }
+    let green = egui::Color32::from_rgb(120, 220, 120);
+    let base = egui::Frame::window(&ctx.style());
+    managed_window(ctx, layout, spec("task_window"), base, |ui| {
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.label(egui::RichText::new("Current Tasks").strong().size(15.0));
+            if scene.tasks.is_empty() {
+                ui.label(egui::RichText::new("(no active tasks)").weak());
+            }
+            for t in &scene.tasks {
+                ui.separator();
+                ui.label(egui::RichText::new(&t.title).strong().size(14.0)
+                    .color(egui::Color32::from_rgb(255, 225, 120)));
+                let mut reward = Vec::new();
+                if t.xp_reward > 0 { reward.push("experience".to_string()); }
+                if t.coin_reward > 0 { reward.push(format!("{} coin", t.coin_reward)); }
+                if !t.reward_item_text.is_empty() { reward.push(t.reward_item_text.clone()); }
+                if !reward.is_empty() {
+                    ui.label(egui::RichText::new(format!("Reward: {}", reward.join(", "))).size(11.0).weak());
+                }
+                if !t.description.trim().is_empty() {
+                    ui.label(egui::RichText::new(&t.description).size(12.0)
+                        .color(egui::Color32::from_rgb(210, 210, 195)));
+                }
+                for a in &t.activities {
+                    let done = objective_done(a);
+                    let text = egui::RichText::new(format!("  {} {}", if done { "✔" } else { "•" }, objective_label(a)))
+                        .size(12.0)
+                        .color(if done { green } else { egui::Color32::from_rgb(225, 225, 205) });
+                    ui.label(text);
+                }
+            }
+            if !scene.completed_tasks.is_empty() {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Quest History").strong().size(15.0));
+                // Newest first.
+                let mut done: Vec<_> = scene.completed_tasks.iter().collect();
+                done.sort_by(|a, b| b.completed_time.cmp(&a.completed_time));
+                for c in done {
+                    let when = fmt_epoch_day(c.completed_time);
+                    let line = if when.is_empty() { c.title.clone() } else { format!("{}  —  {}", when, c.title) };
+                    ui.label(egui::RichText::new(line).size(12.0).color(green));
+                }
+            }
+        });
     });
 }
 
@@ -1108,6 +1207,30 @@ pub fn draw_labels(
 mod tests {
     use super::*;
     use crate::scene::{Billboard, SceneState};
+
+    #[test]
+    fn task_objective_label_and_done() {
+        use crate::game_state::TaskActivity;
+        let act = |target: &str, done: u32, goal: u32| TaskActivity {
+            activity_id: 0, activity_type: 0, target: target.into(), done_count: done, goal_count: goal,
+        };
+        // Count objective shows the ratio and clamps an over-count.
+        assert_eq!(objective_label(&act("Kill a rat", 3, 10)), "Kill a rat  3/10");
+        assert_eq!(objective_label(&act("Kill a rat", 12, 10)), "Kill a rat  10/10");
+        assert!(!objective_done(&act("Kill a rat", 3, 10)));
+        assert!(objective_done(&act("Kill a rat", 10, 10)));
+        // Single-step objective (goal ≤ 1) shows just the target; completion is by done-count.
+        assert_eq!(objective_label(&act("Speak to Vandar", 0, 1)), "Speak to Vandar");
+        assert!(!objective_done(&act("Speak to Vandar", 0, 1)));
+        assert!(objective_done(&act("Speak to Vandar", 1, 1)));
+    }
+
+    #[test]
+    fn fmt_epoch_day_formats_known_dates() {
+        assert_eq!(fmt_epoch_day(0), "");                 // unknown time → empty
+        assert_eq!(fmt_epoch_day(1_000_000_000), "2001-09-09"); // classic unix milestone
+        assert_eq!(fmt_epoch_day(1_700_000_000), "2023-11-14");
+    }
 
     #[test]
     fn split_keywords_marks_bracketed_runs() {
