@@ -30,7 +30,7 @@ To navigate to map coordinates (mx, my), send server coordinates (my, mx):
 
 ```bash
 # Walk to map (-200, 200) [northeast]:
-curl -X POST http://127.0.0.1:8765/v1/navigate/goto -d '{"x": 200, "y": -200, "z": 3.75}'
+curl -X POST http://127.0.0.1:8765/v1/move/goto -d '{"x": 200, "y": -200, "z": 3.75}'
 #                                                  ^map_y    ^map_x
 ```
 

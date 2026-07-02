@@ -14,7 +14,7 @@ const RUN_SPEED: f32 = 44.0;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::{GameState, ZonePoint};
-use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, TradeCmd, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, ChatEventsShared, ChatSendShared, CastReq, MemSpellReq, SitReq, ConsiderReq, CampReq, CampCmd, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, WarpReq, ZoneCrossReq, ZonePoints, ControllerShared, NavIntent, PosCorrection};
+use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, TradeCmd, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, ChatEventsShared, ChatSendShared, CastReq, MemSpellReq, SitReq, ConsiderReq, CampReq, CampCmd, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints, ControllerShared, NavIntent, PosCorrection};
 use crate::movement::MoveIntent;
 
 /// Min interval (ms) between OP_ClientUpdate sends while moving (native `0x118` = 280 ms).
@@ -31,7 +31,7 @@ const MOVEMENT_HISTORY_MS: u128 = 30_000;
 /// timer without tripping the TeleportA/ZoneLine special-cases in `ProcessMovementHistory`. Field
 /// order matches EQEmu `UpdateMovementEntry`: Y(f32)@0, X(f32)@4, Z(f32)@8, type(u8)@12, ts(u32)@13.
 pub fn build_movement_history(x: f32, y: f32, z: f32) -> Vec<u8> {
-    const TYPE_COLLISION: u8 = 1; // UpdateMovementType::Collision — benign, skips warp/zoneline checks
+    const TYPE_COLLISION: u8 = 1; // UpdateMovementType::Collision — benign, skips teleport/zoneline checks
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u32)
@@ -474,9 +474,6 @@ pub struct Navigator {
     group_kick:        crate::http::GroupKickReq,
     group_make_leader: crate::http::GroupMakeLeaderReq,
     zone_cross:       ZoneCrossReq,
-    /// Direct teleport request (POST /warp). The nav thread jumps the player to these coords,
-    /// sends a position update so the server agrees, and cancels any in-progress /goto.
-    warp:             WarpReq,
     hail:             HailReq,
     say:              SayReq,
     target:           TargetReq,
@@ -577,7 +574,6 @@ impl Navigator {
         group_kick:        crate::http::GroupKickReq,
         group_make_leader: crate::http::GroupMakeLeaderReq,
         zone_cross:       ZoneCrossReq,
-        warp:             WarpReq,
         hail:             HailReq,
         say:              SayReq,
         target:           TargetReq,
@@ -627,7 +623,6 @@ impl Navigator {
             group_kick,
             group_make_leader,
             zone_cross,
-            warp,
             hail,
             say,
             target,
@@ -984,7 +979,7 @@ impl Navigator {
             }
         }
 
-        // Check zone-cross request — warp onto a zone line, then send OP_ZONE_CHANGE.
+        // Check zone-cross request — teleport onto a zone line, then send OP_ZONE_CHANGE.
         let cross_req = self.zone_cross.lock().unwrap().take();
         if let Some(want_zone) = cross_req {
             // Choose a zone line: the requested destination if given (want_zone != 0),
@@ -1007,8 +1002,8 @@ impl Navigator {
             if let Some((dest_zone, _tx, _ty, _tz)) = exit {
                 // Request the zone change to the DESTINATION zone. The server (ZoneUnsolicited)
                 // looks up the closest zone point matching this target zone near our tracked
-                // position and zones us there — so we send the player's real position (no warp;
-                // warping to the destination's arrival coords put us far from the source trigger
+                // position and zones us there — so we send the player's real position (no teleport;
+                // jumping to the destination's arrival coords put us far from the source trigger
                 // and zoned us back to the same zone). The key is sending the TARGET zone id, not
                 // our current zone id.
                 tracing::info!("zone_cross: requesting zone change to zone_id={dest_zone} from ({:.1},{:.1})",
@@ -1020,7 +1015,7 @@ impl Navigator {
             }
         }
 
-        // Auto zone-cross: if the player is within range of a zone point, warp to
+        // Auto zone-cross: if the player is within range of a zone point, teleport to
         // it and send OP_ZONE_CHANGE automatically. Cooldown prevents looping.
         {
             const ZONE_CROSS_COOLDOWN_MS: u128 = 10000; // 10 seconds
@@ -1464,30 +1459,6 @@ impl Navigator {
             return;
         }
 
-        // Direct teleport (POST /warp): jump to the coords and tell the server, then CANCEL any
-        // in-progress navigation. Unlike a /goto this does not path or walk, so it can't be dragged
-        // back by a stalled walk (the old behavior wrote the warp coords into goto_target, which
-        // made the nav thread try to *walk* there and stall). A teleport also stops a controlled fall.
-        let warp_req = self.warp.lock().unwrap().take();
-        if let Some((wx, wy, wz)) = warp_req {
-            gs.player_x = wx;
-            gs.player_y = wy;
-            gs.player_z = wz;
-            self.falling = None;
-            self.path.clear();
-            self.path_goal = None;
-            *self.goto_target.lock().unwrap() = None;
-            *self.nav_intent.lock().unwrap() = None;
-            // Hand the teleport to the render controller (single authority) and keep the streamer's
-            // tracking in sync so it isn't re-flagged as a server correction next tick.
-            *self.pos_correction.lock().unwrap() = Some([wx, wy, wz]);
-            self.last_streamed = [wx, wy, wz];
-            self.last_pos_send = Instant::now();
-            self.send_position_update(stream, gs, wx, wy, wz, gs.player_heading);
-            tracing::info!("NAV: teleport (warp) to ({:.1},{:.1},{:.1}) — navigation cancelled", wx, wy, wz);
-            return;
-        }
-
         // Dead men don't walk (eqoxide#61): once the player is slain, abandon any /goto instead of
         // advancing a corpse through waypoint after waypoint ("no progress… skipping" forever). The
         // route is cleared, so a later respawn/relog starts fresh rather than resuming the old path.
@@ -1507,7 +1478,7 @@ impl Navigator {
         // tick and follow it, instead of pathing to a one-time snapshot. Roaming mobs move, and their
         // client position is frozen (stale) until they come within the server's ~300u update range —
         // so as the player approaches the stale spot and the mob enters range, its real position is
-        // revealed here and the walk homes in on it. If goto_target was cleared (WASD/warp/arrival)
+        // revealed here and the walk homes in on it. If goto_target was cleared (WASD/arrival)
         // while a chase name lingers, the chase is over; if the entity left view, stop cleanly.
         {
             let chase = self.goto_entity.lock().unwrap().clone();
@@ -1938,7 +1909,6 @@ mod tests {
             Default::default(), // group_kick
             Default::default(), // group_make_leader
             Default::default(), // zone_cross
-            Default::default(), // warp
             Default::default(), // hail
             Default::default(), // say
             Default::default(), // target
@@ -2186,7 +2156,7 @@ mod tests {
         assert_eq!(&p[0..4], &(-20.0f32).to_le_bytes(), "Y field @0 = server north");
         assert_eq!(&p[4..8], &(10.0f32).to_le_bytes(), "X field @4 = server east");
         assert_eq!(&p[8..12], &(3.5f32).to_le_bytes(), "Z field @8");
-        assert_eq!(p[12], 1, "type = Collision (benign; skips warp/zoneline cheat checks)");
+        assert_eq!(p[12], 1, "type = Collision (benign; skips teleport/zoneline cheat checks)");
     }
 
     #[test]

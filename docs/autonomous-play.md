@@ -40,7 +40,7 @@ Phase 1 (done): **discovery + indicators**.
   (existing nameplate behavior) — `GET /v1/quests/givers` is the reliable readout.
 - `GET /v1/quests/givers` is your quest tracker: for the current zone it lists quest givers sorted by distance
   with their location, `loaded` (in spawn range) flag, `turn_in` flag, `wanted` items (id, name,
-  count), `reward_xp`, and `hail` text. Workflow: `GET /v1/quests/givers` → pick one → `/v1/navigate/goto` to it →
+  count), `reward_xp`, and `hail` text. Workflow: `GET /v1/quests/givers` → pick one → `/v1/move/goto` to it →
   `/v1/interact/hail` to read the quest → gather items → return → hand in.
 
 **Two kinds of EQ quests** — the client surfaces both:
@@ -85,7 +85,7 @@ DB: `podman exec eqemu_mariadb_1 mariadb -uroot -prootpass peq`. Tables that mat
   slot if the character can't equip it there.)
 
 `#zone` / `#goto` / GM warp are **GM-only** — a non-GM character cannot use them. Move via legit
-walking (`/v1/navigate/goto` pathfinding), the warp endpoint (anti-cheat capped), or DB edits during a clean
+walking (`/v1/move/goto` pathfinding) or DB edits during a clean
 logout (see §6).
 
 ---
@@ -136,8 +136,8 @@ by default, so the zone log won't show swings.
 ### How zone crossing actually works here
 - `GET /v1/observe/zone_points` returns the points from `OP_SEND_ZONE_POINTS`, but those coords are the
   **ARRIVAL** coords (where you land in the destination), **NOT** the in-zone trigger to walk into.
-  So don't `/v1/navigate/goto` them.
-- `POST /v1/navigate/zone_cross {"zone_id": N}` → the nav sends `OP_ZONE_CHANGE` with zoneID=N from the player's
+  So don't `/v1/move/goto` them.
+- `POST /v1/move/zone_cross {"zone_id": N}` → the nav sends `OP_ZONE_CHANGE` with zoneID=N from the player's
   current position. The server's `GetClosestZonePoint(GetPosition(), N, range)` finds the matching
   zone point. The range check compares **linear distance to a squared max** (`zone/zone.cpp`,
   effectively a no-op), so position barely matters — being within ~400u just avoids a cheat-flag
@@ -147,7 +147,7 @@ by default, so the zone log won't show swings.
 - Reachable target zones = the distinct `zone_id`s in `/v1/observe/zone_points`.
 
 The classic "walk into the zone-line geometry" auto-cross is NOT implemented (the client lacks the
-trigger-box coords; only arrival coords are sent). Use `/v1/navigate/zone_cross {zone_id}`.
+trigger-box coords; only arrival coords are sent). Use `/v1/move/zone_cross {zone_id}`.
 
 ---
 
@@ -195,7 +195,7 @@ slot to a free general slot (22-29). Read the current item→slot mapping from t
 
 `Collision::find_path(start, goal, radius) -> Option<Vec<[east,north]>>` (`src/assets.rs`) is grid
 A* over the collision grid (production cell_size **32**). It routes AROUND walls, unlike `slide_move`
-(which only slides along one wall and stalls at corners). `/v1/navigate/goto` computes a path when the goal
+(which only slides along one wall and stalls at corners). `/v1/move/goto` computes a path when the goal
 changes and walks the waypoints; the per-step move + the combat auto-engage still use `slide_move`.
 
 Floor handling: the per-cell floor is probed **relative to the floor of the cell it was reached from**
@@ -240,10 +240,7 @@ at z≈-40** (where surface fish are reachable); the **pit bottom z≈-76** leav
 
 ## 7. Movement constraints for a non-GM character
 
-- **`/v1/navigate/warp`** (teleport): anti-cheat capped (~tens of u/hop) and the server rubber-bands it
-  (`server_corrections` in `/v1/observe/debug` climbs); warping through walls is rejected. Unreliable for real
-  positioning — prefer `/v1/navigate/goto` (pathfinding) or the DB clean-reset (§6).
-- **`/v1/navigate/goto`**: legit incremental walking the server accepts (no rubber-band). Now routes around walls
+- **`/v1/move/goto`**: legit incremental walking the server accepts (no rubber-band). Now routes around walls
   via `find_path`. The reliable movement primitive.
 - City **guards** are tough and gang up; attacking one aggros others and can make you KOS to that
   guard faction (resets on a fresh login / no persistent `faction_values` here). Fine for testing,
