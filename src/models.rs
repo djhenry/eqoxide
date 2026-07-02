@@ -231,12 +231,14 @@ impl ModelAsset {
             let mut rest_translations = vec![[0.0f32; 3]; joint_count];
             let mut rest_rotations    = vec![[0.0f32, 0.0, 0.0, 1.0]; joint_count];
             let mut rest_scales       = vec![[1.0f32; 3]; joint_count];
+            let mut joint_names       = vec![String::new(); joint_count];
             for node in document.nodes() {
                 if let Some(&ji) = joint_index_map.get(&node.index()) {
                     let (t, r, s) = node.transform().decomposed();
                     rest_translations[ji] = t;
                     rest_rotations[ji]    = r;
                     rest_scales[ji]       = s;
+                    joint_names[ji] = node.name().unwrap_or("").to_uppercase();
                 }
             }
 
@@ -290,7 +292,7 @@ impl ModelAsset {
 
             let sd = SkinData { joint_count, parents, inv_bind, clips,
                                 rest_translations, rest_rotations, rest_scales,
-                                ground_probes: Vec::new() };
+                                ground_probes: Vec::new(), joint_names };
             (Some(sd), joint_index_map)
         } else {
             (None, std::collections::HashMap::new())

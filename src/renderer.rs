@@ -128,6 +128,11 @@ pub struct EqRenderer {
     pub assets_path: std::path::PathBuf,
     /// Held weapon models cached by IDFile. `None` = tried and not found (negative cache).
     pub weapon_cache: std::collections::HashMap<String, Option<crate::gpu::GpuWeapon>>,
+    /// Dedicated uniforms for the player's held items (primary, secondary). The player's
+    /// mesh draws use entity_uniform_pool[0..PLAYER_UNIFORM_SLOTS), and a write_buffer to
+    /// a shared slot lands before ALL encoded passes — reusing a mesh slot for the weapon
+    /// clobbers that mesh's transform (a body part drawn at the weapon matrix).
+    pub weapon_uniform_pool: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
     /// Pre-decoded weapon meshes by UPPERCASE IDFile key, loaded once from weapons.glb.
     pub weapon_lib: std::collections::HashMap<String, Vec<crate::assets::MeshData>>,
     /// CPU-decoded textures for all weapons, loaded once from weapons.glb.
@@ -176,6 +181,25 @@ impl EqRenderer {
                 });
                 let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label:  Some("entity_uniform_pool_bg"),
+                    layout: &layouts.entity_bgl,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0, resource: buf.as_entire_binding(),
+                    }],
+                });
+                (buf, bg)
+            }).collect();
+
+        // Dedicated uniforms for the player's held items (primary, secondary).
+        let weapon_uniform_pool: Vec<(wgpu::Buffer, wgpu::BindGroup)> =
+            (0..2).map(|_| {
+                let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label:              Some("weapon_uniform_pool"),
+                    size:               std::mem::size_of::<crate::gpu::EntityUniform>() as u64,
+                    usage:              wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label:  Some("weapon_uniform_pool_bg"),
                     layout: &layouts.entity_bgl,
                     entries: &[wgpu::BindGroupEntry {
                         binding: 0, resource: buf.as_entire_binding(),
@@ -250,6 +274,7 @@ impl EqRenderer {
             depth_view,
             zone_assets: None,
             entity_uniform_pool,
+            weapon_uniform_pool,
             joint_buf_pool,
             equipment_tex_cache: std::collections::HashMap::new(),
             assets_path: std::path::PathBuf::new(),
@@ -669,12 +694,14 @@ impl EqRenderer {
         for m in &weapon_meshes {
             if m.positions.is_empty() || m.indices.is_empty() { continue; }
             let [cx, cy, cz] = m.center;
-            // EQ WLD [p0,p1,p2] -> render [p2,p0,p1] (same axis convention as zone/static meshes).
+            // Keep EQ-native axes: IT models are authored in the attachment-bone frame
+            // (identity attach in the real client). The draw applies the same EQ→Y-up
+            // rotation the rig was baked with, so the vertices must stay unrotated here.
             let verts: Vec<crate::gpu::Vertex> = m.positions.iter().enumerate().map(|(i, &p)| {
                 let n = m.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
                 crate::gpu::Vertex {
-                    position: [p[2] + cz, p[0] + cx, p[1] + cy],
-                    normal:   [n[2], n[0], n[1]],
+                    position: [p[0] + cx, p[1] + cy, p[2] + cz],
+                    normal:   [n[0], n[1], n[2]],
                     uv:       m.uvs.get(i).copied().unwrap_or([0.0, 0.0]),
                 }
             }).collect();
