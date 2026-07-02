@@ -19,6 +19,7 @@ use crate::camera_state::{CameraCmd, CameraSnapshot};
 mod observe;
 mod quests;
 mod group;
+mod trainer;
 mod navigate;
 mod combat;
 mod interact;
@@ -108,6 +109,10 @@ pub type GroupShared = Arc<Mutex<GroupSnapshot>>;
 
 /// POST /v1/group/invite target name. Drained by the nav tick loop, which sends OP_GroupInvite.
 pub type GroupInviteReq = Arc<Mutex<Option<String>>>;
+/// POST /v1/trainer/open sets this to the trainer NPC's spawn id → nav sends OP_GMTraining (#99).
+pub type TrainerOpenReq = Arc<Mutex<Option<u32>>>;
+/// POST /v1/trainer/train sets this to a skill id → nav sends OP_GMTrainSkill for the open trainer.
+pub type TrainerTrainReq = Arc<Mutex<Option<u32>>>;
 /// POST /v1/group/accept trigger — accepts gs.pending_invite. One-shot: `Some(())` then drained.
 pub type GroupAcceptReq = Arc<Mutex<Option<()>>>;
 /// POST /v1/group/decline trigger — declines gs.pending_invite via a defensive OP_GroupDisband.
@@ -314,6 +319,9 @@ pub struct PlayerState {
     pub mem_spells:   [u32; 9],
     /// Player skill values by skill id (0..77), for GET /v1/observe/skills (eqoxide#99).
     pub skills:       Vec<u32>,
+    /// Whether a guildmaster training window is open, and the caps it offers per skill id (#99).
+    pub trainer_open:   bool,
+    pub trainer_skills: Vec<u32>,
     /// The player's own spawn id (for scripting a self-target). (eqoxide#95)
     pub player_id:    u32,
     pub target_id:    Option<u32>,
@@ -398,6 +406,8 @@ pub(crate) struct HttpState {
     pub(crate) cancel_task:           CancelTaskReq,
     pub(crate) group:             GroupShared,
     pub(crate) group_invite:      GroupInviteReq,
+    pub(crate) trainer_open_req:  TrainerOpenReq,
+    pub(crate) trainer_train_req: TrainerTrainReq,
     pub(crate) group_accept:      GroupAcceptReq,
     pub(crate) group_decline:     GroupDeclineReq,
     pub(crate) group_leave:       GroupLeaveReq,
@@ -448,6 +458,8 @@ pub fn spawn_camera_server(
     cancel_task:           CancelTaskReq,
     group:             GroupShared,
     group_invite:      GroupInviteReq,
+    trainer_open_req:  TrainerOpenReq,
+    trainer_train_req: TrainerTrainReq,
     group_accept:      GroupAcceptReq,
     group_decline:     GroupDeclineReq,
     group_leave:       GroupLeaveReq,
@@ -465,13 +477,14 @@ pub fn spawn_camera_server(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until };
             // Versioned + grouped routes: /v1/<group>/<action>. Each group's `router()` defines
             // relative paths; nesting prefixes them. Shared state is applied once at the end.
             let app = Router::new()
                 .nest("/v1/observe",   observe::router())
                 .nest("/v1/quests",    quests::router())
                 .nest("/v1/group",     group::router())
+                .nest("/v1/trainer",   trainer::router())
                 .nest("/v1/navigate",  navigate::router())
                 .nest("/v1/combat",    combat::router())
                 .nest("/v1/interact",  interact::router())
