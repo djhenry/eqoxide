@@ -1,5 +1,10 @@
 # Hair Color — RoF2 Classic Head Models
 
+> **2026-07-01 note:** the tint table below is correct and in use, but this doc's
+> reading of `"%sHE%02d%d1_MDF"` as *hairstyle* selection is superseded — the digit
+> is the **FACE** index (see `luclin-head-faces-and-hair.md`). Where the text says
+> `hairstyle / 10` and `hairstyle % 10`, read `face`.
+
 ## Wire field layout
 
 `haircolor` is an independent `uint8` in every appearance-bearing struct:
