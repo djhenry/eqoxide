@@ -6,7 +6,6 @@ use super::*;
 pub(super) fn router() -> Router<HttpState> {
     Router::new()
         .route("/goto", post(post_goto))
-        .route("/warp", post(post_warp))
         .route("/zone_cross", post(post_zone_cross))
 }
 
@@ -95,23 +94,6 @@ async fn post_goto(
     (StatusCode::OK, format!("navigating to ({:.1},{:.1},{:.1})", target.0, target.1, target.2))
 }
 
-#[derive(serde::Deserialize)]
-struct WarpBody {
-    x: f32,
-    y: f32,
-    z: f32,
-}
-
-/// POST /v1/navigate/warp — teleport directly to coordinates, bypassing collision.
-async fn post_warp(
-    State(s): State<HttpState>,
-    Json(body): Json<WarpBody>,
-) -> (StatusCode, String) {
-    *s.warp.lock().unwrap() = Some((body.x, body.y, body.z));
-    tracing::info!("warp: queued to ({:.1}, {:.1}, {:.1})", body.x, body.y, body.z);
-    (StatusCode::OK, format!("warp queued to ({:.1}, {:.1}, {:.1})", body.x, body.y, body.z))
-}
-
 #[derive(serde::Deserialize, Default)]
 struct ZoneCrossBody {
     /// Destination zone id to cross to. Omit (or 0) to take the nearest zone line.
@@ -126,7 +108,7 @@ fn reachable_zone_ids(zps: &[crate::game_state::ZonePoint]) -> Vec<u16> {
     ids
 }
 
-/// POST /v1/navigate/zone_cross — warp to a zone line and send OP_ZONE_CHANGE.
+/// POST /v1/navigate/zone_cross — teleport to a zone line and send OP_ZONE_CHANGE.
 /// Body: {"zone_id": 1} to cross to a specific zone, or {} for the nearest line.
 ///
 /// A specific `zone_id` that has no zone line from the current zone is REJECTED with 400 (and the

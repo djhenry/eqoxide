@@ -121,7 +121,7 @@ impl CharacterController {
                hop_cooldown: 0.0 }
     }
 
-    /// Hard-set the position (zone-in, /warp, large server correction). Clears velocity & stuck.
+    /// Hard-set the position (zone-in, teleport, large server correction). Clears velocity & stuck.
     pub fn teleport(&mut self, pos: [f32; 3]) {
         self.pos = pos;
         self.vel_z = 0.0;

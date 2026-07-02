@@ -120,14 +120,10 @@ pub type GroupKickReq = Arc<Mutex<Option<String>>>;
 pub type GroupMakeLeaderReq = Arc<Mutex<Option<String>>>;
 
 /// Zone-crossing request set by POST /v1/navigate/zone_cross; gameplay thread reads it once,
-/// warps to the matching zone line and sends OP_ZONE_CHANGE.
+/// teleports to the matching zone line and sends OP_ZONE_CHANGE.
 ///   Some(0)  → cross the nearest zone line (any destination).
 ///   Some(id) → cross to a specific destination zone id.
 pub type ZoneCrossReq = Arc<Mutex<Option<u16>>>;
-
-/// Direct warp target set by POST /v1/navigate/warp; the App reads it once and teleports
-/// the player to the exact coordinates, bypassing collision.
-pub type WarpReq = Arc<Mutex<Option<(f32, f32, f32)>>>;
 
 /// NPC name to hail, set by POST /v1/interact/hail; the nav thread reads it once and sends a
 /// "Hail, <name>" say packet so the NPC fires its hail/quest script.
@@ -369,7 +365,6 @@ pub(crate) struct HttpState {
     pub(crate) entity_ids:       EntityIds,
     pub(crate) zone_points:      ZonePoints,
     pub(crate) zone_cross:       ZoneCrossReq,
-    pub(crate) warp:             WarpReq,
     pub(crate) hail:             HailReq,
     pub(crate) say:              SayReq,
     pub(crate) target:           TargetReq,
@@ -419,7 +414,6 @@ pub fn spawn_camera_server(
     entity_ids:       EntityIds,
     zone_points:      ZonePoints,
     zone_cross:       ZoneCrossReq,
-    warp:             WarpReq,
     hail:             HailReq,
     say:              SayReq,
     target:           TargetReq,
@@ -465,7 +459,7 @@ pub fn spawn_camera_server(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, zone_cross, warp, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, zone_cross, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until };
             // Versioned + grouped routes: /v1/<group>/<action>. Each group's `router()` defines
             // relative paths; nesting prefixes them. Shared state is applied once at the end.
             let app = Router::new()
