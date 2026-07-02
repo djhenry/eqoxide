@@ -68,10 +68,15 @@ body textures not yet fully traced.
 
 ---
 
-## Head Polygon Groups — CONFIRMED DEFINITIVE (2026-06)
+## Head Polygon Groups — SUPERSEDED (see `luclin-head-faces-and-hair.md`)
 
-**This section supersedes the earlier "hesk = hair" error. ELFHESK textures are NOT
-hair variants; they are base skin textures for 8 different head polygon regions.**
+**2026-07-01 correction: every claim below that `hesk{N}{L}` is indexed by
+HAIRSTYLE is WRONG — the digit is the FACE index (the client's face-change
+attribute drives the `%sHE%02d%d1_MDF` swap). Regions 4/5 are the NOSE
+(bone-weight verified), the "ear tips" group is the crown strip, and hairstyle
+is a dead actor-attach path for S3D races in RoF2 (no `*_HEAD_HAIR` actor ships).
+See `luclin-head-faces-and-hair.md` for the validated model. The PFS/EQG
+container-format sections later in this file remain valid.**
 
 ### Confirmed mesh fragment counts (Wood Elf Female example)
 
