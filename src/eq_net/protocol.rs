@@ -655,7 +655,7 @@ pub fn eq_race_to_code(race_id: u32) -> &'static str {
         // Playable races
         1 => "HUM", 2 => "BAR", 3 => "ERU", 4 => "ELF", 5 => "HIE", 6 => "DKE",
         7 => "HEF", 8 => "DWF", 9 => "TRL", 10 => "OGR", 11 => "HFL", 12 => "GNM",
-        128 => "IKS", 522 => "VAH",
+        128 => "IKS", 130 => "VAH", 330 => "FRG", 522 => "DRK",
         // NPC races 13..=127 — best-fit to an available archetype model
         // (humanoid/elf/dwarf/gnoll/skeleton/zombie/creature/bear/wolf/rat/snake/
         // frog/bat/bird/wasp/worm/fish). Names from EQEmu common/races.h.
@@ -774,6 +774,49 @@ pub fn eq_race_to_code(race_id: u32) -> &'static str {
         125 => "BRD", // Pegasus
         126 => "HUM", // Djinn
         127 => "HUM", // Invisible Man
+        // Post-Titanium "new model" NPC race IDs. PEQ uses these heavily even in
+        // classic-era zones — e.g. restless/decaying skeletons in qeytoqrg are race
+        // 367 (Skeleton2), not 60 — so without these they all render as human males.
+        // Best-fit to an available archetype model, as above; names from races.h.
+        131 => "IKS", // Sarnak (lizardkin)
+        137 => "GNL", // Kunark Goblin
+        141 => "HUM", // Boat
+        145 => "SPI", // Goo
+        161 => "SKE", // Undead Iksar
+        188 => "HUM", // Frost Giant
+        202 => "GNL", // Grimling
+        215 => "HUM", // Tegi
+        217 => "SNA", // Shissar
+        224 => "HUM", // Shade
+        240 => "HUM", // Teleport Man
+        350 => "FRG", // Undead Froglok
+        359 => "ZOM", // Undead Vampire
+        360 => "HUM", // Vampire (Luclin)
+        361 => "GNL", // Rujarkian Orc
+        364 => "ELF", // Sand Elf
+        367 => "SKE", // Skeleton (new model)
+        368 => "ZOM", // Mummy
+        369 => "GNL", // Goblin (new model)
+        372 => "HUM", // Dervish (new model)
+        373 => "HUM", // Shade (new model)
+        374 => "HUM", // Golem (new model)
+        394 => "SNA", // Ikaav (snake-woman)
+        396 => "HUM", // Kyv
+        397 => "HUM", // Noc
+        402 => "HUM", // Mastruq
+        413 => "HUM", // Dragorn
+        415 => "RAT", // Rat (new model)
+        432 => "SNA", // Drake (new model)
+        433 => "GNL", // Goblin2
+        439 => "WOL", // Puma (new model)
+        440 => "SPI", // Spider (new model)
+        442 => "HUM", // Animated Statue
+        456 => "HUM", // Sporali
+        457 => "HUM", // Gnomework
+        458 => "GNL", // Orc (new model)
+        461 => "SPI", // Drachnid (new model)
+        467 => "HUM", // Shiliskin
+        468 => "SNA", // Snake (new model)
         // Unknown — default to humanoid
         _ => "HUM",
     }
@@ -1144,6 +1187,31 @@ mod tests {
     #[test]
     fn test_eq_race_to_code_unknown() {
         assert_eq!(eq_race_to_code(9999), "HUM");
+    }
+
+    #[test]
+    fn test_eq_race_to_code_post_titanium_npc_races() {
+        // PEQ populates classic-era zones with post-127 "new model" race IDs;
+        // these must map to a best-fit archetype code, not the HUM fallback.
+        assert_eq!(eq_race_to_code(367), "SKE"); // Skeleton2 (restless/decaying skeletons)
+        assert_eq!(eq_race_to_code(161), "SKE"); // Undead Iksar
+        assert_eq!(eq_race_to_code(368), "ZOM"); // Mummy
+        assert_eq!(eq_race_to_code(350), "FRG"); // Undead Froglok
+        assert_eq!(eq_race_to_code(137), "GNL"); // Kunark Goblin
+        assert_eq!(eq_race_to_code(433), "GNL"); // Goblin2
+        assert_eq!(eq_race_to_code(458), "GNL"); // Orc2
+        assert_eq!(eq_race_to_code(364), "ELF"); // Sand Elf
+        assert_eq!(eq_race_to_code(415), "RAT"); // Rat (new model)
+        assert_eq!(eq_race_to_code(468), "SNA"); // Snake (new model)
+        assert_eq!(eq_race_to_code(440), "SPI"); // Spider (new model)
+        assert_eq!(eq_race_to_code(439), "WOL"); // Puma2
+    }
+
+    #[test]
+    fn test_eq_race_to_code_vah_shir_and_drakkin() {
+        // Vah Shir is race 130; Drakkin is race 522 (it was previously mapped to VAH).
+        assert_eq!(eq_race_to_code(130), "VAH");
+        assert_eq!(eq_race_to_code(522), "DRK");
     }
 
     #[test]
