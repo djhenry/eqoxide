@@ -923,13 +923,51 @@ impl Collision {
         let goal_floor = self.nearest_floor(goal[0], goal[1], goal[2], STEP_UP, STEP_UP)
             .unwrap_or(goal[2]);
         const GOAL_TIER_TOL: f32 = 8.0; // reached floor within this of goal_floor == the right tier
-        // The caller's z can be stale, so find the start floor by trying several reference levels.
+        // Start floor: anchor to the caller's EXACT (x,y), NOT the 8u cell center. Near a wall the
+        // cell center can fall on the wall's footprint, whose only surface is the wall-TOP — so the
+        // center probe would start the char up on the wall and route the whole path along it, a
+        // height the walker can't scale from a standstill (it wedges → 0 progress, #2). The exact
+        // start point sits on the real floor (e.g. the street) the char is actually standing on.
+        // The caller's z can still be stale, so try several reference levels; fall back to the cell
+        // center only if the exact point has no floor at any of them.
         let start_floor = [start[2], goal[2], 0.0, -60.0, -120.0]
             .into_iter()
-            .find_map(|rz| floor_near(sc, sr, rz))
+            .find_map(|rz| self.nearest_floor(start[0], start[1], rz, STEP_UP, MAX_DROP))
+            .or_else(|| [start[2], goal[2], 0.0, -60.0, -120.0].into_iter().find_map(|rz| floor_near(sc, sr, rz)))
             .unwrap_or(start[2]);
         const STEP_H: f32 = 20.0;        // max CLIMB between adjacent cells (stairs/ledge)
         const MAX_STEP_DOWN: f32 = 60.0; // max DROP between adjacent cells (fall/hop down a level)
+        // Snap the start CELL onto the surface the char is really on. When the char stands at a
+        // cell's edge next to a wall, the 8u cell CENTER can fall on the wall's footprint — whose
+        // only floor is the wall-TOP — so A* run from that cell would begin up on the wall and
+        // either route along it (a height the walker can't scale → 0 progress) or find no route at
+        // all. If the start cell's column has no floor at the char's true height (`start_floor`),
+        // hop to the nearest neighbouring cell that does. (#2)
+        let cell_has_start_floor = |c: i32, r: i32| -> bool {
+            let ctr = center(c, r);
+            self.column_floors(ctr[0], ctr[1], start_floor, STEP_H, MAX_STEP_DOWN)
+                .into_iter().any(|z| (z - start_floor).abs() <= GOAL_TIER_TOL)
+        };
+        let (sc, sr) = if cell_has_start_floor(sc, sr) {
+            (sc, sr)
+        } else {
+            let mut best: Option<(i32, i32, i32)> = None; // (col, row, dist²)
+            for rad in 1i32..=3 {
+                for dc in -rad..=rad {
+                    for dr in -rad..=rad {
+                        if dc.abs() != rad && dr.abs() != rad { continue; } // ring only
+                        let (nc, nr) = (sc + dc, sr + dr);
+                        if nc < 0 || nr < 0 || nc >= cols || nr >= rows { continue; }
+                        if cell_has_start_floor(nc, nr) {
+                            let d2 = dc * dc + dr * dr;
+                            if best.map_or(true, |(_, _, bd)| d2 < bd) { best = Some((nc, nr, d2)); }
+                        }
+                    }
+                }
+                if best.is_some() { break; } // nearest ring wins
+            }
+            best.map(|(c, r, _)| (c, r)).unwrap_or((sc, sr))
+        };
         const CHEST: f32 = 3.0;
         const MAX_NODES: usize = 200_000;
         // Aggro-avoidance (#67): softly bias A* AWAY from cells near NPCs so long routes skirt mob
@@ -1409,6 +1447,52 @@ mod tests {
         // Moving parallel to the wall (north) from east=3 never reaches it.
         assert!(col.sweep([3.0, 0.0, 0.0], [0.0, 5.0, 0.0], 1.0).is_none(),
             "parallel motion should not hit the wall");
+    }
+
+    /// Deterministic offline reproduction of the qeynos2 path-following stalls reported on #2,
+    /// using the REAL baked collision mesh. Point `ZONE_GLB` at the cached qeynos2 glb, e.g.
+    /// `ZONE_GLB=~/.local/share/eqoxide/assets/models/qeynos2.glb cargo test --lib diagnose_qeynos2_stall -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires the cached qeynos2 glb at $ZONE_GLB"]
+    fn diagnose_qeynos2_stall() {
+        let p = std::env::var("ZONE_GLB").expect("set ZONE_GLB to the cached qeynos2 glb");
+        let za = ZoneAssets::from_glb(std::path::Path::new(&p)).unwrap();
+        let col = Collision::build(&za, 32.0);
+        eprintln!("collision: from_collision_mesh={} grid {}x{} cell={} origin={:?}",
+            col.from_collision_mesh, col.cols, col.rows, col.cell_size, col.origin);
+
+        let probe = |label: &str, start: [f32; 3], goal: [f32; 3]| {
+            let sf = col.nearest_floor(start[0], start[1], start[2], 20.0, 100.0);
+            let gf = col.nearest_floor(goal[0], goal[1], goal[2], 20.0, 100.0);
+            eprintln!("\n[{label}] start={start:?} floor={sf:?}  goal={goal:?} floor={gf:?}");
+            // What find_path sees at the start CELL CENTER (8u nav grid) vs the exact start point —
+            // if these differ, quantization snaps the char onto adjacent (elevated) geometry.
+            const NAV_CELL: f32 = 8.0;
+            let sc = (((start[0] - col.origin[0]) / NAV_CELL) as i32) as f32;
+            let sr = (((start[1] - col.origin[1]) / NAV_CELL) as i32) as f32;
+            let ccx = col.origin[0] + (sc + 0.5) * NAV_CELL;
+            let ccy = col.origin[1] + (sr + 0.5) * NAV_CELL;
+            eprintln!("  start cell center=({ccx:.1},{ccy:.1}) floor@refz={:?}  column={:?}",
+                col.nearest_floor(ccx, ccy, start[2], 20.0, 100.0),
+                col.column_floors(ccx, ccy, start[2], 20.0, 100.0));
+            match col.find_path(start, goal, crate::movement::PLAYER_RADIUS, &[]) {
+                Some(path) => {
+                    eprintln!("  find_path: {} waypoints", path.len());
+                    for (i, w) in path.iter().enumerate().take(6) {
+                        eprintln!("    [{i}] ({:.1},{:.1},{:.1})", w[0], w[1], w[2]);
+                    }
+                    if path.len() > 6 { eprintln!("    ... last ({:.1},{:.1},{:.1})",
+                        path.last().unwrap()[0], path.last().unwrap()[1], path.last().unwrap()[2]); }
+                }
+                None => eprintln!("  find_path: NONE (no route)"),
+            }
+        };
+
+        // Case A — street-level corner wedge (Kessen). Both reported goals.
+        probe("A1 corner-wedge 145u south", [256.4, 324.9, 0.0], [254.0, 180.0, 0.0]);
+        probe("A2 corner-wedge 28u NE",     [256.4, 324.9, 0.0], [276.0, 305.0, 0.0]);
+        // Case B — multi-level water→street climb (Slink), out of the moat up onto the street.
+        probe("B water->street climb",      [-502.3, -141.3, -16.0], [-600.0, -141.0, -5.0]);
     }
 
     #[test]
