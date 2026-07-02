@@ -79,7 +79,7 @@ geometry is loaded.
 ### `find_path(start, goal, radius) → Option<Vec<[east, north]>>`
 
 **Grid A\*** over the collision cells — routes *around* walls and returns cell-center waypoints
-(goal-inclusive), or `None` if no route / no geometry. This is what `/v1/navigate/goto` uses (it walks the
+(goal-inclusive), or `None` if no route / no geometry. This is what `/v1/move/goto` uses (it walks the
 waypoints; `slide_move` only does the per-step move). Added 2026-06-21.
 
 - Walkable = a floor exists under the cell; an edge needs a small floor-height step (`STEP_H=20`)
@@ -116,7 +116,7 @@ don't block the move.
 
 ## Navigation Collision (navigation.rs)
 
-`/v1/navigate/goto` first computes an A\* route via `find_path` (above) when the goal changes, then walks the
+`/v1/move/goto` first computes an A\* route via `find_path` (above) when the goal changes, then walks the
 waypoints. `slide_move()` implements the same three-attempt slide logic for each step (and for the
 combat auto-engage approach). It returns `None` only when fully boxed in (logs "Path blocked by a
 wall" and clears the goto). Because `find_path` routes around walls, the per-step slide rarely boxes

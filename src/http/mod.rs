@@ -1,5 +1,5 @@
 //! The agent-facing HTTP/REST API (axum). Routes are versioned + grouped: `/v1/<group>/<action>`,
-//! where `<group>` mirrors the MCP tool grouping — `observe`, `navigate`, `combat`, `interact`,
+//! where `<group>` mirrors the MCP tool grouping — `observe`, `move`, `combat`, `interact`,
 //! `merchant`, `inventory`, `chat`, `camera`, `lifecycle`. The `/v1` prefix lets a future breaking
 //! revision ship as `/v2` while old clients keep working.
 //!
@@ -119,7 +119,7 @@ pub type GroupKickReq = Arc<Mutex<Option<String>>>;
 /// POST /v1/group/makeleader target member name. Sends OP_GroupMakeLeader.
 pub type GroupMakeLeaderReq = Arc<Mutex<Option<String>>>;
 
-/// Zone-crossing request set by POST /v1/navigate/zone_cross; gameplay thread reads it once,
+/// Zone-crossing request set by POST /v1/move/zone_cross; gameplay thread reads it once,
 /// teleports to the matching zone line and sends OP_ZONE_CHANGE.
 ///   Some(0)  → cross the nearest zone line (any destination).
 ///   Some(id) → cross to a specific destination zone id.
