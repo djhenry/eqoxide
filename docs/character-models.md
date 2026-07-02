@@ -30,7 +30,7 @@ converts an archive to a skinned, animated `.glb`:
    written into the root node's glTF `extras`, for render-time scaling.
 
 Regenerate all character models with `tools/regen_models.sh` (run from repo root; uses
-`$EQ_ASSETS` or `~/eq_assets/EQ_Files`). Output `.glb` files are **gitignored** — only the
+`$EQ_ASSETS` or `~/eq_assets/everquest_rof2`). Output `.glb` files are **gitignored** — only the
 script and code are committed. Naming: `<archetype>.glb` = male, `<archetype>_f.glb` = female.
 
 ## Loading + race/gender selection
