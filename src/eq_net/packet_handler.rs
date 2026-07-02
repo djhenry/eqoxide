@@ -1481,6 +1481,13 @@ fn apply_special_message(gs: &mut GameState, payload: &[u8]) {
     }
 }
 
+/// EQEmu marks a zone line with no fixed destination/trigger coordinate using the sentinel
+/// `999999`. Such an entry is not a real navigable point — treat any coord at/near it as garbage.
+fn is_sentinel_zone_point(x: f32, y: f32, z: f32) -> bool {
+    const SENTINEL: f32 = 900_000.0;
+    x.abs() >= SENTINEL || y.abs() >= SENTINEL || z.abs() >= SENTINEL
+}
+
 fn apply_zone_points(gs: &mut GameState, payload: &[u8]) {
     // Wire format: optional 4-byte header + N × ZonePointEntry_S (24 bytes each).
     // Detect header: if (len-4) % 24 == 0 and len >= 4, skip header.
@@ -1493,15 +1500,25 @@ fn apply_zone_points(gs: &mut GameState, payload: &[u8]) {
     let mut i = offset;
     while i + SIZE_ZONE_POINT_ENTRY <= payload.len() {
         let e = unsafe { safe_read::<ZonePointEntry_S>(&payload[i..]) };
-        gs.zone_points.push(ZonePoint {
-            iterator: e.iterator,
-            server_x: e.x,
-            server_y: e.y,
-            server_z: e.z,
-            heading:  e.heading,
-            zone_id:  e.zoneid,
-        });
         i += SIZE_ZONE_POINT_ENTRY;
+        // Copy out of the packed struct before use (unaligned field refs are UB).
+        let (ex, ey, ez, heading, iterator, zoneid) = (e.x, e.y, e.z, e.heading, e.iterator, e.zoneid);
+        // Drop sentinel/garbage zone points: EQEmu uses 999999 as a "no coordinate" marker for some
+        // zone lines. Feeding it into the auto-zone-cross proximity math and destination selection
+        // corrupts them (a point ~1e6 units away), so ignore any entry with a sentinel coordinate
+        // (#136).
+        if is_sentinel_zone_point(ex, ey, ez) {
+            tracing::debug!("EQ: ignoring sentinel zone point zone_id={} x={:.0} y={:.0}", zoneid, ex, ey);
+            continue;
+        }
+        gs.zone_points.push(ZonePoint {
+            iterator,
+            server_x: ex,
+            server_y: ey,
+            server_z: ez,
+            heading,
+            zone_id: zoneid,
+        });
     }
     tracing::info!("EQ: {} zone exit points received:", gs.zone_points.len());
     for zp in &gs.zone_points {
@@ -2300,6 +2317,35 @@ mod tests {
         b[4..8].copy_from_slice(&200u32.to_le_bytes()); // spell_id
         b[8..12].copy_from_slice(&3u32.to_le_bytes());  // scribing = spellbar re-enable
         assert_eq!(parse_memorize_spell(&b), Some((2, 200, 3)));
+    }
+
+    #[test]
+    fn zone_points_drop_sentinel_entries() {
+        use super::apply_zone_points;
+        use crate::eq_net::protocol::SIZE_ZONE_POINT_ENTRY;
+        // Build one 32-byte RoF2 ZonePoint_Entry: iterator@0, y@4, x@8, z@12, heading@16,
+        // zoneid(u16)@20, zoneinstance@22, then two trailing u32s.
+        let entry = |iter: u32, y: f32, x: f32, z: f32, zoneid: u16| -> Vec<u8> {
+            let mut b = vec![0u8; SIZE_ZONE_POINT_ENTRY];
+            b[0..4].copy_from_slice(&iter.to_le_bytes());
+            b[4..8].copy_from_slice(&y.to_le_bytes());
+            b[8..12].copy_from_slice(&x.to_le_bytes());
+            b[12..16].copy_from_slice(&z.to_le_bytes());
+            b[16..20].copy_from_slice(&0f32.to_le_bytes());
+            b[20..22].copy_from_slice(&zoneid.to_le_bytes());
+            b
+        };
+        let mut payload = Vec::new();
+        payload.extend(entry(0, 200.0, 100.0, -7.0, 2));       // real qeynos2 line
+        payload.extend(entry(1, -350.0, 999999.0, 0.0, 2));    // sentinel garbage (x=999999)
+        payload.extend(entry(2, 1395.0, 734.5, 4.0, 2));       // another real line
+
+        let mut gs = GameState::new();
+        apply_zone_points(&mut gs, &payload);
+        assert_eq!(gs.zone_points.len(), 2, "the sentinel (x=999999) entry must be dropped");
+        assert!(gs.zone_points.iter().all(|zp| zp.server_x.abs() < 900_000.0),
+            "no sentinel coordinate survives");
+        assert!(gs.zone_points.iter().any(|zp| (zp.server_x - 100.0).abs() < 0.5), "kept the real lines");
     }
 
     #[test]
