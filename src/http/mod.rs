@@ -19,7 +19,7 @@ use crate::camera_state::{CameraCmd, CameraSnapshot};
 mod observe;
 mod quests;
 mod group;
-mod navigate;
+mod move_api;
 mod combat;
 mod interact;
 mod merchant;
@@ -466,7 +466,7 @@ pub fn spawn_camera_server(
                 .nest("/v1/observe",   observe::router())
                 .nest("/v1/quests",    quests::router())
                 .nest("/v1/group",     group::router())
-                .nest("/v1/navigate",  navigate::router())
+                .nest("/v1/move",      move_api::router())
                 .nest("/v1/combat",    combat::router())
                 .nest("/v1/interact",  interact::router())
                 .nest("/v1/merchant",  merchant::router())

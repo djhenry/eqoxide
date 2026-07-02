@@ -12,7 +12,7 @@ All routes are **versioned and grouped**: `/<version>/<group>/<action>`. The cur
 | Group | Purpose |
 |-------|---------|
 | `observe`   | read-only world/player state (incl. the `/v1/observe/frame` screenshot) |
-| `navigate`  | movement: goto / warp / zone cross |
+| `move`      | movement: goto (walk & stop) / follow (walk & keep following) / stop / zone cross |
 | `combat`    | targeting, auto-attack, consider, spell scribe/memorize/cast |
 | `interact`  | hail, say, loot, give (turn-in), doors, sit/stand |
 | `quests`    | native task journal + old-style Lua turn-in quest givers, task offers/accept/decline/cancel |
@@ -44,13 +44,14 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 
 ---
 
-## `navigate` — movement
+## `move` — movement
 
 | Route | Body | Description |
 |-------|------|-------------|
-| `POST /v1/navigate/goto` | `{"name":"Guard Phaeton"}` \| `{"x":,"y":,"z":}` \| `{"map_x":,"map_y":}` | Walk to an entity (fuzzy name) or coordinates. `map_*` are Brewall map coords (= negated server x/y). |
-| `POST /v1/navigate/warp` | `{"x":,"y":,"z":}` | Teleport to exact coords, bypassing collision. |
-| `POST /v1/navigate/zone_cross` | `{"zone_id":N}` \| `{}` | Warp to a zone line and send OP_ZoneChange (specific zone, or nearest line). |
+| `POST /v1/move/goto` | `{"name":"Guard Phaeton"}` \| `{"x":,"y":,"z":}` \| `{"map_x":,"map_y":}` \| `{}` | Walk to an entity (fuzzy name, one-time snapshot) or coordinates and **stop** on arrival. Empty body → the player's current target. `map_*` are Brewall map coords (= negated server x/y). |
+| `POST /v1/move/follow` | `{"name":"a rat"}` \| `{}` | Walk to a named entity and **keep following** it until canceled. Empty body → current target. Coordinates are rejected (400). |
+| `POST /v1/move/stop` | — | Cancel any active goto/follow. |
+| `POST /v1/move/zone_cross` | `{"zone_id":N}` \| `{}` | Cross a zone line and send OP_ZoneChange (specific zone, or nearest line). |
 
 ---
 
@@ -183,7 +184,7 @@ shape.
 - **Most actions are fire-and-forget**: a handler writes a shared request slot that the navigation
   thread drains each tick. The HTTP 200 means *queued*, not *done* — observe the result via
   `GET /v1/observe/*` or the `chat/events` feed.
-- **Async travel**: `goto` / `zone_cross` return immediately; poll `GET /v1/observe/debug` (or watch
+- **Async travel**: `move/goto` / `move/zone_cross` return immediately; poll `GET /v1/observe/debug` (or watch
   for a `zone` event) to know when movement / a zone-in completed.
 - **Coordinates**: server convention is `x=east, y=north, z=up`. Brewall map coords negate x/y.
 - See `docs/autonomous-play.md` for end-to-end play recipes.
