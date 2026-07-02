@@ -12,6 +12,47 @@ pub(super) fn router() -> Router<HttpState> {
         .route("/click_door", post(post_door_click))
         .route("/sit", post(post_sit))
         .route("/stand", post(post_stand))
+        .route("/dialogue", post(post_dialogue))
+}
+
+/// POST /v1/interact/dialogue — click one of the NPC-dialogue choices from GET
+/// /v1/observe/dialogue. Body is either `{"index": N}` (position in the choices list) or
+/// `{"text": "..."}` (matched case-insensitively against a choice's label). Sends an
+/// OP_ItemLinkClick so the server resolves the saylink and treats it as our reply to the NPC. (#120)
+#[derive(serde::Deserialize)]
+struct DialogueBody {
+    index: Option<usize>,
+    text:  Option<String>,
+}
+
+async fn post_dialogue(
+    State(s): State<HttpState>,
+    body: Result<Json<DialogueBody>, axum::extract::rejection::JsonRejection>,
+) -> (StatusCode, String) {
+    let b = match body {
+        Ok(Json(b)) => b,
+        Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"index\":N} or {\"text\":\"...\"}".into()),
+    };
+    let choices = s.dialogue.lock().unwrap().clone();
+    if choices.is_empty() {
+        return (StatusCode::CONFLICT, "no dialogue choices available".into());
+    }
+    let chosen = if let Some(i) = b.index {
+        choices.get(i).cloned()
+    } else if let Some(t) = &b.text {
+        choices.iter().find(|c| c.text.eq_ignore_ascii_case(t.trim())).cloned()
+    } else {
+        return (StatusCode::BAD_REQUEST, "provide {\"index\":N} or {\"text\":\"...\"}".into());
+    };
+    match chosen {
+        Some(c) => {
+            let label = c.text.clone();
+            *s.dialogue_click.lock().unwrap() = Some(c);
+            tracing::info!("dialogue: queued click {:?}", label);
+            (StatusCode::OK, format!("clicking '{}'", label))
+        }
+        None => (StatusCode::NOT_FOUND, "no matching dialogue choice".into()),
+    }
 }
 
 #[derive(serde::Deserialize)]

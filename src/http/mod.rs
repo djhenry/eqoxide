@@ -220,6 +220,14 @@ pub struct MessageEntry {
 /// GET /v1/observe/messages. Exposes NPC dialogue (kind "npc") as machine-readable text + keywords.
 pub type MessagesShared = Arc<Mutex<Vec<MessageEntry>>>;
 
+/// Live snapshot of the current clickable NPC-dialogue choices (saylinks from the most recent NPC
+/// message), published each tick by the nav thread and read by GET /v1/observe/dialogue. (#120)
+pub type DialogueShared = Arc<Mutex<Vec<crate::game_state::DialogueChoice>>>;
+
+/// Pending "click a dialogue choice" request (POST /v1/interact/dialogue or a GUI click): the nav
+/// thread drains it and sends an OP_ItemLinkClick for the chosen saylink. (#120)
+pub type DialogueClickReq = Arc<Mutex<Option<crate::game_state::DialogueChoice>>>;
+
 /// One async game event exposed by the `GET /v1/events/*` feed. `category` is the top-level bucket
 /// the events API filters on (chat/combat/navigate/system); `kind` is the sub-type
 /// (tell/ooc/shout/group/gmsay/zone/slain/attacked/…). `id` is a 1-based monotonic cursor;
@@ -390,6 +398,8 @@ pub(crate) struct HttpState {
     pub(crate) inventory:        InventoryShared,
     pub(crate) loot:             LootReq,
     pub(crate) messages:         MessagesShared,
+    pub(crate) dialogue:         DialogueShared,
+    pub(crate) dialogue_click:   DialogueClickReq,
     pub(crate) chat_events:      ChatEventsShared,
     pub(crate) chat_send:        ChatSendShared,
     pub(crate) spells:           std::sync::Arc<crate::spells::SpellDb>,
@@ -441,6 +451,8 @@ pub fn spawn_camera_server(
     inventory:        InventoryShared,
     loot:             LootReq,
     messages:         MessagesShared,
+    dialogue:         DialogueShared,
+    dialogue_click:   DialogueClickReq,
     chat_events:      ChatEventsShared,
     chat_send:        ChatSendShared,
     spells:           std::sync::Arc<crate::spells::SpellDb>,
@@ -471,7 +483,7 @@ pub fn spawn_camera_server(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, zone_cross, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, zone_cross, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, dialogue, dialogue_click, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until };
             // Versioned + grouped routes: /v1/<group>/<action>. Each group's `router()` defines
             // relative paths; nesting prefixes them. Shared state is applied once at the end.
             let app = Router::new()
