@@ -11,6 +11,11 @@ use tokio::sync::mpsc;
 
 use super::protocol::*;
 
+/// Upper bound on datagrams drained (and ACKed) per `poll_recv` call. Generous enough to clear a
+/// zone-in spawn burst in one wake, but bounded so a sustained flood can't monopolize the loop —
+/// anything beyond this drains on the next wake ~10 ms later. (#153)
+const MAX_DATAGRAMS_PER_POLL: usize = 4096;
+
 // ── CRC32 table ────────────────────────────────────────────────────────────
 
 const CRC32_TABLE: [u32; 256] = [
@@ -348,17 +353,26 @@ impl EqStream {
     }
 
     /// Poll for incoming data. Non-blocking. Returns false if the socket is closed.
+    /// Receive and dispatch every datagram currently queued on the socket — sending an ACK for
+    /// each reliable packet as it's processed — not just one per call.
+    ///
+    /// Reading a single datagram per call (with the ~10 ms gameplay loop) capped intake at ~100
+    /// datagrams/sec. A busy zone's inbound reliable burst (e.g. Nektulos's ~700-spawn zone-in)
+    /// then backed up in the OS receive buffer while our ACKs lagged, until the server's resend
+    /// queue overflowed and dropped us as linkdead ("Stopping resend because we hit thresholds").
+    /// Draining fully each wake keeps ACKs current even if the loop is delayed under CPU
+    /// contention. Bounded by `MAX_DATAGRAMS_PER_POLL` so a sustained flood can't starve the rest
+    /// of the loop in a single wake (the remainder drains on the next wake). (#153)
     pub fn poll_recv(&mut self) -> bool {
         let mut buf = vec![0u8; 4096];
-        match self.socket.try_recv(&mut buf) {
-            Ok(n) => {
-                buf.truncate(n);
-                self.on_raw_recv(&buf);
-                true
+        for _ in 0..MAX_DATAGRAMS_PER_POLL {
+            match self.socket.try_recv(&mut buf) {
+                Ok(n) => self.on_raw_recv(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return true,
+                Err(_) => return false,
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
-            Err(_) => false,
         }
+        true
     }
 
     /// Send a keepalive response.
