@@ -731,7 +731,7 @@ pub fn encode_entity_pass(
     use crate::models::{race_to_archetype, archetype_scale};
     use crate::gpu::GpuModel;
 
-    struct DrawCmd { archetype: &'static str, mesh_idx: usize, uniform_slot: usize, equipment: [u32; 9], gender: u8, face: u8, hairstyle: u8, helm: u32, showhelm: u8 }
+    struct DrawCmd { archetype: &'static str, mesh_idx: usize, uniform_slot: usize, equipment: [u32; 9], gender: u8, face: u8, hairstyle: u8 }
 
     let mut draws: Vec<DrawCmd> = Vec::new();
     let pool_half = r.entity_uniform_pool.len() / 2;
@@ -771,7 +771,7 @@ pub fn encode_entity_pass(
                 &r.entity_uniform_pool[slot].0, 0,
                 bytemuck::bytes_of(&crate::gpu::EntityUniform { model: mat, tint }),
             );
-            draws.push(DrawCmd { archetype, mesh_idx, uniform_slot: slot, equipment: b.equipment, gender: b.gender, face: b.face, hairstyle: b.hairstyle, helm: b.helm, showhelm: b.showhelm });
+            draws.push(DrawCmd { archetype, mesh_idx, uniform_slot: slot, equipment: b.equipment, gender: b.gender, face: b.face, hairstyle: b.hairstyle });
             slot += 1;
         }
         if slot >= slot_end { break; }
@@ -803,8 +803,6 @@ pub fn encode_entity_pass(
             model.head_parts[draw.mesh_idx],
             model.head_default_hidden[draw.mesh_idx],
             draw.face, draw.hairstyle,
-        ) || crate::models::hair_hidden_by_helm(
-            model.head_parts[draw.mesh_idx], draw.showhelm, draw.helm,
         ) { continue; }
         pass.set_bind_group(2, &r.entity_uniform_pool[draw.uniform_slot].1, &[]);
         let bg = resolve_equip_tex(r, &model.texture_bind_groups, mesh.texture_idx,
@@ -830,7 +828,7 @@ pub fn encode_skinned_entity_pass(
     use crate::models::race_to_archetype;
     use crate::gpu::{EntityUniform, GpuModel};
 
-    struct DrawCmd { model_key: &'static str, model_slot: u8, mesh_idx: usize, uniform_slot: usize, joint_slot: usize, equipment: [u32; 9], face: u8, hairstyle: u8, helm: u32, showhelm: u8 }
+    struct DrawCmd { model_key: &'static str, model_slot: u8, mesh_idx: usize, uniform_slot: usize, joint_slot: usize, equipment: [u32; 9], face: u8, hairstyle: u8 }
 
     let mut draws: Vec<DrawCmd> = Vec::new();
     let pool_half    = r.entity_uniform_pool.len() / 2;
@@ -912,7 +910,7 @@ pub fn encode_skinned_entity_pass(
                 &r.entity_uniform_pool[u_slot].0, 0,
                 bytemuck::bytes_of(&EntityUniform { model: mat, tint }),
             );
-            draws.push(DrawCmd { model_key, model_slot, mesh_idx, uniform_slot: u_slot, joint_slot: j_slot, equipment: b.equipment, face: b.face, hairstyle: b.hairstyle, helm: b.helm, showhelm: b.showhelm });
+            draws.push(DrawCmd { model_key, model_slot, mesh_idx, uniform_slot: u_slot, joint_slot: j_slot, equipment: b.equipment, face: b.face, hairstyle: b.hairstyle });
             u_slot += 1;
         }
         j_slot += 1;
@@ -952,8 +950,6 @@ pub fn encode_skinned_entity_pass(
             model.head_parts[draw.mesh_idx],
             model.head_default_hidden[draw.mesh_idx],
             draw.face, draw.hairstyle,
-        ) || crate::models::hair_hidden_by_helm(
-            model.head_parts[draw.mesh_idx], draw.showhelm, draw.helm,
         ) { continue; }
         pass.set_bind_group(2, &r.entity_uniform_pool[draw.uniform_slot].1, &[]);
         pass.set_bind_group(1, skin_base_tex(r, &model.texture_bind_groups, mesh.texture_idx), &[]);
@@ -975,8 +971,6 @@ pub fn encode_skinned_entity_pass(
             model.head_parts[draw.mesh_idx],
             model.head_default_hidden[draw.mesh_idx],
             draw.face, draw.hairstyle,
-        ) || crate::models::hair_hidden_by_helm(
-            model.head_parts[draw.mesh_idx], draw.showhelm, draw.helm,
         ) { continue; }
         let Some(overlay) = resolve_overlay_tex(r, &model.prefix,
             model.equip_slots[draw.mesh_idx], &draw.equipment) else { continue };

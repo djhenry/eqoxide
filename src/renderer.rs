@@ -25,10 +25,11 @@ pub struct EntityAnimState {
 
 /// Pre-allocated entity uniform buffer slot count.
 /// Layout: [0..PLAYER_UNIFORM_SLOTS) = player, [PLAYER_UNIFORM_SLOTS..) = entities.
-// Character GLB models have up to 27 primitives (humanoid). The player draws one
-// uniform slot per mesh, so this MUST be >= the max mesh count or the player loses
-// its later primitives (head pieces + feet were dropped at the old value of 16).
-pub const PLAYER_UNIFORM_SLOTS: usize = 32;
+// The player draws one uniform slot per mesh, so this MUST be >= the max mesh count
+// or the player loses its later primitives (head pieces + feet were dropped at the
+// old value of 16; ears/mouth at 32). Face-variant character GLBs (8 faces × split
+// skin/hair prims + fixed head regions + body) reach ~57 primitives (huf).
+pub const PLAYER_UNIFORM_SLOTS: usize = 64;
 // 32 player + entity mesh draws, split half static / half skinned. At ~27 meshes per
 // humanoid, the skinned half (TOTAL/2 - 32) bounds how many character spawns can draw:
 // 8224 -> ~4080 skinned slots -> ~150 NPCs. Crowded zones (Qeynos ~190 spawns) exceed
