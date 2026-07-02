@@ -96,8 +96,11 @@ async fn post_hail(
     match resolved {
         Some(key) => {
             let display_name = clean_entity_name(&key);
-            *s.hail.lock().unwrap() = Some(display_name.clone());
-            tracing::info!("hail: queued hail to {:?}", display_name);
+            // Resolve the NPC's spawn_id so the nav thread can target it before saying — the
+            // server only fires EVENT_SAY on the player's current target (#130).
+            let spawn_id = s.entity_ids.lock().unwrap().get(&key).copied();
+            *s.hail.lock().unwrap() = Some((display_name.clone(), spawn_id));
+            tracing::info!("hail: queued hail to {:?} (spawn_id={:?})", display_name, spawn_id);
             (StatusCode::OK, format!("hailing {}", display_name))
         }
         None => {
