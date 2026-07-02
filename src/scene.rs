@@ -307,7 +307,11 @@ impl SceneState {
             target_id: gs.target_id,
             merchant_open: gs.merchant_open,
             merchant_items: gs.merchant_items.clone(),
-            group_members: gs.group_members.clone(),
+            // Override the OP_GroupUpdateB placeholder level (70/65) with the real level resolved
+            // from the profile / entity list, so the HUD roster shows true levels. (eqoxide#104)
+            group_members: gs.group_members.iter().map(|m| crate::game_state::GroupMember {
+                level: gs.group_member_level(&m.name), ..m.clone()
+            }).collect(),
             group_leader: gs.group_leader.clone(),
         }
     }
