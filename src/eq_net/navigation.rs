@@ -1010,16 +1010,27 @@ impl Navigator {
                         .map(|zp| (zp.zone_id, zp.server_x, zp.server_y, zp.server_z))
                 }
             };
-            if let Some((dest_zone, _tx, _ty, _tz)) = exit {
-                // Request the zone change to the DESTINATION zone. The server (ZoneUnsolicited)
-                // looks up the closest zone point matching this target zone near our tracked
-                // position and zones us there — so we send the player's real position (no teleport;
-                // jumping to the destination's arrival coords put us far from the source trigger
-                // and zoned us back to the same zone). The key is sending the TARGET zone id, not
-                // our current zone id.
-                tracing::info!("zone_cross: requesting zone change to zone_id={dest_zone} from ({:.1},{:.1})",
-                          gs.player_x, gs.player_y);
-                self.send_zone_change_packet(stream, gs, dest_zone);
+            if let Some((dest_zone, tx, ty, tz)) = exit {
+                // Only request the zone change when the player is actually AT the zone line. The
+                // server validates the crossing against our tracked position — asking to zone from
+                // far away (e.g. a self-heal calling zone_cross mid-hunt) reads as a /MQZone hack and
+                // the CLE subsystem KICKS the client (the recurring "linkdead"), cascading to the
+                // whole group (#136). If we're not near the line yet, WALK to it instead; the
+                // auto-zone-cross below then fires the crossing safely once we arrive.
+                const ZONE_LINE_DIST2: f32 = 15.0 * 15.0; // matches the auto-cross trigger radius
+                let dx = tx - gs.player_x;
+                let dy = ty - gs.player_y;
+                if dx * dx + dy * dy <= ZONE_LINE_DIST2 {
+                    tracing::info!("zone_cross: at the line — requesting zone change to zone_id={dest_zone} from ({:.1},{:.1})",
+                              gs.player_x, gs.player_y);
+                    self.send_zone_change_packet(stream, gs, dest_zone);
+                } else {
+                    tracing::info!("zone_cross: {:.0}u from the zone_id={dest_zone} line — walking to it (auto-cross will complete)",
+                              (dx * dx + dy * dy).sqrt());
+                    gs.log_msg("zone", &format!("Walking to the zone {} line", dest_zone));
+                    *self.goto_target.lock().unwrap() = Some((tx, ty, tz));
+                    *self.goto_entity.lock().unwrap() = None;
+                }
             } else {
                 tracing::info!("zone_cross: no zone line found for zone_id={want_zone}");
                 gs.log_msg("zone", "No zone line found to cross");
