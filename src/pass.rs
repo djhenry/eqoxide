@@ -547,11 +547,11 @@ pub fn encode_player_pass(
                 drop(pass); // end the skinned pass before drawing the weapon
 
                 // ── Held items: draw each equipped item at the rig's attachment bone
-                // (R_POINT = primary hand, L_POINT = left hand), posed by the current
-                // animation so it swings with combat. EQ authors IT models in the
-                // point-bone frame with an identity attach, so the only extra transform
-                // is the same EQ→Y-up rotation the rig itself was baked with (the
-                // converter's `rq`); no per-weapon tuning.
+                // (R_POINT = primary hand, L_POINT = left hand, SHIELD_POINT = off-hand
+                // shield), posed by the current animation so it swings with combat. EQ
+                // authors IT models in the point-bone frame with an identity attach, so
+                // the only extra transform is the same EQ→Y-up rotation the rig itself
+                // was baked with (the converter's `rq`); no per-weapon tuning.
                 let (clip_i, t) = r.anim_states.get(&0).map(|s| (s.clip_idx, s.time)).unwrap_or((0, 0.0));
                 let pmat = glam::Mat4::from_cols_array_2d(&crate::camera::entity_model_matrix_heading(
                     scene.player_pos, scene.player_heading, visual_scale, dominant_mesh_scale,
@@ -559,15 +559,20 @@ pub fn encode_player_pass(
                 let rq = glam::Mat4::from_quat(
                     glam::Quat::from_axis_angle(glam::Vec3::X, -std::f32::consts::FRAC_PI_2));
                 let held = [
-                    (scene.primary_weapon_idfile.to_uppercase(),   "R_POINT", 0usize),
-                    (scene.secondary_weapon_idfile.to_uppercase(), "L_POINT", 1usize),
+                    (scene.primary_weapon_idfile.to_uppercase(), "R_POINT", 0usize),
+                    (scene.secondary_weapon_idfile.to_uppercase(),
+                     crate::models::secondary_attach_bone(&scene.secondary_weapon_idfile), 1usize),
                 ];
                 let mut weapon_draws: Vec<(&crate::gpu::GpuWeapon, usize)> = Vec::new();
                 for (wkey, bone, wslot) in &held {
                     let Some(Some(weapon)) = r.weapon_cache.get(wkey) else { continue };
                     // GLBs baked before joint names were exported can't locate the bone;
                     // skip rather than guess (a wrong bone reads worse than no weapon).
-                    let Some(joint) = model.skin.attach_joint(bone) else { continue };
+                    // Old rigs may lack SHIELD_POINT — fall back to gripping at L_POINT.
+                    let Some(joint) = model.skin.attach_joint(bone)
+                        .or_else(|| (*bone == "SHIELD_POINT")
+                            .then(|| model.skin.attach_joint("L_POINT")).flatten())
+                        else { continue };
                     let hand = glam::Mat4::from_cols_array_2d(&model.skin.joint_world(clip_i, t, joint));
                     let wmat = (pmat * hand * rq).to_cols_array_2d();
                     r.queue.write_buffer(&r.weapon_uniform_pool[*wslot].0, 0,
@@ -942,13 +947,14 @@ pub fn encode_skinned_entity_pass(
             b.pos, b.heading, visual_scale, dominant_scale, [0.0, 0.0], true, 0.0));
         let anim = r.anim_states.get(&b.id)
             .filter(|s| !model.skin.clips.is_empty() && s.clip_idx < model.skin.clips.len());
-        for (key, bone) in crate::models::held_item_keys(&b.equipment, b.dead)
-            .into_iter().zip(["R_POINT", "L_POINT"])
-        {
-            let Some(key) = key else { continue };
+        for held in crate::models::held_item_keys(&b.equipment, b.dead) {
+            let Some((key, bone)) = held else { continue };
             if w_slot >= r.weapon_uniform_pool.len() { break; }
             if !matches!(r.weapon_cache.get(&key), Some(Some(_))) { continue; }
-            let Some(joint) = model.skin.attach_joint(bone) else { continue };
+            // Old rigs may lack SHIELD_POINT — fall back to gripping at L_POINT.
+            let Some(joint) = model.skin.attach_joint(bone)
+                .or_else(|| (bone == "SHIELD_POINT").then(|| model.skin.attach_joint("L_POINT")).flatten())
+                else { continue };
             let hand = glam::Mat4::from_cols_array_2d(&match anim {
                 Some(s) => model.skin.joint_world(s.clip_idx, s.time, joint),
                 None    => model.skin.joint_world_rest(joint),

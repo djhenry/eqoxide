@@ -1006,6 +1006,7 @@ impl EqRenderer {
         let entity_keys: Vec<String> = scene.billboards.iter()
             .flat_map(|b| crate::models::held_item_keys(&b.equipment, b.dead))
             .flatten()
+            .map(|(key, _bone)| key)
             .collect();
         for key in entity_keys { self.ensure_weapon(&key); }
 
