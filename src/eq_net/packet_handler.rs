@@ -1225,8 +1225,11 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
         .split('\0').next().unwrap_or("")
         .to_string();
     if msg.is_empty() { return; }
-    // NPC dialogue may embed saylink hyperlinks; show only the readable label.
-    let msg = strip_say_links(&msg);
+    // NPC dialogue may embed saylink hyperlinks; show the readable label and capture any clickable
+    // choices. Only the Say channel (8) is NPC conversation — a saylink arriving on a player chat
+    // channel (tell/OOC/etc.) is not a dialogue prompt, so choices are only adopted for `say`.
+    let (msg, choices) = parse_say_links(&msg);
+    if chan_num == 8 && !choices.is_empty() { gs.dialogue_choices = choices; }
 
     // EQEmu ChatChannel: 0 guild, 2 group, 3 shout, 4 auction, 5 OOC, 6 broadcast, 7 tell,
     // 8 say, 11 gmsay. The inter-agent channels are ALSO recorded as structured chat events for
@@ -1261,31 +1264,63 @@ const SAY_LINK_BODY_SIZE: usize = 56;
 
 /// Strip EQ "saylink" framing from chat text, leaving only the human-readable label.
 ///
-/// On the wire a saylink is `\x12` + a fixed 56-char body (the numeric link id/prefix)
-/// + the display text + `\x12` (RoF2). The real client renders only the display text
-/// (underlined/clickable); we have no link UI, so we show it as plain text. Text outside
-/// any `\x12...\x12` pair passes through unchanged. This mirrors EQEmu's
-/// `Strings::Split(msg, '\x12')` handling: splitting on the control byte yields plain
-/// text at even indices and link contents (body+text) at odd indices. A malformed or
-/// short link segment is kept as-is (minus the control byte) so we never eat real text.
+/// Thin wrapper over [`parse_say_links`] for callers that only want the readable text.
 /// (eqoxide#46)
 fn strip_say_links(s: &str) -> String {
+    parse_say_links(s).0
+}
+
+/// Parse EQ "saylink" framing out of an NPC message, returning both the human-readable text
+/// (identical to what [`strip_say_links`] produced) and the structured, clickable choices.
+///
+/// On the wire a saylink is `\x12` + a fixed 56-char hex body + the display text + `\x12`
+/// (RoF2). Splitting on the `\x12` control byte (as EQEmu's `Strings::Split(msg, '\x12')` does)
+/// yields plain text at even indices and link contents (body+text) at odd indices. For each
+/// well-formed link (odd segment at least `SAY_LINK_BODY_SIZE` long) we drop the body from the
+/// display text and decode the body's hex fields into a [`DialogueChoice`] so the link can later
+/// be re-clicked via `OP_ItemLinkClick`. Only real saylinks (body `item_id == SAYLINK_ITEM_ID`)
+/// become choices; other item links keep their display text but are not offered as choices.
+/// A malformed or short link segment is kept verbatim (minus the control byte) so we never eat
+/// real text.
+///
+/// Body field offsets (hex chars), from EQEmu `common/say_link.cpp`
+/// `DegenerateLinkBody` / RoF2 `SAY_LINK_BODY_SIZE == 56`:
+///   action_id[0..1] item_id[1..6] augment_1[6..11] augment_2[11..16] augment_3[16..21]
+///   augment_4[21..26] augment_5[26..31] augment_6[31..36] is_evolving[36..37]
+///   evolve_group[37..41] evolve_level[41..43] ornament_icon[43..48] hash[48..56]
+fn parse_say_links(s: &str) -> (String, Vec<crate::game_state::DialogueChoice>) {
     if !s.contains('\x12') {
-        return s.to_string();
+        return (s.to_string(), Vec::new());
     }
     let mut out = String::with_capacity(s.len());
+    let mut choices = Vec::new();
     for (i, seg) in s.split('\x12').enumerate() {
-        if i & 1 == 1 && seg.len() > SAY_LINK_BODY_SIZE {
+        if i & 1 == 1 && seg.len() >= SAY_LINK_BODY_SIZE {
             // Link content: drop the fixed-length body, keep the trailing display text.
             // Body is ASCII (hex digits), so byte offset 56 is a valid UTF-8 boundary.
-            out.push_str(&seg[SAY_LINK_BODY_SIZE..]);
+            let (body, display) = seg.split_at(SAY_LINK_BODY_SIZE);
+            out.push_str(display);
+            let hx = |a: usize, b: usize| u32::from_str_radix(&body[a..b], 16).unwrap_or(0);
+            if hx(1, 6) == SAYLINK_ITEM_ID {
+                choices.push(crate::game_state::DialogueChoice {
+                    text:      display.to_string(),
+                    item_id:   SAYLINK_ITEM_ID,
+                    augments:  [hx(6, 11), hx(11, 16), hx(16, 21), hx(21, 26), hx(26, 31), hx(31, 36)],
+                    link_hash: hx(48, 56),
+                    icon:      hx(43, 48),
+                });
+            }
         } else {
             // Plain text (even index) or a too-short/malformed link body — keep verbatim.
             out.push_str(seg);
         }
     }
-    out
+    (out, choices)
 }
+
+/// Item id that marks an EQ item-link body as a "saylink" rather than a real item
+/// (EQEmu `common/features.h` `SAYLINK_ITEM_ID`).
+const SAYLINK_ITEM_ID: u32 = 0xF_FFFF;
 
 /// EQEmu sends GM-flagged accounts verbose server-side debug messages that are not
 /// player-facing. These flood the NPC Dialogue panel and should be silently dropped.
@@ -1434,8 +1469,11 @@ fn apply_special_message(gs: &mut GameState, payload: &[u8]) {
     let msg = String::from_utf8_lossy(&payload[msg_start..])
         .trim_end_matches('\0')
         .to_string();
-    let msg = strip_say_links(&msg);
+    let (msg, choices) = parse_say_links(&msg);
     if msg.trim().is_empty() || is_debug_spam(&msg) { return; }
+    // A new NPC line carrying clickable saylinks (e.g. a Soulbinder's "[bind your soul]") replaces
+    // the current dialogue choices (#120).
+    if !choices.is_empty() { gs.dialogue_choices = choices; }
     if sayer.is_empty() {
         gs.log_msg("npc", &msg);
     } else {
@@ -2737,6 +2775,84 @@ mod tests {
     fn extract_saylink_text_passes_through_plain_string() {
         assert_eq!(extract_saylink_text(""), "");
         assert_eq!(extract_saylink_text("not a link"), "not a link");
+    }
+
+    /// Build a 56-char saylink body exactly as EQEmu `say_link.cpp` `GenerateLinkBody` does, so the
+    /// parser's field offsets are checked against the real wire format.
+    fn mk_saylink_body(item_id: u32, aug1: u32, ornament: u32, hash: u32) -> String {
+        let b = format!(
+            "{:01x}{:05x}{:05x}{:05x}{:05x}{:05x}{:05x}{:05x}{:01x}{:04x}{:02x}{:05x}{:08x}",
+            0, item_id, aug1, 0, 0, 0, 0, 0, 0, 0, 0, ornament, hash,
+        );
+        assert_eq!(b.len(), SAY_LINK_BODY_SIZE);
+        b
+    }
+
+    #[test]
+    fn parse_say_links_extracts_clickable_choice() {
+        use super::{parse_say_links, SAYLINK_ITEM_ID};
+        let body = mk_saylink_body(SAYLINK_ITEM_ID, 42, 7, 0xABCD);
+        let msg = format!("Do you wish to \x12{body}bind your soul\x12 here?");
+        let (text, choices) = parse_say_links(&msg);
+        assert_eq!(text, "Do you wish to bind your soul here?");
+        assert_eq!(choices.len(), 1);
+        let c = &choices[0];
+        assert_eq!(c.text, "bind your soul");
+        assert_eq!(c.item_id, SAYLINK_ITEM_ID);
+        assert_eq!(c.augments[0], 42, "sayid decoded from augment_1");
+        assert_eq!(c.icon, 7);
+        assert_eq!(c.link_hash, 0xABCD);
+    }
+
+    #[test]
+    fn parse_say_links_plain_text_has_no_choices() {
+        use super::parse_say_links;
+        let (text, choices) = parse_say_links("just a greeting");
+        assert_eq!(text, "just a greeting");
+        assert!(choices.is_empty());
+    }
+
+    #[test]
+    fn parse_say_links_ignores_non_saylink_item_links() {
+        use super::parse_say_links;
+        // A real item link (item_id != SAYLINK_ITEM_ID) keeps its display text but is not a choice.
+        let body = mk_saylink_body(1001, 0, 0, 0);
+        let (text, choices) = parse_say_links(&format!("\x12{body}Rusty Dagger\x12"));
+        assert_eq!(text, "Rusty Dagger");
+        assert!(choices.is_empty(), "item links are not dialogue choices");
+    }
+
+    #[test]
+    fn special_message_populates_dialogue_choices() {
+        use super::{apply_special_message, SAYLINK_ITEM_ID};
+        // SpecialMesg: header[11] | sayer\0 | unknown[12] | message\0
+        let mut p = vec![0u8; 11];
+        p.extend_from_slice(b"Soulbinder\0");
+        p.extend_from_slice(&[0u8; 12]);
+        let body = mk_saylink_body(SAYLINK_ITEM_ID, 5, 0, 0);
+        p.extend_from_slice(format!("Do you wish to \x12{body}bind your soul\x12?").as_bytes());
+
+        let mut gs = GameState::new();
+        apply_special_message(&mut gs, &p);
+        assert_eq!(gs.dialogue_choices.len(), 1);
+        assert_eq!(gs.dialogue_choices[0].text, "bind your soul");
+        assert_eq!(gs.dialogue_choices[0].augments[0], 5);
+        // The logged line shows clean text (no link markup).
+        assert!(gs.messages.back().unwrap().text.contains("bind your soul"));
+        assert!(!gs.messages.back().unwrap().text.contains('\u{12}'));
+    }
+
+    #[test]
+    fn build_item_link_click_lays_out_struct() {
+        use crate::eq_net::protocol::{build_item_link_click, OP_ITEM_LINK_CLICK};
+        assert_eq!(OP_ITEM_LINK_CLICK, 0x4cef);
+        let p = build_item_link_click(0xF_FFFF, &[42, 0, 0, 0, 0, 0], 0xABCD, 7);
+        assert_eq!(p.len(), 52);
+        assert_eq!(u32::from_le_bytes([p[0], p[1], p[2], p[3]]), 0xF_FFFF); // item_id
+        assert_eq!(u32::from_le_bytes([p[4], p[5], p[6], p[7]]), 42);       // augments[0] = sayid
+        assert_eq!(u32::from_le_bytes([p[28], p[29], p[30], p[31]]), 0xABCD); // link_hash
+        assert_eq!(u32::from_le_bytes([p[32], p[33], p[34], p[35]]), 4);      // unknown028
+        assert_eq!(u16::from_le_bytes([p[48], p[49]]), 7);                    // icon
     }
 
     fn build_task_description(seq: u32, task_id: u32, title: &str, desc: &str, coin: u32, xp: u32, reward_text: &str, item_link: &str) -> Vec<u8> {

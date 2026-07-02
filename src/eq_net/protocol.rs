@@ -239,6 +239,30 @@ pub const OP_SIMPLE_MESSAGE: u16 = 0x213f;     // RoF2: OP_SimpleMessage
 /// World/NPC emote text (some quest flavor). Emote_Struct: type(u32) | message[1024]\0
 pub const OP_EMOTE: u16 = 0x373b;              // RoF2: OP_Emote
 
+/// Client → server when the player clicks an item/say link. For a "saylink" (a clickable NPC
+/// dialogue choice) the server resolves the phrase from its `saylink` table by the id carried in
+/// the augments and processes it as if the player said it to the NPC. See
+/// [`build_item_link_click`] and EQEmu `zone/client_packet.cpp` `Handle_OP_ItemLinkClick`.
+pub const OP_ITEM_LINK_CLICK: u16 = 0x4cef;    // RoF2: OP_ItemLinkClick
+
+/// Build an `OP_ItemLinkClick` payload (`ItemViewRequest_Struct`, 52 bytes, RoF2
+/// `common/patches/rof2_structs.h`) to "click" a parsed saylink:
+///   item_id(u32) @0 | augments[6](u32) @4 | link_hash(u32) @28 | unknown028(u32=4) @32
+///   | unknown032[12] @36 | icon(u16) @48 | unknown046[2] @50
+/// The server reads `item_id` (must be `SAYLINK_ITEM_ID`) and the sayid in `augments[0]`
+/// (non-silent) / `augments[1]` (silent); the remaining fields round-trip the link body.
+pub fn build_item_link_click(item_id: u32, augments: &[u32; 6], link_hash: u32, icon: u32) -> Vec<u8> {
+    let mut p = vec![0u8; 52];
+    p[0..4].copy_from_slice(&item_id.to_le_bytes());
+    for (i, a) in augments.iter().enumerate() {
+        p[4 + i * 4..8 + i * 4].copy_from_slice(&a.to_le_bytes());
+    }
+    p[28..32].copy_from_slice(&link_hash.to_le_bytes());
+    p[32..36].copy_from_slice(&4u32.to_le_bytes()); // unknown028 — always 4 on the live client
+    p[48..50].copy_from_slice(&(icon as u16).to_le_bytes());
+    p
+}
+
 // ── Misc zone→client ──────────────────────────────────────────────────────
 
 pub const OP_ZONE_PLAYER_TO_BIND: u16 = 0x08d8;  // RoF2: OP_ZonePlayerToBind
