@@ -8,6 +8,10 @@
 # detects the new binary and relaunches automatically. The agent can also launch
 # eqoxide directly without this script when auto-restart is not needed.
 #
+# Build POLITELY while a server/clients are running: use ./build.sh instead of a bare
+# `cargo build --release`. It compiles under nice/ionice and leaves a core free so a
+# rebuild storm can't spike load and trip the server's CLE linkdead drop (#151).
+#
 # Usage:
 #   ./dev-run.sh              # release build (default): target/release/eqoxide
 #   ./dev-run.sh debug        # debug build:             target/debug/eqoxide
