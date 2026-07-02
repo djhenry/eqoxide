@@ -109,6 +109,12 @@ pub struct CharacterController {
     stuck_time:    f32,
     /// Seconds until another nav auto-hop is allowed (prevents jump-spamming a wall we can't clear).
     hop_cooldown:  f32,
+    /// Zone "underworld" floor from OP_NewZone (`GameState::zone_underworld`), or NEG_INFINITY when
+    /// unknown. The step never lets the character descend to/below this Z: a collision gap that
+    /// would drop us onto deep below-world boundary geometry (Nektulos river bottom ≈ -199, below
+    /// the zone's -189 underworld) instead recovers to the last good grounded position, so the
+    /// server never sees a below-world position and doesn't ZoneToBindPoint + CLE-drop us (#150).
+    underworld:    f32,
 }
 
 #[inline]
@@ -118,7 +124,13 @@ impl CharacterController {
     pub fn new(pos: [f32; 3]) -> Self {
         Self { pos, vel_z: 0.0, on_ground: false, in_water: false,
                good: std::collections::VecDeque::new(), good_timer: 0.0, stuck_time: 0.0,
-               hop_cooldown: 0.0 }
+               hop_cooldown: 0.0, underworld: f32::NEG_INFINITY }
+    }
+
+    /// Set the zone underworld floor (from `GameState::zone_underworld`); `None` disables the clamp.
+    /// Called on zone load so the fall-through guard in `step` uses the current zone's threshold (#150).
+    pub fn set_underworld(&mut self, underworld: Option<f32>) {
+        self.underworld = underworld.unwrap_or(f32::NEG_INFINITY);
     }
 
     /// Hard-set the position (zone-in, teleport, large server correction). Clears velocity & stuck.
@@ -207,8 +219,23 @@ impl CharacterController {
             if !self.on_ground {
                 self.vel_z = (self.vel_z - GRAVITY * dt).max(-MAX_FALL);
                 let cand = self.pos[2] + self.vel_z * dt;
+                // Never descend to/below the zone's underworld floor. A collision gap can otherwise
+                // drop us onto deep below-world boundary geometry (or the void) below `underworld`,
+                // which the server treats as fallen-through-the-world → ZoneToBindPoint, then CLE
+                // linkdead. Recover to the last good grounded position instead; if we have none yet,
+                // just stop sinking (hold above underworld) and let a server correction sort it. (#150)
+                let landing_valid = |f: f32| cand <= f && f > self.underworld;
                 match floor {
-                    Some(f) if cand <= f => { self.pos[2] = f; self.vel_z = 0.0; self.on_ground = true; }
+                    Some(f) if landing_valid(f) => { self.pos[2] = f; self.vel_z = 0.0; self.on_ground = true; }
+                    _ if cand <= self.underworld => {
+                        match self.good.back() {
+                            Some(&g) => { self.pos = g; self.on_ground = true; }
+                            None => {} // hold current pos; don't sink below underworld
+                        }
+                        self.vel_z = 0.0;
+                        tracing::info!("fall-through guard: blocked descent below underworld {:.1} → {:?}",
+                                       self.underworld, self.pos);
+                    }
                     _ => self.pos[2] = cand,
                 }
             }
@@ -519,5 +546,35 @@ mod tests {
         for _ in 0..20 { ctrl.step(walk(0.0, [0.0, 0.0]), 0.05, &bad); }
         assert!((ctrl.pos[0]).abs() < 1e-2 && (ctrl.pos[1]).abs() < 1e-2,
             "should have rubber-banded to the last good grounded position (origin): {:?}", ctrl.pos);
+    }
+
+    #[test]
+    fn fall_through_guard_never_descends_below_underworld() {
+        // A gap that would drop the character onto deep below-world boundary geometry at z=-300
+        // (below the zone's underworld floor -189), plus a normal floor at z=0 above. The guard must
+        // refuse to sink below underworld and recover to the last good grounded position. (#150)
+        let c = col(vec![floor(0.0, -100.0, 100.0), floor(-300.0, -100.0, 100.0)]);
+        let mut ctrl = CharacterController::new([0.0, 0.0, -188.0]); // already dropped just above underworld
+        ctrl.set_underworld(Some(-189.0));
+        ctrl.vel_z = -50.0;                 // falling fast toward the boundary
+        ctrl.good.push_back([1.0, 2.0, 3.0]); // a known-good grounded position (on the z=0 floor)
+
+        ctrl.step(walk(0.0, [0.0, 0.0]), 0.1, &c);
+
+        assert!(ctrl.pos[2] >= -189.0, "must not sink to/below underworld: z={}", ctrl.pos[2]);
+        assert_eq!(ctrl.pos, [1.0, 2.0, 3.0], "should recover to the last good grounded position");
+        assert!(ctrl.on_ground, "recovered position is treated as grounded");
+    }
+
+    #[test]
+    fn fall_through_guard_disabled_when_underworld_unknown() {
+        // With no underworld set (default), the guard must not fire — a normal fall onto real floor
+        // below still lands there, unchanged from prior behavior.
+        let c = col(vec![floor(-50.0, -100.0, 100.0)]);
+        let mut ctrl = CharacterController::new([0.0, 0.0, 0.0]);
+        // underworld left at its NEG_INFINITY default (set_underworld never called).
+        for _ in 0..40 { ctrl.step(walk(0.0, [0.0, 0.0]), 0.1, &c); }
+        assert!((ctrl.pos[2] - (-50.0)).abs() < 0.5, "falls to and lands on the real floor at -50: {}", ctrl.pos[2]);
+        assert!(ctrl.on_ground);
     }
 }
