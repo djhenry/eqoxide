@@ -171,7 +171,7 @@ Key test modules:
 ```yaml
 login_host: "127.0.0.1"
 login_port: 5998
-assets_path: "~/eq_assets/EQ_Files"
+assets_path: "~/eq_assets/everquest_rof2"
 models_path: "assets/models"
 character_name: "Aiquestbot"
 ```
