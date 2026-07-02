@@ -1836,7 +1836,11 @@ impl Navigator {
         buf[34..38].copy_from_slice(&anim.to_le_bytes()); // animation (10-bit in u32)
         buf[38..42].copy_from_slice(&dy.to_le_bytes());   // delta_y
         // delta_heading at [42..46] = 0 (already zeroed)
-        stream.send_app_packet(OP_CLIENT_UPDATE, &buf);
+        // Position is a transient firehose — send it UNRELIABLY (ack_req=false), exactly like the
+        // native client and the server's own position broadcasts. Sending it on the reliable stream
+        // (which we never retransmit) makes a single dropped datagram an unfillable sequence gap, so
+        // long continuous runs — which send the most position packets — reliably linkdead (eqoxide#127).
+        stream.send_app_packet_unreliable(OP_CLIENT_UPDATE, &buf);
     }
 
     /// Send OP_ZONE_CHANGE to request crossing a zone line to `target_zone_id`.
