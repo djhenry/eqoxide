@@ -854,7 +854,7 @@ pub fn eq_race_to_code(race_id: u32) -> &'static str {
 pub const SIZE_NEW_ZONE: usize = 948;    // RoF2 NewZone_Struct (rof2_structs.h)
 pub const SIZE_ZONE_SERVER_INFO: usize = 130; // ZoneServerInfo_S (ip[128] + port[2])
 pub const SIZE_CLIENT_ZONE_ENTRY: usize = 76; // ClientZoneEntry_S (RoF2: u32 + char[64] + u32 + u32)
-pub const SIZE_ENTER_WORLD: usize = 68;  // EnterWorld_S
+pub const SIZE_ENTER_WORLD: usize = 72;  // EnterWorld_S: name[64] + tutorial(4) + return_home(4)
 pub const SIZE_LOGIN_INFO: usize = 464;  // LoginInfo_S
 /// RoF2 PlayerPositionUpdateServer_Struct = 24 bytes (adds vehicle_id u16 vs Titanium's 22).
 /// rof2_structs.h: spawn_id(u16)+vehicle_id(u16)+5×bit-packed-u32 = 2+2+20 = 24.
@@ -932,6 +932,15 @@ mod tests {
         // RoF2 NewZone_Struct = 948 bytes (rof2_structs.h).
         assert_eq!(SIZE_NEW_ZONE, 948);
         assert_eq!(std::mem::size_of::<NewZone_S>(), 948);
+    }
+
+    #[test]
+    fn rof2_enter_world_size() {
+        // EnterWorld_Struct = name[64] + tutorial(u32) + return_home(u32) = 72 bytes
+        // (common/patches/rof2_structs.h). Sending only 68 bytes drops return_home, so the server
+        // reads it from uninitialized memory and intermittently refuses entry → login loop (#140).
+        assert_eq!(SIZE_ENTER_WORLD, 72);
+        assert_eq!(std::mem::size_of::<EnterWorld_S>(), 72);
     }
 
     #[test]
@@ -1539,7 +1548,9 @@ pub struct ClientZoneEntry_S {
 
 const _: () = assert!(std::mem::size_of::<ClientZoneEntry_S>() == 76, "ClientZoneEntry_S must be 76 bytes (RoF2)");
 
-/// Enter world (68 bytes) — character select.
+/// Enter world (72 bytes) — character select. `return_home` (offset 68..72) MUST be sent: if the
+/// packet is truncated to 68 bytes the server reads `return_home` from uninitialized memory and,
+/// when it's non-zero, refuses entry ("trying to go home before they're able"), looping login (#140).
 #[repr(C, packed)]
 #[derive(Debug, Copy, Clone)]
 pub struct EnterWorld_S {
