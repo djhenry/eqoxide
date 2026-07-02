@@ -195,9 +195,12 @@ Findings / scope:
 - HEAD ARMOR (helm): material-3 helm textures (humhe03xx) don't exist; helms are typically
   separate models selected by spawn.helm (+showhelm). Likely another attached-model job (or a
   head-texture swap for materials that DO ship humhe textures). Investigate spawn.helm usage.
-- HAIR: EQ hair = a head texture variant / separate hair piece by hairstyle+color. Check whether
-  the converted head mesh includes hair or needs a hair texture/mesh. The head currently shows
-  the baked face (helm material-3 texture missing → baked fallback).
+- HAIR: RESOLVED (2026-07-01, character-hair-fix): RoF2 S3D races ship NO hairstyle
+  geometry (dead actor-attach path); hair = painted scalp texels in the FACE textures
+  (hesk{F}{L}, F = face 0-7, NOT hairstyle) × runtime haircolor tint. Converter splits
+  scalp (head-bone tris, eq_head_part:"hair", tinted) from facial skin (eq_face only);
+  client selects by spawn.face + tints by spawn.haircolor. See
+  docs/eq-technical-knowledgebase/luclin-head-faces-and-hair.md.
 - MINOR BUG noticed: when an equip texture falls back to baked (no armor texture for that
   material), the per-mesh TINT is still applied — a missing-helm head can get tinted (e.g. green
   face). Consider skipping tint when the texture falls back to baked skin.
@@ -226,9 +229,9 @@ Queue (tractable first):
 - [x] Monster sizing FIXED (7f619d1): scale by idle-pose extent, not eq_height/bind extent.
       rat was already fine; bat/snake/wolf/gnoll were mis-sized. Humanoid 10.3→12 (intended) —
       user: confirm player height still looks right vs doorways.
-- [~] Hair: SEPARATE-FEATURE (like helms). humhe000X are face textures; head renders humhesk* skin/
-      skullcap. EQ hair = a head-piece selected by hairstyle (helm value 0). Needs the hair/helm
-      head-piece geometry + helm-value selection — same class as head-armor; not a texture swap.
+- [x] Hair: FIXED (character-hair-fix worktrees, both repos). It was never a missing head-piece:
+      hesk digit = FACE index; hair = painted scalp × haircolor tint; hairstyle is visually inert
+      on RoF2 S3D races (authentic). See the HAIR note above + luclin-head-faces-and-hair.md.
 - [ ] Head armor (helm) + weapons/shields: BLOCKED on converter joint-names (see blocker above) —
       needs s3d_to_gltf to emit bone names + regen, then a bone-attachment render path.
 - [ ] tint-on-baked: low priority (not visibly manifesting; head shows normal skin).

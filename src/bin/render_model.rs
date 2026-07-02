@@ -327,6 +327,8 @@ type SharedWindow = Arc<Mutex<Option<Arc<Window>>>>;
 /// The skinned draw loop reads these and applies `models::head_part_visible`.
 static SEL_FACE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 static SEL_HAIR: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// Haircolor tint index (0-23; >=24 = no tint) applied to painted-hair scalp prims.
+static SEL_HAIRCOLOR: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
 /// Camera focus height as a percentage of model height (0 = feet, 50 = center, 100 = top of head).
 /// The orbit camera keeps this point centered, so ~85-95 frames the head for face/hair inspection.
 /// Set via `POST /head {"target":N}`.
@@ -402,6 +404,9 @@ fn main() {
     }
     if let Some(h) = args.iter().position(|a| a == "--hairstyle").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()) {
         SEL_HAIR.store(h, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(c) = args.iter().position(|a| a == "--haircolor").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()) {
+        SEL_HAIRCOLOR.store(c, std::sync::atomic::Ordering::Relaxed);
     }
 
     let frame_req:     FrameReq         = Arc::new(Mutex::new(None));
@@ -486,14 +491,16 @@ fn main() {
                 }
 
                 #[derive(serde::Deserialize)]
-                struct HeadBody { face: Option<u8>, hairstyle: Option<u8>, target: Option<u32> }
+                struct HeadBody { face: Option<u8>, hairstyle: Option<u8>, haircolor: Option<u8>, target: Option<u32> }
                 async fn post_head(Json(body): Json<HeadBody>) -> String {
                     if let Some(f) = body.face { SEL_FACE.store(f, std::sync::atomic::Ordering::Relaxed); }
                     if let Some(h) = body.hairstyle { SEL_HAIR.store(h, std::sync::atomic::Ordering::Relaxed); }
+                    if let Some(c) = body.haircolor { SEL_HAIRCOLOR.store(c, std::sync::atomic::Ordering::Relaxed); }
                     if let Some(t) = body.target { SEL_TARGET.store(t.min(100), std::sync::atomic::Ordering::Relaxed); }
-                    format!("face={} hairstyle={} target={}",
+                    format!("face={} hairstyle={} haircolor={} target={}",
                         SEL_FACE.load(std::sync::atomic::Ordering::Relaxed),
                         SEL_HAIR.load(std::sync::atomic::Ordering::Relaxed),
+                        SEL_HAIRCOLOR.load(std::sync::atomic::Ordering::Relaxed),
                         SEL_TARGET.load(std::sync::atomic::Ordering::Relaxed))
                 }
 
@@ -1288,11 +1295,16 @@ fn render_frame(s: &mut ViewerState) {
     );
     s.queue.write_buffer(&s.camera_uniform.buf, 0, bytemuck::cast_slice(&vp));
 
-    // Write entity uniform for each mesh.
+    // Write entity uniform for each mesh. Painted-hair scalp prims get the
+    // haircolor tint, exactly like the live client's pass (models::head_part_tint).
     if let Some(sk) = s.skinned.as_ref() {
-        for (mesh, (buf, _)) in sk.model.meshes.iter().zip(s.uniform_pool.iter()) {
+        let haircolor = SEL_HAIRCOLOR.load(std::sync::atomic::Ordering::Relaxed);
+        for (i, (mesh, (buf, _))) in sk.model.meshes.iter().zip(s.uniform_pool.iter()).enumerate() {
+            let tint = sk.model.head_parts.get(i).copied().flatten()
+                .and_then(|p| eqoxide::models::head_part_tint(Some(p), haircolor))
+                .unwrap_or(mesh.base_color);
             s.queue.write_buffer(buf, 0, bytemuck::bytes_of(&EntityUniform {
-                model: mat, tint: mesh.base_color,
+                model: mat, tint,
             }));
         }
     } else {

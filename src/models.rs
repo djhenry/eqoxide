@@ -7,52 +7,57 @@ use std::path::Path;
 use crate::assets::{MeshData, TextureData};
 use crate::anim::{AnimClip, GroundProbe, JointChannel, JointProperty, SkinData};
 
-/// A head primitive belonging to a specific hairstyle variant.  Emitted by the converter in
-/// `primitive.extras` as `{ "eq_hairstyle": H }` on the scalp regions whose texture swaps by
-/// hairstyle (H=0 = bald base; H=1..7 = hair painted on the scalp).  Body, eyes, ears and the
-/// fixed head regions carry no extras and are `None` in `ModelAsset::head_parts` (always drawn).
+/// A head primitive belonging to a Luclin head-region variant. RoF2 swaps the head regions
+/// 1/4/5 (face+scalp, nose bridge, nose tip on humans; layout varies per race) by the spawn's
+/// **face** value — decompiled eqgame `FUN_REDACTED` attr 1 → `FUN_REDACTED`
+/// `"%sHE%02d%d1_MDF"`. Hairstyle is a dead actor-attach path for S3D races (no
+/// `*_HEAD_HAIR` actor ships in RoF2), so it selects nothing here. Hair itself is PAINTED
+/// into these textures as a neutral light base, colored at runtime by the `haircolor` tint
+/// table (see [`crate::head::hair_tint`]). The converter splits each region into a facial-skin
+/// prim and a painted-hair scalp prim so only the hair texels get tinted.
 ///
-/// (Luclin face is driven by skeletal bone positions, not texture — there are no face-variant
-/// textures — so `face` no longer selects a primitive.)
+/// Body, eyes, ears and the other fixed head regions carry no extras and are `None` in
+/// `ModelAsset::head_parts` (always drawn, untinted).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeadPart {
-    /// Renders the scalp region for hairstyle `H`; visible only when `hairstyle == H`.
-    /// Classic `humhe*` heads: hair color is BAKED into the swapped texture, so this variant is
-    /// never runtime-tinted (see [`crate::head`]). Emitted by the plain `{ "eq_hairstyle": H }`
-    /// extras contract (no `eq_head_part`).
-    HairstyleVariant(u8),
-    /// A synthetic hair SHELL for hairstyle `H` (asset-server #8): separate Luclin-style geometry
-    /// that replaces bald heads, emitted with `{ "eq_head_part": "hair", "eq_hairstyle": H }`.
-    /// Visible only when `hairstyle == H`, RUNTIME-TINTED by the character's `haircolor` (the shell
-    /// texture is untinted grey — see [`head_part_tint`]), and hidden when a helm is worn+shown.
-    Hair(u8),
+    /// Facial-skin part of face variant `F`; visible only when `face == F`, never tinted.
+    /// Emitted as `{ "eq_face": F }`.
+    Face(u8),
+    /// Painted-hair scalp part, runtime-tinted by `haircolor`. `Some(F)` = the scalp half of
+    /// face variant `F` (visible when `face == F`); `None` = an always-visible fixed hair
+    /// region (e.g. the sculpted crown strip across the skull top). Emitted as
+    /// `{ "eq_head_part": "hair" [, "eq_face": F] }`.
+    Hair(Option<u8>),
 }
 
-/// Whether a mesh primitive should render given its head-part tag and the character's hairstyle.
+/// Whether a mesh primitive should render given its head-part tag and the character's face.
 /// - `None` (body, eyes, ears, fixed head regions): always visible.
-/// - `HairstyleVariant(H)`: visible only when `hairstyle == H` (H=0 bald is the default).
+/// - `Face(F)` / `Hair(Some(F))`: visible only when `face == F` (F=0 is the default).
+/// - `Hair(None)` (fixed crown hair): always visible.
 ///
-/// `_face` is retained in the signature (callers pass the spawn `face`) but is unused: Luclin
-/// has no face-variant textures.  `_default_hidden` is likewise unneeded — the default
-/// `hairstyle == 0` already selects the bald variant via the match below.
+/// `_hairstyle` is retained in the signature (callers pass the spawn `hairstyle`) but is
+/// unused: RoF2 ships no hairstyle geometry or textures for S3D player races, so hairstyle
+/// has no visual effect on them (authentic client behavior). `_default_hidden` is likewise
+/// unneeded — the default `face == 0` already selects the base variant via the match below.
 pub fn head_part_visible(
     part: Option<HeadPart>,
     _default_hidden: bool,
-    _face: u8,
-    hairstyle: u8,
+    face: u8,
+    _hairstyle: u8,
 ) -> bool {
     match part {
         None => true,
-        Some(HeadPart::HairstyleVariant(h)) => h == hairstyle,
-        Some(HeadPart::Hair(h)) => h == hairstyle,
+        Some(HeadPart::Face(f)) => f == face,
+        Some(HeadPart::Hair(Some(f))) => f == face,
+        Some(HeadPart::Hair(None)) => true,
     }
 }
 
-/// Runtime tint for a head primitive, as a multiplicative RGBA (1.0 = no change), or `None` to keep
-/// the mesh's own base/equipment tint. Only synthetic hair SHELLS ([`HeadPart::Hair`]) are tinted —
-/// by the character's `haircolor` via [`crate::head::hair_tint`] (`haircolor >= 24` → white / no
-/// tint). Classic textured hair ([`HeadPart::HairstyleVariant`]), faces and body parts are never
-/// tinted (their color is baked into the texture), matching the real RoF2 client (asset-server #8).
+/// Runtime tint for a head primitive, as a multiplicative RGBA (1.0 = no change), or `None` to
+/// keep the mesh's own base/equipment tint. Only painted-hair scalp parts ([`HeadPart::Hair`])
+/// are tinted — by the character's `haircolor` via [`crate::head::hair_tint`] (`haircolor >= 24`
+/// → white / no tint, leaving the neutral light base = the authentic untinted look). Facial skin
+/// and body parts are never tinted.
 pub fn head_part_tint(part: Option<HeadPart>, haircolor: u8) -> Option<[f32; 4]> {
     match part {
         Some(HeadPart::Hair(_)) => {
@@ -63,24 +68,30 @@ pub fn head_part_tint(part: Option<HeadPart>, haircolor: u8) -> Option<[f32; 4]>
     }
 }
 
-/// Classify a primitive's glTF `extras` object into a head-part tag + its default-hidden flag, or
-/// `None` if the primitive carries no `eq_hairstyle` (body/eyes/ears/fixed head/bald base → always
-/// drawn). `eq_head_part == "hair"` marks a synthetic hair SHELL ([`HeadPart::Hair`], runtime-tinted
-/// + helm-hidden); a plain `eq_hairstyle` (no `eq_head_part`) is a classic swappable scalp texture
-/// ([`HeadPart::HairstyleVariant`], untinted). See the two contracts in `from_glb` (eqoxide#98).
+/// Classify a primitive's glTF `extras` object into a head-part tag + its default-hidden flag,
+/// or `None` for untagged primitives (body/eyes/ears/fixed skin regions → always drawn).
+///
+/// Contract (asset-server face-variant bake):
+/// - `{ "eq_face": F }` → [`HeadPart::Face`] (facial skin of face variant F).
+/// - `{ "eq_face": F, "eq_head_part": "hair" }` → [`HeadPart::Hair`]`(Some(F))` (tinted scalp).
+/// - `{ "eq_head_part": "hair" }` alone → [`HeadPart::Hair`]`(None)` (fixed crown hair).
+///
+/// Legacy GLBs (pre-fix) tagged the same textures `eq_hairstyle` — accepted as the face index
+/// so old bakes still select a single variant instead of rendering all 8 overlapped.
 pub(crate) fn parse_head_extras(v: &serde_json::Value) -> Option<(HeadPart, bool)> {
-    let h = v.get("eq_hairstyle")?.as_u64()? as u8;
-    let dflt_hidden = v.get("eq_default_hidden").and_then(|b| b.as_bool()).unwrap_or(false);
+    let face = v
+        .get("eq_face")
+        .or_else(|| v.get("eq_hairstyle"))
+        .and_then(|f| f.as_u64())
+        .map(|f| f as u8);
     let is_hair = v.get("eq_head_part").and_then(|p| p.as_str()) == Some("hair");
-    let part = if is_hair { HeadPart::Hair(h) } else { HeadPart::HairstyleVariant(h) };
+    let dflt_hidden = v.get("eq_default_hidden").and_then(|b| b.as_bool()).unwrap_or(false);
+    let part = match (is_hair, face) {
+        (true, f) => HeadPart::Hair(f),
+        (false, Some(f)) => HeadPart::Face(f),
+        (false, None) => return None,
+    };
     Some((part, dflt_hidden))
-}
-
-/// Whether a head primitive is hidden because a helm is worn and shown. Only synthetic hair SHELLS
-/// ([`HeadPart::Hair`]) are hidden — a helm covers the hair. Classic scalp/face prims are left alone
-/// (a helm model already replaces the head region on that path). `showhelm != 0 && helm != 0`.
-pub fn hair_hidden_by_helm(part: Option<HeadPart>, showhelm: u8, helm: u32) -> bool {
-    matches!(part, Some(HeadPart::Hair(_))) && showhelm != 0 && helm != 0
 }
 
 /// Per-vertex joint skinning data for one mesh primitive (parallel to MeshData positions).
@@ -1362,85 +1373,90 @@ mod tests {
     }
 
     #[test]
-    fn head_part_visible_hairstyle_zero_shows_only_bald() {
-        // default hairstyle 0 → only the H=0 (bald) scalp variant renders
-        assert!( head_part_visible(Some(HeadPart::HairstyleVariant(0)), false, 0, 0));
-        for h in 1u8..=7 {
-            assert!(!head_part_visible(Some(HeadPart::HairstyleVariant(h)), true, 0, 0),
-                "HairstyleVariant({h}) should be hidden when hairstyle=0");
+    fn head_part_visible_face_zero_shows_only_base() {
+        // default face 0 → only the F=0 variants render
+        assert!( head_part_visible(Some(HeadPart::Face(0)), false, 0, 0));
+        for f in 1u8..=7 {
+            assert!(!head_part_visible(Some(HeadPart::Face(f)), true, 0, 0),
+                "Face({f}) should be hidden when face=0");
         }
     }
 
     #[test]
-    fn head_part_visible_hairstyle_n_shows_only_n() {
-        // hairstyle=3 → only the H=3 scalp variant renders; bald and others hidden
-        assert!( head_part_visible(Some(HeadPart::HairstyleVariant(3)), true, 0, 3));
-        for h in [0u8, 1, 2, 4, 7] {
-            assert!(!head_part_visible(Some(HeadPart::HairstyleVariant(h)), false, 0, 3),
-                "HairstyleVariant({h}) should be hidden when hairstyle=3");
+    fn head_part_visible_face_n_shows_only_n() {
+        // face=3 → only the F=3 variants render; base and others hidden
+        assert!( head_part_visible(Some(HeadPart::Face(3)), true, 3, 0));
+        assert!( head_part_visible(Some(HeadPart::Hair(Some(3))), true, 3, 0));
+        for f in [0u8, 1, 2, 4, 7] {
+            assert!(!head_part_visible(Some(HeadPart::Face(f)), false, 3, 0),
+                "Face({f}) should be hidden when face=3");
+            assert!(!head_part_visible(Some(HeadPart::Hair(Some(f))), false, 3, 0),
+                "Hair(Some({f})) should be hidden when face=3");
         }
     }
 
     #[test]
-    fn head_part_visible_ignores_face() {
-        // face no longer selects a primitive (Luclin face is skeletal) — any face value works
-        assert!(head_part_visible(Some(HeadPart::HairstyleVariant(2)), false, 5, 2));
-        assert!(head_part_visible(Some(HeadPart::HairstyleVariant(2)), false, 0, 2));
+    fn head_part_visible_ignores_hairstyle() {
+        // hairstyle selects nothing: RoF2 ships no hairstyle geometry/textures for
+        // S3D player races (the client's actor-attach path finds no actor).
+        assert!(head_part_visible(Some(HeadPart::Face(2)), false, 2, 5));
+        assert!(head_part_visible(Some(HeadPart::Face(2)), false, 2, 0));
+        assert!(head_part_visible(Some(HeadPart::Hair(None)), false, 2, 5));
     }
 
     #[test]
-    fn head_part_visible_default_hidden_flag_ignored_when_hairstyle_matches() {
-        // default_hidden=true on the H=0 variant, but hairstyle=0 matches → visible anyway
-        assert!(head_part_visible(Some(HeadPart::HairstyleVariant(0)), true, 0, 0));
+    fn crown_hair_always_visible() {
+        // fixed crown-strip hair (no face variant) renders for every face value
+        for f in 0u8..=7 {
+            assert!(head_part_visible(Some(HeadPart::Hair(None)), false, f, 0));
+        }
     }
 
-    // ── eqoxide#98: synthetic hair-shell contract (HeadPart::Hair) ──────────────────────────
+    #[test]
+    fn head_part_visible_default_hidden_flag_ignored_when_face_matches() {
+        // default_hidden=true on the F=0 variant, but face=0 matches → visible anyway
+        assert!(head_part_visible(Some(HeadPart::Face(0)), true, 0, 0));
+    }
+
+    // ── face-variant + painted-hair contract (asset-server hair fix) ────────────────────────
 
     #[test]
-    fn parse_head_extras_classifies_hair_shell_vs_scalp_vs_none() {
+    fn parse_head_extras_classifies_hair_vs_face_vs_none() {
         use serde_json::json;
-        // eq_head_part=="hair" → Hair shell (with default_hidden honored).
+        // eq_face + eq_head_part=="hair" → tinted scalp half of face variant F.
         assert_eq!(
-            parse_head_extras(&json!({"eq_head_part":"hair","eq_hairstyle":3,"eq_default_hidden":true})),
-            Some((HeadPart::Hair(3), true)));
-        // plain eq_hairstyle (no eq_head_part) → classic swappable scalp texture, untinted.
+            parse_head_extras(&json!({"eq_head_part":"hair","eq_face":3,"eq_default_hidden":true})),
+            Some((HeadPart::Hair(Some(3)), true)));
+        // plain eq_face → facial skin variant, untinted.
+        assert_eq!(
+            parse_head_extras(&json!({"eq_face":2})),
+            Some((HeadPart::Face(2), false)));
+        // eq_head_part=="hair" alone → always-visible fixed crown hair.
+        assert_eq!(
+            parse_head_extras(&json!({"eq_head_part":"hair"})),
+            Some((HeadPart::Hair(None), false)));
+        // legacy pre-fix GLBs used eq_hairstyle for the same variants → read as face.
         assert_eq!(
             parse_head_extras(&json!({"eq_hairstyle":2})),
-            Some((HeadPart::HairstyleVariant(2), false)));
-        // no eq_hairstyle → untagged (body/eyes/bald base) → None.
+            Some((HeadPart::Face(2), false)));
+        assert_eq!(
+            parse_head_extras(&json!({"eq_head_part":"hair","eq_hairstyle":4,"eq_default_hidden":true})),
+            Some((HeadPart::Hair(Some(4)), true)));
+        // no tags → untagged (body/eyes/fixed skin) → None.
         assert_eq!(parse_head_extras(&json!({"foo":1})), None);
     }
 
     #[test]
-    fn hair_shell_visible_only_for_its_hairstyle() {
-        assert!( head_part_visible(Some(HeadPart::Hair(3)), true, 0, 3));  // matches → shown
-        assert!(!head_part_visible(Some(HeadPart::Hair(3)), true, 0, 2));  // mismatch → hidden
-        assert!(!head_part_visible(Some(HeadPart::Hair(3)), true, 0, 0));  // bald → no shell
-    }
-
-    #[test]
-    fn only_hair_shells_are_tinted_by_haircolor() {
-        // Hair shell → tinted by hair_tint(haircolor); index 0 = [46,26,12].
-        assert_eq!(head_part_tint(Some(HeadPart::Hair(1)), 0),
+    fn only_hair_parts_are_tinted_by_haircolor() {
+        // Painted-hair scalp → tinted by hair_tint(haircolor); index 0 = [46,26,12].
+        assert_eq!(head_part_tint(Some(HeadPart::Hair(Some(1))), 0),
+            Some([46.0/255.0, 26.0/255.0, 12.0/255.0, 1.0]));
+        assert_eq!(head_part_tint(Some(HeadPart::Hair(None)), 0),
             Some([46.0/255.0, 26.0/255.0, 12.0/255.0, 1.0]));
         // haircolor >= 24 → white (no visible tint) but still Some for hair.
-        assert_eq!(head_part_tint(Some(HeadPart::Hair(1)), 24), Some([1.0, 1.0, 1.0, 1.0]));
-        // classic textured hair + untagged prims are never tinted (color baked in).
-        assert_eq!(head_part_tint(Some(HeadPart::HairstyleVariant(1)), 0), None);
+        assert_eq!(head_part_tint(Some(HeadPart::Hair(Some(1))), 24), Some([1.0, 1.0, 1.0, 1.0]));
+        // facial skin + untagged prims are never tinted.
+        assert_eq!(head_part_tint(Some(HeadPart::Face(1)), 0), None);
         assert_eq!(head_part_tint(None, 0), None);
     }
-
-    #[test]
-    fn helm_hides_only_hair_shells_when_worn_and_shown() {
-        // Hair shell hidden iff a helm is worn (helm!=0) AND shown (showhelm!=0).
-        assert!( hair_hidden_by_helm(Some(HeadPart::Hair(1)), 1, 17));
-        assert!(!hair_hidden_by_helm(Some(HeadPart::Hair(1)), 0, 17)); // showhelm off
-        assert!(!hair_hidden_by_helm(Some(HeadPart::Hair(1)), 1, 0));  // no helm
-        // classic hair + untagged prims are never helm-hidden here (helm model replaces the head).
-        assert!(!hair_hidden_by_helm(Some(HeadPart::HairstyleVariant(1)), 1, 17));
-        assert!(!hair_hidden_by_helm(None, 1, 17));
-    }
 }
-
-
-
