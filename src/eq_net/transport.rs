@@ -117,6 +117,38 @@ fn decode_passes(data: &[u8], pass1: u8, pass2: u8, key: u32) -> Option<Vec<u8>>
     Some(result)
 }
 
+/// Apply the negotiated encode passes to `data` — the inverse of `decode_passes` (pass1 then
+/// pass2). XOR encode is symmetric, so it reuses `decode_xor` with the same key.
+fn encode_passes(data: &[u8], pass1: u8, pass2: u8, key: u32) -> Vec<u8> {
+    let mut result = data.to_vec();
+    if pass1 == ENCODE_COMPRESSION {
+        result = eq_compress(&result);
+    } else if pass1 == ENCODE_XOR {
+        result = decode_xor(&result, key);
+    }
+    if pass2 == ENCODE_COMPRESSION {
+        result = eq_compress(&result);
+    } else if pass2 == ENCODE_XOR {
+        result = decode_xor(&result, key);
+    }
+    result
+}
+
+/// Build the body (everything except the trailing outer CRC) of a RAW, unreliable application
+/// datagram — the inverse of `decode_raw_app`: `[opcode_lo] ++ encode_passes([opcode_hi] ++ payload)`.
+/// The `opcode_lo` lead byte is left plaintext so the wire's non-zero-lead-byte rule marks this as
+/// a raw application packet rather than a protocol packet (those lead with 0x00).
+fn encode_raw_app(opcode: u16, payload: &[u8], pass1: u8, pass2: u8, key: u32) -> Vec<u8> {
+    let mut inner = Vec::with_capacity(1 + payload.len());
+    inner.push((opcode >> 8) as u8); // opcode high byte, then payload — all encode-passed
+    inner.extend_from_slice(payload);
+    let encoded = encode_passes(&inner, pass1, pass2, key);
+    let mut body = Vec::with_capacity(1 + encoded.len());
+    body.push((opcode & 0xFF) as u8); // plaintext non-zero lead byte (opcode low)
+    body.extend_from_slice(&encoded);
+    body
+}
+
 /// Decode a standalone RAW (unreliable) application packet — CRC already stripped — into
 /// its `(opcode, payload)`.
 ///
@@ -296,6 +328,25 @@ impl EqStream {
         self.send_reliable(&app_data);
     }
 
+    /// Send an application packet UNRELIABLY: a raw datagram with no sequence number and no
+    /// retransmit tracking — the same `ack_req=false` path the server uses for its own
+    /// high-frequency position broadcasts (`Mob::SendPosUpdate`). Use this for the streamed
+    /// `OP_ClientUpdate` position firehose. A dropped update is harmless (the next one supersedes
+    /// it), whereas sending position reliably makes every lost datagram an unfillable sequence gap;
+    /// since we never retransmit (`OP_ACK`/`OP_OUT_OF_ORDER` are ignored), the server's ordered
+    /// stream stalls and eventually drops the session as linkdead on long continuous runs — the
+    /// more a client moves, the more reliable position packets it sends and the sooner one is lost
+    /// (eqoxide#127). Only valid for opcodes whose low byte is non-zero (the raw-app-packet marker).
+    pub fn send_app_packet_unreliable(&mut self, opcode: u16, payload: &[u8]) {
+        debug_assert!(opcode & 0xFF != 0, "raw app packets need a non-zero low opcode byte");
+        let body = encode_raw_app(
+            opcode, payload,
+            self.session.encode_pass1, self.session.encode_pass2, self.session.encode_key,
+        );
+        let datagram = self.append_crc(body);
+        let _ = self.socket.try_send(&datagram);
+    }
+
     /// Poll for incoming data. Non-blocking. Returns false if the socket is closed.
     pub fn poll_recv(&mut self) -> bool {
         let mut buf = vec![0u8; 4096];
@@ -400,18 +451,7 @@ impl EqStream {
     // ── Encoding/decoding ─────────────────────────────────────────────────────
 
     fn encode(&self, data: &[u8]) -> Vec<u8> {
-        let mut result = data.to_vec();
-        if self.session.encode_pass1 == ENCODE_COMPRESSION {
-            result = eq_compress(&result);
-        } else if self.session.encode_pass1 == ENCODE_XOR {
-            result = decode_xor(&result, self.session.encode_key);
-        }
-        if self.session.encode_pass2 == ENCODE_COMPRESSION {
-            result = eq_compress(&result);
-        } else if self.session.encode_pass2 == ENCODE_XOR {
-            result = decode_xor(&result, self.session.encode_key);
-        }
-        result
+        encode_passes(data, self.session.encode_pass1, self.session.encode_pass2, self.session.encode_key)
     }
 
     fn decode(&self, data: &[u8]) -> Option<Vec<u8>> {
@@ -686,6 +726,28 @@ mod tests {
         assert!(decode_raw_app(&[], ENCODE_NONE, ENCODE_NONE, 0).is_none());
         // Lead byte only, nothing after it to carry opcode_hi.
         assert!(decode_raw_app(&[0xcb], ENCODE_NONE, ENCODE_NONE, 0).is_none());
+    }
+
+    #[test]
+    fn encode_raw_app_round_trips_through_decode() {
+        // What send_app_packet_unreliable puts on the wire (minus outer CRC) must decode back to
+        // the same opcode+payload under every negotiated encode mode — this is the OP_ClientUpdate
+        // firehose that must reach the server unreliably to avoid the linkdead (eqoxide#127).
+        let opcode: u16 = 0x7dfc; // OP_ClientUpdate (RoF2)
+        let payload: Vec<u8> = (0u8..46).collect(); // a full 46-byte position struct's worth
+        let key = 0x1357_9bdf;
+        for &(p1, p2) in &[
+            (ENCODE_NONE, ENCODE_NONE),
+            (ENCODE_XOR, ENCODE_NONE),
+            (ENCODE_COMPRESSION, ENCODE_NONE),
+        ] {
+            let body = encode_raw_app(opcode, &payload, p1, p2, key);
+            assert_ne!(body[0], 0x00, "lead byte must be non-zero so the wire reads it as a raw app packet");
+            assert_eq!(body[0], (opcode & 0xFF) as u8, "lead byte is the plaintext opcode low byte");
+            let (op, pl) = decode_raw_app(&body, p1, p2, key).expect("encoded raw app packet should decode");
+            assert_eq!(op, opcode, "opcode round-trips (pass1={p1}, pass2={p2})");
+            assert_eq!(pl, payload, "payload round-trips (pass1={p1}, pass2={p2})");
+        }
     }
 
     #[test]
