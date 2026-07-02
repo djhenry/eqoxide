@@ -163,7 +163,7 @@ fn reachable_zone_ids(zps: &[crate::game_state::ZonePoint]) -> Vec<u16> {
     ids
 }
 
-/// POST /v1/navigate/zone_cross — teleport to a zone line and send OP_ZONE_CHANGE.
+/// POST /v1/move/zone_cross — teleport to a zone line and send OP_ZONE_CHANGE.
 /// Body: {"zone_id": 1} to cross to a specific zone, or {} for the nearest line.
 ///
 /// A specific `zone_id` that has no zone line from the current zone is REJECTED with 400 (and the

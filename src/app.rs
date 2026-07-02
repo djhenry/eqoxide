@@ -118,7 +118,7 @@ pub struct App {
     nav_intent:       crate::http::NavIntent,
     /// A large server correction handed over by the nav streamer; applied to the controller.
     pos_correction:   crate::http::PosCorrection,
-    /// Shared goto target — set by HTTP /navigate; cleared by the render thread on manual WASD
+    /// Shared goto target — set by HTTP /move; cleared by the render thread on manual WASD
     /// (so manual movement cancels navigation). WASD no longer writes a target here.
     goto_target:  crate::http::GotoTarget,
     /// Shared request slots written by HUD buttons; the nav thread drains and sends them.

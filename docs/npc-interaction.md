@@ -133,7 +133,7 @@ NPC Dialogue panel. Matching strings: `"AddLootDrop"`, `"min/max"`, `"[Loot]"`.
 
 ```sh
 # Walk to an NPC
-curl -X POST localhost:8765/v1/navigate/goto -H 'Content-Type: application/json' \
+curl -X POST localhost:8765/v1/move/goto -H 'Content-Type: application/json' \
      -d '{"name":"Lanhern Firepride"}'
 sleep 6
 
