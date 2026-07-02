@@ -41,6 +41,9 @@ pub struct SkinData {
     pub rest_scales:       Vec<[f32; 3]>,
     /// Lowest-at-bind vertices, in render (skinned) space, used to ground the model.
     pub ground_probes:     Vec<GroundProbe>,
+    /// glTF node name per joint (uppercased), e.g. "HUFR_POINT". Empty for GLBs baked
+    /// before joint names were exported. Used to locate weapon attachment bones.
+    pub joint_names:       Vec<String>,
 }
 
 impl SkinData {
@@ -126,6 +129,19 @@ impl SkinData {
         self.joint_globals(clip_idx, time)
             .get(joint).copied().unwrap_or(glam::Mat4::IDENTITY)
             .to_cols_array_2d()
+    }
+
+    /// Find the attachment joint whose bone name ends with `suffix` (e.g. "R_POINT" matches
+    /// "HUFR_POINT"). EQ rigs carry dedicated attachment bones the real client snaps held
+    /// items to: R_POINT (primary hand), L_POINT (left hand), SHIELD_POINT (shield).
+    /// Several other bones share the suffix (e.g. "HUFGAUNTR_POINT"); the hand point is
+    /// always `{race}{suffix}`, so the shortest matching name wins.
+    /// Returns None on GLBs baked before joint names were exported.
+    pub fn attach_joint(&self, suffix: &str) -> Option<usize> {
+        self.joint_names.iter().enumerate()
+            .filter(|(_, n)| n.ends_with(suffix))
+            .min_by_key(|(_, n)| n.len())
+            .map(|(i, _)| i)
     }
 
     /// Bind-pose world position of each joint (translation of the inverse of inv_bind). Used to
@@ -361,6 +377,23 @@ mod tests {
         (vec![[0.0;3]; n], vec![[0.0,0.0,0.0,1.0]; n], vec![[1.0;3]; n])
     }
 
+    #[test]
+    fn attach_joint_prefers_hand_point_over_longer_suffix_matches() {
+        let mut skin = single_translation_skin();
+        // Rig order deliberately puts the decoy (gauntlet mount) before the hand point.
+        skin.joint_names = vec![
+            "HUFPEBIP01".into(),
+            "HUFGAUNTR_POINT".into(),
+            "HUFR_POINT".into(),
+        ];
+        skin.joint_count = 3;
+        assert_eq!(skin.attach_joint("R_POINT"), Some(2), "hand point, not gauntlet mount");
+        assert_eq!(skin.attach_joint("L_POINT"), None);
+        // Unnamed joints (pre-name GLBs) find nothing.
+        skin.joint_names = vec![String::new(); 3];
+        assert_eq!(skin.attach_joint("R_POINT"), None);
+    }
+
     fn single_translation_skin() -> SkinData {
         let (rest_translations, rest_rotations, rest_scales) = default_rest(1);
         SkinData {
@@ -378,7 +411,7 @@ mod tests {
                 }],
             }],
             rest_translations, rest_rotations, rest_scales,
-            ground_probes: vec![],
+            ground_probes: vec![], joint_names: vec![],
         }
     }
 
@@ -407,7 +440,7 @@ mod tests {
                 AnimClip { name: "Spider_Walking_Fast".to_string(),     duration: 0.7, channels: vec![make_channel(0)] },
             ],
             rest_translations, rest_rotations, rest_scales,
-            ground_probes: vec![],
+            ground_probes: vec![], joint_names: vec![],
         }
     }
 
@@ -424,7 +457,7 @@ mod tests {
             rest_translations: vec![[5.0, 0.0, 0.0]],
             rest_rotations: vec![[0.0, 0.0, 0.0, 1.0]],
             rest_scales: vec![[1.0; 3]],
-            ground_probes: vec![],
+            ground_probes: vec![], joint_names: vec![],
         };
         let bp = skin.bind_pose();
         let bsm = skin.bind_skin_matrices();
@@ -476,7 +509,7 @@ mod tests {
                 name: n.to_string(), duration: 2.0, channels: vec![make_channel(0)],
             }).collect(),
             rest_translations, rest_rotations, rest_scales,
-            ground_probes: vec![],
+            ground_probes: vec![], joint_names: vec![],
         }
     }
 
@@ -545,7 +578,7 @@ mod tests {
                            channels: vec![make_channel(0), make_channel(3), make_channel(6)] },
             ],
             rest_translations, rest_rotations, rest_scales,
-            ground_probes: vec![],
+            ground_probes: vec![], joint_names: vec![],
         };
         assert_eq!(skin.clip_for_action("idle"), Some(0),
             "a real idle clip should be used regardless of joint coverage");
@@ -566,7 +599,7 @@ mod tests {
                 AnimClip { name: "Run".to_string(),  duration: 1.0, channels: vec![make_channel(0)] },
             ],
             rest_translations, rest_rotations, rest_scales,
-            ground_probes: vec![],
+            ground_probes: vec![], joint_names: vec![],
         };
         assert_eq!(skin.clip_for_action("idle"), Some(0),
             "no idle clip → fall back to walk (index 0)");
@@ -597,7 +630,7 @@ mod tests {
                 name: n.to_string(), duration: 2.0, channels: vec![make_channel(0)],
             }).collect(),
             rest_translations, rest_rotations, rest_scales,
-            ground_probes: vec![],
+            ground_probes: vec![], joint_names: vec![],
         }
     }
 
