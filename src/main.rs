@@ -195,7 +195,6 @@ OPTIONS:
     let group_kick:        http::GroupKickReq        = Arc::new(Mutex::new(None));
     let group_make_leader: http::GroupMakeLeaderReq  = Arc::new(Mutex::new(None));
     let zone_cross:       http::ZoneCrossReq    = Arc::new(Mutex::new(None));
-    let warp:             http::WarpReq         = Arc::new(Mutex::new(None));
     let hail:             http::HailReq         = Arc::new(Mutex::new(None));
     let say:              http::SayReq          = Arc::new(Mutex::new(None));
     let target:           http::TargetReq       = Arc::new(Mutex::new(None));
@@ -261,7 +260,6 @@ OPTIONS:
         let gk  = group_kick.clone();
         let gml = group_make_leader.clone();
         let zc  = zone_cross.clone();
-        let wp  = warp.clone();
         let hl  = hail.clone();
         let sy  = say.clone();
         let tg  = target.clone();
@@ -294,7 +292,7 @@ OPTIONS:
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, wp, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, cev, csd, ca, ms, st, co, sc, md, sd, cp, cu, cv, ni, pc).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, cev, csd, ca, ms, st, co, sc, md, sd, cp, cu, cv, ni, pc).await {
                     tracing::error!("EQ: fatal: {e}");
                 }
             });
@@ -339,7 +337,6 @@ OPTIONS:
         entity_ids,
         zone_points,
         zone_cross,
-        warp.clone(),
         hail,
         say,
         target,
@@ -407,7 +404,6 @@ OPTIONS:
         app_door_click,
         shared_collision,
         app_player_info,
-        warp,
         testzone_mode,
         shutdown.clone(),
         camp.clone(),

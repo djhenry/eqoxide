@@ -17,7 +17,7 @@ pub(super) fn router() -> Router<HttpState> {
 
 /// GET /v1/quests/givers — the agent's "quests near me" view for the current zone. Lists quest
 /// givers (data/quests.json) with location, distance, whether they're loaded (in spawn range), what
-/// they want (turn-in items), and reward XP. Combine with /v1/observe/entities + /v1/navigate/goto
+/// they want (turn-in items), and reward XP. Combine with /v1/observe/entities + /v1/move/goto
 /// to walk to a giver and /v1/interact/give to hand in. See docs/autonomous-play.md.
 async fn get_givers(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let player = s.player_info.lock().unwrap().clone();
@@ -153,7 +153,6 @@ pub(crate) mod tests {
             entity_ids: Arc::new(Mutex::new(HashMap::new())),
             zone_points: Arc::new(Mutex::new(Vec::new())),
             zone_cross: Arc::new(Mutex::new(None)),
-            warp: Arc::new(Mutex::new(None)),
             hail: Arc::new(Mutex::new(None)),
             say: Arc::new(Mutex::new(None)),
             target: Arc::new(Mutex::new(None)),

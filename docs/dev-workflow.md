@@ -135,7 +135,7 @@ Key log lines to watch:
 - `API_PORT=<port>` — the HTTP API port this instance bound (may not be 8765; see *API Port Discovery*)
 - `camera HTTP: http://127.0.0.1:<port>` — server is up
 - `eqstr: loaded N strings` — string table loaded
-- `NAV: arrived at (…)` — /v1/navigate/goto completed
+- `NAV: arrived at (…)` — /v1/move/goto completed
 - `EQ: hailing '…'` — hail packet sent
 - `EQ: say: …` — say packet sent
 - `WARN … unhandled opcode` — new packet type to handle

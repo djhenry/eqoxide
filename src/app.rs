@@ -118,7 +118,7 @@ pub struct App {
     nav_intent:       crate::http::NavIntent,
     /// A large server correction handed over by the nav streamer; applied to the controller.
     pos_correction:   crate::http::PosCorrection,
-    /// Shared goto target — set by HTTP /navigate; cleared by the render thread on manual WASD
+    /// Shared goto target — set by HTTP /move; cleared by the render thread on manual WASD
     /// (so manual movement cancels navigation). WASD no longer writes a target here.
     goto_target:  crate::http::GotoTarget,
     /// Shared request slots written by HUD buttons; the nav thread drains and sends them.
@@ -171,7 +171,6 @@ pub struct App {
     frame_req:    FrameReq,
     // Live player state for the /debug endpoint.
     player_info:  crate::http::PlayerInfo,
-    warp:         crate::http::WarpReq,
     // Precomputed zone collision grid: floor grounding, camera collision, nameplate occlusion.
     // Held as Arc and also published to `shared_collision` so the nav thread can read it.
     collision:    Option<Arc<assets::Collision>>,
@@ -250,7 +249,6 @@ impl App {
         door_click:      crate::http::DoorClickReq,
         shared_collision: assets::SharedCollision,
         player_info:     crate::http::PlayerInfo,
-        warp:            crate::http::WarpReq,
         testzone_mode:   bool,
         shutdown:        std::sync::Arc<std::sync::atomic::AtomicBool>,
         camp:            crate::http::CampReq,
@@ -310,7 +308,7 @@ impl App {
             pick_screen_w: 800,
             pick_screen_h: 600,
             game_state, scene: SceneState::default(), app_rx, last_inbound: std::time::Instant::now(), frame_req,
-            player_info, warp, shutdown, camp, camp_until, collision: None, shared_collision,
+            player_info, shutdown, camp, camp_until, collision: None, shared_collision,
             last_grounded_z: 0.0,
             prev_render_pos: [0.0, 0.0, 0.0],
             entity_motion: std::collections::HashMap::new(),
@@ -680,7 +678,7 @@ impl App {
     /// Runs every `about_to_wait` (even idle ones) so the network keeps flowing without a render.
     /// Returns true when visible state is changing or pending: queued packets, an active zone load,
     /// player input/motion in flight, easing doors/position/heading, or a queued HTTP request that a
-    /// render must service (frame capture / camera / warp).
+    /// render must service (frame capture / camera).
     fn poll_external(&mut self) -> bool {
         let mut activity = false;
 
@@ -697,7 +695,6 @@ impl App {
         // A queued HTTP request that only a render frame can service.
         if self.frame_req.lock().is_ok_and(|g| g.is_some()) { activity = true; }
         if self.camera_cmd.lock().is_ok_and(|g| g.is_some()) { activity = true; }
-        if self.warp.lock().is_ok_and(|g| g.is_some()) { activity = true; }
 
         // Player input / motion in flight (keys held, free-fly override active, or falling).
         let nav_driving = self.nav_intent.lock().map(|g| g.is_some()).unwrap_or(false);
@@ -748,23 +745,6 @@ impl App {
         // EQ packets are drained in `poll_external` (called from `about_to_wait` every wake) so the
         // network keeps flowing even on idle frames that don't render. `game_state` is already current
         // here.
-
-        // Warp (POST /warp) is handled authoritatively by the NAV thread (see navigation.rs),
-        // which teleports the server-side position AND cancels any in-progress /goto. We only
-        // PEEK it here for instant local visual feedback (clearing any WASD override so the
-        // render follows the new server position); the nav thread is the slot's sole consumer.
-        // The old code instead wrote the warp coords into goto_target, which made the nav thread
-        // try to *walk* there and stall — a warp could then be dragged back to a stuck path.
-        let warp_peek = *self.warp.lock().unwrap();
-        if let Some((wx, wy, wz)) = warp_peek {
-            self.game_state.player_x = wx;
-            self.game_state.player_y = wy;
-            self.game_state.player_z = wz;
-            self.visual_player_pos = [wx, wy, wz];
-            // Single authority: teleport the controller for instant local feedback (the nav thread
-            // is the slot's sole consumer and also hands us the same coords via pos_correction).
-            self.controller.teleport([wx, wy, wz]);
-        }
 
         // Ease each door's render fraction toward its server-authoritative open/close target.
         {
