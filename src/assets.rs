@@ -1491,8 +1491,23 @@ mod tests {
         // Case A — street-level corner wedge (Kessen). Both reported goals.
         probe("A1 corner-wedge 145u south", [256.4, 324.9, 0.0], [254.0, 180.0, 0.0]);
         probe("A2 corner-wedge 28u NE",     [256.4, 324.9, 0.0], [276.0, 305.0, 0.0]);
-        // Case B — multi-level water→street climb (Slink), out of the moat up onto the street.
-        probe("B water->street climb",      [-502.3, -141.3, -16.0], [-600.0, -141.0, -5.0]);
+        // Case B — the char is in the qeynos2 moat at z=-16. find_path returns NONE, but that is
+        // CORRECT here: the moat floor is traversable (a route to another moat point succeeds) yet
+        // the moat is a SEALED PIT in this collision — bounded by a wall taller than a walkable step
+        // (path_clear blocks the climb) with void beyond it up to the street, and the zone carries
+        // NO water volume, so it isn't swimmable either. There is no walkable exit for find_path to
+        // find. This is an asset/collision gap (the moat should be swimmable water with exits), not
+        // a pathing defect — see the moat→street probes below and the note on #2.
+        probe("B moat (sealed pit — NONE is correct)", [-502.3, -141.3, -16.0], [-600.0, -141.0, -5.0]);
+        let within = col.find_path([-502.3, -141.3, -16.0], [-490.0, -100.0, -16.0], crate::movement::PLAYER_RADIUS, &[]);
+        eprintln!("  moat floor traversable (start → 40u north @z=-16): {}",
+            within.map(|p| format!("{} waypoints", p.len())).unwrap_or_else(|| "NONE".into()));
+        for gx in [-560.0f32, -580.0, -600.0] {
+            let r = col.find_path([-502.3, -141.3, -16.0], [gx, -141.0, -8.0], crate::movement::PLAYER_RADIUS, &[]);
+            eprintln!("  moat → street x={gx}: {}",
+                r.map(|p| format!("{} waypoints", p.len())).unwrap_or_else(|| "NONE".into()));
+        }
+        eprintln!("  zone has a water volume: {}", col.water.is_some());
     }
 
     #[test]
