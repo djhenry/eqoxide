@@ -846,6 +846,13 @@ pub fn encode_skinned_entity_pass(
     struct DrawCmd { model_key: &'static str, model_slot: u8, mesh_idx: usize, uniform_slot: usize, joint_slot: usize, equipment: [u32; 9], face: u8, hairstyle: u8 }
 
     let mut draws: Vec<DrawCmd> = Vec::new();
+    // Held items (spawn equipment slots 7/8) drawn at the rig's attach bones, same
+    // contract as the player pass. weapon_uniform_pool slots 0-1 belong to the player;
+    // entities allocate from 2, nearest-first, and overflow just skips the item.
+    let mut weapon_draws: Vec<(String, usize)> = Vec::new();
+    let mut w_slot = 2usize;
+    let rq = glam::Mat4::from_quat(
+        glam::Quat::from_axis_angle(glam::Vec3::X, -std::f32::consts::FRAC_PI_2));
     let pool_half    = r.entity_uniform_pool.len() / 2;
     let uniform_base = pool_half + PLAYER_UNIFORM_SLOTS; // upper half for skinned
     let mut u_slot   = uniform_base;
@@ -928,6 +935,30 @@ pub fn encode_skinned_entity_pass(
             draws.push(DrawCmd { model_key, model_slot, mesh_idx, uniform_slot: u_slot, joint_slot: j_slot, equipment: b.equipment, face: b.face, hairstyle: b.hairstyle });
             u_slot += 1;
         }
+
+        // Held items at the rig attach bones, posed to match the body (animated pose
+        // when the anim state is valid, rest pose when the body fell back to bind).
+        let emat = glam::Mat4::from_cols_array_2d(&crate::camera::entity_model_matrix_heading(
+            b.pos, b.heading, visual_scale, dominant_scale, [0.0, 0.0], true, 0.0));
+        let anim = r.anim_states.get(&b.id)
+            .filter(|s| !model.skin.clips.is_empty() && s.clip_idx < model.skin.clips.len());
+        for (key, bone) in crate::models::held_item_keys(&b.equipment, b.dead)
+            .into_iter().zip(["R_POINT", "L_POINT"])
+        {
+            let Some(key) = key else { continue };
+            if w_slot >= r.weapon_uniform_pool.len() { break; }
+            if !matches!(r.weapon_cache.get(&key), Some(Some(_))) { continue; }
+            let Some(joint) = model.skin.attach_joint(bone) else { continue };
+            let hand = glam::Mat4::from_cols_array_2d(&match anim {
+                Some(s) => model.skin.joint_world(s.clip_idx, s.time, joint),
+                None    => model.skin.joint_world_rest(joint),
+            });
+            let wmat = (emat * hand * rq).to_cols_array_2d();
+            r.queue.write_buffer(&r.weapon_uniform_pool[w_slot].0, 0,
+                bytemuck::bytes_of(&EntityUniform { model: wmat, tint: [1.0, 1.0, 1.0, 1.0] }));
+            weapon_draws.push((key, w_slot));
+            w_slot += 1;
+        }
         j_slot += 1;
     }
     if draws.is_empty() { return; }
@@ -994,6 +1025,23 @@ pub fn encode_skinned_entity_pass(
         pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
         pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+    }
+
+    // Held items: static meshes at the pre-posed attach-bone matrices (same pipeline
+    // the player weapon pass uses; bind group 3 is beyond this pipeline's layout and
+    // is ignored).
+    pass.set_pipeline(&r.pipelines.character);
+    for (key, wslot) in &weapon_draws {
+        let Some(Some(weapon)) = r.weapon_cache.get(key) else { continue };
+        pass.set_bind_group(2, &r.weapon_uniform_pool[*wslot].1, &[]);
+        for mesh in &weapon.meshes {
+            let bg = mesh.texture_idx.and_then(|ti| weapon.texture_bind_groups.get(ti))
+                .unwrap_or(&r.fallback_texture_bg);
+            pass.set_bind_group(1, bg, &[]);
+            pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+            pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+        }
     }
 }
 

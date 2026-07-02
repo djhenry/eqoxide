@@ -37,6 +37,9 @@ pub const PLAYER_UNIFORM_SLOTS: usize = 64;
 pub const TOTAL_ENTITY_UNIFORM_SLOTS: usize = 8224;
 /// Pre-allocated joint buffer pool size. Slot 0 = player, 1..N = entities.
 pub const JOINT_BUF_SLOTS: usize = 512;
+/// Held-item uniform slots: 0-1 = player primary/secondary, 2.. = entity held items
+/// (up to two per drawn skinned entity, nearest-first; overflow entities skip weapons).
+pub const WEAPON_UNIFORM_SLOTS: usize = 512;
 /// Dedicated uniform slot count for doors (one slot per door mesh draw this frame).
 /// Sized generously; far more than any zone's door count × meshes-per-door.
 pub const DOOR_UNIFORM_SLOTS: usize = 512;
@@ -128,9 +131,10 @@ pub struct EqRenderer {
     pub assets_path: std::path::PathBuf,
     /// Held weapon models cached by IDFile. `None` = tried and not found (negative cache).
     pub weapon_cache: std::collections::HashMap<String, Option<crate::gpu::GpuWeapon>>,
-    /// Dedicated uniforms for the player's held items (primary, secondary). The player's
-    /// mesh draws use entity_uniform_pool[0..PLAYER_UNIFORM_SLOTS), and a write_buffer to
-    /// a shared slot lands before ALL encoded passes — reusing a mesh slot for the weapon
+    /// Dedicated uniforms for held items: slots 0-1 = player (primary, secondary),
+    /// slots 2.. = entity held items, allocated nearest-first by the skinned entity
+    /// pass. Character mesh draws use entity_uniform_pool, and a write_buffer to a
+    /// shared slot lands before ALL encoded passes — reusing a mesh slot for a weapon
     /// clobbers that mesh's transform (a body part drawn at the weapon matrix).
     pub weapon_uniform_pool: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
     /// Pre-decoded weapon meshes by UPPERCASE IDFile key, loaded once from weapons.glb.
@@ -189,9 +193,9 @@ impl EqRenderer {
                 (buf, bg)
             }).collect();
 
-        // Dedicated uniforms for the player's held items (primary, secondary).
+        // Dedicated uniforms for held items (player + entities).
         let weapon_uniform_pool: Vec<(wgpu::Buffer, wgpu::BindGroup)> =
-            (0..2).map(|_| {
+            (0..WEAPON_UNIFORM_SLOTS).map(|_| {
                 let buf = device.create_buffer(&wgpu::BufferDescriptor {
                     label:              Some("weapon_uniform_pool"),
                     size:               std::mem::size_of::<crate::gpu::EntityUniform>() as u64,
@@ -997,6 +1001,13 @@ impl EqRenderer {
         let (wp, ws) = (scene.primary_weapon_idfile.clone(), scene.secondary_weapon_idfile.clone());
         if !wp.is_empty() { self.ensure_weapon(&wp); }
         if !ws.is_empty() { self.ensure_weapon(&ws); }
+        // Same for every entity's held items (spawn equipment slots 7/8; both hit the
+        // per-IDFile cache, including a negative cache, so this is cheap after first sight).
+        let entity_keys: Vec<String> = scene.billboards.iter()
+            .flat_map(|b| crate::models::held_item_keys(&b.equipment, b.dead))
+            .flatten()
+            .collect();
+        for key in entity_keys { self.ensure_weapon(&key); }
 
         crate::pass::encode_sky_pass(self, encoder, view);
         crate::pass::encode_zone_pass(self, encoder, view, scene);

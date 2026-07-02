@@ -858,9 +858,31 @@ pub fn character_model_key(race: &str, gender: u8) -> (&'static str, u8) {
     }
 }
 
+/// Held-item model keys for a spawn's equipment array (wire slots: primary=7,
+/// secondary=8). Spawn equipment carries the held model's numeric IT id
+/// (`d_melee_texture_*` server-side); 0 = empty hand. Keys match the UPPERCASE
+/// IDFile keys of `weapons.glb` ("IT7", "IT10649", …). Dead entities show no
+/// held items — the corpse pose has no meaningful hand attachment.
+pub fn held_item_keys(equipment: &[u32; 9], dead: bool) -> [Option<String>; 2] {
+    if dead { return [None, None]; }
+    let key = |n: u32| (n != 0).then(|| format!("IT{n}"));
+    [key(equipment[7]), key(equipment[8])]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn held_item_keys_map_wire_slots_and_skip_dead() {
+        let mut eq = [0u32; 9];
+        eq[7] = 10649;
+        eq[8] = 7;
+        assert_eq!(held_item_keys(&eq, false),
+                   [Some("IT10649".into()), Some("IT7".into())]);
+        assert_eq!(held_item_keys(&eq, true), [None, None]);
+        assert_eq!(held_item_keys(&[0; 9], false), [None, None]);
+    }
 
     #[test]
     fn load_returns_err_on_missing_file() {

@@ -131,6 +131,16 @@ impl SkinData {
             .to_cols_array_2d()
     }
 
+    /// Like [`Self::joint_world`] but at the rest (bind) pose — for entities whose animation
+    /// state is missing or holds the out-of-range sentinel clip (they render bind-posed,
+    /// so an attached item must match). Identity if `joint` is invalid.
+    pub fn joint_world_rest(&self, joint: usize) -> [[f32; 4]; 4] {
+        let (t, r, s) = self.rest_trs();
+        self.build_globals(&t, &r, &s)
+            .get(joint).copied().unwrap_or(glam::Mat4::IDENTITY)
+            .to_cols_array_2d()
+    }
+
     /// Find the attachment joint whose bone name ends with `suffix` (e.g. "R_POINT" matches
     /// "HUFR_POINT"). EQ rigs carry dedicated attachment bones the real client snaps held
     /// items to: R_POINT (primary hand), L_POINT (left hand), SHIELD_POINT (shield).
