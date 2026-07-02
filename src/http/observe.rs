@@ -19,6 +19,7 @@ pub(super) fn router() -> Router<HttpState> {
         .route("/entities", get(get_entities))
         .route("/inventory", get(get_inventory))
         .route("/messages", get(get_messages))
+        .route("/dialogue", get(get_dialogue))
         .route("/spells", get(get_spells))
         .route("/skills", get(get_skills))
         .route("/doors", get(get_doors))
@@ -128,6 +129,17 @@ async fn get_messages(
         None    => all.iter().collect(),
     };
     Json(serde_json::json!({ "count": filtered.len(), "messages": filtered }))
+}
+
+/// GET /v1/observe/dialogue — the current clickable NPC-dialogue choices (saylinks from the most
+/// recent NPC message, e.g. a Soulbinder's "[bind your soul]"). `index` is the argument POSTed to
+/// /v1/interact/dialogue to click that choice. Empty when no NPC has offered choices. (#120)
+async fn get_dialogue(State(s): State<HttpState>) -> Json<serde_json::Value> {
+    let choices = s.dialogue.lock().unwrap();
+    let list: Vec<_> = choices.iter().enumerate()
+        .map(|(i, c)| serde_json::json!({ "index": i, "text": c.text }))
+        .collect();
+    Json(serde_json::json!({ "count": list.len(), "choices": list }))
 }
 
 /// GET /v1/observe/spells — the 9 memorized gems with names. Empty gem = spell id 0 or 0xFFFFFFFF.
