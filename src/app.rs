@@ -696,6 +696,13 @@ impl App {
         if self.frame_req.lock().is_ok_and(|g| g.is_some()) { activity = true; }
         if self.camera_cmd.lock().is_ok_and(|g| g.is_some()) { activity = true; }
 
+        // A pending server position correction (GM #summon, knockback, spell pushback, anti-cheat
+        // snap) is consumed only inside the render frame (`pos_correction` handler → controller
+        // teleport). Force a frame even when the client is otherwise idle so the controller adopts
+        // the new position promptly; otherwise the correction sits unconsumed while the position
+        // streamer re-sends the stale controller position, reverting both client and server (#116).
+        if self.pos_correction.lock().is_ok_and(|g| g.is_some()) { activity = true; }
+
         // Player input / motion in flight (keys held, free-fly override active, or falling).
         let nav_driving = self.nav_intent.lock().map(|g| g.is_some()).unwrap_or(false);
         if !self.keys_held.is_empty() || nav_driving || !self.on_ground {
