@@ -763,14 +763,22 @@ fn apply_mob_health(gs: &mut GameState, payload: &[u8]) {
 /// target_name/_hp_pct are seeded from the entity here and kept live in app.rs from the entity list.
 /// See the two-GameState split note. (eqoxide#9)
 /// Synthetic OP_MoveItem (nav → render gs). `/v1/inventory/move` sends the real 28-byte move to the
-/// server (which applies it silently, no echo) and updates the network gs; the render gs would
-/// otherwise only learn of it on the next OP_CharInventory (relog/zone), leaving held-item models
-/// stale. The nav thread mirrors the move here via app_tx so `scene.*_weapon_idfile` refresh within
-/// a frame. Payload is a synthetic 8 bytes: from_slot(i32 LE) + to_slot(i32 LE) — NOT the 28-byte
-/// wire MoveItem_Struct (the server never sends OP_MoveItem to the client, so this is unambiguous).
+/// server (which applies it silently, no echo for a client-initiated move) and updates the network
+/// gs; the render gs would otherwise only learn of it on the next OP_CharInventory (relog/zone),
+/// leaving held-item models stale. The nav thread mirrors the move here via app_tx so
+/// `scene.*_weapon_idfile` refresh within a frame. Payload is a synthetic 8 bytes: from_slot(i32
+/// LE) + to_slot(i32 LE).
+///
+/// IMPORTANT: the server DOES send `OP_MoveItem` to the client in other flows (trade, autostack,
+/// resync — EQEmu `zone/trading.cpp`, `zone/inventory.cpp`, `zone/client.cpp`), as a 28-byte
+/// `MoveItem_Struct`. Those inbound packets are dispatched through this same `apply_packet` on both
+/// gamestates, so they reach this handler too — and decoding the wire struct's first 8 bytes as
+/// (from,to) would relocate slot 0 into a garbage slot and corrupt the inventory. Guard on the
+/// EXACT synthetic length (8) so only our own synthetic packet is applied; the 28-byte wire form is
+/// ignored here (real inventory changes arrive via OP_CharInventory / OP_ItemPacket).
 /// (eqoxide#141, same render/network GameState split as #9.)
 fn apply_move_item(gs: &mut GameState, payload: &[u8]) {
-    if payload.len() < 8 { return; }
+    if payload.len() != 8 { return; } // synthetic is exactly 8; ignore the 28-byte inbound wire MoveItem_Struct
     let from = i32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
     let to   = i32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
     gs.move_item(from, to);
@@ -1952,6 +1960,23 @@ mod tests {
         // A too-short payload is ignored (no panic, no change).
         apply_move_item(&mut gs, &[0u8; 4]);
         assert_eq!(gs.inventory.iter().find(|i| i.slot == 14).map(|i| i.idfile.as_str()), Some("IT63"));
+
+        // A REAL 28-byte inbound wire MoveItem_Struct (server sends these on trade/autostack/resync)
+        // is dispatched through the same apply_packet and reaches this handler — it must be IGNORED,
+        // not decoded as (from=0, to=garbage), which would relocate slot 0 and corrupt inventory.
+        gs.inventory.push(crate::game_state::InvItem {
+            slot: 0, item_id: 1234, name: "Charm".into(), ..Default::default()
+        });
+        // Mirror a real Worn/Normal wire move: from_slot = Type(0)|Unknown02(0) → first 4 bytes 0;
+        // to_slot = Slot|SubIndex(-1) → a large garbage i32 (bytes 6..8 = 0xFFFF). Decoding this as
+        // (from=0, to=garbage) is exactly what would relocate slot 0 without the exact-length guard.
+        let mut wire = [0u8; 28]; // MoveItem_Struct: from_slot(12) + to_slot(12) + number_in_stack(4)
+        wire[6] = 0xFF; wire[7] = 0xFF; // to_slot SubIndex = -1 → `to` is nonzero garbage
+        apply_move_item(&mut gs, &wire);
+        assert!(gs.inventory.iter().any(|i| i.slot == 0 && i.name == "Charm"),
+            "28-byte inbound wire MoveItem must be ignored — slot 0 must not be relocated");
+        assert_eq!(gs.inventory.iter().find(|i| i.slot == 14).map(|i| i.idfile.as_str()), Some("IT63"),
+            "the equipped weapon is untouched by the ignored wire packet");
     }
 
     #[test]
