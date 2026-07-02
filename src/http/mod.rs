@@ -130,9 +130,11 @@ pub type GroupMakeLeaderReq = Arc<Mutex<Option<String>>>;
 ///   Some(id) → cross to a specific destination zone id.
 pub type ZoneCrossReq = Arc<Mutex<Option<u16>>>;
 
-/// NPC name to hail, set by POST /v1/interact/hail; the nav thread reads it once and sends a
-/// "Hail, <name>" say packet so the NPC fires its hail/quest script.
-pub type HailReq = Arc<Mutex<Option<String>>>;
+/// A hail request set by POST /v1/interact/hail: the NPC's display name (for the "Hail, <name>"
+/// say text) plus its `spawn_id` when known. The nav thread targets the NPC (`spawn_id`) BEFORE
+/// saying, because the server only fires an NPC's `EVENT_SAY` on the player's current target
+/// (client.cpp: `Mob* t = GetTarget()`), so a hail without a target is silently ignored (#130).
+pub type HailReq = Arc<Mutex<Option<(String, Option<u32>)>>>;
 
 /// Arbitrary Say-channel text, set by POST /v1/interact/say or a HUD button/keyword; the nav thread
 /// reads it once and sends it on the Say channel (used for quest keyword follow-ups).
