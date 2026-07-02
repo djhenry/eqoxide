@@ -1166,11 +1166,21 @@ impl App {
             // the /goto planner tracks progress against. Without this per-frame publish the view stays
             // frozen at the spawn position (set once at camera-init): the planner sees no progress,
             // skips every waypoint, and keeps driving the controller into a wall.
-            if let Ok(mut v) = self.controller_view.lock() {
-                v.pos = cpos;
-                v.heading = self.heading_target;
-                v.moving = intent.wish_dir[0] != 0.0 || intent.wish_dir[1] != 0.0 || !self.on_ground;
-                v.initialized = true;
+            //
+            // Only publish once the controller has been seeded at the real spawn (camera-init). This
+            // block runs every frame from the first — before camera-init, the controller isn't stepped
+            // (see above) and `cpos` is its default ORIGIN. Publishing that would mark the view
+            // `initialized` at (0,0,0), so the nav streamer sends a (0,0,0) OP_ClientUpdate before the
+            // real spawn position is known — a 600+ unit jump the server flags as an MQWarp and then
+            // corrects. Gating on `camera_initialized` lets the camera-init block do the first publish
+            // with the real spawn position instead (#133).
+            if self.camera_initialized {
+                if let Ok(mut v) = self.controller_view.lock() {
+                    v.pos = cpos;
+                    v.heading = self.heading_target;
+                    v.moving = intent.wish_dir[0] != 0.0 || intent.wish_dir[1] != 0.0 || !self.on_ground;
+                    v.initialized = true;
+                }
             }
         }
 
