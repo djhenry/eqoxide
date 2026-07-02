@@ -105,12 +105,25 @@ See `http-api.md` for both the port-discovery convention and the `/v1/lifecycle/
 ## Build + Verify Loop
 
 1. Make a code change
-2. `cargo build --release` (or `cargo test` first)
+2. `./build.sh` (or `cargo build --release`; run `cargo test` first if useful)
 3. `dev-run.sh` detects the new binary and restarts the client within ~4 seconds
 4. `curl "http://127.0.0.1:$PORT/v1/observe/frame" -o /tmp/frame.png` to capture the current screen
    (`PORT` from the `API_PORT=` line — see *API Port Discovery* above; single-instance dev
    defaults to 8765)
 5. Read `/tmp/frame.png` with the image viewer or the `Read` tool to inspect visually
+
+### Build politely when the game is running (`./build.sh`)
+
+The EQEmu server, its zones, and any eqoxide clients share this box with your rebuilds. A full
+`cargo build --release` pegs every core, and the load spike can be high enough that the server's
+CLE subsystem drops connected clients as **linkdead** — a storm of `rustc` processes has taken
+down a live group mid-play (#151).
+
+**`./build.sh`** wraps `cargo build --release` in `nice -n 19 ionice -c3` and leaves one core
+free (`-j $(nproc)-1`), so a rebuild yields CPU/IO to the live game instead of starving it. Prefer
+it (or `nice -n 19 ionice -c3 cargo build --release`) any time a server/clients are running —
+this is the recommended default for automation and agents. It falls back to a plain build if
+`nice`/`ionice` aren't available, and passes extra args straight through (`./build.sh --bin render_model`).
 
 ---
 
