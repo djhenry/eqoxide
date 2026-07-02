@@ -1082,6 +1082,42 @@ impl Collision {
                     }
                 }
 
+                // WATER ASCENT: the reverse of the descent — if THIS column is submerged
+                // (water above the current floor), the character can swim up to the surface
+                // and haul out onto a neighbor floor at or below surface + STEP_H. Without
+                // this, flooded pits (qeynos2's moat) are one-way traps: descent gets you in,
+                // and the normal climb's chest ray hits the pit wall on the way out.
+                if let Some(water) = &self.water {
+                    let submerged = (0..=3).any(|k| water.is_water(a[0], a[1], cz + 2.0 + k as f32 * 4.0));
+                    if submerged {
+                        // Top of the contiguous water column above the current floor.
+                        let mut surface = cz;
+                        while surface - cz < 200.0 && water.is_water(a[0], a[1], surface + 2.0) {
+                            surface += 2.0;
+                        }
+                        for nf in self.column_floors(b[0], b[1], surface, STEP_H, surface - cz) {
+                            if nf <= cz + 1.0 { continue; }           // ascents only
+                            if nf > surface + STEP_H { continue; }    // too high to haul out
+                            let nkey = (nc, nr, qf(nf));
+                            if closed.contains(&nkey) { continue; }
+                            // Swim at the surface, then the usual chest clearance for the
+                            // step out — the ray starts at swim height, so it passes over
+                            // the pit lip that blocks the ground-level climb ray.
+                            let ray_z = surface.max(nf - STEP_H);
+                            if !self.path_clear([a[0], a[1], ray_z + CHEST], [b[0], b[1], nf + CHEST], radius) { continue; }
+                            let step = (((dc * dc + dr * dr) as f32).sqrt()) * cell + (nf - cz) * 0.5
+                                + aggro_cost(b[0], b[1]);
+                            let tentative = g_cur + step;
+                            if tentative < *g_score.get(&nkey).unwrap_or(&f32::MAX) {
+                                g_score.insert(nkey, tentative);
+                                came.insert(nkey, ckey);
+                                floor_of.insert(nkey, nf);
+                                heap.push(Node { f: tentative + h(nc, nr), c: nc, r: nr, fz: nf });
+                            }
+                        }
+                    }
+                }
+
                 // CONTROLLED FALL: step off a ledge / through a hole and fall to the floor below.
                 // Allowed when (a) you can move horizontally off the edge at your CURRENT height (open
                 // air beyond the ledge reads as clear), and (b) there's a landing floor within
@@ -1201,6 +1237,43 @@ mod door_glb_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A flooded pit must be exitable by SWIMMING UP: pit floor at z=0, a cliff wall
+    /// up to the bank at z=10, water filling the pit to z=9. Without water the chest
+    /// ray for the climb crosses the cliff face and the pit is sealed (qeynos2 moat,
+    /// asset-server#14 / eqoxide#2 Case B). With water, A* must swim to the surface
+    /// and haul out onto the bank.
+    #[test]
+    fn find_path_swims_up_out_of_a_flooded_pit() {
+        let mesh = |positions: Vec<[f32; 3]>| MeshData {
+            positions, normals: vec![], uvs: vec![],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        // EQ WLD pos = [north, height, east].
+        let pit_floor = mesh(vec![[0.0, 0.0, 0.0], [0.0, 0.0, 24.0], [24.0, 0.0, 24.0], [24.0, 0.0, 0.0]]);
+        let cliff     = mesh(vec![[0.0, 0.0, 24.0], [24.0, 0.0, 24.0], [24.0, 10.0, 24.0], [0.0, 10.0, 24.0]]);
+        let bank      = mesh(vec![[0.0, 10.0, 24.0], [0.0, 10.0, 48.0], [24.0, 10.0, 48.0], [24.0, 10.0, 24.0]]);
+        let assets = ZoneAssets { terrain: vec![pit_floor, cliff, bank], objects: vec![], textures: vec![] };
+
+        let start = [8.0, 12.0, 0.0];   // pit floor
+        let goal  = [40.0, 12.0, 10.0]; // bank
+
+        // Dry pit: sealed — the climb's chest ray crosses the cliff face.
+        let dry = Collision::build(&assets, 4.0);
+        assert!(dry.find_path(start, goal, 1.0, &[]).is_none(),
+            "dry pit should be sealed (no walkable exit)");
+
+        // Flooded to z=9: swim up and haul out onto the bank.
+        let mut wet = Collision::build(&assets, 4.0);
+        wet.set_water(Some(std::sync::Arc::new(crate::water_map::WaterMap::flat_below(9.0))));
+        let path = wet.find_path(start, goal, 1.0, &[]);
+        assert!(path.is_some(), "flooded pit must be exitable by swimming up to the bank");
+        let last = *path.unwrap().last().unwrap();
+        assert!((last[0] - goal[0]).abs() < 8.0 && (last[1] - goal[1]).abs() < 8.0,
+            "path should end at the bank goal, got {last:?}");
+    }
 
     /// A single horizontal floor quad + one vertical wall: the floor raycast must
     /// return the floor height (not the wall), and a ray crossing the wall must hit.
@@ -1457,7 +1530,11 @@ mod tests {
     fn diagnose_qeynos2_stall() {
         let p = std::env::var("ZONE_GLB").expect("set ZONE_GLB to the cached qeynos2 glb");
         let za = ZoneAssets::from_glb(std::path::Path::new(&p)).unwrap();
-        let col = Collision::build(&za, 32.0);
+        let mut col = Collision::build(&za, 32.0);
+        // Attach the zone's water map like production does (app.rs) — the earlier run of
+        // this diagnostic skipped it and mis-reported the moat as having no water volume.
+        let wtr_dir = std::path::Path::new(&p).parent().unwrap().join("maps/water");
+        col.set_water(crate::water_map::WaterMap::load(&wtr_dir, "qeynos2").map(std::sync::Arc::new));
         eprintln!("collision: from_collision_mesh={} grid {}x{} cell={} origin={:?}",
             col.from_collision_mesh, col.cols, col.rows, col.cell_size, col.origin);
 
@@ -1491,14 +1568,14 @@ mod tests {
         // Case A — street-level corner wedge (Kessen). Both reported goals.
         probe("A1 corner-wedge 145u south", [256.4, 324.9, 0.0], [254.0, 180.0, 0.0]);
         probe("A2 corner-wedge 28u NE",     [256.4, 324.9, 0.0], [276.0, 305.0, 0.0]);
-        // Case B — the char is in the qeynos2 moat at z=-16. find_path returns NONE, but that is
-        // CORRECT here: the moat floor is traversable (a route to another moat point succeeds) yet
-        // the moat is a SEALED PIT in this collision — bounded by a wall taller than a walkable step
-        // (path_clear blocks the climb) with void beyond it up to the street, and the zone carries
-        // NO water volume, so it isn't swimmable either. There is no walkable exit for find_path to
-        // find. This is an asset/collision gap (the moat should be swimmable water with exits), not
-        // a pathing defect — see the moat→street probes below and the note on #2.
-        probe("B moat (sealed pit — NONE is correct)", [-502.3, -141.3, -16.0], [-600.0, -141.0, -5.0]);
+        // Case B — the char is in the qeynos2 moat at z=-16. The earlier "sealed pit / no water
+        // volume" verdict was wrong on both counts: the zone DOES have water (delivered via
+        // maps/water/qeynos2.wtr — this diagnostic just never attached it), and with the WATER
+        // ASCENT nav edge the moat is exitable: swim up at the south end and haul out onto the
+        // z=+1 bank (see B2), from which the city center is reachable (B5/B7). The original
+        // street goal below still probes NONE because that west-gate strip is disconnected from
+        // the city center even street→street (B6) — an unreachable GOAL, not a moat problem.
+        probe("B moat → west-gate street (goal itself disconnected, see B6)", [-502.3, -141.3, -16.0], [-600.0, -141.0, -5.0]);
         let within = col.find_path([-502.3, -141.3, -16.0], [-490.0, -100.0, -16.0], crate::movement::PLAYER_RADIUS, &[]);
         eprintln!("  moat floor traversable (start → 40u north @z=-16): {}",
             within.map(|p| format!("{} waypoints", p.len())).unwrap_or_else(|| "NONE".into()));
@@ -1508,6 +1585,45 @@ mod tests {
                 r.map(|p| format!("{} waypoints", p.len())).unwrap_or_else(|| "NONE".into()));
         }
         eprintln!("  zone has a water volume: {}", col.water.is_some());
+
+        // Moat exit scan: walk the whole moat water region and report every column where a
+        // haul-out is geometrically possible (a neighbor floor within STEP_H of the water
+        // surface and a clear chest ray from swim height). If this prints nothing, the
+        // collision genuinely has no exit and the swim-up nav edge can't help.
+        if let Some(w) = col.water.clone() {
+            let mut found = 0;
+            let mut y = -260.0f32;
+            while y < -20.0 {
+                let mut x = -520.0f32;
+                while x < -420.0 {
+                    if w.is_water(x, y, -11.0) {
+                        let mut surface = -16.0f32;
+                        while surface < 40.0 && w.is_water(x, y, surface + 2.0) { surface += 2.0; }
+                        for (dx, dy) in [(-8.0f32,0.0),(8.0,0.0),(0.0,-8.0),(0.0,8.0),(-8.0,-8.0),(8.0,8.0),(-8.0,8.0),(8.0,-8.0)] {
+                            let (bx, by) = (x + dx, y + dy);
+                            for nf in col.column_floors(bx, by, surface, 20.0, 4.0) {
+                                if nf > surface + 20.0 || nf <= -15.0 { continue; }
+                                let ray_z = surface.max(nf - 20.0);
+                                if col.path_clear([x, y, ray_z + 3.0], [bx, by, nf + 3.0], crate::movement::PLAYER_RADIUS) {
+                                    eprintln!("  EXIT candidate: swim ({x:.0},{y:.0}) surface {surface:.1} -> floor {nf:.1} at ({bx:.0},{by:.0})");
+                                    found += 1;
+                                }
+                            }
+                        }
+                    }
+                    x += 8.0;
+                }
+                y += 8.0;
+            }
+            eprintln!("  moat exit candidates: {found}");
+        }
+        // Route segments: can A* reach the SE-bank exit, and does the bank connect onward?
+        probe("B2 moat → SE bank (swim-up exit)", [-502.3, -141.3, -16.0], [-488.0, -244.0, 1.0]);
+        probe("B3 SE bank → west street",         [-488.0, -244.0, 1.0],   [-600.0, -141.0, -8.0]);
+        probe("B4 moat floor → SE moat water",    [-502.3, -141.3, -16.0], [-488.0, -236.0, -14.0]);
+        probe("B5 SE bank → city center",         [-488.0, -244.0, 1.0],   [0.0, 0.0, 3.0]);
+        probe("B6 west street → city center",     [-600.0, -141.0, -8.0],  [0.0, 0.0, 3.0]);
+        probe("B7 moat → city center",            [-502.3, -141.3, -16.0], [0.0, 0.0, 3.0]);
     }
 
     #[test]
