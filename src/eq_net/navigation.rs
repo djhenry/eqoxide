@@ -21,6 +21,29 @@ use crate::movement::MoveIntent;
 const POS_SEND_MOVING_MS: u128 = 280;
 /// Forced keepalive interval (ms) when idle (native `0x514` = 1300 ms).
 const POS_SEND_KEEPALIVE_MS: u128 = 1300;
+/// Interval (ms) between OP_FloatListThing (movement-history) sends. The server's MQGhost detector
+/// (`cheat_manager.cpp`) trips ~70s after movement if this packet never arrives, then re-flags on
+/// every movement check. Sending one benign entry every 30s keeps the 70s timer alive (eqoxide#105).
+const MOVEMENT_HISTORY_MS: u128 = 30_000;
+
+/// Build a RoF2 OP_FloatListThing payload: one `UpdateMovementEntry` (packed, 17 bytes) at the given
+/// server position. `type = Collision` (1) is a normal move — it resets the server's movement-history
+/// timer without tripping the TeleportA/ZoneLine special-cases in `ProcessMovementHistory`. Field
+/// order matches EQEmu `UpdateMovementEntry`: Y(f32)@0, X(f32)@4, Z(f32)@8, type(u8)@12, ts(u32)@13.
+pub fn build_movement_history(x: f32, y: f32, z: f32) -> Vec<u8> {
+    const TYPE_COLLISION: u8 = 1; // UpdateMovementType::Collision — benign, skips warp/zoneline checks
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u32)
+        .unwrap_or(0);
+    let mut b = Vec::with_capacity(17);
+    b.extend_from_slice(&y.to_le_bytes()); // Y @0 (server north)
+    b.extend_from_slice(&x.to_le_bytes()); // X @4 (server east)
+    b.extend_from_slice(&z.to_le_bytes()); // Z @8
+    b.push(TYPE_COLLISION);                // type @12
+    b.extend_from_slice(&ts.to_le_bytes()); // timestamp @13
+    b
+}
 /// A >12u jump in the network gs player position between ticks that we did NOT stream is a genuine
 /// server correction (anti-cheat snap / teleport), handed to the render controller to apply.
 const CORRECTION_SQ: f32 = 144.0;
@@ -524,6 +547,8 @@ pub struct Navigator {
     controller_view:  ControllerShared,
     nav_intent:       NavIntent,
     pos_correction:   PosCorrection,
+    /// Last time we sent OP_FloatListThing (movement history) — the anti-MQGhost keepalive (#105).
+    last_movement_history_send: Instant,
     /// Last position we streamed, and the last-send timestamp (for the 280 ms / 1300 ms cadence).
     last_streamed:    [f32; 3],
     last_pos_send:    Instant,
@@ -648,6 +673,7 @@ impl Navigator {
             pos_correction,
             last_streamed: [0.0, 0.0, 0.0],
             last_pos_send: Instant::now(),
+            last_movement_history_send: Instant::now(),
             streamed_init: false,
         }
     }
@@ -702,7 +728,10 @@ impl Navigator {
                 gs.entities.values().find(|e| e.name == m.name).map(|e| e.hp_pct).unwrap_or(0.0)
             };
             crate::http::GroupMemberView {
-                name: m.name.clone(), level: m.level, is_leader: m.is_leader, is_merc: m.is_merc,
+                // m.level from OP_GroupUpdateB is a server placeholder (70/65); resolve the real
+                // level from our profile / the member's spawn instead. (eqoxide#104)
+                name: m.name.clone(), level: gs.group_member_level(&m.name),
+                is_leader: m.is_leader, is_merc: m.is_merc,
                 tank: m.tank, assist: m.assist, puller: m.puller, offline: m.offline, hp_pct,
             }
         }).collect();
@@ -1749,6 +1778,13 @@ impl Navigator {
         let view = *self.controller_view.lock().unwrap();
         // Don't stream/mirror until the render controller has spawned (else we'd push origin).
         if !view.initialized { return; }
+        // Anti-MQGhost keepalive (#105): send a movement-history entry every 30s (< the server's 70s
+        // window) whether or not we're moving, so the server's CheatManager never false-flags us.
+        if self.last_movement_history_send.elapsed().as_millis() >= MOVEMENT_HISTORY_MS {
+            stream.send_app_packet(OP_FLOAT_LIST_THING,
+                &build_movement_history(view.pos[0], view.pos[1], view.pos[2]));
+            self.last_movement_history_send = Instant::now();
+        }
         // A controlled fall owns the Z descent + fall-damage; let it stream, don't fight it here.
         if self.falling.is_some() { return; }
         let gp = [gs.player_x, gs.player_y, gs.player_z];
@@ -2139,6 +2175,18 @@ mod tests {
         assert_eq!(b.len(), 8);
         assert_eq!(&b[0..4], &0x1122u32.to_le_bytes());
         assert_eq!(&b[4..8], &0x3344u32.to_le_bytes());
+    }
+
+    #[test]
+    fn build_movement_history_layout() {
+        // EQEmu UpdateMovementEntry is a packed 17-byte struct: Y@0, X@4, Z@8, type@12, ts@13.
+        // Must be >= sizeof(UpdateMovementEntry) or the server debug-logs + ignores it (#105).
+        let p = build_movement_history(10.0, -20.0, 3.5);
+        assert_eq!(p.len(), 17, "UpdateMovementEntry is 17 packed bytes");
+        assert_eq!(&p[0..4], &(-20.0f32).to_le_bytes(), "Y field @0 = server north");
+        assert_eq!(&p[4..8], &(10.0f32).to_le_bytes(), "X field @4 = server east");
+        assert_eq!(&p[8..12], &(3.5f32).to_le_bytes(), "Z field @8");
+        assert_eq!(p[12], 1, "type = Collision (benign; skips warp/zoneline cheat checks)");
     }
 
     #[test]

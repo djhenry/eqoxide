@@ -305,12 +305,16 @@ fn apply_group_update_b(gs: &mut GameState, p: &[u8]) {
     gs.log_msg("group", "Group roster updated");
 }
 
-/// OP_GroupUpdate — an incremental "member joined" notice to existing members. GroupJoin_Struct:
-/// owner_name(cstr), membername(cstr), merc(u8), padding[3], level(u32), unknown[12].
+/// OP_GroupUpdate — an incremental "member joined" notice sent to EVERY existing member (EQEmu
+/// `Group::AddMember` queues it to all slots). RoF2 `GroupJoin_Struct` (148 bytes) uses FIXED-width
+/// char arrays, NOT NUL-terminated variable fields: owner_name[64]@0, membername[64]@64, merc u8@128,
+/// padding[3]@129, level u32@132, unknown[12]@136. Reading the names as sequential `rd_cstr` (as
+/// before) advanced only past owner_name's NUL — landing inside the zero padding — so membername came
+/// back EMPTY and the append was skipped, leaving existing members blind to later joiners (#101).
 fn apply_group_join(gs: &mut GameState, p: &[u8]) {
     let mut o = 0usize;
-    let _owner_name = rd_cstr(p, &mut o);
-    let member_name = rd_cstr(p, &mut o);
+    let _owner_name = rd_fixed_cstr(p, &mut o, 64);
+    let member_name = rd_fixed_cstr(p, &mut o, 64);
     let is_merc = rd_u8(p, &mut o) != 0;
     o += 3; // padding
     let level = rd_u32(p, &mut o);
@@ -2913,14 +2917,15 @@ mod tests {
         assert!(gs.group_members.iter().all(|m| m.name.is_empty()) || gs.group_members.len() <= 5);
     }
 
+    // Build the REAL RoF2 GroupJoin_Struct wire (148 bytes): fixed char[64] name fields, not cstrs.
     fn build_group_join(owner: &str, member: &str, level: u32) -> Vec<u8> {
-        let mut p = Vec::new();
-        p.extend_from_slice(owner.as_bytes()); p.push(0);
-        p.extend_from_slice(member.as_bytes()); p.push(0);
-        p.push(0); // merc u8
-        p.extend_from_slice(&[0u8; 3]); // padding
-        p.extend_from_slice(&level.to_le_bytes());
-        p.extend_from_slice(&[0u8; 12]); // unknown
+        let mut p = vec![0u8; 148];
+        let o = owner.as_bytes();
+        p[0..o.len().min(63)].copy_from_slice(&o[..o.len().min(63)]);   // owner_name[64] @ 0
+        let m = member.as_bytes();
+        p[64..64 + m.len().min(63)].copy_from_slice(&m[..m.len().min(63)]); // membername[64] @ 64
+        // merc @128 = 0; padding @129..132; level @132
+        p[132..136].copy_from_slice(&level.to_le_bytes());
         p
     }
 
@@ -2933,6 +2938,24 @@ mod tests {
         assert_eq!(gs.group_members.len(), 1);
         assert_eq!(gs.group_members[0].name, "Sariel");
         assert_eq!(gs.group_members[0].level, 8);
+    }
+
+    #[test]
+    fn existing_member_learns_about_a_later_joiner() {
+        // The #101 desync: an already-present member (Elaria, who joined with a {Sylvaris, Elaria}
+        // roster) receives OP_GroupUpdate when Fenwick joins later. With the fixed-offset parse she
+        // must append Fenwick; the old sequential-cstr parse read an empty name and dropped it,
+        // leaving her blind to everyone who joined after her.
+        let mut gs = GameState::new();
+        gs.group_members = vec![
+            crate::game_state::GroupMember { name: "Sylvaris".into(), is_leader: true, ..Default::default() },
+            crate::game_state::GroupMember { name: "Elaria".into(), ..Default::default() },
+        ];
+        apply_group_join(&mut gs, &build_group_join("Sylvaris", "Fenwick", 12));
+        let names: Vec<_> = gs.group_members.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"Fenwick"), "existing member must learn the later joiner: {names:?}");
+        assert_eq!(gs.group_members.len(), 3);
+        assert_eq!(gs.group_members.iter().find(|m| m.name == "Fenwick").unwrap().level, 12);
     }
 
     fn fixed_name_pair(name1: &str, name2: &str) -> Vec<u8> {

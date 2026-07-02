@@ -784,6 +784,7 @@ impl App {
             let pos = if self.camera_initialized { self.controller.pos } else { [gs.player_x, gs.player_y, gs.player_z] };
             let h_cw = crate::eq_net::protocol::ccw_to_cw(gs.player_heading);
             *self.player_info.lock().unwrap() = crate::http::PlayerState {
+                name:       gs.player_name.clone(),
                 zone:       gs.zone_name.clone(),
                 race:       gs.player_race.clone(),
                 class:      gs.player_class.clone(),
@@ -895,6 +896,16 @@ impl App {
                 // an NPC moves between update packets).
                 if b.action == "idle" && m.speed > 0.5 && d > 1e-4 {
                     b.action = "walking".to_string();
+                }
+
+                // Face the direction of travel while moving, exactly like the player does. The
+                // server `heading` field is stale between the sparse position updates and often
+                // points ~180° from the glide vector, so rendering it verbatim made moving NPCs
+                // appear to walk backwards. Derive heading (degrees, 0=north) from the glide delta
+                // `to` (east=to[0], north=to[1]); when stopped, keep the authoritative server
+                // heading (b.heading is refreshed from the entity each frame). (eqoxide#106)
+                if d > 0.1 && m.speed > 0.5 {
+                    b.heading = (-to[0]).atan2(to[1]).to_degrees().rem_euclid(360.0);
                 }
             }
         }

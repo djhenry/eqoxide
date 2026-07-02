@@ -30,6 +30,7 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let player = s.player_info.lock().unwrap().clone();
     Json(serde_json::json!({
         "player": {
+            "name":       player.name,
             "zone":       player.zone,
             "race":       player.race,
             "class":      player.class,
