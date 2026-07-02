@@ -858,9 +858,101 @@ pub fn character_model_key(race: &str, gender: u8) -> (&'static str, u8) {
     }
 }
 
+/// IT model ids whose geometry is a shield, derived from the PEQ `items` table by
+/// vote per idfile (`SUM(itemtype=8) > SUM(itemtype IN weapon-types)`) — stray
+/// mislabeled rows share weapon idfiles (IT7 has one "shield" morningstar), and
+/// misc items (potions) share shield idfiles (IT200), so neither a plain
+/// `itemtype=8` set nor an all-rows majority is right. Sorted for binary search. IT200-228 are the classic
+/// shield models; the rest are Luclin+ ranges.
+const SHIELD_IT_IDS: &[u32] = &[
+    48, 67, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209,
+    210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221,
+    222, 223, 224, 225, 226, 228, 10530, 10531, 10532, 10535, 10536, 10537,
+    10538, 10540, 10542, 10543, 10544, 10611, 10645, 10646, 10664, 10665, 10668, 10669,
+    10670, 10671, 10691, 10697, 10729, 10730, 10738, 10754, 10772, 10775, 10781, 10790,
+    10826, 10827, 10832, 10833, 10843, 10849, 10850, 10857, 10858, 10960, 10961, 10963,
+    10964, 10965, 10969, 10970, 10971, 10973, 10976, 10977, 10978, 10979, 10980, 10982,
+    10983, 10984, 10985, 10986, 10987, 10988, 10989, 10990, 10991, 10992, 10993, 10994,
+    10995, 10996, 11001, 11002, 11003, 11013, 11017, 11018, 11019, 11020, 11048, 11049,
+    11085, 11086, 11102, 11103, 11110, 11111, 11142, 11143, 11144, 11145, 11183, 11185,
+    11188, 11189, 11190, 11191, 11220, 11224, 11341, 11410, 11440, 11442, 11443, 11452,
+    11460, 11469, 11478, 11486, 11490, 11491, 11492, 11493, 11494, 11495, 11496, 11497,
+    11531, 11588, 11596, 11704, 11705, 11706, 11729, 11732, 11733, 11758, 11759, 11760,
+    11783, 11786, 11787, 11797, 11872, 11873, 11874, 11875, 12143, 12144, 12145, 12146,
+    12183, 12184, 12185, 12186, 12201, 12202, 12217, 12218, 12232, 12233, 12247, 12248,
+    12390, 12391, 12400, 12406, 12412, 12428, 12447, 12455, 12461, 12467, 12483, 12573,
+    12584, 12595, 12606, 12640, 12641, 12642, 12667, 12668, 12669, 12696, 12697, 12698,
+    12723, 12724, 12749, 12750, 12751, 12776, 12777, 12778, 14000, 60123, 60135, 60136,
+    60139, 60142, 60143, 60144, 60145, 60146, 60327, 60328, 60329, 60340, 67367, 67918,
+    67919, 67939, 99251, 99252, 99253, 99276, 99277, 99278, 101025, 101037
+];
+
+/// Whether an IT model id is a shield (drives the off-hand attach bone).
+pub fn is_shield_it(it_id: u32) -> bool {
+    SHIELD_IT_IDS.binary_search(&it_id).is_ok()
+}
+
+/// Attach bone for the player's secondary-hand item, from its IDFile string
+/// ("IT210"): shields mount on the forearm SHIELD_POINT, everything else is
+/// gripped at L_POINT (also the fallback for unparseable idfiles).
+pub fn secondary_attach_bone(idfile: &str) -> &'static str {
+    let it_id = idfile.trim().trim_start_matches(['I', 'T', 'i', 't']).parse::<u32>().unwrap_or(0);
+    if is_shield_it(it_id) { "SHIELD_POINT" } else { "L_POINT" }
+}
+
+/// Held-item model keys + attach bones for a spawn's equipment array (wire slots:
+/// primary=7, secondary=8). Spawn equipment carries the held model's numeric IT id
+/// (`d_melee_texture_*` server-side); 0 = empty hand. Keys match the UPPERCASE
+/// IDFile keys of `weapons.glb` ("IT7", "IT10649", …). Off-hand shields mount at
+/// SHIELD_POINT; anything else is gripped. Dead entities show no held items — the
+/// corpse pose has no meaningful hand attachment.
+pub fn held_item_keys(equipment: &[u32; 9], dead: bool) -> [Option<(String, &'static str)>; 2] {
+    if dead { return [None, None]; }
+    let key = |n: u32, bone: &'static str| (n != 0).then(|| (format!("IT{n}"), bone));
+    let sec_bone = if is_shield_it(equipment[8]) { "SHIELD_POINT" } else { "L_POINT" };
+    [key(equipment[7], "R_POINT"), key(equipment[8], sec_bone)]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn held_item_keys_map_wire_slots_and_skip_dead() {
+        let mut eq = [0u32; 9];
+        eq[7] = 10649;
+        eq[8] = 7;
+        assert_eq!(held_item_keys(&eq, false),
+                   [Some(("IT10649".into(), "R_POINT")), Some(("IT7".into(), "L_POINT"))]);
+        assert_eq!(held_item_keys(&eq, true), [None, None]);
+        assert_eq!(held_item_keys(&[0; 9], false), [None, None]);
+    }
+
+    #[test]
+    fn shields_route_to_shield_point() {
+        // IT200-228 are the classic shield models; IT7 (mace) and IT10649 (short
+        // sword) are weapons even though stray mislabeled DB rows share the ids.
+        assert!(is_shield_it(200));
+        assert!(is_shield_it(228));
+        assert!(is_shield_it(11085));
+        assert!(!is_shield_it(7));
+        assert!(!is_shield_it(10649));
+        assert!(!is_shield_it(0));
+
+        // A shield in the secondary slot attaches at SHIELD_POINT; primary never does
+        // (even holding a shield model there — the real client only shield-mounts
+        // the off hand).
+        let mut eq = [0u32; 9];
+        eq[7] = 200;
+        eq[8] = 210;
+        assert_eq!(held_item_keys(&eq, false),
+                   [Some(("IT200".into(), "R_POINT")), Some(("IT210".into(), "SHIELD_POINT"))]);
+
+        // Player-side idfile strings resolve the same way.
+        assert_eq!(secondary_attach_bone("IT210"), "SHIELD_POINT");
+        assert_eq!(secondary_attach_bone("IT7"), "L_POINT");
+        assert_eq!(secondary_attach_bone("garbage"), "L_POINT");
+    }
 
     #[test]
     fn load_returns_err_on_missing_file() {
