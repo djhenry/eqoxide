@@ -26,6 +26,18 @@ pub struct WaterMap {
 }
 
 impl WaterMap {
+    /// Test-only: a map where everything below `top_z` is water (two-leaf BSP split on z).
+    /// Lets nav tests exercise swim edges without a real `.wtr` file.
+    #[cfg(test)]
+    pub fn flat_below(top_z: f32) -> WaterMap {
+        WaterMap { nodes: vec![
+            // node 1: dist = z - top_z; above → leaf 2 (dry), below → leaf 3 (water)
+            BspNode { normal: [0.0, 0.0, 1.0], split: -top_z, special: 0, left: 2, right: 3 },
+            BspNode { normal: [0.0; 3], split: 0.0, special: 0, left: 0, right: 0 },
+            BspNode { normal: [0.0; 3], split: 0.0, special: 1, left: 0, right: 0 },
+        ]}
+    }
+
     /// Load `<dir>/<zone>.wtr` (v1 BSP). Returns None if missing or unparseable (nav then just
     /// behaves as before — no water descents).
     pub fn load(dir: &Path, zone: &str) -> Option<WaterMap> {
