@@ -212,6 +212,23 @@ pub struct GroupMember {
     pub offline: bool,
 }
 
+/// One clickable NPC-dialogue choice parsed from a saylink embedded in an NPC message.
+///
+/// EQ NPCs offer interactive choices as "saylinks" — links woven into their dialogue text (the
+/// server auto-injects one for any `[bracketed]` phrase). Clicking a saylink does NOT send its
+/// text; it sends `OP_ItemLinkClick` carrying the link's ids, and the server resolves the phrase
+/// from its `saylink` table and processes it as if the player said it to the NPC. So a choice
+/// carries the raw link ids needed to rebuild that click packet, plus the display `text`.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct DialogueChoice {
+    /// Human-readable label shown between the link delimiters (what a player reads/clicks).
+    pub text:      String,
+    pub item_id:   u32,        // always SAYLINK_ITEM_ID (0xFFFFF) for a saylink
+    pub augments:  [u32; 6],   // augments[0]=sayid (non-silent), augments[1]=sayid (silent)
+    pub link_hash: u32,
+    pub icon:      u32,        // ornament_icon from the link body
+}
+
 /// All state the renderer needs for one frame.
 #[derive(Debug, Default, Clone)]
 pub struct GameState {
@@ -295,6 +312,12 @@ pub struct GameState {
 
     // Message log (ring buffer)
     pub messages: VecDeque<LogEntry>,
+
+    // Clickable NPC-dialogue choices from the most recent NPC message that carried saylinks
+    // (e.g. a Soulbinder's "Do you wish to [bind your soul]?"). Replaced whenever a new NPC
+    // message arrives with >=1 saylink; consumed by GET /v1/observe/dialogue, the click API, and
+    // the GUI's clickable message HUD.
+    pub dialogue_choices: Vec<DialogueChoice>,
 
     // Inter-agent chat events (tells/ooc/shout/group/gmsay) for the GET /events feed.
     pub chat_events:  VecDeque<ChatLogEvent>,

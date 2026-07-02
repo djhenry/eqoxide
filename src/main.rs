@@ -210,6 +210,8 @@ OPTIONS:
     let door_click:       http::DoorClickReq    = Arc::new(Mutex::new(None));
     let doors_shared:     http::DoorsShared     = Arc::new(Mutex::new(Vec::new()));
     let messages:         http::MessagesShared  = Arc::new(Mutex::new(Vec::new()));
+    let dialogue:         http::DialogueShared   = Arc::new(Mutex::new(Vec::new()));
+    let dialogue_click:   http::DialogueClickReq = Arc::new(Mutex::new(None));
     let chat_events:      http::ChatEventsShared = Arc::new(Mutex::new(Vec::new()));
     let chat_send:        http::ChatSendShared   = Arc::new(Mutex::new(Vec::new()));
     let cast:             http::CastReq         = Arc::new(Mutex::new(None));
@@ -275,6 +277,8 @@ OPTIONS:
         let dc  = door_click.clone();
         let ds  = doors_shared.clone();
         let mg  = messages.clone();
+        let dlg = dialogue.clone();
+        let dcl = dialogue_click.clone();
         let cev = chat_events.clone();
         let csd = chat_send.clone();
         let ca  = cast.clone();
@@ -292,7 +296,7 @@ OPTIONS:
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, cev, csd, ca, ms, st, co, sc, md, sd, cp, cu, cv, ni, pc).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, sc, md, sd, cp, cu, cv, ni, pc).await {
                     tracing::error!("EQ: fatal: {e}");
                 }
             });
@@ -303,6 +307,7 @@ OPTIONS:
     let app_goto = goto_target.clone();
     let app_hail   = hail.clone();
     let app_say    = say.clone();
+    let app_dialogue_click = dialogue_click.clone();
     let app_target = target.clone();
     let app_attack  = attack.clone();
     let app_cast    = cast.clone();
@@ -354,6 +359,8 @@ OPTIONS:
         inventory,
         loot,
         messages,
+        dialogue,
+        dialogue_click,
         chat_events,
         chat_send,
         spells.clone(),
@@ -392,6 +399,7 @@ OPTIONS:
         app_goto,
         app_hail,
         app_say,
+        app_dialogue_click,
         app_target,
         app_attack,
         app_cast,

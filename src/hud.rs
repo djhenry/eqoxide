@@ -325,7 +325,7 @@ pub fn nearest_npc_name(scene: &SceneState) -> Option<String> {
 /// Dedicated panel for NPC dialogue (kind "npc"), e.g. quest-giver responses to a hail.
 /// Bracketed [keywords] are highlighted and clickable — clicking one says it back so the
 /// player can follow a quest conversation without typing.
-pub fn draw_quest_dialogue(ctx: &egui::Context, layout: &mut UiLayout, scene: &SceneState, say: &crate::http::SayReq) {
+pub fn draw_quest_dialogue(ctx: &egui::Context, layout: &mut UiLayout, scene: &SceneState, say: &crate::http::SayReq, dialogue_click: &crate::http::DialogueClickReq) {
     let visible: Vec<_> = scene.messages.iter()
         .filter(|m| m.kind == "npc" && m.timestamp.elapsed().as_secs() < 45)
         .collect();
@@ -345,9 +345,19 @@ pub fn draw_quest_dialogue(ctx: &egui::Context, layout: &mut UiLayout, scene: &S
                         let label = egui::Label::new(egui::RichText::new(&seg).size(13.0)
                             .strong().color(egui::Color32::from_rgb(255, 225, 90)))
                             .sense(egui::Sense::click());
-                        if ui.add(label).on_hover_text("Click to say this keyword").clicked() {
+                        if ui.add(label).on_hover_text("Click to answer the NPC").clicked() {
                             let kw = seg.trim_start_matches('[').trim_end_matches(']').to_string();
-                            *say.lock().unwrap() = Some(kw);
+                            // Prefer the proper saylink click (OP_ItemLinkClick by sayid) when this
+                            // keyword corresponds to a parsed dialogue choice — it works even for
+                            // "silent" links where the sent phrase differs from the label. Fall back
+                            // to plain Say for bracketed text that isn't an actual saylink. (#120)
+                            if let Some(choice) = scene.dialogue_choices.iter()
+                                .find(|c| c.text.eq_ignore_ascii_case(&kw))
+                            {
+                                *dialogue_click.lock().unwrap() = Some(choice.clone());
+                            } else {
+                                *say.lock().unwrap() = Some(kw);
+                            }
                         }
                     } else {
                         ui.label(egui::RichText::new(&seg).size(13.0)

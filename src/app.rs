@@ -124,6 +124,8 @@ pub struct App {
     /// Shared request slots written by HUD buttons; the nav thread drains and sends them.
     hail:         crate::http::HailReq,
     say:          crate::http::SayReq,
+    /// Written when a clickable NPC-dialogue choice (saylink) is clicked in the HUD (#120).
+    dialogue_click: crate::http::DialogueClickReq,
     target:       crate::http::TargetReq,
     attack:       crate::http::AttackReq,
     cast:         crate::http::CastReq,
@@ -237,6 +239,7 @@ impl App {
         goto_target:     crate::http::GotoTarget,
         hail:            crate::http::HailReq,
         say:             crate::http::SayReq,
+        dialogue_click:  crate::http::DialogueClickReq,
         target:          crate::http::TargetReq,
         attack:          crate::http::AttackReq,
         cast:            crate::http::CastReq,
@@ -295,7 +298,7 @@ impl App {
             controller: crate::movement::CharacterController::new([0.0, 0.0, 0.0]),
             controller_view, nav_intent, pos_correction,
             goto_target,
-            hail, say, target, attack, cast, sit, consider, buy, sell, trade, spells, door_click, say_buffer: String::new(),
+            hail, say, dialogue_click, target, attack, cast, sit, consider, buy, sell, trade, spells, door_click, say_buffer: String::new(),
             drag_active: false, last_cursor: winit::dpi::PhysicalPosition::new(0.0, 0.0),
             click_start: None,
             pick_view_proj: [
@@ -1288,7 +1291,7 @@ impl App {
             &mut self.minimap_zoom, &mut self.minimap_full, &mut self.show_map,
             self.current_fps, self.zone_map.as_ref(),
             cam_eye, self.collision.as_deref(),
-            &self.hail, &self.say, &self.target, &mut self.say_buffer,
+            &self.hail, &self.say, &self.dialogue_click, &self.target, &mut self.say_buffer,
             &self.attack, &self.cast, &self.sit, &self.consider, &self.spells,
             &self.buy, &self.sell, &self.trade,
             &self.spell_icons,
@@ -1351,6 +1354,7 @@ impl App {
         collision:     Option<&assets::Collision>,
         hail:          &crate::http::HailReq,
         say:           &crate::http::SayReq,
+        dialogue_click: &crate::http::DialogueClickReq,
         target:        &crate::http::TargetReq,
         say_buffer:    &mut String,
         attack:        &crate::http::AttackReq,
@@ -1402,7 +1406,7 @@ impl App {
             } else {
                 hud::draw_ui_menu(ctx, ui_layout);
                 hud::draw_hud(ctx, ui_layout, scene, "EQ Observer");
-                hud::draw_quest_dialogue(ctx, ui_layout, scene, say);
+                hud::draw_quest_dialogue(ctx, ui_layout, scene, say, dialogue_click);
                 hud::draw_message_log(ctx, ui_layout, scene);
                 hud::draw_labels(ctx, scene, view_proj, screen_w, screen_h, cam_eye, collision);
                 hud::draw_minimap(ctx, ui_layout, scene, zone_min, zone_max, minimap_zoom, minimap_full, zone_map, show_map);

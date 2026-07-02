@@ -91,6 +91,9 @@ pub struct SceneState {
     /// Doors to render this frame, copied from `GameState::doors`.
     pub doors: Vec<DoorRender>,
     pub messages: Vec<LogEntry>,
+    /// Clickable NPC-dialogue choices (saylinks) from the most recent NPC message, for the HUD's
+    /// clickable dialogue (#120).
+    pub dialogue_choices: Vec<crate::game_state::DialogueChoice>,
     /// Item material IDs for each equipment slot (0..9), from the player profile.
     pub player_equipment: [u32; 9],
     /// RGB tint for each equipment slot (0..9), from the player profile.
@@ -288,6 +291,7 @@ impl SceneState {
             billboards,
             doors,
             messages,
+            dialogue_choices: gs.dialogue_choices.clone(),
             player_equipment: gs.player_equipment,
             player_equipment_tint: gs.player_equipment_tint,
             inventory: gs.inventory.clone(),

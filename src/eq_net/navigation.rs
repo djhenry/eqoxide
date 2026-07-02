@@ -14,7 +14,7 @@ const RUN_SPEED: f32 = 44.0;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::{GameState, ZonePoint};
-use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, TradeCmd, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, ChatEventsShared, ChatSendShared, CastReq, MemSpellReq, SitReq, ConsiderReq, CampReq, CampCmd, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints, ControllerShared, NavIntent, PosCorrection};
+use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, TradeCmd, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, ChatEventsShared, ChatSendShared, CastReq, MemSpellReq, SitReq, ConsiderReq, CampReq, CampCmd, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints, ControllerShared, NavIntent, PosCorrection, DialogueShared, DialogueClickReq};
 use crate::movement::MoveIntent;
 
 /// Min interval (ms) between OP_ClientUpdate sends while moving (native `0x118` = 280 ms).
@@ -502,6 +502,11 @@ pub struct Navigator {
     /// Snapshot of the current zone's doors, published each tick for GET /doors.
     doors_shared:     DoorsShared,
     messages:         MessagesShared,
+    /// Snapshot of the current NPC-dialogue choices (published each tick for GET
+    /// /v1/observe/dialogue) and the pending POST /v1/interact/dialogue click request (drained
+    /// into an OP_ItemLinkClick). (#120)
+    dialogue:         DialogueShared,
+    dialogue_click:   DialogueClickReq,
     chat_events:      ChatEventsShared,
     chat_send:        ChatSendShared,
     collision:        crate::assets::SharedCollision,
@@ -589,6 +594,8 @@ impl Navigator {
         door_click:       DoorClickReq,
         doors_shared:     DoorsShared,
         messages:         MessagesShared,
+        dialogue:         DialogueShared,
+        dialogue_click:   DialogueClickReq,
         chat_events:      ChatEventsShared,
         chat_send:        ChatSendShared,
         cast:             CastReq,
@@ -644,6 +651,8 @@ impl Navigator {
             door_click,
             doors_shared,
             messages,
+            dialogue,
+            dialogue_click,
             chat_events,
             chat_send,
             collision,
@@ -764,6 +773,8 @@ impl Navigator {
             crate::http::MessageEntry { kind: m.kind.clone(), text: m.text.clone(), keywords }
         }));
         drop(out);
+        // Publish the current clickable NPC-dialogue choices (GET /v1/observe/dialogue, #120).
+        *self.dialogue.lock().unwrap() = gs.dialogue_choices.clone();
         // Publish async events (GET /v1/events/*), preserving their stable monotonic ids.
         let mut ev = self.chat_events.lock().unwrap();
         ev.clear();
@@ -1069,6 +1080,17 @@ impl Navigator {
                 stream.send_app_packet(OP_CHANNEL_MESSAGE, &pkt);
                 gs.log_msg("chat", &format!("You say, '{}'", text));
             }
+        }
+
+        // Check dialogue-click request (POST /v1/interact/dialogue, or a GUI click): "click" a
+        // parsed saylink by sending OP_ItemLinkClick with its ids. The server resolves the phrase
+        // from its saylink table and processes it as if we said it to the NPC (#120).
+        let click = self.dialogue_click.lock().unwrap().take();
+        if let Some(c) = click {
+            let pkt = build_item_link_click(c.item_id, &c.augments, c.link_hash, c.icon);
+            tracing::info!("EQ: dialogue click: '{}' (sayid={})", c.text, c.augments[0]);
+            stream.send_app_packet(OP_ITEM_LINK_CLICK, &pkt);
+            gs.log_msg("chat", &format!("You say, '{}'", c.text));
         }
 
         // Drain queued outgoing chat (POST /tell|/ooc|/shout|/group): build + send OP_ChannelMessage.
@@ -1928,6 +1950,8 @@ mod tests {
             Default::default(), // door_click
             Default::default(), // doors_shared
             Default::default(), // messages
+            Default::default(), // dialogue
+            Default::default(), // dialogue_click
             Default::default(), // chat_events
             Default::default(), // chat_send
             Default::default(), // cast

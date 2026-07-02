@@ -170,6 +170,8 @@ pub(crate) mod tests {
             inventory: Arc::new(Mutex::new(Vec::new())),
             loot: Arc::new(Mutex::new(None)),
             messages: Arc::new(Mutex::new(Vec::new())),
+            dialogue: Arc::new(Mutex::new(Vec::new())),
+            dialogue_click: Arc::new(Mutex::new(None)),
             chat_events: Arc::new(Mutex::new(Vec::new())),
             chat_send: Arc::new(Mutex::new(Vec::new())),
             spells: std::sync::Arc::new(crate::spells::SpellDb::default()),
