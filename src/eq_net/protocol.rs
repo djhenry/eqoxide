@@ -189,6 +189,12 @@ pub const OP_GROUP_LEADER_CHANGE: u16 = 0x21b4;   // S→C leader name push; 148
 pub const OP_GROUP_ACKNOWLEDGE: u16   = 0x7323;   // S→C only — "you joined" trigger; 4B, no fields
 pub const OP_GROUP_MAKE_LEADER: u16   = 0x4229;   // C→S /makeleader; GroupMakeLeader_Struct (456B)
 
+// ── Skill training at guildmasters (eqoxide#99) ──────────────────────────────────────────────
+pub const OP_GM_TRAINING: u16      = 0x1966; // C→S open request / S→C reply; GMTrainee_Struct (448B, skills[]=caps)
+pub const OP_GM_TRAIN_SKILL: u16   = 0x2a85; // C→S train one skill; GMSkillChange_Struct (12B)
+pub const OP_GM_END_TRAINING: u16  = 0x4d6b; // C→S close window; GMTrainEnd_Struct (8B)
+pub const OP_SKILL_UPDATE: u16     = 0x004c; // S→C one skill's new value; SkillUpdate_Struct (12B)
+
 // ── Gameplay: looting ─────────────────────────────────────────────────────
 
 /// Server → client when a mob dies and leaves a lootable corpse.

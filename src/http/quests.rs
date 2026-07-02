@@ -185,6 +185,8 @@ pub(crate) mod tests {
             camp_until: Arc::new(Mutex::new(None)),
             group:             Arc::new(Mutex::new(GroupSnapshot::default())),
             group_invite:      Arc::new(Mutex::new(None)),
+            trainer_open_req:  Arc::new(Mutex::new(None)),
+            trainer_train_req: Arc::new(Mutex::new(None)),
             group_accept:      Arc::new(Mutex::new(None)),
             group_decline:     Arc::new(Mutex::new(None)),
             group_leave:       Arc::new(Mutex::new(None)),
