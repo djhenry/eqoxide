@@ -1056,12 +1056,23 @@ impl Navigator {
             self.last_zone_cross = Instant::now();
         }
 
-        // Check hail request — say "Hail, <name>" so a nearby NPC fires its hail script.
-        let hail_name = self.hail.lock().unwrap().take();
-        if let Some(name) = hail_name {
+        // Check hail request — say "Hail, <name>" so the NPC fires its hail script. The server only
+        // runs an NPC's EVENT_SAY on the player's CURRENT TARGET (client.cpp: `Mob* t = GetTarget()`),
+        // so we must target the NPC FIRST, in the same tick and before the say packet, or the hail is
+        // silently ignored (#130). The target packet precedes the say on the ordered stream, so the
+        // server has GetTarget()==the NPC when it processes the say.
+        let hail_req = self.hail.lock().unwrap().take();
+        if let Some((name, spawn_id)) = hail_req {
+            if let Some(id) = spawn_id {
+                gs.target_id = Some(id);
+                if let Some(e) = gs.entities.get(&id) { gs.target_name = Some(e.name.clone()); }
+                stream.send_app_packet(OP_TARGET_MOUSE, &build_target_packet(id));
+                // Mirror the client-initiated target into the render GameState (HUD/HTTP). (#9)
+                let _ = app_tx.send(AppPacket { opcode: OP_TARGET_MOUSE, payload: build_target_packet(id) });
+            }
             let msg = format!("Hail, {}", name);
             let pkt = build_say_packet(&gs.player_name, &name, &msg);
-            tracing::info!("EQ: hailing '{}' (say): {}", name, msg);
+            tracing::info!("EQ: hailing '{}' (target={:?}, say): {}", name, spawn_id, msg);
             stream.send_app_packet(OP_CHANNEL_MESSAGE, &pkt);
             gs.log_msg("chat", &format!("You say, '{}'", msg));
         }

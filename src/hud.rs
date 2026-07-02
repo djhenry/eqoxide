@@ -487,8 +487,9 @@ pub fn draw_control_bar(
                 None => "Hail nearest".to_string(),
             };
             if ui.add_enabled(nearest.is_some(), egui::Button::new(hail_label)).clicked() {
-                if let Some((_, n)) = nearest {
-                    *hail.lock().unwrap() = Some(n);
+                if let Some((id, n)) = nearest {
+                    // Target the NPC too — the server only fires EVENT_SAY on the current target (#130).
+                    *hail.lock().unwrap() = Some((n, Some(id)));
                 }
             }
 
