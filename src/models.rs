@@ -675,7 +675,7 @@ pub fn velious_material_fallback(material: u32) -> Option<u32> {
 pub fn race_to_archetype(race: &str) -> &'static str {
     match race.to_uppercase().as_str() {
         "HUM" | "HFL" | "GNM" | "ERU" |
-        "IKS" | "VAH" | "BAR" | "TRL" | "OGR"          => "humanoid",
+        "IKS" | "VAH" | "BAR" | "TRL" | "OGR" | "DRK"  => "humanoid",
         "ELF" | "HIE" | "HEF" | "DKE"                   => "elf",
         "DWF"                                            => "dwarf",
         "GNL" | "KOB" | "GOB" | "ORC"                   => "gnoll",
