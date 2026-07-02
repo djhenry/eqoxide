@@ -664,9 +664,14 @@ fn apply_task_select_window(gs: &mut GameState, p: &[u8]) {
 fn apply_new_spawn(gs: &mut GameState, payload: &[u8]) {
     if let Some((info, _)) = parse_rof2_spawn(payload) {
         let name = info.name.clone();
+        // Corpse spawns arrive already-dead (npc: 2=pc_corpse, 3=npc_corpse). The death handler
+        // (`apply_death`) only runs for entities that die while in view, so a corpse that spawns
+        // this way never gets marked dead — and the scene renderer would show it standing in an
+        // idle pose. Mark it below (after `register_spawn`) so it uses the Lying/dead clip (#118).
+        let sid = info.spawn_id;
+        let is_corpse = info.npc == 2 || info.npc == 3;
         // If this new spawn is an NPC corpse, queue it for auto-looting.
         if info.npc != 0 && name.to_lowercase().contains("corpse") {
-            let sid = info.spawn_id;
             tracing::info!("EQ: NPC corpse spawned: id={} name={:?} → queuing for loot", sid, name);
             gs.pending_loot.push_back(sid);
             if gs.loot_queued_at.is_none() {
@@ -676,6 +681,15 @@ fn apply_new_spawn(gs: &mut GameState, payload: &[u8]) {
                 name.replace("_corpse", "").replace('_', " ")));
         }
         register_spawn(gs, info);
+        // Corpse spawns (PC and NPC) lie down — mirror `apply_death` so the renderer picks the
+        // dead clip instead of the default standing pose (#118).
+        if is_corpse {
+            if let Some(e) = gs.entities.get_mut(&sid) {
+                e.dead      = true;
+                e.hp_pct    = 0.0;
+                e.animation = 115; // Animation::Lying
+            }
+        }
     }
 }
 
@@ -2412,6 +2426,84 @@ mod tests {
         assert_eq!(e.name, "a_gnoll");
         assert!((e.x - 150.0).abs() < 0.2);
         assert!((e.y - (-100.0)).abs() < 0.2);
+    }
+
+    /// A corpse that arrives as a fresh spawn (npc: 2=pc_corpse, 3=npc_corpse) never goes through
+    /// `apply_death`, so `apply_new_spawn` must mark it dead + Lying (animation 115) or the scene
+    /// renderer shows it standing in an idle pose (#118). A live NPC (npc=1) must stay upright.
+    #[test]
+    fn corpse_spawn_marked_dead_and_lying() {
+        use super::apply_new_spawn;
+
+        // Minimal RoF2 spawn buffer with a settable NPC/corpse type byte (mirrors build_npc_buf).
+        fn build_spawn(name: &str, id: u32, npc: u8) -> Vec<u8> {
+            let mut b = Vec::new();
+            b.extend_from_slice(name.as_bytes()); b.push(0);
+            b.extend_from_slice(&id.to_le_bytes());
+            b.push(10); // level
+            b.extend_from_slice(&5.0f32.to_le_bytes()); // bounding
+            b.push(npc); // NPC type: 0=pc, 1=npc, 2=pc_corpse, 3=npc_corpse
+            b.extend_from_slice(&0u32.to_le_bytes()); // bitfields
+            b.push(0); // OtherData
+            b.extend_from_slice(&0.0f32.to_le_bytes()); // unk3
+            b.extend_from_slice(&0.0f32.to_le_bytes()); // unk4
+            b.push(1); b.extend_from_slice(&1u32.to_le_bytes()); // props_count=1, bodytype=1
+            b.push(0); // curHp — a corpse is at 0%
+            b.extend_from_slice(&[0u8; 6]);  // hair..beard
+            b.extend_from_slice(&[0u8; 12]); // drakkin
+            b.extend_from_slice(&[0, 0, 0, 0]); // equip_chest2..helm
+            b.extend_from_slice(&6.0f32.to_le_bytes()); // size
+            b.push(0); // face
+            b.extend_from_slice(&0.35f32.to_le_bytes()); // walkspeed
+            b.extend_from_slice(&0.7f32.to_le_bytes());  // runspeed
+            b.extend_from_slice(&54u32.to_le_bytes()); // race
+            b.push(0); b.extend_from_slice(&[0u8; 12]); // holding, deity, guild, rank
+            b.extend_from_slice(&[1, 0, 100, 0, 0]); // class_, pvp, StandState, light, fly
+            b.push(0); // lastName\0
+            b.extend_from_slice(&[0u8; 6]); // aatitle, guild_show, TempPet
+            b.extend_from_slice(&0u32.to_le_bytes()); // petOwnerId
+            b.push(0); // FindBits
+            b.extend_from_slice(&64u32.to_le_bytes()); // PlayerState
+            b.extend_from_slice(&[0u8; 20]); // NpcTintIndex..unk
+            b.extend_from_slice(&[0u8; 60]); // non-playable equipment block
+            b.extend_from_slice(&0u32.to_le_bytes()); // pos word0
+            b.extend_from_slice(&0u32.to_le_bytes()); // pos word1
+            b.extend_from_slice(&0u32.to_le_bytes()); // pos word2
+            b.extend_from_slice(&0u32.to_le_bytes()); // pos word3
+            b.extend_from_slice(&100u32.to_le_bytes()); // word4: animation=100 (standing)
+            b.extend_from_slice(&[0u8; 8]); // unknown20
+            b.push(0); // IsMercenary
+            b.extend_from_slice(b"0000000000000000\0"); // RealEstateItemGuid (17B)
+            b.extend_from_slice(&0xffffffffu32.to_le_bytes()); // RealEstateID
+            b.extend_from_slice(&0xffffffffu32.to_le_bytes()); // RealEstateItemID
+            b.extend_from_slice(&[0u8; 29]); // padding
+            b
+        }
+
+        // NPC corpse (npc=3) → dead + Lying.
+        let mut gs = GameState::new();
+        gs.player_name = "Someone_Else".into();
+        apply_new_spawn(&mut gs, &build_spawn("a_gnoll_corpse", 77, 3));
+        let e = gs.entities.get(&77).expect("npc corpse in entities");
+        assert!(e.dead, "npc corpse must be marked dead");
+        assert_eq!(e.animation, 115, "npc corpse uses the Lying clip");
+        assert_eq!(e.hp_pct, 0.0);
+
+        // PC corpse (npc=2) → another player's corpse lies down too (not auto-looted, but dead).
+        let mut gs2 = GameState::new();
+        gs2.player_name = "Someone_Else".into();
+        apply_new_spawn(&mut gs2, &build_spawn("Aldric`s corpse", 88, 2));
+        let e2 = gs2.entities.get(&88).expect("pc corpse in entities");
+        assert!(e2.dead, "pc corpse must be marked dead");
+        assert_eq!(e2.animation, 115);
+
+        // A live NPC (npc=1) must NOT be marked dead.
+        let mut gs3 = GameState::new();
+        gs3.player_name = "Someone_Else".into();
+        apply_new_spawn(&mut gs3, &build_spawn("a_gnoll", 99, 1));
+        let e3 = gs3.entities.get(&99).expect("live npc in entities");
+        assert!(!e3.dead, "a live npc must not be marked dead");
+        assert_eq!(e3.animation, 100, "a live npc keeps its standing animation");
     }
 
     #[test]
