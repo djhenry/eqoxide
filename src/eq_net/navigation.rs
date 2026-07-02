@@ -1315,6 +1315,13 @@ impl Navigator {
             // EQEmu applies the move silently (no echo), so mirror it into our snapshot or
             // /inventory goes stale and the next move corrupts it (phantom items).
             gs.move_item(from_slot as i32, to_slot as i32);
+            // Mirror the same move into the RENDER GameState via a synthetic app packet, or the
+            // render side keeps stale held-item models (scene.*_weapon_idfile) until the next
+            // OP_CharInventory (relog/zone). 8-byte payload: from(i32 LE) + to(i32 LE). (#141)
+            let mut mv = [0u8; 8];
+            mv[0..4].copy_from_slice(&(from_slot as i32).to_le_bytes());
+            mv[4..8].copy_from_slice(&(to_slot as i32).to_le_bytes());
+            let _ = app_tx.send(AppPacket { opcode: OP_MOVE_ITEM, payload: mv.to_vec() });
             tracing::info!("EQ: move item — from_slot={} to_slot={} qty=0(whole)", from_slot, to_slot);
             gs.log_msg("inventory", &format!("Moved item (slot {} -> {})", from_slot, to_slot));
         }
