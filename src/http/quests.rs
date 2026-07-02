@@ -153,7 +153,6 @@ pub(crate) mod tests {
             entity_ids: Arc::new(Mutex::new(HashMap::new())),
             zone_points: Arc::new(Mutex::new(Vec::new())),
             zone_cross: Arc::new(Mutex::new(None)),
-            warp: Arc::new(Mutex::new(None)),
             hail: Arc::new(Mutex::new(None)),
             say: Arc::new(Mutex::new(None)),
             target: Arc::new(Mutex::new(None)),
