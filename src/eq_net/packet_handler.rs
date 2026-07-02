@@ -807,6 +807,8 @@ fn apply_new_zone(gs: &mut GameState, payload: &[u8]) {
     gs.safe_y = f32::from_le_bytes([payload[588], payload[589], payload[590], payload[591]]);
     gs.safe_x = f32::from_le_bytes([payload[592], payload[593], payload[594], payload[595]]);
     gs.safe_z = f32::from_le_bytes([payload[596], payload[597], payload[598], payload[599]]);
+    // underworld (min-z floor) @ 608 — below this the server does a ZoneToBindPoint recovery (#150).
+    gs.zone_underworld = Some(f32::from_le_bytes([payload[608], payload[609], payload[610], payload[611]]));
     // zone_id @ 852
     gs.zone_id = u16::from_le_bytes([payload[852], payload[853]]);
     gs.zone_changed = true;

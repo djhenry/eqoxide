@@ -287,6 +287,11 @@ pub struct GameState {
     pub safe_x: f32,
     pub safe_y: f32,
     pub safe_z: f32,
+    /// Zone "underworld" floor from OP_NewZone (rof2_structs.h @608): the server treats any position
+    /// at or below this Z as fallen-through-the-world and does a ZoneToBindPoint recovery. `None`
+    /// until OP_NewZone is parsed. The movement controller clamps against it so a collision gap
+    /// can't drop us below it and trip the server's below-world drop → CLE linkdead (#150).
+    pub zone_underworld: Option<f32>,
 
     // Entities in zone (keyed by spawn_id)
     pub entities: std::collections::HashMap<u32, Entity>,

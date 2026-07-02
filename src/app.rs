@@ -1140,6 +1140,9 @@ impl App {
             // collision loaded; otherwise hold position so we don't fall through a loading void.
             if self.camera_initialized {
                 if let Some(c) = self.collision.as_deref() {
+                    // Keep the fall-through guard's threshold current with the zone's underworld
+                    // floor (from OP_NewZone), so a collision gap can't drop us below it (#150).
+                    self.controller.set_underworld(self.game_state.zone_underworld);
                     self.controller.step(intent, dt, c);
                 }
             }
