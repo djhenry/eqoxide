@@ -37,6 +37,13 @@ pub const PLAYER_UNIFORM_SLOTS: usize = 64;
 pub const TOTAL_ENTITY_UNIFORM_SLOTS: usize = 8224;
 /// Pre-allocated joint buffer pool size. Slot 0 = player, 1..N = entities.
 pub const JOINT_BUF_SLOTS: usize = 512;
+
+/// Max distance from the player at which an entity's animation clock is advanced each frame (#152).
+/// MUST be ≥ [`crate::pass::ENTITY_DRAW_DIST`] (the skinned-pass distance cull) so every entity that
+/// gets DRAWN also gets its clock advanced — otherwise a drawn entity would freeze. The small margin
+/// beyond the draw distance keeps a ring of just-out-of-range entities warm so panning/approach never
+/// reveals a frozen pose.
+pub(crate) const ANIM_ADVANCE_DIST: f32 = crate::pass::ENTITY_DRAW_DIST + 48.0;
 /// Held-item uniform slots: 0-1 = player primary/secondary, 2.. = entity held items
 /// (up to two per drawn skinned entity, nearest-first; overflow entities skip weapons).
 pub const WEAPON_UNIFORM_SLOTS: usize = 512;
@@ -879,9 +886,24 @@ impl EqRenderer {
     ) {
         use crate::gpu::GpuModel;
 
-        // Animate NPCs and player (player uses reserved id=0)
+        // Animate NPCs and player (player uses reserved id=0).
+        //
+        // Only advance animation clocks for entities near enough to actually be DRAWN. The skinned
+        // entity pass culls anything past `ENTITY_DRAW_DIST` from the player, so advancing a farther
+        // entity's clip clock is pure CPU with zero on-screen effect. Gating this here makes per-
+        // frame animation work scale with the number of NEARBY spawns instead of the entire zone
+        // population (crowded outdoor zones carry ~700), a hot spot when several clients share a box
+        // (#152). Gate on DISTANCE ONLY (not the draw pass's frustum test) and add a small margin, so
+        // an entity is never drawn — or panned into view — with a frozen clock; its clock simply
+        // resumes when it comes back into range (a phase shift that's invisible for looping idles).
+        // The player (id 0) is always animated.
         let anim_targets: Vec<(u32, &str, &str, u8)> = {
+            let pp = scene.player_pos;
             let mut v: Vec<(u32, &str, &str, u8)> = scene.billboards.iter()
+                .filter(|b| {
+                    let (dx, dy, dz) = (b.pos[0] - pp[0], b.pos[1] - pp[1], b.pos[2] - pp[2]);
+                    dx * dx + dy * dy + dz * dz <= ANIM_ADVANCE_DIST * ANIM_ADVANCE_DIST
+                })
                 .map(|b| (b.id, b.race.as_str(), b.action.as_str(), b.gender))
                 .collect();
             if !scene.player_race.is_empty() {
@@ -1034,6 +1056,15 @@ impl EqRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn anim_advance_dist_covers_the_draw_cull() {
+        // Invariant (#152): every entity the skinned pass DRAWS must also have its animation clock
+        // advanced, or it would render frozen. The anim gate must therefore reach at least as far as
+        // the draw-distance cull. (The margin keeps a ring beyond the draw distance warm.)
+        assert!(ANIM_ADVANCE_DIST >= crate::pass::ENTITY_DRAW_DIST,
+            "anim gate {ANIM_ADVANCE_DIST} must be >= draw cull {}", crate::pass::ENTITY_DRAW_DIST);
+    }
 
     #[test]
     fn eqoxide_uses_pipeline_types() {
