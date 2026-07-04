@@ -156,6 +156,7 @@ impl SceneState {
             ("BRD", "bird",      "Bird"),
             ("WSP", "wasp",      "Wasp"),
             ("WRM", "worm",      "Worm"),
+            ("FIS", "fish",      "Fish"),
         ];
 
         // Deduplicate archetypes (e.g. WOL/LIO/CAT all map to "wolf").
@@ -166,6 +167,12 @@ impl SceneState {
             if seen.insert(arch) {
                 unique.push(*entry);
             }
+        }
+
+        // Debug hook: `EQ_TESTZONE_ONLY=<archetype>` shows just that model, centered — handy for
+        // eyeballing a single archetype's orientation/scale (e.g. the fish, #149).
+        if let Ok(only) = std::env::var("EQ_TESTZONE_ONLY") {
+            unique.retain(|(_, arch, _)| *arch == only);
         }
 
         let spacing = 20.0_f32; // east spacing between models
