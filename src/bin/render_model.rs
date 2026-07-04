@@ -1231,7 +1231,7 @@ fn render_frame(s: &mut ViewerState) {
         // matrices for THIS frame. If this differs from the visible GPU size, the bug is
         // in the GPU pipeline downstream of the skinning math (not the pose/scale).
         let m = camera::entity_model_matrix_heading(
-            [0.0, 0.0, 0.0], 0.0, vscale, dominant, [0.0, 0.0], true, 0.0,
+            [0.0, 0.0, 0.0], 0.0, vscale, dominant, [0.0, 0.0], true, 0.0, glam::Mat4::IDENTITY,
         );
         if !sk.dbg_done {
             sk.dbg_done = true;
@@ -1261,7 +1261,7 @@ fn render_frame(s: &mut ViewerState) {
         let vscale = 2.0 * s.model.y_extent * s.arch_scale;
         let m = camera::entity_model_matrix_heading(
             [0.0, 0.0, 0.0], 0.0, vscale, s.arch_scale,
-            [s.model.x_center, s.model.z_center], true, s.model.y_bottom,
+            [s.model.x_center, s.model.z_center], true, s.model.y_bottom, glam::Mat4::IDENTITY,
         );
         let lift = vscale * 0.5 + s.model.y_bottom * s.arch_scale;
         (vscale, m, lift)
@@ -1464,7 +1464,7 @@ fn render_frame(s: &mut ViewerState) {
                 // visual_scale as the model so markers align with the mesh.
                 let marker_mat = camera::entity_model_matrix_heading(
                     marker.pos, 0.0, visual_scale, s.arch_scale,
-                    [s.model.x_center, s.model.z_center], true, s.model.y_bottom,
+                    [s.model.x_center, s.model.z_center], true, s.model.y_bottom, glam::Mat4::IDENTITY,
                 );
                 s.queue.write_buffer(&s.marker_uniforms[i].0, 0, bytemuck::bytes_of(&EntityUniform {
                     model: marker_mat, tint: marker.color,
