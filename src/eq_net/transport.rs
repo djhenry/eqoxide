@@ -254,6 +254,32 @@ pub struct AppPacket {
 
 // ── EQ Stream ──────────────────────────────────────────────────────────────
 
+/// How an incoming reliable sequence number relates to what we've already delivered.
+#[derive(Debug, PartialEq, Eq)]
+enum SeqClass {
+    /// Exactly the next expected packet — deliver it (and advance).
+    Deliver,
+    /// Ahead of the next expected (a gap) — buffer it and send OP_OUT_OF_ORDER.
+    Future,
+    /// Behind the next expected — an already-delivered packet the server is retransmitting because
+    /// our ACK was lost. Re-ACK it (never re-deliver) so the server's resend_timeout doesn't drop
+    /// the session (#158).
+    Duplicate,
+}
+
+/// Classify a reliable `seq` against `next_recv_seq` (the next sequence we expect), handling u16
+/// wrap-around near the top of the sequence space. Pure so the resend/duplicate decision is
+/// unit-tested independently of the socket.
+fn classify_seq(seq: u16, next_recv_seq: u16) -> SeqClass {
+    if seq == next_recv_seq {
+        SeqClass::Deliver
+    } else if seq > next_recv_seq || (seq < 0x1000 && next_recv_seq > 0xF000) {
+        SeqClass::Future
+    } else {
+        SeqClass::Duplicate
+    }
+}
+
 pub struct EqStream {
     session: SessionInfo,
     socket: UdpSocket,
@@ -559,18 +585,29 @@ impl EqStream {
         let seq = Cursor::new(&decoded[..2]).read_u16::<BigEndian>().unwrap();
         let data = decoded[2..].to_vec();
 
-        if seq == self.next_recv_seq {
-            self.next_recv_seq = self.next_recv_seq.wrapping_add(1);
-            self.deliver_seq(seq, data, is_fragment);
-            // Drain buffered continuations
-            while let Some((ndata, nfrag)) = self.recv_buf.remove(&self.next_recv_seq) {
-                let nseq = self.next_recv_seq;
+        match classify_seq(seq, self.next_recv_seq) {
+            SeqClass::Deliver => {
                 self.next_recv_seq = self.next_recv_seq.wrapping_add(1);
-                self.deliver_seq(nseq, ndata, nfrag);
+                self.deliver_seq(seq, data, is_fragment);
+                // Drain buffered continuations
+                while let Some((ndata, nfrag)) = self.recv_buf.remove(&self.next_recv_seq) {
+                    let nseq = self.next_recv_seq;
+                    self.next_recv_seq = self.next_recv_seq.wrapping_add(1);
+                    self.deliver_seq(nseq, ndata, nfrag);
+                }
             }
-        } else if seq > self.next_recv_seq || (seq < 0x1000 && self.next_recv_seq > 0xF000) {
-            self.recv_buf.insert(seq, (data, is_fragment));
-            self.send_raw(OP_OUT_OF_ORDER, &seq.to_be_bytes());
+            SeqClass::Future => {
+                self.recv_buf.insert(seq, (data, is_fragment));
+                self.send_raw(OP_OUT_OF_ORDER, &seq.to_be_bytes());
+            }
+            SeqClass::Duplicate => {
+                // A retransmit of an ALREADY-DELIVERED reliable packet: our original OP_ACK for it
+                // was lost, so the server is resending it and waiting for the ACK. RE-ACK it (never
+                // re-deliver — we already dispatched it). Without this the packet stays "un-ACKed"
+                // on the server and its `resend_timeout` (30s) closes the whole session, a spurious
+                // linkdead on an otherwise idle client (#158).
+                self.send_ack(seq);
+            }
         }
     }
 
@@ -678,6 +715,23 @@ mod tests {
         let encoded = decode_xor(&data, key);
         let decoded = decode_xor(&encoded, key);
         assert_eq!(data, decoded);
+    }
+
+    #[test]
+    fn classify_seq_reacks_duplicates_not_delivers() {
+        use super::{classify_seq, SeqClass};
+        // The next expected packet is delivered.
+        assert_eq!(classify_seq(5, 5), SeqClass::Deliver);
+        // A gap ahead is a future packet (buffer + OOO).
+        assert_eq!(classify_seq(6, 5), SeqClass::Future);
+        // A packet BEHIND the next expected is an already-delivered retransmit — must be re-ACKed,
+        // NOT dropped, or the server's 30s resend_timeout linkdeads us (#158).
+        assert_eq!(classify_seq(4, 5), SeqClass::Duplicate);
+        assert_eq!(classify_seq(0, 5), SeqClass::Duplicate);
+        // Wrap-around: next just past the top, a low seq is the FUTURE (wrapped) packet…
+        assert_eq!(classify_seq(2, 0xF001), SeqClass::Future);
+        // …while a seq just below `next` (also near the top) is a past duplicate.
+        assert_eq!(classify_seq(0xF000, 0xF001), SeqClass::Duplicate);
     }
 
     #[test]
