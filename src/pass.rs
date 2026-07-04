@@ -18,7 +18,7 @@ fn anim_now_ms() -> u64 {
 /// Entity draw distance (EQ units, measured from the player). Beyond this an NPC's 3D
 /// model is not drawn — it's a distant speck. Combined with a frustum test, this caps
 /// the per-frame entity work in densely-populated zones (e.g. gfaydark, ~400 spawns).
-const ENTITY_DRAW_DIST: f32 = 500.0;
+pub(crate) const ENTITY_DRAW_DIST: f32 = 500.0;
 /// NDC slack for the frustum test so a tall model whose feet sit just off-screen still
 /// draws (the culled position is the feet; the body extends upward).
 const ENTITY_CULL_MARGIN: f32 = 0.5;
