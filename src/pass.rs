@@ -475,6 +475,7 @@ pub fn encode_player_pass(
                     let mat = crate::camera::entity_model_matrix_heading(
                         scene.player_pos, scene.player_heading, visual_scale,
                         dominant_mesh_scale, [0.0, 0.0], true, 0.0,
+                        crate::models::archetype_correction(archetype),
                     );
                     let tint = match model.equip_slots[i] {
                         Some(ref es) if scene.player_equipment_tint[es.slot] != [0, 0, 0] => {
@@ -555,7 +556,7 @@ pub fn encode_player_pass(
                 let (clip_i, t) = r.anim_states.get(&0).map(|s| (s.clip_idx, s.time)).unwrap_or((0, 0.0));
                 let pmat = glam::Mat4::from_cols_array_2d(&crate::camera::entity_model_matrix_heading(
                     scene.player_pos, scene.player_heading, visual_scale, dominant_mesh_scale,
-                    [0.0, 0.0], true, 0.0));
+                    [0.0, 0.0], true, 0.0, crate::models::archetype_correction(archetype)));
                 let rq = glam::Mat4::from_quat(
                     glam::Quat::from_axis_angle(glam::Vec3::X, -std::f32::consts::FRAC_PI_2));
                 let held = [
@@ -615,6 +616,7 @@ pub fn encode_player_pass(
                 let mat = crate::camera::entity_model_matrix_heading(
                     scene.player_pos, scene.player_heading, visual_scale, arch_scale,
                     [model.x_center, model.z_center], true, model.y_bottom,
+                    crate::models::archetype_correction(archetype),
                 );
                 for (i, mesh) in model.meshes.iter().enumerate() {
                     if i >= PLAYER_UNIFORM_SLOTS { break; }
@@ -767,7 +769,7 @@ pub fn encode_entity_pass(
         let arch_scale   = archetype_scale(archetype);
         let visual_scale = 2.0 * model.y_extent * arch_scale;
         let mat = crate::camera::entity_model_matrix_heading(b.pos, b.heading, visual_scale, arch_scale,
-            [model.x_center, model.z_center], true, model.y_bottom);
+            [model.x_center, model.z_center], true, model.y_bottom, crate::models::archetype_correction(archetype));
         for (mesh_idx, mesh) in model.meshes.iter().enumerate() {
             if slot >= slot_end { break; }
             let slot_meta = model.equip_slots[mesh_idx];
@@ -915,6 +917,7 @@ pub fn encode_skinned_entity_pass(
             let mat = crate::camera::entity_model_matrix_heading(
                 b.pos, b.heading, visual_scale, dominant_scale,
                 [0.0, 0.0], true, 0.0,
+                crate::models::archetype_correction(archetype),
             );
             let slot_meta = model.equip_slots[mesh_idx];
             let tint: [f32; 4] = if b.dead { [0.5, 0.5, 0.5, 1.0] }
@@ -944,7 +947,8 @@ pub fn encode_skinned_entity_pass(
         // Held items at the rig attach bones, posed to match the body (animated pose
         // when the anim state is valid, rest pose when the body fell back to bind).
         let emat = glam::Mat4::from_cols_array_2d(&crate::camera::entity_model_matrix_heading(
-            b.pos, b.heading, visual_scale, dominant_scale, [0.0, 0.0], true, 0.0));
+            b.pos, b.heading, visual_scale, dominant_scale, [0.0, 0.0], true, 0.0,
+            crate::models::archetype_correction(archetype)));
         let anim = r.anim_states.get(&b.id)
             .filter(|s| !model.skin.clips.is_empty() && s.clip_idx < model.skin.clips.len());
         for held in crate::models::held_item_keys(&b.equipment, b.dead) {
