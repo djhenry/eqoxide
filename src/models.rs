@@ -704,6 +704,20 @@ pub fn race_to_archetype(race: &str) -> &'static str {
 /// Arch-scale is a multiplier such that `visual_scale = 2 * y_bottom * arch_scale * node_scale`
 /// equals the desired total character height in EQ units (feet-to-head).
 /// Calibrated from actual GLTF vertex bounds; review after adding new models.
+/// Per-archetype model-space orientation fix-up applied in `entity_model_matrix_heading` (#149).
+/// Most models need none (identity). The shared substitute `fish.glb` is authored with its
+/// nose→tail along the model's Y axis; after the standard Y-up→Z-up conversion that axis points
+/// straight up (world +Z) with the mouth at −Z, so the fish stands on its nose ("mouth-down").
+/// Rotating −90° about Y lays it flat and turns the mouth to +X — the canonical "front = +X" pose
+/// the heading yaw then points. (Verified in `--testzone`: the fish goes from a vertical sliver to a
+/// horizontal, nose-forward fish.)
+pub fn archetype_correction(archetype: &str) -> glam::Mat4 {
+    match archetype {
+        "fish" => glam::Mat4::from_rotation_y(-std::f32::consts::FRAC_PI_2),
+        _ => glam::Mat4::IDENTITY,
+    }
+}
+
 pub fn archetype_scale(archetype: &str) -> f32 {
     // EQ units ≈ feet. `height = y_extent * arch_scale` gives rendered model height.
     // Calibrated from actual GLB vertex bounds; review after adding new models.
@@ -1071,6 +1085,21 @@ mod tests {
         assert_eq!(race_to_archetype("UNKNOWN"), "creature");
     }
 
+    #[test]
+    fn fish_gets_orientation_correction_others_identity() {
+        // The substitute fish.glb renders mouth-down without a correction; only "fish" gets one (#149).
+        assert_ne!(archetype_correction("fish"), glam::Mat4::IDENTITY, "fish must be re-oriented");
+        for a in ["humanoid", "rat", "snake", "wolf", "bear", "worm", "creature"] {
+            assert_eq!(archetype_correction(a), glam::Mat4::IDENTITY, "{a} must not be rotated");
+        }
+        // After the standard conversion the fish's mouth points world −Z (mouth-down); the
+        // correction must send that to +X (the model-front the heading yaw points).
+        let m = archetype_correction("fish");
+        let nose = m.transform_vector3(-glam::Vec3::Z);
+        assert!((nose.x - 1.0).abs() < 1e-5 && nose.y.abs() < 1e-5 && nose.z.abs() < 1e-5,
+            "fish correction should send the −Z mouth to +X (front), got {nose:?}");
+    }
+
     /// End-to-end: EQ race id → archetype model. Guards the run-10 fixes to the NPC race
     /// table (Skeleton/Zombie/Wasp/Rat/Gnoll/Fish/Kobold were mapped to wrong creatures).
     #[test]
@@ -1197,7 +1226,7 @@ mod tests {
         let center_xz = [a.x_center, a.z_center];
         let pos = [100.0_f32, -200.0, 5.0];
         let mat = crate::camera::entity_model_matrix_heading(
-            pos, 0.0, visual_scale, ms, center_xz, true, 0.0);
+            pos, 0.0, visual_scale, ms, center_xz, true, 0.0, glam::Mat4::IDENTITY);
         let m = glam::Mat4::from_cols_array_2d(&mat);
         let skin = sk.bind_skin_matrices();
         let (mut mnx, mut mxx) = (f32::MAX, f32::MIN);
@@ -1241,7 +1270,7 @@ mod tests {
         let ms = (target / a.true_height) * a.skinned_node_scale;
         let visual_scale = 2.0 * (-floor) * ms;
         let pos = [100.0_f32, -200.0, 5.0];
-        let mat = crate::camera::entity_model_matrix_heading(pos, 0.0, visual_scale, ms, [cx, cz], true, 0.0);
+        let mat = crate::camera::entity_model_matrix_heading(pos, 0.0, visual_scale, ms, [cx, cz], true, 0.0, glam::Mat4::IDENTITY);
         let m = glam::Mat4::from_cols_array_2d(&mat);
         let imats: Vec<glam::Mat4> = sk.evaluate(idle, 0.0).iter()
             .map(|x| glam::Mat4::from_cols_array_2d(x)).collect();
@@ -1288,7 +1317,7 @@ mod tests {
             let target = archetype_target_height(archetype);
             let ms = (target / a.true_height) * a.skinned_node_scale;
             let visual_scale = 2.0 * (-floor) * ms;
-            let mat = crate::camera::entity_model_matrix_heading(pos, 0.0, visual_scale, ms, [cxb, czb], true, 0.0);
+            let mat = crate::camera::entity_model_matrix_heading(pos, 0.0, visual_scale, ms, [cxb, czb], true, 0.0, glam::Mat4::IDENTITY);
             let m = glam::Mat4::from_cols_array_2d(&mat);
             let imats: Vec<glam::Mat4> = sk.evaluate(idle, 0.0).iter()
                 .map(|x| glam::Mat4::from_cols_array_2d(x)).collect();

@@ -78,7 +78,7 @@ pub fn entity_model_matrix_scaled(
 /// space, so yaw = heading_rad + π/2 rotates +X to the CCW heading direction.
 pub fn entity_model_matrix_heading(
     pos: [f32; 3], heading_deg: f32, visual_scale: f32, mesh_scale: f32,
-    center_xz: [f32; 2], y_up: bool, y_bottom: f32,
+    center_xz: [f32; 2], y_up: bool, y_bottom: f32, correction: glam::Mat4,
 ) -> [[f32; 4]; 4] {
     let p      = glam::Vec3::from(pos);
     let yaw    = heading_deg.to_radians() + std::f32::consts::FRAC_PI_2;
@@ -97,8 +97,14 @@ pub fn entity_model_matrix_heading(
     } else {
         glam::Mat4::from_translation(glam::Vec3::new(-center_xz[0], -center_xz[1], 0.0))
     };
+    // `correction` is a per-archetype model-space fix-up (identity for most): some substitute GLB
+    // models are authored with a body axis that leaves them mis-oriented after the standard
+    // conversion (e.g. the shared `fish.glb` renders nose-down). Applied AFTER the Y-up/Z-up
+    // conversion and BEFORE the heading yaw, so it re-orients the model into the canonical
+    // "front = +X, flat on the ground" pose the yaw then points by heading (#149).
     (glam::Mat4::from_translation(lifted)
         * glam::Mat4::from_rotation_z(yaw)
+        * correction
         * x_rot
         * glam::Mat4::from_scale(glam::Vec3::splat(mesh_scale))
         * recenter)
@@ -228,7 +234,7 @@ mod tests {
     #[test]
     fn static_model_y_up_axis_maps_to_world_up() {
         // y_up=true: a static model's +Y (its up axis) must convert to world +Z.
-        let m = entity_model_matrix_heading([0.0, 0.0, 0.0], 0.0, 0.0, 1.0, [0.0, 0.0], true, 0.0);
+        let m = entity_model_matrix_heading([0.0, 0.0, 0.0], 0.0, 0.0, 1.0, [0.0, 0.0], true, 0.0, glam::Mat4::IDENTITY);
         let up = apply(&m, [0.0, 1.0, 0.0]);
         assert!(up[2] > 0.9, "static +Y should map to world +Z (got {up:?})");
     }
@@ -238,7 +244,7 @@ mod tests {
         // y_up=false: a skinned model is already Z-up; its +Z must stay world +Z,
         // and its +Y must stay horizontal (NOT tip up). This guards the
         // double-rotation regression that laid characters flat on the ground.
-        let m = entity_model_matrix_heading([0.0, 0.0, 0.0], 0.0, 0.0, 1.0, [0.0, 0.0], false, 0.0);
+        let m = entity_model_matrix_heading([0.0, 0.0, 0.0], 0.0, 0.0, 1.0, [0.0, 0.0], false, 0.0, glam::Mat4::IDENTITY);
         let up = apply(&m, [0.0, 0.0, 1.0]);
         assert!(up[2] > 0.9, "skinned +Z should stay world +Z (got {up:?})");
         let fwd = apply(&m, [0.0, 1.0, 0.0]);
@@ -253,8 +259,8 @@ mod tests {
         // recentre values for an arbitrary vertex.
         let v = [0.004_f32, -0.003, 0.012];
         for y_up in [true, false] {
-            let m0 = entity_model_matrix_heading([0.0, 0.0, 0.0], 0.0, 1.0, 2600.0, [0.0, 0.0], y_up, 0.0);
-            let m1 = entity_model_matrix_heading([0.0, 0.0, 0.0], 0.0, 1.0, 2600.0, [3.0, 5.0], y_up, 0.0);
+            let m0 = entity_model_matrix_heading([0.0, 0.0, 0.0], 0.0, 1.0, 2600.0, [0.0, 0.0], y_up, 0.0, glam::Mat4::IDENTITY);
+            let m1 = entity_model_matrix_heading([0.0, 0.0, 0.0], 0.0, 1.0, 2600.0, [3.0, 5.0], y_up, 0.0, glam::Mat4::IDENTITY);
             let z0 = apply(&m0, v)[2];
             let z1 = apply(&m1, v)[2];
             assert!((z0 - z1).abs() < 1e-3,
