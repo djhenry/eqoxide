@@ -1,158 +1,87 @@
-# HUD Window Management: Movable, Resizable, Persistent Layouts
+# The Window System (UI overhaul, #162)
 
-Most HUD windows in the egui client are now **movable** and can be **resized** (some windows). Window
-positions and sizes are saved and restored **per-character** between sessions.
+The in-game UI is a registry-driven window system (`src/ui/`) themed after the
+native RoF2 client. Every interactive element lives in a window; windows are
+moveable, most are resizeable, and everything persists per character.
+Architecture details: `docs/ui-overhaul-design.md`.
 
----
+## The Window Selector
 
-## Movable Windows
+The **Windows** panel (top center by default) lists every window with a toggle
+button and hosts the global controls: **Lock**, **Fade**, **UI scale**, and
+**Reset all**. It can be moved but **never closed** — if you lose your layout,
+the Selector is always there to recover from.
 
-When windows are **unlocked**, these HUD windows can be dragged:
+## Windows
 
-- Status bar (player stats, HP/mana/etc.)
-- Messages (log panel)
-- Map (minimap)
-- Controls (navigation buttons)
-- Actions (action grid, spell gems, auto-attack)
-- Inventory
-- NPC Dialogue (quest dialogue panel)
+| Window | Hotkey | Notes |
+|---|---|---|
+| Player | — | HP/mana/XP gauges, coin, stats |
+| Target | — | con-colored name, HP, Attack/Consider |
+| Group | G | roster, HP bars, invite Accept/Decline, leader tools |
+| Chat | — | tabs (All/Chat/Combat/System/Loot), scrollback, slash commands |
+| Inventory | I | worn grid + general slots, click-to-move, stack counts |
+| Spell Gems | — | 9 gems, click to cast |
+| Spellbook | B | memorized gems + scrolls (full book: follow-up) |
+| Skills | K | trained skills, "show untrained" toggle |
+| Pet | — | pet name/HP + commands |
+| Quest Journal | T | active tasks w/ objectives, offers, history |
+| Actions | — | attack, sit, hail, target-nearest, camp |
+| Map | M | resizable zone map, zoom slider + scroll |
+| Compass | — | heading tape + /loc |
+| Options | O | UI scale, fades, lock, reset |
+| Help | H | hotkeys, slash commands, window how-to |
 
-**Transient overlays** remain fixed in place (not movable):
+**Transient windows** (Merchant, Loot, Trainer, Casting bar, NPC Dialogue,
+Confirm/Quantity) open automatically from game state and close with it. Their
+✕ dismisses them for the current session (and ends the session where a
+protocol path exists — merchant close, trainer end-training).
 
-- FPS counter (top-right)
-- Loading screen
-- 3D nameplates (floating NPC/player labels)
-- Debug overlay
+## Moving, resizing, closing
 
----
+- **Drag** anywhere on a window that isn't a control (title strip included).
+  Windows drag freely — you can tuck them partly off-screen like the native
+  client; they're pulled back on-screen at next load if the resolution changed.
+- **Resize** from any edge/corner of resizable windows.
+- **✕** in the title strip closes; reopen from the Selector or hotkey.
+- **Right-click** a window for per-window opacity, fade toggle, reset, lock.
+- **Ctrl+L** (or the Selector/Options checkbox) locks all windows: no move, no
+  resize, clicks still work.
+- **Fades**: windows the mouse hasn't been over for ~2 s dim to ~40 %
+  opacity and restore on approach (native `CXWnd` behavior). Global toggle in
+  the Selector; per-window opacity in the right-click menu.
 
-## Resizable Windows
+## Scaling
 
-These windows support both **dragging (moving) and resizing** via edge/corner handles:
+The whole UI scales with the OS window: the design canvas is 1280×720 points
+and the zoom is `ui_scale × min(w/1280, h/720) / dpi`. The per-character
+**UI scale** multiplier (0.5–2×) is in the Selector and Options windows.
 
-- Messages (left/right/bottom edges, corners)
-- Map (left/right/bottom edges, corners)
-- Inventory (left/right/bottom edges, corners)
-- NPC Dialogue (left/right/bottom edges, corners)
+## Persistence
 
-Other movable windows support **dragging only** (fixed size).
+`~/.config/eqoxide/ui_layout_<Character>.json` (version 2), saved debounced
+(1 s) and flushed on every exit path:
 
----
+- per-window: open/closed, position, size (content), opacity
+- global: lock, fades, UI scale
+- **OS window geometry**: inner size + maximized (+ position where the
+  platform allows reading it — X11 yes, **Wayland no**: compositors don't
+  expose window position, so on Wayland only size/maximized restore)
 
-## How to Move a Window
+Positions are stored with the screen size they were saved under; loading at a
+different size runs the native client's edge-relative remap (windows keep
+their corner/edge relationship instead of drifting). Old v1 layout files are
+migrated by dropping their (incompatible) geometry once; settings survive.
 
-When windows are **unlocked**:
+Delete the file to reset everything for that character.
 
-1. A thin **header strip** (the window's name) appears at the top of each movable window.
-2. **Click and drag** the header to move the window anywhere on screen.
-3. Windows are constrained so they cannot be dragged fully off-screen.
+## Chat commands
 
----
+`/say` (default), `/tell <name> <msg>` (`/t`), `/r` (reply), `/ooc`,
+`/shout`, `/g`|`/gsay`|`/group`, `/camp`.
 
-## Locking/Unlocking Windows
+## For agent developers
 
-**Press `Ctrl+L`** to toggle the lock state.
-
-Alternatively, use the **`⚙ UI` menu** (top-left corner):
-- Click the gear icon to open the UI menu
-- Select **"Lock windows (Ctrl+L)"** to toggle
-
-**When locked:**
-- All windows are frozen in place (prevents accidental moves/resizes)
-- Drag headers disappear
-- Right-click context menus are still available
-
----
-
-## Window Context Menu
-
-**Right-click any window** to open a context menu with:
-
-- **Opacity slider** — adjust the per-window transparency (0–255 alpha)
-- **Reset this window** — restore the window to its default position and size
-- **Lock all windows** — checkbox to toggle the global lock state (same as `Ctrl+L`)
-
----
-
-## UI Menu (Top-Left Gear Icon)
-
-The **`⚙ UI`** menu provides:
-
-- **Lock windows (Ctrl+L)** — toggle the global lock state
-- **Reset all windows** — restore all windows to their default positions and sizes
-
----
-
-## Persistence and Storage
-
-Window layouts are **saved to disk** per character:
-
-**File location:** `~/.config/eqoxide/ui_layout_<CharacterName>.json`
-
-The directory follows the XDG base-dir spec: it is `$XDG_CONFIG_HOME/eqoxide/` when
-`XDG_CONFIG_HOME` is set, otherwise `~/.config/eqoxide/`. The directory is created
-automatically on first save. (If it cannot be created, the client falls back to the
-process working directory.)
-
-Non-alphanumeric characters in the character name are **stripped** from the filename (e.g.,
-a character named "Cleric-Alt" saves to `ui_layout_ClericAlt.json`).
-
-**Migration:** older builds saved these files in the process working directory. On
-startup, any legacy `ui_layout_<CharacterName>.json` found in the working directory is
-automatically moved into `~/.config/eqoxide/` (unless a config-dir copy already exists).
-
-**Format** (JSON):
-
-```json
-{
-  "locked": true,
-  "windows": {
-    "status_hud": {
-      "pos": [100, 50],
-      "size": null,
-      "alpha": 255
-    },
-    "message_log": {
-      "pos": [400, 200],
-      "size": [300, 400],
-      "alpha": 200
-    },
-    "minimap": {
-      "pos": null,
-      "size": null,
-      "alpha": 255
-    }
-  }
-}
-```
-
-**Window IDs:**
-
-- `status_hud` — player stats bar
-- `message_log` — messages/chat panel
-- `minimap` — map window
-- `control_bar` — navigation/movement buttons
-- `action_grid` — spells, auto-attack, sit/stand
-- `inventory` — character inventory
-- `npc_dialogue` — NPC quest dialogue panel
-
-**Field meanings:**
-
-- `locked` — whether all windows are locked (boolean)
-- `pos` — `[x, y]` screen coordinates (top-left), or `null` to use default
-- `size` — `[width, height]`, or `null` for default (non-resizable windows always show `null`)
-- `alpha` — opacity 0–255 (255 = opaque, 0 = invisible)
-
-**To reset all layouts:** Delete the `~/.config/eqoxide/ui_layout_<CharacterName>.json`
-file. Next login will restore default positions.
-
----
-
-## Saving Behavior
-
-Window positions and sizes are **saved automatically**:
-
-- **Debounced** (~1 second) while dragging or resizing (avoid excessive disk writes)
-- **Flushed to disk** when the application window closes
-
-Changes take effect on the next login for that character.
+Windows read the per-frame `SceneState` snapshot and write the same
+request slots the HTTP API uses — anything a window does, an agent can do via
+`/v1/...` and vice versa. Screenshot via `GET /v1/observe/frame` (1024 px).

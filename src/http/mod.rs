@@ -21,6 +21,7 @@ mod quests;
 mod group;
 mod move_api;
 mod trainer;
+mod pet;
 mod combat;
 mod interact;
 mod merchant;
@@ -155,6 +156,12 @@ pub type BuyReq = Arc<Mutex<Option<(u32, u32)>>>;
 /// Sell request — (merchant spawn id, player inventory slot, quantity), set by POST /v1/merchant/sell.
 /// Nav thread reads it and sends OP_ShopRequest (open) + OP_ShopPlayerSell (sell that slot).
 pub type SellReq = Arc<Mutex<Option<(u32, u32, u32)>>>;
+
+/// Manual pet command — one OP_PetCommands command byte (PET_ATTACK=2, PET_FOLLOWME=4,
+/// PET_GUARDHERE=5, PET_SIT=6, PET_BACKOFF=28; EQEmu zone/common.h), set by POST /v1/pet/command
+/// or a Pet-window button. The nav thread drains it and sends OP_PetCommands (attack uses the
+/// current target as PetCommand_Struct.target; other commands send target 0).
+pub type PetCmdReq = Arc<Mutex<Option<u8>>>;
 
 /// Open/close a merchant window. `Open(merchant_id)` from POST /v1/merchant/open; `Close` from
 /// POST /v1/merchant/close. The nav thread sends OP_ShopRequest (command 1/0).
@@ -434,6 +441,7 @@ pub(crate) struct HttpState {
     pub(crate) doors_shared:     DoorsShared,
     pub(crate) camp:             CampReq,
     pub(crate) camp_until:       CampUntil,
+    pub(crate) pet_cmd:          PetCmdReq,
 }
 
 pub fn spawn_camera_server(
@@ -488,6 +496,7 @@ pub fn spawn_camera_server(
     doors_shared:     DoorsShared,
     camp:             CampReq,
     camp_until:       CampUntil,
+    pet_cmd:          PetCmdReq,
     port:             u16,
     // When `Some`, an already-bound listener from `--api-port` (exact port, no scan).
     // When `None`, scan upward from `port` for the first free port.
@@ -496,7 +505,7 @@ pub fn spawn_camera_server(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, zone_cross, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, dialogue, nav_state, dialogue_click, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, zone_cross, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, dialogue, nav_state, dialogue_click, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until, pet_cmd };
             // Versioned + grouped routes: /v1/<group>/<action>. Each group's `router()` defines
             // relative paths; nesting prefixes them. Shared state is applied once at the end.
             let app = Router::new()
@@ -505,6 +514,7 @@ pub fn spawn_camera_server(
                 .nest("/v1/group",     group::router())
                 .nest("/v1/move",      move_api::router())
                 .nest("/v1/trainer",   trainer::router())
+                .nest("/v1/pet",       pet::router())
                 .nest("/v1/combat",    combat::router())
                 .nest("/v1/interact",  interact::router())
                 .nest("/v1/merchant",  merchant::router())

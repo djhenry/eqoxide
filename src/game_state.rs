@@ -428,7 +428,8 @@ impl GameState {
     }
 
     pub fn log_msg(&mut self, kind: &str, text: &str) {
-        if self.messages.len() >= 50 {
+        // 400 entries so the chat window has real scrollback (was 50).
+        if self.messages.len() >= 400 {
             self.messages.pop_front();
         }
         self.messages.push_back(LogEntry {
@@ -605,6 +606,32 @@ impl GameState {
     }
 }
 
+/// Split NPC dialogue text into runs, flagging `[bracketed]` quest keywords.
+/// An unterminated `[` run is treated as plain text. Shared by the dialogue
+/// window (clickable keywords) and the HTTP message feed (keyword extraction).
+pub fn split_keywords(text: &str) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        if open > 0 {
+            out.push((rest[..open].to_string(), false));
+        }
+        if let Some(close_rel) = rest[open..].find(']') {
+            let close = open + close_rel;
+            out.push((rest[open..=close].to_string(), true));
+            rest = &rest[close + 1..];
+        } else {
+            out.push((rest[open..].to_string(), false));
+            rest = "";
+            break;
+        }
+    }
+    if !rest.is_empty() {
+        out.push((rest.to_string(), false));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Door, Entity, GameState};
@@ -714,18 +741,18 @@ mod tests {
     #[test]
     fn log_msg_drops_oldest_when_full() {
         let mut gs = GameState::new();
-        // Fill to exactly 50
-        for i in 0..50 {
+        // Fill to exactly the ring cap (400 — sized for chat scrollback, #162).
+        for i in 0..400 {
             gs.log_msg("kind", &format!("msg {i}"));
         }
-        assert_eq!(gs.messages.len(), 50);
+        assert_eq!(gs.messages.len(), 400);
         assert_eq!(gs.messages[0].text, "msg 0");
 
         // Adding one more should drop "msg 0"
-        gs.log_msg("kind", "msg 50");
-        assert_eq!(gs.messages.len(), 50);
+        gs.log_msg("kind", "msg 400");
+        assert_eq!(gs.messages.len(), 400);
         assert_eq!(gs.messages[0].text, "msg 1");
-        assert_eq!(gs.messages[49].text, "msg 50");
+        assert_eq!(gs.messages[399].text, "msg 400");
     }
 
     // --- GameState::upsert_entity / remove_entity ---
