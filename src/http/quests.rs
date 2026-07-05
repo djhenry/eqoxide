@@ -171,6 +171,7 @@ pub(crate) mod tests {
             loot: Arc::new(Mutex::new(None)),
             messages: Arc::new(Mutex::new(Vec::new())),
             dialogue: Arc::new(Mutex::new(Vec::new())),
+            nav_state: Arc::new(Mutex::new("idle".to_string())),
             dialogue_click: Arc::new(Mutex::new(None)),
             chat_events: Arc::new(Mutex::new(Vec::new())),
             chat_send: Arc::new(Mutex::new(Vec::new())),

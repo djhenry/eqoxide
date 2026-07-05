@@ -14,7 +14,7 @@ const RUN_SPEED: f32 = 44.0;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::{GameState, ZonePoint};
-use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, TradeCmd, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, ChatEventsShared, ChatSendShared, CastReq, MemSpellReq, SitReq, ConsiderReq, CampReq, CampCmd, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints, ControllerShared, NavIntent, PosCorrection, DialogueShared, DialogueClickReq};
+use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, TradeCmd, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, ChatEventsShared, ChatSendShared, CastReq, MemSpellReq, SitReq, ConsiderReq, CampReq, CampCmd, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints, ControllerShared, NavIntent, PosCorrection, DialogueShared, DialogueClickReq, NavStateShared};
 use crate::movement::MoveIntent;
 
 /// Min interval (ms) between OP_ClientUpdate sends while moving (native `0x118` = 280 ms).
@@ -455,6 +455,8 @@ fn dist2(zp: &crate::game_state::ZonePoint, gs: &GameState) -> f32 {
 
 pub struct Navigator {
     goto_target:      GotoTarget,
+    /// Live nav state for GET /v1/observe/debug (#166): idle|navigating|arrived|no_path|blocked.
+    nav_state:        NavStateShared,
     goto_entity:      crate::http::GotoEntity,
     entity_positions: EntityPositions,
     entity_ids:       EntityIds,
@@ -560,6 +562,7 @@ pub struct Navigator {
 impl Navigator {
     pub fn new(
         goto_target:      GotoTarget,
+        nav_state:        NavStateShared,
         goto_entity:      crate::http::GotoEntity,
         entity_positions: EntityPositions,
         entity_ids:       EntityIds,
@@ -611,6 +614,7 @@ impl Navigator {
     ) -> Self {
         Navigator {
             goto_target,
+            nav_state,
             goto_entity,
             entity_positions,
             entity_ids,
@@ -848,6 +852,13 @@ impl Navigator {
             shared.extend(gs.zone_points.iter().cloned());
             shared.extend(map_labels);
         }
+    }
+
+    /// Publish the current `/move/goto` navigation state for GET /v1/observe/debug (#166):
+    /// idle | navigating | arrived | no_path | blocked.
+    fn set_nav_state(&self, state: &str) {
+        let mut s = self.nav_state.lock().unwrap();
+        if *s != state { *s = state.to_string(); }
     }
 
     /// Live NPC-camp positions to route AROUND (aggro-avoidance, #67), excluding NPCs near the
@@ -1556,6 +1567,9 @@ impl Navigator {
                 self.path.clear();
                 self.path_goal = None;
                 *self.nav_intent.lock().unwrap() = None;
+                // Only downgrade from "navigating" (an external cancel / WASD). Keep terminal states
+                // (arrived / no_path / blocked) so a driver can still read the last outcome (#166).
+                if *self.nav_state.lock().unwrap() == "navigating" { self.set_nav_state("idle"); }
                 return;
             }
         };
@@ -1576,12 +1590,27 @@ impl Navigator {
             // a mob group and get the player killed. Exclude NPCs near the GOAL — you're walking TO
             // the destination (often a target mob), so its own camp must not be avoided.
             let avoid = Self::aggro_avoid(gs, goal);
-            self.path = match self.collision.read().unwrap().as_ref() {
-                Some(c) => c
-                    .find_path([gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], crate::movement::PLAYER_RADIUS, &avoid)
-                    .unwrap_or_default(),
-                None => Vec::new(),
-            };
+            let route = self.collision.read().unwrap().as_ref().map(|c|
+                c.find_path([gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], crate::movement::PLAYER_RADIUS, &avoid));
+            match route {
+                // Collision loaded, but A* found NO navmesh route to the target. Report it and STOP,
+                // rather than silently straight-lining into geometry and looking "wedged" — a driver
+                // needs to tell "unreachable" from "stuck" (#166). Clear path_goal so re-issuing the
+                // same target re-evaluates.
+                Some(None) => {
+                    tracing::info!("NAV: no path to ({:.0},{:.0}) — unreachable, stopping", goal.0, goal.1);
+                    gs.log_msg("zone", "No path to destination (unreachable)");
+                    self.set_nav_state("no_path");
+                    self.path.clear();
+                    self.path_goal = None;
+                    *self.goto_target.lock().unwrap() = None;
+                    *self.nav_intent.lock().unwrap() = None;
+                    return;
+                }
+                Some(Some(path)) => { self.path = path; self.set_nav_state("navigating"); }
+                // Collision not loaded yet (zoning): keep the old straight-line-toward-goal fallback.
+                None => { self.path = Vec::new(); self.set_nav_state("navigating"); }
+            }
             tracing::info!("NAV: path to ({:.0},{:.0}) = {} waypoints", goal.0, goal.1, self.path.len());
         }
 
@@ -1644,6 +1673,7 @@ impl Navigator {
                 tracing::info!("NAV: fall of {:.0}u (up to {} dmg) would exceed {} hp — stopping at ledge",
                     drop_to_target, max_dmg, gs.cur_hp);
                 gs.log_msg("zone", "Fall too dangerous (HP too low) — stopped at the ledge");
+                self.set_nav_state("blocked");
                 *self.goto_target.lock().unwrap() = None;
                 *self.nav_intent.lock().unwrap() = None; // else the controller keeps walking the last
                 // wish_dir forever — drifting 1000s of units with no nav activity (eqoxide#71).
@@ -1663,6 +1693,7 @@ impl Navigator {
         let gdist = (gdx * gdx + gdy * gdy).sqrt();
         if gdist <= STOP_DIST {
             tracing::info!("NAV: arrived at ({:.1},{:.1})", goal.0, goal.1);
+            self.set_nav_state("arrived");
             *self.goto_target.lock().unwrap() = None;
             *self.nav_intent.lock().unwrap() = None; // stop driving the controller
             gs.player_heading = eq_heading(gdx, gdy);
@@ -1701,6 +1732,7 @@ impl Navigator {
                             tracing::info!("NAV: stalled (no progress) near ({:.1},{:.1}) — stopping",
                                 gs.player_x, gs.player_y);
                             gs.log_msg("zone", "Path stalled — stopped");
+                            self.set_nav_state("blocked");
                             *self.goto_target.lock().unwrap() = None;
                             *self.nav_intent.lock().unwrap() = None;
                             return;
@@ -1945,6 +1977,7 @@ mod tests {
     fn test_navigator(group: crate::http::GroupShared) -> Navigator {
         Navigator::new(
             Default::default(), // goto_target
+            std::sync::Arc::new(std::sync::Mutex::new("idle".to_string())), // nav_state
             Default::default(), // goto_entity
             Default::default(), // entity_positions
             Default::default(), // entity_ids
