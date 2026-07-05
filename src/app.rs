@@ -1690,15 +1690,16 @@ fn zone_needs_reload(scene_zone: &str, current_zone: &str) -> bool {
 }
 
 /// Distance (units from the player) within which entity billboards get per-frame motion smoothing
-/// and floor-snapping. Same rationale as [`crate::renderer::ANIM_ADVANCE_DIST`] (#152, PR #161):
-/// the skinned entity pass culls everything past [`crate::pass::ENTITY_DRAW_DIST`], so gliding /
-/// floor-raycasting a farther entity is pure CPU with zero on-screen effect — in a crowded outdoor
-/// zone (~700 spawns) that work dominated the update phase. MUST be ≥ `ENTITY_DRAW_DIST` (margin
-/// included) so no entity is ever DRAWN un-smoothed / un-grounded; see the invariant test below.
+/// (dead-reckoned gliding). Same rationale as [`crate::renderer::ANIM_ADVANCE_DIST`] (#152,
+/// PR #161): the skinned entity pass culls everything past [`crate::pass::ENTITY_DRAW_DIST`], so
+/// gliding a farther entity a fraction of a unit per frame is pure CPU with zero on-screen effect —
+/// in a crowded outdoor zone (~700 spawns) that work dominated the update phase. MUST be ≥
+/// `ENTITY_DRAW_DIST` (margin included) so no entity is ever DRAWN un-smoothed; see the invariant
+/// test below. The floor snap is NOT gated by this — see [`smooth_entity_motion`].
 pub(crate) const MOTION_SMOOTH_DIST: f32 = crate::pass::ENTITY_DRAW_DIST + 48.0;
 
-/// Smooth NPC movement and snap billboards to the terrain floor — for entities within
-/// [`MOTION_SMOOTH_DIST`] of the player only.
+/// Smooth NPC movement (entities within [`MOTION_SMOOTH_DIST`] of the player only) and snap ALL
+/// billboards to the terrain floor (memoized, so it's ~free for anything not actively moving).
 ///
 /// Server position updates (OP_ClientUpdate) arrive only a few times per second, so snapping each
 /// billboard to the latest packet looks choppy. Instead we estimate each entity's velocity from its
@@ -1706,9 +1707,14 @@ pub(crate) const MOTION_SMOOTH_DIST: f32 = crate::pass::ENTITY_DRAW_DIST + 48.0;
 /// pace. Large horizontal jumps (spawns, teleports, server corrections) snap instead of sliding.
 /// The floor snap runs on the smoothed position so the ground height follows the glide.
 ///
-/// Entities beyond the gate keep their raw server position and their `motion` entry is DROPPED, so
-/// an entity re-entering range starts from a fresh entry (display == server pos) and SNAPS there
-/// instead of gliding across the distance it covered while out of range on stale state.
+/// Entities beyond the gate track the raw server position (display == target, speed 0): their
+/// skinned model isn't drawn out there, so per-frame gliding would be invisible CPU burn — but the
+/// billboard footprints that DO still render at any distance (name label, fallback quad for
+/// model-less races, minimap dot) must stay grounded exactly as before #152, which the shared
+/// memoized floor snap provides at ~zero cost (a far entity re-raycasts only when a sparse server
+/// update actually moves it, not per frame). Because display tracks the raw position while far, an
+/// entity re-entering the gate starts from its current server pos and SNAPS there instead of
+/// gliding across the distance it covered while out of range.
 fn smooth_entity_motion(
     motion:     &mut std::collections::HashMap<u32, EntityMotion>,
     billboards: &mut [crate::scene::Billboard],
@@ -1729,80 +1735,93 @@ fn smooth_entity_motion(
                                            // send a position only ~every 2.7s; the old 1.0s
                                            // cap made the pace estimate ~3x too high, so the
                                            // entity lurched to each point then waited.
-    // Ids that are both alive this frame AND within the smoothing gate. Everything else's motion
-    // state is dropped below, so despawned entities don't leak and out-of-range entities snap
-    // fresh when they come back.
-    let mut live_near: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    // Ids alive this frame. Everything else's motion state is dropped below, so despawned
+    // entities don't leak state.
+    let mut live: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
     for b in &mut *billboards {
         let target = b.pos;
-        let (dx, dy, dz) = (target[0] - player_pos[0],
-                            target[1] - player_pos[1],
-                            target[2] - player_pos[2]);
-        if dx * dx + dy * dy + dz * dz > MOTION_SMOOTH_DIST * MOTION_SMOOTH_DIST {
-            continue; // not drawn (past ENTITY_DRAW_DIST): keep raw server pos, cost ~nothing
-        }
-        live_near.insert(b.id);
+        live.insert(b.id);
         let m = motion.entry(b.id).or_insert_with(|| EntityMotion {
             display: target, target, speed: 0.0, last_update: now,
             floor_at: [f32::NAN; 3], floor_z: 0.0,
         });
 
-        // A changed server position is a fresh update: estimate the travel pace from the
-        // distance moved since the previous one over the real elapsed interval.
-        if target != m.target {
-            let dx = target[0] - m.target[0];
-            let dy = target[1] - m.target[1];
-            let dz = target[2] - m.target[2];
-            let dt_upd = (now - m.last_update).as_secs_f32().clamp(0.05, MAX_UPD);
-            let horiz = (dx * dx + dy * dy).sqrt();
-            if horiz / dt_upd > TELEPORT_SPEED {
-                m.speed = 0.0;          // teleport / correction — snap, don't slide across
-                m.display = target;
-            } else {
-                m.speed = (horiz * horiz + dz * dz).sqrt() / dt_upd;
+        let (dx, dy, dz) = (target[0] - player_pos[0],
+                            target[1] - player_pos[1],
+                            target[2] - player_pos[2]);
+        if dx * dx + dy * dy + dz * dz > MOTION_SMOOTH_DIST * MOTION_SMOOTH_DIST {
+            // Beyond the smoothing gate: skip the per-frame glide (the skinned model isn't drawn
+            // past ENTITY_DRAW_DIST, so gliding would be invisible CPU burn) and track the raw
+            // server position instead, so the shared floor snap below keeps the still-rendered
+            // footprints (label / fallback quad / minimap dot) grounded and a re-entering entity
+            // snaps rather than gliding on stale state. `last_update` advances only on a real
+            // position change, keeping the pace estimate honest for the first move after re-entry.
+            if target != m.target {
+                m.target = target;
+                m.last_update = now;
             }
-            m.target = target;
-            m.last_update = now;
-        }
+            m.display = target;
+            m.speed = 0.0;
+        } else {
+            // A changed server position is a fresh update: estimate the travel pace from the
+            // distance moved since the previous one over the real elapsed interval.
+            if target != m.target {
+                let dx = target[0] - m.target[0];
+                let dy = target[1] - m.target[1];
+                let dz = target[2] - m.target[2];
+                let dt_upd = (now - m.last_update).as_secs_f32().clamp(0.05, MAX_UPD);
+                let horiz = (dx * dx + dy * dy).sqrt();
+                if horiz / dt_upd > TELEPORT_SPEED {
+                    m.speed = 0.0;          // teleport / correction — snap, don't slide across
+                    m.display = target;
+                } else {
+                    m.speed = (horiz * horiz + dz * dz).sqrt() / dt_upd;
+                }
+                m.target = target;
+                m.last_update = now;
+            }
 
-        // Glide the rendered position toward the latest server position at that pace, never
-        // overshooting: a moving entity travels smoothly over the whole update gap and a
-        // stopped one settles cleanly (no extrapolation drift past its last point).
-        let to = [target[0] - m.display[0], target[1] - m.display[1], target[2] - m.display[2]];
-        let d = (to[0] * to[0] + to[1] * to[1] + to[2] * to[2]).sqrt();
-        if d > 1e-4 {
-            let move_d = (m.speed * dt).min(d);
-            let f = move_d / d;
-            for i in 0..3 { m.display[i] += to[i] * f; }
-        }
-        b.pos = m.display;
+            // Glide the rendered position toward the latest server position at that pace, never
+            // overshooting: a moving entity travels smoothly over the whole update gap and a
+            // stopped one settles cleanly (no extrapolation drift past its last point).
+            let to = [target[0] - m.display[0], target[1] - m.display[1], target[2] - m.display[2]];
+            let d = (to[0] * to[0] + to[1] * to[1] + to[2] * to[2]).sqrt();
+            if d > 1e-4 {
+                let move_d = (m.speed * dt).min(d);
+                let f = move_d / d;
+                for i in 0..3 { m.display[i] += to[i] * f; }
+            }
+            b.pos = m.display;
 
-        // Override "idle" action with "walking" when the entity is actively moving
-        // toward its server target. Preserves dead / combat / sitting overrides —
-        // only replaces "idle" (the default for all non-dead, non-swinging entities
-        // from scene.rs, since the server animation field is always "Standing" while
-        // an NPC moves between update packets).
-        if b.action == "idle" && m.speed > 0.5 && d > 1e-4 {
-            b.action = "walking".to_string();
-        }
+            // Override "idle" action with "walking" when the entity is actively moving
+            // toward its server target. Preserves dead / combat / sitting overrides —
+            // only replaces "idle" (the default for all non-dead, non-swinging entities
+            // from scene.rs, since the server animation field is always "Standing" while
+            // an NPC moves between update packets).
+            if b.action == "idle" && m.speed > 0.5 && d > 1e-4 {
+                b.action = "walking".to_string();
+            }
 
-        // Face the direction of travel while moving, exactly like the player does. The
-        // server `heading` field is stale between the sparse position updates and often
-        // points ~180° from the glide vector, so rendering it verbatim made moving NPCs
-        // appear to walk backwards. Derive heading (degrees, 0=north) from the glide delta
-        // `to` (east=to[0], north=to[1]); when stopped, keep the authoritative server
-        // heading (b.heading is refreshed from the entity each frame). (eqoxide#106)
-        if d > 0.1 && m.speed > 0.5 {
-            b.heading = (-to[0]).atan2(to[1]).to_degrees().rem_euclid(360.0);
+            // Face the direction of travel while moving, exactly like the player does. The
+            // server `heading` field is stale between the sparse position updates and often
+            // points ~180° from the glide vector, so rendering it verbatim made moving NPCs
+            // appear to walk backwards. Derive heading (degrees, 0=north) from the glide delta
+            // `to` (east=to[0], north=to[1]); when stopped, keep the authoritative server
+            // heading (b.heading is refreshed from the entity each frame). (eqoxide#106)
+            if d > 0.1 && m.speed > 0.5 {
+                b.heading = (-to[0]).atan2(to[1]).to_degrees().rem_euclid(360.0);
+            }
         }
 
         // Snap the billboard to the terrain floor so it doesn't hover above geometry.
         // NPCs get z from the server spawn/update packets; the player gets floor_z
-        // applied each frame. Same grounding here, on the smoothed position — but only
-        // for near entities, and memoized: the downward raycast is the single most
-        // expensive piece of the old every-entity loop, and a stationary entity's
-        // position is bit-identical frame to frame, so only re-raycast on movement (#152).
+        // applied each frame. Same grounding here, on the smoothed position — for ALL
+        // entities (labels / fallback quads / minimap dots render at any distance), but
+        // memoized: the downward raycast is the single most expensive piece of the old
+        // every-entity loop, and the compared position is bit-identical frame to frame
+        // unless the entity actually moved (near: the glide has settled; far: the raw
+        // server pos only changes on a sparse update), so only re-raycast on movement (#152).
         match collision {
             Some(col) => {
                 if b.pos != m.floor_at {
@@ -1817,7 +1836,7 @@ fn smooth_entity_motion(
         }
     }
 
-    motion.retain(|id, _| live_near.contains(id));
+    motion.retain(|id, _| live.contains(id));
 }
 
 #[cfg(test)]
@@ -1835,12 +1854,12 @@ mod tests {
         }
     }
 
-    /// Flat floor at z=0 spanning east/north [-100,100], for floor-snap tests.
-    fn flat_collision() -> crate::assets::Collision {
+    /// Flat floor at z=`h` spanning east/north [-100,100], for floor-snap tests.
+    fn flat_collision_at(h: f32) -> crate::assets::Collision {
         use crate::assets::{Collision, MeshData, RenderMode, ZoneAssets};
         let floor = MeshData {
-            positions: vec![[-100.0, 0.0, -100.0], [100.0, 0.0, -100.0],
-                            [100.0, 0.0, 100.0], [-100.0, 0.0, 100.0]],
+            positions: vec![[-100.0, h, -100.0], [100.0, h, -100.0],
+                            [100.0, h, 100.0], [-100.0, h, 100.0]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
             center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
@@ -1861,18 +1880,22 @@ mod tests {
     }
 
     #[test]
-    fn distant_entity_is_skipped_and_state_dropped() {
+    fn distant_entity_is_not_glided_and_despawn_drops_state() {
         let mut motion: HashMap<u32, EntityMotion> = HashMap::new();
         let now = std::time::Instant::now();
         let far = [MOTION_SMOOTH_DIST + 100.0, 0.0, 0.0];
+        // Two ticks: an out-of-range entity's raw server position passes through untouched
+        // (no glide state ever forms — display tracks the raw pos exactly, speed stays 0).
         let mut bbs = vec![bb(7, far)];
-        // Two ticks: entry must never be created for an out-of-range entity, and its raw
-        // server position must pass through untouched (it isn't drawn anyway).
         for _ in 0..2 {
             smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], None, now, 1.0 / 60.0);
         }
         assert_eq!(bbs[0].pos, far, "distant entity keeps its raw server position");
-        assert!(motion.is_empty(), "no motion state may accumulate for out-of-range entities");
+        assert_eq!(motion[&7].display, far, "display must track the raw pos while out of range");
+        assert_eq!(motion[&7].speed, 0.0, "no glide pace may accumulate while out of range");
+        // Despawn (entity absent this frame) → its state is dropped, no leak.
+        smooth_entity_motion(&mut motion, &mut [], [0.0; 3], None, now, 1.0 / 60.0);
+        assert!(motion.is_empty(), "despawned entity's motion state must be dropped");
     }
 
     #[test]
@@ -1904,11 +1927,11 @@ mod tests {
         let mut bbs = vec![bb(7, [20.0, 0.0, 0.0])];
         smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], None, t1, 1.0 / 60.0);
         assert!(bbs[0].pos[0] < 20.0, "precondition: display lags the target mid-glide");
-        // Entity leaves range for a frame → its state must be dropped …
+        // Entity leaves range for a frame → its display must jump to tracking the raw pos …
         let far = [MOTION_SMOOTH_DIST + 100.0, 0.0, 0.0];
         let mut bbs = vec![bb(7, far)];
         smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], None, t1, 1.0 / 60.0);
-        assert!(motion.is_empty(), "out-of-range entity's motion state must be dropped");
+        assert_eq!(motion[&7].display, far, "out-of-range entity's display tracks the raw pos");
         // … so on re-entry it snaps to the fresh server position instead of gliding
         // from the stale display across the distance covered while out of range.
         let mut bbs = vec![bb(7, [30.0, 0.0, 0.0])];
@@ -1918,21 +1941,48 @@ mod tests {
 
     #[test]
     fn near_entity_floor_snaps_and_memoizes() {
-        let col = flat_collision();
+        let col_a = flat_collision_at(0.0);
+        let col_b = flat_collision_at(2.0); // different height — any re-raycast is detectable
         let mut motion: HashMap<u32, EntityMotion> = HashMap::new();
         let now = std::time::Instant::now();
-        // Near entity hovering at z=5 over the z=0 floor → snapped down to the floor,
-        // repeatedly (the memoized result must serve every following stationary frame).
-        for _ in 0..3 {
+        // Frame 1: entity hovering at z=5 over the z=0 floor → raycast, snapped to z=0.
+        let mut bbs = vec![bb(7, [10.0, 0.0, 5.0])];
+        smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], Some(&col_a), now, 1.0 / 60.0);
+        assert!(bbs[0].pos[2].abs() < 1e-3, "hovering entity snaps to floor, got z={}", bbs[0].pos[2]);
+        // Frames 2-3: SAME position, but the floor swapped to z=2. A working memo cache serves
+        // the stored z=0 WITHOUT re-raycasting; a silently broken cache would re-raycast and
+        // return z=2 — so this pins that the raycast really ran only once.
+        for _ in 0..2 {
             let mut bbs = vec![bb(7, [10.0, 0.0, 5.0])];
-            smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], Some(&col), now, 1.0 / 60.0);
-            assert!(bbs[0].pos[2].abs() < 1e-3, "hovering entity snaps to floor, got z={}", bbs[0].pos[2]);
+            smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], Some(&col_b), now, 1.0 / 60.0);
+            assert!(bbs[0].pos[2].abs() < 1e-3,
+                "stationary entity must be served from the memo cache (no re-raycast), got z={}",
+                bbs[0].pos[2]);
         }
-        // Distant entity: NOT floor-snapped (not drawn) — raw z passes through.
-        let far = [MOTION_SMOOTH_DIST + 100.0, 0.0, 5.0];
-        let mut bbs = vec![bb(8, far)];
-        smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], Some(&col), now, 1.0 / 60.0);
-        assert_eq!(bbs[0].pos[2], 5.0, "distant entity skips the floor raycast");
+        // Server moves the entity → cache invalidated → fresh raycast against the CURRENT
+        // floor (z=2). Guards against a cache that never invalidates.
+        let mut bbs = vec![bb(7, [50.0, 0.0, 5.0])]; // 40u jump in one tick = teleport snap
+        smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], Some(&col_b), now, 1.0 / 60.0);
+        assert!((bbs[0].pos[2] - 2.0).abs() < 1e-3,
+            "moved entity must re-raycast against the current floor, got z={}", bbs[0].pos[2]);
+    }
+
+    #[test]
+    fn distant_entity_is_still_floor_snapped_for_labels() {
+        // A far entity's skinned model isn't drawn, but its name label / fallback quad /
+        // minimap dot still render at any distance — so it must stay grounded exactly as
+        // before the #152 gate (memoized: re-raycast only when the server pos changes).
+        let col = flat_collision_at(0.0);
+        let mut motion: HashMap<u32, EntityMotion> = HashMap::new();
+        let now = std::time::Instant::now();
+        let player = [1000.0, 0.0, 0.0]; // entity is ~990u away — well past MOTION_SMOOTH_DIST
+        assert!(1000.0 - 10.0 > MOTION_SMOOTH_DIST, "precondition: entity is out of range");
+        for _ in 0..2 {
+            let mut bbs = vec![bb(8, [10.0, 0.0, 5.0])];
+            smooth_entity_motion(&mut motion, &mut bbs, player, Some(&col), now, 1.0 / 60.0);
+            assert!(bbs[0].pos[2].abs() < 1e-3,
+                "distant entity's billboard must snap to the floor, got z={}", bbs[0].pos[2]);
+        }
     }
 
     #[test]
