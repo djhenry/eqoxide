@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 /// Per-window persisted state. `None` = "use the registry default".
-#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq, Debug)]
 pub struct WinState {
     #[serde(default)]
     pub open: Option<bool>,
@@ -27,6 +27,14 @@ fn full_alpha() -> u8 {
     255
 }
 
+// NOT derived: `#[derive(Default)]` would give alpha 0 (invisible window) —
+// the serde `default = "full_alpha"` above only applies when deserializing.
+impl Default for WinState {
+    fn default() -> Self {
+        WinState { open: None, pos: None, size: None, alpha: 255 }
+    }
+}
+
 /// Saved OS window geometry. `pos` is best-effort: winit cannot read or set the
 /// outer position on Wayland, so it round-trips only on X11/XWayland.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Debug)]
@@ -39,7 +47,7 @@ pub struct OsWindowState {
 }
 
 /// On-disk form. Every field defaults so v1 files (locked + windows only) load.
-#[derive(serde::Serialize, serde::Deserialize, Default)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Persisted {
     #[serde(default)]
     version: u32,
@@ -62,6 +70,23 @@ fn default_scale() -> f32 {
 }
 fn default_fades() -> bool {
     true
+}
+
+// NOT derived: `#[derive(Default)]` would give ui_scale 0.0 (clamped to 0.5 —
+// a half-size UI on first run) and fades false; the serde `default =` fns
+// above only run during deserialization, not for a missing file.
+impl Default for Persisted {
+    fn default() -> Self {
+        Persisted {
+            version: 0,
+            locked: false,
+            ui_scale: default_scale(),
+            fades: default_fades(),
+            screen: None,
+            os_window: None,
+            windows: HashMap::new(),
+        }
+    }
 }
 
 pub struct Layout {
@@ -100,7 +125,7 @@ impl Layout {
     }
 
     pub fn from_path(path: PathBuf) -> Self {
-        let persisted = std::fs::read_to_string(&path)
+        let mut persisted = std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| match serde_json::from_str::<Persisted>(&s) {
                 Ok(p) => Some(p),
@@ -110,6 +135,18 @@ impl Layout {
                 }
             })
             .unwrap_or_default();
+        // v1 files (pre-#162) used different window ids and a different point
+        // space — their geometry is meaningless now. Keep the lock flag, drop
+        // the window entries (one-time fresh layout).
+        if persisted.version < 2 && !persisted.windows.is_empty() {
+            tracing::info!(
+                "ui layout: migrating v{} file {} — dropping {} stale window entries",
+                persisted.version,
+                path.display(),
+                persisted.windows.len()
+            );
+            persisted.windows.clear();
+        }
         Layout {
             locked: persisted.locked,
             ui_scale: persisted.ui_scale.clamp(0.5, 2.0),
@@ -148,9 +185,14 @@ impl Layout {
             }
         };
         if old != screen {
-            for ws in self.windows.values_mut() {
+            for (id, ws) in self.windows.iter_mut() {
                 if let Some(pos) = ws.pos.as_mut() {
-                    let size = ws.size.unwrap_or([100.0, 40.0]);
+                    // Non-resizable windows have no stored size; use their
+                    // registry default so half-classification is right.
+                    let size = ws
+                        .size
+                        .or_else(|| super::registry::get(id).map(|d| d.default_size))
+                        .unwrap_or([100.0, 40.0]);
                     pos[0] = remap_axis(pos[0], size[0], old[0], screen[0]);
                     pos[1] = remap_axis(pos[1], size[1], old[1], screen[1]);
                 }
@@ -280,34 +322,29 @@ impl Layout {
         self.observed.insert(id.to_string(), (min, size));
     }
 
-    /// Debounced save; call once per frame. The actual disk write happens on a
-    /// throwaway thread so a slow disk can't hitch the render loop.
+    /// Debounced save; call once per frame. The file is tiny (a few KB), so a
+    /// synchronous atomic write is cheaper and safer than a detached writer
+    /// thread (which could race `save_now` and leave a torn file).
     pub fn maybe_save(&mut self) {
         if self.dirty && self.last_save.elapsed() >= Duration::from_millis(1000) {
-            if let Some(json) = self.serialize() {
-                let path = self.path.clone();
-                std::thread::spawn(move || {
-                    if let Err(e) = std::fs::write(&path, json) {
-                        tracing::warn!("ui layout: save failed ({}): {e}", path.display());
-                    }
-                });
-                self.dirty = false;
-                self.last_save = Instant::now();
-            }
+            self.save_now();
         }
     }
 
-    /// Synchronous flush — call on every exit path.
+    /// Synchronous, atomic flush (temp file + rename) — call on every exit path.
     pub fn save_now(&mut self) {
         if !self.dirty {
             return;
         }
         if let Some(json) = self.serialize() {
-            if let Err(e) = std::fs::write(&self.path, json) {
-                tracing::warn!("ui layout: save failed ({}): {e}", self.path.display());
-            } else {
-                self.dirty = false;
-                self.last_save = Instant::now();
+            let tmp = self.path.with_extension("json.tmp");
+            let res = std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, &self.path));
+            match res {
+                Ok(()) => {
+                    self.dirty = false;
+                    self.last_save = Instant::now();
+                }
+                Err(e) => tracing::warn!("ui layout: save failed ({}): {e}", self.path.display()),
             }
         }
     }
@@ -371,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_file_loads_with_defaults() {
+    fn v1_file_loads_with_defaults_and_drops_stale_geometry() {
         let path = tmp("v1compat");
         std::fs::write(
             &path,
@@ -379,14 +416,12 @@ mod tests {
         )
         .unwrap();
         let l = Layout::from_path(path.clone());
-        assert!(l.locked);
+        assert!(l.locked, "settings like the lock flag survive migration");
         assert_eq!(l.ui_scale, 1.0);
         assert!(l.fades);
         assert_eq!(l.os_window, None);
-        let w = l.win("inventory").unwrap();
-        assert_eq!(w.pos, Some([8.0, 90.0]));
-        assert_eq!(w.alpha, 200);
-        assert_eq!(w.open, None, "v1 files have no open state; use default");
+        // v1 geometry is in a different id-set + point space: dropped.
+        assert_eq!(l.win("inventory"), None);
         let _ = std::fs::remove_file(path);
     }
 
@@ -503,5 +538,28 @@ mod tests {
     fn sanitize_strips_path_chars() {
         assert_eq!(sanitize("Bob"), "Bob");
         assert_eq!(sanitize("E'vil/../x"), "Evilx");
+    }
+
+    /// Regression (#162 live-verify): a missing layout file must yield the real
+    /// defaults, not derive-Default zeros (ui_scale 0.5-clamped, fades off).
+    #[test]
+    fn fresh_layout_has_sane_defaults() {
+        let path = tmp("fresh_defaults");
+        let _ = std::fs::remove_file(&path);
+        let l = Layout::from_path(path);
+        assert_eq!(l.ui_scale, 1.0);
+        assert!(l.fades);
+        assert!(!l.locked);
+    }
+
+    /// Regression (#162 live-verify): recording geometry for a window that has
+    /// no stored entry must not create it with alpha 0 (invisible window).
+    #[test]
+    fn geometry_entry_defaults_opaque() {
+        let mut l = Layout::from_path(tmp("alpha_default"));
+        l.set_geometry("chat", [0.0, 100.0], Some([400.0, 200.0]));
+        assert_eq!(l.alpha_of("chat"), 255);
+        l.set_open("map", true);
+        assert_eq!(l.alpha_of("map"), 255);
     }
 }

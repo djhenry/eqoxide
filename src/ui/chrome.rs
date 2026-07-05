@@ -90,11 +90,14 @@ fn default_pos(def: &WindowDef, screen: egui::Rect, size: [f32; 2]) -> egui::Pos
     egui::pos2(x, y)
 }
 
-/// Show one chromed window. Returns `None` when egui culled it entirely.
+/// Show one chromed window. `screen` is the true point-space screen rect
+/// computed by the caller — NOT `ctx.screen_rect()`, which is stale on the
+/// first frame after any zoom change.
 pub fn eq_window(
     ctx: &egui::Context,
     sys: &mut WinSys,
     def: &WindowDef,
+    screen: egui::Rect,
     add_contents: impl FnOnce(&mut egui::Ui),
 ) -> FrameResult {
     let id = def.id;
@@ -103,12 +106,15 @@ pub fn eq_window(
     let stored = sys.layout.win(id).cloned();
     let observed = sys.layout.observed(id);
 
+    // Stored size is the CONTENT size (what default_size/fixed_size control);
+    // persisting the outer rect here would grow windows by the chrome overhead
+    // every session.
     let size = stored
         .as_ref()
         .and_then(|s| s.size)
         .filter(|_| def.resizable)
         .unwrap_or(def.default_size);
-    let dpos = default_pos(def, ctx.screen_rect(), size);
+    let dpos = default_pos(def, screen, size);
 
     let opacity = sys.effective_alpha(ctx, id, false);
 
@@ -119,15 +125,17 @@ pub fn eq_window(
         .title_bar(false)
         .collapsible(false)
         .frame(frame)
-        // Off-screen repair happens at load (persist::remap_all); constrain
-        // keeps live drags reachable without fighting stored positions.
-        .constrain(true)
+        // Native behavior (design §5): windows drag freely — even partly
+        // offscreen ("tucking") — and off-screen repair happens only at load
+        // time via persist::remap_all. constrain(true) would silently rewrite
+        // stored positions every frame.
+        .constrain(false)
         .movable(!locked)
         .resizable(def.resizable && !locked);
 
     if reset_pending {
         win = win
-            .current_pos(default_pos(def, ctx.screen_rect(), def.default_size))
+            .current_pos(default_pos(def, screen, def.default_size))
             .fixed_size(egui::Vec2::from(def.default_size));
     } else {
         let pos = stored.as_ref().and_then(|s| s.pos).map(|p| egui::pos2(p[0], p[1])).unwrap_or(dpos);
@@ -142,11 +150,14 @@ pub fn eq_window(
     }
 
     let mut result = FrameResult::default();
+    let mut content_size = egui::Vec2::ZERO;
 
     let resp = win.show(ctx, |ui| {
         ui.set_opacity(opacity);
         result.close_clicked = title_strip(ui, def, locked);
         add_contents(ui);
+        // Content size — the space default_size/fixed_size actually control.
+        content_size = ui.min_rect().size();
     });
 
     if let Some(resp) = resp {
@@ -184,6 +195,8 @@ pub fn eq_window(
         }
 
         // Record geometry once the window has settled (skip the reset frame).
+        // Position is the OUTER rect min (what default_pos/current_pos set);
+        // size is the CONTENT size (what default_size/fixed_size set).
         let rect = resp.response.rect;
         let rect_min = [rect.min.x, rect.min.y];
         let rect_size = [rect.width(), rect.height()];
@@ -198,7 +211,8 @@ pub fn eq_window(
                 .unwrap_or(false);
             let has_stored = stored.as_ref().map(|s| s.pos.is_some()).unwrap_or(false);
             if has_stored || moved {
-                let size = def.resizable.then_some(rect_size);
+                let size = (def.resizable && content_size != egui::Vec2::ZERO)
+                    .then_some([content_size.x, content_size.y]);
                 sys.layout.set_geometry(id, rect_min, size);
             }
         }

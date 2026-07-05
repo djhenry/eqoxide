@@ -110,6 +110,10 @@ pub struct UiState {
     pub chat: ChatState,
     pub minimap_zoom: f32,
     cmds: Vec<UiCmd>,
+    /// Transient windows the user dismissed with the ✕ this session; cleared
+    /// when the window's game-state gate goes false, so the next session
+    /// (merchant visit, NPC reply, …) reopens it.
+    dismissed: std::collections::HashSet<&'static str>,
     theme_applied: bool,
 }
 
@@ -121,6 +125,7 @@ impl UiState {
             chat: ChatState::default(),
             minimap_zoom: 1.0,
             cmds: Vec::new(),
+            dismissed: std::collections::HashSet::new(),
             theme_applied: false,
         }
     }
@@ -165,10 +170,13 @@ impl UiState {
     }
 
     /// Draw every open window. Call once per frame inside `egui::Context::run`.
+    /// `screen_pts` is the TRUE point-space screen size computed by the caller
+    /// — `ctx.screen_rect()` is wrong on the first frame after a zoom change.
     #[allow(clippy::too_many_arguments)]
     pub fn draw_all(
         &mut self,
         ctx: &egui::Context,
+        screen_pts: [f32; 2],
         scene: &SceneState,
         spells: &crate::spells::SpellDb,
         acts: &Actions,
@@ -181,8 +189,11 @@ impl UiState {
             theme::apply(ctx);
             self.theme_applied = true;
         }
-        let sr = ctx.screen_rect();
-        self.sys.layout.remap_all([sr.width(), sr.height()]);
+        // Clear LAST frame's reset flags before drawing, so a reset issued
+        // during frame N is actually observed by chrome during frame N+1.
+        self.sys.layout.end_frame();
+        self.sys.layout.remap_all(screen_pts);
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, screen_pts.into());
 
         // Keep /r working: remember the sender of the most recent incoming tell
         // (logged as kind "tell" with a "<Sender> text" prefix).
@@ -215,9 +226,18 @@ impl UiState {
         let mut cmds = std::mem::take(&mut self.cmds);
         for def in REGISTRY {
             let open = if def.transient {
-                Self::transient_open(def.id, scene, acts)
+                let gate = Self::transient_open(def.id, scene, acts);
+                if !gate {
+                    // Gate closed: forget any dismissal so the next session
+                    // (new merchant visit, new NPC reply…) reopens the window.
+                    self.dismissed.remove(def.id);
+                }
+                gate && !self.dismissed.contains(def.id)
             } else {
-                self.sys.layout.is_open(def.id, def.default_open)
+                // A pending group invite must be answerable even when the
+                // Group window is closed: force it open while one is up.
+                (def.id == registry::GROUP && scene.pending_invite.is_some())
+                    || self.sys.layout.is_open(def.id, def.default_open)
             };
             if !open {
                 continue;
@@ -239,12 +259,14 @@ impl UiState {
                 minimap_zoom: &mut self.minimap_zoom,
                 fps,
             };
-            let result = chrome::eq_window(ctx, &mut self.sys, def, |ui| {
+            let result = chrome::eq_window(ctx, &mut self.sys, def, screen, |ui| {
                 windows::draw(def.id, ui, &mut cx)
             });
             if result.close_clicked {
                 if def.transient {
-                    // Transients close by telling the game to end the session.
+                    // Hide immediately; also tell the game to end the session
+                    // where a protocol path exists.
+                    self.dismissed.insert(def.id);
                     match def.id {
                         registry::MERCHANT => {
                             *acts.trade.lock().unwrap() = Some(crate::http::TradeCmd::Close);
@@ -278,7 +300,6 @@ impl UiState {
         }
         self.cmds = cmds;
 
-        self.sys.layout.end_frame();
         self.sys.layout.maybe_save();
     }
 }
@@ -338,7 +359,7 @@ mod tests {
             ui.sys.layout.set_locked(locked);
             let ctx = egui::Context::default();
             let _ = ctx.run(Default::default(), |ctx| {
-                ui.draw_all(ctx, &scene, &spells, &acts, [0.0; 2], [100.0; 2], None, 60.0);
+                ui.draw_all(ctx, [1280.0, 720.0], &scene, &spells, &acts, [0.0; 2], [100.0; 2], None, 60.0);
             });
         }
         // Populated-ish scene (merchant open forces the transient path too).
@@ -349,7 +370,7 @@ mod tests {
         scene.coin = [1, 2, 3, 4];
         let ctx = egui::Context::default();
         let _ = ctx.run(Default::default(), |ctx| {
-            ui.draw_all(ctx, &scene, &spells, &acts, [0.0; 2], [100.0; 2], None, 60.0);
+            ui.draw_all(ctx, [1280.0, 720.0], &scene, &spells, &acts, [0.0; 2], [100.0; 2], None, 60.0);
         });
         let _ = std::fs::remove_file(crate::config::config_dir().join("ui_layout___uitest__.json"));
     }

@@ -311,11 +311,21 @@ impl App {
         }
         let maximized = window.is_maximized();
         let pos = window.outer_position().ok().map(|p| [p.x, p.y]);
-        self.ui_state.layout_mut().set_os_window(crate::ui::persist::OsWindowState {
-            size: [size.width, size.height],
-            pos,
-            maximized,
-        });
+        // While maximized, keep the last floating size/pos on record so
+        // un-maximizing next session restores a sensible window instead of a
+        // monitor-sized one; only the flag updates.
+        let prev = self.ui_state.layout().os_window;
+        let st = if maximized {
+            let prev = prev.unwrap_or(crate::ui::persist::OsWindowState {
+                size: [size.width, size.height],
+                pos,
+                maximized: true,
+            });
+            crate::ui::persist::OsWindowState { maximized: true, ..prev }
+        } else {
+            crate::ui::persist::OsWindowState { size: [size.width, size.height], pos, maximized }
+        };
+        self.ui_state.layout_mut().set_os_window(st);
     }
 
     /// Cast a ray from the camera through screen pixel `cursor` and return the
@@ -1197,7 +1207,7 @@ impl App {
         let load_status_text = self.load_status.lock().unwrap().clone();
         let sync_frac = *self.sync_progress.lock().unwrap();
         let prof_egui = crate::profiling::Stopwatch::start();
-        Self::egui_pass(
+        let egui_wants_repaint = Self::egui_pass(
             &mut self.egui_state, &mut self.egui_renderer, &self.egui_ctx, &mut self.ui_state, &self.window,
             &mut enc, &view, renderer, self.loading, &self.current_zone, &load_status_text,
             sync_frac,
@@ -1229,9 +1239,14 @@ impl App {
             self.frame_profile.blend(&sample, frame_ms);
         }
 
-        // NOTE: no `request_redraw()` here. The loop is event-driven — `about_to_wait` decides whether
-        // the next frame is needed (active animation/input/packets) and only then requests a redraw.
-        // A still scene therefore stops rendering and idle CPU drops to ~0. See `about_to_wait`/`wake`.
+        // NOTE: no unconditional `request_redraw()` here. The loop is event-driven — `about_to_wait`
+        // decides whether the next frame is needed and only then requests a redraw. A still scene
+        // therefore stops rendering and idle CPU drops to ~0. See `about_to_wait`/`wake`.
+        // Exception: egui-driven animations (window fades, casting bar, camp countdown easing) have
+        // no input/packet to wake the loop, so honor egui's own repaint request (#162).
+        if egui_wants_repaint {
+            self.wake();
+        }
         // GPU borrow (renderer) is released here.
         // pending_reload is checked by window_event after render_frame returns.
     }
@@ -1264,9 +1279,9 @@ impl App {
         show_debug:    bool,
         corrections:   u32,
         frame_profile: &crate::profiling::FrameProfile,
-    ) {
+    ) -> bool {
         let (Some(egui_state), Some(egui_renderer), Some(egui_ctx), Some(window)) =
-            (egui_state, egui_renderer, egui_ctx, window) else { return };
+            (egui_state, egui_renderer, egui_ctx, window) else { return false };
 
         let raw_input = egui_state.take_egui_input(window);
         let view_proj = renderer.last_view_proj;
@@ -1285,6 +1300,14 @@ impl App {
             / nppp)
             .max(0.05);
         egui_ctx.set_zoom_factor(zoom);
+        // The TRUE point-space screen size. Never trust ctx.screen_rect() for
+        // layout math: set_zoom_factor is applied lazily inside run(), and on
+        // the first frame egui's previous screen_rect is a 10000x10000
+        // placeholder — remapping/anchoring against it destroys saved layouts.
+        let screen_pts = [
+            screen_w as f32 / (nppp * zoom),
+            screen_h as f32 / (nppp * zoom),
+        ];
 
         let full_output = egui_ctx.run(raw_input, |ctx| {
             hud::draw_fps(ctx, current_fps);
@@ -1296,7 +1319,7 @@ impl App {
                 hud::draw_loading(ctx, current_zone, load_status, sync_progress);
             } else {
                 hud::draw_labels(ctx, scene, view_proj, screen_w, screen_h, cam_eye, collision);
-                ui_state.draw_all(ctx, scene, spells, acts, zone_min, zone_max, zone_map, current_fps);
+                ui_state.draw_all(ctx, screen_pts, scene, spells, acts, zone_min, zone_max, zone_map, current_fps);
                 if show_debug {
                     hud::draw_debug_overlay(ctx, scene.player_pos, scene.player_heading, current_zone, corrections);
                 }
@@ -1331,6 +1354,14 @@ impl App {
             egui_renderer.render(&mut pass.forget_lifetime(), &primitives, &screen_desc);
         }
         for id in &full_output.textures_delta.free { egui_renderer.free_texture(id); }
+
+        // True when egui has an animation in flight (fade, gauge easing, camp
+        // countdown): the caller must keep the event-driven loop awake.
+        full_output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|v| v.repaint_delay < std::time::Duration::from_millis(200))
+            .unwrap_or(false)
     }
 
     /// Submit the command buffer; if a /frame capture is pending, copy the
@@ -1371,7 +1402,9 @@ impl App {
             renderer.device.poll(wgpu::Maintain::Wait);
             let png = encode_frame_png(
                 &slice.get_mapped_range(), w, h, row_pitch, renderer.surface_config.format,
-                Some(512),
+                // 1024 keeps window text readable in captures (#162); 512 made
+                // the new UI's 12pt labels illegible.
+                Some(1024),
             );
             let _ = tx.send(png);
         } else {
@@ -1472,6 +1505,24 @@ impl ApplicationHandler for App {
             self.maybe_finish_load();
             self.poll_sync();
             return;
+        }
+
+        // Release events must reach the game even when egui consumes them
+        // (typing in chat while holding W): otherwise `keys_held` keeps the key
+        // and the character runs forever. Same for losing window focus.
+        match &event {
+            WindowEvent::KeyboardInput { event: key_event, .. } => {
+                if key_event.state == ElementState::Released {
+                    if let PhysicalKey::Code(code) = key_event.physical_key {
+                        self.keys_held.remove(&code);
+                    }
+                }
+            }
+            WindowEvent::Focused(false) => {
+                self.keys_held.clear();
+                self.drag_active = false;
+            }
+            _ => {}
         }
 
         // Let egui see the event first. If it wants a repaint (hover/focus/typing) or consumes the
@@ -1595,12 +1646,15 @@ impl ApplicationHandler for App {
                                     self.ui_state.layout_mut().set_locked(!locked);
                                 }
                                 // Window toggles route through the registry so
-                                // hotkeys live in one table (#162).
-                                other => {
+                                // hotkeys live in one table (#162). Ignore OS
+                                // key-repeat — holding the key must not strobe
+                                // the window open/closed.
+                                other if !event.repeat => {
                                     if let Some(key) = winit_to_egui_key(other) {
                                         self.ui_state.hotkey(key);
                                     }
                                 }
+                                _ => {}
                             }
                         }
                         ElementState::Released => {
