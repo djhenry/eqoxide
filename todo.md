@@ -3,32 +3,18 @@
 Active work + bite-sized tasks for smaller agents to continue if the main session stops.
 Keep this updated as tasks complete.
 
-## IN PROGRESS: UI overhaul (#162, agent "ui-dev", branch worktree-ui-overhaul)
+## IN REVIEW: UI overhaul (#162, agent "ui-dev", PR #170, branch worktree-ui-overhaul)
 
-State at pause (see docs/ui-overhaul-design.md + docs/ui-window-management.md):
-- DONE + committed (4 commits): design doc; core window framework (src/ui/ --
-  registry/chrome/theme/persist v2/icons/widgets, app.rs+main.rs rewire, hud.rs
-  reduced to overlays, ui_layout.rs deleted); all 21 window bodies; core
-  review-fix commit (frame-1 screen_rect, content-size persistence,
-  constrain(false), stuck keys, repaint wake, atomic saves, transient dismissal).
-- UNCOMMITTED in worktree: small window fixes (chat /camp, loot range 25,
-  group leader-gating, inventory move slots 0..=33) + docs rewrite -- plus a
-  background agent was finishing the nav<->render sync cluster when paused:
-  trainer-close/auto-attack/chat-echo/loot-state/task-offers/pending-invite
-  mirrors via app_tx synthetic packets + PetCmdReq slot (verify with
-  `cargo test` + `git diff` before building on it).
-- REMAINING: (1) check/complete the sync-agent work, cargo test; (2) Selector
-  polish -- list transients greyed + global opacity (touches ui/mod.rs
-  window_list + selector.rs); (3) final live verify: launch `--config uidev`
-  (account uidev/uidevpass, char Uidev, lsid 40; ~/.config/eqoxide/config-uidev.yaml),
-  screenshot via /v1/observe/frame at two OS window sizes to prove scaling +
-  layout restore (delete ~/.config/eqoxide/ui_layout_Uidev.json for a fresh run);
-  (4) commit, push, PR referencing #162, comment on issue; (5) file follow-up
-  issues for blocked parity: buffs (no OP_Buff), bags/bank, spellbook contents,
-  interactive loot, PC trade, item tooltips, respawn picker (design doc section 9).
-- Live verification so far: char creation, zoning, all default windows render
-  correctly (1024px frames), chat/dialogue/map/gauges work, persistence file v2
-  round-trips with correct defaults after the Default-derive fix.
+Complete and live-verified; awaiting review/merge of PR #170. Registry-driven
+window system in src/ui/ (see docs/ui-overhaul-design.md + ui-window-management.md):
+21 windows, RoF2 theme from the real TGAs, per-char persistence v2 incl. OS
+window geometry, non-closeable Window Selector, UI scaling, nav<->render sync
+via synthetic app_tx packets, pet commands (+/v1/pet/command), /v1/trainer/close.
+Follow-ups to file as issues after merge (design doc section 9): buff window
+(OP_Buff), bags/bank, spellbook contents, interactive loot, PC trade, item
+tooltips, respawn picker, hotbutton bar. Verification char: uidev/Uidev (lsid 40).
+Also observed (pre-existing, not from this branch): NPC say lines can show raw
+saylink framing in the message log for some opcodes (seen from Zamel in qeynos).
 
 ## DONE: client no longer reads ~/eq_assets at runtime (all assets via the asset server)
 
