@@ -20,7 +20,7 @@ use crate::eq_net::packet_handler::apply_packet;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::GameState;
-use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, DialogueShared, DialogueClickReq, ChatEventsShared, ChatSendShared, CastReq, MemSpellReq, SitReq, ConsiderReq, CampReq, CampUntil, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints, TaskOffersShared, CompletedTasksShared, AcceptTaskReq, CancelTaskReq};
+use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, DialogueShared, DialogueClickReq, NavStateShared, ChatEventsShared, ChatSendShared, CastReq, MemSpellReq, SitReq, ConsiderReq, CampReq, CampUntil, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints, TaskOffersShared, CompletedTasksShared, AcceptTaskReq, CancelTaskReq};
 
 type DesCbcEnc = Encryptor<Des>;
 type DesCbcDec = Decryptor<Des>;
@@ -68,6 +68,7 @@ pub async fn run_login_flow(
     app_tx:           mpsc::UnboundedSender<AppPacket>,
     max_retries:      u32,
     goto_target:      GotoTarget,
+    nav_state:        NavStateShared,
     goto_entity:      crate::http::GotoEntity,
     entity_positions: EntityPositions,
     entity_ids:       EntityIds,
@@ -146,7 +147,7 @@ pub async fn run_login_flow(
                     tracing::info!("NAV: {} zone points seeded", gs.zone_points.len());
                 }
                 let char_name = config.character_name.clone();
-                let navigator = Navigator::new(goto_target, goto_entity, entity_positions, entity_ids, zone_points, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, zone_cross, hail, say, target, attack, buy, sell, trade, merchant, move_req, give, inventory, loot, door_click, doors_shared, messages, dialogue, dialogue_click, chat_events, chat_send, cast, mem_spell, sit, consider, collision, maps_dir, camp.clone(), controller_view, nav_intent, pos_correction);
+                let navigator = Navigator::new(goto_target, nav_state, goto_entity, entity_positions, entity_ids, zone_points, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, zone_cross, hail, say, target, attack, buy, sell, trade, merchant, move_req, give, inventory, loot, door_click, doors_shared, messages, dialogue, dialogue_click, chat_events, chat_send, cast, mem_spell, sit, consider, collision, maps_dir, camp.clone(), controller_view, nav_intent, pos_correction);
                 run_gameplay_phase(stream, net_rx, app_tx, gs, char_name, navigator, world_creds, shutdown.clone(), camp.clone(), camp_until.clone()).await;
                 return Ok(());
             }
