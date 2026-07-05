@@ -211,6 +211,7 @@ OPTIONS:
     let doors_shared:     http::DoorsShared     = Arc::new(Mutex::new(Vec::new()));
     let messages:         http::MessagesShared  = Arc::new(Mutex::new(Vec::new()));
     let dialogue:         http::DialogueShared   = Arc::new(Mutex::new(Vec::new()));
+    let nav_state:        http::NavStateShared   = Arc::new(Mutex::new("idle".to_string()));
     let dialogue_click:   http::DialogueClickReq = Arc::new(Mutex::new(None));
     let chat_events:      http::ChatEventsShared = Arc::new(Mutex::new(Vec::new()));
     let chat_send:        http::ChatSendShared   = Arc::new(Mutex::new(Vec::new()));
@@ -279,6 +280,7 @@ OPTIONS:
         let mg  = messages.clone();
         let dlg = dialogue.clone();
         let dcl = dialogue_click.clone();
+        let nst = nav_state.clone();
         let cev = chat_events.clone();
         let csd = chat_send.clone();
         let ca  = cast.clone();
@@ -296,7 +298,7 @@ OPTIONS:
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, sc, md, sd, cp, cu, cv, ni, pc).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, nst, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, sc, md, sd, cp, cu, cv, ni, pc).await {
                     tracing::error!("EQ: fatal: {e}");
                 }
             });
@@ -360,6 +362,7 @@ OPTIONS:
         loot,
         messages,
         dialogue,
+        nav_state,
         dialogue_click,
         chat_events,
         chat_send,
