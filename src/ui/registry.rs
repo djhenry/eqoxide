@@ -133,8 +133,8 @@ pub const REGISTRY: &[WindowDef] = &[
     },
     WindowDef {
         hotkey: None,
-        default_anchor: Align2::RIGHT_CENTER,
-        default_offset: [-8.0, 0.0],
+        default_anchor: Align2::RIGHT_BOTTOM,
+        default_offset: [-8.0, -80.0],
         default_size: [46.0, 330.0],
         resizable: false,
         default_open: true,
@@ -185,7 +185,7 @@ pub const REGISTRY: &[WindowDef] = &[
     WindowDef {
         hotkey: None,
         default_anchor: Align2::CENTER_TOP,
-        default_offset: [0.0, 60.0],
+        default_offset: [0.0, 96.0],
         default_size: [440.0, 150.0],
         transient: true,
         ..def(NPC_DIALOGUE, "Dialogue")
