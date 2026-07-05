@@ -1,8 +1,192 @@
-//! TODO(#162): window body — being implemented by the ui-dev window fan-out.
+//! Map window — unified minimap / zone map (replaces the old small minimap +
+//! fullscreen map pair in hud.rs). One resizable window: the painter fills the
+//! body, centered on the player, north-up. Scroll or the bottom slider zooms.
 
-use crate::ui::UiCtx;
+use crate::ui::{theme, UiCtx};
+use egui::{Color32, Pos2, Stroke, Vec2};
+
+/// Zoom range (1.0 = whole zone fits the view).
+const ZOOM_MIN: f32 = 0.5;
+const ZOOM_MAX: f32 = 8.0;
 
 pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
-    let _ = &cx.scene;
-    ui.label("(under construction)");
+    let s = cx.scene;
+
+    // ── Reserve two small bottom rows; the canvas takes the rest. ───────────
+    let footer_h = 40.0;
+    let avail = ui.available_size();
+    let canvas_size = Vec2::new(avail.x.max(120.0), (avail.y - footer_h).max(100.0));
+    let (resp, painter) = ui.allocate_painter(canvas_size, egui::Sense::hover());
+    let rect = resp.rect;
+    let painter = painter.with_clip_rect(rect);
+
+    // Scroll over the map zooms (no modifier needed).
+    if resp.hovered() {
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+        if scroll.abs() > 0.5 {
+            *cx.minimap_zoom = (*cx.minimap_zoom * (1.0 + scroll * 0.005)).clamp(ZOOM_MIN, ZOOM_MAX);
+        }
+    }
+    let zoom = *cx.minimap_zoom;
+
+    // ── Zone bounds: prefer the map file's own extents, else terrain bounds. ─
+    let (zone_min, zone_max) = map_bounds(cx);
+    let zone_w = (zone_max[0] - zone_min[0]).max(1.0);
+    let zone_h = (zone_max[1] - zone_min[1]).max(1.0);
+
+    // scene.player_pos = [east, north, up] = [server_x, server_y, server_z].
+    let player = [s.player_pos[0], s.player_pos[1]];
+
+    // View extents: centered on the player, clamped inside the zone when the
+    // view is smaller than the zone (degenerate bounds fall back to player).
+    let view_w = zone_w / zoom;
+    let view_h = zone_h / zoom;
+    let (half_w, half_h) = (view_w * 0.5, view_h * 0.5);
+    let cx_e = if zone_min[0] + half_w <= zone_max[0] - half_w {
+        player[0].clamp(zone_min[0] + half_w, zone_max[0] - half_w)
+    } else {
+        player[0]
+    };
+    let cy_n = if zone_min[1] + half_h <= zone_max[1] - half_h {
+        player[1].clamp(zone_min[1] + half_h, zone_max[1] - half_h)
+    } else {
+        player[1]
+    };
+    let view_left = cx_e - half_w;
+    let view_bot = cy_n - half_h;
+
+    // Map coord → screen. East (+) → right, north (+) → up (flip screen Y).
+    let to_screen = |east: f32, north: f32| -> Pos2 {
+        egui::pos2(
+            rect.min.x + (east - view_left) / view_w * rect.width(),
+            rect.max.y - (north - view_bot) / view_h * rect.height(),
+        )
+    };
+
+    // ── Background + grid (100-unit ticks). ─────────────────────────────────
+    painter.rect_filled(rect, 3.0, theme::BG_PANEL);
+    let tick = Stroke::new(0.5, Color32::from_white_alpha(16));
+    let step = 100.0_f32;
+    let mut ge = (view_left / step).ceil() * step;
+    while ge <= view_left + view_w {
+        painter.line_segment([to_screen(ge, view_bot), to_screen(ge, view_bot + view_h)], tick);
+        ge += step;
+    }
+    let mut gn = (view_bot / step).ceil() * step;
+    while gn <= view_bot + view_h {
+        painter.line_segment([to_screen(view_left, gn), to_screen(view_left + view_w, gn)], tick);
+        gn += step;
+    }
+
+    // ── Zone map line art (Brewall-style .map files). ───────────────────────
+    if let Some(zm) = cx.zone_map {
+        for line in &zm.lines {
+            let p1 = to_screen(line.east1, line.north1);
+            let p2 = to_screen(line.east2, line.north2);
+            // Cull segments fully outside the view (clip rect handles partials).
+            if (p1.x < rect.min.x && p2.x < rect.min.x)
+                || (p1.x > rect.max.x && p2.x > rect.max.x)
+                || (p1.y < rect.min.y && p2.y < rect.min.y)
+                || (p1.y > rect.max.y && p2.y > rect.max.y)
+            {
+                continue;
+            }
+            let color = Color32::from_rgba_unmultiplied(line.r, line.g, line.b, 180);
+            painter.line_segment([p1, p2], Stroke::new(0.8, color));
+        }
+        // POI labels once zoomed in enough to read them.
+        if zoom >= 2.0 {
+            for label in &zm.labels {
+                let p = to_screen(label.east, label.north);
+                if !rect.contains(p) {
+                    continue;
+                }
+                painter.text(
+                    p,
+                    egui::Align2::CENTER_CENTER,
+                    &label.text,
+                    egui::FontId::proportional(10.0),
+                    theme::TEXT_WEAK,
+                );
+            }
+        }
+    }
+
+    // ── Entity dots — billboard.pos = [east, north, up]. ────────────────────
+    for b in &s.billboards {
+        let p = to_screen(b.pos[0], b.pos[1]);
+        if !rect.contains(p) {
+            continue;
+        }
+        let color = if b.dead {
+            theme::CON_GREY
+        } else if b.is_target {
+            theme::HP
+        } else {
+            theme::CHAT_COMBAT
+        };
+        painter.circle_filled(p, 3.0, color);
+        if b.is_target && !b.dead {
+            painter.circle_stroke(p, 5.0, Stroke::new(1.0, theme::HP));
+        }
+    }
+
+    // ── Player arrow: triangle rotated by heading (0 = north, clockwise). ───
+    let pp = to_screen(player[0], player[1]);
+    let hr = s.player_heading.to_radians();
+    let dir = |ang: f32, len: f32| Vec2::new(ang.sin() * len, -ang.cos() * len);
+    let tip = pp + dir(hr, 9.0);
+    let back_l = pp + dir(hr + 2.5, 6.5);
+    let back_r = pp + dir(hr - 2.5, 6.5);
+    painter.add(egui::Shape::convex_polygon(
+        vec![tip, back_l, back_r],
+        theme::CHAT_GROUP,
+        Stroke::new(1.0, Color32::from_black_alpha(200)),
+    ));
+
+    painter.rect_stroke(rect, 3.0, Stroke::new(1.0, theme::FRAME_LO));
+
+    // ── Footer: zoom slider + zone/loc readout. ─────────────────────────────
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Zoom").color(theme::TEXT_WEAK).size(10.0));
+        ui.spacing_mut().slider_width = (ui.available_width() - 40.0).max(60.0);
+        ui.add(
+            egui::Slider::new(cx.minimap_zoom, ZOOM_MIN..=ZOOM_MAX)
+                .show_value(false)
+                .logarithmic(true),
+        );
+        ui.label(egui::RichText::new(format!("{zoom:.1}x")).color(theme::TEXT_WEAK).size(10.0));
+    });
+    ui.horizontal(|ui| {
+        let zone = if s.zone.is_empty() { "(no zone)" } else { s.zone.as_str() };
+        ui.label(egui::RichText::new(zone).color(theme::GOLD).size(11.0));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{:.0}, {:.0}, {:.0}",
+                    s.player_pos[0], s.player_pos[1], s.player_pos[2]
+                ))
+                .color(theme::TEXT_WEAK)
+                .size(11.0),
+            );
+        });
+    });
+}
+
+/// Zone extents in map coords: the map file's own line extents when loaded
+/// (map art usually covers the whole zone), else the terrain bounds passed in.
+fn map_bounds(cx: &UiCtx) -> ([f32; 2], [f32; 2]) {
+    if let Some(zm) = cx.zone_map {
+        if !zm.lines.is_empty() {
+            let (mut min, mut max) = ([f32::MAX; 2], [f32::MIN; 2]);
+            for l in &zm.lines {
+                min[0] = min[0].min(l.east1).min(l.east2);
+                min[1] = min[1].min(l.north1).min(l.north2);
+                max[0] = max[0].max(l.east1).max(l.east2);
+                max[1] = max[1].max(l.north1).max(l.north2);
+            }
+            return (min, max);
+        }
+    }
+    (cx.zone_min, cx.zone_max)
 }

@@ -769,7 +769,7 @@ impl Navigator {
         let mut out = self.messages.lock().unwrap();
         out.clear();
         out.extend(gs.messages.iter().map(|m| {
-            let keywords = crate::hud::split_keywords(&m.text).into_iter()
+            let keywords = crate::game_state::split_keywords(&m.text).into_iter()
                 .filter(|(_, is_kw)| *is_kw)
                 .map(|(seg, _)| seg.trim_matches(|c| c == '[' || c == ']').trim().to_string())
                 .filter(|k| !k.is_empty())
@@ -984,9 +984,19 @@ impl Navigator {
 
         // POST /v1/trainer/open {"trainer":"X"}: send OP_GMTraining for the resolved NPC spawn id.
         // The server replies OP_GMTraining with the offered caps → apply_gm_training sets gs.trainer_*.
+        // Sentinel: Some(0) ENDS the open session (OP_GMEndTraining) — 0 is never a real spawn id;
+        // reusing the slot avoids threading one more field through the positional chains (#162).
         if let Some(npc_id) = self.trainer_open_req.lock().unwrap().take() {
-            stream.send_app_packet(OP_GM_TRAINING, &build_gm_training(npc_id, gs.player_id));
-            tracing::info!("EQ: trainer: opening training with npc {npc_id}");
+            if npc_id == 0 {
+                if let Some(open_npc) = gs.trainer_open.take() {
+                    stream.send_app_packet(OP_GM_END_TRAINING, &build_gm_end_training(open_npc, gs.player_id));
+                    gs.trainer_skills.clear();
+                    tracing::info!("EQ: trainer: ended training with npc {open_npc}");
+                }
+            } else {
+                stream.send_app_packet(OP_GM_TRAINING, &build_gm_training(npc_id, gs.player_id));
+                tracing::info!("EQ: trainer: opening training with npc {npc_id}");
+            }
         }
 
         // POST /v1/trainer/train {"skill_id":N}: send OP_GMTrainSkill to the open trainer. The server

@@ -606,6 +606,32 @@ impl GameState {
     }
 }
 
+/// Split NPC dialogue text into runs, flagging `[bracketed]` quest keywords.
+/// An unterminated `[` run is treated as plain text. Shared by the dialogue
+/// window (clickable keywords) and the HTTP message feed (keyword extraction).
+pub fn split_keywords(text: &str) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        if open > 0 {
+            out.push((rest[..open].to_string(), false));
+        }
+        if let Some(close_rel) = rest[open..].find(']') {
+            let close = open + close_rel;
+            out.push((rest[open..=close].to_string(), true));
+            rest = &rest[close + 1..];
+        } else {
+            out.push((rest[open..].to_string(), false));
+            rest = "";
+            break;
+        }
+    }
+    if !rest.is_empty() {
+        out.push((rest.to_string(), false));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Door, Entity, GameState};

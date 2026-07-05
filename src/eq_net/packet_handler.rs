@@ -1277,7 +1277,9 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
     }
 
     if !sender.is_empty() {
-        gs.log_msg("chat", &format!("<{}> {}", sender, msg));
+        // Log under the channel kind (tell/ooc/shout/group) so the chat window
+        // can color and tab-filter by channel; plain say stays "chat" (#162).
+        gs.log_msg(event_channel.unwrap_or("chat"), &format!("<{}> {}", sender, msg));
     } else {
         // Zone-wide broadcasts without a sender (server messages like "An earthquake strikes!").
         gs.log_msg("zone", &msg);
@@ -1762,7 +1764,7 @@ mod tests {
                 apply_money_update, apply_money_on_corpse, apply_set_target, apply_move_item, apply_spawn_appearance,
                 extract_saylink_text, apply_task_description, apply_completed_tasks, apply_task_select_window,
                 strip_say_links, SAY_LINK_BODY_SIZE, SIZE_DEATH,
-                rd_u16, rd_fixed_cstr, apply_group_update_b, apply_group_join, apply_group_disband_you,
+                apply_group_update_b, apply_group_join, apply_group_disband_you,
                 apply_group_disband_other, apply_group_leader_change, apply_group_invite, apply_group_acknowledge};
     use crate::game_state::{GameState, Entity, TaskStatus};
 
@@ -2155,12 +2157,20 @@ mod tests {
     }
 
     #[test]
-    fn apply_channel_message_zone_with_sender_logs_chat() {
+    fn apply_channel_message_logs_under_channel_kind() {
+        // Channel messages log under their channel kind (shout/tell/ooc/group)
+        // so the chat window can tab-filter and color them (#162).
         let mut gs = GameState::new();
         let payload = make_chan_payload("Soandso", 3, "Hello zone!");
         super::apply_channel_message(&mut gs, &payload);
-        assert!(gs.messages.iter().any(|m| m.kind == "chat"
+        assert!(gs.messages.iter().any(|m| m.kind == "shout"
             && m.text == "<Soandso> Hello zone!"));
+
+        // Plain say (8) still logs as "chat".
+        let payload = make_chan_payload("Soandso", 8, "hi there");
+        super::apply_channel_message(&mut gs, &payload);
+        assert!(gs.messages.iter().any(|m| m.kind == "chat"
+            && m.text == "<Soandso> hi there"));
     }
 
     #[test]
@@ -2449,7 +2459,7 @@ mod tests {
         // after the first, so the 2nd+ doors decode garbage/empty names. Two records guard it.
         use super::apply_spawn_doors;
         const REC: usize = 100;
-        let mut build = |name: &[u8], door_id: u8| -> [u8; REC] {
+        let build = |name: &[u8], door_id: u8| -> [u8; REC] {
             let mut r = [0u8; REC];
             r[..name.len()].copy_from_slice(name); // name @0
             r[60] = door_id;                        // door_id @60
