@@ -22,6 +22,10 @@ pub struct AppConfig {
     pub models_path: PathBuf,
     pub http_port: u16,
     pub asset_server_url: String,
+    /// Directory holding the native client's UI atlases (`uifiles/default`),
+    /// for item/spell icons in the window system. Optional — UI falls back to
+    /// text when unset and the default location is absent (#162).
+    pub eq_ui_dir: Option<String>,
 }
 
 impl AppConfig {
@@ -66,7 +70,12 @@ impl AppConfig {
             .unwrap_or("http://localhost:8088")
             .to_string();
 
-        AppConfig { assets_path, models_path, http_port, asset_server_url }
+        let eq_ui_dir = r
+            .and_then(|v| v.get("eq_ui_dir"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        AppConfig { assets_path, models_path, http_port, asset_server_url, eq_ui_dir }
     }
 }
 
