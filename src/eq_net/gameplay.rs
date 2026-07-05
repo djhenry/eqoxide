@@ -186,18 +186,27 @@ pub async fn run_gameplay_phase(
                     loop { sleep(Duration::from_millis(200)).await; }
                 }
                 OP_REQUEST_CLIENT_ZONE_CHANGE if packet.payload.len() >= 24 => {
-                    // Server wants us to move — either a zone transition or a same-zone teleport.
-                    // Parse RequestClientZoneChange_Struct (24 bytes):
-                    //   u16 zone_id, u16 instance_id, float y, float x, float z,
-                    //   float heading, u32 type
-                    // Wire layout: y at offset 4, x at offset 8 (Titanium struct)
+                    // Server wants us to move — either a zone transition or a same-zone teleport
+                    // (GM #summon / #goto / #zone). RoF2 RequestClientZoneChange_Struct
+                    // (common/patches/rof2_structs.h): u16 zone_id, u16 instance_id, u32 unknown004,
+                    // float y, float x, float z, float heading, ... — i.e. an extra `unknown004`
+                    // sits before the coords that the Titanium struct does NOT have, so y/x/z live at
+                    // offsets 8/12/16, not 4/8/12. Reading the Titanium offsets grabbed `unknown004`
+                    // as y (a garbage/NaN float), which corrupted the teleport target: a NaN position
+                    // fails the streamer's `> CORRECTION_SQ` jump test so the controller never adopted
+                    // it, leaving a GM #summon/#zone'd character stranded at its old coords / in the
+                    // void (#167). (#116 family — same-zone summons are also on this path.)
                     let zone_id     = u16::from_le_bytes([packet.payload[0], packet.payload[1]]);
                     let instance_id = u16::from_le_bytes([packet.payload[2], packet.payload[3]]);
-                    let y = f32::from_le_bytes([packet.payload[4], packet.payload[5], packet.payload[6], packet.payload[7]]);
-                    let x = f32::from_le_bytes([packet.payload[8], packet.payload[9], packet.payload[10], packet.payload[11]]);
-                    let z = f32::from_le_bytes([packet.payload[12], packet.payload[13], packet.payload[14], packet.payload[15]]);
+                    let y = f32::from_le_bytes([packet.payload[8],  packet.payload[9],  packet.payload[10], packet.payload[11]]);
+                    let x = f32::from_le_bytes([packet.payload[12], packet.payload[13], packet.payload[14], packet.payload[15]]);
+                    let z = f32::from_le_bytes([packet.payload[16], packet.payload[17], packet.payload[18], packet.payload[19]]);
 
-                    if zone_id == gs.zone_id {
+                    // Defense-in-depth: never let a non-finite coordinate reach the position — a NaN
+                    // silently breaks every downstream distance/adoption test (the bug above).
+                    if !(x.is_finite() && y.is_finite() && z.is_finite()) {
+                        tracing::warn!("EQ: OP_REQUEST_CLIENT_ZONE_CHANGE with non-finite coords ({x},{y},{z}) — ignoring");
+                    } else if zone_id == gs.zone_id {
                         // Same-zone teleport (e.g. #goto x y z, #zone 0).
                         // The server expects the client to just move — it clears zone_mode
                         // before we respond, so sending OP_ZONE_CHANGE would cause a cancel
