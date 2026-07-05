@@ -462,7 +462,13 @@ pub fn encode_player_pass(
 
                 let target = crate::models::target_height_for(&scene.player_race, archetype);
                 let height = if model.true_height > 0.001 { model.true_height } else { 1.0 };
-                let dominant_mesh_scale = (target / height) * model.node_scale;
+                // Normalize to `target` height. Do NOT re-apply the model's authored `node_scale`:
+                // skinned vertices are stored raw (node_scale is not baked in), and `true_height`
+                // is measured from those same raw/posed points, so `target/height` already yields
+                // the exact scale — multiplying by node_scale re-inflates it. Harmless when
+                // node_scale==1 (every rigged race), but the shared `fish.glb` armature is scale-100,
+                // which rendered the fish ~100× too large (#149 follow-up).
+                let dominant_mesh_scale = target / height;
                 // Skinned EQ models are authored horizontally centered on the origin, so NO
                 // recenter (center_xz=[0,0]); the measured centers were unreliable and pushed
                 // the model off. Vertically the origin sits above the feet, so lift by a
@@ -907,7 +913,9 @@ pub fn encode_skinned_entity_pass(
 
         let target = crate::models::target_height_for(&b.race, archetype);
         let height = if model.true_height > 0.001 { model.true_height } else { 1.0 };
-        let dominant_scale    = (target / height) * model.node_scale;
+        // See the player pass: normalize to `target` only — do not re-apply the authored
+        // `node_scale` (it would re-inflate; the scale-100 `fish.glb` rendered ~100× too big).
+        let dominant_scale    = target / height;
         // Same placement as the player pass: no recenter (models are authored centered),
         // lift by a calibrated fraction of target height to ground the feet.
         // Ground by the model's own feet: lift = -feet_offset * mesh_scale.
