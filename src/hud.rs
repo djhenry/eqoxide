@@ -168,6 +168,8 @@ pub fn draw_profile(ctx: &egui::Context, p: &crate::profiling::FrameProfile) {
                 );
             };
             line(ui, "update", p.update_ms);
+            line(ui, " scene", p.scene_ms);
+            line(ui, " smooth", p.smooth_ms);
             line(ui, "render", p.render_ms);
             line(ui, "egui",   p.egui_ms);
             line(ui, "submit", p.submit_ms);

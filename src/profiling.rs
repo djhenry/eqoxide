@@ -27,9 +27,13 @@ pub fn enabled() -> bool {
 /// Smoothed per-phase timings (milliseconds) for the HUD overlay. All zero until the first profiled
 /// frame. Each field is an exponential moving average so the on-screen numbers are readable rather
 /// than flickering frame-to-frame.
-#[derive(Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
 pub struct FrameProfile {
     pub update_ms: f32,
+    /// Update sub-phase: rebuilding `SceneState` from `GameState` (per-frame snapshot clone).
+    pub scene_ms:  f32,
+    /// Update sub-phase: per-entity motion smoothing + floor snap.
+    pub smooth_ms: f32,
     pub render_ms: f32,
     pub egui_ms:   f32,
     pub submit_ms: f32,
@@ -43,6 +47,8 @@ impl FrameProfile {
     pub fn blend(&mut self, s: &FrameSample, frame_ms: f32) {
         const A: f32 = 0.12; // EMA weight — ~0.5s settling at 60fps
         self.update_ms += (s.update_ms() - self.update_ms) * A;
+        self.scene_ms  += (s.scene_ms()  - self.scene_ms)  * A;
+        self.smooth_ms += (s.smooth_ms() - self.smooth_ms) * A;
         self.render_ms += (s.render_ms() - self.render_ms) * A;
         self.egui_ms   += (s.egui_ms()   - self.egui_ms)   * A;
         self.submit_ms += (s.submit_ms() - self.submit_ms) * A;
@@ -55,6 +61,10 @@ impl FrameProfile {
 #[derive(Default)]
 pub struct FrameSample {
     pub update: std::time::Duration,
+    /// Sub-span of `update`: `SceneState::from_game_state`.
+    pub scene:  std::time::Duration,
+    /// Sub-span of `update`: entity motion smoothing + floor snap.
+    pub smooth: std::time::Duration,
     pub render: std::time::Duration,
     pub egui:   std::time::Duration,
     pub submit: std::time::Duration,
@@ -63,6 +73,8 @@ pub struct FrameSample {
 
 impl FrameSample {
     pub fn update_ms(&self) -> f32 { self.update.as_secs_f32() * 1000.0 }
+    pub fn scene_ms(&self)  -> f32 { self.scene.as_secs_f32()  * 1000.0 }
+    pub fn smooth_ms(&self) -> f32 { self.smooth.as_secs_f32() * 1000.0 }
     pub fn render_ms(&self) -> f32 { self.render.as_secs_f32() * 1000.0 }
     pub fn egui_ms(&self)   -> f32 { self.egui.as_secs_f32()   * 1000.0 }
     pub fn submit_ms(&self) -> f32 { self.submit.as_secs_f32() * 1000.0 }
