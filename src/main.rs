@@ -219,6 +219,7 @@ OPTIONS:
     let mem_spell:        http::MemSpellReq     = Arc::new(Mutex::new(None));
     let sit:              http::SitReq          = Arc::new(Mutex::new(None));
     let consider:         http::ConsiderReq     = Arc::new(Mutex::new(None));
+    let pet_cmd:          http::PetCmdReq       = Arc::new(Mutex::new(None));
     // spells_us.txt is an EQ data file; default to the configured assets dir,
     // overridable via EQ_SPELLS_FILE.
     let spells_path = std::env::var("EQ_SPELLS_FILE")
@@ -287,6 +288,7 @@ OPTIONS:
         let ms  = mem_spell.clone();
         let st  = sit.clone();
         let co  = consider.clone();
+        let pcm = pet_cmd.clone();
         let sc  = shared_collision.clone();
         let sd  = shutdown.clone();
         let cp  = camp.clone();
@@ -298,7 +300,7 @@ OPTIONS:
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, nst, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, sc, md, sd, cp, cu, cv, ni, pc).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, nst, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, pcm, sc, md, sd, cp, cu, cv, ni, pc).await {
                     tracing::error!("EQ: fatal: {e}");
                 }
             });
@@ -307,17 +309,38 @@ OPTIONS:
 
     // HTTP server
     let app_goto = goto_target.clone();
-    let app_hail   = hail.clone();
-    let app_say    = say.clone();
-    let app_dialogue_click = dialogue_click.clone();
-    let app_target = target.clone();
-    let app_attack  = attack.clone();
-    let app_cast    = cast.clone();
-    let app_sit     = sit.clone();
-    let app_consider = consider.clone();
-    let app_buy     = buy.clone();
-    let app_sell    = sell.clone();
-    let app_trade   = trade.clone();
+    // All the request slots UI windows can write, bundled (#162). These are the
+    // same slots the HTTP API and nav/gameplay threads share.
+    let app_actions = eqoxide::ui::Actions {
+        hail: hail.clone(),
+        say: say.clone(),
+        chat_send: chat_send.clone(),
+        dialogue_click: dialogue_click.clone(),
+        target: target.clone(),
+        attack: attack.clone(),
+        cast: cast.clone(),
+        mem_spell: mem_spell.clone(),
+        sit: sit.clone(),
+        consider: consider.clone(),
+        buy: buy.clone(),
+        sell: sell.clone(),
+        trade: trade.clone(),
+        move_item: move_req.clone(),
+        loot: loot.clone(),
+        accept_task: accept_task.clone(),
+        cancel_task: cancel_task.clone(),
+        trainer_open: trainer_open_req.clone(),
+        trainer_train: trainer_train_req.clone(),
+        group_invite: group_invite.clone(),
+        group_accept: group_accept.clone(),
+        group_decline: group_decline.clone(),
+        group_leave: group_leave.clone(),
+        group_kick: group_kick.clone(),
+        group_make_leader: group_make_leader.clone(),
+        camp: camp.clone(),
+        camp_until: camp_until.clone(),
+        pet_cmd: pet_cmd.clone(),
+    };
     let app_spells  = spells.clone();
     let app_door_click = door_click.clone();
     let app_player_info = player_info.clone();
@@ -386,6 +409,7 @@ OPTIONS:
         doors_shared,
         camp.clone(),
         camp_until.clone(),
+        pet_cmd.clone(),
         app_cfg.http_port,
         exact_listener,
     );
@@ -400,25 +424,14 @@ OPTIONS:
         app_rx,
         frame_req,
         app_goto,
-        app_hail,
-        app_say,
-        app_dialogue_click,
-        app_target,
-        app_attack,
-        app_cast,
-        app_sit,
-        app_consider,
-        app_buy,
-        app_sell,
-        app_trade,
+        app_actions,
         app_spells,
         app_door_click,
         shared_collision,
         app_player_info,
         testzone_mode,
         shutdown.clone(),
-        camp.clone(),
-        camp_until.clone(),
+        app_cfg.eq_ui_dir,
         asset_server_url,
         asset_user,
         asset_pass,

@@ -490,6 +490,10 @@ pub struct Navigator {
     mem_spell:        MemSpellReq,
     sit:              SitReq,
     consider:         ConsiderReq,
+    /// Manual pet command (POST /v1/pet/command or a Pet-window button): one OP_PetCommands
+    /// command byte (PET_ATTACK/PET_BACKOFF/…), drained once per tick. Attack uses the current
+    /// target; see the drain in `tick`.
+    pet_cmd:          crate::http::PetCmdReq,
     /// Camp request slot, shared with the gameplay loop. The nav thread only WRITES it — when the
     /// `/camp` chat keyword is typed it pushes a `Toggle` here instead of sending the text as Say.
     camp:             CampReq,
@@ -605,6 +609,7 @@ impl Navigator {
         mem_spell:        MemSpellReq,
         sit:              SitReq,
         consider:         ConsiderReq,
+        pet_cmd:          crate::http::PetCmdReq,
         collision:        crate::assets::SharedCollision,
         maps_dir:         std::path::PathBuf,
         camp:             CampReq,
@@ -648,6 +653,7 @@ impl Navigator {
             mem_spell,
             sit,
             consider,
+            pet_cmd,
             camp,
             give_state: None,
             inventory,
@@ -769,7 +775,7 @@ impl Navigator {
         let mut out = self.messages.lock().unwrap();
         out.clear();
         out.extend(gs.messages.iter().map(|m| {
-            let keywords = crate::hud::split_keywords(&m.text).into_iter()
+            let keywords = crate::game_state::split_keywords(&m.text).into_iter()
                 .filter(|(_, is_kw)| *is_kw)
                 .map(|(seg, _)| seg.trim_matches(|c| c == '[' || c == ']').trim().to_string())
                 .filter(|k| !k.is_empty())
@@ -917,6 +923,9 @@ impl Navigator {
                 gs.log_msg("quest", "Accepted task offer");
             }
             gs.task_offers.clear();
+            // Mirror into the RENDER GameState: an EMPTY OP_TaskSelectWindow parses to zero offers
+            // (apply_task_select_window), clearing render-side task_offers so the selector closes.
+            let _ = app_tx.send(AppPacket { opcode: OP_TASK_SELECT_WINDOW, payload: Vec::new() });
         }
 
         // POST /v1/quests/cancel ({"task_id":N}): abandon an active task. OP_CancelTask addresses
@@ -944,6 +953,9 @@ impl Navigator {
         if self.group_accept.lock().unwrap().take().is_some() {
             if let Some(inviter) = gs.pending_invite.take() {
                 stream.send_app_packet(OP_GROUP_FOLLOW, &build_group_follow(&inviter, &gs.player_name));
+                // Mirror into the RENDER GameState (apply_group_invite set its pending_invite too,
+                // and only a disband would ever clear it) so the forced-open Group window relaxes.
+                let _ = app_tx.send(AppPacket { opcode: OP_UI_CLEAR_INVITE, payload: Vec::new() });
                 tracing::info!("EQ: group: accepted invite from {inviter}");
                 gs.log_msg("group", &format!("Accepted group invite from {inviter}"));
             }
@@ -954,6 +966,9 @@ impl Navigator {
         if self.group_decline.lock().unwrap().take().is_some() {
             if let Some(inviter) = gs.pending_invite.take() {
                 stream.send_app_packet(OP_GROUP_DISBAND, &build_group_disband(&gs.player_name, &gs.player_name));
+                // A decline produces NO server packet at all — mirror the cleared invite into the
+                // RENDER GameState or its pending_invite (and the invite dialog) lingers forever.
+                let _ = app_tx.send(AppPacket { opcode: OP_UI_CLEAR_INVITE, payload: Vec::new() });
                 tracing::info!("EQ: group: declined invite from {inviter}");
                 gs.log_msg("group", &format!("Declined group invite from {inviter}"));
             }
@@ -984,9 +999,24 @@ impl Navigator {
 
         // POST /v1/trainer/open {"trainer":"X"}: send OP_GMTraining for the resolved NPC spawn id.
         // The server replies OP_GMTraining with the offered caps → apply_gm_training sets gs.trainer_*.
+        // Sentinel: Some(0) ENDS the open session (OP_GMEndTraining) — 0 is never a real spawn id;
+        // reusing the slot avoids threading one more field through the positional chains (#162).
         if let Some(npc_id) = self.trainer_open_req.lock().unwrap().take() {
-            stream.send_app_packet(OP_GM_TRAINING, &build_gm_training(npc_id, gs.player_id));
-            tracing::info!("EQ: trainer: opening training with npc {npc_id}");
+            if npc_id == 0 {
+                if let Some(open_npc) = gs.trainer_open.take() {
+                    let payload = build_gm_end_training(open_npc, gs.player_id);
+                    stream.send_app_packet(OP_GM_END_TRAINING, &payload);
+                    gs.trainer_skills.clear();
+                    // Mirror into the RENDER GameState: ending training is client-initiated (the
+                    // server never echoes OP_GMEndTraining), so without this the render-side
+                    // trainer_open stays Some and the transient Trainer window never closes.
+                    let _ = app_tx.send(AppPacket { opcode: OP_GM_END_TRAINING, payload });
+                    tracing::info!("EQ: trainer: ended training with npc {open_npc}");
+                }
+            } else {
+                stream.send_app_packet(OP_GM_TRAINING, &build_gm_training(npc_id, gs.player_id));
+                tracing::info!("EQ: trainer: opening training with npc {npc_id}");
+            }
         }
 
         // POST /v1/trainer/train {"skill_id":N}: send OP_GMTrainSkill to the open trainer. The server
@@ -1083,6 +1113,17 @@ impl Navigator {
         // so we must target the NPC FIRST, in the same tick and before the say packet, or the hail is
         // silently ignored (#130). The target packet precedes the say on the ordered stream, so the
         // server has GetTarget()==the NPC when it processes the say.
+        // Local chat echo (#3 of the UI-overhaul bug cluster): the chat window renders only the
+        // RENDER GameState's message log, and outgoing chat is client-initiated (the server doesn't
+        // echo your own say/tell/... back), so every send below also mirrors a "You say/tell …"
+        // line over app_tx via the internal-only OP_UI_LOCAL_ECHO packet.
+        let echo = |kind: &str, text: &str| {
+            let _ = app_tx.send(AppPacket {
+                opcode: OP_UI_LOCAL_ECHO,
+                payload: build_ui_local_echo(kind, text),
+            });
+        };
+
         let hail_req = self.hail.lock().unwrap().take();
         if let Some((name, spawn_id)) = hail_req {
             if let Some(id) = spawn_id {
@@ -1096,7 +1137,9 @@ impl Navigator {
             let pkt = build_say_packet(&gs.player_name, &name, &msg);
             tracing::info!("EQ: hailing '{}' (target={:?}, say): {}", name, spawn_id, msg);
             stream.send_app_packet(OP_CHANNEL_MESSAGE, &pkt);
-            gs.log_msg("chat", &format!("You say, '{}'", msg));
+            let line = format!("You say, '{}'", msg);
+            gs.log_msg("chat", &line);
+            echo("chat", &line);
         }
 
         // Check say request — arbitrary Say text (HUD say box / quest keyword follow-up).
@@ -1111,7 +1154,9 @@ impl Navigator {
                 let pkt = build_say_packet(&gs.player_name, "", &text);
                 tracing::info!("EQ: say: {}", text);
                 stream.send_app_packet(OP_CHANNEL_MESSAGE, &pkt);
-                gs.log_msg("chat", &format!("You say, '{}'", text));
+                let line = format!("You say, '{}'", text);
+                gs.log_msg("chat", &line);
+                echo("chat", &line);
             }
         }
 
@@ -1123,7 +1168,9 @@ impl Navigator {
             let pkt = build_item_link_click(c.item_id, &c.augments, c.link_hash, c.icon);
             tracing::info!("EQ: dialogue click: '{}' (sayid={})", c.text, c.augments[0]);
             stream.send_app_packet(OP_ITEM_LINK_CLICK, &pkt);
-            gs.log_msg("chat", &format!("You say, '{}'", c.text));
+            let line = format!("You say, '{}'", c.text);
+            gs.log_msg("chat", &line);
+            echo("chat", &line);
         }
 
         // Drain queued outgoing chat (POST /tell|/ooc|/shout|/group): build + send OP_ChannelMessage.
@@ -1137,7 +1184,17 @@ impl Navigator {
             let label = match c.chan { 7 => format!("tell {}", c.to), 5 => "ooc".into(),
                                        3 => "shout".into(), 2 => "group".into(), n => format!("chan{n}") };
             tracing::info!("EQ: {} -> {}", label, c.text);
-            gs.log_msg("chat", &format!("You {}: {}", label, c.text));
+            // Native-style local echo, logged under the channel's kind so the chat window
+            // tab-filters and colors it like the matching incoming traffic.
+            let (kind, line): (&str, String) = match c.chan {
+                7 => ("tell",  format!("You told {}, '{}'", c.to, c.text)),
+                5 => ("ooc",   format!("You say out of character, '{}'", c.text)),
+                3 => ("shout", format!("You shout, '{}'", c.text)),
+                2 => ("group", format!("You tell your party, '{}'", c.text)),
+                _ => ("chat",  format!("You {}: {}", label, c.text)),
+            };
+            gs.log_msg(kind, &line);
+            echo(kind, &line);
         }
 
         // Check target request — set target + auto-consider it (con color comes back as
@@ -1164,7 +1221,42 @@ impl Navigator {
             let payload = [if on { 1u8 } else { 0u8 }, 0, 0, 0];
             stream.send_app_packet(OP_AUTO_ATTACK, &payload);
             gs.auto_attack = on;
+            // Mirror the toggle into the RENDER GameState (apply_auto_attack): the toggle is
+            // client-initiated, so without this scene.auto_attack stays false forever and the
+            // Actions/Target windows' Attack button can never show ON (or turn it off). (#2)
+            let _ = app_tx.send(AppPacket { opcode: OP_AUTO_ATTACK, payload: payload.to_vec() });
             tracing::info!("EQ: auto-attack {}", if on { "ON" } else { "OFF" });
+        }
+
+        // POST /v1/pet/command or a Pet-window button: send one OP_PetCommands for the player's
+        // pet. PET_ATTACK aims at the current target (like the auto-pet path); every other command
+        // (back off / follow / guard / sit) targets 0 — the server acts on the pet itself.
+        let pet_cmd = self.pet_cmd.lock().unwrap().take();
+        if let Some(cmd) = pet_cmd {
+            let cmd = cmd as u32;
+            if gs.pet_id.is_none() {
+                gs.log_msg("pet", "You have no pet");
+            } else if cmd == PET_ATTACK {
+                match gs.target_id.filter(|&t| t != 0) {
+                    Some(tid) => {
+                        stream.send_app_packet(OP_PET_COMMANDS, &build_pet_command(PET_ATTACK, tid));
+                        // Keep the auto-pet-combat dedupe in sync so it doesn't immediately
+                        // re-issue (or back-off-cancel) the manual order.
+                        self.last_pet_target = Some(tid);
+                        tracing::info!("EQ: pet command attack → target {tid}");
+                        gs.log_msg("pet", "Pet attack ordered");
+                    }
+                    None => gs.log_msg("pet", "Pet attack: no target"),
+                }
+            } else {
+                stream.send_app_packet(OP_PET_COMMANDS, &build_pet_command(cmd, 0));
+                if cmd == PET_BACKOFF { self.last_pet_target = None; }
+                tracing::info!("EQ: pet command {cmd}");
+                gs.log_msg("pet", &format!("Pet command sent ({})", match cmd {
+                    PET_BACKOFF => "back off", PET_FOLLOWME => "follow",
+                    PET_GUARDHERE => "guard here", PET_SIT => "sit", _ => "other",
+                }));
+            }
         }
 
         // Cast a memorized spell gem. Target priority: an explicit API target > the current target
@@ -2020,6 +2112,7 @@ mod tests {
             Default::default(), // mem_spell
             Default::default(), // sit
             Default::default(), // consider
+            Default::default(), // pet_cmd
             Default::default(), // collision
             std::path::PathBuf::new(), // maps_dir
             Default::default(), // camp

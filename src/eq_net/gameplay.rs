@@ -253,6 +253,10 @@ pub async fn run_gameplay_phase(
                     s.send_app_packet(OP_LOOT_REQUEST, &corpse_id.to_le_bytes());
                     gs.loot_session_active = true;
                     gs.loot_last_activity = Some(std::time::Instant::now());
+                    // Mirror the session start into the RENDER GameState (internal-only packet):
+                    // this loop drives looting on the NAV gs only, but the Loot window gates on
+                    // the render-side scene.loot_active (see apply_ui_loot_state).
+                    let _ = app_tx.send(AppPacket { opcode: OP_UI_LOOT_STATE, payload: vec![1] });
                     tracing::info!("EQ: auto-loot: sent OP_LootRequest for corpse_id={}", corpse_id);
                 }
                 if gs.pending_loot.is_empty() {
@@ -267,6 +271,9 @@ pub async fn run_gameplay_phase(
                     s.send_app_packet(OP_END_LOOT_REQUEST, &[]);
                     gs.loot_session_active = false;
                     gs.loot_last_activity = None;
+                    // Mirror the session end (payload 0 also clears the render side's undrained
+                    // pending_loot) so the Loot window actually closes. (bug #4)
+                    let _ = app_tx.send(AppPacket { opcode: OP_UI_LOOT_STATE, payload: vec![0] });
                     gs.log_msg("loot", "Looting complete");
                     tracing::info!("EQ: auto-loot: sent OP_EndLootRequest (session complete)");
                     // Reset queued_at so the next corpse gets its own delay window.

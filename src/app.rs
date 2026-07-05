@@ -88,8 +88,6 @@ pub struct App {
     // Minimap
     zone_min:      [f32; 2],
     zone_max:      [f32; 2],
-    minimap_zoom:  f32,
-    minimap_full:  bool,
     zone_map:      Option<zone_map::ZoneMap>,
     // Camera & smooth position
     visual_player_pos:  [f32; 3],
@@ -129,25 +127,12 @@ pub struct App {
     /// Shared goto target — set by HTTP /move; cleared by the render thread on manual WASD
     /// (so manual movement cancels navigation). WASD no longer writes a target here.
     goto_target:  crate::http::GotoTarget,
-    /// Shared request slots written by HUD buttons; the nav thread drains and sends them.
-    hail:         crate::http::HailReq,
-    say:          crate::http::SayReq,
-    /// Written when a clickable NPC-dialogue choice (saylink) is clicked in the HUD (#120).
-    dialogue_click: crate::http::DialogueClickReq,
-    target:       crate::http::TargetReq,
-    attack:       crate::http::AttackReq,
-    cast:         crate::http::CastReq,
-    sit:          crate::http::SitReq,
-    consider:     crate::http::ConsiderReq,
-    /// Merchant buy/sell/open-close request slots written by the HUD merchant window.
-    buy:          crate::http::BuyReq,
-    sell:         crate::http::SellReq,
-    trade:        crate::http::TradeReq,
+    /// All shared request slots UI windows write; the nav/gameplay threads drain
+    /// and send them. One struct instead of a dozen fields (#162).
+    acts:         crate::ui::Actions,
     spells:       std::sync::Arc<crate::spells::SpellDb>,
     /// Shared door-click request slot; the nav thread drains it and sends OP_ClickDoor.
     door_click:   crate::http::DoorClickReq,
-    /// Text buffer for the HUD say box.
-    say_buffer:   String,
     // Mouse
     drag_active:  bool,
     last_cursor:  winit::dpi::PhysicalPosition<f64>,
@@ -167,10 +152,6 @@ pub struct App {
     /// winit event loop on the MAIN thread, so winit tears down its Wayland clipboard worker cleanly
     /// — instead of a background thread calling `process::exit()` and racing that teardown (SIGSEGV).
     shutdown:     std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Camp command slot (HUD Camp button writes a Toggle here) and the published camp deadline the
-    /// HUD reads for its countdown. The gameplay loop owns the camp logic; see `gameplay::camp_apply`.
-    camp:         crate::http::CampReq,
-    camp_until:   crate::http::CampUntil,
     scene:        SceneState,
     app_rx:       tokio::sync::mpsc::UnboundedReceiver<AppPacket>,
     /// When an inbound server packet was last applied. Feeds the connection-health signal
@@ -209,21 +190,9 @@ pub struct App {
     on_ground:  bool,
     /// F10 toggles an on-screen debug overlay (heading values, coords, corrections).
     show_debug: bool,
-    /// Whether the inventory/equipment window is open (toggled by the HUD button or the I key).
-    show_inventory: bool,
-    /// Whether the Task Window (native quest log) is open (toggled by the HUD button or the T key, #144).
-    show_tasks: bool,
-    /// Whether the map window is open (toggled by the HUD button or the M key). Defaults closed.
-    show_map: bool,
-    ui_layout: crate::ui_layout::UiLayout,
-    /// Cached egui textures for spell-gem icons (spells01..07.tga). Empty until first render.
-    spell_icons: Vec<egui::TextureHandle>,
-    /// True once `load_spell_icons` has been attempted (avoids retrying every frame after failure).
-    tried_icons: bool,
-    /// Cached global UI zoom factor (min(w/1920, h/1080) / dpi) and the surface size it was computed
-    /// for — recomputed only when the size changes, not every frame.
-    ui_zoom: f32,
-    ui_zoom_size: (u32, u32),
+    /// The window system: registry-driven windows, per-character layout
+    /// persistence, icon atlases, chat state (#162).
+    ui_state: crate::ui::UiState,
     /// Asset-sync progress fraction (0.0–1.0) shown on the loading screen; None when not syncing.
     sync_progress: std::sync::Arc<std::sync::Mutex<Option<f32>>>,
     /// Set to Some(Ok(())) when the common-model sync finishes, Some(Err(msg)) on failure.
@@ -247,25 +216,14 @@ impl App {
         app_rx:          tokio::sync::mpsc::UnboundedReceiver<AppPacket>,
         frame_req:       FrameReq,
         goto_target:     crate::http::GotoTarget,
-        hail:            crate::http::HailReq,
-        say:             crate::http::SayReq,
-        dialogue_click:  crate::http::DialogueClickReq,
-        target:          crate::http::TargetReq,
-        attack:          crate::http::AttackReq,
-        cast:            crate::http::CastReq,
-        sit:             crate::http::SitReq,
-        consider:        crate::http::ConsiderReq,
-        buy:             crate::http::BuyReq,
-        sell:            crate::http::SellReq,
-        trade:           crate::http::TradeReq,
+        acts:            crate::ui::Actions,
         spells:          std::sync::Arc<crate::spells::SpellDb>,
         door_click:      crate::http::DoorClickReq,
         shared_collision: assets::SharedCollision,
         player_info:     crate::http::PlayerInfo,
         testzone_mode:   bool,
         shutdown:        std::sync::Arc<std::sync::atomic::AtomicBool>,
-        camp:            crate::http::CampReq,
-        camp_until:      crate::http::CampUntil,
+        eq_ui_dir:       Option<String>,
         asset_server_url: String,
         asset_user:       String,
         asset_pass:       String,
@@ -273,7 +231,7 @@ impl App {
         nav_intent:       crate::http::NavIntent,
         pos_correction:   crate::http::PosCorrection,
     ) -> Self {
-        let ui_layout = crate::ui_layout::UiLayout::load(&character_name);
+        let ui_state = crate::ui::UiState::new(&character_name, eq_ui_dir);
         let mut game_state = GameState::new();
         game_state.player_name = character_name;
 
@@ -290,7 +248,7 @@ impl App {
             load_status:  Arc::new(Mutex::new(String::new())),
             pending_load: Arc::new(Mutex::new(None)),
             zone_min: [0.0; 2], zone_max: [0.0; 2],
-            minimap_zoom: 1.0, minimap_full: false, zone_map: None,
+            zone_map: None,
             visual_player_pos: [0.0, 0.0, 0.0],
             prev_logical_pos:  [0.0, 0.0, 0.0],
             last_moved_at:     std::time::Instant::now(),
@@ -308,7 +266,7 @@ impl App {
             controller: crate::movement::CharacterController::new([0.0, 0.0, 0.0]),
             controller_view, nav_intent, pos_correction,
             goto_target,
-            hail, say, dialogue_click, target, attack, cast, sit, consider, buy, sell, trade, spells, door_click, say_buffer: String::new(),
+            acts, spells, door_click,
             drag_active: false, last_cursor: winit::dpi::PhysicalPosition::new(0.0, 0.0),
             click_start: None,
             pick_view_proj: [
@@ -321,7 +279,7 @@ impl App {
             pick_screen_w: 800,
             pick_screen_h: 600,
             game_state, scene: SceneState::default(), app_rx, last_inbound: std::time::Instant::now(), frame_req,
-            player_info, shutdown, camp, camp_until, collision: None, shared_collision,
+            player_info, shutdown, collision: None, shared_collision,
             last_grounded_z: 0.0,
             prev_render_pos: [0.0, 0.0, 0.0],
             entity_motion: std::collections::HashMap::new(),
@@ -333,19 +291,41 @@ impl App {
             on_ground: true,
             testzone_mode,
             show_debug: false,
-            show_inventory: false,
-            show_tasks: false,
-            show_map: false,
-            ui_layout,
-            spell_icons: Vec::new(),
-            tried_icons: false,
-            ui_zoom: 1.0,
-            ui_zoom_size: (0, 0),
+            ui_state,
             sync_progress: Arc::new(Mutex::new(None)),
             sync_done:     Arc::new(Mutex::new(None)),
             models_loaded: false,
             asset_server_url, asset_user, asset_pass,
         }
+    }
+
+    /// Record the OS window's current geometry into the per-character layout
+    /// (debounced by the layout's save machinery). Position is best-effort:
+    /// `outer_position()` errors on Wayland, in which case only size/maximized
+    /// round-trip (#162).
+    fn record_os_window(&mut self) {
+        let Some(window) = &self.window else { return };
+        let size = window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return;
+        }
+        let maximized = window.is_maximized();
+        let pos = window.outer_position().ok().map(|p| [p.x, p.y]);
+        // While maximized, keep the last floating size/pos on record so
+        // un-maximizing next session restores a sensible window instead of a
+        // monitor-sized one; only the flag updates.
+        let prev = self.ui_state.layout().os_window;
+        let st = if maximized {
+            let prev = prev.unwrap_or(crate::ui::persist::OsWindowState {
+                size: [size.width, size.height],
+                pos,
+                maximized: true,
+            });
+            crate::ui::persist::OsWindowState { maximized: true, ..prev }
+        } else {
+            crate::ui::persist::OsWindowState { size: [size.width, size.height], pos, maximized }
+        };
+        self.ui_state.layout_mut().set_os_window(st);
     }
 
     /// Cast a ray from the camera through screen pixel `cursor` and return the
@@ -1223,36 +1203,20 @@ impl App {
         self.pick_screen_w  = renderer.surface_config.width;
         self.pick_screen_h  = renderer.surface_config.height;
 
-        // Lazily load spell-gem icon atlases (needs egui Context, only available at render time).
-        if !self.tried_icons {
-            if let Some(ctx) = &self.egui_ctx {
-                self.spell_icons = hud::load_spell_icons(ctx);
-                self.tried_icons = true;
-            }
-        }
-
         // Egui pass — use associated function to avoid reborrowing self.
         let load_status_text = self.load_status.lock().unwrap().clone();
         let sync_frac = *self.sync_progress.lock().unwrap();
         let prof_egui = crate::profiling::Stopwatch::start();
-        Self::egui_pass(
-            &mut self.egui_state, &mut self.egui_renderer, &self.egui_ctx, &mut self.ui_layout, &self.window,
+        let egui_wants_repaint = Self::egui_pass(
+            &mut self.egui_state, &mut self.egui_renderer, &self.egui_ctx, &mut self.ui_state, &self.window,
             &mut enc, &view, renderer, self.loading, &self.current_zone, &load_status_text,
             sync_frac,
             &self.scene, self.zone_min, self.zone_max,
-            &mut self.minimap_zoom, &mut self.minimap_full, &mut self.show_map,
             self.current_fps, self.zone_map.as_ref(),
             cam_eye, self.collision.as_deref(),
-            &self.hail, &self.say, &self.dialogue_click, &self.target, &mut self.say_buffer,
-            &self.attack, &self.cast, &self.sit, &self.consider, &self.spells,
-            &self.buy, &self.sell, &self.trade,
-            &self.spell_icons,
-            &mut self.show_inventory,
-            &mut self.show_tasks,
-            &mut self.ui_zoom, &mut self.ui_zoom_size,
+            &self.acts, &self.spells,
             self.show_debug, self.game_state.server_corrections,
             &self.frame_profile,
-            &self.camp, &self.camp_until,
         );
         let dur_egui = prof_egui.elapsed();
 
@@ -1275,20 +1239,26 @@ impl App {
             self.frame_profile.blend(&sample, frame_ms);
         }
 
-        // NOTE: no `request_redraw()` here. The loop is event-driven — `about_to_wait` decides whether
-        // the next frame is needed (active animation/input/packets) and only then requests a redraw.
-        // A still scene therefore stops rendering and idle CPU drops to ~0. See `about_to_wait`/`wake`.
+        // NOTE: no unconditional `request_redraw()` here. The loop is event-driven — `about_to_wait`
+        // decides whether the next frame is needed and only then requests a redraw. A still scene
+        // therefore stops rendering and idle CPU drops to ~0. See `about_to_wait`/`wake`.
+        // Exception: egui-driven animations (window fades, casting bar, camp countdown easing) have
+        // no input/packet to wake the loop, so honor egui's own repaint request (#162).
+        if egui_wants_repaint {
+            self.wake();
+        }
         // GPU borrow (renderer) is released here.
         // pending_reload is checked by window_event after render_frame returns.
     }
 
     /// Egui render pass. Takes fields as explicit parameters so Rust can verify
     /// they are disjoint from the caller's live `&mut renderer` borrow.
+    #[allow(clippy::too_many_arguments)]
     fn egui_pass(
         egui_state:    &mut Option<egui_winit::State>,
         egui_renderer: &mut Option<egui_wgpu::Renderer>,
         egui_ctx:      &Option<egui::Context>,
-        ui_layout:     &mut crate::ui_layout::UiLayout,
+        ui_state:      &mut crate::ui::UiState,
         window:        &Option<Arc<Window>>,
         encoder:       &mut wgpu::CommandEncoder,
         view:          &wgpu::TextureView,
@@ -1300,56 +1270,44 @@ impl App {
         scene:         &SceneState,
         zone_min:      [f32; 2],
         zone_max:      [f32; 2],
-        minimap_zoom:  &mut f32,
-        minimap_full:  &mut bool,
-        show_map:      &mut bool,
         current_fps:   f32,
         zone_map:      Option<&zone_map::ZoneMap>,
         cam_eye:       [f32; 3],
         collision:     Option<&assets::Collision>,
-        hail:          &crate::http::HailReq,
-        say:           &crate::http::SayReq,
-        dialogue_click: &crate::http::DialogueClickReq,
-        target:        &crate::http::TargetReq,
-        say_buffer:    &mut String,
-        attack:        &crate::http::AttackReq,
-        cast:          &crate::http::CastReq,
-        sit:           &crate::http::SitReq,
-        consider:      &crate::http::ConsiderReq,
+        acts:          &crate::ui::Actions,
         spells:        &crate::spells::SpellDb,
-        buy:           &crate::http::BuyReq,
-        sell:          &crate::http::SellReq,
-        trade:         &crate::http::TradeReq,
-        spell_icons:   &[egui::TextureHandle],
-        show_inventory: &mut bool,
-        show_tasks:     &mut bool,
-        ui_zoom:       &mut f32,
-        ui_zoom_size:  &mut (u32, u32),
         show_debug:    bool,
         corrections:   u32,
         frame_profile: &crate::profiling::FrameProfile,
-        camp:          &crate::http::CampReq,
-        camp_until:    &crate::http::CampUntil,
-    ) {
+    ) -> bool {
         let (Some(egui_state), Some(egui_renderer), Some(egui_ctx), Some(window)) =
-            (egui_state, egui_renderer, egui_ctx, window) else { return };
+            (egui_state, egui_renderer, egui_ctx, window) else { return false };
 
         let raw_input = egui_state.take_egui_input(window);
         let view_proj = renderer.last_view_proj;
         let screen_w  = renderer.surface_config.width;
         let screen_h  = renderer.surface_config.height;
 
-        // Scale the entire UI (text + widgets) to a fixed 1920x1080 design layout by the CONSTRAINING
-        // window dimension: zoom = min(w/1920, h/1080) (the smaller ratio fits without overflow), so
-        // a 16:9 window matches 1:1 and other aspect ratios scale uniformly. Divided by the native
-        // DPI ppp so it's display-independent. Cached; only recomputed when the surface size changes.
-        if (screen_w, screen_h) != *ui_zoom_size {
-            let nppp = window.scale_factor() as f32;
-            let (rw, rh) = (hud::HUD_REF_W, hud::HUD_REF_H);
-            *ui_zoom = ((screen_w as f32 / rw).min(screen_h as f32 / rh) / nppp).max(0.05);
-            *ui_zoom_size = (screen_w, screen_h);
-        }
-        egui_ctx.set_zoom_factor(*ui_zoom);
+        // Scale the entire UI (text + widgets) with the window: zoom =
+        // user_scale × min(w/REF_W, h/REF_H) / dpi — the constraining dimension
+        // fits a REF_W×REF_H design canvas exactly, other aspect ratios scale
+        // uniformly, and the per-character user multiplier applies on top.
+        let nppp = window.scale_factor() as f32;
+        let user_scale = ui_state.layout().ui_scale;
+        let zoom = ((screen_w as f32 / crate::ui::REF_W)
+            .min(screen_h as f32 / crate::ui::REF_H)
+            * user_scale
+            / nppp)
+            .max(0.05);
+        egui_ctx.set_zoom_factor(zoom);
+        // The TRUE point-space screen size. Never trust ctx.screen_rect() for
+        // layout math: set_zoom_factor is applied lazily inside run(), and on
+        // the first frame egui's previous screen_rect is a 10000x10000
+        // placeholder — remapping/anchoring against it destroys saved layouts.
+        let screen_pts = [
+            screen_w as f32 / (nppp * zoom),
+            screen_h as f32 / (nppp * zoom),
+        ];
 
         let full_output = egui_ctx.run(raw_input, |ctx| {
             hud::draw_fps(ctx, current_fps);
@@ -1360,25 +1318,13 @@ impl App {
             if loading {
                 hud::draw_loading(ctx, current_zone, load_status, sync_progress);
             } else {
-                hud::draw_ui_menu(ctx, ui_layout);
-                hud::draw_hud(ctx, ui_layout, scene, "EQ Observer");
-                hud::draw_quest_dialogue(ctx, ui_layout, scene, say, dialogue_click);
-                hud::draw_message_log(ctx, ui_layout, scene);
                 hud::draw_labels(ctx, scene, view_proj, screen_w, screen_h, cam_eye, collision);
-                hud::draw_minimap(ctx, ui_layout, scene, zone_min, zone_max, minimap_zoom, minimap_full, zone_map, show_map);
-                hud::draw_control_bar(ctx, ui_layout, scene, hail, say, target, say_buffer, camp, camp_until);
-                hud::draw_action_grid(ctx, ui_layout, scene, spells, spell_icons, attack, cast, sit, target, consider);
-                hud::draw_inventory(ctx, ui_layout, scene, show_inventory);
-                hud::draw_task_window(ctx, ui_layout, scene, show_tasks);
-                hud::draw_group_roster(ctx, ui_layout, scene);
-                hud::draw_merchant(ctx, ui_layout, scene, buy, sell, trade);
+                ui_state.draw_all(ctx, screen_pts, scene, spells, acts, zone_min, zone_max, zone_map, current_fps);
                 if show_debug {
                     hud::draw_debug_overlay(ctx, scene.player_pos, scene.player_heading, current_zone, corrections);
                 }
             }
         });
-        ui_layout.end_frame();
-        ui_layout.maybe_save();
         egui_state.handle_platform_output(window, full_output.platform_output);
         // egui auto-enables IME when a text field is focused; on Linux that hands keystrokes
         // to the system IME (fcitx/ibus) which composes instead of delivering them, so the
@@ -1408,6 +1354,14 @@ impl App {
             egui_renderer.render(&mut pass.forget_lifetime(), &primitives, &screen_desc);
         }
         for id in &full_output.textures_delta.free { egui_renderer.free_texture(id); }
+
+        // True when egui has an animation in flight (fade, gauge easing, camp
+        // countdown): the caller must keep the event-driven loop awake.
+        full_output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|v| v.repaint_delay < std::time::Duration::from_millis(200))
+            .unwrap_or(false)
     }
 
     /// Submit the command buffer; if a /frame capture is pending, copy the
@@ -1448,7 +1402,9 @@ impl App {
             renderer.device.poll(wgpu::Maintain::Wait);
             let png = encode_frame_png(
                 &slice.get_mapped_range(), w, h, row_pitch, renderer.surface_config.format,
-                Some(512),
+                // 1024 keeps window text readable in captures (#162); 512 made
+                // the new UI's 12pt labels illegible.
+                Some(1024),
             );
             let _ = tx.send(png);
         } else {
@@ -1464,11 +1420,21 @@ use std::mem;
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let window = Arc::new(
-            event_loop
-                .create_window(WindowAttributes::default().with_title("EQ Observer"))
-                .expect("create window"),
-        );
+        // Restore the per-character OS window geometry (#162). Size + maximized
+        // work everywhere; position restore is best-effort (ignored on Wayland).
+        let saved = self.ui_state.layout().os_window;
+        let mut attrs = WindowAttributes::default().with_title("EQ Observer");
+        let size = saved.map(|s| s.size).unwrap_or([1600, 900]);
+        attrs = attrs.with_inner_size(winit::dpi::PhysicalSize::new(size[0].max(320), size[1].max(240)));
+        if let Some(st) = saved {
+            if let Some([x, y]) = st.pos {
+                attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(x, y));
+            }
+            if st.maximized {
+                attrs = attrs.with_maximized(true);
+            }
+        }
+        let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         self.init_gpu(window);
         // Kick the event-driven loop: render the first frames so zone loading starts (in --testzone
         // there are no network packets to trigger it). Once loading sets in, `poll_external` keeps the
@@ -1490,6 +1456,9 @@ impl ApplicationHandler for App {
     ///    when the character stood still.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            // Flush layout on EVERY exit path (POST /exit, GM kick, signals) —
+            // CloseRequested already does; this covers the rest (#162).
+            self.ui_state.layout_mut().save_now();
             event_loop.exit();
             return;
         }
@@ -1501,7 +1470,7 @@ impl ApplicationHandler for App {
 
         // Keep rendering while a camp is in progress so the HUD countdown ticks smoothly even in a
         // still scene (the event-driven loop would otherwise idle between sparse packets).
-        if self.camp_until.lock().unwrap().is_some() {
+        if self.acts.camp_until.lock().unwrap().is_some() {
             self.active_until = std::time::Instant::now() + Self::ACTIVE_LINGER;
         }
 
@@ -1538,6 +1507,24 @@ impl ApplicationHandler for App {
             return;
         }
 
+        // Release events must reach the game even when egui consumes them
+        // (typing in chat while holding W): otherwise `keys_held` keeps the key
+        // and the character runs forever. Same for losing window focus.
+        match &event {
+            WindowEvent::KeyboardInput { event: key_event, .. } => {
+                if key_event.state == ElementState::Released {
+                    if let PhysicalKey::Code(code) = key_event.physical_key {
+                        self.keys_held.remove(&code);
+                    }
+                }
+            }
+            WindowEvent::Focused(false) => {
+                self.keys_held.clear();
+                self.drag_active = false;
+            }
+            _ => {}
+        }
+
         // Let egui see the event first. If it wants a repaint (hover/focus/typing) or consumes the
         // event, wake the loop so the UI updates; bail out on consumed events.
         let egui_resp = if let (Some(egui_state), Some(window)) = (&mut self.egui_state, &self.window) {
@@ -1551,7 +1538,7 @@ impl ApplicationHandler for App {
         }
 
         match event {
-            WindowEvent::CloseRequested => { self.ui_layout.save_now(); event_loop.exit(); }
+            WindowEvent::CloseRequested => { self.ui_state.layout_mut().save_now(); event_loop.exit(); }
 
             WindowEvent::Resized(size) => {
                 if let Some((surface, renderer)) = &mut self.gpu {
@@ -1560,7 +1547,17 @@ impl ApplicationHandler for App {
                     surface.configure(&renderer.device, &renderer.surface_config);
                     renderer.recreate_depth_texture();
                 }
+                self.record_os_window();
             }
+
+            // Persist the OS window position when the platform reports it
+            // (never fires on Wayland; X11/XWayland only).
+            WindowEvent::Moved(_) => self.record_os_window(),
+
+            // A pure DPI change (same pixel size) still needs a zoom recompute;
+            // the zoom is derived per-frame from window.scale_factor(), so just
+            // wake and repaint.
+            WindowEvent::ScaleFactorChanged { .. } => {}
 
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
                 match state {
@@ -1583,7 +1580,7 @@ impl ApplicationHandler for App {
                                             self.game_state.target_name   = Some(e.name.clone());
                                             self.game_state.target_hp_pct = Some(e.hp_pct);
                                         }
-                                        *self.target.lock().unwrap() = Some(id);
+                                        *self.acts.target.lock().unwrap() = Some(id);
                                     }
                                     Some(PickResult::Door(door_id)) => {
                                         // Server-authoritative: only request the open; never set is_open locally.
@@ -1641,21 +1638,21 @@ impl ApplicationHandler for App {
                                     self.show_debug = !self.show_debug;
                                     tracing::info!("DEBUG: overlay {}", if self.show_debug { "ON" } else { "OFF" });
                                 }
-                                KeyCode::KeyI => {
-                                    self.show_inventory = !self.show_inventory;
-                                }
-                                KeyCode::KeyT => {
-                                    self.show_tasks = !self.show_tasks;
-                                }
-                                KeyCode::KeyM => {
-                                    self.show_map = !self.show_map;
-                                }
                                 KeyCode::KeyL
                                     if self.keys_held.contains(&KeyCode::ControlLeft)
                                         || self.keys_held.contains(&KeyCode::ControlRight) =>
                                 {
-                                    self.ui_layout.locked = !self.ui_layout.locked;
-                                    self.ui_layout.set_dirty_locked();
+                                    let locked = self.ui_state.layout().locked;
+                                    self.ui_state.layout_mut().set_locked(!locked);
+                                }
+                                // Window toggles route through the registry so
+                                // hotkeys live in one table (#162). Ignore OS
+                                // key-repeat — holding the key must not strobe
+                                // the window open/closed.
+                                other if !event.repeat => {
+                                    if let Some(key) = winit_to_egui_key(other) {
+                                        self.ui_state.hotkey(key);
+                                    }
                                 }
                                 _ => {}
                             }
@@ -1674,6 +1671,22 @@ impl ApplicationHandler for App {
         // render at least one frame and keep the active window open briefly for follow-up animation.
         self.wake();
     }
+}
+
+/// Map a winit key code to the egui key used by the window registry's hotkeys.
+/// Only letters used as window toggles need mapping.
+fn winit_to_egui_key(code: KeyCode) -> Option<egui::Key> {
+    Some(match code {
+        KeyCode::KeyB => egui::Key::B,
+        KeyCode::KeyG => egui::Key::G,
+        KeyCode::KeyH => egui::Key::H,
+        KeyCode::KeyI => egui::Key::I,
+        KeyCode::KeyK => egui::Key::K,
+        KeyCode::KeyM => egui::Key::M,
+        KeyCode::KeyO => egui::Key::O,
+        KeyCode::KeyT => egui::Key::T,
+        _ => return None,
+    })
 }
 
 /// Decide whether the zone geometry must be (re)loaded.

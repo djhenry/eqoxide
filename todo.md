@@ -3,6 +3,19 @@
 Active work + bite-sized tasks for smaller agents to continue if the main session stops.
 Keep this updated as tasks complete.
 
+## IN REVIEW: UI overhaul (#162, agent "ui-dev", PR #170, branch worktree-ui-overhaul)
+
+Complete and live-verified; awaiting review/merge of PR #170. Registry-driven
+window system in src/ui/ (see docs/ui-overhaul-design.md + ui-window-management.md):
+21 windows, RoF2 theme from the real TGAs, per-char persistence v2 incl. OS
+window geometry, non-closeable Window Selector, UI scaling, nav<->render sync
+via synthetic app_tx packets, pet commands (+/v1/pet/command), /v1/trainer/close.
+Follow-ups to file as issues after merge (design doc section 9): buff window
+(OP_Buff), bags/bank, spellbook contents, interactive loot, PC trade, item
+tooltips, respawn picker, hotbutton bar. Verification char: uidev/Uidev (lsid 40).
+Also observed (pre-existing, not from this branch): NPC say lines can show raw
+saylink framing in the message log for some opcodes (seen from Zamel in qeynos).
+
 ## DONE: client no longer reads ~/eq_assets at runtime (all assets via the asset server)
 
 Everything the client loads now comes from the asset-server cache, not ~/eq_assets:
