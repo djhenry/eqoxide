@@ -29,6 +29,7 @@ pub(super) fn router() -> Router<HttpState> {
 async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let cam   = s.snapshot.lock().unwrap().clone();
     let player = s.player_info.lock().unwrap().clone();
+    let nav_state = s.nav_state.lock().unwrap().clone();
     Json(serde_json::json!({
         "player": {
             "name":       player.name,
@@ -54,6 +55,7 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             "target_hp_pct": player.target_hp_pct,
             "connected":   player.connected,
             "last_packet_age_ms": player.last_packet_age_ms,
+            "nav_state":   nav_state,
         },
         "camera": {
             "azimuth_deg":   cam.azimuth.to_degrees(),
