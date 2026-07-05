@@ -11,6 +11,7 @@ pub fn router() -> Router<HttpState> {
         .route("/open",  post(post_open))
         .route("/list",  get(get_list))
         .route("/train", post(post_train))
+        .route("/close", post(post_close))
 }
 
 #[derive(serde::Deserialize)]
@@ -87,4 +88,12 @@ async fn post_train(
     *s.trainer_train_req.lock().unwrap() = Some(b.skill_id);
     let name = crate::skills::skill_name(b.skill_id).unwrap_or("?");
     (StatusCode::OK, format!("training {} (skill_id={})", name, b.skill_id))
+}
+
+/// POST /v1/trainer/close — end the open training session (OP_GMEndTraining). Uses the
+/// `trainer_open_req` slot's `Some(0)` sentinel (0 is never a real spawn id) so no extra
+/// request slot needs threading through the nav chain (#162).
+async fn post_close(State(s): State<HttpState>) -> (StatusCode, String) {
+    *s.trainer_open_req.lock().unwrap() = Some(0);
+    (StatusCode::OK, "closing trainer".into())
 }

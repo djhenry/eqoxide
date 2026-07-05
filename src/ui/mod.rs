@@ -184,6 +184,21 @@ impl UiState {
         let sr = ctx.screen_rect();
         self.sys.layout.remap_all([sr.width(), sr.height()]);
 
+        // Keep /r working: remember the sender of the most recent incoming tell
+        // (logged as kind "tell" with a "<Sender> text" prefix).
+        if let Some(sender) = scene
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.kind == "tell")
+            .and_then(|m| m.text.strip_prefix('<'))
+            .and_then(|t| t.split('>').next())
+        {
+            if !sender.is_empty() && !sender.eq_ignore_ascii_case(&scene.player_name) {
+                self.chat.reply_to = sender.to_string();
+            }
+        }
+
         let window_list: Vec<(&'static str, &'static str, bool, Option<egui::Key>)> = REGISTRY
             .iter()
             .filter(|d| !d.transient && d.id != registry::SELECTOR)
@@ -230,8 +245,15 @@ impl UiState {
             if result.close_clicked {
                 if def.transient {
                     // Transients close by telling the game to end the session.
-                    if def.id == registry::MERCHANT {
-                        *acts.trade.lock().unwrap() = Some(crate::http::TradeCmd::Close);
+                    match def.id {
+                        registry::MERCHANT => {
+                            *acts.trade.lock().unwrap() = Some(crate::http::TradeCmd::Close);
+                        }
+                        // Some(0) = end-training sentinel (see navigation.rs).
+                        registry::TRAINER => {
+                            *acts.trainer_open.lock().unwrap() = Some(0);
+                        }
+                        _ => {}
                     }
                 } else {
                     self.sys.layout.set_open(def.id, false);
