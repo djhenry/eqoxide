@@ -6,7 +6,9 @@
 use crate::ui::{theme, UiCtx};
 
 /// Max distance (world units) at which "Loot nearest corpse" engages.
-const LOOT_RANGE: f32 = 50.0;
+/// Matches the server's loot range (~25u): offering corpses beyond it would
+/// silently fail server-side.
+const LOOT_RANGE: f32 = 25.0;
 /// How long a loot message stays in the recent-drops list.
 const RECENT_SECS: u64 = 20;
 

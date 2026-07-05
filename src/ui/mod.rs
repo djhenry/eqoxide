@@ -58,6 +58,8 @@ pub struct Actions {
     pub group_make_leader: crate::http::GroupMakeLeaderReq,
     pub camp: crate::http::CampReq,
     pub camp_until: crate::http::CampUntil,
+    /// Manual pet command byte for OP_PetCommands (Pet window buttons).
+    pub pet_cmd: crate::http::PetCmdReq,
 }
 
 /// Chat window runtime state (input buffer, active tab).
@@ -338,6 +340,7 @@ mod tests {
             group_make_leader: Arc::new(Mutex::new(None)),
             camp: Arc::new(Mutex::new(None)),
             camp_until: Arc::new(Mutex::new(None)),
+            pet_cmd: Arc::new(Mutex::new(None)),
         }
     }
 

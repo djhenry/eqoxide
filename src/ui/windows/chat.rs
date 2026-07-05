@@ -58,6 +58,10 @@ fn submit(line: &str, cx: &mut UiCtx) {
         "ooc" => send(5, "", arg),
         "shout" => send(3, "", arg),
         "g" | "gsay" | "group" => send(2, "", arg),
+        // /camp — same toggle the Actions window's Camp button uses.
+        "camp" => {
+            *cx.acts.camp.lock().unwrap() = Some(crate::http::CampCmd::Toggle);
+        }
         "say" if !arg.is_empty() => {
             *cx.acts.say.lock().unwrap() = Some(arg.to_string());
         }
