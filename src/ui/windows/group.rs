@@ -44,6 +44,11 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     }
 
     // ── Member rows ──────────────────────────────────────────────────────────
+    // Kick / Make Leader are leader-only server-side; hide them from non-leaders
+    // so the UI can't fire requests the nav layer's validation would reject
+    // (and can't disband the clicker's own membership by accident).
+    let self_is_leader = s.group_leader.eq_ignore_ascii_case(&s.player_name)
+        || s.group_members.iter().any(|m| m.is_leader && m.name.eq_ignore_ascii_case(&s.player_name));
     for m in &s.group_members {
         let is_self = m.name.eq_ignore_ascii_case(&s.player_name);
         let is_leader = m.is_leader || (!s.group_leader.is_empty() && m.name.eq_ignore_ascii_case(&s.group_leader));
@@ -73,8 +78,8 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
                 badge(ui, "offline", theme::TEXT_WEAK);
             }
 
-            // Small ✕ on the right of the row kicks a non-self member.
-            if !is_self {
+            // Small ✕ on the right of the row kicks a non-self member (leader only).
+            if !is_self && self_is_leader {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let x = ui
                         .small_button(egui::RichText::new("✕").size(9.0))
@@ -86,8 +91,8 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
             }
         });
 
-        // Right-click a non-self member row: Kick / Make Leader.
-        if !is_self {
+        // Right-click a non-self member row: Kick / Make Leader (leader only).
+        if !is_self && self_is_leader {
             row.response.interact(egui::Sense::click()).context_menu(|ui| {
                 if ui.button(egui::RichText::new("Kick").size(11.0)).clicked() {
                     *cx.acts.group_kick.lock().unwrap() = Some(m.name.clone());

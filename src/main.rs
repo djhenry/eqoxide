@@ -219,6 +219,7 @@ OPTIONS:
     let mem_spell:        http::MemSpellReq     = Arc::new(Mutex::new(None));
     let sit:              http::SitReq          = Arc::new(Mutex::new(None));
     let consider:         http::ConsiderReq     = Arc::new(Mutex::new(None));
+    let pet_cmd:          http::PetCmdReq       = Arc::new(Mutex::new(None));
     // spells_us.txt is an EQ data file; default to the configured assets dir,
     // overridable via EQ_SPELLS_FILE.
     let spells_path = std::env::var("EQ_SPELLS_FILE")
@@ -287,6 +288,7 @@ OPTIONS:
         let ms  = mem_spell.clone();
         let st  = sit.clone();
         let co  = consider.clone();
+        let pcm = pet_cmd.clone();
         let sc  = shared_collision.clone();
         let sd  = shutdown.clone();
         let cp  = camp.clone();
@@ -298,7 +300,7 @@ OPTIONS:
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, nst, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, sc, md, sd, cp, cu, cv, ni, pc).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, nst, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, pcm, sc, md, sd, cp, cu, cv, ni, pc).await {
                     tracing::error!("EQ: fatal: {e}");
                 }
             });
@@ -337,6 +339,7 @@ OPTIONS:
         group_make_leader: group_make_leader.clone(),
         camp: camp.clone(),
         camp_until: camp_until.clone(),
+        pet_cmd: pet_cmd.clone(),
     };
     let app_spells  = spells.clone();
     let app_door_click = door_click.clone();
@@ -406,6 +409,7 @@ OPTIONS:
         doors_shared,
         camp.clone(),
         camp_until.clone(),
+        pet_cmd.clone(),
         app_cfg.http_port,
         exact_listener,
     );

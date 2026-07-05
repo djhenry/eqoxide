@@ -62,6 +62,11 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_COMPLETED_TASKS      => apply_completed_tasks(gs, p),
         OP_TASK_SELECT_WINDOW   => apply_task_select_window(gs, p),
         OP_GM_TRAINING          => apply_gm_training(gs, p),
+        OP_GM_END_TRAINING      => apply_gm_end_training(gs, p),  // synthetic (nav → render gs); see fn doc
+        OP_AUTO_ATTACK          => apply_auto_attack(gs, p),      // synthetic (nav → render gs); see fn doc
+        OP_UI_LOCAL_ECHO        => apply_ui_local_echo(gs, p),    // internal-only; see protocol.rs
+        OP_UI_LOOT_STATE        => apply_ui_loot_state(gs, p),    // internal-only; see protocol.rs
+        OP_UI_CLEAR_INVITE      => { gs.pending_invite = None; }  // internal-only; see protocol.rs
         OP_SKILL_UPDATE         => apply_skill_update(gs, p),
         OP_GROUP_UPDATE_B       => apply_group_update_b(gs, p),
         OP_GROUP_UPDATE         => apply_group_join(gs, p),
@@ -393,6 +398,48 @@ fn apply_gm_training(gs: &mut GameState, p: &[u8]) {
     gs.trainer_open = Some(npcid);
     gs.trainer_skills = caps;
     gs.log_msg("trainer", "Training window opened");
+}
+
+/// OP_GMEndTraining — SYNTHETIC mirror only. The wire packet is client→server (the server never
+/// echoes it), so this arm fires only for the copy navigation.rs sends over app_tx after ending a
+/// training session: it closes the RENDER GameState's trainer window (the transient Trainer window
+/// gates on `scene.trainer_open`, which otherwise stayed Some forever).
+fn apply_gm_end_training(gs: &mut GameState, _p: &[u8]) {
+    gs.trainer_open = None;
+    gs.trainer_skills.clear();
+    gs.log_msg("trainer", "Training window closed");
+}
+
+/// OP_AutoAttack — SYNTHETIC mirror only (client→server on the wire; never received). The nav
+/// thread mirrors its own OP_AutoAttack sends over app_tx so the RENDER GameState's `auto_attack`
+/// tracks the toggle (the Actions/Target windows' Attack button reads `scene.auto_attack`).
+/// Payload: 4 bytes, byte[0] = 1 enables / 0 disables — the same buffer sent to the server.
+fn apply_auto_attack(gs: &mut GameState, p: &[u8]) {
+    gs.auto_attack = p.first().copied().unwrap_or(0) != 0;
+}
+
+/// OP_UI_LOCAL_ECHO (internal-only, never on the wire) — local echo of the player's own outgoing
+/// chat. Payload: `kind` NUL `text`; logs as gs.log_msg(kind, text) so the chat window shows it.
+fn apply_ui_local_echo(gs: &mut GameState, p: &[u8]) {
+    let Some(nul) = p.iter().position(|&b| b == 0) else { return; };
+    let kind = String::from_utf8_lossy(&p[..nul]).into_owned();
+    let text = String::from_utf8_lossy(&p[nul + 1..]).into_owned();
+    if kind.is_empty() || text.is_empty() { return; }
+    gs.log_msg(&kind, &text);
+}
+
+/// OP_UI_LOOT_STATE (internal-only, never on the wire) — mirror of the gameplay loop's auto-loot
+/// session, which runs entirely on the NAV GameState. Byte 0: 1 = session active, 0 = idle. On the
+/// RENDER GameState `pending_loot` is filled by inbound corpse packets but never drained (only the
+/// gameplay loop drains its copy), so going idle also clears it — otherwise `scene.loot_active`
+/// would gate the Loot window open forever after the first corpse.
+fn apply_ui_loot_state(gs: &mut GameState, p: &[u8]) {
+    let active = p.first().copied().unwrap_or(0) != 0;
+    gs.loot_session_active = active;
+    if !active {
+        gs.pending_loot.clear();
+        gs.loot_queued_at = None;
+    }
 }
 
 /// OP_SkillUpdate — one skill's new value (after training or skill-ups). SkillUpdate_Struct:
@@ -3368,5 +3415,86 @@ mod tests {
         let mut gs = GameState::new();
         apply_group_acknowledge(&mut gs, &[]);
         assert_eq!(gs.chat_events.back().unwrap().kind, "joined");
+    }
+
+    // ── Synthetic nav→render mirror packets (two-GameState split) ────────────
+
+    #[test]
+    fn apply_ui_local_echo_logs_kind_and_text() {
+        let mut gs = GameState::new();
+        let p = crate::eq_net::protocol::build_ui_local_echo("tell", "You told Sariel, 'on my way'");
+        super::apply_ui_local_echo(&mut gs, &p);
+        assert!(gs.messages.iter().any(|m| m.kind == "tell"
+            && m.text == "You told Sariel, 'on my way'"));
+    }
+
+    #[test]
+    fn apply_ui_local_echo_ignores_malformed_payloads() {
+        let mut gs = GameState::new();
+        super::apply_ui_local_echo(&mut gs, b"no-nul-separator");
+        super::apply_ui_local_echo(&mut gs, b"\0text-without-kind");
+        super::apply_ui_local_echo(&mut gs, b"chat\0");
+        assert!(gs.messages.is_empty(), "malformed echoes must log nothing");
+    }
+
+    #[test]
+    fn apply_gm_end_training_clears_trainer_state() {
+        // The end-training packet is client→server; the synthetic mirror must close the RENDER
+        // GameState's trainer window or the transient Trainer window never closes (bug #1).
+        let mut gs = GameState::new();
+        gs.trainer_open = Some(77);
+        gs.trainer_skills = vec![100; crate::skills::NUM_SKILLS];
+        super::apply_gm_end_training(&mut gs, &[0u8; 8]);
+        assert!(gs.trainer_open.is_none());
+        assert!(gs.trainer_skills.is_empty());
+    }
+
+    #[test]
+    fn apply_auto_attack_mirrors_toggle_from_payload() {
+        let mut gs = GameState::new();
+        super::apply_auto_attack(&mut gs, &[1, 0, 0, 0]);
+        assert!(gs.auto_attack, "byte[0]=1 must switch auto-attack ON");
+        super::apply_auto_attack(&mut gs, &[0, 0, 0, 0]);
+        assert!(!gs.auto_attack, "byte[0]=0 must switch auto-attack OFF");
+        super::apply_auto_attack(&mut gs, &[]);
+        assert!(!gs.auto_attack, "empty payload is treated as OFF, not a panic");
+    }
+
+    #[test]
+    fn apply_ui_loot_state_sets_and_clears_session() {
+        let mut gs = GameState::new();
+        super::apply_ui_loot_state(&mut gs, &[1]);
+        assert!(gs.loot_session_active);
+        // Render-side pending_loot is filled by corpse packets but never drained there — the
+        // idle mirror must clear it or scene.loot_active would stay true forever (bug #4).
+        gs.pending_loot.push_back(42);
+        gs.loot_queued_at = Some(std::time::Instant::now());
+        super::apply_ui_loot_state(&mut gs, &[0]);
+        assert!(!gs.loot_session_active);
+        assert!(gs.pending_loot.is_empty());
+        assert!(gs.loot_queued_at.is_none());
+    }
+
+    #[test]
+    fn apply_packet_ui_clear_invite_clears_pending_invite() {
+        use crate::eq_net::transport::AppPacket;
+        let mut gs = GameState::new();
+        gs.pending_invite = Some("Sariel".into());
+        super::apply_packet(&mut gs, &AppPacket {
+            opcode: crate::eq_net::protocol::OP_UI_CLEAR_INVITE, payload: Vec::new(),
+        });
+        assert!(gs.pending_invite.is_none());
+    }
+
+    #[test]
+    fn apply_task_select_window_empty_payload_clears_offers() {
+        // navigation.rs mirrors an accept/decline by sending an EMPTY OP_TaskSelectWindow, which
+        // must clear the render-side offers so the Task selector window closes (bug #5).
+        let mut gs = GameState::new();
+        gs.task_offers.push(crate::game_state::TaskOffer {
+            task_id: 9, npc_id: 3, title: "T".into(), description: "D".into(), has_rewards: false,
+        });
+        apply_task_select_window(&mut gs, &[]);
+        assert!(gs.task_offers.is_empty());
     }
 }

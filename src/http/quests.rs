@@ -186,6 +186,7 @@ pub(crate) mod tests {
             doors_shared: Arc::new(Mutex::new(Vec::new())),
             camp: Arc::new(Mutex::new(None)),
             camp_until: Arc::new(Mutex::new(None)),
+            pet_cmd: Arc::new(Mutex::new(None)),
             group:             Arc::new(Mutex::new(GroupSnapshot::default())),
             group_invite:      Arc::new(Mutex::new(None)),
             trainer_open_req:  Arc::new(Mutex::new(None)),

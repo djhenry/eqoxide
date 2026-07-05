@@ -132,6 +132,9 @@ pub const DMGTYPE_FALLING: u8 = 0xFC;
 
 pub const OP_PET_COMMANDS: u16 = 0x0159;      // RoF2: OP_PetCommands
 pub const PET_ATTACK: u32 = 2;
+pub const PET_FOLLOWME: u32 = 4;
+pub const PET_GUARDHERE: u32 = 5;
+pub const PET_SIT: u32 = 6;
 pub const PET_BACKOFF: u32 = 28;
 
 // Merchant/shop: open a merchant, then buy an item from its inventory slot.
@@ -220,6 +223,32 @@ pub const OP_END_LOOT_REQUEST: u16 = 0x30f7; // RoF2: OP_EndLootRequest
 
 pub const OP_EXP_UPDATE: u16 = 0x20ed;    // RoF2: OP_ExpUpdate
 pub const OP_LEVEL_UPDATE: u16 = 0x1eec;  // RoF2: OP_LevelUpdate
+
+// ── Internal (client-only) synthetic opcodes ──────────────────────────────
+// NEVER sent on the wire. The nav/gameplay threads mirror CLIENT-initiated state changes into
+// the render thread's separate GameState by sending synthetic AppPackets over app_tx (the same
+// channel real server packets arrive on) — see the two-GameState split notes in navigation.rs.
+// 0xFFxx sits far above every RoF2 opcode this client handles, so they can't collide.
+
+/// Local echo of the player's own outgoing chat (say/tell/ooc/shout/group), so the chat window —
+/// which renders only the RENDER GameState's message log — shows what you said. Payload:
+/// `kind` NUL `text` (both UTF-8); applied as `gs.log_msg(kind, text)`.
+pub const OP_UI_LOCAL_ECHO: u16 = 0xFFF0;
+/// Auto-loot session mirror (the gameplay loop drives looting on the NAV GameState only).
+/// Payload: 1 byte — 1 = a loot session is active, 0 = idle (also clears queued corpses).
+pub const OP_UI_LOOT_STATE: u16 = 0xFFF1;
+/// Clear the pending group invite after the player accepts/declines it (both are client-initiated;
+/// a decline produces no server packet at all). Payload: empty.
+pub const OP_UI_CLEAR_INVITE: u16 = 0xFFF2;
+
+/// Build an [`OP_UI_LOCAL_ECHO`] payload: `kind` NUL `text`.
+pub fn build_ui_local_echo(kind: &str, text: &str) -> Vec<u8> {
+    let mut b = Vec::with_capacity(kind.len() + 1 + text.len());
+    b.extend_from_slice(kind.as_bytes());
+    b.push(0);
+    b.extend_from_slice(text.as_bytes());
+    b
+}
 
 // ── Chat ──────────────────────────────────────────────────────────────────
 

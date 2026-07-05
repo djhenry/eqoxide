@@ -88,7 +88,11 @@ fn inv_slot(ui: &mut egui::Ui, cx: &mut UiCtx, slot: i32, label: &str, item: Opt
         }
     }
 
-    if resp.clicked() {
+    // OP_MoveItem can only address possessions wire slots 0..=33 (worn +
+    // general + cursor); bag sub-slots aren't modeled — moving them would
+    // desync client and server inventories.
+    let movable = (0..=33).contains(&slot);
+    if resp.clicked() && movable {
         match selected_slot(ui) {
             // Click the selected slot again → deselect.
             Some(s) if s == slot => ui.ctx().data_mut(|d| d.remove::<i32>(sel_id())),

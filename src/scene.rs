@@ -369,7 +369,10 @@ impl SceneState {
             pet_id: gs.pet_id,
             pending_invite: gs.pending_invite.clone(),
             task_offers: gs.task_offers.clone(),
-            loot_active: gs.loot_session_active || !gs.pending_loot.is_empty(),
+            // Gate on the mirrored loot SESSION only (OP_UI_LOOT_STATE from the gameplay loop).
+            // The render-side pending_loot fills from corpse packets but is drained only by the
+            // gameplay loop's copy, so including it here held the Loot window open forever (#4).
+            loot_active: gs.loot_session_active,
             player_dead: gs.player_dead,
             zone_id: gs.zone_id,
         }
