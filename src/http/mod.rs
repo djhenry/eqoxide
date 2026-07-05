@@ -351,6 +351,10 @@ pub struct PlayerState {
     /// dead/frozen rather than merely idle. Recomputed from `last_packet_age_ms` every frame (the
     /// derived Default is a transient `false` before the first snapshot).
     pub connected:          bool,
+    /// Smoothed per-phase frame timings (ms); all zero unless the client runs with `--profile` /
+    /// `EQ_PROFILE=1`. Exposed under `/v1/observe/debug` → `frame_profile` so perf work (#152)
+    /// can read phase costs programmatically instead of screenshotting the HUD overlay.
+    pub frame_profile:      crate::profiling::FrameProfile,
 }
 pub type PlayerInfo = Arc<Mutex<PlayerState>>;
 
