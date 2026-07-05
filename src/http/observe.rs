@@ -57,6 +57,8 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             "last_packet_age_ms": player.last_packet_age_ms,
             "nav_state":   nav_state,
         },
+        // Per-phase frame timings (ms, EMA-smoothed); all zero unless --profile / EQ_PROFILE=1.
+        "frame_profile": player.frame_profile,
         "camera": {
             "azimuth_deg":   cam.azimuth.to_degrees(),
             "elevation_deg": cam.elevation.to_degrees(),
