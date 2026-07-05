@@ -46,5 +46,6 @@ pub mod http;
 pub mod hud;
 pub mod quests;
 pub mod spells;
+pub mod ui;
 pub mod ui_layout;
 pub mod zone_map;

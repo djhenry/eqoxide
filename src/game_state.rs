@@ -428,7 +428,8 @@ impl GameState {
     }
 
     pub fn log_msg(&mut self, kind: &str, text: &str) {
-        if self.messages.len() >= 50 {
+        // 400 entries so the chat window has real scrollback (was 50).
+        if self.messages.len() >= 400 {
             self.messages.pop_front();
         }
         self.messages.push_back(LogEntry {
@@ -714,18 +715,18 @@ mod tests {
     #[test]
     fn log_msg_drops_oldest_when_full() {
         let mut gs = GameState::new();
-        // Fill to exactly 50
-        for i in 0..50 {
+        // Fill to exactly the ring cap (400 — sized for chat scrollback, #162).
+        for i in 0..400 {
             gs.log_msg("kind", &format!("msg {i}"));
         }
-        assert_eq!(gs.messages.len(), 50);
+        assert_eq!(gs.messages.len(), 400);
         assert_eq!(gs.messages[0].text, "msg 0");
 
         // Adding one more should drop "msg 0"
-        gs.log_msg("kind", "msg 50");
-        assert_eq!(gs.messages.len(), 50);
+        gs.log_msg("kind", "msg 400");
+        assert_eq!(gs.messages.len(), 400);
         assert_eq!(gs.messages[0].text, "msg 1");
-        assert_eq!(gs.messages[49].text, "msg 50");
+        assert_eq!(gs.messages[399].text, "msg 400");
     }
 
     // --- GameState::upsert_entity / remove_entity ---

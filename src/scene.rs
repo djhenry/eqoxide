@@ -127,6 +127,28 @@ pub struct SceneState {
     pub group_members: Vec<crate::game_state::GroupMember>,
     /// Current group leader's name ("" if unknown/not grouped).
     pub group_leader: String,
+    // ── UI-overhaul additions (#162) ──
+    /// Absolute HP/mana values for the player window ("123 / 456" readouts).
+    pub cur_hp: i32,
+    pub max_hp: i32,
+    pub cur_mana: i32,
+    pub max_mana: i32,
+    /// Player skill values indexed by skill id (see `crate::skills`), from the profile.
+    pub player_skills: Vec<u32>,
+    /// `Some(trainer_entity_id)` while a GM-trainer session is open.
+    pub trainer_open: Option<u32>,
+    /// Per-skill caps the open trainer offers (same indexing as `player_skills`).
+    pub trainer_skills: Vec<u32>,
+    /// The player's pet spawn id, if one is up.
+    pub pet_id: Option<u32>,
+    /// Pending group invite from this player name (accept/decline dialog).
+    pub pending_invite: Option<String>,
+    /// Tasks offered by an open task-select window.
+    pub task_offers: Vec<crate::game_state::TaskOffer>,
+    /// True while the auto-loot session is working a corpse (loot window).
+    pub loot_active: bool,
+    pub player_dead: bool,
+    pub zone_id: u16,
 }
 
 impl SceneState {
@@ -337,6 +359,19 @@ impl SceneState {
                 level: gs.group_member_level(&m.name), ..m.clone()
             }).collect(),
             group_leader: gs.group_leader.clone(),
+            cur_hp: gs.cur_hp,
+            max_hp: gs.max_hp,
+            cur_mana: gs.cur_mana,
+            max_mana: gs.max_mana,
+            player_skills: gs.player_skills.clone(),
+            trainer_open: gs.trainer_open,
+            trainer_skills: gs.trainer_skills.clone(),
+            pet_id: gs.pet_id,
+            pending_invite: gs.pending_invite.clone(),
+            task_offers: gs.task_offers.clone(),
+            loot_active: gs.loot_session_active || !gs.pending_loot.is_empty(),
+            player_dead: gs.player_dead,
+            zone_id: gs.zone_id,
         }
     }
 }
