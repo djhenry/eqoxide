@@ -1597,11 +1597,13 @@ impl Navigator {
                         gs.player_heading = hdg;
                         if dist > engage {
                             // Drive the controller toward the target (it owns collide-and-slide).
+                            let swim = self.collision.read().unwrap().as_ref()
+                                .is_some_and(|c| c.in_water([gs.player_x, gs.player_y, gs.player_z]));
                             *self.nav_intent.lock().unwrap() = Some(MoveIntent {
                                 wish_dir:    [dx / dist, dy / dist],
                                 wish_vspeed: 0.0,
                                 jump:        false,
-                                want_swim:   false,
+                                want_swim:   swim,
                                 speed:       RUN_SPEED,
                                 climb:       crate::movement::NAV_CLIMB, // surmount fence/cart lips find_path routed over (#41)
                                 hop:         false,                      // melee approach: no auto-hop
@@ -1790,7 +1792,13 @@ impl Navigator {
         // client-applied, so an unguarded drop can suicide a squishy character.
         const FALL_TRIGGER: f32 = 18.0; // bigger than a stair/ledge step (the walk STEP_H is 20)
         let drop_to_target = gs.player_z - target.2;
-        if drop_to_target > FALL_TRIGGER && dist <= STOP_DIST + 8.0 {
+        // A submerged landing (e.g. a surface pool whose solid bottom find_path routed to) is NOT a
+        // lethal fall: you splash into water, which negates fall damage in RoF2, then swim across.
+        // Only guard DRY drops — otherwise a ground-level pool reads as a big fall and the character
+        // gets stuck at the water's edge (#191).
+        let water_landing = self.collision.read().unwrap().as_ref()
+            .is_some_and(|c| c.in_water([target.0, target.1, target.2 + 3.0]));
+        if drop_to_target > FALL_TRIGGER && dist <= STOP_DIST + 8.0 && !water_landing {
             let (_, max_dmg) = fall_damage(drop_to_target);
             if gs.cur_hp > 0 && max_dmg >= gs.cur_hp as u32 {
                 tracing::info!("NAV: fall of {:.0}u (up to {} dmg) would exceed {} hp — stopping at ledge",
@@ -1872,11 +1880,15 @@ impl Navigator {
         // render facing and the streamed heading agree.
         let heading = eq_heading(dx, dy);
         gs.player_heading = heading;
+        // Swim when we're in water so the controller actively swims across/up to the surface instead
+        // of trudging along the bottom (#191). The controller only swims when want_swim && in_water.
+        let swim = self.collision.read().unwrap().as_ref()
+            .is_some_and(|c| c.in_water([gs.player_x, gs.player_y, gs.player_z]));
         *self.nav_intent.lock().unwrap() = Some(MoveIntent {
             wish_dir:    [dx / dist, dy / dist],
             wish_vspeed: 0.0,
             jump:        false,
-            want_swim:   false,
+            want_swim:   swim,
             speed:       RUN_SPEED,
             climb:       crate::movement::NAV_CLIMB, // surmount fence/cart lips find_path routed over (#41)
             // Net progress has stalled toward this waypoint → ask the controller to hop the barrier
