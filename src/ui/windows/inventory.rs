@@ -2,8 +2,9 @@
 //! slots 0-22), general inventory (23-32), cursor (33), coin footer.
 //! Click-to-move: first click selects a slot (gold ring), second click sends
 //! the pair into the shared `move_item` request slot (same path as the HTTP
-//! `/inventory/move` API). Bag *contents* (sub-slots ≥ 251) aren't modeled by
-//! the client yet, so bags can't be opened from here.
+//! `/inventory/move` API). Bag *contents* (general-bag flat slots 251-350) are
+//! modeled and shown grouped under their parent bag; they are movable like any
+//! other slot (the move encoder sets the RoF2 SubIndex). (eqoxide#201)
 
 use crate::game_state::InvItem;
 use crate::ui::{theme, widgets, UiCtx};
@@ -40,8 +41,6 @@ const GENERAL_FIRST: i32 = 23;
 const GENERAL_LAST: i32 = 32;
 /// Cursor wire slot.
 const CURSOR_SLOT: i32 = 33;
-/// First bag-content sub-slot (not modeled client-side yet).
-const BAG_SLOTS_BEGIN: i32 = 251;
 
 fn sel_id() -> egui::Id {
     egui::Id::new("inv_sel")
@@ -61,8 +60,8 @@ fn inv_slot(ui: &mut egui::Ui, cx: &mut UiCtx, slot: i32, label: &str, item: Opt
             if it.charges > 1 {
                 tip.push_str(&format!("\nQty: {}", it.charges));
             }
-            if slot >= BAG_SLOTS_BEGIN {
-                tip.push_str("\nbag contents not yet supported");
+            if let Some((parent, sub)) = crate::game_state::bag_wire_parent(slot) {
+                tip.push_str(&format!("\nin bag {} slot {}", parent - GENERAL_FIRST + 1, sub + 1));
             }
             (cx.icons.item(ui.ctx(), it.icon), it.name.clone(), tip)
         }
@@ -88,10 +87,9 @@ fn inv_slot(ui: &mut egui::Ui, cx: &mut UiCtx, slot: i32, label: &str, item: Opt
         }
     }
 
-    // OP_MoveItem can only address possessions wire slots 0..=33 (worn +
-    // general + cursor); bag sub-slots aren't modeled — moving them would
-    // desync client and server inventories.
-    let movable = (0..=33).contains(&slot);
+    // OP_MoveItem addresses possessions wire slots 0..=33 (worn + general + cursor) and
+    // general-bag content slots (251-350), which encode as the parent slot + SubIndex. (eqoxide#201)
+    let movable = (0..=33).contains(&slot) || crate::game_state::bag_wire_parent(slot).is_some();
     if resp.clicked() && movable {
         match selected_slot(ui) {
             // Click the selected slot again → deselect.
@@ -136,12 +134,6 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
             }
         }
     });
-    ui.label(
-        egui::RichText::new("Bags can't be opened yet (contents not modeled).")
-            .weak()
-            .size(10.0),
-    );
-
     if let Some(cur) = find(CURSOR_SLOT) {
         ui.add_space(2.0);
         ui.horizontal(|ui| {
@@ -150,16 +142,41 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
         });
     }
 
-    // Anything outside the modeled 0-33 range (e.g. bag sub-slots the server
-    // streamed anyway) — show it so items never silently vanish.
+    // ── Open bags: contents grouped under their parent general slot (23-32). ──
+    for parent in GENERAL_FIRST..=GENERAL_LAST {
+        let mut contents: Vec<&InvItem> = inv
+            .iter()
+            .filter(|i| crate::game_state::bag_wire_parent(i.slot).map_or(false, |(p, _)| p == parent))
+            .collect();
+        if contents.is_empty() {
+            continue;
+        }
+        contents.sort_by_key(|i| i.slot);
+        let bag_name = find(parent).map(|c| c.name.clone()).unwrap_or_else(|| "Bag".into());
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new(format!("{} — slot {}", bag_name, parent - GENERAL_FIRST + 1))
+                .strong()
+                .size(11.0)
+                .color(theme::TEXT_WEAK),
+        );
+        ui.horizontal_wrapped(|ui| {
+            for it in contents {
+                inv_slot(ui, cx, it.slot, &it.name, Some(it));
+            }
+        });
+    }
+
+    // Fallback: any other slot outside 0-33 and outside the general-bag range — show it so items
+    // never silently vanish (e.g. cursor-bag slots the server streamed).
     let mut other: Vec<&InvItem> = inv
         .iter()
-        .filter(|i| !(0..=CURSOR_SLOT).contains(&i.slot))
+        .filter(|i| !(0..=CURSOR_SLOT).contains(&i.slot) && crate::game_state::bag_wire_parent(i.slot).is_none())
         .collect();
     if !other.is_empty() {
         other.sort_by_key(|i| i.slot);
         ui.add_space(2.0);
-        ui.label(egui::RichText::new("Bag contents").strong().size(12.0).color(theme::TEXT_WEAK));
+        ui.label(egui::RichText::new("Other items").strong().size(12.0).color(theme::TEXT_WEAK));
         ui.horizontal_wrapped(|ui| {
             for it in other {
                 inv_slot(ui, cx, it.slot, &it.name, Some(it));

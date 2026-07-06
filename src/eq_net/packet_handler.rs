@@ -485,6 +485,36 @@ fn apply_group_acknowledge(gs: &mut GameState, _p: &[u8]) {
 // Slot numbers are RoF2 wire slots: equipment 0-22, general-inv 23-32, cursor 33 (rof2_limits.h).
 // We store them directly in InvItem.slot, consistent with how apply_item_packet already works.
 
+/// Push a parsed RoF2 item into `out` as an InvItem, then flatten any bag contents into their own
+/// InvItems at the flat wire slot `bag_wire_slot(parent, sub_index)`. Bagged items thus appear in
+/// gs.inventory (and `/v1/observe/inventory`) and are movable via the same MoveItem path as any
+/// other slot. RoF2 bags don't nest, so one level is enough. (eqoxide#201)
+fn push_item_and_contents(out: &mut Vec<crate::game_state::InvItem>, item: crate::eq_net::item::RoF2Item) {
+    let parent_slot = item.main_slot as i32;
+    let bag_contents = item.bag_contents; // move the Vec out before consuming the rest of `item`
+    out.push(crate::game_state::InvItem {
+        slot:    parent_slot,
+        item_id: item.id,
+        name:    item.name,
+        icon:    item.icon,
+        charges: (item.stacksize as i32).max(1),
+        idfile:  item.idfile,
+        click_spell_id: item.click_spell_id,
+    });
+    for (sub_index, sub) in bag_contents {
+        let Some(flat) = crate::game_state::bag_wire_slot(parent_slot, sub_index) else { continue };
+        out.push(crate::game_state::InvItem {
+            slot:    flat,
+            item_id: sub.id,
+            name:    sub.name,
+            icon:    sub.icon,
+            charges: (sub.stacksize as i32).max(1),
+            idfile:  sub.idfile,
+            click_spell_id: sub.click_spell_id,
+        });
+    }
+}
+
 /// OP_CharInventory — the full player inventory + equipment, binary-serialized in RoF2 format.
 /// Reads `uint32 item_count` then N back-to-back SerializeItem blobs, replacing gs.inventory.
 fn apply_char_inventory(gs: &mut GameState, p: &[u8]) {
@@ -499,15 +529,7 @@ fn apply_char_inventory(gs: &mut GameState, p: &[u8]) {
             tracing::warn!("EQ: OP_CharInventory: failed to parse item at offset {off}; stopping");
             break;
         };
-        items.push(crate::game_state::InvItem {
-            slot:    item.main_slot as i32,
-            item_id: item.id,
-            name:    item.name,
-            icon:    item.icon,
-            charges: (item.stacksize as i32).max(1), // stack quantity lives in stacksize, not charges
-            idfile:  item.idfile,
-            click_spell_id: item.click_spell_id,
-        });
+        push_item_and_contents(&mut items, item);
         off += consumed;
     }
     if !items.is_empty() {
@@ -544,24 +566,29 @@ fn apply_item_packet(gs: &mut GameState, p: &[u8]) {
         gs.merchant_items.push(mi);
         gs.merchant_items.sort_by_key(|m| m.merchant_slot);
     } else {
-        let it = crate::game_state::InvItem {
-            slot:    item.main_slot as i32,
-            item_id: item.id,
-            name:    item.name,
-            icon:    item.icon,
-            charges: (item.stacksize as i32).max(1), // stack quantity lives in stacksize, not charges
-            idfile:  item.idfile,
-            click_spell_id: item.click_spell_id,
-        };
         const ITEM_PACKET_LOOT: u32 = 0x66;
         if packet_type == ITEM_PACKET_LOOT {
             // A Loot item's `main_slot` is NOT a safe inventory destination — it collides with
             // occupied general-inventory wire slots and would evict a real item (eqoxide#56).
+            let it = crate::game_state::InvItem {
+                slot:    item.main_slot as i32,
+                item_id: item.id,
+                name:    item.name,
+                icon:    item.icon,
+                charges: (item.stacksize as i32).max(1),
+                idfile:  item.idfile,
+                click_spell_id: item.click_spell_id,
+            };
             apply_looted_item(gs, it);
         } else {
             // OP_CharInventory / equip / cursor etc.: `main_slot` IS the authoritative slot.
-            gs.inventory.retain(|x| x.slot != it.slot);
-            gs.inventory.push(it);
+            // Expand bag contents too, so a container delivered here shows its items. (eqoxide#201)
+            let mut upserts = Vec::new();
+            push_item_and_contents(&mut upserts, item);
+            for it in upserts {
+                gs.inventory.retain(|x| x.slot != it.slot);
+                gs.inventory.push(it);
+            }
         }
     }
 }
