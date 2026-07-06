@@ -12,10 +12,44 @@ const ZOOM_MAX: f32 = 8.0;
 pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     let s = cx.scene;
 
-    // ── Reserve two small bottom rows; the canvas takes the rest. ───────────
-    let footer_h = 40.0;
-    let avail = ui.available_size();
-    let canvas_size = Vec2::new(avail.x.max(120.0), (avail.y - footer_h).max(100.0));
+    // Footer (bottom panel) draws first and measures itself; the canvas then
+    // takes the EXACT remainder. Never size the canvas as `available - <const>`
+    // and draw a taller footer after it — the window grows to fit the overflow,
+    // re-derives the canvas from the new size, and creeps forever (the
+    // window-growth feedback loop).
+    egui::TopBottomPanel::bottom(ui.id().with("map_footer"))
+        .frame(egui::Frame::none().inner_margin(egui::Margin { top: 3.0, ..Default::default() }))
+        .show_separator_line(false)
+        .show_inside(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Zoom").color(theme::TEXT_WEAK).size(10.0));
+                ui.spacing_mut().slider_width = (ui.available_width() - 40.0).max(60.0);
+                ui.add(
+                    egui::Slider::new(cx.minimap_zoom, ZOOM_MIN..=ZOOM_MAX)
+                        .show_value(false)
+                        .logarithmic(true),
+                );
+                let zoom = *cx.minimap_zoom;
+                ui.label(egui::RichText::new(format!("{zoom:.1}x")).color(theme::TEXT_WEAK).size(10.0));
+            });
+            ui.horizontal(|ui| {
+                let zone = if s.zone.is_empty() { "(no zone)" } else { s.zone.as_str() };
+                ui.label(egui::RichText::new(zone).color(theme::GOLD).size(11.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{:.0}, {:.0}, {:.0}",
+                            s.player_pos[0], s.player_pos[1], s.player_pos[2]
+                        ))
+                        .color(theme::TEXT_WEAK)
+                        .size(11.0),
+                    );
+                });
+            });
+        });
+
+    egui::CentralPanel::default().frame(egui::Frame::none()).show_inside(ui, |ui| {
+    let canvas_size = ui.available_size().max(Vec2::new(120.0, 100.0));
     let (resp, painter) = ui.allocate_painter(canvas_size, egui::Sense::hover());
     let rect = resp.rect;
     let painter = painter.with_clip_rect(rect);
@@ -30,7 +64,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     let zoom = *cx.minimap_zoom;
 
     // ── Zone bounds: prefer the map file's own extents, else terrain bounds. ─
-    let (zone_min, zone_max) = map_bounds(cx);
+    let (zone_min, zone_max) = map_bounds(ui, cx);
     let zone_w = (zone_max[0] - zone_min[0]).max(1.0);
     let zone_h = (zone_max[1] - zone_min[1]).max(1.0);
 
@@ -65,16 +99,26 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
 
     // ── Background + grid (100-unit ticks). ─────────────────────────────────
     painter.rect_filled(rect, 3.0, theme::BG_PANEL);
+    // All grid + map segments are batched into one painter.extend: each
+    // line_segment call takes egui's graphics lock, and ~4k locked pushes per
+    // frame made the map the most expensive window in --profile.
+    let mut shapes: Vec<egui::Shape> = Vec::with_capacity(1024);
     let tick = Stroke::new(0.5, Color32::from_white_alpha(16));
     let step = 100.0_f32;
     let mut ge = (view_left / step).ceil() * step;
     while ge <= view_left + view_w {
-        painter.line_segment([to_screen(ge, view_bot), to_screen(ge, view_bot + view_h)], tick);
+        shapes.push(egui::Shape::line_segment(
+            [to_screen(ge, view_bot), to_screen(ge, view_bot + view_h)],
+            tick,
+        ));
         ge += step;
     }
     let mut gn = (view_bot / step).ceil() * step;
     while gn <= view_bot + view_h {
-        painter.line_segment([to_screen(view_left, gn), to_screen(view_left + view_w, gn)], tick);
+        shapes.push(egui::Shape::line_segment(
+            [to_screen(view_left, gn), to_screen(view_left + view_w, gn)],
+            tick,
+        ));
         gn += step;
     }
 
@@ -92,8 +136,10 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
                 continue;
             }
             let color = Color32::from_rgba_unmultiplied(line.r, line.g, line.b, 180);
-            painter.line_segment([p1, p2], Stroke::new(0.8, color));
+            shapes.push(egui::Shape::line_segment([p1, p2], Stroke::new(0.8, color)));
         }
+        // Flush before the POI labels so text draws on top of the line art.
+        painter.extend(shapes.drain(..));
         // POI labels once zoomed in enough to read them.
         if zoom >= 2.0 {
             for label in &zm.labels {
@@ -111,6 +157,9 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
             }
         }
     }
+
+    // No zone map: the grid ticks are still pending.
+    painter.extend(shapes);
 
     // ── Entity dots — billboard.pos = [east, north, up]. ────────────────────
     for b in &s.billboards {
@@ -145,39 +194,22 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     ));
 
     painter.rect_stroke(rect, 3.0, Stroke::new(1.0, theme::FRAME_LO));
-
-    // ── Footer: zoom slider + zone/loc readout. ─────────────────────────────
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Zoom").color(theme::TEXT_WEAK).size(10.0));
-        ui.spacing_mut().slider_width = (ui.available_width() - 40.0).max(60.0);
-        ui.add(
-            egui::Slider::new(cx.minimap_zoom, ZOOM_MIN..=ZOOM_MAX)
-                .show_value(false)
-                .logarithmic(true),
-        );
-        ui.label(egui::RichText::new(format!("{zoom:.1}x")).color(theme::TEXT_WEAK).size(10.0));
-    });
-    ui.horizontal(|ui| {
-        let zone = if s.zone.is_empty() { "(no zone)" } else { s.zone.as_str() };
-        ui.label(egui::RichText::new(zone).color(theme::GOLD).size(11.0));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(
-                egui::RichText::new(format!(
-                    "{:.0}, {:.0}, {:.0}",
-                    s.player_pos[0], s.player_pos[1], s.player_pos[2]
-                ))
-                .color(theme::TEXT_WEAK)
-                .size(11.0),
-            );
-        });
     });
 }
 
 /// Zone extents in map coords: the map file's own line extents when loaded
 /// (map art usually covers the whole zone), else the terrain bounds passed in.
-fn map_bounds(cx: &UiCtx) -> ([f32; 2], [f32; 2]) {
+/// The scan over ~4k line endpoints is cached per zone (recomputing it every
+/// frame showed up in the --profile window timings).
+fn map_bounds(ui: &egui::Ui, cx: &UiCtx) -> ([f32; 2], [f32; 2]) {
     if let Some(zm) = cx.zone_map {
         if !zm.lines.is_empty() {
+            let key = egui::Id::new(("map_bounds", &cx.scene.zone, zm.lines.len()));
+            if let Some(cached) =
+                ui.ctx().data(|d| d.get_temp::<([f32; 2], [f32; 2])>(key))
+            {
+                return cached;
+            }
             let (mut min, mut max) = ([f32::MAX; 2], [f32::MIN; 2]);
             for l in &zm.lines {
                 min[0] = min[0].min(l.east1).min(l.east2);
@@ -185,6 +217,7 @@ fn map_bounds(cx: &UiCtx) -> ([f32; 2], [f32; 2]) {
                 max[0] = max[0].max(l.east1).max(l.east2);
                 max[1] = max[1].max(l.north1).max(l.north2);
             }
+            ui.ctx().data_mut(|d| d.insert_temp(key, (min, max)));
             return (min, max);
         }
     }
