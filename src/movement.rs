@@ -217,6 +217,13 @@ impl CharacterController {
             }
         }
 
+        // A character that nav-pathed DOWN to a pool floor becomes on_ground on the bottom; the
+        // passive-buoyancy branch below only fired while airborne, so it used to sit there
+        // submerged forever. Treat "on the floor but well below the water surface" as submerged so
+        // it floats back up (a body resting underwater is still buoyant). (eqoxide#197)
+        let submerged_on_floor = self.in_water && !swimming
+            && col.water_surface(self.pos).is_some_and(|surf| self.pos[2] < surf - 2.0);
+
         // ── Vertical: swim / buoyancy / jump / gravity + ground clamp. ──
         if swimming {
             self.on_ground = false;
@@ -235,13 +242,17 @@ impl CharacterController {
                     self.pos[2] = (self.pos[2] + BUOY_RATE * dt).min(target);
                 }
             }
-        } else if self.in_water && !self.on_ground {
-            // Submerged but NOT actively swimming (walked / nav-pathed into water): float toward the
-            // surface instead of applying gravity and free-falling through the passable water plane
-            // to the riverbed — or, in open deep water with no bottom, to the zone boundary (#172).
+        } else if self.in_water && (!self.on_ground || submerged_on_floor) {
+            // Submerged but NOT actively swimming (walked / nav-pathed into water, incl. resting on
+            // the pool bottom): float toward the surface instead of applying gravity and free-falling
+            // through the passable water plane to the riverbed — or, in open deep water with no
+            // bottom, to the zone boundary (#172) — or sitting on the pool floor (#197).
             // Rise-only: buoyancy never accelerates the character downward.
             const BUOY_RATE:   f32 = 30.0; // vertical settle rate toward the surface (u/s)
             const FLOAT_DEPTH: f32 = 2.0;  // rest this far below the surface (body floats, head clears)
+            // Detach from the floor so buoyancy owns the vertical (we only get here on_ground when
+            // submerged_on_floor, i.e. genuinely below the surface and about to rise).
+            self.on_ground = false;
             self.vel_z = 0.0;
             if let Some(surf) = col.water_surface(self.pos) {
                 let target = surf - FLOAT_DEPTH;
@@ -518,6 +529,21 @@ mod tests {
         };
         for _ in 0..240 { ctrl.step(swim, 1.0 / 60.0, &c); }
         assert!(ctrl.pos[2] > 5.0, "swim floats off the bottom toward the surface (~8): {}", ctrl.pos[2]);
+    }
+
+    #[test]
+    fn buoyancy_floats_off_the_bottom_when_grounded_and_not_swimming() {
+        // #197: nav pathed the character DOWN to the pool floor and then STOPPED driving, so it
+        // rests on_ground on the bottom, submerged, with want_swim=false. Passive buoyancy must
+        // still float it back up — before the fix it sat on the bottom forever (the buoyancy branch
+        // required !on_ground).
+        let mut c = col(vec![]);
+        c.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::flat_below(10.0))));
+        let mut ctrl = CharacterController::new([0.0, 0.0, -20.0]);
+        ctrl.on_ground = true; // resting on the pool bottom, NOT swimming
+        for _ in 0..240 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 60.0, &c); }
+        assert!(ctrl.pos[2] > 5.0, "must float off the bottom to the surface (~8), got {}", ctrl.pos[2]);
+        assert!(!ctrl.on_ground, "detaches from the floor while floating up");
     }
 
     #[test]
