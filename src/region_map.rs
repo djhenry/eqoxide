@@ -152,6 +152,86 @@ impl RegionMap {
         v
     }
 
+    /// Precompute a representative interior `[east, north, z]` point for every zone-line region, so
+    /// "where is the line to zone X?" is an O(1) lookup at request time instead of an exhaustive
+    /// runtime scan that stalled the network thread and linkdead-ed the client (#204). Runs ONCE at
+    /// zone load (off the net thread). `bounds` = `(min_e, max_e, min_n, max_n, zmin, zmax)` (server
+    /// coords). Returns `(zone_line_index, [east, north, z])` per zone-line leaf.
+    ///
+    /// Walks the BSP once (O(nodes)), carrying an AABB tightened by each axis-aligned split plane
+    /// (oblique planes are left as a superset), then grid-samples inside each zone-line leaf's AABB
+    /// and validates every candidate with `zone_line_at`, so a slightly loose AABB can never yield a
+    /// wrong point — only fail to find one (logged). Sample count per leaf is capped, so the whole
+    /// pass is bounded regardless of zone size.
+    pub fn zone_line_region_points(&self, bounds: (f32, f32, f32, f32, f32, f32)) -> Vec<(i32, [f32; 3])> {
+        let (min_e, max_e, min_n, max_n, zmin, zmax) = bounds;
+        if self.nodes.is_empty() || min_e > max_e || min_n > max_n || zmin > zmax { return Vec::new(); }
+        // BSP axes (leaf_at swaps to `(sy, sx, sz)`): axis0 = north, axis1 = east, axis2 = z.
+        let root = [[min_n, max_n], [min_e, max_e], [zmin, zmax]];
+        let mut out = Vec::new();
+        self.collect_zone_line_leaves(1, root, 0, &mut out);
+        out
+    }
+
+    /// Tighten `aabb` to a plane's half-space for an axis-aligned plane; leave it unchanged (a
+    /// superset) for an oblique one. `positive` selects the `dist > 0` side.
+    fn tighten_aabb(mut aabb: [[f32; 2]; 3], normal: [f32; 3], split: f32, positive: bool) -> [[f32; 2]; 3] {
+        // Only axis-aligned planes tighten an AABB cleanly.
+        let axis = (0..3).find(|&k| normal[k].abs() > 1e-4 && (0..3).all(|j| j == k || normal[j].abs() < 1e-4));
+        if let Some(k) = axis {
+            let bound = -split / normal[k]; // coord[k] on the plane
+            if (normal[k] > 0.0) == positive { aabb[k][0] = aabb[k][0].max(bound); } // coord > bound
+            else                             { aabb[k][1] = aabb[k][1].min(bound); } // coord < bound
+        }
+        aabb
+    }
+
+    fn collect_zone_line_leaves(&self, nn: i32, aabb: [[f32; 2]; 3], depth: u32, out: &mut Vec<(i32, [f32; 3])>) {
+        if nn <= 0 || depth > 256 { return; }
+        let Some(node) = self.nodes.get((nn - 1) as usize) else { return; };
+        if node.left == 0 && node.right == 0 {
+            if node.special == REGION_ZONE_LINE && node.zone_line_index != 0 {
+                match self.sample_region_point(node.zone_line_index, aabb) {
+                    Some(p) => out.push((node.zone_line_index, p)),
+                    None => tracing::warn!(
+                        "region_map: no interior point found for zone-line index {} (AABB {:?}) — /zone_cross to it may fail",
+                        node.zone_line_index, aabb),
+                }
+            }
+            return;
+        }
+        self.collect_zone_line_leaves(node.left,  Self::tighten_aabb(aabb, node.normal, node.split, true),  depth + 1, out);
+        self.collect_zone_line_leaves(node.right, Self::tighten_aabb(aabb, node.normal, node.split, false), depth + 1, out);
+    }
+
+    /// Grid-sample `aabb` (`[north, east, z]` ranges) for points classifying as zone-line `index`;
+    /// return their centroid as `[east, north, z]`. Step is chosen to cap total samples (bounded
+    /// work even for a loose AABB). `None` if the region isn't hit (too small for the step).
+    fn sample_region_point(&self, index: i32, aabb: [[f32; 2]; 3]) -> Option<[f32; 3]> {
+        let ext = [aabb[0][1] - aabb[0][0], aabb[1][1] - aabb[1][0], aabb[2][1] - aabb[2][0]];
+        if ext.iter().any(|&e| e < 0.0) { return None; }
+        const MAX_SAMPLES: f64 = 120_000.0;
+        let vol = ext[0].max(1.0) as f64 * ext[1].max(1.0) as f64 * ext[2].max(1.0) as f64;
+        let step = ((vol / MAX_SAMPLES).cbrt() as f32).clamp(2.0, 64.0);
+        let (mut sum, mut hits) = ([0f64; 3], 0u32);
+        let mut north = aabb[0][0];
+        while north <= aabb[0][1] {
+            let mut east = aabb[1][0];
+            while east <= aabb[1][1] {
+                let mut z = aabb[2][0];
+                while z <= aabb[2][1] {
+                    if self.zone_line_at(east, north, z) == Some(index) {
+                        sum[0] += east as f64; sum[1] += north as f64; sum[2] += z as f64; hits += 1;
+                    }
+                    z += step;
+                }
+                east += step;
+            }
+            north += step;
+        }
+        (hits > 0).then(|| [(sum[0] / hits as f64) as f32, (sum[1] / hits as f64) as f32, (sum[2] / hits as f64) as f32])
+    }
+
     /// Height of the water surface directly above a submerged point `(sx, sy, submerged_z)`.
     /// Binary-searches upward for the water→air boundary. Returns `None` if the point isn't in
     /// water, or if it's still water `MAX_UP` above it (unbounded / not a normal surface). Used by
@@ -253,5 +333,21 @@ mod tests {
         assert_eq!(RegionMap::zone_line_below(0.0, 7).zone_line_indices(), vec![7]);
         // A water-only map (no zone-line leaves) has no exit indices.
         assert!(RegionMap::flat_below(0.0).zone_line_indices().is_empty());
+    }
+
+    #[test]
+    fn zone_line_region_points_finds_a_validated_interior_point() {
+        // zone-line region = everywhere z < 0. Precompute must return one point actually inside it.
+        let rm = RegionMap::zone_line_below(0.0, 7);
+        let pts = rm.zone_line_region_points((-100.0, 100.0, -50.0, 50.0, -30.0, 20.0));
+        assert_eq!(pts.len(), 1, "one zone-line region");
+        let (idx, p) = pts[0];
+        assert_eq!(idx, 7);
+        assert!(p[2] < 0.0, "point is below the z=0 boundary (inside the region): {p:?}");
+        // Ground-truth: the returned [east, north, z] classifies as the zone-line region.
+        assert_eq!(rm.zone_line_at(p[0], p[1], p[2]), Some(7), "returned point validates: {p:?}");
+        // A water-only map yields no zone-line region points.
+        assert!(RegionMap::flat_below(0.0)
+            .zone_line_region_points((-100.0, 100.0, -50.0, 50.0, -30.0, 20.0)).is_empty());
     }
 }
