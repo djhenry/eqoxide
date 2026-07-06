@@ -7,9 +7,11 @@
 //!
 //! - **Item icons**: `dragitem1..178.dds`, 256×256 sheets of 6×6 40 px cells.
 //!   Wire icon ids are offset by the classic base 500:
-//!   `idx = icon - 500; sheet = idx/36 + 1; cell = idx%36` (row-major).
-//! - **Spell icons**: `spells01..07.tga`, sheets of 6×6 40 px cells
-//!   (`crate::spells::icon_cell` maps a spell's icon id to sheet/cell).
+//!   `idx = icon - 500; sheet = idx/36 + 1; cell = idx%36`. Cells are **column-major**
+//!   (RoF2 `A_DragItem` `<Vertical>true</Vertical>`) — see `cell_uv`.
+//! - **Spell icons**: `spells01..07.tga`, sheets of 6×6 40 px cells, **row-major**
+//!   (`A_SpellIcons` `<Vertical>false</Vertical>`; `crate::spells::icon_cell` maps a
+//!   spell's icon id to sheet/cell).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -85,9 +87,18 @@ impl Icons {
         }
     }
 
-    fn cell_uv(cell: u32) -> egui::Rect {
-        let col = (cell % SHEET_CELLS) as f32;
-        let row = (cell / SHEET_CELLS) as f32;
+    /// UV rect of linear `cell` within a 6×6 sheet. RoF2 lays these two ways (per each
+    /// `Ui2DAnimation`'s `<Vertical>` flag in EQUI_Animations.xml): item icons (`A_DragItem`,
+    /// `Vertical=true`) advance **down a column first** (column-major); spell icons
+    /// (`A_SpellIcons`, `Vertical=false`) advance **across a row first** (row-major). Applying the
+    /// row-major layout to items transposes every icon (#184 — a short sword drew as a bottle).
+    fn cell_uv(cell: u32, vertical: bool) -> egui::Rect {
+        let (col, row) = if vertical {
+            (cell / SHEET_CELLS, cell % SHEET_CELLS) // column-major (items)
+        } else {
+            (cell % SHEET_CELLS, cell / SHEET_CELLS) // row-major (spells)
+        };
+        let (col, row) = (col as f32, row as f32);
         // Cells are 40 px in a 256 px sheet (the last 16 px are padding).
         let unit = CELL as f32 / 256.0;
         egui::Rect::from_min_max(
@@ -110,7 +121,7 @@ impl Icons {
             .entry(sheet)
             .or_insert_with(|| Self::load_sheet(ctx, &dir, &format!("dragitem{sheet}.dds")))
             .as_ref()?;
-        Some(IconRef { tex: tex.id(), uv: Self::cell_uv(cell) })
+        Some(IconRef { tex: tex.id(), uv: Self::cell_uv(cell, true) })
     }
 
     /// Spell icon by (1-based sheet, cell) — pair produced by `spells::icon_cell`.
@@ -121,7 +132,7 @@ impl Icons {
             .entry(sheet)
             .or_insert_with(|| Self::load_sheet(ctx, &dir, &format!("spells{sheet:02}.tga")))
             .as_ref()?;
-        Some(IconRef { tex: tex.id(), uv: Self::cell_uv(cell) })
+        Some(IconRef { tex: tex.id(), uv: Self::cell_uv(cell, false) })
     }
 }
 
@@ -139,11 +150,26 @@ mod tests {
 
     #[test]
     fn cell_uv_grid() {
-        let uv = Icons::cell_uv(0);
+        let uv = Icons::cell_uv(0, false);
         assert_eq!(uv.min, egui::pos2(0.0, 0.0));
-        let uv7 = Icons::cell_uv(7); // row 1, col 1
+        let uv7 = Icons::cell_uv(7, false); // row 1, col 1
         assert!((uv7.min.x - 40.0 / 256.0).abs() < 1e-6);
         assert!((uv7.min.y - 40.0 / 256.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn item_cells_are_column_major_spells_row_major() {
+        let unit = 40.0 / 256.0;
+        // cell 1: spells (row-major) → col 1, row 0; items (column-major) → col 0, row 1 (the transpose).
+        let spell1 = Icons::cell_uv(1, false);
+        assert!((spell1.min.x - unit).abs() < 1e-6 && spell1.min.y.abs() < 1e-6);
+        let item1 = Icons::cell_uv(1, true);
+        assert!(item1.min.x.abs() < 1e-6 && (item1.min.y - unit).abs() < 1e-6);
+        // Short Sword: icon 580 → sheet 3, cell 8. Column-major cell 8 = col 1, row 2 (the sword);
+        // row-major would be col 2, row 1 (the bottle) — the #184 bug.
+        let sword = Icons::cell_uv(8, true);
+        assert!((sword.min.x - unit).abs() < 1e-6, "col 1");
+        assert!((sword.min.y - 2.0 * unit).abs() < 1e-6, "row 2");
     }
 
     #[test]
