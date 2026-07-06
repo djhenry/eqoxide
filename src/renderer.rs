@@ -705,9 +705,10 @@ impl EqRenderer {
         for m in &weapon_meshes {
             if m.positions.is_empty() || m.indices.is_empty() { continue; }
             let [cx, cy, cz] = m.center;
-            // Keep EQ-native axes: IT models are authored in the attachment-bone frame
-            // (identity attach in the real client). The draw applies the same EQ→Y-up
-            // rotation the rig was baked with, so the vertices must stay unrotated here.
+            // Keep the baker's vertex frame untouched: weapons.glb positions are the
+            // zone pipeline's Y/Z-swapped WLD coordinates, and the draw bridges them
+            // into the rig frame with models::held_item_xform(). Rotating here too
+            // would double-transform.
             let verts: Vec<crate::gpu::Vertex> = m.positions.iter().enumerate().map(|(i, &p)| {
                 let n = m.normals.get(i).copied().unwrap_or([0.0, 0.0, 1.0]);
                 crate::gpu::Vertex {
