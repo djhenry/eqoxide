@@ -261,9 +261,16 @@ impl UiState {
                 minimap_zoom: &mut self.minimap_zoom,
                 fps,
             };
+            let win_t0 = crate::profiling::enabled().then(std::time::Instant::now);
             let result = chrome::eq_window(ctx, &mut self.sys, def, screen, |ui| {
                 windows::draw(def.id, ui, &mut cx)
             });
+            if let Some(t0) = win_t0 {
+                let ms = t0.elapsed().as_secs_f32() * 1000.0;
+                if ms > 2.0 {
+                    tracing::info!("ui profile: window '{}' took {ms:.1} ms", def.id);
+                }
+            }
             if result.close_clicked {
                 if def.transient {
                     // Hide immediately; also tell the game to end the session
