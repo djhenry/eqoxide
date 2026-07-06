@@ -1,10 +1,12 @@
 //! Quest-giver data + the agent quest experience.
 //!
 //! EQEmu quests are Lua scripts (not in the DB), so `tools/quest_finder.py --export` bakes the
-//! quest-giver info (location, wanted turn-in items, reward XP) into `data/quests.json`. This module
-//! loads it into a process-global and answers "is this NPC a quest giver?" so the HUD can draw a
-//! golden "!" over them (like a modern MMO) and `GET /quests` can list eligible quests near the
-//! player. See `docs/autonomous-play.md` §0 and the questing roadmap in `todo.md`.
+//! quest-giver info (location, wanted turn-in items, reward XP) into `quests.json`. That file is
+//! delivered through the asset server's `gamedata` set (custom-content editable) and synced into the
+//! local cache, from which this module loads it into a process-global and answers "is this NPC a
+//! quest giver?" so the HUD can draw a golden "!" over them (like a modern MMO) and `GET /quests`
+//! can list eligible quests near the player. See `docs/autonomous-play.md` §0 and the questing
+//! roadmap in `todo.md`.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -30,8 +32,9 @@ pub struct QuestGiver {
 type QuestData = HashMap<String, HashMap<String, QuestGiver>>;
 static QUESTS: OnceLock<QuestData> = OnceLock::new();
 
-/// Load `data/quests.json` once at startup. Missing/invalid file = no quest indicators (the client
-/// still runs); regenerate with `python3 tools/quest_finder.py --export`.
+/// Load `quests.json` (synced from the asset server's `gamedata` set) once at startup. Missing/
+/// invalid file = no quest indicators (the client still runs); regenerate with
+/// `python3 tools/quest_finder.py --export`, which writes into the asset server's content dir.
 pub fn load(path: &std::path::Path) {
     let data: QuestData = std::fs::read_to_string(path)
         .ok()

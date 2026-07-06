@@ -169,9 +169,11 @@ def beginner():
     print("\nRun `python3 tools/quest_finder.py qeynos --turnins` (and qeynos2) for the full list.")
 
 
-def export(zones, path="data/quests.json"):
-    """Write data/quests.json that the client loads to mark quest givers (golden '!') and serve
-    GET /quests. Keyed by zone -> clean NPC name (spaces, matching the client's clean_entity_name)."""
+def export(zones, path="../eqoxide_asset_server/content/quests.json"):
+    """Write quests.json — the canonical quest-giver data. It is delivered to the client through the
+    asset server's `gamedata` set (default path = the asset server's content/quests.json; a server
+    can instead drop an override in the bake raw_dir). The client marks quest givers (golden '!') and
+    serves GET /quests from it. Keyed by zone -> clean NPC name (spaces, matching clean_entity_name)."""
     import json
     import os
     from collections import Counter
