@@ -122,6 +122,9 @@ pub struct App {
     controller_view:  crate::http::ControllerShared,
     /// The nav planner's /goto movement intent, consumed when no WASD key is held.
     nav_intent:       crate::http::NavIntent,
+    /// HTTP manual-move / jump escape hatch (#188), consumed when no WASD key is held, with
+    /// priority over `nav_intent` while active.
+    manual_move:      crate::http::ManualMoveReq,
     /// A large server correction handed over by the nav streamer; applied to the controller.
     pos_correction:   crate::http::PosCorrection,
     /// Shared goto target — set by HTTP /move; cleared by the render thread on manual WASD
@@ -229,6 +232,7 @@ impl App {
         asset_pass:       String,
         controller_view:  crate::http::ControllerShared,
         nav_intent:       crate::http::NavIntent,
+        manual_move:      crate::http::ManualMoveReq,
         pos_correction:   crate::http::PosCorrection,
     ) -> Self {
         let ui_state = crate::ui::UiState::new(&character_name, eq_ui_dir);
@@ -264,7 +268,7 @@ impl App {
             frame_profile: crate::profiling::FrameProfile::default(),
             keys_held: std::collections::HashSet::new(),
             controller: crate::movement::CharacterController::new([0.0, 0.0, 0.0]),
-            controller_view, nav_intent, pos_correction,
+            controller_view, nav_intent, manual_move, pos_correction,
             goto_target,
             acts, spells, door_click,
             drag_active: false, last_cursor: winit::dpi::PhysicalPosition::new(0.0, 0.0),
@@ -1014,6 +1018,11 @@ impl App {
                 *self.nav_intent.lock().unwrap() = None;
             }
             let space = self.keys_held.contains(&KeyCode::Space);
+            // HTTP manual-move / jump escape hatch (#188): drive the controller like WASD when an
+            // agent is stuck (A* found no path). Active only while within its deadline; yields to
+            // real keyboard input, but takes priority over the nav planner's /goto intent.
+            let manual = { *self.manual_move.lock().unwrap() }
+                .filter(|m| std::time::Instant::now() < m.until);
             let intent = if wasd_active || space {
                 crate::movement::MoveIntent {
                     wish_dir:    [de, dn],
@@ -1023,6 +1032,21 @@ impl App {
                     speed:       MOVE_SPEED,
                     climb:       0.0,   // free WASD uses the native 2u step (no wall-climbing)
                     hop:         false, // and does not auto-hop barriers (Space is the manual jump)
+                }
+            } else if let Some(m) = manual {
+                // Like WASD, manual drive cancels any in-progress /goto so it doesn't fight us.
+                *self.goto_target.lock().unwrap() = None;
+                *self.nav_intent.lock().unwrap() = None;
+                let (wish, heading) = crate::movement::manual_wish(m.dir);
+                if let Some(h) = heading { self.heading_target = h; } // face where we walk
+                crate::movement::MoveIntent {
+                    wish_dir:    wish,
+                    wish_vspeed: 0.0,
+                    jump:        m.jump,
+                    want_swim:   swimming,
+                    speed:       MOVE_SPEED,
+                    climb:       0.0,
+                    hop:         false,
                 }
             } else {
                 // No manual input → follow the nav planner's /goto intent (if any).

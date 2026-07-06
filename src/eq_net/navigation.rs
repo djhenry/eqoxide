@@ -446,6 +446,28 @@ pub fn eq_heading(d_east: f32, d_north: f32) -> f32 {
     (-d_east).atan2(d_north).to_degrees().rem_euclid(360.0)
 }
 
+/// Plan a route to `goal`, trying progressively harder before giving up (#188 — "A* gives up too
+/// easily"):
+///   1. a full route at the native radius, then at shrinking radii — a smaller clearance threads
+///      narrower gaps between geometry that the full width is boxed out of;
+///   2. if no full route exists at any width, a PARTIAL route toward the goal, so a stranded
+///      character walks as close as it can (and the walker re-paths from there) instead of not
+///      moving at all. Truly boxed in (no progress possible) still returns `None`.
+fn plan_path(
+    col: &crate::assets::Collision,
+    start: [f32; 3],
+    goal: [f32; 3],
+    avoid: &[[f32; 2]],
+) -> Option<Vec<[f32; 3]>> {
+    use crate::movement::PLAYER_RADIUS;
+    for r in [PLAYER_RADIUS, PLAYER_RADIUS * 0.5, PLAYER_RADIUS * 0.25] {
+        if let Some(p) = col.find_path(start, goal, r, avoid, false) {
+            return Some(p);
+        }
+    }
+    col.find_path(start, goal, PLAYER_RADIUS, avoid, true)
+}
+
 pub struct Navigator {
     goto_target:      GotoTarget,
     /// Live nav state for GET /v1/observe/debug (#166): idle|navigating|arrived|no_path|blocked.
@@ -1692,7 +1714,7 @@ impl Navigator {
             // the destination (often a target mob), so its own camp must not be avoided.
             let avoid = Self::aggro_avoid(gs, goal);
             let route = self.collision.read().unwrap().as_ref().map(|c|
-                c.find_path([gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], crate::movement::PLAYER_RADIUS, &avoid));
+                plan_path(c, [gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], &avoid));
             match route {
                 // Collision loaded, but A* found NO navmesh route to the target. Report it and STOP,
                 // rather than silently straight-lining into geometry and looking "wedged" — a driver
@@ -1817,7 +1839,7 @@ impl Navigator {
                     let avoid = Self::aggro_avoid(gs, goal);
                     let fresh = if self.nav_repaths < 8 {
                         self.collision.read().unwrap().as_ref().and_then(|c|
-                            c.find_path([gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], crate::movement::PLAYER_RADIUS, &avoid))
+                            plan_path(c, [gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], &avoid))
                     } else { None };
                     match fresh {
                         Some(np) if np.len() > 1 => {

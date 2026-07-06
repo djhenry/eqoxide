@@ -197,6 +197,7 @@ OPTIONS:
     let group_kick:        http::GroupKickReq        = Arc::new(Mutex::new(None));
     let group_make_leader: http::GroupMakeLeaderReq  = Arc::new(Mutex::new(None));
     let zone_cross:       http::ZoneCrossReq    = Arc::new(Mutex::new(None));
+    let manual_move:      http::ManualMoveReq   = Arc::new(Mutex::new(None));
     let hail:             http::HailReq         = Arc::new(Mutex::new(None));
     let say:              http::SayReq          = Arc::new(Mutex::new(None));
     let target:           http::TargetReq       = Arc::new(Mutex::new(None));
@@ -370,6 +371,7 @@ OPTIONS:
         zone_points,
         shared_collision.clone(),
         zone_cross,
+        manual_move.clone(),
         hail,
         say,
         target,
@@ -440,6 +442,7 @@ OPTIONS:
         asset_pass,
         controller_view,
         nav_intent,
+        manual_move,
         pos_correction,
     );
     event_loop.run_app(&mut application).expect("event loop run");

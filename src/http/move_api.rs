@@ -10,6 +10,51 @@ pub(super) fn router() -> Router<HttpState> {
         .route("/follow", post(post_follow))
         .route("/stop", post(post_stop))
         .route("/zone_cross", post(post_zone_cross))
+        .route("/manual", post(post_manual))
+        .route("/jump", post(post_jump))
+}
+
+#[derive(serde::Deserialize, Default)]
+struct ManualBody {
+    /// World movement direction (server coords): `east` = +server_y, `north` = +server_x. Any
+    /// magnitude; it's normalized. Zero/omitted = stand in place (e.g. a jump with no movement).
+    east:  Option<f32>,
+    north: Option<f32>,
+    jump:  Option<bool>,
+    /// How long to drive the controller, in ms (default 400, clamped to 5000). The render loop
+    /// applies the intent every frame until this elapses, then movement stops.
+    duration_ms: Option<u64>,
+}
+
+/// POST /v1/move/manual — drive the CharacterController directly (like WASD), bypassing A*, to
+/// escape a spot where `goto` returns no_path (#188). Body: `{east, north, jump, duration_ms}`.
+/// Takes priority over any in-progress `/goto` (which it cancels) but yields to real keyboard input.
+async fn post_manual(
+    State(s): State<HttpState>,
+    body: Result<Json<ManualBody>, axum::extract::rejection::JsonRejection>,
+) -> (StatusCode, String) {
+    let b = body.map(|Json(b)| b).unwrap_or_default();
+    let dir = [b.east.unwrap_or(0.0), b.north.unwrap_or(0.0)];
+    let jump = b.jump.unwrap_or(false);
+    let ms = b.duration_ms.unwrap_or(400).min(5000);
+    if dir[0] == 0.0 && dir[1] == 0.0 && !jump {
+        return (StatusCode::BAD_REQUEST, "provide a direction {east,north} and/or {\"jump\":true}".into());
+    }
+    *s.manual_move.lock().unwrap() = Some(ManualMove {
+        dir, jump,
+        until: std::time::Instant::now() + std::time::Duration::from_millis(ms),
+    });
+    (StatusCode::OK, format!("manual move dir=({:.1},{:.1}) jump={jump} for {ms}ms", dir[0], dir[1]))
+}
+
+/// POST /v1/move/jump — a single hop in place (a discrete convenience over `/manual` with only
+/// `jump`). Clears any `/goto` and pops the character up, e.g. to clear a lip A* stranded it behind.
+async fn post_jump(State(s): State<HttpState>) -> (StatusCode, String) {
+    *s.manual_move.lock().unwrap() = Some(ManualMove {
+        dir: [0.0, 0.0], jump: true,
+        until: std::time::Instant::now() + std::time::Duration::from_millis(400),
+    });
+    (StatusCode::OK, "jump".into())
 }
 
 #[derive(serde::Deserialize, Default)]
