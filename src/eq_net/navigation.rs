@@ -495,7 +495,37 @@ fn plan_path(
         tracing::warn!("nav: path plan from ({:.0},{:.0}) to ({:.0},{:.0}) took {ms}ms on the net thread — slower than expected",
             start[0], start[1], goal[0], goal[1]);
     }
-    plan
+    if let Some(p) = plan {
+        return Some(p);
+    }
+    // Isolated start: A* couldn't leave the start cell (it's on a steep slope face / wall lip where
+    // the controller slid, and no neighbor cell resolves a walkable floor from there) — so every
+    // goto returns no_path and the character is stranded forever (#205). Re-anchor: a clean walkable
+    // floor is almost always a few units away laterally (usually just downhill). Retry from the
+    // nearest such floor and route from there; the walker then heads off the face to that floor
+    // first. Prepend the anchor so the character is steered to the clean ground before the route.
+    const RING: [(f32, f32); 12] = [
+        (-16.0, 0.0), (16.0, 0.0), (0.0, -16.0), (0.0, 16.0),
+        (-16.0, -16.0), (16.0, -16.0), (-16.0, 16.0), (16.0, 16.0),
+        (-32.0, 0.0), (32.0, 0.0), (0.0, -32.0), (0.0, 32.0),
+    ];
+    for (dx, dy) in RING {
+        let (ax, ay) = (start[0] + dx, start[1] + dy);
+        // A floor reachable from the char's height (generous down-search finds ground below a face).
+        let Some(af) = col.nearest_floor(ax, ay, start[2], 20.0, 100.0) else { continue };
+        let anchor = [ax, ay, af];
+        if let Some(mut p) = col.find_path(anchor, goal, PLAYER_RADIUS, avoid, true) {
+            // Only worthwhile if the re-anchored start could actually move (more than the lone
+            // start cell A* was stuck on) — otherwise it's the same dead spot.
+            if p.len() > 1 {
+                p.insert(0, anchor);
+                tracing::info!("nav: start isolated at ({:.0},{:.0},{:.0}) — re-anchored to clean floor ({:.0},{:.0},{:.0})",
+                    start[0], start[1], start[2], ax, ay, af);
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 pub struct Navigator {
