@@ -20,38 +20,44 @@ struct ManualBody {
     /// magnitude; it's normalized. Zero/omitted = stand in place (e.g. a jump with no movement).
     east:  Option<f32>,
     north: Option<f32>,
+    /// Vertical axis for SWIMMING, `-1..1` (`+1` = up toward the surface, `-1` = dive). Only has an
+    /// effect while the character is in water; ignored on land (#207).
+    up:    Option<f32>,
     jump:  Option<bool>,
     /// How long to drive the controller, in ms (default 400, clamped to 5000). The render loop
     /// applies the intent every frame until this elapses, then movement stops.
     duration_ms: Option<u64>,
 }
 
-/// POST /v1/move/manual — drive the CharacterController directly (like WASD), bypassing A*, to
-/// escape a spot where `goto` returns no_path (#188). Body: `{east, north, jump, duration_ms}`.
-/// Takes priority over any in-progress `/goto` (which it cancels) but yields to real keyboard input.
+/// POST /v1/move/manual — drive the CharacterController directly (like WASD), bypassing A*: escape a
+/// spot where `goto` returns no_path (#188), or swim up/down in water with `up` (#207). Body:
+/// `{east, north, up, jump, duration_ms}`. Takes priority over any in-progress `/goto` (which it
+/// cancels) but yields to real keyboard input.
 async fn post_manual(
     State(s): State<HttpState>,
     body: Result<Json<ManualBody>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, String) {
     let b = body.map(|Json(b)| b).unwrap_or_default();
     let dir = [b.east.unwrap_or(0.0), b.north.unwrap_or(0.0)];
+    let up = b.up.unwrap_or(0.0).clamp(-1.0, 1.0);
     let jump = b.jump.unwrap_or(false);
     let ms = b.duration_ms.unwrap_or(400).min(5000);
-    if dir[0] == 0.0 && dir[1] == 0.0 && !jump {
-        return (StatusCode::BAD_REQUEST, "provide a direction {east,north} and/or {\"jump\":true}".into());
+    if dir[0] == 0.0 && dir[1] == 0.0 && up == 0.0 && !jump {
+        return (StatusCode::BAD_REQUEST, "provide a direction {east,north}, {up:-1..1} (swim), and/or {\"jump\":true}".into());
     }
     *s.manual_move.lock().unwrap() = Some(ManualMove {
-        dir, jump,
+        dir, up, jump,
         until: std::time::Instant::now() + std::time::Duration::from_millis(ms),
     });
-    (StatusCode::OK, format!("manual move dir=({:.1},{:.1}) jump={jump} for {ms}ms", dir[0], dir[1]))
+    (StatusCode::OK, format!("manual move dir=({:.1},{:.1}) up={up:.1} jump={jump} for {ms}ms", dir[0], dir[1]))
 }
 
 /// POST /v1/move/jump — a single hop in place (a discrete convenience over `/manual` with only
-/// `jump`). Clears any `/goto` and pops the character up, e.g. to clear a lip A* stranded it behind.
+/// `jump`). Clears any `/goto` and pops the character up — on land it's a jump; in water it swims
+/// upward toward the surface (#207), e.g. to lift off a pool floor.
 async fn post_jump(State(s): State<HttpState>) -> (StatusCode, String) {
     *s.manual_move.lock().unwrap() = Some(ManualMove {
-        dir: [0.0, 0.0], jump: true,
+        dir: [0.0, 0.0], up: 0.0, jump: true,
         until: std::time::Instant::now() + std::time::Duration::from_millis(400),
     });
     (StatusCode::OK, "jump".into())
