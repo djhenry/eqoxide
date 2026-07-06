@@ -18,7 +18,7 @@
 pub mod anim;
 pub mod app;
 pub mod assets;
-pub mod water_map;
+pub mod region_map;
 pub mod asset_sync;
 pub mod billboard;
 pub mod camera;

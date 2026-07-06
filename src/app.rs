@@ -477,7 +477,7 @@ impl App {
             set_status("Building collision grid…");
             // Load the zone's water regions (maps/water/<zone>.wtr) so find_path can swim/descend
             // through water where there's no walkable connection. None if the zone has no .wtr.
-            let water = crate::water_map::WaterMap::load(&maps_dir.join("water"), &zone_name).map(Arc::new);
+            let water = crate::region_map::RegionMap::load(&maps_dir.join("water"), &zone_name).map(Arc::new);
             let collision = opt_assets.as_ref().map(|za| {
                 let mut c = assets::Collision::build(za, 32.0);
                 c.set_water(water);
