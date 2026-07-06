@@ -442,7 +442,7 @@ mod tests {
     fn buoyancy_floats_toward_surface_instead_of_sinking() {
         // Open deep water: everything below z=10 is water, and there is NO floor at all.
         let mut c = col(vec![]);
-        c.set_water(Some(std::sync::Arc::new(crate::water_map::WaterMap::flat_below(10.0))));
+        c.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::flat_below(10.0))));
         // Submerged at z=0, not on the ground, and NOT actively swimming (want_swim=false) — the
         // "walked into the river" case. Previously this free-fell forever (#172).
         let mut ctrl = CharacterController::new([0.0, 0.0, 0.0]);
