@@ -556,15 +556,14 @@ pub fn encode_player_pass(
                 // ── Held items: draw each equipped item at the rig's attachment bone
                 // (R_POINT = primary hand, L_POINT = left hand, SHIELD_POINT = off-hand
                 // shield), posed by the current animation so it swings with combat. EQ
-                // authors IT models in the point-bone frame with an identity attach, so
-                // the only extra transform is the same EQ→Y-up rotation the rig itself
-                // was baked with (the converter's `rq`); no per-weapon tuning.
+                // authors IT models in the point-bone frame with an identity attach; the
+                // only extra transform bridges the weapon bake's vertex convention into
+                // the rig frame (see models::held_item_xform); no per-weapon tuning.
                 let (clip_i, t) = r.anim_states.get(&0).map(|s| (s.clip_idx, s.time)).unwrap_or((0, 0.0));
                 let pmat = glam::Mat4::from_cols_array_2d(&crate::camera::entity_model_matrix_heading(
                     scene.player_pos, scene.player_heading, visual_scale, dominant_mesh_scale,
                     [0.0, 0.0], true, 0.0, crate::models::archetype_correction(archetype)));
-                let rq = glam::Mat4::from_quat(
-                    glam::Quat::from_axis_angle(glam::Vec3::X, -std::f32::consts::FRAC_PI_2));
+                let hx = crate::models::held_item_xform();
                 let held = [
                     (scene.primary_weapon_idfile.to_uppercase(), "R_POINT", 0usize),
                     (scene.secondary_weapon_idfile.to_uppercase(),
@@ -581,7 +580,7 @@ pub fn encode_player_pass(
                             .then(|| model.skin.attach_joint("L_POINT")).flatten())
                         else { continue };
                     let hand = glam::Mat4::from_cols_array_2d(&model.skin.joint_world(clip_i, t, joint));
-                    let wmat = (pmat * hand * rq).to_cols_array_2d();
+                    let wmat = (pmat * hand * hx).to_cols_array_2d();
                     r.queue.write_buffer(&r.weapon_uniform_pool[*wslot].0, 0,
                         bytemuck::bytes_of(&EntityUniform { model: wmat, tint: [1.0, 1.0, 1.0, 1.0] }));
                     weapon_draws.push((weapon, *wslot));
@@ -864,8 +863,7 @@ pub fn encode_skinned_entity_pass(
     // entities allocate from 2, nearest-first, and overflow just skips the item.
     let mut weapon_draws: Vec<(String, usize)> = Vec::new();
     let mut w_slot = 2usize;
-    let rq = glam::Mat4::from_quat(
-        glam::Quat::from_axis_angle(glam::Vec3::X, -std::f32::consts::FRAC_PI_2));
+    let hx = crate::models::held_item_xform();
     let pool_half    = r.entity_uniform_pool.len() / 2;
     let uniform_base = pool_half + PLAYER_UNIFORM_SLOTS; // upper half for skinned
     let mut u_slot   = uniform_base;
@@ -971,7 +969,7 @@ pub fn encode_skinned_entity_pass(
                 Some(s) => model.skin.joint_world(s.clip_idx, s.time, joint),
                 None    => model.skin.joint_world_rest(joint),
             });
-            let wmat = (emat * hand * rq).to_cols_array_2d();
+            let wmat = (emat * hand * hx).to_cols_array_2d();
             r.queue.write_buffer(&r.weapon_uniform_pool[w_slot].0, 0,
                 bytemuck::bytes_of(&EntityUniform { model: wmat, tint: [1.0, 1.0, 1.0, 1.0] }));
             weapon_draws.push((key, w_slot));

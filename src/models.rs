@@ -901,6 +901,24 @@ const SHIELD_IT_IDS: &[u32] = &[
     67919, 67939, 99251, 99252, 99253, 99276, 99277, 99278, 101025, 101037
 ];
 
+/// Bone-local transform for drawing a held IT model at a rig attach bone.
+///
+/// weapons.glb vertices are NOT raw EQ coordinates: `bake_weapons_glb` routes IT
+/// meshes through the zone pipeline, whose WLD reader swaps Y/Z — a det=-1
+/// mirror `S`: (x,y,z) -> (x,z,y). The rig's `joint_world()` lives in the
+/// converter's conjugated Y-up frame, a proper rotation `R` = -90° about X:
+/// (x,y,z) -> (x,z,-y). The real client attaches IT actors with an identity
+/// local transform in EQ space, so the draw needs `J·R·v_eq = J·(R·S)·v_glb`,
+/// and `R·S = diag(1,1,-1)`: a bone-local Z negation.
+///
+/// The old code applied `R` here, treating the verts as raw EQ — that stacked a
+/// rotation onto the already-mirrored bake and rendered every held item
+/// reflected in the bone's local Z (shields faced backward and cut through the
+/// arm, blades pointed the wrong way — eqoxide#178).
+pub fn held_item_xform() -> glam::Mat4 {
+    glam::Mat4::from_scale(glam::Vec3::new(1.0, 1.0, -1.0))
+}
+
 /// Whether an IT model id is a shield (drives the off-hand attach bone).
 pub fn is_shield_it(it_id: u32) -> bool {
     SHIELD_IT_IDS.binary_search(&it_id).is_ok()
@@ -940,6 +958,38 @@ mod tests {
                    [Some(("IT10649".into(), "R_POINT")), Some(("IT7".into(), "L_POINT"))]);
         assert_eq!(held_item_keys(&eq, true), [None, None]);
         assert_eq!(held_item_keys(&[0; 9], false), [None, None]);
+    }
+
+    #[test]
+    fn held_item_xform_bridges_baked_verts_to_an_identity_eq_attach() {
+        // Contract: drawing a weapons.glb mesh with `J * held_item_xform()` must
+        // equal attaching the raw EQ-space model at the bone with an identity
+        // local transform, i.e. J * R * v_eq, where R is the converter's rig
+        // bake rotation (-90° about X) and the baked vert is S·v_eq with S the
+        // zone pipeline's Y/Z swap. Regression guard for eqoxide#178 (held items
+        // rendered mirrored: shields faced backward, blades pointed wrong).
+        let r = glam::Mat4::from_quat(
+            glam::Quat::from_axis_angle(glam::Vec3::X, -std::f32::consts::FRAC_PI_2));
+        let s = glam::Mat4::from_cols_array_2d(&[
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0], // Y column maps to Z
+            [0.0, 1.0, 0.0, 0.0], // Z column maps to Y
+            [0.0, 0.0, 0.0, 1.0],
+        ]);
+        // An arbitrary rigid bone pose, so the identity holds under any J.
+        let j = glam::Mat4::from_rotation_translation(
+            glam::Quat::from_euler(glam::EulerRot::XYZ, 0.3, -1.1, 2.0),
+            glam::Vec3::new(-0.7, 1.4, 2.4));
+        for v_eq in [glam::Vec3::X, glam::Vec3::Y, glam::Vec3::Z,
+                     glam::Vec3::new(2.5, -0.3, 0.05)] {
+            let want = j * r * v_eq.extend(1.0);           // identity attach in EQ space
+            let baked = s * v_eq.extend(1.0);              // what weapons.glb stores
+            let got = j * held_item_xform() * baked;       // what the draw computes
+            assert!((want - got).length() < 1e-5, "v_eq={v_eq:?}: {want:?} != {got:?}");
+        }
+        // And the full mapping from authored EQ space is orientation-preserving
+        // (det > 0) — the old `J * R * S` stack was a mirror.
+        assert!((held_item_xform() * s).determinant() > 0.0);
     }
 
     #[test]
