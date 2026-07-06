@@ -492,6 +492,9 @@ const NAV_STUCK_TICKS: u32 = 20;
 /// walker commands the controller to hop — net progress has stalled, which is the real "wedged
 /// against a fence/cart" signal (sliding along it still looks like motion frame-to-frame). (#41)
 const NAV_HOP_TICKS: u32 = 6;
+/// On a hard stall (NAV_STUCK_TICKS), drive the reverse (downhill) direction for this many ticks
+/// before re-pathing — long enough to clear a wedged slope-face start (~150 ms/tick). (eqoxide#212)
+const NAV_BACKOFF_TICKS: u32 = 3;
 
 /// EQ heading in degrees (0..360) for a movement delta in server axes.
 /// EQ convention: heading 0 faces +Y (north) and increases counter-clockwise
@@ -661,6 +664,11 @@ pub struct Navigator {
     /// Consecutive stall-recovery re-paths for the current goal; capped so a truly unreachable
     /// snag stops instead of re-pathing forever.
     nav_repaths:      u32,
+    /// Downhill back-off (eqoxide#212): when the walker wedges on a slope face, drive the reverse
+    /// direction for this many ticks before re-pathing, so the re-plan starts from cleaner ground.
+    /// 0 = not backing off.
+    backoff_ticks:    u32,
+    backoff_dir:      [f32; 2],
     /// Single-authority controller integration (design §2). `controller_view` is the render
     /// thread's authoritative position snapshot we stream to the server; `nav_intent` is the
     /// `/goto` planner's per-frame wish written for the render controller; `pos_correction` hands a
@@ -795,6 +803,8 @@ impl Navigator {
             stuck_ticks: 0,
             stuck_i: 0,
             nav_repaths: 0,
+            backoff_ticks: 0,
+            backoff_dir: [0.0, 0.0],
             controller_view,
             nav_intent,
             pos_correction,
@@ -1823,6 +1833,7 @@ impl Navigator {
             self.stuck_best = f32::MAX;
             self.stuck_ticks = 0;
             self.nav_repaths = 0;
+            self.backoff_ticks = 0;
             // Route with the native collision radius (1.0, was 2.0): the 2× radius boxed the player
             // out of gaps the native client threads, causing "boxed in by walls" / platform stalls
             // (issues #22/#13/#2). Collide-and-slide in the controller keeps it off walls.
@@ -1946,6 +1957,41 @@ impl Navigator {
             return;
         }
 
+        // Active downhill back-off (eqoxide#212): after a hard stall we drive the REVERSE aim for a
+        // few ticks to slide off a wedged slope face onto cleaner ground, THEN re-path from there.
+        // This complements #205's start re-anchoring: back off first, then the (now grade-limited)
+        // plan routes around the face instead of straight back up it.
+        if self.backoff_ticks > 0 {
+            self.backoff_ticks -= 1;
+            *self.nav_intent.lock().unwrap() = Some(MoveIntent {
+                wish_dir:    self.backoff_dir,
+                wish_vspeed: 0.0,
+                jump:        false,
+                want_swim:   false,
+                speed:       RUN_SPEED,
+                climb:       crate::movement::NAV_CLIMB,
+                hop:         false,
+            });
+            if self.backoff_ticks == 0 {
+                // Backed off — re-plan from the cleaner spot. If it still can't route, the next
+                // stall (nav_repaths already counted) stops us.
+                let avoid = Self::aggro_avoid(gs, goal);
+                let fresh = self.collision.read().unwrap().as_ref().and_then(|c|
+                    plan_path(c, [gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], &avoid));
+                if let Some(np) = fresh {
+                    if np.len() > 1 {
+                        tracing::info!("NAV: backed off downhill — re-pathing ({} wp, attempt {})",
+                            np.len(), self.nav_repaths);
+                        self.path = np;
+                        self.path_i = 0;
+                        self.stuck_i = 0;
+                        self.stuck_ticks = 0;
+                    }
+                }
+            }
+            return;
+        }
+
         // Progress-based stall detection. Pure-pursuit advances `path_i` steadily as the avatar moves
         // along the route; if it has NOT advanced for NAV_STUCK_TICKS we're genuinely wedged (or the
         // route crosses a spot the capsule controller can't track). Recover by re-pathing from the
@@ -1959,31 +2005,24 @@ impl Navigator {
                 self.stuck_ticks += 1;
                 if self.stuck_ticks >= NAV_STUCK_TICKS {
                     self.stuck_ticks = 0;
-                    let avoid = Self::aggro_avoid(gs, goal);
-                    let fresh = if self.nav_repaths < 8 {
-                        self.collision.read().unwrap().as_ref().and_then(|c|
-                            plan_path(c, [gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], &avoid))
-                    } else { None };
-                    match fresh {
-                        Some(np) if np.len() > 1 => {
-                            self.nav_repaths += 1;
-                            tracing::info!("NAV: no progress near ({:.1},{:.1}) — re-pathing ({} wp, attempt {})",
-                                gs.player_x, gs.player_y, np.len(), self.nav_repaths);
-                            self.path = np;
-                            self.path_i = 0;
-                            self.stuck_i = 0;
-                            return;
-                        }
-                        _ => {
-                            tracing::info!("NAV: stalled (no progress) near ({:.1},{:.1}) — stopping",
-                                gs.player_x, gs.player_y);
-                            gs.log_msg("zone", "Path stalled — stopped");
-                            self.set_nav_state("blocked");
-                            *self.goto_target.lock().unwrap() = None;
-                            *self.nav_intent.lock().unwrap() = None;
-                            return;
-                        }
+                    if self.nav_repaths < 8 {
+                        // Count this recovery, then back off DOWNHILL (reverse the aim) before
+                        // re-pathing (the re-plan happens when the back-off completes). This clears
+                        // a wedged slope face instead of re-planning from the same stuck spot. (#212)
+                        self.nav_repaths += 1;
+                        self.backoff_ticks = NAV_BACKOFF_TICKS;
+                        self.backoff_dir = if dist > 1e-3 { [-dx / dist, -dy / dist] } else { [0.0, 0.0] };
+                        tracing::info!("NAV: no progress near ({:.1},{:.1}) — backing off downhill (attempt {})",
+                            gs.player_x, gs.player_y, self.nav_repaths);
+                        return;
                     }
+                    tracing::info!("NAV: stalled (no progress) near ({:.1},{:.1}) — stopping",
+                        gs.player_x, gs.player_y);
+                    gs.log_msg("zone", "Path stalled — stopped");
+                    self.set_nav_state("blocked");
+                    *self.goto_target.lock().unwrap() = None;
+                    *self.nav_intent.lock().unwrap() = None;
+                    return;
                 }
             }
         }
