@@ -839,6 +839,7 @@ impl App {
             let lp = [self.game_state.player_x, self.game_state.player_y, self.game_state.player_z];
             let dx = lp[0] - self.prev_logical_pos[0];
             let dy = lp[1] - self.prev_logical_pos[1];
+            let dz = lp[2] - self.prev_logical_pos[2];
             let nav_dist = (dx * dx + dy * dy).sqrt();
             if nav_dist > 0.01 {
                 // Estimate nav-driven speed from the distance moved over the elapsed interval.
@@ -846,6 +847,11 @@ impl App {
                 let dt_upd = (now - self.last_player_nav_update).as_secs_f32().clamp(0.05, 0.5);
                 self.player_nav_speed = nav_dist / dt_upd;
                 self.last_player_nav_update = now;
+            }
+            // `last_moved_at` latches "moving" for the animation. Count VERTICAL swim too (in water)
+            // so swimming straight up/down with no horizontal travel still plays the swim clip —
+            // otherwise a diving/surfacing character reads as idle (#207 companion to the #198 anim).
+            if nav_dist > 0.01 || (self.controller.in_water && dz.abs() > 0.01) {
                 self.last_moved_at = std::time::Instant::now();
             }
             self.prev_logical_pos = lp;
@@ -860,10 +866,14 @@ impl App {
                 "dead".to_string()
             } else if let Some((code, _)) = self.game_state.combat_anims.get(&pid).filter(|_| swinging) {
                 format!("C{:02}", code)
+            } else if self.controller.in_water {
+                // In water we always swim, never stand: the forward stroke (P06 "swim") while moving,
+                // and treading water in place (L09 "swim_idle") when holding position — so a still
+                // character doesn't appear to stand on the surface (#198/#207). in_water is the
+                // controller's per-step check.
+                if self.last_moved_at.elapsed().as_millis() < 250 { "swimming".to_string() } else { "treading".to_string() }
             } else if self.last_moved_at.elapsed().as_millis() < 250 {
-                // Swimming while moving in water; walking/running otherwise (#198). The controller is
-                // the source of truth for in_water (it queries the zone's water map each step).
-                if self.controller.in_water { "swimming".to_string() } else { "walking".to_string() }
+                "walking".to_string()
             } else if self.game_state.sitting {
                 "sitting".to_string()
             } else {
@@ -1849,14 +1859,18 @@ fn smooth_entity_motion(
             // only replaces "idle" (the default for all non-dead, non-swinging entities
             // from scene.rs, since the server animation field is always "Standing" while
             // an NPC moves between update packets).
-            if b.action == "idle" && m.speed > 0.5 && d > 1e-4 {
-                // Swim animation for an NPC/PC moving through water (#198), same water check the
-                // player uses; walking otherwise.
-                b.action = if collision.is_some_and(|c| c.in_water(b.pos)) {
-                    "swimming".to_string()
-                } else {
-                    "walking".to_string()
-                };
+            if b.action == "idle" {
+                // Swim animation for an NPC/PC in water (#198/#207), same water check the player
+                // uses: the active stroke while moving, treading water when holding still, so a
+                // character in water never appears to stand on the surface. Walking on dry land;
+                // still on dry land stays idle.
+                let in_water = collision.is_some_and(|c| c.in_water(b.pos));
+                let moving = m.speed > 0.5 && d > 1e-4;
+                if in_water {
+                    b.action = if moving { "swimming" } else { "treading" }.to_string();
+                } else if moving {
+                    b.action = "walking".to_string();
+                }
             }
 
             // Face the direction of travel while moving, exactly like the player does. The

@@ -256,13 +256,19 @@ impl SkinData {
                     && !n.contains("back") && !n.contains("left") && !n.contains("right")
                     && !n.contains("shoot")
             }),
-            // Swim clip (name contains "swim"), used while moving in water (#198). Prefer the
-            // forward swim, not the directional/backstroke variants.
+            // Active swim stroke while moving in water (L06/L09 "swim", #198). Prefer the forward
+            // stroke, not the directional/backstroke variants or the tread-water idle.
             "swimming" => self.clips.iter().position(|c| {
                 let n = c.name.to_lowercase();
-                n.contains("swim")
+                n.contains("swim") && !n.contains("idle")
                     && !n.contains("back") && !n.contains("left") && !n.contains("right")
             }),
+            // Treading water while holding position in water (L08/P07 "swim_idle", #207) — so a still
+            // character swims in place instead of standing on the surface. Fall back to the active
+            // swim clip if the model has no dedicated tread-water idle.
+            "treading" => self.clips.iter()
+                .position(|c| { let n = c.name.to_lowercase(); n.contains("swim") && n.contains("idle") })
+                .or_else(|| self.clips.iter().position(|c| c.name.to_lowercase().contains("swim"))),
             "sitting" => self.clips.iter().position(|c| {
                 let n = c.name.to_lowercase();
                 n.contains("sit") && !n.contains("swim")
@@ -456,6 +462,7 @@ mod tests {
                 AnimClip { name: "Spider_Walking_Backward".to_string(), duration: 1.0, channels: vec![make_channel(0)] },
                 AnimClip { name: "Spider_Walking_Fast".to_string(),     duration: 0.7, channels: vec![make_channel(0)] },
                 AnimClip { name: "Spider_Swimming".to_string(),         duration: 1.0, channels: vec![make_channel(0)] },
+                AnimClip { name: "Spider_Swim_Idle".to_string(),        duration: 1.0, channels: vec![make_channel(0)] },
             ],
             rest_translations, rest_rotations, rest_scales,
             ground_probes: vec![], joint_names: vec![],
@@ -540,7 +547,8 @@ mod tests {
         assert_eq!(skin.clip_for_action("walking"),      Some(1), "walking → Spider_Walking");
         assert_eq!(skin.clip_for_action(""),             Some(1), "'' → Spider_Walking (default)");
         assert_eq!(skin.clip_for_action("running"),      Some(2), "running → Spider_Running");
-        assert_eq!(skin.clip_for_action("swimming"),     Some(5), "swimming → Spider_Swimming (#198)");
+        assert_eq!(skin.clip_for_action("swimming"),     Some(5), "swimming → Spider_Swimming, the active stroke (not the idle) (#198)");
+        assert_eq!(skin.clip_for_action("treading"),     Some(6), "treading → Spider_Swim_Idle, tread-water in place (#207)");
         // action_skin has no death clip → still returns None (bind-pose fallback).
         assert_eq!(skin.clip_for_action("dead"),         None,    "no death clip → None");
         assert_eq!(skin.clip_for_action("attack"),       Some(1), "unknown → Spider_Walking");
