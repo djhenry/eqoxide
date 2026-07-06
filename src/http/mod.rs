@@ -288,7 +288,13 @@ pub struct ChatSend {
 pub type ChatSendShared = Arc<Mutex<Vec<ChatSend>>>;
 
 #[derive(Clone, Copy)]
-pub struct CastRequest { pub gem: u8, pub target_id: Option<u32> }
+pub struct CastRequest {
+    pub gem: u8,
+    pub target_id: Option<u32>,
+    /// When Some, this is an item "clicky" cast: the wire inventory slot of the item to activate.
+    /// The gem field is then ignored and the click spell is resolved from the item. (eqoxide#193)
+    pub item_slot: Option<u32>,
+}
 /// Cast a memorized gem (0-8) on an explicit target, else current target, else self.
 pub type CastReq = Arc<Mutex<Option<CastRequest>>>;
 /// Scribe/memorize request — (slot, spell_id, scribing): scribing 0 = scribe a scroll into the

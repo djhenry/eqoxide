@@ -45,6 +45,9 @@ pub struct RoF2Item {
     pub icon:           u32,
     pub name:           String,
     pub idfile:         String,
+    /// Item's click ("clicky") spell id from ClickEffectStruct.effect — 0 if the item has no
+    /// clickable effect. Used to activate teleport rings/port potions via an item cast. (eqoxide#193)
+    pub click_spell_id: u32,
 }
 
 // ── Fixed struct sizes from rof2_structs.h (pragma pack(1)) ──────────────────
@@ -167,6 +170,12 @@ pub fn parse_rof2_item(buf: &[u8]) -> Option<(RoF2Item, usize)> {
 
     // ── K. 6 effect blocks: fixed struct + effect-name C-str + int32(0) ───────
     // 1. ClickEffectStruct (30) + ClickName C-str + i32
+    // ClickEffectStruct.effect (int32 @0) is the item's click ("clicky") spell id — >0 for a
+    // clickable effect (teleport potions/rings, etc.), 0/-1 for none. Read it before advancing so
+    // an item-activate cast can send it as the CastSpell_Struct spell_id. (eqoxide#193)
+    if off + 4 > len { return None; }
+    let click_effect = i32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+    let click_spell_id = if click_effect > 0 { click_effect as u32 } else { 0 };
     off = skip(off, CLICK_LEN, len)?; off = skip_cstr(buf, off)?; off = skip(off, 4, len)?;
     // 2. ProcEffectStruct (30) + ProcName C-str + i32
     off = skip(off, PROC_LEN,  len)?; off = skip_cstr(buf, off)?; off = skip(off, 4, len)?;
@@ -195,7 +204,7 @@ pub fn parse_rof2_item(buf: &[u8]) -> Option<(RoF2Item, usize)> {
     }
 
     Some((RoF2Item { slot_type, main_slot, sub_slot, price, merchant_count, stacksize, charges,
-                     id, icon, name, idfile }, off))
+                     id, icon, name, idfile, click_spell_id }, off))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -287,6 +296,28 @@ pub(crate) mod tests {
         assert_eq!(it.icon, 678);
         assert_eq!(it.name, "Cloth Cap");
         assert_eq!(it.idfile, "IT63");
+        assert_eq!(it.click_spell_id, 0, "base fixture has no click effect");
+    }
+
+    /// eqoxide#193: an item with a positive ClickEffectStruct.effect exposes it as click_spell_id.
+    #[test]
+    fn parses_click_spell_id_from_click_effect() {
+        // The click block (K, first effect) begins right after J (TertiaryBodyStruct). Locate its
+        // start from the same layout the fixture writes, then patch effect (int32 @0). Using the
+        // module constants keeps this correct if any block size changes.
+        let body_start = HDR_LEN + 2 + FINISH_LEN + 10 + 1 + 5 + 1; // matches fixture2() comment
+        let click_start = body_start + BODY_LEN + 1 + SECONDARY_LEN + 1 + TERTIARY_LEN;
+
+        let mut b = fixture();
+        b[click_start..click_start + 4].copy_from_slice(&2512i32.to_le_bytes()); // effect = spell 2512
+        let (it, _) = parse_rof2_item(&b).expect("parse");
+        assert_eq!(it.click_spell_id, 2512);
+
+        // A non-positive effect (0 / -1) means "no clicky" → 0.
+        let mut b0 = fixture();
+        b0[click_start..click_start + 4].copy_from_slice(&(-1i32).to_le_bytes());
+        let (it0, _) = parse_rof2_item(&b0).expect("parse");
+        assert_eq!(it0.click_spell_id, 0);
     }
 
     #[test]
