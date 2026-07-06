@@ -221,13 +221,18 @@ pub fn fall_damage(height: f32) -> (u32, u32) {
     (if max == 0 { 0 } else { roll % (max + 1) }, max)
 }
 
-/// Titanium `EnvDamage2_Struct` (31 bytes): id@0, damage(u32)@6, dmgtype(u8)@22, constant(u16)@27.
+/// RoF2 `EnvDamage2_Struct` (39 bytes): id@0, damage(u32)@6, dmgtype(u8)@26, constant(u16)@33.
+/// The RoF2 server's DECODE reads only id/damage/dmgtype (it forces `constant = 0xFFFF` itself); the
+/// rest of the struct is unknown padding. The old Titanium 31-byte layout (dmgtype@22) failed the
+/// server's `DECODE_LENGTH_EXACT` and was silently dropped, so a fall's local HP decrement never
+/// reached the server and HP desynced (#195). dmgtype: 0xFA=Lava, 0xFB=Drowning, 0xFC=Falling,
+/// 0xFD=Trap.
 pub fn build_env_damage_packet(player_id: u32, damage: u32, dmgtype: u8) -> Vec<u8> {
-    let mut buf = vec![0u8; 31];
+    let mut buf = vec![0u8; 39];
     buf[0..4].copy_from_slice(&player_id.to_le_bytes());
     buf[6..10].copy_from_slice(&damage.to_le_bytes());
-    buf[22] = dmgtype;
-    buf[27..29].copy_from_slice(&0xFFFFu16.to_le_bytes());
+    buf[26] = dmgtype;
+    buf[33..35].copy_from_slice(&0xFFFFu16.to_le_bytes());
     buf
 }
 
@@ -2106,6 +2111,18 @@ pub fn make_position_packet(spawn_id: u32, x: f32, y: f32, z: f32, heading: f32)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_damage_packet_is_rof2_39_byte_layout() {
+        // RoF2 EnvDamage2_Struct: 39 bytes with dmgtype@26, constant@33 — the server's
+        // DECODE_LENGTH_EXACT drops any other size (Titanium's 31 → silent HP desync, #195).
+        let buf = build_env_damage_packet(0x1234_5678, 250, 0xFC /* falling */);
+        assert_eq!(buf.len(), 39, "must be the RoF2 39-byte size");
+        assert_eq!(u32::from_le_bytes(buf[0..4].try_into().unwrap()), 0x1234_5678, "id@0");
+        assert_eq!(u32::from_le_bytes(buf[6..10].try_into().unwrap()), 250, "damage@6");
+        assert_eq!(buf[26], 0xFC, "dmgtype@26 (falling)");
+        assert_eq!(u16::from_le_bytes(buf[33..35].try_into().unwrap()), 0xFFFF, "constant@33");
+    }
 
     /// Build a minimal Navigator for unit tests that only exercise a single `sync_*`/tick method —
     /// every other shared slot gets an empty/default placeholder.
