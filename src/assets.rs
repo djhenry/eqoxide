@@ -454,7 +454,7 @@ pub struct Collision {
     rows:      usize,
     /// Optional water-region map (from the zone's `.wtr`). When present, find_path may DESCEND
     /// through water (swim down a canal/shaft) to a lower floor that has no walkable connection.
-    water:     Option<std::sync::Arc<crate::water_map::WaterMap>>,
+    water:     Option<std::sync::Arc<crate::region_map::RegionMap>>,
     /// True when the terrain triangles came from a dedicated `__collision__` mesh (SOLID +
     /// INVIS faces, PASSABLE excluded). False for legacy zones with no baked collision mesh,
     /// where the rendered terrain is used as a fallback. Diagnostic/provenance only.
@@ -543,7 +543,7 @@ impl Collision {
     }
 
     /// Attach a zone water map so find_path can route swim descents. Call after `build`.
-    pub fn set_water(&mut self, water: Option<std::sync::Arc<crate::water_map::WaterMap>>) {
+    pub fn set_water(&mut self, water: Option<std::sync::Arc<crate::region_map::RegionMap>>) {
         self.water = water;
     }
 
@@ -557,6 +557,68 @@ impl Collision {
     /// Used by the controller's buoyancy to float toward the surface (#172).
     pub fn water_surface(&self, pos: [f32; 3]) -> Option<f32> {
         self.water.as_ref().and_then(|w| w.surface_z(pos[0], pos[1], pos[2]))
+    }
+
+    /// If `pos` = [east, north, z] (server coords) lies in a zone-line (`DRNTP`) region, the
+    /// zone-point index it carries — the `OP_SendZonepoints` `iterator` for that line, used to
+    /// resolve the destination zone. `None` when not on a zone line, no region map, or a v1 map.
+    /// This is how the native client triggers a crossing: it detects the region from zone geometry
+    /// rather than a coordinate list.
+    pub fn zone_line_at(&self, pos: [f32; 3]) -> Option<i32> {
+        self.water.as_ref().and_then(|w| w.zone_line_at(pos[0], pos[1], pos[2]))
+    }
+
+    /// Find a point inside a zone-line region nearest to `near` (= [east, north, z]), returning
+    /// `(region_index, point)`. When `index` is `Some`, only that zone-point index matches; `None`
+    /// matches any zone line. Used by the explicit `/zone_cross` API to walk the character onto the
+    /// zone line, where the auto-cross then fires. `None` if the zone has no region map or no
+    /// matching region is found within the search radius.
+    ///
+    /// A zone-line region can be smaller than the pathfinding grid cell (32u) and only a few units
+    /// thick vertically, so we sample on an expanding ring around `near` at a fine XY step and z-scan
+    /// each point. Expanding outward and returning the first hit yields the closest region while
+    /// keeping the cost proportional to how far away it is (not the whole zone).
+    pub fn find_zone_line_near(&self, index: Option<i32>, near: [f32; 3]) -> Option<(i32, [f32; 3])> {
+        self.water.as_ref()?;
+        if self.cols == 0 || self.tris.is_empty() { return None; }
+        // Zone height range (once), so the z scan is independent of the player's elevation.
+        let (mut zmin, mut zmax) = (f32::MAX, f32::MIN);
+        for t in &self.tris { for v in t { zmin = zmin.min(v[2]); zmax = zmax.max(v[2]); } }
+        if zmin > zmax { return None; }
+        let min_e = self.origin[0];
+        let max_e = self.origin[0] + self.cols as f32 * self.cell_size;
+        let min_n = self.origin[1];
+        let max_n = self.origin[1] + self.rows as f32 * self.cell_size;
+        const XY_STEP: f32 = 6.0;  // finer than a zone line's XY footprint
+        const Z_STEP:  f32 = 2.0;  // finer than a zone line's vertical thickness
+        const MAX_R:   f32 = 3000.0; // don't chase a zone line across the whole world
+        let test = |east: f32, north: f32| -> Option<(i32, [f32; 3])> {
+            if east < min_e || east > max_e || north < min_n || north > max_n { return None; }
+            let mut z = zmin;
+            while z <= zmax {
+                if let Some(found) = self.zone_line_at([east, north, z]) {
+                    if index.is_none_or(|want| want == found) {
+                        return Some((found, [east, north, z]));
+                    }
+                }
+                z += Z_STEP;
+            }
+            None
+        };
+        if let Some(hit) = test(near[0], near[1]) { return Some(hit); }
+        let mut r = XY_STEP;
+        while r <= MAX_R {
+            // Angular step chosen so neighbouring ring samples are ~XY_STEP apart.
+            let steps = ((std::f32::consts::TAU * r / XY_STEP).ceil() as usize).max(1);
+            for i in 0..steps {
+                let a = std::f32::consts::TAU * i as f32 / steps as f32;
+                if let Some(hit) = test(near[0] + r * a.cos(), near[1] + r * a.sin()) {
+                    return Some(hit);
+                }
+            }
+            r += XY_STEP;
+        }
+        None
     }
 
     #[inline]
@@ -1273,7 +1335,7 @@ mod tests {
 
         // Flooded to z=9: swim up and haul out onto the bank.
         let mut wet = Collision::build(&assets, 4.0);
-        wet.set_water(Some(std::sync::Arc::new(crate::water_map::WaterMap::flat_below(9.0))));
+        wet.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::flat_below(9.0))));
         let path = wet.find_path(start, goal, 1.0, &[]);
         assert!(path.is_some(), "flooded pit must be exitable by swimming up to the bank");
         let last = *path.unwrap().last().unwrap();
@@ -1540,7 +1602,7 @@ mod tests {
         // Attach the zone's water map like production does (app.rs) — the earlier run of
         // this diagnostic skipped it and mis-reported the moat as having no water volume.
         let wtr_dir = std::path::Path::new(&p).parent().unwrap().join("maps/water");
-        col.set_water(crate::water_map::WaterMap::load(&wtr_dir, "qeynos2").map(std::sync::Arc::new));
+        col.set_water(crate::region_map::RegionMap::load(&wtr_dir, "qeynos2").map(std::sync::Arc::new));
         eprintln!("collision: from_collision_mesh={} grid {}x{} cell={} origin={:?}",
             col.from_collision_mesh, col.cols, col.rows, col.cell_size, col.origin);
 

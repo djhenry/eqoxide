@@ -446,13 +446,6 @@ pub fn eq_heading(d_east: f32, d_north: f32) -> f32 {
     (-d_east).atan2(d_north).to_degrees().rem_euclid(360.0)
 }
 
-/// Squared 2D distance from a zone point to the player's current position.
-fn dist2(zp: &crate::game_state::ZonePoint, gs: &GameState) -> f32 {
-    let dx = zp.server_x - gs.player_x;
-    let dy = zp.server_y - gs.player_y;
-    dx * dx + dy * dy
-}
-
 pub struct Navigator {
     goto_target:      GotoTarget,
     /// Live nav state for GET /v1/observe/debug (#166): idle|navigating|arrived|no_path|blocked.
@@ -1031,72 +1024,88 @@ impl Navigator {
             }
         }
 
-        // Check zone-cross request — teleport onto a zone line, then send OP_ZONE_CHANGE.
+        // Check zone-cross request — walk onto the target zone line so the auto-cross below fires.
+        //
+        // A zone line's real trigger is a `DRNTP` region baked into the zone geometry (native
+        // mechanism), NOT the coords in OP_SendZonepoints — those are the DESTINATION of each line,
+        // so walking to them lands the player nowhere near the trigger and the server safe-coords /
+        // cheat-flags the crossing (the root cause of #174). Resolve the target zone to its
+        // zone-point index (iterator), locate that DRNTP region in the zone BSP, and walk there.
         let cross_req = self.zone_cross.lock().unwrap().take();
         if let Some(want_zone) = cross_req {
-            // Choose a zone line: the requested destination if given (want_zone != 0),
-            // otherwise the one nearest the player. Zone points are in server coords
-            // (server_x = east, server_y = north) — same frame as the player.
-            let exit = {
-                let zps = self.zone_points.lock().unwrap();
-                let candidates = zps.iter().filter(|zp| zp.zone_id != 0);
-                if want_zone != 0 {
-                    candidates
-                        .filter(|zp| zp.zone_id == want_zone)
-                        .min_by(|a, b| dist2(a, gs).total_cmp(&dist2(b, gs)))
-                        .map(|zp| (zp.zone_id, zp.server_x, zp.server_y, zp.server_z))
-                } else {
-                    candidates
-                        .min_by(|a, b| dist2(a, gs).total_cmp(&dist2(b, gs)))
-                        .map(|zp| (zp.zone_id, zp.server_x, zp.server_y, zp.server_z))
-                }
-            };
-            if let Some((dest_zone, tx, ty, tz)) = exit {
-                // Only request the zone change when the player is actually AT the zone line. The
-                // server validates the crossing against our tracked position — asking to zone from
-                // far away (e.g. a self-heal calling zone_cross mid-hunt) reads as a /MQZone hack and
-                // the CLE subsystem KICKS the client (the recurring "linkdead"), cascading to the
-                // whole group (#136). If we're not near the line yet, WALK to it instead; the
-                // auto-zone-cross below then fires the crossing safely once we arrive.
-                const ZONE_LINE_DIST2: f32 = 15.0 * 15.0; // matches the auto-cross trigger radius
-                let dx = tx - gs.player_x;
-                let dy = ty - gs.player_y;
-                if dx * dx + dy * dy <= ZONE_LINE_DIST2 {
-                    tracing::info!("zone_cross: at the line — requesting zone change to zone_id={dest_zone} from ({:.1},{:.1})",
-                              gs.player_x, gs.player_y);
-                    self.send_zone_change_packet(stream, gs, dest_zone);
-                } else {
-                    tracing::info!("zone_cross: {:.0}u from the zone_id={dest_zone} line — walking to it (auto-cross will complete)",
-                              (dx * dx + dy * dy).sqrt());
-                    gs.log_msg("zone", &format!("Walking to the zone {} line", dest_zone));
-                    *self.goto_target.lock().unwrap() = Some((tx, ty, tz));
-                    *self.goto_entity.lock().unwrap() = None;
+            // want_zone != 0 → resolve it to a zone-point index; want_zone == 0 → any nearest line.
+            let want_index = if want_zone != 0 {
+                match self.zone_points.lock().unwrap().iter()
+                    .find(|zp| zp.zone_id == want_zone).map(|zp| zp.iterator as i32)
+                {
+                    Some(idx) => Some(idx),
+                    None => {
+                        tracing::info!("zone_cross: no zone point advertised for zone_id={want_zone}");
+                        gs.log_msg("zone", "No zone line found to cross");
+                        None
+                    }
                 }
             } else {
-                tracing::info!("zone_cross: no zone line found for zone_id={want_zone}");
-                gs.log_msg("zone", "No zone line found to cross");
+                None // any zone line
+            };
+            // Only proceed if we actually have a target (want_zone==0 always may; want_zone!=0 needs a match).
+            if want_zone == 0 || want_index.is_some() {
+                let located = self.collision.read().unwrap().as_ref()
+                    .and_then(|c| c.find_zone_line_near(want_index, [gs.player_x, gs.player_y, gs.player_z]));
+                match located {
+                    Some((index, [tx, ty, tz])) => {
+                        // Destination zone for logging (resolve the located region's index).
+                        let dest_zone = self.zone_points.lock().unwrap().iter()
+                            .find(|zp| zp.iterator as i32 == index).map(|zp| zp.zone_id).unwrap_or(want_zone);
+                        let d2 = (tx - gs.player_x).powi(2) + (ty - gs.player_y).powi(2);
+                        const ZONE_LINE_DIST2: f32 = 15.0 * 15.0;
+                        if d2 <= ZONE_LINE_DIST2 {
+                            // Already standing on the line — the auto-cross below fires this tick.
+                            tracing::info!("zone_cross: already on the zone_id={dest_zone} line (index={index})");
+                        } else {
+                            tracing::info!("zone_cross: walking {:.0}u to the zone_id={dest_zone} line at ({tx:.0},{ty:.0}) (index={index})", d2.sqrt());
+                            gs.log_msg("zone", &format!("Walking to the zone {} line", dest_zone));
+                            *self.goto_target.lock().unwrap() = Some((tx, ty, tz));
+                            *self.goto_entity.lock().unwrap() = None;
+                        }
+                    }
+                    None => {
+                        tracing::info!("zone_cross: no zone-line region found for zone_id={want_zone}");
+                        gs.log_msg("zone", "No zone line found to cross");
+                    }
+                }
             }
         }
 
-        // Auto zone-cross: if the player is within range of a zone point, teleport to
-        // it and send OP_ZONE_CHANGE automatically. Cooldown prevents looping.
+        // Auto zone-cross (native mechanism): when the player stands in a DRNTP zone-line region
+        // baked into the zone BSP, resolve its zone-point index to a destination via the
+        // OP_SendZonepoints list and send OP_ZONE_CHANGE. The server then matches our real position
+        // against the DB trigger and places us at the correct arrival point. Cooldown prevents
+        // re-firing while still inside the region right after a crossing.
         {
             const ZONE_CROSS_COOLDOWN_MS: u128 = 10000; // 10 seconds
             if self.last_zone_cross.elapsed().as_millis() > ZONE_CROSS_COOLDOWN_MS {
-            const ZONE_LINE_DIST: f32 = 15.0;
-            const ZONE_LINE_DIST2: f32 = ZONE_LINE_DIST * ZONE_LINE_DIST;
-            let zps = self.zone_points.lock().unwrap();
-            let nearby = zps.iter()
-                .filter(|zp| zp.zone_id != 0)
-                .find(|zp| dist2(zp, gs) < ZONE_LINE_DIST2);
-            if let Some(zp) = nearby {
-                let dest = zp.zone_id;
-                drop(zps); // release lock before mutating gs
-                tracing::info!("zone_cross: auto-triggered near a zone line to zone_id={dest}");
-                gs.log_msg("zone", &format!("Crossing to zone {}", dest));
-                self.send_zone_change_packet(stream, gs, dest);
-                self.last_zone_cross = Instant::now();
-            }
+                let index = self.collision.read().unwrap().as_ref()
+                    .and_then(|c| c.zone_line_at([gs.player_x, gs.player_y, gs.player_z]));
+                if let Some(index) = index {
+                    // Resolve destination: the advertised zone point whose iterator matches this
+                    // region's index. A region with no matching zone point (e.g. a WLD index the DB
+                    // doesn't advertise) is left alone rather than crossing blindly.
+                    let dest = self.zone_points.lock().unwrap().iter()
+                        .find(|zp| zp.iterator as i32 == index && zp.zone_id != 0)
+                        .map(|zp| zp.zone_id);
+                    match dest {
+                        Some(dest_zone) => {
+                            tracing::info!("zone_cross: in zone-line region index={index} → zone_id={dest_zone}");
+                            gs.log_msg("zone", &format!("Crossing to zone {}", dest_zone));
+                            self.send_zone_change_packet(stream, gs, dest_zone);
+                            self.last_zone_cross = Instant::now();
+                        }
+                        None => {
+                            tracing::debug!("zone_cross: zone-line region index={index} has no matching zone point — ignoring");
+                        }
+                    }
+                }
             }
         }
 
