@@ -135,10 +135,12 @@ pub type ZoneCrossReq = Arc<Mutex<Option<u16>>>;
 /// loop drives the CharacterController with this — exactly like WASD — taking priority over the
 /// `/goto` nav planner (but below real keyboard input) until `until`, so an agent can walk/hop out
 /// of a spot where A* finds no path. `dir` is a world `(east, north)` direction (zero = stand in
-/// place, e.g. a jump with no movement).
+/// place, e.g. a jump with no movement). `up` is the vertical axis for swimming (`-1..1`): while in
+/// water it drives the character up/down through the water column (#207); it's ignored on land.
 #[derive(Clone, Copy)]
 pub struct ManualMove {
     pub dir:   [f32; 2],
+    pub up:    f32,
     pub jump:  bool,
     pub until: std::time::Instant,
 }
