@@ -368,6 +368,7 @@ OPTIONS:
         entity_positions,
         entity_ids,
         zone_points,
+        shared_collision.clone(),
         zone_cross,
         hail,
         say,
