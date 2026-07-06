@@ -477,12 +477,25 @@ fn plan_path(
     avoid: &[[f32; 2]],
 ) -> Option<Vec<[f32; 3]>> {
     use crate::movement::PLAYER_RADIUS;
-    for r in [PLAYER_RADIUS, PLAYER_RADIUS * 0.5, PLAYER_RADIUS * 0.25] {
-        if let Some(p) = col.find_path(start, goal, r, avoid, false) {
-            return Some(p);
+    // This runs on the network thread, so a slow plan delays keepalive/ACK handling. Long-range
+    // pathing isn't time-critical, but if it ever gets THIS slow we want it visible — warn so a slow
+    // plan can't silently starve the connection the way the zone-line scan did (#204).
+    const SLOW_MS: u128 = 100;
+    let t0 = std::time::Instant::now();
+    let plan = (|| {
+        for r in [PLAYER_RADIUS, PLAYER_RADIUS * 0.5, PLAYER_RADIUS * 0.25] {
+            if let Some(p) = col.find_path(start, goal, r, avoid, false) {
+                return Some(p);
+            }
         }
+        col.find_path(start, goal, PLAYER_RADIUS, avoid, true)
+    })();
+    let ms = t0.elapsed().as_millis();
+    if ms >= SLOW_MS {
+        tracing::warn!("nav: path plan from ({:.0},{:.0}) to ({:.0},{:.0}) took {ms}ms on the net thread — slower than expected",
+            start[0], start[1], goal[0], goal[1]);
     }
-    col.find_path(start, goal, PLAYER_RADIUS, avoid, true)
+    plan
 }
 
 pub struct Navigator {

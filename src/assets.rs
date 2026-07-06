@@ -459,6 +459,10 @@ pub struct Collision {
     /// INVIS faces, PASSABLE excluded). False for legacy zones with no baked collision mesh,
     /// where the rendered terrain is used as a fallback. Diagnostic/provenance only.
     pub from_collision_mesh: bool,
+    /// Precomputed `(zone_line_index, [east, north, z])` for each zone-line region, built once from
+    /// the water map at `set_water` (zone load). Lets `find_zone_line_near` be an O(1) cache read on
+    /// the network thread instead of an exhaustive scan that linkdead-ed the client (#204).
+    zone_line_regions: Vec<(i32, [f32; 3])>,
 }
 
 impl Collision {
@@ -518,7 +522,7 @@ impl Collision {
         }
         let cell_size = cell_size.max(1.0);
         if tris.is_empty() || min[0] == f32::MAX {
-            return Collision { tris, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0, water: None, from_collision_mesh };
+            return Collision { tris, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0, water: None, from_collision_mesh, zone_line_regions: Vec::new() };
         }
         let cols = (((max[0] - min[0]) / cell_size).ceil() as usize + 1).max(1);
         let rows = (((max[1] - min[1]) / cell_size).ceil() as usize + 1).max(1);
@@ -539,12 +543,39 @@ impl Collision {
                 }
             }
         }
-        Collision { tris, cells, origin: min, cell_size, cols, rows, water: None, from_collision_mesh }
+        Collision { tris, cells, origin: min, cell_size, cols, rows, water: None, from_collision_mesh, zone_line_regions: Vec::new() }
     }
 
     /// Attach a zone water map so find_path can route swim descents. Call after `build`.
     pub fn set_water(&mut self, water: Option<std::sync::Arc<crate::region_map::RegionMap>>) {
         self.water = water;
+        // Precompute zone-line region points now (zone load, off the net thread) so the runtime
+        // find_zone_line_near is an O(1) cache read (#204).
+        self.zone_line_regions = self.precompute_zone_line_regions();
+    }
+
+    /// Build the zone-line region cache from the water map. Bounded + timed; warns if it runs long
+    /// (nav prep should never be slow enough to matter next to keepalive). Empty when there's no
+    /// water map / no zone-line regions.
+    fn precompute_zone_line_regions(&self) -> Vec<(i32, [f32; 3])> {
+        let Some(water) = self.water.as_ref() else { return Vec::new(); };
+        if self.cols == 0 || self.tris.is_empty() { return Vec::new(); }
+        let (mut zmin, mut zmax) = (f32::MAX, f32::MIN);
+        for t in &self.tris { for v in t { zmin = zmin.min(v[2]); zmax = zmax.max(v[2]); } }
+        let bounds = (
+            self.origin[0], self.origin[0] + self.cols as f32 * self.cell_size,
+            self.origin[1], self.origin[1] + self.rows as f32 * self.cell_size,
+            zmin, zmax,
+        );
+        let t0 = std::time::Instant::now();
+        let regions = water.zone_line_region_points(bounds);
+        let ms = t0.elapsed().as_millis();
+        if ms > 250 {
+            tracing::warn!("nav: zone-line region precompute took {ms}ms ({} region(s)) — slower than expected", regions.len());
+        } else if !regions.is_empty() {
+            tracing::info!("nav: precomputed {} zone-line region point(s) in {ms}ms", regions.len());
+        }
+        regions
     }
 
     /// True if `pos` = [east, north, z] (server coords) lies in a water region.
@@ -581,51 +612,20 @@ impl Collision {
     /// zone line, where the auto-cross then fires. `None` if the zone has no region map or no
     /// matching region is found within the search radius.
     ///
-    /// A zone-line region can be smaller than the pathfinding grid cell (32u) and only a few units
-    /// thick vertically, so we sample on an expanding ring around `near` at a fine XY step and z-scan
-    /// each point. Expanding outward and returning the first hit yields the closest region while
-    /// keeping the cost proportional to how far away it is (not the whole zone).
+    /// O(regions) cache read — NO scan. The region points are precomputed once at zone load
+    /// (`set_water`), so this is safe to call on the network thread; the old per-request expanding
+    /// ring × z scan did up to ~10^8 BSP walks synchronously and force-linkdead-ed the client when a
+    /// line was far away or missing from the `.wtr` (#204). `index` filters to a destination zone's
+    /// line (`None` = any); returns `(index, [east, north, z])` of the region nearest `near`.
     pub fn find_zone_line_near(&self, index: Option<i32>, near: [f32; 3]) -> Option<(i32, [f32; 3])> {
-        self.water.as_ref()?;
-        if self.cols == 0 || self.tris.is_empty() { return None; }
-        // Zone height range (once), so the z scan is independent of the player's elevation.
-        let (mut zmin, mut zmax) = (f32::MAX, f32::MIN);
-        for t in &self.tris { for v in t { zmin = zmin.min(v[2]); zmax = zmax.max(v[2]); } }
-        if zmin > zmax { return None; }
-        let min_e = self.origin[0];
-        let max_e = self.origin[0] + self.cols as f32 * self.cell_size;
-        let min_n = self.origin[1];
-        let max_n = self.origin[1] + self.rows as f32 * self.cell_size;
-        const XY_STEP: f32 = 6.0;  // finer than a zone line's XY footprint
-        const Z_STEP:  f32 = 2.0;  // finer than a zone line's vertical thickness
-        const MAX_R:   f32 = 3000.0; // don't chase a zone line across the whole world
-        let test = |east: f32, north: f32| -> Option<(i32, [f32; 3])> {
-            if east < min_e || east > max_e || north < min_n || north > max_n { return None; }
-            let mut z = zmin;
-            while z <= zmax {
-                if let Some(found) = self.zone_line_at([east, north, z]) {
-                    if index.is_none_or(|want| want == found) {
-                        return Some((found, [east, north, z]));
-                    }
-                }
-                z += Z_STEP;
-            }
-            None
-        };
-        if let Some(hit) = test(near[0], near[1]) { return Some(hit); }
-        let mut r = XY_STEP;
-        while r <= MAX_R {
-            // Angular step chosen so neighbouring ring samples are ~XY_STEP apart.
-            let steps = ((std::f32::consts::TAU * r / XY_STEP).ceil() as usize).max(1);
-            for i in 0..steps {
-                let a = std::f32::consts::TAU * i as f32 / steps as f32;
-                if let Some(hit) = test(near[0] + r * a.cos(), near[1] + r * a.sin()) {
-                    return Some(hit);
-                }
-            }
-            r += XY_STEP;
-        }
-        None
+        self.zone_line_regions
+            .iter()
+            .filter(|(idx, _)| index.is_none_or(|want| want == *idx))
+            .min_by(|a, b| {
+                let d2 = |p: &[f32; 3]| (p[0] - near[0]).powi(2) + (p[1] - near[1]).powi(2) + (p[2] - near[2]).powi(2);
+                d2(&a.1).partial_cmp(&d2(&b.1)).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .copied()
     }
 
     #[inline]
