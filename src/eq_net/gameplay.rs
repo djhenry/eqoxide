@@ -226,6 +226,24 @@ pub async fn run_gameplay_phase(
                         tracing::info!("EQ: cross-zone OP_REQUEST_CLIENT_ZONE_CHANGE zone_id={zone_id} → sent OP_ZONE_CHANGE");
                     }
                 }
+                OP_TRANSLOCATE if packet.payload.len() >= 92 => {
+                    // The server is offering a translocate (Priest of Discord, a Timorous Deep
+                    // firepot, or a Translocate spell): a confirmation prompt carrying the
+                    // destination (Translocate_Struct: ZoneID@0, SpellID@4, y@76, x@80, z@84,
+                    // Complete@88). A headless agent that triggered it wants to travel, so auto-accept
+                    // by echoing the struct back with Complete=1 — the server then moves/zones us via
+                    // its normal path (OP_RequestClientZoneChange / a same-zone move handled above).
+                    // Ignore a packet already marked Complete (nothing to accept). (#192)
+                    use crate::eq_net::navigation::build_translocate_ack;
+                    let complete = u32::from_le_bytes([packet.payload[88], packet.payload[89], packet.payload[90], packet.payload[91]]);
+                    if complete != 1 {
+                        let zone_id  = u32::from_le_bytes([packet.payload[0], packet.payload[1], packet.payload[2], packet.payload[3]]);
+                        let spell_id = u32::from_le_bytes([packet.payload[4], packet.payload[5], packet.payload[6], packet.payload[7]]);
+                        s.send_app_packet(OP_TRANSLOCATE, &build_translocate_ack(&packet.payload));
+                        gs.log_msg("zone", &format!("Accepting translocate to zone {zone_id}"));
+                        tracing::info!("EQ: OP_Translocate → auto-accepting (zone_id={zone_id}, spell_id={spell_id})");
+                    }
+                }
                 OP_ZONE_CHANGE if packet.payload.len() >= 96 => {
                     // RoF2 ZoneChange_Struct: success is an i32 at offset 92 (was 84 in Titanium).
                     let success = i32::from_le_bytes([

@@ -316,6 +316,7 @@ pub fn respawn_window_reply(payload: &[u8]) -> Option<[u8; 4]> {
 }
 pub const OP_ZONE_CHANGE: u16 = 0x2d18;            // RoF2: OP_ZoneChange
 pub const OP_REQUEST_CLIENT_ZONE_CHANGE: u16 = 0x3fcf; // RoF2: OP_RequestClientZoneChange
+pub const OP_TRANSLOCATE: u16 = 0x6580;            // RoF2: OP_Translocate (translocate confirm/accept)
 pub const OP_LOGOUT: u16 = 0x4ac6;                 // RoF2: OP_Logout
 // NOTE: no OP_LOGOUT_REPLY constant — OP_LogoutReply=0x0000 (unused) in patch_RoF2.conf, so RoF2
 // never sends a wire logout reply. Clean shutdown (perform_clean_shutdown) sends OP_Logout and
