@@ -1041,11 +1041,22 @@ impl App {
                 *self.nav_intent.lock().unwrap() = None;
                 let (wish, heading) = crate::movement::manual_wish(m.dir);
                 if let Some(h) = heading { self.heading_target = h; } // face where we walk
+                // Vertical control only applies in water: `up` swims up/down through the column, and
+                // a jump underwater becomes full swim-up so /move/jump lifts a submerged character off
+                // the pool floor. On land, jump is the normal hop and `up` is ignored (#207). Gate on
+                // `in_water` (the player is in water), NOT the keyboard-swim `swimming` flag — that's
+                // `lmb_drive && w_held`, which is never set for an API-driven agent.
+                let vspeed = if in_water {
+                    let v = m.up * MOVE_SPEED;
+                    if m.jump && v < MOVE_SPEED { MOVE_SPEED } else { v }
+                } else {
+                    0.0
+                };
                 crate::movement::MoveIntent {
                     wish_dir:    wish,
-                    wish_vspeed: 0.0,
-                    jump:        m.jump,
-                    want_swim:   swimming,
+                    wish_vspeed: vspeed,
+                    jump:        m.jump && !in_water, // land hop only; underwater a jump is swim-up
+                    want_swim:   in_water,
                     speed:       MOVE_SPEED,
                     climb:       0.0,
                     hop:         false,
