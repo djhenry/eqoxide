@@ -144,6 +144,16 @@ pub fn draw_labels(
     // NPC labels
     for (i, b) in scene.billboards.iter().enumerate() {
         if b.level == 0 { continue; } // level-0 placeholder spawns have no label
+        // Cull nameplates on the SAME distance+frustum test the model draw uses
+        // (pass.rs), so a plate never shows for a spawn whose model isn't rendered —
+        // and, unlike the occlusion test below, this is independent of whether zone
+        // geometry is loaded. Without it, far-off spawns (past ENTITY_DRAW_DIST) and
+        // — when collision is None (asset server down / mid-reload) — every on-screen
+        // spawn showed a floating label with no model (#177).
+        if !crate::camera::entity_in_view(b.pos, scene.player_pos, view_proj,
+                                          crate::pass::ENTITY_DRAW_DIST, crate::pass::ENTITY_CULL_MARGIN) {
+            continue;
+        }
         let Some([sx, sy]) = project_to_screen(b.pos, view_proj, screen_w, screen_h) else {
             continue; // behind camera or outside depth range
         };
