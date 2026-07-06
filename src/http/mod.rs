@@ -131,6 +131,19 @@ pub type GroupMakeLeaderReq = Arc<Mutex<Option<String>>>;
 ///   Some(id) → cross to a specific destination zone id.
 pub type ZoneCrossReq = Arc<Mutex<Option<u16>>>;
 
+/// Manual-movement escape hatch (#188), set by POST /v1/move/manual or /v1/move/jump. The render
+/// loop drives the CharacterController with this — exactly like WASD — taking priority over the
+/// `/goto` nav planner (but below real keyboard input) until `until`, so an agent can walk/hop out
+/// of a spot where A* finds no path. `dir` is a world `(east, north)` direction (zero = stand in
+/// place, e.g. a jump with no movement).
+#[derive(Clone, Copy)]
+pub struct ManualMove {
+    pub dir:   [f32; 2],
+    pub jump:  bool,
+    pub until: std::time::Instant,
+}
+pub type ManualMoveReq = Arc<Mutex<Option<ManualMove>>>;
+
 /// A hail request set by POST /v1/interact/hail: the NPC's display name (for the "Hail, <name>"
 /// say text) plus its `spawn_id` when known. The nav thread targets the NPC (`spawn_id`) BEFORE
 /// saying, because the server only fires an NPC's `EVENT_SAY` on the player's current target
@@ -401,6 +414,8 @@ pub(crate) struct HttpState {
     /// Zone collision + region map (shared with the nav thread); read-only here, for zone_exits.
     pub(crate) shared_collision: crate::assets::SharedCollision,
     pub(crate) zone_cross:       ZoneCrossReq,
+    /// Manual-move / jump escape hatch (#188), consumed by the render loop.
+    pub(crate) manual_move:      ManualMoveReq,
     pub(crate) hail:             HailReq,
     pub(crate) say:              SayReq,
     pub(crate) target:           TargetReq,
@@ -457,6 +472,7 @@ pub fn spawn_camera_server(
     zone_points:      ZonePoints,
     shared_collision: crate::assets::SharedCollision,
     zone_cross:       ZoneCrossReq,
+    manual_move:      ManualMoveReq,
     hail:             HailReq,
     say:              SayReq,
     target:           TargetReq,
@@ -508,7 +524,7 @@ pub fn spawn_camera_server(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, shared_collision, zone_cross, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, dialogue, nav_state, dialogue_click, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until, pet_cmd };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, shared_collision, zone_cross, manual_move, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, dialogue, nav_state, dialogue_click, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until, pet_cmd };
             // Versioned + grouped routes: /v1/<group>/<action>. Each group's `router()` defines
             // relative paths; nesting prefixes them. Shared state is applied once at the end.
             let app = Router::new()

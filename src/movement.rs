@@ -84,6 +84,22 @@ pub struct MoveIntent {
     pub hop:         bool,
 }
 
+/// Convert a world `(east, north)` movement request into a unit `wish_dir` plus the EQ heading
+/// (CCW degrees, 0 = north) to face while moving it. Returns `None` heading when the request is
+/// ~zero (stand in place — e.g. a jump with no direction). Used by the HTTP manual-move escape
+/// hatch (#188) to drive the controller directly, like WASD, when A* has stranded the character.
+pub fn manual_wish(dir: [f32; 2]) -> ([f32; 2], Option<f32>) {
+    let len = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt();
+    if len > 1e-4 {
+        let wish = [dir[0] / len, dir[1] / len];
+        // The render loop's forward vector is (-sin h, cos h), so h = atan2(-east, north).
+        let heading = (-wish[0]).atan2(wish[1]).to_degrees().rem_euclid(360.0);
+        (wish, Some(heading))
+    } else {
+        ([0.0, 0.0], None)
+    }
+}
+
 /// A read-only snapshot of the controller the render thread publishes each frame for the nav
 /// thread to stream to the server (design §2 "Threading"). `heading` is EQ-CCW degrees.
 #[derive(Clone, Copy, Debug, Default)]
@@ -402,6 +418,22 @@ impl CharacterController {
 mod tests {
     use super::*;
     use crate::assets::{Collision, ZoneAssets, MeshData, RenderMode};
+
+    #[test]
+    fn manual_wish_normalizes_and_faces_the_move_direction() {
+        // North (+north) → unit north, heading 0.
+        let (w, h) = manual_wish([0.0, 5.0]);
+        assert!((w[0]).abs() < 1e-5 && (w[1] - 1.0).abs() < 1e-5);
+        assert!((h.unwrap()).abs() < 1e-4);
+        // East (+east) → unit east, heading 270 (EQ: 0=north, CCW, so east = 270°).
+        let (w, h) = manual_wish([5.0, 0.0]);
+        assert!((w[0] - 1.0).abs() < 1e-5 && w[1].abs() < 1e-5);
+        assert!((h.unwrap() - 270.0).abs() < 1e-3);
+        // Zero request → no movement, no heading change (e.g. jump in place).
+        let (w, h) = manual_wish([0.0, 0.0]);
+        assert_eq!(w, [0.0, 0.0]);
+        assert!(h.is_none());
+    }
 
     fn mesh(positions: Vec<[f32; 3]>) -> MeshData {
         MeshData {
