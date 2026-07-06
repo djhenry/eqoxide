@@ -184,7 +184,10 @@ impl CharacterController {
             // Free WASD uses the native 2u step; the nav planner raises `climb` to NAV_CLIMB so the
             // controller can follow find_path over fence/cart lips it routed across (#41).
             let max_step = STEP_UP.max(intent.climb);
-            if self.on_ground && low_hit && low_prog + 0.01 < hlen(wish) {
+            // Allow step-up while SWIMMING too, not just when grounded: that's how a character hauls
+            // OUT of water onto the shore (swimming clears on_ground, so without this it just presses
+            // into the bank lip at the surface and can't climb the last few units, #191).
+            if (self.on_ground || swimming) && low_hit && low_prog + 0.01 < hlen(wish) {
                 if let Some(step) = self.try_step_up(wish, max_step, col) {
                     if hlen([step[0] - self.pos[0], step[1] - self.pos[1], 0.0]) > low_prog + 0.05 {
                         applied = step;
@@ -218,7 +221,20 @@ impl CharacterController {
         if swimming {
             self.on_ground = false;
             self.vel_z = 0.0;
-            self.pos[2] += intent.wish_vspeed * dt;
+            if intent.wish_vspeed != 0.0 {
+                // Explicit vertical input (a human swimming up/down along the look direction).
+                self.pos[2] += intent.wish_vspeed * dt;
+            } else if let Some(surf) = col.water_surface(self.pos) {
+                // Nav-driven swim with no vertical wish: float toward the surface so the character
+                // swims ACROSS at the top instead of sitting on / crawling along the pool bottom the
+                // path may route to (#191). Without this, want_swim just froze it at its current z.
+                const BUOY_RATE: f32 = 30.0;
+                const FLOAT_DEPTH: f32 = 2.0;
+                let target = surf - FLOAT_DEPTH;
+                if self.pos[2] < target {
+                    self.pos[2] = (self.pos[2] + BUOY_RATE * dt).min(target);
+                }
+            }
         } else if self.in_water && !self.on_ground {
             // Submerged but NOT actively swimming (walked / nav-pathed into water): float toward the
             // surface instead of applying gravity and free-falling through the passable water plane
@@ -484,6 +500,24 @@ mod tests {
         assert!((7.0..=9.0).contains(&ctrl.pos[2]),
             "should settle just below the z=10 surface (~8): {}", ctrl.pos[2]);
         assert!(ctrl.vel_z.abs() < 1e-3, "no accumulating fall velocity: {}", ctrl.vel_z);
+    }
+
+    #[test]
+    fn nav_swim_floats_off_the_bottom_toward_the_surface() {
+        // Deep water (surface z=10). The character starts submerged and grounded on the bottom
+        // (z=-20) — the case where a path routed it to the pool floor. A nav-driven swim
+        // (want_swim=true, no vertical wish) must float it UP to the surface, not leave it crawling
+        // the bottom (#191).
+        let mut c = col(vec![]);
+        c.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::flat_below(10.0))));
+        let mut ctrl = CharacterController::new([0.0, 0.0, -20.0]);
+        ctrl.on_ground = true;
+        let swim = MoveIntent {
+            wish_dir: [1.0, 0.0], wish_vspeed: 0.0, jump: false, want_swim: true,
+            speed: 35.0, climb: 0.0, hop: false,
+        };
+        for _ in 0..240 { ctrl.step(swim, 1.0 / 60.0, &c); }
+        assert!(ctrl.pos[2] > 5.0, "swim floats off the bottom toward the surface (~8): {}", ctrl.pos[2]);
     }
 
     #[test]
