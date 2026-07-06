@@ -861,7 +861,9 @@ impl App {
             } else if let Some((code, _)) = self.game_state.combat_anims.get(&pid).filter(|_| swinging) {
                 format!("C{:02}", code)
             } else if self.last_moved_at.elapsed().as_millis() < 250 {
-                "walking".to_string()
+                // Swimming while moving in water; walking/running otherwise (#198). The controller is
+                // the source of truth for in_water (it queries the zone's water map each step).
+                if self.controller.in_water { "swimming".to_string() } else { "walking".to_string() }
             } else if self.game_state.sitting {
                 "sitting".to_string()
             } else {
@@ -1837,7 +1839,13 @@ fn smooth_entity_motion(
             // from scene.rs, since the server animation field is always "Standing" while
             // an NPC moves between update packets).
             if b.action == "idle" && m.speed > 0.5 && d > 1e-4 {
-                b.action = "walking".to_string();
+                // Swim animation for an NPC/PC moving through water (#198), same water check the
+                // player uses; walking otherwise.
+                b.action = if collision.is_some_and(|c| c.in_water(b.pos)) {
+                    "swimming".to_string()
+                } else {
+                    "walking".to_string()
+                };
             }
 
             // Face the direction of travel while moving, exactly like the player does. The
