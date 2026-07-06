@@ -1061,6 +1061,12 @@ impl Collision {
             .unwrap_or(start[2]);
         const STEP_H: f32 = 20.0;        // max CLIMB between adjacent cells (stairs/ledge)
         const MAX_STEP_DOWN: f32 = 60.0; // max DROP between adjacent cells (fall/hop down a level)
+        // Grade limit (eqoxide#212): STEP_H=20 over an 8u cell is a 250% grade. A discrete vertical
+        // step that tall is already blocked here by the chest-ray path_clear (its riser is a wall),
+        // so the climbs that actually reach A* are smooth RAMPS — and a ramp steeper than the
+        // controller can walk makes it slide on the face and wedge (#205). Reject a climb whose
+        // grade (rise/run) exceeds what's walkable; A* then routes around the steep face.
+        const MAX_WALK_GRADE: f32 = 1.2;  // walkable up to ~50° (rise/run); steeper = slide
         // Snap the start CELL onto the surface the char is really on. When the char stands at a
         // cell's edge next to a wall, the 8u cell CENTER can fall on the wall's footprint — whose
         // only floor is the wall-TOP — so A* run from that cell would begin up on the wall and
@@ -1173,6 +1179,13 @@ impl Collision {
                 // overhang (the multi-level connection) instead of staying on the upper surface.
                 for nf in self.column_floors(b[0], b[1], cz, STEP_H, MAX_STEP_DOWN) {
                     if nf - cz > STEP_H || cz - nf > MAX_STEP_DOWN { continue; }
+                    // Grade limit: skip a climb too steep to walk (rise/run > MAX_WALK_GRADE) —
+                    // A* then routes around the slope face instead of wedging on it. (eqoxide#212)
+                    let rise = nf - cz;
+                    if rise > 0.0 {
+                        let run = (((dc * dc + dr * dr) as f32).sqrt()) * cell; // 8u orth / ~11.3u diag
+                        if rise / run > MAX_WALK_GRADE { continue; }
+                    }
                     let nkey = (nc, nr, qf(nf));
                     if closed.contains(&nkey) { continue; }
                     if !self.path_clear([a[0], a[1], cz + CHEST], [b[0], b[1], nf + CHEST], radius) { continue; }
@@ -1494,6 +1507,42 @@ mod tests {
         let last = *path.unwrap().last().unwrap();
         assert!((last[0] - goal[0]).abs() < 8.0 && (last[1] - goal[1]).abs() < 8.0,
             "path should end at the bank goal, got {last:?}");
+    }
+
+    /// eqoxide#212: A* must refuse a ramp too steep to walk (it slides/wedges), while taking a
+    /// gentle ramp of the same rise. Same geometry, only the ramp's run (steepness) differs.
+    #[test]
+    fn find_path_rejects_too_steep_ramp() {
+        // MeshData pos = [north, up, east]; Collision maps to world [east, north, up].
+        let quad = |v: Vec<[f32; 3]>| MeshData {
+            positions: v, normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
+            texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        // Build: low floor (east -40..0, z=0), a ramp (east 0..RUN, z 0->30), high plateau
+        // (east RUN..RUN+40, z=30). Start on the low floor, goal on the plateau. North spans 0..40.
+        let scene = |run: f32| {
+            let low  = quad(vec![[0.0, 0.0, -40.0], [40.0, 0.0, -40.0], [40.0, 0.0, 0.0], [0.0, 0.0, 0.0]]);
+            let ramp = quad(vec![[0.0, 0.0, 0.0], [40.0, 0.0, 0.0], [40.0, 30.0, run], [0.0, 30.0, run]]);
+            let high = quad(vec![[0.0, 30.0, run], [40.0, 30.0, run], [40.0, 30.0, run + 40.0], [0.0, 30.0, run + 40.0]]);
+            ZoneAssets { terrain: vec![low, ramp, high], objects: vec![], textures: vec![] }
+        };
+        let start = [-20.0, 20.0, 0.0]; // low floor (world [east,north,up])
+
+        // Gentle ramp: 30u rise over 48u run = grade 0.625 < 1.2 → walkable.
+        let gentle = Collision::build(&scene(48.0), 4.0);
+        let goal_g = [48.0 + 20.0, 20.0, 30.0];
+        let p_gentle = gentle.find_path(start, goal_g, 1.0, &[], false);
+        assert!(p_gentle.is_some(), "a gentle (0.625) ramp must be walkable");
+        let last = *p_gentle.unwrap().last().unwrap();
+        assert!(last[2] > 20.0, "gentle path should reach the high plateau (z~30), got {last:?}");
+
+        // Steep ramp: 30u rise over 16u run = grade 1.875 > 1.2 → A* must refuse to climb it, so
+        // the plateau is unreachable (no partial route reaches the top tier).
+        let steep = Collision::build(&scene(16.0), 4.0);
+        let goal_s = [16.0 + 20.0, 20.0, 30.0];
+        let full = steep.find_path(start, goal_s, 1.0, &[], false);
+        assert!(full.is_none(), "a 1.875-grade ramp is too steep — A* must not route up it");
     }
 
     /// A single horizontal floor quad + one vertical wall: the floor raycast must
