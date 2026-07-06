@@ -33,8 +33,10 @@ hailing + saying `[keyword]`s.
 ### The quest experience for agents (MMO-style)
 
 Phase 1 (done): **discovery + indicators**.
-- `tools/quest_finder.py --export` bakes quest-giver data into `data/quests.json` (regenerate if the
-  server's quests change). The client loads it at startup (`src/quests.rs`).
+- `tools/quest_finder.py --export` bakes quest-giver data into `quests.json`, which is delivered to
+  the client through the asset server's `gamedata` set (default output = the asset server's
+  `content/quests.json`; regenerate + re-bake if the server's quests change). The client syncs it into
+  its cache and loads it at startup (`src/quests.rs`).
 - The HUD draws a golden **"❗ quest"** over any NPC that has a quest (so you can SEE quest givers
   in `/v1/observe/frame`, like a modern MMO). Note: in dense cities the nameplate may be occluded by buildings
   (existing nameplate behavior) — `GET /v1/quests/givers` is the reliable readout.
@@ -46,7 +48,7 @@ Phase 1 (done): **discovery + indicators**.
 **Two kinds of EQ quests** — the client surfaces both:
 - **Old-style Lua turn-in/dialogue quests** (most classic Qeynos quests: Rat Whiskers, Gnoll Fangs,
   the guild-note hand-in) have **no protocol representation** — they're emergent server Lua. The
-  golden "!" + `GET /v1/quests/givers` (derived from `data/quests.json`) are the only way to see them.
+  golden "!" + `GET /v1/quests/givers` (derived from `quests.json` (asset-server gamedata)) are the only way to see them.
 - **Native Task-system quests** (LDoN+; present in Titanium) — the server pushes a real quest journal
   (`OP_TaskDescription`/`OP_TaskActivity`/`OP_CompletedTasks`). The client decodes these into a live
   journal: **`GET /v1/quests/log`** returns active tasks with title, description, reward, and objectives
