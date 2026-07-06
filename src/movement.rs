@@ -198,11 +198,28 @@ impl CharacterController {
             }
         }
 
-        // ── Vertical: swim / jump / gravity + ground clamp. ──
+        // ── Vertical: swim / buoyancy / jump / gravity + ground clamp. ──
         if swimming {
             self.on_ground = false;
             self.vel_z = 0.0;
             self.pos[2] += intent.wish_vspeed * dt;
+        } else if self.in_water && !self.on_ground {
+            // Submerged but NOT actively swimming (walked / nav-pathed into water): float toward the
+            // surface instead of applying gravity and free-falling through the passable water plane
+            // to the riverbed — or, in open deep water with no bottom, to the zone boundary (#172).
+            // Rise-only: buoyancy never accelerates the character downward.
+            const BUOY_RATE:   f32 = 30.0; // vertical settle rate toward the surface (u/s)
+            const FLOAT_DEPTH: f32 = 2.0;  // rest this far below the surface (body floats, head clears)
+            self.vel_z = 0.0;
+            if let Some(surf) = col.water_surface(self.pos) {
+                let target = surf - FLOAT_DEPTH;
+                if self.pos[2] < target {
+                    self.pos[2] = (self.pos[2] + BUOY_RATE * dt).min(target);
+                }
+                // At/above the float line: hold — don't sink (no gravity while submerged).
+            }
+            // No bounded surface found: hold position rather than free-fall (a server correction or
+            // the #150 underworld guard would otherwise have to recover us).
         } else {
             if intent.jump && self.on_ground {
                 self.vel_z = JUMP_VELOCITY;
@@ -419,6 +436,32 @@ mod tests {
         ctrl.step(walk(35.0, [0.7071, 0.7071]), 0.1, &c);
         assert!(ctrl.pos[0] < 4.1, "should be stopped short of the wall (no penetration, east<4.1): {}", ctrl.pos[0]);
         assert!(ctrl.pos[1] > 0.5, "should have slid north along the wall: {}", ctrl.pos[1]);
+    }
+
+    #[test]
+    fn buoyancy_floats_toward_surface_instead_of_sinking() {
+        // Open deep water: everything below z=10 is water, and there is NO floor at all.
+        let mut c = col(vec![]);
+        c.set_water(Some(std::sync::Arc::new(crate::water_map::WaterMap::flat_below(10.0))));
+        // Submerged at z=0, not on the ground, and NOT actively swimming (want_swim=false) — the
+        // "walked into the river" case. Previously this free-fell forever (#172).
+        let mut ctrl = CharacterController::new([0.0, 0.0, 0.0]);
+        ctrl.on_ground = false;
+        for _ in 0..180 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 60.0, &c); }
+        assert!(ctrl.pos[2] > 0.0, "should float UP, not sink: {}", ctrl.pos[2]);
+        assert!((7.0..=9.0).contains(&ctrl.pos[2]),
+            "should settle just below the z=10 surface (~8): {}", ctrl.pos[2]);
+        assert!(ctrl.vel_z.abs() < 1e-3, "no accumulating fall velocity: {}", ctrl.vel_z);
+    }
+
+    #[test]
+    fn falls_normally_in_air_without_water() {
+        // Regression guard: with no water map, an airborne controller still falls under gravity.
+        let c = col(vec![floor(0.0, -100.0, 100.0)]);
+        let mut ctrl = CharacterController::new([0.0, 0.0, 50.0]);
+        ctrl.on_ground = false;
+        ctrl.step(walk(0.0, [0.0, 0.0]), 0.1, &c);
+        assert!(ctrl.pos[2] < 50.0 && ctrl.vel_z < 0.0, "should fall under gravity: z={} vz={}", ctrl.pos[2], ctrl.vel_z);
     }
 
     #[test]
