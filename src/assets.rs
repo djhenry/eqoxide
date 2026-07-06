@@ -147,6 +147,44 @@ pub fn expand_objects(objects: &[ObjectModel]) -> Vec<MeshData> {
     out
 }
 
+/// Compact one primitive to only the vertices its indices actually reference, remapping the
+/// indices accordingly. glTF meshes frequently share ONE POSITION accessor across many primitives
+/// (each primitive is just an index subset — e.g. qeynos's `terrain` is 242 primitives over a
+/// single 51,700-vertex pool). gltf-rs's `read_positions()` returns that FULL shared pool for
+/// every primitive, so uploading positions as-read duplicates the whole pool once per primitive:
+/// qeynos = 242 × 51,700 ≈ 12.5M verts (~400 MB) for 51,700 unique verts. That ~400 MB exhausts
+/// GPU memory and the zone terrain fails to render (a void), while a low-primitive zone like
+/// ecommons (43 prims ≈ 16 MB) is unaffected. Compaction makes the emitted vertex count track the
+/// triangles a primitive actually draws, independent of the shared pool's size. (eqoxide#213)
+fn compact_primitive(
+    positions: Vec<[f32; 3]>,
+    normals:   Vec<[f32; 3]>,
+    uvs:       Vec<[f32; 2]>,
+    indices:   Vec<u32>,
+) -> (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<[f32; 2]>, Vec<u32>) {
+    let mut remap = vec![u32::MAX; positions.len()];
+    let mut np = Vec::new();
+    let mut nn = Vec::new();
+    let mut nu = Vec::new();
+    let mut ni = Vec::with_capacity(indices.len());
+    for &i in &indices {
+        let iu = i as usize;
+        if iu >= positions.len() { continue; } // defensive: drop out-of-range (valid GLBs never hit)
+        let r = if remap[iu] == u32::MAX {
+            let nr = np.len() as u32;
+            remap[iu] = nr;
+            np.push(positions[iu]);
+            nn.push(normals.get(iu).copied().unwrap_or([0.0, 0.0, 1.0]));
+            nu.push(uvs.get(iu).copied().unwrap_or([0.0, 0.0]));
+            nr
+        } else {
+            remap[iu]
+        };
+        ni.push(r);
+    }
+    (np, nn, nu, ni)
+}
+
 impl ZoneAssets {
     /// Load a server-baked zone GLB into the same `ZoneAssets` the renderer consumes.
     ///
@@ -238,6 +276,12 @@ impl ZoneAssets {
                     Some(iter) => iter.into_u32().collect(),
                     None => (0..positions.len() as u32).collect(),
                 };
+
+                // Drop the shared-vertex-pool overhead: emit only the vertices this primitive
+                // references (see compact_primitive — fixes the qeynos 242×-pool blowup). (eqoxide#213)
+                let (positions, normals, uvs, indices) =
+                    compact_primitive(positions, normals, uvs, indices);
+                if positions.is_empty() { continue; }
 
                 // Resolve texture name from the material's base-color texture.
                 let texture_name: Option<String> = primitive.material()
@@ -1388,6 +1432,33 @@ mod door_glb_tests {
 mod tests {
     use super::*;
 
+    /// eqoxide#213: compact_primitive must emit only the vertices a primitive references (from a
+    /// shared pool) while preserving the exact triangles — this is what stops the qeynos 242×
+    /// vertex-pool blowup that voided the zone.
+    #[test]
+    fn compact_primitive_drops_unreferenced_pool_vertices() {
+        // A shared 5-vertex pool; the primitive's triangle uses only verts 4, 2, 0.
+        let pool = vec![[0.0,0.0,0.0],[1.0,1.0,1.0],[2.0,2.0,2.0],[3.0,3.0,3.0],[4.0,4.0,4.0]];
+        let normals = vec![[0.0,0.0,1.0]; 5];
+        let uvs = vec![[0.0,0.0],[0.1,0.1],[0.2,0.2],[0.3,0.3],[0.4,0.4]];
+        let indices = vec![4u32, 2, 0];
+
+        let (p, n, u, idx) = compact_primitive(pool.clone(), normals, uvs.clone(), indices);
+        assert_eq!(p.len(), 3, "only the 3 referenced verts survive (not all 5)");
+        assert_eq!(n.len(), 3);
+        assert_eq!(u.len(), 3);
+        // Reconstruct the triangle through the remapped indices — must equal the originals.
+        let tri: Vec<[f32;3]> = idx.iter().map(|&i| p[i as usize]).collect();
+        assert_eq!(tri, vec![pool[4], pool[2], pool[0]], "triangle geometry preserved");
+        let tri_uv: Vec<[f32;2]> = idx.iter().map(|&i| u[i as usize]).collect();
+        assert_eq!(tri_uv, vec![uvs[4], uvs[2], uvs[0]], "per-vertex uvs follow the remap");
+
+        // A shared index reuses one compacted vertex, not a duplicate.
+        let (p2, _, _, idx2) = compact_primitive(pool.clone(), vec![[0.0,0.0,1.0];5], vec![[0.0,0.0];5], vec![2,2,4]);
+        assert_eq!(p2.len(), 2, "the two distinct verts (2,4) → 2 outputs");
+        assert_eq!(idx2, vec![0, 0, 1]);
+    }
+
     /// A flooded pit must be exitable by SWIMMING UP: pit floor at z=0, a cliff wall
     /// up to the bank at z=10, water filling the pit to z=9. Without water the chest
     /// ray for the climb crosses the cliff face and the pit is sealed (qeynos2 moat,
@@ -1902,5 +1973,3 @@ mod instanced_tests {
         assert!(total_instances >= za.objects.len(), "more placements than models");
     }
 }
-
-
