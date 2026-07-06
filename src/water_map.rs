@@ -88,4 +88,21 @@ impl WaterMap {
     pub fn is_water(&self, sx: f32, sy: f32, sz: f32) -> bool {
         matches!(self.region_type(sx, sy, sz), 1 | 7)
     }
+
+    /// Height of the water surface directly above a submerged point `(sx, sy, submerged_z)`.
+    /// Binary-searches upward for the water→air boundary. Returns `None` if the point isn't in
+    /// water, or if it's still water `MAX_UP` above it (unbounded / not a normal surface). Used by
+    /// the controller's buoyancy so a character floats up to the surface instead of sinking (#172).
+    pub fn surface_z(&self, sx: f32, sy: f32, submerged_z: f32) -> Option<f32> {
+        if !self.is_water(sx, sy, submerged_z) { return None; }
+        const MAX_UP: f32 = 200.0;
+        let mut lo = submerged_z;            // in water
+        let mut hi = submerged_z + MAX_UP;   // expected air
+        if self.is_water(sx, sy, hi) { return None; } // still water at the top → not a normal surface
+        for _ in 0..24 {
+            let mid = (lo + hi) * 0.5;
+            if self.is_water(sx, sy, mid) { lo = mid; } else { hi = mid; }
+        }
+        Some(hi) // first non-water height ≈ the surface
+    }
 }

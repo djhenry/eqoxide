@@ -553,6 +553,12 @@ impl Collision {
         self.water.as_ref().is_some_and(|w| w.is_water(pos[0], pos[1], pos[2]))
     }
 
+    /// Water-surface height above a submerged `pos`, or `None` if not in water / no bounded surface.
+    /// Used by the controller's buoyancy to float toward the surface (#172).
+    pub fn water_surface(&self, pos: [f32; 3]) -> Option<f32> {
+        self.water.as_ref().and_then(|w| w.surface_z(pos[0], pos[1], pos[2]))
+    }
+
     #[inline]
     fn cell_range(&self, min_e: f32, min_n: f32, max_e: f32, max_n: f32) -> (usize, usize, usize, usize) {
         let c0 = (((min_e - self.origin[0]) / self.cell_size) as isize).clamp(0, self.cols as isize - 1) as usize;
