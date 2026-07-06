@@ -74,7 +74,9 @@ async fn get_frame(State(s): State<HttpState>) -> Response {
     let (tx, rx) = oneshot::channel::<Vec<u8>>();
     *s.frame_req.lock().unwrap() = Some(tx);
 
-    match tokio::time::timeout(std::time::Duration::from_secs(2), rx).await {
+    // 10s: a debug build's readback + 1024px PNG encode can exceed 2s when the
+    // render loop is saturated, which made captures 503 while frames were fine.
+    match tokio::time::timeout(std::time::Duration::from_secs(10), rx).await {
         Ok(Ok(png_bytes)) => Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "image/png")
