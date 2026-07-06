@@ -1867,17 +1867,24 @@ fn smooth_entity_motion(
         // every-entity loop, and the compared position is bit-identical frame to frame
         // unless the entity actually moved (near: the glide has settled; far: the raw
         // server pos only changes on a sparse update), so only re-raycast on movement (#152).
-        match collision {
-            Some(col) => {
-                if b.pos != m.floor_at {
-                    m.floor_at = b.pos;
-                    m.floor_z  = col.floor_z(b.pos[0], b.pos[1], b.pos[2]);
+        if b.floating {
+            // Boats/ships float on the water surface: keep their server-sent z, do NOT snap to the
+            // floor. The server skips FixZ for boats too (Mob::FixZ: `if (GetIsBoat()) return;`)
+            // because they're GravityBehavior::Floating; floor_z would find the seabed/dock a few
+            // units down in shallow harbor water and yank the ship underwater (#194).
+        } else {
+            match collision {
+                Some(col) => {
+                    if b.pos != m.floor_at {
+                        m.floor_at = b.pos;
+                        m.floor_z  = col.floor_z(b.pos[0], b.pos[1], b.pos[2]);
+                    }
+                    b.pos[2] = m.floor_z;
                 }
-                b.pos[2] = m.floor_z;
+                // No collision loaded (zone (re)loading): invalidate the cache so the snap is
+                // recomputed against the NEW zone geometry once it arrives, not served stale.
+                None => m.floor_at = [f32::NAN; 3],
             }
-            // No collision loaded (zone (re)loading): invalidate the cache so the snap is
-            // recomputed against the NEW zone geometry once it arrives, not served stale.
-            None => m.floor_at = [f32::NAN; 3],
         }
     }
 
@@ -1895,7 +1902,7 @@ mod tests {
             level: 1, hp_pct: 100.0, is_target: false, dead: false,
             name: format!("npc{id}"), race: "HUM".into(), action: "idle".into(),
             heading: 0.0, equipment: [0; 9], equipment_tint: [[0; 3]; 9],
-            gender: 0, face: 0, hairstyle: 0, haircolor: 0, helm: 0, showhelm: 0,
+            gender: 0, face: 0, hairstyle: 0, haircolor: 0, helm: 0, showhelm: 0, floating: false,
         }
     }
 

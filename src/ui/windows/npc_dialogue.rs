@@ -195,6 +195,7 @@ mod tests {
             haircolor: 0,
             helm: 0,
             showhelm: 0,
+            floating: false,
         }
     }
 
