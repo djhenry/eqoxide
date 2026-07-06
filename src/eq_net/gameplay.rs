@@ -394,15 +394,13 @@ async fn perform_clean_shutdown(
 ) {
     tracing::info!("EQ: clean shutdown requested — sending OP_Logout");
     s.send_app_packet(OP_LOGOUT, &[]);
-    let deadline = std::time::Instant::now() + Duration::from_millis(300);
-    'wait: while std::time::Instant::now() < deadline {
+    // RoF2 has no wire OP_LogoutReply (OP_LogoutReply=0x0000/unused in patch_RoF2.conf), so there is
+    // nothing to wait for — the old code always timed out. Just give OP_Logout a brief window to
+    // flush to the socket and be processed server-side (character save) before we disconnect.
+    let deadline = std::time::Instant::now() + Duration::from_millis(150);
+    while std::time::Instant::now() < deadline {
         s.poll_recv();
-        while let Ok(pkt) = rx.try_recv() {
-            if pkt.opcode == OP_LOGOUT_REPLY {
-                tracing::info!("EQ: received OP_LogoutReply");
-                break 'wait;
-            }
-        }
+        while rx.try_recv().is_ok() {}
         sleep(Duration::from_millis(10)).await;
     }
     s.send_session_disconnect();
