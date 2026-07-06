@@ -568,6 +568,13 @@ impl Collision {
         self.water.as_ref().and_then(|w| w.zone_line_at(pos[0], pos[1], pos[2]))
     }
 
+    /// Distinct zone-point indices of every zone-line region in this zone — the set of exits. Each
+    /// links to an entrance via the `OP_SendZonepoints` `iterator`. Empty when the zone has no
+    /// region map (or a v1 map with no indices).
+    pub fn zone_line_indices(&self) -> Vec<i32> {
+        self.water.as_ref().map(|w| w.zone_line_indices()).unwrap_or_default()
+    }
+
     /// Find a point inside a zone-line region nearest to `near` (= [east, north, z]), returning
     /// `(region_index, point)`. When `index` is `Some`, only that zone-point index matches; `None`
     /// matches any zone line. Used by the explicit `/zone_cross` API to walk the character onto the
