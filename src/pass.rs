@@ -20,8 +20,9 @@ fn anim_now_ms() -> u64 {
 /// the per-frame entity work in densely-populated zones (e.g. gfaydark, ~400 spawns).
 pub(crate) const ENTITY_DRAW_DIST: f32 = 500.0;
 /// NDC slack for the frustum test so a tall model whose feet sit just off-screen still
-/// draws (the culled position is the feet; the body extends upward).
-const ENTITY_CULL_MARGIN: f32 = 0.5;
+/// draws (the culled position is the feet; the body extends upward). Shared with the HUD so
+/// nameplates cull on the exact same distance+frustum test as models (#177).
+pub(crate) const ENTITY_CULL_MARGIN: f32 = 0.5;
 
 /// Vestigial: this used to HIDE an armor mesh whose exact material+variant texture was
 /// missing (e.g. the variant-03 main chest torso for an armor material that only ships
