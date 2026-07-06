@@ -1159,7 +1159,12 @@ impl Collision {
                             if !water.is_water(b[0], b[1], nf + 3.0) && !water.is_water(b[0], b[1], nf + 12.0) { continue; }
                             let nkey = (nc, nr, qf(nf));
                             if closed.contains(&nkey) { continue; }
-                            let step = (((dc * dc + dr * dr) as f32).sqrt()) * cell + (cz - nf) * 0.5;
+                            // Steep per-depth cost so descending to a pool BOTTOM is a last resort:
+                            // A* should cross a surface pool at the top (cheap surface-traversal edge
+                            // above) and only dive when reaching a genuinely lower level is the only
+                            // way (a flooded sewer). Without this bias A* dove straight to the floor
+                            // of the Halas pool and the swimmer got stranded there (#191).
+                            let step = (((dc * dc + dr * dr) as f32).sqrt()) * cell + (cz - nf) * 4.0;
                             let tentative = g_cur + step;
                             if tentative < *g_score.get(&nkey).unwrap_or(&f32::MAX) {
                                 g_score.insert(nkey, tentative);
@@ -1202,6 +1207,45 @@ impl Collision {
                                 came.insert(nkey, ckey);
                                 floor_of.insert(nkey, nf);
                                 heap.push(Node { f: tentative + h(nc, nr), c: nc, r: nr, fz: nf });
+                            }
+                        }
+                    }
+                }
+
+                // WATER SURFACE TRAVERSAL: swim ACROSS a body of water at its surface (#191). If the
+                // neighbor column is swimmable water whose surface sits roughly level with our current
+                // height (a ground-level pool, or the next cell of one we're already swimming), connect
+                // at that surface — so A* crosses the TOP of a pool instead of diving to the bottom and
+                // back (which fights the controller's buoyancy toward the surface). This makes a
+                // surface pool (e.g. the Halas central pool on the way to the Everfrost line) a
+                // crossable swim rather than a drop to the pool floor the fall-guard refuses.
+                if let Some(water) = &self.water {
+                    // Probe downward for the first swimmable water within a step of the current
+                    // floor — a pool's surface often sits a little BELOW the shore you wade in from
+                    // (Halas's central pool surface is ~5u under the ice), so a 1u probe would miss
+                    // it. Take that water's surface as the swim height.
+                    let mut surf = None;
+                    let mut z = cz - 1.0;
+                    while z >= cz - STEP_H {
+                        if water.is_water(b[0], b[1], z) { surf = water.surface_z(b[0], b[1], z); break; }
+                        z -= 4.0;
+                    }
+                    if let Some(surf) = surf {
+                        let nkey = (nc, nr, qf(surf));
+                        // No chest-clearance requirement (like WATER DESCENT): you swim across open
+                        // water at the surface, and a dry-walk clearance ray from the shore floor
+                        // would snag on the ice/rock lip at the pool's edge — which is exactly what
+                        // pushed A* to dive to the bottom instead. Cheaper than the descent, so A*
+                        // now prefers crossing at the top; the controller collide-and-slides off any
+                        // wall that happens to sit in the water.
+                        if (surf - cz).abs() <= STEP_H && !closed.contains(&nkey) {
+                            let step = (((dc * dc + dr * dr) as f32).sqrt()) * cell + (surf - cz).abs() * 0.5;
+                            let tentative = g_cur + step;
+                            if tentative < *g_score.get(&nkey).unwrap_or(&f32::MAX) {
+                                g_score.insert(nkey, tentative);
+                                came.insert(nkey, ckey);
+                                floor_of.insert(nkey, surf);
+                                heap.push(Node { f: tentative + h(nc, nr), c: nc, r: nr, fz: surf });
                             }
                         }
                     }
@@ -1563,6 +1607,37 @@ mod tests {
         let last = *partial.last().unwrap();
         assert!(last[0] > start[0] + 30.0, "partial route makes real progress toward the goal: {last:?}");
         assert!(last[0] < 100.0, "partial route stops on the near side of the wall: {last:?}");
+    }
+
+    #[test]
+    fn find_path_swims_across_a_surface_pool_instead_of_diving() {
+        // Positions are [north, up, east]. A deep pool bottom under the whole span, with dry shores
+        // laid on top at z=0 at each end, and a surface-level water body between them.
+        let quad = |n0: f32, n1: f32, e0: f32, e1: f32, up: f32| MeshData {
+            positions: vec![[n0, up, e0], [n1, up, e0], [n1, up, e1], [n0, up, e1]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let pool_bottom = quad(0.0, 40.0, 0.0, 160.0, -92.0); // deep floor, east 0..160
+        let near_shore  = quad(0.0, 40.0, 0.0, 40.0, 0.0);    // dry, east 0..40
+        let far_shore   = quad(0.0, 40.0, 120.0, 160.0, 0.0); // dry, east 120..160
+        let mut col = Collision::build(
+            &ZoneAssets { terrain: vec![pool_bottom, near_shore, far_shore], objects: vec![], textures: vec![] }, 8.0);
+        // SUNKEN pool: water surface at z=-8, a few units BELOW the z=0 shores you wade in from
+        // (like Halas's central pool under the ice) — so the swim edge has to probe down to find it.
+        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::flat_below(-8.0))));
+
+        let start = [20.0, 20.0, 0.0];   // near shore
+        let goal  = [140.0, 20.0, 0.0];  // far shore, across the pool
+        let path = col.find_path(start, goal, crate::movement::PLAYER_RADIUS, &[], false)
+            .expect("a swim route across the surface pool should exist");
+        // It reaches the far shore...
+        let last = *path.last().unwrap();
+        assert!((last[0] - 140.0).abs() < 12.0, "ends at the far shore: {last:?}");
+        // ...at the SURFACE (~ -8), never diving toward the -92 pool bottom.
+        let deepest = path.iter().map(|w| w[2]).fold(f32::MAX, f32::min);
+        assert!(deepest > -20.0, "route stays near the surface, not the pool bottom: deepest={deepest} path={path:?}");
     }
 
     #[test]
