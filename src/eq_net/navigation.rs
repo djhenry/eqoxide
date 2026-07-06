@@ -2081,9 +2081,16 @@ impl Navigator {
     /// Send OP_ZONE_CHANGE to request crossing a zone line to `target_zone_id`.
     /// ZoneChange_Struct (88 bytes): char_name[64] + zoneID(u16) + instance_id(u16)
     ///   + y(f32) + x(f32) + z(f32) + zone_reason(u32) + success(i32=0)
-    /// NOTE: zoneID must be the DESTINATION zone, not our current zone — the server
-    /// (ZoneUnsolicited) reads it as the target and finds the matching zone point near our
-    /// tracked position. Sending our current zone made target==current → request cancelled.
+    /// NOTE: send `zoneID = 0`, the "resolve from position" sentinel — NOT the destination zone id.
+    /// Naming the destination (`zoneID != 0`) routes the server into `GetClosestZonePoint(target)`,
+    /// whose water-map `InZoneLine` OBB test (a THIRD geometry source, from the server's own `.wtr`,
+    /// with real z bounds) rejects our position when the server's tracked z is off — tripping the
+    /// MQZone anticheat ("MQZoneUnknownDest") on a perfectly legitimate walk-in crossing, and also
+    /// hard-cancelling if the matched zone_point's target ≠ our named zone. `zoneID = 0` instead
+    /// routes into `GetClosestZonePointWithoutZone` (XY-only, z-agnostic, no OBB, no cheat check);
+    /// the server still resolves the real destination + instance from the matched zone_point, so the
+    /// crossing works exactly the same, just without the false positive (#199, verified vs
+    /// EQEmu zoning.cpp / zone.cpp). `0` is not our current zone id, so it never self-cancels.
     fn send_zone_change_packet(&self, stream: &mut EqStream, gs: &GameState, target_zone_id: u16) {
         // RoF2 ZoneChange_Struct is 100 bytes (rof2_structs.h): char_name[64], zoneID@64,
         // instanceID@66, Unknown068@68, Unknown072@72, y@76, x@80, z@84, zone_reason@88,
@@ -2093,8 +2100,8 @@ impl Navigator {
         let name_bytes = gs.player_name.as_bytes();
         let name_len = name_bytes.len().min(64);
         buf[..name_len].copy_from_slice(&name_bytes[..name_len]);
-        buf[64..66].copy_from_slice(&target_zone_id.to_le_bytes());   // zoneID = destination
-        buf[66..68].copy_from_slice(&0u16.to_le_bytes());             // instanceID = 0
+        buf[64..66].copy_from_slice(&0u16.to_le_bytes());             // zoneID = 0 → server resolves (see NOTE, #199)
+        buf[66..68].copy_from_slice(&0u16.to_le_bytes());             // instanceID = 0 (server resolves)
         // @68..76 Unknown068/Unknown072 left zero.
         buf[76..80].copy_from_slice(&gs.player_y.to_le_bytes());      // y (north)
         buf[80..84].copy_from_slice(&gs.player_x.to_le_bytes());      // x (east)
