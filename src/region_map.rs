@@ -137,6 +137,21 @@ impl RegionMap {
         }
     }
 
+    /// Distinct zone-point indices of every zone-line (`DRNTP`) region in this map — the set of
+    /// exits the current zone has. Each index links to an entrance via the `OP_SendZonepoints`
+    /// `iterator`. Empty for a v1 map (no indices).
+    pub fn zone_line_indices(&self) -> Vec<i32> {
+        let mut v: Vec<i32> = self
+            .nodes
+            .iter()
+            .filter(|n| n.left == 0 && n.right == 0 && n.special == REGION_ZONE_LINE && n.zone_line_index != 0)
+            .map(|n| n.zone_line_index)
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
     /// Height of the water surface directly above a submerged point `(sx, sy, submerged_z)`.
     /// Binary-searches upward for the water→air boundary. Returns `None` if the point isn't in
     /// water, or if it's still water `MAX_UP` above it (unbounded / not a normal surface). Used by
@@ -231,5 +246,12 @@ mod tests {
         let rm = RegionMap::zone_line_below(0.0, 7);
         assert_eq!(rm.zone_line_at(1.0, 2.0, -3.0), Some(7));
         assert_eq!(rm.zone_line_at(1.0, 2.0, 3.0), None);
+    }
+
+    #[test]
+    fn zone_line_indices_enumerates_distinct_indices() {
+        assert_eq!(RegionMap::zone_line_below(0.0, 7).zone_line_indices(), vec![7]);
+        // A water-only map (no zone-line leaves) has no exit indices.
+        assert!(RegionMap::flat_below(0.0).zone_line_indices().is_empty());
     }
 }

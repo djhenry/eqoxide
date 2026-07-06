@@ -398,6 +398,8 @@ pub(crate) struct HttpState {
     pub(crate) entity_positions: EntityPositions,
     pub(crate) entity_ids:       EntityIds,
     pub(crate) zone_points:      ZonePoints,
+    /// Zone collision + region map (shared with the nav thread); read-only here, for zone_exits.
+    pub(crate) shared_collision: crate::assets::SharedCollision,
     pub(crate) zone_cross:       ZoneCrossReq,
     pub(crate) hail:             HailReq,
     pub(crate) say:              SayReq,
@@ -453,6 +455,7 @@ pub fn spawn_camera_server(
     entity_positions: EntityPositions,
     entity_ids:       EntityIds,
     zone_points:      ZonePoints,
+    shared_collision: crate::assets::SharedCollision,
     zone_cross:       ZoneCrossReq,
     hail:             HailReq,
     say:              SayReq,
@@ -505,7 +508,7 @@ pub fn spawn_camera_server(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, zone_cross, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, dialogue, nav_state, dialogue_click, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until, pet_cmd };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, shared_collision, zone_cross, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, dialogue, nav_state, dialogue_click, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until, pet_cmd };
             // Versioned + grouped routes: /v1/<group>/<action>. Each group's `router()` defines
             // relative paths; nesting prefixes them. Shared state is applied once at the end.
             let app = Router::new()
