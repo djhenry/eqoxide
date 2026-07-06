@@ -188,3 +188,137 @@ actually the arrival point in the *other* zone.
 
 See also: none yet on WLD BSP region fragment format in general (0x29 —
 would be a good follow-up topic: `wld-bsp-regions.md`).
+
+## MQZoneUnknownDest false positive on legitimate zone-line crossings (confirmed)
+
+**Symptom:** server logs `/MQZone used at x [..] y [..] z [..] with Unknown
+Destination` even though the crossing succeeds and the coords are right on the
+real `zone_points` trigger (e.g. halas→everfrost trigger `x=-78,y=-693`,
+observed crossing at `x=-68.98,y=-688.05,z=0.00`, only ~10 units of XY error).
+
+**Two totally different validation paths inside `Handle_OP_ZoneChange`,
+selected by whether the client sends `zc->zoneID == 0`:**
+
+- `EQEmu/zone/zoning.cpp:38` (`Handle_OP_ZoneChange`). `zc->x/y/z/zone_reason/
+  success` are logged (`zoning.cpp:56-69`) but **never used for matching** —
+  matching always uses the server's own tracked `Mob::GetPosition()`
+  (`zone/mob.h:678`, updated by the player's ordinary `OP_ClientUpdate`
+  packets), not the payload coordinates.
+- **`zc->zoneID == 0`** ("client doesn't know where it's going") →
+  `Zone::GetClosestZonePointWithoutZone(x,y,z,client,ZONEPOINT_NOZONE_RANGE)`,
+  `zoning.cpp:100`. Implementation `zone/zone.cpp:2093-2129`: pure **XY-only**
+  squared-distance nearest-neighbor across **all** zone_points regardless of
+  target zone (z term is explicitly commented out, `zone.cpp:2117`). **No
+  water-map check at all.** Only failure mode: no zone_point within
+  `sqrt(40000)=200`... actually `max_distance2 = max_distance*max_distance`
+  with `max_distance=ZONEPOINT_NOZONE_RANGE=40000.0f`
+  (`zone/common.h:62`) → effectively unbounded in practice. If it fails, the
+  cheat raised is **`MQZone`/`MQGate`** (not `MQZoneUnknownDest`) plus
+  `SendZoneCancel` — the zone is *rejected*, not silently flagged-but-allowed
+  (`zoning.cpp:110-114`).
+- **`zc->zoneID != 0`** (client names a destination zone) →
+  `Zone::GetClosestZonePoint(glm::vec3(GetPosition()), target_zone_id, this,
+  ZONEPOINT_ZONE_RANGE)`, `zoning.cpp:138`. Implementation
+  `zone/zone.cpp:2031-2085`. This is the path that emits `MQZoneUnknownDest`
+  ("... with Unknown Destination"), and it does so via **two independent
+  false-positive heuristics**, gated on `Zone::HasWaterMap()`:
+  - **No water map for the zone:** flags if the nearest same-target zone_point
+    is `> 400.0f` units away in XY (`zone.cpp:2068`, straight `400.0f`
+    constant, not tied to `ZONEPOINT_ZONE_RANGE`) — this is the "distance
+    heuristic" documented earlier in this file. It's a *warning-only* flag; it
+    does not null out `closest_zp` unless `closest_dist > max_distance2`
+    (`zone.cpp:2078`), so the zone still succeeds.
+  - **Zone HAS a water map (`<zone>.wtr` file present under `maps/water/`):**
+    the 400-unit XY heuristic is **bypassed entirely** and replaced with
+    `!zone->watermap->InZoneLine(glm::vec3(client->GetPosition()))`
+    (`zone.cpp:2068`, first half of the `||`). `WaterMapV2::InZoneLine`
+    (`zone/water_map_v2.cpp:58-60`) checks whether the position falls inside
+    any authored `OrientedBoundingBox` region tagged `RegionTypeZoneLine`
+    (`zone/water_map_v2.h:43`, `zone/oriented_bounding_box.h:23-37`). **This
+    box test is fully 3-dimensional** (`min_z/max_z` are real fields checked
+    inside `ContainsPoint`, `zone/oriented_bounding_box.cpp`) and is a
+    **third, independent geometry source** — separate from both the client's
+    WLD `DRNTP` BSP region and the DB `zone_points` trigger `x/y/z`. **Confirmed:
+    `halas.wtr` exists** (`everquest_rof2/maps/water/halas.wtr`), so Halas→
+    Everfrost crossings go through this stricter box test, not the lenient
+    400-unit heuristic.
+  - Either branch true → `client->cheat_manager.CheatDetected(MQZoneUnknownDest,
+    location)` (`zone.cpp:2070-2071`) where `location` is the same
+    `GetPosition()` passed in — i.e. **the coordinates in the log line are the
+    server's last-tracked position for the player at the moment `OP_ZoneChange`
+    was processed, not anything read out of the `ZoneChange_Struct` payload.**
+    This flag is *advisory only* here too — `closest_zp` is still returned/used
+    (`zone.cpp:2078-2084`) unless it's also beyond `max_distance2`, so the
+    crossing succeeds anyway. Matches the observed symptom exactly: successful
+    crossing + a cheat-log line.
+  - The `.wtr` z-bound check is the prime suspect for the false positive: the
+    observed logged `z [0.00]` is very unlikely to be Halas's real terrain
+    elevation at that spot; if the server's last `OP_ClientUpdate`-derived
+    z for the player was stale/wrong (e.g. sent one tick before reaching the
+    doorway, or a floor-raycast miss at the zone seam) when the server happened
+    to process `OP_ZoneChange`, the OBB's `min_z..max_z` for the authored
+    zone-line volume can reject an XY-perfect position. **Not fully confirmed
+    against eqoxide's own tracked z at the crossing instant** — would need a
+    debug log of the last `send_position_update` z value immediately before
+    `send_zone_change_packet` fires to nail down definitively — but the
+    mechanism (3D OBB test, independent of DB trigger data, gated only on
+    `zone->HasWaterMap()`) is fully confirmed in EQEmu source.
+  - Corroborating changelog: `EQEmu/changelog.txt:3736` — *"JJ: Initial fix
+    for /MQZone detection to reduce false positives"* (11/25/2012) — EQEmu's
+    own history acknowledges this detector is false-positive-prone.
+  - `RuleB(Cheat, EnableMQZoneDetector)` defaults `true`,
+    `RuleI(Cheat, MQZoneExemptStatus)` defaults `-1` = **no status is exempt**
+    (`common/ruletypes.h:1125,1130`) — GMs/admins are not automatically
+    spared either.
+
+**Why the detector's two zc->zoneID branches differ this way (inferred, not
+in source comments):** `GetClosestZonePoint` (the `zoneID != 0`, stricter
+branch) is exactly the code path a `/MQZone <zone>` MacroQuest-style cheat
+would hit, since that cheat names its destination explicitly — hence the rule
+is literally named `MQZone`. `GetClosestZonePointWithoutZone` (the `zoneID ==
+0` branch) has no such check because a client that says "I don't know where
+I'm going" can't be pre-naming a destination to exploit. This asymmetry is
+almost certainly *why* the stricter/buggier check only exists on the
+non-zero-zoneID path.
+
+**Open question, not resolved here — whether the vanilla RoF2 client sends
+`zoneID = 0` or `zoneID = <destination>` on an organic zone-line walk.** Not
+directly recoverable from the (stripped, opcode-table-driven) client
+decompile — see "Client side" section above. Both are structurally valid
+server-side (`zoning.cpp:78` and `:120` are siblings in the same `if`), so
+either could be "native."
+
+## Recommendation for eqoxide (MQZone false positive)
+
+1. **Send `OP_ZoneChange.zoneID = 0`** instead of the resolved destination
+   zone id. This routes the request through `GetClosestZonePointWithoutZone`
+   (`zone.cpp:2093`), which has **no water-map/OBB check and no 400-unit
+   heuristic** — it's a plain nearest-zone_point-by-XY lookup across all
+   zones, tolerant of z entirely (z term explicitly disabled,
+   `zone.cpp:2117`). Given eqoxide is already walking to within ~10 units of
+   the real DB trigger (per the "Client side" fix above), this will reliably
+   resolve to the correct zone_point without risk of the `MQZoneUnknownDest`
+   flag, and without needing to track/send a precise z to satisfy a
+   `.wtr`-authored 3D box that eqoxide has no data for and no way to author
+   itself (eqoxide doesn't parse `.wtr` water-map files at all today).
+   `instanceID`/other fields are unaffected — leave `instanceID=0` (or current
+   instance) as before; the server resolves `target_instance_id` from the
+   matched `zone_point` in the zero-zoneID branch too (`zoning.cpp:104-105`).
+2. This is a **strict improvement, not just cheat-flag suppression**: it also
+   removes the last remaining edge case where a stale/incorrect destination
+   zone_id (e.g. multiple zone_points at slightly different trigger spots
+   heading to different target zones, or an index/iterator mismatch bug) could
+   cause `target_zone_id != zone_point->target_zone_id` and an outright
+   `SendZoneCancel` (`zoning.cpp:141-146`) — that mismatch check is skipped
+   entirely on the zero-zoneID path.
+3. Keep sending real current `x/y/z` in the packet for protocol fidelity/
+   server logging (still unused for matching either way).
+4. If eqoxide ever wants to be defensive against the (much rarer) case where
+   NO zone_point is within `ZONEPOINT_NOZONE_RANGE` at all, that still results
+   in `SendZoneCancel` + `MQZone`/`MQGate` (not `MQZoneUnknownDest`) — but this
+   should not happen given the existing trigger-walk-to logic already gets
+   eqoxide within DB-tolerance of the real trigger.
+5. Do **not** attempt to parse/author `.wtr` water-map zone-line boxes just
+   to satisfy this check — that's solving a false positive the server itself
+   documents as historically flaky (changelog above), and the zero-zoneID path
+   sidesteps it entirely with less client-side work.
