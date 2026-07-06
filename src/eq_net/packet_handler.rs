@@ -53,7 +53,6 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         }
         OP_ZONE_PLAYER_TO_BIND  => apply_bind_respawn(gs, p),
         OP_DAMAGE               => apply_combat_damage(gs, p),
-        OP_BECOME_CORPSE        => apply_become_corpse(gs, p),
         OP_MONEY_ON_CORPSE      => apply_money_on_corpse(gs, p),
         OP_MONEY_UPDATE         => apply_money_update(gs, p),
         OP_WEAR_CHANGE          => apply_wear_change(gs, p),
@@ -1660,23 +1659,6 @@ fn apply_bind_respawn(gs: &mut GameState, payload: &[u8]) {
     gs.update_hp(gs.player_id, full, full); // cur=max → hp_pct=100, consistent with hp/hp_max
     gs.strategy = "Respawning...".into();
     gs.log_msg("zone", "Respawning at bind point");
-}
-
-fn apply_become_corpse(gs: &mut GameState, payload: &[u8]) {
-    // OP_BECOME_CORPSE: server sends on player death (to trigger corpse + rebind).
-    // RoF2 BecomeCorpse_Struct (rof2_structs.h / eq_packet_structs.h — no ENCODE):
-    //   /*00*/ uint32 spawn_id   ← corpse's spawn id at byte 0 (Titanium comment was wrong: no 4-byte prefix)
-    //   /*04*/ float  y
-    //   /*08*/ float  x
-    //   /*12*/ float  z          → total 16 bytes
-    if payload.len() < 4 { return; }
-    let corpse_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-    tracing::info!("EQ: OP_BecomeCorpse corpse_id={}", corpse_id);
-    gs.pending_loot.push_back(corpse_id);
-    if gs.loot_queued_at.is_none() {
-        gs.loot_queued_at = Some(std::time::Instant::now());
-    }
-    gs.log_msg("combat", "Mob left a corpse — auto-looting...");
 }
 
 /// Apply a WearChange: update one equipment slot's material + tint on an entity.

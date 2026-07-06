@@ -200,11 +200,10 @@ pub const OP_SKILL_UPDATE: u16     = 0x004c; // S→C one skill's new value; Ski
 
 // ── Gameplay: looting ─────────────────────────────────────────────────────
 
-/// Server → client when a mob dies and leaves a lootable corpse.
-/// Payload: BecomeCorpse_Struct = spawn_id(u32) + y(f32) + x(f32) + z(f32)
-/// NOTE: OP_BecomeCorpse=0x0000 in patch_RoF2.conf (commented "# Unused?");
-/// keeping current value pending investigation of how RoF2 signals corpse lootability.
-pub const OP_BECOME_CORPSE: u16    = 0x4dbc; // RoF2: NO MATCH IN CONF — needs manual resolution (OP_BecomeCorpse=0x0000 in conf)
+// NOTE: OP_BecomeCorpse is 0x0000 (unused) in patch_RoF2.conf — RoF2 never sends it (the old
+// 0x4dbc constant was the stale Titanium value). Corpse lootability is signalled instead by
+// OP_Death (apply_death), which queues the corpse for auto-loot. There is no OP_BECOME_CORPSE
+// constant on purpose; see apply_death in packet_handler.rs.
 /// Client → server to open a corpse for looting. Payload: corpse spawn_id (u32).
 pub const OP_LOOT_REQUEST: u16     = 0x0adf; // RoF2: OP_LootRequest
 /// Server → client with coin amounts on corpse. MoneyOnCorpse_Struct (20 bytes):
@@ -318,7 +317,9 @@ pub fn respawn_window_reply(payload: &[u8]) -> Option<[u8; 4]> {
 pub const OP_ZONE_CHANGE: u16 = 0x2d18;            // RoF2: OP_ZoneChange
 pub const OP_REQUEST_CLIENT_ZONE_CHANGE: u16 = 0x3fcf; // RoF2: OP_RequestClientZoneChange
 pub const OP_LOGOUT: u16 = 0x4ac6;                 // RoF2: OP_Logout
-pub const OP_LOGOUT_REPLY: u16 = 0x48c2; // RoF2: NO MATCH IN CONF — needs manual resolution (OP_LogoutReply=0x0000 in conf)
+// NOTE: no OP_LOGOUT_REPLY constant — OP_LogoutReply=0x0000 (unused) in patch_RoF2.conf, so RoF2
+// never sends a wire logout reply. Clean shutdown (perform_clean_shutdown) sends OP_Logout and
+// disconnects after a brief flush window rather than waiting for a reply that never arrives.
 pub const OP_GMKICK: u16 = 0x26a7;       // RoF2: OP_GMKick; zone → client, we were booted (e.g. logged in elsewhere)
 pub const OP_CAMP: u16 = 0x28ec;         // RoF2: OP_Camp; client → zone, begin camp; server arms a 29s timer then
                                          // removes the char cleanly (no linkdead). Cancelled by a
