@@ -506,6 +506,7 @@ fn apply_char_inventory(gs: &mut GameState, p: &[u8]) {
             icon:    item.icon,
             charges: (item.stacksize as i32).max(1), // stack quantity lives in stacksize, not charges
             idfile:  item.idfile,
+            click_spell_id: item.click_spell_id,
         });
         off += consumed;
     }
@@ -550,6 +551,7 @@ fn apply_item_packet(gs: &mut GameState, p: &[u8]) {
             icon:    item.icon,
             charges: (item.stacksize as i32).max(1), // stack quantity lives in stacksize, not charges
             idfile:  item.idfile,
+            click_spell_id: item.click_spell_id,
         };
         const ITEM_PACKET_LOOT: u32 = 0x66;
         if packet_type == ITEM_PACKET_LOOT {
@@ -1920,6 +1922,7 @@ mod tests {
         use crate::game_state::InvItem;
         let inv = |slot: i32, id: u32, ch: i32| InvItem {
             slot, item_id: id, name: String::new(), icon: 0, charges: ch, idfile: String::new(),
+            click_spell_id: 0,
         };
         let mut gs = GameState::new();
         // Skin of Milk x20 @23, Bread Cakes x20 @24, Rat Whiskers x1 @25.
@@ -2870,7 +2873,8 @@ mod tests {
         let mut gs = GameState::new();
         // Push a dummy item so we can verify inventory is untouched
         gs.inventory.push(crate::game_state::InvItem {
-            slot: 99, item_id: 1, name: "existing".into(), icon: 1, charges: 1, idfile: "IT1".into()
+            slot: 99, item_id: 1, name: "existing".into(), icon: 1, charges: 1, idfile: "IT1".into(),
+            click_spell_id: 0,
         });
         let payload = 0u32.to_le_bytes().to_vec(); // count = 0
         apply_char_inventory(&mut gs, &payload);

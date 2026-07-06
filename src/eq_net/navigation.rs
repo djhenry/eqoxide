@@ -125,6 +125,23 @@ pub fn build_cast_packet(slot: u32, spell_id: u32, target_id: u32) -> Vec<u8> {
     buf
 }
 
+/// RoF2 item "clicky" cast — activates an item's click effect (teleport ring / port potion, etc.).
+/// Same 44-byte `CastSpell_Struct` as [`build_cast_packet`], but `slot` = `CastingSlot::Item` (22)
+/// and `inventory_slot` carries the real possessions slot of the item (as an `InventorySlot_Struct`)
+/// instead of SLOT_INVALID. `spell_id` is the item's click effect (`ClickEffectStruct.effect`).
+/// Server (common/patches/rof2.cpp): `RoF2ToServerCastingSlot` maps 22→Item 1:1, `RoF2ToServerSlot`
+/// decodes the slot, and `Handle_OP_CastSpell` validates the item at that slot has that click
+/// effect — so both the slot value and the real inventory_slot must be correct. (eqoxide#193)
+pub fn build_item_cast_packet(inventory_slot: u32, spell_id: u32, target_id: u32) -> Vec<u8> {
+    let mut buf = vec![0u8; 44];
+    buf[0..4].copy_from_slice(&22u32.to_le_bytes());   // slot = CastingSlot::Item
+    buf[4..8].copy_from_slice(&spell_id.to_le_bytes()); // item's click effect spell id
+    buf[8..20].copy_from_slice(&rof2_possessions_slot(inventory_slot)); // the item's real slot
+    buf[20..24].copy_from_slice(&target_id.to_le_bytes());
+    // cs_unknown[2] @24..32 = 0; y/x/z_pos @32..44 = 0.0 (already zeroed).
+    buf
+}
+
 /// `MemorizeSpell_Struct` (16 bytes): slot, spell_id, scribing, reduction. Identical layout under
 /// Titanium and RoF2 (verified against EQEmu rof2_structs.h — no ENCODE), opcode 0x217c.
 /// scribing: 0 = scribe a scroll into the spellbook at `slot`; 1 = memorize a known spell into
@@ -1357,6 +1374,22 @@ impl Navigator {
         // matching the real RoF2 client, which self-targets heals/buffs. (eqoxide#95)
         let cast_req = self.cast.lock().unwrap().take();
         if let Some(req) = cast_req {
+          if let Some(item_slot) = req.item_slot {
+            // Item "clicky" cast (teleport ring / port potion, etc.). Resolve the click spell from
+            // the item currently at that wire slot and refuse if it isn't a clicky, so a stale slot
+            // can't fire an unrelated cast. Target: explicit > current > self. (eqoxide#193)
+            let click = gs.inventory.iter().find(|i| i.slot == item_slot as i32)
+                .map(|i| i.click_spell_id).unwrap_or(0);
+            if click == 0 {
+                tracing::info!("EQ: item cast slot={} ignored — no clicky item at that slot", item_slot);
+            } else {
+                let target = req.target_id.filter(|&t| t != 0)
+                    .or(gs.target_id.filter(|&t| t != 0))
+                    .unwrap_or(gs.player_id);
+                stream.send_app_packet(OP_CAST_SPELL, &build_item_cast_packet(item_slot, click, target));
+                tracing::info!("EQ: item cast slot={} spell={} target={}", item_slot, click, target);
+            }
+          } else {
             let spell_id = gs.mem_spells.get(req.gem as usize).copied().unwrap_or(0xFFFF_FFFF);
             if spell_id != 0xFFFF_FFFF {
                 let explicit = req.target_id.filter(|&t| t != 0);
@@ -1378,6 +1411,7 @@ impl Navigator {
             } else {
                 tracing::info!("EQ: cast gem={} ignored — empty gem", req.gem);
             }
+          }
         }
 
         // Scribe a scroll into the spellbook (scribing=0) or memorize a known spell into a gem
@@ -2508,6 +2542,22 @@ mod tests {
         assert_eq!(&p[0..4], &1u32.to_le_bytes(), "slot (gem)");
         assert_eq!(&p[4..8], &93u32.to_le_bytes(), "spell_id");
         assert_eq!(&p[8..20], &[0xFFu8; 12], "inventory_slot = all -1 (no clicky item)");
+        assert_eq!(&p[20..24], &27u32.to_le_bytes(), "target_id");
+        assert_eq!(&p[24..44], &[0u8; 20], "cs_unknown + y/x/z position = 0");
+    }
+
+    #[test]
+    fn item_cast_packet_layout() {
+        // eqoxide#193: item clicky cast — slot = CastingSlot::Item (22), spell = the item's click
+        // effect, inventory_slot = the real possessions slot (Type=0, Slot=n, SubIndex/AugIndex=-1),
+        // target@20. Activate the item at general slot 25 (spell 2512) on target 27.
+        let p = build_item_cast_packet(25, 2512, 27);
+        assert_eq!(p.len(), 44, "RoF2 CastSpell_Struct is 44 bytes");
+        assert_eq!(&p[0..4], &22u32.to_le_bytes(), "slot = CastingSlot::Item");
+        assert_eq!(&p[4..8], &2512u32.to_le_bytes(), "spell_id = item click effect");
+        // inventory_slot @8..20 must equal the possessions-slot encoding for slot 25.
+        assert_eq!(&p[8..20], &rof2_possessions_slot(25), "inventory_slot = real item slot");
+        assert_eq!(&p[12..14], &25i16.to_le_bytes(), "…Slot field (struct @4) carries wire slot 25");
         assert_eq!(&p[20..24], &27u32.to_le_bytes(), "target_id");
         assert_eq!(&p[24..44], &[0u8; 20], "cs_unknown + y/x/z position = 0");
     }

@@ -96,11 +96,27 @@ async fn post_consider(State(s): State<HttpState>, body: Option<Json<ConsiderBod
 }
 
 #[derive(serde::Deserialize)]
-struct CastBody { gem: Option<u8>, spell_id: Option<u32>, target_id: Option<u32> }
+struct CastBody { gem: Option<u8>, spell_id: Option<u32>, target_id: Option<u32>, item_slot: Option<u32> }
 
-/// POST /v1/combat/cast {"gem":0-8} | {"spell_id":N,"target_id":M?}
+/// POST /v1/combat/cast {"gem":0-8} | {"spell_id":N,"target_id":M?} | {"item_slot":S,"target_id":M?}
+/// `item_slot` activates an inventory item's click ("clicky") effect — a teleport ring / port
+/// potion, etc. — at the given RoF2 wire slot (from GET /v1/observe/inventory). (eqoxide#193)
 async fn post_cast(State(s): State<HttpState>, body: Option<Json<CastBody>>) -> (StatusCode, String) {
-    let b = body.map(|Json(b)| b).unwrap_or(CastBody { gem: None, spell_id: None, target_id: None });
+    let b = body.map(|Json(b)| b).unwrap_or(CastBody { gem: None, spell_id: None, target_id: None, item_slot: None });
+    // Item clicky cast: validate the slot holds a clickable item (for a clear error), then queue it.
+    if let Some(slot) = b.item_slot {
+        let clicky = s.inventory.lock().unwrap().iter()
+            .find(|i| i.slot == slot as i32)
+            .map(|i| (i.name.clone(), i.click_spell_id));
+        match clicky {
+            None => return (StatusCode::BAD_REQUEST, format!("no item at slot {slot}")),
+            Some((name, 0)) => return (StatusCode::BAD_REQUEST, format!("'{name}' (slot {slot}) has no clicky effect")),
+            Some((name, spell)) => {
+                *s.cast.lock().unwrap() = Some(CastRequest { gem: 0, target_id: b.target_id, item_slot: Some(slot) });
+                return (StatusCode::OK, format!("item cast queued: '{name}' (slot {slot}, spell {spell})"));
+            }
+        }
+    }
     let mem = s.player_info.lock().unwrap().mem_spells;
     let gem = if let Some(g) = b.gem {
         g
@@ -113,7 +129,7 @@ async fn post_cast(State(s): State<HttpState>, body: Option<Json<CastBody>>) -> 
         return (StatusCode::BAD_REQUEST, "provide {\"gem\":0-8} or {\"spell_id\":N}".into());
     };
     if gem > 8 { return (StatusCode::BAD_REQUEST, "gem must be 0-8".into()); }
-    *s.cast.lock().unwrap() = Some(CastRequest { gem, target_id: b.target_id });
+    *s.cast.lock().unwrap() = Some(CastRequest { gem, target_id: b.target_id, item_slot: None });
     (StatusCode::OK, format!("cast queued (gem {gem})"))
 }
 
