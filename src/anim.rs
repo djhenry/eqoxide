@@ -256,6 +256,13 @@ impl SkinData {
                     && !n.contains("back") && !n.contains("left") && !n.contains("right")
                     && !n.contains("shoot")
             }),
+            // Swim clip (name contains "swim"), used while moving in water (#198). Prefer the
+            // forward swim, not the directional/backstroke variants.
+            "swimming" => self.clips.iter().position(|c| {
+                let n = c.name.to_lowercase();
+                n.contains("swim")
+                    && !n.contains("back") && !n.contains("left") && !n.contains("right")
+            }),
             "sitting" => self.clips.iter().position(|c| {
                 let n = c.name.to_lowercase();
                 n.contains("sit") && !n.contains("swim")
@@ -448,6 +455,7 @@ mod tests {
                 AnimClip { name: "Spider_Running".to_string(),          duration: 0.5, channels: vec![make_channel(0)] },
                 AnimClip { name: "Spider_Walking_Backward".to_string(), duration: 1.0, channels: vec![make_channel(0)] },
                 AnimClip { name: "Spider_Walking_Fast".to_string(),     duration: 0.7, channels: vec![make_channel(0)] },
+                AnimClip { name: "Spider_Swimming".to_string(),         duration: 1.0, channels: vec![make_channel(0)] },
             ],
             rest_translations, rest_rotations, rest_scales,
             ground_probes: vec![], joint_names: vec![],
@@ -532,6 +540,7 @@ mod tests {
         assert_eq!(skin.clip_for_action("walking"),      Some(1), "walking → Spider_Walking");
         assert_eq!(skin.clip_for_action(""),             Some(1), "'' → Spider_Walking (default)");
         assert_eq!(skin.clip_for_action("running"),      Some(2), "running → Spider_Running");
+        assert_eq!(skin.clip_for_action("swimming"),     Some(5), "swimming → Spider_Swimming (#198)");
         // action_skin has no death clip → still returns None (bind-pose fallback).
         assert_eq!(skin.clip_for_action("dead"),         None,    "no death clip → None");
         assert_eq!(skin.clip_for_action("attack"),       Some(1), "unknown → Spider_Walking");
