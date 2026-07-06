@@ -23,7 +23,10 @@ pub(super) fn router() -> Router<HttpState> {
         .route("/spells", get(get_spells))
         .route("/skills", get(get_skills))
         .route("/doors", get(get_doors))
-        .route("/zone_points", get(get_zone_points))
+        .route("/zone_entrances", get(get_zone_entrances))
+        // Deprecated alias for /zone_entrances (its content was always the entrance/arrival list).
+        .route("/zone_points", get(get_zone_entrances))
+        .route("/zone_exits", get(get_zone_exits))
 }
 
 async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
@@ -179,7 +182,45 @@ async fn get_doors(State(s): State<HttpState>) -> Json<Vec<DoorView>> {
     Json(s.doors_shared.lock().unwrap().clone())
 }
 
-/// GET /v1/observe/zone_points — returns all zone exit points received from the server.
-async fn get_zone_points(State(s): State<HttpState>) -> Json<Vec<crate::game_state::ZonePoint>> {
+/// GET /v1/observe/zone_entrances — the zone **entrances** advertised by the server
+/// (`OP_SendZonepoints`): where you *arrive* (in the destination zone's coordinate space) and your
+/// heading when you cross into a zone, keyed by destination `zone_id` + `iterator`. This is NOT
+/// where you go to *leave* the current zone — for that, see `/zone_exits`. (Also served at the
+/// deprecated alias `/zone_points`.)
+async fn get_zone_entrances(State(s): State<HttpState>) -> Json<Vec<crate::game_state::ZonePoint>> {
     Json(s.zone_points.lock().unwrap().clone())
+}
+
+/// GET /v1/observe/zone_exits — the current zone's **exits**: the WLD zone-line regions you navigate
+/// *toward* to leave, in the current zone's coordinate space. Each exit is the same region
+/// `/v1/move/zone_cross` walks to. Per exit: `location` `[x,y,z]` (a point inside the region nearest
+/// the player — position-relative), `zone_id` (destination, or `null` if the WLD region's index
+/// isn't advertised in the entrance list), and `index` (the link to the matching entrance's
+/// `iterator`). Advertised entrances with no WLD region are omitted. Empty when the zone has no
+/// region map (no `.wtr` / v1 map) or no collision is loaded yet.
+async fn get_zone_exits(State(s): State<HttpState>) -> Json<serde_json::Value> {
+    let player = s.player_info.lock().unwrap().clone();
+    let pos = [player.pos_east, player.pos_north, player.pos_up];
+    // index -> destination zone_id, from the advertised entrance list.
+    let dest_of: std::collections::HashMap<i32, u16> = s
+        .zone_points
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|zp| (zp.iterator as i32, zp.zone_id))
+        .collect();
+    let mut exits = Vec::new();
+    if let Some(col) = s.shared_collision.read().unwrap().as_ref() {
+        for index in col.zone_line_indices() {
+            let location = col
+                .find_zone_line_near(Some(index), pos)
+                .map(|(_, p)| serde_json::json!([p[0], p[1], p[2]]));
+            exits.push(serde_json::json!({
+                "index": index,
+                "zone_id": dest_of.get(&index),
+                "location": location,
+            }));
+        }
+    }
+    Json(serde_json::json!(exits))
 }

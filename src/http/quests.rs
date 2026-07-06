@@ -152,6 +152,7 @@ pub(crate) mod tests {
             entity_positions: Arc::new(Mutex::new(HashMap::new())),
             entity_ids: Arc::new(Mutex::new(HashMap::new())),
             zone_points: Arc::new(Mutex::new(Vec::new())),
+            shared_collision: Arc::new(std::sync::RwLock::new(None)),
             zone_cross: Arc::new(Mutex::new(None)),
             hail: Arc::new(Mutex::new(None)),
             say: Arc::new(Mutex::new(None)),
