@@ -48,6 +48,9 @@ pub struct RoF2Item {
     /// Item's click ("clicky") spell id from ClickEffectStruct.effect — 0 if the item has no
     /// clickable effect. Used to activate teleport rings/port potions via an item cast. (eqoxide#193)
     pub click_spell_id: u32,
+    /// Nested bag contents (this item is a container): (bag_sub_index 0-9, sub-item). Empty for
+    /// non-containers. The caller maps each to a flat bag wire slot. (eqoxide#201)
+    pub bag_contents: Vec<(u32, RoF2Item)>,
 }
 
 // ── Fixed struct sizes from rof2_structs.h (pragma pack(1)) ──────────────────
@@ -192,19 +195,26 @@ pub fn parse_rof2_item(buf: &[u8]) -> Option<(RoF2Item, usize)> {
     off = skip(off, QUATERNARY_LEN, len)?;
 
     // ── M. Sub-items (bag contents): uint32 count + (uint32 index + item) × N ─
+    // Each nested sub-item is preceded by its 0-based bag slot index (EQEmu SerializeItem writes
+    // `index` = invbag::SLOT_BEGIN..SLOT_END before each; common/patches/rof2.cpp:6913). Retain
+    // them so bagged items are visible/movable — the caller maps (this item's slot, sub_index) to
+    // a flat bag wire slot. (eqoxide#201)
     if off + 4 > len { return None; }
     let subitem_count = u32a(off);
     off += 4;
+    let mut bag_contents = Vec::new();
     for _ in 0..subitem_count {
         if off + 4 > len { return None; }
+        let sub_index = u32a(off);
         off += 4; // uint32 bag-slot index
         // Recursive: parse the sub-item to get its consumed size.
-        let (_sub, sub_len) = parse_rof2_item(&buf[off..])?;
+        let (sub, sub_len) = parse_rof2_item(&buf[off..])?;
         off += sub_len;
+        bag_contents.push((sub_index, sub));
     }
 
     Some((RoF2Item { slot_type, main_slot, sub_slot, price, merchant_count, stacksize, charges,
-                     id, icon, name, idfile, click_spell_id }, off))
+                     id, icon, name, idfile, click_spell_id, bag_contents }, off))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -318,6 +328,26 @@ pub(crate) mod tests {
         b0[click_start..click_start + 4].copy_from_slice(&(-1i32).to_le_bytes());
         let (it0, _) = parse_rof2_item(&b0).expect("parse");
         assert_eq!(it0.click_spell_id, 0);
+    }
+
+    /// eqoxide#201: a container's nested sub-items (section M) are retained with their bag index.
+    #[test]
+    fn parses_bag_contents_with_sub_index() {
+        // Base fixture ends with subitem_count = 0 (last 4 bytes). Rewrite it to 1 and append one
+        // sub-record: bag index (u32) + a full nested item blob (fixture2, id 2002).
+        let mut bag = fixture();
+        let n = bag.len();
+        bag[n - 4..n].copy_from_slice(&1u32.to_le_bytes()); // subitem_count = 1
+        bag.extend_from_slice(&2u32.to_le_bytes());         // bag sub-index = 2
+        bag.extend_from_slice(&fixture2());                 // nested sub-item
+
+        let (it, consumed) = parse_rof2_item(&bag).expect("parse");
+        assert_eq!(consumed, bag.len(), "consumes container + nested sub-item");
+        assert_eq!(it.bag_contents.len(), 1, "one bag content retained");
+        let (sub_index, sub) = &it.bag_contents[0];
+        assert_eq!(*sub_index, 2, "bag sub-index preserved");
+        assert_eq!(sub.id, 2002, "nested sub-item is fixture2 (id 2002)");
+        assert!(sub.bag_contents.is_empty(), "nested item has no further contents");
     }
 
     #[test]
