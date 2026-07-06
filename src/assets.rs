@@ -953,7 +953,12 @@ impl Collision {
     /// a clear chest-height segment between cell centers.
     /// `avoid` is a set of XY points (nearby NPC positions) the route should skirt — see the
     /// aggro-avoidance note below (#67). Pass `&[]` for a pure geometric route.
-    pub fn find_path(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]]) -> Option<Vec<[f32; 3]>> {
+    /// A* over the walkable-floor grid. `radius` is the clearance the route must keep from geometry
+    /// (smaller threads narrower gaps). When `allow_partial` is true and the goal cell is
+    /// unreachable, returns a path to the nearest-reachable cell toward the goal instead of `None`
+    /// (so a stranded character still makes progress, #188); when false, only a route that reaches
+    /// the goal cell is returned. `None` = no progress possible (truly boxed in).
+    pub fn find_path(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]], allow_partial: bool) -> Option<Vec<[f32; 3]>> {
         use std::collections::BinaryHeap;
         use std::cmp::Ordering;
         if self.cols == 0 || self.rows == 0 { return None; }
@@ -1089,6 +1094,11 @@ impl Collision {
         // A goal-cell node reached at the WRONG tier — kept as a last resort so we never regress to
         // "no route" when the requested tier is unreachable (better a wrong-tier path than none).
         let mut goal_fallback: Option<Key> = None;
+        // Closest-to-goal cell we actually reach, for a partial-path fallback (#188): if the goal
+        // cell itself is unreachable, still walk AS FAR toward it as we can rather than not moving at
+        // all — the walker's re-path loop then makes further incremental progress from there.
+        let mut best_toward: Option<Key> = None;
+        let mut best_toward_h = f32::MAX;
         while let Some(Node { c, r, fz, .. }) = heap.pop() {
             let ckey = (c, r, qf(fz));
             if !closed.insert(ckey) { continue; } // already expanded
@@ -1103,6 +1113,10 @@ impl Collision {
             }
             expanded += 1;
             if expanded > MAX_NODES { break; }
+            // Track the closest-to-goal cell reached (heuristic = straight-line cells to the goal),
+            // for the partial-path fallback below.
+            let hd = h(c, r);
+            if hd < best_toward_h { best_toward_h = hd; best_toward = Some(ckey); }
             let cz = fz;
             let g_cur = *g_score.get(&ckey).unwrap_or(&f32::MAX);
             let a = center(c, r);
@@ -1227,12 +1241,25 @@ impl Collision {
         }
         // Prefer the requested tier; fall back to a wrong-tier goal only if the right tier is
         // unreachable (keeps the old "reach the goal cell at all" behaviour as a floor).
-        let goal_key = match goal_key.or(goal_fallback) {
-            Some(k) => k,
+        let (goal_key, reached_goal) = match goal_key.or(goal_fallback) {
+            Some(k) => (k, true),
             None => {
-                tracing::info!("find_path: no route (expanded={}, cap={}, start_floor={}, goal_floor={})",
-                    expanded, MAX_NODES, start_floor, goal_floor);
-                return None;
+                // Partial-path fallback (#188): the goal cell is unreachable, but if the search got
+                // meaningfully closer (≥1 cell of straight-line progress), walk to the nearest cell
+                // it reached instead of returning "no route". The walker re-paths from there.
+                let progressed = best_toward.is_some() && best_toward_h + 1.0 < h(sc, sr);
+                match best_toward {
+                    Some(bk) if allow_partial && progressed => {
+                        tracing::info!("find_path: partial route toward goal (expanded={}, {:.0}->{:.0} cells from goal)",
+                            expanded, h(sc, sr), best_toward_h);
+                        (bk, false)
+                    }
+                    _ => {
+                        tracing::info!("find_path: no route (expanded={}, cap={}, start_floor={}, goal_floor={})",
+                            expanded, MAX_NODES, start_floor, goal_floor);
+                        return None;
+                    }
+                }
             }
         };
         let mut path = Vec::new();
@@ -1246,7 +1273,11 @@ impl Collision {
             match came.get(&cur) { Some(&p) => cur = p, None => break }
         }
         path.reverse();
-        if let Some(last) = path.last_mut() { *last = [goal[0], goal[1], goal[2]]; }
+        // Snap the final waypoint to the exact goal only when we actually reached the goal cell; a
+        // partial path must end at the reachable cell, not clip toward an unreachable goal.
+        if reached_goal {
+            if let Some(last) = path.last_mut() { *last = [goal[0], goal[1], goal[2]]; }
+        }
         Some(path)
     }
 }
@@ -1337,13 +1368,13 @@ mod tests {
 
         // Dry pit: sealed — the climb's chest ray crosses the cliff face.
         let dry = Collision::build(&assets, 4.0);
-        assert!(dry.find_path(start, goal, 1.0, &[]).is_none(),
+        assert!(dry.find_path(start, goal, 1.0, &[], false).is_none(),
             "dry pit should be sealed (no walkable exit)");
 
         // Flooded to z=9: swim up and haul out onto the bank.
         let mut wet = Collision::build(&assets, 4.0);
         wet.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::flat_below(9.0))));
-        let path = wet.find_path(start, goal, 1.0, &[]);
+        let path = wet.find_path(start, goal, 1.0, &[], false);
         assert!(path.is_some(), "flooded pit must be exitable by swimming up to the bank");
         let last = *path.unwrap().last().unwrap();
         assert!((last[0] - goal[0]).abs() < 8.0 && (last[1] - goal[1]).abs() < 8.0,
@@ -1497,11 +1528,41 @@ mod tests {
         // The direct line (5,5)->(15,5) crosses the wall (north 5 < 14) → blocked.
         assert!(col.segment_blocked([5.0, 5.0, 3.0], [15.0, 5.0, 3.0]));
         // find_path routes AROUND the wall through the northern gap.
-        let path = col.find_path([5.0, 5.0, 0.0], [15.0, 5.0, 0.0], 1.0, &[])
+        let path = col.find_path([5.0, 5.0, 0.0], [15.0, 5.0, 0.0], 1.0, &[], false)
             .expect("a route around the wall should exist");
         let last = *path.last().unwrap();
         assert!((last[0] - 15.0).abs() < 1.5 && (last[1] - 5.0).abs() < 1.5, "ends at goal: {last:?}");
         assert!(path.iter().any(|p| p[1] > 12.0), "path must detour north through the gap: {path:?}");
+    }
+
+    #[test]
+    fn find_path_returns_partial_route_when_goal_is_walled_off() {
+        // 200x200 floor at z=0 (big enough for the 8u nav grid to make real progress).
+        let floor = MeshData {
+            positions: vec![[0.0, 0.0, 0.0], [200.0, 0.0, 0.0], [200.0, 0.0, 200.0], [0.0, 0.0, 200.0]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        // FULL wall at east=100 spanning the whole north extent (0..200) — no gap, so the goal is
+        // sealed off with no route to it.
+        let wall = MeshData {
+            positions: vec![[0.0, 0.0, 100.0], [200.0, 0.0, 100.0], [200.0, 20.0, 100.0], [0.0, 20.0, 100.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let col = Collision::build(&ZoneAssets { terrain: vec![floor, wall], objects: vec![], textures: vec![] }, 8.0);
+        let start = [20.0, 100.0, 0.0];
+        let goal  = [180.0, 100.0, 0.0]; // sealed behind the wall at east=100
+        // No full route exists.
+        assert!(col.find_path(start, goal, 1.0, &[], false).is_none(), "goal is walled off — no full route");
+        // But a partial route toward the goal does (#188): it advances east toward the wall and
+        // stops on the near side (never crossing east=100) instead of returning "no route".
+        let partial = col.find_path(start, goal, 1.0, &[], true).expect("partial route toward the goal");
+        let last = *partial.last().unwrap();
+        assert!(last[0] > start[0] + 30.0, "partial route makes real progress toward the goal: {last:?}");
+        assert!(last[0] < 100.0, "partial route stops on the near side of the wall: {last:?}");
     }
 
     #[test]
@@ -1522,8 +1583,8 @@ mod tests {
             .map(|w| ((w[0] - npc[0][0]).powi(2) + (w[1] - npc[0][1]).powi(2)).sqrt())
             .fold(f32::MAX, f32::min);
 
-        let direct = col.find_path(start, goal, 1.0, &[]).expect("open route exists");
-        let skirt  = col.find_path(start, goal, 1.0, &npc).expect("aggro route still exists (mild penalty)");
+        let direct = col.find_path(start, goal, 1.0, &[], false).expect("open route exists");
+        let skirt  = col.find_path(start, goal, 1.0, &npc, false).expect("aggro route still exists (mild penalty)");
 
         // The plain route runs right past the NPC; the aggro route bows away from it.
         assert!(min_to_npc(&direct) < 10.0, "plain route passes through the NPC: {}", min_to_npc(&direct));
@@ -1627,7 +1688,7 @@ mod tests {
             eprintln!("  start cell center=({ccx:.1},{ccy:.1}) floor@refz={:?}  column={:?}",
                 col.nearest_floor(ccx, ccy, start[2], 20.0, 100.0),
                 col.column_floors(ccx, ccy, start[2], 20.0, 100.0));
-            match col.find_path(start, goal, crate::movement::PLAYER_RADIUS, &[]) {
+            match col.find_path(start, goal, crate::movement::PLAYER_RADIUS, &[], false) {
                 Some(path) => {
                     eprintln!("  find_path: {} waypoints", path.len());
                     for (i, w) in path.iter().enumerate().take(6) {
@@ -1651,11 +1712,11 @@ mod tests {
         // street goal below still probes NONE because that west-gate strip is disconnected from
         // the city center even street→street (B6) — an unreachable GOAL, not a moat problem.
         probe("B moat → west-gate street (goal itself disconnected, see B6)", [-502.3, -141.3, -16.0], [-600.0, -141.0, -5.0]);
-        let within = col.find_path([-502.3, -141.3, -16.0], [-490.0, -100.0, -16.0], crate::movement::PLAYER_RADIUS, &[]);
+        let within = col.find_path([-502.3, -141.3, -16.0], [-490.0, -100.0, -16.0], crate::movement::PLAYER_RADIUS, &[], false);
         eprintln!("  moat floor traversable (start → 40u north @z=-16): {}",
             within.map(|p| format!("{} waypoints", p.len())).unwrap_or_else(|| "NONE".into()));
         for gx in [-560.0f32, -580.0, -600.0] {
-            let r = col.find_path([-502.3, -141.3, -16.0], [gx, -141.0, -8.0], crate::movement::PLAYER_RADIUS, &[]);
+            let r = col.find_path([-502.3, -141.3, -16.0], [gx, -141.0, -8.0], crate::movement::PLAYER_RADIUS, &[], false);
             eprintln!("  moat → street x={gx}: {}",
                 r.map(|p| format!("{} waypoints", p.len())).unwrap_or_else(|| "NONE".into()));
         }
