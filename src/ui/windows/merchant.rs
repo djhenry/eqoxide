@@ -17,21 +17,27 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
         return;
     };
 
-    let footer_h = 26.0;
-    let body_h = (ui.available_height() - footer_h).max(80.0);
+    // Footer as a self-measuring bottom panel; the panels take the exact
+    // remainder — a hardcoded `available - footer_h` split slightly under-
+    // reserves and the window grows a few px every frame (growth loop).
+    egui::TopBottomPanel::bottom(ui.id().with("merchant_footer"))
+        .frame(egui::Frame::none().inner_margin(egui::Margin { top: 3.0, ..Default::default() }))
+        .show_inside(ui, |ui| {
+            ui.horizontal(|ui| {
+                widgets::coin_row(ui, cx.scene.coin);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button(egui::RichText::new("Done").size(11.0)).clicked() {
+                        *cx.acts.trade.lock().unwrap() = Some(crate::http::TradeCmd::Close);
+                    }
+                });
+            });
+        });
 
-    ui.columns(2, |cols| {
-        draw_buy_panel(&mut cols[0], cx, merchant_id, body_h);
-        draw_sell_panel(&mut cols[1], cx, merchant_id, body_h);
-    });
-
-    ui.separator();
-    ui.horizontal(|ui| {
-        widgets::coin_row(ui, cx.scene.coin);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button(egui::RichText::new("Done").size(11.0)).clicked() {
-                *cx.acts.trade.lock().unwrap() = Some(crate::http::TradeCmd::Close);
-            }
+    egui::CentralPanel::default().frame(egui::Frame::none()).show_inside(ui, |ui| {
+        let body_h = ui.available_height();
+        ui.columns(2, |cols| {
+            draw_buy_panel(&mut cols[0], cx, merchant_id, body_h);
+            draw_sell_panel(&mut cols[1], cx, merchant_id, body_h);
         });
     });
 }

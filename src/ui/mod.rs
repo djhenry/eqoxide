@@ -378,6 +378,73 @@ mod tests {
         let _ = std::fs::remove_file(crate::config::config_dir().join("ui_layout___uitest__.json"));
     }
 
+    /// Regression: window sizes must STABILIZE across frames. A body that
+    /// sizes its canvas from `available - <hardcoded footer>` and then draws a
+    /// taller footer overflows its allotment; the window grows to fit, the
+    /// body re-derives from the new size, and the window creeps across the
+    /// screen forever while pinning the render loop (chat grew right, map grew
+    /// down). Bodies must let bottom panels measure themselves.
+    #[test]
+    fn window_sizes_do_not_creep() {
+        let mut ui = UiState::new("__uitest_growth__", None);
+        let acts = actions();
+        let spells = crate::spells::SpellDb::empty();
+        for def in REGISTRY {
+            if !def.transient {
+                ui.sys.layout.set_open(def.id, true);
+            }
+        }
+        let mut scene = SceneState::default();
+        scene.player_name = "Testy".into();
+        scene.merchant_open = Some(42); // exercise the merchant transient too
+        for i in 0..80 {
+            scene.messages.push(crate::scene::LogEntry {
+                kind: "chat".into(),
+                text: format!("chatter line {i} with some width to it"),
+                timestamp: std::time::Instant::now(),
+            });
+        }
+
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 720.0),
+            )),
+            ..Default::default()
+        };
+        let frame = |ui: &mut UiState, ctx: &egui::Context| {
+            let _ = ctx.run(raw.clone(), |ctx| {
+                ui.draw_all(ctx, [1280.0, 720.0], &scene, &spells, &acts, [0.0; 2], [100.0; 2], None, 60.0);
+            });
+        };
+
+        // Warm up (initial placement + first-frame sizing), then snapshot.
+        for _ in 0..5 {
+            frame(&mut ui, &ctx);
+        }
+        let snapshot: Vec<(&str, [f32; 2])> = REGISTRY
+            .iter()
+            .filter_map(|d| ui.sys.layout.observed(d.id).map(|(_, size)| (d.id, size)))
+            .collect();
+        assert!(!snapshot.is_empty(), "warmup produced no window rects");
+
+        // 30 more frames: no window may keep growing.
+        for _ in 0..30 {
+            frame(&mut ui, &ctx);
+        }
+        for (id, before) in snapshot {
+            let (_, after) = ui.sys.layout.observed(id).expect("window vanished");
+            assert!(
+                after[0] - before[0] < 3.0 && after[1] - before[1] < 3.0,
+                "window '{id}' creeps: {before:?} -> {after:?} over 30 frames"
+            );
+        }
+        let _ = std::fs::remove_file(
+            crate::config::config_dir().join("ui_layout___uitest_growth__.json"),
+        );
+    }
+
     #[test]
     fn hotkey_toggles_registered_window() {
         let mut ui = UiState::new("__uitest_hotkey__", None);
