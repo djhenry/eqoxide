@@ -53,6 +53,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
             *cx.acts.cast.lock().unwrap() = Some(crate::http::CastRequest {
                 gem: gem as u8,
                 target_id: None,
+                item_slot: None,
             });
         }
     }

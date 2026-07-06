@@ -156,6 +156,10 @@ pub struct InvItem {
     pub charges: i32,
     /// EQ IDFile (e.g. "IT63") — the held/world model id, used to render the weapon in hand.
     pub idfile:  String,
+    /// Item's click ("clicky") spell id (0 = none). Lets an agent activate a teleport ring / port
+    /// potion via `POST /v1/combat/cast {"item_slot": <this item's slot>}`. (eqoxide#193)
+    #[serde(default)]
+    pub click_spell_id: u32,
 }
 
 /// One item offered by an open merchant (decoded from OP_ItemPacket with PacketType=Merchant,
