@@ -236,6 +236,18 @@ pub fn build_env_damage_packet(player_id: u32, damage: u32, dmgtype: u8) -> Vec<
     buf
 }
 
+/// Accept a translocate offer (#192). The server sends `OP_Translocate` with a `Translocate_Struct`
+/// (92 bytes: ZoneID@0, SpellID@4, Caster[64]@12, y@76, x@80, z@84, Complete@88) as a "do you accept?"
+/// prompt; the client accepts by echoing the SAME struct back with `Complete@88 = 1`. The RoF2 wire
+/// struct isn't transformed, so we just copy the prompt and flip that field. Returns the 92-byte ack.
+pub fn build_translocate_ack(prompt: &[u8]) -> Vec<u8> {
+    let mut ack = vec![0u8; 92];
+    let n = prompt.len().min(92);
+    ack[..n].copy_from_slice(&prompt[..n]);
+    ack[88..92].copy_from_slice(&1u32.to_le_bytes()); // Complete = 1 → accept
+    ack
+}
+
 /// Titanium `PetCommand_Struct` (8 bytes): command(u32), target(u32). e.g. PET_ATTACK + a mob
 /// spawn id sends the player's pet to attack it.
 pub fn build_pet_command(command: u32, target: u32) -> Vec<u8> {
@@ -2122,6 +2134,21 @@ mod tests {
         assert_eq!(u32::from_le_bytes(buf[6..10].try_into().unwrap()), 250, "damage@6");
         assert_eq!(buf[26], 0xFC, "dmgtype@26 (falling)");
         assert_eq!(u16::from_le_bytes(buf[33..35].try_into().unwrap()), 0xFFFF, "constant@33");
+    }
+
+    #[test]
+    fn translocate_ack_echoes_prompt_with_complete_set() {
+        // A 92-byte prompt: ZoneID=30@0, SpellID=1234@4, coords, Complete=0@88.
+        let mut prompt = vec![0u8; 92];
+        prompt[0..4].copy_from_slice(&30u32.to_le_bytes());
+        prompt[4..8].copy_from_slice(&1234u32.to_le_bytes());
+        prompt[80..84].copy_from_slice(&(-76.0f32).to_le_bytes()); // x
+        let ack = build_translocate_ack(&prompt);
+        assert_eq!(ack.len(), 92, "ack is the 92-byte Translocate_Struct");
+        assert_eq!(&ack[0..4], &prompt[0..4], "ZoneID echoed");
+        assert_eq!(&ack[4..8], &prompt[4..8], "SpellID echoed");
+        assert_eq!(&ack[80..84], &prompt[80..84], "dest x echoed");
+        assert_eq!(u32::from_le_bytes(ack[88..92].try_into().unwrap()), 1, "Complete=1 (accept)");
     }
 
     /// Build a minimal Navigator for unit tests that only exercise a single `sync_*`/tick method —
