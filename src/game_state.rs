@@ -162,6 +162,31 @@ pub struct InvItem {
     pub click_spell_id: u32,
 }
 
+/// First flat bag-content wire slot (RoF2 invbag::GENERAL_BAGS_BEGIN). A container in general slot
+/// `p` (23-32) exposes its 10 sub-slots at `251 + (p-23)*10 + sub` for `sub` in 0..9. (eqoxide#201)
+pub const BAG_SLOTS_BEGIN: i32 = 251;
+
+/// Flat bag wire slot for a general-inventory container at `parent_slot` (23-32) holding a sub-item
+/// at `sub_index` (0-9). None for non-general parents or out-of-range indices. (eqoxide#201)
+pub fn bag_wire_slot(parent_slot: i32, sub_index: u32) -> Option<i32> {
+    if (23..=32).contains(&parent_slot) && sub_index < 10 {
+        Some(BAG_SLOTS_BEGIN + (parent_slot - 23) * 10 + sub_index as i32)
+    } else {
+        None
+    }
+}
+
+/// Inverse of [`bag_wire_slot`]: the (parent general slot, sub-index) a flat bag slot decodes to,
+/// or None if `flat` is not a general-bag content slot (251..=350). (eqoxide#201)
+pub fn bag_wire_parent(flat: i32) -> Option<(i32, u32)> {
+    if (BAG_SLOTS_BEGIN..=350).contains(&flat) {
+        let o = flat - BAG_SLOTS_BEGIN;
+        Some((23 + o / 10, (o % 10) as u32))
+    } else {
+        None
+    }
+}
+
 /// One item offered by an open merchant (decoded from OP_ItemPacket with PacketType=Merchant,
 /// sent by the server after a successful OP_ShopRequest). Drives `GET /trade/list` + the HUD
 /// merchant window. `merchant_slot` is the slot to pass to `POST /trade/buy`.
@@ -639,6 +664,33 @@ pub fn split_keywords(text: &str) -> Vec<(String, bool)> {
 #[cfg(test)]
 mod tests {
     use super::{Door, Entity, GameState};
+
+    /// eqoxide#201: the flat bag-slot mapping must round-trip and match the RoF2 numbering
+    /// (GENERAL_BAGS_BEGIN=251, stride 10, parent general slots 23-32).
+    #[test]
+    fn bag_wire_slot_maps_and_round_trips() {
+        use super::{bag_wire_slot, bag_wire_parent};
+        // First general bag (slot 23), sub 0 → 251; sub 9 → 260. Second bag (24) sub 0 → 261.
+        assert_eq!(bag_wire_slot(23, 0), Some(251));
+        assert_eq!(bag_wire_slot(23, 9), Some(260));
+        assert_eq!(bag_wire_slot(24, 0), Some(261));
+        assert_eq!(bag_wire_slot(32, 9), Some(350)); // last general bag, last sub
+        // Out of range → None (not a general container / bad sub-index).
+        assert_eq!(bag_wire_slot(22, 0), None); // worn slot, not a bag parent
+        assert_eq!(bag_wire_slot(33, 0), None); // cursor bags unsupported for move
+        assert_eq!(bag_wire_slot(23, 10), None);
+        // Inverse round-trips for every general bag/sub combination.
+        for parent in 23..=32 {
+            for sub in 0..10u32 {
+                let flat = bag_wire_slot(parent, sub).unwrap();
+                assert_eq!(bag_wire_parent(flat), Some((parent, sub)));
+            }
+        }
+        // Non-bag flats decode to None.
+        assert_eq!(bag_wire_parent(33), None);
+        assert_eq!(bag_wire_parent(250), None);
+        assert_eq!(bag_wire_parent(351), None);
+    }
 
     fn make_entity(id: u32, name: &str, x: f32, y: f32, z: f32, is_npc: bool) -> Entity {
         Entity {
