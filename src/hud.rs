@@ -243,37 +243,87 @@ pub fn draw_nav_debug(
         Some(egui::pos2(sx / ppp, sy / ppp))
     };
 
-    // (a) collision floor grid: ±R around the player, every STEP units.
-    const R: i32 = 96;
-    const STEP: i32 = 8;
+    // Nav grid: cells are 8u (find_path's NAV_CELL). Sample a ±R window around the player.
+    // (a) dots = the cell floor from `nearest_floor` (the WALKER's ground). (c) edges = whether
+    // A* would permit the step to the E/N neighbor — GREEN walkable, RED blocked on grade/wall,
+    // absent = no floor there. This is A*'s real connectivity: where edges stop/redden is the
+    // boundary A* respects, so a green edge crossing a wall = A* ignoring it.
+    const R: i32 = 72;
+    const STEP: i32 = 8;            // = NAV_CELL
     const STEP_UP: f32 = 20.0;
     const MAX_DROP: f32 = 100.0;
-    let mut gx = -R;
-    while gx <= R {
-        let mut gy = -R;
-        while gy <= R {
-            let x = p[0] + gx as f32;
-            let y = p[1] + gy as f32;
-            match col.nearest_floor(x, y, p[2], STEP_UP, MAX_DROP) {
-                Some(fz) => {
-                    if let Some(sp) = on_screen([x, y, fz]) {
-                        let dz = fz - p[2];
-                        let c = if dz > 4.0 { egui::Color32::from_rgb(255, 90, 90) }
-                                else if dz < -4.0 { egui::Color32::from_rgb(80, 160, 255) }
-                                else { egui::Color32::from_rgb(80, 255, 120) };
-                        painter.circle_filled(sp, 2.0, c);
-                    }
-                }
-                None => {
-                    if let Some(sp) = on_screen([x, y, p[2]]) {
-                        painter.circle_stroke(sp, 2.0,
-                            egui::Stroke::new(1.0, egui::Color32::from_gray(90)));
+    // A* per-edge constants (mirror find_path @ src/assets.rs):
+    const STEP_H: f32 = 20.0;
+    const MAX_STEP_DOWN: f32 = 60.0;
+    const MAX_WALK_GRADE: f32 = 1.2;
+    const CHEST: f32 = 3.0;
+
+    let n = (2 * R / STEP + 1) as usize;
+    let cellpos = |i: usize, j: usize| -> [f32; 2] {
+        [p[0] + (-R + i as i32 * STEP) as f32, p[1] + (-R + j as i32 * STEP) as f32]
+    };
+    // Precompute each cell's floor once.
+    let mut fl = vec![vec![None::<f32>; n]; n];
+    for i in 0..n {
+        for j in 0..n {
+            let c = cellpos(i, j);
+            fl[i][j] = col.nearest_floor(c[0], c[1], p[2], STEP_UP, MAX_DROP);
+        }
+    }
+    // (c) A* walkable edges (E + N per cell) — replicate find_path's step-band + grade + chest-ray.
+    let edge_to = |a: [f32; 3], b: [f32; 2]| -> Option<([f32; 3], bool)> {
+        let cz = a[2];
+        let mut chosen: Option<(f32, bool)> = None;
+        for nf in col.column_floors(b[0], b[1], cz, STEP_H, MAX_STEP_DOWN) {
+            if nf - cz > STEP_H || cz - nf > MAX_STEP_DOWN { continue; }
+            let rise = nf - cz;
+            let run = ((b[0] - a[0]).hypot(b[1] - a[1])).max(1e-3);
+            let grade_ok = !(rise > 0.0 && rise / run > MAX_WALK_GRADE);
+            let clear = col.path_clear([a[0], a[1], cz + CHEST], [b[0], b[1], nf + CHEST], 1.0);
+            let walk = grade_ok && clear;
+            if walk { chosen = Some((nf, true)); break; }
+            else if chosen.is_none() { chosen = Some((nf, false)); }
+        }
+        chosen.map(|(nf, w)| ([b[0], b[1], nf], w))
+    };
+    for i in 0..n {
+        for j in 0..n {
+            let Some(fz) = fl[i][j] else { continue; };
+            let a = cellpos(i, j);
+            let ap = [a[0], a[1], fz];
+            for (ni, nj) in [(i + 1, j), (i, j + 1)] {
+                if ni >= n || nj >= n { continue; }
+                let b = cellpos(ni, nj);
+                if let Some((bp, walk)) = edge_to(ap, b) {
+                    if let (Some(sa), Some(sb)) = (on_screen(ap), on_screen(bp)) {
+                        let (c, w) = if walk {
+                            (egui::Color32::from_rgba_unmultiplied(60, 230, 90, 170), 1.0)
+                        } else {
+                            (egui::Color32::from_rgba_unmultiplied(255, 60, 60, 220), 1.6)
+                        };
+                        painter.line_segment([sa, sb], egui::Stroke::new(w, c));
                     }
                 }
             }
-            gy += STEP;
         }
-        gx += STEP;
+    }
+    // (a) cell floor dots (drawn on top of the edges).
+    for i in 0..n {
+        for j in 0..n {
+            let c = cellpos(i, j);
+            match fl[i][j] {
+                Some(fz) => if let Some(sp) = on_screen([c[0], c[1], fz]) {
+                    let dz = fz - p[2];
+                    let col_ = if dz > 4.0 { egui::Color32::from_rgb(255, 90, 90) }
+                              else if dz < -4.0 { egui::Color32::from_rgb(80, 160, 255) }
+                              else { egui::Color32::from_rgb(80, 255, 120) };
+                    painter.circle_filled(sp, 1.6, col_);
+                },
+                None => if let Some(sp) = on_screen([c[0], c[1], p[2]]) {
+                    painter.circle_stroke(sp, 1.6, egui::Stroke::new(1.0, egui::Color32::from_gray(90)));
+                },
+            }
+        }
     }
 
     // (b) A* path to the goal — reproduce find_path's exact decisions (incl. MAX_WALK_GRADE).
