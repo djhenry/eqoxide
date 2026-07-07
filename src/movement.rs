@@ -34,6 +34,18 @@ const MAX_FALL: f32 = 128.0;
 /// the ground") was a placeholder carried over from the pre-controller WASD block (eqoxide#92).
 /// (Exact RoF2 parity of the impulse is worth a decompile/live check; 4u restores a usable jump.)
 pub const JUMP_VELOCITY: f32 = 31.0;
+
+/// Horizontal distance a *running* jump clears to a landing at roughly takeoff height, at
+/// `run_speed` (u/s). The character leaves the ground at `JUMP_VELOCITY` and, ignoring the small
+/// landing-height difference, is airborne for `2·JUMP_VELOCITY/GRAVITY` seconds (up then back to
+/// takeoff height); horizontal reach = airborne_time · run_speed. `find_path` uses this to add
+/// jump-edges across genuine floor gaps no wider than a jump can bridge (eqoxide#190). A landing
+/// that is LOWER than takeoff gives more airborne time, so this is a conservative (minimum) reach.
+pub fn running_jump_reach(run_speed: f32) -> f32 {
+    let air_time = 2.0 * JUMP_VELOCITY / GRAVITY;
+    air_time * run_speed
+}
+
 /// Vertical impulse for a nav auto-hop over a low fence/cart rail. Peak height = v²/(2·GRAVITY);
 /// at 44 that clears ~8u, enough for the low pen fences that block `/goto` (#41). Only used in nav
 /// mode (`MoveIntent::allow_hop`), so it never affects the native WASD jump feel.
