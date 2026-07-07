@@ -536,7 +536,14 @@ fn plan_path(
                 return Some(p);
             }
         }
-        col.find_path(start, goal, PLAYER_RADIUS, avoid, true)
+        // Fallback: no FULL route at any width — walk a PARTIAL route as far toward the goal as A*
+        // can reach (the walker re-paths from the far end). Warn so this degraded routing is visible.
+        let partial = col.find_path(start, goal, PLAYER_RADIUS, avoid, true);
+        if let Some(ref p) = partial {
+            tracing::warn!("nav: no full route from ({:.0},{:.0}) to ({:.0},{:.0}) — walking a PARTIAL route ({} wp) toward it",
+                start[0], start[1], goal[0], goal[1], p.len());
+        }
+        partial
     })();
     let ms = t0.elapsed().as_millis();
     if ms >= SLOW_MS {
@@ -567,7 +574,7 @@ fn plan_path(
             // start cell A* was stuck on) — otherwise it's the same dead spot.
             if p.len() > 1 {
                 p.insert(0, anchor);
-                tracing::info!("nav: start isolated at ({:.0},{:.0},{:.0}) — re-anchored to clean floor ({:.0},{:.0},{:.0})",
+                tracing::warn!("nav: start isolated at ({:.0},{:.0},{:.0}) — re-anchored to clean floor ({:.0},{:.0},{:.0})",
                     start[0], start[1], start[2], ax, ay, af);
                 return Some(p);
             }
@@ -668,9 +675,14 @@ pub struct Navigator {
     stuck_best:       f32,
     stuck_ticks:      u32,
     stuck_i:          usize,
-    /// Consecutive stall-recovery re-paths for the current goal; capped so a truly unreachable
-    /// snag stops instead of re-pathing forever.
+    /// Stall-recovery re-paths WITHOUT forward progress; capped so a truly unreachable snag stops
+    /// instead of re-pathing forever, but reset whenever the walker gets meaningfully closer to the
+    /// goal — so a long cross-zone journey that clears several distinct wedges isn't killed by the
+    /// cap while it's still making progress (#229).
     nav_repaths:      u32,
+    /// Closest straight-line distance to the current goal reached so far; when it drops by
+    /// `REPATH_RESET_DIST` the re-path budget resets (real progress → the last wedge is behind us).
+    nav_best_gdist:   f32,
     /// Downhill back-off (eqoxide#212): when the walker wedges on a slope face, drive the reverse
     /// direction for this many ticks before re-pathing, so the re-plan starts from cleaner ground.
     /// 0 = not backing off.
@@ -810,6 +822,7 @@ impl Navigator {
             stuck_ticks: 0,
             stuck_i: 0,
             nav_repaths: 0,
+            nav_best_gdist: f32::MAX,
             backoff_ticks: 0,
             backoff_dir: [0.0, 0.0],
             controller_view,
@@ -1840,6 +1853,7 @@ impl Navigator {
             self.stuck_best = f32::MAX;
             self.stuck_ticks = 0;
             self.nav_repaths = 0;
+            self.nav_best_gdist = f32::MAX;
             self.backoff_ticks = 0;
             // Route with the native collision radius (1.0, was 2.0): the 2× radius boxed the player
             // out of gaps the native client threads, causing "boxed in by walls" / platform stalls
@@ -1964,6 +1978,17 @@ impl Navigator {
             return;
         }
 
+        // Long-route progress (#229): a distant goto (e.g. zone_cross across a big overland zone)
+        // crosses several tricky spots, each of which can cost a stall-recovery re-path. Reset the
+        // re-path budget whenever we get meaningfully CLOSER to the goal, so the cap counts
+        // CONSECUTIVE failed recoveries at one wedge — not the total over a long journey that is
+        // otherwise progressing fine. Without this the 8-cap killed long crossings partway.
+        const REPATH_RESET_DIST: f32 = 200.0;
+        if gdist < self.nav_best_gdist - REPATH_RESET_DIST {
+            self.nav_best_gdist = gdist;
+            self.nav_repaths = 0;
+        }
+
         // Active downhill back-off (eqoxide#212): after a hard stall we drive the REVERSE aim for a
         // few ticks to slide off a wedged slope face onto cleaner ground, THEN re-path from there.
         // This complements #205's start re-anchoring: back off first, then the (now grade-limited)
@@ -1976,7 +2001,12 @@ impl Navigator {
                 jump:        false,
                 want_swim:   false,
                 speed:       RUN_SPEED,
-                climb:       crate::movement::NAV_CLIMB,
+                // The back-off must move like a HUMAN (native step-up), NOT with the NAV_CLIMB super-
+                // step. Its whole purpose is to slide DOWNHILL off a wedged face; with the 20u nav
+                // climb it would instead scale the unwalkable slope/ridge it's wedged against and
+                // strand itself higher up (#229). climb 0 → the controller uses STEP_UP (2u), so
+                // gravity slides it down the face a player couldn't have climbed in the first place.
+                climb:       0.0,
                 hop:         false,
             });
             if self.backoff_ticks == 0 {
@@ -1987,7 +2017,7 @@ impl Navigator {
                     plan_path(c, [gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], &avoid));
                 if let Some(np) = fresh {
                     if np.len() > 1 {
-                        tracing::info!("NAV: backed off downhill — re-pathing ({} wp, attempt {})",
+                        tracing::warn!("NAV: backed off downhill — re-pathing ({} wp, attempt {})",
                             np.len(), self.nav_repaths);
                         self.path = np;
                         self.path_i = 0;
@@ -2019,11 +2049,11 @@ impl Navigator {
                         self.nav_repaths += 1;
                         self.backoff_ticks = NAV_BACKOFF_TICKS;
                         self.backoff_dir = if dist > 1e-3 { [-dx / dist, -dy / dist] } else { [0.0, 0.0] };
-                        tracing::info!("NAV: no progress near ({:.1},{:.1}) — backing off downhill (attempt {})",
+                        tracing::warn!("NAV: no progress near ({:.1},{:.1}) — backing off downhill (attempt {})",
                             gs.player_x, gs.player_y, self.nav_repaths);
                         return;
                     }
-                    tracing::info!("NAV: stalled (no progress) near ({:.1},{:.1}) — stopping",
+                    tracing::warn!("NAV: stalled (no progress) near ({:.1},{:.1}) — stopping",
                         gs.player_x, gs.player_y);
                     gs.log_msg("zone", "Path stalled — stopped");
                     self.set_nav_state("blocked");
