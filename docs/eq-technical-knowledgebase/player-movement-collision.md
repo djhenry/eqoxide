@@ -85,6 +85,68 @@ entity_z = floor_z + entity_0x138_height_offset;   // eqgame.exe.c:46358-46359
 
 ---
 
+## 4a. Slope / Max Climb Angle — NO explicit grade/angle check exists
+
+Searched the full Ghidra decompile for any slope/grade/angle test (`grep -n
+"slope\|Slope\|grade\|Grade\|steep\|Steep\|climb\|Climb" ghidra/eqgame.exe.c`)
+— **zero hits** relevant to movement (only unrelated "Upgrade/Downgrade
+mercenary" UI strings). There is no dot-product-against-floor-normal test, no
+stored "max walkable slope" constant, and no separate "slide down if too
+steep" branch anywhere in the movement code.
+
+**What actually happens instead** (re-examined `FUN_00506a20`,
+`eqgame.exe.c:160147-160206`, called from the case-`0x17b` step loop):
+- `FUN_00506a20` re-tests the *same* candidate XY point at a shrinking set of
+  z heights, decrementing by the same `_DAT_009c58e8 = 2.0` step constant used
+  by the outer loop (`eqgame.exe.c:160193`), calling `FUN_0048c890` (the raw
+  point/BSP intersection primitive) at each height until it finds a clear one
+  or runs out of candidates (`0.0 < param_4` guards the loop).
+- The outer step loop (`eqgame.exe.c:46259-46368`, documented in §4 above)
+  starts its candidate ladder at `entity_z + 2.0` and steps *down* by 2.0 per
+  iteration, stopping once the remaining candidate value drops to/below
+  `_DAT_009c58a0 = 5.0`.
+
+**So the client has no angle-based slope limit at all — "can't climb this
+hill" is a pure side effect of the 2.0-unit step-height cap interacting with
+however much the floor rises within the horizontal distance covered by one
+movement resolution.** A gentle grade lets the floor probe (§2, foot+1 down
+200) always find a walkable surface within ±2.0u of the previous step, so the
+step loop keeps succeeding every tick and you walk straight up it — a genuine
+50-60° grade in EQ terrain is walkable in the real client if it's smooth
+(no ledge), because each per-tick horizontal delta is small enough that the
+per-tick rise stays under 2.0u. A grade becomes unwalkable only where a
+*single* per-tick horizontal step would need >2.0u of rise to find the next
+floor (i.e., short, steep, and/or "steppy" terrain, or an actual vertical
+ledge) — which is a **step-height-vs-per-tick-distance** relationship, not a
+fixed degree threshold.
+
+**Not fully traced (time-boxed, flag as inferred):** the exact number of step
+iterations the outer loop is allowed to retry per movement resolution (govern
+by the table lookup `puVar6[(int)fVar20 + 0xb]`, `eqgame.exe.c:46304`,
+apparently a per-race/model or per-animation-state value) was not pinned down
+to a concrete constant. This bounds how many consecutive 2.0-unit steps can
+be climbed in a single input frame, which in turn is the real (indirect)
+"max climbable rise" — likely small (a handful of steps), since staircases in
+EQ zones are built from many short risers rather than the client bounding a
+huge single climb.
+
+**Practical corollary for a fixed-grid A\*:** because the true test is
+step-height-vs-move-distance (continuous, per-tick), any constant grade
+threshold picked for an 8-unit grid cell is necessarily an *approximation* of
+the native behavior, not a client-derived constant. A tighter approximation
+than a flat `rise/run` cutoff: treat a cell-to-cell edge as walkable if the
+rise is achievable in `≤ N` 2.0-unit steps where `N ≈ cell_horizontal_dist /
+per_tick_move_dist` (run speed × tick interval) — i.e. **scale the allowed
+rise with the distance being covered**, not a fixed ratio. At `~44 u/s` run
+speed and a `~280 ms` client tick (§8) that's roughly `12 u` of horizontal
+travel per tick, over which the client could climb multiple 2.0u steps if the
+per-tick floor stays within reach — meaning short, punchy grade spikes (a
+low curb, a rock lip) are far more forgiving than the smooth average slope of
+a long hillside. A single blended `rise/run > 1.2` cutoff evaluated over an
+8-unit cell is a reasonable, but not client-exact, stand-in for this.
+
+---
+
 ## 5. Movement and Collision Sequence per Frame
 
 1. Compute desired (x, y, z) from inputs.
@@ -113,6 +175,40 @@ The zone collision runs against the **WLD BSP tree** loaded from `<zone>.wld` (i
 - Zone-bounding floors/walls.
 
 The renderer (EQGraphicsDX9.dll) loads `objects.wld`, `lights.wld`, and the zone wld separately (`EQGraphicsDX9.dll.c:89248-89279`). The physics query (`DAT_015d46a8` vtable call to the world's IntersectRay method) goes against all loaded collision faces including INVIS.
+
+**No `"INVIS"` string literal exists in the RoF2 client decompile** (checked
+`grep -n "INVIS\|invis" ghidra/EQGraphicsDX9.dll.c` and `ghidra/eqgame.exe.c`
+— zero hits); the "INVIS = separate invisible-but-solid faces" model above is
+not a literal client-side name, it's the well-established WLD authoring
+convention (faces with no render material / render_method 0, kept only for
+collision) and is precisely reconstructable from the **wire format bit**
+that actually encodes it: each WLD `DmSpriteDef2` face entry (0x36 fragment)
+carries a per-face flag word where **bit `0x0010` = "PASSABLE" (player can
+walk through this face)**. A face is solid collision iff that bit is
+**clear**, independent of whether it has a visible render material. eqoxide's
+asset server already reconstructs the client's true collision set this way —
+confirmed, not inferred: `eqoxide_asset_server/src/zone.rs:392-399`
+(`load_collision_geometry`, doc comment: *"Uses libeq `Mesh::collision_indices()`,
+which keeps every face whose flag bit 0x0010 is CLEAR — i.e. all SOLID faces,
+INCLUDING invisible-but-solid ones (zone boundaries, invisible walls,
+doorframes) that have no render material, while excluding PASSABLE faces
+(water surfaces, foliage)"*). The render-method-0 "baked as opaque black
+terrain" issue tracked separately (see `eq-invisible-boundary-render.md`
+memory note, asset-server PR#30) is the *rendering* side of the same
+face-set; `is_invisible_render_method` (`eqoxide_asset_server/src/convert/mod.rs:419`)
+is what filters those faces OUT of the visual mesh while `load_collision_geometry`
+keeps them IN the collision mesh — the two pipelines are intentionally
+different views of the same WLD faces, matching how the native client
+renders one geometry set (visible materials only) but collides against a
+larger set (all non-PASSABLE faces).
+
+**eqoxide's own collision-mesh consumer** already builds and prefers this
+baked mesh over the render mesh when present (`src/assets.rs:355`, `:486-520`,
+with an explicit walk-through-invisible-wall regression test at
+`src/assets.rs:1694-1741`) — this is the correct, client-faithful design;
+no further change needed here, only confirmation that the pathfinder queries
+should be run against this collision mesh (not the render/terrain mesh) for
+every ray/step test in §3-4 above.
 
 ---
 
@@ -189,19 +285,26 @@ The native client is position-authoritative: it never receives its own position 
 
 | Parameter | Native RoF2 | eqoxide current | Notes |
 |---|---|---|---|
-| Wall sphere radius | **1.0 unit** | `PLAYER_RADIUS = 2.0` | eqoxide is 2× too large; players will get stuck in narrow gaps the native client navigates |
+| Wall sphere radius | **1.0 unit** | `PLAYER_RADIUS = 1.0` (`src/movement.rs:13`) | Fixed — now matches native exactly |
 | Ground probe origin | foot_z + **1.0** | `floor_z()` from foot_z | eqoxide probes from foot, not 1 above; OK since render floor-ray starts at current z |
 | Ground probe range | **200 units** down | Configurable in `nearest_floor` | Confirm ≥ 200 for tall multi-level zones (Kelethin tree platforms) |
-| Step-up height | **2.0 units** | `STEP_HEIGHT = 3.0` | eqoxide is 1.5× higher; may overstep in staircase seams |
+| Step-up height (controller, per-tick) | **2.0 units** | `STEP_UP = 2.0` (`src/movement.rs:17`) | Fixed — matches native exactly |
+| Step-up height (A\* cell-to-cell) | N/A — native has no single "max climb," see §4a | `STEP_H = 20.0` (`src/assets.rs:1062`) | Deliberately larger than the controller's 2.0: represents a *sequence* of native 2.0u steps across an 8u cell, gated by `MAX_WALK_GRADE` below, not a literal per-tick cap |
+| Slope/grade limit | **none — no angle check exists**; emergent from step-height (2.0u) vs per-tick horizontal distance (§4a) | `rise/run > 1.2` (~50°) flat cutoff | eqoxide's constant-grade cutoff is a reasonable approximation, not a client-derived value; real client's tolerance scales with how far you move per tick, so short steep steps are more forgiving than a long steep grade of the same average angle |
 | Position update interval | **280 ms min** | **150 ms** | eqoxide sends twice as often; server tolerates it but wastes bandwidth |
 | Force-send interval | **1300 ms** | N/A (no keepalive) | Consider adding a keepalive send every ~1–2 s when stationary |
 | Axis-separated slide | At higher-level caller | `path_clear` x/y retry | Architecture matches |
-| Collision geometry | BSP including INVIS faces | Render tris only | INVIS invisible barriers may be missing; can cause walk-through-wall bugs |
+| Collision geometry | WLD faces with PASSABLE bit (0x0010) clear, incl. no-material INVIS faces | `__collision__` GLB mesh when baked (falls back to render tris for legacy/un-rebaked zones) | Fixed — see §7; `Collision::build` (`src/assets.rs:519-529`) already prefers `__collision__`; only un-rebaked zones fall back to render-only |
 
 ---
 
 ## Related Topics
 
-- `opcodes.md` — 0x7dfc = OP_ClientUpdate wire mapping.
-- `spawn-struct.md` — PlayerPositionUpdateClient/Server layout.
-- `eqg-format.md` — zone geometry loading (EQG vs S3D).
+- `swimming-and-fall-damage.md` — water regions, fall-damage self-report, and
+  why entering water is never treated as a fall (relevant to the collision
+  volume when swimming vs walking).
+- `zone-line-crossing.md` — the sibling WLD-BSP-region parser (`DRNTP`) that
+  shares the same region-flag decoding path referenced in `swimming-and-fall-damage.md`.
+- `boats-and-vehicles.md` — the other water-traversal mechanism (not
+  relevant to on-foot collision, but the adjacent "how do you cross this"
+  decision tree).
