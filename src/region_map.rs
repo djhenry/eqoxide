@@ -169,7 +169,8 @@ impl RegionMap {
         // BSP axes (leaf_at swaps to `(sy, sx, sz)`): axis0 = north, axis1 = east, axis2 = z.
         let root = [[min_n, max_n], [min_e, max_e], [zmin, zmax]];
         let mut out = Vec::new();
-        self.collect_zone_line_leaves(1, root, 0, &mut out);
+        let mut obliques: Vec<([f32; 3], f32, bool)> = Vec::new();
+        self.collect_zone_line_leaves(1, root, &mut obliques, 0, &mut out);
         out
     }
 
@@ -186,12 +187,21 @@ impl RegionMap {
         aabb
     }
 
-    fn collect_zone_line_leaves(&self, nn: i32, aabb: [[f32; 2]; 3], depth: u32, out: &mut Vec<(i32, [f32; 3])>) {
+    /// True if `normal` is axis-aligned (captured exactly by the AABB); false = oblique.
+    fn is_axis_aligned(normal: [f32; 3]) -> bool {
+        (0..3).any(|k| normal[k].abs() > 1e-4 && (0..3).all(|j| j == k || normal[j].abs() < 1e-4))
+    }
+
+    /// DFS the BSP once, carrying the AABB (tightened by axis-aligned split planes) AND the list of
+    /// OBLIQUE half-space constraints on the current leaf (which the AABB can't represent). At each
+    /// zone-line leaf, find a point inside its convex region for the O(1) find_zone_line_near lookup.
+    fn collect_zone_line_leaves(&self, nn: i32, aabb: [[f32; 2]; 3],
+        obliques: &mut Vec<([f32; 3], f32, bool)>, depth: u32, out: &mut Vec<(i32, [f32; 3])>) {
         if nn <= 0 || depth > 256 { return; }
         let Some(node) = self.nodes.get((nn - 1) as usize) else { return; };
         if node.left == 0 && node.right == 0 {
             if node.special == REGION_ZONE_LINE && node.zone_line_index != 0 {
-                match self.sample_region_point(node.zone_line_index, aabb) {
+                match self.find_interior_point(node.zone_line_index, aabb, obliques) {
                     Some(p) => out.push((node.zone_line_index, p)),
                     None => tracing::warn!(
                         "region_map: no interior point found for zone-line index {} (AABB {:?}) — /zone_cross to it may fail",
@@ -200,8 +210,48 @@ impl RegionMap {
             }
             return;
         }
-        self.collect_zone_line_leaves(node.left,  Self::tighten_aabb(aabb, node.normal, node.split, true),  depth + 1, out);
-        self.collect_zone_line_leaves(node.right, Self::tighten_aabb(aabb, node.normal, node.split, false), depth + 1, out);
+        let oblique = !Self::is_axis_aligned(node.normal);
+        // left child: dist > 0 (positive side); right child: dist < 0.
+        for (child, positive) in [(node.left, true), (node.right, false)] {
+            let child_aabb = Self::tighten_aabb(aabb, node.normal, node.split, positive);
+            if oblique { obliques.push((node.normal, node.split, positive)); }
+            self.collect_zone_line_leaves(child, child_aabb, obliques, depth + 1, out);
+            if oblique { obliques.pop(); }
+        }
+    }
+
+    /// Find a point inside a zone-line leaf's convex region — the intersection of its AABB (axis-
+    /// aligned planes) and the `obliques` half-spaces. Start at the AABB centre and iteratively
+    /// project onto any violated oblique constraint (re-clamping into the AABB each round), which
+    /// converges to an interior point of the convex region. Validate with `zone_line_at`; if that
+    /// somehow fails, fall back to the old grid sample. Returns `[east, north, z]`. #230
+    fn find_interior_point(&self, index: i32, aabb: [[f32; 2]; 3], obliques: &[([f32; 3], f32, bool)]) -> Option<[f32; 3]> {
+        if (0..3).any(|k| aabb[k][1] < aabb[k][0]) { return None; }
+        // BSP space p = (north, east, z) (leaf_at's (sy,sx,sz) swap).
+        let mut p = [(aabb[0][0] + aabb[0][1]) * 0.5, (aabb[1][0] + aabb[1][1]) * 0.5, (aabb[2][0] + aabb[2][1]) * 0.5];
+        const MARGIN: f32 = 1.0; // aim a little inside the plane, not exactly on it
+        for _ in 0..48 {
+            let mut moved = false;
+            for &(n, s, positive) in obliques {
+                let d = n[0] * p[0] + n[1] * p[1] + n[2] * p[2] + s;
+                let inside = if positive { d > 0.0 } else { d < 0.0 };
+                if !inside {
+                    let n2 = n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
+                    if n2 < 1e-9 { continue; }
+                    let target = if positive { MARGIN } else { -MARGIN };
+                    let t = (target - d) / n2;
+                    p[0] += n[0] * t; p[1] += n[1] * t; p[2] += n[2] * t;
+                    moved = true;
+                }
+            }
+            for k in 0..3 { p[k] = p[k].clamp(aabb[k][0], aabb[k][1]); }
+            if !moved { break; }
+        }
+        let cand = [p[1], p[0], p[2]]; // (east, north, z)
+        if self.zone_line_at(cand[0], cand[1], cand[2]) == Some(index) {
+            return Some(cand);
+        }
+        self.sample_region_point(index, aabb)
     }
 
     /// Grid-sample `aabb` (`[north, east, z]` ranges) for points classifying as zone-line `index`;
@@ -349,5 +399,25 @@ mod tests {
         // A water-only map yields no zone-line region points.
         assert!(RegionMap::flat_below(0.0)
             .zone_line_region_points((-100.0, 100.0, -50.0, 50.0, -30.0, 20.0)).is_empty());
+    }
+
+    #[test]
+    fn find_interior_point_handles_oblique_region() {
+        // Zone-line region = the half-space north+east > 50, bounded by an OBLIQUE plane the AABB
+        // can't represent. The AABB centre (0,0) is on the WRONG side, so constraint projection must
+        // move the candidate into the region (a coarse grid could otherwise miss a thin slice). #230
+        let rm = RegionMap { nodes: vec![
+            // node1: dist = north + east - 50; >0 → leaf2 (zone-line idx 7), <0 → leaf3 (normal)
+            BspNode { normal: [1.0, 1.0, 0.0], split: -50.0, special: 0, left: 2, right: 3, zone_line_index: 0 },
+            BspNode { normal: [0.0; 3], split: 0.0, special: REGION_ZONE_LINE, left: 0, right: 0, zone_line_index: 7 },
+            BspNode { normal: [0.0; 3], split: 0.0, special: 0, left: 0, right: 0, zone_line_index: 0 },
+        ] };
+        let pts = rm.zone_line_region_points((-100.0, 100.0, -100.0, 100.0, -10.0, 10.0));
+        assert_eq!(pts.len(), 1, "one zone-line region");
+        let (idx, p) = pts[0];
+        assert_eq!(idx, 7);
+        // p = [east, north, z]; must be inside the oblique region and classify correctly.
+        assert!(p[0] + p[1] > 50.0, "point inside north+east>50: {p:?}");
+        assert_eq!(rm.zone_line_at(p[0], p[1], p[2]), Some(7), "returned point validates: {p:?}");
     }
 }
