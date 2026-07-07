@@ -148,7 +148,22 @@ pub fn reassemble(cache: &CacheDirs, entry: &FileEntry) -> anyhow::Result<()> {
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(out_path, &bytes)?;
+    // Write to a sibling temp file, then atomically rename into place. A concurrent reader (the
+    // zone-load path parses this same file right after sync) must never observe a half-written
+    // GLB: with an in-place `write`, a large file (qeynos ~50 MB) could be parsed mid-write under
+    // I/O contention → "failed to parse zone glb" → fallback grass. Rename within the same
+    // directory is atomic on the same filesystem, so a reader sees either the old complete file or
+    // the new complete file. The `.part` suffix keeps a crashed/aborted write out of the real path.
+    // (eqoxide#223)
+    let tmp_path = out_path.with_extension(format!(
+        "{}.part",
+        out_path.extension().and_then(|e| e.to_str()).unwrap_or("")
+    ));
+    std::fs::write(&tmp_path, &bytes)?;
+    if let Err(e) = std::fs::rename(&tmp_path, &out_path) {
+        let _ = std::fs::remove_file(&tmp_path); // don't leave a stray .part behind
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -345,6 +360,25 @@ mod manifest_tests {
         reassemble(&cache, &m.files[0]).unwrap();
         let out = std::fs::read(cache.models_dir().join("humanoid.glb")).unwrap();
         assert_eq!(out, whole);
+    }
+
+    #[test]
+    fn reassemble_is_atomic_and_leaves_no_part_file() {
+        // eqoxide#223: reassemble writes via a temp file + atomic rename. After success the final
+        // file is complete and no ".part" temp remains (a leftover would signal a non-atomic path).
+        let dir = tempfile::tempdir().unwrap();
+        let cache = CacheDirs::with_root(dir.path());
+        let (m, whole) = manifest_with(&cache);
+        reassemble(&cache, &m.files[0]).unwrap();
+        let out_path = cache.models_dir().join("humanoid.glb");
+        assert_eq!(std::fs::read(&out_path).unwrap(), whole, "final file is the complete content");
+        // No sibling .part temp left behind.
+        let part = out_path.with_extension("glb.part");
+        assert!(!part.exists(), "no .part temp should remain after a successful reassemble");
+        // Re-running over an existing complete file replaces it atomically (still complete, no part).
+        reassemble(&cache, &m.files[0]).unwrap();
+        assert_eq!(std::fs::read(&out_path).unwrap(), whole);
+        assert!(!part.exists());
     }
 
     #[test]
