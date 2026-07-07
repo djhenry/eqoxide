@@ -1059,7 +1059,13 @@ impl Collision {
             .find_map(|rz| self.nearest_floor(start[0], start[1], rz, STEP_UP, MAX_DROP))
             .or_else(|| [start[2], goal[2], 0.0, -60.0, -120.0].into_iter().find_map(|rz| floor_near(sc, sr, rz)))
             .unwrap_or(start[2]);
-        const STEP_H: f32 = 20.0;        // max CLIMB between adjacent cells (stairs/ledge)
+        const STEP_H: f32 = 20.0;        // vertical SEARCH range for column_floors + per-cell rise cap
+        // What actually enforces "nav climbs only what a WASD player can" (#239) is NOT a per-cell
+        // rise cap (that would reject legitimate smooth ramps) — it's the FEET-level `path_clear`
+        // below: a discrete riser taller than the walker's ~2.5u step blocks the low ray, so A* routes
+        // around it, while a smooth ramp (surface stays under the ray) passes and is governed by
+        // MAX_WALK_GRADE. Paired with the controller's native STEP_UP cap (no more NAV_CLIMB=20), nav
+        // can no longer scale the boundary-wall lips it used to climb onto the high side of.
         const MAX_STEP_DOWN: f32 = 60.0; // max DROP between adjacent cells (fall/hop down a level)
         // Grade limit (eqoxide#212): STEP_H=20 over an 8u cell is a 250% grade. A discrete vertical
         // step that tall is already blocked here by the chest-ray path_clear (its riser is a wall),
@@ -1197,7 +1203,14 @@ impl Collision {
                     }
                     let nkey = (nc, nr, qf(nf));
                     if closed.contains(&nkey) { continue; }
+                    // Reachability rays. The CHEST ray (3u) alone SKIMS OVER a low invisible-boundary
+                    // lip (~2–3u) — A* then routes onto the wall's high side, where the feet-level
+                    // walker snags and strands (#239). Add a FEET-level ray just above the walker's
+                    // real max step-up (STEP_UP + ground-snap ≈ 2.5u): a lip taller than the walker can
+                    // mount blocks the edge, matching what the native client's feet-level sphere does.
+                    const FEET_CLR: f32 = crate::movement::STEP_UP + 0.5;
                     if !self.path_clear([a[0], a[1], cz + CHEST], [b[0], b[1], nf + CHEST], radius) { continue; }
+                    if !self.path_clear([a[0], a[1], cz + FEET_CLR], [b[0], b[1], nf + FEET_CLR], radius) { continue; }
                     let step = (((dc * dc + dr * dr) as f32).sqrt()) * cell + (nf - cz).abs() * 0.5
                         + aggro_cost(b[0], b[1]);
                     let tentative = g_cur + step;
