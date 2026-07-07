@@ -594,10 +594,36 @@ impl App {
             egui_ctx.clone(), egui::ViewportId::ROOT, &*window, None, None, None,
         );
         let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
-        let renderer  = EqRenderer::new(device, queue, surface_config);
+        let mut renderer  = EqRenderer::new(device, queue, surface_config);
         // Resolve models to the cwd-independent XDG cache and sync the `common`
         // set from the asset server before loading character models.
         let cache = crate::asset_sync::CacheDirs::resolve();
+
+        // Background model-sync worker (eqoxide#224): the ~450 MB of playable-race models are no
+        // longer in the startup `common` set — each is its own `charmodel/<key>` set fetched on
+        // demand the first time a spawn of that race is rendered. The renderer sends a race key
+        // here; this worker logs in once and syncs that set, then the lazy loader picks it up.
+        {
+            let (model_tx, model_rx) = std::sync::mpsc::channel::<String>();
+            let url = self.asset_server_url.clone();
+            let user = self.asset_user.clone();
+            let pass = self.asset_pass.clone();
+            std::thread::spawn(move || {
+                let wcache = crate::asset_sync::CacheDirs::resolve(); // same XDG path; cheap
+                let sync = match crate::asset_sync::AssetSync::login(&url, &user, &pass) {
+                    Ok(s) => s,
+                    Err(e) => { tracing::warn!("model-sync worker: login failed: {e}"); return; }
+                };
+                while let Ok(key) = model_rx.recv() {
+                    let set = format!("charmodel/{key}");
+                    match crate::asset_sync::sync_set(&sync, &set, &wcache, &mut |_| {}) {
+                        Ok(()) => tracing::debug!("model-sync worker: synced {set}"),
+                        Err(e) => tracing::warn!("model-sync worker: sync {set} failed: {e}"),
+                    }
+                }
+            });
+            renderer.set_model_sync_tx(model_tx);
+        }
         self.models_path = cache.models_dir();
         self.loading = true;
         *self.load_status.lock().unwrap() = "Connecting to asset server…".to_string();

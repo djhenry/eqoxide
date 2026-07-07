@@ -126,6 +126,13 @@ pub struct EqRenderer {
     /// The common set is fully synced before render begins, so a missing file here is a genuinely
     /// absent race, not one still downloading. (eqoxide#224)
     model_load_tried:        std::collections::HashSet<(&'static str, u8)>,
+    /// Channel to the background model-sync worker: send a race model KEY (e.g. "race_hum") to
+    /// fetch its `charmodel/<key>` set on demand the first time a spawn of that race is seen, so
+    /// the client never downloads the ~450 MB of race models it doesn't need. None until wired in
+    /// (e.g. offline/test). (eqoxide#224)
+    model_sync_tx:           Option<std::sync::mpsc::Sender<String>>,
+    /// Race keys already requested from the sync worker, so each is fetched at most once.
+    model_sync_requested:    std::collections::HashSet<&'static str>,
     pub anim_states:         std::collections::HashMap<u32, EntityAnimState>,
     pub last_view_proj:      [[f32; 4]; 4],
     pub last_cam_pos:        [f32; 3],
@@ -280,6 +287,8 @@ impl EqRenderer {
             fallback_texture_bg,
             gpu_character_models: std::collections::HashMap::new(),
             model_load_tried:     std::collections::HashSet::new(),
+            model_sync_tx:        None,
+            model_sync_requested: std::collections::HashSet::new(),
             anim_states:     std::collections::HashMap::new(),
             last_view_proj: [
                 [1.0, 0.0, 0.0, 0.0],
@@ -500,6 +509,19 @@ impl EqRenderer {
             base
         };
         if !path.exists() {
+            // Race models are fetched ON DEMAND: request the `charmodel/<key>` sync once and retry
+            // loading on a later frame (do NOT mark tried, so it isn't given up on). Archetypes ship
+            // in the always-synced `common` set, so a missing one there is genuinely absent.
+            if key.starts_with("race_") {
+                self.model_load_tried.remove(&(key, gender)); // allow a retry once it's synced
+                if self.model_sync_requested.insert(key) {
+                    if let Some(tx) = &self.model_sync_tx {
+                        let _ = tx.send(key.to_string());
+                        tracing::debug!("renderer: requested on-demand sync of character model '{key}'");
+                    }
+                }
+                return;
+            }
             tracing::warn!("renderer: character model '{key}' (gender {gender}) absent — that spawn won't render");
             return;
         }
@@ -511,6 +533,12 @@ impl EqRenderer {
             }
             Err(e) => tracing::error!("renderer: failed to load character model '{key}': {e}"),
         }
+    }
+
+    /// Wire the renderer to the background model-sync worker so missing race models are fetched on
+    /// demand (see `ensure_character_model`). Called once after the worker thread is spawned. (#224)
+    pub fn set_model_sync_tx(&mut self, tx: std::sync::mpsc::Sender<String>) {
+        self.model_sync_tx = Some(tx);
     }
 
     /// Upload one `ModelAsset` to the GPU as a `GpuModel` (skinned when it has a
