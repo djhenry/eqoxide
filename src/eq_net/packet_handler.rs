@@ -1801,6 +1801,7 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
         cur_hp:         info.cur_hp as i32,
         max_hp:         100, // RoF2 spawn has no separate max_hp; treat as percent
         race:           eq_race_to_code(info.race).to_string(),
+        floating:       crate::eq_net::protocol::is_boat_race(info.race),
         heading:        info.heading,
         dead:           false,
         equipment:      info.equipment,
@@ -1908,7 +1909,7 @@ mod tests {
             x: 0.0, y: 0.0, z: 0.0, hp_pct, cur_hp: 100, max_hp: 100,
             race: String::new(), heading: 0.0, dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
-            face: 0, hairstyle: 0, haircolor: 0, animation: 0,
+            face: 0, hairstyle: 0, haircolor: 0, animation: 0, floating: false,
         }
     }
 
@@ -3184,7 +3185,7 @@ mod tests {
         // Register an NPC entity with id=42
         gs.entities.insert(42, Entity {
             spawn_id: 42, name: "Orc Pawn".into(),
-            x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100,
+            x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100, floating: false,
             level: 5, is_npc: true, gender: 0, race: "ORC".into(),
             cur_hp: 50, max_hp: 100, hp_pct: 50.0,
             dead: false,

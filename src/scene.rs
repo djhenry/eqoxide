@@ -32,6 +32,8 @@ pub struct Billboard {
     /// Helm material + show-helm flag, for hiding hair shells under a worn helm.
     pub helm:      u32,
     pub showhelm:  u8,
+    /// Boat/ship: floats on the water surface, exempt from the render floor-snap (#194).
+    pub floating:  bool,
 }
 
 /// A door to render this frame. Positions are in client convention [east=x, north=y, up=z].
@@ -221,6 +223,7 @@ impl SceneState {
                 haircolor: 0,
                 helm:      0,
                 showhelm:  0,
+                floating:  false,
             });
         }
 
@@ -275,6 +278,7 @@ impl SceneState {
                 haircolor: e.haircolor,
                 helm:      e.helm as u32,
                 showhelm:  e.showhelm,
+                floating:  e.floating,
             }
         }).collect();
 
@@ -426,7 +430,7 @@ mod tests {
             race: "GNL".into(),
             heading: 0.0,
             dead: false,
-            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0, floating: false,
             face: 0, hairstyle: 0, haircolor: 0,
             animation: 0,
         });
@@ -511,7 +515,7 @@ mod tests {
             race: String::new(),
             heading: 0.0,
             dead: false,
-            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0, floating: false,
             face: 0, hairstyle: 0, haircolor: 0,
             animation: 0,
         });
@@ -550,7 +554,7 @@ mod tests {
             race: String::new(),
             heading: 0.0,
             dead: false,
-            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0, floating: false,
             face: 0, hairstyle: 0, haircolor: 0,
             animation: 0,
         });
@@ -572,7 +576,7 @@ mod tests {
             spawn_id: 5, name: "x".into(), level: 1, is_npc: true,
             x: 0.0, y: 0.0, z: 0.0, hp_pct: 100.0, cur_hp: 1, max_hp: 1,
             race: "HUM".into(), heading: 0.0, dead: false,
-            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0, floating: false,
             face: 0, hairstyle: 0, haircolor: 0,
             animation: 0,
         };
@@ -592,7 +596,7 @@ mod tests {
             spawn_id: 5, name: "x".into(), level: 1, is_npc: true,
             x: 0.0, y: 0.0, z: 0.0, hp_pct: 100.0, cur_hp: 1, max_hp: 1,
             race: "HUM".into(), heading: 0.0, dead: false,
-            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 1, helm: 0, showhelm: 0,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 1, helm: 0, showhelm: 0, floating: false,
             face: 0, hairstyle: 0, haircolor: 0,
             animation: 0,
         };
