@@ -121,6 +121,11 @@ pub struct EqRenderer {
     /// Character models keyed by (archetype, gender) — gender 0 = male, 1 = female.
     /// Female variants are loaded from `<archetype>_f.glb` when present.
     pub gpu_character_models: std::collections::HashMap<(&'static str, u8), crate::gpu::GpuModel>,
+    /// (key, gender) whose GLB we've already tried to load — so a lazily-loaded model (or a race
+    /// with no baked model file) is attempted exactly once, not re-stat/re-warned every frame.
+    /// The common set is fully synced before render begins, so a missing file here is a genuinely
+    /// absent race, not one still downloading. (eqoxide#224)
+    model_load_tried:        std::collections::HashSet<(&'static str, u8)>,
     pub anim_states:         std::collections::HashMap<u32, EntityAnimState>,
     pub last_view_proj:      [[f32; 4]; 4],
     pub last_cam_pos:        [f32; 3],
@@ -274,6 +279,7 @@ impl EqRenderer {
             texture_bind_groups: vec![],
             fallback_texture_bg,
             gpu_character_models: std::collections::HashMap::new(),
+            model_load_tried:     std::collections::HashSet::new(),
             anim_states:     std::collections::HashMap::new(),
             last_view_proj: [
                 [1.0, 0.0, 0.0, 0.0],
@@ -457,67 +463,16 @@ impl EqRenderer {
     /// Models with valid skins (joint_count ≤ 128) are loaded as Skinned; others as Static.
     /// Missing models fall back to billboard rendering.
     /// `_assets_path` is unused (everything now comes from the cache); kept for call-site stability.
+    /// Point the renderer at the model cache and load the small always-needed assets (weapons).
+    /// Character models themselves are NOT loaded here anymore — the ~45 archetype + per-race GLBs
+    /// (~457 MB) used to be parsed and uploaded eagerly at startup, blocking the loading screen and
+    /// pinning all of them in VRAM. They now load on demand the first time a visible spawn needs one
+    /// (see `ensure_character_model`, driven per-frame from `render_frame`), so startup no longer
+    /// waits on them and GPU memory scales with the races actually present. (eqoxide#224)
     pub fn load_character_models(&mut self, models_dir: &std::path::Path, _assets_path: &std::path::Path) {
-        use crate::models::ModelAsset;
         // Worn-armor textures + held-weapon S3Ds come from the asset-server cache ("gameequip" set),
         // not ~/eq_assets. Weapon loading (ensure_weapon) reads from here too.
         self.assets_path = models_dir.to_path_buf();
-
-        const ARCHETYPES: &[&str] = &[
-            "humanoid", "elf", "dwarf", "gnoll", "skeleton", "zombie",
-            "creature", "bear", "rat", "snake", "frog", "wasp",
-            "wolf", "bat", "bird", "worm", "fish", "boat",
-        ];
-
-        for &key in ARCHETYPES {
-            let gltf_path = models_dir.join(format!("{}.glb", key));
-            let asset = if gltf_path.exists() {
-                match ModelAsset::load(&gltf_path) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        tracing::error!("renderer: glTF load failed for '{}': {}", key, e);
-                        continue;
-                    }
-                }
-            } else {
-                tracing::error!("renderer: no GLB found for archetype '{}' at {}", key, gltf_path.display());
-                continue;
-            };
-
-            // Build the male model (gender 0) plus a female variant (gender 1) from
-            // `<archetype>_f.glb` when present. Each is stored under (archetype, gender).
-            let mut variants: Vec<(u8, ModelAsset)> = vec![(0, asset)];
-            let female_path = models_dir.join(format!("{}_f.glb", key));
-            if female_path.exists() {
-                match ModelAsset::load(&female_path) {
-                    Ok(fa) => variants.push((1, fa)),
-                    Err(e) => tracing::warn!("renderer: female glTF load failed for '{}': {}", key, e),
-                }
-            }
-            for (gender, asset) in variants {
-                let model = self.build_character_model(key, asset);
-                self.gpu_character_models.insert((key, gender), model);
-            } // gender variants
-        }
-
-        // Per-race character models (`race_<code>.glb`): each maps to exactly one
-        // race+gender, the gender baked into the code (see `models::race_model_basename`).
-        // There is no look-alike fallback — a race whose model file is absent simply
-        // does not render, so log each missing one ONCE here rather than per frame.
-        for &code in crate::models::PLAYABLE_RACE_MODELS {
-            let path = models_dir.join(format!("{code}.glb"));
-            if !path.exists() {
-                tracing::error!("renderer: missing character model '{code}.glb' — that race will not render");
-                continue;
-            }
-            match ModelAsset::load(&path) {
-                Ok(asset) => {
-                    let model = self.build_character_model(code, asset);
-                    self.gpu_character_models.insert((code, 0), model);
-                }
-                Err(e) => tracing::error!("renderer: failed to load character model '{code}.glb': {e}"),
-            }
-        }
 
         let weapons_glb = models_dir.join("weapons.glb");
         if weapons_glb.exists() {
@@ -525,6 +480,36 @@ impl EqRenderer {
                 Ok((m, t)) => { self.weapon_tex = t; self.weapon_lib = m; }
                 Err(e) => tracing::warn!("weapons: load {} failed: {}", weapons_glb.display(), e),
             }
+        }
+    }
+
+    /// Lazily load + upload one character model (archetype or `race_<code>`) on first use, keyed by
+    /// `(key, gender)` from `models::character_model_key`. Idempotent and attempted at most once:
+    /// the `(key, gender)` is recorded whether the load succeeds, fails, or the GLB is absent, so a
+    /// missing model isn't re-stat/re-logged every frame. `gender == 1` prefers `<key>_f.glb` and
+    /// falls back to the base `<key>.glb` (matching the female→male lookup fallback). The common set
+    /// is fully synced before rendering, so a missing file is a genuinely absent race. (eqoxide#224)
+    pub fn ensure_character_model(&mut self, key: &'static str, gender: u8) {
+        if self.gpu_character_models.contains_key(&(key, gender)) { return; }
+        if !self.model_load_tried.insert((key, gender)) { return; } // already attempted
+        let base = self.assets_path.join(format!("{key}.glb"));
+        let path = if gender == 1 {
+            let f = self.assets_path.join(format!("{key}_f.glb"));
+            if f.exists() { f } else { base }
+        } else {
+            base
+        };
+        if !path.exists() {
+            tracing::warn!("renderer: character model '{key}' (gender {gender}) absent — that spawn won't render");
+            return;
+        }
+        match crate::models::ModelAsset::load(&path) {
+            Ok(asset) => {
+                let model = self.build_character_model(key, asset);
+                self.gpu_character_models.insert((key, gender), model);
+                tracing::debug!("renderer: lazily loaded character model '{key}' (gender {gender})");
+            }
+            Err(e) => tracing::error!("renderer: failed to load character model '{key}': {e}"),
         }
     }
 
@@ -886,6 +871,32 @@ impl EqRenderer {
         dt:         f32,
     ) {
         use crate::gpu::GpuModel;
+
+        // Lazy character-model loading (eqoxide#224): parse + upload the models that the entities
+        // about to be DRAWN actually need — a few per frame — instead of all ~45 at startup. The
+        // player's own model is prioritized so the local avatar is never a no-show. Bounded per
+        // frame so a crowd of new races doesn't hitch; unloaded ones simply don't render this frame
+        // and fill in over the next few frames (then stay cached). GPU memory tracks present races.
+        {
+            const LOADS_PER_FRAME: usize = 2;
+            let dd2 = crate::pass::ENTITY_DRAW_DIST * crate::pass::ENTITY_DRAW_DIST;
+            let mut needed: Vec<(&'static str, u8)> = Vec::with_capacity(scene.billboards.len() + 1);
+            needed.push(crate::models::character_model_key(&scene.player_race, scene.player_gender));
+            for b in &scene.billboards {
+                let d = [b.pos[0] - cam_target[0], b.pos[1] - cam_target[1], b.pos[2] - cam_target[2]];
+                if d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > dd2 { continue; }
+                needed.push(crate::models::character_model_key(&b.race, b.gender));
+            }
+            let mut budget = LOADS_PER_FRAME;
+            for (key, slot) in needed {
+                if budget == 0 { break; }
+                if self.model_by_key(key, slot).is_some() || self.model_load_tried.contains(&(key, slot)) {
+                    continue;
+                }
+                self.ensure_character_model(key, slot);
+                budget -= 1;
+            }
+        }
 
         // Animate NPCs and player (player uses reserved id=0).
         //
