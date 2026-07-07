@@ -39,13 +39,14 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_SPAWN_DOOR           => apply_spawn_doors(gs, p),
         OP_MOVE_DOOR            => apply_move_door(gs, p),
         OP_REQUEST_CLIENT_ZONE_CHANGE => {
+            // The actual response (OP_ZONE_CHANGE with the server's real zone_id, or a same-zone
+            // teleport) is sent by the gameplay.rs handler for this opcode. Here we only surface it
+            // in the message log. (Previously set gs.pending_server_zone, which the nav thread
+            // re-answered with a zoneID=0 packet → misroute; removed for #235.)
             if p.len() >= 4 {
                 let zone_id = u16::from_le_bytes([p[0], p[1]]);
                 let instance_id = u16::from_le_bytes([p[2], p[3]]);
                 tracing::info!("EQ: OP_REQUEST_CLIENT_ZONE_CHANGE → zone_id={zone_id} instance={instance_id} ({} bytes)", p.len());
-                if zone_id != 0 && zone_id != gs.zone_id {
-                    gs.pending_server_zone = Some(zone_id);
-                }
             } else {
                 tracing::info!("EQ: OP_REQUEST_CLIENT_ZONE_CHANGE ({} bytes)", p.len());
             }

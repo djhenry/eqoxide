@@ -313,9 +313,6 @@ pub struct GameState {
     pub zone_name: String,
     pub zone_id: u16,
     pub zone_changed: bool,
-    /// Zone id the server told us to move to (OP_RequestClientZoneChange, e.g. a portal
-    /// door). The nav thread drains this and initiates the normal zone-change handshake.
-    pub pending_server_zone: Option<u16>,
     pub safe_x: f32,
     pub safe_y: f32,
     pub safe_z: f32,
