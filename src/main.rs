@@ -31,6 +31,8 @@ OPTIONS:
                            Omit to use the default ~/.config/eqoxide/config.yaml.
     --testzone             Run the renderer offline (no server) for asset/zone debugging.
     --profile              Enable the per-phase frame-timing HUD overlay.
+    --nav-debug            Show the navmesh/pathfinding debug overlay at startup (collision floor
+                           grid + live A* path to the current goal). Toggle at runtime with F11.
     --api-port <N>         Bind the agent HTTP API to exactly TCP port N (1-65535), instead of
                            scanning upward from the config base port. The launch's API is
                            disabled if N is already in use. Use a port you've reserved via a
@@ -40,6 +42,7 @@ OPTIONS:
     let args: Vec<String> = std::env::args().collect();
     let mut testzone_mode = false;
     let mut profile_flag  = false;
+    let mut nav_debug_flag = false;
     let mut login_cfg_arg: Option<String> = None;
     let mut api_port_arg: Option<u16> = None;
     let mut idx = 1; // skip argv[0] (program name)
@@ -48,6 +51,7 @@ OPTIONS:
         match arg {
             "--testzone" => testzone_mode = true,
             "--profile"  => profile_flag  = true,
+            "--nav-debug" => nav_debug_flag = true,
             "-h" | "--help" => { print!("{USAGE}"); std::process::exit(0); }
             // accept both "--config <value>" and "--config=<value>"
             _ if arg == "--config" || arg.starts_with("--config=") => {
@@ -435,6 +439,7 @@ OPTIONS:
         shared_collision,
         app_player_info,
         testzone_mode,
+        nav_debug_flag,
         shutdown.clone(),
         app_cfg.eq_ui_dir,
         asset_server_url,
