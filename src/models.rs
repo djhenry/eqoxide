@@ -680,6 +680,7 @@ pub fn race_to_archetype(race: &str) -> &'static str {
         "IKS" | "VAH" | "BAR" | "TRL" | "OGR" | "DRK"  => "humanoid",
         "ELF" | "HIE" | "HEF" | "DKE"                   => "elf",
         "DWF"                                            => "dwarf",
+        "SHP"                                            => "boat",   // boats/ships (#194)
         "GNL" | "KOB" | "GOB" | "ORC"                   => "gnoll",
         "SKE"                                            => "skeleton",
         "ZOM"                                            => "zombie",
@@ -739,6 +740,9 @@ pub fn archetype_scale(archetype: &str) -> f32 {
         "worm"     =>  3.5,  // Worm:            → ~1.5 EQ units
         "fish"     =>  0.18, // Fish:            → ~1.2 EQ units
         "bear"     =>  8.0,  // Panda bear:      → ~5 EQ units
+        // Boats/ships: the EQG model is already authored in EQ units (rowboat ~10u tall), so
+        // render at ~native size rather than shrinking to a character height (#194).
+        "boat"     =>  1.0,
         _          =>  6.0,
     }
 }

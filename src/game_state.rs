@@ -47,6 +47,9 @@ pub struct Entity {
     pub haircolor: u8,
     /// Server animation state (Animation::Standing=100, Sitting=110, Crouching=111, etc.)
     pub animation: u32,
+    /// True for boat/ship races: they float on the water surface and are exempt from the render
+    /// floor-snap (matching the server's `Mob::FixZ` boat skip) so they don't sink (#194).
+    pub floating: bool,
 }
 
 impl Entity {
@@ -709,7 +712,7 @@ mod tests {
             dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
             face: 0, hairstyle: 0, haircolor: 0,
-            animation: 0,
+            animation: 0, floating: false,
         }
     }
 

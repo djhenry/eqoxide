@@ -466,7 +466,7 @@ impl EqRenderer {
         const ARCHETYPES: &[&str] = &[
             "humanoid", "elf", "dwarf", "gnoll", "skeleton", "zombie",
             "creature", "bear", "rat", "snake", "frog", "wasp",
-            "wolf", "bat", "bird", "worm", "fish",
+            "wolf", "bat", "bird", "worm", "fish", "boat",
         ];
 
         for &key in ARCHETYPES {

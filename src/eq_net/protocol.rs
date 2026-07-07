@@ -705,7 +705,20 @@ pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
 
 // ── Race ID → renderer code mapping ────────────────────────────────────────
 
+/// True for boat/ship spawn races (EQEmu common/races.h): Ship=72, Launch=73, GhostShip=114,
+/// Boat=141, DiscordShip=404, Rowboat=502, Boat2=533, MerchantShip=550, PirateShip=551,
+/// GhostShip2=552. These are `GravityBehavior::Floating` server-side — they ride the water surface
+/// and must be exempt from the client's floor-snap so they don't sink (the server's `Mob::FixZ`
+/// skips them too, zone/waypoints.cpp). #194.
+pub fn is_boat_race(race_id: u32) -> bool {
+    matches!(race_id, 72 | 73 | 114 | 141 | 404 | 502 | 533 | 550 | 551 | 552)
+}
+
 pub fn eq_race_to_code(race_id: u32) -> &'static str {
+    // Boats/ships render as the "boat" archetype (a real ship model), not a HUM placeholder (#194).
+    if is_boat_race(race_id) {
+        return "SHP";
+    }
     match race_id {
         // Playable races
         1 => "HUM", 2 => "BAR", 3 => "ERU", 4 => "ELF", 5 => "HIE", 6 => "DKE",
@@ -1246,6 +1259,18 @@ mod tests {
         assert_eq!(eq_race_to_code(5), "HIE"); // High Elf
         assert_eq!(eq_race_to_code(7), "HEF"); // Half Elf
         assert_ne!(eq_race_to_code(5), eq_race_to_code(7));
+    }
+
+    #[test]
+    fn test_is_boat_race() {
+        // Ferry + rowboat + variant ship races float (#194).
+        for r in [72u32, 73, 114, 141, 404, 502, 533, 550, 551, 552] {
+            assert!(is_boat_race(r), "race {r} should be a boat");
+        }
+        // Humanoids and other NPCs don't.
+        for r in [1u32, 2, 5, 71, 74, 128, 501, 503, 9999] {
+            assert!(!is_boat_race(r), "race {r} should NOT be a boat");
+        }
     }
 
     #[test]
