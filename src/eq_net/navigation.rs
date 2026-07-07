@@ -495,6 +495,13 @@ const NAV_HOP_TICKS: u32 = 6;
 /// On a hard stall (NAV_STUCK_TICKS), drive the reverse (downhill) direction for this many ticks
 /// before re-pathing — long enough to clear a wedged slope-face start (~150 ms/tick). (eqoxide#212)
 const NAV_BACKOFF_TICKS: u32 = 3;
+/// A path segment longer than this (horizontal) is a find_path JUMP-EDGE, not a walk — normal
+/// adjacent nav cells are ≤ 8·√2 ≈ 11.3u apart, jump-edges span ≥ 16u across a real gap. The walker
+/// asks the controller to jump when traversing such a segment. (eqoxide#190)
+const JUMP_SEG_MIN: f32 = 12.0;
+/// Only fire the jump while within this of the takeoff waypoint — so the leap starts grounded at
+/// the near edge and does NOT re-trigger after landing (just under the 8u nav cell). (eqoxide#190)
+const JUMP_TAKEOFF_DIST: f32 = 7.0;
 
 /// EQ heading in degrees (0..360) for a movement delta in server axes.
 /// EQ convention: heading 0 faces +Y (north) and increases counter-clockwise
@@ -2038,10 +2045,24 @@ impl Navigator {
         // of trudging along the bottom (#191). The controller only swims when want_swim && in_water.
         let swim = self.collision.read().unwrap().as_ref()
             .is_some_and(|c| c.in_water([gs.player_x, gs.player_y, gs.player_z]));
+        // Jump-edge execution (eqoxide#190): if the current path segment is a jump — a horizontal
+        // hop bigger than any adjacent nav cell, which find_path only emits across a real gap — ask
+        // the controller to jump. Gated on being near the takeoff waypoint so the leap starts
+        // grounded at the near edge and doesn't re-trigger on landing; the forward wish_dir carries
+        // it across (the ~22.7u reach the edge was sized for). The controller ignores jump unless
+        // grounded, so it fires exactly once at takeoff.
+        let jump = match (self.path.get(self.path_i), self.path.get(self.path_i + 1)) {
+            (Some(a), Some(b)) => {
+                let seg = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+                let to_takeoff = ((gs.player_x - a[0]).powi(2) + (gs.player_y - a[1]).powi(2)).sqrt();
+                seg > JUMP_SEG_MIN && to_takeoff < JUMP_TAKEOFF_DIST
+            }
+            _ => false,
+        };
         *self.nav_intent.lock().unwrap() = Some(MoveIntent {
             wish_dir:    [dx / dist, dy / dist],
             wish_vspeed: 0.0,
-            jump:        false,
+            jump,
             want_swim:   swim,
             speed:       RUN_SPEED,
             climb:       crate::movement::NAV_CLIMB, // surmount fence/cart lips find_path routed over (#41)
