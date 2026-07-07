@@ -1010,13 +1010,17 @@ pub fn parse_player_profile(payload: &[u8]) -> Option<ProfileInfo> {
     Some(ProfileInfo { level, class_id, stats, coin, mem_spells, cur_hp, cur_mana })
 }
 
-pub fn parse_begin_cast(p: &[u8]) -> Option<(u16, u16, u32)> {
-    if p.len() < 8 { return None; }
-    Some((
-        u16::from_le_bytes([p[0], p[1]]),
-        u16::from_le_bytes([p[2], p[3]]),
-        u32::from_le_bytes([p[4], p[5], p[6], p[7]]),
-    ))
+/// RoF2 `BeginCast_Struct` (10 bytes, EQEmu common/patches/rof2_structs.h:719):
+///   /*00*/ uint32 spell_id;  /*04*/ uint16 caster_id;  /*06*/ uint32 cast_time; (ms)
+/// The old Titanium-style read (caster u16@0, spell u16@2, cast_ms u32@4) misaligned every field —
+/// cast_ms straddled caster_id + the low half of cast_time, yielding the ~108-hour phantom cast bar
+/// (eqoxide#222). Returns (caster_id, spell_id, cast_ms).
+pub fn parse_begin_cast(p: &[u8]) -> Option<(u16, u32, u32)> {
+    if p.len() < 10 { return None; }
+    let spell_id  = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+    let caster_id = u16::from_le_bytes([p[4], p[5]]);
+    let cast_ms   = u32::from_le_bytes([p[6], p[7], p[8], p[9]]);
+    Some((caster_id, spell_id, cast_ms))
 }
 
 pub fn parse_mana_change(p: &[u8]) -> Option<u32> {
@@ -1132,9 +1136,14 @@ fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
 }
 
 pub fn apply_begin_cast(gs: &mut GameState, p: &[u8]) {
-    if let Some((_caster, spell_id, cast_ms)) = parse_begin_cast(p) {
+    if let Some((caster_id, spell_id, cast_ms)) = parse_begin_cast(p) {
+        // Only the PLAYER's own cast drives the local cast bar. Any OP_BeginCast (a nearby NPC or
+        // other player casting) would otherwise set gs.casting — which the UI reads to DISABLE the
+        // player's spellcasting (spellbook.rs/spellgems.rs gate on casting.is_none()) and never
+        // clears for a non-self cast (only OP_InterruptCast / self memorize resets it). (eqoxide#222)
+        if caster_id as u32 != gs.player_id { return; }
         gs.casting = Some(CastState {
-            spell_id: spell_id as u32,
+            spell_id,
             started: std::time::Instant::now(),
             cast_ms,
         });
@@ -1819,7 +1828,7 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
 #[cfg(test)]
 mod tests {
     use super::{apply_emote, apply_death, class_name, con_color, consider_message, parse_player_profile,
-                parse_begin_cast, parse_memorize_spell, apply_char_inventory,
+                parse_begin_cast, apply_begin_cast, parse_memorize_spell, apply_char_inventory,
                 apply_money_update, apply_money_on_corpse, apply_set_target, apply_move_item, apply_spawn_appearance,
                 extract_saylink_text, apply_task_description, apply_completed_tasks, apply_task_select_window,
                 strip_say_links, SAY_LINK_BODY_SIZE, SIZE_DEATH,
@@ -2423,10 +2432,12 @@ mod tests {
 
     #[test]
     fn begin_cast_sets_casting_state() {
-        let mut gs = crate::game_state::GameState::new();
-        let mut b = [0u8; 8];
-        b[2..4].copy_from_slice(&200u16.to_le_bytes());
-        b[4..8].copy_from_slice(&3000u32.to_le_bytes());
+        // The player's OWN cast (caster_id == player_id) sets the cast bar. RoF2 10-byte layout.
+        let mut gs = crate::game_state::GameState::new(); // player_id defaults to 0
+        let mut b = [0u8; 10];
+        b[0..4].copy_from_slice(&200u32.to_le_bytes());               // spell_id
+        b[4..6].copy_from_slice(&(gs.player_id as u16).to_le_bytes()); // caster = self
+        b[6..10].copy_from_slice(&3000u32.to_le_bytes());            // cast_time ms
         super::apply_begin_cast(&mut gs, &b.to_vec());
         let c = gs.casting.as_ref().expect("casting set");
         assert_eq!(c.spell_id, 200);
@@ -2435,12 +2446,37 @@ mod tests {
 
     #[test]
     fn parse_begin_cast_reads_fields() {
-        let mut b = [0u8; 8];
-        b[0..2].copy_from_slice(&55u16.to_le_bytes());   // caster
-        b[2..4].copy_from_slice(&200u16.to_le_bytes());  // spell
-        b[4..8].copy_from_slice(&3500u32.to_le_bytes()); // cast_time ms
-        assert_eq!(parse_begin_cast(&b), Some((55, 200, 3500)));
-        assert_eq!(parse_begin_cast(&[0u8; 4]), None);
+        // RoF2 BeginCast_Struct: spell_id u32@0, caster_id u16@4, cast_time u32@6 (10 bytes).
+        let mut b = [0u8; 10];
+        b[0..4].copy_from_slice(&200u32.to_le_bytes());  // spell_id
+        b[4..6].copy_from_slice(&55u16.to_le_bytes());   // caster_id
+        b[6..10].copy_from_slice(&3500u32.to_le_bytes()); // cast_time ms
+        assert_eq!(parse_begin_cast(&b), Some((55, 200, 3500))); // (caster_id, spell_id, cast_ms)
+        assert_eq!(parse_begin_cast(&[0u8; 8]), None); // 8 bytes is too short for the 10-byte struct
+    }
+
+    #[test]
+    fn apply_begin_cast_only_paints_player_own_cast() {
+        // eqoxide#222: an NPC's OP_BeginCast must NOT set the player's cast bar (which would disable
+        // the player's spellcasting and never clear). Only the player's own cast (caster_id ==
+        // player_id) drives gs.casting.
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        let begin = |caster: u16, spell: u32, ms: u32| {
+            let mut b = [0u8; 10];
+            b[0..4].copy_from_slice(&spell.to_le_bytes());
+            b[4..6].copy_from_slice(&caster.to_le_bytes());
+            b[6..10].copy_from_slice(&ms.to_le_bytes());
+            b
+        };
+        // NPC (caster 999) casting → ignored, no phantom cast bar.
+        apply_begin_cast(&mut gs, &begin(999, 500, 3000));
+        assert!(gs.casting.is_none(), "an NPC's cast must not set the player's cast bar");
+        // The player's own cast (caster 42) → cast bar set with the real cast time (not garbage).
+        apply_begin_cast(&mut gs, &begin(42, 700, 2500));
+        let cs = gs.casting.as_ref().expect("player's own cast sets the bar");
+        assert_eq!(cs.spell_id, 700);
+        assert_eq!(cs.cast_ms, 2500);
     }
 
     #[test]
