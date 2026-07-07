@@ -1750,7 +1750,7 @@ impl Navigator {
                                 jump:        false,
                                 want_swim:   swim,
                                 speed:       RUN_SPEED,
-                                climb:       crate::movement::NAV_CLIMB, // surmount fence/cart lips find_path routed over (#41)
+                                climb:       0.0, // nav uses the native step-up now (#239); fences handled by hop
                                 hop:         false,                      // melee approach: no auto-hop
                             });
                         } else {
@@ -2095,7 +2095,7 @@ impl Navigator {
             jump,
             want_swim:   swim,
             speed:       RUN_SPEED,
-            climb:       crate::movement::NAV_CLIMB, // surmount fence/cart lips find_path routed over (#41)
+            climb:       0.0, // nav uses the native step-up now (#239); fences handled by hop
             // Net progress has stalled toward this waypoint → ask the controller to hop the barrier
             // (it only does if grounded, off cooldown, and a near-level landing exists beyond). (#41)
             hop:         self.stuck_ticks >= NAV_HOP_TICKS,
