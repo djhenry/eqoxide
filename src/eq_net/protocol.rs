@@ -715,6 +715,10 @@ pub fn is_boat_race(race_id: u32) -> bool {
 }
 
 pub fn eq_race_to_code(race_id: u32) -> &'static str {
+    // Boats/ships render as the "boat" archetype (a real ship model), not a HUM placeholder (#194).
+    if is_boat_race(race_id) {
+        return "SHP";
+    }
     match race_id {
         // Playable races
         1 => "HUM", 2 => "BAR", 3 => "ERU", 4 => "ELF", 5 => "HIE", 6 => "DKE",
