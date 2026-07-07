@@ -193,6 +193,9 @@ pub struct App {
     on_ground:  bool,
     /// F10 toggles an on-screen debug overlay (heading values, coords, corrections).
     show_debug: bool,
+    /// Navmesh/pathfinding debug overlay (collision floor grid + live A* path). Initial
+    /// state from `--nav-debug`; F11 toggles at runtime. See `hud::draw_nav_debug`.
+    nav_debug: bool,
     /// The window system: registry-driven windows, per-character layout
     /// persistence, icon atlases, chat state (#162).
     ui_state: crate::ui::UiState,
@@ -225,6 +228,7 @@ impl App {
         shared_collision: assets::SharedCollision,
         player_info:     crate::http::PlayerInfo,
         testzone_mode:   bool,
+        nav_debug:       bool,
         shutdown:        std::sync::Arc<std::sync::atomic::AtomicBool>,
         eq_ui_dir:       Option<String>,
         asset_server_url: String,
@@ -295,6 +299,7 @@ impl App {
             on_ground: true,
             testzone_mode,
             show_debug: false,
+            nav_debug,
             ui_state,
             sync_progress: Arc::new(Mutex::new(None)),
             sync_done:     Arc::new(Mutex::new(None)),
@@ -1290,6 +1295,8 @@ impl App {
             &self.acts, &self.spells,
             self.show_debug, self.game_state.server_corrections,
             &self.frame_profile,
+            self.nav_debug,
+            self.goto_target.lock().unwrap().map(|(x, y, z)| [x, y, z]),
         );
         let dur_egui = prof_egui.elapsed();
 
@@ -1352,6 +1359,8 @@ impl App {
         show_debug:    bool,
         corrections:   u32,
         frame_profile: &crate::profiling::FrameProfile,
+        nav_debug:     bool,               // navmesh overlay on? (--nav-debug / F11)
+        nav_goal:      Option<[f32; 3]>,   // current A* goal for the navmesh overlay
     ) -> bool {
         let (Some(egui_state), Some(egui_renderer), Some(egui_ctx), Some(window)) =
             (egui_state, egui_renderer, egui_ctx, window) else { return false };
@@ -1392,6 +1401,9 @@ impl App {
                 hud::draw_loading(ctx, current_zone, load_status, sync_progress);
             } else {
                 hud::draw_labels(ctx, scene, view_proj, screen_w, screen_h, cam_eye, collision);
+                if nav_debug {
+                    hud::draw_nav_debug(ctx, scene, view_proj, screen_w, screen_h, collision, nav_goal);
+                }
                 ui_state.draw_all(ctx, screen_pts, scene, spells, acts, zone_min, zone_max, zone_map, current_fps);
                 if show_debug {
                     hud::draw_debug_overlay(ctx, scene.player_pos, scene.player_heading, current_zone, corrections);
@@ -1710,6 +1722,10 @@ impl ApplicationHandler for App {
                                 KeyCode::F10 => {
                                     self.show_debug = !self.show_debug;
                                     tracing::info!("DEBUG: overlay {}", if self.show_debug { "ON" } else { "OFF" });
+                                }
+                                KeyCode::F11 => {
+                                    self.nav_debug = !self.nav_debug;
+                                    tracing::info!("NAV DEBUG: navmesh overlay {}", if self.nav_debug { "ON" } else { "OFF" });
                                 }
                                 KeyCode::KeyL
                                     if self.keys_held.contains(&KeyCode::ControlLeft)

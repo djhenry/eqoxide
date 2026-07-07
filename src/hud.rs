@@ -215,6 +215,90 @@ pub fn draw_labels(
     }
 }
 
+/// TEMP DEBUG (navmesh visualization): overlays the collision floor + the A* path near the
+/// player, to expose where `find_path` (A*, with `MAX_WALK_GRADE`) and the walker's floor
+/// (`nearest_floor`) disagree on steep slopes.
+///  - floor dots: green ≈ level, blue = below player, red = above player, gray ring = no floor
+///    in the step band (`nearest_floor` = the *walker's* notion of ground, no grade limit);
+///  - yellow line + orange dots: the A* path to `goto_target` (find_path's exact decisions,
+///    incl. the 1.2 grade limit). Where the yellow line stops short of the goal but green/blue
+///    floor dots continue toward it = the A*/collision slope mismatch.
+pub fn draw_nav_debug(
+    ctx: &egui::Context,
+    scene: &SceneState,
+    view_proj: [[f32; 4]; 4],
+    screen_w: u32,
+    screen_h: u32,
+    collision: Option<&crate::assets::Collision>,
+    nav_goal: Option<[f32; 3]>,
+) {
+    let Some(col) = collision else { return; };
+    let ppp = ctx.pixels_per_point();
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground, egui::Id::new("nav_debug")));
+    let p = scene.player_pos;
+    let on_screen = |w: [f32; 3]| -> Option<egui::Pos2> {
+        let [sx, sy] = project_to_screen(w, view_proj, screen_w, screen_h)?;
+        if sx < 0.0 || sy < 0.0 || sx > screen_w as f32 || sy > screen_h as f32 { return None; }
+        Some(egui::pos2(sx / ppp, sy / ppp))
+    };
+
+    // (a) collision floor grid: ±R around the player, every STEP units.
+    const R: i32 = 96;
+    const STEP: i32 = 8;
+    const STEP_UP: f32 = 20.0;
+    const MAX_DROP: f32 = 100.0;
+    let mut gx = -R;
+    while gx <= R {
+        let mut gy = -R;
+        while gy <= R {
+            let x = p[0] + gx as f32;
+            let y = p[1] + gy as f32;
+            match col.nearest_floor(x, y, p[2], STEP_UP, MAX_DROP) {
+                Some(fz) => {
+                    if let Some(sp) = on_screen([x, y, fz]) {
+                        let dz = fz - p[2];
+                        let c = if dz > 4.0 { egui::Color32::from_rgb(255, 90, 90) }
+                                else if dz < -4.0 { egui::Color32::from_rgb(80, 160, 255) }
+                                else { egui::Color32::from_rgb(80, 255, 120) };
+                        painter.circle_filled(sp, 2.0, c);
+                    }
+                }
+                None => {
+                    if let Some(sp) = on_screen([x, y, p[2]]) {
+                        painter.circle_stroke(sp, 2.0,
+                            egui::Stroke::new(1.0, egui::Color32::from_gray(90)));
+                    }
+                }
+            }
+            gy += STEP;
+        }
+        gx += STEP;
+    }
+
+    // (b) A* path to the goal — reproduce find_path's exact decisions (incl. MAX_WALK_GRADE).
+    if let Some(goal) = nav_goal {
+        let pts: Vec<egui::Pos2> = match col.find_path(p, goal, 1.0, &[], true) {
+            Some(path) => std::iter::once(p).chain(path.iter().copied())
+                .filter_map(on_screen).collect(),
+            None => Vec::new(),
+        };
+        for pair in pts.windows(2) {
+            painter.line_segment([pair[0], pair[1]],
+                egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 230, 40)));
+        }
+        for wp in &pts {
+            painter.circle_filled(*wp, 3.0, egui::Color32::from_rgb(255, 140, 0));
+        }
+        // goal marker: yellow ring, red-filled if A* found no path at all.
+        if let Some(sp) = on_screen(goal) {
+            if pts.is_empty() { painter.circle_filled(sp, 6.0, egui::Color32::RED); }
+            painter.circle_stroke(sp, 9.0,
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 255, 0)));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
