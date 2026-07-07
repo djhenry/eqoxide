@@ -1067,6 +1067,15 @@ impl Collision {
         // controller can walk makes it slide on the face and wedge (#205). Reject a climb whose
         // grade (rise/run) exceeds what's walkable; A* then routes around the steep face.
         const MAX_WALK_GRADE: f32 = 1.2;  // walkable up to ~50° (rise/run); steeper = slide
+        // Jump-edges (eqoxide#190): let A* leap a GENUINE horizontal floor gap a running jump can
+        // clear. NAV_RUN_SPEED matches navigation::RUN_SPEED (the speed the walker drives a jump at);
+        // reach is derived from it via movement::running_jump_reach (~22.7u). JUMP_UP_TOL caps how
+        // much higher a landing may sit (a running jump's apex ≈ JUMP_VELOCITY²/2·GRAVITY ≈ 4u).
+        // JUMP_PENALTY makes a jump cost more than the equivalent walk so A* only jumps when a gap
+        // would otherwise block the route.
+        const NAV_RUN_SPEED: f32 = 44.0;
+        const JUMP_UP_TOL: f32 = 4.0;
+        const JUMP_PENALTY: f32 = 30.0;
         // Snap the start CELL onto the surface the char is really on. When the char stands at a
         // cell's edge next to a wall, the 8u cell CENTER can fall on the wall's footprint — whose
         // only floor is the wall-TOP — so A* run from that cell would begin up on the wall and
@@ -1197,6 +1206,56 @@ impl Collision {
                         came.insert(nkey, ckey);
                         floor_of.insert(nkey, nf);
                         heap.push(Node { f: tentative + h(nc, nr), c: nc, r: nr, fz: nf });
+                    }
+                }
+
+                // JUMP-EDGE (eqoxide#190): a running jump crosses a GENUINE horizontal floor gap —
+                // wider than one cell (so normal walk edges can't bridge it) but within jump reach.
+                // Only fires in a CARDINAL direction whose ADJACENT cell is a gap (no walkable floor
+                // to step to — otherwise it's just walking). Land on the nearest cell within reach
+                // whose floor is at ~takeoff height or lower, with a clear arc. Costs more than
+                // walking (JUMP_PENALTY) so A* prefers real routes and only leaps when a gap blocks it.
+                if (dc == 0) != (dr == 0) {
+                    let walkable_at = |x: f32, y: f32| {
+                        self.column_floors(x, y, cz, STEP_H, MAX_STEP_DOWN)
+                            .into_iter().any(|f| f - cz <= STEP_H && cz - f <= MAX_STEP_DOWN)
+                    };
+                    if !walkable_at(b[0], b[1]) {
+                        let reach = crate::movement::running_jump_reach(NAV_RUN_SPEED);
+                        let max_k = (reach / cell).floor() as i32;
+                        for k in 2..=max_k.max(2) {
+                            let (jc, jr) = (c + dc * k, r + dr * k);
+                            if jc < 0 || jr < 0 || jc >= cols || jr >= rows { break; }
+                            if (k as f32) * cell > reach { break; }
+                            // every intermediate cell must be a gap (no walkable floor near cz);
+                            // if there's ground between, it's not a real jump gap.
+                            let all_gap = (1..k).all(|j| {
+                                let m = center(c + dc * j, r + dr * j);
+                                !walkable_at(m[0], m[1])
+                            });
+                            if !all_gap { break; }
+                            // landing floor: at ~takeoff height (a jump gains ≤ JUMP_UP_TOL) or lower.
+                            let land = center(jc, jr);
+                            let landing = self.column_floors(land[0], land[1], cz, JUMP_UP_TOL, MAX_STEP_DOWN)
+                                .into_iter()
+                                .filter(|&nf| nf - cz <= JUMP_UP_TOL && cz - nf <= MAX_STEP_DOWN)
+                                .max_by(|x, y| x.partial_cmp(y).unwrap_or(Ordering::Equal));
+                            let Some(nf) = landing else { continue };
+                            // arc clear: no wall between takeoff and landing (chest height).
+                            if !self.path_clear([a[0], a[1], cz + CHEST], [land[0], land[1], nf + CHEST], radius) {
+                                continue;
+                            }
+                            let nkey = (jc, jr, qf(nf));
+                            if closed.contains(&nkey) { continue; }
+                            let tentative = g_cur + (k as f32) * cell + JUMP_PENALTY;
+                            if tentative < *g_score.get(&nkey).unwrap_or(&f32::MAX) {
+                                g_score.insert(nkey, tentative);
+                                came.insert(nkey, ckey);
+                                floor_of.insert(nkey, nf);
+                                heap.push(Node { f: tentative + h(jc, jr), c: jc, r: jr, fz: nf });
+                            }
+                            break; // nearest valid landing in this direction wins
+                        }
                     }
                 }
                 // WATER DESCENT: if the neighbor column holds water below the current floor, allow
@@ -1543,6 +1602,44 @@ mod tests {
         let goal_s = [16.0 + 20.0, 20.0, 30.0];
         let full = steep.find_path(start, goal_s, 1.0, &[], false);
         assert!(full.is_none(), "a 1.875-grade ramp is too steep — A* must not route up it");
+    }
+
+    /// eqoxide#190: A* must route across a horizontal floor GAP a running jump can clear (a
+    /// jump-edge), and must NOT invent a route across a gap wider than the jump reach.
+    #[test]
+    fn find_path_jumps_a_horizontal_gap() {
+        let quad = |v: Vec<[f32; 3]>| MeshData {
+            positions: v, normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
+            texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        // pos = [north, up, east]. Two z=0 platforms separated by a gap along east; north -40..40.
+        let platform = |e0: f32, e1: f32| quad(vec![
+            [-40.0, 0.0, e0], [40.0, 0.0, e0], [40.0, 0.0, e1], [-40.0, 0.0, e1]]);
+
+        // find_path uses an 8u nav cell; reach ≈ 22.7u lands ≤ 2 cells (16u) out. Jumpable: an 8u
+        // gap (east 8..16) — the far platform's cell sits 16u from the near edge. Only connection.
+        let ok = ZoneAssets { terrain: vec![platform(-48.0, 8.0), platform(16.0, 64.0)], objects: vec![], textures: vec![] };
+        let col = Collision::build(&ok, 4.0);
+        let start = [-20.0, 0.0, 0.0]; // world [east, north, up], on platform A
+        let goal  = [40.0, 0.0, 0.0];  // on platform B
+        let path = col.find_path(start, goal, 1.0, &[], false)
+            .expect("an 8u gap within jump reach must be routable via a jump-edge");
+        let last = *path.last().unwrap();
+        assert!((last[0] - goal[0]).abs() < 8.0, "path reaches platform B, got {last:?}");
+        // The route must contain a jump segment: a hop bigger than any adjacent-cell step
+        // (≤ 8·√2 ≈ 11.3u at the 8u nav cell) — the gap crossing is ~16u.
+        let has_jump = path.windows(2).any(|w| {
+            ((w[1][0] - w[0][0]).powi(2) + (w[1][1] - w[0][1]).powi(2)).sqrt() > 12.0
+        });
+        assert!(has_jump, "route should include a jump segment across the gap: {path:?}");
+
+        // Too wide: a 32u gap exceeds the jump reach → no route (must not fabricate one).
+        let wide = Collision::build(
+            &ZoneAssets { terrain: vec![platform(-48.0, 8.0), platform(40.0, 88.0)], objects: vec![], textures: vec![] },
+            4.0);
+        assert!(wide.find_path([-20.0, 0.0, 0.0], [60.0, 0.0, 0.0], 1.0, &[], false).is_none(),
+            "a 32u gap exceeds jump reach — A* must not route across it");
     }
 
     /// A single horizontal floor quad + one vertical wall: the floor raycast must
