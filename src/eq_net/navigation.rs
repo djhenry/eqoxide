@@ -1246,13 +1246,13 @@ impl Navigator {
             }
         }
 
-        // Server-initiated zone change (portal door etc.): begin the normal zone-change
-        // handshake to the requested destination, reusing the zone-cross path.
-        if let Some(dest_zone) = gs.pending_server_zone.take() {
-            tracing::info!("EQ: server-requested zone change → zone_id={dest_zone}");
-            self.send_zone_change_packet(stream, gs, dest_zone);
-            self.last_zone_cross = Instant::now();
-        }
+        // NOTE: server-initiated zone changes (GM #zone, portal doors, spell ports/gate/evac) are
+        // answered by the gameplay.rs OP_REQUEST_CLIENT_ZONE_CHANGE handler, which echoes the
+        // server's real zone_id via build_zone_change. This block USED to re-send via
+        // send_zone_change_packet, but #199 changed that to always emit zoneID=0 (the resolve-from-
+        // position sentinel, correct only for client-initiated WALK-IN crossings). That misrouted
+        // every server-initiated teleport to a wrong zone (#235) — so it's removed; the wire
+        // zoneID=0 path is now confined to /v1/move/zone_cross.
 
         // Check hail request — say "Hail, <name>" so the NPC fires its hail script. The server only
         // runs an NPC's EVENT_SAY on the player's CURRENT TARGET (client.cpp: `Mob* t = GetTarget()`),
