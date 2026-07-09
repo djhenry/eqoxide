@@ -223,6 +223,30 @@ pub fn draw_labels(
 ///  - yellow line + orange dots: the A* path to `goto_target` (find_path's exact decisions,
 ///    incl. the 1.2 grade limit). Where the yellow line stops short of the goal but green/blue
 ///    floor dots continue toward it = the A*/collision slope mismatch.
+/// One cached A* grid cell (8u): the walker's floor here + whether the step to the E/N neighbor is
+/// walkable. Computed once from static geometry and reused across frames (see `NavDebugCache`).
+struct NavCell { floor: Option<f32>, edge_e: Option<(f32, bool)>, edge_n: Option<(f32, bool)> }
+
+/// Persistent cache for the nav-debug overlay so it doesn't re-raycast the whole grid and re-run a
+/// full A* every frame (that recompute-per-frame is what made the overlay tank the frame rate). The
+/// floor/edge queries are functions of STATIC geometry, so each cell is computed once and reused;
+/// only cells newly in range as the player walks are raycast. The A* path is recomputed on a throttle
+/// (goal change or every few frames), not every frame. Invalidated on a big teleport/level change.
+#[derive(Default)]
+struct NavDebugCache {
+    last_pos: [f32; 3],
+    ref_z:    f32,
+    valid:    bool,
+    coarse:   std::collections::HashMap<(i32, i32), NavCell>, // 8u A* grid: floors + edges
+    fine:     std::collections::HashMap<(i32, i32), Option<f32>>, // 4u near-player floor dots
+    path:     Vec<[f32; 3]>,
+    path_goal: Option<[f32; 3]>,
+    path_age: u32,
+}
+thread_local! {
+    static NAV_CACHE: std::cell::RefCell<NavDebugCache> = std::cell::RefCell::new(NavDebugCache::default());
+}
+
 pub fn draw_nav_debug(
     ctx: &egui::Context,
     scene: &SceneState,
@@ -243,13 +267,16 @@ pub fn draw_nav_debug(
         Some(egui::pos2(sx / ppp, sy / ppp))
     };
 
-    // Nav grid: cells are 8u (find_path's NAV_CELL). Sample a ±R window around the player.
-    // (a) dots = the cell floor from `nearest_floor` (the WALKER's ground). (c) edges = whether
-    // A* would permit the step to the E/N neighbor — GREEN walkable, RED blocked on grade/wall,
-    // absent = no floor there. This is A*'s real connectivity: where edges stop/redden is the
-    // boundary A* respects, so a green edge crossing a wall = A* ignoring it.
-    const R: i32 = 72;
-    const STEP: i32 = 8;            // = NAV_CELL
+    // Nav grid + A* path, CACHED so we don't re-raycast the whole grid and re-run a full A* EVERY
+    // frame — that per-frame recompute is what tanked the frame rate (and made the walker crawl under
+    // the overlay). Floor/edge queries are functions of STATIC geometry, so each cell is computed
+    // once and reused; only newly-in-range cells get raycast as the player walks. Floor dots use a
+    // FINER grid near the player for extra fidelity; edges + the A* path stay at the 8u NAV_CELL
+    // (A*'s real resolution, so the edges keep reflecting A*'s actual connectivity).
+    const R: i32 = 96;              // coarse (8u) context radius
+    const CELL: i32 = 8;            // = NAV_CELL — edges + A* work at this resolution
+    const FINE_R: i32 = 32;         // fine (4u) floor-dot radius for near-player detail
+    const FINE: i32 = 4;
     const STEP_UP: f32 = 20.0;
     const MAX_DROP: f32 = 100.0;
     // A* per-edge constants (mirror find_path @ src/assets.rs):
@@ -257,96 +284,129 @@ pub fn draw_nav_debug(
     const MAX_STEP_DOWN: f32 = 60.0;
     const MAX_WALK_GRADE: f32 = 1.2;
     const CHEST: f32 = 3.0;
+    let walk_col  = egui::Color32::from_rgba_unmultiplied(60, 230, 90, 170);
+    let block_col = egui::Color32::from_rgba_unmultiplied(255, 60, 60, 220);
+    let dot_col = |fz: f32| {
+        let dz = fz - p[2];
+        if dz > 4.0 { egui::Color32::from_rgb(255, 90, 90) }
+        else if dz < -4.0 { egui::Color32::from_rgb(80, 160, 255) }
+        else { egui::Color32::from_rgb(80, 255, 120) }
+    };
 
-    let n = (2 * R / STEP + 1) as usize;
-    let cellpos = |i: usize, j: usize| -> [f32; 2] {
-        [p[0] + (-R + i as i32 * STEP) as f32, p[1] + (-R + j as i32 * STEP) as f32]
-    };
-    // Precompute each cell's floor once.
-    let mut fl = vec![vec![None::<f32>; n]; n];
-    for i in 0..n {
-        for j in 0..n {
-            let c = cellpos(i, j);
-            fl[i][j] = col.nearest_floor(c[0], c[1], p[2], STEP_UP, MAX_DROP);
+    NAV_CACHE.with(|slot| {
+        let cache = &mut *slot.borrow_mut();
+        // Invalidate on first use / a big teleport / a level (z) change — cached floors were sampled
+        // relative to the old reference height and would be wrong on a different level.
+        let jumped = (p[0] - cache.last_pos[0]).hypot(p[1] - cache.last_pos[1]) > 200.0
+            || (p[2] - cache.ref_z).abs() > 20.0;
+        if !cache.valid || jumped {
+            cache.coarse.clear();
+            cache.fine.clear();
+            cache.path.clear();
+            cache.path_goal = None;
+            cache.ref_z = p[2];
+            cache.valid = true;
         }
-    }
-    // (c) A* walkable edges (E + N per cell) — replicate find_path's step-band + grade + chest-ray.
-    let edge_to = |a: [f32; 3], b: [f32; 2]| -> Option<([f32; 3], bool)> {
-        let cz = a[2];
-        let mut chosen: Option<(f32, bool)> = None;
-        for nf in col.column_floors(b[0], b[1], cz, STEP_H, MAX_STEP_DOWN) {
-            if nf - cz > STEP_H || cz - nf > MAX_STEP_DOWN { continue; }
-            let rise = nf - cz;
-            let run = ((b[0] - a[0]).hypot(b[1] - a[1])).max(1e-3);
-            let grade_ok = !(rise > 0.0 && rise / run > MAX_WALK_GRADE);
-            let clear = col.path_clear([a[0], a[1], cz + CHEST], [b[0], b[1], nf + CHEST], 1.0);
-            let walk = grade_ok && clear;
-            if walk { chosen = Some((nf, true)); break; }
-            else if chosen.is_none() { chosen = Some((nf, false)); }
+        cache.last_pos = p;
+        let ref_z = cache.ref_z;
+
+        // ── Coarse 8u cells (floor + E/N walkable edges): raycast only cells not already cached. ──
+        let (pcx, pcy) = ((p[0] / CELL as f32).round() as i32, (p[1] / CELL as f32).round() as i32);
+        let chalf = R / CELL;
+        for ci in -chalf..=chalf {
+            for cj in -chalf..=chalf {
+                let key = (pcx + ci, pcy + cj);
+                if cache.coarse.contains_key(&key) { continue; }
+                let (cx, cy) = (key.0 as f32 * CELL as f32, key.1 as f32 * CELL as f32);
+                let floor = col.nearest_floor(cx, cy, ref_z, STEP_UP, MAX_DROP);
+                let edge = |bx: f32, by: f32, cz: f32| -> Option<(f32, bool)> {
+                    let mut chosen: Option<(f32, bool)> = None;
+                    for nf in col.column_floors(bx, by, cz, STEP_H, MAX_STEP_DOWN) {
+                        if nf - cz > STEP_H || cz - nf > MAX_STEP_DOWN { continue; }
+                        let rise = nf - cz;
+                        let run = ((bx - cx).hypot(by - cy)).max(1e-3);
+                        let grade_ok = !(rise > 0.0 && rise / run > MAX_WALK_GRADE);
+                        let clear = col.path_clear([cx, cy, cz + CHEST], [bx, by, nf + CHEST], 1.0);
+                        if grade_ok && clear { chosen = Some((nf, true)); break; }
+                        else if chosen.is_none() { chosen = Some((nf, false)); }
+                    }
+                    chosen
+                };
+                let (edge_e, edge_n) = match floor {
+                    Some(fz) => (edge(cx + CELL as f32, cy, fz), edge(cx, cy + CELL as f32, fz)),
+                    None => (None, None),
+                };
+                cache.coarse.insert(key, NavCell { floor, edge_e, edge_n });
+            }
         }
-        chosen.map(|(nf, w)| ([b[0], b[1], nf], w))
-    };
-    for i in 0..n {
-        for j in 0..n {
-            let Some(fz) = fl[i][j] else { continue; };
-            let a = cellpos(i, j);
-            let ap = [a[0], a[1], fz];
-            for (ni, nj) in [(i + 1, j), (i, j + 1)] {
-                if ni >= n || nj >= n { continue; }
-                let b = cellpos(ni, nj);
-                if let Some((bp, walk)) = edge_to(ap, b) {
-                    if let (Some(sa), Some(sb)) = (on_screen(ap), on_screen(bp)) {
-                        let (c, w) = if walk {
-                            (egui::Color32::from_rgba_unmultiplied(60, 230, 90, 170), 1.0)
-                        } else {
-                            (egui::Color32::from_rgba_unmultiplied(255, 60, 60, 220), 1.6)
-                        };
-                        painter.line_segment([sa, sb], egui::Stroke::new(w, c));
+        // Edges (green walkable / red blocked), from the cache.
+        for ci in -chalf..=chalf {
+            for cj in -chalf..=chalf {
+                let key = (pcx + ci, pcy + cj);
+                let Some(nc) = cache.coarse.get(&key) else { continue; };
+                let Some(fz) = nc.floor else { continue; };
+                let (cx, cy) = (key.0 as f32 * CELL as f32, key.1 as f32 * CELL as f32);
+                let a = [cx, cy, fz];
+                for (e, bx, by) in [(&nc.edge_e, cx + CELL as f32, cy), (&nc.edge_n, cx, cy + CELL as f32)] {
+                    if let Some((nf, walk)) = e {
+                        if let (Some(sa), Some(sb)) = (on_screen(a), on_screen([bx, by, *nf])) {
+                            let (c, w) = if *walk { (walk_col, 1.0) } else { (block_col, 1.6) };
+                            painter.line_segment([sa, sb], egui::Stroke::new(w, c));
+                        }
                     }
                 }
             }
         }
-    }
-    // (a) cell floor dots (drawn on top of the edges).
-    for i in 0..n {
-        for j in 0..n {
-            let c = cellpos(i, j);
-            match fl[i][j] {
-                Some(fz) => if let Some(sp) = on_screen([c[0], c[1], fz]) {
-                    let dz = fz - p[2];
-                    let col_ = if dz > 4.0 { egui::Color32::from_rgb(255, 90, 90) }
-                              else if dz < -4.0 { egui::Color32::from_rgb(80, 160, 255) }
-                              else { egui::Color32::from_rgb(80, 255, 120) };
-                    painter.circle_filled(sp, 1.6, col_);
-                },
-                None => if let Some(sp) = on_screen([c[0], c[1], p[2]]) {
-                    painter.circle_stroke(sp, 1.6, egui::Stroke::new(1.0, egui::Color32::from_gray(90)));
-                },
+
+        // ── Floor dots: FINE (4u) near the player, COARSE (8u) for the outer context ring. ──
+        let (pfx, pfy) = ((p[0] / FINE as f32).round() as i32, (p[1] / FINE as f32).round() as i32);
+        let fhalf = FINE_R / FINE;
+        for fi in -fhalf..=fhalf {
+            for fj in -fhalf..=fhalf {
+                let key = (pfx + fi, pfy + fj);
+                let (fx, fy) = (key.0 as f32 * FINE as f32, key.1 as f32 * FINE as f32);
+                let fz = *cache.fine.entry(key).or_insert_with(|| col.nearest_floor(fx, fy, ref_z, STEP_UP, MAX_DROP));
+                if let Some(fz) = fz {
+                    if let Some(sp) = on_screen([fx, fy, fz]) { painter.circle_filled(sp, 1.6, dot_col(fz)); }
+                }
             }
         }
-    }
+        // Coarse dots outside the fine window (context).
+        for ci in -chalf..=chalf {
+            for cj in -chalf..=chalf {
+                let key = (pcx + ci, pcy + cj);
+                let (cx, cy) = (key.0 as f32 * CELL as f32, key.1 as f32 * CELL as f32);
+                if (cx - p[0]).abs() <= FINE_R as f32 && (cy - p[1]).abs() <= FINE_R as f32 { continue; }
+                if let Some(Some(fz)) = cache.coarse.get(&key).map(|c| c.floor) {
+                    if let Some(sp) = on_screen([cx, cy, fz]) { painter.circle_filled(sp, 1.6, dot_col(fz)); }
+                }
+            }
+        }
 
-    // (b) A* path to the goal — reproduce find_path's exact decisions (incl. MAX_WALK_GRADE).
-    if let Some(goal) = nav_goal {
-        let pts: Vec<egui::Pos2> = match col.find_path(p, goal, 1.0, &[], true) {
-            Some(path) => std::iter::once(p).chain(path.iter().copied())
-                .filter_map(on_screen).collect(),
-            None => Vec::new(),
-        };
-        for pair in pts.windows(2) {
-            painter.line_segment([pair[0], pair[1]],
-                egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 230, 40)));
+        // ── A* path: recompute on a THROTTLE (goal change or every ~12 frames), not every frame. ──
+        if let Some(goal) = nav_goal {
+            if cache.path_goal != Some(goal) || cache.path_age >= 12 || cache.path.is_empty() {
+                cache.path = col.find_path(p, goal, 1.0, &[], true).unwrap_or_default();
+                cache.path_goal = Some(goal);
+                cache.path_age = 0;
+            } else {
+                cache.path_age += 1;
+            }
+            let pts: Vec<egui::Pos2> = std::iter::once(p).chain(cache.path.iter().copied())
+                .filter_map(on_screen).collect();
+            for pair in pts.windows(2) {
+                painter.line_segment([pair[0], pair[1]], egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 230, 40)));
+            }
+            for wp in &pts { painter.circle_filled(*wp, 3.0, egui::Color32::from_rgb(255, 140, 0)); }
+            if let Some(sp) = on_screen(goal) {
+                if cache.path.is_empty() { painter.circle_filled(sp, 6.0, egui::Color32::RED); }
+                painter.circle_stroke(sp, 9.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 255, 0)));
+            }
+        } else {
+            cache.path.clear();
+            cache.path_goal = None;
         }
-        for wp in &pts {
-            painter.circle_filled(*wp, 3.0, egui::Color32::from_rgb(255, 140, 0));
-        }
-        // goal marker: yellow ring, red-filled if A* found no path at all.
-        if let Some(sp) = on_screen(goal) {
-            if pts.is_empty() { painter.circle_filled(sp, 6.0, egui::Color32::RED); }
-            painter.circle_stroke(sp, 9.0,
-                egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 255, 0)));
-        }
-    }
+    });
 }
 
 #[cfg(test)]
