@@ -1100,6 +1100,37 @@ impl Navigator {
         if *s != state { *s = state.to_string(); }
     }
 
+    /// Is the player slain? Detected the SAME way the render/anim path picks the dead pose
+    /// (`cur_hp <= 0` with a known `max_hp`) OR via the OP_Death `player_dead` flag. Using cur_hp —
+    /// not just `player_dead` — catches an HP-to-0 update that lands before OP_Death arrives, which is
+    /// the window in which a corpse was seen still walking (#238).
+    fn is_player_dead(gs: &GameState) -> bool {
+        gs.player_dead || (gs.cur_hp <= 0 && gs.max_hp > 0)
+    }
+
+    /// Stop all navigation the instant the player is slain (#238): abandon the destination + route +
+    /// controller intent so a corpse doesn't keep walking toward the goal, and clear the overlay line.
+    /// The route is wiped so a later respawn/relog starts fresh instead of resuming the dead man's
+    /// path. Returns true when the player is dead (the caller returns early from the walk tick).
+    fn nav_halt_if_dead(&mut self, gs: &GameState) -> bool {
+        if !Self::is_player_dead(gs) {
+            return false;
+        }
+        if self.goto_target.lock().unwrap().take().is_some() {
+            tracing::info!("NAV: player is dead — abandoning /goto");
+        }
+        *self.goto_entity.lock().unwrap() = None;      // drop any entity chase
+        *self.zone_cross.lock().unwrap() = None;        // drop a queued zone-cross
+        *self.nav_intent.lock().unwrap() = None;        // stop driving the controller
+        *self.nav_path_view.lock().unwrap() = (Vec::new(), Vec::new()); // clear the overlay line
+        self.path.clear();
+        self.local_path.clear();
+        self.path_goal = None;
+        self.path_i = 0;
+        self.set_nav_state("idle");
+        true
+    }
+
     /// Live NPC-camp positions to route AROUND (aggro-avoidance, #67), excluding NPCs near the
     /// goal (you're walking TO the destination, often a target mob, so its own camp isn't avoided).
     fn aggro_avoid(gs: &GameState, goal: (f32, f32, f32)) -> Vec<[f32; 2]> {
@@ -1324,7 +1355,9 @@ impl Navigator {
         // re-firing while still inside the region right after a crossing.
         {
             const ZONE_CROSS_COOLDOWN_MS: u128 = 10000; // 10 seconds
-            if self.last_zone_cross.elapsed().as_millis() > ZONE_CROSS_COOLDOWN_MS {
+            // A dead corpse standing in a zone-line region must NOT auto-zone (#238) — this fires purely
+            // from physical position, so a character killed right at a boundary would cross while dead.
+            if !Self::is_player_dead(gs) && self.last_zone_cross.elapsed().as_millis() > ZONE_CROSS_COOLDOWN_MS {
                 let index = self.collision.read().unwrap().as_ref()
                     .and_then(|c| c.zone_line_at([gs.player_x, gs.player_y, gs.player_z]));
                 if let Some(index) = index {
@@ -1699,6 +1732,15 @@ impl Navigator {
         // (independent of the 150 ms planner gate below). This is the single position authority.
         self.stream_position(stream, gs);
 
+        // Dead men don't walk (#238, eqoxide#61): the instant the player is slain, abandon any /goto
+        // or /zone_cross and stop driving the controller, so a corpse doesn't keep walking its route
+        // toward the goal. Placed BEFORE the fast-steering refresh AND the 150 ms walk gate so
+        // movement halts within a tick, not up to a gate-period later. Position streaming above still
+        // runs, keeping the stationary corpse in sync with the server.
+        if self.nav_halt_if_dead(gs) {
+            return;
+        }
+
         // FAST STEERING (#nav-multires). The plans (`path`, `local_path`) are refreshed on the 150ms
         // gate below, but the controller runs at ~100Hz — driving a 150ms-stale heading overshoots
         // every turn by up to RUN_SPEED·0.15 ≈ 6.6u and clips walls (the "not following the line"
@@ -1900,20 +1942,8 @@ impl Navigator {
             return;
         }
 
-        // Dead men don't walk (eqoxide#61): once the player is slain, abandon any /goto instead of
-        // advancing a corpse through waypoint after waypoint ("no progress… skipping" forever). The
-        // route is cleared, so a later respawn/relog starts fresh rather than resuming the old path.
-        if gs.player_dead {
-            if self.goto_target.lock().unwrap().take().is_some() {
-                tracing::info!("NAV: player is dead — abandoning /goto");
-            }
-            *self.goto_entity.lock().unwrap() = None; // drop any chase too
-            self.path.clear();
-            self.path_goal = None;
-            self.path_i = 0;
-            *self.nav_intent.lock().unwrap() = None; // stop driving the controller
-            return;
-        }
+        // (The dead-player guard now runs earlier — right after stream_position, before the fast-
+        // steering refresh and the 150 ms gate — so a corpse stops within a tick. See #238.)
 
         // Chase (eqoxide#88): when /goto targets a named ENTITY, re-resolve its CURRENT position each
         // tick and follow it, instead of pathing to a one-time snapshot. Roaming mobs move, and their
@@ -2561,6 +2591,71 @@ mod tests {
             Default::default(), // pos_correction
             Default::default(), // nav_path_view
         )
+    }
+
+    #[test]
+    fn dead_player_halts_navigation() {
+        // #238: a character that dies mid-goto must stop — the corpse must not keep walking the route.
+        // Seed an in-progress nav, then assert nav_halt_if_dead() clears everything and reports dead.
+        let seed_nav = |nav: &mut Navigator| {
+            *nav.goto_target.lock().unwrap() = Some((100.0, 200.0, 0.0));
+            *nav.goto_entity.lock().unwrap() = Some("a bat".into());
+            *nav.nav_intent.lock().unwrap() = Some(crate::movement::MoveIntent::default());
+            *nav.nav_path_view.lock().unwrap() = (vec![[0.0, 0.0, 0.0]], vec![[0.0, 0.0, 0.0]]);
+            nav.path = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]];
+            nav.local_path = vec![[0.0, 0.0, 0.0]];
+            nav.path_goal = Some((100.0, 200.0, 0.0));
+            nav.path_i = 1;
+            *nav.nav_state.lock().unwrap() = "navigating".into();
+        };
+        let assert_halted = |nav: &Navigator| {
+            assert!(nav.goto_target.lock().unwrap().is_none(), "goto_target must clear on death");
+            assert!(nav.goto_entity.lock().unwrap().is_none(), "goto_entity must clear on death");
+            assert!(nav.nav_intent.lock().unwrap().is_none(), "nav_intent must clear so the controller stops");
+            assert!(nav.path.is_empty() && nav.local_path.is_empty(), "route must clear on death");
+            assert_eq!(nav.path_goal, None);
+            assert_eq!(*nav.nav_state.lock().unwrap(), "idle");
+        };
+        let new_nav = || {
+            let g: crate::http::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::http::GroupSnapshot::default()));
+            test_navigator(g)
+        };
+
+        // (a) An HP-to-0 update that arrives BEFORE OP_Death (player_dead still false) — the exact
+        //     window in which the corpse was seen walking. cur_hp<=0 with a known max must halt nav.
+        let mut nav = new_nav();
+        seed_nav(&mut nav);
+        let mut gs = GameState::new();
+        gs.player_dead = false;
+        gs.cur_hp = 0;
+        gs.max_hp = 1284;
+        assert!(nav.nav_halt_if_dead(&gs), "cur_hp<=0 (pre-OP_Death) must halt navigation");
+        assert_halted(&nav);
+
+        // (b) The OP_Death flag path (player_dead set, cur_hp already zeroed by apply_death).
+        let mut nav = new_nav();
+        seed_nav(&mut nav);
+        let mut gs = GameState::new();
+        gs.player_dead = true;
+        gs.cur_hp = 0;
+        gs.max_hp = 1284;
+        assert!(nav.nav_halt_if_dead(&gs));
+        assert_halted(&nav);
+
+        // (c) A LIVE player must NOT be halted (and cur_hp<=0 with max_hp==0 = "unknown", not dead —
+        //     e.g. a fresh spawn before the first HP update — must not spuriously stop nav).
+        let mut nav = new_nav();
+        seed_nav(&mut nav);
+        let mut gs = GameState::new();
+        gs.player_dead = false;
+        gs.cur_hp = 900;
+        gs.max_hp = 1284;
+        assert!(!nav.nav_halt_if_dead(&gs), "a live player must keep navigating");
+        assert!(nav.goto_target.lock().unwrap().is_some(), "live nav must be untouched");
+        gs.cur_hp = 0;
+        gs.max_hp = 0; // unknown HP, not a death
+        assert!(!nav.nav_halt_if_dead(&gs), "cur_hp<=0 with max_hp==0 is unknown HP, not death");
+        assert!(nav.goto_target.lock().unwrap().is_some());
     }
 
     #[test]
