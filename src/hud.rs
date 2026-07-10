@@ -239,7 +239,8 @@ struct NavDebugCache {
     valid:    bool,
     coarse:   std::collections::HashMap<(i32, i32), NavCell>, // 8u A* grid: floors + edges
     fine:     std::collections::HashMap<(i32, i32), Option<f32>>, // 4u near-player floor dots
-    path:     Vec<[f32; 3]>,
+    path:     Vec<[f32; 3]>,     // coarse 8u route (bounded to a visible range)
+    local:    Vec<[f32; 3]>,     // fine 2u local plan the walker actually follows
     path_goal: Option<[f32; 3]>,
     path_age: u32,
 }
@@ -383,27 +384,55 @@ pub fn draw_nav_debug(
             }
         }
 
-        // ── A* path: recompute on a THROTTLE (goal change or every ~12 frames), not every frame. ──
+        // ── A* paths: recompute on a THROTTLE (goal change or every ~12 frames), not every frame. ──
+        // Both are BOUNDED so a distant goal doesn't run a whole-zone A* every refresh (that hitched
+        // the frame rate on long routes) and the drawn line stays a reasonable near-range length:
+        //   • COARSE (yellow, 8u, ≤COARSE_VIS): the near global route.
+        //   • FINE (cyan, 2u, ≤FINE_VIS): the sub-8u local route the WALKER actually steers along —
+        //     to a carrot ~LOCAL_REACH ahead on the coarse route (mirrors navigation.rs).
+        const COARSE_VIS: f32 = 160.0;
+        const FINE_VIS:   f32 = 40.0;
+        const LOCAL_REACH: f32 = 24.0;
         if let Some(goal) = nav_goal {
             if cache.path_goal != Some(goal) || cache.path_age >= 12 || cache.path.is_empty() {
-                cache.path = col.find_path(p, goal, 1.0, &[], true).unwrap_or_default();
+                cache.path = col.find_path_res(p, goal, 1.0, &[], true, 8.0, Some(COARSE_VIS)).unwrap_or_default();
+                // Fine local plan toward a carrot ~LOCAL_REACH along the coarse route (or the goal).
+                let mut acc = 0.0f32;
+                let mut carrot = goal;
+                let mut prev = p;
+                for w in &cache.path {
+                    let d = ((w[0] - prev[0]).powi(2) + (w[1] - prev[1]).powi(2)).sqrt();
+                    if acc + d >= LOCAL_REACH {
+                        let t = ((LOCAL_REACH - acc) / d.max(1e-3)).clamp(0.0, 1.0);
+                        carrot = [prev[0] + (w[0]-prev[0])*t, prev[1] + (w[1]-prev[1])*t, w[2]];
+                        break;
+                    }
+                    acc += d; prev = *w; carrot = *w;
+                }
+                cache.local = col.find_path_res(p, carrot, 1.0, &[], true, 2.0, Some(FINE_VIS)).unwrap_or_default();
                 cache.path_goal = Some(goal);
                 cache.path_age = 0;
             } else {
                 cache.path_age += 1;
             }
-            let pts: Vec<egui::Pos2> = std::iter::once(p).chain(cache.path.iter().copied())
-                .filter_map(on_screen).collect();
-            for pair in pts.windows(2) {
-                painter.line_segment([pair[0], pair[1]], egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 230, 40)));
+            // Coarse (yellow).
+            let cp: Vec<egui::Pos2> = std::iter::once(p).chain(cache.path.iter().copied()).filter_map(on_screen).collect();
+            for pair in cp.windows(2) {
+                painter.line_segment([pair[0], pair[1]], egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(255, 230, 40, 150)));
             }
-            for wp in &pts { painter.circle_filled(*wp, 3.0, egui::Color32::from_rgb(255, 140, 0)); }
+            for wp in &cp { painter.circle_filled(*wp, 2.5, egui::Color32::from_rgb(255, 140, 0)); }
+            // Fine local plan (cyan) — the line the walker follows.
+            let lp: Vec<egui::Pos2> = std::iter::once(p).chain(cache.local.iter().copied()).filter_map(on_screen).collect();
+            for pair in lp.windows(2) {
+                painter.line_segment([pair[0], pair[1]], egui::Stroke::new(3.0, egui::Color32::from_rgb(80, 230, 255)));
+            }
             if let Some(sp) = on_screen(goal) {
                 if cache.path.is_empty() { painter.circle_filled(sp, 6.0, egui::Color32::RED); }
                 painter.circle_stroke(sp, 9.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 255, 0)));
             }
         } else {
             cache.path.clear();
+            cache.local.clear();
             cache.path_goal = None;
         }
     });
