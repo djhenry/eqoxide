@@ -1127,6 +1127,19 @@ impl Collision {
         };
         const CHEST: f32 = 3.0;
         const MAX_NODES: usize = 200_000;
+        // Wall-clock budget (#257). A* runs synchronously on the NETWORK thread, so an
+        // expensive search (measured at 14–17 s in the pathological submerged-start → far-goal
+        // case) blocks the net loop long enough that no position/keepalive packet goes out —
+        // EQEmu's MQGhost anti-cheat then trips and the server kicks the client as linkdead.
+        // A node cap alone doesn't bound wall-clock (per-node cost swings widely with geometry
+        // density), so cap the search by TIME: once the budget elapses we stop and fall through
+        // to the same partial-path fallback used when MAX_NODES is hit, so the walker still makes
+        // forward progress and re-plans from there. This bounds the net-thread stall to roughly
+        // the budget regardless of how pathological the query is. A normal plan finishes far
+        // under it, so ordinary navigation is unaffected.
+        const PLAN_BUDGET_MS: u64 = 150;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(PLAN_BUDGET_MS);
+        let mut timed_out = false;
         // Aggro-avoidance (#67): softly bias A* AWAY from cells near NPCs so long routes skirt mob
         // camps instead of plowing through them and getting the player killed. Proactive (before
         // aggro) and faction-agnostic — the client has no broad faction data, so it avoids ALL
@@ -1190,6 +1203,14 @@ impl Collision {
             }
             expanded += 1;
             if expanded > MAX_NODES { break; }
+            // Time-cap the search so it can never starve the net thread (#257). Check every 128
+            // expansions — Instant::now() is ~20ns so the overhead is negligible, and the
+            // worst-case overrun past the deadline is one 128-node batch (tens of ms), keeping the
+            // total stall an order of magnitude under the linkdead threshold.
+            if expanded & 0x7F == 0 && std::time::Instant::now() >= deadline {
+                timed_out = true;
+                break;
+            }
             // Track the closest-to-goal cell reached (heuristic = straight-line cells to the goal),
             // for the partial-path fallback below.
             let hd = h(c, r);
@@ -1447,13 +1468,20 @@ impl Collision {
                 let progressed = best_toward.is_some() && best_toward_h + 1.0 < h(sc, sr);
                 match best_toward {
                     Some(bk) if allow_partial && progressed => {
-                        tracing::info!("find_path: partial route toward goal (expanded={}, {:.0}->{:.0} cells from goal)",
-                            expanded, h(sc, sr), best_toward_h);
+                        tracing::info!("find_path: partial route toward goal (expanded={}, {:.0}->{:.0} cells from goal{})",
+                            expanded, h(sc, sr), best_toward_h,
+                            if timed_out { ", TIMED OUT" } else { "" });
                         (bk, false)
                     }
                     _ => {
-                        tracing::info!("find_path: no route (expanded={}, cap={}, start_floor={}, goal_floor={})",
-                            expanded, MAX_NODES, start_floor, goal_floor);
+                        if timed_out {
+                            tracing::warn!("find_path: search timed out after {}ms ({} nodes) with no usable route \
+                                — start_floor={start_floor} goal_floor={goal_floor} (#257 net-thread time cap)",
+                                PLAN_BUDGET_MS, expanded);
+                        } else {
+                            tracing::info!("find_path: no route (expanded={}, cap={}, start_floor={}, goal_floor={})",
+                                expanded, MAX_NODES, start_floor, goal_floor);
+                        }
                         return None;
                     }
                 }
@@ -1639,6 +1667,29 @@ mod tests {
         let goal_s = [16.0 + 20.0, 20.0, 30.0];
         let full = steep.find_path(start, goal_s, 1.0, &[], false);
         assert!(full.is_none(), "a 1.875-grade ramp is too steep — A* must not route up it");
+    }
+
+    /// #257: the net-thread wall-clock budget (PLAN_BUDGET_MS) must be generous enough that a
+    /// large but ordinary open-terrain plan still routes ALL the way to the goal — the cap only
+    /// truncates pathological searches, never a legitimate long walk. A big empty floor is the
+    /// cheap-per-node case, so a full corner-to-corner route completes far under the budget.
+    #[test]
+    fn find_path_large_open_plan_is_not_truncated_by_time_cap() {
+        let big = MeshData {
+            positions: vec![
+                [-320.0, 0.0, -320.0], [320.0, 0.0, -320.0], [320.0, 0.0, 320.0], [-320.0, 0.0, 320.0],
+            ],
+            normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
+            texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let col = Collision::build(&ZoneAssets { terrain: vec![big], objects: vec![], textures: vec![] }, 32.0);
+        // World [east, north, up]: opposite corners of the plane, ~800u apart (~100 nav cells).
+        let path = col.find_path([-300.0, -300.0, 0.0], [300.0, 300.0, 0.0], 1.0, &[], false)
+            .expect("a large open plane must route fully corner-to-corner within the time budget");
+        let last = *path.last().unwrap();
+        assert!((last[0] - 300.0).abs() < 8.0 && (last[1] - 300.0).abs() < 8.0,
+            "route must reach the far corner (not a truncated partial), got {last:?}");
     }
 
     /// eqoxide#190: A* must route across a horizontal floor GAP a running jump can clear (a
