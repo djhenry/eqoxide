@@ -47,6 +47,7 @@ pub async fn run_gameplay_phase(
         let s  = stream.as_mut().expect("stream always Some in loop");
         let rx = net_rx.as_mut().expect("net_rx always Some in loop");
         s.poll_recv();
+        s.poll_resend(); // retransmit un-ACKed reliables so a lost packet doesn't linkdead us (#254)
 
         // Relaxed: the flag is a self-contained shutdown signal with no happens-before
         // dependency on other data published by the setter (/exit or window-close).
@@ -418,6 +419,7 @@ async fn perform_clean_shutdown(
     let deadline = std::time::Instant::now() + Duration::from_millis(150);
     while std::time::Instant::now() < deadline {
         s.poll_recv();
+        s.poll_resend(); // (#254)
         while rx.try_recv().is_ok() {}
         sleep(Duration::from_millis(10)).await;
     }
@@ -464,6 +466,7 @@ async fn reconnect_via_world(
 
     while std::time::Instant::now() < deadline && zone_server.is_none() {
         world_stream.poll_recv();
+        world_stream.poll_resend(); // retransmit OP_SEND_LOGIN_INFO/ENTER_WORLD across the handoff (#254)
         while let Ok(packet) = world_rx.try_recv() {
             let _ = app_tx.send(packet.clone());
             match packet.opcode {
@@ -549,6 +552,7 @@ async fn run_zone_entry_handshake(
 
     while std::time::Instant::now() < deadline && !done_client_ready {
         stream.poll_recv();
+        stream.poll_resend(); // retransmit OP_ZONE_ENTRY/ReqClientSpawn during zone-in (#254)
         while let Ok(packet) = net_rx.try_recv() {
             apply_packet(gs, &packet);
             let _ = app_tx.send(packet.clone());
