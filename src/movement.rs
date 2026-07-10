@@ -13,14 +13,14 @@ use crate::assets::Collision;
 pub const PLAYER_RADIUS: f32 = 1.0;
 /// Skin width kept between the cylinder and the surface after a swept hit.
 const SKIN: f32 = 0.05;
-/// Native step-up height (`_DAT_009c58e8 = 2.0f`). Used for free WASD movement.
-const STEP_UP: f32 = 2.0;
-/// Step-up height the `/goto` planner permits (via [`MoveIntent::climb`]). Matches `find_path`'s
-/// edge-climb cap (`Collision::find_path` `STEP_H = 20.0`): whatever A* routes over as a connected
-/// walkable ledge, the controller can then actually climb — so it no longer wedges on the small
-/// fences/cart lips that gate penned content (#41). The floor-existence guard in `try_step_up`
-/// still only mounts a real surface, so this is not a wall-scaling cheat.
-pub const NAV_CLIMB: f32 = 20.0;
+/// Native step-up height (`_DAT_009c58e8 = 2.0f`, RoF2 client decompile). This is a HARD cap: the
+/// native client can auto-step a ledge at most 2.0u tall; anything taller is a wall (jump or go
+/// around) — there is no larger climb and no separate slope check. It is the single source of truth
+/// for how high nav may climb, so `find_path` derives its edge-climb cap (`STEP_H`) from it. Both
+/// free WASD and the nav walker are clamped to this — navigation must never climb what a WASD player
+/// can't (#239). (Was decoupled from a super-human `NAV_CLIMB = 20.0`, which teleported the walker up
+/// 20u ridges/invisible walls and stranded it on the high side of boundaries.)
+pub const STEP_UP: f32 = 2.0;
 /// Ground-probe origin above the feet (`_DAT_009c3390 = 1.0f`).
 const GROUND_ORIGIN: f32 = 1.0;
 /// Ground-probe downward range (`_DAT_009c58e4 = 200.0f`).
@@ -193,9 +193,12 @@ impl CharacterController {
             let low_prog = hlen([low_pos[0] - self.pos[0], low_pos[1] - self.pos[1], 0.0]);
             let mut applied = [low_pos[0], low_pos[1], self.pos[2]];
             let mut stepped = false;
-            // Free WASD uses the native 2u step; the nav planner raises `climb` to NAV_CLIMB so the
-            // controller can follow find_path over fence/cart lips it routed across (#41).
-            let max_step = STEP_UP.max(intent.climb);
+            // Step-up is the native 2u for BOTH free WASD and nav (#239): nav must not be able to
+            // climb anything a WASD player can't. Fence/cart lips taller than 2u are crossed the way
+            // a real player does — via `hop`, below — not climbed. (`intent.climb` no longer raises
+            // this; it used to carry the super-human NAV_CLIMB=20.)
+            let _ = intent.climb;
+            let max_step = STEP_UP;
             // Allow step-up while SWIMMING too, not just when grounded: that's how a character hauls
             // OUT of water onto the shore (swimming clears on_ground, so without this it just presses
             // into the bank lip at the surface and can't climb the last few units, #191).
@@ -590,9 +593,12 @@ mod tests {
     }
 
     #[test]
-    fn nav_climb_surmounts_a_fence_lip_that_walk_cannot() {
-        // A 6u lip (fence/cart) the native 2u step can't clear but find_path routes over: floor z=0,
-        // a 6u riser at east=5, floor z=6 beyond. This is the Halas sled-dog pen case (#41).
+    fn nav_does_not_scale_a_lip_taller_than_the_native_step() {
+        // A 6u lip: floor z=0, a 6u riser at east=5, floor z=6 beyond. #239: nav must move like a
+        // WASD player — the native 2u step-up can't mount a 6u riser, and the old NAV_CLIMB=20
+        // super-step is gone — so nav is blocked at the lip exactly like WASD. (find_path now routes
+        // AROUND such lips: its feet-level path_clear rejects the >2.5u riser; a THIN fence with flat
+        // floor on both sides is crossed by `hop`, not climb — see the hop test below.)
         let geo = || col(vec![floor(0.0, -100.0, 5.0), wall(5.0, 0.0, 6.0), floor(6.0, 5.0, 100.0)]);
 
         // Free WASD (climb=0 → native 2u step): blocked at the lip, stays at z=0.
@@ -602,14 +608,14 @@ mod tests {
         assert!(wasd.pos[0] < 5.1, "WASD must NOT scale a 6u lip: east={}", wasd.pos[0]);
         assert!(wasd.pos[2] < 1.0, "WASD should stay at floor z=0: {}", wasd.pos[2]);
 
-        // Nav (climb=NAV_CLIMB): climbs the lip and stands on the z=6 surface inside the pen.
+        // Nav is now capped at the same native step-up (no NAV_CLIMB): also blocked, also at z=0.
         let nav_intent = MoveIntent { wish_dir: [1.0, 0.0], wish_vspeed: 0.0, jump: false,
-            want_swim: false, speed: 35.0, climb: NAV_CLIMB, hop: false };
+            want_swim: false, speed: 35.0, climb: 0.0, hop: false };
         let mut nav = CharacterController::new([3.0, 0.0, 0.0]);
         nav.on_ground = true;
         for _ in 0..5 { nav.step(nav_intent, 0.1, &geo()); }
-        assert!(nav.pos[0] > 5.0, "nav should climb past the lip edge: east={}", nav.pos[0]);
-        assert!((nav.pos[2] - 6.0).abs() < 0.3, "nav should stand on the 6u ledge: {}", nav.pos[2]);
+        assert!(nav.pos[0] < 5.1, "nav must NOT scale a 6u lip either (#239): east={}", nav.pos[0]);
+        assert!(nav.pos[2] < 1.0, "nav should stay at floor z=0: {}", nav.pos[2]);
     }
 
     #[test]
@@ -626,7 +632,7 @@ mod tests {
 
         // Nav with hop commanded: hops the fence and lands on the flat floor beyond (z≈0, east>5).
         let nav_intent = MoveIntent { wish_dir: [1.0, 0.0], wish_vspeed: 0.0, jump: false,
-            want_swim: false, speed: 35.0, climb: NAV_CLIMB, hop: true };
+            want_swim: false, speed: 35.0, climb: 0.0, hop: true };
         let mut nav = CharacterController::new([2.0, 0.0, 0.0]);
         nav.on_ground = true;
         for _ in 0..40 { nav.step(nav_intent, 0.05, &geo()); }

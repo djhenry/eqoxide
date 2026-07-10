@@ -583,6 +583,35 @@ fn plan_path(
     None
 }
 
+/// A pure-pursuit carrot: the point `reach` units along `path` (starting from segment `start_i`),
+/// measured from the projection of `from` onto that segment. Returns `[east, north, z]`, carrying the
+/// z of the segment the carrot lands on. Used at two scales: a far carrot (~LOCAL_REACH) as the fine
+/// plan's goal, and a near carrot (LOOK_AHEAD) along the fine plan as the steering aim.
+fn carrot_along(path: &[[f32; 3]], start_i: usize, from: [f32; 2], reach: f32) -> Option<[f32; 3]> {
+    let a = *path.get(start_i)?;
+    let b = path.get(start_i + 1).copied().unwrap_or(a);
+    let ab = [b[0] - a[0], b[1] - a[1]];
+    let l2 = ab[0] * ab[0] + ab[1] * ab[1];
+    let t = if l2 < 1e-6 { 0.0 } else { (((from[0] - a[0]) * ab[0] + (from[1] - a[1]) * ab[1]) / l2).clamp(0.0, 1.0) };
+    let mut cur = [a[0] + ab[0] * t, a[1] + ab[1] * t];
+    let (mut rem, mut i, mut cz) = (reach, start_i, b[2]);
+    loop {
+        match path.get(i + 1).copied() {
+            Some(bp) => {
+                cz = bp[2];
+                let d = [bp[0] - cur[0], bp[1] - cur[1]];
+                let dl = (d[0] * d[0] + d[1] * d[1]).sqrt();
+                if dl >= rem || i + 2 >= path.len() {
+                    let c = if dl < 1e-6 { cur } else { [cur[0] + d[0] * (rem / dl).min(1.0), cur[1] + d[1] * (rem / dl).min(1.0)] };
+                    break Some([c[0], c[1], cz]);
+                }
+                rem -= dl; cur = [bp[0], bp[1]]; i += 1;
+            }
+            None => break Some([cur[0], cur[1], cz]),
+        }
+    }
+}
+
 pub struct Navigator {
     goto_target:      GotoTarget,
     /// Live nav state for GET /v1/observe/debug (#166): idle|navigating|arrived|no_path|blocked.
@@ -660,6 +689,11 @@ pub struct Navigator {
     path:             Vec<[f32; 3]>,  // [east, north, floor_z] per waypoint
     path_i:           usize,
     path_goal:        Option<(f32, f32, f32)>,
+    /// Fine LOCAL A* plan (2u grid, bounded) the walker actually steers along, re-run each tick from
+    /// the player toward a carrot ~LOCAL_REACH ahead on the coarse `path`. It threads sub-8u detail
+    /// (thin ramps, narrow openings) the coarse grid can't see. Empty = coarse aim (fine plan failed
+    /// or no coarse path). Two-tier planner (#nav-multires).
+    local_path:       Vec<[f32; 3]>,
     /// The spawn id the pet was last ordered to attack (avoids re-spamming OP_PetCommands every
     /// tick). Reset when the target changes; see the auto-pet-combat block.
     last_pet_target:  Option<u32>,
@@ -815,6 +849,7 @@ impl Navigator {
             path: Vec::new(),
             path_i: 0,
             path_goal: None,
+            local_path: Vec::new(),
             last_pet_target: None,
             falling: None,
             fall_start_z: 0.0,
@@ -1609,6 +1644,25 @@ impl Navigator {
         // (independent of the 150 ms planner gate below). This is the single position authority.
         self.stream_position(stream, gs);
 
+        // FAST STEERING (#nav-multires). The plans (`path`, `local_path`) are refreshed on the 150ms
+        // gate below, but the controller runs at ~100Hz — driving a 150ms-stale heading overshoots
+        // every turn by up to RUN_SPEED·0.15 ≈ 6.6u and clips walls (the "not following the line"
+        // bug). So each loop (~10ms), re-project the CURRENT position onto the stable fine path and
+        // refresh ONLY nav_intent's `wish_dir` (+ facing) — the flags/speed the walker set stay. The
+        // carrot slides along the line as we move, so the avatar hugs it through tight turns.
+        if !self.local_path.is_empty() && self.goto_target.lock().unwrap().is_some() {
+            if let Some(aim) = carrot_along(&self.local_path, 0, [gs.player_x, gs.player_y], 5.0) {
+                let (dx, dy) = (aim[0] - gs.player_x, aim[1] - gs.player_y);
+                let d = (dx * dx + dy * dy).sqrt();
+                if d > 1e-3 {
+                    if let Some(intent) = self.nav_intent.lock().unwrap().as_mut() {
+                        intent.wish_dir = [dx / d, dy / d];
+                    }
+                    gs.player_heading = eq_heading(dx, dy);
+                }
+            }
+        }
+
         if self.last_tick.elapsed().as_millis() < NAV_TICK_MS {
             return;
         }
@@ -1750,7 +1804,7 @@ impl Navigator {
                                 jump:        false,
                                 want_swim:   swim,
                                 speed:       RUN_SPEED,
-                                climb:       crate::movement::NAV_CLIMB, // surmount fence/cart lips find_path routed over (#41)
+                                climb:       0.0, // nav uses the native step-up now (#239); fences handled by hop
                                 hop:         false,                      // melee approach: no auto-hop
                             });
                         } else {
@@ -1902,29 +1956,31 @@ impl Navigator {
             if t >= 1.0 { self.path_i += 1; } else { break; }
         }
         let have_path = !self.path.is_empty();
-        let target = if let Some(&a) = self.path.get(self.path_i) {
-            let b = self.path.get(self.path_i + 1).copied().unwrap_or(a);
-            let ab = [b[0] - a[0], b[1] - a[1]];
-            let l2 = ab[0] * ab[0] + ab[1] * ab[1];
-            let t = if l2 < 1e-6 { 0.0 } else { (((px - a[0]) * ab[0] + (py - a[1]) * ab[1]) / l2).clamp(0.0, 1.0) };
-            let mut cur = [a[0] + ab[0] * t, a[1] + ab[1] * t];
-            let (mut rem, mut i, mut cz) = (LOOK_AHEAD, self.path_i, b[2]);
-            let carrot = loop {
-                match self.path.get(i + 1).copied() {
-                    Some(bp) => {
-                        cz = bp[2];
-                        let d = [bp[0] - cur[0], bp[1] - cur[1]];
-                        let dl = (d[0] * d[0] + d[1] * d[1]).sqrt();
-                        if dl >= rem || i + 2 >= self.path.len() {
-                            break if dl < 1e-6 { cur } else { [cur[0] + d[0] * (rem / dl).min(1.0), cur[1] + d[1] * (rem / dl).min(1.0)] };
-                        }
-                        rem -= dl; cur = [bp[0], bp[1]]; i += 1;
-                    }
-                    None => break cur,
-                }
+        let target: (f32, f32, f32) = if have_path {
+            // Coarse aim: look-ahead carrot on the 8u global route (the fallback).
+            let coarse = carrot_along(&self.path, self.path_i, [px, py], LOOK_AHEAD)
+                .unwrap_or([goal.0, goal.1, gs.player_z]);
+            // TWO-TIER (#nav-multires): thread sub-8u detail near the walker. Plan a FINE 2u route
+            // (bounded → cheap, re-run every tick) from here to a carrot ~LOCAL_REACH ahead on the
+            // coarse route, and steer along IT. This keeps the walker on thin ramps and threads narrow
+            // openings the 8u grid can't resolve. Fall back to the coarse aim if the fine plan can't
+            // reach (a real local dead-end), so a local snag never stalls the whole route.
+            const LOCAL_REACH: f32 = 24.0;   // how far ahead on the coarse route the fine plan aims
+            const LOCAL_CELL:  f32 = 2.0;    // fine grid resolution
+            const LOCAL_BOUND: f32 = 40.0;   // cap the fine search radius (keeps it cheap)
+            let local_goal = carrot_along(&self.path, self.path_i, [px, py], LOCAL_REACH).unwrap_or(coarse);
+            self.local_path = self.collision.read().unwrap().as_ref()
+                .and_then(|c| c.find_path_res([px, py, gs.player_z], local_goal,
+                    crate::movement::PLAYER_RADIUS, &[], true, LOCAL_CELL, Some(LOCAL_BOUND)))
+                .unwrap_or_default();
+            let aim = if self.local_path.len() >= 2 {
+                carrot_along(&self.local_path, 0, [px, py], LOOK_AHEAD).unwrap_or(coarse)
+            } else {
+                coarse
             };
-            (carrot[0], carrot[1], cz)
+            (aim[0], aim[1], aim[2])
         } else {
+            self.local_path.clear();
             // No path computed: straight-line toward the goal at the player's CURRENT height.
             (goal.0, goal.1, gs.player_z)
         };
@@ -2095,7 +2151,7 @@ impl Navigator {
             jump,
             want_swim:   swim,
             speed:       RUN_SPEED,
-            climb:       crate::movement::NAV_CLIMB, // surmount fence/cart lips find_path routed over (#41)
+            climb:       0.0, // nav uses the native step-up now (#239); fences handled by hop
             // Net progress has stalled toward this waypoint → ask the controller to hop the barrier
             // (it only does if grounded, off cooldown, and a near-level landing exists beyond). (#41)
             hop:         self.stuck_ticks >= NAV_HOP_TICKS,
