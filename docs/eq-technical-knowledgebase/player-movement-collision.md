@@ -298,6 +298,136 @@ The native client is position-authoritative: it never receives its own position 
 
 ---
 
+## 12. Max Walkable Slope — NO Explicit Angle/Normal Test Found
+
+Traced the full ground-movement path (`FUN_0043e8c0` movement-command switch case
+`0x17b`, `eqgame.exe.c:46259-46368`; the raw ground-clamp `FUN_00507230`,
+`eqgame.exe.c:160473`; and the candidate-validate `FUN_00506a20`,
+`eqgame.exe.c:160147-160206`). **No dot-product / surface-normal / degree-threshold
+comparison exists anywhere in this path.** There is no `MaxSlope` constant.
+
+The two gates that exist are purely §2 (unrestricted vertical floor-snap, foot+1
+down 200, **no cap on the magnitude of the Z change**) and §3/§4 (a forward
+LOS/sphere obstruction test, radius 1.0, at a probe height `z_old + 2.0`
+(`_DAT_009c58e8`, confirmed `case 0x17b` line 46264/46307)). Concretely:
+
+- If the forward LOS ray at `z_old + 2.0` is **not** obstructed, the move commits
+  and Z re-snaps to *whatever floor is found* — **no matter how large the Z
+  delta is**. A continuous ramp of any steepness is walkable up to the point
+  where the ramp surface itself intersects that forward ray, i.e. where the
+  **local rise exceeds ~2.0 units within the per-tick horizontal travel
+  distance**. At normal run speed (~44 u/s) and a render-frame tick, horizontal
+  travel per tick is well under 2 units, so the *effective* tolerated grade for
+  smooth, continuously-sampled ramps is very high (near-vertical faces are the
+  practical limit, not a fixed angle) — this matches the well-known EQ player
+  experience of "cheesing" absurdly steep terrain by approaching it that way,
+  which native EQ has always allowed because there never was a real slope check.
+- A **discrete** riser (stair edge, curb, fence rail) that's taller than ~2.0
+  units directly in the path DOES intersect the z_old+2.0 ray and is rejected —
+  this is what reads as a step-height cap (§4), not a slope cap.
+
+**Confidence:** the absence-of-a-check claim is as strong as a full trace of the
+cited functions can make it (no stray float comparison against a normal.z or
+`cos(angle)`-shaped constant appears anywhere in the reachable code). The
+"effective grade from ray-height / per-tick travel distance" reasoning above is
+**inference**, not a literal cited constant — there is no single native "max
+slope" number to port to eqoxide; slope-walkability is emergent, not declared.
+
+## 13. Slope Slide Behavior — Block, Not Slide
+
+Per §5 (already established): there is no wall-slide/tangent vector computed
+anywhere in the traced path. A move that fails the forward-obstruction test
+simply does not apply that tick — the player is **blocked in place** (can still
+turn/attempt other headings), not physically slid back down the face. This
+applies identically whether the obstruction is a genuine wall or a too-steep
+local rise that intersects the step-up ray. There is no separate "on-slope"
+downhill-slide force in the ground-movement code (any slide-like drift players
+report near steep terrain is `depenetrate`-adjacent geometry noise, not a
+declared physics feature).
+
+## 14. Fences / Low Walls / Carts — Same 2.0u Ray, No Distinct "Vault"
+
+There is no separate code path for climbing over a fence/cart rail. It uses the
+exact same z_old+2.0 forward-obstruction ray as any other terrain: if the
+rail's top is below the ray height (`z_old + 2.0`), the ray clears and the
+floor-snap (§2, unrestricted) pops the player onto it (walking-over a low
+rail/curb). If the rail is taller than ~2.0 units, the ray is blocked and the
+native client treats it as a plain wall — the **only** ways past it are jump
+(§15) or walking around; there is no "auto-vault" for anything taller than the
+ordinary step height. This directly answers the "super-human climb" question:
+**native RoF2 has no discrete-obstacle climb bigger than ~2.0 units under any
+circumstances** during ground movement.
+
+## 15. Jump — Not Recoverable From This Decompile Pass (Gap)
+
+No jump-impulse or gravity-accel constant was identified in this pass — the
+input-command giant switch (`FUN_0043e8c0`) has many unlabeled cases and the
+specific jump case (bound to a keybind ID, not found by string/opcode grep
+since the binary is stripped) was not isolated in the time budget available.
+**This is an open gap**, not a "confirmed absent" finding — jump almost
+certainly exists as a `vel_z += const` on a `Space`-bound command elsewhere in
+this same function, but pinning down which numbered case, and the vertical
+velocity / gravity-decel constants it uses, needs either (a) more exhaustive
+jump-table tracing in `capstone/eqgame.exe.asm` around `FUN_0043e8c0`
+(`0x0043e8c0`-`0x00441a00`, asm lines 86265-90029), or (b) the cheaper route:
+capture real `OP_ClientUpdate` telemetry (z_pos over time, §8) during a live
+jump and curve-fit `v0`/`g` from the parabola — no live client access was used
+for this note (offline decompile only, per this agent's constraints).
+
+eqoxide's own `movement.rs:28-36` already flags its `GRAVITY = 120.0` /
+`JUMP_VELOCITY = 31.0` (peak ≈ 4.0u) as an approximation pending decompile/live
+verification — this pass did not resolve that; still open.
+
+## 16. eqoxide `NAV_CLIMB` Cross-Check (movement.rs / assets.rs, read `HEAD` of this worktree)
+
+Confirmed by reading `src/movement.rs` and `src/assets.rs` directly (not the
+client — this is an eqoxide-side finding, recorded here because it's the direct
+answer to "what should replace NAV_CLIMB"):
+
+- `PLAYER_RADIUS = 1.0` (`movement.rs:13`) and `STEP_UP = 2.0` (`movement.rs:17`)
+  **already match native exactly** (§3, §4/§14 above). Good — no change needed
+  for the WASD path.
+- `NAV_CLIMB = 20.0` (`movement.rs:23`) is fed into `try_step_up` as `max_step`
+  (`movement.rs:198,368-380`) **only when `slide()` reports the horizontal move
+  blocked** (`low_hit`, `movement.rs:202`). `try_step_up` **teleports** the
+  cylinder to `pos.z + max_step`, sweeps, and — if a floor is found in-band —
+  snaps straight there in one frame (`movement.rs:369-376`). At `NAV_CLIMB=20`
+  this is a literal one-frame 20-unit vertical teleport with no native
+  counterpart at all (§14: native's discrete-obstruction climb caps at ~2.0u,
+  period).
+- **Continuous ramps do not need `NAV_CLIMB`.** The vertical ground-clamp for
+  an on-ground character re-snaps upward **unconditionally** whenever the new
+  floor is higher (`movement.rs:286`, `Some(f) if ... || f > foot => self.pos[2]
+  = f`) — this already matches native's unrestricted floor-snap (§2/§12) with no
+  magnitude cap. A rising ramp is walked by ordinary forward `slide()` +
+  per-frame ground-snap and never even reaches `try_step_up` unless the ramp is
+  steep enough to intersect the `slide()` chest-height ray (`CHEST = 4.0`,
+  `movement.rs:316`) — which is exactly the case A*'s `MAX_WALK_GRADE` (`assets.rs:1069`)
+  is already built to keep out of the routed graph (per its own `#212` comment).
+  So `try_step_up` firing for a *routed* ramp edge should be rare in practice;
+  when it *does* fire, it should behave like native — cap at 2.0u, not 20.
+
+**Recommendation:** eliminate `NAV_CLIMB` as a distinct, larger constant.
+`intent.climb` should not exceed `STEP_UP` (2.0) for genuine step resolution —
+matching native's real limit exactly. For a fence/cart lip between ~2u and
+whatever a running jump clears, use the **existing** `NAV_HOP_VELOCITY` /
+`can_hop` mechanism (`movement.rs:52,386-399`, already built for exactly this,
+issue #41) instead of inflating the climb — that's what a real player does
+(jump it), not an instant teleport-climb. If a specific routed A* edge still
+can't be traversed by 2.0u-step + hop, the fix belongs in A* (reject/avoid that
+edge, or add a jump-edge per the existing `running_jump_reach` mechanism at
+`assets.rs:1070-1078`, already used for horizontal gaps) — not in raising the
+controller's instantaneous climb budget.
+
+## 17. Comparison Table Addendum
+
+| Parameter | Native RoF2 | eqoxide | Notes |
+|---|---|---|---|
+| Max walkable slope | **no explicit check** — emergent from step-ray vs local rise (§12) | `MAX_WALK_GRADE = 1.2` (A*, `assets.rs:1069`) | Not a literal client constant; a reasonable coarse-grid conservative approximation. No native number to replace it with — keep as a tunable, not "fix" to a cited value. |
+| Slope behavior | **block, not slide** (§13) | matches (`slide()` has no slide-down force) | Consistent. |
+| Discrete obstacle climb (fence/curb) | **~2.0u max, always** (§14) | `STEP_UP=2.0` (WASD, correct) vs `NAV_CLIMB=20.0` (nav, super-human) | `NAV_CLIMB` is the one confirmed mismatch (§16) — drop it to `STEP_UP`. |
+| Jump impulse / gravity | not recovered this pass (§15) | `JUMP_VELOCITY=31.0`, `GRAVITY=120.0` (peak ≈4.0u) | Open — approximation, self-flagged in `movement.rs:31-35`. |
+
 ## Related Topics
 
 - `swimming-and-fall-damage.md` — water regions, fall-damage self-report, and
