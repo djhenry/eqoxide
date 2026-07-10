@@ -2,9 +2,10 @@
 //!
 //! Ported from the Python reference at eq_client/connection/stream.py.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 use std::net::SocketAddr;
+use std::time::Instant;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -15,6 +16,25 @@ use super::protocol::*;
 /// zone-in spawn burst in one wake, but bounded so a sustained flood can't monopolize the loop —
 /// anything beyond this drains on the next wake ~10 ms later. (#153)
 const MAX_DATAGRAMS_PER_POLL: usize = 4096;
+
+// ── Reliable-send retransmission (#254) ──────────────────────────────────────
+// Mirrors EQEmu's Network resend rules (zone/world main.cpp: base=100ms, factor=1.5, min=300,
+// max=5000) with rolling_ping seeded at 500ms → first resend ≈ 500·1.5 + 100 = 850ms, then doubled
+// per attempt and clamped. The server drops the session (resend_timeout) at 30s of an un-ACKed oldest
+// packet, so resending well inside that window keeps the ordered stream alive.
+const RESEND_BASE_MS: u64 = 850;   // first-attempt delay
+const RESEND_MIN_MS:  u64 = 300;   // clamp floor
+const RESEND_MAX_MS:  u64 = 5000;  // clamp ceiling (steady-state cadence on a dead link)
+/// Cap on datagrams resent in a single go-back-N pass (EQEmu MAX_CLIENT_RECV_PACKETS_PER_WINDOW).
+const MAX_RESEND_PER_PASS: usize = 300;
+
+/// Backoff before the Nth retransmit of the oldest outstanding reliable packet: `RESEND_BASE_MS`
+/// doubled per prior attempt, clamped to `[RESEND_MIN_MS, RESEND_MAX_MS]`. `retries` is shifted-capped
+/// so the `<<` can't overflow.
+fn resend_delay(retries: u32) -> std::time::Duration {
+    let ms = (RESEND_BASE_MS << retries.min(4)).clamp(RESEND_MIN_MS, RESEND_MAX_MS);
+    std::time::Duration::from_millis(ms)
+}
 
 // ── CRC32 table ────────────────────────────────────────────────────────────
 
@@ -280,6 +300,24 @@ fn classify_seq(seq: u16, next_recv_seq: u16) -> SeqClass {
     }
 }
 
+/// Serial-number "`a` is at or before `b`" (RFC 1982), handling u16 wrap. Used to decide which
+/// buffered reliable sends a CUMULATIVE inbound `OP_ACK(acked)` acknowledges: `a` is acked when
+/// `seq_leq(a, acked)`. `a == b` counts as ≤. Pure so the ack/window logic is unit-tested off-socket.
+fn seq_leq(a: u16, b: u16) -> bool {
+    b.wrapping_sub(a) < 0x8000
+}
+
+/// A reliable protocol datagram we've sent but the server has not yet ACKed, kept verbatim (the exact
+/// on-wire bytes, post-encode + CRC) so it can be retransmitted unchanged until acknowledged. Without
+/// retransmission a single lost/reordered reliable stalls the server's ordered receive window and it
+/// drops us as linkdead — worst at zone handoffs (#254).
+struct Sent {
+    seq: u16,
+    datagram: Vec<u8>,
+    sent_at: Instant,
+    retries: u32,
+}
+
 pub struct EqStream {
     session: SessionInfo,
     socket: UdpSocket,
@@ -288,6 +326,9 @@ pub struct EqStream {
     send_seq: u16,
     next_recv_seq: u16,
     recv_buf: HashMap<u16, (Vec<u8>, bool)>, // seq → (data, is_fragment)
+    /// Sent-but-unACKed reliable datagrams, in send order, retransmitted on OP_OutOfOrder / timeout
+    /// until the server ACKs their sequence (#254). Cumulative OP_ACK pops from the front.
+    sent: VecDeque<Sent>,
     frags: FragmentBuffer,
     app_tx: mpsc::UnboundedSender<AppPacket>,
 }
@@ -309,6 +350,7 @@ impl EqStream {
             send_seq: 0,
             next_recv_seq: 0,
             recv_buf: HashMap::new(),
+            sent: VecDeque::new(),
             frags: FragmentBuffer::new(),
             app_tx,
         };
@@ -401,6 +443,40 @@ impl EqStream {
         true
     }
 
+    /// Retransmit un-ACKed reliable datagrams (#254). Timer-driven **go-back-N**, mirroring EQEmu's
+    /// `ReliableStreamConnection::ProcessResend`: once the OLDEST outstanding packet's backoff has
+    /// elapsed, resend the WHOLE outstanding window (verbatim, same sequences) and double each entry's
+    /// backoff (clamped). Nothing here fires until a packet has actually gone un-ACKed past its delay,
+    /// so calling it every ~10 ms loop tick is cheap. This is what stops a single lost/reordered
+    /// reliable from stalling the server's ordered receive window and getting us dropped as linkdead —
+    /// most exposed at zone handoffs, where a fresh session must land OP_ZoneEntry/ReqClientSpawn.
+    /// Backoff is capped so a truly dead link just re-sends every RESEND_MAX_MS until the server's 30 s
+    /// resend_timeout drops the session and the reconnect path takes over.
+    pub fn poll_resend(&mut self) {
+        let now = Instant::now();
+        let due = match self.sent.front() {
+            Some(front) => now.saturating_duration_since(front.sent_at) >= resend_delay(front.retries),
+            None => return,
+        };
+        if !due {
+            return;
+        }
+        // Go-back-N: resend the whole outstanding window (bounded per pass like the server's
+        // MAX_CLIENT_RECV_PACKETS_PER_WINDOW). Indexed so socket + buffer borrows stay disjoint.
+        let n = self.sent.len().min(MAX_RESEND_PER_PASS);
+        // Steady-state this should be silent: healthy ACKs keep the window empty. A sustained stream of
+        // these means ACKs aren't clearing the window (loss, or an ack-decode mismatch) — useful signal.
+        tracing::debug!(
+            "NET: retransmitting {} un-ACKed reliable(s), oldest seq={} retries={} (#254)",
+            n, self.sent[0].seq, self.sent[0].retries,
+        );
+        for i in 0..n {
+            let _ = self.socket.try_send(&self.sent[i].datagram);
+            self.sent[i].sent_at = now;
+            self.sent[i].retries = self.sent[i].retries.saturating_add(1);
+        }
+    }
+
     /// Send a keepalive response.
     pub fn send_keepalive(&mut self) {
         self.send_raw(OP_KEEPALIVE, &[]);
@@ -459,7 +535,7 @@ impl EqStream {
             let seq = self.next_send_seq();
             let mut inner = seq.to_be_bytes().to_vec();
             inner.extend_from_slice(app_data);
-            self.send_raw(OP_PACKET, &self.encode(&inner));
+            self.send_tracked(seq, OP_PACKET, &self.encode(&inner));
         } else {
             // Fragment
             let seq = self.next_send_seq();
@@ -468,7 +544,7 @@ impl EqStream {
             let mut inner = seq.to_be_bytes().to_vec();
             inner.extend_from_slice(&total_size.to_be_bytes());
             inner.extend_from_slice(&app_data[..first_max]);
-            self.send_raw(OP_FRAGMENT, &self.encode(&inner));
+            self.send_tracked(seq, OP_FRAGMENT, &self.encode(&inner));
 
             let mut offset = first_max;
             while offset < app_data.len() {
@@ -476,16 +552,50 @@ impl EqStream {
                 let end = (offset + max_inner - 2).min(app_data.len());
                 let mut inner = seq.to_be_bytes().to_vec();
                 inner.extend_from_slice(&app_data[offset..end]);
-                self.send_raw(OP_FRAGMENT, &self.encode(&inner));
+                self.send_tracked(seq, OP_FRAGMENT, &self.encode(&inner));
                 offset = end;
             }
         }
+    }
+
+    /// Build, RECORD, and send a reliable protocol datagram (OP_Packet / OP_Fragment). Frames exactly
+    /// like `send_raw` but retains the final wire bytes in the resend window so the datagram can be
+    /// retransmitted VERBATIM (same `seq`) on OP_OutOfOrder / timeout until the server ACKs it (#254).
+    fn send_tracked(&mut self, seq: u16, opcode: u8, encoded_inner: &[u8]) {
+        let mut raw = vec![0x00, opcode];
+        raw.extend_from_slice(encoded_inner);
+        let datagram = self.append_crc(raw);
+        let _ = self.socket.try_send(&datagram);
+        self.sent.push_back(Sent { seq, datagram, sent_at: Instant::now(), retries: 0 });
     }
 
     fn next_send_seq(&mut self) -> u16 {
         let seq = self.send_seq;
         self.send_seq = self.send_seq.wrapping_add(1);
         seq
+    }
+
+    /// Process an inbound OP_ACK. EQStream ACKs are CUMULATIVE — `acked` acknowledges every reliable
+    /// sequence up to and including it — so drop every buffered send at or before it from the front of
+    /// the resend window. A stale/duplicate ACK (behind the window base) pops nothing. (#254)
+    fn ack_up_to(&mut self, acked: u16) {
+        while let Some(front) = self.sent.front() {
+            if seq_leq(front.seq, acked) {
+                self.sent.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Process an inbound OP_OutOfOrder(seq): the server RECEIVED our reliable `seq` but ahead of a gap
+    /// (it buffered it), so stop retransmitting THAT packet — it arrived. SELECTIVE: removes only the
+    /// exact `seq`, is not cumulative, and does NOT trigger a resend (the still-missing earlier
+    /// packet(s) are retransmitted by the resend timer). Mirrors EQEmu `OutOfOrderAck`. (#254)
+    fn on_out_of_order(&mut self, seq: u16) {
+        if let Some(pos) = self.sent.iter().position(|s| s.seq == seq) {
+            self.sent.remove(pos);
+        }
     }
 
     // ── Encoding/decoding ─────────────────────────────────────────────────────
@@ -546,7 +656,18 @@ impl EqStream {
                 self.handle_fragment(payload);
             }
             OP_APP_COMBINED => self.handle_combined(payload),
-            OP_ACK | OP_OUT_OF_ORDER => {} // no retransmit tracking
+            // Inbound reliability control (#254). Both carry an encoded BE u16 sequence, framed like a
+            // reliable packet's seq — decode the same way ordered packets are decoded.
+            OP_ACK => {
+                if let Some(dec) = self.decode(payload) {
+                    if dec.len() >= 2 { self.ack_up_to(u16::from_be_bytes([dec[0], dec[1]])); }
+                }
+            }
+            OP_OUT_OF_ORDER => {
+                if let Some(dec) = self.decode(payload) {
+                    if dec.len() >= 2 { self.on_out_of_order(u16::from_be_bytes([dec[0], dec[1]])); }
+                }
+            }
             _ => {}
         }
     }
@@ -732,6 +853,48 @@ mod tests {
         assert_eq!(classify_seq(2, 0xF001), SeqClass::Future);
         // …while a seq just below `next` (also near the top) is a past duplicate.
         assert_eq!(classify_seq(0xF000, 0xF001), SeqClass::Duplicate);
+    }
+
+    #[test]
+    fn seq_leq_handles_wraparound() {
+        use super::seq_leq;
+        // Plain ordering: a cumulative ACK(acked) clears every sent seq <= acked.
+        assert!(seq_leq(5, 5));            // equal → acked
+        assert!(seq_leq(3, 5));            // before → acked
+        assert!(!seq_leq(6, 5));           // after → not yet acked
+        // Wrap-around: 0xFFFE precedes 0x0001, so an ACK(0x0001) clears 0xFFFE/0xFFFF/0x0000/0x0001…
+        assert!(seq_leq(0xFFFE, 0x0001));
+        assert!(seq_leq(0xFFFF, 0x0001));
+        assert!(seq_leq(0x0000, 0x0001));
+        // …but NOT a seq ahead of the wrapped ack.
+        assert!(!seq_leq(0x0002, 0x0001));
+        assert!(!seq_leq(0x0001, 0xFFFE)); // ahead across the wrap → not acked
+    }
+
+    #[test]
+    fn cumulative_ack_pops_front_run_including_wrap() {
+        use super::seq_leq;
+        // Mirror ack_up_to: pop the front run of outstanding seqs that are <= acked.
+        let popped = |outstanding: &[u16], acked: u16| -> usize {
+            outstanding.iter().take_while(|&&s| seq_leq(s, acked)).count()
+        };
+        assert_eq!(popped(&[10, 11, 12, 13], 12), 3); // acks 10,11,12; 13 stays
+        assert_eq!(popped(&[10, 11, 12], 9), 0);      // stale ack behind the base → nothing
+        assert_eq!(popped(&[10, 11, 12], 12), 3);     // acks the whole window
+        // A gap in the window (a seq removed by OP_OutOfOrder) doesn't break cumulative ack.
+        assert_eq!(popped(&[10, 12, 13], 13), 3);
+        // Wrap: window straddles the u16 top; ACK(1) clears through the wrap.
+        assert_eq!(popped(&[0xFFFE, 0xFFFF, 0x0000, 0x0001, 0x0002], 0x0001), 4);
+    }
+
+    #[test]
+    fn resend_delay_backs_off_and_clamps() {
+        use super::{resend_delay, RESEND_MAX_MS};
+        assert_eq!(resend_delay(0).as_millis(), 850);   // first attempt ≈ ping-seeded
+        assert_eq!(resend_delay(1).as_millis(), 1700);  // doubled
+        assert_eq!(resend_delay(2).as_millis(), 3400);
+        assert_eq!(resend_delay(3).as_millis(), RESEND_MAX_MS as u128); // 6800 → clamped to 5000
+        assert_eq!(resend_delay(9).as_millis(), RESEND_MAX_MS as u128); // shift capped, stays clamped
     }
 
     #[test]
