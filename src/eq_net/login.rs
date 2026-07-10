@@ -182,6 +182,7 @@ async fn run_login_phase(
 
     'login: loop {
         stream.poll_recv();
+        stream.poll_resend(); // retransmit un-ACKed login reliables (#254)
 
         while let Ok(packet) = net_rx.try_recv() {
             // Forward to render loop so it gets zone/spawn data during login.
