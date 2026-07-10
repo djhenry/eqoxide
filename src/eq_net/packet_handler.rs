@@ -1448,6 +1448,11 @@ fn apply_formatted_message(gs: &mut GameState, payload: &[u8]) {
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let text = crate::eqstr::format_id(string_id, &arg_refs)
         .unwrap_or_else(|| arg_refs.join(" "));
+    // Formatted quest/server text can embed item saylinks in its arguments (e.g. "You need
+    // [<56-hex body>rat whiskers]."). Strip the fixed hex link body so only the readable name
+    // shows, matching the says/emote paths (#256). apply_channel_message/apply_special_message
+    // already do this; this was the remaining un-stripped message render path.
+    let text = strip_say_links(&text);
     if !text.trim().is_empty() && !is_debug_spam(&text) {
         gs.log_msg("system", &text);
     }
@@ -1856,6 +1861,31 @@ mod tests {
     fn strip_say_links_short_body_kept_verbatim() {
         // A control byte with too-short a body (malformed) must not eat text.
         assert_eq!(strip_say_links("a\u{12}short\u{12}b"), "ashortb");
+    }
+
+    fn make_formatted(string_id: u32, args: &[&str]) -> Vec<u8> {
+        // OP_FormattedMessage: unknown0(u32) + string_id(u32) + type(u32) + NUL-separated args.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(&string_id.to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        for a in args { buf.extend_from_slice(a.as_bytes()); buf.push(0); }
+        buf
+    }
+
+    #[test]
+    fn apply_formatted_message_strips_saylink_hex_body() {
+        // #256: a formatted server/quest message whose argument embeds an item saylink must show
+        // only the readable name, not the 56-char hex body — the says/emote paths already do this;
+        // this was the remaining un-stripped render path. string_id 0 isn't in the eqstr table, so
+        // the handler falls back to joining the raw args (which carry the link).
+        let mut gs = GameState::new();
+        let arg = format!("You need {} for this.", saylink('0', "rat whiskers"));
+        super::apply_formatted_message(&mut gs, &make_formatted(0, &[&arg]));
+        let logged = gs.messages.back().expect("a message was logged");
+        assert!(logged.text.contains("rat whiskers"), "name kept: {:?}", logged.text);
+        assert!(!logged.text.contains('\u{12}'), "control byte stripped: {:?}", logged.text);
+        assert!(!logged.text.contains("00000"), "hex body stripped: {:?}", logged.text);
     }
 
     #[test]
