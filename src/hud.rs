@@ -230,8 +230,9 @@ struct NavCell { floor: Option<f32>, edge_e: Option<(f32, bool)>, edge_n: Option
 /// Persistent cache for the nav-debug overlay so it doesn't re-raycast the whole grid and re-run a
 /// full A* every frame (that recompute-per-frame is what made the overlay tank the frame rate). The
 /// floor/edge queries are functions of STATIC geometry, so each cell is computed once and reused;
-/// only cells newly in range as the player walks are raycast. The A* path is recomputed on a throttle
-/// (goal change or every few frames), not every frame. Invalidated on a big teleport/level change.
+/// only cells newly in range as the player walks are raycast. Invalidated on a big teleport/level
+/// change. The A* path is NO LONGER recomputed here — the overlay draws the walker's ACTUAL committed
+/// plan, published by the nav thread via `nav_path_view`, so what you see is what it follows (#246).
 #[derive(Default)]
 struct NavDebugCache {
     last_pos: [f32; 3],
@@ -239,10 +240,6 @@ struct NavDebugCache {
     valid:    bool,
     coarse:   std::collections::HashMap<(i32, i32), NavCell>, // 8u A* grid: floors + edges
     fine:     std::collections::HashMap<(i32, i32), Option<f32>>, // 4u near-player floor dots
-    path:     Vec<[f32; 3]>,     // coarse 8u route (bounded to a visible range)
-    local:    Vec<[f32; 3]>,     // fine 2u local plan the walker actually follows
-    path_goal: Option<[f32; 3]>,
-    path_age: u32,
 }
 thread_local! {
     static NAV_CACHE: std::cell::RefCell<NavDebugCache> = std::cell::RefCell::new(NavDebugCache::default());
@@ -256,6 +253,7 @@ pub fn draw_nav_debug(
     screen_h: u32,
     collision: Option<&crate::assets::Collision>,
     nav_goal: Option<[f32; 3]>,
+    nav_paths: &(Vec<[f32; 3]>, Vec<[f32; 3]>), // walker's live (coarse, fine) plan (#246)
 ) {
     let Some(col) = collision else { return; };
     let ppp = ctx.pixels_per_point();
@@ -303,8 +301,6 @@ pub fn draw_nav_debug(
         if !cache.valid || jumped {
             cache.coarse.clear();
             cache.fine.clear();
-            cache.path.clear();
-            cache.path_goal = None;
             cache.ref_z = p[2];
             cache.valid = true;
         }
@@ -384,56 +380,48 @@ pub fn draw_nav_debug(
             }
         }
 
-        // ── A* paths: recompute on a THROTTLE (goal change or every ~12 frames), not every frame. ──
-        // Both are BOUNDED so a distant goal doesn't run a whole-zone A* every refresh (that hitched
-        // the frame rate on long routes) and the drawn line stays a reasonable near-range length:
-        //   • COARSE (yellow, 8u, ≤COARSE_VIS): the near global route.
-        //   • FINE (cyan, 2u, ≤FINE_VIS): the sub-8u local route the WALKER actually steers along —
-        //     to a carrot ~LOCAL_REACH ahead on the coarse route (mirrors navigation.rs).
+        // ── A* paths: drawn from the WALKER'S ACTUAL committed plan (published via nav_path_view), NOT
+        // a separate recompute — so the overlay shows exactly what the walker follows, including a
+        // stale/awkward segment, instead of an idealized fresh route (#246). No A* runs here, so a long
+        // route no longer hitches the frame rate; we still bound the DRAWN coarse line to a near-range
+        // window so a cross-zone route isn't a screen-spanning tangle.
+        //   • COARSE (yellow): the walker's global 8u route (`Navigator::path`), drawn ≤COARSE_VIS ahead.
+        //   • FINE (cyan): the fine 2u local plan (`Navigator::local_path`) the walker steers along.
         const COARSE_VIS: f32 = 160.0;
-        const FINE_VIS:   f32 = 40.0;
-        const LOCAL_REACH: f32 = 24.0;
+        let (coarse_plan, fine_plan) = nav_paths;
         if let Some(goal) = nav_goal {
-            if cache.path_goal != Some(goal) || cache.path_age >= 12 || cache.path.is_empty() {
-                cache.path = col.find_path_res(p, goal, 1.0, &[], true, 8.0, Some(COARSE_VIS)).unwrap_or_default();
-                // Fine local plan toward a carrot ~LOCAL_REACH along the coarse route (or the goal).
-                let mut acc = 0.0f32;
-                let mut carrot = goal;
-                let mut prev = p;
-                for w in &cache.path {
-                    let d = ((w[0] - prev[0]).powi(2) + (w[1] - prev[1]).powi(2)).sqrt();
-                    if acc + d >= LOCAL_REACH {
-                        let t = ((LOCAL_REACH - acc) / d.max(1e-3)).clamp(0.0, 1.0);
-                        carrot = [prev[0] + (w[0]-prev[0])*t, prev[1] + (w[1]-prev[1])*t, w[2]];
-                        break;
-                    }
-                    acc += d; prev = *w; carrot = *w;
-                }
-                cache.local = col.find_path_res(p, carrot, 1.0, &[], true, 2.0, Some(FINE_VIS)).unwrap_or_default();
-                cache.path_goal = Some(goal);
-                cache.path_age = 0;
-            } else {
-                cache.path_age += 1;
+            // Draw the coarse route from the point nearest the player forward, capping the drawn
+            // length at COARSE_VIS so a distant goal stays a reasonable near-range line.
+            let near_i = coarse_plan.iter().enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    let da = (a[0]-p[0]).hypot(a[1]-p[1]);
+                    let db = (b[0]-p[0]).hypot(b[1]-p[1]);
+                    da.total_cmp(&db)
+                }).map(|(i, _)| i).unwrap_or(0);
+            let mut coarse_vis: Vec<[f32; 3]> = Vec::new();
+            let mut acc = 0.0f32;
+            let mut prev = p;
+            for w in coarse_plan.iter().skip(near_i) {
+                acc += (w[0]-prev[0]).hypot(w[1]-prev[1]);
+                if acc > COARSE_VIS { break; }
+                coarse_vis.push(*w);
+                prev = *w;
             }
             // Coarse (yellow).
-            let cp: Vec<egui::Pos2> = std::iter::once(p).chain(cache.path.iter().copied()).filter_map(on_screen).collect();
+            let cp: Vec<egui::Pos2> = std::iter::once(p).chain(coarse_vis.iter().copied()).filter_map(on_screen).collect();
             for pair in cp.windows(2) {
                 painter.line_segment([pair[0], pair[1]], egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(255, 230, 40, 150)));
             }
             for wp in &cp { painter.circle_filled(*wp, 2.5, egui::Color32::from_rgb(255, 140, 0)); }
-            // Fine local plan (cyan) — the line the walker follows.
-            let lp: Vec<egui::Pos2> = std::iter::once(p).chain(cache.local.iter().copied()).filter_map(on_screen).collect();
+            // Fine local plan (cyan) — the line the walker actually follows.
+            let lp: Vec<egui::Pos2> = std::iter::once(p).chain(fine_plan.iter().copied()).filter_map(on_screen).collect();
             for pair in lp.windows(2) {
                 painter.line_segment([pair[0], pair[1]], egui::Stroke::new(3.0, egui::Color32::from_rgb(80, 230, 255)));
             }
             if let Some(sp) = on_screen(goal) {
-                if cache.path.is_empty() { painter.circle_filled(sp, 6.0, egui::Color32::RED); }
+                if coarse_plan.is_empty() { painter.circle_filled(sp, 6.0, egui::Color32::RED); }
                 painter.circle_stroke(sp, 9.0, egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 255, 0)));
             }
-        } else {
-            cache.path.clear();
-            cache.local.clear();
-            cache.path_goal = None;
         }
     });
 }

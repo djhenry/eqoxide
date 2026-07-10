@@ -499,6 +499,70 @@ mod tests {
         MoveIntent { wish_dir: dir, wish_vspeed: 0.0, jump: false, want_swim: false, speed,
                      climb: 0.0, hop: false }
     }
+    /// Partial vertical wall: east=`e`, north [n0,n1], height [h0,h1] — for bends/obstacles.
+    fn wall_seg(e: f32, n0: f32, n1: f32, h0: f32, h1: f32) -> MeshData {
+        mesh(vec![[n0, h0, e], [n1, h0, e], [n1, h1, e], [n0, h1, e]])
+    }
+    /// Min distance from `p=[east,north]` to the path polyline's XY segments (cross-track error).
+    fn xte(p: [f32; 2], path: &[[f32; 3]]) -> f32 {
+        let mut best = f32::MAX;
+        for seg in path.windows(2) {
+            let (a, b) = (seg[0], seg[1]);
+            let ab = [b[0] - a[0], b[1] - a[1]];
+            let l2 = ab[0] * ab[0] + ab[1] * ab[1];
+            let t = if l2 < 1e-6 { 0.0 } else { (((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / l2).clamp(0.0, 1.0) };
+            let c = [a[0] + ab[0] * t, a[1] + ab[1] * t];
+            best = best.min(((p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2)).sqrt());
+        }
+        best
+    }
+
+    /// Targeted navigation regression: drive the real controller down a real A* path that BENDS
+    /// around an obstacle, using the same fast-steering the nav thread does (carrot look-ahead on the
+    /// path from the CURRENT position each frame), and assert the avatar HUGS the line — it reaches
+    /// the goal and never strays more than a small margin. This is what "not following the line /
+    /// running into things" looks like as a measurement: excessive cross-track error at the bend.
+    #[test]
+    fn nav_walker_hugs_a_bending_path_without_straying() {
+        use crate::eq_net::navigation::carrot_along;
+        // Floor east[-50,50] × north[-100,100]; a wall at east=0 blocks north<12, so the route must
+        // detour up over the wall top (north≥12) and back down — a bend the walker must track.
+        let col = col(vec![
+            floor(0.0, -50.0, 50.0),
+            wall_seg(0.0, -100.0, 12.0, 0.0, 20.0),
+        ]);
+        let start = [-40.0, 0.0, 0.0];
+        let goal  = [40.0, 0.0, 0.0];
+        let path = col.find_path(start, goal, PLAYER_RADIUS, &[], false).expect("route around the wall");
+        let line: Vec<[f32; 3]> = std::iter::once(start).chain(path.iter().copied()).collect();
+
+        let mut ctrl = CharacterController::new(start);
+        ctrl.on_ground = true;
+        let (mut path_i, mut max_xte, mut arrived) = (0usize, 0.0f32, false);
+        for _ in 0..4000 {
+            // Advance the active segment as we pass it (mirrors the walker's path_i logic).
+            while path_i + 2 < line.len() {
+                let (a, b) = (line[path_i], line[path_i + 1]);
+                let ab = [b[0] - a[0], b[1] - a[1]];
+                let l2 = ab[0] * ab[0] + ab[1] * ab[1];
+                let t = if l2 < 1e-6 { 1.0 } else { ((ctrl.pos[0] - a[0]) * ab[0] + (ctrl.pos[1] - a[1]) * ab[1]) / l2 };
+                if t >= 1.0 { path_i += 1; } else { break; }
+            }
+            let carrot = carrot_along(&line, path_i, [ctrl.pos[0], ctrl.pos[1]], 5.0).unwrap();
+            let (dx, dy) = (carrot[0] - ctrl.pos[0], carrot[1] - ctrl.pos[1]);
+            let d = (dx * dx + dy * dy).sqrt().max(1e-3);
+            let intent = MoveIntent { wish_dir: [dx / d, dy / d], wish_vspeed: 0.0, jump: false,
+                want_swim: false, speed: 44.0, climb: 0.0, hop: false };
+            ctrl.step(intent, 0.016, &col);
+            // Skip the tail approach to the goal (the carrot shortens there) — measure along the route.
+            if ((ctrl.pos[0] - goal[0]).powi(2) + (ctrl.pos[1] - goal[1]).powi(2)).sqrt() > 6.0 {
+                max_xte = max_xte.max(xte([ctrl.pos[0], ctrl.pos[1]], &line));
+            }
+            if ((ctrl.pos[0] - goal[0]).powi(2) + (ctrl.pos[1] - goal[1]).powi(2)).sqrt() < 3.0 { arrived = true; break; }
+        }
+        assert!(arrived, "walker must reach the goal (ended at {:?})", ctrl.pos);
+        assert!(max_xte < 3.0, "walker strayed {max_xte:.1}u off the line at the bend (corner-cutting into walls)");
+    }
 
     #[test]
     fn slides_along_wall_instead_of_stopping() {
