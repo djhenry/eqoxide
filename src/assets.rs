@@ -1002,17 +1002,29 @@ impl Collision {
     /// unreachable, returns a path to the nearest-reachable cell toward the goal instead of `None`
     /// (so a stranded character still makes progress, #188); when false, only a route that reaches
     /// the goal cell is returned. `None` = no progress possible (truly boxed in).
+    /// Default nav plan: the standard 8u grid over the WHOLE zone (long-range routing). This is the
+    /// coarse tier of the two-tier planner (#nav-multires) — cheap over big distances but blind to
+    /// sub-8u detail (thin ramps, narrow openings). The FINE local tier calls `find_path_res` with a
+    /// small cell + a search bound to thread that detail near the walker.
     pub fn find_path(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]], allow_partial: bool) -> Option<Vec<[f32; 3]>> {
+        self.find_path_res(start, goal, radius, avoid, allow_partial, 8.0, None)
+    }
+
+    /// A* at an arbitrary grid resolution `cell`, optionally bounded to `max_search` units of the
+    /// start (so a FINE plan stays local + cheap even if it hits an obstacle). `cell` = 8.0 +
+    /// `max_search` = None reproduces the classic whole-zone nav grid.
+    pub fn find_path_res(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]],
+        allow_partial: bool, cell: f32, max_search: Option<f32>) -> Option<Vec<[f32; 3]>> {
         use std::collections::BinaryHeap;
         use std::cmp::Ordering;
         if self.cols == 0 || self.rows == 0 { return None; }
         // Navigate on a FINER grid than the collision broad-phase buckets (self.cell_size, ~32u).
         // At 32u, cell centers fall inside walls in tight corridors, so A* sees a fragmented graph,
         // finds no route, and the caller straight-lines into walls. An 8u nav grid keeps cell
-        // centers inside corridors so A* can actually route around them. (The collision triangle
-        // lookup via floor_z/path_clear works at any query point regardless of bucket size.)
-        const NAV_CELL: f32 = 8.0;
-        let cell = NAV_CELL;
+        // centers inside corridors so A* can actually route around them; a finer cell (the local
+        // tier) resolves thin ramps/openings. (The collision triangle lookup via floor_z/path_clear
+        // works at any query point regardless of bucket size.)
+        let cell = cell.max(1.0);
         let cols = (self.cols as f32 * self.cell_size / cell).ceil() as i32;
         let rows = (self.rows as f32 * self.cell_size / cell).ceil() as i32;
         let to_cell = |e: f32, n: f32| -> (i32, i32) {
@@ -1189,6 +1201,11 @@ impl Collision {
                 let (nc, nr) = (c + dc, r + dr);
                 if nc < 0 || nr < 0 || nc >= cols || nr >= rows { continue; }
                 let b = center(nc, nr);
+                // Local-tier bound: keep a FINE plan within `max_search` units of the start so its
+                // cost stays small even when it has to detour around an obstacle (#nav-multires).
+                if let Some(maxr) = max_search {
+                    if (b[0] - start[0]).hypot(b[1] - start[1]) > maxr { continue; }
+                }
                 // Consider EVERY surface in the neighbor column reachable by climbing <=STEP_H or
                 // dropping <=MAX_STEP_DOWN — this is what lets A* descend onto a lower floor under an
                 // overhang (the multi-level connection) instead of staying on the upper surface.
