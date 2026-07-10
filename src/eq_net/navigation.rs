@@ -587,7 +587,7 @@ fn plan_path(
 /// measured from the projection of `from` onto that segment. Returns `[east, north, z]`, carrying the
 /// z of the segment the carrot lands on. Used at two scales: a far carrot (~LOCAL_REACH) as the fine
 /// plan's goal, and a near carrot (LOOK_AHEAD) along the fine plan as the steering aim.
-fn carrot_along(path: &[[f32; 3]], start_i: usize, from: [f32; 2], reach: f32) -> Option<[f32; 3]> {
+pub(crate) fn carrot_along(path: &[[f32; 3]], start_i: usize, from: [f32; 2], reach: f32) -> Option<[f32; 3]> {
     let a = *path.get(start_i)?;
     let b = path.get(start_i + 1).copied().unwrap_or(a);
     let ab = [b[0] - a[0], b[1] - a[1]];
