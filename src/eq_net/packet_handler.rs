@@ -741,13 +741,9 @@ fn apply_task_select_window(gs: &mut GameState, p: &[u8]) {
 fn apply_new_spawn(gs: &mut GameState, payload: &[u8]) {
     if let Some((info, _)) = parse_rof2_spawn(payload) {
         let name = info.name.clone();
-        // Corpse spawns arrive already-dead (npc: 2=pc_corpse, 3=npc_corpse). The death handler
-        // (`apply_death`) only runs for entities that die while in view, so a corpse that spawns
-        // this way never gets marked dead — and the scene renderer would show it standing in an
-        // idle pose. Mark it below (after `register_spawn`) so it uses the Lying/dead clip (#118).
+        // If this new spawn is an NPC corpse, queue it for auto-looting. (The dead/Lying flagging that
+        // lays the corpse down is now done for ALL spawn paths inside `register_spawn` — #253.)
         let sid = info.spawn_id;
-        let is_corpse = info.npc == 2 || info.npc == 3;
-        // If this new spawn is an NPC corpse, queue it for auto-looting.
         if info.npc != 0 && name.to_lowercase().contains("corpse") {
             tracing::info!("EQ: NPC corpse spawned: id={} name={:?} → queuing for loot", sid, name);
             gs.pending_loot.push_back(sid);
@@ -758,15 +754,6 @@ fn apply_new_spawn(gs: &mut GameState, payload: &[u8]) {
                 name.replace("_corpse", "").replace('_', " ")));
         }
         register_spawn(gs, info);
-        // Corpse spawns (PC and NPC) lie down — mirror `apply_death` so the renderer picks the
-        // dead clip instead of the default standing pose (#118).
-        if is_corpse {
-            if let Some(e) = gs.entities.get_mut(&sid) {
-                e.dead      = true;
-                e.hp_pct    = 0.0;
-                e.animation = 115; // Animation::Lying
-            }
-        }
     }
 }
 
@@ -1775,6 +1762,13 @@ fn apply_money_update(gs: &mut GameState, payload: &[u8]) {
 /// player fields are updated instead and the spawn is NOT added to entities.
 pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
     let is_npc = info.npc != 0;
+    // A spawn can arrive ALREADY a corpse (npc: 2=pc_corpse, 3=npc_corpse) — most commonly the
+    // corpses that already exist when you zone in (delivered via OP_ZoneSpawns / OP_ZoneEntry, which
+    // flow straight through here). Flag it dead + Lying so the scene renderer plays the D05 death clip
+    // and the corpse lies down, instead of standing in the idle pose. Doing this in `register_spawn`
+    // (the ONE path every spawn takes) covers zone-in corpses too, not just fresh OP_NewSpawn ones —
+    // the earlier fix only patched the single-spawn path, so zone-in corpses still stood (#253/#118).
+    let is_corpse = info.npc == 2 || info.npc == 3;
 
     if !is_npc && !gs.player_name.is_empty() && info.name == gs.player_name {
         gs.player_id      = info.spawn_id;
@@ -1806,14 +1800,15 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
         level:          info.level as u32,
         is_npc,
         x: info.x, y: info.y, z: info.z,
-        // curHp in RoF2 Spawn_Struct is an HP percent (0..100), same as Titanium.
-        hp_pct:         (info.cur_hp as f32).min(100.0),
-        cur_hp:         info.cur_hp as i32,
+        // curHp in RoF2 Spawn_Struct is an HP percent (0..100), same as Titanium. A corpse is dead —
+        // force 0 so the HUD/con logic agrees with the dead pose.
+        hp_pct:         if is_corpse { 0.0 } else { (info.cur_hp as f32).min(100.0) },
+        cur_hp:         if is_corpse { 0 } else { info.cur_hp as i32 },
         max_hp:         100, // RoF2 spawn has no separate max_hp; treat as percent
         race:           eq_race_to_code(info.race).to_string(),
         floating:       crate::eq_net::protocol::is_boat_race(info.race),
         heading:        info.heading,
-        dead:           false,
+        dead:           is_corpse,
         equipment:      info.equipment,
         equipment_tint: info.equipment_tint,
         gender:         info.gender,
@@ -1822,7 +1817,8 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
         face:           info.face,
         hairstyle:      info.hairstyle,
         haircolor:      info.haircolor,
-        animation:      info.stand_state as u32,
+        // Corpses use the Lying animation (115) so the scene renderer picks the "dead"/D05 clip.
+        animation:      if is_corpse { 115 } else { info.stand_state as u32 },
     });
 }
 
@@ -2349,6 +2345,43 @@ mod tests {
         use super::apply_wear_change;
         let mut gs = GameState::new();
         apply_wear_change(&mut gs, &[1, 2, 3]); // shorter than SIZE_WEAR_CHANGE; must not panic
+    }
+
+    #[test]
+    fn register_spawn_lays_down_zone_in_corpses() {
+        use super::register_spawn;
+        use crate::eq_net::protocol::SpawnInfo;
+        let mk = |npc: u8, name: &str| SpawnInfo {
+            spawn_id: 7, name: name.into(), last_name: String::new(),
+            level: 2, npc, gender: 0, race: 1, class_: 1, body_type: 1,
+            cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0,
+            stand_state: 100, pet_owner_id: 0, player_state: 64,
+            x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100,
+            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9],
+        };
+        // A PC corpse (npc=2) arriving via the bulk zone-in path (which calls register_spawn directly,
+        // NOT apply_new_spawn) must be flagged dead + Lying so the renderer lays it down — the earlier
+        // fix only patched the single-spawn path, so zone-in corpses still stood in idle (#253).
+        let mut gs = GameState::new();
+        gs.player_name = "Someone".into();
+        register_spawn(&mut gs, mk(2, "Aldric's corpse378"));
+        let e = gs.entities.get(&7).unwrap();
+        assert!(e.dead, "pc corpse (npc=2) must be flagged dead");
+        assert_eq!(e.animation, 115, "corpse uses the Lying animation → scene picks the D05 dead clip");
+        assert_eq!(e.hp_pct, 0.0, "a corpse is at 0 hp");
+
+        // An NPC corpse (npc=3) likewise.
+        let mut gs = GameState::new();
+        register_spawn(&mut gs, mk(3, "a_rat_corpse"));
+        assert!(gs.entities.get(&7).unwrap().dead, "npc corpse (npc=3) must be flagged dead");
+
+        // A LIVING npc (npc=1) is untouched: not dead, keeps its stand_state animation and hp.
+        let mut gs = GameState::new();
+        register_spawn(&mut gs, mk(1, "a rat"));
+        let e = gs.entities.get(&7).unwrap();
+        assert!(!e.dead, "a living spawn must not be flagged dead");
+        assert_eq!(e.animation, 100);
+        assert_eq!(e.hp_pct, 100.0);
     }
 
     #[test]
