@@ -1335,9 +1335,16 @@ impl Collision {
                         while surface - cz < 200.0 && water.is_water(a[0], a[1], surface + 2.0) {
                             surface += 2.0;
                         }
+                        // A swimmer floats at the surface and can only STEP out onto a low lip — the
+                        // controller's swim step-up is the native STEP_UP (~2.5u with the ground snap),
+                        // NOT a 20u climb. Capping the haul-out here to that keeps A* from routing a
+                        // vertical scramble from the water onto a bridge/ledge the walker can't perform
+                        // (#nav-multires: the water analogue of the #239 climb limit). A genuinely
+                        // walkable exit is a beach/ramp, handled by the normal ground edges, not here.
+                        const WATER_EXIT_UP: f32 = crate::movement::STEP_UP + 0.5;
                         for nf in self.column_floors(b[0], b[1], surface, STEP_H, surface - cz) {
-                            if nf <= cz + 1.0 { continue; }           // ascents only
-                            if nf > surface + STEP_H { continue; }    // too high to haul out
+                            if nf <= cz + 1.0 { continue; }              // ascents only
+                            if nf > surface + WATER_EXIT_UP { continue; } // too high to haul out of water
                             let nkey = (nc, nr, qf(nf));
                             if closed.contains(&nkey) { continue; }
                             // Swim at the surface, then the usual chest clearance for the
