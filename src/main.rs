@@ -244,6 +244,8 @@ OPTIONS:
     let controller_view:  http::ControllerShared = Arc::new(Mutex::new(eqoxide::movement::ControllerView::default()));
     let nav_intent:       http::NavIntent        = Arc::new(Mutex::new(None));
     let pos_correction:   http::PosCorrection     = Arc::new(Mutex::new(None));
+    // Walker's live plan, published by the nav thread and drawn by the nav-debug overlay (#246).
+    let nav_path_view:    http::NavPathView       = Arc::new(Mutex::new((Vec::new(), Vec::new())));
 
     // EQ network task — skipped in --testzone mode (offline debug)
     let character_name = login_cfg.character_name.clone();
@@ -303,11 +305,12 @@ OPTIONS:
         let cv  = controller_view.clone();
         let ni  = nav_intent.clone();
         let pc  = pos_correction.clone();
+        let npv = nav_path_view.clone();
         let md  = data_dir.join("maps");
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, nst, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, pcm, sc, md, sd, cp, cu, cv, ni, pc).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, nst, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, pcm, sc, md, sd, cp, cu, cv, ni, pc, npv).await {
                     tracing::error!("EQ: fatal: {e}");
                 }
             });
@@ -449,6 +452,7 @@ OPTIONS:
         nav_intent,
         manual_move,
         pos_correction,
+        nav_path_view,
     );
     event_loop.run_app(&mut application).expect("event loop run");
     // The event loop has now exited gracefully — either the window was closed, or a shutdown was
