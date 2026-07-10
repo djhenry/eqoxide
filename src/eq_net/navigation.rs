@@ -495,6 +495,16 @@ const NAV_HOP_TICKS: u32 = 6;
 /// On a hard stall (NAV_STUCK_TICKS), drive the reverse (downhill) direction for this many ticks
 /// before re-pathing — long enough to clear a wedged slope-face start (~150 ms/tick). (eqoxide#212)
 const NAV_BACKOFF_TICKS: u32 = 3;
+/// Proactive re-plan (#246): after this many consecutive ticks where the fine 2u plan can't REACH its
+/// carrot on the committed coarse route, the route is treated as blocked ahead and re-planned from the
+/// current position — long before the ~3 s NAV_STUCK_TICKS give-up, so the walker detours instead of
+/// pressing into the obstacle. Small so the reaction is quick (~0.5 s) but > 1 to ride out a carrot
+/// that momentarily lands on a fine-impassable lip.
+const NAV_LOCAL_STUCK_TICKS: u32 = 3;
+/// Minimum ticks between two proactive coarse re-plans, so a persistently-awkward carrot can't thrash
+/// the coarse planner every tick (~1 s). The existing stall/back-off recovery still handles a genuine
+/// wedge the fresh coarse plan can't route around.
+const REPLAN_COOLDOWN_TICKS: u32 = 6;
 /// A path segment longer than this (horizontal) is a find_path JUMP-EDGE, not a walk — normal
 /// adjacent nav cells are ≤ 8·√2 ≈ 11.3u apart, jump-edges span ≥ 16u across a real gap. The walker
 /// asks the controller to jump when traversing such a segment. (eqoxide#190)
@@ -722,6 +732,16 @@ pub struct Navigator {
     /// 0 = not backing off.
     backoff_ticks:    u32,
     backoff_dir:      [f32; 2],
+    /// Proactive coarse re-plan (#246). The coarse 8u route is committed at goal-change and, without
+    /// this, only re-planned on a ~3s no-progress stall — so an obstacle the coarse grid skims but the
+    /// fine 2u planner can't thread makes the walker press into it for seconds while the overlay (which
+    /// re-plans continuously) already shows a clean detour. `local_stuck_ticks` counts consecutive
+    /// ticks the fine plan fails to REACH its coarse carrot (blocked ahead); after a few, `replan_coarse`
+    /// is armed so the next tick re-plans the coarse route from the CURRENT position (routing around
+    /// BEFORE the stall). `replan_cooldown` throttles those re-plans so they don't thrash.
+    local_stuck_ticks: u32,
+    replan_coarse:     bool,
+    replan_cooldown:   u32,
     /// Single-authority controller integration (design §2). `controller_view` is the render
     /// thread's authoritative position snapshot we stream to the server; `nav_intent` is the
     /// `/goto` planner's per-frame wish written for the render controller; `pos_correction` hands a
@@ -729,6 +749,9 @@ pub struct Navigator {
     controller_view:  ControllerShared,
     nav_intent:       NavIntent,
     pos_correction:   PosCorrection,
+    /// Draw-only mirror of the walker's committed `path`/`local_path`, published each tick for the
+    /// nav-debug overlay so it shows what the walker actually follows, not a separate recompute (#246).
+    nav_path_view:    crate::http::NavPathView,
     /// Last time we sent OP_FloatListThing (movement history) — the anti-MQGhost keepalive (#105).
     last_movement_history_send: Instant,
     /// Last position we streamed, and the last-send timestamp (for the 280 ms / 1300 ms cadence).
@@ -790,6 +813,7 @@ impl Navigator {
         controller_view:  ControllerShared,
         nav_intent:       NavIntent,
         pos_correction:   PosCorrection,
+        nav_path_view:    crate::http::NavPathView,
     ) -> Self {
         Navigator {
             goto_target,
@@ -859,10 +883,14 @@ impl Navigator {
             nav_repaths: 0,
             nav_best_gdist: f32::MAX,
             backoff_ticks: 0,
+            local_stuck_ticks: 0,
+            replan_coarse: false,
+            replan_cooldown: 0,
             backoff_dir: [0.0, 0.0],
             controller_view,
             nav_intent,
             pos_correction,
+            nav_path_view,
             last_streamed: [0.0, 0.0, 0.0],
             last_pos_send: Instant::now(),
             last_movement_history_send: Instant::now(),
@@ -1898,17 +1926,37 @@ impl Navigator {
             }
         };
 
-        // (Re)compute a wall-avoiding A* path when the goal changes. find_path returns
-        // waypoints (goal-inclusive); an empty path falls back to a straight line to the goal.
-        if self.path_goal != Some(goal) {
+        // (Re)compute a wall-avoiding A* path when the goal changes OR the proactive re-plan is armed
+        // (#246). find_path returns waypoints (goal-inclusive); an empty path falls back to a straight
+        // line to the goal. `replan_coarse` (armed below when the fine plan can't thread the committed
+        // coarse route) re-plans from the CURRENT position without wiping the journey-level recovery
+        // budget (nav_repaths / nav_best_gdist) — it's normal steering, not a stall recovery.
+        if self.replan_cooldown > 0 { self.replan_cooldown -= 1; }
+        let goal_changed = self.path_goal != Some(goal);
+        if goal_changed || self.replan_coarse {
             self.path_goal = Some(goal);
+            // Re-anchor the walker to the fresh route (which starts at the current position).
             self.path_i = 0;
             self.stuck_i = 0;
-            self.stuck_best = f32::MAX;
-            self.stuck_ticks = 0;
-            self.nav_repaths = 0;
-            self.nav_best_gdist = f32::MAX;
             self.backoff_ticks = 0;
+            if goal_changed {
+                self.stuck_best = f32::MAX;
+                self.stuck_ticks = 0;
+                self.nav_repaths = 0;
+                self.nav_best_gdist = f32::MAX;
+                self.local_stuck_ticks = 0;
+                self.replan_cooldown = 0;
+                self.replan_coarse = false;
+            } else {
+                // Proactive re-plan (#246): throttle the next one so a persistently-awkward carrot can't
+                // thrash the coarse planner every tick, and clear the arm flag. Deliberately DO NOT
+                // reset `stuck_ticks` — the stall clock must keep running across proactive re-plans so a
+                // genuine wedge the fresh coarse route also can't escape still trips the ~3 s back-off
+                // (and eventually the re-path cap), instead of re-planning forever pressed into a wall.
+                self.replan_coarse = false;
+                self.local_stuck_ticks = 0;
+                self.replan_cooldown = REPLAN_COOLDOWN_TICKS;
+            }
             // Route with the native collision radius (1.0, was 2.0): the 2× radius boxed the player
             // out of gaps the native client threads, causing "boxed in by walls" / platform stalls
             // (issues #22/#13/#2). Collide-and-slide in the controller keeps it off walls.
@@ -1973,6 +2021,31 @@ impl Navigator {
                 .and_then(|c| c.find_path_res([px, py, gs.player_z], local_goal,
                     crate::movement::PLAYER_RADIUS, &[], true, LOCAL_CELL, Some(LOCAL_BOUND)))
                 .unwrap_or_default();
+            // Proactive re-plan trigger (#246): did the fine plan actually REACH its coarse carrot? If
+            // the committed coarse route skims an obstacle the 8u grid missed, the fine 2u plan stops
+            // short (truncated partial toward the reachable frontier) and the walker presses into it.
+            // Arm a fresh coarse re-plan (from the current position) after a few such ticks — long
+            // before the ~3 s stall — so the route detours around the obstacle, matching the overlay.
+            let reached_carrot = self.local_path.last().is_some_and(|p|
+                (p[0] - local_goal[0]).hypot(p[1] - local_goal[1]) <= LOCAL_CELL * 2.0);
+            // Only re-plan proactively while the walker is otherwise moving HEALTHILY: the point is to
+            // detour BEFORE bonking. Once it's genuinely wedged (in a back-off, or the stall clock is
+            // already climbing), the existing stall/back-off recovery owns it — arming another coarse
+            // plan here just piles redundant (and, in some zones, ~2 s) A* runs onto the net thread.
+            let healthy = self.backoff_ticks == 0 && self.stuck_ticks < NAV_HOP_TICKS;
+            if !reached_carrot && healthy && self.replan_cooldown == 0 {
+                self.local_stuck_ticks += 1;
+                if self.local_stuck_ticks >= NAV_LOCAL_STUCK_TICKS {
+                    self.replan_coarse = true;
+                    tracing::debug!("NAV: fine plan blocked short of carrot near ({:.0},{:.0}) — re-planning coarse (#246)", px, py);
+                }
+            } else {
+                self.local_stuck_ticks = 0;
+            }
+            // Publish the walker's ACTUAL committed plan for the nav-debug overlay (#246) so it draws
+            // exactly what the walker follows — coarse route + fine local plan — rather than an
+            // independent per-frame recompute that over-states how cleanly the walker is steering.
+            *self.nav_path_view.lock().unwrap() = (self.path.clone(), self.local_path.clone());
             let aim = if self.local_path.len() >= 2 {
                 carrot_along(&self.local_path, 0, [px, py], LOOK_AHEAD).unwrap_or(coarse)
             } else {
@@ -1981,6 +2054,7 @@ impl Navigator {
             (aim[0], aim[1], aim[2])
         } else {
             self.local_path.clear();
+            *self.nav_path_view.lock().unwrap() = (Vec::new(), Vec::new());
             // No path computed: straight-line toward the goal at the player's CURRENT height.
             (goal.0, goal.1, gs.player_z)
         };
@@ -2458,6 +2532,7 @@ mod tests {
             Default::default(), // controller_view
             Default::default(), // nav_intent
             Default::default(), // pos_correction
+            Default::default(), // nav_path_view
         )
     }
 

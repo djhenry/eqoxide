@@ -127,6 +127,9 @@ pub struct App {
     manual_move:      crate::http::ManualMoveReq,
     /// A large server correction handed over by the nav streamer; applied to the controller.
     pos_correction:   crate::http::PosCorrection,
+    /// Walker's live plan (coarse, fine), published by the nav thread; drawn by the nav-debug
+    /// overlay so it shows what the walker actually follows, not a separate recompute (#246).
+    nav_path_view:    crate::http::NavPathView,
     /// Shared goto target — set by HTTP /move; cleared by the render thread on manual WASD
     /// (so manual movement cancels navigation). WASD no longer writes a target here.
     goto_target:  crate::http::GotoTarget,
@@ -238,6 +241,7 @@ impl App {
         nav_intent:       crate::http::NavIntent,
         manual_move:      crate::http::ManualMoveReq,
         pos_correction:   crate::http::PosCorrection,
+        nav_path_view:    crate::http::NavPathView,
     ) -> Self {
         let ui_state = crate::ui::UiState::new(&character_name, eq_ui_dir);
         let mut game_state = GameState::new();
@@ -272,7 +276,7 @@ impl App {
             frame_profile: crate::profiling::FrameProfile::default(),
             keys_held: std::collections::HashSet::new(),
             controller: crate::movement::CharacterController::new([0.0, 0.0, 0.0]),
-            controller_view, nav_intent, manual_move, pos_correction,
+            controller_view, nav_intent, manual_move, pos_correction, nav_path_view,
             goto_target,
             acts, spells, door_click,
             drag_active: false, last_cursor: winit::dpi::PhysicalPosition::new(0.0, 0.0),
@@ -1297,6 +1301,7 @@ impl App {
             &self.frame_profile,
             self.nav_debug,
             self.goto_target.lock().unwrap().map(|(x, y, z)| [x, y, z]),
+            self.nav_path_view.lock().unwrap().clone(),
         );
         let dur_egui = prof_egui.elapsed();
 
@@ -1361,6 +1366,7 @@ impl App {
         frame_profile: &crate::profiling::FrameProfile,
         nav_debug:     bool,               // navmesh overlay on? (--nav-debug / F11)
         nav_goal:      Option<[f32; 3]>,   // current A* goal for the navmesh overlay
+        nav_paths:     (Vec<[f32; 3]>, Vec<[f32; 3]>), // walker's live (coarse, fine) plan (#246)
     ) -> bool {
         let (Some(egui_state), Some(egui_renderer), Some(egui_ctx), Some(window)) =
             (egui_state, egui_renderer, egui_ctx, window) else { return false };
@@ -1402,7 +1408,7 @@ impl App {
             } else {
                 hud::draw_labels(ctx, scene, view_proj, screen_w, screen_h, cam_eye, collision);
                 if nav_debug {
-                    hud::draw_nav_debug(ctx, scene, view_proj, screen_w, screen_h, collision, nav_goal);
+                    hud::draw_nav_debug(ctx, scene, view_proj, screen_w, screen_h, collision, nav_goal, &nav_paths);
                 }
                 ui_state.draw_all(ctx, screen_pts, scene, spells, acts, zone_min, zone_max, zone_map, current_fps);
                 if show_debug {

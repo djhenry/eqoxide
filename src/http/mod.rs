@@ -57,6 +57,12 @@ pub type NavIntent = Arc<Mutex<Option<crate::movement::MoveIntent>>>;
 /// (teleport). Small deltas are ignored — the controller is authoritative (design §3.4).
 pub type PosCorrection = Arc<Mutex<Option<[f32; 3]>>>;
 
+/// The walker's ACTUAL committed plan, published each nav tick so the `--nav-debug` overlay can draw
+/// exactly what the walker is following instead of an independent per-frame `find_path` recompute
+/// (#246). `.0` = coarse global route (`Navigator::path`), `.1` = fine local plan
+/// (`Navigator::local_path`). Empty when idle. Draw-only; never steered from.
+pub type NavPathView = Arc<Mutex<(Vec<[f32; 3]>, Vec<[f32; 3]>)>>;
+
 /// Live entity name → (x, y, z) map, updated by login.rs as packets arrive.
 pub type EntityPositions = Arc<Mutex<HashMap<String, (f32, f32, f32)>>>;
 
