@@ -1017,6 +1017,33 @@ impl Navigator {
         // On zone change, load map labels from disk as fallback zone points.
         if gs.zone_name != self.current_zone {
             self.current_zone = gs.zone_name.clone();
+
+            // Reset the nav destination + route on a zone change (#248). The old goal/path are in the
+            // PREVIOUS zone's coordinate space; kept across a crossing they aim the walker at an
+            // arbitrary spot (usually a corner near the arrival point) and wedge it there. A completed
+            // crossing IS the "walk to the zone line" goal reached, so the character should come to
+            // rest in the new zone; a driver that wants to keep going re-issues /v1/move/* afterward.
+            // (This is the zone-boundary sibling of the mid-zone stale-plan bug #246.)
+            *self.goto_target.lock().unwrap() = None;
+            *self.goto_entity.lock().unwrap() = None;
+            *self.nav_intent.lock().unwrap() = None; // stop driving the controller toward the stale aim
+            *self.nav_path_view.lock().unwrap() = (Vec::new(), Vec::new()); // clear the overlay line
+            self.path.clear();
+            self.local_path.clear();
+            self.path_goal = None;
+            self.path_i = 0;
+            self.stuck_i = 0;
+            self.stuck_best = f32::MAX;
+            self.stuck_ticks = 0;
+            self.nav_repaths = 0;
+            self.nav_best_gdist = f32::MAX;
+            self.backoff_ticks = 0;
+            self.local_stuck_ticks = 0;
+            self.replan_coarse = false;
+            self.replan_cooldown = 0;
+            self.falling = None;
+            self.set_nav_state("idle");
+
             let mut shared = self.zone_points.lock().unwrap();
             // Start fresh with server entries.
             shared.clear();
@@ -2534,6 +2561,54 @@ mod tests {
             Default::default(), // pos_correction
             Default::default(), // nav_path_view
         )
+    }
+
+    #[test]
+    fn zone_change_resets_stale_destination_and_path() {
+        // #248: a destination + route left over from the PREVIOUS zone must not survive a crossing —
+        // in the new zone's coordinate space they aim the walker at a corner near the arrival point
+        // and wedge it there. sync_zone_points must clear the goal, path, and recovery state.
+        let group: crate::http::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::http::GroupSnapshot::default()));
+        let mut nav = test_navigator(group);
+
+        // Simulate an in-progress nav in the OLD zone.
+        nav.current_zone = "gfaydark".into();
+        *nav.goto_target.lock().unwrap() = Some((100.0, 200.0, 0.0));
+        *nav.goto_entity.lock().unwrap() = Some("a bat".into());
+        *nav.nav_intent.lock().unwrap() = Some(crate::movement::MoveIntent::default());
+        *nav.nav_path_view.lock().unwrap() = (vec![[0.0, 0.0, 0.0]], vec![[0.0, 0.0, 0.0]]);
+        nav.path = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]];
+        nav.local_path = vec![[0.0, 0.0, 0.0]];
+        nav.path_goal = Some((100.0, 200.0, 0.0));
+        nav.path_i = 1;
+        nav.stuck_ticks = 5;
+        nav.nav_repaths = 3;
+        nav.backoff_ticks = 2;
+        nav.replan_coarse = true;
+        nav.falling = Some(0.0);
+        *nav.nav_state.lock().unwrap() = "blocked".into();
+
+        // Cross into a NEW zone.
+        let mut gs = GameState::new();
+        gs.zone_name = "crushbone".into();
+        nav.sync_zone_points(&gs);
+
+        // Destination + route + recovery state all cleared; walker comes to rest in the new zone.
+        assert!(nav.goto_target.lock().unwrap().is_none(), "goto_target must clear on zone change");
+        assert!(nav.goto_entity.lock().unwrap().is_none(), "goto_entity must clear on zone change");
+        assert!(nav.nav_intent.lock().unwrap().is_none(), "nav_intent must clear so the controller stops");
+        let (coarse, fine) = &*nav.nav_path_view.lock().unwrap();
+        assert!(coarse.is_empty() && fine.is_empty(), "overlay path must clear on zone change");
+        assert!(nav.path.is_empty() && nav.local_path.is_empty(), "route must clear on zone change");
+        assert_eq!(nav.path_goal, None);
+        assert_eq!(nav.path_i, 0);
+        assert_eq!(nav.stuck_ticks, 0);
+        assert_eq!(nav.nav_repaths, 0);
+        assert_eq!(nav.backoff_ticks, 0);
+        assert!(!nav.replan_coarse);
+        assert!(nav.falling.is_none());
+        assert_eq!(*nav.nav_state.lock().unwrap(), "idle");
+        assert_eq!(nav.current_zone, "crushbone");
     }
 
     #[test]
