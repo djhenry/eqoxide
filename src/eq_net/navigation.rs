@@ -1644,6 +1644,25 @@ impl Navigator {
         // (independent of the 150 ms planner gate below). This is the single position authority.
         self.stream_position(stream, gs);
 
+        // FAST STEERING (#nav-multires). The plans (`path`, `local_path`) are refreshed on the 150ms
+        // gate below, but the controller runs at ~100Hz — driving a 150ms-stale heading overshoots
+        // every turn by up to RUN_SPEED·0.15 ≈ 6.6u and clips walls (the "not following the line"
+        // bug). So each loop (~10ms), re-project the CURRENT position onto the stable fine path and
+        // refresh ONLY nav_intent's `wish_dir` (+ facing) — the flags/speed the walker set stay. The
+        // carrot slides along the line as we move, so the avatar hugs it through tight turns.
+        if !self.local_path.is_empty() && self.goto_target.lock().unwrap().is_some() {
+            if let Some(aim) = carrot_along(&self.local_path, 0, [gs.player_x, gs.player_y], 5.0) {
+                let (dx, dy) = (aim[0] - gs.player_x, aim[1] - gs.player_y);
+                let d = (dx * dx + dy * dy).sqrt();
+                if d > 1e-3 {
+                    if let Some(intent) = self.nav_intent.lock().unwrap().as_mut() {
+                        intent.wish_dir = [dx / d, dy / d];
+                    }
+                    gs.player_heading = eq_heading(dx, dy);
+                }
+            }
+        }
+
         if self.last_tick.elapsed().as_millis() < NAV_TICK_MS {
             return;
         }
