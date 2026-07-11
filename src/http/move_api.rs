@@ -274,7 +274,13 @@ async fn post_zone_cross(
     }
     *s.zone_cross.lock().unwrap() = Some(zone_id);
     tracing::info!("zone_cross: flagged for OP_ZONE_CHANGE (target zone_id={zone_id})");
-    (StatusCode::OK, format!("zone_cross request queued (zone_id={zone_id})"))
+    // Honest, async-aware response (#267): the client WALKS to the zone line, it does not teleport, so
+    // this 200 means "accepted", not "arrived". Tell the caller how to observe the real outcome — a bare
+    // "queued" read as success while a wedged character went nowhere.
+    (StatusCode::OK, format!(
+        "zone_cross to zone_id={zone_id} accepted — walking to the zone line (async, not a teleport). \
+         Poll GET /v1/observe/debug: the `zone` field changes on success; `nav_state` becomes `blocked` \
+         if the walker wedges before reaching the line, or `no_path` if no line to that zone exists."))
 }
 
 #[cfg(test)]
