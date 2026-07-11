@@ -1,4 +1,9 @@
 //! `/v1/move/*` — movement: walk to a target/coords and stop, follow a target, stop, cross a zone line.
+//!
+//! NOTE (#267): endpoints that take a JSON body (`/goto`, `/manual`, `/zone_cross`, …) require the
+//! `Content-Type: application/json` header — without it axum's `Json` extractor rejects the body and
+//! the call 400s (bodyless requests like `/stop`, `/jump` are unaffected). Small agents that omit
+//! the header get a silent no-op; always send `Content-Type: application/json` with a JSON body.
 
 use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use std::collections::HashMap;
@@ -16,8 +21,10 @@ pub(super) fn router() -> Router<HttpState> {
 
 #[derive(serde::Deserialize, Default)]
 struct ManualBody {
-    /// World movement direction (server coords): `east` = +server_y, `north` = +server_x. Any
-    /// magnitude; it's normalized. Zero/omitted = stand in place (e.g. a jump with no movement).
+    /// World movement direction, matching `/v1/observe/debug` `pos`: `east` = +server_x (= pos.x),
+    /// `north` = +server_y (= pos.y) — the zone-wide EQ convention used everywhere in the client.
+    /// (#267: the previous doc had these swapped.) Any magnitude; it's normalized. Zero/omitted =
+    /// stand in place (e.g. a jump with no movement).
     east:  Option<f32>,
     north: Option<f32>,
     /// Vertical axis for SWIMMING, `-1..1` (`+1` = up toward the surface, `-1` = dive). Only has an
@@ -234,12 +241,17 @@ fn reachable_zone_ids(zps: &[crate::game_state::ZonePoint]) -> Vec<u16> {
     ids
 }
 
-/// POST /v1/move/zone_cross — teleport to a zone line and send OP_ZONE_CHANGE.
+/// POST /v1/move/zone_cross — WALK to a zone line, then cross it (OP_ZONE_CHANGE fires on arrival).
+/// It does NOT teleport — the character navigates to the DRNTP zone-line region on foot, so a
+/// success response only means the crossing was QUEUED, not that the zone changed (#267). Poll
+/// `/v1/observe/debug` (`zone` + `nav_state`) to confirm arrival: if the walker wedges before
+/// reaching the line (e.g. a nav trap), the zone won't change even though this returned 200.
 /// Body: {"zone_id": 1} to cross to a specific zone, or {} for the nearest line.
 ///
 /// A specific `zone_id` that has no zone line from the current zone is REJECTED with 400 (and the
 /// list of reachable zone_ids) instead of silently doing nothing / crossing a nearby line — so the
-/// caller knows the destination wasn't honored (eqoxide#47).
+/// caller knows the destination wasn't honored (eqoxide#47). NOTE this only checks that a zone LINE
+/// exists, not that the walker can physically reach it.
 async fn post_zone_cross(
     State(s): State<HttpState>,
     body: Option<Json<ZoneCrossBody>>,
