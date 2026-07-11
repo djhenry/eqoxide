@@ -356,6 +356,7 @@ OPTIONS:
         group_make_leader: group_make_leader.clone(),
         camp: camp.clone(),
         camp_until: camp_until.clone(),
+        respawn: respawn.clone(),
         pet_cmd: pet_cmd.clone(),
     };
     let app_spells  = spells.clone();
