@@ -1408,6 +1408,11 @@ impl Navigator {
 
         let hail_req = self.hail.lock().unwrap().take();
         if let Some((name, spawn_id)) = hail_req {
+            // A hail starts a FRESH interaction — drop any saylink choices left over from a prior
+            // NPC (or a system/command message). Otherwise `/observe/dialogue` leaks the last
+            // choices indefinitely, since they're only ever overwritten when a new say-line carries
+            // saylinks and never cleared (#274). The hailed NPC's own reply repopulates them.
+            gs.dialogue_choices.clear();
             if let Some(id) = spawn_id {
                 gs.target_id = Some(id);
                 if let Some(e) = gs.entities.get(&id) { gs.target_name = Some(e.name.clone()); }
