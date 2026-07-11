@@ -1745,6 +1745,21 @@ impl ApplicationHandler for App {
                                     self.camera.reset_to_follow();
                                     *self.goto_target.lock().unwrap() = None;
                                 }
+                                // Self-target (native EQ F1): target your own character (#291).
+                                // Mirrors the click-to-target path — sets the render target AND the
+                                // acts.target handle so the nav thread sends OP_TargetMouse for self,
+                                // enabling self-heals/buffs, consider-on-self, and (server permitting)
+                                // GM #kill/#damage on yourself.
+                                KeyCode::F1 if !event.repeat => {
+                                    let me = self.game_state.player_id;
+                                    if me != 0 {
+                                        self.game_state.target_id     = Some(me);
+                                        self.game_state.target_con    = None;
+                                        self.game_state.target_name   = Some(self.game_state.player_name.clone());
+                                        self.game_state.target_hp_pct = Some(self.game_state.hp_pct);
+                                        *self.acts.target.lock().unwrap() = Some(me);
+                                    }
+                                }
                                 KeyCode::F10 => {
                                     self.show_debug = !self.show_debug;
                                     tracing::info!("DEBUG: overlay {}", if self.show_debug { "ON" } else { "OFF" });
