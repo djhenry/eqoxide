@@ -1593,7 +1593,8 @@ impl Navigator {
             let pkt = build_channel_message(&gs.player_name, &c.to, c.chan, &c.text);
             stream.send_app_packet(OP_CHANNEL_MESSAGE, &pkt);
             let label = match c.chan { 7 => format!("tell {}", c.to), 5 => "ooc".into(),
-                                       3 => "shout".into(), 2 => "group".into(), n => format!("chan{n}") };
+                                       3 => "shout".into(), 2 => "group".into(), 0 => "guild".into(),
+                                       n => format!("chan{n}") };
             tracing::info!("EQ: {} -> {}", label, c.text);
             // Native-style local echo, logged under the channel's kind so the chat window
             // tab-filters and colors it like the matching incoming traffic.
@@ -1602,6 +1603,7 @@ impl Navigator {
                 5 => ("ooc",   format!("You say out of character, '{}'", c.text)),
                 3 => ("shout", format!("You shout, '{}'", c.text)),
                 2 => ("group", format!("You tell your party, '{}'", c.text)),
+                0 => ("guild", format!("You say to your guild, '{}'", c.text)),
                 _ => ("chat",  format!("You {}: {}", label, c.text)),
             };
             gs.log_msg(kind, &line);

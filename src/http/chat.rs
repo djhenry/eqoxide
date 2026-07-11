@@ -1,4 +1,4 @@
-//! `/v1/chat/*` — send messages on the inter-agent channels (tell/ooc/shout/group).
+//! `/v1/chat/*` — send messages on the inter-agent channels (tell/ooc/shout/group/guild).
 //! The incoming side (reading what others said) is the read-only `/v1/events/*` feed.
 
 use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
@@ -10,6 +10,7 @@ pub(super) fn router() -> Router<HttpState> {
         .route("/ooc", post(post_ooc))
         .route("/shout", post(post_shout))
         .route("/group", post(post_group))
+        .route("/guild", post(post_guild))
 }
 
 #[derive(serde::Deserialize)]
@@ -47,4 +48,14 @@ async fn post_group(State(s): State<HttpState>, Json(b): Json<TextBody>) -> (Sta
     if b.text.trim().is_empty() { return (StatusCode::BAD_REQUEST, "group requires 'text'".into()); }
     s.chat_send.lock().unwrap().push(ChatSend { chan: 2, to: String::new(), text: b.text });
     (StatusCode::OK, "group queued".into())
+}
+
+/// POST /v1/chat/guild {"text"} — guild-channel broadcast (EQEmu chan 0; reaches every online guild
+/// member regardless of zone). The shared channel for a guild of agents. Inbound guild messages
+/// arrive as `kind:"guild"` events on GET /v1/events/chat and in /v1/observe/messages. Requires guild
+/// membership to have recipients (#295). (#294)
+async fn post_guild(State(s): State<HttpState>, Json(b): Json<TextBody>) -> (StatusCode, String) {
+    if b.text.trim().is_empty() { return (StatusCode::BAD_REQUEST, "guild requires 'text'".into()); }
+    s.chat_send.lock().unwrap().push(ChatSend { chan: 0, to: String::new(), text: b.text });
+    (StatusCode::OK, "guild queued".into())
 }
