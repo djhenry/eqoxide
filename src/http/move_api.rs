@@ -73,6 +73,21 @@ struct MoveBody {
     x:     Option<f32>,
     y:     Option<f32>,
     z:     Option<f32>,
+    /// Route around KOS/hostile NPC aggro range (#242). Since the client has no broad faction data,
+    /// this avoids ALL live NPC camps (soft bias, never fails the route). `true` (default) keeps the
+    /// historical avoidance; `false` routes straight through (e.g. to walk INTO a mob).
+    avoid_aggro:  Option<bool>,
+    /// Extra berth (world units) to give each NPC beyond the ~50u default aggro radius, for routing
+    /// more conservatively around dangerous pulls. Default 0.
+    aggro_buffer: Option<f32>,
+}
+
+/// Apply the request's aggro-avoidance knobs to the shared nav setting the walker reads (#242). Only
+/// overrides a field when the request provides it, so omitting them leaves the current setting.
+fn apply_avoid_opts(nav_avoid: &crate::http::NavAvoidShared, avoid_aggro: Option<bool>, aggro_buffer: Option<f32>) {
+    let mut o = nav_avoid.lock().unwrap();
+    if let Some(e) = avoid_aggro  { o.enabled = e; }
+    if let Some(b) = aggro_buffer { o.buffer  = b.clamp(0.0, 500.0); }
 }
 
 impl MoveBody {
@@ -148,6 +163,8 @@ async fn post_goto(
         }
     };
 
+    // Apply aggro-avoidance knobs for this route (#242).
+    apply_avoid_opts(&s.nav_avoid, b.avoid_aggro, b.aggro_buffer);
     // Set the position, then clear any chase — goto walks to a fixed point and stops.
     *s.goto_target.lock().unwrap() = Some(target);
     *s.goto_entity.lock().unwrap() = None;
@@ -204,6 +221,9 @@ async fn post_stop(State(s): State<HttpState>) -> (StatusCode, String) {
 struct ZoneCrossBody {
     /// Destination zone id to cross to. Omit (or 0) to take the nearest zone line.
     zone_id: Option<u16>,
+    /// Route around NPC aggro range on the way to the zone line (#242). See `MoveBody`.
+    avoid_aggro:  Option<bool>,
+    aggro_buffer: Option<f32>,
 }
 
 /// Sorted, de-duplicated set of zone_ids reachable via a zone line from the current zone.
@@ -224,7 +244,9 @@ async fn post_zone_cross(
     State(s): State<HttpState>,
     body: Option<Json<ZoneCrossBody>>,
 ) -> (StatusCode, String) {
-    let zone_id = body.and_then(|Json(b)| b.zone_id).unwrap_or(0);
+    let b = body.map(|Json(b)| b).unwrap_or_default();
+    apply_avoid_opts(&s.nav_avoid, b.avoid_aggro, b.aggro_buffer);
+    let zone_id = b.zone_id.unwrap_or(0);
     if zone_id != 0 {
         let reachable = reachable_zone_ids(&s.zone_points.lock().unwrap());
         if !reachable.contains(&zone_id) {

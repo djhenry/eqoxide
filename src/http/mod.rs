@@ -57,6 +57,21 @@ pub type NavIntent = Arc<Mutex<Option<crate::movement::MoveIntent>>>;
 /// (teleport). Small deltas are ignored — the controller is authoritative (design §3.4).
 pub type PosCorrection = Arc<Mutex<Option<[f32; 3]>>>;
 
+/// Aggro-avoidance knobs the `/v1/move/*` handlers set and the nav walker reads (#242). `enabled`
+/// gates the always-on NPC-camp avoidance (#67) — `false` routes straight through (e.g. to reach a
+/// mob). `buffer` widens the soft-avoid radius so the route gives hostile pulls more berth. Default =
+/// the historical behavior (avoidance on, no extra buffer). A `/goto`/`/zone_cross` request that omits
+/// the fields leaves the current setting unchanged.
+#[derive(Clone, Copy)]
+pub struct AggroAvoidOpts {
+    pub enabled: bool,
+    pub buffer:  f32,
+}
+impl Default for AggroAvoidOpts {
+    fn default() -> Self { Self { enabled: true, buffer: 0.0 } }
+}
+pub type NavAvoidShared = Arc<Mutex<AggroAvoidOpts>>;
+
 /// The walker's ACTUAL committed plan, published each nav tick so the `--nav-debug` overlay can draw
 /// exactly what the walker is following instead of an independent per-frame `find_path` recompute
 /// (#246). `.0` = coarse global route (`Navigator::path`), `.1` = fine local plan
@@ -428,6 +443,8 @@ pub(crate) struct HttpState {
     /// Zone collision + region map (shared with the nav thread); read-only here, for zone_exits.
     pub(crate) shared_collision: crate::assets::SharedCollision,
     pub(crate) zone_cross:       ZoneCrossReq,
+    /// Aggro-avoidance knobs set by /v1/move/goto|zone_cross and read by the nav walker (#242).
+    pub(crate) nav_avoid:        NavAvoidShared,
     /// Manual-move / jump escape hatch (#188), consumed by the render loop.
     pub(crate) manual_move:      ManualMoveReq,
     pub(crate) hail:             HailReq,
@@ -530,6 +547,7 @@ pub fn spawn_camera_server(
     camp:             CampReq,
     camp_until:       CampUntil,
     pet_cmd:          PetCmdReq,
+    nav_avoid:        NavAvoidShared,
     port:             u16,
     // When `Some`, an already-bound listener from `--api-port` (exact port, no scan).
     // When `None`, scan upward from `port` for the first free port.
@@ -538,7 +556,7 @@ pub fn spawn_camera_server(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, shared_collision, zone_cross, manual_move, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, dialogue, nav_state, dialogue_click, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until, pet_cmd };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, shared_collision, zone_cross, manual_move, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, dialogue, nav_state, dialogue_click, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until, pet_cmd, nav_avoid };
             // Versioned + grouped routes: /v1/<group>/<action>. Each group's `router()` defines
             // relative paths; nesting prefixes them. Shared state is applied once at the end.
             let app = Router::new()

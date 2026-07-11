@@ -154,6 +154,7 @@ pub(crate) mod tests {
             zone_points: Arc::new(Mutex::new(Vec::new())),
             shared_collision: Arc::new(std::sync::RwLock::new(None)),
             zone_cross: Arc::new(Mutex::new(None)),
+            nav_avoid: Arc::new(Mutex::new(crate::http::AggroAvoidOpts::default())),
             manual_move: Arc::new(Mutex::new(None)),
             hail: Arc::new(Mutex::new(None)),
             say: Arc::new(Mutex::new(None)),
