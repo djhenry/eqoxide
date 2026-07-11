@@ -1434,6 +1434,7 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
         5  => Some("ooc"),
         3  => Some("shout"),
         2  => Some("group"),
+        0  => Some("guild"),
         11 => Some("gmsay"),
         _  => None,
     };
@@ -2606,6 +2607,22 @@ mod tests {
         assert_eq!(e.category, "chat");
         assert_eq!(e.kind, "tell");
         assert!(!e.directed, "a tell to someone else is not directed at us");
+    }
+
+    #[test]
+    fn apply_channel_message_guild_logs_and_events_as_guild() {
+        // #294: guild chat is EQEmu ChatChannel 0. It logs under kind "guild" and surfaces as an
+        // undirected chat event so agents can filter guild traffic via GET /v1/events/chat.
+        let mut gs = GameState::new();
+        gs.player_name = "Mordeth".to_string();
+        super::apply_channel_message(&mut gs, &make_chan_payload("Garrik", 0, "forming up at the gate"));
+        assert!(gs.messages.iter().any(|m| m.kind == "guild"
+            && m.text == "<Garrik> forming up at the gate"));
+        let e = gs.chat_events.back().expect("a chat event");
+        assert_eq!(e.kind, "guild");
+        assert_eq!(e.from, "Garrik");
+        assert!(!e.directed, "guild chat is a broadcast, not directed at us");
+        assert_eq!(e.text, "forming up at the gate");
     }
 
     #[test]
