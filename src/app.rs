@@ -15,6 +15,10 @@ use crate::eq_net::packet_handler::apply_packet;
 use crate::eq_net::transport::AppPacket;
 use crate::frame_capture::encode_frame_png;
 use crate::game_state::GameState;
+
+/// How long after a death `/v1/observe/debug` keeps reporting `killed_by` + `died_ago_secs` (so an
+/// infrequently-polling agent still sees a recent death, even after respawning). (#284)
+const DEATH_STICKY_SECS: u64 = 300;
 use crate::http::FrameReq;
 use crate::renderer::EqRenderer;
 use crate::scene::SceneState;
@@ -827,6 +831,16 @@ impl App {
                 hp_pct:        gs.hp_pct,
                 cur_hp:        gs.cur_hp,
                 max_hp:        gs.max_hp,
+                // Death state (#284). `dead` is live (held slain until /lifecycle/respawn);
+                // killed_by/died_ago_secs stay reported for DEATH_STICKY_SECS after death (through a
+                // respawn too) so an infrequent poller still sees it.
+                dead:          gs.player_dead,
+                killed_by:     gs.died_at
+                                   .filter(|t| t.elapsed().as_secs() < DEATH_STICKY_SECS)
+                                   .map(|_| gs.killed_by.clone()),
+                died_ago_secs: gs.died_at
+                                   .filter(|t| t.elapsed().as_secs() < DEATH_STICKY_SECS)
+                                   .map(|t| t.elapsed().as_secs()),
                 mana_pct:      gs.mana_pct,
                 cur_mana:      gs.cur_mana,
                 max_mana:      gs.max_mana,

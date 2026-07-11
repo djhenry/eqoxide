@@ -423,6 +423,11 @@ pub struct GameState {
     /// server never opens (or never honors) the respawn window. Cleared once HP is
     /// restored. Transient recovery bookkeeping. (eqoxide#50)
     pub player_dead_since: Option<std::time::Instant>,
+    /// Name of whatever last killed the player (from OP_Death's killer_id), and when the death
+    /// happened. Unlike `player_dead_since` these PERSIST past the respawn so `/v1/observe/debug`
+    /// can report a recent death (dead / killed_by / died_ago_secs) even after reviving. (#284)
+    pub killed_by: String,
+    pub died_at: Option<std::time::Instant>,
     /// True when auto-attack is enabled.
     pub auto_attack: bool,
 

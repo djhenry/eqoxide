@@ -1199,6 +1199,13 @@ fn apply_death(gs: &mut GameState, payload: &[u8]) {
             return;
         }
         gs.player_dead_since = Some(std::time::Instant::now());
+        // Capture who killed us + when, and keep it past the respawn so /observe/debug can report a
+        // recent death (dead / killed_by / died_ago_secs) — an agent polling state can otherwise not
+        // tell it died (#284).
+        gs.killed_by = gs.entities.get(&killer_id).map(|e| e.name.clone())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "something".to_string());
+        gs.died_at   = Some(std::time::Instant::now());
         gs.hp_pct    = 0.0;
         gs.player_dead = true; // nav walker checks this and clears any stale /goto (eqoxide#61)
         // Zero cur_hp too: the self-render path derives the dead pose from
@@ -1207,11 +1214,13 @@ fn apply_death(gs: &mut GameState, payload: &[u8]) {
         // player's own model keeps standing. Respawn reseeds cur_hp from the fresh
         // PlayerProfile, so the avatar stands back up automatically. (eqoxide#44)
         gs.cur_hp    = 0;
-        gs.strategy  = "Dead — waiting to respawn".into();
-        tracing::info!("EQ: combat: *** You have been slain! ***");
-        gs.log_msg("combat", "*** You have been slain! ***");
+        gs.strategy  = "Dead — POST /v1/lifecycle/respawn to revive".into();
+        let killer = gs.killed_by.clone();
+        tracing::info!("EQ: combat: *** You have been slain by {killer}! ***");
+        gs.log_msg("combat", &format!("*** You have been slain by {killer}! *** (POST /v1/lifecycle/respawn to revive at bind)"));
         // Async combat event so an agent learns of its own death immediately (GET /v1/events/combat).
-        gs.push_event("combat", "slain", "", true, "*** You have been slain! ***");
+        gs.push_event("combat", "slain", &killer, true,
+            &format!("You have been slain by {killer} — POST /v1/lifecycle/respawn to revive"));
     } else {
         let name = gs.entities.get(&d_id).map(|e| e.name.clone());
         if let Some(name) = name {
@@ -1949,6 +1958,27 @@ mod tests {
         let mut p = vec![0u8; SIZE_DEATH];
         p[0..4].copy_from_slice(&player_id.to_le_bytes()); // spawn_id = player
         p
+    }
+
+    #[test]
+    fn apply_death_captures_killer_and_death_time() {
+        // #284: a self death records who killed us + when, persisted for /observe/debug so a headless
+        // agent can tell it died (and by what) even though it later respawns.
+        let mut gs = GameState::new();
+        gs.player_id = 7; gs.max_hp = 100; gs.cur_hp = 100;
+        gs.entities.insert(42, test_entity(42, "a_giant_rat", 100.0));
+        let mut p = vec![0u8; SIZE_DEATH];
+        p[0..4].copy_from_slice(&7u32.to_le_bytes());  // spawn_id = player
+        p[4..8].copy_from_slice(&42u32.to_le_bytes()); // killer_id
+        super::apply_death(&mut gs, &p);
+        assert!(gs.player_dead, "self death marks player_dead");
+        assert_eq!(gs.killed_by, "a_giant_rat", "killer name captured");
+        assert!(gs.died_at.is_some(), "death time recorded");
+        // An unknown killer falls back to a readable placeholder, never empty.
+        let mut gs2 = GameState::new();
+        gs2.player_id = 7; gs2.max_hp = 100; gs2.cur_hp = 100;
+        super::apply_death(&mut gs2, &self_death_payload(7));
+        assert_eq!(gs2.killed_by, "something");
     }
 
     #[test]
