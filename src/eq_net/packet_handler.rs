@@ -860,6 +860,13 @@ fn apply_set_target(gs: &mut GameState, payload: &[u8]) {
 
 fn apply_new_zone(gs: &mut GameState, payload: &[u8]) {
     gs.doors.clear();
+    // Purge the previous zone's spawns (#270). OP_NewZone fires on EVERY server-driven zone entry
+    // — normal travel, a same-zone #zone, AND a death-respawn — whereas the login/gameplay reconnect
+    // clears (login.rs / gameplay.rs) only run on the first-entry path. Without this, respawns and
+    // re-zones accumulate stale + duplicate cross-zone entities, so name→position resolution
+    // (goto/follow/merchant/target-by-name) picks ghosts. The OP_ZoneEntry spawn stream that follows
+    // repopulates the map for the new zone; sync_entities full-replaces the HTTP maps from it.
+    gs.entities.clear();
     if payload.len() < SIZE_NEW_ZONE { return; }
     // RoF2 NewZone_Struct (rof2_structs.h, 948 bytes). Use direct byte offsets
     // to avoid struct-padding issues with the packed 948-byte layout.
@@ -1959,6 +1966,21 @@ mod tests {
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
             face: 0, hairstyle: 0, haircolor: 0, animation: 0, floating: false,
         }
+    }
+
+    #[test]
+    fn new_zone_clears_stale_entities_from_prior_zone() {
+        // #270: OP_NewZone fires on every server-driven zone entry (travel, same-zone #zone,
+        // death-respawn) and must purge the previous zone's spawns, or respawns/re-zones leak
+        // stale + duplicate cross-zone entities into name→position resolution. The clears run
+        // before the length guard, so a short payload still exercises them; the following
+        // OP_ZoneEntry stream repopulates the map for the new zone.
+        let mut gs = GameState::new();
+        gs.entities.insert(1, test_entity(1, "Fippy_Darkpaw", 100.0));
+        gs.entities.insert(2, test_entity(2, "a_gnoll_pup", 100.0));
+        assert_eq!(gs.entities.len(), 2);
+        super::apply_new_zone(&mut gs, &[]);
+        assert!(gs.entities.is_empty(), "prior-zone entities must be cleared on zone entry (#270)");
     }
 
     #[test]
