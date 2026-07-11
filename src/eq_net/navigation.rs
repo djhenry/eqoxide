@@ -1282,16 +1282,34 @@ impl Navigator {
 
     /// Live NPC-camp positions to route AROUND (aggro-avoidance, #67), excluding NPCs near the
     /// goal (you're walking TO the destination, often a target mob, so its own camp isn't avoided).
-    /// The nearest IN-ZONE translocator region (a zone-line region whose destination is THIS zone — a
-    /// Qeynos guild-vault waterfall), as a goto target the char can walk INTO to teleport out (#266).
-    /// None if the nearest zone-line goes to a neighbour zone (a normal exit, not an escape portal).
+    /// The nearest FLOOR-REACHABLE in-zone translocator region (a zone-line region whose destination
+    /// is THIS zone — the Qeynos guild-vault waterfall), as a goto target the char can walk INTO to
+    /// teleport out (#266). None if no reachable in-zone portal exists.
+    ///
+    /// Two things this handles (both from find-issues-1's verified goto-Nerissa wedge at (-607,-71,z-14)):
+    ///  1. Restrict to IN-ZONE indices, not the nearest zone-line overall — once a stranded char drifts
+    ///     toward its goal a normal neighbour-zone exit can become the closest line, and "nearest line
+    ///     then check in-zone" returned None from there, so the escape never fired.
+    ///  2. Require the region's DRNTP footprint to reach the char's floor height, so walking to its XY
+    ///     actually fires the z-EXACT auto-cross — skipping top-of-waterfall-column leaves whose point
+    ///     sits high up (the char reaches the XY on the floor, stands below the leaf, never crosses).
     fn find_in_zone_portal(&self, gs: &GameState) -> Option<(f32, f32, f32)> {
         let guard = self.collision.read().unwrap();
         let c = guard.as_ref()?;
-        let (idx, loc) = c.find_zone_line_near(None, [gs.player_x, gs.player_y, gs.player_z])?;
-        let dest = self.zone_points.lock().unwrap().iter()
-            .find(|zp| zp.iterator as i32 == idx).map(|zp| zp.zone_id)?;
-        (dest == gs.zone_id).then_some((loc[0], loc[1], loc[2]))
+        let pos = [gs.player_x, gs.player_y, gs.player_z];
+        let in_zone_idxs: Vec<i32> = self.zone_points.lock().unwrap().iter()
+            .filter(|zp| zp.zone_id == gs.zone_id)
+            .map(|zp| zp.iterator as i32)
+            .collect();
+        let portal = c.find_reachable_in_zone_line(&in_zone_idxs, pos).map(|(_, l)| (l[0], l[1], l[2]));
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            let cands: Vec<_> = in_zone_idxs.iter()
+                .filter_map(|&idx| c.find_zone_line_near(Some(idx), pos)
+                    .map(|(_, l)| (idx, [l[0].round(), l[1].round(), l[2].round()])))
+                .collect();
+            tracing::debug!("find_in_zone_portal: pos_z={:.0} in_zone_idxs={in_zone_idxs:?} nearest_per_idx={cands:?} chose_reachable={portal:?}", pos[2]);
+        }
+        portal
     }
 
     fn aggro_avoid(gs: &GameState, goal: (f32, f32, f32), enabled: bool) -> Vec<[f32; 2]> {
