@@ -214,6 +214,9 @@ pub type TradeReq = Arc<Mutex<Option<TradeCmd>>>;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CampCmd { Start, Toggle }
 pub type CampReq = Arc<Mutex<Option<CampCmd>>>;
+/// Set true by POST /v1/lifecycle/respawn to release a held-dead character back to its bind point
+/// (the client no longer auto-respawns — it holds the character slain until asked). (#284)
+pub type RespawnReq = Arc<Mutex<bool>>;
 
 /// Published camp state: `Some(deadline)` while a camp is in progress (the instant the client will
 /// disconnect), `None` otherwise. Set by the gameplay loop; read by the HUD for the countdown and
@@ -392,6 +395,14 @@ pub struct PlayerState {
     pub hp_pct:        f32,
     pub cur_hp:        i32,
     pub max_hp:        i32,
+    /// Death state for headless agents (#284). `dead` = currently slain (held until POST
+    /// /v1/lifecycle/respawn). `killed_by` + `died_ago_secs` also persist for a window AFTER a
+    /// respawn, so an infrequently-polling agent can still tell it died and what killed it.
+    pub dead:          bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub killed_by:     Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub died_ago_secs: Option<u64>,
     pub mana_pct:      f32,
     pub cur_mana:      i32,
     pub max_mana:      i32,
@@ -489,6 +500,7 @@ pub(crate) struct HttpState {
     pub(crate) doors_shared:     DoorsShared,
     pub(crate) camp:             CampReq,
     pub(crate) camp_until:       CampUntil,
+    pub(crate) respawn:          RespawnReq,
     pub(crate) pet_cmd:          PetCmdReq,
 }
 
@@ -546,6 +558,7 @@ pub fn spawn_camera_server(
     doors_shared:     DoorsShared,
     camp:             CampReq,
     camp_until:       CampUntil,
+    respawn:          RespawnReq,
     pet_cmd:          PetCmdReq,
     nav_avoid:        NavAvoidShared,
     port:             u16,
@@ -556,7 +569,7 @@ pub fn spawn_camera_server(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, shared_collision, zone_cross, manual_move, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, dialogue, nav_state, dialogue_click, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until, pet_cmd, nav_avoid };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, shared_collision, zone_cross, manual_move, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, dialogue, nav_state, dialogue_click, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until, respawn, pet_cmd, nav_avoid };
             // Versioned + grouped routes: /v1/<group>/<action>. Each group's `router()` defines
             // relative paths; nesting prefixes them. Shared state is applied once at the end.
             let app = Router::new()
