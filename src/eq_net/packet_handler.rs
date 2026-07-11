@@ -2009,6 +2009,22 @@ mod tests {
     }
 
     #[test]
+    fn apply_consider_parses_20byte_reply_and_logs_attitude() {
+        // #273: the server ENCODEs OP_Consider as the 20-byte RoF2 Consider_Struct (targetid@4,
+        // faction@8, level@12). apply_consider must produce the attitude line + set the con color.
+        let mut gs = GameState::new();
+        gs.entities.insert(450, test_entity(450, "Guard_Phaeton", 100.0));
+        let mut reply = [0u8; 20];
+        reply[4..8].copy_from_slice(&450u32.to_le_bytes());   // targetid
+        reply[8..12].copy_from_slice(&9u32.to_le_bytes());     // faction 9 = scowls, ready to attack
+        reply[12..16].copy_from_slice(&2u32.to_le_bytes());    // level (con color)
+        super::apply_consider(&mut gs, &reply);
+        let m = gs.messages.back().unwrap().text.clone();
+        assert!(m.contains("Guard_Phaeton") && m.contains("scowls"), "attitude line: {m}");
+        assert!(gs.target_con.is_some(), "con color must be set for the HUD tint");
+    }
+
+    #[test]
     fn combat_damage_to_player_decrements_local_hp() {
         // eqoxide#55: a hit on the player should optimistically reduce local HP between OP_HPUpdates.
         use super::apply_combat_damage;
