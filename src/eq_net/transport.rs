@@ -672,6 +672,28 @@ impl EqStream {
         }
     }
 
+    /// Dispatch a protocol sub-packet pulled from an OP_Combined, whose `payload` is ALREADY
+    /// plaintext. The reliability opcodes (Packet/Fragment/Ack/OutOfOrder) whose standalone handlers
+    /// decode their body must be handled here WITHOUT decoding, since the combined body was decoded
+    /// once already. Everything else (session-response/keepalive/stat/nested-combined) does not decode
+    /// its body, so it can share `dispatch_transport` unchanged. (#302)
+    fn handle_predecoded_transport(&mut self, opcode: u8, payload: &[u8]) {
+        match opcode {
+            OP_PACKET => self.handle_ordered_decoded(payload, false),
+            OP_FRAGMENT | OP_FRAGMENT_CONT | OP_FRAGMENT_CONT2 | OP_FRAGMENT_CONT3 => {
+                self.handle_ordered_decoded(payload, true);
+            }
+            OP_ACK => {
+                if payload.len() >= 2 { self.ack_up_to(u16::from_be_bytes([payload[0], payload[1]])); }
+            }
+            OP_OUT_OF_ORDER => {
+                if payload.len() >= 2 { self.on_out_of_order(u16::from_be_bytes([payload[0], payload[1]])); }
+            }
+            // Non-decoding transport opcodes are safe to route through the standard dispatch.
+            _ => self.dispatch_transport(opcode, payload),
+        }
+    }
+
     fn handle_session_response(&mut self, payload: &[u8]) {
         if payload.len() < 15 {
             return;
@@ -692,6 +714,10 @@ impl EqStream {
         self.session.connected = true;
     }
 
+    /// A standalone reliable datagram (OP_Packet / OP_Fragment) straight off the wire: its body is
+    /// still encoded, so decode once then process. (A reliable arriving as an OP_Combined SUB is
+    /// already plaintext — see `handle_ordered_decoded`, called directly from the combined handler,
+    /// to avoid decoding it a second time. #302.)
     fn handle_ordered(&mut self, payload: &[u8], is_fragment: bool) {
         if payload.len() < 2 {
             return;
@@ -700,6 +726,13 @@ impl EqStream {
             Some(d) => d,
             None => return,
         };
+        self.handle_ordered_decoded(&decoded, is_fragment);
+    }
+
+    /// Process an ALREADY-DECODED reliable inner (`seq(BE u16) + data`): classify by sequence, ACK,
+    /// and deliver in order. Shared by the standalone path (after one decode) and the OP_Combined
+    /// sub-packet path (subs are already plaintext). (#302)
+    fn handle_ordered_decoded(&mut self, decoded: &[u8], is_fragment: bool) {
         if decoded.len() < 2 {
             return;
         }
@@ -770,7 +803,13 @@ impl EqStream {
                 // ran over the whole combined body, which `decode` above undid), so a raw app
                 // sub goes straight to the app layer — no per-sub decode.
                 if sub[0] == 0x00 {
-                    self.dispatch_transport(sub[1], &sub[2..]);
+                    // A protocol sub-packet. Its body is ALREADY plaintext (the combined body was
+                    // decoded once, above) — exactly like the raw-app subs below, which go straight to
+                    // the app layer with no per-sub decode. So the reliability opcodes must be handled
+                    // WITHOUT re-decoding; routing them through `dispatch_transport` (which decodes
+                    // again) double-decodes the sub → a corrupt seq → the reliable is never ACKed →
+                    // the server's resend_timeout (30s) closes the session (idle linkdead, #302).
+                    self.handle_predecoded_transport(sub[1], &sub[2..]);
                 } else {
                     self.dispatch_app(sub);
                 }
@@ -853,6 +892,57 @@ mod tests {
         assert_eq!(classify_seq(2, 0xF001), SeqClass::Future);
         // …while a seq just below `next` (also near the top) is a past duplicate.
         assert_eq!(classify_seq(0xF000, 0xF001), SeqClass::Duplicate);
+    }
+
+    /// Build an EqStream wired to a dummy UDP peer for driving the receive path in a test. Its outbound
+    /// ACKs go nowhere (try_send to a closed local port is a harmless no-op).
+    async fn test_stream(pass1: u8, key: u32) -> (EqStream, mpsc::UnboundedReceiver<AppPacket>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let _ = socket.connect("127.0.0.1:1").await;
+        let stream = EqStream {
+            session: SessionInfo { encode_pass1: pass1, encode_key: key, ..SessionInfo::default() },
+            socket,
+            peer: "127.0.0.1:1".parse().unwrap(),
+            send_seq: 0,
+            next_recv_seq: 0,
+            recv_buf: HashMap::new(),
+            sent: VecDeque::new(),
+            frags: FragmentBuffer::new(),
+            app_tx: tx,
+        };
+        (stream, rx)
+    }
+
+    #[tokio::test]
+    async fn combined_reliable_subpacket_is_not_double_decoded() {
+        // #302: a reliable OP_Packet bundled inside an OP_Combined has an already-plaintext body
+        // (the combined body was decoded once). Re-decoding it — as the old dispatch_transport path
+        // did — corrupts its seq under XOR, so it's never ACKed and the server's resend_timeout (30s)
+        // linkdeads an idle client. Drive exactly that datagram and assert the inner app packet is
+        // delivered intact (which requires the seq to be read correctly, i.e. NOT double-decoded).
+        let key = 0x1234_5678u32;
+        let (mut stream, mut rx) = test_stream(ENCODE_XOR, key).await;
+
+        // Reliable inner: seq(BE u16 = 0) + app packet (opcode 0x1234 LE, payload AA BB).
+        let inner = [0x00u8, 0x00, 0x34, 0x12, 0xAA, 0xBB];
+        // Combined sub-packet: [0x00, OP_PACKET] + inner.
+        let mut sub = vec![0x00u8, OP_PACKET];
+        sub.extend_from_slice(&inner);
+        // Combined body: length-prefixed sub.
+        let mut body = vec![sub.len() as u8];
+        body.extend_from_slice(&sub);
+        // The server XOR-encodes the whole datagram body once.
+        let encoded = encode_passes(&body, ENCODE_XOR, ENCODE_NONE, key);
+        // Datagram: [0x00, OP_COMBINED] + encoded (crc_bytes = 0 in this session).
+        let mut dgram = vec![0x00u8, OP_COMBINED];
+        dgram.extend_from_slice(&encoded);
+
+        stream.on_raw_recv(&dgram);
+
+        let app = rx.try_recv().expect("combined reliable sub must deliver its app packet (no double-decode)");
+        assert_eq!(app.opcode, 0x1234);
+        assert_eq!(app.payload, vec![0xAA, 0xBB]);
     }
 
     #[test]
