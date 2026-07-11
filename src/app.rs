@@ -851,6 +851,11 @@ impl App {
                                    .or_else(|| gs.target_name.clone()),
                 target_hp_pct: gs.target_id.and_then(|id| gs.entities.get(&id)).map(|e| e.hp_pct)
                                    .or(gs.target_hp_pct),
+                // #292: con difficulty tier + attitude enum (from the last consider) and the
+                // target's level, only while something is targeted.
+                target_con:      gs.target_id.and(gs.target_con_name.clone()),
+                target_attitude: gs.target_id.and(gs.target_attitude.clone()),
+                target_level:    gs.target_id.and_then(|id| gs.entities.get(&id)).map(|e| e.level),
                 // Connection health (#8): time since the last inbound server packet. `connected`
                 // flips false after CONN_STALE_SECS of silence — the world is frozen, not idle.
                 last_packet_age_ms: self.last_inbound.elapsed().as_millis() as u64,

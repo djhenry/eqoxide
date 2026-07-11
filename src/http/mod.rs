@@ -415,6 +415,16 @@ pub struct PlayerState {
     /// Current target's display name and HP percent (0–100), or None when nothing is targeted.
     pub target_name:   Option<String>,
     pub target_hp_pct: Option<f32>,
+    /// #292: consider result for the current target (from POST /v1/combat/consider). `target_con`
+    /// is the difficulty tier (gray/green/light_blue/blue/white/yellow/red), `target_attitude` the
+    /// faction attitude enum (ally … scowls), `target_level` the target's actual level — so agents
+    /// can gauge "how tough + how hostile" programmatically. Populated after a consider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_con:      Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_attitude: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_level:    Option<u32>,
     /// Milliseconds since the last inbound server packet (connection-health signal, #8).
     pub last_packet_age_ms: u64,
     /// False when no server packet has arrived for [`CONN_STALE_SECS`] — the session is
