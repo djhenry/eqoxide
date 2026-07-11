@@ -109,6 +109,39 @@ pub fn build_consider_packet(player_id: u32, target_id: u32) -> Vec<u8> {
     buf
 }
 
+/// RoF2 `BookRequest_Struct` (fixed 8216 bytes, rof2_structs.h:2899) for OP_ReadBook — reads a
+/// book/note item's text (#288). Fixed-size: the server's DECODE_LENGTH_EXACT rejects any other
+/// length. Layout: window(u32)@0, invslot(TypelessInventorySlot 8B)@4, type(u32)@12,
+/// target_id(u32)@16, can_cast(u8)@20, can_scribe(u8)@21, txtfile(char[8194])@22. The server keys the
+/// `books` table by the FILENAME in `txtfile`, so that string is what matters; `invslot` only drives a
+/// secondary type/can_scribe override. The server copies txtfile into a 20-char buffer, so a filename
+/// ≥20 chars won't resolve — keep it short.
+pub fn build_read_book_packet(slot: i16, target_id: u32, filename: &str) -> Vec<u8> {
+    let mut buf = vec![0u8; 8216];
+    buf[0..4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());   // window = new
+    // invslot: TypelessInventorySlot_Struct { Slot, SubIndex, AugIndex, Unknown01 } — i16 each.
+    buf[4..6].copy_from_slice(&slot.to_le_bytes());
+    buf[6..8].copy_from_slice(&(-1i16).to_le_bytes());          // SubIndex = -1 (not inside a bag)
+    buf[8..10].copy_from_slice(&(-1i16).to_le_bytes());         // AugIndex = -1
+    buf[12..16].copy_from_slice(&1u32.to_le_bytes());           // type = 1 (Book) — echoed in the reply
+    buf[16..20].copy_from_slice(&target_id.to_le_bytes());
+    // txtfile @22: the item's Filename, NUL-terminated. Cap at 19 so the server's 20-char copy stays
+    // NUL-terminated and resolves against the books table.
+    let fb = filename.as_bytes();
+    let n = fb.len().min(19);
+    buf[22..22 + n].copy_from_slice(&fb[..n]);
+    buf
+}
+
+/// Parse an OP_ReadBook REPLY (same 8216-byte struct). The book text is at offset 22, NUL-terminated;
+/// RoF2 uses a backtick as the newline marker. Returns the readable text. (#288)
+pub fn parse_read_book_reply(payload: &[u8]) -> Option<String> {
+    if payload.len() < 23 { return None; }
+    let body = &payload[22..];
+    let end = body.iter().position(|&b| b == 0).unwrap_or(body.len());
+    Some(String::from_utf8_lossy(&body[..end]).replace('`', "\n"))
+}
+
 /// RoF2 `CastSpell_Struct` (44 bytes, rof2_structs.h): slot(u32), spell_id(u32),
 /// inventory_slot(InventorySlot_Struct, 12B), target_id(u32), cs_unknown[2](u32), y/x/z_pos(f32).
 /// The client targets RoF2; the old Titanium 20-byte layout failed the server's
@@ -784,6 +817,9 @@ pub struct Navigator {
     /// Aggro-avoidance knobs from /v1/move/* (#242): whether to route around NPC camps and how wide a
     /// buffer to give them. Read each time a route is (re)planned.
     nav_avoid:        crate::http::NavAvoidShared,
+    /// POST /v1/interact/read request: the inventory wire slot of a book/note to read (#288). Drained
+    /// each tick; the item's Filename is sent as OP_ReadBook and the server replies with the text.
+    read_book:        crate::http::ReadBookReq,
     /// Last time we sent OP_FloatListThing (movement history) — the anti-MQGhost keepalive (#105).
     last_movement_history_send: Instant,
     /// Last position we streamed, and the last-send timestamp (for the 280 ms / 1300 ms cadence).
@@ -847,6 +883,7 @@ impl Navigator {
         pos_correction:   PosCorrection,
         nav_path_view:    crate::http::NavPathView,
         nav_avoid:        crate::http::NavAvoidShared,
+        read_book:        crate::http::ReadBookReq,
     ) -> Self {
         Navigator {
             goto_target,
@@ -925,6 +962,7 @@ impl Navigator {
             pos_correction,
             nav_path_view,
             nav_avoid,
+            read_book,
             last_streamed: [0.0, 0.0, 0.0],
             last_pos_send: Instant::now(),
             last_movement_history_send: Instant::now(),
@@ -1580,6 +1618,22 @@ impl Navigator {
                     PET_BACKOFF => "back off", PET_FOLLOWME => "follow",
                     PET_GUARDHERE => "guard here", PET_SIT => "sit", _ => "other",
                 }));
+            }
+        }
+
+        // POST /v1/interact/read {"slot":N}: read a book/note. Look up the item at that wire slot;
+        // if it carries a Filename it's readable, so send OP_ReadBook with that filename and the
+        // server replies with the text (apply_read_book stores it → GET /v1/observe/item_text). (#288)
+        let read_slot = self.read_book.lock().unwrap().take();
+        if let Some(slot) = read_slot {
+            match gs.inventory.iter().find(|i| i.slot == slot) {
+                Some(item) if !item.filename.is_empty() => {
+                    let pkt = build_read_book_packet(slot as i16, gs.player_id, &item.filename);
+                    stream.send_app_packet(OP_READ_BOOK, &pkt);
+                    tracing::info!("EQ: read book slot={} file='{}'", slot, item.filename);
+                }
+                Some(_) => gs.log_msg("book", &format!("Item in slot {slot} is not readable")),
+                None    => gs.log_msg("book", &format!("No item in slot {slot} to read")),
             }
         }
 
@@ -2670,6 +2724,7 @@ mod tests {
             Default::default(), // pos_correction
             Default::default(), // nav_path_view
             Default::default(), // nav_avoid
+            Default::default(), // read_book
         )
     }
 
@@ -3030,6 +3085,31 @@ mod tests {
         assert_eq!(p.len(), 20, "RoF2 Consider_Struct must be exactly 20 bytes");
         assert_eq!(u32::from_le_bytes([p[0], p[1], p[2], p[3]]), 7);
         assert_eq!(u32::from_le_bytes([p[4], p[5], p[6], p[7]]), 42);
+    }
+
+    #[test]
+    fn read_book_packet_layout() {
+        // #288: RoF2 BookRequest_Struct is a fixed 8216 bytes (DECODE_LENGTH_EXACT). Verify size,
+        // the window/slot/type/target fields, and that the item's Filename lands at offset 22.
+        let p = build_read_book_packet(23, 99, "book0001");
+        assert_eq!(p.len(), 8216, "BookRequest_Struct must be exactly 8216 bytes");
+        assert_eq!(u32::from_le_bytes([p[0], p[1], p[2], p[3]]), 0xFFFF_FFFF); // window = new
+        assert_eq!(i16::from_le_bytes([p[4], p[5]]), 23);                       // invslot.Slot
+        assert_eq!(u32::from_le_bytes([p[12], p[13], p[14], p[15]]), 1);        // type = Book
+        assert_eq!(u32::from_le_bytes([p[16], p[17], p[18], p[19]]), 99);       // target_id
+        assert_eq!(&p[22..30], b"book0001");                                    // txtfile = Filename
+        assert_eq!(p[30], 0, "txtfile is NUL-terminated after the filename");
+    }
+
+    #[test]
+    fn read_book_reply_decodes_backtick_newlines() {
+        // The reply reuses the same 8216-byte struct; text starts at offset 22, NUL-terminated, and
+        // RoF2 encodes newlines as a backtick. Build a synthetic reply and round-trip it.
+        let mut reply = vec![0u8; 8216];
+        let body = b"line one`line two";
+        reply[22..22 + body.len()].copy_from_slice(body);
+        let text = parse_read_book_reply(&reply).unwrap();
+        assert_eq!(text, "line one\nline two");
     }
 
     #[test]

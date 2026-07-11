@@ -107,7 +107,18 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_MANA_CHANGE          => apply_mana_change(gs, p),
         OP_MEMORIZE_SPELL       => apply_memorize_spell(gs, p),
         OP_INTERRUPT_CAST       => apply_interrupt_cast(gs, p),
+        OP_READ_BOOK            => apply_read_book(gs, p),
         _                       => {}
+    }
+}
+
+/// OP_ReadBook (reply) — the server returns a book/note's text in the same 8216-byte struct we sent
+/// (#288). Store the readable text so the observer API can surface it. The trailing empty
+/// OP_FinishWindow the server also sends is a no-op for us (not dispatched).
+fn apply_read_book(gs: &mut GameState, p: &[u8]) {
+    if let Some(text) = crate::eq_net::navigation::parse_read_book_reply(p) {
+        gs.log_msg("book", &text);
+        gs.last_book_text = Some(text);
     }
 }
 
@@ -502,6 +513,7 @@ fn push_item_and_contents(out: &mut Vec<crate::game_state::InvItem>, item: crate
         charges: (item.stacksize as i32).max(1),
         idfile:  item.idfile,
         click_spell_id: item.click_spell_id,
+        filename: item.filename,
     });
     for (sub_index, sub) in bag_contents {
         let Some(flat) = crate::game_state::bag_wire_slot(parent_slot, sub_index) else { continue };
@@ -513,6 +525,7 @@ fn push_item_and_contents(out: &mut Vec<crate::game_state::InvItem>, item: crate
             charges: (sub.stacksize as i32).max(1),
             idfile:  sub.idfile,
             click_spell_id: sub.click_spell_id,
+            filename: sub.filename,
         });
     }
 }
@@ -580,6 +593,7 @@ fn apply_item_packet(gs: &mut GameState, p: &[u8]) {
                 charges: (item.stacksize as i32).max(1),
                 idfile:  item.idfile,
                 click_spell_id: item.click_spell_id,
+                filename: item.filename,
             };
             apply_looted_item(gs, it);
         } else {
@@ -2078,7 +2092,7 @@ mod tests {
         let mut gs = GameState::new();
         gs.inventory.push(crate::game_state::InvItem {
             slot: 28, item_id: 13007, name: "Bone Chips".into(), icon: 0, charges: 1,
-            idfile: String::new(), click_spell_id: 0,
+            idfile: String::new(), click_spell_id: 0, filename: String::new(),
         });
         let mut echo = [0u8; 20];
         echo[0..4].copy_from_slice(&123u32.to_le_bytes());   // npcid
@@ -2111,7 +2125,7 @@ mod tests {
     fn inv_item(slot: i32, item_id: u32, charges: i32) -> crate::game_state::InvItem {
         crate::game_state::InvItem {
             slot, item_id, name: format!("item{item_id}"), icon: 0, charges,
-            idfile: String::new(), click_spell_id: 0,
+            idfile: String::new(), click_spell_id: 0, filename: String::new(),
         }
     }
 
@@ -2263,7 +2277,7 @@ mod tests {
         use crate::game_state::InvItem;
         let inv = |slot: i32, id: u32, ch: i32| InvItem {
             slot, item_id: id, name: String::new(), icon: 0, charges: ch, idfile: String::new(),
-            click_spell_id: 0,
+            click_spell_id: 0, filename: String::new(),
         };
         let mut gs = GameState::new();
         // Skin of Milk x20 @23, Bread Cakes x20 @24, Rat Whiskers x1 @25.
@@ -3279,7 +3293,7 @@ mod tests {
         // Push a dummy item so we can verify inventory is untouched
         gs.inventory.push(crate::game_state::InvItem {
             slot: 99, item_id: 1, name: "existing".into(), icon: 1, charges: 1, idfile: "IT1".into(),
-            click_spell_id: 0,
+            click_spell_id: 0, filename: String::new(),
         });
         let payload = 0u32.to_le_bytes().to_vec(); // count = 0
         apply_char_inventory(&mut gs, &payload);
