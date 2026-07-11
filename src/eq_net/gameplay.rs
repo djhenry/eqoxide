@@ -17,10 +17,7 @@ use crate::game_state::GameState;
 
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Respawn safety-net (eqoxide#50): if the player has been dead this long without the
-/// server opening/honoring the respawn window, proactively request a bind respawn.
-const RESPAWN_TIMEOUT: Duration = Duration::from_secs(10);
-/// How often to re-send the bind-respawn request while still stuck dead.
+/// How often to re-send the bind-respawn request while an explicit respawn is pending (#284/#50).
 const RESPAWN_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Consume the zone stream and run the gameplay loop indefinitely.
@@ -35,13 +32,17 @@ pub async fn run_gameplay_phase(
     shutdown:      Arc<AtomicBool>,
     camp:          crate::http::CampReq,
     camp_until:    crate::http::CampUntil,
+    respawn:       crate::http::RespawnReq,
 ) {
     // Wrap in Option so Rust allows reassignment after zone transitions.
     let mut stream: Option<EqStream>                      = Some(stream_init);
     let mut net_rx: Option<UnboundedReceiver<AppPacket>>  = Some(net_rx_init);
     let mut last_keepalive = std::time::Instant::now();
-    // Last time the respawn safety-net re-sent a bind-respawn request (eqoxide#50).
+    // Last time we (re)sent a bind-respawn request while an explicit respawn is pending (#284/#50).
     let mut last_respawn_retry: Option<std::time::Instant> = None;
+    // The OP_RespawnWindow payload the server sent when we died, held (NOT auto-answered) until the
+    // agent POSTs /v1/lifecycle/respawn (#284).
+    let mut pending_respawn: Option<Vec<u8>> = None;
 
     loop {
         let s  = stream.as_mut().expect("stream always Some in loop");
@@ -135,22 +136,15 @@ pub async fn run_gameplay_phase(
                     s.send_app_packet(OP_LOOT_ITEM, &packet.payload);
                     tracing::info!("EQ: auto-loot: taking item (echoed OP_LootItem)");
                 }
-                // Player died: the server opened the respawn hover window and holds us as a
-                // corpse until we pick an option. Auto-select 0 ("Bind Location") so an unattended
-                // session recovers instead of being stuck dead-in-place. The server then sends
-                // OP_ZonePlayerToBind + an HP update + a fresh OP_ZoneEntry self-spawn, which the
-                // existing handlers apply (position → bind, HP → alive, re-spawn), so no further
-                // client state reset is needed beyond clearing the "waiting to respawn" strategy.
+                // Player died: the server opened the respawn hover window and holds us as a corpse
+                // until we pick an option. #284: DON'T auto-respawn — keep the character slain so a
+                // headless agent can observe the death (killed_by / corpse) and decide. HOLD the
+                // window; we answer it only when the agent POSTs /v1/lifecycle/respawn (handled by
+                // the respawn-drive block below). The server keeps us as a corpse meanwhile.
                 OP_RESPAWN_WINDOW => {
-                    if let Some(reply) = respawn_window_reply(&packet.payload) {
-                        s.send_app_packet(OP_RESPAWN_WINDOW, &reply);
-                        gs.strategy = "Respawning at bind...".into();
-                        gs.log_msg("combat", "Respawning at bind point.");
-                        tracing::info!("EQ: respawn window — auto-selected bind (option 0)");
-                    } else {
-                        tracing::warn!("EQ: OP_RespawnWindow too short ({} bytes) — not answered",
-                            packet.payload.len());
-                    }
+                    pending_respawn = Some(packet.payload.clone());
+                    gs.strategy = "Dead — POST /v1/lifecycle/respawn to revive".into();
+                    tracing::info!("EQ: respawn window received — holding dead until /lifecycle/respawn (#284)");
                 }
                 // Death respawn: EQEmu (with RespawnFromHover off) sends OP_ZonePlayerToBind and
                 // then holds us in a ZoneToBindPoint "zoning" state, waiting for the client to
@@ -372,27 +366,32 @@ pub async fn run_gameplay_phase(
             last_keepalive = std::time::Instant::now();
         }
 
-        // Respawn safety-net (eqoxide#50): the server intermittently fails to send
-        // OP_RespawnWindow — or sends it but never applies the follow-up respawn —
-        // leaving the character stuck dead in place. If we've been dead past
-        // RESPAWN_TIMEOUT, proactively send the bind-respawn reply (option 0) and keep
-        // retrying every RESPAWN_RETRY_INTERVAL. Harmless if the server isn't holding a
-        // window (it just ignores the reply); player_dead_since clears once HP returns.
-        match gs.player_dead_since {
-            Some(dead_since)
-                if dead_since.elapsed() > RESPAWN_TIMEOUT
-                    && last_respawn_retry.map_or(true, |t| t.elapsed() > RESPAWN_RETRY_INTERVAL) =>
+        // Respawn drive (#284): we no longer auto-respawn. While dead, we recover ONLY once the
+        // agent asks via POST /v1/lifecycle/respawn (which sets `respawn`). Then reply to the held
+        // OP_RespawnWindow (option 0 = bind); if the window wasn't captured, fall back to a proactive
+        // bind-select so a requested respawn always recovers (never permanently stuck-dead). Retry
+        // every RESPAWN_RETRY_INTERVAL until HP returns. Once alive again, reset all death state.
+        if gs.player_dead_since.is_some() {
+            let want_respawn = *respawn.lock().unwrap();
+            if want_respawn
+                && last_respawn_retry.map_or(true, |t| t.elapsed() > RESPAWN_RETRY_INTERVAL)
             {
-                s.send_app_packet(OP_RESPAWN_WINDOW, &build_respawn_select(0));
-                gs.log_msg("combat", "No respawn — re-requesting bind respawn.");
-                tracing::warn!(
-                    "EQ: respawn safety-net — sent bind respawn (dead {}s, no recovery)",
-                    dead_since.elapsed().as_secs()
-                );
+                let reply = pending_respawn.as_deref()
+                    .and_then(respawn_window_reply)
+                    .unwrap_or_else(|| build_respawn_select(0));
+                s.send_app_packet(OP_RESPAWN_WINDOW, &reply);
+                gs.strategy = "Respawning at bind...".into();
+                gs.log_msg("combat", "Respawning at bind point.");
+                tracing::info!("EQ: respawn requested — sent bind respawn (#284)");
                 last_respawn_retry = Some(std::time::Instant::now());
             }
-            None => last_respawn_retry = None,
-            _ => {}
+        } else {
+            // Alive: clear the one-shot request + held window + retry timer for the next death.
+            if last_respawn_retry.is_some() || pending_respawn.is_some() {
+                last_respawn_retry = None;
+                pending_respawn = None;
+            }
+            *respawn.lock().unwrap() = false;
         }
 
         navigator.tick(s, &mut gs, &app_tx);
