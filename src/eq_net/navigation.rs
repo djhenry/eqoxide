@@ -510,6 +510,10 @@ const NAV_LOCAL_STUCK_TICKS: u32 = 3;
 /// the coarse planner every tick (~1 s). The existing stall/back-off recovery still handles a genuine
 /// wedge the fresh coarse plan can't route around.
 const REPLAN_COOLDOWN_TICKS: u32 = 6;
+/// After auto-escaping a sealed interior through an in-zone teleport (#266), block another escape for
+/// this long (~10 s at 150 ms/tick) so a goal that's STILL unreachable after the teleport can't
+/// ping-pong the char back and forth through the portal. One escape attempt, then it walks/stalls.
+const PORTAL_COOLDOWN_TICKS: u32 = 66;
 /// A path segment longer than this (horizontal) is a find_path JUMP-EDGE, not a walk — normal
 /// adjacent nav cells are ≤ 8·√2 ≈ 11.3u apart, jump-edges span ≥ 16u across a real gap. The walker
 /// asks the controller to jump when traversing such a segment. (eqoxide#190)
@@ -771,6 +775,16 @@ pub struct Navigator {
     local_stuck_ticks: u32,
     replan_coarse:     bool,
     replan_cooldown:   u32,
+    /// Auto-escape a SEALED interior via an in-zone teleport (#266). When a /goto goal is walk-
+    /// unreachable and the nearest zone-line region is a translocator that loops back to THIS zone (the
+    /// Qeynos guild-vault waterfall), the goto is temporarily redirected to that region — the char
+    /// walks in via the normal machinery, the auto-cross teleports it out, and the post-teleport jump
+    /// restores the real goal. `escape_return` holds the real goal while escaping; `last_walk_pos`
+    /// detects the teleport jump; `portal_cooldown` blocks an immediate re-escape so a still-unreachable
+    /// goal can't ping-pong through the portal forever.
+    escape_return:     Option<(f32, f32, f32)>,
+    last_walk_pos:     [f32; 3],
+    portal_cooldown:   u32,
     /// Single-authority controller integration (design §2). `controller_view` is the render
     /// thread's authoritative position snapshot we stream to the server; `nav_intent` is the
     /// `/goto` planner's per-frame wish written for the render controller; `pos_correction` hands a
@@ -919,6 +933,9 @@ impl Navigator {
             local_stuck_ticks: 0,
             replan_coarse: false,
             replan_cooldown: 0,
+            escape_return: None,
+            last_walk_pos: [0.0, 0.0, 0.0],
+            portal_cooldown: 0,
             backoff_dir: [0.0, 0.0],
             controller_view,
             nav_intent,
@@ -1167,6 +1184,18 @@ impl Navigator {
 
     /// Live NPC-camp positions to route AROUND (aggro-avoidance, #67), excluding NPCs near the
     /// goal (you're walking TO the destination, often a target mob, so its own camp isn't avoided).
+    /// The nearest IN-ZONE translocator region (a zone-line region whose destination is THIS zone — a
+    /// Qeynos guild-vault waterfall), as a goto target the char can walk INTO to teleport out (#266).
+    /// None if the nearest zone-line goes to a neighbour zone (a normal exit, not an escape portal).
+    fn find_in_zone_portal(&self, gs: &GameState) -> Option<(f32, f32, f32)> {
+        let guard = self.collision.read().unwrap();
+        let c = guard.as_ref()?;
+        let (idx, loc) = c.find_zone_line_near(None, [gs.player_x, gs.player_y, gs.player_z])?;
+        let dest = self.zone_points.lock().unwrap().iter()
+            .find(|zp| zp.iterator as i32 == idx).map(|zp| zp.zone_id)?;
+        (dest == gs.zone_id).then_some((loc[0], loc[1], loc[2]))
+    }
+
     fn aggro_avoid(gs: &GameState, goal: (f32, f32, f32), enabled: bool) -> Vec<[f32; 2]> {
         // `enabled == false` (from `avoid_aggro:false` on /v1/move/*) routes straight through — no
         // avoid points — for when the caller WANTS to path into a mob (#242). Default stays on (#67).
@@ -2047,6 +2076,21 @@ impl Navigator {
             }
         }
 
+        // Teleport detection (#266): a position jump far bigger than one tick of walking (RUN_SPEED
+        // ·0.15 ≈ 6.6u) means we were repositioned — an in-zone waterfall teleport, a GM #goto, or a
+        // server correction. If we were mid portal-escape, RESTORE the real goal (we're now on the far
+        // side of the teleport) and re-plan; any other jump just forces a re-plan off the stale path.
+        let jumped = (gs.player_x - self.last_walk_pos[0]).hypot(gs.player_y - self.last_walk_pos[1]) > 40.0;
+        self.last_walk_pos = [gs.player_x, gs.player_y, gs.player_z];
+        if jumped {
+            if let Some(ret) = self.escape_return.take() {
+                *self.goto_target.lock().unwrap() = Some(ret);
+                tracing::info!("NAV: teleported via in-zone portal — resuming goto to ({:.0},{:.0}) (#266)", ret.0, ret.1);
+            }
+            self.path_goal = None; // force a re-plan from the new position
+        }
+        if self.portal_cooldown > 0 { self.portal_cooldown -= 1; }
+
         let goto = *self.goto_target.lock().unwrap(); // copy out so the lock is released
         let goal = match goto {
             Some(t) => t,
@@ -2057,6 +2101,7 @@ impl Navigator {
             None    => {
                 self.path.clear();
                 self.path_goal = None;
+                self.escape_return = None; // goto cancelled → abandon any in-progress portal escape (#266)
                 *self.nav_intent.lock().unwrap() = None;
                 // Only downgrade from "navigating" (an external cancel / WASD). Keep terminal states
                 // (arrived / no_path / blocked) so a driver can still read the last outcome (#166).
@@ -2121,7 +2166,28 @@ impl Navigator {
                     *self.nav_intent.lock().unwrap() = None;
                     return;
                 }
-                Some(Some(path)) => { self.path = path; self.set_nav_state("navigating"); }
+                Some(Some(path)) => {
+                    // Does the coarse route actually REACH the goal, or is it a PARTIAL (goal walk-
+                    // unreachable — the char is boxed in)? A full route is goal-inclusive so its last
+                    // waypoint sits ~a cell from the goal; a partial ends far short.
+                    let reaches = path.last().is_some_and(|w| (w[0]-goal.0).hypot(w[1]-goal.1) <= 10.0);
+                    if !reaches && self.escape_return.is_none() && self.portal_cooldown == 0 {
+                        // Boxed in. If the only way out is an in-zone translocator (a vault waterfall),
+                        // REDIRECT the goto to it — walk in via the normal machinery, the auto-cross
+                        // teleports us out, and the jump-restore above resumes the real goal (#266).
+                        if let Some(portal) = self.find_in_zone_portal(gs) {
+                            tracing::info!("NAV: goal ({:.0},{:.0}) unreachable by walking — escaping the sealed area via the in-zone teleport at ({:.0},{:.0}) (#266)", goal.0, goal.1, portal.0, portal.1);
+                            self.escape_return = Some(goal);
+                            *self.goto_target.lock().unwrap() = Some(portal);
+                            self.portal_cooldown = PORTAL_COOLDOWN_TICKS;
+                            self.path_goal = None; // re-plan to the portal next tick
+                            *self.nav_intent.lock().unwrap() = None;
+                            return;
+                        }
+                    }
+                    self.path = path;
+                    self.set_nav_state("navigating");
+                }
                 // Collision not loaded yet (zoning): keep the old straight-line-toward-goal fallback.
                 None => { self.path = Vec::new(); self.set_nav_state("navigating"); }
             }
@@ -2253,6 +2319,16 @@ impl Navigator {
                 return;
             }
             ArrivalAction::Arrived => {
+                if let Some(ret) = self.escape_return.take() {
+                    // Reached the in-zone portal but did NOT teleport (auto-cross cooldown / region miss)
+                    // — give up the escape and resume the real goal; portal_cooldown blocks a re-escape
+                    // (#266). A portal escape is a plain goto (following==false), so it lands here.
+                    tracing::info!("NAV: reached the in-zone portal without teleporting — resuming goto to ({:.0},{:.0})", ret.0, ret.1);
+                    *self.goto_target.lock().unwrap() = Some(ret);
+                    self.path_goal = None;
+                    *self.nav_intent.lock().unwrap() = None;
+                    return;
+                }
                 tracing::info!("NAV: arrived at ({:.1},{:.1})", goal.0, goal.1);
                 self.set_nav_state("arrived");
                 *self.goto_target.lock().unwrap() = None;
