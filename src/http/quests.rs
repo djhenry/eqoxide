@@ -159,6 +159,7 @@ pub(crate) mod tests {
             hail: Arc::new(Mutex::new(None)),
             say: Arc::new(Mutex::new(None)),
             target: Arc::new(Mutex::new(None)),
+            who_req: Arc::new(Mutex::new(None)),
             attack: Arc::new(Mutex::new(None)),
             cast: Arc::new(Mutex::new(None)),
             mem_spell: Arc::new(Mutex::new(None)),

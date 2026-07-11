@@ -36,6 +36,11 @@ mod lifecycle;
 /// and sends the bytes back through the channel.
 pub type FrameReq = Arc<Mutex<Option<oneshot::Sender<Vec<u8>>>>>;
 
+/// A pending `/who all` request: GET /v1/observe/who registers a oneshot sender here; the nav thread
+/// drains it, sends OP_WhoAllRequest, and fires it with the parsed roster when OP_WhoAllResponse
+/// arrives. (#300)
+pub type WhoReq = Arc<Mutex<Option<oneshot::Sender<Vec<crate::game_state::WhoEntry>>>>>;
+
 /// Target position for the navigation system. Set by /goto, cleared on arrival.
 pub type GotoTarget = Arc<Mutex<Option<(f32, f32, f32)>>>;
 
@@ -507,6 +512,7 @@ pub(crate) struct HttpState {
     pub(crate) hail:             HailReq,
     pub(crate) say:              SayReq,
     pub(crate) target:           TargetReq,
+    pub(crate) who_req:          WhoReq,
     pub(crate) attack:           AttackReq,
     pub(crate) cast:             CastReq,
     pub(crate) mem_spell:        MemSpellReq,
@@ -568,6 +574,7 @@ pub fn spawn_camera_server(
     hail:             HailReq,
     say:              SayReq,
     target:           TargetReq,
+    who_req:          WhoReq,
     attack:           AttackReq,
     cast:             CastReq,
     mem_spell:        MemSpellReq,
@@ -621,7 +628,7 @@ pub fn spawn_camera_server(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, shared_collision, zone_cross, manual_move, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, dialogue, nav_state, dialogue_click, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until, respawn, pet_cmd, nav_avoid, read_book, guild, guild_action };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, shared_collision, zone_cross, manual_move, hail, say, target, who_req, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, dialogue, nav_state, dialogue_click, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until, respawn, pet_cmd, nav_avoid, read_book, guild, guild_action };
             // Versioned + grouped routes: /v1/<group>/<action>. Each group's `router()` defines
             // relative paths; nesting prefixes them. Shared state is applied once at the end.
             let app = Router::new()
