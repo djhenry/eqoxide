@@ -145,6 +145,13 @@ pub const OP_SHOP_END: u16 = 0x30a8;          // RoF2: OP_ShopEnd; server confir
 
 // Move/equip/unequip an item between inventory slots.
 pub const OP_MOVE_ITEM: u16 = 0x32ee;         // RoF2: OP_MoveItem; MoveItem_Struct (from_slot,to_slot,number_in_stack)
+// S->C: destroy an item / reduce a stack's charges at a slot. RoF2 DeleteItem_Struct shares
+// MoveItem's 28-byte wire layout (from_slot InventorySlot_Struct@0, to_slot@12, number_in_stack@24).
+// The server sends OP_DeleteItem to clear a slot during SwapItemResync (the "Inventory
+// Desyncronization" recovery after a rejected move); without handling it the cleared slot's scratch
+// token lingers in our inventory forever (#275).
+pub const OP_DELETE_ITEM: u16 = 0x18ad;       // RoF2: OP_DeleteItem
+pub const OP_DELETE_CHARGE: u16 = 0x01b8;     // RoF2: OP_DeleteCharge (same wire struct)
 
 // Trade window: hand an item to an NPC for a quest turn-in. Sequence is
 //   C: OP_TradeRequest → S: OP_TradeRequestAck → C: OP_MoveItem(cursor→trade slot) +
