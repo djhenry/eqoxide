@@ -106,6 +106,7 @@ pub async fn run_gameplay_phase(
             navigator.sync_zone_points(&gs);
             navigator.sync_tasks(&gs);
             navigator.sync_group(&gs);
+            navigator.sync_guild(&gs);
             navigator.sync_inventory(&gs);
             navigator.sync_merchant(&gs);
             navigator.sync_messages(&gs);

@@ -108,6 +108,10 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_MEMORIZE_SPELL       => apply_memorize_spell(gs, p),
         OP_INTERRUPT_CAST       => apply_interrupt_cast(gs, p),
         OP_READ_BOOK            => apply_read_book(gs, p),
+        OP_GUILD_LIST           => apply_guild_list(gs, p),
+        OP_GUILD_MEMBER_LIST    => apply_guild_member_list(gs, p),
+        OP_GUILD_MEMBER_UPDATE  => apply_guild_member_update(gs, p),
+        OP_GUILD_INVITE         => apply_guild_invite(gs, p),
         _                       => {}
     }
 }
@@ -1457,6 +1461,102 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
     }
 }
 
+/// OP_GuildsList — the server-wide guild directory (guild_id → name). Little-endian, variable
+/// length: u8[64] header, u32 count, then `count` × (u32 guild_id, NUL-terminated name). Used to
+/// resolve the player's own guild_id (and any member's) to a display name. Rebuilt on every receipt
+/// (the server re-sends it whenever any guild is created/renamed/deleted). (#295)
+fn apply_guild_list(gs: &mut GameState, payload: &[u8]) {
+    if payload.len() < 68 { return; }
+    let count = u32::from_le_bytes([payload[64], payload[65], payload[66], payload[67]]) as usize;
+    let mut rest = &payload[68..];
+    let mut names = std::collections::HashMap::with_capacity(count);
+    for _ in 0..count {
+        if rest.len() < 4 { break; }
+        let id = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
+        let (name, r) = match read_cstr(&rest[4..]) { Some(v) => v, None => break };
+        rest = r;
+        if !name.is_empty() { names.insert(id, name); }
+    }
+    tracing::info!("EQ: guild directory: {} guilds", names.len());
+    gs.guild_names = names;
+}
+
+/// OP_GuildMemberList — the full guild roster snapshot. NOTE: this is the one guild packet sent in
+/// NETWORK byte order (BIG-ENDIAN). Layout: cstr prefix_name, u32 guild_id (uninitialized — ignore),
+/// u32 member_count, then per member: cstr name, u32 level, u32 banker, u32 class, u32 rank(0-8),
+/// u32 time_last_on, u32 tribute_enable, u32 unk, u32 total_tribute, u32 last_tribute, u32 unk,
+/// cstr public_note, u16 zoneinstance, u16 zone_id, u32 unk, u32 unk. Online = zone_id != 0. Full
+/// replace (the server re-sends the whole list on membership changes). (#295)
+fn apply_guild_member_list(gs: &mut GameState, payload: &[u8]) {
+    // All integers here are big-endian.
+    let rd_u32 = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+    let rd_u16 = |b: &[u8]| u16::from_be_bytes([b[0], b[1]]);
+    let (_prefix, rest) = match read_cstr(payload) { Some(v) => v, None => return };
+    if rest.len() < 8 { return; }
+    let count = rd_u32(&rest[4..]) as usize; // skip the uninitialized guild_id u32 at rest[0..4]
+    let mut cur = &rest[8..];
+    let mut members = Vec::with_capacity(count.min(4096));
+    for _ in 0..count {
+        let (name, r) = match read_cstr(cur) { Some(v) => v, None => break };
+        cur = r;
+        if cur.len() < 40 { break; } // 10 × u32 before the public_note cstr
+        let level = rd_u32(&cur[0..]);
+        let class = rd_u32(&cur[8..]);   // cur[4..] = banker flags (skipped)
+        let rank  = rd_u32(&cur[12..]);
+        // consume the 10 fixed u32s: level, banker, class, rank, time_last_on, tribute_enable,
+        // unknown, total_tribute, last_tribute, unknown_one.
+        cur = &cur[40..];
+        let (public_note, r) = match read_cstr(cur) { Some(v) => v, None => break };
+        cur = r;
+        if cur.len() < 12 { break; } // u16 zoneinstance + u16 zone_id + u32 + u32
+        let zone_id = rd_u16(&cur[2..]) as u32; // cur[0..2] = zoneinstance (skipped)
+        cur = &cur[12..];
+        members.push(crate::game_state::GuildMember {
+            name, rank, level, class, zone_id, online: zone_id != 0, public_note,
+        });
+    }
+    tracing::info!("EQ: guild roster: {} members", members.len());
+    gs.guild_members = members;
+}
+
+/// OP_GuildMemberUpdate — a live presence ping for one member (little-endian, 80-byte fixed struct):
+/// GuildID(u32) MemberName[64] ZoneID(u16) InstanceID(u16) LastSeen(u32) Unknown(u32). ZoneID==0
+/// means the member just went offline; nonzero means online in that zone. Patches the matching
+/// roster entry in place. (#295)
+fn apply_guild_member_update(gs: &mut GameState, payload: &[u8]) {
+    if payload.len() < 72 { return; }
+    let name = {
+        let nb = &payload[4..68];
+        let end = nb.iter().position(|&b| b == 0).unwrap_or(nb.len());
+        String::from_utf8_lossy(&nb[..end]).to_string()
+    };
+    let zone_id = u16::from_le_bytes([payload[68], payload[69]]) as u32;
+    if let Some(m) = gs.guild_members.iter_mut().find(|m| m.name == name) {
+        m.zone_id = zone_id;
+        m.online = zone_id != 0;
+        tracing::info!("EQ: guild presence: {} {}", name, if zone_id != 0 { "online" } else { "offline" });
+    }
+}
+
+/// OP_GuildInvite (inbound) — the server forwards a guild invite to us verbatim as a
+/// GuildCommand_Struct (140B): othername[64]@0 (= us), myname[64]@64 (= the inviter), u16
+/// guildeqid@128 (the guild), u8 unknown[2]@130, u32 officer@132 (offered rank). We capture it as a
+/// pending invite so POST /v1/guild/accept can reply with OP_GuildInviteAccept. (#295)
+fn apply_guild_invite(gs: &mut GameState, payload: &[u8]) {
+    if payload.len() < 136 { return; }
+    let inviter = {
+        let nb = &payload[64..128];
+        let end = nb.iter().position(|&b| b == 0).unwrap_or(nb.len());
+        String::from_utf8_lossy(&nb[..end]).to_string()
+    };
+    let guild_id = u16::from_le_bytes([payload[128], payload[129]]) as u32;
+    let rank = u32::from_le_bytes([payload[132], payload[133], payload[134], payload[135]]);
+    if inviter.is_empty() { return; }
+    gs.log_msg("guild", &format!("{} invites you to their guild", inviter));
+    tracing::info!("EQ: guild invite from {} (guild_id={}, rank={})", inviter, guild_id, rank);
+    gs.pending_guild_invite = Some((inviter, guild_id, rank));
+}
+
 /// RoF2 saylink body length (`SAY_LINK_BODY_SIZE`, EQEmu `common/patches/rof2_limits.h`).
 const SAY_LINK_BODY_SIZE: usize = 56;
 
@@ -1689,6 +1789,20 @@ fn apply_spawn_appearance(gs: &mut GameState, payload: &[u8]) {
     const SITTING:   u32 = 110;
     if kind == ANIMATION && id == gs.player_id {
         gs.sitting = param == SITTING;
+    }
+    // Guild membership reflect (#295): the server pushes our own guild id/rank as SpawnAppearance
+    // kinds when membership changes (e.g. a GM `#guild add/remove`), with no client action. Applying
+    // them here keeps /observe/debug's guild identity live without any guild-specific opcode. Only
+    // our own spawn carries our membership. (GuildID=22, GuildRank=23, GuildShow=52.)
+    if id == gs.player_id {
+        const GUILD_ID: u16 = 22;
+        const GUILD_RANK: u16 = 23;
+        match kind {
+            GUILD_ID   => { gs.player_guild_id = param;
+                            tracing::info!("EQ: guild membership changed → guild_id={}", param); }
+            GUILD_RANK => { gs.player_guild_rank = param; }
+            _ => {}
+        }
     }
 }
 
@@ -1924,8 +2038,11 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
         gs.player_equipment_tint = info.equipment_tint;
         gs.player_face           = info.face;
         gs.player_hairstyle      = info.hairstyle;
-        tracing::info!("EQ: player spawn id={} pos=({:.1},{:.1},{:.1}) equip={:?}",
-            info.spawn_id, info.x, info.y, info.z, gs.player_equipment);
+        // Our own guild identity, from the self-spawn stream (#295). 0xFFFFFFFF/0 = no guild.
+        gs.player_guild_id       = info.guild_id;
+        gs.player_guild_rank     = info.guild_rank;
+        tracing::info!("EQ: player spawn id={} pos=({:.1},{:.1},{:.1}) equip={:?} guild_id={}",
+            info.spawn_id, info.x, info.y, info.z, gs.player_equipment, info.guild_id);
         return;
     }
 
@@ -2720,6 +2837,63 @@ mod tests {
         assert!(gs.messages.is_empty(), "empty message should produce no log entry");
     }
 
+    // --- guild membership (#295) ---
+
+    #[test]
+    fn apply_guild_list_builds_directory() {
+        let mut gs = GameState::new();
+        let mut p = vec![0u8; 64];               // 64-byte zero header
+        p.extend_from_slice(&2u32.to_le_bytes()); // count = 2
+        p.extend_from_slice(&7u32.to_le_bytes()); p.extend_from_slice(b"Knights\0");
+        p.extend_from_slice(&9u32.to_le_bytes()); p.extend_from_slice(b"Mages\0");
+        super::apply_guild_list(&mut gs, &p);
+        assert_eq!(gs.guild_names.get(&7).map(|s| s.as_str()), Some("Knights"));
+        assert_eq!(gs.guild_names.get(&9).map(|s| s.as_str()), Some("Mages"));
+    }
+
+    #[test]
+    fn apply_guild_member_list_parses_big_endian_roster() {
+        // OP_GuildMemberList is the one BIG-ENDIAN packet. Build one member and verify the fields
+        // land, and that online is derived from zone_id != 0.
+        let mut gs = GameState::new();
+        let mut p = Vec::new();
+        p.extend_from_slice(b"MyGuild\0");            // prefix cstr
+        p.extend_from_slice(&0u32.to_be_bytes());     // guild_id (uninitialized — ignored)
+        p.extend_from_slice(&1u32.to_be_bytes());     // member_count
+        p.extend_from_slice(b"Alice\0");              // name
+        for v in [10u32/*level*/, 0/*banker*/, 1/*class*/, 5/*rank*/, 0, 0, 0, 0, 0, 1] {
+            p.extend_from_slice(&v.to_be_bytes());    // 10 u32s
+        }
+        p.extend_from_slice(b"tank\0");               // public_note
+        p.extend_from_slice(&0u16.to_be_bytes());     // zoneinstance
+        p.extend_from_slice(&22u16.to_be_bytes());    // zone_id (online)
+        p.extend_from_slice(&1u32.to_be_bytes());     // unk
+        p.extend_from_slice(&0u32.to_be_bytes());     // unk
+        super::apply_guild_member_list(&mut gs, &p);
+        assert_eq!(gs.guild_members.len(), 1);
+        let m = &gs.guild_members[0];
+        assert_eq!(m.name, "Alice");
+        assert_eq!((m.level, m.class, m.rank, m.zone_id), (10, 1, 5, 22));
+        assert!(m.online, "zone_id 22 → online");
+        assert_eq!(m.public_note, "tank");
+    }
+
+    #[test]
+    fn apply_guild_member_update_patches_presence() {
+        let mut gs = GameState::new();
+        gs.guild_members = vec![crate::game_state::GuildMember {
+            name: "Bob".into(), rank: 5, level: 3, class: 1, zone_id: 22, online: true,
+            public_note: String::new(),
+        }];
+        // Little-endian 80-byte update: GuildID(4) MemberName[64] ZoneID(2) InstanceID(2) ...
+        let mut p = vec![0u8; 80];
+        p[4..7].copy_from_slice(b"Bob");
+        // zone_id = 0 at offset 68 → offline
+        super::apply_guild_member_update(&mut gs, &p);
+        assert!(!gs.guild_members[0].online, "zone_id 0 → offline");
+        assert_eq!(gs.guild_members[0].zone_id, 0);
+    }
+
     #[test]
     fn apply_wear_change_updates_one_slot() {
         use super::{register_spawn, apply_wear_change};
@@ -2728,7 +2902,7 @@ mod tests {
         gs.player_name = "Nobody".into();
         let info = SpawnInfo {
             spawn_id: 42, name: "a".into(), last_name: String::new(),
-            level: 5, npc: 1, gender: 0, race: 54, class_: 1, body_type: 1,
+            level: 5, npc: 1, gender: 0, race: 54, class_: 1, guild_id: 0xFFFF_FFFF, guild_rank: 0, body_type: 1,
             cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0, stand_state: 100,
             pet_owner_id: 0, player_state: 64,
             x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100,
@@ -2759,7 +2933,7 @@ mod tests {
         use crate::eq_net::protocol::SpawnInfo;
         let mk = |npc: u8, name: &str| SpawnInfo {
             spawn_id: 7, name: name.into(), last_name: String::new(),
-            level: 2, npc, gender: 0, race: 1, class_: 1, body_type: 1,
+            level: 2, npc, gender: 0, race: 1, class_: 1, guild_id: 0xFFFF_FFFF, guild_rank: 0, body_type: 1,
             cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0,
             stand_state: 100, pet_owner_id: 0, player_state: 64,
             x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100,
@@ -2857,7 +3031,7 @@ mod tests {
         equipment_tint[1] = [30, 20, 10]; // RGB (already in RGB order for SpawnInfo)
         let info = SpawnInfo {
             spawn_id: 7, name: "Orc".into(), last_name: String::new(),
-            level: 10, npc: 1, gender: 1, race: 54, class_: 1, body_type: 1,
+            level: 10, npc: 1, gender: 1, race: 54, class_: 1, guild_id: 0xFFFF_FFFF, guild_rank: 0, body_type: 1,
             cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0, stand_state: 100,
             pet_owner_id: 0, player_state: 64,
             x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100,
