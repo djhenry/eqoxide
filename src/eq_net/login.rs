@@ -123,6 +123,7 @@ pub async fn run_login_flow(
     pos_correction:   crate::http::PosCorrection,
     nav_path_view:    crate::http::NavPathView,
     nav_avoid:        crate::http::NavAvoidShared,
+    read_book:        crate::http::ReadBookReq,
 ) -> Result<(), String> {
     for attempt in 1..=max_retries {
         if attempt > 1 {
@@ -151,7 +152,7 @@ pub async fn run_login_flow(
                     tracing::info!("NAV: {} zone points seeded", gs.zone_points.len());
                 }
                 let char_name = config.character_name.clone();
-                let navigator = Navigator::new(goto_target, nav_state, goto_entity, entity_positions, entity_ids, zone_points, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, zone_cross, hail, say, target, attack, buy, sell, trade, merchant, move_req, give, inventory, loot, door_click, doors_shared, messages, dialogue, dialogue_click, chat_events, chat_send, cast, mem_spell, sit, consider, pet_cmd, collision, maps_dir, camp.clone(), controller_view, nav_intent, pos_correction, nav_path_view, nav_avoid);
+                let navigator = Navigator::new(goto_target, nav_state, goto_entity, entity_positions, entity_ids, zone_points, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, zone_cross, hail, say, target, attack, buy, sell, trade, merchant, move_req, give, inventory, loot, door_click, doors_shared, messages, dialogue, dialogue_click, chat_events, chat_send, cast, mem_spell, sit, consider, pet_cmd, collision, maps_dir, camp.clone(), controller_view, nav_intent, pos_correction, nav_path_view, nav_avoid, read_book.clone());
                 run_gameplay_phase(stream, net_rx, app_tx, gs, char_name, navigator, world_creds, shutdown.clone(), camp.clone(), camp_until.clone(), respawn.clone()).await;
                 return Ok(());
             }

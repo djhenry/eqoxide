@@ -163,6 +163,10 @@ pub struct InvItem {
     /// potion via `POST /v1/combat/cast {"item_slot": <this item's slot>}`. (eqoxide#193)
     #[serde(default)]
     pub click_spell_id: u32,
+    /// Book/note text-file id (`Item.Filename`). Empty for non-books; when set, the item is READABLE
+    /// via `POST /v1/interact/read {"slot":N}` → the server returns the text (#288).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub filename: String,
 }
 
 /// First flat bag-content wire slot (RoF2 invbag::GENERAL_BAGS_BEGIN). A container in general slot
@@ -346,6 +350,10 @@ pub struct GameState {
 
     // Message log (ring buffer)
     pub messages: VecDeque<LogEntry>,
+
+    /// Text of the most recently read book/note (OP_ReadBook reply), newline-decoded. `None` until a
+    /// book has been read this session. Surfaced via GET /v1/observe/item_text. (#288)
+    pub last_book_text: Option<String>,
 
     // Clickable NPC-dialogue choices from the most recent NPC message that carried saylinks
     // (e.g. a Soulbinder's "Do you wish to [bind your soul]?"). Replaced whenever a new NPC
