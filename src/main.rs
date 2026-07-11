@@ -246,6 +246,8 @@ OPTIONS:
     let pos_correction:   http::PosCorrection     = Arc::new(Mutex::new(None));
     // Walker's live plan, published by the nav thread and drawn by the nav-debug overlay (#246).
     let nav_path_view:    http::NavPathView       = Arc::new(Mutex::new((Vec::new(), Vec::new())));
+    // Aggro-avoidance knobs (#242): set by /v1/move/* and read by the nav walker when it plans.
+    let nav_avoid:        http::NavAvoidShared    = Arc::new(Mutex::new(http::AggroAvoidOpts::default()));
 
     // EQ network task — skipped in --testzone mode (offline debug)
     let character_name = login_cfg.character_name.clone();
@@ -306,11 +308,12 @@ OPTIONS:
         let ni  = nav_intent.clone();
         let pc  = pos_correction.clone();
         let npv = nav_path_view.clone();
+        let nav = nav_avoid.clone();
         let md  = data_dir.join("maps");
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, nst, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, pcm, sc, md, sd, cp, cu, cv, ni, pc, npv).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, nst, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, pcm, sc, md, sd, cp, cu, cv, ni, pc, npv, nav).await {
                     tracing::error!("EQ: fatal: {e}");
                 }
             });
@@ -422,6 +425,7 @@ OPTIONS:
         camp.clone(),
         camp_until.clone(),
         pet_cmd.clone(),
+        nav_avoid.clone(),
         app_cfg.http_port,
         exact_listener,
     );

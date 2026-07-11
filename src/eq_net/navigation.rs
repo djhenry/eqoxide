@@ -533,6 +533,7 @@ fn plan_path(
     start: [f32; 3],
     goal: [f32; 3],
     avoid: &[[f32; 2]],
+    aggro_buffer: f32,
 ) -> Option<Vec<[f32; 3]>> {
     use crate::movement::PLAYER_RADIUS;
     // This runs on the network thread, so a slow plan delays keepalive/ACK handling. Long-range
@@ -542,13 +543,13 @@ fn plan_path(
     let t0 = std::time::Instant::now();
     let plan = (|| {
         for r in [PLAYER_RADIUS, PLAYER_RADIUS * 0.5, PLAYER_RADIUS * 0.25] {
-            if let Some(p) = col.find_path(start, goal, r, avoid, false) {
+            if let Some(p) = col.find_path_res(start, goal, r, avoid, false, 8.0, None, aggro_buffer) {
                 return Some(p);
             }
         }
         // Fallback: no FULL route at any width — walk a PARTIAL route as far toward the goal as A*
         // can reach (the walker re-paths from the far end). Warn so this degraded routing is visible.
-        let partial = col.find_path(start, goal, PLAYER_RADIUS, avoid, true);
+        let partial = col.find_path_res(start, goal, PLAYER_RADIUS, avoid, true, 8.0, None, aggro_buffer);
         if let Some(ref p) = partial {
             tracing::warn!("nav: no full route from ({:.0},{:.0}) to ({:.0},{:.0}) — walking a PARTIAL route ({} wp) toward it",
                 start[0], start[1], goal[0], goal[1], p.len());
@@ -579,7 +580,7 @@ fn plan_path(
         // A floor reachable from the char's height (generous down-search finds ground below a face).
         let Some(af) = col.nearest_floor(ax, ay, start[2], 20.0, 100.0) else { continue };
         let anchor = [ax, ay, af];
-        if let Some(mut p) = col.find_path(anchor, goal, PLAYER_RADIUS, avoid, true) {
+        if let Some(mut p) = col.find_path_res(anchor, goal, PLAYER_RADIUS, avoid, true, 8.0, None, aggro_buffer) {
             // Only worthwhile if the re-anchored start could actually move (more than the lone
             // start cell A* was stuck on) — otherwise it's the same dead spot.
             if p.len() > 1 {
@@ -752,6 +753,9 @@ pub struct Navigator {
     /// Draw-only mirror of the walker's committed `path`/`local_path`, published each tick for the
     /// nav-debug overlay so it shows what the walker actually follows, not a separate recompute (#246).
     nav_path_view:    crate::http::NavPathView,
+    /// Aggro-avoidance knobs from /v1/move/* (#242): whether to route around NPC camps and how wide a
+    /// buffer to give them. Read each time a route is (re)planned.
+    nav_avoid:        crate::http::NavAvoidShared,
     /// Last time we sent OP_FloatListThing (movement history) — the anti-MQGhost keepalive (#105).
     last_movement_history_send: Instant,
     /// Last position we streamed, and the last-send timestamp (for the 280 ms / 1300 ms cadence).
@@ -814,6 +818,7 @@ impl Navigator {
         nav_intent:       NavIntent,
         pos_correction:   PosCorrection,
         nav_path_view:    crate::http::NavPathView,
+        nav_avoid:        crate::http::NavAvoidShared,
     ) -> Self {
         Navigator {
             goto_target,
@@ -891,6 +896,7 @@ impl Navigator {
             nav_intent,
             pos_correction,
             nav_path_view,
+            nav_avoid,
             last_streamed: [0.0, 0.0, 0.0],
             last_pos_send: Instant::now(),
             last_movement_history_send: Instant::now(),
@@ -1133,7 +1139,10 @@ impl Navigator {
 
     /// Live NPC-camp positions to route AROUND (aggro-avoidance, #67), excluding NPCs near the
     /// goal (you're walking TO the destination, often a target mob, so its own camp isn't avoided).
-    fn aggro_avoid(gs: &GameState, goal: (f32, f32, f32)) -> Vec<[f32; 2]> {
+    fn aggro_avoid(gs: &GameState, goal: (f32, f32, f32), enabled: bool) -> Vec<[f32; 2]> {
+        // `enabled == false` (from `avoid_aggro:false` on /v1/move/*) routes straight through — no
+        // avoid points — for when the caller WANTS to path into a mob (#242). Default stays on (#67).
+        if !enabled { return Vec::new(); }
         const NEAR_GOAL_SQ: f32 = 55.0 * 55.0;
         gs.entities.values()
             .filter(|e| e.is_npc && !e.dead)
@@ -2036,9 +2045,10 @@ impl Navigator {
             // Aggro-avoidance (#67): route AROUND live NPC camps so a long goto doesn't plow through
             // a mob group and get the player killed. Exclude NPCs near the GOAL — you're walking TO
             // the destination (often a target mob), so its own camp must not be avoided.
-            let avoid = Self::aggro_avoid(gs, goal);
+            let av = *self.nav_avoid.lock().unwrap();
+            let avoid = Self::aggro_avoid(gs, goal, av.enabled);
             let route = self.collision.read().unwrap().as_ref().map(|c|
-                plan_path(c, [gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], &avoid));
+                plan_path(c, [gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], &avoid, av.buffer));
             match route {
                 // Collision loaded, but A* found NO navmesh route to the target. Report it and STOP,
                 // rather than silently straight-lining into geometry and looking "wedged" — a driver
@@ -2092,7 +2102,7 @@ impl Navigator {
             let local_goal = carrot_along(&self.path, self.path_i, [px, py], LOCAL_REACH).unwrap_or(coarse);
             self.local_path = self.collision.read().unwrap().as_ref()
                 .and_then(|c| c.find_path_res([px, py, gs.player_z], local_goal,
-                    crate::movement::PLAYER_RADIUS, &[], true, LOCAL_CELL, Some(LOCAL_BOUND)))
+                    crate::movement::PLAYER_RADIUS, &[], true, LOCAL_CELL, Some(LOCAL_BOUND), 0.0))
                 .unwrap_or_default();
             // Proactive re-plan trigger (#246): did the fine plan actually REACH its coarse carrot? If
             // the committed coarse route skims an obstacle the 8u grid missed, the fine 2u plan stops
@@ -2215,9 +2225,10 @@ impl Navigator {
             if self.backoff_ticks == 0 {
                 // Backed off — re-plan from the cleaner spot. If it still can't route, the next
                 // stall (nav_repaths already counted) stops us.
-                let avoid = Self::aggro_avoid(gs, goal);
+                let av = *self.nav_avoid.lock().unwrap();
+                let avoid = Self::aggro_avoid(gs, goal, av.enabled);
                 let fresh = self.collision.read().unwrap().as_ref().and_then(|c|
-                    plan_path(c, [gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], &avoid));
+                    plan_path(c, [gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], &avoid, av.buffer));
                 if let Some(np) = fresh {
                     if np.len() > 1 {
                         tracing::warn!("NAV: backed off downhill — re-pathing ({} wp, attempt {})",
@@ -2606,6 +2617,7 @@ mod tests {
             Default::default(), // nav_intent
             Default::default(), // pos_correction
             Default::default(), // nav_path_view
+            Default::default(), // nav_avoid
         )
     }
 
