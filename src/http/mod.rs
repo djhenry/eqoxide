@@ -19,6 +19,7 @@ use crate::camera_state::{CameraCmd, CameraSnapshot};
 mod observe;
 mod quests;
 mod group;
+mod guild;
 mod move_api;
 mod trainer;
 mod pet;
@@ -133,6 +134,32 @@ pub struct GroupSnapshot {
     pub you_are_leader:   bool,
 }
 pub type GroupShared = Arc<Mutex<GroupSnapshot>>;
+
+/// Published each nav tick from the player's guild identity + roster: the guild fields of
+/// /v1/observe/debug and GET /v1/guild/roster. `guild_id == 0` / empty `guild_name` = not in a
+/// guild. Mirrors GroupSnapshot. (#295)
+#[derive(Clone, Default)]
+pub struct GuildSnapshot {
+    pub guild_id:   u32,
+    pub guild_name: String,
+    pub guild_rank: u32,
+    pub members:    Vec<crate::game_state::GuildMember>,
+    /// Name of whoever has a pending guild invite out to us (for GET /v1/guild/roster), or None.
+    pub pending_invite: Option<String>,
+}
+pub type GuildShared = Arc<Mutex<GuildSnapshot>>;
+
+/// One queued guild action from POST /v1/guild/{invite,accept,leave,remove}, drained by the nav tick
+/// which sends the matching RoF2 guild opcode. Bundled into one slot to keep the Navigator plumbing
+/// small. (#295)
+#[derive(Clone, Debug, PartialEq)]
+pub enum GuildAction {
+    Invite(String),   // POST /v1/guild/invite {"name"} — invite a player to our guild
+    Accept,           // POST /v1/guild/accept — accept a pending guild invite
+    Leave,            // POST /v1/guild/leave — leave our guild
+    Remove(String),   // POST /v1/guild/remove {"name"} — leader/GM removes a member
+}
+pub type GuildActionReq = Arc<Mutex<Option<GuildAction>>>;
 
 /// POST /v1/group/invite target name. Drained by the nav tick loop, which sends OP_GroupInvite.
 pub type GroupInviteReq = Arc<Mutex<Option<String>>>;
@@ -522,6 +549,8 @@ pub(crate) struct HttpState {
     pub(crate) respawn:          RespawnReq,
     pub(crate) pet_cmd:          PetCmdReq,
     pub(crate) read_book:        ReadBookReq,
+    pub(crate) guild:            GuildShared,
+    pub(crate) guild_action:     GuildActionReq,
 }
 
 pub fn spawn_camera_server(
@@ -582,6 +611,8 @@ pub fn spawn_camera_server(
     pet_cmd:          PetCmdReq,
     nav_avoid:        NavAvoidShared,
     read_book:        ReadBookReq,
+    guild:            GuildShared,
+    guild_action:     GuildActionReq,
     port:             u16,
     // When `Some`, an already-bound listener from `--api-port` (exact port, no scan).
     // When `None`, scan upward from `port` for the first free port.
@@ -590,13 +621,14 @@ pub fn spawn_camera_server(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, shared_collision, zone_cross, manual_move, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, dialogue, nav_state, dialogue_click, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until, respawn, pet_cmd, nav_avoid, read_book };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, shared_collision, zone_cross, manual_move, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, dialogue, nav_state, dialogue_click, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until, respawn, pet_cmd, nav_avoid, read_book, guild, guild_action };
             // Versioned + grouped routes: /v1/<group>/<action>. Each group's `router()` defines
             // relative paths; nesting prefixes them. Shared state is applied once at the end.
             let app = Router::new()
                 .nest("/v1/observe",   observe::router())
                 .nest("/v1/quests",    quests::router())
                 .nest("/v1/group",     group::router())
+                .nest("/v1/guild",     guild::router())
                 .nest("/v1/move",      move_api::router())
                 .nest("/v1/trainer",   trainer::router())
                 .nest("/v1/pet",       pet::router())

@@ -42,10 +42,18 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let cam   = s.snapshot.lock().unwrap().clone();
     let player = s.player_info.lock().unwrap().clone();
     let nav_state = s.nav_state.lock().unwrap().clone();
+    let (guild_name, guild_id, guild_rank) = {
+        let g = s.guild.lock().unwrap();
+        (g.guild_name.clone(), g.guild_id, g.guild_rank)
+    };
     Json(serde_json::json!({
         "player": {
             "name":       player.name,
             "zone":       player.zone,
+            // Guild identity (#295): empty name / id 0 = not in a guild.
+            "guild":      guild_name,
+            "guild_id":   guild_id,
+            "guild_rank": guild_rank,
             "race":       player.race,
             "class":      player.class,
             "level":      player.level,

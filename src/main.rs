@@ -253,6 +253,10 @@ OPTIONS:
     let nav_avoid:        http::NavAvoidShared    = Arc::new(Mutex::new(http::AggroAvoidOpts::default()));
     // POST /v1/interact/read request slot (#288): the inventory wire slot of a book/note to read.
     let read_book:        http::ReadBookReq       = Arc::new(Mutex::new(None));
+    // Guild roster/identity published for GET /v1/guild/roster + /observe/debug, and the guild-action
+    // request slot for POST /v1/guild/{invite,accept,leave,remove} (#295).
+    let guild:            http::GuildShared       = Arc::new(Mutex::new(http::GuildSnapshot::default()));
+    let guild_action:     http::GuildActionReq    = Arc::new(Mutex::new(None));
 
     // EQ network task — skipped in --testzone mode (offline debug)
     let character_name = login_cfg.character_name.clone();
@@ -316,11 +320,13 @@ OPTIONS:
         let npv = nav_path_view.clone();
         let nav = nav_avoid.clone();
         let rb  = read_book.clone();
+        let gld = guild.clone();
+        let gla = guild_action.clone();
         let md  = data_dir.join("maps");
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, nst, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, pcm, sc, md, sd, cp, cu, rsp, cv, ni, pc, npv, nav, rb).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, nst, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, pcm, sc, md, sd, cp, cu, rsp, cv, ni, pc, npv, nav, rb, gld, gla).await {
                     tracing::error!("EQ: fatal: {e}");
                 }
             });
@@ -436,6 +442,8 @@ OPTIONS:
         pet_cmd.clone(),
         nav_avoid.clone(),
         read_book.clone(),
+        guild.clone(),
+        guild_action.clone(),
         app_cfg.http_port,
         exact_listener,
     );
