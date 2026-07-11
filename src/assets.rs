@@ -1007,14 +1007,14 @@ impl Collision {
     /// sub-8u detail (thin ramps, narrow openings). The FINE local tier calls `find_path_res` with a
     /// small cell + a search bound to thread that detail near the walker.
     pub fn find_path(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]], allow_partial: bool) -> Option<Vec<[f32; 3]>> {
-        self.find_path_res(start, goal, radius, avoid, allow_partial, 8.0, None)
+        self.find_path_res(start, goal, radius, avoid, allow_partial, 8.0, None, 0.0)
     }
 
     /// A* at an arbitrary grid resolution `cell`, optionally bounded to `max_search` units of the
     /// start (so a FINE plan stays local + cheap even if it hits an obstacle). `cell` = 8.0 +
     /// `max_search` = None reproduces the classic whole-zone nav grid.
     pub fn find_path_res(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]],
-        allow_partial: bool, cell: f32, max_search: Option<f32>) -> Option<Vec<[f32; 3]>> {
+        allow_partial: bool, cell: f32, max_search: Option<f32>, aggro_buffer: f32) -> Option<Vec<[f32; 3]>> {
         use std::collections::BinaryHeap;
         use std::cmp::Ordering;
         if self.cols == 0 || self.rows == 0 { return None; }
@@ -1145,14 +1145,18 @@ impl Collision {
         // aggro) and faction-agnostic — the client has no broad faction data, so it avoids ALL
         // nearby NPCs; the penalty is MILD and fades to 0 at AGGRO_RADIUS, so a route is only
         // nudged around a camp when a clear alternative exists — it never becomes "no route".
-        const AGGRO_RADIUS: f32 = 50.0;  // ~ a low-level mob's aggro range
-        const AGGRO_PENALTY: f32 = 60.0; // max extra step cost right at an NPC; 0 at the radius edge
+        // `aggro_buffer` (#242) WIDENS that radius when the caller asks to route more conservatively
+        // around hostile pulls (`avoid_aggro` on /v1/move/*), and scales the penalty up with it so a
+        // bigger buffer gives real berth — while staying soft (still fades to 0 at the edge, so an
+        // unavoidable disc is threaded at shortest exposure rather than failing the route).
+        let aggro_radius  = 50.0 + aggro_buffer.max(0.0);       // ~a low-level mob's aggro range + buffer
+        let aggro_penalty = 60.0 * (1.0 + aggro_buffer.max(0.0) / 50.0); // firmer with a wider buffer
         let aggro_cost = |x: f32, y: f32| -> f32 {
             let mut worst = 0.0f32;
             for p in avoid {
                 let d2 = (x - p[0]) * (x - p[0]) + (y - p[1]) * (y - p[1]);
-                if d2 < AGGRO_RADIUS * AGGRO_RADIUS {
-                    worst = worst.max(AGGRO_PENALTY * (1.0 - d2.sqrt() / AGGRO_RADIUS));
+                if d2 < aggro_radius * aggro_radius {
+                    worst = worst.max(aggro_penalty * (1.0 - d2.sqrt() / aggro_radius));
                 }
             }
             worst
@@ -1973,6 +1977,34 @@ mod tests {
         // …and still arrive.
         let last = *skirt.last().unwrap();
         assert!((last[0] - goal[0]).abs() < 3.0 && (last[1] - goal[1]).abs() < 3.0, "reaches goal: {last:?}");
+    }
+
+    #[test]
+    fn aggro_buffer_widens_the_berth_around_npcs() {
+        // #242: a larger `aggro_buffer` on find_path_res gives the NPC MORE berth (route bows wider),
+        // while still reaching the goal — the avoidance stays soft (never fails).
+        let floor = MeshData {
+            positions: vec![[0.0, 0.0, 0.0], [200.0, 0.0, 0.0], [200.0, 0.0, 200.0], [0.0, 0.0, 200.0]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let col = Collision::build(&ZoneAssets { terrain: vec![floor], objects: vec![], textures: vec![] }, 16.0);
+        let start = [20.0, 100.0, 0.0];
+        let goal  = [180.0, 100.0, 0.0];
+        let npc = [[100.0, 100.0f32]];
+        let min_to_npc = |path: &[[f32; 3]]| path.iter()
+            .map(|w| ((w[0] - npc[0][0]).powi(2) + (w[1] - npc[0][1]).powi(2)).sqrt())
+            .fold(f32::MAX, f32::min);
+
+        let narrow = col.find_path_res(start, goal, 1.0, &npc, false, 8.0, None, 0.0).expect("route exists");
+        let wide   = col.find_path_res(start, goal, 1.0, &npc, false, 8.0, None, 60.0).expect("wider route still exists");
+
+        assert!(min_to_npc(&wide) > min_to_npc(&narrow) + 8.0,
+            "a bigger aggro_buffer should widen the berth (wide {} vs narrow {})",
+            min_to_npc(&wide), min_to_npc(&narrow));
+        let last = *wide.last().unwrap();
+        assert!((last[0] - goal[0]).abs() < 3.0 && (last[1] - goal[1]).abs() < 3.0, "still reaches goal: {last:?}");
     }
 
     #[test]
