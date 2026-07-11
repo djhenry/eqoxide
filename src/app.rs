@@ -215,6 +215,9 @@ pub struct App {
     asset_server_url: String,
     asset_user: String,
     asset_pass: String,
+    /// OS window title — "{account} {character} - EQOxide" so side-by-side agent clients are
+    /// tellable apart on the taskbar/switcher (#297). Computed once at construction from config.
+    window_title: String,
 }
 
 impl App {
@@ -248,6 +251,8 @@ impl App {
         nav_path_view:    crate::http::NavPathView,
     ) -> Self {
         let ui_state = crate::ui::UiState::new(&character_name, eq_ui_dir);
+        // Distinct per-client window title (#297): "{account} {character} - EQOxide".
+        let window_title = format!("{} {} - EQOxide", asset_user, character_name);
         let mut game_state = GameState::new();
         game_state.player_name = character_name;
 
@@ -313,6 +318,7 @@ impl App {
             sync_done:     Arc::new(Mutex::new(None)),
             models_loaded: false,
             asset_server_url, asset_user, asset_pass,
+            window_title,
         }
     }
 
@@ -1541,7 +1547,7 @@ impl ApplicationHandler for App {
         // Restore the per-character OS window geometry (#162). Size + maximized
         // work everywhere; position restore is best-effort (ignored on Wayland).
         let saved = self.ui_state.layout().os_window;
-        let mut attrs = WindowAttributes::default().with_title("EQ Observer");
+        let mut attrs = WindowAttributes::default().with_title(&self.window_title);
         let size = saved.map(|s| s.size).unwrap_or([1600, 900]);
         attrs = attrs.with_inner_size(winit::dpi::PhysicalSize::new(size[0].max(320), size[1].max(240)));
         if let Some(st) = saved {
