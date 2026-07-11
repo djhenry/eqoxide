@@ -1358,8 +1358,28 @@ impl Navigator {
             };
             // Only proceed if we actually have a target (want_zone==0 always may; want_zone!=0 needs a match).
             if want_zone == 0 || want_index.is_some() {
-                let located = self.collision.read().unwrap().as_ref()
-                    .and_then(|c| c.find_zone_line_near(want_index, [gs.player_x, gs.player_y, gs.player_z]));
+                // Locate the NEAREST reachable zone-line region for the wanted zone (not the first
+                // zone-point index that matches — a zone with several lines to the same target, or an
+                // in-zone translocator with multiple advertised points, would otherwise pick one with
+                // no nearby region and no-op, #266). want_index==None → any nearest line.
+                let located = self.collision.read().unwrap().as_ref().and_then(|c| {
+                    let pos = [gs.player_x, gs.player_y, gs.player_z];
+                    match (want_zone, want_index) {
+                        (0, _) => c.find_zone_line_near(None, pos),
+                        (_, _) => {
+                            // Every zone-point index advertised for `want_zone`, nearest region wins.
+                            let idxs: Vec<i32> = self.zone_points.lock().unwrap().iter()
+                                .filter(|zp| zp.zone_id == want_zone).map(|zp| zp.iterator as i32).collect();
+                            idxs.iter()
+                                .filter_map(|&idx| c.find_zone_line_near(Some(idx), pos))
+                                .min_by(|a, b| {
+                                    let da = (a.1[0]-pos[0]).hypot(a.1[1]-pos[1]);
+                                    let db = (b.1[0]-pos[0]).hypot(b.1[1]-pos[1]);
+                                    da.total_cmp(&db)
+                                })
+                        }
+                    }
+                });
                 match located {
                     Some((index, [tx, ty, tz])) => {
                         // Destination zone for logging (resolve the located region's index).
