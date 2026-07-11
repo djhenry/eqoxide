@@ -7,6 +7,22 @@ pub(super) fn router() -> Router<HttpState> {
     Router::new()
         .route("/camp", post(post_camp))
         .route("/exit", post(post_exit))
+        .route("/respawn", post(post_respawn))
+}
+
+/// POST /v1/lifecycle/respawn — revive a slain character at its bind point. The client holds a dead
+/// character in the slain state (it no longer auto-respawns) so an agent can inspect `dead` /
+/// `killed_by` in /v1/observe/debug and recover its corpse before continuing; this releases it. A
+/// no-op (but still 200) if the character isn't currently dead. (#284)
+async fn post_respawn(State(s): State<HttpState>) -> (StatusCode, &'static str) {
+    let dead = s.player_info.lock().unwrap().dead;
+    *s.respawn.lock().unwrap() = true;
+    if dead {
+        tracing::info!("respawn: requested via POST /v1/lifecycle/respawn");
+        (StatusCode::OK, "respawning at bind point")
+    } else {
+        (StatusCode::OK, "not currently dead (respawn will apply on the next death)")
+    }
 }
 
 /// POST /v1/lifecycle/camp — toggle a camp. Starts a camp if none is running, or cancels the one in

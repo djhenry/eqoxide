@@ -168,6 +168,9 @@ OPTIONS:
     // `camp_until` is the published camp deadline (Some while camping) for the HUD countdown.
     let camp:       http::CampReq   = Arc::new(Mutex::new(None));
     let camp_until: http::CampUntil = Arc::new(Mutex::new(None));
+    // Respawn request (#284): POST /v1/lifecycle/respawn sets this; the gameplay loop reads it to
+    // release a held-dead character to its bind point (no more auto-respawn).
+    let respawn:    http::RespawnReq = Arc::new(Mutex::new(false));
 
     // Route SIGTERM/SIGINT into the same clean-shutdown flag so a killed process (e.g.
     // `timeout N ./eqoxide`, Ctrl-C, or `kill <pid>`) logs out cleanly instead of dropping
@@ -304,6 +307,7 @@ OPTIONS:
         let sd  = shutdown.clone();
         let cp  = camp.clone();
         let cu  = camp_until.clone();
+        let rsp = respawn.clone();
         let cv  = controller_view.clone();
         let ni  = nav_intent.clone();
         let pc  = pos_correction.clone();
@@ -313,7 +317,7 @@ OPTIONS:
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, nst, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, pcm, sc, md, sd, cp, cu, cv, ni, pc, npv, nav).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, nst, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, pcm, sc, md, sd, cp, cu, rsp, cv, ni, pc, npv, nav).await {
                     tracing::error!("EQ: fatal: {e}");
                 }
             });
@@ -352,6 +356,7 @@ OPTIONS:
         group_make_leader: group_make_leader.clone(),
         camp: camp.clone(),
         camp_until: camp_until.clone(),
+        respawn: respawn.clone(),
         pet_cmd: pet_cmd.clone(),
     };
     let app_spells  = spells.clone();
@@ -424,6 +429,7 @@ OPTIONS:
         doors_shared,
         camp.clone(),
         camp_until.clone(),
+        respawn.clone(),
         pet_cmd.clone(),
         nav_avoid.clone(),
         app_cfg.http_port,

@@ -58,6 +58,9 @@ pub struct Actions {
     pub group_make_leader: crate::http::GroupMakeLeaderReq,
     pub camp: crate::http::CampReq,
     pub camp_until: crate::http::CampUntil,
+    /// Set true by the HUD death-overlay Respawn button (mirrors POST /v1/lifecycle/respawn) so a
+    /// HUMAN player can revive — the client no longer auto-respawns. (#284)
+    pub respawn: crate::http::RespawnReq,
     /// Manual pet command byte for OP_PetCommands (Pet window buttons).
     pub pet_cmd: crate::http::PetCmdReq,
 }
@@ -347,6 +350,7 @@ mod tests {
             group_make_leader: Arc::new(Mutex::new(None)),
             camp: Arc::new(Mutex::new(None)),
             camp_until: Arc::new(Mutex::new(None)),
+            respawn: Arc::new(Mutex::new(false)),
             pet_cmd: Arc::new(Mutex::new(None)),
         }
     }
