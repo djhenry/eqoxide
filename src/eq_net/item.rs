@@ -45,6 +45,9 @@ pub struct RoF2Item {
     pub icon:           u32,
     pub name:           String,
     pub idfile:         String,
+    /// Book/note text-file id (RoF2 item section I, `Item.Filename`). Empty for non-books; when set,
+    /// the item is READABLE — send it in OP_ReadBook to fetch the text (#288).
+    pub filename:       String,
     /// Item's click ("clicky") spell id from ClickEffectStruct.effect — 0 if the item has no
     /// clickable effect. Used to activate teleport rings/port potions via an item cast. (eqoxide#193)
     pub click_spell_id: u32,
@@ -165,8 +168,8 @@ pub fn parse_rof2_item(buf: &[u8]) -> Option<(RoF2Item, usize)> {
     // ── H. ItemSecondaryBodyStruct (74 bytes) ─────────────────────────────────
     off = skip(off, SECONDARY_LEN, len)?;
 
-    // ── I. Filename C-string ──────────────────────────────────────────────────
-    off = skip_cstr(buf, off)?;
+    // ── I. Filename C-string — the book/note text-file id (empty for non-books, #288) ─────────
+    let (filename, o) = read_cstr(buf, off)?; off = o;
 
     // ── J. ItemTertiaryBodyStruct (76 bytes) ──────────────────────────────────
     off = skip(off, TERTIARY_LEN, len)?;
@@ -214,7 +217,7 @@ pub fn parse_rof2_item(buf: &[u8]) -> Option<(RoF2Item, usize)> {
     }
 
     Some((RoF2Item { slot_type, main_slot, sub_slot, price, merchant_count, stacksize, charges,
-                     id, icon, name, idfile, click_spell_id, bag_contents }, off))
+                     id, icon, name, idfile, filename, click_spell_id, bag_contents }, off))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

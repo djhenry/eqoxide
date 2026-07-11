@@ -102,6 +102,11 @@ pub type AcceptTaskReq = Arc<Mutex<Option<u32>>>;
 /// (CancelTask_Struct).
 pub type CancelTaskReq = Arc<Mutex<Option<u32>>>;
 
+/// Read a book/note item, set by POST /v1/interact/read ({"slot":N}). Carries the inventory wire
+/// slot of the item to read. The nav thread takes it, looks up the item's Filename in gs.inventory,
+/// and sends OP_ReadBook; the server replies with the text (surfaced via /v1/observe/item_text). (#288)
+pub type ReadBookReq = Arc<Mutex<Option<i32>>>;
+
 /// One group member's live view for GET /v1/group/roster (role badges are read-only display
 /// flags pushed by the server — not settable via this API in v1).
 #[derive(Clone, serde::Serialize)]
@@ -420,6 +425,10 @@ pub struct PlayerState {
     /// `EQ_PROFILE=1`. Exposed under `/v1/observe/debug` → `frame_profile` so perf work (#152)
     /// can read phase costs programmatically instead of screenshotting the HUD overlay.
     pub frame_profile:      crate::profiling::FrameProfile,
+    /// Text of the most recently read book/note (OP_ReadBook reply), newline-decoded. None until a
+    /// book is read. Surfaced via GET /v1/observe/item_text so an agent can read a quest note (#288).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub book_text:          Option<String>,
 }
 pub type PlayerInfo = Arc<Mutex<PlayerState>>;
 
@@ -502,6 +511,7 @@ pub(crate) struct HttpState {
     pub(crate) camp_until:       CampUntil,
     pub(crate) respawn:          RespawnReq,
     pub(crate) pet_cmd:          PetCmdReq,
+    pub(crate) read_book:        ReadBookReq,
 }
 
 pub fn spawn_camera_server(
@@ -561,6 +571,7 @@ pub fn spawn_camera_server(
     respawn:          RespawnReq,
     pet_cmd:          PetCmdReq,
     nav_avoid:        NavAvoidShared,
+    read_book:        ReadBookReq,
     port:             u16,
     // When `Some`, an already-bound listener from `--api-port` (exact port, no scan).
     // When `None`, scan upward from `port` for the first free port.
@@ -569,7 +580,7 @@ pub fn spawn_camera_server(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, shared_collision, zone_cross, manual_move, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, dialogue, nav_state, dialogue_click, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until, respawn, pet_cmd, nav_avoid };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, shared_collision, zone_cross, manual_move, hail, say, target, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, dialogue, nav_state, dialogue_click, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until, respawn, pet_cmd, nav_avoid, read_book };
             // Versioned + grouped routes: /v1/<group>/<action>. Each group's `router()` defines
             // relative paths; nesting prefixes them. Shared state is applied once at the end.
             let app = Router::new()

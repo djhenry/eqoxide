@@ -13,6 +13,40 @@ pub(super) fn router() -> Router<HttpState> {
         .route("/sit", post(post_sit))
         .route("/stand", post(post_stand))
         .route("/dialogue", post(post_dialogue))
+        .route("/read", post(post_read))
+}
+
+/// POST /v1/interact/read — read a book or note. Body: `{"slot": N}` where N is the item's
+/// inventory wire slot (from GET /v1/observe/inventory; the item must have a non-empty `filename`).
+/// Sends OP_ReadBook; the server replies with the text, which appears at GET /v1/observe/item_text
+/// (and in the message log under the "book" kind). (#288)
+#[derive(serde::Deserialize)]
+struct ReadBody {
+    slot: i32,
+}
+
+async fn post_read(
+    State(s): State<HttpState>,
+    body: Result<Json<ReadBody>, axum::extract::rejection::JsonRejection>,
+) -> (StatusCode, String) {
+    let b = match body {
+        Ok(Json(b)) => b,
+        Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"slot\":N}".into()),
+    };
+    // Validate against the last-published inventory so a bad slot fails fast with a clear message,
+    // rather than being silently dropped by the nav thread.
+    let readable = s.inventory.lock().unwrap().iter()
+        .find(|i| i.slot == b.slot)
+        .map(|i| !i.filename.is_empty());
+    match readable {
+        Some(true) => {
+            *s.read_book.lock().unwrap() = Some(b.slot);
+            tracing::info!("read: queued book slot={}", b.slot);
+            (StatusCode::OK, format!("reading item in slot {}", b.slot))
+        }
+        Some(false) => (StatusCode::CONFLICT, format!("item in slot {} is not readable", b.slot)),
+        None => (StatusCode::NOT_FOUND, format!("no item in slot {}", b.slot)),
+    }
 }
 
 /// POST /v1/interact/dialogue — click one of the NPC-dialogue choices from GET

@@ -857,6 +857,8 @@ impl App {
                 connected:          self.last_inbound.elapsed().as_secs() < crate::http::CONN_STALE_SECS,
                 // Previous frame's smoothed phase timings (this frame's aren't known yet).
                 frame_profile:      self.frame_profile,
+                // Most recently read book/note text (OP_ReadBook reply), for GET /v1/observe/item_text (#288).
+                book_text:          self.game_state.last_book_text.clone(),
             };
         }
         // Mirror the health state into the scene so the HUD can show a "connection lost" banner (#8).

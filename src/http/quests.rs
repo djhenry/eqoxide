@@ -191,6 +191,7 @@ pub(crate) mod tests {
             camp_until: Arc::new(Mutex::new(None)),
             respawn: Arc::new(Mutex::new(false)),
             pet_cmd: Arc::new(Mutex::new(None)),
+            read_book: Arc::new(Mutex::new(None)),
             group:             Arc::new(Mutex::new(GroupSnapshot::default())),
             group_invite:      Arc::new(Mutex::new(None)),
             trainer_open_req:  Arc::new(Mutex::new(None)),

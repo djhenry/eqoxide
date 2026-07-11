@@ -27,6 +27,15 @@ pub(super) fn router() -> Router<HttpState> {
         // Deprecated alias for /zone_entrances (its content was always the entrance/arrival list).
         .route("/zone_points", get(get_zone_entrances))
         .route("/zone_exits", get(get_zone_exits))
+        .route("/item_text", get(get_item_text))
+}
+
+/// GET /v1/observe/item_text — the text of the most recently read book/note (from
+/// POST /v1/interact/read). Returns `{"text": "..."}` once a book has been read this session, or
+/// `{"text": null}` if none has. Newlines are decoded from RoF2's backtick marker. (#288)
+async fn get_item_text(State(s): State<HttpState>) -> Json<serde_json::Value> {
+    let text = s.player_info.lock().unwrap().book_text.clone();
+    Json(serde_json::json!({ "text": text }))
 }
 
 async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
