@@ -1495,6 +1495,9 @@ impl Navigator {
                     None => {
                         tracing::info!("zone_cross: no zone point advertised for zone_id={want_zone}");
                         gs.log_msg("zone", "No zone line found to cross");
+                        // Make the failure observable instead of a silent no-op (#267): a caller that
+                        // got 200 from POST /zone_cross can poll nav_state and see it didn't happen.
+                        self.set_nav_state("no_path");
                         None
                     }
                 }
@@ -1545,6 +1548,9 @@ impl Navigator {
                     None => {
                         tracing::info!("zone_cross: no zone-line region found for zone_id={want_zone}");
                         gs.log_msg("zone", "No zone line found to cross");
+                        // Advertised in OP_SendZonepoints but no DRNTP region in the loaded map (a .wtr
+                        // gap): report it so the caller isn't left thinking the 200 meant success (#267).
+                        self.set_nav_state("no_path");
                     }
                 }
             }
