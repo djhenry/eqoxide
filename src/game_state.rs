@@ -265,6 +265,26 @@ pub struct DialogueChoice {
     pub icon:      u32,        // ornament_icon from the link body
 }
 
+/// One guild member from the guild roster (OP_GuildMemberList). Surfaced via GET /v1/guild/roster
+/// so agents can see who is in the guild and who is online, the way /v1/group/roster works for a
+/// group. (#295)
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct GuildMember {
+    pub name:   String,
+    /// Rank within the guild: 0 member, 1 officer, 2 leader (RoF2 guildrank).
+    pub rank:   u32,
+    pub level:  u32,
+    /// EQ class id (0 if unknown from the roster record).
+    pub class:  u32,
+    /// Zone id where the member was last seen (0 = offline). Exposed numerically at the API layer.
+    pub zone_id: u32,
+    /// True if the member is currently online. Per the RoF2 roster there is no separate flag —
+    /// online is derived as `zone_id != 0`.
+    pub online: bool,
+    /// The member's guild public note (may be empty).
+    pub public_note: String,
+}
+
 /// All state the renderer needs for one frame.
 #[derive(Debug, Default, Clone)]
 pub struct GameState {
@@ -288,6 +308,20 @@ pub struct GameState {
     /// (Player hair is not helm-hidden — the player's `showhelm` flag isn't tracked; NPCs are.)
     pub player_haircolor: u8,
     pub player_action: String,
+    /// Player's guild id (from the PlayerProfile / spawn `guildID`). `0` = not in a guild (EQEmu's
+    /// GUILD_NONE). Resolved to a name via `guild_names` (OP_GuildsList). Exposed at
+    /// /v1/observe/debug and used to route/label guild chat. (#295)
+    pub player_guild_id: u32,
+    /// Player's rank within the guild (guildrank): 0 member, 1 officer, 2 leader (RoF2). (#295)
+    pub player_guild_rank: u32,
+    /// guild id → guild name, built from OP_GuildsList (the server's guild-name table). Used to
+    /// resolve `player_guild_id` and each roster member's guild to a display name. (#295)
+    pub guild_names: std::collections::HashMap<u32, String>,
+    /// The player's guild roster (from OP_GuildMemberList), for GET /v1/guild/roster. (#295)
+    pub guild_members: Vec<GuildMember>,
+    /// A pending incoming guild invite: (inviter name, guild_id, offered rank). Set when the server
+    /// forwards an OP_GuildInvite to us; consumed by POST /v1/guild/accept. (#295)
+    pub pending_guild_invite: Option<(String, u32, u32)>,
     pub hp_pct: f32,
     /// Player's absolute current/max HP (from OP_HP_UPDATE), used for the lethal-fall guard.
     pub cur_hp: i32,

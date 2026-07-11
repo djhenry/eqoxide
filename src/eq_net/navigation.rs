@@ -458,6 +458,36 @@ pub fn build_group_disband(own_name: &str, target_name: &str) -> [u8; 148] {
     buf
 }
 
+/// GuildCommand_Struct (RoF2, 140 bytes) — the payload for BOTH OP_GuildInvite and OP_GuildRemove
+/// (#295): othername[64]@0 (target / member acted on), myname[64]@64 (sender), u16 guildeqid@128
+/// (sender's guild id; server overwrites with our real GuildID if 0), u8 unknown[2]@130,
+/// u32 officer@132 (the target RANK on the 0-8 scale — for a plain invite this is GUILD_RECRUIT=8;
+/// for a self-leave/remove it's ignored), u32 unknown136. A self-leave is othername == myname.
+pub fn build_guild_command(othername: &str, myname: &str, guild_id: u32, rank: u32) -> [u8; 140] {
+    let mut buf = [0u8; 140];
+    let n = othername.as_bytes().len().min(63);
+    buf[0..n].copy_from_slice(&othername.as_bytes()[..n]);
+    let n2 = myname.as_bytes().len().min(63);
+    buf[64..64 + n2].copy_from_slice(&myname.as_bytes()[..n2]);
+    buf[128..130].copy_from_slice(&(guild_id as u16).to_le_bytes());
+    buf[132..136].copy_from_slice(&rank.to_le_bytes());
+    buf
+}
+
+/// GuildInviteAccept_Struct (RoF2, 136 bytes) — reply to an incoming OP_GuildInvite (#295):
+/// inviter[64]@0, newmember[64]@64 (us), u32 response@128 (the rank to accept at, 0-8; >=9 declines),
+/// u32 guildeqid@132 (the guild being joined).
+pub fn build_guild_invite_accept(inviter: &str, newmember: &str, response: u32, guild_id: u32) -> [u8; 136] {
+    let mut buf = [0u8; 136];
+    let n = inviter.as_bytes().len().min(63);
+    buf[0..n].copy_from_slice(&inviter.as_bytes()[..n]);
+    let n2 = newmember.as_bytes().len().min(63);
+    buf[64..64 + n2].copy_from_slice(&newmember.as_bytes()[..n2]);
+    buf[128..132].copy_from_slice(&response.to_le_bytes());
+    buf[132..136].copy_from_slice(&guild_id.to_le_bytes());
+    buf
+}
+
 /// OP_GroupMakeLeader payload: GroupMakeLeader_Struct (456 bytes): Unknown000(u32)=0,
 /// CurrentLeader[64], NewLeader[64], Unknown072[324]=0. Only NewLeader is read server-side.
 pub fn build_group_make_leader(current_leader: &str, new_leader: &str) -> [u8; 456] {
@@ -834,6 +864,10 @@ pub struct Navigator {
     /// POST /v1/interact/read request: the inventory wire slot of a book/note to read (#288). Drained
     /// each tick; the item's Filename is sent as OP_ReadBook and the server replies with the text.
     read_book:        crate::http::ReadBookReq,
+    /// Guild roster + identity published each tick for GET /v1/guild/roster + /observe/debug (#295).
+    guild:            crate::http::GuildShared,
+    /// POST /v1/guild/{invite,accept,leave,remove} — one queued guild action, drained each tick (#295).
+    guild_action:     crate::http::GuildActionReq,
     /// Last time we sent OP_FloatListThing (movement history) — the anti-MQGhost keepalive (#105).
     last_movement_history_send: Instant,
     /// Last position we streamed, and the last-send timestamp (for the 280 ms / 1300 ms cadence).
@@ -898,6 +932,8 @@ impl Navigator {
         nav_path_view:    crate::http::NavPathView,
         nav_avoid:        crate::http::NavAvoidShared,
         read_book:        crate::http::ReadBookReq,
+        guild:            crate::http::GuildShared,
+        guild_action:     crate::http::GuildActionReq,
     ) -> Self {
         Navigator {
             goto_target,
@@ -980,6 +1016,8 @@ impl Navigator {
             nav_path_view,
             nav_avoid,
             read_book,
+            guild,
+            guild_action,
             last_streamed: [0.0, 0.0, 0.0],
             last_pos_send: Instant::now(),
             last_movement_history_send: Instant::now(),
@@ -1044,6 +1082,28 @@ impl Navigator {
                 tank: m.tank, assist: m.assist, puller: m.puller, offline: m.offline, hp_pct,
             }
         }).collect();
+    }
+
+    /// Publish the player's guild identity + roster from `gs` into the shared slot (GET
+    /// /v1/guild/roster and the guild fields of /observe/debug). Resolves guild_id → name via the
+    /// OP_GuildsList table. (#295)
+    pub fn sync_guild(&self, gs: &GameState) {
+        let mut g = self.guild.lock().unwrap();
+        // GUILD_NONE is 0xFFFFFFFF (and 0 also means none). Normalize both to 0 so the API cleanly
+        // reports "no guild" as guild_id 0 / empty name / empty roster.
+        let in_guild = gs.player_guild_id != 0 && gs.player_guild_id != 0xFFFF_FFFF;
+        if in_guild {
+            g.guild_id = gs.player_guild_id;
+            g.guild_rank = gs.player_guild_rank;
+            g.guild_name = gs.guild_names.get(&gs.player_guild_id).cloned().unwrap_or_default();
+            g.members = gs.guild_members.clone();
+        } else {
+            g.guild_id = 0;
+            g.guild_rank = 0;
+            g.guild_name.clear();
+            g.members.clear();
+        }
+        g.pending_invite = gs.pending_guild_invite.as_ref().map(|(inviter, _, _)| inviter.clone());
     }
 
     /// Publish the player's inventory + equipment from `gs` into the shared slot (GET /inventory).
@@ -1683,6 +1743,44 @@ impl Navigator {
                 }
                 Some(_) => gs.log_msg("book", &format!("Item in slot {slot} is not readable")),
                 None    => gs.log_msg("book", &format!("No item in slot {slot} to read")),
+            }
+        }
+
+        // POST /v1/guild/{invite,accept,leave,remove}: one queued guild action → the matching RoF2
+        // guild opcode. Invite/remove/leave share GuildCommand_Struct; accept replies to a captured
+        // pending invite with GuildInviteAccept_Struct. (#295)
+        let guild_action = self.guild_action.lock().unwrap().take();
+        if let Some(action) = guild_action {
+            const GUILD_RECRUIT: u32 = 8; // default rank for a fresh invite (RoF2 0-8 scale)
+            match action {
+                crate::http::GuildAction::Invite(name) => {
+                    let pkt = build_guild_command(&name, &gs.player_name, gs.player_guild_id, GUILD_RECRUIT);
+                    stream.send_app_packet(OP_GUILD_INVITE, &pkt);
+                    gs.log_msg("guild", &format!("Inviting {name} to the guild"));
+                    tracing::info!("EQ: guild invite -> {name}");
+                }
+                crate::http::GuildAction::Remove(name) => {
+                    let pkt = build_guild_command(&name, &gs.player_name, gs.player_guild_id, 0);
+                    stream.send_app_packet(OP_GUILD_REMOVE, &pkt);
+                    gs.log_msg("guild", &format!("Removing {name} from the guild"));
+                    tracing::info!("EQ: guild remove -> {name}");
+                }
+                crate::http::GuildAction::Leave => {
+                    // Self-leave: othername == myname.
+                    let pkt = build_guild_command(&gs.player_name, &gs.player_name, gs.player_guild_id, 0);
+                    stream.send_app_packet(OP_GUILD_REMOVE, &pkt);
+                    gs.log_msg("guild", "Leaving guild");
+                    tracing::info!("EQ: guild leave");
+                }
+                crate::http::GuildAction::Accept => match gs.pending_guild_invite.take() {
+                    Some((inviter, guild_id, rank)) => {
+                        let pkt = build_guild_invite_accept(&inviter, &gs.player_name, rank, guild_id);
+                        stream.send_app_packet(OP_GUILD_INVITE_ACCEPT, &pkt);
+                        gs.log_msg("guild", &format!("Accepting guild invite from {inviter}"));
+                        tracing::info!("EQ: guild accept from {inviter} (guild_id={guild_id})");
+                    }
+                    None => gs.log_msg("guild", "No pending guild invite to accept"),
+                },
             }
         }
 
@@ -2821,6 +2919,8 @@ mod tests {
             Default::default(), // nav_path_view
             Default::default(), // nav_avoid
             Default::default(), // read_book
+            Default::default(), // guild
+            Default::default(), // guild_action
         )
     }
 
@@ -3181,6 +3281,31 @@ mod tests {
         assert_eq!(p.len(), 20, "RoF2 Consider_Struct must be exactly 20 bytes");
         assert_eq!(u32::from_le_bytes([p[0], p[1], p[2], p[3]]), 7);
         assert_eq!(u32::from_le_bytes([p[4], p[5], p[6], p[7]]), 42);
+    }
+
+    #[test]
+    fn guild_command_packet_layout() {
+        // #295: GuildCommand_Struct is 140 bytes: othername@0, myname@64, guildeqid(u16)@128,
+        // officer(u32 rank)@132. Used for invite (rank=8) and remove/leave.
+        let p = build_guild_command("Target", "Me", 42, 8);
+        assert_eq!(p.len(), 140);
+        assert_eq!(&p[0..6], b"Target");
+        assert_eq!(p[6], 0, "othername NUL-terminated");
+        assert_eq!(&p[64..66], b"Me");
+        assert_eq!(u16::from_le_bytes([p[128], p[129]]), 42);            // guildeqid
+        assert_eq!(u32::from_le_bytes([p[132], p[133], p[134], p[135]]), 8); // officer/rank
+    }
+
+    #[test]
+    fn guild_invite_accept_packet_layout() {
+        // #295: GuildInviteAccept_Struct is 136 bytes: inviter@0, newmember@64, response(u32)@128,
+        // guildeqid(u32)@132.
+        let p = build_guild_invite_accept("Boss", "Me", 8, 42);
+        assert_eq!(p.len(), 136);
+        assert_eq!(&p[0..4], b"Boss");
+        assert_eq!(&p[64..66], b"Me");
+        assert_eq!(u32::from_le_bytes([p[128], p[129], p[130], p[131]]), 8);  // response (rank)
+        assert_eq!(u32::from_le_bytes([p[132], p[133], p[134], p[135]]), 42); // guildeqid
     }
 
     #[test]
