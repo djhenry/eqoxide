@@ -63,7 +63,14 @@ pub const OP_WORLD_CLIENT_READY: u16 = 0x23c1; // RoF2: OP_WorldClientReady
 pub const OP_EXPANSION_INFO: u16 = 0x590d;    // RoF2: OP_ExpansionInfo
 pub const OP_WORLD_CRC1: u16 = 0x0f13;        // RoF2: OP_World_Client_CRC1
 pub const OP_WORLD_CRC2: u16 = 0x4b8d;        // RoF2: OP_World_Client_CRC2
-pub const OP_GUILD_LIST: u16 = 0x507a;        // RoF2: OP_GuildsList
+pub const OP_GUILD_LIST: u16 = 0x507a;        // RoF2: OP_GuildsList (server-wide guild directory)
+// Guild membership/roster (#295). Values from patch_RoF2.conf. NOTE: OP_GuildMemberList is the
+// one packet in this subsystem sent in NETWORK byte order (big-endian); the rest are little-endian.
+pub const OP_GUILD_MEMBER_LIST: u16 = 0x12a6;   // full roster snapshot (BIG-ENDIAN)
+pub const OP_GUILD_MEMBER_UPDATE: u16 = 0x69b9; // presence ping (zone_id 0 = offline)
+pub const OP_GUILD_INVITE: u16 = 0x7099;        // invite (also promote/demote) — GuildCommand_Struct
+pub const OP_GUILD_INVITE_ACCEPT: u16 = 0x7053; // accept/decline an invite
+pub const OP_GUILD_REMOVE: u16 = 0x1444;        // remove a member / self-leave — GuildCommand_Struct
 
 // ── Zone server opcodes ───────────────────────────────────────────────────
 
@@ -421,6 +428,11 @@ pub struct SpawnInfo {
     pub gender:          u8,
     pub race:            u32,
     pub class_:          u8,
+    /// Guild id from the spawn stream: 0xFFFFFFFF (and 0) mean "no guild". For a player's own
+    /// self-spawn this is how we learn our guild identity (#295).
+    pub guild_id:        u32,
+    /// Guild rank (0-8 scale: 0 none, 1 leader … 8 recruit). Only meaningful with a real guild_id.
+    pub guild_rank:      u32,
     pub body_type:       u32,
     pub cur_hp:          u8,   // HP percent (100 = full)
     pub helm:            u8,
@@ -585,8 +597,12 @@ pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
 
     // 31. holding (u8)
     skip!(1);
-    // 32-34. deity guildID guildrank (3×u32)
-    skip!(12);
+    // 32. deity (u32)
+    skip!(4);
+    // 33-34. guildID guildrank (2×u32). NPCs send guildID=0xFFFFFFFF/rank=0; a real player carries
+    // its guild here — captured so we can expose the player's own guild identity (#295).
+    let guild_id = rd_u32!();
+    let guild_rank = rd_u32!();
     // 35. class_ (u8)
     let class_ = rd_u8!();
     // 36. pvp (u8)
@@ -704,7 +720,7 @@ pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
     skip!(29);
 
     Some((SpawnInfo {
-        spawn_id, name, last_name, level, npc, gender, race, class_,
+        spawn_id, name, last_name, level, npc, gender, race, class_, guild_id, guild_rank,
         body_type, cur_hp, helm, show_helm, face, hairstyle, haircolor, stand_state,
         pet_owner_id, player_state,
         x, y, z, heading, animation,
