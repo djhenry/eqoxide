@@ -599,6 +599,29 @@ fn plan_path(
     None
 }
 
+/// What the walker should do on reaching (near) its goal, kept pure so the follow-vs-goto distinction
+/// is unit-tested off the tick. `Arrived` = a one-shot /goto is done → stop for good. `FollowHold` = a
+/// /follow chase has caught up → stand near the leader but STAY latched so it re-engages when the
+/// leader moves (#268). `Drive` = not there yet → keep walking.
+#[derive(Debug, PartialEq, Eq)]
+enum ArrivalAction { Drive, Arrived, FollowHold }
+
+/// Arrival radius for a one-shot /goto (melee range is ~14u, so 2u keeps us well inside it).
+const STOP_DIST: f32 = 2.0;
+/// A /follow settles up to this far behind the leader (a bit behind, still in group range).
+const FOLLOW_DIST: f32 = 10.0;
+
+/// Stop within 2u for a one-shot /goto; a /follow settles up to FOLLOW_DIST behind the leader.
+fn arrival_action(gdist: f32, following: bool) -> ArrivalAction {
+    if following {
+        if gdist <= FOLLOW_DIST { ArrivalAction::FollowHold } else { ArrivalAction::Drive }
+    } else if gdist <= STOP_DIST {
+        ArrivalAction::Arrived
+    } else {
+        ArrivalAction::Drive
+    }
+}
+
 /// A pure-pursuit carrot: the point `reach` units along `path` (starting from segment `start_i`),
 /// measured from the projection of `from` onto that segment. Returns `[east, north, z]`, carrying the
 /// z of the segment the carrot lands on. Used at two scales: a far carrot (~LOCAL_REACH) as the fine
@@ -2191,18 +2214,33 @@ impl Navigator {
         }
 
         // Arrival: measure distance to the FINAL goal, not the look-ahead carrot (which always leads
-        // by ~LOOK_AHEAD). Melee range is ~14u, so stopping within 2u keeps us well inside it.
-        const STOP_DIST: f32 = 2.0;
+        // by ~LOOK_AHEAD). A one-shot /goto stops for good; a /follow (live `goto_entity`, re-resolved
+        // by the block above) settles a bit behind the leader but STAYS latched so it re-engages the
+        // moment the leader walks off — instead of clearing the chase and idling forever (#268).
         let gdx = goal.0 - gs.player_x;
         let gdy = goal.1 - gs.player_y;
         let gdist = (gdx * gdx + gdy * gdy).sqrt();
-        if gdist <= STOP_DIST {
-            tracing::info!("NAV: arrived at ({:.1},{:.1})", goal.0, goal.1);
-            self.set_nav_state("arrived");
-            *self.goto_target.lock().unwrap() = None;
-            *self.nav_intent.lock().unwrap() = None; // stop driving the controller
-            gs.player_heading = eq_heading(gdx, gdy);
-            return;
+        let following = self.goto_entity.lock().unwrap().is_some();
+        match arrival_action(gdist, following) {
+            ArrivalAction::FollowHold => {
+                // Caught up — hold, but keep goto_target/goto_entity so a later tick drives again once
+                // the leader moves past FOLLOW_DIST.
+                self.set_nav_state("following");
+                self.path.clear();
+                self.path_goal = None;
+                *self.nav_intent.lock().unwrap() = None; // stand still until the leader moves
+                gs.player_heading = eq_heading(gdx, gdy);
+                return;
+            }
+            ArrivalAction::Arrived => {
+                tracing::info!("NAV: arrived at ({:.1},{:.1})", goal.0, goal.1);
+                self.set_nav_state("arrived");
+                *self.goto_target.lock().unwrap() = None;
+                *self.nav_intent.lock().unwrap() = None; // stop driving the controller
+                gs.player_heading = eq_heading(gdx, gdy);
+                return;
+            }
+            ArrivalAction::Drive => {} // not there yet — keep walking / re-plan below
         }
 
         // Long-route progress (#229): a distant goto (e.g. zone_cross across a big overland zone)
@@ -2698,6 +2736,21 @@ mod tests {
         gs.max_hp = 0; // unknown HP, not a death
         assert!(!nav.nav_halt_if_dead(&gs), "cur_hp<=0 with max_hp==0 is unknown HP, not death");
         assert!(nav.goto_target.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn arrival_action_follow_stays_latched_goto_stops() {
+        use super::{arrival_action, ArrivalAction};
+        // One-shot /goto (following=false): stops for good only within STOP_DIST(2u).
+        assert_eq!(arrival_action(1.0, false), ArrivalAction::Arrived);
+        assert_eq!(arrival_action(3.0, false), ArrivalAction::Drive);
+        // /follow (following=true): HOLDS within FOLLOW_DIST(10u) — keeps the chase, never "arrives" —
+        // and drives again once the leader moves past it (#268). A one-shot goto never HoldFollows.
+        assert_eq!(arrival_action(1.0, true),  ArrivalAction::FollowHold);
+        assert_eq!(arrival_action(9.0, true),  ArrivalAction::FollowHold);
+        assert_eq!(arrival_action(12.0, true), ArrivalAction::Drive); // leader walked off → re-engage
+        // Crucially, a follower within melee range does NOT get the terminal `Arrived` a goto would.
+        assert_ne!(arrival_action(1.0, true), ArrivalAction::Arrived);
     }
 
     #[test]
