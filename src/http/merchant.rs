@@ -100,7 +100,8 @@ async fn post_buy(
 struct SellBody {
     /// Merchant NPC name (fuzzy-matched, like /merchant/buy).
     merchant: String,
-    /// Player inventory slot of the item to sell (Titanium: 22-29 general, 251+ bag contents).
+    /// Player inventory slot of the item to sell — the RoF2 wire slot `/v1/observe/inventory`
+    /// reports (general inventory 23-32, bag contents 251+).
     slot: u32,
     /// Number to sell from the slot (stack count). Defaults to 1.
     quantity: Option<u32>,

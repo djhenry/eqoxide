@@ -623,15 +623,17 @@ fn apply_looted_item(gs: &mut GameState, mut it: crate::game_state::InvItem) {
 }
 
 
-/// OP_ShopPlayerSell (server→client echo) — confirms a sale completed. Merchant_Purchase_Struct:
-/// npcid @0, itemslot @4 (the WIRE slot, server-translated back), quantity @8, price @12. The
-/// server has already removed the item from the player; mirror that in `gs.inventory` so the
-/// display + `GET /inventory` refresh (otherwise sold items linger and look like a failed sale).
+/// OP_ShopPlayerSell (server→client echo) — confirms a sale completed. The server ENCODEs it as the
+/// RoF2 Merchant_Purchase_Struct (20 bytes): npcid @0, inventory_slot(TypelessInventorySlot_Struct —
+/// Slot i16 @4, SubIndex @6, AugIndex @8, Unknown @10) @4, quantity @12, price @16. (The old 16-byte
+/// read grabbed quantity/price from the wrong offsets, so the item never left `gs.inventory` and the
+/// sale looked failed — #269.) `Slot` is the RoF2 wire slot, matching `gs.inventory[].slot`. The
+/// server has already removed the item; mirror that so the display + `GET /inventory` refresh.
 fn apply_shop_player_sell(gs: &mut GameState, p: &[u8]) {
-    if p.len() < 16 { return; }
-    let itemslot = u32::from_le_bytes([p[4], p[5], p[6], p[7]]) as i32;
-    let quantity = u32::from_le_bytes([p[8], p[9], p[10], p[11]]) as i32;
-    let price    = u32::from_le_bytes([p[12], p[13], p[14], p[15]]);
+    if p.len() < 20 { return; }
+    let itemslot = i16::from_le_bytes([p[4], p[5]]) as i32;
+    let quantity = u32::from_le_bytes([p[12], p[13], p[14], p[15]]) as i32;
+    let price    = u32::from_le_bytes([p[16], p[17], p[18], p[19]]);
     if let Some(idx) = gs.inventory.iter().position(|i| i.slot == itemslot) {
         let it = &mut gs.inventory[idx];
         let sold_name = it.name.clone();
@@ -1981,6 +1983,29 @@ mod tests {
         assert_eq!(gs.entities.len(), 2);
         super::apply_new_zone(&mut gs, &[]);
         assert!(gs.entities.is_empty(), "prior-zone entities must be cleared on zone entry (#270)");
+    }
+
+    #[test]
+    fn apply_shop_player_sell_parses_rof2_echo_and_removes_item() {
+        // #269: the server echoes the 20-byte RoF2 Merchant_Purchase_Struct (Slot i16@4,
+        // quantity@12, price@16). The old 16-byte read took quantity/price from the wrong offsets
+        // and never removed the item, so a sale looked failed. A correct echo for slot 28 must
+        // drop the item and log the payout.
+        let mut gs = GameState::new();
+        gs.inventory.push(crate::game_state::InvItem {
+            slot: 28, item_id: 13007, name: "Bone Chips".into(), icon: 0, charges: 1,
+            idfile: String::new(), click_spell_id: 0,
+        });
+        let mut echo = [0u8; 20];
+        echo[0..4].copy_from_slice(&123u32.to_le_bytes());   // npcid
+        echo[4..6].copy_from_slice(&28i16.to_le_bytes());     // inventory_slot.Slot
+        echo[6..8].copy_from_slice(&(-1i16).to_le_bytes());   // SubIndex (not in a bag)
+        echo[12..16].copy_from_slice(&1u32.to_le_bytes());    // quantity
+        echo[16..20].copy_from_slice(&3u32.to_le_bytes());    // price
+        super::apply_shop_player_sell(&mut gs, &echo);
+        assert!(gs.inventory.iter().all(|i| i.slot != 28), "sold item must leave inventory");
+        assert!(gs.messages.back().unwrap().text.contains("Sold Bone Chips"),
+            "sale confirmation logged: {}", gs.messages.back().unwrap().text);
     }
 
     #[test]
