@@ -1682,15 +1682,26 @@ impl Navigator {
         if let Some((merchant_id, slot, quantity)) = sell_req {
             let open = merchant_click(merchant_id, gs.player_id, 1);
             stream.send_app_packet(OP_SHOP_REQUEST, &open);
-            // Merchant_Purchase_Struct (16b): npcid, itemslot(player slot), quantity, price.
-            let mut sell = [0u8; 16];
+            // RoF2 Merchant_Purchase_Struct is 20 bytes (rof2_structs.h): npcid(u32)@0,
+            // inventory_slot(TypelessInventorySlot_Struct: Slot i16@4, SubIndex i16@6, AugIndex i16@8,
+            // Unknown i16@10)@4, quantity(u32)@12, price(u32)@16. The old 16-byte body (plain u32
+            // slot@4) failed the server's DECODE_LENGTH_EXACT, so EVERY sell was silently dropped
+            // (#269). `slot` is the RoF2 wire slot /observe/inventory reports (general inv 23-32);
+            // RoF2ToServerTypelessSlot passes it straight through for a top-level possession, so
+            // SubIndex/AugIndex are the "none" sentinels (SLOT_INVALID / SOCKET_INVALID = -1).
+            let mut sell = [0u8; 20];
             sell[0..4].copy_from_slice(&merchant_id.to_le_bytes());
-            sell[4..8].copy_from_slice(&slot.to_le_bytes());
-            sell[8..12].copy_from_slice(&quantity.to_le_bytes());
-            // price = 0: the server charges its own buy-back price.
+            sell[4..6].copy_from_slice(&(slot as i16).to_le_bytes());   // Slot (RoF2 wire slot)
+            sell[6..8].copy_from_slice(&(-1i16).to_le_bytes());          // SubIndex: not inside a bag
+            sell[8..10].copy_from_slice(&(-1i16).to_le_bytes());         // AugIndex: no augment socket
+            // Unknown01 @10 stays 0.
+            sell[12..16].copy_from_slice(&quantity.to_le_bytes());
+            // price @16 = 0: the server charges its own buy-back price.
             stream.send_app_packet(OP_SHOP_PLAYER_SELL, &sell);
             tracing::info!("EQ: shop sell — merchant_id={} slot={} qty={}", merchant_id, slot, quantity);
-            gs.log_msg("merchant", &format!("Sold item (slot {} x{})", slot, quantity));
+            // No optimistic "Sold" log: the server's OP_ShopPlayerSell echo (apply_shop_player_sell)
+            // confirms the real payout + removes the item, so a premature success can't be printed
+            // when the sale fails (#269).
         }
 
         // Open/close a merchant window (POST /trade/open, /trade/close). OP_ShopRequest with
