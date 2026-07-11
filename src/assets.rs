@@ -672,6 +672,29 @@ impl Collision {
             .copied()
     }
 
+    /// Nearest zone-line region whose index is in `in_zone_idxs` (a same-zone destination — an escape
+    /// translocator, not a normal neighbour-zone exit) AND whose `DRNTP` footprint is present at the
+    /// caller's floor height `near[2]` under the region's XY.
+    ///
+    /// The auto-cross (`zone_line_at`) is a z-EXACT BSP test. A tall vertical translocator (the Qeynos
+    /// guild-vault waterfall) bakes several DRNTP leaves up its column; a leaf near the TOP yields an
+    /// interior point high up, and a char that walks to that XY on the vault floor stands BELOW the
+    /// leaf and never triggers — so the escape stalls at the portal without teleporting (#266). We keep
+    /// only regions still present at the char's own height (`zone_line_at([x, y, near_z]) == idx`), i.e.
+    /// whose footprint reaches the floor the char is standing on, so walking there fires the cross.
+    /// `None` if no such reachable in-zone portal exists.
+    pub fn find_reachable_in_zone_line(&self, in_zone_idxs: &[i32], near: [f32; 3]) -> Option<(i32, [f32; 3])> {
+        self.zone_line_regions
+            .iter()
+            .filter(|(idx, loc)| in_zone_idxs.contains(idx)
+                && self.zone_line_at([loc[0], loc[1], near[2]]) == Some(*idx))
+            .min_by(|a, b| {
+                let d2 = |p: &[f32; 3]| (p[0] - near[0]).powi(2) + (p[1] - near[1]).powi(2) + (p[2] - near[2]).powi(2);
+                d2(&a.1).partial_cmp(&d2(&b.1)).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .copied()
+    }
+
     #[inline]
     fn cell_range(&self, min_e: f32, min_n: f32, max_e: f32, max_n: f32) -> (usize, usize, usize, usize) {
         let c0 = (((min_e - self.origin[0]) / self.cell_size) as isize).clamp(0, self.cols as isize - 1) as usize;
