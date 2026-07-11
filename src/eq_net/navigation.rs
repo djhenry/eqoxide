@@ -1621,6 +1621,15 @@ impl Navigator {
                 }
             }
             stream.send_app_packet(OP_MEMORIZE_SPELL, &build_memorize_packet(slot, spell_id, scribing));
+            if scribing == 0 {
+                // The RoF2 server CONSUMES the scribed scroll: OPMemorizeSpell's memSpellScribing
+                // case runs ScribeSpell(...) then DeleteItemInInventory(slotCursor) (zone/
+                // client_process.cpp). We already moved the scroll to the cursor above, so mirror
+                // that deletion locally — otherwise the (now server-deleted) scroll stays stuck on
+                // cursor slot 33 in our view, blocking looting and any later cursor move (#271). No
+                // OP_DeleteItem is sent: the server already removed it, so that would double-delete.
+                gs.inventory.retain(|i| i.slot != SLOT_CURSOR as i32);
+            }
             let what = match scribing { 0 => "scribe", 1 => "memorize", _ => "unmem" };
             tracing::info!("EQ: {what} spell={spell_id} slot={slot}");
             gs.log_msg("spell", &format!("{what} spell {spell_id} (slot {slot})"));
