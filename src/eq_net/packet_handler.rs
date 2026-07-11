@@ -112,6 +112,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_GUILD_MEMBER_LIST    => apply_guild_member_list(gs, p),
         OP_GUILD_MEMBER_UPDATE  => apply_guild_member_update(gs, p),
         OP_GUILD_INVITE         => apply_guild_invite(gs, p),
+        OP_WHO_ALL_RESPONSE     => apply_who_all(gs, p),
         _                       => {}
     }
 }
@@ -1409,6 +1410,60 @@ fn read_cstr(buf: &[u8]) -> Option<(String, &[u8])> {
     Some((s, &buf[nul + 1..]))
 }
 
+/// Read a little-endian u32 from the front of `buf`, returning it and the slice following it.
+/// `None` if fewer than 4 bytes remain. Companion to [`read_cstr`] for cursor-style wire parsing.
+fn take_u32(buf: &[u8]) -> Option<(u32, &[u8])> {
+    if buf.len() < 4 { return None; }
+    Some((u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]), &buf[4..]))
+}
+
+/// Parse an `OP_WhoAllResponse` (RoF2 wire) roster into `gs.who_roster` (#300). Layout
+/// (`common/patches/rof2.cpp` ENCODE(OP_WhoAllResponse)):
+///   64-byte `WhoAllReturnStruct` header — the online COUNT is a u32 at offset 44 (RoF2 moves it
+///   into `unknown44[0]`) — then `count` player records, each WIDENED by one always-zero u32 after
+///   `FormatMSGID`:
+///     FormatMSGID u32 | pad0 u32 | PIDMSGID u32 | Name cstr | RankMSGID u32 | Guild cstr
+///     | Unknown80[2] u32×2 | ZoneMSGID u32 | Zone u32 | Class u32 | Level u32 | Race u32
+///     | Account cstr | Unknown100 u32
+/// Anonymous players carry `ZoneMSGID == 0xFFFFFFFF` and zeroed class/level/race/zone.
+fn apply_who_all(gs: &mut GameState, p: &[u8]) {
+    if p.len() < 64 {
+        tracing::warn!("who: OP_WhoAllResponse too short ({} bytes)", p.len());
+        return;
+    }
+    let count = u32::from_le_bytes([p[44], p[45], p[46], p[47]]) as usize;
+    let mut rest = &p[64..];
+    let mut roster: Vec<crate::game_state::WhoEntry> = Vec::with_capacity(count.min(4096));
+    for _ in 0..count {
+        // Parse one record; on truncation, keep what we already have rather than dropping all.
+        let parsed = (|| {
+            let (_fmt, r) = take_u32(rest)?;
+            let (_pad, r) = take_u32(r)?;
+            let (_pid, r) = take_u32(r)?;
+            let (name, r) = read_cstr(r)?;
+            let (_rank, r) = take_u32(r)?;
+            let (guild, r) = read_cstr(r)?;
+            let (_u80a, r) = take_u32(r)?;
+            let (_u80b, r) = take_u32(r)?;
+            let (zonestr, r) = take_u32(r)?;
+            let (zone, r) = take_u32(r)?;
+            let (class, r) = take_u32(r)?;
+            let (level, r) = take_u32(r)?;
+            let (race, r) = take_u32(r)?;
+            let (_acct, r) = read_cstr(r)?;
+            let (_u100, r) = take_u32(r)?;
+            let anon = zonestr == 0xFFFF_FFFF || (class == 0 && level == 0 && race == 0);
+            Some((crate::game_state::WhoEntry { name, level, class, race, zone_id: zone, guild, anon }, r))
+        })();
+        match parsed {
+            Some((entry, r)) => { roster.push(entry); rest = r; }
+            None => break,
+        }
+    }
+    tracing::info!("who: parsed {}/{} online player(s) from OP_WhoAllResponse", roster.len(), count);
+    gs.who_roster = roster;
+}
+
 fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
     // RoF2 OP_ChannelMessage is a variable-length, NUL-terminated wire format — NOT the
     // fixed Titanium struct. See EQEmu common/patches/rof2.cpp ENCODE(OP_ChannelMessage):
@@ -2082,7 +2137,7 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_emote, apply_death, class_name, con_color, consider_message, parse_player_profile,
+    use super::{apply_emote, apply_death, apply_who_all, class_name, con_color, consider_message, parse_player_profile,
                 parse_begin_cast, apply_begin_cast, parse_memorize_spell, apply_char_inventory,
                 apply_money_update, apply_money_on_corpse, apply_set_target, apply_move_item, apply_spawn_appearance,
                 extract_saylink_text, apply_task_description, apply_completed_tasks, apply_task_select_window,
@@ -2595,6 +2650,66 @@ mod tests {
         assert_eq!(class_name(16), "Berserker");
         assert_eq!(class_name(0), "");
         assert_eq!(class_name(99), "");
+    }
+
+    #[test]
+    fn who_all_request_is_156_bytes_with_filters() {
+        let p = crate::eq_net::protocol::build_who_all_request(3);
+        assert_eq!(p.len(), 156, "RoF2 Who_All_Struct must be exactly 156 bytes (DECODE_LENGTH_EXACT)");
+        // whom[0..64] and unknown088[64..128] are zero.
+        assert!(p[0..128].iter().all(|&b| b == 0), "whom + unknown088 pad are empty/zero");
+        // wrace..guildid (offsets 128..152) are all 0xFFFFFFFF (no filter).
+        for off in (128..152).step_by(4) {
+            assert_eq!(u32::from_le_bytes(p[off..off + 4].try_into().unwrap()), 0xFFFF_FFFF);
+        }
+        assert_eq!(u32::from_le_bytes(p[152..156].try_into().unwrap()), 3, "type=3 = /who all");
+    }
+
+    #[test]
+    fn apply_who_all_parses_rof2_widened_records() {
+        // Build a synthetic RoF2 OP_WhoAllResponse: 64-byte header (count at offset 44) + 2 records
+        // in the RoF2 widened layout (the extra pad0 u32 after FormatMSGID).
+        fn push_u32(v: &mut Vec<u8>, x: u32) { v.extend_from_slice(&x.to_le_bytes()); }
+        fn push_cstr(v: &mut Vec<u8>, s: &str) { v.extend_from_slice(s.as_bytes()); v.push(0); }
+        fn record(v: &mut Vec<u8>, name: &str, guild: &str, zonestr: u32, zone: u32, class: u32, level: u32, race: u32) {
+            push_u32(v, 5025);        // FormatMSGID
+            push_u32(v, 0);           // pad0 (RoF2-only)
+            push_u32(v, 0xFFFF_FFFF); // PIDMSGID
+            push_cstr(v, name);
+            push_u32(v, 0);           // RankMSGID
+            push_cstr(v, guild);
+            push_u32(v, 0xFFFF_FFFF); // Unknown80[0]
+            push_u32(v, 0xFFFF_FFFF); // Unknown80[1]
+            push_u32(v, zonestr);     // ZoneMSGID
+            push_u32(v, zone);
+            push_u32(v, class);
+            push_u32(v, level);
+            push_u32(v, race);
+            push_cstr(v, "");         // Account
+            push_u32(v, 207);         // Unknown100
+        }
+        let mut p = vec![0u8; 64];
+        p[44..48].copy_from_slice(&2u32.to_le_bytes()); // count = 2 at offset 44
+        record(&mut p, "Alice", "Knights of Truth", 5, 2, 3 /*Paladin*/, 10, 1 /*HUM*/);
+        record(&mut p, "Bob", "", 0xFFFF_FFFF, 0, 0, 0, 0); // anonymous
+
+        let mut gs = GameState::new();
+        apply_who_all(&mut gs, &p);
+        assert_eq!(gs.who_roster.len(), 2);
+
+        let a = &gs.who_roster[0];
+        assert_eq!(a.name, "Alice");
+        assert_eq!(a.guild, "Knights of Truth");
+        assert_eq!(a.zone_id, 2);
+        assert_eq!(a.class, 3);
+        assert_eq!(a.level, 10);
+        assert_eq!(a.race, 1);
+        assert!(!a.anon);
+
+        let b = &gs.who_roster[1];
+        assert_eq!(b.name, "Bob");
+        assert!(b.anon, "ZoneMSGID=0xFFFFFFFF and zeroed stats => anonymous");
+        assert_eq!(b.level, 0);
     }
 
     #[test]

@@ -14,7 +14,7 @@ const RUN_SPEED: f32 = 44.0;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::{GameState, ZonePoint};
-use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, TradeCmd, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, ChatEventsShared, ChatSendShared, CastReq, MemSpellReq, SitReq, ConsiderReq, CampReq, CampCmd, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, TaskLog, ZoneCrossReq, ZonePoints, ControllerShared, NavIntent, PosCorrection, DialogueShared, DialogueClickReq, NavStateShared};
+use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, TradeCmd, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, ChatEventsShared, ChatSendShared, CastReq, MemSpellReq, SitReq, ConsiderReq, CampReq, CampCmd, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, WhoReq, TaskLog, ZoneCrossReq, ZonePoints, ControllerShared, NavIntent, PosCorrection, DialogueShared, DialogueClickReq, NavStateShared};
 use crate::movement::MoveIntent;
 
 /// Min interval (ms) between OP_ClientUpdate sends while moving (native `0x118` = 280 ms).
@@ -744,6 +744,10 @@ pub struct Navigator {
     hail:             HailReq,
     say:              SayReq,
     target:           TargetReq,
+    /// GET /v1/observe/who registers a oneshot here; drained in `tick` to send OP_WhoAllRequest. (#300)
+    who_req:          WhoReq,
+    /// Held between sending the request and receiving OP_WhoAllResponse; fired by `fulfill_who`. (#300)
+    pending_who:      Option<tokio::sync::oneshot::Sender<Vec<crate::game_state::WhoEntry>>>,
     attack:           AttackReq,
     buy:              BuyReq,
     sell:             SellReq,
@@ -902,6 +906,7 @@ impl Navigator {
         hail:             HailReq,
         say:              SayReq,
         target:           TargetReq,
+        who_req:          WhoReq,
         attack:           AttackReq,
         buy:              BuyReq,
         sell:             SellReq,
@@ -960,6 +965,8 @@ impl Navigator {
             hail,
             say,
             target,
+            who_req,
+            pending_who: None,
             attack,
             buy,
             sell,
@@ -1111,6 +1118,15 @@ impl Navigator {
         let mut inv = self.inventory.lock().unwrap();
         inv.clear();
         inv.extend(gs.inventory.iter().cloned());
+    }
+
+    /// Deliver the freshly-parsed `/who all` roster to the pending GET /v1/observe/who (#300). Called
+    /// from the gameplay drain loop right after an OP_WhoAllResponse updates `gs.who_roster`. No-op if
+    /// no request is in flight (e.g. an unsolicited/duplicate response).
+    pub fn fulfill_who(&mut self, gs: &GameState) {
+        if let Some(tx) = self.pending_who.take() {
+            let _ = tx.send(gs.who_roster.clone());
+        }
     }
 
     /// Publish the open-merchant session from `gs` into the shared slot (GET /trade/list + the HUD
@@ -1702,6 +1718,15 @@ impl Navigator {
             // this is a client-initiated change, so it won't otherwise reach the render side. (#9)
             let _ = app_tx.send(AppPacket { opcode: OP_TARGET_MOUSE, payload: build_target_packet(id) });
             tracing::info!("EQ: target spawn_id={} + consider", id);
+        }
+
+        // Check /who all request (#300) — send OP_WhoAllRequest (server-wide, type=3); the oneshot
+        // sender is held in `pending_who` until OP_WhoAllResponse arrives (see `fulfill_who`). A newer
+        // request supersedes an in-flight one (its sender drops → that GET times out).
+        if let Some(tx) = self.who_req.lock().unwrap().take() {
+            stream.send_app_packet(OP_WHO_ALL_REQUEST, &build_who_all_request(3));
+            self.pending_who = Some(tx);
+            tracing::info!("EQ: sent OP_WhoAllRequest (/who all)");
         }
 
         // Check attack request — send OP_AUTO_ATTACK(1) to start, OP_AUTO_ATTACK(0) to stop.
@@ -2909,6 +2934,7 @@ mod tests {
             Default::default(), // hail
             Default::default(), // say
             Default::default(), // target
+            Default::default(), // who_req
             Default::default(), // attack
             Default::default(), // buy
             Default::default(), // sell

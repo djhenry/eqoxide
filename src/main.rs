@@ -208,6 +208,7 @@ OPTIONS:
     let hail:             http::HailReq         = Arc::new(Mutex::new(None));
     let say:              http::SayReq          = Arc::new(Mutex::new(None));
     let target:           http::TargetReq       = Arc::new(Mutex::new(None));
+    let who_req:          http::WhoReq          = Arc::new(Mutex::new(None));
     let attack:           http::AttackReq       = Arc::new(Mutex::new(None));
     let buy:              http::BuyReq          = Arc::new(Mutex::new(None));
     let sell:             http::SellReq         = Arc::new(Mutex::new(None));
@@ -287,6 +288,7 @@ OPTIONS:
         let hl  = hail.clone();
         let sy  = say.clone();
         let tg  = target.clone();
+        let wr  = who_req.clone();
         let at  = attack.clone();
         let by  = buy.clone();
         let sl  = sell.clone();
@@ -326,7 +328,7 @@ OPTIONS:
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, nst, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, pcm, sc, md, sd, cp, cu, rsp, cv, ni, pc, npv, nav, rb, gld, gla).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, nst, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, wr, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, pcm, sc, md, sd, cp, cu, rsp, cv, ni, pc, npv, nav, rb, gld, gla).await {
                     tracing::error!("EQ: fatal: {e}");
                 }
             });
@@ -399,6 +401,7 @@ OPTIONS:
         hail,
         say,
         target,
+        who_req,
         attack,
         cast.clone(),
         mem_spell.clone(),
