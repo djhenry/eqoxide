@@ -1243,15 +1243,27 @@ fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
     let target_id = u16::from_le_bytes([payload[0], payload[1]]) as u32;
     let source_id = u16::from_le_bytes([payload[2], payload[3]]) as u32;
     let damage    = i32::from_le_bytes([payload[9], payload[10], payload[11], payload[12]]);
-    let type_val  = payload[4];
     let target_name = gs.entities.get(&target_id).map(|e| e.name.clone())
         .unwrap_or_else(|| if target_id == gs.player_id { gs.player_name.clone() } else { format!("#{target_id}") });
     let source_name = gs.entities.get(&source_id).map(|e| e.name.clone())
         .unwrap_or_else(|| if source_id == gs.player_id { gs.player_name.clone() } else { format!("#{source_id}") });
-    let msg = if damage == 0 {
-        format!("{source_name} misses {target_name} (type={type_val})")
-    } else {
+    // A `CombatDamage_Struct.damage` of 0 is a plain miss; a POSITIVE value is real damage; a
+    // NEGATIVE value is an EQEmu special-outcome sentinel (zone/common.h DMG_*), NOT "negative
+    // damage" (#262). Map each to native combat wording instead of leaking "-N damage" / "(type=N)".
+    let msg = if damage > 0 {
         format!("{source_name} hits {target_name} for {damage} damage")
+    } else if damage == 0 {
+        format!("{source_name} tries to hit {target_name}, but misses!")
+    } else {
+        match damage {
+            -1 => format!("{target_name} blocks {source_name}'s attack!"),   // DMG_BLOCKED
+            -2 => format!("{target_name} parries {source_name}'s attack!"),  // DMG_PARRIED
+            -3 => format!("{target_name} ripostes {source_name}'s attack!"), // DMG_RIPOSTED
+            -4 => format!("{target_name} dodges {source_name}'s attack!"),   // DMG_DODGED
+            -5 => format!("{source_name} tries to hit {target_name}, but {target_name} is invulnerable!"), // DMG_INVULNERABLE
+            -6 => format!("{source_name}'s attack is absorbed by a rune!"),  // DMG_RUNE
+            _  => format!("{source_name} tries to hit {target_name}, but the attack fails!"),
+        }
     };
     tracing::info!("EQ: combat: {msg}");
     gs.log_msg("combat", &msg);
@@ -1977,6 +1989,41 @@ mod tests {
         apply_combat_damage(&mut gs, &dmg(7, 99, 9999)); // lethal hit
         assert_eq!(gs.cur_hp, 0, "HP clamps at 0");
         assert!((gs.hp_pct - 0.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn apply_combat_damage_formats_hits_misses_and_special_sentinels() {
+        // #262: damage>0 = a hit, ==0 = a clean miss (no "(type=N)" leak), <0 = an EQEmu
+        // special-outcome sentinel (zone/common.h DMG_*) rendered with native wording — never
+        // as "-N damage".
+        use super::apply_combat_damage;
+        let dmg = |target: u16, source: u16, damage: i32| -> [u8; 13] {
+            let mut b = [0u8; 13];
+            b[0..2].copy_from_slice(&target.to_le_bytes());
+            b[2..4].copy_from_slice(&source.to_le_bytes());
+            b[4] = 1; // skill type — must NOT leak into player-facing text
+            b[9..13].copy_from_slice(&damage.to_le_bytes());
+            b
+        };
+        let mut gs = GameState::new();
+        gs.player_id = 7; gs.player_name = "Hero".into(); gs.max_hp = 100; gs.cur_hp = 100;
+        let last = |gs: &GameState| gs.messages.back().unwrap().text.clone();
+
+        apply_combat_damage(&mut gs, &dmg(7, 99, 24));
+        assert!(last(&gs).contains("for 24 damage"), "hit: {}", last(&gs));
+
+        apply_combat_damage(&mut gs, &dmg(7, 99, 0));
+        assert!(last(&gs).contains("misses"), "miss: {}", last(&gs));
+        assert!(!last(&gs).contains("type="), "miss must not leak skill type: {}", last(&gs));
+
+        for (d, verb) in [(-1, "blocks"), (-2, "parries"), (-3, "ripostes"),
+                          (-4, "dodges"), (-5, "invulnerable"), (-6, "rune")] {
+            apply_combat_damage(&mut gs, &dmg(7, 99, d));
+            let m = last(&gs);
+            assert!(m.contains(verb), "sentinel {d} should say '{verb}': {m}");
+            assert!(!m.contains("damage"), "sentinel {d} must not render as damage: {m}");
+            assert!(!m.contains(&format!("{d}")), "sentinel {d} must not leak the raw number: {m}");
+        }
     }
 
     #[test]
