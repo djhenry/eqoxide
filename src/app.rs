@@ -1414,6 +1414,12 @@ impl App {
         let full_output = egui_ctx.run(raw_input, |ctx| {
             hud::draw_fps(ctx, current_fps);
             hud::draw_connection_banner(ctx, scene.disconnected);
+            // Death overlay + Respawn button for human players (#284): the client no longer
+            // auto-respawns, so a human needs a way to revive. Clicking sets the same respawn
+            // request POST /v1/lifecycle/respawn drives.
+            if hud::draw_death_overlay(ctx, scene.player_dead, &scene.killed_by) {
+                *acts.respawn.lock().unwrap() = true;
+            }
             if crate::profiling::enabled() {
                 hud::draw_profile(ctx, frame_profile);
             }

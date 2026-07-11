@@ -10,6 +10,38 @@ use crate::scene::SceneState;
 
 /// A top-center red banner shown when the server connection has gone silent (#8), so a frozen/dead
 /// session is visible to a human player instead of looking like a normal idle scene.
+/// Death overlay (#284): while the player is slain the client HOLDS them dead (no auto-respawn), so
+/// a HUMAN needs a way to revive. Show a centered panel naming the killer with a "Respawn at Bind"
+/// button. Returns true the frame the button is clicked (the caller sets the respawn request, the
+/// same flag POST /v1/lifecycle/respawn drives).
+pub fn draw_death_overlay(ctx: &egui::Context, dead: bool, killed_by: &str) -> bool {
+    if !dead { return false; }
+    let mut clicked = false;
+    egui::Area::new(egui::Id::new("death_overlay"))
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgba_unmultiplied(20, 0, 0, 220))
+                .inner_margin(egui::Margin::symmetric(24.0, 18.0))
+                .rounding(8.0)
+                .show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label(egui::RichText::new("You have died.")
+                            .size(22.0).strong().color(egui::Color32::from_rgb(230, 60, 60)));
+                        if !killed_by.is_empty() {
+                            ui.label(egui::RichText::new(format!("Slain by {killed_by}"))
+                                .color(egui::Color32::from_rgb(220, 200, 200)));
+                        }
+                        ui.add_space(10.0);
+                        if ui.button(egui::RichText::new("⚰  Respawn at Bind").size(16.0)).clicked() {
+                            clicked = true;
+                        }
+                    });
+                });
+        });
+    clicked
+}
+
 pub fn draw_connection_banner(ctx: &egui::Context, disconnected: bool) {
     if !disconnected { return; }
     egui::Area::new(egui::Id::new("connection_banner"))

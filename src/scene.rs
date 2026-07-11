@@ -150,6 +150,8 @@ pub struct SceneState {
     /// True while the auto-loot session is working a corpse (loot window).
     pub loot_active: bool,
     pub player_dead: bool,
+    /// Who last killed the player — shown on the HUD death overlay (#284).
+    pub killed_by: String,
     pub zone_id: u16,
 }
 
@@ -378,6 +380,7 @@ impl SceneState {
             // gameplay loop's copy, so including it here held the Loot window open forever (#4).
             loot_active: gs.loot_session_active,
             player_dead: gs.player_dead,
+            killed_by: gs.killed_by.clone(),
             zone_id: gs.zone_id,
         }
     }
