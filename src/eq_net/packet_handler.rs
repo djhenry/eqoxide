@@ -1616,6 +1616,39 @@ pub fn con_color(level: u32) -> [u8; 3] {
     }
 }
 
+/// Map the OP_Consider `level` field (EQEmu ConsiderColor) to a readable difficulty TIER for the API
+/// (#292), parallel to the RGB in [`con_color`]: gray = trivial (no exp), green, light_blue, blue,
+/// white = even con, yellow = slightly higher, red = much higher / dangerous.
+pub fn con_level_name(level: u32) -> &'static str {
+    match level {
+        6       => "gray",        // no exp — trivial
+        2       => "green",
+        18      => "light_blue",
+        4       => "blue",        // DarkBlue
+        15      => "yellow",
+        13      => "red",         // dangerous
+        10 | 20 => "white",       // even con (White / WhiteTitanium)
+        _       => "white",
+    }
+}
+
+/// Map the OP_Consider faction value (1..=9) to a compact attitude enum for the API (#292),
+/// so agents don't string-match the localized [`consider_message`] prose. ally … scowls (KOS).
+pub fn attitude_name(faction: u32) -> &'static str {
+    match faction {
+        1 => "ally",
+        2 => "warmly",
+        3 => "kindly",
+        4 => "amiable",
+        5 => "indifferent",
+        6 => "apprehensive",
+        7 => "dubious",
+        8 => "threatening",
+        9 => "scowls",           // ready to attack (KOS)
+        _ => "indifferent",
+    }
+}
+
 /// OP_Consider reply — the server's con of our target. Consider_Struct: playerid(u32) +
 /// targetid(u32) + faction(u32) + level(u32 = con color) + cur_hp + ... Sets the target
 /// (so its nameplate highlights) plus the con-color tint and a /consider log line.
@@ -1628,6 +1661,10 @@ fn apply_consider(gs: &mut GameState, payload: &[u8]) {
         .unwrap_or_else(|| "Your target".to_string());
     gs.target_id  = Some(target_id);
     gs.target_con = Some(con_color(level));
+    // #292: also record the structured difficulty tier + attitude enum so agents can read "how
+    // tough" from /observe/debug instead of scraping the localized chat line or the RGB tint.
+    gs.target_con_name = Some(con_level_name(level).to_string());
+    gs.target_attitude = Some(attitude_name(faction).to_string());
     let msg = format!("{} {}.", name, consider_message(faction));
     tracing::info!("EQ: consider: {msg}");
     gs.log_msg("combat", &msg);
@@ -2120,6 +2157,37 @@ mod tests {
         let m = gs.messages.back().unwrap().text.clone();
         assert!(m.contains("Guard_Phaeton") && m.contains("scowls"), "attitude line: {m}");
         assert!(gs.target_con.is_some(), "con color must be set for the HUD tint");
+    }
+
+    #[test]
+    fn con_level_and_attitude_names_map_wire_values() {
+        // #292: the ConsiderColor `level` → difficulty tier, and faction → attitude enum.
+        use super::{con_level_name, attitude_name};
+        assert_eq!(con_level_name(6), "gray");       // no exp / trivial
+        assert_eq!(con_level_name(2), "green");
+        assert_eq!(con_level_name(18), "light_blue");
+        assert_eq!(con_level_name(4), "blue");
+        assert_eq!(con_level_name(10), "white");     // even
+        assert_eq!(con_level_name(20), "white");     // WhiteTitanium
+        assert_eq!(con_level_name(15), "yellow");
+        assert_eq!(con_level_name(13), "red");       // dangerous
+        assert_eq!(attitude_name(1), "ally");
+        assert_eq!(attitude_name(5), "indifferent");
+        assert_eq!(attitude_name(9), "scowls");      // KOS
+    }
+
+    #[test]
+    fn apply_consider_sets_structured_con_fields() {
+        // #292: apply_consider records the difficulty tier + attitude enum for /observe/debug.
+        let mut gs = GameState::new();
+        gs.entities.insert(450, test_entity(450, "a_guard", 100.0));
+        let mut reply = [0u8; 20];
+        reply[4..8].copy_from_slice(&450u32.to_le_bytes());   // targetid
+        reply[8..12].copy_from_slice(&9u32.to_le_bytes());     // faction 9 = scowls
+        reply[12..16].copy_from_slice(&13u32.to_le_bytes());   // level 13 = red
+        super::apply_consider(&mut gs, &reply);
+        assert_eq!(gs.target_con_name.as_deref(), Some("red"), "difficulty tier stored");
+        assert_eq!(gs.target_attitude.as_deref(), Some("scowls"), "attitude enum stored");
     }
 
     fn inv_item(slot: i32, item_id: u32, charges: i32) -> crate::game_state::InvItem {

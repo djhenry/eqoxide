@@ -344,6 +344,11 @@ pub struct GameState {
     pub target_hp_pct: Option<f32>,
     /// Consider color (RGB) of the current target, set from the OP_Consider reply.
     pub target_con: Option<[u8; 3]>,
+    /// #292: structured con of the current target, from the OP_Consider reply — a difficulty tier
+    /// (gray/green/light_blue/blue/white/yellow/red) and a compact attitude enum (ally … scowls),
+    /// exposed on /observe/debug so agents can read "how tough" without scraping chat.
+    pub target_con_name: Option<String>,
+    pub target_attitude: Option<String>,
 
     // Zone exit points (populated by OP_SEND_ZONE_POINTS on zone entry)
     pub zone_points: Vec<ZonePoint>,
