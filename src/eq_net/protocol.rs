@@ -283,6 +283,33 @@ pub const OP_SIMPLE_MESSAGE: u16 = 0x213f;     // RoF2: OP_SimpleMessage
 /// World/NPC emote text (some quest flavor). Emote_Struct: type(u32) | message[1024]\0
 pub const OP_EMOTE: u16 = 0x373b;              // RoF2: OP_Emote
 
+// ── Social: /who all ──────────────────────────────────────────────────────
+
+/// `/who` roster request (client → server). RoF2 `Who_All_Struct` is 156 bytes — WIDER than the
+/// generic 76-byte struct by an inserted `unknown088[64]` pad after `whom[64]`; the RoF2 patch
+/// enforces `DECODE_LENGTH_EXACT`, so it MUST be exactly 156 bytes or the server drops it
+/// (`common/patches/rof2_structs.h` Who_All_Struct, `rof2.cpp` DECODE). See [`build_who_all_request`].
+pub const OP_WHO_ALL_REQUEST: u16 = 0x674b;    // RoF2: OP_WhoAllRequest
+/// `/who` roster response (server → client). RoF2 has its own ENCODE: 64-byte `WhoAllReturnStruct`
+/// header (online count at offset 44) then N player records, each WIDENED by one always-zero u32
+/// after `FormatMSGID` (`rof2.cpp` ENCODE(OP_WhoAllResponse)). Parsed in `packet_handler::apply_who_all`.
+pub const OP_WHO_ALL_RESPONSE: u16 = 0x578c;   // RoF2: OP_WhoAllResponse
+
+/// Build a 156-byte RoF2 `Who_All_Struct` payload for `OP_WhoAllRequest`.
+///   whom[64] | unknown088[64] | wrace u32 | wclass u32 | lvllow u32 | lvlhigh u32
+///   | gmlookup u32 | guildid u32 | type u32
+/// For an unfiltered roster all filter fields are `0xFFFFFFFF` (= "no filter") and `whom` is empty.
+/// `who_type`: 0 = zone-local `/who`, 3 = server-wide `/who all`.
+pub fn build_who_all_request(who_type: u32) -> Vec<u8> {
+    let mut p = vec![0u8; 156];
+    // whom[0..64] and unknown088[64..128] stay zeroed (empty name, RoF2 pad).
+    for off in [128, 132, 136, 140, 144, 148] {
+        p[off..off + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // wrace..guildid = no filter
+    }
+    p[152..156].copy_from_slice(&who_type.to_le_bytes()); // type
+    p
+}
+
 /// Client → server when the player clicks an item/say link. For a "saylink" (a clickable NPC
 /// dialogue choice) the server resolves the phrase from its `saylink` table by the id carried in
 /// the augments and processes it as if the player said it to the NPC. See

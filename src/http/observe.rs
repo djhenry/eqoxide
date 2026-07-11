@@ -28,6 +28,7 @@ pub(super) fn router() -> Router<HttpState> {
         .route("/zone_points", get(get_zone_entrances))
         .route("/zone_exits", get(get_zone_exits))
         .route("/item_text", get(get_item_text))
+        .route("/who", get(get_who))
 }
 
 /// GET /v1/observe/item_text — the text of the most recently read book/note (from
@@ -106,6 +107,49 @@ async fn get_frame(State(s): State<HttpState>) -> Response {
         _ => Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .body(Body::from("renderer not ready"))
+            .unwrap(),
+    }
+}
+
+/// One enriched player row for GET /v1/observe/who.
+#[derive(serde::Serialize)]
+struct WhoView {
+    name:  String,
+    level: u32,
+    /// Class name (e.g. "Wizard"), empty when the player is anonymous.
+    class: String,
+    /// Race code (e.g. "HUM"), empty when the player is anonymous.
+    race:  String,
+    /// Numeric zone id the player is in (0 when anonymous).
+    zone_id: u32,
+    /// Guild name, empty if none.
+    guild: String,
+    anon:  bool,
+}
+
+/// GET /v1/observe/who — server-wide `/who all` roster of everyone currently online. Triggers an
+/// OP_WhoAllRequest and awaits the OP_WhoAllResponse (so an agent can see which fellow agents/players
+/// are online before coordinating). Returns `{online: [{name, level, class, race, zone_id, guild,
+/// anon}]}`. 503 if no response arrives in time. (#300)
+async fn get_who(State(s): State<HttpState>) -> Response {
+    let (tx, rx) = oneshot::channel::<Vec<crate::game_state::WhoEntry>>();
+    *s.who_req.lock().unwrap() = Some(tx);
+    match tokio::time::timeout(std::time::Duration::from_secs(6), rx).await {
+        Ok(Ok(roster)) => {
+            let online: Vec<WhoView> = roster.into_iter().map(|e| WhoView {
+                class:   if e.anon { String::new() } else { crate::eq_net::packet_handler::class_name(e.class).to_string() },
+                race:    if e.anon { String::new() } else { crate::eq_net::protocol::eq_race_to_code(e.race).to_string() },
+                name: e.name, level: e.level, zone_id: e.zone_id, guild: e.guild, anon: e.anon,
+            }).collect();
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::json!({ "online": online }).to_string()))
+                .unwrap()
+        }
+        _ => Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(Body::from("no /who response (not connected, or server did not reply in time)"))
             .unwrap(),
     }
 }
