@@ -77,6 +77,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_GROUP_ACKNOWLEDGE    => apply_group_acknowledge(gs, p),
         OP_CHAR_INVENTORY       => apply_char_inventory(gs, p),
         OP_ITEM_PACKET          => apply_item_packet(gs, p),
+        OP_DELETE_ITEM | OP_DELETE_CHARGE => apply_delete_item(gs, p),
         OP_SHOP_REQUEST         => apply_shop_request(gs, p),
         OP_SHOP_PLAYER_SELL     => apply_shop_player_sell(gs, p),
         OP_SHOP_END             => {
@@ -587,9 +588,42 @@ fn apply_item_packet(gs: &mut GameState, p: &[u8]) {
             let mut upserts = Vec::new();
             push_item_and_contents(&mut upserts, item);
             for it in upserts {
+                // Guard against non-inventory slots. A resync/diagnostic ItemPacketTrade can carry a
+                // trade-window slot (>= SLOT_TRADE_BEGIN 3000), a bank slot, or the 0xFFFF sentinel;
+                // upserting those leaves phantom items the player can never reach (#275). Real
+                // possessions (equip 0-22, general 23-32, cursor 33) and bag contents (251+, < 3000)
+                // pass through.
+                if it.slot < 0 || it.slot as u32 >= SLOT_TRADE_BEGIN {
+                    tracing::debug!("item_packet: skip non-inventory slot {} (item {})", it.slot, it.item_id);
+                    continue;
+                }
                 gs.inventory.retain(|x| x.slot != it.slot);
                 gs.inventory.push(it);
             }
+        }
+    }
+}
+
+/// OP_DeleteItem / OP_DeleteCharge (S->C) — the server destroys an item, or removes charges from a
+/// stack, at a slot. RoF2 `DeleteItem_Struct` (28 bytes) mirrors `MoveItem`: `from_slot`
+/// (InventorySlot_Struct — Type i16@0, Slot i16@4) @0, `to_slot`@12, `number_in_stack`@24. The
+/// server sends this to clear a slot during `SwapItemResync` (the "Inventory Desyncronization"
+/// recovery after a rejected move); leaving it unhandled left the resync's scratch token stuck in
+/// inventory forever, so a quest turn-in appeared to strand junk items in invalid slots (#275).
+fn apply_delete_item(gs: &mut GameState, p: &[u8]) {
+    if p.len() < 6 { return; }
+    let slot_type = i16::from_le_bytes([p[0], p[1]]);
+    // Only possessions-type slots (Type 0) address our inventory wire slots.
+    if slot_type != 0 { return; }
+    let slot = i16::from_le_bytes([p[4], p[5]]) as i32;
+    // The resync clear sends number_in_stack = 0xFFFFFFFF; OP_DeleteCharge may send a real count.
+    let count = if p.len() >= 28 { u32::from_le_bytes([p[24], p[25], p[26], p[27]]) } else { 0 };
+    if let Some(idx) = gs.inventory.iter().position(|i| i.slot == slot) {
+        let charges = gs.inventory[idx].charges.max(0) as u32;
+        if count > 0 && count < charges {
+            gs.inventory[idx].charges -= count as i32; // OP_DeleteCharge: partial stack removal
+        } else {
+            gs.inventory.remove(idx); // OP_DeleteItem / whole-stack clear
         }
     }
 }
@@ -2022,6 +2056,53 @@ mod tests {
         let m = gs.messages.back().unwrap().text.clone();
         assert!(m.contains("Guard_Phaeton") && m.contains("scowls"), "attitude line: {m}");
         assert!(gs.target_con.is_some(), "con color must be set for the HUD tint");
+    }
+
+    fn inv_item(slot: i32, item_id: u32, charges: i32) -> crate::game_state::InvItem {
+        crate::game_state::InvItem {
+            slot, item_id, name: format!("item{item_id}"), icon: 0, charges,
+            idfile: String::new(), click_spell_id: 0,
+        }
+    }
+
+    /// Build a RoF2 DeleteItem_Struct (28B): from_slot InventorySlot_Struct (Type@0, Slot@4),
+    /// to_slot@12, number_in_stack@24.
+    fn delete_item_wire(slot_type: i16, slot: i16, count: u32) -> [u8; 28] {
+        let mut b = [0u8; 28];
+        b[0..2].copy_from_slice(&slot_type.to_le_bytes());
+        b[4..6].copy_from_slice(&slot.to_le_bytes());
+        b[24..28].copy_from_slice(&count.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn apply_delete_item_clears_slot_and_leaves_others() {
+        // #275: the SwapItemResync clear sends OP_DeleteItem with number_in_stack=0xFFFFFFFF to
+        // erase the scratch token it dropped on an empty slot. Handle it (was unhandled → token
+        // stuck forever); only the named slot is removed.
+        let mut gs = GameState::new();
+        gs.inventory.push(inv_item(33, 22292, 1)); // Copper Coin scratch token on cursor
+        gs.inventory.push(inv_item(28, 13007, 1)); // real Bone Chips in general inv
+        super::apply_delete_item(&mut gs, &delete_item_wire(0, 33, 0xFFFF_FFFF));
+        assert!(gs.inventory.iter().all(|i| i.slot != 33), "cleared token removed");
+        assert!(gs.inventory.iter().any(|i| i.slot == 28), "other slots untouched");
+    }
+
+    #[test]
+    fn apply_delete_charge_reduces_stack_partial() {
+        let mut gs = GameState::new();
+        gs.inventory.push(inv_item(28, 13007, 5));
+        super::apply_delete_item(&mut gs, &delete_item_wire(0, 28, 2)); // remove 2 of 5
+        assert_eq!(gs.inventory.iter().find(|i| i.slot == 28).unwrap().charges, 3);
+    }
+
+    #[test]
+    fn apply_delete_item_ignores_non_possessions_slot() {
+        // A typeTrade (3) delete must not touch our possessions inventory.
+        let mut gs = GameState::new();
+        gs.inventory.push(inv_item(5, 999, 1));
+        super::apply_delete_item(&mut gs, &delete_item_wire(3, 5, 0xFFFF_FFFF));
+        assert!(gs.inventory.iter().any(|i| i.slot == 5), "non-possessions delete ignored");
     }
 
     #[test]
