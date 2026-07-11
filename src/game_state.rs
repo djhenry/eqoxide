@@ -285,6 +285,25 @@ pub struct GuildMember {
     pub public_note: String,
 }
 
+/// One player row from an `OP_WhoAllResponse` roster (`/who all`), so agents can enumerate who is
+/// online server-wide (name, level, class, race, zone, guild) before coordinating. (#300)
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct WhoEntry {
+    pub name:  String,
+    /// EQ level (0 when the player is anonymous — the server zeroes stats for `/anon`).
+    pub level: u32,
+    /// EQ class id (0 when anonymous). Rendered to a name at the API layer via `class_name`.
+    pub class: u32,
+    /// EQ race id (0 when anonymous). Rendered to a race code at the API layer.
+    pub race:  u32,
+    /// Zone id the player is in (0 when anonymous). Exposed numerically at the API layer.
+    pub zone_id: u32,
+    /// Guild name, empty if none.
+    pub guild: String,
+    /// True when the player is `/anon` or `/roleplay` — the server suppressed class/level/race/zone.
+    pub anon:  bool,
+}
+
 /// All state the renderer needs for one frame.
 #[derive(Debug, Default, Clone)]
 pub struct GameState {
@@ -319,6 +338,8 @@ pub struct GameState {
     pub guild_names: std::collections::HashMap<u32, String>,
     /// The player's guild roster (from OP_GuildMemberList), for GET /v1/guild/roster. (#295)
     pub guild_members: Vec<GuildMember>,
+    /// Latest `/who all` roster (from OP_WhoAllResponse), for GET /v1/observe/who. (#300)
+    pub who_roster: Vec<WhoEntry>,
     /// A pending incoming guild invite: (inviter name, guild_id, offered rank). Set when the server
     /// forwards an OP_GuildInvite to us; consumed by POST /v1/guild/accept. (#295)
     pub pending_guild_invite: Option<(String, u32, u32)>,

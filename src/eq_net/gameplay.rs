@@ -111,6 +111,10 @@ pub async fn run_gameplay_phase(
             navigator.sync_merchant(&gs);
             navigator.sync_messages(&gs);
             navigator.sync_doors(&gs);
+            // Deliver a /who all roster to the pending GET /v1/observe/who as soon as it lands (#300).
+            if packet.opcode == OP_WHO_ALL_RESPONSE {
+                navigator.fulfill_who(&gs);
+            }
             let _ = app_tx.send(packet.clone());
 
             match packet.opcode {
