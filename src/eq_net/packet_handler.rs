@@ -1251,6 +1251,8 @@ fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < 13 { return; }
     let target_id = u16::from_le_bytes([payload[0], payload[1]]) as u32;
     let source_id = u16::from_le_bytes([payload[2], payload[3]]) as u32;
+    // spellid (u32)@5 — non-zero for a SPELL action (heal/buff/nuke/DoT); 0 for a melee swing.
+    let spellid   = u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
     let damage    = i32::from_le_bytes([payload[9], payload[10], payload[11], payload[12]]);
     let target_name = gs.entities.get(&target_id).map(|e| e.name.clone())
         .unwrap_or_else(|| if target_id == gs.player_id { gs.player_name.clone() } else { format!("#{target_id}") });
@@ -1259,7 +1261,21 @@ fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
     // A `CombatDamage_Struct.damage` of 0 is a plain miss; a POSITIVE value is real damage; a
     // NEGATIVE value is an EQEmu special-outcome sentinel (zone/common.h DMG_*), NOT "negative
     // damage" (#262). Map each to native combat wording instead of leaking "-N damage" / "(type=N)".
-    let msg = if damage > 0 {
+    let msg = if spellid != 0 {
+        // A SPELL landed via OP_Damage — NOT a melee swing. A heal on a full-HP target arrives with
+        // damage==0, which previously fell into the "tries to hit … misses" branch (#272). Resolve the
+        // spell name and word it as a spell: beneficial (heal/buff) → "lands on", damaging → "hits for".
+        let db = crate::spells::global();
+        let sname = db.and_then(|d| d.get(spellid)).map(|s| s.name.clone());
+        let beneficial = db.is_some_and(|d| d.is_beneficial(spellid));
+        match sname {
+            Some(n) if beneficial            => format!("{source_name}'s {n} lands on {target_name}"),
+            Some(n) if damage > 0            => format!("{source_name}'s {n} hits {target_name} for {damage} damage"),
+            Some(n)                          => format!("{source_name}'s {n} lands on {target_name}"),
+            None    if damage > 0            => format!("{source_name}'s spell hits {target_name} for {damage} damage"),
+            None                             => format!("{source_name} casts a spell on {target_name}"),
+        }
+    } else if damage > 0 {
         format!("{source_name} hits {target_name} for {damage} damage")
     } else if damage == 0 {
         format!("{source_name} tries to hit {target_name}, but misses!")
@@ -1281,7 +1297,11 @@ fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
     // react per-hit instead of pinning at the last server value until the next OP_HPUpdate (which
     // then reconciles the authoritative HP). `damage`@9 is the same reliable field shown above; only
     // real hits (>0) reduce HP, clamped at 0. Guarded on a known max so the percent stays sane.
-    if target_id == gs.player_id && damage > 0 && gs.max_hp > 0 {
+    // A BENEFICIAL spell (heal/buff) whose `damage` field carries the heal amount must NOT be
+    // subtracted from HP — that would drain the player on every heal (#272); the OP_HPUpdate carries
+    // the true post-heal HP.
+    let beneficial_spell = spellid != 0 && crate::spells::global().is_some_and(|d| d.is_beneficial(spellid));
+    if target_id == gs.player_id && damage > 0 && gs.max_hp > 0 && !beneficial_spell {
         gs.cur_hp = (gs.cur_hp - damage).max(0);
         gs.hp_pct = (gs.cur_hp as f32 / gs.max_hp.max(1) as f32) * 100.0;
     }
@@ -2087,6 +2107,42 @@ mod tests {
             assert!(!m.contains("damage"), "sentinel {d} must not render as damage: {m}");
             assert!(!m.contains(&format!("{d}")), "sentinel {d} must not leak the raw number: {m}");
         }
+    }
+
+    #[test]
+    fn apply_combat_damage_spell_is_not_a_melee_miss() {
+        // #272: a spell landing via OP_Damage carries a non-zero spellid@5. A heal on a full target
+        // arrives with damage==0 and previously fell into the melee "tries to hit … misses!" branch.
+        // (No spell db is loaded in the unit test, so name/beneficial resolve to None/false and the
+        // wording falls to the generic spell phrasing — which is still NOT melee-miss text.)
+        use super::apply_combat_damage;
+        let spell = |target: u16, source: u16, spellid: u32, damage: i32| -> [u8; 13] {
+            let mut b = [0u8; 13];
+            b[0..2].copy_from_slice(&target.to_le_bytes());
+            b[2..4].copy_from_slice(&source.to_le_bytes());
+            b[5..9].copy_from_slice(&spellid.to_le_bytes()); // spellid@5 (u32)
+            b[9..13].copy_from_slice(&damage.to_le_bytes());
+            b
+        };
+        let mut gs = GameState::new();
+        gs.player_id = 7; gs.player_name = "Piety".into(); gs.max_hp = 100; gs.cur_hp = 100;
+        let last = |gs: &GameState| gs.messages.back().unwrap().text.clone();
+
+        // Self-cast heal restoring 0 HP (full target): spellid=200, damage=0.
+        apply_combat_damage(&mut gs, &spell(7, 7, 200, 0));
+        let m = last(&gs);
+        assert!(!m.contains("misses") && !m.contains("tries to hit"),
+            "a landed heal must NOT render as a melee miss: {m}");
+        assert!(m.contains("spell") || m.contains("Piety"), "should read as a spell: {m}");
+        assert_eq!(gs.cur_hp, 100, "a 0-damage spell must not change HP");
+
+        // Spell DAMAGE (nuke) still shows the amount, worded as a spell not plain melee.
+        apply_combat_damage(&mut gs, &spell(7, 99, 300, 40));
+        assert!(last(&gs).contains("for 40 damage"), "spell damage shows the amount: {}", last(&gs));
+
+        // Sanity: a real MELEE miss (spellid==0, damage==0) is unaffected.
+        apply_combat_damage(&mut gs, &spell(7, 99, 0, 0));
+        assert!(last(&gs).contains("misses"), "melee 0-damage still a miss: {}", last(&gs));
     }
 
     #[test]
