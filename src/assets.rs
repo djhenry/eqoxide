@@ -1558,6 +1558,18 @@ impl Collision {
         // partial path must end at the reachable cell, not clip toward an unreachable goal.
         if reached_goal {
             if let Some(last) = path.last_mut() { *last = [goal[0], goal[1], goal[2]]; }
+        } else {
+            // A PARTIAL route can end inside a submerged dead-end pocket (e.g. a sunken pool whose
+            // walls exceed the climb-out grade): `best_toward` picks the cell with the best
+            // straight-line heuristic to the goal, with no way to know that continuing from a water
+            // cell dead-ends (the water-ascent haul-out cap makes it topologically a trap). Walking
+            // the char IN gets it stuck oscillating until it stalls out — see #259. Trim trailing
+            // submerged waypoints so a partial route stops at the dry edge instead of driving into
+            // the trap; an honest "no route" beats a one-way walk into a pit.
+            while path.last().is_some_and(|&wp| self.in_water(wp)) {
+                path.pop();
+            }
+            if path.is_empty() { return None; }
         }
         Some(path)
     }
@@ -2245,6 +2257,65 @@ mod tests {
         probe("B5 SE bank → city center",         [-488.0, -244.0, 1.0],   [0.0, 0.0, 3.0]);
         probe("B6 west street → city center",     [-600.0, -141.0, -8.0],  [0.0, 0.0, 3.0]);
         probe("B7 moat → city center",            [-502.3, -141.3, -16.0], [0.0, 0.0, 3.0]);
+    }
+
+    /// #259: a sunken, water-filled pit in the middle of an otherwise-open street. The pit floor
+    /// is a legal one-way DROP from the rim (MAX_STEP_DOWN is generous) but climbing back out is
+    /// capped at `WATER_EXIT_UP` (~2.5u above the water surface) — the water surface here sits
+    /// 10u below the rim, so once in, there is no walkable way out. With the search radius bounded
+    /// (mirroring the real `plan_path` fallback's local-tier cap once every full-route radius has
+    /// failed), the far-side goal and any walk-around are both out of reach, forcing a genuine
+    /// PARTIAL route — exactly the condition under which `best_toward` used to land inside the pit
+    /// (closer by straight-line heuristic than any street cell) and drive the walker into the trap.
+    #[test]
+    fn find_path_does_not_drive_a_partial_route_into_a_sunken_water_pit() {
+        let quad = |v: Vec<[f32; 3]>| MeshData {
+            positions: v, normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
+            texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        // MeshData pos = [north, up, east]; Collision maps to world [east, north, up].
+        // A street "frame" (four strips) around a 40x40 hole (east 80..120, north 80..120).
+        let south = quad(vec![[0.0, 0.0, 0.0],   [0.0, 0.0, 200.0],   [80.0, 0.0, 200.0],   [80.0, 0.0, 0.0]]);
+        let north = quad(vec![[120.0, 0.0, 0.0], [120.0, 0.0, 200.0], [200.0, 0.0, 200.0],  [200.0, 0.0, 0.0]]);
+        let west  = quad(vec![[80.0, 0.0, 0.0],  [80.0, 0.0, 80.0],   [120.0, 0.0, 80.0],   [120.0, 0.0, 0.0]]);
+        let east  = quad(vec![[80.0, 0.0, 120.0],[80.0, 0.0, 200.0],  [120.0, 0.0, 200.0],  [120.0, 0.0, 120.0]]);
+        // Pit floor, 20u below the street, extending slightly under the frame's hole edges so the
+        // rim cells find it as a column drop (not disconnected geometry).
+        let pit = quad(vec![[70.0, -40.0, 70.0], [70.0, -40.0, 130.0], [130.0, -40.0, 130.0], [130.0, -40.0, 70.0]]);
+        let assets = ZoneAssets { terrain: vec![south, north, west, east, pit], objects: vec![], textures: vec![] };
+
+        let mut col = Collision::build(&assets, 8.0);
+        // Water fills only the pit's own footprint, up to 30u below street level (z=-30) — far too
+        // deep for either the dry grade limit or WATER_EXIT_UP to reach the z=0 rim from the
+        // surface. Bounded to the pit's XY box (unlike `flat_below`, which is a global z-split) so
+        // the "swim across the surface" edge can't misfire against the dry street elsewhere.
+        col.set_water(Some(std::sync::Arc::new(
+            crate::region_map::RegionMap::box_below(70.0, 130.0, 70.0, 130.0, -30.0))));
+
+        // Sanity: the pit is reachable (a legal drop) but NOT climbable back out — a genuine
+        // one-way trap, the real structural bug independent of the fix under test.
+        let into_pit = col.find_path([60.0, 100.0, 0.0], [100.0, 100.0, -40.0], 1.0, &[], false);
+        assert!(into_pit.is_some(), "the pit floor must be a legal drop from the rim");
+        let out_of_pit = col.find_path([100.0, 100.0, -40.0], [60.0, 100.0, 0.0], 1.0, &[], false);
+        assert!(out_of_pit.is_none(), "the pit must have no walkable exit — a one-way trap");
+
+        // A full route DOES exist by going around the hole (north or south corridor) — confirms
+        // this is a solvable street layout, not a sealed level.
+        let start = [60.0f32, 100.0, 0.0];
+        let goal  = [140.0f32, 100.0, 0.0];
+        assert!(col.find_path(start, goal, 1.0, &[], false).is_some(),
+            "a full route around the pit must exist when the search isn't radius-bounded");
+
+        // Radius-bound the search (as the real fallback does) so neither the goal nor the
+        // walk-around is reachable — forcing a genuine PARTIAL route toward the goal.
+        let path = col.find_path_res(start, goal, 1.0, &[], true, 8.0, Some(50.0), 0.0)
+            .expect("a partial route toward the goal should still make progress");
+        let last = *path.last().unwrap();
+        let last_wet = col.in_water(last);
+        eprintln!("partial route: {} waypoints, last={last:?} in_water={last_wet}", path.len());
+        assert!(!last_wet, "#259: a partial route must never end submerged in the pit — that \
+            strands the walker in a one-way trap. last={last:?}");
     }
 
     #[test]
