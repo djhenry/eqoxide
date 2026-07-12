@@ -112,8 +112,14 @@ pub async fn run_gameplay_phase(
             navigator.sync_messages(&gs);
             navigator.sync_doors(&gs);
             // Deliver a /who all roster to the pending GET /v1/observe/who as soon as it lands (#300).
+            // A friends-presence poll (OP_FriendsWho) replies on this SAME opcode, so route it to the
+            // pending GET /v1/social/friends instead when a friends poll is what we just sent (#301).
             if packet.opcode == OP_WHO_ALL_RESPONSE {
-                navigator.fulfill_who(&gs);
+                if navigator.expecting_friends() {
+                    navigator.fulfill_friends(&gs);
+                } else {
+                    navigator.fulfill_who(&gs);
+                }
             }
             let _ = app_tx.send(packet.clone());
 
