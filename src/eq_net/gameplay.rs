@@ -33,6 +33,8 @@ pub async fn run_gameplay_phase(
     camp:          crate::http::CampReq,
     camp_until:    crate::http::CampUntil,
     respawn:       crate::http::RespawnReq,
+    game_state_snapshot: crate::http::GameStateSnapshot,
+    last_inbound:        crate::http::LastInboundShared,
 ) {
     // Wrap in Option so Rust allows reassignment after zone transitions.
     let mut stream: Option<EqStream>                      = Some(stream_init);
@@ -102,6 +104,7 @@ pub async fn run_gameplay_phase(
         let mut world_reconnect_needed = false;
         while let Ok(packet) = rx.try_recv() {
             apply_packet(&mut gs, &packet);
+            *last_inbound.lock().unwrap() = std::time::Instant::now();
             navigator.sync_entities(&gs);
             navigator.sync_zone_points(&gs);
             navigator.sync_tasks(&gs);
@@ -406,6 +409,8 @@ pub async fn run_gameplay_phase(
         }
 
         navigator.tick(s, &mut gs, &app_tx);
+
+        publish_snapshot(&gs, &game_state_snapshot);
 
         sleep(Duration::from_millis(10)).await;
     }
