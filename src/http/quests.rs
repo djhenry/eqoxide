@@ -160,6 +160,8 @@ pub(crate) mod tests {
             say: Arc::new(Mutex::new(None)),
             target: Arc::new(Mutex::new(None)),
             who_req: Arc::new(Mutex::new(None)),
+            friends_list: Arc::new(Mutex::new(Vec::new())),
+            friends_req: Arc::new(Mutex::new(None)),
             attack: Arc::new(Mutex::new(None)),
             cast: Arc::new(Mutex::new(None)),
             mem_spell: Arc::new(Mutex::new(None)),
