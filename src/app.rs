@@ -85,6 +85,11 @@ pub struct App {
     current_zone:   String,
     loading:        bool,
     pending_reload: bool,
+    /// Zone-transition fade (#286): 0.0 = clear, 1.0 = fully black. Ramps to black fast when a
+    /// zone/position change commits (hiding the reposition + old-scene-then-pop), holds black while
+    /// the new zone loads, and fades back in once it's ready — so all three relocation paths (zone
+    /// transfer, summon, death→bind) get one clean transition instead of an abrupt cut.
+    fade:           f32,
     /// Current loading step shown to the user while loading == true.
     load_status:    Arc<Mutex<String>>,
     /// Background thread writes completed load data here; render loop drains it.
@@ -265,7 +270,7 @@ impl App {
         App {
             window: None, gpu: None, egui_ctx: None, egui_state: None, egui_renderer: None,
             models_path,
-            current_zone: String::new(), loading: false, pending_reload: false,
+            current_zone: String::new(), loading: false, pending_reload: false, fade: 0.0,
             load_status:  Arc::new(Mutex::new(String::new())),
             pending_load: Arc::new(Mutex::new(None)),
             zone_min: [0.0; 2], zone_max: [0.0; 2],
@@ -990,6 +995,15 @@ impl App {
             self.needs_reground = true;
         }
 
+        // Zone-transition fade (#286): drive `fade` toward black while a zone (re)load is committing
+        // or in progress, and fade back in once the new zone is ready. Fast to black (~0.12s) so the
+        // server-driven reposition + the old scene are hidden almost immediately (the client learns
+        // the zone change and the new coords in the same packet, so we can't fade out *before* the
+        // move — we black out as it commits); slower fade-in (~0.4s) for a smooth reveal of the new
+        // zone. This covers all three relocation paths since they all funnel through the reload above
+        // (cross-zone) — and a big same-zone reposition (summon/bind) is caught by `pending_reload`.
+        self.fade = next_fade(self.fade, self.loading || self.pending_reload, dt);
+
         // Fresh `now` for the FPS timer; `dt` and `last_frame_time` were already updated at top.
         let now = std::time::Instant::now();
 
@@ -1318,7 +1332,7 @@ impl App {
         let prof_egui = crate::profiling::Stopwatch::start();
         let egui_wants_repaint = Self::egui_pass(
             &mut self.egui_state, &mut self.egui_renderer, &self.egui_ctx, &mut self.ui_state, &self.window,
-            &mut enc, &view, renderer, self.loading, &self.current_zone, &load_status_text,
+            &mut enc, &view, renderer, self.loading, self.fade, &self.current_zone, &load_status_text,
             sync_frac,
             &self.scene, self.zone_min, self.zone_max,
             self.current_fps, self.zone_map.as_ref(),
@@ -1376,6 +1390,7 @@ impl App {
         view:          &wgpu::TextureView,
         renderer:      &EqRenderer,
         loading:       bool,
+        fade:          f32,               // zone-transition fade 0..1 (#286)
         current_zone:  &str,
         load_status:   &str,
         sync_progress: Option<f32>,
@@ -1425,6 +1440,10 @@ impl App {
         ];
 
         let full_output = egui_ctx.run(raw_input, |ctx| {
+            // Zone-transition fade backdrop (#286): a full-screen black layer at `fade` alpha, drawn
+            // FIRST so the 3D scene (the reposition + the old-then-new zone pop) is hidden behind it
+            // while the HUD / loading text render on top and stay legible.
+            hud::draw_fade(ctx, fade);
             hud::draw_fps(ctx, current_fps);
             hud::draw_connection_banner(ctx, scene.disconnected);
             // Death overlay + Respawn button for human players (#284): the client no longer
@@ -1845,6 +1864,23 @@ fn zone_needs_reload(scene_zone: &str, current_zone: &str) -> bool {
     !scene_zone.is_empty() && scene_zone != current_zone
 }
 
+/// Advance the zone-transition fade (#286) one frame toward its target: fully black (1.0) while a
+/// zone/position change is `transitioning`, else clear (0.0). Fast to black (`FADE_OUT_S`) so the
+/// server-driven reposition + old scene are hidden almost immediately; a slower fade-in (`FADE_IN_S`)
+/// reveals the new zone. Pure so the easing is unit-testable off the render loop.
+fn next_fade(current: f32, transitioning: bool, dt: f32) -> f32 {
+    const FADE_OUT_S: f32 = 0.12; // clear → black
+    const FADE_IN_S:  f32 = 0.40; // black → clear
+    let target = if transitioning { 1.0 } else { 0.0 };
+    if current < target {
+        (current + dt / FADE_OUT_S).min(target)
+    } else if current > target {
+        (current - dt / FADE_IN_S).max(target)
+    } else {
+        current
+    }
+}
+
 /// Distance (units from the player) within which entity billboards get per-frame motion smoothing
 /// (dead-reckoned gliding). Same rationale as [`crate::renderer::ANIM_ADVANCE_DIST`] (#152,
 /// PR #161): the skinned entity pass culls everything past [`crate::pass::ENTITY_DRAW_DIST`], so
@@ -2014,7 +2050,7 @@ fn smooth_entity_motion(
 
 #[cfg(test)]
 mod tests {
-    use super::{smooth_entity_motion, zone_needs_reload, EntityMotion, MOTION_SMOOTH_DIST};
+    use super::{smooth_entity_motion, zone_needs_reload, next_fade, EntityMotion, MOTION_SMOOTH_DIST};
     use std::collections::HashMap;
 
     fn bb(id: u32, pos: [f32; 3]) -> crate::scene::Billboard {
@@ -2167,6 +2203,26 @@ mod tests {
     #[test]
     fn changing_zones_triggers_load() {
         assert!(zone_needs_reload("gfaydark", "arena"));
+    }
+
+    #[test]
+    fn zone_fade_blacks_out_fast_and_fades_in_slower() {
+        // #286: entering a transition ramps to fully black quickly (~0.12s), then holds; leaving it
+        // fades back to clear more slowly (~0.4s). Both directions clamp to [0,1] and never overshoot.
+        // Fade to black: from clear, ~0.12s of 60fps steps reaches ~1.0.
+        let mut f = 0.0;
+        for _ in 0..8 { f = next_fade(f, true, 1.0 / 60.0); } // ~0.133s
+        assert!(f >= 0.999, "should be fully black after ~0.13s transitioning, got {f}");
+        // Holds at black while still transitioning.
+        assert_eq!(next_fade(1.0, true, 1.0 / 60.0), 1.0);
+        // Fade in: from black, ~0.12s in should still be partly dark (slower than the fade-out).
+        let mut g = 1.0;
+        for _ in 0..8 { g = next_fade(g, false, 1.0 / 60.0); }
+        assert!(g > 0.5, "fade-in is slower than fade-out; still dark after ~0.13s, got {g}");
+        // Eventually reaches clear and clamps (no negative).
+        let mut h = 0.05;
+        for _ in 0..8 { h = next_fade(h, false, 1.0 / 60.0); }
+        assert_eq!(h, 0.0, "fade-in clamps to clear, got {h}");
     }
 
     #[test]

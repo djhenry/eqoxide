@@ -139,6 +139,17 @@ pub fn draw_debug_overlay(
         });
 }
 
+/// Zone-transition fade overlay (#286): a full-screen black rectangle at `alpha` (0.0 = clear,
+/// 1.0 = opaque black). Drawn as a background layer so the loading text / HUD render on top of it.
+/// A no-op at alpha 0 so it costs nothing outside a transition.
+pub fn draw_fade(ctx: &egui::Context, alpha: f32) {
+    if alpha <= 0.0 { return; }
+    let a = (alpha.clamp(0.0, 1.0) * 255.0) as u8;
+    let rect = ctx.screen_rect();
+    ctx.layer_painter(egui::LayerId::new(egui::Order::Background, egui::Id::new("zone_fade")))
+        .rect_filled(rect, 0.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, a));
+}
+
 pub fn draw_loading(ctx: &egui::Context, zone: &str, status: &str, progress: Option<f32>) {
     egui::Area::new(egui::Id::new("loading"))
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
