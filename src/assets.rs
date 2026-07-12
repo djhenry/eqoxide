@@ -1525,6 +1525,35 @@ impl Collision {
             match came.get(&cur) { Some(&p) => cur = p, None => break }
         }
         path.reverse();
+        // Edge margin (#312): A* routes through 8u cell CENTERS, so a cell that merely touches a
+        // wall/ledge/waterline still counts as walkable and the followed straight line hugs that
+        // boundary — the walker then clips the edge and falls off or wedges (the #314 city-wall
+        // corner is exactly this). Inset each waypoint away from any unwalkable side by ~the
+        // collision radius: sample the floor a margin out in ±E/±N; a side with no floor in a tight
+        // band around the waypoint's z is a wall/drop/water edge, so nudge away from it. Opposing
+        // walls (a narrow corridor) cancel out — the centre line is kept. A corner pushes diagonally
+        // inward, unwedging it.
+        let margin = radius.max(1.0).min(cell * 0.45);
+        // Walkable a margin out = a floor exists within a tight vertical band of the waypoint (so a
+        // wall lip above, a drop below, or water all read as "edge" and get avoided).
+        let edge_ok = |x: f32, y: f32, z: f32| -> bool {
+            self.nearest_floor(x, y, z, 3.0, 8.0).map_or(false, |f| (f - z).abs() <= 8.0)
+        };
+        for i in 0..path.len() {
+            let [x, y, z] = path[i];
+            let mut push = [0.0f32, 0.0f32];
+            if !edge_ok(x + margin, y, z) { push[0] -= 1.0; }
+            if !edge_ok(x - margin, y, z) { push[0] += 1.0; }
+            if !edge_ok(x, y + margin, z) { push[1] -= 1.0; }
+            if !edge_ok(x, y - margin, z) { push[1] += 1.0; }
+            let len = (push[0] * push[0] + push[1] * push[1]).sqrt();
+            if len > 0.0 {
+                let (nx, ny) = (x + push[0] / len * margin, y + push[1] / len * margin);
+                // Only apply the inset if the nudged point is itself on walkable ground (don't shove
+                // the waypoint across the cell into a different wall).
+                if edge_ok(nx, ny, z) { path[i] = [nx, ny, z]; }
+            }
+        }
         // Snap the final waypoint to the exact goal only when we actually reached the goal cell; a
         // partial path must end at the reachable cell, not clip toward an unreachable goal.
         if reached_goal {
@@ -1909,6 +1938,27 @@ mod tests {
         let last = *path.last().unwrap();
         assert!((last[0] - 15.0).abs() < 1.5 && (last[1] - 5.0).abs() < 1.5, "ends at goal: {last:?}");
         assert!(path.iter().any(|p| p[1] > 12.0), "path must detour north through the gap: {path:?}");
+    }
+
+    #[test]
+    fn find_path_edge_margin_keeps_waypoints_on_mesh() {
+        // #312 safety: the waypoint edge-inset must never shove a point OFF the floor (it only nudges
+        // toward walkable interior, guarded by `edge_ok(nudged)`). Route across the same 20x20 floor
+        // the wall test uses and assert every waypoint stays on real floor. (The real edge-hug fix is
+        // validated live against #314; a flat synthetic floor is already covered by path_clear.)
+        let floor = MeshData {
+            positions: vec![[0.0, 0.0, 0.0], [20.0, 0.0, 0.0], [20.0, 0.0, 20.0], [0.0, 0.0, 20.0]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let col = Collision::build(&ZoneAssets { terrain: vec![floor], objects: vec![], textures: vec![] }, 2.0);
+        let path = col.find_path([3.0, 3.0, 0.0], [17.0, 17.0, 0.0], 1.0, &[], false)
+            .expect("a route across the floor should exist");
+        for p in &path {
+            assert!(col.nearest_floor(p[0], p[1], 0.0, 3.0, 8.0).is_some(),
+                "edge-inset pushed a waypoint off-mesh: {p:?}");
+        }
     }
 
     #[test]
