@@ -51,6 +51,30 @@ impl RegionMap {
         ]}
     }
 
+    /// Test-only: water only inside the XY box `[n0,n1] x [e0,e1]` and below `top_z` — everywhere
+    /// else (including below `top_z` outside the box) reads as dry. Unlike `flat_below` (a single
+    /// z-split, water at that depth EVERYWHERE), this lets a nav test build a spatially bounded
+    /// pond so swim edges can't misfire against unrelated dry terrain elsewhere in the scene.
+    #[cfg(test)]
+    pub fn box_below(n0: f32, n1: f32, e0: f32, e1: f32, top_z: f32) -> RegionMap {
+        let dry   = BspNode { normal: [0.0; 3], split: 0.0, special: 0, left: 0, right: 0, zone_line_index: 0 };
+        let water = BspNode { normal: [0.0; 3], split: 0.0, special: 1, left: 0, right: 0, zone_line_index: 0 };
+        RegionMap { nodes: vec![
+            // 1: north >= n0 → 2, else dry(6)
+            BspNode { normal: [1.0, 0.0, 0.0], split: -n0, special: 0, left: 2, right: 6, zone_line_index: 0 },
+            // 2: north <= n1 → 3, else dry(6)
+            BspNode { normal: [-1.0, 0.0, 0.0], split: n1, special: 0, left: 3, right: 6, zone_line_index: 0 },
+            // 3: east >= e0 → 4, else dry(6)
+            BspNode { normal: [0.0, 1.0, 0.0], split: -e0, special: 0, left: 4, right: 6, zone_line_index: 0 },
+            // 4: east <= e1 → 5, else dry(6)
+            BspNode { normal: [0.0, -1.0, 0.0], split: e1, special: 0, left: 5, right: 6, zone_line_index: 0 },
+            // 5: up < top_z → water(7), else dry(6)
+            BspNode { normal: [0.0, 0.0, 1.0], split: -top_z, special: 0, left: 6, right: 7, zone_line_index: 0 },
+            dry,   // 6
+            water, // 7
+        ]}
+    }
+
     /// Test-only: a map where everything below `top_z` is a zone-line region carrying `index`.
     #[cfg(test)]
     pub fn zone_line_below(top_z: f32, index: i32) -> RegionMap {
