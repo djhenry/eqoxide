@@ -295,6 +295,27 @@ pub const OP_WHO_ALL_REQUEST: u16 = 0x674b;    // RoF2: OP_WhoAllRequest
 /// after `FormatMSGID` (`rof2.cpp` ENCODE(OP_WhoAllResponse)). Parsed in `packet_handler::apply_who_all`.
 pub const OP_WHO_ALL_RESPONSE: u16 = 0x578c;   // RoF2: OP_WhoAllResponse
 
+/// Friends presence poll (client → server). RoF2 has NO decode for this opcode — the zone reads the
+/// whole packet body as a raw NUL-terminated C string of comma-joined friend names
+/// (`Handle_OP_FriendsWho` → `client.cpp` fills FromID/FromName server-side). The server replies with
+/// the ONLINE subset reusing the `OP_WhoAllResponse` wire format, so `apply_who_all` parses it
+/// unchanged. Per-name cap 64 bytes (an over-long name drops the whole reply). (#301)
+pub const OP_FRIENDS_WHO: u16 = 0x3956;        // RoF2: OP_FriendsWho
+
+/// Build an `OP_FriendsWho` payload: the friend names comma-joined into one NUL-terminated ASCII
+/// string (no header, no struct). Empty list → a single NUL. Names ≥64 bytes are dropped (the server
+/// would otherwise silently discard the entire reply). (#301)
+pub fn build_friends_who(names: &[String]) -> Vec<u8> {
+    let joined = names.iter()
+        .filter(|n| !n.trim().is_empty() && n.len() < 64)
+        .map(|n| n.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut p = joined.into_bytes();
+    p.push(0); // NUL-terminate (server does an unbounded strchr off the buffer)
+    p
+}
+
 /// Build a 156-byte RoF2 `Who_All_Struct` payload for `OP_WhoAllRequest`.
 ///   whom[64] | unknown088[64] | wrace u32 | wclass u32 | lvllow u32 | lvlhigh u32
 ///   | gmlookup u32 | guildid u32 | type u32
@@ -1353,6 +1374,20 @@ mod tests {
         // Vah Shir is race 130; Drakkin is race 522 (it was previously mapped to VAH).
         assert_eq!(eq_race_to_code(130), "VAH");
         assert_eq!(eq_race_to_code(522), "DRK");
+    }
+
+    #[test]
+    fn build_friends_who_is_comma_joined_nul_terminated() {
+        // #301: OP_FriendsWho payload is the friend names comma-joined into one NUL-terminated ASCII
+        // string — no header/struct (the server reads the whole body as a C string).
+        let p = build_friends_who(&["Findissues".into(), "Fixissuesthree".into()]);
+        assert_eq!(p, b"Findissues,Fixissuesthree\0");
+        // Empty list → a lone NUL.
+        assert_eq!(build_friends_who(&[]), b"\0");
+        // Blank and over-long (>=64) names are dropped so they can't silently void the server reply.
+        let long = "x".repeat(70);
+        let p = build_friends_who(&["  ".into(), long, "Ok".into()]);
+        assert_eq!(p, b"Ok\0");
     }
 
     #[test]
