@@ -72,6 +72,13 @@ pub type NavIntent = Arc<Mutex<Option<crate::movement::MoveIntent>>>;
 /// (teleport). Small deltas are ignored — the controller is authoritative (design §3.4).
 pub type PosCorrection = Arc<Mutex<Option<[f32; 3]>>>;
 
+/// Single-owner GameState publication (see
+/// docs/superpowers/plans/2026-07-12-gamestate-single-owner-snapshot.md). The network thread is
+/// the sole writer of `GameState`; it publishes an immutable clone here after every gameplay tick
+/// via `eq_net::gameplay::publish_snapshot`. Render/HTTP consumers read it lock-free via `.load()`
+/// (borrowed) or `.load_full()` (owned `Arc<GameState>`).
+pub type GameStateSnapshot = std::sync::Arc<arc_swap::ArcSwap<crate::game_state::GameState>>;
+
 /// Aggro-avoidance knobs the `/v1/move/*` handlers set and the nav walker reads (#242). `enabled`
 /// gates the always-on NPC-camp avoidance (#67) — `false` routes straight through (e.g. to reach a
 /// mob). `buffer` widens the soft-avoid radius so the route gives hostile pulls more berth. Default =

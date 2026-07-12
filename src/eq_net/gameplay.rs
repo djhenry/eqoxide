@@ -639,6 +639,13 @@ pub fn camp_expired(current: Option<std::time::Instant>, now: std::time::Instant
     matches!(current, Some(d) if now >= d)
 }
 
+/// Publish the network thread's `GameState` for lock-free reads by the render/HTTP threads. Called
+/// once per gameplay tick, after every mutation for that tick (packet-applied and `Navigator::tick`'s
+/// own writes) has landed — see the call site in `run_gameplay_phase`.
+pub fn publish_snapshot(gs: &GameState, snapshot: &crate::http::GameStateSnapshot) {
+    snapshot.store(Arc::new(gs.clone()));
+}
+
 #[cfg(test)]
 mod camp_tests {
     use super::*;
@@ -696,5 +703,30 @@ mod camp_tests {
     #[test]
     fn idle_never_expires() {
         assert!(!camp_expired(None, Instant::now()));
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn publish_snapshot_reflects_latest_state_independent_of_later_mutation() {
+        let snapshot: crate::http::GameStateSnapshot =
+            Arc::new(arc_swap::ArcSwap::from_pointee(GameState::new()));
+
+        let mut gs = GameState::new();
+        gs.player_name = "Aldric".to_string();
+        publish_snapshot(&gs, &snapshot);
+        assert_eq!(snapshot.load().player_name, "Aldric");
+
+        // Mutating the source after publishing must not retroactively change the already-published
+        // snapshot — each publish is an independent, immutable clone.
+        gs.player_name = "Mutated".to_string();
+        assert_eq!(snapshot.load().player_name, "Aldric");
+
+        // A second publish replaces the snapshot wholesale.
+        publish_snapshot(&gs, &snapshot);
+        assert_eq!(snapshot.load().player_name, "Mutated");
     }
 }
