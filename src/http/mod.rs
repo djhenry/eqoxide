@@ -79,6 +79,12 @@ pub type PosCorrection = Arc<Mutex<Option<[f32; 3]>>>;
 /// (borrowed) or `.load_full()` (owned `Arc<GameState>`).
 pub type GameStateSnapshot = std::sync::Arc<arc_swap::ArcSwap<crate::game_state::GameState>>;
 
+/// Updated by the network thread every time it applies a real inbound packet (never on a mere
+/// idle tick — `GameStateSnapshot` publishes unconditionally every ~10ms, which would make a
+/// pointer-equality check meaningless as a connection-health signal). The render thread polls this
+/// once per frame to derive `last_packet_age_ms`/`connected` for `/debug` (#8).
+pub type LastInboundShared = std::sync::Arc<std::sync::Mutex<std::time::Instant>>;
+
 /// Aggro-avoidance knobs the `/v1/move/*` handlers set and the nav walker reads (#242). `enabled`
 /// gates the always-on NPC-camp avoidance (#67) — `false` routes straight through (e.g. to reach a
 /// mob). `buffer` widens the soft-avoid radius so the route gives hostile pulls more berth. Default =
