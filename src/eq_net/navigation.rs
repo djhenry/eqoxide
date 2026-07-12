@@ -614,13 +614,19 @@ fn plan_path(
     const SLOW_MS: u128 = 100;
     let t0 = std::time::Instant::now();
     let plan = (|| {
-        for r in [PLAYER_RADIUS, PLAYER_RADIUS * 0.5, PLAYER_RADIUS * 0.25] {
-            if let Some(p) = col.find_path_res(start, goal, r, avoid, false, 8.0, None, aggro_buffer) {
-                return Some(p);
-            }
+        // Plan at the char's REAL collision radius only. The old fallback retried at half/quarter
+        // radius to "thread narrower gaps" (#188), but PLAYER_RADIUS (1.0) is the native RoF2
+        // collision sphere the movement controller actually enforces — a route planned at a smaller
+        // clearance runs through gaps the char physically can't fit (the cells the nav-debug overlay,
+        // which uses the full radius, correctly paints RED). The char then wedges trying to follow it
+        // (#310, and the #314 city-wall wedge). If the full-radius route is boxed out, fall through to
+        // a PARTIAL route (walk as far as is actually walkable, then re-path) — that keeps the char
+        // moving toward the goal without emitting an unfollowable path.
+        if let Some(p) = col.find_path_res(start, goal, PLAYER_RADIUS, avoid, false, 8.0, None, aggro_buffer) {
+            return Some(p);
         }
-        // Fallback: no FULL route at any width — walk a PARTIAL route as far toward the goal as A*
-        // can reach (the walker re-paths from the far end). Warn so this degraded routing is visible.
+        // Fallback: no FULL route — walk a PARTIAL route as far toward the goal as A* can reach (the
+        // walker re-paths from the far end). Warn so this degraded routing is visible.
         let partial = col.find_path_res(start, goal, PLAYER_RADIUS, avoid, true, 8.0, None, aggro_buffer);
         if let Some(ref p) = partial {
             tracing::warn!("nav: no full route from ({:.0},{:.0}) to ({:.0},{:.0}) — walking a PARTIAL route ({} wp) toward it",
