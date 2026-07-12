@@ -29,6 +29,7 @@ mod merchant;
 mod inventory;
 mod chat;
 mod events;
+mod social;
 mod camera;
 mod lifecycle;
 
@@ -40,6 +41,14 @@ pub type FrameReq = Arc<Mutex<Option<oneshot::Sender<Vec<u8>>>>>;
 /// drains it, sends OP_WhoAllRequest, and fires it with the parsed roster when OP_WhoAllResponse
 /// arrives. (#300)
 pub type WhoReq = Arc<Mutex<Option<oneshot::Sender<Vec<crate::game_state::WhoEntry>>>>>;
+
+/// The client-local friends list (names). Edited by POST /v1/social/friends {add|remove}; read by the
+/// nav thread to build the OP_FriendsWho poll and by GET /v1/social/friends to annotate online. (#301)
+pub type FriendsListShared = Arc<Mutex<Vec<String>>>;
+/// A pending friends-presence poll: GET /v1/social/friends registers a oneshot here; the nav thread
+/// drains it, sends OP_FriendsWho, and fires it with the online-friends roster (the OP_WhoAllResponse
+/// the server sends back) — mirrors [`WhoReq`]. (#301)
+pub type FriendsReq = Arc<Mutex<Option<oneshot::Sender<Vec<crate::game_state::WhoEntry>>>>>;
 
 /// Target position for the navigation system. Set by /goto, cleared on arrival.
 pub type GotoTarget = Arc<Mutex<Option<(f32, f32, f32)>>>;
@@ -513,6 +522,8 @@ pub(crate) struct HttpState {
     pub(crate) say:              SayReq,
     pub(crate) target:           TargetReq,
     pub(crate) who_req:          WhoReq,
+    pub(crate) friends_list:     FriendsListShared,
+    pub(crate) friends_req:      FriendsReq,
     pub(crate) attack:           AttackReq,
     pub(crate) cast:             CastReq,
     pub(crate) mem_spell:        MemSpellReq,
@@ -575,6 +586,8 @@ pub fn spawn_camera_server(
     say:              SayReq,
     target:           TargetReq,
     who_req:          WhoReq,
+    friends_list:     FriendsListShared,
+    friends_req:      FriendsReq,
     attack:           AttackReq,
     cast:             CastReq,
     mem_spell:        MemSpellReq,
@@ -628,7 +641,7 @@ pub fn spawn_camera_server(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, shared_collision, zone_cross, manual_move, hail, say, target, who_req, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, dialogue, nav_state, dialogue_click, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until, respawn, pet_cmd, nav_avoid, read_book, guild, guild_action };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, shared_collision, zone_cross, manual_move, hail, say, target, who_req, friends_list, friends_req, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, dialogue, nav_state, dialogue_click, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until, respawn, pet_cmd, nav_avoid, read_book, guild, guild_action };
             // Versioned + grouped routes: /v1/<group>/<action>. Each group's `router()` defines
             // relative paths; nesting prefixes them. Shared state is applied once at the end.
             let app = Router::new()
@@ -645,6 +658,7 @@ pub fn spawn_camera_server(
                 .nest("/v1/inventory", inventory::router())
                 .nest("/v1/chat",      chat::router())
                 .nest("/v1/events",    events::router())
+                .nest("/v1/social",    social::router())
                 .nest("/v1/camera",    camera::router())
                 .nest("/v1/lifecycle", lifecycle::router())
                 .with_state(state);

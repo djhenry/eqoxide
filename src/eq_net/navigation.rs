@@ -748,6 +748,13 @@ pub struct Navigator {
     who_req:          WhoReq,
     /// Held between sending the request and receiving OP_WhoAllResponse; fired by `fulfill_who`. (#300)
     pending_who:      Option<tokio::sync::oneshot::Sender<Vec<crate::game_state::WhoEntry>>>,
+    /// Client-local friends list + a pending friends-presence poll, mirroring who_req/pending_who.
+    /// The OP_FriendsWho reply arrives on the SAME opcode as /who all (OP_WhoAllResponse), so
+    /// `expecting_friends` records that the next such reply is a friends poll, not a /who all. (#301)
+    friends_list:     crate::http::FriendsListShared,
+    friends_req:      crate::http::FriendsReq,
+    pending_friends:  Option<tokio::sync::oneshot::Sender<Vec<crate::game_state::WhoEntry>>>,
+    expecting_friends: bool,
     attack:           AttackReq,
     buy:              BuyReq,
     sell:             SellReq,
@@ -907,6 +914,8 @@ impl Navigator {
         say:              SayReq,
         target:           TargetReq,
         who_req:          WhoReq,
+        friends_list:     crate::http::FriendsListShared,
+        friends_req:      crate::http::FriendsReq,
         attack:           AttackReq,
         buy:              BuyReq,
         sell:             SellReq,
@@ -967,6 +976,10 @@ impl Navigator {
             target,
             who_req,
             pending_who: None,
+            friends_list,
+            friends_req,
+            pending_friends: None,
+            expecting_friends: false,
             attack,
             buy,
             sell,
@@ -1127,6 +1140,19 @@ impl Navigator {
         if let Some(tx) = self.pending_who.take() {
             let _ = tx.send(gs.who_roster.clone());
         }
+    }
+
+    /// True when the next OP_WhoAllResponse should be treated as an OP_FriendsWho reply (a friends
+    /// poll) rather than a /who all — so the gameplay loop routes it to `fulfill_friends`. (#301)
+    pub fn expecting_friends(&self) -> bool { self.expecting_friends }
+
+    /// Deliver the friends-presence reply (the online subset, parsed into `gs.who_roster` by
+    /// `apply_who_all`) to the pending GET /v1/social/friends. Mirrors `fulfill_who`. (#301)
+    pub fn fulfill_friends(&mut self, gs: &GameState) {
+        if let Some(tx) = self.pending_friends.take() {
+            let _ = tx.send(gs.who_roster.clone());
+        }
+        self.expecting_friends = false;
     }
 
     /// Publish the open-merchant session from `gs` into the shared slot (GET /trade/list + the HUD
@@ -1732,7 +1758,19 @@ impl Navigator {
         if let Some(tx) = self.who_req.lock().unwrap().take() {
             stream.send_app_packet(OP_WHO_ALL_REQUEST, &build_who_all_request(3));
             self.pending_who = Some(tx);
+            self.expecting_friends = false; // the next OP_WhoAllResponse is a /who all, not a friends poll
             tracing::info!("EQ: sent OP_WhoAllRequest (/who all)");
+        }
+
+        // Check friends-presence request (#301) — send OP_FriendsWho with the client-local friends
+        // string; the reply arrives as OP_WhoAllResponse (online subset), routed to `fulfill_friends`
+        // by the `expecting_friends` flag. Mirrors the /who all path above.
+        if let Some(tx) = self.friends_req.lock().unwrap().take() {
+            let names = self.friends_list.lock().unwrap().clone();
+            stream.send_app_packet(OP_FRIENDS_WHO, &build_friends_who(&names));
+            self.pending_friends = Some(tx);
+            self.expecting_friends = true;
+            tracing::info!("EQ: sent OP_FriendsWho ({} friend(s))", names.len());
         }
 
         // Check attack request — send OP_AUTO_ATTACK(1) to start, OP_AUTO_ATTACK(0) to stop.
@@ -2941,6 +2979,8 @@ mod tests {
             Default::default(), // say
             Default::default(), // target
             Default::default(), // who_req
+            Default::default(), // friends_list
+            Default::default(), // friends_req
             Default::default(), // attack
             Default::default(), // buy
             Default::default(), // sell
