@@ -403,13 +403,18 @@ pub(crate) fn remap_axis(pos: f32, size: f32, old_dim: f32, new_dim: f32) -> f32
 mod tests {
     use super::*;
 
-    fn tmp(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("ui_layout_v2_{name}.json"))
+    // Each test gets its own tempdir (not a fixed shared /tmp path keyed only by test name) so
+    // concurrent `cargo test` processes (multiple worktrees, or CI) never clobber each other's
+    // fixture files. `dir` must stay bound in the test's scope — it deletes the directory on
+    // drop. Mirrors the pattern already used correctly in asset_sync.rs. See #356.
+    fn tmp(dir: &tempfile::TempDir, name: &str) -> PathBuf {
+        dir.path().join(format!("ui_layout_v2_{name}.json"))
     }
 
     #[test]
     fn v1_file_loads_with_defaults_and_drops_stale_geometry() {
-        let path = tmp("v1compat");
+        let dir = tempfile::tempdir().unwrap();
+        let path = tmp(&dir, "v1compat");
         std::fs::write(
             &path,
             r#"{ "locked": true, "windows": { "inventory": { "pos": [8,90], "size": null, "alpha": 200 } } }"#,
@@ -422,23 +427,22 @@ mod tests {
         assert_eq!(l.os_window, None);
         // v1 geometry is in a different id-set + point space: dropped.
         assert_eq!(l.win("inventory"), None);
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn corrupt_file_yields_defaults() {
-        let path = tmp("corrupt");
+        let dir = tempfile::tempdir().unwrap();
+        let path = tmp(&dir, "corrupt");
         std::fs::write(&path, b"{ not json").unwrap();
         let l = Layout::from_path(path.clone());
         assert!(!l.locked);
         assert_eq!(l.win("x"), None);
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn open_state_round_trip() {
-        let path = tmp("open");
-        let _ = std::fs::remove_file(&path);
+        let dir = tempfile::tempdir().unwrap();
+        let path = tmp(&dir, "open");
         let mut l = Layout::from_path(path.clone());
         assert!(!l.is_open("inventory", false));
         assert!(l.is_open("player", true));
@@ -446,12 +450,12 @@ mod tests {
         l.save_now();
         let l2 = Layout::from_path(path.clone());
         assert!(l2.is_open("inventory", false));
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn set_geometry_marks_dirty_only_on_change() {
-        let mut l = Layout::from_path(tmp("dirty"));
+        let dir = tempfile::tempdir().unwrap();
+        let mut l = Layout::from_path(tmp(&dir, "dirty"));
         l.set_geometry("hud", [1.0, 2.0], None);
         assert!(l.dirty());
         l.clear_dirty_for_test();
@@ -461,8 +465,8 @@ mod tests {
 
     #[test]
     fn os_window_round_trip() {
-        let path = tmp("oswin");
-        let _ = std::fs::remove_file(&path);
+        let dir = tempfile::tempdir().unwrap();
+        let path = tmp(&dir, "oswin");
         let mut l = Layout::from_path(path.clone());
         l.set_os_window(OsWindowState { size: [1600, 900], pos: Some([10, 20]), maximized: false });
         l.save_now();
@@ -471,7 +475,6 @@ mod tests {
             l2.os_window,
             Some(OsWindowState { size: [1600, 900], pos: Some([10, 20]), maximized: false })
         );
-        let _ = std::fs::remove_file(path);
     }
 
     // ── remap math (the native FUN_0088bfa0 table) ──
@@ -501,8 +504,8 @@ mod tests {
 
     #[test]
     fn remap_all_only_once_and_tracks_screen() {
-        let path = tmp("remapall");
-        let _ = std::fs::remove_file(&path);
+        let dir = tempfile::tempdir().unwrap();
+        let path = tmp(&dir, "remapall");
         std::fs::write(
             &path,
             r#"{ "version": 2, "screen": [1280.0, 720.0],
@@ -516,12 +519,12 @@ mod tests {
         // second call with same size is a no-op
         l.remap_all([1920.0, 1080.0]);
         assert_eq!(l.win("w").unwrap().pos, Some([1820.0, 980.0]));
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn reset_clears_geometry_keeps_open() {
-        let mut l = Layout::from_path(tmp("reset"));
+        let dir = tempfile::tempdir().unwrap();
+        let mut l = Layout::from_path(tmp(&dir, "reset"));
         l.set_open("w", true);
         l.set_geometry("w", [5.0, 6.0], Some([10.0, 10.0]));
         l.reset("w");
@@ -544,8 +547,8 @@ mod tests {
     /// defaults, not derive-Default zeros (ui_scale 0.5-clamped, fades off).
     #[test]
     fn fresh_layout_has_sane_defaults() {
-        let path = tmp("fresh_defaults");
-        let _ = std::fs::remove_file(&path);
+        let dir = tempfile::tempdir().unwrap();
+        let path = tmp(&dir, "fresh_defaults");
         let l = Layout::from_path(path);
         assert_eq!(l.ui_scale, 1.0);
         assert!(l.fades);
@@ -556,7 +559,8 @@ mod tests {
     /// no stored entry must not create it with alpha 0 (invisible window).
     #[test]
     fn geometry_entry_defaults_opaque() {
-        let mut l = Layout::from_path(tmp("alpha_default"));
+        let dir = tempfile::tempdir().unwrap();
+        let mut l = Layout::from_path(tmp(&dir, "alpha_default"));
         l.set_geometry("chat", [0.0, 100.0], Some([400.0, 200.0]));
         assert_eq!(l.alpha_of("chat"), 255);
         l.set_open("map", true);
