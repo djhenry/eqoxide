@@ -235,8 +235,10 @@ pub fn gem_is_empty(spell_id: u32) -> bool {
 pub struct CastOutcome {
     /// The spell that ended, or 0 when the server never told us which (see `GameState::ended_cast_spell`).
     pub spell_id: u32,
-    /// `cast_completed` | `cast_interrupted` | `cast_fizzled` | `cast_failed` — the same string
-    /// used as the event `kind`, so the poll and the push agree.
+    /// `cast_completed` | `cast_interrupted` | `cast_fizzled` | `cast_failed` |
+    /// `cast_ended_unexplained` — the same string used as the event `kind`, so the poll and the
+    /// push agree. The last one is the client's INFERENCE that a cast ended (the server sent its
+    /// cast-end signal and never said why); every other kind is a verdict the server actually gave.
     pub kind: &'static str,
     /// The human-readable line (also written to the message log).
     pub text: String,
@@ -246,9 +248,18 @@ pub struct CastOutcome {
 /// How long [`GameState::resolve_pending_cast_end`] waits for a packet that EXPLAINS a cast the
 /// server has already ended, before reporting the end as unexplained.
 ///
-/// The explaining packet is sent in the same server tick as the OP_ManaChange that ends the cast
-/// (`SendSpellBarEnable` then `MemorizeSpell` — zone/spells.cpp:1817,1824), so this only has to
-/// outlast network jitter, not a game tick.
+/// ## This encodes a TIMING ASSUMPTION — state it, don't hide it (see eqoxide#356)
+/// The assumption: the explaining packet is queued in the SAME server tick as the OP_ManaChange
+/// that ends the cast — `SendSpellBarEnable` then `MemorizeSpell` are back-to-back in
+/// `Mob::SpellFinished` (zone/spells.cpp:1817,1824), and `InterruptSpell` likewise emits
+/// OP_InterruptCast immediately before its OP_ManaChange (:1306-1314). So this window only has to
+/// outlast network jitter, not a game tick, and 400ms is generous for a LAN/loopback server.
+///
+/// If a loaded server ever split those across ticks, the outcome would degrade to
+/// `cast_ended_unexplained` instead of the true reason. That is the SAFE direction — an honest
+/// "I don't know why it ended" rather than a confident wrong answer — but it is a real failure mode
+/// and a reader should not have to infer it from the constant. Widen this before concluding the
+/// client is mis-reporting outcomes on a busy server.
 pub const CAST_END_GRACE: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// How recently OP_ManaChange must have named a spell for that name to be trusted on a failure that
@@ -746,9 +757,17 @@ impl GameState {
     }
 
     /// Called every gameplay tick. If the server ended a cast and never explained it within
-    /// [`CAST_END_GRACE`], report that honestly instead of staying silent. An unexplained end is a
-    /// real, observable thing — a spell that did not take hold — and the agent must be able to see
-    /// it. (eqoxide#348)
+    /// [`CAST_END_GRACE`], say so — but say it as what it IS.
+    ///
+    /// This is deliberately **not** `cast_failed`. `cast_failed` means "the server told us the cast
+    /// failed" — that is knowledge, carried by a real server string. An unexplained end means "the
+    /// server told us nothing; we inferred the cast ended" — that is an inference. Collapsing the
+    /// two would hand the agent a verdict the client does not actually have, and phrasing it in
+    /// server voice ("Your spell did not take hold") would make our guess indistinguishable from
+    /// something the server said. An agent must be able to branch on the difference.
+    ///
+    /// The same rule governs `spell_id`: an unnamed spell reports 0, because a plausibly-wrong name
+    /// is a lie while an honest "unknown" is not. (eqoxide#348)
     pub fn resolve_pending_cast_end(&mut self) {
         let Some(at) = self.pending_cast_end else { return };
         if at.elapsed() < CAST_END_GRACE { return; }
@@ -757,11 +776,13 @@ impl GameState {
             .filter(|(_, t)| t.elapsed() < CAST_HINT_FRESH)
             .map(|(id, _)| id)
             .unwrap_or(0);
+        // Client's-own-voice, explicitly an observation — never a fabricated server line.
         let text = format!(
-            "Your spell ({}) did not take hold — the cast ended with no effect.",
+            "The cast of {} ended with no outcome reported by the server \
+             (observed by the client; the server said nothing).",
             crate::spells::name_of(spell_id),
         );
-        self.finish_cast(spell_id, "cast_failed", &text);
+        self.finish_cast(spell_id, "cast_ended_unexplained", &text);
     }
 
     pub fn upsert_entity(&mut self, e: Entity) {

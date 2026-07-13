@@ -3984,9 +3984,51 @@ mod tests {
         gs.pending_cast_end = Some(std::time::Instant::now() - crate::game_state::CAST_END_GRACE);
         gs.resolve_pending_cast_end();
         let last = gs.last_cast.as_ref().expect("an unexplained end is still an outcome");
-        assert_eq!(last.kind, "cast_failed");
+        assert_eq!(last.kind, "cast_ended_unexplained");
         assert_eq!(last.spell_id, 202, "OP_ManaChange named the spell that ended");
-        assert_eq!(event_kinds(&gs), ["cast_begin", "cast_failed"]);
+        assert_eq!(event_kinds(&gs), ["cast_begin", "cast_ended_unexplained"]);
+    }
+
+    #[test]
+    fn an_unexplained_end_is_not_reported_as_a_server_verdict() {
+        // The client must never dress its own INFERENCE up as something the server said.
+        //
+        //   cast_failed             = "the server told us the cast failed"  → knowledge
+        //   cast_ended_unexplained  = "the server told us nothing; we inferred it ended" → inference
+        //
+        // Collapsing them hands the agent a verdict the client does not have. Worse, phrasing the
+        // inference in server voice ("Your spell did not take hold") makes our guess
+        // indistinguishable from a real server string. Keep the two kinds — and the two VOICES —
+        // apart. (eqoxide#348 review)
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+
+        // (a) The server DID give a verdict: OP_SimpleMessage 199 carries a real eqstr.
+        super::apply_begin_cast(&mut gs, &begin_cast_pkt(42, 202, 2500));
+        super::apply_simple_message(&mut gs, &simple_msg_pkt(199)); // INSUFFICIENT_MANA
+        let verdict = gs.last_cast.clone().expect("server verdict recorded");
+        assert_eq!(verdict.kind, "cast_failed");
+
+        // (b) The server said NOTHING — only its cast-end signal, then silence.
+        let mut gs2 = GameState::new();
+        gs2.player_id = 42;
+        super::apply_begin_cast(&mut gs2, &begin_cast_pkt(42, 202, 2500));
+        super::apply_mana_change(&mut gs2, &mana_change_pkt(90, 202, 0));
+        gs2.pending_cast_end = Some(std::time::Instant::now() - crate::game_state::CAST_END_GRACE);
+        gs2.resolve_pending_cast_end();
+        let inferred = gs2.last_cast.clone().expect("unexplained end recorded");
+
+        assert_ne!(inferred.kind, verdict.kind,
+            "an inference must not be reported under the same kind as a server verdict — an agent \
+             has to be able to branch on 'the server said it failed' vs 'we don't know why it ended'");
+        assert_eq!(inferred.kind, "cast_ended_unexplained");
+        // And it must not be written in the server's voice. The real EQ fizzle/no-hold strings are
+        // second-person imperatives ("Your spell ..."); our inference must announce itself as ours.
+        assert!(inferred.text.contains("no outcome reported by the server"),
+            "the text must say the server reported nothing, not fabricate a server line: {}",
+            inferred.text);
+        assert!(!inferred.text.starts_with("Your spell"),
+            "must not imitate a server string: {}", inferred.text);
     }
 
     #[test]

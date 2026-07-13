@@ -570,10 +570,20 @@ pub struct LastCastView {
     /// 0 when the server never named the spell (an honest unknown, not a guess).
     pub spell_id:   u32,
     pub spell_name: String,
-    /// `cast_completed` | `cast_interrupted` | `cast_fizzled` | `cast_failed` — the same value the
-    /// matching `/v1/events/combat` event carries as its `kind`.
+    /// `cast_completed` | `cast_interrupted` | `cast_fizzled` | `cast_failed` |
+    /// `cast_ended_unexplained` — the same value the matching `/v1/events/combat` event carries as
+    /// its `kind`.
+    ///
+    /// The first four are verdicts the SERVER gave us. `cast_ended_unexplained` is the client's own
+    /// INFERENCE: the server sent its cast-end signal (OP_ManaChange keepcasting=0) and never said
+    /// why — the usual cause being `Mob::SpellFinished` returning false. An agent must be able to
+    /// branch on "the server said it failed" vs "we don't know why it ended", so these are
+    /// deliberately not the same kind.
     pub outcome:    String,
-    /// The server's own line ("Your spell fizzles!", "Insufficient Mana to cast this spell!", …).
+    /// The line shown to the agent. For a server verdict this is the SERVER's own string ("Your
+    /// spell fizzles!", "Insufficient Mana to cast this spell!"). For `cast_ended_unexplained` it
+    /// is written in the CLIENT's voice and says plainly that the server reported nothing — never
+    /// server-sounding prose we invented, which an agent could not tell from a real server line.
     pub text:       String,
     /// When the outcome landed. Not serialized — `ago_secs` is computed from it on read.
     #[serde(skip)]

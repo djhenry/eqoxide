@@ -79,7 +79,9 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             "nav_state":   nav_state,
             // Spellcasting (#348). `casting` is non-null ONLY while our own cast bar is running;
             // `last_cast` is how the previous cast ended (cast_completed / cast_interrupted /
-            // cast_fizzled / cast_failed) and survives it. Before this, casting was tracked
+            // cast_fizzled / cast_failed, plus cast_ended_unexplained — the client's inference when
+            // the server ended the cast without saying why) and survives it. Before this, casting
+            // was tracked
             // internally and published NOWHERE — an agent could not tell a spell that landed from
             // one that fizzled, was interrupted, or never started. The same transitions are pushed
             // onto /v1/events/combat as they happen.
