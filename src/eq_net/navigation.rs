@@ -2,7 +2,6 @@
 //! sending EQ movement packets and notifying the render loop.
 
 use std::time::Instant;
-use tokio::sync::mpsc::UnboundedSender;
 
 /// Nav tick interval (ms). Steps are gated to fire no more often than this.
 const NAV_TICK_MS: u128 = 150;
@@ -1377,7 +1376,6 @@ impl Navigator {
         &mut self,
         stream:  &mut EqStream,
         gs:      &mut GameState,
-        app_tx:  &UnboundedSender<AppPacket>,
     ) {
         // POST /loot: queue the requested corpse onto the existing auto-loot pipeline. The gameplay
         // loop drains pending_loot — sends OP_LootRequest, echoes each OP_LootItem to take it, then
@@ -1417,9 +1415,6 @@ impl Navigator {
                 gs.log_msg("quest", "Accepted task offer");
             }
             gs.task_offers.clear();
-            // Mirror into the RENDER GameState: an EMPTY OP_TaskSelectWindow parses to zero offers
-            // (apply_task_select_window), clearing render-side task_offers so the selector closes.
-            let _ = app_tx.send(AppPacket { opcode: OP_TASK_SELECT_WINDOW, payload: Vec::new() });
         }
 
         // POST /v1/quests/cancel ({"task_id":N}): abandon an active task. OP_CancelTask addresses
@@ -1447,9 +1442,6 @@ impl Navigator {
         if self.group_accept.lock().unwrap().take().is_some() {
             if let Some(inviter) = gs.pending_invite.take() {
                 stream.send_app_packet(OP_GROUP_FOLLOW, &build_group_follow(&inviter, &gs.player_name));
-                // Mirror into the RENDER GameState (apply_group_invite set its pending_invite too,
-                // and only a disband would ever clear it) so the forced-open Group window relaxes.
-                let _ = app_tx.send(AppPacket { opcode: OP_UI_CLEAR_INVITE, payload: Vec::new() });
                 tracing::info!("EQ: group: accepted invite from {inviter}");
                 gs.log_msg("group", &format!("Accepted group invite from {inviter}"));
             }
@@ -1460,9 +1452,6 @@ impl Navigator {
         if self.group_decline.lock().unwrap().take().is_some() {
             if let Some(inviter) = gs.pending_invite.take() {
                 stream.send_app_packet(OP_GROUP_DISBAND, &build_group_disband(&gs.player_name, &gs.player_name));
-                // A decline produces NO server packet at all — mirror the cleared invite into the
-                // RENDER GameState or its pending_invite (and the invite dialog) lingers forever.
-                let _ = app_tx.send(AppPacket { opcode: OP_UI_CLEAR_INVITE, payload: Vec::new() });
                 tracing::info!("EQ: group: declined invite from {inviter}");
                 gs.log_msg("group", &format!("Declined group invite from {inviter}"));
             }
@@ -1501,10 +1490,6 @@ impl Navigator {
                     let payload = build_gm_end_training(open_npc, gs.player_id);
                     stream.send_app_packet(OP_GM_END_TRAINING, &payload);
                     gs.trainer_skills.clear();
-                    // Mirror into the RENDER GameState: ending training is client-initiated (the
-                    // server never echoes OP_GMEndTraining), so without this the render-side
-                    // trainer_open stays Some and the transient Trainer window never closes.
-                    let _ = app_tx.send(AppPacket { opcode: OP_GM_END_TRAINING, payload });
                     tracing::info!("EQ: trainer: ended training with npc {open_npc}");
                 }
             } else {
@@ -1651,17 +1636,6 @@ impl Navigator {
         // so we must target the NPC FIRST, in the same tick and before the say packet, or the hail is
         // silently ignored (#130). The target packet precedes the say on the ordered stream, so the
         // server has GetTarget()==the NPC when it processes the say.
-        // Local chat echo (#3 of the UI-overhaul bug cluster): the chat window renders only the
-        // RENDER GameState's message log, and outgoing chat is client-initiated (the server doesn't
-        // echo your own say/tell/... back), so every send below also mirrors a "You say/tell …"
-        // line over app_tx via the internal-only OP_UI_LOCAL_ECHO packet.
-        let echo = |kind: &str, text: &str| {
-            let _ = app_tx.send(AppPacket {
-                opcode: OP_UI_LOCAL_ECHO,
-                payload: build_ui_local_echo(kind, text),
-            });
-        };
-
         let hail_req = self.hail.lock().unwrap().take();
         if let Some((name, spawn_id)) = hail_req {
             // A hail starts a FRESH interaction — drop any saylink choices left over from a prior
@@ -1673,8 +1647,6 @@ impl Navigator {
                 gs.target_id = Some(id);
                 if let Some(e) = gs.entities.get(&id) { gs.target_name = Some(e.name.clone()); }
                 stream.send_app_packet(OP_TARGET_MOUSE, &build_target_packet(id));
-                // Mirror the client-initiated target into the render GameState (HUD/HTTP). (#9)
-                let _ = app_tx.send(AppPacket { opcode: OP_TARGET_MOUSE, payload: build_target_packet(id) });
             }
             let msg = format!("Hail, {}", name);
             let pkt = build_say_packet(&gs.player_name, &name, &msg);
@@ -1682,7 +1654,6 @@ impl Navigator {
             stream.send_app_packet(OP_CHANNEL_MESSAGE, &pkt);
             let line = format!("You say, '{}'", msg);
             gs.log_msg("chat", &line);
-            echo("chat", &line);
         }
 
         // Check say request — arbitrary Say text (HUD say box / quest keyword follow-up).
@@ -1699,7 +1670,6 @@ impl Navigator {
                 stream.send_app_packet(OP_CHANNEL_MESSAGE, &pkt);
                 let line = format!("You say, '{}'", text);
                 gs.log_msg("chat", &line);
-                echo("chat", &line);
             }
         }
 
@@ -1713,7 +1683,6 @@ impl Navigator {
             stream.send_app_packet(OP_ITEM_LINK_CLICK, &pkt);
             let line = format!("You say, '{}'", c.text);
             gs.log_msg("chat", &line);
-            echo("chat", &line);
         }
 
         // Drain queued outgoing chat (POST /tell|/ooc|/shout|/group): build + send OP_ChannelMessage.
@@ -1739,22 +1708,27 @@ impl Navigator {
                 _ => ("chat",  format!("You {}: {}", label, c.text)),
             };
             gs.log_msg(kind, &line);
-            echo(kind, &line);
         }
 
         // Check target request — set target + auto-consider it (con color comes back as
-        // an OP_CONSIDER reply, handled in packet_handler).
+        // an OP_CONSIDER reply, handled in packet_handler). Also seed target_name/target_hp_pct
+        // here (name/HP.update_hp*/update_hp_pct then keep target_hp_pct live as combat HP updates
+        // arrive — see GameState::update_hp/update_hp_pct). The player is never present in
+        // `entities` (register_spawn special-cases and returns early for the self-spawn), so a
+        // self-target (F1) must resolve name/HP from the player fields directly instead — mirrors
+        // the entity-name idiom used for combat-log lines in packet_handler.rs. (eqoxide#9, #291)
         let target_id = self.target.lock().unwrap().take();
         if let Some(id) = target_id {
             gs.target_id = Some(id);
-            if let Some(e) = gs.entities.get(&id) {
-                gs.target_name = Some(e.name.clone());
+            if id == gs.player_id {
+                gs.target_name   = Some(gs.player_name.clone());
+                gs.target_hp_pct = Some(gs.hp_pct);
+            } else if let Some(e) = gs.entities.get(&id) {
+                gs.target_name   = Some(e.name.clone());
+                gs.target_hp_pct = Some(e.hp_pct);
             }
             stream.send_app_packet(OP_TARGET_MOUSE, &build_target_packet(id));
             stream.send_app_packet(OP_CONSIDER, &build_consider_packet(gs.player_id, id));
-            // Mirror the target into the RENDER GameState (HUD/HTTP) via a synthetic app packet —
-            // this is a client-initiated change, so it won't otherwise reach the render side. (#9)
-            let _ = app_tx.send(AppPacket { opcode: OP_TARGET_MOUSE, payload: build_target_packet(id) });
             tracing::info!("EQ: target spawn_id={} + consider", id);
         }
 
@@ -1787,10 +1761,6 @@ impl Navigator {
             let payload = [if on { 1u8 } else { 0u8 }, 0, 0, 0];
             stream.send_app_packet(OP_AUTO_ATTACK, &payload);
             gs.auto_attack = on;
-            // Mirror the toggle into the RENDER GameState (apply_auto_attack): the toggle is
-            // client-initiated, so without this scene.auto_attack stays false forever and the
-            // Actions/Target windows' Attack button can never show ON (or turn it off). (#2)
-            let _ = app_tx.send(AppPacket { opcode: OP_AUTO_ATTACK, payload: payload.to_vec() });
             tracing::info!("EQ: auto-attack {}", if on { "ON" } else { "OFF" });
         }
 
@@ -1966,11 +1936,6 @@ impl Navigator {
             let payload = build_spawn_appearance_packet(gs.player_id as u16, 14, param);
             stream.send_app_packet(OP_SPAWN_APPEARANCE, &payload);
             gs.sitting = sit;
-            // Bridge to the RENDER GameState so the player's OWN sit animation plays. A client-
-            // initiated sit sets only the nav-thread `gs.sitting`; the render loop reads its separate
-            // GameState, updated solely from `app_tx`. Mirror the appearance through a synthetic
-            // packet (apply_spawn_appearance), same pattern as the target/money bridges. (#53)
-            let _ = app_tx.send(AppPacket { opcode: OP_SPAWN_APPEARANCE, payload });
             tracing::info!("EQ: {}", if sit { "sit" } else { "stand" });
         }
 
@@ -2000,18 +1965,11 @@ impl Navigator {
             // Deduct the cost from on-hand coin for the HUD: the server takes the money with
             // update_client=false (Handle_OP_ShopPlayerBuy → TakeMoneyFromPP) and sends no
             // OP_MoneyUpdate, so the displayed coin would otherwise stay stale after a purchase.
-            // spend_coin here only updates *this* (network-thread) GameState; the HUD / HTTP coin
-            // is published from the render thread's separate GameState, which is fed solely by
-            // packets through app_tx. So after deducting, synthesize an OP_MoneyUpdate carrying the
-            // new total and route it through app_tx — apply_money_update applies it on the render
-            // copy, keeping the HUD in sync (mirrors how real money packets reach both copies).
+            // spend_coin updates gs.coin directly here, which the network thread publishes every
+            // tick, so the HUD/HTTP coin stays in sync without needing a synthetic echo.
             let price = gs.merchant_items.iter().find(|m| m.merchant_slot == slot).map(|m| m.price);
             if let Some(p) = price {
-                if gs.spend_coin(p as u64) {
-                    let mut money = Vec::with_capacity(16);
-                    for v in gs.coin { money.extend_from_slice(&(v as i32).to_le_bytes()); }
-                    let _ = app_tx.send(AppPacket { opcode: OP_MONEY_UPDATE, payload: money });
-                }
+                gs.spend_coin(p as u64);
             }
             tracing::info!("EQ: shop buy — merchant_id={} slot={} qty=1 cost={}", merchant_id, slot, price.unwrap_or(0));
             gs.log_msg("merchant", &format!("Bought item (slot {})", slot));
@@ -2075,13 +2033,6 @@ impl Navigator {
             // EQEmu applies the move silently (no echo), so mirror it into our snapshot or
             // /inventory goes stale and the next move corrupts it (phantom items).
             gs.move_item(from_slot as i32, to_slot as i32);
-            // Mirror the same move into the RENDER GameState via a synthetic app packet, or the
-            // render side keeps stale held-item models (scene.*_weapon_idfile) until the next
-            // OP_CharInventory (relog/zone). 8-byte payload: from(i32 LE) + to(i32 LE). (#141)
-            let mut mv = [0u8; 8];
-            mv[0..4].copy_from_slice(&(from_slot as i32).to_le_bytes());
-            mv[4..8].copy_from_slice(&(to_slot as i32).to_le_bytes());
-            let _ = app_tx.send(AppPacket { opcode: OP_MOVE_ITEM, payload: mv.to_vec() });
             tracing::info!("EQ: move item — from_slot={} to_slot={} qty=0(whole)", from_slot, to_slot);
             gs.log_msg("inventory", &format!("Moved item (slot {} -> {})", from_slot, to_slot));
         }
@@ -2283,7 +2234,6 @@ impl Navigator {
             let next_z = (gs.player_z - FALL_STEP).max(land_z);
             let hdg = gs.player_heading;
             self.send_position_update(stream, gs, gs.player_x, gs.player_y, next_z, hdg);
-            let _ = app_tx.send(make_position_packet(gs.player_id, gs.player_x, gs.player_y, next_z, hdg));
             gs.player_z = next_z;
             if next_z <= land_z + 0.5 {
                 let height = (self.fall_start_z - land_z).max(0.0);

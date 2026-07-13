@@ -11,8 +11,6 @@ use winit::{
 
 use glam::Vec4Swizzles as _;
 use crate::camera_state::{lerp3, lerp_angle, CameraCmd, CameraSnapshot, CameraState};
-use crate::eq_net::packet_handler::apply_packet;
-use crate::eq_net::transport::AppPacket;
 use crate::frame_capture::encode_frame_png;
 use crate::game_state::GameState;
 
@@ -159,7 +157,15 @@ pub struct App {
     pick_screen_w:  u32,
     pick_screen_h:  u32,
     // EQ state
-    game_state:   GameState,
+    /// The `ArcSwap` handle the network thread publishes into every gameplay tick.
+    game_state_snapshot: crate::http::GameStateSnapshot,
+    /// This frame's cached load of `game_state_snapshot`. Refreshed at the top of poll_external
+    /// and render_frame; reads between two refresh points may straddle two snapshots, which is
+    /// fine — each snapshot is internally consistent.
+    game_state_view: std::sync::Arc<GameState>,
+    /// Render-thread-owned door open/close easing state, keyed by `door_id`. `GameState::Door`
+    /// only carries the authoritative `is_open`; this map is what actually animates the swing.
+    door_frac: std::collections::HashMap<u8, f32>,
     /// Offline testzone mode — bypasses EQ server entirely.
     #[allow(dead_code)]
     testzone_mode: bool,
@@ -168,11 +174,13 @@ pub struct App {
     /// — instead of a background thread calling `process::exit()` and racing that teardown (SIGSEGV).
     shutdown:     std::sync::Arc<std::sync::atomic::AtomicBool>,
     scene:        SceneState,
-    app_rx:       tokio::sync::mpsc::UnboundedReceiver<AppPacket>,
     /// When an inbound server packet was last applied. Feeds the connection-health signal
     /// (`connected`/`last_packet_age_ms`) so a dead/frozen server is distinguishable from an idle
     /// one instead of the world silently freezing (eqoxide#8).
     last_inbound: std::time::Instant,
+    /// The network thread's live "time of last real inbound packet" handle — polled once per
+    /// `poll_external` and compared against `last_inbound` to detect a fresh arrival.
+    last_inbound_shared: crate::http::LastInboundShared,
     // Frame capture for /frame API
     frame_req:    FrameReq,
     // Live player state for the /debug endpoint.
@@ -234,7 +242,8 @@ impl App {
         character_name:  String,
         camera_cmd:      Arc<Mutex<Option<CameraCmd>>>,
         camera_snapshot: Arc<Mutex<CameraSnapshot>>,
-        app_rx:          tokio::sync::mpsc::UnboundedReceiver<AppPacket>,
+        game_state_snapshot: crate::http::GameStateSnapshot,
+        last_inbound_shared: crate::http::LastInboundShared,
         frame_req:       FrameReq,
         goto_target:     crate::http::GotoTarget,
         acts:            crate::ui::Actions,
@@ -258,14 +267,19 @@ impl App {
         let ui_state = crate::ui::UiState::new(&character_name, eq_ui_dir);
         // Distinct per-client window title (#297): "{account} {character} - EQOxide".
         let window_title = format!("{} {} - EQOxide", asset_user, character_name);
-        let mut game_state = GameState::new();
-        game_state.player_name = character_name;
-
         if testzone_mode {
-            game_state.zone_name = "testzone".to_string();
-            game_state.zone_changed = true;
+            // No network thread runs in --testzone mode (it's skipped entirely in main.rs), so
+            // nothing else will ever publish into `game_state_snapshot` — it would otherwise sit
+            // on the initial `GameState::new()` default forever. Seed it here so `game_state_view`
+            // (what the scene build reads) sees the debug-zone bootstrap.
+            let mut gs = GameState::new();
+            gs.player_name = character_name.clone();
+            gs.zone_name = "testzone".to_string();
+            gs.zone_changed = true;
+            game_state_snapshot.store(std::sync::Arc::new(gs));
             tracing::info!("APP: --testzone mode, will load debug zone");
         }
+        let game_state_view = game_state_snapshot.load_full();
 
         App {
             window: None, gpu: None, egui_ctx: None, egui_state: None, egui_renderer: None,
@@ -304,7 +318,7 @@ impl App {
             pick_cam_eye: [0.0; 3],
             pick_screen_w: 800,
             pick_screen_h: 600,
-            game_state, scene: SceneState::default(), app_rx, last_inbound: std::time::Instant::now(), frame_req,
+            scene: SceneState::default(), last_inbound: std::time::Instant::now(), frame_req,
             player_info, shutdown, collision: None, shared_collision,
             last_grounded_z: 0.0,
             prev_render_pos: [0.0, 0.0, 0.0],
@@ -324,6 +338,8 @@ impl App {
             models_loaded: false,
             asset_server_url, asset_user, asset_pass,
             window_title,
+            game_state_snapshot, game_state_view, last_inbound_shared,
+            door_frac: std::collections::HashMap::new(),
         }
     }
 
@@ -390,7 +406,7 @@ impl App {
         let mut best_t = f32::MAX;
         let mut best: Option<PickResult> = None;
 
-        for (&id, e) in &self.game_state.entities {
+        for (&id, e) in &self.game_state_view.entities {
             if e.dead { continue; }
             // Lift sphere center to entity mid-body height. Entity (x=east, y=north).
             let center = glam::Vec3::new(e.x, e.y, e.z + SPHERE_R * 0.75);
@@ -413,7 +429,7 @@ impl App {
         // T(pos) * Rz(yaw) * S(size/100). Incline is ignored for picking (negligible).
         let door_bounds = self.gpu.as_ref().map(|(_, r)| &r.door_bounds);
         const DEFAULT_DOOR_AABB: ([f32; 3], [f32; 3]) = ([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]);
-        for d in self.game_state.doors.values() {
+        for d in self.game_state_view.doors.values() {
             let (bmin, bmax) = door_bounds
                 .and_then(|b| b.get(&d.name.to_uppercase()))
                 .copied()
@@ -729,12 +745,28 @@ impl App {
     /// render must service (frame capture / camera).
     fn poll_external(&mut self) -> bool {
         let mut activity = false;
-
-        // Drain all queued packets; any packet may move/spawn an entity, so treat as activity.
-        while let Ok(packet) = self.app_rx.try_recv() {
-            apply_packet(&mut self.game_state, &packet);
-            self.last_inbound = std::time::Instant::now(); // connection-health heartbeat (#8)
+        // `publish_snapshot` (eq_net::gameplay) only stores a new Arc into `game_state_snapshot`
+        // when the freshly-mutated `GameState` actually differs (PartialEq) from what's already
+        // published, so the Arc's pointer identity is now a COMPLETE activity signal: it covers
+        // both a real inbound packet (apply_packet) and a client-initiated mutation that produced
+        // no packet at all (e.g. Navigator::tick handling POST /v1/interact/sit, or the auto-loot
+        // session-close timer). A genuinely idle world republishes the same Arc, so this correctly
+        // lets the render loop sleep.
+        let new_view = self.game_state_snapshot.load_full();
+        if !std::sync::Arc::ptr_eq(&new_view, &self.game_state_view) {
             activity = true;
+        }
+        self.game_state_view = new_view;
+
+        // Connection health (`connected` / CONN_STALE_SECS / the "connection lost" banner) stays
+        // strictly packet-based — it must NOT be driven by the activity signal above, which now
+        // also fires for packet-less client-initiated changes. `last_inbound_shared` is bumped only
+        // where a real inbound packet is applied (gameplay.rs's drain loop, login.rs, and the
+        // zone/world reconnect handshakes), so mirror it here purely for the elapsed-time checks
+        // further down — it does not gate `activity`.
+        let new_inbound = *self.last_inbound_shared.lock().unwrap();
+        if new_inbound != self.last_inbound {
+            self.last_inbound = new_inbound;
         }
 
         // Still loading a zone, or a reload is queued → keep rendering the progress screen.
@@ -758,15 +790,17 @@ impl App {
         }
 
         // Doors still easing toward their open/closed target.
-        if self.game_state.doors.values()
-            .any(|d| (d.open_frac - if d.is_open { 1.0 } else { 0.0 }).abs() > 0.001)
-        {
+        if self.game_state_view.doors.iter().any(|(id, d)| {
+            let target = if d.is_open { 1.0 } else { 0.0 };
+            let frac = self.door_frac.get(id).copied().unwrap_or(target);
+            (frac - target).abs() > 0.001
+        }) {
             activity = true;
         }
 
         // Visual position still gliding toward the logical (server-authoritative) position.
-        let dx = self.game_state.player_x - self.visual_player_pos[0];
-        let dy = self.game_state.player_y - self.visual_player_pos[1];
+        let dx = self.game_state_view.player_x - self.visual_player_pos[0];
+        let dy = self.game_state_view.player_y - self.visual_player_pos[1];
         if dx * dx + dy * dy > 0.01 { activity = true; }
 
         // Heading still smoothing toward its target.
@@ -786,6 +820,7 @@ impl App {
     }
 
     fn render_frame(&mut self) {
+        self.game_state_view = self.game_state_snapshot.load_full();
         // Compute dt at the very top so it's available for animation before SceneState is built.
         let now = std::time::Instant::now();
         let dt  = (now - self.last_frame_time).as_secs_f32().min(0.1);
@@ -801,23 +836,24 @@ impl App {
         // network keeps flowing even on idle frames that don't render. `game_state` is already current
         // here.
 
-        // Ease each door's render fraction toward its server-authoritative open/close target.
-        {
-            let step = (dt / 0.5).min(1.0); // ~0.5s full travel
-            for d in self.game_state.doors.values_mut() {
-                let target = if d.is_open { 1.0_f32 } else { 0.0_f32 };
-                d.open_frac += (target - d.open_frac) * step;
-                if (d.open_frac - target).abs() < 0.001 { d.open_frac = target; }
-            }
+        // Ease each door's render-only open fraction toward its server-authoritative open/close
+        // target. Lives on App (not GameState) — see `ease_door_frac`. New doors seed at their
+        // current state (a door that spawns open renders open immediately, matching the old
+        // spawn-time open_frac init) — only subsequent state *changes* animate.
+        for (&id, d) in self.game_state_view.doors.iter() {
+            let entry = self.door_frac.entry(id)
+                .or_insert_with(|| if d.is_open { 1.0 } else { 0.0 });
+            *entry = ease_door_frac(*entry, d.is_open, dt, DOOR_TRAVEL_SECS);
         }
+        self.door_frac.retain(|id, _| self.game_state_view.doors.contains_key(id));
 
         let prof_scene = crate::profiling::Stopwatch::start();
-        self.scene = SceneState::from_game_state(&self.game_state);
+        self.scene = SceneState::from_game_state(&self.game_state_view, &self.door_frac);
         let dur_scene = prof_scene.elapsed();
 
         // Update shared player state for the /debug HTTP endpoint.
         {
-            let gs = &self.game_state;
+            let gs = &*self.game_state_view;
             let pos = if self.camera_initialized { self.controller.pos } else { [gs.player_x, gs.player_y, gs.player_z] };
             let h_cw = crate::eq_net::protocol::ccw_to_cw(gs.player_heading);
             *self.player_info.lock().unwrap() = crate::http::PlayerState {
@@ -874,7 +910,7 @@ impl App {
                 // Previous frame's smoothed phase timings (this frame's aren't known yet).
                 frame_profile:      self.frame_profile,
                 // Most recently read book/note text (OP_ReadBook reply), for GET /v1/observe/item_text (#288).
-                book_text:          self.game_state.last_book_text.clone(),
+                book_text:          gs.last_book_text.clone(),
             };
         }
         // Mirror the health state into the scene so the HUD can show a "connection lost" banner (#8).
@@ -903,7 +939,7 @@ impl App {
         // Nav steps fire every 150 ms; we latch "moving" for 250 ms so the
         // walking animation runs continuously between steps rather than flickering.
         {
-            let lp = [self.game_state.player_x, self.game_state.player_y, self.game_state.player_z];
+            let lp = [self.game_state_view.player_x, self.game_state_view.player_y, self.game_state_view.player_z];
             let dx = lp[0] - self.prev_logical_pos[0];
             let dy = lp[1] - self.prev_logical_pos[1];
             let dz = lp[2] - self.prev_logical_pos[2];
@@ -925,13 +961,13 @@ impl App {
             // Priority: dead > combat swing > walking > sitting > idle. Combat and
             // movement override sitting (classic EQ stands you up when you attack or
             // move); sitting only replaces the plain idle clip. (eqoxide#53)
-            let pid = self.game_state.player_id;
-            let player_dead = self.game_state.cur_hp <= 0 && self.game_state.max_hp > 0;
-            let swinging = self.game_state.combat_anims.get(&pid)
+            let pid = self.game_state_view.player_id;
+            let player_dead = self.game_state_view.cur_hp <= 0 && self.game_state_view.max_hp > 0;
+            let swinging = self.game_state_view.combat_anims.get(&pid)
                 .map_or(false, |(_, t)| t.elapsed() < crate::scene::COMBAT_SWING_WINDOW);
             self.scene.player_action = if player_dead {
                 "dead".to_string()
-            } else if let Some((code, _)) = self.game_state.combat_anims.get(&pid).filter(|_| swinging) {
+            } else if let Some((code, _)) = self.game_state_view.combat_anims.get(&pid).filter(|_| swinging) {
                 format!("C{:02}", code)
             } else if self.controller.in_water {
                 // In water we always swim, never stand: the forward stroke (P06 "swim") while moving,
@@ -941,7 +977,7 @@ impl App {
                 if self.last_moved_at.elapsed().as_millis() < 250 { "swimming".to_string() } else { "treading".to_string() }
             } else if self.last_moved_at.elapsed().as_millis() < 250 {
                 "walking".to_string()
-            } else if self.game_state.sitting {
+            } else if self.game_state_view.sitting {
                 "sitting".to_string()
             } else {
                 "idle".to_string()
@@ -954,7 +990,7 @@ impl App {
         let should_init_cam = if self.scene.zone == "testzone" {
             !self.camera_initialized && self.gpu.is_some() && !self.loading
         } else {
-            !self.camera_initialized && self.game_state.player_id != 0
+            !self.camera_initialized && self.game_state_view.player_id != 0
         };
         if should_init_cam {
             self.visual_player_pos = self.scene.player_pos;
@@ -993,6 +1029,13 @@ impl App {
             // The new zone's floor may sit above the zone-point spawn z; settle onto it once
             // collision loads (see the reground block in the vertical-physics section below).
             self.needs_reground = true;
+            // Door ids are per-zone u8s that collide across zones (e.g. door_id=3 in zone A and
+            // door_id=3 in zone B are unrelated doors). Without this clear, `door_frac`'s
+            // entry-or-insert-with-current-state seeding (render_frame, below) never fires for a
+            // colliding id, so the new zone's door inherits the PREVIOUS zone's easing fraction —
+            // a door left open in zone A would render open on arrival in zone B and visibly swing
+            // shut (or vice versa).
+            self.door_frac.clear();
         }
 
         // Zone-transition fade (#286): drive `fade` toward black while a zone (re)load is committing
@@ -1181,7 +1224,7 @@ impl App {
                 if let Some(c) = self.collision.as_deref() {
                     // Keep the fall-through guard's threshold current with the zone's underworld
                     // floor (from OP_NewZone), so a collision gap can't drop us below it (#150).
-                    self.controller.set_underworld(self.game_state.zone_underworld);
+                    self.controller.set_underworld(self.game_state_view.zone_underworld);
                     self.controller.step(intent, dt, c);
                 }
             }
@@ -1191,10 +1234,6 @@ impl App {
             self.visual_player_pos = cpos;
             self.scene.player_pos  = cpos;
             self.camera.focus      = cpos;
-            // Mirror into the render GameState so HUD/picking/distance see the live position.
-            self.game_state.player_x = cpos[0];
-            self.game_state.player_y = cpos[1];
-            self.game_state.player_z = cpos[2];
             if self.on_ground { self.last_grounded_z = cpos[2]; }
 
             // Heading for nav-driven movement: face the planner's wish_dir (the render gs heading is
@@ -1338,7 +1377,7 @@ impl App {
             self.current_fps, self.zone_map.as_ref(),
             cam_eye, self.collision.as_deref(),
             &self.acts, &self.spells,
-            self.show_debug, self.game_state.server_corrections,
+            self.show_debug, self.game_state_view.server_corrections,
             &self.frame_profile,
             self.nav_debug,
             self.goto_target.lock().unwrap().map(|(x, y, z)| [x, y, z]),
@@ -1717,19 +1756,16 @@ impl ApplicationHandler for App {
                             if dx * dx + dy * dy < 25.0 {
                                 match self.pick_at(self.last_cursor) {
                                     Some(PickResult::Entity(id)) => {
-                                        self.game_state.target_id   = Some(id);
-                                        self.game_state.target_con  = None;
-                                        if let Some(e) = self.game_state.entities.get(&id) {
-                                            self.game_state.target_name   = Some(e.name.clone());
-                                            self.game_state.target_hp_pct = Some(e.hp_pct);
-                                        }
+                                        // Navigator::tick (network thread) already polls this same
+                                        // slot, sets the real target state, and it flows back via the
+                                        // next GameState snapshot — no local echo needed.
                                         *self.acts.target.lock().unwrap() = Some(id);
                                     }
                                     Some(PickResult::Door(door_id)) => {
-                                        // Server-authoritative: only request the open; never set is_open locally.
+                                        // Server-authoritative: only request the open; never set is_open
+                                        // locally. Navigator::tick (network thread) already logs
+                                        // "Clicked door {id}" when it polls this same slot.
                                         *self.door_click.lock().unwrap() = Some(door_id);
-                                        self.game_state.log_msg("door",
-                                            &format!("Clicked door {}", door_id));
                                     }
                                     None => {}
                                 }
@@ -1778,17 +1814,14 @@ impl ApplicationHandler for App {
                                     *self.goto_target.lock().unwrap() = None;
                                 }
                                 // Self-target (native EQ F1): target your own character (#291).
-                                // Mirrors the click-to-target path — sets the render target AND the
-                                // acts.target handle so the nav thread sends OP_TargetMouse for self,
+                                // Mirrors the click-to-target path — just sets the acts.target handle;
+                                // Navigator::tick (network thread) does the real work (OP_TargetMouse +
+                                // OP_Consider) and the result flows back via the next GameState snapshot,
                                 // enabling self-heals/buffs, consider-on-self, and (server permitting)
                                 // GM #kill/#damage on yourself.
                                 KeyCode::F1 if !event.repeat => {
-                                    let me = self.game_state.player_id;
+                                    let me = self.game_state_view.player_id;
                                     if me != 0 {
-                                        self.game_state.target_id     = Some(me);
-                                        self.game_state.target_con    = None;
-                                        self.game_state.target_name   = Some(self.game_state.player_name.clone());
-                                        self.game_state.target_hp_pct = Some(self.game_state.hp_pct);
                                         *self.acts.target.lock().unwrap() = Some(me);
                                     }
                                 }
@@ -2236,5 +2269,44 @@ mod tests {
         // No zone yet / transient reset: don't try to fetch `<empty>.glb` over a loaded zone.
         assert!(!zone_needs_reload("", ""));
         assert!(!zone_needs_reload("", "arena"));
+    }
+}
+
+/// Seconds for a door to fully swing/slide from closed to open (or back).
+const DOOR_TRAVEL_SECS: f32 = 0.5;
+
+/// One easing step for a door's render-only open fraction, moving `current` toward the target
+/// implied by `is_open` proportionally (an exponential ease with time-constant governed by
+/// `full_travel_secs`), matching the old in-`GameState` tween exactly. Snaps exactly to the
+/// target once within 0.001 of it.
+fn ease_door_frac(current: f32, is_open: bool, dt: f32, full_travel_secs: f32) -> f32 {
+    let target = if is_open { 1.0_f32 } else { 0.0_f32 };
+    let step = (dt / full_travel_secs).min(1.0);
+    let next = current + (target - current) * step;
+    if (next - target).abs() < 0.001 { target } else { next }
+}
+
+#[cfg(test)]
+mod door_frac_tests {
+    use super::*;
+
+    #[test]
+    fn eases_toward_open_target_and_snaps_on_arrival() {
+        let frac = ease_door_frac(0.0, true, 0.25, 0.5);
+        assert!((frac - 0.5).abs() < 1e-6);
+        let frac = ease_door_frac(frac, true, 0.5, 0.5); // a full extra travel-window's worth of dt
+        assert_eq!(frac, 1.0);
+    }
+
+    #[test]
+    fn eases_toward_closed_target() {
+        let frac = ease_door_frac(1.0, false, 0.25, 0.5);
+        assert!((frac - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dt_larger_than_full_travel_snaps_immediately() {
+        let frac = ease_door_frac(0.0, true, 10.0, 0.5);
+        assert_eq!(frac, 1.0);
     }
 }

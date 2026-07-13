@@ -158,8 +158,6 @@ OPTIONS:
         camera_state::CameraState::new([0.0, 0.0, 0.0], 0.0).snapshot(),
     ));
 
-    let (app_tx, app_rx) = tokio::sync::mpsc::unbounded_channel::<eq_net::AppPacket>();
-
     // Shared clean-shutdown flag. Set by window-close, a completed camp, and signals; observed by
     // the EQ network thread, which performs the logout sequence and exits the process.
     let shutdown: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
@@ -245,6 +243,15 @@ OPTIONS:
     let shared_collision: assets::SharedCollision = Arc::new(std::sync::RwLock::new(None));
     let frame_req:        http::FrameReq        = Arc::new(Mutex::new(None));
     let player_info:      http::PlayerInfo      = Arc::new(Mutex::new(http::PlayerState::default()));
+    // Single-owner GameState snapshot (see
+    // docs/superpowers/plans/2026-07-12-gamestate-single-owner-snapshot.md). The network thread is
+    // the sole writer of GameState; it publishes here every tick. `last_inbound` is a separate,
+    // smaller signal: the wall-clock time of the last REAL inbound packet, used for connection
+    // health (a hung network thread stops updating it even though nothing else changes).
+    let game_state_snapshot: http::GameStateSnapshot =
+        Arc::new(arc_swap::ArcSwap::from_pointee(eqoxide::game_state::GameState::new()));
+    let last_inbound_shared: http::LastInboundShared =
+        Arc::new(Mutex::new(std::time::Instant::now()));
     // Single-authority movement (Component A): the render thread owns the CharacterController and
     // publishes `controller_view`; the nav thread streams it and writes `nav_intent` for /goto;
     // `pos_correction` hands a server correction back to the controller.
@@ -329,11 +336,13 @@ OPTIONS:
         let rb  = read_book.clone();
         let gld = guild.clone();
         let gla = guild_action.clone();
+        let gss = game_state_snapshot.clone();
+        let lis = last_inbound_shared.clone();
         let md  = data_dir.join("maps");
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, nst, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, wr, fl, fq, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, pcm, sc, md, sd, cp, cu, rsp, cv, ni, pc, npv, nav, rb, gld, gla).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, 10, gt, nst, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, wr, fl, fq, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, pcm, sc, md, sd, cp, cu, rsp, cv, ni, pc, npv, nav, rb, gld, gla, gss, lis).await {
                     tracing::error!("EQ: fatal: {e}");
                 }
             });
@@ -465,7 +474,8 @@ OPTIONS:
         character_name,
         camera_cmd,
         camera_snapshot,
-        app_rx,
+        game_state_snapshot.clone(),
+        last_inbound_shared.clone(),
         frame_req,
         app_goto,
         app_actions,

@@ -5,11 +5,11 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{Duration, sleep};
 
 use crate::eq_net::login::WorldCredentials;
-use crate::eq_net::navigation::{Navigator, make_position_packet};
+use crate::eq_net::navigation::Navigator;
 use crate::eq_net::packet_handler::apply_packet;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
@@ -24,7 +24,6 @@ const RESPAWN_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 pub async fn run_gameplay_phase(
     stream_init:   EqStream,
     net_rx_init:   UnboundedReceiver<AppPacket>,
-    app_tx:        UnboundedSender<AppPacket>,
     mut gs:        GameState,
     char_name:     String,
     mut navigator: Navigator,
@@ -33,6 +32,8 @@ pub async fn run_gameplay_phase(
     camp:          crate::http::CampReq,
     camp_until:    crate::http::CampUntil,
     respawn:       crate::http::RespawnReq,
+    game_state_snapshot: crate::http::GameStateSnapshot,
+    last_inbound:        crate::http::LastInboundShared,
 ) {
     // Wrap in Option so Rust allows reassignment after zone transitions.
     let mut stream: Option<EqStream>                      = Some(stream_init);
@@ -102,6 +103,7 @@ pub async fn run_gameplay_phase(
         let mut world_reconnect_needed = false;
         while let Ok(packet) = rx.try_recv() {
             apply_packet(&mut gs, &packet);
+            *last_inbound.lock().unwrap() = std::time::Instant::now();
             navigator.sync_entities(&gs);
             navigator.sync_zone_points(&gs);
             navigator.sync_tasks(&gs);
@@ -121,7 +123,6 @@ pub async fn run_gameplay_phase(
                     navigator.fulfill_who(&gs);
                 }
             }
-            let _ = app_tx.send(packet.clone());
 
             match packet.opcode {
                 // Another player is asking to trade with us: the server forwards their
@@ -222,8 +223,6 @@ pub async fn run_gameplay_phase(
                         gs.player_y = y;
                         gs.player_z = z;
                         tracing::info!("EQ: same-zone teleport → pos=({:.1},{:.1},{:.1})", x, y, z);
-                        // Send position update so the server knows where we are.
-                        let _ = app_tx.send(make_position_packet(gs.player_id, x, y, z, gs.player_heading));
                     } else {
                         // Cross-zone transition (#zone <name>): send OP_ZONE_CHANGE to
                         // trigger the full zone-change protocol (world reconnect, etc.).
@@ -286,10 +285,6 @@ pub async fn run_gameplay_phase(
                     s.send_app_packet(OP_LOOT_REQUEST, &corpse_id.to_le_bytes());
                     gs.loot_session_active = true;
                     gs.loot_last_activity = Some(std::time::Instant::now());
-                    // Mirror the session start into the RENDER GameState (internal-only packet):
-                    // this loop drives looting on the NAV gs only, but the Loot window gates on
-                    // the render-side scene.loot_active (see apply_ui_loot_state).
-                    let _ = app_tx.send(AppPacket { opcode: OP_UI_LOOT_STATE, payload: vec![1] });
                     tracing::info!("EQ: auto-loot: sent OP_LootRequest for corpse_id={}", corpse_id);
                 }
                 if gs.pending_loot.is_empty() {
@@ -304,9 +299,6 @@ pub async fn run_gameplay_phase(
                     s.send_app_packet(OP_END_LOOT_REQUEST, &[]);
                     gs.loot_session_active = false;
                     gs.loot_last_activity = None;
-                    // Mirror the session end (payload 0 also clears the render side's undrained
-                    // pending_loot) so the Loot window actually closes. (bug #4)
-                    let _ = app_tx.send(AppPacket { opcode: OP_UI_LOOT_STATE, payload: vec![0] });
                     gs.log_msg("loot", "Looting complete");
                     tracing::info!("EQ: auto-loot: sent OP_EndLootRequest (session complete)");
                     // Reset queued_at so the next corpse gets its own delay window.
@@ -318,14 +310,14 @@ pub async fn run_gameplay_phase(
         if world_reconnect_needed {
             tracing::info!("EQ: zone change approved — reconnecting to world for zone handoff");
             let ok = reconnect_via_world(
-                &mut stream, &mut net_rx, &app_tx, &mut gs, &char_name, &world_creds,
+                &mut stream, &mut net_rx, &mut gs, &char_name, &world_creds, &last_inbound,
             ).await;
             if ok {
                 run_zone_entry_handshake(
                     stream.as_mut().unwrap(),
                     net_rx.as_mut().unwrap(),
-                    &app_tx,
                     &mut gs,
+                    &last_inbound,
                 ).await;
                 navigator.sync_zone_points(&gs);
                 last_keepalive = std::time::Instant::now();
@@ -356,8 +348,8 @@ pub async fn run_gameplay_phase(
                     run_zone_entry_handshake(
                         stream.as_mut().unwrap(),
                         net_rx.as_mut().unwrap(),
-                        &app_tx,
                         &mut gs,
+                        &last_inbound,
                     ).await;
                     navigator.sync_zone_points(&gs);
                     last_keepalive = std::time::Instant::now();
@@ -405,7 +397,9 @@ pub async fn run_gameplay_phase(
             *respawn.lock().unwrap() = false;
         }
 
-        navigator.tick(s, &mut gs, &app_tx);
+        navigator.tick(s, &mut gs);
+
+        publish_snapshot(&gs, &game_state_snapshot);
 
         sleep(Duration::from_millis(10)).await;
     }
@@ -439,13 +433,18 @@ async fn perform_clean_shutdown(
 
 /// After OP_ZONE_CHANGE success=1: reconnect to world, get OP_ZONE_SERVER_INFO, connect to new zone.
 /// On success, `stream` and `net_rx` are replaced with the new zone connection.
+///
+/// `last_inbound` is bumped as real inbound packets are drained here (the world-reconnect leg of a
+/// zone handoff), the same way the gameplay loop's drain does — this handoff can take multiple
+/// seconds and, with CONN_STALE_SECS=15, would otherwise falsely report the connection as lost
+/// while it's mid-transition.
 async fn reconnect_via_world(
-    stream:      &mut Option<EqStream>,
-    net_rx:      &mut Option<UnboundedReceiver<AppPacket>>,
-    app_tx:      &UnboundedSender<AppPacket>,
-    _gs:         &mut GameState,
-    char_name:   &str,
-    creds:       &WorldCredentials,
+    stream:       &mut Option<EqStream>,
+    net_rx:       &mut Option<UnboundedReceiver<AppPacket>>,
+    _gs:          &mut GameState,
+    char_name:    &str,
+    creds:        &WorldCredentials,
+    last_inbound: &crate::http::LastInboundShared,
 ) -> bool {
     drop(stream.take());
     drop(net_rx.take());
@@ -478,7 +477,7 @@ async fn reconnect_via_world(
         world_stream.poll_recv();
         world_stream.poll_resend(); // retransmit OP_SEND_LOGIN_INFO/ENTER_WORLD across the handoff (#254)
         while let Ok(packet) = world_rx.try_recv() {
-            let _ = app_tx.send(packet.clone());
+            *last_inbound.lock().unwrap() = std::time::Instant::now();
             match packet.opcode {
                 // In a fresh-login reconnect, world sends OP_SEND_CHAR_INFO as the trigger.
                 // In a zoning=1 reconnect, world sends OP_APPROVE_WORLD (RoF2: 0x7499) instead.
@@ -544,11 +543,15 @@ async fn reconnect_via_world(
 
 /// Handles the OP_NEW_ZONE → OP_WEATHER → OP_SEND_EXP_ZONE_IN handshake
 /// that completes after connecting to a new zone server.
+///
+/// `last_inbound` is bumped as real inbound packets are drained here, exactly like the gameplay
+/// loop's own drain (`run_gameplay_phase`) does — a slow zone-in (up to the 30s deadline below)
+/// must not falsely report the connection as lost while it's healthy and still zoning in.
 async fn run_zone_entry_handshake(
-    stream:  &mut EqStream,
-    net_rx:  &mut UnboundedReceiver<AppPacket>,
-    app_tx:  &UnboundedSender<AppPacket>,
-    gs:      &mut GameState,
+    stream:       &mut EqStream,
+    net_rx:       &mut UnboundedReceiver<AppPacket>,
+    gs:           &mut GameState,
+    last_inbound: &crate::http::LastInboundShared,
 ) {
     // Clear stale entities now so OP_ZONE_SPAWNS can repopulate them.
     // (OP_NEW_ZONE arrives AFTER OP_ZONE_SPAWNS in the Titanium server sequence, so
@@ -565,7 +568,7 @@ async fn run_zone_entry_handshake(
         stream.poll_resend(); // retransmit OP_ZONE_ENTRY/ReqClientSpawn during zone-in (#254)
         while let Ok(packet) = net_rx.try_recv() {
             apply_packet(gs, &packet);
-            let _ = app_tx.send(packet.clone());
+            *last_inbound.lock().unwrap() = std::time::Instant::now();
             match packet.opcode {
                 OP_NEW_ZONE if !done_new_zone => {
                     done_new_zone = true;
@@ -639,6 +642,21 @@ pub fn camp_expired(current: Option<std::time::Instant>, now: std::time::Instant
     matches!(current, Some(d) if now >= d)
 }
 
+/// Publish the network thread's `GameState` for lock-free reads by the render/HTTP threads. Called
+/// once per gameplay tick, after every mutation for that tick (packet-applied and `Navigator::tick`'s
+/// own writes) has landed — see the call site in `run_gameplay_phase`.
+///
+/// Store only on a real change so the published Arc's identity is a complete activity signal: the
+/// render thread wakes on ANY network-thread mutation (inbound packet OR client-initiated request
+/// handled by `Navigator::tick`), and a genuinely idle world lets the loop sleep (see
+/// `App::poll_external` in app.rs, which drives its wake decision off `Arc::ptr_eq` against this
+/// snapshot).
+pub fn publish_snapshot(gs: &GameState, snapshot: &crate::http::GameStateSnapshot) {
+    if **snapshot.load() != *gs {
+        snapshot.store(Arc::new(gs.clone()));
+    }
+}
+
 #[cfg(test)]
 mod camp_tests {
     use super::*;
@@ -696,5 +714,71 @@ mod camp_tests {
     #[test]
     fn idle_never_expires() {
         assert!(!camp_expired(None, Instant::now()));
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn publish_snapshot_reflects_latest_state_independent_of_later_mutation() {
+        let snapshot: crate::http::GameStateSnapshot =
+            Arc::new(arc_swap::ArcSwap::from_pointee(GameState::new()));
+
+        let mut gs = GameState::new();
+        gs.player_name = "Aldric".to_string();
+        publish_snapshot(&gs, &snapshot);
+        assert_eq!(snapshot.load().player_name, "Aldric");
+
+        // Mutating the source after publishing must not retroactively change the already-published
+        // snapshot — each publish is an independent, immutable clone.
+        gs.player_name = "Mutated".to_string();
+        assert_eq!(snapshot.load().player_name, "Aldric");
+
+        // A second publish replaces the snapshot wholesale.
+        publish_snapshot(&gs, &snapshot);
+        assert_eq!(snapshot.load().player_name, "Mutated");
+    }
+
+    /// Fix (single-owner GameState wake signal): a no-op publish (state genuinely unchanged since
+    /// the last publish) must NOT replace the Arc — the render loop's `poll_external` treats a new
+    /// Arc identity as "something happened" and would otherwise spuriously wake every tick even in
+    /// an idle world.
+    #[test]
+    fn publish_snapshot_keeps_same_arc_when_state_unchanged() {
+        let gs = GameState::new();
+        let snapshot: crate::http::GameStateSnapshot =
+            Arc::new(arc_swap::ArcSwap::from_pointee(gs.clone()));
+
+        publish_snapshot(&gs, &snapshot);
+        let before = snapshot.load_full();
+
+        // Same state, re-published (e.g. a quiet tick with no inbound packet and no client request).
+        publish_snapshot(&gs, &snapshot);
+        let after = snapshot.load_full();
+
+        assert!(Arc::ptr_eq(&before, &after), "unchanged state must not republish a new Arc");
+    }
+
+    /// Counterpart: a real mutation (standing in for either an inbound packet or a client-initiated
+    /// change made by `Navigator::tick`, e.g. `gs.sitting`) DOES publish a new Arc, and the new
+    /// snapshot reflects it.
+    #[test]
+    fn publish_snapshot_publishes_new_arc_when_state_changed() {
+        let mut gs = GameState::new();
+        let snapshot: crate::http::GameStateSnapshot =
+            Arc::new(arc_swap::ArcSwap::from_pointee(gs.clone()));
+
+        publish_snapshot(&gs, &snapshot);
+        let before = snapshot.load_full();
+
+        // Simulate a client-initiated mutation with no inbound packet (e.g. POST /v1/interact/sit).
+        gs.sitting = true;
+        publish_snapshot(&gs, &snapshot);
+        let after = snapshot.load_full();
+
+        assert!(!Arc::ptr_eq(&before, &after), "a real state change must publish a new Arc");
+        assert!(after.sitting, "the new snapshot must reflect the mutation");
     }
 }
