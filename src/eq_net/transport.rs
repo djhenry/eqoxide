@@ -387,7 +387,14 @@ impl EqStream {
                 tokio::time::Duration::from_millis(100),
                 stream.socket.recv(&mut recv_buf),
             ).await {
-                Ok(Ok(n)) => stream.on_raw_recv(&recv_buf[..n]),
+                Ok(Ok(n)) => {
+                    // The other socket read. Stamped for the same reason `poll_recv` is, and stamped
+                    // here rather than left as a benign exception: the invariant "whoever receives
+                    // the datagram owns the clock" is only load-bearing if it has NO exceptions —
+                    // an asterisk on it is how it rots back into #343 (review).
+                    stream.net_health.lock().unwrap().last_datagram = std::time::Instant::now();
+                    stream.on_raw_recv(&recv_buf[..n]);
+                }
                 Ok(Err(e)) => return Err(e.into()),
                 Err(_) => {} // recv timeout, keep waiting
             }
