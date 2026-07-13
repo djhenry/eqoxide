@@ -128,6 +128,14 @@ pub const FLAG_SWIM: u8  = 1 << 1;
 /// still find). Instead the surface survives and A* pays a penalty to use it, so a route keeps to
 /// the middle of a corridor when it can and still threads a 4u bridge when it must.
 pub const FLAG_EDGE: u8  = 1 << 2;
+/// Ground too steep to CLIMB, but which the controller can still slide/fall DOWN.
+///
+/// Deleting these outright (my first cut) made a steep face impassable in BOTH directions and cut
+/// whole regions off: it was the root cause of the crushbone/grobb parity misses, where the grid
+/// walked a 150u descent our mesh called unreachable. The controller can descend a steep slope (it
+/// slides, and gravity does the rest); it just cannot walk back up. So the surface stays, and the
+/// ASYMMETRY lives in the edge rules: you may descend onto it, never ascend to it.
+pub const FLAG_STEEP: u8 = 1 << 3;
 
 /// One walkable surface in a column: the height you stand (or float) at, plus what kind it is.
 #[derive(Clone, Copy, Debug)]
@@ -147,6 +155,7 @@ struct RawSpan {
     zmin:     f32,
     zmax:     f32,
     walkable: bool,
+    steep:    bool,
 }
 
 /// The baked navmesh: a sparse CSR of XY columns → sorted walkable surfaces.
@@ -164,20 +173,74 @@ pub struct NavMesh {
     /// Directed component→component edges contributed by one-way FALL links.
     comp_edges: Vec<Vec<u32>>,
     components: u32,
+    /// For each column, the index (into `keys`) of its 8 XY neighbours, or `u32::MAX` for none.
+    /// A* touches 8 neighbours per expanded node; without this each one cost a binary search over
+    /// hundreds of thousands of keys, which dominated the search on big outdoor zones.
+    nbr:        Vec<[u32; 8]>,
     /// blake3 of (source collision geometry + params) — the cache-invalidation key.
     pub digest: [u8; 32],
 }
 
-/// Can a character move BETWEEN these two surfaces in both directions? This is the honest
-/// definition — it is what the controller can actually do (`movement::STEP_UP`), so a drop bigger
-/// than a step is NOT traversable here; it is a one-way fall, handled separately.
-#[inline]
-fn traversable(a: Surface, b: Surface, max_climb: f32) -> bool {
-    (b.z - a.z).abs() <= max_climb
-}
-
 #[inline]
 fn ckey(c: i32, r: i32) -> u64 { ((c as u32 as u64) << 32) | (r as u32 as u64) }
+
+/// The SINGLE source of truth for what the controller can do between two surfaces.
+///
+/// A* and the connected-component labeller both go through this, so "reachable" and "routable" can
+/// never disagree — a mismatch there is how a planner ends up promising a route it will then refuse.
+/// Returns `None` if the move is impossible, else its cost. `bidir` reports whether the reverse move
+/// is also possible (the component labeller needs that; one-way moves become directed comp edges).
+///
+/// Every rule here maps to a real controller capability in `movement.rs`:
+///   * climb up  <= STEP_UP (2.0)         — the native step-up; there is no other ascent primitive.
+///   * step down <= STEP_UP               — ordinary walking.
+///   * fall down <= MAX_FALL              — one-way; costly, so A* takes the stairs when they exist.
+///   * DROP INTO WATER from any height    — water negates fall damage (the walker already knows this:
+///                                          `navigation.rs` skips its lethal-fall guard for a water
+///                                          landing). One-way: getting out needs a low lip.
+///   * haul OUT of water <= STEP_UP       — the controller's swim step-up.
+///   * swim across                        — level moves along the waterline.
+///   * DESCEND a steep face               — one-way; you slide down, you cannot climb back.
+fn edge(a: Surface, b: Surface, p: &BakeParams) -> Option<(f32, bool)> {
+    let rise = b.z - a.z;
+    let steep_b = b.flags & FLAG_STEEP != 0;
+    let steep_a = a.flags & FLAG_STEEP != 0;
+
+    match (a.is_swim(), b.is_swim()) {
+        // Swim across the surface of a body of water (#197p2 — the legacy model has no such node).
+        (true, true) => (rise.abs() <= p.max_climb).then_some((SWIM_COST, true)),
+        // Leaving the water: you can only haul out onto a LOW lip.
+        (true, false) => (rise <= p.max_climb && rise >= -p.max_climb)
+            .then_some((EXIT_WATER_COST, true)),
+        // Entering the water: you can step in, OR JUMP IN FROM ANY HEIGHT — water breaks the fall.
+        // Requiring a 2u lip here (my first cut) fenced whole lakes off as their own component and
+        // was the root cause of the halas parity misses.
+        (false, true) => {
+            if rise > p.max_climb { return None; }          // can't climb UP into a raised pool
+            let drop = -rise;
+            // A level-ish entry is symmetric (wade in / step out); a real plunge is one-way.
+            let bidir = drop <= p.max_climb;
+            Some((ENTER_WATER_COST + drop * 0.5, bidir))
+        }
+        (false, false) => {
+            // You can never CLIMB onto a steep face — but you MUST be able to step onto its BRINK,
+            // which is level with the ground above it. (Blocking rise > -0.01 made the top of every
+            // ramp unreachable, so nothing could ever start sliding down it.)
+            if steep_b && rise > BRINK_TOL { return None; }
+            // ...and you can't climb off a steep face upward either.
+            if steep_a && rise > p.max_climb { return None; }
+            if rise > p.max_climb { return None; }          // taller than the native step-up: a wall
+            if rise < -MAX_FALL { return None; }            // unsurvivable / unrecoverable
+            if rise >= -p.max_climb {
+                Some((rise.abs() * 0.5, true))              // ordinary walking, both ways
+            } else if steep_b || steep_a {
+                Some((-rise * 0.5 + STEEP_PENALTY, false))  // slide DOWN a slope: one-way
+            } else {
+                Some((-rise * 2.0 + FALL_PENALTY, false))   // a real drop: one-way, last resort
+            }
+        }
+    }
+}
 
 impl NavMesh {
     pub fn column_count(&self)  -> usize { self.keys.len() }
@@ -199,6 +262,23 @@ impl NavMesh {
     /// Every populated `(col, row)`, for diagnostics and the offline validation harness.
     pub fn populated_columns(&self) -> impl Iterator<Item = (i32, i32)> + '_ {
         self.keys.iter().map(|&k| ((k >> 32) as u32 as i32, (k & 0xffff_ffff) as u32 as i32))
+    }
+
+    /// Precompute each column's 8 neighbour column indices, so A* never binary-searches in its hot loop.
+    fn build_neighbours(&mut self) {
+        self.nbr = self.keys.iter().map(|&k| {
+            let (c, r) = ((k >> 32) as u32 as i32, (k & 0xffff_ffff) as u32 as i32);
+            let mut out = [u32::MAX; 8];
+            for (i, (dc, dr)) in DIRS.iter().enumerate() {
+                if let Ok(j) = self.keys.binary_search(&ckey(c + dc, r + dr)) { out[i] = j as u32; }
+            }
+            out
+        }).collect();
+    }
+
+    /// Component id + surface for a surface index (diagnostics).
+    pub fn surface_at(&self, si: usize) -> (u32, Surface) {
+        (self.comp[si], self.surfaces[si])
     }
 
     /// How many surfaces are swimmable waterlines (the #197p2 layer).
@@ -239,7 +319,7 @@ impl NavMesh {
 
         if tris.is_empty() {
             return NavMesh { params, origin: [0.0, 0.0], keys: vec![], offsets: vec![0],
-                             surfaces: vec![], comp: vec![], comp_edges: vec![], components: 0, digest };
+                             surfaces: vec![], comp: vec![], comp_edges: vec![], components: 0, nbr: vec![], digest };
         }
 
         // XY origin + extent (the extent picks the cell size — see BakeParams::for_extent).
@@ -285,6 +365,9 @@ impl NavMesh {
             // component, so A* on the floor never wanders onto it.
             let nz = (n[2] / nl).abs();
             let walkable = nz >= cos_max;
+            // Steep-but-not-vertical ground: too steep to climb, but you can slide DOWN it. Kept as
+            // a descend-only surface rather than deleted (see FLAG_STEEP).
+            let steep = !walkable && nz >= COS_STEEP;
 
             let (mut tmin_e, mut tmax_e) = (f32::MAX, f32::MIN);
             let (mut tmin_n, mut tmax_n) = (f32::MAX, f32::MIN);
@@ -306,13 +389,13 @@ impl NavMesh {
                                  [t[1][0], t[1][1], t[1][2]],
                                  [t[2][0], t[2][1], t[2][2]] ];
                     let Some((zmin, zmax)) = clip_z_range(&poly, x0, y0, x0 + cs, y0 + cs) else { continue };
-                    raw.push(RawSpan { key: ckey(c, r), zmin, zmax, walkable });
+                            raw.push(RawSpan { key: ckey(c, r), zmin, zmax, walkable, steep });
                 }
             }
         }
         if raw.is_empty() {
             return NavMesh { params, origin, keys: vec![], offsets: vec![0], surfaces: vec![],
-                             comp: vec![], comp_edges: vec![], components: 0, digest };
+                             comp: vec![], comp_edges: vec![], components: 0, nbr: vec![], digest };
         }
 
         // Group spans by column, merging overlapping solids (a floor made of many triangles is one
@@ -338,7 +421,11 @@ impl NavMesh {
                     // non-walkable one only if it is at (or above) the merged top — a walkable floor
                     // laid on a steep rock still walks.
                     Some(m) if s.zmin <= m.zmax + params.cell_height => {
-                        if s.zmax >= m.zmax { m.walkable = s.walkable; m.zmax = m.zmax.max(s.zmax); }
+                        if s.zmax >= m.zmax {
+                            m.walkable = s.walkable;
+                            m.steep = s.steep;
+                            m.zmax = m.zmax.max(s.zmax);
+                        }
                     }
                     _ => merged.push(s),
                 }
@@ -351,10 +438,13 @@ impl NavMesh {
             // surface, and A* cannot anchor to it no matter what z the caller reports.
             let start = surfaces.len();
             for (k, m) in merged.iter().enumerate() {
-                if !m.walkable { continue; }
+                if !m.walkable && !m.steep { continue; }
                 let ceil = merged.get(k + 1).map(|n| n.zmin).unwrap_or(f32::INFINITY);
                 if ceil - m.zmax < params.agent_height { continue; }
-                surfaces.push(Surface { z: m.zmax, flags: FLAG_WALK });
+                surfaces.push(Surface {
+                    z: m.zmax,
+                    flags: if m.walkable { FLAG_WALK } else { FLAG_STEEP },
+                });
             }
             if surfaces.len() > start {
                 keys.push(key);
@@ -364,8 +454,9 @@ impl NavMesh {
         }
 
         let mut mesh = NavMesh { params, origin, keys, offsets, surfaces,
-                                 comp: vec![], comp_edges: vec![], components: 0, digest };
+                                 comp: vec![], comp_edges: vec![], components: 0, nbr: vec![], digest };
         if let Some(w) = water { mesh.add_water_layer(w); }
+        mesh.build_neighbours();
         mesh.mark_edges();
         mesh.label_components();
         mesh.link_components();
@@ -387,8 +478,9 @@ impl NavMesh {
                     Err(_) => continue,
                 };
                 for (k, ns) in self.column(nc, nr).iter().enumerate() {
-                    let drop = s.z - ns.z;
-                    if drop > self.params.max_climb && drop <= MAX_FALL {
+                    // Any move that is POSSIBLE but not bidirectional (a fall, a plunge into water,
+                    // a slide down a steep face) is a DIRECTED link between components.
+                    if let Some((_, false)) = edge(s, *ns, &self.params) {
                         let (a, b) = (self.comp[si], self.comp[base + k]);
                         if a != b { edges[a as usize].insert(b); }
                     }
@@ -489,7 +581,7 @@ impl NavMesh {
                     for (k, ns) in self.column(nc, nr).iter().enumerate() {
                         let ni = base + k;
                         if self.comp[ni] != u32::MAX { continue; }
-                        if !traversable(s, *ns, self.params.max_climb) { continue; }
+                        if !matches!(edge(s, *ns, &self.params), Some((_, true))) { continue; }
                         found.push(ni);
                     }
                 }
@@ -587,7 +679,14 @@ impl NavMesh {
         }
         let (gc, gr, _) = self.locate(gidx);
         let cs = self.params.cell_size;
-        let h = |c: i32, r: i32| (((c - gc) as f32).powi(2) + ((r - gr) as f32).powi(2)).sqrt() * cs;
+        // Slightly WEIGHTED A* (h * 1.25). The graph is a fine grid, so an admissible heuristic
+        // expands a huge, nearly-circular frontier on open terrain. A mild weight focuses the search
+        // toward the goal for a bounded loss of optimality (<=25% longer in the worst case, in
+        // practice far less) and cut the worst-case whole-zone query from ~190ms to well under 100ms.
+        // The walker re-plans as it goes, so a marginally longer route costs nothing real; a 190ms
+        // stall on every path request would.
+        const H_WEIGHT: f32 = 1.25;
+        let h = |c: i32, r: i32| (((c - gc) as f32).powi(2) + ((r - gr) as f32).powi(2)).sqrt() * cs * H_WEIGHT;
 
         struct Node { f: f32, si: usize, c: i32, r: i32 }
         impl PartialEq for Node { fn eq(&self, o: &Self) -> bool { self.f == o.f } }
@@ -614,37 +713,23 @@ impl NavMesh {
             let s = self.surfaces[si];
             let g_cur = g[si];
 
-            for (dc, dr) in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)] {
+            let ci = match self.keys.binary_search(&ckey(c, r)) { Ok(i) => i, Err(_) => continue };
+            for (di, (dc, dr)) in DIRS.iter().enumerate() {
+                let nj = self.nbr[ci][di];
+                if nj == u32::MAX { continue; }
                 let (nc, nr) = (c + dc, r + dr);
-                let base = match self.keys.binary_search(&ckey(nc, nr)) {
-                    Ok(i) => self.offsets[i] as usize,
-                    Err(_) => continue,
-                };
+                let base = self.offsets[nj as usize] as usize;
+                let hi = self.offsets[nj as usize + 1] as usize;
                 let run = ((dc * dc + dr * dr) as f32).sqrt() * cs;
-                for (k, ns) in self.column(nc, nr).iter().enumerate() {
+                for (k, ns) in self.surfaces[base..hi].iter().enumerate() {
                     let ni = base + k;
                     if closed[ni] { continue; }
                     let rise = ns.z - s.z;
 
-                    // Edge admissibility, straight from the controller's real capabilities.
-                    let mut cost = if s.is_swim() && ns.is_swim() {
-                        // Swim across the surface — the #197p2 edge the legacy model cannot express.
-                        if rise.abs() > self.params.max_climb { continue; }
-                        run * 1.5
-                    } else if s.is_swim() != ns.is_swim() {
-                        // Enter/leave the water: only at a low lip (the controller's swim step-up).
-                        if rise.abs() > self.params.max_climb { continue; }
-                        run * 2.0
-                    } else if rise > self.params.max_climb {
-                        continue; // taller than the native STEP_UP: a wall, not a step.
-                    } else if rise < -MAX_FALL {
-                        continue; // lethal / unrecoverable drop.
-                    } else if rise < -self.params.max_climb {
-                        // A drop the walker must fall down. Costly: A* takes stairs when they exist.
-                        run + (-rise) * 2.0 + FALL_PENALTY
-                    } else {
-                        run + rise.abs() * 0.5
-                    };
+                    // Edge admissibility + cost: the SAME function the component labeller uses, so
+                    // A* can never refuse a move that reachability promised (or vice versa).
+                    let Some((mut cost, _)) = edge(s, *ns, &self.params) else { continue };
+                    cost += run;
                     // Prefer the middle of a corridor over its wall/ledge/waterline lip — but never
                     // refuse the lip, or a narrow bridge becomes unroutable (see `mark_edges`).
                     if ns.flags & FLAG_EDGE != 0 { cost += EDGE_PENALTY; }
@@ -756,6 +841,55 @@ impl NavMesh {
         best.map(|(_, i)| i)
     }
 
+    /// Load this zone's navmesh from the on-disk cache, or bake it and cache it.
+    ///
+    /// The cache is keyed on blake3(source GLB bytes + bake params). If EITHER changes — a re-baked
+    /// zone asset, or a retuned parameter — the stored digest will not match and we re-bake. There
+    /// is deliberately no "trust the filename/mtime" path: silently pathing on a mesh baked from
+    /// geometry the client is no longer rendering is exactly the class of lie this project exists to
+    /// eliminate, and it would be invisible in every test we have.
+    ///
+    /// Writes are atomic (tmp file + rename), so a crash or two clients racing can never leave a
+    /// half-written mesh that later loads as valid.
+    ///
+    /// This does real work (median ~1s, up to ~5s): call it OFF the render/network threads.
+    pub fn load_or_bake(cache_dir: &std::path::Path, zone: &str, glb: &std::path::Path,
+                        water: Option<&RegionMap>, params: BakeParams) -> anyhow::Result<NavMesh> {
+        let glb_bytes = std::fs::read(glb)?;
+        let path = cache_dir.join(format!("{zone}.nvm"));
+
+        if let Ok(blob) = std::fs::read(&path) {
+            match NavMesh::deserialize(&blob, &glb_bytes, params) {
+                Some(m) => {
+                    tracing::info!("navmesh: loaded {} from cache ({} surfaces)", zone, m.surface_count());
+                    return Ok(m);
+                }
+                // Not corruption — the source GLB or the bake params changed. Re-bake.
+                None => tracing::info!("navmesh: cached {zone} is stale (source or params changed) — re-baking"),
+            }
+        }
+
+        let t0 = std::time::Instant::now();
+        let assets = crate::assets::ZoneAssets::from_glb(glb)?;
+        let tris = collision_tris(&assets);
+        let mesh = NavMesh::bake(&tris, water, params, &glb_bytes);
+        tracing::info!("navmesh: baked {zone} in {}ms ({} columns, {} surfaces, {} components)",
+            t0.elapsed().as_millis(), mesh.column_count(), mesh.surface_count(), mesh.components);
+
+        std::fs::create_dir_all(cache_dir)?;
+        let tmp = cache_dir.join(format!(".{zone}.nvm.tmp"));
+        std::fs::write(&tmp, mesh.serialize())?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(mesh)
+    }
+
+    /// Is this mesh healthy enough to path on? A bake that produced almost nothing (a zone whose
+    /// collision mesh is missing — see #373 for nektulos/arena) must FALL BACK to the legacy grid and
+    /// say so, never silently path on a mesh that does not describe the world.
+    pub fn is_usable(&self) -> bool {
+        self.surface_count() >= 500 && self.column_count() >= 200
+    }
+
     // ───────────────────────────── cache ─────────────────────────────
 
     /// Serialize (deflate). Format: magic, version, digest, params, CSR.
@@ -820,16 +954,17 @@ impl NavMesh {
             surfaces.push(Surface { z: f32::from_le_bytes(v[b..b + 4].try_into().ok()?), flags: v[b + 4] });
         }
         let mut mesh = NavMesh { params, origin, keys, offsets, surfaces,
-                                 comp: vec![], comp_edges: vec![], components: 0, digest };
+                                 comp: vec![], comp_edges: vec![], components: 0, nbr: vec![], digest };
         // Components are derived, not stored: relabelling is a pure BFS over the surface graph
         // (no triangle work), so it is far cheaper than the bytes it would cost on disk.
+        mesh.build_neighbours();
         mesh.label_components();
         mesh.link_components();
         Some(mesh)
     }
 }
 
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 /// Max drop A* will plan (matches the legacy MAX_FALL).
 const MAX_FALL: f32 = 120.0;
 /// A fall is a last resort — take the stairs if they exist (matches the legacy FALL_PENALTY intent).
@@ -837,6 +972,18 @@ const FALL_PENALTY: f32 = 5_000.0;
 /// Cost of routing over a surface within `agent_radius` of a wall/ledge/waterline. Big enough to
 /// push a route to the middle of a corridor, small enough that a narrow bridge is still taken.
 const EDGE_PENALTY: f32 = 6.0;
+/// Slope steeper than `max_grade` but still descendable by sliding (up to ~72 deg).
+const COS_STEEP: f32 = 0.31;
+/// Swimming is slower than walking, so A* prefers a dry route when one exists.
+const SWIM_COST: f32 = 4.0;
+const ENTER_WATER_COST: f32 = 6.0;
+const EXIT_WATER_COST: f32 = 6.0;
+/// Sliding down a steep face works but is not something to do casually.
+const STEEP_PENALTY: f32 = 40.0;
+/// You may step onto the BRINK of a steep face (level with the ground above it), but not climb it.
+const BRINK_TOL: f32 = 0.5;
+/// The 8 XY neighbour directions, in the order `NavMesh::nbr` stores them.
+const DIRS: [(i32, i32); 8] = [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)];
 
 /// Clip a triangle to the cell square `[x0,x1] × [y0,y1]` and return the clipped polygon's z-range,
 /// or `None` if the triangle does not actually cover the cell. This is Recast's rasterizer: an
@@ -998,15 +1145,59 @@ mod tests {
     }
 
     #[test]
-    fn a_steep_face_is_not_walkable() {
-        // A 70° ramp (grade 2.75, well past MAX_WALK_GRADE 1.2) must produce no surface — the legacy
-        // grid only applies its grade cap on ASCENT (#313), so it happily plans DOWN such a face.
-        let tris = vec![
+    fn a_steep_face_can_be_slid_down_but_never_climbed() {
+        // A ~70deg ramp (grade 2.75, well past MAX_WALK_GRADE 1.2), with a flat pad at the bottom
+        // and at the top.
+        //
+        // My first cut DELETED steep faces outright. That made the slope impassable in BOTH
+        // directions and cut whole regions off the graph — it was the root cause of the
+        // crushbone/grobb parity misses, where the grid happily walked a 150u descent that our mesh
+        // called unreachable. The controller CAN get down a steep slope (it slides, gravity does the
+        // rest); it just cannot walk back up. So the asymmetry belongs in the edge rules, not in a
+        // deletion. (The legacy grid has the opposite bug: it caps grade on ASCENT only, #313.)
+        let mut tris = quad(0.0, -20.0, 0.0, 0.0, 40.0);      // bottom pad
+        tris.extend(vec![                                     // the steep face, e 0..10, z 0..27.5
             [[0.0, 0.0, 0.0], [10.0, 0.0, 27.5], [0.0, 40.0, 0.0]],
             [[10.0, 0.0, 27.5], [10.0, 40.0, 27.5], [0.0, 40.0, 0.0]],
-        ];
+        ]);
+        tris.extend(quad(27.5, 10.0, 40.0, 0.0, 40.0));       // top pad
         let mesh = NavMesh::bake(&tris, None, BakeParams::default(), b"t");
-        assert_eq!(mesh.surface_count(), 0, "a 70° face must yield no walkable surface");
+
+        // The face exists — as descend-only ground, not as a wall and not as a hole.
+        let (c, r) = mesh.to_cell(5.0, 20.0);
+        let face = mesh.column(c, r);
+        assert!(!face.is_empty(), "the steep face must still exist as a surface");
+        assert!(face.iter().all(|s| s.flags & FLAG_STEEP != 0), "it must be flagged steep: {face:?}");
+
+        // Down the slope: allowed (you slide).
+        assert!(mesh.find_path([30.0, 20.0, 27.5], [-10.0, 20.0, 0.0]).is_some(),
+            "must be able to descend a steep slope");
+        // Up the slope: refused (the controller has no ascent primitive that can do this).
+        assert!(mesh.find_path([-10.0, 20.0, 0.0], [30.0, 20.0, 27.5]).is_none(),
+            "must NOT be able to climb a ~70deg face — promising that route would be a lie");
+    }
+
+    #[test]
+    fn you_can_jump_into_water_from_a_height_but_must_haul_out_over_a_low_lip() {
+        // A pool whose shore is a 12u drop to the waterline: you can JUMP IN from the bank (water
+        // negates fall damage — the walker already knows this), but you cannot climb 12u back out.
+        //
+        // Requiring a 2u lip to ENTER the water (my first cut) fenced whole lakes off as their own
+        // connected component, so A* refused to swim at all. That was the root cause of the halas
+        // parity misses.
+        let mut tris = quad(12.0, -40.0, 0.0, 0.0, 60.0);   // bank, 12u above the waterline
+        tris.extend(quad(-40.0, 0.0, 60.0, 0.0, 60.0));     // pool bottom
+        tris.extend(quad(0.0, 60.0, 100.0, 0.0, 60.0));     // far shore, AT the waterline
+        let water = RegionMap::box_below(0.0, 60.0, 0.0, 60.0, 0.0);
+        let mesh = NavMesh::bake(&tris, Some(&water), BakeParams::default(), b"t");
+
+        // Bank -> far shore: must route (jump in, swim across, step out on the level far shore).
+        let p = mesh.find_path([-20.0, 30.0, 12.0], [80.0, 30.0, 0.0])
+            .expect("must be able to jump in and swim across");
+        assert!(p.iter().any(|w| w[2] > -10.0), "should cross at/near the surface, not the bottom");
+        // And it must NOT claim you can climb the 12u bank back out of the water.
+        let back = mesh.find_path([30.0, 30.0, 0.0], [-20.0, 30.0, 12.0]);
+        assert!(back.is_none(), "must not promise a 12u climb straight out of the water");
     }
 
     #[test]
@@ -1026,6 +1217,47 @@ mod tests {
         let path = mesh.find_path([10.0, 30.0, 0.0], [50.0, 30.0, 0.0]).expect("a swim route");
         let deepest = path.iter().map(|w| w[2]).fold(f32::MAX, f32::min);
         assert!(deepest > -10.0, "swimmer must stay near the surface, but dove to {deepest}");
+    }
+
+    #[test]
+    fn load_or_bake_rebakes_when_the_zone_asset_changes_on_disk() {
+        // The invalidation path, end to end on a real file. A cached mesh whose source GLB has been
+        // re-baked must NOT be reused: pathing on geometry the client no longer renders is a silent
+        // lie, and nothing else in the system would catch it.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("nav");
+        let glb = dir.path().join("z.glb");
+
+        // A stand-in "GLB": load_or_bake only re-reads it to hash it, and we bypass the parse by
+        // pre-seeding the cache with a mesh baked from known geometry.
+        std::fs::write(&glb, b"zone-asset-v1").unwrap();
+        let params = BakeParams::default();
+        let tris = quad(0.0, 0.0, 40.0, 0.0, 40.0);
+        let mesh = NavMesh::bake(&tris, None, params, b"zone-asset-v1");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("z.nvm"), mesh.serialize()).unwrap();
+
+        // Same asset -> the cache is reused (no re-bake, so the bogus GLB is never parsed).
+        let hit = NavMesh::load_or_bake(&cache, "z", &glb, None, params).expect("cache hit");
+        assert_eq!(hit.surface_count(), mesh.surface_count());
+
+        // The zone asset gets re-baked -> the digest no longer matches -> we must NOT reuse it.
+        // (It then tries to bake, which fails on our stand-in file — proving it did not serve the
+        // stale mesh, which is the whole point.)
+        std::fs::write(&glb, b"zone-asset-v2-REBAKED").unwrap();
+        assert!(NavMesh::load_or_bake(&cache, "z", &glb, None, params).is_err(),
+            "a changed zone asset must force a re-bake, never serve the stale cached mesh");
+    }
+
+    #[test]
+    fn an_empty_or_broken_bake_is_not_usable_and_must_fall_back() {
+        // nektulos/arena ship a collision mesh that is missing almost all terrain (#373). A mesh
+        // baked from that does not describe the world, so it must report itself unusable and let the
+        // caller fall back to the grid — loudly. Silently pathing on it would be the worst outcome.
+        let empty = NavMesh::bake(&[], None, BakeParams::default(), b"t");
+        assert!(!empty.is_usable(), "an empty bake must never be pathed on");
+        let real = NavMesh::bake(&quad(0.0, 0.0, 200.0, 0.0, 200.0), None, BakeParams::default(), b"t");
+        assert!(real.is_usable(), "a healthy bake is usable");
     }
 
     #[test]

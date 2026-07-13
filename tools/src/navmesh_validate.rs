@@ -130,6 +130,8 @@ struct ZoneReport {
     /// Biggest single rise on each route the GRID found but the navmesh refused. A rise above
     /// movement::STEP_UP (2.0) means the walker could never have walked that grid route anyway.
     g_only_rise:   Vec<f32>,
+    /// Diagnosis of each GENUINE miss (a walkable grid route the navmesh refused).
+    misses:        Vec<String>,
 }
 
 fn median(v: &mut Vec<u128>) -> u128 {
@@ -238,6 +240,7 @@ fn run_zone(zone: &str, models: &std::path::Path, nav_dir: &std::path::Path,
     let (mut both, mut m_only, mut g_only, mut none_) = (0, 0, 0, 0);
     let (mut m_us, mut g_us) = (Vec::new(), Vec::new());
     let mut g_only_rise: Vec<f32> = Vec::new();
+    let mut misses: Vec<String> = Vec::new();
     if all.len() >= 2 {
         for _ in 0..n_pairs {
             let a = all[rng.gen_range(0..all.len())];
@@ -261,6 +264,36 @@ fn run_zone(zone: &str, models: &std::path::Path, nav_dir: &std::path::Path,
                 (true, None)     => m_only += 1,
                 (false, Some(p)) => {
                     g_only += 1;
+                    // Root-cause the GENUINE misses (a grid route the walker really could walk that
+                    // the navmesh refuses). These are the only true regressions in the parity data.
+                    let mut mr: f32 = 0.0;
+                    let mut pv = start;
+                    for w in p.iter() { mr = mr.max(w[2] - pv[2]); pv = *w; }
+                    if mr <= eqoxide::movement::STEP_UP {
+                        let si = mesh.nearest_index(start);
+                        let gi = mesh.nearest_index(goal);
+                        let why = match (si, gi) {
+                            (None, _) => "start does not anchor to any surface".to_string(),
+                            (_, None) => "goal does not anchor to any surface".to_string(),
+                            (Some(a), Some(b)) => {
+                                let (sc, sa) = mesh.surface_at(a);
+                                let (gc, ga) = mesh.surface_at(b);
+                                // How far did the grid route have to travel vertically / did it use a
+                                // horizontal GAP (a jump edge, which our mesh has no equivalent for)?
+                                let mut maxgap: f32 = 0.0;
+                                let mut pv = start;
+                                for w in p.iter() {
+                                    maxgap = maxgap.max((w[0]-pv[0]).hypot(w[1]-pv[1]));
+                                    pv = *w;
+                                }
+                                format!("start comp={sc} (z={:.1}) goal comp={gc} (z={:.1}); {}; grid max step {:.0}u",
+                                    sa.z, ga.z,
+                                    if sc != gc { "DIFFERENT COMPONENTS (no link)" } else { "same component (search failed?)" },
+                                    maxgap)
+                            }
+                        };
+                        misses.push(format!("{}: {:?} -> {:?} | {why}", zone, start, goal));
+                    }
                     // IS THAT GRID ROUTE ACTUALLY WALKABLE? The legacy A* admits a climb of up to
                     // STEP_H=20 per cell, but the controller's real step-up is movement::STEP_UP=2.0
                     // and it has no other ascent primitive (#239). So a grid "route" containing a
@@ -290,6 +323,7 @@ fn run_zone(zone: &str, models: &std::path::Path, nav_dir: &std::path::Path,
         mesh_us_max: m_us.iter().copied().max().unwrap_or(0),
         grid_us_max: g_us.iter().copied().max().unwrap_or(0),
         g_only_rise,
+        misses,
     })
 }
 
@@ -451,6 +485,8 @@ fn main() -> Result<()> {
             let adj = 100.0 * (both + m_only + none_ + unwalkable) as f32 / total_pairs.max(1) as f32;
             println!("  GENUINE navmesh misses (grid route the walker really could walk): {genuine} ({:.1}%)",
                 100.0 * genuine as f32 / total_pairs.max(1) as f32);
+            println!("\n  --- ROOT CAUSE of each genuine miss ---");
+            for m in reports.iter().flat_map(|r| r.misses.iter()) { println!("    {m}"); }
             println!("  parity discounting unwalkable grid routes: {adj:.2}%  ->  {}",
                 if adj >= 95.0 { "PROCEED" } else { "still under the gate" });
         }
