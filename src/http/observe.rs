@@ -47,6 +47,33 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let health = s.health();
     let frame_profile = *s.frame_profile.lock().unwrap();
     let nav_state = s.nav_state.lock().unwrap().clone();
+    // Is nav running in a KNOWN-DEGRADED mode in this zone? (#229/#329)
+    //
+    // A floor is an up-facing triangle. Some zones bake real, walkable ground from INVERTED
+    // (down-facing) art — measured across the 34 cached zones, permafrost and highpass carry the
+    // most — so the floor-normal filter would delete it. Nav's safety valve admits the column's
+    // BOTTOM-MOST surface as ground when the filter leaves the column with no floor at all (nothing
+    // lies beneath ground; a ceiling always has a floor under it). That keeps the zone navigable,
+    // but the answer came from mis-wound art and the surface's true facing is unverified — a
+    // degraded answer, not a wrong one, and the agent must be able to SEE that rather than be
+    // quietly handed it.
+    //
+    // `null` = the filter has answered every nav query in this zone from properly wound floors.
+    // Non-null = the fallback has fired `queries` times since zone load. A `tracing::warn!` is not
+    // observable to an agent driving this client over HTTP; a client that quietly answers from a
+    // degraded code path is lying by omission. So report it here, where the agent can see it.
+    let nav_degraded = s.shared_collision.read().unwrap().as_ref().and_then(|col| {
+        let hits = col.fallback_hits();
+        (hits > 0).then(|| serde_json::json!({
+            "reason": "inverted_floor_art",
+            "queries": hits,
+            "detail": "parts of this zone's collision mesh are wound INVERTED (down-facing where \
+                       ground should face up), so nav cannot verify a floor's facing there and has \
+                       fallen back to accepting the column's lowest surface as ground. Routes \
+                       through those areas are planned on unverified ground and may be less \
+                       reliable (#329/#353).",
+        }))
+    });
     let (guild_name, guild_id, guild_rank) = {
         let g = s.guild.lock().unwrap();
         (g.guild_name.clone(), g.guild_id, g.guild_rank)
@@ -118,6 +145,10 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
                 "ago_secs":   o.at.elapsed().as_secs(),
             })),
         },
+        // Nav health for THIS zone. `null` when nav is running normally; an object naming the
+        // degraded mode when it is not (see `nav_degraded` above). An agent must be able to tell
+        // "no route exists" from "this zone's pathing is known-unreliable".
+        "nav_degraded": nav_degraded,
         // Per-phase frame timings (ms, EMA-smoothed); all zero unless --profile / EQ_PROFILE=1.
         // Render-owned — the one field here the render loop legitimately publishes.
         "frame_profile": frame_profile,
