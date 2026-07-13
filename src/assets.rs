@@ -1360,6 +1360,36 @@ impl Collision {
         self.find_path_res(start, goal, radius, avoid, allow_partial, 8.0, None, 0.0, PlanCtx::default())
     }
 
+    /// The goal's floor when the caller's `z` could NOT be resolved to a tier — i.e. it sits below
+    /// every floor in the goal's column (an agent passing a rough `z`, usually 0, or a map coord).
+    /// Returns the nearest floor anywhere in that column: the goal the caller meant.
+    ///
+    /// `Some(z)` here means **the client is about to change the caller's goal**. That is an
+    /// accommodation, and an accommodation presented as compliance is a lie — so it is reported, not
+    /// quietly performed: the planner surfaces it as `nav_reason: goal_z_snapped` and says so in the
+    /// message log, rather than letting an agent that asked for `z: 0` be told `arrived` at `z: 47`
+    /// without ever learning its goal was moved.
+    ///
+    /// `None` = there is no floor anywhere in the column: the goal is off the mesh, and that is a
+    /// genuine `GoalNotWalkable` (fail loudly, don't search).
+    pub fn snap_goal_to_column_floor(&self, goal: [f32; 3]) -> Option<f32> {
+        const COLUMN: f32 = 1000.0; // the whole column: "is there ANY floor at this XY?"
+        self.nearest_floor(goal[0], goal[1], goal[2], COLUMN, COLUMN)
+    }
+
+    /// Did resolving `goal` require SNAPPING its z to a different floor? `Some(floor_z)` = yes, and
+    /// the caller's goal is being changed — see [`Collision::snap_goal_to_column_floor`]. Used by the
+    /// planner to tell the agent, so the snap is never silent.
+    pub fn goal_z_was_snapped(&self, goal: [f32; 3]) -> Option<f32> {
+        const GOAL_TIER_TOL: f32 = 8.0;
+        const GOAL_DROP: f32 = 400.0;
+        let resolved = self.nearest_floor(goal[0], goal[1], goal[2], GOAL_TIER_TOL, GOAL_TIER_TOL)
+            .or_else(|| self.floor_beneath(goal[0], goal[1], goal[2], GOAL_TIER_TOL, GOAL_DROP));
+        // A tier the caller named was honoured → nothing was changed → nothing to report.
+        if resolved.is_some() { return None; }
+        self.snap_goal_to_column_floor(goal)
+    }
+
     /// BEST-EFFORT route at an arbitrary grid resolution `cell`, optionally bounded to `max_search`
     /// units of the start (so a FINE plan stays local + cheap even if it hits an obstacle).
     /// `cell` = 8.0 + `max_search` = None reproduces the classic whole-zone nav grid.
@@ -1584,9 +1614,8 @@ impl Collision {
         // (its wrong-tier `goal_fallback` accepted the goal cell at whatever tier it really had).
         // Live North Qeynos: `goto (-40,250,z=0)` refused to move at all. So before giving up, snap
         // the goal to the nearest floor ANYWHERE in its column — that is the goal the caller meant.
-        const COLUMN: f32 = 1000.0; // the whole column: we are asking "is there ANY floor at this XY?"
         let goal_floor = match resolved_goal_floor
-            .or_else(|| self.nearest_floor(goal[0], goal[1], goal[2], COLUMN, COLUMN))
+            .or_else(|| self.snap_goal_to_column_floor(goal))
         {
             Some(f) => f,
             // NO floor anywhere in the goal's column: off the mesh, or out over a void. THAT is an

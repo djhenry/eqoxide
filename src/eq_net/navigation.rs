@@ -930,11 +930,10 @@ pub struct Navigator {
     /// The PATHFINDING WORKER (#340). Coarse A* plans are POSTED here and picked up on a later tick;
     /// the net thread never blocks on a search. See `crate::eq_net::nav_planner`.
     planner:          crate::eq_net::nav_planner::Planner,
-    /// The goal the in-flight plan was requested for. A reply is only applied while this still
-    /// matches the walker's current goal — belt-and-braces alongside the planner's generation
-    /// counter, since a goal can be re-issued with the same generation semantics but a different
-    /// value (e.g. a portal redirect).
-    plan_goal:        Option<(f32, f32, f32)>,
+    /// The planner SNAPPED the current goal's z to a floor the caller never named (see
+    /// `Collision::goal_z_was_snapped`). Carried to ARRIVAL, so the agent is not simply told
+    /// `arrived` as though it got the goal it asked for — it did not.
+    goal_snapped: bool,
     /// True while a plan is in flight for a goal we have NO route for yet — the walker must stand
     /// still rather than straight-line into geometry. (A re-plan of a goal we already have a route
     /// for keeps walking the old route while the new one computes.)
@@ -1098,7 +1097,7 @@ impl Navigator {
             last_movement_history_send: Instant::now(),
             streamed_init: false,
             planner: crate::eq_net::nav_planner::Planner::spawn(),
-            plan_goal: None,
+            goal_snapped: false,
             awaiting_first_plan: false,
         }
     }
@@ -1296,7 +1295,6 @@ impl Navigator {
             // coordinate space. Abandon it — applying it here would drive the character at a route
             // through a zone it is no longer in.
             self.planner.cancel();
-            self.plan_goal = None;
             self.awaiting_first_plan = false;
             self.set_nav_state("idle");
 
@@ -1383,7 +1381,6 @@ impl Navigator {
         self.local_i = 0;
         self.path_goal = None;
         self.planner.cancel();
-        self.plan_goal = None;
         self.awaiting_first_plan = false;
         *self.goto_target.lock().unwrap() = None;
         *self.nav_intent.lock().unwrap() = None;
@@ -1403,7 +1400,18 @@ impl Navigator {
     ) -> bool {
         use crate::assets::PlanOutcome;
         self.awaiting_first_plan = false;
-        self.plan_goal = None;
+        // The in-flight goal lives INSIDE the Planner now and is cleared by `poll` the moment the
+        // reply is handed over, so a consumed-but-dropped reply can no longer wedge the planner
+        // permanently at `nav_state: planning`. That state is unrepresentable — see `Planner::pending`.
+        // Did the planner CHANGE the goal we asked for? Say so — an agent that asked for z=0 and is
+        // walked to z=47 must not simply be told `arrived` as if it got what it requested.
+        let snapped = reply.goal_snapped_z;
+        self.goal_snapped = snapped.is_some();
+        if let Some(z) = snapped {
+            gs.log_msg("zone", &format!(
+                "Goal z={:.0} is not on any floor — routing to the floor at z={:.0} instead (the client \
+                 CHANGED your goal; it is not the one you gave).", goal.2, z));
+        }
         match reply.outcome {
             // A real, complete route to the goal. The only outcome the walker may treat as a plan.
             PlanOutcome::Route(path) => {
@@ -1412,7 +1420,11 @@ impl Navigator {
                 self.path = path;
                 self.path_i = 0;
                 self.stuck_i = 0;
-                self.set_nav_state("navigating");
+                match snapped {
+                    // Navigating, but NOT to the goal as given — the agent can see that in nav_reason.
+                    Some(_) => self.set_nav_state_because("navigating", Some("goal_z_snapped")),
+                    None    => self.set_nav_state("navigating"),
+                }
                 false
             }
             // The search was CUT SHORT — "I don't know", not "no route". It did close real ground
@@ -1505,7 +1517,6 @@ impl Navigator {
         self.path_i = 0;
         // A corpse must not act on a plan that lands after it died (#238 + #340).
         self.planner.cancel();
-        self.plan_goal = None;
         self.awaiting_first_plan = false;
         self.set_nav_state("idle");
         true
@@ -2503,7 +2514,6 @@ impl Navigator {
                 // Nav stopped — any plan still in flight is for a goal nobody wants. Abandon it so
                 // its reply can never be applied (#340).
                 self.planner.cancel();
-                self.plan_goal = None;
                 self.awaiting_first_plan = false;
                 *self.nav_intent.lock().unwrap() = None;
                 // Only downgrade from an ACTIVE state (an external cancel / WASD). Keep terminal
@@ -2528,7 +2538,8 @@ impl Navigator {
         // tick — the decision function must know that, or a moving leader re-plans forever and the
         // walker never gets a route (#377 review, B1).
         let is_chase = self.goto_entity.lock().unwrap().is_some();
-        let decision = replan_decision(self.path_goal, goal, self.plan_goal, self.replan_coarse, is_chase);
+        let in_flight = self.planner.in_flight_goal().map(|g| (g[0], g[1], g[2]));
+        let decision = replan_decision(self.path_goal, goal, in_flight, self.replan_coarse, is_chase);
         if decision.reset_route {
             // A genuinely DIFFERENT destination — the committed route is for somewhere else. Drop it
             // and the journey-level recovery budget with it.
@@ -2545,6 +2556,7 @@ impl Navigator {
             self.local_stuck_ticks = 0;
             self.replan_cooldown = 0;
             self.replan_coarse = false;
+            self.goal_snapped = false; // a new destination: whatever we snapped for the old one is moot
         }
         if decision.post {
             // NOTE the walker's cursor into the route (`path_i` / `stuck_i`) is deliberately NOT
@@ -2597,7 +2609,6 @@ impl Navigator {
                         goal_region,
                         collision: c,
                     });
-                    self.plan_goal = Some(goal);
                     self.path_goal = Some(goal); // the goal the committed/incoming route is FOR
                     let post_us = t0.elapsed().as_micros();
                     tracing::info!("NAV: posted plan #{gen} to ({:.0},{:.0}) — {post_us}us on the net thread (was: the whole A*)",
@@ -2615,7 +2626,6 @@ impl Navigator {
                 // Collision not loaded yet (zoning): keep the old straight-line-toward-goal fallback.
                 None => {
                     self.planner.cancel();
-                    self.plan_goal = None;
                     self.path_goal = Some(goal);
                     self.awaiting_first_plan = false;
                     self.path = Vec::new();
@@ -2624,14 +2634,30 @@ impl Navigator {
             }
         }
 
-        // Pick up a finished plan. `poll` DISCARDS a stale reply (one for a goal we've since
-        // abandoned) — applying it would walk the character toward a goal nobody asked for.
+        // Pick up a finished plan. `poll` already DISCARDS a stale reply — one whose generation is
+        // not the request we are waiting on (a goal we have since abandoned, a zone change, a death).
+        // That generation check is the ONLY staleness guard we need, and it is sound.
+        //
+        // There used to be a second guard here: `plan_goal == Some(goal)`, an exact f32 compare that
+        // DROPPED the reply if the goal had drifted at all since the request. It was a PERMANENT
+        // DEADLOCK. `poll()` consumes the reply and clears `pending`, but dropping it here meant
+        // `apply_plan` never ran — and `apply_plan` is the only thing that clears `plan_goal`. So
+        // `plan_goal` stayed `Some(stale)` forever, `replan_decision` then refused to post while a
+        // plan was "in flight", `post` was false forever, and the character sat at
+        // `nav_state: planning` PERMANENTLY. `is_dead()` cannot catch it: the worker is alive and
+        // idle. It is the same silent lie as the dead-planner bug, through a different door — and it
+        // fired on an ordinary sequence: /goto A, then re-aim 20u away before A's plan lands.
+        //
+        // Note my live /follow verification PASSED ANYWAY, by luck: NPC position updates are sparse
+        // relative to the 150ms nav tick, so the reply happened to land in a window where the leader
+        // had not moved. A pure-function test caught what live play structurally could not — which is
+        // the same argument this PR makes about wall-clock budgets, turned on my own verification.
+        //
+        // So: APPLY THE ROUTE regardless of drift. A route to where the leader stood 200ms ago is
+        // exactly what you want to be walking while the next plan computes. It is also the honest
+        // move: we HAVE a route, so walk it, instead of freezing while pretending to think.
         if let Some(reply) = self.planner.poll() {
-            if self.plan_goal == Some(goal) {
-                if self.apply_plan(reply, gs, goal) { return; }
-            } else {
-                tracing::debug!("NAV: dropping plan #{} — the goal moved on", reply.gen);
-            }
+            if self.apply_plan(reply, gs, goal) { return; }
         }
 
         // THE PLANNER IS DEAD (its thread panicked). Nothing will ever answer a plan request again,
@@ -2806,7 +2832,13 @@ impl Navigator {
                     return;
                 }
                 tracing::info!("NAV: arrived at ({:.1},{:.1})", goal.0, goal.1);
-                self.set_nav_state("arrived");
+                // `arrived` alone would tell an agent it got what it asked for. If the planner moved
+                // its goal's z onto a real floor, it did not — carry that all the way to the end.
+                if self.goal_snapped {
+                    self.set_nav_state_because("arrived", Some("goal_z_snapped"));
+                } else {
+                    self.set_nav_state("arrived");
+                }
                 *self.goto_target.lock().unwrap() = None;
                 *self.nav_intent.lock().unwrap() = None; // stop driving the controller
                 gs.player_heading = eq_heading(gdx, gdy);
@@ -2868,7 +2900,6 @@ impl Navigator {
                         goal_region,
                         collision: c,
                     });
-                    self.plan_goal = Some(goal);
                     self.stuck_ticks = 0;
                     tracing::warn!("NAV: backed off downhill — posted re-plan #{gen} (attempt {})", self.nav_repaths);
                 }
@@ -3264,6 +3295,141 @@ mod tests {
             "a goal with no walkable floor must NOT be redirected through a portal — the agent needs \
              `goal_not_walkable` (fix your coordinates), not the portal's `search_closed`");
         assert!(!portal_escape_applies(NoRoute::NoGeometry), "no collision loaded is not a portal problem");
+    }
+
+    /// **THE LIVENESS INVARIANT: no sequence of goals may leave the planner wedged.**
+    ///
+    /// This is the property, pinned directly rather than by example — because the bug it guards
+    /// against was found by reasoning about the state machine, NOT by live play (live `/follow`
+    /// passed by sheer luck: NPC position updates are sparse relative to the 150ms tick, so the
+    /// reply happened to land while the leader was still).
+    ///
+    /// The deadlock: `poll()` consumed a reply and cleared `pending`, but a `plan_goal == goal`
+    /// exact-compare in the tick DROPPED it — and `apply_plan` is the only thing that clears
+    /// `plan_goal`. So `plan_goal` stayed `Some(stale)` forever, `replan_decision` refused to post
+    /// while a plan was "in flight", and the character sat at `nav_state: planning` PERMANENTLY,
+    /// with a live, idle worker that `is_dead()` could never flag.
+    ///
+    /// Models the real tick loop — including the ONE rule that fixes it: consuming a reply always
+    /// clears `plan_goal` — and drives it with adversarial goal motion (jitter, cell-sized drift,
+    /// mid-flight re-aims inside the reset threshold, teleports, standing still). Over the whole
+    /// run the walker must never go blind for long: it must keep getting routes.
+    #[test]
+    fn no_goal_sequence_can_wedge_the_planner() {
+        // Adversarial goal motion, including the exact sequence that deadlocked: re-aim 20u away
+        // (> GOAL_REPLAN_DIST 8, < GOAL_RESET_DIST 40) BEFORE the in-flight plan lands.
+        let moves: [f32; 12] = [0.0, 0.3, 20.0, 9.0, 1320.0, 0.0, 12.0, 39.0, 41.0, 0.5, 20.0, 200.0];
+        for &is_chase in &[true, false] {
+            for &replan_coarse in &[true, false] {
+                let mut planned: Option<(f32, f32, f32)> = None;
+                let mut in_flight: Option<(f32, f32, f32)> = None;
+                let mut in_flight_age = 0;
+                let mut goal = (0.0f32, 0.0, 0.0);
+                let mut ticks_since_route = 0;
+
+                for tick in 0..600 {
+                    // The goal wanders adversarially.
+                    goal.0 += moves[tick % moves.len()];
+
+                    let d = replan_decision(planned, goal, in_flight, replan_coarse, is_chase);
+                    if d.post {
+                        in_flight = Some(goal);
+                        planned = Some(goal);
+                        in_flight_age = 0;
+                    }
+                    // The worker answers after a couple of ticks. Consuming the reply ALWAYS clears
+                    // the in-flight goal — that is the invariant the deadlock violated.
+                    if in_flight.is_some() {
+                        in_flight_age += 1;
+                        if in_flight_age >= 2 {
+                            in_flight = None;      // reply consumed -> plan_goal cleared, ALWAYS
+                            ticks_since_route = 0; // and the walker got a route
+                        }
+                    }
+                    ticks_since_route += 1;
+
+                    assert!(ticks_since_route < 60, // ~9 s at 150ms/tick: far beyond any real plan
+                        "DEADLOCK at tick {tick} (chase={is_chase}, replan_coarse={replan_coarse}): the \
+                         walker has gone {ticks_since_route} ticks with no route while the goal keeps \
+                         moving. A plan must always eventually be posted AND consumed — a planner that \
+                         silently stops posting leaves the character at `nav_state: planning` forever, \
+                         which is a lie no `is_dead()` check can ever catch.");
+                }
+            }
+        }
+    }
+
+    /// The exact ordinary sequence the reviewer used to prove the deadlock: `/goto A`, then re-aim to
+    /// `/goto B` 20u away (inside the reset threshold) BEFORE A's plan lands. Once A's reply is
+    /// consumed, B must be planned for — not frozen forever.
+    #[test]
+    fn re_aiming_before_the_first_plan_lands_does_not_freeze() {
+        let a = (100.0f32, 0.0, 0.0);
+        // /goto A: nothing planned, nothing in flight -> post.
+        let d = replan_decision(None, a, None, false, false);
+        assert!(d.post, "the first goal must be planned for");
+        let (planned, in_flight) = (Some(a), Some(a));
+
+        // Re-aim 20u away while A's plan is still computing. > GOAL_REPLAN_DIST, < GOAL_RESET_DIST:
+        // we correctly do NOT supersede the in-flight plan...
+        let b = (120.0f32, 0.0, 0.0);
+        let d = replan_decision(planned, b, in_flight, false, false);
+        assert!(!d.post, "an in-flight plan for essentially this goal is left to land");
+
+        // ...and when it lands, `plan_goal` is CLEARED (apply_plan always runs now). B must then be
+        // planned for. If the reply had been dropped instead, in_flight would still be Some(a) here
+        // and this would be `false` forever — the deadlock.
+        let d = replan_decision(planned, b, None, false, false);
+        assert!(d.post,
+            "once the in-flight plan is consumed, a goal that has moved must be re-planned for — \
+             otherwise the character is frozen at `planning` permanently");
+    }
+
+    /// **A GOAL THE CLIENT CHANGED MUST NOT BE REPORTED AS THE GOAL THE AGENT ASKED FOR.**
+    ///
+    /// When the caller's `z` sits below every floor in the goal's column, the planner snaps the goal
+    /// onto the real floor. That is a good accommodation — but performing it silently makes it a lie:
+    /// an agent that asked for `z: 0` would be told `navigating`, then `arrived`, as though it got
+    /// what it requested, having actually been walked to `z: 47`. An accommodation presented as
+    /// compliance is exactly the class this PR exists to eliminate, so it is surfaced —
+    /// `nav_reason: goal_z_snapped`, all the way through to ARRIVAL, plus the message log.
+    #[test]
+    fn a_snapped_goal_z_is_reported_not_silently_performed() {
+        use crate::eq_net::nav_planner::PlanReply;
+        let g: crate::http::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::http::GroupSnapshot::default()));
+        let mut nav = test_navigator(g);
+        let mut gs = GameState::new();
+        let goal = (100.0f32, 100.0f32, 0.0f32); // the agent asked for z = 0
+
+        // The planner routed there — but only by moving the goal onto the floor at z = 47.
+        nav.apply_plan(PlanReply {
+            gen: 1,
+            outcome: crate::assets::PlanOutcome::Route(vec![[0.0, 0.0, 47.0], [100.0, 100.0, 47.0]]),
+            plan_ms: 5,
+            goal_snapped_z: Some(47.0),
+        }, &mut gs, goal);
+
+        let st = nav.nav_state.lock().unwrap().clone();
+        assert_eq!(st.state, "navigating");
+        assert_eq!(st.reason.as_deref(), Some("goal_z_snapped"),
+            "the agent asked for z=0 and is being walked to z=47 — it must be TOLD its goal was changed");
+        assert!(gs.messages.iter().any(|m| m.text.contains("CHANGED your goal")),
+            "and it must be said in the message log too, in words");
+
+        // ...and it must survive to ARRIVAL. `arrived` with no reason would tell the agent it got
+        // exactly what it asked for, which is the whole lie.
+        assert!(nav.goal_snapped, "the snap must be carried to arrival, not forgotten en route");
+
+        // A goal whose z WAS honoured reports nothing — the accommodation must not be cried wolf.
+        nav.apply_plan(PlanReply {
+            gen: 2,
+            outcome: crate::assets::PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]]),
+            plan_ms: 5,
+            goal_snapped_z: None,
+        }, &mut gs, goal);
+        let st = nav.nav_state.lock().unwrap().clone();
+        assert_eq!(st.reason, None, "a goal that was honoured as given carries no snap reason");
+        assert!(!nav.goal_snapped);
     }
 
     /// A goal that has not meaningfully moved must not re-plan at all (the cheap half of B1).
