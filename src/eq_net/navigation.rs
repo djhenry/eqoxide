@@ -2477,8 +2477,14 @@ impl Navigator {
             // exactly what the walker follows — coarse route + fine local plan — rather than an
             // independent per-frame recompute that over-states how cleanly the walker is steering.
             *self.nav_path_view.lock().unwrap() = (self.path.clone(), self.local_path.clone());
+            // Segment 0 — a literal, NOT `self.local_i` — is correct here and is not the #311 bug.
+            // `local_path` was just re-planned FROM the current position a few lines up, so the
+            // walker is on its first segment by construction and the cursor was reset to 0 with it.
+            // The bug is in the fast-steering loop, which re-aims ~15x per rebuild and so must track
+            // a live cursor; this main-tick aim runs once per rebuild against a path that starts
+            // under the walker's feet.
             let aim = if self.local_path.len() >= 2 {
-                carrot_along(&self.local_path, self.local_i, [px, py], LOOK_AHEAD).unwrap_or(coarse)
+                carrot_along(&self.local_path, 0, [px, py], LOOK_AHEAD).unwrap_or(coarse)
             } else {
                 coarse
             };
@@ -3014,6 +3020,7 @@ mod tests {
             nav.local_path = vec![[0.0, 0.0, 0.0]];
             nav.path_goal = Some((100.0, 200.0, 0.0));
             nav.path_i = 1;
+            nav.local_i = 1;
             *nav.nav_state.lock().unwrap() = "navigating".into();
         };
         let assert_halted = |nav: &Navigator| {
@@ -3021,6 +3028,9 @@ mod tests {
             assert!(nav.goto_entity.lock().unwrap().is_none(), "goto_entity must clear on death");
             assert!(nav.nav_intent.lock().unwrap().is_none(), "nav_intent must clear so the controller stops");
             assert!(nav.path.is_empty() && nav.local_path.is_empty(), "route must clear on death");
+            // The fast-steering cursor must reset with the path it indexes (#311) — a stale local_i
+            // left over a cleared/rebuilt local_path aims the walker at the wrong segment.
+            assert_eq!(nav.local_i, 0, "local_i must reset with local_path on death");
             assert_eq!(nav.path_goal, None);
             assert_eq!(*nav.nav_state.lock().unwrap(), "idle");
         };
@@ -3152,6 +3162,7 @@ mod tests {
         nav.local_path = vec![[0.0, 0.0, 0.0]];
         nav.path_goal = Some((100.0, 200.0, 0.0));
         nav.path_i = 1;
+        nav.local_i = 1;
         nav.stuck_ticks = 5;
         nav.nav_repaths = 3;
         nav.backoff_ticks = 2;
@@ -3173,6 +3184,9 @@ mod tests {
         assert!(nav.path.is_empty() && nav.local_path.is_empty(), "route must clear on zone change");
         assert_eq!(nav.path_goal, None);
         assert_eq!(nav.path_i, 0);
+        // The fast-steering cursor must reset with the path it indexes (#311) — a stale local_i in
+        // the NEW zone points at a segment of a route that no longer exists.
+        assert_eq!(nav.local_i, 0, "local_i must reset with local_path on zone change");
         assert_eq!(nav.stuck_ticks, 0);
         assert_eq!(nav.nav_repaths, 0);
         assert_eq!(nav.backoff_ticks, 0);
