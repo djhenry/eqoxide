@@ -166,6 +166,9 @@ pub struct App {
     /// and render_frame; reads between two refresh points may straddle two snapshots, which is
     /// fine — each snapshot is internally consistent.
     game_state_view: std::sync::Arc<GameState>,
+    /// Render-thread-owned door open/close easing state, keyed by `door_id`. `GameState::Door`
+    /// only carries the authoritative `is_open`; this map is what actually animates the swing.
+    door_frac: std::collections::HashMap<u8, f32>,
     /// Offline testzone mode — bypasses EQ server entirely.
     #[allow(dead_code)]
     testzone_mode: bool,
@@ -266,14 +269,19 @@ impl App {
         // Distinct per-client window title (#297): "{account} {character} - EQOxide".
         let window_title = format!("{} {} - EQOxide", asset_user, character_name);
         let mut game_state = GameState::new();
-        let game_state_view = game_state_snapshot.load_full();
         game_state.player_name = character_name;
 
         if testzone_mode {
             game_state.zone_name = "testzone".to_string();
             game_state.zone_changed = true;
             tracing::info!("APP: --testzone mode, will load debug zone");
+            // No network thread runs in --testzone mode (it's skipped entirely in main.rs), so
+            // nothing else will ever publish into `game_state_snapshot` — it would otherwise sit
+            // on the initial `GameState::new()` default forever. Seed it here so `game_state_view`
+            // (what the scene build reads, since Task 4) sees the debug-zone bootstrap.
+            game_state_snapshot.store(std::sync::Arc::new(game_state.clone()));
         }
+        let game_state_view = game_state_snapshot.load_full();
 
         App {
             window: None, gpu: None, egui_ctx: None, egui_state: None, egui_renderer: None,
@@ -333,6 +341,7 @@ impl App {
             asset_server_url, asset_user, asset_pass,
             window_title,
             game_state_snapshot, game_state_view,
+            door_frac: std::collections::HashMap::new(),
         }
     }
 
@@ -768,9 +777,11 @@ impl App {
         }
 
         // Doors still easing toward their open/closed target.
-        if self.game_state.doors.values()
-            .any(|d| (d.open_frac - if d.is_open { 1.0 } else { 0.0 }).abs() > 0.001)
-        {
+        if self.game_state_view.doors.iter().any(|(id, d)| {
+            let target = if d.is_open { 1.0 } else { 0.0 };
+            let frac = self.door_frac.get(id).copied().unwrap_or(target);
+            (frac - target).abs() > 0.001
+        }) {
             activity = true;
         }
 
@@ -812,18 +823,19 @@ impl App {
         // network keeps flowing even on idle frames that don't render. `game_state` is already current
         // here.
 
-        // Ease each door's render fraction toward its server-authoritative open/close target.
-        {
-            let step = (dt / 0.5).min(1.0); // ~0.5s full travel
-            for d in self.game_state.doors.values_mut() {
-                let target = if d.is_open { 1.0_f32 } else { 0.0_f32 };
-                d.open_frac += (target - d.open_frac) * step;
-                if (d.open_frac - target).abs() < 0.001 { d.open_frac = target; }
-            }
+        // Ease each door's render-only open fraction toward its server-authoritative open/close
+        // target. Lives on App (not GameState) — see `ease_door_frac`. New doors seed at their
+        // current state (a door that spawns open renders open immediately, matching the old
+        // spawn-time open_frac init) — only subsequent state *changes* animate.
+        for (&id, d) in self.game_state_view.doors.iter() {
+            let entry = self.door_frac.entry(id)
+                .or_insert_with(|| if d.is_open { 1.0 } else { 0.0 });
+            *entry = ease_door_frac(*entry, d.is_open, dt, DOOR_TRAVEL_SECS);
         }
+        self.door_frac.retain(|id, _| self.game_state_view.doors.contains_key(id));
 
         let prof_scene = crate::profiling::Stopwatch::start();
-        self.scene = SceneState::from_game_state(&self.game_state);
+        self.scene = SceneState::from_game_state(&self.game_state_view, &self.door_frac);
         let dur_scene = prof_scene.elapsed();
 
         // Update shared player state for the /debug HTTP endpoint.
@@ -2247,5 +2259,44 @@ mod tests {
         // No zone yet / transient reset: don't try to fetch `<empty>.glb` over a loaded zone.
         assert!(!zone_needs_reload("", ""));
         assert!(!zone_needs_reload("", "arena"));
+    }
+}
+
+/// Seconds for a door to fully swing/slide from closed to open (or back).
+const DOOR_TRAVEL_SECS: f32 = 0.5;
+
+/// One easing step for a door's render-only open fraction, moving `current` toward the target
+/// implied by `is_open` proportionally (an exponential ease with time-constant governed by
+/// `full_travel_secs`), matching the old in-`GameState` tween exactly. Snaps exactly to the
+/// target once within 0.001 of it.
+fn ease_door_frac(current: f32, is_open: bool, dt: f32, full_travel_secs: f32) -> f32 {
+    let target = if is_open { 1.0_f32 } else { 0.0_f32 };
+    let step = (dt / full_travel_secs).min(1.0);
+    let next = current + (target - current) * step;
+    if (next - target).abs() < 0.001 { target } else { next }
+}
+
+#[cfg(test)]
+mod door_frac_tests {
+    use super::*;
+
+    #[test]
+    fn eases_toward_open_target_and_snaps_on_arrival() {
+        let frac = ease_door_frac(0.0, true, 0.25, 0.5);
+        assert!((frac - 0.5).abs() < 1e-6);
+        let frac = ease_door_frac(frac, true, 0.5, 0.5); // a full extra travel-window's worth of dt
+        assert_eq!(frac, 1.0);
+    }
+
+    #[test]
+    fn eases_toward_closed_target() {
+        let frac = ease_door_frac(1.0, false, 0.25, 0.5);
+        assert!((frac - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dt_larger_than_full_travel_snaps_immediately() {
+        let frac = ease_door_frac(0.0, true, 10.0, 0.5);
+        assert_eq!(frac, 1.0);
     }
 }

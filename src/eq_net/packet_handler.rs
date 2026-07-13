@@ -1965,7 +1965,6 @@ fn apply_spawn_doors(gs: &mut GameState, p: &[u8]) {
             invert_state: r[63] != 0,
             is_open: r[62] != 0,   // state_at_spawn is already invert-adjusted
             door_param: rd_u32(r, 64),
-            open_frac: if r[62] != 0 { 1.0 } else { 0.0 },
         };
         gs.upsert_door(door);
         off += REC;
@@ -3310,7 +3309,7 @@ mod tests {
         // normal door (invert_state = false)
         gs.upsert_door(crate::game_state::Door {
             door_id: 1, name: "D".into(), x:0.0,y:0.0,z:0.0,heading:0.0,incline:0,size:100,
-            opentype:5, door_param:0, invert_state:false, is_open:false, open_frac:0.0,
+            opentype:5, door_param:0, invert_state:false, is_open:false,
         });
         apply_move_door(&mut gs, &[1, 0x02]); // action 0x02 = open
         assert!(gs.doors.get(&1).unwrap().is_open);
@@ -3320,7 +3319,7 @@ mod tests {
         // inverted door: action 0x02 means "close", 0x03 means "open"
         gs.upsert_door(crate::game_state::Door {
             door_id: 2, name: "D".into(), x:0.0,y:0.0,z:0.0,heading:0.0,incline:0,size:100,
-            opentype:5, door_param:0, invert_state:true, is_open:true, open_frac:1.0,
+            opentype:5, door_param:0, invert_state:true, is_open:true,
         });
         apply_move_door(&mut gs, &[2, 0x02]);
         assert!(!gs.doors.get(&2).unwrap().is_open);

@@ -37,7 +37,8 @@ pub struct Billboard {
 }
 
 /// A door to render this frame. Positions are in client convention [east=x, north=y, up=z].
-/// `heading` is EQ 0..512; `open_frac` is 0=closed..1=open (used by Task 9; closed for now).
+/// `heading` is EQ 0..512; `open_frac` is 0=closed..1=open, eased render-side by `App` (see
+/// `ease_door_frac` in app.rs) since `GameState::Door` only carries the authoritative `is_open`.
 #[derive(Debug, Clone)]
 pub struct DoorRender {
     pub door_id:   u8,
@@ -234,7 +235,7 @@ impl SceneState {
     }
 
     /// Build SceneState from a live GameState snapshot.
-    pub fn from_game_state(gs: &GameState) -> Self {
+    pub fn from_game_state(gs: &GameState, door_frac: &std::collections::HashMap<u8, f32>) -> Self {
         let billboards = gs.entities.values().map(|e| {
             // Map EQ Animation:: values to action strings for clip resolution.
             // Animation constants from eq_constants.h: Standing=100, Freeze=102,
@@ -293,7 +294,7 @@ impl SceneState {
             incline: d.incline,
             size:    d.size,
             opentype: d.opentype,
-            open_frac: d.open_frac,
+            open_frac: door_frac.get(&d.door_id).copied().unwrap_or(0.0),
         }).collect();
 
         let messages = gs.messages.iter().map(|m| LogEntry {
@@ -443,7 +444,7 @@ mod tests {
 
     #[test]
     fn from_game_state_sets_player_fields() {
-        let scene = SceneState::from_game_state(&sample_state());
+        let scene = SceneState::from_game_state(&sample_state(), &std::collections::HashMap::new());
         assert_eq!(scene.player_name, "Aethas");
         assert_eq!(scene.player_pos, [1.0, 2.0, 3.0]); // EQ native [server_x, server_y, server_z]
         assert_eq!(scene.player_heading, 192.0);
@@ -451,7 +452,7 @@ mod tests {
 
     #[test]
     fn from_game_state_marks_target_billboard() {
-        let scene = SceneState::from_game_state(&sample_state());
+        let scene = SceneState::from_game_state(&sample_state(), &std::collections::HashMap::new());
         assert_eq!(scene.billboards.len(), 1);
         assert!(scene.billboards[0].is_target);
     }
@@ -460,26 +461,26 @@ mod tests {
     fn from_game_state_no_target_no_is_target() {
         let mut gs = sample_state();
         gs.target_id = None;
-        let scene = SceneState::from_game_state(&gs);
+        let scene = SceneState::from_game_state(&gs, &std::collections::HashMap::new());
         assert!(!scene.billboards[0].is_target);
     }
 
     #[test]
     fn from_game_state_billboard_race_propagated() {
         let gs = sample_state();
-        let scene = SceneState::from_game_state(&gs);
+        let scene = SceneState::from_game_state(&gs, &std::collections::HashMap::new());
         assert_eq!(scene.billboards[0].race, "GNL");
     }
 
     #[test]
     fn from_game_state_billboard_id_propagated() {
-        let scene = SceneState::from_game_state(&sample_state());
+        let scene = SceneState::from_game_state(&sample_state(), &std::collections::HashMap::new());
         assert_eq!(scene.billboards[0].id, 42);
     }
 
     #[test]
     fn from_game_state_zone_name() {
-        let scene = SceneState::from_game_state(&sample_state());
+        let scene = SceneState::from_game_state(&sample_state(), &std::collections::HashMap::new());
         assert_eq!(scene.zone, "qeynoshills");
     }
 
@@ -491,7 +492,7 @@ mod tests {
         gs.player_x = 100.0;
         gs.player_y = 200.0;
         gs.player_z = 50.0;
-        let scene = SceneState::from_game_state(&gs);
+        let scene = SceneState::from_game_state(&gs, &std::collections::HashMap::new());
         assert_eq!(
             scene.player_pos,
             [100.0, 200.0, 50.0],
@@ -522,7 +523,7 @@ mod tests {
             face: 0, hairstyle: 0, haircolor: 0,
             animation: 0,
         });
-        let scene = SceneState::from_game_state(&gs);
+        let scene = SceneState::from_game_state(&gs, &std::collections::HashMap::new());
         assert_eq!(scene.billboards.len(), 1);
         let b = &scene.billboards[0];
         assert_eq!(b.pos[0], 10.0, "pos[0] should be server_x (east)");
@@ -535,7 +536,7 @@ mod tests {
     #[test]
     fn target_entity_has_is_target_true() {
         let gs = sample_state(); // target_id = Some(42)
-        let scene = SceneState::from_game_state(&gs);
+        let scene = SceneState::from_game_state(&gs, &std::collections::HashMap::new());
         let targeted: Vec<_> = scene.billboards.iter().filter(|b| b.is_target).collect();
         assert_eq!(targeted.len(), 1);
         assert_eq!(targeted[0].id, 42);
@@ -562,7 +563,7 @@ mod tests {
             animation: 0,
         });
         gs.target_id = Some(42);
-        let scene = SceneState::from_game_state(&gs);
+        let scene = SceneState::from_game_state(&gs, &std::collections::HashMap::new());
         for b in &scene.billboards {
             if b.id == 42 {
                 assert!(b.is_target, "id=42 should be targeted");
@@ -586,7 +587,7 @@ mod tests {
         e.equipment[1] = 17;
         e.equipment_tint[1] = [9, 8, 7];
         gs.upsert_entity(e);
-        let scene = SceneState::from_game_state(&gs);
+        let scene = SceneState::from_game_state(&gs, &std::collections::HashMap::new());
         assert_eq!(scene.billboards[0].equipment[1], 17);
         assert_eq!(scene.billboards[0].equipment_tint[1], [9, 8, 7]);
     }
@@ -604,7 +605,7 @@ mod tests {
             animation: 0,
         };
         gs.upsert_entity(e);
-        let scene = SceneState::from_game_state(&gs);
+        let scene = SceneState::from_game_state(&gs, &std::collections::HashMap::new());
         assert_eq!(scene.billboards[0].gender, 1, "entity gender propagates to billboard");
         assert_eq!(scene.player_gender, 1, "player gender propagates to scene");
     }
@@ -617,7 +618,7 @@ mod tests {
         gs.log_msg("say", "hello");
         gs.log_msg("tell", "world");
         gs.log_msg("ooc", "third");
-        let scene = SceneState::from_game_state(&gs);
+        let scene = SceneState::from_game_state(&gs, &std::collections::HashMap::new());
         assert_eq!(scene.messages.len(), 3);
         assert_eq!(scene.messages[0].text, "hello");
         assert_eq!(scene.messages[2].text, "third");
@@ -633,7 +634,7 @@ mod tests {
             GroupMember { name: "Aldric".into(), is_leader: true, level: 10, ..Default::default() },
             GroupMember { name: "Sariel".into(), level: 8, ..Default::default() },
         ];
-        let scene = SceneState::from_game_state(&gs);
+        let scene = SceneState::from_game_state(&gs, &std::collections::HashMap::new());
         assert_eq!(scene.group_leader, "Aldric");
         assert_eq!(scene.group_members.len(), 2);
         assert_eq!(scene.group_members[1].name, "Sariel");
