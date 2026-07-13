@@ -845,6 +845,29 @@ impl EqStream {
     }
 }
 
+/// Build an EqStream wired to a dummy UDP peer for driving the receive path in a test. Its outbound
+/// ACKs go nowhere (try_send to a closed local port is a harmless no-op). `pub(crate)` (rather than
+/// nested in `mod tests`) so other modules' tests — e.g. `eq_net::gameplay`'s zone-handshake
+/// publish-cadence test (#324) — can drive a real `EqStream` without a live UDP session handshake.
+#[cfg(test)]
+pub(crate) async fn test_stream(pass1: u8, key: u32) -> (EqStream, mpsc::UnboundedReceiver<AppPacket>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let _ = socket.connect("127.0.0.1:1").await;
+    let stream = EqStream {
+        session: SessionInfo { encode_pass1: pass1, encode_key: key, ..SessionInfo::default() },
+        socket,
+        peer: "127.0.0.1:1".parse().unwrap(),
+        send_seq: 0,
+        next_recv_seq: 0,
+        recv_buf: HashMap::new(),
+        sent: VecDeque::new(),
+        frags: FragmentBuffer::new(),
+        app_tx: tx,
+    };
+    (stream, rx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -892,26 +915,6 @@ mod tests {
         assert_eq!(classify_seq(2, 0xF001), SeqClass::Future);
         // …while a seq just below `next` (also near the top) is a past duplicate.
         assert_eq!(classify_seq(0xF000, 0xF001), SeqClass::Duplicate);
-    }
-
-    /// Build an EqStream wired to a dummy UDP peer for driving the receive path in a test. Its outbound
-    /// ACKs go nowhere (try_send to a closed local port is a harmless no-op).
-    async fn test_stream(pass1: u8, key: u32) -> (EqStream, mpsc::UnboundedReceiver<AppPacket>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let _ = socket.connect("127.0.0.1:1").await;
-        let stream = EqStream {
-            session: SessionInfo { encode_pass1: pass1, encode_key: key, ..SessionInfo::default() },
-            socket,
-            peer: "127.0.0.1:1".parse().unwrap(),
-            send_seq: 0,
-            next_recv_seq: 0,
-            recv_buf: HashMap::new(),
-            sent: VecDeque::new(),
-            frags: FragmentBuffer::new(),
-            app_tx: tx,
-        };
-        (stream, rx)
     }
 
     #[tokio::test]
