@@ -633,6 +633,42 @@ impl GameState {
         }
     }
 
+    /// Select a new target and clear every piece of PREVIOUS-target derived state in the
+    /// same call, so nothing can leak across a re-target (eqoxide#323). Before this existed,
+    /// every target-select call site set `target_id` (and sometimes `target_name`) inline and
+    /// left `target_con`/`target_con_name`/`target_attitude` untouched — those three only ever
+    /// get written by a fresh OP_Consider reply (`apply_consider`), so a trivial mob targeted
+    /// right after a dangerous one rendered with the OLD red con until the next consider
+    /// reply landed (or forever, for a spawn — e.g. a corpse — the server never considers).
+    /// `target_name`/`target_hp_pct` had the same problem for any id not present in
+    /// `gs.entities` (a corpse, an out-of-range spawn, a stale/bogus id): the previous
+    /// target's name/HP just stayed put instead of clearing.
+    ///
+    /// `target_name`/`target_hp_pct` are seeded from `entities[id]`, except for the F1
+    /// self-target case (`id == player_id`): the player is never present in `entities`
+    /// (`register_spawn` special-cases and skips the self-spawn), so self-target must resolve
+    /// name/HP from the player's own fields instead — mirrors the entity-name idiom used for
+    /// combat-log lines elsewhere (packet_handler.rs) and the self-target branch already
+    /// covered by `update_hp`'s live-sync (eqoxide#9, #291). Any OTHER unknown id clears
+    /// `target_name`/`target_hp_pct` to `None` rather than leaving the previous target's
+    /// values in place.
+    pub fn set_target(&mut self, id: u32) {
+        self.target_id = Some(id);
+        self.target_con = None;
+        self.target_con_name = None;
+        self.target_attitude = None;
+        if id == self.player_id {
+            self.target_name = Some(self.player_name.clone());
+            self.target_hp_pct = Some(self.hp_pct);
+        } else if let Some(e) = self.entities.get(&id) {
+            self.target_name = Some(e.name.clone());
+            self.target_hp_pct = Some(e.hp_pct);
+        } else {
+            self.target_name = None;
+            self.target_hp_pct = None;
+        }
+    }
+
     pub fn upsert_door(&mut self, d: Door) {
         self.doors.insert(d.door_id, d);
     }
@@ -931,6 +967,89 @@ mod tests {
         gs.target_id = Some(11);
         gs.remove_entity(10);
         assert_eq!(gs.target_id, Some(11));
+    }
+
+    // --- GameState::set_target (eqoxide#323: stale con/attitude/name/HP on re-target) ---
+
+    #[test]
+    fn set_target_unknown_spawn_clears_name_and_hp() {
+        // Targeting a corpse / out-of-range spawn / bogus id not in `entities`: target_id
+        // still updates, but name/HP must clear to None rather than keep the PREVIOUS
+        // target's values (the actual #323 bug — target_id updated but name/hp didn't).
+        let mut gs = GameState::new();
+        gs.upsert_entity(make_entity(7, "a rat", 0.0, 0.0, 0.0, true));
+        gs.set_target(7);
+        assert_eq!(gs.target_name.as_deref(), Some("a rat"));
+        assert_eq!(gs.target_hp_pct, Some(100.0));
+
+        gs.set_target(999_999); // not in entities (corpse / stale id)
+        assert_eq!(gs.target_id, Some(999_999));
+        assert_eq!(gs.target_name, None, "must clear, not keep the previous target's name");
+        assert_eq!(gs.target_hp_pct, None, "must clear, not keep the previous target's hp");
+    }
+
+    #[test]
+    fn set_target_clears_stale_con_attitude_on_retarget_then_repopulates() {
+        // A: target a dangerous mob, apply its consider reply (con/con_name/attitude set —
+        // mirrors apply_consider), then immediately re-target a trivial mob. The old con MUST
+        // NOT survive the re-target (it used to persist red until — or if the server never
+        // considers the new target, e.g. a corpse — forever).
+        let mut gs = GameState::new();
+        gs.upsert_entity(make_entity(1, "a dragon", 0.0, 0.0, 0.0, true));
+        gs.set_target(1);
+        gs.target_con = Some([255, 0, 0]);
+        gs.target_con_name = Some("red".to_string());
+        gs.target_attitude = Some("scowls".to_string());
+
+        gs.upsert_entity(make_entity(2, "a rat", 1.0, 0.0, 0.0, true));
+        gs.set_target(2);
+        assert_eq!(gs.target_con, None, "stale con must clear on re-target");
+        assert_eq!(gs.target_con_name, None, "stale con_name must clear on re-target");
+        assert_eq!(gs.target_attitude, None, "stale attitude must clear on re-target");
+
+        // Repopulates once a fresh consider reply lands for the new target.
+        gs.target_con = Some([0, 255, 0]);
+        gs.target_con_name = Some("green".to_string());
+        gs.target_attitude = Some("indifferent".to_string());
+        assert_eq!(gs.target_con, Some([0, 255, 0]));
+        assert_eq!(gs.target_con_name.as_deref(), Some("green"));
+        assert_eq!(gs.target_attitude.as_deref(), Some("indifferent"));
+    }
+
+    #[test]
+    fn set_target_self_f1_resolves_player_name_and_hp_not_entities() {
+        // F1 self-target: id == player_id. The player is never present in `entities`
+        // (register_spawn skips the self-spawn), so this must NOT fall into the
+        // "unknown spawn -> clear" branch — it must resolve from the player fields.
+        let mut gs = GameState::new();
+        gs.player_id = 1;
+        gs.player_name = "Aldric".to_string();
+        gs.hp_pct = 42.0;
+        gs.set_target(1);
+        assert!(!gs.entities.contains_key(&1), "player must never appear in entities");
+        assert_eq!(gs.target_id, Some(1));
+        assert_eq!(gs.target_name.as_deref(), Some("Aldric"));
+        assert_eq!(gs.target_hp_pct, Some(42.0));
+    }
+
+    #[test]
+    fn set_target_self_after_mob_clears_stale_con() {
+        // Re-targeting SELF (F1) after having a con'd mob targeted must also clear the
+        // stale con/attitude — self-target is never considered, so nothing else would.
+        let mut gs = GameState::new();
+        gs.player_id = 1;
+        gs.player_name = "Aldric".to_string();
+        gs.upsert_entity(make_entity(9, "a dragon", 0.0, 0.0, 0.0, true));
+        gs.set_target(9);
+        gs.target_con = Some([255, 0, 0]);
+        gs.target_con_name = Some("red".to_string());
+        gs.target_attitude = Some("scowls".to_string());
+
+        gs.set_target(1); // F1
+        assert_eq!(gs.target_con, None);
+        assert_eq!(gs.target_con_name, None);
+        assert_eq!(gs.target_attitude, None);
+        assert_eq!(gs.target_name.as_deref(), Some("Aldric"));
     }
 
     #[test]
