@@ -87,22 +87,22 @@ async fn post_attack_off(State(s): State<HttpState>) -> (StatusCode, String) {
 struct ConsiderBody { id: Option<u32> }
 
 /// POST /v1/combat/consider {"id":N?} — consider a spawn (con color/faction), default current target.
-async fn post_consider(State(s): State<HttpState>, body: Option<Json<ConsiderBody>>) -> (StatusCode, String) {
-    let id = body.and_then(|Json(b)| b.id).or(s.player_info.lock().unwrap().target_id);
+async fn post_consider(State(s): State<HttpState>, OptionalJson(body): OptionalJson<ConsiderBody>) -> (StatusCode, String) {
+    let id = body.and_then(|b| b.id).or(s.player_info.lock().unwrap().target_id);
     match id {
         Some(id) => { *s.consider.lock().unwrap() = Some(id); (StatusCode::OK, format!("consider {id} queued")) }
         None => (StatusCode::BAD_REQUEST, "no target; provide {\"id\":N}".into()),
     }
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Default)]
 struct CastBody { gem: Option<u8>, spell_id: Option<u32>, target_id: Option<u32>, item_slot: Option<u32> }
 
 /// POST /v1/combat/cast {"gem":0-8} | {"spell_id":N,"target_id":M?} | {"item_slot":S,"target_id":M?}
 /// `item_slot` activates an inventory item's click ("clicky") effect — a teleport ring / port
 /// potion, etc. — at the given RoF2 wire slot (from GET /v1/observe/inventory). (eqoxide#193)
-async fn post_cast(State(s): State<HttpState>, body: Option<Json<CastBody>>) -> (StatusCode, String) {
-    let b = body.map(|Json(b)| b).unwrap_or(CastBody { gem: None, spell_id: None, target_id: None, item_slot: None });
+async fn post_cast(State(s): State<HttpState>, OptionalJson(body): OptionalJson<CastBody>) -> (StatusCode, String) {
+    let b = body.unwrap_or_default();
     // Item clicky cast: validate the slot holds a clickable item (for a clear error), then queue it.
     if let Some(slot) = b.item_slot {
         let clicky = s.inventory.lock().unwrap().iter()
@@ -167,4 +167,74 @@ async fn post_scribe(
         Some(f) => format!("scribing spell {} into book slot {} (scroll from slot {})", b.spell_id, slot, f),
         None    => format!("scribing spell {} into book slot {} (scroll assumed on cursor)", b.spell_id, slot),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+    use crate::http::quests::tests::empty_state;
+
+    async fn body_text(resp: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    // --- consider: a malformed body must not silently fall back to "current target" ------------
+
+    #[tokio::test]
+    async fn consider_no_body_falls_back_to_current_target() {
+        let state = empty_state();
+        state.player_info.lock().unwrap().target_id = Some(7);
+        let consider = state.consider.clone();
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::post("/consider").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(*consider.lock().unwrap(), Some(7));
+    }
+
+    #[tokio::test]
+    async fn consider_malformed_id_is_400_and_does_not_fall_back() {
+        let state = empty_state();
+        // A current target IS set — the old Option<Json<T>> bug would silently consider IT instead
+        // of reporting the malformed "id" field.
+        state.player_info.lock().unwrap().target_id = Some(7);
+        let consider = state.consider.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/consider")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"id":"not-a-number"}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(consider.lock().unwrap().is_none(),
+            "a malformed id must not silently fall through to considering the current target");
+    }
+
+    // --- cast: preserve the "no gem/spell_id" 400, but a malformed body must say so honestly ----
+
+    #[tokio::test]
+    async fn cast_no_body_is_400_with_provide_message() {
+        let state = empty_state();
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::post("/cast").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let text = body_text(resp).await;
+        assert!(text.contains("provide"), "message: {text}");
+    }
+
+    #[tokio::test]
+    async fn cast_malformed_gem_is_400_with_malformed_message() {
+        let state = empty_state();
+        let app = router().with_state(state);
+        let req = Request::post("/cast")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"gem":"not-a-number"}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let text = body_text(resp).await;
+        assert!(text.contains("malformed JSON body"),
+            "message should name the real cause, not the unrelated \"provide gem/spell_id\" default-validation text: {text}");
+    }
 }

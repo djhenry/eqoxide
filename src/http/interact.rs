@@ -100,9 +100,9 @@ struct HailBody {
 /// The NPC must be within ~200 units (server-enforced say range).
 async fn post_hail(
     State(s): State<HttpState>,
-    body: Option<Json<HailBody>>,
+    OptionalJson(body): OptionalJson<HailBody>,
 ) -> (StatusCode, String) {
-    let requested = body.and_then(|Json(b)| b.name);
+    let requested = body.and_then(|b| b.name);
     let positions = s.entity_positions.lock().unwrap();
 
     let resolved: Option<String> = if let Some(name) = &requested {
@@ -184,9 +184,9 @@ struct LootBody {
 /// spawn id, {"name":"..."} to fuzzy-match a corpse name, or {} for the nearest corpse.
 async fn post_loot(
     State(s): State<HttpState>,
-    body: Option<Json<LootBody>>,
+    OptionalJson(body): OptionalJson<LootBody>,
 ) -> (StatusCode, String) {
-    let b = body.map(|Json(b)| b).unwrap_or_default();
+    let b = body.unwrap_or_default();
     // Resolve to a corpse spawn id: explicit id > fuzzy name > nearest corpse.
     let resolved: Option<(String, u32)> = if let Some(id) = b.id {
         let name = s.entity_ids.lock().unwrap().iter()
@@ -298,4 +298,74 @@ async fn post_sit(State(s): State<HttpState>) -> (StatusCode, String) {
 async fn post_stand(State(s): State<HttpState>) -> (StatusCode, String) {
     *s.sit.lock().unwrap() = Some(false);
     (StatusCode::OK, "stand queued".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+    use crate::http::quests::tests::empty_state;
+
+    fn seed_npc(state: &crate::http::HttpState, key: &str, id: u32, pos: (f32, f32, f32)) {
+        state.entity_positions.lock().unwrap().insert(key.to_string(), pos);
+        state.entity_ids.lock().unwrap().insert(key.to_string(), id);
+    }
+
+    // --- hail: a malformed name must not silently fall back to "nearest NPC" -------------------
+
+    #[tokio::test]
+    async fn hail_no_body_hails_nearest_npc() {
+        let state = empty_state();
+        seed_npc(&state, "Guard_Phaeton000", 5, (1.0, 1.0, 0.0));
+        let hail = state.hail.clone();
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::post("/hail").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(hail.lock().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn hail_malformed_name_is_400_and_does_not_hail_nearest() {
+        let state = empty_state();
+        seed_npc(&state, "Guard_Phaeton000", 5, (1.0, 1.0, 0.0));
+        let hail = state.hail.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/hail")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":5}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(hail.lock().unwrap().is_none(),
+            "a malformed name must not silently fall through to hailing the nearest NPC");
+    }
+
+    // --- loot: a malformed id must not silently fall back to "nearest corpse" ------------------
+
+    #[tokio::test]
+    async fn loot_no_body_loots_nearest_corpse() {
+        let state = empty_state();
+        seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
+        let loot = state.loot.clone();
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::post("/loot").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(*loot.lock().unwrap(), Some(9));
+    }
+
+    #[tokio::test]
+    async fn loot_malformed_id_is_400_and_does_not_loot_nearest() {
+        let state = empty_state();
+        seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
+        let loot = state.loot.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/loot")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"id":"not-a-number"}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(loot.lock().unwrap().is_none(),
+            "a malformed id must not silently fall through to looting the nearest corpse");
+    }
 }

@@ -16,6 +16,40 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 use crate::camera_state::{CameraCmd, CameraSnapshot};
 
+/// Extracts an optional JSON body, distinguishing "no body was sent" (→ `.0 == None`, so the
+/// handler applies its own defaults) from "a body was sent but didn't parse" (→ a 400 naming
+/// exactly what failed). `Option<axum::Json<T>>` collapses BOTH cases into `None` — a malformed or
+/// out-of-range field (e.g. a `u16` field given `99999`) silently looks identical to an omitted
+/// body, so the handler's default kicks in and the caller gets a misleading 200 (eqoxide#328).
+///
+/// Whether a body was "sent" is judged from the raw bytes (empty/whitespace-only ⇒ absent), not
+/// from the `Content-Type` header — so a caller that forgets `Content-Type: application/json` still
+/// gets its body parsed (or a clear 400) instead of a silent no-op.
+pub(crate) struct OptionalJson<T>(pub(crate) Option<T>);
+
+#[axum::async_trait]
+impl<T, S> axum::extract::FromRequest<S> for OptionalJson<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = (axum::http::StatusCode, String);
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        let bytes = axum::body::Bytes::from_request(req, state)
+            .await
+            .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("failed to read request body: {e}")))?;
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            return Ok(OptionalJson(None));
+        }
+        let de = &mut serde_json::Deserializer::from_slice(&bytes);
+        match serde_path_to_error::deserialize::<_, T>(de) {
+            Ok(v) => Ok(OptionalJson(Some(v))),
+            Err(e) => Err((axum::http::StatusCode::BAD_REQUEST, format!("malformed JSON body: {e}"))),
+        }
+    }
+}
+
 mod observe;
 mod quests;
 mod group;
