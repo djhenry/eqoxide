@@ -1494,6 +1494,30 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
     let (msg, choices) = parse_say_links(&msg);
     if chan_num == 8 && !choices.is_empty() { gs.dialogue_choices = choices; }
 
+    // Self-echo filter (#325): EQEmu broadcasts channel messages — say/ooc/shout/group/guild/
+    // auction/gmsay — back to the SENDING client too, not just other listeners in range
+    // (zone/entity.cpp's ChannelMessageSend delivery loops iterate every client including the
+    // sender, with no `client == sender` skip; confirmed against a live server). Tells are the
+    // same story via a different mechanism: the world server echoes a tell back to the sender
+    // on chan_num 14 (ChatChannel_TellEcho), NOT 7 (zone/worldserver.cpp), so a self-tell doesn't
+    // even land in the tell/ooc/... match below — without this filter it silently falls into the
+    // generic "chat" bucket as a *second*, differently formatted line.
+    //
+    // The outgoing-chat code in navigation.rs (the hail/say/dialogue-click/chat_send sites)
+    // already writes the "You say/tell/..." line into the log the moment we send, so this
+    // inbound bounce-back must never be logged or evented — logging it doubles every outgoing
+    // line, and eventing it means an agent polling /v1/events/chat receives its own outbound
+    // message as if some other player said it (agent-honesty violation). The check is keyed on
+    // sender identity, not channel number, so it catches the chan-14 tell echo along with every
+    // other self-broadcast channel uniformly.
+    let is_self_echo = !gs.player_name.is_empty()
+        && !sender.is_empty()
+        && sender.eq_ignore_ascii_case(&gs.player_name);
+    if is_self_echo {
+        tracing::debug!("chat: dropped self-echo from server (chan {chan_num}): {msg}");
+        return;
+    }
+
     // EQEmu ChatChannel: 0 guild, 2 group, 3 shout, 4 auction, 5 OOC, 6 broadcast, 7 tell,
     // 8 say, 11 gmsay. The inter-agent channels are ALSO recorded as structured chat events for
     // the GET /events feed; `say` (8) is NPC dialogue / local say and stays in the message log only.
@@ -3109,6 +3133,103 @@ mod tests {
         assert_eq!(e.category, "chat");
         assert_eq!(e.kind, "ooc");
         assert!(!e.directed);
+    }
+
+    // --- self-echo filter (#325) ---
+    //
+    // EQEmu broadcasts channel messages back to the SENDING client, not just other listeners
+    // (zone/entity.cpp ChannelMessageSend loops include the sender with no skip; confirmed
+    // live against the running server). The outgoing-chat code in navigation.rs already writes
+    // the "You say/tell/..." line into the log when we send, so this inbound bounce must be
+    // dropped entirely — it must not double the message log AND it must never surface as a
+    // /v1/events/chat event (an agent would otherwise "hear" its own outbound message as if
+    // someone else said it).
+
+    #[test]
+    fn apply_channel_message_self_say_is_dropped_entirely() {
+        let mut gs = GameState::new();
+        gs.player_name = "Mordeth".to_string();
+        super::apply_channel_message(&mut gs, &make_chan_payload("Mordeth", 8, "echo probe"));
+        assert!(gs.messages.is_empty(), "our own say bouncing back must not be logged again");
+        assert!(gs.chat_events.is_empty());
+    }
+
+    #[test]
+    fn apply_channel_message_self_shout_is_dropped_from_log_and_events() {
+        let mut gs = GameState::new();
+        gs.player_name = "Mordeth".to_string();
+        super::apply_channel_message(&mut gs, &make_chan_payload("Mordeth", 3, "shout echo"));
+        assert!(gs.messages.is_empty(), "our own shout bouncing back must not be logged again");
+        assert!(gs.chat_events.is_empty(), "our own shout must never appear as an inbound chat event");
+    }
+
+    #[test]
+    fn apply_channel_message_self_ooc_group_guild_gmsay_are_dropped() {
+        for chan in [0u32, 2, 5, 11] {
+            let mut gs = GameState::new();
+            gs.player_name = "Mordeth".to_string();
+            super::apply_channel_message(&mut gs, &make_chan_payload("Mordeth", chan, "self bounce"));
+            assert!(gs.messages.is_empty(), "chan {chan}: self bounce must not be logged");
+            assert!(gs.chat_events.is_empty(), "chan {chan}: self bounce must not be a chat event");
+        }
+    }
+
+    #[test]
+    fn apply_channel_message_self_tell_echo_chan14_is_dropped() {
+        // EQEmu echoes a tell back to the SENDER on chan_num 14 (ChatChannel_TellEcho), NOT 7
+        // (zone/worldserver.cpp: the world mutates chan_num to 14 before relaying the echo back
+        // to the sender's zone). This chan number isn't in the tell/ooc/etc. event_channel match
+        // at all, so without the self filter it would fall through to the generic "chat" bucket
+        // and log as "<Mordeth> ..." — a second, differently-formatted line for the same tell.
+        let mut gs = GameState::new();
+        gs.player_name = "Mordeth".to_string();
+        super::apply_channel_message(&mut gs, &make_chan_payload_to("Mordeth", "Katie", 14, "you stuck?"));
+        assert!(gs.messages.is_empty(), "the tell echo (chan 14) must not be logged again");
+        assert!(gs.chat_events.is_empty());
+    }
+
+    #[test]
+    fn apply_channel_message_self_tell_chan7_sender_is_us_is_dropped() {
+        // Defensive: even if a chan-7 tell packet ever arrived with US as the sender (rather
+        // than the documented chan-14 echo), the filter is keyed on sender identity, not the
+        // channel number, so it still must not be logged or evented.
+        let mut gs = GameState::new();
+        gs.player_name = "Mordeth".to_string();
+        super::apply_channel_message(&mut gs, &make_tell("Mordeth", "Katie", "hi"));
+        assert!(gs.messages.is_empty());
+        assert!(gs.chat_events.is_empty());
+    }
+
+    #[test]
+    fn apply_channel_message_self_filter_is_case_insensitive() {
+        let mut gs = GameState::new();
+        gs.player_name = "Mordeth".to_string();
+        super::apply_channel_message(&mut gs, &make_chan_payload("MORDETH", 5, "case check"));
+        assert!(gs.messages.is_empty(), "sender name case must not defeat the self filter");
+        assert!(gs.chat_events.is_empty());
+    }
+
+    #[test]
+    fn apply_channel_message_other_player_still_logs_when_player_name_unset() {
+        // Guard against an over-eager filter: before we've learned our own player_name (empty
+        // string, e.g. mid zone-transition), nothing should be treated as a self-echo.
+        let mut gs = GameState::new();
+        assert_eq!(gs.player_name, "");
+        super::apply_channel_message(&mut gs, &make_chan_payload("Garrik", 3, "hello zone"));
+        assert!(gs.messages.iter().any(|m| m.kind == "shout" && m.text == "<Garrik> hello zone"));
+    }
+
+    #[test]
+    fn apply_channel_message_other_player_same_channel_still_logged_and_evented() {
+        // Requirement 3: genuine inbound traffic from OTHER players must be unaffected by the
+        // self filter, on every channel the filter touches.
+        let mut gs = GameState::new();
+        gs.player_name = "Mordeth".to_string();
+        super::apply_channel_message(&mut gs, &make_chan_payload("Garrik", 3, "hello zone"));
+        assert!(gs.messages.iter().any(|m| m.kind == "shout" && m.text == "<Garrik> hello zone"));
+        let e = gs.chat_events.back().expect("a chat event from another player");
+        assert_eq!(e.from, "Garrik");
+        assert_eq!(e.kind, "shout");
     }
 
     #[test]
