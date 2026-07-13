@@ -160,6 +160,12 @@ pub struct App {
     pick_screen_h:  u32,
     // EQ state
     game_state:   GameState,
+    /// The `ArcSwap` handle the network thread publishes into every gameplay tick.
+    game_state_snapshot: crate::http::GameStateSnapshot,
+    /// This frame's cached load of `game_state_snapshot`. Refreshed at the top of poll_external
+    /// and render_frame; reads between two refresh points may straddle two snapshots, which is
+    /// fine — each snapshot is internally consistent.
+    game_state_view: std::sync::Arc<GameState>,
     /// Offline testzone mode — bypasses EQ server entirely.
     #[allow(dead_code)]
     testzone_mode: bool,
@@ -235,6 +241,7 @@ impl App {
         camera_cmd:      Arc<Mutex<Option<CameraCmd>>>,
         camera_snapshot: Arc<Mutex<CameraSnapshot>>,
         app_rx:          tokio::sync::mpsc::UnboundedReceiver<AppPacket>,
+        game_state_snapshot: crate::http::GameStateSnapshot,
         frame_req:       FrameReq,
         goto_target:     crate::http::GotoTarget,
         acts:            crate::ui::Actions,
@@ -259,6 +266,7 @@ impl App {
         // Distinct per-client window title (#297): "{account} {character} - EQOxide".
         let window_title = format!("{} {} - EQOxide", asset_user, character_name);
         let mut game_state = GameState::new();
+        let game_state_view = game_state_snapshot.load_full();
         game_state.player_name = character_name;
 
         if testzone_mode {
@@ -324,6 +332,7 @@ impl App {
             models_loaded: false,
             asset_server_url, asset_user, asset_pass,
             window_title,
+            game_state_snapshot, game_state_view,
         }
     }
 
@@ -390,7 +399,7 @@ impl App {
         let mut best_t = f32::MAX;
         let mut best: Option<PickResult> = None;
 
-        for (&id, e) in &self.game_state.entities {
+        for (&id, e) in &self.game_state_view.entities {
             if e.dead { continue; }
             // Lift sphere center to entity mid-body height. Entity (x=east, y=north).
             let center = glam::Vec3::new(e.x, e.y, e.z + SPHERE_R * 0.75);
@@ -413,7 +422,7 @@ impl App {
         // T(pos) * Rz(yaw) * S(size/100). Incline is ignored for picking (negligible).
         let door_bounds = self.gpu.as_ref().map(|(_, r)| &r.door_bounds);
         const DEFAULT_DOOR_AABB: ([f32; 3], [f32; 3]) = ([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]);
-        for d in self.game_state.doors.values() {
+        for d in self.game_state_view.doors.values() {
             let (bmin, bmax) = door_bounds
                 .and_then(|b| b.get(&d.name.to_uppercase()))
                 .copied()
@@ -728,6 +737,7 @@ impl App {
     /// player input/motion in flight, easing doors/position/heading, or a queued HTTP request that a
     /// render must service (frame capture / camera).
     fn poll_external(&mut self) -> bool {
+        self.game_state_view = self.game_state_snapshot.load_full();
         let mut activity = false;
 
         // Drain all queued packets; any packet may move/spawn an entity, so treat as activity.
@@ -786,6 +796,7 @@ impl App {
     }
 
     fn render_frame(&mut self) {
+        self.game_state_view = self.game_state_snapshot.load_full();
         // Compute dt at the very top so it's available for animation before SceneState is built.
         let now = std::time::Instant::now();
         let dt  = (now - self.last_frame_time).as_secs_f32().min(0.1);
@@ -817,7 +828,7 @@ impl App {
 
         // Update shared player state for the /debug HTTP endpoint.
         {
-            let gs = &self.game_state;
+            let gs = &*self.game_state_view;
             let pos = if self.camera_initialized { self.controller.pos } else { [gs.player_x, gs.player_y, gs.player_z] };
             let h_cw = crate::eq_net::protocol::ccw_to_cw(gs.player_heading);
             *self.player_info.lock().unwrap() = crate::http::PlayerState {
@@ -874,7 +885,7 @@ impl App {
                 // Previous frame's smoothed phase timings (this frame's aren't known yet).
                 frame_profile:      self.frame_profile,
                 // Most recently read book/note text (OP_ReadBook reply), for GET /v1/observe/item_text (#288).
-                book_text:          self.game_state.last_book_text.clone(),
+                book_text:          gs.last_book_text.clone(),
             };
         }
         // Mirror the health state into the scene so the HUD can show a "connection lost" banner (#8).
@@ -1338,7 +1349,7 @@ impl App {
             self.current_fps, self.zone_map.as_ref(),
             cam_eye, self.collision.as_deref(),
             &self.acts, &self.spells,
-            self.show_debug, self.game_state.server_corrections,
+            self.show_debug, self.game_state_view.server_corrections,
             &self.frame_profile,
             self.nav_debug,
             self.goto_target.lock().unwrap().map(|(x, y, z)| [x, y, z]),

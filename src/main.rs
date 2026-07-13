@@ -477,6 +477,7 @@ OPTIONS:
         camera_cmd,
         camera_snapshot,
         app_rx,
+        game_state_snapshot.clone(),
         frame_req,
         app_goto,
         app_actions,
