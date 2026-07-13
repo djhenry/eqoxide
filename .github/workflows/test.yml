@@ -14,6 +14,22 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # The repo's tracked .cargo/config.toml sets `rustc-wrapper = "sccache"` and
+    # `rustflags = ["-C", "link-arg=-fuse-ld=mold"]` — a local-dev speed-up for the shared dev
+    # box where both tools are installed. Neither exists on a bare `ubuntu-latest` runner, and
+    # a fresh checkout picks the config file up automatically (it's repo-tracked, not
+    # gitignored), so an unmodified `cargo build` here fails immediately with
+    # `could not execute process 'sccache ...' (never executed): No such file or directory`.
+    # Rather than edit the shared config file (other agents rely on it locally), override both
+    # settings via env vars scoped to this job: CARGO_BUILD_RUSTC_WRAPPER="" and RUSTFLAGS=""
+    # each take precedence over their config-file counterpart and effectively erase them.
+    # Verified empirically against a throwaway crate with an identical config.toml: with a
+    # linker name that cannot exist anywhere (not just "absent from PATH"), the build fails
+    # without the RUSTFLAGS="" override and succeeds with it, confirming the override fully
+    # cancels the config file's rustflags rather than merely appending to them.
+    env:
+      CARGO_BUILD_RUSTC_WRAPPER: ""
+      RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v4
 
