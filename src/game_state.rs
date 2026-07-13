@@ -1007,6 +1007,70 @@ mod tests {
         assert!((gs.hp_pct - 0.0).abs() < 1e-4);
     }
 
+    // --- GameState::update_hp / update_hp_pct live-sync `target_hp_pct` (eqoxide#9, task 6) ---
+    // target_hp_pct is a stored snapshot (seeded when a target is selected — see
+    // Navigator::tick), not derived fresh from `entities` on every HUD read, so these HP
+    // handlers must refresh it whenever the update is for whichever spawn is currently
+    // targeted — including the F1 self-target case, where the player is never present in
+    // `gs.entities` (register_spawn special-cases and skips the self-spawn).
+
+    #[test]
+    fn update_hp_refreshes_target_hp_pct_for_targeted_entity() {
+        let mut gs = GameState::new();
+        gs.upsert_entity(make_entity(7, "mob", 0.0, 0.0, 0.0, true));
+        gs.target_id = Some(7);
+        gs.update_hp(7, 50, 200);
+        let pct = gs.target_hp_pct.expect("target_hp_pct must be set for the targeted entity");
+        assert!((pct - 25.0).abs() < 1e-4, "expected 25.0, got {pct}");
+    }
+
+    #[test]
+    fn update_hp_leaves_target_hp_pct_untouched_for_non_targeted_entity() {
+        let mut gs = GameState::new();
+        gs.upsert_entity(make_entity(7, "mob", 0.0, 0.0, 0.0, true));
+        gs.upsert_entity(make_entity(8, "other mob", 0.0, 0.0, 0.0, true));
+        gs.target_id = Some(8);
+        gs.target_hp_pct = Some(99.0); // sentinel: whatever the targeted entity (8) last showed
+        gs.update_hp(7, 50, 200); // HP update for a DIFFERENT, non-targeted entity
+        assert_eq!(gs.target_hp_pct, Some(99.0), "target_hp_pct must not move for a non-targeted entity's HP update");
+    }
+
+    #[test]
+    fn update_hp_pct_refreshes_target_hp_pct_for_targeted_entity() {
+        let mut gs = GameState::new();
+        gs.upsert_entity(make_entity(7, "mob", 0.0, 0.0, 0.0, true));
+        gs.target_id = Some(7);
+        gs.update_hp_pct(7, 40.0);
+        assert_eq!(gs.target_hp_pct, Some(40.0), "target_hp_pct must live-sync with a percent-only HP update for the targeted entity");
+    }
+
+    #[test]
+    fn update_hp_pct_leaves_target_hp_pct_untouched_for_non_targeted_entity() {
+        let mut gs = GameState::new();
+        gs.upsert_entity(make_entity(7, "mob", 0.0, 0.0, 0.0, true));
+        gs.upsert_entity(make_entity(8, "other mob", 0.0, 0.0, 0.0, true));
+        gs.target_id = Some(8);
+        gs.target_hp_pct = Some(99.0); // sentinel
+        gs.update_hp_pct(7, 40.0); // percent-only update for a DIFFERENT, non-targeted entity
+        assert_eq!(gs.target_hp_pct, Some(99.0), "target_hp_pct must not move for a non-targeted entity's percent-only HP update");
+    }
+
+    #[test]
+    fn update_hp_self_target_refreshes_target_hp_pct_from_player_hp() {
+        // F1 (self-target): target_id == player_id. The player is never present in
+        // `entities` (register_spawn special-cases and skips the self-spawn), so this must
+        // take the `spawn_id == self.player_id` branch and source target_hp_pct from the
+        // player's own hp_pct field rather than `entities.get(&spawn_id)` (which would find
+        // nothing and leave target_hp_pct stuck / unset).
+        let mut gs = GameState::new();
+        gs.player_id = 1;
+        gs.target_id = Some(1);
+        gs.update_hp(1, 30, 200); // 15%
+        assert!(!gs.entities.contains_key(&1), "player must never appear in entities");
+        let pct = gs.target_hp_pct.expect("target_hp_pct must be set for the self-target case");
+        assert!((pct - 15.0).abs() < 1e-4, "expected 15.0, got {pct}");
+    }
+
     #[test]
     fn set_xp_converts_330_ratio_to_percent() {
         let mut gs = GameState::new();
