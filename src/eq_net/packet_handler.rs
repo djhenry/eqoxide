@@ -55,6 +55,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_ZONE_PLAYER_TO_BIND  => apply_bind_respawn(gs, p),
         OP_DAMAGE               => apply_combat_damage(gs, p),
         OP_MONEY_ON_CORPSE      => apply_money_on_corpse(gs, p),
+        OP_LOOT_COMPLETE        => apply_loot_complete(gs),
         OP_MONEY_UPDATE         => apply_money_update(gs, p),
         OP_WEAR_CHANGE          => apply_wear_change(gs, p),
         OP_TASK_DESCRIPTION     => apply_task_description(gs, p),
@@ -2290,19 +2291,65 @@ pub fn apply_wear_change(gs: &mut GameState, p: &[u8]) {
     }
 }
 
+/// EQEmu's `LootResponse` enum (zone/common.h) — the `response` byte of MoneyOnCorpse_Struct,
+/// the server's only ack for a client OP_LootRequest. Verified against zone/corpse.cpp
+/// `MakeLootRequestPackets` (sets `Normal`/`LootAll` on success) and `SendLootReqErrorPacket`
+/// (sets `SomeoneElse`/`NotAtThisTime`/`Hostiles`/`TooFar` on refusal) — see protocol.rs OP_MONEY_ON_CORPSE.
+fn loot_refusal_reason(response: u8) -> Option<&'static str> {
+    match response {
+        1 | 3 | 6 => None, // Normal / Normal2 / LootAll — accepted, not a refusal.
+        0 => Some("someone else is looting it"),
+        2 => Some("not at this time"),
+        4 => Some("hostiles nearby"),
+        5 => Some("too far away"),
+        _ => Some("refused"),
+    }
+}
+
 fn apply_money_on_corpse(gs: &mut GameState, payload: &[u8]) {
     // MoneyOnCorpse_Struct: response(u8) + 3×pad + platinum(u32) + gold(u32) + silver(u32) + copper(u32)
     if payload.len() < 20 { return; }
-    let response  = payload[0];
-    if response != 0 {
-        tracing::warn!("EQ: OP_MoneyOnCorpse denied (response={})", response);
+    let response = payload[0];
+    if let Some(reason) = loot_refusal_reason(response) {
+        // The corpse never opened — say so honestly (distinct from "Looting complete") instead of
+        // letting the auto-loot timer silently declare the session done with zero items (#346).
+        let corpse_id = gs.loot_current_corpse.take();
+        gs.loot_session_active = false;
+        gs.loot_confirmed = false;
+        gs.loot_last_activity = None;
+        gs.loot_end_requested_at = None;
+        let msg = format!("Loot refused: {reason}");
+        gs.log_msg("loot", &msg);
+        gs.push_event("loot", "refused", "system", true, &msg);
+        tracing::warn!(
+            "EQ: OP_MoneyOnCorpse refused loot (response={response}, corpse_id={corpse_id:?})"
+        );
+        // Let the queue move on to the next corpse rather than getting stuck behind this refusal.
+        gs.loot_queued_at = gs.pending_loot.front().map(|_| std::time::Instant::now());
         return;
     }
+    // Normal(1) / Normal2(3) / LootAll(6) — the server accepted the request.
+    gs.loot_confirmed = true;
+    gs.loot_last_activity = Some(std::time::Instant::now());
+
+    // ONLY Normal(1)/Normal2(3) carry the corpse's coin: they are the reply to OP_LootRequest built
+    // by `Corpse::MakeLootRequestPackets` (zone/corpse.cpp:1139), which is the one place that fills
+    // the platinum/gold/silver/copper fields. LootAll(6) is the SoD+ "all items were sent" marker
+    // that trails the item packets — it is NOT a fresh accept and must never credit coin.
+    //
+    // Crediting it happens to be harmless TODAY only because `BasePacket` memsets the buffer
+    // (common/base_packet.cpp:31) so a LootAll packet carries zeros. That makes coin correctness
+    // load-bearing on a server-side memset — in the exact field whose polarity was already inverted
+    // once (see above: every looted coin used to be silently discarded). A two-value match is free;
+    // don't bet the purse on someone else's memset (#346 review).
+    if !matches!(response, 1 | 3) {
+        return;
+    }
+
     let platinum = u32::from_le_bytes([payload[4],  payload[5],  payload[6],  payload[7]]);
     let gold     = u32::from_le_bytes([payload[8],  payload[9],  payload[10], payload[11]]);
     let silver   = u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
     let copper   = u32::from_le_bytes([payload[16], payload[17], payload[18], payload[19]]);
-    gs.loot_last_activity = Some(std::time::Instant::now());
     if platinum > 0 || gold > 0 || silver > 0 || copper > 0 {
         // Add the looted coins to the on-hand total for the HUD. Corpse loot calls the server's
         // AddMoneyToPP with update_client=false (verified in EQEmu), so it does NOT also send an
@@ -2321,6 +2368,70 @@ fn apply_money_on_corpse(gs: &mut GameState, payload: &[u8]) {
     } else {
         tracing::info!("EQ: no coins on corpse");
     }
+}
+
+/// OP_LootComplete — a 0-byte packet the server sends for TWO very different outcomes, and it is
+/// byte-identical in both, so the packet alone cannot tell them apart (#346 review):
+///
+///   1. The genuine close: `Corpse::EndLoot` (zone/corpse.cpp:1787), sent in reply to OUR
+///      OP_EndLootRequest. This — and only this — means "the loot session finished".
+///   2. A server-side ABORT of an item take: `Corpse::LootCorpseItem` (zone/corpse.cpp:1419)
+///      answers our OP_LootItem echo with `SendEndLootErrorPacket` (corpse.cpp:50 → a 0-byte
+///      OP_LootComplete) on EVERY error path — LORE conflict (corpse.cpp:1535, :1548),
+///      cursor-not-empty (corpse.cpp:1459 — a live condition for this client, see #275), loot
+///      cooldown, not-the-looter, zoning, and others. The items STAY ON THE CORPSE.
+///
+/// Reporting (2) as "Looting complete" would be exactly the #346 lie relocated from the timer to
+/// the item path: the agent concludes the corpse is done and walks away, leaving the loot behind.
+///
+/// The discriminator is our own state, not the packet: we only ever send OP_EndLootRequest from
+/// `LootTickAction::Close`, which sets `loot_end_requested_at`. So:
+///   - `loot_end_requested_at.is_some()` → we asked to close → a genuine completion.
+///   - an open, CONFIRMED session that we never asked to close → the server aborted → say so.
+///   - anything else (no session, or a session that hasn't been accepted yet) → a stray/late
+///     packet (e.g. arriving after our own TimedOut, while the NEXT corpse is already opening).
+///     It must not be attributed to that corpse — leave the session untouched.
+fn apply_loot_complete(gs: &mut GameState) {
+    // (1) Genuine close — this is the ONLY place "Looting complete" may be emitted.
+    if gs.loot_end_requested_at.is_some() {
+        let corpse_id = gs.loot_current_corpse.take();
+        gs.loot_session_active = false;
+        gs.loot_confirmed = false;
+        gs.loot_last_activity = None;
+        gs.loot_end_requested_at = None;
+        gs.log_msg("loot", "Looting complete");
+        gs.push_event("loot", "complete", "system", true, "Looting complete");
+        tracing::info!("EQ: OP_LootComplete received — loot session closed by server (corpse_id={corpse_id:?})");
+        gs.loot_queued_at = gs.pending_loot.front().map(|_| std::time::Instant::now());
+        return;
+    }
+
+    // (2) We never asked to close, but a confirmed session was open → the server aborted an item
+    // take (LORE / cursor-not-empty / …). Items remain on the corpse; report it honestly.
+    if gs.loot_session_active && gs.loot_confirmed {
+        let corpse_id = gs.loot_current_corpse.take();
+        gs.loot_session_active = false;
+        gs.loot_confirmed = false;
+        gs.loot_last_activity = None;
+        gs.loot_end_requested_at = None;
+        let msg = format!(
+            "Loot aborted by the server — items may remain on the corpse (corpse_id={corpse_id:?}). \
+             A full cursor or a LORE-conflicting item is the usual cause."
+        );
+        gs.log_msg("loot", &msg);
+        gs.push_event("loot", "aborted", "system", true, &msg);
+        tracing::warn!("EQ: {msg}");
+        gs.loot_queued_at = gs.pending_loot.front().map(|_| std::time::Instant::now());
+        return;
+    }
+
+    // (3) Stray/late packet. Do NOT clear state: a session may have just opened for the NEXT
+    // corpse (which this packet has nothing to do with — it is 0-byte and carries no corpse id).
+    tracing::info!(
+        "EQ: stray OP_LootComplete (no close pending, confirmed={}) — ignoring, not attributing it \
+         to corpse_id={:?}",
+        gs.loot_confirmed, gs.loot_current_corpse,
+    );
 }
 
 /// OP_MoneyUpdate — the server's authoritative NEW coin total after a change that it tracks
@@ -3119,16 +3230,221 @@ mod tests {
         assert_eq!(gs.coin, [84, 9, 13, 8]);
     }
 
+    /// Build a MoneyOnCorpse_Struct payload (20 bytes): response(u8) + 3×pad + pp/gp/sp/cp (u32 LE).
+    fn money_on_corpse_payload(response: u8, pp: u32, gp: u32, sp: u32, cp: u32) -> Vec<u8> {
+        let mut p = vec![response, 0, 0, 0];
+        for v in [pp, gp, sp, cp] { p.extend_from_slice(&v.to_le_bytes()); }
+        p
+    }
+
     #[test]
-    fn money_on_corpse_adds_looted_coin() {
+    fn money_on_corpse_adds_looted_coin_on_normal_response() {
+        // #346: response=1 (LootResponse::Normal, verified against EQEmu zone/corpse.cpp
+        // MakeLootRequestPackets) is the server's ACCEPT — not response=0 (that's SomeoneElse, a
+        // REFUSAL). The old code had this backwards.
         let mut gs = GameState::new();
         gs.coin = [10, 0, 5, 0];
-        // MoneyOnCorpse_Struct: response(0)+3pad + platinum=2 gold=1 silver=0 copper=3 (u32 LE)
-        let mut p = vec![0u8; 4];
-        for v in [2u32, 1, 0, 3] { p.extend_from_slice(&v.to_le_bytes()); }
+        gs.loot_session_active = true;
+        let p = money_on_corpse_payload(1, 2, 1, 0, 3);
         apply_money_on_corpse(&mut gs, &p);
         assert_eq!(gs.coin, [12, 1, 5, 3]); // added on top of existing
+        assert!(gs.loot_confirmed, "a Normal response must confirm the session opened");
+        assert!(gs.loot_session_active, "an accepted request must not close the session");
     }
+
+    #[test]
+    fn money_on_corpse_normal2_response_also_confirms() {
+        let mut gs = GameState::new();
+        let p = money_on_corpse_payload(3, 0, 0, 0, 0);
+        apply_money_on_corpse(&mut gs, &p);
+        assert!(gs.loot_confirmed, "Normal2(3) is documented as behaving exactly like Normal(1)");
+    }
+
+    /// Core #346 regression: response=0 (SomeoneElse) is a REFUSAL, not the "OK, add zero coins"
+    /// case the old (inverted) polarity treated it as. A refusal must close the session, leave
+    /// `loot_confirmed` false, and emit a distinct message — never anything resembling success.
+    #[test]
+    fn money_on_corpse_someone_else_response_is_a_refusal_not_a_success() {
+        let mut gs = GameState::new();
+        gs.coin = [10, 0, 5, 0];
+        gs.loot_session_active = true;
+        gs.loot_current_corpse = Some(42);
+        let p = money_on_corpse_payload(0, 99, 99, 99, 99); // coin fields must be ignored
+        apply_money_on_corpse(&mut gs, &p);
+        assert_eq!(gs.coin, [10, 0, 5, 0], "a refused loot must not credit any coin");
+        assert!(!gs.loot_session_active, "a refusal must close the session");
+        assert!(!gs.loot_confirmed);
+        assert_eq!(gs.loot_current_corpse, None);
+        let last = gs.messages.back().expect("a refusal must log a message");
+        assert_eq!(last.kind, "loot");
+        assert!(last.text.to_lowercase().contains("refus"), "got: {:?}", last.text);
+        assert_ne!(last.text, "Looting complete", "a refusal must never read as success");
+        let ev = gs.chat_events.back().expect("a refusal must push an agent-visible event");
+        assert_eq!(ev.kind, "refused");
+    }
+
+    #[test]
+    fn money_on_corpse_too_far_response_is_also_a_refusal() {
+        let mut gs = GameState::new();
+        let p = money_on_corpse_payload(5, 0, 0, 0, 0); // TooFar
+        apply_money_on_corpse(&mut gs, &p);
+        assert!(!gs.loot_session_active);
+        assert!(!gs.loot_confirmed);
+        let last = gs.messages.back().unwrap();
+        assert!(last.text.contains("too far"), "got: {:?}", last.text);
+    }
+
+    /// LootAll(6) is the SoD+ "all items were sent" marker that follows a SUCCESSFUL loot's item
+    /// packets — it must NOT be treated as a refusal (a naive default-branch-is-refusal
+    /// implementation would misfire here).
+    #[test]
+    fn money_on_corpse_loot_all_marker_is_not_a_refusal() {
+        let mut gs = GameState::new();
+        gs.loot_session_active = true;
+        gs.loot_confirmed = true;
+        let p = money_on_corpse_payload(6, 0, 0, 0, 0);
+        apply_money_on_corpse(&mut gs, &p);
+        assert!(gs.loot_session_active, "LootAll must not close the session");
+        assert!(gs.loot_confirmed);
+    }
+
+    /// #346 REVIEW. Only Normal(1)/Normal2(3) — the reply to OP_LootRequest built by
+    /// `Corpse::MakeLootRequestPackets` (zone/corpse.cpp:1139) — carry the corpse's coin. LootAll(6)
+    /// is the trailing "all items were sent" marker and must credit NOTHING.
+    ///
+    /// This is deliberately fed a coin-BEARING LootAll payload, which cannot occur on the wire today
+    /// (`BasePacket` memsets the buffer, common/base_packet.cpp:31 — so a real LootAll carries
+    /// zeros). That memset is exactly the point: without this guard, coin correctness would be
+    /// load-bearing on a server-side memset in the very field whose polarity was already inverted
+    /// once. If EQEmu ever populates it, this test is what stops us crediting phantom coin.
+    #[test]
+    fn money_on_corpse_loot_all_marker_never_credits_coin() {
+        let mut gs = GameState::new();
+        gs.coin = [10, 0, 5, 0];
+        gs.loot_session_active = true;
+        gs.loot_confirmed = true;
+        let before = gs.messages.len();
+        let p = money_on_corpse_payload(6, 99, 99, 99, 99); // coin fields must be ignored outright
+        apply_money_on_corpse(&mut gs, &p);
+        assert_eq!(gs.coin, [10, 0, 5, 0],
+            "LootAll(6) is an end-of-items marker, not a coin-bearing accept — it must credit nothing");
+        assert_eq!(gs.messages.len(), before, "and it must not announce looted coins");
+        // It is still an accept, not a refusal: the session stays open and confirmed.
+        assert!(gs.loot_session_active);
+        assert!(gs.loot_confirmed);
+    }
+
+    /// The ONLY inbound packet allowed to log "Looting complete" per the agent-honesty invariant
+    /// (#346) is OP_LootComplete — verified this is what EQEmu's Corpse::EndLoot actually sends.
+    #[test]
+    fn loot_complete_logs_and_pushes_completion_only_when_a_session_was_open() {
+        let mut gs = GameState::new();
+        gs.loot_session_active = true;
+        gs.loot_confirmed = true;
+        gs.loot_current_corpse = Some(7);
+        // We asked the server to close (LootTickAction::Close sent OP_EndLootRequest) — this is the
+        // ONLY shape in which OP_LootComplete means "finished".
+        gs.loot_end_requested_at = Some(std::time::Instant::now());
+        super::apply_loot_complete(&mut gs);
+        assert!(!gs.loot_session_active);
+        assert!(!gs.loot_confirmed);
+        assert_eq!(gs.loot_current_corpse, None);
+        let last = gs.messages.back().expect("must log a message");
+        assert_eq!(last.text, "Looting complete");
+        let ev = gs.chat_events.back().expect("must push an agent-visible event");
+        assert_eq!(ev.kind, "complete");
+        assert_eq!(ev.text, "Looting complete");
+    }
+
+    /// The completion message must be reachable from a REAL inbound packet, not just by calling
+    /// the handler directly — i.e. OP_LOOT_COMPLETE must actually be dispatched in `apply_packet`.
+    /// Without the dispatch arm, "Looting complete" would be unreachable in the field (#346).
+    #[test]
+    fn apply_packet_dispatches_op_loot_complete_to_the_completion_handler() {
+        use crate::eq_net::transport::AppPacket;
+        let mut gs = GameState::new();
+        gs.loot_session_active = true;
+        gs.loot_confirmed = true;
+        gs.loot_current_corpse = Some(7);
+        gs.loot_end_requested_at = Some(std::time::Instant::now());
+        super::apply_packet(&mut gs, &AppPacket {
+            opcode: crate::eq_net::protocol::OP_LOOT_COMPLETE,
+            payload: Vec::new(), // OP_LootComplete is a 0-byte packet (corpse.cpp EndLoot)
+        });
+        assert!(!gs.loot_session_active, "the inbound packet must close the session");
+        let last = gs.messages.back().expect("must log a message");
+        assert_eq!(last.text, "Looting complete");
+    }
+
+    /// #346 REVIEW REGRESSION. EQEmu's `Corpse::LootCorpseItem` (zone/corpse.cpp:1419) answers our
+    /// OP_LootItem echo with `SendEndLootErrorPacket` (corpse.cpp:50) on EVERY error path — LORE
+    /// conflict (:1535, :1548), cursor-not-empty (:1459, a live condition for this client — #275),
+    /// loot cooldown, not-the-looter, zoning… That packet is a 0-byte OP_LootComplete, BYTE-IDENTICAL
+    /// to the genuine close from `Corpse::EndLoot` (:1787). The items STAY ON THE CORPSE.
+    ///
+    /// Reporting it as "Looting complete" would be #346's exact lie, just relocated from the timer
+    /// to the item path: the agent would conclude the corpse was done and walk away from the loot.
+    /// The only discriminator is our own `loot_end_requested_at` — we never asked to close here.
+    #[test]
+    fn server_abort_mid_item_take_is_reported_as_an_abort_not_a_completion() {
+        let mut gs = GameState::new();
+        gs.loot_session_active = true;
+        gs.loot_confirmed = true;          // the corpse DID open (OP_MoneyOnCorpse accepted)
+        gs.loot_current_corpse = Some(7);
+        gs.loot_end_requested_at = None;   // we never sent OP_EndLootRequest — the server aborted
+        super::apply_loot_complete(&mut gs);
+
+        let last = gs.messages.back().expect("an abort must log a message");
+        assert_ne!(last.text, "Looting complete",
+            "a server-side abort must NEVER be reported as a completed loot — the items are still there");
+        assert!(last.text.to_lowercase().contains("abort"), "got: {:?}", last.text);
+
+        let ev = gs.chat_events.back().expect("an abort must push an agent-visible event");
+        assert_eq!(ev.kind, "aborted",
+            "an agent polling /v1/events/loot must be able to tell an abort from a completion");
+        assert_ne!(ev.kind, "complete");
+
+        // The session is over either way — but it ended dishonestly-free.
+        assert!(!gs.loot_session_active);
+        assert_eq!(gs.loot_current_corpse, None);
+    }
+
+    /// #346 REVIEW REGRESSION (second hole). OP_LootComplete is 0-byte, so it carries no corpse id
+    /// and cannot be correlated. If our own `TimedOut` gave up on corpse 7 and the queue moved on to
+    /// corpse 9, a LATE OP_LootComplete for corpse 7 must not be claimed as success for corpse 9 —
+    /// a corpse that has not even been accepted by the server yet.
+    #[test]
+    fn late_loot_complete_after_timeout_is_not_attributed_to_the_next_corpse() {
+        let mut gs = GameState::new();
+        // State after TimedOut on corpse 7, with corpse 9 just opened (OP_LootRequest sent, no ack).
+        gs.loot_session_active = true;
+        gs.loot_confirmed = false;         // corpse 9 has NOT been accepted yet
+        gs.loot_current_corpse = Some(9);
+        gs.loot_end_requested_at = None;   // we have not asked to close corpse 9
+        let msgs_before = gs.messages.len();
+        let evs_before = gs.chat_events.len();
+
+        super::apply_loot_complete(&mut gs); // the late packet for corpse 7 arrives
+
+        assert_eq!(gs.messages.len(), msgs_before,
+            "a stray OP_LootComplete must not announce anything about the next corpse");
+        assert_eq!(gs.chat_events.len(), evs_before);
+        // …and it must not tear down the in-flight session for corpse 9.
+        assert!(gs.loot_session_active, "the next corpse's session must survive a stray packet");
+        assert_eq!(gs.loot_current_corpse, Some(9));
+    }
+
+    /// A late/duplicate OP_LootComplete after the session was already considered closed (e.g. a
+    /// TimedOut gave up first) must not re-announce success.
+    #[test]
+    fn loot_complete_with_no_active_session_does_not_log_a_duplicate_success() {
+        let mut gs = GameState::new();
+        gs.loot_session_active = false;
+        let before = gs.messages.len();
+        super::apply_loot_complete(&mut gs);
+        assert_eq!(gs.messages.len(), before, "no session was open — nothing to announce");
+    }
+
     use crate::eq_net::item::tests::{fixture, fixture2};
 
     #[test]

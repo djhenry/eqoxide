@@ -234,8 +234,14 @@ pub const OP_SKILL_UPDATE: u16     = 0x004c; // S→C one skill's new value; Ski
 // constant on purpose; see apply_death in packet_handler.rs.
 /// Client → server to open a corpse for looting. Payload: corpse spawn_id (u32).
 pub const OP_LOOT_REQUEST: u16     = 0x0adf; // RoF2: OP_LootRequest
-/// Server → client with coin amounts on corpse. MoneyOnCorpse_Struct (20 bytes):
-/// response(u8) + 3×pad + platinum(u32) + gold(u32) + silver(u32) + copper(u32).
+/// Server → client with coin amounts on corpse — the ONLY server ack for OP_LootRequest.
+/// MoneyOnCorpse_Struct (20 bytes): response(u8) + 3×pad + platinum(u32) + gold(u32) +
+/// silver(u32) + copper(u32). `response` is EQEmu's `LootResponse` enum (zone/common.h):
+/// SomeoneElse=0, Normal=1 (accepted), NotAtThisTime=2, Normal2=3 (accepted), Hostiles=4,
+/// TooFar=5, LootAll=6 (SoD+ "all items sent" marker, follows the item packets on a successful
+/// loot — NOT a refusal). Only 1/3/6 mean the corpse actually opened; everything else is a
+/// refusal and no items will follow (#346 — verified against EQEmu zone/corpse.cpp
+/// `MakeLootRequestPackets` / `SendLootReqErrorPacket`, do not treat this as a guess).
 pub const OP_MONEY_ON_CORPSE: u16  = 0x5f44; // RoF2: OP_MoneyOnCorpse
 /// Server → client with the player's NEW total coin after any change (buy/sell/loot/etc).
 /// MoneyUpdate_Struct (16 bytes): platinum(i32) gold(i32) silver(i32) copper(i32). Without
@@ -243,8 +249,16 @@ pub const OP_MONEY_ON_CORPSE: u16  = 0x5f44; // RoF2: OP_MoneyOnCorpse
 pub const OP_MONEY_UPDATE: u16     = 0x640c; // RoF2: OP_MoneyUpdate
 /// Server → client: one packet per lootable item. Client echoes back to take it.
 pub const OP_LOOT_ITEM: u16        = 0x4dc9; // RoF2: OP_LootItem
-/// Client → server to close a loot session.
+/// Client → server to close a loot session. Payload: the corpse's spawn_id as a u32 (EQEmu's
+/// `Handle_OP_EndLootRequest` requires `app->size == sizeof(uint32)`; an empty payload fails that
+/// size check and the server silently drops the request — no response at all, ever — which is
+/// the root cause behind #346's timer-only "Looting complete").
 pub const OP_END_LOOT_REQUEST: u16 = 0x30f7; // RoF2: OP_EndLootRequest
+/// Server → client: the AUTHORITATIVE "loot session closed" signal, sent by
+/// `Corpse::EndLoot` unconditionally once a well-formed OP_EndLootRequest resolves to a real
+/// corpse entity. Zero-length payload. This — not a client-side timer — is the only place
+/// "Looting complete" may honestly be reported (#346).
+pub const OP_LOOT_COMPLETE: u16    = 0x55c4; // RoF2: OP_LootComplete
 
 // ── Gameplay: progression ─────────────────────────────────────────────────
 
