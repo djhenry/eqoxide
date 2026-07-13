@@ -1804,16 +1804,26 @@ pub fn attitude_name(faction: u32) -> &'static str {
 }
 
 /// OP_Consider reply — the server's con of our target. Consider_Struct: playerid(u32) +
-/// targetid(u32) + faction(u32) + level(u32 = con color) + cur_hp + ... Sets the target
-/// (so its nameplate highlights) plus the con-color tint and a /consider log line.
+/// targetid(u32) + faction(u32) + level(u32 = con color) + cur_hp + ... Applies the con-color
+/// tint and a /consider log line to the CURRENT target.
+///
+/// This is data ABOUT a target, not a target-select (eqoxide#330) — the client always sends
+/// OP_CONSIDER right after a `GameState::set_target` call (navigation.rs), so `target_id` is
+/// already correct by the time this reply lands. Writing `target_id` here too made this the 5th
+/// (uncounted) writer alongside the 4 that PR #327 routed through `set_target`: if the target
+/// changed again (auto-combat retarget, hail, a second manual target) before a stale consider
+/// reply for the PREVIOUS target arrived, this handler would snap `target_id`/`target_con*` back
+/// to that stale target while `target_name`/`target_hp_pct` kept the CURRENT target's values —
+/// a mismatched id+con/name+hp split-brain. Guarding on "is this still the current target" and
+/// never writing `target_id` makes a stale reply a no-op instead.
 fn apply_consider(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < 16 { return; }
     let target_id = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    if gs.target_id != Some(target_id) { return; } // stale reply for a target we've since left
     let faction   = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
     let level     = u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
     let name = gs.entities.get(&target_id).map(|e| e.name.clone())
         .unwrap_or_else(|| "Your target".to_string());
-    gs.target_id  = Some(target_id);
     gs.target_con = Some(con_color(level));
     // #292: also record the structured difficulty tier + attitude enum so agents can read "how
     // tough" from /observe/debug instead of scraping the localized chat line or the RGB tint.
@@ -2319,6 +2329,7 @@ mod tests {
         // faction@8, level@12). apply_consider must produce the attitude line + set the con color.
         let mut gs = GameState::new();
         gs.entities.insert(450, test_entity(450, "Guard_Phaeton", 100.0));
+        gs.set_target(450); // apply_consider only applies to the CURRENT target (#330)
         let mut reply = [0u8; 20];
         reply[4..8].copy_from_slice(&450u32.to_le_bytes());   // targetid
         reply[8..12].copy_from_slice(&9u32.to_le_bytes());     // faction 9 = scowls, ready to attack
@@ -2351,6 +2362,7 @@ mod tests {
         // #292: apply_consider records the difficulty tier + attitude enum for /observe/debug.
         let mut gs = GameState::new();
         gs.entities.insert(450, test_entity(450, "a_guard", 100.0));
+        gs.set_target(450); // apply_consider only applies to the CURRENT target (#330)
         let mut reply = [0u8; 20];
         reply[4..8].copy_from_slice(&450u32.to_le_bytes());   // targetid
         reply[8..12].copy_from_slice(&9u32.to_le_bytes());     // faction 9 = scowls
@@ -2358,6 +2370,32 @@ mod tests {
         super::apply_consider(&mut gs, &reply);
         assert_eq!(gs.target_con_name.as_deref(), Some("red"), "difficulty tier stored");
         assert_eq!(gs.target_attitude.as_deref(), Some("scowls"), "attitude enum stored");
+    }
+
+    #[test]
+    fn apply_consider_ignores_stale_reply_for_a_target_we_have_since_left() {
+        // #330: a manual target on A sends OP_CONSIDER, but the reply can land after we've
+        // already retargeted to B (auto-combat retarget, hail, or a second manual target).
+        // The stale reply for A must be a no-op — it must NOT clobber target_id/con back to A
+        // while target_name/target_hp_pct still hold B's values (the split-brain bug).
+        let mut gs = GameState::new();
+        gs.entities.insert(1, test_entity(1, "mob_a", 80.0));
+        gs.entities.insert(2, test_entity(2, "mob_b", 55.0));
+        gs.set_target(1); // target A
+        gs.set_target(2); // retarget to B before A's consider reply arrives
+
+        let mut reply = [0u8; 20];
+        reply[4..8].copy_from_slice(&1u32.to_le_bytes());     // targetid = A (stale)
+        reply[8..12].copy_from_slice(&9u32.to_le_bytes());     // faction 9 = scowls
+        reply[12..16].copy_from_slice(&13u32.to_le_bytes());   // level 13 = red
+        super::apply_consider(&mut gs, &reply);
+
+        assert_eq!(gs.target_id, Some(2), "target_id must still be B, not snap back to A");
+        assert_eq!(gs.target_name.as_deref(), Some("mob_b"), "target_name must still be B's");
+        assert_eq!(gs.target_hp_pct, Some(55.0), "target_hp_pct must still be B's");
+        assert_eq!(gs.target_con, None, "A's stale con must not be applied to B");
+        assert_eq!(gs.target_con_name, None, "A's stale con_name must not be applied to B");
+        assert_eq!(gs.target_attitude, None, "A's stale attitude must not be applied to B");
     }
 
     fn inv_item(slot: i32, item_id: u32, charges: i32) -> crate::game_state::InvItem {
