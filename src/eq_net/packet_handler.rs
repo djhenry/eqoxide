@@ -2219,27 +2219,68 @@ fn apply_money_on_corpse(gs: &mut GameState, payload: &[u8]) {
     }
 }
 
-/// OP_LootComplete — the AUTHORITATIVE "loot session closed" signal, sent by EQEmu's
-/// `Corpse::EndLoot` unconditionally once a well-formed OP_EndLootRequest resolves to a real
-/// corpse. This is the ONLY place "Looting complete" may be logged — never from a timer (#346).
+/// OP_LootComplete — a 0-byte packet the server sends for TWO very different outcomes, and it is
+/// byte-identical in both, so the packet alone cannot tell them apart (#346 review):
+///
+///   1. The genuine close: `Corpse::EndLoot` (zone/corpse.cpp:1787), sent in reply to OUR
+///      OP_EndLootRequest. This — and only this — means "the loot session finished".
+///   2. A server-side ABORT of an item take: `Corpse::LootCorpseItem` (zone/corpse.cpp:1419)
+///      answers our OP_LootItem echo with `SendEndLootErrorPacket` (corpse.cpp:50 → a 0-byte
+///      OP_LootComplete) on EVERY error path — LORE conflict (corpse.cpp:1535, :1548),
+///      cursor-not-empty (corpse.cpp:1459 — a live condition for this client, see #275), loot
+///      cooldown, not-the-looter, zoning, and others. The items STAY ON THE CORPSE.
+///
+/// Reporting (2) as "Looting complete" would be exactly the #346 lie relocated from the timer to
+/// the item path: the agent concludes the corpse is done and walks away, leaving the loot behind.
+///
+/// The discriminator is our own state, not the packet: we only ever send OP_EndLootRequest from
+/// `LootTickAction::Close`, which sets `loot_end_requested_at`. So:
+///   - `loot_end_requested_at.is_some()` → we asked to close → a genuine completion.
+///   - an open, CONFIRMED session that we never asked to close → the server aborted → say so.
+///   - anything else (no session, or a session that hasn't been accepted yet) → a stray/late
+///     packet (e.g. arriving after our own TimedOut, while the NEXT corpse is already opening).
+///     It must not be attributed to that corpse — leave the session untouched.
 fn apply_loot_complete(gs: &mut GameState) {
-    let had_session = gs.loot_session_active;
-    let corpse_id = gs.loot_current_corpse.take();
-    gs.loot_session_active = false;
-    gs.loot_confirmed = false;
-    gs.loot_last_activity = None;
-    gs.loot_end_requested_at = None;
-    if had_session {
+    // (1) Genuine close — this is the ONLY place "Looting complete" may be emitted.
+    if gs.loot_end_requested_at.is_some() {
+        let corpse_id = gs.loot_current_corpse.take();
+        gs.loot_session_active = false;
+        gs.loot_confirmed = false;
+        gs.loot_last_activity = None;
+        gs.loot_end_requested_at = None;
         gs.log_msg("loot", "Looting complete");
         gs.push_event("loot", "complete", "system", true, "Looting complete");
         tracing::info!("EQ: OP_LootComplete received — loot session closed by server (corpse_id={corpse_id:?})");
-    } else {
-        // A late/duplicate OP_LootComplete for a session we'd already considered closed (e.g. it
-        // arrived after our own TimedOut gave up) — don't re-announce success.
-        tracing::info!("EQ: OP_LootComplete received with no active session — ignoring (corpse_id={corpse_id:?})");
+        gs.loot_queued_at = gs.pending_loot.front().map(|_| std::time::Instant::now());
+        return;
     }
-    // Let the next queued corpse (if any) get its own open delay window.
-    gs.loot_queued_at = gs.pending_loot.front().map(|_| std::time::Instant::now());
+
+    // (2) We never asked to close, but a confirmed session was open → the server aborted an item
+    // take (LORE / cursor-not-empty / …). Items remain on the corpse; report it honestly.
+    if gs.loot_session_active && gs.loot_confirmed {
+        let corpse_id = gs.loot_current_corpse.take();
+        gs.loot_session_active = false;
+        gs.loot_confirmed = false;
+        gs.loot_last_activity = None;
+        gs.loot_end_requested_at = None;
+        let msg = format!(
+            "Loot aborted by the server — items may remain on the corpse (corpse_id={corpse_id:?}). \
+             A full cursor or a LORE-conflicting item is the usual cause."
+        );
+        gs.log_msg("loot", &msg);
+        gs.push_event("loot", "aborted", "system", true, &msg);
+        tracing::warn!("EQ: {msg}");
+        gs.loot_queued_at = gs.pending_loot.front().map(|_| std::time::Instant::now());
+        return;
+    }
+
+    // (3) Stray/late packet. Do NOT clear state: a session may have just opened for the NEXT
+    // corpse (which this packet has nothing to do with — it is 0-byte and carries no corpse id).
+    tracing::info!(
+        "EQ: stray OP_LootComplete (no close pending, confirmed={}) — ignoring, not attributing it \
+         to corpse_id={:?}",
+        gs.loot_confirmed, gs.loot_current_corpse,
+    );
 }
 
 /// OP_MoneyUpdate — the server's authoritative NEW coin total after a change that it tracks
@@ -3124,6 +3165,9 @@ mod tests {
         gs.loot_session_active = true;
         gs.loot_confirmed = true;
         gs.loot_current_corpse = Some(7);
+        // We asked the server to close (LootTickAction::Close sent OP_EndLootRequest) — this is the
+        // ONLY shape in which OP_LootComplete means "finished".
+        gs.loot_end_requested_at = Some(std::time::Instant::now());
         super::apply_loot_complete(&mut gs);
         assert!(!gs.loot_session_active);
         assert!(!gs.loot_confirmed);
@@ -3145,6 +3189,7 @@ mod tests {
         gs.loot_session_active = true;
         gs.loot_confirmed = true;
         gs.loot_current_corpse = Some(7);
+        gs.loot_end_requested_at = Some(std::time::Instant::now());
         super::apply_packet(&mut gs, &AppPacket {
             opcode: crate::eq_net::protocol::OP_LOOT_COMPLETE,
             payload: Vec::new(), // OP_LootComplete is a 0-byte packet (corpse.cpp EndLoot)
@@ -3152,6 +3197,64 @@ mod tests {
         assert!(!gs.loot_session_active, "the inbound packet must close the session");
         let last = gs.messages.back().expect("must log a message");
         assert_eq!(last.text, "Looting complete");
+    }
+
+    /// #346 REVIEW REGRESSION. EQEmu's `Corpse::LootCorpseItem` (zone/corpse.cpp:1419) answers our
+    /// OP_LootItem echo with `SendEndLootErrorPacket` (corpse.cpp:50) on EVERY error path — LORE
+    /// conflict (:1535, :1548), cursor-not-empty (:1459, a live condition for this client — #275),
+    /// loot cooldown, not-the-looter, zoning… That packet is a 0-byte OP_LootComplete, BYTE-IDENTICAL
+    /// to the genuine close from `Corpse::EndLoot` (:1787). The items STAY ON THE CORPSE.
+    ///
+    /// Reporting it as "Looting complete" would be #346's exact lie, just relocated from the timer
+    /// to the item path: the agent would conclude the corpse was done and walk away from the loot.
+    /// The only discriminator is our own `loot_end_requested_at` — we never asked to close here.
+    #[test]
+    fn server_abort_mid_item_take_is_reported_as_an_abort_not_a_completion() {
+        let mut gs = GameState::new();
+        gs.loot_session_active = true;
+        gs.loot_confirmed = true;          // the corpse DID open (OP_MoneyOnCorpse accepted)
+        gs.loot_current_corpse = Some(7);
+        gs.loot_end_requested_at = None;   // we never sent OP_EndLootRequest — the server aborted
+        super::apply_loot_complete(&mut gs);
+
+        let last = gs.messages.back().expect("an abort must log a message");
+        assert_ne!(last.text, "Looting complete",
+            "a server-side abort must NEVER be reported as a completed loot — the items are still there");
+        assert!(last.text.to_lowercase().contains("abort"), "got: {:?}", last.text);
+
+        let ev = gs.chat_events.back().expect("an abort must push an agent-visible event");
+        assert_eq!(ev.kind, "aborted",
+            "an agent polling /v1/events/loot must be able to tell an abort from a completion");
+        assert_ne!(ev.kind, "complete");
+
+        // The session is over either way — but it ended dishonestly-free.
+        assert!(!gs.loot_session_active);
+        assert_eq!(gs.loot_current_corpse, None);
+    }
+
+    /// #346 REVIEW REGRESSION (second hole). OP_LootComplete is 0-byte, so it carries no corpse id
+    /// and cannot be correlated. If our own `TimedOut` gave up on corpse 7 and the queue moved on to
+    /// corpse 9, a LATE OP_LootComplete for corpse 7 must not be claimed as success for corpse 9 —
+    /// a corpse that has not even been accepted by the server yet.
+    #[test]
+    fn late_loot_complete_after_timeout_is_not_attributed_to_the_next_corpse() {
+        let mut gs = GameState::new();
+        // State after TimedOut on corpse 7, with corpse 9 just opened (OP_LootRequest sent, no ack).
+        gs.loot_session_active = true;
+        gs.loot_confirmed = false;         // corpse 9 has NOT been accepted yet
+        gs.loot_current_corpse = Some(9);
+        gs.loot_end_requested_at = None;   // we have not asked to close corpse 9
+        let msgs_before = gs.messages.len();
+        let evs_before = gs.chat_events.len();
+
+        super::apply_loot_complete(&mut gs); // the late packet for corpse 7 arrives
+
+        assert_eq!(gs.messages.len(), msgs_before,
+            "a stray OP_LootComplete must not announce anything about the next corpse");
+        assert_eq!(gs.chat_events.len(), evs_before);
+        // …and it must not tear down the in-flight session for corpse 9.
+        assert!(gs.loot_session_active, "the next corpse's session must survive a stray packet");
+        assert_eq!(gs.loot_current_corpse, Some(9));
     }
 
     /// A late/duplicate OP_LootComplete after the session was already considered closed (e.g. a
