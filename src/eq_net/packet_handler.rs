@@ -912,15 +912,26 @@ fn apply_set_target(gs: &mut GameState, payload: &[u8]) {
 }
 
 fn apply_new_zone(gs: &mut GameState, payload: &[u8]) {
-    gs.doors.clear();
-    // Purge the previous zone's spawns (#270). OP_NewZone fires on EVERY server-driven zone entry
-    // — normal travel, a same-zone #zone, AND a death-respawn — whereas the login/gameplay reconnect
-    // clears (login.rs / gameplay.rs) only run on the first-entry path. Without this, respawns and
-    // re-zones accumulate stale + duplicate cross-zone entities, so name→position resolution
-    // (goto/follow/merchant/target-by-name) picks ghosts. The OP_ZoneEntry spawn stream that follows
-    // repopulates the map for the new zone; sync_entities full-replaces the HTTP maps from it.
-    gs.entities.clear();
+    // Length-check BEFORE the one-shot below: a truncated OP_NewZone must not consume the zone-in's
+    // single apply, or the real one that follows would be swallowed and we'd keep the PREVIOUS zone's
+    // name/id/safe point/underworld clamp (#150) for the whole session.
     if payload.len() < SIZE_NEW_ZONE { return; }
+    // Apply at most once per zone-server session (#322). A zone-in delivers OP_NewZone twice — the
+    // server sends it while handling OP_ZoneEntry and again in reply to the OP_ReqNewZone we send on
+    // OP_Weather — and the second copy arrives AFTER OP_ReqClientSpawn, while the spawn/door stream
+    // it requested is landing. Re-running the clears below would wipe that stream (missing NPCs and
+    // doors after zoning), and re-log "Entered <zone>" + a second navigate/zone event. Both copies
+    // carry identical zone fields, so there is nothing to redo.
+    if gs.new_zone_applied { return; }
+    gs.new_zone_applied = true;
+    // Purge the previous zone's spawns and doors (#270): OP_NewZone fires on EVERY server-driven zone
+    // entry — normal travel, a same-zone #zone, AND a death-respawn — and each one arrives on a fresh
+    // zone-server session, whose handshake re-arms the flag above via `begin_zone_in`. Without the
+    // purge, respawns and re-zones accumulate stale + duplicate cross-zone entities, so name→position
+    // resolution (goto/follow/merchant/target-by-name) picks ghosts. The spawn/door stream that
+    // follows OP_ReqClientSpawn repopulates the new zone; sync_entities full-replaces the HTTP maps.
+    gs.doors.clear();
+    gs.entities.clear();
     // RoF2 NewZone_Struct (rof2_structs.h, 948 bytes). Use direct byte offsets
     // to avoid struct-padding issues with the packed 948-byte layout.
     // zone_short_name[128] @ offset 64
@@ -2138,7 +2149,7 @@ mod tests {
                 parse_begin_cast, apply_begin_cast, parse_memorize_spell, apply_char_inventory,
                 apply_money_update, apply_money_on_corpse, apply_set_target, apply_move_item, apply_spawn_appearance,
                 extract_saylink_text, apply_task_description, apply_completed_tasks, apply_task_select_window,
-                strip_say_links, SAY_LINK_BODY_SIZE, SIZE_DEATH,
+                strip_say_links, SAY_LINK_BODY_SIZE, SIZE_DEATH, SIZE_NEW_ZONE,
                 apply_group_update_b, apply_group_join, apply_group_disband_you,
                 apply_group_disband_other, apply_group_leader_change, apply_group_invite, apply_group_acknowledge};
     use crate::game_state::{GameState, Entity, TaskStatus};
@@ -2279,15 +2290,100 @@ mod tests {
     fn new_zone_clears_stale_entities_from_prior_zone() {
         // #270: OP_NewZone fires on every server-driven zone entry (travel, same-zone #zone,
         // death-respawn) and must purge the previous zone's spawns, or respawns/re-zones leak
-        // stale + duplicate cross-zone entities into name→position resolution. The clears run
-        // before the length guard, so a short payload still exercises them; the following
-        // OP_ZoneEntry stream repopulates the map for the new zone.
+        // stale + duplicate cross-zone entities into name→position resolution. The spawn stream
+        // that follows repopulates the map for the new zone.
         let mut gs = GameState::new();
         gs.entities.insert(1, test_entity(1, "Fippy_Darkpaw", 100.0));
         gs.entities.insert(2, test_entity(2, "a_gnoll_pup", 100.0));
         assert_eq!(gs.entities.len(), 2);
-        super::apply_new_zone(&mut gs, &[]);
+        super::apply_new_zone(&mut gs, &new_zone_payload("qeynos2", 2));
         assert!(gs.entities.is_empty(), "prior-zone entities must be cleared on zone entry (#270)");
+    }
+
+    #[test]
+    fn truncated_new_zone_does_not_consume_the_zone_in_apply() {
+        // The once-per-zone-in one-shot (#322) must be latched only by a WELL-FORMED OP_NewZone.
+        // A truncated one that consumed it would swallow the real NewZone behind it, stranding the
+        // client on the PREVIOUS zone's name/id/safe point/underworld clamp (#150) for the whole
+        // zone-server session — where before the guard the repeat NewZone self-healed it.
+        let mut gs = GameState::new();
+        gs.begin_zone_in();
+        gs.zone_name = "qeynos2".into();
+        gs.zone_id = 2;
+
+        super::apply_new_zone(&mut gs, &[0u8; 16]); // truncated — must be ignored outright
+        assert!(!gs.new_zone_applied, "a short OP_NewZone must not latch the one-shot");
+
+        super::apply_new_zone(&mut gs, &new_zone_payload("freporte", 9)); // the real one
+        assert_eq!(gs.zone_name, "freporte", "the real OP_NewZone must still be applied");
+        assert_eq!(gs.zone_id, 9);
+        assert!(gs.zone_underworld.is_some(), "the #150 underworld clamp must be re-seeded");
+    }
+
+    /// A RoF2 OP_NewZone payload carrying the fields apply_new_zone reads (short name @64, zone_id @852).
+    fn new_zone_payload(short_name: &str, zone_id: u16) -> Vec<u8> {
+        let mut p = vec![0u8; SIZE_NEW_ZONE];
+        p[64..64 + short_name.len()].copy_from_slice(short_name.as_bytes());
+        p[852..854].copy_from_slice(&zone_id.to_le_bytes());
+        p
+    }
+
+    /// A 100-byte RoF2 Door_Struct record for `door_id`.
+    fn door_record(door_id: u8) -> [u8; 100] {
+        let mut rec = [0u8; 100];
+        rec[..5].copy_from_slice(b"DOOR1");
+        rec[52..54].copy_from_slice(&100u16.to_le_bytes()); // size
+        rec[60] = door_id;
+        rec
+    }
+
+    #[test]
+    fn second_new_zone_of_a_zone_in_keeps_the_spawn_and_door_stream() {
+        // #322: a zone-in delivers OP_NewZone twice (the server sends one on OP_ZoneEntry and
+        // answers our OP_ReqNewZone with another). The second copy lands AFTER OP_ReqClientSpawn,
+        // so its entity/door purge used to wipe the spawn/door stream already arriving — silently
+        // losing the zone's NPCs and doors — and logged "Entered <zone>" + a navigate/zone event a
+        // second time. Only the first apply of a zone-server session may clear.
+        let mut gs = GameState::new();
+        gs.begin_zone_in();
+        super::apply_new_zone(&mut gs, &new_zone_payload("qeynos2", 2));
+
+        // OP_ReqClientSpawn is out; the stream it asked for starts landing.
+        gs.entities.insert(1, test_entity(1, "Guard_Jordan", 100.0));
+        super::apply_spawn_doors(&mut gs, &door_record(7));
+
+        super::apply_new_zone(&mut gs, &new_zone_payload("qeynos2", 2)); // the ReqNewZone reply
+
+        assert_eq!(gs.entities.len(), 1, "the second OP_NewZone must not wipe inbound spawns (#322)");
+        assert_eq!(gs.doors.len(), 1, "the second OP_NewZone must not wipe inbound doors (#322)");
+        assert_eq!(gs.zone_name, "qeynos2");
+        assert_eq!(gs.messages.iter().filter(|m| m.text == "Entered qeynos2").count(), 1,
+            "one 'Entered <zone>' message per zone-in");
+        assert_eq!(gs.chat_events.iter().filter(|e| e.kind == "zone").count(), 1,
+            "one navigate/zone event per zone-in");
+    }
+
+    #[test]
+    fn new_zone_still_clears_on_the_next_zone_in() {
+        // The once-per-zone-in guard (#322) is re-armed by begin_zone_in at the top of each
+        // zone-entry handshake, so a real zone change still purges the previous zone (#270) —
+        // including a spawn that lands between the handshake's clear and OP_NewZone.
+        let mut gs = GameState::new();
+        gs.begin_zone_in();
+        super::apply_new_zone(&mut gs, &new_zone_payload("qeynos2", 2));
+        gs.entities.insert(1, test_entity(1, "Guard_Jordan", 100.0));
+        super::apply_spawn_doors(&mut gs, &door_record(7));
+
+        gs.begin_zone_in(); // next zone-server session
+        // Stale arrivals between the handshake's clear and OP_NewZone must still be purged by it.
+        gs.entities.insert(2, test_entity(2, "Guard_Jordan", 100.0));
+        super::apply_spawn_doors(&mut gs, &door_record(4));
+        super::apply_new_zone(&mut gs, &new_zone_payload("freporte", 9));
+
+        assert!(gs.entities.is_empty(), "a real zone change must still purge entities (#270)");
+        assert!(gs.doors.is_empty(), "a real zone change must still purge doors (#270)");
+        assert_eq!(gs.zone_name, "freporte");
+        assert_eq!(gs.zone_id, 9);
     }
 
     #[test]

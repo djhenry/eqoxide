@@ -553,10 +553,10 @@ async fn run_zone_entry_handshake(
     gs:           &mut GameState,
     last_inbound: &crate::http::LastInboundShared,
 ) {
-    // Clear stale entities now so OP_ZONE_SPAWNS can repopulate them.
-    // (OP_NEW_ZONE arrives AFTER OP_ZONE_SPAWNS in the Titanium server sequence, so
-    // we can't rely on apply_new_zone to do this reset.)
-    gs.entities.clear();
+    // Purge the previous zone's spawns/doors now, before OP_ReqClientSpawn asks for the new zone's
+    // stream, and re-arm the once-per-zone-in OP_NewZone apply so the repeat OP_NewZone this
+    // handshake provokes can't clear again mid-stream (#322).
+    gs.begin_zone_in();
 
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let mut done_new_zone     = false;
