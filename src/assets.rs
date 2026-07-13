@@ -536,12 +536,6 @@ pub struct Collision {
     /// which is how A* ended up standing on qcat's ceiling and planning routes through solid rock
     /// (#329). Computed once at build; the ray tests filter on it. (~4 bytes/tri.)
     tri_nz:    Vec<f32>,
-    /// Winding-consistency verdict for `tri_nz`, measured at build (see `winding_is_consistent`).
-    /// EQ zone meshes are single-sided and consistently wound, so a top-down ray's first hit is
-    /// an up-facing face — we sample that. If a zone ever fails the check, the normal filter is
-    /// DISABLED for it and nav falls back to the old (facing-blind) behaviour rather than deleting
-    /// every real floor. Diagnostic + safety valve.
-    floor_normals_ok: bool,
     cells:     Vec<Vec<u32>>,
     origin:    [f32; 2], // (east, north) of cell (0,0) corner
     cell_size: f32,
@@ -638,7 +632,7 @@ impl Collision {
 
         let cell_size = cell_size.max(1.0);
         if tris.is_empty() || min[0] == f32::MAX {
-            return Collision { tris, tri_nz, floor_normals_ok: false, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0, water: None, from_collision_mesh, zone_line_regions: Vec::new() };
+            return Collision { tris, tri_nz, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0, water: None, from_collision_mesh, zone_line_regions: Vec::new() };
         }
         let cols = (((max[0] - min[0]) / cell_size).ceil() as usize + 1).max(1);
         let rows = (((max[1] - min[1]) / cell_size).ceil() as usize + 1).max(1);
@@ -659,56 +653,8 @@ impl Collision {
                 }
             }
         }
-        let mut col = Collision { tris, tri_nz, floor_normals_ok: false, cells, origin: min, cell_size, cols, rows, water: None, from_collision_mesh, zone_line_regions: Vec::new() };
-        col.floor_normals_ok = col.winding_is_consistent();
-        if !col.floor_normals_ok {
-            tracing::warn!("nav: collision mesh winding looks INCONSISTENT — the floor-normal filter is \
-                disabled for this zone; nav may mistake ceilings for floors (#329)");
-        }
-        col
+        Collision { tris, tri_nz, cells, origin: min, cell_size, cols, rows, water: None, from_collision_mesh, zone_line_regions: Vec::new() }
     }
-
-    /// Is the winding consistent enough that `tri_nz > 0` really means "a surface you can stand ON"?
-    ///
-    /// Sampled, not proved. The probe is the LOWEST surface in each of a grid of vertical columns:
-    /// whatever else a column contains, its bottom-most surface is the floor of the lowest room (or
-    /// the terrain), so on a correctly wound mesh it is UP-facing. (The obvious "topmost hit from
-    /// the sky" probe does NOT work: EQ art is single-sided, so an enclosed zone's roof is a face
-    /// wound to look DOWN into the room and has no outward side at all — that probe reads 0%
-    /// up-facing on every dungeon.)
-    ///
-    /// Measured on the shipped GLBs: qcat 99.7%, gfaydark 99.8%, everfrost 94.5%, qeynos2 100%,
-    /// halas 100%, butcher 100%, blackburrow 99.6%, permafrost 94.0%, crushbone 100%, neriakc
-    /// 98.5%, qeynos 99.0%, freportw 100%. The convention holds everywhere; the few % of misses are
-    /// stray inverted art faces, so the bar is a strong majority rather than unanimity. A zone that
-    /// somehow failed would simply keep the old facing-blind behaviour (and log a warning) instead
-    /// of having every real floor filtered away. Cheap: a few hundred rays, once per zone load.
-    fn winding_is_consistent(&self) -> bool {
-        if self.cols == 0 || self.tris.is_empty() { return false; }
-        let zmax = self.tris.iter().flatten().fold(f32::MIN, |m, v| m.max(v[2]));
-        let zmin = self.tris.iter().flatten().fold(f32::MAX, |m, v| m.min(v[2]));
-        let (w, h) = (self.cols as f32 * self.cell_size, self.rows as f32 * self.cell_size);
-        const N: usize = 24; // 24x24 XY probes
-        let (mut up, mut total) = (0usize, 0usize);
-        let mut hits = Vec::new();
-        for i in 0..N {
-            for j in 0..N {
-                let e = self.origin[0] + w * (i as f32 + 0.5) / N as f32;
-                let n = self.origin[1] + h * (j as f32 + 0.5) / N as f32;
-                self.column_hits(e, n, zmax + 1.0, 0.0, (zmax - zmin) + 2.0, false, &mut hits);
-                if let Some(&(_, nz)) = hits.last() { // high→low ⇒ last = the lowest surface
-                    total += 1;
-                    if nz > 0.0 { up += 1; }
-                }
-            }
-        }
-        // Columns that miss all geometry don't vote.
-        total >= 16 && (up as f32) / (total as f32) >= 0.85
-    }
-
-    /// Did this zone's collision mesh pass the build-time winding check, i.e. is the floor-normal
-    /// filter (a ceiling is not a floor, #329) ACTIVE for it? Provenance/diagnostics.
-    pub fn floor_normals_ok(&self) -> bool { self.floor_normals_ok }
 
     /// Attach a zone water map so find_path can route swim descents. Call after `build`.
     pub fn set_water(&mut self, water: Option<std::sync::Arc<crate::region_map::RegionMap>>) {
@@ -899,8 +845,8 @@ impl Collision {
 
     /// Shared vertical-column raycast (Möller–Trumbore). Appends `(hit_z, face_normal_z)` to `out`,
     /// sorted high→low. When `floors_only`, DOWN-facing surfaces are dropped so a ceiling can never
-    /// be mistaken for a floor (#329) — unless this zone's winding failed the build-time check, in
-    /// which case we keep the old facing-blind behaviour rather than deleting real floors.
+    /// be mistaken for a floor (#329) — UNLESS that would empty the column entirely, in which case
+    /// we fall back to the facing-blind result for it (see below).
     fn column_hits(&self, east: f32, north: f32, ref_z: f32, up: f32, down: f32,
                    floors_only: bool, out: &mut Vec<(f32, f32)>) {
         out.clear();
@@ -909,7 +855,7 @@ impl Collision {
         let z_bot = ref_z - down.max(0.0);
         let dir_z = z_bot - z_top; // negative (downward)
         if dir_z.abs() < 1e-6 { return; }
-        let filter = floors_only && self.floor_normals_ok;
+        let filter = floors_only;
         let eps = 1e-6_f32;
         let cross = |a: [f32; 3], b: [f32; 3]| [
             a[1] * b[2] - a[2] * b[1],
@@ -947,6 +893,17 @@ impl Collision {
                     out.push((z_top + t * dir_z, nz));
                 }
             }
+        }
+        // Never delete the ONLY ground in a column. The filter is sound when a real (up-facing)
+        // floor survives it — but when it empties the column, the "ceiling" it just removed was the
+        // only surface here at all, i.e. there is no floor beneath it to make it a ceiling. That is
+        // exactly the highpass shape (#373-adjacent): art inverted at the height a character needs,
+        // with nothing correctly-wound underneath. Falling back to the facing-blind result for just
+        // this column keeps every real floor while still filtering ceilings everywhere a real floor
+        // is present (see `column_fallback_does_not_resurrect_a_ceiling_when_a_real_floor_is_present`).
+        if filter && out.is_empty() {
+            self.column_hits(east, north, ref_z, up, down, false, out);
+            return;
         }
         out.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)); // high→low
     }
@@ -2190,7 +2147,6 @@ mod tests {
             objects: vec![], textures: vec![],
         };
         let col = Collision::build(&assets, 8.0);
-        assert!(col.floor_normals_ok(), "a cleanly wound mesh must pass the winding check");
         // Both surfaces are in the column...
         let all = col.column_surfaces(20.0, 40.0, -56.0, 20.0, 100.0);
         assert_eq!(all.len(), 2, "the ray crosses both the ceiling and the floor");
@@ -2202,34 +2158,81 @@ mod tests {
         assert_eq!(col.column_floors(20.0, 40.0, -56.0, 20.0, 100.0).len(), 1, "the ceiling is not a floor");
     }
 
-    /// The floor-normal filter is only sound if the zone's winding is consistent, so it is validated
-    /// at build. A zone that FAILS validation must fall back to the old facing-blind behaviour
-    /// (keeping every real floor) rather than filtering all its floors away and becoming
-    /// unnavigable — but that fallback is a KNOWN-DEGRADED mode (a ceiling can be picked as a floor
-    /// again, i.e. #329 is back for that zone), so it must be *reportable*: `floor_normals_ok()` is
-    /// what `/v1/observe/debug` surfaces as `nav_degraded`. A silent revert to a bug we just fixed is
-    /// the client lying to the agent by omission.
+    /// highpass in miniature (#373-adjacent — measured 65% of EQEmu-walkable spots losing their
+    /// floor). A zone-WIDE winding gate that samples the LOWEST surface per column is not a useful
+    /// predictor here: highpass scores 98.4% on that probe (its lowest surfaces are wound fine)
+    /// while the inversion is concentrated further UP the column (the mountain pass itself measured
+    /// only 8.6% up-facing). A column can have plenty of correctly-wound geometry elsewhere in the
+    /// zone yet contain, at the height a character actually needs, ONLY a down-facing (inverted)
+    /// surface with nothing correctly-wound underneath it. The facing filter must never delete the
+    /// ONLY ground in a column — a ceiling is only a ceiling if there is a floor beneath it. (This
+    /// is why the fallback below is scoped PER COLUMN rather than gated by a whole-zone verdict.)
     #[test]
-    fn a_miswound_zone_falls_back_visibly_instead_of_deleting_its_floors() {
+    fn column_whose_only_surface_is_inverted_still_finds_a_floor() {
+        let assets = ZoneAssets {
+            terrain: vec![
+                slab(0.0, 0.0, 256.0, 0.0, 256.0, true),      // large, correctly-wound floor
+                slab(50.0, 0.0, 8.0, 300.0, 308.0, false),    // isolated inverted "pass" — nothing else here
+            ],
+            objects: vec![], textures: vec![],
+        };
+        let col = Collision::build(&assets, 8.0);
+
+        // Query off the quad's diagonal split (300,0)-(308,8) so the ray crosses exactly one of its
+        // two triangles, not the shared edge.
+        // Facing-blind: the surface is there, and it is down-facing, same as highpass's pass.
+        let blind = col.column_surfaces(306.0, 2.0, 50.0, 20.0, 100.0);
+        assert_eq!(blind.len(), 1, "exactly one surface lives in this column");
+        assert!(blind[0].1 < 0.0, "and it is down-facing — the only ground here is inverted");
+
+        // The filtered query must still find it: this column has nothing else to fall back on, so
+        // deleting the inverted surface leaves NO floor at all — exactly the highpass 65% bug.
+        let f = col.nearest_floor(306.0, 2.0, 50.0, 20.0, 100.0);
+        assert!(f.is_some(), "the filter must never delete the only ground in a column");
+        assert!((f.unwrap() - 50.0).abs() < 0.1, "expected the inverted surface's own height, got {f:?}");
+        assert_eq!(col.column_floors(306.0, 2.0, 50.0, 20.0, 100.0).len(), 1);
+    }
+
+    /// The column fallback above must be scoped to columns the filter would otherwise empty — it
+    /// must NOT resurrect a ceiling in a qcat-shaped column where a real floor is ALSO present.
+    /// Re-asserts #329's property (see `nearest_floor_never_returns_a_ceiling`) specifically against
+    /// the fallback path: a non-empty filtered result must never be widened back out to facing-blind.
+    #[test]
+    fn column_fallback_does_not_resurrect_a_ceiling_when_a_real_floor_is_present() {
+        let assets = ZoneAssets {
+            terrain: vec![slab(-69.97, 0.0, 64.0, 0.0, 64.0, true),    // real floor
+                          slab(-55.97, 0.0, 64.0, 0.0, 64.0, false)],  // ceiling, 14u above it
+            objects: vec![], textures: vec![],
+        };
+        let col = Collision::build(&assets, 8.0);
+        let f = col.nearest_floor(20.0, 40.0, -56.0, 20.0, 100.0).expect("a floor exists below");
+        assert!((f - (-69.97)).abs() < 0.1,
+            "must anchor to the real floor — the fallback must not fire when the filtered column is non-empty, got {f}");
+        assert_eq!(col.column_floors(20.0, 40.0, -56.0, 20.0, 100.0).len(), 1,
+            "the fallback must not resurrect the filtered-out ceiling alongside the real floor");
+    }
+
+    /// A whole zone can be the degenerate case of `column_whose_only_surface_is_inverted_still_finds_a_floor`
+    /// above: EVERY column's only surface is inverted (a mesh whose winding convention is entirely
+    /// backwards), not just one isolated patch. There is no whole-zone gate anymore to catch or
+    /// report this — the per-column fallback in `column_hits` handles it uniformly, one column at a
+    /// time, with no distinction between "one bad column" and "every column is bad". The zone must
+    /// stay navigable either way.
+    #[test]
+    fn a_fully_inverted_zone_keeps_every_floor_via_the_per_column_fallback() {
         // Every face inverted (down-facing) — a mesh whose winding convention is backwards.
         let assets = ZoneAssets {
             terrain: vec![slab(0.0, 0.0, 96.0, 0.0, 96.0, false)],
             objects: vec![], textures: vec![],
         };
         let col = Collision::build(&assets, 8.0);
-        assert!(!col.floor_normals_ok(), "an inverted mesh must FAIL the winding check");
-        // ...and having failed it, the filter is off: the surface is still found (fail-old), not
-        // filtered away (fail-empty), so the zone stays navigable.
+        // The filter would delete this single, down-facing surface — but that's the only ground in
+        // every column here, so the fallback keeps it (fail-old), rather than deleting it and
+        // leaving the zone unnavigable (fail-empty).
         assert!(col.nearest_floor(20.0, 40.0, 1.0, 20.0, 100.0).is_some(),
-            "a mis-wound zone must keep its floors (degraded, not broken)");
+            "an inverted mesh must keep its floors via the per-column fallback");
         assert!(col.find_path([8.0, 8.0, 0.0], [56.0, 56.0, 0.0], 1.0, &[], false).is_some(),
-            "and must still route — the degradation is reported, not fatal");
-
-        // A correctly wound zone reports healthy (so `nav_degraded` is null in every shipped zone).
-        let ok = Collision::build(&ZoneAssets {
-            terrain: vec![slab(0.0, 0.0, 96.0, 0.0, 96.0, true)], objects: vec![], textures: vec![],
-        }, 8.0);
-        assert!(ok.floor_normals_ok());
+            "and must still route");
     }
 
     /// #229: a `zone_cross` aims at a DRNTP region's interior point, whose z is a point in a VOLUME
