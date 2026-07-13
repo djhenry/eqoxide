@@ -2190,15 +2190,28 @@ fn apply_money_on_corpse(gs: &mut GameState, payload: &[u8]) {
         gs.loot_queued_at = gs.pending_loot.front().map(|_| std::time::Instant::now());
         return;
     }
-    // Normal(1) / Normal2(3) / LootAll(6) — the server accepted the request (LootAll is the
-    // "all items sent" marker that follows the item packets on success, not a fresh accept, but
-    // treating it the same here is harmless: `loot_confirmed` is already true by then).
+    // Normal(1) / Normal2(3) / LootAll(6) — the server accepted the request.
     gs.loot_confirmed = true;
+    gs.loot_last_activity = Some(std::time::Instant::now());
+
+    // ONLY Normal(1)/Normal2(3) carry the corpse's coin: they are the reply to OP_LootRequest built
+    // by `Corpse::MakeLootRequestPackets` (zone/corpse.cpp:1139), which is the one place that fills
+    // the platinum/gold/silver/copper fields. LootAll(6) is the SoD+ "all items were sent" marker
+    // that trails the item packets — it is NOT a fresh accept and must never credit coin.
+    //
+    // Crediting it happens to be harmless TODAY only because `BasePacket` memsets the buffer
+    // (common/base_packet.cpp:31) so a LootAll packet carries zeros. That makes coin correctness
+    // load-bearing on a server-side memset — in the exact field whose polarity was already inverted
+    // once (see above: every looted coin used to be silently discarded). A two-value match is free;
+    // don't bet the purse on someone else's memset (#346 review).
+    if !matches!(response, 1 | 3) {
+        return;
+    }
+
     let platinum = u32::from_le_bytes([payload[4],  payload[5],  payload[6],  payload[7]]);
     let gold     = u32::from_le_bytes([payload[8],  payload[9],  payload[10], payload[11]]);
     let silver   = u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
     let copper   = u32::from_le_bytes([payload[16], payload[17], payload[18], payload[19]]);
-    gs.loot_last_activity = Some(std::time::Instant::now());
     if platinum > 0 || gold > 0 || silver > 0 || copper > 0 {
         // Add the looted coins to the on-hand total for the HUD. Corpse loot calls the server's
         // AddMoneyToPP with update_client=false (verified in EQEmu), so it does NOT also send an
@@ -3154,6 +3167,32 @@ mod tests {
         let p = money_on_corpse_payload(6, 0, 0, 0, 0);
         apply_money_on_corpse(&mut gs, &p);
         assert!(gs.loot_session_active, "LootAll must not close the session");
+        assert!(gs.loot_confirmed);
+    }
+
+    /// #346 REVIEW. Only Normal(1)/Normal2(3) — the reply to OP_LootRequest built by
+    /// `Corpse::MakeLootRequestPackets` (zone/corpse.cpp:1139) — carry the corpse's coin. LootAll(6)
+    /// is the trailing "all items were sent" marker and must credit NOTHING.
+    ///
+    /// This is deliberately fed a coin-BEARING LootAll payload, which cannot occur on the wire today
+    /// (`BasePacket` memsets the buffer, common/base_packet.cpp:31 — so a real LootAll carries
+    /// zeros). That memset is exactly the point: without this guard, coin correctness would be
+    /// load-bearing on a server-side memset in the very field whose polarity was already inverted
+    /// once. If EQEmu ever populates it, this test is what stops us crediting phantom coin.
+    #[test]
+    fn money_on_corpse_loot_all_marker_never_credits_coin() {
+        let mut gs = GameState::new();
+        gs.coin = [10, 0, 5, 0];
+        gs.loot_session_active = true;
+        gs.loot_confirmed = true;
+        let before = gs.messages.len();
+        let p = money_on_corpse_payload(6, 99, 99, 99, 99); // coin fields must be ignored outright
+        apply_money_on_corpse(&mut gs, &p);
+        assert_eq!(gs.coin, [10, 0, 5, 0],
+            "LootAll(6) is an end-of-items marker, not a coin-bearing accept — it must credit nothing");
+        assert_eq!(gs.messages.len(), before, "and it must not announce looted coins");
+        // It is still an accept, not a refusal: the session stays open and confirmed.
+        assert!(gs.loot_session_active);
         assert!(gs.loot_confirmed);
     }
 
