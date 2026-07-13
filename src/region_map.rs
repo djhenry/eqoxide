@@ -75,6 +75,24 @@ impl RegionMap {
         ]}
     }
 
+    /// Test-only: water in the SLAB `bottom_z ..= top_z` — bounded BELOW as well as above. This is
+    /// the shape real `.wtr` water actually has, and the shape that matters: a water volume's lower
+    /// bound need not meet the floor beneath it (the qcat spawn shaft's floor is at -69.97 while its
+    /// water starts at -69.5), so a character standing on that floor has its FEET outside the water
+    /// while its body is submerged. `flat_below` cannot express that — it makes everything below the
+    /// surface wet, which silently hides the bug (#329).
+    #[cfg(test)]
+    pub fn water_slab(bottom_z: f32, top_z: f32) -> RegionMap {
+        RegionMap { nodes: vec![
+            // 1: z < top_z → 2, else dry(3)
+            BspNode { normal: [0.0, 0.0, 1.0], split: -top_z, special: 0, left: 3, right: 2, zone_line_index: 0 },
+            // 2: z > bottom_z → water(4), else dry(3)
+            BspNode { normal: [0.0, 0.0, 1.0], split: -bottom_z, special: 0, left: 4, right: 3, zone_line_index: 0 },
+            BspNode { normal: [0.0; 3], split: 0.0, special: 0, left: 0, right: 0, zone_line_index: 0 }, // 3 dry
+            BspNode { normal: [0.0; 3], split: 0.0, special: 1, left: 0, right: 0, zone_line_index: 0 }, // 4 water
+        ]}
+    }
+
     /// Test-only: a map where everything below `top_z` is a zone-line region carrying `index`.
     #[cfg(test)]
     pub fn zone_line_below(top_z: f32, index: i32) -> RegionMap {

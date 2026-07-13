@@ -177,7 +177,28 @@ impl CharacterController {
             return self.pos;
         }
 
-        self.in_water = col.in_water(self.pos);
+        // Is the character in water? Probe the BODY, not just the origin (#329).
+        //
+        // `self.pos` is the character's FEET. A character standing on the bottom of a pool can have
+        // its feet a hair BELOW the water region's lower bound while its whole body is submerged —
+        // the water volume is baked from the `.wtr` BSP and does not have to meet the floor exactly.
+        // The qcat spawn shaft is precisely this: the floor is at z=-69.97 and the water spans
+        // -69.5 … -43.0, so a character standing there is under 26 UNITS of water while a feet-only
+        // probe reports it bone dry. Everything downstream then goes wrong at once — `swimming` is
+        // false, `submerged_on_floor` is false, buoyancy never fires, and the character is pinned to
+        // the shaft floor for ever. That is the qcat spawn pocket: a level-1 character could not
+        // swim up and out of the water it was standing in, so it could never leave the zone.
+        //
+        // Probe the feet first (so wading is unchanged), then chest height. `water_at` is then used
+        // for every water query in this step, so the surface we float toward is the one above the
+        // BODY rather than one that doesn't exist at the feet.
+        const WATER_BODY: f32 = 3.0; // chest height above the feet
+        let water_at = if col.in_water(self.pos) {
+            self.pos
+        } else {
+            [self.pos[0], self.pos[1], self.pos[2] + WATER_BODY]
+        };
+        self.in_water = col.in_water(water_at);
         let swimming = intent.want_swim && self.in_water;
         if self.hop_cooldown > 0.0 { self.hop_cooldown = (self.hop_cooldown - dt).max(0.0); }
 
@@ -237,7 +258,7 @@ impl CharacterController {
         // submerged forever. Treat "on the floor but well below the water surface" as submerged so
         // it floats back up (a body resting underwater is still buoyant). (eqoxide#197)
         let submerged_on_floor = self.in_water && !swimming
-            && col.water_surface(self.pos).is_some_and(|surf| self.pos[2] < surf - 2.0);
+            && col.water_surface(water_at).is_some_and(|surf| self.pos[2] < surf - 2.0);
 
         // ── Vertical: swim / buoyancy / jump / gravity + ground clamp. ──
         if swimming {
@@ -246,7 +267,7 @@ impl CharacterController {
             if intent.wish_vspeed != 0.0 {
                 // Explicit vertical input (a human swimming up/down along the look direction).
                 self.pos[2] += intent.wish_vspeed * dt;
-            } else if let Some(surf) = col.water_surface(self.pos) {
+            } else if let Some(surf) = col.water_surface(water_at) {
                 // Nav-driven swim with no vertical wish: float toward the surface so the character
                 // swims ACROSS at the top instead of sitting on / crawling along the pool bottom the
                 // path may route to (#191). Without this, want_swim just froze it at its current z.
@@ -269,7 +290,7 @@ impl CharacterController {
             // submerged_on_floor, i.e. genuinely below the surface and about to rise).
             self.on_ground = false;
             self.vel_z = 0.0;
-            if let Some(surf) = col.water_surface(self.pos) {
+            if let Some(surf) = col.water_surface(water_at) {
                 let target = surf - FLOAT_DEPTH;
                 if self.pos[2] < target {
                     self.pos[2] = (self.pos[2] + BUOY_RATE * dt).min(target);
@@ -623,6 +644,28 @@ mod tests {
         for _ in 0..240 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 60.0, &c); }
         assert!(ctrl.pos[2] > 5.0, "must float off the bottom to the surface (~8), got {}", ctrl.pos[2]);
         assert!(!ctrl.on_ground, "detaches from the floor while floating up");
+    }
+
+    /// #329, the qcat spawn shaft: the water volume's LOWER bound sits slightly ABOVE the floor the
+    /// character stands on (floor -69.97, water -69.5…-43.0). Probing water at the character's
+    /// origin — its FEET — then reports "dry" for a character standing under 26 units of water: it
+    /// never swims, buoyancy never fires, and it is pinned to the shaft floor for ever. That is what
+    /// made the qcat spawn pocket an inescapable trap. Water must be probed against the BODY.
+    #[test]
+    fn submerged_character_whose_feet_are_below_the_water_volume_still_floats() {
+        // Water from z=-69.5 up to z=-43 — a box that does NOT reach the floor at -69.97.
+        let mut c = col(vec![]);
+        c.set_water(Some(std::sync::Arc::new(
+            crate::region_map::RegionMap::water_slab(-69.5, -43.0),
+        )));
+        // Sanity: the feet really are outside the water volume, the chest really is inside it.
+        assert!(!c.in_water([0.0, 0.0, -69.97]), "feet sit below the water region's lower bound");
+
+        let mut ctrl = CharacterController::new([0.0, 0.0, -69.97]);
+        ctrl.on_ground = true; // standing on the shaft floor, fully submerged
+        for _ in 0..240 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 60.0, &c); }
+        assert!(ctrl.pos[2] > -50.0,
+            "a submerged character must float up toward the surface (~-45), got {}", ctrl.pos[2]);
     }
 
     #[test]
