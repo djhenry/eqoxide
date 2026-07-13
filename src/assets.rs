@@ -489,8 +489,59 @@ pub struct Hit {
 /// for collision instead of the rendered terrain.
 pub const COLLISION_MESH_TAG: &str = "__collision__";
 
+/// Wall-clock budget for a WHOLE nav plan (#257, #302). A* runs synchronously on the NETWORK
+/// thread, so a long search blocks the net loop until no position/keepalive packet goes out and the
+/// server drops the client as linkdead. A node cap alone doesn't bound wall-clock (per-node cost
+/// swings widely with geometry density), so the search is capped by TIME.
+///
+/// This is the budget for the ENTIRE plan, not per A* call: `plan_path` makes up to 14 calls (full
+/// + partial + a 12-point re-anchor ring), and a per-call deadline let the worst case reach
+/// ~14 × 150 ms ≈ 2.1 s of net-thread stall — squarely in linkdead territory. Callers build ONE
+/// deadline (`PlanCtx::budget()`) and pass it to every call of the plan.
+pub const PLAN_BUDGET_MS: u64 = 150;
+
+/// Per-plan context for `find_path_res`: the things that must be shared across the several A* calls
+/// one logical plan makes, rather than re-armed per call.
+#[derive(Clone, Copy, Default)]
+pub struct PlanCtx {
+    /// Hard wall-clock deadline for the search. Shared across every call in one plan so the total
+    /// net-thread stall is bounded by `PLAN_BUDGET_MS` (see above). `None` = arm a fresh budget.
+    pub deadline: Option<std::time::Instant>,
+    /// Zone-point index of a `DRNTP` zone-line region we are routing to. When set, A* accepts
+    /// arrival at ANY cell whose (XY, floor) lies inside that region — not just the one goal cell
+    /// at the right tier. A region's representative point is an interior point of a VOLUME, so its
+    /// z is structurally never a floor height and a single cell+tier test on it is unsound (#229).
+    pub goal_region: Option<i32>,
+}
+
+impl PlanCtx {
+    /// A context carrying a fresh whole-plan deadline (`PLAN_BUDGET_MS` from now).
+    pub fn budget() -> Self {
+        PlanCtx {
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(PLAN_BUDGET_MS)),
+            ..Default::default()
+        }
+    }
+    pub fn with_goal_region(mut self, idx: Option<i32>) -> Self {
+        self.goal_region = idx;
+        self
+    }
+}
+
 pub struct Collision {
     tris:      Vec<[[f32; 3]; 3]>,
+    /// Per-triangle face-normal Z (normalized), parallel to `tris`. Sign = facing: `> 0` is an
+    /// UP-facing surface (a floor you can stand on), `< 0` a DOWN-facing one (a ceiling / the
+    /// underside of a bridge). Nav used to treat any surface a vertical ray crossed as a floor —
+    /// which is how A* ended up standing on qcat's ceiling and planning routes through solid rock
+    /// (#329). Computed once at build; the ray tests filter on it. (~4 bytes/tri.)
+    tri_nz:    Vec<f32>,
+    /// Winding-consistency verdict for `tri_nz`, measured at build (see `winding_is_consistent`).
+    /// EQ zone meshes are single-sided and consistently wound, so a top-down ray's first hit is
+    /// an up-facing face — we sample that. If a zone ever fails the check, the normal filter is
+    /// DISABLED for it and nav falls back to the old (facing-blind) behaviour rather than deleting
+    /// every real floor. Diagnostic + safety valve.
+    floor_normals_ok: bool,
     cells:     Vec<Vec<u32>>,
     origin:    [f32; 2], // (east, north) of cell (0,0) corner
     cell_size: f32,
@@ -564,9 +615,30 @@ impl Collision {
                 if v[1] > max[1] { max[1] = v[1]; }
             }
         }
+        // Face-normal Z per triangle (see `tri_nz`). The WLD→world map (x,y,z) → (z,x,y) is a cyclic
+        // permutation (determinant +1), so it PRESERVES winding — the sign here is the mesh's own.
+        //
+        // CAVEAT for the next person: placed-object triangles come through `expand_objects`, which
+        // applies each instance's 4x4 matrix to the VERTICES. A MIRRORED instance (negative-
+        // determinant matrix — e.g. a negative scale on one axis) reverses triangle winding, so its
+        // faces would come out normal-INVERTED and this filter would read its floors as ceilings.
+        // No shipped zone has one today (the build-time winding check below would catch a zone where
+        // enough of them existed to matter, and all 34 cached zones pass), but if mirrored instances
+        // ever appear, flip `nz` for triangles whose source instance matrix has det < 0 rather than
+        // letting the whole zone fall back to facing-blind.
+        let tri_nz: Vec<f32> = tris.iter().map(|t| {
+            let e1 = [t[1][0] - t[0][0], t[1][1] - t[0][1], t[1][2] - t[0][2]];
+            let e2 = [t[2][0] - t[0][0], t[2][1] - t[0][1], t[2][2] - t[0][2]];
+            let n = [e1[1] * e2[2] - e1[2] * e2[1],
+                     e1[2] * e2[0] - e1[0] * e2[2],
+                     e1[0] * e2[1] - e1[1] * e2[0]];
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            if len > 1e-9 { n[2] / len } else { 0.0 }
+        }).collect();
+
         let cell_size = cell_size.max(1.0);
         if tris.is_empty() || min[0] == f32::MAX {
-            return Collision { tris, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0, water: None, from_collision_mesh, zone_line_regions: Vec::new() };
+            return Collision { tris, tri_nz, floor_normals_ok: false, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0, water: None, from_collision_mesh, zone_line_regions: Vec::new() };
         }
         let cols = (((max[0] - min[0]) / cell_size).ceil() as usize + 1).max(1);
         let rows = (((max[1] - min[1]) / cell_size).ceil() as usize + 1).max(1);
@@ -587,8 +659,56 @@ impl Collision {
                 }
             }
         }
-        Collision { tris, cells, origin: min, cell_size, cols, rows, water: None, from_collision_mesh, zone_line_regions: Vec::new() }
+        let mut col = Collision { tris, tri_nz, floor_normals_ok: false, cells, origin: min, cell_size, cols, rows, water: None, from_collision_mesh, zone_line_regions: Vec::new() };
+        col.floor_normals_ok = col.winding_is_consistent();
+        if !col.floor_normals_ok {
+            tracing::warn!("nav: collision mesh winding looks INCONSISTENT — the floor-normal filter is \
+                disabled for this zone; nav may mistake ceilings for floors (#329)");
+        }
+        col
     }
+
+    /// Is the winding consistent enough that `tri_nz > 0` really means "a surface you can stand ON"?
+    ///
+    /// Sampled, not proved. The probe is the LOWEST surface in each of a grid of vertical columns:
+    /// whatever else a column contains, its bottom-most surface is the floor of the lowest room (or
+    /// the terrain), so on a correctly wound mesh it is UP-facing. (The obvious "topmost hit from
+    /// the sky" probe does NOT work: EQ art is single-sided, so an enclosed zone's roof is a face
+    /// wound to look DOWN into the room and has no outward side at all — that probe reads 0%
+    /// up-facing on every dungeon.)
+    ///
+    /// Measured on the shipped GLBs: qcat 99.7%, gfaydark 99.8%, everfrost 94.5%, qeynos2 100%,
+    /// halas 100%, butcher 100%, blackburrow 99.6%, permafrost 94.0%, crushbone 100%, neriakc
+    /// 98.5%, qeynos 99.0%, freportw 100%. The convention holds everywhere; the few % of misses are
+    /// stray inverted art faces, so the bar is a strong majority rather than unanimity. A zone that
+    /// somehow failed would simply keep the old facing-blind behaviour (and log a warning) instead
+    /// of having every real floor filtered away. Cheap: a few hundred rays, once per zone load.
+    fn winding_is_consistent(&self) -> bool {
+        if self.cols == 0 || self.tris.is_empty() { return false; }
+        let zmax = self.tris.iter().flatten().fold(f32::MIN, |m, v| m.max(v[2]));
+        let zmin = self.tris.iter().flatten().fold(f32::MAX, |m, v| m.min(v[2]));
+        let (w, h) = (self.cols as f32 * self.cell_size, self.rows as f32 * self.cell_size);
+        const N: usize = 24; // 24x24 XY probes
+        let (mut up, mut total) = (0usize, 0usize);
+        let mut hits = Vec::new();
+        for i in 0..N {
+            for j in 0..N {
+                let e = self.origin[0] + w * (i as f32 + 0.5) / N as f32;
+                let n = self.origin[1] + h * (j as f32 + 0.5) / N as f32;
+                self.column_hits(e, n, zmax + 1.0, 0.0, (zmax - zmin) + 2.0, false, &mut hits);
+                if let Some(&(_, nz)) = hits.last() { // high→low ⇒ last = the lowest surface
+                    total += 1;
+                    if nz > 0.0 { up += 1; }
+                }
+            }
+        }
+        // Columns that miss all geometry don't vote.
+        total >= 16 && (up as f32) / (total as f32) >= 0.85
+    }
+
+    /// Did this zone's collision mesh pass the build-time winding check, i.e. is the floor-normal
+    /// filter (a ceiling is not a floor, #329) ACTIVE for it? Provenance/diagnostics.
+    pub fn floor_normals_ok(&self) -> bool { self.floor_normals_ok }
 
     /// Attach a zone water map so find_path can route swim descents. Call after `build`.
     pub fn set_water(&mut self, water: Option<std::sync::Arc<crate::region_map::RegionMap>>) {
@@ -661,15 +781,50 @@ impl Collision {
     /// ring × z scan did up to ~10^8 BSP walks synchronously and force-linkdead-ed the client when a
     /// line was far away or missing from the `.wtr` (#204). `index` filters to a destination zone's
     /// line (`None` = any); returns `(index, [east, north, z])` of the region nearest `near`.
+    /// The returned point is projected onto the WALKABLE FLOOR beneath the region (#229). A region
+    /// point's z is an interior point of the region VOLUME — across the shipped zones it sits 1.5u
+    /// to 127u ABOVE the real floor, and it is structurally never a floor height. Navigating to it
+    /// verbatim gave A* an unreachable goal tier, so the search could never accept arrival: it
+    /// flooded the grid, hit the time cap, and returned a greedy partial route that wedged into a
+    /// wall. (halas is the one line whose region z is nearly floor-level — and it is the one line
+    /// that always worked.)
+    ///
+    /// The projection is only taken when the region STILL CONTAINS the projected floor point, so a
+    /// tall vertical translocator whose footprint doesn't reach the ground (#266) is never dragged
+    /// down off its trigger volume — such a candidate keeps its original z. Candidates are tried
+    /// nearest-first, preferring one that projects (a region point hanging over a void is skipped).
     pub fn find_zone_line_near(&self, index: Option<i32>, near: [f32; 3]) -> Option<(i32, [f32; 3])> {
-        self.zone_line_regions
+        // Rank by distance to the PROJECTED (standable) point, not the raw region point — and weight
+        // vertical separation far above horizontal. A zone line is often baked as several stacked
+        // DRNTP leaves over more than one XY; gfaydark's butcher line has a leaf whose only floor is
+        // an isolated 74u-high ledge and another that sits on the ground. Ranking on raw 3D distance
+        // picked the ledge (it was 28u closer in XY) and sent the char climbing to an unreachable
+        // perch. Climbing 74u is not "cheaper" than walking 28u further, so make the cost say so.
+        const Z_WEIGHT: f32 = 4.0;
+        let cost = |p: &[f32; 3]| (p[0] - near[0]).hypot(p[1] - near[1]) + Z_WEIGHT * (p[2] - near[2]).abs();
+        let best_projected = self.zone_line_regions
             .iter()
             .filter(|(idx, _)| index.is_none_or(|want| want == *idx))
-            .min_by(|a, b| {
-                let d2 = |p: &[f32; 3]| (p[0] - near[0]).powi(2) + (p[1] - near[1]).powi(2) + (p[2] - near[2]).powi(2);
-                d2(&a.1).partial_cmp(&d2(&b.1)).unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .copied()
+            .filter_map(|&(idx, p)| self.zone_line_floor_point(idx, p).map(|fp| (idx, fp)))
+            .min_by(|a, b| cost(&a.1).total_cmp(&cost(&b.1)));
+        best_projected.or_else(|| self.zone_line_regions // nothing projects (no floor under any) —
+            .iter()                                      // keep the old raw-region-point behaviour
+            .filter(|(idx, _)| index.is_none_or(|want| want == *idx))
+            .min_by(|a, b| cost(&a.1).total_cmp(&cost(&b.1)))
+            .copied())
+    }
+
+    /// Project a zone-line region's representative point down onto the walkable floor beneath it.
+    /// `None` when there is no floor under it, or when the region does NOT extend down to that floor
+    /// (so standing there would not trigger the crossing — see `find_reachable_in_zone_line`, #266).
+    fn zone_line_floor_point(&self, index: i32, p: [f32; 3]) -> Option<[f32; 3]> {
+        const REGION_DROP: f32 = 400.0;
+        let fz = self.floor_beneath(p[0], p[1], p[2], 2.0, REGION_DROP)?;
+        // Standing on that floor must still be INSIDE the region — else we'd walk the char to a spot
+        // that never fires the auto-cross.
+        let inside = self.water.as_ref()
+            .and_then(|w| w.zone_line_at(p[0], p[1], fz + 1.0)) == Some(index);
+        inside.then_some([p[0], p[1], fz])
     }
 
     /// Nearest zone-line region whose index is in `in_zone_idxs` (a same-zone destination — an escape
@@ -731,21 +886,30 @@ impl Collision {
         }
     }
 
-    /// Find the walkable floor height at `(east, north)` nearest to `ref_z`.
-    ///
-    /// Casts a vertical column over `[ref_z - down, ref_z + up]`, gathers EVERY triangle it
-    /// crosses, and returns the hit whose height is **closest to `ref_z`**. This is the surface
-    /// the player would actually stand on (or step to), and — unlike a single top-down ray —
-    /// it does NOT mistake an overhang/awning/bridge ABOVE the floor for the floor itself.
-    /// `up` bounds how far you can step UP onto a ledge; `down` how far you can drop. Returns
-    /// `None` when no surface exists in the band.
-    pub fn nearest_floor(&self, east: f32, north: f32, ref_z: f32, up: f32, down: f32) -> Option<f32> {
-        if self.cols == 0 { return None; }
+    /// EVERY surface a vertical column over `[ref_z - down, ref_z + up]` crosses at `(east, north)`,
+    /// as `(height, face_normal_z)`, sorted **high → low**. `face_normal_z > 0` = up-facing (a
+    /// floor); `< 0` = down-facing (a ceiling / a bridge's underside). Near-vertical walls are
+    /// parallel to the ray and never register. Diagnostic/offline-probe entry point and the shared
+    /// primitive behind `nearest_floor` / `column_floors`.
+    pub fn column_surfaces(&self, east: f32, north: f32, ref_z: f32, up: f32, down: f32) -> Vec<(f32, f32)> {
+        let mut hits = Vec::new();
+        self.column_hits(east, north, ref_z, up, down, false, &mut hits);
+        hits
+    }
+
+    /// Shared vertical-column raycast (Möller–Trumbore). Appends `(hit_z, face_normal_z)` to `out`,
+    /// sorted high→low. When `floors_only`, DOWN-facing surfaces are dropped so a ceiling can never
+    /// be mistaken for a floor (#329) — unless this zone's winding failed the build-time check, in
+    /// which case we keep the old facing-blind behaviour rather than deleting real floors.
+    fn column_hits(&self, east: f32, north: f32, ref_z: f32, up: f32, down: f32,
+                   floors_only: bool, out: &mut Vec<(f32, f32)>) {
+        out.clear();
+        if self.cols == 0 { return; }
         let z_top = ref_z + up.max(0.0);
         let z_bot = ref_z - down.max(0.0);
-        let from = [east, north, z_top];
         let dir_z = z_bot - z_top; // negative (downward)
-        if dir_z.abs() < 1e-6 { return None; }
+        if dir_z.abs() < 1e-6 { return; }
+        let filter = floors_only && self.floor_normals_ok;
         let eps = 1e-6_f32;
         let cross = |a: [f32; 3], b: [f32; 3]| [
             a[1] * b[2] - a[2] * b[1],
@@ -753,12 +917,17 @@ impl Collision {
             a[0] * b[1] - a[1] * b[0],
         ];
         let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let from = [east, north, z_top];
         let dir = [0.0, 0.0, dir_z];
         let (c0, c1, r0, r1) = self.cell_range(east, north, east, north);
-        let mut best: Option<f32> = None;
         for r in r0..=r1 {
             for c in c0..=c1 {
                 for &ti in &self.cells[r * self.cols + c] {
+                    // A floor is an UP-FACING triangle. Reject ceilings BEFORE the (much more
+                    // expensive) intersection test — this is the whole fix for "A* stands on the
+                    // ceiling" and it costs one compare.
+                    let nz = self.tri_nz[ti as usize];
+                    if filter && nz <= 0.0 { continue; }
                     let tri = &self.tris[ti as usize];
                     let (v0, v1, v2) = (tri[0], tri[1], tri[2]);
                     let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
@@ -775,14 +944,38 @@ impl Collision {
                     if v < 0.0 || u + v > 1.0 { continue; }
                     let t = dot(e2, q) * inv;
                     if !(0.0..=1.0).contains(&t) { continue; }
-                    let hit_z = z_top + t * dir_z;
-                    if best.map_or(true, |b| (hit_z - ref_z).abs() < (b - ref_z).abs()) {
-                        best = Some(hit_z);
-                    }
+                    out.push((z_top + t * dir_z, nz));
                 }
             }
         }
-        best
+        out.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)); // high→low
+    }
+
+    /// Find the walkable FLOOR height at `(east, north)` nearest to `ref_z`.
+    ///
+    /// Casts a vertical column over `[ref_z - down, ref_z + up]`, gathers every UP-FACING triangle
+    /// it crosses (a ceiling is not a floor — #329), and returns the one whose height is **closest
+    /// to `ref_z`**. This is the surface the player would actually stand on (or step to), and —
+    /// unlike a single top-down ray — it does NOT mistake an overhang/awning/bridge ABOVE the floor
+    /// for the floor itself. `up` bounds how far you can step UP onto a ledge; `down` how far you
+    /// can drop. Returns `None` when no floor exists in the band.
+    pub fn nearest_floor(&self, east: f32, north: f32, ref_z: f32, up: f32, down: f32) -> Option<f32> {
+        let mut hits = Vec::new();
+        self.column_hits(east, north, ref_z, up, down, true, &mut hits);
+        hits.into_iter()
+            .map(|(z, _)| z)
+            .min_by(|a, b| (a - ref_z).abs().partial_cmp(&(b - ref_z).abs()).unwrap_or(std::cmp::Ordering::Equal))
+    }
+
+    /// The highest walkable floor at or below `z` (searching down `down` units, and up `up` units
+    /// for a goal that sits a little UNDER the floor it names). This is the "what am I standing
+    /// over?" query — used to project a point that lives in a VOLUME (a `DRNTP` zone-line region's
+    /// interior point, whose z is a point inside the region solid and is structurally NEVER a floor
+    /// height, #229) down onto ground a character can actually stand on.
+    pub fn floor_beneath(&self, east: f32, north: f32, z: f32, up: f32, down: f32) -> Option<f32> {
+        let mut hits = Vec::new();
+        self.column_hits(east, north, z + up.max(0.0), 0.0, up.max(0.0) + down.max(0.0), true, &mut hits);
+        hits.first().map(|&(z, _)| z) // high→low ⇒ the first is the highest floor at/below z+up
     }
 
     /// Nearest geometry hit along segment `from → to`, as fraction `t ∈ (0,1]`.
@@ -971,46 +1164,11 @@ impl Collision {
     /// lower floor sits UNDER an upper ledge (so A* can choose to descend instead of always snapping
     /// to the nearest/upper surface).
     pub fn column_floors(&self, east: f32, north: f32, ref_z: f32, up: f32, down: f32) -> Vec<f32> {
-        if self.cols == 0 { return Vec::new(); }
-        let z_top = ref_z + up.max(0.0);
-        let z_bot = ref_z - down.max(0.0);
-        let dir_z = z_bot - z_top;
-        if dir_z.abs() < 1e-6 { return Vec::new(); }
-        let eps = 1e-6_f32;
-        let cross = |a: [f32; 3], b: [f32; 3]| [
-            a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0],
-        ];
-        let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-        let from = [east, north, z_top];
-        let dir = [0.0, 0.0, dir_z];
-        let (c0, c1, r0, r1) = self.cell_range(east, north, east, north);
-        let mut hits: Vec<f32> = Vec::new();
-        for r in r0..=r1 {
-            for c in c0..=c1 {
-                for &ti in &self.cells[r * self.cols + c] {
-                    let tri = &self.tris[ti as usize];
-                    let (v0, v1, v2) = (tri[0], tri[1], tri[2]);
-                    let e1 = [v1[0]-v0[0], v1[1]-v0[1], v1[2]-v0[2]];
-                    let e2 = [v2[0]-v0[0], v2[1]-v0[1], v2[2]-v0[2]];
-                    let p = cross(dir, e2);
-                    let det = dot(e1, p);
-                    if det.abs() < eps { continue; }
-                    let inv = 1.0 / det;
-                    let tvec = [from[0]-v0[0], from[1]-v0[1], from[2]-v0[2]];
-                    let u = dot(tvec, p) * inv;
-                    if u < 0.0 || u > 1.0 { continue; }
-                    let q = cross(tvec, e1);
-                    let v = dot(dir, q) * inv;
-                    if v < 0.0 || u + v > 1.0 { continue; }
-                    let t = dot(e2, q) * inv;
-                    if !(0.0..=1.0).contains(&t) { continue; }
-                    hits.push(z_top + t * dir_z);
-                }
-            }
-        }
-        hits.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)); // high→low
-        hits.dedup_by(|a, b| (*a - *b).abs() < 1.0);
-        hits
+        let mut hits = Vec::new();
+        self.column_hits(east, north, ref_z, up, down, true, &mut hits);
+        let mut zs: Vec<f32> = hits.into_iter().map(|(z, _)| z).collect(); // already high→low
+        zs.dedup_by(|a, b| (*a - *b).abs() < 1.0);
+        zs
     }
 
     /// A* over the collision grid: a walkable waypoint path from `start` to `goal` that routes
@@ -1030,17 +1188,58 @@ impl Collision {
     /// sub-8u detail (thin ramps, narrow openings). The FINE local tier calls `find_path_res` with a
     /// small cell + a search bound to thread that detail near the walker.
     pub fn find_path(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]], allow_partial: bool) -> Option<Vec<[f32; 3]>> {
-        self.find_path_res(start, goal, radius, avoid, allow_partial, 8.0, None, 0.0)
+        self.find_path_res(start, goal, radius, avoid, allow_partial, 8.0, None, 0.0, PlanCtx::default())
     }
 
     /// A* at an arbitrary grid resolution `cell`, optionally bounded to `max_search` units of the
     /// start (so a FINE plan stays local + cheap even if it hits an obstacle). `cell` = 8.0 +
     /// `max_search` = None reproduces the classic whole-zone nav grid.
     pub fn find_path_res(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]],
-        allow_partial: bool, cell: f32, max_search: Option<f32>, aggro_buffer: f32) -> Option<Vec<[f32; 3]>> {
+        allow_partial: bool, cell: f32, max_search: Option<f32>, aggro_buffer: f32, ctx: PlanCtx) -> Option<Vec<[f32; 3]>> {
+        self.find_path_ex(start, goal, radius, avoid, allow_partial, cell, max_search, aggro_buffer, ctx)
+            .map(|(path, _)| path)
+    }
+
+    /// As `find_path_res`, but also reports whether the route actually REACHED the goal (`true`) or
+    /// is only a partial route toward it (`false`).
+    ///
+    /// `allow_partial` is consulted only AFTER the search loop — the A* run itself is identical
+    /// either way. So a caller that wants "a full route, or else the best partial" must not run the
+    /// search twice (which is what `plan_path` used to do: two back-to-back identical floods of the
+    /// grid, each arming its own 150 ms budget). One call with `allow_partial = true` and this flag
+    /// gives the same answer for half the net-thread time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_path_ex(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]],
+        allow_partial: bool, cell: f32, max_search: Option<f32>, aggro_buffer: f32, ctx: PlanCtx) -> Option<(Vec<[f32; 3]>, bool)> {
+        // Anchor A* at the character's true position (so its first leg is one the walker can
+        // actually take). But if the character's EXACT spot is BOXED IN — standing inside a tree
+        // trunk's or a wall's footprint, where the rays out of it are blocked or lead into a sealed
+        // pocket — that anchor strands the search in a handful of nodes. That is precisely the
+        // isolated start the cell-centre anchor + start-cell hop exist to rescue (#2/#205), so fall
+        // back to them.
+        //
+        // The retry is gated on the failed search having explored almost NOTHING, so it fires only
+        // for a boxed-in start (a few nodes, microseconds) and never doubles the cost of a genuine
+        // long search that failed on its merits — which would put two full budgets on the net thread.
+        const BOXED_IN_NODES: usize = 64;
+        let (res, explored) = self.astar(start, goal, radius, avoid, allow_partial, cell, max_search, aggro_buffer, ctx, true);
+        if res.is_none() && explored < BOXED_IN_NODES {
+            return self.astar(start, goal, radius, avoid, allow_partial, cell, max_search, aggro_buffer, ctx, false).0;
+        }
+        res
+    }
+
+    /// The A* itself. `prefer_char_anchor` expands the START node from the character's own (x, y)
+    /// rather than its cell centre (see `anchor_at_char`). Also reports how many nodes the search
+    /// actually reached, so the caller can tell a BOXED-IN start (a handful) from a search that
+    /// failed on its merits (thousands) and retry only the former.
+    #[allow(clippy::too_many_arguments)]
+    fn astar(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]],
+        allow_partial: bool, cell: f32, max_search: Option<f32>, aggro_buffer: f32, ctx: PlanCtx,
+        prefer_char_anchor: bool) -> (Option<(Vec<[f32; 3]>, bool)>, usize) {
         use std::collections::BinaryHeap;
         use std::cmp::Ordering;
-        if self.cols == 0 || self.rows == 0 { return None; }
+        if self.cols == 0 || self.rows == 0 { return (None, 0); }
         // Navigate on a FINER grid than the collision broad-phase buckets (self.cell_size, ~32u).
         // At 32u, cell centers fall inside walls in tight corridors, so A* sees a fragmented graph,
         // finds no route, and the caller straight-lines into walls. An 8u nav grid keeps cell
@@ -1073,15 +1272,43 @@ impl Collision {
         };
         let (sc, sr) = to_cell(start[0], start[1]);
         let (gc, gr) = to_cell(goal[0], goal[1]);
-        if (sc, sr) == (gc, gr) { return Some(vec![[goal[0], goal[1], goal[2]]]); }
-        // The goal's TIER: the walkable surface at the goal XY nearest the requested goal z. On a
-        // zone with stacked levels (neriakc, a walkway over a lower floor) the goal cell exists at
-        // several heights; A* must finish on the one the caller asked for, else it routes the whole
-        // approach along the wrong tier and the walker stalls / lands a level off (#35). A generous
-        // ±STEP_UP band resolves the tier even if goal z is a little off the exact floor.
-        let goal_floor = self.nearest_floor(goal[0], goal[1], goal[2], STEP_UP, STEP_UP)
-            .unwrap_or(goal[2]);
+        // Same cell as the goal: a straight walk. Still start the route AT the character (see the
+        // `path.insert(0, ...)` note at the end of the search) so pure pursuit steers along it.
+        if (sc, sr) == (gc, gr) {
+            return (Some((vec![[start[0], start[1], start[2]], [goal[0], goal[1], goal[2]]], true)), 0);
+        }
         const GOAL_TIER_TOL: f32 = 8.0; // reached floor within this of goal_floor == the right tier
+        // The goal's TIER: the walkable surface at the goal XY the caller means. On a zone with
+        // stacked levels (neriakc, a walkway over a lower floor) the goal cell exists at several
+        // heights; A* must finish on the one the caller asked for, else it routes the whole approach
+        // along the wrong tier and the walker stalls / lands a level off (#35).
+        //
+        // The goal z is NOT always a floor height, and assuming it is was the #229 wedge: a
+        // `zone_cross` aims at a `DRNTP` region's representative point, whose z is an interior point
+        // of the region VOLUME — measured 1.5u to 127u ABOVE the real floor on every zone line in
+        // the shipped assets. Snapping that to the "nearest surface within ±20" produced a PHANTOM
+        // tier (or, pre-normal-filter, a ceiling), and then GOAL_TIER_TOL rejected every cell A*
+        // reached at the TRUE floor — so A* could never accept arrival, flooded the grid, timed out,
+        // and returned a greedy partial that wedged into a wall.
+        //
+        // So: snap to a floor only when the goal z really IS one (within GOAL_TIER_TOL of a
+        // surface). Otherwise the goal is a point in the air / in a volume — project it DOWN onto
+        // the walkable floor beneath it, however far below that is.
+        const GOAL_DROP: f32 = 400.0; // a volume point can sit far above its floor
+        // The snap window is GOAL_TIER_TOL (8), deliberately NARROWER than the old +/-STEP_UP (20).
+        // It has to be: the two clauses below disagree about what a goal that is 8..20u ABOVE a floor
+        // means, and only one of them can win. The old +/-20 said "that's still this floor" — which is
+        // exactly how a zone-line region point 12.9u above its floor (gfaydark->felwithea) got snapped
+        // onto a phantom tier. Tying the window to the SAME tolerance A* later uses to accept arrival
+        // (GOAL_TIER_TOL) makes the two agree by construction: if the goal z is within tier tolerance
+        // of a real floor it IS that tier; otherwise it is a point in the air and gets projected down.
+        // Cost: a goal reported 8..20u BELOW its floor now resolves to the floor beneath it instead of
+        // stepping up to the one above. That is the rarer and more conservative error (walk to the
+        // ground under the target, not to a tier the caller never named), and callers that report a z
+        // that far under their own floor are already lying to us.
+        let goal_floor = self.nearest_floor(goal[0], goal[1], goal[2], GOAL_TIER_TOL, GOAL_TIER_TOL)
+            .or_else(|| self.floor_beneath(goal[0], goal[1], goal[2], GOAL_TIER_TOL, GOAL_DROP))
+            .unwrap_or(goal[2]);
         // Start floor: anchor to the caller's EXACT (x,y), NOT the 8u cell center. Near a wall the
         // cell center can fall on the wall's footprint, whose only surface is the wall-TOP — so the
         // center probe would start the char up on the wall and route the whole path along it, a
@@ -1089,9 +1316,46 @@ impl Collision {
         // start point sits on the real floor (e.g. the street) the char is actually standing on.
         // The caller's z can still be stale, so try several reference levels; fall back to the cell
         // center only if the exact point has no floor at any of them.
-        let start_floor = [start[2], goal[2], 0.0, -60.0, -120.0]
-            .into_iter()
-            .find_map(|rz| self.nearest_floor(start[0], start[1], rz, STEP_UP, MAX_DROP))
+        //
+        // WATER (#329, #197p2): a character FLOATING in water has no floor under it in any
+        // meaningful sense — its support is the WATER SURFACE, and buoyancy holds it there. Anchoring
+        // it to a slab instead planned routes it physically cannot follow: in the flooded qcat spawn
+        // corridor the nearest surface to a floater was the CEILING (the water line is flush with
+        // it), so A* planned across the ceiling plane; in the Halas pool the nearest surface was the
+        // pool BOTTOM 128u down, so A* planned along the bottom and the swimmer dived and stranded.
+        // If the char is in water with no footing directly beneath it, anchor A* to the surface it is
+        // actually floating on — which is exactly the tier the WATER SURFACE TRAVERSAL edges connect.
+        const FOOTING: f32 = 4.0; // a floor this close under the feet = standing (wading), not floating
+        let floating_surface = self.water.as_ref().and_then(|w| {
+            let (x, y, z) = (start[0], start[1], start[2]);
+            let wet = w.is_water(x, y, z) || w.is_water(x, y, z - 1.0);
+            let footed = self.nearest_floor(x, y, z, 2.0, FOOTING).is_some();
+            if wet && !footed { w.surface_z(x, y, z - 1.0) } else { None }
+        });
+        // The floor under the character's EXACT position (not its cell centre). When this resolves,
+        // A* is anchored geometrically AT THE CHARACTER (see `anchor_at_char` below) and needs no
+        // cell-centre fallback at all.
+        let exact_start_floor = floating_surface
+            .or_else(|| [start[2], goal[2], 0.0, -60.0, -120.0]
+                .into_iter()
+                .find_map(|rz| self.nearest_floor(start[0], start[1], rz, STEP_UP, MAX_DROP)));
+        // TRUE-POSITION START ANCHOR (#229's last mile). A* expands each node from its CELL CENTRE,
+        // including the start — but the walker drives from where the character actually STANDS. When
+        // the character is pressed against a wall, its own 8u cell centre can lie INSIDE the wall's
+        // footprint; the start cell then gets hopped to a neighbour (below), A* plans a perfectly
+        // valid chain from THAT centre, and the walker charges from its real position straight at the
+        // first waypoint — through the wall in between. Live everfrost→blackburrow: a 99-waypoint
+        // route in which every A*-validated cell-centre segment was clear and ONLY the
+        // character→waypoint[0] leg was blocked; the walker pressed into the wall, made no progress,
+        // re-planned the identical route, and stalled out after 8 attempts.
+        //
+        // So when the character's exact position has a floor, expand the START node from THE
+        // CHARACTER'S OWN (x, y) instead of the cell centre. Every first-hop edge is then clearance-
+        // tested from where the walker really is, so the route's first leg is always one it can
+        // actually take — and the cell-centre-in-a-wall hop becomes unnecessary (the start node's
+        // floor is the character's real floor, never the wall-top the hop existed to dodge).
+        let anchor_at_char = prefer_char_anchor && exact_start_floor.is_some();
+        let start_floor = exact_start_floor
             .or_else(|| [start[2], goal[2], 0.0, -60.0, -120.0].into_iter().find_map(|rz| floor_near(sc, sr, rz)))
             .unwrap_or(start[2]);
         const STEP_H: f32 = 20.0;        // vertical SEARCH range for column_floors + per-cell rise cap
@@ -1123,12 +1387,22 @@ impl Collision {
         // either route along it (a height the walker can't scale → 0 progress) or find no route at
         // all. If the start cell's column has no floor at the char's true height (`start_floor`),
         // hop to the nearest neighbouring cell that does. (#2)
+        // When the start anchor is a WATER SURFACE (a floating character), there is no solid floor at
+        // that height by definition — the cell is valid if it is swimmable water there instead.
+        //
+        // Only needed when we could NOT anchor at the character's exact position: with
+        // `anchor_at_char` the start node's floor is the character's real floor (never the wall-top)
+        // and its edges are cast from the character's real (x, y), so hopping the cell would only
+        // move the plan's origin away from the walker — which is the very bug it used to cause.
         let cell_has_start_floor = |c: i32, r: i32| -> bool {
             let ctr = center(c, r);
+            if floating_surface.is_some() {
+                return self.water.as_ref().is_some_and(|w| w.is_water(ctr[0], ctr[1], start_floor - 1.0));
+            }
             self.column_floors(ctr[0], ctr[1], start_floor, STEP_H, MAX_STEP_DOWN)
                 .into_iter().any(|z| (z - start_floor).abs() <= GOAL_TIER_TOL)
         };
-        let (sc, sr) = if cell_has_start_floor(sc, sr) {
+        let (sc, sr) = if anchor_at_char || cell_has_start_floor(sc, sr) {
             (sc, sr)
         } else {
             let mut best: Option<(i32, i32, i32)> = None; // (col, row, dist²)
@@ -1150,18 +1424,12 @@ impl Collision {
         };
         const CHEST: f32 = 3.0;
         const MAX_NODES: usize = 200_000;
-        // Wall-clock budget (#257). A* runs synchronously on the NETWORK thread, so an
-        // expensive search (measured at 14–17 s in the pathological submerged-start → far-goal
-        // case) blocks the net loop long enough that no position/keepalive packet goes out —
-        // EQEmu's MQGhost anti-cheat then trips and the server kicks the client as linkdead.
-        // A node cap alone doesn't bound wall-clock (per-node cost swings widely with geometry
-        // density), so cap the search by TIME: once the budget elapses we stop and fall through
+        // Wall-clock budget (#257) — see `PLAN_BUDGET_MS`. Once it elapses we stop and fall through
         // to the same partial-path fallback used when MAX_NODES is hit, so the walker still makes
-        // forward progress and re-plans from there. This bounds the net-thread stall to roughly
-        // the budget regardless of how pathological the query is. A normal plan finishes far
-        // under it, so ordinary navigation is unaffected.
-        const PLAN_BUDGET_MS: u64 = 150;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(PLAN_BUDGET_MS);
+        // forward progress and re-plans from there. The deadline comes from the CALLER (`ctx`) so it
+        // is shared by every A* call in one plan; only a bare call arms its own.
+        let deadline = ctx.deadline
+            .unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_millis(PLAN_BUDGET_MS));
         let mut timed_out = false;
         // Aggro-avoidance (#67): softly bias A* AWAY from cells near NPCs so long routes skirt mob
         // camps instead of plowing through them and getting the player killed. Proactive (before
@@ -1219,6 +1487,21 @@ impl Collision {
         while let Some(Node { c, r, fz, .. }) = heap.pop() {
             let ckey = (c, r, qf(fz));
             if !closed.insert(ckey) { continue; } // already expanded
+            // ZONE-LINE ARRIVAL (#229): a zone line is a VOLUME (a DRNTP BSP region), not a point.
+            // Its representative point's z is an interior point of that volume — structurally never a
+            // floor height — so "did I reach the goal cell at the goal's tier?" is the wrong question
+            // to ask of it. Ask the right one instead: am I STANDING INSIDE the region? That is
+            // exactly the predicate the native auto-cross fires on. Only tested near the goal cell,
+            // so it costs a handful of BSP walks per plan, not one per node.
+            if let (Some(want), Some(water)) = (ctx.goal_region, self.water.as_ref()) {
+                if h(c, r) <= 2.0 * cell {
+                    let p = center(c, r);
+                    if water.zone_line_at(p[0], p[1], fz + 1.0) == Some(want) {
+                        goal_key = Some(ckey);
+                        break;
+                    }
+                }
+            }
             if (c, r) == (gc, gr) {
                 if (fz - goal_floor).abs() <= GOAL_TIER_TOL {
                     goal_key = Some(ckey); // reached the goal cell on the requested tier — done
@@ -1244,7 +1527,11 @@ impl Collision {
             if hd < best_toward_h { best_toward_h = hd; best_toward = Some(ckey); }
             let cz = fz;
             let g_cur = *g_score.get(&ckey).unwrap_or(&f32::MAX);
-            let a = center(c, r);
+            // Expand from the CHARACTER'S OWN position for the start node (see `anchor_at_char`), so
+            // every first-hop edge is clearance-tested from where the walker actually stands rather
+            // than from a cell centre it may not be able to reach. Every other node expands from its
+            // cell centre as before.
+            let a = if anchor_at_char && ckey == skey { [start[0], start[1]] } else { center(c, r) };
             for (dc, dr) in [(-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (-1, 1), (1, -1), (1, 1)] {
                 let (nc, nr) = (c + dc, r + dr);
                 if nc < 0 || nr < 0 || nc >= cols || nr >= rows { continue; }
@@ -1376,7 +1663,11 @@ impl Collision {
                 // this, flooded pits (qeynos2's moat) are one-way traps: descent gets you in,
                 // and the normal climb's chest ray hits the pit wall on the way out.
                 if let Some(water) = &self.water {
-                    let submerged = (0..=3).any(|k| water.is_water(a[0], a[1], cz + 2.0 + k as f32 * 4.0));
+                    // Submerged (water ABOVE us), or floating AT the surface — a start anchored to
+                    // the water surface (#329/#197p2) has air above it, so the old submerged-only
+                    // test never fired for it and a floating swimmer had no way OUT of the water.
+                    let submerged = (0..=3).any(|k| water.is_water(a[0], a[1], cz + 2.0 + k as f32 * 4.0))
+                        || water.is_water(a[0], a[1], cz - 1.0);
                     if submerged {
                         // Top of the contiguous water column above the current floor.
                         let mut surface = cz;
@@ -1484,6 +1775,19 @@ impl Collision {
                 }
             }
         }
+        // The ANCHORS the whole search hung off. Log them on the SUCCESS path too, not just on
+        // failure: every anchor bug in this file's history (#229 goal-on-a-phantom-tier, #329
+        // start-on-the-ceiling, #197p2 start-on-the-pool-bottom) presented as "A* returns a route
+        // the walker can't follow" — a success with visibly wrong anchors. Without this line each
+        // one cost days; with it, each is a 30-second read. Coarse whole-zone plans only (the fine
+        // local tier re-plans every tick and would spam).
+        if max_search.is_none() {
+            tracing::info!("find_path: start=({:.0},{:.0},{:.1}) start_floor={:.2}{} goal=({:.0},{:.0},{:.1}) goal_floor={:.2}{}",
+                start[0], start[1], start[2], start_floor,
+                if floating_surface.is_some() { " (WATER SURFACE — floating)" } else { "" },
+                goal[0], goal[1], goal[2], goal_floor,
+                match ctx.goal_region { Some(i) => format!(" (zone-line region {i})"), None => String::new() });
+        }
         // Prefer the requested tier; fall back to a wrong-tier goal only if the right tier is
         // unreachable (keeps the old "reach the goal cell at all" behaviour as a floor).
         let (goal_key, reached_goal) = match goal_key.or(goal_fallback) {
@@ -1502,14 +1806,14 @@ impl Collision {
                     }
                     _ => {
                         if timed_out {
-                            tracing::warn!("find_path: search timed out after {}ms ({} nodes) with no usable route \
+                            tracing::warn!("find_path: search timed out ({} nodes) with no usable route \
                                 — start_floor={start_floor} goal_floor={goal_floor} (#257 net-thread time cap)",
-                                PLAN_BUDGET_MS, expanded);
+                                expanded);
                         } else {
                             tracing::info!("find_path: no route (expanded={}, cap={}, start_floor={}, goal_floor={})",
                                 expanded, MAX_NODES, start_floor, goal_floor);
                         }
-                        return None;
+                        return (None, came.len());
                     }
                 }
             }
@@ -1569,9 +1873,23 @@ impl Collision {
             while path.last().is_some_and(|&wp| self.in_water(wp)) {
                 path.pop();
             }
-            if path.is_empty() { return None; }
+            if path.is_empty() { return (None, came.len()); }
         }
-        Some(path)
+        // THE ROUTE BEGINS AT THE CHARACTER (#229's last mile, part 2). The walker follows the route
+        // with pure pursuit, which steers along the segment (path[i], path[i+1]) — it ASSUMES path[0]
+        // is where the character is standing. A* returns a start-EXCLUSIVE route, so the walker never
+        // actually aims at the first waypoint: it projects itself onto the path[0]→path[1] segment
+        // and steers along THAT, cutting the corner between them.
+        //
+        // When the first leg is a real manoeuvre, that corner-cut is fatal. Live everfrost: the
+        // character is pressed against a wall, A* correctly routes NORTH off the wall and then west
+        // around it — but pure pursuit projected the character onto the (north-waypoint → west-
+        // waypoint) segment, aimed south-west along it, and drove straight back into the wall. It
+        // made no progress, re-planned the identical (correct) route, and stalled out after 8
+        // attempts. Prepending the character's own position makes the first pursuit segment
+        // character→first-waypoint, so the route's first leg is actually walked.
+        path.insert(0, [start[0], start[1], start_floor]);
+        (Some((path, reached_goal)), came.len())
     }
 }
 
@@ -1846,6 +2164,208 @@ mod tests {
             "no geometry should never block movement");
     }
 
+    // ── nav z-anchor regression tests (#229, #329, #197p2) ───────────────────────────────────────
+    // A quad in EQ WLD space (pos = [north, height, east]). `up` picks the winding, and therefore
+    // the face normal: an up-facing FLOOR you can stand on, or a down-facing CEILING you cannot.
+    fn slab(z: f32, n0: f32, n1: f32, e0: f32, e1: f32, up: bool) -> MeshData {
+        MeshData {
+            positions: vec![[n0, z, e0], [n0, z, e1], [n1, z, e1], [n1, z, e0]],
+            normals: vec![], uvs: vec![],
+            indices: if up { vec![0, 1, 2, 0, 2, 3] } else { vec![0, 2, 1, 0, 3, 2] },
+            texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        }
+    }
+
+    /// #329, the qcat spawn corridor in miniature: a CEILING 14u above the floor. A vertical ray
+    /// crosses both, and the old facing-blind `nearest_floor` returned whichever was closest to the
+    /// reference z — so a character floating at ceiling height was anchored to the CEILING and A*
+    /// planned its whole route through solid rock. A floor is an UP-FACING surface; a ceiling is
+    /// never a floor, no matter how near it is.
+    #[test]
+    fn nearest_floor_never_returns_a_ceiling() {
+        let assets = ZoneAssets {
+            terrain: vec![slab(-69.97, 0.0, 64.0, 0.0, 64.0, true),    // real floor
+                          slab(-55.97, 0.0, 64.0, 0.0, 64.0, false)],  // ceiling, 14u above it
+            objects: vec![], textures: vec![],
+        };
+        let col = Collision::build(&assets, 8.0);
+        assert!(col.floor_normals_ok(), "a cleanly wound mesh must pass the winding check");
+        // Both surfaces are in the column...
+        let all = col.column_surfaces(20.0, 40.0, -56.0, 20.0, 100.0);
+        assert_eq!(all.len(), 2, "the ray crosses both the ceiling and the floor");
+        assert!(all[0].1 < 0.0 && all[1].1 > 0.0, "top = down-facing ceiling, bottom = up-facing floor");
+        // ...but only the floor is a FLOOR. Reference z sits 0.03u under the ceiling and 14u above
+        // the floor, so a nearest-surface rule would pick the ceiling.
+        let f = col.nearest_floor(20.0, 40.0, -56.0, 20.0, 100.0).expect("a floor exists below");
+        assert!((f - (-69.97)).abs() < 0.1, "expected the real floor -69.97, got {f}");
+        assert_eq!(col.column_floors(20.0, 40.0, -56.0, 20.0, 100.0).len(), 1, "the ceiling is not a floor");
+    }
+
+    /// The floor-normal filter is only sound if the zone's winding is consistent, so it is validated
+    /// at build. A zone that FAILS validation must fall back to the old facing-blind behaviour
+    /// (keeping every real floor) rather than filtering all its floors away and becoming
+    /// unnavigable — but that fallback is a KNOWN-DEGRADED mode (a ceiling can be picked as a floor
+    /// again, i.e. #329 is back for that zone), so it must be *reportable*: `floor_normals_ok()` is
+    /// what `/v1/observe/debug` surfaces as `nav_degraded`. A silent revert to a bug we just fixed is
+    /// the client lying to the agent by omission.
+    #[test]
+    fn a_miswound_zone_falls_back_visibly_instead_of_deleting_its_floors() {
+        // Every face inverted (down-facing) — a mesh whose winding convention is backwards.
+        let assets = ZoneAssets {
+            terrain: vec![slab(0.0, 0.0, 96.0, 0.0, 96.0, false)],
+            objects: vec![], textures: vec![],
+        };
+        let col = Collision::build(&assets, 8.0);
+        assert!(!col.floor_normals_ok(), "an inverted mesh must FAIL the winding check");
+        // ...and having failed it, the filter is off: the surface is still found (fail-old), not
+        // filtered away (fail-empty), so the zone stays navigable.
+        assert!(col.nearest_floor(20.0, 40.0, 1.0, 20.0, 100.0).is_some(),
+            "a mis-wound zone must keep its floors (degraded, not broken)");
+        assert!(col.find_path([8.0, 8.0, 0.0], [56.0, 56.0, 0.0], 1.0, &[], false).is_some(),
+            "and must still route — the degradation is reported, not fatal");
+
+        // A correctly wound zone reports healthy (so `nav_degraded` is null in every shipped zone).
+        let ok = Collision::build(&ZoneAssets {
+            terrain: vec![slab(0.0, 0.0, 96.0, 0.0, 96.0, true)], objects: vec![], textures: vec![],
+        }, 8.0);
+        assert!(ok.floor_normals_ok());
+    }
+
+    /// #229: a `zone_cross` aims at a DRNTP region's interior point, whose z is a point in a VOLUME
+    /// — on the shipped zones 1.5u to 127u ABOVE the real floor, and never a floor height. Such a
+    /// goal must be projected DOWN onto the floor beneath it; snapping it to the "nearest surface
+    /// within ±20" found nothing to grab (or a phantom), and the goal tier was then unreachable.
+    #[test]
+    fn goal_high_in_a_volume_projects_onto_the_floor_beneath_it() {
+        let assets = ZoneAssets { terrain: vec![slab(0.0, 0.0, 64.0, 0.0, 64.0, true)], objects: vec![], textures: vec![] };
+        let col = Collision::build(&assets, 8.0);
+        // 47u up — the gfaydark→butcher region z. The old ±STEP_UP(20) window can't even see the floor.
+        assert_eq!(col.nearest_floor(32.0, 32.0, 47.28, 20.0, 20.0), None,
+            "the old ±20 snap window has no surface to grab at a volume point");
+        let f = col.floor_beneath(32.0, 32.0, 47.28, 2.0, 400.0).expect("the floor is beneath it");
+        assert!(f.abs() < 0.01, "the goal must project onto the floor at 0, got {f}");
+        // And a route to that airborne goal now completes (A* accepts arrival on the real floor).
+        assert!(col.find_path([8.0, 8.0, 0.0], [56.0, 56.0, 47.28], 1.0, &[], false).is_some(),
+            "a goal 47u above the floor must still route to the floor under it");
+    }
+
+    /// #329 / #197p2: a character FLOATING in water is supported by the WATER SURFACE, not by a
+    /// slab. Anchoring it to the nearest surface sent A* along the pool BOTTOM (halas: 128u down),
+    /// so the walker dived to the planned floor and stranded. The route must stay at the surface.
+    #[test]
+    fn floating_swimmer_is_anchored_to_the_water_surface_not_the_pool_bottom() {
+        let assets = ZoneAssets {
+            terrain: vec![slab(-100.0, 0.0, 64.0, 0.0, 48.0, true),  // deep pool bottom
+                          slab(0.0, 0.0, 64.0, 48.0, 96.0, true)],   // dry bank, at the waterline
+            objects: vec![], textures: vec![],
+        };
+        let mut col = Collision::build(&assets, 8.0);
+        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::flat_below(0.0))));
+
+        // Floating 2u under the surface, 98u above the only solid floor.
+        let start = [8.0, 32.0, -2.0];
+        let goal  = [72.0, 32.0, 0.0]; // the bank
+        let path = col.find_path(start, goal, 1.0, &[], false).expect("a swimmer must reach the bank");
+        let deepest = path.iter().fold(f32::MAX, |m, w| m.min(w[2]));
+        assert!(deepest > -10.0,
+            "the route must cross AT THE SURFACE, not dive to the -100 pool bottom (deepest wp z = {deepest})");
+        let last = path.last().unwrap();
+        assert!((last[0] - goal[0]).abs() < 8.0 && (last[1] - goal[1]).abs() < 8.0, "and it must reach the bank");
+    }
+
+    /// A character WADING (feet on the bottom, water shallow) is still anchored to the ground — the
+    /// water-surface anchor is only for a character with no footing under it.
+    #[test]
+    fn wading_character_is_still_anchored_to_the_ground() {
+        let assets = ZoneAssets { terrain: vec![slab(0.0, 0.0, 64.0, 0.0, 64.0, true)], objects: vec![], textures: vec![] };
+        let mut col = Collision::build(&assets, 8.0);
+        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::flat_below(3.0))));
+        // Standing on the floor in 3u of water: there IS footing, so no surface anchor.
+        let path = col.find_path([8.0, 32.0, 0.0], [56.0, 32.0, 0.0], 1.0, &[], false)
+            .expect("a wader must still route across the shallows");
+        assert!(path.iter().all(|w| w[2] < 1.0), "waypoints stay on the ground, not up on the waterline");
+    }
+
+    /// #229's last mile: A* expands each node from its CELL CENTRE, but the walker drives from where
+    /// the character actually STANDS. Anchoring the start at the cell centre let A* emit a route
+    /// whose every cell-centre segment was clear while the character→waypoint[0] leg ran straight
+    /// through a wall — the walker pressed into it, made no progress, re-planned the identical route
+    /// and stalled out. (Live everfrost→blackburrow: exactly 1 of 99 segments blocked, the first.)
+    /// EVERY segment of a returned route, INCLUDING the first one from the character's real
+    /// position, must be clearance-clear.
+    #[test]
+    fn route_first_leg_is_walkable_from_the_characters_real_position() {
+        // A wall running north–south at east=44 (north 0..52), with the way around it to the north.
+        let wall = MeshData {
+            positions: vec![[0.0, 0.0, 44.0], [52.0, 0.0, 44.0], [52.0, 12.0, 44.0], [0.0, 12.0, 44.0]],
+            normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
+            texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let assets = ZoneAssets {
+            terrain: vec![slab(0.0, 0.0, 96.0, 0.0, 96.0, true), wall],
+            objects: vec![], textures: vec![],
+        };
+        let col = Collision::build(&assets, 8.0);
+
+        // The character stands just WEST of the wall, off-centre in its nav cell; the goal is EAST of
+        // the wall and south, so any route must first go north around the wall's end.
+        let start = [40.0, 50.0, 0.0];
+        let goal  = [60.0, 10.0, 0.0];
+        let path = col.find_path(start, goal, 1.0, &[], false).expect("a route around the wall exists");
+
+        let mut prev = start;
+        for (i, w) in path.iter().enumerate() {
+            assert!(col.path_clear([prev[0], prev[1], prev[2] + 3.0], [w[0], w[1], w[2] + 3.0], 1.0),
+                "segment {i} ({prev:?} -> {w:?}) crosses the wall — the walker cannot follow it");
+            prev = *w;
+        }
+    }
+
+    /// #257/#302: the search must honour the CALLER's deadline instead of re-arming a fresh budget
+    /// per call. `plan_path` makes up to 14 A* calls per plan; a per-call budget let one plan stall
+    /// the network thread for ~14 × 150 ms ≈ 2.1 s and get the client dropped as linkdead.
+    #[test]
+    fn find_path_honours_a_caller_supplied_deadline() {
+        // A long open corridor — the goal is far enough that A* needs well over the 128-expansion
+        // batch between deadline checks, so an expired deadline must actually cut the search short.
+        let assets = ZoneAssets { terrain: vec![slab(0.0, 0.0, 64.0, 0.0, 1600.0, true)], objects: vec![], textures: vec![] };
+        let col = Collision::build(&assets, 32.0);
+        let (start, goal) = ([8.0, 32.0, 0.0], [1560.0, 32.0, 0.0]);
+
+        let fresh = col.find_path_res(start, goal, 1.0, &[], false, 8.0, None, 0.0, PlanCtx::budget());
+        assert!(fresh.is_some(), "with a fresh budget the route is found");
+
+        let expired = PlanCtx {
+            deadline: Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+            goal_region: None,
+        };
+        let t0 = std::time::Instant::now();
+        let out = col.find_path_res(start, goal, 1.0, &[], false, 8.0, None, 0.0, expired);
+        assert!(out.is_none(), "an already-expired deadline must abort the search, not re-arm a new budget");
+        assert!(t0.elapsed() < std::time::Duration::from_millis(100),
+            "and it must abort promptly ({:?})", t0.elapsed());
+    }
+
+    /// #229: `find_zone_line_near` must hand back a point a character can STAND on — the region's
+    /// own z is an interior point of the trigger volume, and walking to it was never possible.
+    /// The projected point must still be inside the region, so the auto-cross still fires there.
+    #[test]
+    fn zone_line_target_is_projected_onto_the_floor_and_stays_inside_the_region() {
+        let assets = ZoneAssets { terrain: vec![slab(0.0, 0.0, 64.0, 0.0, 64.0, true)], objects: vec![], textures: vec![] };
+        let mut col = Collision::build(&assets, 8.0);
+        // A zone-line region filling everything below z=50 — its representative point is up in the
+        // volume, tens of units above the floor at 0 (exactly the shipped-asset shape).
+        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::zone_line_below(50.0, 7))));
+
+        let (idx, p) = col.find_zone_line_near(Some(7), [8.0, 8.0, 0.0]).expect("the zone line is found");
+        assert_eq!(idx, 7);
+        assert!(p[2].abs() < 0.01, "the target must sit on the floor (z=0), not up in the volume: got {}", p[2]);
+        assert_eq!(col.zone_line_at([p[0], p[1], p[2] + 1.0]), Some(7),
+            "standing on the projected point must still be INSIDE the region, or the cross never fires");
+    }
+
     /// When a zone carries a dedicated `__collision__` mesh, `Collision::build` must collide
     /// against THAT geometry (which includes invisible-but-solid walls) and ignore the rendered
     /// terrain. When absent, it must fall back to the rendered terrain (back-compat). This is
@@ -2082,8 +2602,8 @@ mod tests {
             .map(|w| ((w[0] - npc[0][0]).powi(2) + (w[1] - npc[0][1]).powi(2)).sqrt())
             .fold(f32::MAX, f32::min);
 
-        let narrow = col.find_path_res(start, goal, 1.0, &npc, false, 8.0, None, 0.0).expect("route exists");
-        let wide   = col.find_path_res(start, goal, 1.0, &npc, false, 8.0, None, 60.0).expect("wider route still exists");
+        let narrow = col.find_path_res(start, goal, 1.0, &npc, false, 8.0, None, 0.0, PlanCtx::default()).expect("route exists");
+        let wide   = col.find_path_res(start, goal, 1.0, &npc, false, 8.0, None, 60.0, PlanCtx::default()).expect("wider route still exists");
 
         assert!(min_to_npc(&wide) > min_to_npc(&narrow) + 8.0,
             "a bigger aggro_buffer should widen the berth (wide {} vs narrow {})",
@@ -2309,7 +2829,7 @@ mod tests {
 
         // Radius-bound the search (as the real fallback does) so neither the goal nor the
         // walk-around is reachable — forcing a genuine PARTIAL route toward the goal.
-        let path = col.find_path_res(start, goal, 1.0, &[], true, 8.0, Some(50.0), 0.0)
+        let path = col.find_path_res(start, goal, 1.0, &[], true, 8.0, Some(50.0), 0.0, PlanCtx::default())
             .expect("a partial route toward the goal should still make progress");
         let last = *path.last().unwrap();
         let last_wet = col.in_water(last);
