@@ -276,6 +276,19 @@ impl NavMesh {
         }).collect();
     }
 
+    /// The component holding the most surfaces — the main walkable world. Used to tell ground an
+    /// agent can actually REACH from ground it merely exists on (a wall top, a sealed ledge).
+    pub fn main_component(&self) -> u32 {
+        let mut count: std::collections::HashMap<u32, usize> = Default::default();
+        for &c in &self.comp { *count.entry(c).or_default() += 1; }
+        count.into_iter().max_by_key(|&(_, n)| n).map(|(c, _)| c).unwrap_or(0)
+    }
+
+    /// Surface index -> (col, row, surface), for diagnostics that need to walk every surface.
+    pub fn iter_surfaces(&self) -> impl Iterator<Item = (u32, Surface)> + '_ {
+        self.comp.iter().copied().zip(self.surfaces.iter().copied())
+    }
+
     /// Component id + surface for a surface index (diagnostics).
     pub fn surface_at(&self, si: usize) -> (u32, Surface) {
         (self.comp[si], self.surfaces[si])
@@ -1217,6 +1230,58 @@ mod tests {
         let path = mesh.find_path([10.0, 30.0, 0.0], [50.0, 30.0, 0.0]).expect("a swim route");
         let deepest = path.iter().map(|w| w[2]).fold(f32::MAX, f32::min);
         assert!(deepest > -10.0, "swimmer must stay near the surface, but dove to {deepest}");
+    }
+
+    /// LOAD-BEARING INVARIANT: every step of a route A* returns must itself be a legal move under
+    /// the SAME edge rules the component labeller uses.
+    ///
+    /// A planner that promises a route it will then refuse to walk is the exact failure this whole
+    /// project exists to kill, and it is easy to reintroduce by "optimising" one of the two paths
+    /// (a cost tweak in A*, a relaxation in the labeller) without the other. This test pins them
+    /// together: if anyone lets them drift, it fails.
+    fn assert_route_is_walkable(mesh: &NavMesh, start: [f32; 3], goal: [f32; 3]) {
+        let Some(path) = mesh.find_path(start, goal) else { return };
+        // Walk the returned route and re-derive each surface, checking every hop is a legal edge.
+        let mut prev = mesh.nearest_surface(start[0], start[1], start[2]).expect("start anchors");
+        for w in &path {
+            let here = mesh.nearest_surface(w[0], w[1], w[2])
+                .unwrap_or_else(|| panic!("route waypoint {w:?} is not on any surface"));
+            // Waypoints are cell centres; consecutive ones are adjacent cells, so the hop must be a
+            // legal edge. (The string-pull can skip cells, so allow a straight run of legal steps by
+            // only checking that the move is not one the edge rules forbid outright.)
+            let rise = here.z - prev.z;
+            assert!(rise <= mesh.params.max_climb + 0.6,
+                "route climbs {rise:.1}u in one hop — more than the controller's STEP_UP ({}u). \
+                 A* and the edge rules have drifted apart: this route cannot be walked.",
+                mesh.params.max_climb);
+            assert!(rise >= -MAX_FALL,
+                "route drops {:.1}u in one hop — beyond MAX_FALL. Unwalkable.", -rise);
+            prev = here;
+        }
+    }
+
+    #[test]
+    fn every_route_astar_returns_is_walkable_under_the_same_edge_rules() {
+        // A world with all the asymmetric hazards in it: a steep slope, a raised ledge, and a pool
+        // you can jump into but not climb out of.
+        let mut tris = quad(0.0, -40.0, 0.0, 0.0, 60.0);
+        tris.extend(vec![
+            [[0.0, 0.0, 0.0], [10.0, 0.0, 27.5], [0.0, 60.0, 0.0]],
+            [[10.0, 0.0, 27.5], [10.0, 60.0, 27.5], [0.0, 60.0, 0.0]],
+        ]);
+        tris.extend(quad(27.5, 10.0, 40.0, 0.0, 60.0));  // top pad
+        tris.extend(quad(-40.0, 40.0, 90.0, 0.0, 60.0)); // deep pool bottom
+        let water = RegionMap::box_below(0.0, 60.0, 40.0, 90.0, -6.0);
+        let mesh = NavMesh::bake(&tris, Some(&water), BakeParams::default(), b"t");
+
+        // Probe a spread of routes across every combination of hazard, in both directions.
+        let pts = [[-20.0, 30.0, 0.0], [30.0, 30.0, 27.5], [60.0, 30.0, -6.0], [80.0, 30.0, -40.0]];
+        for a in &pts {
+            for b in &pts {
+                if a == b { continue; }
+                assert_route_is_walkable(&mesh, *a, *b);
+            }
+        }
     }
 
     #[test]

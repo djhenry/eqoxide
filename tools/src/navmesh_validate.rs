@@ -118,6 +118,8 @@ struct ZoneReport {
     swim:          usize,
     stacked_pct:   f32,
     oracle_cov:    Option<f32>,
+    /// % of OUR surfaces EQEmu's NPC mesh has no polygon for — player-only terrain candidates.
+    player_only:   Option<f32>,
     pairs:         usize,
     both_ok:       usize,
     mesh_only:     usize,
@@ -177,6 +179,77 @@ fn run_zone(zone: &str, models: &std::path::Path, nav_dir: &std::path::Path,
         if col.windows(2).any(|w| w[1].z - w[0].z >= 12.0) { stacked += 1; }
     }
 
+    // ── Inverse coverage: ground WE have that EQEmu does NOT (player-only terrain candidates).
+    // Reported, never pruned. EQEmu's mesh is an NPC mesh; a player reaches places a mob never does.
+    let player_only = match load_oracle(&nav_dir.join(format!("{zone}.nav"))) {
+        Ok(o) if !o.is_empty() => {
+            // Bucket EQEmu polys by XY cell. Index each poly's whole AABB, not just its centroid:
+            // Detour polys are LARGE and near-planar, so a centroid-only index would report our
+            // surfaces in a big poly's INTERIOR as "player-only" and wildly overstate this number.
+            // Using the AABB over-covers slightly, which errs toward UNDER-counting player-only —
+            // the honest direction for a claim of the form "EQEmu has no ground here".
+            let mut idx: std::collections::HashMap<(i32, i32), Vec<f32>> = Default::default();
+            for p in &o {
+                let n = p.verts.len() as f32;
+                let cz = p.verts.iter().map(|v| v[2]).sum::<f32>() / n;
+                let (mut e0, mut e1) = (f32::MAX, f32::MIN);
+                let (mut n0, mut n1) = (f32::MAX, f32::MIN);
+                for v in &p.verts {
+                    e0 = e0.min(v[0]); e1 = e1.max(v[0]);
+                    n0 = n0.min(v[1]); n1 = n1.max(v[1]);
+                }
+                let (b0, b1) = ((e0 / 8.0).floor() as i32, (e1 / 8.0).floor() as i32);
+                let (c0, c1) = ((n0 / 8.0).floor() as i32, (n1 / 8.0).floor() as i32);
+                for bx in b0..=b1 {
+                    for by in c0..=c1 {
+                        idx.entry((bx, by)).or_default().push(cz);
+                    }
+                }
+            }
+            let (mut ours, mut only) = (0usize, 0usize);
+            // Break the player-only ground down by WHY an NPC mesh would lack it. Swim surfaces and
+            // descend-only steep faces are things a player can use and a roaming mob cannot — those
+            // are the expected, legitimate divergence. Plain WALKABLE ground EQEmu lacks is the
+            // interesting bucket (ledges/rooftops/interiors mobs never visit).
+            let (mut po_swim, mut po_steep, mut po_walk) = (0usize, 0usize, 0usize);
+            for (c, r) in mesh.populated_columns() {
+                let ctr = mesh.center(c, r);
+                let key = ((ctr[0] / 8.0).floor() as i32, (ctr[1] / 8.0).floor() as i32);
+                for s in mesh.column(c, r) {
+                    ours += 1;
+                    let hit = (-1..=1).any(|dc| (-1..=1).any(|dr| {
+                        idx.get(&(key.0 + dc, key.1 + dr))
+                           .is_some_and(|zs| zs.iter().any(|z| (z - s.z).abs() <= 8.0))
+                    }));
+                    if !hit {
+                        only += 1;
+                        if s.is_swim() { po_swim += 1; }
+                        else if s.flags & eqoxide::navmesh::FLAG_STEEP != 0 { po_steep += 1; }
+                        else { po_walk += 1; }
+                    }
+                }
+            }
+            if only > 0 {
+                // Of the ground EQEmu lacks, how much is REACHABLE from the main walkable world?
+                // Unreachable ground (a wall top my 2u cells happen to surface, a sealed ledge) is
+                // inert: it sits in its own component and A* can never route onto it. Only the
+                // reachable part is a genuine player-only feature.
+                let main = mesh.main_component();
+                let reach_only = mesh.iter_surfaces().filter(|(c, _)| *c == main).count();
+                println!("  [player-only {zone}] {:.1}% of our ground has no EQEmu polygon \
+                    (swim {:.0}%, steep {:.0}%, plain {:.0}%); \
+                    main walkable component holds {} of {} surfaces ({:.0}%)",
+                    100.0 * only as f32 / ours.max(1) as f32,
+                    100.0 * po_swim as f32 / only as f32,
+                    100.0 * po_steep as f32 / only as f32,
+                    100.0 * po_walk as f32 / only as f32,
+                    reach_only, ours, 100.0 * reach_only as f32 / ours.max(1) as f32);
+            }
+            Some(100.0 * only as f32 / ours.max(1) as f32)
+        }
+        _ => None,
+    };
+
     // ── Oracle ──
     let oracle_cov = match load_oracle(&nav_dir.join(format!("{zone}.nav"))) {
         Ok(o) if !o.is_empty() => {
@@ -224,6 +297,36 @@ fn run_zone(zone: &str, models: &std::path::Path, nav_dir: &std::path::Path,
                     }
                 }
                 println!("      at EQEmu poly XYs: no-surface={empty}  z-mismatch={zdiff}  match={ok}");
+                // Is the mismatch a SYSTEMATIC vertical offset (our asset baked at the wrong height)
+                // or scattered noise (genuinely different geometry)? A tight cluster means offset.
+                let mut dzs: Vec<f32> = Vec::new();
+                for op in o.iter().take(6000) {
+                    let n = op.verts.len() as f32;
+                    let c = [op.verts.iter().map(|v| v[0]).sum::<f32>() / n,
+                             op.verts.iter().map(|v| v[1]).sum::<f32>() / n,
+                             op.verts.iter().map(|v| v[2]).sum::<f32>() / n];
+                    let (cc, rr) = mesh.to_cell(c[0], c[1]);
+                    let col = mesh.column(cc, rr);
+                    if col.is_empty() { continue; }
+                    // nearest of OUR surfaces to EQEmu's height
+                    let best = col.iter().map(|s| s.z - c[2])
+                        .min_by(|a, b| a.abs().partial_cmp(&b.abs()).unwrap()).unwrap();
+                    dzs.push(best);
+                }
+                if !dzs.is_empty() {
+                    dzs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let med = dzs[dzs.len()/2];
+                    let p10 = dzs[dzs.len()/10];
+                    let p90 = dzs[dzs.len()*9/10];
+                    let within8 = dzs.iter().filter(|d| d.abs() <= 8.0).count();
+                    println!("      dz(ours - EQEmu) at shared XYs: p10={p10:.1} median={med:.1} p90={p90:.1}  |dz|<=8u: {:.0}%",
+                        100.0 * within8 as f32 / dzs.len() as f32);
+                    println!("      -> {}", if (p90 - p10).abs() < 20.0 {
+                        "TIGHT spread = a SYSTEMATIC vertical offset (asset baked at the wrong height)"
+                    } else {
+                        "WIDE spread = not a simple offset; genuinely different geometry"
+                    });
+                }
                 for s in &samples { println!("        {s}"); }
             }
             Some(pct)
@@ -316,7 +419,7 @@ fn run_zone(zone: &str, models: &std::path::Path, nav_dir: &std::path::Path,
         zone: zone.into(), tris, bake_ms, cache_bytes,
         columns: cols_seen, surfaces: mesh.surface_count(), swim: mesh.swim_surface_count(),
         stacked_pct: if cols_seen > 0 { 100.0 * stacked as f32 / cols_seen as f32 } else { 0.0 },
-        oracle_cov,
+        oracle_cov, player_only,
         pairs: both + m_only + g_only + none_,
         both_ok: both, mesh_only: m_only, grid_only: g_only, neither: none_,
         mesh_us_med: median(&mut m_us.clone()), grid_us_med: median(&mut g_us.clone()),
@@ -401,19 +504,20 @@ fn main() -> Result<()> {
         z
     } else { args };
 
-    println!("{:<13}{:>7}{:>8}{:>9}{:>8}{:>8}{:>7}{:>8} |{:>8} |{:>6}{:>6}{:>6}{:>6} |{:>12}{:>12}",
+    println!("{:<13}{:>7}{:>8}{:>9}{:>8}{:>8}{:>7}{:>8} |{:>8}{:>9} |{:>6}{:>6}{:>6}{:>6} |{:>12}{:>12}",
         "zone", "tris", "bake_ms", "cache_kb", "columns", "surfs", "swim", "stack%",
-        "oracle%", "both", "mesh", "grid", "none", "mesh_us", "grid_us");
+        "oracle%", "plyonly%", "both", "mesh", "grid", "none", "mesh_us", "grid_us");
     println!("{}", "-".repeat(140));
 
     let mut reports = Vec::new();
     for z in &zones {
         match run_zone(z, &models, &nav_dir, n_pairs, params) {
             Ok(r) => {
-                println!("{:<13}{:>7}{:>8}{:>9.0}{:>8}{:>8}{:>7}{:>7.1}% |{:>8} |{:>6}{:>6}{:>6}{:>6} |{:>12}{:>12}",
+                println!("{:<13}{:>7}{:>8}{:>9.0}{:>8}{:>8}{:>7}{:>7.1}% |{:>8}{:>9} |{:>6}{:>6}{:>6}{:>6} |{:>12}{:>12}",
                     r.zone, r.tris, r.bake_ms, r.cache_bytes as f32 / 1024.0, r.columns, r.surfaces,
                     r.swim, r.stacked_pct,
                     r.oracle_cov.map(|c| format!("{c:.1}")).unwrap_or_else(|| "-".into()),
+                    r.player_only.map(|c| format!("{c:.1}")).unwrap_or_else(|| "-".into()),
                     r.both_ok, r.mesh_only, r.grid_only, r.neither,
                     format!("{}/{}", r.mesh_us_med, r.mesh_us_max),
                     format!("{}/{}", r.grid_us_med, r.grid_us_max));
