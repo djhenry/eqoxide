@@ -1029,6 +1029,13 @@ impl App {
             // The new zone's floor may sit above the zone-point spawn z; settle onto it once
             // collision loads (see the reground block in the vertical-physics section below).
             self.needs_reground = true;
+            // Door ids are per-zone u8s that collide across zones (e.g. door_id=3 in zone A and
+            // door_id=3 in zone B are unrelated doors). Without this clear, `door_frac`'s
+            // entry-or-insert-with-current-state seeding (render_frame, below) never fires for a
+            // colliding id, so the new zone's door inherits the PREVIOUS zone's easing fraction —
+            // a door left open in zone A would render open on arrival in zone B and visibly swing
+            // shut (or vice versa).
+            self.door_frac.clear();
         }
 
         // Zone-transition fade (#286): drive `fade` toward black while a zone (re)load is committing
