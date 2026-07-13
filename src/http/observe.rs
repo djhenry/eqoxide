@@ -114,6 +114,30 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             "last_packet_age_ms": health.last_packet_age_ms,
             "snapshot_age_ms":    health.snapshot_age_ms,
             "nav_state":   nav_state,
+            // Spellcasting (#348). `casting` is non-null ONLY while our own cast bar is running;
+            // `last_cast` is how the previous cast ended (cast_completed / cast_interrupted /
+            // cast_fizzled / cast_failed, plus cast_ended_unexplained — the client's INFERENCE when
+            // the server ended the cast without ever saying why) and survives it. Before this,
+            // casting was tracked internally and published NOWHERE — an agent could not tell a spell
+            // that landed from one that fizzled, was interrupted, or never started. The same
+            // transitions are pushed onto /v1/events/combat as they happen.
+            //
+            // `elapsed_ms` / `ago_secs` are measured HERE, at read time — the projection above
+            // carries the raw `Instant`s and never measures them. Same rule as `health()`: an age is
+            // only true at the moment it is read (#343).
+            "casting":     player.casting.as_ref().map(|c| serde_json::json!({
+                "spell_id":   c.spell_id,
+                "spell_name": c.spell_name,
+                "cast_ms":    c.cast_ms,
+                "elapsed_ms": c.started.elapsed().as_millis() as u64,
+            })),
+            "last_cast":   player.last_cast.as_ref().map(|o| serde_json::json!({
+                "spell_id":   o.spell_id,
+                "spell_name": o.spell_name,
+                "outcome":    o.outcome,
+                "text":       o.text,
+                "ago_secs":   o.at.elapsed().as_secs(),
+            })),
         },
         // Nav health for THIS zone. `null` when nav is running normally; an object naming the
         // degraded mode when it is not (see `nav_degraded` above). An agent must be able to tell

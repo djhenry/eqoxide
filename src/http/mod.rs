@@ -568,6 +568,15 @@ pub struct PlayerState {
     /// book is read. Surfaced via GET /v1/observe/item_text so an agent can read a quest note (#288).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub book_text:          Option<String>,
+    /// Spellcasting (#348). `casting` is Some ONLY while the player's own cast bar is running (the
+    /// server accepted the cast and sent OP_BeginCast for our spawn); `last_cast` is how the most
+    /// recent cast ENDED and persists afterwards, so an agent that polls rather than long-polls
+    /// `/v1/events/combat` can still tell *casting* / *landed* / *fizzled* / *interrupted* /
+    /// *never started* apart. Both were previously tracked internally and published nowhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub casting:            Option<CastingView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_cast:          Option<LastCastView>,
 }
 
 impl PlayerState {
@@ -629,6 +638,28 @@ impl PlayerState {
             target_attitude: gs.target_id.and(gs.target_attitude.clone()),
             target_level:    gs.target_id.and_then(|id| gs.entities.get(&id)).map(|e| e.level),
             book_text:       gs.last_book_text.clone(),
+            // Spellcasting (#348). The live cast bar and how the last cast ended, straight from the
+            // server's own packets (OP_BeginCast / OP_InterruptCast / OP_MemorizeSpell scribing=3 /
+            // the spell-failure eqstr messages) — see packet_handler.rs. Publishing these is what
+            // makes casting observable at all.
+            //
+            // The `Instant`s are carried through UNMEASURED on purpose: `elapsed_ms` / `ago_secs`
+            // are computed in the HTTP handler at read time (see `observe::get_debug`). Measuring an
+            // age at projection time would be the #343 bug in miniature — an age is only true at the
+            // moment it is read.
+            casting:         gs.casting.as_ref().map(|c| CastingView {
+                                 spell_id:   c.spell_id,
+                                 spell_name: crate::spells::name_of(c.spell_id),
+                                 cast_ms:    c.cast_ms,
+                                 started:    c.started,
+                             }),
+            last_cast:       gs.last_cast.as_ref().map(|o| LastCastView {
+                                 spell_id:   o.spell_id,
+                                 spell_name: crate::spells::name_of(o.spell_id),
+                                 outcome:    o.kind.to_string(),
+                                 text:       o.text.clone(),
+                                 at:         o.at,
+                             }),
         }
     }
 }
@@ -648,6 +679,51 @@ pub struct Health {
     /// False when NO datagram — not even a session-layer ACK — has arrived for [`CONN_STALE_SECS`].
     /// That is a dead link, as distinct from a quiet world.
     pub connected:          bool,
+}
+
+/// A cast in flight, for `/v1/observe/debug` → `casting` (#348).
+///
+/// NOTE the missing `elapsed_ms`: it is derived at **HTTP read time** from `started`, never stored.
+/// An age baked in when the value is *projected* is only true at that instant; every moment after,
+/// it is wrong, and nothing in the payload says so. That is #343 in miniature — and it is why the
+/// whole player view is now derived on read rather than published by a loop that sleeps. A duration
+/// must be measured when it is read, or it is just another lie with a timestamp on it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CastingView {
+    pub spell_id:   u32,
+    pub spell_name: String,
+    /// Total cast time the server announced in OP_BeginCast.
+    pub cast_ms:    u32,
+    /// When the cast started. Not serialized — `elapsed_ms` is computed from it on read.
+    #[serde(skip)]
+    pub started:    std::time::Instant,
+}
+
+/// How the player's most recent cast ended, for `/v1/observe/debug` → `last_cast` (#348).
+/// `ago_secs` is likewise derived at read time from `at` — see [`CastingView`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LastCastView {
+    /// 0 when the server never named the spell (an honest unknown, not a guess).
+    pub spell_id:   u32,
+    pub spell_name: String,
+    /// `cast_completed` | `cast_interrupted` | `cast_fizzled` | `cast_failed` |
+    /// `cast_ended_unexplained` — the same value the matching `/v1/events/combat` event carries as
+    /// its `kind`.
+    ///
+    /// The first four are verdicts the SERVER gave us. `cast_ended_unexplained` is the client's own
+    /// INFERENCE: the server sent its cast-end signal (OP_ManaChange keepcasting=0) and never said
+    /// why — the usual cause being `Mob::SpellFinished` returning false. An agent must be able to
+    /// branch on "the server said it failed" vs "we don't know why it ended", so these are
+    /// deliberately not the same kind.
+    pub outcome:    String,
+    /// The line shown to the agent. For a server verdict this is the SERVER's own string ("Your
+    /// spell fizzles!", "Insufficient Mana to cast this spell!"). For `cast_ended_unexplained` it
+    /// is written in the CLIENT's voice and says plainly that the server reported nothing — never
+    /// server-sounding prose we invented, which an agent could not tell from a real server line.
+    pub text:       String,
+    /// When the outcome landed. Not serialized — `ago_secs` is computed from it on read.
+    #[serde(skip)]
+    pub at:         std::time::Instant,
 }
 
 /// Turn an entity key like "Guard_Phaeton000" into a display name "Guard Phaeton".
