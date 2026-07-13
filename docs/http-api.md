@@ -33,7 +33,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 
 | Route | Description |
 |-------|-------------|
-| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, target `target_id`/`target_name`/`target_hp_pct`) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms` — see [Connection health](#connection-health)) + camera state. |
+| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, target `target_id`/`target_name`/`target_hp_pct`) + **navigation** (`nav_state`, `nav_reason` — see [Navigation state](#navigation-state)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms` — see [Connection health](#connection-health)) + camera state. |
 | `GET /v1/observe/frame` | Current rendered frame as a PNG (`Content-Type: image/png`). |
 | `GET /v1/observe/entities` | `{ "<name>": [x,y,z], ... }` for all known entities. |
 | `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency}`. Slots are Titanium **wire** ids (DB general slots 23-30 → wire 22-29). |
@@ -189,6 +189,51 @@ shape.
   for a `zone` event) to know when movement / a zone-in completed.
 - **Coordinates**: server convention is `x=east, y=north, z=up`. Brewall map coords negate x/y.
 - See `docs/autonomous-play.md` for end-to-end play recipes.
+
+---
+
+## Navigation state
+
+`GET /v1/observe/debug` carries **`nav_state`** (what navigation is doing) and **`nav_reason`** (the
+machine-readable *why*, `null` unless a state has one). Together they are how you find out whether a
+`/v1/move/*` you fired actually worked — the 200 only means *queued*.
+
+| `nav_state` | Meaning | `nav_reason` |
+|-------------|---------|--------------|
+| `idle` | Nothing to do. | — |
+| `planning` | A route is being computed on the pathfinding worker thread. The character stands still. Normally < 1 s. | — |
+| `navigating` | Walking a **complete route to your goal**. | `goal_z_snapped` (see below) or — |
+| `navigating_partial` | Walking a **partial** route: the search was cut short, so this is *not* a route to your goal — it's progress toward a frontier, and it will re-plan from the far end. Usually resolves to `navigating` or `arrived`. | `search_deadline` / `search_node_cap` |
+| `following` | A `/follow` chase has caught up; holding near the leader, still latched. | — |
+| `arrived` | Reached the goal. | `goal_z_snapped` (see below) or — |
+| `no_path` | **DEFINITIVE: no route exists.** The planner searched to completion. Do not retry the same goal — pick another. | see below |
+| `search_exhausted` | The planner **gave up**. This is **"I don't know", not "no"** — a route may well exist. Try a nearer waypoint. | `search_deadline` / `search_node_cap` |
+| `blocked` | A route exists, but the walker **physically could not follow it** (wedged on geometry after 8 recovery attempts). A steering/collision failure, *not* a routing one. | `walker_stalled`, `fall_would_be_lethal` |
+
+**`goal_z_snapped` — the client CHANGED your goal.** The `z` you gave sits below every floor in the
+goal's column (agents commonly pass `z: 0`, or a map coordinate), so the planner snapped the goal onto
+the real floor at that XY and routed there. You are being walked somewhere you did not literally ask
+for, so you are told — on `navigating` **and on `arrived`**, plus a line in the message log. If the z
+matters to you, re-issue with the real floor height. (A goal with **no** floor anywhere in its column
+is not snapped: it fails as `no_path` / `goal_not_walkable`.)
+
+`nav_reason` for `no_path`:
+
+| Reason | Meaning |
+|--------|---------|
+| `goal_not_walkable` | The goal has no walkable floor under or near it — it's inside geometry, off the mesh, or floating in the air. **Fix your goal's coordinates.** Reported immediately, without searching. |
+| `search_closed` | The planner explored every cell reachable from the character and the goal was not among them. Genuinely walled off. |
+| `start_isolated` | The *character* is boxed in (inside a tree trunk / on a slope face), and re-anchoring to nearby floor didn't help. |
+| `no_geometry` | No collision mesh loaded yet (still zoning). |
+| `planner_dead` | The pathfinding worker thread has **died**. No route can be planned for the rest of the session — a **client fault**, not an unreachable goal. Movement must be driven manually, or the client restarted. This is reported loudly and terminally rather than leaving `nav_state` stuck at `planning` forever. |
+
+> **The distinction between `no_path` and `search_exhausted` is load-bearing, and it is new (#337).**
+> They used to be the same thing — worse, an unreachable goal didn't report *either*. The planner
+> handed the walker a greedy partial route, the walker drove it into a wall, retried 8 times, and
+> froze at `blocked` forever, never once saying "there is no way there". That silent wedge disguised
+> the real nav root cause for months and caused several false diagnoses. **A timeout is never
+> reported as "no route"**, and an unreachable goal is now reported before the character takes a
+> single step.
 
 ---
 

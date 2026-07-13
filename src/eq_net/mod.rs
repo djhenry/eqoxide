@@ -3,6 +3,7 @@
 pub mod gameplay;
 pub mod item;
 pub mod login;
+pub mod nav_planner;
 pub mod navigation;
 pub mod packet_handler;
 pub mod protocol;

@@ -489,23 +489,49 @@ pub struct Hit {
 /// for collision instead of the rendered terrain.
 pub const COLLISION_MESH_TAG: &str = "__collision__";
 
-/// Wall-clock budget for a WHOLE nav plan (#257, #302). A* runs synchronously on the NETWORK
-/// thread, so a long search blocks the net loop until no position/keepalive packet goes out and the
-/// server drops the client as linkdead. A node cap alone doesn't bound wall-clock (per-node cost
-/// swings widely with geometry density), so the search is capped by TIME.
+/// Wall-clock safety net for a WHOLE nav plan run on the PATHFINDING WORKER THREAD (#340).
 ///
-/// This is the budget for the ENTIRE plan, not per A* call: `plan_path` makes up to 14 calls (full
-/// + partial + a 12-point re-anchor ring), and a per-call deadline let the worst case reach
-/// ~14 × 150 ms ≈ 2.1 s of net-thread stall — squarely in linkdead territory. Callers build ONE
-/// deadline (`PlanCtx::budget()`) and pass it to every call of the plan.
-pub const PLAN_BUDGET_MS: u64 = 150;
+/// History: A* used to run synchronously on the NETWORK thread, so a long search blocked the net
+/// loop until no position/keepalive packet went out and the server dropped the client as linkdead
+/// (#257, #302). The cap was 150 ms — and because it bounded the SEARCH rather than the answer, a
+/// search that hit it gave up and returned a greedy partial route that the walker drove into a
+/// wall (#337). The cap was protecting the net thread at the cost of the planner telling the truth.
+///
+/// The planner now runs on its own thread (`eq_net::nav_planner`), so **nothing real-time is
+/// waiting on it** and the search can run to COMPLETION: it either finds the route or closes the
+/// search space and says, honestly, that no route exists. This remains only as a safety net so a
+/// pathological zone can't pin a core forever — and when it fires the outcome is
+/// `PlanOutcome::Exhausted`, i.e. "I don't know", never "no route".
+///
+/// It is the budget for the ENTIRE plan, not per A* call (`plan_path` makes up to 13): callers
+/// build ONE deadline (`PlanCtx::worker()`) and pass it to every call of the plan.
+pub const WORKER_PLAN_BUDGET_MS: u64 = 5_000;
+
+/// Wall-clock budget for the FINE local tier, which still runs INLINE on the net thread every nav
+/// tick (`navigation.rs`). It is bounded to a 40u radius at 2u cells, so it is cheap in practice and
+/// this cap is a backstop, not a working limit.
+///
+/// **It is 150 ms because that is exactly what this tier had before the planner moved off the net
+/// thread** (it called `PlanCtx::default()`, which re-armed the old 150 ms `PLAN_BUDGET_MS` on every
+/// call). Tightening it is NOT free: an earlier version of this change cut it to 20 ms on the
+/// reasoning that "the net thread deserves a small cap", and gfaydark→butcherblock stopped crossing
+/// — the walker wedged 53 u short of the zone line, because threading that corner needs a fine plan
+/// the 20 ms cap was truncating. Verified by A/B against `main` on the live server. The coarse
+/// planner is what needed to come off this thread; the local tier's budget was never the problem, so
+/// it keeps the value it has always had.
+pub const NET_TIER_BUDGET_MS: u64 = 150;
 
 /// Per-plan context for `find_path_res`: the things that must be shared across the several A* calls
 /// one logical plan makes, rather than re-armed per call.
 #[derive(Clone, Copy, Default)]
 pub struct PlanCtx {
-    /// Hard wall-clock deadline for the search. Shared across every call in one plan so the total
-    /// net-thread stall is bounded by `PLAN_BUDGET_MS` (see above). `None` = arm a fresh budget.
+    /// Hard wall-clock deadline for the search, shared by every call in one plan so a plan's total
+    /// cost is bounded by ONE budget rather than one-per-call (#340).
+    ///
+    /// `None` = **NO time cap**: run the search to completion (bounded only by `MAX_NODES`). That is
+    /// the default because a time cap makes the result unfalsifiable — a `None` answer could mean
+    /// "no route" or "I ran out of clock", and the caller cannot tell (#356/#337). Only a caller
+    /// that is genuinely time-constrained (the net-thread local tier) arms a deadline.
     pub deadline: Option<std::time::Instant>,
     /// Zone-point index of a `DRNTP` zone-line region we are routing to. When set, A* accepts
     /// arrival at ANY cell whose (XY, floor) lies inside that region — not just the one goal cell
@@ -515,18 +541,138 @@ pub struct PlanCtx {
 }
 
 impl PlanCtx {
-    /// A context carrying a fresh whole-plan deadline (`PLAN_BUDGET_MS` from now).
-    pub fn budget() -> Self {
+    /// A context with a fresh whole-plan deadline `ms` from now, shared across the plan's A* calls.
+    pub fn budget_ms(ms: u64) -> Self {
         PlanCtx {
-            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(PLAN_BUDGET_MS)),
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(ms)),
             ..Default::default()
         }
     }
+    /// The pathfinding worker's context: a generous whole-plan safety net (see
+    /// [`WORKER_PLAN_BUDGET_MS`]). Nothing real-time waits on this thread.
+    pub fn worker() -> Self { Self::budget_ms(WORKER_PLAN_BUDGET_MS) }
+    /// The fine local tier's context: a hard, small cap, because this one still runs on the net
+    /// thread (see [`NET_TIER_BUDGET_MS`]).
+    pub fn net_tier() -> Self { Self::budget_ms(NET_TIER_BUDGET_MS) }
     pub fn with_goal_region(mut self, idx: Option<i32>) -> Self {
         self.goal_region = idx;
         self
     }
 }
+
+/// Why a search stopped WITHOUT closing its frontier. Both mean "I don't know", never "no".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanLimit {
+    /// The wall-clock deadline in `PlanCtx` elapsed.
+    Deadline,
+    /// The node cap (`MAX_NODES`) was hit.
+    NodeCap,
+}
+
+impl PlanLimit {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PlanLimit::Deadline => "search_deadline",
+            PlanLimit::NodeCap  => "search_node_cap",
+        }
+    }
+}
+
+/// Why no route exists. Every variant is a DEFINITIVE, falsifiable "no" — the search either never
+/// had a valid question to answer, or it closed its whole reachable frontier without finding the
+/// goal. A timeout is NEVER one of these (that's [`PlanLimit`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoRoute {
+    /// No collision geometry loaded (still zoning) — nothing can be planned at all.
+    NoGeometry,
+    /// The GOAL has no walkable floor under or near it: it is inside solid rock, off the mesh, or
+    /// floating in the air far above any ground. No amount of searching can accept arrival there,
+    /// so we fail immediately and loudly instead of flooding the grid and returning a greedy
+    /// partial that the walker drives into a wall (#337).
+    GoalNotWalkable,
+    /// The START's reachable component is a handful of cells — the character is boxed in (standing
+    /// inside a tree trunk / on a slope face). The caller (`plan_path`) retries from a re-anchored
+    /// start before believing this.
+    StartIsolated,
+    /// The search CLOSED its entire reachable frontier and the goal was not in it. This is the real
+    /// "you cannot walk there from here".
+    SearchClosed,
+}
+
+impl NoRoute {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NoRoute::NoGeometry      => "no_geometry",
+            NoRoute::GoalNotWalkable => "goal_not_walkable",
+            NoRoute::StartIsolated   => "start_isolated",
+            NoRoute::SearchClosed    => "search_closed",
+        }
+    }
+}
+
+/// The HONEST outcome of a path plan (#337, #356).
+///
+/// The old planner returned `Option<Vec<Waypoint>>`, which conflated three completely different
+/// answers into one `None`/partial: "here is your route", "there is no route", and "I gave up".
+/// The walker could not tell them apart, so it silently walked a timed-out partial route into a
+/// wall, retried 8×, and froze at `nav_state: blocked` — a lie that disguised the real nav root
+/// cause for months. These three variants are the whole point of the change.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlanOutcome {
+    /// A COMPLETE route that reaches the goal. The only variant the walker may treat as a plan.
+    Route(Vec<[f32; 3]>),
+    /// DEFINITIVE: no route exists. An honest, falsifiable "no" the agent can act on.
+    Unreachable(NoRoute),
+    /// The search was cut short (`limit`) before closing its frontier: "I DON'T KNOW", not "no".
+    /// `progress` is a partial route toward the reachable frontier, present ONLY when it makes
+    /// GENUINE goal-ward progress (see `PARTIAL_MIN_UNITS`) — walk it and re-plan from the far end.
+    Exhausted { limit: PlanLimit, progress: Option<Vec<[f32; 3]>> },
+}
+
+impl PlanOutcome {
+    /// The COMPLETE route, if this outcome is one. A partial route is deliberately NOT returned
+    /// here: treating it as a plan is exactly the #337 lie.
+    pub fn route(&self) -> Option<&Vec<[f32; 3]>> {
+        match self { PlanOutcome::Route(p) => Some(p), _ => None }
+    }
+    /// A machine-readable reason, surfaced to agents via `nav_reason` on GET /v1/observe/debug.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            PlanOutcome::Route(_) => "route",
+            PlanOutcome::Unreachable(r) => r.as_str(),
+            PlanOutcome::Exhausted { limit, .. } => limit.as_str(),
+        }
+    }
+}
+
+/// The raw result of ONE A* run, before it is turned into an honest [`PlanOutcome`].
+#[derive(Debug, Default)]
+struct Search {
+    /// `(route, reached_goal)`. `reached_goal == false` = a PARTIAL route toward the frontier.
+    path:     Option<(Vec<[f32; 3]>, bool)>,
+    /// `Some` = the search was CUT SHORT and its frontier is NOT closed, so "the goal was not
+    /// reached" means *I don't know*. `None` = the frontier closed (or the question was invalid) —
+    /// only then may a missing route be reported as "no route exists".
+    limit:    Option<PlanLimit>,
+    /// Set when we can name WHY there is no route (invalid goal / boxed-in start). `None` with
+    /// `limit: None` and no path = the frontier simply closed without the goal in it.
+    no_route: Option<NoRoute>,
+    /// Straight-line ground (units) toward the goal that a partial route actually closes.
+    progress: f32,
+    /// Nodes whose expansion completed — how big the explored component is.
+    closed_n: usize,
+}
+
+impl Search {
+    fn no_route(r: NoRoute) -> Self { Search { no_route: Some(r), ..Default::default() } }
+}
+
+/// The minimum straight-line ground (units) a PARTIAL route must close toward the goal before the
+/// walker is allowed to walk it. The old bar was ONE nav cell (8u) — so a search that inched a
+/// single cell toward an unreachable goal produced a "route" the walker drove into a wall and then
+/// wedged on (#337). A partial exists to let a long journey be walked in stages, not to let a
+/// wedged character shuffle; 48u = 6 nav cells is a stage, 8u is a shuffle.
+pub const PARTIAL_MIN_UNITS: f32 = 48.0;
 
 pub struct Collision {
     tris:      Vec<[[f32; 3]; 3]>,
@@ -1214,55 +1360,170 @@ impl Collision {
         self.find_path_res(start, goal, radius, avoid, allow_partial, 8.0, None, 0.0, PlanCtx::default())
     }
 
-    /// A* at an arbitrary grid resolution `cell`, optionally bounded to `max_search` units of the
-    /// start (so a FINE plan stays local + cheap even if it hits an obstacle). `cell` = 8.0 +
-    /// `max_search` = None reproduces the classic whole-zone nav grid.
-    pub fn find_path_res(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]],
-        allow_partial: bool, cell: f32, max_search: Option<f32>, aggro_buffer: f32, ctx: PlanCtx) -> Option<Vec<[f32; 3]>> {
-        self.find_path_ex(start, goal, radius, avoid, allow_partial, cell, max_search, aggro_buffer, ctx)
-            .map(|(path, _)| path)
+    /// The goal's floor when the caller's `z` could NOT be resolved to a tier — i.e. it sits below
+    /// every floor in the goal's column (an agent passing a rough `z`, usually 0, or a map coord).
+    /// Returns the nearest floor anywhere in that column: the goal the caller meant.
+    ///
+    /// `Some(z)` here means **the client is about to change the caller's goal**. That is an
+    /// accommodation, and an accommodation presented as compliance is a lie — so it is reported, not
+    /// quietly performed: the planner surfaces it as `nav_reason: goal_z_snapped` and says so in the
+    /// message log, rather than letting an agent that asked for `z: 0` be told `arrived` at `z: 47`
+    /// without ever learning its goal was moved.
+    ///
+    /// `None` = there is no floor anywhere in the column: the goal is off the mesh, and that is a
+    /// genuine `GoalNotWalkable` (fail loudly, don't search).
+    pub fn snap_goal_to_column_floor(&self, goal: [f32; 3]) -> Option<f32> {
+        const COLUMN: f32 = 1000.0; // the whole column: "is there ANY floor at this XY?"
+        self.nearest_floor(goal[0], goal[1], goal[2], COLUMN, COLUMN)
     }
 
-    /// As `find_path_res`, but also reports whether the route actually REACHED the goal (`true`) or
-    /// is only a partial route toward it (`false`).
+    /// Did resolving `goal` require SNAPPING its z to a different floor? `Some(floor_z)` = yes, and
+    /// the caller's goal is being changed — see [`Collision::snap_goal_to_column_floor`]. Used by the
+    /// planner to tell the agent, so the snap is never silent.
+    pub fn goal_z_was_snapped(&self, goal: [f32; 3]) -> Option<f32> {
+        const GOAL_TIER_TOL: f32 = 8.0;
+        const GOAL_DROP: f32 = 400.0;
+        let resolved = self.nearest_floor(goal[0], goal[1], goal[2], GOAL_TIER_TOL, GOAL_TIER_TOL)
+            .or_else(|| self.floor_beneath(goal[0], goal[1], goal[2], GOAL_TIER_TOL, GOAL_DROP));
+        // A tier the caller named was honoured → nothing was changed → nothing to report.
+        if resolved.is_some() { return None; }
+        self.snap_goal_to_column_floor(goal)
+    }
+
+    /// BEST-EFFORT route at an arbitrary grid resolution `cell`, optionally bounded to `max_search`
+    /// units of the start (so a FINE plan stays local + cheap even if it hits an obstacle).
+    /// `cell` = 8.0 + `max_search` = None reproduces the classic whole-zone nav grid.
     ///
-    /// `allow_partial` is consulted only AFTER the search loop — the A* run itself is identical
-    /// either way. So a caller that wants "a full route, or else the best partial" must not run the
-    /// search twice (which is what `plan_path` used to do: two back-to-back identical floods of the
-    /// grid, each arming its own 150 ms budget). One call with `allow_partial = true` and this flag
-    /// gives the same answer for half the net-thread time.
+    /// This returns "the best waypoints I have" — a complete route, or (with `allow_partial`) a
+    /// partial one toward the frontier — and CANNOT say why it has none. It is for LOCAL STEERING
+    /// (the fine 2u tier, whose partials are a 40u steering hint the walker re-plans every tick),
+    /// never for answering an agent's "can I get there?". For that, use [`Collision::find_path_ex`],
+    /// which distinguishes "no route" from "I gave up" (#337/#356).
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_path_res(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]],
+        allow_partial: bool, cell: f32, max_search: Option<f32>, aggro_buffer: f32, ctx: PlanCtx) -> Option<Vec<[f32; 3]>> {
+        let s = self.search(start, goal, radius, avoid, cell, max_search, aggro_buffer, ctx);
+        match s.path {
+            Some((p, true)) => Some(p),
+            Some((p, false)) if allow_partial => Some(p),
+            _ => None,
+        }
+    }
+
+    /// The HONEST plan (#337, #356): run A* and report which of the three genuinely-different
+    /// answers came back — a complete `Route`, a definitive `Unreachable`, or an `Exhausted` search
+    /// that hit a limit and therefore does not know.
+    ///
+    /// There is no `allow_partial` flag: a partial route is not an answer to "route me to the goal",
+    /// it is a consolation prize, so it can only ever ride along inside `Exhausted` — and only when
+    /// it makes real progress (`PARTIAL_MIN_UNITS`). A search that CLOSES its frontier without
+    /// reaching the goal now returns `Unreachable` and NO waypoints at all: walking a partial in
+    /// that case is exactly the silent wedge of #337.
     #[allow(clippy::too_many_arguments)]
     pub fn find_path_ex(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]],
-        allow_partial: bool, cell: f32, max_search: Option<f32>, aggro_buffer: f32, ctx: PlanCtx) -> Option<(Vec<[f32; 3]>, bool)> {
-        // Anchor A* at the character's true position (so its first leg is one the walker can
-        // actually take). But if the character's EXACT spot is BOXED IN — standing inside a tree
-        // trunk's or a wall's footprint, where the rays out of it are blocked or lead into a sealed
-        // pocket — that anchor strands the search in a handful of nodes. That is precisely the
-        // isolated start the cell-centre anchor + start-cell hop exist to rescue (#2/#205), so fall
-        // back to them.
-        //
-        // The retry is gated on the failed search having explored almost NOTHING, so it fires only
-        // for a boxed-in start (a few nodes, microseconds) and never doubles the cost of a genuine
-        // long search that failed on its merits — which would put two full budgets on the net thread.
-        const BOXED_IN_NODES: usize = 64;
-        let (res, explored) = self.astar(start, goal, radius, avoid, allow_partial, cell, max_search, aggro_buffer, ctx, true);
-        if res.is_none() && explored < BOXED_IN_NODES {
-            return self.astar(start, goal, radius, avoid, allow_partial, cell, max_search, aggro_buffer, ctx, false).0;
+        cell: f32, max_search: Option<f32>, aggro_buffer: f32, ctx: PlanCtx) -> PlanOutcome {
+        let s = self.search(start, goal, radius, avoid, cell, max_search, aggro_buffer, ctx);
+        match s.path {
+            Some((p, true)) => PlanOutcome::Route(p),
+            other => match s.limit {
+                // Cut short → "I don't know". Hand back the partial ONLY if it makes genuine
+                // goal-ward progress, so the walker can advance a stage and re-plan from there.
+                Some(limit) => {
+                    let progress = other
+                        .filter(|_| s.progress >= PARTIAL_MIN_UNITS)
+                        .map(|(p, _)| p);
+                    PlanOutcome::Exhausted { limit, progress }
+                }
+                // Frontier CLOSED → a definitive no. No partial: see the doc comment.
+                None => PlanOutcome::Unreachable(s.no_route.unwrap_or(NoRoute::SearchClosed)),
+            },
         }
-        res
+    }
+
+    /// One logical A* run: the char-anchored search, with the cell-centre-anchored retry for a
+    /// boxed-in start folded in.
+    ///
+    /// Anchor A* at the character's true position (so its first leg is one the walker can actually
+    /// take). But if the character's EXACT spot is BOXED IN — standing inside a tree trunk's or a
+    /// wall's footprint, where the rays out of it are blocked or lead into a sealed pocket — that
+    /// anchor strands the search in a handful of nodes. That is precisely the isolated start the
+    /// cell-centre anchor + start-cell hop exist to rescue (#2/#205), so fall back to them.
+    ///
+    /// The retry is gated on the failed search having explored almost NOTHING, so it fires only for
+    /// a boxed-in start (a few nodes, microseconds) and never doubles the cost of a genuine long
+    /// search that failed on its merits.
+    #[allow(clippy::too_many_arguments)]
+    fn search(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]],
+        cell: f32, max_search: Option<f32>, aggro_buffer: f32, ctx: PlanCtx) -> Search {
+        const BOXED_IN_NODES: usize = 64;
+        // Is this search's verdict really "the goal is unreachable", or is it "I couldn't get OUT of
+        // where the character is standing"? The two look identical from the outside — both close the
+        // frontier without reaching the goal — and telling them apart is the whole job here.
+        //
+        // The tell is the SIZE of the component the search closed. A search that explored a handful
+        // of cells did not survey the zone and rule the goal out; it never left the doorstep. The
+        // character is boxed in (stood inside a tree trunk, wedged on a slope face) and the fix is to
+        // re-anchor the START (#205) — not to tell the agent "there is no route", which would be a
+        // FALSE definitive no, the single worst thing this planner can say.
+        //
+        // Note this deliberately ignores any PARTIAL route the search dribbled out. Live gfaydark:
+        // the char wedged on terrain, A* closed after 1 node, the cell-centre retry crawled 5 nodes
+        // and produced a 2-cell partial — and an earlier version of this function took the existence
+        // of that stub as proof the search had really surveyed the zone, and reported `search_closed`
+        // on a goal that was perfectly reachable from 16u away. A 2-cell stub is not a survey. Only a
+        // COMPLETE route (`reached`) proves the search got anywhere.
+        let boxed_in = |s: &Search| {
+            s.limit.is_none()
+                && s.closed_n < BOXED_IN_NODES
+                && !s.path.as_ref().is_some_and(|(_, reached)| *reached)
+                && s.no_route != Some(NoRoute::GoalNotWalkable)
+                && s.no_route != Some(NoRoute::NoGeometry)
+        };
+        let s = self.astar(start, goal, radius, avoid, cell, max_search, aggro_buffer, ctx, true);
+        if !boxed_in(&s) { return s; }
+        // Anchoring at the character's exact position got nowhere. Retry from the cell centre (the
+        // classic #2/#205 rescue) before believing anything.
+        let mut retry = self.astar(start, goal, radius, avoid, cell, max_search, aggro_buffer, ctx, false);
+        // Never LOSE a partial route by retrying. If the char-anchored search produced one and the
+        // cell-centre retry produced nothing, keep the one we had: the fine local tier steers on it,
+        // and dropping it is the same steering-starvation that stopped the halas swimmer — just
+        // reached through the other anchor (#377 review, N1).
+        if retry.path.is_none() && s.path.is_some() {
+            retry = Search { path: s.path, ..retry };
+        }
+        if boxed_in(&retry) {
+            // Both anchors are sealed in: the START is the problem, not the goal. Name it, so
+            // `plan_path` re-anchors (#205) and `find_path_ex` reports `start_isolated` rather than
+            // the false "no route to the goal" this used to collapse into.
+            //
+            // The partial route is deliberately KEPT here. `find_path_ex` already drops it on the
+            // `Unreachable` path (an honest "no" carries no waypoints), so wiping it here bought
+            // nothing — but it also starved `find_path_res`, the FINE LOCAL STEERING tier, which
+            // legitimately runs tiny bounded searches whose component is *always* small and which
+            // needs its partial as a steering hint. Live halas: a swimmer floating at the water's
+            // edge has exactly such a search, and with the partial wiped the walker stopped swimming
+            // and wedged at the shoreline while the coarse planner cheerfully re-issued a perfect
+            // 78-waypoint route across the water, every tick, for 8 attempts.
+            return Search { no_route: Some(NoRoute::StartIsolated), ..retry };
+        }
+        retry
     }
 
     /// The A* itself. `prefer_char_anchor` expands the START node from the character's own (x, y)
-    /// rather than its cell centre (see `anchor_at_char`). Also reports how many nodes the search
-    /// actually reached, so the caller can tell a BOXED-IN start (a handful) from a search that
-    /// failed on its merits (thousands) and retry only the former.
+    /// rather than its cell centre (see `anchor_at_char`).
+    ///
+    /// It reports everything the honest-outcome layer needs to tell "no route exists" from "I gave
+    /// up": whether the frontier was CLOSED or the search was cut short by a limit, how many nodes
+    /// it closed (a handful = a boxed-in start), and how much ground a partial route actually
+    /// covers. The old version returned a bare `Option`, which is why a timeout and a genuine
+    /// no-route were indistinguishable for months (#337/#356).
     #[allow(clippy::too_many_arguments)]
     fn astar(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]],
-        allow_partial: bool, cell: f32, max_search: Option<f32>, aggro_buffer: f32, ctx: PlanCtx,
-        prefer_char_anchor: bool) -> (Option<(Vec<[f32; 3]>, bool)>, usize) {
+        cell: f32, max_search: Option<f32>, aggro_buffer: f32, ctx: PlanCtx,
+        prefer_char_anchor: bool) -> Search {
         use std::collections::BinaryHeap;
         use std::cmp::Ordering;
-        if self.cols == 0 || self.rows == 0 { return (None, 0); }
+        if self.cols == 0 || self.rows == 0 { return Search::no_route(NoRoute::NoGeometry); }
         // Navigate on a FINER grid than the collision broad-phase buckets (self.cell_size, ~32u).
         // At 32u, cell centers fall inside walls in tight corridors, so A* sees a fragmented graph,
         // finds no route, and the caller straight-lines into walls. An 8u nav grid keeps cell
@@ -1298,7 +1559,10 @@ impl Collision {
         // Same cell as the goal: a straight walk. Still start the route AT the character (see the
         // `path.insert(0, ...)` note at the end of the search) so pure pursuit steers along it.
         if (sc, sr) == (gc, gr) {
-            return (Some((vec![[start[0], start[1], start[2]], [goal[0], goal[1], goal[2]]], true)), 0);
+            return Search {
+                path: Some((vec![[start[0], start[1], start[2]], [goal[0], goal[1], goal[2]]], true)),
+                ..Default::default()
+            };
         }
         const GOAL_TIER_TOL: f32 = 8.0; // reached floor within this of goal_floor == the right tier
         // The goal's TIER: the walkable surface at the goal XY the caller means. On a zone with
@@ -1329,9 +1593,41 @@ impl Collision {
         // stepping up to the one above. That is the rarer and more conservative error (walk to the
         // ground under the target, not to a tier the caller never named), and callers that report a z
         // that far under their own floor are already lying to us.
-        let goal_floor = self.nearest_floor(goal[0], goal[1], goal[2], GOAL_TIER_TOL, GOAL_TIER_TOL)
-            .or_else(|| self.floor_beneath(goal[0], goal[1], goal[2], GOAL_TIER_TOL, GOAL_DROP))
-            .unwrap_or(goal[2]);
+        let resolved_goal_floor = self.nearest_floor(goal[0], goal[1], goal[2], GOAL_TIER_TOL, GOAL_TIER_TOL)
+            .or_else(|| self.floor_beneath(goal[0], goal[1], goal[2], GOAL_TIER_TOL, GOAL_DROP));
+        // AN UNACCEPTABLE GOAL FAILS IMMEDIATELY AND LOUDLY (#337). If there is no walkable floor at
+        // or beneath the goal, no cell A* can ever reach will satisfy the arrival test — the search
+        // is guaranteed to flood the entire grid and come back with a greedy partial that the walker
+        // drives into a wall. That is not a search problem, it is an invalid question, and answering
+        // it with a 2-second flood and a wedge is the exact dishonesty this issue is about. Say so
+        // now, in microseconds, with a reason the agent can act on.
+        //
+        // EXCEPT for a zone-line goal (`goal_region`): arrival there is decided by "am I standing
+        // INSIDE the region volume?", not by the goal cell's floor tier — a region's representative
+        // point is an interior point of a VOLUME whose z is structurally never a floor height (#229).
+        // Its walkability is not ours to judge here, so let the search answer it.
+        //
+        // A SLOPPY Z IS NOT AN UNREACHABLE GOAL. Agents routinely pass a rough z (often 0, or a map
+        // coordinate), and the goal's real floor can sit well above it — `floor_beneath` only looks
+        // DOWN, so it finds nothing. An earlier version hard-failed those as `goal_not_walkable`,
+        // which is a FALSE definitive no: the XY is perfectly walkable and `main` routed to it fine
+        // (its wrong-tier `goal_fallback` accepted the goal cell at whatever tier it really had).
+        // Live North Qeynos: `goto (-40,250,z=0)` refused to move at all. So before giving up, snap
+        // the goal to the nearest floor ANYWHERE in its column — that is the goal the caller meant.
+        let goal_floor = match resolved_goal_floor
+            .or_else(|| self.snap_goal_to_column_floor(goal))
+        {
+            Some(f) => f,
+            // NO floor anywhere in the goal's column: off the mesh, or out over a void. THAT is an
+            // unacceptable goal, and it fails immediately and loudly — no flooding the grid for
+            // seconds and handing back a stub to wedge on (#337).
+            None if ctx.goal_region.is_none() => {
+                tracing::info!("find_path: goal ({:.0},{:.0},{:.1}) has NO walkable floor anywhere in its column \
+                    — unreachable by construction (not searching)", goal[0], goal[1], goal[2]);
+                return Search::no_route(NoRoute::GoalNotWalkable);
+            }
+            None => goal[2],
+        };
         // Start floor: anchor to the caller's EXACT (x,y), NOT the 8u cell center. Near a wall the
         // cell center can fall on the wall's footprint, whose only surface is the wall-TOP — so the
         // center probe would start the char up on the wall and route the whole path along it, a
@@ -1446,14 +1742,21 @@ impl Collision {
             best.map(|(c, r, _)| (c, r)).unwrap_or((sc, sr))
         };
         const CHEST: f32 = 3.0;
-        const MAX_NODES: usize = 200_000;
-        // Wall-clock budget (#257) — see `PLAN_BUDGET_MS`. Once it elapses we stop and fall through
-        // to the same partial-path fallback used when MAX_NODES is hit, so the walker still makes
-        // forward progress and re-plans from there. The deadline comes from the CALLER (`ctx`) so it
-        // is shared by every A* call in one plan; only a bare call arms its own.
-        let deadline = ctx.deadline
-            .unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_millis(PLAN_BUDGET_MS));
-        let mut timed_out = false;
+        // The node cap is the ONLY bound on a search once the wall-clock budget is gone, so it also
+        // decides whether the definitive verdict `Unreachable(SearchClosed)` can ever be reached. At
+        // 200k it could NOT be, in exactly the zones where it matters most: gfaydark's 8u nav grid is
+        // ~390k cells, so a whole-zone flood hit the cap and downgraded to `Exhausted` ("I don't
+        // know") even when the frontier really was closable. Raised so a large zone can actually be
+        // surveyed to completion and told "no". Nothing real-time waits on this thread; the worker's
+        // 5 s safety net still bounds a pathological search, and it now bounds it HONESTLY (#377
+        // review, N3).
+        const MAX_NODES: usize = 1_000_000;
+        // Wall-clock deadline: ONLY if the caller armed one (`PlanCtx`). `None` = run to completion.
+        // The planner no longer runs on the net thread, so there is nothing real-time to protect and
+        // no reason to make the answer unfalsifiable by cutting the search short (#340/#356). When a
+        // limit DOES fire it is recorded, and the outcome says "Exhausted" — never "no route".
+        let deadline = ctx.deadline;
+        let mut limit: Option<PlanLimit> = None;
         // Aggro-avoidance (#67): softly bias A* AWAY from cells near NPCs so long routes skirt mob
         // camps instead of plowing through them and getting the player killed. Proactive (before
         // aggro) and faction-agnostic — the client has no broad faction data, so it avoids ALL
@@ -1535,13 +1838,12 @@ impl Collision {
                 if goal_fallback.is_none() { goal_fallback = Some(ckey); }
             }
             expanded += 1;
-            if expanded > MAX_NODES { break; }
-            // Time-cap the search so it can never starve the net thread (#257). Check every 128
-            // expansions — Instant::now() is ~20ns so the overhead is negligible, and the
-            // worst-case overrun past the deadline is one 128-node batch (tens of ms), keeping the
-            // total stall an order of magnitude under the linkdead threshold.
-            if expanded & 0x7F == 0 && std::time::Instant::now() >= deadline {
-                timed_out = true;
+            if expanded > MAX_NODES { limit = Some(PlanLimit::NodeCap); break; }
+            // Wall-clock cap, only when the caller armed one. Checked every 128 expansions —
+            // Instant::now() is ~20ns so the overhead is negligible, and the worst-case overrun is
+            // one 128-node batch.
+            if expanded & 0x7F == 0 && deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                limit = Some(PlanLimit::Deadline);
                 break;
             }
             // Track the closest-to-goal cell reached (heuristic = straight-line cells to the goal),
@@ -1811,32 +2113,38 @@ impl Collision {
                 goal[0], goal[1], goal[2], goal_floor,
                 match ctx.goal_region { Some(i) => format!(" (zone-line region {i})"), None => String::new() });
         }
+        // How much straight-line ground toward the goal the best-reached cell actually closes. The
+        // caller uses this to decide whether a partial route is a STAGE of a journey (worth walking,
+        // then re-planning) or a SHUFFLE into a wall (#337) — see `PARTIAL_MIN_UNITS`.
+        let progress = (h(sc, sr) - best_toward_h).max(0.0);
         // Prefer the requested tier; fall back to a wrong-tier goal only if the right tier is
         // unreachable (keeps the old "reach the goal cell at all" behaviour as a floor).
         let (goal_key, reached_goal) = match goal_key.or(goal_fallback) {
             Some(k) => (k, true),
             None => {
-                // Partial-path fallback (#188): the goal cell is unreachable, but if the search got
-                // meaningfully closer (≥1 cell of straight-line progress), walk to the nearest cell
-                // it reached instead of returning "no route". The walker re-paths from there.
+                // Partial route toward the frontier (#188). Built whenever the search made ANY
+                // progress; whether it may be WALKED is the caller's call, and hinges on the one
+                // question that used to be unanswerable: was the frontier closed, or did we just run
+                // out of clock? `find_path_ex` walks it only under `Exhausted` and only past
+                // `PARTIAL_MIN_UNITS`; a CLOSED search now reports `Unreachable` and no waypoints
+                // at all, instead of handing the walker a greedy stub to wedge on (#337).
                 let progressed = best_toward.is_some() && best_toward_h + 1.0 < h(sc, sr);
                 match best_toward {
-                    Some(bk) if allow_partial && progressed => {
-                        tracing::info!("find_path: partial route toward goal (expanded={}, {:.0}->{:.0} cells from goal{})",
+                    Some(bk) if progressed => {
+                        tracing::info!("find_path: partial route toward goal (expanded={}, {:.0}->{:.0} UNITS from goal, {})",
                             expanded, h(sc, sr), best_toward_h,
-                            if timed_out { ", TIMED OUT" } else { "" });
+                            match limit { Some(l) => l.as_str(), None => "frontier CLOSED — goal is UNREACHABLE" });
                         (bk, false)
                     }
                     _ => {
-                        if timed_out {
-                            tracing::warn!("find_path: search timed out ({} nodes) with no usable route \
-                                — start_floor={start_floor} goal_floor={goal_floor} (#257 net-thread time cap)",
-                                expanded);
-                        } else {
-                            tracing::info!("find_path: no route (expanded={}, cap={}, start_floor={}, goal_floor={})",
-                                expanded, MAX_NODES, start_floor, goal_floor);
+                        match limit {
+                            Some(l) => tracing::warn!("find_path: search hit a limit ({}) after {} nodes with no usable \
+                                route — start_floor={start_floor} goal_floor={goal_floor}. This is NOT 'no route': the \
+                                frontier was never closed.", l.as_str(), expanded),
+                            None => tracing::info!("find_path: NO ROUTE — frontier closed after {} nodes \
+                                (start_floor={start_floor}, goal_floor={goal_floor})", expanded),
                         }
-                        return (None, came.len());
+                        return Search { limit, progress, closed_n: closed.len(), ..Default::default() };
                     }
                 }
             }
@@ -1896,7 +2204,9 @@ impl Collision {
             while path.last().is_some_and(|&wp| self.in_water(wp)) {
                 path.pop();
             }
-            if path.is_empty() { return (None, came.len()); }
+            if path.is_empty() {
+                return Search { limit, progress, closed_n: closed.len(), ..Default::default() };
+            }
         }
         // THE ROUTE BEGINS AT THE CHARACTER (#229's last mile, part 2). The walker follows the route
         // with pure pursuit, which steers along the segment (path[i], path[i+1]) — it ASSUMES path[0]
@@ -1912,7 +2222,13 @@ impl Collision {
         // attempts. Prepending the character's own position makes the first pursuit segment
         // character→first-waypoint, so the route's first leg is actually walked.
         path.insert(0, [start[0], start[1], start_floor]);
-        (Some((path, reached_goal)), came.len())
+        Search {
+            path: Some((path, reached_goal)),
+            limit,
+            no_route: None,
+            progress: if reached_goal { 0.0 } else { progress },
+            closed_n: closed.len(),
+        }
     }
 }
 
@@ -2465,9 +2781,10 @@ mod tests {
         }
     }
 
-    /// #257/#302: the search must honour the CALLER's deadline instead of re-arming a fresh budget
-    /// per call. `plan_path` makes up to 14 A* calls per plan; a per-call budget let one plan stall
-    /// the network thread for ~14 × 150 ms ≈ 2.1 s and get the client dropped as linkdead.
+    /// #340: the search must honour the CALLER's deadline instead of re-arming a fresh budget per
+    /// call. `plan_path` makes up to 13 A* calls per plan; a per-call budget let one plan stall for
+    /// ~13 × 150 ms ≈ 2 s — and while it was on the network thread, that got the client dropped as
+    /// linkdead. `PlanCtx::default()` must arm NO budget at all: a bare call runs to completion.
     #[test]
     fn find_path_honours_a_caller_supplied_deadline() {
         // A long open corridor — the goal is far enough that A* needs well over the 128-expansion
@@ -2476,8 +2793,10 @@ mod tests {
         let col = Collision::build(&assets, 32.0);
         let (start, goal) = ([8.0, 32.0, 0.0], [1560.0, 32.0, 0.0]);
 
-        let fresh = col.find_path_res(start, goal, 1.0, &[], false, 8.0, None, 0.0, PlanCtx::budget());
-        assert!(fresh.is_some(), "with a fresh budget the route is found");
+        let fresh = col.find_path_res(start, goal, 1.0, &[], false, 8.0, None, 0.0, PlanCtx::worker());
+        assert!(fresh.is_some(), "with the worker's (generous) budget the route is found");
+        assert!(col.find_path_res(start, goal, 1.0, &[], false, 8.0, None, 0.0, PlanCtx::default()).is_some(),
+            "and with NO budget (the default) it is found too — a bare search runs to completion");
 
         let expired = PlanCtx {
             deadline: Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
@@ -2488,6 +2807,191 @@ mod tests {
         assert!(out.is_none(), "an already-expired deadline must abort the search, not re-arm a new budget");
         assert!(t0.elapsed() < std::time::Duration::from_millis(100),
             "and it must abort promptly ({:?})", t0.elapsed());
+    }
+
+    /// **#337/#356 — the honesty invariant.** A search that RAN OUT OF CLOCK must report
+    /// `Exhausted` ("I don't know"), and a search that CLOSED its frontier without finding the goal
+    /// must report `Unreachable` ("no"). Collapsing those two into one `None`/partial is what made
+    /// the walker drive a timed-out stub into a wall and freeze at `blocked` — for months, with the
+    /// real root cause hidden behind it.
+    ///
+    /// Same geometry, same goal, same code path: only the budget differs. The answers must differ
+    /// too — and the timeout must NEVER be the one that says "no route".
+    #[test]
+    fn a_timeout_is_never_reported_as_no_route() {
+        let assets = ZoneAssets { terrain: vec![slab(0.0, 0.0, 64.0, 0.0, 1600.0, true)], objects: vec![], textures: vec![] };
+        let col = Collision::build(&assets, 32.0);
+        let start = [8.0, 32.0, 0.0];
+
+        // (a) Reachable goal, no clock → a complete Route.
+        let reachable = [1560.0, 32.0, 0.0];
+        assert!(matches!(col.find_path_ex(start, reachable, 1.0, &[], 8.0, None, 0.0, PlanCtx::default()),
+            PlanOutcome::Route(_)), "a reachable goal with no time cap must produce a complete Route");
+
+        // (b) The SAME reachable goal, with the clock already expired → Exhausted, NEVER Unreachable.
+        let expired = PlanCtx { deadline: Some(std::time::Instant::now() - std::time::Duration::from_secs(1)), goal_region: None };
+        match col.find_path_ex(start, reachable, 1.0, &[], 8.0, None, 0.0, expired) {
+            PlanOutcome::Exhausted { limit: PlanLimit::Deadline, .. } => {}
+            other => panic!("a search that ran out of clock must report Exhausted(Deadline) — reporting \
+                             {other:?} for a goal that IS reachable is the #337 lie"),
+        }
+
+        // (c) A goal OFF the mesh entirely, no clock → a definitive Unreachable, and no waypoints.
+        let off_mesh = [1560.0, 3000.0, 0.0]; // far outside the slab: no walkable floor at all
+        let out = col.find_path_ex(start, off_mesh, 1.0, &[], 8.0, None, 0.0, PlanCtx::default());
+        match &out {
+            PlanOutcome::Unreachable(NoRoute::GoalNotWalkable) => {}
+            other => panic!("a goal with no walkable floor must fail IMMEDIATELY as Unreachable(GoalNotWalkable), got {other:?}"),
+        }
+        assert!(out.route().is_none(), "an unreachable goal must hand back NO route");
+    }
+
+    /// **A SLOPPY GOAL Z IS NOT AN UNREACHABLE GOAL.** Agents routinely pass a rough z (0, or a map
+    /// coordinate) for a goal whose real floor sits well above it. Rejecting those as
+    /// `goal_not_walkable` is a FALSE definitive no — the XY is perfectly walkable, and `main`
+    /// routed to it fine. Caught live in North Qeynos: `goto (-40,250,z=0)` refused to move at all.
+    ///
+    /// The honest line is "is there ANY floor at this XY?": a bad z snaps to the real floor; a goal
+    /// off the mesh entirely still fails hard (asserted above).
+    #[test]
+    fn a_goal_with_a_sloppy_z_still_routes_to_its_real_floor() {
+        // Floor at z = 40. The caller asks for z = 0 — 40u BELOW it, far outside any tier tolerance,
+        // and `floor_beneath` only ever looks DOWN, so the old code resolved nothing and hard-failed.
+        let col = Collision::build(
+            &ZoneAssets { terrain: vec![slab(40.0, 0.0, 200.0, 0.0, 200.0, true)], objects: vec![], textures: vec![] },
+            32.0);
+        let out = col.find_path_ex([16.0, 16.0, 40.0], [180.0, 180.0, 0.0], 1.0, &[], 8.0, None, 0.0, PlanCtx::default());
+        let route = match &out {
+            PlanOutcome::Route(p) => p,
+            other => panic!("a walkable XY with a sloppy z must still ROUTE (snapping to its real \
+                             floor), not be dismissed as unreachable — got {other:?}"),
+        };
+        let last = *route.last().unwrap();
+        assert!((last[0] - 180.0).abs() < 8.0 && (last[1] - 180.0).abs() < 8.0,
+            "and the route must reach the goal XY, got {last:?}");
+    }
+
+    /// **A BOXED-IN START MUST NEVER BE REPORTED AS "NO ROUTE TO THE GOAL".**
+    ///
+    /// The two failures look identical from outside — the frontier closes, the goal isn't in it —
+    /// and conflating them produces a *false definitive no*, which is worse than the silent wedge
+    /// this PR set out to kill: the agent is told, with confidence, something untrue.
+    ///
+    /// Caught LIVE, not by a test: in gfaydark the walker wedged on terrain, A* closed after ONE
+    /// node, and the cell-centre retry dribbled out a 2-cell partial — which an earlier version of
+    /// `search()` mistook for evidence that the zone had really been surveyed. It reported
+    /// `no_path: search_closed` for a goal that was perfectly reachable from 16u away.
+    #[test]
+    fn a_boxed_in_start_is_start_isolated_not_no_route() {
+        // A big open plane the goal sits on, plus a tiny sealed box around the START only.
+        let wall = |n0: f32, e0: f32, n1: f32, e1: f32| MeshData {
+            positions: vec![[n0, 0.0, e0], [n1, 0.0, e1], [n1, 40.0, e1], [n0, 40.0, e0]],
+            normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
+            texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        // The pocket is a FEW cells across, not one — which is what makes this bite. The character
+        // can shuffle a couple of cells inside it, so the search dribbles out a small partial route
+        // "toward" the goal. That stub is exactly what fooled the earlier version into believing the
+        // search had surveyed the zone. (A single-cell box produces no partial at all and would let
+        // the bug through.)
+        let (n0, n1, e0, e1) = (88.0f32, 120.0f32, 88.0f32, 120.0f32); // ~4 nav cells across
+        let terrain = vec![
+            slab(0.0, 0.0, 400.0, 0.0, 400.0, true),
+            wall(n0, e0, n0, e1),
+            wall(n1, e0, n1, e1),
+            wall(n0, e0, n1, e0),
+            wall(n0, e1, n1, e1),
+        ];
+        let col = Collision::build(&ZoneAssets { terrain, objects: vec![], textures: vec![] }, 32.0);
+
+        // Start in the pocket's FAR corner, so shuffling across it gains real ground on the goal —
+        // the search will produce a partial. The goal is wide open and obviously walkable: it is the
+        // START that is sealed in.
+        let out = col.find_path_ex([92.0, 92.0, 0.0], [350.0, 350.0, 0.0], 1.0, &[], 8.0, None, 0.0, PlanCtx::default());
+        match &out {
+            PlanOutcome::Unreachable(NoRoute::StartIsolated) => {}
+            PlanOutcome::Unreachable(NoRoute::SearchClosed) => panic!(
+                "a boxed-in START reported as `search_closed` — that is a FALSE definitive 'no route to \
+                 the goal' for a goal that is perfectly reachable. The character is stuck, not the goal."),
+            other => panic!("expected Unreachable(StartIsolated), got {other:?}"),
+        }
+        assert!(out.route().is_none(), "and no stub route out of the sealed cell — the walker must not drive it");
+    }
+
+    /// **The FINE LOCAL STEERING tier must keep its partial route even from a boxed-in start.**
+    ///
+    /// This is the test that was missing for live-bug #2 (the halas swimmer). `find_path_res` is the
+    /// fine 2u tier the walker steers on; its searches are bounded to 40u, so their explored
+    /// component is *always* small and they look "boxed in" by construction — a floating swimmer at
+    /// a shoreline especially so. An earlier `search()` wiped the partial on that path, the swimmer
+    /// lost its steering hint, stopped swimming, and wedged at the water's edge for 8 attempts while
+    /// the coarse planner cheerfully re-issued a perfect 78-waypoint route across the water.
+    ///
+    /// The honest planner API (`find_path_ex`) must still say `start_isolated` and hand back NO
+    /// route — an "Unreachable" carries no waypoints. Both halves are asserted here: they are
+    /// different questions, and this is exactly where they diverge.
+    #[test]
+    fn a_boxed_in_start_still_yields_a_partial_for_local_steering() {
+        let wall = |n0: f32, e0: f32, n1: f32, e1: f32| MeshData {
+            positions: vec![[n0, 0.0, e0], [n1, 0.0, e1], [n1, 40.0, e1], [n0, 40.0, e0]],
+            normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
+            texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let (n0, n1, e0, e1) = (88.0f32, 120.0f32, 88.0f32, 120.0f32);
+        let terrain = vec![
+            slab(0.0, 0.0, 400.0, 0.0, 400.0, true),
+            wall(n0, e0, n0, e1), wall(n1, e0, n1, e1),
+            wall(n0, e0, n1, e0), wall(n0, e1, n1, e1),
+        ];
+        let col = Collision::build(&ZoneAssets { terrain, objects: vec![], textures: vec![] }, 32.0);
+        let (start, goal) = ([92.0, 92.0, 0.0], [350.0, 350.0, 0.0]);
+
+        // The steering tier: it asked for a best-effort route and it must GET one. Starving it here
+        // is what stopped the swimmer.
+        let steer = col.find_path_res(start, goal, 1.0, &[], true, 8.0, None, 0.0, PlanCtx::default());
+        assert!(steer.is_some(),
+            "the FINE LOCAL STEERING tier (allow_partial) must still get a partial route from a boxed-in \
+             start — wiping it is what stopped the halas swimmer dead at the water's edge");
+        assert!(steer.unwrap().len() >= 2, "and it must be something the walker can actually steer along");
+
+        // The honest planner API, on the very same search, must still refuse to call that a route.
+        let out = col.find_path_ex(start, goal, 1.0, &[], 8.0, None, 0.0, PlanCtx::default());
+        assert!(matches!(out, PlanOutcome::Unreachable(NoRoute::StartIsolated)),
+            "the honest API must still report start_isolated, got {out:?}");
+        assert!(out.route().is_none(), "an Unreachable must carry no waypoints");
+    }
+
+    /// A partial route may only be walked when it makes GENUINE progress toward the goal. The old
+    /// bar was one nav cell (8u) — enough for a wedged character to shuffle a single cell into a
+    /// wall and call it a plan (#337). Under a frontier-CLOSED search there is no partial at all.
+    #[test]
+    fn a_closed_search_yields_no_partial_route() {
+        // A slab with a sealed pocket at the far corner: the goal has a perfectly good floor (so it
+        // is NOT dismissed up front), but two walls seal it off — so the search has to close the
+        // whole slab to learn there is no way in.
+        // A vertical wall (n0,e0)->(n1,e1), 30u tall.
+        let wall = |n0: f32, e0: f32, n1: f32, e1: f32| MeshData {
+            positions: vec![[n0, 0.0, e0], [n1, 0.0, e1], [n1, 30.0, e1], [n0, 30.0, e0]],
+            normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
+            texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let terrain = vec![
+            slab(0.0, 0.0, 200.0, 0.0, 200.0, true),
+            wall(160.0, 160.0, 160.0, 200.0), // along east, at north=160
+            wall(160.0, 160.0, 200.0, 160.0), // along north, at east=160
+        ];
+        let col = Collision::build(&ZoneAssets { terrain, objects: vec![], textures: vec![] }, 32.0);
+
+        let out = col.find_path_ex([16.0, 16.0, 0.0], [180.0, 180.0, 0.0], 1.0, &[], 8.0, None, 0.0, PlanCtx::default());
+        assert!(matches!(out, PlanOutcome::Unreachable(_)),
+            "a sealed goal, searched to completion, is UNREACHABLE — got {out:?}");
+        assert!(out.route().is_none(), "and it must hand back no waypoints at all (the #337 lie is a partial here)");
+        // The old code walked this: `find_path(.., allow_partial=true)` would have returned a greedy
+        // stub toward the pocket. It is still available for LOCAL STEERING, which is the only place
+        // a partial belongs — but the honest planner API above refuses to call it a route.
     }
 
     /// #229: `find_zone_line_near` must hand back a point a character can STAND on — the region's

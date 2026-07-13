@@ -294,8 +294,10 @@ async fn post_zone_cross(
     // "queued" read as success while a wedged character went nowhere.
     (StatusCode::OK, format!(
         "zone_cross to zone_id={zone_id} accepted — walking to the zone line (async, not a teleport). \
-         Poll GET /v1/observe/debug: the `zone` field changes on success; `nav_state` becomes `blocked` \
-         if the walker wedges before reaching the line, or `no_path` if no line to that zone exists."))
+         Poll GET /v1/observe/debug: the `zone` field changes on success. Every failure is now reported \
+         honestly in `nav_state` (+`nav_reason`): `no_path` = no route to the line EXISTS (definitive), \
+         `search_exhausted` = the planner gave up ('I don't know', not 'no'), `blocked` = a route exists \
+         but the walker physically wedged. See docs/http-api.md 'Navigation state'."))
 }
 
 #[cfg(test)]

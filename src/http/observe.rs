@@ -46,7 +46,7 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let player = s.player();
     let health = s.health();
     let frame_profile = *s.frame_profile.lock().unwrap();
-    let nav_state = s.nav_state.lock().unwrap().clone();
+    let nav = s.nav_state.lock().unwrap().clone();
     // Is nav running in a KNOWN-DEGRADED mode in this zone? (#229/#329)
     //
     // A floor is an up-facing triangle. Some zones bake real, walkable ground from INVERTED
@@ -119,7 +119,19 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             "link_age_ms":        health.link_age_ms,
             "last_packet_age_ms": health.last_packet_age_ms,
             "snapshot_age_ms":    health.snapshot_age_ms,
-            "nav_state":   nav_state,
+            // Navigation (#166, #337). `nav_state` is the state; `nav_reason` is the machine-readable
+            // WHY behind a terminal one. The pair exists because the old single overloaded `blocked`
+            // could not tell an agent whether the goal was unreachable, whether the planner had
+            // simply given up, or whether the walker was physically wedged — so an unreachable goal
+            // presented as a silent permanent freeze, which disguised the real nav root cause for
+            // months. See docs/http-api.md ("Navigation state") for the full contract.
+            //   no_path          — DEFINITIVE: no route exists (nav_reason: goal_not_walkable |
+            //                      search_closed | start_isolated | no_geometry). Pick another goal.
+            //   search_exhausted — the planner GAVE UP (search_deadline | search_node_cap). This is
+            //                      "I don't know", NOT "no". Try a nearer waypoint.
+            //   blocked          — a route exists but the walker physically cannot follow it.
+            "nav_state":   nav.state,
+            "nav_reason":  nav.reason,
             // Spellcasting (#348). `casting` is non-null ONLY while our own cast bar is running;
             // `last_cast` is how the previous cast ended (cast_completed / cast_interrupted /
             // cast_fizzled / cast_failed, plus cast_ended_unexplained — the client's INFERENCE when
