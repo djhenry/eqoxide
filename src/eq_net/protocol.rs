@@ -150,13 +150,18 @@ pub const PET_BACKOFF: u32 = 28;
 pub const OP_SHOP_REQUEST: u16 = 0x4fed;      // RoF2: OP_ShopRequest; MerchantClick_Struct (open/close)
 pub const OP_SHOP_PLAYER_BUY: u16 = 0x0ddd;  // RoF2: OP_ShopPlayerBuy; Merchant_Sell_Struct (buy from slot)
 pub const OP_SHOP_PLAYER_SELL: u16 = 0x791b;  // RoF2: OP_ShopPlayerSell; Merchant_Purchase_Struct (sell a player inventory slot)
-pub const OP_SHOP_END: u16 = 0x30a8;          // RoF2: OP_ShopEnd; server confirms the merchant window closed
-// Server→client, 0-byte body. EQEmu SendMerchantEnd() (zone/client.cpp) sends this whenever a
-// merchant session ends without a successful transaction: a rejected OP_ShopPlayerBuy (bad
-// merchant/out-of-range/qty, or a stale/removed item slot — zone/client_packet.cpp
-// Handle_OP_ShopPlayerBuy) as well as an ordinary close. It carries no reason text; a buy the
-// server drops entirely for insufficient funds sends NEITHER this NOR an OP_ShopPlayerBuy echo
-// (#345) — that failure is genuinely silent server-side.
+// RoF2: OP_ShopEnd. Primarily client→server (Handle_OP_ShopEnd), which eqoxide never sends — its
+// merchant close is OP_ShopRequest with cmd=0. Inbound it only arrives from the player-trader
+// (bazaar) path: zone/trading.cpp TraderEndTrader() :926 / CancelTraderTradeWindow() :3872. It is
+// NOT the NPC-merchant refusal signal — that's OP_SHOP_END_CONFIRM, below.
+pub const OP_SHOP_END: u16 = 0x30a8;
+// Server→client, 0-byte body. EQEmu SendMerchantEnd() (zone/client.cpp:13276-13286). For this
+// client it is unambiguously a BUY REFUSAL: every call site is a buy-path early return — bad
+// merchant / not-a-merchant / qty<1 / out-of-range (zone/client_packet.cpp:14151), a stale or
+// removed item slot (:14194), or a negative price (:14254) — or Handle_OP_ShopEnd (:14123), which
+// only fires in response to a client-sent OP_ShopEnd that eqoxide never sends. It carries no reason
+// text. A buy the server drops for insufficient funds sends NEITHER this NOR an OP_ShopPlayerBuy
+// echo (#345) — that one failure is genuinely silent server-side.
 pub const OP_SHOP_END_CONFIRM: u16 = 0x3196;  // RoF2: OP_ShopEndConfirm
 
 // Move/equip/unequip an item between inventory slots.
