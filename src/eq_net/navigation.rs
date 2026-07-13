@@ -1743,12 +1743,21 @@ impl Navigator {
         }
 
         // Check target request — set target + auto-consider it (con color comes back as
-        // an OP_CONSIDER reply, handled in packet_handler).
+        // an OP_CONSIDER reply, handled in packet_handler). Also seed target_name/target_hp_pct
+        // here (name/HP.update_hp*/update_hp_pct then keep target_hp_pct live as combat HP updates
+        // arrive — see GameState::update_hp/update_hp_pct). The player is never present in
+        // `entities` (register_spawn special-cases and returns early for the self-spawn), so a
+        // self-target (F1) must resolve name/HP from the player fields directly instead — mirrors
+        // the entity-name idiom used for combat-log lines in packet_handler.rs. (eqoxide#9, #291)
         let target_id = self.target.lock().unwrap().take();
         if let Some(id) = target_id {
             gs.target_id = Some(id);
-            if let Some(e) = gs.entities.get(&id) {
-                gs.target_name = Some(e.name.clone());
+            if id == gs.player_id {
+                gs.target_name   = Some(gs.player_name.clone());
+                gs.target_hp_pct = Some(gs.hp_pct);
+            } else if let Some(e) = gs.entities.get(&id) {
+                gs.target_name   = Some(e.name.clone());
+                gs.target_hp_pct = Some(e.hp_pct);
             }
             stream.send_app_packet(OP_TARGET_MOUSE, &build_target_packet(id));
             stream.send_app_packet(OP_CONSIDER, &build_consider_packet(gs.player_id, id));
