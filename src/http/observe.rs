@@ -50,13 +50,13 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     // Is nav running in a KNOWN-DEGRADED mode in this zone? (#229/#329)
     //
     // A floor is an up-facing triangle. Some zones bake real, walkable ground from INVERTED
-    // (down-facing) art — measured across the 34 cached zones, permafrost and highpass carry the
-    // most — so the floor-normal filter would delete it. Nav's safety valve admits the column's
-    // BOTTOM-MOST surface as ground when the filter leaves the column with no floor at all (nothing
-    // lies beneath ground; a ceiling always has a floor under it). That keeps the zone navigable,
-    // but the answer came from mis-wound art and the surface's true facing is unverified — a
-    // degraded answer, not a wrong one, and the agent must be able to SEE that rather than be
-    // quietly handed it.
+    // (down-facing) art — across the 34 cached zones the heaviest users are feerrott (667 firings),
+    // everfrost (614) and poknowledge (454) — so the floor-normal filter would delete it. Nav's
+    // safety valve admits the column's BOTTOM-MOST surface as ground when the filter leaves the
+    // column with no floor at all (nothing lies beneath ground; a ceiling always has a floor under
+    // it). That keeps the zone navigable, but the answer came from mis-wound art and the surface's
+    // true facing is unverified — a degraded answer, not a wrong one, and the agent must be able to
+    // SEE that rather than be quietly handed it.
     //
     // `null` = the filter has answered every nav query in this zone from properly wound floors.
     // Non-null = the fallback has fired `queries` times since zone load. A `tracing::warn!` is not

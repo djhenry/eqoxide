@@ -924,20 +924,32 @@ impl Collision {
         out.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)); // high→low
 
         // Never delete the ONLY ground in a column: a ceiling is only a ceiling if there is a floor
-        // BENEATH it. highpass bakes its mountain pass from inverted (down-facing) art with nothing
-        // correctly-wound under it, so the filter deleted the pass itself and 65% of the zone's real
-        // ground went invisible to the planner.
+        // BENEATH it. Some zones bake real, standable ground from INVERTED (down-facing) art, which
+        // the facing filter above would otherwise delete outright, leaving the planner with no floor
+        // in a column that plainly has ground in it. Measured over the 34 cached zones, that costs
+        // permafrost 131 columns and neriakc 14 (2,237 recovered answers zone-wide).
         //
         // The predicate must be asked of the FULL COLUMN, not of this query's window. Callers pass
         // `up=20, down=100`, so "nothing survived the filter in `out`" only means "no floor in these
         // 100 units" — a cavern roof, tower interior, or skydome whose floor is further down than
         // that presents an empty window too, and admitting it would hand back a CEILING as ground.
         // That is #329 itself: at qcat (-48, 1058) the column is [391.8 roof, -70.0 floor], and a
-        // window-scoped test answers `Some(391.8)` — the catacombs roof, 462u above the floor.
+        // window-scoped test answers `Some(391.8)` — the catacombs roof, 462u above the floor. Asked
+        // of the window, this "fix" produced 179k+ ceiling-as-floor answers across 31 zones.
         //
-        // So: only the mesh's bottom-most surface in this column qualifies. Ground (even inverted
-        // ground) has nothing under it; a ceiling always does. Anything else stays deleted, and the
-        // caller correctly gets "no floor here".
+        // So: only the mesh's BOTTOM-MOST surface in this column qualifies. Ground (even inverted
+        // ground) has nothing under it; a ceiling always does. This is sound by construction, not by
+        // measurement: the fallback can only fire when `column_bottom` is DOWN-facing (an up-facing
+        // bottom inside the window would have survived the filter and left `out` non-empty), and a
+        // bottom-most surface has nothing beneath it — so it cannot be a ceiling. Anything else stays
+        // deleted and the caller correctly gets "no floor here".
+        //
+        // LIMIT, so the next reader does not over-trust this: the rule only recovers inverted ground
+        // that is the LOWEST surface in its column. Inverted art with correctly-wound ground BENEATH
+        // it is indistinguishable from a ceiling by this test and stays deleted — deliberately, since
+        // admitting it is exactly the #329 bug. highpass is precisely that shape: all ~40k of its
+        // inverted-band faces have real ground under them, so the fallback never fires there and this
+        // rule does NOT recover highpass's ground loss. That needs a different fix (filed separately).
         if filter && out.is_empty() {
             if let Some(bottom) = self.column_bottom(east, north) {
                 // ...and it still has to be inside the window the caller asked about. A floor 300u
@@ -2212,21 +2224,23 @@ mod tests {
         assert_eq!(col.column_floors(20.0, 40.0, -56.0, 20.0, 100.0).len(), 1, "the ceiling is not a floor");
     }
 
-    /// highpass in miniature (#373-adjacent — measured 65% of EQEmu-walkable spots losing their
-    /// floor). A zone-WIDE winding gate that samples the LOWEST surface per column is not a useful
-    /// predictor here: highpass scores 98.4% on that probe (its lowest surfaces are wound fine)
-    /// while the inversion is concentrated further UP the column (the mountain pass itself measured
-    /// only 8.6% up-facing). A column can have plenty of correctly-wound geometry elsewhere in the
-    /// zone yet contain, at the height a character actually needs, ONLY a down-facing (inverted)
-    /// surface with nothing correctly-wound underneath it. The facing filter must never delete the
-    /// ONLY ground in a column — a ceiling is only a ceiling if there is a floor beneath it. (This
-    /// is why the fallback below is scoped PER COLUMN rather than gated by a whole-zone verdict.)
+    /// Inverted GROUND: a column whose lowest (and here only) surface is down-facing, with nothing
+    /// beneath it. Real zones bake standable ground this way — permafrost loses 131 such columns to
+    /// the facing filter and neriakc 14 — and deleting it leaves the planner with no floor in a
+    /// column that plainly has ground in it. It is ground precisely because nothing lies under it; a
+    /// ceiling always has a floor beneath. So the filter must never delete the ONLY ground in a
+    /// column, and the rule is scoped to the COLUMN rather than to a whole-zone winding verdict
+    /// (which votes on the bottom of each column and so cannot see inversion higher up).
+    ///
+    /// NOT the highpass shape, despite the resemblance: highpass's inverted band all has correctly
+    /// wound ground BENEATH it, so it is a ceiling by this rule and stays deleted. This fallback does
+    /// not fire there and does not recover highpass's loss — see the LIMIT note on `column_hits`.
     #[test]
     fn column_whose_only_surface_is_inverted_still_finds_a_floor() {
         let assets = ZoneAssets {
             terrain: vec![
                 slab(0.0, 0.0, 256.0, 0.0, 256.0, true),      // large, correctly-wound floor
-                slab(50.0, 0.0, 8.0, 300.0, 308.0, false),    // isolated inverted "pass" — nothing else here
+                slab(50.0, 0.0, 8.0, 300.0, 308.0, false),    // isolated inverted GROUND — nothing under it
             ],
             objects: vec![], textures: vec![],
         };
@@ -2234,13 +2248,13 @@ mod tests {
 
         // Query off the quad's diagonal split (300,0)-(308,8) so the ray crosses exactly one of its
         // two triangles, not the shared edge.
-        // Facing-blind: the surface is there, and it is down-facing, same as highpass's pass.
+        // Facing-blind: the surface is there, and it is down-facing — mis-wound ground.
         let blind = col.column_surfaces(306.0, 2.0, 50.0, 20.0, 100.0);
         assert_eq!(blind.len(), 1, "exactly one surface lives in this column");
         assert!(blind[0].1 < 0.0, "and it is down-facing — the only ground here is inverted");
 
-        // The filtered query must still find it: this column has nothing else to fall back on, so
-        // deleting the inverted surface leaves NO floor at all — exactly the highpass 65% bug.
+        // The filtered query must still find it: this column has nothing beneath it to make it a
+        // ceiling, so deleting it leaves NO floor at all where there plainly is ground.
         let f = col.nearest_floor(306.0, 2.0, 50.0, 20.0, 100.0);
         assert!(f.is_some(), "the filter must never delete the only ground in a column");
         assert!((f.unwrap() - 50.0).abs() < 0.1, "expected the inverted surface's own height, got {f:?}");
@@ -2293,7 +2307,7 @@ mod tests {
     #[test]
     fn fallback_admits_the_inverted_ground_but_not_the_ceiling_above_it() {
         let assets = ZoneAssets {
-            terrain: vec![slab(-69.97, 0.0, 64.0, 0.0, 64.0, false),   // INVERTED ground (highpass-style)
+            terrain: vec![slab(-69.97, 0.0, 64.0, 0.0, 64.0, false),   // INVERTED ground (nothing beneath it)
                           slab(-55.97, 0.0, 64.0, 0.0, 64.0, false)],  // ceiling, 14u above it
             objects: vec![], textures: vec![],
         };
