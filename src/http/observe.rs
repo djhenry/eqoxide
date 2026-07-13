@@ -35,13 +35,17 @@ pub(super) fn router() -> Router<HttpState> {
 /// POST /v1/interact/read). Returns `{"text": "..."}` once a book has been read this session, or
 /// `{"text": null}` if none has. Newlines are decoded from RoF2's backtick marker. (#288)
 async fn get_item_text(State(s): State<HttpState>) -> Json<serde_json::Value> {
-    let text = s.player_info.lock().unwrap().book_text.clone();
+    let text = s.player().book_text;
     Json(serde_json::json!({ "text": text }))
 }
 
 async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let cam   = s.snapshot.lock().unwrap().clone();
-    let player = s.player_info.lock().unwrap().clone();
+    // Projected from the network thread's GameState, and freshness measured RIGHT NOW — not read
+    // out of a struct some other loop published whenever it last felt like running (#343).
+    let player = s.player();
+    let health = s.health();
+    let frame_profile = *s.frame_profile.lock().unwrap();
     let nav_state = s.nav_state.lock().unwrap().clone();
     // Is nav running in a KNOWN-DEGRADED mode in this zone? (#229/#329)
     //
@@ -95,8 +99,20 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             "target_id":   player.target_id,
             "target_name": player.target_name,
             "target_hp_pct": player.target_hp_pct,
-            "connected":   player.connected,
-            "last_packet_age_ms": player.last_packet_age_ms,
+            // Connection health, all computed at READ time (#8, #343). Three independent failures,
+            // three independent signals — a frozen world can no longer masquerade as a live one,
+            // because nothing has to be RUNNING for these to be right:
+            //   connected          — is the LINK up? (false after CONN_STALE_SECS with no datagram)
+            //   link_age_ms        — since any inbound datagram, session ACKs included.
+            //   last_packet_age_ms — since the last WORLD update. Reaches 40s+ on an idle session
+            //                        with a perfectly healthy link, so do NOT read it as a
+            //                        disconnect — that's what `connected` is for.
+            //   snapshot_age_ms    — since OUR network thread last ticked. If this is large, every
+            //                        other field in this payload is stale and must not be trusted.
+            "connected":          health.connected,
+            "link_age_ms":        health.link_age_ms,
+            "last_packet_age_ms": health.last_packet_age_ms,
+            "snapshot_age_ms":    health.snapshot_age_ms,
             "nav_state":   nav_state,
         },
         // Nav health for THIS zone. `null` when nav is running normally; an object naming the
@@ -104,7 +120,8 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // "no route exists" from "this zone's pathing is known-unreliable".
         "nav_degraded": nav_degraded,
         // Per-phase frame timings (ms, EMA-smoothed); all zero unless --profile / EQ_PROFILE=1.
-        "frame_profile": player.frame_profile,
+        // Render-owned — the one field here the render loop legitimately publishes.
+        "frame_profile": frame_profile,
         "camera": {
             "azimuth_deg":   cam.azimuth.to_degrees(),
             "elevation_deg": cam.elevation.to_degrees(),
@@ -195,7 +212,7 @@ async fn get_entities(State(s): State<HttpState>) -> Json<HashMap<String, [f32; 
 /// slot holds an item before giving/equipping it.
 async fn get_inventory(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let items = s.inventory.lock().unwrap().clone();
-    let coin  = s.player_info.lock().unwrap().coin;
+    let coin  = s.player().coin;
     Json(serde_json::json!({
         "count": items.len(),
         "items": items,
@@ -239,7 +256,7 @@ async fn get_dialogue(State(s): State<HttpState>) -> Json<serde_json::Value> {
 
 /// GET /v1/observe/spells — the 9 memorized gems with names. Empty gem = spell id 0 or 0xFFFFFFFF.
 async fn get_spells(State(s): State<HttpState>) -> Json<serde_json::Value> {
-    let mem = s.player_info.lock().unwrap().mem_spells;
+    let mem = s.player().mem_spells;
     let gems: Vec<_> = mem.iter().enumerate().map(|(i, &id)| {
         if id == 0 || id == 0xFFFF_FFFF {
             serde_json::json!({ "gem": i, "spell_id": null, "name": null })
@@ -255,7 +272,7 @@ async fn get_spells(State(s): State<HttpState>) -> Json<serde_json::Value> {
 /// means untrained. Ids/names are the RoF2 skill enum (`crate::skills`); an agent uses this to
 /// decide what to train at a guildmaster and to notice when a skill is capped.
 async fn get_skills(State(s): State<HttpState>) -> Json<serde_json::Value> {
-    let skills = s.player_info.lock().unwrap().skills.clone();
+    let skills = s.player().skills;
     let list: Vec<_> = (0..crate::skills::NUM_SKILLS).map(|id| {
         let value = skills.get(id).copied().unwrap_or(0);
         serde_json::json!({ "id": id, "name": crate::skills::skill_name(id as u32), "value": value })
@@ -285,7 +302,7 @@ async fn get_zone_entrances(State(s): State<HttpState>) -> Json<Vec<crate::game_
 /// `iterator`). Advertised entrances with no WLD region are omitted. Empty when the zone has no
 /// region map (no `.wtr` / v1 map) or no collision is loaded yet.
 async fn get_zone_exits(State(s): State<HttpState>) -> Json<serde_json::Value> {
-    let player = s.player_info.lock().unwrap().clone();
+    let player = s.player();
     let pos = [player.pos_east, player.pos_north, player.pos_up];
     // index -> destination zone_id, from the advertised entrance list.
     let dest_of: std::collections::HashMap<i32, u16> = s
@@ -309,4 +326,143 @@ async fn get_zone_exits(State(s): State<HttpState>) -> Json<serde_json::Value> {
         }
     }
     Json(serde_json::json!(exits))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::quests::tests::{ago, empty_state, set_gs};
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    async fn debug_json(state: HttpState) -> serde_json::Value {
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::get("/debug").body(Body::empty()).unwrap()).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// #343 regression — THE lie. The connection is dead: no packet has arrived for a minute, and
+    /// consequently NOTHING has re-published anything (this is precisely the state the old code
+    /// could not represent, because `connected` was computed inside `render_frame` and the render
+    /// loop's wake signal is "a packet arrived"). `/debug` must still say `connected: false`, with a
+    /// `last_packet_age_ms` that reflects real elapsed time — derived when the agent ASKS, so no
+    /// publisher has to be alive for the answer to be honest.
+    #[tokio::test]
+    async fn debug_reports_disconnected_when_the_world_froze_and_nothing_republished() {
+        let state = empty_state();
+        // The world as it was when the link was still up — a sitting character, full HP.
+        set_gs(&state, |gs| {
+            gs.player_name = "Gmkblr".into();
+            gs.zone_name   = "qeynos".into();
+            gs.hp_pct      = 100.0;
+            gs.sitting     = true;
+        });
+        // ...and then silence: 60s with NO datagram at all (not even a session ACK — the link is
+        // genuinely gone), and no publish of any kind.
+        {
+            let mut h = state.net_health.lock().unwrap();
+            h.last_datagram = ago(60);
+            h.last_packet   = ago(60);
+            h.last_tick     = ago(60);
+        }
+
+        let v = debug_json(state).await;
+        let p = &v["player"];
+        assert_eq!(p["connected"], serde_json::json!(false),
+            "a session with no server packet for 60s must NOT report connected:true (#343)");
+        assert!(p["last_packet_age_ms"].as_u64().unwrap() >= 60_000,
+            "last_packet_age_ms must track real elapsed time, got {}", p["last_packet_age_ms"]);
+        assert!(p["snapshot_age_ms"].as_u64().unwrap() >= 60_000,
+            "snapshot_age_ms must expose that our own publisher stopped, got {}", p["snapshot_age_ms"]);
+        // The stale world is still served (last known good) — but it is now clearly LABELLED stale.
+        assert_eq!(p["hp_pct"], serde_json::json!(100.0));
+    }
+
+    /// The healthy case must not regress: a packet just landed → connected, ages near zero.
+    #[tokio::test]
+    async fn debug_reports_connected_while_packets_are_flowing() {
+        let state = empty_state();
+        set_gs(&state, |gs| gs.player_name = "Gmkblr".into());
+
+        let v = debug_json(state).await;
+        let p = &v["player"];
+        assert_eq!(p["connected"], serde_json::json!(true));
+        assert!(p["last_packet_age_ms"].as_u64().unwrap() < 1_000);
+        assert!(p["snapshot_age_ms"].as_u64().unwrap() < 1_000);
+    }
+
+    /// `last_packet_age_ms` must ADVANCE between two reads of an otherwise-idle client. This is the
+    /// exact live symptom of #343: with the value computed at publish time it stayed frozen at the
+    /// same number across consecutive polls whenever the render loop slept.
+    #[tokio::test]
+    async fn last_packet_age_advances_between_reads_with_no_publisher_running() {
+        let state = empty_state();
+        state.net_health.lock().unwrap().last_packet = ago(5);
+        let first = debug_json(state.clone()).await["player"]["last_packet_age_ms"].as_u64().unwrap();
+        // Nothing renders, nothing publishes, no packet arrives — just time passing.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let second = debug_json(state).await["player"]["last_packet_age_ms"].as_u64().unwrap();
+        assert!(second > first,
+            "last_packet_age_ms froze at {first} across two reads — it is not being derived at read time (#343)");
+    }
+
+    /// The two clocks are independent signals and must be reported as such: a live client whose
+    /// SERVER went quiet is not the same failure as a client whose own network thread wedged.
+    #[tokio::test]
+    async fn server_silence_and_publisher_stall_are_distinguishable() {
+        let state = empty_state();
+        // The link is dead (no datagrams at all), but our network thread is fine and still ticking.
+        {
+            let mut h = state.net_health.lock().unwrap();
+            h.last_datagram = ago(30);
+            h.last_packet   = ago(30);
+        }
+        let p = debug_json(state).await["player"].clone();
+        assert_eq!(p["connected"], serde_json::json!(false));
+        assert!(p["last_packet_age_ms"].as_u64().unwrap() >= 30_000);
+        assert!(p["snapshot_age_ms"].as_u64().unwrap() < 1_000,
+            "our own publisher is fine — snapshot_age_ms must not blame it for the link's silence");
+    }
+
+    /// The OTHER half of honesty, found by live-testing #343: a character sitting alone in an empty
+    /// zone receives NO application packet for 40+ seconds while the session layer keeps ACKing
+    /// away. That is an IDLE session, not a dead one. Deriving `connected` from application traffic
+    /// would report it as disconnected — swapping #343's false `true` for an equally damaging false
+    /// `false`, and sending an agent into a pointless reconnect loop. `connected` therefore tracks
+    /// the LINK clock, and `last_packet_age_ms` is left free to say "the world is quiet".
+    #[tokio::test]
+    async fn a_quiet_world_on_a_live_link_is_still_connected() {
+        let state = empty_state();
+        {
+            let mut h = state.net_health.lock().unwrap();
+            h.last_packet   = ago(45);                    // the world has nothing to say...
+            h.last_datagram = std::time::Instant::now();  // ...but the link is demonstrably alive.
+        }
+        let p = debug_json(state).await["player"].clone();
+        assert_eq!(p["connected"], serde_json::json!(true),
+            "a quiet world on a live link must NOT be reported as disconnected (#343)");
+        assert!(p["last_packet_age_ms"].as_u64().unwrap() >= 45_000,
+            "...while still honestly reporting that no world update has arrived for 45s");
+        assert!(p["link_age_ms"].as_u64().unwrap() < 1_000);
+    }
+
+    /// The player block is a projection of the NETWORK thread's GameState, with no render loop in
+    /// the path: a state change published by the network thread is visible to the very next read
+    /// even though no frame was ever drawn (#343).
+    #[tokio::test]
+    async fn player_view_tracks_the_network_snapshot_without_any_render() {
+        let state = empty_state();
+        set_gs(&state, |gs| { gs.hp_pct = 100.0; gs.target_id = Some(7); });
+        let v = debug_json(state.clone()).await;
+        assert_eq!(v["player"]["hp_pct"], serde_json::json!(100.0));
+        assert_eq!(v["player"]["target_id"], serde_json::json!(7));
+
+        set_gs(&state, |gs| { gs.hp_pct = 12.0; gs.target_id = None; });
+        let v = debug_json(state).await;
+        assert_eq!(v["player"]["hp_pct"], serde_json::json!(12.0));
+        assert_eq!(v["player"]["target_id"], serde_json::json!(null));
+        assert_eq!(v["player"]["target_name"], serde_json::json!(null));
+    }
 }

@@ -129,14 +129,14 @@ pub async fn run_login_flow(
     guild:            crate::http::GuildShared,
     guild_action:     crate::http::GuildActionReq,
     game_state_snapshot: crate::http::GameStateSnapshot,
-    last_inbound:        crate::http::LastInboundShared,
+    net_health:          crate::http::NetHealthShared,
 ) -> Result<(), String> {
     for attempt in 1..=max_retries {
         if attempt > 1 {
             tracing::warn!("EQ: retry {}/{}", attempt, max_retries);
             sleep(Duration::from_secs(3)).await;
         }
-        match run_login_phase(&config, &last_inbound).await {
+        match run_login_phase(&config, &net_health).await {
             // A server-rejected create can't succeed on retry — surface it and stop now so the
             // user sees the real reason instead of an endless "Login timed out" loop. (#6)
             Err(LoginError::Fatal(e)) => return Err(e),
@@ -159,7 +159,7 @@ pub async fn run_login_flow(
                 }
                 let char_name = config.character_name.clone();
                 let navigator = Navigator::new(goto_target, nav_state, goto_entity, entity_positions, entity_ids, zone_points, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, zone_cross, hail, say, target, who_req, friends_list, friends_req, attack, buy, sell, trade, merchant, move_req, give, inventory, loot, door_click, doors_shared, messages, dialogue, dialogue_click, chat_events, chat_send, cast, mem_spell, sit, consider, pet_cmd, collision, maps_dir, camp.clone(), controller_view, nav_intent, pos_correction, nav_path_view, nav_avoid, read_book.clone(), guild.clone(), guild_action.clone());
-                run_gameplay_phase(stream, net_rx, gs, char_name, navigator, world_creds, shutdown.clone(), camp.clone(), camp_until.clone(), respawn.clone(), game_state_snapshot, last_inbound).await;
+                run_gameplay_phase(stream, net_rx, gs, char_name, navigator, world_creds, shutdown.clone(), camp.clone(), camp_until.clone(), respawn.clone(), game_state_snapshot, net_health).await;
                 return Ok(());
             }
         }
@@ -179,7 +179,7 @@ pub async fn run_login_flow(
 /// and simply still in progress.
 async fn run_login_phase(
     config: &LoginConfig,
-    last_inbound: &crate::http::LastInboundShared,
+    net_health: &crate::http::NetHealthShared,
 ) -> Result<(EqStream, UnboundedReceiver<AppPacket>, GameState, WorldCredentials), LoginError> {
     let (net_tx, mut net_rx) = mpsc::unbounded_channel::<AppPacket>();
 
@@ -202,7 +202,7 @@ async fn run_login_phase(
         while let Ok(packet) = net_rx.try_recv() {
             // Apply gameplay side effects.
             apply_packet(&mut gs, &packet);
-            *last_inbound.lock().unwrap() = std::time::Instant::now();
+            net_health.lock().unwrap().last_packet = std::time::Instant::now();
 
             // Handle login-protocol state transitions.
             match proto.handle(&packet, &mut stream, &gs) {

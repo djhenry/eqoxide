@@ -33,7 +33,7 @@ pub async fn run_gameplay_phase(
     camp_until:    crate::http::CampUntil,
     respawn:       crate::http::RespawnReq,
     game_state_snapshot: crate::http::GameStateSnapshot,
-    last_inbound:        crate::http::LastInboundShared,
+    net_health:          crate::http::NetHealthShared,
 ) {
     // Wrap in Option so Rust allows reassignment after zone transitions.
     let mut stream: Option<EqStream>                      = Some(stream_init);
@@ -50,6 +50,10 @@ pub async fn run_gameplay_phase(
         let rx = net_rx.as_mut().expect("net_rx always Some in loop");
         s.poll_recv();
         s.poll_resend(); // retransmit un-ACKed reliables so a lost packet doesn't linkdead us (#254)
+        // Link liveness (#343): mirror the transport's last-inbound-DATAGRAM time, which counts
+        // session-layer ACKs/keepalives, not just application packets. `connected` is derived from
+        // this — an idle world sends no app packets for 40+s, and that is not a disconnect.
+        net_health.lock().unwrap().last_datagram = s.last_datagram();
 
         // Relaxed: the flag is a self-contained shutdown signal with no happens-before
         // dependency on other data published by the setter (/exit or window-close).
@@ -103,7 +107,7 @@ pub async fn run_gameplay_phase(
         let mut world_reconnect_needed = false;
         while let Ok(packet) = rx.try_recv() {
             apply_packet(&mut gs, &packet);
-            *last_inbound.lock().unwrap() = std::time::Instant::now();
+            net_health.lock().unwrap().last_packet = std::time::Instant::now();
             navigator.sync_entities(&gs);
             navigator.sync_zone_points(&gs);
             navigator.sync_tasks(&gs);
@@ -338,7 +342,7 @@ pub async fn run_gameplay_phase(
         if world_reconnect_needed {
             tracing::info!("EQ: zone change approved — reconnecting to world for zone handoff");
             let ok = reconnect_via_world(
-                &mut stream, &mut net_rx, &mut gs, &char_name, &world_creds, &last_inbound,
+                &mut stream, &mut net_rx, &mut gs, &char_name, &world_creds, &net_health,
                 &game_state_snapshot,
             ).await;
             if ok {
@@ -346,7 +350,7 @@ pub async fn run_gameplay_phase(
                     stream.as_mut().unwrap(),
                     net_rx.as_mut().unwrap(),
                     &mut gs,
-                    &last_inbound,
+                    &net_health,
                     &game_state_snapshot,
                 ).await;
                 navigator.sync_zone_points(&gs);
@@ -379,7 +383,7 @@ pub async fn run_gameplay_phase(
                         stream.as_mut().unwrap(),
                         net_rx.as_mut().unwrap(),
                         &mut gs,
-                        &last_inbound,
+                        &net_health,
                         &game_state_snapshot,
                     ).await;
                     navigator.sync_zone_points(&gs);
@@ -430,7 +434,7 @@ pub async fn run_gameplay_phase(
 
         navigator.tick(s, &mut gs);
 
-        publish_snapshot(&gs, &game_state_snapshot);
+        publish_snapshot(&gs, &game_state_snapshot, &net_health);
 
         sleep(Duration::from_millis(10)).await;
     }
@@ -465,7 +469,7 @@ async fn perform_clean_shutdown(
 /// After OP_ZONE_CHANGE success=1: reconnect to world, get OP_ZONE_SERVER_INFO, connect to new zone.
 /// On success, `stream` and `net_rx` are replaced with the new zone connection.
 ///
-/// `last_inbound` is bumped as real inbound packets are drained here (the world-reconnect leg of a
+/// `net_health.last_packet` is bumped as real inbound packets are drained here (the world-reconnect leg of a
 /// zone handoff), the same way the gameplay loop's drain does — this handoff can take multiple
 /// seconds and, with CONN_STALE_SECS=15, would otherwise falsely report the connection as lost
 /// while it's mid-transition.
@@ -483,7 +487,7 @@ async fn reconnect_via_world(
     gs:                   &mut GameState,
     char_name:            &str,
     creds:                &WorldCredentials,
-    last_inbound:         &crate::http::LastInboundShared,
+    net_health:           &crate::http::NetHealthShared,
     game_state_snapshot:  &crate::http::GameStateSnapshot,
 ) -> bool {
     drop(stream.take());
@@ -517,7 +521,7 @@ async fn reconnect_via_world(
         world_stream.poll_recv();
         world_stream.poll_resend(); // retransmit OP_SEND_LOGIN_INFO/ENTER_WORLD across the handoff (#254)
         while let Ok(packet) = world_rx.try_recv() {
-            *last_inbound.lock().unwrap() = std::time::Instant::now();
+            net_health.lock().unwrap().last_packet = std::time::Instant::now();
             match packet.opcode {
                 // In a fresh-login reconnect, world sends OP_SEND_CHAR_INFO as the trigger.
                 // In a zoning=1 reconnect, world sends OP_APPROVE_WORLD (RoF2: 0x7499) instead.
@@ -548,7 +552,7 @@ async fn reconnect_via_world(
                 }
             }
         }
-        publish_snapshot(gs, game_state_snapshot);
+        publish_snapshot(gs, game_state_snapshot, net_health);
         sleep(Duration::from_millis(10)).await;
     }
 
@@ -585,7 +589,7 @@ async fn reconnect_via_world(
 /// Handles the OP_NEW_ZONE → OP_WEATHER → OP_SEND_EXP_ZONE_IN handshake
 /// that completes after connecting to a new zone server.
 ///
-/// `last_inbound` is bumped as real inbound packets are drained here, exactly like the gameplay
+/// `net_health.last_packet` is bumped as real inbound packets are drained here, exactly like the gameplay
 /// loop's own drain (`run_gameplay_phase`) does — a slow zone-in (up to the 30s deadline below)
 /// must not falsely report the connection as lost while it's healthy and still zoning in.
 ///
@@ -597,7 +601,7 @@ async fn run_zone_entry_handshake(
     stream:              &mut EqStream,
     net_rx:               &mut UnboundedReceiver<AppPacket>,
     gs:                   &mut GameState,
-    last_inbound:         &crate::http::LastInboundShared,
+    net_health:           &crate::http::NetHealthShared,
     game_state_snapshot:  &crate::http::GameStateSnapshot,
 ) {
     // Purge the previous zone's spawns/doors now, before OP_ReqClientSpawn asks for the new zone's
@@ -613,9 +617,10 @@ async fn run_zone_entry_handshake(
     while std::time::Instant::now() < deadline && !done_client_ready {
         stream.poll_recv();
         stream.poll_resend(); // retransmit OP_ZONE_ENTRY/ReqClientSpawn during zone-in (#254)
+        net_health.lock().unwrap().last_datagram = stream.last_datagram();
         while let Ok(packet) = net_rx.try_recv() {
             apply_packet(gs, &packet);
-            *last_inbound.lock().unwrap() = std::time::Instant::now();
+            net_health.lock().unwrap().last_packet = std::time::Instant::now();
             match packet.opcode {
                 OP_NEW_ZONE if !done_new_zone => {
                     done_new_zone = true;
@@ -636,7 +641,7 @@ async fn run_zone_entry_handshake(
                 _ => {}
             }
         }
-        publish_snapshot(gs, game_state_snapshot);
+        publish_snapshot(gs, game_state_snapshot, net_health);
         sleep(Duration::from_millis(10)).await;
     }
 
@@ -788,10 +793,21 @@ pub fn loot_tick_action(state: &LootTickState, now: std::time::Instant) -> LootT
 /// handled by `Navigator::tick`), and a genuinely idle world lets the loop sleep (see
 /// `App::poll_external` in app.rs, which drives its wake decision off `Arc::ptr_eq` against this
 /// snapshot).
-pub fn publish_snapshot(gs: &GameState, snapshot: &crate::http::GameStateSnapshot) {
+///
+/// `net_health.last_tick` is bumped **unconditionally**, even when the state is byte-identical: it is not a
+/// change signal but a *liveness* signal ("the thread that owns GameState is still running"). HTTP
+/// reads turn it into `snapshot_age_ms`, so a wedged or dead network thread self-identifies instead
+/// of letting a frozen snapshot be served as though it were live (#343). It must therefore stay
+/// outside the `!=` guard.
+pub fn publish_snapshot(
+    gs:         &GameState,
+    snapshot:   &crate::http::GameStateSnapshot,
+    net_health: &crate::http::NetHealthShared,
+) {
     if **snapshot.load() != *gs {
         snapshot.store(Arc::new(gs.clone()));
     }
+    net_health.lock().unwrap().last_tick = std::time::Instant::now();
 }
 
 #[cfg(test)]
@@ -971,6 +987,31 @@ mod loot_tick_tests {
 mod snapshot_tests {
     use super::*;
 
+    fn health() -> crate::http::NetHealthShared {
+        Arc::new(std::sync::Mutex::new(crate::http::NetHealth::default()))
+    }
+
+    /// #343: `net_tick` is a LIVENESS clock, not a change signal. It must advance on every publish
+    /// — including a quiet tick where the state is byte-identical and the Arc is deliberately not
+    /// republished — because `snapshot_age_ms` is how an agent learns that OUR network thread is
+    /// still running. If it only ticked on change, an idle client would look wedged.
+    #[test]
+    fn publish_snapshot_bumps_net_tick_even_when_state_is_unchanged() {
+        let gs = GameState::new();
+        let snapshot: crate::http::GameStateSnapshot =
+            Arc::new(arc_swap::ArcSwap::from_pointee(gs.clone()));
+        let nh = health();
+        nh.lock().unwrap().last_tick =
+            std::time::Instant::now() - std::time::Duration::from_secs(60);
+
+        publish_snapshot(&gs, &snapshot, &nh);
+
+        let age = nh.lock().unwrap().last_tick.elapsed();
+        assert!(age < std::time::Duration::from_secs(1),
+            "an idle-but-alive network tick must refresh net_tick (age was {age:?}) — otherwise \
+             `snapshot_age_ms` would report a healthy idle client as a dead one (#343)");
+    }
+
     #[test]
     fn publish_snapshot_reflects_latest_state_independent_of_later_mutation() {
         let snapshot: crate::http::GameStateSnapshot =
@@ -978,7 +1019,7 @@ mod snapshot_tests {
 
         let mut gs = GameState::new();
         gs.player_name = "Aldric".to_string();
-        publish_snapshot(&gs, &snapshot);
+        publish_snapshot(&gs, &snapshot, &health());
         assert_eq!(snapshot.load().player_name, "Aldric");
 
         // Mutating the source after publishing must not retroactively change the already-published
@@ -987,7 +1028,7 @@ mod snapshot_tests {
         assert_eq!(snapshot.load().player_name, "Aldric");
 
         // A second publish replaces the snapshot wholesale.
-        publish_snapshot(&gs, &snapshot);
+        publish_snapshot(&gs, &snapshot, &health());
         assert_eq!(snapshot.load().player_name, "Mutated");
     }
 
@@ -1001,11 +1042,11 @@ mod snapshot_tests {
         let snapshot: crate::http::GameStateSnapshot =
             Arc::new(arc_swap::ArcSwap::from_pointee(gs.clone()));
 
-        publish_snapshot(&gs, &snapshot);
+        publish_snapshot(&gs, &snapshot, &health());
         let before = snapshot.load_full();
 
         // Same state, re-published (e.g. a quiet tick with no inbound packet and no client request).
-        publish_snapshot(&gs, &snapshot);
+        publish_snapshot(&gs, &snapshot, &health());
         let after = snapshot.load_full();
 
         assert!(Arc::ptr_eq(&before, &after), "unchanged state must not republish a new Arc");
@@ -1020,12 +1061,12 @@ mod snapshot_tests {
         let snapshot: crate::http::GameStateSnapshot =
             Arc::new(arc_swap::ArcSwap::from_pointee(gs.clone()));
 
-        publish_snapshot(&gs, &snapshot);
+        publish_snapshot(&gs, &snapshot, &health());
         let before = snapshot.load_full();
 
         // Simulate a client-initiated mutation with no inbound packet (e.g. POST /v1/interact/sit).
         gs.sitting = true;
-        publish_snapshot(&gs, &snapshot);
+        publish_snapshot(&gs, &snapshot, &health());
         let after = snapshot.load_full();
 
         assert!(!Arc::ptr_eq(&before, &after), "a real state change must publish a new Arc");
@@ -1069,8 +1110,8 @@ mod zone_entry_handshake_publish_tests {
         gs.zone_name = "oldzone".to_string();
         let snapshot: crate::http::GameStateSnapshot =
             Arc::new(arc_swap::ArcSwap::from_pointee(gs.clone()));
-        let last_inbound: crate::http::LastInboundShared =
-            Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+        let last_inbound: crate::http::NetHealthShared =
+            Arc::new(std::sync::Mutex::new(crate::http::NetHealth::default()));
 
         let snapshot_bg     = snapshot.clone();
         let last_inbound_bg = last_inbound.clone();
