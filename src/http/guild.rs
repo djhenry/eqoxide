@@ -38,6 +38,7 @@ async fn get_roster(State(s): State<HttpState>) -> Json<serde_json::Value> {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NameBody { name: String }
 
 fn extract_name(body: Result<Json<NameBody>, axum::extract::rejection::JsonRejection>) -> Result<String, (StatusCode, String)> {

@@ -13,6 +13,7 @@ pub(super) fn router() -> Router<HttpState> {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FriendsBody {
     /// Name to add to the friends list.
     add:    Option<String>,

@@ -9,6 +9,7 @@ pub(super) fn router() -> Router<HttpState> {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MoveBody {
     /// Source slot id (e.g. a general/bag slot like 23, or a worn slot to unequip).
     from: u32,
