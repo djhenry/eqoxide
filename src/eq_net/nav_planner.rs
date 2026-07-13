@@ -66,6 +66,9 @@ pub struct Planner {
     next_gen: u64,
     /// The generation we are currently waiting on, if any.
     pending:  Option<u64>,
+    /// Latched once the worker thread has died (panicked). A dead planner must never masquerade as
+    /// a busy one — see [`Planner::poll`].
+    dead:     bool,
 }
 
 impl Default for Planner {
@@ -81,7 +84,7 @@ impl Planner {
             .name("nav-planner".into())
             .spawn(move || worker(req_rx, rep_tx))
             .expect("spawn nav-planner thread");
-        Planner { req_tx, rep_rx, next_gen: 1, pending: None }
+        Planner { req_tx, rep_rx, next_gen: 1, pending: None, dead: false }
     }
 
     /// Post a plan request and return its generation. **Never blocks on the search** — this is the
@@ -95,7 +98,11 @@ impl Planner {
         // A dead worker must not silently freeze navigation. It can only die if the thread panicked;
         // report it rather than leaving the walker waiting on a plan that will never come.
         if self.req_tx.send(req).is_err() {
-            tracing::error!("nav-planner: worker thread is gone — pathfinding is DEAD (no route will ever be planned)");
+            if !self.dead {
+                tracing::error!("nav-planner: the worker thread is gone — pathfinding is DEAD (no route will \
+                    ever be planned again this session)");
+            }
+            self.dead = true;
             self.pending = None;
         }
         gen
@@ -107,11 +114,38 @@ impl Planner {
         self.pending = None;
     }
 
+    /// Simulate the worker thread PANICKING: its reply `Sender` drops, so our `Receiver` goes
+    /// `Disconnected` — which is exactly what `poll` must notice instead of mistaking it for "no
+    /// reply yet". (Test-only; there is no way to panic a real thread on demand from here.)
+    #[cfg(test)]
+    pub fn kill_worker_for_test(&mut self) {
+        let (tx, rx) = std::sync::mpsc::channel::<PlanReply>();
+        drop(tx);
+        self.rep_rx = rx;
+    }
+
     /// Are we waiting on a plan right now?
     pub fn is_planning(&self) -> bool { self.pending.is_some() }
 
+    /// Has the worker thread DIED (panicked)? Once true, no plan will ever be computed again, and
+    /// the caller MUST say so out loud — see [`Planner::poll`].
+    pub fn is_dead(&self) -> bool { self.dead }
+
     /// Drain the reply channel and return the plan for the request we are actually waiting on.
     /// **Stale replies (a superseded goal) are discarded, not applied** — see the module docs.
+    ///
+    /// # A dead worker must be LOUD
+    ///
+    /// If the worker thread panics, its `Sender` drops and this channel goes `Disconnected`. The
+    /// first version of this function treated that exactly like `Empty` — so `poll` returned `None`
+    /// forever, `awaiting_first_plan` stayed true, and the character sat reporting
+    /// `nav_state: planning` **permanently**, with no log, no timeout and no error.
+    ///
+    /// That is strictly worse than the crash it replaced. On `main` a panic in the planner took the
+    /// network thread down — ugly, but HONEST. Swallowing it converts a loud crash into precisely
+    /// the silent lie this project ranks *above* crashes: a character that says "planning…" forever
+    /// while nothing is planning at all. So `Disconnected` is now latched and surfaced, and the
+    /// Navigator turns it into an honest terminal `no_path` / `planner_dead`.
     pub fn poll(&mut self) -> Option<PlanReply> {
         let mut fresh = None;
         loop {
@@ -126,7 +160,16 @@ impl Planner {
                     }
                 }
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if !self.dead {
+                        tracing::error!("nav-planner: the worker thread is DEAD (panicked) — pathfinding is \
+                            permanently broken for this session. Nav will report no_path/planner_dead rather \
+                            than pretend to be planning.");
+                    }
+                    self.dead = true;
+                    self.pending = None; // nothing will ever answer it
+                    break;
+                }
             }
         }
         fresh
@@ -341,6 +384,37 @@ mod tests {
             assert!(planner.poll().is_none(), "a stale reply must be DISCARDED, never queued for later");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    /// **A DEAD PLANNER MUST BE LOUD.** If the worker thread panics, `poll` used to see
+    /// `TryRecvError::Disconnected`, treat it exactly like `Empty`, and return `None` forever — so
+    /// the Navigator sat at `nav_state: planning` permanently, with no log and no error. That takes
+    /// `main`'s LOUD net-thread panic and converts it into precisely the SILENT LIE this project
+    /// ranks above crashes. The death must be detectable, and it must latch.
+    #[test]
+    fn a_dead_planner_is_reported_not_silently_pending() {
+        let col = Arc::new(plane_with_sealed_box(400.0, 200.0, 200.0));
+        let mut planner = Planner::spawn();
+        assert!(!planner.is_dead(), "a fresh planner is alive");
+
+        // Kill the worker the way a panic would: drop its Sender by making it exit.
+        planner.kill_worker_for_test();
+
+        planner.request(PlanRequest {
+            gen: 0, start: [-300.0, -300.0, 0.0], goal: [300.0, 300.0, 0.0],
+            avoid: vec![], aggro_buffer: 0.0, goal_region: None, collision: col,
+        });
+        // Poll as the nav tick would. It must NOT sit there pretending a plan is coming.
+        for _ in 0..50 {
+            if planner.poll().is_some() { panic!("a dead planner cannot produce a plan"); }
+            if planner.is_dead() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(planner.is_dead(),
+            "a dead worker MUST be detected — otherwise nav reports `planning` forever, which is a \
+             silent lie and strictly worse than the crash it replaced");
+        assert!(!planner.is_planning(),
+            "and it must not still claim a plan is in flight: nothing will ever answer it");
     }
 
     /// `cancel` (nav stopped / goal cleared) must make an in-flight plan un-appliable.
