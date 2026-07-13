@@ -243,6 +243,18 @@ pub struct CastOutcome {
     pub at: std::time::Instant,
 }
 
+/// How long [`GameState::resolve_pending_cast_end`] waits for a packet that EXPLAINS a cast the
+/// server has already ended, before reporting the end as unexplained.
+///
+/// The explaining packet is sent in the same server tick as the OP_ManaChange that ends the cast
+/// (`SendSpellBarEnable` then `MemorizeSpell` — zone/spells.cpp:1817,1824), so this only has to
+/// outlast network jitter, not a game tick.
+pub const CAST_END_GRACE: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// How recently OP_ManaChange must have named a spell for that name to be trusted on a failure that
+/// carries no spell id of its own. See `GameState::ended_cast_spell`.
+pub const CAST_HINT_FRESH: std::time::Duration = std::time::Duration::from_millis(1000);
+
 // ── Cast-outcome string ids (EQEmu zone/string_ids.h) ─────────────────────────────────────────
 // The server reports a cast that never started, or that ended badly, as an eqstr id: either inside
 // OP_InterruptCast (`InterruptCast_Struct.messageid`, common/eq_packet_structs.h:446) or as a bare
@@ -545,14 +557,32 @@ pub struct GameState {
     /// How the player's most recent cast ended (eqoxide#348). Kept after the cast so a slow poller
     /// of `/v1/observe/debug` still learns the outcome it missed on the event feed.
     pub last_cast: Option<CastOutcome>,
-    /// spell_id of the cast the server most recently told us STOPPED — from OP_ManaChange with
-    /// `keepcasting == 0`, which both `Mob::StopCasting` (zone/spells.cpp:1369) and
-    /// `Mob::SendSpellBarEnable` (zone/spells.cpp:5752) send with `spell_id = the cast that ended`.
-    /// It is the ONLY way to name the spell in a *fizzle*: EQEmu decides a fizzle in `DoCastSpell`
-    /// (zone/spells.cpp:318) **before** it ever sends OP_BeginCast (zone/spells.cpp:499), so
-    /// `casting` is still `None` when the fizzle message arrives. Consumed (taken) by
-    /// [`GameState::finish_cast`] so a stale id can never be pinned on a later cast. (eqoxide#348)
-    pub ended_cast_spell: Option<u32>,
+    /// spell_id of the cast the server most recently told us STOPPED, and when it said so — from
+    /// OP_ManaChange with `keepcasting == 0`, which both `Mob::StopCasting` (zone/spells.cpp:1369)
+    /// and `Mob::SendSpellBarEnable` (zone/spells.cpp:5752) send with `spell_id = the cast that
+    /// ended`. It is the ONLY way to name the spell in a *fizzle*: EQEmu decides a fizzle in
+    /// `DoCastSpell` (zone/spells.cpp:320) **before** it ever sends OP_BeginCast
+    /// (zone/spells.cpp:450), so `casting` is still `None` when the fizzle message arrives.
+    ///
+    /// Consumed (taken) by [`GameState::finish_cast`] AND time-scoped ([`CAST_HINT_FRESH`]): the
+    /// server re-arms this on the SendSpellBarEnable that TRAILS an interrupt/refusal
+    /// (zone/spells.cpp:1314) and on the Lua-only `ResetAllCastbarCooldowns` burst
+    /// (zone/spells.cpp:7246), so an un-scoped hint would pin a stale, unrelated spell name on the
+    /// next failure. (eqoxide#348)
+    pub ended_cast_spell: Option<(u32, std::time::Instant)>,
+    /// A cast the server has ENDED (OP_ManaChange `keepcasting=0`) but not yet EXPLAINED. Armed
+    /// only when a cast was actually in flight; cleared by whichever packet refines it into a real
+    /// outcome (memorize=completed / interrupt / message). If nothing refines it within
+    /// [`CAST_END_GRACE`], [`GameState::resolve_pending_cast_end`] reports it as an explicit
+    /// unexplained end rather than letting `casting` hang forever. (eqoxide#348)
+    pub pending_cast_end: Option<std::time::Instant>,
+    /// Number of upcoming OP_ManaChange(`keepcasting=0`) packets to ignore. `Mob::InterruptSpell`
+    /// sends OP_InterruptCast and THEN `SendSpellBarEnable` (zone/spells.cpp:1299-1314); a cast-start
+    /// refusal likewise sends its OP_SimpleMessage and then `StopCastSpell` → `SendSpellBarEnable`.
+    /// That trailing ManaChange arrives AFTER we have already reported the outcome, so without this
+    /// it would re-arm `ended_cast_spell` with a spell we just finished reporting — and the NEXT
+    /// unnamed failure would be attributed to it. (eqoxide#348)
+    pub suppress_cast_end: u8,
     /// True when the player is sitting.
     pub sitting: bool,
     /// When the player's own death was first observed (OP_Death for our spawn), or None
@@ -680,11 +710,16 @@ impl GameState {
             spell_id
         } else {
             self.casting.as_ref().map(|c| c.spell_id)
-                .or(self.ended_cast_spell)
+                // Only a FRESH hint may name the spell. A stale one is worse than no name at all:
+                // it is a plausible-looking lie. 0 = "the server never told us which spell".
+                .or_else(|| self.ended_cast_spell
+                    .filter(|(_, at)| at.elapsed() < CAST_HINT_FRESH)
+                    .map(|(id, _)| id))
                 .unwrap_or(0)
         };
         self.casting = None;
         self.ended_cast_spell = None; // consumed — never reuse it for a later cast
+        self.pending_cast_end = None; // a real outcome supersedes the unexplained-end timeout
         self.last_cast = Some(CastOutcome {
             spell_id,
             kind,
@@ -693,6 +728,40 @@ impl GameState {
         });
         self.log_msg("spell", text);
         self.push_event("combat", kind, "", true, text);
+    }
+
+    /// The server ENDED the player's cast (OP_ManaChange `keepcasting=0` — its universal cast-end
+    /// signal) without yet saying *why*. Clear the cast bar immediately (the cast is genuinely
+    /// over) and start the grace window in which a following packet may still explain it.
+    ///
+    /// Clearing here is what makes `casting` un-stickable. `Mob::SpellFinished` can return false —
+    /// a beneficial buff that won't stack is the common case (zone/spells.cpp:2590 → :1744-1751) —
+    /// and then `CastedSpellFinished` calls `StopCasting()`, which sends this ManaChange and
+    /// **nothing else**: no memorize, no interrupt, no message. Without a terminal here, re-buffing
+    /// an already-buffed target left `casting` set forever. (eqoxide#348)
+    pub fn end_cast_unexplained(&mut self) {
+        if self.casting.is_none() { return; } // no cast in flight → nothing to end (see caller)
+        self.casting = None;
+        self.pending_cast_end = Some(std::time::Instant::now());
+    }
+
+    /// Called every gameplay tick. If the server ended a cast and never explained it within
+    /// [`CAST_END_GRACE`], report that honestly instead of staying silent. An unexplained end is a
+    /// real, observable thing — a spell that did not take hold — and the agent must be able to see
+    /// it. (eqoxide#348)
+    pub fn resolve_pending_cast_end(&mut self) {
+        let Some(at) = self.pending_cast_end else { return };
+        if at.elapsed() < CAST_END_GRACE { return; }
+        self.pending_cast_end = None;
+        let spell_id = self.ended_cast_spell
+            .filter(|(_, t)| t.elapsed() < CAST_HINT_FRESH)
+            .map(|(id, _)| id)
+            .unwrap_or(0);
+        let text = format!(
+            "Your spell ({}) did not take hold — the cast ended with no effect.",
+            crate::spells::name_of(spell_id),
+        );
+        self.finish_cast(spell_id, "cast_failed", &text);
     }
 
     pub fn upsert_entity(&mut self, e: Entity) {

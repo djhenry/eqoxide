@@ -546,16 +546,25 @@ pub struct PlayerState {
 pub type PlayerInfo = Arc<Mutex<PlayerState>>;
 
 /// A cast in flight, for `/v1/observe/debug` → `casting` (#348).
+///
+/// NOTE the missing `elapsed_ms`: it is derived at **HTTP read time** from `started`, never stored.
+/// `PlayerState` is republished only by the render loop, which SLEEPS on an idle world (#343) — an
+/// elapsed/age baked in at publish time would freeze at a stale value while the connection is
+/// perfectly healthy, so `connected: true` would not warn anyone. A duration must be measured when
+/// it is read, or it is just another lie with a timestamp on it.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CastingView {
     pub spell_id:   u32,
     pub spell_name: String,
-    /// Total cast time the server announced in OP_BeginCast, and how much of it has elapsed.
+    /// Total cast time the server announced in OP_BeginCast.
     pub cast_ms:    u32,
-    pub elapsed_ms: u64,
+    /// When the cast started. Not serialized — `elapsed_ms` is computed from it on read.
+    #[serde(skip)]
+    pub started:    std::time::Instant,
 }
 
 /// How the player's most recent cast ended, for `/v1/observe/debug` → `last_cast` (#348).
+/// `ago_secs` is likewise derived at read time from `at` — see [`CastingView`].
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LastCastView {
     /// 0 when the server never named the spell (an honest unknown, not a guess).
@@ -566,7 +575,9 @@ pub struct LastCastView {
     pub outcome:    String,
     /// The server's own line ("Your spell fizzles!", "Insufficient Mana to cast this spell!", …).
     pub text:       String,
-    pub ago_secs:   u64,
+    /// When the outcome landed. Not serialized — `ago_secs` is computed from it on read.
+    #[serde(skip)]
+    pub at:         std::time::Instant,
 }
 
 /// Turn an entity key like "Guard_Phaeton000" into a display name "Guard Phaeton".

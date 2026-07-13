@@ -917,18 +917,22 @@ impl App {
                 // straight from the server's own packets (OP_BeginCast / OP_InterruptCast /
                 // OP_MemorizeSpell scribing=3 / the spell-failure eqstr messages) — see
                 // packet_handler.rs. Publishing them is what makes casting observable at all.
+                // The Instants are carried through UNMEASURED on purpose: `elapsed_ms` / `ago_secs`
+                // are computed in the HTTP handler when the agent actually reads them. Measuring
+                // here would bake in the age at publish time, and the render loop sleeps on an idle
+                // world (#343) — the age would then freeze while `connected` still says true.
                 casting:            gs.casting.as_ref().map(|c| crate::http::CastingView {
                                         spell_id:   c.spell_id,
                                         spell_name: crate::spells::name_of(c.spell_id),
                                         cast_ms:    c.cast_ms,
-                                        elapsed_ms: c.started.elapsed().as_millis() as u64,
+                                        started:    c.started,
                                     }),
                 last_cast:          gs.last_cast.as_ref().map(|o| crate::http::LastCastView {
                                         spell_id:   o.spell_id,
                                         spell_name: crate::spells::name_of(o.spell_id),
                                         outcome:    o.kind.to_string(),
                                         text:       o.text.clone(),
-                                        ago_secs:   o.at.elapsed().as_secs(),
+                                        at:         o.at,
                                     }),
             };
         }

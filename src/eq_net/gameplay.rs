@@ -400,6 +400,12 @@ pub async fn run_gameplay_phase(
             *respawn.lock().unwrap() = false;
         }
 
+        // A cast the server ended (OP_ManaChange keepcasting=0) but never explained — the classic
+        // case is a beneficial buff that won't stack, where SpellFinished returns false and
+        // StopCasting sends that ManaChange and NOTHING else. Report the unexplained end once the
+        // grace window lapses, instead of leaving the agent with no outcome at all. (#348)
+        gs.resolve_pending_cast_end();
+
         navigator.tick(s, &mut gs);
 
         publish_snapshot(&gs, &game_state_snapshot);
