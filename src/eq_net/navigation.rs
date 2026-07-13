@@ -592,97 +592,11 @@ pub fn eq_heading(d_east: f32, d_north: f32) -> f32 {
     (-d_east).atan2(d_north).to_degrees().rem_euclid(360.0)
 }
 
-/// Plan a route to `goal`, trying progressively harder before giving up (#188 — "A* gives up too
-/// easily"):
-///   1. a full route at the native radius, then at shrinking radii — a smaller clearance threads
-///      narrower gaps between geometry that the full width is boxed out of;
-///   2. if no full route exists at any width, a PARTIAL route toward the goal, so a stranded
-///      character walks as close as it can (and the walker re-paths from there) instead of not
-///      moving at all. Truly boxed in (no progress possible) still returns `None`.
-fn plan_path(
-    col: &crate::assets::Collision,
-    start: [f32; 3],
-    goal: [f32; 3],
-    avoid: &[[f32; 2]],
-    aggro_buffer: f32,
-    goal_region: Option<i32>,
-) -> Option<Vec<[f32; 3]>> {
-    use crate::assets::PlanCtx;
-    use crate::movement::PLAYER_RADIUS;
-    // This runs on the network thread, so a slow plan delays keepalive/ACK handling. Long-range
-    // pathing isn't time-critical, but if it ever gets THIS slow we want it visible — warn so a slow
-    // plan can't silently starve the connection the way the zone-line scan did (#204).
-    const SLOW_MS: u128 = 100;
-    let t0 = std::time::Instant::now();
-    // ONE deadline for the WHOLE plan (#257/#302). This function makes up to 13 A* calls (the route
-    // + a 12-point re-anchor ring); each used to arm its OWN fresh budget, so the worst case was
-    // ~13 × 150 ms ≈ 2 s of synchronous stall on the network thread — long enough to miss keepalives
-    // and get dropped as linkdead. Sharing one deadline bounds the whole plan to the budget.
-    let plan_ctx = PlanCtx::budget().with_goal_region(goal_region);
-    let plan = (|| {
-        // Plan at the char's REAL collision radius only. The old fallback retried at half/quarter
-        // radius to "thread narrower gaps" (#188), but PLAYER_RADIUS (1.0) is the native RoF2
-        // collision sphere the movement controller actually enforces — a route planned at a smaller
-        // clearance runs through gaps the char physically can't fit (the cells the nav-debug overlay,
-        // which uses the full radius, correctly paints RED). The char then wedges trying to follow it
-        // (#310, and the #314 city-wall wedge).
-        //
-        // ONE search, not two. This used to run find_path_res twice — once with allow_partial=false
-        // for a full route, then again with allow_partial=true for a partial — but `allow_partial` is
-        // only consulted AFTER A*'s search loop: both calls flooded the grid identically, so the
-        // second was pure duplicated work on the net thread (and, once the two shared a deadline, the
-        // first would eat the budget and starve the second). `find_path_ex` runs the search once and
-        // reports whether it REACHED the goal; a partial route (walk as far as is actually walkable,
-        // then re-path from there) is the same fallback as before, for half the time.
-        let (p, reached) = col.find_path_ex(start, goal, PLAYER_RADIUS, avoid, true, 8.0, None, aggro_buffer, plan_ctx)?;
-        if !reached {
-            tracing::warn!("nav: no full route from ({:.0},{:.0}) to ({:.0},{:.0}) — walking a PARTIAL route ({} wp) toward it",
-                start[0], start[1], goal[0], goal[1], p.len());
-        }
-        Some(p)
-    })();
-    let ms = t0.elapsed().as_millis();
-    if ms >= SLOW_MS {
-        tracing::warn!("nav: path plan from ({:.0},{:.0}) to ({:.0},{:.0}) took {ms}ms on the net thread — slower than expected",
-            start[0], start[1], goal[0], goal[1]);
-    }
-    if let Some(p) = plan {
-        return Some(p);
-    }
-    // Isolated start: A* couldn't leave the start cell (it's on a steep slope face / wall lip where
-    // the controller slid, and no neighbor cell resolves a walkable floor from there) — so every
-    // goto returns no_path and the character is stranded forever (#205). Re-anchor: a clean walkable
-    // floor is almost always a few units away laterally (usually just downhill). Retry from the
-    // nearest such floor and route from there; the walker then heads off the face to that floor
-    // first. Prepend the anchor so the character is steered to the clean ground before the route.
-    const RING: [(f32, f32); 12] = [
-        (-16.0, 0.0), (16.0, 0.0), (0.0, -16.0), (0.0, 16.0),
-        (-16.0, -16.0), (16.0, -16.0), (-16.0, 16.0), (16.0, 16.0),
-        (-32.0, 0.0), (32.0, 0.0), (0.0, -32.0), (0.0, 32.0),
-    ];
-    for (dx, dy) in RING {
-        let (ax, ay) = (start[0] + dx, start[1] + dy);
-        // A floor reachable from the char's height (generous down-search finds ground below a face).
-        let Some(af) = col.nearest_floor(ax, ay, start[2], 20.0, 100.0) else { continue };
-        let anchor = [ax, ay, af];
-        if let Some(p) = col.find_path_res(anchor, goal, PLAYER_RADIUS, avoid, true, 8.0, None, aggro_buffer, plan_ctx) {
-            // Only worthwhile if the re-anchored start could actually move (more than the lone
-            // start cell A* was stuck on) — otherwise it's the same dead spot.
-            // `> 2`, not `> 1`: every route now begins AT its start point (find_path prepends it), so
-            // a route that goes nowhere is already len 2 and `> 1` would wave it through.
-            if p.len() > 2 {
-                // The anchor no longer needs prepending by hand — find_path already returns it as
-                // waypoint 0 (it was planned FROM the anchor), so the old insert would duplicate it
-                // and emit a zero-length first segment. The walker is still steered to the clean
-                // floor first, which was the point.
-                tracing::warn!("nav: start isolated at ({:.0},{:.0},{:.0}) — re-anchored to clean floor ({:.0},{:.0},{:.0})",
-                    start[0], start[1], start[2], ax, ay, af);
-                return Some(p);
-            }
-        }
-    }
-    None
-}
+// The planner itself now lives on its own thread — see `crate::eq_net::nav_planner`. `plan_path`
+// moved there wholesale: it used to run SYNCHRONOUSLY here, on the network thread, which is the
+// single root cause of #340 (up to ~2 s of net-thread stall → linkdead) and #337 (the 150 ms budget
+// forced A* to give up, and a give-up was indistinguishable from "no route", so the walker silently
+// drove a partial route into a wall and froze). `Navigator::tick` now POSTS a request and returns.
 
 /// What the walker should do on reaching (near) its goal, kept pure so the follow-vs-goto distinction
 /// is unit-tested off the tick. `Arrived` = a one-shot /goto is done → stop for good. `FollowHold` = a
@@ -935,6 +849,18 @@ pub struct Navigator {
     last_streamed:    [f32; 3],
     last_pos_send:    Instant,
     streamed_init:    bool,
+    /// The PATHFINDING WORKER (#340). Coarse A* plans are POSTED here and picked up on a later tick;
+    /// the net thread never blocks on a search. See `crate::eq_net::nav_planner`.
+    planner:          crate::eq_net::nav_planner::Planner,
+    /// The goal the in-flight plan was requested for. A reply is only applied while this still
+    /// matches the walker's current goal — belt-and-braces alongside the planner's generation
+    /// counter, since a goal can be re-issued with the same generation semantics but a different
+    /// value (e.g. a portal redirect).
+    plan_goal:        Option<(f32, f32, f32)>,
+    /// True while a plan is in flight for a goal we have NO route for yet — the walker must stand
+    /// still rather than straight-line into geometry. (A re-plan of a goal we already have a route
+    /// for keeps walking the old route while the new one computes.)
+    awaiting_first_plan: bool,
 }
 
 impl Navigator {
@@ -1093,6 +1019,9 @@ impl Navigator {
             last_pos_send: Instant::now(),
             last_movement_history_send: Instant::now(),
             streamed_init: false,
+            planner: crate::eq_net::nav_planner::Planner::spawn(),
+            plan_goal: None,
+            awaiting_first_plan: false,
         }
     }
 
@@ -1285,6 +1214,12 @@ impl Navigator {
             self.replan_coarse = false;
             self.replan_cooldown = 0;
             self.falling = None;
+            // A plan in flight was computed against the PREVIOUS zone's collision grid and its
+            // coordinate space. Abandon it — applying it here would drive the character at a route
+            // through a zone it is no longer in.
+            self.planner.cancel();
+            self.plan_goal = None;
+            self.awaiting_first_plan = false;
             self.set_nav_state("idle");
 
             let mut shared = self.zone_points.lock().unwrap();
@@ -1336,11 +1271,122 @@ impl Navigator {
         }
     }
 
-    /// Publish the current `/move/goto` navigation state for GET /v1/observe/debug (#166):
-    /// idle | navigating | arrived | no_path | blocked.
-    fn set_nav_state(&self, state: &str) {
+    /// Publish the current `/move/goto` navigation state for GET /v1/observe/debug (#166, #337).
+    /// The value set is an AGENT-FACING CONTRACT — every value is documented in `docs/http-api.md`:
+    ///
+    ///   idle | planning | navigating | navigating_partial | following | arrived
+    ///   | no_path | search_exhausted | blocked
+    ///
+    /// `reason` is the machine-readable WHY behind a terminal state. A terminal state without one
+    /// (the old bare `blocked`) tells the agent nothing, which is how an unreachable goal spent
+    /// months masquerading as a mysterious wedge.
+    fn set_nav_state(&self, state: &str) { self.set_nav_state_because(state, None); }
+
+    fn set_nav_state_because(&self, state: &str, reason: Option<&str>) {
+        let next = crate::http::NavStatus { state: state.to_string(), reason: reason.map(str::to_string) };
         let mut s = self.nav_state.lock().unwrap();
-        if *s != state { *s = state.to_string(); }
+        if *s != next { *s = next; }
+    }
+
+    /// Read the current nav state word (without the reason).
+    fn nav_state_is(&self, state: &str) -> bool {
+        self.nav_state.lock().unwrap().state == state
+    }
+
+    /// Stop navigating and report WHY, loudly, in every channel an agent can see: the nav state, a
+    /// machine-readable reason, the message log, and the trace. A nav failure that says nothing is
+    /// the worst failure mode this client has — it cost the project months (#337).
+    fn stop_nav(&mut self, gs: &mut GameState, state: &str, reason: &str, msg: &str) {
+        tracing::warn!("NAV: {msg}");
+        gs.log_msg("zone", msg);
+        self.set_nav_state_because(state, Some(reason));
+        self.path.clear();
+        self.local_path.clear();
+        self.local_i = 0;
+        self.path_goal = None;
+        self.planner.cancel();
+        self.plan_goal = None;
+        self.awaiting_first_plan = false;
+        *self.goto_target.lock().unwrap() = None;
+        *self.nav_intent.lock().unwrap() = None;
+    }
+
+    /// Apply a finished plan from the worker thread. Returns `true` when the tick must STOP here —
+    /// the plan was terminal (no route / gave up) or redirected the goto through a portal.
+    ///
+    /// This is where the three honest outcomes become three DISTINGUISHABLE agent-facing states. The
+    /// old code had one: it walked a complete route and a timed-out partial route identically, and
+    /// when the partial ran into a wall it froze at `blocked` and said nothing at all (#337).
+    fn apply_plan(
+        &mut self,
+        reply: crate::eq_net::nav_planner::PlanReply,
+        gs: &mut GameState,
+        goal: (f32, f32, f32),
+    ) -> bool {
+        use crate::assets::PlanOutcome;
+        self.awaiting_first_plan = false;
+        self.plan_goal = None;
+        match reply.outcome {
+            // A real, complete route to the goal. The only outcome the walker may treat as a plan.
+            PlanOutcome::Route(path) => {
+                tracing::info!("NAV: plan #{} → ROUTE to ({:.0},{:.0}) = {} waypoints ({}ms, off the net thread)",
+                    reply.gen, goal.0, goal.1, path.len(), reply.plan_ms);
+                self.path = path;
+                self.path_i = 0;
+                self.stuck_i = 0;
+                self.set_nav_state("navigating");
+                false
+            }
+            // The search was CUT SHORT — "I don't know", not "no route". It did close real ground
+            // toward the goal (`PARTIAL_MIN_UNITS`), so walk that stage and re-plan from its end.
+            // Reported as its OWN state: an agent must be able to tell "I have a route to your goal"
+            // from "I am walking toward a frontier and hoping" — conflating those is the #337 lie.
+            PlanOutcome::Exhausted { limit, progress: Some(path) } => {
+                tracing::warn!("NAV: plan #{} → EXHAUSTED ({}) after {}ms — walking a PARTIAL route ({} wp) toward \
+                    ({:.0},{:.0}) and re-planning from its end. This is NOT a route to the goal.",
+                    reply.gen, limit.as_str(), reply.plan_ms, path.len(), goal.0, goal.1);
+                gs.log_msg("zone", "Planner gave up before finding a full route — walking as far as it can, then re-planning");
+                self.path = path;
+                self.path_i = 0;
+                self.stuck_i = 0;
+                self.set_nav_state_because("navigating_partial", Some(limit.as_str()));
+                false
+            }
+            // Gave up with nothing usable. Honest "I DON'T KNOW" — deliberately NOT `no_path`, which
+            // would be claiming a certainty we do not have.
+            PlanOutcome::Exhausted { limit, progress: None } => {
+                self.stop_nav(gs, "search_exhausted", limit.as_str(), &format!(
+                    "Path search to ({:.0},{:.0}) GAVE UP ({}) after {}ms with no usable route. This is not \
+                     'no route exists' — the search never finished. Try a nearer waypoint.",
+                    goal.0, goal.1, limit.as_str(), reply.plan_ms));
+                true
+            }
+            // DEFINITIVE: no route exists.
+            PlanOutcome::Unreachable(why) => {
+                // ...unless the only way out is an in-zone translocator (the Qeynos guild-vault
+                // waterfall): REDIRECT the goto to it — the char walks in via the normal machinery,
+                // the auto-cross teleports it out, and the post-teleport jump restores the real goal
+                // (#266). Previously this hung off "the route came back partial"; an honest
+                // Unreachable is a strictly better signal for it.
+                if self.escape_return.is_none() && self.portal_cooldown == 0 {
+                    if let Some(portal) = self.find_in_zone_portal(gs) {
+                        tracing::info!("NAV: goal ({:.0},{:.0}) is UNREACHABLE by walking ({}) — escaping the sealed area \
+                            via the in-zone teleport at ({:.0},{:.0}) (#266)",
+                            goal.0, goal.1, why.as_str(), portal.0, portal.1);
+                        self.escape_return = Some(goal);
+                        *self.goto_target.lock().unwrap() = Some(portal);
+                        self.portal_cooldown = PORTAL_COOLDOWN_TICKS;
+                        self.path_goal = None; // re-plan to the portal next tick
+                        *self.nav_intent.lock().unwrap() = None;
+                        return true;
+                    }
+                }
+                self.stop_nav(gs, "no_path", why.as_str(), &format!(
+                    "No route to ({:.0},{:.0}): {} (searched to completion in {}ms — this is a definitive no, \
+                     not a timeout).", goal.0, goal.1, why.as_str(), reply.plan_ms));
+                true
+            }
+        }
     }
 
     /// Is the player slain? Detected the SAME way the render/anim path picks the dead pose
@@ -1371,6 +1417,10 @@ impl Navigator {
         self.local_i = 0;
         self.path_goal = None;
         self.path_i = 0;
+        // A corpse must not act on a plan that lands after it died (#238 + #340).
+        self.planner.cancel();
+        self.plan_goal = None;
+        self.awaiting_first_plan = false;
         self.set_nav_state("idle");
         true
     }
@@ -2362,10 +2412,20 @@ impl Navigator {
                 self.path.clear();
                 self.path_goal = None;
                 self.escape_return = None; // goto cancelled → abandon any in-progress portal escape (#266)
+                // Nav stopped — any plan still in flight is for a goal nobody wants. Abandon it so
+                // its reply can never be applied (#340).
+                self.planner.cancel();
+                self.plan_goal = None;
+                self.awaiting_first_plan = false;
                 *self.nav_intent.lock().unwrap() = None;
-                // Only downgrade from "navigating" (an external cancel / WASD). Keep terminal states
-                // (arrived / no_path / blocked) so a driver can still read the last outcome (#166).
-                if *self.nav_state.lock().unwrap() == "navigating" { self.set_nav_state("idle"); }
+                // Only downgrade from an ACTIVE state (an external cancel / WASD). Keep terminal
+                // states (arrived / no_path / search_exhausted / blocked) so a driver can still read
+                // the last outcome (#166).
+                if self.nav_state_is("navigating") || self.nav_state_is("navigating_partial")
+                    || self.nav_state_is("planning")
+                {
+                    self.set_nav_state("idle");
+                }
                 return;
             }
         };
@@ -2379,11 +2439,21 @@ impl Navigator {
         let goal_changed = self.path_goal != Some(goal);
         if goal_changed || self.replan_coarse {
             self.path_goal = Some(goal);
-            // Re-anchor the walker to the fresh route (which starts at the current position).
-            self.path_i = 0;
-            self.stuck_i = 0;
-            self.backoff_ticks = 0;
+            // NOTE the walker's cursor into the route (`path_i` / `stuck_i`) is deliberately NOT
+            // reset here — `apply_plan` resets it when the NEW route is actually installed.
+            //
+            // When the plan was computed inline this was the same instant, so resetting here was
+            // harmless. It is NOT harmless now: the reply lands a tick or two later, and until then
+            // the walker is still driving the OLD route. Zeroing its cursor re-aims it at that
+            // route's FIRST waypoint — which is behind it, often far behind — so every proactive
+            // re-plan (#246) yanked the walker backwards for a tick. At a tight spot, where #246
+            // re-plans fire over and over, that was enough to stop gfaydark→butcherblock from
+            // crossing: the walker jittered in place instead of threading the last 50u to the zone
+            // line. Caught by A/B against `main` on the live server, not by any test.
             if goal_changed {
+                self.path_i = 0;
+                self.stuck_i = 0;
+                self.backoff_ticks = 0;
                 self.stuck_best = f32::MAX;
                 self.stuck_ticks = 0;
                 self.nav_repaths = 0;
@@ -2401,6 +2471,11 @@ impl Navigator {
                 self.local_stuck_ticks = 0;
                 self.replan_cooldown = REPLAN_COOLDOWN_TICKS;
             }
+            // POST the plan to the worker thread and RETURN IMMEDIATELY (#340). This used to call
+            // `plan_path` inline — up to ~2 s of synchronous A* on the network thread, which is how
+            // two linkdead bugs (#257, #302) happened and why the search carried a 150 ms budget it
+            // then lied about hitting (#337). The cost here is now a channel send (microseconds).
+            //
             // Route with the native collision radius (1.0, was 2.0): the 2× radius boxed the player
             // out of gaps the native client threads, causing "boxed in by walls" / platform stalls
             // (issues #22/#13/#2). Collide-and-slide in the controller keeps it off walls.
@@ -2409,56 +2484,68 @@ impl Navigator {
             // the destination (often a target mob), so its own camp must not be avoided.
             let av = *self.nav_avoid.lock().unwrap();
             let avoid = Self::aggro_avoid(gs, goal, av.enabled);
-            let route = self.collision.read().unwrap().as_ref().map(|c| {
-                // Is this goal a ZONE LINE? Derived from the goal itself rather than carried as walker
-                // state, so it can't go stale behind a /goto issued from the API thread. The zone-line
-                // target is floor-projected (`find_zone_line_near`), so a `zone_line_at` at standing
-                // height there resolves the DRNTP region the char must end up INSIDE — which is what
-                // A* then accepts arrival on, instead of one cell at a tier the region's z never had (#229).
-                let goal_region = c.zone_line_at([goal.0, goal.1, goal.2 + 1.0]);
-                plan_path(c, [gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], &avoid, av.buffer, goal_region)
-            });
-            match route {
-                // Collision loaded, but A* found NO navmesh route to the target. Report it and STOP,
-                // rather than silently straight-lining into geometry and looking "wedged" — a driver
-                // needs to tell "unreachable" from "stuck" (#166). Clear path_goal so re-issuing the
-                // same target re-evaluates.
-                Some(None) => {
-                    tracing::info!("NAV: no path to ({:.0},{:.0}) — unreachable, stopping", goal.0, goal.1);
-                    gs.log_msg("zone", "No path to destination (unreachable)");
-                    self.set_nav_state("no_path");
-                    self.path.clear();
-                    self.path_goal = None;
-                    *self.goto_target.lock().unwrap() = None;
-                    *self.nav_intent.lock().unwrap() = None;
-                    return;
-                }
-                Some(Some(path)) => {
-                    // Does the coarse route actually REACH the goal, or is it a PARTIAL (goal walk-
-                    // unreachable — the char is boxed in)? A full route is goal-inclusive so its last
-                    // waypoint sits ~a cell from the goal; a partial ends far short.
-                    let reaches = path.last().is_some_and(|w| (w[0]-goal.0).hypot(w[1]-goal.1) <= 10.0);
-                    if !reaches && self.escape_return.is_none() && self.portal_cooldown == 0 {
-                        // Boxed in. If the only way out is an in-zone translocator (a vault waterfall),
-                        // REDIRECT the goto to it — walk in via the normal machinery, the auto-cross
-                        // teleports us out, and the jump-restore above resumes the real goal (#266).
-                        if let Some(portal) = self.find_in_zone_portal(gs) {
-                            tracing::info!("NAV: goal ({:.0},{:.0}) unreachable by walking — escaping the sealed area via the in-zone teleport at ({:.0},{:.0}) (#266)", goal.0, goal.1, portal.0, portal.1);
-                            self.escape_return = Some(goal);
-                            *self.goto_target.lock().unwrap() = Some(portal);
-                            self.portal_cooldown = PORTAL_COOLDOWN_TICKS;
-                            self.path_goal = None; // re-plan to the portal next tick
-                            *self.nav_intent.lock().unwrap() = None;
-                            return;
-                        }
+            let col = self.collision.read().unwrap().as_ref().cloned(); // Arc clone, not the grid
+            match col {
+                Some(c) => {
+                    // Is this goal a ZONE LINE? Derived from the goal itself rather than carried as
+                    // walker state, so it can't go stale behind a /goto issued from the API thread.
+                    // The zone-line target is floor-projected (`find_zone_line_near`), so a
+                    // `zone_line_at` at standing height there resolves the DRNTP region the char must
+                    // end up INSIDE — which is what A* then accepts arrival on, instead of one cell
+                    // at a tier the region's z never had (#229). One BSP point query: microseconds.
+                    let goal_region = c.zone_line_at([goal.0, goal.1, goal.2 + 1.0]);
+                    let t0 = Instant::now();
+                    let gen = self.planner.request(crate::eq_net::nav_planner::PlanRequest {
+                        gen: 0, // assigned by the planner
+                        start: [gs.player_x, gs.player_y, gs.player_z],
+                        goal:  [goal.0, goal.1, goal.2],
+                        avoid,
+                        aggro_buffer: av.buffer,
+                        goal_region,
+                        collision: c,
+                    });
+                    self.plan_goal = Some(goal);
+                    let post_us = t0.elapsed().as_micros();
+                    tracing::info!("NAV: posted plan #{gen} to ({:.0},{:.0}) — {post_us}us on the net thread (was: the whole A*)",
+                        goal.0, goal.1);
+                    // A GOAL CHANGE invalidates the route we're walking: stand still until the plan
+                    // lands (a few hundred ms at worst) rather than straight-lining at a goal we have
+                    // no route to. A PROACTIVE re-plan (#246) keeps walking the committed route while
+                    // the new one computes — the old route is still the best information we have.
+                    if goal_changed {
+                        self.path.clear();
+                        self.awaiting_first_plan = true;
+                        self.set_nav_state("planning");
+                        *self.nav_intent.lock().unwrap() = None;
                     }
-                    self.path = path;
-                    self.set_nav_state("navigating");
                 }
                 // Collision not loaded yet (zoning): keep the old straight-line-toward-goal fallback.
-                None => { self.path = Vec::new(); self.set_nav_state("navigating"); }
+                None => {
+                    self.planner.cancel();
+                    self.plan_goal = None;
+                    self.awaiting_first_plan = false;
+                    self.path = Vec::new();
+                    self.set_nav_state("navigating");
+                }
             }
-            tracing::info!("NAV: path to ({:.0},{:.0}) = {} waypoints", goal.0, goal.1, self.path.len());
+        }
+
+        // Pick up a finished plan. `poll` DISCARDS a stale reply (one for a goal we've since
+        // abandoned) — applying it would walk the character toward a goal nobody asked for.
+        if let Some(reply) = self.planner.poll() {
+            if self.plan_goal == Some(goal) {
+                if self.apply_plan(reply, gs, goal) { return; }
+            } else {
+                tracing::debug!("NAV: dropping plan #{} — the goal moved on", reply.gen);
+            }
+        }
+
+        // Still waiting on the first plan for this goal: DO NOT drive. The straight-line fallback
+        // below exists for "no collision loaded", not for "the planner hasn't answered yet" — using
+        // it here would charge the character at the goal through whatever is in the way.
+        if self.awaiting_first_plan {
+            *self.nav_intent.lock().unwrap() = None;
+            return;
         }
 
         // PURE-PURSUIT path following. Chasing each discrete waypoint made the walker OVERSHOOT it
@@ -2490,10 +2577,15 @@ impl Navigator {
             const LOCAL_CELL:  f32 = 2.0;    // fine grid resolution
             const LOCAL_BOUND: f32 = 40.0;   // cap the fine search radius (keeps it cheap)
             let local_goal = carrot_along(&self.path, self.path_i, [px, py], LOCAL_REACH).unwrap_or(coarse);
+            // This is the ONE A* still on the net thread. It is bounded to LOCAL_BOUND (40u) at a 2u
+            // cell, so it is inherently cheap — but it keeps a hard, small wall-clock cap
+            // (`PlanCtx::net_tier`) precisely because it runs here. Its partial routes are a local
+            // STEERING hint (re-planned every tick, and the walker checks `reached_carrot` below),
+            // never an answer to "can I reach the goal" — that question is the worker's (#337).
             self.local_path = self.collision.read().unwrap().as_ref()
                 .and_then(|c| c.find_path_res([px, py, gs.player_z], local_goal,
                     crate::movement::PLAYER_RADIUS, &[], true, LOCAL_CELL, Some(LOCAL_BOUND), 0.0,
-                    crate::assets::PlanCtx::default()))
+                    crate::assets::PlanCtx::net_tier()))
                 .unwrap_or_default();
             // Fresh plan from the current position → the fast-steering cursor (#311) resets to its
             // start; a stale index into a just-rebuilt path would just move the bug.
@@ -2565,7 +2657,7 @@ impl Navigator {
                 tracing::info!("NAV: fall of {:.0}u (up to {} dmg) would exceed {} hp — stopping at ledge",
                     drop_to_target, max_dmg, gs.cur_hp);
                 gs.log_msg("zone", "Fall too dangerous (HP too low) — stopped at the ledge");
-                self.set_nav_state("blocked");
+                self.set_nav_state_because("blocked", Some("fall_would_be_lethal"));
                 *self.goto_target.lock().unwrap() = None;
                 *self.nav_intent.lock().unwrap() = None; // else the controller keeps walking the last
                 // wish_dir forever — drifting 1000s of units with no nav activity (eqoxide#71).
@@ -2649,25 +2741,30 @@ impl Navigator {
                 hop:         false,
             });
             if self.backoff_ticks == 0 {
-                // Backed off — re-plan from the cleaner spot. If it still can't route, the next
-                // stall (nav_repaths already counted) stops us.
+                // Backed off — re-plan from the cleaner spot. POSTED to the worker like every other
+                // coarse plan (#340): this used to be a second synchronous `plan_path` on the net
+                // thread, and it fired on exactly the stall that made plans slowest. The reply lands
+                // on a later tick via `apply_plan`; until then the walker keeps the old route (which
+                // it is, by definition, no longer making progress on — a few hundred ms of that
+                // changes nothing). If the re-plan still can't route, the honest outcome now stops
+                // us with a reason instead of another silent wedge.
                 let av = *self.nav_avoid.lock().unwrap();
                 let avoid = Self::aggro_avoid(gs, goal, av.enabled);
-                let fresh = self.collision.read().unwrap().as_ref().and_then(|c| {
+                let col = self.collision.read().unwrap().as_ref().cloned();
+                if let Some(c) = col {
                     let goal_region = c.zone_line_at([goal.0, goal.1, goal.2 + 1.0]);
-                    plan_path(c, [gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], &avoid, av.buffer, goal_region)
-                });
-                if let Some(np) = fresh {
-                    // `> 2`, not `> 1`: every route now begins AT the character (find_path prepends
-                    // the start), so "it went nowhere" is len 2 — `> 1` would accept a dead re-path.
-                    if np.len() > 2 {
-                        tracing::warn!("NAV: backed off downhill — re-pathing ({} wp, attempt {})",
-                            np.len(), self.nav_repaths);
-                        self.path = np;
-                        self.path_i = 0;
-                        self.stuck_i = 0;
-                        self.stuck_ticks = 0;
-                    }
+                    let gen = self.planner.request(crate::eq_net::nav_planner::PlanRequest {
+                        gen: 0,
+                        start: [gs.player_x, gs.player_y, gs.player_z],
+                        goal:  [goal.0, goal.1, goal.2],
+                        avoid,
+                        aggro_buffer: av.buffer,
+                        goal_region,
+                        collision: c,
+                    });
+                    self.plan_goal = Some(goal);
+                    self.stuck_ticks = 0;
+                    tracing::warn!("NAV: backed off downhill — posted re-plan #{gen} (attempt {})", self.nav_repaths);
                 }
             }
             return;
@@ -2697,12 +2794,15 @@ impl Navigator {
                             gs.player_x, gs.player_y, self.nav_repaths);
                         return;
                     }
-                    tracing::warn!("NAV: stalled (no progress) near ({:.1},{:.1}) — stopping",
-                        gs.player_x, gs.player_y);
-                    gs.log_msg("zone", "Path stalled — stopped");
-                    self.set_nav_state("blocked");
-                    *self.goto_target.lock().unwrap() = None;
-                    *self.nav_intent.lock().unwrap() = None;
+                    // `blocked` now means ONE thing and one thing only: the planner gave us a route
+                    // and the walker physically could not follow it. It is no longer the dumping
+                    // ground for "the goal was unreachable and nobody said so" — that is `no_path`,
+                    // reported by the planner before a single step is taken (#337).
+                    self.stop_nav(gs, "blocked", "walker_stalled", &format!(
+                        "Wedged at ({:.1},{:.1}) after {} re-path attempts — the route is planned but the \
+                         walker cannot physically follow it. (The goal itself IS reachable; this is a \
+                         collision/steering wedge, not a routing failure.)",
+                        gs.player_x, gs.player_y, self.nav_repaths));
                     return;
                 }
             }
@@ -3020,7 +3120,7 @@ mod tests {
     fn test_navigator(group: crate::http::GroupShared) -> Navigator {
         Navigator::new(
             Default::default(), // goto_target
-            std::sync::Arc::new(std::sync::Mutex::new("idle".to_string())), // nav_state
+            std::sync::Arc::new(std::sync::Mutex::new(crate::http::NavStatus::default())), // nav_state
             Default::default(), // goto_entity
             Default::default(), // entity_positions
             Default::default(), // entity_ids
