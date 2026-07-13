@@ -1328,8 +1328,8 @@ pub fn apply_mana_change(gs: &mut GameState, p: &[u8]) {
     // (InterruptSpell → SendSpellBarEnable, zone/spells.cpp:1314). We reported that outcome on the
     // earlier packet, so the trailing one must not re-arm anything — otherwise the next unnamed
     // failure inherits the spell we just finished reporting. (eqoxide#348)
-    if gs.suppress_cast_end > 0 {
-        gs.suppress_cast_end -= 1;
+    if gs.suppress_cast_end {
+        gs.suppress_cast_end = false;
         return;
     }
 
@@ -1366,6 +1366,12 @@ pub fn apply_memorize_spell(gs: &mut GameState, p: &[u8]) {
             // never report completion. Treat it as the sentinel only when it is NOT the spell we are
             // currently casting. (In practice nothing in EQEmu calls SendSpellBarDisable, so the
             // sentinel never actually arrives; this just keeps the value-collision honest.)
+            //
+            // KNOWN IMPRECISION (accepted, #348 review): if a completion of spell 700 arrives LATE
+            // — after OP_ManaChange already cleared `casting` — `is_sentinel` sees casting == None
+            // and swallows it, so the cast resolves as `cast_ended_unexplained` instead of
+            // `cast_completed`. That degrades to an explicit "we don't know why it ended", which is
+            // imprecision, not a lie. It affects exactly one spell id and only on a late packet.
             3 => {
                 let is_sentinel = spell_id == SPELLBAR_UNLOCK
                     && gs.casting.as_ref().map_or(true, |c| c.spell_id != spell_id);
@@ -1402,7 +1408,7 @@ pub fn apply_interrupt_cast(gs: &mut GameState, p: &[u8]) {
     gs.finish_cast(0, kind, &text); // 0 = take the spell from gs.casting / the ended-cast hint
     // InterruptSpell sends OP_InterruptCast and THEN SendSpellBarEnable (zone/spells.cpp:1299-1314).
     // We have just reported the outcome, so ignore that trailing OP_ManaChange.
-    gs.suppress_cast_end = gs.suppress_cast_end.saturating_add(1);
+    gs.suppress_cast_end = true;
 }
 
 /// A server eqstr id that means the player's cast ended badly (or never started). Returns the event
@@ -1967,8 +1973,12 @@ fn apply_simple_message(gs: &mut GameState, payload: &[u8]) {
         // (zone/spells.cpp:169-241, :484-496). Ignore that trailing terminal; we just explained it.
         // A FIZZLE is the opposite shape — its OP_ManaChange arrives BEFORE this message
         // (StopCasting then MessageString, zone/spells.cpp:326-330) — so it must not suppress.
+        // NOTE: the server does NOT always send that trailing ManaChange — an instant item clicky
+        // or an AA skips SendSpellBarEnable entirely (zone/spells.cpp:158-161), and
+        // SPELL_TOO_POWERFUL reaches that path. `suppress_cast_end` is a bool that begin_cast /
+        // begin_zone_in clear, so an unbalanced arm here cannot leak into a later cast.
         if kind == "cast_failed" {
-            gs.suppress_cast_end = gs.suppress_cast_end.saturating_add(1);
+            gs.suppress_cast_end = true;
         }
         return;
     }
@@ -3987,6 +3997,78 @@ mod tests {
         assert_eq!(last.kind, "cast_ended_unexplained");
         assert_eq!(last.spell_id, 202, "OP_ManaChange named the spell that ended");
         assert_eq!(event_kinds(&gs), ["cast_begin", "cast_ended_unexplained"]);
+    }
+
+    #[test]
+    fn an_unbalanced_suppression_cannot_poison_a_later_cast() {
+        // REGRESSION (PR #364 re-review) — BLOCKING. `suppress_cast_end` used to be an unbounded,
+        // never-reset counter whose correctness rested on a conservation law that is FALSE:
+        // "every cast_failed eqstr is followed by exactly one OP_ManaChange{keepcasting=0}".
+        //
+        // Mob::CastSpell sets send_spellbar_enable = false for an instant item clicky or an AA
+        // ((item_slot != -1 && cast_time == 0) || aa_id — zone/spells.cpp:158-161), so
+        // StopCastSpell skips SendSpellBarEnable entirely and NO terminal ManaChange is ever sent.
+        // SPELL_TOO_POWERFUL (197) reaches exactly that path, and we expose an item-clicky cast.
+        //
+        // The stale +1 then ate the terminal ManaChange of a LATER cast — so `casting` hung forever
+        // with no outcome event. Permanent, session-wide, and caused by something minutes earlier.
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+
+        // A refusal whose trailing ManaChange NEVER ARRIVES (instant clicky / AA path).
+        super::apply_simple_message(&mut gs, &simple_msg_pkt(197)); // SPELL_TOO_POWERFUL
+        assert_eq!(gs.last_cast.as_ref().unwrap().kind, "cast_failed");
+        // ...and the server sends nothing further. The suppression is left armed.
+
+        // Now a completely separate cast that the server ends WITHOUT explaining (won't-stack).
+        // Its terminal ManaChange must NOT be swallowed by the stale suppression.
+        super::apply_begin_cast(&mut gs, &begin_cast_pkt(42, 202, 2500));
+        super::apply_mana_change(&mut gs, &mana_change_pkt(90, 202, 0));
+        assert!(gs.casting.is_none(),
+            "a stale suppression must not eat this cast's terminal — that hangs `casting` forever");
+        assert!(gs.pending_cast_end.is_some(), "the unexplained end must still be tracked");
+        gs.pending_cast_end = Some(std::time::Instant::now() - crate::game_state::CAST_END_GRACE);
+        gs.resolve_pending_cast_end();
+        let last = gs.last_cast.as_ref().expect("the later cast still reports an outcome");
+        assert_eq!(last.kind, "cast_ended_unexplained");
+        assert_eq!(last.spell_id, 202);
+    }
+
+    #[test]
+    fn zoning_clears_cast_state_so_it_cannot_leak_into_the_new_zone() {
+        // A cast cannot survive a zone change: the cast bar, the spawn ids and every packet that
+        // would have explained it belong to the zone we just left. Carrying `casting` over reports
+        // a cast in flight that can never end; carrying `suppress_cast_end` eats the terminal of
+        // the FIRST cast in the new zone. (eqoxide#348 review)
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        super::apply_begin_cast(&mut gs, &begin_cast_pkt(42, 202, 2500));
+        super::apply_simple_message(&mut gs, &simple_msg_pkt(197)); // arms suppression
+        super::apply_begin_cast(&mut gs, &begin_cast_pkt(42, 202, 2500)); // cast in flight...
+        assert!(gs.casting.is_some());
+
+        gs.begin_zone_in(); // ...and we zone.
+        assert!(gs.casting.is_none(), "a cast must not survive a zone change");
+        assert!(gs.pending_cast_end.is_none());
+        assert!(gs.ended_cast_spell.is_none());
+        assert!(!gs.suppress_cast_end, "suppression must not leak into the new zone");
+
+        // The first cast in the new zone behaves normally.
+        super::apply_begin_cast(&mut gs, &begin_cast_pkt(42, 200, 1000));
+        super::apply_mana_change(&mut gs, &mana_change_pkt(90, 200, 0));
+        super::apply_memorize_spell(&mut gs, &memorize_pkt(0, 200, 3));
+        assert_eq!(gs.last_cast.as_ref().unwrap().kind, "cast_completed");
+    }
+
+    #[test]
+    fn every_cast_failed_string_id_has_a_real_server_sender() {
+        // Dead ids are not harmless: each one is a latent UNBALANCED arm of suppress_cast_end (it
+        // can never be matched by a terminal the server never sends for it). 106 and 237 exist in
+        // zone/string_ids.h but nothing in zone/*.cpp sends them, so they were removed.
+        use crate::game_state::CAST_FAILED_STRING_IDS as IDS;
+        assert_eq!(IDS, [197, 199, 214, 236]);
+        assert!(!IDS.contains(&106), "SPELL_DOES_NOT_WORK_HERE has no sender in zone/*.cpp");
+        assert!(!IDS.contains(&237), "SPELL_RECOVERY has no sender in zone/*.cpp");
     }
 
     #[test]

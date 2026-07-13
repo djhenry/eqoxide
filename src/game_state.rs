@@ -278,11 +278,18 @@ pub const MISS_NOTE: u32 = 180;
 /// 439 — "Your spell is interrupted." (zone/string_ids.h:177; the default `InterruptSpell` message).
 pub const INTERRUPT_SPELL: u32 = 439;
 /// Cast-start refusals: the server never begins the cast and only says so as an OP_SimpleMessage.
-/// 106 "This spell does not work here.", 197 "Your spell is too powerful for your intended target.",
-/// 199 "Insufficient Mana to cast this spell!", 214 "You must first select a target for this spell!",
-/// 236 "Spell recast time not yet met.", 237 "Spell recovery time not yet met."
-/// (zone/string_ids.h:26,77,78,86,93,94.)
-pub const CAST_FAILED_STRING_IDS: [u32; 6] = [106, 197, 199, 214, 236, 237];
+///   197 "Your spell is too powerful for your intended target."  (zone/spells.cpp:3487)
+///   199 "Insufficient Mana to cast this spell!"                 (zone/spells.cpp:490)
+///   214 "You must first select a target for this spell!"        (zone/spells.cpp:494 area)
+///   236 "Spell recast time not yet met."                        (zone/spells.cpp:1421,
+///                                                                zone/client_packet.cpp:9685,9689)
+///
+/// Every id here has a REAL sender in the server. Ids with no sender were removed: 106
+/// ("This spell does not work here.") and 237 ("Spell recovery time not yet met.") appear in
+/// zone/string_ids.h but nothing in `zone/*.cpp` ever sends them, so they were dead weight — and
+/// each dead entry is a latent unbalanced arm of `suppress_cast_end`. Do not add an id here without
+/// checking it has a sender. (eqoxide#348 review)
+pub const CAST_FAILED_STRING_IDS: [u32; 4] = [197, 199, 214, 236];
 
 /// One async game event the agent should know about as soon as it happens — surfaced via the
 /// `/v1/events/*` feed. `category` is the top-level bucket the events API filters on
@@ -587,13 +594,30 @@ pub struct GameState {
     /// [`CAST_END_GRACE`], [`GameState::resolve_pending_cast_end`] reports it as an explicit
     /// unexplained end rather than letting `casting` hang forever. (eqoxide#348)
     pub pending_cast_end: Option<std::time::Instant>,
-    /// Number of upcoming OP_ManaChange(`keepcasting=0`) packets to ignore. `Mob::InterruptSpell`
-    /// sends OP_InterruptCast and THEN `SendSpellBarEnable` (zone/spells.cpp:1299-1314); a cast-start
-    /// refusal likewise sends its OP_SimpleMessage and then `StopCastSpell` → `SendSpellBarEnable`.
-    /// That trailing ManaChange arrives AFTER we have already reported the outcome, so without this
-    /// it would re-arm `ended_cast_spell` with a spell we just finished reporting — and the NEXT
-    /// unnamed failure would be attributed to it. (eqoxide#348)
-    pub suppress_cast_end: u8,
+    /// Ignore the next OP_ManaChange(`keepcasting=0`), because we have ALREADY reported the outcome
+    /// it belongs to. `Mob::InterruptSpell` sends OP_InterruptCast and THEN `SendSpellBarEnable`
+    /// (zone/spells.cpp:1299-1314); a cast-start refusal likewise sends its OP_SimpleMessage and
+    /// then `StopCastSpell` → `SendSpellBarEnable`. Without this, that trailing ManaChange would
+    /// re-arm `ended_cast_spell` with a spell we just finished reporting, and the next unnamed
+    /// failure would inherit it.
+    ///
+    /// ## Deliberately a bool, and reset on every cast — it is NOT a counter
+    /// A counter here would be a landmine. Its correctness would rest on a conservation law that is
+    /// FALSE: "every refusal is followed by exactly one OP_ManaChange". `Mob::CastSpell` sets
+    /// `send_spellbar_enable = false` for an instant-cast item clicky or an AA
+    /// (`(item_slot != -1 && cast_time == 0) || aa_id` — zone/spells.cpp:158-161), so
+    /// `StopCastSpell` skips `SendSpellBarEnable` ENTIRELY and no terminal ManaChange is ever sent.
+    /// SPELL_TOO_POWERFUL (197) reaches exactly that path, and eqoxide has an item-clicky cast path
+    /// (`/v1/combat/cast {"item_slot":N}`).
+    ///
+    /// An unbalanced increment on a counter would then never be decremented — silently eating the
+    /// terminal ManaChange of some LATER cast, so `casting` hangs forever with no outcome event.
+    /// Permanent, session-wide, and triggered by something that happened minutes earlier: the exact
+    /// bug that gets written off as "the client randomly gets stuck sometimes".
+    ///
+    /// A bool cannot accumulate, and [`GameState::begin_cast`] / [`GameState::begin_zone_in`] clear
+    /// it, so a missing terminal can affect at most the cast it belongs to. (eqoxide#348 review)
+    pub suppress_cast_end: bool,
     /// True when the player is sitting.
     pub sitting: bool,
     /// When the player's own death was first observed (OP_Death for our spawn), or None
@@ -648,6 +672,21 @@ impl GameState {
         self.entities.clear();
         self.doors.clear();
         self.new_zone_applied = false;
+        // A cast cannot survive a zone change: the spawn ids, the cast bar and every packet that
+        // would have explained the cast belong to the zone we just left. Carrying `casting` across
+        // would report a cast in flight that can never end, and carrying `suppress_cast_end` would
+        // eat the terminal of the first cast in the NEW zone. (eqoxide#348 review)
+        self.reset_cast_tracking();
+        self.casting = None;
+    }
+
+    /// Drop all in-flight cast bookkeeping (but NOT `last_cast`, which is a true record of
+    /// something that already happened). Shared by [`GameState::begin_cast`] and
+    /// [`GameState::begin_zone_in`]. (eqoxide#348 review)
+    fn reset_cast_tracking(&mut self) {
+        self.pending_cast_end = None;
+        self.ended_cast_spell = None;
+        self.suppress_cast_end = false;
     }
 
     pub fn log_msg(&mut self, kind: &str, text: &str) {
@@ -701,6 +740,11 @@ impl GameState {
     /// `combat`/`cast_begin` event so an agent long-polling `/v1/events/*` learns the server
     /// actually accepted the cast — the previous code set `casting` and told nobody. (eqoxide#348)
     pub fn begin_cast(&mut self, spell_id: u32, cast_ms: u32) {
+        // A new cast starts from a CLEAN slate. Every one of these is bookkeeping for the PREVIOUS
+        // cast, and any of it that survives is a booby trap for this one — most dangerously
+        // `suppress_cast_end`, which the server can leave armed with no terminal to balance it (see
+        // its doc comment). Resetting here bounds that damage to the cast it came from.
+        self.reset_cast_tracking();
         self.casting = Some(CastState { spell_id, started: std::time::Instant::now(), cast_ms });
         self.last_cast = None; // a new cast supersedes the previous outcome
         let text = format!("You begin casting {}.", crate::spells::name_of(spell_id));
