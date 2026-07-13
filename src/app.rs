@@ -1742,10 +1742,10 @@ impl ApplicationHandler for App {
                                         *self.acts.target.lock().unwrap() = Some(id);
                                     }
                                     Some(PickResult::Door(door_id)) => {
-                                        // Server-authoritative: only request the open; never set is_open locally.
+                                        // Server-authoritative: only request the open; never set is_open
+                                        // locally. Navigator::tick (network thread) already logs
+                                        // "Clicked door {id}" when it polls this same slot.
                                         *self.door_click.lock().unwrap() = Some(door_id);
-                                        self.game_state.log_msg("door",
-                                            &format!("Clicked door {}", door_id));
                                     }
                                     None => {}
                                 }
