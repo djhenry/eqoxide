@@ -119,11 +119,43 @@ pub type PosCorrection = Arc<Mutex<Option<[f32; 3]>>>;
 /// (borrowed) or `.load_full()` (owned `Arc<GameState>`).
 pub type GameStateSnapshot = std::sync::Arc<arc_swap::ArcSwap<crate::game_state::GameState>>;
 
-/// Updated by the network thread every time it applies a real inbound packet (never on a mere
-/// idle tick — `GameStateSnapshot` publishes unconditionally every ~10ms, which would make a
-/// pointer-equality check meaningless as a connection-health signal). The render thread polls this
-/// once per frame to derive `last_packet_age_ms`/`connected` for `/debug` (#8).
-pub type LastInboundShared = std::sync::Arc<std::sync::Mutex<std::time::Instant>>;
+/// The three clocks that answer "can I trust anything else in this payload?", owned and stamped by
+/// the network thread and turned into `Health` **at HTTP read time** (`HttpState::health`), never
+/// cached (#8, #343). They are deliberately separate signals, because they fail independently:
+///
+/// | clock           | bumped when                        | a stale value means                      |
+/// |-----------------|------------------------------------|------------------------------------------|
+/// | `last_datagram` | ANY inbound UDP datagram           | **the link is dead** → `connected: false` |
+/// | `last_packet`   | an inbound APPLICATION packet       | the world is quiet (NOT necessarily dead) |
+/// | `last_tick`     | every gameplay tick (~10ms)         | OUR network thread wedged/died            |
+///
+/// The `last_datagram` / `last_packet` split is load-bearing and was found by live-testing #343: a
+/// genuinely idle EQ session (a character sitting alone in an empty zone) goes **40+ seconds**
+/// without a single application packet, while the session layer keeps ACKing throughout. Deriving
+/// `connected` from application traffic would therefore report a perfectly healthy idle session as
+/// disconnected — trading the old false `true` for an equally dishonest false `false`.
+#[derive(Debug, Clone, Copy)]
+pub struct NetHealth {
+    /// Last inbound datagram of ANY kind, session-layer ACKs/keepalives included → link liveness.
+    pub last_datagram: std::time::Instant,
+    /// Last inbound APPLICATION packet (a decoded opcode that mutated `GameState`) → world activity.
+    pub last_packet:   std::time::Instant,
+    /// Last network-thread gameplay tick → client liveness (is our own publisher still running?).
+    pub last_tick:     std::time::Instant,
+}
+
+impl Default for NetHealth {
+    fn default() -> Self {
+        let now = std::time::Instant::now();
+        NetHealth { last_datagram: now, last_packet: now, last_tick: now }
+    }
+}
+
+pub type NetHealthShared = std::sync::Arc<std::sync::Mutex<NetHealth>>;
+
+/// Smoothed per-frame phase timings, published by the **render** thread (the only agent-visible
+/// value the renderer legitimately owns — see `PlayerState`'s note on the network/render split).
+pub type FrameProfileShared = std::sync::Arc<std::sync::Mutex<crate::profiling::FrameProfile>>;
 
 /// Aggro-avoidance knobs the `/v1/move/*` handlers set and the nav walker reads (#242). `enabled`
 /// gates the always-on NPC-camp avoidance (#67) — `false` routes straight through (e.g. to reach a
@@ -463,7 +495,20 @@ pub type ZoneInfo = Arc<Mutex<(String, u16)>>;
 /// dead/frozen server is caught within a few seconds (eqoxide#8).
 pub const CONN_STALE_SECS: u64 = 15;
 
+/// How long after a death `killed_by` / `died_ago_secs` keep being reported (through a respawn), so
+/// an infrequently-polling agent still learns that it died and what killed it (#284).
+pub const DEATH_STICKY_SECS: u64 = 300;
+
 /// Live player state for the /v1/observe/debug endpoint.
+///
+/// **This is a pure projection of the network thread's `GameState`** — derived on demand by
+/// [`HttpState::player`], never cached. It deliberately contains NO connection-health or freshness
+/// fields: those are time-derived, and a time-derived value baked into a stored struct is a lie the
+/// moment its publisher stops running. `/debug` computes `connected` / `last_packet_age_ms` /
+/// `snapshot_age_ms` at READ time from [`NetHealth`]'s clocks (#343).
+///
+/// It also contains no render-owned fields: `frame_profile` lives in [`FrameProfileShared`], written
+/// by the render loop. Observation must not be coupled to rendering.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct PlayerState {
     /// The player's own character name — so `/v1/observe/debug` identifies which char it drives (#109).
@@ -519,16 +564,6 @@ pub struct PlayerState {
     pub target_attitude: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_level:    Option<u32>,
-    /// Milliseconds since the last inbound server packet (connection-health signal, #8).
-    pub last_packet_age_ms: u64,
-    /// False when no server packet has arrived for [`CONN_STALE_SECS`] — the session is
-    /// dead/frozen rather than merely idle. Recomputed from `last_packet_age_ms` every frame (the
-    /// derived Default is a transient `false` before the first snapshot).
-    pub connected:          bool,
-    /// Smoothed per-phase frame timings (ms); all zero unless the client runs with `--profile` /
-    /// `EQ_PROFILE=1`. Exposed under `/v1/observe/debug` → `frame_profile` so perf work (#152)
-    /// can read phase costs programmatically instead of screenshotting the HUD overlay.
-    pub frame_profile:      crate::profiling::FrameProfile,
     /// Text of the most recently read book/note (OP_ReadBook reply), newline-decoded. None until a
     /// book is read. Surfaced via GET /v1/observe/item_text so an agent can read a quest note (#288).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -543,15 +578,116 @@ pub struct PlayerState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_cast:          Option<LastCastView>,
 }
-pub type PlayerInfo = Arc<Mutex<PlayerState>>;
+
+impl PlayerState {
+    /// Project the network thread's authoritative `GameState` into the agent-facing view.
+    ///
+    /// `gs.player_x/y/z` and `gs.player_heading` are the *controller's* position: the nav thread
+    /// mirrors `controller_view` into them every tick in `Navigator::stream_position` (and the
+    /// controlled-fall branch writes `player_z` itself), so this is exactly the position the client
+    /// streams to the server — no need to reach into the render thread's controller (#343).
+    pub fn from_game_state(gs: &crate::game_state::GameState) -> Self {
+        PlayerState {
+            name:       gs.player_name.clone(),
+            zone:       gs.zone_name.clone(),
+            race:       gs.player_race.clone(),
+            class:      gs.player_class.clone(),
+            level:      gs.player_level as u32,
+            pos_east:   gs.player_x,
+            pos_north:  gs.player_y,
+            pos_up:     gs.player_z,
+            heading_ccw: gs.player_heading,
+            heading_cw:  crate::eq_net::protocol::ccw_to_cw(gs.player_heading),
+            server_corrections: gs.server_corrections,
+            mem_spells: gs.mem_spells,
+            skills:     gs.player_skills.clone(),
+            trainer_open:   gs.trainer_open.is_some(),
+            trainer_skills: gs.trainer_skills.clone(),
+            player_id:  gs.player_id,
+            target_id:  gs.target_id,
+            coin:       gs.coin,
+            hp_pct:     gs.hp_pct,
+            cur_hp:     gs.cur_hp,
+            max_hp:     gs.max_hp,
+            // Death state (#284). `dead` is live (held slain until /lifecycle/respawn);
+            // killed_by/died_ago_secs stay reported for DEATH_STICKY_SECS after death (through a
+            // respawn too) so an infrequent poller still sees it. Both are time-derived — being
+            // computed here, at read time, they can no longer freeze mid-window (#343).
+            dead:          gs.player_dead,
+            killed_by:     gs.died_at
+                               .filter(|t| t.elapsed().as_secs() < DEATH_STICKY_SECS)
+                               .map(|_| gs.killed_by.clone()),
+            died_ago_secs: gs.died_at
+                               .filter(|t| t.elapsed().as_secs() < DEATH_STICKY_SECS)
+                               .map(|t| t.elapsed().as_secs()),
+            mana_pct:   gs.mana_pct,
+            cur_mana:   gs.cur_mana,
+            max_mana:   gs.max_mana,
+            xp_pct:     gs.xp_pct,
+            // Prefer the live entity (its hp_pct tracks combat via OP_HP_UPDATE); fall back to the
+            // target snapshot stored at target time if the entity is gone. Both gated on target_id
+            // being Some (#331 defence in depth) so a missed GameState::clear_target can never leak
+            // a stale name/HP into the API alongside a null id.
+            target_name:   gs.target_id.and_then(|id| gs.entities.get(&id).map(|e| e.name.clone())
+                               .or_else(|| gs.target_name.clone())),
+            target_hp_pct: gs.target_id.and_then(|id| gs.entities.get(&id).map(|e| e.hp_pct)
+                               .or(gs.target_hp_pct)),
+            // #292: con difficulty tier + attitude enum (from the last consider) and the target's
+            // level, only while something is targeted.
+            target_con:      gs.target_id.and(gs.target_con_name.clone()),
+            target_attitude: gs.target_id.and(gs.target_attitude.clone()),
+            target_level:    gs.target_id.and_then(|id| gs.entities.get(&id)).map(|e| e.level),
+            book_text:       gs.last_book_text.clone(),
+            // Spellcasting (#348). The live cast bar and how the last cast ended, straight from the
+            // server's own packets (OP_BeginCast / OP_InterruptCast / OP_MemorizeSpell scribing=3 /
+            // the spell-failure eqstr messages) — see packet_handler.rs. Publishing these is what
+            // makes casting observable at all.
+            //
+            // The `Instant`s are carried through UNMEASURED on purpose: `elapsed_ms` / `ago_secs`
+            // are computed in the HTTP handler at read time (see `observe::get_debug`). Measuring an
+            // age at projection time would be the #343 bug in miniature — an age is only true at the
+            // moment it is read.
+            casting:         gs.casting.as_ref().map(|c| CastingView {
+                                 spell_id:   c.spell_id,
+                                 spell_name: crate::spells::name_of(c.spell_id),
+                                 cast_ms:    c.cast_ms,
+                                 started:    c.started,
+                             }),
+            last_cast:       gs.last_cast.as_ref().map(|o| LastCastView {
+                                 spell_id:   o.spell_id,
+                                 spell_name: crate::spells::name_of(o.spell_id),
+                                 outcome:    o.kind.to_string(),
+                                 text:       o.text.clone(),
+                                 at:         o.at,
+                             }),
+        }
+    }
+}
+
+/// Connection/freshness health, computed fresh on every HTTP read — never stored (#343).
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct Health {
+    /// Milliseconds since the last inbound UDP datagram. This is what `connected` is derived from.
+    pub link_age_ms:        u64,
+    /// Milliseconds since the last inbound *application* packet — i.e. how long the WORLD has been
+    /// quiet. On an idle session this legitimately reaches tens of seconds while the link is fine,
+    /// so an agent must not treat it as a disconnect signal; use `connected` for that.
+    pub last_packet_age_ms: u64,
+    /// Milliseconds since the network thread last ticked (client-liveness). A large value means OUR
+    /// publisher stopped, so every other field in the payload is stale.
+    pub snapshot_age_ms:    u64,
+    /// False when NO datagram — not even a session-layer ACK — has arrived for [`CONN_STALE_SECS`].
+    /// That is a dead link, as distinct from a quiet world.
+    pub connected:          bool,
+}
 
 /// A cast in flight, for `/v1/observe/debug` → `casting` (#348).
 ///
 /// NOTE the missing `elapsed_ms`: it is derived at **HTTP read time** from `started`, never stored.
-/// `PlayerState` is republished only by the render loop, which SLEEPS on an idle world (#343) — an
-/// elapsed/age baked in at publish time would freeze at a stale value while the connection is
-/// perfectly healthy, so `connected: true` would not warn anyone. A duration must be measured when
-/// it is read, or it is just another lie with a timestamp on it.
+/// An age baked in when the value is *projected* is only true at that instant; every moment after,
+/// it is wrong, and nothing in the payload says so. That is #343 in miniature — and it is why the
+/// whole player view is now derived on read rather than published by a loop that sleeps. A duration
+/// must be measured when it is read, or it is just another lie with a timestamp on it.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CastingView {
     pub spell_id:   u32,
@@ -651,7 +787,13 @@ pub(crate) struct HttpState {
     pub(crate) chat_events:      ChatEventsShared,
     pub(crate) chat_send:        ChatSendShared,
     pub(crate) spells:           std::sync::Arc<crate::spells::SpellDb>,
-    pub(crate) player_info:      PlayerInfo,
+    /// The network thread's authoritative `GameState`. Every agent-facing player field is projected
+    /// from HERE at read time (`HttpState::player`) — the render loop is no longer in the path (#343).
+    pub(crate) game_state:       GameStateSnapshot,
+    /// The network thread's three liveness clocks — turned into `Health` on every read (#343).
+    pub(crate) net_health:       NetHealthShared,
+    /// Render-owned frame timings (the ONLY agent-visible value the render loop publishes).
+    pub(crate) frame_profile:    FrameProfileShared,
     pub(crate) task_log:         TaskLog,
     pub(crate) task_offers_shared:    TaskOffersShared,
     pub(crate) completed_tasks_shared: CompletedTasksShared,
@@ -675,6 +817,35 @@ pub(crate) struct HttpState {
     pub(crate) read_book:        ReadBookReq,
     pub(crate) guild:            GuildShared,
     pub(crate) guild_action:     GuildActionReq,
+}
+
+impl HttpState {
+    /// The agent-facing player view, **derived at read time** from the network thread's `GameState`
+    /// snapshot. There is no cached `PlayerState` anywhere, so there is nothing to go stale (#343).
+    pub(crate) fn player(&self) -> PlayerState {
+        PlayerState::from_game_state(&self.game_state.load())
+    }
+
+    /// Connection + snapshot freshness, computed from the two shared clocks **on every read**.
+    ///
+    /// This is the whole point of #343: before, `connected` was computed inside `render_frame`, and
+    /// the render loop deliberately sleeps when no packets arrive — so a dead connection (no packets
+    /// → no render) meant `connected` was never recomputed and stayed `true` forever. Elapsed time
+    /// is now measured when the agent asks, so silence *is* the signal, and no publisher — not the
+    /// renderer, not the network thread — has to be alive for the answer to be honest.
+    pub(crate) fn health(&self) -> Health {
+        let h = *self.net_health.lock().unwrap();
+        let link_age = h.last_datagram.elapsed();
+        Health {
+            link_age_ms:        link_age.as_millis() as u64,
+            last_packet_age_ms: h.last_packet.elapsed().as_millis() as u64,
+            snapshot_age_ms:    h.last_tick.elapsed().as_millis() as u64,
+            // Link liveness, NOT world activity — see `NetHealth`. An idle session goes 40+s with
+            // no application packet while the session layer keeps ACKing; calling that "disconnected"
+            // would be just as much a lie as #343's frozen `connected: true`.
+            connected:          link_age.as_secs() < CONN_STALE_SECS,
+        }
+    }
 }
 
 pub fn spawn_camera_server(
@@ -715,7 +886,9 @@ pub fn spawn_camera_server(
     chat_events:      ChatEventsShared,
     chat_send:        ChatSendShared,
     spells:           std::sync::Arc<crate::spells::SpellDb>,
-    player_info:      PlayerInfo,
+    game_state:       GameStateSnapshot,
+    net_health:       NetHealthShared,
+    frame_profile:    FrameProfileShared,
     task_log:         TaskLog,
     task_offers_shared:    TaskOffersShared,
     completed_tasks_shared: CompletedTasksShared,
@@ -748,7 +921,7 @@ pub fn spawn_camera_server(
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, shared_collision, zone_cross, manual_move, hail, say, target, who_req, friends_list, friends_req, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, dialogue, nav_state, dialogue_click, chat_events, chat_send, spells, player_info, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until, respawn, pet_cmd, nav_avoid, read_book, guild, guild_action };
+            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, shared_collision, zone_cross, manual_move, hail, say, target, who_req, friends_list, friends_req, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, dialogue, nav_state, dialogue_click, chat_events, chat_send, spells, game_state, net_health, frame_profile, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until, respawn, pet_cmd, nav_avoid, read_book, guild, guild_action };
             // Versioned + grouped routes: /v1/<group>/<action>. Each group's `router()` defines
             // relative paths; nesting prefixes them. Shared state is applied once at the end.
             let app = Router::new()

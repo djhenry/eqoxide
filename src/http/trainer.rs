@@ -52,7 +52,7 @@ async fn post_open(
 /// GET /v1/trainer/list — skills the open trainer will raise, as `{id, name, current, cap}`, listing
 /// only skills where `cap > current` (i.e. actually trainable). `open:false` if no window is open.
 async fn get_list(State(s): State<HttpState>) -> Json<serde_json::Value> {
-    let pi = s.player_info.lock().unwrap();
+    let pi = s.player();
     if !pi.trainer_open {
         return Json(serde_json::json!({ "open": false, "skills": [] }));
     }
@@ -84,7 +84,7 @@ async fn post_train(
         Ok(Json(b)) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"skill_id\":N}".into()),
     };
-    if !s.player_info.lock().unwrap().trainer_open {
+    if !s.player().trainer_open {
         return (StatusCode::BAD_REQUEST, "no trainer window open — call /v1/trainer/open first".into());
     }
     *s.trainer_train_req.lock().unwrap() = Some(b.skill_id);
