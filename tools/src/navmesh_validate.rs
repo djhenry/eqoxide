@@ -179,7 +179,52 @@ fn run_zone(zone: &str, models: &std::path::Path, nav_dir: &std::path::Path,
     let oracle_cov = match load_oracle(&nav_dir.join(format!("{zone}.nav"))) {
         Ok(o) if !o.is_empty() => {
             let (cov, tot) = oracle_coverage(&mesh, &o, 8.0);
-            Some(100.0 * cov as f32 / tot as f32)
+            let pct = 100.0 * cov as f32 / tot as f32;
+            // A low number means our bake and EQEmu's disagree badly. Before blaming the baker,
+            // check whether the two are even describing the same volume of world: if the GLB we
+            // ship and the .map EQEmu baked from cover different bounds, this is an ASSET mismatch,
+            // not a bake bug, and the coverage number is meaningless for that zone.
+            if pct < 60.0 {
+                let bb = |pts: &mut dyn Iterator<Item = [f32; 3]>| {
+                    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+                    for p in pts { for k in 0..3 { lo[k] = lo[k].min(p[k]); hi[k] = hi[k].max(p[k]); } }
+                    (lo, hi)
+                };
+                let (olo, ohi) = bb(&mut o.iter().flat_map(|p| p.verts.iter().copied()));
+                let (mlo, mhi) = bb(&mut mesh.populated_columns().flat_map(|(c, r)| {
+                    let ctr = mesh.center(c, r);
+                    mesh.column(c, r).iter().map(move |s| [ctr[0], ctr[1], s.z]).collect::<Vec<_>>()
+                }));
+                println!("  [diag {zone}] LOW COVERAGE {pct:.1}% — bounds check:");
+                println!("      ours   e[{:.0}..{:.0}] n[{:.0}..{:.0}] z[{:.0}..{:.0}]",
+                    mlo[0], mhi[0], mlo[1], mhi[1], mlo[2], mhi[2]);
+                println!("      EQEmu  e[{:.0}..{:.0}] n[{:.0}..{:.0}] z[{:.0}..{:.0}]",
+                    olo[0], ohi[0], olo[1], ohi[1], olo[2], ohi[2]);
+                // Decisive: at an EQEmu poly's XY, do we have NO surface (missing geometry) or a
+                // surface at a DIFFERENT z (offset / wrong tier)?
+                let (mut empty, mut zdiff, mut ok) = (0, 0, 0);
+                let mut samples = Vec::new();
+                for op in o.iter().take(4000) {
+                    let n = op.verts.len() as f32;
+                    let c = [op.verts.iter().map(|v| v[0]).sum::<f32>() / n,
+                             op.verts.iter().map(|v| v[1]).sum::<f32>() / n,
+                             op.verts.iter().map(|v| v[2]).sum::<f32>() / n];
+                    let (cc, rr) = mesh.to_cell(c[0], c[1]);
+                    let col = mesh.column(cc, rr);
+                    if col.is_empty() { empty += 1; }
+                    else if col.iter().any(|s| (s.z - c[2]).abs() <= 8.0) { ok += 1; }
+                    else {
+                        zdiff += 1;
+                        if samples.len() < 3 {
+                            samples.push(format!("EQEmu z={:.1} vs ours {:?}", c[2],
+                                col.iter().map(|s| format!("{:.1}", s.z)).collect::<Vec<_>>()));
+                        }
+                    }
+                }
+                println!("      at EQEmu poly XYs: no-surface={empty}  z-mismatch={zdiff}  match={ok}");
+                for s in &samples { println!("        {s}"); }
+            }
+            Some(pct)
         }
         _ => None,
     };

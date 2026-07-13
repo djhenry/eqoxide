@@ -17,11 +17,11 @@
 //! standard Recast pipeline ONCE per zone, then caches the result to disk:
 //!
 //!   1. **Voxel heightfield** — rasterize every collision triangle into `cs`-sized XY columns,
-//!      recording each solid span `[zmin, zmax]` and whether the triangle it came from is walkable
-//!      by SLOPE (this is the normal filter `nearest_floor` never had).
+//!      recording each solid span `[zmin, zmax]` and whether it is walkable by SLOPE (the filter
+//!      `nearest_floor` never had). NOTE: on `|nz|`, not the signed normal — EQ's face winding is
+//!      NOT reliable (measured: outdoor terrain is partly wound inside-out; see the rasterizer).
 //!   2. **Surface extraction** — a span's top is a walkable surface only if it is slope-walkable AND
-//!      has `agent_height` of open air above it (this is the clearance filter that makes a ceiling
-//!      stop being a floor, structurally — #329).
+//!      has `agent_height` of open air above it (the clearance filter — you must fit to stand).
 //!   3. **Water surface layer** (ours, not Recast's) — a swimmable body gets an explicit surface
 //!      node at the waterline, so A* can cross a pool AT THE TOP instead of diving (#197 part 2).
 //!   4. **Edge marking** — surfaces within `agent_radius` of a wall/ledge/waterline are FLAGGED, and
@@ -269,19 +269,21 @@ impl NavMesh {
                       e1[0] * e2[1] - e1[1] * e2[0]];
             let nl = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
             if nl < 1e-9 { continue; }
-            // SIGNED nz — this is the whole ballgame, and it is the filter `nearest_floor` lacks.
+            // Slope test on |nz| — NOT on the signed normal.
             //
-            // EQ zone art is a THIN SHELL, not a solid: a cave ceiling is a single polygon with open
-            // air above it. So a clearance test ALONE cannot tell a ceiling from a floor (the qcat
-            // ceiling has 14u of air above it and would pass). The only thing that separates them is
-            // which way the face points, and winding IS reliable here — measured across the shipped
-            // collision meshes, down-facing faces sit at a consistently HIGHER median z than
-            // up-facing ones in every zone (qcat: up −42.0 vs down −28.0; halas: 3.0 vs 599.8).
+            // I first filtered on the SIGNED normal (a floor faces up, a ceiling faces down) after
+            // measuring that winding looked consistent across the shipped collision meshes. That
+            // measurement was taken on INDOOR/city zones and it does not generalise: on outdoor
+            // zones the terrain is partly wound inside-out. In highpass the down-facing faces have a
+            // median z of 60.0 — exactly the height EQEmu's own navmesh calls walkable. Filtering on
+            // the sign therefore DELETED real ground (nektulos dropped to 6.9% coverage against the
+            // oracle: at terrain XYs our only surface was the zone's -199 boundary plane).
             //
-            // So: only an UP-facing face within the walkable grade can ever be stood on. A ceiling
-            // (nz < 0) is not a surface at any z, which is #329 fixed by construction rather than by
-            // a tolerance. This also governs descents, unlike the legacy ascent-only grade cap (#313).
-            let nz = n[2] / nl;
+            // So both windings count as ground here, and the ceiling problem (#329) is solved where
+            // it actually bites — at ANCHORING (see `nearest_index`): you stand on a surface BELOW
+            // your feet, never on one above your head. A ceiling also forms its own connected
+            // component, so A* on the floor never wanders onto it.
+            let nz = (n[2] / nl).abs();
             let walkable = nz >= cos_max;
 
             let (mut tmin_e, mut tmax_e) = (f32::MAX, f32::MIN);
@@ -726,10 +728,25 @@ impl NavMesh {
                     };
                     let ctr = self.center(c, r);
                     for (k, s) in self.column(c, r).iter().enumerate() {
-                        // Weight z-error heavily: on stacked geometry the right TIER matters far more
-                        // than a couple of cells of XY error.
+                        // You stand on something BELOW your feet. A surface above your head is a
+                        // CEILING, not a floor, and anchoring to one is exactly the #329 failure
+                        // (qcat: the flooded corridor's waterline sits flush with the ceiling, the
+                        // caller reports z=-56, and the legacy grid snaps the route to the rock).
+                        // Because EQ's face winding is unreliable we cannot filter ceilings out of
+                        // the mesh geometrically — so we refuse to STAND on them: a surface above
+                        // the feet is heavily penalised, and only used if nothing else exists.
+                        // A small tolerance above the feet keeps a slightly-stale z (the caller
+                        // reporting a hair below its own floor) anchoring to that floor.
+                        let dz = s.z - p[2];
+                        let z_pen = if dz <= self.params.max_climb {
+                            -dz                      // at or below the feet: the natural floor
+                        } else {
+                            dz * 8.0 + 100.0         // above the head: a ceiling — last resort only
+                        };
+                        // Weight the z term heavily: on stacked geometry the right TIER matters far
+                        // more than a couple of cells of XY error.
                         let d = (ctr[0] - p[0]).powi(2) + (ctr[1] - p[1]).powi(2)
-                              + (s.z - p[2]).powi(2) * 4.0;
+                              + z_pen.max(0.0).powi(2) * 4.0;
                         if best.map_or(true, |(bd, _)| d < bd) { best = Some((d, base + k)); }
                     }
                 }
@@ -909,31 +926,59 @@ mod tests {
     }
 
     #[test]
-    fn a_ceiling_is_never_a_walkable_surface() {
-        // THE #329 CASE, structurally. The qcat spawn corridor: an up-facing floor at -69.97 and,
-        // 14u above it, the DOWN-facing rock ceiling at -55.97. The corridor is flooded and the
-        // water surface (-56.00) is flush with that ceiling — so the client reports a player z of
-        // ~-56, and the legacy `nearest_floor` (which gathers every triangle a vertical ray crosses,
-        // with NO normal test) hands back the CEILING as the floor. A* then plans the entire route
-        // across the ceiling plane and the character wedges.
+    fn the_qcat_flooded_corridor_anchors_to_water_or_floor_never_the_ceiling() {
+        // THE #329 CASE, modelled as the zone really is. The qcat spawn corridor: floor at -69.97,
+        // rock ceiling at -55.97 (with rock ABOVE it — that is what a ceiling is), and the corridor
+        // is FLOODED, so the water surface sits at -56.00, flush with the ceiling.
         //
-        // Note this is NOT fixed by a clearance test alone: EQ geometry is a thin shell, so there is
-        // 14u of open air above this ceiling too. It is fixed by the face pointing DOWN.
-        let mut tris = quad(-69.97, 0.0, 40.0, 0.0, 40.0);      // corridor floor  (up-facing)
-        tris.extend(quad_down(-55.97, 0.0, 40.0, 0.0, 40.0));   // rock ceiling    (down-facing) ← impostor
-        let mesh = NavMesh::bake(&tris, None, BakeParams::default(), b"t");
+        // The legacy `nearest_floor` gathers every triangle a vertical ray crosses with no
+        // orientation and no clearance test, so a caller reporting z ~ -56 gets the CEILING back as
+        // its floor, and A* plans the whole route across the rock.
+        //
+        // Two independent mechanisms stop that here:
+        //   1. clearance — the ceiling has rock above it, so nothing can stand on it: it is not a
+        //      surface at all (and this holds whichever way the art is wound, which matters because
+        //      EQ's winding is NOT reliable — see the rasterizer).
+        //   2. the water-surface layer — a character at -56 in a flooded corridor is SWIMMING, and
+        //      the honest thing to anchor to is the waterline, which the legacy model cannot even
+        //      represent (#197p2).
+        for (label, ceiling) in [("down-wound", quad_down(-55.97, 0.0, 40.0, 0.0, 40.0)),
+                                 ("up-wound",   quad(-55.97, 0.0, 40.0, 0.0, 40.0))] {
+            let mut tris = quad(-69.97, 0.0, 40.0, 0.0, 40.0); // corridor floor
+            tris.extend(ceiling);
+            tris.extend(quad(-53.97, 0.0, 40.0, 0.0, 40.0));   // rock above the ceiling
+            let water = RegionMap::flat_below(-56.0);          // the corridor is flooded to -56
+            let mesh = NavMesh::bake(&tris, Some(&water), BakeParams::default(), b"t");
 
-        let (c, r) = mesh.to_cell(20.0, 20.0);
-        let col = mesh.column(c, r);
-        // The claim that matters: the ceiling is NOT a walkable surface, at any z tolerance.
-        assert!(col.iter().all(|s| (s.z - (-55.97)).abs() > 1.0),
-            "the ceiling must not be a surface at all, got column {col:?}");
-        assert_eq!(col.len(), 1, "the corridor column holds exactly one surface (the floor)");
-        // Anchoring with the very z that fools the legacy grid (-56.0, the waterline) now lands on
-        // the real corridor floor 14u below.
-        let s = mesh.nearest_surface(20.0, 20.0, -56.0).expect("a surface exists");
-        assert!((s.z - (-69.97)).abs() < 1.0,
-            "must anchor to the real floor (-69.97), got {} — a ceiling was treated as a floor", s.z);
+            let (c, r) = mesh.to_cell(20.0, 20.0);
+            let col = mesh.column(c, r);
+            // The ceiling can never be STOOD on: there is rock on top of it. (The waterline node
+            // sits at -56.00, 0.03u from the ceiling by construction — that one is a swim surface,
+            // which is exactly right and is the thing the legacy model cannot represent at all.)
+            assert!(col.iter().all(|s| s.is_swim() || (s.z - (-55.97)).abs() > 1.0),
+                "{label}: the ceiling must not be a WALKABLE surface, got {col:?}");
+
+            // Anchoring with the z that fools the legacy grid (-56.0) gives the waterline or the
+            // floor — never the rock.
+            let s = mesh.nearest_surface(20.0, 20.0, -56.0)
+                .unwrap_or_else(|| panic!("{label}: a surface must exist"));
+            assert!(s.is_swim() || (s.z - (-69.97)).abs() < 1.0,
+                "{label}: must anchor to the waterline or the floor, got z={} swim={}",
+                s.z, s.is_swim());
+        }
+    }
+
+    #[test]
+    fn outdoor_ground_survives_even_when_the_art_is_wound_inside_out() {
+        // Regression guard for the bug the EQEmu oracle caught. Filtering on the SIGNED normal looked
+        // right on indoor zones but deleted real ground outdoors, where terrain is partly wound
+        // inside-out: nektulos fell to 6.9% coverage against EQEmu's own navmesh, because at real
+        // terrain XYs our only surface left was the zone's -199 boundary plane. Ground is ground
+        // regardless of which way the triangle happens to face.
+        let tris = quad_down(60.0, 0.0, 40.0, 0.0, 40.0); // a floor, wound the "wrong" way
+        let mesh = NavMesh::bake(&tris, None, BakeParams::default(), b"t");
+        let s = mesh.nearest_surface(20.0, 20.0, 60.0).expect("inside-out ground is still ground");
+        assert!((s.z - 60.0).abs() < 1.0, "expected the floor at 60.0, got {}", s.z);
     }
 
     #[test]
