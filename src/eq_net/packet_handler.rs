@@ -79,12 +79,19 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_ITEM_PACKET          => apply_item_packet(gs, p),
         OP_DELETE_ITEM | OP_DELETE_CHARGE => apply_delete_item(gs, p),
         OP_SHOP_REQUEST         => apply_shop_request(gs, p),
+        OP_SHOP_PLAYER_BUY      => apply_shop_player_buy(gs, p),
         OP_SHOP_PLAYER_SELL     => apply_shop_player_sell(gs, p),
+        OP_SHOP_END_CONFIRM     => apply_shop_end_confirm(gs, p),
         OP_SHOP_END             => {
-            // Server confirmed the merchant window closed.
+            // NOT the NPC-merchant refusal/close signal — that's OP_ShopEndConfirm, above. Inbound
+            // OP_ShopEnd only arrives from the PLAYER-TRADER (bazaar) path: TraderEndTrader() when a
+            // trader we're shopping at shuts down (zone/trading.cpp:926) and CancelTraderTradeWindow()
+            // (:3872). eqoxide doesn't drive trader shops today, so this is effectively unreachable —
+            // but if it ever does arrive, dropping the stale session is the right move. No message: a
+            // trader closing their shop is not a refused purchase, and claiming otherwise would lie.
             gs.merchant_open = None;
             gs.merchant_items.clear();
-            tracing::info!("EQ: merchant window closed (OP_ShopEnd)");
+            tracing::info!("EQ: player-trader session ended (OP_ShopEnd)");
         }
         OP_TRADE_REQUEST_ACK    => {
             // Server acknowledged our OP_TradeRequest — the trade session now exists. The give
@@ -675,6 +682,76 @@ fn apply_looted_item(gs: &mut GameState, mut it: crate::game_state::InvItem) {
     gs.inventory.push(it);
 }
 
+
+/// OP_ShopPlayerBuy (server→client echo) — confirms a purchase completed. On success the RoF2
+/// server echoes the SAME opcode with the SAME 32-byte Merchant_Sell_Struct sent in the request
+/// (npcid@0, playerid@4, itemslot@8, unknown12@12, quantity@16, unknown20@20, price@24,
+/// unknown28@28 — common/patches/rof2_structs.h), with `quantity`/`price` recomputed server-side
+/// (zone/client_packet.cpp Handle_OP_ShopPlayerBuy). The item itself arrives separately as a plain
+/// OP_ItemPacket(Trade), already handled generically by apply_item_packet via `main_slot`.
+///
+/// On failure the server sends NO echo of this opcode at all — for a bad merchant/out-of-range/qty
+/// or a stale slot it sends OP_ShopEndConfirm instead (apply_shop_end_confirm below); for
+/// insufficient funds it sends absolutely nothing. So receipt of THIS packet is itself the success
+/// signal — there is no separate flag to check — and this is the only place allowed to deduct coin
+/// or log "Bought item" (#345, generalizing the #269 sell fix). The server takes the money with
+/// `TakeMoneyFromPP(price)` — the default `update_client=false` overload — so no OP_MoneyUpdate
+/// ever follows a buy; this handler must apply the coin change itself once confirmed.
+///
+/// Note there is NO faction check anywhere in Handle_OP_ShopPlayerBuy (zone/client_packet.cpp
+/// 14126-14372): faction only gates *opening* the window (Handle_OP_ShopRequest :14648-14654,
+/// which rejects at DUBIOUS+ via MerchantRejectMessage). A buy from a KOS merchant whose window is
+/// already open therefore SUCCEEDS — KOS is not a buy-refusal path.
+fn apply_shop_player_buy(gs: &mut GameState, p: &[u8]) {
+    if p.len() < 32 { return; }
+    let itemslot = u32::from_le_bytes([p[8], p[9], p[10], p[11]]);
+    let quantity = u32::from_le_bytes([p[16], p[17], p[18], p[19]]).max(1);
+    let price    = u32::from_le_bytes([p[24], p[25], p[26], p[27]]);
+
+    let msg = format!("Bought item (slot {itemslot}) x{quantity} for {price}c");
+    gs.log_msg("merchant", &msg);
+    gs.push_event("merchant", "bought", "", true, &msg);
+    tracing::info!("EQ: buy confirmed — itemslot={itemslot} qty={quantity} price={price}");
+
+    // The server HAS taken the coin (TakeMoneyFromPP). If our local snapshot can't cover the price
+    // it is already stale/drifted — spend_coin() would then deduct NOTHING and return false, which
+    // would leave `gs.coin` silently OVERSTATED. Never swallow that: the whole point of #345 is that
+    // the client must not report a balance it knows is wrong. Say so out loud (#345).
+    if !gs.spend_coin(price as u64) {
+        let warn = format!(
+            "Coin desync: server charged {price}c for the item above but our balance only showed \
+             {}p {}g {}s {}c — the real balance is lower than displayed",
+            gs.coin[0], gs.coin[1], gs.coin[2], gs.coin[3]
+        );
+        gs.log_msg("merchant", &warn);
+        gs.push_event("merchant", "coin_desync", "", true, &warn);
+        tracing::warn!("EQ: buy confirmed but local coin snapshot could not cover price={price} — coin is stale");
+    }
+}
+
+/// OP_ShopEndConfirm (server→client, 0-byte body) — EQEmu's SendMerchantEnd() (zone/client.cpp
+/// 13276-13286). For THIS client it is unambiguously a buy refusal. Every call site is either a
+/// buy-path early return — bad merchant / not-a-merchant / qty<1 / out-of-range
+/// (zone/client_packet.cpp:14151), a stale-or-removed item slot (:14194), or a negative price
+/// (:14254) — or Handle_OP_ShopEnd (:14123), which only ever runs in response to a client-sent
+/// OP_ShopEnd that eqoxide never sends (its merchant close is OP_ShopRequest with cmd=0).
+///
+/// This must NOT be gated on `merchant_open`. Handle_OP_ShopRequest returns SILENTLY, with no echo,
+/// for a non-merchant target (:14605-14607) and for an out-of-range one (:14610-14612) — so in
+/// exactly the case where this refusal is the only signal the server ever sends, `merchant_open` was
+/// never set. Gating on it would drop the one honest packet on the floor and leave the agent unable
+/// to tell "refused" from "no reply" — a quieter lie, but still a lie (#345 review).
+///
+/// Insufficient funds sends neither this nor the OP_ShopPlayerBuy echo, so the absence of BOTH still
+/// genuinely means "no reply". Silence is acceptable; a fabricated success is not.
+fn apply_shop_end_confirm(gs: &mut GameState, _p: &[u8]) {
+    gs.merchant_open = None;
+    gs.merchant_items.clear();
+    let msg = "Merchant refused the purchase (session ended)";
+    gs.log_msg("merchant", msg);
+    gs.push_event("merchant", "refused", "", true, msg);
+    tracing::info!("EQ: OP_ShopEndConfirm — merchant refused the purchase (session ended)");
+}
 
 /// OP_ShopPlayerSell (server→client echo) — confirms a sale completed. The server ENCODEs it as the
 /// RoF2 Merchant_Purchase_Struct (20 bytes): npcid @0, inventory_slot(TypelessInventorySlot_Struct —
@@ -1601,6 +1678,30 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
     // channel (tell/OOC/etc.) is not a dialogue prompt, so choices are only adopted for `say`.
     let (msg, choices) = parse_say_links(&msg);
     if chan_num == 8 && !choices.is_empty() { gs.dialogue_choices = choices; }
+
+    // Self-echo filter (#325): EQEmu broadcasts channel messages — say/ooc/shout/group/guild/
+    // auction/gmsay — back to the SENDING client too, not just other listeners in range
+    // (zone/entity.cpp's ChannelMessageSend delivery loops iterate every client including the
+    // sender, with no `client == sender` skip; confirmed against a live server). Tells are the
+    // same story via a different mechanism: the world server echoes a tell back to the sender
+    // on chan_num 14 (ChatChannel_TellEcho), NOT 7 (zone/worldserver.cpp), so a self-tell doesn't
+    // even land in the tell/ooc/... match below — without this filter it silently falls into the
+    // generic "chat" bucket as a *second*, differently formatted line.
+    //
+    // The outgoing-chat code in navigation.rs (the hail/say/dialogue-click/chat_send sites)
+    // already writes the "You say/tell/..." line into the log the moment we send, so this
+    // inbound bounce-back must never be logged or evented — logging it doubles every outgoing
+    // line, and eventing it means an agent polling /v1/events/chat receives its own outbound
+    // message as if some other player said it (agent-honesty violation). The check is keyed on
+    // sender identity, not channel number, so it catches the chan-14 tell echo along with every
+    // other self-broadcast channel uniformly.
+    let is_self_echo = !gs.player_name.is_empty()
+        && !sender.is_empty()
+        && sender.eq_ignore_ascii_case(&gs.player_name);
+    if is_self_echo {
+        tracing::debug!("chat: dropped self-echo from server (chan {chan_num}): {msg}");
+        return;
+    }
 
     // EQEmu ChatChannel: 0 guild, 2 group, 3 shout, 4 auction, 5 OOC, 6 broadcast, 7 tell,
     // 8 say, 11 gmsay. The inter-agent channels are ALSO recorded as structured chat events for
@@ -2538,6 +2639,80 @@ mod tests {
     }
 
     #[test]
+    fn apply_shop_player_buy_confirmed_echo_spends_coin_and_logs_bought() {
+        // #345: a confirmed OP_ShopPlayerBuy echo (32-byte Merchant_Sell_Struct, price@24
+        // recomputed server-side) must be the ONLY thing that deducts coin or logs "Bought item" —
+        // never the send-time code in navigation.rs. Start with 10pp (10000c) and confirm a 37c buy.
+        let mut gs = GameState::new();
+        gs.coin = [10, 0, 0, 0]; // 10 platinum = 10000 copper
+        let mut echo = [0u8; 32];
+        echo[0..4].copy_from_slice(&123u32.to_le_bytes());    // npcid
+        echo[4..8].copy_from_slice(&456u32.to_le_bytes());    // playerid
+        echo[8..12].copy_from_slice(&7u32.to_le_bytes());     // itemslot
+        echo[16..20].copy_from_slice(&1u32.to_le_bytes());    // quantity
+        echo[24..28].copy_from_slice(&37u32.to_le_bytes());   // price
+        super::apply_shop_player_buy(&mut gs, &echo);
+        let total = gs.coin[0] as u64 * 1000 + gs.coin[1] as u64 * 100 + gs.coin[2] as u64 * 10 + gs.coin[3] as u64;
+        assert_eq!(total, 10000 - 37, "confirmed buy must deduct the server-echoed price");
+        assert!(gs.messages.back().unwrap().text.contains("Bought item"),
+            "confirmed buy must log a success message: {}", gs.messages.back().unwrap().text);
+    }
+
+    #[test]
+    fn apply_shop_end_confirm_reports_refusal_with_no_merchant_session_open() {
+        // THE case that matters (#345 review): a fresh client buys from a merchant it is out of
+        // range of. Handle_OP_ShopRequest returns SILENTLY for an out-of-range/non-merchant target
+        // (zone/client_packet.cpp:14605-14612), so `merchant_open` is NEVER set; the buy then trips
+        // the same range check (:14151) and SendMerchantEnd() fires. OP_ShopEndConfirm is thus the
+        // ONLY signal the server ever sends — so it must be reported even with no session open.
+        // Gating this on `merchant_open` swallowed the refusal entirely and left the agent unable to
+        // tell "refused" from "no reply": a quieter lie, but still a lie.
+        let mut gs = GameState::new();
+        gs.coin = [10, 0, 0, 0];
+        assert_eq!(gs.merchant_open, None, "precondition: no merchant session was ever opened");
+
+        super::apply_shop_end_confirm(&mut gs, &[]);
+
+        let last = &gs.messages.back().expect("a refusal must be reported, not swallowed").text;
+        assert!(last.contains("refused"), "refusal should say so plainly: {last}");
+        assert!(!last.contains("Bought item"), "refusal must not read like a success: {last}");
+        assert!(gs.chat_events.iter().any(|e| e.kind == "refused"),
+            "a refusal must raise an event the agent can observe, even with no session open");
+        assert_eq!(gs.coin, [10, 0, 0, 0], "a refusal must never spend coin");
+    }
+
+    #[test]
+    fn apply_shop_end_confirm_ends_an_open_session_without_spending() {
+        // The same refusal arriving mid-session must also drop the stale merchant state.
+        let mut gs = GameState::new();
+        gs.coin = [10, 0, 0, 0];
+        gs.merchant_open = Some(123);
+        super::apply_shop_end_confirm(&mut gs, &[]);
+        assert_eq!(gs.merchant_open, None, "refusal ends the merchant session");
+        assert_eq!(gs.coin, [10, 0, 0, 0], "a refusal must never spend coin");
+    }
+
+    #[test]
+    fn apply_shop_player_buy_surfaces_a_coin_desync_instead_of_overstating_the_balance() {
+        // spend_coin() deducts NOTHING and returns false when the price exceeds our snapshot. The
+        // server has already taken the money (TakeMoneyFromPP), so silently ignoring that would
+        // leave `gs.coin` overstated — the client reporting a balance it knows is wrong (#345).
+        let mut gs = GameState::new();
+        gs.coin = [0, 0, 0, 5]; // 5 copper on hand
+        let mut echo = [0u8; 32];
+        echo[8..12].copy_from_slice(&7u32.to_le_bytes());   // itemslot
+        echo[16..20].copy_from_slice(&1u32.to_le_bytes());  // quantity
+        echo[24..28].copy_from_slice(&99u32.to_le_bytes()); // price 99c > 5c on hand
+
+        super::apply_shop_player_buy(&mut gs, &echo);
+
+        assert!(gs.chat_events.iter().any(|e| e.kind == "coin_desync"),
+            "an uncoverable confirmed price must be reported as a desync, not silently swallowed");
+        assert!(gs.messages.iter().any(|m| m.text.contains("Coin desync")),
+            "the desync must be visible in the message log too");
+    }
+
+    #[test]
     fn apply_shop_player_sell_parses_rof2_echo_and_removes_item() {
         // #269: the server echoes the 20-byte RoF2 Merchant_Purchase_Struct (Slot i16@4,
         // quantity@12, price@16). The old 16-byte read took quantity/price from the wrong offsets
@@ -3237,6 +3412,103 @@ mod tests {
         assert_eq!(e.category, "chat");
         assert_eq!(e.kind, "ooc");
         assert!(!e.directed);
+    }
+
+    // --- self-echo filter (#325) ---
+    //
+    // EQEmu broadcasts channel messages back to the SENDING client, not just other listeners
+    // (zone/entity.cpp ChannelMessageSend loops include the sender with no skip; confirmed
+    // live against the running server). The outgoing-chat code in navigation.rs already writes
+    // the "You say/tell/..." line into the log when we send, so this inbound bounce must be
+    // dropped entirely — it must not double the message log AND it must never surface as a
+    // /v1/events/chat event (an agent would otherwise "hear" its own outbound message as if
+    // someone else said it).
+
+    #[test]
+    fn apply_channel_message_self_say_is_dropped_entirely() {
+        let mut gs = GameState::new();
+        gs.player_name = "Mordeth".to_string();
+        super::apply_channel_message(&mut gs, &make_chan_payload("Mordeth", 8, "echo probe"));
+        assert!(gs.messages.is_empty(), "our own say bouncing back must not be logged again");
+        assert!(gs.chat_events.is_empty());
+    }
+
+    #[test]
+    fn apply_channel_message_self_shout_is_dropped_from_log_and_events() {
+        let mut gs = GameState::new();
+        gs.player_name = "Mordeth".to_string();
+        super::apply_channel_message(&mut gs, &make_chan_payload("Mordeth", 3, "shout echo"));
+        assert!(gs.messages.is_empty(), "our own shout bouncing back must not be logged again");
+        assert!(gs.chat_events.is_empty(), "our own shout must never appear as an inbound chat event");
+    }
+
+    #[test]
+    fn apply_channel_message_self_ooc_group_guild_gmsay_are_dropped() {
+        for chan in [0u32, 2, 5, 11] {
+            let mut gs = GameState::new();
+            gs.player_name = "Mordeth".to_string();
+            super::apply_channel_message(&mut gs, &make_chan_payload("Mordeth", chan, "self bounce"));
+            assert!(gs.messages.is_empty(), "chan {chan}: self bounce must not be logged");
+            assert!(gs.chat_events.is_empty(), "chan {chan}: self bounce must not be a chat event");
+        }
+    }
+
+    #[test]
+    fn apply_channel_message_self_tell_echo_chan14_is_dropped() {
+        // EQEmu echoes a tell back to the SENDER on chan_num 14 (ChatChannel_TellEcho), NOT 7
+        // (zone/worldserver.cpp: the world mutates chan_num to 14 before relaying the echo back
+        // to the sender's zone). This chan number isn't in the tell/ooc/etc. event_channel match
+        // at all, so without the self filter it would fall through to the generic "chat" bucket
+        // and log as "<Mordeth> ..." — a second, differently-formatted line for the same tell.
+        let mut gs = GameState::new();
+        gs.player_name = "Mordeth".to_string();
+        super::apply_channel_message(&mut gs, &make_chan_payload_to("Mordeth", "Katie", 14, "you stuck?"));
+        assert!(gs.messages.is_empty(), "the tell echo (chan 14) must not be logged again");
+        assert!(gs.chat_events.is_empty());
+    }
+
+    #[test]
+    fn apply_channel_message_self_tell_chan7_sender_is_us_is_dropped() {
+        // Defensive: even if a chan-7 tell packet ever arrived with US as the sender (rather
+        // than the documented chan-14 echo), the filter is keyed on sender identity, not the
+        // channel number, so it still must not be logged or evented.
+        let mut gs = GameState::new();
+        gs.player_name = "Mordeth".to_string();
+        super::apply_channel_message(&mut gs, &make_tell("Mordeth", "Katie", "hi"));
+        assert!(gs.messages.is_empty());
+        assert!(gs.chat_events.is_empty());
+    }
+
+    #[test]
+    fn apply_channel_message_self_filter_is_case_insensitive() {
+        let mut gs = GameState::new();
+        gs.player_name = "Mordeth".to_string();
+        super::apply_channel_message(&mut gs, &make_chan_payload("MORDETH", 5, "case check"));
+        assert!(gs.messages.is_empty(), "sender name case must not defeat the self filter");
+        assert!(gs.chat_events.is_empty());
+    }
+
+    #[test]
+    fn apply_channel_message_other_player_still_logs_when_player_name_unset() {
+        // Guard against an over-eager filter: before we've learned our own player_name (empty
+        // string, e.g. mid zone-transition), nothing should be treated as a self-echo.
+        let mut gs = GameState::new();
+        assert_eq!(gs.player_name, "");
+        super::apply_channel_message(&mut gs, &make_chan_payload("Garrik", 3, "hello zone"));
+        assert!(gs.messages.iter().any(|m| m.kind == "shout" && m.text == "<Garrik> hello zone"));
+    }
+
+    #[test]
+    fn apply_channel_message_other_player_same_channel_still_logged_and_evented() {
+        // Requirement 3: genuine inbound traffic from OTHER players must be unaffected by the
+        // self filter, on every channel the filter touches.
+        let mut gs = GameState::new();
+        gs.player_name = "Mordeth".to_string();
+        super::apply_channel_message(&mut gs, &make_chan_payload("Garrik", 3, "hello zone"));
+        assert!(gs.messages.iter().any(|m| m.kind == "shout" && m.text == "<Garrik> hello zone"));
+        let e = gs.chat_events.back().expect("a chat event from another player");
+        assert_eq!(e.from, "Garrik");
+        assert_eq!(e.kind, "shout");
     }
 
     #[test]

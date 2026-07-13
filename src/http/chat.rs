@@ -14,6 +14,7 @@ pub(super) fn router() -> Router<HttpState> {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TellBody { to: String, text: String }
 
 /// POST /v1/chat/tell {"to","text"} — send a directed whisper to one character (EQ /tell, chan 7).
@@ -27,6 +28,7 @@ async fn post_tell(State(s): State<HttpState>, Json(b): Json<TellBody>) -> (Stat
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TextBody { text: String }
 
 /// POST /v1/chat/ooc {"text"} — zone-wide out-of-character broadcast (chan 5).

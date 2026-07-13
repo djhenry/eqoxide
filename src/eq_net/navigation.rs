@@ -2011,17 +2011,18 @@ impl Navigator {
             buy[8..12].copy_from_slice(&slot.to_le_bytes());
             buy[16..20].copy_from_slice(&1u32.to_le_bytes()); // quantity = 1 (server sets the price)
             stream.send_app_packet(OP_SHOP_PLAYER_BUY, &buy);
-            // Deduct the cost from on-hand coin for the HUD: the server takes the money with
-            // update_client=false (Handle_OP_ShopPlayerBuy → TakeMoneyFromPP) and sends no
-            // OP_MoneyUpdate, so the displayed coin would otherwise stay stale after a purchase.
-            // spend_coin updates gs.coin directly here, which the network thread publishes every
-            // tick, so the HUD/HTTP coin stays in sync without needing a synthetic echo.
-            let price = gs.merchant_items.iter().find(|m| m.merchant_slot == slot).map(|m| m.price);
-            if let Some(p) = price {
-                gs.spend_coin(p as u64);
-            }
-            tracing::info!("EQ: shop buy — merchant_id={} slot={} qty=1 cost={}", merchant_id, slot, price.unwrap_or(0));
-            gs.log_msg("merchant", &format!("Bought item (slot {})", slot));
+            tracing::info!("EQ: shop buy sent — merchant_id={} slot={} qty=1", merchant_id, slot);
+            // No optimistic "Bought item" log and no local spend_coin here (#345, generalizing the
+            // #269 sell fix): the server can refuse — out-of-range/bad merchant/qty, a stale slot,
+            // or insufficient funds — with NO OP_ShopPlayerBuy echo at all, and the insufficient-funds
+            // case sends nothing whatsoever, so a buy can fail silently server-side. Deducting coin or
+            // logging success at send time therefore fabricates a purchase that never happened.
+            // (Note: KOS is NOT a refusal path — Handle_OP_ShopPlayerBuy has no faction check at all;
+            // faction only gates opening the window. A buy from an already-open KOS merchant succeeds.)
+            // On success the server echoes THIS SAME opcode back (Merchant_Sell_Struct, price
+            // recomputed server-side) — apply_shop_player_buy (packet_handler.rs) is the only place
+            // that may deduct coin or log "Bought item", because it's the only place that knows the
+            // buy actually succeeded.
         }
 
         // Merchant sell: open the merchant (OP_ShopRequest) then sell a player inventory slot

@@ -14,6 +14,7 @@ async fn get_camera(State(s): State<HttpState>) -> Json<CameraSnapshot> {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CameraSetBody {
     azimuth:   Option<f32>,
     elevation: Option<f32>,
