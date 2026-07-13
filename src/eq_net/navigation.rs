@@ -1764,10 +1764,22 @@ impl Navigator {
         // target_attitude so the PREVIOUS target's con can't survive a re-target (eqoxide#323).
         let target_id = self.target.lock().unwrap().take();
         if let Some(id) = target_id {
-            gs.set_target(id);
-            stream.send_app_packet(OP_TARGET_MOUSE, &build_target_packet(id));
-            stream.send_app_packet(OP_CONSIDER, &build_consider_packet(gs.player_id, id));
-            tracing::info!("EQ: target spawn_id={} + consider", id);
+            // Never adopt a spawn that isn't in the zone. POST /v1/combat/target 404s on an unknown
+            // id, but the entity could still despawn between the HTTP check and this drain — and the
+            // server silently IGNORES an OP_TargetMouse for an unknown id, so calling set_target
+            // anyway would leave the client believing in a target the server never set. Say so
+            // instead of lying. The player's own spawn is legal and is absent from `entities`. (#348)
+            if id != gs.player_id && !gs.entities.contains_key(&id) {
+                let text = format!("Cannot target spawn {id}: it is not in this zone.");
+                gs.log_msg("combat", &text);
+                gs.push_event("combat", "target_failed", "", true, &text);
+                tracing::info!("EQ: target spawn_id={} REFUSED — not in the entity list", id);
+            } else {
+                gs.set_target(id);
+                stream.send_app_packet(OP_TARGET_MOUSE, &build_target_packet(id));
+                stream.send_app_packet(OP_CONSIDER, &build_consider_packet(gs.player_id, id));
+                tracing::info!("EQ: target spawn_id={} + consider", id);
+            }
         }
 
         // Check /who all request (#300) — send OP_WhoAllRequest (server-wide, type=3); the oneshot
@@ -1901,6 +1913,11 @@ impl Navigator {
             let click = gs.inventory.iter().find(|i| i.slot == item_slot as i32)
                 .map(|i| i.click_spell_id).unwrap_or(0);
             if click == 0 {
+                // POST /v1/combat/cast validated the slot, but the item can move/vanish between the
+                // handler and this drain. Dropping it with only a tracing line meant the agent saw
+                // 200 and then nothing at all — report the failure where the agent can read it (#348).
+                let text = format!("Cannot cast: no clickable item in slot {item_slot}.");
+                gs.finish_cast(0, "cast_failed", &text);
                 tracing::info!("EQ: item cast slot={} ignored — no clicky item at that slot", item_slot);
             } else {
                 let target = req.target_id.filter(|&t| t != 0)
@@ -1910,8 +1927,9 @@ impl Navigator {
                 tracing::info!("EQ: item cast slot={} spell={} target={}", item_slot, click, target);
             }
           } else {
-            let spell_id = gs.mem_spells.get(req.gem as usize).copied().unwrap_or(0xFFFF_FFFF);
-            if spell_id != 0xFFFF_FFFF {
+            let spell_id = gs.mem_spells.get(req.gem as usize).copied()
+                .unwrap_or(crate::game_state::EMPTY_GEM);
+            if !crate::game_state::gem_is_empty(spell_id) {
                 let explicit = req.target_id.filter(|&t| t != 0);
                 let current  = gs.target_id.filter(|&t| t != 0);
                 let mut target = explicit.or(current).unwrap_or(gs.player_id);
@@ -1929,6 +1947,12 @@ impl Navigator {
                 stream.send_app_packet(OP_CAST_SPELL, &build_cast_packet(req.gem as u32, spell_id, target));
                 tracing::info!("EQ: cast gem={} spell={} target={}", req.gem, spell_id, target);
             } else {
+                // POST /v1/combat/cast now 409s on an empty gem, but the gem can be un-memorized
+                // between the handler and this drain. This arm used to be a bare `tracing::info!` —
+                // the agent got 200 and then ABSOLUTE SILENCE: no packet, no message, no event, no
+                // state change, indistinguishable from a cast still in flight. (#348)
+                let text = format!("Cannot cast: spell gem {} is empty.", req.gem);
+                gs.finish_cast(0, "cast_failed", &text);
                 tracing::info!("EQ: cast gem={} ignored — empty gem", req.gem);
             }
           }

@@ -22,6 +22,13 @@ struct TargetBody {
 
 /// POST /v1/combat/target {"id":<spawn_id>} — target the spawn and auto-consider it. The con
 /// result comes back asynchronously as an OP_Consider reply (→ message log).
+///
+/// 404s on a spawn id that isn't in the zone. It used to adopt ANY id as truth: the nav thread ran
+/// `gs.set_target(id)` unconditionally, so `/v1/observe/debug` reported `target_id: <bogus>` with a
+/// null name — a well-formed "I have a target whose name I don't know" — while the server, which
+/// silently ignores an unknown OP_TargetMouse, left the REAL target untouched. The lie then spread
+/// to every endpoint that defaults to "the current target" (/move/goto, /combat/cast,
+/// /pet/command attack). `/target/name` already 404'd; the numeric route was the hole. (#348)
 async fn post_target(
     State(s): State<HttpState>,
     body: Result<Json<TargetBody>, axum::extract::rejection::JsonRejection>,
@@ -30,6 +37,13 @@ async fn post_target(
         Ok(Json(b)) => b.id,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"id\":<spawn_id>}".into()),
     };
+    // The player's own spawn is a legal target (self-cast / F1) but is deliberately absent from the
+    // entity list — `register_spawn` skips the self-spawn (see GameState::set_target).
+    let is_self = s.player().player_id == id;
+    let known = is_self || s.entity_ids.lock().unwrap().values().any(|&v| v == id);
+    if !known {
+        return (StatusCode::NOT_FOUND, format!("no spawn with id {id} in this zone"));
+    }
     *s.target.lock().unwrap() = Some(id);
     tracing::info!("target: queued spawn_id={}", id);
     (StatusCode::OK, format!("targeting spawn {}", id))
@@ -133,6 +147,15 @@ async fn post_cast(State(s): State<HttpState>, OptionalJson(body): OptionalJson<
         return (StatusCode::BAD_REQUEST, "provide {\"gem\":0-8} or {\"spell_id\":N}".into());
     };
     if gem > 8 { return (StatusCode::BAD_REQUEST, "gem must be 0-8".into()); }
+    // An EMPTY gem is not a cast. The `spell_id` path above already refuses an un-memorized spell,
+    // but an explicit `gem` used to skip every check: this returned 200 "cast queued" and the nav
+    // drain then dropped it with a `tracing::info!` the agent cannot read — 200-then-absolute-
+    // silence, indistinguishable from a cast that is simply still in flight. 409 (like
+    // /v1/interact/read does for an unreadable slot) says so out loud. (#348)
+    if crate::game_state::gem_is_empty(mem[gem as usize]) {
+        return (StatusCode::CONFLICT,
+                format!("spell gem {gem} is empty — memorize a spell into it first"));
+    }
     *s.cast.lock().unwrap() = Some(CastRequest { gem, target_id: b.target_id, item_slot: None });
     (StatusCode::OK, format!("cast queued (gem {gem})"))
 }
@@ -245,6 +268,98 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let text = body_text(resp).await;
         assert!(text.contains("provide"), "message: {text}");
+    }
+
+    // ── #348: /combat/target must not adopt a spawn id the zone doesn't have ────────────────────
+
+    #[tokio::test]
+    async fn target_unknown_spawn_id_is_404_and_queues_nothing() {
+        // The bug: ANY id was accepted, the nav thread ran gs.set_target(id), and /observe/debug
+        // then reported `target_id: 999999` with a null name while the server (which silently
+        // ignores an unknown OP_TargetMouse) kept the REAL target. The bogus id then propagated
+        // into /move/goto, /combat/cast and /pet/command, which all default to "the target".
+        let state = empty_state();
+        state.entity_ids.lock().unwrap().insert("a rat000".into(), 7);
+        let target = state.target.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/target")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"id":999999}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND,
+            "an id that is not in the zone must be an explicit failure, not an adopted truth");
+        assert!(target.lock().unwrap().is_none(), "nothing may be queued for a bogus id");
+    }
+
+    #[tokio::test]
+    async fn target_known_spawn_id_still_works() {
+        let state = empty_state();
+        state.entity_ids.lock().unwrap().insert("a rat000".into(), 7);
+        let target = state.target.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/target")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"id":7}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(*target.lock().unwrap(), Some(7));
+    }
+
+    #[tokio::test]
+    async fn target_own_spawn_id_is_allowed() {
+        // The player's own spawn is a legal target (self-cast / F1) but is deliberately absent from
+        // the entity list, so it must be allowed explicitly or self-targeting would 404.
+        let state = empty_state();
+        set_gs(&state, |gs| gs.player_id = 42);
+        let target = state.target.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/target")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"id":42}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(*target.lock().unwrap(), Some(42));
+    }
+
+    // ── #348: /combat/cast on an EMPTY gem must fail loudly, not 200-then-silence ────────────────
+
+    #[tokio::test]
+    async fn cast_empty_gem_is_409_and_queues_nothing() {
+        // The bug: the gem path skipped every check, returned 200 "cast queued", and the nav drain
+        // then dropped it with a `tracing::info!` the agent cannot read. 200 + total silence is
+        // indistinguishable from a cast that is still in flight.
+        let state = empty_state();
+        set_gs(&state, |gs| {
+            gs.mem_spells = [crate::game_state::EMPTY_GEM; 9];
+            gs.mem_spells[0] = 202; // only gem 0 is memorized
+        });
+        let cast = state.cast.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/cast")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"gem":7}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let text = body_text(resp).await;
+        assert!(text.contains("empty"), "message must name the real cause: {text}");
+        assert!(cast.lock().unwrap().is_none(), "an empty gem must not be queued as a cast");
+    }
+
+    #[tokio::test]
+    async fn cast_memorized_gem_still_works() {
+        let state = empty_state();
+        set_gs(&state, |gs| {
+            gs.mem_spells = [crate::game_state::EMPTY_GEM; 9];
+            gs.mem_spells[2] = 202;
+        });
+        let cast = state.cast.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/cast")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"gem":2}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(cast.lock().unwrap().as_ref().map(|c| c.gem), Some(2));
     }
 
     #[tokio::test]
