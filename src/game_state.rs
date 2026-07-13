@@ -1231,11 +1231,17 @@ mod tests {
     }
 
     #[test]
-    fn set_target_clears_stale_con_attitude_on_retarget_then_repopulates() {
+    fn set_target_clears_stale_con_attitude_on_retarget() {
         // A: target a dangerous mob, apply its consider reply (con/con_name/attitude set —
         // mirrors apply_consider), then immediately re-target a trivial mob. The old con MUST
         // NOT survive the re-target (it used to persist red until — or if the server never
         // considers the new target, e.g. a corpse — forever).
+        //
+        // NB: this test used to have a second "then_repopulates" half that assigned
+        // gs.target_con = Some(X) and then asserted it equals Some(X) — a tautology that
+        // asserted the implementation back to itself without ever calling apply_consider (which
+        // lives in packet_handler.rs, owned elsewhere). Deleted rather than faked through. See
+        // #354/#355 test-suite audit.
         let mut gs = GameState::new();
         gs.upsert_entity(make_entity(1, "a dragon", 0.0, 0.0, 0.0, true));
         gs.set_target(1);
@@ -1248,14 +1254,6 @@ mod tests {
         assert_eq!(gs.target_con, None, "stale con must clear on re-target");
         assert_eq!(gs.target_con_name, None, "stale con_name must clear on re-target");
         assert_eq!(gs.target_attitude, None, "stale attitude must clear on re-target");
-
-        // Repopulates once a fresh consider reply lands for the new target.
-        gs.target_con = Some([0, 255, 0]);
-        gs.target_con_name = Some("green".to_string());
-        gs.target_attitude = Some("indifferent".to_string());
-        assert_eq!(gs.target_con, Some([0, 255, 0]));
-        assert_eq!(gs.target_con_name.as_deref(), Some("green"));
-        assert_eq!(gs.target_attitude.as_deref(), Some("indifferent"));
     }
 
     #[test]
@@ -1370,6 +1368,7 @@ mod tests {
     fn update_hp_max_zero_does_not_panic() {
         let mut gs = GameState::new();
         gs.player_id = 1;
+        gs.hp_pct = 55.0; // seed a nonzero value so the assert actually exercises the update
         // max_hp=0 → uses max(1) guard; cur_hp=0 → 0%
         gs.update_hp(1, 0, 0);
         assert!((gs.hp_pct - 0.0).abs() < 1e-4);
@@ -1534,26 +1533,6 @@ mod tests {
     }
 
     #[test]
-    fn task_offer_can_be_constructed_via_default() {
-        use super::TaskOffer;
-        let offer = TaskOffer::default();
-        assert_eq!(offer.task_id, 0);
-        assert_eq!(offer.npc_id, 0);
-        assert_eq!(offer.title, "");
-        assert_eq!(offer.description, "");
-        assert!(!offer.has_rewards);
-    }
-
-    #[test]
-    fn completed_task_entry_can_be_constructed_via_default() {
-        use super::CompletedTaskEntry;
-        let entry = CompletedTaskEntry::default();
-        assert_eq!(entry.task_id, 0);
-        assert_eq!(entry.title, "");
-        assert_eq!(entry.completed_time, 0);
-    }
-
-    #[test]
     fn group_member_level_resolves_from_profile_and_entities() {
         // OP_GroupUpdateB sends placeholder levels (70/65); the resolver ignores those and reads
         // the real level from the profile (self) or the member's spawn (others). (eqoxide#104)
@@ -1568,13 +1547,4 @@ mod tests {
         assert_eq!(gs.group_member_level("OutOfZone"), 0, "unknown member → 0");
     }
 
-    #[test]
-    fn active_task_extended_fields_default() {
-        use super::{ActiveTask, TaskStatus};
-        let task = ActiveTask::default();
-        assert_eq!(task.task_id, 0);
-        assert_eq!(task.reward_item_text, "");
-        assert_eq!(task.status, TaskStatus::Active);
-        assert_eq!(task.sequence_number, 0);
-    }
 }

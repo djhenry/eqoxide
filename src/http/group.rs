@@ -268,13 +268,25 @@ mod tests {
     #[tokio::test]
     async fn makeleader_when_not_leader_is_400() {
         let state = empty_state();
-        state.group.lock().unwrap().you_are_leader = false;
+        {
+            // Seed the target as a current member so the membership guard is satisfied and
+            // the LEADER guard is the one actually under test here — without this, the 400
+            // comes from "Sariel is not a current group member" instead. See #355 M4.
+            let mut g = state.group.lock().unwrap();
+            g.you_are_leader = false;
+            g.members.push(GroupMemberView {
+                name: "Sariel".into(), level: 8, is_leader: false, is_merc: false,
+                tank: false, assist: false, puller: false, offline: false, hp_pct: 100.0,
+            });
+        }
         let app = router().with_state(state);
         let req = Request::post("/makeleader")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"name":"Sariel"}"#)).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"only the group leader can transfer leadership");
     }
 
     #[tokio::test]
