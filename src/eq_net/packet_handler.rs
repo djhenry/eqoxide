@@ -79,7 +79,9 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_ITEM_PACKET          => apply_item_packet(gs, p),
         OP_DELETE_ITEM | OP_DELETE_CHARGE => apply_delete_item(gs, p),
         OP_SHOP_REQUEST         => apply_shop_request(gs, p),
+        OP_SHOP_PLAYER_BUY      => apply_shop_player_buy(gs, p),
         OP_SHOP_PLAYER_SELL     => apply_shop_player_sell(gs, p),
+        OP_SHOP_END_CONFIRM     => apply_shop_end_confirm(gs, p),
         OP_SHOP_END             => {
             // Server confirmed the merchant window closed.
             gs.merchant_open = None;
@@ -675,6 +677,48 @@ fn apply_looted_item(gs: &mut GameState, mut it: crate::game_state::InvItem) {
     gs.inventory.push(it);
 }
 
+
+/// OP_ShopPlayerBuy (server→client echo) — confirms a purchase completed. On success the RoF2
+/// server echoes the SAME opcode with the SAME 32-byte Merchant_Sell_Struct sent in the request
+/// (npcid@0, playerid@4, itemslot@8, unknown12@12, quantity@16, unknown20@20, price@24,
+/// unknown28@28 — common/patches/rof2_structs.h), with `quantity`/`price` recomputed server-side
+/// (zone/client_packet.cpp Handle_OP_ShopPlayerBuy). The item itself arrives separately as a plain
+/// OP_ItemPacket(Trade), already handled generically by apply_item_packet via `main_slot`.
+///
+/// On failure the server sends NO echo of this opcode at all — for a bad merchant/out-of-range/qty
+/// or a stale slot it sends OP_ShopEndConfirm instead (apply_shop_end_confirm below); for
+/// insufficient funds it sends absolutely nothing. So receipt of THIS packet is itself the success
+/// signal — there is no separate flag to check — and this is the only place allowed to deduct coin
+/// or log "Bought item" (#345, generalizing the #269 sell fix). The server takes the money with
+/// `TakeMoneyFromPP(price)` — the default `update_client=false` overload — so no OP_MoneyUpdate
+/// ever follows a buy; this handler must apply the coin change itself once confirmed.
+fn apply_shop_player_buy(gs: &mut GameState, p: &[u8]) {
+    if p.len() < 32 { return; }
+    let itemslot = u32::from_le_bytes([p[8], p[9], p[10], p[11]]);
+    let quantity = u32::from_le_bytes([p[16], p[17], p[18], p[19]]).max(1);
+    let price    = u32::from_le_bytes([p[24], p[25], p[26], p[27]]);
+    gs.spend_coin(price as u64);
+    let msg = format!("Bought item (slot {itemslot}) x{quantity} for {price}c");
+    gs.log_msg("merchant", &msg);
+    gs.push_event("merchant", "bought", "", true, &msg);
+    tracing::info!("EQ: buy confirmed — itemslot={itemslot} qty={quantity} price={price}");
+}
+
+/// OP_ShopEndConfirm (server→client, 0-byte body) — EQEmu's SendMerchantEnd() sends this whenever a
+/// merchant session ends without completing a purchase (bad merchant/out-of-range/qty, or a stale
+/// item slot removed from the server's list — Handle_OP_ShopPlayerBuy's early-return paths). It's
+/// the closest thing to an explicit "refused" signal the buy path has; insufficient funds sends
+/// neither this nor the OP_ShopPlayerBuy echo, so absence of BOTH just means "no reply" (#345).
+/// Only surface it while a merchant window is actually open, so it can't be misread outside a buy.
+fn apply_shop_end_confirm(gs: &mut GameState, _p: &[u8]) {
+    if gs.merchant_open.take().is_some() {
+        gs.merchant_items.clear();
+        let msg = "Merchant refused the purchase (session ended)";
+        gs.log_msg("merchant", msg);
+        gs.push_event("merchant", "refused", "", true, msg);
+        tracing::info!("EQ: OP_ShopEndConfirm — merchant session ended (buy refused or window closed)");
+    }
+}
 
 /// OP_ShopPlayerSell (server→client echo) — confirms a sale completed. The server ENCODEs it as the
 /// RoF2 Merchant_Purchase_Struct (20 bytes): npcid @0, inventory_slot(TypelessInventorySlot_Struct —
@@ -2407,6 +2451,43 @@ mod tests {
         assert!(gs.doors.is_empty(), "a real zone change must still purge doors (#270)");
         assert_eq!(gs.zone_name, "freporte");
         assert_eq!(gs.zone_id, 9);
+    }
+
+    #[test]
+    fn apply_shop_player_buy_confirmed_echo_spends_coin_and_logs_bought() {
+        // #345: a confirmed OP_ShopPlayerBuy echo (32-byte Merchant_Sell_Struct, price@24
+        // recomputed server-side) must be the ONLY thing that deducts coin or logs "Bought item" —
+        // never the send-time code in navigation.rs. Start with 10pp (10000c) and confirm a 37c buy.
+        let mut gs = GameState::new();
+        gs.coin = [10, 0, 0, 0]; // 10 platinum = 10000 copper
+        let mut echo = [0u8; 32];
+        echo[0..4].copy_from_slice(&123u32.to_le_bytes());    // npcid
+        echo[4..8].copy_from_slice(&456u32.to_le_bytes());    // playerid
+        echo[8..12].copy_from_slice(&7u32.to_le_bytes());     // itemslot
+        echo[16..20].copy_from_slice(&1u32.to_le_bytes());    // quantity
+        echo[24..28].copy_from_slice(&37u32.to_le_bytes());   // price
+        super::apply_shop_player_buy(&mut gs, &echo);
+        let total = gs.coin[0] as u64 * 1000 + gs.coin[1] as u64 * 100 + gs.coin[2] as u64 * 10 + gs.coin[3] as u64;
+        assert_eq!(total, 10000 - 37, "confirmed buy must deduct the server-echoed price");
+        assert!(gs.messages.back().unwrap().text.contains("Bought item"),
+            "confirmed buy must log a success message: {}", gs.messages.back().unwrap().text);
+    }
+
+    #[test]
+    fn apply_shop_end_confirm_refuses_open_session_without_spending() {
+        // A rejected buy (bad merchant/out-of-range/qty, or a stale slot) gets OP_ShopEndConfirm
+        // (0-byte body) instead of the OP_ShopPlayerBuy echo. It must close the merchant session and
+        // log a message DISTINCT from "Bought item" — never a fabricated success — and must not
+        // touch coin.
+        let mut gs = GameState::new();
+        gs.coin = [10, 0, 0, 0];
+        gs.merchant_open = Some(123);
+        super::apply_shop_end_confirm(&mut gs, &[]);
+        assert_eq!(gs.coin, [10, 0, 0, 0], "a refusal must never spend coin");
+        assert_eq!(gs.merchant_open, None, "refusal ends the merchant session");
+        let last = &gs.messages.back().unwrap().text;
+        assert!(!last.contains("Bought item"), "refusal must not read like a success: {last}");
+        assert!(last.contains("refused"), "refusal should say so plainly: {last}");
     }
 
     #[test]

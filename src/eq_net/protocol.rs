@@ -151,6 +151,13 @@ pub const OP_SHOP_REQUEST: u16 = 0x4fed;      // RoF2: OP_ShopRequest; MerchantC
 pub const OP_SHOP_PLAYER_BUY: u16 = 0x0ddd;  // RoF2: OP_ShopPlayerBuy; Merchant_Sell_Struct (buy from slot)
 pub const OP_SHOP_PLAYER_SELL: u16 = 0x791b;  // RoF2: OP_ShopPlayerSell; Merchant_Purchase_Struct (sell a player inventory slot)
 pub const OP_SHOP_END: u16 = 0x30a8;          // RoF2: OP_ShopEnd; server confirms the merchant window closed
+// Server→client, 0-byte body. EQEmu SendMerchantEnd() (zone/client.cpp) sends this whenever a
+// merchant session ends without a successful transaction: a rejected OP_ShopPlayerBuy (bad
+// merchant/out-of-range/qty, or a stale/removed item slot — zone/client_packet.cpp
+// Handle_OP_ShopPlayerBuy) as well as an ordinary close. It carries no reason text; a buy the
+// server drops entirely for insufficient funds sends NEITHER this NOR an OP_ShopPlayerBuy echo
+// (#345) — that failure is genuinely silent server-side.
+pub const OP_SHOP_END_CONFIRM: u16 = 0x3196;  // RoF2: OP_ShopEndConfirm
 
 // Move/equip/unequip an item between inventory slots.
 pub const OP_MOVE_ITEM: u16 = 0x32ee;         // RoF2: OP_MoveItem; MoveItem_Struct (from_slot,to_slot,number_in_stack)
