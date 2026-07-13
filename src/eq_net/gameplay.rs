@@ -630,8 +630,16 @@ pub fn camp_expired(current: Option<std::time::Instant>, now: std::time::Instant
 /// Publish the network thread's `GameState` for lock-free reads by the render/HTTP threads. Called
 /// once per gameplay tick, after every mutation for that tick (packet-applied and `Navigator::tick`'s
 /// own writes) has landed — see the call site in `run_gameplay_phase`.
+///
+/// Store only on a real change so the published Arc's identity is a complete activity signal: the
+/// render thread wakes on ANY network-thread mutation (inbound packet OR client-initiated request
+/// handled by `Navigator::tick`), and a genuinely idle world lets the loop sleep (see
+/// `App::poll_external` in app.rs, which drives its wake decision off `Arc::ptr_eq` against this
+/// snapshot).
 pub fn publish_snapshot(gs: &GameState, snapshot: &crate::http::GameStateSnapshot) {
-    snapshot.store(Arc::new(gs.clone()));
+    if **snapshot.load() != *gs {
+        snapshot.store(Arc::new(gs.clone()));
+    }
 }
 
 #[cfg(test)]
@@ -716,5 +724,46 @@ mod snapshot_tests {
         // A second publish replaces the snapshot wholesale.
         publish_snapshot(&gs, &snapshot);
         assert_eq!(snapshot.load().player_name, "Mutated");
+    }
+
+    /// Fix (single-owner GameState wake signal): a no-op publish (state genuinely unchanged since
+    /// the last publish) must NOT replace the Arc — the render loop's `poll_external` treats a new
+    /// Arc identity as "something happened" and would otherwise spuriously wake every tick even in
+    /// an idle world.
+    #[test]
+    fn publish_snapshot_keeps_same_arc_when_state_unchanged() {
+        let gs = GameState::new();
+        let snapshot: crate::http::GameStateSnapshot =
+            Arc::new(arc_swap::ArcSwap::from_pointee(gs.clone()));
+
+        publish_snapshot(&gs, &snapshot);
+        let before = snapshot.load_full();
+
+        // Same state, re-published (e.g. a quiet tick with no inbound packet and no client request).
+        publish_snapshot(&gs, &snapshot);
+        let after = snapshot.load_full();
+
+        assert!(Arc::ptr_eq(&before, &after), "unchanged state must not republish a new Arc");
+    }
+
+    /// Counterpart: a real mutation (standing in for either an inbound packet or a client-initiated
+    /// change made by `Navigator::tick`, e.g. `gs.sitting`) DOES publish a new Arc, and the new
+    /// snapshot reflects it.
+    #[test]
+    fn publish_snapshot_publishes_new_arc_when_state_changed() {
+        let mut gs = GameState::new();
+        let snapshot: crate::http::GameStateSnapshot =
+            Arc::new(arc_swap::ArcSwap::from_pointee(gs.clone()));
+
+        publish_snapshot(&gs, &snapshot);
+        let before = snapshot.load_full();
+
+        // Simulate a client-initiated mutation with no inbound packet (e.g. POST /v1/interact/sit).
+        gs.sitting = true;
+        publish_snapshot(&gs, &snapshot);
+        let after = snapshot.load_full();
+
+        assert!(!Arc::ptr_eq(&before, &after), "a real state change must publish a new Arc");
+        assert!(after.sitting, "the new snapshot must reflect the mutation");
     }
 }

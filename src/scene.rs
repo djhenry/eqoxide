@@ -52,7 +52,7 @@ pub struct DoorRender {
 }
 
 /// A single entry in the message log.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LogEntry {
     pub kind: String,
     pub text: String,

@@ -744,17 +744,29 @@ impl App {
     /// player input/motion in flight, easing doors/position/heading, or a queued HTTP request that a
     /// render must service (frame capture / camera).
     fn poll_external(&mut self) -> bool {
-        self.game_state_view = self.game_state_snapshot.load_full();
         let mut activity = false;
-        // NOTE: no pointer-equality check on the snapshot here. The network thread republishes
-        // unconditionally every ~10ms, so a pointer change is meaningless as an activity signal —
-        // treating it as activity would pin the render loop permanently active. Real-packet arrival
-        // is detected via the network thread's heartbeat below (#8); nav-driven self-movement and
-        // door easing are covered by the glide/door checks later in this function.
+        // `publish_snapshot` (eq_net::gameplay) only stores a new Arc into `game_state_snapshot`
+        // when the freshly-mutated `GameState` actually differs (PartialEq) from what's already
+        // published, so the Arc's pointer identity is now a COMPLETE activity signal: it covers
+        // both a real inbound packet (apply_packet) and a client-initiated mutation that produced
+        // no packet at all (e.g. Navigator::tick handling POST /v1/interact/sit, or the auto-loot
+        // session-close timer). A genuinely idle world republishes the same Arc, so this correctly
+        // lets the render loop sleep.
+        let new_view = self.game_state_snapshot.load_full();
+        if !std::sync::Arc::ptr_eq(&new_view, &self.game_state_view) {
+            activity = true;
+        }
+        self.game_state_view = new_view;
+
+        // Connection health (`connected` / CONN_STALE_SECS / the "connection lost" banner) stays
+        // strictly packet-based — it must NOT be driven by the activity signal above, which now
+        // also fires for packet-less client-initiated changes. `last_inbound_shared` is bumped only
+        // where a real inbound packet is applied (gameplay.rs's drain loop, login.rs, and the
+        // zone/world reconnect handshakes), so mirror it here purely for the elapsed-time checks
+        // further down — it does not gate `activity`.
         let new_inbound = *self.last_inbound_shared.lock().unwrap();
         if new_inbound != self.last_inbound {
             self.last_inbound = new_inbound;
-            activity = true;
         }
 
         // Still loading a zone, or a reload is queued → keep rendering the progress screen.
