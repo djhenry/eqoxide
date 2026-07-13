@@ -1236,18 +1236,42 @@ pub fn apply_mana_change(gs: &mut GameState, p: &[u8]) {
     // (the profile seed sets the true max for a rested caster at zone-in). (eqoxide#27)
     let Some((new_mana, spell_id, keepcasting)) = parse_mana_change(p) else { return };
     gs.set_mana(new_mana as i32);
-    // `keepcasting == 0` = "the cast stopped". The packet names the spell that ended, which is the
-    // only way to identify a FIZZLED spell: EQEmu decides the fizzle in DoCastSpell (zone/
-    // spells.cpp:318) before OP_BeginCast is ever sent (zone/spells.cpp:499), so gs.casting is None
-    // by the time "Your spell fizzles!" arrives. Stash it for finish_cast to consume. (eqoxide#348)
-    // (No SPELLBAR_UNLOCK check here: OP_ManaChange always carries a REAL spell id — StopCasting
-    // sends `casting_spell_id`, SendSpellBarEnable sends the spell it was called with. The sentinel
-    // only ever appears in OP_MemorizeSpell.)
-    if let (Some(spell_id), Some(0)) = (spell_id, keepcasting) {
+
+    // `keepcasting == 1` is the routine mana/endurance update (Client::CheckManaEndUpdate,
+    // zone/client.cpp:2427-2432) — regen, not a cast ending. Only 0 means "the cast stopped".
+    if keepcasting != Some(0) { return; }
+
+    // OP_ManaChange(keepcasting=0) is the server's UNIVERSAL cast-end signal: StopCasting
+    // (zone/spells.cpp:1369) and SendSpellBarEnable (zone/spells.cpp:5752) both send it, on EVERY
+    // way a cast can end — completed, interrupted, fizzled, refused, or dropped because
+    // SpellFinished returned false. So it is the terminal, deferred by one packet so a following
+    // memorize/interrupt/message can still refine WHY it ended.
+    //
+    // The server also sends it as the TAIL of an interrupt/refusal it has already explained
+    // (InterruptSpell → SendSpellBarEnable, zone/spells.cpp:1314). We reported that outcome on the
+    // earlier packet, so the trailing one must not re-arm anything — otherwise the next unnamed
+    // failure inherits the spell we just finished reporting. (eqoxide#348)
+    if gs.suppress_cast_end > 0 {
+        gs.suppress_cast_end -= 1;
+        return;
+    }
+
+    // The spell that ended. This is the only packet that names a FIZZLED spell — the fizzle is
+    // decided in DoCastSpell (zone/spells.cpp:320) before OP_BeginCast is ever sent (:450), so
+    // gs.casting is None by the time "Your spell fizzles!" arrives.
+    // (No SPELLBAR_UNLOCK check: OP_ManaChange always carries a REAL spell id — StopCasting sends
+    // `casting_spell_id`, SendSpellBarEnable sends the spell it was called with. The sentinel only
+    // ever appears in OP_MemorizeSpell.)
+    if let Some(spell_id) = spell_id {
         if !crate::game_state::gem_is_empty(spell_id) {
-            gs.ended_cast_spell = Some(spell_id);
+            gs.ended_cast_spell = Some((spell_id, std::time::Instant::now()));
         }
     }
+    // Arms the terminal only for a cast we believe is IN FLIGHT. `ResetAllCastbarCooldowns`
+    // (zone/spells.cpp:7246, reachable from Lua quest scripts) fires SendSpellBarEnable for EVERY
+    // memorized gem while the player is not casting at all — arming on those would invent a burst
+    // of phantom cast outcomes. `end_cast_unexplained` no-ops when nothing is casting.
+    gs.end_cast_unexplained();
 }
 
 pub fn apply_memorize_spell(gs: &mut GameState, p: &[u8]) {
@@ -1299,6 +1323,9 @@ pub fn apply_interrupt_cast(gs: &mut GameState, p: &[u8]) {
         _ => ("cast_interrupted", "Your spell is interrupted.".to_string()),
     };
     gs.finish_cast(0, kind, &text); // 0 = take the spell from gs.casting / the ended-cast hint
+    // InterruptSpell sends OP_InterruptCast and THEN SendSpellBarEnable (zone/spells.cpp:1299-1314).
+    // We have just reported the outcome, so ignore that trailing OP_ManaChange.
+    gs.suppress_cast_end = gs.suppress_cast_end.saturating_add(1);
 }
 
 /// A server eqstr id that means the player's cast ended badly (or never started). Returns the event
@@ -1834,6 +1861,14 @@ fn apply_simple_message(gs: &mut GameState, payload: &[u8]) {
         let text = crate::eqstr::format_id(string_id, &[])
             .unwrap_or_else(|| "Your spell failed.".to_string());
         gs.finish_cast(0, kind, &text); // finish_cast logs the line too
+        // A cast-start/mid-cast REFUSAL ("Insufficient Mana", "Spell recast time not yet met", …)
+        // is followed by StopCastSpell/InterruptSpell → SendSpellBarEnable → OP_ManaChange
+        // (zone/spells.cpp:169-241, :484-496). Ignore that trailing terminal; we just explained it.
+        // A FIZZLE is the opposite shape — its OP_ManaChange arrives BEFORE this message
+        // (StopCasting then MessageString, zone/spells.cpp:326-330) — so it must not suppress.
+        if kind == "cast_failed" {
+            gs.suppress_cast_end = gs.suppress_cast_end.saturating_add(1);
+        }
         return;
     }
     if let Some(text) = crate::eqstr::format_id(string_id, &[]) {
@@ -3631,6 +3666,91 @@ mod tests {
     }
 
     #[test]
+    fn the_manachange_trailing_an_interrupt_does_not_re_arm_the_spell_hint() {
+        // REGRESSION (PR #364 review). InterruptSpell sends OP_InterruptCast and THEN
+        // SendSpellBarEnable → OP_ManaChange (zone/spells.cpp:1299-1314). That trailing ManaChange
+        // used to RE-ARM `ended_cast_spell` *after* finish_cast had consumed it — so the next
+        // unnamed failure (a refusal, which sends no OP_BeginCast) was reported against the
+        // previous, unrelated spell. The earlier stale-hint test missed this because it never fed
+        // the trailing ManaChange.
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        super::apply_begin_cast(&mut gs, &begin_cast_pkt(42, 202, 2500));
+        super::apply_interrupt_cast(&mut gs, &interrupt_pkt(42, crate::game_state::INTERRUPT_SPELL));
+        assert_eq!(gs.last_cast.as_ref().unwrap().kind, "cast_interrupted");
+        super::apply_mana_change(&mut gs, &mana_change_pkt(90, 202, 0)); // <-- the trailing one
+        assert!(gs.ended_cast_spell.is_none(), "the trailing ManaChange must not re-arm the hint");
+        assert!(gs.pending_cast_end.is_none(), "nor arm a phantom unexplained-end");
+
+        // A later, unrelated insufficient-mana refusal: no OP_BeginCast, so nothing names the
+        // spell. It must read as UNKNOWN (0), not as the interrupted spell 202.
+        super::apply_simple_message(&mut gs, &simple_msg_pkt(199)); // INSUFFICIENT_MANA
+        let last = gs.last_cast.as_ref().unwrap();
+        assert_eq!(last.kind, "cast_failed");
+        assert_eq!(last.spell_id, 0, "must not inherit the previously interrupted spell");
+    }
+
+    #[test]
+    fn a_cast_the_server_ends_without_explaining_does_not_stick_forever() {
+        // REGRESSION (PR #364 review) — BLOCKING. When Mob::SpellFinished returns false (the common
+        // case: a beneficial buff that won't stack, zone/spells.cpp:2590 → :1744-1751),
+        // CastedSpellFinished calls StopCasting(), which sends OP_ManaChange{keepcasting=0} and
+        // NOTHING else — no memorize, no interrupt, no message. `casting` therefore hung forever
+        // and NO outcome event was ever emitted. Publishing `casting` (this PR) would have turned
+        // that into a brand-new agent-facing lie.
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        super::apply_begin_cast(&mut gs, &begin_cast_pkt(42, 202, 2500));
+        super::apply_mana_change(&mut gs, &mana_change_pkt(90, 202, 0));
+        // The cast bar clears at once — ManaChange(keepcasting=0) IS the end of the cast.
+        assert!(gs.casting.is_none(), "casting must not survive the server's cast-end signal");
+        assert!(gs.pending_cast_end.is_some(), "an unexplained end is pending, not forgotten");
+        // Within the grace window we still hope for an explaining packet, so no outcome yet.
+        gs.resolve_pending_cast_end();
+        assert!(gs.last_cast.is_none());
+        // Once it lapses with no explanation, say so out loud rather than stay silent.
+        gs.pending_cast_end = Some(std::time::Instant::now() - crate::game_state::CAST_END_GRACE);
+        gs.resolve_pending_cast_end();
+        let last = gs.last_cast.as_ref().expect("an unexplained end is still an outcome");
+        assert_eq!(last.kind, "cast_failed");
+        assert_eq!(last.spell_id, 202, "OP_ManaChange named the spell that ended");
+        assert_eq!(event_kinds(&gs), ["cast_begin", "cast_failed"]);
+    }
+
+    #[test]
+    fn an_explaining_packet_inside_the_grace_window_wins_over_the_unexplained_end() {
+        // The deferral must not fire for a NORMAL completion: SpellFinished sends
+        // SendSpellBarEnable (ManaChange) at zone/spells.cpp:1817 and MemorizeSpell(3) at :1824 —
+        // ManaChange arrives FIRST. The memorize that follows must refine the pending end into
+        // "completed", not race it into a bogus "did not take hold".
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        super::apply_begin_cast(&mut gs, &begin_cast_pkt(42, 202, 2500));
+        super::apply_mana_change(&mut gs, &mana_change_pkt(90, 202, 0));
+        super::apply_memorize_spell(&mut gs, &memorize_pkt(0, 202, 3));
+        assert!(gs.pending_cast_end.is_none(), "the memorize consumed the pending end");
+        gs.resolve_pending_cast_end(); // must be a no-op now
+        assert_eq!(event_kinds(&gs), ["cast_begin", "cast_completed"]);
+    }
+
+    #[test]
+    fn a_castbar_cooldown_reset_burst_does_not_invent_cast_outcomes() {
+        // Client::ResetAllCastbarCooldowns (zone/spells.cpp:7246, callable from Lua quest scripts)
+        // fires SendSpellBarEnable — i.e. OP_ManaChange{keepcasting=0} — for EVERY memorized gem
+        // while the player is not casting at all. Arming the terminal on those would emit a burst
+        // of phantom cast_failed events.
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        for spell in [202u32, 203, 204] {
+            super::apply_mana_change(&mut gs, &mana_change_pkt(300, spell, 0));
+        }
+        gs.pending_cast_end = gs.pending_cast_end.map(|_| std::time::Instant::now() - crate::game_state::CAST_END_GRACE);
+        gs.resolve_pending_cast_end();
+        assert!(gs.last_cast.is_none(), "no cast was in flight — inventing an outcome is a lie");
+        assert!(event_kinds(&gs).is_empty());
+    }
+
+    #[test]
     fn spellbar_unlock_sentinel_is_not_a_completed_cast_but_spell_700_still_is() {
         // SPELLBAR_UNLOCK is 0x2bc = 700, which is ALSO a legal spell id. Rejecting the value
         // outright would silently swallow a real completion of spell 700 (a lie by omission);
@@ -3645,6 +3765,25 @@ mod tests {
         super::apply_memorize_spell(&mut gs, &memorize_pkt(0, 700, 3));
         assert_eq!(event_kinds(&gs), ["cast_begin", "cast_completed"]);
         assert_eq!(gs.last_cast.as_ref().unwrap().spell_id, 700);
+    }
+
+    #[test]
+    fn a_stale_spell_hint_expires_rather_than_mis_naming_a_later_failure() {
+        // The suppression counter only cancels the ManaChange that TRAILS an outcome we reported.
+        // A cooldown-reset burst emits ManaChange(keepcasting=0) with no outcome at all, leaving a
+        // hint armed indefinitely. A refusal minutes later carries no spell id of its own, so an
+        // un-expiring hint would name it after whatever that burst last mentioned. 0 (unknown) is
+        // the only honest answer.
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        super::apply_mana_change(&mut gs, &mana_change_pkt(300, 202, 0)); // cooldown-reset burst
+        // Age the hint past its freshness window.
+        gs.ended_cast_spell = gs.ended_cast_spell
+            .map(|(id, _)| (id, std::time::Instant::now() - crate::game_state::CAST_HINT_FRESH));
+        super::apply_simple_message(&mut gs, &simple_msg_pkt(236)); // SPELL_RECAST, names no spell
+        let last = gs.last_cast.as_ref().unwrap();
+        assert_eq!(last.kind, "cast_failed");
+        assert_eq!(last.spell_id, 0, "a stale hint must expire, not become a plausible-looking lie");
     }
 
     #[test]

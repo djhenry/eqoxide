@@ -83,8 +83,24 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             // internally and published NOWHERE — an agent could not tell a spell that landed from
             // one that fizzled, was interrupted, or never started. The same transitions are pushed
             // onto /v1/events/combat as they happen.
-            "casting":     player.casting,
-            "last_cast":   player.last_cast,
+            //
+            // `elapsed_ms` / `ago_secs` are measured HERE, at read time — not when PlayerState was
+            // published. The render loop that publishes PlayerState sleeps on an idle world (#343),
+            // so an age baked in at publish time would freeze at a stale value while `connected`
+            // still reported true. An age is only true at the moment it is read.
+            "casting":     player.casting.as_ref().map(|c| serde_json::json!({
+                "spell_id":   c.spell_id,
+                "spell_name": c.spell_name,
+                "cast_ms":    c.cast_ms,
+                "elapsed_ms": c.started.elapsed().as_millis() as u64,
+            })),
+            "last_cast":   player.last_cast.as_ref().map(|o| serde_json::json!({
+                "spell_id":   o.spell_id,
+                "spell_name": o.spell_name,
+                "outcome":    o.outcome,
+                "text":       o.text,
+                "ago_secs":   o.at.elapsed().as_secs(),
+            })),
         },
         // Per-phase frame timings (ms, EMA-smoothed); all zero unless --profile / EQ_PROFILE=1.
         "frame_profile": player.frame_profile,
