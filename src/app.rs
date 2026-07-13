@@ -786,8 +786,8 @@ impl App {
         }
 
         // Visual position still gliding toward the logical (server-authoritative) position.
-        let dx = self.game_state.player_x - self.visual_player_pos[0];
-        let dy = self.game_state.player_y - self.visual_player_pos[1];
+        let dx = self.game_state_view.player_x - self.visual_player_pos[0];
+        let dy = self.game_state_view.player_y - self.visual_player_pos[1];
         if dx * dx + dy * dy > 0.01 { activity = true; }
 
         // Heading still smoothing toward its target.
@@ -926,7 +926,7 @@ impl App {
         // Nav steps fire every 150 ms; we latch "moving" for 250 ms so the
         // walking animation runs continuously between steps rather than flickering.
         {
-            let lp = [self.game_state.player_x, self.game_state.player_y, self.game_state.player_z];
+            let lp = [self.game_state_view.player_x, self.game_state_view.player_y, self.game_state_view.player_z];
             let dx = lp[0] - self.prev_logical_pos[0];
             let dy = lp[1] - self.prev_logical_pos[1];
             let dz = lp[2] - self.prev_logical_pos[2];
@@ -948,13 +948,13 @@ impl App {
             // Priority: dead > combat swing > walking > sitting > idle. Combat and
             // movement override sitting (classic EQ stands you up when you attack or
             // move); sitting only replaces the plain idle clip. (eqoxide#53)
-            let pid = self.game_state.player_id;
-            let player_dead = self.game_state.cur_hp <= 0 && self.game_state.max_hp > 0;
-            let swinging = self.game_state.combat_anims.get(&pid)
+            let pid = self.game_state_view.player_id;
+            let player_dead = self.game_state_view.cur_hp <= 0 && self.game_state_view.max_hp > 0;
+            let swinging = self.game_state_view.combat_anims.get(&pid)
                 .map_or(false, |(_, t)| t.elapsed() < crate::scene::COMBAT_SWING_WINDOW);
             self.scene.player_action = if player_dead {
                 "dead".to_string()
-            } else if let Some((code, _)) = self.game_state.combat_anims.get(&pid).filter(|_| swinging) {
+            } else if let Some((code, _)) = self.game_state_view.combat_anims.get(&pid).filter(|_| swinging) {
                 format!("C{:02}", code)
             } else if self.controller.in_water {
                 // In water we always swim, never stand: the forward stroke (P06 "swim") while moving,
@@ -964,7 +964,7 @@ impl App {
                 if self.last_moved_at.elapsed().as_millis() < 250 { "swimming".to_string() } else { "treading".to_string() }
             } else if self.last_moved_at.elapsed().as_millis() < 250 {
                 "walking".to_string()
-            } else if self.game_state.sitting {
+            } else if self.game_state_view.sitting {
                 "sitting".to_string()
             } else {
                 "idle".to_string()
@@ -977,7 +977,7 @@ impl App {
         let should_init_cam = if self.scene.zone == "testzone" {
             !self.camera_initialized && self.gpu.is_some() && !self.loading
         } else {
-            !self.camera_initialized && self.game_state.player_id != 0
+            !self.camera_initialized && self.game_state_view.player_id != 0
         };
         if should_init_cam {
             self.visual_player_pos = self.scene.player_pos;
@@ -1204,7 +1204,7 @@ impl App {
                 if let Some(c) = self.collision.as_deref() {
                     // Keep the fall-through guard's threshold current with the zone's underworld
                     // floor (from OP_NewZone), so a collision gap can't drop us below it (#150).
-                    self.controller.set_underworld(self.game_state.zone_underworld);
+                    self.controller.set_underworld(self.game_state_view.zone_underworld);
                     self.controller.step(intent, dt, c);
                 }
             }
@@ -1214,10 +1214,6 @@ impl App {
             self.visual_player_pos = cpos;
             self.scene.player_pos  = cpos;
             self.camera.focus      = cpos;
-            // Mirror into the render GameState so HUD/picking/distance see the live position.
-            self.game_state.player_x = cpos[0];
-            self.game_state.player_y = cpos[1];
-            self.game_state.player_z = cpos[2];
             if self.on_ground { self.last_grounded_z = cpos[2]; }
 
             // Heading for nav-driven movement: face the planner's wish_dir (the render gs heading is

@@ -1,25 +1,15 @@
-# Progress ledger — group-management
+# Progress ledger — gamestate-single-owner-snapshot
 
-Plan: docs/superpowers/plans/2026-07-01-group-management.md
-Spec: docs/superpowers/specs/2026-07-01-group-management-design.md
-Worktree: .claude/worktrees/group-management (branch worktree-group-management)
-Baseline: cargo build OK; cargo test --lib 366 passed, 0 failed
+Plan: docs/superpowers/plans/2026-07-12-gamestate-single-owner-snapshot.md
+Worktree: .claude/worktrees/gamestate-single-owner-snapshot (branch worktree-gamestate-single-owner-snapshot)
+Baseline: cargo build OK; cargo test 526 passed, 0 failed, 17 ignored (base commit 7de68b9)
 
 ## Tasks
-- [x] Task 1: complete (commits 562c0f1..86d0ee6, review clean — minor: 2 unused-import warnings inherited from brief, one missing symmetric test on disband_other name2-match branch, not blocking)
-- [x] Task 2: complete (commits 86d0ee6..a1014f7, review clean — minor: duplicated name-copy pattern across 4 builders, not blocking)
-- [x] Task 3: complete (commits a1014f7..48af69b, review clean — minor: untrimmed name storage on invite/kick/makeleader, cosmetic field alignment, not blocking; main.rs intentionally left non-compiling pending Task 4)
-- [x] Task 4: complete (commits 48af69b..0f4382b, review clean — argument-order trace for group_invite/group_kick/group_make_leader verified across all 9 call sites, no swaps; 2 pre-existing Task-1 compiler warnings noted, not blocking)
-- [x] Task 5: complete (commits 0f4382b..dc24efb, review clean — no egui smoke test but matches existing convention, not blocking)
-- [x] Task 6: complete. Live two-character validation (Korgath+Lyrica, qeynos) against a running
-  EQEmu server. Found and fixed a real bug: `OP_GroupDisband` (0x4c10) client→server struct was
-  128 bytes, but the live server requires 148 bytes — server logged
-  `Wrong size on incoming [OP_GroupDisband] ... Got [128], expected [148]` and silently dropped
-  leave/decline/kick packets (no crash, no roster change). Fixed `build_group_disband()` in
-  `src/eq_net/navigation.rs` to emit 148 bytes; updated its unit test and
-  `docs/eq-technical-knowledgebase/group-protocol.md` (which had wrongly inferred 128 bytes via
-  static analysis). Re-verified live post-fix: invite/accept, decline, non-leader leave, kick,
-  and leader-leave-with-<3-members-disbands all PASS on both sides' rosters. Makeleader handoff
-  itself confirmed working (no disband at transfer); the narrower claim "no disband on a
-  subsequent leave once handed off, with 3+ members remaining" could not be exercised — only 2
-  live characters were available this session. Full detail: `.superpowers/sdd/task-6-report.md`.
+- [x] Task 1: complete (commits 7de68b9..a229a64, review clean — minor: report cited game_state.rs:308 for the Clone derive vs actual 309, immaterial. NOTE: implementer subagent initially committed d7c57a6 directly to the shared main checkout by mistake; recovered via cherry-pick onto this branch as a229a64 and `git reset --hard origin/main` on the main checkout, both done with explicit user confirmation.)
+- [x] Task 2: complete (commits a229a64..96e1542, review clean/Approved — Important (tracked, not blocking): brief's Step 8 live-client + profiler glance (confirm publish_snapshot's ~100Hz GameState deep-clone isn't costing meaningfully in the 10ms tick budget) was not performed, since this task changes no observable behavior. DEFERRED to Task 3's manual verification, the next task with an actual live-client touchpoint — check tick cadence/CPU there before marking Task 3 done. NOTE: implementer subagent's edits landed correctly but it was interrupted before self-verifying/committing/reporting; controller (this session) independently re-verified cargo build/test and committed.)
+- [x] Task 3: complete (commits 96e1542..feea31d, review clean/Approved, 0 findings. Step 0 zone_changed audit confirmed safe: App's zone-reload trigger already compares self.scene.zone vs self.current_zone, never reads zone_changed; scene build stays on self.game_state until Task 4 per plan. Deferred Task 2 profiler glance on publish_snapshot's per-tick cost: not independently measured — live run showed steady 377-384fps with no stutter (render thread signal, not network thread's ~100Hz clone cost); still formally unverified, not blocking. Manual live-client check performed against real EQEmu server: zone render, HUD, target round-trip via HTTP observe API all confirmed; F10 overlay keypress + mouse-click picking could not be interactively verified (no Wayland input injection in sandbox) but underlying data paths were confirmed instead — disclosed, not a gap.)
+- [x] Task 4: complete (commits feea31d..4d44d78, review clean/Approved, 0 findings. Brief said 10 scene.rs test call sites; actual was 14 (4 extra `&sample_state())` sites) — verified as a necessary signature-change consequence, not a shortcut. Unplanned fix disclosed + verified: switching scene-build to game_state_view broke --testzone mode (no network thread ever publishes into the snapshot there) — fixed by seeding game_state_snapshot once inside App::new's existing testzone_mode block; confirmed no-op on the live-server path. Door-click animation behavior (eases ~0.5s, spawn-open renders open immediately) unit-tested + code-inspected but NOT interactively verified against a live server — sandbox has no route to jimbo.lan and testzone has no doors. Still an open verification gap, watch for it if a live-client session becomes available before final review.)
+- [x] Task 5: complete (build clean, 530 lib tests pass. Investigated the brief's cadence assumption: confirmed by code trace, not just reading — the network thread's `stream_position` (eq_net/navigation.rs) mirrors the render controller's own `view.pos` into `gs.player_x/y/z` unconditionally every network tick (independent of the 280ms actual OP_ClientUpdate send-to-server gate), and `view.pos` is itself published by the render thread every frame. So `game_state_view.player_x/y/z` tracks the local controller with ~1 tick of latency during WASD — smooth enough for the `nav_dist > 0.01` gate. No velocity-gated alternative needed; brief's Step 2 applied verbatim. Diff matches the brief's 5 steps exactly, no extra edits (see task-5-report.md for a discarded testzone-specific fix I tried, then reverted after live-testing `--testzone` mode via `/v1/move/manual` showed it never builds collision, so `controller.step` never runs there and player position is static regardless — a pre-existing testzone limitation, not something Task 5 touches). Could not exercise the live-server WASD/goto/GM-teleport acceptance test end-to-end — sandbox still has no route to jimbo.lan and local EQEmu containers are stopped; confidence rests on the code-path trace above plus the empirical testzone probe.)
+- [ ] Task 6: Delete the redundant local target echo
+- [ ] Task 7: Delete the redundant local door-click log echo
+- [ ] Task 8: Remove the dual-GameState system
