@@ -13,6 +13,7 @@ pub(super) fn router() -> Router<HttpState> {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TradeOpenBody {
     /// Merchant NPC name (fuzzy-matched, like /merchant/buy).
     merchant: String,
@@ -64,6 +65,7 @@ async fn get_trade_list(State(s): State<HttpState>) -> Json<serde_json::Value> {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BuyBody {
     /// Merchant NPC name (fuzzy-matched, like /combat/target/name).
     merchant: String,
@@ -97,6 +99,7 @@ async fn post_buy(
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SellBody {
     /// Merchant NPC name (fuzzy-matched, like /merchant/buy).
     merchant: String,
@@ -131,5 +134,50 @@ async fn post_sell(
             (StatusCode::OK, format!("selling slot {} x{} to {} (spawn_id={})", b.slot, qty, clean_entity_name(&key), id))
         }
         None => (StatusCode::NOT_FOUND, format!("no merchant matching {:?}", b.merchant)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+    use crate::http::quests::tests::empty_state;
+
+    fn seed_merchant(state: &crate::http::HttpState, key: &str, id: u32) {
+        state.entity_ids.lock().unwrap().insert(key.to_string(), id);
+    }
+
+    /// eqoxide#341: a typo'd key ("quantitiy" instead of "quantity") must 400 — not be silently
+    /// ignored by serde (leaving `quantity` at its default `None`, which `post_sell` then treats as
+    /// "caller omitted it" and defaults to selling quantity=1).
+    #[tokio::test]
+    async fn sell_unknown_key_is_400_and_does_not_queue() {
+        let state = empty_state();
+        seed_merchant(&state, "Innkeeper_Beek000", 11);
+        let sell = state.sell.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/sell")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"merchant":"Beek","slot":23,"quantitiy":5}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(sell.lock().unwrap().is_none(),
+            "a typo'd key must not silently fall through to selling with quantity defaulted to 1");
+    }
+
+    #[tokio::test]
+    async fn sell_valid_body_still_queues() {
+        let state = empty_state();
+        seed_merchant(&state, "Innkeeper_Beek000", 11);
+        let sell = state.sell.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/sell")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"merchant":"Beek","slot":23,"quantity":5}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(*sell.lock().unwrap(), Some((11, 23, 5)));
     }
 }

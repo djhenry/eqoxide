@@ -78,6 +78,7 @@ async fn get_offers(State(s): State<HttpState>) -> Json<serde_json::Value> {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TaskIdBody { task_id: u32 }
 
 /// POST /v1/quests/accept {"task_id":N} — accept one offered task from an open selector window.

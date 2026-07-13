@@ -22,6 +22,7 @@ pub(super) fn router() -> Router<HttpState> {
 }
 
 #[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct ManualBody {
     /// World movement direction, matching `/v1/observe/debug` `pos`: `east` = +server_x (= pos.x),
     /// `north` = +server_y (= pos.y) — the zone-wide EQ convention used everywhere in the client.
@@ -73,6 +74,7 @@ async fn post_jump(State(s): State<HttpState>) -> (StatusCode, String) {
 }
 
 #[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct MoveBody {
     name:  Option<String>,
     /// Map coordinates (Brewall .txt values) = negated server x/y. goto only.
@@ -227,6 +229,7 @@ async fn post_stop(State(s): State<HttpState>) -> (StatusCode, String) {
 }
 
 #[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct ZoneCrossBody {
     /// Destination zone id to cross to. Omit (or 0) to take the nearest zone line. Deliberately
     /// wider than the wire `u16` zone id so an out-of-range value (e.g. 99999) parses as a normal
@@ -474,6 +477,24 @@ mod tests {
         }
     }
 
+    /// eqoxide#341: a typo'd key ("zone_idd" instead of "zone_id") must 400 — not be silently
+    /// ignored by serde (leaving `zone_id` at its default `None`/0) and fall through to walking to
+    /// the nearest zone line.
+    #[tokio::test]
+    async fn zone_cross_unknown_key_is_400_and_does_not_queue() {
+        let state = empty_state();
+        state.zone_points.lock().unwrap().extend([zp(1), zp(2), zp(38)]);
+        let zc = state.zone_cross.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/zone_cross")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"zone_idd":2}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(zc.lock().unwrap().is_none(),
+            "a typo'd key must not silently fall through to walking to the nearest zone line");
+    }
+
     // --- goto: a malformed body must not silently fall back to "current target" ----------------
 
     #[tokio::test]
@@ -490,6 +511,25 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST,
             "a malformed field must 400, not fall through to the current-target default");
+        assert!(goto_target.lock().unwrap().is_none());
+    }
+
+    /// eqoxide#341: a typo'd key ("nmae" instead of "name") must 400 — not be silently ignored by
+    /// serde (leaving `name` at its default `None`) and fall through to the current-target default.
+    #[tokio::test]
+    async fn goto_unknown_key_is_400_not_silently_defaulted() {
+        let state = empty_state();
+        state.entity_ids.lock().unwrap().insert("a_rat00".into(), 42);
+        state.entity_positions.lock().unwrap().insert("a_rat00".into(), (10.0, 20.0, 3.0));
+        state.player_info.lock().unwrap().target_id = Some(42);
+        let goto_target = state.goto_target.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"nmae":"a rat"}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST,
+            "a typo'd key must 400, not fall through to the current-target default");
         assert!(goto_target.lock().unwrap().is_none());
     }
 
