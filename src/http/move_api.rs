@@ -127,7 +127,7 @@ fn resolve_name(
             .map(|(k, &p)| (k.clone(), p)))
 }
 
-/// Resolve the player's current target (`player_info.target_id`) to its (key, position).
+/// Resolve the player's current target (the player's `target_id`) to its (key, position).
 /// Returns `Err((status, msg))` when there is no target, or the target isn't in the live tables.
 fn resolve_current_target(
     target_id: Option<u32>,
@@ -165,7 +165,7 @@ async fn post_goto(
         (x, y, z)
     } else {
         // No name/coords → default to the player's current target (one-time snapshot).
-        let target_id = s.player_info.lock().unwrap().target_id;
+        let target_id = s.player().target_id;
         let ids = s.entity_ids.lock().unwrap();
         let positions = s.entity_positions.lock().unwrap();
         match resolve_current_target(target_id, &ids, &positions) {
@@ -202,7 +202,7 @@ async fn post_follow(
             None => return (StatusCode::NOT_FOUND, format!("No entity named {name:?}")),
         }
     } else {
-        let target_id = s.player_info.lock().unwrap().target_id;
+        let target_id = s.player().target_id;
         let ids = s.entity_ids.lock().unwrap();
         let positions = s.entity_positions.lock().unwrap();
         match resolve_current_target(target_id, &ids, &positions) {
@@ -307,7 +307,7 @@ mod tests {
     use std::collections::HashMap;
     use tower::ServiceExt;
     use crate::game_state::ZonePoint;
-    use crate::http::quests::tests::empty_state;
+    use crate::http::quests::tests::{empty_state, set_gs};
 
     async fn body_text(resp: axum::response::Response) -> String {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -502,7 +502,7 @@ mod tests {
         let state = empty_state();
         // A current target IS set — under the old Option<Json<T>> bug this is exactly the
         // "meaningful default" a malformed body would silently fall through to.
-        state.player_info.lock().unwrap().target_id = Some(42);
+        set_gs(&state, |gs| gs.target_id = Some(42));
         let goto_target = state.goto_target.clone();
         let app = router().with_state(state);
         let req = Request::post("/goto")
@@ -521,7 +521,7 @@ mod tests {
         let state = empty_state();
         state.entity_ids.lock().unwrap().insert("a_rat00".into(), 42);
         state.entity_positions.lock().unwrap().insert("a_rat00".into(), (10.0, 20.0, 3.0));
-        state.player_info.lock().unwrap().target_id = Some(42);
+        set_gs(&state, |gs| gs.target_id = Some(42));
         let goto_target = state.goto_target.clone();
         let app = router().with_state(state);
         let req = Request::post("/goto")
@@ -538,7 +538,7 @@ mod tests {
         let state = empty_state();
         state.entity_ids.lock().unwrap().insert("a_rat00".into(), 42);
         state.entity_positions.lock().unwrap().insert("a_rat00".into(), (10.0, 20.0, 3.0));
-        state.player_info.lock().unwrap().target_id = Some(42);
+        set_gs(&state, |gs| gs.target_id = Some(42));
         let goto_target = state.goto_target.clone();
         let app = router().with_state(state);
         let resp = app.oneshot(Request::post("/goto").body(Body::empty()).unwrap()).await.unwrap();
@@ -555,7 +555,7 @@ mod tests {
         state.entity_positions.lock().unwrap().insert("a_rat00".into(), (10.0, 20.0, 3.0));
         // A current target IS set — the old Option<Json<T>> bug would silently chase IT instead of
         // reporting the malformed "name" field.
-        state.player_info.lock().unwrap().target_id = Some(42);
+        set_gs(&state, |gs| gs.target_id = Some(42));
         let goto_entity = state.goto_entity.clone();
         let goto_target = state.goto_target.clone();
         let app = router().with_state(state);
@@ -574,7 +574,7 @@ mod tests {
         let state = empty_state();
         state.entity_ids.lock().unwrap().insert("a_rat00".into(), 42);
         state.entity_positions.lock().unwrap().insert("a_rat00".into(), (10.0, 20.0, 3.0));
-        state.player_info.lock().unwrap().target_id = Some(42);
+        set_gs(&state, |gs| gs.target_id = Some(42));
         let goto_entity = state.goto_entity.clone();
         let app = router().with_state(state);
         let resp = app.oneshot(Request::post("/follow").body(Body::empty()).unwrap()).await.unwrap();

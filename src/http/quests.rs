@@ -20,7 +20,7 @@ pub(super) fn router() -> Router<HttpState> {
 /// they want (turn-in items), and reward XP. Combine with /v1/observe/entities + /v1/move/goto
 /// to walk to a giver and /v1/interact/give to hand in. See docs/autonomous-play.md.
 async fn get_givers(State(s): State<HttpState>) -> Json<serde_json::Value> {
-    let player = s.player_info.lock().unwrap().clone();
+    let player = s.player();
     let zone = player.zone.clone();
     let (px, py) = (player.pos_east, player.pos_north);
     let live: HashMap<String, (f32, f32, f32)> = s.entity_positions.lock().unwrap().iter()
@@ -137,6 +137,22 @@ pub(crate) mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
+    /// An `Instant` `secs` in the past (saturating — a just-booted host can't go below its epoch).
+    pub(crate) fn ago(secs: u64) -> std::time::Instant {
+        std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(secs))
+            .expect("monotonic clock older than the test window")
+    }
+
+    /// Mutate the network thread's published `GameState` — the single source of truth every
+    /// agent-facing player field is projected from (#343). Tests that used to poke `player_info`
+    /// directly now seed the snapshot the network thread would have published.
+    pub(crate) fn set_gs(state: &HttpState, f: impl FnOnce(&mut crate::game_state::GameState)) {
+        let mut gs = (**state.game_state.load()).clone();
+        f(&mut gs);
+        state.game_state.store(Arc::new(gs));
+    }
+
     pub(crate) fn empty_state() -> HttpState {
         HttpState {
             cmd_tx: Arc::new(Mutex::new(None)),
@@ -183,7 +199,9 @@ pub(crate) mod tests {
             chat_events: Arc::new(Mutex::new(Vec::new())),
             chat_send: Arc::new(Mutex::new(Vec::new())),
             spells: std::sync::Arc::new(crate::spells::SpellDb::default()),
-            player_info: Arc::new(Mutex::new(PlayerState::default())),
+            game_state: Arc::new(arc_swap::ArcSwap::from_pointee(crate::game_state::GameState::new())),
+            net_health: Arc::new(Mutex::new(crate::http::NetHealth::default())),
+            frame_profile: Arc::new(Mutex::new(crate::profiling::FrameProfile::default())),
             task_log: Arc::new(Mutex::new(Vec::new())),
             task_offers_shared: Arc::new(Mutex::new(Vec::new())),
             completed_tasks_shared: Arc::new(Mutex::new(Vec::new())),
