@@ -242,7 +242,6 @@ OPTIONS:
     eqoxide::spells::set_global(spells.clone());
     let shared_collision: assets::SharedCollision = Arc::new(std::sync::RwLock::new(None));
     let frame_req:        http::FrameReq        = Arc::new(Mutex::new(None));
-    let player_info:      http::PlayerInfo      = Arc::new(Mutex::new(http::PlayerState::default()));
     // Single-owner GameState snapshot (see
     // docs/superpowers/plans/2026-07-12-gamestate-single-owner-snapshot.md). The network thread is
     // the sole writer of GameState; it publishes here every tick. `last_inbound` is a separate,
@@ -250,8 +249,14 @@ OPTIONS:
     // health (a hung network thread stops updating it even though nothing else changes).
     let game_state_snapshot: http::GameStateSnapshot =
         Arc::new(arc_swap::ArcSwap::from_pointee(eqoxide::game_state::GameState::new()));
-    let last_inbound_shared: http::LastInboundShared =
-        Arc::new(Mutex::new(std::time::Instant::now()));
+    // The network thread's three liveness clocks (link / application packet / gameplay tick). The
+    // HTTP layer turns them into `connected`, `last_packet_age_ms` and `snapshot_age_ms` at READ
+    // time, so a frozen world can never masquerade as a live one (#343).
+    let net_health_shared: http::NetHealthShared =
+        Arc::new(Mutex::new(http::NetHealth::default()));
+    // Render-owned frame timings — the one agent-visible value the render loop publishes (#343).
+    let frame_profile_shared: http::FrameProfileShared =
+        Arc::new(Mutex::new(eqoxide::profiling::FrameProfile::default()));
     // Single-authority movement (Component A): the render thread owns the CharacterController and
     // publishes `controller_view`; the nav thread streams it and writes `nav_intent` for /goto;
     // `pos_correction` hands a server correction back to the controller.
@@ -337,12 +342,12 @@ OPTIONS:
         let gld = guild.clone();
         let gla = guild_action.clone();
         let gss = game_state_snapshot.clone();
-        let lis = last_inbound_shared.clone();
+        let nh  = net_health_shared.clone();
         let md  = data_dir.join("maps");
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, 10, gt, nst, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, wr, fl, fq, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, pcm, sc, md, sd, cp, cu, rsp, cv, ni, pc, npv, nav, rb, gld, gla, gss, lis).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, 10, gt, nst, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, wr, fl, fq, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, pcm, sc, md, sd, cp, cu, rsp, cv, ni, pc, npv, nav, rb, gld, gla, gss, nh).await {
                     tracing::error!("EQ: fatal: {e}");
                 }
             });
@@ -386,7 +391,7 @@ OPTIONS:
     };
     let app_spells  = spells.clone();
     let app_door_click = door_click.clone();
-    let app_player_info = player_info.clone();
+    let app_frame_profile = frame_profile_shared.clone();
     // --api-port N: bind exactly N now and FAIL THE LAUNCH if it's taken (don't open a window with
     // a dead API). The bound listener is handed to the server thread so there's no re-bind race.
     // Without --api-port, pass None and let the server scan upward from the config base port.
@@ -438,7 +443,9 @@ OPTIONS:
         chat_events,
         chat_send,
         spells.clone(),
-        player_info,
+        game_state_snapshot.clone(),
+        net_health_shared.clone(),
+        frame_profile_shared.clone(),
         task_log,
         task_offers_shared,
         completed_tasks_shared,
@@ -475,14 +482,14 @@ OPTIONS:
         camera_cmd,
         camera_snapshot,
         game_state_snapshot.clone(),
-        last_inbound_shared.clone(),
+        net_health_shared.clone(),
         frame_req,
         app_goto,
         app_actions,
         app_spells,
         app_door_click,
         shared_collision,
-        app_player_info,
+        app_frame_profile,
         testzone_mode,
         nav_debug_flag,
         shutdown.clone(),

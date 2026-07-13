@@ -331,6 +331,12 @@ pub struct EqStream {
     sent: VecDeque<Sent>,
     frags: FragmentBuffer,
     app_tx: mpsc::UnboundedSender<AppPacket>,
+    /// Wall-clock time of the last inbound **datagram** of any kind — session-layer ACKs and
+    /// keepalive replies included, not just decoded application packets. This is the only sound
+    /// "is the link alive?" signal: a genuinely idle EQ session can go tens of seconds without a
+    /// single APP packet (nothing is happening in the world) while the session layer keeps
+    /// ACKing — so app-packet silence must never be mistaken for a dead connection (#343).
+    last_datagram: std::time::Instant,
 }
 
 impl EqStream {
@@ -352,6 +358,7 @@ impl EqStream {
             recv_buf: HashMap::new(),
             sent: VecDeque::new(),
             frags: FragmentBuffer::new(),
+            last_datagram: std::time::Instant::now(),
             app_tx,
         };
 
@@ -435,7 +442,10 @@ impl EqStream {
         let mut buf = vec![0u8; 4096];
         for _ in 0..MAX_DATAGRAMS_PER_POLL {
             match self.socket.try_recv(&mut buf) {
-                Ok(n) => self.on_raw_recv(&buf[..n]),
+                Ok(n) => {
+                    self.last_datagram = std::time::Instant::now();
+                    self.on_raw_recv(&buf[..n]);
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return true,
                 Err(_) => return false,
             }
@@ -478,6 +488,9 @@ impl EqStream {
     }
 
     /// Send a keepalive response.
+    /// Time of the last inbound datagram on this session (link liveness — see `last_datagram`).
+    pub fn last_datagram(&self) -> std::time::Instant { self.last_datagram }
+
     pub fn send_keepalive(&mut self) {
         self.send_raw(OP_KEEPALIVE, &[]);
     }
@@ -863,6 +876,7 @@ pub(crate) async fn test_stream(pass1: u8, key: u32) -> (EqStream, mpsc::Unbound
         recv_buf: HashMap::new(),
         sent: VecDeque::new(),
         frags: FragmentBuffer::new(),
+        last_datagram: std::time::Instant::now(),
         app_tx: tx,
     };
     (stream, rx)
