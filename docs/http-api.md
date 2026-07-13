@@ -33,7 +33,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 
 | Route | Description |
 |-------|-------------|
-| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, target `target_id`/`target_name`/`target_hp_pct`) + camera state. |
+| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, target `target_id`/`target_name`/`target_hp_pct`) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms` — see [Connection health](#connection-health)) + camera state. |
 | `GET /v1/observe/frame` | Current rendered frame as a PNG (`Content-Type: image/png`). |
 | `GET /v1/observe/entities` | `{ "<name>": [x,y,z], ... }` for all known entities. |
 | `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency}`. Slots are Titanium **wire** ids (DB general slots 23-30 → wire 22-29). |
@@ -189,3 +189,37 @@ shape.
   for a `zone` event) to know when movement / a zone-in completed.
 - **Coordinates**: server convention is `x=east, y=north, z=up`. Brewall map coords negate x/y.
 - See `docs/autonomous-play.md` for end-to-end play recipes.
+
+---
+
+## Connection health
+
+`GET /v1/observe/debug` carries four fields that tell you **whether the rest of the payload can be
+trusted at all**. They are computed when you ask — not cached — so nothing has to be running inside
+the client for them to be right (#343).
+
+| Field | Meaning |
+|-------|---------|
+| `connected` | **Is the link up?** `false` after 15s with no inbound datagram of any kind. This is the ONLY field to use for "am I disconnected?". |
+| `link_age_ms` | ms since any inbound UDP datagram, session-layer ACKs included. `connected` is derived from this. |
+| `last_packet_age_ms` | ms since the last *world update* (an application packet). |
+| `snapshot_age_ms` | ms since the client's network thread last ticked. |
+
+**`last_packet_age_ms` is not a disconnect signal.** An idle EQ session — a character sitting alone
+in a quiet zone — routinely goes **40+ seconds with no application packet** while the link is
+perfectly healthy (the server only pushes HP/mana/position on *change*). Treating a high
+`last_packet_age_ms` as a dead connection will send an agent into a pointless reconnect loop. Read it
+as *"the world is quiet"*, and use `connected` to decide whether the link is gone.
+
+> **Changed in #343.** `connected` previously derived from application traffic and was recomputed
+> only when a frame rendered — so a dead connection (no packets → no render) reported
+> `connected: true`, frozen, forever. It now derives from link liveness, at read time.
+
+**If `snapshot_age_ms` is large, distrust the whole payload.** It means the client's own network
+thread has stopped publishing, so every other field is a stale snapshot regardless of what
+`connected` says.
+
+**Known gap:** a live socket does not prove a live *world*. EQEmu runs its stream reader/writer on
+threads separate from the zone main loop, so a wedged zone can keep ACKing — `connected: true` with a
+climbing `last_packet_age_ms` is currently indistinguishable from a merely quiet zone. Detecting that
+needs an active request/response probe (tracked separately).

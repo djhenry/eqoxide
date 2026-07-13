@@ -184,7 +184,7 @@ async fn run_login_phase(
     let (net_tx, mut net_rx) = mpsc::unbounded_channel::<AppPacket>();
 
     tracing::info!("EQ: connecting to login server {}:{}", config.login_host, config.login_port);
-    let mut stream = EqStream::connect(&config.login_host, config.login_port, net_tx.clone())
+    let mut stream = EqStream::connect(&config.login_host, config.login_port, net_tx.clone(), net_health.clone())
         .await
         .map_err(|e| format!("Login server connection failed: {e}"))?;
 
@@ -214,7 +214,7 @@ async fn run_login_phase(
                     drop(stream);
                     sleep(Duration::from_millis(100)).await;
                     tracing::info!("EQ: connecting to world {}:{}", host, port);
-                    stream = EqStream::connect(&host, port, net_tx.clone())
+                    stream = EqStream::connect(&host, port, net_tx.clone(), net_health.clone())
                         .await
                         .map_err(|e| format!("World connection failed: {e}"))?;
                     proto.on_world_connected(&mut stream);
@@ -223,7 +223,7 @@ async fn run_login_phase(
                     drop(stream);
                     sleep(Duration::from_millis(800)).await;
                     tracing::info!("EQ: connecting to zone {}:{}", host, port);
-                    stream = EqStream::connect(&host, port, net_tx.clone())
+                    stream = EqStream::connect(&host, port, net_tx.clone(), net_health.clone())
                         .await
                         .map_err(|e| format!("Zone connection failed: {e}"))?;
                     // Purge stale spawns/doors before zone entry so the OP_ZoneSpawns/OP_SpawnDoor

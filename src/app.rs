@@ -273,9 +273,10 @@ impl App {
             // nothing else will ever publish into `game_state_snapshot` — it would otherwise sit
             // on the initial `GameState::new()` default forever. Seed it here so `game_state_view`
             // (what the scene build reads) sees the debug-zone bootstrap. Since #343 this seed also
-            // backs `/v1/observe/debug` (which projects the player view straight off this snapshot),
-            // so offline mode still serves a sane name/zone — and, correctly, `connected: false`,
-            // because there is genuinely no connection.
+            // backs `/v1/observe/debug` (which projects the player view straight off this snapshot);
+            // `render_frame` then republishes it each frame with the live controller position, so
+            // offline mode reports a moving player rather than a frozen seed. `connected` is
+            // correctly false throughout — there is genuinely no connection.
             let mut gs = GameState::new();
             gs.player_name = character_name.clone();
             gs.zone_name = "testzone".to_string();
@@ -871,6 +872,22 @@ impl App {
         // loop that deliberately sleeps when no packets arrive — so a dead connection meant
         // `connected` was never recomputed and reported `true`, frozen, forever.
         *self.frame_profile_shared.lock().unwrap() = self.frame_profile;
+
+        // `--testzone` runs with NO network thread, so nothing else ever writes the GameState
+        // snapshot the API projects from — the reported position would otherwise stay frozen at
+        // App::new's seed forever (#343 review). Offline, the render loop IS the sole owner of
+        // GameState, so it publishes here. This is not a re-coupling of observation to rendering:
+        // in this mode there is no other owner, and `connected` stays honestly false (no datagram
+        // ever arrives) while `snapshot_age_ms` stays fresh.
+        if self.testzone_mode && self.camera_initialized {
+            let mut gs = (*self.game_state_view).clone();
+            gs.player_x       = self.controller.pos[0];
+            gs.player_y       = self.controller.pos[1];
+            gs.player_z       = self.controller.pos[2];
+            gs.player_heading = self.visual_heading;
+            crate::eq_net::gameplay::publish_snapshot(
+                &gs, &self.game_state_snapshot, &self.net_health);
+        }
         // Mirror the health state into the scene so the HUD can show a "connection lost" banner (#8).
         self.scene.disconnected = self.last_inbound.elapsed().as_secs() >= crate::http::CONN_STALE_SECS;
 
