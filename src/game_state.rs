@@ -5,7 +5,7 @@ use crate::scene::LogEntry;
 
 /// A zone exit point received in OP_SEND_ZONE_POINTS.
 /// Stored in EQ server convention: server_x = east, server_y = north, server_z = up.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ZonePoint {
     pub iterator:  u32,
     pub server_x:  f32,  // east  (wire field 'x')
@@ -16,7 +16,7 @@ pub struct ZonePoint {
 }
 
 /// A single entity in the zone (NPC or PC, not the player themselves).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Entity {
     pub spawn_id: u32,
     pub name: String,
@@ -61,7 +61,7 @@ impl Entity {
 
 /// A zone door (from OP_SpawnDoor). Position is stored in client convention
 /// (x = east, y = north, z = up), converted from the wire's y-first order.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Door {
     pub door_id: u8,
     pub name: String,        // model name, e.g. "DOOR1"
@@ -79,7 +79,7 @@ pub struct Door {
 
 /// One objective/step of a Task-system quest (from OP_TaskActivity). `done_count`/`goal_count`
 /// are the live progress (e.g. "kill 4 gnolls" -> goal 4, done 2).
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct TaskActivity {
     pub activity_id:   u32,
     pub activity_type: u32,
@@ -103,7 +103,7 @@ pub enum TaskStatus {
 /// A Task-system quest in the player's journal (from OP_TaskDescription + OP_TaskActivity). This is
 /// EQ's *native* quest log (server-pushed), distinct from the old-style Lua turn-in quests surfaced
 /// by tools/quest_finder.py + GET /v1/quests/givers. See docs/autonomous-play.md.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct ActiveTask {
     pub task_id:     u32,
     pub title:       String,
@@ -123,7 +123,7 @@ pub struct ActiveTask {
 /// One task offered by an open task-selector window (from `OP_TaskSelectWindow`, sent when an NPC
 /// script calls `tasksetselector` instead of auto-granting via `assigntask`). No content on this
 /// server's live scripts uses the selector path today, but the protocol path is real.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct TaskOffer {
     pub task_id: u32,
     /// The offering NPC's entity id — required by `OP_AcceptNewTask`'s `task_master_id` field.
@@ -136,7 +136,7 @@ pub struct TaskOffer {
 }
 
 /// One entry from the player's completed-task history (`OP_CompletedTasks`).
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct CompletedTaskEntry {
     pub task_id: u32,
     pub title: String,
@@ -145,7 +145,7 @@ pub struct CompletedTaskEntry {
 }
 
 /// One item in the player's inventory/equipment (decoded from OP_CharInventory / OP_ItemPacket).
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct InvItem {
     /// RoF2 wire slot id: equipment 0-22, general-inventory 23-32, cursor 33 (rof2_limits.h).
     /// Stored as-is from the server's OP_CharInventory / OP_ItemPacket main_slot field so that
@@ -196,7 +196,7 @@ pub fn bag_wire_parent(flat: i32) -> Option<(i32, u32)> {
 /// One item offered by an open merchant (decoded from OP_ItemPacket with PacketType=Merchant,
 /// sent by the server after a successful OP_ShopRequest). Drives `GET /trade/list` + the HUD
 /// merchant window. `merchant_slot` is the slot to pass to `POST /trade/buy`.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct MerchantItem {
     pub merchant_slot: u32,
     pub item_id: u32,
@@ -208,7 +208,7 @@ pub struct MerchantItem {
 }
 
 /// Active spell-cast in progress.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CastState {
     pub spell_id: u32,
     pub started: std::time::Instant,
@@ -222,7 +222,7 @@ pub struct CastState {
 /// specifically to us (a /tell to our name, a GM message, or something happening to *us*). `id` is
 /// monotonic (1-based) per session so an agent can poll `?since=<id>` without missing or re-seeing
 /// events. NPC dialogue (say channel) is NOT recorded here — it stays in `messages`.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct ChatLogEvent {
     pub id:       u64,
     pub category: String,  // "chat" | "combat" | "navigate" | "system"
@@ -304,7 +304,14 @@ pub struct WhoEntry {
 }
 
 /// All state the renderer needs for one frame.
-#[derive(Debug, Default, Clone)]
+///
+/// `PartialEq` is load-bearing: `eq_net::gameplay::publish_snapshot` compares the freshly-mutated
+/// `GameState` against the last-published snapshot and only stores a new `Arc` when it actually
+/// changed. That makes the published Arc's pointer identity a complete "did anything happen"
+/// signal — the render loop's `poll_external` (app.rs) wakes on ANY network-thread mutation
+/// (inbound packet OR a client-initiated HTTP request handled by `Navigator::tick`), and a
+/// genuinely idle world lets the event loop sleep instead of spinning.
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct GameState {
     // Player
     pub player_id: u32,
