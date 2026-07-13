@@ -2575,11 +2575,16 @@ name = "s3d_to_gltf"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
+ "dirs 5.0.1",
+ "eqoxide",
  "glam",
  "gltf",
  "image",
  "libeq_pfs",
  "libeq_wld",
+ "miniz_oxide",
+ "rand",
  "serde_json",
 ]
 

@@ -28,6 +28,7 @@ pub mod head;
 pub mod logging;
 pub mod models;
 pub mod movement;
+pub mod navmesh;
 pub mod profiling;
 pub mod pass;
 pub mod pipeline;

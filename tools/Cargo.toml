@@ -15,7 +15,20 @@ path = "src/validate_glb.rs"
 name = "diagnose_glb"
 path = "src/diagnose_glb.rs"
 
+[[bin]]
+name = "probe_normals"
+path = "src/probe_normals.rs"
+
+[[bin]]
+name = "navmesh_validate"
+path = "src/navmesh_validate.rs"
+
 [dependencies]
+eqoxide = { path = ".." }
+dirs = "5"
+blake3 = "1"
+miniz_oxide = "0.8"
+rand = "0.8"
 anyhow = "1"
 libeq_pfs = { git = "https://github.com/cjab/libeq", package = "libeq_pfs" }
 libeq_wld = { git = "https://github.com/cjab/libeq", package = "libeq_wld" }
