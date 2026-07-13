@@ -1,11 +1,13 @@
 //! `/v1/move/*` — movement: walk to a target/coords and stop, follow a target, stop, cross a zone line.
 //!
-//! NOTE (#267): endpoints that take a JSON body (`/goto`, `/manual`, `/zone_cross`, …) require the
-//! `Content-Type: application/json` header — without it axum's `Json` extractor rejects the body and
-//! the call 400s (bodyless requests like `/stop`, `/jump` are unaffected). Small agents that omit
-//! the header get a silent no-op; always send `Content-Type: application/json` with a JSON body.
+//! NOTE (#267, revised #328): `/goto`, `/manual`, `/zone_cross`, … all take an *optional* JSON body
+//! via [`OptionalJson`]. It judges "was a body sent" from the raw bytes, not the `Content-Type`
+//! header, so — unlike the old `Option<axum::Json<T>>` — a body sent without the header still gets
+//! parsed (or a clear 400) instead of being silently ignored. A body that IS present but fails to
+//! parse (bad syntax, or a field out of range like `zone_id: 99999`) always 400s naming the problem;
+//! it is never downgraded to "no body" (bodyless requests like `/stop`, `/jump` are unaffected either way).
 
-use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+use axum::{extract::State, http::StatusCode, routing::post, Router};
 use std::collections::HashMap;
 use super::*;
 
@@ -42,9 +44,9 @@ struct ManualBody {
 /// cancels) but yields to real keyboard input.
 async fn post_manual(
     State(s): State<HttpState>,
-    body: Result<Json<ManualBody>, axum::extract::rejection::JsonRejection>,
+    OptionalJson(body): OptionalJson<ManualBody>,
 ) -> (StatusCode, String) {
-    let b = body.map(|Json(b)| b).unwrap_or_default();
+    let b = body.unwrap_or_default();
     let dir = [b.east.unwrap_or(0.0), b.north.unwrap_or(0.0)];
     let up = b.up.unwrap_or(0.0).clamp(-1.0, 1.0);
     let jump = b.jump.unwrap_or(false);
@@ -145,9 +147,9 @@ fn resolve_current_target(
 /// Body: {"name":...} | {"x","y","z"} | {"map_x","map_y"} | {} (default: current target).
 async fn post_goto(
     State(s): State<HttpState>,
-    body: Option<Json<MoveBody>>,
+    OptionalJson(body): OptionalJson<MoveBody>,
 ) -> (StatusCode, String) {
-    let b = body.map(|Json(b)| b).unwrap_or_default();
+    let b = body.unwrap_or_default();
 
     let target: (f32, f32, f32) = if let Some(name) = &b.name {
         match resolve_name(name, &s.entity_positions.lock().unwrap()) {
@@ -183,9 +185,9 @@ async fn post_goto(
 /// canceled. Body: {"name":...} | {} (default: current target). Coordinates are rejected (400).
 async fn post_follow(
     State(s): State<HttpState>,
-    body: Option<Json<MoveBody>>,
+    OptionalJson(body): OptionalJson<MoveBody>,
 ) -> (StatusCode, String) {
-    let b = body.map(|Json(b)| b).unwrap_or_default();
+    let b = body.unwrap_or_default();
 
     if b.has_coords() {
         return (StatusCode::BAD_REQUEST,
@@ -226,8 +228,13 @@ async fn post_stop(State(s): State<HttpState>) -> (StatusCode, String) {
 
 #[derive(serde::Deserialize, Default)]
 struct ZoneCrossBody {
-    /// Destination zone id to cross to. Omit (or 0) to take the nearest zone line.
-    zone_id: Option<u16>,
+    /// Destination zone id to cross to. Omit (or 0) to take the nearest zone line. Deliberately
+    /// wider than the wire `u16` zone id so an out-of-range value (e.g. 99999) parses as a normal
+    /// field instead of failing the whole body — that failure used to collapse the entire request
+    /// to "no body", silently defaulting to `zone_id=0` (walk to the nearest zone line) and
+    /// returning 200 instead of rejecting the bogus id (eqoxide#328). It's range-checked below,
+    /// alongside the "no zone line to that id" check, with the same reachable-zone_ids message.
+    zone_id: Option<u32>,
     /// Route around NPC aggro range on the way to the zone line (#242). See `MoveBody`.
     avoid_aggro:  Option<bool>,
     aggro_buffer: Option<f32>,
@@ -254,14 +261,18 @@ fn reachable_zone_ids(zps: &[crate::game_state::ZonePoint]) -> Vec<u16> {
 /// exists, not that the walker can physically reach it.
 async fn post_zone_cross(
     State(s): State<HttpState>,
-    body: Option<Json<ZoneCrossBody>>,
+    OptionalJson(body): OptionalJson<ZoneCrossBody>,
 ) -> (StatusCode, String) {
-    let b = body.map(|Json(b)| b).unwrap_or_default();
+    let b = body.unwrap_or_default();
     apply_avoid_opts(&s.nav_avoid, b.avoid_aggro, b.aggro_buffer);
     let zone_id = b.zone_id.unwrap_or(0);
     if zone_id != 0 {
+        // A zone_id that doesn't fit the wire u16 (e.g. 99999) can never match a zone line, so
+        // fold it into the same "not reachable" rejection as an in-range-but-unreachable id —
+        // same message shape either way — instead of a separate generic range error (eqoxide#328).
         let reachable = reachable_zone_ids(&s.zone_points.lock().unwrap());
-        if !reachable.contains(&zone_id) {
+        let is_reachable = u16::try_from(zone_id).is_ok_and(|z| reachable.contains(&z));
+        if !is_reachable {
             let msg = if reachable.is_empty() {
                 format!("zone_id {zone_id} is not reachable: no zone lines are known for the current \
                          zone yet (still loading, or this zone has none)")
@@ -272,6 +283,7 @@ async fn post_zone_cross(
             return (StatusCode::BAD_REQUEST, msg);
         }
     }
+    let zone_id = zone_id as u16; // safe: either 0, or validated above to fit u16 and be reachable
     *s.zone_cross.lock().unwrap() = Some(zone_id);
     tracing::info!("zone_cross: flagged for OP_ZONE_CHANGE (target zone_id={zone_id})");
     // Honest, async-aware response (#267): the client WALKS to the zone line, it does not teleport, so
@@ -285,10 +297,19 @@ async fn post_zone_cross(
 
 #[cfg(test)]
 mod tests {
-    use super::{reachable_zone_ids, resolve_name, resolve_current_target};
+    use super::{reachable_zone_ids, resolve_name, resolve_current_target, router};
     use axum::http::StatusCode;
+    use axum::body::Body;
+    use axum::http::Request;
     use std::collections::HashMap;
+    use tower::ServiceExt;
     use crate::game_state::ZonePoint;
+    use crate::http::quests::tests::empty_state;
+
+    async fn body_text(resp: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
 
     fn zp(zone_id: u16) -> ZonePoint {
         ZonePoint { iterator: 0, server_x: 0.0, server_y: 0.0, server_z: 0.0, heading: 0.0, zone_id }
@@ -345,5 +366,139 @@ mod tests {
         let (key, p) = resolve_current_target(Some(42), &ids, &positions()).expect("resolved");
         assert_eq!(key, "a_rat00");
         assert_eq!(p, (10.0, 20.0, 3.0));
+    }
+
+    // --- zone_cross: eqoxide#328 regression coverage -----------------------------------------
+
+    /// The exact repro from #328: a `zone_id` that overflows `u16` must 400, not silently collapse
+    /// to "no body" → `zone_id=0` → 200 + walk to the nearest line.
+    #[tokio::test]
+    async fn zone_cross_out_of_range_zone_id_is_400_with_reachable_list() {
+        let state = empty_state();
+        state.zone_points.lock().unwrap().extend([zp(1), zp(2), zp(38)]);
+        let zc = state.zone_cross.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/zone_cross")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"zone_id":99999}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let text = body_text(resp).await;
+        assert!(text.contains("reachable zone_ids: [1, 2, 38]"), "message: {text}");
+        assert!(zc.lock().unwrap().is_none(), "an out-of-range zone_id must not queue a zone cross");
+    }
+
+    /// The out-of-range message must have the SAME shape as the pre-existing in-range-but-unreachable
+    /// rejection (requirement from #328) — same wording, same reachable-list format.
+    #[tokio::test]
+    async fn zone_cross_out_of_range_and_in_range_unreachable_share_message_shape() {
+        let state = empty_state();
+        state.zone_points.lock().unwrap().extend([zp(1), zp(2), zp(38)]);
+        let app = router().with_state(state.clone());
+        let req = Request::post("/zone_cross")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"zone_id":12345}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let in_range_text = body_text(resp).await;
+        assert!(in_range_text.contains("reachable zone_ids: [1, 2, 38]"), "message: {in_range_text}");
+
+        let app2 = router().with_state(state);
+        let req2 = Request::post("/zone_cross")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"zone_id":99999}"#)).unwrap();
+        let resp2 = app2.oneshot(req2).await.unwrap();
+        let out_of_range_text = body_text(resp2).await;
+        let shape = |s: &str| s.replacen("12345", "X", 1).replacen("99999", "X", 1);
+        assert_eq!(shape(&in_range_text), shape(&out_of_range_text),
+            "in-range-unreachable and out-of-range should read identically apart from the id: \
+             {in_range_text:?} vs {out_of_range_text:?}");
+    }
+
+    #[tokio::test]
+    async fn zone_cross_valid_reachable_zone_id_is_200_and_queues() {
+        let state = empty_state();
+        state.zone_points.lock().unwrap().extend([zp(1), zp(2), zp(38)]);
+        let zc = state.zone_cross.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/zone_cross")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"zone_id":2}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(*zc.lock().unwrap(), Some(2));
+    }
+
+    /// A genuinely absent body is the legitimate "nearest zone line" request — must keep working.
+    #[tokio::test]
+    async fn zone_cross_no_body_defaults_to_nearest_line() {
+        let state = empty_state();
+        let zc = state.zone_cross.clone();
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::post("/zone_cross").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(*zc.lock().unwrap(), Some(0));
+    }
+
+    /// Syntactically-broken JSON (not just an out-of-range field) must also 400, not silently no-op.
+    #[tokio::test]
+    async fn zone_cross_malformed_json_syntax_is_400_and_does_not_queue() {
+        let state = empty_state();
+        let zc = state.zone_cross.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/zone_cross")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"zone_id":}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(zc.lock().unwrap().is_none());
+    }
+
+    // --- goto: a malformed body must not silently fall back to "current target" ----------------
+
+    #[tokio::test]
+    async fn goto_malformed_coordinate_is_400_not_silently_defaulted() {
+        let state = empty_state();
+        // A current target IS set — under the old Option<Json<T>> bug this is exactly the
+        // "meaningful default" a malformed body would silently fall through to.
+        state.player_info.lock().unwrap().target_id = Some(42);
+        let goto_target = state.goto_target.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"x":"not-a-number","y":1.0,"z":2.0}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST,
+            "a malformed field must 400, not fall through to the current-target default");
+        assert!(goto_target.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn goto_no_body_falls_back_to_current_target() {
+        let state = empty_state();
+        state.entity_ids.lock().unwrap().insert("a_rat00".into(), 42);
+        state.entity_positions.lock().unwrap().insert("a_rat00".into(), (10.0, 20.0, 3.0));
+        state.player_info.lock().unwrap().target_id = Some(42);
+        let goto_target = state.goto_target.clone();
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::post("/goto").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(*goto_target.lock().unwrap(), Some((10.0, 20.0, 3.0)));
+    }
+
+    // --- manual: a malformed body must be reported honestly, not as "no direction given" -------
+
+    #[tokio::test]
+    async fn manual_malformed_body_reports_malformed_not_missing_direction() {
+        let state = empty_state();
+        let app = router().with_state(state);
+        let req = Request::post("/manual")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"east":"north"}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let text = body_text(resp).await;
+        assert!(text.contains("malformed JSON body"),
+            "message should name the real cause, not the unrelated \"provide a direction\" default-validation text: {text}");
     }
 }
