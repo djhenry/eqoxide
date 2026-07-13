@@ -15,6 +15,7 @@ pub(super) fn router() -> Router<HttpState> {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TargetBody {
     id: u32,
 }
@@ -35,6 +36,7 @@ async fn post_target(
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TargetNameBody {
     name: String,
 }
@@ -84,6 +86,7 @@ async fn post_attack_off(State(s): State<HttpState>) -> (StatusCode, String) {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ConsiderBody { id: Option<u32> }
 
 /// POST /v1/combat/consider {"id":N?} — consider a spawn (con color/faction), default current target.
@@ -96,6 +99,7 @@ async fn post_consider(State(s): State<HttpState>, OptionalJson(body): OptionalJ
 }
 
 #[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct CastBody { gem: Option<u8>, spell_id: Option<u32>, target_id: Option<u32>, item_slot: Option<u32> }
 
 /// POST /v1/combat/cast {"gem":0-8} | {"spell_id":N,"target_id":M?} | {"item_slot":S,"target_id":M?}
@@ -134,6 +138,7 @@ async fn post_cast(State(s): State<HttpState>, OptionalJson(body): OptionalJson<
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MemorizeBody { spell_id: u32, gem: u32 }
 
 /// POST /v1/combat/memorize {"spell_id":N,"gem":0-8} — memorize a known (scribed) spell into a gem.
@@ -149,6 +154,7 @@ async fn post_memorize(
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ScribeBody { spell_id: u32, slot: Option<u32>, from: Option<u32> }
 
 /// POST /v1/combat/scribe {"spell_id":N,"from":S,"slot":B?} — scribe a spell scroll into the
@@ -210,6 +216,23 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert!(consider.lock().unwrap().is_none(),
             "a malformed id must not silently fall through to considering the current target");
+    }
+
+    /// eqoxide#341: a typo'd key ("idd" instead of "id") must 400 — not be silently ignored by serde
+    /// (leaving `id` at its default `None`) and fall through to considering the current target.
+    #[tokio::test]
+    async fn consider_unknown_key_is_400_and_does_not_fall_back() {
+        let state = empty_state();
+        state.player_info.lock().unwrap().target_id = Some(7);
+        let consider = state.consider.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/consider")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"idd":7}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(consider.lock().unwrap().is_none(),
+            "a typo'd key must not silently fall through to considering the current target");
     }
 
     // --- cast: preserve the "no gem/spell_id" 400, but a malformed body must say so honestly ----

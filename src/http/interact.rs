@@ -21,6 +21,7 @@ pub(super) fn router() -> Router<HttpState> {
 /// Sends OP_ReadBook; the server replies with the text, which appears at GET /v1/observe/item_text
 /// (and in the message log under the "book" kind). (#288)
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReadBody {
     slot: i32,
 }
@@ -54,6 +55,7 @@ async fn post_read(
 /// `{"text": "..."}` (matched case-insensitively against a choice's label). Sends an
 /// OP_ItemLinkClick so the server resolves the saylink and treats it as our reply to the NPC. (#120)
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DialogueBody {
     index: Option<usize>,
     text:  Option<String>,
@@ -90,6 +92,7 @@ async fn post_dialogue(
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HailBody {
     /// NPC to hail (fuzzy-matched against /observe/entities). Omit to hail the nearest NPC.
     name: Option<String>,
@@ -148,6 +151,7 @@ async fn post_hail(
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SayBody {
     text: String,
 }
@@ -171,6 +175,7 @@ async fn post_say(
 }
 
 #[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct LootBody {
     /// Corpse spawn id to loot directly.
     id:   Option<u32>,
@@ -224,6 +229,7 @@ async fn post_loot(
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct GiveBody {
     /// NPC name to hand the item to (fuzzy-matched, like /merchant/buy and /combat/target/name).
     npc: String,
@@ -261,6 +267,7 @@ async fn post_give(
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DoorClickBody { door_id: Option<u8>, name: Option<String> }
 
 /// POST /v1/interact/click_door {"door_id": N}  or  {"name": "DOOR1"} (case-insensitive name match).
@@ -341,6 +348,23 @@ mod tests {
             "a malformed name must not silently fall through to hailing the nearest NPC");
     }
 
+    /// eqoxide#341: a typo'd key ("nmae" instead of "name") must 400 — not be silently ignored by
+    /// serde (leaving `name` at its default `None`) and fall through to hailing the nearest NPC.
+    #[tokio::test]
+    async fn hail_unknown_key_is_400_and_does_not_hail_nearest() {
+        let state = empty_state();
+        seed_npc(&state, "Guard_Phaeton000", 5, (1.0, 1.0, 0.0));
+        let hail = state.hail.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/hail")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"nmae":"Guard"}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(hail.lock().unwrap().is_none(),
+            "a typo'd key must not silently fall through to hailing the nearest NPC");
+    }
+
     // --- loot: a malformed id must not silently fall back to "nearest corpse" ------------------
 
     #[tokio::test]
@@ -367,5 +391,22 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert!(loot.lock().unwrap().is_none(),
             "a malformed id must not silently fall through to looting the nearest corpse");
+    }
+
+    /// eqoxide#341: a typo'd key ("idd" instead of "id") must 400 — not be silently ignored by serde
+    /// (leaving `id` at its default `None`) and fall through to looting the nearest corpse.
+    #[tokio::test]
+    async fn loot_unknown_key_is_400_and_does_not_loot_nearest() {
+        let state = empty_state();
+        seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
+        let loot = state.loot.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/loot")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"idd":9}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(loot.lock().unwrap().is_none(),
+            "a typo'd key must not silently fall through to looting the nearest corpse");
     }
 }
