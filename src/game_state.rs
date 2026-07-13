@@ -652,6 +652,14 @@ impl GameState {
             e.max_hp = max_hp;
             e.hp_pct = (cur_hp as f32 / max_hp.max(1) as f32) * 100.0;
         }
+        // Keep the target HUD's HP gauge live: target_hp_pct is a stored snapshot (seeded
+        // when the target is selected — see Navigator::tick), not derived fresh from
+        // `entities` on every read, so it must be refreshed here whenever the update is for
+        // whichever spawn is currently targeted (mob or self via F1). (eqoxide#9, task 6)
+        if self.target_id == Some(spawn_id) {
+            self.target_hp_pct = Some(self.hp_pct).filter(|_| spawn_id == self.player_id)
+                .or_else(|| self.entities.get(&spawn_id).map(|e| e.hp_pct));
+        }
     }
 
     /// Apply a percent-only HP update (OP_MobHealth / `SpawnHPUpdate_Struct2`). A mob
@@ -664,6 +672,11 @@ impl GameState {
         if spawn_id != self.player_id {
             if let Some(e) = self.entities.get_mut(&spawn_id) {
                 e.hp_pct = hp_pct;
+            }
+            // Same live-refresh as update_hp (this path never fires for the player — see guard
+            // above — so no self-target branch is needed here).
+            if self.target_id == Some(spawn_id) {
+                self.target_hp_pct = Some(hp_pct);
             }
         }
     }

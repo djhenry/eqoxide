@@ -1736,12 +1736,9 @@ impl ApplicationHandler for App {
                             if dx * dx + dy * dy < 25.0 {
                                 match self.pick_at(self.last_cursor) {
                                     Some(PickResult::Entity(id)) => {
-                                        self.game_state.target_id   = Some(id);
-                                        self.game_state.target_con  = None;
-                                        if let Some(e) = self.game_state.entities.get(&id) {
-                                            self.game_state.target_name   = Some(e.name.clone());
-                                            self.game_state.target_hp_pct = Some(e.hp_pct);
-                                        }
+                                        // Navigator::tick (network thread) already polls this same
+                                        // slot, sets the real target state, and it flows back via the
+                                        // next GameState snapshot — no local echo needed.
                                         *self.acts.target.lock().unwrap() = Some(id);
                                     }
                                     Some(PickResult::Door(door_id)) => {
@@ -1797,17 +1794,14 @@ impl ApplicationHandler for App {
                                     *self.goto_target.lock().unwrap() = None;
                                 }
                                 // Self-target (native EQ F1): target your own character (#291).
-                                // Mirrors the click-to-target path — sets the render target AND the
-                                // acts.target handle so the nav thread sends OP_TargetMouse for self,
+                                // Mirrors the click-to-target path — just sets the acts.target handle;
+                                // Navigator::tick (network thread) does the real work (OP_TargetMouse +
+                                // OP_Consider) and the result flows back via the next GameState snapshot,
                                 // enabling self-heals/buffs, consider-on-self, and (server permitting)
                                 // GM #kill/#damage on yourself.
                                 KeyCode::F1 if !event.repeat => {
-                                    let me = self.game_state.player_id;
+                                    let me = self.game_state_view.player_id;
                                     if me != 0 {
-                                        self.game_state.target_id     = Some(me);
-                                        self.game_state.target_con    = None;
-                                        self.game_state.target_name   = Some(self.game_state.player_name.clone());
-                                        self.game_state.target_hp_pct = Some(self.game_state.hp_pct);
                                         *self.acts.target.lock().unwrap() = Some(me);
                                     }
                                 }
