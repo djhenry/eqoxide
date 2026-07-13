@@ -75,7 +75,6 @@ pub struct Door {
     pub door_param: u32,
     pub invert_state: bool,  // true = normally-open door
     pub is_open: bool,       // authoritative, from server
-    pub open_frac: f32,      // render-only: eases 0..1 toward is_open
 }
 
 /// One objective/step of a Task-system quest (from OP_TaskActivity). `done_count`/`goal_count`
@@ -1069,7 +1068,7 @@ mod tests {
             door_id: 3, name: "DOOR1".into(),
             x: 10.0, y: 20.0, z: 5.0, heading: 0.0, incline: 0, size: 100,
             opentype: 5, door_param: 0, invert_state: false,
-            is_open: false, open_frac: 0.0,
+            is_open: false,
         });
         gs.set_door_open(3, true);
         assert!(gs.doors.get(&3).unwrap().is_open);
