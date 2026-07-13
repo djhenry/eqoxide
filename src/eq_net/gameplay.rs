@@ -310,13 +310,14 @@ pub async fn run_gameplay_phase(
         if world_reconnect_needed {
             tracing::info!("EQ: zone change approved — reconnecting to world for zone handoff");
             let ok = reconnect_via_world(
-                &mut stream, &mut net_rx, &mut gs, &char_name, &world_creds,
+                &mut stream, &mut net_rx, &mut gs, &char_name, &world_creds, &last_inbound,
             ).await;
             if ok {
                 run_zone_entry_handshake(
                     stream.as_mut().unwrap(),
                     net_rx.as_mut().unwrap(),
                     &mut gs,
+                    &last_inbound,
                 ).await;
                 navigator.sync_zone_points(&gs);
                 last_keepalive = std::time::Instant::now();
@@ -348,6 +349,7 @@ pub async fn run_gameplay_phase(
                         stream.as_mut().unwrap(),
                         net_rx.as_mut().unwrap(),
                         &mut gs,
+                        &last_inbound,
                     ).await;
                     navigator.sync_zone_points(&gs);
                     last_keepalive = std::time::Instant::now();
@@ -431,12 +433,18 @@ async fn perform_clean_shutdown(
 
 /// After OP_ZONE_CHANGE success=1: reconnect to world, get OP_ZONE_SERVER_INFO, connect to new zone.
 /// On success, `stream` and `net_rx` are replaced with the new zone connection.
+///
+/// `last_inbound` is bumped as real inbound packets are drained here (the world-reconnect leg of a
+/// zone handoff), the same way the gameplay loop's drain does — this handoff can take multiple
+/// seconds and, with CONN_STALE_SECS=15, would otherwise falsely report the connection as lost
+/// while it's mid-transition.
 async fn reconnect_via_world(
-    stream:      &mut Option<EqStream>,
-    net_rx:      &mut Option<UnboundedReceiver<AppPacket>>,
-    _gs:         &mut GameState,
-    char_name:   &str,
-    creds:       &WorldCredentials,
+    stream:       &mut Option<EqStream>,
+    net_rx:       &mut Option<UnboundedReceiver<AppPacket>>,
+    _gs:          &mut GameState,
+    char_name:    &str,
+    creds:        &WorldCredentials,
+    last_inbound: &crate::http::LastInboundShared,
 ) -> bool {
     drop(stream.take());
     drop(net_rx.take());
@@ -469,6 +477,7 @@ async fn reconnect_via_world(
         world_stream.poll_recv();
         world_stream.poll_resend(); // retransmit OP_SEND_LOGIN_INFO/ENTER_WORLD across the handoff (#254)
         while let Ok(packet) = world_rx.try_recv() {
+            *last_inbound.lock().unwrap() = std::time::Instant::now();
             match packet.opcode {
                 // In a fresh-login reconnect, world sends OP_SEND_CHAR_INFO as the trigger.
                 // In a zoning=1 reconnect, world sends OP_APPROVE_WORLD (RoF2: 0x7499) instead.
@@ -534,10 +543,15 @@ async fn reconnect_via_world(
 
 /// Handles the OP_NEW_ZONE → OP_WEATHER → OP_SEND_EXP_ZONE_IN handshake
 /// that completes after connecting to a new zone server.
+///
+/// `last_inbound` is bumped as real inbound packets are drained here, exactly like the gameplay
+/// loop's own drain (`run_gameplay_phase`) does — a slow zone-in (up to the 30s deadline below)
+/// must not falsely report the connection as lost while it's healthy and still zoning in.
 async fn run_zone_entry_handshake(
-    stream:  &mut EqStream,
-    net_rx:  &mut UnboundedReceiver<AppPacket>,
-    gs:      &mut GameState,
+    stream:       &mut EqStream,
+    net_rx:       &mut UnboundedReceiver<AppPacket>,
+    gs:           &mut GameState,
+    last_inbound: &crate::http::LastInboundShared,
 ) {
     // Clear stale entities now so OP_ZONE_SPAWNS can repopulate them.
     // (OP_NEW_ZONE arrives AFTER OP_ZONE_SPAWNS in the Titanium server sequence, so
@@ -554,6 +568,7 @@ async fn run_zone_entry_handshake(
         stream.poll_resend(); // retransmit OP_ZONE_ENTRY/ReqClientSpawn during zone-in (#254)
         while let Ok(packet) = net_rx.try_recv() {
             apply_packet(gs, &packet);
+            *last_inbound.lock().unwrap() = std::time::Instant::now();
             match packet.opcode {
                 OP_NEW_ZONE if !done_new_zone => {
                     done_new_zone = true;
