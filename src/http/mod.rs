@@ -36,17 +36,23 @@ where
     type Rejection = (axum::http::StatusCode, String);
 
     async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        // Preserve the underlying rejection's own status (e.g. an over-limit body is 413, not 400).
         let bytes = axum::body::Bytes::from_request(req, state)
             .await
-            .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("failed to read request body: {e}")))?;
+            .map_err(|e| (e.status(), format!("failed to read request body: {e}")))?;
         if bytes.iter().all(u8::is_ascii_whitespace) {
             return Ok(OptionalJson(None));
         }
         let de = &mut serde_json::Deserializer::from_slice(&bytes);
-        match serde_path_to_error::deserialize::<_, T>(de) {
-            Ok(v) => Ok(OptionalJson(Some(v))),
-            Err(e) => Err((axum::http::StatusCode::BAD_REQUEST, format!("malformed JSON body: {e}"))),
-        }
+        let value = serde_path_to_error::deserialize::<_, T>(&mut *de)
+            .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("malformed JSON body: {e}")))?;
+        // Reject trailing garbage after the JSON value (`{"zone_id":45} lolwut`, two concatenated
+        // objects, …). serde_json's streaming Deserializer stops at the end of the FIRST value and
+        // would otherwise silently ignore whatever follows — `axum::Json` rejects these, so we must
+        // too, or #328's silent-acceptance bug survives in a smaller form.
+        de.end()
+            .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("malformed JSON body: trailing data after the JSON value: {e}")))?;
+        Ok(OptionalJson(Some(value)))
     }
 }
 

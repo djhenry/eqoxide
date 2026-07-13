@@ -454,6 +454,26 @@ mod tests {
         assert!(zc.lock().unwrap().is_none());
     }
 
+    /// serde_json's streaming Deserializer stops at the end of the FIRST value, so without an
+    /// explicit `de.end()` a body like `{"zone_id":45} lolwut` (or two concatenated objects) parses
+    /// as a valid request and the garbage is silently ignored — the same silent-acceptance class as
+    /// #328, in a smaller form. `axum::Json` rejects both; so must we.
+    #[tokio::test]
+    async fn zone_cross_trailing_garbage_after_json_is_400_and_does_not_queue() {
+        for body in [r#"{"zone_id":2} lolwut"#, r#"{"zone_id":2}{"zone_id":38}"#] {
+            let state = empty_state();
+            state.zone_points.lock().unwrap().extend([zp(2), zp(38)]);
+            let zc = state.zone_cross.clone();
+            let app = router().with_state(state);
+            let req = Request::post("/zone_cross")
+                .header("content-type", "application/json")
+                .body(Body::from(body)).unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "body {body:?} must be rejected");
+            assert!(zc.lock().unwrap().is_none(), "body {body:?} must not queue a zone cross");
+        }
+    }
+
     // --- goto: a malformed body must not silently fall back to "current target" ----------------
 
     #[tokio::test]
@@ -484,6 +504,56 @@ mod tests {
         let resp = app.oneshot(Request::post("/goto").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(*goto_target.lock().unwrap(), Some((10.0, 20.0, 3.0)));
+    }
+
+    // --- follow: a malformed body must not silently fall back to "current target" --------------
+
+    #[tokio::test]
+    async fn follow_malformed_name_is_400_not_silently_defaulted() {
+        let state = empty_state();
+        state.entity_ids.lock().unwrap().insert("a_rat00".into(), 42);
+        state.entity_positions.lock().unwrap().insert("a_rat00".into(), (10.0, 20.0, 3.0));
+        // A current target IS set — the old Option<Json<T>> bug would silently chase IT instead of
+        // reporting the malformed "name" field.
+        state.player_info.lock().unwrap().target_id = Some(42);
+        let goto_entity = state.goto_entity.clone();
+        let goto_target = state.goto_target.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/follow")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":5}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST,
+            "a malformed name must 400, not fall through to following the current target");
+        assert!(goto_entity.lock().unwrap().is_none());
+        assert!(goto_target.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn follow_no_body_falls_back_to_current_target() {
+        let state = empty_state();
+        state.entity_ids.lock().unwrap().insert("a_rat00".into(), 42);
+        state.entity_positions.lock().unwrap().insert("a_rat00".into(), (10.0, 20.0, 3.0));
+        state.player_info.lock().unwrap().target_id = Some(42);
+        let goto_entity = state.goto_entity.clone();
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::post("/follow").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(goto_entity.lock().unwrap().as_deref(), Some("a_rat00"));
+    }
+
+    /// The pre-existing "coords are not allowed on /follow" 400 must survive the extractor swap.
+    #[tokio::test]
+    async fn follow_with_coords_is_still_400() {
+        let state = empty_state();
+        let app = router().with_state(state);
+        let req = Request::post("/follow")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"x":1.0,"y":2.0,"z":3.0}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let text = body_text(resp).await;
+        assert!(text.contains("not coordinates"), "message: {text}");
     }
 
     // --- manual: a malformed body must be reported honestly, not as "no direction given" -------
