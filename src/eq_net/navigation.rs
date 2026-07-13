@@ -723,6 +723,31 @@ pub(crate) fn carrot_along(path: &[[f32; 3]], start_i: usize, from: [f32; 2], re
     }
 }
 
+/// Fast-steering aim (#nav-multires / #311). Advances `local_i` — the cursor into `local_path` —
+/// as far as the projection of `from` onto the active segment has passed its end (mirrors the
+/// coarse `path_i` advance in `tick()`), then returns the unit `wish_dir` + EQ heading toward a
+/// carrot `reach` units further along `local_path` from there. Pulled out of the fast-steering
+/// block in `tick()` so the cursor mechanics are directly unit-testable without a live `EqStream`:
+/// before this existed, that block called `carrot_along(&self.local_path, 0, ...)` with the
+/// segment index PINNED at 0. `local_path` waypoints are only ~LOCAL_CELL(2u) apart and the plan is
+/// only rebuilt on the 150ms gate, but this steering loop runs every ~10ms — so within ~45ms at
+/// RUN_SPEED the projection onto segment 0 saturates at t=1, and for the rest of the gate the aim
+/// is measured from `local_path[1]`, which is now BEHIND the walker. The look-ahead collapses and
+/// can invert on a bend, which is the drawn-path-vs-actual-movement divergence in #311.
+pub(crate) fn fast_steer_aim(path: &[[f32; 3]], local_i: &mut usize, from: [f32; 2], reach: f32) -> Option<([f32; 2], f32)> {
+    while *local_i + 2 < path.len() {
+        let (a, b) = (path[*local_i], path[*local_i + 1]);
+        let ab = [b[0] - a[0], b[1] - a[1]];
+        let l2 = ab[0] * ab[0] + ab[1] * ab[1];
+        let t = if l2 < 1e-6 { 1.0 } else { ((from[0] - a[0]) * ab[0] + (from[1] - a[1]) * ab[1]) / l2 };
+        if t >= 1.0 { *local_i += 1; } else { break; }
+    }
+    let aim = carrot_along(path, *local_i, from, reach)?;
+    let (dx, dy) = (aim[0] - from[0], aim[1] - from[1]);
+    let d = (dx * dx + dy * dy).sqrt();
+    (d > 1e-3).then(|| ([dx / d, dy / d], eq_heading(dx, dy)))
+}
+
 pub struct Navigator {
     goto_target:      GotoTarget,
     /// Live nav state for GET /v1/observe/debug (#166): idle|navigating|arrived|no_path|blocked.
@@ -816,6 +841,13 @@ pub struct Navigator {
     /// (thin ramps, narrow openings) the coarse grid can't see. Empty = coarse aim (fine plan failed
     /// or no coarse path). Two-tier planner (#nav-multires).
     local_path:       Vec<[f32; 3]>,
+    /// Fast-steering carrot cursor into `local_path` (#311). The fast-steering loop below re-aims
+    /// every ~10ms, far more often than `local_path` is rebuilt (the 150ms gate), so — like the
+    /// coarse `path_i` — it must advance as the projection passes each segment instead of staying
+    /// pinned to segment 0 (where it saturates at t=1 within ~45ms at RUN_SPEED and starts measuring
+    /// the carrot from a point BEHIND the walker). Reset to 0 everywhere `local_path` is rebuilt or
+    /// cleared, since a stale cursor into a fresh path would just move the bug.
+    local_i:          usize,
     /// The spawn id the pet was last ordered to attack (avoids re-spamming OP_PetCommands every
     /// tick). Reset when the target changes; see the auto-pet-combat block.
     last_pet_target:  Option<u32>,
@@ -1019,6 +1051,7 @@ impl Navigator {
             path_i: 0,
             path_goal: None,
             local_path: Vec::new(),
+            local_i: 0,
             last_pet_target: None,
             falling: None,
             fall_start_z: 0.0,
@@ -1226,6 +1259,7 @@ impl Navigator {
             *self.nav_path_view.lock().unwrap() = (Vec::new(), Vec::new()); // clear the overlay line
             self.path.clear();
             self.local_path.clear();
+            self.local_i = 0;
             self.path_goal = None;
             self.path_i = 0;
             self.stuck_i = 0;
@@ -1321,6 +1355,7 @@ impl Navigator {
         *self.nav_path_view.lock().unwrap() = (Vec::new(), Vec::new()); // clear the overlay line
         self.path.clear();
         self.local_path.clear();
+        self.local_i = 0;
         self.path_goal = None;
         self.path_i = 0;
         self.set_nav_state("idle");
@@ -2046,16 +2081,17 @@ impl Navigator {
         // bug). So each loop (~10ms), re-project the CURRENT position onto the stable fine path and
         // refresh ONLY nav_intent's `wish_dir` (+ facing) — the flags/speed the walker set stay. The
         // carrot slides along the line as we move, so the avatar hugs it through tight turns.
+        // `local_i` — NOT a hard-coded 0 — tracks which local_path segment we're on between rebuilds
+        // (#311): pinning the projection to segment 0 for the full 150ms gate let it saturate and
+        // measure the carrot from behind the walker once RUN_SPEED carried us past it.
         if !self.local_path.is_empty() && self.goto_target.lock().unwrap().is_some() {
-            if let Some(aim) = carrot_along(&self.local_path, 0, [gs.player_x, gs.player_y], 5.0) {
-                let (dx, dy) = (aim[0] - gs.player_x, aim[1] - gs.player_y);
-                let d = (dx * dx + dy * dy).sqrt();
-                if d > 1e-3 {
-                    if let Some(intent) = self.nav_intent.lock().unwrap().as_mut() {
-                        intent.wish_dir = [dx / d, dy / d];
-                    }
-                    gs.player_heading = eq_heading(dx, dy);
+            if let Some((wish_dir, heading)) =
+                fast_steer_aim(&self.local_path, &mut self.local_i, [gs.player_x, gs.player_y], 5.0)
+            {
+                if let Some(intent) = self.nav_intent.lock().unwrap().as_mut() {
+                    intent.wish_dir = wish_dir;
                 }
+                gs.player_heading = heading;
             }
         }
 
@@ -2413,6 +2449,9 @@ impl Navigator {
                 .and_then(|c| c.find_path_res([px, py, gs.player_z], local_goal,
                     crate::movement::PLAYER_RADIUS, &[], true, LOCAL_CELL, Some(LOCAL_BOUND), 0.0))
                 .unwrap_or_default();
+            // Fresh plan from the current position → the fast-steering cursor (#311) resets to its
+            // start; a stale index into a just-rebuilt path would just move the bug.
+            self.local_i = 0;
             // Proactive re-plan trigger (#246): did the fine plan actually REACH its coarse carrot? If
             // the committed coarse route skims an obstacle the 8u grid missed, the fine 2u plan stops
             // short (truncated partial toward the reachable frontier) and the walker presses into it.
@@ -2438,6 +2477,12 @@ impl Navigator {
             // exactly what the walker follows — coarse route + fine local plan — rather than an
             // independent per-frame recompute that over-states how cleanly the walker is steering.
             *self.nav_path_view.lock().unwrap() = (self.path.clone(), self.local_path.clone());
+            // Segment 0 — a literal, NOT `self.local_i` — is correct here and is not the #311 bug.
+            // `local_path` was just re-planned FROM the current position a few lines up, so the
+            // walker is on its first segment by construction and the cursor was reset to 0 with it.
+            // The bug is in the fast-steering loop, which re-aims ~15x per rebuild and so must track
+            // a live cursor; this main-tick aim runs once per rebuild against a path that starts
+            // under the walker's feet.
             let aim = if self.local_path.len() >= 2 {
                 carrot_along(&self.local_path, 0, [px, py], LOOK_AHEAD).unwrap_or(coarse)
             } else {
@@ -2446,6 +2491,7 @@ impl Navigator {
             (aim[0], aim[1], aim[2])
         } else {
             self.local_path.clear();
+            self.local_i = 0;
             *self.nav_path_view.lock().unwrap() = (Vec::new(), Vec::new());
             // No path computed: straight-line toward the goal at the player's CURRENT height.
             (goal.0, goal.1, gs.player_z)
@@ -2974,6 +3020,7 @@ mod tests {
             nav.local_path = vec![[0.0, 0.0, 0.0]];
             nav.path_goal = Some((100.0, 200.0, 0.0));
             nav.path_i = 1;
+            nav.local_i = 1;
             *nav.nav_state.lock().unwrap() = "navigating".into();
         };
         let assert_halted = |nav: &Navigator| {
@@ -2981,6 +3028,9 @@ mod tests {
             assert!(nav.goto_entity.lock().unwrap().is_none(), "goto_entity must clear on death");
             assert!(nav.nav_intent.lock().unwrap().is_none(), "nav_intent must clear so the controller stops");
             assert!(nav.path.is_empty() && nav.local_path.is_empty(), "route must clear on death");
+            // The fast-steering cursor must reset with the path it indexes (#311) — a stale local_i
+            // left over a cleared/rebuilt local_path aims the walker at the wrong segment.
+            assert_eq!(nav.local_i, 0, "local_i must reset with local_path on death");
             assert_eq!(nav.path_goal, None);
             assert_eq!(*nav.nav_state.lock().unwrap(), "idle");
         };
@@ -3041,6 +3091,59 @@ mod tests {
         assert_ne!(arrival_action(1.0, true), ArrivalAction::Arrived);
     }
 
+    /// #311 regression: the fast-steering loop re-aims every ~10ms, but `local_path` is only
+    /// rebuilt on the 150ms gate. Waypoints are LOCAL_CELL(2u) apart and RUN_SPEED(44u/s) covers
+    /// ~6.6u over one gate — more than three segments — so a cursor pinned to segment 0 for the
+    /// whole gate saturates its projection (t=1) almost immediately and starts measuring the
+    /// carrot from a point BEHIND the walker once a bend is reached. Drive `fast_steer_aim`
+    /// through a full 150ms gate (fifteen ~10ms ticks) against a FIXED bending `local_path` — no
+    /// rebuild, exactly the gap between rebuilds — and assert the aim keeps leading forward
+    /// through the turn instead of collapsing/inverting.
+    ///
+    /// A hand-simulation of this exact scenario with the index pinned at 0 (the pre-#311 code,
+    /// `carrot_along(&self.local_path, 0, ...)`) inverts hard by tick 14: wish_dir flips to
+    /// point back down the east leg (dot -0.97) even though the route continues north. The
+    /// advancing cursor stays positive throughout (min dot ~0.46) — confirming this scenario
+    /// actually reproduces the bug and that the fix (not just a coincidentally-passing test)
+    /// is what keeps it green.
+    #[test]
+    fn fast_steer_carrot_tracks_a_bend_across_a_full_gate_without_inverting() {
+        // East leg (0,0)->(6,0), then a 90° bend onto a north leg (6,0)->(6,12); LOCAL_CELL(2u)
+        // spacing like the real fine plan.
+        let local_path: Vec<[f32; 3]> = vec![
+            [0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [4.0, 0.0, 0.0], [6.0, 0.0, 0.0],
+            [6.0, 2.0, 0.0], [6.0, 4.0, 0.0], [6.0, 6.0, 0.0], [6.0, 8.0, 0.0],
+            [6.0, 10.0, 0.0], [6.0, 12.0, 0.0],
+        ];
+        let mut local_i = 0usize;
+        let mut pos = [0.0f32, 0.0f32];
+        const DT: f32 = 0.01; // ~10ms fast-steering tick
+        let mut min_forward_dot = f32::MAX;
+        for _ in 0..15 { // 150ms — exactly one local_path gate, deliberately NOT rebuilt
+            let (wish_dir, _heading) = fast_steer_aim(&local_path, &mut local_i, pos, 5.0)
+                .expect("a bending path within reach must always produce an aim");
+            // Forward tangent of the segment the cursor is currently tracking — wish_dir must
+            // never point backward along it.
+            let (a, b) = (local_path[local_i], local_path.get(local_i + 1).copied().unwrap_or(local_path[local_i]));
+            let seg = [b[0] - a[0], b[1] - a[1]];
+            let seg_len = (seg[0] * seg[0] + seg[1] * seg[1]).sqrt();
+            if seg_len > 1e-3 {
+                let dot = (wish_dir[0] * seg[0] + wish_dir[1] * seg[1]) / seg_len;
+                min_forward_dot = min_forward_dot.min(dot);
+            }
+            pos[0] += wish_dir[0] * RUN_SPEED * DT;
+            pos[1] += wish_dir[1] * RUN_SPEED * DT;
+        }
+        assert!(min_forward_dot > 0.3,
+            "fast-steer aim pointed backward along its tracked segment (dot={min_forward_dot:.2}) \
+             at some point in the gate — the carrot cursor collapsed/inverted instead of advancing \
+             through the bend (#311)");
+        let travelled = (pos[0] * pos[0] + pos[1] * pos[1]).sqrt();
+        assert!(travelled > 5.0,
+            "walker made almost no net progress over the 150ms gate (ended {travelled:.2}u from \
+             start at {pos:?}) — the cursor likely stalled pinned to segment 0 (#311)");
+    }
+
     #[test]
     fn zone_change_resets_stale_destination_and_path() {
         // #248: a destination + route left over from the PREVIOUS zone must not survive a crossing —
@@ -3059,6 +3162,7 @@ mod tests {
         nav.local_path = vec![[0.0, 0.0, 0.0]];
         nav.path_goal = Some((100.0, 200.0, 0.0));
         nav.path_i = 1;
+        nav.local_i = 1;
         nav.stuck_ticks = 5;
         nav.nav_repaths = 3;
         nav.backoff_ticks = 2;
@@ -3080,6 +3184,9 @@ mod tests {
         assert!(nav.path.is_empty() && nav.local_path.is_empty(), "route must clear on zone change");
         assert_eq!(nav.path_goal, None);
         assert_eq!(nav.path_i, 0);
+        // The fast-steering cursor must reset with the path it indexes (#311) — a stale local_i in
+        // the NEW zone points at a segment of a route that no longer exists.
+        assert_eq!(nav.local_i, 0, "local_i must reset with local_path on zone change");
         assert_eq!(nav.stuck_ticks, 0);
         assert_eq!(nav.nav_repaths, 0);
         assert_eq!(nav.backoff_ticks, 0);
