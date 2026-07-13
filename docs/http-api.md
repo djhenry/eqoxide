@@ -202,13 +202,20 @@ machine-readable *why*, `null` unless a state has one). Together they are how yo
 |-------------|---------|--------------|
 | `idle` | Nothing to do. | — |
 | `planning` | A route is being computed on the pathfinding worker thread. The character stands still. Normally < 1 s. | — |
-| `navigating` | Walking a **complete route to your goal**. | — |
+| `navigating` | Walking a **complete route to your goal**. | `goal_z_snapped` (see below) or — |
 | `navigating_partial` | Walking a **partial** route: the search was cut short, so this is *not* a route to your goal — it's progress toward a frontier, and it will re-plan from the far end. Usually resolves to `navigating` or `arrived`. | `search_deadline` / `search_node_cap` |
 | `following` | A `/follow` chase has caught up; holding near the leader, still latched. | — |
-| `arrived` | Reached the goal. | — |
+| `arrived` | Reached the goal. | `goal_z_snapped` (see below) or — |
 | `no_path` | **DEFINITIVE: no route exists.** The planner searched to completion. Do not retry the same goal — pick another. | see below |
 | `search_exhausted` | The planner **gave up**. This is **"I don't know", not "no"** — a route may well exist. Try a nearer waypoint. | `search_deadline` / `search_node_cap` |
 | `blocked` | A route exists, but the walker **physically could not follow it** (wedged on geometry after 8 recovery attempts). A steering/collision failure, *not* a routing one. | `walker_stalled`, `fall_would_be_lethal` |
+
+**`goal_z_snapped` — the client CHANGED your goal.** The `z` you gave sits below every floor in the
+goal's column (agents commonly pass `z: 0`, or a map coordinate), so the planner snapped the goal onto
+the real floor at that XY and routed there. You are being walked somewhere you did not literally ask
+for, so you are told — on `navigating` **and on `arrived`**, plus a line in the message log. If the z
+matters to you, re-issue with the real floor height. (A goal with **no** floor anywhere in its column
+is not snapped: it fails as `no_path` / `goal_not_walkable`.)
 
 `nav_reason` for `no_path`:
 
@@ -218,6 +225,7 @@ machine-readable *why*, `null` unless a state has one). Together they are how yo
 | `search_closed` | The planner explored every cell reachable from the character and the goal was not among them. Genuinely walled off. |
 | `start_isolated` | The *character* is boxed in (inside a tree trunk / on a slope face), and re-anchoring to nearby floor didn't help. |
 | `no_geometry` | No collision mesh loaded yet (still zoning). |
+| `planner_dead` | The pathfinding worker thread has **died**. No route can be planned for the rest of the session — a **client fault**, not an unreachable goal. Movement must be driven manually, or the client restarted. This is reported loudly and terminally rather than leaving `nav_state` stuck at `planning` forever. |
 
 > **The distinction between `no_path` and `search_exhausted` is load-bearing, and it is new (#337).**
 > They used to be the same thing — worse, an unreachable goal didn't report *either*. The planner

@@ -56,6 +56,11 @@ pub struct PlanReply {
     pub outcome: PlanOutcome,
     /// How long the search actually took. This is the stall that used to land on the NET THREAD.
     pub plan_ms: u128,
+    /// `Some(z)` when the caller's goal z could not be resolved to any tier and the planner SNAPPED
+    /// the goal to the nearest floor in its column. The client has changed the agent's goal, so the
+    /// agent is told (`nav_reason: goal_z_snapped`) — an accommodation presented as compliance is a
+    /// lie, and this one would otherwise report `arrived` at a z nobody asked for (#377 review).
+    pub goal_snapped_z: Option<f32>,
 }
 
 /// The Navigator's handle on the worker: post requests, poll for the one reply that still matters.
@@ -64,8 +69,16 @@ pub struct Planner {
     rep_rx:   Receiver<PlanReply>,
     /// Next generation to hand out. Monotonic for the life of the Navigator.
     next_gen: u64,
-    /// The generation we are currently waiting on, if any.
-    pending:  Option<u64>,
+    /// The generation we are currently waiting on, and the GOAL it was requested for.
+    ///
+    /// These live together, inside the Planner, on purpose. They used to be two fields in two
+    /// places — `pending` here, `plan_goal` on the Navigator — and `poll()` cleared one while only
+    /// `apply_plan` cleared the other. A tick that consumed a reply and then DROPPED it (because the
+    /// goal had drifted) therefore left `plan_goal` set forever, and the "is a plan in flight?" test
+    /// said yes for the rest of the session: the planner stopped posting, and the character sat at
+    /// `nav_state: planning` PERMANENTLY, with a live, idle worker. Keeping the pair here makes that
+    /// state UNREPRESENTABLE — `poll` clears both, atomically, and no caller can leak one.
+    pending:  Option<(u64, [f32; 3])>,
     /// Latched once the worker thread has died (panicked). A dead planner must never masquerade as
     /// a busy one — see [`Planner::poll`].
     dead:     bool,
@@ -94,7 +107,7 @@ impl Planner {
         let gen = self.next_gen;
         self.next_gen += 1;
         req.gen = gen;
-        self.pending = Some(gen);
+        self.pending = Some((gen, req.goal));
         // A dead worker must not silently freeze navigation. It can only die if the thread panicked;
         // report it rather than leaving the walker waiting on a plan that will never come.
         if self.req_tx.send(req).is_err() {
@@ -127,6 +140,10 @@ impl Planner {
     /// Are we waiting on a plan right now?
     pub fn is_planning(&self) -> bool { self.pending.is_some() }
 
+    /// The GOAL of the plan currently in flight, if any. Cleared by `poll` the instant its reply is
+    /// handed over — so it can never outlive the request it describes.
+    pub fn in_flight_goal(&self) -> Option<[f32; 3]> { self.pending.map(|(_, g)| g) }
+
     /// Has the worker thread DIED (panicked)? Once true, no plan will ever be computed again, and
     /// the caller MUST say so out loud — see [`Planner::poll`].
     pub fn is_dead(&self) -> bool { self.dead }
@@ -151,7 +168,9 @@ impl Planner {
         loop {
             match self.rep_rx.try_recv() {
                 Ok(rep) => {
-                    if Some(rep.gen) == self.pending {
+                    if self.pending.map(|(g, _)| g) == Some(rep.gen) {
+                        // Clear the pending request AND its goal together: handing the reply over is
+                        // exactly the moment the plan stops being in flight.
                         self.pending = None;
                         fresh = Some(rep);
                     } else {
@@ -186,6 +205,17 @@ fn worker(req_rx: Receiver<PlanRequest>, rep_tx: Sender<PlanReply>) {
             req = newer;
         }
         let t0 = Instant::now();
+        // Is the planner about to change the goal it was given? (A zone-line goal is a VOLUME, not a
+        // floor point — it is not "snapped" and must not be reported as such.)
+        let goal_snapped_z = req.goal_region
+            .is_none()
+            .then(|| req.collision.goal_z_was_snapped(req.goal))
+            .flatten();
+        if let Some(z) = goal_snapped_z {
+            tracing::warn!("nav-planner: goal ({:.0},{:.0},{:.1}) has no floor at the z you asked for — \
+                SNAPPING it to the floor at z={:.1}. The client is changing your goal; it is not the one \
+                you specified.", req.goal[0], req.goal[1], req.goal[2], z);
+        }
         let outcome = plan_path(&req.collision, req.start, req.goal, &req.avoid, req.aggro_buffer, req.goal_region);
         let plan_ms = t0.elapsed().as_millis();
         // The headline number for #340: this is the synchronous stall that used to sit on the net
@@ -194,7 +224,7 @@ fn worker(req_rx: Receiver<PlanRequest>, rep_tx: Sender<PlanReply>) {
         tracing::info!("nav-planner: plan #{} ({:.0},{:.0})->({:.0},{:.0}) took {}ms OFF the net thread → {}",
             req.gen, req.start[0], req.start[1], req.goal[0], req.goal[1], plan_ms,
             describe(&outcome));
-        if rep_tx.send(PlanReply { gen: req.gen, outcome, plan_ms }).is_err() {
+        if rep_tx.send(PlanReply { gen: req.gen, outcome, plan_ms, goal_snapped_z }).is_err() {
             break; // Navigator gone (zone change / shutdown)
         }
     }
@@ -415,6 +445,38 @@ mod tests {
              silent lie and strictly worse than the crash it replaced");
         assert!(!planner.is_planning(),
             "and it must not still claim a plan is in flight: nothing will ever answer it");
+    }
+
+    /// **THE LIVENESS INVARIANT, made structural.** Handing a reply over MUST clear the in-flight
+    /// goal, atomically with the pending generation. They used to live in two places — `pending`
+    /// here, `plan_goal` on the Navigator — and a tick that consumed a reply but then DROPPED it
+    /// (because the goal had drifted a few units) cleared only one. The stale `plan_goal` then made
+    /// "is a plan in flight?" answer yes forever: the planner stopped posting and the character sat
+    /// at `nav_state: planning` PERMANENTLY, worker alive and idle, invisible to `is_dead()`.
+    ///
+    /// Keeping the pair in one place makes that unrepresentable. This pins it.
+    #[test]
+    fn handing_over_a_reply_clears_the_in_flight_goal() {
+        let col = Arc::new(plane_with_sealed_box(400.0, 200.0, 200.0));
+        let mut planner = Planner::spawn();
+        let goal = [300.0, 300.0, 0.0];
+        planner.request(PlanRequest {
+            gen: 0, start: [-300.0, -300.0, 0.0], goal,
+            avoid: vec![], aggro_buffer: 0.0, goal_region: None, collision: col,
+        });
+        assert_eq!(planner.in_flight_goal(), Some(goal), "the posted goal is in flight");
+
+        let mut got = None;
+        for _ in 0..2000 {
+            if let Some(r) = planner.poll() { got = Some(r); break; }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(got.is_some(), "the plan must come back");
+        assert_eq!(planner.in_flight_goal(), None,
+            "handing the reply over MUST clear the in-flight goal — if it survives, the planner \
+             believes a plan is forever in flight, stops posting, and the character is frozen at \
+             `nav_state: planning` for the rest of the session");
+        assert!(!planner.is_planning(), "and nothing is pending");
     }
 
     /// `cancel` (nav stopped / goal cleared) must make an in-flight plan un-appliable.
