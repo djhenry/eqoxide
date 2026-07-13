@@ -77,6 +77,14 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             "connected":   player.connected,
             "last_packet_age_ms": player.last_packet_age_ms,
             "nav_state":   nav_state,
+            // Spellcasting (#348). `casting` is non-null ONLY while our own cast bar is running;
+            // `last_cast` is how the previous cast ended (cast_completed / cast_interrupted /
+            // cast_fizzled / cast_failed) and survives it. Before this, casting was tracked
+            // internally and published NOWHERE — an agent could not tell a spell that landed from
+            // one that fizzled, was interrupted, or never started. The same transitions are pushed
+            // onto /v1/events/combat as they happen.
+            "casting":     player.casting,
+            "last_cast":   player.last_cast,
         },
         // Per-phase frame timings (ms, EMA-smoothed); all zero unless --profile / EQ_PROFILE=1.
         "frame_profile": player.frame_profile,

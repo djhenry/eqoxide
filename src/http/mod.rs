@@ -533,8 +533,41 @@ pub struct PlayerState {
     /// book is read. Surfaced via GET /v1/observe/item_text so an agent can read a quest note (#288).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub book_text:          Option<String>,
+    /// Spellcasting (#348). `casting` is Some ONLY while the player's own cast bar is running (the
+    /// server accepted the cast and sent OP_BeginCast for our spawn); `last_cast` is how the most
+    /// recent cast ENDED and persists afterwards, so an agent that polls rather than long-polls
+    /// `/v1/events/combat` can still tell *casting* / *landed* / *fizzled* / *interrupted* /
+    /// *never started* apart. Both were previously tracked internally and published nowhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub casting:            Option<CastingView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_cast:          Option<LastCastView>,
 }
 pub type PlayerInfo = Arc<Mutex<PlayerState>>;
+
+/// A cast in flight, for `/v1/observe/debug` → `casting` (#348).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CastingView {
+    pub spell_id:   u32,
+    pub spell_name: String,
+    /// Total cast time the server announced in OP_BeginCast, and how much of it has elapsed.
+    pub cast_ms:    u32,
+    pub elapsed_ms: u64,
+}
+
+/// How the player's most recent cast ended, for `/v1/observe/debug` → `last_cast` (#348).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LastCastView {
+    /// 0 when the server never named the spell (an honest unknown, not a guess).
+    pub spell_id:   u32,
+    pub spell_name: String,
+    /// `cast_completed` | `cast_interrupted` | `cast_fizzled` | `cast_failed` — the same value the
+    /// matching `/v1/events/combat` event carries as its `kind`.
+    pub outcome:    String,
+    /// The server's own line ("Your spell fizzles!", "Insufficient Mana to cast this spell!", …).
+    pub text:       String,
+    pub ago_secs:   u64,
+}
 
 /// Turn an entity key like "Guard_Phaeton000" into a display name "Guard Phaeton".
 pub fn clean_entity_name(raw: &str) -> String {

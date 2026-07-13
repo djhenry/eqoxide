@@ -215,6 +215,52 @@ pub struct CastState {
     pub cast_ms: u32,
 }
 
+/// Sentinel for an empty spell gem. The RoF2 PlayerProfile writes `0xFFFF_FFFF` into unused
+/// `mem_spells[]` slots (see `apply_player_profile`) and OP_MemorizeSpell `scribing=2` (un-memorize)
+/// writes the same value; a freshly-constructed `GameState` starts at 0 before the first profile
+/// arrives. Both mean "nothing memorized here" — see [`gem_is_empty`]. (eqoxide#348)
+pub const EMPTY_GEM: u32 = 0xFFFF_FFFF;
+
+/// True when spell-gem slot content `spell_id` holds no spell. Casting such a gem is a no-op on the
+/// server (it never answers), so every caller must refuse it *loudly* rather than queue it.
+pub fn gem_is_empty(spell_id: u32) -> bool {
+    spell_id == 0 || spell_id == EMPTY_GEM
+}
+
+/// How the player's most recent spell cast ENDED (eqoxide#348). Published on
+/// `/v1/observe/debug.last_cast` and, as it happens, on the `/v1/events/combat` feed — so an agent
+/// can tell *casting* / *landed* / *fizzled* / *interrupted* / *never started* apart instead of
+/// scraping free text out of the message log.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CastOutcome {
+    /// The spell that ended, or 0 when the server never told us which (see `GameState::ended_cast_spell`).
+    pub spell_id: u32,
+    /// `cast_completed` | `cast_interrupted` | `cast_fizzled` | `cast_failed` — the same string
+    /// used as the event `kind`, so the poll and the push agree.
+    pub kind: &'static str,
+    /// The human-readable line (also written to the message log).
+    pub text: String,
+    pub at: std::time::Instant,
+}
+
+// ── Cast-outcome string ids (EQEmu zone/string_ids.h) ─────────────────────────────────────────
+// The server reports a cast that never started, or that ended badly, as an eqstr id: either inside
+// OP_InterruptCast (`InterruptCast_Struct.messageid`, common/eq_packet_structs.h:446) or as a bare
+// OP_SimpleMessage (`Client::MessageString`, zone/client.cpp:3803-3823). These are the ids that
+// mean "your cast did not happen / did not finish".
+/// 173 — "Your spell fizzles!" (zone/string_ids.h:69; raised by the CheckFizzle path, zone/spells.cpp:318-345).
+pub const SPELL_FIZZLE: u32 = 173;
+/// 180 — "You miss a note, bringing your song to a close!" (the bard fizzle, zone/string_ids.h:71).
+pub const MISS_NOTE: u32 = 180;
+/// 439 — "Your spell is interrupted." (zone/string_ids.h:177; the default `InterruptSpell` message).
+pub const INTERRUPT_SPELL: u32 = 439;
+/// Cast-start refusals: the server never begins the cast and only says so as an OP_SimpleMessage.
+/// 106 "This spell does not work here.", 197 "Your spell is too powerful for your intended target.",
+/// 199 "Insufficient Mana to cast this spell!", 214 "You must first select a target for this spell!",
+/// 236 "Spell recast time not yet met.", 237 "Spell recovery time not yet met."
+/// (zone/string_ids.h:26,77,78,86,93,94.)
+pub const CAST_FAILED_STRING_IDS: [u32; 6] = [106, 197, 199, 214, 236, 237];
+
 /// One async game event the agent should know about as soon as it happens — surfaced via the
 /// `/v1/events/*` feed. `category` is the top-level bucket the events API filters on
 /// ("chat" | "combat" | "navigate" | "system"); `kind` is the sub-type within it (e.g. chat →
@@ -496,6 +542,17 @@ pub struct GameState {
     pub trainer_skills: Vec<u32>,
     /// Active cast in progress (Some) or idle (None).
     pub casting: Option<CastState>,
+    /// How the player's most recent cast ended (eqoxide#348). Kept after the cast so a slow poller
+    /// of `/v1/observe/debug` still learns the outcome it missed on the event feed.
+    pub last_cast: Option<CastOutcome>,
+    /// spell_id of the cast the server most recently told us STOPPED — from OP_ManaChange with
+    /// `keepcasting == 0`, which both `Mob::StopCasting` (zone/spells.cpp:1369) and
+    /// `Mob::SendSpellBarEnable` (zone/spells.cpp:5752) send with `spell_id = the cast that ended`.
+    /// It is the ONLY way to name the spell in a *fizzle*: EQEmu decides a fizzle in `DoCastSpell`
+    /// (zone/spells.cpp:318) **before** it ever sends OP_BeginCast (zone/spells.cpp:499), so
+    /// `casting` is still `None` when the fizzle message arrives. Consumed (taken) by
+    /// [`GameState::finish_cast`] so a stale id can never be pinned on a later cast. (eqoxide#348)
+    pub ended_cast_spell: Option<u32>,
     /// True when the player is sitting.
     pub sitting: bool,
     /// When the player's own death was first observed (OP_Death for our spawn), or None
@@ -597,6 +654,45 @@ impl GameState {
             directed,
             text: text.to_string(),
         });
+    }
+
+    /// The player's own cast bar has started (their OP_BeginCast came back). Publishes a
+    /// `combat`/`cast_begin` event so an agent long-polling `/v1/events/*` learns the server
+    /// actually accepted the cast — the previous code set `casting` and told nobody. (eqoxide#348)
+    pub fn begin_cast(&mut self, spell_id: u32, cast_ms: u32) {
+        self.casting = Some(CastState { spell_id, started: std::time::Instant::now(), cast_ms });
+        self.last_cast = None; // a new cast supersedes the previous outcome
+        let text = format!("You begin casting {}.", crate::spells::name_of(spell_id));
+        self.log_msg("spell", &text);
+        self.push_event("combat", "cast_begin", "", true, &text);
+    }
+
+    /// Terminal outcome for the player's cast: clear the cast bar, remember it for
+    /// `/v1/observe/debug`, log it, and push it onto the `/v1/events/combat` feed. `kind` is one of
+    /// `cast_completed` / `cast_interrupted` / `cast_fizzled` / `cast_failed`.
+    ///
+    /// `spell_id`: pass the id if the packet carried one (OP_MemorizeSpell does); otherwise pass 0
+    /// and we fall back to the in-flight cast, then to the id OP_ManaChange reported as ended (the
+    /// fizzle case, where no OP_BeginCast was ever sent). 0 = "the server never told us which
+    /// spell" — an honest unknown, not a guess. (eqoxide#348)
+    pub fn finish_cast(&mut self, spell_id: u32, kind: &'static str, text: &str) {
+        let spell_id = if spell_id != 0 {
+            spell_id
+        } else {
+            self.casting.as_ref().map(|c| c.spell_id)
+                .or(self.ended_cast_spell)
+                .unwrap_or(0)
+        };
+        self.casting = None;
+        self.ended_cast_spell = None; // consumed — never reuse it for a later cast
+        self.last_cast = Some(CastOutcome {
+            spell_id,
+            kind,
+            text: text.to_string(),
+            at: std::time::Instant::now(),
+        });
+        self.log_msg("spell", text);
+        self.push_event("combat", kind, "", true, text);
     }
 
     pub fn upsert_entity(&mut self, e: Entity) {

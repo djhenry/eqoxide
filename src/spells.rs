@@ -36,6 +36,20 @@ pub fn set_global(db: Arc<SpellDb>) { let _ = GLOBAL.set(db); }
 /// The global spell table, or `None` if it wasn't loaded (e.g. missing spells_us.txt).
 pub fn global() -> Option<&'static Arc<SpellDb>> { GLOBAL.get() }
 
+/// A spell's display name for the message log / event feed, e.g. "Minor Healing". Falls back to
+/// `spell <id>` when the table isn't loaded or the id is unknown, and to `an unknown spell` for id
+/// 0 — which is our explicit "the server never named the spell" sentinel, NOT a real spell.
+/// Never invents a name. (eqoxide#348)
+pub fn name_of(id: u32) -> String {
+    if id == 0 || id == crate::game_state::EMPTY_GEM {
+        return "an unknown spell".to_string();
+    }
+    global()
+        .and_then(|db| db.get(id))
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| format!("spell {id}"))
+}
+
 impl SpellDb {
     pub fn empty() -> Self { Self::default() }
 
