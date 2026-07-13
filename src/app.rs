@@ -11,8 +11,6 @@ use winit::{
 
 use glam::Vec4Swizzles as _;
 use crate::camera_state::{lerp3, lerp_angle, CameraCmd, CameraSnapshot, CameraState};
-use crate::eq_net::packet_handler::apply_packet;
-use crate::eq_net::transport::AppPacket;
 use crate::frame_capture::encode_frame_png;
 use crate::game_state::GameState;
 
@@ -159,7 +157,6 @@ pub struct App {
     pick_screen_w:  u32,
     pick_screen_h:  u32,
     // EQ state
-    game_state:   GameState,
     /// The `ArcSwap` handle the network thread publishes into every gameplay tick.
     game_state_snapshot: crate::http::GameStateSnapshot,
     /// This frame's cached load of `game_state_snapshot`. Refreshed at the top of poll_external
@@ -177,11 +174,13 @@ pub struct App {
     /// — instead of a background thread calling `process::exit()` and racing that teardown (SIGSEGV).
     shutdown:     std::sync::Arc<std::sync::atomic::AtomicBool>,
     scene:        SceneState,
-    app_rx:       tokio::sync::mpsc::UnboundedReceiver<AppPacket>,
     /// When an inbound server packet was last applied. Feeds the connection-health signal
     /// (`connected`/`last_packet_age_ms`) so a dead/frozen server is distinguishable from an idle
     /// one instead of the world silently freezing (eqoxide#8).
     last_inbound: std::time::Instant,
+    /// The network thread's live "time of last real inbound packet" handle — polled once per
+    /// `poll_external` and compared against `last_inbound` to detect a fresh arrival.
+    last_inbound_shared: crate::http::LastInboundShared,
     // Frame capture for /frame API
     frame_req:    FrameReq,
     // Live player state for the /debug endpoint.
@@ -243,8 +242,8 @@ impl App {
         character_name:  String,
         camera_cmd:      Arc<Mutex<Option<CameraCmd>>>,
         camera_snapshot: Arc<Mutex<CameraSnapshot>>,
-        app_rx:          tokio::sync::mpsc::UnboundedReceiver<AppPacket>,
         game_state_snapshot: crate::http::GameStateSnapshot,
+        last_inbound_shared: crate::http::LastInboundShared,
         frame_req:       FrameReq,
         goto_target:     crate::http::GotoTarget,
         acts:            crate::ui::Actions,
@@ -268,18 +267,17 @@ impl App {
         let ui_state = crate::ui::UiState::new(&character_name, eq_ui_dir);
         // Distinct per-client window title (#297): "{account} {character} - EQOxide".
         let window_title = format!("{} {} - EQOxide", asset_user, character_name);
-        let mut game_state = GameState::new();
-        game_state.player_name = character_name;
-
         if testzone_mode {
-            game_state.zone_name = "testzone".to_string();
-            game_state.zone_changed = true;
-            tracing::info!("APP: --testzone mode, will load debug zone");
             // No network thread runs in --testzone mode (it's skipped entirely in main.rs), so
             // nothing else will ever publish into `game_state_snapshot` — it would otherwise sit
             // on the initial `GameState::new()` default forever. Seed it here so `game_state_view`
-            // (what the scene build reads, since Task 4) sees the debug-zone bootstrap.
-            game_state_snapshot.store(std::sync::Arc::new(game_state.clone()));
+            // (what the scene build reads) sees the debug-zone bootstrap.
+            let mut gs = GameState::new();
+            gs.player_name = character_name.clone();
+            gs.zone_name = "testzone".to_string();
+            gs.zone_changed = true;
+            game_state_snapshot.store(std::sync::Arc::new(gs));
+            tracing::info!("APP: --testzone mode, will load debug zone");
         }
         let game_state_view = game_state_snapshot.load_full();
 
@@ -320,7 +318,7 @@ impl App {
             pick_cam_eye: [0.0; 3],
             pick_screen_w: 800,
             pick_screen_h: 600,
-            game_state, scene: SceneState::default(), app_rx, last_inbound: std::time::Instant::now(), frame_req,
+            scene: SceneState::default(), last_inbound: std::time::Instant::now(), frame_req,
             player_info, shutdown, collision: None, shared_collision,
             last_grounded_z: 0.0,
             prev_render_pos: [0.0, 0.0, 0.0],
@@ -340,7 +338,7 @@ impl App {
             models_loaded: false,
             asset_server_url, asset_user, asset_pass,
             window_title,
-            game_state_snapshot, game_state_view,
+            game_state_snapshot, game_state_view, last_inbound_shared,
             door_frac: std::collections::HashMap::new(),
         }
     }
@@ -748,11 +746,14 @@ impl App {
     fn poll_external(&mut self) -> bool {
         self.game_state_view = self.game_state_snapshot.load_full();
         let mut activity = false;
-
-        // Drain all queued packets; any packet may move/spawn an entity, so treat as activity.
-        while let Ok(packet) = self.app_rx.try_recv() {
-            apply_packet(&mut self.game_state, &packet);
-            self.last_inbound = std::time::Instant::now(); // connection-health heartbeat (#8)
+        // NOTE: no pointer-equality check on the snapshot here. The network thread republishes
+        // unconditionally every ~10ms, so a pointer change is meaningless as an activity signal —
+        // treating it as activity would pin the render loop permanently active. Real-packet arrival
+        // is detected via the network thread's heartbeat below (#8); nav-driven self-movement and
+        // door easing are covered by the glide/door checks later in this function.
+        let new_inbound = *self.last_inbound_shared.lock().unwrap();
+        if new_inbound != self.last_inbound {
+            self.last_inbound = new_inbound;
             activity = true;
         }
 

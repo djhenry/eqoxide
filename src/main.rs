@@ -158,8 +158,6 @@ OPTIONS:
         camera_state::CameraState::new([0.0, 0.0, 0.0], 0.0).snapshot(),
     ));
 
-    let (app_tx, app_rx) = tokio::sync::mpsc::unbounded_channel::<eq_net::AppPacket>();
-
     // Shared clean-shutdown flag. Set by window-close, a completed camp, and signals; observed by
     // the EQ network thread, which performs the logout sequence and exits the process.
     let shutdown: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
@@ -344,7 +342,7 @@ OPTIONS:
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
             rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, app_tx, 10, gt, nst, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, wr, fl, fq, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, pcm, sc, md, sd, cp, cu, rsp, cv, ni, pc, npv, nav, rb, gld, gla, gss, lis).await {
+                if let Err(e) = eq_net::run_login_flow(login_cfg, 10, gt, nst, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, wr, fl, fq, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, pcm, sc, md, sd, cp, cu, rsp, cv, ni, pc, npv, nav, rb, gld, gla, gss, lis).await {
                     tracing::error!("EQ: fatal: {e}");
                 }
             });
@@ -476,8 +474,8 @@ OPTIONS:
         character_name,
         camera_cmd,
         camera_snapshot,
-        app_rx,
         game_state_snapshot.clone(),
+        last_inbound_shared.clone(),
         frame_req,
         app_goto,
         app_actions,

@@ -5,11 +5,11 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{Duration, sleep};
 
 use crate::eq_net::login::WorldCredentials;
-use crate::eq_net::navigation::{Navigator, make_position_packet};
+use crate::eq_net::navigation::Navigator;
 use crate::eq_net::packet_handler::apply_packet;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
@@ -24,7 +24,6 @@ const RESPAWN_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 pub async fn run_gameplay_phase(
     stream_init:   EqStream,
     net_rx_init:   UnboundedReceiver<AppPacket>,
-    app_tx:        UnboundedSender<AppPacket>,
     mut gs:        GameState,
     char_name:     String,
     mut navigator: Navigator,
@@ -124,7 +123,6 @@ pub async fn run_gameplay_phase(
                     navigator.fulfill_who(&gs);
                 }
             }
-            let _ = app_tx.send(packet.clone());
 
             match packet.opcode {
                 // Another player is asking to trade with us: the server forwards their
@@ -225,8 +223,6 @@ pub async fn run_gameplay_phase(
                         gs.player_y = y;
                         gs.player_z = z;
                         tracing::info!("EQ: same-zone teleport → pos=({:.1},{:.1},{:.1})", x, y, z);
-                        // Send position update so the server knows where we are.
-                        let _ = app_tx.send(make_position_packet(gs.player_id, x, y, z, gs.player_heading));
                     } else {
                         // Cross-zone transition (#zone <name>): send OP_ZONE_CHANGE to
                         // trigger the full zone-change protocol (world reconnect, etc.).
@@ -289,10 +285,6 @@ pub async fn run_gameplay_phase(
                     s.send_app_packet(OP_LOOT_REQUEST, &corpse_id.to_le_bytes());
                     gs.loot_session_active = true;
                     gs.loot_last_activity = Some(std::time::Instant::now());
-                    // Mirror the session start into the RENDER GameState (internal-only packet):
-                    // this loop drives looting on the NAV gs only, but the Loot window gates on
-                    // the render-side scene.loot_active (see apply_ui_loot_state).
-                    let _ = app_tx.send(AppPacket { opcode: OP_UI_LOOT_STATE, payload: vec![1] });
                     tracing::info!("EQ: auto-loot: sent OP_LootRequest for corpse_id={}", corpse_id);
                 }
                 if gs.pending_loot.is_empty() {
@@ -307,9 +299,6 @@ pub async fn run_gameplay_phase(
                     s.send_app_packet(OP_END_LOOT_REQUEST, &[]);
                     gs.loot_session_active = false;
                     gs.loot_last_activity = None;
-                    // Mirror the session end (payload 0 also clears the render side's undrained
-                    // pending_loot) so the Loot window actually closes. (bug #4)
-                    let _ = app_tx.send(AppPacket { opcode: OP_UI_LOOT_STATE, payload: vec![0] });
                     gs.log_msg("loot", "Looting complete");
                     tracing::info!("EQ: auto-loot: sent OP_EndLootRequest (session complete)");
                     // Reset queued_at so the next corpse gets its own delay window.
@@ -321,13 +310,12 @@ pub async fn run_gameplay_phase(
         if world_reconnect_needed {
             tracing::info!("EQ: zone change approved — reconnecting to world for zone handoff");
             let ok = reconnect_via_world(
-                &mut stream, &mut net_rx, &app_tx, &mut gs, &char_name, &world_creds,
+                &mut stream, &mut net_rx, &mut gs, &char_name, &world_creds,
             ).await;
             if ok {
                 run_zone_entry_handshake(
                     stream.as_mut().unwrap(),
                     net_rx.as_mut().unwrap(),
-                    &app_tx,
                     &mut gs,
                 ).await;
                 navigator.sync_zone_points(&gs);
@@ -359,7 +347,6 @@ pub async fn run_gameplay_phase(
                     run_zone_entry_handshake(
                         stream.as_mut().unwrap(),
                         net_rx.as_mut().unwrap(),
-                        &app_tx,
                         &mut gs,
                     ).await;
                     navigator.sync_zone_points(&gs);
@@ -408,7 +395,7 @@ pub async fn run_gameplay_phase(
             *respawn.lock().unwrap() = false;
         }
 
-        navigator.tick(s, &mut gs, &app_tx);
+        navigator.tick(s, &mut gs);
 
         publish_snapshot(&gs, &game_state_snapshot);
 
@@ -447,7 +434,6 @@ async fn perform_clean_shutdown(
 async fn reconnect_via_world(
     stream:      &mut Option<EqStream>,
     net_rx:      &mut Option<UnboundedReceiver<AppPacket>>,
-    app_tx:      &UnboundedSender<AppPacket>,
     _gs:         &mut GameState,
     char_name:   &str,
     creds:       &WorldCredentials,
@@ -483,7 +469,6 @@ async fn reconnect_via_world(
         world_stream.poll_recv();
         world_stream.poll_resend(); // retransmit OP_SEND_LOGIN_INFO/ENTER_WORLD across the handoff (#254)
         while let Ok(packet) = world_rx.try_recv() {
-            let _ = app_tx.send(packet.clone());
             match packet.opcode {
                 // In a fresh-login reconnect, world sends OP_SEND_CHAR_INFO as the trigger.
                 // In a zoning=1 reconnect, world sends OP_APPROVE_WORLD (RoF2: 0x7499) instead.
@@ -552,7 +537,6 @@ async fn reconnect_via_world(
 async fn run_zone_entry_handshake(
     stream:  &mut EqStream,
     net_rx:  &mut UnboundedReceiver<AppPacket>,
-    app_tx:  &UnboundedSender<AppPacket>,
     gs:      &mut GameState,
 ) {
     // Clear stale entities now so OP_ZONE_SPAWNS can repopulate them.
@@ -570,7 +554,6 @@ async fn run_zone_entry_handshake(
         stream.poll_resend(); // retransmit OP_ZONE_ENTRY/ReqClientSpawn during zone-in (#254)
         while let Ok(packet) = net_rx.try_recv() {
             apply_packet(gs, &packet);
-            let _ = app_tx.send(packet.clone());
             match packet.opcode {
                 OP_NEW_ZONE if !done_new_zone => {
                     done_new_zone = true;
