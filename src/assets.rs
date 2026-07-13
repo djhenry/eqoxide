@@ -1453,7 +1453,14 @@ impl Collision {
         if !boxed_in(&s) { return s; }
         // Anchoring at the character's exact position got nowhere. Retry from the cell centre (the
         // classic #2/#205 rescue) before believing anything.
-        let retry = self.astar(start, goal, radius, avoid, cell, max_search, aggro_buffer, ctx, false);
+        let mut retry = self.astar(start, goal, radius, avoid, cell, max_search, aggro_buffer, ctx, false);
+        // Never LOSE a partial route by retrying. If the char-anchored search produced one and the
+        // cell-centre retry produced nothing, keep the one we had: the fine local tier steers on it,
+        // and dropping it is the same steering-starvation that stopped the halas swimmer — just
+        // reached through the other anchor (#377 review, N1).
+        if retry.path.is_none() && s.path.is_some() {
+            retry = Search { path: s.path, ..retry };
+        }
         if boxed_in(&retry) {
             // Both anchors are sealed in: the START is the problem, not the goal. Name it, so
             // `plan_path` re-anchors (#205) and `find_path_ex` reports `start_isolated` rather than
@@ -1569,12 +1576,29 @@ impl Collision {
         // INSIDE the region volume?", not by the goal cell's floor tier — a region's representative
         // point is an interior point of a VOLUME whose z is structurally never a floor height (#229).
         // Its walkability is not ours to judge here, so let the search answer it.
-        if resolved_goal_floor.is_none() && ctx.goal_region.is_none() {
-            tracing::info!("find_path: goal ({:.0},{:.0},{:.1}) has NO walkable floor under it — unreachable by construction (not searching)",
-                goal[0], goal[1], goal[2]);
-            return Search::no_route(NoRoute::GoalNotWalkable);
-        }
-        let goal_floor = resolved_goal_floor.unwrap_or(goal[2]);
+        //
+        // A SLOPPY Z IS NOT AN UNREACHABLE GOAL. Agents routinely pass a rough z (often 0, or a map
+        // coordinate), and the goal's real floor can sit well above it — `floor_beneath` only looks
+        // DOWN, so it finds nothing. An earlier version hard-failed those as `goal_not_walkable`,
+        // which is a FALSE definitive no: the XY is perfectly walkable and `main` routed to it fine
+        // (its wrong-tier `goal_fallback` accepted the goal cell at whatever tier it really had).
+        // Live North Qeynos: `goto (-40,250,z=0)` refused to move at all. So before giving up, snap
+        // the goal to the nearest floor ANYWHERE in its column — that is the goal the caller meant.
+        const COLUMN: f32 = 1000.0; // the whole column: we are asking "is there ANY floor at this XY?"
+        let goal_floor = match resolved_goal_floor
+            .or_else(|| self.nearest_floor(goal[0], goal[1], goal[2], COLUMN, COLUMN))
+        {
+            Some(f) => f,
+            // NO floor anywhere in the goal's column: off the mesh, or out over a void. THAT is an
+            // unacceptable goal, and it fails immediately and loudly — no flooding the grid for
+            // seconds and handing back a stub to wedge on (#337).
+            None if ctx.goal_region.is_none() => {
+                tracing::info!("find_path: goal ({:.0},{:.0},{:.1}) has NO walkable floor anywhere in its column \
+                    — unreachable by construction (not searching)", goal[0], goal[1], goal[2]);
+                return Search::no_route(NoRoute::GoalNotWalkable);
+            }
+            None => goal[2],
+        };
         // Start floor: anchor to the caller's EXACT (x,y), NOT the 8u cell center. Near a wall the
         // cell center can fall on the wall's footprint, whose only surface is the wall-TOP — so the
         // center probe would start the char up on the wall and route the whole path along it, a
@@ -1689,7 +1713,15 @@ impl Collision {
             best.map(|(c, r, _)| (c, r)).unwrap_or((sc, sr))
         };
         const CHEST: f32 = 3.0;
-        const MAX_NODES: usize = 200_000;
+        // The node cap is the ONLY bound on a search once the wall-clock budget is gone, so it also
+        // decides whether the definitive verdict `Unreachable(SearchClosed)` can ever be reached. At
+        // 200k it could NOT be, in exactly the zones where it matters most: gfaydark's 8u nav grid is
+        // ~390k cells, so a whole-zone flood hit the cap and downgraded to `Exhausted` ("I don't
+        // know") even when the frontier really was closable. Raised so a large zone can actually be
+        // surveyed to completion and told "no". Nothing real-time waits on this thread; the worker's
+        // 5 s safety net still bounds a pathological search, and it now bounds it HONESTLY (#377
+        // review, N3).
+        const MAX_NODES: usize = 1_000_000;
         // Wall-clock deadline: ONLY if the caller armed one (`PlanCtx`). `None` = run to completion.
         // The planner no longer runs on the net thread, so there is nothing real-time to protect and
         // no reason to make the answer unfalsifiable by cutting the search short (#340/#356). When a
@@ -2070,7 +2102,7 @@ impl Collision {
                 let progressed = best_toward.is_some() && best_toward_h + 1.0 < h(sc, sr);
                 match best_toward {
                     Some(bk) if progressed => {
-                        tracing::info!("find_path: partial route toward goal (expanded={}, {:.0}->{:.0} cells from goal, {})",
+                        tracing::info!("find_path: partial route toward goal (expanded={}, {:.0}->{:.0} UNITS from goal, {})",
                             expanded, h(sc, sr), best_toward_h,
                             match limit { Some(l) => l.as_str(), None => "frontier CLOSED — goal is UNREACHABLE" });
                         (bk, false)
@@ -2785,6 +2817,31 @@ mod tests {
         assert!(out.route().is_none(), "an unreachable goal must hand back NO route");
     }
 
+    /// **A SLOPPY GOAL Z IS NOT AN UNREACHABLE GOAL.** Agents routinely pass a rough z (0, or a map
+    /// coordinate) for a goal whose real floor sits well above it. Rejecting those as
+    /// `goal_not_walkable` is a FALSE definitive no — the XY is perfectly walkable, and `main`
+    /// routed to it fine. Caught live in North Qeynos: `goto (-40,250,z=0)` refused to move at all.
+    ///
+    /// The honest line is "is there ANY floor at this XY?": a bad z snaps to the real floor; a goal
+    /// off the mesh entirely still fails hard (asserted above).
+    #[test]
+    fn a_goal_with_a_sloppy_z_still_routes_to_its_real_floor() {
+        // Floor at z = 40. The caller asks for z = 0 — 40u BELOW it, far outside any tier tolerance,
+        // and `floor_beneath` only ever looks DOWN, so the old code resolved nothing and hard-failed.
+        let col = Collision::build(
+            &ZoneAssets { terrain: vec![slab(40.0, 0.0, 200.0, 0.0, 200.0, true)], objects: vec![], textures: vec![] },
+            32.0);
+        let out = col.find_path_ex([16.0, 16.0, 40.0], [180.0, 180.0, 0.0], 1.0, &[], 8.0, None, 0.0, PlanCtx::default());
+        let route = match &out {
+            PlanOutcome::Route(p) => p,
+            other => panic!("a walkable XY with a sloppy z must still ROUTE (snapping to its real \
+                             floor), not be dismissed as unreachable — got {other:?}"),
+        };
+        let last = *route.last().unwrap();
+        assert!((last[0] - 180.0).abs() < 8.0 && (last[1] - 180.0).abs() < 8.0,
+            "and the route must reach the goal XY, got {last:?}");
+    }
+
     /// **A BOXED-IN START MUST NEVER BE REPORTED AS "NO ROUTE TO THE GOAL".**
     ///
     /// The two failures look identical from outside — the frontier closes, the goal isn't in it —
@@ -2831,6 +2888,50 @@ mod tests {
             other => panic!("expected Unreachable(StartIsolated), got {other:?}"),
         }
         assert!(out.route().is_none(), "and no stub route out of the sealed cell — the walker must not drive it");
+    }
+
+    /// **The FINE LOCAL STEERING tier must keep its partial route even from a boxed-in start.**
+    ///
+    /// This is the test that was missing for live-bug #2 (the halas swimmer). `find_path_res` is the
+    /// fine 2u tier the walker steers on; its searches are bounded to 40u, so their explored
+    /// component is *always* small and they look "boxed in" by construction — a floating swimmer at
+    /// a shoreline especially so. An earlier `search()` wiped the partial on that path, the swimmer
+    /// lost its steering hint, stopped swimming, and wedged at the water's edge for 8 attempts while
+    /// the coarse planner cheerfully re-issued a perfect 78-waypoint route across the water.
+    ///
+    /// The honest planner API (`find_path_ex`) must still say `start_isolated` and hand back NO
+    /// route — an "Unreachable" carries no waypoints. Both halves are asserted here: they are
+    /// different questions, and this is exactly where they diverge.
+    #[test]
+    fn a_boxed_in_start_still_yields_a_partial_for_local_steering() {
+        let wall = |n0: f32, e0: f32, n1: f32, e1: f32| MeshData {
+            positions: vec![[n0, 0.0, e0], [n1, 0.0, e1], [n1, 40.0, e1], [n0, 40.0, e0]],
+            normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
+            texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let (n0, n1, e0, e1) = (88.0f32, 120.0f32, 88.0f32, 120.0f32);
+        let terrain = vec![
+            slab(0.0, 0.0, 400.0, 0.0, 400.0, true),
+            wall(n0, e0, n0, e1), wall(n1, e0, n1, e1),
+            wall(n0, e0, n1, e0), wall(n0, e1, n1, e1),
+        ];
+        let col = Collision::build(&ZoneAssets { terrain, objects: vec![], textures: vec![] }, 32.0);
+        let (start, goal) = ([92.0, 92.0, 0.0], [350.0, 350.0, 0.0]);
+
+        // The steering tier: it asked for a best-effort route and it must GET one. Starving it here
+        // is what stopped the swimmer.
+        let steer = col.find_path_res(start, goal, 1.0, &[], true, 8.0, None, 0.0, PlanCtx::default());
+        assert!(steer.is_some(),
+            "the FINE LOCAL STEERING tier (allow_partial) must still get a partial route from a boxed-in \
+             start — wiping it is what stopped the halas swimmer dead at the water's edge");
+        assert!(steer.unwrap().len() >= 2, "and it must be something the walker can actually steer along");
+
+        // The honest planner API, on the very same search, must still refuse to call that a route.
+        let out = col.find_path_ex(start, goal, 1.0, &[], 8.0, None, 0.0, PlanCtx::default());
+        assert!(matches!(out, PlanOutcome::Unreachable(NoRoute::StartIsolated)),
+            "the honest API must still report start_isolated, got {out:?}");
+        assert!(out.route().is_none(), "an Unreachable must carry no waypoints");
     }
 
     /// A partial route may only be walked when it makes GENUINE progress toward the goal. The old
