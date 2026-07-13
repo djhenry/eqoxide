@@ -275,35 +275,63 @@ pub async fn run_gameplay_phase(
         }
 
         // ── Auto-loot ──────────────────────────────────────────────────────────
-        // Open next corpse 500ms after it was queued (delay lets server register the corpse).
-        if !gs.loot_session_active {
-            let ready = gs.loot_queued_at
-                .map(|t| t.elapsed().as_millis() >= 500)
-                .unwrap_or(false);
-            if ready {
-                if let Some(corpse_id) = gs.pending_loot.pop_front() {
-                    s.send_app_packet(OP_LOOT_REQUEST, &corpse_id.to_le_bytes());
-                    gs.loot_session_active = true;
-                    gs.loot_last_activity = Some(std::time::Instant::now());
-                    tracing::info!("EQ: auto-loot: sent OP_LootRequest for corpse_id={}", corpse_id);
-                }
+        // `loot_tick_action` is the pure decision (no I/O, no gs); this loop performs whatever it
+        // decides and applies the resulting state. The one thing it NEVER decides is "Looting
+        // complete" — that message may only come from the inbound OP_LootComplete handler
+        // (apply_loot_complete in packet_handler.rs), never from this timer (#346).
+        match loot_tick_action(&LootTickState {
+            session_active:   gs.loot_session_active,
+            confirmed:        gs.loot_confirmed,
+            current_corpse:   gs.loot_current_corpse,
+            queued_at:        gs.loot_queued_at,
+            pending_front:    gs.pending_loot.front().copied(),
+            last_activity:    gs.loot_last_activity,
+            end_requested_at: gs.loot_end_requested_at,
+        }, std::time::Instant::now()) {
+            LootTickAction::None => {}
+            LootTickAction::Open(corpse_id) => {
+                gs.pending_loot.pop_front();
+                s.send_app_packet(OP_LOOT_REQUEST, &corpse_id.to_le_bytes());
+                gs.loot_session_active = true;
+                gs.loot_confirmed = false;
+                gs.loot_current_corpse = Some(corpse_id);
+                gs.loot_last_activity = Some(std::time::Instant::now());
+                gs.loot_end_requested_at = None;
                 if gs.pending_loot.is_empty() {
                     gs.loot_queued_at = None;
                 }
+                tracing::info!("EQ: auto-loot: sent OP_LootRequest for corpse_id={}", corpse_id);
             }
-        }
-        // Close session after 2 seconds of inactivity (all items have arrived)
-        if gs.loot_session_active {
-            if let Some(t) = gs.loot_last_activity {
-                if t.elapsed().as_secs_f32() > 2.0 {
-                    s.send_app_packet(OP_END_LOOT_REQUEST, &[]);
-                    gs.loot_session_active = false;
-                    gs.loot_last_activity = None;
-                    gs.log_msg("loot", "Looting complete");
-                    tracing::info!("EQ: auto-loot: sent OP_EndLootRequest (session complete)");
-                    // Reset queued_at so the next corpse gets its own delay window.
-                    gs.loot_queued_at = gs.pending_loot.front().map(|_| std::time::Instant::now());
-                }
+            LootTickAction::Close(corpse_id) => {
+                // Payload MUST be the corpse's spawn_id (4 bytes) — EQEmu's Handle_OP_EndLootRequest
+                // drops any OP_EndLootRequest whose size != sizeof(uint32) without replying, so the
+                // old empty-payload send could never have produced an OP_LootComplete at all
+                // (client_packet.cpp:6266).
+                s.send_app_packet(OP_END_LOOT_REQUEST, &corpse_id.to_le_bytes());
+                gs.loot_end_requested_at = Some(std::time::Instant::now());
+                tracing::info!(
+                    "EQ: auto-loot: sent OP_EndLootRequest for corpse_id={} — awaiting OP_LootComplete",
+                    corpse_id
+                );
+            }
+            LootTickAction::TimedOut => {
+                // OP_EndLootRequest got no OP_LootComplete ack in time. Say so honestly instead of
+                // fabricating "Looting complete", and unwedge the queue so later corpses aren't
+                // blocked forever.
+                let corpse = gs.loot_current_corpse.take();
+                gs.loot_session_active = false;
+                gs.loot_confirmed = false;
+                gs.loot_last_activity = None;
+                gs.loot_end_requested_at = None;
+                let msg = format!(
+                    "Loot failed — no close confirmation from the server (corpse_id={:?})",
+                    corpse
+                );
+                gs.log_msg("loot", &msg);
+                gs.push_event("loot", "failed", "system", true, &msg);
+                tracing::warn!("EQ: auto-loot: {}", msg);
+                // Reset queued_at so the next corpse gets its own delay window.
+                gs.loot_queued_at = gs.pending_loot.front().map(|_| std::time::Instant::now());
             }
         }
 
@@ -668,6 +696,95 @@ pub fn camp_expired(current: Option<std::time::Instant>, now: std::time::Instant
     matches!(current, Some(d) if now >= d)
 }
 
+// ── Auto-loot state machine (#346) ────────────────────────────────────────────
+// The invariant this exists to enforce: a success message ("Looting complete") may ONLY be
+// emitted from an inbound-packet handler (OP_LootComplete — see apply_loot_complete in
+// packet_handler.rs), never from a timer or at send time. `loot_tick_action` therefore has no
+// access to `GameState` at all — it can't call `log_msg`/`push_event` even by accident — it only
+// ever decides what packet (if any) the gameplay loop should send next.
+
+/// Delay after a corpse is queued before sending OP_LootRequest (lets the server register the
+/// corpse as lootable).
+const LOOT_OPEN_DELAY_MS: u128 = 500;
+/// How long to wait for item echoes to go quiet before asking the server to close a confirmed
+/// session (send OP_EndLootRequest).
+const LOOT_INACTIVITY_SECS: f32 = 2.0;
+/// How long to wait for OP_LootComplete after sending OP_EndLootRequest before giving up and
+/// reporting a failure instead of wedging the queue forever.
+const LOOT_END_TIMEOUT_SECS: f32 = 5.0;
+
+/// What the gameplay loop should do this tick for the auto-loot pipeline.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum LootTickAction {
+    /// Nothing to do.
+    None,
+    /// Send `OP_LootRequest` for this queued corpse.
+    Open(u32),
+    /// Item echoes have gone quiet on a CONFIRMED session — send `OP_EndLootRequest` for this
+    /// corpse (payload must be its spawn_id, not empty — see `OP_END_LOOT_REQUEST`'s doc).
+    Close(u32),
+    /// `OP_EndLootRequest` was sent but no `OP_LootComplete` arrived within the timeout — report a
+    /// failure and unwedge the queue; never silently claim "complete".
+    TimedOut,
+}
+
+/// The bits of loot state `loot_tick_action` needs, gathered by value so the decision is pure and
+/// unit-testable without a live `GameState`/stream (mirrors `camp_apply`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LootTickState {
+    /// `gs.loot_session_active` — true from the moment OP_LootRequest is sent.
+    pub session_active: bool,
+    /// `gs.loot_confirmed` — true only once the server accepted the request.
+    pub confirmed: bool,
+    /// `gs.loot_current_corpse` — the corpse the open/confirmed session is against, if any.
+    pub current_corpse: Option<u32>,
+    /// `gs.loot_queued_at` — when the current queue head was first queued.
+    pub queued_at: Option<std::time::Instant>,
+    /// `gs.pending_loot.front()` — the next corpse waiting to be opened, if any.
+    pub pending_front: Option<u32>,
+    /// `gs.loot_last_activity` — last time a loot-related packet arrived for this session.
+    pub last_activity: Option<std::time::Instant>,
+    /// `gs.loot_end_requested_at` — when OP_EndLootRequest was sent, awaiting OP_LootComplete.
+    pub end_requested_at: Option<std::time::Instant>,
+}
+
+/// Pure decision for one gameplay tick of the auto-loot pipeline. See `LootTickAction` for what
+/// each outcome means; see the module-level comment above for why this function must never touch
+/// `GameState` or emit a message itself.
+pub fn loot_tick_action(state: &LootTickState, now: std::time::Instant) -> LootTickAction {
+    if !state.session_active {
+        let ready = state.queued_at
+            .map(|t| now.duration_since(t).as_millis() >= LOOT_OPEN_DELAY_MS)
+            .unwrap_or(false);
+        if ready {
+            if let Some(id) = state.pending_front {
+                return LootTickAction::Open(id);
+            }
+        }
+        return LootTickAction::None;
+    }
+    if !state.confirmed {
+        // Sent but not yet accepted/refused by the server — wait. A refusal closes
+        // `session_active` immediately (see apply_money_on_corpse), so reaching here just means
+        // the accept/refuse ack hasn't landed yet.
+        return LootTickAction::None;
+    }
+    if let Some(sent) = state.end_requested_at {
+        if now.duration_since(sent).as_secs_f32() > LOOT_END_TIMEOUT_SECS {
+            return LootTickAction::TimedOut;
+        }
+        return LootTickAction::None;
+    }
+    if let Some(t) = state.last_activity {
+        if now.duration_since(t).as_secs_f32() > LOOT_INACTIVITY_SECS {
+            if let Some(id) = state.current_corpse {
+                return LootTickAction::Close(id);
+            }
+        }
+    }
+    LootTickAction::None
+}
+
 /// Publish the network thread's `GameState` for lock-free reads by the render/HTTP threads. Called
 /// once per gameplay tick, after every mutation for that tick (packet-applied and `Navigator::tick`'s
 /// own writes) has landed — see the call site in `run_gameplay_phase`.
@@ -740,6 +857,119 @@ mod camp_tests {
     #[test]
     fn idle_never_expires() {
         assert!(!camp_expired(None, Instant::now()));
+    }
+}
+
+/// Regression tests for #346 ("Looting complete" was a 2s timer, not an outcome). These pin down
+/// `loot_tick_action`'s decisions; the actual "Looting complete"/"loot refused" MESSAGES are
+/// covered separately in packet_handler.rs (apply_loot_complete / apply_money_on_corpse), since
+/// by design this function cannot emit them at all.
+#[cfg(test)]
+mod loot_tick_tests {
+    use super::*;
+    use std::time::{Duration as Dur, Instant};
+
+    #[test]
+    fn idle_with_no_queue_does_nothing() {
+        let now = Instant::now();
+        let st = LootTickState::default();
+        assert_eq!(loot_tick_action(&st, now), LootTickAction::None);
+    }
+
+    #[test]
+    fn queued_but_not_yet_500ms_does_nothing() {
+        let now = Instant::now();
+        let st = LootTickState {
+            queued_at: Some(now - Dur::from_millis(100)),
+            pending_front: Some(9),
+            ..Default::default()
+        };
+        assert_eq!(loot_tick_action(&st, now), LootTickAction::None);
+    }
+
+    #[test]
+    fn queued_past_500ms_opens_the_front_corpse() {
+        let now = Instant::now();
+        let st = LootTickState {
+            queued_at: Some(now - Dur::from_millis(600)),
+            pending_front: Some(9),
+            ..Default::default()
+        };
+        assert_eq!(loot_tick_action(&st, now), LootTickAction::Open(9));
+    }
+
+    /// THE #346 REGRESSION. The old code closed the session — and logged "Looting complete" —
+    /// after 2s of silence following the SEND of OP_LootRequest, whether or not the server ever
+    /// accepted it. A corpse that never opened must not look like a corpse that opened and was
+    /// empty, so an unconfirmed session must never time its way into a close.
+    #[test]
+    fn active_but_unconfirmed_session_never_closes_no_matter_how_long_it_waits() {
+        let now = Instant::now();
+        let st = LootTickState {
+            session_active: true,
+            confirmed: false, // server never sent an accepting OP_MoneyOnCorpse
+            current_corpse: Some(9),
+            last_activity: Some(now - Dur::from_secs(3600)),
+            ..Default::default()
+        };
+        assert_eq!(loot_tick_action(&st, now), LootTickAction::None,
+            "an unconfirmed session must wait for the server's accept/refuse ack, not a timer");
+    }
+
+    #[test]
+    fn confirmed_session_idle_past_2s_asks_to_close_the_current_corpse() {
+        let now = Instant::now();
+        let st = LootTickState {
+            session_active: true,
+            confirmed: true,
+            current_corpse: Some(9),
+            last_activity: Some(now - Dur::from_secs(3)),
+            ..Default::default()
+        };
+        assert_eq!(loot_tick_action(&st, now), LootTickAction::Close(9));
+    }
+
+    #[test]
+    fn confirmed_session_within_2s_of_activity_does_nothing() {
+        let now = Instant::now();
+        let st = LootTickState {
+            session_active: true,
+            confirmed: true,
+            current_corpse: Some(9),
+            last_activity: Some(now - Dur::from_millis(500)),
+            ..Default::default()
+        };
+        assert_eq!(loot_tick_action(&st, now), LootTickAction::None);
+    }
+
+    #[test]
+    fn end_requested_and_within_timeout_waits_for_loot_complete() {
+        let now = Instant::now();
+        let st = LootTickState {
+            session_active: true,
+            confirmed: true,
+            current_corpse: Some(9),
+            last_activity: Some(now - Dur::from_secs(3)),
+            end_requested_at: Some(now - Dur::from_secs(1)),
+            ..Default::default()
+        };
+        assert_eq!(loot_tick_action(&st, now), LootTickAction::None);
+    }
+
+    /// If the server's OP_LootComplete never shows up, the loop must say so (TimedOut) instead of
+    /// quietly declaring success or wedging the queue forever.
+    #[test]
+    fn end_requested_past_timeout_reports_timed_out() {
+        let now = Instant::now();
+        let st = LootTickState {
+            session_active: true,
+            confirmed: true,
+            current_corpse: Some(9),
+            last_activity: Some(now - Dur::from_secs(10)),
+            end_requested_at: Some(now - Dur::from_secs(6)),
+            ..Default::default()
+        };
+        assert_eq!(loot_tick_action(&st, now), LootTickAction::TimedOut);
     }
 }
 

@@ -605,33 +605,41 @@ fn plan_path(
     goal: [f32; 3],
     avoid: &[[f32; 2]],
     aggro_buffer: f32,
+    goal_region: Option<i32>,
 ) -> Option<Vec<[f32; 3]>> {
+    use crate::assets::PlanCtx;
     use crate::movement::PLAYER_RADIUS;
     // This runs on the network thread, so a slow plan delays keepalive/ACK handling. Long-range
     // pathing isn't time-critical, but if it ever gets THIS slow we want it visible — warn so a slow
     // plan can't silently starve the connection the way the zone-line scan did (#204).
     const SLOW_MS: u128 = 100;
     let t0 = std::time::Instant::now();
+    // ONE deadline for the WHOLE plan (#257/#302). This function makes up to 13 A* calls (the route
+    // + a 12-point re-anchor ring); each used to arm its OWN fresh budget, so the worst case was
+    // ~13 × 150 ms ≈ 2 s of synchronous stall on the network thread — long enough to miss keepalives
+    // and get dropped as linkdead. Sharing one deadline bounds the whole plan to the budget.
+    let plan_ctx = PlanCtx::budget().with_goal_region(goal_region);
     let plan = (|| {
         // Plan at the char's REAL collision radius only. The old fallback retried at half/quarter
         // radius to "thread narrower gaps" (#188), but PLAYER_RADIUS (1.0) is the native RoF2
         // collision sphere the movement controller actually enforces — a route planned at a smaller
         // clearance runs through gaps the char physically can't fit (the cells the nav-debug overlay,
         // which uses the full radius, correctly paints RED). The char then wedges trying to follow it
-        // (#310, and the #314 city-wall wedge). If the full-radius route is boxed out, fall through to
-        // a PARTIAL route (walk as far as is actually walkable, then re-path) — that keeps the char
-        // moving toward the goal without emitting an unfollowable path.
-        if let Some(p) = col.find_path_res(start, goal, PLAYER_RADIUS, avoid, false, 8.0, None, aggro_buffer) {
-            return Some(p);
-        }
-        // Fallback: no FULL route — walk a PARTIAL route as far toward the goal as A* can reach (the
-        // walker re-paths from the far end). Warn so this degraded routing is visible.
-        let partial = col.find_path_res(start, goal, PLAYER_RADIUS, avoid, true, 8.0, None, aggro_buffer);
-        if let Some(ref p) = partial {
+        // (#310, and the #314 city-wall wedge).
+        //
+        // ONE search, not two. This used to run find_path_res twice — once with allow_partial=false
+        // for a full route, then again with allow_partial=true for a partial — but `allow_partial` is
+        // only consulted AFTER A*'s search loop: both calls flooded the grid identically, so the
+        // second was pure duplicated work on the net thread (and, once the two shared a deadline, the
+        // first would eat the budget and starve the second). `find_path_ex` runs the search once and
+        // reports whether it REACHED the goal; a partial route (walk as far as is actually walkable,
+        // then re-path from there) is the same fallback as before, for half the time.
+        let (p, reached) = col.find_path_ex(start, goal, PLAYER_RADIUS, avoid, true, 8.0, None, aggro_buffer, plan_ctx)?;
+        if !reached {
             tracing::warn!("nav: no full route from ({:.0},{:.0}) to ({:.0},{:.0}) — walking a PARTIAL route ({} wp) toward it",
                 start[0], start[1], goal[0], goal[1], p.len());
         }
-        partial
+        Some(p)
     })();
     let ms = t0.elapsed().as_millis();
     if ms >= SLOW_MS {
@@ -657,11 +665,16 @@ fn plan_path(
         // A floor reachable from the char's height (generous down-search finds ground below a face).
         let Some(af) = col.nearest_floor(ax, ay, start[2], 20.0, 100.0) else { continue };
         let anchor = [ax, ay, af];
-        if let Some(mut p) = col.find_path_res(anchor, goal, PLAYER_RADIUS, avoid, true, 8.0, None, aggro_buffer) {
+        if let Some(p) = col.find_path_res(anchor, goal, PLAYER_RADIUS, avoid, true, 8.0, None, aggro_buffer, plan_ctx) {
             // Only worthwhile if the re-anchored start could actually move (more than the lone
             // start cell A* was stuck on) — otherwise it's the same dead spot.
-            if p.len() > 1 {
-                p.insert(0, anchor);
+            // `> 2`, not `> 1`: every route now begins AT its start point (find_path prepends it), so
+            // a route that goes nowhere is already len 2 and `> 1` would wave it through.
+            if p.len() > 2 {
+                // The anchor no longer needs prepending by hand — find_path already returns it as
+                // waypoint 0 (it was planned FROM the anchor), so the old insert would duplicate it
+                // and emit a zero-length first segment. The walker is still steered to the clean
+                // floor first, which was the point.
                 tracing::warn!("nav: start isolated at ({:.0},{:.0},{:.0}) — re-anchored to clean floor ({:.0},{:.0},{:.0})",
                     start[0], start[1], start[2], ax, ay, af);
                 return Some(p);
@@ -2396,8 +2409,15 @@ impl Navigator {
             // the destination (often a target mob), so its own camp must not be avoided.
             let av = *self.nav_avoid.lock().unwrap();
             let avoid = Self::aggro_avoid(gs, goal, av.enabled);
-            let route = self.collision.read().unwrap().as_ref().map(|c|
-                plan_path(c, [gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], &avoid, av.buffer));
+            let route = self.collision.read().unwrap().as_ref().map(|c| {
+                // Is this goal a ZONE LINE? Derived from the goal itself rather than carried as walker
+                // state, so it can't go stale behind a /goto issued from the API thread. The zone-line
+                // target is floor-projected (`find_zone_line_near`), so a `zone_line_at` at standing
+                // height there resolves the DRNTP region the char must end up INSIDE — which is what
+                // A* then accepts arrival on, instead of one cell at a tier the region's z never had (#229).
+                let goal_region = c.zone_line_at([goal.0, goal.1, goal.2 + 1.0]);
+                plan_path(c, [gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], &avoid, av.buffer, goal_region)
+            });
             match route {
                 // Collision loaded, but A* found NO navmesh route to the target. Report it and STOP,
                 // rather than silently straight-lining into geometry and looking "wedged" — a driver
@@ -2472,7 +2492,8 @@ impl Navigator {
             let local_goal = carrot_along(&self.path, self.path_i, [px, py], LOCAL_REACH).unwrap_or(coarse);
             self.local_path = self.collision.read().unwrap().as_ref()
                 .and_then(|c| c.find_path_res([px, py, gs.player_z], local_goal,
-                    crate::movement::PLAYER_RADIUS, &[], true, LOCAL_CELL, Some(LOCAL_BOUND), 0.0))
+                    crate::movement::PLAYER_RADIUS, &[], true, LOCAL_CELL, Some(LOCAL_BOUND), 0.0,
+                    crate::assets::PlanCtx::default()))
                 .unwrap_or_default();
             // Fresh plan from the current position → the fast-steering cursor (#311) resets to its
             // start; a stale index into a just-rebuilt path would just move the bug.
@@ -2632,10 +2653,14 @@ impl Navigator {
                 // stall (nav_repaths already counted) stops us.
                 let av = *self.nav_avoid.lock().unwrap();
                 let avoid = Self::aggro_avoid(gs, goal, av.enabled);
-                let fresh = self.collision.read().unwrap().as_ref().and_then(|c|
-                    plan_path(c, [gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], &avoid, av.buffer));
+                let fresh = self.collision.read().unwrap().as_ref().and_then(|c| {
+                    let goal_region = c.zone_line_at([goal.0, goal.1, goal.2 + 1.0]);
+                    plan_path(c, [gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], &avoid, av.buffer, goal_region)
+                });
                 if let Some(np) = fresh {
-                    if np.len() > 1 {
+                    // `> 2`, not `> 1`: every route now begins AT the character (find_path prepends
+                    // the start), so "it went nowhere" is len 2 — `> 1` would accept a dead re-path.
+                    if np.len() > 2 {
                         tracing::warn!("NAV: backed off downhill — re-pathing ({} wp, attempt {})",
                             np.len(), self.nav_repaths);
                         self.path = np;
@@ -2692,25 +2717,49 @@ impl Navigator {
         gs.player_heading = heading;
         // Swim when we're in water so the controller actively swims across/up to the surface instead
         // of trudging along the bottom (#191). The controller only swims when want_swim && in_water.
-        let swim = self.collision.read().unwrap().as_ref()
-            .is_some_and(|c| c.in_water([gs.player_x, gs.player_y, gs.player_z]));
+        // Probe the BODY, not just the feet: a character standing on a pool bottom can have its
+        // origin a hair below the water volume's lower bound while fully submerged (the qcat spawn
+        // shaft — floor at -69.97, water -69.5…-43.0), and a feet-only test then says "dry" and the
+        // controller trudges instead of swimming. Same probe as movement's `water_at` (#329).
+        let swim = self.collision.read().unwrap().as_ref().is_some_and(|c| {
+            c.in_water([gs.player_x, gs.player_y, gs.player_z])
+                || c.in_water([gs.player_x, gs.player_y, gs.player_z + 3.0])
+        });
         // Jump-edge execution (eqoxide#190): if the current path segment is a jump — a horizontal
         // hop bigger than any adjacent nav cell, which find_path only emits across a real gap — ask
         // the controller to jump. Gated on being near the takeoff waypoint so the leap starts
         // grounded at the near edge and doesn't re-trigger on landing; the forward wish_dir carries
         // it across (the ~22.7u reach the edge was sized for). The controller ignores jump unless
         // grounded, so it fires exactly once at takeoff.
+        // path[0] is the CHARACTER'S OWN position (find_path starts every route there so pure pursuit
+        // walks the first leg — see assets.rs). That opening leg is a plain step onto the nav grid,
+        // never one of A*'s jump edges (those span ≥2 cells BETWEEN cell centres), and it can be up
+        // to ~1.5 cells long — so testing it against JUMP_SEG_MIN would fire a bogus running jump at
+        // the start of every route. Jump edges can only appear from path_i ≥ 1.
         let jump = match (self.path.get(self.path_i), self.path.get(self.path_i + 1)) {
-            (Some(a), Some(b)) => {
+            (Some(a), Some(b)) if self.path_i >= 1 => {
                 let seg = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
                 let to_takeoff = ((gs.player_x - a[0]).powi(2) + (gs.player_y - a[1]).powi(2)).sqrt();
                 seg > JUMP_SEG_MIN && to_takeoff < JUMP_TAKEOFF_DIST
             }
             _ => false,
         };
+        // SWIM UP TO THE WAYPOINT (#329). A* emits water-ascent edges — swim up a flooded shaft, then
+        // haul out onto a ledge within ~2.5u of the water SURFACE — but nav only ever drove wish_dir
+        // horizontally and left the vertical entirely to buoyancy, which parks the character
+        // FLOAT_DEPTH (2u) BELOW the surface. A ledge A* considers a legal haul-out from the surface
+        // is then up to 4.5u above the character: past the 2u step-up, so it can never get out. That
+        // is the second half of the qcat spawn trap — the character correctly floats up the shaft and
+        // then bobs at the waterline under a ledge it cannot reach, for ever.
+        //
+        // So when swimming toward a waypoint the character cannot simply STEP up to, swim up at it,
+        // stopping a step short (the step-up then mounts the ledge). Only ever upward: descending is
+        // buoyancy's and gravity's business.
+        const SWIM_UP_RATE: f32 = 20.0; // u/s, comfortably under the controller's BUOY_RATE (30)
+        let wish_vspeed = if swim && target.2 > gs.player_z + 1.0 { SWIM_UP_RATE } else { 0.0 };
         *self.nav_intent.lock().unwrap() = Some(MoveIntent {
             wish_dir:    [dx / dist, dy / dist],
-            wish_vspeed: 0.0,
+            wish_vspeed,
             jump,
             want_swim:   swim,
             speed:       RUN_SPEED,
