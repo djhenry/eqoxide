@@ -183,47 +183,76 @@ struct LootBody {
     name: Option<String>,
 }
 
+/// A spawn's entity-list key names a corpse (the only class this endpoint is allowed to queue —
+/// eqoxide#346: a live mob or a nonexistent spawn must never be silently "looted").
+fn is_corpse_key(key: &str) -> bool {
+    key.to_lowercase().contains("corpse")
+}
+
+fn queue_loot(s: &HttpState, name: String, id: u32) -> (StatusCode, String) {
+    *s.loot.lock().unwrap() = Some(id);
+    tracing::info!("loot: queued corpse {:?} (spawn_id={})", name, id);
+    (StatusCode::OK, format!("looting {} (spawn_id={})", clean_entity_name(&name), id))
+}
+
 /// POST /v1/interact/loot — open a corpse and take all its items, reusing the auto-loot machinery
 /// (OP_LootRequest → echo each OP_LootItem → OP_EndLootRequest). Must be near the corpse; looted
 /// items land in inventory (see GET /v1/observe/inventory). Body: {"id":N} for a specific corpse
 /// spawn id, {"name":"..."} to fuzzy-match a corpse name, or {} for the nearest corpse.
+///
+/// Every path (id / name / nearest) is restricted to entities whose key names a corpse — eqoxide#346
+/// found that the explicit `id`/`name` paths had NO such check, so an unknown id defaulted to
+/// `format!("spawn {}", id)` and a 200, and a name like "rat" could match a live `a_rat01` standing
+/// next to `a_rat00's corpse`. A nonexistent id or a name matching no corpse is 404; a name matching
+/// more than one corpse is 409 (ambiguous) rather than silently picking one.
 async fn post_loot(
     State(s): State<HttpState>,
     OptionalJson(body): OptionalJson<LootBody>,
 ) -> (StatusCode, String) {
     let b = body.unwrap_or_default();
-    // Resolve to a corpse spawn id: explicit id > fuzzy name > nearest corpse.
-    let resolved: Option<(String, u32)> = if let Some(id) = b.id {
-        let name = s.entity_ids.lock().unwrap().iter()
-            .find(|(_, &v)| v == id).map(|(k, _)| k.clone())
-            .unwrap_or_else(|| format!("spawn {}", id));
-        Some((name, id))
-    } else if let Some(name) = &b.name {
+    if let Some(id) = b.id {
+        let ids = s.entity_ids.lock().unwrap();
+        let found = ids.iter().find(|(_, &v)| v == id).map(|(k, _)| k.clone());
+        drop(ids);
+        return match found {
+            Some(key) if is_corpse_key(&key) => queue_loot(&s, key, id),
+            Some(key) => (StatusCode::NOT_FOUND,
+                format!("spawn_id {} is not a corpse ({})", id, clean_entity_name(&key))),
+            None => (StatusCode::NOT_FOUND, format!("no spawn with id {}", id)),
+        };
+    }
+    if let Some(name) = &b.name {
         let ids = s.entity_ids.lock().unwrap();
         let nl = name.to_lowercase();
-        ids.iter()
-            .find(|(k, _)| k.to_lowercase().contains(&nl) || clean_entity_name(k).to_lowercase().contains(&nl))
-            .map(|(k, &id)| (k.clone(), id))
-    } else {
-        // Nearest corpse to the player (camera focus = player pos).
-        let focus = s.snapshot.lock().unwrap().focus;
-        let positions = s.entity_positions.lock().unwrap();
-        let ids = s.entity_ids.lock().unwrap();
-        positions.iter()
-            .filter(|(k, _)| k.to_lowercase().contains("corpse"))
-            .map(|(k, &(x, y, _))| {
-                let (dx, dy) = (x - focus[0], y - focus[1]);
-                (k.clone(), dx * dx + dy * dy)
-            })
-            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .and_then(|(k, _)| ids.get(&k).map(|&id| (k, id)))
-    };
+        let matches: Vec<(String, u32)> = ids.iter()
+            .filter(|(k, _)| is_corpse_key(k)
+                && (k.to_lowercase().contains(&nl) || clean_entity_name(k).to_lowercase().contains(&nl)))
+            .map(|(k, &v)| (k.clone(), v))
+            .collect();
+        drop(ids);
+        return match matches.len() {
+            0 => (StatusCode::NOT_FOUND, format!("no corpse matching {:?}", name)),
+            1 => { let (key, id) = matches[0].clone(); queue_loot(&s, key, id) }
+            n => (StatusCode::CONFLICT,
+                format!("ambiguous corpse name {:?} matches {} corpses — use {{\"id\":N}}", name, n)),
+        };
+    }
+    // Nearest corpse to the player (camera focus = player pos).
+    let focus = s.snapshot.lock().unwrap().focus;
+    let positions = s.entity_positions.lock().unwrap();
+    let ids = s.entity_ids.lock().unwrap();
+    let resolved = positions.iter()
+        .filter(|(k, _)| is_corpse_key(k))
+        .map(|(k, &(x, y, _))| {
+            let (dx, dy) = (x - focus[0], y - focus[1]);
+            (k.clone(), dx * dx + dy * dy)
+        })
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .and_then(|(k, _)| ids.get(&k).map(|&id| (k, id)));
+    drop(positions);
+    drop(ids);
     match resolved {
-        Some((name, id)) => {
-            *s.loot.lock().unwrap() = Some(id);
-            tracing::info!("loot: queued corpse {:?} (spawn_id={})", name, id);
-            (StatusCode::OK, format!("looting {} (spawn_id={})", clean_entity_name(&name), id))
-        }
+        Some((name, id)) => queue_loot(&s, name, id),
         None => (StatusCode::NOT_FOUND, "no corpse found to loot".into()),
     }
 }
@@ -408,5 +437,100 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert!(loot.lock().unwrap().is_none(),
             "a typo'd key must not silently fall through to looting the nearest corpse");
+    }
+
+    // --- loot: eqoxide#346 — every path must be restricted to an actual corpse -----------------
+    //
+    // Baseline on `main` before this fix: {"id":999999} (no such spawn) returned 200
+    // "looting spawn 999999", and {"name":"<a live mob>"} happily queued that live mob for
+    // looting because the id/name paths never checked `.contains("corpse")` (only the
+    // zero-body "nearest corpse" path did).
+
+    #[tokio::test]
+    async fn loot_nonexistent_id_is_404_not_200() {
+        let state = empty_state();
+        let loot = state.loot.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/loot")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"id":999999}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(loot.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn loot_live_mob_id_is_404_not_a_corpse() {
+        let state = empty_state();
+        // A live mob (non-corpse key) standing near a corpse.
+        seed_npc(&state, "a_rat01", 11, (2.0, 2.0, 0.0));
+        let loot = state.loot.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/loot")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"id":11}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND,
+            "an id that resolves to a live mob (not a corpse) must never be queued for looting");
+        assert!(loot.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn loot_live_mob_name_is_404_not_a_corpse() {
+        let state = empty_state();
+        seed_npc(&state, "a_rat01", 11, (2.0, 2.0, 0.0));
+        let loot = state.loot.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/loot")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"a_rat01"}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND,
+            "a name that only matches a live mob (not a corpse) must never be queued for looting");
+        assert!(loot.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn loot_ambiguous_name_is_409_not_a_silent_pick() {
+        let state = empty_state();
+        seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
+        seed_npc(&state, "a_rat001's corpse", 10, (3.0, 3.0, 0.0));
+        let loot = state.loot.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/loot")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"rat"}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT,
+            "a name matching multiple corpses must be reported as ambiguous, not silently resolved");
+        assert!(loot.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn loot_id_matching_a_corpse_still_works() {
+        let state = empty_state();
+        seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
+        let loot = state.loot.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/loot")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"id":9}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(*loot.lock().unwrap(), Some(9));
+    }
+
+    #[tokio::test]
+    async fn loot_unambiguous_name_matching_a_corpse_still_works() {
+        let state = empty_state();
+        seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
+        let loot = state.loot.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/loot")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"a_rat000"}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(*loot.lock().unwrap(), Some(9));
     }
 }
