@@ -1814,9 +1814,27 @@ pub fn attitude_name(faction: u32) -> &'static str {
     }
 }
 
-/// OP_Consider reply — the server's con of our target. Consider_Struct: playerid(u32) +
-/// targetid(u32) + faction(u32) + level(u32 = con color) + cur_hp + ... Sets the target
-/// (so its nameplate highlights) plus the con-color tint and a /consider log line.
+/// OP_Consider reply — the server's con of a spawn. Consider_Struct: playerid(u32) +
+/// targetid(u32) + faction(u32) + level(u32 = con color) + cur_hp + ...
+///
+/// A consider reply is data ABOUT a spawn, never a target-select (eqoxide#330). It used to write
+/// `gs.target_id`, which made it a 5th (uncounted) writer alongside the 4 that PR #327 routed
+/// through `set_target`: if the target changed (auto-combat retarget, hail, a second manual
+/// target) before a stale reply for the PREVIOUS target landed, this handler snapped
+/// `target_id`/`target_con*` back to that stale spawn while `target_name`/`target_hp_pct` kept
+/// the CURRENT target's values — a mismatched id+con vs name+hp split-brain. It no longer writes
+/// `target_id` at all.
+///
+/// The reply's spawn is NOT necessarily the current target, so the two halves are handled
+/// separately:
+///  - The chat line is ALWAYS logged. There are two OP_CONSIDER send sites (navigation.rs): the
+///    target path (preceded by `set_target`), and the *standalone* consider at navigation.rs:1932,
+///    fed by `POST /v1/combat/consider {"id":N}` — whose whole purpose is conning an arbitrary
+///    spawn that is deliberately NOT your target. Gating the log line on "is this the current
+///    target" would make that endpoint a silent no-op (200 OK, then nothing).
+///  - The `target_con` / `target_con_name` / `target_attitude` HUD+API fields describe the CURRENT
+///    target only, so those three writes are gated on the reply actually being about it. That is
+///    what closes #330: a stale reply can no longer overwrite the current target's con.
 fn apply_consider(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < 16 { return; }
     let target_id = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
@@ -1824,12 +1842,17 @@ fn apply_consider(gs: &mut GameState, payload: &[u8]) {
     let level     = u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
     let name = gs.entities.get(&target_id).map(|e| e.name.clone())
         .unwrap_or_else(|| "Your target".to_string());
-    gs.target_id  = Some(target_id);
-    gs.target_con = Some(con_color(level));
-    // #292: also record the structured difficulty tier + attitude enum so agents can read "how
-    // tough" from /observe/debug instead of scraping the localized chat line or the RGB tint.
-    gs.target_con_name = Some(con_level_name(level).to_string());
-    gs.target_attitude = Some(attitude_name(faction).to_string());
+
+    // Con fields describe the CURRENT target — only apply them when this reply is about it (#330).
+    if gs.target_id == Some(target_id) {
+        gs.target_con = Some(con_color(level));
+        // #292: also record the structured difficulty tier + attitude enum so agents can read "how
+        // tough" from /observe/debug instead of scraping the localized chat line or the RGB tint.
+        gs.target_con_name = Some(con_level_name(level).to_string());
+        gs.target_attitude = Some(attitude_name(faction).to_string());
+    }
+
+    // Always logged — a standalone consider of a non-target spawn must still report its result.
     let msg = format!("{} {}.", name, consider_message(faction));
     tracing::info!("EQ: consider: {msg}");
     gs.log_msg("combat", &msg);
@@ -2415,6 +2438,7 @@ mod tests {
         // faction@8, level@12). apply_consider must produce the attitude line + set the con color.
         let mut gs = GameState::new();
         gs.entities.insert(450, test_entity(450, "Guard_Phaeton", 100.0));
+        gs.set_target(450);
         let mut reply = [0u8; 20];
         reply[4..8].copy_from_slice(&450u32.to_le_bytes());   // targetid
         reply[8..12].copy_from_slice(&9u32.to_le_bytes());     // faction 9 = scowls, ready to attack
@@ -2423,6 +2447,28 @@ mod tests {
         let m = gs.messages.back().unwrap().text.clone();
         assert!(m.contains("Guard_Phaeton") && m.contains("scowls"), "attitude line: {m}");
         assert!(gs.target_con.is_some(), "con color must be set for the HUD tint");
+    }
+
+    #[test]
+    fn apply_consider_standalone_non_target_spawn_still_logs_the_con_line() {
+        // POST /v1/combat/consider {"id":N} sends OP_CONSIDER for an ARBITRARY spawn with no
+        // set_target (the "Standalone consider" send site, navigation.rs:1932) — conning a spawn
+        // that is deliberately NOT your target is the endpoint's whole purpose. The reply must
+        // still produce its chat line, or the endpoint is a silent no-op (200 OK, then nothing).
+        // The con FIELDS are target-scoped, so they must stay untouched here (#330).
+        let mut gs = GameState::new();
+        gs.entities.insert(450, test_entity(450, "Guard_Phaeton", 100.0));
+        // no set_target — nothing is targeted
+        let mut reply = [0u8; 20];
+        reply[4..8].copy_from_slice(&450u32.to_le_bytes());   // targetid
+        reply[8..12].copy_from_slice(&9u32.to_le_bytes());     // faction 9 = scowls
+        reply[12..16].copy_from_slice(&2u32.to_le_bytes());    // level (con color)
+        super::apply_consider(&mut gs, &reply);
+        let m = gs.messages.back().unwrap().text.clone();
+        assert!(m.contains("Guard_Phaeton") && m.contains("scowls"),
+            "standalone consider must still log its result line: {m}");
+        assert_eq!(gs.target_id, None, "a consider reply must never select a target");
+        assert_eq!(gs.target_con, None, "con fields are current-target-scoped; nothing is targeted");
     }
 
     #[test]
@@ -2445,8 +2491,12 @@ mod tests {
     #[test]
     fn apply_consider_sets_structured_con_fields() {
         // #292: apply_consider records the difficulty tier + attitude enum for /observe/debug.
+        // These three fields describe the CURRENT target (that's how /observe/debug exposes them),
+        // so this test targets the spawn first — see the standalone-consider test above for the
+        // non-target path, where the line is logged but these fields stay untouched (#330).
         let mut gs = GameState::new();
         gs.entities.insert(450, test_entity(450, "a_guard", 100.0));
+        gs.set_target(450);
         let mut reply = [0u8; 20];
         reply[4..8].copy_from_slice(&450u32.to_le_bytes());   // targetid
         reply[8..12].copy_from_slice(&9u32.to_le_bytes());     // faction 9 = scowls
@@ -2454,6 +2504,38 @@ mod tests {
         super::apply_consider(&mut gs, &reply);
         assert_eq!(gs.target_con_name.as_deref(), Some("red"), "difficulty tier stored");
         assert_eq!(gs.target_attitude.as_deref(), Some("scowls"), "attitude enum stored");
+    }
+
+    #[test]
+    fn apply_consider_stale_reply_logs_but_does_not_overwrite_current_target_con() {
+        // #330: a manual target on A sends OP_CONSIDER, but the reply can land after we've
+        // already retargeted to B (auto-combat retarget, hail, or a second manual target).
+        // The stale reply must NOT clobber target_id/con back to A while target_name/target_hp_pct
+        // still hold B's values (the split-brain bug) — but it must STILL log its chat line: the
+        // reply is a legitimate con result for A, and the same code path serves the standalone
+        // /v1/combat/consider endpoint, which cons non-target spawns on purpose.
+        let mut gs = GameState::new();
+        gs.entities.insert(1, test_entity(1, "mob_a", 80.0));
+        gs.entities.insert(2, test_entity(2, "mob_b", 55.0));
+        gs.set_target(1); // target A
+        gs.set_target(2); // retarget to B before A's consider reply arrives
+
+        let mut reply = [0u8; 20];
+        reply[4..8].copy_from_slice(&1u32.to_le_bytes());     // targetid = A (stale)
+        reply[8..12].copy_from_slice(&9u32.to_le_bytes());     // faction 9 = scowls
+        reply[12..16].copy_from_slice(&13u32.to_le_bytes());   // level 13 = red
+        super::apply_consider(&mut gs, &reply);
+
+        assert_eq!(gs.target_id, Some(2), "target_id must still be B, not snap back to A");
+        assert_eq!(gs.target_name.as_deref(), Some("mob_b"), "target_name must still be B's");
+        assert_eq!(gs.target_hp_pct, Some(55.0), "target_hp_pct must still be B's");
+        assert_eq!(gs.target_con, None, "A's stale con must not be applied to B");
+        assert_eq!(gs.target_con_name, None, "A's stale con_name must not be applied to B");
+        assert_eq!(gs.target_attitude, None, "A's stale attitude must not be applied to B");
+
+        let m = gs.messages.back().unwrap().text.clone();
+        assert!(m.contains("mob_a") && m.contains("scowls"),
+            "the con result for A must still be logged, not silently swallowed: {m}");
     }
 
     fn inv_item(slot: i32, item_id: u32, charges: i32) -> crate::game_state::InvItem {

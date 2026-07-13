@@ -643,7 +643,7 @@ impl GameState {
     pub fn remove_entity(&mut self, spawn_id: u32) {
         self.entities.remove(&spawn_id);
         if self.target_id == Some(spawn_id) {
-            self.target_id = None;
+            self.clear_target(); // #331: also drops the now-stale name/hp/con, not just the id
         }
         if self.pet_id == Some(spawn_id) {
             self.pet_id = None; // pet died / despawned
@@ -684,6 +684,22 @@ impl GameState {
             self.target_name = None;
             self.target_hp_pct = None;
         }
+    }
+
+    /// Counterpart to [`GameState::set_target`] for "no target" (eqoxide#331): nulls every
+    /// target-derived field, not just `target_id`. Before this existed, `remove_entity` cleared
+    /// only `target_id` on a kill, leaving `target_name`/`target_hp_pct` (and, had anything
+    /// otherwise raced it, `target_con`/`target_con_name`/`target_attitude`) pointing at the
+    /// now-dead mob. The HUD hid the leak (it requires both id and name to be `Some`), but the
+    /// `/v1/observe/debug` HTTP snapshot doesn't, so it reported a dead target's name/HP forever
+    /// after every kill.
+    pub fn clear_target(&mut self) {
+        self.target_id = None;
+        self.target_name = None;
+        self.target_hp_pct = None;
+        self.target_con = None;
+        self.target_con_name = None;
+        self.target_attitude = None;
     }
 
     pub fn upsert_door(&mut self, d: Door) {
@@ -974,6 +990,29 @@ mod tests {
         gs.target_id = Some(10);
         gs.remove_entity(10);
         assert_eq!(gs.target_id, None);
+    }
+
+    #[test]
+    fn remove_entity_clears_all_target_fields() {
+        // eqoxide#331: killing the current target must clear ALL target-derived fields, not
+        // just target_id — otherwise the HTTP /v1/observe/debug snapshot (which, unlike the HUD,
+        // isn't gated on target_id being Some) keeps reporting the dead mob's name/HP forever.
+        let mut gs = GameState::new();
+        gs.upsert_entity(make_entity(10, "a rat", 0.0, 0.0, 0.0, true));
+        gs.set_target(10);
+        gs.target_con = Some([255, 0, 0]);
+        gs.target_con_name = Some("red".to_string());
+        gs.target_attitude = Some("scowls".to_string());
+        assert_eq!(gs.target_name.as_deref(), Some("a rat"));
+
+        gs.remove_entity(10);
+
+        assert_eq!(gs.target_id, None);
+        assert_eq!(gs.target_name, None, "must clear, not leak the dead mob's name");
+        assert_eq!(gs.target_hp_pct, None, "must clear, not leak the dead mob's hp");
+        assert_eq!(gs.target_con, None);
+        assert_eq!(gs.target_con_name, None);
+        assert_eq!(gs.target_attitude, None);
     }
 
     #[test]
