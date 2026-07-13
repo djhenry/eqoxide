@@ -14,9 +14,6 @@ use crate::camera_state::{lerp3, lerp_angle, CameraCmd, CameraSnapshot, CameraSt
 use crate::frame_capture::encode_frame_png;
 use crate::game_state::GameState;
 
-/// How long after a death `/v1/observe/debug` keeps reporting `killed_by` + `died_ago_secs` (so an
-/// infrequently-polling agent still sees a recent death, even after respawning). (#284)
-const DEATH_STICKY_SECS: u64 = 300;
 use crate::http::FrameReq;
 use crate::renderer::EqRenderer;
 use crate::scene::SceneState;
@@ -180,11 +177,15 @@ pub struct App {
     last_inbound: std::time::Instant,
     /// The network thread's live "time of last real inbound packet" handle — polled once per
     /// `poll_external` and compared against `last_inbound` to detect a fresh arrival.
-    last_inbound_shared: crate::http::LastInboundShared,
+    net_health: crate::http::NetHealthShared,
     // Frame capture for /frame API
     frame_req:    FrameReq,
-    // Live player state for the /debug endpoint.
-    player_info:  crate::http::PlayerInfo,
+    /// Smoothed per-phase frame timings, published for `/v1/observe/debug` → `frame_profile`.
+    /// This is the ONLY agent-facing value the render loop publishes: everything else an agent reads
+    /// is projected at HTTP read time from the network thread's `GameState` (#343). Publishing world
+    /// state from a loop whose whole design goal is to STOP RUNNING when nothing is happening is how
+    /// `connected: true` survived a dead connection forever.
+    frame_profile_shared: crate::http::FrameProfileShared,
     // Precomputed zone collision grid: floor grounding, camera collision, nameplate occlusion.
     // Held as Arc and also published to `shared_collision` so the nav thread can read it.
     collision:    Option<Arc<assets::Collision>>,
@@ -243,14 +244,14 @@ impl App {
         camera_cmd:      Arc<Mutex<Option<CameraCmd>>>,
         camera_snapshot: Arc<Mutex<CameraSnapshot>>,
         game_state_snapshot: crate::http::GameStateSnapshot,
-        last_inbound_shared: crate::http::LastInboundShared,
+        net_health: crate::http::NetHealthShared,
         frame_req:       FrameReq,
         goto_target:     crate::http::GotoTarget,
         acts:            crate::ui::Actions,
         spells:          std::sync::Arc<crate::spells::SpellDb>,
         door_click:      crate::http::DoorClickReq,
         shared_collision: assets::SharedCollision,
-        player_info:     crate::http::PlayerInfo,
+        frame_profile_shared: crate::http::FrameProfileShared,
         testzone_mode:   bool,
         nav_debug:       bool,
         shutdown:        std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -271,7 +272,11 @@ impl App {
             // No network thread runs in --testzone mode (it's skipped entirely in main.rs), so
             // nothing else will ever publish into `game_state_snapshot` — it would otherwise sit
             // on the initial `GameState::new()` default forever. Seed it here so `game_state_view`
-            // (what the scene build reads) sees the debug-zone bootstrap.
+            // (what the scene build reads) sees the debug-zone bootstrap. Since #343 this seed also
+            // backs `/v1/observe/debug` (which projects the player view straight off this snapshot);
+            // `render_frame` then republishes it each frame with the live controller position, so
+            // offline mode reports a moving player rather than a frozen seed. `connected` is
+            // correctly false throughout — there is genuinely no connection.
             let mut gs = GameState::new();
             gs.player_name = character_name.clone();
             gs.zone_name = "testzone".to_string();
@@ -319,7 +324,7 @@ impl App {
             pick_screen_w: 800,
             pick_screen_h: 600,
             scene: SceneState::default(), last_inbound: std::time::Instant::now(), frame_req,
-            player_info, shutdown, collision: None, shared_collision,
+            frame_profile_shared, shutdown, collision: None, shared_collision,
             last_grounded_z: 0.0,
             prev_render_pos: [0.0, 0.0, 0.0],
             entity_motion: std::collections::HashMap::new(),
@@ -338,7 +343,7 @@ impl App {
             models_loaded: false,
             asset_server_url, asset_user, asset_pass,
             window_title,
-            game_state_snapshot, game_state_view, last_inbound_shared,
+            game_state_snapshot, game_state_view, net_health,
             door_frac: std::collections::HashMap::new(),
         }
     }
@@ -764,9 +769,18 @@ impl App {
         // where a real inbound packet is applied (gameplay.rs's drain loop, login.rs, and the
         // zone/world reconnect handshakes), so mirror it here purely for the elapsed-time checks
         // further down — it does not gate `activity`.
-        let new_inbound = *self.last_inbound_shared.lock().unwrap();
+        // The HUD banner tracks LINK liveness (any inbound datagram), not application traffic —
+        // an idle world legitimately sends no app packets for 40+s and is not disconnected (#343).
+        let new_inbound = self.net_health.lock().unwrap().last_datagram;
         if new_inbound != self.last_inbound {
             self.last_inbound = new_inbound;
+        }
+        // The HUD's "connection lost" banner is rendered, so it needs a frame to appear — and a dead
+        // connection produces no packets, hence no activity, hence no frame. Wake once whenever the
+        // health state flips so the human sees the banner (the API no longer depends on this: since
+        // #343 `connected` is derived at HTTP read time and needs no render at all).
+        if (self.last_inbound.elapsed().as_secs() >= crate::http::CONN_STALE_SECS) != self.scene.disconnected {
+            activity = true;
         }
 
         // Still loading a zone, or a reload is queued → keep rendering the progress screen.
@@ -851,69 +865,28 @@ impl App {
         self.scene = SceneState::from_game_state(&self.game_state_view, &self.door_frac);
         let dur_scene = prof_scene.elapsed();
 
-        // Update shared player state for the /debug HTTP endpoint.
-        {
-            let gs = &*self.game_state_view;
-            let pos = if self.camera_initialized { self.controller.pos } else { [gs.player_x, gs.player_y, gs.player_z] };
-            let h_cw = crate::eq_net::protocol::ccw_to_cw(gs.player_heading);
-            *self.player_info.lock().unwrap() = crate::http::PlayerState {
-                name:       gs.player_name.clone(),
-                zone:       gs.zone_name.clone(),
-                race:       gs.player_race.clone(),
-                class:      gs.player_class.clone(),
-                level:      gs.player_level as u32,
-                pos_east:   pos[0],
-                pos_north:  pos[1],
-                pos_up:     pos[2],
-                heading_ccw: gs.player_heading,
-                heading_cw:  h_cw,
-                server_corrections: gs.server_corrections,
-                mem_spells: gs.mem_spells,
-                skills:     gs.player_skills.clone(),
-                trainer_open:   gs.trainer_open.is_some(),
-                trainer_skills: gs.trainer_skills.clone(),
-                player_id:  gs.player_id,
-                target_id:  gs.target_id,
-                coin:       gs.coin,
-                hp_pct:        gs.hp_pct,
-                cur_hp:        gs.cur_hp,
-                max_hp:        gs.max_hp,
-                // Death state (#284). `dead` is live (held slain until /lifecycle/respawn);
-                // killed_by/died_ago_secs stay reported for DEATH_STICKY_SECS after death (through a
-                // respawn too) so an infrequent poller still sees it.
-                dead:          gs.player_dead,
-                killed_by:     gs.died_at
-                                   .filter(|t| t.elapsed().as_secs() < DEATH_STICKY_SECS)
-                                   .map(|_| gs.killed_by.clone()),
-                died_ago_secs: gs.died_at
-                                   .filter(|t| t.elapsed().as_secs() < DEATH_STICKY_SECS)
-                                   .map(|t| t.elapsed().as_secs()),
-                mana_pct:      gs.mana_pct,
-                cur_mana:      gs.cur_mana,
-                max_mana:      gs.max_mana,
-                xp_pct:        gs.xp_pct,
-                // Prefer the live entity (its hp_pct tracks combat via OP_HP_UPDATE); fall back to
-                // the target snapshot stored at target time if the entity is gone. Both gated on
-                // target_id being Some (#331 defence in depth) so a snapshot GameState::clear_target
-                // missed can never leak a stale name/HP into the API alongside a null id.
-                target_name:   gs.target_id.and_then(|id| gs.entities.get(&id).map(|e| e.name.clone())
-                                   .or_else(|| gs.target_name.clone())),
-                target_hp_pct: gs.target_id.and_then(|id| gs.entities.get(&id).map(|e| e.hp_pct)
-                                   .or(gs.target_hp_pct)),
-                // #292: con difficulty tier + attitude enum (from the last consider) and the
-                // target's level, only while something is targeted.
-                target_con:      gs.target_id.and(gs.target_con_name.clone()),
-                target_attitude: gs.target_id.and(gs.target_attitude.clone()),
-                target_level:    gs.target_id.and_then(|id| gs.entities.get(&id)).map(|e| e.level),
-                // Connection health (#8): time since the last inbound server packet. `connected`
-                // flips false after CONN_STALE_SECS of silence — the world is frozen, not idle.
-                last_packet_age_ms: self.last_inbound.elapsed().as_millis() as u64,
-                connected:          self.last_inbound.elapsed().as_secs() < crate::http::CONN_STALE_SECS,
-                // Previous frame's smoothed phase timings (this frame's aren't known yet).
-                frame_profile:      self.frame_profile,
-                // Most recently read book/note text (OP_ReadBook reply), for GET /v1/observe/item_text (#288).
-                book_text:          gs.last_book_text.clone(),
-            };
+        // Publish the render loop's ONLY agent-facing output: this frame's smoothed phase timings.
+        // Everything else the agent reads (`/v1/observe/debug`'s player block, `connected`,
+        // `last_packet_age_ms`) is now projected at HTTP read time from the network thread's
+        // GameState + the two liveness clocks (#343). It used to be published from right here — a
+        // loop that deliberately sleeps when no packets arrive — so a dead connection meant
+        // `connected` was never recomputed and reported `true`, frozen, forever.
+        *self.frame_profile_shared.lock().unwrap() = self.frame_profile;
+
+        // `--testzone` runs with NO network thread, so nothing else ever writes the GameState
+        // snapshot the API projects from — the reported position would otherwise stay frozen at
+        // App::new's seed forever (#343 review). Offline, the render loop IS the sole owner of
+        // GameState, so it publishes here. This is not a re-coupling of observation to rendering:
+        // in this mode there is no other owner, and `connected` stays honestly false (no datagram
+        // ever arrives) while `snapshot_age_ms` stays fresh.
+        if self.testzone_mode && self.camera_initialized {
+            let mut gs = (*self.game_state_view).clone();
+            gs.player_x       = self.controller.pos[0];
+            gs.player_y       = self.controller.pos[1];
+            gs.player_z       = self.controller.pos[2];
+            gs.player_heading = self.visual_heading;
+            crate::eq_net::gameplay::publish_snapshot(
+                &gs, &self.game_state_snapshot, &self.net_health);
         }
         // Mirror the health state into the scene so the HUD can show a "connection lost" banner (#8).
         self.scene.disconnected = self.last_inbound.elapsed().as_secs() >= crate::http::CONN_STALE_SECS;
