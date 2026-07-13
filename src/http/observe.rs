@@ -49,23 +49,29 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let nav_state = s.nav_state.lock().unwrap().clone();
     // Is nav running in a KNOWN-DEGRADED mode in this zone? (#229/#329)
     //
-    // A floor is an up-facing triangle, which is only meaningful if the zone's collision mesh is
-    // consistently wound. That is validated at zone load; if a zone ever FAILS the check, the
-    // floor-normal filter is switched off for it and nav reverts to the old facing-blind behaviour
-    // — in which a CEILING can be selected as the floor to stand on (the exact #329 bug: A* planned
-    // routes across qcat's ceiling plane). That fallback is deliberate — deleting every real floor
-    // in a mis-wound zone would be worse — but it MUST NOT be silent. A `tracing::warn!` is not
-    // observable to an agent driving this client over HTTP, and a client that quietly answers from a
-    // known-broken code path is lying by omission. So report it here, where the agent can see it.
+    // A floor is an up-facing triangle. Some zones bake real, walkable ground from INVERTED
+    // (down-facing) art — across the 34 cached zones the heaviest users are feerrott (667 firings),
+    // everfrost (614) and poknowledge (454) — so the floor-normal filter would delete it. Nav's
+    // safety valve admits the column's BOTTOM-MOST surface as ground when the filter leaves the
+    // column with no floor at all (nothing lies beneath ground; a ceiling always has a floor under
+    // it). That keeps the zone navigable, but the answer came from mis-wound art and the surface's
+    // true facing is unverified — a degraded answer, not a wrong one, and the agent must be able to
+    // SEE that rather than be quietly handed it.
     //
-    // `null` = healthy. Every zone shipped today clears the validation bar by >=6 points, so this is
-    // a latent guard rather than a live condition.
+    // `null` = the filter has answered every nav query in this zone from properly wound floors.
+    // Non-null = the fallback has fired `queries` times since zone load. A `tracing::warn!` is not
+    // observable to an agent driving this client over HTTP; a client that quietly answers from a
+    // degraded code path is lying by omission. So report it here, where the agent can see it.
     let nav_degraded = s.shared_collision.read().unwrap().as_ref().and_then(|col| {
-        (!col.floor_normals_ok()).then(|| serde_json::json!({
-            "reason": "floor_normals_unvalidated",
-            "detail": "this zone's collision mesh failed the winding check, so nav cannot tell a \
-                       floor from a ceiling; routes may be planned across ceilings and be unwalkable \
-                       (#329). Pathing in this zone is UNRELIABLE.",
+        let hits = col.fallback_hits();
+        (hits > 0).then(|| serde_json::json!({
+            "reason": "inverted_floor_art",
+            "queries": hits,
+            "detail": "parts of this zone's collision mesh are wound INVERTED (down-facing where \
+                       ground should face up), so nav cannot verify a floor's facing there and has \
+                       fallen back to accepting the column's lowest surface as ground. Routes \
+                       through those areas are planned on unverified ground and may be less \
+                       reliable (#329/#353).",
         }))
     });
     let (guild_name, guild_id, guild_rank) = {

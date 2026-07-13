@@ -223,3 +223,30 @@ thread has stopped publishing, so every other field is a stale snapshot regardle
 threads separate from the zone main loop, so a wedged zone can keep ACKing — `connected: true` with a
 climbing `last_packet_age_ms` is currently indistinguishable from a merely quiet zone. Detecting that
 needs an active request/response probe (tracked separately).
+
+---
+
+## Nav health (`nav_degraded`)
+
+`GET /v1/observe/debug` also carries **`nav_degraded`** — whether pathing in the current zone is
+running on a known-degraded code path. **`null` means healthy**; an object means it is not:
+
+```json
+"nav_degraded": {
+  "reason":  "inverted_floor_art",
+  "queries": 412,
+  "detail":  "parts of this zone's collision mesh are wound INVERTED ..."
+}
+```
+
+Nav treats a **floor** as an *up-facing* triangle, so a ceiling can never be mistaken for one
+(#329). But some zones bake real, walkable ground from **inverted (down-facing) art**, which that
+rule would delete — so when the facing filter leaves a column with no floor at all, nav falls back to
+accepting the column's **bottom-most** surface as ground (nothing lies beneath ground; a ceiling
+always has a floor under it). Those answers are *recovered*, not *verified*: their true facing is
+unknown, so routes crossing them may be less reliable.
+
+`queries` counts how many nav queries have been answered that way since the zone loaded. Read
+`nav_degraded != null` as *"pathing here is on unverified ground"* — it is not a routing failure, and
+it does not mean a route will fail. Use it to distinguish **"no route exists"** from **"this zone's
+pathing is known-unreliable"** when a `move/goto` behaves oddly.
