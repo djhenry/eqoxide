@@ -366,7 +366,11 @@ pub fn draw_nav_debug(
                         let rise = nf - cz;
                         let run = ((bx - cx).hypot(by - cy)).max(1e-3);
                         let grade_ok = !(rise > 0.0 && rise / run > MAX_WALK_GRADE);
-                        let clear = col.path_clear([cx, cy, cz + CHEST], [bx, by, nf + CHEST], 1.0);
+                        // The SAME clearance test A* runs, at the SAME radius and cell — never a
+                        // hand-rolled copy. An overlay that disagrees with the planner is an
+                        // overlay that lies about the planner (#358).
+                        let clear = col.edge_clear([cx, cy, cz + CHEST], [bx, by, nf + CHEST],
+                                                   crate::movement::PLAYER_RADIUS, CELL as f32);
                         if grade_ok && clear { chosen = Some((nf, true)); break; }
                         else if chosen.is_none() { chosen = Some((nf, false)); }
                     }

@@ -552,6 +552,14 @@ pub fn slide_move(
     }
 }
 
+/// Fine grid resolution of the LOCAL plan — the tier the walker actually steers along.
+///
+/// This is the tier whose edges A* validates against the character's whole collision volume rather
+/// than a ray (`assets::SWEPT_EDGE_MAX_CELL`, which a test pins to be >= this). The coupling is why
+/// the value lives here rather than inside `tick`: a silent change to either number un-arms the
+/// #358 fix on the only tier that enforces it.
+pub const LOCAL_CELL: f32 = 2.0;
+
 /// Consecutive no-progress nav ticks (~150 ms each) before the pure-pursuit walker is declared
 /// stuck and re-paths. ~3 s — long enough to ride out a brief wall-slide, short enough to recover.
 const NAV_STUCK_TICKS: u32 = 20;
@@ -2305,9 +2313,13 @@ impl Navigator {
             gs.recent_attackers.retain(|_, t| t.elapsed() < ATTACKER_TTL);
 
             let col = self.collision.read().unwrap();
+            // LINE of sight, not a walkable path: "is this NPC in the open in front of me", used only
+            // to drop targets behind a wall. `line_clear` (a centre ray) is the right primitive —
+            // `path_clear` now sweeps the player's whole collision volume (#358), which would also
+            // reject a perfectly attackable NPC standing in a doorway.
             let clear_to = |e: &crate::game_state::Entity| -> bool {
                 col.as_ref().map_or(true, |c| {
-                    c.path_clear([gs.player_x, gs.player_y, e.z + 3.0], [e.x, e.y, e.z + 3.0], 2.0)
+                    c.line_clear([gs.player_x, gs.player_y, e.z + 3.0], [e.x, e.y, e.z + 3.0], 2.0)
                 })
             };
             let alive_reachable = |id: u32| -> bool {
@@ -2706,7 +2718,6 @@ impl Navigator {
             // openings the 8u grid can't resolve. Fall back to the coarse aim if the fine plan can't
             // reach (a real local dead-end), so a local snag never stalls the whole route.
             const LOCAL_REACH: f32 = 24.0;   // how far ahead on the coarse route the fine plan aims
-            const LOCAL_CELL:  f32 = 2.0;    // fine grid resolution
             const LOCAL_BOUND: f32 = 40.0;   // cap the fine search radius (keeps it cheap)
             let local_goal = carrot_along(&self.path, self.path_i, [px, py], LOCAL_REACH).unwrap_or(coarse);
             // This is the ONE A* still on the net thread. It is bounded to LOCAL_BOUND (40u) at a 2u
