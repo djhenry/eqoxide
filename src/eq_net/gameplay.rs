@@ -50,10 +50,6 @@ pub async fn run_gameplay_phase(
         let rx = net_rx.as_mut().expect("net_rx always Some in loop");
         s.poll_recv();
         s.poll_resend(); // retransmit un-ACKed reliables so a lost packet doesn't linkdead us (#254)
-        // Link liveness (#343): mirror the transport's last-inbound-DATAGRAM time, which counts
-        // session-layer ACKs/keepalives, not just application packets. `connected` is derived from
-        // this — an idle world sends no app packets for 40+s, and that is not a disconnect.
-        net_health.lock().unwrap().last_datagram = s.last_datagram();
 
         // Relaxed: the flag is a self-contained shutdown signal with no happens-before
         // dependency on other data published by the setter (/exit or window-close).
@@ -369,7 +365,7 @@ pub async fn run_gameplay_phase(
             drop(stream.take());
             drop(net_rx.take());
             sleep(Duration::from_millis(800)).await;
-            match EqStream::connect(&zone_ip, zone_port, new_tx).await {
+            match EqStream::connect(&zone_ip, zone_port, new_tx, net_health.clone()).await {
                 Ok(new_stream) => {
                     stream = Some(new_stream);
                     net_rx = Some(new_rx);
@@ -496,7 +492,7 @@ async fn reconnect_via_world(
 
     let (world_tx, mut world_rx) = tokio::sync::mpsc::unbounded_channel::<AppPacket>();
     tracing::info!("EQ: reconnecting to world {}:{}", creds.world_host, creds.world_port);
-    let mut world_stream = match EqStream::connect(&creds.world_host, creds.world_port, world_tx).await {
+    let mut world_stream = match EqStream::connect(&creds.world_host, creds.world_port, world_tx, net_health.clone()).await {
         Ok(s) => s,
         Err(e) => { tracing::warn!("EQ: world reconnect failed: {e}"); return false; }
     };
@@ -569,7 +565,7 @@ async fn reconnect_via_world(
     sleep(Duration::from_millis(800)).await;
     tracing::info!("EQ: zone change: connecting to new zone {}:{}", zone_ip, zone_port);
     let (zone_tx, zone_rx) = tokio::sync::mpsc::unbounded_channel::<AppPacket>();
-    let mut zone_stream = match EqStream::connect(&zone_ip, zone_port, zone_tx).await {
+    let mut zone_stream = match EqStream::connect(&zone_ip, zone_port, zone_tx, net_health.clone()).await {
         Ok(s) => s,
         Err(e) => { tracing::warn!("EQ: zone change: zone connect failed: {e}"); return false; }
     };
@@ -617,7 +613,6 @@ async fn run_zone_entry_handshake(
     while std::time::Instant::now() < deadline && !done_client_ready {
         stream.poll_recv();
         stream.poll_resend(); // retransmit OP_ZONE_ENTRY/ReqClientSpawn during zone-in (#254)
-        net_health.lock().unwrap().last_datagram = stream.last_datagram();
         while let Ok(packet) = net_rx.try_recv() {
             apply_packet(gs, &packet);
             net_health.lock().unwrap().last_packet = std::time::Instant::now();
