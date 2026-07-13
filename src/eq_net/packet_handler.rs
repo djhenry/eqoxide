@@ -905,12 +905,10 @@ fn apply_move_item(gs: &mut GameState, payload: &[u8]) {
 fn apply_set_target(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < 4 { return; }
     let id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-    gs.target_id = Some(id);
-    gs.target_con = None;
-    match gs.entities.get(&id) {
-        Some(e) => { gs.target_name = Some(e.name.clone()); gs.target_hp_pct = Some(e.hp_pct); }
-        None    => { gs.target_name = None; gs.target_hp_pct = None; }
-    }
+    // GameState::set_target also clears target_con_name/target_attitude (not just target_con)
+    // and resolves the F1 self-target case — this handler used to duplicate a partial copy of
+    // that logic inline, which is exactly how the con_name/attitude clear got missed (#323).
+    gs.set_target(id);
 }
 
 fn apply_new_zone(gs: &mut GameState, payload: &[u8]) {
