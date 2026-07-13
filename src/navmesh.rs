@@ -737,7 +737,6 @@ impl NavMesh {
                 for (k, ns) in self.surfaces[base..hi].iter().enumerate() {
                     let ni = base + k;
                     if closed[ni] { continue; }
-                    let rise = ns.z - s.z;
 
                     // Edge admissibility + cost: the SAME function the component labeller uses, so
                     // A* can never refuse a move that reachability promised (or vice versa).
@@ -896,9 +895,24 @@ impl NavMesh {
         Ok(mesh)
     }
 
-    /// Is this mesh healthy enough to path on? A bake that produced almost nothing (a zone whose
-    /// collision mesh is missing — see #373 for nektulos/arena) must FALL BACK to the legacy grid and
-    /// say so, never silently path on a mesh that does not describe the world.
+    /// A SHALLOW health check: did the bake produce anything at all?
+    ///
+    /// # What this CANNOT detect — read before relying on it
+    ///
+    /// It does **not** tell you the mesh describes the world. It only tells you the bake was not
+    /// empty. In particular it does **NOT** catch a zone whose collision asset is missing its
+    /// terrain (nektulos, arena — #373): those bake *hundreds of thousands* of surfaces, so this
+    /// returns `true`, and the surfaces are simply at the wrong heights (in nektulos the nearest
+    /// surface sits a median 91u BELOW the ground EQEmu walks on).
+    ///
+    /// And falling back would not help anyway: the legacy grid reads the **same** absent geometry.
+    /// **There is no client-side mitigation for a zone with no ground in it** — #373 must be fixed in
+    /// the asset. (The `#150` "underworld fall-guard" is exactly such a mask: it clamps a character
+    /// that has already fallen ~91u through terrain that should have been there.)
+    ///
+    /// So this guard buys one thing only — it stops us pathing on a *totally* empty bake. Anything
+    /// stronger would be a safety net that isn't one, which is worse than no net: it lies to the next
+    /// engineer about what is covered.
     pub fn is_usable(&self) -> bool {
         self.surface_count() >= 500 && self.column_count() >= 200
     }
