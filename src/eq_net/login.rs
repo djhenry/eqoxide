@@ -136,7 +136,7 @@ pub async fn run_login_flow(
             tracing::warn!("EQ: retry {}/{}", attempt, max_retries);
             sleep(Duration::from_secs(3)).await;
         }
-        match run_login_phase(&config).await {
+        match run_login_phase(&config, &last_inbound).await {
             // A server-rejected create can't succeed on retry — surface it and stop now so the
             // user sees the real reason instead of an endless "Login timed out" loop. (#6)
             Err(LoginError::Fatal(e)) => return Err(e),
@@ -171,8 +171,15 @@ pub async fn run_login_flow(
 
 /// Run the full handshake (login → world → zone entry).
 /// Returns the live zone stream, its packet receiver, accumulated GameState, and world credentials.
+///
+/// `last_inbound` is bumped as real inbound packets are drained here, exactly like the gameplay
+/// loop's drain does (gameplay.rs) — this handshake can legitimately run past CONN_STALE_SECS
+/// (multiple server hops + a fresh char list), and without this the connection-health check
+/// (`connected` in `/v1/observe/debug`) would falsely go stale/disconnected while login is healthy
+/// and simply still in progress.
 async fn run_login_phase(
     config: &LoginConfig,
+    last_inbound: &crate::http::LastInboundShared,
 ) -> Result<(EqStream, UnboundedReceiver<AppPacket>, GameState, WorldCredentials), LoginError> {
     let (net_tx, mut net_rx) = mpsc::unbounded_channel::<AppPacket>();
 
@@ -195,6 +202,7 @@ async fn run_login_phase(
         while let Ok(packet) = net_rx.try_recv() {
             // Apply gameplay side effects.
             apply_packet(&mut gs, &packet);
+            *last_inbound.lock().unwrap() = std::time::Instant::now();
 
             // Handle login-protocol state transitions.
             match proto.handle(&packet, &mut stream, &gs) {
