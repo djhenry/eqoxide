@@ -11,6 +11,7 @@ pub fn router() -> Router<HttpState> {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CommandBody {
     /// Numeric PET_* command (2=attack, 4=follow, 5=guard here, 6=sit toggle, 28=back off), or
     /// use `name` instead.

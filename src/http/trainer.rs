@@ -15,6 +15,7 @@ pub fn router() -> Router<HttpState> {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct OpenBody { name: Option<String>, trainer: Option<String> }
 
 /// POST /v1/trainer/open {"trainer":"Name"} — open the GM-skills window with a (fuzzily-named) nearby
@@ -69,6 +70,7 @@ async fn get_list(State(s): State<HttpState>) -> Json<serde_json::Value> {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TrainBody { skill_id: u32 }
 
 /// POST /v1/trainer/train {"skill_id":N} — train one point of a skill at the open trainer. The server
