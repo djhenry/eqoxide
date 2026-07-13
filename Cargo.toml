@@ -17,6 +17,7 @@ path = "src/bin/render_model.rs"
 
 [dependencies]
 anyhow = "1"
+arc-swap = "1"
 image = { version = "0.25", default-features = false, features = ["bmp", "png", "dds", "tga"] }
 pollster = "0.3"
 serde = { version = "1", features = ["derive"] }

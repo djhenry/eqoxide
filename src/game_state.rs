@@ -5,7 +5,7 @@ use crate::scene::LogEntry;
 
 /// A zone exit point received in OP_SEND_ZONE_POINTS.
 /// Stored in EQ server convention: server_x = east, server_y = north, server_z = up.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ZonePoint {
     pub iterator:  u32,
     pub server_x:  f32,  // east  (wire field 'x')
@@ -16,7 +16,7 @@ pub struct ZonePoint {
 }
 
 /// A single entity in the zone (NPC or PC, not the player themselves).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Entity {
     pub spawn_id: u32,
     pub name: String,
@@ -61,7 +61,7 @@ impl Entity {
 
 /// A zone door (from OP_SpawnDoor). Position is stored in client convention
 /// (x = east, y = north, z = up), converted from the wire's y-first order.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Door {
     pub door_id: u8,
     pub name: String,        // model name, e.g. "DOOR1"
@@ -75,12 +75,11 @@ pub struct Door {
     pub door_param: u32,
     pub invert_state: bool,  // true = normally-open door
     pub is_open: bool,       // authoritative, from server
-    pub open_frac: f32,      // render-only: eases 0..1 toward is_open
 }
 
 /// One objective/step of a Task-system quest (from OP_TaskActivity). `done_count`/`goal_count`
 /// are the live progress (e.g. "kill 4 gnolls" -> goal 4, done 2).
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct TaskActivity {
     pub activity_id:   u32,
     pub activity_type: u32,
@@ -104,7 +103,7 @@ pub enum TaskStatus {
 /// A Task-system quest in the player's journal (from OP_TaskDescription + OP_TaskActivity). This is
 /// EQ's *native* quest log (server-pushed), distinct from the old-style Lua turn-in quests surfaced
 /// by tools/quest_finder.py + GET /v1/quests/givers. See docs/autonomous-play.md.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct ActiveTask {
     pub task_id:     u32,
     pub title:       String,
@@ -124,7 +123,7 @@ pub struct ActiveTask {
 /// One task offered by an open task-selector window (from `OP_TaskSelectWindow`, sent when an NPC
 /// script calls `tasksetselector` instead of auto-granting via `assigntask`). No content on this
 /// server's live scripts uses the selector path today, but the protocol path is real.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct TaskOffer {
     pub task_id: u32,
     /// The offering NPC's entity id — required by `OP_AcceptNewTask`'s `task_master_id` field.
@@ -137,7 +136,7 @@ pub struct TaskOffer {
 }
 
 /// One entry from the player's completed-task history (`OP_CompletedTasks`).
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct CompletedTaskEntry {
     pub task_id: u32,
     pub title: String,
@@ -146,7 +145,7 @@ pub struct CompletedTaskEntry {
 }
 
 /// One item in the player's inventory/equipment (decoded from OP_CharInventory / OP_ItemPacket).
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct InvItem {
     /// RoF2 wire slot id: equipment 0-22, general-inventory 23-32, cursor 33 (rof2_limits.h).
     /// Stored as-is from the server's OP_CharInventory / OP_ItemPacket main_slot field so that
@@ -197,7 +196,7 @@ pub fn bag_wire_parent(flat: i32) -> Option<(i32, u32)> {
 /// One item offered by an open merchant (decoded from OP_ItemPacket with PacketType=Merchant,
 /// sent by the server after a successful OP_ShopRequest). Drives `GET /trade/list` + the HUD
 /// merchant window. `merchant_slot` is the slot to pass to `POST /trade/buy`.
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct MerchantItem {
     pub merchant_slot: u32,
     pub item_id: u32,
@@ -209,7 +208,7 @@ pub struct MerchantItem {
 }
 
 /// Active spell-cast in progress.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CastState {
     pub spell_id: u32,
     pub started: std::time::Instant,
@@ -223,7 +222,7 @@ pub struct CastState {
 /// specifically to us (a /tell to our name, a GM message, or something happening to *us*). `id` is
 /// monotonic (1-based) per session so an agent can poll `?since=<id>` without missing or re-seeing
 /// events. NPC dialogue (say channel) is NOT recorded here — it stays in `messages`.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct ChatLogEvent {
     pub id:       u64,
     pub category: String,  // "chat" | "combat" | "navigate" | "system"
@@ -305,7 +304,14 @@ pub struct WhoEntry {
 }
 
 /// All state the renderer needs for one frame.
-#[derive(Debug, Default, Clone)]
+///
+/// `PartialEq` is load-bearing: `eq_net::gameplay::publish_snapshot` compares the freshly-mutated
+/// `GameState` against the last-published snapshot and only stores a new `Arc` when it actually
+/// changed. That makes the published Arc's pointer identity a complete "did anything happen"
+/// signal — the render loop's `poll_external` (app.rs) wakes on ANY network-thread mutation
+/// (inbound packet OR a client-initiated HTTP request handled by `Navigator::tick`), and a
+/// genuinely idle world lets the event loop sleep instead of spinning.
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct GameState {
     // Player
     pub player_id: u32,
@@ -653,6 +659,14 @@ impl GameState {
             e.max_hp = max_hp;
             e.hp_pct = (cur_hp as f32 / max_hp.max(1) as f32) * 100.0;
         }
+        // Keep the target HUD's HP gauge live: target_hp_pct is a stored snapshot (seeded
+        // when the target is selected — see Navigator::tick), not derived fresh from
+        // `entities` on every read, so it must be refreshed here whenever the update is for
+        // whichever spawn is currently targeted (mob or self via F1). (eqoxide#9, task 6)
+        if self.target_id == Some(spawn_id) {
+            self.target_hp_pct = Some(self.hp_pct).filter(|_| spawn_id == self.player_id)
+                .or_else(|| self.entities.get(&spawn_id).map(|e| e.hp_pct));
+        }
     }
 
     /// Apply a percent-only HP update (OP_MobHealth / `SpawnHPUpdate_Struct2`). A mob
@@ -665,6 +679,11 @@ impl GameState {
         if spawn_id != self.player_id {
             if let Some(e) = self.entities.get_mut(&spawn_id) {
                 e.hp_pct = hp_pct;
+            }
+            // Same live-refresh as update_hp (this path never fires for the player — see guard
+            // above — so no self-target branch is needed here).
+            if self.target_id == Some(spawn_id) {
+                self.target_hp_pct = Some(hp_pct);
             }
         }
     }
@@ -995,6 +1014,70 @@ mod tests {
         assert!((gs.hp_pct - 0.0).abs() < 1e-4);
     }
 
+    // --- GameState::update_hp / update_hp_pct live-sync `target_hp_pct` (eqoxide#9, task 6) ---
+    // target_hp_pct is a stored snapshot (seeded when a target is selected — see
+    // Navigator::tick), not derived fresh from `entities` on every HUD read, so these HP
+    // handlers must refresh it whenever the update is for whichever spawn is currently
+    // targeted — including the F1 self-target case, where the player is never present in
+    // `gs.entities` (register_spawn special-cases and skips the self-spawn).
+
+    #[test]
+    fn update_hp_refreshes_target_hp_pct_for_targeted_entity() {
+        let mut gs = GameState::new();
+        gs.upsert_entity(make_entity(7, "mob", 0.0, 0.0, 0.0, true));
+        gs.target_id = Some(7);
+        gs.update_hp(7, 50, 200);
+        let pct = gs.target_hp_pct.expect("target_hp_pct must be set for the targeted entity");
+        assert!((pct - 25.0).abs() < 1e-4, "expected 25.0, got {pct}");
+    }
+
+    #[test]
+    fn update_hp_leaves_target_hp_pct_untouched_for_non_targeted_entity() {
+        let mut gs = GameState::new();
+        gs.upsert_entity(make_entity(7, "mob", 0.0, 0.0, 0.0, true));
+        gs.upsert_entity(make_entity(8, "other mob", 0.0, 0.0, 0.0, true));
+        gs.target_id = Some(8);
+        gs.target_hp_pct = Some(99.0); // sentinel: whatever the targeted entity (8) last showed
+        gs.update_hp(7, 50, 200); // HP update for a DIFFERENT, non-targeted entity
+        assert_eq!(gs.target_hp_pct, Some(99.0), "target_hp_pct must not move for a non-targeted entity's HP update");
+    }
+
+    #[test]
+    fn update_hp_pct_refreshes_target_hp_pct_for_targeted_entity() {
+        let mut gs = GameState::new();
+        gs.upsert_entity(make_entity(7, "mob", 0.0, 0.0, 0.0, true));
+        gs.target_id = Some(7);
+        gs.update_hp_pct(7, 40.0);
+        assert_eq!(gs.target_hp_pct, Some(40.0), "target_hp_pct must live-sync with a percent-only HP update for the targeted entity");
+    }
+
+    #[test]
+    fn update_hp_pct_leaves_target_hp_pct_untouched_for_non_targeted_entity() {
+        let mut gs = GameState::new();
+        gs.upsert_entity(make_entity(7, "mob", 0.0, 0.0, 0.0, true));
+        gs.upsert_entity(make_entity(8, "other mob", 0.0, 0.0, 0.0, true));
+        gs.target_id = Some(8);
+        gs.target_hp_pct = Some(99.0); // sentinel
+        gs.update_hp_pct(7, 40.0); // percent-only update for a DIFFERENT, non-targeted entity
+        assert_eq!(gs.target_hp_pct, Some(99.0), "target_hp_pct must not move for a non-targeted entity's percent-only HP update");
+    }
+
+    #[test]
+    fn update_hp_self_target_refreshes_target_hp_pct_from_player_hp() {
+        // F1 (self-target): target_id == player_id. The player is never present in
+        // `entities` (register_spawn special-cases and skips the self-spawn), so this must
+        // take the `spawn_id == self.player_id` branch and source target_hp_pct from the
+        // player's own hp_pct field rather than `entities.get(&spawn_id)` (which would find
+        // nothing and leave target_hp_pct stuck / unset).
+        let mut gs = GameState::new();
+        gs.player_id = 1;
+        gs.target_id = Some(1);
+        gs.update_hp(1, 30, 200); // 15%
+        assert!(!gs.entities.contains_key(&1), "player must never appear in entities");
+        let pct = gs.target_hp_pct.expect("target_hp_pct must be set for the self-target case");
+        assert!((pct - 15.0).abs() < 1e-4, "expected 15.0, got {pct}");
+    }
+
     #[test]
     fn set_xp_converts_330_ratio_to_percent() {
         let mut gs = GameState::new();
@@ -1069,7 +1152,7 @@ mod tests {
             door_id: 3, name: "DOOR1".into(),
             x: 10.0, y: 20.0, z: 5.0, heading: 0.0, incline: 0, size: 100,
             opentype: 5, door_param: 0, invert_state: false,
-            is_open: false, open_frac: 0.0,
+            is_open: false,
         });
         gs.set_door_open(3, true);
         assert!(gs.doors.get(&3).unwrap().is_open);
