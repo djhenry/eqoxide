@@ -454,10 +454,27 @@ pub struct GameState {
     // Loot state
     /// Corpse spawn_ids queued for auto-looting (populated by OP_BecomeCorpse).
     pub pending_loot: VecDeque<u32>,
-    /// True while a loot session is open (LootRequest sent, waiting for server items).
+    /// True from the moment OP_LootRequest is SENT until the server confirms it closed (via
+    /// OP_LootComplete) or refuses it (via OP_MoneyOnCorpse with a non-accept response). Do not
+    /// read this alone as "the corpse is open" — see `loot_confirmed` (#346).
     pub loot_session_active: bool,
-    /// Updated each time the server sends a loot packet; used to time out the session.
+    /// True only once the server has actually accepted the loot request (OP_MoneyOnCorpse with
+    /// response Normal/Normal2/LootAll). Distinguishes "we asked" from "it opened" — a refused
+    /// corpse (SomeoneElse/NotAtThisTime/Hostiles/TooFar) never sets this (#346).
+    pub loot_confirmed: bool,
+    /// Spawn id of the corpse the current loot session is open against, if any. Needed to build a
+    /// well-formed OP_EndLootRequest (the server requires the corpse's spawn_id as its payload —
+    /// an empty payload is silently dropped, #346) and to name the corpse in refusal messages.
+    pub loot_current_corpse: Option<u32>,
+    /// Updated each time the server sends a loot-related packet; used to notice item echoes have
+    /// gone quiet so it's time to ask the server to close the session (OP_EndLootRequest). This
+    /// no longer decides when "Looting complete" is reported — that only ever comes from the
+    /// inbound OP_LootComplete handler (#346).
     pub loot_last_activity: Option<std::time::Instant>,
+    /// Set when OP_EndLootRequest has been sent and we're waiting for the server's OP_LootComplete
+    /// close ack. If this elapses past a timeout with no ack, the session is reported as failed
+    /// (distinct from "complete") rather than silently assumed done (#346).
+    pub loot_end_requested_at: Option<std::time::Instant>,
     /// When the first corpse was pushed to pending_loot; used to delay LootRequest by
     /// 500 ms so the server has time to register the corpse as lootable.
     pub loot_queued_at: Option<std::time::Instant>,
