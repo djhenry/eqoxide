@@ -47,27 +47,6 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let health = s.health();
     let frame_profile = *s.frame_profile.lock().unwrap();
     let nav_state = s.nav_state.lock().unwrap().clone();
-    // Is nav running in a KNOWN-DEGRADED mode in this zone? (#229/#329)
-    //
-    // A floor is an up-facing triangle, which is only meaningful if the zone's collision mesh is
-    // consistently wound. That is validated at zone load; if a zone ever FAILS the check, the
-    // floor-normal filter is switched off for it and nav reverts to the old facing-blind behaviour
-    // — in which a CEILING can be selected as the floor to stand on (the exact #329 bug: A* planned
-    // routes across qcat's ceiling plane). That fallback is deliberate — deleting every real floor
-    // in a mis-wound zone would be worse — but it MUST NOT be silent. A `tracing::warn!` is not
-    // observable to an agent driving this client over HTTP, and a client that quietly answers from a
-    // known-broken code path is lying by omission. So report it here, where the agent can see it.
-    //
-    // `null` = healthy. Every zone shipped today clears the validation bar by >=6 points, so this is
-    // a latent guard rather than a live condition.
-    let nav_degraded = s.shared_collision.read().unwrap().as_ref().and_then(|col| {
-        (!col.floor_normals_ok()).then(|| serde_json::json!({
-            "reason": "floor_normals_unvalidated",
-            "detail": "this zone's collision mesh failed the winding check, so nav cannot tell a \
-                       floor from a ceiling; routes may be planned across ceilings and be unwalkable \
-                       (#329). Pathing in this zone is UNRELIABLE.",
-        }))
-    });
     let (guild_name, guild_id, guild_rank) = {
         let g = s.guild.lock().unwrap();
         (g.guild_name.clone(), g.guild_id, g.guild_rank)
@@ -139,10 +118,6 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
                 "ago_secs":   o.at.elapsed().as_secs(),
             })),
         },
-        // Nav health for THIS zone. `null` when nav is running normally; an object naming the
-        // degraded mode when it is not (see `nav_degraded` above). An agent must be able to tell
-        // "no route exists" from "this zone's pathing is known-unreliable".
-        "nav_degraded": nav_degraded,
         // Per-phase frame timings (ms, EMA-smoothed); all zero unless --profile / EQ_PROFILE=1.
         // Render-owned — the one field here the render loop legitimately publishes.
         "frame_profile": frame_profile,
