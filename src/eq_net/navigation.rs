@@ -1989,13 +1989,16 @@ impl Navigator {
             stream.send_app_packet(OP_SHOP_PLAYER_BUY, &buy);
             tracing::info!("EQ: shop buy sent — merchant_id={} slot={} qty=1", merchant_id, slot);
             // No optimistic "Bought item" log and no local spend_coin here (#345, generalizing the
-            // #269 sell fix): the server can refuse (KOS/out-of-range/insufficient funds/stale slot)
-            // with NO OP_ShopPlayerBuy echo at all — a buy can fail silently server-side — so
-            // deducting coin or logging success at send time fabricates a purchase that never
-            // happened. On success the server echoes THIS SAME opcode back (Merchant_Sell_Struct,
-            // price recomputed server-side) — apply_shop_player_buy (packet_handler.rs) is the only
-            // place that may deduct coin or log "Bought item", because it's the only place that
-            // knows the buy actually succeeded.
+            // #269 sell fix): the server can refuse — out-of-range/bad merchant/qty, a stale slot,
+            // or insufficient funds — with NO OP_ShopPlayerBuy echo at all, and the insufficient-funds
+            // case sends nothing whatsoever, so a buy can fail silently server-side. Deducting coin or
+            // logging success at send time therefore fabricates a purchase that never happened.
+            // (Note: KOS is NOT a refusal path — Handle_OP_ShopPlayerBuy has no faction check at all;
+            // faction only gates opening the window. A buy from an already-open KOS merchant succeeds.)
+            // On success the server echoes THIS SAME opcode back (Merchant_Sell_Struct, price
+            // recomputed server-side) — apply_shop_player_buy (packet_handler.rs) is the only place
+            // that may deduct coin or log "Bought item", because it's the only place that knows the
+            // buy actually succeeded.
         }
 
         // Merchant sell: open the merchant (OP_ShopRequest) then sell a player inventory slot

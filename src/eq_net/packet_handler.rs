@@ -83,10 +83,15 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_SHOP_PLAYER_SELL     => apply_shop_player_sell(gs, p),
         OP_SHOP_END_CONFIRM     => apply_shop_end_confirm(gs, p),
         OP_SHOP_END             => {
-            // Server confirmed the merchant window closed.
+            // NOT the NPC-merchant refusal/close signal — that's OP_ShopEndConfirm, above. Inbound
+            // OP_ShopEnd only arrives from the PLAYER-TRADER (bazaar) path: TraderEndTrader() when a
+            // trader we're shopping at shuts down (zone/trading.cpp:926) and CancelTraderTradeWindow()
+            // (:3872). eqoxide doesn't drive trader shops today, so this is effectively unreachable —
+            // but if it ever does arrive, dropping the stale session is the right move. No message: a
+            // trader closing their shop is not a refused purchase, and claiming otherwise would lie.
             gs.merchant_open = None;
             gs.merchant_items.clear();
-            tracing::info!("EQ: merchant window closed (OP_ShopEnd)");
+            tracing::info!("EQ: player-trader session ended (OP_ShopEnd)");
         }
         OP_TRADE_REQUEST_ACK    => {
             // Server acknowledged our OP_TradeRequest — the trade session now exists. The give
@@ -692,32 +697,60 @@ fn apply_looted_item(gs: &mut GameState, mut it: crate::game_state::InvItem) {
 /// or log "Bought item" (#345, generalizing the #269 sell fix). The server takes the money with
 /// `TakeMoneyFromPP(price)` — the default `update_client=false` overload — so no OP_MoneyUpdate
 /// ever follows a buy; this handler must apply the coin change itself once confirmed.
+///
+/// Note there is NO faction check anywhere in Handle_OP_ShopPlayerBuy (zone/client_packet.cpp
+/// 14126-14372): faction only gates *opening* the window (Handle_OP_ShopRequest :14648-14654,
+/// which rejects at DUBIOUS+ via MerchantRejectMessage). A buy from a KOS merchant whose window is
+/// already open therefore SUCCEEDS — KOS is not a buy-refusal path.
 fn apply_shop_player_buy(gs: &mut GameState, p: &[u8]) {
     if p.len() < 32 { return; }
     let itemslot = u32::from_le_bytes([p[8], p[9], p[10], p[11]]);
     let quantity = u32::from_le_bytes([p[16], p[17], p[18], p[19]]).max(1);
     let price    = u32::from_le_bytes([p[24], p[25], p[26], p[27]]);
-    gs.spend_coin(price as u64);
+
     let msg = format!("Bought item (slot {itemslot}) x{quantity} for {price}c");
     gs.log_msg("merchant", &msg);
     gs.push_event("merchant", "bought", "", true, &msg);
     tracing::info!("EQ: buy confirmed — itemslot={itemslot} qty={quantity} price={price}");
+
+    // The server HAS taken the coin (TakeMoneyFromPP). If our local snapshot can't cover the price
+    // it is already stale/drifted — spend_coin() would then deduct NOTHING and return false, which
+    // would leave `gs.coin` silently OVERSTATED. Never swallow that: the whole point of #345 is that
+    // the client must not report a balance it knows is wrong. Say so out loud (#345).
+    if !gs.spend_coin(price as u64) {
+        let warn = format!(
+            "Coin desync: server charged {price}c for the item above but our balance only showed \
+             {}p {}g {}s {}c — the real balance is lower than displayed",
+            gs.coin[0], gs.coin[1], gs.coin[2], gs.coin[3]
+        );
+        gs.log_msg("merchant", &warn);
+        gs.push_event("merchant", "coin_desync", "", true, &warn);
+        tracing::warn!("EQ: buy confirmed but local coin snapshot could not cover price={price} — coin is stale");
+    }
 }
 
-/// OP_ShopEndConfirm (server→client, 0-byte body) — EQEmu's SendMerchantEnd() sends this whenever a
-/// merchant session ends without completing a purchase (bad merchant/out-of-range/qty, or a stale
-/// item slot removed from the server's list — Handle_OP_ShopPlayerBuy's early-return paths). It's
-/// the closest thing to an explicit "refused" signal the buy path has; insufficient funds sends
-/// neither this nor the OP_ShopPlayerBuy echo, so absence of BOTH just means "no reply" (#345).
-/// Only surface it while a merchant window is actually open, so it can't be misread outside a buy.
+/// OP_ShopEndConfirm (server→client, 0-byte body) — EQEmu's SendMerchantEnd() (zone/client.cpp
+/// 13276-13286). For THIS client it is unambiguously a buy refusal. Every call site is either a
+/// buy-path early return — bad merchant / not-a-merchant / qty<1 / out-of-range
+/// (zone/client_packet.cpp:14151), a stale-or-removed item slot (:14194), or a negative price
+/// (:14254) — or Handle_OP_ShopEnd (:14123), which only ever runs in response to a client-sent
+/// OP_ShopEnd that eqoxide never sends (its merchant close is OP_ShopRequest with cmd=0).
+///
+/// This must NOT be gated on `merchant_open`. Handle_OP_ShopRequest returns SILENTLY, with no echo,
+/// for a non-merchant target (:14605-14607) and for an out-of-range one (:14610-14612) — so in
+/// exactly the case where this refusal is the only signal the server ever sends, `merchant_open` was
+/// never set. Gating on it would drop the one honest packet on the floor and leave the agent unable
+/// to tell "refused" from "no reply" — a quieter lie, but still a lie (#345 review).
+///
+/// Insufficient funds sends neither this nor the OP_ShopPlayerBuy echo, so the absence of BOTH still
+/// genuinely means "no reply". Silence is acceptable; a fabricated success is not.
 fn apply_shop_end_confirm(gs: &mut GameState, _p: &[u8]) {
-    if gs.merchant_open.take().is_some() {
-        gs.merchant_items.clear();
-        let msg = "Merchant refused the purchase (session ended)";
-        gs.log_msg("merchant", msg);
-        gs.push_event("merchant", "refused", "", true, msg);
-        tracing::info!("EQ: OP_ShopEndConfirm — merchant session ended (buy refused or window closed)");
-    }
+    gs.merchant_open = None;
+    gs.merchant_items.clear();
+    let msg = "Merchant refused the purchase (session ended)";
+    gs.log_msg("merchant", msg);
+    gs.push_event("merchant", "refused", "", true, msg);
+    tracing::info!("EQ: OP_ShopEndConfirm — merchant refused the purchase (session ended)");
 }
 
 /// OP_ShopPlayerSell (server→client echo) — confirms a sale completed. The server ENCODEs it as the
@@ -2474,20 +2507,57 @@ mod tests {
     }
 
     #[test]
-    fn apply_shop_end_confirm_refuses_open_session_without_spending() {
-        // A rejected buy (bad merchant/out-of-range/qty, or a stale slot) gets OP_ShopEndConfirm
-        // (0-byte body) instead of the OP_ShopPlayerBuy echo. It must close the merchant session and
-        // log a message DISTINCT from "Bought item" — never a fabricated success — and must not
-        // touch coin.
+    fn apply_shop_end_confirm_reports_refusal_with_no_merchant_session_open() {
+        // THE case that matters (#345 review): a fresh client buys from a merchant it is out of
+        // range of. Handle_OP_ShopRequest returns SILENTLY for an out-of-range/non-merchant target
+        // (zone/client_packet.cpp:14605-14612), so `merchant_open` is NEVER set; the buy then trips
+        // the same range check (:14151) and SendMerchantEnd() fires. OP_ShopEndConfirm is thus the
+        // ONLY signal the server ever sends — so it must be reported even with no session open.
+        // Gating this on `merchant_open` swallowed the refusal entirely and left the agent unable to
+        // tell "refused" from "no reply": a quieter lie, but still a lie.
+        let mut gs = GameState::new();
+        gs.coin = [10, 0, 0, 0];
+        assert_eq!(gs.merchant_open, None, "precondition: no merchant session was ever opened");
+
+        super::apply_shop_end_confirm(&mut gs, &[]);
+
+        let last = &gs.messages.back().expect("a refusal must be reported, not swallowed").text;
+        assert!(last.contains("refused"), "refusal should say so plainly: {last}");
+        assert!(!last.contains("Bought item"), "refusal must not read like a success: {last}");
+        assert!(gs.chat_events.iter().any(|e| e.kind == "refused"),
+            "a refusal must raise an event the agent can observe, even with no session open");
+        assert_eq!(gs.coin, [10, 0, 0, 0], "a refusal must never spend coin");
+    }
+
+    #[test]
+    fn apply_shop_end_confirm_ends_an_open_session_without_spending() {
+        // The same refusal arriving mid-session must also drop the stale merchant state.
         let mut gs = GameState::new();
         gs.coin = [10, 0, 0, 0];
         gs.merchant_open = Some(123);
         super::apply_shop_end_confirm(&mut gs, &[]);
-        assert_eq!(gs.coin, [10, 0, 0, 0], "a refusal must never spend coin");
         assert_eq!(gs.merchant_open, None, "refusal ends the merchant session");
-        let last = &gs.messages.back().unwrap().text;
-        assert!(!last.contains("Bought item"), "refusal must not read like a success: {last}");
-        assert!(last.contains("refused"), "refusal should say so plainly: {last}");
+        assert_eq!(gs.coin, [10, 0, 0, 0], "a refusal must never spend coin");
+    }
+
+    #[test]
+    fn apply_shop_player_buy_surfaces_a_coin_desync_instead_of_overstating_the_balance() {
+        // spend_coin() deducts NOTHING and returns false when the price exceeds our snapshot. The
+        // server has already taken the money (TakeMoneyFromPP), so silently ignoring that would
+        // leave `gs.coin` overstated — the client reporting a balance it knows is wrong (#345).
+        let mut gs = GameState::new();
+        gs.coin = [0, 0, 0, 5]; // 5 copper on hand
+        let mut echo = [0u8; 32];
+        echo[8..12].copy_from_slice(&7u32.to_le_bytes());   // itemslot
+        echo[16..20].copy_from_slice(&1u32.to_le_bytes());  // quantity
+        echo[24..28].copy_from_slice(&99u32.to_le_bytes()); // price 99c > 5c on hand
+
+        super::apply_shop_player_buy(&mut gs, &echo);
+
+        assert!(gs.chat_events.iter().any(|e| e.kind == "coin_desync"),
+            "an uncoverable confirmed price must be reported as a desync, not silently swallowed");
+        assert!(gs.messages.iter().any(|m| m.text.contains("Coin desync")),
+            "the desync must be visible in the message log too");
     }
 
     #[test]
