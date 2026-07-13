@@ -913,6 +913,23 @@ impl App {
                 frame_profile:      self.frame_profile,
                 // Most recently read book/note text (OP_ReadBook reply), for GET /v1/observe/item_text (#288).
                 book_text:          gs.last_book_text.clone(),
+                // Spellcasting (#348): the live cast bar and how the last cast ended. Both come
+                // straight from the server's own packets (OP_BeginCast / OP_InterruptCast /
+                // OP_MemorizeSpell scribing=3 / the spell-failure eqstr messages) — see
+                // packet_handler.rs. Publishing them is what makes casting observable at all.
+                casting:            gs.casting.as_ref().map(|c| crate::http::CastingView {
+                                        spell_id:   c.spell_id,
+                                        spell_name: crate::spells::name_of(c.spell_id),
+                                        cast_ms:    c.cast_ms,
+                                        elapsed_ms: c.started.elapsed().as_millis() as u64,
+                                    }),
+                last_cast:          gs.last_cast.as_ref().map(|o| crate::http::LastCastView {
+                                        spell_id:   o.spell_id,
+                                        spell_name: crate::spells::name_of(o.spell_id),
+                                        outcome:    o.kind.to_string(),
+                                        text:       o.text.clone(),
+                                        ago_secs:   o.at.elapsed().as_secs(),
+                                    }),
             };
         }
         // Mirror the health state into the scene so the HUD can show a "connection lost" banner (#8).

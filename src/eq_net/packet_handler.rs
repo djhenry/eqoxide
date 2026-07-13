@@ -6,7 +6,7 @@
 
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::AppPacket;
-use crate::game_state::{GameState, Entity, ZonePoint, CastState};
+use crate::game_state::{GameState, Entity, ZonePoint};
 
 /// Apply one EQ server packet to `gs`.
 pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
@@ -1082,9 +1082,20 @@ pub fn parse_begin_cast(p: &[u8]) -> Option<(u16, u32, u32)> {
     Some((caster_id, spell_id, cast_ms))
 }
 
-pub fn parse_mana_change(p: &[u8]) -> Option<u32> {
+/// `ManaChange_Struct` (EQEmu common/eq_packet_structs.h:462 — no RoF2 ENCODE, sent raw):
+///   /*00*/ uint32 new_mana;  /*04*/ uint32 stamina;  /*08*/ uint32 spell_id;
+///   /*12*/ uint8  keepcasting;  /*13*/ uint8 padding[3];  /*16*/ int32 slot;
+/// Returns `(new_mana, spell_id, keepcasting)`. `keepcasting == 0` means "the cast STOPPED" — the
+/// server sends it from `Mob::StopCasting` (zone/spells.cpp:1369) and `Mob::SendSpellBarEnable`
+/// (zone/spells.cpp:5752) on *every* cast end (completed, interrupted, or fizzled), naming the
+/// spell that ended. The 4-byte prefix is still accepted (mana only) so a short packet can't
+/// silently drop the mana update. (eqoxide#348)
+pub fn parse_mana_change(p: &[u8]) -> Option<(u32, Option<u32>, Option<u8>)> {
     if p.len() < 4 { return None; }
-    Some(u32::from_le_bytes([p[0], p[1], p[2], p[3]]))
+    let new_mana = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+    if p.len() < 13 { return Some((new_mana, None, None)); }
+    let spell_id = u32::from_le_bytes([p[8], p[9], p[10], p[11]]);
+    Some((new_mana, Some(spell_id), Some(p[12])))
 }
 
 pub fn parse_memorize_spell(p: &[u8]) -> Option<(u32, u32, u32)> {
@@ -1093,9 +1104,16 @@ pub fn parse_memorize_spell(p: &[u8]) -> Option<(u32, u32, u32)> {
     Some((r(0), r(4), r(8)))
 }
 
-pub fn parse_interrupt_cast(p: &[u8]) -> Option<u32> {
-    if p.len() < 4 { return None; }
-    Some(u32::from_le_bytes([p[0], p[1], p[2], p[3]]))
+/// `InterruptCast_Struct` (EQEmu common/eq_packet_structs.h:446 — no RoF2 ENCODE, sent raw):
+///   /*00*/ uint32 spawnid;  /*04*/ uint32 messageid;  /*08*/ char message[0];
+/// `messageid` is an eqstr id that says WHY the cast ended: SPELL_FIZZLE (173) / MISS_NOTE (180) =
+/// a fizzle, INTERRUPT_SPELL (439) = a true interrupt (zone/spells.cpp:1299-1314). Returns
+/// `(spawnid, messageid)`; the old parse read only `spawnid` and threw the reason away, which is
+/// why the client could never tell a fizzle from an interrupt. (eqoxide#348)
+pub fn parse_interrupt_cast(p: &[u8]) -> Option<(u32, u32)> {
+    if p.len() < 8 { return None; }
+    let r = |o: usize| u32::from_le_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]]);
+    Some((r(0), r(4)))
 }
 
 fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
@@ -1201,20 +1219,34 @@ pub fn apply_begin_cast(gs: &mut GameState, p: &[u8]) {
         // player's spellcasting (spellbook.rs/spellgems.rs gate on casting.is_none()) and never
         // clears for a non-self cast (only OP_InterruptCast / self memorize resets it). (eqoxide#222)
         if caster_id as u32 != gs.player_id { return; }
-        gs.casting = Some(CastState {
-            spell_id,
-            started: std::time::Instant::now(),
-            cast_ms,
-        });
+        // Sets gs.casting AND pushes a `combat`/`cast_begin` event — casting used to be tracked
+        // purely internally, so an agent had no way to learn the cast had even started. (eqoxide#348)
+        gs.begin_cast(spell_id, cast_ms);
     }
 }
+
+/// The sentinel spell id `Mob::SendSpellBarDisable` puts in OP_MemorizeSpell (zone/client.h:99
+/// `SPELLBAR_UNLOCK 0x2bc`). It is a spell-bar command, not a spell: never report it as a completed
+/// cast. (Nothing in EQEmu currently calls SendSpellBarDisable, but the sentinel is cheap to honor.)
+const SPELLBAR_UNLOCK: u32 = 0x2bc;
 
 pub fn apply_mana_change(gs: &mut GameState, p: &[u8]) {
     // OP_ManaChange carries the player's new *current* mana (ManaChange_Struct.new_mana @0); no max.
     // Apply it so the HUD/API mana bar tracks spending/regen. set_mana keeps max as a high-water-mark
     // (the profile seed sets the true max for a rested caster at zone-in). (eqoxide#27)
-    if let Some(new_mana) = parse_mana_change(p) {
-        gs.set_mana(new_mana as i32);
+    let Some((new_mana, spell_id, keepcasting)) = parse_mana_change(p) else { return };
+    gs.set_mana(new_mana as i32);
+    // `keepcasting == 0` = "the cast stopped". The packet names the spell that ended, which is the
+    // only way to identify a FIZZLED spell: EQEmu decides the fizzle in DoCastSpell (zone/
+    // spells.cpp:318) before OP_BeginCast is ever sent (zone/spells.cpp:499), so gs.casting is None
+    // by the time "Your spell fizzles!" arrives. Stash it for finish_cast to consume. (eqoxide#348)
+    // (No SPELLBAR_UNLOCK check here: OP_ManaChange always carries a REAL spell id — StopCasting
+    // sends `casting_spell_id`, SendSpellBarEnable sends the spell it was called with. The sentinel
+    // only ever appears in OP_MemorizeSpell.)
+    if let (Some(spell_id), Some(0)) = (spell_id, keepcasting) {
+        if !crate::game_state::gem_is_empty(spell_id) {
+            gs.ended_cast_spell = Some(spell_id);
+        }
     }
 }
 
@@ -1222,17 +1254,66 @@ pub fn apply_memorize_spell(gs: &mut GameState, p: &[u8]) {
     if let Some((slot, spell_id, scribing)) = parse_memorize_spell(p) {
         match scribing {
             1 => { if (slot as usize) < 9 { gs.mem_spells[slot as usize] = spell_id; } }
-            2 => { if (slot as usize) < 9 { gs.mem_spells[slot as usize] = 0xFFFF_FFFF; } }
-            3 => { gs.casting = None; } // spellbar re-enable: cast finished
+            2 => { if (slot as usize) < 9 { gs.mem_spells[slot as usize] = crate::game_state::EMPTY_GEM; } }
+            // memSpellSpellbar (zone/client.h:105) — the server re-enables the spell bar only from
+            // the tail of Mob::SpellFinished (zone/spells.cpp:1803/1824), i.e. the cast COMPLETED.
+            // An interrupt/fizzle never sends it (InterruptSpell → OP_InterruptCast + OP_ManaChange
+            // only). So this is the authoritative "your spell landed" signal. (eqoxide#348)
+            //
+            // SPELLBAR_UNLOCK (0x2bc = 700) is a bar COMMAND, not a spell — but 700 is also a legal
+            // spell id, so we cannot reject it on value alone or a real cast of spell 700 would
+            // never report completion. Treat it as the sentinel only when it is NOT the spell we are
+            // currently casting. (In practice nothing in EQEmu calls SendSpellBarDisable, so the
+            // sentinel never actually arrives; this just keeps the value-collision honest.)
+            3 => {
+                let is_sentinel = spell_id == SPELLBAR_UNLOCK
+                    && gs.casting.as_ref().map_or(true, |c| c.spell_id != spell_id);
+                if is_sentinel {
+                    gs.casting = None;
+                } else {
+                    let text = format!("You have finished casting {}.", crate::spells::name_of(spell_id));
+                    gs.finish_cast(spell_id, "cast_completed", &text);
+                }
+            }
             _ => {}
         }
     }
 }
 
 pub fn apply_interrupt_cast(gs: &mut GameState, p: &[u8]) {
-    if gs.casting.is_some() && parse_interrupt_cast(p).is_some() {
-        gs.casting = None;
-        gs.log_msg("combat", "Your spell is interrupted.");
+    let Some((spawnid, messageid)) = parse_interrupt_cast(p) else { return };
+    // The server ALSO broadcasts an OP_InterruptCast to everyone nearby when someone ELSE's cast
+    // breaks (zone/spells.cpp:1339-1345, with the caster's name appended). Acting on it would clear
+    // OUR cast bar because a passing NPC got interrupted — the same class of bug as eqoxide#222.
+    if spawnid != gs.player_id { return; }
+    // Only a cast we believe is RUNNING can be interrupted. This gate is what keeps a cast-start
+    // refusal from being double-reported: the server says "Insufficient Mana to cast this spell!"
+    // (OP_SimpleMessage 199) and THEN calls InterruptSpell() → OP_InterruptCast 439
+    // (zone/spells.cpp:484-496). apply_simple_message already published the real reason and cleared
+    // `casting`, so the trailing generic "interrupted" here would overwrite a precise outcome with a
+    // vague one. (eqoxide#348)
+    if gs.casting.is_none() { return; }
+    let (kind, text) = match messageid {
+        crate::game_state::SPELL_FIZZLE | crate::game_state::MISS_NOTE =>
+            ("cast_fizzled", "Your spell fizzles!".to_string()),
+        _ => ("cast_interrupted", "Your spell is interrupted.".to_string()),
+    };
+    gs.finish_cast(0, kind, &text); // 0 = take the spell from gs.casting / the ended-cast hint
+}
+
+/// A server eqstr id that means the player's cast ended badly (or never started). Returns the event
+/// `kind` to publish, or None if the message has nothing to do with casting. (eqoxide#348)
+fn cast_outcome_for_string_id(string_id: u32) -> Option<&'static str> {
+    use crate::game_state::{CAST_FAILED_STRING_IDS, MISS_NOTE, SPELL_FIZZLE};
+    match string_id {
+        // A player fizzle reaches us ONLY as this bare message: Client::CheckFizzle fails inside
+        // DoCastSpell, which calls StopCasting() + MessageString(Chat::SpellFailure, SPELL_FIZZLE)
+        // and returns *before* OP_BeginCast / any OP_InterruptCast (zone/spells.cpp:318-345).
+        SPELL_FIZZLE | MISS_NOTE => Some("cast_fizzled"),
+        // Cast-start refusals (no mana / recast timer / no target / …). The server sends the eqstr
+        // and nothing else — previously the cast just vanished. (zone/spells.cpp:169-241, :484-496)
+        id if CAST_FAILED_STRING_IDS.contains(&id) => Some("cast_failed"),
+        _ => None,
     }
 }
 
@@ -1739,10 +1820,22 @@ fn apply_emote(gs: &mut GameState, payload: &[u8]) {
 }
 
 /// OP_SimpleMessage — eqstr-table text, no arguments. Layout: string_id(u32) + color(u32)
-/// + unknown(u32).
+/// + unknown(u32) (`SimpleMessage_Struct`, EQEmu common/eq_packet_structs.h:3832).
+///
+/// `Client::MessageString(type, string_id)` sends this straight to the caster only
+/// (zone/client.cpp:3811-3821 — `QueuePacket`, not a broadcast), so a spell-failure id here is
+/// unambiguously OURS. That matters: a fizzle and every cast-start refusal arrive as nothing BUT
+/// this message, so if we only log the text the outcome is invisible to an agent. Turn the known
+/// spell-failure ids into a real cast outcome. (eqoxide#348)
 fn apply_simple_message(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < 8 { return; }
     let string_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    if let Some(kind) = cast_outcome_for_string_id(string_id) {
+        let text = crate::eqstr::format_id(string_id, &[])
+            .unwrap_or_else(|| "Your spell failed.".to_string());
+        gs.finish_cast(0, kind, &text); // finish_cast logs the line too
+        return;
+    }
     if let Some(text) = crate::eqstr::format_id(string_id, &[]) {
         if !text.trim().is_empty() && !is_debug_spam(&text) {
             gs.log_msg("system", &text);
@@ -3390,6 +3483,181 @@ mod tests {
         b[4..8].copy_from_slice(&200u32.to_le_bytes()); // spell_id
         b[8..12].copy_from_slice(&3u32.to_le_bytes());  // scribing = spellbar re-enable
         assert_eq!(parse_memorize_spell(&b), Some((2, 200, 3)));
+    }
+
+    // ── #348: cast OUTCOMES must reach the agent (events + last_cast), not just `tracing` ────────
+    // Wire ground truth (EQEmu):
+    //   OP_BeginCast      zone/spells.cpp:497   → cast started
+    //   OP_InterruptCast  zone/spells.cpp:1299  → InterruptCast_Struct{spawnid, messageid}
+    //   OP_MemorizeSpell  zone/spells.cpp:1824  → scribing=3 (memSpellSpellbar) = cast COMPLETED
+    //   OP_SimpleMessage  zone/client.cpp:3811  → the ONLY signal for a player FIZZLE (string 173)
+    //   OP_ManaChange     zone/spells.cpp:1369  → keepcasting=0 names the spell that just ended
+
+    /// Build the 10-byte RoF2 BeginCast_Struct.
+    fn begin_cast_pkt(caster: u16, spell: u32, ms: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 10];
+        b[0..4].copy_from_slice(&spell.to_le_bytes());
+        b[4..6].copy_from_slice(&caster.to_le_bytes());
+        b[6..10].copy_from_slice(&ms.to_le_bytes());
+        b
+    }
+    /// InterruptCast_Struct: spawnid u32@0, messageid u32@4.
+    fn interrupt_pkt(spawnid: u32, messageid: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 8];
+        b[0..4].copy_from_slice(&spawnid.to_le_bytes());
+        b[4..8].copy_from_slice(&messageid.to_le_bytes());
+        b
+    }
+    /// MemorizeSpell_Struct: slot u32@0, spell_id u32@4, scribing u32@8.
+    fn memorize_pkt(slot: u32, spell: u32, scribing: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 12];
+        b[0..4].copy_from_slice(&slot.to_le_bytes());
+        b[4..8].copy_from_slice(&spell.to_le_bytes());
+        b[8..12].copy_from_slice(&scribing.to_le_bytes());
+        b
+    }
+    /// SimpleMessage_Struct: string_id u32@0, color u32@4, unknown u32@8.
+    fn simple_msg_pkt(string_id: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 12];
+        b[0..4].copy_from_slice(&string_id.to_le_bytes());
+        b
+    }
+    /// ManaChange_Struct: new_mana u32@0, stamina u32@4, spell_id u32@8, keepcasting u8@12, slot i32@16.
+    fn mana_change_pkt(new_mana: u32, spell: u32, keepcasting: u8) -> Vec<u8> {
+        let mut b = vec![0u8; 20];
+        b[0..4].copy_from_slice(&new_mana.to_le_bytes());
+        b[8..12].copy_from_slice(&spell.to_le_bytes());
+        b[12] = keepcasting;
+        b
+    }
+    fn event_kinds(gs: &GameState) -> Vec<String> {
+        gs.chat_events.iter().map(|e| e.kind.clone()).collect()
+    }
+
+    #[test]
+    fn begin_cast_publishes_a_cast_begin_event() {
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        super::apply_begin_cast(&mut gs, &begin_cast_pkt(42, 202, 2500));
+        assert!(gs.casting.is_some(), "cast bar set");
+        assert_eq!(event_kinds(&gs), ["cast_begin"],
+            "the agent must be able to learn the cast STARTED from /v1/events, not just tracing");
+        // An NPC's cast must not manufacture an event for us (eqoxide#222's class of bug).
+        let mut gs2 = GameState::new();
+        gs2.player_id = 42;
+        super::apply_begin_cast(&mut gs2, &begin_cast_pkt(999, 202, 2500));
+        assert!(event_kinds(&gs2).is_empty(), "someone else's cast is not our cast");
+    }
+
+    #[test]
+    fn completed_cast_publishes_cast_completed_with_the_spell_id() {
+        // The server re-enables the spell bar via OP_MemorizeSpell scribing=3 ONLY from the tail of
+        // SpellFinished (zone/spells.cpp:1824) — i.e. the cast landed.
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        super::apply_begin_cast(&mut gs, &begin_cast_pkt(42, 202, 2500));
+        super::apply_memorize_spell(&mut gs, &memorize_pkt(3, 202, 3));
+        assert!(gs.casting.is_none(), "cast bar cleared on completion");
+        assert_eq!(event_kinds(&gs), ["cast_begin", "cast_completed"]);
+        let last = gs.last_cast.as_ref().expect("outcome recorded for /v1/observe/debug");
+        assert_eq!(last.kind, "cast_completed");
+        assert_eq!(last.spell_id, 202);
+    }
+
+    #[test]
+    fn interrupted_cast_publishes_cast_interrupted_and_ignores_other_casters() {
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        super::apply_begin_cast(&mut gs, &begin_cast_pkt(42, 202, 2500));
+        // Another caster's interrupt is broadcast to everyone nearby (zone/spells.cpp:1339): it must
+        // neither clear OUR cast bar nor emit an outcome for us.
+        super::apply_interrupt_cast(&mut gs, &interrupt_pkt(999, crate::game_state::INTERRUPT_SPELL));
+        assert!(gs.casting.is_some(), "a passing NPC's interrupt must not clear our cast bar");
+        assert_eq!(event_kinds(&gs), ["cast_begin"]);
+        // Ours does.
+        super::apply_interrupt_cast(&mut gs, &interrupt_pkt(42, crate::game_state::INTERRUPT_SPELL));
+        assert!(gs.casting.is_none());
+        assert_eq!(event_kinds(&gs), ["cast_begin", "cast_interrupted"]);
+        let last = gs.last_cast.as_ref().unwrap();
+        assert_eq!(last.kind, "cast_interrupted");
+        assert_eq!(last.spell_id, 202, "the interrupted spell is named from the in-flight cast");
+    }
+
+    #[test]
+    fn fizzle_is_distinguishable_from_an_interrupt_and_names_the_spell() {
+        // A PLAYER fizzle never sends OP_BeginCast or OP_InterruptCast: CheckFizzle fails inside
+        // DoCastSpell (zone/spells.cpp:318) *before* SendBeginCast (:499). All the client gets is
+        // OP_ManaChange (keepcasting=0, naming the spell) + OP_SimpleMessage{SPELL_FIZZLE=173}.
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        super::apply_mana_change(&mut gs, &mana_change_pkt(90, 202, 0));
+        super::apply_simple_message(&mut gs, &simple_msg_pkt(crate::game_state::SPELL_FIZZLE));
+        assert_eq!(event_kinds(&gs), ["cast_fizzled"],
+            "a fizzle must be its own outcome — not silence, and not 'interrupted'");
+        let last = gs.last_cast.as_ref().expect("fizzle recorded");
+        assert_eq!(last.kind, "cast_fizzled");
+        assert_eq!(last.spell_id, 202,
+            "OP_ManaChange(keepcasting=0) is the only thing that names a fizzled spell");
+    }
+
+    #[test]
+    fn cast_start_refusal_is_reported_once_not_double_reported() {
+        // Insufficient mana: the server sends OP_SimpleMessage{199} and THEN InterruptSpell() →
+        // OP_InterruptCast{439} (zone/spells.cpp:484-496). The precise reason must win; the trailing
+        // generic "interrupted" must not overwrite it with a second, vaguer event.
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        super::apply_begin_cast(&mut gs, &begin_cast_pkt(42, 202, 2500));
+        super::apply_simple_message(&mut gs, &simple_msg_pkt(199)); // INSUFFICIENT_MANA
+        super::apply_interrupt_cast(&mut gs, &interrupt_pkt(42, crate::game_state::INTERRUPT_SPELL));
+        assert_eq!(event_kinds(&gs), ["cast_begin", "cast_failed"]);
+        assert_eq!(gs.last_cast.as_ref().unwrap().kind, "cast_failed");
+    }
+
+    #[test]
+    fn a_stale_ended_cast_spell_is_never_pinned_on_a_later_cast() {
+        // ended_cast_spell is a one-shot hint consumed by the outcome. If it survived, the NEXT
+        // failure would be reported against the PREVIOUS spell — a lie with a plausible spell name.
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        super::apply_mana_change(&mut gs, &mana_change_pkt(90, 202, 0));
+        super::apply_simple_message(&mut gs, &simple_msg_pkt(crate::game_state::SPELL_FIZZLE));
+        assert_eq!(gs.last_cast.as_ref().unwrap().spell_id, 202);
+        // A later refusal the server never attached a spell to → 0 ("we don't know"), NOT 202.
+        super::apply_simple_message(&mut gs, &simple_msg_pkt(236)); // SPELL_RECAST
+        let last = gs.last_cast.as_ref().unwrap();
+        assert_eq!(last.kind, "cast_failed");
+        assert_eq!(last.spell_id, 0, "an unknown spell must read as unknown, not as the last one");
+    }
+
+    #[test]
+    fn spellbar_unlock_sentinel_is_not_a_completed_cast_but_spell_700_still_is() {
+        // SPELLBAR_UNLOCK is 0x2bc = 700, which is ALSO a legal spell id. Rejecting the value
+        // outright would silently swallow a real completion of spell 700 (a lie by omission);
+        // accepting it outright would invent a completed cast out of a bar command.
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        // Not casting → 700 is the bar-command sentinel: clears the bar, reports no outcome.
+        super::apply_memorize_spell(&mut gs, &memorize_pkt(0, 700, 3));
+        assert!(gs.last_cast.is_none() && event_kinds(&gs).is_empty());
+        // Actually casting spell 700 → the same packet IS the completion of that cast.
+        super::apply_begin_cast(&mut gs, &begin_cast_pkt(42, 700, 1000));
+        super::apply_memorize_spell(&mut gs, &memorize_pkt(0, 700, 3));
+        assert_eq!(event_kinds(&gs), ["cast_begin", "cast_completed"]);
+        assert_eq!(gs.last_cast.as_ref().unwrap().spell_id, 700);
+    }
+
+    #[test]
+    fn parse_interrupt_cast_reads_spawnid_and_messageid() {
+        assert_eq!(super::parse_interrupt_cast(&interrupt_pkt(42, 173)), Some((42, 173)));
+        assert_eq!(super::parse_interrupt_cast(&[0u8; 4]), None); // 4 bytes: messageid is missing
+    }
+
+    #[test]
+    fn parse_mana_change_reads_spell_and_keepcasting() {
+        assert_eq!(super::parse_mana_change(&mana_change_pkt(120, 202, 0)), Some((120, Some(202), Some(0))));
+        // A short (mana-only) packet still yields the mana update rather than being dropped.
+        assert_eq!(super::parse_mana_change(&120u32.to_le_bytes()), Some((120, None, None)));
     }
 
     #[test]
