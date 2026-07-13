@@ -665,11 +665,16 @@ fn plan_path(
         // A floor reachable from the char's height (generous down-search finds ground below a face).
         let Some(af) = col.nearest_floor(ax, ay, start[2], 20.0, 100.0) else { continue };
         let anchor = [ax, ay, af];
-        if let Some(mut p) = col.find_path_res(anchor, goal, PLAYER_RADIUS, avoid, true, 8.0, None, aggro_buffer, plan_ctx) {
+        if let Some(p) = col.find_path_res(anchor, goal, PLAYER_RADIUS, avoid, true, 8.0, None, aggro_buffer, plan_ctx) {
             // Only worthwhile if the re-anchored start could actually move (more than the lone
             // start cell A* was stuck on) — otherwise it's the same dead spot.
-            if p.len() > 1 {
-                p.insert(0, anchor);
+            // `> 2`, not `> 1`: every route now begins AT its start point (find_path prepends it), so
+            // a route that goes nowhere is already len 2 and `> 1` would wave it through.
+            if p.len() > 2 {
+                // The anchor no longer needs prepending by hand — find_path already returns it as
+                // waypoint 0 (it was planned FROM the anchor), so the old insert would duplicate it
+                // and emit a zero-length first segment. The walker is still steered to the clean
+                // floor first, which was the point.
                 tracing::warn!("nav: start isolated at ({:.0},{:.0},{:.0}) — re-anchored to clean floor ({:.0},{:.0},{:.0})",
                     start[0], start[1], start[2], ax, ay, af);
                 return Some(p);
@@ -2582,7 +2587,9 @@ impl Navigator {
                     plan_path(c, [gs.player_x, gs.player_y, gs.player_z], [goal.0, goal.1, goal.2], &avoid, av.buffer, goal_region)
                 });
                 if let Some(np) = fresh {
-                    if np.len() > 1 {
+                    // `> 2`, not `> 1`: every route now begins AT the character (find_path prepends
+                    // the start), so "it went nowhere" is len 2 — `> 1` would accept a dead re-path.
+                    if np.len() > 2 {
                         tracing::warn!("NAV: backed off downhill — re-pathing ({} wp, attempt {})",
                             np.len(), self.nav_repaths);
                         self.path = np;

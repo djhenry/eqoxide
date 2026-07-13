@@ -617,6 +617,15 @@ impl Collision {
         }
         // Face-normal Z per triangle (see `tri_nz`). The WLD→world map (x,y,z) → (z,x,y) is a cyclic
         // permutation (determinant +1), so it PRESERVES winding — the sign here is the mesh's own.
+        //
+        // CAVEAT for the next person: placed-object triangles come through `expand_objects`, which
+        // applies each instance's 4x4 matrix to the VERTICES. A MIRRORED instance (negative-
+        // determinant matrix — e.g. a negative scale on one axis) reverses triangle winding, so its
+        // faces would come out normal-INVERTED and this filter would read its floors as ceilings.
+        // No shipped zone has one today (the build-time winding check below would catch a zone where
+        // enough of them existed to matter, and all 34 cached zones pass), but if mirrored instances
+        // ever appear, flip `nz` for triangles whose source instance matrix has det < 0 rather than
+        // letting the whole zone fall back to facing-blind.
         let tri_nz: Vec<f32> = tris.iter().map(|t| {
             let e1 = [t[1][0] - t[0][0], t[1][1] - t[0][1], t[1][2] - t[0][2]];
             let e2 = [t[2][0] - t[0][0], t[2][1] - t[0][1], t[2][2] - t[0][2]];
@@ -1286,6 +1295,17 @@ impl Collision {
         // surface). Otherwise the goal is a point in the air / in a volume — project it DOWN onto
         // the walkable floor beneath it, however far below that is.
         const GOAL_DROP: f32 = 400.0; // a volume point can sit far above its floor
+        // The snap window is GOAL_TIER_TOL (8), deliberately NARROWER than the old +/-STEP_UP (20).
+        // It has to be: the two clauses below disagree about what a goal that is 8..20u ABOVE a floor
+        // means, and only one of them can win. The old +/-20 said "that's still this floor" — which is
+        // exactly how a zone-line region point 12.9u above its floor (gfaydark->felwithea) got snapped
+        // onto a phantom tier. Tying the window to the SAME tolerance A* later uses to accept arrival
+        // (GOAL_TIER_TOL) makes the two agree by construction: if the goal z is within tier tolerance
+        // of a real floor it IS that tier; otherwise it is a point in the air and gets projected down.
+        // Cost: a goal reported 8..20u BELOW its floor now resolves to the floor beneath it instead of
+        // stepping up to the one above. That is the rarer and more conservative error (walk to the
+        // ground under the target, not to a tier the caller never named), and callers that report a z
+        // that far under their own floor are already lying to us.
         let goal_floor = self.nearest_floor(goal[0], goal[1], goal[2], GOAL_TIER_TOL, GOAL_TIER_TOL)
             .or_else(|| self.floor_beneath(goal[0], goal[1], goal[2], GOAL_TIER_TOL, GOAL_DROP))
             .unwrap_or(goal[2]);
@@ -2180,6 +2200,36 @@ mod tests {
         let f = col.nearest_floor(20.0, 40.0, -56.0, 20.0, 100.0).expect("a floor exists below");
         assert!((f - (-69.97)).abs() < 0.1, "expected the real floor -69.97, got {f}");
         assert_eq!(col.column_floors(20.0, 40.0, -56.0, 20.0, 100.0).len(), 1, "the ceiling is not a floor");
+    }
+
+    /// The floor-normal filter is only sound if the zone's winding is consistent, so it is validated
+    /// at build. A zone that FAILS validation must fall back to the old facing-blind behaviour
+    /// (keeping every real floor) rather than filtering all its floors away and becoming
+    /// unnavigable — but that fallback is a KNOWN-DEGRADED mode (a ceiling can be picked as a floor
+    /// again, i.e. #329 is back for that zone), so it must be *reportable*: `floor_normals_ok()` is
+    /// what `/v1/observe/debug` surfaces as `nav_degraded`. A silent revert to a bug we just fixed is
+    /// the client lying to the agent by omission.
+    #[test]
+    fn a_miswound_zone_falls_back_visibly_instead_of_deleting_its_floors() {
+        // Every face inverted (down-facing) — a mesh whose winding convention is backwards.
+        let assets = ZoneAssets {
+            terrain: vec![slab(0.0, 0.0, 96.0, 0.0, 96.0, false)],
+            objects: vec![], textures: vec![],
+        };
+        let col = Collision::build(&assets, 8.0);
+        assert!(!col.floor_normals_ok(), "an inverted mesh must FAIL the winding check");
+        // ...and having failed it, the filter is off: the surface is still found (fail-old), not
+        // filtered away (fail-empty), so the zone stays navigable.
+        assert!(col.nearest_floor(20.0, 40.0, 1.0, 20.0, 100.0).is_some(),
+            "a mis-wound zone must keep its floors (degraded, not broken)");
+        assert!(col.find_path([8.0, 8.0, 0.0], [56.0, 56.0, 0.0], 1.0, &[], false).is_some(),
+            "and must still route — the degradation is reported, not fatal");
+
+        // A correctly wound zone reports healthy (so `nav_degraded` is null in every shipped zone).
+        let ok = Collision::build(&ZoneAssets {
+            terrain: vec![slab(0.0, 0.0, 96.0, 0.0, 96.0, true)], objects: vec![], textures: vec![],
+        }, 8.0);
+        assert!(ok.floor_normals_ok());
     }
 
     /// #229: a `zone_cross` aims at a DRNTP region's interior point, whose z is a point in a VOLUME
