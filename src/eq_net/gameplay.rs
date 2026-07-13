@@ -311,6 +311,7 @@ pub async fn run_gameplay_phase(
             tracing::info!("EQ: zone change approved — reconnecting to world for zone handoff");
             let ok = reconnect_via_world(
                 &mut stream, &mut net_rx, &mut gs, &char_name, &world_creds, &last_inbound,
+                &game_state_snapshot,
             ).await;
             if ok {
                 run_zone_entry_handshake(
@@ -318,6 +319,7 @@ pub async fn run_gameplay_phase(
                     net_rx.as_mut().unwrap(),
                     &mut gs,
                     &last_inbound,
+                    &game_state_snapshot,
                 ).await;
                 navigator.sync_zone_points(&gs);
                 last_keepalive = std::time::Instant::now();
@@ -350,6 +352,7 @@ pub async fn run_gameplay_phase(
                         net_rx.as_mut().unwrap(),
                         &mut gs,
                         &last_inbound,
+                        &game_state_snapshot,
                     ).await;
                     navigator.sync_zone_points(&gs);
                     last_keepalive = std::time::Instant::now();
@@ -438,13 +441,22 @@ async fn perform_clean_shutdown(
 /// zone handoff), the same way the gameplay loop's drain does — this handoff can take multiple
 /// seconds and, with CONN_STALE_SECS=15, would otherwise falsely report the connection as lost
 /// while it's mid-transition.
+///
+/// `game_state_snapshot` is published once per drain pass (#324) so the renderer's view stays live
+/// through this leg of the handoff too. This is NOT dead work, even though this loop never calls
+/// `apply_packet` itself: the gameplay loop drains and applies packets into `gs` *before* it checks
+/// `world_reconnect_needed`, and its own publish sits at the loop bottom — *after* that branch. So
+/// `gs` reaches us carrying mutations the renderer has not seen yet, and publishing here flushes
+/// them immediately instead of stranding them for the multiple seconds this handoff takes. Any
+/// future packet handling added to this loop is then covered for free.
 async fn reconnect_via_world(
-    stream:       &mut Option<EqStream>,
-    net_rx:       &mut Option<UnboundedReceiver<AppPacket>>,
-    _gs:          &mut GameState,
-    char_name:    &str,
-    creds:        &WorldCredentials,
-    last_inbound: &crate::http::LastInboundShared,
+    stream:              &mut Option<EqStream>,
+    net_rx:               &mut Option<UnboundedReceiver<AppPacket>>,
+    gs:                   &mut GameState,
+    char_name:            &str,
+    creds:                &WorldCredentials,
+    last_inbound:         &crate::http::LastInboundShared,
+    game_state_snapshot:  &crate::http::GameStateSnapshot,
 ) -> bool {
     drop(stream.take());
     drop(net_rx.take());
@@ -508,6 +520,7 @@ async fn reconnect_via_world(
                 }
             }
         }
+        publish_snapshot(gs, game_state_snapshot);
         sleep(Duration::from_millis(10)).await;
     }
 
@@ -547,11 +560,17 @@ async fn reconnect_via_world(
 /// `last_inbound` is bumped as real inbound packets are drained here, exactly like the gameplay
 /// loop's own drain (`run_gameplay_phase`) does — a slow zone-in (up to the 30s deadline below)
 /// must not falsely report the connection as lost while it's healthy and still zoning in.
+///
+/// `game_state_snapshot` is published once per drain pass (#324), same cadence as the steady-state
+/// gameplay loop — without this the renderer never observes `OP_NEW_ZONE` / spawns / etc. as they
+/// land here, and stays frozen on the OLD zone's last frame for this entire handshake (up to the
+/// 30s deadline) instead of starting the fade/loading screen the moment `OP_NEW_ZONE` arrives.
 async fn run_zone_entry_handshake(
-    stream:       &mut EqStream,
-    net_rx:       &mut UnboundedReceiver<AppPacket>,
-    gs:           &mut GameState,
-    last_inbound: &crate::http::LastInboundShared,
+    stream:              &mut EqStream,
+    net_rx:               &mut UnboundedReceiver<AppPacket>,
+    gs:                   &mut GameState,
+    last_inbound:         &crate::http::LastInboundShared,
+    game_state_snapshot:  &crate::http::GameStateSnapshot,
 ) {
     // Purge the previous zone's spawns/doors now, before OP_ReqClientSpawn asks for the new zone's
     // stream, and re-arm the once-per-zone-in OP_NewZone apply so the repeat OP_NewZone this
@@ -589,6 +608,7 @@ async fn run_zone_entry_handshake(
                 _ => {}
             }
         }
+        publish_snapshot(gs, game_state_snapshot);
         sleep(Duration::from_millis(10)).await;
     }
 
@@ -780,5 +800,68 @@ mod snapshot_tests {
 
         assert!(!Arc::ptr_eq(&before, &after), "a real state change must publish a new Arc");
         assert!(after.sitting, "the new snapshot must reflect the mutation");
+    }
+}
+
+#[cfg(test)]
+mod zone_entry_handshake_publish_tests {
+    use super::*;
+    use crate::eq_net::transport::test_stream;
+
+    /// Minimal RoF2 NewZone_Struct payload: everything zeroed except `zone_short_name` at offset 64
+    /// (see `apply_new_zone` in packet_handler.rs) — enough for `apply_packet` to set `gs.zone_name`.
+    fn new_zone_payload(name: &str) -> Vec<u8> {
+        let mut p = vec![0u8; SIZE_NEW_ZONE];
+        let nb = name.as_bytes();
+        p[64..64 + nb.len()].copy_from_slice(nb);
+        p
+    }
+
+    /// Regression test for #324: before this fix, `run_zone_entry_handshake` mutated `gs` on every
+    /// inbound packet but never called `publish_snapshot` — the renderer only saw the result once the
+    /// WHOLE handshake (NEW_ZONE → WEATHER → SEND_EXP_ZONE_IN) returned control to the caller, so it
+    /// stayed frozen on the old zone for the entire handoff. Drive the handshake with only OP_NEW_ZONE
+    /// (deliberately withholding OP_WEATHER/OP_SEND_EXP_ZONE_IN so the handshake never completes) and
+    /// assert the published snapshot picks up the new zone name anyway — proving the publish happens
+    /// per drain pass, not only at the end.
+    ///
+    /// This needs a real `EqStream` (its `poll_recv`/`poll_resend`/`send_app_packet` calls aren't
+    /// mockable at a lower level), so it uses `transport::test_stream` — a dummy stream wired to a
+    /// closed local UDP peer (outbound sends are harmless no-ops) — rather than a live session
+    /// handshake. `net_rx` is a separate, test-owned channel (the function takes it independently of
+    /// `stream`), so packets are injected directly with no wire encoding needed.
+    #[tokio::test]
+    async fn publishes_zone_name_as_op_new_zone_lands_not_only_at_handshake_end() {
+        let (mut stream, _unused_rx) = test_stream(0, 0).await;
+        let (tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<AppPacket>();
+
+        let mut gs = GameState::new();
+        gs.zone_name = "oldzone".to_string();
+        let snapshot: crate::http::GameStateSnapshot =
+            Arc::new(arc_swap::ArcSwap::from_pointee(gs.clone()));
+        let last_inbound: crate::http::LastInboundShared =
+            Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+
+        let snapshot_bg     = snapshot.clone();
+        let last_inbound_bg = last_inbound.clone();
+        let handle = tokio::spawn(async move {
+            run_zone_entry_handshake(&mut stream, &mut net_rx, &mut gs, &last_inbound_bg, &snapshot_bg).await;
+        });
+
+        tx.send(AppPacket { opcode: OP_NEW_ZONE, payload: new_zone_payload("newzone") }).unwrap();
+
+        // Give the 10ms-cadence drain loop a handful of ticks to pick up the packet and publish —
+        // well short of the 30s handshake deadline, which is never reached (OP_WEATHER/
+        // OP_SEND_EXP_ZONE_IN are withheld on purpose).
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if snapshot.load().zone_name == "newzone" { break; }
+            assert!(std::time::Instant::now() < deadline,
+                "snapshot never picked up OP_NEW_ZONE's zone_name — publish_snapshot isn't being \
+                 called inside the handshake's drain loop (#324)");
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        handle.abort();
     }
 }
