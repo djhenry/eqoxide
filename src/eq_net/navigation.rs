@@ -1644,8 +1644,7 @@ impl Navigator {
             // saylinks and never cleared (#274). The hailed NPC's own reply repopulates them.
             gs.dialogue_choices.clear();
             if let Some(id) = spawn_id {
-                gs.target_id = Some(id);
-                if let Some(e) = gs.entities.get(&id) { gs.target_name = Some(e.name.clone()); }
+                gs.set_target(id); // also clears stale con/attitude from any prior target (#323)
                 stream.send_app_packet(OP_TARGET_MOUSE, &build_target_packet(id));
             }
             let msg = format!("Hail, {}", name);
@@ -1711,22 +1710,13 @@ impl Navigator {
         }
 
         // Check target request — set target + auto-consider it (con color comes back as
-        // an OP_CONSIDER reply, handled in packet_handler). Also seed target_name/target_hp_pct
-        // here (name/HP.update_hp*/update_hp_pct then keep target_hp_pct live as combat HP updates
-        // arrive — see GameState::update_hp/update_hp_pct). The player is never present in
-        // `entities` (register_spawn special-cases and returns early for the self-spawn), so a
-        // self-target (F1) must resolve name/HP from the player fields directly instead — mirrors
-        // the entity-name idiom used for combat-log lines in packet_handler.rs. (eqoxide#9, #291)
+        // an OP_CONSIDER reply, handled in packet_handler). GameState::set_target seeds
+        // target_name/target_hp_pct (name/HP — update_hp/update_hp_pct then keep target_hp_pct
+        // live as combat HP updates arrive) AND clears target_con/target_con_name/
+        // target_attitude so the PREVIOUS target's con can't survive a re-target (eqoxide#323).
         let target_id = self.target.lock().unwrap().take();
         if let Some(id) = target_id {
-            gs.target_id = Some(id);
-            if id == gs.player_id {
-                gs.target_name   = Some(gs.player_name.clone());
-                gs.target_hp_pct = Some(gs.hp_pct);
-            } else if let Some(e) = gs.entities.get(&id) {
-                gs.target_name   = Some(e.name.clone());
-                gs.target_hp_pct = Some(e.hp_pct);
-            }
+            gs.set_target(id);
             stream.send_app_packet(OP_TARGET_MOUSE, &build_target_packet(id));
             stream.send_app_packet(OP_CONSIDER, &build_consider_packet(gs.player_id, id));
             tracing::info!("EQ: target spawn_id={} + consider", id);
@@ -2137,8 +2127,7 @@ impl Navigator {
             // waiting for a respawn rather than roaming out of a sealed pocket.
             if let Some(id) = desired {
                 if Some(id) != current {
-                    gs.target_id = Some(id);
-                    if let Some(e) = gs.entities.get(&id) { gs.target_name = Some(e.name.clone()); }
+                    gs.set_target(id); // also clears stale con/attitude from the old target (#323)
                     stream.send_app_packet(OP_TARGET_MOUSE, &build_target_packet(id));
                 }
             }
