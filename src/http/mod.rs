@@ -404,9 +404,34 @@ pub type MessagesShared = Arc<Mutex<Vec<MessageEntry>>>;
 pub type DialogueShared = Arc<Mutex<Vec<crate::game_state::DialogueChoice>>>;
 
 /// Live navigation state for the active `/move/goto`, set by the nav thread and read by
-/// GET /v1/observe/debug: `idle` | `navigating` | `arrived` | `no_path` | `blocked`. Lets a driver
-/// distinguish "unreachable / no route" from "wedged" from "en route" (#166).
-pub type NavStateShared = Arc<Mutex<String>>;
+/// GET /v1/observe/debug. `state` is the agent-facing contract documented in `docs/http-api.md`:
+///
+/// `idle` | `planning` | `navigating` | `navigating_partial` | `following` | `arrived` |
+/// `no_path` | `search_exhausted` | `blocked`
+///
+/// `reason` is the machine-readable WHY behind a terminal state (`goal_not_walkable`,
+/// `search_closed`, `search_deadline`, …). The whole point of the split (#337): a driver must be
+/// able to tell "there is no route" (definitive) from "the planner gave up" (I don't know) from
+/// "I am wedged" — three answers the old, overloaded `blocked` collapsed into one silent freeze.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NavStatus {
+    pub state:  String,
+    pub reason: Option<String>,
+}
+
+impl Default for NavStatus {
+    fn default() -> Self { NavStatus { state: "idle".into(), reason: None } }
+}
+
+impl From<&str> for NavStatus {
+    fn from(state: &str) -> Self { NavStatus { state: state.to_string(), reason: None } }
+}
+
+impl PartialEq<&str> for NavStatus {
+    fn eq(&self, other: &&str) -> bool { self.state == *other }
+}
+
+pub type NavStateShared = Arc<Mutex<NavStatus>>;
 
 /// Pending "click a dialogue choice" request (POST /v1/interact/dialogue or a GUI click): the nav
 /// thread drains it and sends an OP_ItemLinkClick for the chosen saylink. (#120)

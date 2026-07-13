@@ -223,7 +223,7 @@ OPTIONS:
     let doors_shared:     http::DoorsShared     = Arc::new(Mutex::new(Vec::new()));
     let messages:         http::MessagesShared  = Arc::new(Mutex::new(Vec::new()));
     let dialogue:         http::DialogueShared   = Arc::new(Mutex::new(Vec::new()));
-    let nav_state:        http::NavStateShared   = Arc::new(Mutex::new("idle".to_string()));
+    let nav_state:        http::NavStateShared   = Arc::new(Mutex::new(http::NavStatus::default()));
     let dialogue_click:   http::DialogueClickReq = Arc::new(Mutex::new(None));
     let chat_events:      http::ChatEventsShared = Arc::new(Mutex::new(Vec::new()));
     let chat_send:        http::ChatSendShared   = Arc::new(Mutex::new(Vec::new()));
