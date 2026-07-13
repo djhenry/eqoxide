@@ -893,11 +893,13 @@ impl App {
                 max_mana:      gs.max_mana,
                 xp_pct:        gs.xp_pct,
                 // Prefer the live entity (its hp_pct tracks combat via OP_HP_UPDATE); fall back to
-                // the target snapshot stored at target time if the entity is gone.
-                target_name:   gs.target_id.and_then(|id| gs.entities.get(&id)).map(|e| e.name.clone())
-                                   .or_else(|| gs.target_name.clone()),
-                target_hp_pct: gs.target_id.and_then(|id| gs.entities.get(&id)).map(|e| e.hp_pct)
-                                   .or(gs.target_hp_pct),
+                // the target snapshot stored at target time if the entity is gone. Both gated on
+                // target_id being Some (#331 defence in depth) so a snapshot GameState::clear_target
+                // missed can never leak a stale name/HP into the API alongside a null id.
+                target_name:   gs.target_id.and_then(|id| gs.entities.get(&id).map(|e| e.name.clone())
+                                   .or_else(|| gs.target_name.clone())),
+                target_hp_pct: gs.target_id.and_then(|id| gs.entities.get(&id).map(|e| e.hp_pct)
+                                   .or(gs.target_hp_pct)),
                 // #292: con difficulty tier + attitude enum (from the last consider) and the
                 // target's level, only while something is targeted.
                 target_con:      gs.target_id.and(gs.target_con_name.clone()),
