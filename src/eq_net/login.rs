@@ -226,8 +226,9 @@ async fn run_login_phase(
                     stream = EqStream::connect(&host, port, net_tx.clone())
                         .await
                         .map_err(|e| format!("Zone connection failed: {e}"))?;
-                    // Clear stale entities before zone entry so OP_ZONE_SPAWNS repopulates fresh.
-                    gs.entities.clear();
+                    // Purge stale spawns/doors before zone entry so the OP_ZoneSpawns/OP_SpawnDoor
+                    // stream repopulates fresh, and re-arm the once-per-zone-in OP_NewZone apply (#322).
+                    gs.begin_zone_in();
                     proto.on_zone_connected(&mut stream);
                 }
             }
@@ -308,6 +309,7 @@ struct LoginProtocol<'a> {
     awaiting_create_result: bool,
     done_zone_server_info: bool,
     done_zone_entry:       bool,
+    done_new_zone:         bool,
     done_client_ready:     bool,
     done_zone_weather:     bool,
     start_time: std::time::Instant,
@@ -329,6 +331,7 @@ impl<'a> LoginProtocol<'a> {
             create_attempted:       false,
             done_zone_server_info: false,
             done_zone_entry:       false,
+            done_new_zone:         false,
             done_client_ready:     false,
             done_zone_weather:     false,
             start_time: std::time::Instant::now(),
@@ -475,7 +478,11 @@ impl<'a> LoginProtocol<'a> {
                 }
                 PhaseResult::Continue
             }
-            OP_NEW_ZONE => {
+            // Only the FIRST OP_NewZone drives the handshake: the server sends a second copy in reply
+            // to the OP_ReqNewZone below, and re-sending OP_ReqClientSpawn on it would make the
+            // server re-issue the whole door/object/zone-point stream (#322).
+            OP_NEW_ZONE if !self.done_new_zone => {
+                self.done_new_zone = true;
                 // apply_packet already updated gs.zone_name; just send protocol response.
                 stream.send_app_packet(OP_REQ_CLIENT_SPAWN, &[]);
                 tracing::info!("EQ: zone: {} — sent ReqClientSpawn", gs.zone_name);

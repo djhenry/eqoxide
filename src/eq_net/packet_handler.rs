@@ -914,6 +914,15 @@ fn apply_set_target(gs: &mut GameState, payload: &[u8]) {
 }
 
 fn apply_new_zone(gs: &mut GameState, payload: &[u8]) {
+    // Apply at most once per zone-server session (#322). A zone-in delivers OP_NewZone twice — the
+    // server sends it while handling OP_ZoneEntry and again in reply to the OP_ReqNewZone we send on
+    // OP_Weather — and the second copy arrives AFTER OP_ReqClientSpawn, while the spawn/door stream
+    // it requested is landing. Re-running the clears below would wipe that stream (missing NPCs and
+    // doors after zoning), and re-log "Entered <zone>" + a second navigate/zone event. The zone
+    // fields are identical in both copies, so there is nothing to redo. `begin_zone_in` re-arms this
+    // at the start of the next zone-entry handshake, so a real zone change still purges the old zone.
+    if gs.new_zone_applied { return; }
+    gs.new_zone_applied = true;
     gs.doors.clear();
     // Purge the previous zone's spawns (#270). OP_NewZone fires on EVERY server-driven zone entry
     // — normal travel, a same-zone #zone, AND a death-respawn — whereas the login/gameplay reconnect
@@ -2140,7 +2149,7 @@ mod tests {
                 parse_begin_cast, apply_begin_cast, parse_memorize_spell, apply_char_inventory,
                 apply_money_update, apply_money_on_corpse, apply_set_target, apply_move_item, apply_spawn_appearance,
                 extract_saylink_text, apply_task_description, apply_completed_tasks, apply_task_select_window,
-                strip_say_links, SAY_LINK_BODY_SIZE, SIZE_DEATH,
+                strip_say_links, SAY_LINK_BODY_SIZE, SIZE_DEATH, SIZE_NEW_ZONE,
                 apply_group_update_b, apply_group_join, apply_group_disband_you,
                 apply_group_disband_other, apply_group_leader_change, apply_group_invite, apply_group_acknowledge};
     use crate::game_state::{GameState, Entity, TaskStatus};
@@ -2290,6 +2299,70 @@ mod tests {
         assert_eq!(gs.entities.len(), 2);
         super::apply_new_zone(&mut gs, &[]);
         assert!(gs.entities.is_empty(), "prior-zone entities must be cleared on zone entry (#270)");
+    }
+
+    /// A RoF2 OP_NewZone payload carrying the fields apply_new_zone reads (short name @64, zone_id @852).
+    fn new_zone_payload(short_name: &str, zone_id: u16) -> Vec<u8> {
+        let mut p = vec![0u8; SIZE_NEW_ZONE];
+        p[64..64 + short_name.len()].copy_from_slice(short_name.as_bytes());
+        p[852..854].copy_from_slice(&zone_id.to_le_bytes());
+        p
+    }
+
+    /// A 100-byte RoF2 Door_Struct record for `door_id`.
+    fn door_record(door_id: u8) -> [u8; 100] {
+        let mut rec = [0u8; 100];
+        rec[..5].copy_from_slice(b"DOOR1");
+        rec[52..54].copy_from_slice(&100u16.to_le_bytes()); // size
+        rec[60] = door_id;
+        rec
+    }
+
+    #[test]
+    fn second_new_zone_of_a_zone_in_keeps_the_spawn_and_door_stream() {
+        // #322: a zone-in delivers OP_NewZone twice (the server sends one on OP_ZoneEntry and
+        // answers our OP_ReqNewZone with another). The second copy lands AFTER OP_ReqClientSpawn,
+        // so its entity/door purge used to wipe the spawn/door stream already arriving — silently
+        // losing the zone's NPCs and doors — and logged "Entered <zone>" + a navigate/zone event a
+        // second time. Only the first apply of a zone-server session may clear.
+        let mut gs = GameState::new();
+        gs.begin_zone_in();
+        super::apply_new_zone(&mut gs, &new_zone_payload("qeynos2", 2));
+
+        // OP_ReqClientSpawn is out; the stream it asked for starts landing.
+        gs.entities.insert(1, test_entity(1, "Guard_Jordan", 100.0));
+        super::apply_spawn_doors(&mut gs, &door_record(7));
+
+        super::apply_new_zone(&mut gs, &new_zone_payload("qeynos2", 2)); // the ReqNewZone reply
+
+        assert_eq!(gs.entities.len(), 1, "the second OP_NewZone must not wipe inbound spawns (#322)");
+        assert_eq!(gs.doors.len(), 1, "the second OP_NewZone must not wipe inbound doors (#322)");
+        assert_eq!(gs.zone_name, "qeynos2");
+        assert_eq!(gs.messages.iter().filter(|m| m.text == "Entered qeynos2").count(), 1,
+            "one 'Entered <zone>' message per zone-in");
+        assert_eq!(gs.chat_events.iter().filter(|e| e.kind == "zone").count(), 1,
+            "one navigate/zone event per zone-in");
+    }
+
+    #[test]
+    fn new_zone_still_clears_on_the_next_zone_in() {
+        // The once-per-zone-in guard (#322) is re-armed by begin_zone_in at the top of each
+        // zone-entry handshake, so a real zone change still purges the previous zone (#270) —
+        // including a spawn that lands between the handshake's clear and OP_NewZone.
+        let mut gs = GameState::new();
+        gs.begin_zone_in();
+        super::apply_new_zone(&mut gs, &new_zone_payload("qeynos2", 2));
+        gs.entities.insert(1, test_entity(1, "Guard_Jordan", 100.0));
+        super::apply_spawn_doors(&mut gs, &door_record(7));
+
+        gs.begin_zone_in(); // next zone-server session
+        gs.entities.insert(2, test_entity(2, "Guard_Jordan", 100.0)); // stale, pre-OP_NewZone
+        super::apply_new_zone(&mut gs, &new_zone_payload("freporte", 9));
+
+        assert!(gs.entities.is_empty(), "a real zone change must still purge entities (#270)");
+        assert!(gs.doors.is_empty(), "a real zone change must still purge doors (#270)");
+        assert_eq!(gs.zone_name, "freporte");
+        assert_eq!(gs.zone_id, 9);
     }
 
     #[test]

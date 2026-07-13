@@ -386,6 +386,13 @@ pub struct GameState {
     /// until OP_NewZone is parsed. The movement controller clamps against it so a collision gap
     /// can't drop us below it and trip the server's below-world drop → CLE linkdead (#150).
     pub zone_underworld: Option<f32>,
+    /// True once OP_NewZone has been applied for the current zone-server session. A RoF2 zone-in
+    /// delivers OP_NewZone TWICE: the server sends it unsolicited while handling OP_ZoneEntry and
+    /// again in reply to our OP_ReqNewZone (EQEmu `Handle_Connect_OP_ReqNewZone`). The second copy
+    /// lands after OP_ReqClientSpawn — i.e. while the spawn/door stream we just asked for is
+    /// arriving — so re-running apply_new_zone's entity/door purge would silently wipe it (#322).
+    /// `begin_zone_in` re-arms this per zone-server session, so a real zone change still purges.
+    pub new_zone_applied: bool,
 
     // Entities in zone (keyed by spawn_id)
     pub entities: std::collections::HashMap<u32, Entity>,
@@ -533,6 +540,16 @@ impl GameState {
             messages: VecDeque::with_capacity(50),
             ..Default::default()
         }
+    }
+
+    /// Start a zone-server session (login zone handoff, or an in-game zone change): purge the
+    /// previous zone's spawns and doors and re-arm the once-per-zone-in OP_NewZone apply. Called at
+    /// the top of each zone-entry handshake, before OP_ReqClientSpawn asks for the spawn stream, so
+    /// the clear can never race the stream it precedes. (#322)
+    pub fn begin_zone_in(&mut self) {
+        self.entities.clear();
+        self.doors.clear();
+        self.new_zone_applied = false;
     }
 
     pub fn log_msg(&mut self, kind: &str, text: &str) {
