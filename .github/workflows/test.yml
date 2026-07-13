@@ -1,0 +1,57 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref so pushes to a PR don't queue up stale builds.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Caches ~/.cargo/registry, ~/.cargo/git, and target/ keyed on Cargo.lock. The test suite
+      # itself is fast (569 tests in ~0.73s on a quiet box) — the release build is the slow part,
+      # so this cache is the whole cost story for this workflow.
+      - uses: Swatinem/rust-cache@v2
+
+      # No extra apt packages needed: wgpu/winit's Linux backends (x11-dl, xkbcommon-dl,
+      # wayland-sys, ash for Vulkan) all dlopen their native libraries at runtime via
+      # `libloading` rather than linking against them at build time, so `cargo build` does not
+      # require libx11-dev/libwayland-dev/libxkbcommon-dev/mesa/vulkan headers on the runner.
+      # ureq uses rustls (pure Rust), not openssl-sys, so no TLS dev headers either. If a future
+      # dependency bump changes this and the build step below starts failing on missing system
+      # libraries, add the relevant `apt-get install` step here rather than reaching for
+      # `--no-default-features` — see the fallback note below.
+      - name: cargo build --release
+        run: cargo build --release --locked
+
+      # `cargo test --lib` only runs the library's unit/integration tests, which are pure logic
+      # (game_state, movement, http handlers, pathfinding, etc.) — none of them construct a
+      # wgpu::Instance or winit::EventLoop (that code lives in main.rs/app.rs/render_model.rs,
+      # which are binaries, not part of the `--lib` target), so this is safe to run headless with
+      # no display/GPU present on the runner.
+      #
+      # 17 tests are #[ignore]d because they gate on baked asset fixtures (zone/model .glb files
+      # under assets/) that are gitignored and absent on a fresh clone. They stay ignored here —
+      # see #357 for giving them their own optional/asset-backed job.
+      #
+      # Known flake risk: find_path_does_not_drive_a_partial_route_into_a_sunken_water_pit
+      # (src/assets.rs:2269) asserts on a 150ms wall-clock A* budget and fails under heavy CPU
+      # contention (measured ~8/10 failures at load 16 on a shared dev box); it passes reliably
+      # on a quiet box, and a GitHub-hosted runner is quiet, so this job should stay green. If it
+      # ever flakes red here, that is this known issue (not a new regression) — see #356 for the
+      # real fix (surface PlanOutcome::TimedOut instead of racing the CPU scheduler with a
+      # wall-clock budget). Do not silence it by adding #[ignore] here; #356 tracks the fix.
+      - name: cargo test --lib
+        run: cargo test --lib --locked
