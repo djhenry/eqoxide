@@ -541,6 +541,17 @@ pub struct Collision {
     cell_size: f32,
     cols:      usize,
     rows:      usize,
+    /// Z extent of the whole mesh. The floor-normal filter's safety valve (`column_hits`) has to ask
+    /// "is there anything BENEATH this surface?" of the FULL COLUMN, not of the caller's query
+    /// window — a window is only ~100u tall and a cavern roof's floor is often further down than
+    /// that. Bounds let a column probe span the zone regardless of what the caller asked for.
+    z_min:     f32,
+    z_max:     f32,
+    /// How many times the empty-column fallback in `column_hits` has fired since zone load. The
+    /// fallback is a DEGRADED path — it answers from inverted (mis-wound) art — so an agent must be
+    /// able to see that it is running: this is what `/v1/observe/debug` reports as `nav_degraded`.
+    /// Relaxed: a diagnostic counter, never read for control flow.
+    fallback_hits: std::sync::atomic::AtomicU64,
     /// Optional water-region map (from the zone's `.wtr`). When present, find_path may DESCEND
     /// through water (swim down a canal/shaft) to a lower floor that has no walkable connection.
     water:     Option<std::sync::Arc<crate::region_map::RegionMap>>,
@@ -598,15 +609,19 @@ impl Collision {
             }
         }
 
-        // XY bounds.
+        // XY bounds (for the broad-phase grid) and Z bounds (so a column probe can span the whole
+        // mesh — see `z_min`/`z_max`).
         let mut min = [f32::MAX; 2];
         let mut max = [f32::MIN; 2];
+        let (mut z_min, mut z_max) = (f32::MAX, f32::MIN);
         for t in &tris {
             for v in t {
                 if v[0] < min[0] { min[0] = v[0]; }
                 if v[1] < min[1] { min[1] = v[1]; }
                 if v[0] > max[0] { max[0] = v[0]; }
                 if v[1] > max[1] { max[1] = v[1]; }
+                if v[2] < z_min { z_min = v[2]; }
+                if v[2] > z_max { z_max = v[2]; }
             }
         }
         // Face-normal Z per triangle (see `tri_nz`). The WLD→world map (x,y,z) → (z,x,y) is a cyclic
@@ -632,7 +647,9 @@ impl Collision {
 
         let cell_size = cell_size.max(1.0);
         if tris.is_empty() || min[0] == f32::MAX {
-            return Collision { tris, tri_nz, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0, water: None, from_collision_mesh, zone_line_regions: Vec::new() };
+            return Collision { tris, tri_nz, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0,
+                z_min: 0.0, z_max: 0.0, fallback_hits: Default::default(),
+                water: None, from_collision_mesh, zone_line_regions: Vec::new() };
         }
         let cols = (((max[0] - min[0]) / cell_size).ceil() as usize + 1).max(1);
         let rows = (((max[1] - min[1]) / cell_size).ceil() as usize + 1).max(1);
@@ -653,7 +670,17 @@ impl Collision {
                 }
             }
         }
-        Collision { tris, tri_nz, cells, origin: min, cell_size, cols, rows, water: None, from_collision_mesh, zone_line_regions: Vec::new() }
+        Collision { tris, tri_nz, cells, origin: min, cell_size, cols, rows, z_min, z_max,
+            fallback_hits: Default::default(), water: None, from_collision_mesh, zone_line_regions: Vec::new() }
+    }
+
+    /// How many times the floor-normal filter's empty-column fallback has fired since zone load, i.e.
+    /// how many nav queries have been answered from INVERTED (mis-wound) art rather than from a
+    /// properly up-facing floor. `0` = the filter is doing its job everywhere it has been asked.
+    /// Non-zero = this zone has mis-wound ground and nav is running degraded there. Reported to the
+    /// agent as `nav_degraded` on `/v1/observe/debug` — a degraded mode must never be silent.
+    pub fn fallback_hits(&self) -> u64 {
+        self.fallback_hits.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Attach a zone water map so find_path can route swim descents. Call after `build`.
@@ -845,8 +872,8 @@ impl Collision {
 
     /// Shared vertical-column raycast (Möller–Trumbore). Appends `(hit_z, face_normal_z)` to `out`,
     /// sorted high→low. When `floors_only`, DOWN-facing surfaces are dropped so a ceiling can never
-    /// be mistaken for a floor (#329) — UNLESS that would empty the column entirely, in which case
-    /// we fall back to the facing-blind result for it (see below).
+    /// be mistaken for a floor (#329) — UNLESS the zone's art leaves the column with no floor at
+    /// all, in which case the mesh's BOTTOM-MOST surface is admitted as ground (see below).
     fn column_hits(&self, east: f32, north: f32, ref_z: f32, up: f32, down: f32,
                    floors_only: bool, out: &mut Vec<(f32, f32)>) {
         out.clear();
@@ -894,18 +921,45 @@ impl Collision {
                 }
             }
         }
-        // Never delete the ONLY ground in a column. The filter is sound when a real (up-facing)
-        // floor survives it — but when it empties the column, the "ceiling" it just removed was the
-        // only surface here at all, i.e. there is no floor beneath it to make it a ceiling. That is
-        // exactly the highpass shape (#373-adjacent): art inverted at the height a character needs,
-        // with nothing correctly-wound underneath. Falling back to the facing-blind result for just
-        // this column keeps every real floor while still filtering ceilings everywhere a real floor
-        // is present (see `column_fallback_does_not_resurrect_a_ceiling_when_a_real_floor_is_present`).
-        if filter && out.is_empty() {
-            self.column_hits(east, north, ref_z, up, down, false, out);
-            return;
-        }
         out.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)); // high→low
+
+        // Never delete the ONLY ground in a column: a ceiling is only a ceiling if there is a floor
+        // BENEATH it. highpass bakes its mountain pass from inverted (down-facing) art with nothing
+        // correctly-wound under it, so the filter deleted the pass itself and 65% of the zone's real
+        // ground went invisible to the planner.
+        //
+        // The predicate must be asked of the FULL COLUMN, not of this query's window. Callers pass
+        // `up=20, down=100`, so "nothing survived the filter in `out`" only means "no floor in these
+        // 100 units" — a cavern roof, tower interior, or skydome whose floor is further down than
+        // that presents an empty window too, and admitting it would hand back a CEILING as ground.
+        // That is #329 itself: at qcat (-48, 1058) the column is [391.8 roof, -70.0 floor], and a
+        // window-scoped test answers `Some(391.8)` — the catacombs roof, 462u above the floor.
+        //
+        // So: only the mesh's bottom-most surface in this column qualifies. Ground (even inverted
+        // ground) has nothing under it; a ceiling always does. Anything else stays deleted, and the
+        // caller correctly gets "no floor here".
+        if filter && out.is_empty() {
+            if let Some(bottom) = self.column_bottom(east, north) {
+                // ...and it still has to be inside the window the caller asked about. A floor 300u
+                // below a query band is out of reach, not a floor to stand on.
+                if bottom.0 >= z_bot && bottom.0 <= z_top {
+                    self.fallback_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    out.push(bottom);
+                }
+            }
+        }
+    }
+
+    /// The BOTTOM-MOST surface of the full mesh column at `(east, north)`, facing-blind, as
+    /// `(hit_z, face_normal_z)`. Nothing in this column lies beneath it — which is what makes it
+    /// ground rather than a ceiling, whichever way its art happens to be wound. Spans `z_min..z_max`
+    /// so it is independent of any caller's query window (see the fallback in `column_hits`).
+    fn column_bottom(&self, east: f32, north: f32) -> Option<(f32, f32)> {
+        let mut hits = Vec::new();
+        let mid = 0.5 * (self.z_min + self.z_max);
+        let half = 0.5 * (self.z_max - self.z_min) + 1.0;
+        self.column_hits(east, north, mid, half, half, false, &mut hits); // facing-blind: no recursion
+        hits.last().copied() // high→low ⇒ last = the lowest surface in the column
     }
 
     /// Find the walkable FLOOR height at `(east, north)` nearest to `ref_z`.
@@ -2193,23 +2247,94 @@ mod tests {
         assert_eq!(col.column_floors(306.0, 2.0, 50.0, 20.0, 100.0).len(), 1);
     }
 
-    /// The column fallback above must be scoped to columns the filter would otherwise empty — it
-    /// must NOT resurrect a ceiling in a qcat-shaped column where a real floor is ALSO present.
-    /// Re-asserts #329's property (see `nearest_floor_never_returns_a_ceiling`) specifically against
-    /// the fallback path: a non-empty filtered result must never be widened back out to facing-blind.
+    /// The REAL qcat #329 column, and the trap the fallback must not fall into. Callers query with
+    /// `up=20, down=100`, so "the filter left nothing" is a statement about a 100-unit WINDOW, not
+    /// about the column. qcat's spawn pocket at (-48, 1058) is
+    /// `[391.8 down-facing roof, -70.0 up-facing floor]` — 462u apart. Standing at the roof, the
+    /// window holds ONLY the roof, so a window-scoped "is it empty?" test fires the fallback and
+    /// hands back the CATACOMBS ROOF as the floor. That is #329 itself, in the zone it is named
+    /// after, and it needs no inverted art at all — an ordinary high ceiling is enough.
+    ///
+    /// The predicate is therefore asked of the FULL COLUMN: only the mesh's bottom-most surface can
+    /// be admitted as ground. The roof has a floor 462u beneath it, so it is a ceiling, and the
+    /// honest answer at roof height is "no floor within reach" — `None`, not a confident lie.
     #[test]
-    fn column_fallback_does_not_resurrect_a_ceiling_when_a_real_floor_is_present() {
+    fn fallback_never_admits_a_ceiling_whose_floor_is_below_the_query_window() {
         let assets = ZoneAssets {
-            terrain: vec![slab(-69.97, 0.0, 64.0, 0.0, 64.0, true),    // real floor
+            terrain: vec![slab(-69.97, 0.0, 64.0, 0.0, 64.0, true),     // real floor  (qcat -70.0)
+                          slab(391.84, 0.0, 64.0, 0.0, 64.0, false)],   // roof, 462u ABOVE it
+            objects: vec![], textures: vec![],
+        };
+        let col = Collision::build(&assets, 8.0);
+        // Standing at the roof, the caller's window [291.8, 411.8] contains ONLY the roof — the real
+        // floor is 462u below and nowhere near it. The filter empties the window...
+        assert!(col.column_surfaces(20.0, 40.0, 391.8, 20.0, 100.0).iter().all(|&(_, nz)| nz < 0.0),
+            "the window at roof height holds only the down-facing roof");
+        // ...and the fallback must NOT rescue it: this is a ceiling, and it has a floor beneath it.
+        assert_eq!(col.nearest_floor(20.0, 40.0, 391.8, 20.0, 100.0), None,
+            "the catacombs roof is NOT a floor — a ceiling with a floor 462u beneath it must be refused, not returned");
+        assert!(col.column_floors(20.0, 40.0, 391.8, 20.0, 100.0).is_empty(),
+            "and it must not appear in column_floors either");
+        // The real floor is still found from anywhere within reach of it.
+        let f = col.nearest_floor(20.0, 40.0, -56.0, 20.0, 100.0).expect("the real floor is in reach");
+        assert!((f - (-69.97)).abs() < 0.1, "expected the real floor -69.97, got {f}");
+    }
+
+    /// The same trap, but with the inverted art that motivates the fallback in the first place — so
+    /// "it's mis-wound ground" cannot be used to smuggle a ceiling through. This is #329's exact
+    /// column with BOTH surfaces mis-wound: an INVERTED floor at -69.97 and a ceiling 14u above it
+    /// at -55.97, both down-facing, so NEITHER survives the facing filter and the fallback is the
+    /// only thing answering. A facing-blind fallback hands back both, and at `ref_z = -56` the
+    /// nearest of them is the CEILING — #329, reproduced through the safety valve itself.
+    ///
+    /// Ground is the bottom-most surface of the column; the ceiling has ground beneath it. Only the
+    /// former may be admitted — and `column_floors` must not list the ceiling either, or A* takes it
+    /// as a walkable tier even when `nearest_floor` happens to pick the right surface to stand on.
+    #[test]
+    fn fallback_admits_the_inverted_ground_but_not_the_ceiling_above_it() {
+        let assets = ZoneAssets {
+            terrain: vec![slab(-69.97, 0.0, 64.0, 0.0, 64.0, false),   // INVERTED ground (highpass-style)
                           slab(-55.97, 0.0, 64.0, 0.0, 64.0, false)],  // ceiling, 14u above it
             objects: vec![], textures: vec![],
         };
         let col = Collision::build(&assets, 8.0);
-        let f = col.nearest_floor(20.0, 40.0, -56.0, 20.0, 100.0).expect("a floor exists below");
+        // Neither surface survives the facing filter — both are down-facing.
+        let all = col.column_surfaces(20.0, 40.0, -56.0, 20.0, 100.0);
+        assert_eq!(all.len(), 2, "both surfaces are in the column");
+        assert!(all.iter().all(|&(_, nz)| nz < 0.0), "and BOTH are down-facing — only the fallback can answer");
+
+        // ref_z sits 0.03u under the CEILING and 14u above the ground, so a facing-blind fallback
+        // returns the ceiling as the nearest "floor". Only the bottom-most surface is ground.
+        let f = col.nearest_floor(20.0, 40.0, -56.0, 20.0, 100.0).expect("the inverted ground is still ground");
         assert!((f - (-69.97)).abs() < 0.1,
-            "must anchor to the real floor — the fallback must not fire when the filtered column is non-empty, got {f}");
-        assert_eq!(col.column_floors(20.0, 40.0, -56.0, 20.0, 100.0).len(), 1,
-            "the fallback must not resurrect the filtered-out ceiling alongside the real floor");
+            "expected the inverted GROUND -69.97, got {f} — the fallback must not return the ceiling above it");
+        // And A* must not be offered the ceiling as a walkable tier either.
+        let tiers = col.column_floors(20.0, 40.0, -56.0, 20.0, 100.0);
+        assert_eq!(tiers.len(), 1, "only the ground is a tier, got {tiers:?}");
+        assert!((tiers[0] - (-69.97)).abs() < 0.1, "and it is the ground, not the ceiling: {tiers:?}");
+    }
+
+    /// The fallback is a DEGRADED path (it answers from mis-wound art whose true facing is
+    /// unverified), so it must never run silently: `fallback_hits()` counts its firings and is what
+    /// `/v1/observe/debug` reports as `nav_degraded`. A client that quietly answers from a degraded
+    /// code path is lying to the agent by omission.
+    #[test]
+    fn the_fallback_reports_itself_so_nav_degraded_is_never_silent() {
+        // A cleanly wound zone never needs the fallback → reports healthy (nav_degraded = null).
+        let clean = Collision::build(&ZoneAssets {
+            terrain: vec![slab(0.0, 0.0, 64.0, 0.0, 64.0, true)], objects: vec![], textures: vec![],
+        }, 8.0);
+        assert!(clean.nearest_floor(20.0, 40.0, 0.0, 20.0, 100.0).is_some());
+        assert_eq!(clean.fallback_hits(), 0, "a cleanly wound zone must report nav_degraded = null");
+
+        // A zone with inverted ground answers from the fallback — and SAYS so.
+        let inverted = Collision::build(&ZoneAssets {
+            terrain: vec![slab(0.0, 0.0, 64.0, 0.0, 64.0, false)], objects: vec![], textures: vec![],
+        }, 8.0);
+        assert!(inverted.nearest_floor(20.0, 40.0, 0.0, 20.0, 100.0).is_some(),
+            "the inverted ground is recovered...");
+        assert!(inverted.fallback_hits() > 0,
+            "...and the degraded path that recovered it must be visible to the agent, not silent");
     }
 
     /// A whole zone can be the degenerate case of `column_whose_only_surface_is_inverted_still_finds_a_floor`
@@ -2530,8 +2655,14 @@ mod tests {
     fn find_path_swims_across_a_surface_pool_instead_of_diving() {
         // Positions are [north, up, east]. A deep pool bottom under the whole span, with dry shores
         // laid on top at z=0 at each end, and a surface-level water body between them.
+        // Wound UP-FACING (same vertex order as `slab`) — these are FLOORS, which is what the
+        // `normals: [0,1,0]` below has always claimed. The winding used to be reversed here, so
+        // every "floor" in this fixture was really a down-facing face; the test only passed because
+        // an all-inverted mesh failed the old whole-zone winding gate, which switched the
+        // floor-normal filter off entirely. With the filter always on, a floor has to be wound like
+        // one.
         let quad = |n0: f32, n1: f32, e0: f32, e1: f32, up: f32| MeshData {
-            positions: vec![[n0, up, e0], [n1, up, e0], [n1, up, e1], [n0, up, e1]],
+            positions: vec![[n0, up, e0], [n0, up, e1], [n1, up, e1], [n1, up, e0]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
             render_mode: RenderMode::Opaque, anim: None,
