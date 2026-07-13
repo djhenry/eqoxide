@@ -285,5 +285,9 @@ pub(crate) mod tests {
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["active_count"], 1);
+        // Assert WHICH task survives the filter, not just the count — inverting the filter
+        // (status == Active -> != Active) would also yield a count of 1 (task_id 2), but with
+        // the wrong task. See #355 M3.
+        assert_eq!(json["tasks"][0]["task_id"], 1);
     }
 }

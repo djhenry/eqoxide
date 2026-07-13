@@ -673,8 +673,13 @@ mod tests {
         assert!(wasd.pos[2] < 1.0, "WASD should stay at floor z=0: {}", wasd.pos[2]);
 
         // Nav is now capped at the same native step-up (no NAV_CLIMB): also blocked, also at z=0.
+        // climb is set high (not 0) deliberately: intent.climb is now ignored entirely (see
+        // `let _ = intent.climb;` in step()), but the WASD and nav intents used to be byte-identical
+        // here (both climb: 0.0), so re-introducing the old NAV_CLIMB super-step (`if intent.climb >
+        // 0 { climb up to intent.climb }`) would NOT have been caught by this test. Setting climb
+        // to a value that WOULD scale the lip if honored makes the test an actual regression guard.
         let nav_intent = MoveIntent { wish_dir: [1.0, 0.0], wish_vspeed: 0.0, jump: false,
-            want_swim: false, speed: 35.0, climb: 0.0, hop: false };
+            want_swim: false, speed: 35.0, climb: 20.0, hop: false };
         let mut nav = CharacterController::new([3.0, 0.0, 0.0]);
         nav.on_ground = true;
         for _ in 0..5 { nav.step(nav_intent, 0.1, &geo()); }
