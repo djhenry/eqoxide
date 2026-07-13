@@ -331,6 +331,18 @@ pub struct EqStream {
     sent: VecDeque<Sent>,
     frags: FragmentBuffer,
     app_tx: mpsc::UnboundedSender<AppPacket>,
+    /// Wall-clock time of the last inbound **datagram** of any kind — session-layer ACKs and
+    /// keepalive replies included, not just decoded application packets. This is the only sound
+    /// "is the link alive?" signal: a genuinely idle EQ session can go tens of seconds without a
+    /// single APP packet (nothing is happening in the world) while the session layer keeps
+    /// ACKing — so app-packet silence must never be mistaken for a dead connection (#343).
+    ///
+    /// The stream stamps this **itself**, in `poll_recv`, rather than expecting each of the four
+    /// loops that own an `EqStream` (login, gameplay, zone-entry handshake, world reconnect) to
+    /// remember to mirror it. That discipline is exactly what failed in review of #343: two of the
+    /// four loops didn't mirror, so a >15s world reconnect reported `connected: false` on a healthy
+    /// link. Whoever receives the datagram owns the clock — a future loop gets this for free.
+    net_health: crate::http::NetHealthShared,
 }
 
 impl EqStream {
@@ -338,6 +350,7 @@ impl EqStream {
         host: &str,
         port: u16,
         app_tx: mpsc::UnboundedSender<AppPacket>,
+        net_health: crate::http::NetHealthShared,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let peer: SocketAddr = format!("{}:{}", host, port).parse()?;
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -352,6 +365,7 @@ impl EqStream {
             recv_buf: HashMap::new(),
             sent: VecDeque::new(),
             frags: FragmentBuffer::new(),
+            net_health,
             app_tx,
         };
 
@@ -373,7 +387,14 @@ impl EqStream {
                 tokio::time::Duration::from_millis(100),
                 stream.socket.recv(&mut recv_buf),
             ).await {
-                Ok(Ok(n)) => stream.on_raw_recv(&recv_buf[..n]),
+                Ok(Ok(n)) => {
+                    // The other socket read. Stamped for the same reason `poll_recv` is, and stamped
+                    // here rather than left as a benign exception: the invariant "whoever receives
+                    // the datagram owns the clock" is only load-bearing if it has NO exceptions —
+                    // an asterisk on it is how it rots back into #343 (review).
+                    stream.net_health.lock().unwrap().last_datagram = std::time::Instant::now();
+                    stream.on_raw_recv(&recv_buf[..n]);
+                }
                 Ok(Err(e)) => return Err(e.into()),
                 Err(_) => {} // recv timeout, keep waiting
             }
@@ -435,7 +456,12 @@ impl EqStream {
         let mut buf = vec![0u8; 4096];
         for _ in 0..MAX_DATAGRAMS_PER_POLL {
             match self.socket.try_recv(&mut buf) {
-                Ok(n) => self.on_raw_recv(&buf[..n]),
+                Ok(n) => {
+                    // Link liveness (#343): ANY datagram, stamped BEFORE decode so session-layer
+                    // ACKs/keepalives — which never become application packets — still count.
+                    self.net_health.lock().unwrap().last_datagram = std::time::Instant::now();
+                    self.on_raw_recv(&buf[..n]);
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return true,
                 Err(_) => return false,
             }
@@ -851,6 +877,17 @@ impl EqStream {
 /// publish-cadence test (#324) — can drive a real `EqStream` without a live UDP session handshake.
 #[cfg(test)]
 pub(crate) async fn test_stream(pass1: u8, key: u32) -> (EqStream, mpsc::UnboundedReceiver<AppPacket>) {
+    test_stream_with_health(pass1, key, Default::default()).await
+}
+
+/// As `test_stream`, but with a caller-owned `NetHealthShared` so a test can assert the link clock
+/// is stamped on inbound datagrams (#343).
+#[cfg(test)]
+pub(crate) async fn test_stream_with_health(
+    pass1: u8,
+    key: u32,
+    net_health: crate::http::NetHealthShared,
+) -> (EqStream, mpsc::UnboundedReceiver<AppPacket>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let _ = socket.connect("127.0.0.1:1").await;
@@ -863,14 +900,69 @@ pub(crate) async fn test_stream(pass1: u8, key: u32) -> (EqStream, mpsc::Unbound
         recv_buf: HashMap::new(),
         sent: VecDeque::new(),
         frags: FragmentBuffer::new(),
+        net_health,
         app_tx: tx,
     };
     (stream, rx)
 }
 
+/// An `EqStream` wired to a REAL local peer socket, so a test can actually deliver a datagram to it
+/// and drive `poll_recv`'s receive path end-to-end. Returns the stream, its app-packet receiver, the
+/// peer socket, and the address to send to. (#343)
+#[cfg(test)]
+pub(crate) async fn test_stream_with_peer(
+    net_health: crate::http::NetHealthShared,
+) -> (EqStream, mpsc::UnboundedReceiver<AppPacket>, UdpSocket, SocketAddr) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer_sock.local_addr().unwrap();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let stream_addr = socket.local_addr().unwrap();
+    socket.connect(peer_addr).await.unwrap();
+    let stream = EqStream {
+        session: SessionInfo::default(),
+        socket,
+        peer: peer_addr,
+        send_seq: 0,
+        next_recv_seq: 0,
+        recv_buf: HashMap::new(),
+        sent: VecDeque::new(),
+        frags: FragmentBuffer::new(),
+        net_health,
+        app_tx: tx,
+    };
+    (stream, rx, peer_sock, stream_addr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #343 (review): `connected` is derived from `net_health.last_datagram`, and the ONLY thing
+    /// that stamps it is `poll_recv`. This is what makes the clock correct in all four loops that
+    /// own an `EqStream` — including `reconnect_via_world`, whose 90-SECOND deadline would otherwise
+    /// sail past `CONN_STALE_SECS` and report `connected: false` on a perfectly healthy link
+    /// mid-zone-handoff. The stamp must land for ANY inbound datagram, and must happen BEFORE decode
+    /// so that a session-layer ACK — which never becomes an application packet — still counts.
+    #[tokio::test]
+    async fn poll_recv_stamps_link_liveness_for_any_datagram_even_undecodable_ones() {
+        let net_health: crate::http::NetHealthShared = Default::default();
+        // Pretend the link has been quiet for a minute — well past CONN_STALE_SECS.
+        net_health.lock().unwrap().last_datagram =
+            std::time::Instant::now() - std::time::Duration::from_secs(60);
+
+        let (mut stream, _rx, peer, stream_addr) = test_stream_with_peer(net_health.clone()).await;
+
+        // A datagram the app layer will make nothing of — exactly like a session ACK/keepalive.
+        peer.send_to(&[0x00, 0x15, 0xde, 0xad, 0xbe, 0xef], stream_addr).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        stream.poll_recv();
+
+        let age = net_health.lock().unwrap().last_datagram.elapsed();
+        assert!(age < std::time::Duration::from_secs(1),
+            "an inbound datagram must refresh the link clock (age was {age:?}) — otherwise a long \
+             world reconnect reports connected:false on a healthy link (#343 review)");
+    }
 
     #[test]
     fn test_crc32_zero_key() {

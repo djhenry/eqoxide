@@ -39,7 +39,7 @@ async fn post_target(
     };
     // The player's own spawn is a legal target (self-cast / F1) but is deliberately absent from the
     // entity list — `register_spawn` skips the self-spawn (see GameState::set_target).
-    let is_self = s.player_info.lock().unwrap().player_id == id;
+    let is_self = s.player().player_id == id;
     let known = is_self || s.entity_ids.lock().unwrap().values().any(|&v| v == id);
     if !known {
         return (StatusCode::NOT_FOUND, format!("no spawn with id {id} in this zone"));
@@ -105,7 +105,7 @@ struct ConsiderBody { id: Option<u32> }
 
 /// POST /v1/combat/consider {"id":N?} — consider a spawn (con color/faction), default current target.
 async fn post_consider(State(s): State<HttpState>, OptionalJson(body): OptionalJson<ConsiderBody>) -> (StatusCode, String) {
-    let id = body.and_then(|b| b.id).or(s.player_info.lock().unwrap().target_id);
+    let id = body.and_then(|b| b.id).or(s.player().target_id);
     match id {
         Some(id) => { *s.consider.lock().unwrap() = Some(id); (StatusCode::OK, format!("consider {id} queued")) }
         None => (StatusCode::BAD_REQUEST, "no target; provide {\"id\":N}".into()),
@@ -135,7 +135,7 @@ async fn post_cast(State(s): State<HttpState>, OptionalJson(body): OptionalJson<
             }
         }
     }
-    let mem = s.player_info.lock().unwrap().mem_spells;
+    let mem = s.player().mem_spells;
     let gem = if let Some(g) = b.gem {
         g
     } else if let Some(sid) = b.spell_id {
@@ -204,7 +204,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
-    use crate::http::quests::tests::empty_state;
+    use crate::http::quests::tests::{empty_state, set_gs};
 
     async fn body_text(resp: axum::response::Response) -> String {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -216,7 +216,7 @@ mod tests {
     #[tokio::test]
     async fn consider_no_body_falls_back_to_current_target() {
         let state = empty_state();
-        state.player_info.lock().unwrap().target_id = Some(7);
+        set_gs(&state, |gs| gs.target_id = Some(7));
         let consider = state.consider.clone();
         let app = router().with_state(state);
         let resp = app.oneshot(Request::post("/consider").body(Body::empty()).unwrap()).await.unwrap();
@@ -229,7 +229,7 @@ mod tests {
         let state = empty_state();
         // A current target IS set — the old Option<Json<T>> bug would silently consider IT instead
         // of reporting the malformed "id" field.
-        state.player_info.lock().unwrap().target_id = Some(7);
+        set_gs(&state, |gs| gs.target_id = Some(7));
         let consider = state.consider.clone();
         let app = router().with_state(state);
         let req = Request::post("/consider")
@@ -246,7 +246,7 @@ mod tests {
     #[tokio::test]
     async fn consider_unknown_key_is_400_and_does_not_fall_back() {
         let state = empty_state();
-        state.player_info.lock().unwrap().target_id = Some(7);
+        set_gs(&state, |gs| gs.target_id = Some(7));
         let consider = state.consider.clone();
         let app = router().with_state(state);
         let req = Request::post("/consider")
@@ -310,7 +310,7 @@ mod tests {
         // The player's own spawn is a legal target (self-cast / F1) but is deliberately absent from
         // the entity list, so it must be allowed explicitly or self-targeting would 404.
         let state = empty_state();
-        state.player_info.lock().unwrap().player_id = 42;
+        set_gs(&state, |gs| gs.player_id = 42);
         let target = state.target.clone();
         let app = router().with_state(state);
         let req = Request::post("/target")
@@ -329,11 +329,10 @@ mod tests {
         // then dropped it with a `tracing::info!` the agent cannot read. 200 + total silence is
         // indistinguishable from a cast that is still in flight.
         let state = empty_state();
-        {
-            let mut pi = state.player_info.lock().unwrap();
-            pi.mem_spells = [crate::game_state::EMPTY_GEM; 9];
-            pi.mem_spells[0] = 202; // only gem 0 is memorized
-        }
+        set_gs(&state, |gs| {
+            gs.mem_spells = [crate::game_state::EMPTY_GEM; 9];
+            gs.mem_spells[0] = 202; // only gem 0 is memorized
+        });
         let cast = state.cast.clone();
         let app = router().with_state(state);
         let req = Request::post("/cast")
@@ -349,11 +348,10 @@ mod tests {
     #[tokio::test]
     async fn cast_memorized_gem_still_works() {
         let state = empty_state();
-        {
-            let mut pi = state.player_info.lock().unwrap();
-            pi.mem_spells = [crate::game_state::EMPTY_GEM; 9];
-            pi.mem_spells[2] = 202;
-        }
+        set_gs(&state, |gs| {
+            gs.mem_spells = [crate::game_state::EMPTY_GEM; 9];
+            gs.mem_spells[2] = 202;
+        });
         let cast = state.cast.clone();
         let app = router().with_state(state);
         let req = Request::post("/cast")

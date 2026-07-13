@@ -15,7 +15,7 @@ pub(super) fn router() -> Router<HttpState> {
 /// `killed_by` in /v1/observe/debug and recover its corpse before continuing; this releases it. A
 /// no-op (but still 200) if the character isn't currently dead. (#284)
 async fn post_respawn(State(s): State<HttpState>) -> (StatusCode, &'static str) {
-    let dead = s.player_info.lock().unwrap().dead;
+    let dead = s.player().dead;
     *s.respawn.lock().unwrap() = true;
     if dead {
         tracing::info!("respawn: requested via POST /v1/lifecycle/respawn");
