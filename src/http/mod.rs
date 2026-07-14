@@ -1009,6 +1009,10 @@ pub fn spawn_camera_server(
             use std::io::Write;
             tracing::info!("API_PORT={bound_port}");
             let _ = std::io::stdout().flush();
+            // Stamp the per-pid crash log with what this instance IS (#380). Several clients run at
+            // once on distinct ports; without this, a directory of crash-<pid>.log files is a pile
+            // of anonymous pids and a post-mortem can't tell which one was the client it cares about.
+            crate::crash::log_instance(&format!("api_port={bound_port}"));
             tracing::info!("camera HTTP: http://127.0.0.1:{bound_port}");
             if let Err(e) = axum::serve(listener, app).await {
                 tracing::error!("camera HTTP: server error: {e}");
