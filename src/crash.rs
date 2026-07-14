@@ -489,7 +489,18 @@ fn install_signal_handlers() -> usize {
             let rc = libc::sigaction(sig, &sa, &mut old);
             if rc == 0 {
                 let idx = sig as usize;
-                if idx < MAX_SIGNAL {
+                // NEVER record OURSELVES as the "previous" handler. `sigaction` reports the CURRENT
+                // disposition in `old`, so on a second install that is already
+                // `fatal_signal_handler` — storing it would make `chain_to_previous` recurse into
+                // `fatal_signal_handler` forever, writing FATAL SIGNAL lines in a tight loop (which
+                // bypass the size cap) until the altstack blows.
+                //
+                // That is precisely the "the fix reintroduces the bug it fixes" shape that has
+                // already bitten this module twice, so the guard lives HERE rather than only in
+                // `install()`: it holds even for a direct/repeated call to this function (the unit
+                // tests do exactly that), not just for the single call the shipped client makes.
+                let is_self = old.sa_sigaction == fatal_signal_handler as *const () as usize;
+                if idx < MAX_SIGNAL && !is_self {
                     // Leak it: the handler must be able to read this forever without allocating.
                     PREV_ACTION[idx].store(Box::into_raw(Box::new(old)), Ordering::Relaxed);
                 }
@@ -539,9 +550,18 @@ fn spawn_heartbeat_thread() {
 // install
 // ---------------------------------------------------------------------------------------------
 
-/// Install everything: panic hook, fatal-signal handlers, heartbeat. Call once, as early as possible
-/// in `main()`, before any other thread is spawned.
+/// Install everything: panic hook, fatal-signal handlers, heartbeat. Call as early as possible in
+/// `main()`, before any other thread is spawned.
+///
+/// Idempotent: a second call is a no-op. Besides the obvious (two heartbeat threads, a panic hook
+/// wrapping itself), a re-install would ask `sigaction` for the "previous" disposition and get back
+/// *our own handler* — see the self-chain guard in [`install_signal_handlers`].
 pub fn install() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(install_inner);
+}
+
+fn install_inner() {
     let dir = crash_dir();
     if let Err(e) = std::fs::create_dir_all(&dir) {
         mark_unhealthy("could not create crash dir");
@@ -740,6 +760,49 @@ mod tests {
                 "{} must have captured a previous disposition to chain to",
                 signal_name(sig)
             );
+        }
+    }
+
+    /// Installing twice must NOT make our handler chain to itself.
+    ///
+    /// `sigaction` returns the CURRENT disposition in `old`. On a second install that is already
+    /// `fatal_signal_handler`; recording it as "previous" would make `chain_to_previous` recurse
+    /// into `fatal_signal_handler` forever on the next fault — writing FATAL SIGNAL lines in a tight
+    /// loop (they bypass the size cap, being signal-safe) until the alternate stack blows. The
+    /// process would die *more* silently and *more* confusingly than with no handler at all.
+    ///
+    /// The unit tests above call `install_signal_handlers()` directly and repeatedly, which is
+    /// exactly how this shipped unnoticed — so the guard is asserted against a REPEATED raw call,
+    /// not just against `install()`'s `Once`.
+    #[test]
+    fn installing_twice_never_chains_the_handler_to_itself() {
+        let _g = lock(&TEST_LOCK);
+
+        install_signal_handlers();
+        install_signal_handlers();
+        install_signal_handlers();
+
+        let ours = fatal_signal_handler as *const () as usize;
+        for sig in FATAL_SIGNALS {
+            let prev = PREV_ACTION[sig as usize].load(Ordering::Relaxed);
+            assert!(!prev.is_null(), "{} lost its chain entirely", signal_name(sig));
+            // SAFETY: leaked at install; never freed or mutated afterwards.
+            let recorded = unsafe { (*prev).sa_sigaction };
+            assert_ne!(
+                recorded, ours,
+                "SELF-CHAIN on {}: a repeat install recorded OUR OWN handler as 'previous' — \
+                 chain_to_previous() would then recurse into fatal_signal_handler forever",
+                signal_name(sig)
+            );
+        }
+
+        // And `install()` itself must be idempotent regardless.
+        install();
+        install();
+        for sig in FATAL_SIGNALS {
+            let prev = PREV_ACTION[sig as usize].load(Ordering::Relaxed);
+            let recorded = unsafe { (*prev).sa_sigaction };
+            assert_ne!(recorded, ours, "SELF-CHAIN on {} after install()", signal_name(sig));
         }
     }
 
