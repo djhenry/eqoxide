@@ -4450,6 +4450,492 @@ mod tests {
         assert!(tot_new_ok >= tot_old_ok, "fine-tier route success must not go down");
     }
 
+    /// **THE FAITHFUL WALKER DRIFT SCANNER (the real per-tick recovery loop).** The static scanner
+    /// above drove ONE fine plan with naive pure pursuit and no recovery — which over-counts corner
+    /// wedges the real walker recovers from, and cannot measure a planner-cell fix's benefit (the real
+    /// walker re-anchors its fine plan every tick, so cleaner cells help it even when a single static
+    /// plan wedges). This one mirrors `navigation.rs`'s ACTUAL two-rate loop (post-#399):
+    ///
+    ///   * a COARSE route committed at goal-change (`find_path_ex`), re-planned on stall/backoff;
+    ///   * a ~100 Hz FAST-STEER aim: `fast_steer_aim` toward a 5u carrot on `local_path` (cursor
+    ///     `local_i`), refreshed EVERY controller frame — the thing that hugs a bend;
+    ///   * a 150 ms NAV TICK that advances `path_i`, RE-POSTS a fresh `find_path_local` from the
+    ///     walker's CURRENT position (1-tick lag, as #399's worker introduces), and runs stall
+    ///     detection → downhill backoff → coarse re-plan (capped at 8 attempts), plus the #246/#379
+    ///     proactive coarse re-plan when the fine tier reports `NoWayThrough`.
+    ///
+    /// Then it classifies terminal wedges (never arrived, 8 re-paths spent) by face. THIS is the
+    /// number that gates a planner-cell fix — run it before/after PR-B.
+    ///
+    /// ```text
+    /// ZONE_DIR=~/.local/share/eqoxide/assets/models \
+    ///   cargo test --release --lib faithful_walker_drift_corpus -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "requires baked zone glbs at $ZONE_DIR; the faithful per-tick-recovery drift baseline"]
+    fn faithful_walker_drift_corpus() {
+        use crate::eq_net::navigation::{carrot_along, fast_steer_aim};
+        use crate::movement::{CharacterController, MoveIntent, PLAYER_RADIUS};
+
+        // Production constants, verbatim from navigation.rs (kept in sync — if these drift, the scanner
+        // stops modelling the real walker).
+        const RUN_SPEED: f32 = 44.0;
+        const LOOK_AHEAD: f32 = 5.0;
+        const LOCAL_REACH: f32 = 24.0;
+        const LOCAL_BOUND: f32 = 40.0;
+        const LOCAL_CELL:  f32 = 2.0;
+        const NAV_STUCK_TICKS: u32 = 20;
+        const NAV_HOP_TICKS: u32 = 6;
+        const NAV_BACKOFF_TICKS: u32 = 3;
+        const NAV_LOCAL_STUCK_TICKS: u32 = 3;
+        const REPLAN_COOLDOWN_TICKS: u32 = 6;
+        const MAX_REPATHS: u32 = 8;
+        const DT: f32 = 1.0 / 100.0;          // ~100 Hz controller, per navigation.rs's fast-steer note
+        const FRAMES_PER_TICK: u32 = 15;      // 150 ms / 10 ms
+
+        // The faithful walk. Returns None on arrival, or Some(wedge_pos) on a terminal wedge.
+        let simulate = |col: &Collision, start: [f32; 3], goal: [f32; 3]| -> Option<([f32; 3], [f32; 2])> {
+            let PlanOutcome::Route(mut coarse) = col.find_path_ex(
+                start, goal, PLAYER_RADIUS, &[], 8.0, None, 0.0, PlanCtx::worker()) else { return None };
+            if coarse.len() < 2 { return None; }
+            let mut ctrl = CharacterController::new(start);
+            ctrl.on_ground = true;
+            let mut path_i = 0usize;
+            let mut local_path: Vec<[f32; 3]> = Vec::new();
+            let mut local_i = 0usize;
+            // Fine plan requested LAST tick, applied THIS tick (models #399's ~1-tick worker lag).
+            let mut pending_local: Option<Vec<[f32; 3]>> = None;
+            let mut pending_nwt = false;
+            let (mut stuck_i, mut stuck_ticks, mut repaths) = (0usize, 0u32, 0u32);
+            let (mut local_stuck, mut replan_cd) = (0u32, 0u32);
+            let (mut backoff_ticks, mut backoff_dir) = (0u32, [0.0f32, 0.0]);
+            let mut aim = [0.0f32, 0.0];
+
+            // A journey either arrives, or spends its 8 re-paths (~8·NAV_STUCK_TICKS ticks) and wedges.
+            // 200 ticks (~30 s sim) is well past both for a ≤400u route at RUN_SPEED — a journey still
+            // going at 200 is not making progress and counts as wedged.
+            let nav_ticks_budget = 200;
+            for _ in 0..nav_ticks_budget {
+                let (px, py) = (ctrl.pos[0], ctrl.pos[1]);
+                // ── arrival on the FINAL goal ──
+                if (px - goal[0]).hypot(py - goal[1]) < 3.0 { return None; }
+
+                // ── the 150 ms NAV TICK (planning / recovery) ──
+                // advance path_i along the coarse route
+                while path_i + 2 < coarse.len() {
+                    let (a, b) = (coarse[path_i], coarse[path_i + 1]);
+                    let ab = [b[0] - a[0], b[1] - a[1]];
+                    let l2 = ab[0] * ab[0] + ab[1] * ab[1];
+                    let t = if l2 < 1e-6 { 1.0 } else { ((px - a[0]) * ab[0] + (py - a[1]) * ab[1]) / l2 };
+                    if t >= 1.0 { path_i += 1; } else { break; }
+                }
+                if replan_cd > 0 { replan_cd -= 1; }
+
+                // downhill backoff in progress → drive reverse aim, then re-plan when it ends
+                if backoff_ticks > 0 {
+                    backoff_ticks -= 1;
+                    for _ in 0..FRAMES_PER_TICK {
+                        ctrl.step(MoveIntent { wish_dir: backoff_dir, wish_vspeed: 0.0, jump: false,
+                            want_swim: false, speed: RUN_SPEED, climb: 0.0, hop: false }, DT, col);
+                    }
+                    if backoff_ticks == 0 {
+                        if let PlanOutcome::Route(r) = col.find_path_ex(
+                            [ctrl.pos[0], ctrl.pos[1], ctrl.pos[2]], goal, PLAYER_RADIUS, &[], 8.0, None, 0.0, PlanCtx::worker()) {
+                            coarse = r; path_i = 0; local_path.clear(); local_i = 0;
+                        }
+                        stuck_ticks = 0;
+                    }
+                    continue;
+                }
+
+                // apply the fine plan requested last tick (1-tick lag)
+                if let Some(lp) = pending_local.take() {
+                    local_path = lp; local_i = 0;
+                    if pending_nwt {
+                        local_stuck += 1;
+                        if local_stuck >= NAV_LOCAL_STUCK_TICKS && replan_cd == 0 {
+                            if let PlanOutcome::Route(r) = col.find_path_ex(
+                                [px, py, ctrl.pos[2]], goal, PLAYER_RADIUS, &[], 8.0, None, 0.0, PlanCtx::worker()) {
+                                coarse = r; path_i = 0; local_path.clear(); local_i = 0;
+                            }
+                            local_stuck = 0; replan_cd = REPLAN_COOLDOWN_TICKS;
+                        }
+                    } else {
+                        local_stuck = 0;
+                    }
+                    // pending_nwt is reassigned by the match below every tick, no reset needed here.
+                }
+                // post a fresh fine plan for NOW (lands next tick)
+                let coarse_carrot = carrot_along(&coarse, path_i, [px, py], LOCAL_REACH)
+                    .unwrap_or([goal[0], goal[1], ctrl.pos[2]]);
+                match col.find_path_local([px, py, ctrl.pos[2]], coarse_carrot, LOCAL_CELL, LOCAL_BOUND, LOCAL_CELL * 2.0) {
+                    LocalOutcome::Threaded(s)     => { pending_local = Some(s); pending_nwt = false; }
+                    LocalOutcome::NoWayThrough{steer, ..} => { pending_local = Some(steer); pending_nwt = true; }
+                    LocalOutcome::Exhausted{steer, ..}    => { pending_local = Some(steer); pending_nwt = false; }
+                }
+
+                // stall detection on coarse path_i progress
+                if path_i > stuck_i { stuck_i = path_i; stuck_ticks = 0; }
+                else {
+                    stuck_ticks += 1;
+                    if stuck_ticks >= NAV_STUCK_TICKS {
+                        stuck_ticks = 0;
+                        if repaths < MAX_REPATHS {
+                            repaths += 1;
+                            backoff_ticks = NAV_BACKOFF_TICKS;
+                            let carrot = carrot_along(&coarse, path_i, [px, py], LOOK_AHEAD)
+                                .unwrap_or([goal[0], goal[1], ctrl.pos[2]]);
+                            let (dx, dy) = (carrot[0] - px, carrot[1] - py);
+                            let dl = (dx * dx + dy * dy).sqrt();
+                            backoff_dir = if dl > 1e-3 { [-dx / dl, -dy / dl] } else { [0.0, 0.0] };
+                            continue;
+                        }
+                        return Some((ctrl.pos, aim)); // terminal wedge (8 re-paths spent)
+                    }
+                }
+
+                // ── the ~100 Hz FAST-STEER + controller stepping for this tick ──
+                for _ in 0..FRAMES_PER_TICK {
+                    let from = [ctrl.pos[0], ctrl.pos[1]];
+                    // fast-steer aim on the fine plan if present, else the coarse carrot
+                    let steer_aim = if local_path.len() >= 2 {
+                        fast_steer_aim(&local_path, &mut local_i, from, LOOK_AHEAD).map(|(d, _)| d)
+                    } else { None };
+                    aim = steer_aim.unwrap_or_else(|| {
+                        let c = carrot_along(&coarse, path_i, from, LOOK_AHEAD)
+                            .unwrap_or([goal[0], goal[1], ctrl.pos[2]]);
+                        let (dx, dy) = (c[0] - from[0], c[1] - from[1]);
+                        let d = (dx * dx + dy * dy).sqrt().max(1e-3);
+                        [dx / d, dy / d]
+                    });
+                    ctrl.step(MoveIntent { wish_dir: aim, wish_vspeed: 0.0, jump: false, want_swim: false,
+                        speed: RUN_SPEED, climb: 0.0, hop: stuck_ticks >= NAV_HOP_TICKS }, DT, col);
+                    if (ctrl.pos[0] - goal[0]).hypot(ctrl.pos[1] - goal[1]) < 3.0 { return None; }
+                }
+            }
+            Some((ctrl.pos, aim)) // ran out of sim time
+        };
+
+        let dir = std::env::var("ZONE_DIR")
+            .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
+        let zones: Vec<String> = std::env::var("ZONES").ok()
+            .map(|z| z.split(',').map(str::to_string).collect())
+            .unwrap_or_else(|| vec![
+                "akanon", "blackburrow", "qeynos2", "gfaydark", "crushbone", "neriaka", "felwithea",
+                "highpass", "everfrost", "butcher",
+            ].into_iter().map(str::to_string).collect());
+
+        let mut seed: u64 = 0xD21F_7A3E; // same seed family as the static scanner
+        let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as u32 };
+
+        let (mut tot_pairs, mut tot_walked, mut tot_wedged) = (0usize, 0usize, 0usize);
+        let (mut tot_height, mut tot_overlap, mut tot_other) = (0usize, 0usize, 0usize);
+        println!("\n{:<12} {:>6} {:>7} {:>8} {:>8} {:>6}", "zone", "walked", "wedged", "height", "overlap", "other");
+        for zone in &zones {
+            let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
+            let Ok(za) = ZoneAssets::from_glb(&p) else { println!("{zone:<12}  (no glb — skipped)"); continue };
+            let mut col = Collision::build(&za, 32.0);
+            if col.cols == 0 { println!("{zone:<12}  (no grid — skipped)"); continue; }
+            col.set_water(crate::region_map::RegionMap::load(&std::path::Path::new(&dir).join("maps/water"), zone).map(std::sync::Arc::new));
+
+            // Sample full (start, goal) pairs: a random floor point and a goal 120-400u away that a
+            // coarse route actually reaches (so we simulate real journeys, not un-routable noise).
+            let mut pairs: Vec<([f32; 3], [f32; 3])> = Vec::new();
+            let mut tries = 0;
+            while pairs.len() < 60 && tries < 2000 {
+                tries += 1;
+                let e = col.origin[0] + (rnd() as f32 / u32::MAX as f32) * (col.cols as f32 * col.cell_size);
+                let n = col.origin[1] + (rnd() as f32 / u32::MAX as f32) * (col.rows as f32 * col.cell_size);
+                let Some(z) = col.nearest_floor(e, n, col.z_max, 10.0, 4000.0) else { continue };
+                let ang = (rnd() as f32 / u32::MAX as f32) * std::f32::consts::TAU;
+                let d = 120.0 + (rnd() as f32 / u32::MAX as f32) * 280.0;
+                let (ge, gn) = (e + d * ang.cos(), n + d * ang.sin());
+                let Some(gz) = col.nearest_floor(ge, gn, z, 400.0, 400.0) else { continue };
+                // Dry routes only (the swim-capable variant, PR-D, un-skips water).
+                let s = [e, n, z]; let g = [ge, gn, gz];
+                if col.in_water(s) || col.in_water(g) { continue; }
+                // DRIVABILITY FILTER. This pure-pursuit sim faithfully drives WALK legs only. It does
+                // NOT execute A*'s controlled-fall, jump-edge, or swim edges (those need the walker's
+                // fall/jump/swim intents, out of scope here — the static scanner skipped them per-PLAN
+                // for the same reason). So only accept a journey whose COARSE route is all-walkable: no
+                // segment with a big z-drop (controlled fall / jump landing) and no waypoint in water.
+                // Without this, multi-level dungeons (blackburrow, neriaka) flood the count with wedges
+                // at fall/swim TRANSITIONS the sim structurally cannot cross — a sim artifact, not a
+                // walker drift. (PR-D's swim-capable variant will drive the water legs.)
+                let PlanOutcome::Route(cr) = col.find_path_ex(
+                    s, g, crate::movement::PLAYER_RADIUS, &[], 8.0, None, 0.0, PlanCtx::worker()) else { continue };
+                if cr.len() < 3 { continue; }
+                let drivable = cr.windows(2).all(|w| {
+                    let dz = w[1][2] - w[0][2];
+                    let seg = (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]);
+                    dz > -4.0 && seg < 12.0 // no controlled fall, no jump-edge span
+                }) && !cr.iter().any(|w| col.in_water(*w) || col.in_water([w[0], w[1], w[2] + 3.0]));
+                if !drivable { continue; }
+                pairs.push((s, g));
+            }
+            if pairs.is_empty() { println!("{zone:<12}  (no routable pairs — skipped)"); continue; }
+
+            let (mut walked, mut wedged, mut n_h, mut n_o, mut n_x) = (0usize, 0usize, 0usize, 0usize, 0usize);
+            for (s, g) in &pairs {
+                walked += 1;
+                let Some((w, aim)) = simulate(&col, *s, *g) else { continue };
+                // classify: the plan may route through water mid-journey; skip a wedge that ended in
+                // water (out of scope until the swim variant).
+                if col.in_water(w) || col.in_water([w[0], w[1], w[2] + 3.0]) { walked -= 1; continue; }
+                wedged += 1;
+                let to = [w[0] + aim[0] * 4.0, w[1] + aim[1] * 4.0];
+                let ctrl_chest_blocked = !col.line_clear([w[0], w[1], w[2] + 4.0], [to[0], to[1], w[2] + 4.0], PLAYER_RADIUS);
+                let planner_clear =
+                    col.path_clear([w[0], w[1], w[2] + 3.0], [to[0], to[1], w[2] + 3.0], PLAYER_RADIUS)
+                    && col.path_clear([w[0], w[1], w[2] + 2.5], [to[0], to[1], w[2] + 2.5], PLAYER_RADIUS);
+                let overlap = !col.footprint_clear(w[0], w[1], w[2], PLAYER_RADIUS, 8)
+                    || !col.footprint_clear(w[0] + aim[0], w[1] + aim[1], w[2], PLAYER_RADIUS, 8);
+                let kind = if ctrl_chest_blocked && planner_clear { n_h += 1; "HEIGHT #386" }
+                    else if overlap { n_o += 1; "OVERLAP #381" }
+                    else { n_x += 1; "OTHER" };
+                println!("  [{kind:<12}] {zone}: wedged ({:.1},{:.1},{:.1}) start ({:.1},{:.1},{:.1}) goal ({:.1},{:.1},{:.1})",
+                    w[0], w[1], w[2], s[0], s[1], s[2], g[0], g[1], g[2]);
+            }
+            println!("{zone:<12} {walked:>6} {wedged:>7} {n_h:>8} {n_o:>8} {n_x:>6}");
+            tot_pairs += pairs.len(); tot_walked += walked; tot_wedged += wedged;
+            tot_height += n_h; tot_overlap += n_o; tot_other += n_x;
+        }
+        let rate = if tot_walked > 0 { 100.0 * tot_wedged as f32 / tot_walked as f32 } else { 0.0 };
+        println!("\n=== FAITHFUL WALKER DRIFT: {tot_walked} full journeys walked, {tot_wedged} terminal wedges \
+            ({rate:.2}%) — height #386: {tot_height}, overlap #381: {tot_overlap}, other: {tot_other} ===");
+        let _ = tot_pairs;
+        assert!(tot_walked > 0, "no journeys walked — check $ZONE_DIR");
+    }
+
+    // ─────────────────────── PR-D / D-1: support-axis drift (#375) fixtures ───────────────────────
+    // These prove the support-axis bug and gate the fix. The RED-on-main test reproduces the LIVE qcat
+    // wedge (the planner deletes the floor the controller stands on). The two #329 guards are GREEN on
+    // main (the facing filter incidentally satisfies them) and MUST stay green through D-2, when the
+    // facing-blind `is_standable` classifier must reject ceilings via headroom+anchoring instead.
+
+    /// An UP-facing floor plane at height `z` over east [e0,e1] × north [-100,100] (`tri_nz > 0`, seen
+    /// by `nearest_floor`). NB: the older `floor_band` helper's winding is actually *down*-facing — it
+    /// is only ever used with facing-BLIND queries (`path_clear`/`line_clear`), so its facing never
+    /// mattered; these PR-D fixtures DO care about facing, so they use these explicit helpers instead
+    /// (both windings verified by `floor_and_ceiling_windings_are_as_labelled`).
+    fn floor_up(z: f32, e0: f32, e1: f32) -> MeshData {
+        MeshData {
+            positions: vec![[-100.0, z, e0], [100.0, z, e0], [100.0, z, e1], [-100.0, z, e1]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 2, 1, 0, 3, 2], texture_name: None, base_color: [1.0; 4],
+            center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
+        }
+    }
+
+    /// A DOWN-facing ceiling plane at height `z` (`tri_nz < 0`, discarded by the facing filter).
+    fn ceiling_down(z: f32, e0: f32, e1: f32) -> MeshData {
+        MeshData {
+            positions: vec![[-100.0, z, e0], [100.0, z, e0], [100.0, z, e1], [-100.0, z, e1]],
+            normals: vec![[0.0, -1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
+            center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
+        }
+    }
+
+    /// **D-1 SANITY: the two helpers really face as labelled.** Otherwise the open-air-ceiling fixture
+    /// below would be vacuous (a floor masquerading as a ceiling, or vice-versa).
+    #[test]
+    fn floor_and_ceiling_windings_are_as_labelled() {
+        // floor_up is an up-facing floor the facing filter keeps.
+        let f = Collision::build(&ZoneAssets {
+            terrain: vec![floor_up(0.0, -100.0, 100.0)], objects: vec![], textures: vec![] }, 32.0);
+        assert!(f.nearest_floor(0.0, 0.0, 0.0, 20.0, 20.0).is_some_and(|z| z.abs() < 0.5),
+            "floor_up must be an up-facing floor the facing filter keeps");
+        // ceiling_down is down-facing: it exists as geometry, and WITH a real floor below it, the facing
+        // filter discards it (nearest_floor returns the floor, never the ceiling). Note a LONE
+        // down-facing surface would instead be recovered by the `column_bottom` inverted-art valve
+        // (`assets.rs` column_hits fallback) — which is exactly why this asserts against the
+        // floor-present case, and why PR-D's `is_standable` must reject the ceiling by HEADROOM, not by
+        // being the column bottom (the valve's blind spot).
+        let fc = Collision::build(&ZoneAssets {
+            terrain: vec![floor_up(0.0, -100.0, 100.0), ceiling_down(8.0, -100.0, 100.0)],
+            objects: vec![], textures: vec![] }, 32.0);
+        assert!(fc.ground_below(0.0, 0.0, 20.0, 40.0).is_some(), "the ceiling plane must exist as geometry");
+        // Query with the reference right AT the ceiling height: it must still resolve to the floor.
+        assert!(fc.nearest_floor(0.0, 0.0, 8.0, 5.0, 20.0).is_some_and(|z| z.abs() < 0.5),
+            "with a floor below, the down-facing ceiling must be filtered — nearest_floor@z=8 must be the floor z=0");
+    }
+
+    /// **THE #329 OPEN-AIR-CEILING GATE (D-1, GREEN on main; mutation-RED at D-2).** The adversarial
+    /// case the cancelled navmesh FAKED by putting a rock slab on top of its ceiling: a down-facing
+    /// ceiling at z=8 with OPEN SKY above it (nothing on top). Its only difference from a floor is its
+    /// winding — so a `|nz|`-only classifier admits it (wrong), and even a naive "is there air above?"
+    /// headroom test admits it (there IS air above — wrong). `nearest_floor` must return the real floor
+    /// at z=0, NEVER the open-air ceiling at z=8, for any reference height. On `main` the facing filter
+    /// satisfies this; D-2's facing-blind `is_standable` must keep it satisfied via headroom+anchoring,
+    /// and the D-2 mutation (swap in either naive shortcut) must make this return z=8 → RED.
+    #[test]
+    fn open_air_ceiling_is_never_returned_as_floor() {
+        let col = Collision::build(&ZoneAssets {
+            terrain: vec![floor_up(0.0, -100.0, 100.0), ceiling_down(8.0, -100.0, 100.0)],
+            objects: vec![], textures: vec![],
+        }, 32.0);
+        for rz in [-5.0f32, -2.0, 0.0, 2.0, 5.0] {
+            let f = col.nearest_floor(0.0, 0.0, rz, 20.0, 20.0);
+            assert!(f.is_some_and(|z| (z - 0.0).abs() < 0.5),
+                "ref_z {rz}: nearest_floor must return the real floor z=0, never the open-air ceiling \
+                 z=8 (got {f:?}) — the #329 defence");
+        }
+    }
+
+    /// **THE #329 QCAT-POCKET GATE (D-1, asset; GREEN on main).** At the qcat spawn pocket the column
+    /// is `[roof 391.8, floor -70.0]` (#329, `assets.rs` column comment). The planner must never treat
+    /// the 391.8 roof as ground. GREEN on `main` (facing filter); D-2's facing-blind classifier must
+    /// keep it green via headroom+anchoring (the roof has rock above it → fails headroom).
+    #[test]
+    #[ignore = "requires the cached qcat glb at $ZONE_DIR; #329 guard — GREEN on main, stays green through D-2"]
+    fn qcat_pocket_nearest_floor_is_never_the_ceiling() {
+        let dir = std::env::var("ZONE_DIR")
+            .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
+        let za = ZoneAssets::from_glb(&std::path::Path::new(&dir).join("qcat.glb")).unwrap();
+        let col = Collision::build(&za, 32.0);
+        // The #329 spawn pocket XY. The floor is ~-70; the catacombs roof is ~+391.8.
+        let f = col.nearest_floor(-48.0, 1058.0, -66.0, 20.0, 100.0);
+        assert!(f.is_some_and(|z| z < 100.0),
+            "qcat pocket nearest_floor returned the ceiling (got {f:?}) — #329 reintroduced");
+        // And the whole column's floor set must contain no ceiling-height surface.
+        let floors = col.column_floors(-48.0, 1058.0, -66.0, 20.0, 500.0);
+        assert!(floors.iter().all(|&z| z < 100.0),
+            "qcat pocket column_floors contains a ceiling-height surface: {floors:?} — #329");
+    }
+
+    /// **THE SUPPORT-AXIS DRIFT — RED ON MAIN (#375).** The live wedge captured 2026-07-14: a plain
+    /// `zone_cross` qcat→qeynos2 wedged TERMINALLY at `(4.0, 809.8, -43.0)` with a full route in hand.
+    /// Root cause, pinned here: the controller's ground model (`ground_below`, facing-blind) stands the
+    /// character on solid floor at **z ≈ -42.97**, while the planner's floor model (`column_floors`,
+    /// up-facing-only) sees **only z ≈ -55.97** there — the -42.97 walkway is inverted (down-facing)
+    /// art the facing filter deletes. The two disagree about the floor, so the planner routes as if the
+    /// character were elsewhere (or floating) and loops.
+    ///
+    /// This asserts the invariant PR-D restores: **the planner sees the floor the controller stands
+    /// on.** It is RED on `main` (the planner's set omits -42.97) and GREEN once both sides share
+    /// `is_standable` (D-2). It is the falsifiable, deterministic proof of the bug, independent of any
+    /// live run.
+    #[test]
+    #[ignore = "requires the cached qcat glb at $ZONE_DIR; RED on main — proves the support-axis drift (#375)"]
+    fn qcat_support_floor_is_visible_to_the_planner() {
+        let dir = std::env::var("ZONE_DIR")
+            .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
+        let za = ZoneAssets::from_glb(&std::path::Path::new(&dir).join("qcat.glb")).unwrap();
+        let col = Collision::build(&za, 32.0);
+        let (x, y) = (4.0f32, 809.8);
+        // The controller's ground clamp (facing-blind) — what the walker actually stands on.
+        let ground = col.ground_below(x, y, -42.0, 200.0)
+            .expect("the controller's ground_below must find the walkway the walker stood on");
+        assert!((ground - (-42.97)).abs() < 1.5,
+            "sanity: the controller ground at the wedge XY should be ~-42.97, got {ground:.2}");
+        // The planner's floor set (up-facing filter) — what A* plans over.
+        let planner_floors = col.column_floors(x, y, -43.0, 20.0, 30.0);
+        assert!(planner_floors.iter().any(|&f| (f - ground).abs() < 1.5),
+            "SUPPORT-AXIS DRIFT (#375): the planner's floor set {planner_floors:?} does NOT include the \
+             floor the controller stands on ({ground:.2}). The facing filter deleted the inverted-art \
+             walkway — the planner and walker disagree about where the floor is, which is the live qcat \
+             terminal wedge. RED on main; GREEN after the shared is_standable predicate (D-2).");
+    }
+
+
+    /// **THE FLOOR-MODEL DISAGREEMENT SCAN — a corpus indicator for D-2 (#375).** Counts, over a zone
+    /// corpus, points where the controller's floor model (`ground_below`, facing-blind) finds a
+    /// standable-looking surface the planner's floor model (`column_floors`, facing-filtered) omits.
+    /// That disagreement is the support-axis drift; the live qcat wedge is one instance of it.
+    ///
+    /// **HONEST LIMIT (read before trusting the number).** On `main` this is an **UPPER BOUND**, not a
+    /// clean drift count. A simple facing-blind + footprint + headroom filter **cannot distinguish** a
+    /// real inverted-art FLOOR the character stands on (qcat's −42.97 walkway) from a genuine
+    /// ceiling/overhang UNDERSIDE that merely happens to have open space above it — and telling those
+    /// two apart is *exactly what PR-D's `is_standable` (headroom AND anchoring) adds*. So on `main`
+    /// this over-counts in ceiling-rich zones (a city like qeynos2 reads high not because half its
+    /// floor is inverted, but because it has many undersides). The one zone that is a believable clean
+    /// control is a big OPEN-terrain outdoor zone with few ceilings (**gfaydark ≈ 0.2%**). Treat the
+    /// per-zone numbers as "how much does the floor model disagree here", not "how many real bugs."
+    ///
+    /// **Why this is still the right corpus signal for D-2.** After D-2 the planner and the controller
+    /// call the SAME `is_standable`, so this disagreement is **0 by construction, in every zone** — a
+    /// blunt but genuine regression gate (any nonzero after D-2 means the two sides did not actually
+    /// unify). The SHARP gate — that D-2 makes the planner see qcat's real floor WITHOUT admitting
+    /// ceilings — is the focused pair below (`qcat_support_floor_is_visible_to_the_planner`, RED→GREEN;
+    /// `open_air_ceiling_*` / `qcat_pocket_*`, stay GREEN). This scan is the breadth check; those are
+    /// the correctness gate.
+    ///
+    /// (Why not a swim-simulation scanner: the drift is a STATIC floor-model property — the two floor
+    /// queries disagree whether or not anyone is swimming — so measuring it statically is deterministic
+    /// and needs no buoyancy fidelity. A swim-capable dynamic scanner would only re-derive, less
+    /// reliably, what this and the focused qcat fixture already pin.)
+    ///
+    /// ```text
+    /// ZONE_DIR=~/.local/share/eqoxide/assets/models \
+    ///   cargo test --release --lib floor_model_disagreement_scan -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "requires baked zone glbs at $ZONE_DIR; the D-2 floor-model-disagreement breadth signal (#375)"]
+    fn floor_model_disagreement_scan() {
+        const TOL: f32 = 1.5;      // a planner floor within this of the controller's ground = agreement
+        const HEADROOM: f32 = 5.0;  // open space (to next SOLID surface) a standable spot needs above it
+        const RADIUS: f32 = crate::movement::PLAYER_RADIUS;
+        let dir = std::env::var("ZONE_DIR")
+            .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
+        // The inverted-art zones #375 names, plus a few normal zones as a clean-art control (their
+        // count should already be ~0 on main, and must stay 0 after D-2 — a regression guard).
+        let zones: Vec<String> = std::env::var("ZONES").ok()
+            .map(|z| z.split(',').map(str::to_string).collect())
+            .unwrap_or_else(|| vec![
+                "qcat", "highpass", "permafrost", "neriakc",  // inverted-art zones (#375) — high on main
+                "gfaydark",                                   // open outdoor: the believable clean control (~0)
+                "qeynos2",                                    // ceiling-rich city: reads high (see HONEST LIMIT)
+            ].into_iter().map(str::to_string).collect());
+
+        let mut seed: u64 = 0x5044_0F7D; // distinct stream
+        let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as u32 };
+
+        let mut tot_pts = 0usize;
+        let mut tot_drift = 0usize;
+        println!("\n{:<12} {:>10} {:>12} {:>8}", "zone", "sampled", "drift-pts", "%");
+        for zone in &zones {
+            let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
+            let Ok(za) = ZoneAssets::from_glb(&p) else { println!("{zone:<12}  (no glb — skipped)"); continue };
+            let col = Collision::build(&za, 32.0);
+            if col.cols == 0 { println!("{zone:<12}  (no grid — skipped)"); continue; }
+            let ext_e = col.cols as f32 * col.cell_size;
+            let ext_n = col.rows as f32 * col.cell_size;
+            let (mut sampled, mut drift) = (0usize, 0usize);
+            let mut cols_probed = 0;
+            let zreach = (col.z_max - col.z_min).max(1.0) + 10.0;
+            // Enumerate every surface in a sampled column FACING-BLIND, by walking `ground_below` down
+            // from the top — no planner model, no z-sampling artifact (the invisible-boundary art at
+            // z≈−32768 that made uniform-z sampling miss gfaydark/akanon is simply never a standable
+            // surface, so it is filtered out below rather than dominating the sample space).
+            while cols_probed < 20000 && sampled < 6000 {
+                cols_probed += 1;
+                let e = col.origin[0] + (rnd() as f32 / u32::MAX as f32) * ext_e;
+                let n = col.origin[1] + (rnd() as f32 / u32::MAX as f32) * ext_n;
+                let mut top = col.z_max;
+                for _ in 0..24 { // at most 24 surfaces per column
+                    let Some(ground) = col.ground_below(e, n, top, zreach) else { break };
+                    top = ground - 0.5; // next probe starts just below this surface
+                    // Controller-standable filter: body fits + HEADROOM of open air above (to next SOLID
+                    // surface). Excludes ceilings/roof-undersides — a character cannot stand there.
+                    if !col.footprint_clear(e, n, ground, RADIUS, 8) { continue; }
+                    if col.nearest_hit_t([e, n, ground + 0.5], [e, n, ground + HEADROOM]).is_some() { continue; }
+                    sampled += 1;
+                    let floors = col.column_floors(e, n, ground, 20.0, 20.0);
+                    if !floors.iter().any(|&f| (f - ground).abs() <= TOL) { drift += 1; }
+                }
+            }
+            let pct = if sampled > 0 { 100.0 * drift as f32 / sampled as f32 } else { 0.0 };
+            println!("{zone:<12} {sampled:>10} {drift:>12} {pct:>7.2}%", );
+            tot_pts += sampled; tot_drift += drift;
+        }
+        println!("\n=== FLOOR-MODEL DISAGREEMENT: {tot_drift} / {tot_pts} standable-looking surfaces the \
+            planner's floor model omits (UPPER BOUND — conflates inverted-art floor with ceilings on main; \
+            see HONEST LIMIT). D-2 gate: → 0 by construction (both sides share is_standable). ===");
+        assert!(tot_pts > 0, "no points sampled — check $ZONE_DIR");
+    }
+
     /// Deterministic offline reproduction of the qeynos2 path-following stalls reported on #2,
     /// using the REAL baked collision mesh. Point `ZONE_GLB` at the cached qeynos2 glb, e.g.
     /// `ZONE_GLB=~/.local/share/eqoxide/assets/models/qeynos2.glb cargo test --lib diagnose_qeynos2_stall -- --ignored --nocapture`
