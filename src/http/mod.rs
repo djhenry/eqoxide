@@ -593,6 +593,13 @@ pub struct PlayerState {
     pub target_id:    Option<u32>,
     /// Coin on hand: [platinum, gold, silver, copper], from the player profile.
     pub coin:         [u32; 4],
+    /// False when `coin` may not match the server's real balance right now (#361): a merchant buy
+    /// is in flight and unconfirmed, or a divergence was detected and corrected but not yet
+    /// re-verified by a fresh signal. A silent buy refusal (inventory-full/LORE conflict) sends no
+    /// echo at all, so an agent reading `currency` alone has no other way to know the figure is
+    /// provisional. `true` once the balance is confirmed accurate (a resolved buy/refusal, or the
+    /// most recent OP_PlayerProfile reconciliation).
+    pub coin_verified: bool,
     /// Vitals — same values the HUD renders. Percentages are 0–100. Lets an API consumer make
     /// flee/heal/leveling decisions instead of scraping the message log. (eqoxide#9)
     pub hp_pct:        f32,
@@ -665,6 +672,7 @@ impl PlayerState {
             player_id:  gs.player_id,
             target_id:  gs.target_id,
             coin:       gs.coin,
+            coin_verified: gs.coin_verified,
             hp_pct:     gs.hp_pct,
             cur_hp:     gs.cur_hp,
             max_hp:     gs.max_hp,
