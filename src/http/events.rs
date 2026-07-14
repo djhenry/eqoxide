@@ -18,7 +18,11 @@ pub(super) fn router() -> Router<HttpState> {
         .route("/:category", get(get_by_category))
 }
 
+// `deny_unknown_fields`: a typo'd param (e.g. `?snice=5`) must be a 400 naming the bad field, not
+// silently dropped so the field falls back to its default and the caller gets a misleadingly
+// "healthy" 200 (eqoxide#363 — the query-string half of the #341/#351 JSON-body fix).
 #[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct EventsQuery {
     /// Return only events with id greater than this cursor (default 0 = all). Ids are 1-based.
     since:    Option<u64>,
@@ -164,5 +168,75 @@ mod tests {
         assert_eq!(j["last_id"], 42);
         assert_eq!(j["first_id"], 42);
         assert_eq!(j["dropped"], 0);
+    }
+
+    /// eqoxide#363: a typo'd query param (`?snice=5` instead of `?since=5`) must be rejected with an
+    /// explicit 400 naming the bad field, NOT silently ignored so `since` falls back to its default
+    /// of 0 and the caller gets the whole 200-entry ring back looking like a normal, healthy 200.
+    /// Without `#[serde(deny_unknown_fields)]` on `EventsQuery` this returned 200 with `since` fixed
+    /// at 0 — indistinguishable from a legitimate `?since=0` poll.
+    #[tokio::test]
+    async fn typoed_query_param_is_rejected_not_silently_dropped() {
+        let state = empty_state();
+        {
+            let mut events = state.chat_events.lock().unwrap();
+            for id in 1..=8u64 {
+                events.push(ev(id));
+            }
+        }
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::get("/all?snice=5").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST,
+            "a typo'd/unknown query param must be an explicit failure, not a silent 200 over the whole ring");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let msg = String::from_utf8_lossy(&bytes);
+        assert!(msg.contains("snice"), "the 400 body should name the offending field, got: {msg}");
+    }
+
+    /// REGRESSION GUARD — this pins behaviour that is ALREADY CORRECT today; it fixes nothing.
+    ///
+    /// A *present but unparseable* `since` (garbage, negative, or overflowing u64) is rejected with
+    /// a 400 by `u64::from_str` inside serde_urlencoded's `Part::deserialize_u64` — it does NOT fall
+    /// back to the `unwrap_or(0)` default in `fetch`, which applies only to a genuinely ABSENT param.
+    /// That distinction is the whole point of #363: a default may mask an OMITTED field, never a
+    /// PARSE FAILURE. Nothing in the type system stops a future refactor from taking `since` as a
+    /// `String` and doing `.parse().unwrap_or(0)` — which would silently resurrect #363 in a new
+    /// coat (garbage cursor → whole ring replayed → confident 200). This test exists to make that
+    /// refactor fail loudly. (Verified non-vacuous by exactly that mutation; see the PR.)
+    #[tokio::test]
+    async fn unparseable_since_is_rejected_not_silently_defaulted_to_zero() {
+        for bad in ["abc", "-1", "99999999999999999999999"] {
+            let state = empty_state();
+            {
+                let mut events = state.chat_events.lock().unwrap();
+                for id in 1..=8u64 {
+                    events.push(ev(id));
+                }
+            }
+            let app = router().with_state(state);
+            let uri = format!("/all?since={bad}");
+            let resp = app.oneshot(Request::get(&uri).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST,
+                "?since={bad} must be an explicit 400, not a silent fallback to since=0 that replays the whole ring");
+        }
+    }
+
+    /// The happy path must not regress: a correctly-spelled `since` still parses and filters normally.
+    #[tokio::test]
+    async fn valid_since_param_still_works() {
+        let state = empty_state();
+        {
+            let mut events = state.chat_events.lock().unwrap();
+            for id in 1..=8u64 {
+                events.push(ev(id));
+            }
+        }
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::get("/all?since=5").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        // since=5 should only return events with id > 5, i.e. 6, 7, 8.
+        assert_eq!(j["count"], 3);
+        assert_eq!(j["last_id"], 8);
     }
 }

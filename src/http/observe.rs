@@ -279,7 +279,11 @@ async fn get_inventory(State(s): State<HttpState>) -> Json<serde_json::Value> {
     }))
 }
 
+// `deny_unknown_fields`: same rationale as `EventsQuery` in events.rs (eqoxide#363) — a typo'd
+// `?kidn=npc` must fail loudly instead of silently degrading `kind` to `None` (i.e. "no filter",
+// returning the whole log) and reporting a plain 200.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MessagesQuery {
     /// Filter to a single message channel, e.g. ?kind=npc for NPC dialogue only.
     kind: Option<String>,
@@ -523,5 +527,46 @@ mod tests {
         assert_eq!(v["player"]["hp_pct"], serde_json::json!(12.0));
         assert_eq!(v["player"]["target_id"], serde_json::json!(null));
         assert_eq!(v["player"]["target_name"], serde_json::json!(null));
+    }
+
+    fn push_message(state: &HttpState, kind: &str, text: &str) {
+        state.messages.lock().unwrap().push(MessageEntry {
+            kind: kind.to_string(), text: text.to_string(), keywords: vec![],
+        });
+    }
+
+    async fn get(state: HttpState, uri: &str) -> axum::response::Response {
+        let app = router().with_state(state);
+        app.oneshot(Request::get(uri).body(Body::empty()).unwrap()).await.unwrap()
+    }
+
+    /// eqoxide#363: a typo'd query param (`?kidn=npc` instead of `?kind=npc`) must be rejected with
+    /// an explicit 400 naming the bad field, NOT silently ignored so `kind` falls back to `None`
+    /// (no filter) and the caller gets the whole message log back looking like a normal 200.
+    #[tokio::test]
+    async fn typoed_query_param_is_rejected_not_silently_dropped() {
+        let state = empty_state();
+        push_message(&state, "npc", "Well met, traveler.");
+        push_message(&state, "chat", "someone: hi");
+        let resp = get(state, "/messages?kidn=npc").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST,
+            "a typo'd/unknown query param must be an explicit failure, not a silent 200 over the whole log");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let msg = String::from_utf8_lossy(&bytes);
+        assert!(msg.contains("kidn"), "the 400 body should name the offending field, got: {msg}");
+    }
+
+    /// The happy path must not regress: a correctly-spelled `kind` still filters normally.
+    #[tokio::test]
+    async fn valid_kind_param_still_works() {
+        let state = empty_state();
+        push_message(&state, "npc", "Well met, traveler.");
+        push_message(&state, "chat", "someone: hi");
+        let resp = get(state, "/messages?kind=npc").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["count"], 1);
+        assert_eq!(v["messages"][0]["kind"], "npc");
     }
 }
