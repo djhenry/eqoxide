@@ -1046,6 +1046,13 @@ pub fn spawn_camera_server(
             // Stamp the per-pid crash log with what this instance IS (#380). Several clients run at
             // once on distinct ports; without this, a directory of crash-<pid>.log files is a pile
             // of anonymous pids and a post-mortem can't tell which one was the client it cares about.
+            //
+            // This is deliberately the SECOND `INSTANCE` line, not the only one: `crash::install()`
+            // already stamped a fallback identity (argv + cwd) at process start, before argument
+            // parsing, config load, asset sync, or GPU init got a chance to kill the process before
+            // the listener ever got here (#392). If none of that happens — the port never binds, or
+            // this task panics first — the fallback stamp is still on record; this call just adds
+            // the more specific `api_port=` line on top of it once the listener is actually up.
             crate::crash::log_instance(&format!("api_port={bound_port}"));
             tracing::info!("camera HTTP: http://127.0.0.1:{bound_port}");
             if let Err(e) = axum::serve(listener, app).await {
