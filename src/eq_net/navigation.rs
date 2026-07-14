@@ -2720,11 +2720,12 @@ impl Navigator {
             const LOCAL_REACH: f32 = 24.0;   // how far ahead on the coarse route the fine plan aims
             const LOCAL_BOUND: f32 = 40.0;   // cap the fine search radius (keeps it cheap)
             let local_goal = carrot_along(&self.path, self.path_i, [px, py], LOCAL_REACH).unwrap_or(coarse);
-            // This is the ONE A* still on the net thread. It is bounded to LOCAL_BOUND (40u) at a 2u
-            // cell, so it is inherently cheap — but it keeps a hard, small wall-clock cap
-            // (`PlanCtx::net_tier`) precisely because it runs here. Its partial routes are a local
-            // STEERING hint (re-planned every tick, and the walker checks `reached_carrot` below),
-            // never an answer to "can I reach the goal" — that question is the worker's (#337).
+            // This is the ONE A* still on the net thread. It is bounded SPATIALLY to LOCAL_BOUND (40u)
+            // at a 2u cell, so it is inherently cheap, plus a deterministic NODE-CAP backstop
+            // (`PlanCtx::net_tier`, #394 — no wall clock, so its cost no longer depends on machine
+            // load). Its partial routes are a local STEERING hint (re-planned every tick, and the
+            // walker checks `reached_carrot` below), never an answer to "can I reach the goal" — that
+            // question is the worker's (#337). (#382 moves this A* off the net thread too.)
             self.local_path = self.collision.read().unwrap().as_ref()
                 .and_then(|c| c.find_path_res([px, py, gs.player_z], local_goal,
                     crate::movement::PLAYER_RADIUS, &[], true, LOCAL_CELL, Some(LOCAL_BOUND), 0.0,
