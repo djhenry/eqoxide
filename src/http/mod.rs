@@ -417,14 +417,48 @@ pub type DialogueShared = Arc<Mutex<Vec<crate::game_state::DialogueChoice>>>;
 pub struct NavStatus {
     pub state:  String,
     pub reason: Option<String>,
+    /// The FINE LOCAL (2 u) steering tier's last honest outcome (#382), published as the top-level
+    /// `nav_local` on GET /v1/observe/debug. `None` = the tier has not answered for the current route
+    /// (idle, or the first fine plan is still in flight).
+    ///
+    /// It is carried HERE, alongside `state`/`reason`, rather than in a second shared cell, because
+    /// the two are read together and must not be able to drift: an agent that sees
+    /// `nav_state: navigating` needs to know, in the same snapshot, whether the tier that is actually
+    /// steering it can see a way through the next 40 u.
+    pub local:  Option<NavLocal>,
+}
+
+/// What the fine 2 u steering tier last said, verbatim. See `assets::LocalOutcome`.
+///
+/// **`state` is never `no_path` and structurally cannot be.** The fine search closes only the frontier
+/// inside a 40 u window, so it can never prove a goal unreachable; conflating its local dead-end with
+/// a definitive "no route" would be #337 with a smaller radius.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NavLocal {
+    /// `threaded` (healthy: a complete fine route to the carrot) | `no_way_through` (the window's
+    /// frontier CLOSED — the coarse corridor is not threadable here) | `exhausted` (the search was
+    /// cut short: "I don't know") | `planner_dead` (the fine worker died; steering has degraded to
+    /// the coarse route only — the walker keeps walking).
+    pub state:       String,
+    /// `threaded` | `search_closed` | `start_isolated` | `goal_not_walkable` | `no_geometry` |
+    /// `search_node_cap` | `local_planner_dead`.
+    pub reason:      String,
+    /// Consecutive nav ticks the fine tier has failed to thread to its carrot. A nonzero value with
+    /// `state: navigating` means the walker is being steered on the coarse route through a stretch the
+    /// fine tier says it cannot fit — usually the prelude to a proactive coarse re-plan (#246).
+    pub stuck_ticks: u32,
+    /// How long the last fine plan took, in microseconds. This is the per-tick cost that used to be
+    /// paid **on the network thread** (mean 15.3 ms, worst 358 ms, release/akanon) and is now paid on
+    /// the fine worker.
+    pub plan_us:     u64,
 }
 
 impl Default for NavStatus {
-    fn default() -> Self { NavStatus { state: "idle".into(), reason: None } }
+    fn default() -> Self { NavStatus { state: "idle".into(), reason: None, local: None } }
 }
 
 impl From<&str> for NavStatus {
-    fn from(state: &str) -> Self { NavStatus { state: state.to_string(), reason: None } }
+    fn from(state: &str) -> Self { NavStatus { state: state.to_string(), reason: None, local: None } }
 }
 
 impl PartialEq<&str> for NavStatus {

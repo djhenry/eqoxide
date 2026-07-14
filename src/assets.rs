@@ -527,7 +527,7 @@ pub const COLLISION_MESH_TAG: &str = "__collision__";
 /// budget), so the plan is bounded by one budget, not one-per-call (#340).
 pub const MAX_NODES: usize = 8_000_000;
 
-/// Deterministic node cap for the FINE local tier (#394). Replaces `NET_TIER_BUDGET_MS = 150`.
+/// Deterministic node cap for the FINE local tier (#394).
 ///
 /// The fine search is bounded SPATIALLY — a 40 u window at 2 u cells, ~1257 XY cells × a few z-tiers —
 /// so its frontier genuinely closes at ~800–3700 nodes in practice (measured). This cap is therefore a
@@ -535,8 +535,14 @@ pub const MAX_NODES: usize = 8_000_000;
 /// the search unboundedly, and — like the coarse cap — it is a node count, not a clock, so the outcome
 /// is the same on every machine.
 ///
-/// (In PR #394 the fine tier still runs inline on the net thread; the spatial bound is what keeps its
-/// cost small there. #382 moves it to its own worker.)
+/// **Why #382 moves this tier off the net thread even though it is already deterministic:** the fine
+/// search's cost is dominated by PER-NODE collision work (`column_floors` + capsule sweeps), NOT by node
+/// count. Measured worst case (release, corpus): a 1.34 s fine plan that closed just ~3681 nodes —
+/// ~366 µs/node in dense stacked geometry. So there is **no node cap that bounds this search's WALL TIME
+/// without cutting legitimate routes** (normal fine searches close ~800–1200 nodes). A cap keeps the
+/// answer honest and deterministic; only moving OFF the net thread keeps an occasional 1.3 s fine plan
+/// from stalling the network loop. Nothing waits on the fine worker, and the walker keeps steering on
+/// the last good plan meanwhile (#382).
 pub const NET_TIER_NODE_CAP: usize = 40_000;
 
 /// Per-plan context for `find_path_res`: the things that must be shared across the several A* calls
@@ -697,6 +703,93 @@ impl PlanOutcome {
             PlanOutcome::Route(_) => "route",
             PlanOutcome::Unreachable(r) => r.as_str(),
             PlanOutcome::Exhausted { limit, .. } => limit.as_str(),
+        }
+    }
+}
+
+/// The HONEST outcome of the FINE LOCAL steering search — the bounded 2 u tier that actually steers
+/// the character along the last ~40 u of the committed coarse route (#382).
+///
+/// # Why this is NOT `PlanOutcome`
+///
+/// Two differences, and both of them are safety properties rather than taste:
+///
+/// 1. **A bounded search's "no" is a statement about its WINDOW, never about the goal.** The fine
+///    search only ever closes the frontier *inside* `LOCAL_BOUND` (40 u). "I could not reach the
+///    carrot" therefore means "not through this 40 u window" — it is *not* evidence that the goal is
+///    unreachable, and it must never be able to become `nav_state: no_path`. Giving this tier a
+///    `PlanOutcome` would put an `Unreachable` variant in the hands of the steering loop, and
+///    `Unreachable` is the one word in this codebase that means a **definitive, falsifiable no**.
+///    There is deliberately no way to spell that here.
+/// 2. **Every variant carries `steer`.** `PlanOutcome::Unreachable` carries no waypoints on purpose
+///    (walking a partial you have proven leads nowhere is the #337 lie). But the fine tier's partial
+///    is not a route proposal — it is a *steering hint*, re-planned continuously, and it is load-
+///    bearing: with it wiped, a halas swimmer floating at the water's edge stopped swimming and
+///    wedged at the shoreline while the coarse planner cheerfully re-issued a perfect 78-waypoint
+///    route across the water, every tick, for 8 attempts (#377 review, N1). "I cannot reach the
+///    carrot" does not imply "I cannot usefully move."
+///
+/// # The distinction that matters
+///
+/// [`LocalOutcome::NoWayThrough`] (the window's frontier CLOSED) and [`LocalOutcome::Exhausted`] (the
+/// search was CUT SHORT) look identical from outside — both are "the steer path stops short of the
+/// carrot" — and for as long as the fine tier ran under a 150 ms wall clock they *were* identical:
+/// one `Option<Vec<_>>`, no way to ask which. The walker armed the proactive coarse re-plan (#246) on
+/// both, so **a timeout was silently laundered into "the coarse route ahead is blocked"**. Under CPU
+/// load that fired on routes that were perfectly threadable. Telling the two apart is the whole point
+/// of this type — see `navigation::arms_coarse_replan`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LocalOutcome {
+    /// A complete fine route from the character to the carrot. The healthy case.
+    Threaded(Vec<[f32; 3]>),
+    /// The window's frontier CLOSED without reaching the carrot: inside this 40 u window there is
+    /// genuinely no way through to it (the coarse corridor skims something the 8 u grid missed).
+    /// A falsifiable *local* no — and the ONLY outcome that may arm a proactive coarse re-plan.
+    NoWayThrough {
+        steer: Vec<[f32; 3]>,
+        /// Which flavour of local dead-end (`search_closed`, `start_isolated`, `goal_not_walkable`,
+        /// `no_geometry`). Reported verbatim so an agent can tell "the corridor is walled" from
+        /// "*I* am the one who is wedged".
+        why:   NoRoute,
+    },
+    /// The search was CUT SHORT by `MAX_NODES` before closing its window: "**I don't know**", not
+    /// "no". It must never arm a coarse re-plan, and it must never reach the agent as `no_path`.
+    ///
+    /// There is no `PlanLimit::Deadline` here in practice — the fine tier arms no wall clock
+    /// (`PlanCtx::default()`), which is exactly what #382 deleted — but the variant is typed on
+    /// `PlanLimit` so that a limit, whatever its kind, can only ever be spelled as "I stopped
+    /// looking".
+    Exhausted { limit: PlanLimit, steer: Vec<[f32; 3]> },
+}
+
+impl LocalOutcome {
+    /// The waypoints to STEER along this tick — a complete fine route, or the best partial toward the
+    /// carrot. Always available (possibly empty); the walker never has to wait for it.
+    pub fn steer(&self) -> &[[f32; 3]] {
+        match self {
+            LocalOutcome::Threaded(p) => p,
+            LocalOutcome::NoWayThrough { steer, .. } | LocalOutcome::Exhausted { steer, .. } => steer,
+        }
+    }
+    /// Did the fine plan actually REACH its carrot?
+    pub fn threaded(&self) -> bool { matches!(self, LocalOutcome::Threaded(_)) }
+    /// The state word published as `nav_local.state` on GET /v1/observe/debug.
+    ///
+    /// **None of these is `no_path`, and none of them can become it.** A bounded window cannot prove
+    /// a goal unreachable, so this tier is structurally incapable of saying so — see the type docs.
+    pub fn state(&self) -> &'static str {
+        match self {
+            LocalOutcome::Threaded(_)       => "threaded",
+            LocalOutcome::NoWayThrough { .. } => "no_way_through",
+            LocalOutcome::Exhausted { .. }  => "exhausted",
+        }
+    }
+    /// The machine-readable WHY, surfaced as `nav_local.reason`.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            LocalOutcome::Threaded(_)          => "threaded",
+            LocalOutcome::NoWayThrough { why, .. } => why.as_str(),
+            LocalOutcome::Exhausted { limit, .. }  => limit.as_str(),
         }
     }
 }
@@ -1676,6 +1769,62 @@ impl Collision {
         }
     }
 
+    /// The FINE LOCAL STEERING plan (#382): a bounded A* at `cell` resolution (2 u) within `bound`
+    /// units (40 u) of the character, aimed at a carrot on the committed coarse route.
+    ///
+    /// # It runs to COMPLETION. There is no wall clock.
+    ///
+    /// `PlanCtx::default()` arms **no deadline**, and that is the point of #382. This search used to
+    /// run inline on the network thread under a 150 ms budget — a residual net-thread stall of the
+    /// same class that caused the #257/#302 linkdead bugs (measured, release, akanon: mean 15.3 ms,
+    /// worst **358 ms**), and, worse, a budget that made its answer unfalsifiable: a search that ran
+    /// out of clock and one that proved the corridor impassable came back as the same short
+    /// `Option<Vec<_>>`. It now runs on `nav_planner::LocalPlanner`, where nothing real-time waits on
+    /// it, so it can afford the truth.
+    ///
+    /// Termination is **spatial, not temporal**: `max_search = Some(bound)` confines the frontier to a
+    /// 40 u disc at 2 u cells — a few thousand cells — so the search genuinely closes. `MAX_NODES`
+    /// remains as an absolute backstop, and hitting it yields [`LocalOutcome::Exhausted`]: a
+    /// *distinguishable* "I stopped looking", never a silent "there is no way through". A consequence
+    /// worth stating plainly: with the clock gone, this tier is **deterministic** — the same character
+    /// in the same spot now steers the same way whatever else the box is doing.
+    ///
+    /// Clearance: always the MINIMUM (`PLAYER_RADIUS`). See `search_tiered` — a bounded plan does not
+    /// choose a route, it threads one the coarse planner already chose with room, so the generous pass
+    /// buys nothing and costs a second search.
+    /// `carrot_tol` is how near the carrot counts as REACHING it. This is not slop — it is the
+    /// question. A carrot is an interpolated point on a line between two 8 u COARSE cell centres, so
+    /// its z is a coarse floor height and its XY routinely lands a couple of units off the fine grid's
+    /// walkable floor (or inside a wall corner the 8 u grid cut). A* would then never accept arrival at
+    /// the goal *cell*, and a plan that gets the walker exactly where it needs to go would be reported
+    /// as "there is no way through" — which is not merely pessimistic, it would arm a spurious coarse
+    /// re-plan (#246) and publish a false `nav_local`. Measured: judging on A*'s strict goal-cell flag
+    /// instead of this tolerance loses **16 of 1447** real carrots across the zone corpus.
+    ///
+    /// So the fine tier's success criterion is the walker's: *did the plan get me to the carrot?* —
+    /// the same test the walker itself applied before this change (`LOCAL_CELL * 2`).
+    pub fn find_path_local(&self, start: [f32; 3], goal: [f32; 3], cell: f32, bound: f32, carrot_tol: f32)
+        -> LocalOutcome
+    {
+        // Plan owner: the fine tier's node cap, with a shared plan-wide counter so its two anchor
+        // searches (char + cell-centre retry) draw from one budget (#394). The cap is a runaway
+        // backstop; the 40u `bound` is what really terminates this search.
+        let ctx = PlanCtx { node_cap: Some(NET_TIER_NODE_CAP), ..PlanCtx::default() }.ensure_budget();
+        let (s, _tight) = self.search_tiered(
+            start, goal, crate::movement::PLAYER_RADIUS, &[], cell, Some(bound), 0.0, ctx);
+        // The partial rides along in EVERY variant — it is a steering hint, not a route proposal.
+        let steer: Vec<[f32; 3]> = s.path.map(|(p, _)| p).unwrap_or_default();
+        let reached = steer.last()
+            .is_some_and(|w| (w[0] - goal[0]).hypot(w[1] - goal[1]) <= carrot_tol);
+        if reached { return LocalOutcome::Threaded(steer); }
+        match s.limit {
+            // Cut short → "I don't know". Never "the corridor is blocked".
+            Some(limit) => LocalOutcome::Exhausted { limit, steer },
+            // Frontier CLOSED inside the window → a falsifiable local "no way through".
+            None => LocalOutcome::NoWayThrough { steer, why: s.no_route.unwrap_or(NoRoute::SearchClosed) },
+        }
+    }
+
     /// TIERED CLEARANCE (#358). Search at a GENEROUS clearance (`NAV_PREFERRED_CLEARANCE`) and fall
     /// back to the MINIMUM one — exactly `movement::PLAYER_RADIUS` — only when no generous route
     /// exists. Returns the answering search plus `tight`: the route only exists at the minimum, i.e.
@@ -1719,11 +1868,12 @@ impl Collision {
         // pay for it. A BOUNDED plan (`max_search: Some`) is the fine local tier: it follows a carrot
         // on a coarse route that was ALREADY chosen with room, inside a 40u window where there is no
         // meaningful alternative to choose. Asking it for a roomy route buys nothing and costs a
-        // second search — on the net thread, every nav tick (#382). Measured on the production call
-        // (2u cell / 40u bound / 150 ms): the second pass adds ~30-60% mean on top of the sweep and
-        // DOUBLES the plans that overrun the budget (blackburrow 17 -> 30 of 240). So the local tier
-        // plans at the MINIMUM clearance and spends its budget on the question it exists to answer —
-        // does the character FIT — while the off-thread coarse planner (5 s) picks the roomy route.
+        // second search, every nav tick. Measured on the production call (2u cell / 40u bound): the
+        // second pass adds ~30-60% mean on top of the sweep and DOUBLES the plans that overrun a
+        // 150 ms budget (blackburrow 17 -> 30 of 240). So the local tier plans at the MINIMUM
+        // clearance and spends its time on the question it exists to answer — does the character FIT
+        // — while the coarse planner picks the roomy route. (Both tiers are off the net thread now:
+        // the coarse one since #377, the fine one since #382.)
         let chooses_a_route = max_search.is_none();
         let preferred = if chooses_a_route { minimum.max(NAV_PREFERRED_CLEARANCE) } else { minimum };
         if preferred > minimum {
@@ -4136,6 +4286,168 @@ mod tests {
         }
         println!("\nWORST reachable-component close across corpus: {worst} nodes");
         println!("=> the coarse MAX_NODES backstop must be comfortably above this (it is: 8M).");
+    }
+
+    /// **THE #382 CORPUS MEASUREMENT.** Fine-tier route success and cost, OLD (inline, net-thread) vs
+    /// NEW (`find_path_local`, off-thread), over real baked zones — because every previous tightening of
+    /// nav has SEALED ZONES (the coarse capsule sweep cost −29% route success in akanon, see
+    /// `path_clear`), so "it should be strictly better" is not good enough to ship on.
+    ///
+    /// Note the baseline is NOT a wall clock: #394 already deleted that. Both sides use the SAME
+    /// node-capped search — the only difference #382 makes is WHERE it runs (net thread vs worker) and
+    /// that `find_path_local` returns an HONEST `LocalOutcome` instead of a bare `Option`. So this gate
+    /// proves the new API + off-thread move does not change which carrots get threaded.
+    ///
+    /// * **OLD** = `find_path_res(.., allow_partial: true, .., PlanCtx::net_tier())` — verbatim what
+    ///   `navigation.rs` called inline on the network thread before this change.
+    /// * **NEW** = `find_path_local(..)` — the same node-capped search, off the net thread.
+    ///
+    /// Both are run back-to-back on identical (start, carrot) pairs sampled the way production
+    /// generates them: walk a real coarse route and take carrots `LOCAL_REACH` (24 u) ahead of points
+    /// along it. Reports threaded-count, disagreements, and the timing distribution — the same
+    /// per-tick cost that used to land on the net thread.
+    ///
+    /// ```text
+    /// ZONE_DIR=~/.local/share/eqoxide/assets/models \
+    ///   cargo test --lib fine_tier_corpus -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "requires baked zone glbs at $ZONE_DIR"]
+    fn fine_tier_corpus_route_success_and_cost() {
+        use std::time::Instant;
+        const LOCAL_REACH: f32 = 24.0;
+        const LOCAL_BOUND: f32 = 40.0;
+        const LOCAL_CELL:  f32 = 2.0;
+
+        let dir = std::env::var("ZONE_DIR")
+            .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
+        let zones: Vec<String> = std::env::var("ZONES").ok()
+            .map(|z| z.split(',').map(str::to_string).collect())
+            .unwrap_or_else(|| vec![
+                // A deliberately mixed corpus: the zone #382's own numbers came from (akanon), the one
+                // whose route success the last nav tightening cost 29% (akanon again), a dense city, a
+                // big outdoor zone, dungeons, and the gfaydark corner an earlier budget cut broke.
+                "akanon", "blackburrow", "qeynos2", "gfaydark", "crushbone", "neriaka", "felwithea",
+                "highpass", "everfrost", "butcher",
+            ].into_iter().map(str::to_string).collect());
+
+        // A seeded LCG: a failure here must be reproducible, and an unseeded sample is not evidence.
+        let mut seed: u64 = 0x3820_0F1E;
+        let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as u32 };
+
+        let (mut tot_old_ok, mut tot_new_ok, mut tot_pairs) = (0usize, 0usize, 0usize);
+        let (mut tot_new_only, mut tot_old_only) = (0usize, 0usize);
+        let mut old_us: Vec<u128> = Vec::new();
+        let mut new_us: Vec<u128> = Vec::new();
+
+        println!("\n{:<12} {:>6} {:>10} {:>10} {:>9} {:>9} {:>10} {:>10}",
+            "zone", "pairs", "old ok", "new ok", "new-only", "old-only", "old mean", "new mean");
+        for zone in &zones {
+            let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
+            let Ok(za) = ZoneAssets::from_glb(&p) else { println!("{zone:<12}  (no glb — skipped)"); continue };
+            let col = Collision::build(&za, 32.0);
+            if col.cols == 0 { println!("{zone:<12}  (no grid — skipped)"); continue; }
+
+            // Sample (start, carrot) pairs the way production makes them: real coarse routes, carrots
+            // 24u ahead along them. A carrot invented out of thin air would not be the question the
+            // fine tier is actually asked.
+            let mut pairs: Vec<([f32; 3], [f32; 3])> = Vec::new();
+            let mut tries = 0;
+            while pairs.len() < 240 && tries < 900 {
+                tries += 1;
+                // A random point on walkable floor...
+                let e = col.origin[0] + (rnd() as f32 / u32::MAX as f32) * (col.cols as f32 * col.cell_size);
+                let n = col.origin[1] + (rnd() as f32 / u32::MAX as f32) * (col.rows as f32 * col.cell_size);
+                // Anchor the probe at the TOP of the zone and search down. NOT at the midpoint of
+                // [z_min, z_max]: several zones (gfaydark, everfrost, butcher) carry invisible-boundary
+                // art at z ~= -32768, which drags the midpoint 16,000 units below the world and made the
+                // first version of this sampler find NO floor at all in exactly the big outdoor zones
+                // that matter most here (gfaydark is the zone a tighter fine-tier budget once broke).
+                let Some(z) = col.nearest_floor(e, n, col.z_max, 10.0, 4000.0) else { continue };
+                let s = [e, n, z];
+                // ...and a goal 120-400u away in a random direction. (Two INDEPENDENT random points in
+                // a big outdoor zone are almost never mutually routable, which is why the first version
+                // of this sampler produced zero pairs for gfaydark/everfrost/butcher and only 7 for
+                // akanon — the very zone #382's numbers came from. A displaced goal is both far more
+                // productive and a better model of what an agent actually asks for.)
+                let ang = (rnd() as f32 / u32::MAX as f32) * std::f32::consts::TAU;
+                let d = 120.0 + (rnd() as f32 / u32::MAX as f32) * 280.0;
+                let (ge, gn) = (e + d * ang.cos(), n + d * ang.sin());
+                let Some(gz) = col.nearest_floor(ge, gn, z, 400.0, 400.0) else { continue };
+                // A real coarse route (8u, the off-thread contract), then carrots along it.
+                let PlanOutcome::Route(route) = col.find_path_ex(
+                    s, [ge, gn, gz], crate::movement::PLAYER_RADIUS, &[], 8.0, None, 0.0, PlanCtx::worker())
+                    else { continue };
+                if route.len() < 3 { continue; }
+                // Take a spread of carrots along the route, not just its head, so the sample covers the
+                // whole journey (corners, doorways, stairs) rather than only its easy first stride.
+                for i in (0..route.len().saturating_sub(2)).step_by(3) {
+                    if pairs.len() >= 240 { break; }
+                    let from = route[i];
+                    let Some(carrot) = crate::eq_net::navigation::carrot_along(&route, i, [from[0], from[1]], LOCAL_REACH)
+                        else { continue };
+                    pairs.push((from, carrot));
+                }
+            }
+            if pairs.is_empty() { println!("{zone:<12}  (no routable pairs — skipped)"); continue; }
+
+            let (mut old_ok, mut new_ok, mut new_only, mut old_only) = (0usize, 0usize, 0usize, 0usize);
+            let (mut zo, mut zn) = (Vec::new(), Vec::new());
+            for (s, c) in &pairs {
+                // OLD: exactly the call navigation.rs made inline on the net thread (node-capped).
+                let t0 = Instant::now();
+                let old = col.find_path_res(*s, *c, crate::movement::PLAYER_RADIUS, &[], true,
+                    LOCAL_CELL, Some(LOCAL_BOUND), 0.0, PlanCtx::net_tier());
+                let ot = t0.elapsed().as_micros();
+                // The old API cannot say whether it reached the carrot — it returns partials as routes.
+                // That is the #382 honesty gap. Reconstruct "reached" the way the walker had to: measure.
+                let o_reached = old.as_ref().and_then(|p| p.last()).is_some_and(|w|
+                    (w[0] - c[0]).hypot(w[1] - c[1]) <= LOCAL_CELL * 2.0);
+
+                // NEW: the same node-capped search, off the net thread, with an outcome that says which
+                // answer it is (threaded / no-way-through / exhausted).
+                let t1 = Instant::now();
+                let new = col.find_path_local(*s, *c, LOCAL_CELL, LOCAL_BOUND, LOCAL_CELL * 2.0);
+                let nt = t1.elapsed().as_micros();
+
+                if o_reached { old_ok += 1; }
+                if new.threaded() { new_ok += 1; }
+                if new.threaded() && !o_reached { new_only += 1; }
+                if o_reached && !new.threaded() { old_only += 1; }
+                zo.push(ot); zn.push(nt);
+            }
+            let mean = |v: &[u128]| if v.is_empty() { 0 } else { (v.iter().sum::<u128>() / v.len() as u128) as usize };
+            println!("{zone:<12} {:>6} {:>9}  {:>9}  {:>8}  {:>8}  {:>8}us {:>8}us",
+                pairs.len(), old_ok, new_ok, new_only, old_only, mean(&zo), mean(&zn));
+            tot_pairs += pairs.len(); tot_old_ok += old_ok; tot_new_ok += new_ok;
+            tot_new_only += new_only; tot_old_only += old_only;
+            old_us.extend(zo); new_us.extend(zn);
+        }
+
+        old_us.sort_unstable(); new_us.sort_unstable();
+        let pct = |v: &[u128], p: usize| if v.is_empty() { 0 } else { v[(v.len() - 1) * p / 100] };
+        let mean = |v: &[u128]| if v.is_empty() { 0 } else { (v.iter().sum::<u128>() / v.len() as u128) as usize };
+        println!("\n=== FINE-TIER CORPUS ({tot_pairs} pairs) ===");
+        println!("route success  OLD (inline, net-thread) : {tot_old_ok}/{tot_pairs} = {:.2}%",
+            100.0 * tot_old_ok as f32 / tot_pairs as f32);
+        println!("route success  NEW (off-thread worker)  : {tot_new_ok}/{tot_pairs} = {:.2}%",
+            100.0 * tot_new_ok as f32 / tot_pairs as f32);
+        println!("  NEW threads what OLD could not : {tot_new_only}");
+        println!("  OLD threads what NEW could not : {tot_old_only}   <-- MUST BE 0 (a regression)");
+        println!("cost/plan  OLD (inline/net-thread)  mean {}us  p50 {}us  p99 {}us  max {}us",
+            mean(&old_us), pct(&old_us, 50), pct(&old_us, 99), old_us.last().copied().unwrap_or(0));
+        println!("cost/plan  NEW  mean {}us  p50 {}us  p99 {}us  max {}us  (paid on the fine WORKER, not the net thread)",
+            mean(&new_us), pct(&new_us, 50), pct(&new_us, 99), new_us.last().copied().unwrap_or(0));
+
+        assert!(tot_pairs > 0, "the corpus produced no pairs — check $ZONE_DIR");
+        // THE REGRESSION GATE. Deleting a deadline can only ADD completed searches: any search that
+        // finished inside 150ms finishes identically without it (A* is deterministic given the same
+        // inputs; the deadline only ever ABORTS). So a route the old tier threaded and the new one
+        // cannot is not a rounding difference — it is a real regression, and this must catch it.
+        assert_eq!(tot_old_only, 0,
+            "REGRESSION: {tot_old_only} carrots the OLD budgeted fine tier could thread and the new one \
+             cannot. Deleting the wall clock must be monotone.");
+        assert!(tot_new_ok >= tot_old_ok, "fine-tier route success must not go down");
     }
 
     /// Deterministic offline reproduction of the qeynos2 path-following stalls reported on #2,
