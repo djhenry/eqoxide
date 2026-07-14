@@ -10,7 +10,7 @@ Keep this updated as tasks complete. (Older entries below are an ARCHIVE — see
 `main` is green at `f8c6730`. **CI enforces** `cargo build --release` + `cargo test --lib` on every
 PR (`.github/workflows/test.yml`). 692 tests.
 
-## ⚠️ Read this SECOND: how the last handoff lied, so you don't repeat it
+## ⚠️ Read this FIRST: how the last handoff lied, so you don't repeat it
 
 The previous version of this file called #378 **"the owner's design."** It was not. The owner had
 said, verbatim:
@@ -34,7 +34,7 @@ The same disease produced a **fabricated conflict report** (an agent read a two-
 **four headline numbers that did not survive review** (see below). All three were caught by an
 independent reader. None would have been caught by the author.
 
-## Read this first: the `agent-honesty` label
+## Read this NEXT: the `agent-honesty` label
 
 It is the project's top prioritization principle. 13 open issues carry it.
 
@@ -122,7 +122,7 @@ Reviewed adversarially; **Phase 2 CANCELLED**. Four headline numbers **did not s
 - *Raw parity 93.88%* → pairs were sampled from **the navmesh's own domain**, so ground it dropped could
   never be sampled. Resampled neutrally from the EQEmu oracle: **83.5%**, and grid-only routes **+53%**.
 
-And the fix at its heart was **unsound**: `|nz|` slope classification (`navmesh.rs:369`) discards the
+And the fix at its heart was **unsound**: `|nz|` slope classification (`navmesh.rs:379-380`) discards the
 sign, so **a flat ceiling (`|nz| = 1.0`) classifies as walkable floor** — #329 reproduced verbatim. Its
 two defences fail on a real EQ ceiling, which is a thin shell with **open air above it**. qcat survived
 only because it happens to have rock above its ceiling. **#375 is CLOSED as unsafe** for the same reason:
@@ -136,12 +136,15 @@ observation is correct even though `|nz|` is not the fix. **My inference, not a 
 fix likely belongs in the **asset pipeline** (`eqoxide_asset_server`, the producer), since the art
 itself is inverted and every downstream consumer inherits it. Nobody has decided this — re-derive it.
 
-6. **Asset bugs — NOT client bugs; do not try to fix them in the client.**
-   - **#373** — `nektulos`/`arena` GLBs are **missing their terrain**: 95%/98% of EQEmu-walkable ground
-     has *no collision geometry at all*. **No client-side mitigation exists.** Almost certainly the hole
-     the **#150 underworld fall-guard** masks.
-   - **highpass inverted winding** (was #375, now closed): the fix is to repair the winding in
-     `eqoxide_asset_server`, NOT to discard the normal's sign in the client.
+## Asset bugs — NOT client bugs; do not try to fix them in the client
+- **#373** — `nektulos`/`arena` GLBs are **missing their terrain**: 95%/98% of EQEmu-walkable ground
+  has *no collision geometry at all*. **No client-side mitigation exists.** Almost certainly the hole
+  the **#150 underworld fall-guard** masks.
+- **highpass inverted winding** (was #375, now closed as unsafe): whatever the fix is, it is **NOT**
+  `|nz|` — discarding the normal's sign admits ceilings as floors (#329). #375's closure lists **two**
+  candidate directions and settles neither: (a) a clearance/headroom or anchoring discriminator that
+  does not depend on the winding sign, or (b) repair the winding in `eqoxide_asset_server` (the
+  producer). (b) is the one I'd favour — **but nobody has decided, so re-derive it, don't cite this.**
 
 ## Backlog (issues carry full repros + measurements)
 
