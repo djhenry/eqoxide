@@ -14,11 +14,10 @@ dependency order; each phase leaves the client in a working, testable state.
 
 ## Ground-truth sources (this branch)
 
-- **RoF2 client decompile** — `~/eq_assets/everquest_rof2/decompiled/` (`ghidra/*.c`,
-  `capstone/*.asm`). Generated for the 2019 RoF2 build. Capstone done; Ghidra in progress.
-- **EQEmu RoF2 patch** — `~/git/EQEmu/common/patches/`: `rof2_structs.h` (wire layout),
-  `rof2.cpp` (encode/decode + opcode translation), `~/git/EQEmu/utils/patches/patch_RoF2.conf`
-  (the opcode table). This is the definitive contract.
+- **EQEmu RoF2 patch** — the open-source EQEmu server
+  ([github.com/EQEmu/Server](https://github.com/EQEmu/Server)), `common/patches/`:
+  `rof2_structs.h` (wire layout), `rof2.cpp` (encode/decode + opcode translation), and
+  `utils/patches/patch_RoF2.conf` (the opcode table). This is the definitive contract.
 - **eq-client-expert agent** — repointed to RoF2; consult for any client-side behavior.
 
 ## How EQEmu decides we're a RoF2 client (the target of Phase 1)
@@ -114,4 +113,4 @@ values, all expected handshake opcodes present with the conf's values); the real
 live RoF2-identification check above.
 
 **Risk:** some opcodes eqoxide uses may not exist or be renamed in RoF2; the conf is
-authoritative — anything unmapped is investigated via `rof2.cpp` / the decompile / the expert.
+authoritative — anything unmapped is investigated via `rof2.cpp` / the expert.

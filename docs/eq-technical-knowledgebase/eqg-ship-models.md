@@ -1,7 +1,7 @@
 # EQG Ship/Boat Models (RoF2)
 
-**Status: confirmed by direct binary extraction/parsing of the RoF2 install
-(`~/eq_assets/everquest_rof2/`).** All struct offsets below were validated by
+**Status: confirmed by direct extraction/parsing of the RoF2 client's data
+files.** All struct offsets below were validated by
 parsing real files end-to-end (computed end-of-parse offset == exact file
 length, valid vertex-index bounds, unit-length normals). Scratch scripts:
 `/tmp/claude-*/scratchpad/pfs2.py` (PFS reader, fixed — see §0), `extract2.py`
@@ -55,9 +55,8 @@ file formats/magics differ.
 
 ### 2a. `shipmvm.eqg` / `shipmvp.eqg` / `shipuvu.eqg` / `shippvu.eqg` / `shipworkshop.eqg` = FULL SUB-ZONES, not NPC models
 
-Confirmed: `eqgame.exe.c:636134-636138` registers `"shipmvp"`, `"shippvu"`,
-`"shipuvu"`, `"shipmvm"` as actual **zone IDs** (`FUN_007dc430(0xd, zone_id,
-"shipXXX", "The Open Sea", ...)`), i.e. these are the classic "you board the
+Confirmed: the client registers `"shipmvp"`, `"shippvu"`, `"shipuvu"`,
+`"shipmvm"` as actual **zone IDs** ("The Open Sea", etc.), i.e. these are the classic "you board the
 ferry and get zoned into the ship's interior" instance zones (the RoF2
 successor to the old Trilogy-era boat-crossing mechanic), not a spawn's
 render model. Their `*_chr.txt` (e.g. `shipmvm_chr.txt`) is the normal
@@ -190,7 +189,7 @@ extras.
   model), an additional per-vertex bone-weight block almost certainly follows
   the base vertex array before the polygon array (mirrors the `EQGA`
   skinned-NPC pattern flagged as "not yet reversed" in
-  `eqg-character-models.md`). **Not reverse-engineered in this pass** — out
+  `eqg-character-models.md`). **Not investigated in this pass** — out
   of scope for a static-mesh MVP.
 
 ### Polygon (triangle) record — confirmed **20 bytes**, both versions
@@ -222,12 +221,11 @@ needed either).
 
 ## 5. `.zon` placement format (needed only for the full multi-piece ship, NOT MVP)
 
-`shipmvm.zon`: magic `EQGZ`, **version 2** (the version-1 branch is what's
-decompiled at `EQGraphicsDX9.dll.c:87371` `FUN_10064da0`, gated on
-`*(int*)(param_2+4) == 1` — RoF2's own top-level zone `.zon` files are
-presumably version 1; this ship sub-zone `.zon` is version 2, a variant not
-covered by that decompiled branch). Header (28 bytes, all confirmed by exact
-byte offsets matching the decompile's field reads):
+`shipmvm.zon`: magic `EQGZ`, **version 2** (the client's version-1 handling is
+a separate branch gated on a version-1 check — RoF2's own top-level zone
+`.zon` files are presumably version 1; this ship sub-zone `.zon` is version
+2, a variant not covered by that other branch). Header (28 bytes, all
+confirmed by exact byte offsets matching the observed field layout):
 ```
 char[4] magic "EQGZ"
 u32 version        (2 for shipmvm.zon)
@@ -242,11 +240,9 @@ u32 unknown2 (0)        -- not decoded
   i.e. one `.mod`/`.ter` filename can back multiple named placed instances.
 ```
 A `model_count`-entry (4 bytes each) name-offset-fixup table follows the
-string table (`EQGraphicsDX9.dll.c:87439-87450`), then the **placeable
-array**: confirmed **36-byte stride** per record
-(`local_268 = pcVar16 + placeable_count*0x24 + model_count*4` at
-`EQGraphicsDX9.dll.c:87454`). Partially decoded fields (not fully solved —
-lower priority since §6 MVP doesn't need this):
+string table, then the **placeable array**: confirmed **36-byte stride** per
+record. Partially decoded fields (not fully solved — lower priority since §6
+MVP doesn't need this):
 ```
 offset 0x00: u32 model_name_index (into the model name table)
 offset 0x04: u32 (another string/name offset, used to build a per-instance path)

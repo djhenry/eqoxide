@@ -4,8 +4,8 @@
 //! (`~/.config/eqoxide/ui_layout_<name>.json`); old v1 files load unchanged via
 //! serde defaults. New in v2: per-window `open` state, OS-window geometry,
 //! UI-scale/fades preferences, and the native client's cross-resolution
-//! edge-relative position remap (decompiled `FUN_0088bfa0`), which replaces the
-//! old letterbox/constrain heuristics.
+//! edge-relative position remap, which replaces the old letterbox/constrain
+//! heuristics.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -379,9 +379,9 @@ impl Layout {
     }
 }
 
-/// One axis of the native client's cross-resolution window remap (decompiled
-/// RoF2 `FUN_0088bfa0`): windows in the left/top half keep their absolute
-/// coordinate, windows in the right/bottom half keep their distance from that
+/// One axis of the native client's cross-resolution window remap: windows in
+/// the left/top half keep their absolute coordinate, windows in the
+/// right/bottom half keep their distance from that
 /// edge, windows straddling the center shift by the center delta; finally the
 /// result is clamped on-screen (title always reachable).
 pub(crate) fn remap_axis(pos: f32, size: f32, old_dim: f32, new_dim: f32) -> f32 {
@@ -477,7 +477,7 @@ mod tests {
         );
     }
 
-    // ── remap math (the native FUN_0088bfa0 table) ──
+    // ── remap math (native cross-resolution remap) ──
     #[test]
     fn remap_left_half_keeps_absolute() {
         assert_eq!(remap_axis(10.0, 100.0, 1280.0, 1920.0), 10.0);

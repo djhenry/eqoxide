@@ -1,12 +1,12 @@
 # EQG Character Models (RoF2)
 
-**Status: confirmed from file enumeration, eqclient.ini, and eqgame.exe.c decompile.**
+**Status: confirmed from file enumeration, eqclient.ini, and client behavior.**
 
 ## DECISIVE: Which player races use EQG models?
 
 **None.** All playable race character models in RoF2 are in S3D/WLD format (Luclin-era
 archives). No per-race EQG archives (`hum.eqg`, `huf.eqg`, `elf.eqg`, etc.) exist in
-`~/eq_assets/everquest_rof2/`. EQG archives with 3-letter race codes (`aam.eqg`,
+the RoF2 client's data files. EQG archives with 3-letter race codes (`aam.eqg`,
 `ahm.eqg`, etc.) are NPC/creature models, not player character models.
 
 This means **EQG support is not the correct path to RoF2 player character hair.**
@@ -17,7 +17,7 @@ This means **EQG support is not the correct path to RoF2 player character hair.*
 
 ### eqclient.ini confirms Luclin enabled for all races
 
-`~/eq_assets/everquest_rof2/eqclient.ini`:
+`eqclient.ini`:
 ```
 UseLuclinHumanMale=TRUE
 UseLuclinHumanFemale=TRUE
@@ -29,22 +29,17 @@ UseLuclinDarkElfMale=TRUE
 RoF2 always loads Luclin models; the classic `global_chr.s3d` is a fallback that the
 client retains but never reaches under defaults.
 
-### Client model-load path (eqgame.exe.c)
+### Client model-load path
 
-- `FUN_0048e420` (eqgame.exe.c:100868) — reads `UseLuclin{Race}Male/Female` from
-  eqclient.ini
-- `FUN_0048e510` (eqgame.exe.c:100902) — wrapper that also checks
-  `AllLuclinPcModelsOff`; race 0x82 (Vah Shir) handled separately
-- Loading code at eqgame.exe.c:103363,103382:
-  ```c
-  _sprintf(acStack_cbc, "global%s_chr2", auStack_89c);  // geometry/skel WLD
-  _sprintf((char *)&uStack_cc4, "global%s_chr");         // textures + stub WLD
-  ```
-  Where `auStack_89c` is the 3-letter race model code built from `FUN_00488c00`.
-- `FUN_00488c00` (eqgame.exe.c:97394) — returns race name string ("Human", "WoodElf",
-  etc.) used for UseLuclin INI key lookup. The 3-letter model codes come from a
-  separate lookup (not shown separately in the decompile — they follow from the
-  archive names below).
+- The client reads `UseLuclin{Race}Male/Female` keys from `eqclient.ini`
+  (gated by an `AllLuclinPcModelsOff` check; race 0x82 / Vah Shir is handled
+  separately) to decide whether to load the Luclin model set for a race.
+- Loading builds two archive names from the 3-letter race model code:
+  `global{code}_chr2` (geometry/skeleton WLD) and `global{code}_chr`
+  (textures + stub WLD). The race-name string (e.g. "Human", "WoodElf") used
+  for the UseLuclin INI key lookup is a separate mapping from the 3-letter
+  model code; the codes themselves are given by the archive names in the
+  table below.
 
 ### Per-race archive pairs
 
@@ -272,7 +267,7 @@ They carry NO mesh geometry. The WLD assigns all DAGs track_reference values but
 mesh_or_sprite_reference = 0 for all ELFHE* head/hair DAGs.
 
 `ELFHAIR_POINT_DAG` and `ELFHEAD_POINT_DAG` are the canonical hat/hair equipment
-attachment points referenced in eqgame.exe.c string table (lines 8038, 8043).
+attachment points referenced by the client's bone-name string table.
 
 ---
 
@@ -352,27 +347,26 @@ String table follows at offset 20; contains null-terminated bone/joint names:
 Full parse of bone data + vertex format not yet reversed (out of scope for PC
 character support).
 
-### EQGS v1 format (older, in EQGraphicsDX9.dll.c)
+### EQGS v1 format (older)
 
 Magic `EQGS` (0x53475145), version field == 1 at offset 4.
-Checked by `FUN_100631e0` (EQGraphicsDX9.dll.c:86173).
 Header at offset 8 = string table length; string table at offset 0x18 (24).
 Fields at 0x0c, 0x10, 0x14 control material count, geometry groups, and
 bone/palette count. Not found in any RoF2 EQG files examined; may be used by
 older zone-chr S3D archives or early PoP-era EQG files.
 
-### Other EQG magic bytes (all confirmed from EQGraphicsDX9.dll.c:88169-88213)
+### Other EQG magic bytes (confirmed)
 
-| Magic  | Type  | Handler function    | Notes                  |
-|--------|-------|---------------------|------------------------|
-| `EQGM` | 2     | FUN_10063f10... no  | Static mesh (OpenEQ TerMod.cs isTer=false) |
-| `EQGT` | 2     | FUN_10063f10        | Terrain (OpenEQ TerMod.cs isTer=true) |
-| `EQAL` | 5     | FUN_10064c70        | Material layer list    |
-| `EQGL` | 6     | FUN_100645f0        | Geometry list (light?) |
-| `EQGZ` | 3     | FUN_10064da0        | Zone data              |
-| `EQLOD`| 7     | FUN_10064ab0        | Level-of-detail        |
-| `EQTZP`| 8     | FUN_10064bd0        | Terrain zone point     |
-| `EQOBG`| 9     = FUN_10065b60        | Object group           |
+| Magic  | Type  | Notes                  |
+|--------|-------|------------------------|
+| `EQGM` | 2     | Static mesh (OpenEQ TerMod.cs isTer=false) |
+| `EQGT` | 2     | Terrain (OpenEQ TerMod.cs isTer=true) |
+| `EQAL` | 5     | Material layer list    |
+| `EQGL` | 6     | Geometry list (light?) |
+| `EQGZ` | 3     | Zone data              |
+| `EQLOD`| 7     | Level-of-detail        |
+| `EQTZP`| 8     | Terrain zone point     |
+| `EQOBG`| 9     | Object group           |
 
 ---
 

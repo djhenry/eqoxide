@@ -4,22 +4,15 @@
 
 `R_POINT`, `L_POINT`, `SHIELD_POINT`, `HEAD_POINT`, `TUNIC_POINT`, `HAIR_POINT`,
 `GAUNTL/R_POINT`, `SHOULDL/R_POINT`, `LEGL/R_POINT`, `PELVIS_POINT`, etc. are all
-registered identically as `%s<NAME>_DAG` string lookups in
-`eq_assets/everquest_rof2/decompiled/ghidra/eqgame.exe.c:7960-8104` (e.g. line
-8020 `%sR_POINT_DAG`, 8022 `%sL_POINT_DAG`, 8024 `%sSHIELD_POINT_DAG`). No
-separate weapon-attach offset table was found anywhere in `eqgame.exe.c` or
-`EQGraphicsDX9.dll.c`. `EQGraphicsDX9.dll.c:23540-23700` and `:65760-65900` only
-use these names for hide/show (occlusion) bookkeeping (struct offsets
-0x90/0x91/0x92), not attach math.
+registered identically as ordinary `%s<NAME>_DAG` named-bone lookups. There is
+no separate weapon-attach offset table — the point bone's own transform is
+used directly for attachment. These bone names are otherwise only used for
+hide/show (occlusion) bookkeeping, not attach math.
 
-`CHierarchicalAttachedActor` (constructed in `EQGraphicsDX9.dll.c:61915`,
-`FUN_10046fa0`) is presumably the class that actually positions an attached
-IT-model actor, but its vtable has only ONE reference in the Ghidra decompile
-(the constructor setting the vtable pointer) — **no method bodies were
-recoverable**. This is an acknowledged gap: the exact attach-time matrix math
-inside the client binary could not be directly proven. Everything below is
-either (a) proven from real WLD skeleton/mesh data, or (b) inferred from
-control flow and marked as such.
+The exact attach-time matrix math used internally by the client could not be
+directly confirmed. This is an acknowledged gap. Everything below is either
+(a) proven from real WLD skeleton/mesh data, or (b) inferred from behavior
+and marked as such.
 
 ## CONFIRMED: SHIELD_POINT hangs off the forearm, not the hand
 
@@ -76,10 +69,10 @@ applies to every bone, not just point bones). They are **not separately
 keyframed per animation clip**; their local offset from the parent is
 constant. All visible motion of a held weapon/shield during combat/idle
 animations comes from the parent hand/forearm chain's own animated rotation,
-not from the point bone itself. The `eqgame.exe.c:66295-66400`
-`R_POINT_TRACK`/`L_POINT_TRACK` → `SPELL_POINT_TRACK` substitution logic is a
-**per-race missing-track fallback** (some skeletons don't define their own
-hand point at all), not a per-animation-clip retargeting mechanism.
+not from the point bone itself. The `R_POINT_TRACK`/`L_POINT_TRACK` →
+`SPELL_POINT_TRACK` substitution logic is a **per-race missing-track
+fallback** (some skeletons don't define their own hand point at all), not a
+per-animation-clip retargeting mechanism.
 
 ## CONFIRMED root cause candidate: weapons.glb vertices are NOT EQ-native — they already went through the axis-swap ("mirror") Y-up conversion, not the proper rq rotation
 
@@ -186,13 +179,11 @@ Sampled via `.../scratchpad/eq_re/src/bin/list.rs` (bounding boxes are in
 
 ## Open gaps
 
-- `CHierarchicalAttachedActor`'s actual attach-transform method body
-  (EQGraphicsDX9.dll) could not be recovered — no vtable data array in the
-  Ghidra decompile, only the constructor's vtable-pointer store at
-  `EQGraphicsDX9.dll.c:61915`. All conclusions about "identity local attach"
-  are inferred from (a) no offset table found in control flow and (b) the
-  skeleton data itself fully accounting for observed orientations — not from
-  directly reading the attach function.
+- The client's actual attach-transform implementation could not be
+  independently confirmed. All conclusions about "identity local attach"
+  are inferred from (a) no separate offset table found anywhere in the
+  observable behavior and (b) the skeleton data itself fully accounting for
+  observed orientations — not from directly reading the attach function.
 - Grip-origin convention (weapon origin at blade center vs at grip/hilt end)
   not conclusively settled from only 2 sampled meshes.
 

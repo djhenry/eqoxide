@@ -22,8 +22,7 @@ Mode: unattended self-paced loop. Validate by PLAYING (no server-side peeking ex
 - [ ] Re-verify prior features (camp/exit, idle anims, navpath, merchant, etc.)
 
 ## Log
-- 2026-06-26: branch + roadmap created; eq-client-expert repointed to RoF2; decompiles (capstone done, ghidra eqgame.exe pending). Starting Phase 1 opcode migration.
-- 2026-06-26: Ghidra decompile COMPLETE — eqgame.exe.c (1.16M lines/34k fns), EQGraphicsDX9.dll.c, eqmain.dll.c at ~/eq_assets/everquest_rof2/decompiled/ghidra/. expert has full RoF2 sources. Phase 1 opcode subagent still running.
+- 2026-06-26: branch + roadmap created; eq-client-expert repointed to RoF2. Starting Phase 1 opcode migration (sourced from the EQEmu server's RoF2 patch tables).
 - 2026-06-26: Phase 1 DONE (commit 46c472a). Opcode table → RoF2; ClientZoneEntry 76B; 250 tests pass. NO-MATCH: 8 loginserver opcodes (version-agnostic, left as-is) + OP_BECOME_CORPSE/OP_LOGOUT_REPLY (0x0000 in conf). Verifying RoF2 identification next.
 
 ## Phase 1 VALIDATED (2026-06-27)

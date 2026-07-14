@@ -1,20 +1,20 @@
 # Luclin Heads: Faces, Painted Hair, and the Dead Hairstyle Path (RoF2)
 
-**Status: validated 2026-07-01 against the RoF2 decompile (`eqgame.exe.c`), the RoF2
-asset archives, and bone-weight analysis of the baked GLBs. SUPERSEDES the hair
+**Status: validated 2026-07-01 against the RoF2 asset archives and bone-weight
+analysis of the baked GLBs. SUPERSEDES the hair
 sections of `eqg-character-models.md` and the `luclin-character-hair.md` worktree doc,
 both of which misread the `hesk` texture digit as a HAIRSTYLE index. It is the FACE
 index.**
 
 ## The three head attributes and what the client does with them
 
-`FUN_0040d770` (eqgame.exe.c:9150) is the attribute dispatcher for S3D character
-heads. Its `param_3` selects the attribute:
+The client's attribute dispatcher for S3D character heads selects among three
+attributes:
 
 | attr | wire field | mechanism |
 |------|-----------|-----------|
-| 1 | `face` | **material swap** `"%sHE%02d%d1_MDF"` via `FUN_0040d1a0` (texture change) |
-| 2 | `hairstyle` | **actor attach** at slot 8: Luclin heads look up `"%s_HS%2d_HEAD_HAIR"` (`FUN_0040ab10`); classic heads attach `IT{1000+style+race_offset}` (`FUN_0040aa30`, offsets in `FUN_0040a290`) |
+| 1 | `face` | **material swap** `"%sHE%02d%d1_MDF"` (texture change) |
+| 2 | `hairstyle` | **actor attach** at slot 8: Luclin heads look up `"%s_HS%2d_HEAD_HAIR"`; classic heads attach `IT{1000+style+race_offset}` |
 | 3 | `beard` | actor attach at slot 9 (`"%s_FACIALHAIR_%02d"` / classic IT2000+) |
 
 ### Face (attr 1) — the hesk texture swap
@@ -31,13 +31,13 @@ heads. Its `param_3` selects the attribute:
 
 ### Hairstyle (attr 2) — DEAD CODE with stock RoF2 assets
 
-Exhaustive scan of every `.s3d` WLD string table in `~/eq_assets/everquest_rof2`:
-**no `*_HEAD_HAIR` actor exists anywhere**, and no `IT13xx/IT14xx` hair actors
-exist in `global_chr.s3d`/`gequip*.s3d`. The `{RACE}HEHAIR1–9_DAG` skeleton bones
-are sway-chains for those (never-shipped) attachments; **zero vertices** in any
-player-race body mesh bind to them. The only real hair models in RoF2 are the
-Drakkin EQG ones (`dkf.eqg`/`dkm.eqg`: `dk{f,m}_hair_00..07.mod`, attached via
-`"%s_HAIR_%02d"`, `FUN_0040ac80`).
+Exhaustive scan of every `.s3d` WLD string table in the RoF2 client's asset
+archives: **no `*_HEAD_HAIR` actor exists anywhere**, and no `IT13xx/IT14xx`
+hair actors exist in `global_chr.s3d`/`gequip*.s3d`. The `{RACE}HEHAIR1–9_DAG`
+skeleton bones are sway-chains for those (never-shipped) attachments; **zero
+vertices** in any player-race body mesh bind to them. The only real hair
+models in RoF2 are the Drakkin EQG ones (`dkf.eqg`/`dkm.eqg`:
+`dk{f,m}_hair_00..07.mod`, attached via `"%s_HAIR_%02d"`).
 
 **Therefore: changing `hairstyle` has NO visual effect on S3D player races in the
 real RoF2 client.** Bald-looking Luclin heads with painted hair are authentic.
@@ -46,11 +46,11 @@ real RoF2 client.** Bald-looking Luclin heads with painted hair are authentic.
 
 The hair you "see" on Luclin models is painted into the head textures as a
 NEUTRAL LIGHT base (huf scalp texels avg ≈ RGB(158,116,85); elf ≈ (173,123,90) —
-lighter than the face). The client colors it by multiplying with the 24-entry
-tint table at VA `0x00AC1A70` (see `hair-color.md` for the table). In the swap
-function the tint pointer is only passed for `FUN_0040a240()==2` races (High
-Elf, Dark Elf, Half Elf, female Dwarf) — races whose region layout isolates the
-hair texels; the visible result is neutral/blonde-ish hair for the others.
+lighter than the face). The client colors it by multiplying with a 24-entry tint table (see
+`hair-color.md` for the table). In the swap logic the tint pointer is only
+passed for a subset of races (High Elf, Dark Elf, Half Elf, female Dwarf) —
+races whose region layout isolates the hair texels; the visible result is
+neutral/blonde-ish hair for the others.
 
 ## Head polygon regions (huf, verified by bone weights + debug-color renders)
 

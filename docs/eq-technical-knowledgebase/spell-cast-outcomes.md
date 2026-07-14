@@ -1,6 +1,7 @@
 # Spell-cast outcome packets (RoF2, caster's own cast)
 
-Server source: `/home/dhenry/git/EQEmu`. All findings below are **confirmed by
+Server source: the open-source EQEmu server
+([github.com/EQEmu/Server](https://github.com/EQEmu/Server)). All findings below are **confirmed by
 reading source** (not inferred) unless marked otherwise. Struct field layout
 confirmed for the RoF2 wire specifically via `common/patches/rof2_structs.h`
 + `common/patches/rof2.cpp` ENCODE handlers, cross-checked against the
@@ -217,14 +218,6 @@ OP_SimpleMessage=0x213f       (line 185)
 OP_Action=0x744c              (line 212)
 OP_Damage=0x6f15              (line 220)
 ```
-
-Lightly corroborated in the RoF2 client binary itself
-(`/home/dhenry/eq_assets/everquest_rof2/decompiled/capstone/eqgame.exe.asm`):
-literal comparisons against `0x318f` (OP_BeginCast) and `0x5467`
-(OP_ManaChange) appear in what looks like the opcode-dispatch switch around
-`0x004c3fc8`/`0x004c4860` — consistent with the client treating these as
-distinct handled opcodes (not deeply traced function-by-function; treat as
-corroboration, not full confirmation).
 
 ## Wire-layout gotcha for eqoxide
 

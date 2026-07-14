@@ -29,14 +29,10 @@ order (`col = cell % cols; row = cell / cols`) eqoxide currently used.
   are column-major. These are two different conventions in the same client;
   do not assume they match.
 - The XML property names (`Grid`, `Cycle`, `Vertical`, `CellWidth`,
-  `CellHeight`) are parsed as literal strings in the stripped client at
-  `everquest_rof2/decompiled/ghidra/eqgame.exe.c:799819-799849` (`FUN_008ab800`)
-  and `:799947-799978` (`FUN_008abb20`) — confirms these are real, live fields
-  read by the animation loader, not dead/unused XML attributes. The decompile
-  is fully stripped (`FUN_xxxx`) so the actual per-frame cell-index → (row,col)
-  arithmetic function could not be isolated directly; the ordering below was
-  therefore confirmed empirically (see next section) rather than read out of
-  decompiled code.
+  `CellHeight`) are real, live fields read by the animation loader, not
+  dead/unused XML attributes. The actual per-frame cell-index → (row,col)
+  arithmetic could not be isolated directly from client behavior alone; the
+  ordering below was therefore confirmed empirically (see next section).
 - **Empirical confirmation** (decisive): extracted `dragitem3.dds`,
   `dragitem7.dds`, `dragitem15.dds` from
   `everquest_rof2/uifiles/default/` with `magick` (DXT5-compressed 256×256

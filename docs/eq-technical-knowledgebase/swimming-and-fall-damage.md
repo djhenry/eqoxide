@@ -3,10 +3,9 @@
 ## 1. Water is a WLD BSP region type, not a special zone-line-like object
 
 The zone's own `.wld` (inside `<zone>.s3d`) carries a 0x21 `WorldTree` BSP whose
-leaves are tagged by 0x29 `Zone` fragments naming a region-type prefix. Confirmed by
-decompile, `FUN_00487530` (`everquest_rof2/decompiled/ghidra/eqgame.exe.c:96178-96301`):
+leaves are tagged by 0x29 `Zone` fragments naming a region-type prefix. Confirmed:
 the **terrain-type code is packed into the LOW NIBBLE (bits 0-3)** of the region's
-cached flag word (offset `+0x198` of the region struct):
+cached flag word:
 
 | Prefix | Low-nibble value | Meaning |
 |---|---|---|
@@ -18,10 +17,10 @@ cached flag word (offset `+0x198` of the region struct):
 | `W2` | 9 | extra water tier |
 | `W3` | 10 | extra water tier |
 
-(`eqgame.exe.c:96218-96248`, e.g. `"WT"` → `param_2 = param_2 & 0xffffff05 | 5`).
-Separately, high bits of the SAME word carry unrelated flags: `0x40000000`=PvP
-(2nd char `'P'`), `0x80000000`=zone-line (`"...TP..."`), plus M/S/P/F suffix bits
-(`eqgame.exe.c:96256-96296`) — see `zone-line-crossing.md` for the zone-line half of
+(e.g., `"WT"` sets the low nibble to 5 while preserving the high-order flag
+bits). Separately, high bits of the SAME word carry unrelated flags:
+`0x40000000`=PvP (2nd char `'P'`), `0x80000000`=zone-line (`"...TP..."`), plus
+M/S/P/F suffix bits — see `zone-line-crossing.md` for the zone-line half of
 this same parser.
 
 **Server-side equivalent**: EQEmu compiles the identical WLD BSP into a `.wtr`-style

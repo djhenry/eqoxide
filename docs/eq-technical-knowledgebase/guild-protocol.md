@@ -1,10 +1,10 @@
 # Guild protocol (RoF2)
 
-Status: all findings below are **confirmed** by direct code read against
-`/home/dhenry/git/EQEmu` (RoF2 patch files + zone server logic), current as of this repo's
-HEAD. Nothing here is from the decompiled client — `eqgame.exe.c` has no guild-related literal
-strings (server `MessageString` IDs drive UI text), so client-side rendering/UI behavior is
-inferred from server packet-construction comments, not disassembled. Cross-reference
+Status: all findings below are **confirmed** by direct code read against the open-source EQEmu
+server ([github.com/EQEmu/Server](https://github.com/EQEmu/Server) — RoF2 patch files + zone
+server logic), current as of this repo's HEAD. Server `MessageString` IDs drive client UI text,
+so client-side rendering/UI behavior is inferred from server packet-construction comments rather
+than observed directly. Cross-reference
 `group-protocol.md` — guild follows the same "server-authoritative, client sends intent, server
 re-broadcasts state" shape, with the added wrinkle that `OP_GuildMemberList` uses **network byte
 order** (a real outlier in this codebase) and `OP_PlayerProfile`'s guild fields sit **after a
@@ -303,11 +303,11 @@ the sender's guild, this is a promote/demote (`officer` compared against their c
 `othername` is guildless, it's a fresh invite; if `othername` is in a *different* guild, it's
 rejected with a chat message. **The server just forwards the packet verbatim to the target**
 (`client->QueuePacket(app)`) — the invitee's client receives the exact same `OP_GuildInvite`/
-`GuildCommand_Struct` back, and is expected to render an invite popup client-side (not verified —
-no literal strings in the decompile). No response is required to dismiss/see it; only accepting
+`GuildCommand_Struct` back, and is expected to render an invite popup client-side (not confirmed
+from the server source). No response is required to dismiss/see it; only accepting
 sends a new opcode (below).
 
-For a plain invite (not promote), the real client is inferred (not directly disassembled) to send
+For a plain invite (not promote), the real client is inferred (not directly confirmed) to send
 `officer = GUILD_RECRUIT (8)` as the initial rank — this matches
 `Handle_OP_GuildInvite`'s "not overridden for RoF2→RoF2" code path (only cross-version clients get
 `officer` rewritten) and is the lowest/default rank in the 0-8 scale.

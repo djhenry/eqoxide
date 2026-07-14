@@ -12,6 +12,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Fast, dependency-free guard: fail the build if local-system detail (absolute home paths,
+  # local container names, an inline DB credential) or proprietary-derived content (references to
+  # a decompiled commercial client / RE tooling) reappears in a tracked file. This is the durable
+  # defense that keeps a one-time scrub from silently regressing on a public repo. See the script
+  # for the exact patterns and the (temporary) exclusions.
+  no-local-detail:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: check for local-system detail / proprietary-derived content
+        run: bash scripts/check-no-local-detail.sh
+
   test:
     runs-on: ubuntu-latest
     # The repo's tracked .cargo/config.toml sets `rustc-wrapper = "sccache"` and
