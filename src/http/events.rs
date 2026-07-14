@@ -193,6 +193,34 @@ mod tests {
         assert!(msg.contains("snice"), "the 400 body should name the offending field, got: {msg}");
     }
 
+    /// REGRESSION GUARD — this pins behaviour that is ALREADY CORRECT today; it fixes nothing.
+    ///
+    /// A *present but unparseable* `since` (garbage, negative, or overflowing u64) is rejected with
+    /// a 400 by `u64::from_str` inside serde_urlencoded's `Part::deserialize_u64` — it does NOT fall
+    /// back to the `unwrap_or(0)` default in `fetch`, which applies only to a genuinely ABSENT param.
+    /// That distinction is the whole point of #363: a default may mask an OMITTED field, never a
+    /// PARSE FAILURE. Nothing in the type system stops a future refactor from taking `since` as a
+    /// `String` and doing `.parse().unwrap_or(0)` — which would silently resurrect #363 in a new
+    /// coat (garbage cursor → whole ring replayed → confident 200). This test exists to make that
+    /// refactor fail loudly. (Verified non-vacuous by exactly that mutation; see the PR.)
+    #[tokio::test]
+    async fn unparseable_since_is_rejected_not_silently_defaulted_to_zero() {
+        for bad in ["abc", "-1", "99999999999999999999999"] {
+            let state = empty_state();
+            {
+                let mut events = state.chat_events.lock().unwrap();
+                for id in 1..=8u64 {
+                    events.push(ev(id));
+                }
+            }
+            let app = router().with_state(state);
+            let uri = format!("/all?since={bad}");
+            let resp = app.oneshot(Request::get(&uri).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST,
+                "?since={bad} must be an explicit 400, not a silent fallback to since=0 that replays the whole ring");
+        }
+    }
+
     /// The happy path must not regress: a correctly-spelled `since` still parses and filters normally.
     #[tokio::test]
     async fn valid_since_param_still_works() {
