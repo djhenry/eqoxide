@@ -728,6 +728,11 @@ fn apply_shop_player_buy(gs: &mut GameState, p: &[u8]) {
         gs.push_event("merchant", "coin_desync", "", true, &warn);
         tracing::warn!("EQ: buy confirmed but local coin snapshot could not cover price={price} — coin is stale");
     }
+    // Note: even a fully-covered, confirmed buy does NOT clear coin_verified here. `begin_shop_buy`
+    // (send time) bumped `unverified_buys`, and this per-buy echo only confirms a relative delta —
+    // it cannot rule out an EARLIER silent refusal (inventory-full/LORE) having already diverged the
+    // absolute balance. Only `reconcile_coin` (a real OP_PlayerProfile) may restore trust (#361
+    // review — FIX 1). `coin_verified()` is computed, so there is no field to wrongly set here.
 }
 
 /// OP_ShopEndConfirm (server→client, 0-byte body) — EQEmu's SendMerchantEnd() (zone/client.cpp
@@ -748,6 +753,11 @@ fn apply_shop_player_buy(gs: &mut GameState, p: &[u8]) {
 fn apply_shop_end_confirm(gs: &mut GameState, _p: &[u8]) {
     gs.merchant_open = None;
     gs.merchant_items.clear();
+    // Deliberately does NOT clear coin_verified. No coin was taken on any path reaching this handler
+    // (see the doc comment above), so THIS buy cost nothing — but that is a relative fact about one
+    // buy, and cannot rule out an EARLIER silent refusal having already diverged the balance. Only
+    // `reconcile_coin` (a real OP_PlayerProfile) restores trust; a refusal echo must not (#361
+    // review — FIX 1).
     let msg = "Merchant refused the purchase (session ended)";
     gs.log_msg("merchant", msg);
     gs.push_event("merchant", "refused", "", true, msg);
@@ -1215,7 +1225,29 @@ fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
 
     // ── Stats, coin, mem_spells (fixed offsets, no variable-length content before them) ──
     if let Some(p) = parse_player_profile(payload) {
-        gs.coin = p.coin;
+        // Coin reconciliation against the server's authoritative figure (#361): a merchant buy the
+        // server silently refused (inventory-full/LORE — no echo of any kind reaches the client
+        // for either, EQEmu zone/client_packet.cpp ~14198-14303) can leave `gs.coin` diverged from
+        // reality with nothing else to correct it. Only reconcile when this payload actually
+        // carried the coin block (>=13285 — see `parse_player_profile`'s offset comment); a
+        // short/legacy-length payload leaves `p.coin` at the parser's zero sentinel, which is not
+        // a real reading and must not overwrite (or be compared against) the real balance.
+        if payload.len() >= 13285 {
+            if let Some(prior) = gs.reconcile_coin(p.coin) {
+                let warn = format!(
+                    "Coin desync detected on zone-in: local balance was {}p {}g {}s {}c but the \
+                     server says {}p {}g {}s {}c (a merchant refusal likely charged or withheld \
+                     coin without telling us) — correcting to the server's figure",
+                    prior[0], prior[1], prior[2], prior[3],
+                    p.coin[0], p.coin[1], p.coin[2], p.coin[3],
+                );
+                gs.log_msg("merchant", &warn);
+                gs.push_event("merchant", "coin_desync", "", true, &warn);
+                tracing::warn!("EQ: PlayerProfile coin reconciliation found a desync: {:?} -> {:?}", prior, p.coin);
+            }
+        } else {
+            gs.coin = p.coin; // legacy/short payload: no real coin block, preserve prior behavior
+        }
         gs.stats = p.stats;
         gs.mem_spells = p.mem_spells;
         // Seed the player's own HP. The server only sends a self OP_HPUpdate when HP *changes*
@@ -2831,6 +2863,57 @@ mod tests {
             "an uncoverable confirmed price must be reported as a desync, not silently swallowed");
         assert!(gs.messages.iter().any(|m| m.text.contains("Coin desync")),
             "the desync must be visible in the message log too");
+    }
+
+    #[test]
+    fn apply_shop_player_buy_confirmed_success_does_not_re_verify_coin() {
+        // #361 review (FIX 1): a confirmed, coverable buy applies the correct delta but must NOT
+        // flip coin back to verified — an earlier silent refusal could already have diverged the
+        // absolute balance, and only a real OP_PlayerProfile can rule that out.
+        let mut gs = GameState::new();
+        gs.coin = [10, 0, 0, 0];
+        gs.coin_confirmed = true; // a real reading had landed at some earlier point
+        gs.begin_shop_buy();      // this buy is in flight (as the nav tick does at send time)
+        let mut echo = [0u8; 32];
+        echo[8..12].copy_from_slice(&7u32.to_le_bytes());
+        echo[16..20].copy_from_slice(&1u32.to_le_bytes());
+        echo[24..28].copy_from_slice(&37u32.to_le_bytes());
+        super::apply_shop_player_buy(&mut gs, &echo);
+        assert!(!gs.coin_verified(),
+            "a per-buy echo confirms a relative delta only; it cannot restore absolute trust");
+    }
+
+    #[test]
+    fn apply_shop_player_buy_desync_leaves_coin_unverified() {
+        // #361: a confirmed buy whose price we could NOT cover means our balance is known wrong
+        // (overstated) — it must stay unverified until the next OP_PlayerProfile reconciles it,
+        // not be marked trustworthy just because a packet arrived.
+        let mut gs = GameState::new();
+        gs.coin = [0, 0, 0, 5];
+        gs.coin_confirmed = true;
+        gs.begin_shop_buy();
+        let mut echo = [0u8; 32];
+        echo[8..12].copy_from_slice(&7u32.to_le_bytes());
+        echo[16..20].copy_from_slice(&1u32.to_le_bytes());
+        echo[24..28].copy_from_slice(&99u32.to_le_bytes()); // > 5c on hand
+        super::apply_shop_player_buy(&mut gs, &echo);
+        assert!(!gs.coin_verified(), "a detected desync must not be reported as a trustworthy balance");
+        assert!(gs.chat_events.iter().any(|e| e.kind == "coin_desync"));
+    }
+
+    #[test]
+    fn apply_shop_end_confirm_does_not_re_verify_coin() {
+        // #361 review (FIX 1): a refusal never spends coin on THIS buy, but that is a relative fact
+        // — it cannot rule out an earlier silent refusal, so it must not restore trust. Only a real
+        // OP_PlayerProfile (reconcile_coin) may. It still clears merchant_open.
+        let mut gs = GameState::new();
+        gs.coin = [10, 0, 0, 0];
+        gs.coin_confirmed = true;
+        gs.merchant_open = Some(111);
+        gs.begin_shop_buy();
+        super::apply_shop_end_confirm(&mut gs, &[]);
+        assert!(!gs.coin_verified(), "a refusal echo confirms one buy's cost only, not absolute trust");
+        assert_eq!(gs.merchant_open, None, "the refusal still honestly closes the merchant");
     }
 
     #[test]
@@ -4960,6 +5043,72 @@ mod tests {
         assert_eq!(gs.cur_mana, 150);
         assert_eq!(gs.max_mana, 400, "spend must not lower max");
         assert!((gs.mana_pct - 37.5).abs() < 1e-3, "150/400 = 37.5%, got {}", gs.mana_pct);
+    }
+
+    /// Builds a minimal-but-full-length RoF2 PlayerProfile payload (>=13285 bytes) with the given
+    /// coin at the real wire offsets (@13269 platinum .. @13281 copper), so `apply_player_profile`
+    /// takes the coin-reconciliation path rather than the short/legacy-payload fallback.
+    fn profile_payload_with_coin(coin: [u32; 4]) -> Vec<u8> {
+        let mut buf = vec![0u8; 14000];
+        buf[13269..13273].copy_from_slice(&coin[0].to_le_bytes());
+        buf[13273..13277].copy_from_slice(&coin[1].to_le_bytes());
+        buf[13277..13281].copy_from_slice(&coin[2].to_le_bytes());
+        buf[13281..13285].copy_from_slice(&coin[3].to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn player_profile_reconciles_a_silent_coin_desync() {
+        // #361: the inventory-full merchant-buy refusal silently takes the player's coin
+        // server-side (EQEmu client_packet.cpp: TakeMoneyFromPP @14261-14278 runs before the
+        // free-slot check @14282-14303 that can fail) with no echo at all. The next zone-in's
+        // OP_PlayerProfile is the only remaining source of truth — it must correct `gs.coin` and
+        // report the divergence, not silently adopt the server's figure with no trace.
+        use super::apply_player_profile;
+        let mut gs = GameState::new();
+        gs.coin = [10, 0, 0, 0];
+        gs.coin_confirmed = true; // we already had a real prior reading this session
+        gs.begin_shop_buy();      // a buy was sent and never confirmed either way
+
+        apply_player_profile(&mut gs, &profile_payload_with_coin([9, 0, 0, 0]));
+
+        assert_eq!(gs.coin, [9, 0, 0, 0], "must correct to the server's authoritative figure");
+        assert!(gs.coin_verified(), "the figure is now fresh from the source of truth");
+        assert!(gs.chat_events.iter().any(|e| e.kind == "coin_desync"),
+            "a real divergence must be surfaced as an event, not silently absorbed");
+        assert!(gs.messages.iter().any(|m| m.text.contains("Coin desync")),
+            "the desync must be visible in the message log too");
+    }
+
+    #[test]
+    fn player_profile_first_login_seeds_coin_without_a_false_desync_report() {
+        // A fresh session's first PlayerProfile must seed a real starting balance without ever
+        // being misreported as a "desync" against the arbitrary [0,0,0,0] startup default.
+        use super::apply_player_profile;
+        let mut gs = GameState::new();
+        assert!(!gs.coin_confirmed);
+
+        apply_player_profile(&mut gs, &profile_payload_with_coin([12, 3, 4, 5]));
+
+        assert_eq!(gs.coin, [12, 3, 4, 5]);
+        assert!(gs.coin_verified());
+        assert!(gs.coin_confirmed);
+        assert!(!gs.chat_events.iter().any(|e| e.kind == "coin_desync"),
+            "seeding the first real balance is not a desync");
+    }
+
+    #[test]
+    fn player_profile_agreeing_coin_reports_no_desync() {
+        use super::apply_player_profile;
+        let mut gs = GameState::new();
+        gs.coin = [9, 0, 0, 0];
+        gs.coin_confirmed = true;
+
+        apply_player_profile(&mut gs, &profile_payload_with_coin([9, 0, 0, 0]));
+
+        assert_eq!(gs.coin, [9, 0, 0, 0]);
+        assert!(!gs.chat_events.iter().any(|e| e.kind == "coin_desync"),
+            "a matching balance must not be reported as a desync");
     }
 
     // ── RoF2 Animation_Struct byte-layout tests ──────────────────────────────────────────────────
