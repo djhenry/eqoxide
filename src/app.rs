@@ -492,7 +492,8 @@ impl App {
 
         *load_status.lock().unwrap() = "Connecting to asset server…".to_string();
 
-        std::thread::spawn(move || {
+        // Named for the #380 crash-log panic hook — see `crash` module docs.
+        std::thread::Builder::new().name("zone-asset-loader".into()).spawn(move || {
             let set_status = |s: &str| { *load_status.lock().unwrap() = s.to_string(); };
 
             let cache = crate::asset_sync::CacheDirs::resolve();
@@ -540,7 +541,7 @@ impl App {
             *pending.lock().unwrap() = Some(PendingLoad {
                 zone_name, assets: opt_assets, collision, zone_map, zone_min, zone_max,
             });
-        });
+        }).expect("spawn zone-asset-loader thread");
     }
 
     /// Called each frame to check whether the background load thread has finished.
@@ -653,7 +654,7 @@ impl App {
             let url = self.asset_server_url.clone();
             let user = self.asset_user.clone();
             let pass = self.asset_pass.clone();
-            std::thread::spawn(move || {
+            std::thread::Builder::new().name("model-sync-worker".into()).spawn(move || {
                 let wcache = crate::asset_sync::CacheDirs::resolve(); // same XDG path; cheap
                 let sync = match crate::asset_sync::AssetSync::login(&url, &user, &pass) {
                     Ok(s) => s,
@@ -666,7 +667,7 @@ impl App {
                         Err(e) => tracing::warn!("model-sync worker: sync {set} failed: {e}"),
                     }
                 }
-            });
+            }).expect("spawn model-sync-worker thread");
             renderer.set_model_sync_tx(model_tx);
         }
         self.models_path = cache.models_dir();
@@ -679,7 +680,7 @@ impl App {
         let status = self.load_status.clone();
         let progress = self.sync_progress.clone();
         let done = self.sync_done.clone();
-        std::thread::spawn(move || {
+        std::thread::Builder::new().name("common-asset-loader".into()).spawn(move || {
             let result = (|| -> anyhow::Result<()> {
                 let sync = crate::asset_sync::AssetSync::login(&url, &user, &pass)?;
                 *status.lock().unwrap() = "Verifying assets…".to_string();
@@ -717,7 +718,7 @@ impl App {
                 Err(e) => Err(format!("Asset sync failed and no cached models: {e}")),
             };
             *done.lock().unwrap() = Some(final_result);
-        });
+        }).expect("spawn common-asset-loader thread");
         self.egui_ctx      = Some(egui_ctx);
         self.egui_state    = Some(egui_state);
         self.egui_renderer = Some(egui_renderer);

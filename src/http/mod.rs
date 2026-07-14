@@ -943,8 +943,16 @@ pub fn spawn_camera_server(
     // When `None`, scan upward from `port` for the first free port.
     exact_listener:   Option<std::net::TcpListener>,
 ) {
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().expect("http tokio runtime");
+    // Named (see #380 — a panic hook can only say WHICH thread died if the thread has a name;
+    // the default anonymous name would just show up as '<unnamed>' in the crash log).
+    std::thread::Builder::new()
+        .name("http-server".into())
+        .spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_name("http-tokio-worker")
+            .build()
+            .expect("http tokio runtime");
         rt.block_on(async move {
             let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, shared_collision, zone_cross, manual_move, hail, say, target, who_req, friends_list, friends_req, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, dialogue, nav_state, dialogue_click, chat_events, chat_send, spells, game_state, net_health, frame_profile, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until, respawn, pet_cmd, nav_avoid, read_book, guild, guild_action };
             // Versioned + grouped routes: /v1/<group>/<action>. Each group's `router()` defines
@@ -1006,7 +1014,8 @@ pub fn spawn_camera_server(
                 tracing::error!("camera HTTP: server error: {e}");
             }
         });
-    });
+    })
+    .expect("spawn http-server thread");
 }
 
 #[cfg(test)]

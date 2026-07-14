@@ -14,6 +14,9 @@ use winit::event_loop::EventLoop;
 
 fn main() {
     eqoxide::logging::init();
+    // Install the panic hook + fatal-signal handlers + heartbeat BEFORE anything else runs, so
+    // no thread can panic or fault before the client is able to say why (#380).
+    eqoxide::crash::install();
 
     // Parse + STRICTLY validate CLI args. We error out (with help) on anything malformed or
     // unrecognized rather than silently falling back to defaults — a silent fallback once made the
@@ -344,14 +347,25 @@ OPTIONS:
         let gss = game_state_snapshot.clone();
         let nh  = net_health_shared.clone();
         let md  = data_dir.join("maps");
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-            rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, 10, gt, nst, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, wr, fl, fq, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, pcm, sc, md, sd, cp, cu, rsp, cv, ni, pc, npv, nav, rb, gld, gla, gss, nh).await {
-                    tracing::error!("EQ: fatal: {e}");
-                }
-            });
-        });
+        // Named (not the default anonymous thread) so a panic here — the exact "worker thread
+        // dies quietly" risk #380 calls out — identifies itself in the crash log instead of
+        // showing up as thread '<unnamed>'. Its own tokio runtime's worker pool is named
+        // distinctly from the HTTP server's (see below) for the same reason.
+        std::thread::Builder::new()
+            .name("eq-net".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .thread_name("eq-net-tokio-worker")
+                    .build()
+                    .expect("tokio runtime");
+                rt.block_on(async {
+                    if let Err(e) = eq_net::run_login_flow(login_cfg, 10, gt, nst, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, wr, fl, fq, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, pcm, sc, md, sd, cp, cu, rsp, cv, ni, pc, npv, nav, rb, gld, gla, gss, nh).await {
+                        tracing::error!("EQ: fatal: {e}");
+                    }
+                });
+            })
+            .expect("spawn eq-net thread");
     }
 
     // HTTP server
@@ -511,5 +525,10 @@ OPTIONS:
     // out (it idles after sending OP_Logout + OP_SessionDisconnect), give it a moment, then exit.
     shutdown.store(true, Ordering::Relaxed);
     std::thread::sleep(std::time::Duration::from_millis(1500));
+    // Record the clean exit BEFORE actually exiting (#380). Its presence as the last line of the
+    // durable crash log is what makes its ABSENCE, after a run that's no longer running,
+    // diagnostic of an unclean death (a panic/signal record would be there instead — or, for an
+    // OOM-kill, neither, which the heartbeat file's last-write time can help distinguish).
+    eqoxide::crash::log_clean_shutdown();
     std::process::exit(0);
 }
