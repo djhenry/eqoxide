@@ -74,6 +74,22 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
                        reliable (#329/#353).",
         }))
     });
+    // Tiered clearance (#358): routes are normally planned with a body-width of margin from walls
+    // and drops. When the ONLY route to a goal is one that threads a narrow door or a tight bridge
+    // with no margin to spare, the planner falls back to the minimum clearance (exactly the
+    // character's own collision radius) — still genuinely walkable, but riskier. Report it: an agent
+    // that is being handed tight routes deserves to know it is, rather than just noticing it falls
+    // off things more often.
+    let nav_tight = s.shared_collision.read().unwrap().as_ref().and_then(|col| {
+        let n = col.tight_plans();
+        (n > 0).then(|| serde_json::json!({
+            "reason": "minimum_clearance_fallback",
+            "routes": n,
+            "detail": "no route existed at the preferred clearance, so these routes were planned at \
+                       the MINIMUM (the character's own collision radius) — they fit, but with no \
+                       margin from the walls and drops they pass. Expect tight doorways/bridges.",
+        }))
+    });
     let (guild_name, guild_id, guild_rank) = {
         let g = s.guild.lock().unwrap();
         (g.guild_name.clone(), g.guild_id, g.guild_rank)
@@ -161,6 +177,7 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // degraded mode when it is not (see `nav_degraded` above). An agent must be able to tell
         // "no route exists" from "this zone's pathing is known-unreliable".
         "nav_degraded": nav_degraded,
+        "nav_tight": nav_tight,
         // Per-phase frame timings (ms, EMA-smoothed); all zero unless --profile / EQ_PROFILE=1.
         // Render-owned — the one field here the render loop legitimately publishes.
         "frame_profile": frame_profile,

@@ -698,6 +698,10 @@ pub struct Collision {
     /// able to see that it is running: this is what `/v1/observe/debug` reports as `nav_degraded`.
     /// Relaxed: a diagnostic counter, never read for control flow.
     fallback_hits: std::sync::atomic::AtomicU64,
+    /// How many routes only existed at the MINIMUM clearance (`PLAYER_RADIUS`) — i.e. threaded a
+    /// narrow door or a tight bridge with no margin to spare. Surfaced as `nav_tight` so an agent is
+    /// never silently handed a riskier path than it thinks (`search_tiered`).
+    tight_plans: std::sync::atomic::AtomicU64,
     /// Optional water-region map (from the zone's `.wtr`). When present, find_path may DESCEND
     /// through water (swim down a canal/shaft) to a lower floor that has no walkable connection.
     water:     Option<std::sync::Arc<crate::region_map::RegionMap>>,
@@ -710,6 +714,63 @@ pub struct Collision {
     /// the network thread instead of an exhaustive scan that linkdead-ed the client (#204).
     zone_line_regions: Vec<(i32, [f32; 3])>,
 }
+
+/// The clearance a route is planned at BY DEFAULT — deliberately larger than the character.
+///
+/// Fitting is not walking. A route planned at exactly `PLAYER_RADIUS` is allowed to skim a wall, a
+/// cliff lip or the edge of a bridge with *zero* margin, and the walker — which slides on contact
+/// and gets shoved around by server position corrections — falls off it. So plan with room, and
+/// fall back to the minimum only where the roomy route does not exist (`search_tiered`).
+///
+/// **2 × `PLAYER_RADIUS`**: one radius to fit, one radius of margin. Chosen by measuring the
+/// fallback rate over 1200 start/goal pairs in the cached zones — the fraction of routes that only
+/// exist at the minimum clearance, i.e. where the second A* pass is spent for nothing:
+///
+/// | preferred | qeynos2 | gfaydark | freportw | akanon |
+/// |-----------|---------|----------|----------|--------|
+/// | 1.5 ×     |   0 %   |    0 %   |    8 %   |  32 %  |
+/// | **2.0 ×** | **0 %** |  **3 %** | **16 %** |**33 %**|
+/// | 2.5 ×     |   0 %   |     —    |   18 %   |  39 %  |
+/// | 3.0 ×     |   0 %   |     —    |   28 %   |  48 %  |
+///
+/// Routability is identical at every value (the fallback guarantees it) — what moves is how often
+/// the roomy tier fails. At 2× the generous tier still carries the large majority of routes in the
+/// open and city zones; by 3× the fallback is close to a coin-flip in the tight indoor ones
+/// (Ak'Anon's gnome tunnels), which is two searches to answer what one could. 2× buys a full
+/// body-width of standing room without making the exception the rule.
+pub const NAV_PREFERRED_CLEARANCE: f32 = crate::movement::PLAYER_RADIUS * 2.0;
+
+/// The share of a plan's remaining budget the GENEROUS clearance pass may spend before it is
+/// abandoned in favour of the minimum-clearance pass that actually decides the answer.
+///
+/// The roomy tier is an OPTIMISATION — a nicer route when one is cheaply available. The minimum tier
+/// is the one that knows whether a route exists at all, so it must never be starved by the tier that
+/// merely prefers a better one. Both passes share the CALLER'S single deadline (see `search_tiered`):
+/// giving each its own would make one plan cost two budgets, which on the net-thread local tier is
+/// how you get a #302-class stall.
+const GENEROUS_BUDGET_SHARE: f32 = 0.4;
+
+/// The generous pass's deadline: a SLICE of the caller's remaining budget, **never a fresh one**.
+///
+/// One plan, one budget. A pass that arms its own deadline makes a plan cost N budgets instead of
+/// one — and on the fine local tier, which still runs inline on the net thread every nav tick
+/// (#382), that is the #302 stall disease: two 150 ms budgets is a 300 ms net-thread stall. The
+/// deadline is materialised ONCE by the caller of this function so the split cannot drift as the
+/// clock runs between the two passes.
+///
+/// `None` in → `None` out: an unbudgeted plan (the worker) stays unbudgeted; this function must
+/// never INVENT a cap, only subdivide one. An already-expired budget yields an already-expired
+/// slice — the generous pass gets no time, the minimum pass still gets the honest answer.
+fn generous_deadline(caller: Option<std::time::Instant>, now: std::time::Instant)
+    -> Option<std::time::Instant> {
+    caller.map(|d| now + d.saturating_duration_since(now).mul_f32(GENEROUS_BUDGET_SHARE))
+}
+
+/// Plan cell size at or below which A* validates an edge by sweeping the character's whole
+/// collision volume instead of casting a centre ray — see `Collision::edge_clear` for the measured
+/// reason this is not simply "always". Sits above `navigation::LOCAL_CELL` (2u, the fine tier) and
+/// below the coarse whole-zone grid (8u).
+pub(crate) const SWEPT_EDGE_MAX_CELL: f32 = 4.0;
 
 impl Collision {
     /// Build the grid from zone geometry. `cell_size` is in EQ units.
@@ -794,7 +855,7 @@ impl Collision {
         let cell_size = cell_size.max(1.0);
         if tris.is_empty() || min[0] == f32::MAX {
             return Collision { tris, tri_nz, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0,
-                z_min: 0.0, z_max: 0.0, fallback_hits: Default::default(),
+                z_min: 0.0, z_max: 0.0, fallback_hits: Default::default(), tight_plans: Default::default(),
                 water: None, from_collision_mesh, zone_line_regions: Vec::new() };
         }
         let cols = (((max[0] - min[0]) / cell_size).ceil() as usize + 1).max(1);
@@ -817,7 +878,7 @@ impl Collision {
             }
         }
         Collision { tris, tri_nz, cells, origin: min, cell_size, cols, rows, z_min, z_max,
-            fallback_hits: Default::default(), water: None, from_collision_mesh, zone_line_regions: Vec::new() }
+            fallback_hits: Default::default(), tight_plans: Default::default(), water: None, from_collision_mesh, zone_line_regions: Vec::new() }
     }
 
     /// How many times the floor-normal filter's empty-column fallback has fired since zone load, i.e.
@@ -825,6 +886,10 @@ impl Collision {
     /// properly up-facing floor. `0` = the filter is doing its job everywhere it has been asked.
     /// Non-zero = this zone has mis-wound ground and nav is running degraded there. Reported to the
     /// agent as `nav_degraded` on `/v1/observe/debug` — a degraded mode must never be silent.
+    pub fn tight_plans(&self) -> u64 {
+        self.tight_plans.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn fallback_hits(&self) -> u64 {
         self.fallback_hits.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -1312,19 +1377,132 @@ impl Collision {
         self.nearest_hit_t(from, to).map_or(false, |t| t < 0.92)
     }
 
-    /// Can the player step from `from` to `to` without crossing a wall?
+    /// Is the LINE `from → to` unobstructed? A single centre ray, extended past `to` by `radius`.
     ///
-    /// The ray is extended past `to` by `radius` so the player stops a little short of
-    /// the wall instead of clipping into it. Caller should pass points at roughly chest
-    /// height (a couple units above the feet) so knee-high floor lips and stair edges
-    /// don't read as walls. Returns `true` (clear) when there is no zone geometry loaded.
-    pub fn path_clear(&self, from: [f32; 3], to: [f32; 3], radius: f32) -> bool {
+    /// This is a LINE-OF-SIGHT primitive — it answers "can I see/shoot from here to there", NOT
+    /// "can the character WALK from here to there". The character is a cylinder, not a line: use
+    /// `path_clear` for anything the walker has to physically traverse (#358).
+    pub fn line_clear(&self, from: [f32; 3], to: [f32; 3], radius: f32) -> bool {
         let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
         let dist = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
         if dist < 1e-5 { return true; }
         let ext = (dist + radius.max(0.0)) / dist;
         let target = [from[0] + d[0] * ext, from[1] + d[1] * ext, from[2] + d[2] * ext];
         self.nearest_hit_t(from, target).is_none()
+    }
+
+    /// The clearance test A* validates ONE GRID EDGE with, at plan resolution `cell`.
+    ///
+    /// Sweeps the character's collision volume (`path_clear`) on a FINE grid and casts a centre ray
+    /// (`line_clear`) on a COARSE one. That asymmetry is deliberate and it is the whole subtlety of
+    /// #358 — a cell-centre line is only the line the WALKER will actually walk when the grid is
+    /// fine enough:
+    ///
+    /// * On the FINE local tier (`navigation::LOCAL_CELL` = 2u) the centre line ≈ the walked line,
+    ///   and a corridor holds SEVERAL lateral cell choices. Rejecting the one edge that scrapes a
+    ///   wall just makes A* pick the cell one over — down the middle. This is the tier the walker
+    ///   steers along, and the only tier fine enough to even EXPRESS a route through a gap narrower
+    ///   than the character. Measured on the live gfaydark→butcher wedge: the coarse route had 0
+    ///   ray/capsule disagreements, the fine route had 2 — on exactly the segments the character
+    ///   was stuck on.
+    ///
+    /// * On the COARSE 8u tier a cell centre only has to have a FLOOR under it — it can sit 0.3u
+    ///   from a wall in a corridor the character walks down the middle of without trouble, and a
+    ///   corridor narrower than ~16u offers no laterally-adjacent cell to move to. Sweeping the
+    ///   volume along that arbitrary lattice line therefore does not reject *unwalkable corridors*,
+    ///   it rejects *corridors*. Measured over 1200 start/goal pairs in 10 cached zones: routable
+    ///   pairs fell 876 → 813 (−7%), and Ak'Anon — all narrow gnome tunnels — collapsed from 90/120
+    ///   to 55/120 (−29%). Sealing a third of a city is a worse bug than the one being fixed (#310
+    ///   removed a sub-radius planning fallback for the mirror-image reason), so the coarse tier
+    ///   stays a corridor SELECTOR validated by a ray, and the fine tier — re-planned every tick
+    ///   ahead of the walker — is what enforces that the volume actually fits.
+    pub fn edge_clear(&self, from: [f32; 3], to: [f32; 3], radius: f32, cell: f32) -> bool {
+        if cell <= SWEPT_EDGE_MAX_CELL { self.path_clear(from, to, radius) }
+        else { self.line_clear(from, to, radius) }
+    }
+
+    /// Can the player's COLLISION VOLUME travel from `from` to `to` without crossing geometry?
+    ///
+    /// The clearance test the planner validates a segment with **must be the same test the
+    /// controller moves under** (#358). It was not: this cast a single centre RAY while
+    /// `CharacterController` moves a cylinder of `movement::PLAYER_RADIUS`. A corner can be
+    /// ray-clear and capsule-blocked — the ray threads the gap, the shoulder does not — so A*
+    /// handed the walker routes it is physically incapable of following, and the controller's
+    /// slide-along-wall response then shoved it off-route and wedged it.
+    ///
+    /// The mismatch bites HARDEST on the fine local tier: at `navigation::LOCAL_CELL` = 2u the grid
+    /// can actually *express* a route through a sub-capsule gap, where the coarse 8u grid never
+    /// could. That is why the overlay showed the coarse line rounding the corner cleanly while the
+    /// fine line — the one the walker steers along — hugged the wall. Measured on the live
+    /// gfaydark→butcher wedge: coarse route = 0 ray/capsule disagreements, fine route = 2, both on
+    /// the segments the character was stuck on.
+    ///
+    /// So sweep the volume: the centre line plus both SHOULDERS, offset `±radius` perpendicular to
+    /// the horizontal motion. This is deliberately the exact feeler pattern `Collision::sweep` (the
+    /// mover's own swept-cylinder approximation, design §3.1) uses — the planner and the controller
+    /// now share one collision model, so "the planner says clear" and "the controller can traverse
+    /// it" cannot drift apart. Matching an *ideal* capsule instead would be a different (and
+    /// weaker) guarantee: it would agree with geometry the controller does not actually implement.
+    ///
+    /// Cost is 3 rays instead of 1. The A* edge test runs two of these (chest + feet) per edge; the
+    /// grid broad-phase keeps each ray to a handful of triangles.
+    ///
+    /// Returns `true` (clear) when there is no zone geometry loaded.
+    pub fn path_clear(&self, from: [f32; 3], to: [f32; 3], radius: f32) -> bool {
+        let d = [to[0] - from[0], to[1] - from[1]];
+        let hlen = (d[0] * d[0] + d[1] * d[1]).sqrt();
+        let r = radius.max(0.0);
+        // Purely vertical (or zero-length) motion has no horizontal shoulders to sweep.
+        if hlen < 1e-5 || r < 1e-5 { return self.line_clear(from, to, radius); }
+        let perp = [-d[1] / hlen * r, d[0] / hlen * r];
+        // Feelers ACROSS THE WHOLE DIAMETER, not just the two shoulders. Three rays (centre + both
+        // shoulders) leak on DIAGONAL motion: the shoulders are offset perpendicular to the travel
+        // direction, so against a wall the segment crosses at an angle, one shoulder starts already
+        // PAST the wall plane and the other never reaches it — both slide along the wall instead of
+        // across it, and the capsule threads a slot narrower than itself. Caught by mutation-testing
+        // this very fix: A* diagonally threaded a 2.5u slot with a 2.0u clearance, on an edge every
+        // one of the three rays called clear.
+        //
+        // Sampling the diameter at r/2 spacing closes it: a wall panel that ENDS inside the swept
+        // rectangle now has a feeler either side of its end. This is an approximation of a swept
+        // disc, not an exact one — a needle thinner than r/2 threading between feelers would still
+        // slip — but zone geometry is walls and panels, not needles, and it is the same family of
+        // approximation the mover itself uses.
+        //
+        // LIMIT (#381): the feelers are offset PERPENDICULAR to travel, so they cannot see a wall the
+        // segment runs ALONGSIDE — a ray parallel to a plane never intersects it. A segment skimming
+        // a wall within the body radius, but never crossing it, still reads clear at every feeler.
+        // This is pre-existing (the single centre ray was blind to it too) and it is the floor this
+        // fix cannot get below: measured end-to-end, fine waypoints whose capsule does not fit drop
+        // 0.657% -> 0.248% across five zones, but do not reach zero (akanon 0.65%, blackburrow
+        // 0.84%). Adding feelers cannot close it — no finite set of parallel rays can. The durable
+        // answer is a baked clearance field (#372/#378), not more rays. Do not "fix" it here.
+        const FEELERS: [f32; 5] = [-1.0, -0.5, 0.0, 0.5, 1.0];
+        FEELERS.iter().all(|&f| self.line_clear(
+            [from[0] + perp[0] * f, from[1] + perp[1] * f, from[2]],
+            [to[0] + perp[0] * f, to[1] + perp[1] * f, to[2]],
+            radius,
+        ))
+    }
+
+    /// Does the character have `clearance` of walkable GROUND all around `(east, north)` at `z`?
+    ///
+    /// The other hazard. `edge_clear`/`path_clear` sweep the character's volume against geometry
+    /// that is IN THE WAY — walls. Nothing in the search saw geometry that is MISSING: a cliff lip,
+    /// the edge of a bridge, a dock, a waterline. A route may therefore be perfectly wall-clear and
+    /// still run along the very brink of a drop, and the walker — which slides on contact and gets
+    /// shoved around by server position corrections — eventually goes over it.
+    ///
+    /// Probes the four axial directions at `clearance` (the same predicate and the same ±band as the
+    /// waypoint inset's `edge_ok`, so the search and the inset agree about what an "edge" is) and
+    /// requires ground within a tight vertical band of `z` at each. A drop below, a wall lip above,
+    /// and open water all read as "no ground" and so as an edge to keep away from.
+    pub fn ground_margin_ok(&self, east: f32, north: f32, z: f32, clearance: f32) -> bool {
+        if clearance <= 0.0 { return true; }
+        [(clearance, 0.0), (-clearance, 0.0), (0.0, clearance), (0.0, -clearance)]
+            .iter()
+            .all(|&(dx, dy)| self.nearest_floor(east + dx, north + dy, z, 3.0, 8.0)
+                .is_some_and(|f| (f - z).abs() <= 8.0))
     }
 
     /// ALL distinct walkable surface heights at `(east, north)` within `[ref_z - down, ref_z + up]`,
@@ -1402,7 +1580,7 @@ impl Collision {
     #[allow(clippy::too_many_arguments)]
     pub fn find_path_res(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]],
         allow_partial: bool, cell: f32, max_search: Option<f32>, aggro_buffer: f32, ctx: PlanCtx) -> Option<Vec<[f32; 3]>> {
-        let s = self.search(start, goal, radius, avoid, cell, max_search, aggro_buffer, ctx);
+        let (s, _tight) = self.search_tiered(start, goal, radius, avoid, cell, max_search, aggro_buffer, ctx);
         match s.path {
             Some((p, true)) => Some(p),
             Some((p, false)) if allow_partial => Some(p),
@@ -1422,7 +1600,7 @@ impl Collision {
     #[allow(clippy::too_many_arguments)]
     pub fn find_path_ex(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]],
         cell: f32, max_search: Option<f32>, aggro_buffer: f32, ctx: PlanCtx) -> PlanOutcome {
-        let s = self.search(start, goal, radius, avoid, cell, max_search, aggro_buffer, ctx);
+        let (s, _tight) = self.search_tiered(start, goal, radius, avoid, cell, max_search, aggro_buffer, ctx);
         match s.path {
             Some((p, true)) => PlanOutcome::Route(p),
             other => match s.limit {
@@ -1438,6 +1616,68 @@ impl Collision {
                 None => PlanOutcome::Unreachable(s.no_route.unwrap_or(NoRoute::SearchClosed)),
             },
         }
+    }
+
+    /// TIERED CLEARANCE (#358). Search at a GENEROUS clearance (`NAV_PREFERRED_CLEARANCE`) and fall
+    /// back to the MINIMUM one — exactly `movement::PLAYER_RADIUS` — only when no generous route
+    /// exists. Returns the answering search plus `tight`: the route only exists at the minimum, i.e.
+    /// it threads a narrow door or a tight bridge with no margin to spare.
+    ///
+    /// Why default above the character's own size: fitting is not walking. A route planned at exactly
+    /// `PLAYER_RADIUS` may skim a wall, a cliff lip or the edge of a bridge with zero margin, and the
+    /// walker — which slides on contact and is shoved around by server position corrections — falls
+    /// off it. Normal walking should have room.
+    ///
+    /// **The floor is `PLAYER_RADIUS` and it is not negotiable.** #310 removed a fallback that planned
+    /// at 0.5x and 0.25x `PLAYER_RADIUS`, threading gaps narrower than the character's real collision
+    /// radius and handing the walker routes it could not fit through. This is the mirror image, and the
+    /// distinction is the whole design: the DEFAULT is above the radius, the FALLBACK is AT it, never
+    /// under. If no route exists even at `PLAYER_RADIUS`, the honest answer is no route.
+    ///
+    /// **The generous tier is strictly BEST-EFFORT and can never starve the minimum tier.** The two
+    /// searches share ONE budget — the caller's — and the generous pass gets a slice of it, never a
+    /// budget of its own. Arming a fresh deadline per pass is how a plan quietly costs two budgets,
+    /// which on the net-thread local tier is the #302 stall disease; `PlanCtx` exists precisely so a
+    /// plan is bounded by one deadline no matter how many A* calls it makes. The deadline is
+    /// materialised ONCE, up front, so the split cannot drift as the clock runs.
+    ///
+    /// Only a COMPLETE generous route is accepted. A generous partial is not evidence the goal is
+    /// unreachable, only that it is unreachable *with room* — and the honest `Unreachable` /
+    /// `Exhausted` verdict (#337/#356) must always come from the minimum tier, which is the one that
+    /// knows whether a route exists at all.
+    #[allow(clippy::too_many_arguments)]
+    fn search_tiered(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]],
+        cell: f32, max_search: Option<f32>, aggro_buffer: f32, ctx: PlanCtx) -> (Search, bool) {
+        // The hard floor (#310). Never search below the radius the controller actually moves with.
+        let minimum = radius.max(crate::movement::PLAYER_RADIUS);
+        // Tiering is a ROUTE-CHOICE mechanism, and only a plan that actually chooses a route should
+        // pay for it. A BOUNDED plan (`max_search: Some`) is the fine local tier: it follows a carrot
+        // on a coarse route that was ALREADY chosen with room, inside a 40u window where there is no
+        // meaningful alternative to choose. Asking it for a roomy route buys nothing and costs a
+        // second search — on the net thread, every nav tick (#382). Measured on the production call
+        // (2u cell / 40u bound / 150 ms): the second pass adds ~30-60% mean on top of the sweep and
+        // DOUBLES the plans that overrun the budget (blackburrow 17 -> 30 of 240). So the local tier
+        // plans at the MINIMUM clearance and spends its budget on the question it exists to answer —
+        // does the character FIT — while the off-thread coarse planner (5 s) picks the roomy route.
+        let chooses_a_route = max_search.is_none();
+        let preferred = if chooses_a_route { minimum.max(NAV_PREFERRED_CLEARANCE) } else { minimum };
+        if preferred > minimum {
+            // Materialise the shared deadline ONCE, then hand the generous pass a slice of what is
+            // left. The minimum pass keeps the caller's ORIGINAL deadline, so the plan as a whole
+            // still finishes inside the one budget the caller armed, and the fallback always has the
+            // remainder of it to find the route that does exist.
+            let now = std::time::Instant::now();
+            let generous_ctx = PlanCtx { deadline: generous_deadline(ctx.deadline, now), ..ctx };
+            let s = self.search(start, goal, preferred, avoid, cell, max_search, aggro_buffer, generous_ctx);
+            if matches!(s.path, Some((_, true))) { return (s, false); }
+        }
+        let s = self.search(start, goal, minimum, avoid, cell, max_search, aggro_buffer, ctx);
+        let tight = preferred > minimum && matches!(s.path, Some((_, true)));
+        // Honesty: a tight route is a RISKIER route — no margin from the walls and drops it passes.
+        // An agent must be able to tell it is walking one, so count it; `/v1/observe/debug` reports
+        // it as `nav_tight`. A degraded mode must never be silent.
+        if tight { self.tight_plans.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        (s, tight)
     }
 
     /// One logical A* run: the char-anchored search, with the cell-centre-anchored retry for a
@@ -1757,6 +1997,18 @@ impl Collision {
         // limit DOES fire it is recorded, and the outcome says "Exhausted" — never "no route".
         let deadline = ctx.deadline;
         let mut limit: Option<PlanLimit> = None;
+        // How much walkable ground the route must keep around it (the LEDGE margin, enforced on the
+        // neighbour cell below). Asked for ONLY above the minimum clearance: at `PLAYER_RADIUS` the
+        // plan promises exactly "the character fits" — which is the promise that keeps a narrow
+        // bridge, gangplank or catwalk routable at all — and the GENEROUS tier layers standing room
+        // on top of it (`search_tiered`). A swim plan is exempt outright: a floating character has no
+        // ground under it by definition, so the probe would reject every cell it must cross.
+        let ledge_margin = if radius > crate::movement::PLAYER_RADIUS && floating_surface.is_none() {
+            radius
+        } else {
+            0.0
+        };
+        let mut margin_ok: std::collections::HashMap<(i32, i32, i32), bool> = std::collections::HashMap::new();
         // Aggro-avoidance (#67): softly bias A* AWAY from cells near NPCs so long routes skirt mob
         // camps instead of plowing through them and getting the player killed. Proactive (before
         // aggro) and faction-agnostic — the client has no broad faction data, so it avoids ALL
@@ -1839,10 +2091,14 @@ impl Collision {
             }
             expanded += 1;
             if expanded > MAX_NODES { limit = Some(PlanLimit::NodeCap); break; }
-            // Wall-clock cap, only when the caller armed one. Checked every 128 expansions —
-            // Instant::now() is ~20ns so the overhead is negligible, and the worst-case overrun is
-            // one 128-node batch.
-            if expanded & 0x7F == 0 && deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            // Wall-clock cap, only when the caller armed one. Checked every 32 expansions —
+            // `Instant::now()` is ~20ns so the overhead is still negligible, and the worst-case
+            // OVERRUN is one batch. The batch was 128; a node now costs several times more (the
+            // swept clearance test casts 5 feelers x 2 heights per edge instead of 2 rays, #358), so
+            // a 128-node batch overshoots the deadline by several times what it used to. The point of
+            // the cap is a bound on the net-thread stall, and that bound is `batch x cost-per-node` —
+            // when the cost per node goes up, the batch has to come down or the bound silently rots.
+            if expanded & 0x1F == 0 && deadline.is_some_and(|d| std::time::Instant::now() >= d) {
                 limit = Some(PlanLimit::Deadline);
                 break;
             }
@@ -1886,8 +2142,16 @@ impl Collision {
                     // real max step-up (STEP_UP + ground-snap ≈ 2.5u): a lip taller than the walker can
                     // mount blocks the edge, matching what the native client's feet-level sphere does.
                     const FEET_CLR: f32 = crate::movement::STEP_UP + 0.5;
-                    if !self.path_clear([a[0], a[1], cz + CHEST], [b[0], b[1], nf + CHEST], radius) { continue; }
-                    if !self.path_clear([a[0], a[1], cz + FEET_CLR], [b[0], b[1], nf + FEET_CLR], radius) { continue; }
+                    if !self.edge_clear([a[0], a[1], cz + CHEST], [b[0], b[1], nf + CHEST], radius, cell) { continue; }
+                    if !self.edge_clear([a[0], a[1], cz + FEET_CLR], [b[0], b[1], nf + FEET_CLR], radius, cell) { continue; }
+                    // LEDGE margin. The rays above only see geometry that is IN THE WAY; this is the
+                    // one test that sees geometry that is MISSING (a drop, a bridge edge, a
+                    // waterline). Only the GENEROUS tier asks for it: at the minimum tier the promise
+                    // is exactly "the character fits", which is what keeps a narrow bridge or a
+                    // gangplank routable at all (see `search_tiered`). Memoised per (cell, floor)
+                    // — a cell is reached from up to 8 neighbours and the probe is 4 column queries.
+                    if ledge_margin > 0.0 && !*margin_ok.entry(nkey).or_insert_with(||
+                        self.ground_margin_ok(b[0], b[1], nf, ledge_margin)) { continue; }
                     let step = (((dc * dc + dr * dr) as f32).sqrt()) * cell + (nf - cz).abs() * 0.5
                         + aggro_cost(b[0], b[1]);
                     let tentative = g_cur + step;
@@ -1932,7 +2196,7 @@ impl Collision {
                                 .max_by(|x, y| x.partial_cmp(y).unwrap_or(Ordering::Equal));
                             let Some(nf) = landing else { continue };
                             // arc clear: no wall between takeoff and landing (chest height).
-                            if !self.path_clear([a[0], a[1], cz + CHEST], [land[0], land[1], nf + CHEST], radius) {
+                            if !self.edge_clear([a[0], a[1], cz + CHEST], [land[0], land[1], nf + CHEST], radius, cell) {
                                 continue;
                             }
                             let nkey = (jc, jr, qf(nf));
@@ -2015,7 +2279,7 @@ impl Collision {
                             // step out — the ray starts at swim height, so it passes over
                             // the pit lip that blocks the ground-level climb ray.
                             let ray_z = surface.max(nf - STEP_H);
-                            if !self.path_clear([a[0], a[1], ray_z + CHEST], [b[0], b[1], nf + CHEST], radius) { continue; }
+                            if !self.edge_clear([a[0], a[1], ray_z + CHEST], [b[0], b[1], nf + CHEST], radius, cell) { continue; }
                             let step = (((dc * dc + dr * dr) as f32).sqrt()) * cell + (nf - cz) * 0.5
                                 + aggro_cost(b[0], b[1]);
                             let tentative = g_cur + step;
@@ -2075,7 +2339,7 @@ impl Collision {
                 // dry sewer) connect. It's directional (you fall DOWN); climbing back needs a real
                 // path. A per-unit fall cost makes A* prefer walking/stairs when a route exists.
                 const MAX_FALL: f32 = 120.0;
-                if self.path_clear([a[0], a[1], cz + CHEST], [b[0], b[1], cz + CHEST], radius) {
+                if self.edge_clear([a[0], a[1], cz + CHEST], [b[0], b[1], cz + CHEST], radius, cell) {
                     // The first surface you'd land on falling at b = highest floor below a real-step
                     // drop. (column_floors returns high→low, so `find` gives the first landing.)
                     if let Some(nf) = self.column_floors(b[0], b[1], cz, 0.0, MAX_FALL)
@@ -2166,8 +2430,15 @@ impl Collision {
         // corner is exactly this). Inset each waypoint away from any unwalkable side by ~the
         // collision radius: sample the floor a margin out in ±E/±N; a side with no floor in a tight
         // band around the waypoint's z is a wall/drop/water edge, so nudge away from it. Opposing
-        // walls (a narrow corridor) cancel out — the centre line is kept. A corner pushes diagonally
-        // inward, unwedging it.
+        // walls (a narrow corridor) cancel out — the centre line is kept. A corner pushes away from
+        // BOTH sides, unwedging it.
+        //
+        // NOTE (#358): this only sees sides where the FLOOR RUNS OUT — ledges, drops, waterlines. A
+        // wall standing on continuous floor is invisible to it (there is still floor a margin out,
+        // at the wall's foot), so the inset is not, and never was, what keeps a route off a WALL.
+        // Measured on the live gfaydark→butcher wedge: the inset moved not one waypoint, and the
+        // routes before and after widening the margin were byte-identical. Clearance from walls is
+        // enforced by the edge test (`edge_clear`), not here.
         let margin = radius.max(1.0).min(cell * 0.45);
         // Walkable a margin out = a floor exists within a tight vertical band of the waypoint (so a
         // wall lip above, a drop below, or water all read as "edge" and get avoided).
@@ -2184,9 +2455,23 @@ impl Collision {
             let len = (push[0] * push[0] + push[1] * push[1]).sqrt();
             if len > 0.0 {
                 let (nx, ny) = (x + push[0] / len * margin, y + push[1] / len * margin);
-                // Only apply the inset if the nudged point is itself on walkable ground (don't shove
-                // the waypoint across the cell into a different wall).
-                if edge_ok(nx, ny, z) { path[i] = [nx, ny, z]; }
+                // Two guards, because the inset faces two hazards and `edge_ok` only sees one.
+                //
+                // `edge_ok` asks "is there still FLOOR there" — it is what stops the nudge shoving a
+                // waypoint off the mesh. It is structurally incapable of seeing a WALL: `column_hits`
+                // discards every triangle with `tri_nz <= 0` before intersecting, so a vertical face
+                // can never be a `nearest_floor` hit. There is floor at a wall's foot, so `edge_ok`
+                // happily green-lights a nudge straight INTO one (#358).
+                //
+                // That was survivable while the inset was small, but the tiered planner (see
+                // `search_tiered`) now plans at a GENEROUS `radius`, which makes `margin` — and so
+                // the push — correspondingly bigger. A bigger push validated by a wall-blind guard is
+                // how you end up walking closer to walls than before. So also require the character's
+                // own collision volume to actually FIT where we are moving it: `footprint_clear` is
+                // the same ring test the controller's depenetration net uses.
+                if edge_ok(nx, ny, z) && self.footprint_clear(nx, ny, z, radius, 8) {
+                    path[i] = [nx, ny, z];
+                }
             }
         }
         // Snap the final waypoint to the exact goal only when we actually reached the goal cell; a
@@ -3090,6 +3375,407 @@ mod tests {
         assert!(f.is_some(), "nearest_floor should find the floor above");
         assert!((f.unwrap() - 10.0).abs() < 1e-3, "expected floor z=10, got {:?}", f);
     }
+
+    /// A 20x20 floor at z=0, plus a wall plane at east=10 broken by a `gap`-wide slot centred on
+    /// north=9 (a 2u nav-grid cell centre, so the FINE tier can actually try to thread it).
+    /// ONE PLAN, ONE BUDGET (#302/#382). The generous pass must take a SLICE of the caller's
+    /// deadline, never arm a fresh one — two passes each arming `NET_TIER_BUDGET_MS` is a 300 ms
+    /// stall on the net thread the fine tier still runs on, which is exactly the disease `PlanCtx`
+    /// exists to prevent.
+    #[test]
+    fn the_generous_pass_takes_a_slice_of_the_budget_never_a_fresh_one() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let caller = now + Duration::from_millis(crate::assets::NET_TIER_BUDGET_MS);
+
+        let g = generous_deadline(Some(caller), now).expect("a budgeted plan keeps a budget");
+        assert!(g <= caller,
+            "the generous pass may never outlive the budget the caller armed — that is two budgets \
+             for one plan (#302)");
+        let slice = g.duration_since(now).as_millis() as f32;
+        let whole = caller.duration_since(now).as_millis() as f32;
+        assert!((slice - whole * GENEROUS_BUDGET_SHARE).abs() < 2.0,
+            "expected {:.0}ms of the {whole:.0}ms budget, got {slice:.0}ms", whole * GENEROUS_BUDGET_SHARE);
+
+        // An UNBUDGETED plan (the off-thread worker) stays unbudgeted — never invent a cap.
+        assert_eq!(generous_deadline(None, now), None);
+        // An already-spent budget yields no time to the generous tier, and cannot resurrect any.
+        let spent = now - Duration::from_millis(10);
+        assert!(generous_deadline(Some(spent), now).unwrap() <= now);
+    }
+
+    /// Tiering is a route-CHOICE mechanism, so only a plan that chooses a route pays for it. The
+    /// BOUNDED local tier (`max_search: Some`) follows a carrot on a coarse route that was already
+    /// chosen with room, inside a 40u window with no meaningful alternative — so it plans at the
+    /// MINIMUM clearance and spends its budget on the question it exists to answer: does the
+    /// character FIT. Measured on the production call (2u cell / 40u bound / 150 ms, ON the net
+    /// thread): the second pass adds ~30-60% mean on top of the sweep and DOUBLES the plans that
+    /// overrun the budget (blackburrow 17 -> 30 of 240) while buying nothing (#382).
+    #[test]
+    fn the_bounded_local_tier_plans_at_the_minimum_clearance_not_the_generous_one() {
+        let r = crate::movement::PLAYER_RADIUS;
+        let col = slotted_wall(2.0 * r + 0.5); // fits the character, not the preferred margin
+        let (start, goal) = ([5.0, 9.0, 0.0], [15.0, 9.0, 0.0]);
+
+        // UNBOUNDED = route-choosing (the coarse planner, off-thread): the generous tier is tried,
+        // finds nothing, and the minimum-clearance fallback answers — and REPORTS itself as tight.
+        let (s, tight) = col.search_tiered(start, goal, r, &[], 2.0, None, 0.0, PlanCtx::default());
+        assert!(matches!(s.path, Some((_, true))), "the route exists at the minimum clearance");
+        assert!(tight, "a route that only exists at the minimum must report as tight");
+
+        // BOUNDED = local steering (the net-thread tier): straight to the minimum. No second search,
+        // and nothing to call "tight" — no roomier route was ever asked for, so none was denied.
+        let (s, tight) = col.search_tiered(start, goal, r, &[], 2.0, Some(60.0), 0.0, PlanCtx::default());
+        assert!(matches!(s.path, Some((_, true))),
+            "the local tier must still find the route the character fits through");
+        assert!(!tight, "a bounded local plan never asks for the generous tier, so it cannot be tight");
+    }
+
+    /// A COMPLETE tiered route, or `None` — the `allow_partial = false` question these tests ask.
+    /// Returns `(waypoints, tight)`; `tight` = the route only exists at the MINIMUM clearance.
+    fn tiered_route(col: &Collision, start: [f32; 3], goal: [f32; 3], radius: f32, cell: f32)
+        -> Option<(Vec<[f32; 3]>, bool)> {
+        let (s, tight) = col.search_tiered(start, goal, radius, &[], cell, None, 0.0, PlanCtx::default());
+        match s.path { Some((p, true)) => Some((p, tight)), _ => None }
+    }
+
+    fn slotted_wall(gap: f32) -> Collision {
+        let floor = MeshData {
+            positions: vec![[0.0, 0.0, 0.0], [20.0, 0.0, 0.0], [20.0, 0.0, 20.0], [0.0, 0.0, 20.0]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        // GLB axes -> world: east = p[2], north = p[0], height = p[1].
+        let (lo, hi) = (9.0 - gap / 2.0, 9.0 + gap / 2.0);
+        let panel = |n0: f32, n1: f32| MeshData {
+            positions: vec![[n0, 0.0, 10.0], [n1, 0.0, 10.0], [n1, 10.0, 10.0], [n0, 10.0, 10.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        Collision::build(&ZoneAssets {
+            terrain: vec![floor, panel(0.0, lo), panel(hi, 20.0)], objects: vec![], textures: vec![],
+        }, 2.0)
+    }
+
+    /// #358: the planner validated segments with a RAY while the controller moves a CYLINDER of
+    /// `PLAYER_RADIUS`. A 1.5u slot is wider than the ray (which has no width at all) and NARROWER
+    /// than the character (2 * PLAYER_RADIUS = 2.0u): the ray threads it, the shoulders do not.
+    /// `path_clear` must answer for the character's real volume, not for a line.
+    #[test]
+    fn path_clear_rejects_a_slot_the_ray_fits_through_but_the_character_does_not() {
+        let r = crate::movement::PLAYER_RADIUS;
+        let col = slotted_wall(1.5); // < 2 * PLAYER_RADIUS -> the character cannot fit
+        let (from, to) = ([5.0, 9.0, 3.0], [15.0, 9.0, 3.0]); // dead down the middle of the slot
+        // The LINE really is unobstructed — that is exactly why the old ray test said "clear".
+        assert!(col.line_clear(from, to, r), "the centre ray does thread the slot");
+        // ...but the character does not fit, so the planner must NOT call this segment clear.
+        assert!(!col.path_clear(from, to, r),
+            "path_clear must sweep the player's collision volume, not a ray: a {}u slot cannot pass \
+             a {}u-radius character", 1.5, r);
+        // A slot the character genuinely fits through stays passable — the fix must not seal doors.
+        let wide = slotted_wall(2.0 * r + 1.0);
+        assert!(wide.path_clear(from, to, r), "a slot wider than the character must stay clear");
+    }
+
+    /// The planner must not hand the walker a route through a gap its own collision volume cannot
+    /// pass. With the slot as the ONLY way through, the honest answer is "no route" — not a route
+    /// the character will wedge in. (Run on the FINE 2u tier: that is the tier that can express a
+    /// sub-capsule gap at all, and the tier the walker actually steers along.)
+    #[test]
+    fn find_path_refuses_a_gap_narrower_than_the_character() {
+        let r = crate::movement::PLAYER_RADIUS;
+        let narrow = slotted_wall(1.5);
+        let route = narrow.find_path_res([5.0, 9.0, 0.0], [15.0, 9.0, 0.0], r, &[], false, 2.0,
+            None, 0.0, PlanCtx::default());
+        assert!(route.is_none(),
+            "A* threaded a gap the character cannot fit through: {route:?}");
+        // Control: widen the slot past the character's diameter and the same route appears.
+        let wide = slotted_wall(2.0 * r + 1.0);
+        let route = wide.find_path_res([5.0, 9.0, 0.0], [15.0, 9.0, 0.0], r, &[], false, 2.0,
+            None, 0.0, PlanCtx::default());
+        assert!(route.is_some(), "a gap the character DOES fit through must stay routable");
+    }
+
+    /// The waypoint inset (#312) must never nudge a waypoint INTO a wall.
+    ///
+    /// Its original guard, `edge_ok(nudged)`, cannot prevent that — and not by accident:
+    /// `column_hits` discards every triangle with `tri_nz <= 0` before intersecting, so a vertical
+    /// face is *structurally incapable* of being a `nearest_floor` hit. There is floor at a wall's
+    /// foot, so `edge_ok` reports "walkable" right up against one. That was survivable while the
+    /// inset was small; the tiered planner now plans at a GENEROUS radius, which scales `margin` and
+    /// so the push. A bigger push behind a wall-blind guard walks the character CLOSER to walls than
+    /// before — so the push is also checked against the character's own collision volume.
+    #[test]
+    fn the_waypoint_inset_never_nudges_the_character_into_a_wall() {
+        let r = crate::movement::PLAYER_RADIUS;
+        // A corridor with a DROP on one side and a WALL on the other. The floor runs out at
+        // north 13.5; a wall stands on the floor at north 10. The route runs east between them, so
+        // the inset — pushing away from the drop, the only hazard `edge_ok` can see — is aimed
+        // squarely at the wall, which it cannot see at all.
+        let floor = MeshData { // east 0..40, north 0..12.5
+            positions: vec![[0.0, 0.0, 0.0], [12.5, 0.0, 0.0], [12.5, 0.0, 40.0], [0.0, 0.0, 40.0]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let wall = MeshData { // vertical plane at north = 10, spanning the corridor's whole length
+            positions: vec![[10.0, 0.0, 0.0], [10.0, 0.0, 40.0], [10.0, 10.0, 40.0], [10.0, 10.0, 0.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let col = Collision::build(&ZoneAssets {
+            terrain: vec![floor, wall], objects: vec![], textures: vec![] }, 8.0);
+        // The blind spot itself: there is floor at the wall's FOOT, so the inset's only guard reads
+        // "walkable" right up against it. `column_hits` drops every triangle with tri_nz <= 0 before
+        // intersecting, so a vertical face can never be a `nearest_floor` hit — by construction.
+        assert!(col.nearest_floor(20.0, 10.0, 0.0, 3.0, 8.0).is_some(),
+            "nearest_floor is structurally blind to the wall — that is the whole point");
+
+        let path = col.find_path([4.0, 12.0, 0.0], [36.0, 12.0, 0.0], r, &[], true)
+            .expect("a route along the corridor exists");
+        for p in &path {
+            assert!(col.footprint_clear(p[0], p[1], p[2], r, 8),
+                "the inset pushed a waypoint into the character's own collision volume at {p:?} — \
+                 it nudged away from the drop it CAN see, straight into the wall it CANNOT");
+        }
+    }
+
+    /// The DIAGONAL leak — found by mutation-testing this very fix, and the reason `path_clear`
+    /// samples the whole diameter instead of just the two shoulders.
+    ///
+    /// A* crossed a wall on a diagonal edge, (9,3) → (11,1), threading a 2.5u slot with a 2.0u
+    /// clearance — and all three of the original rays (centre + both shoulders) called it clear. On
+    /// a diagonal the shoulders are offset PERPENDICULAR to travel, so they slide ALONG the wall
+    /// rather than across it: one starts already past the wall plane, the other never reaches it.
+    /// The capsule threads a gap narrower than itself, which is the exact lie #358 exists to kill.
+    #[test]
+    fn path_clear_does_not_leak_through_a_slot_on_a_diagonal() {
+        let col = two_slot_wall(2.5, 6.0); // narrow slot spans north 1.75..4.25
+        // The diagonal that leaked: it crosses the wall inside the slot, but a 2.0u-clearance
+        // character does not fit through a 2.5u slot.
+        assert!(col.line_clear([9.0, 3.0, 3.0], [11.0, 1.0, 3.0], 2.0),
+            "the centre line really does thread the slot — that is why the ray test passed it");
+        assert!(!col.path_clear([9.0, 3.0, 3.0], [11.0, 1.0, 3.0], 2.0),
+            "DIAGONAL LEAK: a 2.0u-clearance character cannot fit a 2.5u slot, on any heading");
+        // ...and the orthogonal crossing was already rejected, then and now.
+        assert!(!col.path_clear([9.0, 3.0, 3.0], [11.0, 3.0, 3.0], 2.0));
+        // The slot IS passable at a clearance it genuinely fits (2.5u slot, 1.0u radius), on the
+        // diagonal too — the fix must not seal it.
+        assert!(col.path_clear([9.0, 3.0, 3.0], [11.0, 3.0, 3.0], 1.0),
+            "a slot the character fits through must stay clear");
+    }
+
+    /// The swept-edge cell threshold must actually COVER the tier the walker steers along. These two
+    /// numbers live in different modules and were coupled by a comment; a comment does not fail a
+    /// build. If `LOCAL_CELL` were raised above `SWEPT_EDGE_MAX_CELL`, the fine tier would silently
+    /// fall back to ray clearance and #358 would be un-fixed with every test still green.
+    #[test]
+    fn the_swept_edge_test_covers_the_tier_the_walker_actually_steers_along() {
+        assert!(crate::eq_net::navigation::LOCAL_CELL <= SWEPT_EDGE_MAX_CELL,
+            "the local tier ({}) is not covered by the swept edge test (<= {}) — the walker would \
+             be steered along ray-validated edges again (#358)",
+            crate::eq_net::navigation::LOCAL_CELL, SWEPT_EDGE_MAX_CELL);
+        // ...and the coarse whole-zone grid (8u) must stay OUTSIDE it — sweeping an 8u lattice line
+        // seals corridors (Ak'Anon: 90/120 routable pairs -> 55/120).
+        assert!(SWEPT_EDGE_MAX_CELL < 8.0, "the coarse tier must remain a ray-validated selector");
+    }
+
+    /// The coarse/fine asymmetry of `edge_clear` is a deliberate, MEASURED compromise, not an
+    /// oversight — pin it so it can't be "tidied" into either extreme. Sweeping the volume on the
+    /// coarse 8u lattice seals narrow corridors (Ak'Anon: 90/120 routable pairs → 55/120); casting
+    /// a ray on the fine tier is what let the walker be handed the unwalkable route in the first
+    /// place.
+    #[test]
+    fn edge_clear_sweeps_the_volume_at_the_resolution_the_walker_steers_along() {
+        let r = crate::movement::PLAYER_RADIUS;
+        let col = slotted_wall(1.5); // narrower than the character (2 * PLAYER_RADIUS)
+        let (from, to) = ([5.0, 9.0, 3.0], [15.0, 9.0, 3.0]);
+        // FINE tier (2u = navigation::LOCAL_CELL): the plan the walker actually steers along. The
+        // character's volume must fit, and a corridor here has lateral cells to detour into.
+        assert!(!col.edge_clear(from, to, r, 2.0),
+            "the fine tier must validate the character's collision VOLUME");
+        // COARSE tier (8u): a corridor SELECTOR over a lattice whose centre line is not the walked
+        // line — a ray. See `edge_clear` for the routability measurement behind this.
+        assert!(col.edge_clear(from, to, r, 8.0),
+            "the coarse tier must stay a ray — sweeping an 8u lattice line seals corridors");
+    }
+
+    /// A wall at east=10 with TWO ways through: a `narrow` slot centred on north=3 and a `wide` one
+    /// centred on north=15. Floor is 20x20 at z=0.
+    fn two_slot_wall(narrow: f32, wide: f32) -> Collision {
+        let floor = MeshData {
+            positions: vec![[0.0, 0.0, 0.0], [20.0, 0.0, 0.0], [20.0, 0.0, 20.0], [0.0, 0.0, 20.0]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let panel = |n0: f32, n1: f32| MeshData {
+            positions: vec![[n0, 0.0, 10.0], [n1, 0.0, 10.0], [n1, 10.0, 10.0], [n0, 10.0, 10.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        Collision::build(&ZoneAssets {
+            terrain: vec![
+                floor,
+                panel(0.0, 3.0 - narrow / 2.0),                 // ..narrow slot @ north 3..
+                panel(3.0 + narrow / 2.0, 15.0 - wide / 2.0),   // ..wide slot @ north 15..
+                panel(15.0 + wide / 2.0, 20.0),
+            ],
+            objects: vec![], textures: vec![],
+        }, 2.0)
+    }
+
+    /// The owner's requirement: walk with ROOM by default. Given a narrow door and a wide one, the
+    /// planner takes the wide one even though the narrow one is closer to the straight line — a
+    /// route that skims a wall is a route the walker slides into.
+    #[test]
+    fn find_path_prefers_the_route_with_room_when_one_exists() {
+        let r = crate::movement::PLAYER_RADIUS;
+        // Narrow: passable by the character (> 2r) but NOT with the preferred margin (< 2 * 2r).
+        // Wide: comfortably passable with the preferred margin.
+        let col = two_slot_wall(2.0 * r + 0.5, 2.0 * NAV_PREFERRED_CLEARANCE + 2.0);
+        let (path, tight) = tiered_route(&col, [5.0, 3.0, 0.0], [15.0, 3.0, 0.0], r, 2.0)
+            .expect("a route exists through both slots");
+        assert!(!tight, "a roomy route exists, so the planner must not report a tight one");
+        // It detoured NORTH to the wide slot instead of squeezing through the near, narrow one.
+        assert!(path.iter().any(|p| p[1] > 10.0),
+            "planner squeezed through the narrow slot instead of taking the roomy one: {path:?}");
+    }
+
+    /// ...but a narrow door must stay ROUTABLE. When the roomy route does not exist, fall back to the
+    /// minimum clearance and say so — a tight route is walkable, just riskier.
+    #[test]
+    fn find_path_falls_back_to_the_minimum_clearance_when_only_a_tight_route_exists() {
+        let r = crate::movement::PLAYER_RADIUS;
+        let col = slotted_wall(2.0 * r + 0.5); // fits the character, not the preferred margin
+        let before = col.tight_plans();
+        let (path, tight) = tiered_route(&col, [5.0, 9.0, 0.0], [15.0, 9.0, 0.0], r, 2.0)
+            .expect("a tight door must stay routable — sealing it is a worse bug (#310)");
+        assert!(!path.is_empty());
+        assert!(tight, "the planner must REPORT that this route only exists at minimum clearance");
+        assert_eq!(col.tight_plans(), before + 1,
+            "a tight route must be counted so `/v1/observe/debug` can surface `nav_tight` — a \
+             degraded mode must never be silent");
+    }
+
+    /// #310, the repeat offence: the fallback floor is `PLAYER_RADIUS` and NOTHING gets planned below
+    /// it. A gap narrower than the character is not a tight route, it is NO route — and saying so is
+    /// the whole point of #358.
+    #[test]
+    fn find_path_never_plans_below_the_player_radius() {
+        let r = crate::movement::PLAYER_RADIUS;
+        let col = slotted_wall(2.0 * r - 0.5); // narrower than the character
+        for asked in [r, r * 0.5, r * 0.25, 0.0] {
+            let route = tiered_route(&col, [5.0, 9.0, 0.0], [15.0, 9.0, 0.0], asked, 2.0);
+            assert!(route.is_none(),
+                "radius={asked}: planner threaded a gap the character cannot fit through. The \
+                 minimum clearance is PLAYER_RADIUS ({r}) and a caller asking for less does not \
+                 lower it (#310).");
+        }
+    }
+
+    /// The OTHER hazard. `edge_clear` sees geometry that is in the way; only `ground_margin_ok` sees
+    /// geometry that is MISSING. Route around the inside corner of a sheer drop and require the
+    /// route to keep its standing room from the brink — "walking near edges is a good way to fall
+    /// off them".
+    #[test]
+    fn find_path_keeps_its_standing_room_from_a_drop() {
+        // Floor is an L: east 0..8 (all north), plus east 8..20 for north 12..20.
+        // The rest — east 8..20, north 0..12 — is a VOID the character would fall into.
+        let quad = |e0: f32, e1: f32, n0: f32, n1: f32| MeshData {
+            positions: vec![[n0, 0.0, e0], [n1, 0.0, e0], [n1, 0.0, e1], [n0, 0.0, e1]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let col = Collision::build(&ZoneAssets {
+            terrain: vec![quad(0.0, 8.0, 0.0, 20.0), quad(8.0, 20.0, 12.0, 20.0)],
+            objects: vec![], textures: vec![],
+        }, 2.0);
+        assert!(!col.ground_margin_ok(9.0, 13.0, 0.0, NAV_PREFERRED_CLEARANCE),
+            "a point 1u from the brink has no standing room");
+        assert!(col.ground_margin_ok(12.0, 17.0, 0.0, NAV_PREFERRED_CLEARANCE),
+            "a point well inside the floor does");
+
+        // The straight line (4,4) -> (16,16) runs clean through the void, so A* must round the
+        // inside corner at (8,12) — the exact place a route hugs a drop.
+        let (path, _) = tiered_route(&col, [4.0, 4.0, 0.0], [16.0, 16.0, 0.0],
+            crate::movement::PLAYER_RADIUS, 2.0).expect("a route around the void exists");
+        // Every waypoint the walker is asked to stand on has a body-width of ground around it.
+        // (The final waypoint is snapped to the caller's exact goal, which is the caller's problem.)
+        for p in &path[..path.len() - 1] {
+            assert!(col.ground_margin_ok(p[0], p[1], p[2], NAV_PREFERRED_CLEARANCE),
+                "route hugs the brink of the drop at {p:?} — no standing room");
+        }
+    }
+
+    /// The case the waypoint inset CANNOT rescue, and therefore the case that justifies testing the
+    /// ledge margin inside the SEARCH rather than nudging waypoints afterwards.
+    ///
+    /// Two platforms joined by a short 3u CATWALK and a long 8u BRIDGE. The catwalk is wide enough
+    /// for the character (> 2 · PLAYER_RADIUS) and it is the direct line — but standing on it puts a
+    /// sheer drop barely a step away on both sides. The inset cannot fix that: nudging away from one
+    /// brink walks into the other, so the pushes cancel and the waypoint stays on the brink. Only the
+    /// search can fix it, by going round.
+    #[test]
+    fn find_path_takes_the_long_wide_bridge_over_the_short_narrow_catwalk() {
+        let r = crate::movement::PLAYER_RADIUS;
+        let quad = |e0: f32, e1: f32, n0: f32, n1: f32| MeshData {
+            positions: vec![[n0, 0.0, e0], [n1, 0.0, e0], [n1, 0.0, e1], [n0, 0.0, e1]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let col = Collision::build(&ZoneAssets {
+            terrain: vec![
+                quad(0.0, 10.0, 0.0, 20.0),    // platform A
+                quad(20.0, 30.0, 0.0, 20.0),   // platform B
+                quad(10.0, 20.0, 10.0, 13.0),  // CATWALK: 3u wide, on the direct line
+                quad(10.0, 20.0, 0.0, 6.0),    // BRIDGE: 6u wide, a detour to the south
+                                               // (void between them: north 6..10)
+            ],
+            objects: vec![], textures: vec![],
+        }, 2.0);
+        // The catwalk fits the character but has no standing room; the bridge has both.
+        assert!(col.ground_margin_ok(15.0, 11.5, 0.0, r), "the catwalk fits the character");
+        assert!(!col.ground_margin_ok(15.0, 11.5, 0.0, NAV_PREFERRED_CLEARANCE),
+            "...but there is a drop a step away on both sides");
+        assert!(col.ground_margin_ok(15.0, 3.0, 0.0, NAV_PREFERRED_CLEARANCE), "the bridge has room");
+
+        let (path, tight) = tiered_route(&col, [5.0, 11.0, 0.0], [25.0, 11.0, 0.0], r, 2.0)
+            .expect("both crossings exist");
+        assert!(!tight, "a roomy crossing exists, so the route must not be a tight one");
+        // It took the BRIDGE, not the direct catwalk.
+        assert!(path.iter().any(|p| p[1] < 6.0),
+            "planner walked the brink of the catwalk instead of detouring to the wide bridge — and \
+             the waypoint inset cannot save it (both sides are a drop, so the nudges cancel): {path:?}");
+        for p in &path[..path.len() - 1] {
+            assert!(col.ground_margin_ok(p[0], p[1], p[2], NAV_PREFERRED_CLEARANCE),
+                "route has no standing room at {p:?}");
+        }
+        // ...and when the catwalk is the ONLY crossing, it stays routable — as a TIGHT route.
+        let only_catwalk = Collision::build(&ZoneAssets {
+            terrain: vec![
+                quad(0.0, 10.0, 0.0, 20.0), quad(20.0, 30.0, 0.0, 20.0), quad(10.0, 20.0, 10.0, 13.0),
+            ],
+            objects: vec![], textures: vec![],
+        }, 2.0);
+        let (_, tight) = tiered_route(&only_catwalk, [5.0, 11.0, 0.0], [25.0, 11.0, 0.0], r, 2.0)
+            .expect("the only crossing must stay routable (#310) — sealing it is the worse bug");
+        assert!(tight, "a catwalk-only crossing is walkable, but it must REPORT as tight");
+    }
+
+    /// #358 drift guard: the clearance the PLANNER validates with and the radius the CONTROLLER
+    /// moves with are the same number, and the waypoint inset (#312) is never smaller than it.
+    /// An inset below the collision radius puts the capsule's shoulder inside the wall by
+    /// construction — which is what the old `.min(cell * 0.45)` clamp did on the fine 2u tier
+
+    /// The inset must deliver its margin from BOTH walls at an inside corner. A normalised diagonal
+    /// push spends the margin on the diagonal and leaves only `margin / √2` per wall — under the
 
     #[test]
     fn find_path_routes_around_a_partial_wall() {
