@@ -5,14 +5,52 @@ Keep this updated as tasks complete. (Older entries below are an ARCHIVE — see
 
 ---
 
-# CURRENT STATE (2026-07-13)
+# CURRENT STATE (2026-07-14)
 
-`main` is green. **CI now exists and enforces** `cargo build --release` + `cargo test --lib` on every
-PR (`.github/workflows/test.yml`). 687 tests. 18 PRs landed in one session.
+`main` is green. **CI enforces** `cargo build --release` + `cargo test --lib` on every PR
+(`.github/workflows/test.yml`).
 
-## Read this first: the `agent-honesty` label
+**Do not trust any count or sha in this file — RUN these.** Every hardcoded figure here has gone stale
+at least once, including during the review of the commit that corrected it (a reviewer's own corrected
+test count was wrong by the time it landed, because a PR merged mid-review):
+```bash
+git rev-parse --short origin/main                                     # current main
+cargo test --lib -- --list | tail -1                                  # real test count
+gh issue list -R djhenry/eqoxide --label agent-honesty --state open   # the live agent-honesty list
+gh issue view <N> -R djhenry/eqoxide --json state --jq .state         # is it ACTUALLY still open?
+```
+At the time of writing: `b66eb69`, **722 tests**, **14** open `agent-honesty` issues
+(#344 #347 #349 #355 #356 #360 #361 #366 #370 #371 #378 #386 #390 #391) — *all four figures produced by
+running the commands above, not by typing them.* **They are already decaying. Re-run them.**
 
-It is the project's top prioritization principle. 13 open issues carry it.
+## ⚠️ Read this FIRST: how the last handoff lied, so you don't repeat it
+
+The previous version of this file called #378 **"the owner's design."** It was not. The owner had
+said, verbatim:
+
+> *"**Could we** refactor this to be more intuitive? In OOP, I **would possibly** build a boundary
+> sweeper into which I could pass different kinds of detectors... (**might optionally** add MOB
+> avoidance...)"*
+
+A question with three hedges became, in three hops — an issue, then this file, then a session
+handoff prompt — **"the owner's design," priority #2, with a trait spec and acceptance criteria.**
+An agent then wrote a 785-line design doc against it. Nobody lied on purpose. Each hop just dropped
+one hedge.
+
+**The rule this produces, and it binds THIS FILE hardest:** when you record what the owner wants,
+**quote them or mark it as your inference.** Never launder a suggestion into a requirement. An agent
+reading this file has no independent channel to reality and cannot detect the promotion. *Precision
+without provenance reads as authority and is worse than no number at all.*
+
+The same disease produced a **fabricated conflict report** (an agent read a two-dot `git diff` as
+"PR #372 deletes nav_planner.rs" when the branch merely predated the file) and, in PR #372 itself,
+**four headline numbers that did not survive review** (see below). All three were caught by an
+independent reader. None would have been caught by the author.
+
+## Read this NEXT: the `agent-honesty` label
+
+It is the project's top prioritization principle. **Get the live count with the command above** —
+any number written here is already wrong.
 
 > **The client must never lie to the agent.** Every API response and every observable field must be
 > either TRUE, or an EXPLICIT failure the caller can distinguish. Never a confident falsehood.
@@ -32,50 +70,113 @@ Two hard-won process rules:
 
 ## NEXT UP
 
-1. **PR #372 — navmesh harness (open, additive-only, safe).** Pure Rust, **no C++ dep**. Touches no
-   client pathing. Phase 2 (wire behind `Collision::find_path`; per-zone bake + disk cache, blake3
-   invalidation) was gated on #374 + #377 — **both have landed**, so it can proceed. Its author asked
-   to **check in before wiring into `find_path`** — honour that. (That request came from the working
-   session, not the tracker; you cannot re-derive it from #372, so it is recorded here.) Query median
-   **1.5–2.8ms vs the grid's 150ms**. Caveat it raised *itself*: with #374+#377 in, the grid now works,
-   so the navmesh's case is narrower — it wins on (a) the grid still planning routes the walker
-   **cannot walk** (86.5%, 90 of 104, of its "wins" contain a rise above `STEP_UP`, max **773u**),
-   (b) O(1) honest unreachability, (c) native water + stacked tiers.
+**THE NAVMESH IS DEAD. THE GRID IS BANKED.** Owner's decision, 2026-07-14, on the evidence below.
+Do not restart it without reading the review on #372 first.
 
-2. **#378 — the traversability abstraction (owner's design; highest structural value).** One oracle
-   answering *"can the character be here / go there, at this clearance?"* with pluggable hazard
-   detectors (floor/ledge, wall, water; later mobs, players, danger zones). Today there are **four**
-   inconsistent, mutually-blind notions of "walkable" — the A* cell test (blind to the character's
-   radius), `edge_ok` (sees ledges but is **structurally blind to walls**; the code's own comment now
-   documents this honestly, corrected in 8a7bd0b — so do not go looking for a lying comment),
-   `path_clear` (rays vs a capsule), and the `avoid` set (bolted on). **#358, #379 and #381 would have
-   been *prevented* by this, not merely caught.** Perf: bake static hazards into a clearance field
-   (what #372 already does); keep only dynamic hazards as runtime detectors.
+1. **#386 — planner probes to 3.0u, the controller collides to 4.0u.** Head-height geometry (an
+   overhead beam, a low arch, a chest-high railing) is **clear to A\* and solid to the walker** — the
+   planner hands the walker routes it physically cannot follow. This is #358's signature in the
+   **height axis**, in the fatal orientation: the planner is the *permissive* one. Constants verified:
+   planner probes at `cz+2.5` (`FEET_CLR`, `assets.rs:2144`) and `cz+3.0` (`CHEST`, `assets.rs:1984`);
+   controller at `foot+0.5` / `foot+4.0` (`movement.rs:350-351`); the cylinder is ~6u tall.
+   ⚠️ `path_clear`'s doc (`assets.rs:1440-1445`) claims the planner and controller "**cannot drift
+   apart**" because they share `Collision::sweep` — but **`sweep` has ZERO production callers**
+   (`grep -rn '\.sweep('` → two unit tests). That false comment is *why* later wall/corner reports got
+   matched to #358 and deprioritised. **Do not just bump CHEST 3.0→4.0** — every prior tightening of
+   planner walkability has SEALED ZONES (the coarse capsule sweep cost **−29% route success in
+   akanon**, `assets.rs:1413-1415`). Measure route parity on the corpus before/after.
 
-3. **#382 — the fine (2u) plan still runs on the network thread.** #377 moved the **coarse** plan to a
+2. **#382 — the fine (2u) plan still runs on the network thread.** #377 moved the **coarse** plan to a
    worker (net-thread stall **1.6s → 4µs**, budget deleted). The fine plan still runs per-tick on the
    net thread under a 150ms budget — so it still can't tell "no route" from "I gave up", and is still
-   nondeterministic under load. #372 removes the fine tier entirely; otherwise extend `nav_planner`.
+   nondeterministic under load. **The navmesh is cancelled, so option (2) in that issue is dead: the
+   answer is option (1), extend `nav_planner`.**
 
-4. **#380 — the client can exit SILENTLY** (no panic, no log). Seen twice after a butcher zone-in; not
-   reproducible. **The client must not be able to die without recording why** — add a panic hook that
-   logs (incl. thread name); log clean shutdown so its absence is diagnostic. Check `dmesg` for OOM.
+3. **#379 / #381 — the nav-drift family** (plus **#358**, already CLOSED in `8a7bd0b` — context only,
+   do not go looking for it). Coarse commits to corridors the fine tier can't fit (no feedback channel,
+   so it re-proposes forever); the clearance sweep is blind to a wall the segment runs PARALLEL to.
+   **Same generator as #386: the planner and the walker hold different beliefs about what is solid.**
+   Treat these as ONE thread, not N parallel fixers — four independent fixers would produce four more
+   mutually-blind patches, which is exactly how this family got to four members.
 
-5. **Asset bugs — NOT client bugs; do not try to fix them in the client.**
-   - **#373** — `nektulos`/`arena` GLBs are **missing their terrain**: 95%/98% of EQEmu-walkable ground
-     has *no collision geometry at all*. **No client-side mitigation exists** (grid and navmesh read
-     the same absent geometry). Almost certainly the hole the **#150 underworld fall-guard** masks.
-   - **#375** — `highpass` bakes its pass from **inverted-wound art**, so the #353 normal filter deletes
-     65% of the zone's real ground. #374's column-bottom fallback **cannot** fix it (0 of 40,422). The
-     fix is `|nz|` classification + clearance (what #372 does: 39.3% → 99.2%).
+4. **#380 — the client can exit silently. DONE, MERGED (PR #387, on `main`).** The client now records
+   why it died: a panic hook (with thread name), hand-installed `sigaction` handlers for
+   SIGSEGV/SIGBUS/SIGILL/SIGABRT/SIGFPE with `SA_ONSTACK` + chaining, a labelled clean-shutdown marker,
+   and per-pid durable logs. **Root cause of the original incident remains UNKNOWN** — it was never
+   reproduced; what is fixed is that the *next* one will be self-diagnosing. It spawned three follow-ups:
+   **#390** (unbounded crash-log FILE COUNT — one pair per launch, forever, even for `--help`),
+   **#391** (pid reuse merges two runs into one log), **#392** (a crash before HTTP bind is anonymous).
+   ⚠️ **Keep the lesson, it is the most expensive one this project has bought twice:** PR #387's first
+   revision **shipped a client that could not start — with green CI** — because *no test ever called
+   `install_signal_handlers()`*. Its "obvious" fix would then have **deleted** the loud
+   `has overflowed its stack` message std already prints, manufacturing new silent deaths inside the PR
+   meant to end them. **A green suite over an unexercised code path is not evidence.**
+
+5. **#378 — traversability abstraction. STATUS: PROPOSAL, NOT SCHEDULED.** See the warning at the top
+   of this file — this was walked back from "the owner's design" to what it actually was: a hedged
+   suggestion. The *problem* it names is real and now has **four** confirmed children (#358, #379,
+   #381, #386). The *solution* in the issue is one agent's sketch. PR #385 is a design sketch, not an
+   approved plan. **Design it fresh if you pick it up; do not cite #378 as a requirement.**
+   The one part that IS genuinely the owner's, and stands: **tiered clearance** — walk with a
+   larger-than-player margin normally, fall back to exactly `PLAYER_RADIUS` only when no generous route
+   exists, and **NEVER below `PLAYER_RADIUS`** (#310 removed a sub-radius fallback that planned routes
+   the character could not fit through — do not re-introduce it).
+
+## What happened to the navmesh (PR #372) — do not re-litigate without reading this
+
+Reviewed adversarially; **Phase 2 CANCELLED**. Four headline numbers **did not survive**:
+- *"Navmesh finds 462 routes (27%) the grid cannot"* → **those "wins" are overwhelmingly grid TIMEOUTS,
+  not grid failures.** The harness bucketed a 150ms `PLAN_BUDGET` timeout as "no route" — **the #337
+  anti-pattern, inside the tool built to evaluate nav.** (Careful with the numbers: the *462* is from the
+  PR's original 1700-pair/34-zone self-sampled run. The review's **separate** re-instrumented run — 2200
+  pairs, 11 zones — found **567** navmesh-only routes, of which **548 (97%) were grid timeouts** and only
+  19 were genuine grid failures, with **50.4%** of all grid queries saturating the budget. The 97% is NOT
+  a breakdown of the 462; the two runs were never reconciled. The conclusion is solid; the composition
+  was sloppy, and this file said so wrong the first time.)
+- *"Query 1.5–2.8ms vs the grid's ~150ms" (~60×)* → **150ms is the grid's CAP, not its cost.** The grid's
+  median *is* the budget, exactly. A censored distribution; the speedup is undefined. Where the grid does
+  not saturate (qcat): grid 7.3ms vs navmesh 6.2ms — **comparable**.
+- *"Adjusted parity 99.18%"* → **the failing gate redefined to pass.** The "unwalkable" grid routes were
+  scored by absolute Δz vs `STEP_UP`, but `STEP_UP` is a *step height, not a slope limit*
+  (`MAX_WALK_GRADE = 1.2`). 125 of 238 were ordinary walkable **ramps**. The **"max 773u climb" does not
+  exist** — it is the final waypoint's goal-snap (`assets.rs:2477-2480`, verified;
+  the #372 review cited `:1885`, which is the WATER-anchoring block — a wrong citation this file
+  retyped without checking, and its own reviewer caught. Cite by reading, not by copying.).
+- *Raw parity 93.88%* → pairs were sampled from **the navmesh's own domain**, so ground it dropped could
+  never be sampled. Resampled neutrally from the EQEmu oracle: **83.5%**, and grid-only routes **+53%**.
+
+And the fix at its heart was **unsound**: `|nz|` slope classification (`navmesh.rs:379-380`) discards the
+sign, so **a flat ceiling (`|nz| = 1.0`) classifies as walkable floor** — #329 reproduced verbatim. Its
+two defences fail on a real EQ ceiling, which is a thin shell with **open air above it**. qcat survived
+only because it happens to have rock above its ceiling. **#375 is CLOSED as unsafe** for the same reason:
+porting `|nz|` into the shipping `nearest_floor` would re-open #329 in every zone nobody tested.
+Its worst-case query is **455ms, unbounded** — *worse* on the net thread than the grid's bounded 150ms.
+
+**What was real and survives:** bake ~0.4–0.9s median / 5.6s max (everfrost); ~800KB/zone (the honest
+extrapolation is **~450MB over the real 497-zone universe**, not the PR's "180MB for ~200 zones"); the
+water-surface layer works; and **EQ face winding genuinely is unreliable for outdoor terrain** — that
+observation is correct even though `|nz|` is not the fix. **My inference, not a decided plan:** a real
+fix likely belongs in the **asset pipeline** (`eqoxide_asset_server`, the producer), since the art
+itself is inverted and every downstream consumer inherits it. Nobody has decided this — re-derive it.
+
+## Asset bugs — NOT client bugs; do not try to fix them in the client
+- **#373** — `nektulos`/`arena` GLBs are **missing their terrain**: 95%/98% of EQEmu-walkable ground
+  has *no collision geometry at all*. **No client-side mitigation exists.** Almost certainly the hole
+  the **#150 underworld fall-guard** masks.
+- **highpass inverted winding** (was #375, now closed as unsafe): whatever the fix is, it is **NOT**
+  `|nz|` — discarding the normal's sign admits ceilings as floors (#329). #375's closure lists **two**
+  candidate directions and settles neither: (a) a clearance/headroom or anchoring discriminator that
+  does not depend on the winding sign, or (b) repair the winding in `eqoxide_asset_server` (the
+  producer). (b) is the one I'd favour — **but nobody has decided, so re-derive it, don't cite this.**
 
 ## Backlog (issues carry full repros + measurements)
 
-- **agent-honesty (13 open — get the live list with `gh issue list --label agent-honesty --state open`;
+- **agent-honesty (14 as of writing — RUN `gh issue list --label agent-honesty --state open`;
   do not trust this enumeration to stay current):** #347 (structural — "200 = queued" is systematically
   dishonest; single-slot mailboxes silently overwrite), #371 (`connected:true` means the SOCKET is
   alive, not the WORLD — a wedged zone keeps ACKing; needs an **active probe**), #361, #366, #370,
-  #363, #360, #349, #344 — plus #380, #378, #355, #356, already covered above.
+  #360, #349, #344, #386, #390, #391 — plus #378, #355, #356, covered above.
+  (**#363 and #380 are CLOSED** — they were listed here as open; do not chase them.)
 - **Nav:** #313 (grade capped on ascent only), #309 (no climb mechanic), #240 (moving platforms),
   #329 (qcat spawn pocket — the planner is correct now; the **controller** can't execute),
   #266 (a related but DISTINCT wedge — qeynos2 guild vault, portal/zone-transition routing; reopened
