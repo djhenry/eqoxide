@@ -14,6 +14,9 @@ use winit::event_loop::EventLoop;
 
 fn main() {
     eqoxide::logging::init();
+    // Install the panic hook + fatal-signal handlers + heartbeat BEFORE anything else runs, so
+    // no thread can panic or fault before the client is able to say why (#380).
+    eqoxide::crash::install();
 
     // Parse + STRICTLY validate CLI args. We error out (with help) on anything malformed or
     // unrecognized rather than silently falling back to defaults — a silent fallback once made the
@@ -52,7 +55,7 @@ OPTIONS:
             "--testzone" => testzone_mode = true,
             "--profile"  => profile_flag  = true,
             "--nav-debug" => nav_debug_flag = true,
-            "-h" | "--help" => { print!("{USAGE}"); std::process::exit(0); }
+            "-h" | "--help" => { print!("{USAGE}"); eqoxide::crash::exit("help", 0); }
             // accept both "--config <value>" and "--config=<value>"
             _ if arg == "--config" || arg.starts_with("--config=") => {
                 let value = if let Some(v) = arg.strip_prefix("--config=") {
@@ -62,13 +65,13 @@ OPTIONS:
                         Some(v) if !v.starts_with('-') => { idx += 1; v.clone() }
                         _ => {
                             eprintln!("error: --config requires a value (a profile name or config file path)\n\n{USAGE}");
-                            std::process::exit(2);
+                            eqoxide::crash::exit("bad-args", 2);
                         }
                     }
                 };
                 if value.is_empty() {
                     eprintln!("error: --config requires a non-empty value\n\n{USAGE}");
-                    std::process::exit(2);
+                    eqoxide::crash::exit("bad-args", 2);
                 }
                 login_cfg_arg = Some(value);
             }
@@ -81,7 +84,7 @@ OPTIONS:
                         Some(v) if !v.starts_with('-') => { idx += 1; v.clone() }
                         _ => {
                             eprintln!("error: --api-port requires a value (a TCP port 1-65535)\n\n{USAGE}");
-                            std::process::exit(2);
+                            eqoxide::crash::exit("bad-args", 2);
                         }
                     }
                 };
@@ -89,13 +92,13 @@ OPTIONS:
                     Ok(p) if p > 0 => api_port_arg = Some(p),
                     _ => {
                         eprintln!("error: --api-port must be a number 1-65535, got '{value}'\n\n{USAGE}");
-                        std::process::exit(2);
+                        eqoxide::crash::exit("bad-args", 2);
                     }
                 }
             }
             other => {
                 eprintln!("error: unrecognized argument '{other}'\n\n{USAGE}");
-                std::process::exit(2);
+                eqoxide::crash::exit("bad-args", 2);
             }
         }
         idx += 1;
@@ -113,7 +116,7 @@ OPTIONS:
     if login_cfg_arg.is_some() && !login_cfg_path.exists() {
         eprintln!("error: config file not found for --config {}: {}\n\n{USAGE}",
             login_cfg_arg.as_deref().unwrap_or(""), login_cfg_path.display());
-        std::process::exit(2);
+        eqoxide::crash::exit("bad-args", 2);
     }
     tracing::info!("renderer: loading login config from {}", login_cfg_path.display());
 
@@ -344,14 +347,25 @@ OPTIONS:
         let gss = game_state_snapshot.clone();
         let nh  = net_health_shared.clone();
         let md  = data_dir.join("maps");
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-            rt.block_on(async {
-                if let Err(e) = eq_net::run_login_flow(login_cfg, 10, gt, nst, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, wr, fl, fq, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, pcm, sc, md, sd, cp, cu, rsp, cv, ni, pc, npv, nav, rb, gld, gla, gss, nh).await {
-                    tracing::error!("EQ: fatal: {e}");
-                }
-            });
-        });
+        // Named (not the default anonymous thread) so a panic here — the exact "worker thread
+        // dies quietly" risk #380 calls out — identifies itself in the crash log instead of
+        // showing up as thread '<unnamed>'. Its own tokio runtime's worker pool is named
+        // distinctly from the HTTP server's (see below) for the same reason.
+        std::thread::Builder::new()
+            .name("eq-net".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .thread_name("eq-net-tokio-worker")
+                    .build()
+                    .expect("tokio runtime");
+                rt.block_on(async {
+                    if let Err(e) = eq_net::run_login_flow(login_cfg, 10, gt, nst, ge, ep, ei, zp, tl, tos, cts, atk, ctk, gr, gi, tor, ttr, ga, gd, gl, gk, gml, zc, hl, sy, tg, wr, fl, fq, at, by, sl, tr, mc, mv, gv, iv, lt, dc, ds, mg, dlg, dcl, cev, csd, ca, ms, st, co, pcm, sc, md, sd, cp, cu, rsp, cv, ni, pc, npv, nav, rb, gld, gla, gss, nh).await {
+                        tracing::error!("EQ: fatal: {e}");
+                    }
+                });
+            })
+            .expect("spawn eq-net thread");
     }
 
     // HTTP server
@@ -400,7 +414,7 @@ OPTIONS:
             Ok(l) => Some(l),
             Err(e) => {
                 eprintln!("error: --api-port {p} is unavailable ({e}). Free the port or choose another.");
-                std::process::exit(1);
+                eqoxide::crash::exit("api-port-unavailable", 1);
             }
         },
         None => None,
@@ -511,5 +525,9 @@ OPTIONS:
     // out (it idles after sending OP_Logout + OP_SessionDisconnect), give it a moment, then exit.
     shutdown.store(true, Ordering::Relaxed);
     std::thread::sleep(std::time::Duration::from_millis(1500));
-    std::process::exit(0);
+    // Record the clean exit BEFORE actually exiting (#380). Its presence as the last line of the
+    // durable crash log is what makes its ABSENCE, after a run that's no longer running,
+    // diagnostic of an unclean death (a panic/signal record would be there instead — or, for an
+    // OOM-kill, neither, which the heartbeat file's last-write time can help distinguish).
+    eqoxide::crash::exit("clean", 0);
 }

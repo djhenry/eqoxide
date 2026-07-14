@@ -54,7 +54,12 @@ async fn post_exit(State(s): State<HttpState>) -> (StatusCode, &'static str) {
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_secs(45)).await;
         tracing::warn!("exit: watchdog timeout — loop unresponsive, forcing process exit");
-        std::process::exit(0);
+        // Label it (#380): this exit fires EXACTLY when the render/gameplay loop is already wedged.
+        // An unlabelled exit(0) here would leave a post-mortem with "no clean-shutdown record, no
+        // panic, no signal, fresh heartbeat" — which the crash module documents as meaning
+        // OOM-kill. A wedge would then be confidently misreported as an OOM: an agent-honesty
+        // violation inside the agent-honesty fix. The reason string is the whole point.
+        crate::crash::exit("render-loop-wedged", 0);
     });
     (StatusCode::OK, "camping out, then shutting down (~30s)")
 }
