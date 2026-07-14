@@ -1,20 +1,115 @@
 # TODO
 
 Active work + bite-sized tasks for smaller agents to continue if the main session stops.
-Keep this updated as tasks complete.
+Keep this updated as tasks complete. (Older entries below are an ARCHIVE — see git history.)
 
-## IN REVIEW: UI overhaul (#162, agent "ui-dev", PR #170, branch worktree-ui-overhaul)
+---
 
-Complete and live-verified; awaiting review/merge of PR #170. Registry-driven
-window system in src/ui/ (see docs/ui-overhaul-design.md + ui-window-management.md):
-21 windows, RoF2 theme from the real TGAs, per-char persistence v2 incl. OS
-window geometry, non-closeable Window Selector, UI scaling, nav<->render sync
-via synthetic app_tx packets, pet commands (+/v1/pet/command), /v1/trainer/close.
-Follow-ups to file as issues after merge (design doc section 9): buff window
-(OP_Buff), bags/bank, spellbook contents, interactive loot, PC trade, item
-tooltips, respawn picker, hotbutton bar. Verification char: uidev/Uidev (lsid 40).
-Also observed (pre-existing, not from this branch): NPC say lines can show raw
-saylink framing in the message log for some opcodes (seen from Zamel in qeynos).
+# CURRENT STATE (2026-07-13)
+
+`main` is green. **CI now exists and enforces** `cargo build --release` + `cargo test --lib` on every
+PR (`.github/workflows/test.yml`). 687 tests. 18 PRs landed in one session.
+
+## Read this first: the `agent-honesty` label
+
+It is the project's top prioritization principle. 13 open issues carry it.
+
+> **The client must never lie to the agent.** Every API response and every observable field must be
+> either TRUE, or an EXPLICIT failure the caller can distinguish. Never a confident falsehood.
+>
+> An AI agent has no independent channel to reality — whatever the client reports IS its world. A
+> crash is *honest*. A silent wrong answer is undetectable, unrecoverable, and poisons every
+> decision downstream. **Silent-wrong-answer bugs outrank features AND crashes.**
+
+Two hard-won process rules:
+- **Verification hierarchy:** make the bad state *unrepresentable* > property-test the universals >
+  example-test + **mutation-check it** (revert the fix → confirm RED) > live-run to validate the
+  model's premises. **Never let a passing live run discharge a claim containing "never" / "always" /
+  "cannot"** — a race that usually wins is indistinguishable from one that cannot lose. (A `/follow`
+  deadlock passed live verification *by luck*; a pure-function test caught it.)
+- **Every PR gets an independent reviewer agent before merge.** That gate found a real, shipping
+  defect in *every* PR it examined — including three where the *fix* reintroduced the bug it fixed.
+
+## NEXT UP
+
+1. **PR #372 — navmesh harness (open, additive-only, safe).** Pure Rust, **no C++ dep**. Touches no
+   client pathing. Phase 2 (wire behind `Collision::find_path`; per-zone bake + disk cache, blake3
+   invalidation) was gated on #374 + #377 — **both have landed**, so it can proceed. Its author asked
+   to **check in before wiring into `find_path`** — honour that. (That request came from the working
+   session, not the tracker; you cannot re-derive it from #372, so it is recorded here.) Query median
+   **1.5–2.8ms vs the grid's 150ms**. Caveat it raised *itself*: with #374+#377 in, the grid now works,
+   so the navmesh's case is narrower — it wins on (a) the grid still planning routes the walker
+   **cannot walk** (86.5%, 90 of 104, of its "wins" contain a rise above `STEP_UP`, max **773u**),
+   (b) O(1) honest unreachability, (c) native water + stacked tiers.
+
+2. **#378 — the traversability abstraction (owner's design; highest structural value).** One oracle
+   answering *"can the character be here / go there, at this clearance?"* with pluggable hazard
+   detectors (floor/ledge, wall, water; later mobs, players, danger zones). Today there are **four**
+   inconsistent, mutually-blind notions of "walkable" — the A* cell test (blind to the character's
+   radius), `edge_ok` (sees ledges but is **structurally blind to walls**; the code's own comment now
+   documents this honestly, corrected in 8a7bd0b — so do not go looking for a lying comment),
+   `path_clear` (rays vs a capsule), and the `avoid` set (bolted on). **#358, #379 and #381 would have
+   been *prevented* by this, not merely caught.** Perf: bake static hazards into a clearance field
+   (what #372 already does); keep only dynamic hazards as runtime detectors.
+
+3. **#382 — the fine (2u) plan still runs on the network thread.** #377 moved the **coarse** plan to a
+   worker (net-thread stall **1.6s → 4µs**, budget deleted). The fine plan still runs per-tick on the
+   net thread under a 150ms budget — so it still can't tell "no route" from "I gave up", and is still
+   nondeterministic under load. #372 removes the fine tier entirely; otherwise extend `nav_planner`.
+
+4. **#380 — the client can exit SILENTLY** (no panic, no log). Seen twice after a butcher zone-in; not
+   reproducible. **The client must not be able to die without recording why** — add a panic hook that
+   logs (incl. thread name); log clean shutdown so its absence is diagnostic. Check `dmesg` for OOM.
+
+5. **Asset bugs — NOT client bugs; do not try to fix them in the client.**
+   - **#373** — `nektulos`/`arena` GLBs are **missing their terrain**: 95%/98% of EQEmu-walkable ground
+     has *no collision geometry at all*. **No client-side mitigation exists** (grid and navmesh read
+     the same absent geometry). Almost certainly the hole the **#150 underworld fall-guard** masks.
+   - **#375** — `highpass` bakes its pass from **inverted-wound art**, so the #353 normal filter deletes
+     65% of the zone's real ground. #374's column-bottom fallback **cannot** fix it (0 of 40,422). The
+     fix is `|nz|` classification + clearance (what #372 does: 39.3% → 99.2%).
+
+## Backlog (issues carry full repros + measurements)
+
+- **agent-honesty (13 open — get the live list with `gh issue list --label agent-honesty --state open`;
+  do not trust this enumeration to stay current):** #347 (structural — "200 = queued" is systematically
+  dishonest; single-slot mailboxes silently overwrite), #371 (`connected:true` means the SOCKET is
+  alive, not the WORLD — a wedged zone keeps ACKing; needs an **active probe**), #361, #366, #370,
+  #363, #360, #349, #344 — plus #380, #378, #355, #356, already covered above.
+- **Nav:** #313 (grade capped on ascent only), #309 (no climb mechanic), #240 (moving platforms),
+  #329 (qcat spawn pocket — the planner is correct now; the **controller** can't execute),
+  #266 (a related but DISTINCT wedge — qeynos2 guild vault, portal/zone-transition routing; reopened
+  pending live re-test. **Do not assume the #329 diagnosis carries over.**)
+  ⚠️ **Do NOT loosen `MAX_WALK_GRADE`** (1.2, `src/assets.rs:1933`) without re-measuring qcat. It is
+  what stops A* routing the character up into solid rock — the grade cap exists to prevent the
+  slope-wedge class (#205/#212), and #353's review kept it deliberately untouched. The margin was
+  reported as narrow in-session, but **that figure is recorded in no issue** — re-derive it before
+  you touch the constant, don't trust a remembered number.
+- **Test suite:** #355 (**4** surviving mutants — 2 in `packet_handler.rs`, 1 in `http/quests.rs`,
+  1 in `http/group.rs`), #356 (flaky wall-clock A* test — fix by surfacing `PlanOutcome`, **not** by
+  `#[ignore]`), #357 (2 ignored tests actually FAIL — character model reports **2× expected height**,
+  12.57 vs 6.00; real bug or stale fixture?).
+- **Features:** #226 (audio), #225 (split zone GLB), #194 (boats), #256 (item links).
+
+## Ops notes
+
+- **Remote build box:** `rbuild <worktree-dir> test --lib` (6-core/23GB, sccache+mold, idle). The local
+  box is 8-core/15GB and shared — a cold `--release` build there will stall you.
+- **NEVER `git stash`** in this repo — it is a **repo-global ref** and worktrees share it; it silently
+  destroyed an agent's work. Commit instead.
+- **One game account + one API port per agent.** EQ evicts the older session; sharing an account
+  corrupts other agents' live tests.
+- `pgrep -f 'eqoxide'` **matches your own command line.** It produced false "still running" reports
+  three separate times. Check the real process tree.
+
+---
+
+# ARCHIVE (older sessions — kept for context; see git history)
+
+## DONE: UI overhaul (#162, PR #170) — merged long ago
+Registry-driven window system in src/ui/ (docs/ui-overhaul-design.md + ui-window-management.md):
+21 windows, RoF2 theme from the real TGAs, per-char persistence v2, Window Selector, UI scaling,
+pet commands, /v1/trainer/close.
 
 ## DONE: client no longer reads ~/eq_assets at runtime (all assets via the asset server)
 
