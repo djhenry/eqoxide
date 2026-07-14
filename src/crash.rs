@@ -40,7 +40,12 @@
 //!   `eqoxide --help` left a `crash-<pid>.log` + `heartbeat-<pid>` pair behind, forever.
 //!   [`install`] now prunes crash/heartbeat files older than [`prune_max_age`] on every call
 //!   (cheap, unconditional — see [`prune_stale_files`]), and [`exit`] removes *this instance's*
-//!   heartbeat file before it exits, so a lingering heartbeat means something again.
+//!   heartbeat file before it exits, so a lingering heartbeat means something again. The prune is
+//!   gated on process liveness: a file whose embedded pid is still running is **never** deleted no
+//!   matter how old it looks, because a healthy long-lived client's crash log has a stale mtime by
+//!   design and unlinking it under its open [`CRASH_FD`] would make its *next* crash invisible —
+//!   #390's own blindness, one level worse (found in the PR #401 review; only dead runs' files are
+//!   eligible).
 //! - **#391 (pid reuse merges two runs' records).** The per-pid crash log used to be opened
 //!   `O_APPEND` and never truncated, so a process that reused a pid would append to a *dead*
 //!   run's file and both runs' records would sit in one file under one `pid=`. [`install`] now
@@ -161,7 +166,53 @@ fn prune_max_age() -> std::time::Duration {
     DEFAULT_PRUNE_MAX_AGE
 }
 
-/// Remove `crash-*`/`heartbeat-*` entries in `dir` whose mtime is at least `max_age` old.
+/// Extract the pid embedded in a `crash-<pid>.log` or `heartbeat-<pid>` filename.
+///
+/// The filenames are the only place the owning pid is recorded for pruning purposes, so the prune
+/// pass reads it back out to answer "is the process that owns this file still alive?" (see
+/// [`prune_stale_files`]). Returns `None` for any name that doesn't match the exact shape — which
+/// then, conservatively, is *not* pruned by the liveness path (age still governs it).
+fn pid_from_crash_filename(name: &str) -> Option<u32> {
+    let digits = if let Some(rest) = name.strip_prefix("crash-") {
+        rest.strip_suffix(".log")?
+    } else if let Some(rest) = name.strip_prefix("heartbeat-") {
+        rest
+    } else {
+        return None;
+    };
+    digits.parse::<u32>().ok()
+}
+
+/// Whether a process with this pid currently exists. `kill(pid, 0)` sends no signal; it only probes
+/// existence and permission. `rc == 0` = exists and signalable; `EPERM` = exists but owned by
+/// another user (still ALIVE — must be treated as alive, not dead); `ESRCH` = no such process.
+fn pid_is_alive(pid: u32) -> bool {
+    // pid 0 means "this process group" to kill(2), never a real per-instance pid; treat as not a
+    // liveness target so a malformed "crash-0.log" is governed by age alone.
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: `kill` with signal 0 performs only the existence/permission check, sends nothing, and
+    // is async-signal-safe. It cannot corrupt state.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Remove `crash-*`/`heartbeat-*` entries in `dir` that belong to a DEAD process and whose mtime is
+/// at least `max_age` old.
+///
+/// **The liveness gate is not optional (#390 HIGH, found in the PR #401 review).** A `crash-<pid>.log`
+/// is written once near process start and its mtime is only touched again on a panic/exit — it does
+/// NOT self-refresh the way the heartbeat does. So a perfectly healthy, long-lived client (this repo
+/// runs multi-day GM/listener characters) that simply hasn't crashed in `max_age` would, without this
+/// gate, have its crash log deleted out from under its still-open, leaked [`CRASH_FD`] by ANY other
+/// client's `install()`-time prune. A later real crash would then `write(2)` into an already-unlinked
+/// inode — a record no post-mortem can ever see, lost at process exit. That is precisely the blindness
+/// #390 exists to cure, reintroduced one level worse. So a file whose embedded pid is still alive is
+/// NEVER pruned, regardless of age; only genuinely-dead runs' files are.
 ///
 /// Cheap and unconditional by design: `install()` runs before argument parsing, so this must be
 /// safe to run on every launch — including a trivial `eqoxide --help` — without a daemon, a lock
@@ -185,6 +236,16 @@ fn prune_stale_files(dir: &std::path::Path, max_age: std::time::Duration) {
         };
         if !(name.starts_with("crash-") || name.starts_with("heartbeat-")) {
             continue;
+        }
+        // NEVER prune a live process's files, no matter how old the mtime looks. A quiet but
+        // healthy long-lived client's crash log has a stale mtime by design, and unlinking it under
+        // its open CRASH_FD would make its NEXT crash invisible (#390 HIGH). Only a genuinely dead
+        // run's files are eligible; pid reuse would only make us *keep* a stale file too long
+        // (harmless over-retention), never delete a live one.
+        if let Some(file_pid) = pid_from_crash_filename(name) {
+            if pid_is_alive(file_pid) {
+                continue;
+            }
         }
         let modified = match entry.metadata().and_then(|m| m.modified()) {
             Ok(m) => m,
@@ -409,11 +470,18 @@ pub fn log_exit(reason: &str, code: i32) {
 
 /// Log an intentional exit and then take it. Use in place of bare `std::process::exit`.
 ///
-/// Also removes this instance's heartbeat file (#390): every `process::exit` call in the binary
-/// goes through here, so this is the one place that can say "this pid is not coming back" for
-/// every kind of intentional exit, not just the fully-clean one. Without it the heartbeat directory
-/// accumulates one stale file per past launch that a post-mortem has to cross-reference by pid to
-/// ignore — noise around the one heartbeat file that actually matters (a *live* process's).
+/// Also removes this instance's heartbeat file (#390): every intentional `process::exit` in the
+/// **main `eqoxide` binary** goes through here (the offline `render_model`/`crash_probe` helper
+/// binaries have their own bare `process::exit`s and are not agent-driven clients), so for the real
+/// client this is the one place that can say "this pid is not coming back" for every kind of
+/// intentional exit, not just the fully-clean one. Without it the heartbeat directory accumulates
+/// one stale file per past launch that a post-mortem has to cross-reference by pid to ignore —
+/// noise around the one heartbeat file that actually matters (a *live* process's).
+///
+/// A panic/fatal-signal death does NOT come through here, so it leaves its heartbeat behind — but
+/// it also leaves a PANIC/FATAL record, so it is not anonymous, and the prune pass will reclaim
+/// that heartbeat later once the pid is both genuinely dead AND past `max_age` (the liveness gate in
+/// [`prune_stale_files`] correctly keeps it until then).
 pub fn exit(reason: &str, code: i32) -> ! {
     log_exit(reason, code);
     remove_heartbeat_file();
@@ -782,6 +850,22 @@ mod tests {
         LOG_HEALTHY.store(true, Ordering::Relaxed);
     }
 
+    /// A pid that is reliably NOT alive: spawn a trivial child, reap it, and return its now-freed
+    /// pid. Far more robust than hoping an arbitrary large constant happens to be unused on the test
+    /// box — which matters now that `prune_stale_files` skips *live* pids (#390 review). There is a
+    /// negligible reuse window between reap and use; the alternative (a hardcoded pid) is strictly
+    /// worse, since a collision there would be silent and permanent.
+    fn a_reliably_dead_pid() -> u32 {
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .or_else(|_| std::process::Command::new("true").spawn())
+            .expect("spawn a short-lived child to obtain a dead pid");
+        let pid = child.id();
+        child.wait().expect("reap the short-lived child");
+        assert!(!pid_is_alive(pid), "reaped child pid must read as dead for these tests to be valid");
+        pid
+    }
+
     #[test]
     fn paths_are_per_pid_so_concurrent_clients_do_not_share_a_log() {
         let _g = lock(&TEST_LOCK);
@@ -1067,8 +1151,10 @@ mod tests {
         let d = TempCrashDir::new("prune-pure");
         reset_globals();
 
-        let stale_crash = d.0.join("crash-999999.log");
-        let stale_heartbeat = d.0.join("heartbeat-999999");
+        // A genuinely DEAD pid: the liveness gate must let its stale files through to pruning.
+        let dead = a_reliably_dead_pid();
+        let stale_crash = d.0.join(format!("crash-{dead}.log"));
+        let stale_heartbeat = d.0.join(format!("heartbeat-{dead}"));
         std::fs::write(&stale_crash, "a run that is long gone\n").unwrap();
         std::fs::write(&stale_heartbeat, "1700000000").unwrap();
 
@@ -1076,8 +1162,49 @@ mod tests {
         // everything matching the prefixes without needing to fake an old mtime.
         prune_stale_files(&d.0, std::time::Duration::from_secs(0));
 
-        assert!(!stale_crash.exists(), "a stale crash log must be pruned");
-        assert!(!stale_heartbeat.exists(), "a stale heartbeat must be pruned");
+        assert!(!stale_crash.exists(), "a stale crash log from a DEAD pid must be pruned");
+        assert!(!stale_heartbeat.exists(), "a stale heartbeat from a DEAD pid must be pruned");
+    }
+
+    /// #390 HIGH (PR #401 review): a file with a STALE mtime but a LIVE pid must SURVIVE prune.
+    ///
+    /// The crash log's mtime is set once near process start and only touched on a panic/exit, so a
+    /// healthy long-lived client (this repo runs multi-day GM/listener chars) looks "stale" by age
+    /// alone. Deleting it out from under its still-open, leaked `CRASH_FD` would make its NEXT crash
+    /// write into an already-unlinked inode — invisible to every post-mortem. That is #390's own
+    /// blindness, one level worse. The original prune shipped with ZERO coverage of this gap.
+    ///
+    /// MUTATION CHECK: remove the `if pid_is_alive(file_pid) { continue; }` skip in
+    /// `prune_stale_files` → the live-pid file is pruned (max_age=0 makes every file "old") → RED.
+    #[test]
+    fn prune_never_deletes_a_live_pids_file_regardless_of_age() {
+        let _g = lock(&TEST_LOCK);
+        let d = TempCrashDir::new("prune-liveness");
+        reset_globals();
+
+        // Our own pid is, by definition, alive for the duration of this test.
+        let live = std::process::id();
+        let live_crash = d.0.join(format!("crash-{live}.log"));
+        let live_heartbeat = d.0.join(format!("heartbeat-{live}"));
+        std::fs::write(&live_crash, "a HEALTHY long-lived client's crash log\n").unwrap();
+        std::fs::write(&live_heartbeat, "1700000000").unwrap();
+
+        // A dead pid's file alongside it, to prove prune still removes those in the same pass — the
+        // gate discriminates by liveness, it doesn't just disable pruning.
+        let dead = a_reliably_dead_pid();
+        let dead_crash = d.0.join(format!("crash-{dead}.log"));
+        std::fs::write(&dead_crash, "a genuinely dead run\n").unwrap();
+
+        // max_age = 0: every file is old enough to prune, so ONLY the liveness gate can save one.
+        prune_stale_files(&d.0, std::time::Duration::from_secs(0));
+
+        assert!(
+            live_crash.exists(),
+            "a LIVE pid's crash log must NEVER be pruned regardless of age — unlinking it under its \
+             open CRASH_FD makes its next crash invisible (#390 HIGH)"
+        );
+        assert!(live_heartbeat.exists(), "a LIVE pid's heartbeat must never be pruned either");
+        assert!(!dead_crash.exists(), "a genuinely DEAD pid's file must still be pruned in the same pass");
     }
 
     /// A large `max_age` must leave recent files alone — pruning is a bound, not a purge.
@@ -1087,7 +1214,10 @@ mod tests {
         let d = TempCrashDir::new("prune-keep");
         reset_globals();
 
-        let fresh_crash = d.0.join("crash-123.log");
+        // A DEAD pid, so survival here is due to the AGE gate (fresh file), not the liveness gate —
+        // this test's job is to prove young files are kept.
+        let dead = a_reliably_dead_pid();
+        let fresh_crash = d.0.join(format!("crash-{dead}.log"));
         let unrelated = d.0.join("not-ours.txt");
         std::fs::write(&fresh_crash, "still-relevant\n").unwrap();
         std::fs::write(&unrelated, "leave me alone\n").unwrap();
@@ -1111,7 +1241,8 @@ mod tests {
         let d = TempCrashDir::new("prune-wiring");
         reset_globals();
 
-        let stale = d.0.join("crash-424242.log");
+        let dead = a_reliably_dead_pid();
+        let stale = d.0.join(format!("crash-{dead}.log"));
         std::fs::write(&stale, "a dead run's leftover\n").unwrap();
 
         std::env::set_var(CRASH_PRUNE_MAX_AGE_SECS_ENV, "0");
