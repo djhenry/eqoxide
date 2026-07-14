@@ -35,17 +35,19 @@ Two hard-won process rules:
 1. **PR #372 — navmesh harness (open, additive-only, safe).** Pure Rust, **no C++ dep**. Touches no
    client pathing. Phase 2 (wire behind `Collision::find_path`; per-zone bake + disk cache, blake3
    invalidation) was gated on #374 + #377 — **both have landed**, so it can proceed. Its author asked
-   to **check in before wiring into `find_path`** — honour that. Query median **639µs vs the grid's
-   150ms**. Caveat it raised *itself*: with #374+#377 in, the grid now works, so the navmesh's case is
-   narrower — it wins on (a) the grid still planning routes the walker **cannot walk** (86–96% of its
-   "wins" contain a rise above `STEP_UP`, max **773u**), (b) O(1) honest unreachability, (c) native
-   water + stacked tiers.
+   to **check in before wiring into `find_path`** — honour that. (That request came from the working
+   session, not the tracker; you cannot re-derive it from #372, so it is recorded here.) Query median
+   **1.5–2.8ms vs the grid's 150ms**. Caveat it raised *itself*: with #374+#377 in, the grid now works,
+   so the navmesh's case is narrower — it wins on (a) the grid still planning routes the walker
+   **cannot walk** (86.5%, 90 of 104, of its "wins" contain a rise above `STEP_UP`, max **773u**),
+   (b) O(1) honest unreachability, (c) native water + stacked tiers.
 
 2. **#378 — the traversability abstraction (owner's design; highest structural value).** One oracle
    answering *"can the character be here / go there, at this clearance?"* with pluggable hazard
    detectors (floor/ledge, wall, water; later mobs, players, danger zones). Today there are **four**
    inconsistent, mutually-blind notions of "walkable" — the A* cell test (blind to the character's
-   radius), `edge_ok` (sees ledges, **blind to walls**, while its comment claims otherwise),
+   radius), `edge_ok` (sees ledges but is **structurally blind to walls**; the code's own comment now
+   documents this honestly, corrected in 8a7bd0b — so do not go looking for a lying comment),
    `path_clear` (rays vs a capsule), and the `avoid` set (bolted on). **#358, #379 and #381 would have
    been *prevented* by this, not merely caught.** Perf: bake static hazards into a clearance field
    (what #372 already does); keep only dynamic hazards as runtime detectors.
@@ -69,16 +71,21 @@ Two hard-won process rules:
 
 ## Backlog (issues carry full repros + measurements)
 
-- **agent-honesty (13):** #347 (structural — "200 = queued" is systematically dishonest; single-slot
-  mailboxes silently overwrite), #341, #371 (`connected:true` means the SOCKET is alive, not the
-  WORLD — a wedged zone keeps ACKing; needs an **active probe**), #361, #366, #370, #379, #381.
+- **agent-honesty (13 open — get the live list with `gh issue list --label agent-honesty --state open`;
+  do not trust this enumeration to stay current):** #347 (structural — "200 = queued" is systematically
+  dishonest; single-slot mailboxes silently overwrite), #371 (`connected:true` means the SOCKET is
+  alive, not the WORLD — a wedged zone keeps ACKing; needs an **active probe**), #361, #366, #370,
+  #363, #360, #349, #344 — plus #380, #378, #355, #356, already covered above.
 - **Nav:** #313 (grade capped on ascent only), #309 (no climb mechanic), #240 (moving platforms),
-  #329/#266 (qcat spawn pocket — planner is correct now; the **controller** can't execute).
+  #329 (qcat spawn pocket — the planner is correct now; the **controller** can't execute),
+  #266 (a related but DISTINCT wedge — qeynos2 guild vault, portal/zone-transition routing; reopened
+  pending live re-test. **Do not assume the #329 diagnosis carries over.**)
   ⚠️ **Do NOT loosen `MAX_WALK_GRADE`** — in qcat a **3% margin** is the only thing stopping A* routing
   the character up into solid rock.
-- **Test suite:** #355 (2 surviving mutants in `packet_handler.rs`), #356 (flaky wall-clock A* test —
-  fix by surfacing `PlanOutcome`, **not** by `#[ignore]`), #357 (2 ignored tests actually FAIL —
-  character model reports **2× expected height**; real bug or stale fixture?).
+- **Test suite:** #355 (**4** surviving mutants — 2 in `packet_handler.rs`, 1 in `http/quests.rs`,
+  1 in `http/group.rs`), #356 (flaky wall-clock A* test — fix by surfacing `PlanOutcome`, **not** by
+  `#[ignore]`), #357 (2 ignored tests actually FAIL — character model reports **2× expected height**,
+  12.57 vs 6.00; real bug or stale fixture?).
 - **Features:** #226 (audio), #225 (split zone GLB), #194 (boats), #256 (item links).
 
 ## Ops notes
