@@ -2870,7 +2870,32 @@ mod tests {
         super::apply_consider(&mut gs, &reply);
         let m = gs.messages.back().unwrap().text.clone();
         assert!(m.contains("Guard_Phaeton") && m.contains("scowls"), "attitude line: {m}");
-        assert!(gs.target_con.is_some(), "con color must be set for the HUD tint");
+        // #355 M1: assert the con color's VALUE, not just is_some(). The con RGB must derive from
+        // the difficulty LEVEL (@12), never the faction/attitude (@8). Asserting only is_some()
+        // let a `con_color(level) -> con_color(faction)` mutation survive — the /observe/debug tint
+        // is the field an agent reads to decide "can I win this fight", so a wrong-but-present value
+        // is the worst class of lie.
+        assert_eq!(gs.target_con, Some(con_color(2)), "con tint must come from level (2=green), not faction (9)");
+    }
+
+    #[test]
+    fn apply_consider_con_color_comes_from_level_not_faction() {
+        // #355 M1, the lethal-mob scenario made explicit: a red-con (much higher level, would kill
+        // you) mob that also happens to hash to a low faction number must still tint RED. If the con
+        // color is (mis)computed from the faction field, this dangerous mob reports a SAFE green con
+        // and an agent picks a fight it cannot win. level and faction are chosen so con_color differs
+        // between them, so the mutation cannot hide.
+        let mut gs = GameState::new();
+        gs.entities.insert(77, test_entity(77, "a_dragon", 100.0));
+        gs.set_target(77);
+        let mut reply = [0u8; 20];
+        reply[4..8].copy_from_slice(&77u32.to_le_bytes());     // targetid
+        reply[8..12].copy_from_slice(&2u32.to_le_bytes());      // faction 2 -> con_color(2) = GREEN (safe)
+        reply[12..16].copy_from_slice(&13u32.to_le_bytes());    // level 13 -> con_color(13) = RED (lethal)
+        super::apply_consider(&mut gs, &reply);
+        assert_ne!(con_color(2), con_color(13), "test premise: the two inputs must map to different colors");
+        assert_eq!(gs.target_con, Some(con_color(13)),
+            "a lethal (level-13/red) mob must tint RED from its level, never GREEN from its faction (#355 M1)");
     }
 
     #[test]
@@ -3939,8 +3964,22 @@ mod tests {
     #[test]
     fn apply_wear_change_ignores_short_packet() {
         use super::apply_wear_change;
+        use crate::eq_net::protocol::SIZE_WEAR_CHANGE;
         let mut gs = GameState::new();
-        apply_wear_change(&mut gs, &[1, 2, 3]); // shorter than SIZE_WEAR_CHANGE; must not panic
+        // Craft a packet whose bytes, if the short-packet length guard were removed, would
+        // zero-pad (via `safe_read`) into a VALID-looking WearChange for the local player:
+        //   spawn_id = 0x0201 (= player_id), material = 17, slot/color = 0 (padded).
+        // #355 M2: the guard deletion survived because this test had ZERO assertions and
+        // `safe_read`'s zero-padding guarantees no panic — so "must not panic" proved nothing.
+        // A truncated packet must be REJECTED, not decoded into garbage equipment.
+        gs.player_id = 0x0201;
+        let short = [0x01u8, 0x02, 17, 0]; // len 4 < SIZE_WEAR_CHANGE (10)
+        assert!(short.len() < SIZE_WEAR_CHANGE, "test premise: packet is genuinely short");
+        apply_wear_change(&mut gs, &short); // must not panic AND must not mutate state
+        assert_eq!(gs.player_equipment, [0u32; 9],
+            "a short WearChange must be rejected by the length guard, not zero-pad-decoded \
+             into garbage equipment for the local player (#355 M2)");
+        assert_eq!(gs.player_equipment_tint, [[0u8; 3]; 9], "tint must also stay untouched");
     }
 
     #[test]
