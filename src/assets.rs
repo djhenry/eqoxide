@@ -489,50 +489,65 @@ pub struct Hit {
 /// for collision instead of the rendered terrain.
 pub const COLLISION_MESH_TAG: &str = "__collision__";
 
-/// Wall-clock safety net for a WHOLE nav plan run on the PATHFINDING WORKER THREAD (#340).
+/// The DETERMINISTIC runaway bound for a whole plan: a maximum number of node expansions (#394).
 ///
-/// History: A* used to run synchronously on the NETWORK thread, so a long search blocked the net
-/// loop until no position/keepalive packet went out and the server dropped the client as linkdead
-/// (#257, #302). The cap was 150 ms — and because it bounded the SEARCH rather than the answer, a
-/// search that hit it gave up and returned a greedy partial route that the walker drove into a
-/// wall (#337). The cap was protecting the net thread at the cost of the planner telling the truth.
+/// # This REPLACES a wall-clock budget, and that is the whole point
 ///
-/// The planner now runs on its own thread (`eq_net::nav_planner`), so **nothing real-time is
-/// waiting on it** and the search can run to COMPLETION: it either finds the route or closes the
-/// search space and says, honestly, that no route exists. This remains only as a safety net so a
-/// pathological zone can't pin a core forever — and when it fires the outcome is
-/// `PlanOutcome::Exhausted`, i.e. "I don't know", never "no route".
+/// The coarse worker used to carry `WORKER_PLAN_BUDGET_MS = 5_000` — a five-second wall clock. A wall
+/// clock makes the planner's answer **a function of how fast the machine is**: on a loaded runner the
+/// 5 s expired before a big zone's frontier closed, so a genuinely-unreachable goal came back
+/// `Exhausted(Deadline)` ("I don't know") on a slow box and `Unreachable(SearchClosed)` ("no route") on
+/// a fast one. That is not a lie — `Exhausted` is honest — but it is **nondeterministic**, and it is
+/// why `main`'s CI was intermittently red (`an_unreachable_goal_reports_unreachable_not_a_partial_route`
+/// failing under load). #377's claim that the budget was "deleted" and the planner "deterministic" was
+/// simply false: the budget was raised 150 ms → 5 s and moved off the net thread, not removed.
 ///
-/// It is the budget for the ENTIRE plan, not per A* call (`plan_path` makes up to 13): callers
-/// build ONE deadline (`PlanCtx::worker()`) and pass it to every call of the plan.
-pub const WORKER_PLAN_BUDGET_MS: u64 = 5_000;
+/// A NODE cap has the identical runaway protection — it stops a pathological search from pinning a
+/// core — but it is **machine-independent**: the same query expands the same nodes and returns the
+/// same `PlanOutcome` on my box, on CI, and on the user's, whatever the load. Hitting it yields
+/// `Exhausted(NodeCap)`, an honest and *reproducible* "I stopped looking".
+///
+/// **Chosen by measurement** (`worst_case_reachable_component`, over the biggest baked zones): the
+/// largest real reachable-component close is **everfrost, 1,121,438 nodes** (its 8 u nav grid is ~1.1M
+/// cells). That is the worst legitimate whole-zone "no route" the cap must let through as
+/// `SearchClosed` — and note it already EXCEEDED the previous `MAX_NODES = 1_000_000`, so main was
+/// silently truncating everfrost's honest closes into false `Exhausted`. This cap is ~7× above it, so a
+/// legitimate whole-zone close always reaches `SearchClosed`, with headroom for larger unmeasured zones,
+/// while still bounding a true runaway. It is the cap for the ENTIRE plan (`plan_path` makes up to 13
+/// A* calls); callers share ONE `PlanCtx`, so the plan is bounded by one budget, not one-per-call (#340).
+pub const MAX_NODES: usize = 8_000_000;
 
-/// Wall-clock budget for the FINE local tier, which still runs INLINE on the net thread every nav
-/// tick (`navigation.rs`). It is bounded to a 40u radius at 2u cells, so it is cheap in practice and
-/// this cap is a backstop, not a working limit.
+/// Deterministic node cap for the FINE local tier (#394). Replaces `NET_TIER_BUDGET_MS = 150`.
 ///
-/// **It is 150 ms because that is exactly what this tier had before the planner moved off the net
-/// thread** (it called `PlanCtx::default()`, which re-armed the old 150 ms `PLAN_BUDGET_MS` on every
-/// call). Tightening it is NOT free: an earlier version of this change cut it to 20 ms on the
-/// reasoning that "the net thread deserves a small cap", and gfaydark→butcherblock stopped crossing
-/// — the walker wedged 53 u short of the zone line, because threading that corner needs a fine plan
-/// the 20 ms cap was truncating. Verified by A/B against `main` on the live server. The coarse
-/// planner is what needed to come off this thread; the local tier's budget was never the problem, so
-/// it keeps the value it has always had.
-pub const NET_TIER_BUDGET_MS: u64 = 150;
+/// The fine search is bounded SPATIALLY — a 40 u window at 2 u cells, ~1257 XY cells × a few z-tiers —
+/// so its frontier genuinely closes at ~800–3700 nodes in practice (measured). This cap is therefore a
+/// pure runaway backstop that a real fine plan never hits; it exists so a pathological zone cannot spin
+/// the search unboundedly, and — like the coarse cap — it is a node count, not a clock, so the outcome
+/// is the same on every machine.
+///
+/// (In PR #394 the fine tier still runs inline on the net thread; the spatial bound is what keeps its
+/// cost small there. #382 moves it to its own worker.)
+pub const NET_TIER_NODE_CAP: usize = 40_000;
 
 /// Per-plan context for `find_path_res`: the things that must be shared across the several A* calls
 /// one logical plan makes, rather than re-armed per call.
 #[derive(Clone, Copy, Default)]
 pub struct PlanCtx {
-    /// Hard wall-clock deadline for the search, shared by every call in one plan so a plan's total
-    /// cost is bounded by ONE budget rather than one-per-call (#340).
+    /// The search's runaway bound: a maximum number of node expansions, shared by every A* call in one
+    /// plan so a plan's total cost is bounded by ONE budget rather than one-per-call (#340).
     ///
-    /// `None` = **NO time cap**: run the search to completion (bounded only by `MAX_NODES`). That is
-    /// the default because a time cap makes the result unfalsifiable — a `None` answer could mean
-    /// "no route" or "I ran out of clock", and the caller cannot tell (#356/#337). Only a caller
-    /// that is genuinely time-constrained (the net-thread local tier) arms a deadline.
-    pub deadline: Option<std::time::Instant>,
+    /// **This is a NODE COUNT, not a wall clock, and it deliberately CANNOT be a wall clock (#394).**
+    /// A wall-clock deadline made the planner's answer depend on machine speed: a genuinely-unreachable
+    /// goal in a big zone came back `Unreachable(SearchClosed)` on a fast box and `Exhausted(Deadline)`
+    /// on a slow/loaded one — the same question, two answers, which is what made CI intermittently red.
+    /// A node cap is reproducible: the same query expands the same nodes and returns the same
+    /// `PlanOutcome` on every machine. There is no `Option<Instant>` field here, and there is no method
+    /// that builds one, so a clock-dependent search is not merely discouraged — it is unrepresentable.
+    ///
+    /// `None` = the global `MAX_NODES` backstop. A caller may set a TIGHTER cap (the tiers do — see
+    /// [`WORKER_NODE_CAP`] / [`NET_TIER_NODE_CAP`]). Whichever bites, the outcome is
+    /// `Exhausted(NodeCap)` — an honest "I stopped looking", never a "no route".
+    pub node_cap: Option<usize>,
     /// Zone-point index of a `DRNTP` zone-line region we are routing to. When set, A* accepts
     /// arrival at ANY cell whose (XY, floor) lies inside that region — not just the one goal cell
     /// at the right tier. A region's representative point is an interior point of a VOLUME, so its
@@ -541,39 +556,42 @@ pub struct PlanCtx {
 }
 
 impl PlanCtx {
-    /// A context with a fresh whole-plan deadline `ms` from now, shared across the plan's A* calls.
-    pub fn budget_ms(ms: u64) -> Self {
-        PlanCtx {
-            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(ms)),
-            ..Default::default()
-        }
+    /// A context bounded by a fresh node cap, shared across the plan's A* calls.
+    pub fn with_node_cap(cap: usize) -> Self {
+        PlanCtx { node_cap: Some(cap), ..Default::default() }
     }
-    /// The pathfinding worker's context: a generous whole-plan safety net (see
-    /// [`WORKER_PLAN_BUDGET_MS`]). Nothing real-time waits on this thread.
-    pub fn worker() -> Self { Self::budget_ms(WORKER_PLAN_BUDGET_MS) }
-    /// The fine local tier's context: a hard, small cap, because this one still runs on the net
-    /// thread (see [`NET_TIER_BUDGET_MS`]).
-    pub fn net_tier() -> Self { Self::budget_ms(NET_TIER_BUDGET_MS) }
+    /// The pathfinding worker's context: bounded only by the global [`MAX_NODES`] backstop, which is
+    /// generous enough that a real whole-zone close reaches `SearchClosed` (chosen by measurement). Its
+    /// answer no longer depends on the clock (#394); nothing real-time waits on this thread.
+    pub fn worker() -> Self { Self::default() }
+    /// The fine local tier's context: a node-cap backstop (see [`NET_TIER_NODE_CAP`]); the tier is
+    /// really bounded by its 40u spatial window.
+    pub fn net_tier() -> Self { Self::with_node_cap(NET_TIER_NODE_CAP) }
     pub fn with_goal_region(mut self, idx: Option<i32>) -> Self {
         self.goal_region = idx;
         self
     }
 }
 
-/// Why a search stopped WITHOUT closing its frontier. Both mean "I don't know", never "no".
+/// Why a search stopped WITHOUT closing its frontier: it hit its node cap. Means "I don't know",
+/// never "no".
+///
+/// **This used to have a second variant, `Deadline` (a wall-clock timeout), and it was deleted on
+/// purpose (#394).** A wall-clock limit made the planner's answer machine-speed-dependent — the same
+/// unreachable goal reported `Unreachable` on a fast box and `Exhausted(Deadline)` on a slow one. There
+/// is now only ONE way a search can be cut short, it is a deterministic node count, and a wall clock
+/// cannot be reintroduced because `PlanCtx` can no longer hold one. Keeping the enum (rather than
+/// folding it away) leaves `PlanOutcome::Exhausted` a clean place to name future *deterministic* limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanLimit {
-    /// The wall-clock deadline in `PlanCtx` elapsed.
-    Deadline,
-    /// The node cap (`MAX_NODES`) was hit.
+    /// The node cap (`PlanCtx::node_cap`, or the global `MAX_NODES`) was hit.
     NodeCap,
 }
 
 impl PlanLimit {
     pub fn as_str(self) -> &'static str {
         match self {
-            PlanLimit::Deadline => "search_deadline",
-            PlanLimit::NodeCap  => "search_node_cap",
+            PlanLimit::NodeCap => "search_node_cap",
         }
     }
 }
@@ -740,30 +758,27 @@ pub struct Collision {
 /// body-width of standing room without making the exception the rule.
 pub const NAV_PREFERRED_CLEARANCE: f32 = crate::movement::PLAYER_RADIUS * 2.0;
 
-/// The share of a plan's remaining budget the GENEROUS clearance pass may spend before it is
-/// abandoned in favour of the minimum-clearance pass that actually decides the answer.
+/// The share of a plan's node budget the GENEROUS clearance pass may spend before it is abandoned in
+/// favour of the minimum-clearance pass that actually decides the answer.
 ///
 /// The roomy tier is an OPTIMISATION — a nicer route when one is cheaply available. The minimum tier
 /// is the one that knows whether a route exists at all, so it must never be starved by the tier that
-/// merely prefers a better one. Both passes share the CALLER'S single deadline (see `search_tiered`):
-/// giving each its own would make one plan cost two budgets, which on the net-thread local tier is
-/// how you get a #302-class stall.
+/// merely prefers a better one. Both passes share the CALLER'S single node budget (see `search_tiered`):
+/// giving each its own would make one plan cost two budgets.
 const GENEROUS_BUDGET_SHARE: f32 = 0.4;
 
-/// The generous pass's deadline: a SLICE of the caller's remaining budget, **never a fresh one**.
+/// The generous pass's node cap: a SLICE of the caller's budget, **never a fresh one** (#394).
 ///
-/// One plan, one budget. A pass that arms its own deadline makes a plan cost N budgets instead of
-/// one — and on the fine local tier, which still runs inline on the net thread every nav tick
-/// (#382), that is the #302 stall disease: two 150 ms budgets is a 300 ms net-thread stall. The
-/// deadline is materialised ONCE by the caller of this function so the split cannot drift as the
-/// clock runs between the two passes.
+/// One plan, one budget. A pass that arms its own cap makes a plan cost N budgets instead of one. The
+/// cap is subdivided ONCE by the caller of this function so the two passes together stay within the one
+/// budget the caller set.
 ///
-/// `None` in → `None` out: an unbudgeted plan (the worker) stays unbudgeted; this function must
-/// never INVENT a cap, only subdivide one. An already-expired budget yields an already-expired
-/// slice — the generous pass gets no time, the minimum pass still gets the honest answer.
-fn generous_deadline(caller: Option<std::time::Instant>, now: std::time::Instant)
-    -> Option<std::time::Instant> {
-    caller.map(|d| now + d.saturating_duration_since(now).mul_f32(GENEROUS_BUDGET_SHARE))
+/// `None` in → `None` out: an unbudgeted plan stays unbudgeted (bounded only by the global `MAX_NODES`
+/// backstop); this function must never INVENT a cap, only subdivide one. A node cap, unlike the
+/// wall-clock deadline this replaced, does not "run down" between the passes — it is a fixed budget,
+/// so the split is a plain fraction with no clock to drift.
+fn generous_node_cap(caller: Option<usize>) -> Option<usize> {
+    caller.map(|cap| ((cap as f32) * GENEROUS_BUDGET_SHARE) as usize)
 }
 
 /// Plan cell size at or below which A* validates an edge by sweeping the character's whole
@@ -1645,6 +1660,13 @@ impl Collision {
     /// unreachable, only that it is unreachable *with room* — and the honest `Unreachable` /
     /// `Exhausted` verdict (#337/#356) must always come from the minimum tier, which is the one that
     /// knows whether a route exists at all.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn search_tiered_for_test(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]],
+        cell: f32, max_search: Option<f32>, aggro_buffer: f32, ctx: PlanCtx) -> (Search, bool) {
+        self.search_tiered(start, goal, radius, avoid, cell, max_search, aggro_buffer, ctx)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn search_tiered(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]],
         cell: f32, max_search: Option<f32>, aggro_buffer: f32, ctx: PlanCtx) -> (Search, bool) {
@@ -1662,12 +1684,11 @@ impl Collision {
         let chooses_a_route = max_search.is_none();
         let preferred = if chooses_a_route { minimum.max(NAV_PREFERRED_CLEARANCE) } else { minimum };
         if preferred > minimum {
-            // Materialise the shared deadline ONCE, then hand the generous pass a slice of what is
-            // left. The minimum pass keeps the caller's ORIGINAL deadline, so the plan as a whole
-            // still finishes inside the one budget the caller armed, and the fallback always has the
-            // remainder of it to find the route that does exist.
-            let now = std::time::Instant::now();
-            let generous_ctx = PlanCtx { deadline: generous_deadline(ctx.deadline, now), ..ctx };
+            // Hand the generous pass a SLICE of the caller's node budget. The minimum pass keeps the
+            // caller's ORIGINAL cap, so the plan as a whole still finishes inside the one budget the
+            // caller set, and the fallback always has the full budget to find the route that exists.
+            // A node cap needs no "materialise once" dance — it does not run down between the passes.
+            let generous_ctx = PlanCtx { node_cap: generous_node_cap(ctx.node_cap), ..ctx };
             let s = self.search(start, goal, preferred, avoid, cell, max_search, aggro_buffer, generous_ctx);
             if matches!(s.path, Some((_, true))) { return (s, false); }
         }
@@ -1982,20 +2003,17 @@ impl Collision {
             best.map(|(c, r, _)| (c, r)).unwrap_or((sc, sr))
         };
         const CHEST: f32 = 3.0;
-        // The node cap is the ONLY bound on a search once the wall-clock budget is gone, so it also
-        // decides whether the definitive verdict `Unreachable(SearchClosed)` can ever be reached. At
-        // 200k it could NOT be, in exactly the zones where it matters most: gfaydark's 8u nav grid is
-        // ~390k cells, so a whole-zone flood hit the cap and downgraded to `Exhausted` ("I don't
-        // know") even when the frontier really was closable. Raised so a large zone can actually be
-        // surveyed to completion and told "no". Nothing real-time waits on this thread; the worker's
-        // 5 s safety net still bounds a pathological search, and it now bounds it HONESTLY (#377
-        // review, N3).
-        const MAX_NODES: usize = 1_000_000;
-        // Wall-clock deadline: ONLY if the caller armed one (`PlanCtx`). `None` = run to completion.
-        // The planner no longer runs on the net thread, so there is nothing real-time to protect and
-        // no reason to make the answer unfalsifiable by cutting the search short (#340/#356). When a
-        // limit DOES fire it is recorded, and the outcome says "Exhausted" — never "no route".
-        let deadline = ctx.deadline;
+        // The node cap is the ONLY bound on a search, so it also decides whether the definitive verdict
+        // `Unreachable(SearchClosed)` can ever be reached. Too tight and a whole-zone flood hits the cap
+        // and downgrades to `Exhausted` ("I don't know") even when the frontier really was closable — a
+        // false "I don't know" in place of an honest "no". So it is chosen by MEASUREMENT, above.
+        //
+        // The module-level `MAX_NODES` (8M, chosen so everfrost's 1.12M-node whole-zone close still
+        // reaches SearchClosed, #394) is the ABSOLUTE backstop; a caller may set a TIGHTER `ctx.node_cap`
+        // (the fine tier does). It is a NODE COUNT, not a wall clock: whichever cap bites, the same query
+        // hits it after the same number of expansions on every machine, so the outcome is reproducible.
+        // A wall-clock budget used to sit here too and made the answer machine-speed-dependent — deleted.
+        let node_cap = ctx.node_cap.unwrap_or(MAX_NODES).min(MAX_NODES);
         let mut limit: Option<PlanLimit> = None;
         // How much walkable ground the route must keep around it (the LEDGE margin, enforced on the
         // neighbour cell below). Asked for ONLY above the minimum clearance: at `PLAYER_RADIUS` the
@@ -2090,18 +2108,14 @@ impl Collision {
                 if goal_fallback.is_none() { goal_fallback = Some(ckey); }
             }
             expanded += 1;
-            if expanded > MAX_NODES { limit = Some(PlanLimit::NodeCap); break; }
-            // Wall-clock cap, only when the caller armed one. Checked every 32 expansions —
-            // `Instant::now()` is ~20ns so the overhead is still negligible, and the worst-case
-            // OVERRUN is one batch. The batch was 128; a node now costs several times more (the
-            // swept clearance test casts 5 feelers x 2 heights per edge instead of 2 rays, #358), so
-            // a 128-node batch overshoots the deadline by several times what it used to. The point of
-            // the cap is a bound on the net-thread stall, and that bound is `batch x cost-per-node` —
-            // when the cost per node goes up, the batch has to come down or the bound silently rots.
-            if expanded & 0x1F == 0 && deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-                limit = Some(PlanLimit::Deadline);
-                break;
-            }
+            // The ONE runaway bound, and it is a deterministic node count (#394). Whichever cap the
+            // caller set (or the global `MAX_NODES` backstop), the same query hits it after the same
+            // number of expansions on every machine — so an unreachable goal that overruns the cap
+            // reports `Exhausted(NodeCap)` reproducibly, instead of `SearchClosed` on a fast box and
+            // `Exhausted(Deadline)` on a slow one. The wall-clock check that used to sit here (and made
+            // the answer machine-speed-dependent) is deleted; there is no `Instant::now()` in the
+            // search at all now, so the search cost also stops paying that per-batch clock read.
+            if expanded > node_cap { limit = Some(PlanLimit::NodeCap); break; }
             // Track the closest-to-goal cell reached (heuristic = straight-line cells to the goal),
             // for the partial-path fallback below.
             let hd = h(c, r);
@@ -3066,62 +3080,61 @@ mod tests {
         }
     }
 
-    /// #340: the search must honour the CALLER's deadline instead of re-arming a fresh budget per
-    /// call. `plan_path` makes up to 13 A* calls per plan; a per-call budget let one plan stall for
-    /// ~13 × 150 ms ≈ 2 s — and while it was on the network thread, that got the client dropped as
-    /// linkdead. `PlanCtx::default()` must arm NO budget at all: a bare call runs to completion.
+    /// #340/#394: the search must honour the CALLER's NODE CAP instead of re-arming a fresh one per
+    /// call. `plan_path` makes up to 13 A* calls per plan; a per-call budget let one plan cost 13× its
+    /// intended bound. `PlanCtx::default()` must arm NO tight cap (only the global `MAX_NODES`
+    /// backstop): a bare call runs to completion.
     #[test]
-    fn find_path_honours_a_caller_supplied_deadline() {
-        // A long open corridor — the goal is far enough that A* needs well over the 128-expansion
-        // batch between deadline checks, so an expired deadline must actually cut the search short.
+    fn find_path_honours_a_caller_supplied_node_cap() {
+        // A long open corridor — the goal is far enough that A* must expand well over a handful of
+        // nodes, so a tiny node cap must actually cut the search short before it can reach the goal.
         let assets = ZoneAssets { terrain: vec![slab(0.0, 0.0, 64.0, 0.0, 1600.0, true)], objects: vec![], textures: vec![] };
         let col = Collision::build(&assets, 32.0);
         let (start, goal) = ([8.0, 32.0, 0.0], [1560.0, 32.0, 0.0]);
 
         let fresh = col.find_path_res(start, goal, 1.0, &[], false, 8.0, None, 0.0, PlanCtx::worker());
-        assert!(fresh.is_some(), "with the worker's (generous) budget the route is found");
+        assert!(fresh.is_some(), "with the worker's (generous) cap the route is found");
         assert!(col.find_path_res(start, goal, 1.0, &[], false, 8.0, None, 0.0, PlanCtx::default()).is_some(),
-            "and with NO budget (the default) it is found too — a bare search runs to completion");
+            "and with the default (MAX_NODES backstop) it is found too — a bare search runs to completion");
 
-        let expired = PlanCtx {
-            deadline: Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
-            goal_region: None,
-        };
-        let t0 = std::time::Instant::now();
-        let out = col.find_path_res(start, goal, 1.0, &[], false, 8.0, None, 0.0, expired);
-        assert!(out.is_none(), "an already-expired deadline must abort the search, not re-arm a new budget");
-        assert!(t0.elapsed() < std::time::Duration::from_millis(100),
-            "and it must abort promptly ({:?})", t0.elapsed());
+        // A cap of 4 nodes cannot reach a goal ~190 cells away. Note the outcome is DETERMINISTIC:
+        // this asserts identically on a fast box and a slow one, which the old wall-clock version
+        // could not (that was the #394 bug).
+        let tiny = PlanCtx { node_cap: Some(4), ..PlanCtx::default() };
+        let out = col.find_path_res(start, goal, 1.0, &[], false, 8.0, None, 0.0, tiny);
+        assert!(out.is_none(), "a 4-node cap must abort the search before it reaches a far goal");
     }
 
-    /// **#337/#356 — the honesty invariant.** A search that RAN OUT OF CLOCK must report
-    /// `Exhausted` ("I don't know"), and a search that CLOSED its frontier without finding the goal
-    /// must report `Unreachable` ("no"). Collapsing those two into one `None`/partial is what made
-    /// the walker drive a timed-out stub into a wall and freeze at `blocked` — for months, with the
-    /// real root cause hidden behind it.
+    /// **#337/#356/#394 — the honesty invariant, made DETERMINISTIC.** A search that hit its NODE CAP
+    /// must report `Exhausted` ("I don't know"), and a search that CLOSED its frontier without finding
+    /// the goal must report `Unreachable` ("no"). Collapsing those two is what made the walker drive a
+    /// stub into a wall and freeze at `blocked` for months.
     ///
-    /// Same geometry, same goal, same code path: only the budget differs. The answers must differ
-    /// too — and the timeout must NEVER be the one that says "no route".
+    /// Same geometry, same goal, same code path: only the node cap differs. The answers must differ
+    /// too — and the cut-short search must NEVER be the one that says "no route". Unlike the wall-clock
+    /// version this replaced (#394), the answer here does not depend on machine speed: a 4-node cap is
+    /// hit after exactly 4 expansions on every machine.
     #[test]
-    fn a_timeout_is_never_reported_as_no_route() {
+    fn a_node_cap_is_never_reported_as_no_route() {
         let assets = ZoneAssets { terrain: vec![slab(0.0, 0.0, 64.0, 0.0, 1600.0, true)], objects: vec![], textures: vec![] };
         let col = Collision::build(&assets, 32.0);
         let start = [8.0, 32.0, 0.0];
 
-        // (a) Reachable goal, no clock → a complete Route.
+        // (a) Reachable goal, generous cap → a complete Route.
         let reachable = [1560.0, 32.0, 0.0];
         assert!(matches!(col.find_path_ex(start, reachable, 1.0, &[], 8.0, None, 0.0, PlanCtx::default()),
-            PlanOutcome::Route(_)), "a reachable goal with no time cap must produce a complete Route");
+            PlanOutcome::Route(_)), "a reachable goal with a generous cap must produce a complete Route");
 
-        // (b) The SAME reachable goal, with the clock already expired → Exhausted, NEVER Unreachable.
-        let expired = PlanCtx { deadline: Some(std::time::Instant::now() - std::time::Duration::from_secs(1)), goal_region: None };
-        match col.find_path_ex(start, reachable, 1.0, &[], 8.0, None, 0.0, expired) {
-            PlanOutcome::Exhausted { limit: PlanLimit::Deadline, .. } => {}
-            other => panic!("a search that ran out of clock must report Exhausted(Deadline) — reporting \
+        // (b) The SAME reachable goal, with a cap too small to reach it → Exhausted(NodeCap), NEVER
+        //     Unreachable. The search stopped LOOKING; it did not prove there is no route.
+        let tiny = PlanCtx { node_cap: Some(4), ..PlanCtx::default() };
+        match col.find_path_ex(start, reachable, 1.0, &[], 8.0, None, 0.0, tiny) {
+            PlanOutcome::Exhausted { limit: PlanLimit::NodeCap, .. } => {}
+            other => panic!("a search cut short by its node cap must report Exhausted(NodeCap) — reporting \
                              {other:?} for a goal that IS reachable is the #337 lie"),
         }
 
-        // (c) A goal OFF the mesh entirely, no clock → a definitive Unreachable, and no waypoints.
+        // (c) A goal OFF the mesh entirely, generous cap → a definitive Unreachable, and no waypoints.
         let off_mesh = [1560.0, 3000.0, 0.0]; // far outside the slab: no walkable floor at all
         let out = col.find_path_ex(start, off_mesh, 1.0, &[], 8.0, None, 0.0, PlanCtx::default());
         match &out {
@@ -3376,32 +3389,21 @@ mod tests {
         assert!((f.unwrap() - 10.0).abs() < 1e-3, "expected floor z=10, got {:?}", f);
     }
 
-    /// A 20x20 floor at z=0, plus a wall plane at east=10 broken by a `gap`-wide slot centred on
-    /// north=9 (a 2u nav-grid cell centre, so the FINE tier can actually try to thread it).
-    /// ONE PLAN, ONE BUDGET (#302/#382). The generous pass must take a SLICE of the caller's
-    /// deadline, never arm a fresh one — two passes each arming `NET_TIER_BUDGET_MS` is a 300 ms
-    /// stall on the net thread the fine tier still runs on, which is exactly the disease `PlanCtx`
-    /// exists to prevent.
+    /// ONE PLAN, ONE BUDGET (#302/#394). The generous clearance pass must take a SLICE of the caller's
+    /// NODE budget, never arm a fresh one — two passes each arming the full cap is a plan that quietly
+    /// costs two budgets, exactly the disease `PlanCtx` exists to prevent. A node cap, unlike the
+    /// wall-clock deadline this replaced, has no "now" to measure from — the split is a plain fraction.
     #[test]
     fn the_generous_pass_takes_a_slice_of_the_budget_never_a_fresh_one() {
-        use std::time::{Duration, Instant};
-        let now = Instant::now();
-        let caller = now + Duration::from_millis(crate::assets::NET_TIER_BUDGET_MS);
+        let caller = 1000usize;
+        let g = generous_node_cap(Some(caller)).expect("a budgeted plan keeps a budget");
+        assert!(g < caller,
+            "the generous pass may never get the FULL cap — that is two budgets for one plan (#302)");
+        assert_eq!(g, (caller as f32 * GENEROUS_BUDGET_SHARE) as usize,
+            "the generous pass gets exactly GENEROUS_BUDGET_SHARE of the caller's node budget");
 
-        let g = generous_deadline(Some(caller), now).expect("a budgeted plan keeps a budget");
-        assert!(g <= caller,
-            "the generous pass may never outlive the budget the caller armed — that is two budgets \
-             for one plan (#302)");
-        let slice = g.duration_since(now).as_millis() as f32;
-        let whole = caller.duration_since(now).as_millis() as f32;
-        assert!((slice - whole * GENEROUS_BUDGET_SHARE).abs() < 2.0,
-            "expected {:.0}ms of the {whole:.0}ms budget, got {slice:.0}ms", whole * GENEROUS_BUDGET_SHARE);
-
-        // An UNBUDGETED plan (the off-thread worker) stays unbudgeted — never invent a cap.
-        assert_eq!(generous_deadline(None, now), None);
-        // An already-spent budget yields no time to the generous tier, and cannot resurrect any.
-        let spent = now - Duration::from_millis(10);
-        assert!(generous_deadline(Some(spent), now).unwrap() <= now);
+        // An UNBUDGETED plan (only the MAX_NODES backstop) stays unbudgeted — never invent a cap.
+        assert_eq!(generous_node_cap(None), None);
     }
 
     /// Tiering is a route-CHOICE mechanism, so only a plan that chooses a route pays for it. The
@@ -4011,6 +4013,68 @@ mod tests {
         // Moving parallel to the wall (north) from east=3 never reaches it.
         assert!(col.sweep([3.0, 0.0, 0.0], [0.0, 5.0, 0.0], 1.0).is_none(),
             "parallel motion should not hit the wall");
+    }
+
+    /// **PICK THE NODE CAP BY MEASUREMENT (#394).** The worker's node cap must be generous enough that
+    /// a legitimate WHOLE-ZONE "no route" still reaches `SearchClosed` — a cap that truncates a real
+    /// full-frontier close into `Exhausted(NodeCap)` would be a new honesty bug ("I don't know" where
+    /// the truth is "no route"). So this measures the LARGEST reachable component across the corpus:
+    /// for each zone, a start on real floor, routed to a deliberately-OFF-MESH goal that forces A* to
+    /// flood the entire reachable component and close it. `closed_n` at that point IS the component
+    /// size — the worst case the cap must clear. Run with a HIGH cap so nothing truncates.
+    ///
+    /// ```text
+    /// cargo test --release --lib worst_case_reachable_component -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "requires baked zone glbs; measurement for the #394 node cap"]
+    fn worst_case_reachable_component() {
+        use std::time::Instant;
+        let dir = format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap());
+        // The biggest grids first — those are where a full close is largest.
+        let zones = ["everfrost", "butcher", "gfaydark"];
+        println!("\n{:<12} {:>12} {:>12} {:>10}", "zone", "xy_cells@8u", "MAX_closed", "ms");
+        let mut worst = 0usize;
+        for zone in zones {
+            let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
+            let Ok(za) = ZoneAssets::from_glb(&p) else { continue };
+            let col = Collision::build(&za, 32.0);
+            if col.cols == 0 { continue; }
+            let mut seed: u64 = 99;
+            let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as u32 };
+            // Sample several starts; force each to an OFF-MESH goal (far outside the grid, no floor)
+            // so A* must close the whole reachable component. Take the largest closed_n seen.
+            let (mut max_closed, mut max_ms) = (0usize, 0u128);
+            let ext_e = col.cols as f32 * col.cell_size;
+            let ext_n = col.rows as f32 * col.cell_size;
+            // The four grid corners, on real floor: a route to the FARTHEST reachable floor explores
+            // the largest span of the component. Whether it reaches or closes, `closed_n` at a HIGH cap
+            // is the worst-case number the node cap must clear.
+            let corners = [(0.05, 0.05), (0.95, 0.05), (0.05, 0.95), (0.95, 0.95), (0.5, 0.5)];
+            for _ in 0..120 {
+                let e = col.origin[0] + (rnd() as f32 / u32::MAX as f32) * ext_e;
+                let n = col.origin[1] + (rnd() as f32 / u32::MAX as f32) * ext_n;
+                let Some(z) = col.nearest_floor(e, n, col.z_max, 10.0, 4000.0) else { continue };
+                // corners + one fully-random goal, so we don't systematically miss a hard interior pair
+                let rc = (rnd() as f32 / u32::MAX as f32, rnd() as f32 / u32::MAX as f32);
+                let probes = corners.iter().copied().chain(std::iter::once(rc));
+                for (fe, fn_) in probes {
+                    let (ge, gn) = (col.origin[0] + fe * ext_e, col.origin[1] + fn_ * ext_n);
+                    let Some(gz) = col.nearest_floor(ge, gn, col.z_max, 10.0, 4000.0) else { continue };
+                    let t = Instant::now();
+                    let (sr, _t) = col.search_tiered_for_test(
+                        [e, n, z], [ge, gn, gz], crate::movement::PLAYER_RADIUS, &[], 8.0, None, 0.0,
+                        PlanCtx { node_cap: Some(8_000_000), ..PlanCtx::default() });
+                    let ms = t.elapsed().as_millis();
+                    if sr.closed_n > max_closed { max_closed = sr.closed_n; max_ms = ms; }
+                }
+            }
+            worst = worst.max(max_closed);
+            let xy = (col.cols as f32 * col.cell_size / 8.0).ceil() * (col.rows as f32 * col.cell_size / 8.0).ceil();
+            println!("{zone:<12} {:>12.0} {:>12} {:>10}", xy, max_closed, max_ms);
+        }
+        println!("\nWORST reachable-component close across corpus: {worst} nodes");
+        println!("=> the coarse MAX_NODES backstop must be comfortably above this (it is: 8M).");
     }
 
     /// Deterministic offline reproduction of the qeynos2 path-following stalls reported on #2,

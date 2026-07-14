@@ -349,6 +349,13 @@ mod tests {
     /// This is the bug that cost the project months. The old planner flooded the grid, gave up, and
     /// handed the walker a greedy partial; the walker drove it into the wall, retried 8×, and froze
     /// at `blocked`, never once saying "there is no way in".
+    ///
+    /// **This test was INTERMITTENTLY RED on CI before #394** — not flaky, correctly detecting a real
+    /// bug: the coarse worker carried a 5 s wall clock, and on a loaded runner the 62,500-cell frontier
+    /// close blew it, so the honest `Unreachable(SearchClosed)` degraded to `Exhausted(Deadline)`. The
+    /// answer depended on machine speed. #394 replaced the wall clock with a deterministic node cap, so
+    /// the frontier now closes to the same answer on every box. The determinism is pinned by
+    /// `the_coarse_planner_is_deterministic_under_load` below.
     #[test]
     fn an_unreachable_goal_reports_unreachable_not_a_partial_route() {
         let col = plane_with_sealed_box(1000.0, 400.0, 400.0);
@@ -358,6 +365,51 @@ mod tests {
             other => panic!("a walled-off goal must report a DEFINITIVE Unreachable(SearchClosed), got {other:?}"),
         }
         assert!(out.route().is_none(), "an unreachable goal must yield NO waypoints — a partial route here is the #337 lie");
+    }
+
+    /// # PROPERTY: **THE COARSE PLANNER'S ANSWER DOES NOT DEPEND ON MACHINE SPEED.** (#394)
+    ///
+    /// This is the universal #394 is about, and a passing quiet run cannot discharge it — the old
+    /// wall-clock bug passed 5/5 locally and only failed under CI load. So this test manufactures the
+    /// load: it saturates every core with spinner threads and plans the same walled-off goal many
+    /// times, and asserts the answer is `Unreachable(SearchClosed)` **every single time**.
+    ///
+    /// Under a wall-clock budget this test FAILS by construction: the load pushes the frontier close
+    /// past the deadline and the outcome flips to `Exhausted(Deadline)`. Under a node cap it CANNOT
+    /// fail: the same 62,500-cell frontier is closed after the same number of expansions whatever the
+    /// CPU is doing. That difference is the entire point of the fix.
+    ///
+    /// (Belt and braces: `PlanLimit::Deadline` no longer exists, so `Exhausted(Deadline)` is not even
+    /// spellable. This test guards the LAYER ABOVE that — that no *new* wall clock creeps back in and
+    /// makes a genuinely-unreachable goal report anything other than the definitive no.)
+    #[test]
+    fn the_coarse_planner_is_deterministic_under_load() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let col = Arc::new(plane_with_sealed_box(1000.0, 400.0, 400.0));
+        // Saturate the box: one busy-spinner per core, so the plan below competes for CPU exactly the
+        // way it does on a loaded CI runner (which is where the wall-clock version failed).
+        let stop = Arc::new(AtomicBool::new(false));
+        let load: Vec<_> = (0..std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || { let mut x = 0u64; while !stop.load(Ordering::Relaxed) { x = x.wrapping_add(1); std::hint::black_box(x); } })
+            })
+            .collect();
+
+        // The same walled-off goal, planned repeatedly. Every answer must be the definitive no.
+        // (4 iterations, not more: each is a full 62,500-cell frontier close — the point is proven by a
+        // handful of repeats under load, and a property test must not itself become a CI time sink.)
+        for i in 0..4 {
+            let out = plan_path(&col, [-900.0, -900.0, 0.0], [400.0, 400.0, 0.0], &[], 0.0, None);
+            assert!(matches!(out, PlanOutcome::Unreachable(NoRoute::SearchClosed)),
+                "run {i} under full CPU load returned {out:?} — the coarse planner's answer must NOT \
+                 depend on machine speed. A wall-clock budget would flip this to Exhausted(Deadline); a \
+                 node cap cannot (#394).");
+        }
+        stop.store(true, Ordering::Relaxed);
+        for h in load { let _ = h.join(); }
     }
 
     /// A reachable goal on the same fixture still routes (the honesty change must not make the
