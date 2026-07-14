@@ -228,11 +228,6 @@ pub fn draw_labels(
             _ => egui::Color32::WHITE,
         };
 
-        // Golden "!" over NPCs that have a quest (data from quests.json, synced from the asset server), MMO-style, so an
-        // agent (or a human watching /frame) can SEE who to talk to. See src/quests.rs.
-        let is_quest_giver =
-            crate::quests::is_quest_giver(&scene.zone, &crate::http::clean_entity_name(&b.name));
-
         egui::Area::new(egui::Id::new(("npc_label", i)))
             .fixed_pos(egui::pos2(sx - 35.0, sy - 80.0))
             .interactable(false)
@@ -241,12 +236,6 @@ pub fn draw_labels(
                     .fill(egui::Color32::from_black_alpha(160))
                     .inner_margin(egui::Margin { left: 4.0, right: 4.0, top: 2.0, bottom: 2.0 })
                     .show(ui, |ui| {
-                        if is_quest_giver {
-                            ui.label(egui::RichText::new("❗ quest")
-                                .size(13.0)
-                                .strong()
-                                .color(egui::Color32::from_rgb(255, 210, 40)));
-                        }
                         ui.label(egui::RichText::new(&b.name)
                             .size(12.0)
                             .color(name_color));

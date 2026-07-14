@@ -744,8 +744,11 @@ NOTE: this whole grind-uptime saga is qcat-geometry friction; for robust sustain
 better hunting venue (open land mobs) would help, but it's not a goal blocker — leveling is proven.
 
 ## QUESTING — roadmap (2026-06-21)
-Goal: complete beginner Qeynos quests. NEW TOOL (done, committed): `tools/quest_finder.py` finds
-quest givers (location + turn-in items + XP) by joining server Lua quest scripts to spawned NPCs.
+Goal: complete beginner Qeynos quests. Quests must be discovered the way a human player would —
+in-game context clues, internet searches, and trial + error — NOT by reading server Lua scripts or
+DB spawn tables. (The old `tools/quest_finder.py` oracle + its golden-"!"/`GET /v1/quests/givers`
+surface were removed per the owner's decision; the client never hands the agent quest-giver data no
+human could see.)
 
 TARGET FIRST QUEST (ideal — mobs + giver both in qeynos2, no external travel): **Rat Whiskers**.
 - Giver: **Exterminator_Wintloag** in qeynos2 (North Qeynos) ~ city level z~4 (near 135,202,4).
