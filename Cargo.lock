@@ -846,6 +846,7 @@ dependencies = [
  "glam",
  "gltf",
  "image",
+ "libc",
  "miniz_oxide",
  "pollster",
  "rand",

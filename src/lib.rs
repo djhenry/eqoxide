@@ -38,6 +38,7 @@ pub mod skills;
 // Modules only needed by the full client binary.
 pub mod camera_state;
 pub mod config;
+pub mod crash;
 pub mod eq_net;
 pub mod eqstr;
 pub mod frame_capture;
