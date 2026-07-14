@@ -7,8 +7,21 @@ Keep this updated as tasks complete. (Older entries below are an ARCHIVE — see
 
 # CURRENT STATE (2026-07-14)
 
-`main` is green at `f8c6730`. **CI enforces** `cargo build --release` + `cargo test --lib` on every
-PR (`.github/workflows/test.yml`). 692 tests.
+`main` is green. **CI enforces** `cargo build --release` + `cargo test --lib` on every PR
+(`.github/workflows/test.yml`).
+
+**Do not trust any count or sha in this file — RUN these.** Every hardcoded figure here has gone stale
+at least once, including during the review of the commit that corrected it (a reviewer's own corrected
+test count was wrong by the time it landed, because a PR merged mid-review):
+```bash
+git rev-parse --short origin/main                                     # current main
+cargo test --lib -- --list | tail -1                                  # real test count
+gh issue list -R djhenry/eqoxide --label agent-honesty --state open   # the live agent-honesty list
+gh issue view <N> -R djhenry/eqoxide --json state --jq .state         # is it ACTUALLY still open?
+```
+At the time of writing: `b66eb69`, **722 tests**, **14** open `agent-honesty` issues
+(#344 #347 #349 #355 #356 #360 #361 #366 #370 #371 #378 #386 #390 #391) — *all four figures produced by
+running the commands above, not by typing them.* **They are already decaying. Re-run them.**
 
 ## ⚠️ Read this FIRST: how the last handoff lied, so you don't repeat it
 
@@ -36,7 +49,8 @@ independent reader. None would have been caught by the author.
 
 ## Read this NEXT: the `agent-honesty` label
 
-It is the project's top prioritization principle. 13 open issues carry it.
+It is the project's top prioritization principle. **Get the live count with the command above** —
+any number written here is already wrong.
 
 > **The client must never lie to the agent.** Every API response and every observable field must be
 > either TRUE, or an EXPLICIT failure the caller can distinguish. Never a confident falsehood.
@@ -78,16 +92,25 @@ Do not restart it without reading the review on #372 first.
    nondeterministic under load. **The navmesh is cancelled, so option (2) in that issue is dead: the
    answer is option (1), extend `nav_planner`.**
 
-3. **#379 / #381 / #358 — the nav-drift family.** Coarse commits to corridors the fine tier can't fit
-   (no feedback channel, so it re-proposes forever); the clearance sweep is blind to a wall the
-   segment runs PARALLEL to; rays-vs-capsule. Same generator as #386.
+3. **#379 / #381 — the nav-drift family** (plus **#358**, already CLOSED in `8a7bd0b` — context only,
+   do not go looking for it). Coarse commits to corridors the fine tier can't fit (no feedback channel,
+   so it re-proposes forever); the clearance sweep is blind to a wall the segment runs PARALLEL to.
+   **Same generator as #386: the planner and the walker hold different beliefs about what is solid.**
+   Treat these as ONE thread, not N parallel fixers — four independent fixers would produce four more
+   mutually-blind patches, which is exactly how this family got to four members.
 
-4. **#380 — the client can exit SILENTLY** (no panic, no log). **PR #387 was REJECTED** — it made the
-   client fail to start at all (`signal_hook::register` *asserts* on SIGSEGV/SIGILL/SIGFPE: they are on
-   its `FORBIDDEN` list, so `install()` panicked before `main` parsed args), and its obvious fix would
-   have **DELETED** the loud `has overflowed its stack` message std already prints, manufacturing new
-   silent deaths. Rework in flight. **Lesson: it shipped green CI on a binary that could not run —
-   there was no test that called `install_signal_handlers()`.**
+4. **#380 — the client can exit silently. DONE, MERGED (PR #387, on `main`).** The client now records
+   why it died: a panic hook (with thread name), hand-installed `sigaction` handlers for
+   SIGSEGV/SIGBUS/SIGILL/SIGABRT/SIGFPE with `SA_ONSTACK` + chaining, a labelled clean-shutdown marker,
+   and per-pid durable logs. **Root cause of the original incident remains UNKNOWN** — it was never
+   reproduced; what is fixed is that the *next* one will be self-diagnosing. It spawned three follow-ups:
+   **#390** (unbounded crash-log FILE COUNT — one pair per launch, forever, even for `--help`),
+   **#391** (pid reuse merges two runs into one log), **#392** (a crash before HTTP bind is anonymous).
+   ⚠️ **Keep the lesson, it is the most expensive one this project has bought twice:** PR #387's first
+   revision **shipped a client that could not start — with green CI** — because *no test ever called
+   `install_signal_handlers()`*. Its "obvious" fix would then have **deleted** the loud
+   `has overflowed its stack` message std already prints, manufacturing new silent deaths inside the PR
+   meant to end them. **A green suite over an unexercised code path is not evidence.**
 
 5. **#378 — traversability abstraction. STATUS: PROPOSAL, NOT SCHEDULED.** See the warning at the top
    of this file — this was walked back from "the owner's design" to what it actually was: a hedged
@@ -152,7 +175,8 @@ itself is inverted and every downstream consumer inherits it. Nobody has decided
   do not trust this enumeration to stay current):** #347 (structural — "200 = queued" is systematically
   dishonest; single-slot mailboxes silently overwrite), #371 (`connected:true` means the SOCKET is
   alive, not the WORLD — a wedged zone keeps ACKing; needs an **active probe**), #361, #366, #370,
-  #363, #360, #349, #344 — plus #380, #378, #355, #356, already covered above.
+  #360, #349, #344, #386, #390, #391 — plus #378, #355, #356, covered above.
+  (**#363 and #380 are CLOSED** — they were listed here as open; do not chase them.)
 - **Nav:** #313 (grade capped on ascent only), #309 (no climb mechanic), #240 (moving platforms),
   #329 (qcat spawn pocket — the planner is correct now; the **controller** can't execute),
   #266 (a related but DISTINCT wedge — qeynos2 guild vault, portal/zone-transition routing; reopened
