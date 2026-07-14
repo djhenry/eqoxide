@@ -727,14 +727,12 @@ fn apply_shop_player_buy(gs: &mut GameState, p: &[u8]) {
         gs.log_msg("merchant", &warn);
         gs.push_event("merchant", "coin_desync", "", true, &warn);
         tracing::warn!("EQ: buy confirmed but local coin snapshot could not cover price={price} — coin is stale");
-        // Known wrong (overstated) until the next OP_PlayerProfile reconciles it (#361) — must not
-        // read as a trustworthy balance in the meantime.
-        gs.coin_verified = false;
-    } else {
-        // The confirmed echo tells us exactly what happened; the deduction above matches the
-        // server's own price, so the balance is trustworthy again (#361).
-        gs.coin_verified = true;
     }
+    // Note: even a fully-covered, confirmed buy does NOT clear coin_verified here. `begin_shop_buy`
+    // (send time) bumped `unverified_buys`, and this per-buy echo only confirms a relative delta —
+    // it cannot rule out an EARLIER silent refusal (inventory-full/LORE) having already diverged the
+    // absolute balance. Only `reconcile_coin` (a real OP_PlayerProfile) may restore trust (#361
+    // review — FIX 1). `coin_verified()` is computed, so there is no field to wrongly set here.
 }
 
 /// OP_ShopEndConfirm (server→client, 0-byte body) — EQEmu's SendMerchantEnd() (zone/client.cpp
@@ -755,10 +753,11 @@ fn apply_shop_player_buy(gs: &mut GameState, p: &[u8]) {
 fn apply_shop_end_confirm(gs: &mut GameState, _p: &[u8]) {
     gs.merchant_open = None;
     gs.merchant_items.clear();
-    // No coin was ever taken on any path that reaches this handler (see the doc comment above),
-    // so a balance left provisionally unverified by `begin_shop_buy` is confirmed accurate again
-    // (#361) — untouched, and now we KNOW it, rather than merely hoping so.
-    gs.coin_verified = true;
+    // Deliberately does NOT clear coin_verified. No coin was taken on any path reaching this handler
+    // (see the doc comment above), so THIS buy cost nothing — but that is a relative fact about one
+    // buy, and cannot rule out an EARLIER silent refusal having already diverged the balance. Only
+    // `reconcile_coin` (a real OP_PlayerProfile) restores trust; a refusal echo must not (#361
+    // review — FIX 1).
     let msg = "Merchant refused the purchase (session ended)";
     gs.log_msg("merchant", msg);
     gs.push_event("merchant", "refused", "", true, msg);
@@ -2867,18 +2866,21 @@ mod tests {
     }
 
     #[test]
-    fn apply_shop_player_buy_confirmed_success_marks_coin_verified() {
-        // #361: once a buy is confirmed and the price is covered, the balance is trustworthy
-        // again — even though `begin_shop_buy` (called at send time) marked it unverified.
+    fn apply_shop_player_buy_confirmed_success_does_not_re_verify_coin() {
+        // #361 review (FIX 1): a confirmed, coverable buy applies the correct delta but must NOT
+        // flip coin back to verified — an earlier silent refusal could already have diverged the
+        // absolute balance, and only a real OP_PlayerProfile can rule that out.
         let mut gs = GameState::new();
         gs.coin = [10, 0, 0, 0];
-        gs.coin_verified = false; // set by begin_shop_buy() when the request was sent
+        gs.coin_confirmed = true; // a real reading had landed at some earlier point
+        gs.begin_shop_buy();      // this buy is in flight (as the nav tick does at send time)
         let mut echo = [0u8; 32];
         echo[8..12].copy_from_slice(&7u32.to_le_bytes());
         echo[16..20].copy_from_slice(&1u32.to_le_bytes());
         echo[24..28].copy_from_slice(&37u32.to_le_bytes());
         super::apply_shop_player_buy(&mut gs, &echo);
-        assert!(gs.coin_verified, "a confirmed, coverable buy resolves the pending uncertainty");
+        assert!(!gs.coin_verified(),
+            "a per-buy echo confirms a relative delta only; it cannot restore absolute trust");
     }
 
     #[test]
@@ -2888,23 +2890,30 @@ mod tests {
         // not be marked trustworthy just because a packet arrived.
         let mut gs = GameState::new();
         gs.coin = [0, 0, 0, 5];
+        gs.coin_confirmed = true;
+        gs.begin_shop_buy();
         let mut echo = [0u8; 32];
         echo[8..12].copy_from_slice(&7u32.to_le_bytes());
         echo[16..20].copy_from_slice(&1u32.to_le_bytes());
         echo[24..28].copy_from_slice(&99u32.to_le_bytes()); // > 5c on hand
         super::apply_shop_player_buy(&mut gs, &echo);
-        assert!(!gs.coin_verified, "a detected desync must not be reported as a trustworthy balance");
+        assert!(!gs.coin_verified(), "a detected desync must not be reported as a trustworthy balance");
+        assert!(gs.chat_events.iter().any(|e| e.kind == "coin_desync"));
     }
 
     #[test]
-    fn apply_shop_end_confirm_marks_coin_verified() {
-        // #361: a refusal never spends coin (see the doc comment on apply_shop_end_confirm), so a
-        // balance left unverified by begin_shop_buy() at send time is confirmed accurate again.
+    fn apply_shop_end_confirm_does_not_re_verify_coin() {
+        // #361 review (FIX 1): a refusal never spends coin on THIS buy, but that is a relative fact
+        // — it cannot rule out an earlier silent refusal, so it must not restore trust. Only a real
+        // OP_PlayerProfile (reconcile_coin) may. It still clears merchant_open.
         let mut gs = GameState::new();
         gs.coin = [10, 0, 0, 0];
-        gs.coin_verified = false;
+        gs.coin_confirmed = true;
+        gs.merchant_open = Some(111);
+        gs.begin_shop_buy();
         super::apply_shop_end_confirm(&mut gs, &[]);
-        assert!(gs.coin_verified, "a confirmed refusal resolves the pending uncertainty honestly");
+        assert!(!gs.coin_verified(), "a refusal echo confirms one buy's cost only, not absolute trust");
+        assert_eq!(gs.merchant_open, None, "the refusal still honestly closes the merchant");
     }
 
     #[test]
@@ -5004,12 +5013,12 @@ mod tests {
         let mut gs = GameState::new();
         gs.coin = [10, 0, 0, 0];
         gs.coin_confirmed = true; // we already had a real prior reading this session
-        gs.coin_verified = false; // a buy was sent and never confirmed either way
+        gs.begin_shop_buy();      // a buy was sent and never confirmed either way
 
         apply_player_profile(&mut gs, &profile_payload_with_coin([9, 0, 0, 0]));
 
         assert_eq!(gs.coin, [9, 0, 0, 0], "must correct to the server's authoritative figure");
-        assert!(gs.coin_verified, "the figure is now fresh from the source of truth");
+        assert!(gs.coin_verified(), "the figure is now fresh from the source of truth");
         assert!(gs.chat_events.iter().any(|e| e.kind == "coin_desync"),
             "a real divergence must be surfaced as an event, not silently absorbed");
         assert!(gs.messages.iter().any(|m| m.text.contains("Coin desync")),
@@ -5027,7 +5036,7 @@ mod tests {
         apply_player_profile(&mut gs, &profile_payload_with_coin([12, 3, 4, 5]));
 
         assert_eq!(gs.coin, [12, 3, 4, 5]);
-        assert!(gs.coin_verified);
+        assert!(gs.coin_verified());
         assert!(gs.coin_confirmed);
         assert!(!gs.chat_events.iter().any(|e| e.kind == "coin_desync"),
             "seeding the first real balance is not a desync");
