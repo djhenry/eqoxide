@@ -90,6 +90,28 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
                        margin from the walls and drops they pass. Expect tight doorways/bridges.",
         }))
     });
+    // The fine 2u steering tier's last honest word (#382). `null` when it is threading cleanly — a
+    // healthy tier says nothing, exactly like `nav_degraded` / `nav_tight`.
+    let nav_local = nav.local.as_ref().filter(|l| l.state != "threaded").map(|l| serde_json::json!({
+        "state":       l.state,
+        "reason":      l.reason,
+        "stuck_ticks": l.stuck_ticks,
+        "plan_us":     l.plan_us,
+        "detail": match l.state.as_str() {
+            "no_way_through" => "the FINE 2u planner CLOSED its whole 40u window without finding a way \
+                                 along the committed coarse route. The corridor is not threadable from \
+                                 here. This is a LOCAL fact — it does NOT mean the goal is unreachable \
+                                 (the coarse route is being re-planned around it, #246).",
+            "exhausted"      => "the FINE 2u planner was CUT SHORT before closing its window (node cap). \
+                                 This is 'I don't know', NOT 'there is no way through' — the walker is \
+                                 steering on the best partial it has.",
+            "planner_dead"   => "the fine-tier worker thread has DIED. Steering has degraded to the \
+                                 COARSE 8u route only for the rest of this session: the character keeps \
+                                 walking, but without 2u detail it will handle thin ramps and narrow \
+                                 openings worse. This is a client fault; restart to recover it.",
+            _                => "",
+        },
+    }));
     let (guild_name, guild_id, guild_rank) = {
         let g = s.guild.lock().unwrap();
         (g.guild_name.clone(), g.guild_id, g.guild_rank)
@@ -146,6 +168,12 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             //   search_exhausted — the planner GAVE UP (search_node_cap). This is
             //                      "I don't know", NOT "no". Try a nearer waypoint.
             //   blocked          — a route exists but the walker physically cannot follow it.
+            //   blocked          — a route exists but the walker physically cannot follow it
+            //                      (nav_reason: walker_stalled | local_no_way_through |
+            //                      fall_would_be_lethal). `local_no_way_through` means the FINE 2u
+            //                      tier CLOSED its 40u window without finding a way along the coarse
+            //                      corridor — the corridor is genuinely not threadable here, which is
+            //                      a different fact from "the walker slid into something" (#382).
             "nav_state":   nav.state,
             "nav_reason":  nav.reason,
             // Spellcasting (#348). `casting` is non-null ONLY while our own cast bar is running;
@@ -178,6 +206,24 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // "no route exists" from "this zone's pathing is known-unreliable".
         "nav_degraded": nav_degraded,
         "nav_tight": nav_tight,
+        // The FINE 2u STEERING tier (#382). `null` while it is healthy (a complete fine route to its
+        // carrot) or has not yet answered. Non-null when the tier that is actually steering the
+        // character cannot see a way through the next 40u — and it says WHICH kind of cannot:
+        //
+        //   no_way_through — the 40u window's frontier CLOSED. There is genuinely no way along the
+        //                    committed coarse corridor from here (the 8u grid skimmed something).
+        //                    Falsifiable, and *local*: it says nothing about whether the GOAL is
+        //                    reachable. The walker keeps steering on the coarse route and re-plans it
+        //                    (#246).
+        //   exhausted      — the search was CUT SHORT (node cap). "I DON'T KNOW", not "no".
+        //   planner_dead   — the fine worker thread died. Steering has degraded to coarse-only for
+        //                    the rest of the session; the walker keeps walking, but with 8u detail.
+        //
+        // This field exists because until #382 the fine tier's failure was INVISIBLE: it ran under a
+        // 150ms wall clock, so "did not reach the carrot" meant either "impassable" or "ran out of
+        // clock" with no way to ask which, and `nav_state` said a confident `navigating` throughout.
+        // The clock is gone; the ambiguity went with it.
+        "nav_local": nav_local,
         // Per-phase frame timings (ms, EMA-smoothed); all zero unless --profile / EQ_PROFILE=1.
         // Render-owned — the one field here the render loop legitimately publishes.
         "frame_profile": frame_profile,

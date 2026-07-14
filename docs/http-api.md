@@ -207,7 +207,7 @@ machine-readable *why*, `null` unless a state has one). Together they are how yo
 | `arrived` | Reached the goal. | `goal_z_snapped` (see below) or — |
 | `no_path` | **DEFINITIVE: no route exists.** The planner searched to completion. Do not retry the same goal — pick another. | see below |
 | `search_exhausted` | The planner **gave up**. This is **"I don't know", not "no"** — a route may well exist. Try a nearer waypoint. | `search_node_cap` |
-| `blocked` | A route exists, but the walker **physically could not follow it** (wedged on geometry after 8 recovery attempts). A steering/collision failure, *not* a routing one. | `walker_stalled`, `fall_would_be_lethal` |
+| `blocked` | A route exists, but the walker **could not follow it** (wedged after 8 recovery attempts). Not a routing failure. | `walker_stalled`, `local_no_way_through`, `fall_would_be_lethal` |
 
 **`goal_z_snapped` — the client CHANGED your goal.** The `z` you gave sits below every floor in the
 goal's column (agents commonly pass `z: 0`, or a map coordinate), so the planner snapped the goal onto
@@ -225,6 +225,55 @@ is not snapped: it fails as `no_path` / `goal_not_walkable`.)
 | `start_isolated` | The *character* is boxed in (inside a tree trunk / on a slope face), and re-anchoring to nearby floor didn't help. |
 | `no_geometry` | No collision mesh loaded yet (still zoning). |
 | `planner_dead` | The pathfinding worker thread has **died**. No route can be planned for the rest of the session — a **client fault**, not an unreachable goal. Movement must be driven manually, or the client restarted. This is reported loudly and terminally rather than leaving `nav_state` stuck at `planning` forever. |
+
+`nav_reason` for `blocked`:
+
+| Reason | Meaning |
+|--------|---------|
+| `walker_stalled` | The fine planner *can* thread the route from here, and the walker still didn't move: a genuine collision/steering wedge. `POST /v1/move/manual` (optionally `"jump": true`) may free it; then re-issue the `goto`. |
+| `local_no_way_through` | The **fine 2u planner closed its whole 40u window** without finding a way along the committed route. The corridor is not threadable at the character's own collision radius — this is *not* a slide/collision wedge, and nudging will not fix it. Approach the goal from another direction. (#382) |
+| `fall_would_be_lethal` | The next waypoint is down a drop whose fall damage would likely kill the character. Stopped at the ledge. |
+
+---
+
+## The fine steering tier (`nav_local`) — #382
+
+Navigation has two tiers. The **coarse** one (8 u cells, whole zone) chooses the route and produces
+`nav_state`. The **fine** one (2 u cells, a 40 u window, re-planned every nav tick) is what actually
+**steers** the character along the last few strides of that route — threading the thin ramps and narrow
+openings the 8 u grid cannot see. `GET /v1/observe/debug` carries **`nav_local`**: what that tier last
+said. It is **`null` while the tier is healthy** (a complete fine route to its carrot), exactly like
+`nav_degraded` / `nav_tight`.
+
+```json
+"nav_local": {
+  "state": "no_way_through",
+  "reason": "search_closed",
+  "stuck_ticks": 2,
+  "plan_us": 14300,
+  "detail": "..."
+}
+```
+
+| `state` | Meaning |
+|---------|---------|
+| `no_way_through` | The fine planner **closed its entire 40 u window** and found no way along the committed coarse route from here. A falsifiable **local** "no" — the coarse route is being re-planned around it. It says **nothing** about whether your goal is reachable. |
+| `exhausted` | The fine search was **cut short** (node cap) before closing its window: **"I don't know"**, not "no". The walker is steering on the best partial it has. |
+| `planner_dead` | The fine worker thread has **died**. Steering has degraded to the coarse 8 u route for the rest of the session — the character **keeps walking**, but handles thin ramps and narrow openings worse. A client fault; restart to recover it. |
+
+> **`nav_local.state` is never `no_path`, and structurally cannot be.** A 40 u window can never prove a
+> *goal* unreachable, so a tight doorway must never be able to tell an agent its destination does not
+> exist. Only the coarse planner, which closes the whole zone's frontier, may say `no_path`.
+
+**Why this field exists.** The fine tier is bounded *spatially* (a 40 u window) plus a deterministic
+node cap (#394 removed its old 150 ms wall clock, so its answer no longer depends on machine load), and
+until #382 it ran **inline on the network thread**, every nav tick — the last A* left on that thread, a
+residual stall of the class that caused the #257/#302 linkdead drops (measured, release/akanon: mean
+**15.3 ms**, worst **358 ms**). #382 moves it onto its own worker thread: the walker keeps steering on
+the last good fine plan while a new one computes, so nothing real-time waits on the fine search. That
+move is also where `nav_local` comes from — the honest `LocalOutcome` (`threaded` / `no_way_through` /
+`exhausted`) the worker reports, so an agent watching a character grind at a doorway can tell "the
+corridor is not threadable" from "the steering planner hasn't caught up." `nav_local` is where you read it.
 
 > **The distinction between `no_path` and `search_exhausted` is load-bearing, and it is new (#337).**
 > They used to be the same thing — worse, an unreachable goal didn't report *either*. The planner
