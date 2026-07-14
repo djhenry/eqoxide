@@ -80,8 +80,11 @@ Two hard-won process rules:
   #329 (qcat spawn pocket — the planner is correct now; the **controller** can't execute),
   #266 (a related but DISTINCT wedge — qeynos2 guild vault, portal/zone-transition routing; reopened
   pending live re-test. **Do not assume the #329 diagnosis carries over.**)
-  ⚠️ **Do NOT loosen `MAX_WALK_GRADE`** — in qcat a **3% margin** is the only thing stopping A* routing
-  the character up into solid rock.
+  ⚠️ **Do NOT loosen `MAX_WALK_GRADE`** (1.2, `src/assets.rs:1933`) without re-measuring qcat. It is
+  what stops A* routing the character up into solid rock — the grade cap exists to prevent the
+  slope-wedge class (#205/#212), and #353's review kept it deliberately untouched. The margin was
+  reported as narrow in-session, but **that figure is recorded in no issue** — re-derive it before
+  you touch the constant, don't trust a remembered number.
 - **Test suite:** #355 (**4** surviving mutants — 2 in `packet_handler.rs`, 1 in `http/quests.rs`,
   1 in `http/group.rs`), #356 (flaky wall-clock A* test — fix by surfacing `PlanOutcome`, **not** by
   `#[ignore]`), #357 (2 ignored tests actually FAIL — character model reports **2× expected height**,
