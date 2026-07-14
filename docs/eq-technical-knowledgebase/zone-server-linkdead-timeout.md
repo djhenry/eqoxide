@@ -17,7 +17,7 @@ which transport timer fired.
    logs (category `net_client`) `"Closing connection for ... time_since_first_sent
    [...] >= ... resend_timeout [...]"` (`:1151-1159`) and calls `Close()` →
    `ChangeStatus(StatusDisconnecting)` immediately.
-2. **`stale_connection_ms` = 60000ms** (`reliable_stream_connection.h:298`, also
+2. **`stale_connection_ms` = 60000ms** (`reliable_stream_connection.h:285`, also
    no `RuleI`). Time since the zone server received **anything at all** from the
    client (`m_last_recv`, bumped unconditionally at the very top of `ProcessPacket`,
    `reliable_stream_connection.cpp:446`, before opcode dispatch — even a bare
