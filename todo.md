@@ -171,7 +171,7 @@ itself is inverted and every downstream consumer inherits it. Nobody has decided
 
 ## Backlog (issues carry full repros + measurements)
 
-- **agent-honesty (13 open — get the live list with `gh issue list --label agent-honesty --state open`;
+- **agent-honesty (14 as of writing — RUN `gh issue list --label agent-honesty --state open`;
   do not trust this enumeration to stay current):** #347 (structural — "200 = queued" is systematically
   dishonest; single-slot mailboxes silently overwrite), #371 (`connected:true` means the SOCKET is
   alive, not the WORLD — a wedged zone keeps ACKing; needs an **active probe**), #361, #366, #370,
