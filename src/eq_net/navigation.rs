@@ -2373,6 +2373,13 @@ impl Navigator {
         // merchant is open by the time the buy arrives. Must be within ~200u of the merchant.
         let buy_req = self.buy.lock().unwrap().take();
         if let Some((merchant_id, slot)) = buy_req {
+            // #360/#361: a failed/unanswered OP_ShopRequest must not leave `merchant_open` reporting
+            // the PREVIOUS merchant, and the coin balance must read as provisionally unverified until
+            // this buy's outcome is actually known (a confirmed echo, a confirmed refusal, or the next
+            // OP_PlayerProfile reconciliation) — a silent inventory-full/LORE refusal sends no echo at
+            // all. See GameState::begin_shop_open/begin_shop_buy for the full rationale.
+            gs.begin_shop_open();
+            gs.begin_shop_buy();
             let open = merchant_click(merchant_id, gs.player_id, 1);
             stream.send_app_packet(OP_SHOP_REQUEST, &open);
             // RoF2 Merchant_Sell_Struct (32b): npcid@0, playerid@4, itemslot@8, unknown12@12,
@@ -2403,6 +2410,8 @@ impl Navigator {
         // Must be within ~200u of the merchant; the server computes the price (we send 0).
         let sell_req = self.sell.lock().unwrap().take();
         if let Some((merchant_id, slot, quantity)) = sell_req {
+            // #360: same staleness hazard as the buy path above — clear before sending.
+            gs.begin_shop_open();
             let open = merchant_click(merchant_id, gs.player_id, 1);
             stream.send_app_packet(OP_SHOP_REQUEST, &open);
             // RoF2 Merchant_Purchase_Struct is 20 bytes (rof2_structs.h): npcid(u32)@0,
@@ -2436,6 +2445,12 @@ impl Navigator {
                 TradeCmd::Open(id) => (id, 1u32),
                 TradeCmd::Close    => (gs.merchant_open.unwrap_or(0), 0u32),
             };
+            if command == 1 {
+                // #360: clear before sending — an Open request that never gets an echo (non-merchant
+                // target / out-of-range) must not leave `merchant_open` reporting the merchant we had
+                // open before this request.
+                gs.begin_shop_open();
+            }
             let open = merchant_click(merchant_id, gs.player_id, command);
             stream.send_app_packet(OP_SHOP_REQUEST, &open);
             tracing::info!("EQ: shop {} — merchant_id={}", if command == 1 { "open" } else { "close" }, merchant_id);

@@ -132,6 +132,9 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             "heading_cw":  player.heading_cw,
             "server_corrections": player.server_corrections,
             "currency":    currency_json(player.coin),
+            // #361: false means a merchant buy is in flight/unconfirmed or a detected desync hasn't
+            // been re-verified yet — `currency` above may not match the server's real balance.
+            "coin_verified": player.coin_verified,
             "hp_pct":      player.hp_pct,
             "hp":          player.cur_hp,
             "hp_max":      player.max_hp,
@@ -316,12 +319,15 @@ async fn get_entities(State(s): State<HttpState>) -> Json<HashMap<String, [f32; 
 /// 23-30 → wire 22-29), plus item_id, name, charges, icon, and idfile. Use this to discover which
 /// slot holds an item before giving/equipping it.
 async fn get_inventory(State(s): State<HttpState>) -> Json<serde_json::Value> {
-    let items = s.inventory.lock().unwrap().clone();
-    let coin  = s.player().coin;
+    let items  = s.inventory.lock().unwrap().clone();
+    let player = s.player();
     Json(serde_json::json!({
         "count": items.len(),
         "items": items,
-        "currency": currency_json(coin),
+        "currency": currency_json(player.coin),
+        // #361: see the /debug field of the same name — false means `currency` may not match the
+        // server's real balance right now (a merchant buy in flight, or an unreconciled desync).
+        "coin_verified": player.coin_verified,
     }))
 }
 

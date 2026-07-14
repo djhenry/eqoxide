@@ -439,6 +439,19 @@ pub struct GameState {
     pub xp_pct: f32,
     /// Coin on hand (platinum, gold, silver, copper), from the player profile.
     pub coin: [u32; 4],
+    /// True once `coin` has been seeded from at least one real OP_PlayerProfile coin block (#361).
+    /// Gates `reconcile_coin`'s desync report: comparing a genuine starting balance against the
+    /// arbitrary all-zero startup default on first login must never be misreported as a "desync".
+    pub coin_confirmed: bool,
+    /// True when `coin` is currently believed to match the server's real balance. Set false at the
+    /// moment a buy is SENT (`begin_shop_buy`) and only set true again once the outcome is actually
+    /// known: a confirmed buy echo, a confirmed refusal (`OP_ShopEndConfirm`), or the next
+    /// authoritative `OP_PlayerProfile` (`reconcile_coin`). Two merchant-buy refusal paths —
+    /// inventory-full and a LORE conflict (EQEmu zone/client_packet.cpp ~14198-14303) — send NO
+    /// echo of any kind, so without this flag a silently-refused buy (which, for inventory-full,
+    /// the server's own source comments admit it charges for anyway) would leave `coin` diverged
+    /// with no observable sign the value is unreliable (#361, agent-honesty).
+    pub coin_verified: bool,
     /// Stats (STR, STA, CHA, DEX, INT, AGI, WIS), from the player profile.
     pub stats: [u32; 7],
     /// Item material IDs for each equipment slot (0..9), from the player profile.
@@ -863,6 +876,50 @@ impl GameState {
         true
     }
 
+    /// Call immediately before sending an OP_ShopRequest to open a merchant window — the first
+    /// packet of every buy, sell, and explicit `/v1/merchant/open` (#360). `Handle_OP_ShopRequest`
+    /// (EQEmu zone/client_packet.cpp) sends NO echo at all on a failed request — a non-merchant
+    /// target (:14605-14607) or an out-of-range one (:14610-14612) — so without this,
+    /// `merchant_open` would keep reporting the PREVIOUS merchant's id forever after such a
+    /// request. Clearing it optimistically at send time makes the stale-lie unrepresentable: only
+    /// the server's OP_ShopRequest echo (`apply_shop_request`) may set it again, so an unanswered
+    /// request now reads as "not open" instead of "still open on the last one".
+    pub fn begin_shop_open(&mut self) {
+        self.merchant_open = None;
+        self.merchant_items.clear();
+    }
+
+    /// Call immediately before sending the OP_ShopPlayerBuy packet itself (#361). Marks `coin` as
+    /// not-yet-verified: a silent buy refusal (inventory-full or LORE conflict, EQEmu
+    /// zone/client_packet.cpp ~14198-14303) sends no echo of any kind, so the client cannot tell
+    /// success from failure until either a confirmed echo arrives or the next `reconcile_coin`
+    /// runs. `apply_shop_player_buy` / `apply_shop_end_confirm` set it back to true once the
+    /// outcome is actually known.
+    pub fn begin_shop_buy(&mut self) {
+        self.coin_verified = false;
+    }
+
+    /// Reconcile the local coin snapshot against the server's authoritative figure, carried by
+    /// every OP_PlayerProfile (#361). Two merchant-buy refusal paths — inventory-full and a LORE
+    /// conflict — send no echo of any kind, and for inventory-full the server takes the coin
+    /// anyway (EQEmu's own source comments at zone/client_packet.cpp:14258-14259 and :14286 admit
+    /// the bug), so a silently-refused buy can leave `coin` diverged from the real balance with
+    /// nothing else to correct it.
+    ///
+    /// Corrects `coin` unconditionally and always leaves `coin_confirmed`/`coin_verified` true —
+    /// the figure is now fresh from the source of truth, resolving any in-flight uncertainty
+    /// either way. Returns the stale prior balance ONLY when it disagreed with the server's figure
+    /// AND a real prior reading already existed; comparing a genuine starting balance against the
+    /// arbitrary all-zero startup default on first login must never be misreported as a desync.
+    pub fn reconcile_coin(&mut self, server_coin: [u32; 4]) -> Option<[u32; 4]> {
+        let prior = self.coin;
+        let desynced = self.coin_confirmed && prior != server_coin;
+        self.coin = server_coin;
+        self.coin_confirmed = true;
+        self.coin_verified = true;
+        if desynced { Some(prior) } else { None }
+    }
+
     /// Mirror a client-authoritative whole-item move (OP_MoveItem) into the local snapshot.
     /// EQEmu applies inventory moves silently — it validates the client's OP_MoveItem and updates
     /// the server inventory but sends no echo (the real client already moved the item in its own
@@ -1071,7 +1128,7 @@ pub fn split_keywords(text: &str) -> Vec<(String, bool)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Door, Entity, GameState};
+    use super::{Door, Entity, GameState, MerchantItem};
 
     /// eqoxide#201: the flat bag-slot mapping must round-trip and match the RoF2 numbering
     /// (GENERAL_BAGS_BEGIN=251, stride 10, parent general slots 23-32).
@@ -1164,6 +1221,80 @@ mod tests {
         // Spend everything (84037 copper)
         assert!(gs.spend_coin(84_037));
         assert_eq!(gs.coin, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn begin_shop_open_clears_a_stale_previous_merchant() {
+        // #360: sending a NEW OP_ShopRequest (for merchant B) must not leave `merchant_open`
+        // reporting the PREVIOUS merchant (A) if B's request is refused silently (no echo at
+        // all — out-of-range/non-merchant, EQEmu client_packet.cpp:14605-14612). Clearing at
+        // send time means a request that never gets answered reads as "not open", never "still
+        // open on A".
+        let mut gs = GameState::new();
+        gs.merchant_open = Some(111); // merchant A, from a prior successful open
+        gs.merchant_items.push(MerchantItem { merchant_slot: 1, item_id: 1, name: "Rusty Dagger".into(), icon: 0, price: 5, quantity: 1 });
+
+        gs.begin_shop_open(); // about to send OP_ShopRequest for merchant B
+
+        assert_eq!(gs.merchant_open, None, "must not still report the previous merchant (A) as open");
+        assert!(gs.merchant_items.is_empty(), "stale wares list must not survive either");
+    }
+
+    #[test]
+    fn begin_shop_buy_marks_coin_unverified_until_resolved() {
+        // #361: the moment a buy is sent, coin becomes provisionally unverified — a silent
+        // refusal (inventory-full/LORE) sends no echo at all, so we cannot know yet whether the
+        // server's balance still matches ours.
+        let mut gs = GameState::new();
+        gs.coin_verified = true;
+        gs.begin_shop_buy();
+        assert!(!gs.coin_verified, "coin must be unverified the instant a buy is in flight");
+    }
+
+    #[test]
+    fn reconcile_coin_corrects_a_silent_divergence_and_reports_it() {
+        // The inventory-full refusal path takes the player's coin server-side but sends no echo
+        // (EQEmu client_packet.cpp: TakeMoneyFromPP @14261-14278 runs before the free-slot check
+        // @14282-14303 that can fail) — so the client's balance silently overstates reality until
+        // the next OP_PlayerProfile arrives and this reconciles it.
+        let mut gs = GameState::new();
+        gs.coin = [10, 0, 0, 0];
+        gs.coin_confirmed = true; // we already had a real prior reading (not first login)
+        gs.coin_verified = false; // a buy is in flight, outcome unknown
+
+        let prior = gs.reconcile_coin([9, 5, 0, 0]); // server says less than we believed
+
+        assert_eq!(prior, Some([10, 0, 0, 0]), "a real mismatch must be reported, not swallowed");
+        assert_eq!(gs.coin, [9, 5, 0, 0], "coin must be corrected to the server's authoritative figure");
+        assert!(gs.coin_verified, "the figure is now fresh from the source of truth");
+        assert!(gs.coin_confirmed);
+    }
+
+    #[test]
+    fn reconcile_coin_agrees_reports_nothing() {
+        let mut gs = GameState::new();
+        gs.coin = [9, 5, 0, 0];
+        gs.coin_confirmed = true;
+        let prior = gs.reconcile_coin([9, 5, 0, 0]);
+        assert_eq!(prior, None, "matching figures are not a desync");
+        assert!(gs.coin_verified);
+    }
+
+    #[test]
+    fn reconcile_coin_first_login_never_misreports_the_zero_default_as_a_desync() {
+        // A fresh GameState starts coin=[0,0,0,0], coin_confirmed=false. The FIRST real
+        // OP_PlayerProfile a returning (non-broke) character receives will almost always disagree
+        // with that arbitrary startup default — this must never be reported as a "desync".
+        let mut gs = GameState::new();
+        assert!(!gs.coin_confirmed, "precondition: no real coin reading has ever landed yet");
+        assert_eq!(gs.coin, [0, 0, 0, 0]);
+
+        let prior = gs.reconcile_coin([12, 3, 4, 5]); // the character's actual starting balance
+
+        assert_eq!(prior, None, "seeding the very first real balance is not a desync");
+        assert_eq!(gs.coin, [12, 3, 4, 5]);
+        assert!(gs.coin_confirmed);
+        assert!(gs.coin_verified);
     }
 
     #[test]
