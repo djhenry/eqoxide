@@ -443,15 +443,22 @@ pub struct GameState {
     /// Gates `reconcile_coin`'s desync report: comparing a genuine starting balance against the
     /// arbitrary all-zero startup default on first login must never be misreported as a "desync".
     pub coin_confirmed: bool,
-    /// True when `coin` is currently believed to match the server's real balance. Set false at the
-    /// moment a buy is SENT (`begin_shop_buy`) and only set true again once the outcome is actually
-    /// known: a confirmed buy echo, a confirmed refusal (`OP_ShopEndConfirm`), or the next
-    /// authoritative `OP_PlayerProfile` (`reconcile_coin`). Two merchant-buy refusal paths —
-    /// inventory-full and a LORE conflict (EQEmu zone/client_packet.cpp ~14198-14303) — send NO
-    /// echo of any kind, so without this flag a silently-refused buy (which, for inventory-full,
-    /// the server's own source comments admit it charges for anyway) would leave `coin` diverged
-    /// with no observable sign the value is unreliable (#361, agent-honesty).
-    pub coin_verified: bool,
+    /// Count of merchant buys SENT since the last authoritative OP_PlayerProfile reconciliation
+    /// (#361). Incremented by `begin_shop_buy` the instant a buy goes out; reset to zero ONLY by
+    /// `reconcile_coin` — the sole path that compares `coin` against the server's real balance.
+    /// Any nonzero value means at least one buy's outcome is unaccounted-for against server truth:
+    /// two merchant-buy refusal paths — inventory-full and a LORE conflict (EQEmu
+    /// zone/client_packet.cpp ~14198-14303) — send NO echo of any kind, and inventory-full takes
+    /// the coin anyway (the server's own source comments admit the missing refund), so a
+    /// silently-refused buy leaves `coin` diverged with no per-buy signal.
+    ///
+    /// Deliberately a counter, not a bool, and `coin_verified` is a COMPUTED read of it (never an
+    /// independently-settable field): a later CONFIRMED buy must NOT be able to clear the standing
+    /// uncertainty. `spend_coin` succeeding against an already-stale balance (stale from an EARLIER
+    /// silent refusal) would otherwise re-flip a bool back to "verified" while still off by that
+    /// refusal — a compounding lie a single per-transaction confirmation cannot be allowed to tell
+    /// (reviewer-proven, #361 review, agent-honesty). Only real server truth resolves it.
+    pub unverified_buys: u32,
     /// Stats (STR, STA, CHA, DEX, INT, AGI, WIS), from the player profile.
     pub stats: [u32; 7],
     /// Item material IDs for each equipment slot (0..9), from the player profile.
@@ -876,7 +883,7 @@ impl GameState {
         true
     }
 
-    /// Call immediately before sending an OP_ShopRequest to open a merchant window — the first
+    /// Call immediately before sending an OP_ShopRequest to open merchant `merchant_id` — the first
     /// packet of every buy, sell, and explicit `/v1/merchant/open` (#360). `Handle_OP_ShopRequest`
     /// (EQEmu zone/client_packet.cpp) sends NO echo at all on a failed request — a non-merchant
     /// target (:14605-14607) or an out-of-range one (:14610-14612) — so without this,
@@ -884,19 +891,38 @@ impl GameState {
     /// request. Clearing it optimistically at send time makes the stale-lie unrepresentable: only
     /// the server's OP_ShopRequest echo (`apply_shop_request`) may set it again, so an unanswered
     /// request now reads as "not open" instead of "still open on the last one".
-    pub fn begin_shop_open(&mut self) {
-        self.merchant_open = None;
-        self.merchant_items.clear();
+    ///
+    /// Clears ONLY when this is genuinely a (re)open of a DIFFERENT merchant, or a first open. The
+    /// routine pre-buy/pre-sell OP_ShopRequest resend against the merchant that's ALREADY open must
+    /// NOT flicker `merchant_open` to None for a round-trip — `sync_merchant` mirrors it into the
+    /// HTTP snapshot every tick and the HUD gates the window on `is_some()`, so a blind clear-then-
+    /// reconfirm made every buy/sell briefly report the open merchant as closed, a new false
+    /// negative (#361 review — FIX 2). A stale id from an earlier failed request differs from this
+    /// target and is still cleared.
+    pub fn begin_shop_open_for(&mut self, merchant_id: u32) {
+        if self.merchant_open != Some(merchant_id) {
+            self.merchant_open = None;
+            self.merchant_items.clear();
+        }
     }
 
-    /// Call immediately before sending the OP_ShopPlayerBuy packet itself (#361). Marks `coin` as
-    /// not-yet-verified: a silent buy refusal (inventory-full or LORE conflict, EQEmu
-    /// zone/client_packet.cpp ~14198-14303) sends no echo of any kind, so the client cannot tell
-    /// success from failure until either a confirmed echo arrives or the next `reconcile_coin`
-    /// runs. `apply_shop_player_buy` / `apply_shop_end_confirm` set it back to true once the
-    /// outcome is actually known.
+    /// Call immediately before sending the OP_ShopPlayerBuy packet itself (#361). Records that a
+    /// buy is now outstanding and unaccounted-for against server truth (`unverified_buys += 1`), so
+    /// `coin_verified()` reads false until the next `reconcile_coin`. A silent buy refusal
+    /// (inventory-full or LORE conflict, EQEmu zone/client_packet.cpp ~14198-14303) sends no echo
+    /// of any kind, so the client cannot tell success from failure per-buy; only an OP_PlayerProfile
+    /// clears the uncertainty. Saturating so a marathon shopping run can never wrap the counter.
     pub fn begin_shop_buy(&mut self) {
-        self.coin_verified = false;
+        self.unverified_buys = self.unverified_buys.saturating_add(1);
+    }
+
+    /// True only when `coin` is known to match the server's real balance: a genuine reading has
+    /// landed (`coin_confirmed`) AND no merchant buy has been sent since the last authoritative
+    /// reconciliation (`unverified_buys == 0`). Computed — never an independently-settable field —
+    /// so no single per-transaction confirmation can assert trust the client has not actually
+    /// verified against server truth (#361, agent-honesty).
+    pub fn coin_verified(&self) -> bool {
+        self.coin_confirmed && self.unverified_buys == 0
     }
 
     /// Reconcile the local coin snapshot against the server's authoritative figure, carried by
@@ -906,17 +932,20 @@ impl GameState {
     /// the bug), so a silently-refused buy can leave `coin` diverged from the real balance with
     /// nothing else to correct it.
     ///
-    /// Corrects `coin` unconditionally and always leaves `coin_confirmed`/`coin_verified` true —
-    /// the figure is now fresh from the source of truth, resolving any in-flight uncertainty
-    /// either way. Returns the stale prior balance ONLY when it disagreed with the server's figure
-    /// AND a real prior reading already existed; comparing a genuine starting balance against the
-    /// arbitrary all-zero startup default on first login must never be misreported as a desync.
+    /// Corrects `coin` unconditionally, marks it confirmed, and clears `unverified_buys` back to
+    /// zero — the figure is now fresh from the source of truth, so `coin_verified()` reads true and
+    /// every outstanding buy's uncertainty is resolved at once. This is the ONLY path that clears
+    /// that uncertainty: a per-buy echo cannot, because it confirms a relative delta, not that the
+    /// absolute balance escaped an earlier silent refusal (#361 review). Returns the stale prior
+    /// balance ONLY when it disagreed with the server's figure AND a real prior reading already
+    /// existed; comparing a genuine starting balance against the arbitrary all-zero startup default
+    /// on first login must never be misreported as a desync.
     pub fn reconcile_coin(&mut self, server_coin: [u32; 4]) -> Option<[u32; 4]> {
         let prior = self.coin;
         let desynced = self.coin_confirmed && prior != server_coin;
         self.coin = server_coin;
         self.coin_confirmed = true;
-        self.coin_verified = true;
+        self.unverified_buys = 0;
         if desynced { Some(prior) } else { None }
     }
 
@@ -1234,10 +1263,25 @@ mod tests {
         gs.merchant_open = Some(111); // merchant A, from a prior successful open
         gs.merchant_items.push(MerchantItem { merchant_slot: 1, item_id: 1, name: "Rusty Dagger".into(), icon: 0, price: 5, quantity: 1 });
 
-        gs.begin_shop_open(); // about to send OP_ShopRequest for merchant B
+        gs.begin_shop_open_for(222); // about to send OP_ShopRequest for a DIFFERENT merchant B
 
         assert_eq!(gs.merchant_open, None, "must not still report the previous merchant (A) as open");
         assert!(gs.merchant_items.is_empty(), "stale wares list must not survive either");
+    }
+
+    #[test]
+    fn begin_shop_open_for_an_already_open_merchant_does_not_flicker_it_closed() {
+        // #361 review (FIX 2): the pre-buy/pre-sell OP_ShopRequest resend targets the merchant
+        // that's ALREADY open. Clearing merchant_open here would flicker the HUD/`/v1/merchant/list`
+        // to "closed" for a round-trip against a merchant that never closed — a new false negative.
+        let mut gs = GameState::new();
+        gs.merchant_open = Some(111);
+        gs.merchant_items.push(MerchantItem { merchant_slot: 1, item_id: 1, name: "Rusty Dagger".into(), icon: 0, price: 5, quantity: 1 });
+
+        gs.begin_shop_open_for(111); // re-open the SAME merchant (routine pre-buy resend)
+
+        assert_eq!(gs.merchant_open, Some(111), "an already-open merchant must not flicker closed");
+        assert!(!gs.merchant_items.is_empty(), "its wares list must survive the resend too");
     }
 
     #[test]
@@ -1246,9 +1290,38 @@ mod tests {
         // refusal (inventory-full/LORE) sends no echo at all, so we cannot know yet whether the
         // server's balance still matches ours.
         let mut gs = GameState::new();
-        gs.coin_verified = true;
+        gs.coin_confirmed = true; // a real reading had landed, so coin_verified() was true
+        assert!(gs.coin_verified());
         gs.begin_shop_buy();
-        assert!(!gs.coin_verified, "coin must be unverified the instant a buy is in flight");
+        assert!(!gs.coin_verified(), "coin must be unverified the instant a buy is in flight");
+    }
+
+    #[test]
+    fn a_confirmed_buy_cannot_re_verify_coin_left_stale_by_an_earlier_silent_refusal() {
+        // #361 review (FIX 1, reviewer-proven PoC): coin_verified must not be a bool any single
+        // confirmation can clear. Scenario:
+        //   * coin confirmed+verified.
+        //   * Buy #1 is a TRUE silent inventory-full refusal — begin_shop_buy runs, then nothing
+        //     (no echo). coin stays put locally but server truth has silently dropped.
+        //   * Buy #2 is a normal CONFIRMED purchase the still-stale local balance can cover.
+        // The confirmed buy #2 must NOT flip coin back to "verified": the earlier silent refusal
+        // is still unaccounted-for, so only a real OP_PlayerProfile may restore trust.
+        let mut gs = GameState::new();
+        gs.coin = [100, 0, 0, 0];
+        gs.coin_confirmed = true;
+        assert!(gs.coin_verified(), "precondition: a real reading had established trust");
+
+        gs.begin_shop_buy(); // buy #1 sent — silent inventory-full refusal, never echoes
+        gs.begin_shop_buy(); // buy #2 sent
+        // buy #2's confirmed echo would run spend_coin against the still-stale [100,..]; simulate
+        // the balance-covering deduction that the OLD bool would have re-verified on.
+        assert!(gs.spend_coin(20));
+        assert!(!gs.coin_verified(),
+            "a confirmed buy cannot earn back trust while an earlier silent refusal is unresolved");
+
+        // Only the authoritative server profile clears the standing uncertainty.
+        gs.reconcile_coin([50, 0, 0, 0]);
+        assert!(gs.coin_verified(), "a real OP_PlayerProfile is the sole path back to verified");
     }
 
     #[test]
@@ -1260,13 +1333,14 @@ mod tests {
         let mut gs = GameState::new();
         gs.coin = [10, 0, 0, 0];
         gs.coin_confirmed = true; // we already had a real prior reading (not first login)
-        gs.coin_verified = false; // a buy is in flight, outcome unknown
+        gs.begin_shop_buy();      // a buy is in flight, outcome unknown
+        assert!(!gs.coin_verified());
 
         let prior = gs.reconcile_coin([9, 5, 0, 0]); // server says less than we believed
 
         assert_eq!(prior, Some([10, 0, 0, 0]), "a real mismatch must be reported, not swallowed");
         assert_eq!(gs.coin, [9, 5, 0, 0], "coin must be corrected to the server's authoritative figure");
-        assert!(gs.coin_verified, "the figure is now fresh from the source of truth");
+        assert!(gs.coin_verified(), "the figure is now fresh from the source of truth");
         assert!(gs.coin_confirmed);
     }
 
@@ -1277,7 +1351,7 @@ mod tests {
         gs.coin_confirmed = true;
         let prior = gs.reconcile_coin([9, 5, 0, 0]);
         assert_eq!(prior, None, "matching figures are not a desync");
-        assert!(gs.coin_verified);
+        assert!(gs.coin_verified());
     }
 
     #[test]
@@ -1294,7 +1368,7 @@ mod tests {
         assert_eq!(prior, None, "seeding the very first real balance is not a desync");
         assert_eq!(gs.coin, [12, 3, 4, 5]);
         assert!(gs.coin_confirmed);
-        assert!(gs.coin_verified);
+        assert!(gs.coin_verified());
     }
 
     #[test]

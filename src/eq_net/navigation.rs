@@ -2374,11 +2374,12 @@ impl Navigator {
         let buy_req = self.buy.lock().unwrap().take();
         if let Some((merchant_id, slot)) = buy_req {
             // #360/#361: a failed/unanswered OP_ShopRequest must not leave `merchant_open` reporting
-            // the PREVIOUS merchant, and the coin balance must read as provisionally unverified until
-            // this buy's outcome is actually known (a confirmed echo, a confirmed refusal, or the next
-            // OP_PlayerProfile reconciliation) — a silent inventory-full/LORE refusal sends no echo at
-            // all. See GameState::begin_shop_open/begin_shop_buy for the full rationale.
-            gs.begin_shop_open();
+            // a DIFFERENT previous merchant, and the coin balance must read as unverified until this
+            // buy is reconciled against a real OP_PlayerProfile — a silent inventory-full/LORE refusal
+            // sends no echo at all. begin_shop_open_for only clears when re-targeting a different (or
+            // no) merchant, so a routine re-buy from the already-open one doesn't flicker it closed
+            // (#361 review FIX 2). See GameState::begin_shop_open_for/begin_shop_buy for the rationale.
+            gs.begin_shop_open_for(merchant_id);
             gs.begin_shop_buy();
             let open = merchant_click(merchant_id, gs.player_id, 1);
             stream.send_app_packet(OP_SHOP_REQUEST, &open);
@@ -2410,8 +2411,9 @@ impl Navigator {
         // Must be within ~200u of the merchant; the server computes the price (we send 0).
         let sell_req = self.sell.lock().unwrap().take();
         if let Some((merchant_id, slot, quantity)) = sell_req {
-            // #360: same staleness hazard as the buy path above — clear before sending.
-            gs.begin_shop_open();
+            // #360: same staleness hazard as the buy path above — clear a DIFFERENT stale merchant
+            // before sending, but don't flicker the one that's already open (#361 review FIX 2).
+            gs.begin_shop_open_for(merchant_id);
             let open = merchant_click(merchant_id, gs.player_id, 1);
             stream.send_app_packet(OP_SHOP_REQUEST, &open);
             // RoF2 Merchant_Purchase_Struct is 20 bytes (rof2_structs.h): npcid(u32)@0,
@@ -2448,8 +2450,9 @@ impl Navigator {
             if command == 1 {
                 // #360: clear before sending — an Open request that never gets an echo (non-merchant
                 // target / out-of-range) must not leave `merchant_open` reporting the merchant we had
-                // open before this request.
-                gs.begin_shop_open();
+                // open before this request. begin_shop_open_for keeps an already-open re-open from
+                // flickering the window closed (#361 review FIX 2).
+                gs.begin_shop_open_for(merchant_id);
             }
             let open = merchant_click(merchant_id, gs.player_id, command);
             stream.send_app_packet(OP_SHOP_REQUEST, &open);
