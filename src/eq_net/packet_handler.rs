@@ -3972,14 +3972,30 @@ mod tests {
         // #355 M2: the guard deletion survived because this test had ZERO assertions and
         // `safe_read`'s zero-padding guarantees no panic — so "must not panic" proved nothing.
         // A truncated packet must be REJECTED, not decoded into garbage equipment.
+        // WearChange_S is #[repr(C, packed)] => SIZE_WEAR_CHANGE is exactly 9.
         gs.player_id = 0x0201;
-        let short = [0x01u8, 0x02, 17, 0]; // len 4 < SIZE_WEAR_CHANGE (10)
+        let short = [0x01u8, 0x02, 17, 0]; // len 4, well below SIZE_WEAR_CHANGE (9)
         assert!(short.len() < SIZE_WEAR_CHANGE, "test premise: packet is genuinely short");
         apply_wear_change(&mut gs, &short); // must not panic AND must not mutate state
         assert_eq!(gs.player_equipment, [0u32; 9],
             "a short WearChange must be rejected by the length guard, not zero-pad-decoded \
              into garbage equipment for the local player (#355 M2)");
         assert_eq!(gs.player_equipment_tint, [[0u8; 3]; 9], "tint must also stay untouched");
+
+        // Boundary case — pin the EXACT cutoff, not just "very short". A packet of
+        // SIZE_WEAR_CHANGE-1 (8) bytes already fills every field that matters here
+        // (spawn_id@0, material@2, color@4..8 — only the trailing wear_slot_id@8 is
+        // missing, so it zero-pads to slot 0). It must STILL be rejected. Without this case
+        // the test catches a guard DELETE but not a guard RELAX (e.g. `< SIZE_WEAR_CHANGE`
+        // -> `< 5`), which would let lengths 5..=8 decode into valid-looking garbage
+        // equipment — the very "silent garbage from a short packet" impact M2 exists to prevent.
+        let boundary = [0x01u8, 0x02, 17, 0, 0, 0, 0, 0]; // len 8 = SIZE_WEAR_CHANGE-1; material 17, slot 0 (padded)
+        assert_eq!(boundary.len(), SIZE_WEAR_CHANGE - 1, "test premise: one byte short of the full struct");
+        apply_wear_change(&mut gs, &boundary);
+        assert_eq!(gs.player_equipment, [0u32; 9],
+            "a WearChange one byte short of SIZE_WEAR_CHANGE must be rejected too — the guard must \
+             pin the exact cutoff, not merely 'very short' (#355 M2, overfit guard)");
+        assert_eq!(gs.player_equipment_tint, [[0u8; 3]; 9], "tint must also stay untouched at the boundary");
     }
 
     #[test]
