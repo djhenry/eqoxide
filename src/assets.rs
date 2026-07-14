@@ -507,14 +507,24 @@ pub const COLLISION_MESH_TAG: &str = "__collision__";
 /// same `PlanOutcome` on my box, on CI, and on the user's, whatever the load. Hitting it yields
 /// `Exhausted(NodeCap)`, an honest and *reproducible* "I stopped looking".
 ///
-/// **Chosen by measurement** (`worst_case_reachable_component`, over the biggest baked zones): the
-/// largest real reachable-component close is **everfrost, 1,121,438 nodes** (its 8 u nav grid is ~1.1M
-/// cells). That is the worst legitimate whole-zone "no route" the cap must let through as
-/// `SearchClosed` — and note it already EXCEEDED the previous `MAX_NODES = 1_000_000`, so main was
-/// silently truncating everfrost's honest closes into false `Exhausted`. This cap is ~7× above it, so a
-/// legitimate whole-zone close always reaches `SearchClosed`, with headroom for larger unmeasured zones,
-/// while still bounding a true runaway. It is the cap for the ENTIRE plan (`plan_path` makes up to 13
-/// A* calls); callers share ONE `PlanCtx`, so the plan is bounded by one budget, not one-per-call (#340).
+/// **Chosen by measurement** (`worst_case_reachable_component`, over the biggest baked zones in the
+/// test corpus): the largest **measured-corpus** reachable-component close is **everfrost, 1,121,438
+/// nodes** (its 8 u nav grid is ~1.1M cells). That is the worst legitimate whole-zone "no route" the
+/// cap must let through as `SearchClosed` — and note it already EXCEEDED the previous
+/// `MAX_NODES = 1_000_000`, so main was silently truncating everfrost's honest closes into false
+/// `Exhausted`. This cap is ~7× above it, so a legitimate whole-zone close reaches `SearchClosed` with
+/// headroom, while still bounding a true runaway.
+///
+/// **Caveat, stated honestly:** everfrost is the biggest zone *in the corpus*, NOT the biggest in RoF2
+/// — larger outdoor zones exist and are unmeasured. But the residual risk is small and bounded: (1) a
+/// REACHABLE goal is found by goal-directed A* long before the cap (the admissible heuristic pulls the
+/// search toward the goal, so it does not explore the whole component), so a bigger zone does not make
+/// a reachable goal false-`Exhausted`; (2) the only failure is an UNREACHABLE goal in a >8M-node
+/// component reporting `Exhausted(NodeCap)` ("I don't know") instead of `Unreachable(SearchClosed)`
+/// ("no") — which is still HONEST, just less precise. So 8M is a precision floor, not a safety floor.
+///
+/// It is the cap for the ENTIRE plan (`plan_path` makes up to 13 A* calls sharing one `PlanCtx`
+/// budget), so the plan is bounded by one budget, not one-per-call (#340).
 pub const MAX_NODES: usize = 8_000_000;
 
 /// Deterministic node cap for the FINE local tier (#394). Replaces `NET_TIER_BUDGET_MS = 150`.
@@ -531,10 +541,12 @@ pub const NET_TIER_NODE_CAP: usize = 40_000;
 
 /// Per-plan context for `find_path_res`: the things that must be shared across the several A* calls
 /// one logical plan makes, rather than re-armed per call.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct PlanCtx {
-    /// The search's runaway bound: a maximum number of node expansions, shared by every A* call in one
-    /// plan so a plan's total cost is bounded by ONE budget rather than one-per-call (#340).
+    /// The plan's runaway bound: a maximum number of node expansions **across the WHOLE plan** (#340,
+    /// #394). `plan_path` makes up to 13 A* calls (1 primary + a 12-point `StartIsolated` re-anchor
+    /// ring), and `search_tiered` makes up to 2 clearance passes inside each — this is the budget for
+    /// ALL of them together, not one each.
     ///
     /// **This is a NODE COUNT, not a wall clock, and it deliberately CANNOT be a wall clock (#394).**
     /// A wall-clock deadline made the planner's answer depend on machine speed: a genuinely-unreachable
@@ -545,9 +557,23 @@ pub struct PlanCtx {
     /// that builds one, so a clock-dependent search is not merely discouraged — it is unrepresentable.
     ///
     /// `None` = the global `MAX_NODES` backstop. A caller may set a TIGHTER cap (the tiers do — see
-    /// [`WORKER_NODE_CAP`] / [`NET_TIER_NODE_CAP`]). Whichever bites, the outcome is
-    /// `Exhausted(NodeCap)` — an honest "I stopped looking", never a "no route".
+    /// [`NET_TIER_NODE_CAP`]). Whichever bites, the outcome is `Exhausted(NodeCap)` — an honest
+    /// "I stopped looking", never a "no route".
     pub node_cap: Option<usize>,
+    /// The plan-wide RUNNING TOTAL of node expansions, shared by every A* call in the plan (#394 review).
+    ///
+    /// This is what makes `node_cap` a WHOLE-PLAN bound rather than a per-call one. On `main` the
+    /// wall-clock version got plan-wide bounding for free: `deadline` was a single absolute `Instant`,
+    /// so all 13 calls checked the *same* moment. A node count has no absolute reference — expansions
+    /// accumulate — so the running total must be shared explicitly. Every `astar` increments this
+    /// counter and stops the plan when it passes `node_cap`; a plan that fans out to 13 calls therefore
+    /// still costs at most `node_cap` expansions total, not `node_cap × 13`. The first plan owner
+    /// (`plan_path`, or a standalone `find_path_ex`/`find_path_res`) materialises it via
+    /// [`PlanCtx::ensure_budget`]; every call it spawns clones the same `Arc` and so shares the count.
+    ///
+    /// `None` only in a `PlanCtx` that has not yet entered a plan (e.g. `PlanCtx::worker()` before it
+    /// reaches `find_path_ex`); the plan owner fills it in before the first search runs.
+    pub expanded: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     /// Zone-point index of a `DRNTP` zone-line region we are routing to. When set, A* accepts
     /// arrival at ANY cell whose (XY, floor) lies inside that region — not just the one goal cell
     /// at the right tier. A region's representative point is an interior point of a VOLUME, so its
@@ -559,6 +585,18 @@ impl PlanCtx {
     /// A context bounded by a fresh node cap, shared across the plan's A* calls.
     pub fn with_node_cap(cap: usize) -> Self {
         PlanCtx { node_cap: Some(cap), ..Default::default() }
+    }
+    /// Materialise the plan-wide expansion counter if it isn't already present, and return the ctx.
+    ///
+    /// Called by the PLAN OWNERS — `plan_path`, and standalone `find_path_ex`/`find_path_res` — so that
+    /// every A* call in one logical plan shares ONE running total. Idempotent: a ctx that already has a
+    /// counter (because `plan_path` set it before fanning out to `find_path_ex`) keeps that same shared
+    /// `Arc`, which is exactly how the 13 calls come to share a budget.
+    pub fn ensure_budget(mut self) -> Self {
+        if self.expanded.is_none() {
+            self.expanded = Some(std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        }
+        self
     }
     /// The pathfinding worker's context: bounded only by the global [`MAX_NODES`] backstop, which is
     /// generous enough that a real whole-zone close reaches `SearchClosed` (chosen by measurement). Its
@@ -1595,6 +1633,8 @@ impl Collision {
     #[allow(clippy::too_many_arguments)]
     pub fn find_path_res(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]],
         allow_partial: bool, cell: f32, max_search: Option<f32>, aggro_buffer: f32, ctx: PlanCtx) -> Option<Vec<[f32; 3]>> {
+        // Plan owner: materialise the plan-wide budget so this call's internal A* passes share one cap.
+        let ctx = ctx.ensure_budget();
         let (s, _tight) = self.search_tiered(start, goal, radius, avoid, cell, max_search, aggro_buffer, ctx);
         match s.path {
             Some((p, true)) => Some(p),
@@ -1615,6 +1655,9 @@ impl Collision {
     #[allow(clippy::too_many_arguments)]
     pub fn find_path_ex(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]],
         cell: f32, max_search: Option<f32>, aggro_buffer: f32, ctx: PlanCtx) -> PlanOutcome {
+        // Plan owner (when called standalone). When `plan_path` drives this, `ctx` already carries a
+        // shared counter, so `ensure_budget` is a no-op and all 13 calls keep sharing the one budget.
+        let ctx = ctx.ensure_budget();
         let (s, _tight) = self.search_tiered(start, goal, radius, avoid, cell, max_search, aggro_buffer, ctx);
         match s.path {
             Some((p, true)) => PlanOutcome::Route(p),
@@ -1684,11 +1727,16 @@ impl Collision {
         let chooses_a_route = max_search.is_none();
         let preferred = if chooses_a_route { minimum.max(NAV_PREFERRED_CLEARANCE) } else { minimum };
         if preferred > minimum {
-            // Hand the generous pass a SLICE of the caller's node budget. The minimum pass keeps the
-            // caller's ORIGINAL cap, so the plan as a whole still finishes inside the one budget the
-            // caller set, and the fallback always has the full budget to find the route that exists.
-            // A node cap needs no "materialise once" dance — it does not run down between the passes.
-            let generous_ctx = PlanCtx { node_cap: generous_node_cap(ctx.node_cap), ..ctx };
+            // Give the generous pass a SLICE of the budget that REMAINS at this point in the plan, and
+            // let it draw from the same plan-wide counter (`..ctx.clone()` shares the `Arc`). Since both
+            // passes share one running total, the minimum pass — which gets the FULL cap — always has
+            // whatever the generous pass did not spend, so the roomy tier can never starve the tier that
+            // actually decides whether a route exists (#302). The slice is computed on the budget LEFT,
+            // not the original cap, exactly as `main`'s `generous_deadline` sliced the remaining time.
+            let cap = ctx.node_cap.unwrap_or(MAX_NODES).min(MAX_NODES);
+            let used = ctx.expanded.as_ref().map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
+            let generous_cap = used + generous_node_cap(Some(cap.saturating_sub(used))).unwrap_or(0);
+            let generous_ctx = PlanCtx { node_cap: Some(generous_cap), ..ctx.clone() };
             let s = self.search(start, goal, preferred, avoid, cell, max_search, aggro_buffer, generous_ctx);
             if matches!(s.path, Some((_, true))) { return (s, false); }
         }
@@ -1740,7 +1788,9 @@ impl Collision {
                 && s.no_route != Some(NoRoute::GoalNotWalkable)
                 && s.no_route != Some(NoRoute::NoGeometry)
         };
-        let s = self.astar(start, goal, radius, avoid, cell, max_search, aggro_buffer, ctx, true);
+        // Both anchors share the plan-wide budget (same `ctx.expanded` Arc): the retry draws down what
+        // the first anchor left, so the two together cost one budget, not two.
+        let s = self.astar(start, goal, radius, avoid, cell, max_search, aggro_buffer, ctx.clone(), true);
         if !boxed_in(&s) { return s; }
         // Anchoring at the character's exact position got nowhere. Retry from the cell centre (the
         // classic #2/#205 rescue) before believing anything.
@@ -2070,7 +2120,12 @@ impl Collision {
         floor_of.insert(skey, start_floor);
         let mut heap = BinaryHeap::new();
         heap.push(Node { f: h(sc, sr), c: sc, r: sr, fz: start_floor });
-        let mut expanded = 0usize;
+        // The PLAN-WIDE running total of expansions (#394 review). `astar` increments the shared
+        // counter (materialised by the plan owner via `PlanCtx::ensure_budget`) so that a plan fanning
+        // out to up to 13 A* calls is bounded by ONE `node_cap`, not `node_cap` per call. A ctx with no
+        // shared counter (only a raw unit test constructs one) falls back to a local count, which for a
+        // single call is the same thing.
+        let mut local_expanded = 0usize;
         let mut goal_key: Option<Key> = None;
         // A goal-cell node reached at the WRONG tier — kept as a last resort so we never regress to
         // "no route" when the requested tier is unreachable (better a wrong-tier path than none).
@@ -2107,15 +2162,20 @@ impl Collision {
                 // may be reachable by climbing to it at an adjacent cell. Fall through and expand.
                 if goal_fallback.is_none() { goal_fallback = Some(ckey); }
             }
-            expanded += 1;
-            // The ONE runaway bound, and it is a deterministic node count (#394). Whichever cap the
-            // caller set (or the global `MAX_NODES` backstop), the same query hits it after the same
-            // number of expansions on every machine — so an unreachable goal that overruns the cap
-            // reports `Exhausted(NodeCap)` reproducibly, instead of `SearchClosed` on a fast box and
-            // `Exhausted(Deadline)` on a slow one. The wall-clock check that used to sit here (and made
-            // the answer machine-speed-dependent) is deleted; there is no `Instant::now()` in the
-            // search at all now, so the search cost also stops paying that per-batch clock read.
-            if expanded > node_cap { limit = Some(PlanLimit::NodeCap); break; }
+            // The ONE runaway bound, and it is a deterministic, PLAN-WIDE node count (#394 + review).
+            // Increment the shared running total (or a local one for a bare unit-test ctx) and stop
+            // when it passes `node_cap`. Because every A* call in the plan shares this counter, a plan
+            // that fans out to 13 calls still costs at most `node_cap` expansions in total, not per
+            // call — which is what makes the "one plan, one budget" contract (#340) true rather than
+            // merely documented. Whichever cap bites, the same query hits it after the same number of
+            // expansions on every machine — `Exhausted(NodeCap)` reproducibly, instead of `SearchClosed`
+            // on a fast box and `Exhausted(Deadline)` on a slow one. The wall-clock check that used to
+            // sit here is deleted; there is no `Instant::now()` in the search at all now.
+            let total = match &ctx.expanded {
+                Some(shared) => shared.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+                None => { local_expanded += 1; local_expanded }
+            };
+            if total > node_cap { limit = Some(PlanLimit::NodeCap); break; }
             // Track the closest-to-goal cell reached (heuristic = straight-line cells to the goal),
             // for the partial-path fallback below.
             let hd = h(c, r);
@@ -2409,8 +2469,8 @@ impl Collision {
                 let progressed = best_toward.is_some() && best_toward_h + 1.0 < h(sc, sr);
                 match best_toward {
                     Some(bk) if progressed => {
-                        tracing::info!("find_path: partial route toward goal (expanded={}, {:.0}->{:.0} UNITS from goal, {})",
-                            expanded, h(sc, sr), best_toward_h,
+                        tracing::info!("find_path: partial route toward goal (this-call expansions={}, {:.0}->{:.0} UNITS from goal, {})",
+                            closed.len(), h(sc, sr), best_toward_h,
                             match limit { Some(l) => l.as_str(), None => "frontier CLOSED — goal is UNREACHABLE" });
                         (bk, false)
                     }
@@ -2418,9 +2478,9 @@ impl Collision {
                         match limit {
                             Some(l) => tracing::warn!("find_path: search hit a limit ({}) after {} nodes with no usable \
                                 route — start_floor={start_floor} goal_floor={goal_floor}. This is NOT 'no route': the \
-                                frontier was never closed.", l.as_str(), expanded),
+                                frontier was never closed.", l.as_str(), closed.len()),
                             None => tracing::info!("find_path: NO ROUTE — frontier closed after {} nodes \
-                                (start_floor={start_floor}, goal_floor={goal_floor})", expanded),
+                                (start_floor={start_floor}, goal_floor={goal_floor})", closed.len()),
                         }
                         return Search { limit, progress, closed_n: closed.len(), ..Default::default() };
                     }
@@ -4018,10 +4078,11 @@ mod tests {
     /// **PICK THE NODE CAP BY MEASUREMENT (#394).** The worker's node cap must be generous enough that
     /// a legitimate WHOLE-ZONE "no route" still reaches `SearchClosed` — a cap that truncates a real
     /// full-frontier close into `Exhausted(NodeCap)` would be a new honesty bug ("I don't know" where
-    /// the truth is "no route"). So this measures the LARGEST reachable component across the corpus:
-    /// for each zone, a start on real floor, routed to a deliberately-OFF-MESH goal that forces A* to
-    /// flood the entire reachable component and close it. `closed_n` at that point IS the component
-    /// size — the worst case the cap must clear. Run with a HIGH cap so nothing truncates.
+    /// the truth is "no route"). So this measures the LARGEST reachable component across the MEASURED
+    /// corpus (the baked zones available locally — not all of RoF2; see the `MAX_NODES` caveat): for
+    /// each zone, a start on real floor routed to far corners that force A* to flood the reachable
+    /// component. `closed_n` at that point IS the component size — the worst case the cap must clear.
+    /// Run with a HIGH cap so nothing truncates.
     ///
     /// ```text
     /// cargo test --release --lib worst_case_reachable_component -- --ignored --nocapture
