@@ -86,11 +86,16 @@ Do not restart it without reading the review on #372 first.
    planner walkability has SEALED ZONES (the coarse capsule sweep cost **−29% route success in
    akanon**, `assets.rs:1413-1415`). Measure route parity on the corpus before/after.
 
-2. **#382 — the fine (2u) plan still runs on the network thread.** #377 moved the **coarse** plan to a
-   worker (net-thread stall **1.6s → 4µs**, budget deleted). The fine plan still runs per-tick on the
-   net thread under a 150ms budget — so it still can't tell "no route" from "I gave up", and is still
-   nondeterministic under load. **The navmesh is cancelled, so option (2) in that issue is dead: the
-   answer is option (1), extend `nav_planner`.**
+2. **#394 (was RED on main) / #382 — the planner's wall-clock budgets.** #377 moved the **coarse**
+   plan to a worker (net-thread stall **1.6s → 4µs**) but did NOT delete its budget — it RAISED it
+   150ms → 5000ms (`WORKER_PLAN_BUDGET_MS`). The earlier claim here ("budget deleted") was **false**;
+   a 5s wall clock still made the coarse answer machine-speed-dependent, and a loaded CI runner flipped
+   a genuinely-unreachable goal from `Unreachable(SearchClosed)` to `Exhausted(Deadline)` — which is
+   why `main` was intermittently RED. **#394 replaces BOTH tiers' wall clocks with a deterministic
+   NODE CAP** (`PlanLimit::Deadline` and the `deadline` field deleted; `MAX_NODES = 8M`, chosen so
+   everfrost's 1.12M-node whole-zone close still reaches `SearchClosed`). **#382 then moves the fine
+   (2u) plan off the net thread** — the navmesh is cancelled, so option (2) there is dead; the answer
+   is option (1), extend `nav_planner`.
 
 3. **#379 / #381 — the nav-drift family** (plus **#358**, already CLOSED in `8a7bd0b` — context only,
    do not go looking for it). Coarse commits to corridors the fine tier can't fit (no feedback channel,
