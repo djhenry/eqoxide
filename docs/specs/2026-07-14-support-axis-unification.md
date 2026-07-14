@@ -167,7 +167,65 @@ non-negotiable:
    wedge lives — so it literally cannot see this bug today. PR-D must extend it to drive swim/buoyancy, classify
    a "support-drift" wedge (walker finds floor the planner doesn't), and prove that count drops to **0** on
    qcat and the other inverted-art zones (#375 names highpass, permafrost, neriakc).
+   > **⚠️ SUPERSEDED at D-1 implementation — see the Addendum below.** The swim-capable *corpus* scanner was
+   > NOT built as written; a static disagreement scan + the focused qcat pair replaced it, deliberately. The
+   > D-2 gate is **restated** in the Addendum. This bullet is kept verbatim only to show what the original
+   > design said before the deviation.
 3. **The #329 fixtures above stay green and mutation-checked.**
+
+---
+
+## ADDENDUM (D-1 implementation, 2026-07-14): the swim-scanner deferral and the restated D-2 gate
+
+This addendum records a deliberate deviation from the design above, made while implementing D-1 (PR #405), so
+the owner sees that "the swim-capable scanner" (gate item #2 above, and the D-1 plan-table row) became
+"static disagreement scan + focused qcat pair" — and why. **No code changed to accommodate this; it is a
+scoping/gate clarification.**
+
+### 1. What was built instead, and WHY the swim *corpus* scanner is deferred
+
+D-1 ships, in place of a swim-capable corpus scanner:
+- **`qcat_support_floor_is_visible_to_the_planner`** — a focused, deterministic RED-on-main assertion at the
+  live wedge XY: the planner's `column_floors` omits the −42.97 floor the controller's `ground_below` stands on.
+- **`floor_model_disagreement_scan`** — a STATIC corpus scan of planner-vs-controller floor-model disagreement.
+- **`faithful_walker_drift_corpus`** — the dry (water-skipping) per-tick-recovery dynamic harness.
+
+The support-axis drift is a **static property of the floor model**: at the wedge point the two floor *queries*
+disagree **whether or not anyone is swimming**. So it is provable and gate-able deterministically, without
+simulating buoyancy. A swim-simulation *corpus* scanner would add real **buoyancy-fidelity risk** (float rate,
+haul-out sizing, surface-vs-body probes — themselves the subjects of open bugs #197/#309/#359) **without adding
+discrimination at the qcat point** — the focused pair already proves the fix there. Building a fragile swim sim
+to re-derive a fact a two-line static assertion pins would be motion, not progress. The dry faithful scanner is
+kept because per-tick *steering* recovery genuinely needs simulation (that is dynamic, not static); *support*
+does not.
+
+### 2. The restated D-2 gate (this replaces "swim scanner → 0")
+
+Since "the swim scanner's qcat support-drift count → 0" no longer exists as written, **D-2 passes iff ALL of:**
+- **(a)** `qcat_support_floor_is_visible_to_the_planner` flips **RED → GREEN** (the planner now sees the floor
+  the controller stands on);
+- **(b)** `floor_model_disagreement_scan` **drops on the inverted-art zones** (qcat / highpass / permafrost /
+  neriakc) — and, because after D-2 both sides call one `is_standable`, is **0 by construction** everywhere
+  (a nonzero result means the two sides were not actually unified — a blunt but real regression catch);
+- **(c)** corpus **route-success ≥ 99.50%** (`fine_tier_corpus`), stop-and-report on ANY drop;
+- **(d)** the **#329 gates stay GREEN and mutation-checked** — `open_air_ceiling_is_never_returned_as_floor`
+  and `qcat_pocket_nearest_floor_is_never_the_ceiling`, with the D-2 mutation (swap in either naive shortcut)
+  making the open-air fixture return z=8 → RED.
+
+That is the unambiguous bar for D-2's reviewer.
+
+### 3. The water axis is not silently dropped
+
+The live qcat wedge's start anchor carried a `(WATER SURFACE — floating)` component, so the water axis is
+genuinely relevant to this bug. It is covered as follows, and the split is deliberate:
+- **The FIX is proven at the water-adjacent point:** the qcat pair (RED→GREEN) sits exactly on the flooded
+  walkway, so D-2 is verified where the water actually matters.
+- **The swim-capable *corpus breadth* (how many water-adjacent points across all zones) is DEFERRED** to a
+  tracked follow-up, to be built only if the static scan + focused pair prove insufficient in practice. It is
+  **not** a D-2 gate. If it is built, it extends `faithful_walker_drift_corpus` with the swim/buoyancy drive
+  (`want_swim` + `wish_vspeed`, mirroring `navigation.rs`) and un-skips water journeys — the same harness, one
+  more intent. Until then, the water-axis *correctness* is gated (the qcat pair); only its *corpus breadth* is
+  outstanding.
 
 ## Staying honest
 
@@ -189,7 +247,7 @@ most wants re-baking — that list is what I'll hand the asset effort once this 
 
 | step | what | gate |
 |---|---|---|
-| **D-1** | Tests only: the swim scanner variant + the qcat end-to-end repro + the open-air-ceiling fixture. **RED on `main`** (proves the bug before any fix). | fixtures compile; the qcat support-drift repro is RED |
+| **D-1** | Tests only: **[shipped in PR #405]** the focused qcat RED-on-main repro + the #329 open-air-ceiling & qcat-pocket gates + a STATIC `floor_model_disagreement_scan` + the dry `faithful_walker_drift_corpus` harness. The swim-capable *corpus* scanner is **deferred** (see Addendum §1/§3) — the drift is static, so the qcat pair proves it deterministically. **RED on `main`** (proves the bug before any fix). | the qcat support-drift repro is RED on main; #329 gates green + mutation-checked |
 | **D-2** | The shared `is_standable` predicate used by both the planner and the walker; delete the old column-bottom patch. | route-success ≥ 99.50%; all #329 tests green + mutation-checked; qcat support-drift → 0 |
 | **D-3** | The `nav_support` honesty counter; `docs/http-api.md` updated. | a test that it fires on inverted art and is null on clean art |
 
