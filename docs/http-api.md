@@ -15,7 +15,7 @@ All routes are **versioned and grouped**: `/<version>/<group>/<action>`. The cur
 | `move`      | movement: goto (walk & stop) / follow (walk & keep following) / stop / zone cross |
 | `combat`    | targeting, auto-attack, consider, spell scribe/memorize/cast |
 | `interact`  | hail, say, loot, give (turn-in), doors, sit/stand |
-| `quests`    | native task journal + old-style Lua turn-in quest givers, task offers/accept/decline/cancel |
+| `quests`    | native EQ task journal (server-pushed), task offers/accept/decline/cancel |
 | `merchant`  | open/close a vendor, list wares, buy, sell |
 | `inventory` | inventory management actions |
 | `events`    | read the async event feed (chat/combat/navigate/system) |
@@ -88,7 +88,6 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 
 | Route | Body | Description |
 |-------|------|-------------|
-| `GET /v1/quests/givers` | — | "Quests near me": old-style Lua turn-in givers in this zone with distance, loaded flag, wanted items, reward XP. |
 | `GET /v1/quests/log` | — | The native EQ Task journal (server-pushed) — active tasks only, with objectives + live progress. |
 | `GET /v1/quests/completed` | — | Completed task history: `{task_id, title, completed_time}[]`. |
 | `GET /v1/quests/offers` | — | Pending task offers from an open selector window: `{task_id, npc_id, title, description, has_rewards}[]`. |

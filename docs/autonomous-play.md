@@ -12,62 +12,35 @@ account + character_name fields).
 
 ---
 
-## 0. Finding quests (`tools/quest_finder.py`)
+## 0. Finding quests — no oracle; discover them like a human
 
-EQEmu quests are **Lua scripts** in the server's `/opt/eqemu/data/quests/<zone>/<Npc_Name>.lua`
-(NOT in the DB), so you can't find them with SQL alone. Use the finder to discover quest givers,
-where they're spawned, what they want (turn-in item ids + names + counts), and the XP reward:
+The client deliberately exposes **no** list of quest givers, no "what does this NPC want" readout,
+and no map/HUD marker over quest NPCs. A human player has none of that, and neither does the agent:
+figuring out which quests exist and what to do is part of the game. Discover quests the way a person
+would — **in-game context clues** (NPC hails, `[bracketed]` keywords, zone text, item drops),
+**internet searches** (EQ quest wikis/allakhazam-style references), and **trial + error** (hail an
+NPC, say its keywords, try handing it likely items).
 
-```sh
-python3 tools/quest_finder.py --beginner          # curated low-level Qeynos turn-in quests
-python3 tools/quest_finder.py qeynos --turnins    # all turn-in givers in South Qeynos (+ qeynos2)
-python3 tools/quest_finder.py --npc Captain_Tillin # full script for one NPC
-```
+The one quest surface the client *does* expose is EQ's **native Task-system journal**, and only
+because it is **server-pushed** — the same quest window a human sees in their own client. `GET
+/v1/quests/log` returns active tasks with title, description, reward, and objectives showing live
+progress (`done_count`/`goal_count`); completed tasks move to `GET /v1/quests/completed`; `POST
+/v1/quests/cancel` abandons an active task; `GET /v1/quests/offers` + `POST /v1/quests/accept`/
+`/decline` handle the (rare) case where an NPC presents a choice of tasks instead of auto-granting
+one. Most classic Qeynos quests (Rat Whiskers, Gnoll Fangs, the guild-note hand-in) are emergent
+server Lua with **no protocol representation** — they never appear in the task journal, and there is
+no legitimate way for the client to surface them. You find them by playing.
 
-A turn-in quest = a giver with an `event_trade` block (`check_turn_in(...)`); the finder prints the
-required items and reward. Example beginner targets (verified spawned): **Captain_Tillin** in
-`qeynos` (-512,37,32) wants **Gnoll Fang (13915) x1-4** → up to 28000 XP; **Priestess_Caulria** in
-`qeynos2` (-604,-133,-10) wants rabid pelts. Dialogue/hail quests (no `event_trade`) are driven by
-hailing + saying `[keyword]`s.
-
-### The quest experience for agents (MMO-style)
-
-Phase 1 (done): **discovery + indicators**.
-- `tools/quest_finder.py --export` bakes quest-giver data into `quests.json`, which is delivered to
-  the client through the asset server's `gamedata` set (default output = the asset server's
-  `content/quests.json`; regenerate + re-bake if the server's quests change). The client syncs it into
-  its cache and loads it at startup (`src/quests.rs`).
-- The HUD draws a golden **"❗ quest"** over any NPC that has a quest (so you can SEE quest givers
-  in `/v1/observe/frame`, like a modern MMO). Note: in dense cities the nameplate may be occluded by buildings
-  (existing nameplate behavior) — `GET /v1/quests/givers` is the reliable readout.
-- `GET /v1/quests/givers` is your quest tracker: for the current zone it lists quest givers sorted by distance
-  with their location, `loaded` (in spawn range) flag, `turn_in` flag, `wanted` items (id, name,
-  count), `reward_xp`, and `hail` text. Workflow: `GET /v1/quests/givers` → pick one → `/v1/move/goto` to it →
-  `/v1/interact/hail` to read the quest → gather items → return → hand in.
-
-**Two kinds of EQ quests** — the client surfaces both:
-- **Old-style Lua turn-in/dialogue quests** (most classic Qeynos quests: Rat Whiskers, Gnoll Fangs,
-  the guild-note hand-in) have **no protocol representation** — they're emergent server Lua. The
-  golden "!" + `GET /v1/quests/givers` (derived from `quests.json` (asset-server gamedata)) are the only way to see them.
-- **Native Task-system quests** (LDoN+; present in Titanium) — the server pushes a real quest journal
-  (`OP_TaskDescription`/`OP_TaskActivity`/`OP_CompletedTasks`). The client decodes these into a live
-  journal: **`GET /v1/quests/log`** returns active tasks with title, description, reward, and objectives
-  showing live progress (`done_count`/`goal_count`), plus completed task ids. The authentic "quest
-  added to my log, watch it tick up" experience. Completed tasks move to `GET /v1/quests/completed` (with title + time); `POST /v1/quests/cancel`
-  abandons an active task; `GET /v1/quests/offers` + `POST /v1/quests/accept`/`/decline` handle the
-  (rare) case where an NPC presents a choice of tasks instead of auto-granting one. (OpenEQ decodes these structs but builds nothing on
-  them; packet-only clients can't see the old-style quests at all. See `docs/protocol-notes.md`.)
-
-To actually *complete* a turn-in quest you still need: reach + kill the mob → **loot** the item →
-reach the giver → **hand it in**. Looting (`/v1/interact/loot`) and item hand-in (`/v1/interact/give`) are the gameplay
-actions being added next (see the questing roadmap in `todo.md`). The hail/say flow for dialogue
-quests already exists (`docs/npc-interaction.md`).
+To *complete* a turn-in quest you: reach + kill the mob → **loot** the item (`/v1/interact/loot`) →
+reach the giver → **hand it in** (`/v1/interact/give`). The hail/say flow for dialogue quests is in
+`docs/npc-interaction.md`.
 
 ---
 
 ## 1. Creating + configuring a non-GM character (EQEmu DB)
 
-DB: `podman exec eqemu_mariadb_1 mariadb -uroot -prootpass peq`. Tables that matter:
+DB: connect to the EQEmu `peq` database with your own local credentials (host/container, user, and
+password are environment-specific — do not hard-code or commit them). Tables that matter:
 
 - **`login_accounts`** (login server auth): set `account_password` to the **lowercase-hex SHA512**
   of the password. EQEmu's `eqcrypt_verify_hash` falls through all hash modes, so a SHA512 string
