@@ -32,6 +32,28 @@
 //! - **A heartbeat** — so a post-mortem can distinguish an uncatchable `SIGKILL`/OOM-kill from a
 //!   process that was already wedged long before it died.
 //!
+//! ## Keeping the crash directory bounded and honest (#390, #391, #392)
+//!
+//! The #387 review that shipped this module deferred three follow-ups, all fixed here:
+//!
+//! - **#390 (unbounded file count).** `install()` runs before argument parsing, so even
+//!   `eqoxide --help` left a `crash-<pid>.log` + `heartbeat-<pid>` pair behind, forever.
+//!   [`install`] now prunes crash/heartbeat files older than [`prune_max_age`] on every call
+//!   (cheap, unconditional — see [`prune_stale_files`]), and [`exit`] removes *this instance's*
+//!   heartbeat file before it exits, so a lingering heartbeat means something again.
+//! - **#391 (pid reuse merges two runs' records).** The per-pid crash log used to be opened
+//!   `O_APPEND` and never truncated, so a process that reused a pid would append to a *dead*
+//!   run's file and both runs' records would sit in one file under one `pid=`. [`install`] now
+//!   truncates `crash-<pid>.log` at open time (see [`open_log_for_install`]) — any bytes already
+//!   in that file necessarily belong to a process that is no longer alive, so there is nothing to
+//!   preserve.
+//! - **#392 (pre-bind crash is anonymous).** [`log_instance`] used to fire only once the HTTP
+//!   listener bound (`src/http/mod.rs`), so anything that killed the process before that — asset
+//!   sync, config load, GPU/adapter init, early zone load — left a real crash record with no way
+//!   to tell *which* instance it was. `install()` now stamps a fallback identity (argv + cwd, see
+//!   [`fallback_instance_label`]) as its very first `INSTANCE` line; the HTTP layer's later
+//!   `api_port=` stamp still lands on top of it once (if) the listener actually binds.
+//!
 //! ## Why we don't use `signal-hook` for the fatal signals
 //!
 //! `signal_hook::low_level::register` **panics** on `SIGSEGV`/`SIGILL`/`SIGFPE` (they're on its
@@ -114,6 +136,65 @@ pub fn crash_log_path() -> PathBuf {
 /// one had just been SIGKILLed. That defeats the file's entire purpose in the *normal* case.
 pub fn heartbeat_path() -> PathBuf {
     crash_dir().join(format!("heartbeat-{}", std::process::id()))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pruning (#390 — unbounded file count: one crash-<pid>.log + heartbeat-<pid> per launch, forever)
+// ---------------------------------------------------------------------------------------------
+
+/// Env override for the prune threshold, in whole seconds. Test-only escape hatch (mirrors
+/// [`CRASH_DIR_ENV`]) — without it, proving `install()` actually prunes would require faking a
+/// file's mtime days in the past, which std cannot do without a filetime-manipulation dependency.
+pub const CRASH_PRUNE_MAX_AGE_SECS_ENV: &str = "EQOXIDE_CRASH_PRUNE_MAX_AGE_SECS";
+
+/// 7 days: long enough that a post-mortem investigating "what happened this week" is never
+/// missing a record, short enough that a directory that gets a new pid on every launch (this repo
+/// runs clients constantly, often several at once) stays bounded rather than growing forever.
+const DEFAULT_PRUNE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+fn prune_max_age() -> std::time::Duration {
+    if let Ok(v) = std::env::var(CRASH_PRUNE_MAX_AGE_SECS_ENV) {
+        if let Ok(secs) = v.parse::<u64>() {
+            return std::time::Duration::from_secs(secs);
+        }
+    }
+    DEFAULT_PRUNE_MAX_AGE
+}
+
+/// Remove `crash-*`/`heartbeat-*` entries in `dir` whose mtime is at least `max_age` old.
+///
+/// Cheap and unconditional by design: `install()` runs before argument parsing, so this must be
+/// safe to run on every launch — including a trivial `eqoxide --help` — without a daemon, a lock
+/// file, or any state beyond "list the directory once." Best-effort throughout: a missing dir, an
+/// unreadable entry, or a failed `remove_file` is silently skipped rather than treated as fatal —
+/// pruning is housekeeping, not something a launch should ever fail over.
+///
+/// Only touches names starting with `crash-` or `heartbeat-`, so a stray unrelated file someone
+/// drops in the same cache directory is never at risk.
+fn prune_stale_files(dir: &std::path::Path, max_age: std::time::Duration) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        if !(name.starts_with("crash-") || name.starts_with("heartbeat-")) {
+            continue;
+        }
+        let modified = match entry.metadata().and_then(|m| m.modified()) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let age = now.duration_since(modified).unwrap_or_default();
+        if age >= max_age {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -219,6 +300,23 @@ fn open_log_for_append() -> Option<std::fs::File> {
     std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()
 }
 
+/// Open this instance's crash log the way `install()` does: truncating, not appending (#391).
+///
+/// `crash-<pid>.log` is per-pid by design (finding 4 of the #387 review), which means any bytes
+/// already in the file at `install()` time cannot belong to *this* run — they can only be left
+/// over from a now-dead process that happened to reuse the same pid. There is nothing there worth
+/// preserving, and appending to it would merge two runs' records under one `pid=`, defeating the
+/// per-pid split's entire purpose. `append_line`'s fallback path (`open_log_for_append`, used
+/// pre-install and by unit tests that don't hold a live fd) still appends deliberately: those
+/// callers are writing *multiple lines within the same run* and must not truncate each other.
+fn open_log_for_install() -> Option<std::fs::File> {
+    let path = crash_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&path).ok()
+}
+
 fn now_epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -246,6 +344,19 @@ fn format_exit_line(ts: u64, pid: u32, reason: &str, code: i32) -> String {
 
 fn format_instance_line(ts: u64, pid: u32, label: &str) -> String {
     format!("[{ts}] pid={pid} INSTANCE {label}")
+}
+
+/// The identity `install()` can stamp before anything else about this run is known (#392): argv
+/// and cwd. Neither requires arg parsing, config load, or a bound port — all of which can be the
+/// thing that kills the process. `src/http/mod.rs` adds a second, more specific `INSTANCE
+/// api_port=<N>` line later if (and only if) the listener actually binds; this fallback line is
+/// what keeps a crash that happens *before* that from being anonymous.
+fn fallback_instance_label() -> String {
+    let argv: Vec<String> = std::env::args().collect();
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unknown cwd>".to_string());
+    format!("argv={argv:?} cwd={cwd}")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -297,9 +408,22 @@ pub fn log_exit(reason: &str, code: i32) {
 }
 
 /// Log an intentional exit and then take it. Use in place of bare `std::process::exit`.
+///
+/// Also removes this instance's heartbeat file (#390): every `process::exit` call in the binary
+/// goes through here, so this is the one place that can say "this pid is not coming back" for
+/// every kind of intentional exit, not just the fully-clean one. Without it the heartbeat directory
+/// accumulates one stale file per past launch that a post-mortem has to cross-reference by pid to
+/// ignore — noise around the one heartbeat file that actually matters (a *live* process's).
 pub fn exit(reason: &str, code: i32) -> ! {
     log_exit(reason, code);
+    remove_heartbeat_file();
     std::process::exit(code)
+}
+
+/// Remove this instance's heartbeat file. Split out from [`exit`] so it is unit-testable — `exit`
+/// itself calls `std::process::exit` and would kill the test binary if called directly.
+fn remove_heartbeat_file() {
+    let _ = std::fs::remove_file(heartbeat_path());
 }
 
 /// The ordinary, fully-clean shutdown (camp completed, render loop exited on its own).
@@ -308,7 +432,11 @@ pub fn log_clean_shutdown() {
 }
 
 /// Record what this instance *is*, so a directory of per-pid logs is navigable — which pid was the
-/// client on api_port 8901, which config it ran. Call once the port is actually bound.
+/// client on api_port 8901, which config it ran.
+///
+/// May be called more than once per run: `install()` uses it immediately for a fallback identity
+/// (argv + cwd, #392), and `src/http/mod.rs` calls it again with `api_port=<N>` once the listener
+/// actually binds. Both lines land in the log — the second never erases the first.
 pub fn log_instance(label: &str) {
     let line = format_instance_line(now_epoch_secs(), pid(), label);
     tracing::info!(target: "eqoxide::crash", "{line}");
@@ -568,7 +696,13 @@ fn install_inner() {
         tracing::error!(target: "eqoxide::crash", "cannot create {}: {e}", dir.display());
     }
 
-    match open_log_for_append() {
+    // #390: bound the directory on every launch, including a trivial `--help` — this runs before
+    // argument parsing, so it must be cheap and unconditional. See `prune_stale_files`.
+    prune_stale_files(&dir, prune_max_age());
+
+    // #391: truncate, not append. Any bytes already in crash-<pid>.log belong to a dead process
+    // that reused this pid — see `open_log_for_install`.
+    match open_log_for_install() {
         Some(f) => {
             // Leak the fd: a signal handler may fire at any moment, including after `main` would
             // have dropped a scoped File and closed it.
@@ -578,6 +712,12 @@ fn install_inner() {
             mark_unhealthy("could not open log at install");
         }
     }
+
+    // #392: stamp a fallback instance identity as early as possible, before anything that could
+    // kill the process (arg parsing, config load, asset sync, GPU init, HTTP bind) gets a chance
+    // to. `log_instance` appends rather than replaces, so the HTTP layer's later, more specific
+    // `api_port=` line still lands on top of this one instead of erasing it.
+    log_instance(&fallback_instance_label());
 
     install_panic_hook();
     let n = install_signal_handlers();
@@ -912,6 +1052,197 @@ mod tests {
             "a write failure must flip the health flag — otherwise 'no record' is \
              indistinguishable from 'we could not write one'"
         );
+        reset_globals();
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // #390 — unbounded file count
+    // -----------------------------------------------------------------------------------------
+
+    /// MUTATION CHECK: with the `if age >= max_age { remove_file }` body of `prune_stale_files`
+    /// replaced by a no-op, this goes RED (both files remain).
+    #[test]
+    fn prune_stale_files_removes_crash_and_heartbeat_entries_at_or_past_max_age() {
+        let _g = lock(&TEST_LOCK);
+        let d = TempCrashDir::new("prune-pure");
+        reset_globals();
+
+        let stale_crash = d.0.join("crash-999999.log");
+        let stale_heartbeat = d.0.join("heartbeat-999999");
+        std::fs::write(&stale_crash, "a run that is long gone\n").unwrap();
+        std::fs::write(&stale_heartbeat, "1700000000").unwrap();
+
+        // max_age = 0: every existing file's age (now - its mtime) is >= 0, so this prunes
+        // everything matching the prefixes without needing to fake an old mtime.
+        prune_stale_files(&d.0, std::time::Duration::from_secs(0));
+
+        assert!(!stale_crash.exists(), "a stale crash log must be pruned");
+        assert!(!stale_heartbeat.exists(), "a stale heartbeat must be pruned");
+    }
+
+    /// A large `max_age` must leave recent files alone — pruning is a bound, not a purge.
+    #[test]
+    fn prune_stale_files_leaves_recent_files_and_non_matching_names_alone() {
+        let _g = lock(&TEST_LOCK);
+        let d = TempCrashDir::new("prune-keep");
+        reset_globals();
+
+        let fresh_crash = d.0.join("crash-123.log");
+        let unrelated = d.0.join("not-ours.txt");
+        std::fs::write(&fresh_crash, "still-relevant\n").unwrap();
+        std::fs::write(&unrelated, "leave me alone\n").unwrap();
+
+        prune_stale_files(&d.0, std::time::Duration::from_secs(3600));
+
+        assert!(fresh_crash.exists(), "a file younger than max_age must not be pruned");
+        assert!(unrelated.exists(), "prune must never touch a name it didn't create");
+    }
+
+    /// Wiring check, not just the pure function: `install()` must actually call the pruning path
+    /// on every launch, unconditionally — including a launch that goes on to do nothing else
+    /// (`--help`). Uses `CRASH_PRUNE_MAX_AGE_SECS_ENV=0` so a file created moments ago in this
+    /// test still counts as "stale" without needing to fake its mtime days in the past.
+    ///
+    /// MUTATION CHECK: with the `prune_stale_files(&dir, prune_max_age())` line removed from
+    /// `install_inner`, this goes RED (the stale file survives `install_inner()`).
+    #[test]
+    fn install_prunes_the_crash_dir_before_touching_its_own_files() {
+        let _g = lock(&TEST_LOCK);
+        let d = TempCrashDir::new("prune-wiring");
+        reset_globals();
+
+        let stale = d.0.join("crash-424242.log");
+        std::fs::write(&stale, "a dead run's leftover\n").unwrap();
+
+        std::env::set_var(CRASH_PRUNE_MAX_AGE_SECS_ENV, "0");
+        install_inner();
+        std::env::remove_var(CRASH_PRUNE_MAX_AGE_SECS_ENV);
+        reset_globals();
+
+        assert!(
+            !stale.exists(),
+            "install() must prune stale crash/heartbeat files unconditionally, even before \
+             argument parsing runs"
+        );
+    }
+
+    /// MUTATION CHECK: with `remove_heartbeat_file` reverted to a no-op, this goes RED.
+    #[test]
+    fn remove_heartbeat_file_deletes_this_instances_heartbeat() {
+        let _g = lock(&TEST_LOCK);
+        let d = TempCrashDir::new("heartbeat-cleanup");
+        reset_globals();
+
+        std::fs::write(heartbeat_path(), "1700000000").unwrap();
+        assert!(heartbeat_path().exists(), "test setup sanity check");
+        let _ = &d; // keep TempCrashDir alive for the duration of the assertion below
+
+        // This is exactly what `exit()` calls right before `std::process::exit` — tested directly
+        // because `exit()` itself would terminate the test binary.
+        remove_heartbeat_file();
+
+        assert!(
+            !heartbeat_path().exists(),
+            "an intentional exit must remove this instance's heartbeat file, or the directory \
+             fills with stale heartbeats a post-mortem has to cross-reference by pid to ignore (#390)"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // #391 — pid reuse merges two runs' records
+    // -----------------------------------------------------------------------------------------
+
+    /// MUTATION CHECK: with `.truncate(true)` in `open_log_for_install` reverted to `.append(true)`
+    /// (i.e. made identical to `open_log_for_append`), this goes RED — the stale record from the
+    /// "dead process that reused this pid" survives the open, exactly reproducing #391.
+    #[test]
+    fn install_truncates_a_pids_crash_log_instead_of_appending_to_it() {
+        let _g = lock(&TEST_LOCK);
+        let d = TempCrashDir::new("truncate-391");
+        reset_globals();
+
+        // Simulate a dead process that reused this pid: pre-existing content in crash-<pid>.log
+        // that install() must not merge with this run's own records.
+        std::fs::write(crash_log_path(), "STALE RECORD FROM A DEAD PROCESS, SAME PID\n").unwrap();
+        assert!(d.log_contents().contains("STALE RECORD"), "test setup sanity check");
+
+        // This is exactly what `install_inner()` calls to obtain the fd for this run's log.
+        let f = open_log_for_install().expect("open crash log for install");
+        drop(f);
+
+        let contents = d.log_contents();
+        assert!(
+            !contents.contains("STALE RECORD"),
+            "install must truncate a pre-existing crash-<pid>.log (pid reuse), not append to it \
+             and merge two runs' records under one pid=: {contents:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // #392 — pre-bind crash is anonymous
+    // -----------------------------------------------------------------------------------------
+
+    #[test]
+    fn fallback_instance_label_carries_argv_and_cwd() {
+        let label = fallback_instance_label();
+        assert!(label.contains("argv="), "must carry argv, got: {label:?}");
+        assert!(label.contains("cwd="), "must carry cwd, got: {label:?}");
+    }
+
+    /// Wiring check: `install()` must stamp SOME instance identity before anything that could kill
+    /// the process (arg parsing, config load, asset sync, GPU init, HTTP bind) gets a chance to —
+    /// not only once `src/http/mod.rs` gets far enough to bind a listener.
+    ///
+    /// MUTATION CHECK: with the `log_instance(&fallback_instance_label())` line removed from
+    /// `install_inner`, this goes RED — no `INSTANCE` line exists until the (never-called, in this
+    /// test) HTTP layer would add one, reproducing #392 exactly.
+    #[test]
+    fn install_stamps_a_fallback_instance_identity_before_any_port_binds() {
+        let _g = lock(&TEST_LOCK);
+        let d = TempCrashDir::new("fallback-identity-wiring");
+        reset_globals();
+
+        install_inner();
+        reset_globals();
+
+        let contents = d.log_contents();
+        assert!(
+            contents.contains("INSTANCE"),
+            "install() must stamp a fallback instance identity even before HTTP ever binds, \
+             got: {contents:?}"
+        );
+        assert!(
+            !contents.contains("api_port="),
+            "no port has bound in this test — the ONLY instance line here must be the fallback, \
+             got: {contents:?}"
+        );
+    }
+
+    /// End-to-end shape of the #392 fix: a crash landing before any bind still carries the
+    /// fallback identity alongside it in the same file, so the post-mortem is not anonymous.
+    #[test]
+    fn a_crash_before_any_bind_still_lands_next_to_a_fallback_identity() {
+        let _g = lock(&TEST_LOCK);
+        let d = TempCrashDir::new("fallback-identity-e2e");
+        reset_globals();
+
+        let f = open_log_for_install().expect("open crash log for install");
+        CRASH_FD.store(f.into_raw_fd(), Ordering::Relaxed);
+        log_instance(&fallback_instance_label());
+
+        // Simulate a crash that happens before anything ever binds an HTTP listener.
+        let line = format_panic_line(
+            now_epoch_secs(),
+            std::process::id(),
+            "main",
+            "src/main.rs:1:1",
+            "boom before bind",
+        );
+        append_line(&line);
+
+        let contents = d.log_contents();
+        assert!(contents.contains("INSTANCE"), "fallback identity must be present: {contents:?}");
+        assert!(contents.contains("PANIC"), "the crash record itself must be present: {contents:?}");
         reset_globals();
     }
 }
