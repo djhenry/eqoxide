@@ -1,11 +1,10 @@
 # Group protocol (RoF2)
 
-Status: all findings below are **confirmed** against `/home/dhenry/git/EQEmu` (RoF2 patch files
-and zone server logic) unless marked "inferred". The decompiled RoF2 client
-(`/home/dhenry/eq_assets/everquest_rof2/decompiled/ghidra/eqgame.exe.c`) has essentially no
-group-related literal strings (client message text is resolved via server-sent `MessageString`
-IDs, not baked into the exe), so client-side rendering behavior below is inferred from the
-server's packet-construction comments, not directly disassembled.
+Status: all findings below are **confirmed** against the open-source EQEmu server
+([github.com/EQEmu/Server](https://github.com/EQEmu/Server) — RoF2 patch files and zone server
+logic) unless marked "inferred". Client message text is resolved via server-sent `MessageString`
+IDs rather than being fixed client-side, so client-side rendering behavior below is inferred from
+the server's packet-construction comments rather than observed directly.
 
 Related: `hp-update.md` (group unlocks percent HP/mana/endurance for other members, NOT full
 `OP_HPUpdate` — corrected there).
@@ -114,8 +113,8 @@ struct GroupCancel_Struct {
 (`zone/client_packet.cpp:7151-7180`) just forwards the packet verbatim to the inviter (same-zone)
 or via `ServerOP_GroupCancelInvite` (cross-zone, `zone/worldserver.cpp:1262-1269`), then
 unconditionally calls `Group::RemoveFromGroup(this)`. Semantics of `toggle` (e.g. distinguishing
-"declined" vs "invite timed out/cancelled") are client-side only — not verified from the decompile
-(no literal strings found); treat as **inferred**.
+"declined" vs "invite timed out/cancelled") are client-side only and are not observable from the
+server source; treat as **inferred**.
 
 ### GroupFollow_Struct (accept) — 152 bytes (`rof2_structs.h:2648-2658`)
 ```c
@@ -278,9 +277,8 @@ creating a new one (`Client::GroupFollow`, `zone/client.cpp:5052-5175`).
    unconditionally as a safety no-op (B was never actually added to a group yet in the normal
    decline case, so this is mostly a defensive cleanup call).
 3. A's client receives the same `OP_GroupCancelInvite` packet back and is expected to render the
-   decline message client-side (not verified in the decompile — no group-related literal strings
-   found in `eqgame.exe.c`; EQ typically resolves these via server `MessageString` IDs sent
-   separately, not this packet's payload).
+   decline message client-side (not confirmed — EQ typically resolves these via server
+   `MessageString` IDs sent separately, not this packet's payload).
 
 **(e) Leader (or an authorized member) kicks a member:**
 `Client::Handle_OP_GroupDisband` (`zone/client_packet.cpp:7195-7375`) is overloaded for both kick
@@ -395,6 +393,5 @@ binding themselves beyond the initial roster snapshot's member names).
   off-tank delegation) — struct location identified (`common/eq_packet_structs.h:2526-2534,
   4836-4857`) but not traced end-to-end.
 - Client-side rendering/popup logic for invite/decline (what exact UI element pops up, whether
-  there's a timeout) is not recoverable from the current decompile (no literal strings) — cheapest
-  next step would be a live packet capture + client screen recording rather than more decompile
-  digging.
+  there's a timeout) is not recoverable from the server source — cheapest next step would be a
+  live packet capture + client screen recording.

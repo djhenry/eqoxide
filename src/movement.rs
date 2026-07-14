@@ -9,11 +9,11 @@
 
 use crate::assets::Collision;
 
-/// Native RoF2 wall-collision sphere radius (`eqgame.exe.asm:0x00440418`, `fld1`).
+/// Wall-collision sphere radius, matched to the reference RoF2 client.
 pub const PLAYER_RADIUS: f32 = 1.0;
 /// Skin width kept between the cylinder and the surface after a swept hit.
 const SKIN: f32 = 0.05;
-/// Native step-up height (`_DAT_009c58e8 = 2.0f`, RoF2 client decompile). This is a HARD cap: the
+/// Step-up height, matched to the reference RoF2 client. This is a HARD cap: the
 /// native client can auto-step a ledge at most 2.0u tall; anything taller is a wall (jump or go
 /// around) — there is no larger climb and no separate slope check. It is the single source of truth
 /// for how high nav may climb, so `find_path` derives its edge-climb cap (`STEP_H`) from it. Both
@@ -21,9 +21,9 @@ const SKIN: f32 = 0.05;
 /// can't (#239). (Was decoupled from a super-human `NAV_CLIMB = 20.0`, which teleported the walker up
 /// 20u ridges/invisible walls and stranded it on the high side of boundaries.)
 pub const STEP_UP: f32 = 2.0;
-/// Ground-probe origin above the feet (`_DAT_009c3390 = 1.0f`).
+/// Ground-probe origin above the feet.
 const GROUND_ORIGIN: f32 = 1.0;
-/// Ground-probe downward range (`_DAT_009c58e4 = 200.0f`).
+/// Ground-probe downward range.
 const GROUND_DEPTH: f32 = 200.0;
 /// Gravity / terminal fall (matches the renderer's prior physics + falling-physics.md).
 const GRAVITY: f32 = 120.0;
@@ -32,7 +32,7 @@ const MAX_FALL: f32 = 128.0;
 /// enough to clear/mount low ledges, steps and small crates (well above the 2u step-up), matching
 /// the reference RoF2 client's usable jump. The old value (13 → only ~0.7u peak, "barely leaves
 /// the ground") was a placeholder carried over from the pre-controller WASD block (eqoxide#92).
-/// (Exact RoF2 parity of the impulse is worth a decompile/live check; 4u restores a usable jump.)
+/// (Exact RoF2 parity of the impulse is worth a live check; 4u restores a usable jump.)
 pub const JUMP_VELOCITY: f32 = 31.0;
 
 /// Horizontal distance a *running* jump clears to a landing at roughly takeoff height, at

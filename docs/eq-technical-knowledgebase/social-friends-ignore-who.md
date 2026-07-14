@@ -1,8 +1,8 @@
 # Social: Friends (buddy) list, Ignore list, /who and /who all (RoF2)
 
-Status: confirmed (server side fully; client side confirmed via decompile +
-live UI/ini artifacts, exact network-send call sites not traced instruction-
-by-instruction — see "client-side" notes below for what is inferred).
+Status: confirmed (server side fully; client side confirmed via live UI/ini
+artifacts, exact network-send call sites not independently traced — see
+"client-side" notes below for what is inferred).
 
 ## 1. Friends / buddy list — NO server-side persistence, NO push notification
 
@@ -20,24 +20,22 @@ Friend0=SomeName
 Friend1=OtherName
 ...
 ```
-(`Friend0`..`Friend99`, keys read via `FUN_00861120("Friends", "Friend%d", ...)`
-in the client — `everquest_rof2/decompiled/ghidra/eqgame.exe.c:169231-169233`.)
+(`Friend0`..`Friend99`, keys read from the ini via a `"Friend%d"` key format.)
 
 **Add/remove is a local console-command round-trip, not a network opcode.**
 The Friends window's Add/Delete buttons (`EQUI_FriendsWnd.xml:25-46,94-115`,
 ScreenIDs `AddButton`/`DeleteButton`) synthesize and run the commands
 `"buddy %s"` (add) / `"buddy -%s"` (remove) through the client's own
-command-line processor (`eqgame.exe.c:150159` / `:150150`, string literals
-confirmed in `decompiled/capstone/eqgame.exe.asm:320777,320864`). This updates
+command-line processor. This updates
 the client's in-memory/ini friends list only; nothing is sent to the server at
 add/remove time.
 
 **"Who of my friends is online" is a manual pull, not a push.** The Friends
 window has a `WhoButton` (`EQUI_FriendsWnd.xml:71-92`, ScreenID `WhoButton`) —
-clicking it (or, per the decompile, on zoning into world the client replays
-its whole locally-stored friends+ignored list back into the command
-processor via `FUN_00517d50`, `eqgame.exe.c:169206-169254`) causes the client
-to send **the full comma-separated name list** in one `OP_FriendsWho` packet:
+clicking it (or, on zoning into world, the client replays its whole
+locally-stored friends+ignored list back into the command processor) causes
+the client to send **the full comma-separated name list** in one
+`OP_FriendsWho` packet:
 ```c
 // EQEmu/zone/client.cpp:2194-2208
 void Client::FriendsWho(char *FriendsString) {
@@ -103,11 +101,9 @@ real "ignore" wire opcode has not been identified/named in this patch; it's
 just mapped to a no-op so the unknown-opcode warning log doesn't fire.)
 
 Like Friends, the list is persisted client-side in the per-character ini
-under `[Ignored]` (`Ignored0`..`Ignored99`,
-`eqgame.exe.c:169238-169239,169241-169244`), rebuilt at zone-in via the
-same `FUN_00517d50` replay loop using the command pair `"ignoreplayer %s"` /
-`"ignoreplayer -%s"` (string literals confirmed at
-`decompiled/capstone/eqgame.exe.asm:325887,325933,371067`). Ignore filtering
+under `[Ignored]` (`Ignored0`..`Ignored99`), rebuilt at zone-in via the same
+replay mechanism using the command pair `"ignoreplayer %s"` /
+`"ignoreplayer -%s"`. Ignore filtering
 (tells/chat suppression) therefore happens **entirely client-side** against
 that local list; the server has no concept of it.
 

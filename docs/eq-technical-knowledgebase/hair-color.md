@@ -7,7 +7,9 @@
 
 ## Wire field layout
 
-`haircolor` is an independent `uint8` in every appearance-bearing struct:
+`haircolor` is an independent `uint8` in every appearance-bearing struct. Offsets below are from the
+open-source EQEmu server's RoF2 patch structs
+([github.com/EQEmu/Server](https://github.com/EQEmu/Server), `common/patches/rof2_structs.h`):
 
 | Struct | File | Location |
 |--------|------|----------|
@@ -16,24 +18,16 @@
 | `FaceChange_Struct` | `rof2_structs.h:2674` | byte 0 |
 | `CharacterSelectEntry_Struct` | `rof2_structs.h:257` | `HairColor` field |
 
-Range is 0–23 (24 values). Values >= 24 are clamped/discarded by the client (see capstone guard below).
+Range is 0–23 (24 values). Values ≥ 24 are clamped/discarded by the client (no tint applied).
 
 ---
 
 ## Client-side hair color tint table
 
-**VA:** `0x00AC1A70`  (eqgame.exe, `.data` section, file offset `0x6BFC70`)
+This is the 24-entry RGB tint palette the client applies to Luclin hair/beard materials. eqoxide
+ships the same values as `HAIR_TINT` in `src/head.rs`.
 
-**Confirmed** in capstone at `eqgame.exe:0x0040d35c`:
-```asm
-0x0040d34e:  mov   al, byte ptr [esi + 0xa]   ; haircolor byte from char object (+10)
-0x0040d351:  cmp   al, 0x18                    ; guard: must be < 24
-0x0040d353:  jae   0x40d3da                    ; out-of-range -> no tint (EDI=0)
-0x0040d359:  movzx edi, al
-0x0040d35c:  lea   edi, [edi*4 + 0xac1a70]    ; EDI = &table[haircolor]
-```
-
-**24-entry RGB table (4 bytes each, format 0x00RRGGBB):**
+**24-entry RGB table (format 0x00RRGGBB):**
 
 | Index | Hex | RGB | Description |
 |-------|-----|-----|-------------|
@@ -62,29 +56,30 @@ Range is 0–23 (24 values). Values >= 24 are clamped/discarded by the client (s
 | 22 | 0x00CEFDC9 | (206, 253, 201) | Light green |
 | 23 | 0x00559B48 | (85, 155, 72) | Green |
 
-**Tint format:** multiplicative RGB — texel × (color / 255.0). Alpha byte is always 0x00 (treated as opaque tint, alpha channel not used). `beardcolor` uses the same table.
+**Tint format:** multiplicative RGB — texel × (color / 255.0). The alpha byte is always 0x00 (the
+alpha channel is not used). `beardcolor` uses the same table.
 
 ---
 
 ## Which code path applies the tint
 
-Function `FUN_0040d1a0` (VA `0x0040d1a0`, ghidra `eqgame.exe.c:8917`) sets up head material swaps. It receives the character appearance object, current hairstyle, and face index.
+The head material-swap path receives the character appearance object, current hairstyle/face, and
+gates the tint on race and gender.
 
-### Race/model gate (`FUN_0040a240`, VA `0x0040a240`)
+### Race/model gate
 
-This function checks race and gender, returns:
-- **0** — no Luclin/no tint path (race 4, 9, 10, 13+, etc.)
-- **1** — classic tintable but NOT in the race-2 subset (Human=1, Barb=2, Erudite=3, Dwarf=8-male, Halfling=11, Gnome=12)
-- **2** — Luclin-style hair tint eligible (High Elf=5, Dark Elf=6, Half Elf=7, Dwarf-female=8)
+The race/gender gate resolves to one of three cases:
+- **no Luclin / no tint** — race 4, 9, 10, 13+, etc.
+- **classic tintable but NOT in the Luclin subset** — Human=1, Barb=2, Erudite=3, male Dwarf=8,
+  Halfling=11, Gnome=12.
+- **Luclin-style hair tint eligible** — High Elf=5, Dark Elf=6, Half Elf=7, female Dwarf=8.
 
-**Tint is applied ONLY when all three conditions hold:**
-1. `FUN_0040a240()` returns **2** (races 5, 6, 7, or female Dwarf)
-2. BL (hairstyle-related flag derived from earlier `bStack_e3` calculation) is non-zero  
-3. `haircolor < 24`
-
-Additionally (capstone `eqgame.exe:0x0040d308`): the Luclin model "has-head" flag at `[model_ptr + 0x34]` must be non-zero. If this flag is 0 (classic model), the check at `0x0040d324` (`je 0x40d3da`) fires immediately, `EDI = 0`, and no tint is applied.
-
-Source: `eqgame.exe.c:9003-9006`, capstone `eqgame.exe.asm:17308-17323`.
+**Tint is applied ONLY when all of these hold:**
+1. The race is in the Luclin-eligible subset (High Elf, Dark Elf, Half Elf, or female Dwarf).
+2. The hairstyle-related flag is non-zero.
+3. `haircolor < 24`.
+4. The **Luclin head model is actually loaded** (a classic head model fails this gate outright, so
+   no tint is applied to classic heads).
 
 ---
 
@@ -98,7 +93,7 @@ All `HUMHE{N}{V}_MDF` material fragments (type `0x30`) have:
 
 Fragment names: `HUMHE0001_MDF` through `HUMHE0072_MDF`.
 
-Material selection builds the name via format `"%sHE%02d%d1_MDF"` (ghidra `eqgame.exe.c:9008`) where:
+Material selection builds the name via the format `"%sHE%02d%d1_MDF"` where:
 - `%s` = race prefix (`"HUM"`, `"BAR"`, etc.)
 - `%02d` = `hairstyle / 10` (always `00` for hairstyles 0–7)
 - `%d` = `hairstyle % 10` (0–7)
@@ -127,15 +122,17 @@ The textures do NOT use a white/gray hair region that would require runtime tint
 
 ### Conclusion for Human classic heads
 
-**Confirmed:** For Human race (race ID 1) using classic `humhe*` textures, `haircolor` byte has NO visual effect:
-- `FUN_0040a240()` returns 1 for race 1 (not 2), so the tint condition fails
-- Classic model flag at `+0x34` is 0, giving an additional guard
-- The vtable call for material swap at `eqgame.exe:FUN_0040d1a0:9011` always receives `puVar11 = NULL`
-- Hair is baked into the texture; the `hairstyle` index alone selects the texture
+**Confirmed** (from the WLD/BMP data above, independent of any client-code trace): for Human race
+(race ID 1) using classic `humhe*` textures, the `haircolor` byte has NO visual effect:
+- Human is not in the Luclin-eligible race subset, so the tint condition fails.
+- A classic head model fails the "Luclin head loaded" gate, an additional guard.
+- Hair is baked into the texture; the `hairstyle`/face index alone selects the texture.
 
-The same applies to Barbarian (2), Erudite (3), male Dwarf (8), Halfling (11), Gnome (12) — they return 1 from `FUN_0040a240`, not 2.
+The same applies to Barbarian (2), Erudite (3), male Dwarf (8), Halfling (11), Gnome (12) — none are
+in the Luclin-eligible subset.
 
-**Races that DO use the tint table:** High Elf (5), Dark Elf (6), Half Elf (7), female Dwarf (8) — only when Luclin head model is loaded.
+**Races that DO use the tint table:** High Elf (5), Dark Elf (6), Half Elf (7), female Dwarf (8) —
+only when the Luclin head model is loaded.
 
 ---
 

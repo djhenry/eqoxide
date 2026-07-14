@@ -76,16 +76,13 @@ actually the arrival point in the *other* zone.
   `GetClosestZonePointWithoutZone` call when `zc->zoneID==0`,
   `zoning.cpp:100`).
 
-## Client side (RoF2 eqgame.exe, decompiled, confirmed)
+## Client side (RoF2, confirmed)
 
-- **Region-flag string parser**: `FUN_00487530` @
-  `everquest_rof2/decompiled/ghidra/eqgame.exe.c:96178-96301`. This decodes the
-  ASCII "region type" name string that WLD BSP Region fragments (frag 0x29)
-  carry, into a 32-bit flag word. Registered as the engine's region-type
-  translator callback during world/display init:
-  `(**(code **)(*DAT_015d46a8 + 0x2c))(FUN_00487530);` —
-  `eqgame.exe.c:106052`.
-- **Format, confirmed by decompile** (`eqgame.exe.c:96222-96296`):
+- **Region-flag string parser**: the client decodes the ASCII "region type"
+  name string that WLD BSP Region fragments (frag 0x29) carry into a 32-bit
+  flag word, registered as the engine's region-type translator during
+  world/display init.
+- **Format** (established):
   - bytes[0..2) = 2-letter terrain-type prefix: `"DR"` (normal/drop), `"WT"`
     (water), `"LA"` (lava), `"SL"` (slime), `"VW"` (underwater-vision water),
     `"W2"`/`"W3"` (extra water tiers).
@@ -98,10 +95,8 @@ actually the arrival point in the *other* zone.
     `0x4000000` — extra suffix flags, only read if the string is long enough
     (`length > 0x21`).
   - There's a short "Area" form too (`"AWT"`, `"ALV"`, `"AVW"`, `"APK"`,
-    `"ATP<N>"`, `"ASL"`): `"ATP<N>"` is expanded via
-    `sprintf(buf, "DRNTP00255%05d000000000000000", N)` — `eqgame.exe.c:96211-96215`.
-    This is direct evidence for the **canonical long-form zone-line region
-    name literally being `"DRNTP00255NNNNN000000000000000"`**, where `NNNNN`
+    `"ATP<N>"`, `"ASL"`): `"ATP<N>"` expands to the **canonical long-form
+    zone-line region name `"DRNTP00255NNNNN000000000000000"`**, where `NNNNN`
     is the zone-point index, zero-padded to 5 digits, i.e. numerically
     identical to `zone_points.number` / `ZonePoint_Entry.iterator`. `"00255"`
     is a fixed literal (not yet decoded — possibly a legacy default
@@ -110,24 +105,20 @@ actually the arrival point in the *other* zone.
   - **The region string therefore only ever encodes an INDEX, never a
     destination.** There is no zone id, no target x/y/z in the WLD at all.
 - **Per-region flag storage + zone-line test helper**: each BSP region's
-  parsed flag word is cached at offset `+0x198` of its per-region struct; a
-  family of `__thiscall` bit-test helpers read it —
-  `FUN_007dc710(region_container, region_index)` tests bit `0x80000000`
-  (zone-line): `eqgame.exe.c:633252-633269`. Sibling helpers test the other
-  bits (`0x1000000`, `0x2000000`, `0x10000000`, `0x400000`, etc. — water/lava/
-  slime/other-terrain-type tests) at `eqgame.exe.c:633178-633334`.
-- **Not fully traced (time-boxed out) — inferred, not confirmed instruction-
-  by-instruction**: the exact per-tick code that (a) determines which BSP
-  region the player's current position falls in, (b) calls the zone-line
-  test above, (c) re-parses/extracts the embedded `NNNNN` digits from that
-  region's raw name string, (d) matches `NNNNN` against the `iterator` field
-  of the `ZonePoint_Entry[]` array received earlier via `OP_SendZonepoints`,
-  and (e) builds/sends `OP_ZoneChange` with `zoneID = matched_entry.zoneid`.
-  The client is fully stripped (no `OP_ZoneChange`/`ZonePoint` string
-  literals to anchor on — opcodes appear to be loaded from an external patch
-  table rather than hardcoded), so this final wiring step could not be
-  pinned to a specific `FUN_xxxx`/address within budget. The architecture
-  (index in WLD region name → look up destination in the previously-received
+  parsed flag word is cached on its per-region runtime state; a family of
+  bit-test helpers read it — one tests bit `0x80000000` (zone-line), with
+  sibling helpers testing the other bits (`0x1000000`, `0x2000000`,
+  `0x10000000`, `0x400000`, etc. — water/lava/slime/other-terrain-type
+  tests).
+- **Not confirmed instruction-by-instruction — inferred**: the exact per-tick
+  logic that (a) determines which BSP region the player's current position
+  falls in, (b) calls the zone-line test above, (c) re-parses/extracts the
+  embedded `NNNNN` digits from that region's raw name string, (d) matches
+  `NNNNN` against the `iterator` field of the `ZonePoint_Entry[]` array
+  received earlier via `OP_SendZonepoints`, and (e) builds/sends
+  `OP_ZoneChange` with `zoneID = matched_entry.zoneid`. This final wiring
+  step could not be pinned down precisely. The architecture (index in WLD
+  region name → look up destination in the previously-received
   `OP_SendZonepoints` array by matching `iterator`) is strongly implied by
   the struct/opcode evidence above and is consistent with known EQ WLD
   modding-community documentation of the `DRNTP` region-name convention, but
@@ -182,9 +173,9 @@ actually the arrival point in the *other* zone.
      `"DRNTP00255NNNNN..."` (or `"<XX>NTP...` for water/lava/slime variants)
      — parse the 5 digits at string offset 10 (after `"DRNTP00255"`) as the
      zone-point index and match against `ZonePoint_Entry.iterator` from
-     `OP_SendZonepoints`. This part of the client is inferred/reconstructed,
-     not directly traced in the decompile — treat as a fallback design, not
-     gospel.
+     `OP_SendZonepoints`. This part of the client behavior is
+     inferred/reconstructed, not independently confirmed — treat as a
+     fallback design, not gospel.
 
 See also: none yet on WLD BSP region fragment format in general (0x29 —
 would be a good follow-up topic: `wld-bsp-regions.md`).
@@ -283,8 +274,8 @@ non-zero-zoneID path.
 
 **Open question, not resolved here — whether the vanilla RoF2 client sends
 `zoneID = 0` or `zoneID = <destination>` on an organic zone-line walk.** Not
-directly recoverable from the (stripped, opcode-table-driven) client
-decompile — see "Client side" section above. Both are structurally valid
+directly determined from the client alone — see "Client side" section
+above. Both are structurally valid
 server-side (`zoning.cpp:78` and `:120` are siblings in the same `if`), so
 either could be "native."
 

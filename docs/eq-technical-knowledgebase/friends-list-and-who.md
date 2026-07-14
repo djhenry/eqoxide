@@ -163,8 +163,8 @@ pending-request flag set when `OP_FriendsWho` is sent, cleared on next
 ## Client-local friends storage (corroboration, not wire-related)
 
 The RoF2 client's local friends list is confirmed to persist as
-per-character INI keys (`decompiled/ghidra/eqgame.exe.c:169225-169232`):
-section `[Friends]`, keys `Friend0=Name`, `Friend1=Name`, ... — consistent
+per-character INI keys: section `[Friends]`, keys `Friend0=Name`,
+`Friend1=Name`, ... — consistent
 with issue #301's framing that friends are client-local and presence is a
 separate pull. (Not directly load-bearing for the wire protocol — eqoxide's
 own local friends storage format doesn't need to match this INI convention
@@ -173,7 +173,7 @@ unless parity with the retail INI file is a goal.)
 ## Status
 
 Confirmed directly from EQEmu RoF2 source for both directions (no
-Ghidra confirmation of the exact client-side OP_FriendsWho send path was
+independent confirmation of the exact client-side OP_FriendsWho send path was
 attempted beyond the INI corroboration above — EQEmu server behavior is
 authoritative enough here since eqoxide only needs to match what the *server*
 accepts/produces, not replicate original client internals).
