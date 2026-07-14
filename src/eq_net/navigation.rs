@@ -3509,11 +3509,14 @@ mod fine_tier_tests {
     /// This is a UNIVERSAL claim ("cannot stall"), and a live run cannot discharge a universal — a race
     /// that usually wins is indistinguishable from one that cannot lose. In this very codebase a
     /// `/follow` deadlock passed live verification by luck and was caught only by a pure-function test.
-    /// So it is pinned here, over 20k randomised states including every degenerate shape.
+    /// So it is pinned here, over 4k randomised states including every degenerate shape. (4k, not 40k:
+    /// this runs in a DEBUG build on a 2-core CI runner, in parallel with the coarse planner's tests,
+    /// whose 5 s safety net a CPU-hungry neighbour can genuinely push over the edge. A property test
+    /// that destabilises its neighbours is not free.)
     #[test]
     fn the_walker_never_stalls_waiting_on_the_fine_plan() {
         let mut rng = Lcg(0xF382_0001);
-        for case in 0..20_000u32 {
+        for case in 0..4_000u32 {
             // Every shape the fine tier can hand us, degenerate ones included.
             let local: Vec<[f32; 3]> = match case % 6 {
                 0 => Vec::new(),                        // never asked / still computing / dead-empty

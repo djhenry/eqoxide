@@ -506,7 +506,7 @@ fn local_worker(req_rx: Receiver<LocalRequest>, rep_tx: Sender<LocalReply>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assets::{Collision, LocalOutcome, MeshData, PlanOutcome, RenderMode, ZoneAssets};
+    use crate::assets::{Collision, LocalOutcome, MeshData, PlanLimit, PlanOutcome, RenderMode, ZoneAssets};
 
     /// GLB-space quad (`positions` are `[north, up, east]`).
     fn quad(v: Vec<[f32; 3]>) -> MeshData {
@@ -806,26 +806,42 @@ mod tests {
         assert!(open.steer().len() >= 2, "and it must carry waypoints to steer along");
     }
 
-    /// **THE FINE TIER IS DETERMINISTIC.** With the 150 ms wall clock deleted, the same question from
-    /// the same spot yields the same answer no matter what else the box is doing — the search is bounded
-    /// SPATIALLY (a 40 u window at 2 u cells), not temporally. A clock-bounded search is a function of
-    /// the CPU's mood; this one is a function of the geometry.
+    /// **THE FINE TIER HAS NO WALL CLOCK, AND SO IS DETERMINISTIC.** (#382)
     ///
+    /// The search is bounded SPATIALLY (a 40 u window at 2 u cells), not temporally, so the same
+    /// question from the same spot yields the same answer no matter what else the box is doing. A
+    /// clock-bounded search is a function of the CPU's mood; this one is a function of the geometry.
     /// (It is the same wall-clock dependence that made the coarse planner's reachable count flip
     /// 28→26→27 across identical runs before #377.)
+    ///
+    /// Two assertions, and the FIRST is the load-bearing one:
+    ///
+    /// 1. **`Exhausted { limit: Deadline }` must be unreachable.** `find_path_local` arms **no**
+    ///    deadline, so no search of any duration can ever report one. Re-arm a budget in
+    ///    `find_path_local` — the exact thing #382 deleted — and any search that outruns it lands here.
+    /// 2. Repeated runs agree.
+    ///
+    /// **What this does NOT prove** (stated rather than implied): a re-armed *generous* clock that
+    /// never fires on this small fixture would slip past. The real guarantee is structural — the fine
+    /// tier passes `PlanCtx::default()`, whose `deadline` is `None` — and this test is its tripwire, not
+    /// its proof.
+    ///
+    /// It deliberately does **no** artificial CPU loading. An earlier version spun a busy-loop between
+    /// runs to "prove" clock-independence; on a 2-core CI runner that starved the *coarse* planner's 5 s
+    /// safety net in a test running in parallel and turned its honest `Unreachable` into
+    /// `Exhausted { Deadline }` — a self-inflicted demonstration of exactly why wall clocks make answers
+    /// depend on the weather.
     #[test]
     fn the_fine_plan_is_deterministic_because_it_has_no_wall_clock() {
         let col = plane_with_a_solid_wall();
         let first = col.find_path_local([-20.0, 0.0, 0.0], [20.0, 0.0, 0.0], 2.0, 40.0, 4.0);
-        for i in 0..12 {
-            // Load the box between runs. A wall-clock-bounded search would notice; this one cannot.
-            let mut sink = 0u64;
-            for k in 0..2_000_000u64 { sink = sink.wrapping_add(k ^ sink.rotate_left(7)); }
-            std::hint::black_box(sink);
+        for i in 0..8 {
             let again = col.find_path_local([-20.0, 0.0, 0.0], [20.0, 0.0, 0.0], 2.0, 40.0, 4.0);
+            assert!(!matches!(again, LocalOutcome::Exhausted { limit: PlanLimit::Deadline, .. }),
+                "run {i}: the fine tier arms NO deadline, so a wall-clock limit must be UNREACHABLE. \
+                 Seeing one means a budget has come back — which is what #382 deleted.");
             assert_eq!(first, again,
-                "run {i}: the fine plan must be a function of the GEOMETRY, not of the clock. A differing \
-                 answer here means a wall-clock budget has come back.");
+                "run {i}: the fine plan must be a function of the GEOMETRY, not of the clock.");
         }
     }
 
