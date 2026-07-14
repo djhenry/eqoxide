@@ -748,17 +748,91 @@ pub(crate) fn carrot_along(path: &[[f32; 3]], start_i: usize, from: [f32; 2], re
 /// is measured from `local_path[1]`, which is now BEHIND the walker. The look-ahead collapses and
 /// can invert on a bend, which is the drawn-path-vs-actual-movement divergence in #311.
 pub(crate) fn fast_steer_aim(path: &[[f32; 3]], local_i: &mut usize, from: [f32; 2], reach: f32) -> Option<([f32; 2], f32)> {
-    while *local_i + 2 < path.len() {
-        let (a, b) = (path[*local_i], path[*local_i + 1]);
-        let ab = [b[0] - a[0], b[1] - a[1]];
-        let l2 = ab[0] * ab[0] + ab[1] * ab[1];
-        let t = if l2 < 1e-6 { 1.0 } else { ((from[0] - a[0]) * ab[0] + (from[1] - a[1]) * ab[1]) / l2 };
-        if t >= 1.0 { *local_i += 1; } else { break; }
-    }
+    advance_cursor(path, local_i, from);
     let aim = carrot_along(path, *local_i, from, reach)?;
     let (dx, dy) = (aim[0] - from[0], aim[1] - from[1]);
     let d = (dx * dx + dy * dy).sqrt();
     (d > 1e-3).then(|| ([dx / d, dy / d], eq_heading(dx, dy)))
+}
+
+/// Advance a pure-pursuit cursor into `path` while the projection of `from` onto the active segment
+/// has passed its end. Monotone and idempotent: calling it twice from the same position is a no-op.
+///
+/// Both cursors need this and for the same reason (#311): a path is only rebuilt every so often, but
+/// the walker keeps moving along it, so a cursor pinned to segment 0 saturates at t=1 and the carrot
+/// starts being measured from a point BEHIND the walker — the look-ahead collapses and inverts on a
+/// bend. Since #382 the fine path arrives from a worker a tick or two after it was requested and so
+/// STARTS a few units behind the walker by construction, which makes this advance load-bearing on the
+/// very first use of a fresh plan, not just partway through its life.
+pub(crate) fn advance_cursor(path: &[[f32; 3]], i: &mut usize, from: [f32; 2]) {
+    // A cursor can only ever index the path it was advanced along, whatever it held before. The fine
+    // path is now REPLACED asynchronously, by a worker, with one that may be SHORTER than the one the
+    // cursor was walking — so "the cursor outran the path" is a state this code must simply not have.
+    // Clamping here makes it unrepresentable everywhere downstream, rather than leaving each caller to
+    // remember a bounds check. (Found by the `the_walker_never_stalls_waiting_on_the_fine_plan`
+    // property test, which fuzzes exactly this.)
+    *i = (*i).min(path.len().saturating_sub(1));
+    while *i + 2 < path.len() {
+        let (a, b) = (path[*i], path[*i + 1]);
+        let ab = [b[0] - a[0], b[1] - a[1]];
+        let l2 = ab[0] * ab[0] + ab[1] * ab[1];
+        let t = if l2 < 1e-6 { 1.0 } else { ((from[0] - a[0]) * ab[0] + (from[1] - a[1]) * ab[1]) / l2 };
+        if t >= 1.0 { *i += 1; } else { break; }
+    }
+}
+
+/// **THE NO-STALL INVARIANT, as a total function (#382).**
+///
+/// The fine 2 u tier is ADVISORY. It runs on a worker thread now, so on any given tick it may be:
+/// never asked, still computing, dead, or back with nothing usable. In every one of those cases this
+/// returns an aim and the walker drives. There is no input — none — for which the walker must wait.
+///
+/// That is the whole safety argument for moving the fine plan off the net thread, and it is
+/// deliberately expressed as a **total pure function** rather than as an "is a plan in flight?" guard
+/// somewhere in `tick`. A guard is a claim you can only test by racing it; totality is a property you
+/// can prove. This distinction is not academic here: a `/follow` deadlock in this codebase once passed
+/// LIVE verification **by luck** (the reply happened to land in a window where the leader had not
+/// moved) and was caught only by a pure-function test. "The walker cannot stall" is a universal claim,
+/// and no number of live runs discharges a universal.
+///
+/// `local` is whatever the fine tier last produced (empty = nothing to steer on). `fallback` is the
+/// aim of last resort when even the coarse route yields nothing (the straight line to the goal).
+pub(crate) fn steer_target(
+    coarse: &[[f32; 3]], path_i: usize,
+    local:  &[[f32; 3]], local_i: &mut usize,
+    from: [f32; 2], look_ahead: f32,
+    fallback: [f32; 3],
+) -> [f32; 3] {
+    // The coarse carrot: the aim we ALWAYS have while a route is committed.
+    let coarse_aim = carrot_along(coarse, path_i, from, look_ahead).unwrap_or(fallback);
+    // The fine carrot, when the fine tier has given us a path worth steering along. A 1-waypoint
+    // "path" is just the character's own position and steers nowhere.
+    if local.len() >= 2 {
+        // The fine plan was computed a tick or two ago, FROM a point the walker has since driven past
+        // (#382) — so advance the cursor onto the segment it is actually on before measuring the
+        // carrot, or the aim is taken from behind it (#311).
+        advance_cursor(local, local_i, from);
+        carrot_along(local, *local_i, from, look_ahead).unwrap_or(coarse_aim)
+    } else {
+        coarse_aim
+    }
+}
+
+/// Should the fine tier's outcome arm a proactive COARSE re-plan (#246)?
+///
+/// **Only a CLOSED window may.** `NoWayThrough` means the fine search explored its entire 40 u window
+/// and proved there is no way along the committed coarse corridor from here — that is real evidence
+/// the coarse route skims something the 8 u grid missed, and re-planning around it is the right move.
+///
+/// `Exhausted` means the search **did not look**. Arming on it is a limit laundered into "the route
+/// ahead is blocked" — and that is exactly what the deleted 150 ms wall-clock budget did every time it
+/// fired: under CPU load, a perfectly threadable corridor got re-planned as though it were walled,
+/// which both wasted a coarse plan and (per #379) fed the coarse tier no information it could act on,
+/// so it re-proposed the same corridor forever.
+///
+/// `Threaded` obviously does not: the walker is threading it right now.
+pub(crate) fn arms_coarse_replan(outcome: &crate::assets::LocalOutcome) -> bool {
+    matches!(outcome, crate::assets::LocalOutcome::NoWayThrough { .. })
 }
 
 pub struct Navigator {
@@ -853,7 +927,17 @@ pub struct Navigator {
     /// the player toward a carrot ~LOCAL_REACH ahead on the coarse `path`. It threads sub-8u detail
     /// (thin ramps, narrow openings) the coarse grid can't see. Empty = coarse aim (fine plan failed
     /// or no coarse path). Two-tier planner (#nav-multires).
+    ///
+    /// **This is now the LAST GOOD fine plan, not this tick's** (#382). It is computed on
+    /// `local_planner`'s worker thread and lands a tick or two after it is posted; the walker keeps
+    /// steering on the previous one meanwhile, exactly as #377 does with the coarse route. It is never
+    /// waited on — see `steer_target`.
     local_path:       Vec<[f32; 3]>,
+    /// Where `local_path` was planned FROM. The walker has moved since (~6.6u per tick at RUN_SPEED),
+    /// which the fast-steering cursor absorbs — but a TELEPORT or a big server correction leaves the
+    /// plan describing ground the character is no longer standing on, and steering along it would aim
+    /// the walker at a line it isn't on. Beyond `LOCAL_BOUND` from here the plan is dropped.
+    local_from:       [f32; 3],
     /// Fast-steering carrot cursor into `local_path` (#311). The fast-steering loop below re-aims
     /// every ~10ms, far more often than `local_path` is rebuilt (the 150ms gate), so — like the
     /// coarse `path_i` — it must advance as the projection passes each segment instead of staying
@@ -892,10 +976,15 @@ pub struct Navigator {
     /// Proactive coarse re-plan (#246). The coarse 8u route is committed at goal-change and, without
     /// this, only re-planned on a ~3s no-progress stall — so an obstacle the coarse grid skims but the
     /// fine 2u planner can't thread makes the walker press into it for seconds while the overlay (which
-    /// re-plans continuously) already shows a clean detour. `local_stuck_ticks` counts consecutive
-    /// ticks the fine plan fails to REACH its coarse carrot (blocked ahead); after a few, `replan_coarse`
-    /// is armed so the next tick re-plans the coarse route from the CURRENT position (routing around
-    /// BEFORE the stall). `replan_cooldown` throttles those re-plans so they don't thrash.
+    /// re-plans continuously) already shows a clean detour. `local_stuck_ticks` counts consecutive fine
+    /// plans that came back `NoWayThrough` (the 40u window CLOSED without a way to the carrot); after a
+    /// few, `replan_coarse` is armed so the next tick re-plans the coarse route from the CURRENT
+    /// position (routing around BEFORE the stall). `replan_cooldown` throttles those so they don't thrash.
+    ///
+    /// **Only `NoWayThrough` counts (#382, `arms_coarse_replan`).** It used to count any fine plan that
+    /// fell short of the carrot — which, under the old 150 ms wall clock, INCLUDED every plan that
+    /// merely ran out of time. A timeout was therefore laundered into "the coarse route ahead is
+    /// blocked", and under CPU load that re-planned corridors that were perfectly threadable.
     local_stuck_ticks: u32,
     replan_coarse:     bool,
     replan_cooldown:   u32,
@@ -938,6 +1027,15 @@ pub struct Navigator {
     /// The PATHFINDING WORKER (#340). Coarse A* plans are POSTED here and picked up on a later tick;
     /// the net thread never blocks on a search. See `crate::eq_net::nav_planner`.
     planner:          crate::eq_net::nav_planner::Planner,
+    /// The FINE-TIER WORKER (#382). The 2u/40u steering plan is posted here EVERY nav tick and picked
+    /// up a tick or two later. It was the last A* left on the network thread, and the last search in
+    /// the client under a wall-clock budget.
+    ///
+    /// **Nothing ever waits on it.** There is deliberately no `awaiting_first_local_plan` mirroring
+    /// `awaiting_first_plan`: the coarse tier may legitimately stand the character still (driving with
+    /// no route at all would charge it through geometry), but the fine tier only ever REFINES an aim
+    /// the coarse route already provides, so its absence degrades steering rather than blocking it.
+    local_planner:    crate::eq_net::nav_planner::LocalPlanner,
     /// The planner SNAPPED the current goal's z to a floor the caller never named (see
     /// `Collision::goal_z_was_snapped`). Carried to ARRIVAL, so the agent is not simply told
     /// `arrived` as though it got the goal it asked for — it did not.
@@ -1076,6 +1174,7 @@ impl Navigator {
             path_goal: None,
             local_path: Vec::new(),
             local_i: 0,
+            local_from: [0.0, 0.0, 0.0],
             last_pet_target: None,
             falling: None,
             fall_start_z: 0.0,
@@ -1105,9 +1204,27 @@ impl Navigator {
             last_movement_history_send: Instant::now(),
             streamed_init: false,
             planner: crate::eq_net::nav_planner::Planner::spawn(),
+            local_planner: crate::eq_net::nav_planner::LocalPlanner::spawn(),
             goal_snapped: false,
             awaiting_first_plan: false,
         }
+    }
+
+    /// Drop the fine plan and forget the fine tier's last word. Called wherever the ground the plan
+    /// describes stops being ground we are standing on — a new destination, a teleport, a stop.
+    fn clear_local_plan(&mut self) {
+        self.local_path.clear();
+        self.local_i = 0;
+        self.local_stuck_ticks = 0;
+        self.local_planner.cancel();
+        self.set_nav_local(None);
+    }
+
+    /// Did the FINE tier last say the corridor ahead is genuinely not threadable? Read from the
+    /// published field rather than a shadow copy, so what steers the walker and what the agent is told
+    /// cannot drift apart.
+    fn local_says_no_way_through(&self) -> bool {
+        self.nav_state.lock().unwrap().local.as_ref().is_some_and(|l| l.state == "no_way_through")
     }
 
     /// Copy all entity positions from `gs` into the shared entity map
@@ -1366,10 +1483,23 @@ impl Navigator {
     /// months masquerading as a mysterious wedge.
     fn set_nav_state(&self, state: &str) { self.set_nav_state_because(state, None); }
 
+    /// Set the walker's state + reason. **Deliberately does NOT touch `local`** — the fine tier's
+    /// last word is an independent fact about a different tier, and clobbering it here would mean
+    /// every ordinary state transition silently erased the one field that says whether the tier
+    /// steering the character can see a way through (#382).
     fn set_nav_state_because(&self, state: &str, reason: Option<&str>) {
-        let next = crate::http::NavStatus { state: state.to_string(), reason: reason.map(str::to_string) };
         let mut s = self.nav_state.lock().unwrap();
-        if *s != next { *s = next; }
+        let reason = reason.map(str::to_string);
+        if s.state != state || s.reason != reason {
+            s.state = state.to_string();
+            s.reason = reason;
+        }
+    }
+
+    /// Publish the FINE tier's last honest outcome (#382). Never touches `state`/`reason`.
+    fn set_nav_local(&self, local: Option<crate::http::NavLocal>) {
+        let mut s = self.nav_state.lock().unwrap();
+        if s.local != local { s.local = local; }
     }
 
     /// Read the current nav state word (without the reason).
@@ -1385,13 +1515,79 @@ impl Navigator {
         gs.log_msg("zone", msg);
         self.set_nav_state_because(state, Some(reason));
         self.path.clear();
+        // Drop the fine PLAN, but deliberately KEEP the fine tier's last word (`nav_local`) — it is
+        // the evidence behind a terminal `blocked`, and an agent reading the outcome of a failed goto
+        // needs to see whether the corridor was proven unthreadable or whether the fine tier merely
+        // stopped looking. It is cleared when a new route is committed (`clear_local_plan`).
         self.local_path.clear();
         self.local_i = 0;
+        self.local_stuck_ticks = 0;
+        self.local_planner.cancel();
         self.path_goal = None;
         self.planner.cancel();
         self.awaiting_first_plan = false;
         *self.goto_target.lock().unwrap() = None;
         *self.nav_intent.lock().unwrap() = None;
+    }
+
+    /// Apply a finished FINE plan from the local worker (#382).
+    ///
+    /// Three things happen here, and the second is the one #382 is about:
+    ///
+    /// 1. **Install the steer path.** Every outcome carries one — a complete fine route, or the best
+    ///    partial toward the carrot. Even a `NoWayThrough` partial is installed: it is a steering hint,
+    ///    not a route proposal, and wiping it is what stranded the halas swimmer at the shoreline
+    ///    (#377 review, N1). The walker was steering on the PREVIOUS fine plan until this moment; it
+    ///    never waited.
+    ///
+    /// 2. **Arm the proactive coarse re-plan ONLY on a CLOSED window** (`arms_coarse_replan`). The old
+    ///    code armed it whenever the fine path merely fell short of the carrot — which, under the
+    ///    150 ms wall clock this PR deletes, included every plan that simply ran out of time. A
+    ///    timeout was therefore laundered into "the coarse route ahead is blocked", and under CPU load
+    ///    it re-planned corridors that were perfectly threadable. Now `Exhausted` ("I stopped looking")
+    ///    and `NoWayThrough` ("I looked at all of it; there is no way") are different values and only
+    ///    the second is evidence of anything.
+    ///
+    /// 3. **Publish what the fine tier actually said** (`nav_local`), so an agent watching a character
+    ///    grind against a doorway can tell "the corridor is genuinely not threadable" from "the
+    ///    steering planner is not keeping up" — instead of reading a confident `nav_state: navigating`
+    ///    and nothing else, which is what it got before.
+    ///
+    /// The carrot is judged against `reply.goal` — the carrot the plan was actually FOR — not against
+    /// today's carrot, which has slid a few units since the request was posted.
+    fn apply_local_plan(&mut self, reply: crate::eq_net::nav_planner::LocalReply) {
+        let outcome = reply.outcome;
+        self.local_path = outcome.steer().to_vec();
+        self.local_from = reply.start;
+        // A fresh plan starts at `reply.start`, a point the walker has already driven past. Zero the
+        // cursor and let `steer_target`'s projection advance it onto the segment the walker is really
+        // on (#311) — a stale index into a new path would just move the bug.
+        self.local_i = 0;
+
+        // Only re-plan proactively while the walker is otherwise moving HEALTHILY: the point is to
+        // detour BEFORE bonking. Once it's genuinely wedged (in a back-off, or the stall clock is
+        // already climbing), the existing stall/back-off recovery owns it.
+        let healthy = self.backoff_ticks == 0 && self.stuck_ticks < NAV_HOP_TICKS;
+        if arms_coarse_replan(&outcome) && healthy && self.replan_cooldown == 0 {
+            self.local_stuck_ticks += 1;
+            if self.local_stuck_ticks >= NAV_LOCAL_STUCK_TICKS {
+                self.replan_coarse = true;
+                tracing::debug!("NAV: fine plan CLOSED its window short of the carrot near ({:.0},{:.0}) \
+                    ({}) — re-planning coarse (#246)", reply.start[0], reply.start[1], outcome.reason());
+            }
+        } else if outcome.threaded() {
+            self.local_stuck_ticks = 0;
+        }
+        // `Exhausted` deliberately does NEITHER: it is not evidence the corridor is blocked (so it must
+        // not count toward a re-plan) and it is not evidence it is clear (so it must not reset the
+        // count either). "I don't know" changes nothing.
+
+        self.set_nav_local(Some(crate::http::NavLocal {
+            state:       outcome.state().to_string(),
+            reason:      outcome.reason().to_string(),
+            stuck_ticks: self.local_stuck_ticks,
+            plan_us:     reply.plan_us as u64,
+        }));
     }
 
     /// Apply a finished plan from the worker thread. Returns `true` when the tick must STOP here —
@@ -1428,6 +1624,12 @@ impl Navigator {
                 self.path = path;
                 self.path_i = 0;
                 self.stuck_i = 0;
+                // The fine plan is a REFINEMENT OF A SPECIFIC COARSE ROUTE — it threads a carrot on it.
+                // Replace the route and the refinement is void: steering on it would follow the OLD
+                // route's corridor. Inline planning hid this (the fine plan was rebuilt from the new
+                // route the same tick); now it persists across ticks, so it must be dropped explicitly.
+                // The walker steers on the coarse carrot for the ~1 tick until the next fine plan lands.
+                self.clear_local_plan();
                 match snapped {
                     // Navigating, but NOT to the goal as given — the agent can see that in nav_reason.
                     Some(_) => self.set_nav_state_because("navigating", Some("goal_z_snapped")),
@@ -1447,6 +1649,7 @@ impl Navigator {
                 self.path = path;
                 self.path_i = 0;
                 self.stuck_i = 0;
+                self.clear_local_plan(); // same: a new coarse route voids the fine plan that refined the old one
                 self.set_nav_state_because("navigating_partial", Some(limit.as_str()));
                 false
             }
@@ -2509,6 +2712,9 @@ impl Navigator {
                 tracing::info!("NAV: teleported via in-zone portal — resuming goto to ({:.0},{:.0}) (#266)", ret.0, ret.1);
             }
             self.path_goal = None; // force a re-plan from the new position
+            // The fine plan describes ground we are no longer standing on. Steering along it would aim
+            // the walker at a line 40+ units away (#382).
+            self.clear_local_plan();
         }
         if self.portal_cooldown > 0 { self.portal_cooldown -= 1; }
 
@@ -2524,8 +2730,9 @@ impl Navigator {
                 self.path_goal = None;
                 self.escape_return = None; // goto cancelled → abandon any in-progress portal escape (#266)
                 // Nav stopped — any plan still in flight is for a goal nobody wants. Abandon it so
-                // its reply can never be applied (#340).
+                // its reply can never be applied (#340). Same for the fine tier (#382).
                 self.planner.cancel();
+                self.clear_local_plan();
                 self.awaiting_first_plan = false;
                 *self.nav_intent.lock().unwrap() = None;
                 // Only downgrade from an ACTIVE state (an external cancel / WASD). Keep terminal
@@ -2556,8 +2763,7 @@ impl Navigator {
             // A genuinely DIFFERENT destination — the committed route is for somewhere else. Drop it
             // and the journey-level recovery budget with it.
             self.path.clear();
-            self.local_path.clear();
-            self.local_i = 0;
+            self.clear_local_plan(); // a fine plan aimed at the OLD route's carrot is not a hint, it's a lie
             self.path_i = 0;
             self.stuck_i = 0;
             self.backoff_ticks = 0;
@@ -2565,7 +2771,6 @@ impl Navigator {
             self.stuck_ticks = 0;
             self.nav_repaths = 0;
             self.nav_best_gdist = f32::MAX;
-            self.local_stuck_ticks = 0;
             self.replan_cooldown = 0;
             self.replan_coarse = false;
             self.goal_snapped = false; // a new destination: whatever we snapped for the old one is moot
@@ -2709,70 +2914,79 @@ impl Navigator {
         }
         let have_path = !self.path.is_empty();
         let target: (f32, f32, f32) = if have_path {
-            // Coarse aim: look-ahead carrot on the 8u global route (the fallback).
+            // TWO-TIER (#nav-multires, #382). The coarse 8u route says WHERE to go; a FINE 2u plan,
+            // bounded to LOCAL_BOUND around the character and aimed at a carrot ~LOCAL_REACH ahead on
+            // that route, says HOW to thread the next few strides of it — the thin ramps and narrow
+            // openings the 8u grid cannot resolve.
+            //
+            // The fine plan used to be computed RIGHT HERE, inline, on the network thread, every nav
+            // tick, under a 150ms wall clock. That was the last A* on this thread (mean 15.3ms, worst
+            // 358ms, release/akanon) and the last wall-clock budget in the client — a residual stall of
+            // the exact class that caused the #257/#302 linkdead drops, and a budget that made the
+            // answer unfalsifiable. It is now POSTED to `local_planner` and picked up a tick or two
+            // later; the walker keeps steering on the LAST GOOD fine plan meanwhile, exactly as #377
+            // does with the coarse route.
+            const LOCAL_REACH: f32 = 24.0;   // how far ahead on the coarse route the fine plan aims
+            const LOCAL_BOUND: f32 = 40.0;   // the fine search window (keeps it bounded → it terminates)
             let coarse = carrot_along(&self.path, self.path_i, [px, py], LOOK_AHEAD)
                 .unwrap_or([goal.0, goal.1, gs.player_z]);
-            // TWO-TIER (#nav-multires): thread sub-8u detail near the walker. Plan a FINE 2u route
-            // (bounded → cheap, re-run every tick) from here to a carrot ~LOCAL_REACH ahead on the
-            // coarse route, and steer along IT. This keeps the walker on thin ramps and threads narrow
-            // openings the 8u grid can't resolve. Fall back to the coarse aim if the fine plan can't
-            // reach (a real local dead-end), so a local snag never stalls the whole route.
-            const LOCAL_REACH: f32 = 24.0;   // how far ahead on the coarse route the fine plan aims
-            const LOCAL_BOUND: f32 = 40.0;   // cap the fine search radius (keeps it cheap)
-            let local_goal = carrot_along(&self.path, self.path_i, [px, py], LOCAL_REACH).unwrap_or(coarse);
-            // This is the ONE A* still on the net thread. It is bounded to LOCAL_BOUND (40u) at a 2u
-            // cell, so it is inherently cheap — but it keeps a hard, small wall-clock cap
-            // (`PlanCtx::net_tier`) precisely because it runs here. Its partial routes are a local
-            // STEERING hint (re-planned every tick, and the walker checks `reached_carrot` below),
-            // never an answer to "can I reach the goal" — that question is the worker's (#337).
-            self.local_path = self.collision.read().unwrap().as_ref()
-                .and_then(|c| c.find_path_res([px, py, gs.player_z], local_goal,
-                    crate::movement::PLAYER_RADIUS, &[], true, LOCAL_CELL, Some(LOCAL_BOUND), 0.0,
-                    crate::assets::PlanCtx::net_tier()))
-                .unwrap_or_default();
-            // Fresh plan from the current position → the fast-steering cursor (#311) resets to its
-            // start; a stale index into a just-rebuilt path would just move the bug.
-            self.local_i = 0;
-            // Proactive re-plan trigger (#246): did the fine plan actually REACH its coarse carrot? If
-            // the committed coarse route skims an obstacle the 8u grid missed, the fine 2u plan stops
-            // short (truncated partial toward the reachable frontier) and the walker presses into it.
-            // Arm a fresh coarse re-plan (from the current position) after a few such ticks — long
-            // before the ~3 s stall — so the route detours around the obstacle, matching the overlay.
-            let reached_carrot = self.local_path.last().is_some_and(|p|
-                (p[0] - local_goal[0]).hypot(p[1] - local_goal[1]) <= LOCAL_CELL * 2.0);
-            // Only re-plan proactively while the walker is otherwise moving HEALTHILY: the point is to
-            // detour BEFORE bonking. Once it's genuinely wedged (in a back-off, or the stall clock is
-            // already climbing), the existing stall/back-off recovery owns it — arming another coarse
-            // plan here just piles redundant (and, in some zones, ~2 s) A* runs onto the net thread.
-            let healthy = self.backoff_ticks == 0 && self.stuck_ticks < NAV_HOP_TICKS;
-            if !reached_carrot && healthy && self.replan_cooldown == 0 {
-                self.local_stuck_ticks += 1;
-                if self.local_stuck_ticks >= NAV_LOCAL_STUCK_TICKS {
-                    self.replan_coarse = true;
-                    tracing::debug!("NAV: fine plan blocked short of carrot near ({:.0},{:.0}) — re-planning coarse (#246)", px, py);
-                }
-            } else {
-                self.local_stuck_ticks = 0;
+
+            // 1. PICK UP a finished fine plan, if one landed. `poll` has already discarded any aimed at
+            //    a carrot we have since walked past.
+            if let Some(reply) = self.local_planner.poll() {
+                self.apply_local_plan(reply);
             }
+
+            // 2. A fine plan the walker has been TELEPORTED away from describes ground it is not on.
+            //    (Ordinary walking drift — ~6.6u/tick — is absorbed by the fast-steering cursor, which
+            //    re-projects the live position onto the path every ~10ms. A 40u jump is not drift.)
+            if !self.local_path.is_empty()
+                && (px - self.local_from[0]).hypot(py - self.local_from[1]) > LOCAL_BOUND
+            {
+                self.clear_local_plan();
+            }
+
+            // 3. POST a fresh fine plan for where we are NOW. `post_if_idle` is a no-op while one is
+            //    already in flight — and note there is deliberately NO way to ASK whether one is (see
+            //    `LocalPlanner::post_if_idle`), because the one thing this code must never be able to
+            //    write is `if planner.is_planning() { return; }`. The walker cannot wait on a question
+            //    it cannot pose. This call is a channel send: microseconds, not a search.
+            let local_goal = carrot_along(&self.path, self.path_i, [px, py], LOCAL_REACH).unwrap_or(coarse);
+            if let Some(c) = self.collision.read().unwrap().as_ref().cloned() {
+                self.local_planner.post_if_idle(crate::eq_net::nav_planner::LocalRequest {
+                    gen: 0, // assigned by the planner
+                    start: [px, py, gs.player_z],
+                    goal:  local_goal,
+                    cell:  LOCAL_CELL,
+                    bound: LOCAL_BOUND,
+                    // The walker's own long-standing test for "did the fine plan reach the carrot?"
+                    // (#246). It lives here, with the walker, because it IS the walker's question.
+                    carrot_tol: LOCAL_CELL * 2.0,
+                    collision: c,
+                });
+            }
+            // A dead fine worker is NOT terminal — the coarse route still steers the character — but it
+            // must not be silent either: the agent is being steered with 8u detail from here on.
+            if self.local_planner.is_dead() {
+                self.set_nav_local(Some(crate::http::NavLocal {
+                    state: "planner_dead".into(), reason: "local_planner_dead".into(),
+                    stuck_ticks: 0, plan_us: 0,
+                }));
+            }
+
+            // 4. STEER. Never blocks, never waits — `steer_target` is TOTAL over every state the fine
+            //    tier can be in (never asked / in flight / dead / answered with nothing). See its docs:
+            //    "the walker cannot stall on the fine plan" is a universal claim, so it is discharged by
+            //    a property test over this function, not by a live run that happened to win the race.
+            let aim = steer_target(&self.path, self.path_i, &self.local_path, &mut self.local_i,
+                [px, py], LOOK_AHEAD, coarse);
             // Publish the walker's ACTUAL committed plan for the nav-debug overlay (#246) so it draws
             // exactly what the walker follows — coarse route + fine local plan — rather than an
             // independent per-frame recompute that over-states how cleanly the walker is steering.
             *self.nav_path_view.lock().unwrap() = (self.path.clone(), self.local_path.clone());
-            // Segment 0 — a literal, NOT `self.local_i` — is correct here and is not the #311 bug.
-            // `local_path` was just re-planned FROM the current position a few lines up, so the
-            // walker is on its first segment by construction and the cursor was reset to 0 with it.
-            // The bug is in the fast-steering loop, which re-aims ~15x per rebuild and so must track
-            // a live cursor; this main-tick aim runs once per rebuild against a path that starts
-            // under the walker's feet.
-            let aim = if self.local_path.len() >= 2 {
-                carrot_along(&self.local_path, 0, [px, py], LOOK_AHEAD).unwrap_or(coarse)
-            } else {
-                coarse
-            };
             (aim[0], aim[1], aim[2])
         } else {
-            self.local_path.clear();
-            self.local_i = 0;
+            self.clear_local_plan();
             *self.nav_path_view.lock().unwrap() = (Vec::new(), Vec::new());
             // No path computed: straight-line toward the goal at the player's CURRENT height.
             (goal.0, goal.1, gs.player_z)
@@ -2942,15 +3156,34 @@ impl Navigator {
                             gs.player_x, gs.player_y, self.nav_repaths);
                         return;
                     }
-                    // `blocked` now means ONE thing and one thing only: the planner gave us a route
-                    // and the walker physically could not follow it. It is no longer the dumping
-                    // ground for "the goal was unreachable and nobody said so" — that is `no_path`,
-                    // reported by the planner before a single step is taken (#337).
-                    self.stop_nav(gs, "blocked", "walker_stalled", &format!(
-                        "Wedged at ({:.1},{:.1}) after {} re-path attempts — the route is planned but the \
-                         walker cannot physically follow it. (The goal itself IS reachable; this is a \
-                         collision/steering wedge, not a routing failure.)",
-                        gs.player_x, gs.player_y, self.nav_repaths));
+                    // `blocked` means ONE thing: the planner gave us a route and the walker could not
+                    // follow it. It is no longer the dumping ground for "the goal was unreachable and
+                    // nobody said so" — that is `no_path`, reported before a single step is taken
+                    // (#337).
+                    //
+                    // But there are TWO ways to fail to follow a route, and they want different
+                    // responses from an agent (#382). If the FINE tier closed its whole 40u window and
+                    // found no way along the corridor, the walker is not "sliding on something" — the
+                    // corridor is genuinely too tight, and hopping/nudging will not help; the goal
+                    // needs approaching another way. If the fine tier was threading happily and the
+                    // walker still didn't move, it IS a physics wedge and `/move/manual` may free it.
+                    // Collapsing the two into one `walker_stalled` told the agent a confident story
+                    // about a cause we had not established.
+                    if self.local_says_no_way_through() {
+                        self.stop_nav(gs, "blocked", "local_no_way_through", &format!(
+                            "Wedged at ({:.1},{:.1}) after {} re-path attempts — and the FINE 2u planner has \
+                             CLOSED its whole 40u window without finding a way along the committed route. The \
+                             corridor here is not threadable at the character's own collision radius: this is \
+                             not a slide/collision wedge, and nudging will not fix it. Approach the goal from \
+                             another direction.",
+                            gs.player_x, gs.player_y, self.nav_repaths));
+                    } else {
+                        self.stop_nav(gs, "blocked", "walker_stalled", &format!(
+                            "Wedged at ({:.1},{:.1}) after {} re-path attempts — the route is planned, the fine \
+                             planner can thread it, but the walker cannot physically follow it. (The goal itself \
+                             IS reachable; this is a collision/steering wedge, not a routing failure.)",
+                            gs.player_x, gs.player_y, self.nav_repaths));
+                    }
                     return;
                 }
             }
@@ -3229,6 +3462,174 @@ pub fn make_position_packet(spawn_id: u32, x: f32, y: f32, z: f32, heading: f32)
     AppPacket {
         opcode: OP_CLIENT_UPDATE,
         payload: encode_position_update(spawn_id as u16, x, y, z, heading),
+    }
+}
+
+#[cfg(test)]
+mod fine_tier_tests {
+    use super::*;
+    use crate::assets::{LocalOutcome, NoRoute, PlanLimit};
+
+    /// A tiny deterministic LCG. No new dependency, and a seeded generator means a failure is
+    /// reproducible — which a `rand`-seeded property test would not be.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next_u32(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u32
+        }
+        fn f32_in(&mut self, lo: f32, hi: f32) -> f32 {
+            lo + (self.next_u32() as f32 / u32::MAX as f32) * (hi - lo)
+        }
+        fn usize_below(&mut self, n: usize) -> usize {
+            if n == 0 { 0 } else { self.next_u32() as usize % n }
+        }
+    }
+
+    fn random_path(rng: &mut Lcg, n: usize) -> Vec<[f32; 3]> {
+        (0..n).map(|_| [rng.f32_in(-500.0, 500.0), rng.f32_in(-500.0, 500.0), rng.f32_in(-50.0, 50.0)])
+            .collect()
+    }
+
+    /// # PROPERTY: **THE WALKER CAN NEVER STALL WAITING ON THE FINE PLAN.** (#382)
+    ///
+    /// The fine 2u plan now comes back from a worker thread, so on any given tick the fine tier may be
+    /// in ANY of these states, and the walker must drive regardless:
+    ///
+    /// * never asked (`local` empty, first tick of a route)
+    /// * still computing (`local` empty, or holding the PREVIOUS plan)
+    /// * dead (`local` frozen at whatever it last held, forever)
+    /// * answered with nothing usable (`local` empty or a 1-waypoint stub)
+    /// * answered with a partial from a position the walker has since driven past
+    ///
+    /// **Every one of those is just "some `local` slice", and `steer_target` is TOTAL over all of
+    /// them.** There is no input for which it has no aim, and therefore no state in which the walker
+    /// waits. That is why the fine tier's absence degrades steering instead of blocking it.
+    ///
+    /// This is a UNIVERSAL claim ("cannot stall"), and a live run cannot discharge a universal — a race
+    /// that usually wins is indistinguishable from one that cannot lose. In this very codebase a
+    /// `/follow` deadlock passed live verification by luck and was caught only by a pure-function test.
+    /// So it is pinned here, over 20k randomised states including every degenerate shape.
+    #[test]
+    fn the_walker_never_stalls_waiting_on_the_fine_plan() {
+        let mut rng = Lcg(0xF382_0001);
+        for case in 0..20_000u32 {
+            // Every shape the fine tier can hand us, degenerate ones included.
+            let local: Vec<[f32; 3]> = match case % 6 {
+                0 => Vec::new(),                        // never asked / still computing / dead-empty
+                1 => random_path(&mut rng, 1),          // a 1-waypoint stub: steers nowhere
+                2 => random_path(&mut rng, 2),          // the minimum usable plan
+                3 => { let n = rng.usize_below(30); random_path(&mut rng, 2 + n) } // an ordinary fine plan
+                4 => vec![[7.0, 7.0, 0.0]; 4],          // fully degenerate: zero-length segments
+                _ => { let n = rng.usize_below(4); random_path(&mut rng, 2 + n) }  // a stale partial
+            };
+            // ...against every shape of coarse route, since that is the fallback the aim rests on.
+            let coarse: Vec<[f32; 3]> = match case % 4 {
+                0 => { let n = rng.usize_below(40); random_path(&mut rng, 2 + n) }
+                1 => random_path(&mut rng, 2),
+                2 => vec![[3.0, 3.0, 0.0]; 3],          // degenerate coarse route
+                _ => random_path(&mut rng, 8),
+            };
+            // ...from anywhere, with ANY cursor value, including ones far past the end of the path (a
+            // cursor that outran a plan the worker then replaced with a shorter one).
+            let from = [rng.f32_in(-600.0, 600.0), rng.f32_in(-600.0, 600.0)];
+            let path_i = rng.usize_below(coarse.len() + 3);
+            let mut local_i = rng.usize_below(local.len() + 3);
+            let fallback = [rng.f32_in(-600.0, 600.0), rng.f32_in(-600.0, 600.0), 0.0];
+
+            let aim = steer_target(&coarse, path_i, &local, &mut local_i, from, 5.0, fallback);
+
+            // THE PROPERTY: an aim always exists, and it is a real point the walker can be driven at.
+            // (`steer_target` returns `[f32;3]`, not `Option` — the no-stall guarantee is in the TYPE.
+            // This pins the other half: that no input makes it produce a NaN the controller would
+            // silently turn into a frozen wish_dir.)
+            assert!(aim.iter().all(|c| c.is_finite()),
+                "case {case}: the walker must ALWAYS have a finite aim — there is no fine-tier state in \
+                 which it may wait. got {aim:?} (local={} wp, coarse={} wp)", local.len(), coarse.len());
+            // And the cursor stays inside the path it indexes, however absurd its starting value.
+            assert!(local.len() < 2 || local_i < local.len(),
+                "case {case}: the fine cursor must stay in bounds (local_i={local_i}, len={})", local.len());
+        }
+    }
+
+    /// # PROPERTY: **A LIMIT CAN NEVER BE REPORTED AS "NO WAY THROUGH".** (#382, the #337 disease)
+    ///
+    /// The proactive coarse re-plan (#246) is armed when the fine tier says the committed route cannot
+    /// be threaded from here. Under the deleted 150 ms wall clock it was armed whenever the fine path
+    /// merely fell short of the carrot — and a search that *ran out of clock* falls short of the carrot
+    /// in exactly the same way a search that *proved the corridor impassable* does. So a TIMEOUT was
+    /// laundered into "the route ahead is blocked": under CPU load, corridors that were perfectly
+    /// threadable got torn up and re-planned, and (per #379) the coarse tier learned nothing from it and
+    /// re-proposed the same corridor forever.
+    ///
+    /// The two answers are now different VALUES, and only the one that actually looked at the whole
+    /// window may arm anything. This is universal over every limit and every partial, so it is a
+    /// property, not an example.
+    #[test]
+    fn a_search_that_stopped_looking_can_never_arm_a_replan() {
+        let mut rng = Lcg(0xF382_0002);
+        for _ in 0..2_000 {
+            let n = rng.usize_below(20);
+            let steer = random_path(&mut rng, n);
+            // "I stopped looking" — WHATEVER the limit, and whatever partial it dribbled out.
+            for limit in [PlanLimit::Deadline, PlanLimit::NodeCap] {
+                let o = LocalOutcome::Exhausted { limit, steer: steer.clone() };
+                assert!(!arms_coarse_replan(&o),
+                    "an EXHAUSTED search did not look at the window — treating it as 'the corridor is \
+                     blocked' is a limit laundered into a fact, which is exactly what the 150ms budget did");
+                assert_ne!(o.state(), "no_way_through",
+                    "and it must never be PUBLISHED as 'no way through' either");
+            }
+            // "I looked at all of it; there is no way" — the only outcome that is evidence of anything.
+            for why in [NoRoute::SearchClosed, NoRoute::StartIsolated, NoRoute::GoalNotWalkable, NoRoute::NoGeometry] {
+                let o = LocalOutcome::NoWayThrough { steer: steer.clone(), why };
+                assert!(arms_coarse_replan(&o),
+                    "a CLOSED window IS evidence the coarse corridor is not threadable — it must still \
+                     arm the #246 re-plan, or this change trades one bug for a worse one");
+            }
+            // And a threaded route obviously arms nothing.
+            assert!(!arms_coarse_replan(&LocalOutcome::Threaded(steer.clone())));
+        }
+    }
+
+    /// # PROPERTY: **THE FINE TIER CAN NEVER SAY `no_path`.** (#382)
+    ///
+    /// `no_path` is the client's DEFINITIVE, falsifiable "there is no route" — the one word an agent is
+    /// entitled to act on by giving up on a goal. The fine tier searches a **40 u window**. A closed
+    /// window proves nothing whatever about the goal, which is typically hundreds of units away. If the
+    /// fine tier could reach `no_path`, a character standing in front of a tight doorway would tell its
+    /// agent the destination is unreachable — a confident falsehood, and the single worst thing this
+    /// planner can say.
+    ///
+    /// It cannot, and the reason is structural rather than a guard: `LocalOutcome` has **no variant
+    /// that spells a definitive no**, so there is nothing to map. This pins the mapping anyway, because
+    /// a future hand could add one.
+    #[test]
+    fn the_bounded_fine_tier_can_never_report_a_definitive_no_path() {
+        let mut rng = Lcg(0xF382_0003);
+        for _ in 0..500 {
+            let n = rng.usize_below(10);
+            let steer = random_path(&mut rng, n);
+            let outcomes = [
+                LocalOutcome::Threaded(steer.clone()),
+                LocalOutcome::NoWayThrough { steer: steer.clone(), why: NoRoute::SearchClosed },
+                LocalOutcome::NoWayThrough { steer: steer.clone(), why: NoRoute::StartIsolated },
+                LocalOutcome::NoWayThrough { steer: steer.clone(), why: NoRoute::GoalNotWalkable },
+                LocalOutcome::Exhausted { limit: PlanLimit::NodeCap, steer: steer.clone() },
+                LocalOutcome::Exhausted { limit: PlanLimit::Deadline, steer: steer.clone() },
+            ];
+            for o in &outcomes {
+                assert_ne!(o.state(), "no_path",
+                    "a 40u window can NEVER prove a goal unreachable — the fine tier must have no way to \
+                     say `no_path`, or a tight doorway becomes 'your destination does not exist'");
+                assert_ne!(o.state(), "search_exhausted",
+                    "nor may it borrow the COARSE planner's terminal states: those stop the walker, and a \
+                     local dead-end must not");
+                // Every outcome carries a steer hint — the walker is never left with nothing to follow.
+                assert_eq!(o.steer().len(), steer.len(),
+                    "every fine outcome must carry its steering hint (the halas swimmer, #377 review N1)");
+            }
+        }
     }
 }
 

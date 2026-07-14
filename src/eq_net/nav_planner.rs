@@ -1,4 +1,16 @@
-//! The pathfinding WORKER THREAD (#340, #337).
+//! The pathfinding WORKER THREADS (#340, #337, #382).
+//!
+//! Two workers live here, one per nav tier:
+//!
+//! | tier | type | posted | budget |
+//! |---|---|---|---|
+//! | **coarse** (8 u, whole route) | [`Planner`] | on a goal change / re-plan | none (5 s safety net) |
+//! | **fine** (2 u, 40 u window, steering) | [`LocalPlanner`] | **every nav tick** | none (spatially bounded) |
+//!
+//! **Neither runs on the network thread, and neither carries a wall clock any more.** The coarse tier
+//! came off in #377; the fine tier — the one that actually steers the character — came off in #382,
+//! which is also what deleted the last 150 ms budget. See [`LocalPlanner`] for why the fine tier needs
+//! a worker of its own rather than sharing the coarse one.
 //!
 //! # Why this exists
 //!
@@ -32,7 +44,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Instant;
 
-use crate::assets::{Collision, NoRoute, PlanCtx, PlanOutcome};
+use crate::assets::{Collision, LocalOutcome, NoRoute, PlanCtx, PlanOutcome};
 use crate::movement::PLAYER_RADIUS;
 
 /// One plan the walker wants computed. Carries its own `Arc<Collision>` so the worker never touches
@@ -308,10 +320,193 @@ pub fn plan_path(
     first
 }
 
+// ---------------------------------------------------------------------------------------------
+// THE FINE LOCAL TIER (#382)
+// ---------------------------------------------------------------------------------------------
+
+/// One fine/local steering plan: a bounded 2 u A* from the character to a carrot on the coarse route.
+pub struct LocalRequest {
+    pub gen:       u64,
+    pub start:     [f32; 3],
+    /// The carrot: a point ~`LOCAL_REACH` ahead on the committed coarse route.
+    pub goal:      [f32; 3],
+    pub cell:      f32,
+    pub bound:     f32,
+    /// How near the carrot counts as REACHING it — see `Collision::find_path_local`.
+    pub carrot_tol: f32,
+    pub collision: Arc<Collision>,
+}
+
+/// A finished fine plan. It carries the `start` and `goal` it was computed FOR, because by the time
+/// it lands the walker has moved and the carrot has slid — and every judgement made about this plan
+/// ("did it reach its carrot?") must be made against the question it actually answered, not against
+/// the question we would ask now.
+pub struct LocalReply {
+    pub gen:     u64,
+    pub start:   [f32; 3],
+    pub goal:    [f32; 3],
+    pub outcome: LocalOutcome,
+    /// Microseconds, not milliseconds: this is the stall that used to land on the NET THREAD every
+    /// single nav tick (measured, release, akanon: mean 15.3 ms, worst 358 ms).
+    pub plan_us: u128,
+}
+
+/// The Navigator's handle on the FINE tier's worker (#382).
+///
+/// # Why a second worker and not the coarse one
+///
+/// The two tiers have irreconcilable latency contracts. A coarse plan is posted on a goal change and
+/// may legitimately take **seconds** (its safety net is 5 s); a fine plan is posted on **every nav
+/// tick** and is worthless if it is not back within a tick or two. Sharing one worker would put every
+/// fine plan behind whatever coarse search is running — starving the tier that steers, for the entire
+/// duration of the tier that routes — and the coarse worker's request-coalescing (newest wins) would
+/// happily throw a coarse plan away in favour of a fine one. So: two workers, two queues, two
+/// generations, one shared pattern.
+///
+/// # The contract that makes this safe
+///
+/// **The walker never waits on this.** There is no `awaiting_first_local_plan`, and there is
+/// deliberately no way to add one: the steering aim is chosen by `navigation::steer_target`, a TOTAL
+/// pure function of (coarse route, whatever the fine tier last produced). Every state this planner
+/// can be in — never asked, in flight, dead, answered with nothing — is just "the fine path is
+/// empty", and an empty fine path steers on the coarse carrot. A stall here would be worse than the
+/// bug being fixed, and in this codebase a `/follow` deadlock once passed live verification *by
+/// luck*; so the no-stall claim is discharged by a property test over that pure function, not by a
+/// race we happened to win.
+pub struct LocalPlanner {
+    req_tx:   Sender<LocalRequest>,
+    rep_rx:   Receiver<LocalReply>,
+    next_gen: u64,
+    /// The generation we are waiting on. Cleared by `poll` the instant its reply is handed over.
+    pending:  Option<u64>,
+    dead:     bool,
+}
+
+impl Default for LocalPlanner {
+    fn default() -> Self { Self::spawn() }
+}
+
+impl LocalPlanner {
+    pub fn spawn() -> Self {
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<LocalRequest>();
+        let (rep_tx, rep_rx) = std::sync::mpsc::channel::<LocalReply>();
+        std::thread::Builder::new()
+            .name("nav-local".into())
+            .spawn(move || local_worker(req_rx, rep_tx))
+            .expect("spawn nav-local thread");
+        LocalPlanner { req_tx, rep_rx, next_gen: 1, pending: None, dead: false }
+    }
+
+    /// Post a fine plan **if the worker is idle**, and return whether one was posted. A channel send —
+    /// microseconds — never a search.
+    ///
+    /// # There is deliberately no public `is_planning()`
+    ///
+    /// This is the whole no-stall design, and it is a TYPE decision, not a discipline one. The obvious
+    /// API is `is_planning()` + `request()`, and the obvious caller is
+    ///
+    /// ```text
+    /// if planner.is_planning() { return; }   // <-- the walker now waits on the fine tier. Deadlock.
+    /// ```
+    ///
+    /// That single line would reintroduce the class of bug this PR exists to remove — and worse than
+    /// the original, because it would be a *stall on a thread boundary* rather than a bounded inline
+    /// search. #377 removed its own deadlock the same way: it did not add a check that `plan_goal` was
+    /// cleared, it **deleted the field**, so the bad state could not be written down.
+    ///
+    /// So the "is one in flight?" question is not askable from outside. Posting is idempotent (a second
+    /// post while one is in flight is a no-op), and there is nothing to wait on because there is nothing
+    /// to ask. Callers get an aim from `navigation::steer_target`, which is total.
+    pub fn post_if_idle(&mut self, mut req: LocalRequest) -> bool {
+        if self.pending.is_some() || self.dead { return false; }
+        let gen = self.next_gen;
+        self.next_gen += 1;
+        req.gen = gen;
+        self.pending = Some(gen);
+        if self.req_tx.send(req).is_err() {
+            if !self.dead {
+                tracing::error!("nav-local: the fine-tier worker thread is gone — the walker will steer on the \
+                    COARSE route only (it keeps walking; the last ~40u of steering just loses its 2u detail)");
+            }
+            self.dead = true;
+            self.pending = None;
+            return false;
+        }
+        true
+    }
+
+    /// Abandon the fine plan in flight (the route was reset / nav stopped).
+    pub fn cancel(&mut self) { self.pending = None; }
+
+    /// Test-only. Production code cannot ask this — see [`LocalPlanner::post_if_idle`].
+    #[cfg(test)]
+    pub fn is_planning(&self) -> bool { self.pending.is_some() }
+
+    /// Has the fine worker DIED? Unlike the coarse planner this is NOT terminal for navigation — the
+    /// walker degrades to coarse-only steering — but it must still be said out loud, because an agent
+    /// that is being steered without the fine tier is being steered worse and deserves to know.
+    pub fn is_dead(&self) -> bool { self.dead }
+
+    #[cfg(test)]
+    pub fn kill_worker_for_test(&mut self) {
+        let (tx, rx) = std::sync::mpsc::channel::<LocalReply>();
+        drop(tx);
+        self.rep_rx = rx;
+    }
+
+    /// Drain the reply channel and hand back the fine plan for the request we are actually waiting
+    /// on. Stale replies (a superseded carrot) are DISCARDED — steering along a plan aimed at a
+    /// carrot we have already walked past is its own quiet lie.
+    pub fn poll(&mut self) -> Option<LocalReply> {
+        let mut fresh = None;
+        loop {
+            match self.rep_rx.try_recv() {
+                Ok(rep) => {
+                    if self.pending == Some(rep.gen) {
+                        self.pending = None;
+                        fresh = Some(rep);
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if !self.dead {
+                        tracing::error!("nav-local: the fine-tier worker thread is DEAD (panicked) — steering \
+                            falls back to the COARSE route for the rest of this session. Reported as \
+                            nav_local.state=planner_dead; the walker keeps walking.");
+                    }
+                    self.dead = true;
+                    self.pending = None;
+                    break;
+                }
+            }
+        }
+        fresh
+    }
+}
+
+/// The fine worker loop. Same shape as `worker`: block, coalesce the backlog down to the NEWEST
+/// request (an older carrot is already stale — the walker has driven past it), plan, reply.
+fn local_worker(req_rx: Receiver<LocalRequest>, rep_tx: Sender<LocalReply>) {
+    while let Ok(mut req) = req_rx.recv() {
+        while let Ok(newer) = req_rx.try_recv() { req = newer; }
+        let t0 = Instant::now();
+        let outcome = req.collision.find_path_local(req.start, req.goal, req.cell, req.bound, req.carrot_tol);
+        let plan_us = t0.elapsed().as_micros();
+        if !outcome.threaded() {
+            tracing::debug!("nav-local: fine plan #{} ({:.0},{:.0})->({:.0},{:.0}) = {} ({}) in {}us",
+                req.gen, req.start[0], req.start[1], req.goal[0], req.goal[1],
+                outcome.state(), outcome.reason(), plan_us);
+        }
+        if rep_tx.send(LocalReply { gen: req.gen, start: req.start, goal: req.goal, outcome, plan_us }).is_err() {
+            break; // Navigator gone (zone change / shutdown)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assets::{Collision, MeshData, PlanOutcome, RenderMode, ZoneAssets};
+    use crate::assets::{Collision, LocalOutcome, MeshData, PlanOutcome, RenderMode, ZoneAssets};
 
     /// GLB-space quad (`positions` are `[north, up, east]`).
     fn quad(v: Vec<[f32; 3]>) -> MeshData {
@@ -530,5 +725,176 @@ mod tests {
             "fixture sanity: the synchronous plan must be genuinely expensive ({sync_us}us) or this proves nothing");
         assert!(post_us < 1_000,
             "posting a plan must NOT block the net thread — it must be a channel send, not a search (took {post_us}us)");
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // THE FINE LOCAL TIER (#382)
+    // ------------------------------------------------------------------------------------------
+
+    /// A 200x200 floor with a solid wall across east=0 (no gap). A carrot on the far side of it is
+    /// inside the fine tier's 40u window and yet genuinely unreachable — the window's frontier CLOSES.
+    /// That is the fixture that separates "there is no way through" from "I stopped looking".
+    fn plane_with_a_solid_wall() -> Arc<Collision> {
+        const H: f32 = 30.0;
+        let terrain = vec![
+            quad(vec![[-100.0, 0.0, -100.0], [100.0, 0.0, -100.0], [100.0, 0.0, 100.0], [-100.0, 0.0, 100.0]]),
+            // A wall plane at east = 0, spanning the whole north extent. (GLB positions = [n, up, e].)
+            quad(vec![[-100.0, 0.0, 0.0], [100.0, 0.0, 0.0], [100.0, H, 0.0], [-100.0, H, 0.0]]),
+        ];
+        Arc::new(Collision::build(&ZoneAssets { terrain, objects: vec![], textures: vec![] }, 32.0))
+    }
+
+    /// **THE #382 HEADLINE, MEASURED: the fine plan is no longer a search on the calling thread.**
+    ///
+    /// This tier ran INLINE on the network thread, EVERY nav tick, under a 150 ms wall clock — the last
+    /// A* on that thread and the last budget in the client (measured live, release/akanon: mean 15.3 ms,
+    /// worst 358 ms). This test pays both costs side by side: what the net thread used to spend per tick
+    /// (`find_path_local`), and what it spends now (`LocalPlanner::request`).
+    ///
+    /// Like its coarse counterpart above, the assertions only get SAFER under CPU load — a busy box
+    /// makes the synchronous search slower, not faster.
+    #[test]
+    fn posting_a_fine_plan_does_not_block_the_caller() {
+        let col = plane_with_a_solid_wall();
+        let start = [-20.0, 0.0, 0.0];
+        let goal  = [ 20.0, 0.0, 0.0]; // through the wall: the window must be fully closed
+
+        // What the NET THREAD used to pay, synchronously, every single nav tick:
+        let t0 = Instant::now();
+        let outcome = col.find_path_local(start, goal, 2.0, 40.0, 4.0);
+        let sync_us = t0.elapsed().as_micros();
+        assert!(!outcome.threaded(), "fixture sanity: the carrot is behind a solid wall");
+
+        // What it pays now:
+        let mut lp = LocalPlanner::spawn();
+        let t1 = Instant::now();
+        lp.post_if_idle(LocalRequest {
+            gen: 0, start, goal, cell: 2.0, bound: 40.0, carrot_tol: 4.0, collision: col.clone(),
+        });
+        let post_us = t1.elapsed().as_micros();
+
+        eprintln!("NET-THREAD STALL PER NAV TICK (fine tier): synchronous {sync_us}us  ->  posted {post_us}us");
+        assert!(sync_us > 1_000,
+            "fixture sanity: the synchronous fine plan must cost real time ({sync_us}us) or this proves nothing");
+        assert!(post_us < 500,
+            "posting the fine plan must NOT block the net thread — it must be a channel send, not a search \
+             (took {post_us}us). This is the ONE assertion that #382 exists to make.");
+    }
+
+    /// **THE HONESTY SPLIT.** A carrot behind a solid wall must come back as a CLOSED window
+    /// (`NoWayThrough`) — a falsifiable local "no" the walker can act on — and a carrot down an open
+    /// corridor must come back `Threaded`. Under the old `find_path_res` both were the same
+    /// `Option<Vec<_>>` and the caller could not ask which.
+    #[test]
+    fn a_closed_fine_window_is_no_way_through_and_an_open_one_is_threaded() {
+        let col = plane_with_a_solid_wall();
+
+        let blocked = col.find_path_local([-20.0, 0.0, 0.0], [20.0, 0.0, 0.0], 2.0, 40.0, 4.0);
+        match &blocked {
+            LocalOutcome::NoWayThrough { why, .. } => {
+                assert!(matches!(why, NoRoute::SearchClosed | NoRoute::StartIsolated),
+                    "a walled carrot closes the window: got {why:?}");
+            }
+            other => panic!("a carrot behind a solid wall must CLOSE the window (NoWayThrough), got {other:?}"),
+        }
+        // It is a LOCAL no, and it must never be able to become the agent-facing `no_path`.
+        assert_ne!(blocked.state(), "no_path");
+
+        // The mirror image: the honesty change must not make the fine tier timid.
+        let open = col.find_path_local([-30.0, 0.0, 0.0], [-10.0, 0.0, 0.0], 2.0, 40.0, 4.0);
+        assert!(open.threaded(), "an open 20u run along the floor must THREAD, got {open:?}");
+        assert!(open.steer().len() >= 2, "and it must carry waypoints to steer along");
+    }
+
+    /// **THE FINE TIER IS DETERMINISTIC.** With the 150 ms wall clock deleted, the same question from
+    /// the same spot yields the same answer no matter what else the box is doing — the search is bounded
+    /// SPATIALLY (a 40 u window at 2 u cells), not temporally. A clock-bounded search is a function of
+    /// the CPU's mood; this one is a function of the geometry.
+    ///
+    /// (It is the same wall-clock dependence that made the coarse planner's reachable count flip
+    /// 28→26→27 across identical runs before #377.)
+    #[test]
+    fn the_fine_plan_is_deterministic_because_it_has_no_wall_clock() {
+        let col = plane_with_a_solid_wall();
+        let first = col.find_path_local([-20.0, 0.0, 0.0], [20.0, 0.0, 0.0], 2.0, 40.0, 4.0);
+        for i in 0..12 {
+            // Load the box between runs. A wall-clock-bounded search would notice; this one cannot.
+            let mut sink = 0u64;
+            for k in 0..2_000_000u64 { sink = sink.wrapping_add(k ^ sink.rotate_left(7)); }
+            std::hint::black_box(sink);
+            let again = col.find_path_local([-20.0, 0.0, 0.0], [20.0, 0.0, 0.0], 2.0, 40.0, 4.0);
+            assert_eq!(first, again,
+                "run {i}: the fine plan must be a function of the GEOMETRY, not of the clock. A differing \
+                 answer here means a wall-clock budget has come back.");
+        }
+    }
+
+    /// **AN ABANDONED FINE PLAN MUST NEVER BE INSTALLED.** This is the real staleness path in
+    /// production: the walker gets a NEW destination (or is teleported), `clear_local_plan` cancels the
+    /// fine plan in flight, and the next tick posts a fresh one — but the abandoned plan is still being
+    /// computed on the worker and WILL land. It describes a carrot on a route we have thrown away.
+    /// Steering along it would aim the walker at ground nobody asked for; the generation check must
+    /// reject it.
+    ///
+    /// (Note `post_if_idle` means the Navigator never *supersedes* an in-flight fine plan — it simply
+    /// doesn't post on top of one. Cancellation is therefore the ONLY way a stale fine reply is
+    /// produced, so it is the case that has to be pinned.)
+    #[test]
+    fn an_abandoned_fine_plan_is_discarded_not_applied() {
+        let col = plane_with_a_solid_wall();
+        let mut lp = LocalPlanner::spawn();
+        let mk = |start: [f32; 3], goal: [f32; 3], col: &Arc<Collision>| LocalRequest {
+            gen: 0, start, goal, cell: 2.0, bound: 40.0, carrot_tol: 4.0, collision: col.clone(),
+        };
+        // Plan A: the expensive walled question, so it really is in flight when we abandon it...
+        assert!(lp.post_if_idle(mk([-20.0, 0.0, 0.0], [20.0, 0.0, 0.0], &col)), "A must post");
+        assert!(!lp.post_if_idle(mk([0.0, 0.0, 0.0], [10.0, 0.0, 0.0], &col)),
+            "a second post while one is in flight must be a NO-OP — the walker never queues fine plans");
+        // ...the route is reset (a new /goto, a teleport): the plan is abandoned mid-flight.
+        lp.cancel();
+        // ...and the next tick posts a fresh one for the new route.
+        assert!(lp.post_if_idle(mk([-30.0, 0.0, 0.0], [-10.0, 0.0, 0.0], &col)), "B must post after a cancel");
+
+        // A's answer is computed and DOES arrive. It must be dropped on the way in; only B may land.
+        let mut applied = None;
+        for _ in 0..2000 {
+            if let Some(r) = lp.poll() { applied = Some(r); break; }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let rep = applied.expect("a fine plan must come back");
+        assert_eq!(rep.start, [-30.0, 0.0, 0.0],
+            "the applied plan must be the CURRENT route's — the ABANDONED one, which was computed and did \
+             arrive, must have been discarded on the way in");
+        assert!(!lp.is_planning(), "handing the reply over clears the pending request");
+        for _ in 0..20 {
+            assert!(lp.poll().is_none(), "a stale fine reply must be DISCARDED, never queued for later");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// A DEAD fine worker must be detected and must NOT wedge navigation. Unlike the coarse planner —
+    /// whose death is terminal, because nothing can route without it — the fine tier only refines an aim
+    /// the coarse route already provides. So its death degrades steering to 8 u detail and the walker
+    /// KEEPS WALKING. It must still be latched and said out loud (`nav_local.state = planner_dead`): a
+    /// character being steered worse than the agent believes is exactly the quiet lie this project ranks
+    /// above crashes.
+    #[test]
+    fn a_dead_fine_planner_is_reported_and_does_not_wedge_the_walker() {
+        let col = plane_with_a_solid_wall();
+        let mut lp = LocalPlanner::spawn();
+        assert!(!lp.is_dead());
+        lp.kill_worker_for_test();
+        lp.post_if_idle(LocalRequest { gen: 0, start: [-20.0, 0.0, 0.0], goal: [20.0, 0.0, 0.0],
+            cell: 2.0, bound: 40.0, carrot_tol: 4.0, collision: col });
+        for _ in 0..50 {
+            assert!(lp.poll().is_none(), "a dead planner cannot produce a plan");
+            if lp.is_dead() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(lp.is_dead(), "a dead fine worker MUST be detected, not silently 'still thinking'");
+        assert!(!lp.is_planning(),
+            "and it must not claim a plan is in flight: `tick` only skips POSTING while one is — if that \
+             stuck true, the fine tier would never be re-posted even after a restart");
+        // The walker's aim does not depend on it at all — see `navigation::steer_target`, which is total.
     }
 }
