@@ -203,11 +203,11 @@ machine-readable *why*, `null` unless a state has one). Together they are how yo
 | `idle` | Nothing to do. | — |
 | `planning` | A route is being computed on the pathfinding worker thread. The character stands still. Normally < 1 s. | — |
 | `navigating` | Walking a **complete route to your goal**. | `goal_z_snapped` (see below) or — |
-| `navigating_partial` | Walking a **partial** route: the search was cut short, so this is *not* a route to your goal — it's progress toward a frontier, and it will re-plan from the far end. Usually resolves to `navigating` or `arrived`. | `search_deadline` / `search_node_cap` |
+| `navigating_partial` | Walking a **partial** route: the search was cut short, so this is *not* a route to your goal — it's progress toward a frontier, and it will re-plan from the far end. Usually resolves to `navigating` or `arrived`. | `search_node_cap` |
 | `following` | A `/follow` chase has caught up; holding near the leader, still latched. | — |
 | `arrived` | Reached the goal. | `goal_z_snapped` (see below) or — |
 | `no_path` | **DEFINITIVE: no route exists.** The planner searched to completion. Do not retry the same goal — pick another. | see below |
-| `search_exhausted` | The planner **gave up**. This is **"I don't know", not "no"** — a route may well exist. Try a nearer waypoint. | `search_deadline` / `search_node_cap` |
+| `search_exhausted` | The planner **gave up**. This is **"I don't know", not "no"** — a route may well exist. Try a nearer waypoint. | `search_node_cap` |
 | `blocked` | A route exists, but the walker **physically could not follow it** (wedged on geometry after 8 recovery attempts). A steering/collision failure, *not* a routing one. | `walker_stalled`, `fall_would_be_lethal` |
 
 **`goal_z_snapped` — the client CHANGED your goal.** The `z` you gave sits below every floor in the

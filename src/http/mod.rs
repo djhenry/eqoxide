@@ -410,7 +410,7 @@ pub type DialogueShared = Arc<Mutex<Vec<crate::game_state::DialogueChoice>>>;
 /// `no_path` | `search_exhausted` | `blocked`
 ///
 /// `reason` is the machine-readable WHY behind a terminal state (`goal_not_walkable`,
-/// `search_closed`, `search_deadline`, …). The whole point of the split (#337): a driver must be
+/// `search_closed`, `search_node_cap`, …). The whole point of the split (#337): a driver must be
 /// able to tell "there is no route" (definitive) from "the planner gave up" (I don't know) from
 /// "I am wedged" — three answers the old, overloaded `blocked` collapsed into one silent freeze.
 #[derive(Clone, Debug, PartialEq)]

@@ -143,7 +143,7 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             // months. See docs/http-api.md ("Navigation state") for the full contract.
             //   no_path          — DEFINITIVE: no route exists (nav_reason: goal_not_walkable |
             //                      search_closed | start_isolated | no_geometry). Pick another goal.
-            //   search_exhausted — the planner GAVE UP (search_deadline | search_node_cap). This is
+            //   search_exhausted — the planner GAVE UP (search_node_cap). This is
             //                      "I don't know", NOT "no". Try a nearer waypoint.
             //   blocked          — a route exists but the walker physically cannot follow it.
             "nav_state":   nav.state,

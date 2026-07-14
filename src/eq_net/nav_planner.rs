@@ -260,14 +260,32 @@ pub fn plan_path(
     aggro_buffer: f32,
     goal_region: Option<i32>,
 ) -> PlanOutcome {
-    // ONE deadline for the WHOLE plan, not one per A* call (#340). This function makes up to 13 A*
-    // calls (the route + a 12-point re-anchor ring); when each armed its OWN 150 ms budget the worst
-    // case was ~2 s of stall. It is a plan-wide safety net now, and a generous one, because it no
-    // longer has a real-time thread to protect.
-    let ctx = PlanCtx::worker().with_goal_region(goal_region);
+    // ONE node budget for the WHOLE plan, not one per A* call (#340, #394 review). This function makes
+    // up to 13 A* calls (the route + a 12-point re-anchor ring), and `search_tiered` makes up to 2
+    // clearance passes inside each — `ensure_budget()` materialises a single shared expansion counter
+    // HERE, before the fan-out, so every one of those searches draws from the same `MAX_NODES` (8M)
+    // budget. Without this the port to a node cap would have given each call its OWN 8M, and the
+    // pathological StartIsolated-in-a-big-zone case would cost ~13 × 8M expansions (minutes) instead of
+    // one plan's worth (~28 s worst case, measured). Nothing real-time waits on this thread, but a
+    // plan that runs for minutes still blocks the NEXT goal (the worker coalesces only between plans),
+    // so the plan-wide bound matters.
+    let ctx = PlanCtx::worker().ensure_budget().with_goal_region(goal_region);
+    plan_path_with_ctx(col, start, goal, avoid, aggro_buffer, ctx)
+}
+
+/// The body of [`plan_path`], taking the (already budgeted) `ctx` so a test can supply a small-capped
+/// budget and observe that all 13 A* calls draw from its ONE shared counter (#394 review, FIX 1).
+pub(crate) fn plan_path_with_ctx(
+    col: &Collision,
+    start: [f32; 3],
+    goal: [f32; 3],
+    avoid: &[[f32; 2]],
+    aggro_buffer: f32,
+    ctx: PlanCtx,
+) -> PlanOutcome {
     let radius = PLAYER_RADIUS;
 
-    let first = col.find_path_ex(start, goal, radius, avoid, 8.0, None, aggro_buffer, ctx);
+    let first = col.find_path_ex(start, goal, radius, avoid, 8.0, None, aggro_buffer, ctx.clone());
     match first {
         // A real route, or an honest limit — either way, that's the answer.
         PlanOutcome::Route(_) | PlanOutcome::Exhausted { .. } => return first,
@@ -289,7 +307,10 @@ pub fn plan_path(
         // A floor reachable from the char's height (a generous down-search finds ground below a face).
         let Some(af) = col.nearest_floor(ax, ay, start[2], 20.0, 100.0) else { continue };
         let anchor = [ax, ay, af];
-        let out = col.find_path_ex(anchor, goal, radius, avoid, 8.0, None, aggro_buffer, ctx);
+        // Same shared budget (`ctx.clone()` shares the `Arc`): the ring retries draw down the SAME 8M,
+        // so 13 calls cost one plan's budget, not 13. The last retry may find the budget already spent
+        // by earlier ones and return `Exhausted(NodeCap)` — honest, and bounded.
+        let out = col.find_path_ex(anchor, goal, radius, avoid, 8.0, None, aggro_buffer, ctx.clone());
         // Only worthwhile if the re-anchored start could actually MOVE (more than the lone start
         // cell A* was stuck on). `> 2`, not `> 1`: every route begins AT its start point (find_path
         // prepends it), so a route that goes nowhere is already len 2.
@@ -349,6 +370,13 @@ mod tests {
     /// This is the bug that cost the project months. The old planner flooded the grid, gave up, and
     /// handed the walker a greedy partial; the walker drove it into the wall, retried 8×, and froze
     /// at `blocked`, never once saying "there is no way in".
+    ///
+    /// **This test was INTERMITTENTLY RED on CI before #394** — not flaky, correctly detecting a real
+    /// bug: the coarse worker carried a 5 s wall clock, and on a loaded runner the 62,500-cell frontier
+    /// close blew it, so the honest `Unreachable(SearchClosed)` degraded to `Exhausted(Deadline)`. The
+    /// answer depended on machine speed. #394 replaced the wall clock with a deterministic node cap, so
+    /// the frontier now closes to the same answer on every box. The determinism is pinned by
+    /// `the_coarse_planner_is_deterministic_under_load` below.
     #[test]
     fn an_unreachable_goal_reports_unreachable_not_a_partial_route() {
         let col = plane_with_sealed_box(1000.0, 400.0, 400.0);
@@ -358,6 +386,111 @@ mod tests {
             other => panic!("a walled-off goal must report a DEFINITIVE Unreachable(SearchClosed), got {other:?}"),
         }
         assert!(out.route().is_none(), "an unreachable goal must yield NO waypoints — a partial route here is the #337 lie");
+    }
+
+    /// # PROPERTY: **THE COARSE PLANNER'S ANSWER DOES NOT DEPEND ON MACHINE SPEED.** (#394)
+    ///
+    /// This is the universal #394 is about, and a passing quiet run cannot discharge it — the old
+    /// wall-clock bug passed 5/5 locally and only failed under CI load. So this test manufactures the
+    /// load: it saturates every core with spinner threads and plans the same walled-off goal many
+    /// times, and asserts the answer is `Unreachable(SearchClosed)` **every single time**.
+    ///
+    /// Under a wall-clock budget this test FAILS by construction: the load pushes the frontier close
+    /// past the deadline and the outcome flips to `Exhausted(Deadline)`. Under a node cap it CANNOT
+    /// fail: the same 62,500-cell frontier is closed after the same number of expansions whatever the
+    /// CPU is doing. That difference is the entire point of the fix.
+    ///
+    /// (Belt and braces: `PlanLimit::Deadline` no longer exists, so `Exhausted(Deadline)` is not even
+    /// spellable. This test guards the LAYER ABOVE that — that no *new* wall clock creeps back in and
+    /// makes a genuinely-unreachable goal report anything other than the definitive no.)
+    #[test]
+    fn the_coarse_planner_is_deterministic_under_load() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let col = Arc::new(plane_with_sealed_box(1000.0, 400.0, 400.0));
+        // Saturate the box: one busy-spinner per core, so the plan below competes for CPU exactly the
+        // way it does on a loaded CI runner (which is where the wall-clock version failed).
+        let stop = Arc::new(AtomicBool::new(false));
+        let load: Vec<_> = (0..std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || { let mut x = 0u64; while !stop.load(Ordering::Relaxed) { x = x.wrapping_add(1); std::hint::black_box(x); } })
+            })
+            .collect();
+
+        // The same walled-off goal, planned repeatedly. Every answer must be the definitive no.
+        // (4 iterations, not more: each is a full 62,500-cell frontier close — the point is proven by a
+        // handful of repeats under load, and a property test must not itself become a CI time sink.)
+        for i in 0..4 {
+            let out = plan_path(&col, [-900.0, -900.0, 0.0], [400.0, 400.0, 0.0], &[], 0.0, None);
+            assert!(matches!(out, PlanOutcome::Unreachable(NoRoute::SearchClosed)),
+                "run {i} under full CPU load returned {out:?} — the coarse planner's answer must NOT \
+                 depend on machine speed. A wall-clock budget would flip this to Exhausted(Deadline); a \
+                 node cap cannot (#394).");
+        }
+        stop.store(true, Ordering::Relaxed);
+        for h in load { let _ = h.join(); }
+    }
+
+    /// # THE NODE BUDGET IS PLAN-WIDE, NOT PER-CALL (#394 review, FIX 1).
+    ///
+    /// `plan_path` fans out to up to 13 A* calls (the primary + a 12-point StartIsolated re-anchor
+    /// ring). On `main` the wall-clock deadline was a single shared `Instant`, so the WHOLE plan was
+    /// bounded together. The node-cap port must preserve that: one shared, decrementing budget across
+    /// all 13 calls — not 13 independent copies of the cap.
+    ///
+    /// This pins it directly. With a small shared cap, the total expansions across the ENTIRE plan
+    /// (read from the shared counter) must not exceed that cap by more than one call's final over-shoot
+    /// — proving the ring retries drew DOWN the same budget rather than each getting a fresh one. Under
+    /// the per-call bug this fixture spent ~13× the cap; the assertion catches exactly that.
+    /// A big open floor with a sealed box around `(box_e, box_n)` (the GOAL, walled off) AND a sealed
+    /// box around `(start_e, start_n)` (the START, boxed in). The boxed start makes `find_path_ex`
+    /// return `Unreachable(StartIsolated)`, which is what makes `plan_path` fire its 12-point re-anchor
+    /// RING; the ring anchors land outside the start box on the open floor and each floods the whole
+    /// plane trying to reach the walled-off goal — so every one of the ~13 A* calls is EXPENSIVE, which
+    /// is exactly the condition under which per-call vs plan-wide budgeting differs by ~13×.
+    fn two_boxes(half: f32, box_e: f32, box_n: f32, start_e: f32, start_n: f32) -> Collision {
+        const H: f32 = 30.0;
+        let mut terrain = vec![
+            quad(vec![[-half, 0.0, -half], [half, 0.0, -half], [half, 0.0, half], [-half, 0.0, half]]),
+        ];
+        for (ce, cn, r) in [(box_e, box_n, 24.0f32), (start_e, start_n, 6.0f32)] {
+            let (e0, e1, n0, n1) = (ce - r, ce + r, cn - r, cn + r);
+            terrain.push(quad(vec![[n0, 0.0, e0], [n1, 0.0, e0], [n1, H, e0], [n0, H, e0]]));
+            terrain.push(quad(vec![[n0, 0.0, e1], [n1, 0.0, e1], [n1, H, e1], [n0, H, e1]]));
+            terrain.push(quad(vec![[n0, 0.0, e0], [n0, 0.0, e1], [n0, H, e1], [n0, H, e0]]));
+            terrain.push(quad(vec![[n1, 0.0, e0], [n1, 0.0, e1], [n1, H, e1], [n1, H, e0]]));
+        }
+        Collision::build(&ZoneAssets { terrain, objects: vec![], textures: vec![] }, 32.0)
+    }
+
+    #[test]
+    fn the_node_budget_is_plan_wide_not_per_call() {
+        use std::sync::atomic::Ordering;
+        // Start boxed in (fires the ring), goal walled off elsewhere (every ring anchor floods and
+        // closes) — so all ~13 A* calls run and all are expensive. half=1000 = 62,500 cells, far more
+        // than the small cap, so per-call budgeting would blow ~13× past it.
+        let col = two_boxes(1000.0, 400.0, 400.0, -400.0, -400.0);
+        let cap = 10_000usize;
+        let ctx = crate::assets::PlanCtx::with_node_cap(cap).ensure_budget();
+        let counter = ctx.expanded.clone().unwrap();
+
+        // Drive the REAL plan_path fan-out (primary + 12-point ring) against the shared budget.
+        let out = plan_path_with_ctx(&col, [-400.0, -400.0, 0.0], [400.0, 400.0, 0.0], &[], 0.0, ctx);
+        let total = counter.load(Ordering::Relaxed);
+
+        // LOWER bound: the plan really did its work THROUGH this shared counter. If a call quietly
+        // created its OWN counter instead (the per-call bug), this one reads ~0 and the plan's cost
+        // vanished from view — that is the failure to catch. A real flood fills the shared budget.
+        assert!(total >= cap,
+            "the plan expanded only {total} nodes on the shared counter — its searches did NOT draw from \
+             the plan-wide budget (each made its own). out={out:?}");
+        // UPPER bound: all ~13 calls together stopped within one call's final over-shoot of the cap. A
+        // per-call cap would let each spend up to `cap` alone — ~{} total.
+        assert!(total <= cap + 8192,
+            "plan_path expanded {total} nodes against a {cap}-node PLAN-WIDE cap — a per-call cap would \
+             allow ~{} across the ~13 calls. The budget is not shared.", cap * 13);
     }
 
     /// A reachable goal on the same fixture still routes (the honesty change must not make the
