@@ -8,7 +8,8 @@
 
 ## 1. --no-zones CLI Flag
 
-Added `--no-zones` to `/home/dhenry/git/eqoxide_asset_server/src/main.rs` in the `Build` subcommand.
+Added `--no-zones` to the asset server's `src/main.rs` (separate `eqoxide_asset_server` repo) in
+the `Build` subcommand.
 Mirrors `--zones-only` but inverts it: runs `build_from_raw` (common) + `build_gamedata_from_raw` +
 `build_gameequip_from_raw`, skips `build_zones_from_raw` entirely. Message printed:
 `--no-zones: skipping zone baking (existing zone GLBs preserved)`.

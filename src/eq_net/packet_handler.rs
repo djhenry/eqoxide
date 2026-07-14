@@ -370,8 +370,8 @@ fn apply_group_disband_you(gs: &mut GameState, _p: &[u8]) {
 }
 
 /// OP_GroupDisbandOther — someone else left/was removed. 148-byte common GroupGeneric_Struct:
-/// name1[64], name2[64]. Which field carries the departing member isn't documented in the
-/// decompile; we defensively remove whichever of the two names is a CURRENT roster member (and
+/// name1[64], name2[64]. Which field carries the departing member isn't documented; we
+/// defensively remove whichever of the two names is a CURRENT roster member (and
 /// no-op with a warning if neither matches) rather than guessing wrong and corrupting state.
 fn apply_group_disband_other(gs: &mut GameState, p: &[u8]) {
     let mut o = 0usize;

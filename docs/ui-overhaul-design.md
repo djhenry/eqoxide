@@ -7,11 +7,10 @@ per-character persistence of window open/closed/pos/size **and** OS-window geome
 a non-closeable window-control panel listing all windows; RoF2-like look & feel, but
 better; native-client feature parity minus Sony/external services.
 
-This design is grounded in three research passes over (a) the current egui HUD
+This design is grounded in research passes over (a) the current egui HUD
 (`src/hud.rs`, `src/ui_layout.rs`, `src/app.rs`), (b) the native RoF2 UI definitions
-(`~/eq_assets/everquest_rof2/uifiles/default/`, 164 `EQUI_*.xml`), and (c) the
-decompiled RoF2 client (`CXWnd`/`CXWndManager`/`CSidlScreenWnd` behavior,
-`UI_<char>_<server>.ini` schema).
+(the client's own `uifiles/default/`, 164 `EQUI_*.xml`), and (c) observed
+native-client window behavior (including the `UI_<char>_<server>.ini` schema).
 
 ---
 
@@ -125,8 +124,8 @@ serde defaults; we write `"version": 2`).
 }
 ```
 
-**Cross-resolution remap** (straight from the decompiled client,
-`FUN_REDACTED`): on load, for each axis — window in the left/top half of the old
+**Cross-resolution remap** (matching observed native-client behavior): on load,
+for each axis — window in the left/top half of the old
 screen keeps its absolute coordinate; in the right/bottom half keeps its distance
 from that edge; straddling the center shifts by the center delta; then clamp
 on-screen. This is why native EQ windows "stick to their corner" across
@@ -144,7 +143,7 @@ resolution changes, and it replaces both `canvas_off` and blind `constrain`.
 - Flush-on-exit gap fixed: the `POST /exit` / SIGTERM path (`about_to_wait` exit
   branch) now calls `save_now()` like `CloseRequested` already does.
 
-## 5. Window chrome & behavior (imitating CXWnd where it's good)
+## 5. Window chrome & behavior (imitating the native UI where it's good)
 
 `chrome::eq_window(uictx, def, |ui| body)` wraps `egui::Window` with
 `title_bar(false)` and draws its own chrome:
@@ -157,7 +156,7 @@ resolution changes, and it replaces both `canvas_off` and blind `constrain`.
   No clamping during drag (native behavior); clamp/repair happens at load-time
   remap, plus a "title strip must stay reachable" minimal constraint.
 - **Lock** (global, Ctrl+L, persisted): blocks move + resize only; clicks still work.
-- **Fades** (the signature EQ feel, from `CXWnd::OnProcessFrame`): when the pointer
+- **Fades** (the signature EQ feel, matching the native client): when the pointer
   has been outside a window's rect for 2 s, animate its opacity to
   `fade_to_alpha` (~50%) over 0.5 s; animate back on re-enter. Global toggle +
   per-window alpha via right-click context menu.
