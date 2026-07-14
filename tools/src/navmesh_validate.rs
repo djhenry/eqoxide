@@ -1,36 +1,95 @@
-//! Offline validation harness for the client-side navmesh bake (`eqoxide::navmesh`).
+//! Offline MEASUREMENT HARNESS for the client-side navmesh bake (`eqoxide::navmesh`).
 //!
-//! Touches NO client pathing code. It bakes a navmesh from each zone's own collision mesh — exactly
-//! as the client will at zone load — and validates it against three references:
+//! Touches NO client pathing code, and the thing it measures is NOT shipping: the navmesh is not
+//! wired under `Collision::find_path` and Phase 2 (doing so) is CANCELLED. This tool exists to
+//! produce HONEST numbers about the representation — bake cost, cache size, oracle coverage, and an
+//! A/B against the legacy grid — so that future decisions rest on measurements instead of vibes.
 //!
-//!   1. **EQEmu's prebuilt `maps/nav/*.nav`** — the GROUND-TRUTH ORACLE. This is the navmesh the
-//!      EQEmu server actually paths its NPCs on, in production, over the same geometry. We never
-//!      ship or load these in the client (navigation must stay a client-side computation); they are
-//!      used here, offline, purely to check that our bake did not lose walkable area the server
-//!      believes exists. A low coverage number means OUR bake parameters are wrong.
-//!   2. **The legacy grid** (`Collision::find_path`) — A/B over random start/goal pairs: reachability
-//!      agreement, and wall-clock per query.
-//!   3. **The known failure cases** (#329, #197p2, stacked tiers) — the acceptance tests.
+//! # What this tool got WRONG before, and how it is prevented now
 //!
-//! It also measures the three numbers that decide the design: BAKE TIME (the client's zone-load
-//! cost), CACHE SIZE, and QUERY TIME.
+//! An independent review found that every headline number this harness printed was inflated by a
+//! measurement bug. They are listed here because a harness whose own history hides its wrong turns is
+//! a harness nobody can trust:
 //!
-//! Usage:
-//!   navmesh_validate                 # every zone GLB present locally
-//!   navmesh_validate qcat qeynos2    # named zones
-//!   navmesh_validate --pairs 500     # A/B sample size (default 200)
+//!   1. **A grid TIMEOUT was bucketed as "the grid found no route."** `Collision::find_path` returns
+//!      a bare `Option`, and the old code read `None` as "no path exists." It does not: it can also
+//!      mean "I hit my budget and I don't know." 97% of the navmesh's claimed "462 routes the grid
+//!      cannot find" were grid timeouts. That is the #337 anti-pattern — a timeout reported as a
+//!      definitive "no" — inside the very tool meant to evaluate nav.
+//!      **Now:** we call `find_path_ex`, which returns a `PlanOutcome` (`Route` / `Unreachable` /
+//!      `Exhausted{limit}`), and an `Exhausted` grid answer gets its OWN bucket in every table.
+//!      Parity is computed ONLY over pairs the grid answered definitively — an undecided pair cannot
+//!      be scored for or against anyone.
+//!   2. **A rise was called "unwalkable" by comparing it to `STEP_UP`.** `STEP_UP` (2.0) is a
+//!      DISCRETE STEP height; the walker's SLOPE limit is `MAX_WALK_GRADE` (1.2). A 6.2u rise over an
+//!      8u run is a 38° ramp it walks routinely. 125 of 238 flagged routes were ordinary ramps.
+//!      **Now:** a segment is walkable if it is a small enough STEP *or* a shallow enough GRADE.
+//!   3. **The "max 773u rise" headline was a bookkeeping artifact.** `assets.rs` snaps the final
+//!      waypoint to the caller's exact goal z once the goal CELL is reached, so the last segment's
+//!      Δz is the caller's own goal z, not a climb. 85 of the big rises sat on the final segment.
+//!      **Now:** the goal-snap segment is EXCLUDED from the verdict and reported separately.
+//!   4. **Endpoints were sampled from `mesh.populated_columns()` — the navmesh's OWN domain.** Ground
+//!      the navmesh dropped could never be sampled, so the grid could never be credited for reaching
+//!      it. Neutral sampling moved parity 93.88% → 83.5%. It also took `sa[0].z`, the LOWEST surface
+//!      in a column, so upper tiers were never tested as endpoints.
+//!      **Now:** endpoints are drawn from the EQEmu ORACLE's walkable polygon centroids — the
+//!      declared ground truth, neutral to both planners — and each carries its own z, on its own tier.
+//!   5. **`oracle_coverage` searched a ±1-cell XY ring and ±8u in z**, so it could not tell "we have
+//!      this ground" from "we have something roughly near it": gfaydark reported 97.2% coverage while
+//!      25% of the oracle's walkable XYs had no navmesh column at all.
+//!      **Now:** three separate, labelled numbers — STRICT (same column), LOOSE (the old ring), and
+//!      NO-COLUMN (the oracle has ground where we have nothing at all).
+//!
+//! # The oracle
+//!
+//! **EQEmu's prebuilt `maps/nav/*.nav`** — the GROUND-TRUTH ORACLE. This is the navmesh the EQEmu
+//! server actually paths its NPCs on, in production, over the same geometry. We never ship or load
+//! these in the client (navigation must stay a client-side computation); they are used here, offline,
+//! purely to check that our bake did not lose walkable area the server believes exists, and to sample
+//! A/B endpoints neutrally.
+//!
+//! It is a LOWER BOUND, not a ceiling: ground EQEmu omits may still be real.
+//!
+//! # Usage
+//!
+//! The oracle directory is NOT hardcoded (it is machine-specific, and this repo is public). Set it:
+//!
+//! ```text
+//!   export EQOXIDE_NAVMESH_ORACLE_DIR=/path/to/eqemu/maps/nav
+//!   navmesh_validate                          # every zone GLB present locally
+//!   navmesh_validate qcat qeynos2             # named zones
+//!   navmesh_validate --pairs 500              # A/B sample size (default 200)
+//!   navmesh_validate --oracle-dir /path/...   # or pass it explicitly (wins over the env var)
+//! ```
 
-use anyhow::Result;
-use eqoxide::assets::{Collision, ZoneAssets};
+use anyhow::{Context, Result};
+use eqoxide::assets::{Collision, PlanCtx, PlanOutcome, ZoneAssets};
+use eqoxide::movement::{MAX_WALK_GRADE, PLAYER_RADIUS, STEP_UP};
 use eqoxide::navmesh::{collision_tris, BakeParams, NavMesh};
 use eqoxide::region_map::RegionMap;
 use rand::{Rng, SeedableRng};
 use std::time::Instant;
 
+/// The env var naming EQEmu's `maps/nav` directory. There is deliberately NO default: the path is
+/// machine-specific and this is a PUBLIC repository, so baking one in would leak a local filesystem
+/// layout (it previously did). Absent the variable we fail loudly rather than guessing.
+const ORACLE_ENV: &str = "EQOXIDE_NAVMESH_ORACLE_DIR";
+
 // ─────────────── EQEmu .nav oracle (offline only — never linked into the client) ───────────────
 
 struct OraclePoly {
     verts: Vec<[f32; 3]>,
+}
+
+impl OraclePoly {
+    fn centroid(&self) -> [f32; 3] {
+        let n = self.verts.len() as f32;
+        [
+            self.verts.iter().map(|v| v[0]).sum::<f32>() / n,
+            self.verts.iter().map(|v| v[1]).sum::<f32>() / n,
+            self.verts.iter().map(|v| v[2]).sum::<f32>() / n,
+        ]
+    }
 }
 
 /// Parse EQEmu's `EQNAVMESH` v2: zlib-deflated `[u32 tiles][dtNavMeshParams][tile…]`, standard
@@ -86,27 +145,164 @@ fn load_oracle(path: &std::path::Path) -> Result<Vec<OraclePoly>> {
     Ok(polys)
 }
 
-/// Fraction of the oracle's walkable polygons our bake also considers walkable: for each oracle
-/// polygon centroid, is there a surface of ours within `tol` in z, in that XY neighbourhood?
-fn oracle_coverage(mesh: &NavMesh, oracle: &[OraclePoly], tol: f32) -> (usize, usize) {
-    let mut covered = 0;
+/// How much of the oracle's walkable area our bake also has — reported THREE ways, because one number
+/// cannot carry the distinction that matters.
+///
+/// The old single metric searched a ±1-cell XY ring at ±8u in z and reported ~97% for gfaydark, a
+/// zone where a QUARTER of the oracle's walkable XYs have no navmesh column at all. A metric that
+/// generous cannot tell "we have the ground" from "we have something roughly near it", which is
+/// precisely the question the metric exists to answer.
+#[derive(Clone, Copy, Default)]
+struct Coverage {
+    /// Same column, |dz| <= STRICT_Z. "We have THIS ground, at THIS height."
+    strict: f32,
+    /// ±1-cell ring, |dz| <= LOOSE_Z. The old, generous metric — kept for comparison, clearly labelled.
+    loose: f32,
+    /// The oracle has walkable ground at an XY where we have NO COLUMN AT ALL. The honest floor on
+    /// how much we simply lost. This is the number that was invisible before.
+    no_column: f32,
+}
+
+fn oracle_coverage(mesh: &NavMesh, oracle: &[OraclePoly]) -> Coverage {
+    const STRICT_Z: f32 = 4.0;
+    const LOOSE_Z: f32 = 8.0;
+    if oracle.is_empty() { return Coverage::default(); }
+
+    let (mut strict, mut loose, mut none) = (0usize, 0usize, 0usize);
     for p in oracle {
-        let n = p.verts.len() as f32;
-        let c = [
-            p.verts.iter().map(|v| v[0]).sum::<f32>() / n,
-            p.verts.iter().map(|v| v[1]).sum::<f32>() / n,
-            p.verts.iter().map(|v| v[2]).sum::<f32>() / n,
-        ];
+        let c = p.centroid();
         let (c0, r0) = mesh.to_cell(c[0], c[1]);
-        let hit = (-1..=1).any(|dc| {
-            (-1..=1).any(|dr| mesh.column(c0 + dc, r0 + dr).iter().any(|s| (s.z - c[2]).abs() <= tol))
+
+        if mesh.column(c0, r0).is_empty() { none += 1; }
+        if mesh.column(c0, r0).iter().any(|s| (s.z - c[2]).abs() <= STRICT_Z) { strict += 1; }
+        let hit_loose = (-1..=1).any(|dc| {
+            (-1..=1).any(|dr| {
+                mesh.column(c0 + dc, r0 + dr).iter().any(|s| (s.z - c[2]).abs() <= LOOSE_Z)
+            })
         });
-        if hit { covered += 1; }
+        if hit_loose { loose += 1; }
     }
-    (covered, oracle.len())
+    let n = oracle.len() as f32;
+    Coverage {
+        strict:    100.0 * strict as f32 / n,
+        loose:     100.0 * loose as f32 / n,
+        no_column: 100.0 * none as f32 / n,
+    }
+}
+
+// ─────────────── route walkability, judged the way the WALKER actually moves ───────────────
+
+/// The verdict on one grid route that the navmesh refused.
+struct RouteVerdict {
+    /// The steepest NON-goal-snap segment the walker could not traverse, if any. `None` = the walker
+    /// really could have walked this route, so the navmesh genuinely missed it.
+    worst_unwalkable: Option<Segment>,
+    /// The biggest rise anywhere on the route EXCLUDING the goal-snap segment.
+    max_rise: f32,
+    /// True if the biggest rise on the WHOLE route sat on the final (goal-snap) segment — i.e. it is
+    /// a bookkeeping artifact of `assets.rs` rewriting the last waypoint to the caller's goal z, not
+    /// a climb the walker would ever attempt.
+    max_rise_was_goal_snap: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Segment {
+    rise: f32,
+    run:  f32,
+}
+
+impl Segment {
+    fn grade(&self) -> f32 {
+        if self.run > 1e-3 { self.rise / self.run } else { f32::INFINITY }
+    }
+    /// Can the walker traverse this segment upward?
+    ///
+    /// TWO primitives, either of which suffices — this is the correction at the heart of the harness:
+    ///   * a DISCRETE STEP: any rise up to `STEP_UP` (2.0), regardless of run. This is a ledge the
+    ///     controller auto-steps.
+    ///   * a RAMP: any rise whose GRADE (rise/run) is within `MAX_WALK_GRADE` (1.2, ~50°). A 6.2u
+    ///     rise across an 8u cell is a 38° ramp — routine — even though 6.2 is far above `STEP_UP`.
+    ///
+    /// The old harness tested ONLY the first and so declared every ramp unwalkable. `STEP_UP` is a
+    /// step height; it was never a slope limit.
+    fn walkable(&self) -> bool {
+        if self.rise <= 0.0 { return true; }              // descending / level: not a climb
+        if self.rise <= STEP_UP { return true; }          // a step
+        self.grade() <= MAX_WALK_GRADE                    // ...or a ramp
+    }
+}
+
+/// Judge a grid route the way the CONTROLLER would have to walk it.
+fn judge_route(start: [f32; 3], path: &[[f32; 3]]) -> RouteVerdict {
+    let mut segs: Vec<Segment> = Vec::with_capacity(path.len());
+    let mut prev = start;
+    for w in path {
+        segs.push(Segment {
+            rise: w[2] - prev[2],
+            run:  (w[0] - prev[0]).hypot(w[1] - prev[1]),
+        });
+        prev = *w;
+    }
+
+    // EXCLUDE the final segment. `assets.rs` snaps the last waypoint to the caller's exact goal
+    // (x, y, z) once the goal CELL is reached, so its Δz is whatever z the caller passed in — it is
+    // not a climb the walker plans or attempts. Scoring it produced the bogus "max 773u" headline.
+    let body = if segs.is_empty() { &segs[..] } else { &segs[..segs.len() - 1] };
+
+    let max_rise = body.iter().map(|s| s.rise).fold(f32::NEG_INFINITY, f32::max);
+    let max_rise = if max_rise.is_finite() { max_rise } else { 0.0 };
+    let whole_max = segs.iter().map(|s| s.rise).fold(f32::NEG_INFINITY, f32::max);
+    let whole_max = if whole_max.is_finite() { whole_max } else { 0.0 };
+
+    let worst_unwalkable = body.iter()
+        .filter(|s| !s.walkable())
+        .max_by(|a, b| a.grade().partial_cmp(&b.grade()).unwrap_or(std::cmp::Ordering::Equal))
+        .copied();
+
+    RouteVerdict {
+        worst_unwalkable,
+        max_rise,
+        // The route's biggest rise is on the goal-snap segment and the body's is strictly smaller.
+        max_rise_was_goal_snap: !segs.is_empty() && whole_max > max_rise + 1e-3,
+    }
 }
 
 // ─────────────── per-zone run ───────────────
+
+/// The A/B tally. The grid has THREE possible answers, not two — that distinction is the whole point.
+#[derive(Default)]
+struct AbTally {
+    /// mesh routed, grid routed.
+    both: usize,
+    /// mesh routed, grid said DEFINITIVELY unreachable. A genuine navmesh advantage.
+    mesh_only: usize,
+    /// mesh routed, grid gave up (deadline / node cap). **NOT an advantage** — the grid never
+    /// answered. Counting these as navmesh wins is what inflated "462 routes the grid cannot find".
+    mesh_vs_grid_gaveup: usize,
+    /// grid routed, mesh did not. The navmesh's misses.
+    grid_only: usize,
+    /// neither found a route, both definitively.
+    neither: usize,
+    /// mesh found nothing and the grid gave up: nobody knows anything. Scored for no one.
+    both_unknown: usize,
+}
+
+impl AbTally {
+    fn total(&self) -> usize {
+        self.both + self.mesh_only + self.mesh_vs_grid_gaveup
+            + self.grid_only + self.neither + self.both_unknown
+    }
+    /// Pairs on which the GRID gave a definitive answer. Only these can be scored: a pair the grid
+    /// abandoned is undecided, and folding it into either column would be a lie about what we know.
+    fn decided(&self) -> usize { self.both + self.mesh_only + self.grid_only + self.neither }
+    /// Agreement-or-better, over the DECIDED pairs only.
+    fn parity(&self) -> f32 {
+        let d = self.decided();
+        if d == 0 { return 0.0; }
+        100.0 * (self.both + self.mesh_only + self.neither) as f32 / d as f32
+    }
+    fn gaveup(&self) -> usize { self.mesh_vs_grid_gaveup + self.both_unknown }
+}
 
 struct ZoneReport {
     zone:          String,
@@ -114,22 +310,16 @@ struct ZoneReport {
     bake_ms:       u128,
     cache_bytes:   usize,
     columns:       usize,
-    surfaces:      usize,
     swim:          usize,
     stacked_pct:   f32,
-    oracle_cov:    Option<f32>,
-    pairs:         usize,
-    both_ok:       usize,
-    mesh_only:     usize,
-    grid_only:     usize,
-    neither:       usize,
+    cov:           Option<Coverage>,
+    ab:            AbTally,
     mesh_us_med:   u128,
     grid_us_med:   u128,
     mesh_us_max:   u128,
     grid_us_max:   u128,
-    /// Biggest single rise on each route the GRID found but the navmesh refused. A rise above
-    /// movement::STEP_UP (2.0) means the walker could never have walked that grid route anyway.
-    g_only_rise:   Vec<f32>,
+    /// Every grid-only route, judged as the walker would have to walk it.
+    verdicts:      Vec<RouteVerdict>,
     /// Diagnosis of each GENUINE miss (a walkable grid route the navmesh refused).
     misses:        Vec<String>,
 }
@@ -178,181 +368,91 @@ fn run_zone(zone: &str, models: &std::path::Path, nav_dir: &std::path::Path,
     }
 
     // ── Oracle ──
-    let oracle_cov = match load_oracle(&nav_dir.join(format!("{zone}.nav"))) {
-        Ok(o) if !o.is_empty() => {
-            let (cov, tot) = oracle_coverage(&mesh, &o, 8.0);
-            let pct = 100.0 * cov as f32 / tot as f32;
-            // A low number means our bake and EQEmu's disagree badly. Before blaming the baker,
-            // check whether the two are even describing the same volume of world: if the GLB we
-            // ship and the .map EQEmu baked from cover different bounds, this is an ASSET mismatch,
-            // not a bake bug, and the coverage number is meaningless for that zone.
-            if pct < 60.0 {
-                let bb = |pts: &mut dyn Iterator<Item = [f32; 3]>| {
-                    let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
-                    for p in pts { for k in 0..3 { lo[k] = lo[k].min(p[k]); hi[k] = hi[k].max(p[k]); } }
-                    (lo, hi)
-                };
-                let (olo, ohi) = bb(&mut o.iter().flat_map(|p| p.verts.iter().copied()));
-                let (mlo, mhi) = bb(&mut mesh.populated_columns().flat_map(|(c, r)| {
-                    let ctr = mesh.center(c, r);
-                    mesh.column(c, r).iter().map(move |s| [ctr[0], ctr[1], s.z]).collect::<Vec<_>>()
-                }));
-                println!("  [diag {zone}] LOW COVERAGE {pct:.1}% — bounds check:");
-                println!("      ours   e[{:.0}..{:.0}] n[{:.0}..{:.0}] z[{:.0}..{:.0}]",
-                    mlo[0], mhi[0], mlo[1], mhi[1], mlo[2], mhi[2]);
-                println!("      EQEmu  e[{:.0}..{:.0}] n[{:.0}..{:.0}] z[{:.0}..{:.0}]",
-                    olo[0], ohi[0], olo[1], ohi[1], olo[2], ohi[2]);
-                // Decisive: at an EQEmu poly's XY, do we have NO surface (missing geometry) or a
-                // surface at a DIFFERENT z (offset / wrong tier)?
-                let (mut empty, mut zdiff, mut ok) = (0, 0, 0);
-                let mut samples = Vec::new();
-                for op in o.iter().take(4000) {
-                    let n = op.verts.len() as f32;
-                    let c = [op.verts.iter().map(|v| v[0]).sum::<f32>() / n,
-                             op.verts.iter().map(|v| v[1]).sum::<f32>() / n,
-                             op.verts.iter().map(|v| v[2]).sum::<f32>() / n];
-                    let (cc, rr) = mesh.to_cell(c[0], c[1]);
-                    let col = mesh.column(cc, rr);
-                    if col.is_empty() { empty += 1; }
-                    else if col.iter().any(|s| (s.z - c[2]).abs() <= 8.0) { ok += 1; }
-                    else {
-                        zdiff += 1;
-                        if samples.len() < 3 {
-                            samples.push(format!("EQEmu z={:.1} vs ours {:?}", c[2],
-                                col.iter().map(|s| format!("{:.1}", s.z)).collect::<Vec<_>>()));
-                        }
-                    }
-                }
-                println!("      at EQEmu poly XYs: no-surface={empty}  z-mismatch={zdiff}  match={ok}");
-                // Is the mismatch a SYSTEMATIC vertical offset (our asset baked at the wrong height)
-                // or scattered noise (genuinely different geometry)? A tight cluster means offset.
-                let mut dzs: Vec<f32> = Vec::new();
-                for op in o.iter().take(6000) {
-                    let n = op.verts.len() as f32;
-                    let c = [op.verts.iter().map(|v| v[0]).sum::<f32>() / n,
-                             op.verts.iter().map(|v| v[1]).sum::<f32>() / n,
-                             op.verts.iter().map(|v| v[2]).sum::<f32>() / n];
-                    let (cc, rr) = mesh.to_cell(c[0], c[1]);
-                    let col = mesh.column(cc, rr);
-                    if col.is_empty() { continue; }
-                    // nearest of OUR surfaces to EQEmu's height
-                    let best = col.iter().map(|s| s.z - c[2])
-                        .min_by(|a, b| a.abs().partial_cmp(&b.abs()).unwrap()).unwrap();
-                    dzs.push(best);
-                }
-                if !dzs.is_empty() {
-                    dzs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                    let med = dzs[dzs.len()/2];
-                    let p10 = dzs[dzs.len()/10];
-                    let p90 = dzs[dzs.len()*9/10];
-                    let within8 = dzs.iter().filter(|d| d.abs() <= 8.0).count();
-                    println!("      dz(ours - EQEmu) at shared XYs: p10={p10:.1} median={med:.1} p90={p90:.1}  |dz|<=8u: {:.0}%",
-                        100.0 * within8 as f32 / dzs.len() as f32);
-                    println!("      -> {}", if (p90 - p10).abs() < 20.0 {
-                        "TIGHT spread = a SYSTEMATIC vertical offset (asset baked at the wrong height)"
-                    } else {
-                        "WIDE spread = not a simple offset; genuinely different geometry"
-                    });
-                }
-                for s in &samples { println!("        {s}"); }
-            }
-            Some(pct)
-        }
-        _ => None,
-    };
+    let oracle = load_oracle(&nav_dir.join(format!("{zone}.nav"))).ok()
+        .filter(|o: &Vec<OraclePoly>| !o.is_empty());
+    let cov = oracle.as_ref().map(|o| oracle_coverage(&mesh, o));
 
     // ── A/B vs the legacy grid ──
     let mut col = Collision::build(&assets, 32.0);
     col.set_water(water.map(std::sync::Arc::new));
 
-    let all: Vec<(i32, i32)> = mesh.populated_columns().collect();
-    let mut rng = rand::rngs::StdRng::seed_from_u64(0xE0_0F);
-    let (mut both, mut m_only, mut g_only, mut none_) = (0, 0, 0, 0);
+    let mut ab = AbTally::default();
     let (mut m_us, mut g_us) = (Vec::new(), Vec::new());
-    let mut g_only_rise: Vec<f32> = Vec::new();
+    let mut verdicts: Vec<RouteVerdict> = Vec::new();
     let mut misses: Vec<String> = Vec::new();
-    if all.len() >= 2 {
+
+    // ENDPOINTS ARE SAMPLED FROM THE ORACLE, NOT FROM OUR OWN MESH.
+    //
+    // The old harness drew both endpoints from `mesh.populated_columns()` — the navmesh's own domain.
+    // That is a rigged sample in the navmesh's favour twice over: ground the navmesh DROPPED can never
+    // be chosen, so the grid can never be credited for reaching it; and it took `sa[0].z`, the LOWEST
+    // surface in the column, so upper tiers were never tested as endpoints at all. Correcting this
+    // alone moved parity 93.88% → 83.5% and raised grid-only routes by 53%.
+    //
+    // The oracle's walkable polygon centroids are the PR's own declared ground truth and are neutral
+    // to both planners — and each centroid carries its own z, on its own tier.
+    //
+    // No oracle → NO A/B. We do not fall back to self-sampling: a rigged number is worse than none.
+    if let Some(o) = oracle.as_ref() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0xE0_0F);
         for _ in 0..n_pairs {
-            let a = all[rng.gen_range(0..all.len())];
-            let b = all[rng.gen_range(0..all.len())];
-            let (sa, sb) = (mesh.column(a.0, a.1), mesh.column(b.0, b.1));
-            if sa.is_empty() || sb.is_empty() { continue; }
-            let (pa, pb) = (mesh.center(a.0, a.1), mesh.center(b.0, b.1));
-            let start = [pa[0], pa[1], sa[0].z];
-            let goal  = [pb[0], pb[1], sb[0].z];
+            let start = o[rng.gen_range(0..o.len())].centroid();
+            let goal  = o[rng.gen_range(0..o.len())].centroid();
 
             let t = Instant::now();
             let mp = mesh.find_path(start, goal);
             m_us.push(t.elapsed().as_micros());
 
+            // `find_path_ex`, NOT `find_path`. The bare `Option` from `find_path` cannot distinguish
+            // "no route exists" from "I ran out of budget", and conflating them is precisely how this
+            // harness manufactured a capability claim out of the grid's timeouts (#337).
             let t = Instant::now();
-            let gp = col.find_path(start, goal, eqoxide::movement::PLAYER_RADIUS, &[], false);
+            let gp = col.find_path_ex(start, goal, PLAYER_RADIUS, &[], 8.0, None, 0.0,
+                                      PlanCtx::default());
             g_us.push(t.elapsed().as_micros());
 
-            match (mp.is_some(), gp.as_ref()) {
-                (true, Some(_))  => both += 1,
-                (true, None)     => m_only += 1,
-                (false, Some(p)) => {
-                    g_only += 1;
-                    // Root-cause the GENUINE misses (a grid route the walker really could walk that
-                    // the navmesh refuses). These are the only true regressions in the parity data.
-                    let mut mr: f32 = 0.0;
-                    let mut pv = start;
-                    for w in p.iter() { mr = mr.max(w[2] - pv[2]); pv = *w; }
-                    if mr <= eqoxide::movement::STEP_UP {
-                        let si = mesh.nearest_index(start);
-                        let gi = mesh.nearest_index(goal);
-                        let why = match (si, gi) {
+            match (mp.is_some(), &gp) {
+                (true,  PlanOutcome::Route(_))          => ab.both += 1,
+                (true,  PlanOutcome::Unreachable(_))    => ab.mesh_only += 1,
+                (true,  PlanOutcome::Exhausted { .. })  => ab.mesh_vs_grid_gaveup += 1,
+                (false, PlanOutcome::Unreachable(_))    => ab.neither += 1,
+                (false, PlanOutcome::Exhausted { .. })  => ab.both_unknown += 1,
+                (false, PlanOutcome::Route(p)) => {
+                    ab.grid_only += 1;
+                    let v = judge_route(start, p);
+                    // A GENUINE miss: the walker really could have walked this grid route, and the
+                    // navmesh refused it. These are the only true regressions in the parity data.
+                    if v.worst_unwalkable.is_none() {
+                        let why = match (mesh.nearest_index(start), mesh.nearest_index(goal)) {
                             (None, _) => "start does not anchor to any surface".to_string(),
                             (_, None) => "goal does not anchor to any surface".to_string(),
                             (Some(a), Some(b)) => {
                                 let (sc, sa) = mesh.surface_at(a);
                                 let (gc, ga) = mesh.surface_at(b);
-                                // How far did the grid route have to travel vertically / did it use a
-                                // horizontal GAP (a jump edge, which our mesh has no equivalent for)?
-                                let mut maxgap: f32 = 0.0;
-                                let mut pv = start;
-                                for w in p.iter() {
-                                    maxgap = maxgap.max((w[0]-pv[0]).hypot(w[1]-pv[1]));
-                                    pv = *w;
-                                }
-                                format!("start comp={sc} (z={:.1}) goal comp={gc} (z={:.1}); {}; grid max step {:.0}u",
+                                format!("start comp={sc} (z={:.1}) goal comp={gc} (z={:.1}); {}",
                                     sa.z, ga.z,
-                                    if sc != gc { "DIFFERENT COMPONENTS (no link)" } else { "same component (search failed?)" },
-                                    maxgap)
+                                    if sc != gc { "DIFFERENT COMPONENTS (no link)" }
+                                    else { "same component (search failed?)" })
                             }
                         };
-                        misses.push(format!("{}: {:?} -> {:?} | {why}", zone, start, goal));
+                        misses.push(format!("{zone}: {start:?} -> {goal:?} | {why}"));
                     }
-                    // IS THAT GRID ROUTE ACTUALLY WALKABLE? The legacy A* admits a climb of up to
-                    // STEP_H=20 per cell, but the controller's real step-up is movement::STEP_UP=2.0
-                    // and it has no other ascent primitive (#239). So a grid "route" containing a
-                    // riser taller than that is one the walker can never actually traverse — the grid
-                    // is reporting a path it cannot walk. Measure the biggest single rise.
-                    let mut max_rise: f32 = 0.0;
-                    let mut prev = start;
-                    for w in p.iter() {
-                        max_rise = max_rise.max(w[2] - prev[2]);
-                        prev = *w;
-                    }
-                    g_only_rise.push(max_rise);
+                    verdicts.push(v);
                 }
-                (false, None)    => none_ += 1,
             }
         }
     }
 
     Ok(ZoneReport {
         zone: zone.into(), tris, bake_ms, cache_bytes,
-        columns: cols_seen, surfaces: mesh.surface_count(), swim: mesh.swim_surface_count(),
+        columns: cols_seen, swim: mesh.swim_surface_count(),
         stacked_pct: if cols_seen > 0 { 100.0 * stacked as f32 / cols_seen as f32 } else { 0.0 },
-        oracle_cov,
-        pairs: both + m_only + g_only + none_,
-        both_ok: both, mesh_only: m_only, grid_only: g_only, neither: none_,
+        cov,
+        ab,
         mesh_us_med: median(&mut m_us.clone()), grid_us_med: median(&mut g_us.clone()),
         mesh_us_max: m_us.iter().copied().max().unwrap_or(0),
         grid_us_max: g_us.iter().copied().max().unwrap_or(0),
-        g_only_rise,
+        verdicts,
         misses,
     })
 }
@@ -373,7 +473,8 @@ fn failure_cases(models: &std::path::Path, params: BakeParams) {
             None => println!("  #329 qcat spawn anchor -> NO SURFACE   [FAIL]"),
         }
         let (c, r) = mesh.to_cell(p[0], p[1]);
-        let ceiling_is_walkable = mesh.column(c, r).iter().any(|s| (s.z - (-55.97)).abs() < 1.5);
+        let ceiling_is_walkable = mesh.column(c, r).iter()
+            .any(|s| !s.is_swim() && (s.z - (-55.97)).abs() < 1.5);
         println!("  #329 qcat ceiling (-55.97) exposed as walkable? {ceiling_is_walkable}   [{}]",
             if ceiling_is_walkable { "FAIL" } else { "PASS" });
     }
@@ -400,13 +501,46 @@ fn failure_cases(models: &std::path::Path, params: BakeParams) {
     }
 }
 
+/// Resolve the oracle directory from `--oracle-dir` or `$EQOXIDE_NAVMESH_ORACLE_DIR`.
+///
+/// **No default, and no guessing.** This used to be a hardcoded absolute path into one developer's
+/// container volume, committed to a PUBLIC repository. If it is not configured we say so and stop.
+fn resolve_oracle_dir(args: &mut Vec<String>) -> Result<std::path::PathBuf> {
+    let from_flag = args.iter().position(|a| a == "--oracle-dir").map(|i| {
+        let v = args.get(i + 1).cloned();
+        args.drain(i..=(i + 1).min(args.len() - 1));
+        v
+    });
+    let dir = match from_flag {
+        Some(Some(v)) => v,
+        Some(None) => anyhow::bail!("--oracle-dir needs a path argument"),
+        None => std::env::var(ORACLE_ENV).map_err(|_| anyhow::anyhow!(
+            "the EQEmu navmesh oracle directory is not configured.\n\
+             \n\
+             This harness validates our bake against EQEmu's own prebuilt navmeshes (`maps/nav/*.nav`)\n\
+             and samples its A/B endpoints from them. Point it at that directory:\n\
+             \n\
+             \x20   export {ORACLE_ENV}=/path/to/eqemu/maps/nav\n\
+             \x20   navmesh_validate [zones...]\n\
+             \n\
+             ...or pass `--oracle-dir /path/to/eqemu/maps/nav`.\n\
+             \n\
+             (There is no built-in default on purpose: the path is machine-specific and this is a\n\
+             public repository.)"))?,
+    };
+    let dir = std::path::PathBuf::from(dir);
+    anyhow::ensure!(dir.is_dir(), "oracle dir does not exist or is not a directory: {}", dir.display());
+    Ok(dir)
+}
+
 fn main() -> Result<()> {
-    let models = dirs::data_dir().unwrap().join("eqoxide/assets/models");
-    // The oracle lives in the EQEmu server volume. Offline only — never read by the client.
-    let nav_dir = std::path::PathBuf::from(
-        "/home/dhenry/.local/share/containers/storage/volumes/eqemu_eqemu-server-data/_data/maps/nav");
+    let models = dirs::data_dir()
+        .context("no user data dir")?
+        .join("eqoxide/assets/models");
 
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let nav_dir = resolve_oracle_dir(&mut args)?;
+
     let mut n_pairs = 200usize;
     if let Some(i) = args.iter().position(|a| a == "--pairs") {
         n_pairs = args[i + 1].parse()?;
@@ -418,7 +552,8 @@ fn main() -> Result<()> {
         args.drain(i..=i + 1);
     }
     println!("bake params: {params:?}");
-    println!("oracle: EQEmu maps/nav (offline ground truth; NOT shipped, NOT loaded by the client)\n");
+    println!("oracle: {} (offline ground truth; NOT shipped, NOT loaded by the client)", nav_dir.display());
+    println!("A/B endpoints are sampled from the ORACLE, not from our own mesh — see the module docs.\n");
 
     let zones: Vec<String> = if args.is_empty() {
         let mut z: Vec<String> = std::fs::read_dir(&models)?
@@ -431,20 +566,29 @@ fn main() -> Result<()> {
         z
     } else { args };
 
-    println!("{:<13}{:>7}{:>8}{:>9}{:>8}{:>8}{:>7}{:>8} |{:>8} |{:>6}{:>6}{:>6}{:>6} |{:>12}{:>12}",
-        "zone", "tris", "bake_ms", "cache_kb", "columns", "surfs", "swim", "stack%",
-        "oracle%", "both", "mesh", "grid", "none", "mesh_us", "grid_us");
-    println!("{}", "-".repeat(140));
+    // `gaveup` is its OWN column. It is not a navmesh win and not a grid loss — it is the grid
+    // declining to answer, and it must never again be laundered into either.
+    println!("{:<13}{:>7}{:>8}{:>9}{:>8}{:>7}{:>7} |{:>7}{:>7}{:>8} |{:>6}{:>6}{:>6}{:>6}{:>8} |{:>12}{:>12}",
+        "zone", "tris", "bake_ms", "cache_kb", "columns", "swim", "stack%",
+        "cov_str", "cov_lax", "no_col%",
+        "both", "mesh", "grid", "none", "gaveup",
+        "mesh_us", "grid_us");
+    println!("{}", "-".repeat(152));
 
     let mut reports = Vec::new();
     for z in &zones {
         match run_zone(z, &models, &nav_dir, n_pairs, params) {
             Ok(r) => {
-                println!("{:<13}{:>7}{:>8}{:>9.0}{:>8}{:>8}{:>7}{:>7.1}% |{:>8} |{:>6}{:>6}{:>6}{:>6} |{:>12}{:>12}",
-                    r.zone, r.tris, r.bake_ms, r.cache_bytes as f32 / 1024.0, r.columns, r.surfaces,
+                let (cs, cl, cn) = match r.cov {
+                    Some(c) => (format!("{:.1}", c.strict), format!("{:.1}", c.loose),
+                                format!("{:.1}", c.no_column)),
+                    None => ("-".into(), "-".into(), "-".into()),
+                };
+                println!("{:<13}{:>7}{:>8}{:>9.0}{:>8}{:>7}{:>6.1}% |{:>7}{:>7}{:>8} |{:>6}{:>6}{:>6}{:>6}{:>8} |{:>12}{:>12}",
+                    r.zone, r.tris, r.bake_ms, r.cache_bytes as f32 / 1024.0, r.columns,
                     r.swim, r.stacked_pct,
-                    r.oracle_cov.map(|c| format!("{c:.1}")).unwrap_or_else(|| "-".into()),
-                    r.both_ok, r.mesh_only, r.grid_only, r.neither,
+                    cs, cl, cn,
+                    r.ab.both, r.ab.mesh_only, r.ab.grid_only, r.ab.neither, r.ab.gaveup(),
                     format!("{}/{}", r.mesh_us_med, r.mesh_us_max),
                     format!("{}/{}", r.grid_us_med, r.grid_us_max));
                 reports.push(r);
@@ -453,73 +597,113 @@ fn main() -> Result<()> {
         }
     }
 
-    if !reports.is_empty() {
-        let n = reports.len();
-        let bakes: Vec<u128> = reports.iter().map(|r| r.bake_ms).collect();
-        let total_pairs: usize = reports.iter().map(|r| r.pairs).sum();
-        let both: usize   = reports.iter().map(|r| r.both_ok).sum();
-        let m_only: usize = reports.iter().map(|r| r.mesh_only).sum();
-        let g_only: usize = reports.iter().map(|r| r.grid_only).sum();
-        let none_: usize  = reports.iter().map(|r| r.neither).sum();
-        let cache: usize  = reports.iter().map(|r| r.cache_bytes).sum();
-        let covs: Vec<f32> = reports.iter().filter_map(|r| r.oracle_cov).collect();
+    if reports.is_empty() { return Ok(()); }
 
-        println!("\n=== TOTALS ({n} zones) ===");
-        println!("BAKE TIME (the client's zone-load cost): median {} ms | max {} ms ({})",
-            median(&mut bakes.clone()), bakes.iter().max().unwrap(),
-            reports.iter().max_by_key(|r| r.bake_ms).unwrap().zone);
-        println!("CACHE SIZE: total {:.1} MB over {n} zones | mean {:.0} KB/zone | max {:.0} KB ({})",
-            cache as f32 / 1048576.0, cache as f32 / 1024.0 / n as f32,
-            reports.iter().map(|r| r.cache_bytes).max().unwrap() as f32 / 1024.0,
-            reports.iter().max_by_key(|r| r.cache_bytes).unwrap().zone);
-        let mut all_m: Vec<u128> = reports.iter().map(|r| r.mesh_us_med).collect();
-        let mut all_g: Vec<u128> = reports.iter().map(|r| r.grid_us_med).collect();
-        println!("QUERY TIME: navmesh median {} us (worst {} us) | legacy grid median {} us (worst {} us)",
-            median(&mut all_m), reports.iter().map(|r| r.mesh_us_max).max().unwrap(),
-            median(&mut all_g), reports.iter().map(|r| r.grid_us_max).max().unwrap());
-        if !covs.is_empty() {
-            let mean = covs.iter().sum::<f32>() / covs.len() as f32;
-            let worst = covs.iter().cloned().fold(f32::MAX, f32::min);
-            let worst_z = &reports.iter().filter(|r| r.oracle_cov.is_some())
-                .min_by(|a, b| a.oracle_cov.unwrap().partial_cmp(&b.oracle_cov.unwrap()).unwrap())
-                .unwrap().zone;
-            println!("ORACLE COVERAGE (our bake vs EQEmu's own navmesh): mean {mean:.1}% | worst {worst:.1}% ({worst_z})");
-        }
+    let n = reports.len();
+    let bakes: Vec<u128> = reports.iter().map(|r| r.bake_ms).collect();
+    let cache: usize = reports.iter().map(|r| r.cache_bytes).sum();
 
-        println!("\n=== GO / NO-GO ===");
-        println!("A/B pairs: {total_pairs}   both={both}  mesh-only={m_only}  grid-only={g_only}  neither={none_}");
-        let parity = 100.0 * (both + m_only + none_) as f32 / total_pairs.max(1) as f32;
-        println!("parity-or-better reachability: {parity:.2}%   (gate: >= 95%)  ->  {}",
-            if parity >= 95.0 { "PROCEED" } else { "DO NOT PROCEED — fall back to patching the grid" });
-        println!("  routes the navmesh found that the grid could NOT: {m_only} ({:.1}%)",
-            100.0 * m_only as f32 / total_pairs.max(1) as f32);
-        println!("  routes the grid found that the navmesh could NOT: {g_only} ({:.1}%)",
-            100.0 * g_only as f32 / total_pairs.max(1) as f32);
+    let mut tot = AbTally::default();
+    for r in &reports {
+        tot.both += r.ab.both;
+        tot.mesh_only += r.ab.mesh_only;
+        tot.mesh_vs_grid_gaveup += r.ab.mesh_vs_grid_gaveup;
+        tot.grid_only += r.ab.grid_only;
+        tot.neither += r.ab.neither;
+        tot.both_unknown += r.ab.both_unknown;
+    }
 
-        // Are those grid-only routes REAL? The legacy A* climbs up to STEP_H=20 per cell, but the
-        // controller can only step movement::STEP_UP=2.0 (#239). A grid route with a bigger riser is
-        // one the walker physically cannot follow — the grid is reporting a path it cannot walk, so
-        // counting it against the navmesh measures the grid's bug, not ours.
-        let rises: Vec<f32> = reports.iter().flat_map(|r| r.g_only_rise.clone()).collect();
+    println!("\n=== TOTALS ({n} zones) ===");
+    println!("BAKE TIME (the client's zone-load cost): median {} ms | max {} ms ({})",
+        median(&mut bakes.clone()), bakes.iter().max().unwrap(),
+        reports.iter().max_by_key(|r| r.bake_ms).unwrap().zone);
+
+    // Extrapolating a whole-cache size needs a DENOMINATOR, and the denominator is the zone universe
+    // — not however many zones happened to be baked locally today. Count it, don't guess it: a
+    // previous version of this PR asserted "~180 MB for ~200 zones" with no source for the 200.
+    let mean_kb = cache as f32 / 1024.0 / n as f32;
+    let universe = std::fs::read_dir(&nav_dir).map(|d| {
+        d.filter_map(|e| e.ok())
+         .filter(|e| e.path().extension().is_some_and(|x| x == "nav"))
+         .count()
+    }).unwrap_or(0);
+    println!("CACHE SIZE: total {:.1} MB over {n} zones | mean {mean_kb:.0} KB/zone | max {:.0} KB ({})",
+        cache as f32 / 1048576.0,
+        reports.iter().map(|r| r.cache_bytes).max().unwrap() as f32 / 1024.0,
+        reports.iter().max_by_key(|r| r.cache_bytes).unwrap().zone);
+    if universe > 0 {
+        println!("  -> full-cache extrapolation: {universe} zones x {mean_kb:.0} KB = {:.0} MB \
+                  (zone count from {} — measured, not assumed)",
+            universe as f32 * mean_kb / 1024.0, nav_dir.display());
+    }
+
+    let mut all_m: Vec<u128> = reports.iter().map(|r| r.mesh_us_med).collect();
+    let mut all_g: Vec<u128> = reports.iter().map(|r| r.grid_us_med).collect();
+    println!("QUERY TIME: navmesh median {} us (worst {} us) | legacy grid median {} us (worst {} us)",
+        median(&mut all_m), reports.iter().map(|r| r.mesh_us_max).max().unwrap(),
+        median(&mut all_g), reports.iter().map(|r| r.grid_us_max).max().unwrap());
+    println!("  NOTE: do NOT quote a speedup ratio off these. If the grid is running under a deadline,\n\
+              \x20       its time is CENSORED at the budget — that is a CAP, not a COST, and dividing by\n\
+              \x20       it manufactures a speedup. Compare only on pairs where neither planner is\n\
+              \x20       truncated. The navmesh's own worst case is UNBOUNDED (no deadline, no node cap).");
+
+    let covs: Vec<Coverage> = reports.iter().filter_map(|r| r.cov).collect();
+    if !covs.is_empty() {
+        let m = |f: fn(&Coverage) -> f32| covs.iter().map(f).sum::<f32>() / covs.len() as f32;
+        println!("ORACLE COVERAGE (our bake vs EQEmu's own navmesh), three ways:");
+        println!("  STRICT  (same column, |dz|<=4u)  mean {:.1}%   <- 'we have THIS ground'", m(|c| c.strict));
+        println!("  LOOSE   (+-1 cell, |dz|<=8u)     mean {:.1}%   <- the old, generous metric", m(|c| c.loose));
+        println!("  NO COLUMN AT ALL                 mean {:.1}%   <- oracle has ground, we have NOTHING",
+            m(|c| c.no_column));
+    }
+
+    println!("\n=== GO / NO-GO ===");
+    println!("A/B pairs: {}   both={}  mesh-only={}  grid-only={}  neither={}",
+        tot.total(), tot.both, tot.mesh_only, tot.grid_only, tot.neither);
+    println!("GRID DECLINED TO ANSWER on {} pairs ({:.1}%) — deadline or node cap.",
+        tot.gaveup(), 100.0 * tot.gaveup() as f32 / tot.total().max(1) as f32);
+    println!("  These are UNDECIDED and are excluded from parity. They are NOT navmesh wins: reporting\n\
+              \x20 a timeout as 'a route the grid cannot find' is the #337 lie, and it is how this\n\
+              \x20 harness once claimed 462 such routes when 97% of them were grid timeouts.");
+
+    let parity = tot.parity();
+    println!("parity-or-better reachability (over the {} DECIDED pairs): {parity:.2}%   (gate: >= 95%)  ->  {}",
+        tot.decided(),
+        if parity >= 95.0 { "PROCEED" } else { "DO NOT PROCEED — fall back to patching the grid" });
+
+    // Are those grid-only routes REAL? Judge them as the WALKER moves — a step OR a ramp — not
+    // against STEP_UP alone, and never on the goal-snap segment.
+    if !reports.iter().all(|r| r.verdicts.is_empty()) {
+        let vs: Vec<&RouteVerdict> = reports.iter().flat_map(|r| r.verdicts.iter()).collect();
+        let unwalkable = vs.iter().filter(|v| v.worst_unwalkable.is_some()).count();
+        let genuine = vs.len() - unwalkable;
+        let snap_artifacts = vs.iter().filter(|v| v.max_rise_was_goal_snap).count();
+
+        println!("\n  --- the {} grid-only routes, judged as the WALKER would walk them ---", vs.len());
+        println!("  GENUINE navmesh misses (the walker really could have walked it): {genuine} ({:.1}% of decided)",
+            100.0 * genuine as f32 / tot.decided().max(1) as f32);
+        println!("  truly unwalkable by the grid (a step > STEP_UP({STEP_UP}u) AND a grade > MAX_WALK_GRADE({MAX_WALK_GRADE})): {unwalkable}");
+        println!("  routes whose biggest rise sat on the GOAL-SNAP segment (a bookkeeping artifact of\n\
+                  \x20   assets.rs rewriting the last waypoint to the caller's goal z, NOT a climb): {snap_artifacts}");
+
+        let mut rises: Vec<f32> = vs.iter().map(|v| v.max_rise).collect();
+        rises.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         if !rises.is_empty() {
-            let unwalkable = rises.iter().filter(|&&r| r > eqoxide::movement::STEP_UP).count();
-            let mut sorted = rises.clone();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            println!("\n  of those {} grid-only routes, {} ({:.0}%) contain a single rise > STEP_UP({}u)",
-                rises.len(), unwalkable, 100.0 * unwalkable as f32 / rises.len() as f32,
-                eqoxide::movement::STEP_UP);
-            println!("  -> the walker could NOT have followed them; the grid reported a path it cannot walk.");
-            println!("  grid-only max-rise: median {:.1}u, p90 {:.1}u, max {:.1}u",
-                sorted[sorted.len() / 2], sorted[sorted.len() * 9 / 10], sorted[sorted.len() - 1]);
-            let genuine = rises.len() - unwalkable;
-            let adj = 100.0 * (both + m_only + none_ + unwalkable) as f32 / total_pairs.max(1) as f32;
-            println!("  GENUINE navmesh misses (grid route the walker really could walk): {genuine} ({:.1}%)",
-                100.0 * genuine as f32 / total_pairs.max(1) as f32);
-            println!("\n  --- ROOT CAUSE of each genuine miss ---");
-            for m in reports.iter().flat_map(|r| r.misses.iter()) { println!("    {m}"); }
-            println!("  parity discounting unwalkable grid routes: {adj:.2}%  ->  {}",
-                if adj >= 95.0 { "PROCEED" } else { "still under the gate" });
+            println!("  max mid-route rise (goal-snap EXCLUDED): median {:.1}u, p90 {:.1}u, max {:.1}u",
+                rises[rises.len() / 2], rises[rises.len() * 9 / 10], rises[rises.len() - 1]);
         }
+
+        println!("\n  --- ROOT CAUSE of each genuine miss ---");
+        for m in reports.iter().flat_map(|r| r.misses.iter()) { println!("    {m}"); }
+
+        // The old harness printed an "adjusted parity" that added every STEP_UP-flagged route back
+        // into the numerator, reaching 99.18% and declaring PROCEED. That was the GATE REDEFINED TO
+        // PASS: most of those routes were ordinary ramps. Discounting is only honest for routes the
+        // walker provably cannot walk, and it is reported as a clearly-labelled SECONDARY number.
+        let adj_num = tot.both + tot.mesh_only + tot.neither + unwalkable;
+        let adj = 100.0 * adj_num as f32 / tot.decided().max(1) as f32;
+        println!("\n  [secondary] parity discounting ONLY the provably-unwalkable grid routes: {adj:.2}%");
+        println!("  This is NOT the gate. The gate is the {parity:.2}% above.");
     }
 
     failure_cases(&models, params);

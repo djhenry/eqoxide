@@ -324,7 +324,7 @@ pub fn draw_nav_debug(
     // A* per-edge constants (mirror find_path @ src/assets.rs):
     const STEP_H: f32 = 20.0;
     const MAX_STEP_DOWN: f32 = 60.0;
-    const MAX_WALK_GRADE: f32 = 1.2;
+    use crate::movement::MAX_WALK_GRADE;
     const CHEST: f32 = 3.0;
     let walk_col  = egui::Color32::from_rgba_unmultiplied(60, 230, 90, 170);
     let block_col = egui::Color32::from_rgba_unmultiplied(255, 60, 60, 220);

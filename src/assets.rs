@@ -1930,7 +1930,7 @@ impl Collision {
         // so the climbs that actually reach A* are smooth RAMPS — and a ramp steeper than the
         // controller can walk makes it slide on the face and wedge (#205). Reject a climb whose
         // grade (rise/run) exceeds what's walkable; A* then routes around the steep face.
-        const MAX_WALK_GRADE: f32 = 1.2;  // walkable up to ~50° (rise/run); steeper = slide
+        use crate::movement::MAX_WALK_GRADE;  // walkable up to ~50° (rise/run); steeper = slide
         // Jump-edges (eqoxide#190): let A* leap a GENUINE horizontal floor gap a running jump can
         // clear. NAV_RUN_SPEED matches navigation::RUN_SPEED (the speed the walker drives a jump at);
         // reach is derived from it via movement::running_jump_reach (~22.7u). JUMP_UP_TOL caps how

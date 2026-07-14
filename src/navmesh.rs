@@ -18,8 +18,10 @@
 //!
 //!   1. **Voxel heightfield** — rasterize every collision triangle into `cs`-sized XY columns,
 //!      recording each solid span `[zmin, zmax]` and whether it is walkable by SLOPE (the filter
-//!      `nearest_floor` never had). NOTE: on `|nz|`, not the signed normal — EQ's face winding is
-//!      NOT reliable (measured: outdoor terrain is partly wound inside-out; see the rasterizer).
+//!      `nearest_floor` never had). On the SIGNED normal, so a down-facing face (a ceiling) is never
+//!      ground. KNOWN LIMITATION: EQ's face winding is NOT reliable — outdoor terrain is partly wound
+//!      inside-out, so some real outdoor ground is DROPPED and those zones under-report against the
+//!      oracle. That is deliberate; see the rasterizer for why the `|nz|` "fix" was unsound (#375).
 //!   2. **Surface extraction** — a span's top is a walkable surface only if it is slope-walkable AND
 //!      has `agent_height` of open air above it (the clearance filter — you must fit to stand).
 //!   3. **Water surface layer** (ours, not Recast's) — a swimmable body gets an explicit surface
@@ -28,9 +30,11 @@
 //!      A* pays to cross one. (Recast's hard erosion DELETES them; measured on the real zones that
 //!      is far more aggressive than EQEmu's bake and disconnects narrow stairs and bridges.)
 //!   5. **Connected components** — labelled once, over exactly the edges A* can traverse, with
-//!      one-way FALL links kept directional. This makes "unreachable" an O(1) answer instead of
-//!      something discovered by exhausting the search — which is the very thing that stalls the
-//!      network thread for seconds today (#257/#302/#340).
+//!      one-way FALL links kept directional. "Unreachable" is then answered by a DFS over the
+//!      component graph (`comp_reachable`) — **O(components)**, allocating a seen-set per query, not
+//!      the O(1) this header used to claim. It is still answered BEFORE any A* expansion, which is
+//!      the point: today the same question is answered only by exhausting the search, and that is
+//!      what stalls the network thread for seconds (#257/#302/#340).
 //!
 //! # What the result is
 //!
@@ -39,9 +43,20 @@
 //! multi-storey buildings, 192/497 zones with >10% stacked columns) natively expressible.
 //!
 //! Links between surfaces are NOT stored: they are derived at query time from the neighbouring
-//! column's surface list, which is an O(1) array read instead of a Möller–Trumbore ray cast. That is
-//! the ~100× per-node win, and it means this type is a drop-in for the `column_floors` /
-//! `nearest_floor` role the A* in `assets.rs` already uses.
+//! column's surface list, which is an array read instead of a Möller–Trumbore ray cast. (An earlier
+//! draft of this header claimed a "~100× per-node win". That figure had no source and the end-to-end
+//! speedup derived from it was refuted — the grid's measured "~150 ms" was its BUDGET CAP, not its
+//! cost. Where the grid does not saturate, the two are comparable. No speedup is claimed here.)
+//!
+//! # STATUS — this module is a MEASUREMENT TOOL, not a shipping pathfinder
+//!
+//! **It is deliberately NOT wired under `Collision::find_path`, and Phase 2 (doing so) is CANCELLED.**
+//! Nothing in `src/` calls it; it is exercised only by its own tests and by the offline harness
+//! `tools/src/navmesh_validate.rs`. It is kept because the *measurements* are worth having (bake cost,
+//! cache size, and the water-surface layer for #197p2) and because it is the cheapest place to keep
+//! studying the representation. It is NOT kept because it is better than the grid — on the corrected
+//! numbers it is not. Do not promote it to the live path on the strength of this file's own comments;
+//! re-measure with the harness first.
 //!
 //! DELIBERATELY NOT USED: EQEmu's prebuilt `maps/nav/*.nav` files. Navigation is a client-side
 //! computation. Those files are used ONLY by the offline validation harness as a ground-truth
@@ -309,8 +324,17 @@ impl NavMesh {
         }
     }
 
-    /// The walkable surface at `(east, north)` nearest `ref_z`. Drop-in for `nearest_floor` — but a
-    /// ceiling can never be returned, because a ceiling is not a surface in this representation.
+    /// The walkable surface at `(east, north)` nearest `ref_z`. Drop-in for `nearest_floor`.
+    ///
+    /// A ceiling can never be returned, because a down-facing face is never admitted as a surface in
+    /// the first place (see the signed-normal slope test in `bake`). This guarantee is exactly as
+    /// strong as that test: a revision that classified on `|nz|` broke it and returned qcat's ceiling
+    /// here (#329). If you change the classifier, this docstring is a claim you must re-earn — the
+    /// `the_qcat_flooded_corridor_*` test is its guard.
+    ///
+    /// Note this is a claim about CEILINGS (down-facing faces), not about correctness of the tier
+    /// chosen: `nearest_surface` picks the surface nearest `ref_z` in either direction, so a caller
+    /// passing a z it is not actually standing on can still get the wrong FLOOR back.
     pub fn nearest_surface(&self, east: f32, north: f32, ref_z: f32) -> Option<Surface> {
         let (c, r) = self.to_cell(east, north);
         self.column(c, r).iter()
@@ -351,7 +375,8 @@ impl NavMesh {
         // ── Stage 1: voxel heightfield. Clip each triangle to each column it overlaps and record
         // the solid span there. `nz` (the surface normal's up component) decides slope-walkability —
         // the filter `nearest_floor` never had. A downward-facing face (a ceiling) has nz < 0 and can
-        // never be walkable, so #329's ceiling-as-floor is impossible by construction.
+        // never be walkable, so #329's ceiling-as-floor is impossible by construction. That sentence
+        // is only true while the test below uses the SIGNED normal — it was once false, see there.
         let cos_max = 1.0 / (1.0 + params.max_grade * params.max_grade).sqrt();
         let mut raw: Vec<RawSpan> = Vec::new();
         for t in tris {
@@ -362,21 +387,39 @@ impl NavMesh {
                       e1[0] * e2[1] - e1[1] * e2[0]];
             let nl = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
             if nl < 1e-9 { continue; }
-            // Slope test on |nz| — NOT on the signed normal.
+            // Slope test on the SIGNED normal: a floor faces up (nz > 0), a ceiling faces down.
             //
-            // I first filtered on the SIGNED normal (a floor faces up, a ceiling faces down) after
-            // measuring that winding looked consistent across the shipped collision meshes. That
-            // measurement was taken on INDOOR/city zones and it does not generalise: on outdoor
-            // zones the terrain is partly wound inside-out. In highpass the down-facing faces have a
-            // median z of 60.0 — exactly the height EQEmu's own navmesh calls walkable. Filtering on
-            // the sign therefore DELETED real ground (nektulos dropped to 6.9% coverage against the
-            // oracle: at terrain XYs our only surface was the zone's -199 boundary plane).
+            // A previous revision of this file filtered on `|nz|` instead, to rescue outdoor ground
+            // that EQ's art winds inside-out (see KNOWN LIMITATION below). **That was unsound and has
+            // been reverted.** `|nz|` gives a flat ceiling `|nz| = 1.0`, so it classified a ceiling as
+            // a walkable FLOOR — reintroducing #329 verbatim. Neither of the two defences claimed for
+            // it holds on a real EQ ceiling:
+            //   * "clearance saves us — a ceiling has rock above it": a real EQ ceiling is a thin
+            //     SINGLE-SIDED SHELL with OPEN AIR above it (see `quad_down` in the tests). With
+            //     nothing above, `ceil = f32::INFINITY`, the clearance test passes, and the ceiling
+            //     becomes a surface.
+            //   * "anchoring saves us — you stand on a surface below your feet": that only relocates
+            //     the anchor. The underside of any solid at least `agent_height` thick — a stone
+            //     bridge, an overhang — still becomes a phantom mid-air floor that A* will route
+            //     across.
+            // Promising a route over a ceiling is precisely the confident-falsehood class this module
+            // exists to end, so the sign stays.
             //
-            // So both windings count as ground here, and the ceiling problem (#329) is solved where
-            // it actually bites — at ANCHORING (see `nearest_index`): you stand on a surface BELOW
-            // your feet, never on one above your head. A ceiling also forms its own connected
-            // component, so A* on the floor never wanders onto it.
-            let nz = (n[2] / nl).abs();
+            // ── KNOWN LIMITATION (accepted, NOT fixed) ──
+            // EQ's face winding is genuinely NOT reliable: on some outdoor zones the terrain is partly
+            // wound inside-out, and those down-facing faces are real, walkable ground. In highpass the
+            // down-facing faces have a median z of 60.0 — exactly the height EQEmu's own navmesh calls
+            // walkable. Filtering on the sign therefore DROPS that ground, and the affected outdoor
+            // zones (highpass, nektulos) UNDER-REPORT walkable area against the oracle.
+            //
+            // That is the correct trade for now, and it is deliberate: a harness that under-reports
+            // ground is HONEST (it says "I don't have this"), while one that invents floors inside
+            // ceilings is not (it says "walk here" about solid rock). Under-reporting is a visible,
+            // falsifiable gap; a phantom floor is a silent lie. **Do not "fix" this by reintroducing
+            // `.abs()`** — #375 was closed as unsafe for exactly that reason. A real fix needs a
+            // winding-independent inside/outside test (e.g. ray-parity against the closed hull, or
+            // seeding orientation from a known-outdoor sample), which is not in scope here.
+            let nz = n[2] / nl;
             let walkable = nz >= cos_max;
             // Steep-but-not-vertical ground: too steep to climb, but you can slide DOWN it. Kept as
             // a descend-only surface rather than deleted (see FLAG_STEEP).
@@ -1099,56 +1142,124 @@ mod tests {
             .collect()
     }
 
+    /// THE #329 GUARD. If you break the surface classifier, THIS is the test that must go red.
+    ///
+    /// **Mutation-checked.** Reintroducing `.abs()` on `nz` in `bake` (i.e. classifying slope on
+    /// `|nz|`) makes both halves of this test FAIL. That property is the whole point of the test and
+    /// it must be preserved: an earlier version of this test seeded a rock slab 2u ABOVE the ceiling,
+    /// so the ceiling was killed by the CLEARANCE filter rather than by the orientation test — and it
+    /// therefore passed with `|nz|` and without it. It guarded nothing. Do not add a slab back.
+    ///
+    /// A real EQ ceiling is a thin, single-sided, DOWN-WOUND shell with **open air above it** (that
+    /// is what `quad_down` builds). There is nothing on top of it to save us: `ceil` comes out as
+    /// `f32::INFINITY`, so the clearance filter passes it. The ONLY thing standing between a ceiling
+    /// and A* routing across it is the signed-normal test.
     #[test]
     fn the_qcat_flooded_corridor_anchors_to_water_or_floor_never_the_ceiling() {
-        // THE #329 CASE, modelled as the zone really is. The qcat spawn corridor: floor at -69.97,
-        // rock ceiling at -55.97 (with rock ABOVE it — that is what a ceiling is), and the corridor
-        // is FLOODED, so the water surface sits at -56.00, flush with the ceiling.
-        //
-        // The legacy `nearest_floor` gathers every triangle a vertical ray crosses with no
-        // orientation and no clearance test, so a caller reporting z ~ -56 gets the CEILING back as
-        // its floor, and A* plans the whole route across the rock.
-        //
-        // Two independent mechanisms stop that here:
-        //   1. clearance — the ceiling has rock above it, so nothing can stand on it: it is not a
-        //      surface at all (and this holds whichever way the art is wound, which matters because
-        //      EQ's winding is NOT reliable — see the rasterizer).
-        //   2. the water-surface layer — a character at -56 in a flooded corridor is SWIMMING, and
-        //      the honest thing to anchor to is the waterline, which the legacy model cannot even
-        //      represent (#197p2).
-        for (label, ceiling) in [("down-wound", quad_down(-55.97, 0.0, 40.0, 0.0, 40.0)),
-                                 ("up-wound",   quad(-55.97, 0.0, 40.0, 0.0, 40.0))] {
-            let mut tris = quad(-69.97, 0.0, 40.0, 0.0, 40.0); // corridor floor
-            tris.extend(ceiling);
-            tris.extend(quad(-53.97, 0.0, 40.0, 0.0, 40.0));   // rock above the ceiling
-            let water = RegionMap::flat_below(-56.0);          // the corridor is flooded to -56
+        const FLOOR: f32 = -69.97;
+        const CEILING: f32 = -55.97;
+
+        // ── Part A: the DRY corridor. The cleanest statement of the invariant, with no water layer
+        // that could mask a bad classification behind a swim node.
+        {
+            let mut tris = quad(FLOOR, 0.0, 40.0, 0.0, 40.0);          // corridor floor
+            tris.extend(quad_down(CEILING, 0.0, 40.0, 0.0, 40.0));     // ceiling: OPEN AIR ABOVE IT
+            let mesh = NavMesh::bake(&tris, None, BakeParams::default(), b"t");
+
+            let (c, r) = mesh.to_cell(20.0, 20.0);
+            let col = mesh.column(c, r);
+            assert!(!col.iter().any(|s| (s.z - CEILING).abs() < 1.0),
+                "the ceiling must not be a surface AT ALL — it is a down-facing face with nothing \
+                 above it, so clearance cannot save us and only the signed normal can. Got {col:?}");
+            assert_eq!(col.len(), 1, "only the floor is a surface: {col:?}");
+
+            // The z that fools the legacy grid (#329: a caller reporting ~ -56, flush with the rock)
+            // must still resolve to the FLOOR, not to the ceiling 0.03u away.
+            let s = mesh.nearest_surface(20.0, 20.0, -56.0).expect("a surface must exist");
+            assert!((s.z - FLOOR).abs() < 1.0,
+                "must anchor to the floor at {FLOOR}, got z={} — that is the ceiling (#329)", s.z);
+        }
+
+        // ── Part B: the corridor as qcat really is — FLOODED. The water surface sits at -56.00,
+        // flush with the ceiling, which is exactly why the legacy `nearest_floor` anchors to rock.
+        // Here the honest anchor for a character at -56 is the WATERLINE (it is swimming, #197p2) —
+        // and the ceiling must still never be walkable ground.
+        {
+            let mut tris = quad(FLOOR, 0.0, 40.0, 0.0, 40.0);
+            tris.extend(quad_down(CEILING, 0.0, 40.0, 0.0, 40.0));     // still open air above
+            let water = RegionMap::flat_below(-56.0);
             let mesh = NavMesh::bake(&tris, Some(&water), BakeParams::default(), b"t");
 
             let (c, r) = mesh.to_cell(20.0, 20.0);
             let col = mesh.column(c, r);
-            // The ceiling can never be STOOD on: there is rock on top of it. (The waterline node
-            // sits at -56.00, 0.03u from the ceiling by construction — that one is a swim surface,
-            // which is exactly right and is the thing the legacy model cannot represent at all.)
-            assert!(col.iter().all(|s| s.is_swim() || (s.z - (-55.97)).abs() > 1.0),
-                "{label}: the ceiling must not be a WALKABLE surface, got {col:?}");
+            // A swim node near the ceiling's z is CORRECT (the waterline really is there). A solid
+            // WALKABLE surface there is the #329 lie. Distinguish them — do not let FLAG_SWIM launder
+            // a ceiling.
+            assert!(!col.iter().any(|s| !s.is_swim() && (s.z - CEILING).abs() < 1.0),
+                "the ceiling must not be a WALKABLE surface, got {col:?}");
 
-            // Anchoring with the z that fools the legacy grid (-56.0) gives the waterline or the
-            // floor — never the rock.
-            let s = mesh.nearest_surface(20.0, 20.0, -56.0)
-                .unwrap_or_else(|| panic!("{label}: a surface must exist"));
-            assert!(s.is_swim() || (s.z - (-69.97)).abs() < 1.0,
-                "{label}: must anchor to the waterline or the floor, got z={} swim={}",
-                s.z, s.is_swim());
+            let s = mesh.nearest_surface(20.0, 20.0, -56.0).expect("a surface must exist");
+            assert!(s.is_swim() || (s.z - FLOOR).abs() < 1.0,
+                "must anchor to the waterline or the floor, got z={} swim={}", s.z, s.is_swim());
         }
     }
 
+    /// The GENERAL form of #329, and the case that kills the "anchoring saves us" defence: the
+    /// UNDERSIDE of a thick solid — a stone bridge, an overhang, a cave roof — must not become a
+    /// phantom floor hanging in mid-air.
+    ///
+    /// This is strictly worse than the qcat ceiling, because here anchoring cannot help: the phantom
+    /// surface is genuinely BELOW a character standing on the bridge deck, so "you stand on a surface
+    /// below your feet" happily anchors to it. Only the orientation test rejects it.
+    ///
+    /// **Mutation-checked**: reintroducing `.abs()` on `nz` makes this fail.
     #[test]
+    fn the_underside_of_a_bridge_is_never_a_phantom_mid_air_floor() {
+        let mut tris = quad(0.0, 0.0, 40.0, 0.0, 40.0);            // ground
+        tris.extend(quad_down(14.0, 10.0, 30.0, 0.0, 40.0));       // bridge UNDERSIDE (down-facing)
+        tris.extend(quad(22.0, 10.0, 30.0, 0.0, 40.0));            // bridge DECK (up-facing)
+        let mesh = NavMesh::bake(&tris, None, BakeParams::default(), b"t");
+
+        // Mid-bridge column: the ground below, the deck on top — and NOTHING in between.
+        let (c, r) = mesh.to_cell(20.0, 20.0);
+        let col = mesh.column(c, r);
+        assert!(!col.iter().any(|s| (s.z - 14.0).abs() < 1.0),
+            "the bridge's underside became a walkable surface floating 14u in the air: {col:?}");
+        assert_eq!(col.len(), 2, "exactly two surfaces: the ground and the deck. Got {col:?}");
+        assert!((col[0].z - 0.0).abs() < 0.6 && (col[1].z - 22.0).abs() < 0.6, "{col:?}");
+
+        // And a character walking the ground under the bridge anchors to the GROUND, not to the
+        // rock slab above its head.
+        let s = mesh.nearest_surface(20.0, 20.0, 1.0).expect("the ground is a surface");
+        assert!((s.z - 0.0).abs() < 0.6, "must anchor to the ground, got z={}", s.z);
+    }
+
+    /// ── KNOWN FAILURE, DELIBERATELY LEFT RED (`#[ignore]`d, run it with `--ignored`) ──
+    ///
+    /// This is a REAL, MEASURED defect and it is recorded here rather than deleted, because a
+    /// codebase that quietly drops the test for the thing it cannot do is lying by omission.
+    ///
+    /// The observation is sound: EQ's face winding is NOT reliable. On outdoor zones the terrain is
+    /// partly wound inside-out, so classifying slope on the SIGNED normal DROPS real, walkable ground
+    /// — nektulos fell to 6.9% oracle coverage (at real terrain XYs the only surface left was the
+    /// zone's -199 boundary plane), and highpass under-reports the same way.
+    ///
+    /// The attempted fix — classify on `|nz|` — was UNSOUND and has been reverted: it made a flat
+    /// ceiling (`|nz| = 1.0`) a walkable floor, reintroducing #329 and turning the underside of every
+    /// bridge and overhang into a phantom mid-air floor. See the rasterizer. #375 (porting `|nz|` into
+    /// the shipping `nearest_floor`) was CLOSED AS UNSAFE for this reason.
+    ///
+    /// So we knowingly accept the under-report. Under-reporting ground is HONEST — the mesh says "I
+    /// do not have this" and the caller can fall back. Inventing a floor inside solid rock is a
+    /// confident falsehood, which the agent-honesty invariant ranks strictly worse. **Do not make
+    /// this test pass by reintroducing `.abs()`.** A correct fix needs a winding-INDEPENDENT
+    /// inside/outside test (ray-parity against the closed hull, or seeding orientation from a
+    /// known-outdoor sample); until someone builds that, this stays red.
+    #[test]
+    #[ignore = "KNOWN FAILURE: signed-normal classification drops inside-out outdoor ground \
+                (highpass/nektulos under-report). The |nz| 'fix' was unsound (#329/#375) and was \
+                reverted. Accepted, not solved — see the doc comment."]
     fn outdoor_ground_survives_even_when_the_art_is_wound_inside_out() {
-        // Regression guard for the bug the EQEmu oracle caught. Filtering on the SIGNED normal looked
-        // right on indoor zones but deleted real ground outdoors, where terrain is partly wound
-        // inside-out: nektulos fell to 6.9% coverage against EQEmu's own navmesh, because at real
-        // terrain XYs our only surface left was the zone's -199 boundary plane. Ground is ground
-        // regardless of which way the triangle happens to face.
         let tris = quad_down(60.0, 0.0, 40.0, 0.0, 40.0); // a floor, wound the "wrong" way
         let mesh = NavMesh::bake(&tris, None, BakeParams::default(), b"t");
         let s = mesh.nearest_surface(20.0, 20.0, 60.0).expect("inside-out ground is still ground");
@@ -1253,8 +1364,13 @@ mod tests {
     /// project exists to kill, and it is easy to reintroduce by "optimising" one of the two paths
     /// (a cost tweak in A*, a relaxation in the labeller) without the other. This test pins them
     /// together: if anyone lets them drift, it fails.
-    fn assert_route_is_walkable(mesh: &NavMesh, start: [f32; 3], goal: [f32; 3]) {
-        let Some(path) = mesh.find_path(start, goal) else { return };
+    ///
+    /// Returns `true` if a route actually existed and was checked. The caller MUST count these: a
+    /// `None` here asserts NOTHING, so a version of this test that only ever saw `None` would pass
+    /// while checking nothing at all (it previously did exactly that — `let Some(path) = .. else
+    /// { return }` with no tally). A vacuous guard is worse than no guard, because it reads as one.
+    fn assert_route_is_walkable(mesh: &NavMesh, start: [f32; 3], goal: [f32; 3]) -> bool {
+        let Some(path) = mesh.find_path(start, goal) else { return false };
         // Walk the returned route and re-derive each surface, checking every hop is a legal edge.
         let mut prev = mesh.nearest_surface(start[0], start[1], start[2]).expect("start anchors");
         for w in &path {
@@ -1272,6 +1388,7 @@ mod tests {
                 "route drops {:.1}u in one hop — beyond MAX_FALL. Unwalkable.", -rise);
             prev = here;
         }
+        true
     }
 
     #[test]
@@ -1288,14 +1405,76 @@ mod tests {
         let water = RegionMap::box_below(0.0, 60.0, 40.0, 90.0, -6.0);
         let mesh = NavMesh::bake(&tris, Some(&water), BakeParams::default(), b"t");
 
-        // Probe a spread of routes across every combination of hazard, in both directions.
+        let mut checked = 0usize;
+
+        // ── (a) The hazard matrix. BOTTOM PAD, TOP PAD, WATER SURFACE, POOL BOTTOM.
+        //
+        // Pinned EXACTLY, because "which pairs route" is the mesh's actual contract and a count alone
+        // would let it drift in either direction. `true` = a route must exist (and every hop in it is
+        // then re-checked against the edge rules); `false` = the mesh must refuse, because promising
+        // that route would be a lie the walker cannot honour.
+        //
+        // ⚠ This matrix RECORDS two real modelling gaps — it does not bless them. See `edge()`:
+        // leaving water `(true,false)` requires `|rise| <= max_climb`, and entering `(false,true)`
+        // refuses any climb, so there is **no DIVE edge and no SWIM-UP edge**. Consequences, both
+        // visible below: a swimmer at the surface cannot descend to a submerged floor, and the pool
+        // bottom is a ONE-WAY TRAP (you can fall in off the ledge and never get out). That mirrors the
+        // client's own no-swim-up bug (#207). It is out of scope here — this module is a measurement
+        // tool, not a shipping pathfinder — but it is written down rather than left as a silent 3/12.
+        const PAD: usize = 0;   // bottom pad, z=0     — walled in by the steep face
+        const TOP: usize = 1;   // top pad,    z=27.5  — the only region with a way out
+        const SURF: usize = 2;  // waterline,  z=-6
+        const DEEP: usize = 3;  // pool bottom,z=-40   — a trap
         let pts = [[-20.0, 30.0, 0.0], [30.0, 30.0, 27.5], [60.0, 30.0, -6.0], [80.0, 30.0, -40.0]];
-        for a in &pts {
-            for b in &pts {
-                if a == b { continue; }
-                assert_route_is_walkable(&mesh, *a, *b);
+        let name = ["bottom-pad", "top-pad", "water-surface", "pool-bottom"];
+
+        let mut expect = [[false; 4]; 4];
+        expect[TOP][PAD]  = true;  // slide DOWN the steep face
+        expect[TOP][SURF] = true;  // jump off the ledge into the water
+        expect[TOP][DEEP] = true;  // ...or fall all the way to the pool bottom
+        // Everything else is refused, and each refusal is a rule doing its job:
+        //   PAD -> *    : cannot CLIMB the ~70° face, and the pad is otherwise sealed.
+        //   SURF -> TOP : cannot haul 33.5u straight up out of the water.
+        //   SURF -> DEEP: no dive edge  (gap, above).
+        //   DEEP -> *   : no swim-up edge (gap, above) — the trap.
+
+        for (i, a) in pts.iter().enumerate() {
+            for (j, b) in pts.iter().enumerate() {
+                if i == j { continue; }
+                let ok = assert_route_is_walkable(&mesh, *a, *b);
+                assert_eq!(ok, expect[i][j],
+                    "{} -> {}: mesh says route={ok}, contract says {}. The edge rules changed. If \
+                     that is intended, update the matrix AND say why — do not flip it to green.",
+                    name[i], name[j], expect[i][j]);
+                if ok { checked += 1; }
             }
         }
+
+        // ── (b) Exercise the invariant over real routes WITHIN each connected region, so that
+        // `assert_route_is_walkable` (the actual point of this test) validates a decent number of
+        // multi-hop paths rather than the three the hazard matrix happens to allow.
+        let intra = [
+            ([-35.0, 10.0, 0.0],   [-5.0, 50.0, 0.0]),    // across the bottom pad
+            ([15.0, 10.0, 27.5],   [35.0, 50.0, 27.5]),   // across the top pad
+            ([45.0, 10.0, -6.0],   [85.0, 50.0, -6.0]),   // swim across the surface (#197p2)
+        ];
+        for (a, b) in intra {
+            for (s, g) in [(a, b), (b, a)] {
+                assert!(assert_route_is_walkable(&mesh, s, g),
+                    "{s:?} -> {g:?} must route: it is flat ground (or open water) within one region");
+                checked += 1;
+            }
+        }
+
+        // ── THE ANTI-VACUITY GUARD.
+        //
+        // `assert_route_is_walkable` asserts NOTHING when it gets `None` back, so before this line the
+        // test passed happily if every single pair returned `None` — a load-bearing-looking invariant
+        // that checked zero routes. (It really was thin: the hazard matrix alone yields just 3.) This
+        // pins the floor so the invariant can never silently stop being tested.
+        assert!(checked >= 9,
+            "the walkability invariant was only exercised on {checked} routes — too few to prove \
+             anything. The mesh got more restrictive, or this world stopped connecting.");
     }
 
     #[test]

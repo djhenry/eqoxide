@@ -71,3 +71,14 @@ jobs:
       # wall-clock budget). Do not silence it by adding #[ignore] here; #356 tracks the fix.
       - name: cargo test --lib
         run: cargo test --lib --locked
+
+      # `tools/` is a workspace MEMBER but not the root package, and `cargo build` at the root builds
+      # only the root package — so until this step existed, nothing in CI ever compiled `tools/` and
+      # every binary in it could rot silently against a change to the `eqoxide` lib it depends on.
+      # (`navmesh_validate` and `probe_normals` were both added without CI ever building them once.)
+      #
+      # `check`, not `build`: these are offline developer tools, so we care that they still COMPILE
+      # against the lib, not that we produce optimised binaries for them on every push. `--all-targets`
+      # so their tests/benches are type-checked too.
+      - name: cargo check -p s3d_to_gltf (offline tools)
+        run: cargo check -p s3d_to_gltf --all-targets --locked

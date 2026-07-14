@@ -21,6 +21,20 @@ const SKIN: f32 = 0.05;
 /// can't (#239). (Was decoupled from a super-human `NAV_CLIMB = 20.0`, which teleported the walker up
 /// 20u ridges/invisible walls and stranded it on the high side of boundaries.)
 pub const STEP_UP: f32 = 2.0;
+
+/// Steepest SMOOTH RAMP the walker can climb, as rise/run (~50°). Steeper than this and it slides on
+/// the face and wedges (#205), so `find_path` refuses such a climb (`assets.rs`, #212).
+///
+/// **This is NOT `STEP_UP`, and confusing the two is a live foot-gun.** `STEP_UP` (2.0) is the height
+/// of a DISCRETE vertical step — a ledge you auto-step. `MAX_WALK_GRADE` is a SLOPE limit over a run.
+/// A rise of 6.2u across an 8u cell is a 38° ramp the walker climbs routinely, even though 6.2 ≫ 2.0:
+/// judging that rise against `STEP_UP` calls an ordinary ramp "unwalkable". The offline navmesh
+/// harness did exactly that and mis-reported 125 walkable ramps as unwalkable grid routes.
+///
+/// It lives here, `pub`, because it had drifted into TWO private copies (`assets.rs`'s A* edge test
+/// and `hud.rs`'s nav-debug overlay) that had to agree and nothing made them. One definition now.
+pub const MAX_WALK_GRADE: f32 = 1.2;
+
 /// Ground-probe origin above the feet (`_DAT_009c3390 = 1.0f`).
 const GROUND_ORIGIN: f32 = 1.0;
 /// Ground-probe downward range (`_DAT_009c58e4 = 200.0f`).
