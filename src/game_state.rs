@@ -101,8 +101,8 @@ pub enum TaskStatus {
 }
 
 /// A Task-system quest in the player's journal (from OP_TaskDescription + OP_TaskActivity). This is
-/// EQ's *native* quest log (server-pushed), distinct from the old-style Lua turn-in quests surfaced
-/// by tools/quest_finder.py + GET /v1/quests/givers. See docs/autonomous-play.md.
+/// EQ's *native* quest log (server-pushed) — the same journal a human sees in their own quest
+/// window, surfaced by GET /v1/quests/log. See docs/autonomous-play.md.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct ActiveTask {
     pub task_id:     u32,
