@@ -102,16 +102,23 @@ Do not restart it without reading the review on #372 first.
 ## What happened to the navmesh (PR #372) — do not re-litigate without reading this
 
 Reviewed adversarially; **Phase 2 CANCELLED**. Four headline numbers **did not survive**:
-- *"Navmesh finds 462 routes (27%) the grid cannot"* → **97% of those are grid TIMEOUTS, not failures.**
-  The harness bucketed a 150ms `PLAN_BUDGET` timeout as "no route" — **the #337 anti-pattern, inside the
-  tool built to evaluate nav.** 50.4% of grid queries were saturating the budget.
+- *"Navmesh finds 462 routes (27%) the grid cannot"* → **those "wins" are overwhelmingly grid TIMEOUTS,
+  not grid failures.** The harness bucketed a 150ms `PLAN_BUDGET` timeout as "no route" — **the #337
+  anti-pattern, inside the tool built to evaluate nav.** (Careful with the numbers: the *462* is from the
+  PR's original 1700-pair/34-zone self-sampled run. The review's **separate** re-instrumented run — 2200
+  pairs, 11 zones — found **567** navmesh-only routes, of which **548 (97%) were grid timeouts** and only
+  19 were genuine grid failures, with **50.4%** of all grid queries saturating the budget. The 97% is NOT
+  a breakdown of the 462; the two runs were never reconciled. The conclusion is solid; the composition
+  was sloppy, and this file said so wrong the first time.)
 - *"Query 1.5–2.8ms vs the grid's ~150ms" (~60×)* → **150ms is the grid's CAP, not its cost.** The grid's
   median *is* the budget, exactly. A censored distribution; the speedup is undefined. Where the grid does
   not saturate (qcat): grid 7.3ms vs navmesh 6.2ms — **comparable**.
 - *"Adjusted parity 99.18%"* → **the failing gate redefined to pass.** The "unwalkable" grid routes were
   scored by absolute Δz vs `STEP_UP`, but `STEP_UP` is a *step height, not a slope limit*
   (`MAX_WALK_GRADE = 1.2`). 125 of 238 were ordinary walkable **ramps**. The **"max 773u climb" does not
-  exist** — it is the final waypoint's goal-snap (`assets.rs:1885`).
+  exist** — it is the final waypoint's goal-snap (`assets.rs:2477-2480`, verified;
+  the #372 review cited `:1885`, which is the WATER-anchoring block — a wrong citation this file
+  retyped without checking, and its own reviewer caught. Cite by reading, not by copying.).
 - *Raw parity 93.88%* → pairs were sampled from **the navmesh's own domain**, so ground it dropped could
   never be sampled. Resampled neutrally from the EQEmu oracle: **83.5%**, and grid-only routes **+53%**.
 
@@ -125,7 +132,9 @@ Its worst-case query is **455ms, unbounded** — *worse* on the net thread than 
 **What was real and survives:** bake ~0.4–0.9s median / 5.6s max (everfrost); ~800KB/zone (the honest
 extrapolation is **~450MB over the real 497-zone universe**, not the PR's "180MB for ~200 zones"); the
 water-surface layer works; and **EQ face winding genuinely is unreliable for outdoor terrain** — that
-observation is correct even though `|nz|` is not the fix. A real fix belongs in the **asset pipeline**.
+observation is correct even though `|nz|` is not the fix. **My inference, not a decided plan:** a real
+fix likely belongs in the **asset pipeline** (`eqoxide_asset_server`, the producer), since the art
+itself is inverted and every downstream consumer inherits it. Nobody has decided this — re-derive it.
 
 6. **Asset bugs — NOT client bugs; do not try to fix them in the client.**
    - **#373** — `nektulos`/`arena` GLBs are **missing their terrain**: 95%/98% of EQEmu-walkable ground
