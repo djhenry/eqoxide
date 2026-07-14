@@ -33,17 +33,9 @@ patterns=(
 # Paths excluded from the scan:
 #   - this script itself (it necessarily contains the patterns it searches for)
 #   - the CI workflow (references the script)
-#
-# TEMPORARY exclusions — remove once the concurrent "remove quest oracle" PR lands:
-#   tools/quest_finder.py and docs/autonomous-play.md still carry the old detail and are being
-#   deleted / scrubbed in that separate PR. They are excluded here only so this guard can be
-#   introduced without blocking on that PR's merge. DELETE these two lines once that PR is on main
-#   (at which point quest_finder.py is gone and autonomous-play.md is clean).
 excludes=(
   ":(exclude)scripts/check-no-local-detail.sh"
-  ":(exclude).github/workflows/*"
-  ":(exclude)tools/quest_finder.py"
-  ":(exclude)docs/autonomous-play.md"
+  ":(exclude).github/workflows/test.yml"
 )
 
 status=0
