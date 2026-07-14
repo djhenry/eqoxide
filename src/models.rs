@@ -9,8 +9,8 @@ use crate::anim::{AnimClip, GroundProbe, JointChannel, JointProperty, SkinData};
 
 /// A head primitive belonging to a Luclin head-region variant. RoF2 swaps the head regions
 /// 1/4/5 (face+scalp, nose bridge, nose tip on humans; layout varies per race) by the spawn's
-/// **face** value — decompiled eqgame `FUN_REDACTED` attr 1 → `FUN_REDACTED`
-/// `"%sHE%02d%d1_MDF"`. Hairstyle is a dead actor-attach path for S3D races (no
+/// **face** value, which selects the head material set. Hairstyle is a dead actor-attach path
+/// for S3D races (no
 /// `*_HEAD_HAIR` actor ships in RoF2), so it selects nothing here. Hair itself is PAINTED
 /// into these textures as a neutral light base, colored at runtime by the `haircolor` tint
 /// table (see [`crate::head::hair_tint`]). The converter splits each region into a facial-skin
@@ -661,7 +661,7 @@ pub fn equip_swap_key(prefix: &str, slot: EquipSlot, material: u32) -> Option<St
 
 /// Velious armor materials (17-23) reuse a classic base-tier texture when a race's Velious art isn't
 /// shipped (e.g. elves have no `elf*23` textures, only human/Iksar do). The original Titanium client
-/// remaps them (observed behavior of the original Titanium `REDACTED-CLIENT`): 17/20/23 → 1 (leather), 18/21 → 2 (chain), 19/22 → 3
+/// remaps them (observed behavior of the original Titanium client): 17/20/23 → 1 (leather), 18/21 → 2 (chain), 19/22 → 3
 /// (plate). Returns the fallback material to try when the raw material's texture is missing, so e.g.
 /// material-23 cloth pants on an elf render as leather-look leggings instead of bare skin. (The
 /// wizard-only 23 → 4 case is omitted.)

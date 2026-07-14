@@ -1,16 +1,15 @@
-//! Hair/beard color tint table — **Luclin-head-only**, kept here as verified ground truth.
+//! Hair/beard color tint table — **Luclin-head-only**.
 //!
-//! IMPORTANT: the real RoF2 client does NOT apply this tint to classic `humhe*` heads (the
-//! models eqoxide currently renders). Per the decompiled client (`FUN_REDACTED` @ VA 0x0040d1a0):
-//! the tint fires only when the Luclin-head flag (`[model+0x34]`) is set AND the race gate
-//! (`FUN_REDACTED`) returns 2 — i.e. only High Elf (5), Dark Elf (6), Half Elf (7) and female
-//! Dwarf. For classic heads, hair color is 100% baked into the 8 `hairstyle` textures
-//! (`humhe00{N}{1|2}`); the `haircolor` wire byte is never read on that path. So this table is
-//! dormant until Luclin head models are implemented — do not apply it to classic heads.
+//! IMPORTANT: the reference RoF2 client does NOT apply this tint to classic `humhe*` heads (the
+//! models eqoxide currently renders). The tint applies only to Luclin head models, and only for
+//! the races that have them — High Elf (5), Dark Elf (6), Half Elf (7) and female Dwarf. For
+//! classic heads, hair color is 100% baked into the 8 `hairstyle` textures (`humhe00{N}{1|2}`);
+//! the `haircolor` wire byte is never read on that path. So this table is dormant until Luclin
+//! head models are implemented — do not apply it to classic heads.
 
-/// Hair & beard color tint table from REDACTED-CLIENT (data @ VA 0x00AC1A70, file off 0x6BFC70;
-/// 24 × DWORD `0x00RRGGBB`). Multiplicative tint (texel × color / 255) on the **Luclin** hair/
-/// beard material, indexed by the `haircolor`/`beardcolor` byte clamped to 0–23 (≥24 → no tint).
+/// Hair & beard color tint table (24 entries, RGB). Multiplicative tint (texel × color / 255) on
+/// the **Luclin** hair/beard material, indexed by the `haircolor`/`beardcolor` byte clamped to
+/// 0–23 (≥24 → no tint).
 const HAIR_TINT: [[u8; 3]; 24] = [
     [46,26,12],[67,41,22],[78,49,35],[127,81,59],[101,11,6],[185,55,20],[215,85,50],
     [139,114,30],[204,179,97],[225,221,108],[251,255,129],[253,250,201],[255,255,255],

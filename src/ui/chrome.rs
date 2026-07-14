@@ -3,8 +3,8 @@
 //! Wraps `egui::Window` (title_bar off) with: a custom RoF2-style title strip
 //! (gradient + gold close box), default placement from the registry anchor,
 //! stored-geometry restore, drag/resize gating by the global lock, native-style
-//! mouse-proximity fading (2 s delay, 0.5 s animation — decompiled
-//! `CXWnd::OnProcessFrame`), a right-click context menu (opacity / fades /
+//! mouse-proximity fading (2 s delay, 0.5 s animation, matching the native
+//! client), a right-click context menu (opacity / fades /
 //! reset / lock), and persisted geometry recording.
 
 use super::persist::Layout;

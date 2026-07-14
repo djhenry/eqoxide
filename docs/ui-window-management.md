@@ -48,7 +48,7 @@ protocol path exists — merchant close, trainer end-training).
 - **Ctrl+L** (or the Selector/Options checkbox) locks all windows: no move, no
   resize, clicks still work.
 - **Fades**: windows the mouse hasn't been over for ~2 s dim to ~40 %
-  opacity and restore on approach (native `CXWnd` behavior). Global toggle in
+  opacity and restore on approach (native window behavior). Global toggle in
   the Selector; per-window opacity in the right-click menu.
 
 ## Scaling
