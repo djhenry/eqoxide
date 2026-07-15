@@ -29,6 +29,7 @@ pub mod logging;
 pub mod models;
 pub mod movement;
 pub mod profiling;
+pub mod traversability;
 pub mod pass;
 pub mod pipeline;
 pub mod renderer;
