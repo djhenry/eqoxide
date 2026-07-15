@@ -20,13 +20,16 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// How often to re-send the bind-respawn request while an explicit respawn is pending (#284/#50).
 const RESPAWN_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
-/// #371 active liveness probe. `connected:true` only proves the SOCKET ACKs; a wedged zone keeps
-/// ACKing while its main loop stops processing, which is indistinguishable from a quiet zone by the
-/// passive clocks. The probe is a self-`OP_Consider`: purely zone-MAIN-LOOP-serviced (the zone
-/// resolves it against its in-process entity list and replies — no WORLD hop, unlike OP_WhoAll),
+/// #371 active liveness probe. `connected:true` only proves the SOCKET ACKs; a zone that is still
+/// ticking but not servicing our packets (a stuck per-client dispatch / script, or a very slow tick)
+/// keeps ACKing while making no application progress for us, which is indistinguishable from a quiet
+/// zone by the passive clocks. The probe is a self-`OP_Consider`: purely zone-MAIN-LOOP-serviced (the
+/// zone resolves it against its in-process entity list and replies — no WORLD hop, unlike OP_WhoAll),
 /// benign (self is not an NPC, so faction is hardcoded 1 with no aggro/faction/hate-list evaluation),
 /// and outside any anti-cheat path (MQGhost keys on movement cadence only). An unanswered probe past
-/// [`crate::http::PROBE_TIMEOUT_SECS`] while the socket still ACKs is the wedged-world signal.
+/// [`crate::http::PROBE_TIMEOUT_SECS`] while the socket still ACKs is the unresponsive-world signal.
+/// (Scope: this catches the still-ticking-but-unresponsive case. A TOTAL zone freeze stops the ACKs
+/// too on this single-threaded-libuv server, so that is already covered by `connected: false`.)
 ///
 /// Only sent once the world has been application-silent this long — during active play spontaneous
 /// packets already prove the world is processing, so the probe adds no load there.
@@ -458,12 +461,13 @@ pub async fn run_gameplay_phase(
         }
 
         // ── Active liveness probe (#371) ─────────────────────────────────────
-        // Poke the zone MAIN LOOP with a cheap self-consider it must service to answer, so a wedged
-        // zone (still ACKing at the socket, but not processing) is distinguishable from a merely
-        // quiet one. The reply is captured above and turned into `world_responsive` at HTTP read
-        // time. Only fires once the world has been application-silent for PROBE_QUIET_THRESHOLD (no
-        // load during active play) and at most once per PROBE_INTERVAL. Gated on being in-zone
-        // (player_id set); a self-consider is benign and non-disruptive (see the const doc).
+        // Poke the zone MAIN LOOP with a cheap self-consider it must service to answer, so a zone
+        // that is still ticking at the socket but not making application progress for us is
+        // distinguishable from a merely quiet one. The reply is captured above and turned into
+        // `world_responsive` at HTTP read time. Only fires once the world has been application-silent
+        // for PROBE_QUIET_THRESHOLD (no load during active play) and at most once per PROBE_INTERVAL.
+        // Gated on being in-zone (player_id set); a self-consider is benign and non-disruptive (see
+        // the const doc, which also bounds what this signal does and does not catch).
         if gs.player_id != 0 {
             let (last_packet_ago, probe_sent_ago) = {
                 let h = net_health.lock().unwrap();
