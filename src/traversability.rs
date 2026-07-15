@@ -193,10 +193,10 @@ pub struct Blockage {
 /// successful query allocates nothing.
 pub type BlockedBy = Blockage;
 
-/// Count of cold-path (`diagnose`) evaluations ON THIS THREAD, for the "zero diagnosis on success"
-/// proof (design §5c). Test-only, and thread-local on purpose: the cargo test harness runs tests in
-/// parallel, and a global counter would let another test's legitimate diagnoses pollute the
-/// zero-on-success assertion.
+// Count of cold-path (`diagnose`) evaluations ON THIS THREAD, for the "zero diagnosis on success"
+// proof (design §5c). Test-only, and thread-local on purpose: the cargo test harness runs tests in
+// parallel, and a global counter would let another test's legitimate diagnoses pollute the
+// zero-on-success assertion.
 #[cfg(test)]
 thread_local! {
     pub(crate) static DIAGNOSE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -236,11 +236,19 @@ pub struct Traversability<'a> {
     /// A floating (swimming) plan is exempt from ground margins outright: a floating character has
     /// no ground under it by definition, so the probe would refuse every cell it must cross.
     pub floating: bool,
+    /// PER-PLAN memo for the ground-margin probe, keyed by (cell-quantized XY, floor bucket) —
+    /// a cell is reached from up to 8 neighbours and the probe costs 4 column queries, so this is
+    /// the same memo A* used to keep locally (it moved here with the predicate). `RefCell`: a
+    /// `Traversability` lives inside one search on one thread.
+    margin_memo: std::cell::RefCell<std::collections::HashMap<(i64, i64, i32), bool>>,
 }
 
 impl<'a> Traversability<'a> {
     pub fn new(col: &'a Collision, radius: f32, cell: f32, ledge_margin: f32, floating: bool) -> Self {
-        Traversability { col, body: &PLAYER_BODY, radius, cell, ledge_margin, floating }
+        Traversability {
+            col, body: &PLAYER_BODY, radius, cell, ledge_margin, floating,
+            margin_memo: std::cell::RefCell::new(std::collections::HashMap::new()),
+        }
     }
 
     // ── HOT: what A* calls, per edge / per waypoint. No Result, no Option, no allocation. ──
@@ -342,12 +350,22 @@ impl<'a> Traversability<'a> {
 
     /// `ledge_margin` of ground all around (a drop, a lip, open water all read as "no ground").
     /// `true` when this plan asked for no margin (the minimum tier / a floating plan).
+    /// Memoised per (plan-cell, floor bucket) for the life of this plan.
     #[inline]
     fn occupy_margin_ok(&self, p: Point) -> bool {
         if self.ledge_margin <= 0.0 || self.floating {
             return true;
         }
-        self.col.ground_margin_ok(p.xy[0], p.xy[1], p.floor_z, self.ledge_margin)
+        let cell = self.cell.max(1.0);
+        let key = ((p.xy[0] / cell).floor() as i64,
+                   (p.xy[1] / cell).floor() as i64,
+                   (p.floor_z / 2.0).round() as i32);
+        if let Some(&ok) = self.margin_memo.borrow().get(&key) {
+            return ok;
+        }
+        let ok = self.col.ground_margin_ok(p.xy[0], p.xy[1], p.floor_z, self.ledge_margin);
+        self.margin_memo.borrow_mut().insert(key, ok);
+        ok
     }
 
     /// Cold-path only: name the ground hazard at a spot with no usable floor — open water reads
@@ -549,6 +567,58 @@ mod tests {
                 "shore refusal names a ground hazard: {e:?}"),
             Ok(()) => panic!("a point with water/void within the preferred margin must be refused"),
         }
+    }
+
+    /// **ROUTE-PARITY PIN (design PR-2's gate).** Re-plumbing the A* edge test / ledge margin /
+    /// waypoint inset through `Traversability` must be BYTE-IDENTICAL re-plumbing: the emitted
+    /// waypoints over these fixtures may not move by a single bit. The hashes below were recorded
+    /// on the pre-façade code (commit "one Body", where routes last legitimately changed); if this
+    /// test goes red, the re-plumbing did something it was not supposed to.
+    ///
+    /// If a LATER change legitimately alters routes (a new probe, a margin change), re-record the
+    /// hashes IN THE SAME COMMIT and say so in its message — this pin is for silent drift, not a
+    /// freeze on tuning.
+    #[test]
+    fn facade_replumbing_is_byte_identical_route_parity() {
+        fn hash_route(h: &mut u64, r: Option<Vec<[f32; 3]>>) {
+            // FNV-1a over the exact f32 bit patterns; Option-ness folded in.
+            const P: u64 = 0x100000001b3;
+            match r {
+                None => { *h ^= 0xdead; *h = h.wrapping_mul(P); }
+                Some(ws) => for w in ws {
+                    for c in w {
+                        *h ^= c.to_bits() as u64;
+                        *h = h.wrapping_mul(P);
+                    }
+                },
+            }
+        }
+        // Fixture A: open plateau with real edges (generous tier's ledge margin is live near them).
+        let plateau = col(vec![floor_at(0.0, -40.0, 40.0, -40.0, 40.0)]);
+        // Fixture B: a 3u-wide corridor (generous pass fails, minimum tier threads it).
+        let corridor = col(vec![
+            floor_at(0.0, -40.0, 40.0, -20.0, 20.0),
+            panel(0.0, -20.0, -1.5, 0.0, 10.0), // wall with a 3u slot at north ∈ (-1.5, 1.5)
+            panel(0.0, 1.5, 20.0, 0.0, 10.0),
+        ]);
+        // Fixture C: a bend — a wall the route must detour around (the inset works its corner).
+        let bend = col(vec![
+            floor_at(0.0, -50.0, 50.0, -100.0, 100.0),
+            panel(0.0, -100.0, 12.0, 0.0, 20.0),
+        ]);
+
+        let mut h: u64 = 0xcbf29ce484222325;
+        for (c, pairs) in [
+            (&plateau, [([-30.0, 0.0, 0.0], [30.0, 0.0, 0.0]), ([-30.0, -35.0, 0.0], [30.0, 35.0, 0.0])]),
+            (&corridor, [([-20.0, 0.0, 0.0], [20.0, 0.0, 0.0]), ([-20.0, -10.0, 0.0], [20.0, 10.0, 0.0])]),
+            (&bend, [([-40.0, 0.0, 0.0], [40.0, 0.0, 0.0]), ([-40.0, -50.0, 0.0], [40.0, 60.0, 0.0])]),
+        ] {
+            for (s, g) in pairs {
+                hash_route(&mut h, c.find_path(s, g, PLAYER_RADIUS, &[], false));
+                hash_route(&mut h, Some(c.find_path_local(s, g, 2.0, 40.0, 4.0).steer().to_vec()));
+            }
+        }
+        assert_eq!(h, 0xb1e7db81be9e74ad_u64, "route parity broken: waypoints moved (new hash {h:#x})");
     }
 
     /// **ZERO DIAGNOSIS ON SUCCESS (design §5c #2).** A successful plan must never pay for a
