@@ -347,10 +347,13 @@ impl CharacterController {
     /// capsule approximation. Grazing cases the thin centre ray slips past are caught next frame by
     /// the depenetration net (§3.3).
     fn slide(&self, from: [f32; 3], delta: [f32; 3], col: &Collision) -> ([f32; 3], bool) {
-        // The contact heights come from the ONE shared body (#386): the chest ray here and the
-        // planner's top edge probe are the same `Body::chest` field, so the planner can never again
-        // clear a band this ray collides with (the drift that wedged the walker under lintels).
-        let probes = crate::traversability::PLAYER_BODY.contact_probes();
+        // The contact heights AND the radius come from the ONE shared body (#386, #378 Phase 2):
+        // the chest ray here and the planner's top edge probe are the same `Body::chest` field, and
+        // the back-off radius is `Body::radius` — the planner can never again clear a band this ray
+        // collides with, nor plan to a clearance this back-off disagrees with.
+        let body = &crate::traversability::PLAYER_BODY;
+        let probes = body.contact_probes();
+        let radius = body.radius;
         let mut pos = from;
         let mut remaining = delta;
         let mut hit_any = false;
@@ -374,7 +377,7 @@ impl CharacterController {
                     // Distance into the plane along the motion (floored so grazing hits don't blow up).
                     let ndot = (-(d_hat[0] * hit.normal[0] + d_hat[1] * hit.normal[1])).max(0.05);
                     let contact = hit.t * len;
-                    let advance = (contact - PLAYER_RADIUS / ndot - SKIN).max(0.0);
+                    let advance = (contact - radius / ndot - SKIN).max(0.0);
                     pos[0] += d_hat[0] * advance;
                     pos[1] += d_hat[1] * advance;
                     // Slide the unused budget along the plane (horizontal; z owned by ground/gravity).
