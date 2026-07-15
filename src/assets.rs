@@ -717,12 +717,6 @@ pub enum PlanOutcome {
 }
 
 impl PlanOutcome {
-    /// A definitive `Unreachable` with NO diagnosis — the convenience constructor for the many call
-    /// sites (and tests) that only have the `reason`. The cold diagnosis is attached separately by
-    /// `find_path_ex`, the one place with the geometry to compute it.
-    pub fn unreachable(reason: NoRoute) -> Self {
-        PlanOutcome::Unreachable { reason, goal_blocked_by: None, frontier_blocked_by: None }
-    }
     /// The COMPLETE route, if this outcome is one. A partial route is deliberately NOT returned
     /// here: treating it as a plan is exactly the #337 lie.
     pub fn route(&self) -> Option<&Vec<[f32; 3]>> {
@@ -1759,8 +1753,8 @@ impl Collision {
     }
 
     /// A* over the collision grid: a walkable waypoint path from `start` to `goal` that routes
-    /// AROUND walls (slide_move only slides along one). Returns cell-center waypoints
-    /// `[east, north]` (start-exclusive, goal-inclusive) or None if no geometry / no route.
+    /// AROUND walls (a plain collide-and-slide toward the goal only slides along one). Returns
+    /// cell-center waypoints `[east, north]` (start-exclusive, goal-inclusive) or None if no geometry / no route.
     /// Walkability = a floor exists under the cell; an edge needs a small floor-height step and
     /// a clear chest-height segment between cell centers.
     /// `avoid` is a set of XY points (nearby NPC positions) the route should skirt — see the
@@ -1903,6 +1897,9 @@ impl Collision {
     {
         use crate::traversability::{Blockage, HazardKind, Point, Traversability, Tier};
         let r = radius.max(Tier::Minimum.units());
+        // DRY-PLAN diagnosis: `floating: false`. A water-START failed plan could read inconsistently
+        // here, but planner water nav is an unimplemented gap (#359/#197/#423) and out of scope — the
+        // diagnosis is only ever consulted for dry plans until that lands.
         let trav = Traversability::new(self, r, cell, 0.0, false);
 
         // GOAL: definitive. A floor anywhere in the column, then the occupancy test; else off-mesh.

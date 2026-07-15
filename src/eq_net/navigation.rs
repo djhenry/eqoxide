@@ -1498,11 +1498,17 @@ impl Navigator {
         if s.state != state || s.reason != reason {
             s.state = state.to_string();
             s.reason = reason;
-            // A state transition retires the previous terminal's blockage (#378 Phase 2): the
-            // `nav_blocked_by` payload belongs to ONE `no_path`, and leaving it set across a fresh
-            // `navigating` would be a stale lie. `stop_nav_blocked` re-sets it immediately after.
+            // A state transition retires the previous route's per-instance facts (#378 Phase 2,
+            // #343 discipline): the `nav_blocked_by` payload belongs to ONE `no_path`, and `nav_tier`
+            // belongs to ONE committed route. Leaving either set across a transition — e.g. a
+            // "preferred" tier from an ARRIVED journey A surviving into journey B's `no_path`, or an
+            // Exhausted `navigating_partial` reading a stale tier — is exactly the `connected:true`
+            // stale-field lie. Cleared here on EVERY transition; the Route arm of `apply_plan`
+            // re-sets `tier` immediately after (it writes it AFTER this call), and `stop_nav_blocked`
+            // re-sets the blockage immediately after, so a genuinely-current fact is never lost.
             s.blocked_goal = None;
             s.blocked_frontier = None;
+            s.tier = None;
         }
     }
 
@@ -3936,6 +3942,72 @@ mod tests {
         let st = nav.nav_state.lock().unwrap().clone();
         assert_eq!(st.reason, None, "a goal that was honoured as given carries no snap reason");
         assert!(!nav.goal_snapped);
+    }
+
+    /// **`nav_tier` IS PER-ROUTE AND MUST NOT GO STALE (#378 Phase 2, #343 discipline).** The tier is
+    /// the fact for the route being walked RIGHT NOW; it must never survive into a state whose route
+    /// it does not describe. Repro the review's finding: journey A commits a `preferred` route →
+    /// journey B is unreachable → the `no_path` state must NOT still read `preferred` from A. Also
+    /// pins that an ARRIVED and an Exhausted `navigating_partial` state carry no stale tier.
+    #[test]
+    fn nav_tier_does_not_survive_into_a_later_no_path_or_arrived() {
+        use crate::assets::{NoRoute, PlanLimit, PlanOutcome};
+        use crate::eq_net::nav_planner::PlanReply;
+        let group: crate::http::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::http::GroupSnapshot::default()));
+        let mut nav = test_navigator(group);
+        let mut gs = GameState::new();
+        let goal = (100.0f32, 100.0f32, 0.0f32);
+
+        // Journey A: a committed route at the roomy tier → nav_tier = "preferred".
+        nav.apply_plan(PlanReply {
+            gen: 1,
+            outcome: PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]]),
+            plan_ms: 5, goal_snapped_z: None, tight: false,
+        }, &mut gs, goal);
+        assert_eq!(nav.nav_state.lock().unwrap().tier, Some("preferred"),
+            "a committed preferred route publishes nav_tier = preferred");
+
+        // Journey B: a definitively unreachable goal → no_path. The tier from A must be GONE.
+        nav.apply_plan(PlanReply {
+            gen: 2,
+            outcome: PlanOutcome::Unreachable {
+                reason: NoRoute::SearchClosed, goal_blocked_by: None, frontier_blocked_by: None },
+            plan_ms: 5, goal_snapped_z: None, tight: false,
+        }, &mut gs, goal);
+        let st = nav.nav_state.lock().unwrap().clone();
+        assert_eq!(st.state, "no_path");
+        assert_eq!(st.tier, None,
+            "nav_tier must NOT survive from journey A into journey B's no_path (the #343 stale-field lie)");
+
+        // A fresh minimum-tier route, then an Exhausted partial: the partial is not a confirmed route,
+        // so it must carry no tier either.
+        nav.apply_plan(PlanReply {
+            gen: 3,
+            outcome: PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [50.0, 50.0, 0.0]]),
+            plan_ms: 5, goal_snapped_z: None, tight: true,
+        }, &mut gs, goal);
+        assert_eq!(nav.nav_state.lock().unwrap().tier, Some("minimum"));
+        nav.apply_plan(PlanReply {
+            gen: 4,
+            outcome: PlanOutcome::Exhausted {
+                limit: PlanLimit::NodeCap,
+                progress: Some(vec![[0.0, 0.0, 0.0], [60.0, 60.0, 0.0], [90.0, 90.0, 0.0]]) },
+            plan_ms: 5, goal_snapped_z: None, tight: false,
+        }, &mut gs, goal);
+        let st = nav.nav_state.lock().unwrap().clone();
+        assert_eq!(st.state, "navigating_partial");
+        assert_eq!(st.tier, None, "an Exhausted partial walk is not a confirmed route — it carries no tier");
+
+        // And an arrived state (reached via set_nav_state) after a committed route carries no stale tier.
+        nav.apply_plan(PlanReply {
+            gen: 5,
+            outcome: PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]]),
+            plan_ms: 5, goal_snapped_z: None, tight: false,
+        }, &mut gs, goal);
+        assert_eq!(nav.nav_state.lock().unwrap().tier, Some("preferred"));
+        nav.set_nav_state("arrived");
+        assert_eq!(nav.nav_state.lock().unwrap().tier, None,
+            "arrival ends the route — its tier must not linger");
     }
 
     /// A goal that has not meaningfully moved must not re-plan at all (the cheap half of B1).

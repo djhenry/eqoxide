@@ -79,8 +79,10 @@ geometry is loaded.
 ### `find_path(start, goal, radius) → Option<Vec<[east, north]>>`
 
 **Grid A\*** over the collision cells — routes *around* walls and returns cell-center waypoints
-(goal-inclusive), or `None` if no route / no geometry. This is what `/v1/move/goto` uses (it walks the
-waypoints; `slide_move` only does the per-step move). Added 2026-06-21.
+(goal-inclusive), or `None` if no route / no geometry. This is what `/v1/move/goto` uses: it walks the
+waypoints by emitting a `MoveIntent` toward the next carrot, and the ONE collide-and-slide mover
+(`CharacterController::slide`, movement.rs) resolves each frame's motion against geometry. Added
+2026-06-21.
 
 - Walkable = a floor exists under the cell; an edge needs a small floor-height step (`STEP_H=20`)
   and a clear chest-height `path_clear` between cell centers.
@@ -116,12 +118,14 @@ don't block the move.
 
 ## Navigation Collision (navigation.rs)
 
-`/v1/move/goto` first computes an A\* route via `find_path` (above) when the goal changes, then walks the
-waypoints. `slide_move()` implements the same three-attempt slide logic for each step (and for the
-combat auto-engage approach). It returns `None` only when fully boxed in (logs "Path blocked by a
-wall" and clears the goto). Because `find_path` routes around walls, the per-step slide rarely boxes
-in now — but the combat auto-engage still uses bare `slide_move`, so it only reaches mobs on a clear
-straight path (see `autonomous-play.md` §2/§5).
+`/v1/move/goto` first computes an A\* route via `find_path` (above) when the goal changes, then walks
+the waypoints by emitting a `MoveIntent` toward the current carrot each tick. There is now a **single
+collide-and-slide model** — `CharacterController::slide` (movement.rs) — shared by nav-driven movement,
+free WASD, and the combat auto-engage approach; the walker never resolves collision itself. Its contact
+ray heights come from `traversability::PLAYER_BODY` (the same body the planner probes with, #378/#386).
+The old `navigation::slide_move` (a second, divergent three-attempt slide with its own `z+3` chest ray)
+was **deleted** in the #378 Phase 2 refactor — it had zero production callers; a second slide model that
+nothing calls is exactly the planner/walker drift the refactor exists to prevent.
 
 ---
 
