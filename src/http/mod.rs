@@ -161,13 +161,27 @@ pub struct NetHealth {
     pub last_packet:   std::time::Instant,
     /// Last network-thread gameplay tick → client liveness (is our own publisher still running?).
     pub last_tick:     std::time::Instant,
-    /// When the network thread last sent an active liveness probe (#371). `None` until the first
-    /// probe fires (e.g. before we are fully in-zone) — in which case there is simply no probe
-    /// verdict yet and `world_responsive` defers to the passive signals.
+    /// When the network thread MOST RECENTLY (re)sent an active liveness probe (#371). Bumped on
+    /// every 30s resend while a probe stays unanswered — this is a scheduling clock only. Do NOT feed
+    /// this into `world_responsive`'s timeout check: resending an already-unanswered probe must not
+    /// look like a *fresh* one, or a permanently wedged zone would flicker back to "responsive" every
+    /// time the resend fires (the exact bug this comment is warning against — see
+    /// `first_unanswered_probe_sent` below, which is what `world_responsive` actually reads).
+    /// `None` until the first probe fires (e.g. before we are fully in-zone) — in which case there is
+    /// simply no probe verdict yet and `world_responsive` defers to the passive signals.
     pub last_probe_sent:  Option<std::time::Instant>,
     /// When we last saw the probe's reply come back from the zone (#371). Compared against
-    /// `last_probe_sent` to tell an answered probe from an outstanding one.
+    /// `first_unanswered_probe_sent` to tell an answered probe from an outstanding one.
     pub last_probe_reply: Option<std::time::Instant>,
+    /// When the CURRENT unanswered-probe streak began (#371 wedge-flicker fix). Set the first time a
+    /// probe is sent while none is already outstanding; deliberately left UNCHANGED by later resends
+    /// of that same still-unanswered probe, so a zone that never answers cannot "earn" a fresh 10s
+    /// in-flight grace window every time we poke it again. Reset to `None` the moment a genuine reply
+    /// (or any spontaneous app packet — see `probe_outstanding`'s caller) proves the world is alive,
+    /// and on zone-change (`reset_probe_clocks`). This — not `last_probe_sent` — is what
+    /// `world_responsive` measures its timeout against, so once a wedge verdict is reached it stays
+    /// `false` until a genuine reply, no matter how many resends happen in between.
+    pub first_unanswered_probe_sent: Option<std::time::Instant>,
 }
 
 impl Default for NetHealth {
@@ -176,6 +190,7 @@ impl Default for NetHealth {
         NetHealth {
             last_datagram: now, last_packet: now, last_tick: now,
             last_probe_sent: None, last_probe_reply: None,
+            first_unanswered_probe_sent: None,
         }
     }
 }
@@ -194,20 +209,29 @@ pub const PROBE_TIMEOUT_SECS: u64 = 10;
 /// - **No probe sent yet** → `true`. We are not asserting a probe result we do not have; the
 ///   passive signals (`connected` / `last_packet_age_ms`) stand until the first probe fires.
 /// - **Answered** → `true`. "Answered" = proof the zone processed something at or after we sent the
-///   probe: its own reply (`probe_reply_ago <= probe_sent_ago`) OR *any* spontaneous application
-///   packet since (`last_packet_ago <= probe_sent_ago`). The second clause is belt-and-suspenders:
-///   a busy zone is obviously alive even if a single probe reply was dropped, and it is exactly what
-///   keeps a legitimately-quiet-but-answering idle session from ever false-alarming.
-/// - **Outstanding but not yet overdue** (`probe_sent_ago < timeout`) → `true`. Still in flight;
-///   never mistake normal latency for a wedge.
+///   probe: its own reply (`probe_reply_ago <= first_unanswered_sent_ago`) OR *any* spontaneous
+///   application packet since (`last_packet_ago <= first_unanswered_sent_ago`). The second clause is
+///   belt-and-suspenders: a busy zone is obviously alive even if a single probe reply was dropped,
+///   and it is exactly what keeps a legitimately-quiet-but-answering idle session from ever
+///   false-alarming.
+/// - **Outstanding but not yet overdue** (`first_unanswered_sent_ago < timeout`) → `true`. Still in
+///   flight; never mistake normal latency for a wedge.
 /// - **Outstanding AND overdue** → `false`. The wedged-world signal — the whole point of #371.
+///
+/// CALLER CONTRACT (#371 wedge-flicker fix): `first_unanswered_sent_ago` MUST be the age of the
+/// FIRST send of the current unanswered probe streak, not the most recent resend. `gameplay.rs`
+/// resends an unanswered probe every `PROBE_INTERVAL` (30s) purely to keep detecting recovery; if
+/// this function were fed the age of that most-recent resend instead, a permanently wedged zone
+/// would re-enter the "still in flight" branch every 30s and flicker back to `true` forever even
+/// though it never actually answers. `NetHealth::first_unanswered_probe_sent` is the clock that
+/// holds still across resends and only clears on a genuine reply or a zone change — feed that one.
 pub fn world_responsive(
-    probe_sent_ago:  Option<std::time::Duration>,
-    probe_reply_ago: Option<std::time::Duration>,
-    last_packet_ago: std::time::Duration,
-    timeout:         std::time::Duration,
+    first_unanswered_sent_ago: Option<std::time::Duration>,
+    probe_reply_ago:           Option<std::time::Duration>,
+    last_packet_ago:           std::time::Duration,
+    timeout:                   std::time::Duration,
 ) -> bool {
-    match probe_sent_ago {
+    match first_unanswered_sent_ago {
         None => true,
         Some(sent_ago) => {
             let answered = probe_reply_ago.is_some_and(|r| r <= sent_ago)
@@ -985,7 +1009,10 @@ impl HttpState {
         let last_packet_ago = h.last_packet.elapsed();
         // #371: the active-probe verdict, all measured at read time (like every other health field,
         // per #343 — never cached, so no live publisher has to run for the answer to stay honest).
-        let probe_sent_ago  = h.last_probe_sent.map(|t| t.elapsed());
+        // NOTE: the timeout check is measured against `first_unanswered_probe_sent`, NOT
+        // `last_probe_sent` — the latter is bumped by every 30s resend and would let a permanently
+        // wedged zone re-earn the 10s in-flight grace window forever (the #371-followup bug).
+        let probe_sent_ago  = h.first_unanswered_probe_sent.map(|t| t.elapsed());
         let probe_reply_ago = h.last_probe_reply.map(|t| t.elapsed());
         let world_responsive = world_responsive(
             probe_sent_ago, probe_reply_ago, last_packet_ago,
