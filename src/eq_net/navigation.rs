@@ -564,6 +564,15 @@ const NAV_LOCAL_STUCK_TICKS: u32 = 3;
 /// the coarse planner every tick (~1 s). The existing stall/back-off recovery still handles a genuine
 /// wedge the fresh coarse plan can't route around.
 const REPLAN_COOLDOWN_TICKS: u32 = 6;
+/// How many PROACTIVE coarse re-plans (#246) may fire at ONE spot — without the journey getting
+/// meaningfully closer to the goal — before the walker stops honestly (#378 Phase 2). Each proactive
+/// re-plan reinstalls a fresh coarse route and so resets the stall clock, which is why the ~3 s
+/// `NAV_STUCK_TICKS` give-up never trips at a fine-impassable spot and the walker oscillated
+/// `navigating` forever (the live qcat L-corner). At ~(NAV_LOCAL_STUCK_TICKS + REPLAN_COOLDOWN_TICKS)
+/// ≈ 9 ticks per proactive re-plan, 8 of them is ~11 s of trying to detour before the honest
+/// `blocked / local_no_way_through`. Resets on real goal-ward progress (like `nav_repaths`), so a
+/// long multi-corner journey that keeps progressing never trips it.
+const PROACTIVE_REPLAN_CAP: u32 = 8;
 /// After auto-escaping a sealed interior through an in-zone teleport (#266), block another escape for
 /// this long (~10 s at 150 ms/tick) so a goal that's STILL unreachable after the teleport can't
 /// ping-pong the char back and forth through the portal. One escape attempt, then it walks/stalls.
@@ -972,6 +981,15 @@ pub struct Navigator {
     local_stuck_ticks: u32,
     replan_coarse:     bool,
     replan_cooldown:   u32,
+    /// How many PROACTIVE coarse re-plans (#246) have fired since the journey last made real
+    /// progress. This is the oscillation guard (#378 Phase 2). Each proactive re-plan installs a
+    /// fresh coarse route, which `apply_plan` resets `path_i`/`stuck_i` for — so the stall clock
+    /// (`stuck_ticks`) never accumulates its 20-tick give-up and `nav_repaths` (bumped only by the
+    /// stall path) never climbs. Without a counter of its OWN, a spot the fine tier cannot thread
+    /// but the coarse tier keeps "re-routing" around loops `navigating` FOREVER — the live qcat
+    /// L-corner. Capped at [`PROACTIVE_REPLAN_CAP`]; reset on real goal-ward progress (like
+    /// `nav_repaths`). At the cap the walker stops honestly with `blocked / local_no_way_through`.
+    proactive_replans: u32,
     /// Auto-escape a SEALED interior via an in-zone teleport (#266). When a /goto goal is walk-
     /// unreachable and the nearest zone-line region is a translocator that loops back to THIS zone (the
     /// Qeynos guild-vault waterfall), the goto is temporarily redirected to that region — the char
@@ -1166,6 +1184,7 @@ impl Navigator {
             stuck_ticks: 0,
             stuck_i: 0,
             nav_repaths: 0,
+            proactive_replans: 0,
             nav_best_gdist: f32::MAX,
             backoff_ticks: 0,
             local_stuck_ticks: 0,
@@ -1394,6 +1413,7 @@ impl Navigator {
             self.stuck_best = f32::MAX;
             self.stuck_ticks = 0;
             self.nav_repaths = 0;
+            self.proactive_replans = 0;
             self.nav_best_gdist = f32::MAX;
             self.backoff_ticks = 0;
             self.local_stuck_ticks = 0;
@@ -1556,8 +1576,13 @@ impl Navigator {
             self.local_stuck_ticks += 1;
             if self.local_stuck_ticks >= NAV_LOCAL_STUCK_TICKS {
                 self.replan_coarse = true;
+                // Count each armed proactive re-plan toward the oscillation budget (#378 Phase 2).
+                // `tick` resets this on real progress and terminates honestly at the cap, so a spot
+                // the fine tier cannot thread can no longer loop `navigating` forever (qcat L-corner).
+                self.proactive_replans += 1;
                 tracing::debug!("NAV: fine plan CLOSED its window short of the carrot near ({:.0},{:.0}) \
-                    ({}) — re-planning coarse (#246)", reply.start[0], reply.start[1], outcome.reason());
+                    ({}) — re-planning coarse (#246, proactive #{})", reply.start[0], reply.start[1],
+                    outcome.reason(), self.proactive_replans);
             }
         } else if outcome.threaded() {
             self.local_stuck_ticks = 0;
@@ -2772,6 +2797,7 @@ impl Navigator {
             self.stuck_best = f32::MAX;
             self.stuck_ticks = 0;
             self.nav_repaths = 0;
+            self.proactive_replans = 0; // a new destination: the old spot's proactive budget is moot
             self.nav_best_gdist = f32::MAX;
             self.replan_cooldown = 0;
             self.replan_coarse = false;
@@ -3082,6 +3108,31 @@ impl Navigator {
         if gdist < self.nav_best_gdist - REPATH_RESET_DIST {
             self.nav_best_gdist = gdist;
             self.nav_repaths = 0;
+            // The fine-impassable spot is behind us — the journey is progressing, so forgive the
+            // proactive re-plans spent getting past it (#378 Phase 2). This is what keeps the guard
+            // below from ever tripping on a long multi-corner journey that is otherwise fine.
+            self.proactive_replans = 0;
+        }
+
+        // OSCILLATION GUARD (#378 Phase 2 — the live qcat L-corner honesty fix). The proactive coarse
+        // re-plan (#246) re-routes around a spot the fine 2u tier cannot thread, and each fresh route
+        // resets the stall clock — so `stuck_ticks` never reaches its 20-tick give-up and the walker
+        // oscillated `navigating` FOREVER on a corner it could not round toward an around-the-corner
+        // goal. If the proactive re-plan has fired PROACTIVE_REPLAN_CAP times without the journey
+        // getting meaningfully closer (the reset above), the re-routing is not helping: this is a
+        // genuine wedge, and the honest answer is `blocked / local_no_way_through` — NOT a silent loop,
+        // and NOT `no_path` (a coarse route to the goal does exist; the walker cannot physically follow
+        // it here). `Exhausted`-style "I don't know" is untouched — this fires only on a real,
+        // repeatedly-confirmed local dead-end.
+        if self.proactive_replans >= PROACTIVE_REPLAN_CAP {
+            self.stop_nav(gs, "blocked", "local_no_way_through", &format!(
+                "Wedged near ({:.1},{:.1}) after {} proactive coarse re-plans that did not get the \
+                 journey past this spot: the fine 2u planner cannot thread the committed route here, \
+                 and re-routing keeps returning to the same impasse. The corridor is not traversable at \
+                 the character's collision radius from this approach — a coarse route to the goal exists, \
+                 but the walker cannot follow it around this corner. Approach from another direction.",
+                gs.player_x, gs.player_y, self.proactive_replans));
+            return;
         }
 
         // Active downhill back-off (eqoxide#212): after a hard stall we drive the REVERSE aim for a
@@ -4132,11 +4183,52 @@ mod tests {
         assert_eq!(nav.local_i, 0, "local_i must reset with local_path on zone change");
         assert_eq!(nav.stuck_ticks, 0);
         assert_eq!(nav.nav_repaths, 0);
+        assert_eq!(nav.proactive_replans, 0, "the oscillation budget must reset on zone change");
         assert_eq!(nav.backoff_ticks, 0);
         assert!(!nav.replan_coarse);
         assert!(nav.falling.is_none());
         assert_eq!(*nav.nav_state.lock().unwrap(), "idle");
         assert_eq!(nav.current_zone, "crushbone");
+    }
+
+    /// **THE OSCILLATION GUARD counts proactive re-plans (#378 Phase 2).** A repeatedly-`NoWayThrough`
+    /// fine tier must ARM the proactive coarse re-plan AND bump the oscillation budget, so a spot the
+    /// fine tier cannot thread cannot loop `navigating` forever (the live qcat L-corner). A `Threaded`
+    /// fine plan resets the local-stuck run (the wedge is over) but does NOT retroactively forgive the
+    /// budget — only real journey progress (in `tick`) does that.
+    #[test]
+    fn proactive_replan_arms_and_counts_toward_the_oscillation_budget() {
+        use crate::assets::{LocalOutcome, NoRoute};
+        let group: crate::http::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::http::GroupSnapshot::default()));
+        let mut nav = test_navigator(group);
+
+        let nwt = |start: [f32; 3]| crate::eq_net::nav_planner::LocalReply {
+            gen: 1, start, goal: [start[0] + 40.0, start[1], start[2]],
+            outcome: LocalOutcome::NoWayThrough { steer: vec![start], why: NoRoute::SearchClosed },
+            plan_us: 100,
+        };
+        // Healthy walker, cooldown clear: NAV_LOCAL_STUCK_TICKS consecutive NoWayThrough plans arm the
+        // proactive re-plan on the LAST one, and that arming bumps the oscillation budget exactly once.
+        nav.backoff_ticks = 0;
+        nav.stuck_ticks = 0;
+        nav.replan_cooldown = 0;
+        for _ in 0..NAV_LOCAL_STUCK_TICKS {
+            nav.apply_local_plan(nwt([0.0, 0.0, 0.0]));
+        }
+        assert!(nav.replan_coarse, "NoWayThrough × NAV_LOCAL_STUCK_TICKS must arm the proactive re-plan");
+        assert_eq!(nav.proactive_replans, 1, "arming the proactive re-plan bumps the oscillation budget");
+
+        // A Threaded plan ends the local-stuck run but must not forgive the budget (only tick's
+        // progress reset does): the fine tier finding one way through does not prove the wedge gone.
+        nav.apply_local_plan(crate::eq_net::nav_planner::LocalReply {
+            gen: 2, start: [0.0, 0.0, 0.0], goal: [40.0, 0.0, 0.0],
+            outcome: LocalOutcome::Threaded(vec![[0.0, 0.0, 0.0], [40.0, 0.0, 0.0]]), plan_us: 100,
+        });
+        assert_eq!(nav.local_stuck_ticks, 0, "a threaded fine plan resets the local-stuck run");
+        assert_eq!(nav.proactive_replans, 1, "a threaded fine plan must not forgive the oscillation budget");
+
+        // The cap is a real, small bound — the guard is not a no-op.
+        assert!(PROACTIVE_REPLAN_CAP > 0 && PROACTIVE_REPLAN_CAP <= 16);
     }
 
     #[test]
