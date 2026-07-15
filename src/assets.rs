@@ -865,6 +865,10 @@ pub struct Collision {
     /// the water map at `set_water` (zone load). Lets `find_zone_line_near` be an O(1) cache read on
     /// the network thread instead of an exhaustive scan that linkdead-ed the client (#204).
     zone_line_regions: Vec<(i32, [f32; 3])>,
+    /// The zone-lifetime static clearance field (#378 / design §3d, the `MemoField`): graded
+    /// wall/ground distances per (2 u cell, floor bucket), computed on demand and cached until the
+    /// zone (and this struct) is dropped. See `traversability::ClearanceField`.
+    clearance: crate::traversability::ClearanceField,
 }
 
 /// The clearance a route is planned at BY DEFAULT — deliberately larger than the character.
@@ -1026,6 +1030,7 @@ impl Collision {
         if tris.is_empty() || min[0] == f32::MAX {
             return Collision { tris, tri_nz, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0,
                 z_min: 0.0, z_max: 0.0, facing_blind_hits: Default::default(), tight_plans: Default::default(),
+                clearance: Default::default(),
                 water: None, from_collision_mesh, zone_line_regions: Vec::new() };
         }
         let cols = (((max[0] - min[0]) / cell_size).ceil() as usize + 1).max(1);
@@ -1048,7 +1053,8 @@ impl Collision {
             }
         }
         Collision { tris, tri_nz, cells, origin: min, cell_size, cols, rows, z_min, z_max,
-            facing_blind_hits: Default::default(), tight_plans: Default::default(), water: None, from_collision_mesh, zone_line_regions: Vec::new() }
+            facing_blind_hits: Default::default(), tight_plans: Default::default(), water: None, from_collision_mesh, zone_line_regions: Vec::new(),
+            clearance: Default::default() }
     }
 
     /// How many times the floor-normal filter's empty-column fallback has fired since zone load, i.e.
@@ -1665,12 +1671,38 @@ impl Collision {
     /// waypoint inset's `edge_ok`, so the search and the inset agree about what an "edge" is) and
     /// requires ground within a tight vertical band of `z` at each. A drop below, a wall lip above,
     /// and open water all read as "no ground" and so as an edge to keep away from.
+    ///
+    /// NOTE (#378 phase 1): production planning now uses the GRADED, zone-lifetime form of this
+    /// predicate — [`Collision::ground_clearance`] via the clearance field — same probe band, same
+    /// axial directions, but a distance instead of a boolean and memoised across plans. This exact-
+    /// point boolean remains as the diagnostic/test primitive the graded form is validated against.
     pub fn ground_margin_ok(&self, east: f32, north: f32, z: f32, clearance: f32) -> bool {
         if clearance <= 0.0 { return true; }
         [(clearance, 0.0), (-clearance, 0.0), (0.0, clearance), (0.0, -clearance)]
             .iter()
             .all(|&(dx, dy)| self.nearest_floor(east + dx, north + dy, z, 3.0, 8.0)
                 .is_some_and(|f| (f - z).abs() <= 8.0))
+    }
+
+    /// Graded RADIAL wall clearance at a standing point, from the zone-lifetime clearance field
+    /// (#378/#381): distance to the nearest solid geometry at the body's probe heights, in any
+    /// direction. Unlike `path_clear`'s travel-parallel feelers, a radial spoke crosses a wall the
+    /// route merely runs alongside. Memoised per (2 u cell, floor bucket); deterministic
+    /// (computed at the key centre, never the query point).
+    pub fn wall_clearance(&self, east: f32, north: f32, floor_z: f32) -> f32 {
+        self.clearance.wall_at(self, east, north, floor_z)
+    }
+
+    /// Graded ground (ledge) clearance at a standing point, from the zone-lifetime clearance
+    /// field: distance to the nearest direction where the floor runs out (drop / lip / waterline).
+    /// The graded form of `ground_margin_ok`, same probe band, memoised for the zone's lifetime.
+    pub fn ground_clearance(&self, east: f32, north: f32, floor_z: f32) -> f32 {
+        self.clearance.ground_at(self, east, north, floor_z)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clearance_field_for_test(&self) -> &crate::traversability::ClearanceField {
+        &self.clearance
     }
 
     /// ALL distinct walkable surface heights at `(east, north)` within `[ref_z - down, ref_z + up]`,
@@ -2282,6 +2314,24 @@ impl Collision {
             }
             worst
         };
+        // WALL-HUG COST (#381, via the zone-lifetime clearance field). `path_clear`'s feelers run
+        // parallel to travel, so an edge that RUNS ALONGSIDE a wall — never crossing it — reads
+        // clear at every feeler; the emitted lane then hugs the wall and the walker presses into it
+        // (the qcat hallway symptom). The field's RADIAL wall distance sees exactly that wall, and
+        // it enters here as a COST, never a filter: a lane inside the preferred clearance pays up
+        // to one extra cell-length per step, so A* swings to the corridor middle whenever a freer
+        // lane exists and still threads the tight lane when nothing else does (a cost can never
+        // become no_route — the §9 non-negotiable, same contract as `aggro_cost`).
+        //
+        // FINE TIER ONLY (`cell <= SWEPT_EDGE_MAX_CELL`): the fine lane is the one the walker
+        // actually steers along. The coarse 8 u tier stays a pure optimistic corridor SELECTOR —
+        // its centres sit near walls in every city corridor as a matter of geometry, and biasing it
+        // buys no walkability (the walker never walks the coarse line) at real routing drift.
+        let hug_cost = |x: f32, y: f32, fz: f32| -> f32 {
+            if cell > SWEPT_EDGE_MAX_CELL { return 0.0; }
+            let w = self.wall_clearance(x, y, fz);
+            if w >= NAV_PREFERRED_CLEARANCE { 0.0 } else { cell * (1.0 - w / NAV_PREFERRED_CLEARANCE) }
+        };
         // MULTI-FLOOR A*: the node is (cell, floor), not just cell — so a single cell can be visited
         // at several heights (a ramp or lower floor sitting UNDER an upper ledge). Single-floor A*
         // snapped every cell to the surface nearest the current z and could never step down onto a
@@ -2408,7 +2458,7 @@ impl Collision {
                         crate::traversability::Point::new([a[0], a[1]], cz),
                         crate::traversability::Point::new([b[0], b[1]], nf)) { continue; }
                     let step = (((dc * dc + dr * dr) as f32).sqrt()) * cell + (nf - cz).abs() * 0.5
-                        + aggro_cost(b[0], b[1]);
+                        + aggro_cost(b[0], b[1]) + hug_cost(b[0], b[1], nf);
                     let tentative = g_cur + step;
                     if tentative < *g_score.get(&nkey).unwrap_or(&f32::MAX) {
                         g_score.insert(nkey, tentative);

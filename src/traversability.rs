@@ -114,10 +114,13 @@ impl Body {
 /// tier — it is a lie. There is deliberately no float constructor here and no third variant:
 /// a sub-radius plan is not expressible.
 ///
-/// (The legacy `find_path*` plumbing still carries `radius: f32` for its external callers; it is
-/// clamped to `Tier::Minimum.units()` at the ladder — `search_tiered` — which is built from
-/// [`Tier::LADDER`]. Migrating those signatures to `Tier` outright is deliberately deferred; the
-/// clamp plus this ladder keeps #310 unrepresentable at the only place a tier is chosen.)
+/// (Honest scope note: the legacy `find_path*` plumbing still carries `radius: f32` for its
+/// external callers, and `search_tiered` still derives its two rungs as
+/// `radius.max(PLAYER_RADIUS)` / `.max(NAV_PREFERRED_CLEARANCE)` — those rungs are exactly
+/// [`Tier::Minimum`]/[`Tier::Preferred`]'s units (`tier_ladder_floors_at_player_radius` pins the
+/// equality), but the signatures have NOT been migrated to take `Tier`; that is deferred to the
+/// controller-wiring phase. Until then this enum is the named truth the f32 plumbing is clamped
+/// against, not yet the type it carries.)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tier {
     /// `NAV_PREFERRED_CLEARANCE` (2 × `PLAYER_RADIUS`): one radius to fit, one radius of standing
@@ -193,6 +196,136 @@ pub struct Blockage {
 /// successful query allocates nothing.
 pub type BlockedBy = Blockage;
 
+// ─────────────────────────── the static clearance field (design §3) ───────────────────────────
+
+/// Memo-key lattice: clearances are computed at the centres of a fixed 2 u XY grid (the fine
+/// tier's cell) with 2 u floor buckets (A*'s own `qf` quantum). A query is answered for the key
+/// cell its point falls in.
+const FIELD_CELL: f32 = 2.0;
+/// Storage quantum for the u8-packed distances (units per count). Saturates at 63.75 u.
+const FIELD_QUANTUM: f32 = 0.25;
+/// How far the WALL spokes look. Everything at/above this reads as "roomy": the largest wall
+/// threshold anywhere is `Tier::Preferred` (2.0), and the hug cost fades out there too, so a
+/// 4 u horizon leaves headroom without paying for long rays.
+const WALL_CAP: f32 = 4.0;
+/// How far the GROUND probe looks. The largest ground (ledge) margin is `Tier::Preferred` (2.0).
+const GROUND_CAP: f32 = 2.0;
+/// Ground probe radii, ascending. The 0.5 rung exists so a lip RIGHT at a waypoint reads as ~0.
+const GROUND_RADII: [f32; 4] = [0.5, 1.0, 1.5, 2.0];
+/// Bound on each memo map (~24 B/entry ⇒ tens of MB worst case, cleared with the zone). At
+/// capacity the field keeps ANSWERING correctly — it just recomputes instead of inserting — so the
+/// bound degrades speed, never truth, and never unboundedly grows in a huge zone (gfaydark is
+/// 5.9 M columns at 2 u; only VISITED cells ever memoise, but a long session visits a lot).
+const FIELD_MAX_ENTRIES: usize = 1 << 20;
+
+/// **The static clearance field (`MemoField`, design §3d): for a standing point, the horizontal
+/// distance to the nearest thing you cannot be at.** Two graded distances, not booleans:
+///
+/// * `wall_at` — distance to the nearest SOLID geometry at the body's probe heights, measured
+///   RADIALLY (16 spokes). This is what closes #381's structural hole: `path_clear`'s feelers run
+///   parallel to travel and can never see a wall the segment runs alongside; a radial spoke
+///   crosses it. Used as a hot COST (the hug penalty — never a hard filter below
+///   `Tier::Preferred`, per the design's §9 non-negotiable) and as the generous tier's
+///   standing-room threshold.
+/// * `ground_at` — distance to the nearest spot where the floor RUNS OUT (a drop, a bridge lip,
+///   a waterline): the graded form of the old boolean `ground_margin_ok`, probed on the same four
+///   axial directions and the same ±band.
+///
+/// # Determinism (the #394 discipline)
+///
+/// A memoised value is a PURE FUNCTION OF ITS KEY: it is always computed at the key cell's centre
+/// and bucket floor, never at the querying point — so the answer does not depend on which query
+/// happened to populate the cache first, and concurrent workers racing to insert write identical
+/// values. The price is quantisation (a query point can sit up to ~1.4 u from its key centre);
+/// every consumer of this field is a cost or a ladder-guarded threshold, sized for that error.
+#[derive(Default)]
+pub struct ClearanceField {
+    wall: std::sync::RwLock<std::collections::HashMap<(i64, i64, i32), u8>>,
+    ground: std::sync::RwLock<std::collections::HashMap<(i64, i64, i32), u8>>,
+    /// Entry cap per map (tests shrink it to prove the degrade-not-grow behaviour).
+    cap: std::sync::atomic::AtomicUsize,
+}
+
+impl ClearanceField {
+    fn key(x: f32, y: f32, floor_z: f32) -> (i64, i64, i32) {
+        ((x / FIELD_CELL).floor() as i64,
+         (y / FIELD_CELL).floor() as i64,
+         (floor_z / 2.0).round() as i32)
+    }
+    fn key_centre(k: (i64, i64, i32)) -> [f32; 3] {
+        [(k.0 as f32 + 0.5) * FIELD_CELL, (k.1 as f32 + 0.5) * FIELD_CELL, k.2 as f32 * 2.0]
+    }
+    fn cap(&self) -> usize {
+        match self.cap.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => FIELD_MAX_ENTRIES,
+            n => n,
+        }
+    }
+    pub(crate) fn set_cap_for_test(&self, n: usize) {
+        self.cap.store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn cached(map: &std::sync::RwLock<std::collections::HashMap<(i64, i64, i32), u8>>,
+              k: (i64, i64, i32)) -> Option<f32> {
+        map.read().ok()?.get(&k).map(|&q| q as f32 * FIELD_QUANTUM)
+    }
+    fn store(&self, map: &std::sync::RwLock<std::collections::HashMap<(i64, i64, i32), u8>>,
+             k: (i64, i64, i32), v: f32) -> f32 {
+        let q = ((v / FIELD_QUANTUM).round() as i64).clamp(0, u8::MAX as i64) as u8;
+        if let Ok(mut m) = map.write() {
+            // At capacity: answer correctly, just don't grow. Purity of compute-from-key makes the
+            // recompute identical to what the entry would have held.
+            if m.len() < self.cap() || m.contains_key(&k) {
+                m.insert(k, q);
+            }
+        }
+        q as f32 * FIELD_QUANTUM
+    }
+
+    /// Radial distance from the (key cell of) `(x, y, floor_z)` to the nearest solid geometry at
+    /// the body's planner probe heights, saturating at [`WALL_CAP`].
+    pub fn wall_at(&self, col: &Collision, x: f32, y: f32, floor_z: f32) -> f32 {
+        let k = Self::key(x, y, floor_z);
+        if let Some(v) = Self::cached(&self.wall, k) { return v; }
+        let c = Self::key_centre(k);
+        let mut best = WALL_CAP;
+        const SPOKES: usize = 16;
+        for i in 0..SPOKES {
+            let a = (i as f32) / (SPOKES as f32) * std::f32::consts::TAU;
+            let (dx, dy) = (a.cos(), a.sin());
+            for hz in PLAYER_BODY.planner_probes() {
+                let from = [c[0], c[1], c[2] + hz];
+                let to = [c[0] + dx * WALL_CAP, c[1] + dy * WALL_CAP, c[2] + hz];
+                if let Some(t) = col.nearest_hit_t(from, to) {
+                    best = best.min(t * WALL_CAP);
+                }
+            }
+        }
+        self.store(&self.wall, k, best)
+    }
+
+    /// Distance from the (key cell of) `(x, y, floor_z)` to the nearest missing-floor direction —
+    /// the graded `ground_margin_ok`: the first radius (of [`GROUND_RADII`], on the four axial
+    /// directions) with no floor in the ±band, saturating at [`GROUND_CAP`].
+    pub fn ground_at(&self, col: &Collision, x: f32, y: f32, floor_z: f32) -> f32 {
+        let k = Self::key(x, y, floor_z);
+        if let Some(v) = Self::cached(&self.ground, k) { return v; }
+        let c = Self::key_centre(k);
+        let mut clear = GROUND_CAP;
+        'radii: for (i, &r) in GROUND_RADII.iter().enumerate() {
+            for (dx, dy) in [(r, 0.0), (-r, 0.0), (0.0, r), (0.0, -r)] {
+                let ok = col.nearest_floor(c[0] + dx, c[1] + dy, c[2], 3.0, 8.0)
+                    .is_some_and(|f| (f - c[2]).abs() <= 8.0);
+                if !ok {
+                    clear = if i == 0 { 0.0 } else { GROUND_RADII[i - 1] };
+                    break 'radii;
+                }
+            }
+        }
+        self.store(&self.ground, k, clear)
+    }
+}
+
 // Count of cold-path (`diagnose`) evaluations ON THIS THREAD, for the "zero diagnosis on success"
 // proof (design §5c). Test-only, and thread-local on purpose: the cargo test harness runs tests in
 // parallel, and a global counter would let another test's legitimate diagnoses pollute the
@@ -236,19 +369,11 @@ pub struct Traversability<'a> {
     /// A floating (swimming) plan is exempt from ground margins outright: a floating character has
     /// no ground under it by definition, so the probe would refuse every cell it must cross.
     pub floating: bool,
-    /// PER-PLAN memo for the ground-margin probe, keyed by (cell-quantized XY, floor bucket) —
-    /// a cell is reached from up to 8 neighbours and the probe costs 4 column queries, so this is
-    /// the same memo A* used to keep locally (it moved here with the predicate). `RefCell`: a
-    /// `Traversability` lives inside one search on one thread.
-    margin_memo: std::cell::RefCell<std::collections::HashMap<(i64, i64, i32), bool>>,
 }
 
 impl<'a> Traversability<'a> {
     pub fn new(col: &'a Collision, radius: f32, cell: f32, ledge_margin: f32, floating: bool) -> Self {
-        Traversability {
-            col, body: &PLAYER_BODY, radius, cell, ledge_margin, floating,
-            margin_memo: std::cell::RefCell::new(std::collections::HashMap::new()),
-        }
+        Traversability { col, body: &PLAYER_BODY, radius, cell, ledge_margin, floating }
     }
 
     // ── HOT: what A* calls, per edge / per waypoint. No Result, no Option, no allocation. ──
@@ -348,24 +473,24 @@ impl<'a> Traversability<'a> {
         self.col.footprint_clear(p.xy[0], p.xy[1], p.floor_z, self.radius, 8)
     }
 
-    /// `ledge_margin` of ground all around (a drop, a lip, open water all read as "no ground").
-    /// `true` when this plan asked for no margin (the minimum tier / a floating plan).
-    /// Memoised per (plan-cell, floor bucket) for the life of this plan.
+    /// STANDING ROOM (the tiered promise above `Tier::Minimum`): `ledge_margin` of GROUND all
+    /// around (a drop, a lip, open water all read as "no ground") AND `radius` of radial WALL
+    /// clearance — the roomy tier keeps its distance from geometry that is missing and geometry
+    /// that is in the way, through the one zone-lifetime clearance field.
+    ///
+    /// `true` when this plan asked for no margin (the minimum tier / a floating plan): at
+    /// `Tier::Minimum` the promise is exactly "the character fits" — a threshold here would seal
+    /// the narrow bridges and corridors the minimum tier exists to keep routable (the design's §9
+    /// non-negotiable: the field is a threshold at Minimum ONLY for what genuinely cannot fit,
+    /// which the swept edge test already enforces; above Minimum it is standing room; it is never
+    /// a hard filter that survives the ladder's fallback).
     #[inline]
     fn occupy_margin_ok(&self, p: Point) -> bool {
         if self.ledge_margin <= 0.0 || self.floating {
             return true;
         }
-        let cell = self.cell.max(1.0);
-        let key = ((p.xy[0] / cell).floor() as i64,
-                   (p.xy[1] / cell).floor() as i64,
-                   (p.floor_z / 2.0).round() as i32);
-        if let Some(&ok) = self.margin_memo.borrow().get(&key) {
-            return ok;
-        }
-        let ok = self.col.ground_margin_ok(p.xy[0], p.xy[1], p.floor_z, self.ledge_margin);
-        self.margin_memo.borrow_mut().insert(key, ok);
-        ok
+        self.col.ground_clearance(p.xy[0], p.xy[1], p.floor_z) >= self.ledge_margin
+            && self.col.wall_clearance(p.xy[0], p.xy[1], p.floor_z) >= self.radius
     }
 
     /// Cold-path only: name the ground hazard at a spot with no usable floor — open water reads
@@ -378,19 +503,23 @@ impl<'a> Traversability<'a> {
         }
     }
 
-    /// Cold-path only: name the hazard that broke the ground margin around `p` (the first probe
-    /// direction with no floor, classified water-vs-floor at that spot).
+    /// Cold-path only: name the hazard that broke the standing-room test around `p`. If the
+    /// GROUND half failed, walk the axial probes outward to the failing spot and classify it
+    /// water-vs-floor there; otherwise the WALL half failed.
     fn margin_hazard(&self, p: Point) -> HazardKind {
-        let m = self.ledge_margin;
-        for (dx, dy) in [(m, 0.0), (-m, 0.0), (0.0, m), (0.0, -m)] {
-            let (x, y) = (p.xy[0] + dx, p.xy[1] + dy);
-            let ok = self.col.nearest_floor(x, y, p.floor_z, 3.0, 8.0)
-                .is_some_and(|f| (f - p.floor_z).abs() <= 8.0);
-            if !ok {
-                return self.ground_hazard([x, y], p.floor_z);
+        if self.col.ground_clearance(p.xy[0], p.xy[1], p.floor_z) < self.ledge_margin {
+            let m = self.ledge_margin;
+            for (dx, dy) in [(m, 0.0), (-m, 0.0), (0.0, m), (0.0, -m)] {
+                let (x, y) = (p.xy[0] + dx, p.xy[1] + dy);
+                let ok = self.col.nearest_floor(x, y, p.floor_z, 3.0, 8.0)
+                    .is_some_and(|f| (f - p.floor_z).abs() <= 8.0);
+                if !ok {
+                    return self.ground_hazard([x, y], p.floor_z);
+                }
             }
+            return HazardKind::Floor;
         }
-        HazardKind::Floor
+        HazardKind::Wall
     }
 }
 
@@ -485,6 +614,93 @@ mod tests {
         assert!(planner[0] > crate::movement::STEP_UP,
             "the planner's low probe must clear the step-up band, or every stair reads as a wall");
         assert!(PLAYER_BODY.radius >= crate::movement::PLAYER_RADIUS);
+    }
+
+    /// **THE FIELD IS DETERMINISTIC AND HISTORY-BLIND (the #394 discipline).** A memoised value is
+    /// a pure function of its key: two queries anywhere inside one 2 u key cell get the identical
+    /// answer, in either order, memo warm or cold — so a plan's outcome can never depend on which
+    /// earlier plan happened to populate the cache.
+    #[test]
+    fn clearance_field_answers_are_a_pure_function_of_the_key() {
+        let c = col(vec![
+            floor_at(0.0, -30.0, 30.0, -30.0, 30.0),
+            panel(10.0, -30.0, 30.0, 0.0, 10.0), // a wall east of the origin
+        ]);
+        // Two distinct points in the same 2u key cell (keys floor(x/2): 4.1 and 5.3 both → 2).
+        let a = c.wall_clearance(4.1, 0.2, 0.0);
+        let b = c.wall_clearance(5.3, 1.7, 0.0);
+        assert_eq!(a, b, "same key cell must give the identical (key-centre) answer");
+        // Warm-vs-cold: a fresh Collision over the same geometry, queried in a different order.
+        let c2 = col(vec![
+            floor_at(0.0, -30.0, 30.0, -30.0, 30.0),
+            panel(10.0, -30.0, 30.0, 0.0, 10.0),
+        ]);
+        let _ = c2.wall_clearance(-20.0, -20.0, 0.0); // unrelated first query
+        assert_eq!(c2.wall_clearance(5.3, 1.7, 0.0), a, "history must not change the answer");
+        // And the value is sane: the key centre (5,1) is 5u from the wall at east=10, but capped
+        // sampling quantises — just require it sees the wall inside the cap and not through it.
+        assert!(a > 3.0 && a <= 5.5, "wall at east=10 from key-centre ~(5,1): {a}");
+        let g = c.ground_clearance(0.0, 0.0, 0.0);
+        assert!(g >= 2.0, "mid-plateau has full ground clearance: {g}");
+        let edge = c.ground_clearance(-29.5, 0.0, 0.0);
+        assert!(edge < 2.0, "the plateau lip has reduced ground clearance: {edge}");
+    }
+
+    /// **THE MEMO IS BOUNDED, AND THE BOUND DEGRADES SPEED, NEVER TRUTH.** At capacity the field
+    /// answers from a fresh compute instead of growing — same values, map never exceeds the cap.
+    #[test]
+    fn clearance_field_capacity_degrades_not_grows_or_lies() {
+        let c = col(vec![floor_at(0.0, -60.0, 60.0, -60.0, 60.0)]);
+        // Record truth uncapped.
+        let pts: Vec<(f32, f32)> = (0..40).map(|i| (-58.0 + 3.0 * i as f32, 2.0 * i as f32 - 40.0)).collect();
+        let truth: Vec<f32> = pts.iter().map(|&(x, y)| c.wall_clearance(x, y, 0.0)).collect();
+        // A fresh, tightly-capped field over the same geometry.
+        let c2 = col(vec![floor_at(0.0, -60.0, 60.0, -60.0, 60.0)]);
+        c2.clearance_field_for_test().set_cap_for_test(8);
+        for (i, &(x, y)) in pts.iter().enumerate() {
+            assert_eq!(c2.wall_clearance(x, y, 0.0), truth[i], "capped field lied at {:?}", (x, y));
+        }
+        // Repeat pass: still correct (whether served from the 8 kept entries or recomputed).
+        for (i, &(x, y)) in pts.iter().enumerate() {
+            assert_eq!(c2.wall_clearance(x, y, 0.0), truth[i]);
+        }
+    }
+
+    /// **THE HALLWAY HUG (the qcat symptom, #381).** A fine plan whose start and carrot both sit
+    /// in a lane close to one wall must swing to the roomier lane for the ride, instead of
+    /// emitting a lane that skims the wall for the walker to press into. The corridor is
+    /// asymmetric on purpose (walls at north −2.5 and +4.5): the start/carrot lane (n = −1) has
+    /// only 1.5 u of wall clearance, a full-clearance lane exists two cells north, and ONLY the
+    /// hug cost distinguishes them — both lanes are wall-legal at the minimum tier the fine
+    /// planner runs at, and without the cost the straight hugging lane is strictly shorter.
+    ///
+    /// (The lane deliberately sits at 1.5 u, not wall-TANGENT 1.0 u: at exact tangency the swept
+    /// edge test itself refuses DIAGONAL entry into the lane — the body corner grazes the wall —
+    /// so a tangent carrot is only reachable along the hug lane and no cost can move the route.
+    /// That tangent-carrot case is the coarse tier's to avoid creating, not this cost's to fix.)
+    ///
+    /// Mutation check: zero the hug cost (`hug_cost` → 0.0) and this MUST go red — verified at
+    /// authoring time.
+    #[test]
+    fn fine_plan_swings_off_the_hugged_wall_when_a_freer_lane_exists() {
+        // Walls run EAST-WEST (north = -2.5 and +4.5), corridor open east [-30, 30].
+        let wall_ns = |n: f32| mesh(vec![[n, 0.0, -30.0], [n, 8.0, -30.0], [n, 8.0, 30.0], [n, 0.0, 30.0]]);
+        let c = col(vec![
+            floor_at(0.0, -30.0, 30.0, -12.0, 12.0),
+            wall_ns(-2.5),
+            wall_ns(4.5),
+        ]);
+        // Start and carrot both in the near-wall lane (1.5 u off the south wall).
+        let out = c.find_path_local([-16.0, -1.0, 0.0], [16.0, -1.0, 0.0], 2.0, 40.0, 4.0);
+        let steer = out.steer();
+        assert!(steer.len() >= 3, "the corridor must still be threaded: {out:?}");
+        // Mid-route (away from the endpoints, which are pinned to the ask), the lane must have
+        // pulled off the south wall toward the roomy side.
+        let mid: Vec<_> = steer.iter().filter(|w| w[0] > -8.0 && w[0] < 8.0).collect();
+        assert!(!mid.is_empty(), "route must cross the corridor middle: {steer:?}");
+        let worst = mid.iter().map(|w| w[1] + 2.5).fold(f32::MAX, f32::min); // distance from south wall
+        assert!(worst > 2.0,
+            "mid-route lane still hugs the south wall (nearest approach {worst:.2}u): {steer:?}");
     }
 
     /// Tier is the ladder and the ladder is closed: two rungs, minimum == the controller's radius,
