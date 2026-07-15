@@ -4583,12 +4583,15 @@ mod tests {
         let zones: Vec<String> = std::env::var("ZONES").ok()
             .map(|z| z.split(',').map(str::to_string).collect())
             .unwrap_or_else(|| vec![
-                // A deliberately mixed corpus: the zone #382's own numbers came from (akanon), the one
-                // whose route success the last nav tightening cost 29% (akanon again), a dense city, a
-                // big outdoor zone, dungeons, the gfaydark corner an earlier budget cut broke, and
-                // qcat — the aqueduct hallways where the live #386/#381 wall-press symptom shows.
+                // A deliberately mixed DRY corpus: the zone #382's own numbers came from (akanon), the
+                // one whose route success the last nav tightening cost 29% (akanon again), a dense
+                // city, a big outdoor zone, dungeons, and the gfaydark corner an earlier budget cut
+                // broke. **qcat is deliberately NOT here**: it is confounded by known bugs (#423
+                // walk-through-walls-into-water, #329 spawn-pocket dead-end, and unimplemented water
+                // nav #359/#197), so a route-success/cost number there is not clean evidence about
+                // this refactor. Pass ZONES=qcat explicitly if you want to look at it in isolation.
                 "akanon", "blackburrow", "qeynos2", "gfaydark", "crushbone", "neriaka", "felwithea",
-                "highpass", "everfrost", "butcher", "qcat",
+                "highpass", "everfrost", "butcher",
             ].into_iter().map(str::to_string).collect());
 
         // A seeded LCG: a failure here must be reproducible, and an unseeded sample is not evidence.
@@ -4878,23 +4881,32 @@ mod tests {
 
         let dir = std::env::var("ZONE_DIR")
             .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
-        let zones: Vec<String> = std::env::var("ZONES").ok()
-            .map(|z| z.split(',').map(str::to_string).collect())
-            .unwrap_or_else(|| vec![
-                // qcat is in the default set on purpose: the live #386/#381 symptom (hallway
-                // wall-press) is there, and it is the zone the traversability refactor is gated on.
-                "akanon", "blackburrow", "qeynos2", "gfaydark", "crushbone", "neriaka", "felwithea",
-                "highpass", "everfrost", "butcher", "qcat",
-            ].into_iter().map(str::to_string).collect());
-
-        let mut seed: u64 = 0xD21F_7A3E; // same seed family as the static scanner
-        let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as u32 };
 
         // `DRIFT_INCLUDE_WATER=1` runs the water-inclusive variant (#378 Phase 2 validation): keep
         // water-adjacent journeys and COUNT waterline wedges (the separate #423 crossing bug) in a
         // `water` column, so the water dimension is measured rather than silently dropped. Default
-        // (unset) is the original DRY gate that skips water.
+        // (unset) is the DRY gate that skips water.
         let include_water = std::env::var("DRIFT_INCLUDE_WATER").is_ok();
+
+        // The DRY acceptance corpus is clean dry dungeons/cities. **qcat is deliberately NOT a dry
+        // gate zone**: it is confounded by known bugs (#423 walk-through-walls-into-water, #329
+        // spawn-pocket dead-end, and unimplemented water nav #359/#197), so a pass/fail there is not
+        // clean evidence about this refactor — the owner's call. qcat is added ONLY in the
+        // water-inclusive VISIBILITY run (never a pass/fail gate), where measuring water-adjacent
+        // behaviour is the whole point and its waterline wedges land in the `water`/#423 column.
+        let zones: Vec<String> = std::env::var("ZONES").ok()
+            .map(|z| z.split(',').map(str::to_string).collect())
+            .unwrap_or_else(|| {
+                let mut z: Vec<String> = vec![
+                    "akanon", "blackburrow", "qeynos2", "gfaydark", "crushbone", "neriaka",
+                    "felwithea", "highpass", "everfrost", "butcher",
+                ].into_iter().map(str::to_string).collect();
+                if include_water { z.push("qcat".to_string()); }
+                z
+            });
+
+        let mut seed: u64 = 0xD21F_7A3E; // same seed family as the static scanner
+        let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as u32 };
 
         let (mut tot_pairs, mut tot_walked, mut tot_wedged) = (0usize, 0usize, 0usize);
         let (mut tot_height, mut tot_overlap, mut tot_other, mut tot_water) = (0usize, 0usize, 0usize, 0usize);
