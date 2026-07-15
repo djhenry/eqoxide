@@ -89,9 +89,10 @@ fix for any client-initiated melee.
   (name starts `a_`/`an_`, excludes named guards/merchants) within 200u that has a clear path
   (`path_clear`). If none reachable, idle and wait for respawns (do NOT roam toward out-of-pocket
   mobs — it strands the bot; see §5 limitations).
-- **Reachability matters**: the combat approach uses `slide_move` (single-wall slide), so only
-  mobs with a clear straight path are reliably meleeable. Mobs across water / behind walls / at a
-  different z are not (see §5).
+- **Reachability matters**: the combat approach drives the shared collide-and-slide mover
+  (`CharacterController::slide`) toward the target, so a mob behind a wall it cannot slide around, or
+  across water / at a different z, is not reliably meleeable (see §5). For a mob around a corner, issue
+  a `/v1/move/goto` first (A\* routes around walls) and engage once adjacent.
 
 ### Verifying combat
 Client logs outgoing hits as `EQ: combat: Claude hits <mob> for N damage` and kills as
@@ -169,9 +170,11 @@ slot to a free general slot (22-29). Read the current item→slot mapping from t
 ## 5. Navigation / pathfinding (find_path)
 
 `Collision::find_path(start, goal, radius) -> Option<Vec<[east,north]>>` (`src/assets.rs`) is grid
-A* over the collision grid (production cell_size **32**). It routes AROUND walls, unlike `slide_move`
-(which only slides along one wall and stalls at corners). `/v1/move/goto` computes a path when the goal
-changes and walks the waypoints; the per-step move + the combat auto-engage still use `slide_move`.
+A* over the collision grid. It routes AROUND walls (a plain slide toward the goal only slides along one
+wall and stalls at corners). `/v1/move/goto` computes a path when the goal changes and walks the
+waypoints by emitting a `MoveIntent` each tick; the frame-by-frame motion — for nav, free WASD, and the
+combat auto-engage alike — is resolved by the ONE collide-and-slide mover, `CharacterController::slide`
+(the divergent `navigation::slide_move` was deleted in #378 Phase 2).
 
 Floor handling: the per-cell floor is probed **relative to the floor of the cell it was reached from**
 (`floor_near`), so multi-level dungeons work even when the caller's start `z` is stale (a common

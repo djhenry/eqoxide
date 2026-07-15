@@ -171,7 +171,7 @@ cargo test -- --ignored       # run asset-dependent tests (needs ~/eq_assets)
 
 Key test modules:
 - `src/assets.rs` — collision grid (floor_z, segment_blocked, path_clear)
-- `src/eq_net/navigation.rs` — slide_move, packet builders (say, target, consider)
+- `src/eq_net/navigation.rs` — the nav walker/planner loop, packet builders (say, target, consider)
 - `src/hud.rs` — split_keywords, nearest_npc_name
 - `src/eqstr.rs` — string table parse + substitute
 

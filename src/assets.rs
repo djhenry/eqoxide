@@ -684,10 +684,35 @@ pub enum PlanOutcome {
     /// A COMPLETE route that reaches the goal. The only variant the walker may treat as a plan.
     Route(Vec<[f32; 3]>),
     /// DEFINITIVE: no route exists. An honest, falsifiable "no" the agent can act on.
-    Unreachable(NoRoute),
+    ///
+    /// `goal_blocked_by` / `frontier_blocked_by` are the agent-honesty payload (#378 Phase 2,
+    /// design §5a), computed on the COLD path — only when a plan has already failed, never in the
+    /// hot A* loop. They are two DIFFERENT, actionable facts:
+    ///
+    /// * `goal_blocked_by` — one `Traversability::can_occupy(goal)` — "is my goal itself
+    ///   impossible to stand at?" Definitive: if it is `Some`, no search could ever have succeeded.
+    ///   This is what explains `GoalNotWalkable`.
+    /// * `frontier_blocked_by` — one `can_traverse(best_toward → the next step toward the goal)` —
+    ///   "I got as close as *here*; the thing between me and the goal is a **Wall** at (x,y,z)."
+    ///   This explains `SearchClosed`, the common wedge where the goal is perfectly walkable but the
+    ///   character's component does not contain it (a sealed corridor).
+    ///
+    /// Honesty about the honesty channel: `frontier_blocked_by` is ONE blocking fact, not
+    /// necessarily the only one and not necessarily the one to fix — it is *named* as such in the
+    /// API (`frontier_blocked_by`, not `reason`). Both are `None` when the diagnosis could not be
+    /// computed (e.g. no `best_toward`); a missing diagnosis is honest silence, never a fabrication.
+    Unreachable {
+        reason: NoRoute,
+        goal_blocked_by: Option<crate::traversability::Blockage>,
+        frontier_blocked_by: Option<crate::traversability::Blockage>,
+    },
     /// The search was cut short (`limit`) before closing its frontier: "I DON'T KNOW", not "no".
     /// `progress` is a partial route toward the reachable frontier, present ONLY when it makes
     /// GENUINE goal-ward progress (see `PARTIAL_MIN_UNITS`) — walk it and re-plan from the far end.
+    ///
+    /// **Deliberately carries NO blockage.** A cut-short search did not close its frontier, so it
+    /// does not KNOW what stopped it; inventing a blockage here would be a fabrication. "I don't
+    /// know" stays "I don't know" (#337/#356 discipline).
     Exhausted { limit: PlanLimit, progress: Option<Vec<[f32; 3]>> },
 }
 
@@ -701,7 +726,7 @@ impl PlanOutcome {
     pub fn reason(&self) -> &'static str {
         match self {
             PlanOutcome::Route(_) => "route",
-            PlanOutcome::Unreachable(r) => r.as_str(),
+            PlanOutcome::Unreachable { reason, .. } => reason.as_str(),
             PlanOutcome::Exhausted { limit, .. } => limit.as_str(),
         }
     }
@@ -810,6 +835,11 @@ struct Search {
     progress: f32,
     /// Nodes whose expansion completed — how big the explored component is.
     closed_n: usize,
+    /// The CLOSEST-to-goal standing position the search actually reached (`best_toward`), in world
+    /// space `[east, north, floor_z]`. Carried so the COLD honesty path (`find_path_ex`) can name
+    /// the obstruction that ended the journey — the wall between the frontier and the goal (#378
+    /// Phase 2, design §5a). `None` when the search closed nothing useful.
+    best_toward: Option<[f32; 3]>,
 }
 
 impl Search {
@@ -913,9 +943,13 @@ pub const NAV_PREFERRED_CLEARANCE: f32 = crate::movement::PLAYER_RADIUS * 2.0;
 /// collision ray sits at `foot + 4.0` (`movement.rs`), so ~5u is the clearance a body actually needs;
 /// this is measured against route-success (≥ 99.50%) before shipping.
 ///
-/// Both belong on the shared `Body` (PR-A). Defined here until PR-A lands — do NOT invent a second copy.
-pub const NAV_NEAR_HORIZONTAL: f32 = 0.64;
-pub const NAV_AGENT_HEIGHT: f32 = 5.0;
+/// **PR-A landed (Phase 2): the single source of truth is now `traversability::PLAYER_BODY`.** These
+/// two consts are thin aliases into it — the VALUE lives on the shared `Body`
+/// (`Body::near_horizontal` / `Body::agent_height`), and every existing `NAV_NEAR_HORIZONTAL` /
+/// `NAV_AGENT_HEIGHT` reference reads through here so no second copy exists. Change the number on the
+/// `Body`, not here.
+pub const NAV_NEAR_HORIZONTAL: f32 = crate::traversability::PLAYER_BODY.near_horizontal;
+pub const NAV_AGENT_HEIGHT: f32 = crate::traversability::PLAYER_BODY.agent_height;
 
 /// The share of a plan's node budget the GENEROUS clearance pass may spend before it is abandoned in
 /// favour of the minimum-clearance pass that actually decides the answer.
@@ -1719,8 +1753,8 @@ impl Collision {
     }
 
     /// A* over the collision grid: a walkable waypoint path from `start` to `goal` that routes
-    /// AROUND walls (slide_move only slides along one). Returns cell-center waypoints
-    /// `[east, north]` (start-exclusive, goal-inclusive) or None if no geometry / no route.
+    /// AROUND walls (a plain collide-and-slide toward the goal only slides along one). Returns
+    /// cell-center waypoints `[east, north]` (start-exclusive, goal-inclusive) or None if no geometry / no route.
     /// Walkability = a floor exists under the cell; an edge needs a small floor-height step and
     /// a clear chest-height segment between cell centers.
     /// `avoid` is a set of XY points (nearby NPC positions) the route should skirt — see the
@@ -1802,11 +1836,23 @@ impl Collision {
     #[allow(clippy::too_many_arguments)]
     pub fn find_path_ex(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]],
         cell: f32, max_search: Option<f32>, aggro_buffer: f32, ctx: PlanCtx) -> PlanOutcome {
+        self.find_path_ex_tiered(start, goal, radius, avoid, cell, max_search, aggro_buffer, ctx).0
+    }
+
+    /// [`find_path_ex`] plus the per-route TIER (#378 Phase 2 / design §4c): `true` = the route only
+    /// existed at the MINIMUM clearance (a tight door/bridge threaded with no margin — a riskier
+    /// path), `false` = the roomy preferred tier carried it (or there is no route). This is the
+    /// per-route fact the zone-lifetime `nav_tight` counter cannot give; the worker puts it on
+    /// `PlanReply` so an agent sees `nav_tier` for the route it is actually walking.
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_path_ex_tiered(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]],
+        cell: f32, max_search: Option<f32>, aggro_buffer: f32, ctx: PlanCtx) -> (PlanOutcome, bool) {
         // Plan owner (when called standalone). When `plan_path` drives this, `ctx` already carries a
         // shared counter, so `ensure_budget` is a no-op and all 13 calls keep sharing the one budget.
         let ctx = ctx.ensure_budget();
-        let (s, _tight) = self.search_tiered(start, goal, radius, avoid, cell, max_search, aggro_buffer, ctx);
-        match s.path {
+        let (s, tight) = self.search_tiered(start, goal, radius, avoid, cell, max_search, aggro_buffer, ctx);
+        let best_toward = s.best_toward;
+        let outcome = match s.path {
             Some((p, true)) => PlanOutcome::Route(p),
             other => match s.limit {
                 // Cut short → "I don't know". Hand back the partial ONLY if it makes genuine
@@ -1817,10 +1863,65 @@ impl Collision {
                         .map(|(p, _)| p);
                     PlanOutcome::Exhausted { limit, progress }
                 }
-                // Frontier CLOSED → a definitive no. No partial: see the doc comment.
-                None => PlanOutcome::Unreachable(s.no_route.unwrap_or(NoRoute::SearchClosed)),
+                // Frontier CLOSED → a definitive no. Now, and ONLY now (the COLD path, after a
+                // plan has already failed), name WHY and WHERE (#378 Phase 2). No partial.
+                None => {
+                    let reason = s.no_route.unwrap_or(NoRoute::SearchClosed);
+                    let (goal_blocked_by, frontier_blocked_by) =
+                        self.diagnose_unreachable(goal, radius, cell, best_toward);
+                    PlanOutcome::Unreachable { reason, goal_blocked_by, frontier_blocked_by }
+                }
             },
-        }
+        };
+        // `tight` is only meaningful for a real route; a no-route/exhausted answer has no tier.
+        (outcome, tight)
+    }
+
+    /// The COLD honesty diagnosis behind an `Unreachable` (#378 Phase 2, design §5a). Runs at most
+    /// twice, and only after a plan has already failed — never in the hot A* loop, and never on a
+    /// successful plan.
+    ///
+    /// * `goal_blocked_by`: is the GOAL itself impossible to stand at? Resolve a floor anywhere in
+    ///   the goal's column; if there is none, the goal is off the mesh (a `Floor` blockage). If
+    ///   there is one, ask the one authority whether the body can occupy it.
+    /// * `frontier_blocked_by`: from the closest-to-goal standing position the search actually
+    ///   reached (`best_toward`), step one plan-cell toward the goal and ask `can_traverse` — the
+    ///   wall (or drop, or waterline) that ended the journey's closest approach.
+    ///
+    /// Both use `Tier::Minimum` clearance (the hard floor): a blockage is only reported when even
+    /// the character's own collision radius does not fit, so the diagnosis can never over-claim a
+    /// wall the walker could actually have squeezed past.
+    fn diagnose_unreachable(&self, goal: [f32; 3], radius: f32, cell: f32,
+        best_toward: Option<[f32; 3]>)
+        -> (Option<crate::traversability::Blockage>, Option<crate::traversability::Blockage>)
+    {
+        use crate::traversability::{Blockage, HazardKind, Point, Traversability, Tier};
+        let r = radius.max(Tier::Minimum.units());
+        // DRY-PLAN diagnosis: `floating: false`. A water-START failed plan could read inconsistently
+        // here, but planner water nav is an unimplemented gap (#359/#197/#423) and out of scope — the
+        // diagnosis is only ever consulted for dry plans until that lands.
+        let trav = Traversability::new(self, r, cell, 0.0, false);
+
+        // GOAL: definitive. A floor anywhere in the column, then the occupancy test; else off-mesh.
+        let goal_blocked_by = match self.snap_goal_to_column_floor(goal) {
+            Some(gz) => trav.can_occupy(Point::new([goal[0], goal[1]], gz)).err(),
+            None => Some(Blockage { hazard: HazardKind::Floor, at: goal }),
+        };
+
+        // FRONTIER: the obstruction at the search's closest approach. Step one cell toward the goal
+        // and ask can_traverse; the failure names the wall/drop/water between here and the goal.
+        let frontier_blocked_by = best_toward.and_then(|bt| {
+            let dir = [goal[0] - bt[0], goal[1] - bt[1]];
+            let d = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt();
+            if d < 1e-3 { return None; }
+            let step = cell.max(2.0);
+            let to_xy = [bt[0] + dir[0] / d * step, bt[1] + dir[1] / d * step];
+            // The next step's floor tier, following the terrain from the frontier's height.
+            let to_z = self.nearest_floor(to_xy[0], to_xy[1], bt[2], 20.0, 60.0).unwrap_or(bt[2]);
+            trav.can_traverse(Point::new([bt[0], bt[1]], bt[2]), Point::new(to_xy, to_z)).err()
+        });
+
+        (goal_blocked_by, frontier_blocked_by)
     }
 
     /// The FINE LOCAL STEERING plan (#382): a bounded A* at `cell` resolution (2 u) within `bound`
@@ -2682,6 +2783,12 @@ impl Collision {
                 goal[0], goal[1], goal[2], goal_floor,
                 match ctx.goal_region { Some(i) => format!(" (zone-line region {i})"), None => String::new() });
         }
+        // The closest-to-goal STANDING POSITION the search reached, in world space — carried out so
+        // the cold honesty path can name the obstruction that ended the journey (#378 Phase 2).
+        let best_toward_xyz = best_toward.map(|bk| {
+            let ctr = center(bk.0, bk.1);
+            [ctr[0], ctr[1], *floor_of.get(&bk).unwrap_or(&goal_floor)]
+        });
         // How much straight-line ground toward the goal the best-reached cell actually closes. The
         // caller uses this to decide whether a partial route is a STAGE of a journey (worth walking,
         // then re-planning) or a SHUFFLE into a wall (#337) — see `PARTIAL_MIN_UNITS`.
@@ -2713,7 +2820,7 @@ impl Collision {
                             None => tracing::info!("find_path: NO ROUTE — frontier closed after {} nodes \
                                 (start_floor={start_floor}, goal_floor={goal_floor})", closed.len()),
                         }
-                        return Search { limit, progress, closed_n: closed.len(), ..Default::default() };
+                        return Search { limit, progress, closed_n: closed.len(), best_toward: best_toward_xyz, ..Default::default() };
                     }
                 }
             }
@@ -2750,6 +2857,30 @@ impl Collision {
         let edge_ok = |x: f32, y: f32, z: f32| -> bool {
             self.nearest_floor(x, y, z, 3.0, 8.0).map_or(false, |f| (f - z).abs() <= 8.0)
         };
+        // WALL-AWARE half (#378 Phase 2 / the qcat L-corner). `edge_ok` sees only geometry that is
+        // MISSING (drops, ledges, waterlines). A WALL standing on continuous floor is invisible to
+        // it — there is floor at the wall's foot — so a route along a narrow ledge (wall one side,
+        // drop the other) got pushed off the DROP but never off the WALL, and the walker pressed
+        // into the wall trying to round the corner (the live qcat symptom). Probe for a solid face
+        // at the body's own probe heights within its standing-room distance: a wall that close in a
+        // direction is a hazard to push AWAY from, exactly as a missing floor is. On a narrow ledge
+        // the wall push and the drop push point the SAME way — toward the ledge centre — so the
+        // waypoint (and the carrot the walker steers at) sits down the middle and the corner is
+        // roundable.
+        //
+        // DETECTION distance is the body `radius` (standing room = keep the body off the wall), not
+        // the smaller in-cell `margin` — a cell centre sits ~1u from a wall on the 2u fine grid, and
+        // a `margin`-only probe (0.9u there) would miss it. NUDGE magnitude stays `margin` (capped
+        // to `cell*0.45` so a push never overshoots into the next cell). A corridor exactly
+        // `2·radius` wide has a wall at `radius` on BOTH sides → the two pushes cancel → the centre
+        // line is kept, so a minimum-width corridor is never sealed.
+        let body = &crate::traversability::PLAYER_BODY;
+        let wall_probe = radius.max(margin);
+        let wall_near = |x: f32, y: f32, z: f32, ex: f32, ny: f32| -> bool {
+            let (dx, dy) = (ex * wall_probe, ny * wall_probe);
+            body.planner_probes().iter().any(|&hz|
+                self.nearest_hit_t([x, y, z + hz], [x + dx, y + dy, z + hz]).is_some())
+        };
         // The inset's occupancy guard, through the one authority (#378) — with NO ledge margin:
         // the inset asks "can the body stand exactly here", not "does this spot have route-choice
         // standing room". Margins are the search's concern; one here would refuse nudges the
@@ -2758,18 +2889,20 @@ impl Collision {
         for i in 0..path.len() {
             let [x, y, z] = path[i];
             let mut push = [0.0f32, 0.0f32];
-            if !edge_ok(x + margin, y, z) { push[0] -= 1.0; }
-            if !edge_ok(x - margin, y, z) { push[0] += 1.0; }
-            if !edge_ok(x, y + margin, z) { push[1] -= 1.0; }
-            if !edge_ok(x, y - margin, z) { push[1] += 1.0; }
+            // A side is a hazard if the FLOOR runs out there (edge) OR a WALL stands there. Both
+            // push away; opposing hazards (a corridor's two walls, a bridge's two rails) CANCEL, so
+            // the centre line is kept and only genuinely one-sided hazards move the waypoint.
+            if !edge_ok(x + margin, y, z) || wall_near(x, y, z, 1.0, 0.0) { push[0] -= 1.0; }
+            if !edge_ok(x - margin, y, z) || wall_near(x, y, z, -1.0, 0.0) { push[0] += 1.0; }
+            if !edge_ok(x, y + margin, z) || wall_near(x, y, z, 0.0, 1.0) { push[1] -= 1.0; }
+            if !edge_ok(x, y - margin, z) || wall_near(x, y, z, 0.0, -1.0) { push[1] += 1.0; }
             let len = (push[0] * push[0] + push[1] * push[1]).sqrt();
             if len > 0.0 {
                 let (nx, ny) = (x + push[0] / len * margin, y + push[1] / len * margin);
                 // The nudge destination must be OCCUPIABLE — floor AND wall axes, through the one
                 // authority (#378). The floor half is what stops the nudge shoving a waypoint off
-                // the mesh; the wall half exists because a floor probe is structurally incapable of
-                // seeing a wall (`is_standable` rejects near-vertical faces, and there is floor at a
-                // wall's foot — #358), so a floor-only guard green-lights a nudge straight into one.
+                // the mesh; the wall half stops it nudging straight INTO the far wall of a corridor
+                // narrower than 2·margin (where a one-sided push would otherwise cross the centre).
                 if inset_trav.can_occupy_fast(crate::traversability::Point::new([nx, ny], z)) {
                     path[i] = [nx, ny, z];
                 }
@@ -2814,6 +2947,7 @@ impl Collision {
             no_route: None,
             progress: if reached_goal { 0.0 } else { progress },
             closed_n: closed.len(),
+            best_toward: best_toward_xyz,
         }
     }
 }
@@ -3340,7 +3474,7 @@ mod tests {
         let off_mesh = [1560.0, 3000.0, 0.0]; // far outside the slab: no walkable floor at all
         let out = col.find_path_ex(start, off_mesh, 1.0, &[], 8.0, None, 0.0, PlanCtx::default());
         match &out {
-            PlanOutcome::Unreachable(NoRoute::GoalNotWalkable) => {}
+            PlanOutcome::Unreachable { reason: NoRoute::GoalNotWalkable, .. } => {}
             other => panic!("a goal with no walkable floor must fail IMMEDIATELY as Unreachable(GoalNotWalkable), got {other:?}"),
         }
         assert!(out.route().is_none(), "an unreachable goal must hand back NO route");
@@ -3410,8 +3544,8 @@ mod tests {
         // START that is sealed in.
         let out = col.find_path_ex([92.0, 92.0, 0.0], [350.0, 350.0, 0.0], 1.0, &[], 8.0, None, 0.0, PlanCtx::default());
         match &out {
-            PlanOutcome::Unreachable(NoRoute::StartIsolated) => {}
-            PlanOutcome::Unreachable(NoRoute::SearchClosed) => panic!(
+            PlanOutcome::Unreachable { reason: NoRoute::StartIsolated, .. } => {}
+            PlanOutcome::Unreachable { reason: NoRoute::SearchClosed, .. } => panic!(
                 "a boxed-in START reported as `search_closed` — that is a FALSE definitive 'no route to \
                  the goal' for a goal that is perfectly reachable. The character is stuck, not the goal."),
             other => panic!("expected Unreachable(StartIsolated), got {other:?}"),
@@ -3458,7 +3592,7 @@ mod tests {
 
         // The honest planner API, on the very same search, must still refuse to call that a route.
         let out = col.find_path_ex(start, goal, 1.0, &[], 8.0, None, 0.0, PlanCtx::default());
-        assert!(matches!(out, PlanOutcome::Unreachable(NoRoute::StartIsolated)),
+        assert!(matches!(out, PlanOutcome::Unreachable { reason: NoRoute::StartIsolated, .. }),
             "the honest API must still report start_isolated, got {out:?}");
         assert!(out.route().is_none(), "an Unreachable must carry no waypoints");
     }
@@ -3486,7 +3620,7 @@ mod tests {
         let col = Collision::build(&ZoneAssets { terrain, objects: vec![], textures: vec![] }, 32.0);
 
         let out = col.find_path_ex([16.0, 16.0, 0.0], [180.0, 180.0, 0.0], 1.0, &[], 8.0, None, 0.0, PlanCtx::default());
-        assert!(matches!(out, PlanOutcome::Unreachable(_)),
+        assert!(matches!(out, PlanOutcome::Unreachable { .. }),
             "a sealed goal, searched to completion, is UNREACHABLE — got {out:?}");
         assert!(out.route().is_none(), "and it must hand back no waypoints at all (the #337 lie is a partial here)");
         // The old code walked this: `find_path(.., allow_partial=true)` would have returned a greedy
@@ -4059,6 +4193,120 @@ mod tests {
         assert!(last[0] < 100.0, "partial route stops on the near side of the wall: {last:?}");
     }
 
+    /// **THE COLD BLOCKAGE DIAGNOSIS (#378 Phase 2, design §5a).** A sealed component: the goal is
+    /// perfectly WALKABLE (floor under it), but a full wall stands between the start's component and
+    /// it. So `goal_blocked_by` must be `None` (the goal itself is fine — this is the case where the
+    /// goal-only diagnosis would teach the agent nothing), and `frontier_blocked_by` must NAME THE
+    /// WALL, at a position on the wall plane — the obstruction that ended the closest approach.
+    #[test]
+    fn unreachable_frontier_blocked_by_names_the_wall_that_sealed_the_component() {
+        use crate::traversability::HazardKind;
+        let floor = MeshData {
+            positions: vec![[0.0, 0.0, 0.0], [200.0, 0.0, 0.0], [200.0, 0.0, 200.0], [0.0, 0.0, 200.0]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let wall = MeshData {
+            positions: vec![[0.0, 0.0, 100.0], [200.0, 0.0, 100.0], [200.0, 20.0, 100.0], [0.0, 20.0, 100.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let col = Collision::build(&ZoneAssets { terrain: vec![floor, wall], objects: vec![], textures: vec![] }, 8.0);
+        let start = [20.0, 100.0, 0.0];
+        let goal  = [180.0, 100.0, 0.0]; // walkable floor under it, but sealed behind the wall @east=100
+        match col.find_path_ex(start, goal, 1.0, &[], 8.0, None, 0.0, PlanCtx::default()) {
+            PlanOutcome::Unreachable { reason: NoRoute::SearchClosed, goal_blocked_by, frontier_blocked_by } => {
+                assert!(goal_blocked_by.is_none(),
+                    "the goal itself is walkable — goal_blocked_by must be None, got {goal_blocked_by:?}");
+                let f = frontier_blocked_by.expect("the frontier obstruction (the wall) must be named");
+                assert_eq!(f.hazard, HazardKind::Wall, "the sealing obstruction is a Wall, got {f:?}");
+                assert!((f.at[0] - 100.0).abs() < 8.0,
+                    "the blockage should sit on the wall plane @east=100, got {:?}", f.at);
+            }
+            other => panic!("a sealed component must be Unreachable(SearchClosed) with a frontier blockage, got {other:?}"),
+        }
+    }
+
+    /// **GOAL-BLOCKED IS DEFINITIVE.** A goal off the mesh (no floor anywhere in its column) must set
+    /// `goal_blocked_by` (a Floor hazard) — the highest-value, definitive fact: if the goal cannot be
+    /// stood at, no search could have succeeded. Pairs with the `GoalNotWalkable` reason.
+    #[test]
+    fn unreachable_goal_off_the_mesh_is_named_by_goal_blocked_by() {
+        use crate::traversability::HazardKind;
+        let assets = ZoneAssets { terrain: vec![slab(0.0, 0.0, 200.0, 0.0, 200.0, true)], objects: vec![], textures: vec![] };
+        let col = Collision::build(&assets, 32.0);
+        let out = col.find_path_ex([16.0, 16.0, 0.0], [4000.0, 4000.0, 0.0], 1.0, &[], 8.0, None, 0.0, PlanCtx::default());
+        match out {
+            PlanOutcome::Unreachable { reason: NoRoute::GoalNotWalkable, goal_blocked_by, .. } => {
+                let g = goal_blocked_by.expect("an off-mesh goal must set goal_blocked_by (definitive)");
+                assert_eq!(g.hazard, HazardKind::Floor, "off-mesh goal is a Floor blockage, got {g:?}");
+            }
+            other => panic!("an off-mesh goal must be Unreachable(GoalNotWalkable) with goal_blocked_by, got {other:?}"),
+        }
+    }
+
+    /// **#337 DISCIPLINE: `Exhausted` CARRIES NO BLOCKAGE.** A search cut short by its node cap did
+    /// not close its frontier, so it does not KNOW what stopped it — inventing a blockage there would
+    /// be a fabrication. `Exhausted` has no blockage fields AT ALL (it is a different variant); this
+    /// pins that a cut-short search is never dressed up with a diagnosis it did not earn.
+    #[test]
+    fn exhausted_never_carries_a_blockage() {
+        let assets = ZoneAssets { terrain: vec![slab(0.0, 0.0, 64.0, 0.0, 1600.0, true)], objects: vec![], textures: vec![] };
+        let col = Collision::build(&assets, 32.0);
+        let tiny = PlanCtx { node_cap: Some(4), ..PlanCtx::default() };
+        match col.find_path_ex([8.0, 32.0, 0.0], [1560.0, 32.0, 0.0], 1.0, &[], 8.0, None, 0.0, tiny) {
+            PlanOutcome::Exhausted { limit: PlanLimit::NodeCap, .. } => {} // no blockage field exists — good
+            other => panic!("a node-capped search must be Exhausted (no blockage), got {other:?}"),
+        }
+    }
+
+    /// **NEVER A FALSE BLOCKAGE (the honesty invariant for the new payload).** Two guarantees:
+    /// (1) a SUCCESSFUL plan (`Route`) never carries any blockage — a blockage on a route the walker
+    /// can walk would be a confident falsehood; (2) any `frontier_blocked_by` a failed plan reports
+    /// must be a REAL obstruction — re-asking the one authority (`can_traverse` at the minimum tier)
+    /// from the frontier toward the goal must AGREE that it is blocked. The diagnosis is derived from
+    /// exactly that predicate, so it can never over-claim a wall the body could have squeezed past.
+    #[test]
+    fn the_blockage_diagnosis_is_never_a_false_positive() {
+        // (1) Open floor, a reachable goal → a Route, and a Route has no blockage fields at all.
+        let open = Collision::build(
+            &ZoneAssets { terrain: vec![slab(0.0, 0.0, 200.0, 0.0, 200.0, true)], objects: vec![], textures: vec![] }, 32.0);
+        match open.find_path_ex([16.0, 16.0, 0.0], [180.0, 180.0, 0.0], 1.0, &[], 8.0, None, 0.0, PlanCtx::default()) {
+            PlanOutcome::Route(_) => {} // the variant has no blockage — a successful plan cannot carry one
+            other => panic!("open floor must route, got {other:?}"),
+        }
+
+        // (2) A sealed component's frontier_blocked_by must be corroborated by the one authority.
+        let floor = MeshData {
+            positions: vec![[0.0, 0.0, 0.0], [200.0, 0.0, 0.0], [200.0, 0.0, 200.0], [0.0, 0.0, 200.0]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let wall = MeshData {
+            positions: vec![[0.0, 0.0, 100.0], [200.0, 0.0, 100.0], [200.0, 20.0, 100.0], [0.0, 20.0, 100.0]],
+            normals: vec![[0.0, 0.0, 1.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let col = Collision::build(&ZoneAssets { terrain: vec![floor, wall], objects: vec![], textures: vec![] }, 8.0);
+        if let PlanOutcome::Unreachable { frontier_blocked_by: Some(f), .. } =
+            col.find_path_ex([20.0, 100.0, 0.0], [180.0, 100.0, 0.0], 1.0, &[], 8.0, None, 0.0, PlanCtx::default())
+        {
+            // Re-ask the authority: from the blockage's own approach, a step toward the goal (east)
+            // at the minimum tier must genuinely be refused. A blockage the body could pass would be
+            // a false positive.
+            use crate::traversability::{Traversability, Point, Tier};
+            let trav = Traversability::new(&col, Tier::Minimum.units(), 8.0, 0.0, false);
+            let from = Point::new([f.at[0] - 4.0, f.at[1]], 0.0);
+            let to   = Point::new([f.at[0] + 4.0, f.at[1]], 0.0);
+            assert!(trav.can_traverse(from, to).is_err(),
+                "a reported frontier blockage at {:?} must be a REAL obstruction the authority also refuses", f.at);
+        }
+    }
+
     #[test]
     fn find_path_swims_across_a_surface_pool_instead_of_diving() {
         // Positions are [north, up, east]. A deep pool bottom under the whole span, with dry shores
@@ -4202,6 +4450,36 @@ mod tests {
         }
     }
 
+    /// **THE WALL-AWARE INSET (#378 Phase 2 / the qcat L-corner).** A route running along a ledge
+    /// with a WALL on one side and continuous floor at its foot must be nudged OFF the wall — the
+    /// old floor-only inset could not see a wall standing on floor (#358), so the walker pressed
+    /// into it. Isolated here from the other two wall-avoidance mechanisms so it is the ONLY thing
+    /// that can move the route: a MINIMUM-tier BOUNDED plan at `cell = 8` runs with no standing-room
+    /// field filter (bounded ⇒ minimum tier) AND no hug cost (`cell > SWEPT_EDGE_MAX_CELL`). That is
+    /// exactly the qcat case — a single lane the field/hug cost cannot improve, only the inset can.
+    ///
+    /// Mutation check (verified at authoring time): drop the `wall_near(..)` disjunct from the inset
+    /// push and the interior waypoints sit ~1u from the wall (unmoved) → RED.
+    #[test]
+    fn wall_aware_inset_pushes_a_ledge_route_off_the_wall() {
+        // Continuous floor east[-5,20]; a wall at east=8 standing ON it (floor at its foot, so the
+        // floor-only `edge_ok` is blind to it). The east=7 coarse cell centre sits 1u from the wall.
+        let col = Collision::build(&ZoneAssets {
+            terrain: vec![floor_band(0.0, -5.0, 20.0), wall_east(8.0, 0.0, 10.0)],
+            objects: vec![], textures: vec![] }, 32.0);
+        let path = col.find_path_res([7.0, -30.0, 0.0], [7.0, 30.0, 0.0], 1.0, &[], true,
+            8.0, Some(200.0), 0.0, PlanCtx::default()).expect("route north along the ledge");
+        // Interior waypoints (start is prepended at the char's real pos; the goal-cell end is pinned)
+        // must be pushed clear of the wall@8. Pre-inset they sit at east=7 (1u clearance); the
+        // wall-aware inset moves them ~1u west → >=1.5u clearance.
+        let interior: Vec<_> = path.iter().skip(1).take(path.len().saturating_sub(2)).collect();
+        assert!(!interior.is_empty(), "route should have interior waypoints: {path:?}");
+        let closest = interior.iter().map(|w| 8.0 - w[0]).fold(f32::MAX, f32::min);
+        assert!(closest >= 1.5,
+            "wall-aware inset must push interior waypoints >=1.5u off the wall@8 \
+             (closest {closest:.2}): {path:?}");
+    }
+
 
     /// **PICK THE NODE CAP BY MEASUREMENT (#394).** The worker's node cap must be generous enough that
     /// a legitimate WHOLE-ZONE "no route" still reaches `SearchClosed` — a cap that truncates a real
@@ -4302,12 +4580,15 @@ mod tests {
         let zones: Vec<String> = std::env::var("ZONES").ok()
             .map(|z| z.split(',').map(str::to_string).collect())
             .unwrap_or_else(|| vec![
-                // A deliberately mixed corpus: the zone #382's own numbers came from (akanon), the one
-                // whose route success the last nav tightening cost 29% (akanon again), a dense city, a
-                // big outdoor zone, dungeons, the gfaydark corner an earlier budget cut broke, and
-                // qcat — the aqueduct hallways where the live #386/#381 wall-press symptom shows.
+                // A deliberately mixed DRY corpus: the zone #382's own numbers came from (akanon), the
+                // one whose route success the last nav tightening cost 29% (akanon again), a dense
+                // city, a big outdoor zone, dungeons, and the gfaydark corner an earlier budget cut
+                // broke. **qcat is deliberately NOT here**: it is confounded by known bugs (#423
+                // walk-through-walls-into-water, #329 spawn-pocket dead-end, and unimplemented water
+                // nav #359/#197), so a route-success/cost number there is not clean evidence about
+                // this refactor. Pass ZONES=qcat explicitly if you want to look at it in isolation.
                 "akanon", "blackburrow", "qeynos2", "gfaydark", "crushbone", "neriaka", "felwithea",
-                "highpass", "everfrost", "butcher", "qcat",
+                "highpass", "everfrost", "butcher",
             ].into_iter().map(str::to_string).collect());
 
         // A seeded LCG: a failure here must be reproducible, and an unseeded sample is not evidence.
@@ -4597,21 +4878,37 @@ mod tests {
 
         let dir = std::env::var("ZONE_DIR")
             .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
+
+        // `DRIFT_INCLUDE_WATER=1` runs the water-inclusive variant (#378 Phase 2 validation): keep
+        // water-adjacent journeys and COUNT waterline wedges (the separate #423 crossing bug) in a
+        // `water` column, so the water dimension is measured rather than silently dropped. Default
+        // (unset) is the DRY gate that skips water.
+        let include_water = std::env::var("DRIFT_INCLUDE_WATER").is_ok();
+
+        // The DRY acceptance corpus is clean dry dungeons/cities. **qcat is deliberately NOT a dry
+        // gate zone**: it is confounded by known bugs (#423 walk-through-walls-into-water, #329
+        // spawn-pocket dead-end, and unimplemented water nav #359/#197), so a pass/fail there is not
+        // clean evidence about this refactor — the owner's call. qcat is added ONLY in the
+        // water-inclusive VISIBILITY run (never a pass/fail gate), where measuring water-adjacent
+        // behaviour is the whole point and its waterline wedges land in the `water`/#423 column.
         let zones: Vec<String> = std::env::var("ZONES").ok()
             .map(|z| z.split(',').map(str::to_string).collect())
-            .unwrap_or_else(|| vec![
-                // qcat is in the default set on purpose: the live #386/#381 symptom (hallway
-                // wall-press) is there, and it is the zone the traversability refactor is gated on.
-                "akanon", "blackburrow", "qeynos2", "gfaydark", "crushbone", "neriaka", "felwithea",
-                "highpass", "everfrost", "butcher", "qcat",
-            ].into_iter().map(str::to_string).collect());
+            .unwrap_or_else(|| {
+                let mut z: Vec<String> = vec![
+                    "akanon", "blackburrow", "qeynos2", "gfaydark", "crushbone", "neriaka",
+                    "felwithea", "highpass", "everfrost", "butcher",
+                ].into_iter().map(str::to_string).collect();
+                if include_water { z.push("qcat".to_string()); }
+                z
+            });
 
         let mut seed: u64 = 0xD21F_7A3E; // same seed family as the static scanner
         let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as u32 };
 
         let (mut tot_pairs, mut tot_walked, mut tot_wedged) = (0usize, 0usize, 0usize);
-        let (mut tot_height, mut tot_overlap, mut tot_other) = (0usize, 0usize, 0usize);
-        println!("\n{:<12} {:>6} {:>7} {:>8} {:>8} {:>6}", "zone", "walked", "wedged", "height", "overlap", "other");
+        let (mut tot_height, mut tot_overlap, mut tot_other, mut tot_water) = (0usize, 0usize, 0usize, 0usize);
+        println!("\n=== faithful walker drift: {} mode ===", if include_water { "WATER-INCLUSIVE" } else { "DRY" });
+        println!("{:<12} {:>6} {:>7} {:>8} {:>8} {:>6} {:>6}", "zone", "walked", "wedged", "height", "overlap", "other", "water");
         for zone in &zones {
             let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
             let Ok(za) = ZoneAssets::from_glb(&p) else { println!("{zone:<12}  (no glb — skipped)"); continue };
@@ -4632,37 +4929,53 @@ mod tests {
                 let d = 120.0 + (rnd() as f32 / u32::MAX as f32) * 280.0;
                 let (ge, gn) = (e + d * ang.cos(), n + d * ang.sin());
                 let Some(gz) = col.nearest_floor(ge, gn, z, 400.0, 400.0) else { continue };
-                // Dry routes only (the swim-capable variant, PR-D, un-skips water).
+                // WATER MODE (#378 Phase 2 validation): `DRIFT_INCLUDE_WATER=1` KEEPS water-adjacent
+                // journeys so the water dimension is MEASURED, not silently dropped — the lesson from
+                // the earlier miss. The water CROSSING itself is a separate pre-existing bug (#423,
+                // out of scope), so those journeys are expected to wedge at the waterline and are
+                // COUNTED in a `water` column, never hidden. Dry mode (default) is the original gate.
                 let s = [e, n, z]; let g = [ge, gn, gz];
-                if col.in_water(s) || col.in_water(g) { continue; }
+                if !include_water && (col.in_water(s) || col.in_water(g)) { continue; }
                 // DRIVABILITY FILTER. This pure-pursuit sim faithfully drives WALK legs only. It does
                 // NOT execute A*'s controlled-fall, jump-edge, or swim edges (those need the walker's
                 // fall/jump/swim intents, out of scope here — the static scanner skipped them per-PLAN
                 // for the same reason). So only accept a journey whose COARSE route is all-walkable: no
-                // segment with a big z-drop (controlled fall / jump landing) and no waypoint in water.
-                // Without this, multi-level dungeons (blackburrow, neriaka) flood the count with wedges
-                // at fall/swim TRANSITIONS the sim structurally cannot cross — a sim artifact, not a
-                // walker drift. (PR-D's swim-capable variant will drive the water legs.)
+                // segment with a big z-drop (controlled fall / jump landing) and (dry mode) no waypoint
+                // in water. Without this, multi-level dungeons (blackburrow, neriaka) flood the count
+                // with wedges at fall/swim TRANSITIONS the sim structurally cannot cross — a sim
+                // artifact, not a walker drift.
                 let PlanOutcome::Route(cr) = col.find_path_ex(
                     s, g, crate::movement::PLAYER_RADIUS, &[], 8.0, None, 0.0, PlanCtx::worker()) else { continue };
                 if cr.len() < 3 { continue; }
-                let drivable = cr.windows(2).all(|w| {
+                let no_fall_jump = cr.windows(2).all(|w| {
                     let dz = w[1][2] - w[0][2];
                     let seg = (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]);
                     dz > -4.0 && seg < 12.0 // no controlled fall, no jump-edge span
-                }) && !cr.iter().any(|w| col.in_water(*w) || col.in_water([w[0], w[1], w[2] + 3.0]));
-                if !drivable { continue; }
+                });
+                let no_water = !cr.iter().any(|w| col.in_water(*w) || col.in_water([w[0], w[1], w[2] + 3.0]));
+                if !no_fall_jump { continue; } // the sim cannot drive fall/jump edges in EITHER mode
+                if !include_water && !no_water { continue; }
                 pairs.push((s, g));
             }
             if pairs.is_empty() { println!("{zone:<12}  (no routable pairs — skipped)"); continue; }
 
-            let (mut walked, mut wedged, mut n_h, mut n_o, mut n_x) = (0usize, 0usize, 0usize, 0usize, 0usize);
+            let (mut walked, mut wedged, mut n_h, mut n_o, mut n_x, mut n_w) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
             for (s, g) in &pairs {
                 walked += 1;
                 let Some((w, aim)) = simulate(&col, *s, *g) else { continue };
-                // classify: the plan may route through water mid-journey; skip a wedge that ended in
-                // water (out of scope until the swim variant).
-                if col.in_water(w) || col.in_water([w[0], w[1], w[2] + 3.0]) { walked -= 1; continue; }
+                // A wedge that ended in/at water. DRY mode drops it (out of scope). WATER mode COUNTS
+                // it in the `water` column (the pre-existing #423 crossing bug, measured not hidden)
+                // and moves on — the height/overlap classifiers below are for dry-ground wedges.
+                if col.in_water(w) || col.in_water([w[0], w[1], w[2] + 3.0]) {
+                    if include_water {
+                        wedged += 1; n_w += 1;
+                        println!("  [{:<12}] {zone}: WATERLINE wedge ({:.1},{:.1},{:.1}) start ({:.1},{:.1},{:.1}) goal ({:.1},{:.1},{:.1}) (#423, out of scope)",
+                            "WATER #423", w[0], w[1], w[2], s[0], s[1], s[2], g[0], g[1], g[2]);
+                    } else {
+                        walked -= 1;
+                    }
+                    continue;
+                }
                 wedged += 1;
                 let to = [w[0] + aim[0] * 4.0, w[1] + aim[1] * 4.0];
                 // Classify against the heights each side ACTUALLY uses, read from the shared Body —
@@ -4684,13 +4997,18 @@ mod tests {
                 println!("  [{kind:<12}] {zone}: wedged ({:.1},{:.1},{:.1}) start ({:.1},{:.1},{:.1}) goal ({:.1},{:.1},{:.1})",
                     w[0], w[1], w[2], s[0], s[1], s[2], g[0], g[1], g[2]);
             }
-            println!("{zone:<12} {walked:>6} {wedged:>7} {n_h:>8} {n_o:>8} {n_x:>6}");
+            println!("{zone:<12} {walked:>6} {wedged:>7} {n_h:>8} {n_o:>8} {n_x:>6} {n_w:>6}");
             tot_pairs += pairs.len(); tot_walked += walked; tot_wedged += wedged;
-            tot_height += n_h; tot_overlap += n_o; tot_other += n_x;
+            tot_height += n_h; tot_overlap += n_o; tot_other += n_x; tot_water += n_w;
         }
         let rate = if tot_walked > 0 { 100.0 * tot_wedged as f32 / tot_walked as f32 } else { 0.0 };
-        println!("\n=== FAITHFUL WALKER DRIFT: {tot_walked} full journeys walked, {tot_wedged} terminal wedges \
-            ({rate:.2}%) — height #386: {tot_height}, overlap #381: {tot_overlap}, other: {tot_other} ===");
+        println!("\n=== FAITHFUL WALKER DRIFT [{}]: {tot_walked} full journeys walked, {tot_wedged} terminal wedges \
+            ({rate:.2}%) — height #386: {tot_height}, overlap #381: {tot_overlap}, other: {tot_other}, water #423: {tot_water} ===",
+            if include_water { "WATER-INCLUSIVE" } else { "DRY" });
+        if include_water {
+            println!("(water #423 = wedged at a water crossing — the SEPARATE pre-existing collision bug, \
+                      not a traversability-refactor regression; counted here so the water dimension is measured, not hidden.)");
+        }
         let _ = tot_pairs;
         assert!(tot_walked > 0, "no journeys walked — check $ZONE_DIR");
     }

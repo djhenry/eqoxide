@@ -529,28 +529,12 @@ pub fn build_channel_message(sender: &str, target: &str, chan_num: u32, message:
     buf
 }
 
-/// Choose a movement delta `(dx, dy)` from the desired `(full_dx, full_dy)` step,
-/// sliding along a single axis when the diagonal is blocked by a wall. `dx`/`dy` are
-/// in EQ server axes: dx = east (server_x), dy = north (server_y). Returns `None`
-/// only when fully boxed in. Cast at chest height (z+3) so low lips/stairs don't block.
-/// Collision world points are `[east, north, height]` = `[server_x, server_y, server_z]`.
-pub fn slide_move(
-    col: &crate::assets::Collision,
-    px: f32, py: f32, z: f32,
-    full_dx: f32, full_dy: f32, radius: f32,
-) -> Option<(f32, f32)> {
-    let chest = z + 3.0;
-    let clear = |sx: f32, sy: f32| col.path_clear([px, py, chest], [px + sx, py + sy, chest], radius);
-    if clear(full_dx, full_dy) {
-        Some((full_dx, full_dy))
-    } else if clear(full_dx, 0.0) {
-        Some((full_dx, 0.0))
-    } else if clear(0.0, full_dy) {
-        Some((0.0, full_dy))
-    } else {
-        None
-    }
-}
+// NOTE: `slide_move` — a second, divergent collision-slide implementation (chest ray at z+3, its
+// own axis-drop logic) — was DELETED in Phase 2 (#378). It had ZERO production callers: the walker
+// steers via `CharacterController` (movement.rs `slide`), the ONE collision model, which derives
+// its probe heights from `traversability::PLAYER_BODY`. A second slide model that nothing calls is
+// exactly the drift this refactor exists to make impossible (its z+3 chest ray never matched the
+// controller's `Body::chest` = 4.0). Gone; there is now a single collide-and-slide in the client.
 
 /// Fine grid resolution of the LOCAL plan — the tier the walker actually steers along.
 ///
@@ -580,6 +564,15 @@ const NAV_LOCAL_STUCK_TICKS: u32 = 3;
 /// the coarse planner every tick (~1 s). The existing stall/back-off recovery still handles a genuine
 /// wedge the fresh coarse plan can't route around.
 const REPLAN_COOLDOWN_TICKS: u32 = 6;
+/// How many PROACTIVE coarse re-plans (#246) may fire at ONE spot — without the journey getting
+/// meaningfully closer to the goal — before the walker stops honestly (#378 Phase 2). Each proactive
+/// re-plan reinstalls a fresh coarse route and so resets the stall clock, which is why the ~3 s
+/// `NAV_STUCK_TICKS` give-up never trips at a fine-impassable spot and the walker oscillated
+/// `navigating` forever (the live qcat L-corner). At ~(NAV_LOCAL_STUCK_TICKS + REPLAN_COOLDOWN_TICKS)
+/// ≈ 9 ticks per proactive re-plan, 8 of them is ~11 s of trying to detour before the honest
+/// `blocked / local_no_way_through`. Resets on real goal-ward progress (like `nav_repaths`), so a
+/// long multi-corner journey that keeps progressing never trips it.
+const PROACTIVE_REPLAN_CAP: u32 = 8;
 /// After auto-escaping a sealed interior through an in-zone teleport (#266), block another escape for
 /// this long (~10 s at 150 ms/tick) so a goal that's STILL unreachable after the teleport can't
 /// ping-pong the char back and forth through the portal. One escape attempt, then it walks/stalls.
@@ -988,6 +981,15 @@ pub struct Navigator {
     local_stuck_ticks: u32,
     replan_coarse:     bool,
     replan_cooldown:   u32,
+    /// How many PROACTIVE coarse re-plans (#246) have fired since the journey last made real
+    /// progress. This is the oscillation guard (#378 Phase 2). Each proactive re-plan installs a
+    /// fresh coarse route, which `apply_plan` resets `path_i`/`stuck_i` for — so the stall clock
+    /// (`stuck_ticks`) never accumulates its 20-tick give-up and `nav_repaths` (bumped only by the
+    /// stall path) never climbs. Without a counter of its OWN, a spot the fine tier cannot thread
+    /// but the coarse tier keeps "re-routing" around loops `navigating` FOREVER — the live qcat
+    /// L-corner. Capped at [`PROACTIVE_REPLAN_CAP`]; reset on real goal-ward progress (like
+    /// `nav_repaths`). At the cap the walker stops honestly with `blocked / local_no_way_through`.
+    proactive_replans: u32,
     /// Auto-escape a SEALED interior via an in-zone teleport (#266). When a /goto goal is walk-
     /// unreachable and the nearest zone-line region is a translocator that loops back to THIS zone (the
     /// Qeynos guild-vault waterfall), the goto is temporarily redirected to that region — the char
@@ -1182,6 +1184,7 @@ impl Navigator {
             stuck_ticks: 0,
             stuck_i: 0,
             nav_repaths: 0,
+            proactive_replans: 0,
             nav_best_gdist: f32::MAX,
             backoff_ticks: 0,
             local_stuck_ticks: 0,
@@ -1410,6 +1413,7 @@ impl Navigator {
             self.stuck_best = f32::MAX;
             self.stuck_ticks = 0;
             self.nav_repaths = 0;
+            self.proactive_replans = 0;
             self.nav_best_gdist = f32::MAX;
             self.backoff_ticks = 0;
             self.local_stuck_ticks = 0;
@@ -1422,6 +1426,7 @@ impl Navigator {
             self.planner.cancel();
             self.awaiting_first_plan = false;
             self.set_nav_state("idle");
+            self.nav_state.lock().unwrap().tier = None; // no route committed → no per-route tier
 
             let mut shared = self.zone_points.lock().unwrap();
             // Start fresh with server entries.
@@ -1493,6 +1498,17 @@ impl Navigator {
         if s.state != state || s.reason != reason {
             s.state = state.to_string();
             s.reason = reason;
+            // A state transition retires the previous route's per-instance facts (#378 Phase 2,
+            // #343 discipline): the `nav_blocked_by` payload belongs to ONE `no_path`, and `nav_tier`
+            // belongs to ONE committed route. Leaving either set across a transition — e.g. a
+            // "preferred" tier from an ARRIVED journey A surviving into journey B's `no_path`, or an
+            // Exhausted `navigating_partial` reading a stale tier — is exactly the `connected:true`
+            // stale-field lie. Cleared here on EVERY transition; the Route arm of `apply_plan`
+            // re-sets `tier` immediately after (it writes it AFTER this call), and `stop_nav_blocked`
+            // re-sets the blockage immediately after, so a genuinely-current fact is never lost.
+            s.blocked_goal = None;
+            s.blocked_frontier = None;
+            s.tier = None;
         }
     }
 
@@ -1511,9 +1527,28 @@ impl Navigator {
     /// machine-readable reason, the message log, and the trace. A nav failure that says nothing is
     /// the worst failure mode this client has — it cost the project months (#337).
     fn stop_nav(&mut self, gs: &mut GameState, state: &str, reason: &str, msg: &str) {
+        self.stop_nav_blocked(gs, state, reason, None, None, msg);
+    }
+
+    /// [`stop_nav`], additionally publishing the agent-honesty blockage payload (#378 Phase 2). The
+    /// two `Blockage`es come from the COLD diagnosis inside `PlanOutcome::Unreachable`; they are set
+    /// on `NavStatus` (surfaced as `nav_blocked_by` on /v1/observe/debug) so an agent handed a
+    /// terminal `no_path` learns WHAT stopped it and WHERE, not just that it stopped.
+    fn stop_nav_blocked(&mut self, gs: &mut GameState, state: &str, reason: &str,
+        goal_blk: Option<crate::traversability::Blockage>,
+        frontier_blk: Option<crate::traversability::Blockage>, msg: &str)
+    {
         tracing::warn!("NAV: {msg}");
         gs.log_msg("zone", msg);
         self.set_nav_state_because(state, Some(reason));
+        // Publish the blockage AFTER the state (set_nav_state_because clears it on transition).
+        let to_nav = |b: crate::traversability::Blockage| crate::http::NavBlockage {
+            hazard: b.hazard.as_str(), at: b.at };
+        {
+            let mut s = self.nav_state.lock().unwrap();
+            s.blocked_goal = goal_blk.map(to_nav);
+            s.blocked_frontier = frontier_blk.map(to_nav);
+        }
         self.path.clear();
         // Drop the fine PLAN, but deliberately KEEP the fine tier's last word (`nav_local`) — it is
         // the evidence behind a terminal `blocked`, and an agent reading the outcome of a failed goto
@@ -1572,8 +1607,13 @@ impl Navigator {
             self.local_stuck_ticks += 1;
             if self.local_stuck_ticks >= NAV_LOCAL_STUCK_TICKS {
                 self.replan_coarse = true;
+                // Count each armed proactive re-plan toward the oscillation budget (#378 Phase 2).
+                // `tick` resets this on real progress and terminates honestly at the cap, so a spot
+                // the fine tier cannot thread can no longer loop `navigating` forever (qcat L-corner).
+                self.proactive_replans += 1;
                 tracing::debug!("NAV: fine plan CLOSED its window short of the carrot near ({:.0},{:.0}) \
-                    ({}) — re-planning coarse (#246)", reply.start[0], reply.start[1], outcome.reason());
+                    ({}) — re-planning coarse (#246, proactive #{})", reply.start[0], reply.start[1],
+                    outcome.reason(), self.proactive_replans);
             }
         } else if outcome.threaded() {
             self.local_stuck_ticks = 0;
@@ -1635,6 +1675,12 @@ impl Navigator {
                     Some(_) => self.set_nav_state_because("navigating", Some("goal_z_snapped")),
                     None    => self.set_nav_state("navigating"),
                 }
+                // Publish the PER-ROUTE tier (#378 Phase 2 / design §4c): `minimum` = this route
+                // only existed at the character's own collision radius (a tight door/bridge, no
+                // margin — riskier), `preferred` = the roomy tier carried it. The agent sees the
+                // risk of the route it is actually walking, not a zone-lifetime aggregate.
+                self.nav_state.lock().unwrap().tier =
+                    Some(if reply.tight { "minimum" } else { "preferred" });
                 false
             }
             // The search was CUT SHORT — "I don't know", not "no route". It did close real ground
@@ -1663,7 +1709,7 @@ impl Navigator {
                 true
             }
             // DEFINITIVE: no route exists.
-            PlanOutcome::Unreachable(why) => {
+            PlanOutcome::Unreachable { reason: why, goal_blocked_by, frontier_blocked_by } => {
                 // ...unless the only way out is an in-zone translocator (the Qeynos guild-vault
                 // waterfall): REDIRECT the goto to it — the char walks in via the normal machinery,
                 // the auto-cross teleports it out, and the post-teleport jump restores the real goal
@@ -1690,9 +1736,18 @@ impl Navigator {
                         return true;
                     }
                 }
-                self.stop_nav(gs, "no_path", why.as_str(), &format!(
+                // The agent-honesty payload (#378 Phase 2): name WHAT is blocking and WHERE, so an
+                // agent gets more than a bare `search_closed`. `goal_blocked_by` is the definitive
+                // "your goal itself is impossible"; `frontier_blocked_by` is "I got as close as here
+                // and THIS is the obstruction". Both are surfaced on /v1/observe/debug alongside the
+                // reason; a missing diagnosis stays absent (honest silence, never invented).
+                let blk = goal_blocked_by.or(frontier_blocked_by);
+                let detail = blk.map(|b| format!(" — blocked by {} at ({:.0},{:.0},{:.0})",
+                    b.hazard.as_str(), b.at[0], b.at[1], b.at[2])).unwrap_or_default();
+                self.stop_nav_blocked(gs, "no_path", why.as_str(), goal_blocked_by, frontier_blocked_by,
+                    &format!(
                     "No route to ({:.0},{:.0}): {} (searched to completion in {}ms — this is a definitive no, \
-                     not a timeout).", goal.0, goal.1, why.as_str(), reply.plan_ms));
+                     not a timeout){}.", goal.0, goal.1, why.as_str(), reply.plan_ms, detail));
                 true
             }
         }
@@ -2788,6 +2843,7 @@ impl Navigator {
             self.stuck_best = f32::MAX;
             self.stuck_ticks = 0;
             self.nav_repaths = 0;
+            self.proactive_replans = 0; // a new destination: the old spot's proactive budget is moot
             self.nav_best_gdist = f32::MAX;
             self.replan_cooldown = 0;
             self.replan_coarse = false;
@@ -3098,6 +3154,31 @@ impl Navigator {
         if gdist < self.nav_best_gdist - REPATH_RESET_DIST {
             self.nav_best_gdist = gdist;
             self.nav_repaths = 0;
+            // The fine-impassable spot is behind us — the journey is progressing, so forgive the
+            // proactive re-plans spent getting past it (#378 Phase 2). This is what keeps the guard
+            // below from ever tripping on a long multi-corner journey that is otherwise fine.
+            self.proactive_replans = 0;
+        }
+
+        // OSCILLATION GUARD (#378 Phase 2 — the live qcat L-corner honesty fix). The proactive coarse
+        // re-plan (#246) re-routes around a spot the fine 2u tier cannot thread, and each fresh route
+        // resets the stall clock — so `stuck_ticks` never reaches its 20-tick give-up and the walker
+        // oscillated `navigating` FOREVER on a corner it could not round toward an around-the-corner
+        // goal. If the proactive re-plan has fired PROACTIVE_REPLAN_CAP times without the journey
+        // getting meaningfully closer (the reset above), the re-routing is not helping: this is a
+        // genuine wedge, and the honest answer is `blocked / local_no_way_through` — NOT a silent loop,
+        // and NOT `no_path` (a coarse route to the goal does exist; the walker cannot physically follow
+        // it here). `Exhausted`-style "I don't know" is untouched — this fires only on a real,
+        // repeatedly-confirmed local dead-end.
+        if self.proactive_replans >= PROACTIVE_REPLAN_CAP {
+            self.stop_nav(gs, "blocked", "local_no_way_through", &format!(
+                "Wedged near ({:.1},{:.1}) after {} proactive coarse re-plans that did not get the \
+                 journey past this spot: the fine 2u planner cannot thread the committed route here, \
+                 and re-routing keeps returning to the same impasse. The corridor is not traversable at \
+                 the character's collision radius from this approach — a coarse route to the goal exists, \
+                 but the walker cannot follow it around this corner. Approach from another direction.",
+                gs.player_x, gs.player_y, self.proactive_replans));
+            return;
         }
 
         // Active downhill back-off (eqoxide#212): after a hard stall we drive the REVERSE aim for a
@@ -3836,6 +3917,7 @@ mod tests {
             outcome: crate::assets::PlanOutcome::Route(vec![[0.0, 0.0, 47.0], [100.0, 100.0, 47.0]]),
             plan_ms: 5,
             goal_snapped_z: Some(47.0),
+            tight: false,
         }, &mut gs, goal);
 
         let st = nav.nav_state.lock().unwrap().clone();
@@ -3855,10 +3937,77 @@ mod tests {
             outcome: crate::assets::PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]]),
             plan_ms: 5,
             goal_snapped_z: None,
+            tight: false,
         }, &mut gs, goal);
         let st = nav.nav_state.lock().unwrap().clone();
         assert_eq!(st.reason, None, "a goal that was honoured as given carries no snap reason");
         assert!(!nav.goal_snapped);
+    }
+
+    /// **`nav_tier` IS PER-ROUTE AND MUST NOT GO STALE (#378 Phase 2, #343 discipline).** The tier is
+    /// the fact for the route being walked RIGHT NOW; it must never survive into a state whose route
+    /// it does not describe. Repro the review's finding: journey A commits a `preferred` route →
+    /// journey B is unreachable → the `no_path` state must NOT still read `preferred` from A. Also
+    /// pins that an ARRIVED and an Exhausted `navigating_partial` state carry no stale tier.
+    #[test]
+    fn nav_tier_does_not_survive_into_a_later_no_path_or_arrived() {
+        use crate::assets::{NoRoute, PlanLimit, PlanOutcome};
+        use crate::eq_net::nav_planner::PlanReply;
+        let group: crate::http::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::http::GroupSnapshot::default()));
+        let mut nav = test_navigator(group);
+        let mut gs = GameState::new();
+        let goal = (100.0f32, 100.0f32, 0.0f32);
+
+        // Journey A: a committed route at the roomy tier → nav_tier = "preferred".
+        nav.apply_plan(PlanReply {
+            gen: 1,
+            outcome: PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]]),
+            plan_ms: 5, goal_snapped_z: None, tight: false,
+        }, &mut gs, goal);
+        assert_eq!(nav.nav_state.lock().unwrap().tier, Some("preferred"),
+            "a committed preferred route publishes nav_tier = preferred");
+
+        // Journey B: a definitively unreachable goal → no_path. The tier from A must be GONE.
+        nav.apply_plan(PlanReply {
+            gen: 2,
+            outcome: PlanOutcome::Unreachable {
+                reason: NoRoute::SearchClosed, goal_blocked_by: None, frontier_blocked_by: None },
+            plan_ms: 5, goal_snapped_z: None, tight: false,
+        }, &mut gs, goal);
+        let st = nav.nav_state.lock().unwrap().clone();
+        assert_eq!(st.state, "no_path");
+        assert_eq!(st.tier, None,
+            "nav_tier must NOT survive from journey A into journey B's no_path (the #343 stale-field lie)");
+
+        // A fresh minimum-tier route, then an Exhausted partial: the partial is not a confirmed route,
+        // so it must carry no tier either.
+        nav.apply_plan(PlanReply {
+            gen: 3,
+            outcome: PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [50.0, 50.0, 0.0]]),
+            plan_ms: 5, goal_snapped_z: None, tight: true,
+        }, &mut gs, goal);
+        assert_eq!(nav.nav_state.lock().unwrap().tier, Some("minimum"));
+        nav.apply_plan(PlanReply {
+            gen: 4,
+            outcome: PlanOutcome::Exhausted {
+                limit: PlanLimit::NodeCap,
+                progress: Some(vec![[0.0, 0.0, 0.0], [60.0, 60.0, 0.0], [90.0, 90.0, 0.0]]) },
+            plan_ms: 5, goal_snapped_z: None, tight: false,
+        }, &mut gs, goal);
+        let st = nav.nav_state.lock().unwrap().clone();
+        assert_eq!(st.state, "navigating_partial");
+        assert_eq!(st.tier, None, "an Exhausted partial walk is not a confirmed route — it carries no tier");
+
+        // And an arrived state (reached via set_nav_state) after a committed route carries no stale tier.
+        nav.apply_plan(PlanReply {
+            gen: 5,
+            outcome: PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]]),
+            plan_ms: 5, goal_snapped_z: None, tight: false,
+        }, &mut gs, goal);
+        assert_eq!(nav.nav_state.lock().unwrap().tier, Some("preferred"));
+        nav.set_nav_state("arrived");
+        assert_eq!(nav.nav_state.lock().unwrap().tier, None,
+            "arrival ends the route — its tier must not linger");
     }
 
     /// A goal that has not meaningfully moved must not re-plan at all (the cheap half of B1).
@@ -4148,11 +4297,52 @@ mod tests {
         assert_eq!(nav.local_i, 0, "local_i must reset with local_path on zone change");
         assert_eq!(nav.stuck_ticks, 0);
         assert_eq!(nav.nav_repaths, 0);
+        assert_eq!(nav.proactive_replans, 0, "the oscillation budget must reset on zone change");
         assert_eq!(nav.backoff_ticks, 0);
         assert!(!nav.replan_coarse);
         assert!(nav.falling.is_none());
         assert_eq!(*nav.nav_state.lock().unwrap(), "idle");
         assert_eq!(nav.current_zone, "crushbone");
+    }
+
+    /// **THE OSCILLATION GUARD counts proactive re-plans (#378 Phase 2).** A repeatedly-`NoWayThrough`
+    /// fine tier must ARM the proactive coarse re-plan AND bump the oscillation budget, so a spot the
+    /// fine tier cannot thread cannot loop `navigating` forever (the live qcat L-corner). A `Threaded`
+    /// fine plan resets the local-stuck run (the wedge is over) but does NOT retroactively forgive the
+    /// budget — only real journey progress (in `tick`) does that.
+    #[test]
+    fn proactive_replan_arms_and_counts_toward_the_oscillation_budget() {
+        use crate::assets::{LocalOutcome, NoRoute};
+        let group: crate::http::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::http::GroupSnapshot::default()));
+        let mut nav = test_navigator(group);
+
+        let nwt = |start: [f32; 3]| crate::eq_net::nav_planner::LocalReply {
+            gen: 1, start, goal: [start[0] + 40.0, start[1], start[2]],
+            outcome: LocalOutcome::NoWayThrough { steer: vec![start], why: NoRoute::SearchClosed },
+            plan_us: 100,
+        };
+        // Healthy walker, cooldown clear: NAV_LOCAL_STUCK_TICKS consecutive NoWayThrough plans arm the
+        // proactive re-plan on the LAST one, and that arming bumps the oscillation budget exactly once.
+        nav.backoff_ticks = 0;
+        nav.stuck_ticks = 0;
+        nav.replan_cooldown = 0;
+        for _ in 0..NAV_LOCAL_STUCK_TICKS {
+            nav.apply_local_plan(nwt([0.0, 0.0, 0.0]));
+        }
+        assert!(nav.replan_coarse, "NoWayThrough × NAV_LOCAL_STUCK_TICKS must arm the proactive re-plan");
+        assert_eq!(nav.proactive_replans, 1, "arming the proactive re-plan bumps the oscillation budget");
+
+        // A Threaded plan ends the local-stuck run but must not forgive the budget (only tick's
+        // progress reset does): the fine tier finding one way through does not prove the wedge gone.
+        nav.apply_local_plan(crate::eq_net::nav_planner::LocalReply {
+            gen: 2, start: [0.0, 0.0, 0.0], goal: [40.0, 0.0, 0.0],
+            outcome: LocalOutcome::Threaded(vec![[0.0, 0.0, 0.0], [40.0, 0.0, 0.0]]), plan_us: 100,
+        });
+        assert_eq!(nav.local_stuck_ticks, 0, "a threaded fine plan resets the local-stuck run");
+        assert_eq!(nav.proactive_replans, 1, "a threaded fine plan must not forgive the oscillation budget");
+
+        // The cap is a real, small bound — the guard is not a no-op.
+        assert!(PROACTIVE_REPLAN_CAP > 0 && PROACTIVE_REPLAN_CAP <= 16);
     }
 
     #[test]
@@ -4301,34 +4491,6 @@ mod tests {
         assert_eq!(p.len(), msg_end + 1);
     }
 
-    fn wall_collision() -> crate::assets::Collision {
-        // Vertical wall at world east=5: EQ p2=5 (render.X), north=p0 [0,10], height=p1 [0,10].
-        let wall = crate::assets::MeshData {
-            positions: vec![[0.0, 0.0, 5.0], [10.0, 0.0, 5.0], [10.0, 10.0, 5.0], [0.0, 10.0, 5.0]],
-            normals: vec![[0.0, 0.0, 1.0]; 4],
-            uvs: vec![[0.0, 0.0]; 4],
-            indices: vec![0, 1, 2, 0, 2, 3],
-            texture_name: None,
-            base_color: [1.0; 4],
-            center: [0.0, 0.0, 0.0],
-            render_mode: crate::assets::RenderMode::Opaque, anim: None,
-        };
-        crate::assets::Collision::build(
-            &crate::assets::ZoneAssets { terrain: vec![wall], objects: vec![], textures: vec![] }, 4.0)
-    }
-
-    #[test]
-    fn slide_move_slides_along_wall_when_diagonal_blocked() {
-        let col = wall_collision();
-        // Player at east=3, north=5, stepping toward the wall (east +2) and north (+2).
-        // The diagonal hits the wall at east=5, so it should slide to north-only.
-        // slide_move(col, px=east, py=north, z, full_dx=east, full_dy=north, radius)
-        let r = slide_move(&col, 3.0, 5.0, 0.0, 2.0, 2.0, 2.0);
-        assert_eq!(r, Some((0.0, 2.0)), "should slide along north, dropping the blocked east");
-
-        // Moving away from the wall (east -2) is unobstructed → full move.
-        assert_eq!(slide_move(&col, 3.0, 5.0, 0.0, -2.0, 2.0, 2.0), Some((-2.0, 2.0)));
-    }
 
     #[test]
     fn build_target_packet_is_spawn_id_le() {
