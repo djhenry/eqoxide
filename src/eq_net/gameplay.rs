@@ -20,6 +20,48 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// How often to re-send the bind-respawn request while an explicit respawn is pending (#284/#50).
 const RESPAWN_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
+/// #371 active liveness probe. `connected:true` only proves the SOCKET ACKs; a wedged zone keeps
+/// ACKing while its main loop stops processing, which is indistinguishable from a quiet zone by the
+/// passive clocks. The probe is a self-`OP_Consider`: purely zone-MAIN-LOOP-serviced (the zone
+/// resolves it against its in-process entity list and replies — no WORLD hop, unlike OP_WhoAll),
+/// benign (self is not an NPC, so faction is hardcoded 1 with no aggro/faction/hate-list evaluation),
+/// and outside any anti-cheat path (MQGhost keys on movement cadence only). An unanswered probe past
+/// [`crate::http::PROBE_TIMEOUT_SECS`] while the socket still ACKs is the wedged-world signal.
+///
+/// Only sent once the world has been application-silent this long — during active play spontaneous
+/// packets already prove the world is processing, so the probe adds no load there.
+const PROBE_QUIET_THRESHOLD: Duration = Duration::from_secs(12);
+/// Minimum gap between probes while the world stays quiet, so we poke at most ~twice a minute.
+const PROBE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// #371: does this OP_Consider reply describe our OWN spawn — i.e. is it the reply to our
+/// self-consider liveness probe, rather than a user `/consider` of another mob? Reads targetid@4
+/// of Consider_Struct.
+fn consider_reply_is_self(payload: &[u8], player_id: u32) -> bool {
+    player_id != 0
+        && payload.len() >= 8
+        && u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]) == player_id
+}
+
+/// #371: is a liveness probe currently awaiting its reply? True when we have sent a probe that has
+/// not yet been answered (no reply, or the last reply predates the last send). Used to consume the
+/// probe's own reply exactly once, so a genuine user self-consider is never swallowed.
+fn probe_outstanding(h: &crate::http::NetHealth) -> bool {
+    match (h.last_probe_sent, h.last_probe_reply) {
+        (Some(sent), Some(reply)) => sent > reply,
+        (Some(_), None)           => true,
+        _                         => false,
+    }
+}
+
+/// #371: on a zone change, discard the previous zone's probe verdict. `world_responsive` returns to
+/// "no verdict yet" (true) until we re-probe in the new zone, so a transition never reads as a wedge.
+fn reset_probe_clocks(net_health: &crate::http::NetHealthShared) {
+    let mut h = net_health.lock().unwrap();
+    h.last_probe_sent = None;
+    h.last_probe_reply = None;
+}
+
 /// Consume the zone stream and run the gameplay loop indefinitely.
 pub async fn run_gameplay_phase(
     stream_init:   EqStream,
@@ -102,6 +144,19 @@ pub async fn run_gameplay_phase(
         let mut zone_redirect: Option<(String, u16)> = None;
         let mut world_reconnect_needed = false;
         while let Ok(packet) = rx.try_recv() {
+            // #371: intercept the reply to OUR self-consider liveness probe BEFORE apply_packet.
+            // It is an internal health poke, not world state — stamp the probe clock and DROP it, so
+            // it does not spam the con log, overwrite target con, or bump `last_packet` (which would
+            // reset last_packet_age_ms every probe cadence and destroy its "world quiet for 45s"
+            // meaning). Only consume it while a probe is actually outstanding, so a genuine user
+            // self-consider is never swallowed.
+            if packet.opcode == OP_CONSIDER && consider_reply_is_self(&packet.payload, gs.player_id) {
+                let mut h = net_health.lock().unwrap();
+                if probe_outstanding(&h) {
+                    h.last_probe_reply = Some(std::time::Instant::now());
+                    continue;
+                }
+            }
             apply_packet(&mut gs, &packet);
             net_health.lock().unwrap().last_packet = std::time::Instant::now();
             navigator.sync_entities(&gs);
@@ -351,6 +406,7 @@ pub async fn run_gameplay_phase(
                 ).await;
                 navigator.sync_zone_points(&gs);
                 last_keepalive = std::time::Instant::now();
+                reset_probe_clocks(&net_health);
             } else {
                 tracing::warn!("EQ: world reconnect failed — exiting gameplay");
                 return;
@@ -384,6 +440,7 @@ pub async fn run_gameplay_phase(
                     ).await;
                     navigator.sync_zone_points(&gs);
                     last_keepalive = std::time::Instant::now();
+                    reset_probe_clocks(&net_health);
                 }
                 Err(e) => {
                     tracing::warn!("EQ: zone transition connect failed: {e}");
@@ -398,6 +455,28 @@ pub async fn run_gameplay_phase(
         if last_keepalive.elapsed() > KEEPALIVE_INTERVAL {
             s.send_keepalive();
             last_keepalive = std::time::Instant::now();
+        }
+
+        // ── Active liveness probe (#371) ─────────────────────────────────────
+        // Poke the zone MAIN LOOP with a cheap self-consider it must service to answer, so a wedged
+        // zone (still ACKing at the socket, but not processing) is distinguishable from a merely
+        // quiet one. The reply is captured above and turned into `world_responsive` at HTTP read
+        // time. Only fires once the world has been application-silent for PROBE_QUIET_THRESHOLD (no
+        // load during active play) and at most once per PROBE_INTERVAL. Gated on being in-zone
+        // (player_id set); a self-consider is benign and non-disruptive (see the const doc).
+        if gs.player_id != 0 {
+            let (last_packet_ago, probe_sent_ago) = {
+                let h = net_health.lock().unwrap();
+                (h.last_packet.elapsed(), h.last_probe_sent.map(|t| t.elapsed()))
+            };
+            let app_silent = last_packet_ago >= PROBE_QUIET_THRESHOLD;
+            let probe_due  = probe_sent_ago.map_or(true, |a| a >= PROBE_INTERVAL);
+            if app_silent && probe_due {
+                s.send_app_packet(OP_CONSIDER,
+                    &crate::eq_net::navigation::build_consider_packet(gs.player_id, gs.player_id));
+                net_health.lock().unwrap().last_probe_sent = Some(std::time::Instant::now());
+                tracing::debug!("EQ: liveness probe — sent self-consider (#371)");
+            }
         }
 
         // Respawn drive (#284): we no longer auto-respawn. While dead, we recover ONLY once the
@@ -1135,5 +1214,61 @@ mod zone_entry_handshake_publish_tests {
         }
 
         handle.abort();
+    }
+}
+
+#[cfg(test)]
+mod liveness_probe_tests {
+    use super::{consider_reply_is_self, probe_outstanding};
+    use crate::http::NetHealth;
+    use std::time::{Duration, Instant};
+
+    fn ago(secs: u64) -> Instant { Instant::now() - Duration::from_secs(secs) }
+
+    /// The self-consider probe reply is discriminated from a user `/consider` of another mob purely
+    /// by `targetid == our own spawn id` (Consider_Struct targetid@4). This is what lets us consume
+    /// the probe's reply and drop it, without swallowing a real consider of some other spawn.
+    #[test]
+    fn consider_reply_is_self_matches_only_our_own_spawn() {
+        let mut reply = vec![0u8; 20];
+        reply[4..8].copy_from_slice(&42u32.to_le_bytes()); // targetid = 42
+        assert!(consider_reply_is_self(&reply, 42),  "targetid == player_id → our probe reply");
+        assert!(!consider_reply_is_self(&reply, 99), "targetid != player_id → a real consider of another mob");
+    }
+
+    /// player_id 0 (not yet in-zone) never matches — we never send a probe then, and a stray
+    /// targetid-0 packet must not be mistaken for a probe reply.
+    #[test]
+    fn consider_reply_is_self_never_matches_before_zone_in() {
+        let reply = vec![0u8; 20]; // targetid = 0
+        assert!(!consider_reply_is_self(&reply, 0));
+    }
+
+    /// A short/truncated payload can't be a valid self-consider reply — don't index out of bounds.
+    #[test]
+    fn consider_reply_is_self_rejects_short_payload() {
+        assert!(!consider_reply_is_self(&[0u8; 4], 42));
+    }
+
+    /// `probe_outstanding` gates the reply-consume so it fires exactly once per probe: true only
+    /// while a sent probe is still awaiting its answer.
+    #[test]
+    fn probe_outstanding_reflects_the_send_reply_race() {
+        let mut h = NetHealth::default();
+        // Never probed → nothing outstanding.
+        h.last_probe_sent = None; h.last_probe_reply = None;
+        assert!(!probe_outstanding(&h), "no probe ever sent → nothing outstanding");
+
+        // Sent, no reply yet → outstanding.
+        h.last_probe_sent = Some(ago(2)); h.last_probe_reply = None;
+        assert!(probe_outstanding(&h), "sent but unanswered → outstanding");
+
+        // Reply came AFTER the send → answered, not outstanding (a later user self-consider is safe).
+        h.last_probe_sent = Some(ago(5)); h.last_probe_reply = Some(ago(4));
+        assert!(!probe_outstanding(&h), "reply newer than send → answered");
+
+        // A new probe sent after the last reply → outstanding again.
+        h.last_probe_sent = Some(ago(1)); h.last_probe_reply = Some(ago(10));
+        assert!(probe_outstanding(&h), "newest send postdates the last reply → outstanding again");
     }
 }
