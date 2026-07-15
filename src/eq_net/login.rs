@@ -25,7 +25,12 @@ use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, MerchantShared, DoorClic
 type DesCbcEnc = Encryptor<Des>;
 type DesCbcDec = Decryptor<Des>;
 
-// ── DES helpers (Titanium login uses all-zero key+IV) ────────────────────────
+// ── DES helpers ──────────────────────────────────────────────────────────────
+// The EQEmu loginserver encrypts the OP_Login credential block and the OP_LoginAccepted
+// reply with DES-CBC using an all-zero key AND all-zero IV (loginserver/encryption.cpp
+// `eqcrypt_block`). This is shared by BOTH the Titanium and the SoD/RoF2 login listeners —
+// SoD did NOT change the login encryption, only the response opcode numbers (#404). So these
+// helpers are correct for the SoD handshake unchanged.
 
 fn des_encrypt(data: &[u8]) -> Vec<u8> {
     let mut out = data.to_vec();
@@ -525,6 +530,9 @@ impl<'a> LoginProtocol<'a> {
                     OP_EXPANSION_INFO,
                     OP_LOG_SERVER,
                     OP_APPROVE_WORLD,
+                    // SoD login listener sends this just before OP_LoginAccepted; it carries
+                    // only expansion-offer data this headless client doesn't use (#404).
+                    OP_LOGIN_EXPANSION_PACKET_DATA,
                 ];
                 if !SILENT.contains(&op) {
                     tracing::info!("EQ: unhandled opcode 0x{:04x} ({} bytes)", op, packet.payload.len());
@@ -538,15 +546,7 @@ impl<'a> LoginProtocol<'a> {
 
     fn send_credentials(&self, stream: &mut EqStream) {
         tracing::info!("EQ: sending credentials for '{}'", self.config.username);
-        let creds = format!("{}\0{}\0", self.config.username, self.config.password);
-        let padded_len = ((creds.len() + 7) / 8) * 8;
-        let mut creds_bytes = creds.into_bytes();
-        creds_bytes.resize(padded_len, 0);
-        let encrypted = des_encrypt(&creds_bytes);
-        // Header: struct.pack('<ibbi', 3, 0, 2, 0)
-        let mut payload = vec![3u8, 0, 0, 0,  0,  2,  0, 0, 0, 0];
-        payload.extend_from_slice(&encrypted);
-        stream.send_app_packet(OP_LOGIN, &payload);
+        stream.send_app_packet(OP_LOGIN, &build_login_request(&self.config.username, &self.config.password));
     }
 
     fn send_server_list_request(&self, stream: &mut EqStream) {
@@ -555,10 +555,7 @@ impl<'a> LoginProtocol<'a> {
     }
 
     fn send_play_everquest(&self, stream: &mut EqStream) {
-        // Header: struct.pack('<ibbi', 5, 0, 0, 0)
-        let mut payload = vec![5u8, 0, 0, 0,  0,  0,  0, 0, 0, 0];
-        payload.extend_from_slice(&self.world_server_id.to_le_bytes());
-        stream.send_app_packet(OP_PLAY_EVERQUEST_REQ, &payload);
+        stream.send_app_packet(OP_PLAY_EVERQUEST_REQ, &build_play_everquest(self.world_server_id));
         tracing::info!("EQ: sent play everquest request (server_id={})", self.world_server_id);
     }
 
@@ -575,79 +572,126 @@ impl<'a> LoginProtocol<'a> {
 
     /// Returns false if the server rejected the credentials.
     fn parse_login_accepted(&mut self, payload: &[u8]) -> bool {
-        if payload.len() < 10 {
-            tracing::info!("EQ: LoginAccepted too short ({} bytes) — assuming success", payload.len());
-            self.lsid   = 1;
-            self.ls_key = "0".to_string();
-            return true;
+        match parse_login_accepted_payload(payload) {
+            Some((lsid, key)) => {
+                self.lsid   = lsid;
+                self.ls_key = key;
+                tracing::info!("EQ: login accepted: lsid={} key={}", self.lsid, self.ls_key);
+                true
+            }
+            None => {
+                tracing::error!("EQ: login rejected by server (success=0)");
+                false
+            }
         }
-        let encrypted = &payload[10..];
-        if encrypted.is_empty() {
-            tracing::info!("EQ: LoginAccepted has no encrypted block — assuming success");
-            self.lsid   = 1;
-            self.ls_key = "0".to_string();
-            return true;
-        }
-        let dec = des_decrypt(encrypted);
-        if dec.len() < 12 {
-            tracing::info!("EQ: decrypted LoginReply too short — assuming success");
-            self.lsid   = 1;
-            self.ls_key = "0".to_string();
-            return true;
-        }
-        if dec[0] == 0 {
-            let err_id = u32::from_le_bytes([dec[1], dec[2], dec[3], dec[4]]);
-            tracing::error!("EQ: login rejected (success=0, error_id={})", err_id);
-            return false;
-        }
-        self.lsid = i32::from_le_bytes([dec[8], dec[9], dec[10], dec[11]]);
-        let key_end = dec[12..].iter().position(|&b| b == 0)
-            .map(|p| p + 12).unwrap_or(dec.len());
-        let key = String::from_utf8_lossy(&dec[12..key_end]).to_string();
-        self.ls_key = if key.is_empty() { "0".to_string() } else { key };
-        tracing::info!("EQ: login accepted: lsid={} key={}", self.lsid, self.ls_key);
-        true
     }
 
     fn parse_server_list(&mut self, payload: &[u8]) {
-        // ServerListReply: LoginBaseMessage prefix (15 or 16 bytes) + count(i32) + entries
-        let mut offset = 16usize;
-        if payload.len() < offset + 4 { offset = 15; }
-        if payload.len() < offset + 4 {
-            tracing::info!("EQ: server list too short");
-            self.world_server_id = 1;
-            self.world_host = self.config.login_host.clone();
-            return;
-        }
-        let count = i32::from_le_bytes([payload[offset], payload[offset+1], payload[offset+2], payload[offset+3]]);
-        offset += 4;
-        tracing::info!("EQ: server list: {} server(s)", count);
-        if count <= 0 || offset >= payload.len() { return; }
-
-        // First entry: ip_str\0 + server_type(4) + server_id(4) + name_str\0 + ...
-        if let Some(ip_end) = payload[offset..].iter().position(|&b| b == 0) {
-            let world_host = String::from_utf8_lossy(&payload[offset..offset + ip_end]).to_string();
-            offset += ip_end + 1;
-            if offset + 8 <= payload.len() {
-                let server_id = u32::from_le_bytes([
-                    payload[offset+4], payload[offset+5], payload[offset+6], payload[offset+7],
-                ]);
-                offset += 8;
-                let name_end = payload[offset..].iter().position(|&b| b == 0)
-                    .unwrap_or(payload.len() - offset);
-                let name = String::from_utf8_lossy(&payload[offset..offset + name_end]).to_string();
-                tracing::info!("EQ: world server: id={} name={} host={}", server_id, name, world_host);
-                self.world_server_id = server_id;
-                self.world_host = if world_host.is_empty() || world_host == "0.0.0.0" {
-                    self.config.login_host.clone()
-                } else {
-                    world_host
-                };
-            }
-        }
-        if self.world_server_id == 0 { self.world_server_id = 1; }
-        if self.world_host.is_empty() { self.world_host = self.config.login_host.clone(); }
+        let (server_id, host, name) = parse_server_list_payload(payload, &self.config.login_host);
+        tracing::info!("EQ: world server: id={} name={} host={}", server_id, name, host);
+        self.world_server_id = server_id;
+        self.world_host = host;
     }
+}
+
+// ── SoD login packet builders / parsers (pure, unit-tested) ────────────────────
+//
+// The SoD (RoF2) login uses the SAME packet layouts and DES-CBC zero-key encryption as the
+// legacy Titanium login; only the response opcode numbers differ (see protocol.rs). Ground
+// truth for these layouts: EQEmu loginserver/login_types.h (LoginBaseMessage,
+// LoginBaseReplyMessage, PlayerLoginReply, ServerListReply) and loginserver/client.cpp +
+// world_server_manager.cpp (byte-for-byte serialization). #404.
+
+/// Build the OP_Login credential packet: a 10-byte unencrypted `LoginBaseMessage`
+/// (sequence=3 "login", encrypt_type=2 "DES") followed by the DES-CBC(zero-key) encryption
+/// of `"user\0pass\0"`, zero-padded to an 8-byte boundary (server rejects non-multiples of 8).
+fn build_login_request(user: &str, pass: &str) -> Vec<u8> {
+    let creds = format!("{user}\0{pass}\0");
+    let padded_len = creds.len().div_ceil(8) * 8;
+    let mut creds_bytes = creds.into_bytes();
+    creds_bytes.resize(padded_len, 0);
+    let encrypted = des_encrypt(&creds_bytes);
+    // LoginBaseMessage: sequence=3 (i32 LE), compressed=0, encrypt_type=2, unk3=0 (i32 LE).
+    let mut payload = vec![3u8, 0, 0, 0,  0,  2,  0, 0, 0, 0];
+    payload.extend_from_slice(&encrypted);
+    payload
+}
+
+/// Build the OP_PlayEverquestRequest packet: a 10-byte `LoginBaseMessage` (sequence=5)
+/// followed by the u32 world server id to join.
+fn build_play_everquest(server_id: u32) -> Vec<u8> {
+    let mut payload = vec![5u8, 0, 0, 0,  0,  0,  0, 0, 0, 0];
+    payload.extend_from_slice(&server_id.to_le_bytes());
+    payload
+}
+
+/// Parse an OP_LoginAccepted payload. Returns `Some((lsid, session_key))` on success, or
+/// `None` if the server explicitly rejected the credentials (decrypted `success` byte == 0).
+///
+/// Layout: `[LoginBaseMessage: 10 bytes][DES-CBC(zero-key) PlayerLoginReply]`. The decrypted
+/// PlayerLoginReply (login_types.h) is packed: success@0, error_str_id@1..5, str[1]@5,
+/// unk1@6, unk2@7, lsid@8..12, key[11]@12 (client reads to the NUL).
+///
+/// Malformed-but-not-rejected cases (too short to hold a reply) preserve the historical
+/// permissive behavior: assume success with a placeholder (lsid=1, key="0"). Only an explicit
+/// success=0 is treated as a rejection, so a real failure is never silently reported as success.
+fn parse_login_accepted_payload(payload: &[u8]) -> Option<(i32, String)> {
+    const PLACEHOLDER: (i32, &str) = (1, "0");
+    if payload.len() < 10 { return Some((PLACEHOLDER.0, PLACEHOLDER.1.to_string())); }
+    let encrypted = &payload[10..];
+    if encrypted.is_empty() { return Some((PLACEHOLDER.0, PLACEHOLDER.1.to_string())); }
+    let dec = des_decrypt(encrypted);
+    if dec.len() < 12 { return Some((PLACEHOLDER.0, PLACEHOLDER.1.to_string())); }
+    if dec[0] == 0 { return None; } // explicit rejection (success=0)
+    let lsid = i32::from_le_bytes([dec[8], dec[9], dec[10], dec[11]]);
+    let key_end = dec[12..].iter().position(|&b| b == 0)
+        .map(|p| p + 12).unwrap_or(dec.len());
+    let key = String::from_utf8_lossy(&dec[12..key_end]).to_string();
+    let key = if key.is_empty() { "0".to_string() } else { key };
+    Some((lsid, key))
+}
+
+/// Parse an OP_ServerListResponse payload. Returns `(world_server_id, world_host, world_name)`,
+/// falling back to `fallback_host` when the advertised host is empty/`0.0.0.0`.
+///
+/// Layout (world_server_manager.cpp CreateServerListPacket): `LoginBaseMessage` (10) +
+/// `LoginBaseReplyMessage` (success@10, error_str_id@11..15, empty str NUL@15) + server_count
+/// (i32)@16 + entries. Each entry: `ip\0` + server_type(i32) + server_id(u32) + `name\0` + ...
+/// (Titanium and SoD entries are identical — only cv_larion differs in world_server.cpp.)
+fn parse_server_list_payload(payload: &[u8], fallback_host: &str) -> (u32, String, String) {
+    let fb = || fallback_host.to_string();
+    let mut offset = 16usize;
+    if payload.len() < offset + 4 { offset = 15; } // defensive fallback for a shorter prefix
+    if payload.len() < offset + 4 {
+        return (1, fb(), String::new());
+    }
+    let count = i32::from_le_bytes([payload[offset], payload[offset+1], payload[offset+2], payload[offset+3]]);
+    offset += 4;
+    if count <= 0 || offset >= payload.len() {
+        return (1, fb(), String::new());
+    }
+
+    let mut server_id = 0u32;
+    let mut host = String::new();
+    let mut name = String::new();
+    // First entry: ip_str\0 + server_type(4) + server_id(4) + name_str\0 + ...
+    if let Some(ip_end) = payload[offset..].iter().position(|&b| b == 0) {
+        let world_host = String::from_utf8_lossy(&payload[offset..offset + ip_end]).to_string();
+        offset += ip_end + 1;
+        if offset + 8 <= payload.len() {
+            server_id = u32::from_le_bytes([
+                payload[offset+4], payload[offset+5], payload[offset+6], payload[offset+7],
+            ]);
+            offset += 8;
+            let name_end = payload[offset..].iter().position(|&b| b == 0)
+                .unwrap_or(payload.len() - offset);
+            name = String::from_utf8_lossy(&payload[offset..offset + name_end]).to_string();
+            host = if world_host.is_empty() || world_host == "0.0.0.0" { fb() } else { world_host };
+        }
+    }
+    if server_id == 0 { server_id = 1; }
+    if host.is_empty() { host = fb(); }
+    (server_id, host, name)
 }
 
 // ── Character-creation helpers ─────────────────────────────────────────────────
@@ -794,5 +838,130 @@ mod charcreate_tests {
         assert!(matches!(e, super::LoginError::Retryable(_)));
         assert_eq!(e.to_string(), "World connection failed");
         assert_eq!(super::LoginError::Fatal("rejected".into()).to_string(), "rejected");
+    }
+}
+
+// ── SoD login handshake tests (#404) ──────────────────────────────────────────
+// Exercise the SoD login packet builders/parsers against the exact byte layouts from EQEmu's
+// loginserver source (login_opcodes_sod.conf, login_types.h, client.cpp,
+// world_server_manager.cpp). Each test is written to go RED if the SoD format is reverted to
+// Titanium or the field offsets drift. Live round-trip (server accepts the SoD handshake and
+// hands off to world) is the orchestrator's build-and-verify gate.
+#[cfg(test)]
+mod sod_login_tests {
+    use super::*;
+
+    /// The migration itself: eqoxide must use the SoD (RoF2) login opcodes, NOT Titanium's.
+    /// Mutation-check: revert any SoD value to its Titanium value (0x0017→0x0016, 0x0018→0x0017,
+    /// 0x0019→0x0018, 0x0022→0x0021) and this goes RED.
+    #[test]
+    fn login_opcodes_are_sod_not_titanium() {
+        // C→S request opcodes — identical in both listeners.
+        assert_eq!(OP_SESSION_READY, 0x0001);
+        assert_eq!(OP_LOGIN, 0x0002);
+        assert_eq!(OP_SERVER_LIST_REQUEST, 0x0004);
+        assert_eq!(OP_PLAY_EVERQUEST_REQ, 0x000d);
+        // S→C response opcodes — SoD shifts each up from the Titanium value.
+        assert_eq!(OP_CHAT_MESSAGE, 0x0017);          // Titanium 0x0016
+        assert_eq!(OP_LOGIN_ACCEPTED, 0x0018);        // Titanium 0x0017
+        assert_eq!(OP_SERVER_LIST_RESPONSE, 0x0019);  // Titanium 0x0018
+        assert_eq!(OP_PLAY_EVERQUEST_RESP, 0x0022);   // Titanium 0x0021
+        assert_eq!(OP_LOGIN_EXPANSION_PACKET_DATA, 0x0031); // SoD-only
+    }
+
+    /// OP_Login: 10-byte LoginBaseMessage (seq=3, encrypt_type=2 DES) + DES(zero-key) of
+    /// "user\0pass\0" zero-padded to an 8-byte boundary. Verified by DES round-trip.
+    #[test]
+    fn login_request_header_and_credential_roundtrip() {
+        let pkt = build_login_request("bob", "secret");
+        // LoginBaseMessage: sequence=3, compressed=0, encrypt_type=2, unk3=0.
+        assert_eq!(&pkt[..10], &[3u8, 0, 0, 0, 0, 2, 0, 0, 0, 0]);
+        let enc = &pkt[10..];
+        // "bob\0secret\0" = 11 bytes → padded to 16; server rejects non-multiples of 8.
+        assert_eq!(enc.len(), 16);
+        assert_eq!(enc.len() % 8, 0);
+        let dec = des_decrypt(enc);
+        assert_eq!(&dec[..11], b"bob\0secret\0");
+    }
+
+    /// OP_PlayEverquestRequest: 10-byte LoginBaseMessage (seq=5) + u32 world server id.
+    #[test]
+    fn play_everquest_request_layout() {
+        let pkt = build_play_everquest(0x1234_5678);
+        assert_eq!(pkt.len(), 14);
+        assert_eq!(&pkt[..10], &[5u8, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(u32::from_le_bytes(pkt[10..14].try_into().unwrap()), 0x1234_5678);
+    }
+
+    // Build a wire-accurate OP_LoginAccepted payload: 10-byte LoginBaseMessage + DES(PlayerLoginReply).
+    fn make_login_accepted(success: u8, lsid: i32, key: &[u8]) -> Vec<u8> {
+        let mut plain = vec![0u8; 32]; // multiple of 8; big enough for lsid@8 + key@12
+        plain[0] = success;                                  // base_reply.success
+        plain[1..5].copy_from_slice(&101i32.to_le_bytes());  // base_reply.error_str_id
+        // str[1]@5, unk1@6, unk2@7 stay 0
+        plain[8..12].copy_from_slice(&lsid.to_le_bytes());   // lsid
+        plain[12..12 + key.len()].copy_from_slice(key);      // key[11], NUL-terminated by zero fill
+        let enc = des_encrypt(&plain);
+        let mut payload = vec![0u8; 10];                     // LoginBaseMessage header
+        payload.extend_from_slice(&enc);
+        payload
+    }
+
+    #[test]
+    fn login_accepted_parses_lsid_and_session_key() {
+        let payload = make_login_accepted(1, 4242, b"ABCDE12345");
+        let (lsid, key) = parse_login_accepted_payload(&payload).expect("valid reply accepted");
+        assert_eq!(lsid, 4242);
+        assert_eq!(key, "ABCDE12345");
+    }
+
+    #[test]
+    fn login_accepted_rejects_on_success_zero() {
+        // success byte == 0 is an explicit credential rejection; must NOT be reported as success
+        // (agent-honesty: never turn a real failure into a confident false OK).
+        let payload = make_login_accepted(0, 0, b"");
+        assert!(parse_login_accepted_payload(&payload).is_none());
+    }
+
+    // Build a wire-accurate OP_ServerListResponse per world_server_manager.cpp CreateServerListPacket.
+    fn make_server_list(ip: &[u8], server_type: i32, server_id: u32, name: &[u8], count: i32) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&4i32.to_le_bytes()); // LoginBaseMessage.sequence
+        p.push(0);                                 // compressed
+        p.push(0);                                 // encrypt_type
+        p.extend_from_slice(&0i32.to_le_bytes());  // unk3  → 10-byte header
+        p.push(1);                                 // base_reply.success @10
+        p.extend_from_slice(&0x65i32.to_le_bytes());// base_reply.error_str_id @11
+        p.push(0);                                 // empty str NUL @15
+        p.extend_from_slice(&count.to_le_bytes()); // server_count @16
+        // first entry
+        p.extend_from_slice(ip);
+        p.push(0);
+        p.extend_from_slice(&server_type.to_le_bytes());
+        p.extend_from_slice(&server_id.to_le_bytes());
+        p.extend_from_slice(name);
+        p.push(0);
+        p.extend_from_slice(b"us\0");
+        p.extend_from_slice(b"en\0");
+        p.extend_from_slice(&0i32.to_le_bytes()); // status
+        p.extend_from_slice(&3u32.to_le_bytes()); // players_online
+        p
+    }
+
+    #[test]
+    fn server_list_parses_first_entry() {
+        let p = make_server_list(b"192.168.1.5", 1, 7, b"MyServer", 1);
+        let (id, host, name) = parse_server_list_payload(&p, "fallback");
+        assert_eq!(id, 7);
+        assert_eq!(host, "192.168.1.5");
+        assert_eq!(name, "MyServer");
+    }
+
+    #[test]
+    fn server_list_uses_fallback_host_for_zero_ip() {
+        let p = make_server_list(b"0.0.0.0", 1, 9, b"S", 1);
+        let (id, host, _name) = parse_server_list_payload(&p, "myfallback");
+        assert_eq!(id, 9);
+        assert_eq!(host, "myfallback");
     }
 }
