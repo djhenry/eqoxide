@@ -624,10 +624,15 @@ mod tests {
         let state = empty_state();
         {
             let mut h = state.net_health.lock().unwrap();
-            h.last_datagram     = std::time::Instant::now(); // link is demonstrably alive (ACKing)...
-            h.last_packet       = ago(30);                   // ...but the world has produced nothing...
-            h.last_probe_sent   = Some(ago(15));             // ...and our probe (15s ago) went...
-            h.last_probe_reply  = None;                      // ...unanswered, past the 10s bound.
+            h.last_datagram = std::time::Instant::now(); // link is demonstrably alive (ACKing)...
+            h.last_packet   = ago(30);                    // ...but the world has produced nothing...
+            h.last_probe_sent = Some(ago(15));            // ...and our probe (15s ago) went...
+            h.last_probe_reply = None;                    // ...unanswered, past the 10s bound.
+            // #371 wedge-flicker fix: `health()` reads the wedge-timeout clock off
+            // `first_unanswered_probe_sent`, not `last_probe_sent` — this is the first (and, in this
+            // scenario, only) unanswered send of the streak, so in production `record_probe_sent`
+            // would have stamped both together. Mirror that here.
+            h.first_unanswered_probe_sent = Some(ago(15));
         }
         let p = debug_json(state).await["player"].clone();
         assert_eq!(p["connected"], serde_json::json!(true),
@@ -649,6 +654,12 @@ mod tests {
             h.last_packet      = ago(45);          // no spontaneous world output for 45s (normal idle)
             h.last_probe_sent  = Some(ago(20));
             h.last_probe_reply = Some(ago(2));     // ...but the probe was answered 2s ago → alive
+            // `first_unanswered_probe_sent` deliberately left `None` (the `empty_state()` default): in
+            // production `record_probe_reply` clears it the instant a genuine reply lands, so an
+            // ANSWERED probe's real state has no outstanding streak at all — this is what makes
+            // `world_responsive` read `true` here (the "no verdict yet" branch), not the reply-vs-send
+            // comparison branch (see `wedge_timeline_tests` for why that branch is otherwise dead from
+            // this call site).
         }
         let p = debug_json(state).await["player"].clone();
         assert_eq!(p["connected"], serde_json::json!(true));
