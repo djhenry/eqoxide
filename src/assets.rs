@@ -842,11 +842,14 @@ pub struct Collision {
     /// that. Bounds let a column probe span the zone regardless of what the caller asked for.
     z_min:     f32,
     z_max:     f32,
-    /// How many times the empty-column fallback in `column_hits` has fired since zone load. The
-    /// fallback is a DEGRADED path — it answers from inverted (mis-wound) art — so an agent must be
-    /// able to see that it is running: this is what `/v1/observe/debug` reports as `nav_degraded`.
-    /// Relaxed: a diagnostic counter, never read for control flow.
-    fallback_hits: std::sync::atomic::AtomicU64,
+    /// How many times `is_standable` has admitted a **DOWN-facing** (inverted-art) surface as ground
+    /// since zone load — i.e. answered a nav query from winding-blind ground whose true facing the
+    /// mesh does not confirm (D-2, #375). It is not wrong (qcat proves inverted-art floor is walkable),
+    /// but it is *unverified*, so an agent must be able to SEE that it is pathing on such ground rather
+    /// than be quietly handed it. Surfaced as `nav_support` on `/v1/observe/debug`. This REPLACES the
+    /// old `column_bottom`-fallback counter (that valve was deleted in D-2); the honesty signal did not
+    /// go with it. Relaxed: a diagnostic counter, never read for control flow.
+    facing_blind_hits: std::sync::atomic::AtomicU64,
     /// How many routes only existed at the MINIMUM clearance (`PLAYER_RADIUS`) — i.e. threaded a
     /// narrow door or a tight bridge with no margin to spare. Surfaced as `nav_tight` so an agent is
     /// never silently handed a riskier path than it thinks (`search_tiered`).
@@ -888,6 +891,27 @@ pub struct Collision {
 /// (Ak'Anon's gnome tunnels), which is two searches to answer what one could. 2× buys a full
 /// body-width of standing room without making the exception the rule.
 pub const NAV_PREFERRED_CLEARANCE: f32 = crate::movement::PLAYER_RADIUS * 2.0;
+
+/// **D-2 (`is_standable`, #375): the two knobs of the shared floor predicate.** A surface is standable
+/// ground, FACING-BLIND, iff `|nz| >= NAV_NEAR_HORIZONTAL` (flat enough to stand on) AND it has
+/// `NAV_AGENT_HEIGHT` of open space above it before the next SOLID surface (else it is under a ceiling,
+/// not standing room). This replaces the winding-sign filter (`nz <= 0` deleted real inverted-art
+/// floor — the qcat live wedge, #375) AND its `column_bottom` recovery valve.
+///
+/// `NAV_NEAR_HORIZONTAL` is tied to the walk-grade limit: a unit normal's `|z|` for a surface at grade
+/// `g` is `1/sqrt(1+g²)`, and `MAX_WALK_GRADE = 1.2` (the astar climb cap) gives `1/sqrt(1+1.44) ≈
+/// 0.64`. So a surface `is_standable` rejects for flatness is exactly one astar's grade limit would
+/// reject anyway — no new seal there.
+///
+/// `NAV_AGENT_HEIGHT` is the clearance a standing character needs. It must EXCEED a real ceiling's
+/// slab-gap (a room ceiling has its roof right above → tiny headroom → rejected) yet stay BELOW a real
+/// room's height (or a low room's floor would be wrongly rejected → seal). The controller's own chest
+/// collision ray sits at `foot + 4.0` (`movement.rs`), so ~5u is the clearance a body actually needs;
+/// this is measured against route-success (≥ 99.50%) before shipping.
+///
+/// Both belong on the shared `Body` (PR-A). Defined here until PR-A lands — do NOT invent a second copy.
+pub const NAV_NEAR_HORIZONTAL: f32 = 0.64;
+pub const NAV_AGENT_HEIGHT: f32 = 5.0;
 
 /// The share of a plan's node budget the GENEROUS clearance pass may spend before it is abandoned in
 /// favour of the minimum-clearance pass that actually decides the answer.
@@ -1001,7 +1025,7 @@ impl Collision {
         let cell_size = cell_size.max(1.0);
         if tris.is_empty() || min[0] == f32::MAX {
             return Collision { tris, tri_nz, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0,
-                z_min: 0.0, z_max: 0.0, fallback_hits: Default::default(), tight_plans: Default::default(),
+                z_min: 0.0, z_max: 0.0, facing_blind_hits: Default::default(), tight_plans: Default::default(),
                 water: None, from_collision_mesh, zone_line_regions: Vec::new() };
         }
         let cols = (((max[0] - min[0]) / cell_size).ceil() as usize + 1).max(1);
@@ -1024,7 +1048,7 @@ impl Collision {
             }
         }
         Collision { tris, tri_nz, cells, origin: min, cell_size, cols, rows, z_min, z_max,
-            fallback_hits: Default::default(), tight_plans: Default::default(), water: None, from_collision_mesh, zone_line_regions: Vec::new() }
+            facing_blind_hits: Default::default(), tight_plans: Default::default(), water: None, from_collision_mesh, zone_line_regions: Vec::new() }
     }
 
     /// How many times the floor-normal filter's empty-column fallback has fired since zone load, i.e.
@@ -1036,8 +1060,12 @@ impl Collision {
         self.tight_plans.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub fn fallback_hits(&self) -> u64 {
-        self.fallback_hits.load(std::sync::atomic::Ordering::Relaxed)
+    /// Count of nav queries answered from a DOWN-facing (inverted-art) surface since zone load — the
+    /// `nav_support` honesty signal (D-2, #375). Zero = every standable surface answered so far faced
+    /// UP (properly wound); non-zero = this zone's ground is partly inverted art and pathing there is
+    /// on winding-blind (unverified-facing) ground.
+    pub fn facing_blind_hits(&self) -> u64 {
+        self.facing_blind_hits.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Attach a zone water map so find_path can route swim descents. Call after `build`.
@@ -1228,18 +1256,31 @@ impl Collision {
     }
 
     /// Shared vertical-column raycast (Möller–Trumbore). Appends `(hit_z, face_normal_z)` to `out`,
-    /// sorted high→low. When `floors_only`, DOWN-facing surfaces are dropped so a ceiling can never
-    /// be mistaken for a floor (#329) — UNLESS the zone's art leaves the column with no floor at
-    /// all, in which case the mesh's BOTTOM-MOST surface is admitted as ground (see below).
+    /// sorted high→low.
+    ///
+    /// When `floors_only`, returns only **standable** surfaces (`is_standable`, D-2 / #375): FACING-
+    /// BLIND, a surface is ground iff `|nz| >= NAV_NEAR_HORIZONTAL` AND it has `NAV_AGENT_HEIGHT` of
+    /// open space above it before the next SOLID surface. This replaced the old winding-sign filter
+    /// (`nz <= 0`), which deleted real inverted-art floor the character stands on (the qcat live wedge)
+    /// and needed a `column_bottom` recovery valve (also removed). The ceiling defence is now HEADROOM
+    /// (a ceiling has its roof right above it → fails) plus the caller's `ref_z ± window` (a far roof,
+    /// e.g. qcat's 391.8, is simply outside the window). Both `column_hits(true)` (the planner's floor
+    /// lookup) and `ground_below` (the walker's clamp) go through this, so the two cannot disagree —
+    /// that agreement is the whole point of #375.
     fn column_hits(&self, east: f32, north: f32, ref_z: f32, up: f32, down: f32,
                    floors_only: bool, out: &mut Vec<(f32, f32)>) {
         out.clear();
         if self.cols == 0 { return; }
         let z_top = ref_z + up.max(0.0);
         let z_bot = ref_z - down.max(0.0);
-        let dir_z = z_bot - z_top; // negative (downward)
-        if dir_z.abs() < 1e-6 { return; }
         let filter = floors_only;
+        // For `is_standable` we need each surface's headroom = distance UP to the next SOLID surface of
+        // EITHER winding, which can lie ABOVE the caller's window — so gather facing-blind from `z_bot`
+        // up to the zone top, classify, then return only in-window standable surfaces. Same triangles
+        // as the window scan (a cell's list is fixed); only the ray is longer, so cost is ~unchanged.
+        let gather_top = if filter { self.z_max.max(z_top) + 1.0 } else { z_top };
+        let dir_z = z_bot - gather_top; // negative (downward)
+        if dir_z.abs() < 1e-6 { return; }
         let eps = 1e-6_f32;
         let cross = |a: [f32; 3], b: [f32; 3]| [
             a[1] * b[2] - a[2] * b[1],
@@ -1247,17 +1288,16 @@ impl Collision {
             a[0] * b[1] - a[1] * b[0],
         ];
         let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-        let from = [east, north, z_top];
+        let from = [east, north, gather_top];
         let dir = [0.0, 0.0, dir_z];
         let (c0, c1, r0, r1) = self.cell_range(east, north, east, north);
+        // `all` = every surface (both windings) in [z_bot, gather_top]; `out` gets the standable
+        // in-window subset. For `filter=false` these coincide (facing-blind, window only).
+        let all = out; // reuse the caller's buffer for the raw gather
         for r in r0..=r1 {
             for c in c0..=c1 {
                 for &ti in &self.cells[r * self.cols + c] {
-                    // A floor is an UP-FACING triangle. Reject ceilings BEFORE the (much more
-                    // expensive) intersection test — this is the whole fix for "A* stands on the
-                    // ceiling" and it costs one compare.
                     let nz = self.tri_nz[ti as usize];
-                    if filter && nz <= 0.0 { continue; }
                     let tri = &self.tris[ti as usize];
                     let (v0, v1, v2) = (tri[0], tri[1], tri[2]);
                     let e1 = [v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]];
@@ -1274,61 +1314,52 @@ impl Collision {
                     if v < 0.0 || u + v > 1.0 { continue; }
                     let t = dot(e2, q) * inv;
                     if !(0.0..=1.0).contains(&t) { continue; }
-                    out.push((z_top + t * dir_z, nz));
+                    all.push((gather_top + t * dir_z, nz));
                 }
             }
         }
-        out.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)); // high→low
+        all.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)); // high→low
+        if !filter { return; } // facing-blind gather = the window scan; done.
 
-        // Never delete the ONLY ground in a column: a ceiling is only a ceiling if there is a floor
-        // BENEATH it. Some zones bake real, standable ground from INVERTED (down-facing) art, which
-        // the facing filter above would otherwise delete outright, leaving the planner with no floor
-        // in a column that plainly has ground in it. Measured over the 34 cached zones, that costs
-        // permafrost 131 columns and neriakc 14 (2,237 recovered answers zone-wide).
+        // Classify each surface as standable and retain only the in-window ones. Headroom is the gap up
+        // to the next surface MORE than a slab-thickness above (so the two triangles of one quad floor
+        // don't read as each other's ceiling). The topmost surface has open sky above → infinite.
         //
-        // The predicate must be asked of the FULL COLUMN, not of this query's window. Callers pass
-        // `up=20, down=100`, so "nothing survived the filter in `out`" only means "no floor in these
-        // 100 units" — a cavern roof, tower interior, or skydome whose floor is further down than
-        // that presents an empty window too, and admitting it would hand back a CEILING as ground.
-        // That is #329 itself: at qcat (-48, 1058) the column is [391.8 roof, -70.0 floor], and a
-        // window-scoped test answers `Some(391.8)` — the catacombs roof, 462u above the floor. Asked
-        // of the window, this "fix" produced 179k+ ceiling-as-floor answers across 31 zones.
-        //
-        // So: only the mesh's BOTTOM-MOST surface in this column qualifies. Ground (even inverted
-        // ground) has nothing under it; a ceiling always does. This is sound by construction, not by
-        // measurement: the fallback can only fire when `column_bottom` is DOWN-facing (an up-facing
-        // bottom inside the window would have survived the filter and left `out` non-empty), and a
-        // bottom-most surface has nothing beneath it — so it cannot be a ceiling. Anything else stays
-        // deleted and the caller correctly gets "no floor here".
-        //
-        // LIMIT, so the next reader does not over-trust this: the rule only recovers inverted ground
-        // that is the LOWEST surface in its column. Inverted art with correctly-wound ground BENEATH
-        // it is indistinguishable from a ceiling by this test and stays deleted — deliberately, since
-        // admitting it is exactly the #329 bug. highpass is precisely that shape: all ~40k of its
-        // inverted-band faces have real ground under them, so the fallback never fires there and this
-        // rule does NOT recover highpass's ground loss. That needs a different fix (filed separately).
-        if filter && out.is_empty() {
-            if let Some(bottom) = self.column_bottom(east, north) {
-                // ...and it still has to be inside the window the caller asked about. A floor 300u
-                // below a query band is out of reach, not a floor to stand on.
-                if bottom.0 >= z_bot && bottom.0 <= z_top {
-                    self.fallback_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    out.push(bottom);
-                }
+        // THE THREE #329 CASES, and which we defend (owner-signed-off 2026-07-15, #375/#329):
+        //   * FAR ROOF (qcat's 391.8 over a −70 floor): DEFENDED by the caller's `ref_z ± window` — a
+        //     character never queries at roof height, so the roof is simply out of range.
+        //   * CLOSE ROOF (a room ceiling with its roof right above): DEFENDED by `headroom` below — a
+        //     solid surface within `NAV_AGENT_HEIGHT` means no standing room.
+        //   * OPEN-TOPPED MID-HEIGHT down-facing surface (a flat ceiling with open sky above): KNOWINGLY
+        //     ADMITTED as walkable. It is GEOMETRICALLY IDENTICAL to qcat's walkable −42.97 walkway
+        //     (down-facing, open above, a floor below), so no per-surface rule can accept the qcat floor
+        //     — the whole #375 fix — while rejecting this. The owner accepted the band. If it ever bites
+        //     a real zone, the mitigation is at the REACHABILITY layer ("does a route actually lead the
+        //     character onto it?"), NOT a per-surface classifier (proven impossible). See the acceptance
+        //     test `open_topped_midheight_surface_is_admitted_as_the_accepted_cost_of_facing_blindness`.
+        const SAME_SURFACE: f32 = 0.3;
+        let n = all.len();
+        let mut keep: Vec<(f32, f32)> = Vec::with_capacity(n);
+        for i in 0..n {
+            let (z, nz) = all[i];
+            if z < z_bot - eps || z > z_top + eps { continue; } // out of the caller's window
+            if nz.abs() < NAV_NEAR_HORIZONTAL { continue; }     // too steep to stand on
+            // Nearest solid strictly above `z` (indices < i are higher, sorted high→low).
+            let mut headroom = f32::INFINITY;
+            for j in (0..i).rev() {
+                if all[j].0 > z + SAME_SURFACE { headroom = all[j].0 - z; break; }
             }
+            if headroom < NAV_AGENT_HEIGHT { continue; }         // under a ceiling — not standing room
+            // Honesty (#375): admitting a DOWN-facing surface as ground means we answered from
+            // winding-blind (inverted-art) geometry the mesh does not confirm is a floor. Count it so
+            // `/v1/observe/debug` can surface `nav_support` — a degraded/unverified mode must never be
+            // silent. (Correct per qcat, but the agent must be able to SEE it is on such ground.)
+            if nz < 0.0 {
+                self.facing_blind_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            keep.push((z, nz));
         }
-    }
-
-    /// The BOTTOM-MOST surface of the full mesh column at `(east, north)`, facing-blind, as
-    /// `(hit_z, face_normal_z)`. Nothing in this column lies beneath it — which is what makes it
-    /// ground rather than a ceiling, whichever way its art happens to be wound. Spans `z_min..z_max`
-    /// so it is independent of any caller's query window (see the fallback in `column_hits`).
-    fn column_bottom(&self, east: f32, north: f32) -> Option<(f32, f32)> {
-        let mut hits = Vec::new();
-        let mid = 0.5 * (self.z_min + self.z_max);
-        let half = 0.5 * (self.z_max - self.z_min) + 1.0;
-        self.column_hits(east, north, mid, half, half, false, &mut hits); // facing-blind: no recursion
-        hits.last().copied() // high→low ⇒ last = the lowest surface in the column
+        *all = keep;
     }
 
     /// Find the walkable FLOOR height at `(east, north)` nearest to `ref_z`.
@@ -1491,14 +1522,22 @@ impl Collision {
         best
     }
 
-    /// Cast a vertical ray from `origin_z` straight down `depth` units at `(east, north)` and
-    /// return the height of the nearest surface below, or `None` if nothing is within reach.
+    /// The height of the nearest **standable** surface at/below `origin_z` within `depth`, or `None`.
     /// Native ground clamp uses `origin = foot_z + 1.0`, `depth = 200` (design §3.2).
+    ///
+    /// D-2 (#375): this is the CONTROLLER's floor clamp, and it now goes through the SAME
+    /// `is_standable` predicate as the planner's `column_hits(true)` — so the two cannot disagree about
+    /// where the floor is (the qcat wedge was exactly that disagreement: the controller's old
+    /// facing-blind first-hit stood on the −42.97 inverted-art walkway while the planner's facing
+    /// filter deleted it). It was a single facing-blind ray; it is now the highest standable surface in
+    /// `[origin_z − depth, origin_z]`. A surface under a ceiling (headroom `< NAV_AGENT_HEIGHT`) is not
+    /// standable — the controller no longer clamps to it (measured against route-success + the faithful
+    /// walker corpus for the low-clearance seal risk).
     pub fn ground_below(&self, east: f32, north: f32, origin_z: f32, depth: f32) -> Option<f32> {
         if self.cols == 0 { return None; }
-        let from = [east, north, origin_z];
-        let to   = [east, north, origin_z - depth.max(0.0)];
-        self.nearest_hit_t(from, to).map(|t| origin_z - t * depth.max(0.0))
+        let mut hits = Vec::new();
+        self.column_hits(east, north, origin_z, 0.0, depth.max(0.0), true, &mut hits);
+        hits.first().map(|&(z, _)| z) // sorted high→low ⇒ first = highest standable at/below origin_z
     }
 
     /// Is the player's cylindrical footprint at `(east, north, foot_z)` clear of geometry?
@@ -2682,10 +2721,10 @@ impl Collision {
                 // Two guards, because the inset faces two hazards and `edge_ok` only sees one.
                 //
                 // `edge_ok` asks "is there still FLOOR there" — it is what stops the nudge shoving a
-                // waypoint off the mesh. It is structurally incapable of seeing a WALL: `column_hits`
-                // discards every triangle with `tri_nz <= 0` before intersecting, so a vertical face
-                // can never be a `nearest_floor` hit. There is floor at a wall's foot, so `edge_ok`
-                // happily green-lights a nudge straight INTO one (#358).
+                // waypoint off the mesh. It is structurally incapable of seeing a WALL: `is_standable`
+                // (in `column_hits`) rejects a near-vertical face via the flatness test `|nz| <
+                // NAV_NEAR_HORIZONTAL`, so a wall can never be a `nearest_floor` hit. There is floor at
+                // a wall's foot, so `edge_ok` happily green-lights a nudge straight INTO one (#358).
                 //
                 // That was survivable while the inset was small, but the tiered planner (see
                 // `search_tiered`) now plans at a GENEROUS `radius`, which makes `margin` — and so
@@ -3025,29 +3064,34 @@ mod tests {
         }
     }
 
-    /// #329, the qcat spawn corridor in miniature: a CEILING 14u above the floor. A vertical ray
-    /// crosses both, and the old facing-blind `nearest_floor` returned whichever was closest to the
-    /// reference z — so a character floating at ceiling height was anchored to the CEILING and A*
-    /// planned its whole route through solid rock. A floor is an UP-FACING surface; a ceiling is
-    /// never a floor, no matter how near it is.
-    #[test]
-    fn nearest_floor_never_returns_a_ceiling() {
-        let assets = ZoneAssets {
-            terrain: vec![slab(-69.97, 0.0, 64.0, 0.0, 64.0, true),    // real floor
-                          slab(-55.97, 0.0, 64.0, 0.0, 64.0, false)],  // ceiling, 14u above it
-            objects: vec![], textures: vec![],
-        };
-        let col = Collision::build(&assets, 8.0);
-        // Both surfaces are in the column...
-        let all = col.column_surfaces(20.0, 40.0, -56.0, 20.0, 100.0);
-        assert_eq!(all.len(), 2, "the ray crosses both the ceiling and the floor");
-        assert!(all[0].1 < 0.0 && all[1].1 > 0.0, "top = down-facing ceiling, bottom = up-facing floor");
-        // ...but only the floor is a FLOOR. Reference z sits 0.03u under the ceiling and 14u above
-        // the floor, so a nearest-surface rule would pick the ceiling.
-        let f = col.nearest_floor(20.0, 40.0, -56.0, 20.0, 100.0).expect("a floor exists below");
-        assert!((f - (-69.97)).abs() < 0.1, "expected the real floor -69.97, got {f}");
-        assert_eq!(col.column_floors(20.0, 40.0, -56.0, 20.0, 100.0).len(), 1, "the ceiling is not a floor");
-    }
+    // ─── RETRACTED at D-2 (#375): three old #329 guards whose premise qcat falsified ───
+    //
+    // `nearest_floor_never_returns_a_ceiling`, `fallback_never_admits_a_ceiling_whose_floor_is_below_
+    // the_query_window`, and `fallback_admits_the_inverted_ground_but_not_the_ceiling_above_it` all
+    // asserted that a DOWN-facing surface with OPEN space above it (a lone ceiling at -55.97 over a
+    // floor 14u below; a roof at 391.8 over a floor 462u below) is a ceiling `nearest_floor` must never
+    // return. The D-2 shape probe (`probe_qcat_column_vs_fixture`) MEASURED the character's walkable
+    // qcat surface at -42.97 to be EXACTLY that shape — down-facing, open above, floor ~13u below — so
+    // "down-facing + open above = ceiling" is false: it is walkable floor (the #375 fix). A facing-blind
+    // classifier that rejected those synthetic ceilings would also delete qcat's walkway.
+    //
+    // The genuine #329 protection is preserved and re-tested by:
+    //   * `close_roof_ceiling_is_rejected_by_headroom` — a ceiling with a roof CLOSE above (headroom <
+    //     NAV_AGENT_HEIGHT) is rejected. That is what makes a ceiling a ceiling — a roof — not its
+    //     winding. Mutation-checked.
+    //   * `qcat_pocket_nearest_floor_is_never_the_ceiling` — the FAR qcat roof (391.8) is never returned
+    //     at a REALISTIC ref_z (the -66 floor), because the `ref_z ± window` excludes it. (The old
+    //     `fallback_never_admits…` queried AT roof height, ref_z=391.8 — a position a character is never
+    //     in; the window defence is the real one.)
+    // `the_fallback_reports_itself_so_nav_degraded_is_never_silent` is removed with the `column_bottom`
+    // valve it tested; the honesty signal is REPLACED IN THIS PR (folded from D-3, review Fix A):
+    // `nav_degraded/inverted_floor_art` → `nav_support/facing_blind_ground`, now driven by
+    // `facing_blind_hits` (a down-facing surface admitted as ground), so there is no dead-signal window
+    // where the client falsely reports "properly wound" while on inverted-art ground.
+    //
+    // The two tests below that assert inverted GROUND is still found (`column_whose_only_surface_is_
+    // inverted…`, `a_fully_inverted_zone…`) STILL PASS under D-2 (an inverted floor with clearance above
+    // is standable) and are kept.
 
     /// Inverted GROUND: a column whose lowest (and here only) surface is down-facing, with nothing
     /// beneath it. Real zones bake standable ground this way — permafrost loses 131 such columns to
@@ -3084,96 +3128,6 @@ mod tests {
         assert!(f.is_some(), "the filter must never delete the only ground in a column");
         assert!((f.unwrap() - 50.0).abs() < 0.1, "expected the inverted surface's own height, got {f:?}");
         assert_eq!(col.column_floors(306.0, 2.0, 50.0, 20.0, 100.0).len(), 1);
-    }
-
-    /// The REAL qcat #329 column, and the trap the fallback must not fall into. Callers query with
-    /// `up=20, down=100`, so "the filter left nothing" is a statement about a 100-unit WINDOW, not
-    /// about the column. qcat's spawn pocket at (-48, 1058) is
-    /// `[391.8 down-facing roof, -70.0 up-facing floor]` — 462u apart. Standing at the roof, the
-    /// window holds ONLY the roof, so a window-scoped "is it empty?" test fires the fallback and
-    /// hands back the CATACOMBS ROOF as the floor. That is #329 itself, in the zone it is named
-    /// after, and it needs no inverted art at all — an ordinary high ceiling is enough.
-    ///
-    /// The predicate is therefore asked of the FULL COLUMN: only the mesh's bottom-most surface can
-    /// be admitted as ground. The roof has a floor 462u beneath it, so it is a ceiling, and the
-    /// honest answer at roof height is "no floor within reach" — `None`, not a confident lie.
-    #[test]
-    fn fallback_never_admits_a_ceiling_whose_floor_is_below_the_query_window() {
-        let assets = ZoneAssets {
-            terrain: vec![slab(-69.97, 0.0, 64.0, 0.0, 64.0, true),     // real floor  (qcat -70.0)
-                          slab(391.84, 0.0, 64.0, 0.0, 64.0, false)],   // roof, 462u ABOVE it
-            objects: vec![], textures: vec![],
-        };
-        let col = Collision::build(&assets, 8.0);
-        // Standing at the roof, the caller's window [291.8, 411.8] contains ONLY the roof — the real
-        // floor is 462u below and nowhere near it. The filter empties the window...
-        assert!(col.column_surfaces(20.0, 40.0, 391.8, 20.0, 100.0).iter().all(|&(_, nz)| nz < 0.0),
-            "the window at roof height holds only the down-facing roof");
-        // ...and the fallback must NOT rescue it: this is a ceiling, and it has a floor beneath it.
-        assert_eq!(col.nearest_floor(20.0, 40.0, 391.8, 20.0, 100.0), None,
-            "the catacombs roof is NOT a floor — a ceiling with a floor 462u beneath it must be refused, not returned");
-        assert!(col.column_floors(20.0, 40.0, 391.8, 20.0, 100.0).is_empty(),
-            "and it must not appear in column_floors either");
-        // The real floor is still found from anywhere within reach of it.
-        let f = col.nearest_floor(20.0, 40.0, -56.0, 20.0, 100.0).expect("the real floor is in reach");
-        assert!((f - (-69.97)).abs() < 0.1, "expected the real floor -69.97, got {f}");
-    }
-
-    /// The same trap, but with the inverted art that motivates the fallback in the first place — so
-    /// "it's mis-wound ground" cannot be used to smuggle a ceiling through. This is #329's exact
-    /// column with BOTH surfaces mis-wound: an INVERTED floor at -69.97 and a ceiling 14u above it
-    /// at -55.97, both down-facing, so NEITHER survives the facing filter and the fallback is the
-    /// only thing answering. A facing-blind fallback hands back both, and at `ref_z = -56` the
-    /// nearest of them is the CEILING — #329, reproduced through the safety valve itself.
-    ///
-    /// Ground is the bottom-most surface of the column; the ceiling has ground beneath it. Only the
-    /// former may be admitted — and `column_floors` must not list the ceiling either, or A* takes it
-    /// as a walkable tier even when `nearest_floor` happens to pick the right surface to stand on.
-    #[test]
-    fn fallback_admits_the_inverted_ground_but_not_the_ceiling_above_it() {
-        let assets = ZoneAssets {
-            terrain: vec![slab(-69.97, 0.0, 64.0, 0.0, 64.0, false),   // INVERTED ground (nothing beneath it)
-                          slab(-55.97, 0.0, 64.0, 0.0, 64.0, false)],  // ceiling, 14u above it
-            objects: vec![], textures: vec![],
-        };
-        let col = Collision::build(&assets, 8.0);
-        // Neither surface survives the facing filter — both are down-facing.
-        let all = col.column_surfaces(20.0, 40.0, -56.0, 20.0, 100.0);
-        assert_eq!(all.len(), 2, "both surfaces are in the column");
-        assert!(all.iter().all(|&(_, nz)| nz < 0.0), "and BOTH are down-facing — only the fallback can answer");
-
-        // ref_z sits 0.03u under the CEILING and 14u above the ground, so a facing-blind fallback
-        // returns the ceiling as the nearest "floor". Only the bottom-most surface is ground.
-        let f = col.nearest_floor(20.0, 40.0, -56.0, 20.0, 100.0).expect("the inverted ground is still ground");
-        assert!((f - (-69.97)).abs() < 0.1,
-            "expected the inverted GROUND -69.97, got {f} — the fallback must not return the ceiling above it");
-        // And A* must not be offered the ceiling as a walkable tier either.
-        let tiers = col.column_floors(20.0, 40.0, -56.0, 20.0, 100.0);
-        assert_eq!(tiers.len(), 1, "only the ground is a tier, got {tiers:?}");
-        assert!((tiers[0] - (-69.97)).abs() < 0.1, "and it is the ground, not the ceiling: {tiers:?}");
-    }
-
-    /// The fallback is a DEGRADED path (it answers from mis-wound art whose true facing is
-    /// unverified), so it must never run silently: `fallback_hits()` counts its firings and is what
-    /// `/v1/observe/debug` reports as `nav_degraded`. A client that quietly answers from a degraded
-    /// code path is lying to the agent by omission.
-    #[test]
-    fn the_fallback_reports_itself_so_nav_degraded_is_never_silent() {
-        // A cleanly wound zone never needs the fallback → reports healthy (nav_degraded = null).
-        let clean = Collision::build(&ZoneAssets {
-            terrain: vec![slab(0.0, 0.0, 64.0, 0.0, 64.0, true)], objects: vec![], textures: vec![],
-        }, 8.0);
-        assert!(clean.nearest_floor(20.0, 40.0, 0.0, 20.0, 100.0).is_some());
-        assert_eq!(clean.fallback_hits(), 0, "a cleanly wound zone must report nav_degraded = null");
-
-        // A zone with inverted ground answers from the fallback — and SAYS so.
-        let inverted = Collision::build(&ZoneAssets {
-            terrain: vec![slab(0.0, 0.0, 64.0, 0.0, 64.0, false)], objects: vec![], textures: vec![],
-        }, 8.0);
-        assert!(inverted.nearest_floor(20.0, 40.0, 0.0, 20.0, 100.0).is_some(),
-            "the inverted ground is recovered...");
-        assert!(inverted.fallback_hits() > 0,
-            "...and the degraded path that recovered it must be visible to the agent, not silent");
     }
 
     /// A whole zone can be the degenerate case of `column_whose_only_surface_is_inverted_still_finds_a_floor`
@@ -3712,9 +3666,9 @@ mod tests {
 
     /// The waypoint inset (#312) must never nudge a waypoint INTO a wall.
     ///
-    /// Its original guard, `edge_ok(nudged)`, cannot prevent that — and not by accident:
-    /// `column_hits` discards every triangle with `tri_nz <= 0` before intersecting, so a vertical
-    /// face is *structurally incapable* of being a `nearest_floor` hit. There is floor at a wall's
+    /// Its original guard, `edge_ok(nudged)`, cannot prevent that — and not by accident: `is_standable`
+    /// (in `column_hits`) rejects a near-vertical face via its flatness test `|nz| < NAV_NEAR_HORIZONTAL`,
+    /// so a wall is *structurally incapable* of being a `nearest_floor` hit. There is floor at a wall's
     /// foot, so `edge_ok` reports "walkable" right up against one. That was survivable while the
     /// inset was small; the tiered planner now plans at a GENEROUS radius, which scales `margin` and
     /// so the push. A bigger push behind a wall-blind guard walks the character CLOSER to walls than
@@ -3741,8 +3695,8 @@ mod tests {
         let col = Collision::build(&ZoneAssets {
             terrain: vec![floor, wall], objects: vec![], textures: vec![] }, 8.0);
         // The blind spot itself: there is floor at the wall's FOOT, so the inset's only guard reads
-        // "walkable" right up against it. `column_hits` drops every triangle with tri_nz <= 0 before
-        // intersecting, so a vertical face can never be a `nearest_floor` hit — by construction.
+        // "walkable" right up against it. `is_standable`'s flatness test (`|nz| < NAV_NEAR_HORIZONTAL`)
+        // rejects the near-vertical face, so a wall can never be a `nearest_floor` hit — by construction.
         assert!(col.nearest_floor(20.0, 10.0, 0.0, 3.0, 8.0).is_some(),
             "nearest_floor is structurally blind to the wall — that is the whole point");
 
@@ -4707,6 +4661,39 @@ mod tests {
         assert!(tot_walked > 0, "no journeys walked — check $ZONE_DIR");
     }
 
+    /// **D-2 SHAPE PROBE (temporary): is the qcat inverted-floor structurally distinguishable from the
+    /// D-1 open-air-ceiling fixture?** Dumps every surface in the qcat wedge column facing-blind, with
+    /// the distance UP to the next SOLID surface (headroom) and whether water sits above — to decide
+    /// whether `is_standable` (facing-blind + headroom + anchoring) can accept -42.97 while rejecting a
+    /// ceiling. Not a gate; a design probe.
+    #[test]
+    #[ignore = "requires qcat glb; D-2 shape probe"]
+    fn probe_qcat_column_vs_fixture() {
+        let dir = std::env::var("ZONE_DIR")
+            .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
+        let za = ZoneAssets::from_glb(&std::path::Path::new(&dir).join("qcat.glb")).unwrap();
+        let mut col = Collision::build(&za, 32.0);
+        col.set_water(crate::region_map::RegionMap::load(&std::path::Path::new(&dir).join("maps/water"), "qcat").map(std::sync::Arc::new));
+        let (x, y) = (4.0f32, 809.8);
+        println!("qcat column at ({x},{y}):  z_min={:.1} z_max={:.1}", col.z_min, col.z_max);
+        // Enumerate surfaces facing-blind, top→down, via ground_below stepping.
+        let mut top = col.z_max;
+        for _ in 0..30 {
+            let Some(s) = col.ground_below(x, y, top, col.z_max - col.z_min + 10.0) else { break };
+            top = s - 0.5;
+            // headroom UP: distance to next solid surface above `s`.
+            let head = (1..400).map(|k| s + k as f32 * 0.5)
+                .find(|&z| col.nearest_hit_t([x, y, z - 0.25], [x, y, z + 0.25]).is_some())
+                .map(|z| z - s);
+            let up_facing = col.nearest_floor(x, y, s, 0.6, 0.6).is_some(); // filtered → up-facing (or valve)
+            let water_above = col.in_water([x, y, s + 1.0]) || col.in_water([x, y, s + 3.0]);
+            println!("  surface z={s:8.2}  up_facing(filtered)={up_facing:5}  headroom_to_solid_above={head:?}  water_above={water_above}");
+        }
+        // The two D-2-relevant surfaces the gates care about:
+        println!("controller ground_below@-42: {:?}", col.ground_below(x, y, -42.0, 200.0));
+        println!("planner column_floors@-43:   {:?}", col.column_floors(x, y, -43.0, 20.0, 30.0));
+    }
+
     // ─────────────────────── PR-D / D-1: support-axis drift (#375) fixtures ───────────────────────
     // These prove the support-axis bug and gate the fix. The RED-on-main test reproduces the LIVE qcat
     // wedge (the planner deletes the floor the controller stands on). The two #329 guards are GREEN on
@@ -4737,50 +4724,72 @@ mod tests {
         }
     }
 
-    /// **D-1 SANITY: the two helpers really face as labelled.** Otherwise the open-air-ceiling fixture
-    /// below would be vacuous (a floor masquerading as a ceiling, or vice-versa).
+    /// **RETRACTED at D-2: `open_air_ceiling_is_never_returned_as_floor`** (the owner-approved D-1
+    /// fixture) and its winding-sanity companion. Both asserted that a down-facing surface with OPEN
+    /// SKY above it (floor at z=0, ceiling at z=8, nothing on top) is a *ceiling* `nearest_floor` must
+    /// never return.
+    ///
+    /// **That premise is FALSIFIED by qcat.** The D-2 shape probe (`probe_qcat_column_vs_fixture`,
+    /// measured 2026-07-14) found the character's walkable −42.97 surface is DOWN-facing, with NOTHING
+    /// solid above it, and an up-facing floor 13u below — geometrically *identical* to the fixture's
+    /// z=8. So "down-facing + open above = ceiling" is wrong: qcat proves such a surface is walkable
+    /// floor. A facing-blind classifier that rejected the fixture's z=8 would also delete qcat's
+    /// walkway — the very bug #375 fixes. The owner reviewed this measurement and RETRACTED the fixture.
+    ///
+    /// The genuine #329 ceilings are caught by the two gates that replaced it:
+    /// `close_roof_ceiling_is_rejected_by_headroom` (a ceiling with a roof close above → low headroom)
+    /// and `qcat_pocket_nearest_floor_is_never_the_ceiling` (a far roof, excluded by the `ref_z`
+    /// window). See the design doc's "RETRACTED" note.
+
+    /// **THE #329 CLOSE-ROOF GATE (D-2, mutation-checked).** A realistic ceiling — a down-facing
+    /// surface with a solid roof CLOSE above it — must be rejected by the headroom test
+    /// (`headroom_to_next_solid_above < NAV_AGENT_HEIGHT`). This is a two-storey sandwich: room-A floor
+    /// at z=0 (10u of headroom → standable), room-A ceiling at z=10 (down-facing, only 1u below
+    /// room-B's floor → headroom 1 → REJECTED), room-B floor at z=11 (standable). The ceiling at z=10
+    /// must NEVER be returned; both real floors (0 and 11) must be.
+    ///
+    /// This is NOT the #372 "decorative rock slab" cheat — there the slab was cosmetic while the
+    /// classifier still used winding; here the roof-above IS the classifier's real input (a ceiling has
+    /// a roof; that is what makes it a ceiling, not its winding). Mutation-check: drop the headroom test
+    /// (see the commented line) → the ceiling at z=10 becomes "standable" → `nearest_floor@10` returns
+    /// ~10 → RED.
     #[test]
-    fn floor_and_ceiling_windings_are_as_labelled() {
-        // floor_up is an up-facing floor the facing filter keeps.
-        let f = Collision::build(&ZoneAssets {
-            terrain: vec![floor_up(0.0, -100.0, 100.0)], objects: vec![], textures: vec![] }, 32.0);
-        assert!(f.nearest_floor(0.0, 0.0, 0.0, 20.0, 20.0).is_some_and(|z| z.abs() < 0.5),
-            "floor_up must be an up-facing floor the facing filter keeps");
-        // ceiling_down is down-facing: it exists as geometry, and WITH a real floor below it, the facing
-        // filter discards it (nearest_floor returns the floor, never the ceiling). Note a LONE
-        // down-facing surface would instead be recovered by the `column_bottom` inverted-art valve
-        // (`assets.rs` column_hits fallback) — which is exactly why this asserts against the
-        // floor-present case, and why PR-D's `is_standable` must reject the ceiling by HEADROOM, not by
-        // being the column bottom (the valve's blind spot).
-        let fc = Collision::build(&ZoneAssets {
-            terrain: vec![floor_up(0.0, -100.0, 100.0), ceiling_down(8.0, -100.0, 100.0)],
-            objects: vec![], textures: vec![] }, 32.0);
-        assert!(fc.ground_below(0.0, 0.0, 20.0, 40.0).is_some(), "the ceiling plane must exist as geometry");
-        // Query with the reference right AT the ceiling height: it must still resolve to the floor.
-        assert!(fc.nearest_floor(0.0, 0.0, 8.0, 5.0, 20.0).is_some_and(|z| z.abs() < 0.5),
-            "with a floor below, the down-facing ceiling must be filtered — nearest_floor@z=8 must be the floor z=0");
+    fn close_roof_ceiling_is_rejected_by_headroom() {
+        let col = Collision::build(&ZoneAssets {
+            terrain: vec![
+                floor_up(0.0, -100.0, 100.0),      // room-A floor (10u headroom → standable)
+                ceiling_down(10.0, -100.0, 100.0), // room-A ceiling (1u below room-B floor → rejected)
+                floor_up(11.0, -100.0, 100.0),     // room-B floor (open above → standable)
+            ], objects: vec![], textures: vec![],
+        }, 32.0);
+        // The standable set (column_floors) must contain the two real floors (0 and 11) but NOT the
+        // low-headroom ceiling (10) — precise, unlike a nearest-to-ref_z check where 10 and 11 are
+        // only 1u apart.
+        let floors = col.column_floors(0.0, 0.0, 5.0, 20.0, 20.0);
+        assert!(!floors.iter().any(|&z| (z - 10.0).abs() < 0.5),
+            "column_floors contains the low-headroom ceiling z=10 (set {floors:?}) — the headroom test \
+             failed to reject it (#329). MUTATION: drop the headroom check and this fires.");
+        assert!(floors.iter().any(|&z| z.abs() < 0.5),
+            "room-A floor z=0 (10u headroom) must be standable (set {floors:?})");
+        assert!(floors.iter().any(|&z| (z - 11.0).abs() < 0.5),
+            "room-B floor z=11 (open above) must be standable (set {floors:?})");
     }
 
-    /// **THE #329 OPEN-AIR-CEILING GATE (D-1, GREEN on main; mutation-RED at D-2).** The adversarial
-    /// case the cancelled navmesh FAKED by putting a rock slab on top of its ceiling: a down-facing
-    /// ceiling at z=8 with OPEN SKY above it (nothing on top). Its only difference from a floor is its
-    /// winding — so a `|nz|`-only classifier admits it (wrong), and even a naive "is there air above?"
-    /// headroom test admits it (there IS air above — wrong). `nearest_floor` must return the real floor
-    /// at z=0, NEVER the open-air ceiling at z=8, for any reference height. On `main` the facing filter
-    /// satisfies this; D-2's facing-blind `is_standable` must keep it satisfied via headroom+anchoring,
-    /// and the D-2 mutation (swap in either naive shortcut) must make this return z=8 → RED.
+    /// **D-2 winding sanity (facing-blind now):** after D-2 `nearest_floor` is FACING-BLIND, so it
+    /// accepts an inverted (down-facing) floor with clearance above — that is the whole #375 fix. This
+    /// pins that: a lone `floor_up` is standable AND a lone `ceiling_down` with open air above is ALSO
+    /// standable now (it is walkable floor, per qcat). Contrast `close_roof_ceiling_*`: only a ceiling
+    /// with a *roof close above* is rejected.
     #[test]
-    fn open_air_ceiling_is_never_returned_as_floor() {
-        let col = Collision::build(&ZoneAssets {
-            terrain: vec![floor_up(0.0, -100.0, 100.0), ceiling_down(8.0, -100.0, 100.0)],
-            objects: vec![], textures: vec![],
-        }, 32.0);
-        for rz in [-5.0f32, -2.0, 0.0, 2.0, 5.0] {
-            let f = col.nearest_floor(0.0, 0.0, rz, 20.0, 20.0);
-            assert!(f.is_some_and(|z| (z - 0.0).abs() < 0.5),
-                "ref_z {rz}: nearest_floor must return the real floor z=0, never the open-air ceiling \
-                 z=8 (got {f:?}) — the #329 defence");
-        }
+    fn nearest_floor_is_facing_blind_after_d2() {
+        let up = Collision::build(&ZoneAssets {
+            terrain: vec![floor_up(0.0, -100.0, 100.0)], objects: vec![], textures: vec![] }, 32.0);
+        assert!(up.nearest_floor(0.0, 0.0, 0.0, 5.0, 20.0).is_some_and(|z| z.abs() < 0.5),
+            "an up-facing floor is standable");
+        let down = Collision::build(&ZoneAssets {
+            terrain: vec![ceiling_down(0.0, -100.0, 100.0)], objects: vec![], textures: vec![] }, 32.0);
+        assert!(down.nearest_floor(0.0, 0.0, 0.0, 5.0, 20.0).is_some_and(|z| z.abs() < 0.5),
+            "a down-facing surface with open air above is ALSO standable now (facing-blind) — the qcat fix");
     }
 
     /// **THE #329 QCAT-POCKET GATE (D-1, asset; GREEN on main).** At the qcat spawn pocket the column
@@ -4813,11 +4822,17 @@ mod tests {
     /// character were elsewhere (or floating) and loops.
     ///
     /// This asserts the invariant PR-D restores: **the planner sees the floor the controller stands
-    /// on.** It is RED on `main` (the planner's set omits -42.97) and GREEN once both sides share
-    /// `is_standable` (D-2). It is the falsifiable, deterministic proof of the bug, independent of any
-    /// live run.
+    /// on.** It was RED on `main` (the planner's set omitted -42.97); **it is GREEN at D-2** — both
+    /// sides now share `is_standable`, so `column_floors` includes the inverted-art walkway. It is the
+    /// falsifiable, deterministic proof of the fix, independent of any live run.
+    ///
+    /// **CI note:** the coordinator asked to "un-ignore" this so it runs live. It is asset-gated (needs
+    /// the qcat glb, absent on the CI runner — #357), and `from_glb().unwrap()` would panic there, so
+    /// it stays `#[ignore]`d like every other baked-asset test. It is verified GREEN locally at D-2
+    /// (`ZONE_DIR=… cargo test --release --lib qcat_support_floor_is_visible -- --ignored`). Literal
+    /// un-ignoring is not possible without bundling the asset into CI; flagged in the PR.
     #[test]
-    #[ignore = "requires the cached qcat glb at $ZONE_DIR; RED on main — proves the support-axis drift (#375)"]
+    #[ignore = "requires the cached qcat glb at $ZONE_DIR (#357); GREEN at D-2 — proves the support-axis FIX (#375)"]
     fn qcat_support_floor_is_visible_to_the_planner() {
         let dir = std::env::var("ZONE_DIR")
             .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
@@ -4838,6 +4853,174 @@ mod tests {
              terminal wedge. RED on main; GREEN after the shared is_standable predicate (D-2).");
     }
 
+
+    /// **ACCEPTANCE TEST — the residual #329 band, owner-signed-off 2026-07-15 (review Fix D).**
+    ///
+    /// This is NOT a bug reproduction — it pins INTENDED behaviour. A flat DOWN-facing surface at
+    /// mid-height with OPEN SKY above it (floor@0 + roof@10, nothing on top) IS admitted as walkable
+    /// ground, and A* CAN route onto it. That is the unavoidable cost of facing-blind ground detection:
+    /// this geometry is IDENTICAL to qcat's walkable −42.97 walkway (down-facing, open above, a floor
+    /// below), so no per-surface rule can accept the qcat floor (the #375 fix) while rejecting this —
+    /// the reviewer proved the two are indistinguishable, and the owner accepted the band.
+    ///
+    /// The two #329 cases that ARE still defended (see `close_roof_ceiling_is_rejected_by_headroom` and
+    /// `qcat_pocket_nearest_floor_is_never_the_ceiling`):
+    ///   * **far roof** — excluded by the caller's `ref_z ± window` (a character never queries at roof
+    ///     height);
+    ///   * **close roof** — a solid roof within `NAV_AGENT_HEIGHT` above → `headroom` rejects it.
+    /// Only the OPEN-TOPPED MID-HEIGHT band gets through, knowingly. If it ever bites a real zone, the
+    /// escalation is a connectivity/reachability mitigation (does a *route* lead the character onto it?
+    /// — a graph-level question), NOT a per-surface classifier rule, which the reviewer proved
+    /// impossible. Refs #375 / #329.
+    ///
+    /// This test exists so the accepted state is explicit and greppable: ceiling-as-tier in THIS band
+    /// is DELIBERATE, not a regression — do not "fix" it with a per-surface heuristic.
+    #[test]
+    fn open_topped_midheight_surface_is_admitted_as_the_accepted_cost_of_facing_blindness() {
+        // The reviewer's fixture: a floor at z=0 and a flat DOWN-facing surface at z=10, open sky above.
+        let col = Collision::build(&ZoneAssets {
+            terrain: vec![floor_up(0.0, -100.0, 100.0), ceiling_down(10.0, -100.0, 100.0)],
+            objects: vec![], textures: vec![],
+        }, 32.0);
+        // Queried at its own level, the mid-height surface IS standable (facing-blind + open headroom) —
+        // exactly as qcat's -42.97 walkway is. This is the accepted band.
+        let floors = col.column_floors(0.0, 0.0, 10.0, 3.0, 20.0);
+        assert!(floors.iter().any(|&z| (z - 10.0).abs() < 0.5),
+            "ACCEPTED (#375, owner 2026-07-15): an open-topped mid-height down-facing surface IS \
+             standable — indistinguishable from qcat's walkable inverted floor. Set: {floors:?}");
+        // And A* can route onto it (a character on the floor can climb to it via the accepted admission).
+        let path = col.find_path([0.0, -20.0, 0.0], [0.0, 20.0, 10.0], crate::movement::PLAYER_RADIUS, &[], true);
+        assert!(path.is_some(),
+            "A* routing onto the mid-height surface is the ACCEPTED cost of facing-blindness — NOT a bug. \
+             Do not add a per-surface rule to block it (proven impossible); mitigate at the reachability \
+             layer if it ever bites a real zone.");
+        // Contrast: the far-roof and close-roof cases ARE still rejected — see close_roof_ceiling_* and
+        // qcat_pocket_*. Only THIS open-topped mid-height band is knowingly admitted.
+    }
+
+    /// **THE `nav_support` HONESTY SIGNAL (D-2, review Fix A).** Admitting a DOWN-facing (inverted-art)
+    /// surface as ground is correct (qcat proves it walkable) but UNVERIFIED — so it must be visible,
+    /// not silent. `facing_blind_hits` counts it; `/v1/observe/debug` surfaces it as `nav_support`. This
+    /// pins: a cleanly-wound (up-facing) floor NEVER trips it; an inverted (down-facing) floor DOES —
+    /// so `nav_support` can never read `null` ("all properly wound") while nav is on inverted ground
+    /// (the confident-falsehood the review caught when the old `column_bottom` counter went dead).
+    #[test]
+    fn facing_blind_ground_admission_is_counted_for_nav_support() {
+        // Clean zone: an up-facing floor. Answering from it must NOT trip the signal.
+        let clean = Collision::build(&ZoneAssets {
+            terrain: vec![floor_up(0.0, -100.0, 100.0)], objects: vec![], textures: vec![] }, 32.0);
+        assert!(clean.nearest_floor(0.0, 0.0, 0.0, 5.0, 20.0).is_some(), "the clean floor is standable");
+        assert_eq!(clean.facing_blind_hits(), 0,
+            "a properly-wound floor must NOT trip nav_support — else it cries wolf everywhere");
+
+        // Inverted zone: a lone DOWN-facing floor (open above → standable per qcat). Answering from it
+        // MUST trip the signal — the agent is on unverified-winding ground.
+        let inverted = Collision::build(&ZoneAssets {
+            terrain: vec![ceiling_down(0.0, -100.0, 100.0)], objects: vec![], textures: vec![] }, 32.0);
+        assert!(inverted.nearest_floor(0.0, 0.0, 0.0, 5.0, 20.0).is_some(),
+            "the inverted floor is standable (facing-blind, the #375 fix)");
+        assert!(inverted.facing_blind_hits() > 0,
+            "admitting a down-facing surface as ground MUST be counted — nav_support cannot read null \
+             while pathing on inverted-art ground (the net-new lie deleting column_bottom would create)");
+    }
+
+    /// **§C REVIEW CONTRACT (D-2, mutation-relevant): the destination is judged on its OWN column,
+    /// never vetoed for being far from the source `ref_z`.** A large DROP's landing floor must be
+    /// standable when the planner probes it from the SOURCE cell's height — otherwise the controlled-
+    /// fall edge vanishes and nav can descend into a level it cannot leave. `is_standable` is a property
+    /// of the destination surface's own column (flatness + headroom to the next solid above it); `ref_z`
+    /// only *windows* which surfaces are in range, it does NOT gate standability. If a future edit made
+    /// standability depend on `|surface_z − ref_z|` (the tight-anchoring mistake §C warns against — it
+    /// also seals ramps, which A* climbs ~9.6u/cell at MAX_WALK_GRADE), this fixture fires.
+    #[test]
+    fn is_standable_judges_the_destination_on_its_own_column_not_the_source_z() {
+        // High floor over east[-100,0] at z=0; low floor over east[0,100] at z=-40 — a 40u drop at east=0.
+        let col = Collision::build(&ZoneAssets {
+            terrain: vec![floor_up(0.0, -100.0, 0.0), floor_up(-40.0, 0.0, 100.0)],
+            objects: vec![], textures: vec![],
+        }, 32.0);
+        // Probed from the SOURCE (high) floor's z=0 with a drop-sized `down` window: the landing floor
+        // 40u BELOW ref_z must be standable. A tight `|surface_z − ref_z|` gate would wrongly veto it.
+        let from_source = col.column_floors(20.0, 0.0, 0.0, 5.0, 60.0);
+        assert!(from_source.iter().any(|&z| (z - (-40.0)).abs() < 0.5),
+            "§C: the drop landing (z=-40) must be standable when probed from the SOURCE z=0 (set \
+             {from_source:?}) — is_standable must judge the destination on its own column, not veto it \
+             for distance from ref_z (that would delete the fall edge AND seal ramps).");
+        // And the controlled-fall edge actually forms: A* routes the high floor → low floor.
+        let path = col.find_path([-20.0, 0.0, 0.0], [20.0, 0.0, -40.0], crate::movement::PLAYER_RADIUS, &[], true);
+        assert!(path.is_some(), "A* must route the 40u drop (high floor → low floor); the fall edge must survive D-2");
+    }
+
+    /// **Q1 SEAL MEASUREMENT (#375, D-2 crux).** The owner's Q1: does the anchoring-first `headroom`
+    /// re-delete *legitimately-standable inverted ledges*? For each inverted-art zone, sample surfaces
+    /// facing-blind (the physical truth of what geometry exists), keep the ones a body fits on
+    /// (`footprint_clear`), and split them by what `is_standable` decides:
+    ///   * **RECOVERED** — `is_standable` accepts it (a floor the old facing filter would have deleted
+    ///     for being down-facing, now correctly kept). This is the #375 win.
+    ///   * **HEADROOM-REJECT** — `is_standable` rejects it because `headroom < NAV_AGENT_HEIGHT` (a
+    ///     solid surface close above). **These are NOT all proven to be ceilings.** A mutation-checked
+    ///     test (`close_roof_ceiling_is_rejected_by_headroom`) confirms real close-roof CEILINGS are
+    ///     among them; and a sub-`NAV_AGENT_HEIGHT` space is correctly rejected as below body height
+    ///     (a 5u body cannot stand in <5u clearance — `NAV_AGENT_HEIGHT = 5.0` matches the controller's
+    ///     `foot+4` chest ray). But the corpus CANNOT distinguish a rejected ceiling from a fully
+    ///     sealed pocket: route-success samples start/goal via `nearest_floor`, so a sealed pocket
+    ///     yields no pairs there and is invisible to it — route-success holding is NOT proof every
+    ///     reject is a ceiling. The seal MECHANISM is real (`floor@0 + roof@4` → `column_floors`
+    ///     returns only `[4.0]`, deleting the real floor for <5u headroom). The `<5u` rejection is
+    ///     defensible (below body height); we do NOT claim all rejects are ceilings.
+    ///   * **STEEP-REJECT** — rejected for `|nz| < NAV_NEAR_HORIZONTAL` (a wall/steep slope A*'s grade
+    ///     limit rejects anyway).
+    ///
+    /// ```text
+    /// ZONE_DIR=~/.local/share/eqoxide/assets/models \
+    ///   cargo test --release --lib q1_headroom_seal_measurement -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "requires baked zone glbs at $ZONE_DIR; the Q1 seal measurement (#375)"]
+    fn q1_headroom_seal_measurement() {
+        let dir = std::env::var("ZONE_DIR")
+            .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
+        let zones: Vec<String> = std::env::var("ZONES").ok()
+            .map(|z| z.split(',').map(str::to_string).collect())
+            .unwrap_or_else(|| ["highpass", "permafrost", "neriakc", "qcat"].iter().map(|s| s.to_string()).collect());
+        let mut seed: u64 = 0x0155_EA1D;
+        let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as u32 };
+        println!("\n{:<12} {:>10} {:>10} {:>12} {:>10}", "zone", "fits", "recovered", "headroom-rej", "steep-rej");
+        for zone in &zones {
+            let Ok(za) = ZoneAssets::from_glb(&std::path::Path::new(&dir).join(format!("{zone}.glb"))) else {
+                println!("{zone:<12}  (no glb)"); continue };
+            let col = Collision::build(&za, 32.0);
+            if col.cols == 0 { continue; }
+            let (ext_e, ext_n) = (col.cols as f32 * col.cell_size, col.rows as f32 * col.cell_size);
+            let (mut fits, mut recovered, mut head_rej, mut steep_rej) = (0usize, 0usize, 0usize, 0usize);
+            let mut cols = 0;
+            while cols < 12000 && fits < 8000 {
+                cols += 1;
+                let e = col.origin[0] + (rnd() as f32 / u32::MAX as f32) * ext_e;
+                let n = col.origin[1] + (rnd() as f32 / u32::MAX as f32) * ext_n;
+                // Every surface in the column, facing-blind (physical geometry).
+                let surfs = col.column_surfaces(e, n, 0.5 * (col.z_min + col.z_max),
+                    0.5 * (col.z_max - col.z_min) + 1.0, 0.5 * (col.z_max - col.z_min) + 1.0);
+                for &(z, nz) in &surfs {
+                    if !col.footprint_clear(e, n, z, crate::movement::PLAYER_RADIUS, 8) { continue; }
+                    fits += 1;
+                    // Recompute is_standable's verdict + reason for this surface.
+                    if nz.abs() < NAV_NEAR_HORIZONTAL { steep_rej += 1; continue; }
+                    // headroom to next SOLID above (facing-blind).
+                    let mut head = f32::INFINITY;
+                    for &(zz, _) in &surfs { if zz > z + 0.3 { head = head.min(zz - z); } }
+                    if head < NAV_AGENT_HEIGHT { head_rej += 1; } else { recovered += 1; }
+                }
+            }
+            println!("{zone:<12} {fits:>10} {recovered:>10} {head_rej:>12} {steep_rej:>10}");
+        }
+        println!("\n=== Q1: 'recovered' = floor is_standable KEEPS (the #375 win). 'headroom-rej' = \
+            rejected for a solid surface < {NAV_AGENT_HEIGHT}u above. A mutation-checked test confirms \
+            close-roof CEILINGS are among these; sub-{NAV_AGENT_HEIGHT}u spaces are also rejected as \
+            below body height (correct). Route-success held, BUT the corpus cannot distinguish a rejected \
+            ceiling from a sealed pocket (it samples via nearest_floor, so a sealed pocket is invisible \
+            to it) — this is NOT proof every reject is a ceiling. ===");
+    }
 
     /// **THE FLOOR-MODEL DISAGREEMENT SCAN — a corpus indicator for D-2 (#375).** Counts, over a zone
     /// corpus, points where the controller's floor model (`ground_below`, facing-blind) finds a
