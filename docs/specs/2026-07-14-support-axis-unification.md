@@ -129,27 +129,83 @@ floor under it to step from). Neither defence alone is enough; both are required
 
 ## The test that proves it's safe (this gates the merge)
 
+> ### ⚠️ CORRECTED at D-2 implementation — the original open-air-ceiling fixture below is RETRACTED.
+>
+> The D-1 fixture (kept verbatim below for provenance) asserted that a **down-facing surface with OPEN SKY
+> above it** (floor z=0, ceiling z=8, nothing on top) is a ceiling `nearest_floor` must never return.
+> **The D-2 shape probe (`probe_qcat_column_vs_fixture`, measured 2026-07-14) FALSIFIED that premise:** the
+> character's walkable qcat surface at **−42.97 is DOWN-facing, has NOTHING solid above it, and an up-facing
+> floor 13u below** — geometrically *identical* to the fixture's z=8. So "down-facing + open sky above =
+> ceiling" is **false**; qcat proves such a surface is walkable floor (the #375 fix). A classifier that
+> rejected the fixture's z=8 would also delete qcat's walkway. The owner reviewed the measurement and
+> **replaced the open-air fixture with two gates that hold** (see below).
+>
+> **The real discriminator is not "open sky above" but "a ROOF close above."** A ceiling is a ceiling because
+> it has a roof — that is what `headroom` measures. An open-sky down-facing plane is a *platform*, and per
+> qcat, walkable.
+>
+> **The corrected #329 gate (both, owner-approved):**
+> 1. **Close-roof** (`close_roof_ceiling_is_rejected_by_headroom`, synthetic, mutation-checked): a down-facing
+>    ceiling with a solid roof **within `NAV_AGENT_HEIGHT` above** → `headroom < NAV_AGENT_HEIGHT` → rejected.
+>    This is NOT the #372 decorative cheat: there the slab was cosmetic while the classifier still used
+>    winding; here the roof-above IS the classifier's real input. Mutation: drop the headroom test → the
+>    ceiling is wrongly admitted → RED.
+> 2. **Far-ceiling** (`qcat_pocket_nearest_floor_is_never_the_ceiling`, asset): the qcat-pocket roof at 391.8
+>    (457u above the −66 floor) is never returned at a REALISTIC `ref_z`, because the `ref_z ± window`
+>    excludes it. (The retracted `fallback_never_admits…` queried AT roof height — a position no character is
+>    in; the window is the real defence.)
+>
+> **Q1 answered (measured, `q1_headroom_seal_measurement`, 2026-07-14):** does the headroom test re-delete
+> legit inverted ledges? Over the inverted-art zones, `is_standable` **RECOVERS 91–95%** of footprint-fitting
+> surfaces (highpass 4978/5364, permafrost 5773/6321, neriakc 1893/1984, qcat 4578/4833); only **3–6%** are
+> headroom-rejected (real close-roof ceilings), and **corpus route-success did NOT drop (99.50% → 99.54%)** —
+> so those rejects are ceilings, not legit floors being sealed. No stop-and-report.
+
+### (retracted D-1 fixture, kept for provenance — FALSIFIED by qcat, see the box above)
+
 A deliberately adversarial synthetic column:
 
 - a **floor** at `z = 0`,
 - a **down-facing ceiling** at `z = 8` **with open sky above it** (nothing on top).
 
-This is the hard case: the ceiling's only difference from a floor is its winding *plus* the fact that there's a
+~~This is the hard case: the ceiling's only difference from a floor is its winding *plus* the fact that there's a
 floor 8u below it and no rock above it. A `|nz|`-only classifier admits it (wrong). An "air-above-only"
 classifier admits it too (wrong). **The correct classifier rejects it** (you'd have to stand at z=8 with
-nothing under your feet) and returns the **floor at z=0**.
+nothing under your feet) and returns the **floor at z=0**.~~ **← FALSIFIED: qcat's −42.97 walkway IS exactly
+this shape and is walkable. There is no per-surface way to reject z=8 while accepting −42.97; the discriminator
+is a close roof, not open sky. Replaced by the two gates in the box above.**
 
-The fixture asserts `nearest_floor` at that XY returns **z=0, never z=8**, for any reference height from −5 to
-+5. Mutation-check: swap in either naive shortcut → it returns z=8 → **RED**. This is the exact test the
-navmesh's version **faked** by putting a convenient rock slab on top of its ceiling so it never had to handle
-the open-air case.
+The fixture asserted `nearest_floor` at that XY returns **z=0, never z=8** — RETRACTED.
 
-> **Open question for you (Q1) — scrutinise this most.** The precise definition of "headroom" is the crux.
-> Fable recommends: *"distance up to the next solid surface of either winding, and ground also requires a
-> standable surface within one step below"* (anchoring-first — local, cheap, and it matches the walker's own
-> `ground_below`). The risk: it might also re-delete some legitimately-standable inverted *ledges*. Fable wants
-> this **measured against the real inverted-art zones before committing.** This is what the reviewer should
+> **Q1 — RESOLVED (see the ⚠️ box above).** The original recommendation ("a standable surface within one step
+> below") is superseded: `headroom` = distance up to the next SOLID surface (either winding), and a surface is
+> a ceiling iff that roof is within `NAV_AGENT_HEIGHT`. Measured: 91–95% recovery, 3–6% (ceiling) rejects,
+> route-success flat. This is what the reviewer should
 > attack hardest.
+
+### The accepted residual #329 band (owner-signed-off 2026-07-15)
+
+Facing-blind detection has ONE unavoidable cost, and it is now an **accepted, documented** state rather than a
+latent surprise. The three #329 shapes and what we do with each:
+
+| shape | example | verdict | how |
+|---|---|---|---|
+| **far roof** | qcat pocket: roof 391.8 over a −70 floor | **REJECTED** | the caller's `ref_z ± window` — a character never queries at roof height |
+| **close roof** | a room ceiling with its roof right above | **REJECTED** | `headroom < NAV_AGENT_HEIGHT` — no standing room |
+| **open-topped mid-height** | a flat down-facing surface with **open sky above** and a floor below | **KNOWINGLY ADMITTED as walkable** | — |
+
+The third is the cost. It is **geometrically identical to qcat's walkable −42.97 walkway** (down-facing, open
+above, a floor below), and the reviewer PROVED no per-surface rule can accept the qcat floor — the entire #375
+fix — while rejecting this. So we admit it. Route-success (99.54%) and the corpus say it is rare-to-absent in
+the real zones; the far-roof and close-roof defences above still hold, so this is the *only* band that gets
+through, and it does so deliberately.
+
+- **Pinned by** the acceptance test `open_topped_midheight_surface_is_admitted_as_the_accepted_cost_of_facing_blindness`
+  (an ACCEPTANCE test — asserts the admission is intended, not a bug repro) and a doc block at `is_standable`.
+  These restore the in-repo record that ceiling-as-tier was ever a guarded concern — now on the *accept* side.
+- **Escalation if it ever bites a real zone:** a **connectivity/reachability** mitigation ("does a route
+  actually lead the character onto this surface?" — a graph-level question), **NOT** a per-surface classifier
+  rule (proven impossible). Do not "fix" the band with a per-surface heuristic. Refs #375 / #329.
 
 ---
 
@@ -227,13 +283,17 @@ genuinely relevant to this bug. It is covered as follows, and the split is delib
   more intent. Until then, the water-axis *correctness* is gated (the qcat pair); only its *corpus breadth* is
   outstanding.
 
-## Staying honest
+## Staying honest — DONE IN D-2 (folded from D-3, review Fix A)
 
-Today a counter `nav_degraded{reason:"inverted_floor_art"}` fires when the old column-bottom patch recovers
-inverted ground. That patch goes away with PR-D, but the signal must not vanish — replace it with
-`nav_support{reason:"facing_blind_ground", queries:N}`, a per-zone counter (reset on zone change, never
-silently absent) telling an agent "this zone's floor is partly inverted art; pathing here is on winding-blind
-ground." A degraded/fallback mode must never be silent.
+The old counter `nav_degraded{reason:"inverted_floor_art"}` fired when the column-bottom patch recovered
+inverted ground. D-2 deletes that patch — and, critically, deleting it removed the counter's only writer, so if
+left as-is the client would report `nav_degraded: null` ("every nav query answered from PROPERLY WOUND floors")
+in exactly the inverted-art zones (permafrost/highpass/neriakc/qcat) where nav is now on winding-blind ground:
+a NET-NEW confident falsehood D-2 would introduce. So the signal is REPLACED in this same PR (not deferred to
+D-3): **`nav_support{reason:"facing_blind_ground", queries:N}`**, driven by `facing_blind_hits` — incremented
+whenever `is_standable` admits a DOWN-facing surface as ground — surfaced on `/v1/observe/debug`, documented in
+`docs/http-api.md`. `null` = every standable surface so far faced up; non-null = pathing on unverified-winding
+ground. A degraded/unverified mode must never be silent, and there is no D-2→D-3 window where it is.
 
 ## The client-vs-art split (your "Both" decision)
 

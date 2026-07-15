@@ -243,7 +243,7 @@ Navigation has two tiers. The **coarse** one (8 u cells, whole zone) chooses the
 **steers** the character along the last few strides of that route — threading the thin ramps and narrow
 openings the 8 u grid cannot see. `GET /v1/observe/debug` carries **`nav_local`**: what that tier last
 said. It is **`null` while the tier is healthy** (a complete fine route to its carrot), exactly like
-`nav_degraded` / `nav_tight`.
+`nav_support` / `nav_tight`.
 
 ```json
 "nav_local": {
@@ -319,27 +319,32 @@ needs an active request/response probe (tracked separately).
 
 ---
 
-## Nav health (`nav_degraded`)
+## Nav footing verification (`nav_support`)
 
-`GET /v1/observe/debug` also carries **`nav_degraded`** — whether pathing in the current zone is
-running on a known-degraded code path. **`null` means healthy**; an object means it is not:
+`GET /v1/observe/debug` also carries **`nav_support`** — whether pathing in the current zone is
+answering from **winding-blind (inverted-art) ground**. **`null` means every standable surface so far
+faced UP** (properly wound); an object means nav has answered from a down-facing surface:
 
 ```json
-"nav_degraded": {
-  "reason":  "inverted_floor_art",
+"nav_support": {
+  "reason":  "facing_blind_ground",
   "queries": 412,
   "detail":  "parts of this zone's collision mesh are wound INVERTED ..."
 }
 ```
 
-Nav treats a **floor** as an *up-facing* triangle, so a ceiling can never be mistaken for one
-(#329). But some zones bake real, walkable ground from **inverted (down-facing) art**, which that
-rule would delete — so when the facing filter leaves a column with no floor at all, nav falls back to
-accepting the column's **bottom-most** surface as ground (nothing lies beneath ground; a ceiling
-always has a floor under it). Those answers are *recovered*, not *verified*: their true facing is
-unknown, so routes crossing them may be less reliable.
+Since **D-2 (#375)** nav's floor predicate `is_standable` is **facing-blind**: a surface is ground on
+its flatness + headroom, whichever way its art is wound — because some zones bake real, walkable
+ground from **inverted (down-facing) art** (the qcat live wedge stood on exactly such a walkway, which
+the old up-facing-only filter deleted). Those surfaces ARE walkable, but nav can no longer *verify*
+their facing, so `nav_support` counts each query answered from one.
 
-`queries` counts how many nav queries have been answered that way since the zone loaded. Read
-`nav_degraded != null` as *"pathing here is on unverified ground"* — it is not a routing failure, and
-it does not mean a route will fail. Use it to distinguish **"no route exists"** from **"this zone's
-pathing is known-unreliable"** when a `move/goto` behaves oddly.
+> **Renamed from `nav_degraded`/`inverted_floor_art`.** That older signal counted a `column_bottom`
+> recovery valve, which D-2 removed. Had it been left reading the dead counter it would report `null`
+> ("all pathing on properly-wound floors") in exactly the inverted-art zones (permafrost/highpass/
+> neriakc/qcat) where nav is now on winding-blind ground — a confident falsehood. The signal moved
+> with the mechanism so it stays honest.
+
+`queries` counts how many nav queries have been answered from down-facing ground since the zone
+loaded. Read `nav_support != null` as *"footing here is unverified-winding"* — not an error and not a
+routing failure (the ground is walkable), just an honest "this footing's facing is unconfirmed."

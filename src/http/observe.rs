@@ -47,31 +47,34 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let health = s.health();
     let frame_profile = *s.frame_profile.lock().unwrap();
     let nav = s.nav_state.lock().unwrap().clone();
-    // Is nav running in a KNOWN-DEGRADED mode in this zone? (#229/#329)
+    // Is nav answering from WINDING-BLIND (inverted-art) ground in this zone? (#375, D-2)
     //
-    // A floor is an up-facing triangle. Some zones bake real, walkable ground from INVERTED
-    // (down-facing) art — across the 34 cached zones the heaviest users are feerrott (667 firings),
-    // everfrost (614) and poknowledge (454) — so the floor-normal filter would delete it. Nav's
-    // safety valve admits the column's BOTTOM-MOST surface as ground when the filter leaves the
-    // column with no floor at all (nothing lies beneath ground; a ceiling always has a floor under
-    // it). That keeps the zone navigable, but the answer came from mis-wound art and the surface's
-    // true facing is unverified — a degraded answer, not a wrong one, and the agent must be able to
-    // SEE that rather than be quietly handed it.
+    // D-2 (#375) made the floor predicate `is_standable` FACING-BLIND: a surface is ground on its
+    // flatness + headroom, whichever way its art is wound — because some zones bake real, walkable
+    // ground from INVERTED (down-facing) art (the qcat live wedge stood on exactly such a walkway,
+    // which the old facing filter deleted). That is correct, but it means nav can no longer VERIFY a
+    // floor's facing there — it is standing on unverified-winding ground. `facing_blind_hits` counts
+    // each query answered from a down-facing surface, so the agent can SEE it.
     //
-    // `null` = the filter has answered every nav query in this zone from properly wound floors.
-    // Non-null = the fallback has fired `queries` times since zone load. A `tracing::warn!` is not
-    // observable to an agent driving this client over HTTP; a client that quietly answers from a
-    // degraded code path is lying by omission. So report it here, where the agent can see it.
-    let nav_degraded = s.shared_collision.read().unwrap().as_ref().and_then(|col| {
-        let hits = col.fallback_hits();
+    // (This REPLACES the old `nav_degraded`/`inverted_floor_art` signal, which counted the
+    // `column_bottom` recovery valve firing. D-2 deleted that valve — so if this were left reading the
+    // dead counter it would always be `null`, i.e. "every nav query answered from PROPERLY WOUND
+    // floors," which is a confident falsehood in exactly the inverted-art zones (permafrost/highpass/
+    // neriakc/qcat) where nav is now on winding-blind ground. A degraded/unverified mode must never be
+    // silent, so the signal moves with the mechanism.)
+    //
+    // `null` = every standable surface answered so far faced UP (properly wound). Non-null = nav has
+    // answered `queries` times from down-facing (inverted-art) ground since zone load.
+    let nav_support = s.shared_collision.read().unwrap().as_ref().and_then(|col| {
+        let hits = col.facing_blind_hits();
         (hits > 0).then(|| serde_json::json!({
-            "reason": "inverted_floor_art",
+            "reason": "facing_blind_ground",
             "queries": hits,
             "detail": "parts of this zone's collision mesh are wound INVERTED (down-facing where \
-                       ground should face up), so nav cannot verify a floor's facing there and has \
-                       fallen back to accepting the column's lowest surface as ground. Routes \
-                       through those areas are planned on unverified ground and may be less \
-                       reliable (#329/#353).",
+                       ground should face up). Since D-2 (#375) nav accepts such surfaces as floor on \
+                       flatness + headroom (they ARE walkable — the qcat wedge proved it), but their \
+                       true facing is unverified, so routes through those areas are planned on \
+                       winding-blind ground. Not an error; an honest 'this footing is unverified'.",
         }))
     });
     // Tiered clearance (#358): routes are normally planned with a body-width of margin from walls
@@ -91,7 +94,7 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         }))
     });
     // The fine 2u steering tier's last honest word (#382). `null` when it is threading cleanly — a
-    // healthy tier says nothing, exactly like `nav_degraded` / `nav_tight`.
+    // healthy tier says nothing, exactly like `nav_support` / `nav_tight`.
     let nav_local = nav.local.as_ref().filter(|l| l.state != "threaded").map(|l| serde_json::json!({
         "state":       l.state,
         "reason":      l.reason,
@@ -227,10 +230,11 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             "casting":     casting,
             "last_cast":   last_cast,
         },
-        // Nav health for THIS zone. `null` when nav is running normally; an object naming the
-        // degraded mode when it is not (see `nav_degraded` above). An agent must be able to tell
-        // "no route exists" from "this zone's pathing is known-unreliable".
-        "nav_degraded": nav_degraded,
+        // Nav footing verification for THIS zone (#375, D-2). `null` when every standable surface so
+        // far faced UP (properly wound); an object naming the winding-blind (inverted-art) ground when
+        // nav has answered from a down-facing surface (see `nav_support` above). RENAMED from the old
+        // `nav_degraded`/`inverted_floor_art`, whose mechanism (the column_bottom valve) D-2 deleted.
+        "nav_support": nav_support,
         "nav_tight": nav_tight,
         // The FINE 2u STEERING tier (#382). `null` while it is healthy (a complete fine route to its
         // carrot) or has not yet answered. Non-null when the tier that is actually steering the
