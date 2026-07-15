@@ -332,6 +332,14 @@ world hung", read `world_responsive`, not `last_packet_age_ms`.**
 > progress** for us (a wedged per-client dispatch, a stuck script, a severely slow tick) — the case
 > the passive clocks genuinely cannot see. A `world_responsive: false` is always an honest
 > "the zone did not process my app request in time"; it is never a guess.
+>
+> **Server-content caveat.** The probe relies on the zone replying to a self-`OP_Consider`. A global
+> `EVENT_CONSIDER` quest handler that `return`s 1 SUPPRESSES the consider reply
+> (`zone/client_packet.cpp` `Handle_OP_Consider`), which on a genuinely idle zone would read as a
+> *false* wedge. This is not stock EQEmu and no shipped quest registers such a handler globally — but
+> if future server content adds one, it would silently turn every idle session `world_responsive:
+> false`. If that signal ever misfires on a known-healthy idle zone, check for a global consider hook
+> before trusting it.
 
 ---
 

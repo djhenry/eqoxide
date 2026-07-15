@@ -270,13 +270,17 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         },
     });
     // #371 — attached here (not inside the literal above, which is already at the json! recursion
-    // limit). `connected: true` only proves the SOCKET ACKs; a WEDGED zone keeps ACKing while its
-    // main loop is hung, which is indistinguishable from a quiet zone by the passive clocks. An
-    // active liveness probe (a request the zone main loop must service) settles it:
+    // limit). `connected: true` only proves the SOCKET ACKs; a zone that is still ticking but not
+    // servicing our packets (a stuck per-client dispatch / script, or a very slow tick) keeps ACKing
+    // while producing no application output for us, which is indistinguishable from a quiet zone by
+    // the passive clocks. An active liveness probe (a request the zone main loop must service)
+    // settles it:
     //   world_responsive        — false ONLY when a probe went unanswered past PROBE_TIMEOUT_SECS on
     //                             a still-ACKing link. An idle-but-alive zone stays true (the probe
-    //                             is answered). USE THIS, not last_packet_age_ms, to judge "is the
-    //                             world hung". True before the first probe fires (no verdict yet).
+    //                             is answered). USE THIS, not last_packet_age_ms, to judge whether the
+    //                             world is unresponsive. True before the first probe fires (no verdict
+    //                             yet). NOTE: this catches the still-ticking-but-unresponsive case; a
+    //                             TOTAL zone freeze stops ACKs too and is already `connected: false`.
     //   last_world_response_ms  — since the world last PROVED it processed something for us (a probe
     //                             reply or spontaneous packet), whichever is fresher.
     if let Some(player) = out.get_mut("player").and_then(|p| p.as_object_mut()) {
@@ -609,11 +613,12 @@ mod tests {
         assert!(p["link_age_ms"].as_u64().unwrap() < 1_000);
     }
 
-    /// #371 — THE wedged-world lie, end to end through the real `health()` projection. The link is
-    /// ACKing (a datagram just landed → `connected: true`), the world has been application-silent for
-    /// 30s, and an active liveness probe sent 15s ago was never answered (bound is 10s). `connected`
-    /// alone would tell the agent the world is fine; `world_responsive: false` is the honest signal
-    /// that the zone main loop is not processing.
+    /// #371 — THE unresponsive-world lie, end to end through the real `health()` projection. The link
+    /// is ACKing (a datagram just landed → `connected: true`), the world has been application-silent
+    /// for 30s, and an active liveness probe sent 15s ago was never answered (bound is 10s).
+    /// `connected` alone would tell the agent the world is fine; `world_responsive: false` is the
+    /// honest signal that the zone is not servicing our packets (still-ticking-but-unresponsive; a
+    /// total freeze would already be `connected: false`).
     #[tokio::test]
     async fn debug_reports_world_unresponsive_when_a_probe_goes_unanswered_while_the_link_acks() {
         let state = empty_state();

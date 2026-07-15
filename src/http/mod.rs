@@ -135,14 +135,21 @@ pub type GameStateSnapshot = std::sync::Arc<arc_swap::ArcSwap<crate::game_state:
 /// `connected` from application traffic would therefore report a perfectly healthy idle session as
 /// disconnected — trading the old false `true` for an equally dishonest false `false`.
 ///
-/// #371 adds a FOURTH failure those three cannot see: a **wedged zone**. EQEmu's `EQStreamFactory`
-/// runs the UDP reader/writer on threads separate from the zone main loop, so a hung zone keeps
-/// ACKing (`last_datagram` fresh → `connected: true`) while producing no application output
-/// (`last_packet` climbing) — which is *pixel-identical* to a healthy-but-idle zone. No passive
-/// clock can separate them, because the failure is exactly "the world stopped speaking". The only
+/// #371 adds a FOURTH failure those three cannot fully see: a zone that is **still ticking but not
+/// making application progress for us** — a stuck per-client dispatch, an infinite/blocking quest
+/// script, or a tick so slow it never services our packets. Such a zone keeps ACKing
+/// (`last_datagram` fresh → `connected: true`) while producing no application output for us
+/// (`last_packet` climbing) — which is *pixel-identical* to a healthy-but-idle zone, because the
+/// symptom is exactly "the world stopped speaking". No passive clock can separate them. The only
 /// sound discriminator is an ACTIVE probe: periodically send a cheap request the zone MAIN LOOP
 /// must service to answer, and time the reply. `last_probe_sent` / `last_probe_reply` are that
 /// round-trip's clocks; `HttpState::health` turns them into `world_responsive` at read time.
+///
+/// SCOPE (do not oversell): this EQEmu build runs the zone as a single-threaded libuv loop, so a
+/// *total* freeze stops the ACKs too and is ALREADY caught by `connected: false`. `world_responsive`
+/// does NOT add total-freeze detection — it adds the still-ticking-but-unresponsive case above,
+/// which `connected` cannot see. (The old Titanium `EQStreamFactory` split a hung main loop from a
+/// still-ACKing reader thread; this server does not work that way — do not reason from that model.)
 #[derive(Debug, Clone, Copy)]
 pub struct NetHealth {
     /// Last inbound datagram of ANY kind, session-layer ACKs/keepalives included → link liveness.
