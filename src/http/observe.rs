@@ -116,6 +116,22 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         let g = s.guild.lock().unwrap();
         (g.guild_name.clone(), g.guild_id, g.guild_rank)
     };
+    // Built here as locals (not inline in the big `json!` below) so the player object's macro
+    // expansion stays under serde_json's recursion limit — the object is large and each inline
+    // nested `json!` deepens it. `elapsed_ms` / `ago_secs` are still measured at read time (#343).
+    let casting = player.casting.as_ref().map(|c| serde_json::json!({
+        "spell_id":   c.spell_id,
+        "spell_name": c.spell_name,
+        "cast_ms":    c.cast_ms,
+        "elapsed_ms": c.started.elapsed().as_millis() as u64,
+    }));
+    let last_cast = player.last_cast.as_ref().map(|o| serde_json::json!({
+        "spell_id":   o.spell_id,
+        "spell_name": o.spell_name,
+        "outcome":    o.outcome,
+        "text":       o.text,
+        "ago_secs":   o.at.elapsed().as_secs(),
+    }));
     Json(serde_json::json!({
         "player": {
             "name":       player.name,
@@ -146,6 +162,24 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             "target_id":   player.target_id,
             "target_name": player.target_name,
             "target_hp_pct": player.target_hp_pct,
+            // #292/#409: the last consider's result for the CURRENT target — difficulty tier,
+            // attitude enum, and the target's actual level. The PlayerState projection already
+            // computes these (gated on a live target_id); they MUST be surfaced here or an agent
+            // asking "how tough / what attitude is my target" gets a confident null even though the
+            // consider succeeded (the exact #409 agent-honesty regression — the con reached the
+            // GameState but never the JSON).
+            "target_con":      player.target_con,
+            "target_attitude": player.target_attitude,
+            "target_level":    player.target_level,
+            // Death state for a headless agent (#284/#406). `dead` = currently slain (held until
+            // POST /v1/lifecycle/respawn); `killed_by` + `died_ago_secs` persist for a window after
+            // death (through a respawn). These are the documented way an agent detects it died and
+            // must revive — omitting them let a slain character report `dead: null` forever while the
+            // "You have been slain" chat line fired, i.e. a lie by omission (#406). All computed in
+            // the projection at read time.
+            "dead":          player.dead,
+            "killed_by":     player.killed_by,
+            "died_ago_secs": player.died_ago_secs,
             // Connection health, all computed at READ time (#8, #343). Three independent failures,
             // three independent signals — a frozen world can no longer masquerade as a live one,
             // because nothing has to be RUNNING for these to be right:
@@ -190,19 +224,8 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             // `elapsed_ms` / `ago_secs` are measured HERE, at read time — the projection above
             // carries the raw `Instant`s and never measures them. Same rule as `health()`: an age is
             // only true at the moment it is read (#343).
-            "casting":     player.casting.as_ref().map(|c| serde_json::json!({
-                "spell_id":   c.spell_id,
-                "spell_name": c.spell_name,
-                "cast_ms":    c.cast_ms,
-                "elapsed_ms": c.started.elapsed().as_millis() as u64,
-            })),
-            "last_cast":   player.last_cast.as_ref().map(|o| serde_json::json!({
-                "spell_id":   o.spell_id,
-                "spell_name": o.spell_name,
-                "outcome":    o.outcome,
-                "text":       o.text,
-                "ago_secs":   o.at.elapsed().as_secs(),
-            })),
+            "casting":     casting,
+            "last_cast":   last_cast,
         },
         // Nav health for THIS zone. `null` when nav is running normally; an object naming the
         // degraded mode when it is not (see `nav_degraded` above). An agent must be able to tell
@@ -579,6 +602,107 @@ mod tests {
         assert_eq!(v["player"]["hp_pct"], serde_json::json!(12.0));
         assert_eq!(v["player"]["target_id"], serde_json::json!(null));
         assert_eq!(v["player"]["target_name"], serde_json::json!(null));
+    }
+
+    // --- Target / death STATE must reach /observe/debug, not just the GameState (#409/#406/#408) ---
+    //
+    // These exercise the REAL projection path the live bugs slip through: apply the actual packet
+    // (OP_Consider / OP_Death / a target then a zone-in) to a GameState, then hit the axum /debug
+    // route and assert the JSON. The unit tests in packet_handler.rs mutate+read ONE GameState and
+    // so never see that the hand-built /debug JSON dropped the field on the floor — that gap is
+    // exactly what #400 skipped and what these close.
+
+    /// OP_Consider reply (RoF2 Consider_Struct): playerid@0, targetid@4, faction@8, level@12.
+    fn consider_reply(player_id: u32, target_id: u32, faction: u32, level: u32) -> Vec<u8> {
+        let mut p = vec![0u8; 20];
+        p[0..4].copy_from_slice(&player_id.to_le_bytes());
+        p[4..8].copy_from_slice(&target_id.to_le_bytes());
+        p[8..12].copy_from_slice(&faction.to_le_bytes());
+        p[12..16].copy_from_slice(&level.to_le_bytes());
+        p
+    }
+
+    /// OP_Death (Death_S): spawn_id@0 (the dying entity), killer_id@4.
+    fn death_reply(spawn_id: u32, killer_id: u32) -> Vec<u8> {
+        let mut p = vec![0u8; 32];
+        p[0..4].copy_from_slice(&spawn_id.to_le_bytes());
+        p[4..8].copy_from_slice(&killer_id.to_le_bytes());
+        p
+    }
+
+    /// #409: after a successful consider of the CURRENT target, `/observe/debug` must expose the
+    /// structured con result — difficulty tier, attitude enum, and the target's level. On main these
+    /// are computed by the projection but NEVER serialized by `get_debug`, so an agent reads `null`
+    /// though `apply_consider` ran and the con succeeded. RED on main (fields absent), GREEN after.
+    #[tokio::test]
+    async fn debug_surfaces_consider_result_for_current_target_409() {
+        let state = empty_state();
+        set_gs(&state, |gs| {
+            gs.player_id = 1;
+            // The target's REAL level (12) comes from the spawn — deliberately different from the
+            // consider reply's ConsiderColor field (13 = red) to prove the two are sourced separately.
+            let mut npc = crate::game_state::tests::make_entity(136, "Caleah_Herblender000", 0.0, 0.0, 0.0, true);
+            npc.level = 12;
+            gs.upsert_entity(npc);
+            gs.set_target(136);
+            // faction 8 = "threatening", ConsiderColor 13 = "red".
+            crate::eq_net::packet_handler::apply_consider(gs, &consider_reply(gs.player_id, 136, 8, 13));
+        });
+        let p = debug_json(state).await["player"].clone();
+        assert_eq!(p["target_con"], serde_json::json!("red"),
+            "target_con must reach /observe/debug after a successful consider (#409)");
+        assert_eq!(p["target_attitude"], serde_json::json!("threatening"),
+            "target_attitude must reach /observe/debug after a successful consider (#409)");
+        assert_eq!(p["target_level"], serde_json::json!(12),
+            "target_level must reach /observe/debug (#409)");
+    }
+
+    /// #406: after the character is slain (OP_Death for our own spawn), `/observe/debug` must report
+    /// `dead: true` + `killed_by` + `died_ago_secs`. On main the death message fires (log path) but
+    /// these STATE fields are never serialized by `get_debug`, so a held corpse reports `dead: null`
+    /// forever. RED on main (fields absent → null), GREEN after.
+    #[tokio::test]
+    async fn debug_surfaces_death_state_after_slain_406() {
+        let state = empty_state();
+        set_gs(&state, |gs| {
+            gs.player_id = 42;
+            gs.max_hp = 34;
+            gs.upsert_entity(crate::game_state::tests::make_entity(66, "Guard_Doradek000", 0.0, 0.0, 0.0, true));
+            crate::eq_net::packet_handler::apply_death(gs, &death_reply(42, 66)); // our spawn, killed by 66
+        });
+        let p = debug_json(state).await["player"].clone();
+        assert_eq!(p["dead"], serde_json::json!(true),
+            "a slain character must report dead:true on /observe/debug (#406)");
+        assert_eq!(p["killed_by"], serde_json::json!("Guard_Doradek000"),
+            "killed_by must be surfaced so an agent knows to respawn (#406)");
+        assert!(p["died_ago_secs"].as_u64().is_some(),
+            "died_ago_secs must be present after a death (#406)");
+    }
+
+    /// #408: the target pointer must clear on a zone change. Target a spawn in kaladimb, then zone
+    /// (death-respawn to qeynos → `begin_zone_in`). On main `begin_zone_in` purges the entity map but
+    /// NOT the target, so `/observe/debug` reports the old zone's spawn (id 66, cached name, 100% HP)
+    /// — a spawn that doesn't exist in the new zone. RED on main (target leaks), GREEN after.
+    #[tokio::test]
+    async fn debug_clears_target_on_zone_change_408() {
+        let state = empty_state();
+        set_gs(&state, |gs| {
+            gs.zone_name = "kaladimb".into();
+            gs.upsert_entity(crate::game_state::tests::make_entity(66, "Guard_Dalammer000", 0.0, 0.0, 0.0, true));
+            gs.set_target(66);
+        });
+        assert_eq!(debug_json(state.clone()).await["player"]["target_id"], serde_json::json!(66),
+            "precondition: the spawn is the target before zoning");
+
+        set_gs(&state, |gs| { gs.begin_zone_in(); gs.zone_name = "qeynos".into(); });
+        let p = debug_json(state).await["player"].clone();
+        assert_eq!(p["zone"], serde_json::json!("qeynos"));
+        assert_eq!(p["target_id"], serde_json::json!(null),
+            "target must clear on zone change — an old-zone spawn is not a valid target (#408)");
+        assert_eq!(p["target_name"], serde_json::json!(null),
+            "stale target_name must not leak into the new zone (#408)");
+        assert_eq!(p["target_hp_pct"], serde_json::json!(null),
+            "stale target_hp_pct must not leak into the new zone (#408)");
     }
 
     fn push_message(state: &HttpState, kind: &str, text: &str) {

@@ -1471,7 +1471,7 @@ fn cast_outcome_for_string_id(string_id: u32) -> Option<&'static str> {
 ///   /*028*/ uint32 unknown028
 /// (Note: rof2_structs.h swaps attack_skill/bindzoneid at offsets 12/20 vs eq_packet_structs.h,
 /// but since OP_Death has no encode, the wire always uses the eq_packet_structs.h ordering.)
-fn apply_death(gs: &mut GameState, payload: &[u8]) {
+pub(crate) fn apply_death(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < SIZE_DEATH { return; }
     let d = unsafe { safe_read::<Death_S>(payload) };
     let d_id = d.spawn_id;
@@ -2107,7 +2107,7 @@ pub fn attitude_name(faction: u32) -> &'static str {
 ///  - The `target_con` / `target_con_name` / `target_attitude` HUD+API fields describe the CURRENT
 ///    target only, so those three writes are gated on the reply actually being about it. That is
 ///    what closes #330: a stale reply can no longer overwrite the current target's con.
-fn apply_consider(gs: &mut GameState, payload: &[u8]) {
+pub(crate) fn apply_consider(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < 16 { return; }
     let target_id = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
     let faction   = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
