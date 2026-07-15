@@ -913,9 +913,13 @@ pub const NAV_PREFERRED_CLEARANCE: f32 = crate::movement::PLAYER_RADIUS * 2.0;
 /// collision ray sits at `foot + 4.0` (`movement.rs`), so ~5u is the clearance a body actually needs;
 /// this is measured against route-success (≥ 99.50%) before shipping.
 ///
-/// Both belong on the shared `Body` (PR-A). Defined here until PR-A lands — do NOT invent a second copy.
-pub const NAV_NEAR_HORIZONTAL: f32 = 0.64;
-pub const NAV_AGENT_HEIGHT: f32 = 5.0;
+/// **PR-A landed (Phase 2): the single source of truth is now `traversability::PLAYER_BODY`.** These
+/// two consts are thin aliases into it — the VALUE lives on the shared `Body`
+/// (`Body::near_horizontal` / `Body::agent_height`), and every existing `NAV_NEAR_HORIZONTAL` /
+/// `NAV_AGENT_HEIGHT` reference reads through here so no second copy exists. Change the number on the
+/// `Body`, not here.
+pub const NAV_NEAR_HORIZONTAL: f32 = crate::traversability::PLAYER_BODY.near_horizontal;
+pub const NAV_AGENT_HEIGHT: f32 = crate::traversability::PLAYER_BODY.agent_height;
 
 /// The share of a plan's node budget the GENEROUS clearance pass may spend before it is abandoned in
 /// favour of the minimum-clearance pass that actually decides the answer.

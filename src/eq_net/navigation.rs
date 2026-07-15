@@ -529,28 +529,12 @@ pub fn build_channel_message(sender: &str, target: &str, chan_num: u32, message:
     buf
 }
 
-/// Choose a movement delta `(dx, dy)` from the desired `(full_dx, full_dy)` step,
-/// sliding along a single axis when the diagonal is blocked by a wall. `dx`/`dy` are
-/// in EQ server axes: dx = east (server_x), dy = north (server_y). Returns `None`
-/// only when fully boxed in. Cast at chest height (z+3) so low lips/stairs don't block.
-/// Collision world points are `[east, north, height]` = `[server_x, server_y, server_z]`.
-pub fn slide_move(
-    col: &crate::assets::Collision,
-    px: f32, py: f32, z: f32,
-    full_dx: f32, full_dy: f32, radius: f32,
-) -> Option<(f32, f32)> {
-    let chest = z + 3.0;
-    let clear = |sx: f32, sy: f32| col.path_clear([px, py, chest], [px + sx, py + sy, chest], radius);
-    if clear(full_dx, full_dy) {
-        Some((full_dx, full_dy))
-    } else if clear(full_dx, 0.0) {
-        Some((full_dx, 0.0))
-    } else if clear(0.0, full_dy) {
-        Some((0.0, full_dy))
-    } else {
-        None
-    }
-}
+// NOTE: `slide_move` — a second, divergent collision-slide implementation (chest ray at z+3, its
+// own axis-drop logic) — was DELETED in Phase 2 (#378). It had ZERO production callers: the walker
+// steers via `CharacterController` (movement.rs `slide`), the ONE collision model, which derives
+// its probe heights from `traversability::PLAYER_BODY`. A second slide model that nothing calls is
+// exactly the drift this refactor exists to make impossible (its z+3 chest ray never matched the
+// controller's `Body::chest` = 4.0). Gone; there is now a single collide-and-slide in the client.
 
 /// Fine grid resolution of the LOCAL plan — the tier the walker actually steers along.
 ///
@@ -4301,34 +4285,6 @@ mod tests {
         assert_eq!(p.len(), msg_end + 1);
     }
 
-    fn wall_collision() -> crate::assets::Collision {
-        // Vertical wall at world east=5: EQ p2=5 (render.X), north=p0 [0,10], height=p1 [0,10].
-        let wall = crate::assets::MeshData {
-            positions: vec![[0.0, 0.0, 5.0], [10.0, 0.0, 5.0], [10.0, 10.0, 5.0], [0.0, 10.0, 5.0]],
-            normals: vec![[0.0, 0.0, 1.0]; 4],
-            uvs: vec![[0.0, 0.0]; 4],
-            indices: vec![0, 1, 2, 0, 2, 3],
-            texture_name: None,
-            base_color: [1.0; 4],
-            center: [0.0, 0.0, 0.0],
-            render_mode: crate::assets::RenderMode::Opaque, anim: None,
-        };
-        crate::assets::Collision::build(
-            &crate::assets::ZoneAssets { terrain: vec![wall], objects: vec![], textures: vec![] }, 4.0)
-    }
-
-    #[test]
-    fn slide_move_slides_along_wall_when_diagonal_blocked() {
-        let col = wall_collision();
-        // Player at east=3, north=5, stepping toward the wall (east +2) and north (+2).
-        // The diagonal hits the wall at east=5, so it should slide to north-only.
-        // slide_move(col, px=east, py=north, z, full_dx=east, full_dy=north, radius)
-        let r = slide_move(&col, 3.0, 5.0, 0.0, 2.0, 2.0, 2.0);
-        assert_eq!(r, Some((0.0, 2.0)), "should slide along north, dropping the blocked east");
-
-        // Moving away from the wall (east -2) is unobstructed → full move.
-        assert_eq!(slide_move(&col, 3.0, 5.0, 0.0, -2.0, 2.0, 2.0), Some((-2.0, 2.0)));
-    }
 
     #[test]
     fn build_target_packet_is_spawn_id_le() {
