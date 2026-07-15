@@ -865,6 +865,10 @@ pub struct Collision {
     /// the water map at `set_water` (zone load). Lets `find_zone_line_near` be an O(1) cache read on
     /// the network thread instead of an exhaustive scan that linkdead-ed the client (#204).
     zone_line_regions: Vec<(i32, [f32; 3])>,
+    /// The zone-lifetime static clearance field (#378 / design §3d, the `MemoField`): graded
+    /// wall/ground distances per (2 u cell, floor bucket), computed on demand and cached until the
+    /// zone (and this struct) is dropped. See `traversability::ClearanceField`.
+    clearance: crate::traversability::ClearanceField,
 }
 
 /// The clearance a route is planned at BY DEFAULT — deliberately larger than the character.
@@ -1026,6 +1030,7 @@ impl Collision {
         if tris.is_empty() || min[0] == f32::MAX {
             return Collision { tris, tri_nz, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0,
                 z_min: 0.0, z_max: 0.0, facing_blind_hits: Default::default(), tight_plans: Default::default(),
+                clearance: Default::default(),
                 water: None, from_collision_mesh, zone_line_regions: Vec::new() };
         }
         let cols = (((max[0] - min[0]) / cell_size).ceil() as usize + 1).max(1);
@@ -1048,7 +1053,8 @@ impl Collision {
             }
         }
         Collision { tris, tri_nz, cells, origin: min, cell_size, cols, rows, z_min, z_max,
-            facing_blind_hits: Default::default(), tight_plans: Default::default(), water: None, from_collision_mesh, zone_line_regions: Vec::new() }
+            facing_blind_hits: Default::default(), tight_plans: Default::default(), water: None, from_collision_mesh, zone_line_regions: Vec::new(),
+            clearance: Default::default() }
     }
 
     /// How many times the floor-normal filter's empty-column fallback has fired since zone load, i.e.
@@ -1491,36 +1497,13 @@ impl Collision {
         best
     }
 
-    /// Swept "cylinder" of `radius` moving from `from` by `delta`, approximated by casting the
-    /// centre segment plus offset feeler segments at ±radius perpendicular to the horizontal motion
-    /// and at foot/chest heights. Returns the nearest contact (fraction `t` + slide-plane normal),
-    /// or `None` when the path is clear. (Design §3.1.)
-    pub fn sweep(&self, from: [f32; 3], delta: [f32; 3], radius: f32) -> Option<Hit> {
-        if self.cols == 0 { return None; }
-        let hlen = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
-        // Perpendicular (in the horizontal plane) to the motion, scaled to radius.
-        let perp = if hlen > 1e-6 {
-            [-delta[1] / hlen * radius, delta[0] / hlen * radius]
-        } else {
-            [0.0, 0.0]
-        };
-        // Foot and chest height offsets (cylinder ~6 units tall, origin at the feet).
-        const FOOT: f32 = 0.5;
-        const CHEST: f32 = 4.0;
-        let mut best: Option<Hit> = None;
-        for &(ox, oy) in &[(0.0_f32, 0.0_f32), (perp[0], perp[1]), (-perp[0], -perp[1])] {
-            for &hz in &[FOOT, CHEST] {
-                let f = [from[0] + ox, from[1] + oy, from[2] + hz];
-                let to = [f[0] + delta[0], f[1] + delta[1], f[2] + delta[2]];
-                if let Some((t, n)) = self.nearest_hit(f, to) {
-                    if best.map_or(true, |b| t < b.t) {
-                        best = Some(Hit { t, normal: n });
-                    }
-                }
-            }
-        }
-        best
-    }
+    // NOTE: `Collision::sweep` — a swept-cylinder approximation this comment block used to sit
+    // above — was DELETED (#378 refactor, PR-1). It had ZERO production callers: the mover
+    // (`CharacterController::slide`) implements its own contact resolution and never called it,
+    // while `path_clear`'s doc claimed the two shared it. A dead "shared collision model" that
+    // nothing shares is exactly the #312 class of lie (a comment documenting a fix broader than the
+    // code), so the function is gone; what the planner and the controller ACTUALLY share now is the
+    // probe geometry itself — `traversability::PLAYER_BODY` — which both derive their heights from.
 
     /// The height of the nearest **standable** surface at/below `origin_z` within `depth`, or `None`.
     /// Native ground clamp uses `origin = foot_z + 1.0`, `depth = 200` (design §3.2).
@@ -1545,7 +1528,7 @@ impl Collision {
     /// returning `true` only when none are blocked. Used by the depenetration net (design §3.3).
     pub fn footprint_clear(&self, east: f32, north: f32, foot_z: f32, radius: f32, n: usize) -> bool {
         if self.cols == 0 { return true; }
-        let chest = foot_z + 3.0;
+        let chest = foot_z + crate::traversability::PLAYER_BODY.ring;
         let c = [east, north, chest];
         let n = n.max(1);
         for i in 0..n {
@@ -1622,12 +1605,18 @@ impl Collision {
     /// gfaydark→butcher wedge: coarse route = 0 ray/capsule disagreements, fine route = 2, both on
     /// the segments the character was stuck on.
     ///
-    /// So sweep the volume: the centre line plus both SHOULDERS, offset `±radius` perpendicular to
-    /// the horizontal motion. This is deliberately the exact feeler pattern `Collision::sweep` (the
-    /// mover's own swept-cylinder approximation, design §3.1) uses — the planner and the controller
-    /// now share one collision model, so "the planner says clear" and "the controller can traverse
-    /// it" cannot drift apart. Matching an *ideal* capsule instead would be a different (and
-    /// weaker) guarantee: it would agree with geometry the controller does not actually implement.
+    /// So sweep the volume: feelers across the whole diameter, offset perpendicular to the
+    /// horizontal motion.
+    ///
+    /// **What is — and is not — shared with the controller (corrected, #378/#386).** An earlier
+    /// version of this comment claimed the planner and controller "share one collision model" via
+    /// `Collision::sweep`. That was false on both halves: `sweep` had zero production callers (the
+    /// mover's `slide` rolls its own centre-ray contact resolution) and the feeler patterns
+    /// differed anyway. The TRUE shared artifact is the body geometry: the probe HEIGHTS both sides
+    /// use come from `traversability::PLAYER_BODY` (the planner's top probe IS the controller's
+    /// chest contact ray), and the planner sweeps a strictly WIDER lateral pattern (5 feelers vs
+    /// the mover's centre ray + radius back-off) — conservative in the safe direction:
+    /// planner-clear ⇒ controller-passable laterally, up to the parallel-wall limit below.
     ///
     /// Cost is 3 rays instead of 1. The A* edge test runs two of these (chest + feet) per edge; the
     /// grid broad-phase keeps each ray to a handful of triangles.
@@ -1682,12 +1671,38 @@ impl Collision {
     /// waypoint inset's `edge_ok`, so the search and the inset agree about what an "edge" is) and
     /// requires ground within a tight vertical band of `z` at each. A drop below, a wall lip above,
     /// and open water all read as "no ground" and so as an edge to keep away from.
+    ///
+    /// NOTE (#378 phase 1): production planning now uses the GRADED, zone-lifetime form of this
+    /// predicate — [`Collision::ground_clearance`] via the clearance field — same probe band, same
+    /// axial directions, but a distance instead of a boolean and memoised across plans. This exact-
+    /// point boolean remains as the diagnostic/test primitive the graded form is validated against.
     pub fn ground_margin_ok(&self, east: f32, north: f32, z: f32, clearance: f32) -> bool {
         if clearance <= 0.0 { return true; }
         [(clearance, 0.0), (-clearance, 0.0), (0.0, clearance), (0.0, -clearance)]
             .iter()
             .all(|&(dx, dy)| self.nearest_floor(east + dx, north + dy, z, 3.0, 8.0)
                 .is_some_and(|f| (f - z).abs() <= 8.0))
+    }
+
+    /// Graded RADIAL wall clearance at a standing point, from the zone-lifetime clearance field
+    /// (#378/#381): distance to the nearest solid geometry at the body's probe heights, in any
+    /// direction. Unlike `path_clear`'s travel-parallel feelers, a radial spoke crosses a wall the
+    /// route merely runs alongside. Memoised per (2 u cell, floor bucket); deterministic
+    /// (computed at the key centre, never the query point).
+    pub fn wall_clearance(&self, east: f32, north: f32, floor_z: f32) -> f32 {
+        self.clearance.wall_at(self, east, north, floor_z)
+    }
+
+    /// Graded ground (ledge) clearance at a standing point, from the zone-lifetime clearance
+    /// field: distance to the nearest direction where the floor runs out (drop / lip / waterline).
+    /// The graded form of `ground_margin_ok`, same probe band, memoised for the zone's lifetime.
+    pub fn ground_clearance(&self, east: f32, north: f32, floor_z: f32) -> f32 {
+        self.clearance.ground_at(self, east, north, floor_z)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clearance_field_for_test(&self) -> &crate::traversability::ClearanceField {
+        &self.clearance
     }
 
     /// ALL distinct walkable surface heights at `(east, north)` within `[ref_z - down, ref_z + up]`,
@@ -2241,7 +2256,14 @@ impl Collision {
             }
             best.map(|(c, r, _)| (c, r)).unwrap_or((sc, sr))
         };
-        const CHEST: f32 = 3.0;
+        // The planner's UPPER edge probe. This is `Body::chest` — the SAME height the controller's
+        // contact ray collides at (`movement::CharacterController::slide`) — not a locally-invented
+        // constant. It was 3.0 here for months while the controller collided at 4.0, so geometry
+        // occupying only z ∈ (3.0, 4.0] above the floor (a door lintel, a low arch soffit) was clear
+        // to A* and solid to the walker: the planner handed out routes the walker physically could
+        // not follow (#386, design §1c). Deriving both from the one PLAYER_BODY makes that drift
+        // unrepresentable rather than merely fixed.
+        const CHEST: f32 = crate::traversability::PLAYER_BODY.chest;
         // The node cap is the ONLY bound on a search, so it also decides whether the definitive verdict
         // `Unreachable(SearchClosed)` can ever be reached. Too tight and a whole-zone flood hits the cap
         // and downgrades to `Exhausted` ("I don't know") even when the frontier really was closable — a
@@ -2265,7 +2287,12 @@ impl Collision {
         } else {
             0.0
         };
-        let mut margin_ok: std::collections::HashMap<(i32, i32, i32), bool> = std::collections::HashMap::new();
+        // THE ONE AUTHORITY on what blocks the body, for this plan (#378). The walk-edge test and
+        // the waypoint inset below both consult it — they used to be independent predicates that
+        // could not see each other's hazards. It owns the per-plan ground-margin memo that used to
+        // live here as a bare HashMap.
+        let trav = crate::traversability::Traversability::new(
+            self, radius, cell, ledge_margin, floating_surface.is_some());
         // Aggro-avoidance (#67): softly bias A* AWAY from cells near NPCs so long routes skirt mob
         // camps instead of plowing through them and getting the player killed. Proactive (before
         // aggro) and faction-agnostic — the client has no broad faction data, so it avoids ALL
@@ -2286,6 +2313,24 @@ impl Collision {
                 }
             }
             worst
+        };
+        // WALL-HUG COST (#381, via the zone-lifetime clearance field). `path_clear`'s feelers run
+        // parallel to travel, so an edge that RUNS ALONGSIDE a wall — never crossing it — reads
+        // clear at every feeler; the emitted lane then hugs the wall and the walker presses into it
+        // (the qcat hallway symptom). The field's RADIAL wall distance sees exactly that wall, and
+        // it enters here as a COST, never a filter: a lane inside the preferred clearance pays up
+        // to one extra cell-length per step, so A* swings to the corridor middle whenever a freer
+        // lane exists and still threads the tight lane when nothing else does (a cost can never
+        // become no_route — the §9 non-negotiable, same contract as `aggro_cost`).
+        //
+        // FINE TIER ONLY (`cell <= SWEPT_EDGE_MAX_CELL`): the fine lane is the one the walker
+        // actually steers along. The coarse 8 u tier stays a pure optimistic corridor SELECTOR —
+        // its centres sit near walls in every city corridor as a matter of geometry, and biasing it
+        // buys no walkability (the walker never walks the coarse line) at real routing drift.
+        let hug_cost = |x: f32, y: f32, fz: f32| -> f32 {
+            if cell > SWEPT_EDGE_MAX_CELL { return 0.0; }
+            let w = self.wall_clearance(x, y, fz);
+            if w >= NAV_PREFERRED_CLEARANCE { 0.0 } else { cell * (1.0 - w / NAV_PREFERRED_CLEARANCE) }
         };
         // MULTI-FLOOR A*: the node is (cell, floor), not just cell — so a single cell can be visited
         // at several heights (a ramp or lower floor sitting UNDER an upper ledge). Single-floor A*
@@ -2399,24 +2444,21 @@ impl Collision {
                     }
                     let nkey = (nc, nr, qf(nf));
                     if closed.contains(&nkey) { continue; }
-                    // Reachability rays. The CHEST ray (3u) alone SKIMS OVER a low invisible-boundary
-                    // lip (~2–3u) — A* then routes onto the wall's high side, where the feet-level
-                    // walker snags and strands (#239). Add a FEET-level ray just above the walker's
-                    // real max step-up (STEP_UP + ground-snap ≈ 2.5u): a lip taller than the walker can
-                    // mount blocks the edge, matching what the native client's feet-level sphere does.
-                    const FEET_CLR: f32 = crate::movement::STEP_UP + 0.5;
-                    if !self.edge_clear([a[0], a[1], cz + CHEST], [b[0], b[1], nf + CHEST], radius, cell) { continue; }
-                    if !self.edge_clear([a[0], a[1], cz + FEET_CLR], [b[0], b[1], nf + FEET_CLR], radius, cell) { continue; }
-                    // LEDGE margin. The rays above only see geometry that is IN THE WAY; this is the
-                    // one test that sees geometry that is MISSING (a drop, a bridge edge, a
-                    // waterline). Only the GENEROUS tier asks for it: at the minimum tier the promise
-                    // is exactly "the character fits", which is what keeps a narrow bridge or a
-                    // gangplank routable at all (see `search_tiered`). Memoised per (cell, floor)
-                    // — a cell is reached from up to 8 neighbours and the probe is 4 column queries.
-                    if ledge_margin > 0.0 && !*margin_ok.entry(nkey).or_insert_with(||
-                        self.ground_margin_ok(b[0], b[1], nf, ledge_margin)) { continue; }
+                    // THE WALK-EDGE TEST, through the one authority (#378). Two probe heights from
+                    // the shared Body — the CHEST ray (the controller's own contact height, #386)
+                    // and a FEET ray just above the walker's real max step-up (a low invisible-
+                    // boundary lip the chest ray skims over blocks the feet ray, #239) — each swept
+                    // across the body's width (fine grid) or cast as a centre ray (coarse), plus
+                    // the LEDGE margin: the one test that sees geometry that is MISSING (a drop, a
+                    // bridge edge, a waterline). The margin is asked for only above the minimum
+                    // tier — at `PLAYER_RADIUS` the promise is exactly "the character fits", which
+                    // is what keeps a narrow bridge or gangplank routable at all (`search_tiered`)
+                    // — and is memoised per (cell, floor) inside `trav` for this plan.
+                    if !trav.can_traverse_fast(
+                        crate::traversability::Point::new([a[0], a[1]], cz),
+                        crate::traversability::Point::new([b[0], b[1]], nf)) { continue; }
                     let step = (((dc * dc + dr * dr) as f32).sqrt()) * cell + (nf - cz).abs() * 0.5
-                        + aggro_cost(b[0], b[1]);
+                        + aggro_cost(b[0], b[1]) + hug_cost(b[0], b[1], nf);
                     let tentative = g_cur + step;
                     if tentative < *g_score.get(&nkey).unwrap_or(&f32::MAX) {
                         g_score.insert(nkey, tentative);
@@ -2708,6 +2750,11 @@ impl Collision {
         let edge_ok = |x: f32, y: f32, z: f32| -> bool {
             self.nearest_floor(x, y, z, 3.0, 8.0).map_or(false, |f| (f - z).abs() <= 8.0)
         };
+        // The inset's occupancy guard, through the one authority (#378) — with NO ledge margin:
+        // the inset asks "can the body stand exactly here", not "does this spot have route-choice
+        // standing room". Margins are the search's concern; one here would refuse nudges the
+        // search accepted.
+        let inset_trav = crate::traversability::Traversability::new(self, radius, cell, 0.0, false);
         for i in 0..path.len() {
             let [x, y, z] = path[i];
             let mut push = [0.0f32, 0.0f32];
@@ -2718,21 +2765,12 @@ impl Collision {
             let len = (push[0] * push[0] + push[1] * push[1]).sqrt();
             if len > 0.0 {
                 let (nx, ny) = (x + push[0] / len * margin, y + push[1] / len * margin);
-                // Two guards, because the inset faces two hazards and `edge_ok` only sees one.
-                //
-                // `edge_ok` asks "is there still FLOOR there" — it is what stops the nudge shoving a
-                // waypoint off the mesh. It is structurally incapable of seeing a WALL: `is_standable`
-                // (in `column_hits`) rejects a near-vertical face via the flatness test `|nz| <
-                // NAV_NEAR_HORIZONTAL`, so a wall can never be a `nearest_floor` hit. There is floor at
-                // a wall's foot, so `edge_ok` happily green-lights a nudge straight INTO one (#358).
-                //
-                // That was survivable while the inset was small, but the tiered planner (see
-                // `search_tiered`) now plans at a GENEROUS `radius`, which makes `margin` — and so
-                // the push — correspondingly bigger. A bigger push validated by a wall-blind guard is
-                // how you end up walking closer to walls than before. So also require the character's
-                // own collision volume to actually FIT where we are moving it: `footprint_clear` is
-                // the same ring test the controller's depenetration net uses.
-                if edge_ok(nx, ny, z) && self.footprint_clear(nx, ny, z, radius, 8) {
+                // The nudge destination must be OCCUPIABLE — floor AND wall axes, through the one
+                // authority (#378). The floor half is what stops the nudge shoving a waypoint off
+                // the mesh; the wall half exists because a floor probe is structurally incapable of
+                // seeing a wall (`is_standable` rejects near-vertical faces, and there is floor at a
+                // wall's foot — #358), so a floor-only guard green-lights a nudge straight into one.
+                if inset_trav.can_occupy_fast(crate::traversability::Point::new([nx, ny], z)) {
                     path[i] = [nx, ny, z];
                 }
             }
@@ -4164,20 +4202,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sweep_into_wall_returns_hit_with_facing_normal() {
-        let col = Collision::build(
-            &ZoneAssets { terrain: vec![wall_east(5.0, 0.0, 10.0)], objects: vec![], textures: vec![] }, 4.0);
-        // Moving +east from east=3 by 5 units crosses the wall at east=5.
-        let hit = col.sweep([3.0, 0.0, 0.0], [5.0, 0.0, 0.0], 1.0).expect("should hit the wall");
-        assert!(hit.t > 0.0 && hit.t < 1.0, "t in (0,1): {}", hit.t);
-        // The wall plane is perpendicular to east; the normal must point back toward -east (the
-        // side the mover came from), i.e. normal.east < 0.
-        assert!(hit.normal[0] < -0.5, "normal should oppose +east motion: {:?}", hit.normal);
-        // Moving parallel to the wall (north) from east=3 never reaches it.
-        assert!(col.sweep([3.0, 0.0, 0.0], [0.0, 5.0, 0.0], 1.0).is_none(),
-            "parallel motion should not hit the wall");
-    }
 
     /// **PICK THE NODE CAP BY MEASUREMENT (#394).** The worker's node cap must be generous enough that
     /// a legitimate WHOLE-ZONE "no route" still reaches `SearchClosed` — a cap that truncates a real
@@ -4280,9 +4304,10 @@ mod tests {
             .unwrap_or_else(|| vec![
                 // A deliberately mixed corpus: the zone #382's own numbers came from (akanon), the one
                 // whose route success the last nav tightening cost 29% (akanon again), a dense city, a
-                // big outdoor zone, dungeons, and the gfaydark corner an earlier budget cut broke.
+                // big outdoor zone, dungeons, the gfaydark corner an earlier budget cut broke, and
+                // qcat — the aqueduct hallways where the live #386/#381 wall-press symptom shows.
                 "akanon", "blackburrow", "qeynos2", "gfaydark", "crushbone", "neriaka", "felwithea",
-                "highpass", "everfrost", "butcher",
+                "highpass", "everfrost", "butcher", "qcat",
             ].into_iter().map(str::to_string).collect());
 
         // A seeded LCG: a failure here must be reproducible, and an unseeded sample is not evidence.
@@ -4575,8 +4600,10 @@ mod tests {
         let zones: Vec<String> = std::env::var("ZONES").ok()
             .map(|z| z.split(',').map(str::to_string).collect())
             .unwrap_or_else(|| vec![
+                // qcat is in the default set on purpose: the live #386/#381 symptom (hallway
+                // wall-press) is there, and it is the zone the traversability refactor is gated on.
                 "akanon", "blackburrow", "qeynos2", "gfaydark", "crushbone", "neriaka", "felwithea",
-                "highpass", "everfrost", "butcher",
+                "highpass", "everfrost", "butcher", "qcat",
             ].into_iter().map(str::to_string).collect());
 
         let mut seed: u64 = 0xD21F_7A3E; // same seed family as the static scanner
@@ -4638,10 +4665,17 @@ mod tests {
                 if col.in_water(w) || col.in_water([w[0], w[1], w[2] + 3.0]) { walked -= 1; continue; }
                 wedged += 1;
                 let to = [w[0] + aim[0] * 4.0, w[1] + aim[1] * 4.0];
-                let ctrl_chest_blocked = !col.line_clear([w[0], w[1], w[2] + 4.0], [to[0], to[1], w[2] + 4.0], PLAYER_RADIUS);
-                let planner_clear =
-                    col.path_clear([w[0], w[1], w[2] + 3.0], [to[0], to[1], w[2] + 3.0], PLAYER_RADIUS)
-                    && col.path_clear([w[0], w[1], w[2] + 2.5], [to[0], to[1], w[2] + 2.5], PLAYER_RADIUS);
+                // Classify against the heights each side ACTUALLY uses, read from the shared Body —
+                // not re-hardcoded copies that would themselves drift. HEIGHT counts a wedge where
+                // the controller's contact ray is blocked but the planner's probes are clear; with
+                // both derived from PLAYER_BODY the class should be structurally empty, so any
+                // nonzero count here is a regression alarm (#386).
+                let body = &crate::traversability::PLAYER_BODY;
+                let ctrl_chest_blocked = !col.line_clear(
+                    [w[0], w[1], w[2] + body.contact_probes()[1]],
+                    [to[0], to[1], w[2] + body.contact_probes()[1]], PLAYER_RADIUS);
+                let planner_clear = body.planner_probes().iter().all(|&hz|
+                    col.path_clear([w[0], w[1], w[2] + hz], [to[0], to[1], w[2] + hz], PLAYER_RADIUS));
                 let overlap = !col.footprint_clear(w[0], w[1], w[2], PLAYER_RADIUS, 8)
                     || !col.footprint_clear(w[0] + aim[0], w[1] + aim[1], w[2], PLAYER_RADIUS, 8);
                 let kind = if ctrl_chest_blocked && planner_clear { n_h += 1; "HEIGHT #386" }

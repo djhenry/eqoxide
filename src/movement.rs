@@ -347,8 +347,10 @@ impl CharacterController {
     /// capsule approximation. Grazing cases the thin centre ray slips past are caught next frame by
     /// the depenetration net (§3.3).
     fn slide(&self, from: [f32; 3], delta: [f32; 3], col: &Collision) -> ([f32; 3], bool) {
-        const FOOT: f32 = 0.5;
-        const CHEST: f32 = 4.0;
+        // The contact heights come from the ONE shared body (#386): the chest ray here and the
+        // planner's top edge probe are the same `Body::chest` field, so the planner can never again
+        // clear a band this ray collides with (the drift that wedged the walker under lintels).
+        let probes = crate::traversability::PLAYER_BODY.contact_probes();
         let mut pos = from;
         let mut remaining = delta;
         let mut hit_any = false;
@@ -358,7 +360,7 @@ impl CharacterController {
             let d_hat = [remaining[0] / len, remaining[1] / len];
             // Nearest contact among the foot and chest centre rays.
             let mut best: Option<crate::assets::Hit> = None;
-            for &hz in &[FOOT, CHEST] {
+            for &hz in &probes {
                 let f = [pos[0], pos[1], pos[2] + hz];
                 let to = [f[0] + remaining[0], f[1] + remaining[1], f[2]];
                 if let Some((t, n)) = col.nearest_hit(f, to) {
