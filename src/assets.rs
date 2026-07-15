@@ -1324,6 +1324,19 @@ impl Collision {
         // Classify each surface as standable and retain only the in-window ones. Headroom is the gap up
         // to the next surface MORE than a slab-thickness above (so the two triangles of one quad floor
         // don't read as each other's ceiling). The topmost surface has open sky above → infinite.
+        //
+        // THE THREE #329 CASES, and which we defend (owner-signed-off 2026-07-15, #375/#329):
+        //   * FAR ROOF (qcat's 391.8 over a −70 floor): DEFENDED by the caller's `ref_z ± window` — a
+        //     character never queries at roof height, so the roof is simply out of range.
+        //   * CLOSE ROOF (a room ceiling with its roof right above): DEFENDED by `headroom` below — a
+        //     solid surface within `NAV_AGENT_HEIGHT` means no standing room.
+        //   * OPEN-TOPPED MID-HEIGHT down-facing surface (a flat ceiling with open sky above): KNOWINGLY
+        //     ADMITTED as walkable. It is GEOMETRICALLY IDENTICAL to qcat's walkable −42.97 walkway
+        //     (down-facing, open above, a floor below), so no per-surface rule can accept the qcat floor
+        //     — the whole #375 fix — while rejecting this. The owner accepted the band. If it ever bites
+        //     a real zone, the mitigation is at the REACHABILITY layer ("does a route actually lead the
+        //     character onto it?"), NOT a per-surface classifier (proven impossible). See the acceptance
+        //     test `open_topped_midheight_surface_is_admitted_as_the_accepted_cost_of_facing_blindness`.
         const SAME_SURFACE: f32 = 0.3;
         let n = all.len();
         let mut keep: Vec<(f32, f32)> = Vec::with_capacity(n);
@@ -4840,6 +4853,50 @@ mod tests {
              terminal wedge. RED on main; GREEN after the shared is_standable predicate (D-2).");
     }
 
+
+    /// **ACCEPTANCE TEST — the residual #329 band, owner-signed-off 2026-07-15 (review Fix D).**
+    ///
+    /// This is NOT a bug reproduction — it pins INTENDED behaviour. A flat DOWN-facing surface at
+    /// mid-height with OPEN SKY above it (floor@0 + roof@10, nothing on top) IS admitted as walkable
+    /// ground, and A* CAN route onto it. That is the unavoidable cost of facing-blind ground detection:
+    /// this geometry is IDENTICAL to qcat's walkable −42.97 walkway (down-facing, open above, a floor
+    /// below), so no per-surface rule can accept the qcat floor (the #375 fix) while rejecting this —
+    /// the reviewer proved the two are indistinguishable, and the owner accepted the band.
+    ///
+    /// The two #329 cases that ARE still defended (see `close_roof_ceiling_is_rejected_by_headroom` and
+    /// `qcat_pocket_nearest_floor_is_never_the_ceiling`):
+    ///   * **far roof** — excluded by the caller's `ref_z ± window` (a character never queries at roof
+    ///     height);
+    ///   * **close roof** — a solid roof within `NAV_AGENT_HEIGHT` above → `headroom` rejects it.
+    /// Only the OPEN-TOPPED MID-HEIGHT band gets through, knowingly. If it ever bites a real zone, the
+    /// escalation is a connectivity/reachability mitigation (does a *route* lead the character onto it?
+    /// — a graph-level question), NOT a per-surface classifier rule, which the reviewer proved
+    /// impossible. Refs #375 / #329.
+    ///
+    /// This test exists so the accepted state is explicit and greppable: ceiling-as-tier in THIS band
+    /// is DELIBERATE, not a regression — do not "fix" it with a per-surface heuristic.
+    #[test]
+    fn open_topped_midheight_surface_is_admitted_as_the_accepted_cost_of_facing_blindness() {
+        // The reviewer's fixture: a floor at z=0 and a flat DOWN-facing surface at z=10, open sky above.
+        let col = Collision::build(&ZoneAssets {
+            terrain: vec![floor_up(0.0, -100.0, 100.0), ceiling_down(10.0, -100.0, 100.0)],
+            objects: vec![], textures: vec![],
+        }, 32.0);
+        // Queried at its own level, the mid-height surface IS standable (facing-blind + open headroom) —
+        // exactly as qcat's -42.97 walkway is. This is the accepted band.
+        let floors = col.column_floors(0.0, 0.0, 10.0, 3.0, 20.0);
+        assert!(floors.iter().any(|&z| (z - 10.0).abs() < 0.5),
+            "ACCEPTED (#375, owner 2026-07-15): an open-topped mid-height down-facing surface IS \
+             standable — indistinguishable from qcat's walkable inverted floor. Set: {floors:?}");
+        // And A* can route onto it (a character on the floor can climb to it via the accepted admission).
+        let path = col.find_path([0.0, -20.0, 0.0], [0.0, 20.0, 10.0], crate::movement::PLAYER_RADIUS, &[], true);
+        assert!(path.is_some(),
+            "A* routing onto the mid-height surface is the ACCEPTED cost of facing-blindness — NOT a bug. \
+             Do not add a per-surface rule to block it (proven impossible); mitigate at the reachability \
+             layer if it ever bites a real zone.");
+        // Contrast: the far-roof and close-roof cases ARE still rejected — see close_roof_ceiling_* and
+        // qcat_pocket_*. Only THIS open-topped mid-height band is knowingly admitted.
+    }
 
     /// **THE `nav_support` HONESTY SIGNAL (D-2, review Fix A).** Admitting a DOWN-facing (inverted-art)
     /// surface as ground is correct (qcat proves it walkable) but UNVERIFIED — so it must be visible,
