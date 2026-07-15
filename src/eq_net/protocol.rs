@@ -32,19 +32,36 @@ pub const ENCODE_NONE: u8 = 0;
 pub const ENCODE_COMPRESSION: u8 = 1;
 pub const ENCODE_XOR: u8 = 4;
 
-// ── Login server opcodes ──────────────────────────────────────────────────
-// These are login-server-specific opcodes not present in the world/zone opcode table.
-// patch_RoF2.conf lists them all as 0x0000 (unused/unknown in zone context).
-// Keeping Titanium login-server values until the login-server layer is separately migrated.
+// ── Login server opcodes (SoD-era / RoF2 client — login_opcodes_sod.conf) ───
+// These are login-server-specific opcodes not present in the world/zone opcode table
+// (patch_RoF2.conf lists them all as 0x0000 in zone context). eqoxide is a RoF2 client,
+// so it speaks the EQEmu loginserver's SoD-and-later listener (default port 5999) — NOT
+// the legacy Titanium listener (5998). Ground truth: EQEmu loginserver/login_util/
+// login_opcodes_sod.conf and loginserver/client_manager.cpp (CheckSoDOpcodeFile).
+//
+// Only the SERVER→CLIENT response opcodes differ from Titanium; the client→server request
+// opcodes (SessionReady/Login/ServerListRequest/PlayEverquestRequest) are identical. The
+// packet STRUCTS and the DES-CBC zero-key encryption are byte-identical across both listeners
+// (the loginserver runs one shared Client/struct/crypto codebase and only swaps opcode numbers
+// per port). #404.
+//
+// Titanium → SoD opcode shifts (for reference):
+//   OP_ChatMessage          0x0016 → 0x0017
+//   OP_LoginAccepted        0x0017 → 0x0018
+//   OP_ServerListResponse   0x0018 → 0x0019
+//   OP_PlayEverquestResponse 0x0021 → 0x0022
 
-pub const OP_SESSION_READY: u16 = 0x0001; // RoF2: NO MATCH IN CONF — needs manual resolution (login-server protocol opcode)
-pub const OP_LOGIN: u16 = 0x0002; // RoF2: NO MATCH IN CONF — needs manual resolution (login-server protocol opcode)
-pub const OP_SERVER_LIST_REQUEST: u16 = 0x0004; // RoF2: NO MATCH IN CONF — needs manual resolution (login-server protocol opcode)
-pub const OP_PLAY_EVERQUEST_REQ: u16 = 0x000d; // RoF2: NO MATCH IN CONF — needs manual resolution (login-server protocol opcode)
-pub const OP_CHAT_MESSAGE: u16 = 0x0016; // RoF2: NO MATCH IN CONF — needs manual resolution (login-server protocol opcode)
-pub const OP_LOGIN_ACCEPTED: u16 = 0x0017; // RoF2: NO MATCH IN CONF — needs manual resolution (login-server protocol opcode)
-pub const OP_SERVER_LIST_RESPONSE: u16 = 0x0018; // RoF2: NO MATCH IN CONF — needs manual resolution (login-server protocol opcode)
-pub const OP_PLAY_EVERQUEST_RESP: u16 = 0x0021; // RoF2: NO MATCH IN CONF — needs manual resolution (login-server protocol opcode)
+pub const OP_SESSION_READY: u16 = 0x0001;         // C→S; same in Titanium & SoD
+pub const OP_LOGIN: u16 = 0x0002;                 // C→S; same in Titanium & SoD
+pub const OP_SERVER_LIST_REQUEST: u16 = 0x0004;   // C→S; same in Titanium & SoD
+pub const OP_PLAY_EVERQUEST_REQ: u16 = 0x000d;    // C→S; same in Titanium & SoD
+pub const OP_CHAT_MESSAGE: u16 = 0x0017;          // S→C handshake reply; SoD (Titanium: 0x0016)
+pub const OP_LOGIN_ACCEPTED: u16 = 0x0018;        // S→C login reply; SoD (Titanium: 0x0017)
+pub const OP_SERVER_LIST_RESPONSE: u16 = 0x0019;  // S→C server list; SoD (Titanium: 0x0018)
+pub const OP_PLAY_EVERQUEST_RESP: u16 = 0x0022;   // S→C play reply; SoD (Titanium: 0x0021)
+/// S→C; SoD-only expansion offer data sent just before OP_LoginAccepted. Carries no session
+/// state this headless client needs — ignored/silenced. (login_opcodes_sod.conf, #404)
+pub const OP_LOGIN_EXPANSION_PACKET_DATA: u16 = 0x0031;
 
 // ── World server opcodes ──────────────────────────────────────────────────
 

@@ -15,7 +15,7 @@ Legend: ✅ **working** (implemented & verified) · 🟡 **in progress** · 🔵
 ### Connection, session & travel
 | Feature | Status | Notes |
 |---|---|---|
-| Login as GM observer | ✅ | Direct connect to local EQEmu (login `127.0.0.1:5998`) |
+| Login as GM observer | ✅ | Direct connect to local EQEmu (login `127.0.0.1:5999`) |
 | Login as a regular player character | ✅ | Plays for real; per-character config in `~/.config/eqoxide/` |
 | Multiple instances side-by-side | ✅ | Auto-binds next free HTTP port from 8765; prints `API_PORT=` |
 | Graceful shutdown (`POST /v1/lifecycle/exit`) | ✅ | Per-instance; never `pkill` |
@@ -127,7 +127,7 @@ PORT=$(grep -m1 -oP 'API_PORT=\K[0-9]+' /tmp/eq_durgan.log)   # do not hardcode 
 grep -E "entering world as|sent ReqClientSpawn" /tmp/eq_durgan.log   # confirm zone-in
 ```
 
-Requires the local EQEmu server (login `127.0.0.1:5998`) and a running X/Wayland session on
+Requires the local EQEmu server (login `127.0.0.1:5999`) and a running X/Wayland session on
 display `:0`.
 
 ## Running multiple instances at once
