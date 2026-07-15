@@ -115,6 +115,28 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             _                => "",
         },
     }));
+    // The agent-honesty blockage payload behind a terminal `no_path` (#378 Phase 2). `null` when
+    // there is nothing to report (not a terminal no_path, or the diagnosis could not be computed —
+    // honest silence, never a fabricated hazard). `goal` is the DEFINITIVE "your goal itself cannot
+    // be stood at"; `frontier` is "I got as close as here and THIS is the obstruction between me and
+    // the goal" — ONE blocking fact, not necessarily the only one, and named as such (not `reason`).
+    let blk_json = |b: &crate::http::NavBlockage| serde_json::json!({
+        "hazard": b.hazard, "at": b.at });
+    let nav_blocked_by = (nav.blocked_goal.is_some() || nav.blocked_frontier.is_some()).then(|| {
+        serde_json::json!({
+            "goal":     nav.blocked_goal.as_ref().map(blk_json),
+            "frontier": nav.blocked_frontier.as_ref().map(blk_json),
+            "detail": "the obstruction behind this no_path. `goal` (if present) is definitive — the \
+                       goal itself cannot be stood at. `frontier` is the hazard at the search's \
+                       CLOSEST APPROACH to the goal — one blocking fact, not necessarily the only one \
+                       and not necessarily the one to fix.",
+        })
+    });
+    // The PER-ROUTE clearance tier the CURRENT route was found at (#378 Phase 2 / design §4c).
+    // `minimum` = threaded a tight gap at the character's own collision radius (riskier — no margin);
+    // `preferred` = the roomy tier carried it. Distinct from the zone-lifetime `nav_tight` counter:
+    // this is the fact for the route the character is walking RIGHT NOW.
+    let nav_tier = nav.tier;
     let (guild_name, guild_id, guild_rank) = {
         let g = s.guild.lock().unwrap();
         (g.guild_name.clone(), g.guild_id, g.guild_rank)
@@ -258,6 +280,16 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // clock" with no way to ask which, and `nav_state` said a confident `navigating` throughout.
         // The clock is gone; the ambiguity went with it.
         "nav_local": nav_local,
+        // The agent-honesty payload behind a terminal `no_path` (#378 Phase 2). `null` when there is
+        // nothing to report. `goal` (if present) is the DEFINITIVE "your goal itself cannot be stood
+        // at"; `frontier` is the hazard at the search's CLOSEST APPROACH — one blocking fact, named
+        // as such (not `reason`), not necessarily the only one. Top-level (not under `player`) so the
+        // large player object stays within serde_json's macro recursion limit.
+        "nav_blocked_by": nav_blocked_by,
+        // The PER-ROUTE clearance tier the CURRENT route needed (#378 Phase 2 / design §4c):
+        // `minimum` (tight, no margin — riskier) | `preferred` (roomy) | null (no route committed).
+        // Distinct from the zone-lifetime `nav_tight` counter — this is the route being walked now.
+        "nav_tier": nav_tier,
         // Per-phase frame timings (ms, EMA-smoothed); all zero unless --profile / EQ_PROFILE=1.
         // Render-owned — the one field here the render loop legitimately publishes.
         "frame_profile": frame_profile,

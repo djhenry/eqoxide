@@ -511,6 +511,19 @@ pub type DialogueShared = Arc<Mutex<Vec<crate::game_state::DialogueChoice>>>;
 pub struct NavStatus {
     pub state:  String,
     pub reason: Option<String>,
+    /// The agent-honesty payload behind a terminal `no_path` (#378 Phase 2): WHAT is blocking the
+    /// goal, and WHERE. `blocked_goal` is the definitive "your goal itself cannot be stood at";
+    /// `blocked_frontier` is "I got as close as here and this is the obstruction between me and the
+    /// goal". Surfaced as `nav_blocked_by.goal` / `nav_blocked_by.frontier` on /v1/observe/debug.
+    /// `None` when there is no blockage to report (not a terminal no_path, or the diagnosis could
+    /// not be computed) — honest silence, never a fabricated hazard.
+    pub blocked_goal: Option<NavBlockage>,
+    pub blocked_frontier: Option<NavBlockage>,
+    /// Which clearance tier answered the CURRENT route (#378 Phase 2 / design §4c): `preferred`
+    /// (roomy) or `minimum` (threaded a tight gap with no margin to spare — a riskier path). `None`
+    /// until a route is committed. This is the PER-ROUTE fact the zone-lifetime `nav_tight` counter
+    /// could not give (it is `connected:true`'s shape — a field with no per-instance writer, #343).
+    pub tier: Option<&'static str>,
     /// The FINE LOCAL (2 u) steering tier's last honest outcome (#382), published as the top-level
     /// `nav_local` on GET /v1/observe/debug. `None` = the tier has not answered for the current route
     /// (idle, or the first fine plan is still in flight).
@@ -520,6 +533,14 @@ pub struct NavStatus {
     /// `nav_state: navigating` needs to know, in the same snapshot, whether the tier that is actually
     /// steering it can see a way through the next 40 u.
     pub local:  Option<NavLocal>,
+}
+
+/// A named obstruction with a position — the agent-facing form of `traversability::Blockage`
+/// (#378 Phase 2). `hazard` is `floor` | `wall` | `water`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NavBlockage {
+    pub hazard: &'static str,
+    pub at: [f32; 3],
 }
 
 /// What the fine 2 u steering tier last said, verbatim. See `assets::LocalOutcome`.
@@ -548,11 +569,17 @@ pub struct NavLocal {
 }
 
 impl Default for NavStatus {
-    fn default() -> Self { NavStatus { state: "idle".into(), reason: None, local: None } }
+    fn default() -> Self {
+        NavStatus { state: "idle".into(), reason: None, local: None,
+            blocked_goal: None, blocked_frontier: None, tier: None }
+    }
 }
 
 impl From<&str> for NavStatus {
-    fn from(state: &str) -> Self { NavStatus { state: state.to_string(), reason: None, local: None } }
+    fn from(state: &str) -> Self {
+        NavStatus { state: state.to_string(), reason: None, local: None,
+            blocked_goal: None, blocked_frontier: None, tier: None }
+    }
 }
 
 impl PartialEq<&str> for NavStatus {
