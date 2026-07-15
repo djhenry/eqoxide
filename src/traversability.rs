@@ -93,8 +93,20 @@ pub struct Body {
     /// Total cylinder height, for documentation and future headroom probes. Geometry between
     /// `chest` and `height` is currently invisible to BOTH planner and controller (consistently —
     /// neither refuses it), which keeps the soundness invariant while under-modelling very low
-    /// ceilings; `assets::NAV_AGENT_HEIGHT` (5.0) is what defends standing headroom.
+    /// ceilings; [`Body::agent_height`] is what defends standing headroom.
     pub height: f32,
+    /// The vertical clearance a standing character needs above a surface for it to count as
+    /// STANDING ROOM (the #375 headroom defence: a surface with a solid roof closer than this is a
+    /// ceiling, not ground). It must EXCEED a real ceiling's slab-gap yet stay BELOW a real room's
+    /// height. `assets::is_standable` reads this. **This is the single source of truth** — the
+    /// `assets::NAV_AGENT_HEIGHT` const is now a thin alias to it (design Q6 / PR-A: the value
+    /// belongs on the Body, defined here, aliased there so existing call sites keep compiling).
+    pub agent_height: f32,
+    /// A surface's unit-normal `|z|` must be at least this to be flat enough to stand on (else it
+    /// is a wall/steep slope A*'s grade limit would reject anyway). Tied to `MAX_WALK_GRADE`:
+    /// `1/sqrt(1+1.2²) ≈ 0.64`. `assets::is_standable` reads this; `assets::NAV_NEAR_HORIZONTAL` is
+    /// now a thin alias. Single source of truth here.
+    pub near_horizontal: f32,
 }
 
 /// The one body every query derives from.
@@ -109,6 +121,11 @@ pub const PLAYER_BODY: Body = Body {
     chest: 4.0,
     ring: 3.0,
     height: 6.0,
+    // ~5u standing headroom; the controller's own chest contact ray sits at `chest` = 4.0, so a
+    // body needs a shade above that to stand. Was `assets::NAV_AGENT_HEIGHT`.
+    agent_height: 5.0,
+    // 1/sqrt(1 + MAX_WALK_GRADE²) with MAX_WALK_GRADE = 1.2. Was `assets::NAV_NEAR_HORIZONTAL`.
+    near_horizontal: 0.64,
 };
 
 impl Body {
