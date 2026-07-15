@@ -129,26 +129,58 @@ floor under it to step from). Neither defence alone is enough; both are required
 
 ## The test that proves it's safe (this gates the merge)
 
+> ### ⚠️ CORRECTED at D-2 implementation — the original open-air-ceiling fixture below is RETRACTED.
+>
+> The D-1 fixture (kept verbatim below for provenance) asserted that a **down-facing surface with OPEN SKY
+> above it** (floor z=0, ceiling z=8, nothing on top) is a ceiling `nearest_floor` must never return.
+> **The D-2 shape probe (`probe_qcat_column_vs_fixture`, measured 2026-07-14) FALSIFIED that premise:** the
+> character's walkable qcat surface at **−42.97 is DOWN-facing, has NOTHING solid above it, and an up-facing
+> floor 13u below** — geometrically *identical* to the fixture's z=8. So "down-facing + open sky above =
+> ceiling" is **false**; qcat proves such a surface is walkable floor (the #375 fix). A classifier that
+> rejected the fixture's z=8 would also delete qcat's walkway. The owner reviewed the measurement and
+> **replaced the open-air fixture with two gates that hold** (see below).
+>
+> **The real discriminator is not "open sky above" but "a ROOF close above."** A ceiling is a ceiling because
+> it has a roof — that is what `headroom` measures. An open-sky down-facing plane is a *platform*, and per
+> qcat, walkable.
+>
+> **The corrected #329 gate (both, owner-approved):**
+> 1. **Close-roof** (`close_roof_ceiling_is_rejected_by_headroom`, synthetic, mutation-checked): a down-facing
+>    ceiling with a solid roof **within `NAV_AGENT_HEIGHT` above** → `headroom < NAV_AGENT_HEIGHT` → rejected.
+>    This is NOT the #372 decorative cheat: there the slab was cosmetic while the classifier still used
+>    winding; here the roof-above IS the classifier's real input. Mutation: drop the headroom test → the
+>    ceiling is wrongly admitted → RED.
+> 2. **Far-ceiling** (`qcat_pocket_nearest_floor_is_never_the_ceiling`, asset): the qcat-pocket roof at 391.8
+>    (457u above the −66 floor) is never returned at a REALISTIC `ref_z`, because the `ref_z ± window`
+>    excludes it. (The retracted `fallback_never_admits…` queried AT roof height — a position no character is
+>    in; the window is the real defence.)
+>
+> **Q1 answered (measured, `q1_headroom_seal_measurement`, 2026-07-14):** does the headroom test re-delete
+> legit inverted ledges? Over the inverted-art zones, `is_standable` **RECOVERS 91–95%** of footprint-fitting
+> surfaces (highpass 4978/5364, permafrost 5773/6321, neriakc 1893/1984, qcat 4578/4833); only **3–6%** are
+> headroom-rejected (real close-roof ceilings), and **corpus route-success did NOT drop (99.50% → 99.54%)** —
+> so those rejects are ceilings, not legit floors being sealed. No stop-and-report.
+
+### (retracted D-1 fixture, kept for provenance — FALSIFIED by qcat, see the box above)
+
 A deliberately adversarial synthetic column:
 
 - a **floor** at `z = 0`,
 - a **down-facing ceiling** at `z = 8` **with open sky above it** (nothing on top).
 
-This is the hard case: the ceiling's only difference from a floor is its winding *plus* the fact that there's a
+~~This is the hard case: the ceiling's only difference from a floor is its winding *plus* the fact that there's a
 floor 8u below it and no rock above it. A `|nz|`-only classifier admits it (wrong). An "air-above-only"
 classifier admits it too (wrong). **The correct classifier rejects it** (you'd have to stand at z=8 with
-nothing under your feet) and returns the **floor at z=0**.
+nothing under your feet) and returns the **floor at z=0**.~~ **← FALSIFIED: qcat's −42.97 walkway IS exactly
+this shape and is walkable. There is no per-surface way to reject z=8 while accepting −42.97; the discriminator
+is a close roof, not open sky. Replaced by the two gates in the box above.**
 
-The fixture asserts `nearest_floor` at that XY returns **z=0, never z=8**, for any reference height from −5 to
-+5. Mutation-check: swap in either naive shortcut → it returns z=8 → **RED**. This is the exact test the
-navmesh's version **faked** by putting a convenient rock slab on top of its ceiling so it never had to handle
-the open-air case.
+The fixture asserted `nearest_floor` at that XY returns **z=0, never z=8** — RETRACTED.
 
-> **Open question for you (Q1) — scrutinise this most.** The precise definition of "headroom" is the crux.
-> Fable recommends: *"distance up to the next solid surface of either winding, and ground also requires a
-> standable surface within one step below"* (anchoring-first — local, cheap, and it matches the walker's own
-> `ground_below`). The risk: it might also re-delete some legitimately-standable inverted *ledges*. Fable wants
-> this **measured against the real inverted-art zones before committing.** This is what the reviewer should
+> **Q1 — RESOLVED (see the ⚠️ box above).** The original recommendation ("a standable surface within one step
+> below") is superseded: `headroom` = distance up to the next SOLID surface (either winding), and a surface is
+> a ceiling iff that roof is within `NAV_AGENT_HEIGHT`. Measured: 91–95% recovery, 3–6% (ceiling) rejects,
+> route-success flat. This is what the reviewer should
 > attack hardest.
 
 ---
