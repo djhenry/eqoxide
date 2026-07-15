@@ -708,6 +708,12 @@ impl GameState {
     pub fn begin_zone_in(&mut self) {
         self.entities.clear();
         self.doors.clear();
+        // The target belongs to the zone we just left: its spawn id is meaningless in the new zone
+        // and #270 already purges `entities`, so target_id would point at a gone spawn while
+        // target_name/target_hp_pct fall back to the stale cached snapshot — /observe/debug then
+        // reports a full-HP target from the OLD zone (a confident falsehood an agent may attack /
+        // consider). Clear the whole target (id + name + hp + con) here, not just the entity map (#408).
+        self.clear_target();
         self.new_zone_applied = false;
         // A cast cannot survive a zone change: the spawn ids, the cast bar and every packet that
         // would have explained the cast belong to the zone we just left. Carrying `casting` across
@@ -1156,7 +1162,7 @@ pub fn split_keywords(text: &str) -> Vec<(String, bool)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{Door, Entity, GameState, MerchantItem};
 
     /// eqoxide#201: the flat bag-slot mapping must round-trip and match the RoF2 numbering
@@ -1186,7 +1192,7 @@ mod tests {
         assert_eq!(bag_wire_parent(351), None);
     }
 
-    fn make_entity(id: u32, name: &str, x: f32, y: f32, z: f32, is_npc: bool) -> Entity {
+    pub(crate) fn make_entity(id: u32, name: &str, x: f32, y: f32, z: f32, is_npc: bool) -> Entity {
         Entity {
             spawn_id: id,
             name: name.to_string(),
