@@ -134,20 +134,79 @@ pub type GameStateSnapshot = std::sync::Arc<arc_swap::ArcSwap<crate::game_state:
 /// without a single application packet, while the session layer keeps ACKing throughout. Deriving
 /// `connected` from application traffic would therefore report a perfectly healthy idle session as
 /// disconnected — trading the old false `true` for an equally dishonest false `false`.
+///
+/// #371 adds a FOURTH failure those three cannot see: a **wedged zone**. EQEmu's `EQStreamFactory`
+/// runs the UDP reader/writer on threads separate from the zone main loop, so a hung zone keeps
+/// ACKing (`last_datagram` fresh → `connected: true`) while producing no application output
+/// (`last_packet` climbing) — which is *pixel-identical* to a healthy-but-idle zone. No passive
+/// clock can separate them, because the failure is exactly "the world stopped speaking". The only
+/// sound discriminator is an ACTIVE probe: periodically send a cheap request the zone MAIN LOOP
+/// must service to answer, and time the reply. `last_probe_sent` / `last_probe_reply` are that
+/// round-trip's clocks; `HttpState::health` turns them into `world_responsive` at read time.
 #[derive(Debug, Clone, Copy)]
 pub struct NetHealth {
     /// Last inbound datagram of ANY kind, session-layer ACKs/keepalives included → link liveness.
     pub last_datagram: std::time::Instant,
     /// Last inbound APPLICATION packet (a decoded opcode that mutated `GameState`) → world activity.
+    /// NOTE: the #371 liveness-probe reply is deliberately NOT stamped here — it is a solicited poke,
+    /// not spontaneous world output, and counting it would cap `last_packet_age_ms` at the probe
+    /// cadence and destroy its "the world has been quiet for 45s" meaning. It stamps `last_probe_reply`.
     pub last_packet:   std::time::Instant,
     /// Last network-thread gameplay tick → client liveness (is our own publisher still running?).
     pub last_tick:     std::time::Instant,
+    /// When the network thread last sent an active liveness probe (#371). `None` until the first
+    /// probe fires (e.g. before we are fully in-zone) — in which case there is simply no probe
+    /// verdict yet and `world_responsive` defers to the passive signals.
+    pub last_probe_sent:  Option<std::time::Instant>,
+    /// When we last saw the probe's reply come back from the zone (#371). Compared against
+    /// `last_probe_sent` to tell an answered probe from an outstanding one.
+    pub last_probe_reply: Option<std::time::Instant>,
 }
 
 impl Default for NetHealth {
     fn default() -> Self {
         let now = std::time::Instant::now();
-        NetHealth { last_datagram: now, last_packet: now, last_tick: now }
+        NetHealth {
+            last_datagram: now, last_packet: now, last_tick: now,
+            last_probe_sent: None, last_probe_reply: None,
+        }
+    }
+}
+
+/// #371: a probe left unanswered longer than this — while no spontaneous application packet has
+/// arrived either — means the zone main loop is not processing (a wedged world), even though the
+/// link keeps ACKing. Kept below `PROBE_INTERVAL` so a wedge is declared before the next probe is
+/// even due; kept well above a normal round-trip so ordinary latency never false-alarms.
+pub const PROBE_TIMEOUT_SECS: u64 = 10;
+
+/// #371: decide, at HTTP read time, whether the WORLD (not just the link) is alive, from the
+/// probe/app clocks expressed as ages (time since the event; `None` = it never happened). Pure so
+/// the state machine can be exhaustively unit-tested without a socket. Returns `world_responsive`.
+///
+/// The rule: a probe is only damning once it is BOTH unanswered AND overdue.
+/// - **No probe sent yet** → `true`. We are not asserting a probe result we do not have; the
+///   passive signals (`connected` / `last_packet_age_ms`) stand until the first probe fires.
+/// - **Answered** → `true`. "Answered" = proof the zone processed something at or after we sent the
+///   probe: its own reply (`probe_reply_ago <= probe_sent_ago`) OR *any* spontaneous application
+///   packet since (`last_packet_ago <= probe_sent_ago`). The second clause is belt-and-suspenders:
+///   a busy zone is obviously alive even if a single probe reply was dropped, and it is exactly what
+///   keeps a legitimately-quiet-but-answering idle session from ever false-alarming.
+/// - **Outstanding but not yet overdue** (`probe_sent_ago < timeout`) → `true`. Still in flight;
+///   never mistake normal latency for a wedge.
+/// - **Outstanding AND overdue** → `false`. The wedged-world signal — the whole point of #371.
+pub fn world_responsive(
+    probe_sent_ago:  Option<std::time::Duration>,
+    probe_reply_ago: Option<std::time::Duration>,
+    last_packet_ago: std::time::Duration,
+    timeout:         std::time::Duration,
+) -> bool {
+    match probe_sent_ago {
+        None => true,
+        Some(sent_ago) => {
+            let answered = probe_reply_ago.is_some_and(|r| r <= sent_ago)
+                        || last_packet_ago <= sent_ago;
+            answered || sent_ago < timeout
+        }
     }
 }
 
@@ -748,6 +807,17 @@ pub struct Health {
     /// False when NO datagram — not even a session-layer ACK — has arrived for [`CONN_STALE_SECS`].
     /// That is a dead link, as distinct from a quiet world.
     pub connected:          bool,
+    /// #371: the honest "is the WORLD alive?" signal. `connected` only means the socket ACKs, which
+    /// a WEDGED zone keeps doing perfectly. This is `false` only when an active liveness probe went
+    /// unanswered past [`PROBE_TIMEOUT_SECS`] while nothing spontaneous arrived either — i.e. the
+    /// zone main loop is not processing. An idle-but-alive zone stays `true` (the probe is answered).
+    /// `true` before the first probe fires (no verdict yet — read `connected`/`last_packet_age_ms`).
+    pub world_responsive:      bool,
+    /// #371: ms since the world last demonstrably processed something for us — the most recent of a
+    /// probe reply or a spontaneous application packet. This is the "how long since real proof of
+    /// life" companion to `world_responsive`, and unlike `last_packet_age_ms` it is NOT reset by
+    /// probe traffic being suppressed, because probe replies legitimately count as proof of life here.
+    pub last_world_response_ms: u64,
 }
 
 /// A cast in flight, for `/v1/observe/debug` → `casting` (#348).
@@ -904,15 +974,31 @@ impl HttpState {
     /// renderer, not the network thread — has to be alive for the answer to be honest.
     pub(crate) fn health(&self) -> Health {
         let h = *self.net_health.lock().unwrap();
-        let link_age = h.last_datagram.elapsed();
+        let link_age       = h.last_datagram.elapsed();
+        let last_packet_ago = h.last_packet.elapsed();
+        // #371: the active-probe verdict, all measured at read time (like every other health field,
+        // per #343 — never cached, so no live publisher has to run for the answer to stay honest).
+        let probe_sent_ago  = h.last_probe_sent.map(|t| t.elapsed());
+        let probe_reply_ago = h.last_probe_reply.map(|t| t.elapsed());
+        let world_responsive = world_responsive(
+            probe_sent_ago, probe_reply_ago, last_packet_ago,
+            std::time::Duration::from_secs(PROBE_TIMEOUT_SECS),
+        );
+        // Most recent proof the world processed something for us: a probe reply OR spontaneous
+        // traffic, whichever is fresher. Falls back to the app clock before any probe has replied.
+        let last_world_response_ms = probe_reply_ago
+            .map_or(last_packet_ago, |r| r.min(last_packet_ago))
+            .as_millis() as u64;
         Health {
             link_age_ms:        link_age.as_millis() as u64,
-            last_packet_age_ms: h.last_packet.elapsed().as_millis() as u64,
+            last_packet_age_ms: last_packet_ago.as_millis() as u64,
             snapshot_age_ms:    h.last_tick.elapsed().as_millis() as u64,
             // Link liveness, NOT world activity — see `NetHealth`. An idle session goes 40+s with
             // no application packet while the session layer keeps ACKing; calling that "disconnected"
             // would be just as much a lie as #343's frozen `connected: true`.
             connected:          link_age.as_secs() < CONN_STALE_SECS,
+            world_responsive,
+            last_world_response_ms,
         }
     }
 }
@@ -1091,5 +1177,83 @@ mod currency_tests {
         let v = currency_json([0, 0, 0, 0]);
         assert_eq!(v["platinum"], 0);
         assert_eq!(v["copper"], 0);
+    }
+}
+
+/// #371: the active-liveness-probe state machine, tested as a pure function. These are the exact
+/// distinctions the issue turns on — a wedged-but-ACKing world vs a genuinely idle one — proved
+/// without a socket. The `secs`/`ms` helpers keep the age arithmetic readable.
+#[cfg(test)]
+mod world_responsive_tests {
+    use super::{world_responsive, PROBE_TIMEOUT_SECS};
+    use std::time::Duration;
+
+    const TIMEOUT: Duration = Duration::from_secs(PROBE_TIMEOUT_SECS);
+    fn s(secs: u64) -> Duration { Duration::from_secs(secs) }
+
+    /// THE bug (#371): a probe was sent, no reply has come, and the world has been silent longer than
+    /// the bound — while the link is still ACKing. That is a wedged world, and it MUST read as such.
+    #[test]
+    fn unanswered_probe_past_the_bound_reports_the_world_wedged() {
+        // The realistic wedge: the last spontaneous packet PREDATES the probe (world went quiet at
+        // 30s ago, we probed 15s ago), the probe was never answered, and 15s > the 10s bound. The
+        // probe is only ever sent AFTER a stretch of app-silence, so last_packet_ago > probe_sent_ago
+        // always holds here — nothing has arrived since the probe to prove liveness.
+        assert!(!world_responsive(Some(s(15)), None, s(30), TIMEOUT),
+            "an unanswered probe past the timeout, on a still-ACKing link, is a wedged world");
+    }
+
+    /// The #343-trap-in-reverse: a legitimately IDLE session that has no spontaneous app traffic for
+    /// 45s but whose probe IS answered must STILL read as live. This is the false-alarm we must not
+    /// raise — the whole reason a passive `last_packet_age_ms` threshold cannot solve the problem.
+    #[test]
+    fn idle_but_answered_probe_is_still_live() {
+        // last spontaneous packet 45s ago (a normal solo-idle gap), but the probe replied 2s ago.
+        assert!(world_responsive(Some(s(30)), Some(s(2)), s(45), TIMEOUT),
+            "an idle world that ANSWERS the probe is alive — do not false-alarm on app-silence alone");
+    }
+
+    /// A probe answered by its own reply is live even with zero spontaneous traffic.
+    #[test]
+    fn answered_probe_reports_live() {
+        assert!(world_responsive(Some(s(30)), Some(s(1)), s(30), TIMEOUT));
+    }
+
+    /// A probe in flight but not yet overdue must NOT false-alarm — ordinary round-trip latency is
+    /// not a wedge. Only crossing the bound flips it.
+    #[test]
+    fn outstanding_probe_within_the_bound_is_not_yet_a_wedge() {
+        // Unanswered (last packet predates the probe → no proof of life since), but 3s < 10s bound.
+        assert!(world_responsive(Some(s(3)), None, s(20), TIMEOUT),
+            "a 3s-old unanswered probe (bound 10s) is still in flight, not a wedge");
+        // ...and one whose prior reply predates the newest send is likewise still outstanding.
+        assert!(world_responsive(Some(s(3)), Some(s(20)), s(20), TIMEOUT),
+            "a reply OLDER than the latest probe does not answer it, but 3s < 10s is not yet overdue");
+    }
+
+    /// Spontaneous application traffic since the probe was sent proves the world is processing even
+    /// if that one probe reply was dropped — a busy zone must never read as wedged. This is the
+    /// belt-and-suspenders clause.
+    #[test]
+    fn spontaneous_traffic_since_the_probe_proves_liveness() {
+        // probe sent 15s ago, no probe reply, BUT an app packet arrived 1s ago (world is busy).
+        assert!(world_responsive(Some(s(15)), None, s(1), TIMEOUT),
+            "any app packet since the probe proves liveness — a busy zone is never wedged");
+    }
+
+    /// Before the first probe fires (e.g. mid zone-in), there is no probe verdict; defer to the
+    /// passive signals rather than assert a liveness we have not measured.
+    #[test]
+    fn no_probe_sent_yet_defers_to_passive_signals() {
+        assert!(world_responsive(None, None, s(60), TIMEOUT),
+            "no probe sent yet → no verdict → true (connected/last_packet_age_ms still stand)");
+    }
+
+    /// Exactly at the bound counts as overdue (the boundary is closed on the wedge side), so a probe
+    /// sitting right at the timeout with no other proof of life reads as wedged.
+    #[test]
+    fn boundary_at_the_timeout_is_wedged() {
+        assert!(!world_responsive(Some(TIMEOUT), None, s(60), TIMEOUT),
+            "sent_ago == timeout is overdue (not `< timeout`), so it reports wedged");
     }
 }
