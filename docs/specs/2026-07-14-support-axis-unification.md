@@ -183,6 +183,30 @@ The fixture asserted `nearest_floor` at that XY returns **z=0, never z=8** — R
 > route-success flat. This is what the reviewer should
 > attack hardest.
 
+### The accepted residual #329 band (owner-signed-off 2026-07-15)
+
+Facing-blind detection has ONE unavoidable cost, and it is now an **accepted, documented** state rather than a
+latent surprise. The three #329 shapes and what we do with each:
+
+| shape | example | verdict | how |
+|---|---|---|---|
+| **far roof** | qcat pocket: roof 391.8 over a −70 floor | **REJECTED** | the caller's `ref_z ± window` — a character never queries at roof height |
+| **close roof** | a room ceiling with its roof right above | **REJECTED** | `headroom < NAV_AGENT_HEIGHT` — no standing room |
+| **open-topped mid-height** | a flat down-facing surface with **open sky above** and a floor below | **KNOWINGLY ADMITTED as walkable** | — |
+
+The third is the cost. It is **geometrically identical to qcat's walkable −42.97 walkway** (down-facing, open
+above, a floor below), and the reviewer PROVED no per-surface rule can accept the qcat floor — the entire #375
+fix — while rejecting this. So we admit it. Route-success (99.54%) and the corpus say it is rare-to-absent in
+the real zones; the far-roof and close-roof defences above still hold, so this is the *only* band that gets
+through, and it does so deliberately.
+
+- **Pinned by** the acceptance test `open_topped_midheight_surface_is_admitted_as_the_accepted_cost_of_facing_blindness`
+  (an ACCEPTANCE test — asserts the admission is intended, not a bug repro) and a doc block at `is_standable`.
+  These restore the in-repo record that ceiling-as-tier was ever a guarded concern — now on the *accept* side.
+- **Escalation if it ever bites a real zone:** a **connectivity/reachability** mitigation ("does a route
+  actually lead the character onto this surface?" — a graph-level question), **NOT** a per-surface classifier
+  rule (proven impossible). Do not "fix" the band with a per-surface heuristic. Refs #375 / #329.
+
 ---
 
 ## What could go wrong, and the guard against it
