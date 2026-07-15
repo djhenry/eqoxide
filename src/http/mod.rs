@@ -176,11 +176,15 @@ pub struct NetHealth {
     /// When the CURRENT unanswered-probe streak began (#371 wedge-flicker fix). Set the first time a
     /// probe is sent while none is already outstanding; deliberately left UNCHANGED by later resends
     /// of that same still-unanswered probe, so a zone that never answers cannot "earn" a fresh 10s
-    /// in-flight grace window every time we poke it again. Reset to `None` the moment a genuine reply
-    /// (or any spontaneous app packet — see `probe_outstanding`'s caller) proves the world is alive,
-    /// and on zone-change (`reset_probe_clocks`). This — not `last_probe_sent` — is what
-    /// `world_responsive` measures its timeout against, so once a wedge verdict is reached it stays
-    /// `false` until a genuine reply, no matter how many resends happen in between.
+    /// in-flight grace window every time we poke it again. Reset to `None` the moment ANY proof of
+    /// life arrives — a genuine probe reply (`record_probe_reply`) OR any spontaneous application
+    /// packet (`record_app_packet`) — and on zone-change (`reset_probe_clocks`). Clearing on
+    /// spontaneous traffic is load-bearing: it re-arms the clock so a SECOND wedge after a traffic
+    /// recovery is timed freshly and still detected (without it, a stale streak-start would make the
+    /// answered-clause permanently true → a confident false-alive). This — not `last_probe_sent` — is
+    /// what `world_responsive` measures its timeout against, so once a wedge verdict is reached within
+    /// one continuous silence it stays `false` until real proof of life, no matter how many resends
+    /// happen in between.
     pub first_unanswered_probe_sent: Option<std::time::Instant>,
 }
 
