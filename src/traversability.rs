@@ -42,10 +42,23 @@
 //! ([`Traversability::can_traverse`], [`Traversability::can_occupy`]) return
 //! `Result<(), Blockage>` — WHY the refusal, and WHERE — and are meant to run at most a couple of
 //! times per FAILED plan, never on a successful one. `BlockedBy(hazard, position)` is therefore
-//! free: it is not computed until something has already failed. The two forms MUST agree —
-//! `fast == diagnostic.is_ok()` — and the property test in this module pins that. That agreement
-//! IS the honesty guarantee: the fast path can never say "clear" about a spot the diagnostic path
-//! would refuse, so the diagnosis can never be a confident falsehood about the plan that failed.
+//! free: it is not computed until something has already failed.
+//!
+//! The two forms agree — `fast == diagnostic.is_ok()` — and the property test in this module pins
+//! that. **Be precise about what that buys, and what it does not.** The agreement holds BY
+//! CONSTRUCTION: both forms delegate to the same component predicates (`occupy_floor_ok`,
+//! `occupy_wall_ok`, `occupy_margin_ok`, the same swept edge test) in the same order, so it is a
+//! *consistency* invariant — a guard against a future edit diverging the two paths — NOT itself the
+//! meaningful honesty guarantee. It cannot be, because both forms could agree on a WRONG answer.
+//!
+//! The meaningful guarantee is **planner ⇒ controller agreement**: every segment the planner emits
+//! must be one the controller can actually walk (design §6c). This module delivers that only
+//! PARTIALLY. It is closed on the CHEST axis — the planner's top probe and the controller's contact
+//! ray are now the one `Body::chest` field (#386 closed on the chest axis, the drift that wedged
+//! the walker under lintels). The FOOT axis remains divergent (the planner probes at
+//! `Body::feet_clr` ≈ 2.5 while the controller's low contact ray sits at `Body::foot` = 0.5), and
+//! that residual is tracked as **#420** — to be closed when the controller is wired to consult this
+//! type directly (Phase 2). Do not read the `fast`/`diagnostic` agreement as if it discharged #420.
 
 use crate::assets::Collision;
 
@@ -489,6 +502,15 @@ impl<'a> Traversability<'a> {
         if self.ledge_margin <= 0.0 || self.floating {
             return true;
         }
+        // GROUND half: the substantive new path — the graded field distance replacing the old
+        // boolean `ground_margin_ok`. WALL half: a radial belt-and-braces. Note honestly it is
+        // largely REDUNDANT with `occupy_wall_ok`, which already casts a footprint ring at exactly
+        // `self.radius` (2.0 at Preferred), so a generous point inside the wall standing-room is
+        // usually refused there first. The radial `wall_clearance` (16 spokes) can still catch a
+        // thin wall that falls in the angular gap between the footprint's 8 rays — a belt for
+        // needle geometry real zone art does not contain — and it shares the same zone-lifetime
+        // field the hug COST relies on (its load-bearing use). Kept for that belt, not because it
+        // adds tier behaviour the footprint lacks.
         self.col.ground_clearance(p.xy[0], p.xy[1], p.floor_z) >= self.ledge_margin
             && self.col.wall_clearance(p.xy[0], p.xy[1], p.floor_z) >= self.radius
     }
@@ -703,6 +725,78 @@ mod tests {
             "mid-route lane still hugs the south wall (nearest approach {worst:.2}u): {steer:?}");
     }
 
+    /// **THE GRADED STANDING-ROOM MARGIN (the new `occupy_margin_ok` path, #378 field wiring).**
+    /// The field-wiring commit replaced the boolean `ground_margin_ok` with the field's GRADED
+    /// `ground_clearance`, and added a `wall_clearance >= radius` standing-room half. This pins that
+    /// path directly — not through a route hash (it is invisible on the parity fixtures) but through
+    /// the predicate itself, at both tiers, so the intended behaviour change rests on more than the
+    /// single hug fixture.
+    ///
+    /// Fixture: an open plateau. A point 1.5 u inside the NORTH edge stands on continuous floor
+    /// (a floor edge is not geometry, so `occupy_wall_ok`'s footprint ring is clear and
+    /// `occupy_floor_ok` finds floor) — the ONLY thing that can refuse it is the graded ground
+    /// margin. It must be:
+    ///   * REFUSED at `Tier::Preferred` (margin 2.0 > its ~1.5 u of ground clearance), naming Floor;
+    ///   * OCCUPIABLE at `Tier::Minimum` (no standing-room requirement — the tier's promise is only
+    ///     "the character fits", which keeps narrow ledges routable, #310's mirror).
+    /// A mid-plateau point passes at both.
+    ///
+    /// Mutation check (verified at authoring time): drop the `ground_clearance >= ledge_margin`
+    /// clause from `occupy_margin_ok` and the near-edge Preferred case wrongly PASSES → red. (The
+    /// `wall_clearance >= radius` clause is deliberately NOT mutation-bitable here: it is redundant
+    /// with `occupy_wall_ok`'s footprint ring at the tier radius — see that clause's comment — so
+    /// the near-wall refusal below is enforced by the footprint whether or not the margin clause
+    /// fires. The wall STANDING-ROOM behaviour is still pinned, as the tiered pass/fail below.)
+    #[test]
+    fn graded_standing_room_margin_refuses_near_edge_at_preferred_not_minimum() {
+        let c = col(vec![floor_at(0.0, -40.0, 40.0, -40.0, 40.0)]);
+        // A point 1.5u inside the north floor edge (edge at north=40), mid-span in east.
+        let near_edge = Point::new([0.0, 38.5], 0.0);
+        let mid = Point::new([0.0, 0.0], 0.0);
+
+        // The graded field genuinely sees the edge as reduced ground clearance here, and full
+        // clearance mid-plateau — that is the boolean→graded swap this test exists to pin.
+        assert!(c.ground_clearance(0.0, 38.5, 0.0) < Tier::Preferred.units(),
+            "near the edge, graded ground clearance must be below the preferred margin");
+        assert!(c.ground_clearance(0.0, 0.0, 0.0) >= Tier::Preferred.units(),
+            "mid-plateau must have full graded ground clearance");
+
+        let pref = Traversability::new(&c, Tier::Preferred.units(), 2.0, Tier::Preferred.units(), false);
+        let minm = Traversability::new(&c, Tier::Minimum.units(), 2.0, 0.0, false);
+
+        // Preferred: the near-edge point lacks standing room and is refused, naming the ground.
+        assert!(pref.can_occupy_fast(mid), "mid-plateau is occupiable at the preferred tier");
+        match pref.can_occupy(near_edge) {
+            Err(b) => assert_eq!(b.hazard, HazardKind::Floor,
+                "a point short of the preferred ground margin names Floor: {b:?}"),
+            Ok(()) => panic!("near the edge must be refused at the preferred tier (standing room)"),
+        }
+        // Minimum: the SAME point fits (no standing-room requirement) — the tiered distinction.
+        assert!(minm.can_occupy_fast(near_edge),
+            "the near-edge point must remain occupiable at the minimum tier (it fits)");
+        assert!(minm.can_occupy(near_edge).is_ok());
+
+        // WALL STANDING-ROOM, tiered. A point 1u from a wall on continuous floor: the field sees
+        // the wall (graded `wall_clearance` below the preferred radius), and the point is REFUSED
+        // at Preferred (radius 2.0) yet OCCUPIABLE at Minimum (radius 1.0 — it fits with nothing to
+        // spare). This is the same tier distinction as the ground half, on the wall axis; it is
+        // enforced by the footprint at the tier radius (with the margin clause as a radial belt).
+        let cw = col(vec![
+            floor_at(0.0, -40.0, 40.0, -40.0, 40.0),
+            panel(8.0, -40.0, 40.0, 0.0, 10.0), // a north-south wall at east=8
+        ]);
+        // 1.2u from the wall (east=6.8): fits at radius 1.0 (Minimum), not at radius 2.0 (Preferred).
+        let near_wall = Point::new([6.8, 0.0], 0.0);
+        assert!(cw.wall_clearance(6.8, 0.0, 0.0) < Tier::Preferred.units(),
+            "~1u from the wall, graded wall clearance is below the preferred radius");
+        let prefw = Traversability::new(&cw, Tier::Preferred.units(), 2.0, Tier::Preferred.units(), false);
+        let minw = Traversability::new(&cw, Tier::Minimum.units(), 2.0, 0.0, false);
+        assert!(prefw.can_occupy(near_wall).is_err(),
+            "a point inside the preferred wall standing-room must be refused at Preferred");
+        assert!(minw.can_occupy_fast(near_wall),
+            "the same point fits at the minimum tier (radius 1.0)");
+    }
+
     /// Tier is the ladder and the ladder is closed: two rungs, minimum == the controller's radius,
     /// nothing below it expressible.
     #[test]
@@ -787,13 +881,16 @@ mod tests {
 
     /// **ROUTE-PARITY PIN (design PR-2's gate).** Re-plumbing the A* edge test / ledge margin /
     /// waypoint inset through `Traversability` must be BYTE-IDENTICAL re-plumbing: the emitted
-    /// waypoints over these fixtures may not move by a single bit. The hashes below were recorded
-    /// on the pre-façade code (commit "one Body", where routes last legitimately changed); if this
-    /// test goes red, the re-plumbing did something it was not supposed to.
+    /// waypoints over these fixtures may not move by a single bit. The hash below was first recorded
+    /// in the façade commit (3033ed4) — the re-plumbing itself, where routes were required NOT to
+    /// change; on these fixtures the later field-wiring commit (17b101e: graded margin + hug cost)
+    /// left it unchanged too, which is why the intended route change there is pinned by the hug and
+    /// margin fixtures instead of by this hash. If this test goes red, the re-plumbing did something
+    /// it was not supposed to.
     ///
-    /// If a LATER change legitimately alters routes (a new probe, a margin change), re-record the
-    /// hashes IN THE SAME COMMIT and say so in its message — this pin is for silent drift, not a
-    /// freeze on tuning.
+    /// If a LATER change legitimately alters routes ON THESE FIXTURES (a new probe, a margin
+    /// change), re-record the hash IN THE SAME COMMIT and say so in its message — this pin is for
+    /// silent drift, not a freeze on tuning.
     #[test]
     fn facade_replumbing_is_byte_identical_route_parity() {
         fn hash_route(h: &mut u64, r: Option<Vec<[f32; 3]>>) {

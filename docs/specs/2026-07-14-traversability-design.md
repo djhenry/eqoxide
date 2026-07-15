@@ -1,7 +1,21 @@
 # Traversability: one abstraction, pluggable hazards (#378)
 
-**Status:** proposed — for the owner's approval. No production code is cut until this is signed off.
-**Scope:** `src/assets.rs` (A*, clearance tests), `src/movement.rs` (the controller), `src/eq_net/navigation.rs` + `src/eq_net/nav_planner.rs` (the two planner tiers), and optionally `src/navmesh.rs` (currently only on branch `worktree-navmesh-harness`, PR #372).
+**Status:** approved; Phase 1 built (`src/traversability.rs` — the `Body`/`Tier`, the
+`Traversability` façade, and the `ClearanceField` `MemoField`). Phase 2 (controller wiring, divergent-
+copy deletion, `BlockedBy` → `/v1/observe/debug`, wall-aware inset) is the next branch.
+**Scope:** `src/assets.rs` (A*, clearance tests), `src/movement.rs` (the controller),
+`src/eq_net/navigation.rs` + `src/eq_net/nav_planner.rs` (the two planner tiers), and a new
+`src/traversability.rs`. It does **NOT** touch `src/navmesh.rs`.
+
+> **The navmesh line is CANCELLED — do not re-import it.** #372 (the `worktree-navmesh-harness`
+> navmesh + Recast-style bake) is closed, its "Phase 2" cancelled. This abstraction was built with
+> **zero navmesh code** and does not depend on it. Where this document cites #372's *measurements*
+> (bake times, cache sizes, the `TARGET_COLUMNS` clamp) it does so as **historical data** to size the
+> clearance field, NOT as an instruction to lift `navmesh.rs`. The optional Phase-4 `BakedField`
+> (§3d, §7 PR-5) is an eager bake **of this same `ClearanceField`** — same graded wall/ground
+> distances, same query surface as the shipped `MemoField` — **not** a revival of the navmesh harness.
+> Any file:line reference to `navmesh.rs` below is a pointer into that dead branch for provenance
+> only; a future agent must re-derive the equivalent, not resurrect the harness.
 **Closes / unblocks:** #378 (this), #358 (residual), #379, #381, #375, #312's half-fix. Does *not* close #382.
 
 ---
@@ -637,7 +651,7 @@ Each rung is independently mergeable, independently green, and independently *re
 | **PR-2** | **`Traversability` façade + `Tier`.** Wraps *today's* tests unchanged (Floor = `nearest_floor`, Wall = `path_clear`, Water = `RegionMap`). Route all four predicates through it: A*'s edge tests (`assets.rs:2145`), the ledge margin (`:2153`), the waypoint inset (`:2445`), the controller. **Pure re-plumbing — byte-identical routes.** | **#378's "one type" criterion**; **#312's half-fix** (the inset's `edge_ok` becomes Floor **and** Wall) | a route-hash parity test over the fixture zones: the emitted waypoints must be **byte-identical** to `main`'s. If they are not, PR-2 did something it was not supposed to. |
 | **PR-3** | **`Blockage` / `BlockedBy` + the cold `diagnose` path.** Extend `PlanOutcome::Unreachable` with `goal_blocked_by` / `frontier_blocked_by`; thread through `PlanReply` → `nav_state` → `/v1/observe/debug`. Add per-route **`nav_tier`** (§4c). | **#378's honesty criterion**; the residual half of **#356** | (a) the §5c agreement property test; (b) the §5c zero-diagnose-on-success counter test; (c) a test that `Exhausted` carries **no** blockage (the #337 discipline). |
 | **PR-4** | **`ClearanceField` (MemoField — no bake, no navmesh).** Radial-disc point clearance, memoised per zone with a **bounded** table. A* inner loop becomes a lookup. Coarse tier becomes a **max-pool** view (§6b). | **#381** (radial probe has no parallel-wall hole); **#379** (max-pool ⇒ coarse cannot select a corridor with no fitting point) | (a) the §6d **walkability property test** — the whole point; (b) an inner-loop benchmark, before/after — **#378 requires "no perf regression in the A* inner loop (measure it)"**; (c) a memo-size ceiling test in gfaydark (the ~95 MB **[derived]** leak risk). |
-| **PR-5** *(optional — only if PR-4's numbers demand it)* | **`BakedField`.** Lift stages 1–3 of `navmesh.rs` (voxelise → filter → **keep the BFS distance**) as the field's backing store. Digest-keyed disk cache (`navmesh.rs:947`). Inherit the `TARGET_COLUMNS = 300_000` cell clamp (`navmesh.rs:102`) or reintroduce a 30 s zone-load stall. | zone-load-time O(1) clearance; the memory ceiling | bake determinism (same GLB ⇒ same digest ⇒ same field); a stale-cache-rejection test; field-vs-MemoField agreement on the corpus. |
+| **PR-5** *(optional — only if PR-4's numbers demand it)* | **`BakedField`.** An eager, zone-load bake **of the very `ClearanceField` PR-4 ships** — same graded wall/ground query surface, computed up front instead of on demand. **NOT** a lift of `navmesh.rs` (that harness is cancelled, #372 closed); re-derive the voxelise → filter → clearance-BFS from scratch if the numbers ever demand it. Digest-keyed disk cache; inherit a `TARGET_COLUMNS`-style cell clamp (the historical `300_000` figure sized gfaydark, [cited: #372 measurements]) or reintroduce a 30 s zone-load stall. | zone-load-time O(1) clearance; the memory ceiling | bake determinism (same GLB ⇒ same digest ⇒ same field); a stale-cache-rejection test; field-vs-MemoField agreement on the corpus. |
 | **PR-6** | **Dynamic hazards first-class.** `DynamicHazard` enum replaces `avoid: &[[f32;2]]` + `aggro_buffer` (`nav_planner.rs:46-48`). **Give the fine tier the hazard list it does not have today** (`navigation.rs:2730` passes `&[]`). | **#378 closes here** | a test that a mob on the fine tier's carrot is *skirted*, not walked through; and that a `Severity::Cost` hazard can **never** turn a route into `no_path` (`assets.rs:2012-2017`'s guarantee). |
 | **PR-7** | **Floor detector: `\|nz\|` + headroom, retiring the winding-sign filter.** | **#375** | see §8 — this is the rung most able to hurt you. |
 
@@ -648,15 +662,17 @@ because its safety net (headroom) is a thing PR-4/5 build.
 
 ---
 
-## 8. Interaction with #372 (navmesh) and #375
+## 8. Interaction with #372 (navmesh, CANCELLED) and #375
 
-### 8a. Does this design require the navmesh? **No.**
+### 8a. Does this design require the navmesh? **No — and #372 is now cancelled outright.**
 
-What it requires is a **clearance oracle keyed by (point, surface)**. `MemoField` (PR-4) satisfies that
-with **zero** navmesh code. If the owner banks the working grid and drops #372 entirely, **PR-1 through
-PR-4, PR-6 and PR-7 all still land unchanged.** Only PR-5 — an *optimisation*, explicitly gated on
-PR-4's measurements — reaches for `navmesh.rs`, and even then it takes only **stages 1–3** (the span
-grid, the filter, the clearance BFS) and **not** its planner (`find_path`, components, fall-links).
+What it requires is a **clearance oracle keyed by (point, surface)**. `MemoField` (PR-4, shipped in
+Phase 1) satisfies that with **zero** navmesh code. #372 (the `worktree-navmesh-harness`) is closed
+and its Phase 2 cancelled; the owner banked the working grid and dropped it. **PR-1 through PR-4, PR-6
+and PR-7 all land unchanged regardless.** The optional PR-5 `BakedField` is an eager bake of *this
+design's own* `ClearanceField` (a span grid → filter → clearance-BFS re-derived from scratch), **not**
+a lift of `navmesh.rs`. The `navmesh.rs` file:line references in this section are provenance pointers
+into that dead branch — cited for the measurements they recorded, not as code to resurrect.
 
 That is the design's answer to "the owner may bank the grid and drop the navmesh": **it must not be a
 decision this refactor forces, and it isn't.**
