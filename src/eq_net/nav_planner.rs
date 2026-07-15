@@ -112,6 +112,23 @@ impl Planner {
         Planner { req_tx, rep_rx, next_gen: 1, pending: None, dead: false }
     }
 
+    /// Test-only (#398): like `spawn`, but also hands back a channel the worker sends on every time
+    /// it dequeues a request — after coalescing any backlog, immediately before running the search —
+    /// and so has irrevocably committed to computing that generation. This is the deterministic sync
+    /// seam `a_superseded_plan_is_discarded_not_applied` uses to know "plan A cannot be coalesced away
+    /// any more" without a `sleep` racing the worker's own scheduling.
+    #[cfg(test)]
+    pub fn spawn_with_dequeue_signal() -> (Self, Receiver<u64>) {
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<PlanRequest>();
+        let (rep_tx, rep_rx) = std::sync::mpsc::channel::<PlanReply>();
+        let (dq_tx, dq_rx) = std::sync::mpsc::channel::<u64>();
+        std::thread::Builder::new()
+            .name("nav-planner-test".into())
+            .spawn(move || worker_with_dequeue_signal(req_rx, rep_tx, dq_tx))
+            .expect("spawn nav-planner thread");
+        (Planner { req_tx, rep_rx, next_gen: 1, pending: None, dead: false }, dq_rx)
+    }
+
     /// Post a plan request and return its generation. **Never blocks on the search** — this is the
     /// whole point of the module. Any in-flight plan is implicitly superseded: its reply will carry
     /// an older `gen` and be discarded by `poll`.
@@ -180,15 +197,7 @@ impl Planner {
         loop {
             match self.rep_rx.try_recv() {
                 Ok(rep) => {
-                    if self.pending.map(|(g, _)| g) == Some(rep.gen) {
-                        // Clear the pending request AND its goal together: handing the reply over is
-                        // exactly the moment the plan stops being in flight.
-                        self.pending = None;
-                        fresh = Some(rep);
-                    } else {
-                        tracing::debug!("nav-planner: discarding STALE plan #{} (now waiting on {:?})",
-                            rep.gen, self.pending);
-                    }
+                    if let Some(rep) = self.accept_reply(rep) { fresh = Some(rep); }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -205,17 +214,65 @@ impl Planner {
         }
         fresh
     }
+
+    /// The one place that decides "is this reply CURRENT, or STALE?" for a reply already taken off
+    /// the channel. Shared by `poll`'s non-blocking drain and (test-only) a blocking wait, so there is
+    /// exactly one implementation of the discard rule the module docs describe — not two copies that
+    /// could drift apart.
+    fn accept_reply(&mut self, rep: PlanReply) -> Option<PlanReply> {
+        if self.pending.map(|(g, _)| g) == Some(rep.gen) {
+            // Clear the pending request AND its goal together: handing the reply over is exactly the
+            // moment the plan stops being in flight.
+            self.pending = None;
+            Some(rep)
+        } else {
+            tracing::debug!("nav-planner: discarding STALE plan #{} (now waiting on {:?})", rep.gen, self.pending);
+            None
+        }
+    }
+
+    /// Test-only (#398): block until a reply that matches `pending` is accepted, discarding any stale
+    /// ones along the way through the exact same rule `poll()` uses (`accept_reply`) — but by blocking
+    /// on the channel instead of busy-polling it on a sleep. Waiting for an arbitrarily slow plan (a
+    /// sealed-box search under heavy CPU load) is then bounded by the OS scheduler and `timeout`, not
+    /// by a fixed retry-count-times-sleep-interval budget that can run out before the plan does.
+    #[cfg(test)]
+    fn recv_applied(&mut self, timeout: std::time::Duration) -> PlanReply {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let rep = self.rep_rx.recv_timeout(remaining)
+                .expect("a reply must arrive within the timeout");
+            if let Some(rep) = self.accept_reply(rep) { return rep; }
+        }
+    }
 }
 
 /// The worker loop. Blocks on the request channel, coalesces any backlog down to the newest request
 /// (an older goal is already superseded — computing it would just delay the one that matters), runs
 /// the plan, and ships the outcome back.
 fn worker(req_rx: Receiver<PlanRequest>, rep_tx: Sender<PlanReply>) {
+    worker_impl(req_rx, rep_tx, None)
+}
+
+/// Test-only (#398): identical to `worker`, but sends the generation it just dequeued on
+/// `on_dequeue`, right after coalescing and right before running the search — see
+/// [`Planner::spawn_with_dequeue_signal`].
+#[cfg(test)]
+fn worker_with_dequeue_signal(req_rx: Receiver<PlanRequest>, rep_tx: Sender<PlanReply>, on_dequeue: Sender<u64>) {
+    worker_impl(req_rx, rep_tx, Some(on_dequeue))
+}
+
+fn worker_impl(req_rx: Receiver<PlanRequest>, rep_tx: Sender<PlanReply>, on_dequeue: Option<Sender<u64>>) {
     while let Ok(mut req) = req_rx.recv() {
         while let Ok(newer) = req_rx.try_recv() {
             tracing::debug!("nav-planner: superseding queued plan #{} with #{}", req.gen, newer.gen);
             req = newer;
         }
+        // Test-only observer: the worker has now committed to `req.gen` — it is no longer sitting in
+        // `req_rx` where a future request could coalesce it away. `None` in production; a dropped
+        // receiver on the test side is not this thread's problem, hence `let _ =`.
+        if let Some(tx) = &on_dequeue { let _ = tx.send(req.gen); }
         let t0 = Instant::now();
         // Is the planner about to change the goal it was given? (A zone-line goal is a VOLUME, not a
         // floor point — it is not "snapped" and must not be reported as such.)
@@ -705,43 +762,62 @@ mod tests {
     /// character toward a goal nobody asked for.
     ///
     /// The plan-A goal is deliberately the SEALED one (an expensive, whole-grid search) and plan B
-    /// is posted only once the worker is demonstrably busy with A — so A really is computed and its
-    /// reply really does arrive, and the generation check is what has to reject it. An earlier
+    /// is posted only once the worker has SIGNALLED that it dequeued A — so A really is computed and
+    /// its reply really does arrive, and the generation check is what has to reject it. An earlier
     /// version of this test posted both back-to-back; the worker's request COALESCING quietly threw
     /// A away before it ever ran, so the test passed without ever exercising the check it names.
+    ///
+    /// # #398: no sleep, no wall clock, anywhere in this test
+    ///
+    /// The previous version used `sleep(150ms)` to give the worker "enough time" to pick A up before
+    /// posting B, then polled for up to ~20s waiting for a reply. Under CPU oversubscription that
+    /// failed two ways: the sleep could elapse before the worker was even scheduled (A gets coalesced
+    /// away → the test's own premise, "A was computed and arrived stale", never held — a VACUOUS
+    /// pass), or A's now-uncapped-by-wall-clock close (#394) could outrun the fixed poll window
+    /// (`.expect(...)` panics RED). Both are the same root cause: sequencing derived from *how long
+    /// something usually takes* instead of a signal for *when it actually happened*.
+    ///
+    /// This version replaces both wall-clock dependencies with real synchronization: a
+    /// `spawn_with_dequeue_signal` seam (the worker tells us the instant it has committed to A, so
+    /// posting B is never a race with coalescing) and a blocking `recv_applied` (waiting for A's
+    /// arbitrarily-slow close is bounded by the OS scheduler, not a retry count). Neither depends on
+    /// CPU speed for CORRECTNESS — only `recv_applied`'s outer `timeout` is wall-clock, and it is
+    /// purely a hang detector, generous enough that no plan on this fixture should ever approach it.
     #[test]
     fn a_superseded_plan_is_discarded_not_applied() {
         let col = Arc::new(plane_with_sealed_box(1000.0, 400.0, 400.0));
-        let mut planner = Planner::spawn();
+        let (mut planner, dequeued) = Planner::spawn_with_dequeue_signal();
         let mk = |goal: [f32; 3], col: &Arc<Collision>| PlanRequest {
             gen: 0, start: [-900.0, -900.0, 0.0], goal,
             avoid: vec![], aggro_buffer: 0.0, goal_region: None, collision: col.clone(),
         };
-        // Plan A: the sealed goal — a full-grid search, hundreds of ms.
+        // Plan A: the sealed goal — a full-grid search, hundreds of ms (longer still under load).
         let gen_a = planner.request(mk([400.0, 400.0, 0.0], &col));
-        // Let the worker actually pick A up and start searching, so it can't be coalesced away.
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        // The goal changes mid-flight. A's answer is now stale, but it is still being computed and
-        // WILL arrive.
+
+        // Wait for the WORKER ITSELF to say "I have dequeued A and am past the point where anything
+        // can coalesce it away" — the real sync seam (#398), not a sleep. The worker's coalescing
+        // loop only ever discards requests still SITTING in the channel; the instant it signals here,
+        // A has left that channel for good and WILL run to completion, on any CPU, at any load.
+        let dequeued_gen = dequeued.recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the worker must dequeue plan A — a timeout here is a liveness bug, not a race");
+        assert_eq!(dequeued_gen, gen_a, "the worker must have committed to A specifically");
+
+        // The goal changes mid-flight. A's answer is now stale, but — deterministically, per above —
+        // it is still being computed and WILL arrive.
         let gen_b = planner.request(mk([-900.0, 900.0, 0.0], &col));
         assert!(gen_b > gen_a, "each request gets a fresh, increasing generation");
 
-        // The first (and only) plan we may apply must be B's.
-        let mut applied = None;
-        for _ in 0..2000 {
-            if let Some(rep) = planner.poll() { applied = Some(rep); break; }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let rep = applied.expect("a plan must come back");
+        // The first (and only) plan we may apply must be B's. `recv_applied` blocks on the reply
+        // channel and discards anything stale through the SAME rule `poll()` uses in production
+        // (`accept_reply`) — so however long A's expensive close takes under whatever load the box is
+        // under, this waits exactly that long, never a fixed budget that can run out first.
+        let rep = planner.recv_applied(std::time::Duration::from_secs(120));
         assert_eq!(rep.gen, gen_b,
             "the applied plan must be the CURRENT goal's (#{gen_b}) — the superseded #{gen_a}, which \
              WAS computed and DID arrive, must have been discarded on the way in");
         assert!(!planner.is_planning(), "the reply we applied clears the pending request");
         // And nothing is left queued to be applied later.
-        for _ in 0..20 {
-            assert!(planner.poll().is_none(), "a stale reply must be DISCARDED, never queued for later");
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        assert!(planner.poll().is_none(), "a stale reply must be DISCARDED, never queued for later");
     }
 
     /// **A DEAD PLANNER MUST BE LOUD.** If the worker thread panics, `poll` used to see
