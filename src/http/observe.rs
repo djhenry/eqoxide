@@ -135,7 +135,7 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         "text":       o.text,
         "ago_secs":   o.at.elapsed().as_secs(),
     }));
-    Json(serde_json::json!({
+    let mut out = serde_json::json!({
         "player": {
             "name":       player.name,
             "zone":       player.zone,
@@ -193,6 +193,10 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             //                        disconnect — that's what `connected` is for.
             //   snapshot_age_ms    — since OUR network thread last ticked. If this is large, every
             //                        other field in this payload is stale and must not be trusted.
+            //   world_responsive / last_world_response_ms — #371: is the WORLD alive, not just the
+            //                        socket? Attached to this "player" object just below (kept out of
+            //                        this literal only because it is already at the json! recursion
+            //                        limit). See there for the contract.
             "connected":          health.connected,
             "link_age_ms":        health.link_age_ms,
             "last_packet_age_ms": health.last_packet_age_ms,
@@ -264,7 +268,26 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
             "focus":         cam.focus,
             "mode":          cam.mode,
         },
-    }))
+    });
+    // #371 — attached here (not inside the literal above, which is already at the json! recursion
+    // limit). `connected: true` only proves the SOCKET ACKs; a zone that is still ticking but not
+    // servicing our packets (a stuck per-client dispatch / script, or a very slow tick) keeps ACKing
+    // while producing no application output for us, which is indistinguishable from a quiet zone by
+    // the passive clocks. An active liveness probe (a request the zone main loop must service)
+    // settles it:
+    //   world_responsive        — false ONLY when a probe went unanswered past PROBE_TIMEOUT_SECS on
+    //                             a still-ACKing link. An idle-but-alive zone stays true (the probe
+    //                             is answered). USE THIS, not last_packet_age_ms, to judge whether the
+    //                             world is unresponsive. True before the first probe fires (no verdict
+    //                             yet). NOTE: this catches the still-ticking-but-unresponsive case; a
+    //                             TOTAL zone freeze stops ACKs too and is already `connected: false`.
+    //   last_world_response_ms  — since the world last PROVED it processed something for us (a probe
+    //                             reply or spontaneous packet), whichever is fresher.
+    if let Some(player) = out.get_mut("player").and_then(|p| p.as_object_mut()) {
+        player.insert("world_responsive".into(),       serde_json::json!(health.world_responsive));
+        player.insert("last_world_response_ms".into(), serde_json::json!(health.last_world_response_ms));
+    }
+    Json(out)
 }
 
 /// GET /v1/observe/frame — returns the current rendered frame as a PNG.
@@ -588,6 +611,75 @@ mod tests {
         assert!(p["last_packet_age_ms"].as_u64().unwrap() >= 45_000,
             "...while still honestly reporting that no world update has arrived for 45s");
         assert!(p["link_age_ms"].as_u64().unwrap() < 1_000);
+    }
+
+    /// #371 — THE unresponsive-world lie, end to end through the real `health()` projection. The link
+    /// is ACKing (a datagram just landed → `connected: true`), the world has been application-silent
+    /// for 30s, and an active liveness probe sent 15s ago was never answered (bound is 10s).
+    /// `connected` alone would tell the agent the world is fine; `world_responsive: false` is the
+    /// honest signal that the zone is not servicing our packets (still-ticking-but-unresponsive; a
+    /// total freeze would already be `connected: false`).
+    #[tokio::test]
+    async fn debug_reports_world_unresponsive_when_a_probe_goes_unanswered_while_the_link_acks() {
+        let state = empty_state();
+        {
+            let mut h = state.net_health.lock().unwrap();
+            h.last_datagram = std::time::Instant::now(); // link is demonstrably alive (ACKing)...
+            h.last_packet   = ago(30);                    // ...but the world has produced nothing...
+            h.last_probe_sent = Some(ago(15));            // ...and our probe (15s ago) went...
+            h.last_probe_reply = None;                    // ...unanswered, past the 10s bound.
+            // #371 wedge-flicker fix: `health()` reads the wedge-timeout clock off
+            // `first_unanswered_probe_sent`, not `last_probe_sent` — this is the first (and, in this
+            // scenario, only) unanswered send of the streak, so in production `record_probe_sent`
+            // would have stamped both together. Mirror that here.
+            h.first_unanswered_probe_sent = Some(ago(15));
+        }
+        let p = debug_json(state).await["player"].clone();
+        assert_eq!(p["connected"], serde_json::json!(true),
+            "the socket is still ACKing — connected must stay honest about the LINK");
+        assert_eq!(p["world_responsive"], serde_json::json!(false),
+            "an unanswered probe on a live link is a WEDGED world — the #371 signal must fire");
+    }
+
+    /// #371, the false-alarm we must NOT raise (the #343 trap in reverse): a legitimately idle world
+    /// — 45s with no spontaneous packet — whose probe IS answered stays `world_responsive: true`,
+    /// while `last_packet_age_ms` still honestly reports the 45s of app-silence (the probe reply does
+    /// NOT reset it).
+    #[tokio::test]
+    async fn debug_reports_idle_but_answered_world_as_responsive() {
+        let state = empty_state();
+        {
+            let mut h = state.net_health.lock().unwrap();
+            h.last_datagram    = std::time::Instant::now();
+            h.last_packet      = ago(45);          // no spontaneous world output for 45s (normal idle)
+            h.last_probe_sent  = Some(ago(20));
+            h.last_probe_reply = Some(ago(2));     // ...but the probe was answered 2s ago → alive
+            // `first_unanswered_probe_sent` deliberately left `None` (the `empty_state()` default): in
+            // production `record_probe_reply` clears it the instant a genuine reply lands, so an
+            // ANSWERED probe's real state has no outstanding streak at all — this is what makes
+            // `world_responsive` read `true` here (the "no verdict yet" branch), not the reply-vs-send
+            // comparison branch (see `wedge_timeline_tests` for why that branch is otherwise dead from
+            // this call site).
+        }
+        let p = debug_json(state).await["player"].clone();
+        assert_eq!(p["connected"], serde_json::json!(true));
+        assert_eq!(p["world_responsive"], serde_json::json!(true),
+            "an idle world that answers the probe is alive — must not false-alarm on app-silence");
+        assert!(p["last_packet_age_ms"].as_u64().unwrap() >= 45_000,
+            "the probe reply must NOT reset last_packet_age_ms — its 'world quiet' meaning is preserved");
+        assert!(p["last_world_response_ms"].as_u64().unwrap() < 3_000,
+            "proof-of-life is fresh (probe answered 2s ago), even though spontaneous traffic is 45s stale");
+    }
+
+    /// Before any probe has fired, `world_responsive` defers to the passive signals rather than
+    /// asserting a liveness it never measured — it must default to true, not a phantom wedge.
+    #[tokio::test]
+    async fn debug_defaults_world_responsive_true_before_the_first_probe() {
+        let state = empty_state();
+        state.net_health.lock().unwrap().last_packet = ago(20);
+        let p = debug_json(state).await["player"].clone();
+        assert_eq!(p["world_responsive"], serde_json::json!(true),
+            "no probe sent yet → no verdict → true (read connected/last_packet_age_ms instead)");
     }
 
     /// The player block is a projection of the NETWORK thread's GameState, with no render loop in

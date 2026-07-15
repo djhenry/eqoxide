@@ -20,6 +20,102 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// How often to re-send the bind-respawn request while an explicit respawn is pending (#284/#50).
 const RESPAWN_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
+/// #371 active liveness probe. `connected:true` only proves the SOCKET ACKs; a zone that is still
+/// ticking but not servicing our packets (a stuck per-client dispatch / script, or a very slow tick)
+/// keeps ACKing while making no application progress for us, which is indistinguishable from a quiet
+/// zone by the passive clocks. The probe is a self-`OP_Consider`: purely zone-MAIN-LOOP-serviced (the
+/// zone resolves it against its in-process entity list and replies — no WORLD hop, unlike OP_WhoAll),
+/// benign (self is not an NPC, so faction is hardcoded 1 with no aggro/faction/hate-list evaluation),
+/// and outside any anti-cheat path (MQGhost keys on movement cadence only). An unanswered probe past
+/// [`crate::http::PROBE_TIMEOUT_SECS`] while the socket still ACKs is the unresponsive-world signal.
+/// (Scope: this catches the still-ticking-but-unresponsive case. A TOTAL zone freeze stops the ACKs
+/// too on this single-threaded-libuv server, so that is already covered by `connected: false`.)
+///
+/// Only sent once the world has been application-silent this long — during active play spontaneous
+/// packets already prove the world is processing, so the probe adds no load there.
+const PROBE_QUIET_THRESHOLD: Duration = Duration::from_secs(12);
+/// Minimum gap between probes while the world stays quiet, so we poke at most ~twice a minute.
+const PROBE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// #371: does this OP_Consider reply describe our OWN spawn — i.e. is it the reply to our
+/// self-consider liveness probe, rather than a user `/consider` of another mob? Reads targetid@4
+/// of Consider_Struct.
+fn consider_reply_is_self(payload: &[u8], player_id: u32) -> bool {
+    player_id != 0
+        && payload.len() >= 8
+        && u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]) == player_id
+}
+
+/// #371: is a liveness probe currently awaiting its reply? True when we have sent a probe that has
+/// not yet been answered (no reply, or the last reply predates the last send). Used to consume the
+/// probe's own reply exactly once, so a genuine user self-consider is never swallowed.
+fn probe_outstanding(h: &crate::http::NetHealth) -> bool {
+    match (h.last_probe_sent, h.last_probe_reply) {
+        (Some(sent), Some(reply)) => sent > reply,
+        (Some(_), None)           => true,
+        _                         => false,
+    }
+}
+
+/// #371: on a zone change, discard the previous zone's probe verdict. `world_responsive` returns to
+/// "no verdict yet" (true) until we re-probe in the new zone, so a transition never reads as a wedge.
+fn reset_probe_clocks(net_health: &crate::http::NetHealthShared) {
+    let mut h = net_health.lock().unwrap();
+    h.last_probe_sent = None;
+    h.last_probe_reply = None;
+    h.first_unanswered_probe_sent = None;
+}
+
+/// #371 wedge-flicker fix: pure resend-policy predicate — should the network thread send a new probe
+/// right now, given how long the world has been application-silent and how long ago (if ever) the
+/// last one went out? Extracted out of the loop body so the 30s-resend cadence and the http.rs 10s
+/// grace window can be driven TOGETHER over a simulated timeline in tests — the interaction a
+/// single-snapshot test cannot see (see `wedge_timeline_tests` below, in this same module).
+fn should_send_probe(last_packet_ago: Duration, last_probe_sent_ago: Option<Duration>) -> bool {
+    let app_silent = last_packet_ago >= PROBE_QUIET_THRESHOLD;
+    let probe_due  = last_probe_sent_ago.map_or(true, |a| a >= PROBE_INTERVAL);
+    app_silent && probe_due
+}
+
+/// #371 wedge-flicker fix: apply a just-sent probe to `NetHealth`. Bumps the scheduling clock
+/// (`last_probe_sent`) unconditionally — every resend needs that so `should_send_probe` knows when
+/// the next one is due — but stamps the wedge-timeout clock (`first_unanswered_probe_sent`) ONLY on
+/// the first send of a new unanswered streak (`is_none()`). THIS is the actual fix: a resend of a
+/// still-unanswered probe must never look like a fresh one to `world_responsive`, or a permanently
+/// wedged zone would re-earn the 10s in-flight grace window on every 30s resend forever instead of
+/// staying flagged wedged. Extracted so tests can drive the exact state transition production code
+/// performs, not a re-derivation of it.
+fn record_probe_sent(h: &mut crate::http::NetHealth, now: std::time::Instant) {
+    h.last_probe_sent = Some(now);
+    if h.first_unanswered_probe_sent.is_none() {
+        h.first_unanswered_probe_sent = Some(now);
+    }
+}
+
+/// #371 wedge-flicker fix: apply a genuine probe reply to `NetHealth`. Stamps `last_probe_reply` and
+/// ENDS the unanswered streak (`first_unanswered_probe_sent = None`), so `world_responsive` returns to
+/// "no verdict yet" until the next probe starts a new streak. Extracted alongside `record_probe_sent`
+/// for the same testability reason.
+fn record_probe_reply(h: &mut crate::http::NetHealth, now: std::time::Instant) {
+    h.last_probe_reply = Some(now);
+    h.first_unanswered_probe_sent = None;
+}
+
+/// #371 false-alive-on-second-wedge fix: apply a spontaneous inbound APPLICATION packet to
+/// `NetHealth`. Stamps `last_packet` AND ends any unanswered-probe streak — because real world
+/// traffic is itself proof the zone is servicing us, exactly like a probe reply. Clearing (not
+/// restamping) the streak-start clock re-arms it: within one CONTINUOUS silence nothing bumps
+/// `last_packet`, so the anti-flicker guard from `record_probe_sent` still holds; but once traffic
+/// RESUMES and then stops again, the NEXT probe of the new silence stamps a FRESH streak start,
+/// so a second genuine wedge is still detected. Without this clear, a stale streak-start from an
+/// earlier wedge would sit older than every later probe forever, making the answered-clause
+/// `last_packet_ago <= first_unanswered_sent_ago` permanently true → a confident false-ALIVE that
+/// hides the re-wedge (the worst honesty class).
+fn record_app_packet(h: &mut crate::http::NetHealth, now: std::time::Instant) {
+    h.last_packet = now;
+    h.first_unanswered_probe_sent = None;
+}
+
 /// Consume the zone stream and run the gameplay loop indefinitely.
 pub async fn run_gameplay_phase(
     stream_init:   EqStream,
@@ -102,8 +198,21 @@ pub async fn run_gameplay_phase(
         let mut zone_redirect: Option<(String, u16)> = None;
         let mut world_reconnect_needed = false;
         while let Ok(packet) = rx.try_recv() {
+            // #371: intercept the reply to OUR self-consider liveness probe BEFORE apply_packet.
+            // It is an internal health poke, not world state — stamp the probe clock and DROP it, so
+            // it does not spam the con log, overwrite target con, or bump `last_packet` (which would
+            // reset last_packet_age_ms every probe cadence and destroy its "world quiet for 45s"
+            // meaning). Only consume it while a probe is actually outstanding, so a genuine user
+            // self-consider is never swallowed.
+            if packet.opcode == OP_CONSIDER && consider_reply_is_self(&packet.payload, gs.player_id) {
+                let mut h = net_health.lock().unwrap();
+                if probe_outstanding(&h) {
+                    record_probe_reply(&mut h, std::time::Instant::now());
+                    continue;
+                }
+            }
             apply_packet(&mut gs, &packet);
-            net_health.lock().unwrap().last_packet = std::time::Instant::now();
+            record_app_packet(&mut net_health.lock().unwrap(), std::time::Instant::now());
             navigator.sync_entities(&gs);
             navigator.sync_zone_points(&gs);
             navigator.sync_tasks(&gs);
@@ -354,6 +463,7 @@ pub async fn run_gameplay_phase(
                 ).await;
                 navigator.sync_zone_points(&gs);
                 last_keepalive = std::time::Instant::now();
+                reset_probe_clocks(&net_health);
             } else {
                 tracing::warn!("EQ: world reconnect failed — exiting gameplay");
                 return;
@@ -387,6 +497,7 @@ pub async fn run_gameplay_phase(
                     ).await;
                     navigator.sync_zone_points(&gs);
                     last_keepalive = std::time::Instant::now();
+                    reset_probe_clocks(&net_health);
                 }
                 Err(e) => {
                     tracing::warn!("EQ: zone transition connect failed: {e}");
@@ -401,6 +512,28 @@ pub async fn run_gameplay_phase(
         if last_keepalive.elapsed() > KEEPALIVE_INTERVAL {
             s.send_keepalive();
             last_keepalive = std::time::Instant::now();
+        }
+
+        // ── Active liveness probe (#371) ─────────────────────────────────────
+        // Poke the zone MAIN LOOP with a cheap self-consider it must service to answer, so a zone
+        // that is still ticking at the socket but not making application progress for us is
+        // distinguishable from a merely quiet one. The reply is captured above and turned into
+        // `world_responsive` at HTTP read time. Only fires once the world has been application-silent
+        // for PROBE_QUIET_THRESHOLD (no load during active play) and at most once per PROBE_INTERVAL.
+        // Gated on being in-zone (player_id set); a self-consider is benign and non-disruptive (see
+        // the const doc, which also bounds what this signal does and does not catch).
+        if gs.player_id != 0 {
+            let (last_packet_ago, probe_sent_ago) = {
+                let h = net_health.lock().unwrap();
+                (h.last_packet.elapsed(), h.last_probe_sent.map(|t| t.elapsed()))
+            };
+            if should_send_probe(last_packet_ago, probe_sent_ago) {
+                s.send_app_packet(OP_CONSIDER,
+                    &crate::eq_net::navigation::build_consider_packet(gs.player_id, gs.player_id));
+                let mut h = net_health.lock().unwrap();
+                record_probe_sent(&mut h, std::time::Instant::now());
+                tracing::debug!("EQ: liveness probe — sent self-consider (#371)");
+            }
         }
 
         // Respawn drive (#284): we no longer auto-respawn. While dead, we recover ONLY once the
@@ -526,7 +659,7 @@ async fn reconnect_via_world(
         world_stream.poll_recv();
         world_stream.poll_resend(); // retransmit OP_SEND_LOGIN_INFO/ENTER_WORLD across the handoff (#254)
         while let Ok(packet) = world_rx.try_recv() {
-            net_health.lock().unwrap().last_packet = std::time::Instant::now();
+            record_app_packet(&mut net_health.lock().unwrap(), std::time::Instant::now());
             match packet.opcode {
                 // In a fresh-login reconnect, world sends OP_SEND_CHAR_INFO as the trigger.
                 // In a zoning=1 reconnect, world sends OP_APPROVE_WORLD (RoF2: 0x7499) instead.
@@ -624,7 +757,7 @@ async fn run_zone_entry_handshake(
         stream.poll_resend(); // retransmit OP_ZONE_ENTRY/ReqClientSpawn during zone-in (#254)
         while let Ok(packet) = net_rx.try_recv() {
             apply_packet(gs, &packet);
-            net_health.lock().unwrap().last_packet = std::time::Instant::now();
+            record_app_packet(&mut net_health.lock().unwrap(), std::time::Instant::now());
             match packet.opcode {
                 OP_NEW_ZONE if !done_new_zone => {
                     done_new_zone = true;
@@ -1236,5 +1369,190 @@ mod zone_entry_handshake_publish_tests {
         }
 
         handle.abort();
+    }
+}
+
+#[cfg(test)]
+mod liveness_probe_tests {
+    use super::{consider_reply_is_self, probe_outstanding};
+    use crate::http::NetHealth;
+    use std::time::{Duration, Instant};
+
+    fn ago(secs: u64) -> Instant { Instant::now() - Duration::from_secs(secs) }
+
+    /// The self-consider probe reply is discriminated from a user `/consider` of another mob purely
+    /// by `targetid == our own spawn id` (Consider_Struct targetid@4). This is what lets us consume
+    /// the probe's reply and drop it, without swallowing a real consider of some other spawn.
+    #[test]
+    fn consider_reply_is_self_matches_only_our_own_spawn() {
+        let mut reply = vec![0u8; 20];
+        reply[4..8].copy_from_slice(&42u32.to_le_bytes()); // targetid = 42
+        assert!(consider_reply_is_self(&reply, 42),  "targetid == player_id → our probe reply");
+        assert!(!consider_reply_is_self(&reply, 99), "targetid != player_id → a real consider of another mob");
+    }
+
+    /// player_id 0 (not yet in-zone) never matches — we never send a probe then, and a stray
+    /// targetid-0 packet must not be mistaken for a probe reply.
+    #[test]
+    fn consider_reply_is_self_never_matches_before_zone_in() {
+        let reply = vec![0u8; 20]; // targetid = 0
+        assert!(!consider_reply_is_self(&reply, 0));
+    }
+
+    /// A short/truncated payload can't be a valid self-consider reply — don't index out of bounds.
+    #[test]
+    fn consider_reply_is_self_rejects_short_payload() {
+        assert!(!consider_reply_is_self(&[0u8; 4], 42));
+    }
+
+    /// `probe_outstanding` gates the reply-consume so it fires exactly once per probe: true only
+    /// while a sent probe is still awaiting its answer.
+    #[test]
+    fn probe_outstanding_reflects_the_send_reply_race() {
+        let mut h = NetHealth::default();
+        // Never probed → nothing outstanding.
+        h.last_probe_sent = None; h.last_probe_reply = None;
+        assert!(!probe_outstanding(&h), "no probe ever sent → nothing outstanding");
+
+        // Sent, no reply yet → outstanding.
+        h.last_probe_sent = Some(ago(2)); h.last_probe_reply = None;
+        assert!(probe_outstanding(&h), "sent but unanswered → outstanding");
+
+        // Reply came AFTER the send → answered, not outstanding (a later user self-consider is safe).
+        h.last_probe_sent = Some(ago(5)); h.last_probe_reply = Some(ago(4));
+        assert!(!probe_outstanding(&h), "reply newer than send → answered");
+
+        // A new probe sent after the last reply → outstanding again.
+        h.last_probe_sent = Some(ago(1)); h.last_probe_reply = Some(ago(10));
+        assert!(probe_outstanding(&h), "newest send postdates the last reply → outstanding again");
+    }
+}
+
+#[cfg(test)]
+mod wedge_timeline_tests {
+    //! #371 wedge-flicker regression (independent-reviewer finding). Every liveness test above this
+    //! module — and every test in `http::world_responsive_tests` — feeds `world_responsive` a single
+    //! frozen `(sent_ago, reply_ago, last_packet_ago)` snapshot. None of them exercise the seam the
+    //! bug actually lived in: the gameplay.rs 30s resend cadence (`should_send_probe` +
+    //! `record_probe_sent`) mutating a REAL `NetHealth` across elapsed wall-clock, then read back
+    //! through the http.rs 10s in-flight grace window (`world_responsive`).
+    //!
+    //! This drives the actual production functions — `should_send_probe`, `record_probe_sent`,
+    //! `record_probe_reply` — against a real `NetHealth`, over a synthetic timeline (a fixed `base`
+    //! `Instant` plus `Duration::from_secs(t)`, since `Instant` itself can't be faked/advanced). At
+    //! each virtual second the ages fed to `world_responsive` are computed exactly the way
+    //! `HttpState::health()` computes them (`now_t.duration_since(field)`), just parameterized on the
+    //! synthetic `now_t` instead of a real `Instant::now()`.
+    //!
+    //! Asserts the fixed behavior: for a zone that never answers a single probe, once
+    //! `world_responsive` first reports the wedge (`false`), it must NEVER read `true` again — no
+    //! matter how many more 30s resend cycles elapse. Before the fix this oscillated forever
+    //! (true@0, false@22, true@42, false@52, true@72, ... — the exact timeline from the bug report),
+    //! because every resend restamped the SAME clock `world_responsive` used for its 10s grace check.
+    use super::{record_app_packet, record_probe_sent, should_send_probe, PROBE_INTERVAL};
+    use crate::http::{world_responsive, NetHealth, PROBE_TIMEOUT_SECS};
+    use std::time::{Duration, Instant};
+
+    /// Drives a timeline second-by-second through the REAL `NetHealth` and the real production state
+    /// transitions (`record_app_packet` for spontaneous traffic, `should_send_probe` +
+    /// `record_probe_sent` for the resend policy), and returns the `world_responsive` verdict recorded
+    /// at every virtual second from 0 to `run_secs`. `traffic(t)` says whether a spontaneous
+    /// application packet arrives at second `t` (t=0 always counts as the initial packet). No probe is
+    /// EVER answered in these scenarios — the point is to prove liveness is tracked from spontaneous
+    /// traffic and probe-silence alone, without ever relying on a probe reply.
+    ///
+    /// Per-second order mirrors the gameplay loop: drain inbound packets (→ `record_app_packet`)
+    /// first, then run the probe-send policy, then an HTTP read would compute `world_responsive` from
+    /// the resulting clocks.
+    fn simulate(run_secs: u64, traffic: impl Fn(u64) -> bool) -> Vec<(u64, bool)> {
+        let timeout = Duration::from_secs(PROBE_TIMEOUT_SECS);
+        let base = Instant::now();
+        let mut h = NetHealth {
+            last_datagram: base, last_packet: base, last_tick: base,
+            last_probe_sent: None, last_probe_reply: None, first_unanswered_probe_sent: None,
+        };
+        let mut verdicts = Vec::with_capacity(run_secs as usize + 1);
+
+        for t in 0..=run_secs {
+            let now_t = base + Duration::from_secs(t);
+
+            // 1. Spontaneous inbound traffic (t=0 is the initial packet that seeds `last_packet`).
+            if t == 0 || traffic(t) {
+                record_app_packet(&mut h, now_t); // stamps last_packet AND clears the streak
+            }
+
+            // 2. Resend policy (never answered: record_probe_reply is deliberately never called).
+            let last_packet_ago     = now_t.duration_since(h.last_packet);
+            let last_probe_sent_ago = h.last_probe_sent.map(|s| now_t.duration_since(s));
+            if should_send_probe(last_packet_ago, last_probe_sent_ago) {
+                record_probe_sent(&mut h, now_t);
+            }
+
+            // 3. HTTP-read verdict, computed exactly as `HttpState::health()` does.
+            let first_unanswered_ago = h.first_unanswered_probe_sent.map(|s| now_t.duration_since(s));
+            let probe_reply_ago      = h.last_probe_reply.map(|s| now_t.duration_since(s));
+            let last_packet_ago      = now_t.duration_since(h.last_packet);
+            let responsive = world_responsive(first_unanswered_ago, probe_reply_ago, last_packet_ago, timeout);
+            verdicts.push((t, responsive));
+        }
+        verdicts
+    }
+
+    /// THE original regression, fixed: a permanently silent zone (traffic only at t=0) is flagged
+    /// wedged once, and — across several full 30s resend cycles — never flickers back to `true`.
+    #[test]
+    fn never_answering_zone_stays_wedged_once_flagged() {
+        let run_secs = PROBE_INTERVAL.as_secs() * 6 + 60; // several resend cycles past the first wedge
+        let verdicts = simulate(run_secs, |_| false); // no traffic after t=0
+
+        let first_wedge = verdicts.iter().find(|(_, r)| !r).map(|(t, _)| *t)
+            .expect("a permanently silent zone must eventually be flagged wedged");
+        // Sanity: the timeline must actually span multiple resend cycles past the first wedge,
+        // or this test would pass vacuously without ever exercising a resend.
+        assert!(run_secs - first_wedge > PROBE_INTERVAL.as_secs() * 3,
+            "test timeline too short to cover several resend cycles past the first wedge verdict");
+
+        for &(t, responsive) in verdicts.iter().filter(|(t, _)| *t > first_wedge) {
+            assert!(!responsive,
+                "world_responsive flipped back to true at t={t}s after first wedging at t={first_wedge}s \
+                 — a never-answering zone must stay flagged wedged, not oscillate on every resend");
+        }
+    }
+
+    /// THE second-wedge false-alive (reviewer follow-up): wedge, then RECOVER via resumed spontaneous
+    /// traffic (never a probe reply), then WEDGE AGAIN. The second wedge must be detected —
+    /// `world_responsive` must go `false` again. Before the traffic-clear fix, the stale streak-start
+    /// from the first wedge sat older than every later probe forever, so the answered-clause stayed
+    /// permanently true and the re-wedge read as a confident false-ALIVE.
+    #[test]
+    fn re_wedge_after_traffic_recovery_is_detected() {
+        // Recovery = a sustained burst of spontaneous packets during [recover_from, recover_to];
+        // silence (real wedge) before and after.
+        let recover_from = 100;
+        let recover_to   = 130;
+        let run_secs     = 200;
+        let verdicts = simulate(run_secs, |t| (recover_from..=recover_to).contains(&t));
+
+        // First wedge: silence from t=0 → flagged false well before recovery begins.
+        let first_wedge = verdicts.iter().find(|(_, r)| !r).map(|(t, _)| *t)
+            .expect("first silence must be flagged wedged");
+        assert!(first_wedge < recover_from,
+            "the first wedge must be declared before recovery traffic starts (got t={first_wedge}s)");
+
+        // During recovery, resumed traffic proves the world is alive again → responsive.
+        assert!(verdicts.iter().any(|&(t, r)| (recover_from..=recover_to).contains(&t) && r),
+            "resumed spontaneous traffic must read as responsive again (recovery not detected)");
+
+        // Second wedge: after traffic stops at recover_to, silence resumes and a FRESH probe streak
+        // must time out → world_responsive false again. This is the assertion the fix is about.
+        let re_wedge = verdicts.iter()
+            .find(|&&(t, r)| t > recover_to && !r).map(|&(t, _)| t);
+        assert!(re_wedge.is_some(),
+            "the SECOND wedge (silence after traffic recovery) was NOT detected — world_responsive \
+             stayed true forever = a confident false-alive. Recovery traffic must re-arm the streak \
+             clock so the next silence is timed freshly.");
+        // And the timeline must run well past that re-wedge so this isn't a boundary fluke.
+        assert!(run_secs - re_wedge.unwrap() > PROBE_TIMEOUT_SECS,
+            "timeline too short to confirm the re-wedge verdict holds");
     }
 }
