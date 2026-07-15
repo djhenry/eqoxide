@@ -842,11 +842,14 @@ pub struct Collision {
     /// that. Bounds let a column probe span the zone regardless of what the caller asked for.
     z_min:     f32,
     z_max:     f32,
-    /// How many times the empty-column fallback in `column_hits` has fired since zone load. The
-    /// fallback is a DEGRADED path — it answers from inverted (mis-wound) art — so an agent must be
-    /// able to see that it is running: this is what `/v1/observe/debug` reports as `nav_degraded`.
-    /// Relaxed: a diagnostic counter, never read for control flow.
-    fallback_hits: std::sync::atomic::AtomicU64,
+    /// How many times `is_standable` has admitted a **DOWN-facing** (inverted-art) surface as ground
+    /// since zone load — i.e. answered a nav query from winding-blind ground whose true facing the
+    /// mesh does not confirm (D-2, #375). It is not wrong (qcat proves inverted-art floor is walkable),
+    /// but it is *unverified*, so an agent must be able to SEE that it is pathing on such ground rather
+    /// than be quietly handed it. Surfaced as `nav_support` on `/v1/observe/debug`. This REPLACES the
+    /// old `column_bottom`-fallback counter (that valve was deleted in D-2); the honesty signal did not
+    /// go with it. Relaxed: a diagnostic counter, never read for control flow.
+    facing_blind_hits: std::sync::atomic::AtomicU64,
     /// How many routes only existed at the MINIMUM clearance (`PLAYER_RADIUS`) — i.e. threaded a
     /// narrow door or a tight bridge with no margin to spare. Surfaced as `nav_tight` so an agent is
     /// never silently handed a riskier path than it thinks (`search_tiered`).
@@ -1022,7 +1025,7 @@ impl Collision {
         let cell_size = cell_size.max(1.0);
         if tris.is_empty() || min[0] == f32::MAX {
             return Collision { tris, tri_nz, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0,
-                z_min: 0.0, z_max: 0.0, fallback_hits: Default::default(), tight_plans: Default::default(),
+                z_min: 0.0, z_max: 0.0, facing_blind_hits: Default::default(), tight_plans: Default::default(),
                 water: None, from_collision_mesh, zone_line_regions: Vec::new() };
         }
         let cols = (((max[0] - min[0]) / cell_size).ceil() as usize + 1).max(1);
@@ -1045,7 +1048,7 @@ impl Collision {
             }
         }
         Collision { tris, tri_nz, cells, origin: min, cell_size, cols, rows, z_min, z_max,
-            fallback_hits: Default::default(), tight_plans: Default::default(), water: None, from_collision_mesh, zone_line_regions: Vec::new() }
+            facing_blind_hits: Default::default(), tight_plans: Default::default(), water: None, from_collision_mesh, zone_line_regions: Vec::new() }
     }
 
     /// How many times the floor-normal filter's empty-column fallback has fired since zone load, i.e.
@@ -1057,8 +1060,12 @@ impl Collision {
         self.tight_plans.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    pub fn fallback_hits(&self) -> u64 {
-        self.fallback_hits.load(std::sync::atomic::Ordering::Relaxed)
+    /// Count of nav queries answered from a DOWN-facing (inverted-art) surface since zone load — the
+    /// `nav_support` honesty signal (D-2, #375). Zero = every standable surface answered so far faced
+    /// UP (properly wound); non-zero = this zone's ground is partly inverted art and pathing there is
+    /// on winding-blind (unverified-facing) ground.
+    pub fn facing_blind_hits(&self) -> u64 {
+        self.facing_blind_hits.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Attach a zone water map so find_path can route swim descents. Call after `build`.
@@ -1330,6 +1337,13 @@ impl Collision {
                 if all[j].0 > z + SAME_SURFACE { headroom = all[j].0 - z; break; }
             }
             if headroom < NAV_AGENT_HEIGHT { continue; }         // under a ceiling — not standing room
+            // Honesty (#375): admitting a DOWN-facing surface as ground means we answered from
+            // winding-blind (inverted-art) geometry the mesh does not confirm is a floor. Count it so
+            // `/v1/observe/debug` can surface `nav_support` — a degraded/unverified mode must never be
+            // silent. (Correct per qcat, but the agent must be able to SEE it is on such ground.)
+            if nz < 0.0 {
+                self.facing_blind_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             keep.push((z, nz));
         }
         *all = keep;
@@ -2694,10 +2708,10 @@ impl Collision {
                 // Two guards, because the inset faces two hazards and `edge_ok` only sees one.
                 //
                 // `edge_ok` asks "is there still FLOOR there" — it is what stops the nudge shoving a
-                // waypoint off the mesh. It is structurally incapable of seeing a WALL: `column_hits`
-                // discards every triangle with `tri_nz <= 0` before intersecting, so a vertical face
-                // can never be a `nearest_floor` hit. There is floor at a wall's foot, so `edge_ok`
-                // happily green-lights a nudge straight INTO one (#358).
+                // waypoint off the mesh. It is structurally incapable of seeing a WALL: `is_standable`
+                // (in `column_hits`) rejects a near-vertical face via the flatness test `|nz| <
+                // NAV_NEAR_HORIZONTAL`, so a wall can never be a `nearest_floor` hit. There is floor at
+                // a wall's foot, so `edge_ok` happily green-lights a nudge straight INTO one (#358).
                 //
                 // That was survivable while the inset was small, but the tiered planner (see
                 // `search_tiered`) now plans at a GENEROUS `radius`, which makes `margin` — and so
@@ -3057,8 +3071,10 @@ mod tests {
     //     `fallback_never_admits…` queried AT roof height, ref_z=391.8 — a position a character is never
     //     in; the window defence is the real one.)
     // `the_fallback_reports_itself_so_nav_degraded_is_never_silent` is removed with the `column_bottom`
-    // valve it tested; D-3 replaces the honesty signal (`nav_degraded/inverted_floor_art` →
-    // `nav_support/facing_blind_ground`).
+    // valve it tested; the honesty signal is REPLACED IN THIS PR (folded from D-3, review Fix A):
+    // `nav_degraded/inverted_floor_art` → `nav_support/facing_blind_ground`, now driven by
+    // `facing_blind_hits` (a down-facing surface admitted as ground), so there is no dead-signal window
+    // where the client falsely reports "properly wound" while on inverted-art ground.
     //
     // The two tests below that assert inverted GROUND is still found (`column_whose_only_surface_is_
     // inverted…`, `a_fully_inverted_zone…`) STILL PASS under D-2 (an inverted floor with clearance above
@@ -3637,9 +3653,9 @@ mod tests {
 
     /// The waypoint inset (#312) must never nudge a waypoint INTO a wall.
     ///
-    /// Its original guard, `edge_ok(nudged)`, cannot prevent that — and not by accident:
-    /// `column_hits` discards every triangle with `tri_nz <= 0` before intersecting, so a vertical
-    /// face is *structurally incapable* of being a `nearest_floor` hit. There is floor at a wall's
+    /// Its original guard, `edge_ok(nudged)`, cannot prevent that — and not by accident: `is_standable`
+    /// (in `column_hits`) rejects a near-vertical face via its flatness test `|nz| < NAV_NEAR_HORIZONTAL`,
+    /// so a wall is *structurally incapable* of being a `nearest_floor` hit. There is floor at a wall's
     /// foot, so `edge_ok` reports "walkable" right up against one. That was survivable while the
     /// inset was small; the tiered planner now plans at a GENEROUS radius, which scales `margin` and
     /// so the push. A bigger push behind a wall-blind guard walks the character CLOSER to walls than
@@ -3666,8 +3682,8 @@ mod tests {
         let col = Collision::build(&ZoneAssets {
             terrain: vec![floor, wall], objects: vec![], textures: vec![] }, 8.0);
         // The blind spot itself: there is floor at the wall's FOOT, so the inset's only guard reads
-        // "walkable" right up against it. `column_hits` drops every triangle with tri_nz <= 0 before
-        // intersecting, so a vertical face can never be a `nearest_floor` hit — by construction.
+        // "walkable" right up against it. `is_standable`'s flatness test (`|nz| < NAV_NEAR_HORIZONTAL`)
+        // rejects the near-vertical face, so a wall can never be a `nearest_floor` hit — by construction.
         assert!(col.nearest_floor(20.0, 10.0, 0.0, 3.0, 8.0).is_some(),
             "nearest_floor is structurally blind to the wall — that is the whole point");
 
@@ -4825,6 +4841,32 @@ mod tests {
     }
 
 
+    /// **THE `nav_support` HONESTY SIGNAL (D-2, review Fix A).** Admitting a DOWN-facing (inverted-art)
+    /// surface as ground is correct (qcat proves it walkable) but UNVERIFIED — so it must be visible,
+    /// not silent. `facing_blind_hits` counts it; `/v1/observe/debug` surfaces it as `nav_support`. This
+    /// pins: a cleanly-wound (up-facing) floor NEVER trips it; an inverted (down-facing) floor DOES —
+    /// so `nav_support` can never read `null` ("all properly wound") while nav is on inverted ground
+    /// (the confident-falsehood the review caught when the old `column_bottom` counter went dead).
+    #[test]
+    fn facing_blind_ground_admission_is_counted_for_nav_support() {
+        // Clean zone: an up-facing floor. Answering from it must NOT trip the signal.
+        let clean = Collision::build(&ZoneAssets {
+            terrain: vec![floor_up(0.0, -100.0, 100.0)], objects: vec![], textures: vec![] }, 32.0);
+        assert!(clean.nearest_floor(0.0, 0.0, 0.0, 5.0, 20.0).is_some(), "the clean floor is standable");
+        assert_eq!(clean.facing_blind_hits(), 0,
+            "a properly-wound floor must NOT trip nav_support — else it cries wolf everywhere");
+
+        // Inverted zone: a lone DOWN-facing floor (open above → standable per qcat). Answering from it
+        // MUST trip the signal — the agent is on unverified-winding ground.
+        let inverted = Collision::build(&ZoneAssets {
+            terrain: vec![ceiling_down(0.0, -100.0, 100.0)], objects: vec![], textures: vec![] }, 32.0);
+        assert!(inverted.nearest_floor(0.0, 0.0, 0.0, 5.0, 20.0).is_some(),
+            "the inverted floor is standable (facing-blind, the #375 fix)");
+        assert!(inverted.facing_blind_hits() > 0,
+            "admitting a down-facing surface as ground MUST be counted — nav_support cannot read null \
+             while pathing on inverted-art ground (the net-new lie deleting column_bottom would create)");
+    }
+
     /// **§C REVIEW CONTRACT (D-2, mutation-relevant): the destination is judged on its OWN column,
     /// never vetoed for being far from the source `ref_z`.** A large DROP's landing floor must be
     /// standable when the planner probes it from the SOURCE cell's height — otherwise the controlled-
@@ -4858,10 +4900,17 @@ mod tests {
     /// (`footprint_clear`), and split them by what `is_standable` decides:
     ///   * **RECOVERED** — `is_standable` accepts it (a floor the old facing filter would have deleted
     ///     for being down-facing, now correctly kept). This is the #375 win.
-    ///   * **HEADROOM-REJECT** — `is_standable` rejects it purely because `headroom < NAV_AGENT_HEIGHT`
-    ///     (a roof close above). The Q1 question is whether these are real ceilings (correct) or legit
-    ///     low ledges (a seal). Cross-checked against route-success (≥ 99.50%): if these were real
-    ///     floors, routes over them would fail — and route-success did NOT drop.
+    ///   * **HEADROOM-REJECT** — `is_standable` rejects it because `headroom < NAV_AGENT_HEIGHT` (a
+    ///     solid surface close above). **These are NOT all proven to be ceilings.** A mutation-checked
+    ///     test (`close_roof_ceiling_is_rejected_by_headroom`) confirms real close-roof CEILINGS are
+    ///     among them; and a sub-`NAV_AGENT_HEIGHT` space is correctly rejected as below body height
+    ///     (a 5u body cannot stand in <5u clearance — `NAV_AGENT_HEIGHT = 5.0` matches the controller's
+    ///     `foot+4` chest ray). But the corpus CANNOT distinguish a rejected ceiling from a fully
+    ///     sealed pocket: route-success samples start/goal via `nearest_floor`, so a sealed pocket
+    ///     yields no pairs there and is invisible to it — route-success holding is NOT proof every
+    ///     reject is a ceiling. The seal MECHANISM is real (`floor@0 + roof@4` → `column_floors`
+    ///     returns only `[4.0]`, deleting the real floor for <5u headroom). The `<5u` rejection is
+    ///     defensible (below body height); we do NOT claim all rejects are ceilings.
     ///   * **STEEP-REJECT** — rejected for `|nz| < NAV_NEAR_HORIZONTAL` (a wall/steep slope A*'s grade
     ///     limit rejects anyway).
     ///
@@ -4908,9 +4957,12 @@ mod tests {
             }
             println!("{zone:<12} {fits:>10} {recovered:>10} {head_rej:>12} {steep_rej:>10}");
         }
-        println!("\n=== Q1: 'recovered' = inverted/any floor is_standable KEEPS (the #375 win). \
-            'headroom-rej' = rejected for a roof < {NAV_AGENT_HEIGHT}u above (real ceilings — cross-checked \
-            by route-success ≥ 99.50%, which did NOT drop, so these are not legit floors being sealed). ===");
+        println!("\n=== Q1: 'recovered' = floor is_standable KEEPS (the #375 win). 'headroom-rej' = \
+            rejected for a solid surface < {NAV_AGENT_HEIGHT}u above. A mutation-checked test confirms \
+            close-roof CEILINGS are among these; sub-{NAV_AGENT_HEIGHT}u spaces are also rejected as \
+            below body height (correct). Route-success held, BUT the corpus cannot distinguish a rejected \
+            ceiling from a sealed pocket (it samples via nearest_floor, so a sealed pocket is invisible \
+            to it) — this is NOT proof every reject is a ceiling. ===");
     }
 
     /// **THE FLOOR-MODEL DISAGREEMENT SCAN — a corpus indicator for D-2 (#375).** Counts, over a zone
