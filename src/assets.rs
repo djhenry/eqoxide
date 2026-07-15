@@ -810,6 +810,11 @@ struct Search {
     progress: f32,
     /// Nodes whose expansion completed — how big the explored component is.
     closed_n: usize,
+    /// The CLOSEST-to-goal standing position the search actually reached (`best_toward`), in world
+    /// space `[east, north, floor_z]`. Carried so the COLD honesty path (`find_path_ex`) can name
+    /// the obstruction that ended the journey — the wall between the frontier and the goal (#378
+    /// Phase 2, design §5a). `None` when the search closed nothing useful.
+    best_toward: Option<[f32; 3]>,
 }
 
 impl Search {
@@ -2686,6 +2691,12 @@ impl Collision {
                 goal[0], goal[1], goal[2], goal_floor,
                 match ctx.goal_region { Some(i) => format!(" (zone-line region {i})"), None => String::new() });
         }
+        // The closest-to-goal STANDING POSITION the search reached, in world space — carried out so
+        // the cold honesty path can name the obstruction that ended the journey (#378 Phase 2).
+        let best_toward_xyz = best_toward.map(|bk| {
+            let ctr = center(bk.0, bk.1);
+            [ctr[0], ctr[1], *floor_of.get(&bk).unwrap_or(&goal_floor)]
+        });
         // How much straight-line ground toward the goal the best-reached cell actually closes. The
         // caller uses this to decide whether a partial route is a STAGE of a journey (worth walking,
         // then re-planning) or a SHUFFLE into a wall (#337) — see `PARTIAL_MIN_UNITS`.
@@ -2717,7 +2728,7 @@ impl Collision {
                             None => tracing::info!("find_path: NO ROUTE — frontier closed after {} nodes \
                                 (start_floor={start_floor}, goal_floor={goal_floor})", closed.len()),
                         }
-                        return Search { limit, progress, closed_n: closed.len(), ..Default::default() };
+                        return Search { limit, progress, closed_n: closed.len(), best_toward: best_toward_xyz, ..Default::default() };
                     }
                 }
             }
@@ -2844,6 +2855,7 @@ impl Collision {
             no_route: None,
             progress: if reached_goal { 0.0 } else { progress },
             closed_n: closed.len(),
+            best_toward: best_toward_xyz,
         }
     }
 }
