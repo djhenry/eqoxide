@@ -259,13 +259,17 @@ genuinely relevant to this bug. It is covered as follows, and the split is delib
   more intent. Until then, the water-axis *correctness* is gated (the qcat pair); only its *corpus breadth* is
   outstanding.
 
-## Staying honest
+## Staying honest — DONE IN D-2 (folded from D-3, review Fix A)
 
-Today a counter `nav_degraded{reason:"inverted_floor_art"}` fires when the old column-bottom patch recovers
-inverted ground. That patch goes away with PR-D, but the signal must not vanish — replace it with
-`nav_support{reason:"facing_blind_ground", queries:N}`, a per-zone counter (reset on zone change, never
-silently absent) telling an agent "this zone's floor is partly inverted art; pathing here is on winding-blind
-ground." A degraded/fallback mode must never be silent.
+The old counter `nav_degraded{reason:"inverted_floor_art"}` fired when the column-bottom patch recovered
+inverted ground. D-2 deletes that patch — and, critically, deleting it removed the counter's only writer, so if
+left as-is the client would report `nav_degraded: null` ("every nav query answered from PROPERLY WOUND floors")
+in exactly the inverted-art zones (permafrost/highpass/neriakc/qcat) where nav is now on winding-blind ground:
+a NET-NEW confident falsehood D-2 would introduce. So the signal is REPLACED in this same PR (not deferred to
+D-3): **`nav_support{reason:"facing_blind_ground", queries:N}`**, driven by `facing_blind_hits` — incremented
+whenever `is_standable` admits a DOWN-facing surface as ground — surfaced on `/v1/observe/debug`, documented in
+`docs/http-api.md`. `null` = every standable surface so far faced up; non-null = pathing on unverified-winding
+ground. A degraded/unverified mode must never be silent, and there is no D-2→D-3 window where it is.
 
 ## The client-vs-art split (your "Both" decision)
 
