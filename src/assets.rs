@@ -2754,6 +2754,30 @@ impl Collision {
         let edge_ok = |x: f32, y: f32, z: f32| -> bool {
             self.nearest_floor(x, y, z, 3.0, 8.0).map_or(false, |f| (f - z).abs() <= 8.0)
         };
+        // WALL-AWARE half (#378 Phase 2 / the qcat L-corner). `edge_ok` sees only geometry that is
+        // MISSING (drops, ledges, waterlines). A WALL standing on continuous floor is invisible to
+        // it — there is floor at the wall's foot — so a route along a narrow ledge (wall one side,
+        // drop the other) got pushed off the DROP but never off the WALL, and the walker pressed
+        // into the wall trying to round the corner (the live qcat symptom). Probe for a solid face
+        // at the body's own probe heights within its standing-room distance: a wall that close in a
+        // direction is a hazard to push AWAY from, exactly as a missing floor is. On a narrow ledge
+        // the wall push and the drop push point the SAME way — toward the ledge centre — so the
+        // waypoint (and the carrot the walker steers at) sits down the middle and the corner is
+        // roundable.
+        //
+        // DETECTION distance is the body `radius` (standing room = keep the body off the wall), not
+        // the smaller in-cell `margin` — a cell centre sits ~1u from a wall on the 2u fine grid, and
+        // a `margin`-only probe (0.9u there) would miss it. NUDGE magnitude stays `margin` (capped
+        // to `cell*0.45` so a push never overshoots into the next cell). A corridor exactly
+        // `2·radius` wide has a wall at `radius` on BOTH sides → the two pushes cancel → the centre
+        // line is kept, so a minimum-width corridor is never sealed.
+        let body = &crate::traversability::PLAYER_BODY;
+        let wall_probe = radius.max(margin);
+        let wall_near = |x: f32, y: f32, z: f32, ex: f32, ny: f32| -> bool {
+            let (dx, dy) = (ex * wall_probe, ny * wall_probe);
+            body.planner_probes().iter().any(|&hz|
+                self.nearest_hit_t([x, y, z + hz], [x + dx, y + dy, z + hz]).is_some())
+        };
         // The inset's occupancy guard, through the one authority (#378) — with NO ledge margin:
         // the inset asks "can the body stand exactly here", not "does this spot have route-choice
         // standing room". Margins are the search's concern; one here would refuse nudges the
@@ -2762,18 +2786,20 @@ impl Collision {
         for i in 0..path.len() {
             let [x, y, z] = path[i];
             let mut push = [0.0f32, 0.0f32];
-            if !edge_ok(x + margin, y, z) { push[0] -= 1.0; }
-            if !edge_ok(x - margin, y, z) { push[0] += 1.0; }
-            if !edge_ok(x, y + margin, z) { push[1] -= 1.0; }
-            if !edge_ok(x, y - margin, z) { push[1] += 1.0; }
+            // A side is a hazard if the FLOOR runs out there (edge) OR a WALL stands there. Both
+            // push away; opposing hazards (a corridor's two walls, a bridge's two rails) CANCEL, so
+            // the centre line is kept and only genuinely one-sided hazards move the waypoint.
+            if !edge_ok(x + margin, y, z) || wall_near(x, y, z, 1.0, 0.0) { push[0] -= 1.0; }
+            if !edge_ok(x - margin, y, z) || wall_near(x, y, z, -1.0, 0.0) { push[0] += 1.0; }
+            if !edge_ok(x, y + margin, z) || wall_near(x, y, z, 0.0, 1.0) { push[1] -= 1.0; }
+            if !edge_ok(x, y - margin, z) || wall_near(x, y, z, 0.0, -1.0) { push[1] += 1.0; }
             let len = (push[0] * push[0] + push[1] * push[1]).sqrt();
             if len > 0.0 {
                 let (nx, ny) = (x + push[0] / len * margin, y + push[1] / len * margin);
                 // The nudge destination must be OCCUPIABLE — floor AND wall axes, through the one
                 // authority (#378). The floor half is what stops the nudge shoving a waypoint off
-                // the mesh; the wall half exists because a floor probe is structurally incapable of
-                // seeing a wall (`is_standable` rejects near-vertical faces, and there is floor at a
-                // wall's foot — #358), so a floor-only guard green-lights a nudge straight into one.
+                // the mesh; the wall half stops it nudging straight INTO the far wall of a corridor
+                // narrower than 2·margin (where a one-sided push would otherwise cross the centre).
                 if inset_trav.can_occupy_fast(crate::traversability::Point::new([nx, ny], z)) {
                     path[i] = [nx, ny, z];
                 }
@@ -4204,6 +4230,36 @@ mod tests {
             indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
             center: [0.0; 3], render_mode: RenderMode::Opaque, anim: None,
         }
+    }
+
+    /// **THE WALL-AWARE INSET (#378 Phase 2 / the qcat L-corner).** A route running along a ledge
+    /// with a WALL on one side and continuous floor at its foot must be nudged OFF the wall — the
+    /// old floor-only inset could not see a wall standing on floor (#358), so the walker pressed
+    /// into it. Isolated here from the other two wall-avoidance mechanisms so it is the ONLY thing
+    /// that can move the route: a MINIMUM-tier BOUNDED plan at `cell = 8` runs with no standing-room
+    /// field filter (bounded ⇒ minimum tier) AND no hug cost (`cell > SWEPT_EDGE_MAX_CELL`). That is
+    /// exactly the qcat case — a single lane the field/hug cost cannot improve, only the inset can.
+    ///
+    /// Mutation check (verified at authoring time): drop the `wall_near(..)` disjunct from the inset
+    /// push and the interior waypoints sit ~1u from the wall (unmoved) → RED.
+    #[test]
+    fn wall_aware_inset_pushes_a_ledge_route_off_the_wall() {
+        // Continuous floor east[-5,20]; a wall at east=8 standing ON it (floor at its foot, so the
+        // floor-only `edge_ok` is blind to it). The east=7 coarse cell centre sits 1u from the wall.
+        let col = Collision::build(&ZoneAssets {
+            terrain: vec![floor_band(0.0, -5.0, 20.0), wall_east(8.0, 0.0, 10.0)],
+            objects: vec![], textures: vec![] }, 32.0);
+        let path = col.find_path_res([7.0, -30.0, 0.0], [7.0, 30.0, 0.0], 1.0, &[], true,
+            8.0, Some(200.0), 0.0, PlanCtx::default()).expect("route north along the ledge");
+        // Interior waypoints (start is prepended at the char's real pos; the goal-cell end is pinned)
+        // must be pushed clear of the wall@8. Pre-inset they sit at east=7 (1u clearance); the
+        // wall-aware inset moves them ~1u west → >=1.5u clearance.
+        let interior: Vec<_> = path.iter().skip(1).take(path.len().saturating_sub(2)).collect();
+        assert!(!interior.is_empty(), "route should have interior waypoints: {path:?}");
+        let closest = interior.iter().map(|w| 8.0 - w[0]).fold(f32::MAX, f32::min);
+        assert!(closest >= 1.5,
+            "wall-aware inset must push interior waypoints >=1.5u off the wall@8 \
+             (closest {closest:.2}): {path:?}");
     }
 
 
