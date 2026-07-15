@@ -2255,7 +2255,12 @@ impl Collision {
         } else {
             0.0
         };
-        let mut margin_ok: std::collections::HashMap<(i32, i32, i32), bool> = std::collections::HashMap::new();
+        // THE ONE AUTHORITY on what blocks the body, for this plan (#378). The walk-edge test and
+        // the waypoint inset below both consult it — they used to be independent predicates that
+        // could not see each other's hazards. It owns the per-plan ground-margin memo that used to
+        // live here as a bare HashMap.
+        let trav = crate::traversability::Traversability::new(
+            self, radius, cell, ledge_margin, floating_surface.is_some());
         // Aggro-avoidance (#67): softly bias A* AWAY from cells near NPCs so long routes skirt mob
         // camps instead of plowing through them and getting the player killed. Proactive (before
         // aggro) and faction-agnostic — the client has no broad faction data, so it avoids ALL
@@ -2389,22 +2394,19 @@ impl Collision {
                     }
                     let nkey = (nc, nr, qf(nf));
                     if closed.contains(&nkey) { continue; }
-                    // Reachability rays. The CHEST ray (3u) alone SKIMS OVER a low invisible-boundary
-                    // lip (~2–3u) — A* then routes onto the wall's high side, where the feet-level
-                    // walker snags and strands (#239). Add a FEET-level ray just above the walker's
-                    // real max step-up (STEP_UP + ground-snap ≈ 2.5u): a lip taller than the walker can
-                    // mount blocks the edge, matching what the native client's feet-level sphere does.
-                    const FEET_CLR: f32 = crate::traversability::PLAYER_BODY.feet_clr;
-                    if !self.edge_clear([a[0], a[1], cz + CHEST], [b[0], b[1], nf + CHEST], radius, cell) { continue; }
-                    if !self.edge_clear([a[0], a[1], cz + FEET_CLR], [b[0], b[1], nf + FEET_CLR], radius, cell) { continue; }
-                    // LEDGE margin. The rays above only see geometry that is IN THE WAY; this is the
-                    // one test that sees geometry that is MISSING (a drop, a bridge edge, a
-                    // waterline). Only the GENEROUS tier asks for it: at the minimum tier the promise
-                    // is exactly "the character fits", which is what keeps a narrow bridge or a
-                    // gangplank routable at all (see `search_tiered`). Memoised per (cell, floor)
-                    // — a cell is reached from up to 8 neighbours and the probe is 4 column queries.
-                    if ledge_margin > 0.0 && !*margin_ok.entry(nkey).or_insert_with(||
-                        self.ground_margin_ok(b[0], b[1], nf, ledge_margin)) { continue; }
+                    // THE WALK-EDGE TEST, through the one authority (#378). Two probe heights from
+                    // the shared Body — the CHEST ray (the controller's own contact height, #386)
+                    // and a FEET ray just above the walker's real max step-up (a low invisible-
+                    // boundary lip the chest ray skims over blocks the feet ray, #239) — each swept
+                    // across the body's width (fine grid) or cast as a centre ray (coarse), plus
+                    // the LEDGE margin: the one test that sees geometry that is MISSING (a drop, a
+                    // bridge edge, a waterline). The margin is asked for only above the minimum
+                    // tier — at `PLAYER_RADIUS` the promise is exactly "the character fits", which
+                    // is what keeps a narrow bridge or gangplank routable at all (`search_tiered`)
+                    // — and is memoised per (cell, floor) inside `trav` for this plan.
+                    if !trav.can_traverse_fast(
+                        crate::traversability::Point::new([a[0], a[1]], cz),
+                        crate::traversability::Point::new([b[0], b[1]], nf)) { continue; }
                     let step = (((dc * dc + dr * dr) as f32).sqrt()) * cell + (nf - cz).abs() * 0.5
                         + aggro_cost(b[0], b[1]);
                     let tentative = g_cur + step;
@@ -2698,6 +2700,11 @@ impl Collision {
         let edge_ok = |x: f32, y: f32, z: f32| -> bool {
             self.nearest_floor(x, y, z, 3.0, 8.0).map_or(false, |f| (f - z).abs() <= 8.0)
         };
+        // The inset's occupancy guard, through the one authority (#378) — with NO ledge margin:
+        // the inset asks "can the body stand exactly here", not "does this spot have route-choice
+        // standing room". Margins are the search's concern; one here would refuse nudges the
+        // search accepted.
+        let inset_trav = crate::traversability::Traversability::new(self, radius, cell, 0.0, false);
         for i in 0..path.len() {
             let [x, y, z] = path[i];
             let mut push = [0.0f32, 0.0f32];
@@ -2708,21 +2715,12 @@ impl Collision {
             let len = (push[0] * push[0] + push[1] * push[1]).sqrt();
             if len > 0.0 {
                 let (nx, ny) = (x + push[0] / len * margin, y + push[1] / len * margin);
-                // Two guards, because the inset faces two hazards and `edge_ok` only sees one.
-                //
-                // `edge_ok` asks "is there still FLOOR there" — it is what stops the nudge shoving a
-                // waypoint off the mesh. It is structurally incapable of seeing a WALL: `is_standable`
-                // (in `column_hits`) rejects a near-vertical face via the flatness test `|nz| <
-                // NAV_NEAR_HORIZONTAL`, so a wall can never be a `nearest_floor` hit. There is floor at
-                // a wall's foot, so `edge_ok` happily green-lights a nudge straight INTO one (#358).
-                //
-                // That was survivable while the inset was small, but the tiered planner (see
-                // `search_tiered`) now plans at a GENEROUS `radius`, which makes `margin` — and so
-                // the push — correspondingly bigger. A bigger push validated by a wall-blind guard is
-                // how you end up walking closer to walls than before. So also require the character's
-                // own collision volume to actually FIT where we are moving it: `footprint_clear` is
-                // the same ring test the controller's depenetration net uses.
-                if edge_ok(nx, ny, z) && self.footprint_clear(nx, ny, z, radius, 8) {
+                // The nudge destination must be OCCUPIABLE — floor AND wall axes, through the one
+                // authority (#378). The floor half is what stops the nudge shoving a waypoint off
+                // the mesh; the wall half exists because a floor probe is structurally incapable of
+                // seeing a wall (`is_standable` rejects near-vertical faces, and there is floor at a
+                // wall's foot — #358), so a floor-only guard green-lights a nudge straight into one.
+                if inset_trav.can_occupy_fast(crate::traversability::Point::new([nx, ny], z)) {
                     path[i] = [nx, ny, z];
                 }
             }
