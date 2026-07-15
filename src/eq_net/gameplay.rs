@@ -314,6 +314,9 @@ pub async fn run_gameplay_phase(
                     corpse_id
                 );
             }
+            LootTickAction::OpenTimedOut(corpse_id) => {
+                apply_loot_open_timeout(&mut gs, corpse_id);
+            }
             LootTickAction::TimedOut => {
                 // OP_EndLootRequest got no OP_LootComplete ack in time. Say so honestly instead of
                 // fabricating "Looting complete", and unwedge the queue so later corpses aren't
@@ -712,6 +715,14 @@ const LOOT_INACTIVITY_SECS: f32 = 2.0;
 /// How long to wait for OP_LootComplete after sending OP_EndLootRequest before giving up and
 /// reporting a failure instead of wedging the queue forever.
 const LOOT_END_TIMEOUT_SECS: f32 = 5.0;
+/// How long to wait for the server's OP_MoneyOnCorpse accept/refuse ack after sending
+/// OP_LootRequest before giving up (#370). Every server code path replies immediately (see
+/// #370's issue body — no known silent-drop path), so this only fires on genuine packet loss on
+/// the unreliable channel; it exists purely so that loss can never wedge `pending_loot` forever.
+/// Sized the same as `LOOT_END_TIMEOUT_SECS` (its mirror-image timeout on the other side of a
+/// confirmed session) — both bound "waiting on one specific server ack" and both fire well after
+/// any real round trip but long before an agent would give up waiting on its own.
+const LOOT_OPEN_TIMEOUT_SECS: f32 = 5.0;
 
 /// What the gameplay loop should do this tick for the auto-loot pipeline.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -723,6 +734,11 @@ pub enum LootTickAction {
     /// Item echoes have gone quiet on a CONFIRMED session — send `OP_EndLootRequest` for this
     /// corpse (payload must be its spawn_id, not empty — see `OP_END_LOOT_REQUEST`'s doc).
     Close(u32),
+    /// `OP_LootRequest` was sent but no `OP_MoneyOnCorpse` accept/refuse ack arrived within the
+    /// timeout (#370) — report a failure and unwedge the queue. Distinct from `TimedOut`: this
+    /// session was never even confirmed as open, so treating it as a `Close` would falsely read
+    /// as "corpse opened and was empty" (the exact #346 lie this state machine exists to forbid).
+    OpenTimedOut(u32),
     /// `OP_EndLootRequest` was sent but no `OP_LootComplete` arrived within the timeout — report a
     /// failure and unwedge the queue; never silently claim "complete".
     TimedOut,
@@ -764,9 +780,18 @@ pub fn loot_tick_action(state: &LootTickState, now: std::time::Instant) -> LootT
         return LootTickAction::None;
     }
     if !state.confirmed {
-        // Sent but not yet accepted/refused by the server — wait. A refusal closes
+        // Sent but not yet accepted/refused by the server — normally wait. A refusal closes
         // `session_active` immediately (see apply_money_on_corpse), so reaching here just means
-        // the accept/refuse ack hasn't landed yet.
+        // the accept/refuse ack hasn't landed *yet*. But if OP_MoneyOnCorpse is lost entirely on
+        // the wire, "yet" never arrives — bound the wait so a lost ack can't wedge every later
+        // corpse behind this one forever (#370).
+        if let Some(t) = state.last_activity {
+            if now.duration_since(t).as_secs_f32() > LOOT_OPEN_TIMEOUT_SECS {
+                if let Some(id) = state.current_corpse {
+                    return LootTickAction::OpenTimedOut(id);
+                }
+            }
+        }
         return LootTickAction::None;
     }
     if let Some(sent) = state.end_requested_at {
@@ -783,6 +808,32 @@ pub fn loot_tick_action(state: &LootTickState, now: std::time::Instant) -> LootT
         }
     }
     LootTickAction::None
+}
+
+/// Apply a `LootTickAction::OpenTimedOut` outcome to `GameState`: the server never acked our
+/// OP_LootRequest with an OP_MoneyOnCorpse accept/refuse (lost on the wire, #370). Report it
+/// honestly — never a silent forever-wait, never a fabricated success — and clear the session so
+/// the queue can drain to the next corpse.
+///
+/// The event's `kind` is **`loot_open_timeout`**, deliberately DISTINCT from the confirmed-side
+/// `TimedOut` arm's `failed` kind (and from success/abort/normal-close). `/v1/events/loot` exposes
+/// `kind` as the field agents dispatch on, so "corpse never opened" (here) must be machine-
+/// separable from "corpse opened but never closed" — not merely different free text (#370 review).
+fn apply_loot_open_timeout(gs: &mut GameState, corpse_id: u32) {
+    gs.loot_current_corpse = None;
+    gs.loot_session_active = false;
+    gs.loot_confirmed = false;
+    gs.loot_last_activity = None;
+    gs.loot_end_requested_at = None;
+    let msg = format!(
+        "Loot failed — no response from the server opening corpse_id={}",
+        corpse_id
+    );
+    gs.log_msg("loot", &msg);
+    gs.push_event("loot", "loot_open_timeout", "system", true, &msg);
+    tracing::warn!("EQ: auto-loot: {}", msg);
+    // Reset queued_at so the next corpse gets its own delay window.
+    gs.loot_queued_at = gs.pending_loot.front().map(|_| std::time::Instant::now());
 }
 
 /// Publish the network thread's `GameState` for lock-free reads by the render/HTTP threads. Called
@@ -912,19 +963,69 @@ mod loot_tick_tests {
     /// THE #346 REGRESSION. The old code closed the session — and logged "Looting complete" —
     /// after 2s of silence following the SEND of OP_LootRequest, whether or not the server ever
     /// accepted it. A corpse that never opened must not look like a corpse that opened and was
-    /// empty, so an unconfirmed session must never time its way into a close.
+    /// empty, so an unconfirmed session must never time its way into a `Close` — it may only ever
+    /// resolve via `OpenTimedOut` (see below), a distinct, explicit failure.
     #[test]
-    fn active_but_unconfirmed_session_never_closes_no_matter_how_long_it_waits() {
+    fn active_but_unconfirmed_session_waits_within_open_timeout() {
         let now = Instant::now();
         let st = LootTickState {
             session_active: true,
-            confirmed: false, // server never sent an accepting OP_MoneyOnCorpse
+            confirmed: false, // server never sent an accepting OP_MoneyOnCorpse — yet
+            current_corpse: Some(9),
+            last_activity: Some(now - Dur::from_secs(1)),
+            ..Default::default()
+        };
+        assert_eq!(loot_tick_action(&st, now), LootTickAction::None,
+            "an unconfirmed session must wait for the server's accept/refuse ack, not close early");
+    }
+
+    /// THE #370 FIX. If `OP_MoneyOnCorpse` never arrives at all (lost on the wire), the old code
+    /// returned `None` unconditionally for an unconfirmed session — forever. That silently wedges
+    /// `pending_loot`: every corpse queued after this one waits behind a session that can never
+    /// resolve, and the agent is never told why. Past `LOOT_OPEN_TIMEOUT_SECS` it must instead
+    /// resolve to an explicit, distinguishable failure — NOT `None` (permanently pending) and NOT
+    /// `Close` (which would falsely read as "corpse opened and was empty", the #346 lie).
+    #[test]
+    fn active_but_unconfirmed_session_past_open_timeout_reports_explicit_failure() {
+        let now = Instant::now();
+        let st = LootTickState {
+            session_active: true,
+            confirmed: false, // OP_MoneyOnCorpse never arrived — ack lost
             current_corpse: Some(9),
             last_activity: Some(now - Dur::from_secs(3600)),
             ..Default::default()
         };
-        assert_eq!(loot_tick_action(&st, now), LootTickAction::None,
-            "an unconfirmed session must wait for the server's accept/refuse ack, not a timer");
+        assert_eq!(loot_tick_action(&st, now), LootTickAction::OpenTimedOut(9),
+            "a lost accept/refuse ack must unwedge into an explicit failure, never stay pending forever");
+    }
+
+    /// #370 REVIEW. The `OpenTimedOut` outcome must be MACHINE-distinguishable from the confirmed-
+    /// side `TimedOut` (which pushes kind `failed`) — agents dispatch on the event's `kind`, not its
+    /// free text, so "corpse never opened" and "corpse opened but never closed" must not collide on
+    /// the same kind. This pins the distinct kind AND the session teardown in one place.
+    #[test]
+    fn open_timeout_pushes_a_distinct_event_kind_and_clears_the_session() {
+        let mut gs = GameState::new();
+        gs.loot_session_active = true;
+        gs.loot_confirmed = false;
+        gs.loot_current_corpse = Some(9);
+        gs.loot_last_activity = Some(Instant::now());
+
+        apply_loot_open_timeout(&mut gs, 9);
+
+        let ev = gs.chat_events.back().expect("an open-timeout must push an agent-visible event");
+        assert_eq!(ev.category, "loot");
+        assert_eq!(ev.kind, "loot_open_timeout",
+            "an unconfirmed-open timeout must carry its OWN kind so an agent filtering on kind can \
+             separate it from the confirmed-side `failed`/`complete`/`aborted` outcomes");
+        assert_ne!(ev.kind, "failed", "must not collide with the confirmed-side TimedOut kind");
+
+        // The session is fully torn down so `pending_loot` can drain to the next corpse.
+        assert!(!gs.loot_session_active);
+        assert!(!gs.loot_confirmed);
+        assert_eq!(gs.loot_current_corpse, None);
+        assert_eq!(gs.loot_last_activity, None);
+        assert_eq!(gs.loot_end_requested_at, None);
     }
 
     #[test]
