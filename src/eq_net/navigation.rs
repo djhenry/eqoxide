@@ -1426,6 +1426,7 @@ impl Navigator {
             self.planner.cancel();
             self.awaiting_first_plan = false;
             self.set_nav_state("idle");
+            self.nav_state.lock().unwrap().tier = None; // no route committed → no per-route tier
 
             let mut shared = self.zone_points.lock().unwrap();
             // Start fresh with server entries.
@@ -1497,6 +1498,11 @@ impl Navigator {
         if s.state != state || s.reason != reason {
             s.state = state.to_string();
             s.reason = reason;
+            // A state transition retires the previous terminal's blockage (#378 Phase 2): the
+            // `nav_blocked_by` payload belongs to ONE `no_path`, and leaving it set across a fresh
+            // `navigating` would be a stale lie. `stop_nav_blocked` re-sets it immediately after.
+            s.blocked_goal = None;
+            s.blocked_frontier = None;
         }
     }
 
@@ -1515,9 +1521,28 @@ impl Navigator {
     /// machine-readable reason, the message log, and the trace. A nav failure that says nothing is
     /// the worst failure mode this client has — it cost the project months (#337).
     fn stop_nav(&mut self, gs: &mut GameState, state: &str, reason: &str, msg: &str) {
+        self.stop_nav_blocked(gs, state, reason, None, None, msg);
+    }
+
+    /// [`stop_nav`], additionally publishing the agent-honesty blockage payload (#378 Phase 2). The
+    /// two `Blockage`es come from the COLD diagnosis inside `PlanOutcome::Unreachable`; they are set
+    /// on `NavStatus` (surfaced as `nav_blocked_by` on /v1/observe/debug) so an agent handed a
+    /// terminal `no_path` learns WHAT stopped it and WHERE, not just that it stopped.
+    fn stop_nav_blocked(&mut self, gs: &mut GameState, state: &str, reason: &str,
+        goal_blk: Option<crate::traversability::Blockage>,
+        frontier_blk: Option<crate::traversability::Blockage>, msg: &str)
+    {
         tracing::warn!("NAV: {msg}");
         gs.log_msg("zone", msg);
         self.set_nav_state_because(state, Some(reason));
+        // Publish the blockage AFTER the state (set_nav_state_because clears it on transition).
+        let to_nav = |b: crate::traversability::Blockage| crate::http::NavBlockage {
+            hazard: b.hazard.as_str(), at: b.at };
+        {
+            let mut s = self.nav_state.lock().unwrap();
+            s.blocked_goal = goal_blk.map(to_nav);
+            s.blocked_frontier = frontier_blk.map(to_nav);
+        }
         self.path.clear();
         // Drop the fine PLAN, but deliberately KEEP the fine tier's last word (`nav_local`) — it is
         // the evidence behind a terminal `blocked`, and an agent reading the outcome of a failed goto
@@ -1644,6 +1669,12 @@ impl Navigator {
                     Some(_) => self.set_nav_state_because("navigating", Some("goal_z_snapped")),
                     None    => self.set_nav_state("navigating"),
                 }
+                // Publish the PER-ROUTE tier (#378 Phase 2 / design §4c): `minimum` = this route
+                // only existed at the character's own collision radius (a tight door/bridge, no
+                // margin — riskier), `preferred` = the roomy tier carried it. The agent sees the
+                // risk of the route it is actually walking, not a zone-lifetime aggregate.
+                self.nav_state.lock().unwrap().tier =
+                    Some(if reply.tight { "minimum" } else { "preferred" });
                 false
             }
             // The search was CUT SHORT — "I don't know", not "no route". It did close real ground
@@ -1672,7 +1703,7 @@ impl Navigator {
                 true
             }
             // DEFINITIVE: no route exists.
-            PlanOutcome::Unreachable(why) => {
+            PlanOutcome::Unreachable { reason: why, goal_blocked_by, frontier_blocked_by } => {
                 // ...unless the only way out is an in-zone translocator (the Qeynos guild-vault
                 // waterfall): REDIRECT the goto to it — the char walks in via the normal machinery,
                 // the auto-cross teleports it out, and the post-teleport jump restores the real goal
@@ -1699,9 +1730,18 @@ impl Navigator {
                         return true;
                     }
                 }
-                self.stop_nav(gs, "no_path", why.as_str(), &format!(
+                // The agent-honesty payload (#378 Phase 2): name WHAT is blocking and WHERE, so an
+                // agent gets more than a bare `search_closed`. `goal_blocked_by` is the definitive
+                // "your goal itself is impossible"; `frontier_blocked_by` is "I got as close as here
+                // and THIS is the obstruction". Both are surfaced on /v1/observe/debug alongside the
+                // reason; a missing diagnosis stays absent (honest silence, never invented).
+                let blk = goal_blocked_by.or(frontier_blocked_by);
+                let detail = blk.map(|b| format!(" — blocked by {} at ({:.0},{:.0},{:.0})",
+                    b.hazard.as_str(), b.at[0], b.at[1], b.at[2])).unwrap_or_default();
+                self.stop_nav_blocked(gs, "no_path", why.as_str(), goal_blocked_by, frontier_blocked_by,
+                    &format!(
                     "No route to ({:.0},{:.0}): {} (searched to completion in {}ms — this is a definitive no, \
-                     not a timeout).", goal.0, goal.1, why.as_str(), reply.plan_ms));
+                     not a timeout){}.", goal.0, goal.1, why.as_str(), reply.plan_ms, detail));
                 true
             }
         }
@@ -3871,6 +3911,7 @@ mod tests {
             outcome: crate::assets::PlanOutcome::Route(vec![[0.0, 0.0, 47.0], [100.0, 100.0, 47.0]]),
             plan_ms: 5,
             goal_snapped_z: Some(47.0),
+            tight: false,
         }, &mut gs, goal);
 
         let st = nav.nav_state.lock().unwrap().clone();
@@ -3890,6 +3931,7 @@ mod tests {
             outcome: crate::assets::PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]]),
             plan_ms: 5,
             goal_snapped_z: None,
+            tight: false,
         }, &mut gs, goal);
         let st = nav.nav_state.lock().unwrap().clone();
         assert_eq!(st.reason, None, "a goal that was honoured as given carries no snap reason");

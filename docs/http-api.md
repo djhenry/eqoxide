@@ -33,7 +33,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 
 | Route | Description |
 |-------|-------------|
-| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, target `target_id`/`target_name`/`target_hp_pct`) + **navigation** (`nav_state`, `nav_reason` — see [Navigation state](#navigation-state)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms` — see [Connection health](#connection-health)) + camera state. |
+| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, target `target_id`/`target_name`/`target_hp_pct`) + **navigation** (`nav_state`, `nav_reason`, `nav_blocked_by`, `nav_tier` — see [Navigation state](#navigation-state)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms` — see [Connection health](#connection-health)) + camera state. |
 | `GET /v1/observe/frame` | Current rendered frame as a PNG (`Content-Type: image/png`). |
 | `GET /v1/observe/entities` | `{ "<name>": [x,y,z], ... }` for all known entities. |
 | `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency}`. Slots are Titanium **wire** ids (DB general slots 23-30 → wire 22-29). |
@@ -231,8 +231,22 @@ is not snapped: it fails as `no_path` / `goal_not_walkable`.)
 | Reason | Meaning |
 |--------|---------|
 | `walker_stalled` | The fine planner *can* thread the route from here, and the walker still didn't move: a genuine collision/steering wedge. `POST /v1/move/manual` (optionally `"jump": true`) may free it; then re-issue the `goto`. |
-| `local_no_way_through` | The **fine 2u planner closed its whole 40u window** without finding a way along the committed route. The corridor is not threadable at the character's own collision radius — this is *not* a slide/collision wedge, and nudging will not fix it. Approach the goal from another direction. (#382) |
+| `local_no_way_through` | The **fine 2u planner closed its whole 40u window** without finding a way along the committed route, OR the walker spent its proactive-re-plan budget re-routing the same impasse without progress (the qcat L-corner class). The corridor is not threadable at the character's own collision radius — this is *not* a slide/collision wedge, and nudging will not fix it. A coarse route to the goal may exist, but the walker cannot follow it around this corner. Approach the goal from another direction. (#382, #378) |
 | `fall_would_be_lethal` | The next waypoint is down a drop whose fall damage would likely kill the character. Stopped at the ledge. |
+
+### `nav_blocked_by` and `nav_tier` — the blockage payload (#378)
+
+`GET /v1/observe/debug` carries two more top-level fields whenever navigation has something to say:
+
+- **`nav_blocked_by`** — behind a terminal `no_path`, WHAT is blocking and WHERE. `null` when there is nothing to report (not a terminal `no_path`, or the diagnosis could not be computed — honest silence, never a fabricated hazard). Shape:
+  ```json
+  "nav_blocked_by": {
+    "goal":     { "hazard": "floor", "at": [x, y, z] },   // or null
+    "frontier": { "hazard": "wall",  "at": [x, y, z] }     // or null
+  }
+  ```
+  `goal` is **definitive** — the goal itself cannot be stood at (pairs with `goal_not_walkable`); if it is present, no search could ever have succeeded. `frontier` is the hazard at the search's **closest approach** to the goal (pairs with `search_closed`, the common sealed-corridor wedge where the goal is fine but you are walled off from it). `hazard` is `floor` | `wall` | `water`. **`frontier` is ONE blocking fact — not necessarily the only one, and not necessarily the one to fix.** It is computed only on a FAILED plan (never on a successful one), and only when even the character's own collision radius does not fit, so it never over-claims a wall the walker could have squeezed past. Computed by the same `Traversability` authority the planner uses, so it cannot disagree with what the planner actually refused.
+- **`nav_tier`** — which clearance tier the CURRENT route was found at: `"minimum"` (threaded a tight gap at the character's own collision radius — riskier, no margin from walls/drops), `"preferred"` (the roomy tier carried it), or `null` (no route committed). This is the **per-route** fact for the route being walked right now — distinct from the zone-lifetime `nav_tight` counter, which aggregates over the whole zone and cannot answer "is *my* route tight?".
 
 ---
 

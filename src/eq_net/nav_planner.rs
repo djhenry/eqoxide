@@ -73,6 +73,11 @@ pub struct PlanReply {
     /// agent is told (`nav_reason: goal_z_snapped`) — an accommodation presented as compliance is a
     /// lie, and this one would otherwise report `arrived` at a z nobody asked for (#377 review).
     pub goal_snapped_z: Option<f32>,
+    /// The per-route TIER (#378 Phase 2 / design §4c): `true` = this route only existed at the
+    /// MINIMUM clearance (a tight door/bridge threaded with no margin — a riskier path). Published
+    /// as `nav_tier` on /v1/observe/debug so an agent sees the risk of the route it is walking, a
+    /// PER-ROUTE fact the zone-lifetime `nav_tight` counter cannot give.
+    pub tight: bool,
 }
 
 /// The Navigator's handle on the worker: post requests, poll for the one reply that still matters.
@@ -285,7 +290,7 @@ fn worker_impl(req_rx: Receiver<PlanRequest>, rep_tx: Sender<PlanReply>, on_dequ
                 SNAPPING it to the floor at z={:.1}. The client is changing your goal; it is not the one \
                 you specified.", req.goal[0], req.goal[1], req.goal[2], z);
         }
-        let outcome = plan_path(&req.collision, req.start, req.goal, &req.avoid, req.aggro_buffer, req.goal_region);
+        let (outcome, tight) = plan_path(&req.collision, req.start, req.goal, &req.avoid, req.aggro_buffer, req.goal_region);
         let plan_ms = t0.elapsed().as_millis();
         // The headline number for #340: this is the synchronous stall that used to sit on the net
         // thread (capped at 150 ms per A* call, up to ~2 s per plan). It now sits here, where the
@@ -293,7 +298,7 @@ fn worker_impl(req_rx: Receiver<PlanRequest>, rep_tx: Sender<PlanReply>, on_dequ
         tracing::info!("nav-planner: plan #{} ({:.0},{:.0})->({:.0},{:.0}) took {}ms OFF the net thread → {}",
             req.gen, req.start[0], req.start[1], req.goal[0], req.goal[1], plan_ms,
             describe(&outcome));
-        if rep_tx.send(PlanReply { gen: req.gen, outcome, plan_ms, goal_snapped_z }).is_err() {
+        if rep_tx.send(PlanReply { gen: req.gen, outcome, plan_ms, goal_snapped_z, tight }).is_err() {
             break; // Navigator gone (zone change / shutdown)
         }
     }
@@ -302,7 +307,7 @@ fn worker_impl(req_rx: Receiver<PlanRequest>, rep_tx: Sender<PlanReply>, on_dequ
 fn describe(o: &PlanOutcome) -> String {
     match o {
         PlanOutcome::Route(p) => format!("ROUTE ({} wp)", p.len()),
-        PlanOutcome::Unreachable(r) => format!("UNREACHABLE ({})", r.as_str()),
+        PlanOutcome::Unreachable { reason, .. } => format!("UNREACHABLE ({})", reason.as_str()),
         PlanOutcome::Exhausted { limit, progress: Some(p) } =>
             format!("EXHAUSTED ({}) — walking a PARTIAL route ({} wp) and re-planning from its end", limit.as_str(), p.len()),
         PlanOutcome::Exhausted { limit, progress: None } =>
@@ -328,7 +333,7 @@ pub fn plan_path(
     avoid: &[[f32; 2]],
     aggro_buffer: f32,
     goal_region: Option<i32>,
-) -> PlanOutcome {
+) -> (PlanOutcome, bool) {
     // ONE node budget for the WHOLE plan, not one per A* call (#340, #394 review). This function makes
     // up to 13 A* calls (the route + a 12-point re-anchor ring), and `search_tiered` makes up to 2
     // clearance passes inside each — `ensure_budget()` materialises a single shared expansion counter
@@ -351,16 +356,16 @@ pub(crate) fn plan_path_with_ctx(
     avoid: &[[f32; 2]],
     aggro_buffer: f32,
     ctx: PlanCtx,
-) -> PlanOutcome {
+) -> (PlanOutcome, bool) {
     let radius = PLAYER_RADIUS;
 
-    let first = col.find_path_ex(start, goal, radius, avoid, 8.0, None, aggro_buffer, ctx.clone());
+    let (first, first_tier) = col.find_path_ex_tiered(start, goal, radius, avoid, 8.0, None, aggro_buffer, ctx.clone());
     match first {
-        // A real route, or an honest limit — either way, that's the answer.
-        PlanOutcome::Route(_) | PlanOutcome::Exhausted { .. } => return first,
+        // A real route, or an honest limit — either way, that's the answer (with its tier).
+        PlanOutcome::Route(_) | PlanOutcome::Exhausted { .. } => return (first, first_tier),
         // A definitive no... unless the START is what's broken, which we can still fix.
-        PlanOutcome::Unreachable(NoRoute::StartIsolated) => {}
-        PlanOutcome::Unreachable(_) => return first,
+        PlanOutcome::Unreachable { reason: NoRoute::StartIsolated, .. } => {}
+        PlanOutcome::Unreachable { .. } => return (first, first_tier),
     }
 
     // Isolated start (#205): A* couldn't leave the start cell. A clean walkable floor is almost
@@ -379,7 +384,7 @@ pub(crate) fn plan_path_with_ctx(
         // Same shared budget (`ctx.clone()` shares the `Arc`): the ring retries draw down the SAME 8M,
         // so 13 calls cost one plan's budget, not 13. The last retry may find the budget already spent
         // by earlier ones and return `Exhausted(NodeCap)` — honest, and bounded.
-        let out = col.find_path_ex(anchor, goal, radius, avoid, 8.0, None, aggro_buffer, ctx.clone());
+        let (out, out_tier) = col.find_path_ex_tiered(anchor, goal, radius, avoid, 8.0, None, aggro_buffer, ctx.clone());
         // Only worthwhile if the re-anchored start could actually MOVE (more than the lone start
         // cell A* was stuck on). `> 2`, not `> 1`: every route begins AT its start point (find_path
         // prepends it), so a route that goes nowhere is already len 2.
@@ -391,11 +396,11 @@ pub(crate) fn plan_path_with_ctx(
         if usable {
             tracing::warn!("nav: start isolated at ({:.0},{:.0},{:.0}) — re-anchored to clean floor ({:.0},{:.0},{:.0})",
                 start[0], start[1], start[2], ax, ay, af);
-            return out;
+            return (out, out_tier);
         }
     }
     // The start is sealed in and no nearby floor gets us out. That IS a definitive no.
-    first
+    (first, first_tier)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -632,9 +637,9 @@ mod tests {
     #[test]
     fn an_unreachable_goal_reports_unreachable_not_a_partial_route() {
         let col = plane_with_sealed_box(1000.0, 400.0, 400.0);
-        let out = plan_path(&col, [-900.0, -900.0, 0.0], [400.0, 400.0, 0.0], &[], 0.0, None);
+        let (out, _tier) = plan_path(&col, [-900.0, -900.0, 0.0], [400.0, 400.0, 0.0], &[], 0.0, None);
         match &out {
-            PlanOutcome::Unreachable(NoRoute::SearchClosed) => {}
+            PlanOutcome::Unreachable { reason: NoRoute::SearchClosed, .. } => {}
             other => panic!("a walled-off goal must report a DEFINITIVE Unreachable(SearchClosed), got {other:?}"),
         }
         assert!(out.route().is_none(), "an unreachable goal must yield NO waypoints — a partial route here is the #337 lie");
@@ -675,8 +680,8 @@ mod tests {
         // (4 iterations, not more: each is a full 62,500-cell frontier close — the point is proven by a
         // handful of repeats under load, and a property test must not itself become a CI time sink.)
         for i in 0..4 {
-            let out = plan_path(&col, [-900.0, -900.0, 0.0], [400.0, 400.0, 0.0], &[], 0.0, None);
-            assert!(matches!(out, PlanOutcome::Unreachable(NoRoute::SearchClosed)),
+            let (out, _tier) = plan_path(&col, [-900.0, -900.0, 0.0], [400.0, 400.0, 0.0], &[], 0.0, None);
+            assert!(matches!(out, PlanOutcome::Unreachable { reason: NoRoute::SearchClosed, .. }),
                 "run {i} under full CPU load returned {out:?} — the coarse planner's answer must NOT \
                  depend on machine speed. A wall-clock budget would flip this to Exhausted(Deadline); a \
                  node cap cannot (#394).");
@@ -729,7 +734,7 @@ mod tests {
         let counter = ctx.expanded.clone().unwrap();
 
         // Drive the REAL plan_path fan-out (primary + 12-point ring) against the shared budget.
-        let out = plan_path_with_ctx(&col, [-400.0, -400.0, 0.0], [400.0, 400.0, 0.0], &[], 0.0, ctx);
+        let (out, _tier) = plan_path_with_ctx(&col, [-400.0, -400.0, 0.0], [400.0, 400.0, 0.0], &[], 0.0, ctx);
         let total = counter.load(Ordering::Relaxed);
 
         // LOWER bound: the plan really did its work THROUGH this shared counter. If a call quietly
@@ -750,7 +755,7 @@ mod tests {
     #[test]
     fn a_reachable_goal_still_routes() {
         let col = plane_with_sealed_box(1000.0, 400.0, 400.0);
-        let out = plan_path(&col, [-900.0, -900.0, 0.0], [900.0, 900.0, 0.0], &[], 0.0, None);
+        let (out, _tier) = plan_path(&col, [-900.0, -900.0, 0.0], [900.0, 900.0, 0.0], &[], 0.0, None);
         let route = out.route().unwrap_or_else(|| panic!("an open-plane goal must route, got {out:?}"));
         let last = *route.last().unwrap();
         assert!((last[0] - 900.0).abs() < 8.0 && (last[1] - 900.0).abs() < 8.0,
@@ -916,9 +921,9 @@ mod tests {
 
         // What the NET THREAD used to pay, synchronously, for this plan:
         let t0 = Instant::now();
-        let outcome = plan_path(&col, start, goal, &[], 0.0, None);
+        let (outcome, _tier) = plan_path(&col, start, goal, &[], 0.0, None);
         let sync_us = t0.elapsed().as_micros();
-        assert!(matches!(outcome, PlanOutcome::Unreachable(_)), "fixture sanity: this goal is sealed off");
+        assert!(matches!(outcome, PlanOutcome::Unreachable { .. }), "fixture sanity: this goal is sealed off");
 
         // What it pays now:
         let mut planner = Planner::spawn();
