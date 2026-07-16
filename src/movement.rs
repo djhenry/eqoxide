@@ -7,7 +7,7 @@
 //! and a depenetration / unstuck net, and returns the one authoritative position used for both the
 //! render and the server stream. This replaces the old `override_pos` dual-authority artifact.
 
-use crate::assets::Collision;
+use crate::nav::collision::Collision;
 
 /// Wall-collision sphere radius, matched to the reference RoF2 client.
 pub const PLAYER_RADIUS: f32 = 1.0;
@@ -362,12 +362,12 @@ impl CharacterController {
             if len < 1e-5 { break; }
             let d_hat = [remaining[0] / len, remaining[1] / len];
             // Nearest contact among the foot and chest centre rays.
-            let mut best: Option<crate::assets::Hit> = None;
+            let mut best: Option<crate::nav::collision::Hit> = None;
             for &hz in &probes {
                 let f = [pos[0], pos[1], pos[2] + hz];
                 let to = [f[0] + remaining[0], f[1] + remaining[1], f[2]];
                 if let Some((t, n)) = col.nearest_hit(f, to) {
-                    if best.map_or(true, |b| t < b.t) { best = Some(crate::assets::Hit { t, normal: n }); }
+                    if best.map_or(true, |b| t < b.t) { best = Some(crate::nav::collision::Hit { t, normal: n }); }
                 }
             }
             match best {
@@ -485,7 +485,8 @@ impl CharacterController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assets::{Collision, ZoneAssets, MeshData, RenderMode};
+    use crate::assets::{ZoneAssets, MeshData, RenderMode};
+    use crate::nav::collision::Collision;
 
     #[test]
     fn manual_wish_normalizes_and_faces_the_move_direction() {

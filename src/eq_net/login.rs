@@ -119,7 +119,7 @@ pub async fn run_login_flow(
     sit:              SitReq,
     consider:         ConsiderReq,
     pet_cmd:          crate::http::PetCmdReq,
-    collision:        crate::assets::SharedCollision,
+    collision:        crate::nav::collision::SharedCollision,
     maps_dir:         std::path::PathBuf,
     shutdown:         Arc<AtomicBool>,
     camp:             CampReq,
