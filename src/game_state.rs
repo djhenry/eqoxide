@@ -732,6 +732,17 @@ impl GameState {
         self.suppress_cast_end = false;
     }
 
+    /// Is the player slain? Detected the SAME way the render/anim path picks the dead pose
+    /// (`cur_hp <= 0` with a known `max_hp`) OR via the OP_Death `player_dead` flag. Using cur_hp —
+    /// not just `player_dead` — catches an HP-to-0 update that lands before OP_Death arrives, which
+    /// is the window in which a corpse was seen still walking (#238). Shared by the nav walker
+    /// (`nav::walker::Walker::nav_halt_if_dead`) and the auto zone-cross guard
+    /// (`eq_net::action_loop::ActionLoop::drain_zone_cross`) — moved here (out of `ActionLoop`) so
+    /// both can call it without one depending on the other's private items (M1 walker extraction).
+    pub fn is_player_dead(&self) -> bool {
+        self.player_dead || (self.cur_hp <= 0 && self.max_hp > 0)
+    }
+
     pub fn log_msg(&mut self, kind: &str, text: &str) {
         // 400 entries so the chat window has real scrollback (was 50).
         if self.messages.len() >= 400 {
