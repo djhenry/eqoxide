@@ -42,7 +42,7 @@ async fn post_open(
         .map(|(k, &id)| (k.clone(), id));
     match found {
         Some((key, id)) => {
-            *s.trainer.trainer_open_req.lock().unwrap() = Some(id);
+            s.command.request_open_trainer(id);
             (StatusCode::OK, format!("opening training with {} (spawn_id={})", clean_entity_name(&key), id))
         }
         None => (StatusCode::NOT_FOUND, format!("no entity matching {:?}", name)),
@@ -87,7 +87,7 @@ async fn post_train(
     if !s.player().trainer_open {
         return (StatusCode::BAD_REQUEST, "no trainer window open — call /v1/trainer/open first".into());
     }
-    *s.trainer.trainer_train_req.lock().unwrap() = Some(b.skill_id);
+    s.command.request_train_skill(b.skill_id);
     let name = crate::skills::skill_name(b.skill_id).unwrap_or("?");
     (StatusCode::OK, format!("training {} (skill_id={})", name, b.skill_id))
 }
@@ -96,6 +96,6 @@ async fn post_train(
 /// `trainer_open_req` slot's `Some(0)` sentinel (0 is never a real spawn id) so no extra
 /// request slot needs threading through the nav chain (#162).
 async fn post_close(State(s): State<HttpState>) -> (StatusCode, String) {
-    *s.trainer.trainer_open_req.lock().unwrap() = Some(0);
+    s.command.request_open_trainer(0);
     (StatusCode::OK, "closing trainer".into())
 }

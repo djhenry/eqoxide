@@ -57,7 +57,7 @@ async fn post_accept(
     if !known {
         return (StatusCode::BAD_REQUEST, format!("no pending task offer with task_id={task_id}"));
     }
-    *s.quest.accept_task.lock().unwrap() = Some(task_id);
+    s.command.request_accept_task(task_id);
     tracing::info!("quests: queued accept task_id={task_id}");
     (StatusCode::OK, format!("accepting task_id={task_id}"))
 }
@@ -67,7 +67,7 @@ async fn post_decline(State(s): State<HttpState>) -> (StatusCode, String) {
     if s.quest.task_offers_shared.lock().unwrap().is_empty() {
         return (StatusCode::OK, "no pending task offers".into());
     }
-    *s.quest.accept_task.lock().unwrap() = Some(0);
+    s.command.request_accept_task(0);
     tracing::info!("quests: queued decline-all");
     (StatusCode::OK, "declining pending task offer(s)".into())
 }
@@ -87,7 +87,7 @@ async fn post_cancel(
     if !known {
         return (StatusCode::BAD_REQUEST, format!("no active task with task_id={task_id}"));
     }
-    *s.quest.cancel_task.lock().unwrap() = Some(task_id);
+    s.command.request_cancel_task(task_id);
     tracing::info!("quests: queued cancel task_id={task_id}");
     (StatusCode::OK, format!("cancelling task_id={task_id}"))
 }
@@ -170,14 +170,14 @@ pub(crate) mod tests {
         state.quest.task_offers_shared.lock().unwrap().push(crate::game_state::TaskOffer {
             task_id: 42, npc_id: 7, title: "Offer".into(), description: String::new(), has_rewards: false,
         });
-        let accept = state.quest.accept_task.clone();
+        let command = state.command.clone();
         let app = router().with_state(state);
         let req = Request::post("/accept")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"task_id":42}"#)).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(*accept.lock().unwrap(), Some(42));
+        assert_eq!(command.take_accept_task(), Some(42));
     }
 
     #[tokio::test]
@@ -205,14 +205,14 @@ pub(crate) mod tests {
         state.quest.task_log.lock().unwrap().push(crate::game_state::ActiveTask {
             task_id: 42, sequence_number: 3, ..Default::default()
         });
-        let cancel = state.quest.cancel_task.clone();
+        let command = state.command.clone();
         let app = router().with_state(state);
         let req = Request::post("/cancel")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"task_id":42}"#)).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(*cancel.lock().unwrap(), Some(42));
+        assert_eq!(command.take_cancel_task(), Some(42));
     }
 
     #[tokio::test]
