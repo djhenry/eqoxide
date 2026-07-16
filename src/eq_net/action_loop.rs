@@ -528,7 +528,7 @@ impl ActionLoop {
         // POST /loot: queue the requested corpse onto the existing auto-loot pipeline. The gameplay
         // loop drains pending_loot — sends OP_LootRequest, echoes each OP_LootItem to take it, then
         // OP_EndLootRequest. The 500ms delay (loot_queued_at) lets the server register the corpse.
-        if let Some(corpse_id) = self.interact.loot.lock().unwrap().take() {
+        if let Some(corpse_id) = self.command.take_loot() {
             gs.pending_loot.push_back(corpse_id);
             if gs.loot_queued_at.is_none() {
                 gs.loot_queued_at = Some(Instant::now());
@@ -540,7 +540,7 @@ impl ActionLoop {
     fn drain_doors(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // POST /doors/click or a human door click: send OP_ClickDoor. The door opens
         // visually only when the server replies with OP_MoveDoor.
-        if let Some(door_id) = self.interact.door_click.lock().unwrap().take() {
+        if let Some(door_id) = self.command.take_door_click() {
             stream.send_app_packet(OP_CLICK_DOOR, &build_click_door(door_id, gs.player_id));
             tracing::info!("EQ: click door_id={}", door_id);
             gs.log_msg("door", &format!("Clicked door {}", door_id));
@@ -802,7 +802,7 @@ impl ActionLoop {
         // so we must target the NPC FIRST, in the same tick and before the say packet, or the hail is
         // silently ignored (#130). The target packet precedes the say on the ordered stream, so the
         // server has GetTarget()==the NPC when it processes the say.
-        let hail_req = self.interact.hail.lock().unwrap().take();
+        let hail_req = self.command.take_hail();
         if let Some((name, spawn_id)) = hail_req {
             // A hail starts a FRESH interaction — drop any saylink choices left over from a prior
             // NPC (or a system/command message). Otherwise `/observe/dialogue` leaks the last
@@ -822,7 +822,7 @@ impl ActionLoop {
         }
 
         // Check say request — arbitrary Say text (HUD say box / quest keyword follow-up).
-        let say_text = self.interact.say.lock().unwrap().take();
+        let say_text = self.command.take_say();
         if let Some(text) = say_text {
             // The `/camp` chat keyword is a local command, not Say text: toggle a camp instead of
             // broadcasting it. The gameplay loop drains the camp slot and runs the camp/cancel.
@@ -841,7 +841,7 @@ impl ActionLoop {
         // Check dialogue-click request (POST /v1/interact/dialogue, or a GUI click): "click" a
         // parsed saylink by sending OP_ItemLinkClick with its ids. The server resolves the phrase
         // from its saylink table and processes it as if we said it to the NPC (#120).
-        let click = self.interact.dialogue_click.lock().unwrap().take();
+        let click = self.command.take_dialogue_click();
         if let Some(c) = click {
             let pkt = build_item_link_click(c.item_id, &c.augments, c.link_hash, c.icon);
             tracing::info!("EQ: dialogue click: '{}' (sayid={})", c.text, c.augments[0]);
@@ -982,7 +982,7 @@ impl ActionLoop {
         // POST /v1/interact/read {"slot":N}: read a book/note. Look up the item at that wire slot;
         // if it carries a Filename it's readable, so send OP_ReadBook with that filename and the
         // server replies with the text (apply_read_book stores it → GET /v1/observe/item_text). (#288)
-        let read_slot = self.interact.read_book.lock().unwrap().take();
+        let read_slot = self.command.take_read_book();
         if let Some(slot) = read_slot {
             match gs.inventory.iter().find(|i| i.slot == slot) {
                 Some(item) if !item.filename.is_empty() => {
@@ -1137,7 +1137,7 @@ impl ActionLoop {
 
     fn drain_sit(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Sit / stand (OP_SpawnAppearance type=14, param 110/100).
-        let sit_req = self.interact.sit.lock().unwrap().take();
+        let sit_req = self.command.take_sit();
         if let Some(sit) = sit_req {
             let param = if sit { 110u32 } else { 100u32 };
             let payload = build_spawn_appearance_packet(gs.player_id as u16, 14, param);
@@ -1160,7 +1160,7 @@ impl ActionLoop {
         // Merchant buy: open the merchant (OP_ShopRequest) then buy its inventory slot
         // (OP_ShopPlayerBuy). Sent in sequence — the server processes the open first so the
         // merchant is open by the time the buy arrives. Must be within ~200u of the merchant.
-        let buy_req = self.merchant_slots.buy.lock().unwrap().take();
+        let buy_req = self.command.take_merchant_buy();
         if let Some((merchant_id, slot)) = buy_req {
             // #360/#361: a failed/unanswered OP_ShopRequest must not leave `merchant_open` reporting
             // a DIFFERENT previous merchant, and the coin balance must read as unverified until this
@@ -1198,7 +1198,7 @@ impl ActionLoop {
         // Merchant sell: open the merchant (OP_ShopRequest) then sell a player inventory slot
         // (OP_ShopPlayerSell). Same sequencing as buy so the shop is open server-side first.
         // Must be within ~200u of the merchant; the server computes the price (we send 0).
-        let sell_req = self.merchant_slots.sell.lock().unwrap().take();
+        let sell_req = self.command.take_merchant_sell();
         if let Some((merchant_id, slot, quantity)) = sell_req {
             // #360: same staleness hazard as the buy path above — clear a DIFFERENT stale merchant
             // before sending, but don't flicker the one that's already open (#361 review FIX 2).
@@ -1230,7 +1230,7 @@ impl ActionLoop {
         // Open/close a merchant window (POST /trade/open, /trade/close). OP_ShopRequest with
         // command=1 (open) or 0 (close). The server replies with OP_ShopRequest (Open/Close) +
         // OP_ItemPacket(Merchant) items, decoded in packet_handler into gs.merchant_*.
-        let trade_req = self.merchant_slots.trade.lock().unwrap().take();
+        let trade_req = self.command.take_merchant_trade();
         if let Some(cmd) = trade_req {
             let (merchant_id, command) = match cmd {
                 TradeCmd::Open(id) => (id, 1u32),
@@ -1257,7 +1257,7 @@ impl ActionLoop {
         // SwapItem rejects number_in_stack > 0 for any non-stackable item (inventory.cpp ~2025,
         // "not a stackable item" -> SwapItemResync = the "Inventory Desyncronization" we hit). 0
         // takes the direct-swap/equip path. (A count would only be for splitting a stack.)
-        let move_req = self.inventory_slots.move_req.lock().unwrap().take();
+        let move_req = self.command.take_inventory_move();
         if let Some((from_slot, to_slot)) = move_req {
             // build_move_item emits the structured 28-byte RoF2 MoveItem_Struct; a flat 12-byte
             // packet is silently dropped by the server (see build_move_item / eqoxide#11).
@@ -1444,7 +1444,7 @@ impl ActionLoop {
     fn tick_give(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Begin a new give request if one is queued and we're not already mid-trade.
         if self.give_state.is_none() {
-            if let Some((npc_id, from_slot)) = self.interact.give.lock().unwrap().take() {
+            if let Some((npc_id, from_slot)) = self.command.take_give() {
                 // Step 1: put the item on the cursor (skip if it's already there). Use the 28-byte
                 // structured MoveItem (possessions→cursor); the old flat 12-byte packet was silently
                 // dropped by the server, so the item never reached the cursor (eqoxide#26).

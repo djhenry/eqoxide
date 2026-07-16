@@ -27,7 +27,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
                 widgets::coin_row(ui, cx.scene.coin);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button(egui::RichText::new("Done").size(11.0)).clicked() {
-                        *cx.acts.trade.lock().unwrap() = Some(crate::http::TradeCmd::Close);
+                        cx.acts.command.request_merchant_trade(crate::http::TradeCmd::Close);
                     }
                 });
             });
@@ -82,7 +82,7 @@ fn draw_buy_panel(ui: &mut egui::Ui, cx: &mut UiCtx, merchant_id: u32, height: f
                             }
                         });
                         if ui.button(egui::RichText::new("Buy").size(10.0)).clicked() {
-                            *cx.acts.buy.lock().unwrap() = Some((merchant_id, it.merchant_slot));
+                            cx.acts.command.request_merchant_buy(merchant_id, it.merchant_slot);
                         }
                     });
                 });
@@ -142,8 +142,7 @@ fn draw_sell_panel(ui: &mut egui::Ui, cx: &mut UiCtx, merchant_id: u32, height: 
                             }
                             ui.ctx().data_mut(|d| d.insert_temp(qty_id, qty));
                             if ui.button(egui::RichText::new("Sell").size(10.0)).clicked() {
-                                *cx.acts.sell.lock().unwrap() =
-                                    Some((merchant_id, it.slot as u32, qty));
+                                cx.acts.command.request_merchant_sell(merchant_id, it.slot as u32, qty);
                             }
                         });
                     });

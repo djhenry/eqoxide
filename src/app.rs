@@ -1756,7 +1756,7 @@ impl ApplicationHandler for App {
                                         // Server-authoritative: only request the open; never set is_open
                                         // locally. ActionLoop::tick (network thread) already logs
                                         // "Clicked door {id}" when it polls this same slot.
-                                        *self.door_click.lock().unwrap() = Some(door_id);
+                                        self.acts.command.request_door_click(door_id);
                                     }
                                     None => {}
                                 }
