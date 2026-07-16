@@ -8,7 +8,7 @@
 /// possessions slot: Type = typePossessions (0), Slot = the flat slot, SubIndex = SLOT_INVALID (-1),
 /// AugIndex = SOCKET_INVALID (-1). AugIndex MUST be in [-1, 6) or the server rejects the whole slot
 /// as SLOT_INVALID. (Bank/trade/world slots use other Type values + offsets; not handled here.)
-pub fn rof2_possessions_slot(slot: u32) -> [u8; 12] {
+pub(crate) fn rof2_possessions_slot(slot: u32) -> [u8; 12] {
     let mut s = [0u8; 12];
     s[0..2].copy_from_slice(&0i16.to_le_bytes());          // Type = typePossessions
     s[2..4].copy_from_slice(&0i16.to_le_bytes());          // Unknown02
@@ -25,7 +25,7 @@ pub fn rof2_possessions_slot(slot: u32) -> [u8; 12] {
 /// which the server decodes to the bagged item (`RoF2ToServerSlot`, common/patches/rof2.cpp:7080:
 /// `GENERAL_BAGS_BEGIN + (Slot-GENERAL_BEGIN)*SLOT_COUNT + SubIndex`). This is what makes bagged
 /// items movable. (eqoxide#201)
-pub fn rof2_inventory_slot(flat: u32) -> [u8; 12] {
+pub(crate) fn rof2_inventory_slot(flat: u32) -> [u8; 12] {
     let Some((parent, sub_index)) = crate::game_state::bag_wire_parent(flat as i32) else {
         return rof2_possessions_slot(flat);
     };
