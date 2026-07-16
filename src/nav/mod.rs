@@ -6,5 +6,6 @@
 //! step 3). The `Navigator` god-struct and its `tick()`/`sync_*`/`apply_*plan` methods (the net
 //! action loop) still live in `eq_net::navigation`; moving those out is a later step.
 
+pub mod collision;
 pub mod planner;
 pub mod steering;
