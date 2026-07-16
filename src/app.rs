@@ -14,7 +14,7 @@ use crate::camera_state::{lerp3, lerp_angle, CameraCmd, CameraSnapshot, CameraSt
 use crate::frame_capture::encode_frame_png;
 use crate::game_state::GameState;
 
-use crate::http::FrameReq;
+use crate::ipc::FrameReq;
 use crate::renderer::EqRenderer;
 use crate::scene::SceneState;
 use crate::nav::collision;
@@ -124,26 +124,26 @@ pub struct App {
     /// stream. Replaces the old `override_pos` dual-authority that caused WASD rubber-banding.
     controller:       crate::movement::CharacterController,
     /// Snapshot published each frame for the nav thread to stream.
-    controller_view:  crate::http::ControllerShared,
+    controller_view:  crate::ipc::ControllerShared,
     /// The nav planner's /goto movement intent, consumed when no WASD key is held.
-    nav_intent:       crate::http::NavIntent,
+    nav_intent:       crate::ipc::NavIntent,
     /// HTTP manual-move / jump escape hatch (#188), consumed when no WASD key is held, with
     /// priority over `nav_intent` while active.
-    manual_move:      crate::http::ManualMoveReq,
+    manual_move:      crate::ipc::ManualMoveReq,
     /// A large server correction handed over by the nav streamer; applied to the controller.
-    pos_correction:   crate::http::PosCorrection,
+    pos_correction:   crate::ipc::PosCorrection,
     /// Walker's live plan (coarse, fine), published by the nav thread; drawn by the nav-debug
     /// overlay so it shows what the walker actually follows, not a separate recompute (#246).
-    nav_path_view:    crate::http::NavPathView,
+    nav_path_view:    crate::ipc::NavPathView,
     /// Shared goto target — set by HTTP /move; cleared by the render thread on manual WASD
     /// (so manual movement cancels navigation). WASD no longer writes a target here.
-    goto_target:  crate::http::GotoTarget,
+    goto_target:  crate::ipc::GotoTarget,
     /// All shared request slots UI windows write; the nav/gameplay threads drain
     /// and send them. One struct instead of a dozen fields (#162).
     acts:         crate::ui::Actions,
     spells:       std::sync::Arc<crate::spells::SpellDb>,
     /// Shared door-click request slot; the nav thread drains it and sends OP_ClickDoor.
-    door_click:   crate::http::DoorClickReq,
+    door_click:   crate::ipc::DoorClickReq,
     // Mouse
     drag_active:  bool,
     last_cursor:  winit::dpi::PhysicalPosition<f64>,
@@ -156,7 +156,7 @@ pub struct App {
     pick_screen_h:  u32,
     // EQ state
     /// The `ArcSwap` handle the network thread publishes into every gameplay tick.
-    game_state_snapshot: crate::http::GameStateSnapshot,
+    game_state_snapshot: crate::ipc::GameStateSnapshot,
     /// This frame's cached load of `game_state_snapshot`. Refreshed at the top of poll_external
     /// and render_frame; reads between two refresh points may straddle two snapshots, which is
     /// fine — each snapshot is internally consistent.
@@ -178,7 +178,7 @@ pub struct App {
     last_inbound: std::time::Instant,
     /// The network thread's live "time of last real inbound packet" handle — polled once per
     /// `poll_external` and compared against `last_inbound` to detect a fresh arrival.
-    net_health: crate::http::NetHealthShared,
+    net_health: crate::ipc::NetHealthShared,
     // Frame capture for /frame API
     frame_req:    FrameReq,
     /// Smoothed per-phase frame timings, published for `/v1/observe/debug` → `frame_profile`.
@@ -186,7 +186,7 @@ pub struct App {
     /// is projected at HTTP read time from the network thread's `GameState` (#343). Publishing world
     /// state from a loop whose whole design goal is to STOP RUNNING when nothing is happening is how
     /// `connected: true` survived a dead connection forever.
-    frame_profile_shared: crate::http::FrameProfileShared,
+    frame_profile_shared: crate::ipc::FrameProfileShared,
     // Precomputed zone collision grid: floor grounding, camera collision, nameplate occlusion.
     // Held as Arc and also published to `shared_collision` so the nav thread can read it.
     collision:    Option<Arc<collision::Collision>>,
@@ -244,15 +244,15 @@ impl App {
         character_name:  String,
         camera_cmd:      Arc<Mutex<Option<CameraCmd>>>,
         camera_snapshot: Arc<Mutex<CameraSnapshot>>,
-        game_state_snapshot: crate::http::GameStateSnapshot,
-        net_health: crate::http::NetHealthShared,
+        game_state_snapshot: crate::ipc::GameStateSnapshot,
+        net_health: crate::ipc::NetHealthShared,
         frame_req:       FrameReq,
-        goto_target:     crate::http::GotoTarget,
+        goto_target:     crate::ipc::GotoTarget,
         acts:            crate::ui::Actions,
         spells:          std::sync::Arc<crate::spells::SpellDb>,
-        door_click:      crate::http::DoorClickReq,
+        door_click:      crate::ipc::DoorClickReq,
         shared_collision: collision::SharedCollision,
-        frame_profile_shared: crate::http::FrameProfileShared,
+        frame_profile_shared: crate::ipc::FrameProfileShared,
         testzone_mode:   bool,
         nav_debug:       bool,
         shutdown:        std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -260,11 +260,11 @@ impl App {
         asset_server_url: String,
         asset_user:       String,
         asset_pass:       String,
-        controller_view:  crate::http::ControllerShared,
-        nav_intent:       crate::http::NavIntent,
-        manual_move:      crate::http::ManualMoveReq,
-        pos_correction:   crate::http::PosCorrection,
-        nav_path_view:    crate::http::NavPathView,
+        controller_view:  crate::ipc::ControllerShared,
+        nav_intent:       crate::ipc::NavIntent,
+        manual_move:      crate::ipc::ManualMoveReq,
+        pos_correction:   crate::ipc::PosCorrection,
+        nav_path_view:    crate::ipc::NavPathView,
     ) -> Self {
         let ui_state = crate::ui::UiState::new(&character_name, eq_ui_dir);
         // Distinct per-client window title (#297): "{account} {character} - EQOxide".

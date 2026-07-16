@@ -20,7 +20,7 @@ use crate::eq_net::packet_handler::apply_packet;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::GameState;
-use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, DialogueShared, DialogueClickReq, NavStateShared, ChatEventsShared, ChatSendShared, CastReq, MemSpellReq, SitReq, ConsiderReq, CampReq, CampUntil, RespawnReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, WhoReq, TaskLog, ZoneCrossReq, ZonePoints, TaskOffersShared, CompletedTasksShared, AcceptTaskReq, CancelTaskReq};
+use crate::ipc::{AttackReq, BuyReq, SellReq, TradeReq, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, DialogueShared, DialogueClickReq, NavStateShared, ChatEventsShared, ChatSendShared, CastReq, MemSpellReq, SitReq, ConsiderReq, CampReq, CampUntil, RespawnReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, WhoReq, TaskLog, ZoneCrossReq, ZonePoints, TaskOffersShared, CompletedTasksShared, AcceptTaskReq, CancelTaskReq};
 
 type DesCbcEnc = Encryptor<Des>;
 type DesCbcDec = Decryptor<Des>;
@@ -73,7 +73,7 @@ pub async fn run_login_flow(
     max_retries:      u32,
     goto_target:      GotoTarget,
     nav_state:        NavStateShared,
-    goto_entity:      crate::http::GotoEntity,
+    goto_entity:      crate::ipc::GotoEntity,
     entity_positions: EntityPositions,
     entity_ids:       EntityIds,
     zone_points:      ZonePoints,
@@ -82,22 +82,22 @@ pub async fn run_login_flow(
     completed_tasks_shared: CompletedTasksShared,
     accept_task:           AcceptTaskReq,
     cancel_task:           CancelTaskReq,
-    group:             crate::http::GroupShared,
-    group_invite:      crate::http::GroupInviteReq,
-    trainer_open_req:  crate::http::TrainerOpenReq,
-    trainer_train_req: crate::http::TrainerTrainReq,
-    group_accept:      crate::http::GroupAcceptReq,
-    group_decline:     crate::http::GroupDeclineReq,
-    group_leave:       crate::http::GroupLeaveReq,
-    group_kick:        crate::http::GroupKickReq,
-    group_make_leader: crate::http::GroupMakeLeaderReq,
+    group:             crate::ipc::GroupShared,
+    group_invite:      crate::ipc::GroupInviteReq,
+    trainer_open_req:  crate::ipc::TrainerOpenReq,
+    trainer_train_req: crate::ipc::TrainerTrainReq,
+    group_accept:      crate::ipc::GroupAcceptReq,
+    group_decline:     crate::ipc::GroupDeclineReq,
+    group_leave:       crate::ipc::GroupLeaveReq,
+    group_kick:        crate::ipc::GroupKickReq,
+    group_make_leader: crate::ipc::GroupMakeLeaderReq,
     zone_cross:       ZoneCrossReq,
     hail:             HailReq,
     say:              SayReq,
     target:           TargetReq,
     who_req:          WhoReq,
-    friends_list:     crate::http::FriendsListShared,
-    friends_req:      crate::http::FriendsReq,
+    friends_list:     crate::ipc::FriendsListShared,
+    friends_req:      crate::ipc::FriendsReq,
     attack:           AttackReq,
     buy:              BuyReq,
     sell:             SellReq,
@@ -118,23 +118,23 @@ pub async fn run_login_flow(
     mem_spell:        MemSpellReq,
     sit:              SitReq,
     consider:         ConsiderReq,
-    pet_cmd:          crate::http::PetCmdReq,
+    pet_cmd:          crate::ipc::PetCmdReq,
     collision:        crate::nav::collision::SharedCollision,
     maps_dir:         std::path::PathBuf,
     shutdown:         Arc<AtomicBool>,
     camp:             CampReq,
     camp_until:       CampUntil,
     respawn:          RespawnReq,
-    controller_view:  crate::http::ControllerShared,
-    nav_intent:       crate::http::NavIntent,
-    pos_correction:   crate::http::PosCorrection,
-    nav_path_view:    crate::http::NavPathView,
-    nav_avoid:        crate::http::NavAvoidShared,
-    read_book:        crate::http::ReadBookReq,
-    guild:            crate::http::GuildShared,
-    guild_action:     crate::http::GuildActionReq,
-    game_state_snapshot: crate::http::GameStateSnapshot,
-    net_health:          crate::http::NetHealthShared,
+    controller_view:  crate::ipc::ControllerShared,
+    nav_intent:       crate::ipc::NavIntent,
+    pos_correction:   crate::ipc::PosCorrection,
+    nav_path_view:    crate::ipc::NavPathView,
+    nav_avoid:        crate::ipc::NavAvoidShared,
+    read_book:        crate::ipc::ReadBookReq,
+    guild:            crate::ipc::GuildShared,
+    guild_action:     crate::ipc::GuildActionReq,
+    game_state_snapshot: crate::ipc::GameStateSnapshot,
+    net_health:          crate::ipc::NetHealthShared,
 ) -> Result<(), String> {
     for attempt in 1..=max_retries {
         if attempt > 1 {
@@ -184,7 +184,7 @@ pub async fn run_login_flow(
 /// and simply still in progress.
 async fn run_login_phase(
     config: &LoginConfig,
-    net_health: &crate::http::NetHealthShared,
+    net_health: &crate::ipc::NetHealthShared,
 ) -> Result<(EqStream, UnboundedReceiver<AppPacket>, GameState, WorldCredentials), LoginError> {
     let (net_tx, mut net_rx) = mpsc::unbounded_channel::<AppPacket>();
 

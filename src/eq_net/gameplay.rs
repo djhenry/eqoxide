@@ -27,7 +27,7 @@ const RESPAWN_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 /// zone resolves it against its in-process entity list and replies — no WORLD hop, unlike OP_WhoAll),
 /// benign (self is not an NPC, so faction is hardcoded 1 with no aggro/faction/hate-list evaluation),
 /// and outside any anti-cheat path (MQGhost keys on movement cadence only). An unanswered probe past
-/// [`crate::http::PROBE_TIMEOUT_SECS`] while the socket still ACKs is the unresponsive-world signal.
+/// [`crate::ipc::PROBE_TIMEOUT_SECS`] while the socket still ACKs is the unresponsive-world signal.
 /// (Scope: this catches the still-ticking-but-unresponsive case. A TOTAL zone freeze stops the ACKs
 /// too on this single-threaded-libuv server, so that is already covered by `connected: false`.)
 ///
@@ -49,7 +49,7 @@ fn consider_reply_is_self(payload: &[u8], player_id: u32) -> bool {
 /// #371: is a liveness probe currently awaiting its reply? True when we have sent a probe that has
 /// not yet been answered (no reply, or the last reply predates the last send). Used to consume the
 /// probe's own reply exactly once, so a genuine user self-consider is never swallowed.
-fn probe_outstanding(h: &crate::http::NetHealth) -> bool {
+fn probe_outstanding(h: &crate::ipc::NetHealth) -> bool {
     match (h.last_probe_sent, h.last_probe_reply) {
         (Some(sent), Some(reply)) => sent > reply,
         (Some(_), None)           => true,
@@ -59,7 +59,7 @@ fn probe_outstanding(h: &crate::http::NetHealth) -> bool {
 
 /// #371: on a zone change, discard the previous zone's probe verdict. `world_responsive` returns to
 /// "no verdict yet" (true) until we re-probe in the new zone, so a transition never reads as a wedge.
-fn reset_probe_clocks(net_health: &crate::http::NetHealthShared) {
+fn reset_probe_clocks(net_health: &crate::ipc::NetHealthShared) {
     let mut h = net_health.lock().unwrap();
     h.last_probe_sent = None;
     h.last_probe_reply = None;
@@ -85,7 +85,7 @@ fn should_send_probe(last_packet_ago: Duration, last_probe_sent_ago: Option<Dura
 /// wedged zone would re-earn the 10s in-flight grace window on every 30s resend forever instead of
 /// staying flagged wedged. Extracted so tests can drive the exact state transition production code
 /// performs, not a re-derivation of it.
-fn record_probe_sent(h: &mut crate::http::NetHealth, now: std::time::Instant) {
+fn record_probe_sent(h: &mut crate::ipc::NetHealth, now: std::time::Instant) {
     h.last_probe_sent = Some(now);
     if h.first_unanswered_probe_sent.is_none() {
         h.first_unanswered_probe_sent = Some(now);
@@ -96,7 +96,7 @@ fn record_probe_sent(h: &mut crate::http::NetHealth, now: std::time::Instant) {
 /// ENDS the unanswered streak (`first_unanswered_probe_sent = None`), so `world_responsive` returns to
 /// "no verdict yet" until the next probe starts a new streak. Extracted alongside `record_probe_sent`
 /// for the same testability reason.
-fn record_probe_reply(h: &mut crate::http::NetHealth, now: std::time::Instant) {
+fn record_probe_reply(h: &mut crate::ipc::NetHealth, now: std::time::Instant) {
     h.last_probe_reply = Some(now);
     h.first_unanswered_probe_sent = None;
 }
@@ -111,7 +111,7 @@ fn record_probe_reply(h: &mut crate::http::NetHealth, now: std::time::Instant) {
 /// earlier wedge would sit older than every later probe forever, making the answered-clause
 /// `last_packet_ago <= first_unanswered_sent_ago` permanently true → a confident false-ALIVE that
 /// hides the re-wedge (the worst honesty class).
-fn record_app_packet(h: &mut crate::http::NetHealth, now: std::time::Instant) {
+fn record_app_packet(h: &mut crate::ipc::NetHealth, now: std::time::Instant) {
     h.last_packet = now;
     h.first_unanswered_probe_sent = None;
 }
@@ -125,11 +125,11 @@ pub async fn run_gameplay_phase(
     mut navigator: Navigator,
     world_creds:   WorldCredentials,
     shutdown:      Arc<AtomicBool>,
-    camp:          crate::http::CampReq,
-    camp_until:    crate::http::CampUntil,
-    respawn:       crate::http::RespawnReq,
-    game_state_snapshot: crate::http::GameStateSnapshot,
-    net_health:          crate::http::NetHealthShared,
+    camp:          crate::ipc::CampReq,
+    camp_until:    crate::ipc::CampUntil,
+    respawn:       crate::ipc::RespawnReq,
+    game_state_snapshot: crate::ipc::GameStateSnapshot,
+    net_health:          crate::ipc::NetHealthShared,
 ) {
     // Wrap in Option so Rust allows reassignment after zone transitions.
     let mut stream: Option<EqStream>                      = Some(stream_init);
@@ -625,8 +625,8 @@ async fn reconnect_via_world(
     gs:                   &mut GameState,
     char_name:            &str,
     creds:                &WorldCredentials,
-    net_health:           &crate::http::NetHealthShared,
-    game_state_snapshot:  &crate::http::GameStateSnapshot,
+    net_health:           &crate::ipc::NetHealthShared,
+    game_state_snapshot:  &crate::ipc::GameStateSnapshot,
 ) -> bool {
     drop(stream.take());
     drop(net_rx.take());
@@ -739,8 +739,8 @@ async fn run_zone_entry_handshake(
     stream:              &mut EqStream,
     net_rx:               &mut UnboundedReceiver<AppPacket>,
     gs:                   &mut GameState,
-    net_health:           &crate::http::NetHealthShared,
-    game_state_snapshot:  &crate::http::GameStateSnapshot,
+    net_health:           &crate::ipc::NetHealthShared,
+    game_state_snapshot:  &crate::ipc::GameStateSnapshot,
 ) {
     // Purge the previous zone's spawns/doors now, before OP_ReqClientSpawn asks for the new zone's
     // stream, and re-arm the once-per-zone-in OP_NewZone apply so the repeat OP_NewZone this
@@ -814,12 +814,12 @@ pub enum CampAction {
 /// Returns the new deadline state and the action to take. `Toggle` starts or cancels; `Start` only
 /// ever starts (never cancels an in-progress camp), so repeated /exit calls don't abort the camp.
 pub fn camp_apply(
-    cmd: crate::http::CampCmd,
+    cmd: crate::ipc::CampCmd,
     current: Option<std::time::Instant>,
     now: std::time::Instant,
     dur: Duration,
 ) -> (Option<std::time::Instant>, CampAction) {
-    use crate::http::CampCmd;
+    use crate::ipc::CampCmd;
     match (cmd, current) {
         (_, None)                  => (Some(now + dur), CampAction::Started),
         (CampCmd::Toggle, Some(_)) => (None, CampAction::Cancelled),
@@ -986,8 +986,8 @@ fn apply_loot_open_timeout(gs: &mut GameState, corpse_id: u32) {
 /// outside the `!=` guard.
 pub fn publish_snapshot(
     gs:         &GameState,
-    snapshot:   &crate::http::GameStateSnapshot,
-    net_health: &crate::http::NetHealthShared,
+    snapshot:   &crate::ipc::GameStateSnapshot,
+    net_health: &crate::ipc::NetHealthShared,
 ) {
     if **snapshot.load() != *gs {
         snapshot.store(Arc::new(gs.clone()));
@@ -998,7 +998,7 @@ pub fn publish_snapshot(
 #[cfg(test)]
 mod camp_tests {
     use super::*;
-    use crate::http::CampCmd;
+    use crate::ipc::CampCmd;
     use std::time::{Duration as Dur, Instant};
 
     #[test]
@@ -1222,8 +1222,8 @@ mod loot_tick_tests {
 mod snapshot_tests {
     use super::*;
 
-    fn health() -> crate::http::NetHealthShared {
-        Arc::new(std::sync::Mutex::new(crate::http::NetHealth::default()))
+    fn health() -> crate::ipc::NetHealthShared {
+        Arc::new(std::sync::Mutex::new(crate::ipc::NetHealth::default()))
     }
 
     /// #343: `net_tick` is a LIVENESS clock, not a change signal. It must advance on every publish
@@ -1233,7 +1233,7 @@ mod snapshot_tests {
     #[test]
     fn publish_snapshot_bumps_net_tick_even_when_state_is_unchanged() {
         let gs = GameState::new();
-        let snapshot: crate::http::GameStateSnapshot =
+        let snapshot: crate::ipc::GameStateSnapshot =
             Arc::new(arc_swap::ArcSwap::from_pointee(gs.clone()));
         let nh = health();
         nh.lock().unwrap().last_tick =
@@ -1249,7 +1249,7 @@ mod snapshot_tests {
 
     #[test]
     fn publish_snapshot_reflects_latest_state_independent_of_later_mutation() {
-        let snapshot: crate::http::GameStateSnapshot =
+        let snapshot: crate::ipc::GameStateSnapshot =
             Arc::new(arc_swap::ArcSwap::from_pointee(GameState::new()));
 
         let mut gs = GameState::new();
@@ -1274,7 +1274,7 @@ mod snapshot_tests {
     #[test]
     fn publish_snapshot_keeps_same_arc_when_state_unchanged() {
         let gs = GameState::new();
-        let snapshot: crate::http::GameStateSnapshot =
+        let snapshot: crate::ipc::GameStateSnapshot =
             Arc::new(arc_swap::ArcSwap::from_pointee(gs.clone()));
 
         publish_snapshot(&gs, &snapshot, &health());
@@ -1293,7 +1293,7 @@ mod snapshot_tests {
     #[test]
     fn publish_snapshot_publishes_new_arc_when_state_changed() {
         let mut gs = GameState::new();
-        let snapshot: crate::http::GameStateSnapshot =
+        let snapshot: crate::ipc::GameStateSnapshot =
             Arc::new(arc_swap::ArcSwap::from_pointee(gs.clone()));
 
         publish_snapshot(&gs, &snapshot, &health());
@@ -1343,10 +1343,10 @@ mod zone_entry_handshake_publish_tests {
 
         let mut gs = GameState::new();
         gs.zone_name = "oldzone".to_string();
-        let snapshot: crate::http::GameStateSnapshot =
+        let snapshot: crate::ipc::GameStateSnapshot =
             Arc::new(arc_swap::ArcSwap::from_pointee(gs.clone()));
-        let last_inbound: crate::http::NetHealthShared =
-            Arc::new(std::sync::Mutex::new(crate::http::NetHealth::default()));
+        let last_inbound: crate::ipc::NetHealthShared =
+            Arc::new(std::sync::Mutex::new(crate::ipc::NetHealth::default()));
 
         let snapshot_bg     = snapshot.clone();
         let last_inbound_bg = last_inbound.clone();
@@ -1375,7 +1375,7 @@ mod zone_entry_handshake_publish_tests {
 #[cfg(test)]
 mod liveness_probe_tests {
     use super::{consider_reply_is_self, probe_outstanding};
-    use crate::http::NetHealth;
+    use crate::ipc::NetHealth;
     use std::time::{Duration, Instant};
 
     fn ago(secs: u64) -> Instant { Instant::now() - Duration::from_secs(secs) }
@@ -1450,7 +1450,7 @@ mod wedge_timeline_tests {
     //! (true@0, false@22, true@42, false@52, true@72, ... — the exact timeline from the bug report),
     //! because every resend restamped the SAME clock `world_responsive` used for its 10s grace check.
     use super::{record_app_packet, record_probe_sent, should_send_probe, PROBE_INTERVAL};
-    use crate::http::{world_responsive, NetHealth, PROBE_TIMEOUT_SECS};
+    use crate::ipc::{world_responsive, NetHealth, PROBE_TIMEOUT_SECS};
     use std::time::{Duration, Instant};
 
     /// Drives a timeline second-by-second through the REAL `NetHealth` and the real production state
