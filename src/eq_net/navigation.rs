@@ -265,8 +265,8 @@ pub struct Navigator {
     last_pos_send:    Instant,
     streamed_init:    bool,
     /// The PATHFINDING WORKER (#340). Coarse A* plans are POSTED here and picked up on a later tick;
-    /// the net thread never blocks on a search. See `crate::eq_net::nav_planner`.
-    planner:          crate::eq_net::nav_planner::Planner,
+    /// the net thread never blocks on a search. See `crate::nav::planner`.
+    planner:          crate::nav::planner::Planner,
     /// The FINE-TIER WORKER (#382). The 2u/40u steering plan is posted here EVERY nav tick and picked
     /// up a tick or two later. It was the last A* left on the network thread, and the last search in
     /// the client under a wall-clock budget.
@@ -275,7 +275,7 @@ pub struct Navigator {
     /// `awaiting_first_plan`: the coarse tier may legitimately stand the character still (driving with
     /// no route at all would charge it through geometry), but the fine tier only ever REFINES an aim
     /// the coarse route already provides, so its absence degrades steering rather than blocking it.
-    local_planner:    crate::eq_net::nav_planner::LocalPlanner,
+    local_planner:    crate::nav::planner::LocalPlanner,
     /// The planner SNAPPED the current goal's z to a floor the caller never named (see
     /// `Collision::goal_z_was_snapped`). Carried to ARRIVAL, so the agent is not simply told
     /// `arrived` as though it got the goal it asked for — it did not.
@@ -444,8 +444,8 @@ impl Navigator {
             last_pos_send: Instant::now(),
             last_movement_history_send: Instant::now(),
             streamed_init: false,
-            planner: crate::eq_net::nav_planner::Planner::spawn(),
-            local_planner: crate::eq_net::nav_planner::LocalPlanner::spawn(),
+            planner: crate::nav::planner::Planner::spawn(),
+            local_planner: crate::nav::planner::LocalPlanner::spawn(),
             goal_snapped: false,
             awaiting_first_plan: false,
         }
@@ -828,7 +828,7 @@ impl Navigator {
     ///
     /// The carrot is judged against `reply.goal` — the carrot the plan was actually FOR — not against
     /// today's carrot, which has slid a few units since the request was posted.
-    fn apply_local_plan(&mut self, reply: crate::eq_net::nav_planner::LocalReply) {
+    fn apply_local_plan(&mut self, reply: crate::nav::planner::LocalReply) {
         let outcome = reply.outcome;
         self.local_path = outcome.steer().to_vec();
         self.local_from = reply.start;
@@ -876,7 +876,7 @@ impl Navigator {
     /// when the partial ran into a wall it froze at `blocked` and said nothing at all (#337).
     fn apply_plan(
         &mut self,
-        reply: crate::eq_net::nav_planner::PlanReply,
+        reply: crate::nav::planner::PlanReply,
         gs: &mut GameState,
         goal: (f32, f32, f32),
     ) -> bool {
@@ -2129,7 +2129,7 @@ impl Navigator {
                     // at a tier the region's z never had (#229). One BSP point query: microseconds.
                     let goal_region = c.zone_line_at([goal.0, goal.1, goal.2 + 1.0]);
                     let t0 = Instant::now();
-                    let gen = self.planner.request(crate::eq_net::nav_planner::PlanRequest {
+                    let gen = self.planner.request(crate::nav::planner::PlanRequest {
                         gen: 0, // assigned by the planner
                         start: [gs.player_x, gs.player_y, gs.player_z],
                         goal:  [goal.0, goal.1, goal.2],
@@ -2264,7 +2264,7 @@ impl Navigator {
             //    it cannot pose. This call is a channel send: microseconds, not a search.
             let local_goal = carrot_along(&self.path, self.path_i, [px, py], LOCAL_REACH).unwrap_or(coarse);
             if let Some(c) = self.collision.read().unwrap().as_ref().cloned() {
-                self.local_planner.post_if_idle(crate::eq_net::nav_planner::LocalRequest {
+                self.local_planner.post_if_idle(crate::nav::planner::LocalRequest {
                     gen: 0, // assigned by the planner
                     start: [px, py, gs.player_z],
                     goal:  local_goal,
@@ -2452,7 +2452,7 @@ impl Navigator {
                 let col = self.collision.read().unwrap().as_ref().cloned();
                 if let Some(c) = col {
                     let goal_region = c.zone_line_at([goal.0, goal.1, goal.2 + 1.0]);
-                    let gen = self.planner.request(crate::eq_net::nav_planner::PlanRequest {
+                    let gen = self.planner.request(crate::nav::planner::PlanRequest {
                         gen: 0,
                         start: [gs.player_x, gs.player_y, gs.player_z],
                         goal:  [goal.0, goal.1, goal.2],
@@ -2983,7 +2983,7 @@ mod tests {
     /// `nav_reason: goal_z_snapped`, all the way through to ARRIVAL, plus the message log.
     #[test]
     fn a_snapped_goal_z_is_reported_not_silently_performed() {
-        use crate::eq_net::nav_planner::PlanReply;
+        use crate::nav::planner::PlanReply;
         let g: crate::http::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::http::GroupSnapshot::default()));
         let mut nav = test_navigator(g);
         let mut gs = GameState::new();
@@ -3030,7 +3030,7 @@ mod tests {
     #[test]
     fn nav_tier_does_not_survive_into_a_later_no_path_or_arrived() {
         use crate::assets::{NoRoute, PlanLimit, PlanOutcome};
-        use crate::eq_net::nav_planner::PlanReply;
+        use crate::nav::planner::PlanReply;
         let group: crate::http::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::http::GroupSnapshot::default()));
         let mut nav = test_navigator(group);
         let mut gs = GameState::new();
@@ -3287,7 +3287,7 @@ mod tests {
         let group: crate::http::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::http::GroupSnapshot::default()));
         let mut nav = test_navigator(group);
 
-        let nwt = |start: [f32; 3]| crate::eq_net::nav_planner::LocalReply {
+        let nwt = |start: [f32; 3]| crate::nav::planner::LocalReply {
             gen: 1, start, goal: [start[0] + 40.0, start[1], start[2]],
             outcome: LocalOutcome::NoWayThrough { steer: vec![start], why: NoRoute::SearchClosed },
             plan_us: 100,
@@ -3305,7 +3305,7 @@ mod tests {
 
         // A Threaded plan ends the local-stuck run but must not forgive the budget (only tick's
         // progress reset does): the fine tier finding one way through does not prove the wedge gone.
-        nav.apply_local_plan(crate::eq_net::nav_planner::LocalReply {
+        nav.apply_local_plan(crate::nav::planner::LocalReply {
             gen: 2, start: [0.0, 0.0, 0.0], goal: [40.0, 0.0, 0.0],
             outcome: LocalOutcome::Threaded(vec![[0.0, 0.0, 0.0], [40.0, 0.0, 0.0]]), plan_us: 100,
         });
