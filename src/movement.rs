@@ -105,7 +105,7 @@ pub fn manual_wish(dir: [f32; 2]) -> ([f32; 2], Option<f32>) {
     if len > 1e-4 {
         let wish = [dir[0] / len, dir[1] / len];
         // The render loop's forward vector is (-sin h, cos h), so h = atan2(-east, north).
-        let heading = (-wish[0]).atan2(wish[1]).to_degrees().rem_euclid(360.0);
+        let heading = crate::coord::eq_heading(wish[0], wish[1]);
         (wish, Some(heading))
     } else {
         ([0.0, 0.0], None)
@@ -550,7 +550,7 @@ mod tests {
     /// running into things" looks like as a measurement: excessive cross-track error at the bend.
     #[test]
     fn nav_walker_hugs_a_bending_path_without_straying() {
-        use crate::eq_net::navigation::carrot_along;
+        use crate::nav::steering::carrot_along;
         // Floor east[-50,50] × north[-100,100]; a wall at east=0 blocks north<12, so the route must
         // detour up over the wall top (north≥12) and back down — a bend the walker must track.
         let col = col(vec![

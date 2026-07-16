@@ -1217,7 +1217,7 @@ impl App {
             if !manual_move {
                 let wd = intent.wish_dir;
                 if wd[0] * wd[0] + wd[1] * wd[1] > 1e-4 {
-                    self.heading_target = (-wd[0]).atan2(wd[1]).to_degrees().rem_euclid(360.0);
+                    self.heading_target = crate::coord::eq_heading(wd[0], wd[1]);
                 }
             }
 
@@ -1262,7 +1262,7 @@ impl App {
             // so strafing keeps facing forward instead of turning toward the sideways motion (which
             // would swing the auto-follow camera and spin the view).
             if !manual_move && de * de + dn * dn > 0.02 {
-                let motion_deg = (-de).atan2(dn).to_degrees().rem_euclid(360.0);
+                let motion_deg = crate::coord::eq_heading(de, dn);
                 // Guard against ~180° flips caused by the backward position-correction lerp
                 // that occurs when W is released and visual_player_pos snaps back toward the
                 // server position (which lags up to ~5 units behind the keyboard override).
@@ -2021,7 +2021,7 @@ fn smooth_entity_motion(
             // `to` (east=to[0], north=to[1]); when stopped, keep the authoritative server
             // heading (b.heading is refreshed from the entity each frame). (eqoxide#106)
             if d > 0.1 && m.speed > 0.5 {
-                b.heading = (-to[0]).atan2(to[1]).to_degrees().rem_euclid(360.0);
+                b.heading = crate::coord::eq_heading(to[0], to[1]);
             }
         }
 
