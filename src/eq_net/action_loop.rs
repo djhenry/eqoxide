@@ -552,7 +552,7 @@ impl ActionLoop {
         // For a real accept, look up the offering NPC's id from gs.task_offers (task_master_id is
         // required by the struct); a decline sends task_master_id=0 (irrelevant when task_id==0).
         // Either way, the selector window is done with — clear all pending offers.
-        if let Some(task_id) = self.quest.accept_task.lock().unwrap().take() {
+        if let Some(task_id) = self.command.take_accept_task() {
             let task_master_id = if task_id == 0 {
                 0
             } else {
@@ -571,7 +571,7 @@ impl ActionLoop {
 
         // POST /v1/quests/cancel ({"task_id":N}): abandon an active task. OP_CancelTask addresses
         // the task by its journal sequence_number, not task_id — see build_cancel_task.
-        if let Some(task_id) = self.quest.cancel_task.lock().unwrap().take() {
+        if let Some(task_id) = self.command.take_cancel_task() {
             if let Some(task) = gs.tasks.get(&task_id) {
                 let seq = task.sequence_number;
                 stream.send_app_packet(OP_CANCEL_TASK, &build_cancel_task(seq));
@@ -643,7 +643,7 @@ impl ActionLoop {
         // The server replies OP_GMTraining with the offered caps → apply_gm_training sets gs.trainer_*.
         // Sentinel: Some(0) ENDS the open session (OP_GMEndTraining) — 0 is never a real spawn id;
         // reusing the slot avoids threading one more field through the positional chains (#162).
-        if let Some(npc_id) = self.trainer.trainer_open_req.lock().unwrap().take() {
+        if let Some(npc_id) = self.command.take_trainer_open() {
             if npc_id == 0 {
                 if let Some(open_npc) = gs.trainer_open.take() {
                     let payload = build_gm_end_training(open_npc, gs.player_id);
@@ -659,7 +659,7 @@ impl ActionLoop {
 
         // POST /v1/trainer/train {"skill_id":N}: send OP_GMTrainSkill to the open trainer. The server
         // raises the skill and echoes OP_SkillUpdate → apply_skill_update reflects the new value.
-        if let Some(skill_id) = self.trainer.trainer_train_req.lock().unwrap().take() {
+        if let Some(skill_id) = self.command.take_train_skill() {
             if let Some(npc_id) = gs.trainer_open {
                 stream.send_app_packet(OP_GM_TRAIN_SKILL, &build_gm_train_skill(npc_id, skill_id));
                 tracing::info!("EQ: trainer: training skill {skill_id} at npc {npc_id}");
