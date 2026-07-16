@@ -80,8 +80,11 @@ pub struct ActionLoop {
     group_slots:      crate::ipc::GroupSlots,
     /// `/v1/trainer/*` slots (#M4 — see `ipc::TrainerSlots`).
     trainer:          crate::ipc::TrainerSlots,
-    /// `/v1/combat/*` (+ `/v1/pet/command`) slots (#M4 — see `ipc::CombatSlots`).
-    combat:           crate::ipc::CombatSlots,
+    /// The typed write-path facade (#446). Combat is fully migrated onto it — this thread drains
+    /// combat commands via `self.command.take_*` (no direct `ipc::CombatSlots` field any more);
+    /// other domains still use their own bundle fields until Wave-2 migrates them. See
+    /// `crate::command_state`.
+    command:          crate::command_state::CommandState,
     /// GET /v1/observe/who registers a oneshot here; drained in `tick` to send OP_WhoAllRequest.
     /// Client-local friends list + a pending friends-presence poll mirror the same shape (#300/#301,
     /// #M4 — see `ipc::SocialSlots`).
@@ -156,7 +159,7 @@ impl ActionLoop {
         quest:           crate::ipc::QuestSlots,
         group_slots:     crate::ipc::GroupSlots,
         trainer:         crate::ipc::TrainerSlots,
-        combat:          crate::ipc::CombatSlots,
+        command:         crate::command_state::CommandState,
         social:          crate::ipc::SocialSlots,
         merchant_slots:  crate::ipc::MerchantSlots,
         inventory_slots: crate::ipc::InventorySlots,
@@ -177,7 +180,7 @@ impl ActionLoop {
             quest,
             group_slots,
             trainer,
-            combat,
+            command,
             social,
             pending_who: None,
             pending_friends: None,
@@ -878,7 +881,7 @@ impl ActionLoop {
         // target_name/target_hp_pct (name/HP — update_hp/update_hp_pct then keep target_hp_pct
         // live as combat HP updates arrive) AND clears target_con/target_con_name/
         // target_attitude so the PREVIOUS target's con can't survive a re-target (eqoxide#323).
-        let target_id = self.combat.target.lock().unwrap().take();
+        let target_id = self.command.take_target();
         if let Some(id) = target_id {
             // Never adopt a spawn that isn't in the zone. POST /v1/combat/target 404s on an unknown
             // id, but the entity could still despawn between the HTTP check and this drain — and the
@@ -922,13 +925,13 @@ impl ActionLoop {
         }
     }
 
-    // TODO(MVC): combat.attack is written by both the HUD attack button and POST
-    // /v1/combat/attack — a shared controller verb should own "start/stop auto-attack" so this
-    // drain isn't arbitrating between two independent producers of the same request.
+    // #446: the HUD attack button and POST /v1/combat/attack now both write through the shared
+    // `CommandState::request_attack` verb, and this drain reads it back via `take_attack` — one
+    // typed surface over the slot instead of two call sites poking the raw `Arc<Mutex<..>>`.
     fn drain_combat(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Check attack request — send OP_AUTO_ATTACK(1) to start, OP_AUTO_ATTACK(0) to stop.
         // Server expects exactly 4 bytes; byte[0]=1 enables, byte[0]=0 disables.
-        let attack_req = self.combat.attack.lock().unwrap().take();
+        let attack_req = self.command.take_attack();
         if let Some(on) = attack_req {
             self.auto_attack = on;
             let payload = [if on { 1u8 } else { 0u8 }, 0, 0, 0];
@@ -942,7 +945,7 @@ impl ActionLoop {
         // POST /v1/pet/command or a Pet-window button: send one OP_PetCommands for the player's
         // pet. PET_ATTACK aims at the current target (like the auto-pet path); every other command
         // (back off / follow / guard / sit) targets 0 — the server acts on the pet itself.
-        let pet_cmd = self.combat.pet_cmd.lock().unwrap().take();
+        let pet_cmd = self.command.take_pet_command();
         if let Some(cmd) = pet_cmd {
             let cmd = cmd as u32;
             if gs.pet_id.is_none() {
@@ -1035,7 +1038,7 @@ impl ActionLoop {
         // "none" here or the self-fallback never fires. For BENEFICIAL spells (heals/buffs) that
         // aren't aimed at a friendly target, cast on the caster instead of a hostile/stale mob —
         // matching the real RoF2 client, which self-targets heals/buffs. (eqoxide#95)
-        let cast_req = self.combat.cast.lock().unwrap().take();
+        let cast_req = self.command.take_cast();
         if let Some(req) = cast_req {
           if let Some(item_slot) = req.item_slot {
             // Item "clicky" cast (teleport ring / port potion, etc.). Resolve the click spell from
@@ -1094,7 +1097,7 @@ impl ActionLoop {
         // Scribe a scroll into the spellbook (scribing=0) or memorize a known spell into a gem
         // (scribing=1) — OP_MemorizeSpell. The server validates (you hold the scroll / know the
         // spell) and pushes OP_MemorizeSpell back, which updates gs.mem_spells for the gem case.
-        let mem_req = self.combat.mem_spell.lock().unwrap().take();
+        let mem_req = self.command.take_mem_spell();
         if let Some((slot, spell_id, scribing, from)) = mem_req {
             // Scribing (0) only takes effect on the scroll sitting on the CURSOR: the RoF2 server
             // reads m_inv[slotCursor] and ignores the packet otherwise (silent fail, eqoxide#11).
@@ -1139,7 +1142,7 @@ impl ActionLoop {
 
     fn drain_consider(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Standalone consider.
-        let con_req = self.combat.consider.lock().unwrap().take();
+        let con_req = self.command.take_consider();
         if let Some(id) = con_req {
             stream.send_app_packet(OP_CONSIDER, &build_consider_packet(gs.player_id, id));
             tracing::info!("EQ: consider spawn_id={}", id);
@@ -1957,7 +1960,7 @@ mod tests {
             Default::default(), // quest
             crate::ipc::GroupSlots { group, ..Default::default() },
             Default::default(), // trainer
-            Default::default(), // combat
+            Default::default(), // command (CommandState)
             Default::default(), // social
             Default::default(), // merchant_slots
             Default::default(), // inventory_slots

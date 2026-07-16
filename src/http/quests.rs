@@ -135,7 +135,7 @@ pub(crate) mod tests {
             nav: Default::default(),
             world: Default::default(),
             shared_collision: Arc::new(std::sync::RwLock::new(None)),
-            combat: Default::default(),
+            command: Default::default(),
             social: Default::default(),
             merchant_slots: Default::default(),
             inventory_slots: Default::default(),

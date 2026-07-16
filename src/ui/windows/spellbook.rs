@@ -37,7 +37,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
         if !empty {
             let resp = resp.on_hover_text(format!("Cast {name} (gem {})", gem + 1));
             if resp.clicked() {
-                *cx.acts.cast.lock().unwrap() = Some(crate::http::CastRequest {
+                cx.acts.command.request_cast(crate::http::CastRequest {
                     gem: gem as u8,
                     target_id: None,
                     item_slot: None,

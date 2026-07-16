@@ -43,7 +43,7 @@ async fn post_command(
     });
     match cmd {
         Some(c) => {
-            *s.combat.pet_cmd.lock().unwrap() = Some(c);
+            s.command.request_pet_command(c);
             (StatusCode::OK, format!("pet command {c} queued"))
         }
         None => (StatusCode::BAD_REQUEST, "unknown pet command — use a PET_* number or attack|backoff|follow|guard|sit".into()),
