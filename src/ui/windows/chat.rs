@@ -36,7 +36,7 @@ fn submit(line: &str, cx: &mut UiCtx) {
     let arg = arg.trim();
     let send = |chan: u32, to: &str, text: &str| {
         if !text.is_empty() {
-            cx.acts.chat_send.lock().unwrap().push(ChatSend {
+            cx.acts.command.request_chat_send(ChatSend {
                 chan,
                 to: to.to_string(),
                 text: text.to_string(),

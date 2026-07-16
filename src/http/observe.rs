@@ -365,7 +365,7 @@ struct WhoView {
 /// anon}]}`. 503 if no response arrives in time. (#300)
 async fn get_who(State(s): State<HttpState>) -> Response {
     let (tx, rx) = oneshot::channel::<Vec<crate::game_state::WhoEntry>>();
-    *s.social.who_req.lock().unwrap() = Some(tx);
+    s.command.request_who(tx);
     match tokio::time::timeout(std::time::Duration::from_secs(6), rx).await {
         Ok(Ok(roster)) => {
             let online: Vec<WhoView> = roster.into_iter().map(|e| WhoView {

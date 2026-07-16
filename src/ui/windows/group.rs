@@ -26,10 +26,10 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
                 );
                 ui.horizontal(|ui| {
                     if ui.button(egui::RichText::new("Accept").size(11.0)).clicked() {
-                        *cx.acts.group_accept.lock().unwrap() = Some(());
+                        cx.acts.command.request_group_accept();
                     }
                     if ui.button(egui::RichText::new("Decline").size(11.0)).clicked() {
-                        *cx.acts.group_decline.lock().unwrap() = Some(());
+                        cx.acts.command.request_group_decline();
                     }
                 });
             });
@@ -85,7 +85,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
                         .small_button(egui::RichText::new("✕").size(9.0))
                         .on_hover_text(format!("Kick {} from the group", m.name));
                     if x.clicked() {
-                        *cx.acts.group_kick.lock().unwrap() = Some(m.name.clone());
+                        cx.acts.command.request_group_kick(m.name.clone());
                     }
                 });
             }
@@ -95,11 +95,11 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
         if !is_self && self_is_leader {
             row.response.interact(egui::Sense::click()).context_menu(|ui| {
                 if ui.button(egui::RichText::new("Kick").size(11.0)).clicked() {
-                    *cx.acts.group_kick.lock().unwrap() = Some(m.name.clone());
+                    cx.acts.command.request_group_kick(m.name.clone());
                     ui.close_menu();
                 }
                 if ui.button(egui::RichText::new("Make Leader").size(11.0)).clicked() {
-                    *cx.acts.group_make_leader.lock().unwrap() = Some(m.name.clone());
+                    cx.acts.command.request_group_make_leader(m.name.clone());
                     ui.close_menu();
                 }
             });
@@ -129,7 +129,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
             .on_hover_text("Leave the group")
             .clicked()
         {
-            *cx.acts.group_leave.lock().unwrap() = Some(());
+            cx.acts.command.request_group_leave();
         }
         ui.label(
             egui::RichText::new("right-click a member for options")
