@@ -139,7 +139,7 @@ pub struct Navigator {
     dialogue_click:   DialogueClickReq,
     chat_events:      ChatEventsShared,
     chat_send:        ChatSendShared,
-    collision:        crate::assets::SharedCollision,
+    collision:        crate::nav::collision::SharedCollision,
     maps_dir:         std::path::PathBuf,
     current_zone:     String,
     last_zone_cross:  Instant,
@@ -336,7 +336,7 @@ impl Navigator {
         sit:              SitReq,
         consider:         ConsiderReq,
         pet_cmd:          crate::http::PetCmdReq,
-        collision:        crate::assets::SharedCollision,
+        collision:        crate::nav::collision::SharedCollision,
         maps_dir:         std::path::PathBuf,
         camp:             CampReq,
         controller_view:  ControllerShared,
@@ -880,7 +880,7 @@ impl Navigator {
         gs: &mut GameState,
         goal: (f32, f32, f32),
     ) -> bool {
-        use crate::assets::PlanOutcome;
+        use crate::nav::collision::PlanOutcome;
         self.awaiting_first_plan = false;
         // The in-flight goal lives INSIDE the Planner now and is cleared by `poll` the moment the
         // reply is handed over, so a consumed-but-dropped reply can no longer wedge the planner
@@ -2804,7 +2804,7 @@ pub fn make_position_packet(spawn_id: u32, x: f32, y: f32, z: f32, heading: f32)
 #[cfg(test)]
 mod fine_tier_tests {
     use super::*;
-    use crate::assets::{LocalOutcome, NoRoute, PlanLimit};
+    use crate::nav::collision::{LocalOutcome, NoRoute, PlanLimit};
 
     /// A tiny deterministic LCG. No new dependency, and a seeded generator means a failure is
     /// reproducible — which a `rand`-seeded property test would not be.
@@ -2992,7 +2992,7 @@ mod tests {
         // The planner routed there — but only by moving the goal onto the floor at z = 47.
         nav.apply_plan(PlanReply {
             gen: 1,
-            outcome: crate::assets::PlanOutcome::Route(vec![[0.0, 0.0, 47.0], [100.0, 100.0, 47.0]]),
+            outcome: crate::nav::collision::PlanOutcome::Route(vec![[0.0, 0.0, 47.0], [100.0, 100.0, 47.0]]),
             plan_ms: 5,
             goal_snapped_z: Some(47.0),
             tight: false,
@@ -3012,7 +3012,7 @@ mod tests {
         // A goal whose z WAS honoured reports nothing — the accommodation must not be cried wolf.
         nav.apply_plan(PlanReply {
             gen: 2,
-            outcome: crate::assets::PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]]),
+            outcome: crate::nav::collision::PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]]),
             plan_ms: 5,
             goal_snapped_z: None,
             tight: false,
@@ -3029,7 +3029,7 @@ mod tests {
     /// pins that an ARRIVED and an Exhausted `navigating_partial` state carry no stale tier.
     #[test]
     fn nav_tier_does_not_survive_into_a_later_no_path_or_arrived() {
-        use crate::assets::{NoRoute, PlanLimit, PlanOutcome};
+        use crate::nav::collision::{NoRoute, PlanLimit, PlanOutcome};
         use crate::nav::planner::PlanReply;
         let group: crate::http::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::http::GroupSnapshot::default()));
         let mut nav = test_navigator(group);
@@ -3283,7 +3283,7 @@ mod tests {
     /// budget — only real journey progress (in `tick`) does that.
     #[test]
     fn proactive_replan_arms_and_counts_toward_the_oscillation_budget() {
-        use crate::assets::{LocalOutcome, NoRoute};
+        use crate::nav::collision::{LocalOutcome, NoRoute};
         let group: crate::http::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::http::GroupSnapshot::default()));
         let mut nav = test_navigator(group);
 

@@ -6,7 +6,7 @@
 //! loop on the main thread. The request slots are the cross-thread glue — HTTP writes them, the nav
 //! thread drains them. `--testzone` runs the renderer offline (no server) for asset/zone debugging.
 
-use eqoxide::{assets, camera_state, config, eq_net, eqstr, http};
+use eqoxide::{camera_state, config, eq_net, eqstr, http};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -237,7 +237,7 @@ OPTIONS:
         std::sync::Arc::new(eqoxide::spells::SpellDb::load(&spells_path));
     // Publish globally so the nav thread can resolve spell target types for self-cast (eqoxide#95).
     eqoxide::spells::set_global(spells.clone());
-    let shared_collision: assets::SharedCollision = Arc::new(std::sync::RwLock::new(None));
+    let shared_collision: eqoxide::nav::collision::SharedCollision = Arc::new(std::sync::RwLock::new(None));
     let frame_req:        http::FrameReq        = Arc::new(Mutex::new(None));
     // Single-owner GameState snapshot (see
     // docs/superpowers/plans/2026-07-12-gamestate-single-owner-snapshot.md). The network thread is

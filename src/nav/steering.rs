@@ -16,7 +16,7 @@ use crate::coord::eq_heading;
 /// Fine grid resolution of the LOCAL plan — the tier the walker actually steers along.
 ///
 /// This is the tier whose edges A* validates against the character's whole collision volume rather
-/// than a ray (`assets::SWEPT_EDGE_MAX_CELL`, which a test pins to be >= this). The coupling is why
+/// than a ray (`nav::collision::SWEPT_EDGE_MAX_CELL`, which a test pins to be >= this). The coupling is why
 /// the value lives here rather than inside `tick`: a silent change to either number un-arms the
 /// #358 fix on the only tier that enforces it.
 pub const LOCAL_CELL: f32 = 2.0;
@@ -140,8 +140,8 @@ pub(crate) fn replan_decision(
 /// character itself is boxed in (`StartIsolated`). A goal with no walkable floor under it is not
 /// somewhere any portal leads — redirecting there is nonsense, and worse, it replaces the agent's
 /// real reason (`goal_not_walkable` — *fix your coordinates*) with the portal's.
-pub(crate) fn portal_escape_applies(why: crate::assets::NoRoute) -> bool {
-    use crate::assets::NoRoute;
+pub(crate) fn portal_escape_applies(why: crate::nav::collision::NoRoute) -> bool {
+    use crate::nav::collision::NoRoute;
     matches!(why, NoRoute::SearchClosed | NoRoute::StartIsolated)
 }
 
@@ -292,8 +292,8 @@ pub(crate) fn steer_target(
 /// so it re-proposed the same corridor forever.
 ///
 /// `Threaded` obviously does not: the walker is threading it right now.
-pub(crate) fn arms_coarse_replan(outcome: &crate::assets::LocalOutcome) -> bool {
-    matches!(outcome, crate::assets::LocalOutcome::NoWayThrough { .. })
+pub(crate) fn arms_coarse_replan(outcome: &crate::nav::collision::LocalOutcome) -> bool {
+    matches!(outcome, crate::nav::collision::LocalOutcome::NoWayThrough { .. })
 }
 
 #[cfg(test)]
@@ -359,7 +359,7 @@ mod tests {
     /// reached them. Same family of lie as everything else this PR exists to kill.
     #[test]
     fn only_a_walled_off_goal_may_be_escaped_via_a_portal() {
-        use crate::assets::NoRoute;
+        use crate::nav::collision::NoRoute;
         // Walled off from a perfectly good goal, or boxed in ourselves → a teleport might genuinely
         // be the way out. That is what #266 is for.
         assert!(portal_escape_applies(NoRoute::SearchClosed), "a walled-off goal may be escaped to");

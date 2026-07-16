@@ -543,7 +543,7 @@ pub struct NavBlockage {
     pub at: [f32; 3],
 }
 
-/// What the fine 2 u steering tier last said, verbatim. See `assets::LocalOutcome`.
+/// What the fine 2 u steering tier last said, verbatim. See `nav::collision::LocalOutcome`.
 ///
 /// **`state` is never `no_path` and structurally cannot be.** The fine search closes only the frontier
 /// inside a 40 u window, so it can never prove a goal unreachable; conflating its local dead-end with
@@ -956,7 +956,7 @@ pub(crate) struct HttpState {
     pub(crate) entity_ids:       EntityIds,
     pub(crate) zone_points:      ZonePoints,
     /// Zone collision + region map (shared with the nav thread); read-only here, for zone_exits.
-    pub(crate) shared_collision: crate::assets::SharedCollision,
+    pub(crate) shared_collision: crate::nav::collision::SharedCollision,
     pub(crate) zone_cross:       ZoneCrossReq,
     /// Aggro-avoidance knobs set by /v1/move/goto|zone_cross and read by the nav walker (#242).
     pub(crate) nav_avoid:        NavAvoidShared,
@@ -1077,7 +1077,7 @@ pub fn spawn_camera_server(
     entity_positions: EntityPositions,
     entity_ids:       EntityIds,
     zone_points:      ZonePoints,
-    shared_collision: crate::assets::SharedCollision,
+    shared_collision: crate::nav::collision::SharedCollision,
     zone_cross:       ZoneCrossReq,
     manual_move:      ManualMoveReq,
     hail:             HailReq,
