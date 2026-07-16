@@ -762,7 +762,7 @@ impl PlanOutcome {
 /// one `Option<Vec<_>>`, no way to ask which. The walker armed the proactive coarse re-plan (#246) on
 /// both, so **a timeout was silently laundered into "the coarse route ahead is blocked"**. Under CPU
 /// load that fired on routes that were perfectly threadable. Telling the two apart is the whole point
-/// of this type — see `navigation::arms_coarse_replan`.
+/// of this type — see `nav::steering::arms_coarse_replan`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LocalOutcome {
     /// A complete fine route from the character to the carrot. The healthy case.
@@ -976,7 +976,7 @@ fn generous_node_cap(caller: Option<usize>) -> Option<usize> {
 
 /// Plan cell size at or below which A* validates an edge by sweeping the character's whole
 /// collision volume instead of casting a centre ray — see `Collision::edge_clear` for the measured
-/// reason this is not simply "always". Sits above `navigation::LOCAL_CELL` (2u, the fine tier) and
+/// reason this is not simply "always". Sits above `nav::steering::LOCAL_CELL` (2u, the fine tier) and
 /// below the coarse whole-zone grid (8u).
 pub(crate) const SWEPT_EDGE_MAX_CELL: f32 = 4.0;
 
@@ -1600,7 +1600,7 @@ impl Collision {
     /// #358 — a cell-centre line is only the line the WALKER will actually walk when the grid is
     /// fine enough:
     ///
-    /// * On the FINE local tier (`navigation::LOCAL_CELL` = 2u) the centre line ≈ the walked line,
+    /// * On the FINE local tier (`nav::steering::LOCAL_CELL` = 2u) the centre line ≈ the walked line,
     ///   and a corridor holds SEVERAL lateral cell choices. Rejecting the one edge that scrapes a
     ///   wall just makes A* pick the cell one over — down the middle. This is the tier the walker
     ///   steers along, and the only tier fine enough to even EXPRESS a route through a gap narrower
@@ -1632,7 +1632,7 @@ impl Collision {
     /// handed the walker routes it is physically incapable of following, and the controller's
     /// slide-along-wall response then shoved it off-route and wedged it.
     ///
-    /// The mismatch bites HARDEST on the fine local tier: at `navigation::LOCAL_CELL` = 2u the grid
+    /// The mismatch bites HARDEST on the fine local tier: at `nav::steering::LOCAL_CELL` = 2u the grid
     /// can actually *express* a route through a sub-capsule gap, where the coarse 8u grid never
     /// could. That is why the overlay showed the coarse line rounding the corner cleanly while the
     /// fine line — the one the walker steers along — hugged the wall. Measured on the live
@@ -3912,10 +3912,10 @@ mod tests {
     /// fall back to ray clearance and #358 would be un-fixed with every test still green.
     #[test]
     fn the_swept_edge_test_covers_the_tier_the_walker_actually_steers_along() {
-        assert!(crate::eq_net::navigation::LOCAL_CELL <= SWEPT_EDGE_MAX_CELL,
+        assert!(crate::nav::steering::LOCAL_CELL <= SWEPT_EDGE_MAX_CELL,
             "the local tier ({}) is not covered by the swept edge test (<= {}) — the walker would \
              be steered along ray-validated edges again (#358)",
-            crate::eq_net::navigation::LOCAL_CELL, SWEPT_EDGE_MAX_CELL);
+            crate::nav::steering::LOCAL_CELL, SWEPT_EDGE_MAX_CELL);
         // ...and the coarse whole-zone grid (8u) must stay OUTSIDE it — sweeping an 8u lattice line
         // seals corridors (Ak'Anon: 90/120 routable pairs -> 55/120).
         assert!(SWEPT_EDGE_MAX_CELL < 8.0, "the coarse tier must remain a ray-validated selector");
@@ -3931,7 +3931,7 @@ mod tests {
         let r = crate::movement::PLAYER_RADIUS;
         let col = slotted_wall(1.5); // narrower than the character (2 * PLAYER_RADIUS)
         let (from, to) = ([5.0, 9.0, 3.0], [15.0, 9.0, 3.0]);
-        // FINE tier (2u = navigation::LOCAL_CELL): the plan the walker actually steers along. The
+        // FINE tier (2u = nav::steering::LOCAL_CELL): the plan the walker actually steers along. The
         // character's volume must fit, and a corridor here has lateral cells to detour into.
         assert!(!col.edge_clear(from, to, r, 2.0),
             "the fine tier must validate the character's collision VOLUME");
@@ -4644,7 +4644,7 @@ mod tests {
                 for i in (0..route.len().saturating_sub(2)).step_by(3) {
                     if pairs.len() >= 240 { break; }
                     let from = route[i];
-                    let Some(carrot) = crate::eq_net::navigation::carrot_along(&route, i, [from[0], from[1]], LOCAL_REACH)
+                    let Some(carrot) = crate::nav::steering::carrot_along(&route, i, [from[0], from[1]], LOCAL_REACH)
                         else { continue };
                     pairs.push((from, carrot));
                 }
@@ -4734,7 +4734,7 @@ mod tests {
     #[test]
     #[ignore = "requires baked zone glbs at $ZONE_DIR; the faithful per-tick-recovery drift baseline"]
     fn faithful_walker_drift_corpus() {
-        use crate::eq_net::navigation::{carrot_along, fast_steer_aim};
+        use crate::nav::steering::{carrot_along, fast_steer_aim};
         use crate::movement::{CharacterController, MoveIntent, PLAYER_RADIUS};
 
         // Production constants, verbatim from navigation.rs (kept in sync — if these drift, the scanner
