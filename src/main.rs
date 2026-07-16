@@ -12,16 +12,10 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use winit::event_loop::EventLoop;
 
-fn main() {
-    eqoxide::logging::init();
-    // Install the panic hook + fatal-signal handlers + heartbeat BEFORE anything else runs, so
-    // no thread can panic or fault before the client is able to say why (#380).
-    eqoxide::crash::install();
-
-    // Parse + STRICTLY validate CLI args. We error out (with help) on anything malformed or
-    // unrecognized rather than silently falling back to defaults — a silent fallback once made the
-    // client log into the wrong account when --config pointed at a missing file.
-    const USAGE: &str = "\
+// Shared by `parse_cli` (prints it on a parse error / `-h`/`--help`) and `main` (prints it when a
+// syntactically valid `--config` still doesn't resolve to a file). Keeping one copy means both
+// error paths can never drift apart.
+const USAGE: &str = "\
 eqoxide — EverQuest (Titanium) client
 
 USAGE:
@@ -42,6 +36,21 @@ OPTIONS:
                            /tmp lockfile so concurrent test clients don't collide.
     -h, --help             Show this help and exit.
 ";
+
+/// Parsed command-line flags, as produced by [`parse_cli`].
+struct CliArgs {
+    testzone: bool,
+    profile: bool,
+    nav_debug: bool,
+    config: Option<String>,
+    api_port: Option<u16>,
+}
+
+/// Parse + STRICTLY validate `std::env::args()`. Errors out (printing [`USAGE`] and exiting via
+/// `eqoxide::crash::exit`) on anything malformed or unrecognized rather than silently falling
+/// back to defaults — a silent fallback once made the client log into the wrong account when
+/// `--config` pointed at a missing file.
+fn parse_cli() -> CliArgs {
     let args: Vec<String> = std::env::args().collect();
     let mut testzone_mode = false;
     let mut profile_flag  = false;
@@ -103,19 +112,37 @@ OPTIONS:
         }
         idx += 1;
     }
+    CliArgs {
+        testzone: testzone_mode,
+        profile: profile_flag,
+        nav_debug: nav_debug_flag,
+        config: login_cfg_arg,
+        api_port: api_port_arg,
+    }
+}
+
+fn main() {
+    eqoxide::logging::init();
+    // Install the panic hook + fatal-signal handlers + heartbeat BEFORE anything else runs, so
+    // no thread can panic or fault before the client is able to say why (#380).
+    eqoxide::crash::install();
+
+    let cli = parse_cli();
+    let testzone_mode = cli.testzone;
+    let nav_debug_flag = cli.nav_debug;
 
     // `--profile` (or EQ_PROFILE=1) enables the lightweight per-phase frame-timing HUD overlay.
-    let profile_mode = profile_flag
+    let profile_mode = cli.profile
         || std::env::var("EQ_PROFILE").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
     eqoxide::profiling::set_enabled(profile_mode);
 
     // Resolve the login config. When --config is given the resolved file MUST exist — we never fall
     // back to the default config in that case. The default ~/.config/eqoxide/config.yaml is used
     // only when --config is omitted.
-    let login_cfg_path = config::LoginConfig::resolve_path(login_cfg_arg.as_deref());
-    if login_cfg_arg.is_some() && !login_cfg_path.exists() {
+    let login_cfg_path = config::LoginConfig::resolve_path(cli.config.as_deref());
+    if cli.config.is_some() && !login_cfg_path.exists() {
         eprintln!("error: config file not found for --config {}: {}\n\n{USAGE}",
-            login_cfg_arg.as_deref().unwrap_or(""), login_cfg_path.display());
+            cli.config.as_deref().unwrap_or(""), login_cfg_path.display());
         eqoxide::crash::exit("bad-args", 2);
     }
     tracing::info!("renderer: loading login config from {}", login_cfg_path.display());
@@ -403,7 +430,7 @@ OPTIONS:
     // --api-port N: bind exactly N now and FAIL THE LAUNCH if it's taken (don't open a window with
     // a dead API). The bound listener is handed to the server thread so there's no re-bind race.
     // Without --api-port, pass None and let the server scan upward from the config base port.
-    let exact_listener: Option<std::net::TcpListener> = match api_port_arg {
+    let exact_listener: Option<std::net::TcpListener> = match cli.api_port {
         Some(p) => match std::net::TcpListener::bind(("127.0.0.1", p)) {
             Ok(l) => Some(l),
             Err(e) => {
