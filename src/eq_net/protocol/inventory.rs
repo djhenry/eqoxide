@@ -1,22 +1,31 @@
 //! Inventory move / possessions-slot packet builders. Moved out of `navigation.rs`
 //! (cleanup step 1) — pure `args -> Vec<u8>` builders with no navigation state.
 
+/// Encode one RoF2 `InventorySlot_Struct` (12 bytes): {Type(i16), Unknown02, Slot(i16),
+/// SubIndex(i16), AugIndex(i16), Unknown01} — the record every `rof2_*_slot` builder in this
+/// crate emits (possessions, bag-content, and trade slots all share this 12-byte shape; they
+/// differ only in `type_`/`slot`/`sub_index`). AugIndex is always SOCKET_INVALID (-1) here: none
+/// of this crate's callers target an augment sub-slot. AugIndex MUST be in [-1, 6) or the server
+/// rejects the whole slot as SLOT_INVALID (common/patches/rof2.cpp, RoF2ToServerSlot).
+pub(crate) fn inventory_slot_struct(type_: i16, slot: i16, sub_index: i16) -> [u8; 12] {
+    let mut s = [0u8; 12];
+    s[0..2].copy_from_slice(&type_.to_le_bytes());     // Type
+    s[2..4].copy_from_slice(&0i16.to_le_bytes());       // Unknown02
+    s[4..6].copy_from_slice(&slot.to_le_bytes());       // Slot
+    s[6..8].copy_from_slice(&sub_index.to_le_bytes());  // SubIndex
+    s[8..10].copy_from_slice(&(-1i16).to_le_bytes());   // AugIndex = SOCKET_INVALID
+    s[10..12].copy_from_slice(&0i16.to_le_bytes());     // Unknown01
+    s
+}
+
 /// Encode one RoF2 `InventorySlot_Struct` (12 bytes) for a flat *possessions* slot — equipment
 /// 0-22, general inventory 23-32, cursor 33. RoF2 does NOT send a bare slot int; it sends a
-/// structured record {Type(i16), Unknown02, Slot(i16), SubIndex(i16), AugIndex(i16), Unknown01}
-/// which the server decodes via RoF2ToServerSlot (common/patches/rof2.cpp). For a top-level
-/// possessions slot: Type = typePossessions (0), Slot = the flat slot, SubIndex = SLOT_INVALID (-1),
-/// AugIndex = SOCKET_INVALID (-1). AugIndex MUST be in [-1, 6) or the server rejects the whole slot
-/// as SLOT_INVALID. (Bank/trade/world slots use other Type values + offsets; not handled here.)
-pub fn rof2_possessions_slot(slot: u32) -> [u8; 12] {
-    let mut s = [0u8; 12];
-    s[0..2].copy_from_slice(&0i16.to_le_bytes());          // Type = typePossessions
-    s[2..4].copy_from_slice(&0i16.to_le_bytes());          // Unknown02
-    s[4..6].copy_from_slice(&(slot as i16).to_le_bytes()); // Slot
-    s[6..8].copy_from_slice(&(-1i16).to_le_bytes());       // SubIndex = SLOT_INVALID (top-level)
-    s[8..10].copy_from_slice(&(-1i16).to_le_bytes());      // AugIndex = SOCKET_INVALID
-    s[10..12].copy_from_slice(&0i16.to_le_bytes());        // Unknown01
-    s
+/// structured record (see [`inventory_slot_struct`]) which the server decodes via
+/// RoF2ToServerSlot (common/patches/rof2.cpp). For a top-level possessions slot: Type =
+/// typePossessions (0), Slot = the flat slot, SubIndex = SLOT_INVALID (-1). (Bank/trade/world
+/// slots use other Type values + offsets; not handled here.)
+pub(crate) fn rof2_possessions_slot(slot: u32) -> [u8; 12] {
+    inventory_slot_struct(0, slot as i16, -1)
 }
 
 /// Encode a RoF2 `InventorySlot_Struct` for any possessions OR bag-content flat slot. Top-level
@@ -25,18 +34,11 @@ pub fn rof2_possessions_slot(slot: u32) -> [u8; 12] {
 /// which the server decodes to the bagged item (`RoF2ToServerSlot`, common/patches/rof2.cpp:7080:
 /// `GENERAL_BAGS_BEGIN + (Slot-GENERAL_BEGIN)*SLOT_COUNT + SubIndex`). This is what makes bagged
 /// items movable. (eqoxide#201)
-pub fn rof2_inventory_slot(flat: u32) -> [u8; 12] {
+pub(crate) fn rof2_inventory_slot(flat: u32) -> [u8; 12] {
     let Some((parent, sub_index)) = crate::game_state::bag_wire_parent(flat as i32) else {
         return rof2_possessions_slot(flat);
     };
-    let mut s = [0u8; 12];
-    s[0..2].copy_from_slice(&0i16.to_le_bytes());               // Type = typePossessions
-    s[2..4].copy_from_slice(&0i16.to_le_bytes());               // Unknown02
-    s[4..6].copy_from_slice(&(parent as i16).to_le_bytes());    // Slot = parent general slot (23-32)
-    s[6..8].copy_from_slice(&(sub_index as i16).to_le_bytes()); // SubIndex = bag index 0-9
-    s[8..10].copy_from_slice(&(-1i16).to_le_bytes());           // AugIndex = SOCKET_INVALID
-    s[10..12].copy_from_slice(&0i16.to_le_bytes());             // Unknown01
-    s
+    inventory_slot_struct(0, parent as i16, sub_index as i16)
 }
 
 /// RoF2 `MoveItem_Struct` (28 bytes): from_slot(InventorySlot_Struct,12) + to_slot(…,12) +
