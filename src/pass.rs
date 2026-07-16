@@ -369,20 +369,12 @@ pub fn encode_billboard_pass(
     cam_up:    [f32; 3],
 ) {
     use wgpu::util::DeviceExt;
-    use crate::billboard::{billboard_quad, cross_marker, npc_color, npc_size};
+    use crate::billboard::{billboard_quad, npc_color, npc_size};
 
     let mut all_verts: Vec<crate::gpu::Vertex> = Vec::new();
     let mut all_idxs:  Vec<u32>                = Vec::new();
 
     for b in &scene.billboards {
-        if b.level == 0 {
-            // Level-0 placeholder spawns: draw a small red X on the ground
-            let (verts, idxs) = cross_marker(b.pos, 4.0, [0.9, 0.2, 0.2]);
-            let base = all_verts.len() as u32;
-            all_verts.extend(verts);
-            all_idxs.extend(idxs.iter().map(|i| i + base));
-            continue;
-        }
         if r.character_model_for(&b.race, b.gender).is_some() { continue; }
         let (verts, idxs) = billboard_quad(
             b.pos, npc_size(b.level), npc_color(b.is_target, b.dead, b.hp_pct),
@@ -767,7 +759,6 @@ pub fn encode_entity_pass(
     let mut slot  = PLAYER_UNIFORM_SLOTS;
 
     for b in &scene.billboards {
-        if b.level == 0 { continue; }
         if !crate::camera::entity_in_view(b.pos, scene.player_pos, r.last_view_proj,
                                           ENTITY_DRAW_DIST, ENTITY_CULL_MARGIN) { continue; }
         let archetype = race_to_archetype(&b.race);
