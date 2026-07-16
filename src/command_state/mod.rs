@@ -73,13 +73,12 @@ mod lifecycle;
 /// The typed write-path facade. Holds `.clone()`d handles of the same `ipc` command bundles that
 /// `ActionLoop` and `HttpState` hold; every method is a thin typed read/write of one of their slots.
 ///
-/// `#[allow(dead_code)]`: only the migrated domains' fields are read today (combat, in `combat.rs`).
-/// The rest are pre-declared so Wave-2 fan-out agents fill ONLY their own `command_state/<d>.rs`
-/// and its call sites (plus their own `drain_<d>` in `action_loop.rs`) — never this struct or any
-/// `fn` signature — which keeps the parallel branches off the shared lines (see the migration note
-/// above). A single final cleanup PR then removes the migrated fields and this allow at once.
+/// (#457 cleanup) Combat/merchant/inventory/interact/quest/group/guild/trainer/social/chat are all
+/// migrated now, so the struct-wide `#[allow(dead_code)]` is gone. `nav`, `lifecycle`, and
+/// `camera_manual_move` are still Wave-2 fan-out stubs (see `nav.rs`/`lifecycle.rs`/`camera.rs` —
+/// each is an empty `impl CommandState {}` shell) — narrow field-level allows below until those
+/// domains migrate, per the "HOW TO MIGRATE A DOMAIN" note above.
 #[derive(Clone, Default)]
-#[allow(dead_code)]
 pub struct CommandState {
     combat:    crate::ipc::CombatSlots,
     merchant:  crate::ipc::MerchantSlots,
@@ -91,11 +90,17 @@ pub struct CommandState {
     trainer:   crate::ipc::TrainerSlots,
     social:    crate::ipc::SocialSlots,
     chat:      crate::ipc::ChatSlots,
+    /// Not yet migrated (Wave-2 fan-out stub, see `nav.rs`) — no `request_*`/`take_*` reads this yet.
+    #[allow(dead_code)]
     nav:       crate::ipc::NavSlots,
+    /// Not yet migrated (Wave-2 fan-out stub, see `lifecycle.rs`).
+    #[allow(dead_code)]
     lifecycle: crate::ipc::LifecycleSlots,
     /// Camera's ONLY command slot (the manual-move/jump escape hatch). `CameraSlots` as a whole is
     /// deliberately NOT held here: it has no `Default` (its snapshot's initial value is meaningful)
     /// and its other fields are read-path. Held as the lone Arc so `CommandState` stays `Default`.
+    /// Not yet migrated (Wave-2 fan-out stub, see `camera.rs`).
+    #[allow(dead_code)]
     camera_manual_move: crate::ipc::ManualMoveReq,
 }
 
