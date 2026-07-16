@@ -107,6 +107,22 @@ pub struct Body {
     /// `1/sqrt(1+1.2²) ≈ 0.64`. `nav::collision::is_standable` reads this; `nav::collision::NAV_NEAR_HORIZONTAL` is
     /// now a thin alias. Single source of truth here.
     pub near_horizontal: f32,
+    /// SWIM GEOMETRY, half 1 (#359 / water design §2): how far below the water surface a swimmer's
+    /// feet rest. The controller's buoyancy target AND the plane the planner must assume a swimmer
+    /// occupies are both `surface_z − float_depth`. Before this field existed the value lived as
+    /// TWO duplicated local consts in `movement.rs` the planner had never heard of (the #386
+    /// disease): the planner sized water exits from the raw surface while the swimmer floated 2 u
+    /// lower, so a "legal" exit riser was up to 4.5 u against a ~2.5 u step and the character
+    /// bobbed at the waterline forever (#359).
+    pub float_depth: f32,
+    /// SWIM GEOMETRY, half 2 (#359 / water design §4c, option E3 — THE HAUL-OUT CONTRACT): the
+    /// tallest ledge a swimmer can mount, measured from the WATER SURFACE. The planner's water→land
+    /// exit cap (`nav::collision` WATER ASCENT edge) and the controller's haul-out capability are
+    /// both this one number: the planner admits an exit only when the lip is ≤ `haul_out_up` above
+    /// the surface, and the controller — driven to the surface by the nav swim-up (collided, feet
+    /// never leave the water column) — mounts the residual riser with the swimming step-up
+    /// (`STEP_UP` + `GROUND_SNAP_TOL` = 2.5 u capability, so 2.0 here leaves 0.5 u margin).
+    pub haul_out_up: f32,
 }
 
 /// The one body every query derives from.
@@ -126,6 +142,14 @@ pub const PLAYER_BODY: Body = Body {
     agent_height: 5.0,
     // 1/sqrt(1 + MAX_WALK_GRADE²) with MAX_WALK_GRADE = 1.2. Was `assets::NAV_NEAR_HORIZONTAL`, now `nav::collision::NAV_NEAR_HORIZONTAL`.
     near_horizontal: 0.64,
+    // The controller's historical FLOAT_DEPTH (body floats, head clears), verbatim — buoyancy
+    // behaviour is numerically identical; declaring it here is the drift-unrepresentable move.
+    float_depth: 2.0,
+    // = STEP_UP (design §10 decision 1, owner-approved E3 default): within the swimming step-up's
+    // 2.5 u capability with 0.5 u margin, and covers the qcat spawn-shaft ledge at
+    // surface + 1.03 u (#329). Raising it beyond 2.0 requires a genuine mantle capability the
+    // controller does not have — that would be its own design, not a constant tweak.
+    haul_out_up: crate::movement::STEP_UP,
 };
 
 impl Body {

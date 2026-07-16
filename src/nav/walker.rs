@@ -814,6 +814,11 @@ impl Walker {
             }
             _ => false,
         };
+        // Surface-approach for a haul-out (#359 contract, controller half's TRIGGER): when the
+        // waypoint sits above a swimmer, drive the vertical wish so the controller rises — the
+        // controller executes the rise COLLIDED and clamps it at the water surface (feet never
+        // leave the column), leaving a residual riser ≤ PLAYER_BODY.haul_out_up that its swimming
+        // step-up mounts. The planner admits only such exits, from the same Body fields.
         const SWIM_UP_RATE: f32 = 20.0; // u/s, comfortably under the controller's BUOY_RATE (30)
         let wish_vspeed = if swim && target.2 > gs.player_z + 1.0 { SWIM_UP_RATE } else { 0.0 };
         *self.nav_intent.lock().unwrap() = Some(MoveIntent {
