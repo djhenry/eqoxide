@@ -6,6 +6,7 @@
 
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::AppPacket;
+use crate::eq_net::wire::WireReader;
 use crate::game_state::{GameState, Entity, ZonePoint};
 
 /// Apply one EQ server packet to `gs`.
@@ -157,54 +158,6 @@ fn apply_animation(gs: &mut GameState, p: &[u8]) {
 // strings. Layouts cross-checked against EQEmu titanium.cpp ENCODE(OP_TaskDescription) + the
 // TaskActivity_Struct in eq_packet_structs.h. See docs/protocol-notes.md.
 
-/// Read a u32 LE at `*off`, advancing `off`. Returns 0 if out of bounds.
-fn rd_u32(p: &[u8], off: &mut usize) -> u32 {
-    if *off + 4 > p.len() { return 0; }
-    let v = u32::from_le_bytes([p[*off], p[*off + 1], p[*off + 2], p[*off + 3]]);
-    *off += 4;
-    v
-}
-
-/// Read a null-terminated string at `*off`, advancing `off` past the terminator.
-fn rd_cstr(p: &[u8], off: &mut usize) -> String {
-    let start = *off;
-    while *off < p.len() && p[*off] != 0 { *off += 1; }
-    let s = String::from_utf8_lossy(&p[start..*off]).into_owned();
-    if *off < p.len() { *off += 1; } // skip the null
-    s
-}
-
-/// Read one byte at `*off`, advancing `off`. Returns 0 if out of bounds.
-fn rd_u8(p: &[u8], off: &mut usize) -> u8 {
-    if *off >= p.len() { return 0; }
-    let v = p[*off];
-    *off += 1;
-    v
-}
-
-/// Read a u16 LE at `*off`, advancing `off`. Returns 0 if out of bounds.
-fn rd_u16(p: &[u8], off: &mut usize) -> u16 {
-    if *off + 2 > p.len() { return 0; }
-    let v = u16::from_le_bytes([p[*off], p[*off + 1]]);
-    *off += 2;
-    v
-}
-
-/// Read a fixed-width `len`-byte field at `*off` as a string, stopping at the first embedded NUL
-/// (or the field's end if there isn't one), advancing `off` by exactly `len` regardless of the
-/// packet's actual length (clamped to `p.len()` so this never panics on a truncated packet). Used
-/// for the Group* structs' `name[64]`-style fixed fields, unlike `rd_cstr`'s variable-length
-/// NUL-terminated fields used by the Task-system packets.
-fn rd_fixed_cstr(p: &[u8], off: &mut usize, len: usize) -> String {
-    let start = (*off).min(p.len());
-    let end = (*off + len).min(p.len());
-    let slice = &p[start..end];
-    let nul = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
-    let s = String::from_utf8_lossy(&slice[..nul]).into_owned();
-    *off += len;
-    s
-}
-
 /// Extract the display name from an EQ saylink. `EQ::SayLinkEngine::GenerateLink()` (EQEmu
 /// common/say_link.cpp) emits exactly two `\x12` delimiters: `\x12<56-char body><Name>\x12` — the
 /// body and name are one concatenated segment, not separately delimited. Returns the raw string
@@ -226,23 +179,23 @@ fn extract_saylink_text(s: &str) -> String {
 /// `sequence_number` (the header's SequenceNumber) is kept — OP_CancelTask addresses a task by it.
 /// `reward_item_text` is the item name extracted from item_link's EQ saylink markup.
 fn apply_task_description(gs: &mut GameState, p: &[u8]) {
-    let mut o = 0usize;
-    let sequence_number = rd_u32(p, &mut o);
-    let task_id = rd_u32(p, &mut o);
-    o += 1; // open_window u8
-    let _task_type = rd_u32(p, &mut o);
-    let _reward_type = rd_u32(p, &mut o);
-    let title = rd_cstr(p, &mut o);
-    let _duration = rd_u32(p, &mut o);
-    let _dur_code = rd_u32(p, &mut o);
-    let _start_time = rd_u32(p, &mut o);
-    let description = rd_cstr(p, &mut o);
-    o += 1; // has_rewards u8
-    let coin_reward = rd_u32(p, &mut o);
-    let xp_reward = rd_u32(p, &mut o);
-    let _faction = rd_u32(p, &mut o);
-    let _reward_text = rd_cstr(p, &mut o);
-    let item_link = rd_cstr(p, &mut o);
+    let mut r = WireReader::new(p, "OP_TaskDescription");
+    let sequence_number = r.u32();
+    let task_id = r.u32();
+    r.skip(1); // open_window u8
+    let _task_type = r.u32();
+    let _reward_type = r.u32();
+    let title = r.cstr();
+    let _duration = r.u32();
+    let _dur_code = r.u32();
+    let _start_time = r.u32();
+    let description = r.cstr();
+    r.skip(1); // has_rewards u8
+    let coin_reward = r.u32();
+    let xp_reward = r.u32();
+    let _faction = r.u32();
+    let _reward_text = r.cstr();
+    let item_link = r.cstr();
     let reward_item_text = extract_saylink_text(&item_link);
     if task_id == 0 { return; }
     let title_for_log = title.clone();
@@ -264,21 +217,21 @@ fn apply_task_description(gs: &mut GameState, p: &[u8]) {
 /// (activity_count,id3,taskid,activity_id,unk,activity_type,unk,unk) + mob_name cstr + item_name
 /// cstr + goal_count u32 + 4×u32 unknown + activity_name cstr + done_count u32 (+ unknown).
 fn apply_task_activity(gs: &mut GameState, p: &[u8]) {
-    let mut o = 0usize;
-    let _activity_count = rd_u32(p, &mut o);
-    let _id3 = rd_u32(p, &mut o);
-    let task_id = rd_u32(p, &mut o);
-    let activity_id = rd_u32(p, &mut o);
-    let _unk16 = rd_u32(p, &mut o);
-    let activity_type = rd_u32(p, &mut o);
-    let _unk24 = rd_u32(p, &mut o);
-    let _unk28 = rd_u32(p, &mut o);
-    let mob_name = rd_cstr(p, &mut o);
-    let item_name = rd_cstr(p, &mut o);
-    let goal_count = rd_u32(p, &mut o);
-    o += 16; // 4 unknown u32s
-    let activity_name = rd_cstr(p, &mut o);
-    let done_count = rd_u32(p, &mut o);
+    let mut r = WireReader::new(p, "OP_TaskActivity");
+    let _activity_count = r.u32();
+    let _id3 = r.u32();
+    let task_id = r.u32();
+    let activity_id = r.u32();
+    let _unk16 = r.u32();
+    let activity_type = r.u32();
+    let _unk24 = r.u32();
+    let _unk28 = r.u32();
+    let mob_name = r.cstr();
+    let item_name = r.cstr();
+    let goal_count = r.u32();
+    r.skip(16); // 4 unknown u32s
+    let activity_name = r.cstr();
+    let done_count = r.u32();
     if task_id == 0 { return; }
     // Objective text: prefer the explicit name, else the mob/item the step targets.
     let target = if !activity_name.is_empty() { activity_name }
@@ -308,23 +261,25 @@ fn apply_task_activity(gs: &mut GameState, p: &[u8]) {
 /// tank_flag: u8, assist_flag: u8, puller_flag: u8, offline_flag: u32, timestamp: u32).
 /// Full-replaces gs.group_members/group_leader.
 fn apply_group_update_b(gs: &mut GameState, p: &[u8]) {
-    let mut o = 0usize;
-    let _group_id = rd_u32(p, &mut o);
-    let member_count = rd_u32(p, &mut o);
-    let leader_name = rd_cstr(p, &mut o);
+    // VARIABLE-LENGTH: `member_count` records; a truncated packet must degrade gracefully (stop
+    // early), never panic — so this uses the cursor's non-panicking `try_*` path throughout.
+    let mut r = WireReader::new(p, "OP_GroupUpdateB");
+    let _group_id = r.try_u32().unwrap_or(0);
+    let member_count = r.try_u32().unwrap_or(0);
+    let leader_name = r.try_cstr().unwrap_or_default();
     let mut members = Vec::new();
     for _ in 0..member_count {
-        if o >= p.len() { break; } // truncated packet — stop instead of reading zeroed garbage
-        let _member_index = rd_u32(p, &mut o);
-        let member_name = rd_cstr(p, &mut o);
-        let is_merc = rd_u16(p, &mut o) != 0;
-        let _merc_owner_name = rd_cstr(p, &mut o);
-        let level = rd_u32(p, &mut o);
-        let tank = rd_u8(p, &mut o) != 0;
-        let assist = rd_u8(p, &mut o) != 0;
-        let puller = rd_u8(p, &mut o) != 0;
-        let offline = rd_u32(p, &mut o) != 0;
-        let _timestamp = rd_u32(p, &mut o);
+        if r.at_end() { break; } // truncated packet — stop instead of reading zeroed garbage
+        let _member_index = r.try_u32().unwrap_or(0);
+        let member_name = r.try_cstr().unwrap_or_default();
+        let is_merc = r.try_u16().unwrap_or(0) != 0;
+        let _merc_owner_name = r.try_cstr().unwrap_or_default();
+        let level = r.try_u32().unwrap_or(0);
+        let tank = r.try_u8().unwrap_or(0) != 0;
+        let assist = r.try_u8().unwrap_or(0) != 0;
+        let puller = r.try_u8().unwrap_or(0) != 0;
+        let offline = r.try_u32().unwrap_or(0) != 0;
+        let _timestamp = r.try_u32().unwrap_or(0);
         if member_name.is_empty() { continue; }
         let is_leader = !leader_name.is_empty() && member_name == leader_name;
         members.push(crate::game_state::GroupMember {
@@ -343,12 +298,12 @@ fn apply_group_update_b(gs: &mut GameState, p: &[u8]) {
 /// before) advanced only past owner_name's NUL — landing inside the zero padding — so membername came
 /// back EMPTY and the append was skipped, leaving existing members blind to later joiners (#101).
 fn apply_group_join(gs: &mut GameState, p: &[u8]) {
-    let mut o = 0usize;
-    let _owner_name = rd_fixed_cstr(p, &mut o, 64);
-    let member_name = rd_fixed_cstr(p, &mut o, 64);
-    let is_merc = rd_u8(p, &mut o) != 0;
-    o += 3; // padding
-    let level = rd_u32(p, &mut o);
+    let mut r = WireReader::new(p, "OP_GroupUpdate(GroupJoin)");
+    let _owner_name = r.fixed_cstr(64);
+    let member_name = r.fixed_cstr(64);
+    let is_merc = r.u8() != 0;
+    r.skip(3); // padding
+    let level = r.u32();
     if member_name.is_empty() { return; }
     if gs.group_members.iter().any(|m| m.name == member_name) { return; } // already known
     gs.group_members.push(crate::game_state::GroupMember {
@@ -374,9 +329,9 @@ fn apply_group_disband_you(gs: &mut GameState, _p: &[u8]) {
 /// defensively remove whichever of the two names is a CURRENT roster member (and
 /// no-op with a warning if neither matches) rather than guessing wrong and corrupting state.
 fn apply_group_disband_other(gs: &mut GameState, p: &[u8]) {
-    let mut o = 0usize;
-    let name1 = rd_fixed_cstr(p, &mut o, 64);
-    let name2 = rd_fixed_cstr(p, &mut o, 64);
+    let mut r = WireReader::new(p, "OP_GroupDisbandOther");
+    let name1 = r.fixed_cstr(64);
+    let name2 = r.fixed_cstr(64);
     let removed = if gs.group_members.iter().any(|m| m.name == name1) {
         Some(name1.clone())
     } else if gs.group_members.iter().any(|m| m.name == name2) {
@@ -397,8 +352,9 @@ fn apply_group_disband_other(gs: &mut GameState, p: &[u8]) {
 /// OP_GroupLeaderChange — leader name push. 148-byte common struct: Unknown000[64],
 /// LeaderName[64], Unknown128[20].
 fn apply_group_leader_change(gs: &mut GameState, p: &[u8]) {
-    let mut o = 64usize; // skip Unknown000[64]
-    let leader_name = rd_fixed_cstr(p, &mut o, 64);
+    let mut r = WireReader::new(p, "OP_GroupLeaderChange");
+    r.skip(64); // skip Unknown000[64]
+    let leader_name = r.fixed_cstr(64);
     if leader_name.is_empty() { return; }
     gs.group_leader = leader_name.clone();
     for m in gs.group_members.iter_mut() {
@@ -414,11 +370,13 @@ fn apply_group_leader_change(gs: &mut GameState, p: &[u8]) {
 /// (eqoxide#99). The client sent all-zero skills; the server overwrote them with the caps.
 fn apply_gm_training(gs: &mut GameState, p: &[u8]) {
     if p.len() < 8 { return; }
-    let npcid = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+    let mut r = WireReader::new(p, "OP_GMTraining");
+    let npcid = r.u32();
+    r.skip(4); // playerid (unused)
+    // skills[100] are optional trailing (a short packet just leaves later caps at 0) — non-panicking.
     let mut caps = vec![0u32; crate::skills::NUM_SKILLS];
-    for (i, c) in caps.iter_mut().enumerate() {
-        let o = 8 + i * 4;
-        if o + 4 <= p.len() { *c = u32::from_le_bytes([p[o], p[o + 1], p[o + 2], p[o + 3]]); }
+    for c in caps.iter_mut() {
+        match r.try_u32() { Some(v) => *c = v, None => break }
     }
     gs.trainer_open = Some(npcid);
     gs.trainer_skills = caps;
@@ -472,8 +430,9 @@ fn apply_ui_loot_state(gs: &mut GameState, p: &[u8]) {
 /// /v1/trainer/list stay current (eqoxide#99).
 fn apply_skill_update(gs: &mut GameState, p: &[u8]) {
     if p.len() < 8 { return; }
-    let id = u32::from_le_bytes([p[0], p[1], p[2], p[3]]) as usize;
-    let val = u32::from_le_bytes([p[4], p[5], p[6], p[7]]);
+    let mut r = WireReader::new(p, "OP_SkillUpdate");
+    let id = r.u32() as usize;
+    let val = r.u32();
     if gs.player_skills.len() < crate::skills::NUM_SKILLS {
         gs.player_skills = vec![0u32; crate::skills::NUM_SKILLS];
     }
@@ -487,9 +446,9 @@ fn apply_skill_update(gs: &mut GameState, p: &[u8]) {
 /// then 5 unknown/zero-filled u32s. Only acts when we are the invitee (should always be true for
 /// an inbound invite, but guards against a stray/misrouted packet).
 fn apply_group_invite(gs: &mut GameState, p: &[u8]) {
-    let mut o = 0usize;
-    let invitee_name = rd_fixed_cstr(p, &mut o, 64);
-    let inviter_name = rd_fixed_cstr(p, &mut o, 64);
+    let mut r = WireReader::new(p, "OP_GroupInvite");
+    let invitee_name = r.fixed_cstr(64);
+    let inviter_name = r.fixed_cstr(64);
     if invitee_name != gs.player_name { return; }
     gs.pending_invite = Some(inviter_name.clone());
     gs.push_event("group", "invite_received", &inviter_name, true, &format!("{inviter_name} invited you to a group"));
@@ -814,14 +773,16 @@ fn apply_shop_request(gs: &mut GameState, p: &[u8]) {
 /// stub if we never saw its OP_TaskDescription, so the id isn't silently lost) and upserts
 /// gs.completed_task_history with the title/time the packet already carries.
 fn apply_completed_tasks(gs: &mut GameState, p: &[u8]) {
-    let mut o = 0usize;
+    // VARIABLE-LENGTH: `count` records, but the count is clamped and a truncated packet must
+    // degrade gracefully — non-panicking `try_*` path (break on the first short read).
+    let mut r = WireReader::new(p, "OP_CompletedTasks");
     // Each entry is at least 9 bytes (task_id u32 + empty-title null byte + completed_time u32);
     // clamp so a malformed/truncated count can't spin the loop needlessly.
-    let count = rd_u32(p, &mut o).min((p.len() as u32 / 9).max(1));
+    let count = r.try_u32().unwrap_or(0).min((p.len() as u32 / 9).max(1));
     for _ in 0..count {
-        let task_id = rd_u32(p, &mut o);
-        let title = rd_cstr(p, &mut o);
-        let completed_time = rd_u32(p, &mut o);
+        let Some(task_id) = r.try_u32() else { break; };
+        let Some(title) = r.try_cstr() else { break; };
+        let Some(completed_time) = r.try_u32() else { break; };
         if task_id == 0 { continue; }
         let task = gs.tasks.entry(task_id).or_insert_with(|| crate::game_state::ActiveTask {
             task_id, ..Default::default()
@@ -847,26 +808,29 @@ fn apply_completed_tasks(gs: &mut GameState, p: &[u8]) {
 /// not modeled here — stop parsing this packet (leaving gs.task_offers untouched) and log a warning
 /// rather than guess at the layout and desync/garble subsequent offers in the same packet.
 fn apply_task_select_window(gs: &mut GameState, p: &[u8]) {
-    let mut o = 0usize;
+    // VARIABLE-LENGTH: `task_count` records, count clamped; a truncated/empty packet must degrade
+    // gracefully (an empty payload legitimately clears the offers — see the navigation.rs mirror),
+    // so this uses the non-panicking `try_*` path throughout.
+    let mut r = WireReader::new(p, "OP_TaskSelectWindow");
     // Each entry is at least 23 bytes (task_id u32 + reward_multiplier f32 + duration u32 +
     // duration_code u32 + title cstr≥1 + desc cstr≥1 + has_rewards u8 + element_count u32).
     // Header is 12 bytes (task_count u32 + type u32 + task_giver u32). Clamp the count so a
     // malformed/truncated packet can't request unbounded allocation.
-    let task_count = rd_u32(p, &mut o);
+    let task_count = r.try_u32().unwrap_or(0);
     let max_entries = (p.len().saturating_sub(12) as u32) / 23;
     let task_count = task_count.min(max_entries);
-    let _sel_type = rd_u32(p, &mut o);
-    let task_giver = rd_u32(p, &mut o);
+    let _sel_type = r.try_u32().unwrap_or(0);
+    let task_giver = r.try_u32().unwrap_or(0);
     let mut offers = Vec::with_capacity(task_count as usize);
     for _ in 0..task_count {
-        let task_id = rd_u32(p, &mut o);
-        o += 4; // reward_multiplier f32 (unused)
-        let _duration = rd_u32(p, &mut o);
-        let _duration_code = rd_u32(p, &mut o);
-        let title = rd_cstr(p, &mut o);
-        let description = rd_cstr(p, &mut o);
-        let has_rewards = rd_u8(p, &mut o) != 0;
-        let element_count = rd_u32(p, &mut o);
+        let task_id = r.try_u32().unwrap_or(0);
+        r.try_skip(4); // reward_multiplier f32 (unused)
+        let _duration = r.try_u32().unwrap_or(0);
+        let _duration_code = r.try_u32().unwrap_or(0);
+        let title = r.try_cstr().unwrap_or_default();
+        let description = r.try_cstr().unwrap_or_default();
+        let has_rewards = r.try_u8().unwrap_or(0) != 0;
+        let element_count = r.try_u32().unwrap_or(0);
         if element_count != 0 {
             tracing::warn!(
                 "EQ: OP_TaskSelectWindow: task_id={task_id} has element_count={element_count} \
@@ -902,7 +866,7 @@ fn apply_new_spawn(gs: &mut GameState, payload: &[u8]) {
 
 fn apply_delete_spawn(gs: &mut GameState, payload: &[u8]) {
     if payload.len() >= 4 {
-        let id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let id = WireReader::new(payload, "OP_DeleteSpawn").u32();
         gs.remove_entity(id);
     }
 }
@@ -1635,21 +1599,6 @@ fn apply_set_chat_server(gs: &mut GameState, payload: &[u8]) {
     }
 }
 
-/// Read a NUL-terminated string from the front of `buf`, returning the string (without the
-/// terminator) and the slice following it. Returns `None` if there is no NUL byte.
-fn read_cstr(buf: &[u8]) -> Option<(String, &[u8])> {
-    let nul = buf.iter().position(|&b| b == 0)?;
-    let s = String::from_utf8_lossy(&buf[..nul]).to_string();
-    Some((s, &buf[nul + 1..]))
-}
-
-/// Read a little-endian u32 from the front of `buf`, returning it and the slice following it.
-/// `None` if fewer than 4 bytes remain. Companion to [`read_cstr`] for cursor-style wire parsing.
-fn take_u32(buf: &[u8]) -> Option<(u32, &[u8])> {
-    if buf.len() < 4 { return None; }
-    Some((u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]), &buf[4..]))
-}
-
 /// Parse an `OP_WhoAllResponse` (RoF2 wire) roster into `gs.who_roster` (#300). Layout
 /// (`common/patches/rof2.cpp` ENCODE(OP_WhoAllResponse)):
 ///   64-byte `WhoAllReturnStruct` header — the online COUNT is a u32 at offset 44 (RoF2 moves it
@@ -1665,31 +1614,32 @@ fn apply_who_all(gs: &mut GameState, p: &[u8]) {
         return;
     }
     let count = u32::from_le_bytes([p[44], p[45], p[46], p[47]]) as usize;
-    let mut rest = &p[64..];
+    // VARIABLE-LENGTH: `count` records; on truncation keep what we already parsed rather than
+    // dropping all — non-panicking `try_*` path, break on the first short field.
+    let mut r = WireReader::new(&p[64..], "OP_WhoAllResponse");
     let mut roster: Vec<crate::game_state::WhoEntry> = Vec::with_capacity(count.min(4096));
     for _ in 0..count {
-        // Parse one record; on truncation, keep what we already have rather than dropping all.
         let parsed = (|| {
-            let (_fmt, r) = take_u32(rest)?;
-            let (_pad, r) = take_u32(r)?;
-            let (_pid, r) = take_u32(r)?;
-            let (name, r) = read_cstr(r)?;
-            let (_rank, r) = take_u32(r)?;
-            let (guild, r) = read_cstr(r)?;
-            let (_u80a, r) = take_u32(r)?;
-            let (_u80b, r) = take_u32(r)?;
-            let (zonestr, r) = take_u32(r)?;
-            let (zone, r) = take_u32(r)?;
-            let (class, r) = take_u32(r)?;
-            let (level, r) = take_u32(r)?;
-            let (race, r) = take_u32(r)?;
-            let (_acct, r) = read_cstr(r)?;
-            let (_u100, r) = take_u32(r)?;
+            let _fmt = r.try_u32()?;
+            let _pad = r.try_u32()?;
+            let _pid = r.try_u32()?;
+            let name = r.try_cstr()?;
+            let _rank = r.try_u32()?;
+            let guild = r.try_cstr()?;
+            let _u80a = r.try_u32()?;
+            let _u80b = r.try_u32()?;
+            let zonestr = r.try_u32()?;
+            let zone = r.try_u32()?;
+            let class = r.try_u32()?;
+            let level = r.try_u32()?;
+            let race = r.try_u32()?;
+            let _acct = r.try_cstr()?;
+            let _u100 = r.try_u32()?;
             let anon = zonestr == 0xFFFF_FFFF || (class == 0 && level == 0 && race == 0);
-            Some((crate::game_state::WhoEntry { name, level, class, race, zone_id: zone, guild, anon }, r))
+            Some(crate::game_state::WhoEntry { name, level, class, race, zone_id: zone, guild, anon })
         })();
         match parsed {
-            Some((entry, r)) => { roster.push(entry); rest = r; }
+            Some(entry) => roster.push(entry),
             None => break,
         }
     }
@@ -1702,13 +1652,19 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
     // fixed Titanium struct. See EQEmu common/patches/rof2.cpp ENCODE(OP_ChannelMessage):
     //   sender\0 | target\0 | u32 unknown | u32 language | u32 chan_num
     //   | u32 unknown | u8 unknown | u32 skill_in_language | message\0 | (trailing unknowns)
-    let (sender, rest) = match read_cstr(payload) { Some(v) => v, None => return };
-    let (targetname, rest) = match read_cstr(rest) { Some(v) => v, None => return };
+    // VARIABLE-LENGTH / hot chat path: sender+target are NUL-terminated and the packet has trailing
+    // unknowns, so a defensive early-return (not a panic) is kept for a malformed/short packet — via
+    // the cursor's non-panicking `try_cstr` + `remaining` guard.
+    let mut r = WireReader::new(payload, "OP_ChannelMessage");
+    let Some(sender) = r.try_cstr() else { return; };
+    let Some(targetname) = r.try_cstr() else { return; };
     // After the two strings: 4 (unk) + 4 (lang) + 4 (chan) + 4 (unk) + 1 (unk) + 4 (skill) = 21
     // bytes, then the NUL-terminated message.
-    if rest.len() < 21 { return; }
-    let chan_num = u32::from_le_bytes([rest[8], rest[9], rest[10], rest[11]]);
-    let msg = String::from_utf8_lossy(&rest[21..])
+    if r.remaining() < 21 { return; }
+    r.skip(8);              // unknown u32 + language u32
+    let chan_num = r.u32(); // chan_num is at offset 8 of the 21-byte block (guarded above)
+    r.skip(9);              // remainder of the 21-byte block (unknown u32 + u8 + skill u32)
+    let msg = String::from_utf8_lossy(r.rest())
         .split('\0').next().unwrap_or("")
         .to_string();
     if msg.is_empty() { return; }
@@ -1780,13 +1736,12 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
 fn apply_guild_list(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < 68 { return; }
     let count = u32::from_le_bytes([payload[64], payload[65], payload[66], payload[67]]) as usize;
-    let mut rest = &payload[68..];
+    // VARIABLE-LENGTH: `count` (id, name) records; a short packet stops the loop — non-panicking.
+    let mut r = WireReader::new(&payload[68..], "OP_GuildsList");
     let mut names = std::collections::HashMap::with_capacity(count);
     for _ in 0..count {
-        if rest.len() < 4 { break; }
-        let id = u32::from_le_bytes([rest[0], rest[1], rest[2], rest[3]]);
-        let (name, r) = match read_cstr(&rest[4..]) { Some(v) => v, None => break };
-        rest = r;
+        let Some(id) = r.try_u32() else { break; };
+        let Some(name) = r.try_cstr() else { break; };
         if !name.is_empty() { names.insert(id, name); }
     }
     tracing::info!("EQ: guild directory: {} guilds", names.len());
@@ -1800,29 +1755,29 @@ fn apply_guild_list(gs: &mut GameState, payload: &[u8]) {
 /// cstr public_note, u16 zoneinstance, u16 zone_id, u32 unk, u32 unk. Online = zone_id != 0. Full
 /// replace (the server re-sends the whole list on membership changes). (#295)
 fn apply_guild_member_list(gs: &mut GameState, payload: &[u8]) {
-    // All integers here are big-endian.
-    let rd_u32 = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
-    let rd_u16 = |b: &[u8]| u16::from_be_bytes([b[0], b[1]]);
-    let (_prefix, rest) = match read_cstr(payload) { Some(v) => v, None => return };
-    if rest.len() < 8 { return; }
-    let count = rd_u32(&rest[4..]) as usize; // skip the uninitialized guild_id u32 at rest[0..4]
-    let mut cur = &rest[8..];
+    // BIG-ENDIAN + VARIABLE-LENGTH: this is the one guild packet sent in network byte order. A short
+    // packet stops the loop rather than panicking — non-panicking `try_*_be` path with `has` guards.
+    let mut r = WireReader::new(payload, "OP_GuildMemberList");
+    let Some(_prefix) = r.try_cstr() else { return; };
+    if r.remaining() < 8 { return; }
+    r.skip(4); // skip the uninitialized guild_id u32
+    let count = r.u32_be() as usize;
     let mut members = Vec::with_capacity(count.min(4096));
     for _ in 0..count {
-        let (name, r) = match read_cstr(cur) { Some(v) => v, None => break };
-        cur = r;
-        if cur.len() < 40 { break; } // 10 × u32 before the public_note cstr
-        let level = rd_u32(&cur[0..]);
-        let class = rd_u32(&cur[8..]);   // cur[4..] = banker flags (skipped)
-        let rank  = rd_u32(&cur[12..]);
-        // consume the 10 fixed u32s: level, banker, class, rank, time_last_on, tribute_enable,
-        // unknown, total_tribute, last_tribute, unknown_one.
-        cur = &cur[40..];
-        let (public_note, r) = match read_cstr(cur) { Some(v) => v, None => break };
-        cur = r;
-        if cur.len() < 12 { break; } // u16 zoneinstance + u16 zone_id + u32 + u32
-        let zone_id = rd_u16(&cur[2..]) as u32; // cur[0..2] = zoneinstance (skipped)
-        cur = &cur[12..];
+        let Some(name) = r.try_cstr() else { break; };
+        if r.remaining() < 40 { break; } // 10 × u32 before the public_note cstr
+        let level = r.u32_be();
+        r.skip(4);                 // banker flags (skipped)
+        let class = r.u32_be();
+        let rank  = r.u32_be();
+        // consume the remaining fixed u32s: time_last_on, tribute_enable, unknown, total_tribute,
+        // last_tribute, unknown_one (level/banker/class/rank above make 10 total = 40 bytes).
+        r.skip(24);
+        let Some(public_note) = r.try_cstr() else { break; };
+        if r.remaining() < 12 { break; } // u16 zoneinstance + u16 zone_id + u32 + u32
+        r.skip(2);                 // zoneinstance (skipped)
+        let zone_id = r.u16_be() as u32;
+        r.skip(8);                 // trailing u32 + u32
         members.push(crate::game_state::GuildMember {
             name, rank, level, class, zone_id, online: zone_id != 0, public_note,
         });
@@ -2288,9 +2243,11 @@ fn apply_move_door(gs: &mut GameState, p: &[u8]) {
 
 fn apply_bind_respawn(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < 20 { return; }
-    gs.player_x = f32::from_le_bytes([payload[4],  payload[5],  payload[6],  payload[7]]);
-    gs.player_y = f32::from_le_bytes([payload[8],  payload[9],  payload[10], payload[11]]);
-    gs.player_z = f32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
+    let mut r = WireReader::new(payload, "OP_Respawn");
+    r.skip(4); // spawn_id / zone_id header (unused here)
+    gs.player_x = r.f32();
+    gs.player_y = r.f32();
+    gs.player_z = r.f32();
     // Real EQ revives a bind-respawned character at FULL HP. `apply_death` zeroed hp_pct and left
     // cur_hp/max_hp stale, so without this the HUD/API show a dead-but-full contradiction
     // (hp/hp_max full, hp_pct 0) until some later OP_HPUpdate happens to reconcile it (eqoxide#68).
@@ -5334,6 +5291,19 @@ mod tests {
         assert_eq!(task.xp_reward, 200);
         assert_eq!(task.reward_item_text, "Rusty Dagger");
         assert_eq!(task.status, TaskStatus::Active);
+    }
+
+    /// Behavior-change guard (cleanup #4): a truncated OP_TaskDescription — a fixed-layout,
+    /// single-record decoder — now PANICS via the `WireReader` instead of silently decoding a
+    /// zeroed/garbage task (the old `rd_u32`/`rd_cstr` silent-0 idiom). The panic names the packet
+    /// context so the crash is instantly diagnosable (agent-honesty invariant).
+    #[test]
+    #[should_panic(expected = "wire[OP_TaskDescription]")]
+    fn apply_task_description_truncated_panics() {
+        let mut gs = GameState::new();
+        // A valid header needs seq(4)+task_id(4)+open(1)+type(4)+reward(4)=17 bytes before the title
+        // cstr; give it only 6 so the second u32 read runs off the end.
+        apply_task_description(&mut gs, &[1, 0, 0, 0, 2, 0]);
     }
 
     fn build_completed_tasks(entries: &[(u32, &str, u32)]) -> Vec<u8> {

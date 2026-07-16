@@ -12,6 +12,7 @@
 #![allow(dead_code)]
 
 use std::mem;
+use crate::eq_net::wire::WireReader;
 
 mod combat;
 mod spells;
@@ -669,42 +670,35 @@ pub struct SpawnInfo {
 ///   word3: deltaHeading:10, z:19, pad:3
 ///   word4: animation:10, deltaY:13, pad:9
 pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
-    let mut p = 0usize;
+    // Spawn packets are inherently VARIABLE-LENGTH (variable name/lastName cstrs, flag-conditional
+    // title/suffix, race-dependent equipment block) and are consumed in a "parse until the buffer
+    // runs out / a record won't fit → stop" loop (`apply_zone_spawns`). Truncation therefore means
+    // "incomplete packet, not a spawn" → return None (an existing test enforces this for every
+    // truncation). So this decoder migrates to the unified `WireReader` MECHANISM but on its
+    // NON-panicking (`try_*` → None) path — it does not adopt panic-on-mismatch. Flagged for the
+    // orchestrator. The macros below map 1:1 onto the old ones, keeping the body unchanged.
+    let mut r = WireReader::new(buf, "OP_ZoneSpawn(Spawn_Struct)");
 
     macro_rules! need {
         ($n:expr) => {
-            if p + $n > buf.len() { return None; }
+            if !r.has($n) { return None; }
         };
     }
     macro_rules! rd_u8 {
-        () => {{ need!(1); let v = buf[p]; p += 1; v }};
+        () => {{ match r.try_u8() { Some(v) => v, None => return None } }};
     }
     macro_rules! rd_u32 {
-        () => {{
-            need!(4);
-            let v = u32::from_le_bytes([buf[p], buf[p+1], buf[p+2], buf[p+3]]);
-            p += 4; v
-        }};
+        () => {{ match r.try_u32() { Some(v) => v, None => return None } }};
     }
     macro_rules! rd_f32 {
-        () => {{ let v = f32::from_le_bytes([buf[p], buf[p+1], buf[p+2], buf[p+3]]); p += 4; v }};
+        () => {{ match r.try_f32() { Some(v) => v, None => return None } }};
     }
+    // Spawn name/lastName: NUL-terminated, but sanitised to "" when not all-printable-ASCII.
     macro_rules! rd_cstr {
-        () => {{
-            let start = p;
-            while p < buf.len() && buf[p] != 0 { p += 1; }
-            let s = if buf[p..].first() == Some(&0) {
-                let raw = &buf[start..p];
-                if raw.iter().all(|&b| b >= 0x20 && b < 0x7f) {
-                    String::from_utf8_lossy(raw).into_owned()
-                } else { String::new() }
-            } else { return None; };
-            p += 1; // null terminator
-            s
-        }};
+        () => {{ match r.try_cstr_ascii() { Some(v) => v, None => return None } }};
     }
     macro_rules! skip {
-        ($n:expr) => {{ need!($n); p += $n; }};
+        ($n:expr) => {{ if r.try_skip($n).is_none() { return None; } }};
     }
 
     // 1. name (null-terminated)
@@ -732,9 +726,7 @@ pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
     //   bit  22    : linkdead
     //   bit  23    : showhelm
     //   bits 24-31 : trader/targetable/etc.
-    need!(4);
-    let bitfields = u32::from_le_bytes([buf[p], buf[p+1], buf[p+2], buf[p+3]]);
-    p += 4;
+    let bitfields = rd_u32!();
     let gender   = (bitfields & 0x3) as u8;
     let show_helm = (bitfields >> 23) & 1 != 0;
 
@@ -829,28 +821,28 @@ pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
     if is_playable {
         // TintProfile: 9 × Tint_Struct (Blue,Green,Red,UseTint = 4 bytes each = 36 bytes)
         need!(36);
-        for i in 0..9usize {
-            let b = p + i * 4;
-            // Wire: Blue=buf[b], Green=buf[b+1], Red=buf[b+2]; store as RGB
-            equipment_tint[i] = [buf[b+2], buf[b+1], buf[b]];
+        for tint in equipment_tint.iter_mut() {
+            let b = r.bytes(4); // guaranteed in-bounds by need!(36)
+            // Wire: Blue=b[0], Green=b[1], Red=b[2]; store as RGB
+            *tint = [b[2], b[1], b[0]];
         }
-        p += 36;
 
         // Equipment: 9 × Texture_Struct (Material u32 + 4×u32 padding = 20 bytes each)
         need!(180);
-        for i in 0..9usize {
-            let b = p + i * 20;
-            equipment[i] = u32::from_le_bytes([buf[b], buf[b+1], buf[b+2], buf[b+3]]);
+        for slot in equipment.iter_mut() {
+            *slot = r.u32();  // Material (guaranteed in-bounds by need!(180))
+            r.skip(16);       // 4×u32 padding
         }
-        p += 180;
     } else {
         // Non-playable: 3 × Texture_Struct in abbreviated form (only Material fields used).
         // Layout: 5 zeros(u32) | Primary.Material(u32) | 4 zeros(u32)
         //       | Secondary.Material(u32) | 4 zeros(u32)  = 15 u32s = 60 bytes.
         need!(60);
-        equipment[7] = u32::from_le_bytes([buf[p+20], buf[p+21], buf[p+22], buf[p+23]]);
-        equipment[8] = u32::from_le_bytes([buf[p+40], buf[p+41], buf[p+42], buf[p+43]]);
-        p += 60;
+        r.skip(20);
+        equipment[7] = r.u32();   // Primary.Material @ +20
+        r.skip(16);
+        equipment[8] = r.u32();   // Secondary.Material @ +40
+        r.skip(16);
     }
 
     // Position: Spawn_Struct_Position (5×u32 = 20 bytes)
@@ -860,11 +852,11 @@ pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
     // word3: deltaHeading:10, z:19, pad:3
     // word4: animation:10, deltaY:13, pad:9
     need!(20);
-    let w0 = u32::from_le_bytes([buf[p],   buf[p+1],  buf[p+2],  buf[p+3]]);
-    let w2 = u32::from_le_bytes([buf[p+8], buf[p+9],  buf[p+10], buf[p+11]]);
-    let w3 = u32::from_le_bytes([buf[p+12],buf[p+13], buf[p+14], buf[p+15]]);
-    let w4 = u32::from_le_bytes([buf[p+16],buf[p+17], buf[p+18], buf[p+19]]);
-    p += 20;
+    let w0 = r.u32();
+    let _w1 = r.u32(); // deltaZ/deltaX — unused
+    let w2 = r.u32();
+    let w3 = r.u32();
+    let w4 = r.u32();
 
     // y: signed 19-bit at bits 12-30 of word0
     let y = sext((w0 >> 12) & 0x7FFFF, 19) as f32 / 8.0;
@@ -878,15 +870,19 @@ pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
     // animation: unsigned 10-bit at bits 0-9 of word4
     let animation = w4 & 0x3FF;
 
+    // OPTIONAL trailing fields — present only when the flag bit is set. These MUST stay on the
+    // non-panicking path: reading them as required would panic on a valid packet whose flag is
+    // clear (or whose trailing string is unterminated). `try_cstr` consumes the string if a NUL is
+    // present; otherwise we consume the remainder (matching the old walk-to-end-of-buffer behaviour).
     // Optional title (OtherData & 0x10 = bit4)
-    if other_data & 0x10 != 0 {
-        while p < buf.len() && buf[p] != 0 { p += 1; }
-        if p < buf.len() { p += 1; }
+    if other_data & 0x10 != 0 && r.try_cstr().is_none() {
+        let rem = r.remaining();
+        r.skip(rem);
     }
     // Optional suffix (OtherData & 0x20 = bit5)
-    if other_data & 0x20 != 0 {
-        while p < buf.len() && buf[p] != 0 { p += 1; }
-        if p < buf.len() { p += 1; }
+    if other_data & 0x20 != 0 && r.try_cstr().is_none() {
+        let rem = r.remaining();
+        r.skip(rem);
     }
 
     // unknown20: 2 ints (SplineID etc.)
@@ -906,7 +902,7 @@ pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
         pet_owner_id, player_state,
         x, y, z, heading, animation,
         equipment, equipment_tint,
-    }, p))
+    }, r.pos()))
 }
 
 // ── Race ID → renderer code mapping ────────────────────────────────────────
