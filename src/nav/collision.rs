@@ -1865,7 +1865,7 @@ impl Collision {
         // grade (rise/run) exceeds what's walkable; A* then routes around the steep face.
         const MAX_WALK_GRADE: f32 = 1.2;  // walkable up to ~50° (rise/run); steeper = slide
         // Jump-edges (eqoxide#190): let A* leap a GENUINE horizontal floor gap a running jump can
-        // clear. NAV_RUN_SPEED matches navigation::RUN_SPEED (the speed the walker drives a jump at);
+        // clear. NAV_RUN_SPEED matches action_loop::RUN_SPEED (the speed the walker drives a jump at);
         // reach is derived from it via movement::running_jump_reach (~22.7u). JUMP_UP_TOL caps how
         // much higher a landing may sit (a running jump's apex ≈ JUMP_VELOCITY²/2·GRAVITY ≈ 4u).
         // JUMP_PENALTY makes a jump cost more than the equivalent walk so A* only jumps when a gap

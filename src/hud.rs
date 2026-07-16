@@ -421,8 +421,8 @@ pub fn draw_nav_debug(
         // stale/awkward segment, instead of an idealized fresh route (#246). No A* runs here, so a long
         // route no longer hitches the frame rate; we still bound the DRAWN coarse line to a near-range
         // window so a cross-zone route isn't a screen-spanning tangle.
-        //   • COARSE (yellow): the walker's global 8u route (`Navigator::path`), drawn ≤COARSE_VIS ahead.
-        //   • FINE (cyan): the fine 2u local plan (`Navigator::local_path`) the walker steers along.
+        //   • COARSE (yellow): the walker's global 8u route (`ActionLoop::path`), drawn ≤COARSE_VIS ahead.
+        //   • FINE (cyan): the fine 2u local plan (`ActionLoop::local_path`) the walker steers along.
         const COARSE_VIS: f32 = 160.0;
         let (coarse_plan, fine_plan) = nav_paths;
         if let Some(goal) = nav_goal {
