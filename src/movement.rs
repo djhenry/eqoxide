@@ -274,6 +274,7 @@ impl CharacterController {
                 {
                     self.vel_z = NAV_HOP_VELOCITY;
                     self.on_ground = false;
+                    self.airborne_start_z = Some(self.pos[2]); // §442: a hop begins an airborne stretch
                     self.hop_cooldown = HOP_COOLDOWN;
                 }
             }
@@ -298,6 +299,11 @@ impl CharacterController {
         if swimming {
             self.on_ground = false;
             self.vel_z = 0.0;
+            // §442 (#442) DEFECT-1: water BREAKS a fall — the airborne episode is over the moment the
+            // body is in water. Drop any tracked airborne start so a later dry-ground step-out cannot
+            // latch a stale phantom fall height (fall off a cliff into a lake → swim to shore → NO
+            // fall damage). Matches the old `drive_controlled_fall` water-landing guard + WASD (no dmg).
+            self.airborne_start_z = None;
             if intent.wish_vspeed != 0.0 {
                 // Explicit vertical swim input (the nav swim-up drive, or a human swimming along
                 // the look direction). COLLIDED (#359, second mechanism): this used to be a raw
@@ -339,6 +345,10 @@ impl CharacterController {
             // submerged_on_floor, i.e. genuinely below the surface and about to rise).
             self.on_ground = false;
             self.vel_z = 0.0;
+            // §442 (#442) DEFECT-1: water broke the fall — end the airborne episode (see the swim
+            // branch). Without this, a cliff-drop into water then a walk onto shore latches a
+            // lethal phantom `landed_fall_height` (the stale pre-water start minus the shore z).
+            self.airborne_start_z = None;
             if let Some(surf) = col.water_surface(water_at) {
                 let target = surf - float_depth;
                 if self.pos[2] < target {
@@ -1065,5 +1075,57 @@ mod tests {
         assert!(ctrl.take_landed_fall_height().is_none(),
             "a depenetration/ground-snap grounding mid-fall must NOT emit fall damage");
         assert!(ctrl.airborne_start_z.is_none(), "the net must clear the stale airborne start");
+    }
+
+    /// §442 (#442) DEFECT-1 — water BREAKS a fall: no phantom fall damage on stepping out onto shore.
+    /// Fall off a cliff (airborne start recorded) INTO a lake, float, then walk onto dry ground — the
+    /// dry-land step-out must NOT latch the stale pre-water airborne height (which would be lethal).
+    /// This is the agent-honesty defect: a calm swim-out must never register a phantom HP drop/death.
+    ///
+    /// MUTATION-CHECK: removing the `self.airborne_start_z = None` clears from the water branches
+    /// (swim + submerged/buoyancy) makes this RED — the shore landing then latches
+    /// `Some(pre_water_start − shore_z)` and `take_landed_fall_height()` returns `Some(..)`.
+    #[test]
+    fn water_breaks_a_fall_no_phantom_damage_on_shore() {
+        // Phase 1 — deep water z∈[0,30] over a pool floor at z=0. Start "grounded" 60u up so frame 1
+        // sees the floor drop away (airborne start = 60), then fall INTO the lake and float.
+        let water_c = {
+            let mut c = col(vec![floor(0.0, -100.0, 100.0)]);
+            c.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::water_slab(0.0, 30.0))));
+            c
+        };
+        let mut ctrl = CharacterController::new([0.0, 0.0, 60.0]);
+        ctrl.on_ground = true;
+        for _ in 0..240 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 60.0, &water_c); }
+        assert!(ctrl.in_water, "phase 1 must have fallen into the water: z={}", ctrl.pos[2]);
+        assert!(ctrl.airborne_start_z.is_none(), "water must end the airborne episode (clear the start)");
+
+        // Phase 2 — the character walks out onto a DRY shore (no water, dry floor at z=0 below the
+        // float line). Landing here must NOT latch the stale z=60 airborne start.
+        let shore = col(vec![floor(0.0, -100.0, 100.0)]);
+        for _ in 0..240 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 60.0, &shore); }
+        assert!(ctrl.on_ground, "should have come to rest on the dry shore floor: z={}", ctrl.pos[2]);
+        assert!(ctrl.take_landed_fall_height().is_none(),
+            "water broke the fall — stepping onto shore must apply NO (phantom) fall damage");
+    }
+
+    /// §442 (#442) DEFECT-2 — a nav auto-hop begins an airborne stretch too: the hop-launch path must
+    /// record the airborne start so a hop that lands lower still reports its fall height (else the hop
+    /// off a fence at an edge would deal no damage). Hop a thin fence onto a floor 3u lower.
+    #[test]
+    fn hop_off_a_fence_latches_a_fall_height() {
+        // Floor z=0 for east<5, a thin fence (z=0..5) at east=5, and floor z=-3 beyond (a drop within
+        // the hop probe band so `can_hop` fires). The hop launches from z=0 and lands on z=-3.
+        let geo = col(vec![floor(0.0, -100.0, 5.0), wall(5.0, 0.0, 5.0), floor(-3.0, 5.0, 100.0)]);
+        let nav_intent = MoveIntent { wish_dir: [1.0, 0.0], wish_vspeed: 0.0, jump: false,
+            want_swim: false, speed: 35.0, climb: 0.0, hop: true };
+        let mut ctrl = CharacterController::new([2.0, 0.0, 0.0]);
+        ctrl.on_ground = true;
+        for _ in 0..80 { ctrl.step(nav_intent, 0.05, &geo); }
+        assert!(ctrl.pos[0] > 6.0, "nav should have hopped past the fence: east={}", ctrl.pos[0]);
+        assert!((ctrl.pos[2] + 3.0).abs() < 0.5, "should land on the z=-3 floor beyond: {}", ctrl.pos[2]);
+        let h = ctrl.take_landed_fall_height();
+        assert!(h.is_some_and(|h| (h - 3.0).abs() < 1.0),
+            "the hop-launch must record the airborne start so the 3u drop is reported, got {h:?}");
     }
 }
