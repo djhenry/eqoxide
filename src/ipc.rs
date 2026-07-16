@@ -209,8 +209,8 @@ pub type NavAvoidShared = Arc<Mutex<AggroAvoidOpts>>;
 
 /// The walker's ACTUAL committed plan, published each nav tick so the `--nav-debug` overlay can draw
 /// exactly what the walker is following instead of an independent per-frame `find_path` recompute
-/// (#246). `.0` = coarse global route (`Navigator::path`), `.1` = fine local plan
-/// (`Navigator::local_path`). Empty when idle. Draw-only; never steered from.
+/// (#246). `.0` = coarse global route (`ActionLoop::path`), `.1` = fine local plan
+/// (`ActionLoop::local_path`). Empty when idle. Draw-only; never steered from.
 pub type NavPathView = Arc<Mutex<(Vec<[f32; 3]>, Vec<[f32; 3]>)>>;
 
 /// Live entity name → (x, y, z) map, updated by login.rs as packets arrive.
@@ -284,7 +284,7 @@ pub struct GuildSnapshot {
 pub type GuildShared = Arc<Mutex<GuildSnapshot>>;
 
 /// One queued guild action from POST /v1/guild/{invite,accept,leave,remove}, drained by the nav tick
-/// which sends the matching RoF2 guild opcode. Bundled into one slot to keep the Navigator plumbing
+/// which sends the matching RoF2 guild opcode. Bundled into one slot to keep the ActionLoop plumbing
 /// small. (#295)
 #[derive(Clone, Debug, PartialEq)]
 pub enum GuildAction {

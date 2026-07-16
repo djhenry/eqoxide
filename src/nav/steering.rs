@@ -1,8 +1,8 @@
 //! Pure navigation/steering math — pursuit carrots, replan/arrival decisions, the fast-steering
 //! cursor. Net-independent: this takes positions and paths, and depends only on `assets` types
-//! (no `EqStream`, no packets). Extracted out of `eq_net::navigation` (cleanup step 2 — nav must
-//! not live inside net). The `Navigator` god-struct and its `tick()`/`sync_*`/`apply_*plan`
-//! methods (the net action loop) are a later step and still live in `eq_net::navigation`.
+//! (no `EqStream`, no packets). Extracted out of `eq_net::action_loop` (cleanup step 2 — nav must
+//! not live inside net). The `ActionLoop` god-struct and its `tick()`/`sync_*`/`apply_*plan`
+//! methods (the net action loop) are a later step and still live in `eq_net::action_loop`.
 
 use crate::coord::eq_heading;
 
@@ -65,7 +65,7 @@ pub(crate) const JUMP_TAKEOFF_DIST: f32 = 7.0;
 // moved there wholesale: it used to run SYNCHRONOUSLY here, on the network thread, which is the
 // single root cause of #340 (up to ~2 s of net-thread stall → linkdead) and #337 (the 150 ms budget
 // forced A* to give up, and a give-up was indistinguishable from "no route", so the walker silently
-// drove a partial route into a wall and froze). `Navigator::tick` now POSTS a request and returns.
+// drove a partial route into a wall and froze). `ActionLoop::tick` now POSTS a request and returns.
 
 /// A chase goal must move at least this far (one nav cell) before it counts as a different goal
 /// worth re-planning for. `/follow` and `/goto <entity>` rewrite the goal with the leader's LIVE
@@ -527,8 +527,8 @@ mod tests {
                 let dot = (wish_dir[0] * seg[0] + wish_dir[1] * seg[1]) / seg_len;
                 min_forward_dot = min_forward_dot.min(dot);
             }
-            pos[0] += wish_dir[0] * crate::eq_net::navigation::RUN_SPEED * DT;
-            pos[1] += wish_dir[1] * crate::eq_net::navigation::RUN_SPEED * DT;
+            pos[0] += wish_dir[0] * crate::eq_net::action_loop::RUN_SPEED * DT;
+            pos[1] += wish_dir[1] * crate::eq_net::action_loop::RUN_SPEED * DT;
         }
         assert!(min_forward_dot > 0.3,
             "fast-steer aim pointed backward along its tracked segment (dot={min_forward_dot:.2}) \

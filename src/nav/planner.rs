@@ -15,7 +15,7 @@
 //! # Why this exists
 //!
 //! `Collision::find_path` used to run **synchronously on the network thread**, inside
-//! `Navigator::tick`. That one fact was the root of three separate bugs:
+//! `ActionLoop::tick`. That one fact was the root of three separate bugs:
 //!
 //! * A long A* search stalls the net loop, so no position/keepalive packet goes out and the server
 //!   drops the client as **linkdead**. Two linkdead root causes (#257, #302) were exactly this.
@@ -27,7 +27,7 @@
 //! * And a test asserting on that wall-clock budget is flaky under CPU load (#356).
 //!
 //! All three are downstream of ONE constraint: *the planner must not block the net thread*. So it
-//! doesn't any more. `Navigator::tick` POSTS a request here and returns immediately (micro-, not
+//! doesn't any more. `ActionLoop::tick` POSTS a request here and returns immediately (micro-, not
 //! milliseconds); this thread owns the search. Nothing real-time waits on it, so the search runs to
 //! COMPLETION and reports an honest [`PlanOutcome`]: a route, a definitive `Unreachable`, or an
 //! `Exhausted` "I don't know" — never a timeout dressed up as a "no".
@@ -35,7 +35,7 @@
 //! # The generation counter
 //!
 //! A plan takes time, and the goal can change while one is in flight (a new `/goto`, a re-plan, a
-//! zone change). Every request carries a monotonically increasing `gen`; the Navigator only applies
+//! zone change). Every request carries a monotonically increasing `gen`; the ActionLoop only applies
 //! a reply whose `gen` matches the request it is currently waiting on. **A stale result — one for a
 //! goal we have since abandoned — is discarded, never applied.** Applying one would walk the
 //! character toward a goal nobody asked for, which is its own quiet lie.
@@ -50,7 +50,7 @@ use crate::movement::PLAYER_RADIUS;
 /// One plan the walker wants computed. Carries its own `Arc<Collision>` so the worker never touches
 /// the `SharedCollision` lock the net + render threads use.
 pub struct PlanRequest {
-    /// Monotonic id. A reply is only applied if this still matches the Navigator's current request.
+    /// Monotonic id. A reply is only applied if this still matches the ActionLoop's current request.
     pub gen:          u64,
     pub start:        [f32; 3],
     pub goal:         [f32; 3],
@@ -80,16 +80,16 @@ pub struct PlanReply {
     pub tight: bool,
 }
 
-/// The Navigator's handle on the worker: post requests, poll for the one reply that still matters.
+/// The ActionLoop's handle on the worker: post requests, poll for the one reply that still matters.
 pub struct Planner {
     req_tx:   Sender<PlanRequest>,
     rep_rx:   Receiver<PlanReply>,
-    /// Next generation to hand out. Monotonic for the life of the Navigator.
+    /// Next generation to hand out. Monotonic for the life of the ActionLoop.
     next_gen: u64,
     /// The generation we are currently waiting on, and the GOAL it was requested for.
     ///
     /// These live together, inside the Planner, on purpose. They used to be two fields in two
-    /// places — `pending` here, `plan_goal` on the Navigator — and `poll()` cleared one while only
+    /// places — `pending` here, `plan_goal` on the ActionLoop — and `poll()` cleared one while only
     /// `apply_plan` cleared the other. A tick that consumed a reply and then DROPPED it (because the
     /// goal had drifted) therefore left `plan_goal` set forever, and the "is a plan in flight?" test
     /// said yes for the rest of the session: the planner stopped posting, and the character sat at
@@ -196,7 +196,7 @@ impl Planner {
     /// network thread down — ugly, but HONEST. Swallowing it converts a loud crash into precisely
     /// the silent lie this project ranks *above* crashes: a character that says "planning…" forever
     /// while nothing is planning at all. So `Disconnected` is now latched and surfaced, and the
-    /// Navigator turns it into an honest terminal `no_path` / `planner_dead`.
+    /// ActionLoop turns it into an honest terminal `no_path` / `planner_dead`.
     pub fn poll(&mut self) -> Option<PlanReply> {
         let mut fresh = None;
         loop {
@@ -299,7 +299,7 @@ fn worker_impl(req_rx: Receiver<PlanRequest>, rep_tx: Sender<PlanReply>, on_dequ
             req.gen, req.start[0], req.start[1], req.goal[0], req.goal[1], plan_ms,
             describe(&outcome));
         if rep_tx.send(PlanReply { gen: req.gen, outcome, plan_ms, goal_snapped_z, tight }).is_err() {
-            break; // Navigator gone (zone change / shutdown)
+            break; // ActionLoop gone (zone change / shutdown)
         }
     }
 }
@@ -434,7 +434,7 @@ pub struct LocalReply {
     pub plan_us: u128,
 }
 
-/// The Navigator's handle on the FINE tier's worker (#382).
+/// The ActionLoop's handle on the FINE tier's worker (#382).
 ///
 /// # Why a second worker and not the coarse one
 ///
@@ -581,7 +581,7 @@ fn local_worker(req_rx: Receiver<LocalRequest>, rep_tx: Sender<LocalReply>) {
                 outcome.state(), outcome.reason(), plan_us);
         }
         if rep_tx.send(LocalReply { gen: req.gen, start: req.start, goal: req.goal, outcome, plan_us }).is_err() {
-            break; // Navigator gone (zone change / shutdown)
+            break; // ActionLoop gone (zone change / shutdown)
         }
     }
 }
@@ -828,7 +828,7 @@ mod tests {
 
     /// **A DEAD PLANNER MUST BE LOUD.** If the worker thread panics, `poll` used to see
     /// `TryRecvError::Disconnected`, treat it exactly like `Empty`, and return `None` forever — so
-    /// the Navigator sat at `nav_state: planning` permanently, with no log and no error. That takes
+    /// the ActionLoop sat at `nav_state: planning` permanently, with no log and no error. That takes
     /// `main`'s LOUD net-thread panic and converts it into precisely the SILENT LIE this project
     /// ranks above crashes. The death must be detectable, and it must latch.
     #[test]
@@ -859,7 +859,7 @@ mod tests {
 
     /// **THE LIVENESS INVARIANT, made structural.** Handing a reply over MUST clear the in-flight
     /// goal, atomically with the pending generation. They used to live in two places — `pending`
-    /// here, `plan_goal` on the Navigator — and a tick that consumed a reply but then DROPPED it
+    /// here, `plan_goal` on the ActionLoop — and a tick that consumed a reply but then DROPPED it
     /// (because the goal had drifted a few units) cleared only one. The stale `plan_goal` then made
     /// "is a plan in flight?" answer yes forever: the planner stopped posting and the character sat
     /// at `nav_state: planning` PERMANENTLY, worker alive and idle, invisible to `is_dead()`.
@@ -1051,7 +1051,7 @@ mod tests {
     /// Steering along it would aim the walker at ground nobody asked for; the generation check must
     /// reject it.
     ///
-    /// (Note `post_if_idle` means the Navigator never *supersedes* an in-flight fine plan — it simply
+    /// (Note `post_if_idle` means the ActionLoop never *supersedes* an in-flight fine plan — it simply
     /// doesn't post on top of one. Cancellation is therefore the ONLY way a stale fine reply is
     /// produced, so it is the case that has to be pinned.)
     #[test]
