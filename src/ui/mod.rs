@@ -31,16 +31,16 @@ pub const REF_H: f32 = 720.0;
 /// `App`; the HTTP handlers and nav/gameplay threads hold the other ends.
 #[derive(Clone)]
 pub struct Actions {
+    /// The typed write-path facade (#446). Combat is fully migrated onto it — the Target/Actions/
+    /// spell-gem/spellbook/pet windows write via `cx.acts.command.request_*` (no direct combat slot
+    /// fields any more); other domains still use the raw slot fields below until Wave-2 migrates
+    /// them. See `crate::command_state`.
+    pub command: crate::command_state::CommandState,
     pub hail: crate::http::HailReq,
     pub say: crate::http::SayReq,
     pub chat_send: crate::http::ChatSendShared,
     pub dialogue_click: crate::http::DialogueClickReq,
-    pub target: crate::http::TargetReq,
-    pub attack: crate::http::AttackReq,
-    pub cast: crate::http::CastReq,
-    pub mem_spell: crate::http::MemSpellReq,
     pub sit: crate::http::SitReq,
-    pub consider: crate::http::ConsiderReq,
     pub buy: crate::http::BuyReq,
     pub sell: crate::http::SellReq,
     pub trade: crate::http::TradeReq,
@@ -61,8 +61,6 @@ pub struct Actions {
     /// Set true by the HUD death-overlay Respawn button (mirrors POST /v1/lifecycle/respawn) so a
     /// HUMAN player can revive — the client no longer auto-respawns. (#284)
     pub respawn: crate::http::RespawnReq,
-    /// Manual pet command byte for OP_PetCommands (Pet window buttons).
-    pub pet_cmd: crate::http::PetCmdReq,
 }
 
 /// Chat window runtime state (input buffer, active tab).
@@ -323,16 +321,12 @@ mod tests {
     fn actions() -> Actions {
         use std::sync::{Arc, Mutex};
         Actions {
+            command: crate::command_state::CommandState::default(),
             hail: Arc::new(Mutex::new(None)),
             say: Arc::new(Mutex::new(None)),
             chat_send: Arc::new(Mutex::new(Vec::new())),
             dialogue_click: Arc::new(Mutex::new(None)),
-            target: Arc::new(Mutex::new(None)),
-            attack: Arc::new(Mutex::new(None)),
-            cast: Arc::new(Mutex::new(None)),
-            mem_spell: Arc::new(Mutex::new(None)),
             sit: Arc::new(Mutex::new(None)),
-            consider: Arc::new(Mutex::new(None)),
             buy: Arc::new(Mutex::new(None)),
             sell: Arc::new(Mutex::new(None)),
             trade: Arc::new(Mutex::new(None)),
@@ -351,7 +345,6 @@ mod tests {
             camp: Arc::new(Mutex::new(None)),
             camp_until: Arc::new(Mutex::new(None)),
             respawn: Arc::new(Mutex::new(false)),
-            pet_cmd: Arc::new(Mutex::new(None)),
         }
     }
 

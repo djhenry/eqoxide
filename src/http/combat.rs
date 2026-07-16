@@ -44,7 +44,7 @@ async fn post_target(
     if !known {
         return (StatusCode::NOT_FOUND, format!("no spawn with id {id} in this zone"));
     }
-    *s.combat.target.lock().unwrap() = Some(id);
+    s.command.request_target(id);
     tracing::info!("target: queued spawn_id={}", id);
     (StatusCode::OK, format!("targeting spawn {}", id))
 }
@@ -77,7 +77,7 @@ async fn post_target_name(
     });
     match found {
         Some((key, id)) => {
-            *s.combat.target.lock().unwrap() = Some(id);
+            s.command.request_target(id);
             tracing::info!("target_name: {:?} → spawn_id={}", key, id);
             (StatusCode::OK, format!("targeting {} (spawn_id={})", clean_entity_name(&key), id))
         }
@@ -87,14 +87,14 @@ async fn post_target_name(
 
 /// POST /v1/combat/attack — enable auto-attack (sends OP_AUTO_ATTACK 1).
 async fn post_attack_on(State(s): State<HttpState>) -> (StatusCode, String) {
-    *s.combat.attack.lock().unwrap() = Some(true);
+    s.command.request_attack(true);
     tracing::info!("attack: queued auto-attack ON");
     (StatusCode::OK, "auto-attack ON".into())
 }
 
 /// DELETE /v1/combat/attack — disable auto-attack (sends OP_AUTO_ATTACK 0).
 async fn post_attack_off(State(s): State<HttpState>) -> (StatusCode, String) {
-    *s.combat.attack.lock().unwrap() = Some(false);
+    s.command.request_attack(false);
     tracing::info!("attack: queued auto-attack OFF");
     (StatusCode::OK, "auto-attack OFF".into())
 }
@@ -107,7 +107,7 @@ struct ConsiderBody { id: Option<u32> }
 async fn post_consider(State(s): State<HttpState>, OptionalJson(body): OptionalJson<ConsiderBody>) -> (StatusCode, String) {
     let id = body.and_then(|b| b.id).or(s.player().target_id);
     match id {
-        Some(id) => { *s.combat.consider.lock().unwrap() = Some(id); (StatusCode::OK, format!("consider {id} queued")) }
+        Some(id) => { s.command.request_consider(id); (StatusCode::OK, format!("consider {id} queued")) }
         None => (StatusCode::BAD_REQUEST, "no target; provide {\"id\":N}".into()),
     }
 }
@@ -130,7 +130,7 @@ async fn post_cast(State(s): State<HttpState>, OptionalJson(body): OptionalJson<
             None => return (StatusCode::BAD_REQUEST, format!("no item at slot {slot}")),
             Some((name, 0)) => return (StatusCode::BAD_REQUEST, format!("'{name}' (slot {slot}) has no clicky effect")),
             Some((name, spell)) => {
-                *s.combat.cast.lock().unwrap() = Some(CastRequest { gem: 0, target_id: b.target_id, item_slot: Some(slot) });
+                s.command.request_cast(CastRequest { gem: 0, target_id: b.target_id, item_slot: Some(slot) });
                 return (StatusCode::OK, format!("item cast queued: '{name}' (slot {slot}, spell {spell})"));
             }
         }
@@ -156,7 +156,7 @@ async fn post_cast(State(s): State<HttpState>, OptionalJson(body): OptionalJson<
         return (StatusCode::CONFLICT,
                 format!("spell gem {gem} is empty — memorize a spell into it first"));
     }
-    *s.combat.cast.lock().unwrap() = Some(CastRequest { gem, target_id: b.target_id, item_slot: None });
+    s.command.request_cast(CastRequest { gem, target_id: b.target_id, item_slot: None });
     (StatusCode::OK, format!("cast queued (gem {gem})"))
 }
 
@@ -172,7 +172,7 @@ async fn post_memorize(
 ) -> (StatusCode, String) {
     let b = match body { Ok(Json(b)) => b, Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"spell_id\":N,\"gem\":0-8}".into()) };
     if b.gem > 8 { return (StatusCode::BAD_REQUEST, "gem must be 0-8".into()); }
-    *s.combat.mem_spell.lock().unwrap() = Some((b.gem, b.spell_id, 1, None));
+    s.command.request_mem_spell(b.gem, b.spell_id, 1, None);
     (StatusCode::OK, format!("memorizing spell {} into gem {}", b.spell_id, b.gem))
 }
 
@@ -191,7 +191,7 @@ async fn post_scribe(
 ) -> (StatusCode, String) {
     let b = match body { Ok(Json(b)) => b, Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"spell_id\":N,\"from\":S,\"slot\":B?}".into()) };
     let slot = b.slot.unwrap_or(0);
-    *s.combat.mem_spell.lock().unwrap() = Some((slot, b.spell_id, 0, b.from));
+    s.command.request_mem_spell(slot, b.spell_id, 0, b.from);
     (StatusCode::OK, match b.from {
         Some(f) => format!("scribing spell {} into book slot {} (scroll from slot {})", b.spell_id, slot, f),
         None    => format!("scribing spell {} into book slot {} (scroll assumed on cursor)", b.spell_id, slot),
@@ -217,11 +217,11 @@ mod tests {
     async fn consider_no_body_falls_back_to_current_target() {
         let state = empty_state();
         set_gs(&state, |gs| gs.target_id = Some(7));
-        let consider = state.combat.consider.clone();
+        let command = state.command.clone();
         let app = router().with_state(state);
         let resp = app.oneshot(Request::post("/consider").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(*consider.lock().unwrap(), Some(7));
+        assert_eq!(command.take_consider(), Some(7));
     }
 
     #[tokio::test]
@@ -230,14 +230,14 @@ mod tests {
         // A current target IS set — the old Option<Json<T>> bug would silently consider IT instead
         // of reporting the malformed "id" field.
         set_gs(&state, |gs| gs.target_id = Some(7));
-        let consider = state.combat.consider.clone();
+        let command = state.command.clone();
         let app = router().with_state(state);
         let req = Request::post("/consider")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"id":"not-a-number"}"#)).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert!(consider.lock().unwrap().is_none(),
+        assert!(command.take_consider().is_none(),
             "a malformed id must not silently fall through to considering the current target");
     }
 
@@ -247,14 +247,14 @@ mod tests {
     async fn consider_unknown_key_is_400_and_does_not_fall_back() {
         let state = empty_state();
         set_gs(&state, |gs| gs.target_id = Some(7));
-        let consider = state.combat.consider.clone();
+        let command = state.command.clone();
         let app = router().with_state(state);
         let req = Request::post("/consider")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"idd":7}"#)).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert!(consider.lock().unwrap().is_none(),
+        assert!(command.take_consider().is_none(),
             "a typo'd key must not silently fall through to considering the current target");
     }
 
@@ -280,7 +280,7 @@ mod tests {
         // into /move/goto, /combat/cast and /pet/command, which all default to "the target".
         let state = empty_state();
         state.world.entity_ids.lock().unwrap().insert("a rat000".into(), 7);
-        let target = state.combat.target.clone();
+        let command = state.command.clone();
         let app = router().with_state(state);
         let req = Request::post("/target")
             .header("content-type", "application/json")
@@ -288,21 +288,21 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND,
             "an id that is not in the zone must be an explicit failure, not an adopted truth");
-        assert!(target.lock().unwrap().is_none(), "nothing may be queued for a bogus id");
+        assert!(command.take_target().is_none(), "nothing may be queued for a bogus id");
     }
 
     #[tokio::test]
     async fn target_known_spawn_id_still_works() {
         let state = empty_state();
         state.world.entity_ids.lock().unwrap().insert("a rat000".into(), 7);
-        let target = state.combat.target.clone();
+        let command = state.command.clone();
         let app = router().with_state(state);
         let req = Request::post("/target")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"id":7}"#)).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(*target.lock().unwrap(), Some(7));
+        assert_eq!(command.take_target(), Some(7));
     }
 
     #[tokio::test]
@@ -311,14 +311,14 @@ mod tests {
         // the entity list, so it must be allowed explicitly or self-targeting would 404.
         let state = empty_state();
         set_gs(&state, |gs| gs.player_id = 42);
-        let target = state.combat.target.clone();
+        let command = state.command.clone();
         let app = router().with_state(state);
         let req = Request::post("/target")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"id":42}"#)).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(*target.lock().unwrap(), Some(42));
+        assert_eq!(command.take_target(), Some(42));
     }
 
     // ── #348: /combat/cast on an EMPTY gem must fail loudly, not 200-then-silence ────────────────
@@ -333,7 +333,7 @@ mod tests {
             gs.mem_spells = [crate::game_state::EMPTY_GEM; 9];
             gs.mem_spells[0] = 202; // only gem 0 is memorized
         });
-        let cast = state.combat.cast.clone();
+        let command = state.command.clone();
         let app = router().with_state(state);
         let req = Request::post("/cast")
             .header("content-type", "application/json")
@@ -342,7 +342,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         let text = body_text(resp).await;
         assert!(text.contains("empty"), "message must name the real cause: {text}");
-        assert!(cast.lock().unwrap().is_none(), "an empty gem must not be queued as a cast");
+        assert!(command.take_cast().is_none(), "an empty gem must not be queued as a cast");
     }
 
     #[tokio::test]
@@ -352,14 +352,14 @@ mod tests {
             gs.mem_spells = [crate::game_state::EMPTY_GEM; 9];
             gs.mem_spells[2] = 202;
         });
-        let cast = state.combat.cast.clone();
+        let command = state.command.clone();
         let app = router().with_state(state);
         let req = Request::post("/cast")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"gem":2}"#)).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(cast.lock().unwrap().as_ref().map(|c| c.gem), Some(2));
+        assert_eq!(command.take_cast().map(|c| c.gem), Some(2));
     }
 
     #[tokio::test]

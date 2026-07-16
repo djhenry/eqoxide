@@ -55,7 +55,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
 
     // Manual pet commands. Each button queues one OP_PetCommands command byte;
     // Attack needs a current target (the nav thread aims it at scene.target_id).
-    let send = |cmd: u32| *cx.acts.pet_cmd.lock().unwrap() = Some(cmd as u8);
+    let send = |cmd: u32| cx.acts.command.request_pet_command(cmd as u8);
     ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
     ui.horizontal_wrapped(|ui| {
         let atk_hover = if s.target_id.is_some() {

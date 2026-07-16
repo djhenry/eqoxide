@@ -59,7 +59,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
             "Start auto-attack"
         });
         if resp.clicked() {
-            *cx.acts.attack.lock().unwrap() = Some(!s.auto_attack);
+            cx.acts.command.request_attack(!s.auto_attack);
         }
 
         if ui
@@ -67,7 +67,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
             .on_hover_text("Consider the target")
             .clicked()
         {
-            *cx.acts.consider.lock().unwrap() = Some(target_id);
+            cx.acts.command.request_consider(target_id);
         }
     });
 }

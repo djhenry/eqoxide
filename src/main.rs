@@ -306,6 +306,18 @@ fn main() {
         respawn:    Arc::new(Mutex::new(false)),
     };
 
+    // #446: the typed write-path facade over the command/action slots. Constructed ONCE here
+    // (Controller/wiring role) from `.clone()`s of the SAME command bundles above, then handed to
+    // both `ActionLoop` (via `run_login_flow`) and `HttpState` (via `spawn_camera_server`) and the
+    // UI `Actions` bundle — so a `request_*` write and its `take_*` drain share the same slot. Combat
+    // is fully migrated onto it; the other domains keep their bundle fields until Wave-2 migrates
+    // them (see `crate::command_state`).
+    let command = eqoxide::command_state::CommandState::new(
+        combat.clone(), merchant_slots.clone(), inventory_slots.clone(), interact.clone(),
+        quest.clone(), group_slots.clone(), guild_slots.clone(), trainer.clone(), social.clone(),
+        chat.clone(), nav.clone(), lifecycle.clone(), camera.manual_move.clone(),
+    );
+
     // spells_us.txt is an EQ data file; default to the configured assets dir,
     // overridable via EQ_SPELLS_FILE.
     let spells_path = std::env::var("EQ_SPELLS_FILE")
@@ -345,7 +357,7 @@ fn main() {
         let quest_b           = quest.clone();
         let group_slots_b     = group_slots.clone();
         let trainer_b         = trainer.clone();
-        let combat_b          = combat.clone();
+        let command_b         = command.clone();
         let social_b          = social.clone();
         let merchant_slots_b  = merchant_slots.clone();
         let inventory_slots_b = inventory_slots.clone();
@@ -376,7 +388,7 @@ fn main() {
                 rt.block_on(async {
                     if let Err(e) = eq_net::run_login_flow(
                         login_cfg, 10,
-                        nav_b, world_b, quest_b, group_slots_b, trainer_b, combat_b, social_b,
+                        nav_b, world_b, quest_b, group_slots_b, trainer_b, command_b, social_b,
                         merchant_slots_b, inventory_slots_b, interact_b, chat_b, controller_b,
                         guild_slots_b, sc, md, sd, cp, cu, rsp, gss, nh,
                     ).await {
@@ -394,16 +406,12 @@ fn main() {
     // (separate from the M4 domain bundles above); its fields are individual `.clone()`s pulled
     // out of the M4 bundles so it keeps sharing the same underlying Arcs.
     let app_actions = eqoxide::ui::Actions {
+        command: command.clone(),
         hail: interact.hail.clone(),
         say: interact.say.clone(),
         chat_send: chat.chat_send.clone(),
         dialogue_click: interact.dialogue_click.clone(),
-        target: combat.target.clone(),
-        attack: combat.attack.clone(),
-        cast: combat.cast.clone(),
-        mem_spell: combat.mem_spell.clone(),
         sit: interact.sit.clone(),
-        consider: combat.consider.clone(),
         buy: merchant_slots.buy.clone(),
         sell: merchant_slots.sell.clone(),
         trade: merchant_slots.trade.clone(),
@@ -422,7 +430,6 @@ fn main() {
         camp: lifecycle.camp.clone(),
         camp_until: lifecycle.camp_until.clone(),
         respawn: lifecycle.respawn.clone(),
-        pet_cmd: combat.pet_cmd.clone(),
     };
     let app_spells  = spells.clone();
     let app_door_click = interact.door_click.clone();
@@ -445,7 +452,7 @@ fn main() {
         nav.clone(),
         world,
         shared_collision.clone(),
-        combat.clone(),
+        command.clone(),
         social,
         merchant_slots,
         inventory_slots,
