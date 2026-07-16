@@ -78,8 +78,6 @@ pub struct ActionLoop {
     quest:            crate::ipc::QuestSlots,
     /// `/v1/group/*` slots (#M4 — see `ipc::GroupSlots`).
     group_slots:      crate::ipc::GroupSlots,
-    /// `/v1/trainer/*` slots (#M4 — see `ipc::TrainerSlots`).
-    trainer:          crate::ipc::TrainerSlots,
     /// The typed write-path facade (#446). Combat is fully migrated onto it — this thread drains
     /// combat commands via `self.command.take_*` (no direct `ipc::CombatSlots` field any more);
     /// other domains still use their own bundle fields until Wave-2 migrates them. See
@@ -158,7 +156,6 @@ impl ActionLoop {
         world:           crate::ipc::WorldSlots,
         quest:           crate::ipc::QuestSlots,
         group_slots:     crate::ipc::GroupSlots,
-        trainer:         crate::ipc::TrainerSlots,
         command:         crate::command_state::CommandState,
         social:          crate::ipc::SocialSlots,
         merchant_slots:  crate::ipc::MerchantSlots,
@@ -179,7 +176,6 @@ impl ActionLoop {
             world,
             quest,
             group_slots,
-            trainer,
             command,
             social,
             pending_who: None,
@@ -1966,7 +1962,6 @@ mod tests {
             Default::default(), // world
             Default::default(), // quest
             crate::ipc::GroupSlots { group, ..Default::default() },
-            Default::default(), // trainer
             Default::default(), // command (CommandState)
             Default::default(), // social
             Default::default(), // merchant_slots

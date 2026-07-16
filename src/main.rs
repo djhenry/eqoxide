@@ -356,7 +356,6 @@ fn main() {
         let world_b           = world.clone();
         let quest_b           = quest.clone();
         let group_slots_b     = group_slots.clone();
-        let trainer_b         = trainer.clone();
         let command_b         = command.clone();
         let social_b          = social.clone();
         let merchant_slots_b  = merchant_slots.clone();
@@ -388,7 +387,7 @@ fn main() {
                 rt.block_on(async {
                     if let Err(e) = eq_net::run_login_flow(
                         login_cfg, 10,
-                        nav_b, world_b, quest_b, group_slots_b, trainer_b, command_b, social_b,
+                        nav_b, world_b, quest_b, group_slots_b, command_b, social_b,
                         merchant_slots_b, inventory_slots_b, interact_b, chat_b, controller_b,
                         guild_slots_b, sc, md, sd, cp, cu, rsp, gss, nh,
                     ).await {
@@ -412,15 +411,10 @@ fn main() {
         chat_send: chat.chat_send.clone(),
         dialogue_click: interact.dialogue_click.clone(),
         sit: interact.sit.clone(),
-        buy: merchant_slots.buy.clone(),
-        sell: merchant_slots.sell.clone(),
-        trade: merchant_slots.trade.clone(),
         move_item: inventory_slots.move_req.clone(),
         loot: interact.loot.clone(),
         accept_task: quest.accept_task.clone(),
         cancel_task: quest.cancel_task.clone(),
-        trainer_open: trainer.trainer_open_req.clone(),
-        trainer_train: trainer.trainer_train_req.clone(),
         group_invite: group_slots.group_invite.clone(),
         group_accept: group_slots.group_accept.clone(),
         group_decline: group_slots.group_decline.clone(),
@@ -432,7 +426,6 @@ fn main() {
         respawn: lifecycle.respawn.clone(),
     };
     let app_spells  = spells.clone();
-    let app_door_click = interact.door_click.clone();
     let app_frame_profile = frame_profile_shared.clone();
     // --api-port N: bind exactly N now and FAIL THE LAUNCH if it's taken (don't open a window with
     // a dead API). The bound listener is handed to the server thread so there's no re-bind race.
@@ -464,7 +457,6 @@ fn main() {
         frame_profile_shared.clone(),
         quest,
         group_slots,
-        trainer,
         lifecycle.clone(),
         guild_slots,
         app_cfg.http_port,
@@ -484,7 +476,6 @@ fn main() {
         app_goto,
         app_actions,
         app_spells,
-        app_door_click,
         shared_collision,
         app_frame_profile,
         testzone_mode,

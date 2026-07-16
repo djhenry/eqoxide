@@ -147,7 +147,6 @@ pub(crate) mod tests {
             frame_profile: Arc::new(Mutex::new(crate::profiling::FrameProfile::default())),
             quest: Default::default(),
             group_slots: Default::default(),
-            trainer: Default::default(),
             lifecycle: Default::default(),
             guild_slots: Default::default(),
         }
