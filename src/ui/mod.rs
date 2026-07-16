@@ -41,15 +41,10 @@ pub struct Actions {
     pub chat_send: crate::http::ChatSendShared,
     pub dialogue_click: crate::http::DialogueClickReq,
     pub sit: crate::http::SitReq,
-    pub buy: crate::http::BuyReq,
-    pub sell: crate::http::SellReq,
-    pub trade: crate::http::TradeReq,
     pub move_item: crate::http::MoveReq,
     pub loot: crate::http::LootReq,
     pub accept_task: crate::http::AcceptTaskReq,
     pub cancel_task: crate::http::CancelTaskReq,
-    pub trainer_open: crate::http::TrainerOpenReq,
-    pub trainer_train: crate::http::TrainerTrainReq,
     pub group_invite: crate::http::GroupInviteReq,
     pub group_accept: crate::http::GroupAcceptReq,
     pub group_decline: crate::http::GroupDeclineReq,
@@ -279,11 +274,11 @@ impl UiState {
                     self.dismissed.insert(def.id);
                     match def.id {
                         registry::MERCHANT => {
-                            *acts.trade.lock().unwrap() = Some(crate::http::TradeCmd::Close);
+                            acts.command.request_merchant_trade(crate::http::TradeCmd::Close);
                         }
                         // Some(0) = end-training sentinel (see navigation.rs).
                         registry::TRAINER => {
-                            *acts.trainer_open.lock().unwrap() = Some(0);
+                            acts.command.request_open_trainer(0);
                         }
                         _ => {}
                     }
@@ -327,15 +322,10 @@ mod tests {
             chat_send: Arc::new(Mutex::new(Vec::new())),
             dialogue_click: Arc::new(Mutex::new(None)),
             sit: Arc::new(Mutex::new(None)),
-            buy: Arc::new(Mutex::new(None)),
-            sell: Arc::new(Mutex::new(None)),
-            trade: Arc::new(Mutex::new(None)),
             move_item: Arc::new(Mutex::new(None)),
             loot: Arc::new(Mutex::new(None)),
             accept_task: Arc::new(Mutex::new(None)),
             cancel_task: Arc::new(Mutex::new(None)),
-            trainer_open: Arc::new(Mutex::new(None)),
-            trainer_train: Arc::new(Mutex::new(None)),
             group_invite: Arc::new(Mutex::new(None)),
             group_accept: Arc::new(Mutex::new(None)),
             group_decline: Arc::new(Mutex::new(None)),

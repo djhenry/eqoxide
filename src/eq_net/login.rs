@@ -76,7 +76,6 @@ pub async fn run_login_flow(
     world:           crate::ipc::WorldSlots,
     quest:           crate::ipc::QuestSlots,
     group_slots:     crate::ipc::GroupSlots,
-    trainer:         crate::ipc::TrainerSlots,
     command:         crate::command_state::CommandState,
     social:          crate::ipc::SocialSlots,
     merchant_slots:  crate::ipc::MerchantSlots,
@@ -122,7 +121,7 @@ pub async fn run_login_flow(
                 }
                 let char_name = config.character_name.clone();
                 let action_loop = ActionLoop::new(
-                    nav, world, quest, group_slots, trainer, command, social,
+                    nav, world, quest, group_slots, command, social,
                     merchant_slots, inventory_slots, interact, chat, controller, guild_slots,
                     collision, maps_dir, camp.clone(),
                 );

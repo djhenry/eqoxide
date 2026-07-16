@@ -142,8 +142,6 @@ pub struct App {
     /// and send them. One struct instead of a dozen fields (#162).
     acts:         crate::ui::Actions,
     spells:       std::sync::Arc<crate::spells::SpellDb>,
-    /// Shared door-click request slot; the nav thread drains it and sends OP_ClickDoor.
-    door_click:   crate::ipc::DoorClickReq,
     // Mouse
     drag_active:  bool,
     last_cursor:  winit::dpi::PhysicalPosition<f64>,
@@ -250,7 +248,6 @@ impl App {
         goto_target:     crate::ipc::GotoTarget,
         acts:            crate::ui::Actions,
         spells:          std::sync::Arc<crate::spells::SpellDb>,
-        door_click:      crate::ipc::DoorClickReq,
         shared_collision: collision::SharedCollision,
         frame_profile_shared: crate::ipc::FrameProfileShared,
         testzone_mode:   bool,
@@ -312,7 +309,7 @@ impl App {
             controller: crate::movement::CharacterController::new([0.0, 0.0, 0.0]),
             controller_view, nav_intent, manual_move, pos_correction, nav_path_view,
             goto_target,
-            acts, spells, door_click,
+            acts, spells,
             drag_active: false, last_cursor: winit::dpi::PhysicalPosition::new(0.0, 0.0),
             click_start: None,
             pick_view_proj: [

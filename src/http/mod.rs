@@ -402,8 +402,6 @@ pub(crate) struct HttpState {
     pub(crate) quest:           crate::ipc::QuestSlots,
     /// `/v1/group/*` slots (#M4).
     pub(crate) group_slots:     crate::ipc::GroupSlots,
-    /// `/v1/trainer/*` slots (#M4).
-    pub(crate) trainer:         crate::ipc::TrainerSlots,
     /// `/v1/lifecycle/*` slots (#M4).
     pub(crate) lifecycle:       crate::ipc::LifecycleSlots,
     /// `/v1/guild/*` slots (#M4).
@@ -476,7 +474,6 @@ pub fn spawn_camera_server(
     frame_profile:    FrameProfileShared,
     quest:           crate::ipc::QuestSlots,
     group_slots:     crate::ipc::GroupSlots,
-    trainer:         crate::ipc::TrainerSlots,
     lifecycle:       crate::ipc::LifecycleSlots,
     guild_slots:     crate::ipc::GuildSlots,
     port:             u16,
@@ -498,7 +495,7 @@ pub fn spawn_camera_server(
             let state = HttpState {
                 camera, nav, world, shared_collision, command, social, merchant_slots,
                 inventory_slots, interact, chat, spells, game_state, net_health, frame_profile,
-                quest, group_slots, trainer, lifecycle, guild_slots,
+                quest, group_slots, lifecycle, guild_slots,
             };
             // Versioned + grouped routes: /v1/<group>/<action>. Each group's `router()` defines
             // relative paths; nesting prefixes them. Shared state is applied once at the end.
