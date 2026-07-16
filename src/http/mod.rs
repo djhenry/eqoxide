@@ -376,8 +376,10 @@ pub(crate) struct HttpState {
     pub(crate) world:           crate::ipc::WorldSlots,
     /// Zone collision + region map (shared with the nav thread); read-only here, for zone_exits.
     pub(crate) shared_collision: crate::nav::collision::SharedCollision,
-    /// `/v1/combat/*` (+ `/v1/pet/command`) slots (#M4).
-    pub(crate) combat:          crate::ipc::CombatSlots,
+    /// The typed write-path facade (#446). Combat is fully migrated onto it — combat/pet handlers
+    /// write via `s.command.request_*` (no direct `ipc::CombatSlots` field any more); other domains
+    /// still use their own bundle fields until Wave-2 migrates them. See `crate::command_state`.
+    pub(crate) command:         crate::command_state::CommandState,
     /// `/v1/social/*` (who/friends) slots (#M4).
     pub(crate) social:          crate::ipc::SocialSlots,
     /// `/v1/merchant/*` slots (#M4).
@@ -462,7 +464,7 @@ pub fn spawn_camera_server(
     nav:             crate::ipc::NavSlots,
     world:           crate::ipc::WorldSlots,
     shared_collision: crate::nav::collision::SharedCollision,
-    combat:          crate::ipc::CombatSlots,
+    command:         crate::command_state::CommandState,
     social:          crate::ipc::SocialSlots,
     merchant_slots:  crate::ipc::MerchantSlots,
     inventory_slots: crate::ipc::InventorySlots,
@@ -494,7 +496,7 @@ pub fn spawn_camera_server(
             .expect("http tokio runtime");
         rt.block_on(async move {
             let state = HttpState {
-                camera, nav, world, shared_collision, combat, social, merchant_slots,
+                camera, nav, world, shared_collision, command, social, merchant_slots,
                 inventory_slots, interact, chat, spells, game_state, net_health, frame_profile,
                 quest, group_slots, trainer, lifecycle, guild_slots,
             };
