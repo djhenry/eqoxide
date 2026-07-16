@@ -488,6 +488,60 @@ pub fn ccw_to_cw(ccw: f32) -> f32 {
     (360.0 - ccw).rem_euclid(360.0)
 }
 
+// ── EQ12 wire-heading ↔ degrees (quantization helpers) ─────────────────────
+//
+// EQ packs heading as a 12-bit field, but the *scale* of that field is
+// DIFFERENT between packet types — this is intentional and live-tested
+// (a wrong scale here previously caused a melee-facing bug where
+// IsFacingMob failed server-side):
+//
+//   - Spawn stream / PlayerPositionUpdateServer_Struct (24-byte OP_ClientUpdate,
+//     spawn decode): 0..511 raw == 0..360°, i.e. scale 512/360.
+//   - PlayerPositionUpdateClient_Struct (46-byte client→server position
+//     firehose): the server decodes via EQ12toFloat = wire/4, and EQ headings
+//     run 0..512 = 0..360°, so wire = deg * 512/360 * 4 = deg * 2048/360 —
+//     a 4x larger scale than the 24-byte struct. Do NOT unify these.
+//
+// Each site also has its own rounding convention, preserved exactly below:
+// decode is an exact conversion of an already-integer wire value (no
+// rounding concern); the 24-byte server-side encode `.round()`s; the 46-byte
+// client firehose encode TRUNCATES (`as` cast, no round). These rounding
+// modes are intentionally NOT normalized to match one another.
+
+/// Decode a 12-bit EQ heading field from the 24-byte
+/// `PlayerPositionUpdateServer_Struct` (OP_ClientUpdate) or the RoF2 spawn
+/// stream's `Spawn_Struct_Position` word2 — both use the same 0..511 = 0..360°
+/// CW scale — into CW degrees. Used by `parse_rof2_spawn` and
+/// `decode_position_update`. Exact conversion of an already-quantized integer;
+/// no rounding is applicable on this side.
+#[inline]
+pub fn eq12_server_to_deg_cw(raw: u32) -> f32 {
+    raw as f32 * (360.0 / 512.0)
+}
+
+/// Encode CW degrees into the 12-bit EQ heading field for the 24-byte
+/// `PlayerPositionUpdateServer_Struct` (0..511 = 0..360° scale), already
+/// masked to 12 bits ready to shift into place. Used by
+/// `encode_position_update`. Rounds to nearest (`.round()`) — matches this
+/// site's historical behavior exactly; do not change to truncation.
+#[inline]
+pub fn deg_cw_to_eq12_server(deg_cw: f32) -> u32 {
+    ((deg_cw * (512.0 / 360.0)).round() as i32 as u32) & 0xFFF
+}
+
+/// Encode CW degrees into the 12-bit EQ heading field for the 46-byte
+/// `PlayerPositionUpdateClient_Struct` (client→server position firehose),
+/// already masked to 12 bits ready to write into the packet. This struct's
+/// heading field is INTENTIONALLY 4x the scale of the 24-byte server struct
+/// (2048/360 vs 512/360) because the server decodes it via `EQ12toFloat =
+/// wire/4` — see the module-level comment above. Truncates (`as u32` cast,
+/// no round) — matches this site's historical behavior exactly; do not
+/// change to rounding.
+#[inline]
+pub fn deg_cw_to_eq12_client(deg_cw: f32) -> u32 {
+    ((deg_cw * 2048.0 / 360.0) as u32) & 0xFFF
+}
+
 // ── Titanium Spawn_S bitfield position extraction (LEGACY — not used in RoF2) ─
 
 /// Extract (x, y, z, heading) from a **Titanium** Spawn_S's bitfield blocks.
@@ -516,6 +570,12 @@ pub fn extract_spawn_position(
         val as f32 / 8.0
     }
 
+    // NOTE: same 360/512 scale as `eq12_server_to_deg_cw`, but operates on a
+    // sign-extended `i32` (this legacy Titanium layout treats the 12-bit
+    // heading field as signed), so it cannot share that helper without
+    // reinterpreting the bit pattern and changing behavior. Left as its own
+    // local closure — flagged, not forced, per the extract-only scope of
+    // this refactor.
     fn s12_to_degrees_cw(bits: u32) -> f32 {
         let bits = bits & 0xFFF;
         let val = if bits & 0x800 != 0 {
@@ -811,7 +871,7 @@ pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
     // x: signed 19-bit at bits 0-18 of word2
     let x = sext(w2 & 0x7FFFF, 19) as f32 / 8.0;
     // heading: unsigned 12-bit at bits 19-30 of word2 (0..511 = 0..360° CW)
-    let heading_cw = ((w2 >> 19) & 0xFFF) as f32 * (360.0 / 512.0);
+    let heading_cw = eq12_server_to_deg_cw((w2 >> 19) & 0xFFF);
     let heading = cw_to_ccw(heading_cw);
     // z: signed 19-bit at bits 10-28 of word3
     let z = sext((w3 >> 10) & 0x7FFFF, 19) as f32 / 8.0;
@@ -1537,7 +1597,7 @@ pub fn decode_position_update(p: &[u8]) -> Option<PositionUpdate> {
     // x: signed 19-bit at bits 0-18 of word2
     let x = sext(w2 & 0x7FFFF, 19) as f32 / 8.0;
     // heading: unsigned 12-bit at bits 19-30 of word2 (0..511 = 0..360° CW)
-    let heading_cw = ((w2 >> 19) & 0xFFF) as f32 * (360.0 / 512.0);
+    let heading_cw = eq12_server_to_deg_cw((w2 >> 19) & 0xFFF);
     let heading = cw_to_ccw(heading_cw);
     // z: signed 19-bit at bits 10-28 of word3
     let z = sext((w3 >> 10) & 0x7FFFF, 19) as f32 / 8.0;
@@ -1558,7 +1618,7 @@ pub fn encode_position_update(spawn_id: u16, x: f32, y: f32, z: f32, heading: f3
     let zp = enc_eq19(z);
     // Heading is sent CW on the wire as a 9-bit-scale value (0..512 = 0..360°), mirroring
     // the `* 360/512` in decode_position_update.
-    let hp = ((ccw_to_cw(heading) * (512.0 / 360.0)).round() as i32 as u32) & 0xFFF;
+    let hp = deg_cw_to_eq12_server(ccw_to_cw(heading));
     // word0: angle(12)=0, y(19), pad(1)=0  → y at bits 12-30
     let w0 = yp << 12;
     // word1: deltas = 0
