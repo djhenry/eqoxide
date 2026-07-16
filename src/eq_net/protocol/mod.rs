@@ -2,10 +2,40 @@
 //!
 //! Application opcodes (u16) are sourced from ~/git/EQEmu/utils/patches/patch_RoF2.conf.
 //! Transport-layer opcodes (u8) are protocol-layer constants identical across all patches.
+//!
+//! Packet BUILDERS (payload construction for outbound opcodes) are organized into domain
+//! submodules below — split out of this god-module (and out of `navigation.rs`, where a
+//! large batch of unrelated `args -> Vec<u8>` builders had accreted; cleanup step 1). Each
+//! submodule's public items are re-exported here so existing `protocol::build_*` call sites
+//! keep working unchanged.
 
 #![allow(dead_code)]
 
 use std::mem;
+
+mod combat;
+mod spells;
+mod inventory;
+mod trade;
+mod merchant;
+mod group;
+mod guild;
+mod tasks;
+mod gm;
+mod chat;
+mod world;
+
+pub use combat::*;
+pub use spells::*;
+pub use inventory::*;
+pub use trade::*;
+pub use merchant::*;
+pub use group::*;
+pub use guild::*;
+pub use tasks::*;
+pub use gm::*;
+pub use chat::*;
+pub use world::*;
 
 // ── Transport-layer opcodes ────────────────────────────────────────────────
 
