@@ -129,7 +129,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
 /// (#288). Store the readable text so the observer API can surface it. The trailing empty
 /// OP_FinishWindow the server also sends is a no-op for us (not dispatched).
 fn apply_read_book(gs: &mut GameState, p: &[u8]) {
-    if let Some(text) = crate::eq_net::navigation::parse_read_book_reply(p) {
+    if let Some(text) = crate::eq_net::protocol::parse_read_book_reply(p) {
         gs.log_msg("book", &text);
         gs.last_book_text = Some(text);
     }
@@ -3257,14 +3257,14 @@ mod tests {
         let mut gs = GameState::new();
         gs.player_id = 77;
         // kind 14 (Animation), param 110 (sit) for our own id -> sitting.
-        apply_spawn_appearance(&mut gs, &crate::eq_net::navigation::build_spawn_appearance_packet(77, 14, 110));
+        apply_spawn_appearance(&mut gs, &crate::eq_net::protocol::build_spawn_appearance_packet(77, 14, 110));
         assert!(gs.sitting, "sit appearance for our player must set render sitting");
         // param 100 (stand) -> not sitting.
-        apply_spawn_appearance(&mut gs, &crate::eq_net::navigation::build_spawn_appearance_packet(77, 14, 100));
+        apply_spawn_appearance(&mut gs, &crate::eq_net::protocol::build_spawn_appearance_packet(77, 14, 100));
         assert!(!gs.sitting, "stand appearance clears render sitting");
         // Another spawn's sit must NOT change our flag.
-        apply_spawn_appearance(&mut gs, &crate::eq_net::navigation::build_spawn_appearance_packet(77, 14, 110));
-        apply_spawn_appearance(&mut gs, &crate::eq_net::navigation::build_spawn_appearance_packet(999, 14, 100));
+        apply_spawn_appearance(&mut gs, &crate::eq_net::protocol::build_spawn_appearance_packet(77, 14, 110));
+        apply_spawn_appearance(&mut gs, &crate::eq_net::protocol::build_spawn_appearance_packet(999, 14, 100));
         assert!(gs.sitting, "another spawn's stand must not clear our sitting");
     }
 
