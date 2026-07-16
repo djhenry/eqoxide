@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Instant;
 
-use crate::assets::{Collision, LocalOutcome, NoRoute, PlanCtx, PlanOutcome};
+use crate::nav::collision::{Collision, LocalOutcome, NoRoute, PlanCtx, PlanOutcome};
 use crate::movement::PLAYER_RADIUS;
 
 /// One plan the walker wants computed. Carries its own `Arc<Collision>` so the worker never touches
@@ -589,7 +589,8 @@ fn local_worker(req_rx: Receiver<LocalRequest>, rep_tx: Sender<LocalReply>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assets::{Collision, LocalOutcome, MeshData, PlanOutcome, RenderMode, ZoneAssets};
+    use crate::assets::{MeshData, RenderMode, ZoneAssets};
+    use crate::nav::collision::{Collision, LocalOutcome, PlanOutcome};
 
     /// GLB-space quad (`positions` are `[north, up, east]`).
     fn quad(v: Vec<[f32; 3]>) -> MeshData {
@@ -730,7 +731,7 @@ mod tests {
         // than the small cap, so per-call budgeting would blow ~13× past it.
         let col = two_boxes(1000.0, 400.0, 400.0, -400.0, -400.0);
         let cap = 10_000usize;
-        let ctx = crate::assets::PlanCtx::with_node_cap(cap).ensure_budget();
+        let ctx = crate::nav::collision::PlanCtx::with_node_cap(cap).ensure_budget();
         let counter = ctx.expanded.clone().unwrap();
 
         // Drive the REAL plan_path fan-out (primary + 12-point ring) against the shared budget.

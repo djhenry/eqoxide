@@ -60,7 +60,7 @@
 //! that residual is tracked as **#420** — to be closed when the controller is wired to consult this
 //! type directly (Phase 2). Do not read the `fast`/`diagnostic` agreement as if it discharged #420.
 
-use crate::assets::Collision;
+use crate::nav::collision::Collision;
 
 /// The character's collision volume. THE single source of truth (#386 / design §2a-iv).
 ///
@@ -98,13 +98,13 @@ pub struct Body {
     /// The vertical clearance a standing character needs above a surface for it to count as
     /// STANDING ROOM (the #375 headroom defence: a surface with a solid roof closer than this is a
     /// ceiling, not ground). It must EXCEED a real ceiling's slab-gap yet stay BELOW a real room's
-    /// height. `assets::is_standable` reads this. **This is the single source of truth** — the
-    /// `assets::NAV_AGENT_HEIGHT` const is now a thin alias to it (design Q6 / PR-A: the value
+    /// height. `nav::collision::is_standable` reads this. **This is the single source of truth** — the
+    /// `nav::collision::NAV_AGENT_HEIGHT` const is now a thin alias to it (design Q6 / PR-A: the value
     /// belongs on the Body, defined here, aliased there so existing call sites keep compiling).
     pub agent_height: f32,
     /// A surface's unit-normal `|z|` must be at least this to be flat enough to stand on (else it
     /// is a wall/steep slope A*'s grade limit would reject anyway). Tied to `MAX_WALK_GRADE`:
-    /// `1/sqrt(1+1.2²) ≈ 0.64`. `assets::is_standable` reads this; `assets::NAV_NEAR_HORIZONTAL` is
+    /// `1/sqrt(1+1.2²) ≈ 0.64`. `nav::collision::is_standable` reads this; `nav::collision::NAV_NEAR_HORIZONTAL` is
     /// now a thin alias. Single source of truth here.
     pub near_horizontal: f32,
 }
@@ -122,9 +122,9 @@ pub const PLAYER_BODY: Body = Body {
     ring: 3.0,
     height: 6.0,
     // ~5u standing headroom; the controller's own chest contact ray sits at `chest` = 4.0, so a
-    // body needs a shade above that to stand. Was `assets::NAV_AGENT_HEIGHT`.
+    // body needs a shade above that to stand. Was `assets::NAV_AGENT_HEIGHT`, now `nav::collision::NAV_AGENT_HEIGHT`.
     agent_height: 5.0,
-    // 1/sqrt(1 + MAX_WALK_GRADE²) with MAX_WALK_GRADE = 1.2. Was `assets::NAV_NEAR_HORIZONTAL`.
+    // 1/sqrt(1 + MAX_WALK_GRADE²) with MAX_WALK_GRADE = 1.2. Was `assets::NAV_NEAR_HORIZONTAL`, now `nav::collision::NAV_NEAR_HORIZONTAL`.
     near_horizontal: 0.64,
 };
 
@@ -165,7 +165,7 @@ impl Tier {
     #[inline]
     pub fn units(self) -> f32 {
         match self {
-            Tier::Preferred => crate::assets::NAV_PREFERRED_CLEARANCE,
+            Tier::Preferred => crate::nav::collision::NAV_PREFERRED_CLEARANCE,
             Tier::Minimum => crate::movement::PLAYER_RADIUS,
         }
     }
@@ -565,7 +565,8 @@ impl<'a> Traversability<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assets::{Collision, MeshData, RenderMode, ZoneAssets};
+    use crate::assets::{MeshData, RenderMode, ZoneAssets};
+    use crate::nav::collision::Collision;
     use crate::movement::{CharacterController, MoveIntent, PLAYER_RADIUS};
 
     fn mesh(positions: Vec<[f32; 3]>) -> MeshData {

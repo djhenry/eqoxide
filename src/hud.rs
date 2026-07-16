@@ -180,7 +180,7 @@ pub fn draw_labels(
     screen_w: u32,
     screen_h: u32,
     cam_eye: [f32; 3],
-    collision: Option<&crate::assets::Collision>,
+    collision: Option<&crate::nav::collision::Collision>,
 ) {
     let ppp = ctx.pixels_per_point();
 
@@ -283,7 +283,7 @@ pub fn draw_nav_debug(
     view_proj: [[f32; 4]; 4],
     screen_w: u32,
     screen_h: u32,
-    collision: Option<&crate::assets::Collision>,
+    collision: Option<&crate::nav::collision::Collision>,
     nav_goal: Option<[f32; 3]>,
     nav_paths: &(Vec<[f32; 3]>, Vec<[f32; 3]>), // walker's live (coarse, fine) plan (#246)
 ) {

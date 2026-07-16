@@ -17,6 +17,7 @@ use crate::game_state::GameState;
 use crate::http::FrameReq;
 use crate::renderer::EqRenderer;
 use crate::scene::SceneState;
+use crate::nav::collision;
 use crate::{assets, debug_zone, hud, zone_map};
 
 /// Data produced by the background zone-load thread, ready for GPU upload on the main thread.
@@ -24,7 +25,7 @@ struct PendingLoad {
     zone_name: String,
     /// None means the S3D failed to load; use the fallback ground plane instead.
     assets:    Option<assets::ZoneAssets>,
-    collision: Option<Arc<assets::Collision>>,
+    collision: Option<Arc<collision::Collision>>,
     zone_map:  Option<zone_map::ZoneMap>,
     zone_min:  [f32; 2],
     zone_max:  [f32; 2],
@@ -188,9 +189,9 @@ pub struct App {
     frame_profile_shared: crate::http::FrameProfileShared,
     // Precomputed zone collision grid: floor grounding, camera collision, nameplate occlusion.
     // Held as Arc and also published to `shared_collision` so the nav thread can read it.
-    collision:    Option<Arc<assets::Collision>>,
+    collision:    Option<Arc<collision::Collision>>,
     /// Shared slot the nav thread reads to gate /goto movement against walls.
-    shared_collision: assets::SharedCollision,
+    shared_collision: collision::SharedCollision,
     /// Most recent floor_z result. Used as the anchor for the next frame's floor_z query
     /// so the player's visual height is self-consistent and can't be pulled up to a bridge
     /// or ceiling just because the server placed them there.
@@ -250,7 +251,7 @@ impl App {
         acts:            crate::ui::Actions,
         spells:          std::sync::Arc<crate::spells::SpellDb>,
         door_click:      crate::http::DoorClickReq,
-        shared_collision: assets::SharedCollision,
+        shared_collision: collision::SharedCollision,
         frame_profile_shared: crate::http::FrameProfileShared,
         testzone_mode:   bool,
         nav_debug:       bool,
@@ -529,7 +530,7 @@ impl App {
             // through water where there's no walkable connection. None if the zone has no .wtr.
             let water = crate::region_map::RegionMap::load(&maps_dir.join("water"), &zone_name).map(Arc::new);
             let collision = opt_assets.as_ref().map(|za| {
-                let mut c = assets::Collision::build(za, 32.0);
+                let mut c = collision::Collision::build(za, 32.0);
                 c.set_water(water);
                 Arc::new(c)
             });
@@ -1415,7 +1416,7 @@ impl App {
         current_fps:   f32,
         zone_map:      Option<&zone_map::ZoneMap>,
         cam_eye:       [f32; 3],
-        collision:     Option<&assets::Collision>,
+        collision:     Option<&collision::Collision>,
         acts:          &crate::ui::Actions,
         spells:        &crate::spells::SpellDb,
         show_debug:    bool,
@@ -1920,7 +1921,7 @@ fn smooth_entity_motion(
     motion:     &mut std::collections::HashMap<u32, EntityMotion>,
     billboards: &mut [crate::scene::Billboard],
     player_pos: [f32; 3],
-    collision:  Option<&crate::assets::Collision>,
+    collision:  Option<&crate::nav::collision::Collision>,
     now:        std::time::Instant,
     dt:         f32,
 ) {
@@ -2073,8 +2074,9 @@ mod tests {
     }
 
     /// Flat floor at z=`h` spanning east/north [-100,100], for floor-snap tests.
-    fn flat_collision_at(h: f32) -> crate::assets::Collision {
-        use crate::assets::{Collision, MeshData, RenderMode, ZoneAssets};
+    fn flat_collision_at(h: f32) -> crate::nav::collision::Collision {
+        use crate::assets::{MeshData, RenderMode, ZoneAssets};
+        use crate::nav::collision::Collision;
         let floor = MeshData {
             positions: vec![[-100.0, h, -100.0], [100.0, h, -100.0],
                             [100.0, h, 100.0], [-100.0, h, 100.0]],
