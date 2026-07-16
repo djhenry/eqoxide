@@ -68,28 +68,7 @@ const PROC_LEN:         usize = 30;  // sizeof(ProcEffectStruct)           rof2_
 const WORN_LEN:         usize = 30;  // sizeof(WornEffectStruct)           rof2_structs.h:4962
 const QUATERNARY_LEN:   usize = 171; // sizeof(ItemQuaternaryBodyStruct)   rof2_structs.h:4977
 
-// ── Internal helpers ──────────────────────────────────────────────────────────
-
-/// Read a NUL-terminated string starting at `off`; returns (string, offset just past the NUL).
-fn read_cstr(buf: &[u8], off: usize) -> Option<(String, usize)> {
-    let rel = buf.get(off..)?.iter().position(|&b| b == 0)?;
-    let end = off + rel;
-    Some((String::from_utf8_lossy(&buf[off..end]).into_owned(), end + 1))
-}
-
-/// Skip a NUL-terminated string at `off`; returns offset just past the NUL.
-fn skip_cstr(buf: &[u8], off: usize) -> Option<usize> {
-    let rel = buf.get(off..)?.iter().position(|&b| b == 0)?;
-    Some(off + rel + 1)
-}
-
-/// Skip `n` bytes, returning the new offset or None if out of range.
-#[inline]
-fn skip(off: usize, n: usize, len: usize) -> Option<usize> {
-    let next = off.checked_add(n)?;
-    if next > len { return None; }
-    Some(next)
-}
+use crate::eq_net::wire::WireReader;
 
 /// Deserialize one RoF2-serialized item.
 ///
@@ -101,9 +80,18 @@ fn skip(off: usize, n: usize, len: usize) -> Option<usize> {
 /// `ItemSerializationHeader.unknown000`).  For OP_ItemPacket callers, strip the 4-byte
 /// `PacketType` prefix first.
 pub fn parse_rof2_item(buf: &[u8]) -> Option<(RoF2Item, usize)> {
+    // VARIABLE-LENGTH + recursive: an OP_CharInventory / OP_ItemPacket carries a *count* of
+    // back-to-back items and this fn returns the exact consumed size so the caller can split them.
+    // The caller (`apply_char_inventory`) treats a `None` as "stop, keep what parsed" — so this
+    // decoder KEEPS the non-panicking (`try_*` → `?` → None) contract rather than panicking on a
+    // short/garbled item, to avoid crashing a whole inventory load on one bad record. It uses the
+    // unified `WireReader` mechanism (collapsing the old read_cstr/skip_cstr/skip helpers) but on
+    // its non-panicking path. NOTE: this is a deliberate exception to the panic-on-mismatch rule —
+    // flagged for the orchestrator.
     let len = buf.len();
     if len < HDR_LEN { return None; }
 
+    // Header fields sit at fixed offsets within the guaranteed-present 77-byte header.
     let u16a = |o: usize| u16::from_le_bytes([buf[o], buf[o + 1]]);
     let u32a = |o: usize| u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
 
@@ -121,103 +109,92 @@ pub fn parse_rof2_item(buf: &[u8]) -> Option<(RoF2Item, usize)> {
     let charges        = u32a(56);
     let is_evolving    = buf[76];
 
-    let mut off = HDR_LEN;
+    let mut r = WireReader::new(buf, "RoF2Item");
+    r.skip(HDR_LEN); // consume the 77-byte header (guaranteed present by the len check above)
 
     // ── B. EvolvingItem_Struct (optional, 25 bytes) ───────────────────────────
     if is_evolving > 0 {
-        off = skip(off, EVOLVING_LEN, len)?;
+        r.try_skip(EVOLVING_LEN)?;
     }
 
     // ── C. Two ornamentation C-strings ────────────────────────────────────────
-    off = skip_cstr(buf, off)?; // main-hand ornament (or empty NUL)
-    off = skip_cstr(buf, off)?; // off-hand ornament  (or empty NUL)
+    r.try_cstr()?; // main-hand ornament (or empty NUL)
+    r.try_cstr()?; // off-hand ornament  (or empty NUL)
 
     // ── D. ItemSerializationHeaderFinish (26 bytes) ───────────────────────────
-    off = skip(off, FINISH_LEN, len)?;
+    r.try_skip(FINISH_LEN)?;
 
     // ── E. Name / Lore / IDFile / extra NUL ──────────────────────────────────
     // Name: only written when non-empty (rof2.cpp:6552–6555) — check for NUL vs data.
     // In practice all real items have a non-empty name; we still handle the empty-Name case.
-    let name;
-    if off < len && buf[off] == 0 {
-        // Name is absent (empty string, no NUL written) — treat as empty string and advance 0.
-        // Actually, if the *next* byte is a NUL it could be an empty Lore not a missing Name.
-        // rof2.cpp skips writing entirely when strlen(Name)==0, so there is no NUL to consume.
-        // We cannot distinguish absent Name from empty Lore here; assume Name present in practice.
-        name = String::new();
-        // Do NOT advance: this NUL belongs to Lore.
+    let name = if r.peek_u8() == Some(0) {
+        // Name is absent (empty string, no NUL written): this NUL belongs to Lore — do NOT consume.
+        String::new()
     } else {
-        let (n, o) = read_cstr(buf, off)?;
-        name = n;
-        off = o;
-    }
-    let (_lore, o) = read_cstr(buf, off)?; off = o;
-    let (idfile, o) = read_cstr(buf, off)?; off = o;
-    off = skip(off, 1, len)?; // extra NUL (rof2.cpp:6565)
+        r.try_cstr()?
+    };
+    let _lore = r.try_cstr()?;
+    let idfile = r.try_cstr()?;
+    r.try_skip(1)?; // extra NUL (rof2.cpp:6565)
 
     // ── F. ItemBodyStruct (255 bytes) — id@0, icon@20 ──────────────────────────
-    off = skip(off, BODY_LEN, len)?;
-    // id is at offset 0 and icon at offset 20 within body — read them BEFORE advancing.
-    let body_start = off - BODY_LEN;
+    let body_start = r.pos();
+    r.try_skip(BODY_LEN)?;
+    // id is at offset 0 and icon at offset 20 within body (now guaranteed in-bounds).
     let id   = u32a(body_start);
     let icon = u32a(body_start + 20);
 
     // ── G. CharmFile C-string ─────────────────────────────────────────────────
-    off = skip_cstr(buf, off)?;
+    r.try_cstr()?;
 
     // ── H. ItemSecondaryBodyStruct (74 bytes) ─────────────────────────────────
-    off = skip(off, SECONDARY_LEN, len)?;
+    r.try_skip(SECONDARY_LEN)?;
 
     // ── I. Filename C-string — the book/note text-file id (empty for non-books, #288) ─────────
-    let (filename, o) = read_cstr(buf, off)?; off = o;
+    let filename = r.try_cstr()?;
 
     // ── J. ItemTertiaryBodyStruct (76 bytes) ──────────────────────────────────
-    off = skip(off, TERTIARY_LEN, len)?;
+    r.try_skip(TERTIARY_LEN)?;
 
     // ── K. 6 effect blocks: fixed struct + effect-name C-str + int32(0) ───────
     // 1. ClickEffectStruct (30) + ClickName C-str + i32
     // ClickEffectStruct.effect (int32 @0) is the item's click ("clicky") spell id — >0 for a
     // clickable effect (teleport potions/rings, etc.), 0/-1 for none. Read it before advancing so
     // an item-activate cast can send it as the CastSpell_Struct spell_id. (eqoxide#193)
-    if off + 4 > len { return None; }
-    let click_effect = i32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+    let click_effect = { let o = r.pos(); if o + 4 > len { return None; } i32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]) };
     let click_spell_id = if click_effect > 0 { click_effect as u32 } else { 0 };
-    off = skip(off, CLICK_LEN, len)?; off = skip_cstr(buf, off)?; off = skip(off, 4, len)?;
+    r.try_skip(CLICK_LEN)?; r.try_cstr()?; r.try_skip(4)?;
     // 2. ProcEffectStruct (30) + ProcName C-str + i32
-    off = skip(off, PROC_LEN,  len)?; off = skip_cstr(buf, off)?; off = skip(off, 4, len)?;
+    r.try_skip(PROC_LEN)?;  r.try_cstr()?; r.try_skip(4)?;
     // 3. WornEffectStruct (30) + WornName C-str + i32
-    off = skip(off, WORN_LEN,  len)?; off = skip_cstr(buf, off)?; off = skip(off, 4, len)?;
+    r.try_skip(WORN_LEN)?;  r.try_cstr()?; r.try_skip(4)?;
     // 4. WornEffectStruct (30) + FocusName C-str + i32
-    off = skip(off, WORN_LEN,  len)?; off = skip_cstr(buf, off)?; off = skip(off, 4, len)?;
+    r.try_skip(WORN_LEN)?;  r.try_cstr()?; r.try_skip(4)?;
     // 5. WornEffectStruct (30) + ScrollName C-str + i32
-    off = skip(off, WORN_LEN,  len)?; off = skip_cstr(buf, off)?; off = skip(off, 4, len)?;
+    r.try_skip(WORN_LEN)?;  r.try_cstr()?; r.try_skip(4)?;
     // 6. WornEffectStruct (30) + "\0" (Bard — always empty) + i32
-    off = skip(off, WORN_LEN,  len)?; off = skip_cstr(buf, off)?; off = skip(off, 4, len)?;
+    r.try_skip(WORN_LEN)?;  r.try_cstr()?; r.try_skip(4)?;
 
     // ── L. ItemQuaternaryBodyStruct (171 bytes) ───────────────────────────────
-    off = skip(off, QUATERNARY_LEN, len)?;
+    r.try_skip(QUATERNARY_LEN)?;
 
     // ── M. Sub-items (bag contents): uint32 count + (uint32 index + item) × N ─
     // Each nested sub-item is preceded by its 0-based bag slot index (EQEmu SerializeItem writes
     // `index` = invbag::SLOT_BEGIN..SLOT_END before each; common/patches/rof2.cpp:6913). Retain
     // them so bagged items are visible/movable — the caller maps (this item's slot, sub_index) to
     // a flat bag wire slot. (eqoxide#201)
-    if off + 4 > len { return None; }
-    let subitem_count = u32a(off);
-    off += 4;
+    let subitem_count = r.try_u32()?;
     let mut bag_contents = Vec::new();
     for _ in 0..subitem_count {
-        if off + 4 > len { return None; }
-        let sub_index = u32a(off);
-        off += 4; // uint32 bag-slot index
+        let sub_index = r.try_u32()?; // uint32 bag-slot index
         // Recursive: parse the sub-item to get its consumed size.
-        let (sub, sub_len) = parse_rof2_item(&buf[off..])?;
-        off += sub_len;
+        let (sub, sub_len) = parse_rof2_item(r.rest())?;
+        r.skip(sub_len); // sub_len ≤ remaining (the recursive parse just consumed it)
         bag_contents.push((sub_index, sub));
     }
 
     Some((RoF2Item { slot_type, main_slot, sub_slot, price, merchant_count, stacksize, charges,
-                     id, icon, name, idfile, filename, click_spell_id, bag_contents }, off))
+                     id, icon, name, idfile, filename, click_spell_id, bag_contents }, r.pos()))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
