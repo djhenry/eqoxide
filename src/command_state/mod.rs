@@ -26,7 +26,7 @@
 //! bare verb.
 //!
 //! ────────────────────────────────────────────────────────────────────────────────────────────
-//! HOW TO MIGRATE A DOMAIN  (Wave-2 fan-out: one agent per file, near-zero shared-file conflict)
+//! HOW TO MIGRATE A DOMAIN  (Wave-2 fan-out: LIGHT migration — leave shared structs/signatures alone)
 //! ────────────────────────────────────────────────────────────────────────────────────────────
 //! `combat.rs` is the fully-migrated reference — copy its shape. For your domain `<d>`:
 //!
@@ -45,9 +45,15 @@
 //!        `s.command.request_<verb>(x)` in `http/<d>.rs`, and `*cx.acts.<slot>.lock()… = Some(x)`
 //!        becomes `cx.acts.command.request_<verb>(x)` in `ui/windows/<d>.rs`.
 //!      • MODEL drain → `take_*`: in `action_loop.rs`, `self.<d>.<slot>.lock().unwrap().take()`
-//!        becomes `self.command.take_<thing>()`.
-//!    Then drop the now-unused `<d>` bundle field from `HttpState`/`ActionLoop`/`ui::Actions` and
-//!    their param lists (combat did exactly this — that is the end state to copy).
+//!        becomes `self.command.take_<thing>()` (each domain's drain lives in its own `drain_<d>`
+//!        method — non-adjacent, so parallel Wave-2 branches auto-merge here).
+//! 4. DO NOT remove the `<d>` bundle field or touch any `fn` signature. Leaving the now-dead field
+//!    in place is DELIBERATE: it keeps every Wave-2 branch off the shared lines (`CommandState`'s
+//!    struct/`new()`, `main.rs`, `http/mod.rs`, `ui/mod.rs`, `ActionLoop::new`/`run_login_flow`/
+//!    `spawn_camera_server` signatures) so the branches don't collide. A SINGLE final cleanup PR
+//!    removes all the dead bundle fields + trims those signatures at once, and drops the
+//!    `#[allow(dead_code)]`. (`combat.rs` is the reference for the METHOD shape; note combat also
+//!    already removed its field — that is the eventual end state, NOT what a Wave-2 domain does.)
 
 mod combat;
 // Wave-2 fan-out stubs — one file each, empty `impl CommandState {}` shell awaiting migration.
@@ -69,9 +75,9 @@ mod lifecycle;
 ///
 /// `#[allow(dead_code)]`: only the migrated domains' fields are read today (combat, in `combat.rs`).
 /// The rest are pre-declared so Wave-2 fan-out agents fill ONLY their own `command_state/<d>.rs`
-/// and its call sites — never this struct — giving conflict-free parallel migration. Each field
-/// starts being read the moment its domain's methods land, at which point remove it from the allow
-/// (or the whole allow, once every domain has migrated).
+/// and its call sites (plus their own `drain_<d>` in `action_loop.rs`) — never this struct or any
+/// `fn` signature — which keeps the parallel branches off the shared lines (see the migration note
+/// above). A single final cleanup PR then removes the migrated fields and this allow at once.
 #[derive(Clone, Default)]
 #[allow(dead_code)]
 pub struct CommandState {
