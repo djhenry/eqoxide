@@ -27,7 +27,7 @@ pub struct SpellDb {
 
 /// Process-global spell table, set once at startup (mirrors the eqstr table). Lets the nav thread
 /// resolve a spell's target type for self-cast decisions without threading the Arc through the
-/// login → Navigator arg chain. (eqoxide#95)
+/// login → ActionLoop arg chain. (eqoxide#95)
 static GLOBAL: OnceLock<Arc<SpellDb>> = OnceLock::new();
 
 /// Publish the loaded spell table globally (idempotent — first call wins).

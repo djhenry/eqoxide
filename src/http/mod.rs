@@ -184,7 +184,7 @@ impl PlayerState {
     /// Project the network thread's authoritative `GameState` into the agent-facing view.
     ///
     /// `gs.player_x/y/z` and `gs.player_heading` are the *controller's* position: the nav thread
-    /// mirrors `controller_view` into them every tick in `Navigator::stream_position` (and the
+    /// mirrors `controller_view` into them every tick in `ActionLoop::stream_position` (and the
     /// controlled-fall branch writes `player_z` itself), so this is exactly the position the client
     /// streams to the server — no need to reach into the render thread's controller (#343).
     pub fn from_game_state(gs: &crate::game_state::GameState) -> Self {

@@ -756,7 +756,7 @@ impl App {
         // when the freshly-mutated `GameState` actually differs (PartialEq) from what's already
         // published, so the Arc's pointer identity is now a COMPLETE activity signal: it covers
         // both a real inbound packet (apply_packet) and a client-initiated mutation that produced
-        // no packet at all (e.g. Navigator::tick handling POST /v1/interact/sit, or the auto-loot
+        // no packet at all (e.g. ActionLoop::tick handling POST /v1/interact/sit, or the auto-loot
         // session-close timer). A genuinely idle world republishes the same Arc, so this correctly
         // lets the render loop sleep.
         let new_view = self.game_state_snapshot.load_full();
@@ -1733,14 +1733,14 @@ impl ApplicationHandler for App {
                             if dx * dx + dy * dy < 25.0 {
                                 match self.pick_at(self.last_cursor) {
                                     Some(PickResult::Entity(id)) => {
-                                        // Navigator::tick (network thread) already polls this same
+                                        // ActionLoop::tick (network thread) already polls this same
                                         // slot, sets the real target state, and it flows back via the
                                         // next GameState snapshot — no local echo needed.
                                         *self.acts.target.lock().unwrap() = Some(id);
                                     }
                                     Some(PickResult::Door(door_id)) => {
                                         // Server-authoritative: only request the open; never set is_open
-                                        // locally. Navigator::tick (network thread) already logs
+                                        // locally. ActionLoop::tick (network thread) already logs
                                         // "Clicked door {id}" when it polls this same slot.
                                         *self.door_click.lock().unwrap() = Some(door_id);
                                     }
@@ -1792,7 +1792,7 @@ impl ApplicationHandler for App {
                                 }
                                 // Self-target (native EQ F1): target your own character (#291).
                                 // Mirrors the click-to-target path — just sets the acts.target handle;
-                                // Navigator::tick (network thread) does the real work (OP_TargetMouse +
+                                // ActionLoop::tick (network thread) does the real work (OP_TargetMouse +
                                 // OP_Consider) and the result flows back via the next GameState snapshot,
                                 // enabling self-heals/buffs, consider-on-self, and (server permitting)
                                 // GM #kill/#damage on yourself.
