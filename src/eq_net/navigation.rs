@@ -2722,7 +2722,7 @@ impl Navigator {
         // EQEmu decodes wire heading via EQ12toFloat = wire/4; full circle = 512 EQ units.
         // So wire = cw_degrees * 512/360 * 4 = cw_degrees * 2048/360.
         let h_cw = crate::eq_net::protocol::ccw_to_cw(heading);
-        let eq_heading = ((h_cw * 2048.0 / 360.0) as u32) & 0xFFF;
+        let eq_heading = crate::eq_net::protocol::deg_cw_to_eq12_client(h_cw);
 
         // RoF2 PlayerPositionUpdateClient_Struct (rof2_structs.h, 46 bytes):
         //   0: sequence(u16)  2: spawn_id(u16)  4: vehicle_id(u16)=0
