@@ -29,7 +29,7 @@ pub use combat::*;
 pub use spells::*;
 pub use inventory::*;
 pub use trade::*;
-pub use merchant::*;
+pub(crate) use merchant::*;
 pub use group::*;
 pub use guild::*;
 pub use tasks::*;

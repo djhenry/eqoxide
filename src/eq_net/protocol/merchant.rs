@@ -5,7 +5,7 @@
 /// rate@12, **tab_display@16** (bitmask — b001 = Purchase/Sell tab), unknown02@20 (-1 from client).
 /// Titanium was 16 bytes with no tab_display; without tab_display set the RoF2 server opens the
 /// window but sends NO merchant inventory, so it must be 1.
-pub fn merchant_click(npc_id: u32, player_id: u32, command: u32) -> [u8; 24] {
+pub(crate) fn merchant_click(npc_id: u32, player_id: u32, command: u32) -> [u8; 24] {
     let mut b = [0u8; 24];
     b[0..4].copy_from_slice(&npc_id.to_le_bytes());
     b[4..8].copy_from_slice(&player_id.to_le_bytes());

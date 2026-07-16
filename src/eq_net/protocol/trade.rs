@@ -10,7 +10,7 @@ use crate::eq_net::protocol::rof2_possessions_slot;
 /// trade-window index (0 = the NPC's first trade slot). `server_slot` here is the absolute eqoxide
 /// slot (SLOT_TRADE_BEGIN..); we subtract TRADE_BEGIN back to the index. Type = typeTrade (3) per
 /// rof2_limits.h InventoryTypes; SubIndex/AugIndex = -1 (top-level, not a bag/aug).
-pub fn rof2_trade_slot(server_slot: u32) -> [u8; 12] {
+pub(crate) fn rof2_trade_slot(server_slot: u32) -> [u8; 12] {
     let index = server_slot.saturating_sub(SLOT_TRADE_BEGIN);
     let mut s = [0u8; 12];
     s[0..2].copy_from_slice(&3i16.to_le_bytes());           // Type = typeTrade
