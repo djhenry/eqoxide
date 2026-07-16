@@ -10,7 +10,7 @@ pub(super) fn router() -> Router<HttpState> {
 }
 
 async fn get_camera(State(s): State<HttpState>) -> Json<CameraSnapshot> {
-    Json(s.snapshot.lock().unwrap().clone())
+    Json(s.camera.snapshot.lock().unwrap().clone())
 }
 
 #[derive(serde::Deserialize)]
@@ -29,7 +29,7 @@ async fn post_camera(
 ) -> StatusCode {
     match body {
         Ok(Json(b)) => {
-            *s.cmd_tx.lock().unwrap() = Some(CameraCmd::Set {
+            *s.camera.cmd_tx.lock().unwrap() = Some(CameraCmd::Set {
                 azimuth:   b.azimuth,
                 elevation: b.elevation,
                 radius:    b.radius,
@@ -43,6 +43,6 @@ async fn post_camera(
 
 /// POST /v1/camera/reset — reset the camera to the default follow view.
 async fn post_camera_reset(State(s): State<HttpState>) -> StatusCode {
-    *s.cmd_tx.lock().unwrap() = Some(CameraCmd::Reset);
+    *s.camera.cmd_tx.lock().unwrap() = Some(CameraCmd::Reset);
     StatusCode::OK
 }

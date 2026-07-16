@@ -13,7 +13,6 @@
 //! not genuine HTTP types. See `docs/http-api.md`.
 
 use axum::Router;
-use std::sync::{Arc, Mutex};
 use crate::camera_state::{CameraCmd, CameraSnapshot};
 
 /// Extracts an optional JSON body, distinguishing "no body was sent" (→ `.0 == None`, so the
@@ -357,48 +356,38 @@ pub(crate) fn currency_json(coin: [u32; 4]) -> serde_json::Value {
     })
 }
 
+/// **M4 domain bundles** (see `crate::ipc` module docs): the ~62 flat request/snapshot slots this
+/// struct used to hold individually are now grouped by domain, mirroring the `/v1/<group>/*` router
+/// nesting below — prefiguring a future shared controller-verb API (Phase 2). Each bundle here MUST
+/// be a `.clone()` of the SAME bundle instance handed to `ActionLoop::new` in `main.rs`; that shared
+/// Arc identity (not two independently-`Default`-constructed bundles) is what keeps this the same
+/// cross-thread channel the nav thread drains. See `ipc.rs` and `main.rs` wiring.
+///
+/// A few bundle fields are unused on THIS side of a channel (e.g. `nav.nav_path_view` is written by
+/// the nav thread and read by the render thread, never by an HTTP handler) — that's expected: the
+/// bundle boundary is the DOMAIN, not "exactly the fields this struct touches".
 #[derive(Clone)]
 pub(crate) struct HttpState {
-    pub(crate) cmd_tx:           Arc<Mutex<Option<CameraCmd>>>,
-    pub(crate) snapshot:         Arc<Mutex<CameraSnapshot>>,
-    pub(crate) frame_req:        FrameReq,
-    pub(crate) goto_target:      GotoTarget,
-    pub(crate) goto_entity:      GotoEntity,
-    pub(crate) entity_positions: EntityPositions,
-    pub(crate) entity_ids:       EntityIds,
-    pub(crate) zone_points:      ZonePoints,
+    /// `/v1/camera/*` slots (#M4).
+    pub(crate) camera:          crate::ipc::CameraSlots,
+    /// `/v1/move/*` slots (#M4).
+    pub(crate) nav:             crate::ipc::NavSlots,
+    /// The live entity registry + zone exit points (#M4).
+    pub(crate) world:           crate::ipc::WorldSlots,
     /// Zone collision + region map (shared with the nav thread); read-only here, for zone_exits.
     pub(crate) shared_collision: crate::nav::collision::SharedCollision,
-    pub(crate) zone_cross:       ZoneCrossReq,
-    /// Aggro-avoidance knobs set by /v1/move/goto|zone_cross and read by the nav walker (#242).
-    pub(crate) nav_avoid:        NavAvoidShared,
-    /// Manual-move / jump escape hatch (#188), consumed by the render loop.
-    pub(crate) manual_move:      ManualMoveReq,
-    pub(crate) hail:             HailReq,
-    pub(crate) say:              SayReq,
-    pub(crate) target:           TargetReq,
-    pub(crate) who_req:          WhoReq,
-    pub(crate) friends_list:     FriendsListShared,
-    pub(crate) friends_req:      FriendsReq,
-    pub(crate) attack:           AttackReq,
-    pub(crate) cast:             CastReq,
-    pub(crate) mem_spell:        MemSpellReq,
-    pub(crate) sit:              SitReq,
-    pub(crate) consider:         ConsiderReq,
-    pub(crate) buy:              BuyReq,
-    pub(crate) sell:             SellReq,
-    pub(crate) trade:            TradeReq,
-    pub(crate) merchant:         MerchantShared,
-    pub(crate) move_req:         MoveReq,
-    pub(crate) give:             GiveReq,
-    pub(crate) inventory:        InventoryShared,
-    pub(crate) loot:             LootReq,
-    pub(crate) messages:         MessagesShared,
-    pub(crate) dialogue:         DialogueShared,
-    pub(crate) nav_state:        NavStateShared,
-    pub(crate) dialogue_click:   DialogueClickReq,
-    pub(crate) chat_events:      ChatEventsShared,
-    pub(crate) chat_send:        ChatSendShared,
+    /// `/v1/combat/*` (+ `/v1/pet/command`) slots (#M4).
+    pub(crate) combat:          crate::ipc::CombatSlots,
+    /// `/v1/social/*` (who/friends) slots (#M4).
+    pub(crate) social:          crate::ipc::SocialSlots,
+    /// `/v1/merchant/*` slots (#M4).
+    pub(crate) merchant_slots:  crate::ipc::MerchantSlots,
+    /// `/v1/inventory/*` slots (#M4).
+    pub(crate) inventory_slots: crate::ipc::InventorySlots,
+    /// `/v1/interact/*` slots (#M4).
+    pub(crate) interact:        crate::ipc::InteractSlots,
+    /// Outgoing chat + async events + the message log (#M4).
+    pub(crate) chat:            crate::ipc::ChatSlots,
     pub(crate) spells:           std::sync::Arc<crate::spells::SpellDb>,
     /// The network thread's authoritative `GameState`. Every agent-facing player field is projected
     /// from HERE at read time (`HttpState::player`) — the render loop is no longer in the path (#343).
@@ -407,29 +396,16 @@ pub(crate) struct HttpState {
     pub(crate) net_health:       NetHealthShared,
     /// Render-owned frame timings (the ONLY agent-visible value the render loop publishes).
     pub(crate) frame_profile:    FrameProfileShared,
-    pub(crate) task_log:         TaskLog,
-    pub(crate) task_offers_shared:    TaskOffersShared,
-    pub(crate) completed_tasks_shared: CompletedTasksShared,
-    pub(crate) accept_task:           AcceptTaskReq,
-    pub(crate) cancel_task:           CancelTaskReq,
-    pub(crate) group:             GroupShared,
-    pub(crate) group_invite:      GroupInviteReq,
-    pub(crate) trainer_open_req:  TrainerOpenReq,
-    pub(crate) trainer_train_req: TrainerTrainReq,
-    pub(crate) group_accept:      GroupAcceptReq,
-    pub(crate) group_decline:     GroupDeclineReq,
-    pub(crate) group_leave:       GroupLeaveReq,
-    pub(crate) group_kick:        GroupKickReq,
-    pub(crate) group_make_leader: GroupMakeLeaderReq,
-    pub(crate) door_click:       DoorClickReq,
-    pub(crate) doors_shared:     DoorsShared,
-    pub(crate) camp:             CampReq,
-    pub(crate) camp_until:       CampUntil,
-    pub(crate) respawn:          RespawnReq,
-    pub(crate) pet_cmd:          PetCmdReq,
-    pub(crate) read_book:        ReadBookReq,
-    pub(crate) guild:            GuildShared,
-    pub(crate) guild_action:     GuildActionReq,
+    /// `/v1/quests/*` slots (#M4).
+    pub(crate) quest:           crate::ipc::QuestSlots,
+    /// `/v1/group/*` slots (#M4).
+    pub(crate) group_slots:     crate::ipc::GroupSlots,
+    /// `/v1/trainer/*` slots (#M4).
+    pub(crate) trainer:         crate::ipc::TrainerSlots,
+    /// `/v1/lifecycle/*` slots (#M4).
+    pub(crate) lifecycle:       crate::ipc::LifecycleSlots,
+    /// `/v1/guild/*` slots (#M4).
+    pub(crate) guild_slots:     crate::ipc::GuildSlots,
 }
 
 impl HttpState {
@@ -480,71 +456,27 @@ impl HttpState {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_camera_server(
-    cmd_tx:           Arc<Mutex<Option<CameraCmd>>>,
-    snapshot:         Arc<Mutex<CameraSnapshot>>,
-    frame_req:        FrameReq,
-    goto_target:      GotoTarget,
-    goto_entity:      GotoEntity,
-    entity_positions: EntityPositions,
-    entity_ids:       EntityIds,
-    zone_points:      ZonePoints,
+    camera:          crate::ipc::CameraSlots,
+    nav:             crate::ipc::NavSlots,
+    world:           crate::ipc::WorldSlots,
     shared_collision: crate::nav::collision::SharedCollision,
-    zone_cross:       ZoneCrossReq,
-    manual_move:      ManualMoveReq,
-    hail:             HailReq,
-    say:              SayReq,
-    target:           TargetReq,
-    who_req:          WhoReq,
-    friends_list:     FriendsListShared,
-    friends_req:      FriendsReq,
-    attack:           AttackReq,
-    cast:             CastReq,
-    mem_spell:        MemSpellReq,
-    sit:              SitReq,
-    consider:         ConsiderReq,
-    buy:              BuyReq,
-    sell:             SellReq,
-    trade:            TradeReq,
-    merchant:         MerchantShared,
-    move_req:         MoveReq,
-    give:             GiveReq,
-    inventory:        InventoryShared,
-    loot:             LootReq,
-    messages:         MessagesShared,
-    dialogue:         DialogueShared,
-    nav_state:        NavStateShared,
-    dialogue_click:   DialogueClickReq,
-    chat_events:      ChatEventsShared,
-    chat_send:        ChatSendShared,
+    combat:          crate::ipc::CombatSlots,
+    social:          crate::ipc::SocialSlots,
+    merchant_slots:  crate::ipc::MerchantSlots,
+    inventory_slots: crate::ipc::InventorySlots,
+    interact:        crate::ipc::InteractSlots,
+    chat:            crate::ipc::ChatSlots,
     spells:           std::sync::Arc<crate::spells::SpellDb>,
     game_state:       GameStateSnapshot,
     net_health:       NetHealthShared,
     frame_profile:    FrameProfileShared,
-    task_log:         TaskLog,
-    task_offers_shared:    TaskOffersShared,
-    completed_tasks_shared: CompletedTasksShared,
-    accept_task:           AcceptTaskReq,
-    cancel_task:           CancelTaskReq,
-    group:             GroupShared,
-    group_invite:      GroupInviteReq,
-    trainer_open_req:  TrainerOpenReq,
-    trainer_train_req: TrainerTrainReq,
-    group_accept:      GroupAcceptReq,
-    group_decline:     GroupDeclineReq,
-    group_leave:       GroupLeaveReq,
-    group_kick:        GroupKickReq,
-    group_make_leader: GroupMakeLeaderReq,
-    door_click:       DoorClickReq,
-    doors_shared:     DoorsShared,
-    camp:             CampReq,
-    camp_until:       CampUntil,
-    respawn:          RespawnReq,
-    pet_cmd:          PetCmdReq,
-    nav_avoid:        NavAvoidShared,
-    read_book:        ReadBookReq,
-    guild:            GuildShared,
-    guild_action:     GuildActionReq,
+    quest:           crate::ipc::QuestSlots,
+    group_slots:     crate::ipc::GroupSlots,
+    trainer:         crate::ipc::TrainerSlots,
+    lifecycle:       crate::ipc::LifecycleSlots,
+    guild_slots:     crate::ipc::GuildSlots,
     port:             u16,
     // When `Some`, an already-bound listener from `--api-port` (exact port, no scan).
     // When `None`, scan upward from `port` for the first free port.
@@ -561,7 +493,11 @@ pub fn spawn_camera_server(
             .build()
             .expect("http tokio runtime");
         rt.block_on(async move {
-            let state = HttpState { cmd_tx, snapshot, frame_req, goto_target, goto_entity, entity_positions, entity_ids, zone_points, shared_collision, zone_cross, manual_move, hail, say, target, who_req, friends_list, friends_req, attack, cast, mem_spell, sit, consider, buy, sell, trade, merchant, move_req, give, inventory, loot, messages, dialogue, nav_state, dialogue_click, chat_events, chat_send, spells, game_state, net_health, frame_profile, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, door_click, doors_shared, camp, camp_until, respawn, pet_cmd, nav_avoid, read_book, guild, guild_action };
+            let state = HttpState {
+                camera, nav, world, shared_collision, combat, social, merchant_slots,
+                inventory_slots, interact, chat, spells, game_state, net_health, frame_profile,
+                quest, group_slots, trainer, lifecycle, guild_slots,
+            };
             // Versioned + grouped routes: /v1/<group>/<action>. Each group's `router()` defines
             // relative paths; nesting prefixes them. Shared state is applied once at the end.
             let app = Router::new()

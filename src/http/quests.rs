@@ -18,7 +18,7 @@ pub(super) fn router() -> Router<HttpState> {
 /// GET /v1/quests/completed for finished ones. Each task has a title, description, coin/XP/item
 /// reward, and objectives with live progress (done_count/goal_count).
 async fn get_log(State(s): State<HttpState>) -> Json<serde_json::Value> {
-    let tasks: Vec<_> = s.task_log.lock().unwrap().iter()
+    let tasks: Vec<_> = s.quest.task_log.lock().unwrap().iter()
         .filter(|t| t.status == crate::game_state::TaskStatus::Active)
         .cloned()
         .collect();
@@ -27,7 +27,7 @@ async fn get_log(State(s): State<HttpState>) -> Json<serde_json::Value> {
 
 /// GET /v1/quests/completed — completed task history: {task_id, title, completed_time}[].
 async fn get_completed(State(s): State<HttpState>) -> Json<serde_json::Value> {
-    let completed = s.completed_tasks_shared.lock().unwrap().clone();
+    let completed = s.quest.completed_tasks_shared.lock().unwrap().clone();
     Json(serde_json::json!({ "count": completed.len(), "completed": completed }))
 }
 
@@ -35,7 +35,7 @@ async fn get_completed(State(s): State<HttpState>) -> Json<serde_json::Value> {
 /// {task_id, npc_id, title, description, has_rewards}[]. Empty unless an NPC is actively presenting
 /// a choice of tasks (rare — most content auto-grants via assigntask, see GET /v1/quests/log).
 async fn get_offers(State(s): State<HttpState>) -> Json<serde_json::Value> {
-    let offers = s.task_offers_shared.lock().unwrap().clone();
+    let offers = s.quest.task_offers_shared.lock().unwrap().clone();
     Json(serde_json::json!({ "count": offers.len(), "offers": offers }))
 }
 
@@ -53,21 +53,21 @@ async fn post_accept(
         Ok(Json(b)) => b.task_id,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"task_id\":N}".into()),
     };
-    let known = s.task_offers_shared.lock().unwrap().iter().any(|o| o.task_id == task_id);
+    let known = s.quest.task_offers_shared.lock().unwrap().iter().any(|o| o.task_id == task_id);
     if !known {
         return (StatusCode::BAD_REQUEST, format!("no pending task offer with task_id={task_id}"));
     }
-    *s.accept_task.lock().unwrap() = Some(task_id);
+    *s.quest.accept_task.lock().unwrap() = Some(task_id);
     tracing::info!("quests: queued accept task_id={task_id}");
     (StatusCode::OK, format!("accepting task_id={task_id}"))
 }
 
 /// POST /v1/quests/decline — decline all pending task offers (idempotent no-op if none are open).
 async fn post_decline(State(s): State<HttpState>) -> (StatusCode, String) {
-    if s.task_offers_shared.lock().unwrap().is_empty() {
+    if s.quest.task_offers_shared.lock().unwrap().is_empty() {
         return (StatusCode::OK, "no pending task offers".into());
     }
-    *s.accept_task.lock().unwrap() = Some(0);
+    *s.quest.accept_task.lock().unwrap() = Some(0);
     tracing::info!("quests: queued decline-all");
     (StatusCode::OK, "declining pending task offer(s)".into())
 }
@@ -83,11 +83,11 @@ async fn post_cancel(
         Ok(Json(b)) => b.task_id,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"task_id\":N}".into()),
     };
-    let known = s.task_log.lock().unwrap().iter().any(|t| t.task_id == task_id);
+    let known = s.quest.task_log.lock().unwrap().iter().any(|t| t.task_id == task_id);
     if !known {
         return (StatusCode::BAD_REQUEST, format!("no active task with task_id={task_id}"));
     }
-    *s.cancel_task.lock().unwrap() = Some(task_id);
+    *s.quest.cancel_task.lock().unwrap() = Some(task_id);
     tracing::info!("quests: queued cancel task_id={task_id}");
     (StatusCode::OK, format!("cancelling task_id={task_id}"))
 }
@@ -95,7 +95,7 @@ async fn post_cancel(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -118,76 +118,38 @@ pub(crate) mod tests {
 
     pub(crate) fn empty_state() -> HttpState {
         HttpState {
-            cmd_tx: Arc::new(Mutex::new(None)),
-            snapshot: Arc::new(Mutex::new(crate::camera_state::CameraSnapshot {
-                mode: crate::camera_state::CameraMode::AutoFollow,
-                azimuth: 0.0,
-                elevation: 0.0,
-                radius: 0.0,
-                focus: [0.0, 0.0, 0.0],
-            })),
-            frame_req: Arc::new(Mutex::new(None)),
-            goto_target: Arc::new(Mutex::new(None)),
-            goto_entity: Arc::new(Mutex::new(None)),
-            entity_positions: Arc::new(Mutex::new(HashMap::new())),
-            entity_ids: Arc::new(Mutex::new(HashMap::new())),
-            zone_points: Arc::new(Mutex::new(Vec::new())),
+            // `CameraSlots` has no `Default` impl (`CameraSnapshot`'s fields aren't Default-able),
+            // so it's the one bundle built by hand here; every other bundle is plain `Default::default()`.
+            camera: crate::ipc::CameraSlots {
+                cmd_tx: Arc::new(Mutex::new(None)),
+                snapshot: Arc::new(Mutex::new(crate::camera_state::CameraSnapshot {
+                    mode: crate::camera_state::CameraMode::AutoFollow,
+                    azimuth: 0.0,
+                    elevation: 0.0,
+                    radius: 0.0,
+                    focus: [0.0, 0.0, 0.0],
+                })),
+                frame_req: Arc::new(Mutex::new(None)),
+                manual_move: Arc::new(Mutex::new(None)),
+            },
+            nav: Default::default(),
+            world: Default::default(),
             shared_collision: Arc::new(std::sync::RwLock::new(None)),
-            zone_cross: Arc::new(Mutex::new(None)),
-            nav_avoid: Arc::new(Mutex::new(crate::http::AggroAvoidOpts::default())),
-            manual_move: Arc::new(Mutex::new(None)),
-            hail: Arc::new(Mutex::new(None)),
-            say: Arc::new(Mutex::new(None)),
-            target: Arc::new(Mutex::new(None)),
-            who_req: Arc::new(Mutex::new(None)),
-            friends_list: Arc::new(Mutex::new(Vec::new())),
-            friends_req: Arc::new(Mutex::new(None)),
-            attack: Arc::new(Mutex::new(None)),
-            cast: Arc::new(Mutex::new(None)),
-            mem_spell: Arc::new(Mutex::new(None)),
-            sit: Arc::new(Mutex::new(None)),
-            consider: Arc::new(Mutex::new(None)),
-            buy: Arc::new(Mutex::new(None)),
-            sell: Arc::new(Mutex::new(None)),
-            trade: Arc::new(Mutex::new(None)),
-            merchant: Arc::new(Mutex::new(MerchantSnapshot::default())),
-            move_req: Arc::new(Mutex::new(None)),
-            give: Arc::new(Mutex::new(None)),
-            inventory: Arc::new(Mutex::new(Vec::new())),
-            loot: Arc::new(Mutex::new(None)),
-            messages: Arc::new(Mutex::new(Vec::new())),
-            dialogue: Arc::new(Mutex::new(Vec::new())),
-            nav_state: Arc::new(Mutex::new(crate::http::NavStatus::default())),
-            dialogue_click: Arc::new(Mutex::new(None)),
-            chat_events: Arc::new(Mutex::new(Vec::new())),
-            chat_send: Arc::new(Mutex::new(Vec::new())),
+            combat: Default::default(),
+            social: Default::default(),
+            merchant_slots: Default::default(),
+            inventory_slots: Default::default(),
+            interact: Default::default(),
+            chat: Default::default(),
             spells: std::sync::Arc::new(crate::spells::SpellDb::default()),
             game_state: Arc::new(arc_swap::ArcSwap::from_pointee(crate::game_state::GameState::new())),
             net_health: Arc::new(Mutex::new(crate::http::NetHealth::default())),
             frame_profile: Arc::new(Mutex::new(crate::profiling::FrameProfile::default())),
-            task_log: Arc::new(Mutex::new(Vec::new())),
-            task_offers_shared: Arc::new(Mutex::new(Vec::new())),
-            completed_tasks_shared: Arc::new(Mutex::new(Vec::new())),
-            accept_task: Arc::new(Mutex::new(None)),
-            cancel_task: Arc::new(Mutex::new(None)),
-            door_click: Arc::new(Mutex::new(None)),
-            doors_shared: Arc::new(Mutex::new(Vec::new())),
-            camp: Arc::new(Mutex::new(None)),
-            camp_until: Arc::new(Mutex::new(None)),
-            respawn: Arc::new(Mutex::new(false)),
-            pet_cmd: Arc::new(Mutex::new(None)),
-            read_book: Arc::new(Mutex::new(None)),
-            guild:             Arc::new(Mutex::new(GuildSnapshot::default())),
-            guild_action:      Arc::new(Mutex::new(None)),
-            group:             Arc::new(Mutex::new(GroupSnapshot::default())),
-            group_invite:      Arc::new(Mutex::new(None)),
-            trainer_open_req:  Arc::new(Mutex::new(None)),
-            trainer_train_req: Arc::new(Mutex::new(None)),
-            group_accept:      Arc::new(Mutex::new(None)),
-            group_decline:     Arc::new(Mutex::new(None)),
-            group_leave:       Arc::new(Mutex::new(None)),
-            group_kick:        Arc::new(Mutex::new(None)),
-            group_make_leader: Arc::new(Mutex::new(None)),
+            quest: Default::default(),
+            group_slots: Default::default(),
+            trainer: Default::default(),
+            lifecycle: Default::default(),
+            guild_slots: Default::default(),
         }
     }
 
@@ -205,10 +167,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn accept_known_offer_is_200_and_queues_request() {
         let state = empty_state();
-        state.task_offers_shared.lock().unwrap().push(crate::game_state::TaskOffer {
+        state.quest.task_offers_shared.lock().unwrap().push(crate::game_state::TaskOffer {
             task_id: 42, npc_id: 7, title: "Offer".into(), description: String::new(), has_rewards: false,
         });
-        let accept = state.accept_task.clone();
+        let accept = state.quest.accept_task.clone();
         let app = router().with_state(state);
         let req = Request::post("/accept")
             .header("content-type", "application/json")
@@ -240,10 +202,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn cancel_known_task_is_200_and_queues_request() {
         let state = empty_state();
-        state.task_log.lock().unwrap().push(crate::game_state::ActiveTask {
+        state.quest.task_log.lock().unwrap().push(crate::game_state::ActiveTask {
             task_id: 42, sequence_number: 3, ..Default::default()
         });
-        let cancel = state.cancel_task.clone();
+        let cancel = state.quest.cancel_task.clone();
         let app = router().with_state(state);
         let req = Request::post("/cancel")
             .header("content-type", "application/json")
@@ -256,7 +218,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn log_filters_out_completed_tasks() {
         let state = empty_state();
-        state.task_log.lock().unwrap().extend([
+        state.quest.task_log.lock().unwrap().extend([
             crate::game_state::ActiveTask { task_id: 1, status: crate::game_state::TaskStatus::Active, ..Default::default() },
             crate::game_state::ActiveTask { task_id: 2, status: crate::game_state::TaskStatus::Completed, ..Default::default() },
         ]);

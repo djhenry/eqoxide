@@ -55,7 +55,7 @@ async fn post_manual(
     if dir[0] == 0.0 && dir[1] == 0.0 && up == 0.0 && !jump {
         return (StatusCode::BAD_REQUEST, "provide a direction {east,north}, {up:-1..1} (swim), and/or {\"jump\":true}".into());
     }
-    *s.manual_move.lock().unwrap() = Some(ManualMove {
+    *s.camera.manual_move.lock().unwrap() = Some(ManualMove {
         dir, up, jump,
         until: std::time::Instant::now() + std::time::Duration::from_millis(ms),
     });
@@ -66,7 +66,7 @@ async fn post_manual(
 /// `jump`). Clears any `/goto` and pops the character up — on land it's a jump; in water it swims
 /// upward toward the surface (#207), e.g. to lift off a pool floor.
 async fn post_jump(State(s): State<HttpState>) -> (StatusCode, String) {
-    *s.manual_move.lock().unwrap() = Some(ManualMove {
+    *s.camera.manual_move.lock().unwrap() = Some(ManualMove {
         dir: [0.0, 0.0], up: 0.0, jump: true,
         until: std::time::Instant::now() + std::time::Duration::from_millis(400),
     });
@@ -154,7 +154,7 @@ async fn post_goto(
     let b = body.unwrap_or_default();
 
     let target: (f32, f32, f32) = if let Some(name) = &b.name {
-        match resolve_name(name, &s.entity_positions.lock().unwrap()) {
+        match resolve_name(name, &s.world.entity_positions.lock().unwrap()) {
             Some((_key, pos)) => pos,
             None => return (StatusCode::NOT_FOUND, format!("No entity named {name:?}")),
         }
@@ -166,8 +166,8 @@ async fn post_goto(
     } else {
         // No name/coords → default to the player's current target (one-time snapshot).
         let target_id = s.player().target_id;
-        let ids = s.entity_ids.lock().unwrap();
-        let positions = s.entity_positions.lock().unwrap();
+        let ids = s.world.entity_ids.lock().unwrap();
+        let positions = s.world.entity_positions.lock().unwrap();
         match resolve_current_target(target_id, &ids, &positions) {
             Ok((_key, pos)) => pos,
             Err(e) => return e,
@@ -175,10 +175,10 @@ async fn post_goto(
     };
 
     // Apply aggro-avoidance knobs for this route (#242).
-    apply_avoid_opts(&s.nav_avoid, b.avoid_aggro, b.aggro_buffer);
+    apply_avoid_opts(&s.nav.nav_avoid, b.avoid_aggro, b.aggro_buffer);
     // Set the position, then clear any chase — goto walks to a fixed point and stops.
-    *s.goto_target.lock().unwrap() = Some(target);
-    *s.goto_entity.lock().unwrap() = None;
+    *s.nav.goto_target.lock().unwrap() = Some(target);
+    *s.nav.goto_entity.lock().unwrap() = None;
     tracing::info!("move/goto: target set to ({:.1},{:.1},{:.1})", target.0, target.1, target.2);
     (StatusCode::OK, format!("navigating to ({:.1},{:.1},{:.1})", target.0, target.1, target.2))
 }
@@ -197,14 +197,14 @@ async fn post_follow(
     }
 
     let (key, pos) = if let Some(name) = &b.name {
-        match resolve_name(name, &s.entity_positions.lock().unwrap()) {
+        match resolve_name(name, &s.world.entity_positions.lock().unwrap()) {
             Some(kp) => kp,
             None => return (StatusCode::NOT_FOUND, format!("No entity named {name:?}")),
         }
     } else {
         let target_id = s.player().target_id;
-        let ids = s.entity_ids.lock().unwrap();
-        let positions = s.entity_positions.lock().unwrap();
+        let ids = s.world.entity_ids.lock().unwrap();
+        let positions = s.world.entity_positions.lock().unwrap();
         match resolve_current_target(target_id, &ids, &positions) {
             Ok(kp) => kp,
             Err(e) => return e,
@@ -213,8 +213,8 @@ async fn post_follow(
 
     // Position first, then the chase key: the nav thread re-resolves the key's live position each
     // tick (eqoxide#88) and homes in as the entity moves.
-    *s.goto_target.lock().unwrap() = Some(pos);
-    *s.goto_entity.lock().unwrap() = Some(key.clone());
+    *s.nav.goto_target.lock().unwrap() = Some(pos);
+    *s.nav.goto_entity.lock().unwrap() = Some(key.clone());
     tracing::info!("move/follow: chasing {:?} from ({:.1},{:.1},{:.1})", key, pos.0, pos.1, pos.2);
     (StatusCode::OK, format!("following {}", clean_entity_name(&key)))
 }
@@ -222,8 +222,8 @@ async fn post_follow(
 /// POST /v1/move/stop — cancel any active goto/follow. Idempotent. Clears goto_target and
 /// goto_entity; the nav thread then clears nav_intent next tick via its "no goto ⇒ no nav" invariant.
 async fn post_stop(State(s): State<HttpState>) -> (StatusCode, String) {
-    *s.goto_target.lock().unwrap() = None;
-    *s.goto_entity.lock().unwrap() = None;
+    *s.nav.goto_target.lock().unwrap() = None;
+    *s.nav.goto_entity.lock().unwrap() = None;
     tracing::info!("move/stop: navigation cancelled");
     (StatusCode::OK, "navigation stopped".into())
 }
@@ -267,13 +267,13 @@ async fn post_zone_cross(
     OptionalJson(body): OptionalJson<ZoneCrossBody>,
 ) -> (StatusCode, String) {
     let b = body.unwrap_or_default();
-    apply_avoid_opts(&s.nav_avoid, b.avoid_aggro, b.aggro_buffer);
+    apply_avoid_opts(&s.nav.nav_avoid, b.avoid_aggro, b.aggro_buffer);
     let zone_id = b.zone_id.unwrap_or(0);
     if zone_id != 0 {
         // A zone_id that doesn't fit the wire u16 (e.g. 99999) can never match a zone line, so
         // fold it into the same "not reachable" rejection as an in-range-but-unreachable id —
         // same message shape either way — instead of a separate generic range error (eqoxide#328).
-        let reachable = reachable_zone_ids(&s.zone_points.lock().unwrap());
+        let reachable = reachable_zone_ids(&s.world.zone_points.lock().unwrap());
         let is_reachable = u16::try_from(zone_id).is_ok_and(|z| reachable.contains(&z));
         if !is_reachable {
             let msg = if reachable.is_empty() {
@@ -287,7 +287,7 @@ async fn post_zone_cross(
         }
     }
     let zone_id = zone_id as u16; // safe: either 0, or validated above to fit u16 and be reachable
-    *s.zone_cross.lock().unwrap() = Some(zone_id);
+    *s.nav.zone_cross.lock().unwrap() = Some(zone_id);
     tracing::info!("zone_cross: flagged for OP_ZONE_CHANGE (target zone_id={zone_id})");
     // Honest, async-aware response (#267): the client WALKS to the zone line, it does not teleport, so
     // this 200 means "accepted", not "arrived". Tell the caller how to observe the real outcome — a bare
@@ -380,8 +380,8 @@ mod tests {
     #[tokio::test]
     async fn zone_cross_out_of_range_zone_id_is_400_with_reachable_list() {
         let state = empty_state();
-        state.zone_points.lock().unwrap().extend([zp(1), zp(2), zp(38)]);
-        let zc = state.zone_cross.clone();
+        state.world.zone_points.lock().unwrap().extend([zp(1), zp(2), zp(38)]);
+        let zc = state.nav.zone_cross.clone();
         let app = router().with_state(state);
         let req = Request::post("/zone_cross")
             .header("content-type", "application/json")
@@ -398,7 +398,7 @@ mod tests {
     #[tokio::test]
     async fn zone_cross_out_of_range_and_in_range_unreachable_share_message_shape() {
         let state = empty_state();
-        state.zone_points.lock().unwrap().extend([zp(1), zp(2), zp(38)]);
+        state.world.zone_points.lock().unwrap().extend([zp(1), zp(2), zp(38)]);
         let app = router().with_state(state.clone());
         let req = Request::post("/zone_cross")
             .header("content-type", "application/json")
@@ -423,8 +423,8 @@ mod tests {
     #[tokio::test]
     async fn zone_cross_valid_reachable_zone_id_is_200_and_queues() {
         let state = empty_state();
-        state.zone_points.lock().unwrap().extend([zp(1), zp(2), zp(38)]);
-        let zc = state.zone_cross.clone();
+        state.world.zone_points.lock().unwrap().extend([zp(1), zp(2), zp(38)]);
+        let zc = state.nav.zone_cross.clone();
         let app = router().with_state(state);
         let req = Request::post("/zone_cross")
             .header("content-type", "application/json")
@@ -438,7 +438,7 @@ mod tests {
     #[tokio::test]
     async fn zone_cross_no_body_defaults_to_nearest_line() {
         let state = empty_state();
-        let zc = state.zone_cross.clone();
+        let zc = state.nav.zone_cross.clone();
         let app = router().with_state(state);
         let resp = app.oneshot(Request::post("/zone_cross").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -449,7 +449,7 @@ mod tests {
     #[tokio::test]
     async fn zone_cross_malformed_json_syntax_is_400_and_does_not_queue() {
         let state = empty_state();
-        let zc = state.zone_cross.clone();
+        let zc = state.nav.zone_cross.clone();
         let app = router().with_state(state);
         let req = Request::post("/zone_cross")
             .header("content-type", "application/json")
@@ -467,8 +467,8 @@ mod tests {
     async fn zone_cross_trailing_garbage_after_json_is_400_and_does_not_queue() {
         for body in [r#"{"zone_id":2} lolwut"#, r#"{"zone_id":2}{"zone_id":38}"#] {
             let state = empty_state();
-            state.zone_points.lock().unwrap().extend([zp(2), zp(38)]);
-            let zc = state.zone_cross.clone();
+            state.world.zone_points.lock().unwrap().extend([zp(2), zp(38)]);
+            let zc = state.nav.zone_cross.clone();
             let app = router().with_state(state);
             let req = Request::post("/zone_cross")
                 .header("content-type", "application/json")
@@ -485,8 +485,8 @@ mod tests {
     #[tokio::test]
     async fn zone_cross_unknown_key_is_400_and_does_not_queue() {
         let state = empty_state();
-        state.zone_points.lock().unwrap().extend([zp(1), zp(2), zp(38)]);
-        let zc = state.zone_cross.clone();
+        state.world.zone_points.lock().unwrap().extend([zp(1), zp(2), zp(38)]);
+        let zc = state.nav.zone_cross.clone();
         let app = router().with_state(state);
         let req = Request::post("/zone_cross")
             .header("content-type", "application/json")
@@ -505,7 +505,7 @@ mod tests {
         // A current target IS set — under the old Option<Json<T>> bug this is exactly the
         // "meaningful default" a malformed body would silently fall through to.
         set_gs(&state, |gs| gs.target_id = Some(42));
-        let goto_target = state.goto_target.clone();
+        let goto_target = state.nav.goto_target.clone();
         let app = router().with_state(state);
         let req = Request::post("/goto")
             .header("content-type", "application/json")
@@ -521,10 +521,10 @@ mod tests {
     #[tokio::test]
     async fn goto_unknown_key_is_400_not_silently_defaulted() {
         let state = empty_state();
-        state.entity_ids.lock().unwrap().insert("a_rat00".into(), 42);
-        state.entity_positions.lock().unwrap().insert("a_rat00".into(), (10.0, 20.0, 3.0));
+        state.world.entity_ids.lock().unwrap().insert("a_rat00".into(), 42);
+        state.world.entity_positions.lock().unwrap().insert("a_rat00".into(), (10.0, 20.0, 3.0));
         set_gs(&state, |gs| gs.target_id = Some(42));
-        let goto_target = state.goto_target.clone();
+        let goto_target = state.nav.goto_target.clone();
         let app = router().with_state(state);
         let req = Request::post("/goto")
             .header("content-type", "application/json")
@@ -538,10 +538,10 @@ mod tests {
     #[tokio::test]
     async fn goto_no_body_falls_back_to_current_target() {
         let state = empty_state();
-        state.entity_ids.lock().unwrap().insert("a_rat00".into(), 42);
-        state.entity_positions.lock().unwrap().insert("a_rat00".into(), (10.0, 20.0, 3.0));
+        state.world.entity_ids.lock().unwrap().insert("a_rat00".into(), 42);
+        state.world.entity_positions.lock().unwrap().insert("a_rat00".into(), (10.0, 20.0, 3.0));
         set_gs(&state, |gs| gs.target_id = Some(42));
-        let goto_target = state.goto_target.clone();
+        let goto_target = state.nav.goto_target.clone();
         let app = router().with_state(state);
         let resp = app.oneshot(Request::post("/goto").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -553,13 +553,13 @@ mod tests {
     #[tokio::test]
     async fn follow_malformed_name_is_400_not_silently_defaulted() {
         let state = empty_state();
-        state.entity_ids.lock().unwrap().insert("a_rat00".into(), 42);
-        state.entity_positions.lock().unwrap().insert("a_rat00".into(), (10.0, 20.0, 3.0));
+        state.world.entity_ids.lock().unwrap().insert("a_rat00".into(), 42);
+        state.world.entity_positions.lock().unwrap().insert("a_rat00".into(), (10.0, 20.0, 3.0));
         // A current target IS set — the old Option<Json<T>> bug would silently chase IT instead of
         // reporting the malformed "name" field.
         set_gs(&state, |gs| gs.target_id = Some(42));
-        let goto_entity = state.goto_entity.clone();
-        let goto_target = state.goto_target.clone();
+        let goto_entity = state.nav.goto_entity.clone();
+        let goto_target = state.nav.goto_target.clone();
         let app = router().with_state(state);
         let req = Request::post("/follow")
             .header("content-type", "application/json")
@@ -574,10 +574,10 @@ mod tests {
     #[tokio::test]
     async fn follow_no_body_falls_back_to_current_target() {
         let state = empty_state();
-        state.entity_ids.lock().unwrap().insert("a_rat00".into(), 42);
-        state.entity_positions.lock().unwrap().insert("a_rat00".into(), (10.0, 20.0, 3.0));
+        state.world.entity_ids.lock().unwrap().insert("a_rat00".into(), 42);
+        state.world.entity_positions.lock().unwrap().insert("a_rat00".into(), (10.0, 20.0, 3.0));
         set_gs(&state, |gs| gs.target_id = Some(42));
-        let goto_entity = state.goto_entity.clone();
+        let goto_entity = state.nav.goto_entity.clone();
         let app = router().with_state(state);
         let resp = app.oneshot(Request::post("/follow").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);

@@ -23,7 +23,7 @@ async fn post_tell(State(s): State<HttpState>, Json(b): Json<TellBody>) -> (Stat
     if b.to.trim().is_empty() || b.text.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "tell requires non-empty 'to' and 'text'".into());
     }
-    s.chat_send.lock().unwrap().push(ChatSend { chan: 7, to: b.to.clone(), text: b.text });
+    s.chat.chat_send.lock().unwrap().push(ChatSend { chan: 7, to: b.to.clone(), text: b.text });
     (StatusCode::OK, format!("tell queued to {}", b.to))
 }
 
@@ -34,21 +34,21 @@ struct TextBody { text: String }
 /// POST /v1/chat/ooc {"text"} — zone-wide out-of-character broadcast (chan 5).
 async fn post_ooc(State(s): State<HttpState>, Json(b): Json<TextBody>) -> (StatusCode, String) {
     if b.text.trim().is_empty() { return (StatusCode::BAD_REQUEST, "ooc requires 'text'".into()); }
-    s.chat_send.lock().unwrap().push(ChatSend { chan: 5, to: String::new(), text: b.text });
+    s.chat.chat_send.lock().unwrap().push(ChatSend { chan: 5, to: String::new(), text: b.text });
     (StatusCode::OK, "ooc queued".into())
 }
 
 /// POST /v1/chat/shout {"text"} — zone-wide shout (chan 3).
 async fn post_shout(State(s): State<HttpState>, Json(b): Json<TextBody>) -> (StatusCode, String) {
     if b.text.trim().is_empty() { return (StatusCode::BAD_REQUEST, "shout requires 'text'".into()); }
-    s.chat_send.lock().unwrap().push(ChatSend { chan: 3, to: String::new(), text: b.text });
+    s.chat.chat_send.lock().unwrap().push(ChatSend { chan: 3, to: String::new(), text: b.text });
     (StatusCode::OK, "shout queued".into())
 }
 
 /// POST /v1/chat/group {"text"} — group-channel message (chan 2; only seen by your group).
 async fn post_group(State(s): State<HttpState>, Json(b): Json<TextBody>) -> (StatusCode, String) {
     if b.text.trim().is_empty() { return (StatusCode::BAD_REQUEST, "group requires 'text'".into()); }
-    s.chat_send.lock().unwrap().push(ChatSend { chan: 2, to: String::new(), text: b.text });
+    s.chat.chat_send.lock().unwrap().push(ChatSend { chan: 2, to: String::new(), text: b.text });
     (StatusCode::OK, "group queued".into())
 }
 
@@ -58,6 +58,6 @@ async fn post_group(State(s): State<HttpState>, Json(b): Json<TextBody>) -> (Sta
 /// membership to have recipients (#295). (#294)
 async fn post_guild(State(s): State<HttpState>, Json(b): Json<TextBody>) -> (StatusCode, String) {
     if b.text.trim().is_empty() { return (StatusCode::BAD_REQUEST, "guild requires 'text'".into()); }
-    s.chat_send.lock().unwrap().push(ChatSend { chan: 0, to: String::new(), text: b.text });
+    s.chat.chat_send.lock().unwrap().push(ChatSend { chan: 0, to: String::new(), text: b.text });
     (StatusCode::OK, "guild queued".into())
 }

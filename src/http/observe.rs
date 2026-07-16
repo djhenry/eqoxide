@@ -40,13 +40,13 @@ async fn get_item_text(State(s): State<HttpState>) -> Json<serde_json::Value> {
 }
 
 async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
-    let cam   = s.snapshot.lock().unwrap().clone();
+    let cam   = s.camera.snapshot.lock().unwrap().clone();
     // Projected from the network thread's GameState, and freshness measured RIGHT NOW — not read
     // out of a struct some other loop published whenever it last felt like running (#343).
     let player = s.player();
     let health = s.health();
     let frame_profile = *s.frame_profile.lock().unwrap();
-    let nav = s.nav_state.lock().unwrap().clone();
+    let nav = s.nav.nav_state.lock().unwrap().clone();
     // Is nav answering from WINDING-BLIND (inverted-art) ground in this zone? (#375, D-2)
     //
     // D-2 (#375) made the floor predicate `is_standable` FACING-BLIND: a surface is ground on its
@@ -138,7 +138,7 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     // this is the fact for the route the character is walking RIGHT NOW.
     let nav_tier = nav.tier;
     let (guild_name, guild_id, guild_rank) = {
-        let g = s.guild.lock().unwrap();
+        let g = s.guild_slots.guild.lock().unwrap();
         (g.guild_name.clone(), g.guild_id, g.guild_rank)
     };
     // Built here as locals (not inline in the big `json!` below) so the player object's macro
@@ -325,7 +325,7 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
 /// GET /v1/observe/frame — returns the current rendered frame as a PNG.
 async fn get_frame(State(s): State<HttpState>) -> Response {
     let (tx, rx) = oneshot::channel::<Vec<u8>>();
-    *s.frame_req.lock().unwrap() = Some(tx);
+    *s.camera.frame_req.lock().unwrap() = Some(tx);
 
     // 10s: a debug build's readback + 1024px PNG encode can exceed 2s when the
     // render loop is saturated, which made captures 503 while frames were fine.
@@ -365,7 +365,7 @@ struct WhoView {
 /// anon}]}`. 503 if no response arrives in time. (#300)
 async fn get_who(State(s): State<HttpState>) -> Response {
     let (tx, rx) = oneshot::channel::<Vec<crate::game_state::WhoEntry>>();
-    *s.who_req.lock().unwrap() = Some(tx);
+    *s.social.who_req.lock().unwrap() = Some(tx);
     match tokio::time::timeout(std::time::Duration::from_secs(6), rx).await {
         Ok(Ok(roster)) => {
             let online: Vec<WhoView> = roster.into_iter().map(|e| WhoView {
@@ -388,7 +388,7 @@ async fn get_who(State(s): State<HttpState>) -> Response {
 
 /// GET /v1/observe/entities — returns {name: [x,y,z], ...} for all known entities.
 async fn get_entities(State(s): State<HttpState>) -> Json<HashMap<String, [f32; 3]>> {
-    let positions = s.entity_positions.lock().unwrap();
+    let positions = s.world.entity_positions.lock().unwrap();
     let out: HashMap<_, _> = positions.iter()
         .map(|(k, &(x, y, z))| (k.clone(), [x, y, z]))
         .collect();
@@ -401,7 +401,7 @@ async fn get_entities(State(s): State<HttpState>) -> Json<HashMap<String, [f32; 
 /// 23-30 → wire 22-29), plus item_id, name, charges, icon, and idfile. Use this to discover which
 /// slot holds an item before giving/equipping it.
 async fn get_inventory(State(s): State<HttpState>) -> Json<serde_json::Value> {
-    let items  = s.inventory.lock().unwrap().clone();
+    let items  = s.inventory_slots.inventory.lock().unwrap().clone();
     let player = s.player();
     Json(serde_json::json!({
         "count": items.len(),
@@ -432,7 +432,7 @@ async fn get_messages(
     State(s): State<HttpState>,
     Query(q): Query<MessagesQuery>,
 ) -> Json<serde_json::Value> {
-    let all = s.messages.lock().unwrap();
+    let all = s.chat.messages.lock().unwrap();
     let filtered: Vec<&MessageEntry> = match &q.kind {
         Some(k) => all.iter().filter(|m| m.kind == *k).collect(),
         None    => all.iter().collect(),
@@ -444,7 +444,7 @@ async fn get_messages(
 /// recent NPC message, e.g. a Soulbinder's "[bind your soul]"). `index` is the argument POSTed to
 /// /v1/interact/dialogue to click that choice. Empty when no NPC has offered choices. (#120)
 async fn get_dialogue(State(s): State<HttpState>) -> Json<serde_json::Value> {
-    let choices = s.dialogue.lock().unwrap();
+    let choices = s.interact.dialogue.lock().unwrap();
     let list: Vec<_> = choices.iter().enumerate()
         .map(|(i, c)| serde_json::json!({ "index": i, "text": c.text }))
         .collect();
@@ -479,7 +479,7 @@ async fn get_skills(State(s): State<HttpState>) -> Json<serde_json::Value> {
 
 /// GET /v1/observe/doors — list the current zone's doors (id, name, position, opentype, open state).
 async fn get_doors(State(s): State<HttpState>) -> Json<Vec<DoorView>> {
-    Json(s.doors_shared.lock().unwrap().clone())
+    Json(s.interact.doors_shared.lock().unwrap().clone())
 }
 
 /// GET /v1/observe/zone_entrances — the zone **entrances** advertised by the server
@@ -488,7 +488,7 @@ async fn get_doors(State(s): State<HttpState>) -> Json<Vec<DoorView>> {
 /// where you go to *leave* the current zone — for that, see `/zone_exits`. (Also served at the
 /// deprecated alias `/zone_points`.)
 async fn get_zone_entrances(State(s): State<HttpState>) -> Json<Vec<crate::game_state::ZonePoint>> {
-    Json(s.zone_points.lock().unwrap().clone())
+    Json(s.world.zone_points.lock().unwrap().clone())
 }
 
 /// GET /v1/observe/zone_exits — the current zone's **exits**: the WLD zone-line regions you navigate
@@ -503,7 +503,7 @@ async fn get_zone_exits(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let pos = [player.pos_east, player.pos_north, player.pos_up];
     // index -> destination zone_id, from the advertised entrance list.
     let dest_of: std::collections::HashMap<i32, u16> = s
-        .zone_points
+        .world.zone_points
         .lock()
         .unwrap()
         .iter()
@@ -834,7 +834,7 @@ mod tests {
     }
 
     fn push_message(state: &HttpState, kind: &str, text: &str) {
-        state.messages.lock().unwrap().push(MessageEntry {
+        state.chat.messages.lock().unwrap().push(MessageEntry {
             kind: kind.to_string(), text: text.to_string(), keywords: vec![],
         });
     }
