@@ -79,7 +79,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
                     }
                     ui.horizontal(|ui| {
                         if ui.small_button("Accept").clicked() {
-                            *cx.acts.accept_task.lock().unwrap() = Some(o.task_id);
+                            cx.acts.command.request_accept_task(o.task_id);
                         }
                         if ui
                             .small_button("Decline")
@@ -87,7 +87,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
                             .clicked()
                         {
                             // task_id 0 = decline-all, same as POST /v1/quests/decline.
-                            *cx.acts.accept_task.lock().unwrap() = Some(0);
+                            cx.acts.command.request_accept_task(0);
                         }
                     });
                 }
@@ -201,7 +201,7 @@ fn draw_active(ui: &mut egui::Ui, cx: &mut UiCtx) {
                     .on_hover_text("Abandon this task (cannot be undone)")
                     .clicked()
                 {
-                    *cx.acts.cancel_task.lock().unwrap() = Some(t.task_id);
+                    cx.acts.command.request_cancel_task(t.task_id);
                 }
             });
     }

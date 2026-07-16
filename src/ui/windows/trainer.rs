@@ -69,7 +69,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
                                 ))
                                 .clicked()
                             {
-                                *cx.acts.trainer_train.lock().unwrap() = Some(*id);
+                                cx.acts.command.request_train_skill(*id);
                             }
                             ui.end_row();
                         }
