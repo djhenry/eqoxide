@@ -367,7 +367,7 @@ impl LocalOutcome {
 
 /// The raw result of ONE A* run, before it is turned into an honest [`PlanOutcome`].
 #[derive(Debug, Default)]
-struct Search {
+pub(crate) struct Search {
     /// `(route, reached_goal)`. `reached_goal == false` = a PARTIAL route toward the frontier.
     path:     Option<(Vec<[f32; 3]>, bool)>,
     /// `Some` = the search was CUT SHORT and its frontier is NOT closed, so "the goal was not
@@ -416,6 +416,9 @@ pub struct Collision {
     /// "is there anything BENEATH this surface?" of the FULL COLUMN, not of the caller's query
     /// window — a window is only ~100u tall and a cavern roof's floor is often further down than
     /// that. Bounds let a column probe span the zone regardless of what the caller asked for.
+    /// `z_min` is only consumed by `#[cfg(test)]` zone-corpus probes (to size a full-column scan);
+    /// production code only ever needs the upper bound, so it's test-only to avoid a dead-code warning.
+    #[cfg(test)]
     z_min:     f32,
     z_max:     f32,
     /// How many times `is_standable` has admitted a **DOWN-facing** (inverted-art) surface as ground
@@ -574,13 +577,16 @@ impl Collision {
         // mesh — see `z_min`/`z_max`).
         let mut min = [f32::MAX; 2];
         let mut max = [f32::MIN; 2];
-        let (mut z_min, mut z_max) = (f32::MAX, f32::MIN);
+        #[cfg(test)]
+        let mut z_min = f32::MAX;
+        let mut z_max = f32::MIN;
         for t in &tris {
             for v in t {
                 if v[0] < min[0] { min[0] = v[0]; }
                 if v[1] < min[1] { min[1] = v[1]; }
                 if v[0] > max[0] { max[0] = v[0]; }
                 if v[1] > max[1] { max[1] = v[1]; }
+                #[cfg(test)]
                 if v[2] < z_min { z_min = v[2]; }
                 if v[2] > z_max { z_max = v[2]; }
             }
@@ -609,7 +615,9 @@ impl Collision {
         let cell_size = cell_size.max(1.0);
         if tris.is_empty() || min[0] == f32::MAX {
             return Collision { tris, tri_nz, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0,
-                z_min: 0.0, z_max: 0.0, facing_blind_hits: Default::default(), tight_plans: Default::default(),
+                #[cfg(test)]
+                z_min: 0.0,
+                z_max: 0.0, facing_blind_hits: Default::default(), tight_plans: Default::default(),
                 clearance: Default::default(),
                 water: None, from_collision_mesh, zone_line_regions: Vec::new() };
         }
@@ -632,7 +640,10 @@ impl Collision {
                 }
             }
         }
-        Collision { tris, tri_nz, cells, origin: min, cell_size, cols, rows, z_min, z_max,
+        Collision { tris, tri_nz, cells, origin: min, cell_size, cols, rows,
+            #[cfg(test)]
+            z_min,
+            z_max,
             facing_blind_hits: Default::default(), tight_plans: Default::default(), water: None, from_collision_mesh, zone_line_regions: Vec::new(),
             clearance: Default::default() }
     }

@@ -291,6 +291,9 @@ impl ClearanceField {
             n => n,
         }
     }
+    /// Only called from `#[cfg(test)]` (its sole caller lives in `mod tests`, stripped from a
+    /// plain build) — gated to match, else it reads as dead code outside `cargo test`.
+    #[cfg(test)]
     pub(crate) fn set_cap_for_test(&self, n: usize) {
         self.cap.store(n, std::sync::atomic::Ordering::Relaxed);
     }
