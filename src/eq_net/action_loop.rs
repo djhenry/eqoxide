@@ -129,13 +129,6 @@ pub struct ActionLoop {
     /// The spawn id the pet was last ordered to attack (avoids re-spamming OP_PetCommands every
     /// tick). Reset when the target changes; see the auto-pet-combat block.
     last_pet_target:  Option<u32>,
-    /// `Some(landing_z)` while a controlled fall is in progress (the walker descends at the native
-    /// rate until reaching it, then applies fall damage); `fall_start_z` is where the fall began.
-    /// Stays on `ActionLoop` (not `Walker`): `drive_controlled_fall` writes `gs.player_z` directly
-    /// while a fall is in progress, which the intent-only boundary forbids `Walker` from doing —
-    /// `Walker::drive_walk` only ever ASKS for a fall to begin, by returning `Some(landing_z)`.
-    falling:          Option<f32>,
-    fall_start_z:     f32,
     /// Single-authority controller integration (design §2): `controller_view` is the render
     /// thread's authoritative position snapshot we stream to the server; `nav_intent` is the
     /// `/goto` planner's per-frame wish written for the render controller; `pos_correction` hands a
@@ -204,8 +197,6 @@ impl ActionLoop {
             auto_attack: false,
             walker,
             last_pet_target: None,
-            falling: None,
-            fall_start_z: 0.0,
             controller,
             guild_slots,
             last_streamed: [0.0, 0.0, 0.0],
@@ -386,7 +377,6 @@ impl ActionLoop {
             // rest in the new zone; a driver that wants to keep going re-issues /v1/move/* afterward.
             // (This is the zone-boundary sibling of the mid-zone stale-plan bug #246.)
             self.walker.reset_for_zone_change();
-            self.falling = None; // stays on ActionLoop — see the `falling` field doc comment
 
             let mut shared = self.world.zone_points.lock().unwrap();
             // Start fresh with server entries.
@@ -505,7 +495,6 @@ impl ActionLoop {
         self.drive_auto_pet_combat(stream, gs);
 
         if self.drive_auto_engage_melee(stream, gs) { return; }
-        if self.drive_controlled_fall(stream, gs) { return; }
 
         // (The dead-player guard now runs earlier — right after stream_position, before the fast-
         // steering refresh and the 150 ms gate — so a corpse stops within a tick. See #238.)
@@ -520,12 +509,11 @@ impl ActionLoop {
         };
 
         // `Walker::drive_walk` never touches position/`EqStream` itself (intent-only boundary — see
-        // `crate::nav::walker`'s module doc); it only ASKS to begin a controlled fall by returning
-        // the landing z, which `drive_controlled_fall` (unmoved, driven on a later tick) then owns.
-        if let Some(land_z) = self.walker.drive_walk(gs, goal) {
-            self.falling = Some(land_z);
-            self.fall_start_z = gs.player_z;
-        }
+        // `crate::nav::walker`'s module doc): it only writes the per-frame `nav_intent`. A big drop
+        // is no longer a special handoff — the walker just keeps walking toward the goal and the
+        // render controller's ONE collided gravity path descends off the edge (§442, #442); the
+        // landing damage is applied driver-agnostically in `stream_position`.
+        self.walker.drive_walk(gs, goal);
     }
 
     // TODO(MVC): this and the other `drain_*` methods below are slot CONSUMERS — they poll a
@@ -1431,40 +1419,6 @@ impl ActionLoop {
         false
     }
 
-    /// Returns true if a controlled fall was in progress (handled this tick; caller must stop).
-    ///
-    /// TODO(MVC): the `gs.player_z` write below is the OTHER un-collided position path — the fall
-    /// twin of the swim-vertical raw write that #359 fixed in `movement.rs` (`swim_rise`/
-    /// `swim_sink`). This descent never consults zone geometry between `player_z` and `land_z`, so
-    /// like the pre-fix swim it can pass through solids the controller would have collided with.
-    /// Route it through `CharacterController` in the movement-unification (out of Phase 3a scope).
-    fn drive_controlled_fall(&mut self, stream: &mut EqStream, gs: &mut GameState) -> bool {
-        // Controlled fall in progress: descend at the native rate until landed, then apply native
-        // fall damage (client-computed in EQ; the server only validates OP_EnvDamage). Takes
-        // priority over normal walking so the descent isn't interrupted.
-        if let Some(land_z) = self.falling {
-            const FALL_STEP: f32 = 12.0; // ~native per-update descent (under the 12.8 wire cap)
-            let next_z = (gs.player_z - FALL_STEP).max(land_z);
-            let hdg = gs.player_heading;
-            self.send_position_update(stream, gs, gs.player_x, gs.player_y, next_z, hdg);
-            gs.player_z = next_z;
-            if next_z <= land_z + 0.5 {
-                let height = (self.fall_start_z - land_z).max(0.0);
-                self.falling = None;
-                let (dmg, _max) = fall_damage(height);
-                if dmg > 0 {
-                    stream.send_app_packet(OP_ENV_DAMAGE, &build_env_damage_packet(gs.player_id, dmg, DMGTYPE_FALLING));
-                    gs.cur_hp = (gs.cur_hp - dmg as i32).max(0);
-                    gs.log_msg("combat", &format!("Fell {:.0}u — {} fall damage", height, dmg));
-                    tracing::info!("EQ: fall damage {dmg} (fell {height:.0}u)");
-                }
-                tracing::info!("NAV: landed at z={:.1} after {:.0}u fall", land_z, height);
-            }
-            return true;
-        }
-        false
-    }
-
     // `drive_chase`/`drive_teleport_detect`/`resolve_goal`/`drive_walk` moved to
     // `crate::nav::walker::Walker` (M1 extraction) — see `tick`'s `self.walker.*` calls above.
 
@@ -1545,8 +1499,29 @@ impl ActionLoop {
                 &build_movement_history(view.pos[0], view.pos[1], view.pos[2]));
             self.last_movement_history_send = Instant::now();
         }
-        // A controlled fall owns the Z descent + fall-damage; let it stream, don't fight it here.
-        if self.falling.is_some() { return; }
+        // Driver-agnostic fall damage (§442, #442). The render controller runs the ONE collided
+        // descent (for WASD AND nav) and latches the height of any airborne stretch it just LANDED
+        // from — computed from its OWN tracked airborne start, never a nav waypoint z. We take-and-
+        // clear that one-shot exactly once here and, if the fall was past the safe height, apply the
+        // native (client-computed) fall damage + OP_ENV_DAMAGE — the same formula/threshold the old
+        // `drive_controlled_fall` used. Any fall past the safe height damages, so WASD off a ledge
+        // now damages too, matching the native RoF2 client. A teleport / server correction clears the
+        // signal at the controller (see `CharacterController::teleport`), so a correction is never
+        // misread as a fall (hazard 2b); a mid-fall depenetration/ground-snap recovery latches nothing
+        // (hazard 2a). `SAFE_FALL_HEIGHT` is named so the threshold is easy to tune/revert.
+        const SAFE_FALL_HEIGHT: f32 = 6.0; // below the fall_damage() zero-damage cutoff (~6.7u); the
+                                           // formula's `dmg > 0` stays the final arbiter.
+        if let Some(height) = self.controller.controller_view.lock().unwrap().landed_fall_height.take() {
+            if height > SAFE_FALL_HEIGHT {
+                let (dmg, _max) = fall_damage(height);
+                if dmg > 0 {
+                    stream.send_app_packet(OP_ENV_DAMAGE, &build_env_damage_packet(gs.player_id, dmg, DMGTYPE_FALLING));
+                    gs.cur_hp = (gs.cur_hp - dmg as i32).max(0);
+                    gs.log_msg("combat", &format!("Fell {:.0}u — {} fall damage", height, dmg));
+                    tracing::info!("EQ: fall damage {dmg} (fell {height:.0}u)");
+                }
+            }
+        }
         let gp = [gs.player_x, gs.player_y, gs.player_z];
         if !self.streamed_init {
             self.last_streamed = gp;
@@ -2088,7 +2063,6 @@ mod tests {
         nav.walker.nav_repaths = 3;
         nav.walker.backoff_ticks = 2;
         nav.walker.replan_coarse = true;
-        nav.falling = Some(0.0);
         *nav.nav.nav_state.lock().unwrap() = "blocked".into();
 
         // Cross into a NEW zone.
@@ -2113,7 +2087,6 @@ mod tests {
         assert_eq!(nav.walker.proactive_replans, 0, "the oscillation budget must reset on zone change");
         assert_eq!(nav.walker.backoff_ticks, 0);
         assert!(!nav.walker.replan_coarse);
-        assert!(nav.falling.is_none());
         assert_eq!(*nav.nav.nav_state.lock().unwrap(), "idle");
         assert_eq!(nav.current_zone, "crushbone");
     }
