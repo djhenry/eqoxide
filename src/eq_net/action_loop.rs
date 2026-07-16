@@ -15,7 +15,7 @@ pub(crate) const RUN_SPEED: f32 = 44.0;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::{GameState, ZonePoint};
-use crate::ipc::{AttackReq, BuyReq, SellReq, TradeReq, TradeCmd, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, ChatEventsShared, ChatSendShared, CastReq, MemSpellReq, SitReq, ConsiderReq, CampReq, CampCmd, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, WhoReq, TaskLog, ZoneCrossReq, ZonePoints, ControllerShared, NavIntent, PosCorrection, DialogueShared, DialogueClickReq, NavStateShared};
+use crate::ipc::{TradeCmd, CampReq, CampCmd};
 use crate::movement::MoveIntent;
 
 /// Min interval (ms) between OP_ClientUpdate sends while moving (native `0x118` = 280 ms).
@@ -69,78 +69,47 @@ use crate::coord::eq_heading;
 
 
 pub struct ActionLoop {
-    goto_target:      GotoTarget,
-    /// Live nav state for GET /v1/observe/debug (#166): idle|navigating|arrived|no_path|blocked.
-    nav_state:        NavStateShared,
-    goto_entity:      crate::ipc::GotoEntity,
-    entity_positions: EntityPositions,
-    entity_ids:       EntityIds,
-    zone_points:      ZonePoints,
-    task_log:         TaskLog,
-    task_offers_shared:    crate::ipc::TaskOffersShared,
-    completed_tasks_shared: crate::ipc::CompletedTasksShared,
-    accept_task:           crate::ipc::AcceptTaskReq,
-    cancel_task:           crate::ipc::CancelTaskReq,
-    group:             crate::ipc::GroupShared,
-    group_invite:      crate::ipc::GroupInviteReq,
-    trainer_open_req:  crate::ipc::TrainerOpenReq,
-    trainer_train_req: crate::ipc::TrainerTrainReq,
-    group_accept:      crate::ipc::GroupAcceptReq,
-    group_decline:     crate::ipc::GroupDeclineReq,
-    group_leave:       crate::ipc::GroupLeaveReq,
-    group_kick:        crate::ipc::GroupKickReq,
-    group_make_leader: crate::ipc::GroupMakeLeaderReq,
-    zone_cross:       ZoneCrossReq,
-    hail:             HailReq,
-    say:              SayReq,
-    target:           TargetReq,
-    /// GET /v1/observe/who registers a oneshot here; drained in `tick` to send OP_WhoAllRequest. (#300)
-    who_req:          WhoReq,
-    /// Held between sending the request and receiving OP_WhoAllResponse; fired by `fulfill_who`. (#300)
+    /// `/v1/move/*` slots (#M4 — see `ipc::NavSlots`).
+    nav:              crate::ipc::NavSlots,
+    /// The live entity registry + zone exit points (#M4 — see `ipc::WorldSlots`).
+    world:            crate::ipc::WorldSlots,
+    /// `/v1/quests/*` slots (#M4 — see `ipc::QuestSlots`).
+    quest:            crate::ipc::QuestSlots,
+    /// `/v1/group/*` slots (#M4 — see `ipc::GroupSlots`).
+    group_slots:      crate::ipc::GroupSlots,
+    /// `/v1/trainer/*` slots (#M4 — see `ipc::TrainerSlots`).
+    trainer:          crate::ipc::TrainerSlots,
+    /// `/v1/combat/*` (+ `/v1/pet/command`) slots (#M4 — see `ipc::CombatSlots`).
+    combat:           crate::ipc::CombatSlots,
+    /// GET /v1/observe/who registers a oneshot here; drained in `tick` to send OP_WhoAllRequest.
+    /// Client-local friends list + a pending friends-presence poll mirror the same shape (#300/#301,
+    /// #M4 — see `ipc::SocialSlots`).
+    social:           crate::ipc::SocialSlots,
+    /// Held between sending the `/who` request and receiving OP_WhoAllResponse; fired by
+    /// `fulfill_who`. (#300)
     pending_who:      Option<tokio::sync::oneshot::Sender<Vec<crate::game_state::WhoEntry>>>,
-    /// Client-local friends list + a pending friends-presence poll, mirroring who_req/pending_who.
     /// The OP_FriendsWho reply arrives on the SAME opcode as /who all (OP_WhoAllResponse), so
     /// `expecting_friends` records that the next such reply is a friends poll, not a /who all. (#301)
-    friends_list:     crate::ipc::FriendsListShared,
-    friends_req:      crate::ipc::FriendsReq,
     pending_friends:  Option<tokio::sync::oneshot::Sender<Vec<crate::game_state::WhoEntry>>>,
     expecting_friends: bool,
-    attack:           AttackReq,
-    buy:              BuyReq,
-    sell:             SellReq,
-    trade:            TradeReq,
-    merchant:         MerchantShared,
-    move_req:         MoveReq,
-    give:             GiveReq,
-    cast:             CastReq,
-    mem_spell:        MemSpellReq,
-    sit:              SitReq,
-    consider:         ConsiderReq,
-    /// Manual pet command (POST /v1/pet/command or a Pet-window button): one OP_PetCommands
-    /// command byte (PET_ATTACK/PET_BACKOFF/…), drained once per tick. Attack uses the current
-    /// target; see the drain in `tick`.
-    pet_cmd:          crate::ipc::PetCmdReq,
+    /// `/v1/merchant/*` slots (#M4 — see `ipc::MerchantSlots`).
+    merchant_slots:   crate::ipc::MerchantSlots,
+    /// `/v1/inventory/*` slots (#M4 — see `ipc::InventorySlots`).
+    inventory_slots:  crate::ipc::InventorySlots,
     /// Camp request slot, shared with the gameplay loop. The nav thread only WRITES it — when the
     /// `/camp` chat keyword is typed it pushes a `Toggle` here instead of sending the text as Say.
+    /// Not part of `ipc::LifecycleSlots`: this is the only lifecycle field the nav thread touches
+    /// (`camp_until`/`respawn` go straight to `eq_net::gameplay::run_gameplay_phase`), so bundling
+    /// the whole triple here would just be a field `ActionLoop` never reads.
     camp:             CampReq,
     /// In-progress quest turn-in (POST /give), or None when idle. Drives the trade-window
     /// state machine across nav ticks (request → wait for ack → move item + accept).
     give_state:       Option<GiveState>,
-    /// Shared inventory snapshot (published each tick for GET /inventory) and the pending
-    /// POST /loot corpse request (drained into gs.pending_loot to reuse the auto-loot loop).
-    inventory:        InventoryShared,
-    loot:             LootReq,
-    door_click:       DoorClickReq,
-    /// Snapshot of the current zone's doors, published each tick for GET /doors.
-    doors_shared:     DoorsShared,
-    messages:         MessagesShared,
-    /// Snapshot of the current NPC-dialogue choices (published each tick for GET
-    /// /v1/observe/dialogue) and the pending POST /v1/interact/dialogue click request (drained
-    /// into an OP_ItemLinkClick). (#120)
-    dialogue:         DialogueShared,
-    dialogue_click:   DialogueClickReq,
-    chat_events:      ChatEventsShared,
-    chat_send:        ChatSendShared,
+    /// `/v1/interact/*` slots — hail, say, loot, give, doors, sit/stand, dialogue, read (#M4 — see
+    /// `ipc::InteractSlots`).
+    interact:         crate::ipc::InteractSlots,
+    /// Outgoing chat + async events + the message log (#M4 — see `ipc::ChatSlots`).
+    chat:             crate::ipc::ChatSlots,
     collision:        crate::nav::collision::SharedCollision,
     maps_dir:         std::path::PathBuf,
     current_zone:     String,
@@ -240,26 +209,13 @@ pub struct ActionLoop {
     escape_return:     Option<(f32, f32, f32)>,
     last_walk_pos:     [f32; 3],
     portal_cooldown:   u32,
-    /// Single-authority controller integration (design §2). `controller_view` is the render
+    /// Single-authority controller integration (design §2): `controller_view` is the render
     /// thread's authoritative position snapshot we stream to the server; `nav_intent` is the
     /// `/goto` planner's per-frame wish written for the render controller; `pos_correction` hands a
-    /// genuine server correction back to the controller.
-    controller_view:  ControllerShared,
-    nav_intent:       NavIntent,
-    pos_correction:   PosCorrection,
-    /// Draw-only mirror of the walker's committed `path`/`local_path`, published each tick for the
-    /// nav-debug overlay so it shows what the walker actually follows, not a separate recompute (#246).
-    nav_path_view:    crate::ipc::NavPathView,
-    /// Aggro-avoidance knobs from /v1/move/* (#242): whether to route around NPC camps and how wide a
-    /// buffer to give them. Read each time a route is (re)planned.
-    nav_avoid:        crate::ipc::NavAvoidShared,
-    /// POST /v1/interact/read request: the inventory wire slot of a book/note to read (#288). Drained
-    /// each tick; the item's Filename is sent as OP_ReadBook and the server replies with the text.
-    read_book:        crate::ipc::ReadBookReq,
-    /// Guild roster + identity published each tick for GET /v1/guild/roster + /observe/debug (#295).
-    guild:            crate::ipc::GuildShared,
-    /// POST /v1/guild/{invite,accept,leave,remove} — one queued guild action, drained each tick (#295).
-    guild_action:     crate::ipc::GuildActionReq,
+    /// genuine server correction back to the controller (#M4 — see `ipc::ControllerSlots`).
+    controller:       crate::ipc::ControllerSlots,
+    /// `/v1/guild/*` slots (#M4 — see `ipc::GuildSlots`).
+    guild_slots:      crate::ipc::GuildSlots,
     /// Last time we sent OP_FloatListThing (movement history) — the anti-MQGhost keepalive (#105).
     last_movement_history_send: Instant,
     /// Last position we streamed, and the last-send timestamp (for the 280 ms / 1300 ms cadence).
@@ -289,121 +245,46 @@ pub struct ActionLoop {
 }
 
 impl ActionLoop {
+    /// Takes the M4 domain bundles (see `ipc.rs`) rather than ~59 flat slot params. Each bundle
+    /// passed here MUST be a `.clone()` of the SAME bundle `main.rs` also hands to `HttpState` —
+    /// that shared-Arc identity (not a fresh `Default::default()` bundle) is what keeps this the
+    /// same cross-thread channel the HTTP/agent side writes into. See `ipc.rs` module docs.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        goto_target:      GotoTarget,
-        nav_state:        NavStateShared,
-        goto_entity:      crate::ipc::GotoEntity,
-        entity_positions: EntityPositions,
-        entity_ids:       EntityIds,
-        zone_points:      ZonePoints,
-        task_log:         TaskLog,
-        task_offers_shared:    crate::ipc::TaskOffersShared,
-        completed_tasks_shared: crate::ipc::CompletedTasksShared,
-        accept_task:           crate::ipc::AcceptTaskReq,
-        cancel_task:           crate::ipc::CancelTaskReq,
-        group:             crate::ipc::GroupShared,
-        group_invite:      crate::ipc::GroupInviteReq,
-    trainer_open_req:  crate::ipc::TrainerOpenReq,
-    trainer_train_req: crate::ipc::TrainerTrainReq,
-        group_accept:      crate::ipc::GroupAcceptReq,
-        group_decline:     crate::ipc::GroupDeclineReq,
-        group_leave:       crate::ipc::GroupLeaveReq,
-        group_kick:        crate::ipc::GroupKickReq,
-        group_make_leader: crate::ipc::GroupMakeLeaderReq,
-        zone_cross:       ZoneCrossReq,
-        hail:             HailReq,
-        say:              SayReq,
-        target:           TargetReq,
-        who_req:          WhoReq,
-        friends_list:     crate::ipc::FriendsListShared,
-        friends_req:      crate::ipc::FriendsReq,
-        attack:           AttackReq,
-        buy:              BuyReq,
-        sell:             SellReq,
-        trade:            TradeReq,
-        merchant:         MerchantShared,
-        move_req:         MoveReq,
-        give:             GiveReq,
-        inventory:        InventoryShared,
-        loot:             LootReq,
-        door_click:       DoorClickReq,
-        doors_shared:     DoorsShared,
-        messages:         MessagesShared,
-        dialogue:         DialogueShared,
-        dialogue_click:   DialogueClickReq,
-        chat_events:      ChatEventsShared,
-        chat_send:        ChatSendShared,
-        cast:             CastReq,
-        mem_spell:        MemSpellReq,
-        sit:              SitReq,
-        consider:         ConsiderReq,
-        pet_cmd:          crate::ipc::PetCmdReq,
-        collision:        crate::nav::collision::SharedCollision,
-        maps_dir:         std::path::PathBuf,
-        camp:             CampReq,
-        controller_view:  ControllerShared,
-        nav_intent:       NavIntent,
-        pos_correction:   PosCorrection,
-        nav_path_view:    crate::ipc::NavPathView,
-        nav_avoid:        crate::ipc::NavAvoidShared,
-        read_book:        crate::ipc::ReadBookReq,
-        guild:            crate::ipc::GuildShared,
-        guild_action:     crate::ipc::GuildActionReq,
+        nav:             crate::ipc::NavSlots,
+        world:           crate::ipc::WorldSlots,
+        quest:           crate::ipc::QuestSlots,
+        group_slots:     crate::ipc::GroupSlots,
+        trainer:         crate::ipc::TrainerSlots,
+        combat:          crate::ipc::CombatSlots,
+        social:          crate::ipc::SocialSlots,
+        merchant_slots:  crate::ipc::MerchantSlots,
+        inventory_slots: crate::ipc::InventorySlots,
+        interact:        crate::ipc::InteractSlots,
+        chat:            crate::ipc::ChatSlots,
+        controller:      crate::ipc::ControllerSlots,
+        guild_slots:     crate::ipc::GuildSlots,
+        collision:       crate::nav::collision::SharedCollision,
+        maps_dir:        std::path::PathBuf,
+        camp:            CampReq,
     ) -> Self {
         ActionLoop {
-            goto_target,
-            nav_state,
-            goto_entity,
-            entity_positions,
-            entity_ids,
-            zone_points,
-            task_log,
-            task_offers_shared,
-            completed_tasks_shared,
-            accept_task,
-            cancel_task,
-            group,
-            group_invite,
-            trainer_open_req,
-            trainer_train_req,
-            group_accept,
-            group_decline,
-            group_leave,
-            group_kick,
-            group_make_leader,
-            zone_cross,
-            hail,
-            say,
-            target,
-            who_req,
+            nav,
+            world,
+            quest,
+            group_slots,
+            trainer,
+            combat,
+            social,
             pending_who: None,
-            friends_list,
-            friends_req,
             pending_friends: None,
             expecting_friends: false,
-            attack,
-            buy,
-            sell,
-            trade,
-            merchant,
-            move_req,
-            give,
-            cast,
-            mem_spell,
-            sit,
-            consider,
-            pet_cmd,
+            merchant_slots,
+            inventory_slots,
             camp,
             give_state: None,
-            inventory,
-            loot,
-            door_click,
-            doors_shared,
-            messages,
-            dialogue,
-            dialogue_click,
-            chat_events,
-            chat_send,
+            interact,
+            chat,
             collision,
             maps_dir,
             current_zone: String::new(),
@@ -434,14 +315,8 @@ impl ActionLoop {
             last_walk_pos: [0.0, 0.0, 0.0],
             portal_cooldown: 0,
             backoff_dir: [0.0, 0.0],
-            controller_view,
-            nav_intent,
-            pos_correction,
-            nav_path_view,
-            nav_avoid,
-            read_book,
-            guild,
-            guild_action,
+            controller,
+            guild_slots,
             last_streamed: [0.0, 0.0, 0.0],
             last_pos_send: Instant::now(),
             last_movement_history_send: Instant::now(),
@@ -467,14 +342,14 @@ impl ActionLoop {
     /// published field rather than a shadow copy, so what steers the walker and what the agent is told
     /// cannot drift apart.
     fn local_says_no_way_through(&self) -> bool {
-        self.nav_state.lock().unwrap().local.as_ref().is_some_and(|l| l.state == "no_way_through")
+        self.nav.nav_state.lock().unwrap().local.as_ref().is_some_and(|l| l.state == "no_way_through")
     }
 
     /// Copy all entity positions from `gs` into the shared entity map
     /// (used by the HTTP /entities endpoint and /goto by-name lookup).
     pub fn sync_entities(&self, gs: &GameState) {
-        let mut map = self.entity_positions.lock().unwrap();
-        let mut ids = self.entity_ids.lock().unwrap();
+        let mut map = self.world.entity_positions.lock().unwrap();
+        let mut ids = self.world.entity_ids.lock().unwrap();
         // Full replace: clear stale entries so positions reflect the current zone only.
         map.clear();
         ids.clear();
@@ -486,19 +361,19 @@ impl ActionLoop {
 
     /// Publish the native Task-system quest log from `gs` into the shared slot (GET /quests/log).
     pub fn sync_tasks(&self, gs: &GameState) {
-        let mut log = self.task_log.lock().unwrap();
+        let mut log = self.quest.task_log.lock().unwrap();
         log.clear();
         let mut tasks: Vec<_> = gs.tasks.values().cloned().collect();
         tasks.sort_by_key(|t| t.task_id);
         log.extend(tasks);
         drop(log);
 
-        let mut offers = self.task_offers_shared.lock().unwrap();
+        let mut offers = self.quest.task_offers_shared.lock().unwrap();
         offers.clear();
         offers.extend(gs.task_offers.iter().cloned());
         drop(offers);
 
-        let mut completed = self.completed_tasks_shared.lock().unwrap();
+        let mut completed = self.quest.completed_tasks_shared.lock().unwrap();
         completed.clear();
         completed.extend(gs.completed_task_history.iter().cloned());
     }
@@ -509,7 +384,7 @@ impl ActionLoop {
     /// existing Entity.hp_pct rather than needing a new opcode); the player's own HP% comes
     /// directly from `gs.hp_pct` since the player is never in `gs.entities`.
     pub fn sync_group(&self, gs: &GameState) {
-        let mut g = self.group.lock().unwrap();
+        let mut g = self.group_slots.group.lock().unwrap();
         g.leader = gs.group_leader.clone();
         g.pending_invite = gs.pending_invite.clone();
         g.you_are_leader = !gs.player_name.is_empty() && gs.group_leader == gs.player_name;
@@ -533,7 +408,7 @@ impl ActionLoop {
     /// /v1/guild/roster and the guild fields of /observe/debug). Resolves guild_id → name via the
     /// OP_GuildsList table. (#295)
     pub fn sync_guild(&self, gs: &GameState) {
-        let mut g = self.guild.lock().unwrap();
+        let mut g = self.guild_slots.guild.lock().unwrap();
         // GUILD_NONE is 0xFFFFFFFF (and 0 also means none). Normalize both to 0 so the API cleanly
         // reports "no guild" as guild_id 0 / empty name / empty roster.
         let in_guild = gs.player_guild_id != 0 && gs.player_guild_id != 0xFFFF_FFFF;
@@ -553,7 +428,7 @@ impl ActionLoop {
 
     /// Publish the player's inventory + equipment from `gs` into the shared slot (GET /inventory).
     pub fn sync_inventory(&self, gs: &GameState) {
-        let mut inv = self.inventory.lock().unwrap();
+        let mut inv = self.inventory_slots.inventory.lock().unwrap();
         inv.clear();
         inv.extend(gs.inventory.iter().cloned());
     }
@@ -583,7 +458,7 @@ impl ActionLoop {
     /// Publish the open-merchant session from `gs` into the shared slot (GET /trade/list + the HUD
     /// merchant window).
     pub fn sync_merchant(&self, gs: &GameState) {
-        let mut m = self.merchant.lock().unwrap();
+        let mut m = self.merchant_slots.merchant.lock().unwrap();
         m.open = gs.merchant_open.is_some();
         m.merchant_id = gs.merchant_open;
         m.items.clear();
@@ -594,7 +469,7 @@ impl ActionLoop {
     /// each LogEntry into a serializable MessageEntry and extracting `[bracketed]` quest keywords
     /// (the same splitter the HUD dialogue panel uses).
     pub fn sync_messages(&self, gs: &GameState) {
-        let mut out = self.messages.lock().unwrap();
+        let mut out = self.chat.messages.lock().unwrap();
         out.clear();
         out.extend(gs.messages.iter().map(|m| {
             let keywords = crate::game_state::split_keywords(&m.text).into_iter()
@@ -606,9 +481,9 @@ impl ActionLoop {
         }));
         drop(out);
         // Publish the current clickable NPC-dialogue choices (GET /v1/observe/dialogue, #120).
-        *self.dialogue.lock().unwrap() = gs.dialogue_choices.clone();
+        *self.interact.dialogue.lock().unwrap() = gs.dialogue_choices.clone();
         // Publish async events (GET /v1/events/*), preserving their stable monotonic ids.
-        let mut ev = self.chat_events.lock().unwrap();
+        let mut ev = self.chat.chat_events.lock().unwrap();
         ev.clear();
         ev.extend(gs.chat_events.iter().map(|e| crate::ipc::Event {
             id: e.id, category: e.category.clone(), kind: e.kind.clone(),
@@ -618,7 +493,7 @@ impl ActionLoop {
 
     /// Publish the current zone's doors from `gs` into the shared slot (GET /doors).
     pub fn sync_doors(&self, gs: &GameState) {
-        let mut out = self.doors_shared.lock().unwrap();
+        let mut out = self.interact.doors_shared.lock().unwrap();
         out.clear();
         out.extend(gs.doors.values().map(|d| crate::ipc::DoorView {
             door_id: d.door_id, name: d.name.clone(),
@@ -640,10 +515,10 @@ impl ActionLoop {
             // crossing IS the "walk to the zone line" goal reached, so the character should come to
             // rest in the new zone; a driver that wants to keep going re-issues /v1/move/* afterward.
             // (This is the zone-boundary sibling of the mid-zone stale-plan bug #246.)
-            *self.goto_target.lock().unwrap() = None;
-            *self.goto_entity.lock().unwrap() = None;
-            *self.nav_intent.lock().unwrap() = None; // stop driving the controller toward the stale aim
-            *self.nav_path_view.lock().unwrap() = (Vec::new(), Vec::new()); // clear the overlay line
+            *self.nav.goto_target.lock().unwrap() = None;
+            *self.nav.goto_entity.lock().unwrap() = None;
+            *self.controller.nav_intent.lock().unwrap() = None; // stop driving the controller toward the stale aim
+            *self.nav.nav_path_view.lock().unwrap() = (Vec::new(), Vec::new()); // clear the overlay line
             self.path.clear();
             self.local_path.clear();
             self.local_i = 0;
@@ -666,9 +541,9 @@ impl ActionLoop {
             self.planner.cancel();
             self.awaiting_first_plan = false;
             self.set_nav_state("idle");
-            self.nav_state.lock().unwrap().tier = None; // no route committed → no per-route tier
+            self.nav.nav_state.lock().unwrap().tier = None; // no route committed → no per-route tier
 
-            let mut shared = self.zone_points.lock().unwrap();
+            let mut shared = self.world.zone_points.lock().unwrap();
             // Start fresh with server entries.
             shared.clear();
             shared.extend(gs.zone_points.iter().cloned());
@@ -708,7 +583,7 @@ impl ActionLoop {
             }
         } else {
             // Same zone: update server entries but keep map labels.
-            let mut shared = self.zone_points.lock().unwrap();
+            let mut shared = self.world.zone_points.lock().unwrap();
             let map_labels: Vec<_> = shared.drain(..)
                 .filter(|zp| zp.iterator == u32::MAX)
                 .collect();
@@ -733,7 +608,7 @@ impl ActionLoop {
     /// every ordinary state transition silently erased the one field that says whether the tier
     /// steering the character can see a way through (#382).
     fn set_nav_state_because(&self, state: &str, reason: Option<&str>) {
-        let mut s = self.nav_state.lock().unwrap();
+        let mut s = self.nav.nav_state.lock().unwrap();
         let reason = reason.map(str::to_string);
         if s.state != state || s.reason != reason {
             s.state = state.to_string();
@@ -754,13 +629,13 @@ impl ActionLoop {
 
     /// Publish the FINE tier's last honest outcome (#382). Never touches `state`/`reason`.
     fn set_nav_local(&self, local: Option<crate::ipc::NavLocal>) {
-        let mut s = self.nav_state.lock().unwrap();
+        let mut s = self.nav.nav_state.lock().unwrap();
         if s.local != local { s.local = local; }
     }
 
     /// Read the current nav state word (without the reason).
     fn nav_state_is(&self, state: &str) -> bool {
-        self.nav_state.lock().unwrap().state == state
+        self.nav.nav_state.lock().unwrap().state == state
     }
 
     /// Stop navigating and report WHY, loudly, in every channel an agent can see: the nav state, a
@@ -785,7 +660,7 @@ impl ActionLoop {
         let to_nav = |b: crate::traversability::Blockage| crate::ipc::NavBlockage {
             hazard: b.hazard.as_str(), at: b.at };
         {
-            let mut s = self.nav_state.lock().unwrap();
+            let mut s = self.nav.nav_state.lock().unwrap();
             s.blocked_goal = goal_blk.map(to_nav);
             s.blocked_frontier = frontier_blk.map(to_nav);
         }
@@ -801,8 +676,8 @@ impl ActionLoop {
         self.path_goal = None;
         self.planner.cancel();
         self.awaiting_first_plan = false;
-        *self.goto_target.lock().unwrap() = None;
-        *self.nav_intent.lock().unwrap() = None;
+        *self.nav.goto_target.lock().unwrap() = None;
+        *self.controller.nav_intent.lock().unwrap() = None;
     }
 
     /// Apply a finished FINE plan from the local worker (#382).
@@ -919,7 +794,7 @@ impl ActionLoop {
                 // only existed at the character's own collision radius (a tight door/bridge, no
                 // margin — riskier), `preferred` = the roomy tier carried it. The agent sees the
                 // risk of the route it is actually walking, not a zone-lifetime aggregate.
-                self.nav_state.lock().unwrap().tier =
+                self.nav.nav_state.lock().unwrap().tier =
                     Some(if reply.tight { "minimum" } else { "preferred" });
                 false
             }
@@ -969,10 +844,10 @@ impl ActionLoop {
                             via the in-zone teleport at ({:.0},{:.0}) (#266)",
                             goal.0, goal.1, why.as_str(), portal.0, portal.1);
                         self.escape_return = Some(goal);
-                        *self.goto_target.lock().unwrap() = Some(portal);
+                        *self.nav.goto_target.lock().unwrap() = Some(portal);
                         self.portal_cooldown = PORTAL_COOLDOWN_TICKS;
                         self.path_goal = None; // re-plan to the portal next tick
-                        *self.nav_intent.lock().unwrap() = None;
+                        *self.controller.nav_intent.lock().unwrap() = None;
                         return true;
                     }
                 }
@@ -1009,13 +884,13 @@ impl ActionLoop {
         if !Self::is_player_dead(gs) {
             return false;
         }
-        if self.goto_target.lock().unwrap().take().is_some() {
+        if self.nav.goto_target.lock().unwrap().take().is_some() {
             tracing::info!("NAV: player is dead — abandoning /goto");
         }
-        *self.goto_entity.lock().unwrap() = None;      // drop any entity chase
-        *self.zone_cross.lock().unwrap() = None;        // drop a queued zone-cross
-        *self.nav_intent.lock().unwrap() = None;        // stop driving the controller
-        *self.nav_path_view.lock().unwrap() = (Vec::new(), Vec::new()); // clear the overlay line
+        *self.nav.goto_entity.lock().unwrap() = None;      // drop any entity chase
+        *self.nav.zone_cross.lock().unwrap() = None;        // drop a queued zone-cross
+        *self.controller.nav_intent.lock().unwrap() = None;        // stop driving the controller
+        *self.nav.nav_path_view.lock().unwrap() = (Vec::new(), Vec::new()); // clear the overlay line
         self.path.clear();
         self.local_path.clear();
         self.local_i = 0;
@@ -1045,7 +920,7 @@ impl ActionLoop {
         let guard = self.collision.read().unwrap();
         let c = guard.as_ref()?;
         let pos = [gs.player_x, gs.player_y, gs.player_z];
-        let in_zone_idxs: Vec<i32> = self.zone_points.lock().unwrap().iter()
+        let in_zone_idxs: Vec<i32> = self.world.zone_points.lock().unwrap().iter()
             .filter(|zp| zp.zone_id == gs.zone_id)
             .map(|zp| zp.iterator as i32)
             .collect();
@@ -1146,11 +1021,16 @@ impl ActionLoop {
         self.drive_walk(stream, gs, goal);
     }
 
+    // TODO(MVC): this and the other `drain_*` methods below are slot CONSUMERS — they poll a
+    // request slot that both UI click-handlers (src/ui/) and the HTTP agent API (src/http/) write
+    // into independently today. Program Phase 2 should unify those two producers behind one shared
+    // controller-verb call so "click Loot" and "POST /v1/interact/loot" both go through the same
+    // code path instead of two independent writers racing into the same `Arc<Mutex<Option<T>>>`.
     fn drain_loot(&mut self, gs: &mut GameState) {
         // POST /loot: queue the requested corpse onto the existing auto-loot pipeline. The gameplay
         // loop drains pending_loot — sends OP_LootRequest, echoes each OP_LootItem to take it, then
         // OP_EndLootRequest. The 500ms delay (loot_queued_at) lets the server register the corpse.
-        if let Some(corpse_id) = self.loot.lock().unwrap().take() {
+        if let Some(corpse_id) = self.interact.loot.lock().unwrap().take() {
             gs.pending_loot.push_back(corpse_id);
             if gs.loot_queued_at.is_none() {
                 gs.loot_queued_at = Some(Instant::now());
@@ -1162,7 +1042,7 @@ impl ActionLoop {
     fn drain_doors(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // POST /doors/click or a human door click: send OP_ClickDoor. The door opens
         // visually only when the server replies with OP_MoveDoor.
-        if let Some(door_id) = self.door_click.lock().unwrap().take() {
+        if let Some(door_id) = self.interact.door_click.lock().unwrap().take() {
             stream.send_app_packet(OP_CLICK_DOOR, &build_click_door(door_id, gs.player_id));
             tracing::info!("EQ: click door_id={}", door_id);
             gs.log_msg("door", &format!("Clicked door {}", door_id));
@@ -1174,7 +1054,7 @@ impl ActionLoop {
         // For a real accept, look up the offering NPC's id from gs.task_offers (task_master_id is
         // required by the struct); a decline sends task_master_id=0 (irrelevant when task_id==0).
         // Either way, the selector window is done with — clear all pending offers.
-        if let Some(task_id) = self.accept_task.lock().unwrap().take() {
+        if let Some(task_id) = self.quest.accept_task.lock().unwrap().take() {
             let task_master_id = if task_id == 0 {
                 0
             } else {
@@ -1193,7 +1073,7 @@ impl ActionLoop {
 
         // POST /v1/quests/cancel ({"task_id":N}): abandon an active task. OP_CancelTask addresses
         // the task by its journal sequence_number, not task_id — see build_cancel_task.
-        if let Some(task_id) = self.cancel_task.lock().unwrap().take() {
+        if let Some(task_id) = self.quest.cancel_task.lock().unwrap().take() {
             if let Some(task) = gs.tasks.get(&task_id) {
                 let seq = task.sequence_number;
                 stream.send_app_packet(OP_CANCEL_TASK, &build_cancel_task(seq));
@@ -1205,9 +1085,12 @@ impl ActionLoop {
         }
     }
 
+    // TODO(MVC): same pattern as drain_loot above — group.group_invite/accept/decline/... are each
+    // written by BOTH the HUD group window and POST /v1/group/*; a shared controller verb would
+    // give them one call path instead of two writers into the same bundle field.
     fn drain_group(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // POST /v1/group/invite {"name":"X"}: send OP_GroupInvite.
-        if let Some(target) = self.group_invite.lock().unwrap().take() {
+        if let Some(target) = self.group_slots.group_invite.lock().unwrap().take() {
             stream.send_app_packet(OP_GROUP_INVITE, &build_group_invite(&target, &gs.player_name));
             tracing::info!("EQ: group: invited {target}");
             gs.log_msg("group", &format!("Invited {target} to group"));
@@ -1215,7 +1098,7 @@ impl ActionLoop {
 
         // POST /v1/group/accept: send OP_GroupFollow. Optimistically clear pending_invite now —
         // the real roster confirmation arrives via OP_GroupUpdateB/OP_GroupAcknowledge.
-        if self.group_accept.lock().unwrap().take().is_some() {
+        if self.group_slots.group_accept.lock().unwrap().take().is_some() {
             if let Some(inviter) = gs.pending_invite.take() {
                 stream.send_app_packet(OP_GROUP_FOLLOW, &build_group_follow(&inviter, &gs.player_name));
                 tracing::info!("EQ: group: accepted invite from {inviter}");
@@ -1225,7 +1108,7 @@ impl ActionLoop {
 
         // POST /v1/group/decline: RoF2 has no working OP_GroupCancelInvite, so send a defensive
         // OP_GroupDisband(self, self) cleanup instead.
-        if self.group_decline.lock().unwrap().take().is_some() {
+        if self.group_slots.group_decline.lock().unwrap().take().is_some() {
             if let Some(inviter) = gs.pending_invite.take() {
                 stream.send_app_packet(OP_GROUP_DISBAND, &build_group_disband(&gs.player_name, &gs.player_name));
                 tracing::info!("EQ: group: declined invite from {inviter}");
@@ -1235,7 +1118,7 @@ impl ActionLoop {
 
         // POST /v1/group/leave: send OP_GroupDisband(self, self). If leader with < 3 members this
         // fully disbands the group server-side (no auto handoff — see Global Constraints).
-        if self.group_leave.lock().unwrap().take().is_some() {
+        if self.group_slots.group_leave.lock().unwrap().take().is_some() {
             stream.send_app_packet(OP_GROUP_DISBAND, &build_group_disband(&gs.player_name, &gs.player_name));
             tracing::info!("EQ: group: left group");
             gs.log_msg("group", "Left group");
@@ -1243,14 +1126,14 @@ impl ActionLoop {
 
         // POST /v1/group/kick {"name":"X"}: send OP_GroupDisband(self, target). HTTP layer already
         // validated leadership + membership before queuing this.
-        if let Some(target) = self.group_kick.lock().unwrap().take() {
+        if let Some(target) = self.group_slots.group_kick.lock().unwrap().take() {
             stream.send_app_packet(OP_GROUP_DISBAND, &build_group_disband(&gs.player_name, &target));
             tracing::info!("EQ: group: kicked {target}");
             gs.log_msg("group", &format!("Kicked {target} from group"));
         }
 
         // POST /v1/group/makeleader {"name":"X"}: send OP_GroupMakeLeader.
-        if let Some(target) = self.group_make_leader.lock().unwrap().take() {
+        if let Some(target) = self.group_slots.group_make_leader.lock().unwrap().take() {
             stream.send_app_packet(OP_GROUP_MAKE_LEADER, &build_group_make_leader(&gs.group_leader, &target));
             tracing::info!("EQ: group: transferring leadership to {target}");
             gs.log_msg("group", &format!("Transferred group leadership to {target}"));
@@ -1262,7 +1145,7 @@ impl ActionLoop {
         // The server replies OP_GMTraining with the offered caps → apply_gm_training sets gs.trainer_*.
         // Sentinel: Some(0) ENDS the open session (OP_GMEndTraining) — 0 is never a real spawn id;
         // reusing the slot avoids threading one more field through the positional chains (#162).
-        if let Some(npc_id) = self.trainer_open_req.lock().unwrap().take() {
+        if let Some(npc_id) = self.trainer.trainer_open_req.lock().unwrap().take() {
             if npc_id == 0 {
                 if let Some(open_npc) = gs.trainer_open.take() {
                     let payload = build_gm_end_training(open_npc, gs.player_id);
@@ -1278,7 +1161,7 @@ impl ActionLoop {
 
         // POST /v1/trainer/train {"skill_id":N}: send OP_GMTrainSkill to the open trainer. The server
         // raises the skill and echoes OP_SkillUpdate → apply_skill_update reflects the new value.
-        if let Some(skill_id) = self.trainer_train_req.lock().unwrap().take() {
+        if let Some(skill_id) = self.trainer.trainer_train_req.lock().unwrap().take() {
             if let Some(npc_id) = gs.trainer_open {
                 stream.send_app_packet(OP_GM_TRAIN_SKILL, &build_gm_train_skill(npc_id, skill_id));
                 tracing::info!("EQ: trainer: training skill {skill_id} at npc {npc_id}");
@@ -1297,11 +1180,11 @@ impl ActionLoop {
         // so walking to them lands the player nowhere near the trigger and the server safe-coords /
         // cheat-flags the crossing (the root cause of #174). Resolve the target zone to its
         // zone-point index (iterator), locate that DRNTP region in the zone BSP, and walk there.
-        let cross_req = self.zone_cross.lock().unwrap().take();
+        let cross_req = self.nav.zone_cross.lock().unwrap().take();
         if let Some(want_zone) = cross_req {
             // want_zone != 0 → resolve it to a zone-point index; want_zone == 0 → any nearest line.
             let want_index = if want_zone != 0 {
-                match self.zone_points.lock().unwrap().iter()
+                match self.world.zone_points.lock().unwrap().iter()
                     .find(|zp| zp.zone_id == want_zone).map(|zp| zp.iterator as i32)
                 {
                     Some(idx) => Some(idx),
@@ -1331,7 +1214,7 @@ impl ActionLoop {
                         (0, _) => c.find_zone_line_near(None, pos),
                         (_, _) => {
                             // Every zone-point index advertised for `want_zone`, nearest region wins.
-                            let idxs: Vec<i32> = self.zone_points.lock().unwrap().iter()
+                            let idxs: Vec<i32> = self.world.zone_points.lock().unwrap().iter()
                                 .filter(|zp| zp.zone_id == want_zone).map(|zp| zp.iterator as i32).collect();
                             idxs.iter()
                                 .filter_map(|&idx| c.find_zone_line_near(Some(idx), pos))
@@ -1346,7 +1229,7 @@ impl ActionLoop {
                 match located {
                     Some((index, [tx, ty, tz])) => {
                         // Destination zone for logging (resolve the located region's index).
-                        let dest_zone = self.zone_points.lock().unwrap().iter()
+                        let dest_zone = self.world.zone_points.lock().unwrap().iter()
                             .find(|zp| zp.iterator as i32 == index).map(|zp| zp.zone_id).unwrap_or(want_zone);
                         let d2 = (tx - gs.player_x).powi(2) + (ty - gs.player_y).powi(2);
                         const ZONE_LINE_DIST2: f32 = 15.0 * 15.0;
@@ -1356,8 +1239,8 @@ impl ActionLoop {
                         } else {
                             tracing::info!("zone_cross: walking {:.0}u to the zone_id={dest_zone} line at ({tx:.0},{ty:.0}) (index={index})", d2.sqrt());
                             gs.log_msg("zone", &format!("Walking to the zone {} line", dest_zone));
-                            *self.goto_target.lock().unwrap() = Some((tx, ty, tz));
-                            *self.goto_entity.lock().unwrap() = None;
+                            *self.nav.goto_target.lock().unwrap() = Some((tx, ty, tz));
+                            *self.nav.goto_entity.lock().unwrap() = None;
                         }
                     }
                     None => {
@@ -1387,7 +1270,7 @@ impl ActionLoop {
                     // Resolve destination: the advertised zone point whose iterator matches this
                     // region's index. A region with no matching zone point (e.g. a WLD index the DB
                     // doesn't advertise) is left alone rather than crossing blindly.
-                    let dest = self.zone_points.lock().unwrap().iter()
+                    let dest = self.world.zone_points.lock().unwrap().iter()
                         .find(|zp| zp.iterator as i32 == index && zp.zone_id != 0)
                         .map(|zp| zp.zone_id);
                     match dest {
@@ -1420,7 +1303,7 @@ impl ActionLoop {
         // so we must target the NPC FIRST, in the same tick and before the say packet, or the hail is
         // silently ignored (#130). The target packet precedes the say on the ordered stream, so the
         // server has GetTarget()==the NPC when it processes the say.
-        let hail_req = self.hail.lock().unwrap().take();
+        let hail_req = self.interact.hail.lock().unwrap().take();
         if let Some((name, spawn_id)) = hail_req {
             // A hail starts a FRESH interaction — drop any saylink choices left over from a prior
             // NPC (or a system/command message). Otherwise `/observe/dialogue` leaks the last
@@ -1440,7 +1323,7 @@ impl ActionLoop {
         }
 
         // Check say request — arbitrary Say text (HUD say box / quest keyword follow-up).
-        let say_text = self.say.lock().unwrap().take();
+        let say_text = self.interact.say.lock().unwrap().take();
         if let Some(text) = say_text {
             // The `/camp` chat keyword is a local command, not Say text: toggle a camp instead of
             // broadcasting it. The gameplay loop drains the camp slot and runs the camp/cancel.
@@ -1459,7 +1342,7 @@ impl ActionLoop {
         // Check dialogue-click request (POST /v1/interact/dialogue, or a GUI click): "click" a
         // parsed saylink by sending OP_ItemLinkClick with its ids. The server resolves the phrase
         // from its saylink table and processes it as if we said it to the NPC (#120).
-        let click = self.dialogue_click.lock().unwrap().take();
+        let click = self.interact.dialogue_click.lock().unwrap().take();
         if let Some(c) = click {
             let pkt = build_item_link_click(c.item_id, &c.augments, c.link_hash, c.icon);
             tracing::info!("EQ: dialogue click: '{}' (sayid={})", c.text, c.augments[0]);
@@ -1470,7 +1353,7 @@ impl ActionLoop {
 
         // Drain queued outgoing chat (POST /tell|/ooc|/shout|/group): build + send OP_ChannelMessage.
         let outgoing: Vec<crate::ipc::ChatSend> = {
-            let mut q = self.chat_send.lock().unwrap();
+            let mut q = self.chat.chat_send.lock().unwrap();
             std::mem::take(&mut *q)
         };
         for c in outgoing {
@@ -1500,7 +1383,7 @@ impl ActionLoop {
         // target_name/target_hp_pct (name/HP — update_hp/update_hp_pct then keep target_hp_pct
         // live as combat HP updates arrive) AND clears target_con/target_con_name/
         // target_attitude so the PREVIOUS target's con can't survive a re-target (eqoxide#323).
-        let target_id = self.target.lock().unwrap().take();
+        let target_id = self.combat.target.lock().unwrap().take();
         if let Some(id) = target_id {
             // Never adopt a spawn that isn't in the zone. POST /v1/combat/target 404s on an unknown
             // id, but the entity could still despawn between the HTTP check and this drain — and the
@@ -1525,7 +1408,7 @@ impl ActionLoop {
         // Check /who all request (#300) — send OP_WhoAllRequest (server-wide, type=3); the oneshot
         // sender is held in `pending_who` until OP_WhoAllResponse arrives (see `fulfill_who`). A newer
         // request supersedes an in-flight one (its sender drops → that GET times out).
-        if let Some(tx) = self.who_req.lock().unwrap().take() {
+        if let Some(tx) = self.social.who_req.lock().unwrap().take() {
             stream.send_app_packet(OP_WHO_ALL_REQUEST, &build_who_all_request(3));
             self.pending_who = Some(tx);
             self.expecting_friends = false; // the next OP_WhoAllResponse is a /who all, not a friends poll
@@ -1535,8 +1418,8 @@ impl ActionLoop {
         // Check friends-presence request (#301) — send OP_FriendsWho with the client-local friends
         // string; the reply arrives as OP_WhoAllResponse (online subset), routed to `fulfill_friends`
         // by the `expecting_friends` flag. Mirrors the /who all path above.
-        if let Some(tx) = self.friends_req.lock().unwrap().take() {
-            let names = self.friends_list.lock().unwrap().clone();
+        if let Some(tx) = self.social.friends_req.lock().unwrap().take() {
+            let names = self.social.friends_list.lock().unwrap().clone();
             stream.send_app_packet(OP_FRIENDS_WHO, &build_friends_who(&names));
             self.pending_friends = Some(tx);
             self.expecting_friends = true;
@@ -1544,10 +1427,13 @@ impl ActionLoop {
         }
     }
 
+    // TODO(MVC): combat.attack is written by both the HUD attack button and POST
+    // /v1/combat/attack — a shared controller verb should own "start/stop auto-attack" so this
+    // drain isn't arbitrating between two independent producers of the same request.
     fn drain_combat(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Check attack request — send OP_AUTO_ATTACK(1) to start, OP_AUTO_ATTACK(0) to stop.
         // Server expects exactly 4 bytes; byte[0]=1 enables, byte[0]=0 disables.
-        let attack_req = self.attack.lock().unwrap().take();
+        let attack_req = self.combat.attack.lock().unwrap().take();
         if let Some(on) = attack_req {
             self.auto_attack = on;
             let payload = [if on { 1u8 } else { 0u8 }, 0, 0, 0];
@@ -1561,7 +1447,7 @@ impl ActionLoop {
         // POST /v1/pet/command or a Pet-window button: send one OP_PetCommands for the player's
         // pet. PET_ATTACK aims at the current target (like the auto-pet path); every other command
         // (back off / follow / guard / sit) targets 0 — the server acts on the pet itself.
-        let pet_cmd = self.pet_cmd.lock().unwrap().take();
+        let pet_cmd = self.combat.pet_cmd.lock().unwrap().take();
         if let Some(cmd) = pet_cmd {
             let cmd = cmd as u32;
             if gs.pet_id.is_none() {
@@ -1594,7 +1480,7 @@ impl ActionLoop {
         // POST /v1/interact/read {"slot":N}: read a book/note. Look up the item at that wire slot;
         // if it carries a Filename it's readable, so send OP_ReadBook with that filename and the
         // server replies with the text (apply_read_book stores it → GET /v1/observe/item_text). (#288)
-        let read_slot = self.read_book.lock().unwrap().take();
+        let read_slot = self.interact.read_book.lock().unwrap().take();
         if let Some(slot) = read_slot {
             match gs.inventory.iter().find(|i| i.slot == slot) {
                 Some(item) if !item.filename.is_empty() => {
@@ -1612,7 +1498,7 @@ impl ActionLoop {
         // POST /v1/guild/{invite,accept,leave,remove}: one queued guild action → the matching RoF2
         // guild opcode. Invite/remove/leave share GuildCommand_Struct; accept replies to a captured
         // pending invite with GuildInviteAccept_Struct. (#295)
-        let guild_action = self.guild_action.lock().unwrap().take();
+        let guild_action = self.guild_slots.guild_action.lock().unwrap().take();
         if let Some(action) = guild_action {
             const GUILD_RECRUIT: u32 = 8; // default rank for a fresh invite (RoF2 0-8 scale)
             match action {
@@ -1654,7 +1540,7 @@ impl ActionLoop {
         // "none" here or the self-fallback never fires. For BENEFICIAL spells (heals/buffs) that
         // aren't aimed at a friendly target, cast on the caster instead of a hostile/stale mob —
         // matching the real RoF2 client, which self-targets heals/buffs. (eqoxide#95)
-        let cast_req = self.cast.lock().unwrap().take();
+        let cast_req = self.combat.cast.lock().unwrap().take();
         if let Some(req) = cast_req {
           if let Some(item_slot) = req.item_slot {
             // Item "clicky" cast (teleport ring / port potion, etc.). Resolve the click spell from
@@ -1713,7 +1599,7 @@ impl ActionLoop {
         // Scribe a scroll into the spellbook (scribing=0) or memorize a known spell into a gem
         // (scribing=1) — OP_MemorizeSpell. The server validates (you hold the scroll / know the
         // spell) and pushes OP_MemorizeSpell back, which updates gs.mem_spells for the gem case.
-        let mem_req = self.mem_spell.lock().unwrap().take();
+        let mem_req = self.combat.mem_spell.lock().unwrap().take();
         if let Some((slot, spell_id, scribing, from)) = mem_req {
             // Scribing (0) only takes effect on the scroll sitting on the CURSOR: the RoF2 server
             // reads m_inv[slotCursor] and ignores the packet otherwise (silent fail, eqoxide#11).
@@ -1746,7 +1632,7 @@ impl ActionLoop {
 
     fn drain_sit(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Sit / stand (OP_SpawnAppearance type=14, param 110/100).
-        let sit_req = self.sit.lock().unwrap().take();
+        let sit_req = self.interact.sit.lock().unwrap().take();
         if let Some(sit) = sit_req {
             let param = if sit { 110u32 } else { 100u32 };
             let payload = build_spawn_appearance_packet(gs.player_id as u16, 14, param);
@@ -1758,7 +1644,7 @@ impl ActionLoop {
 
     fn drain_consider(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Standalone consider.
-        let con_req = self.consider.lock().unwrap().take();
+        let con_req = self.combat.consider.lock().unwrap().take();
         if let Some(id) = con_req {
             stream.send_app_packet(OP_CONSIDER, &build_consider_packet(gs.player_id, id));
             tracing::info!("EQ: consider spawn_id={}", id);
@@ -1769,7 +1655,7 @@ impl ActionLoop {
         // Merchant buy: open the merchant (OP_ShopRequest) then buy its inventory slot
         // (OP_ShopPlayerBuy). Sent in sequence — the server processes the open first so the
         // merchant is open by the time the buy arrives. Must be within ~200u of the merchant.
-        let buy_req = self.buy.lock().unwrap().take();
+        let buy_req = self.merchant_slots.buy.lock().unwrap().take();
         if let Some((merchant_id, slot)) = buy_req {
             // #360/#361: a failed/unanswered OP_ShopRequest must not leave `merchant_open` reporting
             // a DIFFERENT previous merchant, and the coin balance must read as unverified until this
@@ -1807,7 +1693,7 @@ impl ActionLoop {
         // Merchant sell: open the merchant (OP_ShopRequest) then sell a player inventory slot
         // (OP_ShopPlayerSell). Same sequencing as buy so the shop is open server-side first.
         // Must be within ~200u of the merchant; the server computes the price (we send 0).
-        let sell_req = self.sell.lock().unwrap().take();
+        let sell_req = self.merchant_slots.sell.lock().unwrap().take();
         if let Some((merchant_id, slot, quantity)) = sell_req {
             // #360: same staleness hazard as the buy path above — clear a DIFFERENT stale merchant
             // before sending, but don't flicker the one that's already open (#361 review FIX 2).
@@ -1839,7 +1725,7 @@ impl ActionLoop {
         // Open/close a merchant window (POST /trade/open, /trade/close). OP_ShopRequest with
         // command=1 (open) or 0 (close). The server replies with OP_ShopRequest (Open/Close) +
         // OP_ItemPacket(Merchant) items, decoded in packet_handler into gs.merchant_*.
-        let trade_req = self.trade.lock().unwrap().take();
+        let trade_req = self.merchant_slots.trade.lock().unwrap().take();
         if let Some(cmd) = trade_req {
             let (merchant_id, command) = match cmd {
                 TradeCmd::Open(id) => (id, 1u32),
@@ -1866,7 +1752,7 @@ impl ActionLoop {
         // SwapItem rejects number_in_stack > 0 for any non-stackable item (inventory.cpp ~2025,
         // "not a stackable item" -> SwapItemResync = the "Inventory Desyncronization" we hit). 0
         // takes the direct-swap/equip path. (A count would only be for splitting a stack.)
-        let move_req = self.move_req.lock().unwrap().take();
+        let move_req = self.inventory_slots.move_req.lock().unwrap().take();
         if let Some((from_slot, to_slot)) = move_req {
             // build_move_item emits the structured 28-byte RoF2 MoveItem_Struct; a flat 12-byte
             // packet is silently dropped by the server (see build_move_item / eqoxide#11).
@@ -1889,11 +1775,11 @@ impl ActionLoop {
         // `local_i` — NOT a hard-coded 0 — tracks which local_path segment we're on between rebuilds
         // (#311): pinning the projection to segment 0 for the full 150ms gate let it saturate and
         // measure the carrot from behind the walker once RUN_SPEED carried us past it.
-        if !self.local_path.is_empty() && self.goto_target.lock().unwrap().is_some() {
+        if !self.local_path.is_empty() && self.nav.goto_target.lock().unwrap().is_some() {
             if let Some((wish_dir, heading)) =
                 fast_steer_aim(&self.local_path, &mut self.local_i, [gs.player_x, gs.player_y], 5.0)
             {
-                if let Some(intent) = self.nav_intent.lock().unwrap().as_mut() {
+                if let Some(intent) = self.controller.nav_intent.lock().unwrap().as_mut() {
                     intent.wish_dir = wish_dir;
                 }
                 gs.player_heading = heading;
@@ -2034,7 +1920,7 @@ impl ActionLoop {
                             // Drive the controller toward the target (it owns collide-and-slide).
                             let swim = self.collision.read().unwrap().as_ref()
                                 .is_some_and(|c| c.in_water([gs.player_x, gs.player_y, gs.player_z]));
-                            *self.nav_intent.lock().unwrap() = Some(MoveIntent {
+                            *self.controller.nav_intent.lock().unwrap() = Some(MoveIntent {
                                 wish_dir:    [dx / dist, dy / dist],
                                 wish_vspeed: 0.0,
                                 jump:        false,
@@ -2046,10 +1932,10 @@ impl ActionLoop {
                         } else {
                             // In melee range: stop the controller and face the target so swings land
                             // (IsFacingMob). The explicit send keeps the server's facing current.
-                            *self.nav_intent.lock().unwrap() = None;
+                            *self.controller.nav_intent.lock().unwrap() = None;
                             self.send_position_update(stream, gs, gs.player_x, gs.player_y, gs.player_z, hdg);
                         }
-                        *self.goto_target.lock().unwrap() = None; // cancel any stale walk
+                        *self.nav.goto_target.lock().unwrap() = None; // cancel any stale walk
                         return true;
                     }
                 }
@@ -2094,15 +1980,15 @@ impl ActionLoop {
         // revealed here and the walk homes in on it. If goto_target was cleared (WASD/arrival)
         // while a chase name lingers, the chase is over; if the entity left view, stop cleanly.
         {
-            let chase = self.goto_entity.lock().unwrap().clone();
+            let chase = self.nav.goto_entity.lock().unwrap().clone();
             if let Some(name) = chase {
-                if self.goto_target.lock().unwrap().is_none() {
-                    *self.goto_entity.lock().unwrap() = None; // cancelled elsewhere
-                } else if let Some(&pos) = self.entity_positions.lock().unwrap().get(&name) {
-                    *self.goto_target.lock().unwrap() = Some(pos); // follow the entity's latest position
+                if self.nav.goto_target.lock().unwrap().is_none() {
+                    *self.nav.goto_entity.lock().unwrap() = None; // cancelled elsewhere
+                } else if let Some(&pos) = self.world.entity_positions.lock().unwrap().get(&name) {
+                    *self.nav.goto_target.lock().unwrap() = Some(pos); // follow the entity's latest position
                 } else {
-                    *self.goto_target.lock().unwrap() = None; // entity despawned / left view
-                    *self.goto_entity.lock().unwrap() = None;
+                    *self.nav.goto_target.lock().unwrap() = None; // entity despawned / left view
+                    *self.nav.goto_entity.lock().unwrap() = None;
                 }
             }
         }
@@ -2117,7 +2003,7 @@ impl ActionLoop {
         self.last_walk_pos = [gs.player_x, gs.player_y, gs.player_z];
         if jumped {
             if let Some(ret) = self.escape_return.take() {
-                *self.goto_target.lock().unwrap() = Some(ret);
+                *self.nav.goto_target.lock().unwrap() = Some(ret);
                 tracing::info!("NAV: teleported via in-zone portal — resuming goto to ({:.0},{:.0}) (#266)", ret.0, ret.1);
             }
             self.path_goal = None; // force a re-plan from the new position
@@ -2131,7 +2017,7 @@ impl ActionLoop {
     /// Resolves the active `/goto` target for this tick, or performs the "no active goto"
     /// stop-and-reset and returns `None` when there is none (caller must stop the tick).
     fn resolve_goal(&mut self) -> Option<(f32, f32, f32)> {
-        let goto = *self.goto_target.lock().unwrap(); // copy out so the lock is released
+        let goto = *self.nav.goto_target.lock().unwrap(); // copy out so the lock is released
         let goal = match goto {
             Some(t) => t,
             // No active /goto ⇒ the controller must not be nav-driven. Clearing nav_intent here is the
@@ -2147,7 +2033,7 @@ impl ActionLoop {
                 self.planner.cancel();
                 self.clear_local_plan();
                 self.awaiting_first_plan = false;
-                *self.nav_intent.lock().unwrap() = None;
+                *self.controller.nav_intent.lock().unwrap() = None;
                 // Only downgrade from an ACTIVE state (an external cancel / WASD). Keep terminal
                 // states (arrived / no_path / search_exhausted / blocked) so a driver can still read
                 // the last outcome (#166).
@@ -2175,7 +2061,7 @@ impl ActionLoop {
         // A CHASE goal (/follow, /goto <entity>) is rewritten with the leader's live position every
         // tick — the decision function must know that, or a moving leader re-plans forever and the
         // walker never gets a route (#377 review, B1).
-        let is_chase = self.goto_entity.lock().unwrap().is_some();
+        let is_chase = self.nav.goto_entity.lock().unwrap().is_some();
         let in_flight = self.planner.in_flight_goal().map(|g| (g[0], g[1], g[2]));
         let decision = replan_decision(self.path_goal, goal, in_flight, self.replan_coarse, is_chase);
         if decision.reset_route {
@@ -2224,7 +2110,7 @@ impl ActionLoop {
             // Aggro-avoidance (#67): route AROUND live NPC camps so a long goto doesn't plow through
             // a mob group and get the player killed. Exclude NPCs near the GOAL — you're walking TO
             // the destination (often a target mob), so its own camp must not be avoided.
-            let av = *self.nav_avoid.lock().unwrap();
+            let av = *self.nav.nav_avoid.lock().unwrap();
             let avoid = Self::aggro_avoid(gs, goal, av.enabled);
             let col = self.collision.read().unwrap().as_ref().cloned(); // Arc clone, not the grid
             match col {
@@ -2257,7 +2143,7 @@ impl ActionLoop {
                     if self.path.is_empty() {
                         self.awaiting_first_plan = true;
                         self.set_nav_state("planning");
-                        *self.nav_intent.lock().unwrap() = None;
+                        *self.controller.nav_intent.lock().unwrap() = None;
                     }
                 }
                 // Collision not loaded yet (zoning): keep the old straight-line-toward-goal fallback.
@@ -2313,7 +2199,7 @@ impl ActionLoop {
         // below exists for "no collision loaded", not for "the planner hasn't answered yet" — using
         // it here would charge the character at the goal through whatever is in the way.
         if self.awaiting_first_plan {
-            *self.nav_intent.lock().unwrap() = None;
+            *self.controller.nav_intent.lock().unwrap() = None;
             return;
         }
 
@@ -2402,11 +2288,11 @@ impl ActionLoop {
             // Publish the walker's ACTUAL committed plan for the nav-debug overlay (#246) so it draws
             // exactly what the walker follows — coarse route + fine local plan — rather than an
             // independent per-frame recompute that over-states how cleanly the walker is steering.
-            *self.nav_path_view.lock().unwrap() = (self.path.clone(), self.local_path.clone());
+            *self.nav.nav_path_view.lock().unwrap() = (self.path.clone(), self.local_path.clone());
             (aim[0], aim[1], aim[2])
         } else {
             self.clear_local_plan();
-            *self.nav_path_view.lock().unwrap() = (Vec::new(), Vec::new());
+            *self.nav.nav_path_view.lock().unwrap() = (Vec::new(), Vec::new());
             // No path computed: straight-line toward the goal at the player's CURRENT height.
             (goal.0, goal.1, gs.player_z)
         };
@@ -2434,8 +2320,8 @@ impl ActionLoop {
                     drop_to_target, max_dmg, gs.cur_hp);
                 gs.log_msg("zone", "Fall too dangerous (HP too low) — stopped at the ledge");
                 self.set_nav_state_because("blocked", Some("fall_would_be_lethal"));
-                *self.goto_target.lock().unwrap() = None;
-                *self.nav_intent.lock().unwrap() = None; // else the controller keeps walking the last
+                *self.nav.goto_target.lock().unwrap() = None;
+                *self.controller.nav_intent.lock().unwrap() = None; // else the controller keeps walking the last
                 // wish_dir forever — drifting 1000s of units with no nav activity (eqoxide#71).
                 return;
             }
@@ -2452,7 +2338,7 @@ impl ActionLoop {
         let gdx = goal.0 - gs.player_x;
         let gdy = goal.1 - gs.player_y;
         let gdist = (gdx * gdx + gdy * gdy).sqrt();
-        let following = self.goto_entity.lock().unwrap().is_some();
+        let following = self.nav.goto_entity.lock().unwrap().is_some();
         match arrival_action(gdist, following) {
             ArrivalAction::FollowHold => {
                 // Caught up — hold, but keep goto_target/goto_entity so a later tick drives again once
@@ -2460,7 +2346,7 @@ impl ActionLoop {
                 self.set_nav_state("following");
                 self.path.clear();
                 self.path_goal = None;
-                *self.nav_intent.lock().unwrap() = None; // stand still until the leader moves
+                *self.controller.nav_intent.lock().unwrap() = None; // stand still until the leader moves
                 gs.player_heading = eq_heading(gdx, gdy);
                 return;
             }
@@ -2470,9 +2356,9 @@ impl ActionLoop {
                     // — give up the escape and resume the real goal; portal_cooldown blocks a re-escape
                     // (#266). A portal escape is a plain goto (following==false), so it lands here.
                     tracing::info!("NAV: reached the in-zone portal without teleporting — resuming goto to ({:.0},{:.0})", ret.0, ret.1);
-                    *self.goto_target.lock().unwrap() = Some(ret);
+                    *self.nav.goto_target.lock().unwrap() = Some(ret);
                     self.path_goal = None;
-                    *self.nav_intent.lock().unwrap() = None;
+                    *self.controller.nav_intent.lock().unwrap() = None;
                     return;
                 }
                 tracing::info!("NAV: arrived at ({:.1},{:.1})", goal.0, goal.1);
@@ -2483,8 +2369,8 @@ impl ActionLoop {
                 } else {
                     self.set_nav_state("arrived");
                 }
-                *self.goto_target.lock().unwrap() = None;
-                *self.nav_intent.lock().unwrap() = None; // stop driving the controller
+                *self.nav.goto_target.lock().unwrap() = None;
+                *self.controller.nav_intent.lock().unwrap() = None; // stop driving the controller
                 gs.player_heading = eq_heading(gdx, gdy);
                 return;
             }
@@ -2533,7 +2419,7 @@ impl ActionLoop {
         // plan routes around the face instead of straight back up it.
         if self.backoff_ticks > 0 {
             self.backoff_ticks -= 1;
-            *self.nav_intent.lock().unwrap() = Some(MoveIntent {
+            *self.controller.nav_intent.lock().unwrap() = Some(MoveIntent {
                 wish_dir:    self.backoff_dir,
                 wish_vspeed: 0.0,
                 jump:        false,
@@ -2555,7 +2441,7 @@ impl ActionLoop {
                 // it is, by definition, no longer making progress on — a few hundred ms of that
                 // changes nothing). If the re-plan still can't route, the honest outcome now stops
                 // us with a reason instead of another silent wedge.
-                let av = *self.nav_avoid.lock().unwrap();
+                let av = *self.nav.nav_avoid.lock().unwrap();
                 let avoid = Self::aggro_avoid(gs, goal, av.enabled);
                 let col = self.collision.read().unwrap().as_ref().cloned();
                 if let Some(c) = col {
@@ -2682,7 +2568,7 @@ impl ActionLoop {
         // buoyancy's and gravity's business.
         const SWIM_UP_RATE: f32 = 20.0; // u/s, comfortably under the controller's BUOY_RATE (30)
         let wish_vspeed = if swim && target.2 > gs.player_z + 1.0 { SWIM_UP_RATE } else { 0.0 };
-        *self.nav_intent.lock().unwrap() = Some(MoveIntent {
+        *self.controller.nav_intent.lock().unwrap() = Some(MoveIntent {
             wish_dir:    [dx / dist, dy / dist],
             wish_vspeed,
             jump,
@@ -2707,7 +2593,7 @@ impl ActionLoop {
     fn tick_give(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Begin a new give request if one is queued and we're not already mid-trade.
         if self.give_state.is_none() {
-            if let Some((npc_id, from_slot)) = self.give.lock().unwrap().take() {
+            if let Some((npc_id, from_slot)) = self.interact.give.lock().unwrap().take() {
                 // Step 1: put the item on the cursor (skip if it's already there). Use the 28-byte
                 // structured MoveItem (possessions→cursor); the old flat 12-byte packet was silently
                 // dropped by the server, so the item never reached the cursor (eqoxide#26).
@@ -2762,7 +2648,7 @@ impl ActionLoop {
     /// server corrections (>12u jumps the server pushed) and forwards them to the controller, and
     /// sends OP_ClientUpdate at ≤280 ms while moving with a forced 1300 ms keepalive when idle.
     fn stream_position(&mut self, stream: &mut EqStream, gs: &mut GameState) {
-        let view = *self.controller_view.lock().unwrap();
+        let view = *self.controller.controller_view.lock().unwrap();
         // Don't stream/mirror until the render controller has spawned (else we'd push origin).
         if !view.initialized { return; }
         // Anti-MQGhost keepalive (#105): send a movement-history entry every 30s (< the server's 70s
@@ -2786,7 +2672,7 @@ impl ActionLoop {
         let cd = [gp[0] - self.last_streamed[0], gp[1] - self.last_streamed[1]];
         if cd[0] * cd[0] + cd[1] * cd[1] > CORRECTION_SQ {
             tracing::info!("NAV: server correction → handing controller new pos ({:.1},{:.1},{:.1})", gp[0], gp[1], gp[2]);
-            *self.pos_correction.lock().unwrap() = Some(gp);
+            *self.controller.pos_correction.lock().unwrap() = Some(gp);
             self.send_position_update(stream, gs, gp[0], gp[1], gp[2], gs.player_heading);
             self.last_streamed = gp;
             self.last_pos_send = Instant::now();
@@ -3106,7 +2992,7 @@ mod tests {
             tight: false,
         }, &mut gs, goal);
 
-        let st = nav.nav_state.lock().unwrap().clone();
+        let st = nav.nav.nav_state.lock().unwrap().clone();
         assert_eq!(st.state, "navigating");
         assert_eq!(st.reason.as_deref(), Some("goal_z_snapped"),
             "the agent asked for z=0 and is being walked to z=47 — it must be TOLD its goal was changed");
@@ -3125,7 +3011,7 @@ mod tests {
             goal_snapped_z: None,
             tight: false,
         }, &mut gs, goal);
-        let st = nav.nav_state.lock().unwrap().clone();
+        let st = nav.nav.nav_state.lock().unwrap().clone();
         assert_eq!(st.reason, None, "a goal that was honoured as given carries no snap reason");
         assert!(!nav.goal_snapped);
     }
@@ -3150,7 +3036,7 @@ mod tests {
             outcome: PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]]),
             plan_ms: 5, goal_snapped_z: None, tight: false,
         }, &mut gs, goal);
-        assert_eq!(nav.nav_state.lock().unwrap().tier, Some("preferred"),
+        assert_eq!(nav.nav.nav_state.lock().unwrap().tier, Some("preferred"),
             "a committed preferred route publishes nav_tier = preferred");
 
         // Journey B: a definitively unreachable goal → no_path. The tier from A must be GONE.
@@ -3160,7 +3046,7 @@ mod tests {
                 reason: NoRoute::SearchClosed, goal_blocked_by: None, frontier_blocked_by: None },
             plan_ms: 5, goal_snapped_z: None, tight: false,
         }, &mut gs, goal);
-        let st = nav.nav_state.lock().unwrap().clone();
+        let st = nav.nav.nav_state.lock().unwrap().clone();
         assert_eq!(st.state, "no_path");
         assert_eq!(st.tier, None,
             "nav_tier must NOT survive from journey A into journey B's no_path (the #343 stale-field lie)");
@@ -3172,7 +3058,7 @@ mod tests {
             outcome: PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [50.0, 50.0, 0.0]]),
             plan_ms: 5, goal_snapped_z: None, tight: true,
         }, &mut gs, goal);
-        assert_eq!(nav.nav_state.lock().unwrap().tier, Some("minimum"));
+        assert_eq!(nav.nav.nav_state.lock().unwrap().tier, Some("minimum"));
         nav.apply_plan(PlanReply {
             gen: 4,
             outcome: PlanOutcome::Exhausted {
@@ -3180,7 +3066,7 @@ mod tests {
                 progress: Some(vec![[0.0, 0.0, 0.0], [60.0, 60.0, 0.0], [90.0, 90.0, 0.0]]) },
             plan_ms: 5, goal_snapped_z: None, tight: false,
         }, &mut gs, goal);
-        let st = nav.nav_state.lock().unwrap().clone();
+        let st = nav.nav.nav_state.lock().unwrap().clone();
         assert_eq!(st.state, "navigating_partial");
         assert_eq!(st.tier, None, "an Exhausted partial walk is not a confirmed route — it carries no tier");
 
@@ -3190,9 +3076,9 @@ mod tests {
             outcome: PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]]),
             plan_ms: 5, goal_snapped_z: None, tight: false,
         }, &mut gs, goal);
-        assert_eq!(nav.nav_state.lock().unwrap().tier, Some("preferred"));
+        assert_eq!(nav.nav.nav_state.lock().unwrap().tier, Some("preferred"));
         nav.set_nav_state("arrived");
-        assert_eq!(nav.nav_state.lock().unwrap().tier, None,
+        assert_eq!(nav.nav.nav_state.lock().unwrap().tier, None,
             "arrival ends the route — its tier must not linger");
     }
 
@@ -3200,65 +3086,25 @@ mod tests {
     /// every other shared slot gets an empty/default placeholder.
     fn test_action_loop(group: crate::ipc::GroupShared) -> ActionLoop {
         ActionLoop::new(
-            Default::default(), // goto_target
-            std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::NavStatus::default())), // nav_state
-            Default::default(), // goto_entity
-            Default::default(), // entity_positions
-            Default::default(), // entity_ids
-            Default::default(), // zone_points
-            Default::default(), // task_log
-            Default::default(), // task_offers_shared
-            Default::default(), // completed_tasks_shared
-            Default::default(), // accept_task
-            Default::default(), // cancel_task
-            group,               // group
-            Default::default(), // group_invite
-            Default::default(), // trainer_open_req
-            Default::default(), // trainer_train_req
-            Default::default(), // group_accept
-            Default::default(), // group_decline
-            Default::default(), // group_leave
-            Default::default(), // group_kick
-            Default::default(), // group_make_leader
-            Default::default(), // zone_cross
-            Default::default(), // hail
-            Default::default(), // say
-            Default::default(), // target
-            Default::default(), // who_req
-            Default::default(), // friends_list
-            Default::default(), // friends_req
-            Default::default(), // attack
-            Default::default(), // buy
-            Default::default(), // sell
-            Default::default(), // trade
-            Default::default(), // merchant
-            Default::default(), // move_req
-            Default::default(), // give
-            Default::default(), // inventory
-            Default::default(), // loot
-            Default::default(), // door_click
-            Default::default(), // doors_shared
-            Default::default(), // messages
-            Default::default(), // dialogue
-            Default::default(), // dialogue_click
-            Default::default(), // chat_events
-            Default::default(), // chat_send
-            Default::default(), // cast
-            Default::default(), // mem_spell
-            Default::default(), // sit
-            Default::default(), // consider
-            Default::default(), // pet_cmd
+            crate::ipc::NavSlots {
+                nav_state: std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::NavStatus::default())),
+                ..Default::default()
+            },
+            Default::default(), // world
+            Default::default(), // quest
+            crate::ipc::GroupSlots { group, ..Default::default() },
+            Default::default(), // trainer
+            Default::default(), // combat
+            Default::default(), // social
+            Default::default(), // merchant_slots
+            Default::default(), // inventory_slots
+            Default::default(), // interact
+            Default::default(), // chat
+            Default::default(), // controller
+            Default::default(), // guild_slots
             Default::default(), // collision
             std::path::PathBuf::new(), // maps_dir
             Default::default(), // camp
-            Default::default(), // controller_view
-            Default::default(), // nav_intent
-            Default::default(), // pos_correction
-            Default::default(), // nav_path_view
-            Default::default(), // nav_avoid
-            Default::default(), // read_book
-            Default::default(), // guild
-            Default::default(), // guild_action
         )
     }
 
@@ -3267,27 +3113,27 @@ mod tests {
         // #238: a character that dies mid-goto must stop — the corpse must not keep walking the route.
         // Seed an in-progress nav, then assert nav_halt_if_dead() clears everything and reports dead.
         let seed_nav = |nav: &mut ActionLoop| {
-            *nav.goto_target.lock().unwrap() = Some((100.0, 200.0, 0.0));
-            *nav.goto_entity.lock().unwrap() = Some("a bat".into());
-            *nav.nav_intent.lock().unwrap() = Some(crate::movement::MoveIntent::default());
-            *nav.nav_path_view.lock().unwrap() = (vec![[0.0, 0.0, 0.0]], vec![[0.0, 0.0, 0.0]]);
+            *nav.nav.goto_target.lock().unwrap() = Some((100.0, 200.0, 0.0));
+            *nav.nav.goto_entity.lock().unwrap() = Some("a bat".into());
+            *nav.controller.nav_intent.lock().unwrap() = Some(crate::movement::MoveIntent::default());
+            *nav.nav.nav_path_view.lock().unwrap() = (vec![[0.0, 0.0, 0.0]], vec![[0.0, 0.0, 0.0]]);
             nav.path = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]];
             nav.local_path = vec![[0.0, 0.0, 0.0]];
             nav.path_goal = Some((100.0, 200.0, 0.0));
             nav.path_i = 1;
             nav.local_i = 1;
-            *nav.nav_state.lock().unwrap() = "navigating".into();
+            *nav.nav.nav_state.lock().unwrap() = "navigating".into();
         };
         let assert_halted = |nav: &ActionLoop| {
-            assert!(nav.goto_target.lock().unwrap().is_none(), "goto_target must clear on death");
-            assert!(nav.goto_entity.lock().unwrap().is_none(), "goto_entity must clear on death");
-            assert!(nav.nav_intent.lock().unwrap().is_none(), "nav_intent must clear so the controller stops");
+            assert!(nav.nav.goto_target.lock().unwrap().is_none(), "goto_target must clear on death");
+            assert!(nav.nav.goto_entity.lock().unwrap().is_none(), "goto_entity must clear on death");
+            assert!(nav.controller.nav_intent.lock().unwrap().is_none(), "nav_intent must clear so the controller stops");
             assert!(nav.path.is_empty() && nav.local_path.is_empty(), "route must clear on death");
             // The fast-steering cursor must reset with the path it indexes (#311) — a stale local_i
             // left over a cleared/rebuilt local_path aims the walker at the wrong segment.
             assert_eq!(nav.local_i, 0, "local_i must reset with local_path on death");
             assert_eq!(nav.path_goal, None);
-            assert_eq!(*nav.nav_state.lock().unwrap(), "idle");
+            assert_eq!(*nav.nav.nav_state.lock().unwrap(), "idle");
         };
         let new_nav = || {
             let g: crate::ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::GroupSnapshot::default()));
@@ -3324,11 +3170,11 @@ mod tests {
         gs.cur_hp = 900;
         gs.max_hp = 1284;
         assert!(!nav.nav_halt_if_dead(&gs), "a live player must keep navigating");
-        assert!(nav.goto_target.lock().unwrap().is_some(), "live nav must be untouched");
+        assert!(nav.nav.goto_target.lock().unwrap().is_some(), "live nav must be untouched");
         gs.cur_hp = 0;
         gs.max_hp = 0; // unknown HP, not a death
         assert!(!nav.nav_halt_if_dead(&gs), "cur_hp<=0 with max_hp==0 is unknown HP, not death");
-        assert!(nav.goto_target.lock().unwrap().is_some());
+        assert!(nav.nav.goto_target.lock().unwrap().is_some());
     }
 
     #[test]
@@ -3341,10 +3187,10 @@ mod tests {
 
         // Simulate an in-progress nav in the OLD zone.
         nav.current_zone = "gfaydark".into();
-        *nav.goto_target.lock().unwrap() = Some((100.0, 200.0, 0.0));
-        *nav.goto_entity.lock().unwrap() = Some("a bat".into());
-        *nav.nav_intent.lock().unwrap() = Some(crate::movement::MoveIntent::default());
-        *nav.nav_path_view.lock().unwrap() = (vec![[0.0, 0.0, 0.0]], vec![[0.0, 0.0, 0.0]]);
+        *nav.nav.goto_target.lock().unwrap() = Some((100.0, 200.0, 0.0));
+        *nav.nav.goto_entity.lock().unwrap() = Some("a bat".into());
+        *nav.controller.nav_intent.lock().unwrap() = Some(crate::movement::MoveIntent::default());
+        *nav.nav.nav_path_view.lock().unwrap() = (vec![[0.0, 0.0, 0.0]], vec![[0.0, 0.0, 0.0]]);
         nav.path = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]];
         nav.local_path = vec![[0.0, 0.0, 0.0]];
         nav.path_goal = Some((100.0, 200.0, 0.0));
@@ -3355,7 +3201,7 @@ mod tests {
         nav.backoff_ticks = 2;
         nav.replan_coarse = true;
         nav.falling = Some(0.0);
-        *nav.nav_state.lock().unwrap() = "blocked".into();
+        *nav.nav.nav_state.lock().unwrap() = "blocked".into();
 
         // Cross into a NEW zone.
         let mut gs = GameState::new();
@@ -3363,10 +3209,10 @@ mod tests {
         nav.sync_zone_points(&gs);
 
         // Destination + route + recovery state all cleared; walker comes to rest in the new zone.
-        assert!(nav.goto_target.lock().unwrap().is_none(), "goto_target must clear on zone change");
-        assert!(nav.goto_entity.lock().unwrap().is_none(), "goto_entity must clear on zone change");
-        assert!(nav.nav_intent.lock().unwrap().is_none(), "nav_intent must clear so the controller stops");
-        let (coarse, fine) = &*nav.nav_path_view.lock().unwrap();
+        assert!(nav.nav.goto_target.lock().unwrap().is_none(), "goto_target must clear on zone change");
+        assert!(nav.nav.goto_entity.lock().unwrap().is_none(), "goto_entity must clear on zone change");
+        assert!(nav.controller.nav_intent.lock().unwrap().is_none(), "nav_intent must clear so the controller stops");
+        let (coarse, fine) = &*nav.nav.nav_path_view.lock().unwrap();
         assert!(coarse.is_empty() && fine.is_empty(), "overlay path must clear on zone change");
         assert!(nav.path.is_empty() && nav.local_path.is_empty(), "route must clear on zone change");
         assert_eq!(nav.path_goal, None);
@@ -3380,7 +3226,7 @@ mod tests {
         assert_eq!(nav.backoff_ticks, 0);
         assert!(!nav.replan_coarse);
         assert!(nav.falling.is_none());
-        assert_eq!(*nav.nav_state.lock().unwrap(), "idle");
+        assert_eq!(*nav.nav.nav_state.lock().unwrap(), "idle");
         assert_eq!(nav.current_zone, "crushbone");
     }
 

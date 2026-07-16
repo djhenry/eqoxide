@@ -31,7 +31,7 @@ async fn post_friends(
         Ok(Json(b)) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"add\":\"Name\"} or {\"remove\":\"Name\"}".into()),
     };
-    let mut list = s.friends_list.lock().unwrap();
+    let mut list = s.social.friends_list.lock().unwrap();
     if let Some(name) = b.add.as_ref().map(|n| n.trim()).filter(|n| !n.is_empty()) {
         if name.len() >= 64 {
             return (StatusCode::BAD_REQUEST, "friend name too long (max 63 chars — the server drops the whole reply otherwise)".into());
@@ -67,12 +67,12 @@ struct FriendView {
 /// and awaits the reply (the online subset), then annotates the full client-local list: a friend is
 /// `online` iff the server returned it. 503 if not connected / no reply in time.
 async fn get_friends(State(s): State<HttpState>) -> (StatusCode, Json<serde_json::Value>) {
-    let friends = s.friends_list.lock().unwrap().clone();
+    let friends = s.social.friends_list.lock().unwrap().clone();
     if friends.is_empty() {
         return (StatusCode::OK, Json(serde_json::json!({ "friends": [] })));
     }
     let (tx, rx) = oneshot::channel::<Vec<crate::game_state::WhoEntry>>();
-    *s.friends_req.lock().unwrap() = Some(tx);
+    *s.social.friends_req.lock().unwrap() = Some(tx);
     match tokio::time::timeout(std::time::Duration::from_secs(6), rx).await {
         Ok(Ok(online_roster)) => {
             // Index the online subset by lowercased name for annotation.

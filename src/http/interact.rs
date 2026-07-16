@@ -36,12 +36,12 @@ async fn post_read(
     };
     // Validate against the last-published inventory so a bad slot fails fast with a clear message,
     // rather than being silently dropped by the nav thread.
-    let readable = s.inventory.lock().unwrap().iter()
+    let readable = s.inventory_slots.inventory.lock().unwrap().iter()
         .find(|i| i.slot == b.slot)
         .map(|i| !i.filename.is_empty());
     match readable {
         Some(true) => {
-            *s.read_book.lock().unwrap() = Some(b.slot);
+            *s.interact.read_book.lock().unwrap() = Some(b.slot);
             tracing::info!("read: queued book slot={}", b.slot);
             (StatusCode::OK, format!("reading item in slot {}", b.slot))
         }
@@ -69,7 +69,7 @@ async fn post_dialogue(
         Ok(Json(b)) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"index\":N} or {\"text\":\"...\"}".into()),
     };
-    let choices = s.dialogue.lock().unwrap().clone();
+    let choices = s.interact.dialogue.lock().unwrap().clone();
     if choices.is_empty() {
         return (StatusCode::CONFLICT, "no dialogue choices available".into());
     }
@@ -83,7 +83,7 @@ async fn post_dialogue(
     match chosen {
         Some(c) => {
             let label = c.text.clone();
-            *s.dialogue_click.lock().unwrap() = Some(c);
+            *s.interact.dialogue_click.lock().unwrap() = Some(c);
             tracing::info!("dialogue: queued click {:?}", label);
             (StatusCode::OK, format!("clicking '{}'", label))
         }
@@ -106,7 +106,7 @@ async fn post_hail(
     OptionalJson(body): OptionalJson<HailBody>,
 ) -> (StatusCode, String) {
     let requested = body.and_then(|b| b.name);
-    let positions = s.entity_positions.lock().unwrap();
+    let positions = s.world.entity_positions.lock().unwrap();
 
     let resolved: Option<String> = if let Some(name) = &requested {
         // Exact (clean) match first, then fuzzy substring.
@@ -118,7 +118,7 @@ async fn post_hail(
     } else {
         // Nearest NPC to the player. Camera focus = [east, north, height] =
         // [server_x, server_y, server_z]; entities stored as (server_x, server_y, z).
-        let focus = s.snapshot.lock().unwrap().focus;
+        let focus = s.camera.snapshot.lock().unwrap().focus;
         positions.iter()
             .filter(|(k, _)| !k.contains("zone_controller"))
             .map(|(k, &(ex, ny, _))| {
@@ -135,8 +135,8 @@ async fn post_hail(
             let display_name = clean_entity_name(&key);
             // Resolve the NPC's spawn_id so the nav thread can target it before saying — the
             // server only fires EVENT_SAY on the player's current target (#130).
-            let spawn_id = s.entity_ids.lock().unwrap().get(&key).copied();
-            *s.hail.lock().unwrap() = Some((display_name.clone(), spawn_id));
+            let spawn_id = s.world.entity_ids.lock().unwrap().get(&key).copied();
+            *s.interact.hail.lock().unwrap() = Some((display_name.clone(), spawn_id));
             tracing::info!("hail: queued hail to {:?} (spawn_id={:?})", display_name, spawn_id);
             (StatusCode::OK, format!("hailing {}", display_name))
         }
@@ -169,7 +169,7 @@ async fn post_say(
     if text.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "empty text".into());
     }
-    *s.say.lock().unwrap() = Some(text.clone());
+    *s.interact.say.lock().unwrap() = Some(text.clone());
     tracing::info!("say: queued {:?}", text);
     (StatusCode::OK, format!("saying {}", text))
 }
@@ -190,7 +190,7 @@ fn is_corpse_key(key: &str) -> bool {
 }
 
 fn queue_loot(s: &HttpState, name: String, id: u32) -> (StatusCode, String) {
-    *s.loot.lock().unwrap() = Some(id);
+    *s.interact.loot.lock().unwrap() = Some(id);
     tracing::info!("loot: queued corpse {:?} (spawn_id={})", name, id);
     (StatusCode::OK, format!("looting {} (spawn_id={})", clean_entity_name(&name), id))
 }
@@ -211,7 +211,7 @@ async fn post_loot(
 ) -> (StatusCode, String) {
     let b = body.unwrap_or_default();
     if let Some(id) = b.id {
-        let ids = s.entity_ids.lock().unwrap();
+        let ids = s.world.entity_ids.lock().unwrap();
         let found = ids.iter().find(|(_, &v)| v == id).map(|(k, _)| k.clone());
         drop(ids);
         return match found {
@@ -222,7 +222,7 @@ async fn post_loot(
         };
     }
     if let Some(name) = &b.name {
-        let ids = s.entity_ids.lock().unwrap();
+        let ids = s.world.entity_ids.lock().unwrap();
         let nl = name.to_lowercase();
         let matches: Vec<(String, u32)> = ids.iter()
             .filter(|(k, _)| is_corpse_key(k)
@@ -238,9 +238,9 @@ async fn post_loot(
         };
     }
     // Nearest corpse to the player (camera focus = player pos).
-    let focus = s.snapshot.lock().unwrap().focus;
-    let positions = s.entity_positions.lock().unwrap();
-    let ids = s.entity_ids.lock().unwrap();
+    let focus = s.camera.snapshot.lock().unwrap().focus;
+    let positions = s.world.entity_positions.lock().unwrap();
+    let ids = s.world.entity_ids.lock().unwrap();
     let resolved = positions.iter()
         .filter(|(k, _)| is_corpse_key(k))
         .map(|(k, &(x, y, _))| {
@@ -280,14 +280,14 @@ async fn post_give(
         Ok(Json(b)) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"npc\":\"...\",\"from\":N}".into()),
     };
-    let ids = s.entity_ids.lock().unwrap();
+    let ids = s.world.entity_ids.lock().unwrap();
     let nl = b.npc.to_lowercase();
     let found = ids.iter()
         .find(|(k, _)| clean_entity_name(k).to_lowercase().contains(&nl) || k.to_lowercase().contains(&nl))
         .map(|(k, &id)| (k.clone(), id));
     match found {
         Some((key, id)) => {
-            *s.give.lock().unwrap() = Some((id, b.from));
+            *s.interact.give.lock().unwrap() = Some((id, b.from));
             tracing::info!("give: queued npc {:?} (spawn_id={}) from_slot={}", key, id, b.from);
             (StatusCode::OK, format!("giving slot {} to {} (spawn_id={})", b.from, clean_entity_name(&key), id))
         }
@@ -308,7 +308,7 @@ async fn post_door_click(
         Some(id)
     } else if let Some(name) = &body.name {
         let up = name.to_uppercase();
-        s.doors_shared.lock().unwrap().iter()
+        s.interact.doors_shared.lock().unwrap().iter()
             .find(|d| d.name.to_uppercase() == up)
             .map(|d| d.door_id)
     } else {
@@ -316,7 +316,7 @@ async fn post_door_click(
     };
     match id {
         Some(id) => {
-            *s.door_click.lock().unwrap() = Some(id);
+            *s.interact.door_click.lock().unwrap() = Some(id);
             (StatusCode::OK, format!("clicking door {}", id))
         }
         None => (StatusCode::BAD_REQUEST,
@@ -326,13 +326,13 @@ async fn post_door_click(
 
 /// POST /v1/interact/sit — sit down (mana/HP regen).
 async fn post_sit(State(s): State<HttpState>) -> (StatusCode, String) {
-    *s.sit.lock().unwrap() = Some(true);
+    *s.interact.sit.lock().unwrap() = Some(true);
     (StatusCode::OK, "sit queued".into())
 }
 
 /// POST /v1/interact/stand — stand up.
 async fn post_stand(State(s): State<HttpState>) -> (StatusCode, String) {
-    *s.sit.lock().unwrap() = Some(false);
+    *s.interact.sit.lock().unwrap() = Some(false);
     (StatusCode::OK, "stand queued".into())
 }
 
@@ -345,8 +345,8 @@ mod tests {
     use crate::http::quests::tests::empty_state;
 
     fn seed_npc(state: &crate::http::HttpState, key: &str, id: u32, pos: (f32, f32, f32)) {
-        state.entity_positions.lock().unwrap().insert(key.to_string(), pos);
-        state.entity_ids.lock().unwrap().insert(key.to_string(), id);
+        state.world.entity_positions.lock().unwrap().insert(key.to_string(), pos);
+        state.world.entity_ids.lock().unwrap().insert(key.to_string(), id);
     }
 
     // --- hail: a malformed name must not silently fall back to "nearest NPC" -------------------
@@ -355,7 +355,7 @@ mod tests {
     async fn hail_no_body_hails_nearest_npc() {
         let state = empty_state();
         seed_npc(&state, "Guard_Phaeton000", 5, (1.0, 1.0, 0.0));
-        let hail = state.hail.clone();
+        let hail = state.interact.hail.clone();
         let app = router().with_state(state);
         let resp = app.oneshot(Request::post("/hail").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -366,7 +366,7 @@ mod tests {
     async fn hail_malformed_name_is_400_and_does_not_hail_nearest() {
         let state = empty_state();
         seed_npc(&state, "Guard_Phaeton000", 5, (1.0, 1.0, 0.0));
-        let hail = state.hail.clone();
+        let hail = state.interact.hail.clone();
         let app = router().with_state(state);
         let req = Request::post("/hail")
             .header("content-type", "application/json")
@@ -383,7 +383,7 @@ mod tests {
     async fn hail_unknown_key_is_400_and_does_not_hail_nearest() {
         let state = empty_state();
         seed_npc(&state, "Guard_Phaeton000", 5, (1.0, 1.0, 0.0));
-        let hail = state.hail.clone();
+        let hail = state.interact.hail.clone();
         let app = router().with_state(state);
         let req = Request::post("/hail")
             .header("content-type", "application/json")
@@ -400,7 +400,7 @@ mod tests {
     async fn loot_no_body_loots_nearest_corpse() {
         let state = empty_state();
         seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
-        let loot = state.loot.clone();
+        let loot = state.interact.loot.clone();
         let app = router().with_state(state);
         let resp = app.oneshot(Request::post("/loot").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -411,7 +411,7 @@ mod tests {
     async fn loot_malformed_id_is_400_and_does_not_loot_nearest() {
         let state = empty_state();
         seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
-        let loot = state.loot.clone();
+        let loot = state.interact.loot.clone();
         let app = router().with_state(state);
         let req = Request::post("/loot")
             .header("content-type", "application/json")
@@ -428,7 +428,7 @@ mod tests {
     async fn loot_unknown_key_is_400_and_does_not_loot_nearest() {
         let state = empty_state();
         seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
-        let loot = state.loot.clone();
+        let loot = state.interact.loot.clone();
         let app = router().with_state(state);
         let req = Request::post("/loot")
             .header("content-type", "application/json")
@@ -449,7 +449,7 @@ mod tests {
     #[tokio::test]
     async fn loot_nonexistent_id_is_404_not_200() {
         let state = empty_state();
-        let loot = state.loot.clone();
+        let loot = state.interact.loot.clone();
         let app = router().with_state(state);
         let req = Request::post("/loot")
             .header("content-type", "application/json")
@@ -464,7 +464,7 @@ mod tests {
         let state = empty_state();
         // A live mob (non-corpse key) standing near a corpse.
         seed_npc(&state, "a_rat01", 11, (2.0, 2.0, 0.0));
-        let loot = state.loot.clone();
+        let loot = state.interact.loot.clone();
         let app = router().with_state(state);
         let req = Request::post("/loot")
             .header("content-type", "application/json")
@@ -479,7 +479,7 @@ mod tests {
     async fn loot_live_mob_name_is_404_not_a_corpse() {
         let state = empty_state();
         seed_npc(&state, "a_rat01", 11, (2.0, 2.0, 0.0));
-        let loot = state.loot.clone();
+        let loot = state.interact.loot.clone();
         let app = router().with_state(state);
         let req = Request::post("/loot")
             .header("content-type", "application/json")
@@ -495,7 +495,7 @@ mod tests {
         let state = empty_state();
         seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
         seed_npc(&state, "a_rat001's corpse", 10, (3.0, 3.0, 0.0));
-        let loot = state.loot.clone();
+        let loot = state.interact.loot.clone();
         let app = router().with_state(state);
         let req = Request::post("/loot")
             .header("content-type", "application/json")
@@ -510,7 +510,7 @@ mod tests {
     async fn loot_id_matching_a_corpse_still_works() {
         let state = empty_state();
         seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
-        let loot = state.loot.clone();
+        let loot = state.interact.loot.clone();
         let app = router().with_state(state);
         let req = Request::post("/loot")
             .header("content-type", "application/json")
@@ -524,7 +524,7 @@ mod tests {
     async fn loot_unambiguous_name_matching_a_corpse_still_works() {
         let state = empty_state();
         seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
-        let loot = state.loot.clone();
+        let loot = state.interact.loot.clone();
         let app = router().with_state(state);
         let req = Request::post("/loot")
             .header("content-type", "application/json")

@@ -16,7 +16,7 @@ pub(super) fn router() -> Router<HttpState> {
 /// no-op (but still 200) if the character isn't currently dead. (#284)
 async fn post_respawn(State(s): State<HttpState>) -> (StatusCode, &'static str) {
     let dead = s.player().dead;
-    *s.respawn.lock().unwrap() = true;
+    *s.lifecycle.respawn.lock().unwrap() = true;
     if dead {
         tracing::info!("respawn: requested via POST /v1/lifecycle/respawn");
         (StatusCode::OK, "respawning at bind point")
@@ -29,8 +29,8 @@ async fn post_respawn(State(s): State<HttpState>) -> (StatusCode, &'static str) 
 /// progress (same as the HUD Camp button and the `/camp` chat keyword). A completed camp shuts the
 /// client down cleanly with no linkdead; a cancel keeps the client in-world.
 async fn post_camp(State(s): State<HttpState>) -> (StatusCode, &'static str) {
-    let camping = s.camp_until.lock().unwrap().is_some();
-    *s.camp.lock().unwrap() = Some(CampCmd::Toggle);
+    let camping = s.lifecycle.camp_until.lock().unwrap().is_some();
+    *s.lifecycle.camp.lock().unwrap() = Some(CampCmd::Toggle);
     if camping {
         tracing::info!("camp: cancel requested via POST /v1/lifecycle/camp");
         (StatusCode::OK, "cancelling camp")
@@ -50,7 +50,7 @@ async fn post_camp(State(s): State<HttpState>) -> (StatusCode, &'static str) {
 /// (CAMP_DURATION ≈ 30s) so it never force-kills mid-camp (which WOULD linkdead); 45s gives margin.
 async fn post_exit(State(s): State<HttpState>) -> (StatusCode, &'static str) {
     tracing::info!("exit: camp-and-shutdown requested via POST /v1/lifecycle/exit");
-    *s.camp.lock().unwrap() = Some(CampCmd::Start);
+    *s.lifecycle.camp.lock().unwrap() = Some(CampCmd::Start);
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_secs(45)).await;
         tracing::warn!("exit: watchdog timeout — loop unresponsive, forcing process exit");
