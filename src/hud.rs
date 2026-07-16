@@ -186,7 +186,6 @@ pub fn draw_labels(
 
     // NPC labels
     for (i, b) in scene.billboards.iter().enumerate() {
-        if b.level == 0 { continue; } // level-0 placeholder spawns have no label
         // Cull nameplates on the SAME distance+frustum test the model draw uses
         // (pass.rs), so a plate never shows for a spawn whose model isn't rendered —
         // and, unlike the occlusion test below, this is independent of whether zone

@@ -123,14 +123,14 @@ fn keyword_link(ui: &mut egui::Ui, cx: &mut UiCtx, seg: &str) {
 // HTTP message feed).
 use crate::game_state::split_keywords;
 
-/// The nearest living NPC within [`HAIL_RANGE`] (2D distance). Skips level-0
-/// placeholder spawns, corpses, and the off-map zone controller.
+/// The nearest living NPC within [`HAIL_RANGE`] (2D distance). Skips corpses and
+/// the off-map zone controller.
 fn nearest_hailable(scene: &SceneState) -> Option<&Billboard> {
     let p = scene.player_pos; // [east, north, height]
     scene
         .billboards
         .iter()
-        .filter(|b| b.level > 0 && !b.dead && !b.name.contains("zone_controller"))
+        .filter(|b| !b.dead && !b.name.contains("zone_controller"))
         .map(|b| {
             let de = b.pos[0] - p[0];
             let dn = b.pos[1] - p[1];
@@ -206,7 +206,6 @@ mod tests {
             bb(1, "Far_Guard000", [100.0, 0.0, 0.0], 5, false), // out of range
             bb(2, "Dead_Guy000", [2.0, 0.0, 0.0], 5, true),     // corpse
             bb(3, "zone_controller", [1.0, 0.0, 0.0], 5, false),
-            bb(4, "Placeholder000", [1.0, 0.0, 0.0], 0, false), // level 0
             bb(5, "Guard_Phaeton000", [10.0, 5.0, 0.0], 5, false),
             bb(6, "Guard_Hobble000", [3.0, 3.0, 0.0], 5, false),
         ];
