@@ -583,12 +583,13 @@ impl ActionLoop {
         }
     }
 
-    // TODO(MVC): same pattern as drain_loot above — group.group_invite/accept/decline/... are each
-    // written by BOTH the HUD group window and POST /v1/group/*; a shared controller verb would
-    // give them one call path instead of two writers into the same bundle field.
+    // #446: the HUD group window and POST /v1/group/* both write through the shared
+    // `CommandState::request_group_*` verbs now, and this drain reads them back via
+    // `take_group_*` — one typed surface over each slot instead of two call sites poking the raw
+    // `Arc<Mutex<..>>`.
     fn drain_group(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // POST /v1/group/invite {"name":"X"}: send OP_GroupInvite.
-        if let Some(target) = self.group_slots.group_invite.lock().unwrap().take() {
+        if let Some(target) = self.command.take_group_invite() {
             stream.send_app_packet(OP_GROUP_INVITE, &build_group_invite(&target, &gs.player_name));
             tracing::info!("EQ: group: invited {target}");
             gs.log_msg("group", &format!("Invited {target} to group"));
@@ -596,7 +597,7 @@ impl ActionLoop {
 
         // POST /v1/group/accept: send OP_GroupFollow. Optimistically clear pending_invite now —
         // the real roster confirmation arrives via OP_GroupUpdateB/OP_GroupAcknowledge.
-        if self.group_slots.group_accept.lock().unwrap().take().is_some() {
+        if self.command.take_group_accept().is_some() {
             if let Some(inviter) = gs.pending_invite.take() {
                 stream.send_app_packet(OP_GROUP_FOLLOW, &build_group_follow(&inviter, &gs.player_name));
                 tracing::info!("EQ: group: accepted invite from {inviter}");
@@ -606,7 +607,7 @@ impl ActionLoop {
 
         // POST /v1/group/decline: RoF2 has no working OP_GroupCancelInvite, so send a defensive
         // OP_GroupDisband(self, self) cleanup instead.
-        if self.group_slots.group_decline.lock().unwrap().take().is_some() {
+        if self.command.take_group_decline().is_some() {
             if let Some(inviter) = gs.pending_invite.take() {
                 stream.send_app_packet(OP_GROUP_DISBAND, &build_group_disband(&gs.player_name, &gs.player_name));
                 tracing::info!("EQ: group: declined invite from {inviter}");
@@ -616,7 +617,7 @@ impl ActionLoop {
 
         // POST /v1/group/leave: send OP_GroupDisband(self, self). If leader with < 3 members this
         // fully disbands the group server-side (no auto handoff — see Global Constraints).
-        if self.group_slots.group_leave.lock().unwrap().take().is_some() {
+        if self.command.take_group_leave().is_some() {
             stream.send_app_packet(OP_GROUP_DISBAND, &build_group_disband(&gs.player_name, &gs.player_name));
             tracing::info!("EQ: group: left group");
             gs.log_msg("group", "Left group");
@@ -624,14 +625,14 @@ impl ActionLoop {
 
         // POST /v1/group/kick {"name":"X"}: send OP_GroupDisband(self, target). HTTP layer already
         // validated leadership + membership before queuing this.
-        if let Some(target) = self.group_slots.group_kick.lock().unwrap().take() {
+        if let Some(target) = self.command.take_group_kick() {
             stream.send_app_packet(OP_GROUP_DISBAND, &build_group_disband(&gs.player_name, &target));
             tracing::info!("EQ: group: kicked {target}");
             gs.log_msg("group", &format!("Kicked {target} from group"));
         }
 
         // POST /v1/group/makeleader {"name":"X"}: send OP_GroupMakeLeader.
-        if let Some(target) = self.group_slots.group_make_leader.lock().unwrap().take() {
+        if let Some(target) = self.command.take_group_make_leader() {
             stream.send_app_packet(OP_GROUP_MAKE_LEADER, &build_group_make_leader(&gs.group_leader, &target));
             tracing::info!("EQ: group: transferring leadership to {target}");
             gs.log_msg("group", &format!("Transferred group leadership to {target}"));
@@ -850,10 +851,10 @@ impl ActionLoop {
         }
 
         // Drain queued outgoing chat (POST /tell|/ooc|/shout|/group): build + send OP_ChannelMessage.
-        let outgoing: Vec<crate::ipc::ChatSend> = {
-            let mut q = self.chat.chat_send.lock().unwrap();
-            std::mem::take(&mut *q)
-        };
+        // #446: both the Chat window and the POST handlers write through the shared
+        // `CommandState::request_chat_send` verb now; this drains the whole FIFO queue at once via
+        // `take_chat_send` (same `std::mem::take` behavior the raw slot drain had).
+        let outgoing: Vec<crate::ipc::ChatSend> = self.command.take_chat_send();
         for c in outgoing {
             let pkt = build_channel_message(&gs.player_name, &c.to, c.chan, &c.text);
             stream.send_app_packet(OP_CHANNEL_MESSAGE, &pkt);
@@ -902,11 +903,14 @@ impl ActionLoop {
         }
     }
 
+    // #446: GET /v1/observe/who and the /v1/social/friends presence poll now register their
+    // oneshot senders through the shared `CommandState::request_who`/`request_friends_who` verbs,
+    // and this drain reads them back via `take_who_req`/`take_friends_req`.
     fn drain_who_friends(&mut self, stream: &mut EqStream) {
         // Check /who all request (#300) — send OP_WhoAllRequest (server-wide, type=3); the oneshot
         // sender is held in `pending_who` until OP_WhoAllResponse arrives (see `fulfill_who`). A newer
         // request supersedes an in-flight one (its sender drops → that GET times out).
-        if let Some(tx) = self.social.who_req.lock().unwrap().take() {
+        if let Some(tx) = self.command.take_who_req() {
             stream.send_app_packet(OP_WHO_ALL_REQUEST, &build_who_all_request(3));
             self.pending_who = Some(tx);
             self.expecting_friends = false; // the next OP_WhoAllResponse is a /who all, not a friends poll
@@ -916,7 +920,7 @@ impl ActionLoop {
         // Check friends-presence request (#301) — send OP_FriendsWho with the client-local friends
         // string; the reply arrives as OP_WhoAllResponse (online subset), routed to `fulfill_friends`
         // by the `expecting_friends` flag. Mirrors the /who all path above.
-        if let Some(tx) = self.social.friends_req.lock().unwrap().take() {
+        if let Some(tx) = self.command.take_friends_req() {
             let names = self.social.friends_list.lock().unwrap().clone();
             stream.send_app_packet(OP_FRIENDS_WHO, &build_friends_who(&names));
             self.pending_friends = Some(tx);
@@ -992,11 +996,14 @@ impl ActionLoop {
         }
     }
 
+    // #446: POST /v1/guild/* now writes through the shared `CommandState::request_guild_action`
+    // verb (which also preserves the original "one pending action at a time" CONFLICT check), and
+    // this drain reads it back via `take_guild_action`.
     fn drain_guild(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // POST /v1/guild/{invite,accept,leave,remove}: one queued guild action → the matching RoF2
         // guild opcode. Invite/remove/leave share GuildCommand_Struct; accept replies to a captured
         // pending invite with GuildInviteAccept_Struct. (#295)
-        let guild_action = self.guild_slots.guild_action.lock().unwrap().take();
+        let guild_action = self.command.take_guild_action();
         if let Some(action) = guild_action {
             const GUILD_RECRUIT: u32 = 8; // default rank for a fresh invite (RoF2 0-8 scale)
             match action {

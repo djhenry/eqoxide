@@ -72,7 +72,7 @@ async fn get_friends(State(s): State<HttpState>) -> (StatusCode, Json<serde_json
         return (StatusCode::OK, Json(serde_json::json!({ "friends": [] })));
     }
     let (tx, rx) = oneshot::channel::<Vec<crate::game_state::WhoEntry>>();
-    *s.social.friends_req.lock().unwrap() = Some(tx);
+    s.command.request_friends_who(tx);
     match tokio::time::timeout(std::time::Duration::from_secs(6), rx).await {
         Ok(Ok(online_roster)) => {
             // Index the online subset by lowercased name for annotation.
