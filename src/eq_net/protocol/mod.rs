@@ -1323,9 +1323,9 @@ mod tests {
         //   word2: x:19, heading:12=0, pad:1 → x at bits 0-18
         //   word3: deltaHdg:10=0, z:19, pad:3 → z at bits 10-28
         //   word4: animation:10=100, deltaY:13=0, pad:9
-        let yp = ((y * 8.0) as i32 as u32) & 0x7FFFF;
-        let xp = ((x * 8.0) as i32 as u32) & 0x7FFFF;
-        let zp = ((z * 8.0) as i32 as u32) & 0x7FFFF;
+        let yp = enc_eq19(y);
+        let xp = enc_eq19(x);
+        let zp = enc_eq19(z);
         b.extend_from_slice(&(yp << 12).to_le_bytes()); // word0
         b.extend_from_slice(&0u32.to_le_bytes());        // word1
         b.extend_from_slice(&xp.to_le_bytes());          // word2
@@ -1505,6 +1505,15 @@ fn sext(v: u32, bits: u32) -> i32 {
     ((v << shift) as i32) >> shift
 }
 
+/// Encode one EQ19 fixed-point coordinate (value/8, wrapped to 19 bits) for the bit-packed
+/// PlayerPositionUpdateServer_Struct wire format — the encode-side counterpart of `sext`'s
+/// decode (`sext(bits, 19) as f32 / 8.0`). Was duplicated at every position-encode call site;
+/// pulled out to keep them in lockstep (identical expression, no behavior change).
+#[inline]
+pub(crate) fn enc_eq19(v: f32) -> u32 {
+    ((v * 8.0) as i32 as u32) & 0x7FFFF
+}
+
 /// Decode the 24-byte bit-packed RoF2 PlayerPositionUpdateServer_Struct (OP_ClientUpdate).
 /// Wire layout (rof2_structs.h):
 ///   spawn_id(u16) | vehicle_id(u16)
@@ -1544,9 +1553,9 @@ pub fn decode_position_update(p: &[u8]) -> Option<PositionUpdate> {
 /// letting the render loop face the player along the nav step direction.
 /// Round-trips with `decode_position_update`.
 pub fn encode_position_update(spawn_id: u16, x: f32, y: f32, z: f32, heading: f32) -> Vec<u8> {
-    let xp = ((x * 8.0) as i32 as u32) & 0x7FFFF;
-    let yp = ((y * 8.0) as i32 as u32) & 0x7FFFF;
-    let zp = ((z * 8.0) as i32 as u32) & 0x7FFFF;
+    let xp = enc_eq19(x);
+    let yp = enc_eq19(y);
+    let zp = enc_eq19(z);
     // Heading is sent CW on the wire as a 9-bit-scale value (0..512 = 0..360°), mirroring
     // the `* 360/512` in decode_position_update.
     let hp = ((ccw_to_cw(heading) * (512.0 / 360.0)).round() as i32 as u32) & 0xFFF;
