@@ -1506,11 +1506,19 @@ fn apply_exp_update(gs: &mut GameState, payload: &[u8]) {
 // RoF2 CombatDamage_Struct (rof2_structs.h): target(u16)@0 source(u16)@2 type(u8)@4
 // spellid(u32)@5 damage(int32)@9 force(f32)@13 ... (RoF2 widened spellid to u32, so damage is
 // at offset 9, not Titanium's 7 — reading it at 7 gave damage<<16, i.e. every value ×65536).
+//
+// #417: the pure-melee sentinel for `spellid` is `SPELL_UNKNOWN` (0xFFFF = 65535), NOT 0 —
+// EQEmu's `Mob::Damage` takes `spell_id` as a `uint16` and every melee call site passes
+// SPELL_UNKNOWN explicitly (zone/attack.cpp), which zero-extends onto this wire's `uint32`
+// field as 0x0000FFFF. A bare `spellid != 0` check therefore treats every melee swing as a
+// spell cast. See docs/eq-technical-knowledgebase/combat-damage-struct.md.
+const SPELL_UNKNOWN: u32 = 0xFFFF;
 fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < 13 { return; }
     let target_id = u16::from_le_bytes([payload[0], payload[1]]) as u32;
     let source_id = u16::from_le_bytes([payload[2], payload[3]]) as u32;
-    // spellid (u32)@5 — non-zero for a SPELL action (heal/buff/nuke/DoT); 0 for a melee swing.
+    // spellid (u32)@5 — non-zero (and not the SPELL_UNKNOWN sentinel) for a SPELL action
+    // (heal/buff/nuke/DoT); 0 or SPELL_UNKNOWN (0xFFFF) for a melee swing.
     let spellid   = u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
     let damage    = i32::from_le_bytes([payload[9], payload[10], payload[11], payload[12]]);
     let target_name = gs.entities.get(&target_id).map(|e| e.name.clone())
@@ -1520,7 +1528,7 @@ fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
     // A `CombatDamage_Struct.damage` of 0 is a plain miss; a POSITIVE value is real damage; a
     // NEGATIVE value is an EQEmu special-outcome sentinel (zone/common.h DMG_*), NOT "negative
     // damage" (#262). Map each to native combat wording instead of leaking "-N damage" / "(type=N)".
-    let msg = if spellid != 0 {
+    let msg = if spellid != 0 && spellid != SPELL_UNKNOWN {
         // A SPELL landed via OP_Damage — NOT a melee swing. A heal on a full-HP target arrives with
         // damage==0, which previously fell into the "tries to hit … misses" branch (#272). Resolve the
         // spell name and word it as a spell: beneficial (heal/buff) → "lands on", damaging → "hits for".
@@ -1559,7 +1567,8 @@ fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
     // A BENEFICIAL spell (heal/buff) whose `damage` field carries the heal amount must NOT be
     // subtracted from HP — that would drain the player on every heal (#272); the OP_HPUpdate carries
     // the true post-heal HP.
-    let beneficial_spell = spellid != 0 && crate::spells::global().is_some_and(|d| d.is_beneficial(spellid));
+    let beneficial_spell = spellid != 0 && spellid != SPELL_UNKNOWN
+        && crate::spells::global().is_some_and(|d| d.is_beneficial(spellid));
     if target_id == gs.player_id && damage > 0 && gs.max_hp > 0 && !beneficial_spell {
         gs.cur_hp = (gs.cur_hp - damage).max(0);
         gs.hp_pct = (gs.cur_hp as f32 / gs.max_hp.max(1) as f32) * 100.0;
@@ -3174,6 +3183,51 @@ mod tests {
         // Sanity: a real MELEE miss (spellid==0, damage==0) is unaffected.
         apply_combat_damage(&mut gs, &spell(7, 99, 0, 0));
         assert!(last(&gs).contains("misses"), "melee 0-damage still a miss: {}", last(&gs));
+    }
+
+    #[test]
+    fn apply_combat_damage_melee_swing_is_not_reported_as_a_spellcast() {
+        // #417 (AGENT-HONESTY): RoF2's pure-melee sentinel for CombatDamage_Struct.spellid@5 is
+        // SPELL_UNKNOWN (0xFFFF = 65535), NOT 0 — EQEmu's Mob::Damage takes spell_id as a uint16
+        // and every melee call site passes SPELL_UNKNOWN, which zero-extends onto this wire's
+        // uint32 field as 0x0000FFFF. A `spellid != 0` classification therefore misreports every
+        // melee hit as "casts a spell on" / "'s spell hits ... for N damage" — a silent wrong
+        // answer in the combat log. See docs/eq-technical-knowledgebase/combat-damage-struct.md.
+        use super::apply_combat_damage;
+        let spell = |target: u16, source: u16, spellid: u32, damage: i32| -> [u8; 13] {
+            let mut b = [0u8; 13];
+            b[0..2].copy_from_slice(&target.to_le_bytes());
+            b[2..4].copy_from_slice(&source.to_le_bytes());
+            b[5..9].copy_from_slice(&spellid.to_le_bytes()); // spellid@5 (u32)
+            b[9..13].copy_from_slice(&damage.to_le_bytes());
+            b
+        };
+        let mut gs = GameState::new();
+        gs.player_id = 7; gs.player_name = "Piety".into(); gs.max_hp = 100; gs.cur_hp = 100;
+        let last = |gs: &GameState| gs.messages.back().unwrap().text.clone();
+
+        // A melee hit whose spellid is the SPELL_UNKNOWN sentinel (0xFFFF) must render as a
+        // melee swing, never as a spellcast.
+        apply_combat_damage(&mut gs, &spell(7, 99, 0xFFFF, 24));
+        let m = last(&gs);
+        assert!(m.contains("hits") && m.contains("for 24 damage"),
+            "SPELL_UNKNOWN melee hit should read as melee wording: {m}");
+        assert!(!m.contains("casts a spell") && !m.contains("'s spell hits"),
+            "SPELL_UNKNOWN melee hit must NOT be reported as a spellcast: {m}");
+
+        // A melee miss with the same sentinel must render as a melee miss, not a spell.
+        apply_combat_damage(&mut gs, &spell(7, 99, 0xFFFF, 0));
+        let m = last(&gs);
+        assert!(m.contains("misses") || m.contains("tries to hit"),
+            "SPELL_UNKNOWN melee miss should read as a melee miss: {m}");
+        assert!(!m.contains("casts a spell"), "SPELL_UNKNOWN miss must NOT be a spellcast: {m}");
+
+        // Sanity: a GENUINE spellid (real cast, e.g. a nuke) is unaffected by the fix and still
+        // renders with spell wording.
+        apply_combat_damage(&mut gs, &spell(7, 99, 300, 40));
+        let m = last(&gs);
+        assert!(m.contains("for 40 damage"), "genuine spell damage still shows the amount: {m}");
+        assert!(!m.contains("misses"), "genuine spell must not read as a melee miss: {m}");
     }
 
     #[test]
