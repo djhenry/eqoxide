@@ -48,6 +48,7 @@ pub mod frame_capture;
 pub mod game_state;
 pub mod http;
 pub mod hud;
+pub mod ipc;
 pub mod spells;
 pub mod ui;
 pub mod zone_map;
