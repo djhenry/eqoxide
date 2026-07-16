@@ -1078,6 +1078,75 @@ impl ActionLoop {
         stream:  &mut EqStream,
         gs:      &mut GameState,
     ) {
+        self.drain_loot(gs);
+        self.drain_doors(stream, gs);
+        self.drain_quests(stream, gs);
+        self.drain_group(stream, gs);
+        self.drain_trainer(stream, gs);
+        self.drain_zone_cross(stream, gs);
+        self.drain_chat(stream, gs);
+        self.drain_target(stream, gs);
+        self.drain_who_friends(stream);
+        self.drain_combat(stream, gs);
+        self.drain_pet(stream, gs);
+        self.drain_read_book(stream, gs);
+        self.drain_guild(stream, gs);
+        self.drain_cast(stream, gs);
+        self.drain_mem_spell(stream, gs);
+        self.drain_sit(stream, gs);
+        self.drain_consider(stream, gs);
+        self.drain_merchant(stream, gs);
+        self.drain_move_item(stream, gs);
+
+        // Stream the controller's authoritative position to the server every tick at native cadence
+        // (independent of the 150 ms planner gate below). This is the single position authority.
+        self.stream_position(stream, gs);
+
+        // Dead men don't walk (#238, eqoxide#61): the instant the player is slain, abandon any /goto
+        // or /zone_cross and stop driving the controller, so a corpse doesn't keep walking its route
+        // toward the goal. Placed BEFORE the fast-steering refresh AND the 150 ms walk gate so
+        // movement halts within a tick, not up to a gate-period later. Position streaming above still
+        // runs, keeping the stationary corpse in sync with the server.
+        if self.nav_halt_if_dead(gs) {
+            return;
+        }
+
+        self.apply_fast_steering(gs);
+
+        if self.last_tick.elapsed().as_millis() < NAV_TICK_MS {
+            return;
+        }
+        self.last_tick = Instant::now();
+
+        // Quest turn-in (POST /give) trade-window state machine. Spans multiple ticks: we must
+        // wait for the server's OP_TradeRequestAck (sets gs.trade_ack_ready) between sending the
+        // trade request and moving the item into the NPC trade slot. Run on the throttled ~150ms
+        // cadence so the per-tick ack timeout count matches the documented ~3s window.
+        self.tick_give(stream, gs);
+
+        self.drive_auto_target(stream, gs);
+
+        self.drive_auto_pet_combat(stream, gs);
+
+        if self.drive_auto_engage_melee(stream, gs) { return; }
+        if self.drive_controlled_fall(stream, gs) { return; }
+
+        // (The dead-player guard now runs earlier — right after stream_position, before the fast-
+        // steering refresh and the 150 ms gate — so a corpse stops within a tick. See #238.)
+
+        self.drive_chase();
+
+        self.drive_teleport_detect(gs);
+
+        let goal = match self.resolve_goal() {
+            Some(g) => g,
+            None => return,
+        };
+
+        self.drive_walk(stream, gs, goal);
+    }
+
+    fn drain_loot(&mut self, gs: &mut GameState) {
         // POST /loot: queue the requested corpse onto the existing auto-loot pipeline. The gameplay
         // loop drains pending_loot — sends OP_LootRequest, echoes each OP_LootItem to take it, then
         // OP_EndLootRequest. The 500ms delay (loot_queued_at) lets the server register the corpse.
@@ -1088,7 +1157,9 @@ impl ActionLoop {
             }
             tracing::info!("loot: queued corpse_id={} for looting (via POST /loot)", corpse_id);
         }
+    }
 
+    fn drain_doors(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // POST /doors/click or a human door click: send OP_ClickDoor. The door opens
         // visually only when the server replies with OP_MoveDoor.
         if let Some(door_id) = self.door_click.lock().unwrap().take() {
@@ -1096,7 +1167,9 @@ impl ActionLoop {
             tracing::info!("EQ: click door_id={}", door_id);
             gs.log_msg("door", &format!("Clicked door {}", door_id));
         }
+    }
 
+    fn drain_quests(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // POST /v1/quests/accept ({"task_id":N}) or /decline (task_id=0): send OP_AcceptNewTask.
         // For a real accept, look up the offering NPC's id from gs.task_offers (task_master_id is
         // required by the struct); a decline sends task_master_id=0 (irrelevant when task_id==0).
@@ -1130,7 +1203,9 @@ impl ActionLoop {
                 tracing::warn!("EQ: quests: cancel requested for unknown task_id={task_id} — ignoring");
             }
         }
+    }
 
+    fn drain_group(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // POST /v1/group/invite {"name":"X"}: send OP_GroupInvite.
         if let Some(target) = self.group_invite.lock().unwrap().take() {
             stream.send_app_packet(OP_GROUP_INVITE, &build_group_invite(&target, &gs.player_name));
@@ -1180,7 +1255,9 @@ impl ActionLoop {
             tracing::info!("EQ: group: transferring leadership to {target}");
             gs.log_msg("group", &format!("Transferred group leadership to {target}"));
         }
+    }
 
+    fn drain_trainer(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // POST /v1/trainer/open {"trainer":"X"}: send OP_GMTraining for the resolved NPC spawn id.
         // The server replies OP_GMTraining with the offered caps → apply_gm_training sets gs.trainer_*.
         // Sentinel: Some(0) ENDS the open session (OP_GMEndTraining) — 0 is never a real spawn id;
@@ -1210,7 +1287,9 @@ impl ActionLoop {
                 gs.log_msg("trainer", "Cannot train — no trainer window open");
             }
         }
+    }
 
+    fn drain_zone_cross(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Check zone-cross request — walk onto the target zone line so the auto-cross below fires.
         //
         // A zone line's real trigger is a `DRNTP` region baked into the zone geometry (native
@@ -1333,7 +1412,9 @@ impl ActionLoop {
         // position sentinel, correct only for client-initiated WALK-IN crossings). That misrouted
         // every server-initiated teleport to a wrong zone (#235) — so it's removed; the wire
         // zoneID=0 path is now confined to /v1/move/zone_cross.
+    }
 
+    fn drain_chat(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Check hail request — say "Hail, <name>" so the NPC fires its hail script. The server only
         // runs an NPC's EVENT_SAY on the player's CURRENT TARGET (client.cpp: `Mob* t = GetTarget()`),
         // so we must target the NPC FIRST, in the same tick and before the say packet, or the hail is
@@ -1411,7 +1492,9 @@ impl ActionLoop {
             };
             gs.log_msg(kind, &line);
         }
+    }
 
+    fn drain_target(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Check target request — set target + auto-consider it (con color comes back as
         // an OP_CONSIDER reply, handled in packet_handler). GameState::set_target seeds
         // target_name/target_hp_pct (name/HP — update_hp/update_hp_pct then keep target_hp_pct
@@ -1436,7 +1519,9 @@ impl ActionLoop {
                 tracing::info!("EQ: target spawn_id={} + consider", id);
             }
         }
+    }
 
+    fn drain_who_friends(&mut self, stream: &mut EqStream) {
         // Check /who all request (#300) — send OP_WhoAllRequest (server-wide, type=3); the oneshot
         // sender is held in `pending_who` until OP_WhoAllResponse arrives (see `fulfill_who`). A newer
         // request supersedes an in-flight one (its sender drops → that GET times out).
@@ -1457,7 +1542,9 @@ impl ActionLoop {
             self.expecting_friends = true;
             tracing::info!("EQ: sent OP_FriendsWho ({} friend(s))", names.len());
         }
+    }
 
+    fn drain_combat(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Check attack request — send OP_AUTO_ATTACK(1) to start, OP_AUTO_ATTACK(0) to stop.
         // Server expects exactly 4 bytes; byte[0]=1 enables, byte[0]=0 disables.
         let attack_req = self.attack.lock().unwrap().take();
@@ -1468,7 +1555,9 @@ impl ActionLoop {
             gs.auto_attack = on;
             tracing::info!("EQ: auto-attack {}", if on { "ON" } else { "OFF" });
         }
+    }
 
+    fn drain_pet(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // POST /v1/pet/command or a Pet-window button: send one OP_PetCommands for the player's
         // pet. PET_ATTACK aims at the current target (like the auto-pet path); every other command
         // (back off / follow / guard / sit) targets 0 — the server acts on the pet itself.
@@ -1499,7 +1588,9 @@ impl ActionLoop {
                 }));
             }
         }
+    }
 
+    fn drain_read_book(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // POST /v1/interact/read {"slot":N}: read a book/note. Look up the item at that wire slot;
         // if it carries a Filename it's readable, so send OP_ReadBook with that filename and the
         // server replies with the text (apply_read_book stores it → GET /v1/observe/item_text). (#288)
@@ -1515,7 +1606,9 @@ impl ActionLoop {
                 None    => gs.log_msg("book", &format!("No item in slot {slot} to read")),
             }
         }
+    }
 
+    fn drain_guild(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // POST /v1/guild/{invite,accept,leave,remove}: one queued guild action → the matching RoF2
         // guild opcode. Invite/remove/leave share GuildCommand_Struct; accept replies to a captured
         // pending invite with GuildInviteAccept_Struct. (#295)
@@ -1553,7 +1646,9 @@ impl ActionLoop {
                 },
             }
         }
+    }
 
+    fn drain_cast(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Cast a memorized spell gem. Target priority: an explicit API target > the current target
         // > self. `Some(0)` is not a real spawn (the "clear target" sentinel), so collapse it to
         // "none" here or the self-fallback never fires. For BENEFICIAL spells (heals/buffs) that
@@ -1612,7 +1707,9 @@ impl ActionLoop {
             }
           }
         }
+    }
 
+    fn drain_mem_spell(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Scribe a scroll into the spellbook (scribing=0) or memorize a known spell into a gem
         // (scribing=1) — OP_MemorizeSpell. The server validates (you hold the scroll / know the
         // spell) and pushes OP_MemorizeSpell back, which updates gs.mem_spells for the gem case.
@@ -1645,7 +1742,9 @@ impl ActionLoop {
             tracing::info!("EQ: {what} spell={spell_id} slot={slot}");
             gs.log_msg("spell", &format!("{what} spell {spell_id} (slot {slot})"));
         }
+    }
 
+    fn drain_sit(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Sit / stand (OP_SpawnAppearance type=14, param 110/100).
         let sit_req = self.sit.lock().unwrap().take();
         if let Some(sit) = sit_req {
@@ -1655,14 +1754,18 @@ impl ActionLoop {
             gs.sitting = sit;
             tracing::info!("EQ: {}", if sit { "sit" } else { "stand" });
         }
+    }
 
+    fn drain_consider(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Standalone consider.
         let con_req = self.consider.lock().unwrap().take();
         if let Some(id) = con_req {
             stream.send_app_packet(OP_CONSIDER, &build_consider_packet(gs.player_id, id));
             tracing::info!("EQ: consider spawn_id={}", id);
         }
+    }
 
+    fn drain_merchant(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Merchant buy: open the merchant (OP_ShopRequest) then buy its inventory slot
         // (OP_ShopPlayerBuy). Sent in sequence — the server processes the open first so the
         // merchant is open by the time the buy arrives. Must be within ~200u of the merchant.
@@ -1754,7 +1857,9 @@ impl ActionLoop {
             tracing::info!("EQ: shop {} — merchant_id={}", if command == 1 { "open" } else { "close" }, merchant_id);
             if command == 0 { gs.merchant_open = None; gs.merchant_items.clear(); }
         }
+    }
 
+    fn drain_move_item(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Move/equip/unequip an item between inventory slots (OP_MoveItem).
         // MoveItem_Struct (12b): from_slot(u32), to_slot(u32), number_in_stack(u32).
         // number_in_stack MUST be 0 for a whole-item move (equip/unequip/rearrange): EQEmu's
@@ -1772,20 +1877,9 @@ impl ActionLoop {
             tracing::info!("EQ: move item — from_slot={} to_slot={} qty=0(whole)", from_slot, to_slot);
             gs.log_msg("inventory", &format!("Moved item (slot {} -> {})", from_slot, to_slot));
         }
+    }
 
-        // Stream the controller's authoritative position to the server every tick at native cadence
-        // (independent of the 150 ms planner gate below). This is the single position authority.
-        self.stream_position(stream, gs);
-
-        // Dead men don't walk (#238, eqoxide#61): the instant the player is slain, abandon any /goto
-        // or /zone_cross and stop driving the controller, so a corpse doesn't keep walking its route
-        // toward the goal. Placed BEFORE the fast-steering refresh AND the 150 ms walk gate so
-        // movement halts within a tick, not up to a gate-period later. Position streaming above still
-        // runs, keeping the stationary corpse in sync with the server.
-        if self.nav_halt_if_dead(gs) {
-            return;
-        }
-
+    fn apply_fast_steering(&mut self, gs: &mut GameState) {
         // FAST STEERING (#nav-multires). The plans (`path`, `local_path`) are refreshed on the 150ms
         // gate below, but the controller runs at ~100Hz — driving a 150ms-stale heading overshoots
         // every turn by up to RUN_SPEED·0.15 ≈ 6.6u and clips walls (the "not following the line"
@@ -1805,18 +1899,9 @@ impl ActionLoop {
                 gs.player_heading = heading;
             }
         }
+    }
 
-        if self.last_tick.elapsed().as_millis() < NAV_TICK_MS {
-            return;
-        }
-        self.last_tick = Instant::now();
-
-        // Quest turn-in (POST /give) trade-window state machine. Spans multiple ticks: we must
-        // wait for the server's OP_TradeRequestAck (sets gs.trade_ack_ready) between sending the
-        // trade request and moving the item into the NPC trade slot. Run on the throttled ~150ms
-        // cadence so the per-tick ack timeout count matches the documented ~3s window.
-        self.tick_give(stream, gs);
-
+    fn drive_auto_target(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Auto-target: while auto-attacking, pick who to fight each tick. Priority (see
         // `pick_combat_target`): a mob that is actively attacking the player (engage adds instead of
         // tanking them unanswered) > a still-valid current target > the nearest reachable trash mob
@@ -1883,7 +1968,9 @@ impl ActionLoop {
                 }
             }
         }
+    }
 
+    fn drive_auto_pet_combat(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Auto-pet-combat: if the player has a pet (e.g. a summoned necro pet), send it to attack
         // the current target. Only (re)issue PET_ATTACK when the target changes, so we don't spam
         // OP_PetCommands every tick. The player's own melee auto-engage (below) still runs, which
@@ -1920,7 +2007,10 @@ impl ActionLoop {
         } else {
             self.last_pet_target = None;
         }
+    }
 
+    /// Returns true if this handled the tick and the caller must stop (melee engage/hold fired).
+    fn drive_auto_engage_melee(&mut self, stream: &mut EqStream, gs: &mut GameState) -> bool {
         // Auto-engage: while auto-attacking, walk into melee range of the target and face it so
         // the server registers swings. Closing the last few units via legit walking (not a held
         // far-away face) is what makes melee actually land. Runs regardless of any pending goto.
@@ -1960,12 +2050,16 @@ impl ActionLoop {
                             self.send_position_update(stream, gs, gs.player_x, gs.player_y, gs.player_z, hdg);
                         }
                         *self.goto_target.lock().unwrap() = None; // cancel any stale walk
-                        return;
+                        return true;
                     }
                 }
             }
         }
+        false
+    }
 
+    /// Returns true if a controlled fall was in progress (handled this tick; caller must stop).
+    fn drive_controlled_fall(&mut self, stream: &mut EqStream, gs: &mut GameState) -> bool {
         // Controlled fall in progress: descend at the native rate until landed, then apply native
         // fall damage (client-computed in EQ; the server only validates OP_EnvDamage). Takes
         // priority over normal walking so the descent isn't interrupted.
@@ -1987,12 +2081,12 @@ impl ActionLoop {
                 }
                 tracing::info!("NAV: landed at z={:.1} after {:.0}u fall", land_z, height);
             }
-            return;
+            return true;
         }
+        false
+    }
 
-        // (The dead-player guard now runs earlier — right after stream_position, before the fast-
-        // steering refresh and the 150 ms gate — so a corpse stops within a tick. See #238.)
-
+    fn drive_chase(&mut self) {
         // Chase (eqoxide#88): when /goto targets a named ENTITY, re-resolve its CURRENT position each
         // tick and follow it, instead of pathing to a one-time snapshot. Roaming mobs move, and their
         // client position is frozen (stale) until they come within the server's ~300u update range —
@@ -2012,7 +2106,9 @@ impl ActionLoop {
                 }
             }
         }
+    }
 
+    fn drive_teleport_detect(&mut self, gs: &mut GameState) {
         // Teleport detection (#266): a position jump far bigger than one tick of walking (RUN_SPEED
         // ·0.15 ≈ 6.6u) means we were repositioned — an in-zone waterfall teleport, a GM #goto, or a
         // server correction. If we were mid portal-escape, RESTORE the real goal (we're now on the far
@@ -2030,7 +2126,11 @@ impl ActionLoop {
             self.clear_local_plan();
         }
         if self.portal_cooldown > 0 { self.portal_cooldown -= 1; }
+    }
 
+    /// Resolves the active `/goto` target for this tick, or performs the "no active goto"
+    /// stop-and-reset and returns `None` when there is none (caller must stop the tick).
+    fn resolve_goal(&mut self) -> Option<(f32, f32, f32)> {
         let goto = *self.goto_target.lock().unwrap(); // copy out so the lock is released
         let goal = match goto {
             Some(t) => t,
@@ -2056,10 +2156,16 @@ impl ActionLoop {
                 {
                     self.set_nav_state("idle");
                 }
-                return;
+                return None;
             }
         };
+        Some(goal)
+    }
 
+    /// The walker: (re)plans the coarse/fine route toward `goal`, steers pure-pursuit along
+    /// it, and drives arrival/stall/fall-edge handling. This is the tail of the old `tick()` --
+    /// every early `return` here is a return from the tick, exactly as before the split.
+    fn drive_walk(&mut self, _stream: &mut EqStream, gs: &mut GameState, goal: (f32, f32, f32)) {
         // (Re)compute a wall-avoiding A* path when the goal changes OR the proactive re-plan is armed
         // (#246). find_path returns waypoints (goal-inclusive); an empty path falls back to a straight
         // line to the goal. `replan_coarse` (armed below when the fine plan can't thread the committed
