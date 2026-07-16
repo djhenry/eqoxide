@@ -29,7 +29,7 @@ fn submit(line: &str, cx: &mut UiCtx) {
     }
     let Some(rest) = line.strip_prefix('/') else {
         // No slash → plain Say (also triggers quest keywords server-side).
-        *cx.acts.say.lock().unwrap() = Some(line.to_string());
+        cx.acts.command.request_say(line.to_string());
         return;
     };
     let (cmd, arg) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
@@ -63,7 +63,7 @@ fn submit(line: &str, cx: &mut UiCtx) {
             *cx.acts.camp.lock().unwrap() = Some(crate::http::CampCmd::Toggle);
         }
         "say" if !arg.is_empty() => {
-            *cx.acts.say.lock().unwrap() = Some(arg.to_string());
+            cx.acts.command.request_say(arg.to_string());
         }
         // Unknown slash command: swallow it rather than shouting gibberish.
         _ => {}

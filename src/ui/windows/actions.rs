@@ -53,7 +53,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
         // Sit / Stand.
         let sit_label = if s.sitting { "Stand" } else { "Sit" };
         if ui.add(btn(sit_label)).clicked() {
-            *cx.acts.sit.lock().unwrap() = Some(!s.sitting);
+            cx.acts.command.request_sit(!s.sitting);
         }
 
         // Target nearest living NPC.
@@ -84,7 +84,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
         };
         if ui.add_enabled(hail_who.is_some(), btn(hail_label)).clicked() {
             if let Some((id, name)) = hail_who {
-                *cx.acts.hail.lock().unwrap() = Some((name, Some(id)));
+                cx.acts.command.request_hail(name, Some(id));
             }
         }
 
