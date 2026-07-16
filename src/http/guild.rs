@@ -50,18 +50,17 @@ fn extract_name(body: Result<Json<NameBody>, axum::extract::rejection::JsonRejec
 
 /// Queue a single guild action (rejecting if one is already pending and undrained).
 fn queue(s: &HttpState, action: GuildAction) -> (StatusCode, String) {
-    let mut slot = s.guild_slots.guild_action.lock().unwrap();
-    if slot.is_some() {
-        return (StatusCode::CONFLICT, "a guild action is already pending".into());
-    }
     let msg = match &action {
         GuildAction::Invite(n) => format!("inviting {n} to the guild"),
         GuildAction::Accept    => "accepting guild invite".into(),
         GuildAction::Leave     => "leaving guild".into(),
         GuildAction::Remove(n) => format!("removing {n} from the guild"),
     };
-    *slot = Some(action);
-    (StatusCode::OK, msg)
+    if s.command.request_guild_action(action) {
+        (StatusCode::OK, msg)
+    } else {
+        (StatusCode::CONFLICT, "a guild action is already pending".into())
+    }
 }
 
 /// POST /v1/guild/invite {"name":"X"} — invite player X to our guild (requires invite rights).
