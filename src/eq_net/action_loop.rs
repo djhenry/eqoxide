@@ -1,5 +1,7 @@
-//! Player navigation: walk toward a target position in capped steps at 150 ms intervals,
-//! sending EQ movement packets and notifying the render loop.
+//! The net action loop: drains HTTP/IPC command slots into EQ wire packets each tick (loot,
+//! doors, quests, group, trainer, zone-cross, chat, combat, merchant, …), and walks the player
+//! toward a `/goto` target in capped steps at 150 ms intervals, sending movement packets and
+//! notifying the render loop.
 
 use std::time::Instant;
 
@@ -66,7 +68,7 @@ use crate::nav::steering::*;
 use crate::coord::eq_heading;
 
 
-pub struct Navigator {
+pub struct ActionLoop {
     goto_target:      GotoTarget,
     /// Live nav state for GET /v1/observe/debug (#166): idle|navigating|arrived|no_path|blocked.
     nav_state:        NavStateShared,
@@ -286,7 +288,7 @@ pub struct Navigator {
     awaiting_first_plan: bool,
 }
 
-impl Navigator {
+impl ActionLoop {
     pub fn new(
         goto_target:      GotoTarget,
         nav_state:        NavStateShared,
@@ -348,7 +350,7 @@ impl Navigator {
         guild:            crate::ipc::GuildShared,
         guild_action:     crate::ipc::GuildActionReq,
     ) -> Self {
-        Navigator {
+        ActionLoop {
             goto_target,
             nav_state,
             goto_entity,
@@ -2985,7 +2987,7 @@ mod tests {
     fn a_snapped_goal_z_is_reported_not_silently_performed() {
         use crate::nav::planner::PlanReply;
         let g: crate::ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::GroupSnapshot::default()));
-        let mut nav = test_navigator(g);
+        let mut nav = test_action_loop(g);
         let mut gs = GameState::new();
         let goal = (100.0f32, 100.0f32, 0.0f32); // the agent asked for z = 0
 
@@ -3032,7 +3034,7 @@ mod tests {
         use crate::nav::collision::{NoRoute, PlanLimit, PlanOutcome};
         use crate::nav::planner::PlanReply;
         let group: crate::ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::GroupSnapshot::default()));
-        let mut nav = test_navigator(group);
+        let mut nav = test_action_loop(group);
         let mut gs = GameState::new();
         let goal = (100.0f32, 100.0f32, 0.0f32);
 
@@ -3088,10 +3090,10 @@ mod tests {
             "arrival ends the route — its tier must not linger");
     }
 
-    /// Build a minimal Navigator for unit tests that only exercise a single `sync_*`/tick method —
+    /// Build a minimal ActionLoop for unit tests that only exercise a single `sync_*`/tick method —
     /// every other shared slot gets an empty/default placeholder.
-    fn test_navigator(group: crate::ipc::GroupShared) -> Navigator {
-        Navigator::new(
+    fn test_action_loop(group: crate::ipc::GroupShared) -> ActionLoop {
+        ActionLoop::new(
             Default::default(), // goto_target
             std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::NavStatus::default())), // nav_state
             Default::default(), // goto_entity
@@ -3158,7 +3160,7 @@ mod tests {
     fn dead_player_halts_navigation() {
         // #238: a character that dies mid-goto must stop — the corpse must not keep walking the route.
         // Seed an in-progress nav, then assert nav_halt_if_dead() clears everything and reports dead.
-        let seed_nav = |nav: &mut Navigator| {
+        let seed_nav = |nav: &mut ActionLoop| {
             *nav.goto_target.lock().unwrap() = Some((100.0, 200.0, 0.0));
             *nav.goto_entity.lock().unwrap() = Some("a bat".into());
             *nav.nav_intent.lock().unwrap() = Some(crate::movement::MoveIntent::default());
@@ -3170,7 +3172,7 @@ mod tests {
             nav.local_i = 1;
             *nav.nav_state.lock().unwrap() = "navigating".into();
         };
-        let assert_halted = |nav: &Navigator| {
+        let assert_halted = |nav: &ActionLoop| {
             assert!(nav.goto_target.lock().unwrap().is_none(), "goto_target must clear on death");
             assert!(nav.goto_entity.lock().unwrap().is_none(), "goto_entity must clear on death");
             assert!(nav.nav_intent.lock().unwrap().is_none(), "nav_intent must clear so the controller stops");
@@ -3183,7 +3185,7 @@ mod tests {
         };
         let new_nav = || {
             let g: crate::ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::GroupSnapshot::default()));
-            test_navigator(g)
+            test_action_loop(g)
         };
 
         // (a) An HP-to-0 update that arrives BEFORE OP_Death (player_dead still false) — the exact
@@ -3229,7 +3231,7 @@ mod tests {
         // in the new zone's coordinate space they aim the walker at a corner near the arrival point
         // and wedge it there. sync_zone_points must clear the goal, path, and recovery state.
         let group: crate::ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::GroupSnapshot::default()));
-        let mut nav = test_navigator(group);
+        let mut nav = test_action_loop(group);
 
         // Simulate an in-progress nav in the OLD zone.
         nav.current_zone = "gfaydark".into();
@@ -3285,7 +3287,7 @@ mod tests {
     fn proactive_replan_arms_and_counts_toward_the_oscillation_budget() {
         use crate::nav::collision::{LocalOutcome, NoRoute};
         let group: crate::ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::GroupSnapshot::default()));
-        let mut nav = test_navigator(group);
+        let mut nav = test_action_loop(group);
 
         let nwt = |start: [f32; 3]| crate::nav::planner::LocalReply {
             gen: 1, start, goal: [start[0] + 40.0, start[1], start[2]],
@@ -3335,7 +3337,7 @@ mod tests {
         });
 
         let group: crate::ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::GroupSnapshot::default()));
-        let nav = test_navigator(group.clone());
+        let nav = test_action_loop(group.clone());
         nav.sync_group(&gs);
 
         let snap = group.lock().unwrap();

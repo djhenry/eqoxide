@@ -9,7 +9,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{Duration, sleep};
 
 use crate::eq_net::login::WorldCredentials;
-use crate::eq_net::navigation::Navigator;
+use crate::eq_net::action_loop::ActionLoop;
 use crate::eq_net::packet_handler::apply_packet;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
@@ -122,7 +122,7 @@ pub async fn run_gameplay_phase(
     net_rx_init:   UnboundedReceiver<AppPacket>,
     mut gs:        GameState,
     char_name:     String,
-    mut navigator: Navigator,
+    mut action_loop: ActionLoop,
     world_creds:   WorldCredentials,
     shutdown:      Arc<AtomicBool>,
     camp:          crate::ipc::CampReq,
@@ -213,23 +213,23 @@ pub async fn run_gameplay_phase(
             }
             apply_packet(&mut gs, &packet);
             record_app_packet(&mut net_health.lock().unwrap(), std::time::Instant::now());
-            navigator.sync_entities(&gs);
-            navigator.sync_zone_points(&gs);
-            navigator.sync_tasks(&gs);
-            navigator.sync_group(&gs);
-            navigator.sync_guild(&gs);
-            navigator.sync_inventory(&gs);
-            navigator.sync_merchant(&gs);
-            navigator.sync_messages(&gs);
-            navigator.sync_doors(&gs);
+            action_loop.sync_entities(&gs);
+            action_loop.sync_zone_points(&gs);
+            action_loop.sync_tasks(&gs);
+            action_loop.sync_group(&gs);
+            action_loop.sync_guild(&gs);
+            action_loop.sync_inventory(&gs);
+            action_loop.sync_merchant(&gs);
+            action_loop.sync_messages(&gs);
+            action_loop.sync_doors(&gs);
             // Deliver a /who all roster to the pending GET /v1/observe/who as soon as it lands (#300).
             // A friends-presence poll (OP_FriendsWho) replies on this SAME opcode, so route it to the
             // pending GET /v1/social/friends instead when a friends poll is what we just sent (#301).
             if packet.opcode == OP_WHO_ALL_RESPONSE {
-                if navigator.expecting_friends() {
-                    navigator.fulfill_friends(&gs);
+                if action_loop.expecting_friends() {
+                    action_loop.fulfill_friends(&gs);
                 } else {
-                    navigator.fulfill_who(&gs);
+                    action_loop.fulfill_who(&gs);
                 }
             }
 
@@ -461,7 +461,7 @@ pub async fn run_gameplay_phase(
                     &net_health,
                     &game_state_snapshot,
                 ).await;
-                navigator.sync_zone_points(&gs);
+                action_loop.sync_zone_points(&gs);
                 last_keepalive = std::time::Instant::now();
                 reset_probe_clocks(&net_health);
             } else {
@@ -495,7 +495,7 @@ pub async fn run_gameplay_phase(
                         &net_health,
                         &game_state_snapshot,
                     ).await;
-                    navigator.sync_zone_points(&gs);
+                    action_loop.sync_zone_points(&gs);
                     last_keepalive = std::time::Instant::now();
                     reset_probe_clocks(&net_health);
                 }
@@ -570,7 +570,7 @@ pub async fn run_gameplay_phase(
         // grace window lapses, instead of leaving the agent with no outcome at all. (#348)
         gs.resolve_pending_cast_end();
 
-        navigator.tick(s, &mut gs);
+        action_loop.tick(s, &mut gs);
 
         publish_snapshot(&gs, &game_state_snapshot, &net_health);
 
@@ -970,12 +970,12 @@ fn apply_loot_open_timeout(gs: &mut GameState, corpse_id: u32) {
 }
 
 /// Publish the network thread's `GameState` for lock-free reads by the render/HTTP threads. Called
-/// once per gameplay tick, after every mutation for that tick (packet-applied and `Navigator::tick`'s
+/// once per gameplay tick, after every mutation for that tick (packet-applied and `ActionLoop::tick`'s
 /// own writes) has landed — see the call site in `run_gameplay_phase`.
 ///
 /// Store only on a real change so the published Arc's identity is a complete activity signal: the
 /// render thread wakes on ANY network-thread mutation (inbound packet OR client-initiated request
-/// handled by `Navigator::tick`), and a genuinely idle world lets the loop sleep (see
+/// handled by `ActionLoop::tick`), and a genuinely idle world lets the loop sleep (see
 /// `App::poll_external` in app.rs, which drives its wake decision off `Arc::ptr_eq` against this
 /// snapshot).
 ///
@@ -1288,7 +1288,7 @@ mod snapshot_tests {
     }
 
     /// Counterpart: a real mutation (standing in for either an inbound packet or a client-initiated
-    /// change made by `Navigator::tick`, e.g. `gs.sitting`) DOES publish a new Arc, and the new
+    /// change made by `ActionLoop::tick`, e.g. `gs.sitting`) DOES publish a new Arc, and the new
     /// snapshot reflects it.
     #[test]
     fn publish_snapshot_publishes_new_arc_when_state_changed() {
