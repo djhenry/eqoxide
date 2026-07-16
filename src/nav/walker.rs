@@ -15,11 +15,12 @@
 //! position from `GameState` (published by `ActionLoop::stream_position`, which mirrors the
 //! controller's authoritative pose) and never writes it.
 //!
-//! The one apparent exception — a controlled fall's direct `gs.player_z` descent — deliberately
-//! stays OUTSIDE `Walker`: `drive_walk` only ever returns `Some(land_z)` to ASK `ActionLoop` to
-//! begin one (see its doc comment); `ActionLoop::drive_controlled_fall` (unmoved) is the thing
-//! that actually steps `gs.player_z` and sends the fall's position packets, exactly as before this
-//! extraction. `Walker` itself never touches `gs.player_*`, `EqStream`, or the controller.
+//! There is no longer any position exception: §442 (#442) retired the controlled-fall handoff (the
+//! old un-collided `gs.player_z` descent). A big drop is no longer special — `drive_walk` just keeps
+//! walking toward the goal and the render controller's ONE collided gravity path descends off the
+//! edge; the landing damage is applied driver-agnostically in `ActionLoop::stream_position` from the
+//! controller's own tracked airborne height. `Walker` never touches `gs.player_*`, `EqStream`, or
+//! the controller — it writes only the per-frame `nav_intent`.
 
 use crate::coord::eq_heading;
 use crate::eq_net::protocol::fall_damage;
@@ -503,14 +504,13 @@ impl Walker {
     /// and drives arrival/stall/fall-edge handling. This is the tail of the old `tick()` — every
     /// early return here is a return from the tick, exactly as before the split.
     ///
-    /// Returns `Some(land_z)` to ask `ActionLoop` to begin a controlled fall to `land_z` — see the
-    /// module doc's "intent-only movement boundary": that is the ONE place this method used to
-    /// write `gs.player_z` directly, and doing so from here would drive position outside the
-    /// intent slot. `ActionLoop::tick` turns this into `self.falling = Some(land_z)` (a field that
-    /// deliberately stayed on `ActionLoop`, since `drive_controlled_fall` — which owns the rest of
-    /// that state machine — was not part of this extraction's method list). Every other exit is
-    /// `None`.
-    pub(crate) fn drive_walk(&mut self, gs: &mut GameState, goal: (f32, f32, f32)) -> Option<f32> {
+    /// Writes ONLY the per-frame `nav_intent` (the intent-only movement boundary — see the module
+    /// doc). A big single-step drop is no longer special-cased: §442 (#442) retired the controlled-
+    /// fall handoff, so the walker just keeps walking toward the goal and the render controller's ONE
+    /// collided gravity path descends off the edge; the landing damage is applied driver-agnostically
+    /// in `ActionLoop::stream_position`. The only thing this method still does about big drops is the
+    /// pre-emptive lethal-fall SAFETY guard (don't walk off a ledge a fall from which would kill us).
+    pub(crate) fn drive_walk(&mut self, gs: &mut GameState, goal: (f32, f32, f32)) {
         if self.replan_cooldown > 0 { self.replan_cooldown -= 1; }
         let is_chase = self.nav.goto_entity.lock().unwrap().is_some();
         let in_flight = self.planner.in_flight_goal().map(|g| (g[0], g[1], g[2]));
@@ -573,7 +573,7 @@ impl Walker {
         }
 
         if let Some(reply) = self.planner.poll() {
-            if self.apply_plan(reply, gs, goal) { return None; }
+            if self.apply_plan(reply, gs, goal) { return; }
         }
 
         if self.planner.is_dead() {
@@ -581,12 +581,12 @@ impl Walker {
                 "The pathfinding worker thread has DIED — no route to ({:.0},{:.0}) or anywhere else can be \
                  planned for the rest of this session. This is a client fault, not an unreachable goal; \
                  movement must be driven manually or the client restarted.", goal.0, goal.1));
-            return None;
+            return;
         }
 
         if self.awaiting_first_plan {
             *self.nav_intent.lock().unwrap() = None;
-            return None;
+            return;
         }
 
         // PURE-PURSUIT path following.
@@ -649,8 +649,11 @@ impl Walker {
         let dy   = target.1 - gs.player_y; // north delta (server_y)
         let dist = (dx * dx + dy * dy).sqrt();
 
-        // Controlled-fall waypoint: a big single-step drop the walker can't walk down. Ask
-        // `ActionLoop` (via the `Some(land_z)` return) to begin one — see this method's doc.
+        // Big single-step drop ahead: no longer a controlled-fall handoff (§442, #442 retired that —
+        // the render controller falls off the edge under its ONE collided gravity path). We keep only
+        // the pre-emptive lethal-fall SAFETY guard: don't walk off a ledge a fall from which would
+        // kill us. (`drop_to_target` is the waypoint-based drop, used ONLY for this stop decision —
+        // the actual fall damage is computed from the controller's own tracked airborne height.)
         const FALL_TRIGGER: f32 = 18.0; // bigger than a stair/ledge step (the walk STEP_H is 20)
         let drop_to_target = gs.player_z - target.2;
         let water_landing = self.collision.read().unwrap().as_ref()
@@ -665,10 +668,9 @@ impl Walker {
                 *self.nav.goto_target.lock().unwrap() = None;
                 *self.nav_intent.lock().unwrap() = None; // else the controller keeps walking the last
                 // wish_dir forever — drifting 1000s of units with no nav activity (eqoxide#71).
-                return None;
+                return;
             }
-            tracing::info!("NAV: stepping off a {:.0}u drop — controlled fall begins", drop_to_target);
-            return Some(target.2);
+            // Non-lethal: fall through to normal walking — the controller descends off the edge.
         }
 
         // Arrival: measure distance to the FINAL goal, not the look-ahead carrot.
@@ -683,7 +685,7 @@ impl Walker {
                 self.path_goal = None;
                 *self.nav_intent.lock().unwrap() = None; // stand still until the leader moves
                 gs.player_heading = eq_heading(gdx, gdy);
-                return None;
+                return;
             }
             ArrivalAction::Arrived => {
                 if let Some(ret) = self.escape_return.take() {
@@ -691,7 +693,7 @@ impl Walker {
                     *self.nav.goto_target.lock().unwrap() = Some(ret);
                     self.path_goal = None;
                     *self.nav_intent.lock().unwrap() = None;
-                    return None;
+                    return;
                 }
                 tracing::info!("NAV: arrived at ({:.1},{:.1})", goal.0, goal.1);
                 if self.goal_snapped {
@@ -702,7 +704,7 @@ impl Walker {
                 *self.nav.goto_target.lock().unwrap() = None;
                 *self.nav_intent.lock().unwrap() = None; // stop driving the controller
                 gs.player_heading = eq_heading(gdx, gdy);
-                return None;
+                return;
             }
             ArrivalAction::Drive => {} // not there yet — keep walking / re-plan below
         }
@@ -723,7 +725,7 @@ impl Walker {
                  the character's collision radius from this approach — a coarse route to the goal exists, \
                  but the walker cannot follow it around this corner. Approach from another direction.",
                 gs.player_x, gs.player_y, self.proactive_replans));
-            return None;
+            return;
         }
 
         // Active downhill back-off (eqoxide#212).
@@ -757,7 +759,7 @@ impl Walker {
                     tracing::warn!("NAV: backed off downhill — posted re-plan #{gen} (attempt {})", self.nav_repaths);
                 }
             }
-            return None;
+            return;
         }
 
         // Progress-based stall detection.
@@ -775,7 +777,7 @@ impl Walker {
                         self.backoff_dir = if dist > 1e-3 { [-dx / dist, -dy / dist] } else { [0.0, 0.0] };
                         tracing::warn!("NAV: no progress near ({:.1},{:.1}) — backing off downhill (attempt {})",
                             gs.player_x, gs.player_y, self.nav_repaths);
-                        return None;
+                        return;
                     }
                     if self.local_says_no_way_through() {
                         self.stop_nav(gs, "blocked", "local_no_way_through", &format!(
@@ -792,7 +794,7 @@ impl Walker {
                              IS reachable; this is a collision/steering wedge, not a routing failure.)",
                             gs.player_x, gs.player_y, self.nav_repaths));
                     }
-                    return None;
+                    return;
                 }
             }
         }
@@ -830,6 +832,5 @@ impl Walker {
             climb:       0.0, // nav uses the native step-up now (#239); fences handled by hop
             hop:         self.stuck_ticks >= NAV_HOP_TICKS,
         });
-        None
     }
 }

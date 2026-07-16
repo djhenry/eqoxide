@@ -1236,10 +1236,16 @@ impl App {
             // corrects. Gating on `camera_initialized` lets the camera-init block do the first publish
             // with the real spawn position instead (#133).
             if self.camera_initialized {
+                // Take the controller's one-shot landed-fall height (if it landed this frame) and
+                // LATCH it into the view, so a single-frame pulse survives until the nav thread —
+                // which ticks on its own cadence — take-and-clears it exactly once (§442, #442).
+                // Only overwrite on a fresh landing; otherwise leave any not-yet-consumed value.
+                let landed = self.controller.take_landed_fall_height();
                 if let Ok(mut v) = self.controller_view.lock() {
                     v.pos = cpos;
                     v.heading = self.heading_target;
                     v.moving = intent.wish_dir[0] != 0.0 || intent.wish_dir[1] != 0.0 || !self.on_ground;
+                    if let Some(h) = landed { v.landed_fall_height = Some(h); }
                     v.initialized = true;
                 }
             }

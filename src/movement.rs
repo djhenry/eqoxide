@@ -127,6 +127,11 @@ pub struct ControllerView {
     /// False until the render thread has spawned and seeded the controller. The nav streamer must
     /// not mirror/stream a default (origin) position before this is set.
     pub initialized: bool,
+    /// One-shot fall height (feet dropped) latched by the render thread the frame the controller
+    /// LANDS from an airborne stretch, for the nav thread to apply driver-agnostic fall damage (§442,
+    /// #442). `None` except right after a landing; the nav streamer take-and-clears it exactly once.
+    /// Respects the init gate — default `None`, only ever set after `initialized`.
+    pub landed_fall_height: Option<f32>,
 }
 
 /// Sole owner of the local player's physical state. Position is `[east, north, z]` (server coords,
@@ -148,6 +153,15 @@ pub struct CharacterController {
     /// the zone's -189 underworld) instead recovers to the last good grounded position, so the
     /// server never sees a below-world position and doesn't ZoneToBindPoint + CLE-drop us (#150).
     underworld:    f32,
+    /// Airborne-height tracking for the driver-agnostic fall-damage signal (§442, #442). `airborne_start_z`
+    /// is the feet Z captured the frame `on_ground` goes true→false (a genuine airborne stretch
+    /// begins); it is `None` while grounded and is CLEARED by `teleport` and by the depenetration net
+    /// / underworld recovery, so neither a server correction nor a mid-fall push-out is misread as a
+    /// fall. On the landing frame (`on_ground` false→true via the gravity path) `landed_fall_height`
+    /// latches `Some(start − landing_z)` — a one-shot the nav thread take-and-clears once to apply
+    /// fall damage. Height ALWAYS comes from this tracked airborne start, never a nav waypoint z.
+    airborne_start_z:   Option<f32>,
+    landed_fall_height: Option<f32>,
 }
 
 #[inline]
@@ -157,7 +171,16 @@ impl CharacterController {
     pub fn new(pos: [f32; 3]) -> Self {
         Self { pos, vel_z: 0.0, on_ground: false, in_water: false,
                good: std::collections::VecDeque::new(), good_timer: 0.0, stuck_time: 0.0,
-               hop_cooldown: 0.0, underworld: f32::NEG_INFINITY }
+               hop_cooldown: 0.0, underworld: f32::NEG_INFINITY,
+               airborne_start_z: None, landed_fall_height: None }
+    }
+
+    /// Take-and-clear the one-shot fall height (feet dropped during the airborne stretch just
+    /// landed). Driver-agnostic (§442, #442): the nav thread reads this each tick and applies fall
+    /// damage — WASD and nav alike. Edge-triggered and consumed exactly once; `None` on every frame
+    /// except the one right after a genuine landing (never after a teleport / depenetration recovery).
+    pub fn take_landed_fall_height(&mut self) -> Option<f32> {
+        self.landed_fall_height.take()
     }
 
     /// Set the zone underworld floor (from `GameState::zone_underworld`); `None` disables the clamp.
@@ -172,6 +195,11 @@ impl CharacterController {
         self.vel_z = 0.0;
         self.on_ground = false;
         self.stuck_time = 0.0;
+        // A teleport / large server correction is a position discontinuity, NOT a fall: drop any
+        // airborne tracking and any not-yet-consumed landing so a correction is never misread as a
+        // fall landing (§442 hazard 2b — `app.rs` calls this from the `pos_correction` handler).
+        self.airborne_start_z = None;
+        self.landed_fall_height = None;
     }
 
     /// Advance one frame. Returns the new authoritative position.
@@ -325,13 +353,19 @@ impl CharacterController {
             if intent.jump && self.on_ground {
                 self.vel_z = JUMP_VELOCITY;
                 self.on_ground = false;
+                self.airborne_start_z = Some(self.pos[2]); // §442: a jump begins an airborne stretch
             }
             let foot = self.pos[2];
             let floor = col.ground_below(self.pos[0], self.pos[1], foot + GROUND_ORIGIN, GROUND_DEPTH);
             if self.on_ground {
                 match floor {
                     Some(f) if (f - foot).abs() <= GROUND_SNAP_TOL || f > foot => self.pos[2] = f,
-                    _ => self.on_ground = false, // floor dropped away / vanished → start falling
+                    _ => {
+                        // Floor dropped away / vanished → a genuine airborne stretch begins. Record
+                        // where we left the ground so the landing can report the fall height (§442).
+                        self.on_ground = false;
+                        self.airborne_start_z = Some(self.pos[2]);
+                    }
                 }
             }
             if !self.on_ground {
@@ -344,13 +378,22 @@ impl CharacterController {
                 // just stop sinking (hold above underworld) and let a server correction sort it. (#150)
                 let landing_valid = |f: f32| cand <= f && f > self.underworld;
                 match floor {
-                    Some(f) if landing_valid(f) => { self.pos[2] = f; self.vel_z = 0.0; self.on_ground = true; }
+                    Some(f) if landing_valid(f) => {
+                        self.pos[2] = f; self.vel_z = 0.0; self.on_ground = true;
+                        // §442: a genuine landing. If we tracked an airborne start (i.e. it was not
+                        // cleared by a teleport / depenetration / underworld recovery), latch a
+                        // one-shot fall height for the nav thread to apply driver-agnostic damage.
+                        if let Some(start) = self.airborne_start_z.take() {
+                            self.landed_fall_height = Some((start - f).max(0.0));
+                        }
+                    }
                     _ if cand <= self.underworld => {
                         match self.good.back() {
                             Some(&g) => { self.pos = g; self.on_ground = true; }
                             None => {} // hold current pos; don't sink below underworld
                         }
                         self.vel_z = 0.0;
+                        self.airborne_start_z = None; // underworld recovery is not a fall landing (§442)
                         tracing::info!("fall-through guard: blocked descent below underworld {:.1} → {:?}",
                                        self.underworld, self.pos);
                     }
@@ -510,6 +553,7 @@ impl CharacterController {
                     self.vel_z = 0.0;
                     self.on_ground = true;
                     self.stuck_time = 0.0;
+                    self.airborne_start_z = None; // push-out recovery, not a fall landing (§442 hazard 2a)
                     tracing::debug!("depenetrate: pushed out from ({:.1},{:.1}) to ({:.1},{:.1},{:.1})",
                         p[0], p[1], e, n, f);
                     return true;
@@ -525,6 +569,7 @@ impl CharacterController {
                 self.vel_z = 0.0;
                 self.on_ground = true;
                 self.stuck_time = 0.0;
+                self.airborne_start_z = None; // last-good recovery, not a fall landing (§442 hazard 2a)
             }
         }
         true
@@ -945,5 +990,80 @@ mod tests {
         for _ in 0..40 { ctrl.step(walk(0.0, [0.0, 0.0]), 0.1, &c); }
         assert!((ctrl.pos[2] - (-50.0)).abs() < 0.5, "falls to and lands on the real floor at -50: {}", ctrl.pos[2]);
         assert!(ctrl.on_ground);
+    }
+
+    /// §442 (#442) — the unified controlled fall is COLLIDED. A fall onto a floor with an intervening
+    /// SOLID floor in between must STOP on the solid, not pass through to the floor below: the descent
+    /// consults `ground_below` every frame (the ONE collided `step`), it is not a raw `gs.player_z`
+    /// write like the retired nav big-drop path. Mirrors `p3_collided_swim_does_not_embed_under_a_flush_ceiling`.
+    ///
+    /// MUTATION-CHECK: temporarily replacing the landing arm in `step`'s gravity block with a raw,
+    /// un-collided descent (always `self.pos[2] = cand`, ignoring `floor`) drops the character
+    /// straight through z=20 to the bottom (and, with no underworld set, keeps sinking) — this test
+    /// then goes RED. Restore the collided landing arm to make it green again.
+    #[test]
+    fn controlled_fall_collides_with_intervening_geometry() {
+        // A high start, a SOLID intervening floor at z=20, and the real floor at z=0 below it.
+        let c = col(vec![floor(0.0, -100.0, 100.0), floor(20.0, -100.0, 100.0)]);
+        let mut ctrl = CharacterController::new([0.0, 0.0, 50.0]);
+        ctrl.on_ground = false; // airborne, about to fall
+        for _ in 0..300 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 60.0, &c); }
+        assert!((ctrl.pos[2] - 20.0).abs() < 0.5,
+            "collided fall must land ON the intervening solid at z=20, not pass through it, got {}", ctrl.pos[2]);
+        assert!(ctrl.pos[2] > 15.0, "must NOT have fallen through to the bottom floor at z=0: {}", ctrl.pos[2]);
+        assert!(ctrl.on_ground, "must be grounded after landing on the solid");
+    }
+
+    /// §442 (#442) — the fall-damage signal is driver-agnostic, edge-triggered, and consumed once.
+    /// A genuine airborne stretch (floor drops away → fall → land) latches ONE `landed_fall_height`
+    /// equal to the drop the controller ITSELF tracked (airborne start − landing z), not a waypoint z.
+    #[test]
+    fn fall_damage_signal_fires_once_from_airborne_height() {
+        // Only a floor at z=0; the controller claims grounded 30u above it, so frame 1 sees the floor
+        // drop away (a genuine true→false transition) and records the airborne start at z=30.
+        let c = col(vec![floor(0.0, -100.0, 100.0)]);
+        let mut ctrl = CharacterController::new([0.0, 0.0, 30.0]);
+        ctrl.on_ground = true;
+        for _ in 0..300 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 60.0, &c); }
+        assert!(ctrl.on_ground && ctrl.pos[2].abs() < 0.5, "should have landed on the z=0 floor: {:?}", ctrl.pos);
+        let h = ctrl.take_landed_fall_height();
+        assert!(h.is_some_and(|h| (h - 30.0).abs() < 1.0),
+            "landed-fall-height must equal the tracked airborne drop (~30), got {h:?}");
+        // Edge-triggered + consumed once: a second take yields nothing.
+        assert!(ctrl.take_landed_fall_height().is_none(), "the fall signal must fire exactly once");
+    }
+
+    /// §442 (#442) hazard 2b — a teleport / server correction MID-FALL must NOT be misread as a fall
+    /// landing: `teleport` clears the airborne tracking, so the settle onto the floor emits nothing.
+    #[test]
+    fn teleport_mid_fall_emits_no_fall_damage() {
+        let c = col(vec![floor(0.0, -100.0, 100.0)]);
+        let mut ctrl = CharacterController::new([0.0, 0.0, 30.0]);
+        ctrl.on_ground = true;
+        for _ in 0..15 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 60.0, &c); } // begin falling
+        assert!(!ctrl.on_ground, "should be airborne after the floor dropped away");
+        ctrl.teleport([0.0, 0.0, 0.0]); // server correction snaps us onto the floor
+        for _ in 0..120 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 60.0, &c); }
+        assert!(ctrl.on_ground, "settled on the floor after the teleport");
+        assert!(ctrl.take_landed_fall_height().is_none(),
+            "a teleport/server correction must suppress the fall-damage signal");
+    }
+
+    /// §442 (#442) hazard 2a — a mid-fall depenetration / ground-snap grounding (the anti-embed net
+    /// flicking `on_ground` true) is a RECOVERY, not a genuine landing: it must emit no (spurious,
+    /// partial-height) fall damage. The net clears the airborne tracking and never latches a height.
+    #[test]
+    fn depenetration_recovery_mid_fall_emits_no_fall_damage() {
+        // Floor everywhere plus two close walls boxing the origin (footprint pierced → embedded),
+        // as in `depenetrates_embedded_point_to_clear_floor`.
+        let c = col(vec![floor(0.0, -100.0, 100.0), wall(0.8, 0.0, 10.0), wall(-0.8, 0.0, 10.0)]);
+        let mut ctrl = CharacterController::new([0.0, 0.0, 0.0]);
+        ctrl.on_ground = false;
+        ctrl.airborne_start_z = Some(50.0); // pretend we are mid-fall from z=50
+        ctrl.step(walk(0.0, [0.0, 0.0]), 0.05, &c);
+        assert!(ctrl.on_ground, "the depenetration net should have grounded us");
+        assert!(ctrl.take_landed_fall_height().is_none(),
+            "a depenetration/ground-snap grounding mid-fall must NOT emit fall damage");
+        assert!(ctrl.airborne_start_z.is_none(), "the net must clear the stale airborne start");
     }
 }
