@@ -449,7 +449,7 @@ pub struct LocalReply {
 /// # The contract that makes this safe
 ///
 /// **The walker never waits on this.** There is no `awaiting_first_local_plan`, and there is
-/// deliberately no way to add one: the steering aim is chosen by `navigation::steer_target`, a TOTAL
+/// deliberately no way to add one: the steering aim is chosen by `crate::nav::steering::steer_target`, a TOTAL
 /// pure function of (coarse route, whatever the fine tier last produced). Every state this planner
 /// can be in — never asked, in flight, dead, answered with nothing — is just "the fine path is
 /// empty", and an empty fine path steers on the coarse carrot. A stall here would be worse than the
@@ -499,7 +499,7 @@ impl LocalPlanner {
     ///
     /// So the "is one in flight?" question is not askable from outside. Posting is idempotent (a second
     /// post while one is in flight is a no-op), and there is nothing to wait on because there is nothing
-    /// to ask. Callers get an aim from `navigation::steer_target`, which is total.
+    /// to ask. Callers get an aim from `crate::nav::steering::steer_target`, which is total.
     pub fn post_if_idle(&mut self, mut req: LocalRequest) -> bool {
         if self.pending.is_some() || self.dead { return false; }
         let gen = self.next_gen;
@@ -1109,6 +1109,6 @@ mod tests {
         assert!(!lp.is_planning(),
             "and it must not claim a plan is in flight: `tick` only skips POSTING while one is — if that \
              stuck true, the fine tier would never be re-posted even after a restart");
-        // The walker's aim does not depend on it at all — see `navigation::steer_target`, which is total.
+        // The walker's aim does not depend on it at all — see `crate::nav::steering::steer_target`, which is total.
     }
 }
