@@ -8,14 +8,14 @@
 use crate::scene::{Billboard, SceneState};
 use crate::ui::{theme, UiCtx};
 
-/// The nearest *living* NPC billboard. Skips level-0 placeholder spawns,
-/// corpses, and the off-map zone controller.
+/// The nearest *living* NPC billboard. Skips corpses and the off-map zone
+/// controller.
 fn nearest_living_npc(scene: &SceneState) -> Option<&Billboard> {
     let p = scene.player_pos; // [east, north, height]
     scene
         .billboards
         .iter()
-        .filter(|b| b.level > 0 && !b.dead && !b.name.contains("zone_controller"))
+        .filter(|b| !b.dead && !b.name.contains("zone_controller"))
         .map(|b| {
             let de = b.pos[0] - p[0];
             let dn = b.pos[1] - p[1];
