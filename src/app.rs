@@ -1750,7 +1750,7 @@ impl ApplicationHandler for App {
                                         // ActionLoop::tick (network thread) already polls this same
                                         // slot, sets the real target state, and it flows back via the
                                         // next GameState snapshot — no local echo needed.
-                                        *self.acts.target.lock().unwrap() = Some(id);
+                                        self.acts.command.request_target(id);
                                     }
                                     Some(PickResult::Door(door_id)) => {
                                         // Server-authoritative: only request the open; never set is_open
@@ -1805,7 +1805,7 @@ impl ApplicationHandler for App {
                                     *self.goto_target.lock().unwrap() = None;
                                 }
                                 // Self-target (native EQ F1): target your own character (#291).
-                                // Mirrors the click-to-target path — just sets the acts.target handle;
+                                // Mirrors the click-to-target path — just requests the target;
                                 // ActionLoop::tick (network thread) does the real work (OP_TargetMouse +
                                 // OP_Consider) and the result flows back via the next GameState snapshot,
                                 // enabling self-heals/buffs, consider-on-self, and (server permitting)
@@ -1813,7 +1813,7 @@ impl ApplicationHandler for App {
                                 KeyCode::F1 if !event.repeat => {
                                     let me = self.game_state_view.player_id;
                                     if me != 0 {
-                                        *self.acts.target.lock().unwrap() = Some(me);
+                                        self.acts.command.request_target(me);
                                     }
                                 }
                                 KeyCode::F10 => {

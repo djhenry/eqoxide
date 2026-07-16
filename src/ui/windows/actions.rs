@@ -47,7 +47,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
         });
         let hover = if attack_on { "Auto-attack ON — click to stop" } else { "Toggle auto-attack" };
         if ui.add(atk).on_hover_text(hover).clicked() {
-            *cx.acts.attack.lock().unwrap() = Some(!attack_on);
+            cx.acts.command.request_attack(!attack_on);
         }
 
         // Sit / Stand.
@@ -67,7 +67,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
             .clicked()
         {
             if let Some((id, _)) = &nearest {
-                *cx.acts.target.lock().unwrap() = Some(*id);
+                cx.acts.command.request_target(*id);
             }
         }
 
@@ -95,7 +95,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
             .clicked()
         {
             if let Some(id) = s.target_id {
-                *cx.acts.consider.lock().unwrap() = Some(id);
+                cx.acts.command.request_consider(id);
             }
         }
 
