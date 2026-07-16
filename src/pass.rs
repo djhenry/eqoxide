@@ -869,7 +869,7 @@ pub fn encode_skinned_entity_pass(
     // shrunken-looking bodies). Distant overflow spawns fall back to their nameplate.
     let pp = scene.player_pos;
     let mut order: Vec<&crate::scene::Billboard> =
-        scene.billboards.iter().filter(|b| b.level != 0).collect();
+        scene.billboards.iter().collect();
     order.sort_by(|a, b| {
         let da = (a.pos[0]-pp[0]).powi(2) + (a.pos[1]-pp[1]).powi(2) + (a.pos[2]-pp[2]).powi(2);
         let db = (b.pos[0]-pp[0]).powi(2) + (b.pos[1]-pp[1]).powi(2) + (b.pos[2]-pp[2]).powi(2);
