@@ -96,7 +96,7 @@ fn inv_slot(ui: &mut egui::Ui, cx: &mut UiCtx, slot: i32, label: &str, item: Opt
             Some(s) if s == slot => ui.ctx().data_mut(|d| d.remove::<i32>(sel_id())),
             // Second click elsewhere → request the move, clear selection.
             Some(s) => {
-                *cx.acts.move_item.lock().unwrap() = Some((s as u32, slot as u32));
+                cx.acts.command.request_inventory_move(s as u32, slot as u32);
                 ui.ctx().data_mut(|d| d.remove::<i32>(sel_id()));
             }
             // First click → select.

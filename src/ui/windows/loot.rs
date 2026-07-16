@@ -82,7 +82,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
                     .on_hover_text(format!("{} ({dist:.0} units away)", b.name))
                     .clicked()
                 {
-                    *cx.acts.loot.lock().unwrap() = Some(b.id);
+                    cx.acts.command.request_loot(b.id);
                 }
             }
             None => {
