@@ -18,7 +18,7 @@ pub(super) fn router() -> Router<HttpState> {
 /// `guild_id` 0) means not in a guild. Each member carries online status + last-seen zone so an
 /// agent can route guild messages to who's actually present.
 async fn get_roster(State(s): State<HttpState>) -> Json<serde_json::Value> {
-    let g = s.guild.lock().unwrap();
+    let g = s.guild_slots.guild.lock().unwrap();
     let members: Vec<serde_json::Value> = g.members.iter().map(|m| serde_json::json!({
         "name":    m.name,
         "rank":    m.rank,
@@ -50,7 +50,7 @@ fn extract_name(body: Result<Json<NameBody>, axum::extract::rejection::JsonRejec
 
 /// Queue a single guild action (rejecting if one is already pending and undrained).
 fn queue(s: &HttpState, action: GuildAction) -> (StatusCode, String) {
-    let mut slot = s.guild_action.lock().unwrap();
+    let mut slot = s.guild_slots.guild_action.lock().unwrap();
     if slot.is_some() {
         return (StatusCode::CONFLICT, "a guild action is already pending".into());
     }
@@ -75,7 +75,7 @@ async fn post_invite(
 
 /// POST /v1/guild/accept — accept a pending guild invite. 400 if none is pending.
 async fn post_accept(State(s): State<HttpState>) -> (StatusCode, String) {
-    if s.guild.lock().unwrap().pending_invite.is_none() {
+    if s.guild_slots.guild.lock().unwrap().pending_invite.is_none() {
         return (StatusCode::BAD_REQUEST, "no pending guild invite".into());
     }
     queue(&s, GuildAction::Accept)
@@ -83,7 +83,7 @@ async fn post_accept(State(s): State<HttpState>) -> (StatusCode, String) {
 
 /// POST /v1/guild/leave — leave the current guild.
 async fn post_leave(State(s): State<HttpState>) -> (StatusCode, String) {
-    if s.guild.lock().unwrap().guild_id == 0 {
+    if s.guild_slots.guild.lock().unwrap().guild_id == 0 {
         return (StatusCode::BAD_REQUEST, "not in a guild".into());
     }
     queue(&s, GuildAction::Leave)

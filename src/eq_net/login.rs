@@ -20,7 +20,7 @@ use crate::eq_net::packet_handler::apply_packet;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::GameState;
-use crate::ipc::{AttackReq, BuyReq, SellReq, TradeReq, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, DialogueShared, DialogueClickReq, NavStateShared, ChatEventsShared, ChatSendShared, CastReq, MemSpellReq, SitReq, ConsiderReq, CampReq, CampUntil, RespawnReq, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, WhoReq, TaskLog, ZoneCrossReq, ZonePoints, TaskOffersShared, CompletedTasksShared, AcceptTaskReq, CancelTaskReq};
+use crate::ipc::{CampReq, CampUntil, RespawnReq};
 
 type DesCbcEnc = Encryptor<Des>;
 type DesCbcDec = Decryptor<Des>;
@@ -68,71 +68,29 @@ pub struct WorldCredentials {
 
 /// Connect, authenticate, enter zone, then run the gameplay loop.
 /// Retries up to `max_retries` times on transient failures.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_login_flow(
-    config:           LoginConfig,
-    max_retries:      u32,
-    goto_target:      GotoTarget,
-    nav_state:        NavStateShared,
-    goto_entity:      crate::ipc::GotoEntity,
-    entity_positions: EntityPositions,
-    entity_ids:       EntityIds,
-    zone_points:      ZonePoints,
-    task_log:         TaskLog,
-    task_offers_shared:    TaskOffersShared,
-    completed_tasks_shared: CompletedTasksShared,
-    accept_task:           AcceptTaskReq,
-    cancel_task:           CancelTaskReq,
-    group:             crate::ipc::GroupShared,
-    group_invite:      crate::ipc::GroupInviteReq,
-    trainer_open_req:  crate::ipc::TrainerOpenReq,
-    trainer_train_req: crate::ipc::TrainerTrainReq,
-    group_accept:      crate::ipc::GroupAcceptReq,
-    group_decline:     crate::ipc::GroupDeclineReq,
-    group_leave:       crate::ipc::GroupLeaveReq,
-    group_kick:        crate::ipc::GroupKickReq,
-    group_make_leader: crate::ipc::GroupMakeLeaderReq,
-    zone_cross:       ZoneCrossReq,
-    hail:             HailReq,
-    say:              SayReq,
-    target:           TargetReq,
-    who_req:          WhoReq,
-    friends_list:     crate::ipc::FriendsListShared,
-    friends_req:      crate::ipc::FriendsReq,
-    attack:           AttackReq,
-    buy:              BuyReq,
-    sell:             SellReq,
-    trade:            TradeReq,
-    merchant:         MerchantShared,
-    move_req:         MoveReq,
-    give:             GiveReq,
-    inventory:        InventoryShared,
-    loot:             LootReq,
-    door_click:       DoorClickReq,
-    doors_shared:     DoorsShared,
-    messages:         MessagesShared,
-    dialogue:         DialogueShared,
-    dialogue_click:   DialogueClickReq,
-    chat_events:      ChatEventsShared,
-    chat_send:        ChatSendShared,
-    cast:             CastReq,
-    mem_spell:        MemSpellReq,
-    sit:              SitReq,
-    consider:         ConsiderReq,
-    pet_cmd:          crate::ipc::PetCmdReq,
-    collision:        crate::nav::collision::SharedCollision,
-    maps_dir:         std::path::PathBuf,
-    shutdown:         Arc<AtomicBool>,
-    camp:             CampReq,
-    camp_until:       CampUntil,
-    respawn:          RespawnReq,
-    controller_view:  crate::ipc::ControllerShared,
-    nav_intent:       crate::ipc::NavIntent,
-    pos_correction:   crate::ipc::PosCorrection,
-    nav_path_view:    crate::ipc::NavPathView,
-    nav_avoid:        crate::ipc::NavAvoidShared,
-    read_book:        crate::ipc::ReadBookReq,
-    guild:            crate::ipc::GuildShared,
-    guild_action:     crate::ipc::GuildActionReq,
+    config:          LoginConfig,
+    max_retries:     u32,
+    nav:             crate::ipc::NavSlots,
+    world:           crate::ipc::WorldSlots,
+    quest:           crate::ipc::QuestSlots,
+    group_slots:     crate::ipc::GroupSlots,
+    trainer:         crate::ipc::TrainerSlots,
+    combat:          crate::ipc::CombatSlots,
+    social:          crate::ipc::SocialSlots,
+    merchant_slots:  crate::ipc::MerchantSlots,
+    inventory_slots: crate::ipc::InventorySlots,
+    interact:        crate::ipc::InteractSlots,
+    chat:            crate::ipc::ChatSlots,
+    controller:      crate::ipc::ControllerSlots,
+    guild_slots:     crate::ipc::GuildSlots,
+    collision:       crate::nav::collision::SharedCollision,
+    maps_dir:        std::path::PathBuf,
+    shutdown:        Arc<AtomicBool>,
+    camp:            CampReq,
+    camp_until:      CampUntil,
+    respawn:         RespawnReq,
     game_state_snapshot: crate::ipc::GameStateSnapshot,
     net_health:          crate::ipc::NetHealthShared,
 ) -> Result<(), String> {
@@ -149,8 +107,8 @@ pub async fn run_login_flow(
             Ok((stream, net_rx, gs, world_creds)) => {
                 // Seed /entities map with everything discovered during login.
                 {
-                    let mut map = entity_positions.lock().unwrap();
-                    let mut ids = entity_ids.lock().unwrap();
+                    let mut map = world.entity_positions.lock().unwrap();
+                    let mut ids = world.entity_ids.lock().unwrap();
                     for (&id, e) in &gs.entities {
                         map.insert(e.name.clone(), (e.x, e.y, e.z));
                         ids.insert(e.name.clone(), id);
@@ -159,11 +117,15 @@ pub async fn run_login_flow(
                 }
                 // Seed zone points (in case OP_SEND_ZONE_POINTS arrived during login phase).
                 if !gs.zone_points.is_empty() {
-                    *zone_points.lock().unwrap() = gs.zone_points.clone();
+                    *world.zone_points.lock().unwrap() = gs.zone_points.clone();
                     tracing::info!("NAV: {} zone points seeded", gs.zone_points.len());
                 }
                 let char_name = config.character_name.clone();
-                let action_loop = ActionLoop::new(goto_target, nav_state, goto_entity, entity_positions, entity_ids, zone_points, task_log, task_offers_shared, completed_tasks_shared, accept_task, cancel_task, group, group_invite, trainer_open_req, trainer_train_req, group_accept, group_decline, group_leave, group_kick, group_make_leader, zone_cross, hail, say, target, who_req, friends_list, friends_req, attack, buy, sell, trade, merchant, move_req, give, inventory, loot, door_click, doors_shared, messages, dialogue, dialogue_click, chat_events, chat_send, cast, mem_spell, sit, consider, pet_cmd, collision, maps_dir, camp.clone(), controller_view, nav_intent, pos_correction, nav_path_view, nav_avoid, read_book.clone(), guild.clone(), guild_action.clone());
+                let action_loop = ActionLoop::new(
+                    nav, world, quest, group_slots, trainer, combat, social,
+                    merchant_slots, inventory_slots, interact, chat, controller, guild_slots,
+                    collision, maps_dir, camp.clone(),
+                );
                 run_gameplay_phase(stream, net_rx, gs, char_name, action_loop, world_creds, shutdown.clone(), camp.clone(), camp_until.clone(), respawn.clone(), game_state_snapshot, net_health).await;
                 return Ok(());
             }
