@@ -611,6 +611,196 @@ pub type DoorsShared = Arc<Mutex<Vec<DoorView>>>;
 #[allow(dead_code)]
 pub type ZoneInfo = Arc<Mutex<(String, u16)>>;
 
+// ── Domain slot bundles (M4) ────────────────────────────────────────────────────────────────
+//
+// Everything above this line is an individual slot alias/type. `ActionLoop` (the network/nav
+// thread's per-tick state, `eq_net::action_loop`) and `HttpState` (the HTTP API's per-request
+// state, `http::mod`) each used to hold ~50–60 of these as flat, individually-named fields —
+// duplicated field lists in two structs, two constructors, and two hand-written test builders,
+// with no structure connecting e.g. `attack`/`cast`/`target` as "the combat slots" beyond
+// eyeballing the source.
+//
+// These bundles regroup the same fields BY DOMAIN, one struct per HTTP API group
+// (`/v1/combat`, `/v1/merchant`, `/v1/group`, …) — the router nesting in `http::mod::
+// spawn_camera_server` is the authoritative domain boundary these mirror, since that's already
+// the seam a future shared "controller verb" (one call both a UI click-handler and an agent HTTP
+// handler go through, instead of each independently poking a slot) would need to land on. This
+// is PURE REGROUPING: every field keeps its original name and `Arc`-sharing semantics unchanged
+// — only its home moved from `ActionLoop`/`HttpState` directly to one of these, embedded by
+// whichever of the two structs actually reads it. See `ActionLoop::new` and
+// `http::mod::spawn_camera_server`/`HttpState` for how a bundle is constructed exactly ONCE and
+// then `.clone()`d (a shallow `Arc`-handle clone, not a fresh channel) into each consumer that
+// needs it — never `Default`-constructed twice, which would silently sever the channel.
+//
+// A `TODO(MVC)` marker sits at a handful of representative drain sites in `action_loop.rs` for
+// where that future controller-verb unification would land; these bundles are the plumbing for
+// it, not the verbs themselves (out of scope here — this is a behavior-preserving refactor).
+
+/// `/v1/combat/*`: targeting, auto-attack, consider, spell scribe/memorize/cast, and the one
+/// `/v1/pet/command` slot (small enough on its own that a dedicated `PetSlots` would just be
+/// noise — it rides along with the other "act on a target" verbs).
+#[derive(Clone, Default)]
+pub struct CombatSlots {
+    pub attack:   AttackReq,
+    pub cast:     CastReq,
+    pub mem_spell: MemSpellReq,
+    pub consider: ConsiderReq,
+    pub target:   TargetReq,
+    pub pet_cmd:  crate::ipc::PetCmdReq,
+}
+
+/// `/v1/merchant/*`: open/close a vendor window, list wares, buy, sell.
+#[derive(Clone, Default)]
+pub struct MerchantSlots {
+    pub merchant: MerchantShared,
+    pub buy:      BuyReq,
+    pub sell:     SellReq,
+    pub trade:    TradeReq,
+}
+
+/// `/v1/inventory/*`: the live snapshot plus the one move/equip/unequip request slot.
+#[derive(Clone, Default)]
+pub struct InventorySlots {
+    pub inventory: InventoryShared,
+    pub move_req:  MoveReq,
+}
+
+/// `/v1/interact/*`: NPC/world interaction — hail, say, loot, give (turn-in), doors, sit/stand,
+/// dialogue clicks, and reading a book/note. Mirrors `http::interact`'s own module doc verbatim
+/// ("NPC/world interaction: hail, say, loot, give (turn-in), doors, sit/stand") — that file is
+/// the domain boundary this bundle reifies, including `doors_shared` (the read-side twin of
+/// `door_click`, published for GET /v1/observe/doors but conceptually the same door verb).
+#[derive(Clone, Default)]
+pub struct InteractSlots {
+    pub hail:           HailReq,
+    pub say:            SayReq,
+    pub loot:           LootReq,
+    pub give:           GiveReq,
+    pub door_click:     DoorClickReq,
+    pub doors_shared:   DoorsShared,
+    pub sit:            SitReq,
+    pub dialogue:       DialogueShared,
+    pub dialogue_click: DialogueClickReq,
+    pub read_book:      ReadBookReq,
+}
+
+/// `/v1/quests/*`: the native Task-system log/offers/history plus accept/cancel requests.
+#[derive(Clone, Default)]
+pub struct QuestSlots {
+    pub task_log:               TaskLog,
+    pub task_offers_shared:     TaskOffersShared,
+    pub completed_tasks_shared: CompletedTasksShared,
+    pub accept_task:            AcceptTaskReq,
+    pub cancel_task:             CancelTaskReq,
+}
+
+/// `/v1/group/*`: roster + invite/accept/decline/leave/kick/transfer-leadership.
+#[derive(Clone, Default)]
+pub struct GroupSlots {
+    pub group:             GroupShared,
+    pub group_invite:      GroupInviteReq,
+    pub group_accept:      GroupAcceptReq,
+    pub group_decline:     GroupDeclineReq,
+    pub group_leave:       GroupLeaveReq,
+    pub group_kick:        GroupKickReq,
+    pub group_make_leader: GroupMakeLeaderReq,
+}
+
+/// `/v1/guild/*`: roster + identity snapshot plus the one queued guild action.
+#[derive(Clone, Default)]
+pub struct GuildSlots {
+    pub guild:        GuildShared,
+    pub guild_action: GuildActionReq,
+}
+
+/// `/v1/trainer/*`: open a trainer window, train a skill.
+#[derive(Clone, Default)]
+pub struct TrainerSlots {
+    pub trainer_open_req:  TrainerOpenReq,
+    pub trainer_train_req: TrainerTrainReq,
+}
+
+/// `/v1/social/*`: the client-local friends list plus the `/who` and friends-presence polls.
+#[derive(Clone, Default)]
+pub struct SocialSlots {
+    pub who_req:      WhoReq,
+    pub friends_list: FriendsListShared,
+    pub friends_req:  FriendsReq,
+}
+
+/// The outgoing/async text feeds: `/v1/chat/*` (outgoing), `/v1/events/*` (async feed), and the
+/// machine-readable NPC/system message log surfaced at `/v1/observe/messages`. Grouped together
+/// (rather than splitting `messages` into its own bundle or into `InteractSlots`) because all
+/// three are "a queue/log of text the nav thread produces or consumes", read by adjacent handlers
+/// in practice (an agent polling `/events` is usually also reading `/observe/messages`).
+#[derive(Clone, Default)]
+pub struct ChatSlots {
+    pub chat_events: ChatEventsShared,
+    pub chat_send:   ChatSendShared,
+    pub messages:    MessagesShared,
+}
+
+/// `/v1/move/*`: the `/goto` target (+ chase-entity), zone-crossing, aggro-avoidance knobs, live
+/// nav status, and the walker's draw-only path mirror. Does NOT include the manual-move/jump
+/// escape hatch (`ManualMoveReq`) — that slot is consumed by the RENDER thread, not the nav
+/// thread/`ActionLoop` (see `CameraSlots`), so folding it in here would make `ActionLoop` carry a
+/// field it can never read.
+#[derive(Clone, Default)]
+pub struct NavSlots {
+    pub goto_target:   GotoTarget,
+    pub goto_entity:   GotoEntity,
+    pub zone_cross:    ZoneCrossReq,
+    pub nav_avoid:     NavAvoidShared,
+    pub nav_state:     NavStateShared,
+    pub nav_path_view: NavPathView,
+}
+
+/// The live entity registry (`login.rs` writes it as spawn packets arrive): name → position/id,
+/// plus the zone's exit points. Read by nearly every domain to resolve a name/target to a spawn
+/// id (merchant buy/sell, combat target, trainer open, `/goto` by name, …) — it is genuinely a
+/// shared world index, not particular to navigation, even though nav is its biggest reader.
+#[derive(Clone, Default)]
+pub struct WorldSlots {
+    pub entity_positions: EntityPositions,
+    pub entity_ids:       EntityIds,
+    pub zone_points:      ZonePoints,
+}
+
+/// Single-authority controller integration (design §2): the render thread's authoritative
+/// position snapshot streamed to the server, the `/goto` planner's per-frame movement intent, and
+/// a server correction handed back to the controller. `ActionLoop`-only — `HttpState` has no
+/// controller-facing endpoint today, so there is nothing for it to embed here.
+#[derive(Clone, Default)]
+pub struct ControllerSlots {
+    pub controller_view: ControllerShared,
+    pub nav_intent:      NavIntent,
+    pub pos_correction:  PosCorrection,
+}
+
+/// `/v1/lifecycle/*`: camp (+ its published deadline) and respawn. `HttpState`-only: `ActionLoop`
+/// only ever WRITES `camp` (never reads `camp_until`/`respawn`, which the separate gameplay-tick
+/// gets directly — see `eq_net::gameplay::run_gameplay_phase`), so it keeps a lone `camp` field
+/// rather than embedding this whole bundle for one field it partially uses.
+#[derive(Clone, Default)]
+pub struct LifecycleSlots {
+    pub camp:       CampReq,
+    pub camp_until: CampUntil,
+    pub respawn:    RespawnReq,
+}
+
+/// What HTTP hands straight to the RENDER thread, bypassing the nav thread entirely:
+/// `/v1/camera/*` (cmd + published snapshot), `GET /v1/observe/frame` (frame-capture request),
+/// and the manual-move/jump escape hatch consumed by the controller alongside WASD. `HttpState`-
+/// only; no `Default` (the camera snapshot's initial value is meaningful — see `App::new`/
+/// `main.rs` — so callers construct this explicitly rather than risk a silently-wrong default).
+#[derive(Clone)]
+pub struct CameraSlots {
+    pub cmd_tx:      Arc<Mutex<Option<crate::camera_state::CameraCmd>>>,
+    pub snapshot:    Arc<Mutex<crate::camera_state::CameraSnapshot>>,
+    pub frame_req:   FrameReq,
+    pub manual_move: ManualMoveReq,
+}
+
 /// #371: the active-liveness-probe state machine, tested as a pure function. These are the exact
 /// distinctions the issue turns on — a wedged-but-ACKing world vs a genuinely idle one — proved
 /// without a socket. The `secs`/`ms` helpers keep the age arithmetic readable.

@@ -18,7 +18,7 @@ pub(super) fn router() -> Router<HttpState> {
 /// GET /v1/group/roster — current group roster, leader, and any pending invite. Empty
 /// `members` means not currently grouped.
 async fn get_roster(State(s): State<HttpState>) -> Json<serde_json::Value> {
-    let g = s.group.lock().unwrap();
+    let g = s.group_slots.group.lock().unwrap();
     Json(serde_json::json!({
         "leader": g.leader,
         "pending_invite": g.pending_invite,
@@ -44,17 +44,17 @@ async fn post_invite(
     body: Result<Json<NameBody>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, String) {
     let name = match extract_name(body) { Ok(n) => n, Err(e) => return e };
-    *s.group_invite.lock().unwrap() = Some(name.clone());
+    *s.group_slots.group_invite.lock().unwrap() = Some(name.clone());
     tracing::info!("group: queued invite to {name}");
     (StatusCode::OK, format!("inviting {name}"))
 }
 
 /// POST /v1/group/accept — accept the current pending invite. 400 if there is none.
 async fn post_accept(State(s): State<HttpState>) -> (StatusCode, String) {
-    if s.group.lock().unwrap().pending_invite.is_none() {
+    if s.group_slots.group.lock().unwrap().pending_invite.is_none() {
         return (StatusCode::BAD_REQUEST, "no pending invite".into());
     }
-    *s.group_accept.lock().unwrap() = Some(());
+    *s.group_slots.group_accept.lock().unwrap() = Some(());
     tracing::info!("group: queued accept");
     (StatusCode::OK, "accepting invite".into())
 }
@@ -62,10 +62,10 @@ async fn post_accept(State(s): State<HttpState>) -> (StatusCode, String) {
 /// POST /v1/group/decline — decline the current pending invite (sends a defensive
 /// OP_GroupDisband cleanup — RoF2 has no working OP_GroupCancelInvite). 400 if there is none.
 async fn post_decline(State(s): State<HttpState>) -> (StatusCode, String) {
-    if s.group.lock().unwrap().pending_invite.is_none() {
+    if s.group_slots.group.lock().unwrap().pending_invite.is_none() {
         return (StatusCode::BAD_REQUEST, "no pending invite".into());
     }
-    *s.group_decline.lock().unwrap() = Some(());
+    *s.group_slots.group_decline.lock().unwrap() = Some(());
     tracing::info!("group: queued decline");
     (StatusCode::OK, "declining invite".into())
 }
@@ -73,10 +73,10 @@ async fn post_decline(State(s): State<HttpState>) -> (StatusCode, String) {
 /// POST /v1/group/leave — leave the current group. If leader with < 3 total members, this fully
 /// disbands the group (confirmed EQEmu server behavior — no auto handoff). 400 if not grouped.
 async fn post_leave(State(s): State<HttpState>) -> (StatusCode, String) {
-    if s.group.lock().unwrap().members.is_empty() {
+    if s.group_slots.group.lock().unwrap().members.is_empty() {
         return (StatusCode::BAD_REQUEST, "not in a group".into());
     }
-    *s.group_leave.lock().unwrap() = Some(());
+    *s.group_slots.group_leave.lock().unwrap() = Some(());
     tracing::info!("group: queued leave");
     (StatusCode::OK, "leaving group".into())
 }
@@ -88,7 +88,7 @@ async fn post_kick(
     body: Result<Json<NameBody>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, String) {
     let name = match extract_name(body) { Ok(n) => n, Err(e) => return e };
-    let g = s.group.lock().unwrap();
+    let g = s.group_slots.group.lock().unwrap();
     if !g.you_are_leader {
         return (StatusCode::BAD_REQUEST, "only the group leader can kick".into());
     }
@@ -96,7 +96,7 @@ async fn post_kick(
         return (StatusCode::BAD_REQUEST, format!("{name} is not a current group member"));
     }
     drop(g);
-    *s.group_kick.lock().unwrap() = Some(name.clone());
+    *s.group_slots.group_kick.lock().unwrap() = Some(name.clone());
     tracing::info!("group: queued kick of {name}");
     (StatusCode::OK, format!("kicking {name}"))
 }
@@ -108,7 +108,7 @@ async fn post_makeleader(
     body: Result<Json<NameBody>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, String) {
     let name = match extract_name(body) { Ok(n) => n, Err(e) => return e };
-    let g = s.group.lock().unwrap();
+    let g = s.group_slots.group.lock().unwrap();
     if !g.you_are_leader {
         return (StatusCode::BAD_REQUEST, "only the group leader can transfer leadership".into());
     }
@@ -116,7 +116,7 @@ async fn post_makeleader(
         return (StatusCode::BAD_REQUEST, format!("{name} is not a current group member"));
     }
     drop(g);
-    *s.group_make_leader.lock().unwrap() = Some(name.clone());
+    *s.group_slots.group_make_leader.lock().unwrap() = Some(name.clone());
     tracing::info!("group: queued makeleader {name}");
     (StatusCode::OK, format!("transferring leadership to {name}"))
 }
@@ -157,7 +157,7 @@ mod tests {
     #[tokio::test]
     async fn invite_with_name_is_200_and_queues_request() {
         let state = empty_state();
-        let invite = state.group_invite.clone();
+        let invite = state.group_slots.group_invite.clone();
         let app = router().with_state(state);
         let req = Request::post("/invite")
             .header("content-type", "application/json")
@@ -178,8 +178,8 @@ mod tests {
     #[tokio::test]
     async fn accept_with_pending_invite_is_200_and_queues_request() {
         let state = empty_state();
-        state.group.lock().unwrap().pending_invite = Some("Sariel".into());
-        let accept = state.group_accept.clone();
+        state.group_slots.group.lock().unwrap().pending_invite = Some("Sariel".into());
+        let accept = state.group_slots.group_accept.clone();
         let app = router().with_state(state);
         let resp = app.oneshot(Request::post("/accept").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -205,11 +205,11 @@ mod tests {
     #[tokio::test]
     async fn leave_when_grouped_is_200_and_queues_request() {
         let state = empty_state();
-        state.group.lock().unwrap().members.push(GroupMemberView {
+        state.group_slots.group.lock().unwrap().members.push(GroupMemberView {
             name: "Aldric".into(), level: 10, is_leader: true, is_merc: false,
             tank: false, assist: false, puller: false, offline: false, hp_pct: 100.0,
         });
-        let leave = state.group_leave.clone();
+        let leave = state.group_slots.group_leave.clone();
         let app = router().with_state(state);
         let resp = app.oneshot(Request::post("/leave").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -219,11 +219,11 @@ mod tests {
     #[tokio::test]
     async fn kick_when_not_leader_is_400() {
         let state = empty_state();
-        state.group.lock().unwrap().members.push(GroupMemberView {
+        state.group_slots.group.lock().unwrap().members.push(GroupMemberView {
             name: "Sariel".into(), level: 8, is_leader: false, is_merc: false,
             tank: false, assist: false, puller: false, offline: false, hp_pct: 100.0,
         });
-        state.group.lock().unwrap().you_are_leader = false;
+        state.group_slots.group.lock().unwrap().you_are_leader = false;
         let app = router().with_state(state);
         let req = Request::post("/kick")
             .header("content-type", "application/json")
@@ -235,7 +235,7 @@ mod tests {
     #[tokio::test]
     async fn kick_unknown_member_is_400() {
         let state = empty_state();
-        state.group.lock().unwrap().you_are_leader = true;
+        state.group_slots.group.lock().unwrap().you_are_leader = true;
         let app = router().with_state(state);
         let req = Request::post("/kick")
             .header("content-type", "application/json")
@@ -248,14 +248,14 @@ mod tests {
     async fn kick_known_member_as_leader_is_200_and_queues_request() {
         let state = empty_state();
         {
-            let mut g = state.group.lock().unwrap();
+            let mut g = state.group_slots.group.lock().unwrap();
             g.you_are_leader = true;
             g.members.push(GroupMemberView {
                 name: "Sariel".into(), level: 8, is_leader: false, is_merc: false,
                 tank: false, assist: false, puller: false, offline: false, hp_pct: 100.0,
             });
         }
-        let kick = state.group_kick.clone();
+        let kick = state.group_slots.group_kick.clone();
         let app = router().with_state(state);
         let req = Request::post("/kick")
             .header("content-type", "application/json")
@@ -272,7 +272,7 @@ mod tests {
             // Seed the target as a current member so the membership guard is satisfied and
             // the LEADER guard is the one actually under test here — without this, the 400
             // comes from "Sariel is not a current group member" instead. See #355 M4.
-            let mut g = state.group.lock().unwrap();
+            let mut g = state.group_slots.group.lock().unwrap();
             g.you_are_leader = false;
             g.members.push(GroupMemberView {
                 name: "Sariel".into(), level: 8, is_leader: false, is_merc: false,
@@ -293,14 +293,14 @@ mod tests {
     async fn makeleader_known_member_as_leader_is_200_and_queues_request() {
         let state = empty_state();
         {
-            let mut g = state.group.lock().unwrap();
+            let mut g = state.group_slots.group.lock().unwrap();
             g.you_are_leader = true;
             g.members.push(GroupMemberView {
                 name: "Sariel".into(), level: 8, is_leader: false, is_merc: false,
                 tank: false, assist: false, puller: false, offline: false, hp_pct: 100.0,
             });
         }
-        let ml = state.group_make_leader.clone();
+        let ml = state.group_slots.group_make_leader.clone();
         let app = router().with_state(state);
         let req = Request::post("/makeleader")
             .header("content-type", "application/json")

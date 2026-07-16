@@ -30,14 +30,14 @@ async fn post_trade_open(
         Ok(Json(b)) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"merchant\":\"...\"}".into()),
     };
-    let ids = s.entity_ids.lock().unwrap();
+    let ids = s.world.entity_ids.lock().unwrap();
     let nl = b.merchant.to_lowercase();
     let found = ids.iter()
         .find(|(k, _)| clean_entity_name(k).to_lowercase().contains(&nl) || k.to_lowercase().contains(&nl))
         .map(|(k, &id)| (k.clone(), id));
     match found {
         Some((key, id)) => {
-            *s.trade.lock().unwrap() = Some(TradeCmd::Open(id));
+            *s.merchant_slots.trade.lock().unwrap() = Some(TradeCmd::Open(id));
             tracing::info!("trade: queued open merchant {:?} (spawn_id={})", key, id);
             (StatusCode::OK, format!("opening merchant {} (spawn_id={})", clean_entity_name(&key), id))
         }
@@ -47,7 +47,7 @@ async fn post_trade_open(
 
 /// POST /v1/merchant/close — close the currently open merchant window (OP_ShopRequest command=Close).
 async fn post_trade_close(State(s): State<HttpState>) -> (StatusCode, String) {
-    *s.trade.lock().unwrap() = Some(TradeCmd::Close);
+    *s.merchant_slots.trade.lock().unwrap() = Some(TradeCmd::Close);
     (StatusCode::OK, "closing merchant window".into())
 }
 
@@ -55,7 +55,7 @@ async fn post_trade_close(State(s): State<HttpState>) -> (StatusCode, String) {
 /// merchant_id, count, items:[{merchant_slot,item_id,name,icon,price,quantity}]}`. `open:false`
 /// means no merchant window is open (never opened, was closed, or the merchant refused, e.g. KOS).
 async fn get_trade_list(State(s): State<HttpState>) -> Json<serde_json::Value> {
-    let m = s.merchant.lock().unwrap();
+    let m = s.merchant_slots.merchant.lock().unwrap();
     Json(serde_json::json!({
         "open": m.open,
         "merchant_id": m.merchant_id,
@@ -83,14 +83,14 @@ async fn post_buy(
         Ok(Json(b)) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"merchant\":\"...\",\"slot\":N}".into()),
     };
-    let ids = s.entity_ids.lock().unwrap();
+    let ids = s.world.entity_ids.lock().unwrap();
     let nl = b.merchant.to_lowercase();
     let found = ids.iter()
         .find(|(k, _)| clean_entity_name(k).to_lowercase().contains(&nl) || k.to_lowercase().contains(&nl))
         .map(|(k, &id)| (k.clone(), id));
     match found {
         Some((key, id)) => {
-            *s.buy.lock().unwrap() = Some((id, b.slot));
+            *s.merchant_slots.buy.lock().unwrap() = Some((id, b.slot));
             tracing::info!("buy: queued merchant {:?} (spawn_id={}) slot={}", key, id, b.slot);
             (StatusCode::OK, format!("buying slot {} from {} (spawn_id={})", b.slot, clean_entity_name(&key), id))
         }
@@ -122,14 +122,14 @@ async fn post_sell(
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"merchant\":\"...\",\"slot\":N,\"quantity\":Q}".into()),
     };
     let qty = b.quantity.unwrap_or(1).max(1);
-    let ids = s.entity_ids.lock().unwrap();
+    let ids = s.world.entity_ids.lock().unwrap();
     let nl = b.merchant.to_lowercase();
     let found = ids.iter()
         .find(|(k, _)| clean_entity_name(k).to_lowercase().contains(&nl) || k.to_lowercase().contains(&nl))
         .map(|(k, &id)| (k.clone(), id));
     match found {
         Some((key, id)) => {
-            *s.sell.lock().unwrap() = Some((id, b.slot, qty));
+            *s.merchant_slots.sell.lock().unwrap() = Some((id, b.slot, qty));
             tracing::info!("sell: queued merchant {:?} (spawn_id={}) slot={} qty={}", key, id, b.slot, qty);
             (StatusCode::OK, format!("selling slot {} x{} to {} (spawn_id={})", b.slot, qty, clean_entity_name(&key), id))
         }
@@ -146,7 +146,7 @@ mod tests {
     use crate::http::quests::tests::empty_state;
 
     fn seed_merchant(state: &crate::http::HttpState, key: &str, id: u32) {
-        state.entity_ids.lock().unwrap().insert(key.to_string(), id);
+        state.world.entity_ids.lock().unwrap().insert(key.to_string(), id);
     }
 
     /// eqoxide#341: a typo'd key ("quantitiy" instead of "quantity") must 400 — not be silently
@@ -156,7 +156,7 @@ mod tests {
     async fn sell_unknown_key_is_400_and_does_not_queue() {
         let state = empty_state();
         seed_merchant(&state, "Innkeeper_Beek000", 11);
-        let sell = state.sell.clone();
+        let sell = state.merchant_slots.sell.clone();
         let app = router().with_state(state);
         let req = Request::post("/sell")
             .header("content-type", "application/json")
@@ -171,7 +171,7 @@ mod tests {
     async fn sell_valid_body_still_queues() {
         let state = empty_state();
         seed_merchant(&state, "Innkeeper_Beek000", 11);
-        let sell = state.sell.clone();
+        let sell = state.merchant_slots.sell.clone();
         let app = router().with_state(state);
         let req = Request::post("/sell")
             .header("content-type", "application/json")

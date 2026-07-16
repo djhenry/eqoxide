@@ -28,7 +28,7 @@ async fn post_move(
         Ok(Json(b)) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"from\":N,\"to\":M}".into()),
     };
-    *s.move_req.lock().unwrap() = Some((b.from, b.to));
+    *s.inventory_slots.move_req.lock().unwrap() = Some((b.from, b.to));
     tracing::info!("move: queued from_slot={} to_slot={}", b.from, b.to);
     (StatusCode::OK, format!("moving item from slot {} to slot {}", b.from, b.to))
 }

@@ -65,7 +65,7 @@ async fn fetch(s: HttpState, q: EventsQuery, category: Option<String>) -> Json<s
     let deadline      = Instant::now() + Duration::from_secs(wait);
     loop {
         let (events, last_id, first_id) = {
-            let all = s.chat_events.lock().unwrap();
+            let all = s.chat.chat_events.lock().unwrap();
             let last_id = all.last().map(|e| e.id).unwrap_or(since).max(since);
             // The oldest id still in the ring — independent of `since`/`category`, since eviction
             // is global. Falls back to `last_id` when the ring is empty (nothing retained, but
@@ -122,7 +122,7 @@ mod tests {
     async fn first_id_reveals_dropped_events_after_the_ring_wraps() {
         let state = empty_state();
         {
-            let mut events = state.chat_events.lock().unwrap();
+            let mut events = state.chat.chat_events.lock().unwrap();
             // Simulate the 200-cap ring having wrapped: ids 1..=50 were evicted, 51..=250 remain.
             for id in 51..=250u64 {
                 events.push(ev(id));
@@ -144,7 +144,7 @@ mod tests {
     async fn first_id_reports_no_gap_when_ring_has_not_wrapped() {
         let state = empty_state();
         {
-            let mut events = state.chat_events.lock().unwrap();
+            let mut events = state.chat.chat_events.lock().unwrap();
             for id in 1..=5u64 {
                 events.push(ev(id));
             }
@@ -179,7 +179,7 @@ mod tests {
     async fn typoed_query_param_is_rejected_not_silently_dropped() {
         let state = empty_state();
         {
-            let mut events = state.chat_events.lock().unwrap();
+            let mut events = state.chat.chat_events.lock().unwrap();
             for id in 1..=8u64 {
                 events.push(ev(id));
             }
@@ -208,7 +208,7 @@ mod tests {
         for bad in ["abc", "-1", "99999999999999999999999"] {
             let state = empty_state();
             {
-                let mut events = state.chat_events.lock().unwrap();
+                let mut events = state.chat.chat_events.lock().unwrap();
                 for id in 1..=8u64 {
                     events.push(ev(id));
                 }
@@ -226,7 +226,7 @@ mod tests {
     async fn valid_since_param_still_works() {
         let state = empty_state();
         {
-            let mut events = state.chat_events.lock().unwrap();
+            let mut events = state.chat.chat_events.lock().unwrap();
             for id in 1..=8u64 {
                 events.push(ev(id));
             }
