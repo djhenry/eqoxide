@@ -167,7 +167,7 @@ pub async fn run_gameplay_phase(
             let current  = *camp_until.lock().unwrap();
             let (next, action) = camp_apply(cmd, current, now, CAMP_DURATION);
             *camp_until.lock().unwrap() = next;
-            use crate::eq_net::navigation::build_spawn_appearance_packet;
+            use crate::eq_net::protocol::build_spawn_appearance_packet;
             match action {
                 CampAction::Started => {
                     s.send_app_packet(OP_CAMP, &[]);
@@ -348,7 +348,7 @@ pub async fn run_gameplay_phase(
                     // by echoing the struct back with Complete=1 — the server then moves/zones us via
                     // its normal path (OP_RequestClientZoneChange / a same-zone move handled above).
                     // Ignore a packet already marked Complete (nothing to accept). (#192)
-                    use crate::eq_net::navigation::build_translocate_ack;
+                    use crate::eq_net::protocol::build_translocate_ack;
                     let complete = u32::from_le_bytes([packet.payload[88], packet.payload[89], packet.payload[90], packet.payload[91]]);
                     if complete != 1 {
                         let zone_id  = u32::from_le_bytes([packet.payload[0], packet.payload[1], packet.payload[2], packet.payload[3]]);
@@ -529,7 +529,7 @@ pub async fn run_gameplay_phase(
             };
             if should_send_probe(last_packet_ago, probe_sent_ago) {
                 s.send_app_packet(OP_CONSIDER,
-                    &crate::eq_net::navigation::build_consider_packet(gs.player_id, gs.player_id));
+                    &crate::eq_net::protocol::build_consider_packet(gs.player_id, gs.player_id));
                 let mut h = net_health.lock().unwrap();
                 record_probe_sent(&mut h, std::time::Instant::now());
                 tracing::debug!("EQ: liveness probe — sent self-consider (#371)");
