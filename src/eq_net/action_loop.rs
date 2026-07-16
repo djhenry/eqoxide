@@ -1432,6 +1432,12 @@ impl ActionLoop {
     }
 
     /// Returns true if a controlled fall was in progress (handled this tick; caller must stop).
+    ///
+    /// TODO(MVC): the `gs.player_z` write below is the OTHER un-collided position path — the fall
+    /// twin of the swim-vertical raw write that #359 fixed in `movement.rs` (`swim_rise`/
+    /// `swim_sink`). This descent never consults zone geometry between `player_z` and `land_z`, so
+    /// like the pre-fix swim it can pass through solids the controller would have collided with.
+    /// Route it through `CharacterController` in the movement-unification (out of Phase 3a scope).
     fn drive_controlled_fall(&mut self, stream: &mut EqStream, gs: &mut GameState) -> bool {
         // Controlled fall in progress: descend at the native rate until landed, then apply native
         // fall damage (client-computed in EQ; the server only validates OP_EnvDamage). Takes

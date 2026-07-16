@@ -2218,24 +2218,37 @@ impl Collision {
                     // Submerged (water ABOVE us), or floating AT the surface — a start anchored to
                     // the water surface (#329/#197p2) has air above it, so the old submerged-only
                     // test never fired for it and a floating swimmer had no way OUT of the water.
-                    let submerged = (0..=3).any(|k| water.is_water(a[0], a[1], cz + 2.0 + k as f32 * 4.0))
-                        || water.is_water(a[0], a[1], cz - 1.0);
-                    if submerged {
-                        // Top of the contiguous water column above the current floor.
-                        let mut surface = cz;
-                        while surface - cz < 200.0 && water.is_water(a[0], a[1], surface + 2.0) {
-                            surface += 2.0;
-                        }
-                        // A swimmer floats at the surface and can only STEP out onto a low lip — the
-                        // controller's swim step-up is the native STEP_UP (~2.5u with the ground snap),
-                        // NOT a 20u climb. Capping the haul-out here to that keeps A* from routing a
-                        // vertical scramble from the water onto a bridge/ledge the walker can't perform
-                        // (#nav-multires: the water analogue of the #239 climb limit). A genuinely
-                        // walkable exit is a beach/ramp, handled by the normal ground edges, not here.
-                        const WATER_EXIT_UP: f32 = crate::movement::STEP_UP + 0.5;
+                    let probe = (0..=3).map(|k| cz + 2.0 + k as f32 * 4.0)
+                        .find(|&z| water.is_water(a[0], a[1], z))
+                        .or_else(|| water.is_water(a[0], a[1], cz - 1.0).then_some(cz - 1.0));
+                    // The REAL surface of the water column (region-map binary search), NOT the old
+                    // 2u upward scan: the haul-out cap below is measured from this plane, and a
+                    // surface quantized 0..2u LOW silently shrank the cap by the same amount — a
+                    // false `no_path` for a legal exit near the cap. `None` = an unbounded column
+                    // (water for 200u+ up): there is no surface, so there is nothing to haul out at.
+                    // Clamped to ≥ cz (the old scan started AT the node's floor): a floating node's
+                    // own key IS the surface, and re-deriving it must never land a float-noise hair
+                    // below and disable its haul-outs.
+                    let surface = probe.and_then(|pz| water.surface_z(a[0], a[1], pz)).map(|s| s.max(cz));
+                    if let Some(surface) = surface {
+                        // THE HAUL-OUT CONTRACT (#359, design §4c option E3). The planner's exit
+                        // cap and the controller's swim geometry are the SAME two Body fields:
+                        //   • planner (here): admit a water→land exit only when the lip is
+                        //     ≤ `haul_out_up` above the surface;
+                        //   • controller (`movement.rs`): floats at `surface − float_depth`, rises
+                        //     — collided, feet clamped to the water column — to the surface under
+                        //     the walker's swim-up drive as it closes on the lip, then mounts it
+                        //     with the swimming step-up (STEP_UP + GROUND_SNAP_TOL = 2.5u, so the
+                        //     2.0u cap leaves 0.5u of margin).
+                        // Before the contract the two sides drifted (#386-style): the planner
+                        // measured `surface + 2.5` while the swimmer floated at `surface − 2.0`,
+                        // so a "legal" riser was up to 4.5u against a 2.5u step and the character
+                        // bobbed at the waterline forever (#359). A genuinely walkable exit is a
+                        // beach/ramp, handled by the normal ground edges, not here.
+                        let haul_out_up = crate::traversability::PLAYER_BODY.haul_out_up;
                         for nf in self.column_floors(b[0], b[1], surface, STEP_H, surface - cz) {
                             if nf <= cz + 1.0 { continue; }              // ascents only
-                            if nf > surface + WATER_EXIT_UP { continue; } // too high to haul out of water
+                            if nf > surface + haul_out_up { continue; } // too high to haul out of water
                             let nkey = (nc, nr, qf(nf));
                             if closed.contains(&nkey) { continue; }
                             // Swim at the surface, then the usual chest clearance for the
@@ -2579,6 +2592,81 @@ mod tests {
         let last = *path.unwrap().last().unwrap();
         assert!((last[0] - goal[0]).abs() < 8.0 && (last[1] - goal[1]).abs() < 8.0,
             "path should end at the bank goal, got {last:?}");
+    }
+
+    /// P1 — the #359 drift-apart property (THE HAUL-OUT CONTRACT, water design §9 gate): sweep the
+    /// exit-ledge height `h` above the water surface in 0.25 u steps over `[0, 2 × haul_out_up]`
+    /// and pin, for every `h`, that
+    ///     planner admits the water→land exit  ⟺  h ≤ PLAYER_BODY.haul_out_up
+    /// AND that every ADMITTED exit is actually EXECUTABLE by the real `CharacterController`,
+    /// driven exactly the way the nav walker drives a swim leg (start floating at
+    /// `surface − float_depth`, swim-up wish when the waypoint is above, the swimming step-up at
+    /// the lip). A planner-legal haul-out the controller cannot climb is the #359 wedge (the
+    /// character bobbed at the waterline forever); a refused exit at `h ≤ haul_out_up` is the
+    /// false-`no_path` the exact-surface sizing prevents. The two sides must never disagree.
+    ///
+    /// (The controller deliberately keeps ~0.5 u of capability margin ABOVE the cap
+    /// (`STEP_UP + GROUND_SNAP_TOL = 2.5` vs `haul_out_up = 2.0`, design §4c E3) — the planner may
+    /// only under-promise, never over-promise, so the property tested is admission ⟹ execution
+    /// plus the exact admission boundary, not capability ⟺ admission.)
+    #[test]
+    fn p1_haul_out_admission_matches_controller_execution() {
+        let mesh = |positions: Vec<[f32; 3]>| MeshData {
+            positions, normals: vec![], uvs: vec![],
+            indices: vec![0, 1, 2, 0, 2, 3],
+            texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let body = &crate::traversability::PLAYER_BODY;
+        let surf = 9.0_f32;
+        // Pit floor z=0 (east 0..24), cliff face at east=24 up to the bank lip, bank at
+        // z = surf + h (east 24..48). EQ WLD pos = [north, height, east]. Water is a SLAB
+        // 0.5..surf — bounded below like real `.wtr` volumes — so there is no water beneath the
+        // pit floor and the surface-traversal edge cannot open a side door: admission is decided
+        // by the WATER ASCENT haul-out edge alone.
+        let scene = |bank_z: f32| {
+            let pit_floor = mesh(vec![[0.0, 0.0, 0.0], [0.0, 0.0, 24.0], [24.0, 0.0, 24.0], [24.0, 0.0, 0.0]]);
+            let cliff = mesh(vec![[0.0, 0.0, 24.0], [24.0, 0.0, 24.0], [24.0, bank_z, 24.0], [0.0, bank_z, 24.0]]);
+            let bank = mesh(vec![[0.0, bank_z, 24.0], [0.0, bank_z, 48.0], [24.0, bank_z, 48.0], [24.0, bank_z, 24.0]]);
+            ZoneAssets { terrain: vec![pit_floor, cliff, bank], objects: vec![], textures: vec![] }
+        };
+        let mut h = 0.0_f32;
+        while h <= 2.0 * body.haul_out_up + 1e-3 {
+            let bank_z = surf + h;
+            let mut col = Collision::build(&scene(bank_z), 4.0);
+            col.set_water(Some(std::sync::Arc::new(
+                crate::region_map::RegionMap::water_slab(0.5, surf))));
+            let admitted = col.find_path([8.0, 12.0, 0.0], [40.0, 12.0, bank_z], 1.0, &[], false).is_some();
+            assert_eq!(admitted, h <= body.haul_out_up,
+                "planner admission must be exactly 'lip ≤ haul_out_up above the surface': \
+                 h={h}, admitted={admitted}");
+            if admitted {
+                // Execute the admitted exit with the real controller, driven like the walker:
+                // horizontal wish at the bank, the walker's swim-up rule for the vertical, its
+                // body-probe want_swim. Success = standing on the bank, past the lip.
+                let mut ctrl = crate::movement::CharacterController::new(
+                    [18.0, 12.0, surf - body.float_depth]);
+                let mut out = false;
+                for _ in 0..1200 {
+                    let p = ctrl.pos;
+                    let swim = col.in_water(p) || col.in_water([p[0], p[1], p[2] + 3.0]);
+                    let intent = crate::movement::MoveIntent {
+                        wish_dir: [1.0, 0.0],
+                        wish_vspeed: if swim && bank_z > p[2] + 1.0 { 20.0 } else { 0.0 },
+                        jump: false, want_swim: swim, speed: 35.0, climb: 0.0, hop: false,
+                    };
+                    ctrl.step(intent, 1.0 / 60.0, &col);
+                    if ctrl.on_ground && ctrl.pos[0] > 24.0 && (ctrl.pos[2] - bank_z).abs() < 0.6 {
+                        out = true;
+                        break;
+                    }
+                }
+                assert!(out,
+                    "the controller must execute every planner-admitted haul-out (#359): \
+                     h={h}, ended at {:?}", ctrl.pos);
+            }
+            h += 0.25;
+        }
     }
 
     /// eqoxide#212: A* must refuse a ramp too steep to walk (it slides/wedges), while taking a

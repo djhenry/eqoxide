@@ -72,6 +72,11 @@ const GOOD_SAMPLE_SECS: f32 = 0.5;
 const PUSHOUT_RADII: [f32; 6] = [1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
 /// Directions sampled per push-out ring.
 const PUSHOUT_DIRS: usize = 16;
+/// Buoyancy: vertical settle rate toward the swim plane (u/s). The plane itself —
+/// `surface − float_depth` — comes from the shared [`crate::traversability::PLAYER_BODY`]
+/// (#359/#386: the planner sizes water exits from the same `float_depth`/`haul_out_up` fields,
+/// so the two sides cannot drift apart again). Was two duplicated locals in the two swim branches.
+const BUOY_RATE: f32 = 30.0;
 
 /// What the driver wants this frame. `wish_dir` is a horizontal direction in server axes
 /// (east, north); magnitude is treated as a throttle (clamped to 1). `speed` is run speed (u/s).
@@ -257,25 +262,43 @@ impl CharacterController {
         // passive-buoyancy branch below only fired while airborne, so it used to sit there
         // submerged forever. Treat "on the floor but well below the water surface" as submerged so
         // it floats back up (a body resting underwater is still buoyant). (eqoxide#197)
+        let float_depth = crate::traversability::PLAYER_BODY.float_depth;
         let submerged_on_floor = self.in_water && !swimming
-            && col.water_surface(water_at).is_some_and(|surf| self.pos[2] < surf - 2.0);
+            && col.water_surface(water_at).is_some_and(|surf| self.pos[2] < surf - float_depth);
 
         // ── Vertical: swim / buoyancy / jump / gravity + ground clamp. ──
         if swimming {
             self.on_ground = false;
             self.vel_z = 0.0;
             if intent.wish_vspeed != 0.0 {
-                // Explicit vertical input (a human swimming up/down along the look direction).
-                self.pos[2] += intent.wish_vspeed * dt;
+                // Explicit vertical swim input (the nav swim-up drive, or a human swimming along
+                // the look direction). COLLIDED (#359, second mechanism): this used to be a raw
+                // `pos[2] +=` write — no sweep, no ceiling clamp — so in water flush with a ceiling
+                // (the qcat spawn corridor) the rise embedded the character in rock and the
+                // depenetration net slammed it back to the last good GROUNDED spot, the shaft
+                // floor: rising CAUSED the very strand it was meant to fix. An upward wish is also
+                // clamped at the water surface — the feet never leave the water column mid-swim;
+                // a haul-out lip is mounted by the swimming step-up above, not by flying out of
+                // the pool.
+                let want = intent.wish_vspeed * dt;
+                if want > 0.0 {
+                    let mut rise = self.swim_rise(want, col);
+                    if let Some(surf) = col.water_surface(water_at) {
+                        rise = rise.min((surf - self.pos[2]).max(0.0));
+                    }
+                    self.pos[2] += rise;
+                } else {
+                    self.pos[2] += self.swim_sink(want, col);
+                }
             } else if let Some(surf) = col.water_surface(water_at) {
-                // Nav-driven swim with no vertical wish: float toward the surface so the character
-                // swims ACROSS at the top instead of sitting on / crawling along the pool bottom the
-                // path may route to (#191). Without this, want_swim just froze it at its current z.
-                const BUOY_RATE: f32 = 30.0;
-                const FLOAT_DEPTH: f32 = 2.0;
-                let target = surf - FLOAT_DEPTH;
+                // Nav-driven swim with no vertical wish: float toward the swim plane
+                // (`surface − float_depth`, from the shared Body) so the character swims ACROSS at
+                // the top instead of sitting on / crawling along the pool bottom the path may
+                // route to (#191). Without this, want_swim just froze it at its current z.
+                let target = surf - float_depth;
                 if self.pos[2] < target {
-                    self.pos[2] = (self.pos[2] + BUOY_RATE * dt).min(target);
+                    let want = (BUOY_RATE * dt).min(target - self.pos[2]);
+                    self.pos[2] += self.swim_rise(want, col);
                 }
             }
         } else if self.in_water && (!self.on_ground || submerged_on_floor) {
@@ -284,16 +307,15 @@ impl CharacterController {
             // through the passable water plane to the riverbed — or, in open deep water with no
             // bottom, to the zone boundary (#172) — or sitting on the pool floor (#197).
             // Rise-only: buoyancy never accelerates the character downward.
-            const BUOY_RATE:   f32 = 30.0; // vertical settle rate toward the surface (u/s)
-            const FLOAT_DEPTH: f32 = 2.0;  // rest this far below the surface (body floats, head clears)
             // Detach from the floor so buoyancy owns the vertical (we only get here on_ground when
             // submerged_on_floor, i.e. genuinely below the surface and about to rise).
             self.on_ground = false;
             self.vel_z = 0.0;
             if let Some(surf) = col.water_surface(water_at) {
-                let target = surf - FLOAT_DEPTH;
+                let target = surf - float_depth;
                 if self.pos[2] < target {
-                    self.pos[2] = (self.pos[2] + BUOY_RATE * dt).min(target);
+                    let want = (BUOY_RATE * dt).min(target - self.pos[2]);
+                    self.pos[2] += self.swim_rise(want, col);
                 }
                 // At/above the float line: hold — don't sink (no gravity while submerged).
             }
@@ -389,6 +411,33 @@ impl CharacterController {
             }
         }
         (pos, hit_any)
+    }
+
+    /// COLLIDED vertical swim ascent (#359, second mechanism): how much of an upward swim `want`
+    /// (> 0) the zone geometry actually allows. Sweeps the BODY TOP (`pos + Body::height`) up
+    /// through the rise and stops `SKIN` short of the first solid hit — the same ray discipline
+    /// the horizontal `slide` uses — so neither buoyancy nor the nav swim-up drive can ever push
+    /// a swimmer's head into a ceiling. Against a flush ceiling the rise settles just below it
+    /// and holds (rise → 0), instead of embedding and triggering a depenetration slam-back.
+    fn swim_rise(&self, want: f32, col: &Collision) -> f32 {
+        let top = self.pos[2] + crate::traversability::PLAYER_BODY.height;
+        let from = [self.pos[0], self.pos[1], top];
+        let to = [self.pos[0], self.pos[1], top + want];
+        match col.nearest_hit(from, to) {
+            Some((t, _)) => (t * want - SKIN).max(0.0),
+            None => want,
+        }
+    }
+
+    /// COLLIDED vertical swim descent: the downward mirror of [`Self::swim_rise`] — sweeps the
+    /// FEET down through `want` (< 0) and stops `SKIN` short of the floor/geometry below, so an
+    /// explicit swim-down can't drive the character through the pool bottom.
+    fn swim_sink(&self, want: f32, col: &Collision) -> f32 {
+        let to = [self.pos[0], self.pos[1], self.pos[2] + want];
+        match col.nearest_hit(self.pos, to) {
+            Some((t, _)) => (t * want + SKIN).min(0.0),
+            None => want,
+        }
     }
 
     /// Step-offset climb (design §3.2): raise the cylinder by `STEP_UP`, sweep again, and — only if
@@ -672,6 +721,55 @@ mod tests {
         for _ in 0..240 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 60.0, &c); }
         assert!(ctrl.pos[2] > -50.0,
             "a submerged character must float up toward the surface (~-45), got {}", ctrl.pos[2]);
+    }
+
+    /// P3 — ceiling-flush water (#359, second mechanism; water design §9 gate). A swimmer under a
+    /// low ceiling, driven UP by the nav swim-up wish, must NOT get embedded in the ceiling: the
+    /// vertical swim is now COLLIDED (`swim_rise` sweeps the body top and stops short of the first
+    /// solid hit). Pre-fix this was a raw `pos[2] += wish_vspeed*dt` write — the rise drove the
+    /// body top straight through the ceiling; the depenetration net then read the frame as embedded
+    /// and slammed the character back to the last good GROUNDED position, the shaft floor. That is
+    /// the qcat spawn corridor (water line flush with the ceiling): rising CAUSED the strand it was
+    /// meant to fix.
+    ///
+    /// The fixture: a solid ceiling floor at z=6, water up to z=5 (its surface a hair under the
+    /// ceiling), a swimmer starting mid-column. Assert the body top (`pos.z + Body::height`, 6.0)
+    /// never crosses the ceiling — i.e. it is never embedded — and it does not get slammed back
+    /// down below its start. MUTATION-CHECK: reverting `swim_rise` to the raw `pos[2] += want`
+    /// write turns this RED (the head embeds and/or the depenetration slam-back fires).
+    #[test]
+    fn p3_collided_swim_does_not_embed_under_a_flush_ceiling() {
+        // Ceiling slab at z=6 (a floor the body top would hit), plus a deep pool floor at z=-20 so
+        // the depenetration net (which reads "no floor anywhere below" as embedded) doesn't freeze
+        // the swimmer — the qcat shaft has a floor under the water too.
+        let mut c = col(vec![floor(6.0, -100.0, 100.0), floor(-20.0, -100.0, 100.0)]);
+        // Water in the SLAB -19.5..5 — surface one unit under the ceiling, bounded below like a real
+        // `.wtr` volume (and not touching the pool floor, the qcat shape).
+        c.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::water_slab(-19.5, 5.0))));
+
+        let body_h = crate::traversability::PLAYER_BODY.height; // 6.0
+        // Start with the body fully under the ceiling: feet at z=-2 → head at z=4, under the z=6 slab.
+        let start_z = -2.0;
+        let mut ctrl = CharacterController::new([0.0, 0.0, start_z]);
+        // Drive a persistent upward swim wish (the nav swim-up toward a high waypoint), like the walker.
+        let swim_up = MoveIntent {
+            wish_dir: [0.0, 0.0], wish_vspeed: 20.0, jump: false, want_swim: true,
+            speed: 0.0, climb: 0.0, hop: false,
+        };
+        let mut worst_head = f32::MIN;
+        for _ in 0..600 {
+            ctrl.step(swim_up, 1.0 / 60.0, &c);
+            worst_head = worst_head.max(ctrl.pos[2] + body_h);
+        }
+        // The head must never cross the ceiling (never embedded): a hair of skin-width tolerance.
+        assert!(worst_head <= 6.0 + 0.1,
+            "collided swim must keep the head below the z=6 ceiling (no embed): worst head z={worst_head}");
+        // And it must NOT have been slammed back below its start by a depenetration recovery.
+        assert!(ctrl.pos[2] >= start_z - 0.1,
+            "swimmer must not be slammed back down (no depenetration recovery to the floor): z={}", ctrl.pos[2]);
+        // Positive control: it DID rise toward the surface (feet up near surface − float_depth = 3).
+        assert!(ctrl.pos[2] > start_z + 1.0,
+            "swimmer should still have risen toward the surface, got z={}", ctrl.pos[2]);
     }
 
     #[test]
