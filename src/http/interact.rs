@@ -41,7 +41,7 @@ async fn post_read(
         .map(|i| !i.filename.is_empty());
     match readable {
         Some(true) => {
-            *s.interact.read_book.lock().unwrap() = Some(b.slot);
+            s.command.request_read_book(b.slot);
             tracing::info!("read: queued book slot={}", b.slot);
             (StatusCode::OK, format!("reading item in slot {}", b.slot))
         }
@@ -83,7 +83,7 @@ async fn post_dialogue(
     match chosen {
         Some(c) => {
             let label = c.text.clone();
-            *s.interact.dialogue_click.lock().unwrap() = Some(c);
+            s.command.request_dialogue_click(c);
             tracing::info!("dialogue: queued click {:?}", label);
             (StatusCode::OK, format!("clicking '{}'", label))
         }
@@ -136,7 +136,7 @@ async fn post_hail(
             // Resolve the NPC's spawn_id so the nav thread can target it before saying — the
             // server only fires EVENT_SAY on the player's current target (#130).
             let spawn_id = s.world.entity_ids.lock().unwrap().get(&key).copied();
-            *s.interact.hail.lock().unwrap() = Some((display_name.clone(), spawn_id));
+            s.command.request_hail(display_name.clone(), spawn_id);
             tracing::info!("hail: queued hail to {:?} (spawn_id={:?})", display_name, spawn_id);
             (StatusCode::OK, format!("hailing {}", display_name))
         }
@@ -169,7 +169,7 @@ async fn post_say(
     if text.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "empty text".into());
     }
-    *s.interact.say.lock().unwrap() = Some(text.clone());
+    s.command.request_say(text.clone());
     tracing::info!("say: queued {:?}", text);
     (StatusCode::OK, format!("saying {}", text))
 }
@@ -190,7 +190,7 @@ fn is_corpse_key(key: &str) -> bool {
 }
 
 fn queue_loot(s: &HttpState, name: String, id: u32) -> (StatusCode, String) {
-    *s.interact.loot.lock().unwrap() = Some(id);
+    s.command.request_loot(id);
     tracing::info!("loot: queued corpse {:?} (spawn_id={})", name, id);
     (StatusCode::OK, format!("looting {} (spawn_id={})", clean_entity_name(&name), id))
 }
@@ -287,7 +287,7 @@ async fn post_give(
         .map(|(k, &id)| (k.clone(), id));
     match found {
         Some((key, id)) => {
-            *s.interact.give.lock().unwrap() = Some((id, b.from));
+            s.command.request_give(id, b.from);
             tracing::info!("give: queued npc {:?} (spawn_id={}) from_slot={}", key, id, b.from);
             (StatusCode::OK, format!("giving slot {} to {} (spawn_id={})", b.from, clean_entity_name(&key), id))
         }
@@ -316,7 +316,7 @@ async fn post_door_click(
     };
     match id {
         Some(id) => {
-            *s.interact.door_click.lock().unwrap() = Some(id);
+            s.command.request_door_click(id);
             (StatusCode::OK, format!("clicking door {}", id))
         }
         None => (StatusCode::BAD_REQUEST,
@@ -326,13 +326,13 @@ async fn post_door_click(
 
 /// POST /v1/interact/sit — sit down (mana/HP regen).
 async fn post_sit(State(s): State<HttpState>) -> (StatusCode, String) {
-    *s.interact.sit.lock().unwrap() = Some(true);
+    s.command.request_sit(true);
     (StatusCode::OK, "sit queued".into())
 }
 
 /// POST /v1/interact/stand — stand up.
 async fn post_stand(State(s): State<HttpState>) -> (StatusCode, String) {
-    *s.interact.sit.lock().unwrap() = Some(false);
+    s.command.request_sit(false);
     (StatusCode::OK, "stand queued".into())
 }
 
@@ -355,25 +355,25 @@ mod tests {
     async fn hail_no_body_hails_nearest_npc() {
         let state = empty_state();
         seed_npc(&state, "Guard_Phaeton000", 5, (1.0, 1.0, 0.0));
-        let hail = state.interact.hail.clone();
+        let command = state.command.clone();
         let app = router().with_state(state);
         let resp = app.oneshot(Request::post("/hail").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert!(hail.lock().unwrap().is_some());
+        assert!(command.take_hail().is_some());
     }
 
     #[tokio::test]
     async fn hail_malformed_name_is_400_and_does_not_hail_nearest() {
         let state = empty_state();
         seed_npc(&state, "Guard_Phaeton000", 5, (1.0, 1.0, 0.0));
-        let hail = state.interact.hail.clone();
+        let command = state.command.clone();
         let app = router().with_state(state);
         let req = Request::post("/hail")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"name":5}"#)).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert!(hail.lock().unwrap().is_none(),
+        assert!(command.take_hail().is_none(),
             "a malformed name must not silently fall through to hailing the nearest NPC");
     }
 
@@ -383,14 +383,14 @@ mod tests {
     async fn hail_unknown_key_is_400_and_does_not_hail_nearest() {
         let state = empty_state();
         seed_npc(&state, "Guard_Phaeton000", 5, (1.0, 1.0, 0.0));
-        let hail = state.interact.hail.clone();
+        let command = state.command.clone();
         let app = router().with_state(state);
         let req = Request::post("/hail")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"nmae":"Guard"}"#)).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert!(hail.lock().unwrap().is_none(),
+        assert!(command.take_hail().is_none(),
             "a typo'd key must not silently fall through to hailing the nearest NPC");
     }
 
@@ -400,25 +400,25 @@ mod tests {
     async fn loot_no_body_loots_nearest_corpse() {
         let state = empty_state();
         seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
-        let loot = state.interact.loot.clone();
+        let command = state.command.clone();
         let app = router().with_state(state);
         let resp = app.oneshot(Request::post("/loot").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(*loot.lock().unwrap(), Some(9));
+        assert_eq!(command.take_loot(), Some(9));
     }
 
     #[tokio::test]
     async fn loot_malformed_id_is_400_and_does_not_loot_nearest() {
         let state = empty_state();
         seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
-        let loot = state.interact.loot.clone();
+        let command = state.command.clone();
         let app = router().with_state(state);
         let req = Request::post("/loot")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"id":"not-a-number"}"#)).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert!(loot.lock().unwrap().is_none(),
+        assert!(command.take_loot().is_none(),
             "a malformed id must not silently fall through to looting the nearest corpse");
     }
 
@@ -428,14 +428,14 @@ mod tests {
     async fn loot_unknown_key_is_400_and_does_not_loot_nearest() {
         let state = empty_state();
         seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
-        let loot = state.interact.loot.clone();
+        let command = state.command.clone();
         let app = router().with_state(state);
         let req = Request::post("/loot")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"idd":9}"#)).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert!(loot.lock().unwrap().is_none(),
+        assert!(command.take_loot().is_none(),
             "a typo'd key must not silently fall through to looting the nearest corpse");
     }
 
@@ -449,14 +449,14 @@ mod tests {
     #[tokio::test]
     async fn loot_nonexistent_id_is_404_not_200() {
         let state = empty_state();
-        let loot = state.interact.loot.clone();
+        let command = state.command.clone();
         let app = router().with_state(state);
         let req = Request::post("/loot")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"id":999999}"#)).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
-        assert!(loot.lock().unwrap().is_none());
+        assert!(command.take_loot().is_none());
     }
 
     #[tokio::test]
@@ -464,7 +464,7 @@ mod tests {
         let state = empty_state();
         // A live mob (non-corpse key) standing near a corpse.
         seed_npc(&state, "a_rat01", 11, (2.0, 2.0, 0.0));
-        let loot = state.interact.loot.clone();
+        let command = state.command.clone();
         let app = router().with_state(state);
         let req = Request::post("/loot")
             .header("content-type", "application/json")
@@ -472,14 +472,14 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND,
             "an id that resolves to a live mob (not a corpse) must never be queued for looting");
-        assert!(loot.lock().unwrap().is_none());
+        assert!(command.take_loot().is_none());
     }
 
     #[tokio::test]
     async fn loot_live_mob_name_is_404_not_a_corpse() {
         let state = empty_state();
         seed_npc(&state, "a_rat01", 11, (2.0, 2.0, 0.0));
-        let loot = state.interact.loot.clone();
+        let command = state.command.clone();
         let app = router().with_state(state);
         let req = Request::post("/loot")
             .header("content-type", "application/json")
@@ -487,7 +487,7 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND,
             "a name that only matches a live mob (not a corpse) must never be queued for looting");
-        assert!(loot.lock().unwrap().is_none());
+        assert!(command.take_loot().is_none());
     }
 
     #[tokio::test]
@@ -495,7 +495,7 @@ mod tests {
         let state = empty_state();
         seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
         seed_npc(&state, "a_rat001's corpse", 10, (3.0, 3.0, 0.0));
-        let loot = state.interact.loot.clone();
+        let command = state.command.clone();
         let app = router().with_state(state);
         let req = Request::post("/loot")
             .header("content-type", "application/json")
@@ -503,34 +503,34 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT,
             "a name matching multiple corpses must be reported as ambiguous, not silently resolved");
-        assert!(loot.lock().unwrap().is_none());
+        assert!(command.take_loot().is_none());
     }
 
     #[tokio::test]
     async fn loot_id_matching_a_corpse_still_works() {
         let state = empty_state();
         seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
-        let loot = state.interact.loot.clone();
+        let command = state.command.clone();
         let app = router().with_state(state);
         let req = Request::post("/loot")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"id":9}"#)).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(*loot.lock().unwrap(), Some(9));
+        assert_eq!(command.take_loot(), Some(9));
     }
 
     #[tokio::test]
     async fn loot_unambiguous_name_matching_a_corpse_still_works() {
         let state = empty_state();
         seed_npc(&state, "a_rat000's corpse", 9, (2.0, 2.0, 0.0));
-        let loot = state.interact.loot.clone();
+        let command = state.command.clone();
         let app = router().with_state(state);
         let req = Request::post("/loot")
             .header("content-type", "application/json")
             .body(Body::from(r#"{"name":"a_rat000"}"#)).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(*loot.lock().unwrap(), Some(9));
+        assert_eq!(command.take_loot(), Some(9));
     }
 }

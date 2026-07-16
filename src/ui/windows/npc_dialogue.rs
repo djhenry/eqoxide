@@ -67,7 +67,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
             .sense(egui::Sense::click());
             let resp = ui.add(link).on_hover_text("Click to answer the NPC");
             if resp.clicked() {
-                *cx.acts.dialogue_click.lock().unwrap() = Some(choice.clone());
+                cx.acts.command.request_dialogue_click(choice.clone());
             }
         }
     }
@@ -82,7 +82,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
                 .on_hover_text("Greet the nearest NPC")
                 .clicked()
             {
-                *cx.acts.hail.lock().unwrap() = Some((name, Some(b.id)));
+                cx.acts.command.request_hail(name, Some(b.id));
             }
         }
         None => {
@@ -112,9 +112,9 @@ fn keyword_link(ui: &mut egui::Ui, cx: &mut UiCtx, seg: &str) {
             .iter()
             .find(|c| c.text.eq_ignore_ascii_case(&kw))
         {
-            *cx.acts.dialogue_click.lock().unwrap() = Some(choice.clone());
+            cx.acts.command.request_dialogue_click(choice.clone());
         } else {
-            *cx.acts.say.lock().unwrap() = Some(kw);
+            cx.acts.command.request_say(kw);
         }
     }
 }
