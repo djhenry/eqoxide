@@ -13,7 +13,7 @@ pub(crate) const RUN_SPEED: f32 = 44.0;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::{GameState, ZonePoint};
-use crate::http::{AttackReq, BuyReq, SellReq, TradeReq, TradeCmd, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, ChatEventsShared, ChatSendShared, CastReq, MemSpellReq, SitReq, ConsiderReq, CampReq, CampCmd, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, WhoReq, TaskLog, ZoneCrossReq, ZonePoints, ControllerShared, NavIntent, PosCorrection, DialogueShared, DialogueClickReq, NavStateShared};
+use crate::ipc::{AttackReq, BuyReq, SellReq, TradeReq, TradeCmd, MerchantShared, DoorClickReq, DoorsShared, MoveReq, GiveReq, InventoryShared, LootReq, MessagesShared, ChatEventsShared, ChatSendShared, CastReq, MemSpellReq, SitReq, ConsiderReq, CampReq, CampCmd, EntityIds, EntityPositions, GotoTarget, HailReq, SayReq, TargetReq, WhoReq, TaskLog, ZoneCrossReq, ZonePoints, ControllerShared, NavIntent, PosCorrection, DialogueShared, DialogueClickReq, NavStateShared};
 use crate::movement::MoveIntent;
 
 /// Min interval (ms) between OP_ClientUpdate sends while moving (native `0x118` = 280 ms).
@@ -70,24 +70,24 @@ pub struct Navigator {
     goto_target:      GotoTarget,
     /// Live nav state for GET /v1/observe/debug (#166): idle|navigating|arrived|no_path|blocked.
     nav_state:        NavStateShared,
-    goto_entity:      crate::http::GotoEntity,
+    goto_entity:      crate::ipc::GotoEntity,
     entity_positions: EntityPositions,
     entity_ids:       EntityIds,
     zone_points:      ZonePoints,
     task_log:         TaskLog,
-    task_offers_shared:    crate::http::TaskOffersShared,
-    completed_tasks_shared: crate::http::CompletedTasksShared,
-    accept_task:           crate::http::AcceptTaskReq,
-    cancel_task:           crate::http::CancelTaskReq,
-    group:             crate::http::GroupShared,
-    group_invite:      crate::http::GroupInviteReq,
-    trainer_open_req:  crate::http::TrainerOpenReq,
-    trainer_train_req: crate::http::TrainerTrainReq,
-    group_accept:      crate::http::GroupAcceptReq,
-    group_decline:     crate::http::GroupDeclineReq,
-    group_leave:       crate::http::GroupLeaveReq,
-    group_kick:        crate::http::GroupKickReq,
-    group_make_leader: crate::http::GroupMakeLeaderReq,
+    task_offers_shared:    crate::ipc::TaskOffersShared,
+    completed_tasks_shared: crate::ipc::CompletedTasksShared,
+    accept_task:           crate::ipc::AcceptTaskReq,
+    cancel_task:           crate::ipc::CancelTaskReq,
+    group:             crate::ipc::GroupShared,
+    group_invite:      crate::ipc::GroupInviteReq,
+    trainer_open_req:  crate::ipc::TrainerOpenReq,
+    trainer_train_req: crate::ipc::TrainerTrainReq,
+    group_accept:      crate::ipc::GroupAcceptReq,
+    group_decline:     crate::ipc::GroupDeclineReq,
+    group_leave:       crate::ipc::GroupLeaveReq,
+    group_kick:        crate::ipc::GroupKickReq,
+    group_make_leader: crate::ipc::GroupMakeLeaderReq,
     zone_cross:       ZoneCrossReq,
     hail:             HailReq,
     say:              SayReq,
@@ -99,8 +99,8 @@ pub struct Navigator {
     /// Client-local friends list + a pending friends-presence poll, mirroring who_req/pending_who.
     /// The OP_FriendsWho reply arrives on the SAME opcode as /who all (OP_WhoAllResponse), so
     /// `expecting_friends` records that the next such reply is a friends poll, not a /who all. (#301)
-    friends_list:     crate::http::FriendsListShared,
-    friends_req:      crate::http::FriendsReq,
+    friends_list:     crate::ipc::FriendsListShared,
+    friends_req:      crate::ipc::FriendsReq,
     pending_friends:  Option<tokio::sync::oneshot::Sender<Vec<crate::game_state::WhoEntry>>>,
     expecting_friends: bool,
     attack:           AttackReq,
@@ -117,7 +117,7 @@ pub struct Navigator {
     /// Manual pet command (POST /v1/pet/command or a Pet-window button): one OP_PetCommands
     /// command byte (PET_ATTACK/PET_BACKOFF/…), drained once per tick. Attack uses the current
     /// target; see the drain in `tick`.
-    pet_cmd:          crate::http::PetCmdReq,
+    pet_cmd:          crate::ipc::PetCmdReq,
     /// Camp request slot, shared with the gameplay loop. The nav thread only WRITES it — when the
     /// `/camp` chat keyword is typed it pushes a `Toggle` here instead of sending the text as Say.
     camp:             CampReq,
@@ -247,17 +247,17 @@ pub struct Navigator {
     pos_correction:   PosCorrection,
     /// Draw-only mirror of the walker's committed `path`/`local_path`, published each tick for the
     /// nav-debug overlay so it shows what the walker actually follows, not a separate recompute (#246).
-    nav_path_view:    crate::http::NavPathView,
+    nav_path_view:    crate::ipc::NavPathView,
     /// Aggro-avoidance knobs from /v1/move/* (#242): whether to route around NPC camps and how wide a
     /// buffer to give them. Read each time a route is (re)planned.
-    nav_avoid:        crate::http::NavAvoidShared,
+    nav_avoid:        crate::ipc::NavAvoidShared,
     /// POST /v1/interact/read request: the inventory wire slot of a book/note to read (#288). Drained
     /// each tick; the item's Filename is sent as OP_ReadBook and the server replies with the text.
-    read_book:        crate::http::ReadBookReq,
+    read_book:        crate::ipc::ReadBookReq,
     /// Guild roster + identity published each tick for GET /v1/guild/roster + /observe/debug (#295).
-    guild:            crate::http::GuildShared,
+    guild:            crate::ipc::GuildShared,
     /// POST /v1/guild/{invite,accept,leave,remove} — one queued guild action, drained each tick (#295).
-    guild_action:     crate::http::GuildActionReq,
+    guild_action:     crate::ipc::GuildActionReq,
     /// Last time we sent OP_FloatListThing (movement history) — the anti-MQGhost keepalive (#105).
     last_movement_history_send: Instant,
     /// Last position we streamed, and the last-send timestamp (for the 280 ms / 1300 ms cadence).
@@ -290,31 +290,31 @@ impl Navigator {
     pub fn new(
         goto_target:      GotoTarget,
         nav_state:        NavStateShared,
-        goto_entity:      crate::http::GotoEntity,
+        goto_entity:      crate::ipc::GotoEntity,
         entity_positions: EntityPositions,
         entity_ids:       EntityIds,
         zone_points:      ZonePoints,
         task_log:         TaskLog,
-        task_offers_shared:    crate::http::TaskOffersShared,
-        completed_tasks_shared: crate::http::CompletedTasksShared,
-        accept_task:           crate::http::AcceptTaskReq,
-        cancel_task:           crate::http::CancelTaskReq,
-        group:             crate::http::GroupShared,
-        group_invite:      crate::http::GroupInviteReq,
-    trainer_open_req:  crate::http::TrainerOpenReq,
-    trainer_train_req: crate::http::TrainerTrainReq,
-        group_accept:      crate::http::GroupAcceptReq,
-        group_decline:     crate::http::GroupDeclineReq,
-        group_leave:       crate::http::GroupLeaveReq,
-        group_kick:        crate::http::GroupKickReq,
-        group_make_leader: crate::http::GroupMakeLeaderReq,
+        task_offers_shared:    crate::ipc::TaskOffersShared,
+        completed_tasks_shared: crate::ipc::CompletedTasksShared,
+        accept_task:           crate::ipc::AcceptTaskReq,
+        cancel_task:           crate::ipc::CancelTaskReq,
+        group:             crate::ipc::GroupShared,
+        group_invite:      crate::ipc::GroupInviteReq,
+    trainer_open_req:  crate::ipc::TrainerOpenReq,
+    trainer_train_req: crate::ipc::TrainerTrainReq,
+        group_accept:      crate::ipc::GroupAcceptReq,
+        group_decline:     crate::ipc::GroupDeclineReq,
+        group_leave:       crate::ipc::GroupLeaveReq,
+        group_kick:        crate::ipc::GroupKickReq,
+        group_make_leader: crate::ipc::GroupMakeLeaderReq,
         zone_cross:       ZoneCrossReq,
         hail:             HailReq,
         say:              SayReq,
         target:           TargetReq,
         who_req:          WhoReq,
-        friends_list:     crate::http::FriendsListShared,
-        friends_req:      crate::http::FriendsReq,
+        friends_list:     crate::ipc::FriendsListShared,
+        friends_req:      crate::ipc::FriendsReq,
         attack:           AttackReq,
         buy:              BuyReq,
         sell:             SellReq,
@@ -335,18 +335,18 @@ impl Navigator {
         mem_spell:        MemSpellReq,
         sit:              SitReq,
         consider:         ConsiderReq,
-        pet_cmd:          crate::http::PetCmdReq,
+        pet_cmd:          crate::ipc::PetCmdReq,
         collision:        crate::nav::collision::SharedCollision,
         maps_dir:         std::path::PathBuf,
         camp:             CampReq,
         controller_view:  ControllerShared,
         nav_intent:       NavIntent,
         pos_correction:   PosCorrection,
-        nav_path_view:    crate::http::NavPathView,
-        nav_avoid:        crate::http::NavAvoidShared,
-        read_book:        crate::http::ReadBookReq,
-        guild:            crate::http::GuildShared,
-        guild_action:     crate::http::GuildActionReq,
+        nav_path_view:    crate::ipc::NavPathView,
+        nav_avoid:        crate::ipc::NavAvoidShared,
+        read_book:        crate::ipc::ReadBookReq,
+        guild:            crate::ipc::GuildShared,
+        guild_action:     crate::ipc::GuildActionReq,
     ) -> Self {
         Navigator {
             goto_target,
@@ -517,7 +517,7 @@ impl Navigator {
             } else {
                 gs.entities.values().find(|e| e.name == m.name).map(|e| e.hp_pct).unwrap_or(0.0)
             };
-            crate::http::GroupMemberView {
+            crate::ipc::GroupMemberView {
                 // m.level from OP_GroupUpdateB is a server placeholder (70/65); resolve the real
                 // level from our profile / the member's spawn instead. (eqoxide#104)
                 name: m.name.clone(), level: gs.group_member_level(&m.name),
@@ -600,7 +600,7 @@ impl Navigator {
                 .map(|(seg, _)| seg.trim_matches(|c| c == '[' || c == ']').trim().to_string())
                 .filter(|k| !k.is_empty())
                 .collect();
-            crate::http::MessageEntry { kind: m.kind.clone(), text: m.text.clone(), keywords }
+            crate::ipc::MessageEntry { kind: m.kind.clone(), text: m.text.clone(), keywords }
         }));
         drop(out);
         // Publish the current clickable NPC-dialogue choices (GET /v1/observe/dialogue, #120).
@@ -608,7 +608,7 @@ impl Navigator {
         // Publish async events (GET /v1/events/*), preserving their stable monotonic ids.
         let mut ev = self.chat_events.lock().unwrap();
         ev.clear();
-        ev.extend(gs.chat_events.iter().map(|e| crate::http::Event {
+        ev.extend(gs.chat_events.iter().map(|e| crate::ipc::Event {
             id: e.id, category: e.category.clone(), kind: e.kind.clone(),
             from: e.from.clone(), directed: e.directed, text: e.text.clone(),
         }));
@@ -618,7 +618,7 @@ impl Navigator {
     pub fn sync_doors(&self, gs: &GameState) {
         let mut out = self.doors_shared.lock().unwrap();
         out.clear();
-        out.extend(gs.doors.values().map(|d| crate::http::DoorView {
+        out.extend(gs.doors.values().map(|d| crate::ipc::DoorView {
             door_id: d.door_id, name: d.name.clone(),
             x: d.x, y: d.y, z: d.z, heading: d.heading,
             opentype: d.opentype, is_open: d.is_open,
@@ -751,7 +751,7 @@ impl Navigator {
     }
 
     /// Publish the FINE tier's last honest outcome (#382). Never touches `state`/`reason`.
-    fn set_nav_local(&self, local: Option<crate::http::NavLocal>) {
+    fn set_nav_local(&self, local: Option<crate::ipc::NavLocal>) {
         let mut s = self.nav_state.lock().unwrap();
         if s.local != local { s.local = local; }
     }
@@ -780,7 +780,7 @@ impl Navigator {
         gs.log_msg("zone", msg);
         self.set_nav_state_because(state, Some(reason));
         // Publish the blockage AFTER the state (set_nav_state_because clears it on transition).
-        let to_nav = |b: crate::traversability::Blockage| crate::http::NavBlockage {
+        let to_nav = |b: crate::traversability::Blockage| crate::ipc::NavBlockage {
             hazard: b.hazard.as_str(), at: b.at };
         {
             let mut s = self.nav_state.lock().unwrap();
@@ -860,7 +860,7 @@ impl Navigator {
         // not count toward a re-plan) and it is not evidence it is clear (so it must not reset the
         // count either). "I don't know" changes nothing.
 
-        self.set_nav_local(Some(crate::http::NavLocal {
+        self.set_nav_local(Some(crate::ipc::NavLocal {
             state:       outcome.state().to_string(),
             reason:      outcome.reason().to_string(),
             stuck_ticks: self.local_stuck_ticks,
@@ -1386,7 +1386,7 @@ impl Navigator {
         }
 
         // Drain queued outgoing chat (POST /tell|/ooc|/shout|/group): build + send OP_ChannelMessage.
-        let outgoing: Vec<crate::http::ChatSend> = {
+        let outgoing: Vec<crate::ipc::ChatSend> = {
             let mut q = self.chat_send.lock().unwrap();
             std::mem::take(&mut *q)
         };
@@ -1521,26 +1521,26 @@ impl Navigator {
         if let Some(action) = guild_action {
             const GUILD_RECRUIT: u32 = 8; // default rank for a fresh invite (RoF2 0-8 scale)
             match action {
-                crate::http::GuildAction::Invite(name) => {
+                crate::ipc::GuildAction::Invite(name) => {
                     let pkt = build_guild_command(&name, &gs.player_name, gs.player_guild_id, GUILD_RECRUIT);
                     stream.send_app_packet(OP_GUILD_INVITE, &pkt);
                     gs.log_msg("guild", &format!("Inviting {name} to the guild"));
                     tracing::info!("EQ: guild invite -> {name}");
                 }
-                crate::http::GuildAction::Remove(name) => {
+                crate::ipc::GuildAction::Remove(name) => {
                     let pkt = build_guild_command(&name, &gs.player_name, gs.player_guild_id, 0);
                     stream.send_app_packet(OP_GUILD_REMOVE, &pkt);
                     gs.log_msg("guild", &format!("Removing {name} from the guild"));
                     tracing::info!("EQ: guild remove -> {name}");
                 }
-                crate::http::GuildAction::Leave => {
+                crate::ipc::GuildAction::Leave => {
                     // Self-leave: othername == myname.
                     let pkt = build_guild_command(&gs.player_name, &gs.player_name, gs.player_guild_id, 0);
                     stream.send_app_packet(OP_GUILD_REMOVE, &pkt);
                     gs.log_msg("guild", "Leaving guild");
                     tracing::info!("EQ: guild leave");
                 }
-                crate::http::GuildAction::Accept => match gs.pending_guild_invite.take() {
+                crate::ipc::GuildAction::Accept => match gs.pending_guild_invite.take() {
                     Some((inviter, guild_id, rank)) => {
                         let pkt = build_guild_invite_accept(&inviter, &gs.player_name, rank, guild_id);
                         stream.send_app_packet(OP_GUILD_INVITE_ACCEPT, &pkt);
@@ -2279,7 +2279,7 @@ impl Navigator {
             // A dead fine worker is NOT terminal — the coarse route still steers the character — but it
             // must not be silent either: the agent is being steered with 8u detail from here on.
             if self.local_planner.is_dead() {
-                self.set_nav_local(Some(crate::http::NavLocal {
+                self.set_nav_local(Some(crate::ipc::NavLocal {
                     state: "planner_dead".into(), reason: "local_planner_dead".into(),
                     stuck_ticks: 0, plan_us: 0,
                 }));
@@ -2984,7 +2984,7 @@ mod tests {
     #[test]
     fn a_snapped_goal_z_is_reported_not_silently_performed() {
         use crate::nav::planner::PlanReply;
-        let g: crate::http::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::http::GroupSnapshot::default()));
+        let g: crate::ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::GroupSnapshot::default()));
         let mut nav = test_navigator(g);
         let mut gs = GameState::new();
         let goal = (100.0f32, 100.0f32, 0.0f32); // the agent asked for z = 0
@@ -3031,7 +3031,7 @@ mod tests {
     fn nav_tier_does_not_survive_into_a_later_no_path_or_arrived() {
         use crate::nav::collision::{NoRoute, PlanLimit, PlanOutcome};
         use crate::nav::planner::PlanReply;
-        let group: crate::http::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::http::GroupSnapshot::default()));
+        let group: crate::ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::GroupSnapshot::default()));
         let mut nav = test_navigator(group);
         let mut gs = GameState::new();
         let goal = (100.0f32, 100.0f32, 0.0f32);
@@ -3090,10 +3090,10 @@ mod tests {
 
     /// Build a minimal Navigator for unit tests that only exercise a single `sync_*`/tick method —
     /// every other shared slot gets an empty/default placeholder.
-    fn test_navigator(group: crate::http::GroupShared) -> Navigator {
+    fn test_navigator(group: crate::ipc::GroupShared) -> Navigator {
         Navigator::new(
             Default::default(), // goto_target
-            std::sync::Arc::new(std::sync::Mutex::new(crate::http::NavStatus::default())), // nav_state
+            std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::NavStatus::default())), // nav_state
             Default::default(), // goto_entity
             Default::default(), // entity_positions
             Default::default(), // entity_ids
@@ -3182,7 +3182,7 @@ mod tests {
             assert_eq!(*nav.nav_state.lock().unwrap(), "idle");
         };
         let new_nav = || {
-            let g: crate::http::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::http::GroupSnapshot::default()));
+            let g: crate::ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::GroupSnapshot::default()));
             test_navigator(g)
         };
 
@@ -3228,7 +3228,7 @@ mod tests {
         // #248: a destination + route left over from the PREVIOUS zone must not survive a crossing —
         // in the new zone's coordinate space they aim the walker at a corner near the arrival point
         // and wedge it there. sync_zone_points must clear the goal, path, and recovery state.
-        let group: crate::http::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::http::GroupSnapshot::default()));
+        let group: crate::ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::GroupSnapshot::default()));
         let mut nav = test_navigator(group);
 
         // Simulate an in-progress nav in the OLD zone.
@@ -3284,7 +3284,7 @@ mod tests {
     #[test]
     fn proactive_replan_arms_and_counts_toward_the_oscillation_budget() {
         use crate::nav::collision::{LocalOutcome, NoRoute};
-        let group: crate::http::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::http::GroupSnapshot::default()));
+        let group: crate::ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::GroupSnapshot::default()));
         let mut nav = test_navigator(group);
 
         let nwt = |start: [f32; 3]| crate::nav::planner::LocalReply {
@@ -3334,7 +3334,7 @@ mod tests {
             gender: 0, helm: 0, showhelm: 0, face: 0, hairstyle: 0, haircolor: 0, animation: 100, floating: false,
         });
 
-        let group: crate::http::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::http::GroupSnapshot::default()));
+        let group: crate::ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::GroupSnapshot::default()));
         let nav = test_navigator(group.clone());
         nav.sync_group(&gs);
 

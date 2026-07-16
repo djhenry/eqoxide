@@ -6,7 +6,7 @@
 //! loop on the main thread. The request slots are the cross-thread glue — HTTP writes them, the nav
 //! thread drains them. `--testzone` runs the renderer offline (no server) for asset/zone debugging.
 
-use eqoxide::{camera_state, config, eq_net, eqstr, http};
+use eqoxide::{camera_state, config, eq_net, eqstr, http, ipc};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -161,11 +161,11 @@ OPTIONS:
 
     // Camp slots. `camp` carries a pending camp command (/exit, /camp, HUD button, `/camp` chat);
     // `camp_until` is the published camp deadline (Some while camping) for the HUD countdown.
-    let camp:       http::CampReq   = Arc::new(Mutex::new(None));
-    let camp_until: http::CampUntil = Arc::new(Mutex::new(None));
+    let camp:       ipc::CampReq   = Arc::new(Mutex::new(None));
+    let camp_until: ipc::CampUntil = Arc::new(Mutex::new(None));
     // Respawn request (#284): POST /v1/lifecycle/respawn sets this; the gameplay loop reads it to
     // release a held-dead character to its bind point (no more auto-respawn).
-    let respawn:    http::RespawnReq = Arc::new(Mutex::new(false));
+    let respawn:    ipc::RespawnReq = Arc::new(Mutex::new(false));
 
     // Route SIGTERM/SIGINT into the same clean-shutdown flag so a killed process (e.g.
     // `timeout N ./eqoxide`, Ctrl-C, or `kill <pid>`) logs out cleanly instead of dropping
@@ -179,56 +179,56 @@ OPTIONS:
         }
     }
 
-    let goto_target:      http::GotoTarget      = Arc::new(Mutex::new(None));
-    let goto_entity:      http::GotoEntity      = Arc::new(Mutex::new(None));
-    let entity_positions: http::EntityPositions = Arc::new(Mutex::new(HashMap::new()));
-    let entity_ids:       http::EntityIds       = Arc::new(Mutex::new(HashMap::new()));
-    let zone_points:      http::ZonePoints      = Arc::new(Mutex::new(Vec::new()));
-    let task_log:         http::TaskLog         = Arc::new(Mutex::new(Vec::new()));
-    let task_offers_shared:    http::TaskOffersShared    = Arc::new(Mutex::new(Vec::new()));
-    let completed_tasks_shared: http::CompletedTasksShared = Arc::new(Mutex::new(Vec::new()));
-    let accept_task:           http::AcceptTaskReq        = Arc::new(Mutex::new(None));
-    let cancel_task:           http::CancelTaskReq        = Arc::new(Mutex::new(None));
-    let group:             http::GroupShared         = Arc::new(Mutex::new(http::GroupSnapshot::default()));
-    let group_invite:      http::GroupInviteReq      = Arc::new(Mutex::new(None));
-    let trainer_open_req:  http::TrainerOpenReq      = Arc::new(Mutex::new(None));
-    let trainer_train_req: http::TrainerTrainReq     = Arc::new(Mutex::new(None));
-    let group_accept:      http::GroupAcceptReq      = Arc::new(Mutex::new(None));
-    let group_decline:     http::GroupDeclineReq     = Arc::new(Mutex::new(None));
-    let group_leave:       http::GroupLeaveReq       = Arc::new(Mutex::new(None));
-    let group_kick:        http::GroupKickReq        = Arc::new(Mutex::new(None));
-    let group_make_leader: http::GroupMakeLeaderReq  = Arc::new(Mutex::new(None));
-    let zone_cross:       http::ZoneCrossReq    = Arc::new(Mutex::new(None));
-    let manual_move:      http::ManualMoveReq   = Arc::new(Mutex::new(None));
-    let hail:             http::HailReq         = Arc::new(Mutex::new(None));
-    let say:              http::SayReq          = Arc::new(Mutex::new(None));
-    let target:           http::TargetReq       = Arc::new(Mutex::new(None));
-    let who_req:          http::WhoReq          = Arc::new(Mutex::new(None));
+    let goto_target:      ipc::GotoTarget      = Arc::new(Mutex::new(None));
+    let goto_entity:      ipc::GotoEntity      = Arc::new(Mutex::new(None));
+    let entity_positions: ipc::EntityPositions = Arc::new(Mutex::new(HashMap::new()));
+    let entity_ids:       ipc::EntityIds       = Arc::new(Mutex::new(HashMap::new()));
+    let zone_points:      ipc::ZonePoints      = Arc::new(Mutex::new(Vec::new()));
+    let task_log:         ipc::TaskLog         = Arc::new(Mutex::new(Vec::new()));
+    let task_offers_shared:    ipc::TaskOffersShared    = Arc::new(Mutex::new(Vec::new()));
+    let completed_tasks_shared: ipc::CompletedTasksShared = Arc::new(Mutex::new(Vec::new()));
+    let accept_task:           ipc::AcceptTaskReq        = Arc::new(Mutex::new(None));
+    let cancel_task:           ipc::CancelTaskReq        = Arc::new(Mutex::new(None));
+    let group:             ipc::GroupShared         = Arc::new(Mutex::new(ipc::GroupSnapshot::default()));
+    let group_invite:      ipc::GroupInviteReq      = Arc::new(Mutex::new(None));
+    let trainer_open_req:  ipc::TrainerOpenReq      = Arc::new(Mutex::new(None));
+    let trainer_train_req: ipc::TrainerTrainReq     = Arc::new(Mutex::new(None));
+    let group_accept:      ipc::GroupAcceptReq      = Arc::new(Mutex::new(None));
+    let group_decline:     ipc::GroupDeclineReq     = Arc::new(Mutex::new(None));
+    let group_leave:       ipc::GroupLeaveReq       = Arc::new(Mutex::new(None));
+    let group_kick:        ipc::GroupKickReq        = Arc::new(Mutex::new(None));
+    let group_make_leader: ipc::GroupMakeLeaderReq  = Arc::new(Mutex::new(None));
+    let zone_cross:       ipc::ZoneCrossReq    = Arc::new(Mutex::new(None));
+    let manual_move:      ipc::ManualMoveReq   = Arc::new(Mutex::new(None));
+    let hail:             ipc::HailReq         = Arc::new(Mutex::new(None));
+    let say:              ipc::SayReq          = Arc::new(Mutex::new(None));
+    let target:           ipc::TargetReq       = Arc::new(Mutex::new(None));
+    let who_req:          ipc::WhoReq          = Arc::new(Mutex::new(None));
     // Client-local friends list + its presence-poll request slot (#301).
-    let friends_list:     http::FriendsListShared = Arc::new(Mutex::new(Vec::new()));
-    let friends_req:      http::FriendsReq      = Arc::new(Mutex::new(None));
-    let attack:           http::AttackReq       = Arc::new(Mutex::new(None));
-    let buy:              http::BuyReq          = Arc::new(Mutex::new(None));
-    let sell:             http::SellReq         = Arc::new(Mutex::new(None));
-    let trade:            http::TradeReq        = Arc::new(Mutex::new(None));
-    let merchant:         http::MerchantShared  = Arc::new(Mutex::new(http::MerchantSnapshot::default()));
-    let move_req:         http::MoveReq         = Arc::new(Mutex::new(None));
-    let give:             http::GiveReq         = Arc::new(Mutex::new(None));
-    let inventory:        http::InventoryShared = Arc::new(Mutex::new(Vec::new()));
-    let loot:             http::LootReq         = Arc::new(Mutex::new(None));
-    let door_click:       http::DoorClickReq    = Arc::new(Mutex::new(None));
-    let doors_shared:     http::DoorsShared     = Arc::new(Mutex::new(Vec::new()));
-    let messages:         http::MessagesShared  = Arc::new(Mutex::new(Vec::new()));
-    let dialogue:         http::DialogueShared   = Arc::new(Mutex::new(Vec::new()));
-    let nav_state:        http::NavStateShared   = Arc::new(Mutex::new(http::NavStatus::default()));
-    let dialogue_click:   http::DialogueClickReq = Arc::new(Mutex::new(None));
-    let chat_events:      http::ChatEventsShared = Arc::new(Mutex::new(Vec::new()));
-    let chat_send:        http::ChatSendShared   = Arc::new(Mutex::new(Vec::new()));
-    let cast:             http::CastReq         = Arc::new(Mutex::new(None));
-    let mem_spell:        http::MemSpellReq     = Arc::new(Mutex::new(None));
-    let sit:              http::SitReq          = Arc::new(Mutex::new(None));
-    let consider:         http::ConsiderReq     = Arc::new(Mutex::new(None));
-    let pet_cmd:          http::PetCmdReq       = Arc::new(Mutex::new(None));
+    let friends_list:     ipc::FriendsListShared = Arc::new(Mutex::new(Vec::new()));
+    let friends_req:      ipc::FriendsReq      = Arc::new(Mutex::new(None));
+    let attack:           ipc::AttackReq       = Arc::new(Mutex::new(None));
+    let buy:              ipc::BuyReq          = Arc::new(Mutex::new(None));
+    let sell:             ipc::SellReq         = Arc::new(Mutex::new(None));
+    let trade:            ipc::TradeReq        = Arc::new(Mutex::new(None));
+    let merchant:         ipc::MerchantShared  = Arc::new(Mutex::new(ipc::MerchantSnapshot::default()));
+    let move_req:         ipc::MoveReq         = Arc::new(Mutex::new(None));
+    let give:             ipc::GiveReq         = Arc::new(Mutex::new(None));
+    let inventory:        ipc::InventoryShared = Arc::new(Mutex::new(Vec::new()));
+    let loot:             ipc::LootReq         = Arc::new(Mutex::new(None));
+    let door_click:       ipc::DoorClickReq    = Arc::new(Mutex::new(None));
+    let doors_shared:     ipc::DoorsShared     = Arc::new(Mutex::new(Vec::new()));
+    let messages:         ipc::MessagesShared  = Arc::new(Mutex::new(Vec::new()));
+    let dialogue:         ipc::DialogueShared   = Arc::new(Mutex::new(Vec::new()));
+    let nav_state:        ipc::NavStateShared   = Arc::new(Mutex::new(ipc::NavStatus::default()));
+    let dialogue_click:   ipc::DialogueClickReq = Arc::new(Mutex::new(None));
+    let chat_events:      ipc::ChatEventsShared = Arc::new(Mutex::new(Vec::new()));
+    let chat_send:        ipc::ChatSendShared   = Arc::new(Mutex::new(Vec::new()));
+    let cast:             ipc::CastReq         = Arc::new(Mutex::new(None));
+    let mem_spell:        ipc::MemSpellReq     = Arc::new(Mutex::new(None));
+    let sit:              ipc::SitReq          = Arc::new(Mutex::new(None));
+    let consider:         ipc::ConsiderReq     = Arc::new(Mutex::new(None));
+    let pet_cmd:          ipc::PetCmdReq       = Arc::new(Mutex::new(None));
     // spells_us.txt is an EQ data file; default to the configured assets dir,
     // overridable via EQ_SPELLS_FILE.
     let spells_path = std::env::var("EQ_SPELLS_FILE")
@@ -238,38 +238,38 @@ OPTIONS:
     // Publish globally so the nav thread can resolve spell target types for self-cast (eqoxide#95).
     eqoxide::spells::set_global(spells.clone());
     let shared_collision: eqoxide::nav::collision::SharedCollision = Arc::new(std::sync::RwLock::new(None));
-    let frame_req:        http::FrameReq        = Arc::new(Mutex::new(None));
+    let frame_req:        ipc::FrameReq        = Arc::new(Mutex::new(None));
     // Single-owner GameState snapshot (see
     // docs/superpowers/plans/2026-07-12-gamestate-single-owner-snapshot.md). The network thread is
     // the sole writer of GameState; it publishes here every tick. `last_inbound` is a separate,
     // smaller signal: the wall-clock time of the last REAL inbound packet, used for connection
     // health (a hung network thread stops updating it even though nothing else changes).
-    let game_state_snapshot: http::GameStateSnapshot =
+    let game_state_snapshot: ipc::GameStateSnapshot =
         Arc::new(arc_swap::ArcSwap::from_pointee(eqoxide::game_state::GameState::new()));
     // The network thread's three liveness clocks (link / application packet / gameplay tick). The
     // HTTP layer turns them into `connected`, `last_packet_age_ms` and `snapshot_age_ms` at READ
     // time, so a frozen world can never masquerade as a live one (#343).
-    let net_health_shared: http::NetHealthShared =
-        Arc::new(Mutex::new(http::NetHealth::default()));
+    let net_health_shared: ipc::NetHealthShared =
+        Arc::new(Mutex::new(ipc::NetHealth::default()));
     // Render-owned frame timings — the one agent-visible value the render loop publishes (#343).
-    let frame_profile_shared: http::FrameProfileShared =
+    let frame_profile_shared: ipc::FrameProfileShared =
         Arc::new(Mutex::new(eqoxide::profiling::FrameProfile::default()));
     // Single-authority movement (Component A): the render thread owns the CharacterController and
     // publishes `controller_view`; the nav thread streams it and writes `nav_intent` for /goto;
     // `pos_correction` hands a server correction back to the controller.
-    let controller_view:  http::ControllerShared = Arc::new(Mutex::new(eqoxide::movement::ControllerView::default()));
-    let nav_intent:       http::NavIntent        = Arc::new(Mutex::new(None));
-    let pos_correction:   http::PosCorrection     = Arc::new(Mutex::new(None));
+    let controller_view:  ipc::ControllerShared = Arc::new(Mutex::new(eqoxide::movement::ControllerView::default()));
+    let nav_intent:       ipc::NavIntent        = Arc::new(Mutex::new(None));
+    let pos_correction:   ipc::PosCorrection     = Arc::new(Mutex::new(None));
     // Walker's live plan, published by the nav thread and drawn by the nav-debug overlay (#246).
-    let nav_path_view:    http::NavPathView       = Arc::new(Mutex::new((Vec::new(), Vec::new())));
+    let nav_path_view:    ipc::NavPathView       = Arc::new(Mutex::new((Vec::new(), Vec::new())));
     // Aggro-avoidance knobs (#242): set by /v1/move/* and read by the nav walker when it plans.
-    let nav_avoid:        http::NavAvoidShared    = Arc::new(Mutex::new(http::AggroAvoidOpts::default()));
+    let nav_avoid:        ipc::NavAvoidShared    = Arc::new(Mutex::new(ipc::AggroAvoidOpts::default()));
     // POST /v1/interact/read request slot (#288): the inventory wire slot of a book/note to read.
-    let read_book:        http::ReadBookReq       = Arc::new(Mutex::new(None));
+    let read_book:        ipc::ReadBookReq       = Arc::new(Mutex::new(None));
     // Guild roster/identity published for GET /v1/guild/roster + /observe/debug, and the guild-action
     // request slot for POST /v1/guild/{invite,accept,leave,remove} (#295).
-    let guild:            http::GuildShared       = Arc::new(Mutex::new(http::GuildSnapshot::default()));
-    let guild_action:     http::GuildActionReq    = Arc::new(Mutex::new(None));
+    let guild:            ipc::GuildShared       = Arc::new(Mutex::new(ipc::GuildSnapshot::default()));
+    let guild_action:     ipc::GuildActionReq    = Arc::new(Mutex::new(None));
 
     // EQ network task — skipped in --testzone mode (offline debug)
     let character_name = login_cfg.character_name.clone();
