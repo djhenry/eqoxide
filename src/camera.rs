@@ -449,7 +449,7 @@ mod tests {
             let dx = 0.0_f32 - cam_pos[0];
             let dy = 0.0_f32 - cam_pos[1];
             let dz = 0.0_f32 - cam_pos[2];
-            let len = (dx*dx + dy*dy + dz*dz).sqrt();
+            let len = (dx*dx + dy*dy + dz*dz).sqrt().max(1e-6);
             [dx/len, dy/len, dz/len]
         };
         let center_world = [mat[3][0], mat[3][1], center_z];

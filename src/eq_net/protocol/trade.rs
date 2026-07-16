@@ -3,23 +3,17 @@
 
 use crate::eq_net::protocol::SLOT_TRADE_BEGIN;
 use crate::eq_net::protocol::rof2_possessions_slot;
+use crate::eq_net::protocol::inventory_slot_struct;
 
 /// Encode one RoF2 `InventorySlot_Struct` (12 bytes) for a *trade-window* slot (handing an item to
 /// an NPC / another player). Trade slots are NOT possessions slots: the server decodes typeTrade via
 /// RoF2ToServerSlot as `server_slot = TRADE_BEGIN(3000) + Slot`, so the wire `Slot` is the 0-based
 /// trade-window index (0 = the NPC's first trade slot). `server_slot` here is the absolute eqoxide
 /// slot (SLOT_TRADE_BEGIN..); we subtract TRADE_BEGIN back to the index. Type = typeTrade (3) per
-/// rof2_limits.h InventoryTypes; SubIndex/AugIndex = -1 (top-level, not a bag/aug).
-pub fn rof2_trade_slot(server_slot: u32) -> [u8; 12] {
+/// rof2_limits.h InventoryTypes; SubIndex = -1 (top-level, not a bag).
+pub(crate) fn rof2_trade_slot(server_slot: u32) -> [u8; 12] {
     let index = server_slot.saturating_sub(SLOT_TRADE_BEGIN);
-    let mut s = [0u8; 12];
-    s[0..2].copy_from_slice(&3i16.to_le_bytes());           // Type = typeTrade
-    s[2..4].copy_from_slice(&0i16.to_le_bytes());           // Unknown02
-    s[4..6].copy_from_slice(&(index as i16).to_le_bytes()); // Slot = trade-window index
-    s[6..8].copy_from_slice(&(-1i16).to_le_bytes());        // SubIndex = SLOT_INVALID
-    s[8..10].copy_from_slice(&(-1i16).to_le_bytes());       // AugIndex = SOCKET_INVALID
-    s[10..12].copy_from_slice(&0i16.to_le_bytes());         // Unknown01
-    s
+    inventory_slot_struct(3, index as i16, -1)
 }
 
 /// RoF2 `MoveItem_Struct` (28 bytes) for moving a *possessions* item (e.g. the cursor) INTO an NPC
