@@ -2557,6 +2557,7 @@ mod tests {
                 strip_say_links, SAY_LINK_BODY_SIZE, SIZE_DEATH, SIZE_NEW_ZONE,
                 apply_group_update_b, apply_group_join, apply_group_disband_you,
                 apply_group_disband_other, apply_group_leader_change, apply_group_invite, apply_group_acknowledge};
+    use crate::eq_net::protocol::enc_eq19;
     use crate::game_state::{GameState, Entity, TaskStatus};
 
     /// Build a RoF2 saylink: 0x12 + 56-char body + display text + 0x12.
@@ -4804,9 +4805,9 @@ mod tests {
             // Non-playable equipment block (60 bytes): 5×u32 zeros, Primary.Material, 4×u32, Secondary.Material, 4×u32
             b.extend_from_slice(&[0u8; 60]);
             // Position (20 bytes): encode x/y/z at correct bit positions
-            let yp = ((y * 8.0) as i32 as u32) & 0x7FFFF;
-            let xp = ((x * 8.0) as i32 as u32) & 0x7FFFF;
-            let zp = ((z * 8.0) as i32 as u32) & 0x7FFFF;
+            let yp = enc_eq19(y);
+            let xp = enc_eq19(x);
+            let zp = enc_eq19(z);
             b.extend_from_slice(&(yp << 12).to_le_bytes()); // word0: y
             b.extend_from_slice(&0u32.to_le_bytes());        // word1: deltas
             b.extend_from_slice(&xp.to_le_bytes());          // word2: x
@@ -4950,9 +4951,9 @@ mod tests {
             b.extend_from_slice(&[0u8; 36]); // TintProfile
             b.extend_from_slice(&[0u8; 180]); // Equipment
             // Position (20 bytes)
-            let yp = ((y * 8.0) as i32 as u32) & 0x7FFFF;
-            let xp = ((x * 8.0) as i32 as u32) & 0x7FFFF;
-            let zp = ((z * 8.0) as i32 as u32) & 0x7FFFF;
+            let yp = enc_eq19(y);
+            let xp = enc_eq19(x);
+            let zp = enc_eq19(z);
             b.extend_from_slice(&(yp << 12).to_le_bytes());
             b.extend_from_slice(&0u32.to_le_bytes());
             b.extend_from_slice(&xp.to_le_bytes());
