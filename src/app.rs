@@ -1240,12 +1240,20 @@ impl App {
                 // LATCH it into the view, so a single-frame pulse survives until the nav thread —
                 // which ticks on its own cadence — take-and-clears it exactly once (§442, #442).
                 // Only overwrite on a fresh landing; otherwise leave any not-yet-consumed value.
-                let landed = self.controller.take_landed_fall_height();
                 if let Ok(mut v) = self.controller_view.lock() {
                     v.pos = cpos;
                     v.heading = self.heading_target;
                     v.moving = intent.wish_dir[0] != 0.0 || intent.wish_dir[1] != 0.0 || !self.on_ground;
-                    if let Some(h) = landed { v.landed_fall_height = Some(h); }
+                    // Latch a fresh landing ONLY into an empty view slot, and only TAKE it from the
+                    // controller when the slot is free (§442 #442 DEFECT-3 — never drop a real fall's
+                    // damage). If the nav thread has not yet consumed a previous landing's height, we
+                    // leave the new one in the controller so it is published on a later frame once the
+                    // slot frees — the pending fall is applied first, and neither height is clobbered.
+                    if v.landed_fall_height.is_none() {
+                        if let Some(h) = self.controller.take_landed_fall_height() {
+                            v.landed_fall_height = Some(h);
+                        }
+                    }
                     v.initialized = true;
                 }
             }
