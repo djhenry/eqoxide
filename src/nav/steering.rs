@@ -61,7 +61,7 @@ pub(crate) const JUMP_SEG_MIN: f32 = 12.0;
 /// Only fire the jump while within this of the takeoff waypoint — so the leap starts grounded at
 /// the near edge and does NOT re-trigger after landing (just under the 8u nav cell). (eqoxide#190)
 pub(crate) const JUMP_TAKEOFF_DIST: f32 = 7.0;
-// The planner itself now lives on its own thread — see `crate::eq_net::nav_planner`. `plan_path`
+// The planner itself now lives on its own thread — see `crate::nav::planner`. `plan_path`
 // moved there wholesale: it used to run SYNCHRONOUSLY here, on the network thread, which is the
 // single root cause of #340 (up to ~2 s of net-thread stall → linkdead) and #337 (the 150 ms budget
 // forced A* to give up, and a give-up was indistinguishable from "no route", so the walker silently

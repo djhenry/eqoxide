@@ -1934,7 +1934,7 @@ impl Collision {
     /// same class that caused the #257/#302 linkdead bugs (measured, release, akanon: mean 15.3 ms,
     /// worst **358 ms**), and, worse, a budget that made its answer unfalsifiable: a search that ran
     /// out of clock and one that proved the corridor impassable came back as the same short
-    /// `Option<Vec<_>>`. It now runs on `nav_planner::LocalPlanner`, where nothing real-time waits on
+    /// `Option<Vec<_>>`. It now runs on `crate::nav::planner::LocalPlanner`, where nothing real-time waits on
     /// it, so it can afford the truth.
     ///
     /// Termination is **spatial, not temporal**: `max_search = Some(bound)` confines the frontier to a
