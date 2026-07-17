@@ -2305,7 +2305,7 @@ mod tests {
             gen: 1,
             outcome: crate::nav::collision::PlanOutcome::Route(vec![[0.0, 0.0, 47.0], [100.0, 100.0, 47.0]]),
             plan_ms: 5,
-            goal_snapped_z: Some(47.0),
+            goal_snapped: Some(crate::nav::collision::GoalSnap::ToColumnFloor { z: 47.0 }),
             tight: false,
         }, &mut gs, goal);
 
@@ -2325,12 +2325,29 @@ mod tests {
             gen: 2,
             outcome: crate::nav::collision::PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]]),
             plan_ms: 5,
-            goal_snapped_z: None,
+            goal_snapped: None,
             tight: false,
         }, &mut gs, goal);
         let st = nav.nav.nav_state.lock().unwrap().clone();
         assert_eq!(st.reason, None, "a goal that was honoured as given carries no snap reason");
         assert!(!nav.walker.goal_snapped);
+
+        // The WATER variant (design §4d): a submerged goal the walker cannot dive to must carry
+        // the same reason channel AND say the water part in words — "arrived" floating at the
+        // surface with no qualifier would claim a depth never reached.
+        nav.walker.apply_plan(PlanReply {
+            gen: 3,
+            outcome: crate::nav::collision::PlanOutcome::Route(vec![[0.0, 0.0, -20.0], [100.0, 100.0, -20.0]]),
+            plan_ms: 5,
+            goal_snapped: Some(crate::nav::collision::GoalSnap::ToWaterSurface { surface_z: 0.0 }),
+            tight: false,
+        }, &mut gs, (100.0, 100.0, -20.0));
+        let st = nav.nav.nav_state.lock().unwrap().clone();
+        assert_eq!(st.reason.as_deref(), Some("goal_z_snapped"),
+            "a submerged goal rides the same goal_z_snapped channel");
+        assert!(gs.messages.iter().any(|m| m.text.contains("WATER SURFACE")),
+            "and the message log must carry the water qualifier, in words");
+        assert!(nav.walker.goal_snapped, "carried to arrival: 'arrived' will bear the qualifier");
     }
 
     /// **`nav_tier` IS PER-ROUTE AND MUST NOT GO STALE (#378 Phase 2, #343 discipline).** The tier is
@@ -2351,7 +2368,7 @@ mod tests {
         nav.walker.apply_plan(PlanReply {
             gen: 1,
             outcome: PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]]),
-            plan_ms: 5, goal_snapped_z: None, tight: false,
+            plan_ms: 5, goal_snapped: None, tight: false,
         }, &mut gs, goal);
         assert_eq!(nav.nav.nav_state.lock().unwrap().tier, Some("preferred"),
             "a committed preferred route publishes nav_tier = preferred");
@@ -2361,7 +2378,7 @@ mod tests {
             gen: 2,
             outcome: PlanOutcome::Unreachable {
                 reason: NoRoute::SearchClosed, goal_blocked_by: None, frontier_blocked_by: None },
-            plan_ms: 5, goal_snapped_z: None, tight: false,
+            plan_ms: 5, goal_snapped: None, tight: false,
         }, &mut gs, goal);
         let st = nav.nav.nav_state.lock().unwrap().clone();
         assert_eq!(st.state, "no_path");
@@ -2373,7 +2390,7 @@ mod tests {
         nav.walker.apply_plan(PlanReply {
             gen: 3,
             outcome: PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [50.0, 50.0, 0.0]]),
-            plan_ms: 5, goal_snapped_z: None, tight: true,
+            plan_ms: 5, goal_snapped: None, tight: true,
         }, &mut gs, goal);
         assert_eq!(nav.nav.nav_state.lock().unwrap().tier, Some("minimum"));
         nav.walker.apply_plan(PlanReply {
@@ -2381,7 +2398,7 @@ mod tests {
             outcome: PlanOutcome::Exhausted {
                 limit: PlanLimit::NodeCap,
                 progress: Some(vec![[0.0, 0.0, 0.0], [60.0, 60.0, 0.0], [90.0, 90.0, 0.0]]) },
-            plan_ms: 5, goal_snapped_z: None, tight: false,
+            plan_ms: 5, goal_snapped: None, tight: false,
         }, &mut gs, goal);
         let st = nav.nav.nav_state.lock().unwrap().clone();
         assert_eq!(st.state, "navigating_partial");
@@ -2391,7 +2408,7 @@ mod tests {
         nav.walker.apply_plan(PlanReply {
             gen: 5,
             outcome: PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]]),
-            plan_ms: 5, goal_snapped_z: None, tight: false,
+            plan_ms: 5, goal_snapped: None, tight: false,
         }, &mut gs, goal);
         assert_eq!(nav.nav.nav_state.lock().unwrap().tier, Some("preferred"));
         nav.walker.set_nav_state("arrived");
