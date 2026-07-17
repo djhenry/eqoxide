@@ -810,6 +810,37 @@ pub fn target_height_for(race: &str, archetype: &str) -> f32 {
     race_target_height(race).unwrap_or_else(|| archetype_target_height(archetype))
 }
 
+/// The scale + vertical-lift (`visual_scale`) for placing a skinned humanoid/NPC model,
+/// as the live render path uses them. This is the SINGLE source of that math: `src/pass.rs`
+/// (production) and the placement regression test both call it, so the test guards the
+/// ACTUAL render scale rather than a hand-copied formula (a divergent copy passed even when
+/// a 2× bug was injected into the renderer — #357 review).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HumanoidPlacement {
+    /// Uniform mesh scale fed to `entity_model_matrix_heading`'s `mesh_scale`.
+    pub mesh_scale: f32,
+    /// Z-lift fed to `entity_model_matrix_heading`'s `visual_scale` (grounds the feet).
+    pub visual_scale: f32,
+}
+
+/// Compute the skinned-model placement scale/lift from the model's measured
+/// `true_height` (robust idle extent), `feet_offset` (robust idle feet), and the archetype
+/// `target` height.
+///
+/// - `mesh_scale = target / true_height` normalizes the robust body extent to `target`. Do
+///   NOT re-apply the model's authored node_scale: skinned verts are stored raw and
+///   `true_height` is measured from those same points, so `target/height` is already exact
+///   (re-applying re-inflated the scale-100 `fish.glb` ~100×, #149).
+/// - `visual_scale = -2 * feet_offset * mesh_scale` grounds the model by its own robust feet
+///   (the origin sits above the feet; `entity_model_matrix_heading` lifts by
+///   `visual_scale * 0.5`).
+pub fn humanoid_placement(true_height: f32, feet_offset: f32, target: f32) -> HumanoidPlacement {
+    let height = if true_height > 0.001 { true_height } else { 1.0 };
+    let mesh_scale = target / height;
+    let visual_scale = -2.0 * feet_offset * mesh_scale;
+    HumanoidPlacement { mesh_scale, visual_scale }
+}
+
 /// Every per-race character model the asset server produces (`race_<code>.glb`,
 /// one file per race+gender, gender encoded in the 3-letter code). Used at load
 /// time to register the models that are present and log the ones that are not.
@@ -1263,35 +1294,56 @@ mod tests {
     }
 
     /// Deterministic check of the player-pass placement math: load the real human
-    /// model, replicate the skinned-player transform, and assert the model ends up
-    /// grounded (feet ≈ pos.z), horizontally centered on pos, and ~target tall.
+    /// model, replicate the LIVE skinned-player transform (src/pass.rs), and assert the
+    /// rendered model ends up grounded (feet ≈ pos.z), horizontally centered on pos, and
+    /// ~target tall.
+    ///
+    /// This test mirrors `src/pass.rs` exactly and MUST measure the bounds over
+    /// triangle-referenced (indexed) vertices only. The glTF POSITION accessor is a
+    /// SHARED vertex pool — gltf-rs `read_positions` returns the full pool for every
+    /// primitive, so `mesh.positions` contains thousands of vertices this primitive's
+    /// triangles never rasterize (see the "GLB shared vertex pool" note / #216). A raw
+    /// max-min over ALL positions spans those unused strays and reports ≈12.6 for the
+    /// human — double the real body — even though the rendered triangles span exactly the
+    /// 6.0 target. (#357: an earlier version of this test used bind-pose grounding and a
+    /// raw all-positions max-min, so it asserted `height 12.57 vs target 6.00` and failed;
+    /// the model was never oversized — the render pipeline scales the robust idle extent
+    /// (`true_height`) to target and grounds on the robust `feet_offset`.)
     #[test]
-    #[ignore = "requires assets/models/humanoid.glb"]
     fn humanoid_player_transform_grounds_and_centers() {
         let p = std::path::PathBuf::from(
             concat!(env!("CARGO_MANIFEST_DIR"), "/assets/models/humanoid.glb"));
+        // assets/models/*.glb are bundled (gitignored) and absent in CI / fresh clones —
+        // skip rather than fail when the model isn't present (matches
+        // gendered_models_idle_ground_and_center).
+        if !p.exists() { return; }
         let a = ModelAsset::load(&p).expect("load");
         let sk = a.skin.as_ref().expect("skin");
         let target = archetype_target_height("humanoid");
-        let height = if a.true_height > 0.001 { a.true_height } else { 1.0 };
-        let ms = (target / height) * a.skinned_node_scale;
-        let lift_basis = -sk.bind_lowest_skinned_z();
-        let visual_scale = 2.0 * lift_basis * ms;
-        let center_xz = [a.x_center, a.z_center];
+        // Derive scale + grounding from the SAME function the live renderer (src/pass.rs)
+        // calls — not a hand copy — so this test genuinely guards the production render
+        // scale. A 2× regression injected into humanoid_placement turns this assertion red.
+        let placement = humanoid_placement(a.true_height, a.feet_offset, target);
         let pos = [100.0_f32, -200.0, 5.0];
         let mat = crate::camera::entity_model_matrix_heading(
-            pos, 0.0, visual_scale, ms, center_xz, true, 0.0, glam::Mat4::IDENTITY);
+            pos, 0.0, placement.visual_scale, placement.mesh_scale, [0.0, 0.0], true, 0.0,
+            archetype_correction("humanoid"));
         let m = glam::Mat4::from_cols_array_2d(&mat);
-        let skin = sk.bind_skin_matrices();
+        // Pose the model the way the live player renders it — the idle animation clip.
+        let idle = sk.clip_for_action("idle").or_else(|| sk.clip_for_action("walking")).unwrap_or(0);
+        let imats: Vec<glam::Mat4> = sk.evaluate(idle, 0.0).iter()
+            .map(|x| glam::Mat4::from_cols_array_2d(x)).collect();
         let (mut mnx, mut mxx) = (f32::MAX, f32::MIN);
         let (mut mny, mut mxy) = (f32::MAX, f32::MIN);
         let (mut mnz, mut mxz) = (f32::MAX, f32::MIN);
         for (mesh, sdo) in a.meshes.iter().zip(a.skin_meshes.iter()) {
             if let Some(sd) = sdo {
-                for (vi, vp) in mesh.positions.iter().enumerate() {
-                    let j = sd.joint_indices[vi];
-                    let w = sd.joint_weights[vi];
-                    let local = crate::anim::SkinData::skin_point(*vp, j, w, &skin);
+                // Only triangle-referenced vertices — the geometry that actually renders.
+                for &idx in &mesh.indices {
+                    let vi = idx as usize;
+                    if vi >= mesh.positions.len() { continue; }
+                    let local = crate::anim::SkinData::skin_point(
+                        mesh.positions[vi], sd.joint_indices[vi], sd.joint_weights[vi], &imats);
                     let wp = m.transform_point3(glam::Vec3::from(local));
                     mnx = mnx.min(wp.x); mxx = mxx.max(wp.x);
                     mny = mny.min(wp.y); mxy = mxy.max(wp.y);
@@ -1367,19 +1419,24 @@ mod tests {
             let a = ModelAsset::load(&path).expect("load");
             let sk = a.skin.as_ref().expect("skin");
             let idle = sk.clip_for_action("idle").or_else(|| sk.clip_for_action("walking")).unwrap_or(0);
-            let (cxb, czb, floor) = a.clip_bounds[idle];
             let target = archetype_target_height(archetype);
-            let ms = (target / a.true_height) * a.skinned_node_scale;
-            let visual_scale = 2.0 * (-floor) * ms;
-            let mat = crate::camera::entity_model_matrix_heading(pos, 0.0, visual_scale, ms, [cxb, czb], true, 0.0, glam::Mat4::IDENTITY);
+            // Mirror the live renderer (src/pass.rs) via the shared placement fn — NOT a hand
+            // copy — and measure over triangle-referenced (indexed) verts only, since the glTF
+            // POSITION accessor is a shared pool of mostly-unused verts (#357).
+            let placement = humanoid_placement(a.true_height, a.feet_offset, target);
+            let mat = crate::camera::entity_model_matrix_heading(
+                pos, 0.0, placement.visual_scale, placement.mesh_scale, [0.0, 0.0], true, 0.0,
+                archetype_correction(archetype));
             let m = glam::Mat4::from_cols_array_2d(&mat);
             let imats: Vec<glam::Mat4> = sk.evaluate(idle, 0.0).iter()
                 .map(|x| glam::Mat4::from_cols_array_2d(x)).collect();
             let (mut mnx, mut mxx, mut mny, mut mxy, mut mnz) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN, f32::MAX);
             for (mesh, sdo) in a.meshes.iter().zip(a.skin_meshes.iter()) {
                 if let Some(sd) = sdo {
-                    for (vi, vp) in mesh.positions.iter().enumerate() {
-                        let local = crate::anim::SkinData::skin_point(*vp, sd.joint_indices[vi], sd.joint_weights[vi], &imats);
+                    for &idx in &mesh.indices {
+                        let vi = idx as usize;
+                        if vi >= mesh.positions.len() { continue; }
+                        let local = crate::anim::SkinData::skin_point(mesh.positions[vi], sd.joint_indices[vi], sd.joint_weights[vi], &imats);
                         let wp = m.transform_point3(glam::Vec3::from(local));
                         mnx = mnx.min(wp.x); mxx = mxx.max(wp.x);
                         mny = mny.min(wp.y); mxy = mxy.max(wp.y);

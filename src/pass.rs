@@ -454,20 +454,18 @@ pub fn encode_player_pass(
                 r.queue.write_buffer(&r.joint_buf_pool[0].0, 0, bytemuck::cast_slice(&joint_array));
 
                 let target = crate::models::target_height_for(&scene.player_race, archetype);
-                let height = if model.true_height > 0.001 { model.true_height } else { 1.0 };
-                // Normalize to `target` height. Do NOT re-apply the model's authored `node_scale`:
-                // skinned vertices are stored raw (node_scale is not baked in), and `true_height`
-                // is measured from those same raw/posed points, so `target/height` already yields
-                // the exact scale — multiplying by node_scale re-inflates it. Harmless when
-                // node_scale==1 (every rigged race), but the shared `fish.glb` armature is scale-100,
-                // which rendered the fish ~100× too large (#149 follow-up).
-                let dominant_mesh_scale = target / height;
-                // Skinned EQ models are authored horizontally centered on the origin, so NO
-                // recenter (center_xz=[0,0]); the measured centers were unreliable and pushed
-                // the model off. Vertically the origin sits above the feet, so lift by a
-                // calibrated fraction of the target height to ground the feet (≈2.5 at target 12).
-                // Ground by the model's own feet: lift = -feet_offset * mesh_scale.
-                let visual_scale = -2.0 * model.feet_offset * dominant_mesh_scale;
+                // Normalize to `target` height and ground by the model's own feet. This math
+                // lives in `models::humanoid_placement` so the placement regression test can
+                // exercise the exact production computation (see the fn's doc; #357).
+                //   - mesh_scale = target/true_height (NO node_scale re-apply, #149).
+                //   - Skinned EQ models are authored horizontally centered on the origin, so NO
+                //     recenter (center_xz=[0,0]); measured centers were unreliable and pushed
+                //     the model off. Vertically the origin sits above the feet, so visual_scale
+                //     lifts by -2*feet_offset*mesh_scale to ground the feet.
+                let placement = crate::models::humanoid_placement(
+                    model.true_height, model.feet_offset, target);
+                let dominant_mesh_scale = placement.mesh_scale;
+                let visual_scale = placement.visual_scale;
 
                 for (i, mesh) in model.meshes.iter().enumerate() {
                     if i >= PLAYER_UNIFORM_SLOTS { break; }
