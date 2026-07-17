@@ -433,15 +433,18 @@ both, on two different fields depending on whether the considered spawn IS your 
 `con_name` — the **difficulty tier**, from the RoF2 `Consider_Struct`'s `level` field (an EQEmu
 `ConsiderColor` enum value, not a literal level number):
 
+Ordered from safest to deadliest (by the mob's level relative to yours — `gray`/`green`/`light_blue`/
+`blue` are all **beneath** you, `white` is **even**, `yellow`/`red` are **above** you):
+
 | `con_name`   | ConsiderColor | Meaning |
 |--------------|---------------|---------|
-| `gray`       | 6             | Trivial — no experience for the kill. |
-| `green`      | 2             | Safely beneath you. |
-| `light_blue` | 18            | Slightly beneath you. |
-| `blue`       | 4             | A bit above you. |
-| `white`      | 10 / 20       | Even con. |
-| `yellow`     | 15            | Noticeably higher — dangerous. |
-| `red`        | 13            | Much higher — likely lethal. |
+| `gray`       | 6             | Far beneath you — trivial, no experience for the kill. |
+| `green`      | 2             | Well beneath you — safe. |
+| `light_blue` | 18            | Beneath you (further below than `blue`, closer to `green`). |
+| `blue`       | 4             | Just beneath you — nearly even, but still below your level. |
+| `white`      | 10 / 20       | Even con — same level as you. |
+| `yellow`     | 15            | Above you — noticeably higher, dangerous. |
+| `red`        | 13            | Well above you — much higher, likely lethal. |
 
 `attitude` — the spawn's **faction disposition**, from the reply's `faction` field (`1..=9`): `ally`,
 `warmly`, `kindly`, `amiable`, `indifferent`, `apprehensive`, `dubious`, `threatening`, `scowls`
