@@ -24,8 +24,11 @@
 //!   • `Resolved(T)`   → HTTP **200**. A REAL positive server ack landed. `T` carries the honest
 //!                       detail read back from the applied receipt (e.g. `BuyOk { item_name,
 //!                       price, coin_after }`) — never an optimistic guess made at send time.
-//!   • `Refused(String)` → HTTP **409**. A REAL negative server ack landed (e.g. the merchant's
-//!                       OP_ShopEndConfirm refusal). The `String` is a human reason.
+//!   • `Refused(String)` → HTTP **409**. A DEFINITIVE negative outcome — either a REAL negative
+//!                       server ack (e.g. the merchant's OP_ShopEndConfirm refusal) OR a client-side
+//!                       PRE-SEND rejection (e.g. a conflicting awaited command already in flight;
+//!                       see the singleton-in-flight discipline below). The `String` is a human
+//!                       reason. Distinct from `Unconfirmed`: here we KNOW it is not a success.
 //!   • `Unconfirmed`   → HTTP **202**. NO resolving packet arrived within the timeout. The outcome
 //!                       is genuinely UNKNOWN — the action may have succeeded, may have been
 //!                       silently refused (insufficient funds sends nothing), or the reply may have
@@ -60,6 +63,39 @@
 //!    zone-change/disconnect reaper fires `Unconfirmed` for any parked buy so a crossing can't
 //!    strand the `Sender` or let it mis-correlate a later shop echo (disconnect is also covered for
 //!    free: dropping `ActionLoop` drops the `Sender`, closing the channel → the same 202).
+//!
+//! ────────────────────────────────────────────────────────────────────────────────────────────
+//! SINGLETON-IN-FLIGHT  (a discipline A3.2 / A3.3 MUST copy — do not "improve" it into a queue)
+//! ────────────────────────────────────────────────────────────────────────────────────────────
+//! An awaited command is fulfilled by correlating a later server packet against the parked request.
+//! But the server ack carries **NO per-request token** — the OP_ShopPlayerBuy echo, an
+//! OP_ShopEndConfirm, etc. do not say WHICH of two identical in-flight requests they answer. So two
+//! identical awaited commands in flight at once (e.g. two buys of the same merchant+slot) are
+//! **indistinguishable at the echo**: superseding the first with the second would let the first's
+//! ack resolve the SECOND caller's `Sender` with the FIRST's receipt — mis-attributing success (a
+//! failed second command reporting `Resolved`/200 off the first's success). Perfect correlation is
+//! impossible; the only honest fix is to not have two in flight.
+//!
+//! Therefore awaited commands are **singleton-in-flight**: at most ONE may be parked at a time. When
+//! a second awaited command of the same kind arrives while one is parked, the drain does NOT
+//! supersede — it REJECTS the new one immediately with `Refused("… already in flight; retry …")`
+//! (HTTP 409) and sends NO wire packets for it, so the server only ever processes one at a time and
+//! the ack correlation stays unambiguous. The first parked command resolves normally. (409 rather
+//! than a 202 `Unconfirmed`, because a pre-send rejection is a thing we KNOW did not happen — the
+//! packets were never sent — so "unknown" would understate our certainty.)
+//!
+//! This is honest and is FINE for naturally-SERIAL verbs — merchant buy (one purchase resolves
+//! before the next), a self-cast (one at a time), a give/trade (one trade window at a time). A
+//! copier migrating such a verb keeps this discipline. Do NOT replace it with a request queue to
+//! allow concurrency: without a per-request token from the server, a queue just relocates the same
+//! mis-attribution hazard.
+//!
+//! KNOWN RESIDUAL (out of reach, documented not fixed): a FIRE-AND-FORGET sibling command (the UI
+//! click path, which does not park) of the same kind + slot, issued concurrently with a parked
+//! awaited command, could still have its echo resolve the awaited command — because the
+//! fire-and-forget path is not gated by `pending_*`. This needs a human click and an agent HTTP
+//! call on the exact same slot at the same instant; it is very low likelihood and, critically,
+//! cannot fabricate success out of nothing (a real echo did land for a real buy of that slot).
 //!
 //! NOTE (verified constraint): a `Sender` CANNOT live in `GameState` — it is `Clone`d into the
 //! ArcSwap snapshot every tick, and a `oneshot::Sender` is not `Clone`. Park it ONLY in
