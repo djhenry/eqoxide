@@ -39,12 +39,21 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 }
 
 // See zone.wgsl's apply_fog for the rationale (RoF2 linear distance fog, eqoxide#517).
-fn apply_fog(color: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
+fn fog_t(world_pos: vec3<f32>) -> f32 {
     let dist  = length(world_pos - camera.camera_pos.xyz);
     let range = max(camera.fog_params.y - camera.fog_params.x, 0.001);
-    let t     = clamp((dist - camera.fog_params.x) / range, 0.0, 1.0)
-                * camera.fog_params.z * camera.fog_params.w;
-    return mix(color, camera.fog_color.rgb, t);
+    return clamp((dist - camera.fog_params.x) / range, 0.0, 1.0)
+           * camera.fog_params.z * camera.fog_params.w;
+}
+
+fn apply_fog(color: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
+    return mix(color, camera.fog_color.rgb, fog_t(world_pos));
+}
+
+// See zone.wgsl's apply_fog_additive for the rationale (avoids brightening additive glow toward
+// fog_color under One/One add; review defect on #523).
+fn apply_fog_additive(color: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
+    return color * (1.0 - fog_t(world_pos));
 }
 
 @fragment
@@ -68,4 +77,14 @@ fn fs_blend(in: VertexOutput) -> @location(0) vec4<f32> {
     let texel = textureSample(t_diffuse, s_diffuse, in.uv);
     let lit = texel.rgb * light;
     return vec4<f32>(apply_fog(lit, in.world_pos), texel.a);
+}
+
+// Additive instanced surfaces only (zone_instanced_additive pipeline). See zone.wgsl's
+// fs_blend_additive for the rationale (review defect on #523).
+@fragment
+fn fs_blend_additive(in: VertexOutput) -> @location(0) vec4<f32> {
+    let light = max(dot(normalize(in.normal), normalize(vec3<f32>(0.5, 1.0, 0.3))), 0.1);
+    let texel = textureSample(t_diffuse, s_diffuse, in.uv);
+    let lit = texel.rgb * light;
+    return vec4<f32>(apply_fog_additive(lit, in.world_pos), texel.a);
 }

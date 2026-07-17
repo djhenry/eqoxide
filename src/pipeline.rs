@@ -281,7 +281,12 @@ pub fn build_pipelines(
             buffers: std::slice::from_ref(&vbl), compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
-            module: &zone_shader, entry_point: "fs_blend",
+            // Additive glow (lava/fire/torches) must attenuate toward zero as fog deepens, not
+            // mix toward fog_color — the fixed-function blend below is a pure One/One add with
+            // no destination term to mix against. `fs_blend_additive` uses `apply_fog_additive`
+            // for that; `fs_blend` (mix-to-fog_color) is only correct under ALPHA_BLENDING
+            // (review defect on #523 — see zone.wgsl's apply_fog_additive doc comment).
+            module: &zone_shader, entry_point: "fs_blend_additive",
             targets: &[Some(wgpu::ColorTargetState {
                 format, blend: Some(additive_blend),
                 write_mask: wgpu::ColorWrites::ALL,
@@ -327,7 +332,10 @@ pub fn build_pipelines(
             buffers: &[vbl.clone(), instance_vbl.clone()], compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
-            module: &zone_inst_shader, entry_point: "fs_blend",
+            // See zone_additive above: additive glow must attenuate toward zero under the
+            // fixed-function One/One add, so this binds `fs_blend_additive` (review defect on
+            // #523), not the mix-to-fog_color `fs_blend` used by zone_instanced_blend.
+            module: &zone_inst_shader, entry_point: "fs_blend_additive",
             targets: &[Some(wgpu::ColorTargetState {
                 format, blend: Some(additive_blend),
                 write_mask: wgpu::ColorWrites::ALL,
