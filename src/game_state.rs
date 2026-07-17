@@ -550,7 +550,7 @@ pub struct GameState {
     /// Zone distance fog, parsed from OP_NewZone slot 0 (eqoxide#517). `None` until OP_NewZone has
     /// been applied, OR when the zone sends a degenerate/disabled fog range
     /// (`fog_maxclip <= fog_minclip`) — matching the native client's hard FOGENABLE-off behavior
-    /// (see `docs/eq-technical-knowledgebase/zone-distance-fog.md`). RoF2's `NewZone_Struct` carries
+    /// (see `~/git/eq_kb/zone-distance-fog.md`). RoF2's `NewZone_Struct` carries
     /// 4 fog "slots"; only slot 0 (the DB's un-suffixed fog_* columns) is populated by ordinary
     /// zone content, so we only read that one (see the KB doc's "Semantics of the 4 slots" note).
     pub zone_fog: Option<ZoneFog>,
@@ -659,7 +659,7 @@ pub struct GameState {
     /// after we asked to close (`TimedOut`) — and have sent (or, for the close-side, already
     /// sent) a defensive/idempotent `OP_EndLootRequest` to release the server-side lock
     /// (`Corpse::EndLoot` doesn't check ownership — safe even for a never-confirmed corpse; see
-    /// docs/eq-technical-knowledgebase/loot-protocol.md). While this is `Some`, `loot_current_corpse`
+    /// ~/git/eq_kb/loot-protocol.md). While this is `Some`, `loot_current_corpse`
     /// and `loot_session_active` are deliberately left untouched so `loot_tick_action` withholds
     /// the NEXT corpse's `OP_LootRequest` until this one's fate is truly settled — narrowing (not
     /// eliminating; neither `OP_MoneyOnCorpse` nor `OP_LootComplete` carries a corpse id at all)

@@ -11,7 +11,7 @@
 //! PR #114) — that is exactly what produced #519's dark "raccoon-mask" band and near-black
 //! scalp on HUM male (haircolor 0 multiplies the skin-toned scalp/eye-band texels by
 //! RGB(46,26,12)). [`hair_tint_applies`] now gates the tint to the native client's subset;
-//! see `docs/eq-technical-knowledgebase/luclin-head-faces-and-hair.md` and `hair-color.md`.
+//! see `~/git/eq_kb/luclin-head-faces-and-hair.md` and `hair-color.md`.
 
 /// Hair & beard color tint table (24 entries, RGB). Multiplicative tint (texel × color / 255) on
 /// the **Luclin** hair/beard material, indexed by the `haircolor`/`beardcolor` byte clamped to
@@ -29,8 +29,8 @@ pub fn hair_tint(index: u8) -> [u8; 3] {
 }
 
 /// Whether the real RoF2 client applies the `haircolor` tint to this race+gender's
-/// painted Luclin hair (verified against decompiled eqgame.exe gate `FUN_0040a240` +
-/// EQEmu `races.h`, `hair-color.md` "Which code path applies the tint"): **male**
+/// painted Luclin hair (verified against the native RoF2 client's race/gender gate +
+/// EQEmu `races.h`, `~/git/eq_kb/hair-color.md` "Which code path applies the tint"): **male**
 /// High Elf (`HIE`), Dark Elf (`DKE`), Half Elf (`HEF`) and **female** Dwarf (`DWF`,
 /// gender 1). All other race/gender combos (incl. HUM/BAR/ERU/ELF/HFL/GNM, female
 /// elves, and male Dwarf) render their painted hair untinted in the native client;

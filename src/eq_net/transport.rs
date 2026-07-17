@@ -31,7 +31,7 @@ const MAX_RESEND_PER_PASS: usize = 300;
 /// How often `connect` re-sends OP_SESSION_REQUEST while waiting for OP_SESSION_RESPONSE. This
 /// establishes ONLY the UDP session (the transport handshake) — it says nothing about whether the
 /// zone has yet ACCEPTED us at the application layer. That distinction is the whole subject of
-/// `docs/eq-technical-knowledgebase/zone-entry-handshake-race.md`: on the `zoning==1` reconnect path
+/// `~/git/eq_kb/zone-entry-handshake-race.md`: on the `zoning==1` reconnect path
 /// World fires OP_ZoneServerInfo optimistically and registers our zone auth out-of-band via a
 /// fire-and-forget TCP `ServerOP_ZoneIncClient` → `Zone::AddAuth`. A cold on-demand zone answers
 /// SESSION_RESPONSE as soon as its listener binds — which can be BEFORE that auth lands — so a fast

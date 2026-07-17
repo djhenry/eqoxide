@@ -90,7 +90,7 @@ Mode: unattended self-paced loop. Validate by PLAYING (no server-side peeking ex
 
 ## NPC lerp fixed (752fea0) + EQG DECISION (expert)
 - Rat lerp: measured RoF2 NPC update = ~27u every ~2.7s (~10u/s). dead-reckon clamped dt_upd to 1.0s -> pace ~3x too high; EXTRAP_CAP 0.3 << 2.7s -> lurch+wait. FIX: interpolate toward latest server pos at measured pace (clamp interval to 4.0, no overshoot). 261 tests pass.
-- EQG DECISION (expert, docs/eq-technical-knowledgebase/eqg-character-models.md): RoF2 player models are LUCLIN S3D (UseLuclin*=TRUE), NOT EQG. NO EQG parser needed for player hair. EQG only for NPC/creature models (EQGA v2 .mds/.ani) + zones - future.
+- EQG DECISION (expert, ~/git/eq_kb/eqg-character-models.md): RoF2 player models are LUCLIN S3D (UseLuclin*=TRUE), NOT EQG. NO EQG parser needed for player hair. EQG only for NPC/creature models (EQGA v2 .mds/.ani) + zones - future.
 - REAL hair path (RoF2): (1) load BOTH global<race>_chr.s3d (textures + stub WLD) AND global<race>_chr2.s3d (geometry WLD) - converter may only load _chr.s3d. (2) head texture variant selection: face(0-7)->{race}he000N.dds, hairstyle->{race}hesk{var}{1,4,5}.dds (select Fragment31 material list for head mesh). This is the character-hair work, RoF2-flavored.
 - TODO: validate combat anim + dead-rat fixes live; validate lerp smooth; then hair via _chr2+texture-variants; continue gates (zone travel, merchant, quests).
 
@@ -151,7 +151,7 @@ Mode: unattended self-paced loop. Validate by PLAYING (no server-side peeking ex
 ## HAIR design RESOLVED (Theory A) — expert
 - RoF2 char archives: ONLY 3 meshes (body+2 eyes), NO hair/beard geometry. Hair = head MATERIAL/texture variants {race}hesk{N}{1,4,5}.dds by hairstyle; face = {race}he000{N}.dds by face. global{race}_chr.s3d holds skeleton+meshes+all materials (NOT a stub); chr2.s3d = anim tracks only.
 - Converter: emit head face variants (he000N, tag face N=1-8) + hair material variants (hesk, tag hair N=1-7), default-hidden, client selects. Client: hairstyle->hair material, face->face texture (Spawn_Struct hairstyle/face u8).
-- Doc: docs/eq-technical-knowledgebase/eqg-character-models.md. NEXT: implement hair (converter+client); quest/give/loot gates.
+- Doc: ~/git/eq_kb/eqg-character-models.md. NEXT: implement hair (converter+client); quest/give/loot gates.
 
 ## Hair client-selection dispatched (a856f79b5d4c5bc12) + loot/give BLOCKED by deaths
 - Hair converter DONE_WITH_CONCERNS (ff4f4ca, asset_server): elf.glb has 8 face + 7 hair tagged primitives (extras eq_head_part/eq_part_index/eq_default_hidden). CONCERNS: (1) face textures don't load -> solid-color faces (libeq_wld base_color_texture doesn't traverse BitmapInfo for HE000N materials) -- converter follow-up; (2) hair only layer1 (no tint). Container restarted, GLBs live.

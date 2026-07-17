@@ -23,6 +23,11 @@ Zone_*.png
 # Superpowers plans/specs — developer-local, not published
 docs/superpowers/
 
+# EQ technical knowledgebase — moved to the private ~/git/eq_kb repo (2026-07-17).
+# Holds raw native-client / local-infra ground-truth citations; must never be
+# re-committed to this public repo. Write new KB notes to ~/git/eq_kb instead.
+docs/eq-technical-knowledgebase/
+
 # Tools build output
 tools/output/
 tools/target/

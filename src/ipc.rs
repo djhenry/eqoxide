@@ -450,7 +450,7 @@ pub type TradeReq = Arc<Mutex<Option<TradeCmd>>>;
 /// the window); `command==0` → `Refused` (a REAL negative ack — RoF2's Handle_OP_ShopRequest
 /// collapses faction-KOS/engaged/feigned-invis/charmed/already-busy into this same echo). A target
 /// that is not a merchant at all, or out of range, sends NO echo whatsoever (confirmed against the
-/// EQEmu RoF2 source — see `docs/eq-technical-knowledgebase/merchant-open-protocol.md`) — that path
+/// EQEmu RoF2 source — see `~/git/eq_kb/merchant-open-protocol.md`) — that path
 /// resolves to `Unconfirmed` via the HTTP timeout / a zone-change reaper, never a fabricated 200.
 /// Sibling of [`TradeReq`], NOT a replacement: the UI open/close click path is unchanged. See
 /// `crate::command_state::result` for the flow.
