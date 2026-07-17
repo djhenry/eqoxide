@@ -142,6 +142,22 @@ const SHOP_PENDING_REAP: Duration = Duration::from_secs(6);
 /// fulfils first, +2s so the reap lands strictly after the caller has already received its 202.
 const CAST_PENDING_REAP: Duration = Duration::from_secs(14);
 
+/// #492/#475 — how long a TIME-REAPED command's correlation key stays quarantined against a stale
+/// echo. The wire echoes (OP_ShopPlayerBuy / OP_ShopRequest / a cast's `last_cast` transition) carry
+/// NO per-request token, so echo→pending correlation was only safe while at most ONE command of that
+/// type was ever outstanding — a fact the OLD "cleared only by the matching echo or a session-ending
+/// zone change" design guaranteed (#475). The time-based reap adds a THIRD, SAME-connection clearing
+/// path that does NOT foreclose delivery of the original request's echo: the transport tolerates a
+/// delayed-but-alive reliable echo right up to the server's 30s `resend_timeout` (transport.rs:
+/// `RESEND_*` / the resend_timeout note — the server drops the session at 30s of an un-ACKed oldest
+/// packet), FAR beyond the 6s/14s reap. So a reaped command's echo can still arrive and, without this
+/// guard, be mis-credited to a newly-admitted SAME-KEY command (a silent wrong `Resolved` — the
+/// honesty regression the reviewer caught). We quarantine the reaped key for the FULL resend window;
+/// while it is live, `fulfill_*` DROPS any matching echo (it might belong to the reaped command),
+/// so a re-admitted same-key command can never be echo-resolved and instead reaps to an honest
+/// `Unconfirmed`/202. Sourced from `transport.rs` (30s resend_timeout), NOT invented.
+const ECHO_QUARANTINE: Duration = Duration::from_secs(30);
+
 /// A merchant buy sent via the honest awaited path (A3 Migration 1, #448), parked here until its
 /// resolving packet lands. Holds the `oneshot::Sender` HTTP is awaiting plus the merchant/slot the
 /// buy was for, so a fulfil can CORRELATE the OP_ShopPlayerBuy echo (rejecting a stray shop echo
@@ -359,6 +375,20 @@ pub struct ActionLoop {
     /// the `gs.last_cast` outcome transition (→ `Resolved(CastEnd)` / `Refused` / `Unconfirmed`), or
     /// reaped as `Unconfirmed` on a zone change. Singleton — one self-cast at a time. See `PendingCast`.
     pending_cast:     Option<PendingCast>,
+    /// #492/#475 — correlation keys of buys the TIME-BASED reap dropped, each with its quarantine
+    /// expiry (`ECHO_QUARANTINE`). While an entry is live, `fulfill_buy_ok` DROPS any OP_ShopPlayerBuy
+    /// echo matching `(merchant_id, slot)` — it could be the delayed echo of the reaped buy (the
+    /// transport delivers up to ~30s), so crediting it to a re-admitted same-key buy would be a silent
+    /// wrong `Resolved`. Zone-change reaps are NOT quarantined (the crossing ends the session, so no
+    /// stale echo can follow). Pruned lazily each `reap_expired_pending`.
+    reaped_buy_keys:  Vec<((u32, u32), Instant)>,
+    /// #492/#475 — same, for reaped opens (key = `merchant_id`; `fulfill_open` correlates on npc_id).
+    reaped_open_keys: Vec<(u32, Instant)>,
+    /// #492/#475 — cast has NO content correlation key (`fulfill_cast` keys only on `outcome.at`), so
+    /// once a cast is time-reaped ANY later cast outcome within the resend window could belong to it.
+    /// This suppresses ALL cast echo-fulfillment until the instant recorded here, so a re-admitted
+    /// cast reaps to an honest `Unconfirmed` rather than absorbing an unrelated spell's outcome.
+    cast_quarantine_until: Option<Instant>,
     /// `/v1/inventory/*` slots (#M4 — see `ipc::InventorySlots`).
     inventory_slots:  crate::ipc::InventorySlots,
     /// In-progress quest turn-in (POST /give), or None when idle. Drives the trade-window
@@ -441,6 +471,9 @@ impl ActionLoop {
             pending_buy: None,
             pending_open: None,
             pending_cast: None,
+            reaped_buy_keys: Vec::new(),
+            reaped_open_keys: Vec::new(),
+            cast_quarantine_until: None,
             inventory_slots,
             give_state: None,
             interact,
@@ -587,6 +620,14 @@ impl ActionLoop {
         let echo_merchant = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
         let echo_slot     = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
         let price         = u32::from_le_bytes([payload[24], payload[25], payload[26], payload[27]]);
+        // #492/#475: if this key was recently TIME-reaped, the echo may be the delayed echo of that
+        // reaped buy (the transport delivers up to ~30s). Crediting it to the current same-key
+        // `pending_buy` would be a silent wrong `Resolved`. DROP it — the re-admitted buy reaps to an
+        // honest `Unconfirmed`/202 instead. Checked BEFORE correlation so a stale echo never resolves.
+        if self.buy_key_quarantined(echo_merchant, echo_slot) {
+            tracing::warn!("EQ: #492/#475 dropped a quarantined shop-buy echo (merchant={echo_merchant} slot={echo_slot}) — could be the stale echo of a reaped buy; not credited");
+            return;
+        }
         // Correlate BEFORE taking: a non-matching echo must leave the parked buy in place.
         let correlates = self.pending_buy.as_ref()
             .is_some_and(|pb| pb.merchant_id == echo_merchant && pb.slot == echo_slot);
@@ -647,6 +688,13 @@ impl ActionLoop {
         if payload.len() < 12 { return; }
         let echo_npc = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
         let command  = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
+        // #492/#475: same as `fulfill_buy_ok` — a shop-open echo for a recently TIME-reaped merchant
+        // may be that reaped open's delayed echo; drop it rather than credit a re-admitted same-merchant
+        // open. The re-admitted open reaps to an honest `Unconfirmed`/202.
+        if self.open_key_quarantined(echo_npc) {
+            tracing::warn!("EQ: #492/#475 dropped a quarantined shop-open echo (merchant={echo_npc}) — could be the stale echo of a reaped open; not credited");
+            return;
+        }
         let correlates = self.pending_open.as_ref().is_some_and(|po| po.merchant_id == echo_npc);
         if !correlates { return; }
         let po = self.pending_open.take().unwrap();
@@ -691,6 +739,12 @@ impl ActionLoop {
     /// (the cast RESOLVED — we know what happened), but `outcome` carries the truth so a 200 can never
     /// be misread as "the spell took hold". See `crate::command_state::result`.
     pub fn fulfill_cast(&mut self, gs: &GameState) {
+        // #492/#475: after a cast is TIME-reaped, cast echoes carry NO content key (`fulfill_cast`
+        // keys only on `outcome.at`), so ANY cast outcome within the resend window could belong to the
+        // reaped cast. Suppress ALL cast echo-fulfillment during the quarantine so a re-admitted cast
+        // reaps to an honest `Unconfirmed` instead of absorbing an unrelated spell's outcome. Degraded
+        // (a genuine cast in this rare window won't resolve on its echo) but never a wrong `Resolved`.
+        if self.cast_quarantined() { return; }
         let Some(pc) = self.pending_cast.as_ref() else { return };
         // Correlate BEFORE taking: only a FRESH outcome (strictly after we parked) is this cast's.
         let Some(outcome) = gs.last_cast.as_ref().filter(|o| o.at > pc.sent_at) else { return };
@@ -750,19 +804,55 @@ impl ActionLoop {
     /// state machine already SELF-times-out every tick via `GIVE_ACK_TIMEOUT_TICKS` /
     /// `GIVE_FINISH_TIMEOUT_TICKS` in `tick_give`, resolving the awaited `Sender` to `Unconfirmed` and
     /// clearing `give_state` — so a stranded give cannot occur.
+    ///
+    /// QUARANTINE (#492/#475): dropping a `pending_*` slot on a NON-session-ending timeout re-opens the
+    /// echo-misattribution class #475 closed — the reaped command's request is still alive on the wire
+    /// and its delayed echo can land up to the transport's ~30s `resend_timeout` later, long after a
+    /// same-key command has been re-admitted. So on each reap we record the reaped command's
+    /// correlation key (buy: merchant_id+slot; open: merchant_id; cast: a key-less time gate) for
+    /// `ECHO_QUARANTINE`; `fulfill_buy_ok`/`fulfill_open`/`fulfill_cast` then DROP any matching echo
+    /// during the window rather than credit it — a re-admitted same-key command reaps to an honest
+    /// `Unconfirmed` instead of stealing the reaped command's outcome (a silent wrong `Resolved`).
     fn reap_expired_pending(&mut self) {
+        let now = Instant::now();
         if self.pending_buy.as_ref().is_some_and(|p| p.sent_at.elapsed() >= SHOP_PENDING_REAP) {
-            self.pending_buy = None; // drop the Sender — caller already got its 202; no late fulfillment
-            tracing::warn!("EQ: #492 reaped a stranded awaited BUY (no resolving packet within {SHOP_PENDING_REAP:?}) — later buys unblocked");
+            let p = self.pending_buy.take().unwrap(); // drop the Sender — caller already got its 202
+            self.reaped_buy_keys.push(((p.merchant_id, p.slot), now + ECHO_QUARANTINE));
+            tracing::warn!("EQ: #492 reaped a stranded awaited BUY (merchant={} slot={}, no resolving packet within {SHOP_PENDING_REAP:?}) — later buys unblocked; key quarantined against a stale echo for {ECHO_QUARANTINE:?}", p.merchant_id, p.slot);
         }
         if self.pending_open.as_ref().is_some_and(|p| p.sent_at.elapsed() >= SHOP_PENDING_REAP) {
-            self.pending_open = None;
-            tracing::warn!("EQ: #492 reaped a stranded awaited OPEN (no resolving packet within {SHOP_PENDING_REAP:?}) — later opens unblocked");
+            let p = self.pending_open.take().unwrap();
+            self.reaped_open_keys.push((p.merchant_id, now + ECHO_QUARANTINE));
+            tracing::warn!("EQ: #492 reaped a stranded awaited OPEN (merchant={}, no resolving packet within {SHOP_PENDING_REAP:?}) — later opens unblocked; key quarantined for {ECHO_QUARANTINE:?}", p.merchant_id);
         }
         if self.pending_cast.as_ref().is_some_and(|p| p.sent_at.elapsed() >= CAST_PENDING_REAP) {
-            self.pending_cast = None;
-            tracing::warn!("EQ: #492 reaped a stranded awaited CAST (no resolving packet within {CAST_PENDING_REAP:?}) — later casts unblocked");
+            self.pending_cast = None; // drop the Sender
+            self.cast_quarantine_until = Some(now + ECHO_QUARANTINE);
+            tracing::warn!("EQ: #492 reaped a stranded awaited CAST (no resolving packet within {CAST_PENDING_REAP:?}) — later casts unblocked; cast echoes suppressed for {ECHO_QUARANTINE:?} (no content key to correlate)");
         }
+        // Prune expired quarantine entries so the sets stay small (they gate `fulfill_*` on `> now`
+        // anyway, so an un-pruned stale entry is inert — this is just housekeeping).
+        self.reaped_buy_keys.retain(|(_, exp)| *exp > now);
+        self.reaped_open_keys.retain(|(_, exp)| *exp > now);
+        if self.cast_quarantine_until.is_some_and(|t| t <= now) { self.cast_quarantine_until = None; }
+    }
+
+    /// #492/#475 — true while an OP_ShopPlayerBuy echo for `(merchant_id, slot)` might be the delayed
+    /// echo of a recently TIME-reaped buy (within `ECHO_QUARANTINE`), so it must not be credited.
+    fn buy_key_quarantined(&self, merchant_id: u32, slot: u32) -> bool {
+        let now = Instant::now();
+        self.reaped_buy_keys.iter().any(|((m, s), exp)| *m == merchant_id && *s == slot && *exp > now)
+    }
+
+    /// #492/#475 — same for an OP_ShopRequest echo's `merchant_id`.
+    fn open_key_quarantined(&self, merchant_id: u32) -> bool {
+        let now = Instant::now();
+        self.reaped_open_keys.iter().any(|(m, exp)| *m == merchant_id && *exp > now)
+    }
+
+    /// #492/#475 — true while cast echoes are suppressed after a time-reaped cast (no content key).
+    fn cast_quarantined(&self) -> bool {
+        self.cast_quarantine_until.is_some_and(|t| t > Instant::now())
     }
 
     /// Publish the open-merchant session from `gs` into the shared slot (GET /trade/list + the HUD
@@ -3430,6 +3520,111 @@ mod tests {
         nav.drain_cast(&mut stream, &mut gs);
         assert!(nav.pending_cast.is_some(), "cast C must be ADMITTED once the stranded slot is reaped");
         assert!(resp_c.try_recv().is_err(), "C must be in flight, not 409-refused");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+    // #492/#475 QUARANTINE — the honesty half of the reap. The wire echoes carry no per-request
+    // token, so once the time-based reap admits a same-key command, a DELAYED echo of the reaped
+    // command (the transport delivers up to the ~30s resend_timeout) must NOT be mis-credited to the
+    // re-admitted command — that would be a silent wrong `Resolved` (worse than the 409 it replaced).
+    // These prove the stale echo is DROPPED and the re-admitted command is never falsely credited.
+    // Mutation-check: deleting the `*_quarantined` guard in the matching `fulfill_*` turns each RED.
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_stale_buy_echo_after_reap_is_not_mis_credited_to_a_readmitted_same_key_buy() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_buy_gs();
+
+        // Buy A (merchant 11, slot 3) parks, then is time-reaped past the deadline.
+        let (tx_a, mut resp_a) = tokio::sync::oneshot::channel();
+        nav.command.request_buy_await(11, 3, tx_a);
+        nav.drain_merchant(&mut stream, &mut gs);
+        nav.pending_buy.as_mut().unwrap().sent_at = Instant::now() - (SHOP_PENDING_REAP + Duration::from_secs(1));
+        nav.reap_expired_pending();
+        assert!(nav.pending_buy.is_none(), "A must be reaped");
+        assert!(matches!(resp_a.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Closed)),
+            "A's Sender is dropped on reap (its caller already got a 202)");
+
+        // Buy B — SAME merchant+slot — is admitted (liveness fix) and parks.
+        let (tx_b, mut resp_b) = tokio::sync::oneshot::channel();
+        nav.command.request_buy_await(11, 3, tx_b);
+        nav.drain_merchant(&mut stream, &mut gs);
+        assert!(nav.pending_buy.is_some(), "B must be admitted, not 409-blocked by A");
+
+        // A's DELAYED real echo now lands. It must be DROPPED (quarantined key), NOT credited to B.
+        let echo = buy_echo(11, 3, 5);
+        apply_packet(&mut gs, &AppPacket { opcode: OP_SHOP_PLAYER_BUY, payload: echo.clone() });
+        nav.fulfill_buy_ok(&gs, &echo);
+        assert!(matches!(resp_b.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
+            "B must NOT be credited with A's stale echo — that would be a silent wrong Resolved");
+        assert!(nav.pending_buy.is_some(), "the stale echo is dropped, leaving B still parked");
+
+        // B (ambiguous same key during the window) can only reap to an honest Unconfirmed — never a
+        // fabricated success from a stale echo.
+        nav.pending_buy.as_mut().unwrap().sent_at = Instant::now() - (SHOP_PENDING_REAP + Duration::from_secs(1));
+        nav.reap_expired_pending();
+        assert!(nav.pending_buy.is_none(), "B reaps rather than resolving on an ambiguous echo");
+        assert!(matches!(resp_b.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Closed)),
+            "B ends Unconfirmed/202 (Sender dropped), never a wrong 200");
+    }
+
+    #[tokio::test]
+    async fn a_stale_open_echo_after_reap_is_not_mis_credited_to_a_readmitted_same_merchant_open() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_open_gs();
+
+        // Open A (merchant 11) parks, then is time-reaped.
+        let (tx_a, _resp_a) = tokio::sync::oneshot::channel();
+        nav.command.request_open_await(11, tx_a);
+        nav.drain_merchant(&mut stream, &mut gs);
+        nav.pending_open.as_mut().unwrap().sent_at = Instant::now() - (SHOP_PENDING_REAP + Duration::from_secs(1));
+        nav.reap_expired_pending();
+        assert!(nav.pending_open.is_none(), "A must be reaped");
+
+        // Open B — SAME merchant — is admitted and parks.
+        let (tx_b, mut resp_b) = tokio::sync::oneshot::channel();
+        nav.command.request_open_await(11, tx_b);
+        nav.drain_merchant(&mut stream, &mut gs);
+        assert!(nav.pending_open.is_some(), "B must be admitted");
+
+        // A's delayed OP_ShopRequest echo (command=1, a REAL "opened" ack) lands — must be DROPPED,
+        // never credited to B as a Resolved(OpenOk).
+        nav.fulfill_open(&open_echo(11, 1));
+        assert!(matches!(resp_b.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
+            "B must NOT be credited with A's stale open echo");
+        assert!(nav.pending_open.is_some(), "the stale echo is dropped, leaving B still parked");
+    }
+
+    #[tokio::test]
+    async fn a_cast_outcome_after_reap_is_not_mis_credited_to_a_readmitted_cast() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_cast_gs();
+
+        // Cast A parks, then is time-reaped (cast has NO content key).
+        let (tx_a, _resp_a) = tokio::sync::oneshot::channel();
+        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx_a);
+        nav.drain_cast(&mut stream, &mut gs);
+        nav.pending_cast.as_mut().unwrap().sent_at = Instant::now() - (CAST_PENDING_REAP + Duration::from_secs(1));
+        nav.reap_expired_pending();
+        assert!(nav.pending_cast.is_none(), "A must be reaped");
+
+        // Cast B is admitted and parks.
+        let (tx_b, mut resp_b) = tokio::sync::oneshot::channel();
+        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx_b);
+        nav.drain_cast(&mut stream, &mut gs);
+        assert!(nav.pending_cast.is_some(), "B must be admitted");
+
+        // A cast outcome now transitions `last_cast` — during the cast quarantine this must NOT be
+        // credited to B (it could be A's reaped cast finally landing). B stays parked; no wrong Resolved.
+        gs.finish_cast(202, "cast_completed", "You have finished casting.");
+        nav.fulfill_cast(&gs);
+        assert!(matches!(resp_b.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
+            "B must NOT be credited with a cast outcome during the post-reap quarantine");
+        assert!(nav.pending_cast.is_some(), "B stays parked — the ambiguous outcome is suppressed");
     }
 
     // ─────────────────────────────────────────────────────────────────────────────────────────
