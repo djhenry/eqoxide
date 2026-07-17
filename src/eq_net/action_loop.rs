@@ -52,13 +52,44 @@ const CORRECTION_SQ: f32 = 144.0;
 /// Pending state of a quest turn-in (POST /give). The trade window spans multiple nav ticks:
 /// we send OP_TradeRequest, then must wait for the server's OP_TradeRequestAck before moving the
 /// item into the NPC trade slot. `ticks_waiting` counts nav ticks (~150ms each) for the timeout.
+///
+/// A3 Migration 2 (#448): the honest awaited give (POST /v1/interact/give) parks its HTTP-side
+/// `oneshot::Sender` HERE — the existing state machine owns it, so there is no separate `pending_give`
+/// field (cf. buy's `pending_buy`). `await_tx` is `None` for the fire-and-forget UI turn-in (no
+/// result awaited) and `Some` for the awaited path. Because the confirming OP_FinishTrade arrives
+/// AFTER we send OP_TradeAcceptClick (at which point the fire-and-forget path is already done and
+/// clears `give_state`), the awaited path does NOT clear here at accept — it flips `accepted` and
+/// stays parked through a SECOND phase to await OP_FinishTrade, resolving `Resolved(GiveOk)` (accepted)
+/// or `Unconfirmed` (no finish = item mismatch/lost, or no ack). The `Sender` deliberately lives ONLY
+/// here — never in `GameState`, which is `Clone`d into the ArcSwap snapshot every tick and a
+/// `oneshot::Sender` is not `Clone`. See `crate::command_state::result` for the full flow.
 struct GiveState {
     npc_id:        u32,
     ticks_waiting: u32,
+    /// The parked HTTP `Sender` for the awaited path (#448); `None` for the fire-and-forget UI give.
+    await_tx:      Option<tokio::sync::oneshot::Sender<crate::command_state::CommandResult<crate::command_state::GiveOk>>>,
+    /// Item name captured from the inventory slot at send time, for the `GiveOk` receipt (the trade
+    /// slots are cleared by the time OP_FinishTrade is applied, so it can't be read back then).
+    item_name:     String,
+    /// Phase flag: `false` = awaiting OP_TradeRequestAck (phase 1); `true` = OP_TradeAcceptClick sent,
+    /// awaiting OP_FinishTrade (phase 2). Only the awaited path enters phase 2 — the fire-and-forget
+    /// path clears `give_state` at accept, exactly as before.
+    accepted:      bool,
 }
 
-/// ~3 second ack timeout, in nav ticks (tick gating is ~150ms → 20 ticks ≈ 3s).
+/// ~3 second ack timeout, in nav ticks (tick gating is ~150ms → 20 ticks ≈ 3s). Phase 1 (awaiting
+/// OP_TradeRequestAck).
 const GIVE_ACK_TIMEOUT_TICKS: u32 = 20;
+
+/// ~3 second finish timeout, in nav ticks — phase 2 of the AWAITED give (#448): after
+/// OP_TradeAcceptClick, how long we wait for OP_FinishTrade before declaring the outcome UNKNOWN
+/// (`Unconfirmed`). An item-mismatch turn-in returns the item on the cursor with NO OP_FinishTrade,
+/// so this timeout is the honest soft-fail for that case. The two net-side timeouts run in sequence,
+/// so the worst-case net verdict lands ≈ (GIVE_ACK_TIMEOUT_TICKS + GIVE_FINISH_TIMEOUT_TICKS) × 150ms
+/// ≈ 6s after the request; the HTTP-side timeout (`GIVE_HTTP_TIMEOUT_SECS`, in `http::interact`) is
+/// set GREATER than that so the NET verdict (Resolved/Unconfirmed) is what the caller receives,
+/// never a vaguer HTTP-elapsed 202. See the two-timeout ordering note in `http::interact::post_give`.
+const GIVE_FINISH_TIMEOUT_TICKS: u32 = 20;
 
 /// A merchant buy sent via the honest awaited path (A3 Migration 1, #448), parked here until its
 /// resolving packet lands. Holds the `oneshot::Sender` HTTP is awaiting plus the merchant/slot the
@@ -478,6 +509,10 @@ impl ActionLoop {
             // parked would let a shop echo in the NEW zone mis-correlate it (or strand it until the
             // HTTP timeout). Firing Unconfirmed here yields the honest "outcome UNKNOWN" 202 promptly.
             self.reap_pending_buy();
+            // #448 (Migration 2): same reasoning for an awaited give still parked across the crossing —
+            // the NPC is in the OLD zone, no OP_FinishTrade can arrive, and a stray finish in the NEW
+            // zone must not mis-resolve it. Reap it to a prompt Unconfirmed/202.
+            self.reap_pending_give();
 
             let mut shared = self.world.zone_points.lock().unwrap();
             // Start fresh with server entries.
@@ -1552,57 +1587,176 @@ impl ActionLoop {
     ///   2. The server replies OP_TradeRequestAck (→ gs.trade_ack_ready); only then may we move the
     ///      cursor item into the NPC trade slot — the server rejects cursor→trade moves before the
     ///      trade session exists.
-    ///   3. Ack seen: OP_MoveItem cursor(30)→trade slot(3000), then OP_TradeAcceptClick. Clear state.
+    ///   3. Ack seen: OP_MoveItem cursor(30)→trade slot(3000), then OP_TradeAcceptClick.
     /// The server then sends OP_FinishTrade (handled in packet_handler). If no ack arrives within
     /// ~3s we abort and reset. Called every tick (not gated by the 150ms walk throttle).
+    ///
+    /// A3 Migration 2 (#448): the AWAITED give (`await_tx` set) does NOT clear at step 3 — it enters a
+    /// phase-2 wait for OP_FinishTrade so `fulfill_give_ok` can resolve `Resolved(GiveOk)` (accepted)
+    /// or a phase-2 timeout can resolve `Unconfirmed` (item mismatch / lost). The FIRE-AND-FORGET give
+    /// (`await_tx` None) still clears at step 3, exactly as before. See `begin_give`/`fulfill_give_ok`.
     fn tick_give(&mut self, stream: &mut EqStream, gs: &mut GameState) {
-        // Begin a new give request if one is queued and we're not already mid-trade.
+        // Begin a new give request if one is queued and we're not already mid-trade. Prefer the
+        // fire-and-forget UI slot (existing behavior), then the awaited slot (#448). Only one trade
+        // runs at a time, so with `give_state` clear at most one begins per tick.
         if self.give_state.is_none() {
             if let Some((npc_id, from_slot)) = self.command.take_give() {
-                // Step 1: put the item on the cursor (skip if it's already there). Use the 28-byte
-                // structured MoveItem (possessions→cursor); the old flat 12-byte packet was silently
-                // dropped by the server, so the item never reached the cursor (eqoxide#26).
-                if from_slot != SLOT_CURSOR {
-                    stream.send_app_packet(OP_MOVE_ITEM, &build_move_item(from_slot, SLOT_CURSOR));
-                    gs.move_item(from_slot as i32, SLOT_CURSOR as i32); // mirror locally
-                }
-                // Send OP_TradeRequest { to_mob_id = npc, from_mob_id = player }.
-                let mut req = [0u8; 8];
-                req[0..4].copy_from_slice(&npc_id.to_le_bytes());
-                req[4..8].copy_from_slice(&gs.player_id.to_le_bytes());
-                stream.send_app_packet(OP_TRADE_REQUEST, &req);
-                gs.trade_ack_ready = false;
-                self.give_state = Some(GiveState { npc_id, ticks_waiting: 0 });
-                tracing::info!("EQ: give: OP_TradeRequest to npc_id={} (item slot {})", npc_id, from_slot);
-                gs.log_msg("trade", "Offering item to NPC...");
+                self.begin_give(stream, gs, npc_id, from_slot, None);
+            } else if let Some((npc_id, from_slot, tx)) = self.command.take_give_await() {
+                self.begin_give(stream, gs, npc_id, from_slot, Some(tx));
             }
             return;
         }
 
-        // Mid-trade: either the ack has arrived (advance) or we keep waiting (with a timeout).
-        if gs.trade_ack_ready {
-            let npc_id = self.give_state.as_ref().map(|g| g.npc_id).unwrap_or(0);
-            // Step 3: move the cursor item into the NPC's first trade slot, then accept. The trade
-            // slot needs RoF2 typeTrade encoding (not possessions) — build_move_item_to_trade emits
-            // the 28-byte structured MoveItem the server actually accepts (eqoxide#26).
-            stream.send_app_packet(OP_MOVE_ITEM, &build_move_item_to_trade(SLOT_CURSOR, SLOT_TRADE_BEGIN));
-            gs.move_item(SLOT_CURSOR as i32, SLOT_TRADE_BEGIN as i32); // mirror locally
-            let mut accept = [0u8; 8];
-            accept[0..4].copy_from_slice(&gs.player_id.to_le_bytes());
-            // unknown4 = 0 (already zeroed).
-            stream.send_app_packet(OP_TRADE_ACCEPT_CLICK, &accept);
-            tracing::info!("EQ: give: cursor→trade slot + OP_TradeAcceptClick (npc_id={})", npc_id);
-            self.give_state = None;
-            gs.trade_ack_ready = false;
-        } else if let Some(g) = self.give_state.as_mut() {
-            g.ticks_waiting += 1;
-            if g.ticks_waiting >= GIVE_ACK_TIMEOUT_TICKS {
-                // Abort: cancel the (possibly half-open) trade session and reset.
-                stream.send_app_packet(OP_CANCEL_TRADE, &[]);
-                tracing::warn!("EQ: give: no trade ack (timed out)");
-                gs.log_msg("trade", "Trade timed out (no NPC ack)");
-                self.give_state = None;
+        // A trade IS already in flight. SINGLETON-IN-FLIGHT (copy buy's reject-while-parked, #448): a
+        // second AWAITED give is refused OUTRIGHT — no new trade is started and the in-flight one is
+        // untouched. OP_FinishTrade carries no per-request token, so two awaited gives in flight would
+        // be indistinguishable at the ack and the first's finish could resolve the second caller's
+        // Sender (a failed second give reporting success). The packets were never sent, so `Refused`
+        // (409, "we KNOW it didn't happen") is honest here — not `Unconfirmed` (202, "unknown"). (A
+        // fire-and-forget give queued now stays in its `give` slot until this trade clears — the
+        // existing serialization; we do NOT drain `take_give` while a trade is in flight.)
+        if let Some((npc_id, from_slot, tx)) = self.command.take_give_await() {
+            let _ = tx.send(crate::command_state::CommandResult::Refused(
+                "a give is already in flight; retry".into()));
+            tracing::info!("EQ: give: awaited give REJECTED — one already in flight (npc_id={npc_id} from_slot={from_slot})");
+        }
+
+        // Advance the state machine. `accepted` splits phase 1 (awaiting ack) from phase 2 (awaited
+        // only: accept sent, awaiting OP_FinishTrade). Read it without holding a borrow across sends.
+        let accepted = self.give_state.as_ref().map(|g| g.accepted).unwrap_or(false);
+
+        if !accepted {
+            // Phase 1: either the ack arrived (advance the trade) or we keep waiting (with a timeout).
+            if gs.trade_ack_ready {
+                let npc_id = self.give_state.as_ref().map(|g| g.npc_id).unwrap_or(0);
+                // Step 3: move the cursor item into the NPC's first trade slot, then accept. The trade
+                // slot needs RoF2 typeTrade encoding (not possessions) — build_move_item_to_trade emits
+                // the 28-byte structured MoveItem the server actually accepts (eqoxide#26).
+                stream.send_app_packet(OP_MOVE_ITEM, &build_move_item_to_trade(SLOT_CURSOR, SLOT_TRADE_BEGIN));
+                gs.move_item(SLOT_CURSOR as i32, SLOT_TRADE_BEGIN as i32); // mirror locally
+                let mut accept = [0u8; 8];
+                accept[0..4].copy_from_slice(&gs.player_id.to_le_bytes());
+                // unknown4 = 0 (already zeroed).
+                stream.send_app_packet(OP_TRADE_ACCEPT_CLICK, &accept);
+                tracing::info!("EQ: give: cursor→trade slot + OP_TradeAcceptClick (npc_id={})", npc_id);
                 gs.trade_ack_ready = false;
+                // Fire-and-forget give: done here, exactly as before. Awaited give: keep `give_state`
+                // parked and enter phase 2 to await the confirming OP_FinishTrade (→ `fulfill_give_ok`
+                // resolves `Resolved(GiveOk)`), resetting the tick counter to time the finish wait.
+                let awaited = self.give_state.as_ref().map(|g| g.await_tx.is_some()).unwrap_or(false);
+                if awaited {
+                    if let Some(g) = self.give_state.as_mut() { g.accepted = true; g.ticks_waiting = 0; }
+                } else {
+                    self.give_state = None;
+                }
+            } else if let Some(g) = self.give_state.as_mut() {
+                g.ticks_waiting += 1;
+                if g.ticks_waiting >= GIVE_ACK_TIMEOUT_TICKS {
+                    // Abort: cancel the (possibly half-open) trade session and reset. The give was SENT
+                    // but never acked — the awaited path reports `Unconfirmed` (202, outcome UNKNOWN),
+                    // NEVER success.
+                    let await_tx = g.await_tx.take();
+                    stream.send_app_packet(OP_CANCEL_TRADE, &[]);
+                    tracing::warn!("EQ: give: no trade ack (timed out)");
+                    gs.log_msg("trade", "Trade timed out (no NPC ack)");
+                    if let Some(tx) = await_tx {
+                        let _ = tx.send(crate::command_state::CommandResult::Unconfirmed);
+                    }
+                    self.give_state = None;
+                    gs.trade_ack_ready = false;
+                }
+            }
+        } else if let Some(g) = self.give_state.as_mut() {
+            // Phase 2 (awaited only): OP_TradeAcceptClick has been sent; we await OP_FinishTrade, which
+            // `fulfill_give_ok` resolves + clears. If none arrives within the window, the turn-in was
+            // either an item mismatch (the server returns the item on the cursor via OP_ItemPacket with
+            // NO OP_FinishTrade) or the reply was lost — the HONEST verdict is `Unconfirmed` (202), NOT
+            // success. We do NOT try to positively detect the cursor-return (ambiguous), so we never
+            // claim a definitive `Refused` we can't prove.
+            g.ticks_waiting += 1;
+            if g.ticks_waiting >= GIVE_FINISH_TIMEOUT_TICKS {
+                let await_tx = g.await_tx.take();
+                if let Some(tx) = await_tx {
+                    let _ = tx.send(crate::command_state::CommandResult::Unconfirmed);
+                }
+                tracing::warn!("EQ: give: no OP_FinishTrade after accept — outcome UNKNOWN (item mismatch or lost)");
+                gs.log_msg("trade", "Trade not confirmed (item may have been returned)");
+                self.give_state = None;
+            }
+        }
+    }
+
+    /// Start a trade-window turn-in (shared by the fire-and-forget UI give and the awaited #448 give):
+    /// capture the item name for the receipt, put the item on the cursor, send OP_TradeRequest, and
+    /// enter phase 1 (`accepted: false`) awaiting OP_TradeRequestAck. `await_tx` is `None` for the UI
+    /// path and `Some` for the awaited path (which is what makes the state machine keep the parked
+    /// `Sender` through OP_FinishTrade). Byte-for-byte the same wire traffic in both cases.
+    fn begin_give(
+        &mut self,
+        stream: &mut EqStream,
+        gs: &mut GameState,
+        npc_id: u32,
+        from_slot: u32,
+        await_tx: Option<tokio::sync::oneshot::Sender<crate::command_state::CommandResult<crate::command_state::GiveOk>>>,
+    ) {
+        // Capture the item name BEFORE it leaves the slot — by the time the confirming OP_FinishTrade
+        // is applied, `clear_trade_slots` has run, so it can't be read back then.
+        let item_name = gs.inventory.iter()
+            .find(|i| i.slot == from_slot as i32)
+            .map(|i| i.name.clone())
+            .unwrap_or_else(|| format!("item in slot {from_slot}"));
+        // Step 1: put the item on the cursor (skip if it's already there). Use the 28-byte structured
+        // MoveItem (possessions→cursor); the old flat 12-byte packet was silently dropped by the
+        // server, so the item never reached the cursor (eqoxide#26).
+        if from_slot != SLOT_CURSOR {
+            stream.send_app_packet(OP_MOVE_ITEM, &build_move_item(from_slot, SLOT_CURSOR));
+            gs.move_item(from_slot as i32, SLOT_CURSOR as i32); // mirror locally
+        }
+        // Send OP_TradeRequest { to_mob_id = npc, from_mob_id = player }.
+        let mut req = [0u8; 8];
+        req[0..4].copy_from_slice(&npc_id.to_le_bytes());
+        req[4..8].copy_from_slice(&gs.player_id.to_le_bytes());
+        stream.send_app_packet(OP_TRADE_REQUEST, &req);
+        gs.trade_ack_ready = false;
+        self.give_state = Some(GiveState { npc_id, ticks_waiting: 0, await_tx, item_name, accepted: false });
+        tracing::info!("EQ: give: OP_TradeRequest to npc_id={} (item slot {})", npc_id, from_slot);
+        gs.log_msg("trade", "Offering item to NPC...");
+    }
+
+    /// Resolve a parked AWAITED give on OP_FinishTrade (A3 Migration 2, #448). Called from the gameplay
+    /// loop AFTER `apply_packet` (which cleared the trade slots), exactly as the buy fulfils are.
+    /// OP_FinishTrade is a 0-byte packet with no correlation data, but for our initiator turn-in it
+    /// unambiguously means the NPC ACCEPTED the item — a mismatch instead returns the item on the
+    /// cursor with NO OP_FinishTrade. So a finish while an awaited give is parked in phase 2 resolves
+    /// THAT give as `Resolved(GiveOk)` carrying the item name captured at send time. No-op unless a
+    /// phase-2 awaited give is parked — a fire-and-forget give already cleared `give_state` at accept
+    /// (it never awaited a result), so its finish correctly resolves nothing. Non-blocking; never
+    /// `.await`s; a dropped receiver (HTTP already timed out) is ignored.
+    pub fn fulfill_give_ok(&mut self) {
+        let resolves = self.give_state.as_ref()
+            .map(|g| g.accepted && g.await_tx.is_some())
+            .unwrap_or(false);
+        if !resolves { return; }
+        let g = self.give_state.take().unwrap();
+        let npc_id = g.npc_id;
+        let item_name = g.item_name;
+        if let Some(tx) = g.await_tx {
+            let _ = tx.send(crate::command_state::CommandResult::Resolved(
+                crate::command_state::GiveOk { npc_id, item_name }));
+        }
+    }
+
+    /// Reap a parked AWAITED give as `Unconfirmed` (A3 Migration 2, #448) — fired on a zone change so
+    /// a crossing mid-give can't strand the `Sender` or let a stray OP_FinishTrade in the new zone
+    /// mis-resolve it. Mirrors `reap_pending_buy`. Only touches an AWAITED give (a fire-and-forget give
+    /// in flight is left to its own tick-abort, unchanged). No-op when nothing awaited is parked.
+    pub fn reap_pending_give(&mut self) {
+        let awaited = self.give_state.as_ref().map(|g| g.await_tx.is_some()).unwrap_or(false);
+        if !awaited { return; }
+        if let Some(mut g) = self.give_state.take() {
+            if let Some(tx) = g.await_tx.take() {
+                let _ = tx.send(crate::command_state::CommandResult::Unconfirmed);
             }
         }
     }
@@ -2281,6 +2435,177 @@ mod tests {
         assert!(matches!(resp_a.await.unwrap(), crate::command_state::CommandResult::Resolved(_)),
             "the echo must resolve the FIRST (parked) buy, not the rejected second one");
         assert!(nav.pending_buy.is_none(), "the parked buy is consumed once");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+    // A3 Migration 2 (#448): the honest awaited quest-turn-in (give) path. These drive a give
+    // through the real `tick_give` state machine (the loop's own `command` slot is shared with the
+    // drain, so a real request→take round-trip runs), advance it with `gs.trade_ack_ready`, and feed
+    // OP_FinishTrade exactly as `gameplay.rs` does (via `fulfill_give_ok`).
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+
+    fn seed_give_gs() -> GameState {
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        gs.inventory.push(crate::game_state::InvItem {
+            slot: 23, name: "Bone Chips".into(), ..Default::default()
+        });
+        gs
+    }
+
+    /// SUCCESS: an awaited give, driven through `tick_give`, acked, then confirmed by OP_FinishTrade,
+    /// resolves to `Resolved(GiveOk)` carrying the NPC id and the item name captured at send time.
+    /// `give_state` is consumed exactly once.
+    #[tokio::test]
+    async fn awaited_give_resolves_on_finish_trade_with_the_receipt() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_give_gs();
+
+        let (tx, resp) = tokio::sync::oneshot::channel();
+        nav.command.request_give_await(11, 23, tx);
+        // Tick 1: begin the trade (OP_TradeRequest sent, phase 1 parked awaiting the ack).
+        nav.tick_give(&mut stream, &mut gs);
+        assert!(nav.give_state.is_some(), "the awaited give must be parked after begin");
+
+        // The server acks the trade session; tick 2 sends the accept and enters phase 2 (still parked).
+        gs.trade_ack_ready = true;
+        nav.tick_give(&mut stream, &mut gs);
+        assert!(nav.give_state.is_some(), "an awaited give must stay parked through phase 2 (await finish)");
+
+        // OP_FinishTrade arrives — apply it (clears trade slots) THEN fulfil, exactly as the gameplay
+        // loop does after `apply_packet`.
+        apply_packet(&mut gs, &AppPacket { opcode: OP_FINISH_TRADE, payload: vec![] });
+        nav.fulfill_give_ok();
+
+        assert_eq!(
+            resp.await.unwrap(),
+            crate::command_state::CommandResult::Resolved(crate::command_state::GiveOk {
+                npc_id: 11, item_name: "Bone Chips".into(),
+            }),
+        );
+        assert!(nav.give_state.is_none(), "give_state must be consumed exactly once");
+    }
+
+    /// NO-ACK SILENCE — THE HONESTY PROOF (net side). The NPC never acks: `tick_give`'s phase-1 abort
+    /// fires after `GIVE_ACK_TIMEOUT_TICKS`, resolving the awaited give to `Unconfirmed` — NEVER
+    /// success — and clears the state. Proves the NET verdict is delivered (which the HTTP side, whose
+    /// timeout is strictly longer, maps to 202).
+    #[tokio::test]
+    async fn awaited_give_with_no_ack_times_out_to_unconfirmed_never_success() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_give_gs();
+
+        let (tx, mut resp) = tokio::sync::oneshot::channel();
+        nav.command.request_give_await(11, 23, tx);
+        nav.tick_give(&mut stream, &mut gs); // begin
+        // No ack ever arrives. Tick until the phase-1 abort fires.
+        for _ in 0..GIVE_ACK_TIMEOUT_TICKS {
+            assert!(matches!(resp.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
+                "the give must not resolve before the timeout — never a fabricated success");
+            nav.tick_give(&mut stream, &mut gs);
+        }
+        assert_eq!(resp.try_recv(), Ok(crate::command_state::CommandResult::Unconfirmed),
+            "a give that was never acked is honestly UNKNOWN, never success");
+        assert!(nav.give_state.is_none(), "the aborted give must clear its state");
+    }
+
+    /// ITEM-MISMATCH: the NPC acks and we send the accept, but the item doesn't match the turn-in, so
+    /// the server returns it on the cursor with NO OP_FinishTrade. `tick_give`'s phase-2 abort fires
+    /// after `GIVE_FINISH_TIMEOUT_TICKS` → the honest `Unconfirmed` (never a claimed success or an
+    /// unprovable `Refused`).
+    #[tokio::test]
+    async fn awaited_give_item_mismatch_no_finish_is_unconfirmed() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_give_gs();
+
+        let (tx, mut resp) = tokio::sync::oneshot::channel();
+        nav.command.request_give_await(11, 23, tx);
+        nav.tick_give(&mut stream, &mut gs);          // begin (phase 1)
+        gs.trade_ack_ready = true;
+        nav.tick_give(&mut stream, &mut gs);          // ack → accept sent, enter phase 2
+        assert!(nav.give_state.is_some());
+        // No OP_FinishTrade (item mismatch). Tick until the phase-2 abort fires.
+        for _ in 0..GIVE_FINISH_TIMEOUT_TICKS {
+            assert!(matches!(resp.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
+                "a give awaiting finish must not resolve early");
+            nav.tick_give(&mut stream, &mut gs);
+        }
+        assert_eq!(resp.try_recv(), Ok(crate::command_state::CommandResult::Unconfirmed),
+            "an item-mismatch turn-in (no OP_FinishTrade) is honestly UNKNOWN, not success");
+        assert!(nav.give_state.is_none());
+    }
+
+    /// SINGLETON-IN-FLIGHT: a second awaited give while one is in flight is rejected `Refused` with no
+    /// new trade started, and the FIRST give is untouched (still parked, still resolvable). Mirrors the
+    /// buy discipline — OP_FinishTrade carries no per-request token, so one-at-a-time is the only
+    /// unambiguous correlation.
+    #[tokio::test]
+    async fn a_second_awaited_give_is_rejected_in_flight_and_leaves_the_first() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_give_gs();
+
+        // Give A parks.
+        let (tx_a, resp_a) = tokio::sync::oneshot::channel();
+        nav.command.request_give_await(11, 23, tx_a);
+        nav.tick_give(&mut stream, &mut gs);
+        assert!(nav.give_state.is_some(), "give A must be parked");
+
+        // Give B arrives while A is in flight → rejected in-flight, A untouched.
+        let (tx_b, resp_b) = tokio::sync::oneshot::channel();
+        nav.command.request_give_await(11, 23, tx_b);
+        nav.tick_give(&mut stream, &mut gs);
+        match resp_b.await.unwrap() {
+            crate::command_state::CommandResult::Refused(reason) =>
+                assert!(reason.contains("already in flight"), "B must be told a give is in flight, got: {reason}"),
+            other => panic!("a second in-flight give must be Refused, not {other:?}"),
+        }
+        assert!(nav.give_state.is_some(), "give A must STILL be parked after B is rejected");
+
+        // A still resolves normally on its own OP_FinishTrade.
+        gs.trade_ack_ready = true;
+        nav.tick_give(&mut stream, &mut gs); // accept → phase 2
+        apply_packet(&mut gs, &AppPacket { opcode: OP_FINISH_TRADE, payload: vec![] });
+        nav.fulfill_give_ok();
+        assert!(matches!(resp_a.await.unwrap(), crate::command_state::CommandResult::Resolved(_)),
+            "the finish must resolve the FIRST (parked) give, not the rejected second one");
+    }
+
+    /// REAPER: a zone change while an awaited give is parked fires `Unconfirmed` for the stranded
+    /// Sender and clears `give_state`, so a stray OP_FinishTrade in the NEW zone can't mis-resolve it.
+    /// Driven through the real `sync_zone_points` zone-change hook.
+    #[tokio::test]
+    async fn zone_change_reaps_a_parked_give_as_unconfirmed() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_give_gs();
+
+        let (tx, resp) = tokio::sync::oneshot::channel();
+        nav.command.request_give_await(11, 23, tx);
+        nav.tick_give(&mut stream, &mut gs);
+        assert!(nav.give_state.is_some());
+
+        gs.zone_name = "newzone".into();
+        nav.sync_zone_points(&gs);
+
+        assert!(nav.give_state.is_none(), "the parked give must be cleared on a zone change");
+        assert_eq!(resp.await.unwrap(), crate::command_state::CommandResult::Unconfirmed);
+    }
+
+    /// THE TWO-TIMEOUT ORDERING LANDMINE (#448): the net-side worst-case verdict time (phase 1 + phase
+    /// 2 run in SEQUENCE) must be strictly LESS than the HTTP-side await budget, so the NET verdict
+    /// (Resolved/Unconfirmed) is what the caller receives, never a vaguer HTTP-elapsed 202. This pins
+    /// that relationship in the constants themselves.
+    #[test]
+    fn net_give_timeout_is_shorter_than_the_http_await_budget() {
+        let net_ms = (GIVE_ACK_TIMEOUT_TICKS + GIVE_FINISH_TIMEOUT_TICKS) as u128 * NAV_TICK_MS;
+        let http_ms = 8_000u128; // GIVE_HTTP_TIMEOUT_SECS (8) in http::interact
+        assert!(net_ms < http_ms,
+            "net worst-case verdict ({net_ms}ms) must land before the HTTP timeout ({http_ms}ms) so the \
+             net verdict wins — otherwise the caller gets a vague HTTP-elapsed 202 instead of the real outcome");
     }
 
     #[test]
