@@ -5,6 +5,7 @@ pub mod item;
 pub mod login;
 pub mod action_loop;
 pub mod packet_handler;
+pub mod packet_telemetry;
 pub mod protocol;
 pub mod transport;
 pub mod ucs;
