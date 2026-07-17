@@ -52,13 +52,23 @@
 //! meaningful honesty guarantee. It cannot be, because both forms could agree on a WRONG answer.
 //!
 //! The meaningful guarantee is **planner ⇒ controller agreement**: every segment the planner emits
-//! must be one the controller can actually walk (design §6c). This module delivers that only
-//! PARTIALLY. It is closed on the CHEST axis — the planner's top probe and the controller's contact
-//! ray are now the one `Body::chest` field (#386 closed on the chest axis, the drift that wedged
-//! the walker under lintels). The FOOT axis remains divergent (the planner probes at
-//! `Body::feet_clr` ≈ 2.5 while the controller's low contact ray sits at `Body::foot` = 0.5), and
-//! that residual is tracked as **#420** — to be closed when the controller is wired to consult this
-//! type directly (Phase 2). Do not read the `fast`/`diagnostic` agreement as if it discharged #420.
+//! must be one the controller can actually walk (design §6c). It is now closed on BOTH vertical
+//! axes, by construction:
+//!
+//! * **CHEST axis (#386)** — the planner's top probe and the controller's chest contact ray are the
+//!   one `Body::chest` field. The drift that wedged the walker under lintels is unrepresentable.
+//! * **FOOT axis (#420)** — the planner's low probe is `Body::feet_clr()` = `foot + step_up`, DERIVED
+//!   from the controller's own [`Body::foot`] contact ray and its real [`Body::step_up`] reach. That
+//!   sum is the exact height of the controller's raised step-slide contact ray, so a low obstacle
+//!   taller than it blocks the planner AND defeats the controller's step-up, and a shorter one
+//!   passes both. Previously the planner's low probe was a bare literal (`STEP_UP + 0.5`) that only
+//!   COINCIDED with the controller's step reach — #420's permissive-planner lie: nothing forced it
+//!   to track the controller if either constant moved. It is now one sum, read twice.
+//!
+//! The residual under-modelling is the reverse (safe) direction: geometry in z ∈ (`chest`, `height`)
+//! is invisible to BOTH (neither refuses it), and standing headroom is defended separately by
+//! [`Body::agent_height`]. That is consistent, not a lie — the planner never PROMISES a pose the
+//! controller then rejects.
 
 use crate::nav::collision::Collision;
 
@@ -71,15 +81,22 @@ use crate::nav::collision::Collision;
 pub struct Body {
     /// Wall-collision radius, matched to the reference RoF2 client (`movement::PLAYER_RADIUS`).
     pub radius: f32,
-    /// The controller's LOW contact ray, just above the feet. The planner deliberately does NOT
-    /// probe here: a probe this low would read every ≤2 u stair riser as a wall, and risers up to
-    /// [`crate::movement::STEP_UP`] (+ ground snap) are climbed by the controller's step-up, not
-    /// collided with.
+    /// The controller's LOW contact ray, just above the feet (`movement::CharacterController::slide`
+    /// `contact_probes()[0]`). The planner deliberately does NOT probe at this raw height: a probe
+    /// this low would read every ≤2 u stair riser as a wall, and risers up to [`Body::step_up`] are
+    /// climbed by the controller's step-up, not collided with. The planner's low probe is instead
+    /// [`Body::feet_clr`] = `foot + step_up`, the exact height of the controller's RAISED step-slide
+    /// contact ray — so the foot axis is one number, not two hand-tuned ones (#420).
     pub foot: f32,
-    /// The planner's LOW probe: just above the controller's real maximum step-up
-    /// (`STEP_UP` 2.0 + `GROUND_SNAP_TOL` 0.5). A riser the walker cannot mount blocks this ray;
-    /// a riser it can mount passes under it. (#239)
-    pub feet_clr: f32,
+    /// The controller's step-up reach (`movement::STEP_UP`): to climb a riser the controller raises
+    /// its cylinder by `step_up` and re-casts its [`Body::foot`] contact ray, so the tallest LOW
+    /// obstacle it can clear tops out at `foot + step_up`. THE shared foot-axis field (#420, the
+    /// twin of the #386 chest unification): the planner's low probe [`Body::feet_clr`] is DERIVED
+    /// from this same `foot + step_up` sum, so "planner clears the low band" and "controller steps
+    /// the low band" cannot drift apart. Before this, the planner's low probe was the literal
+    /// `STEP_UP + 0.5` (where the `0.5` was silently `foot`), free to diverge from the controller's
+    /// real step capability — #420's permissive-planner lie. (#239)
+    pub step_up: f32,
     /// The TOP probe — **the shared one, and the whole point**. This is simultaneously the
     /// controller's chest contact ray (`movement::CharacterController::slide`) and the planner's
     /// upper edge probe (`assets` A*). One field, two readers: the #386 drift (planner 3.0 vs
@@ -133,7 +150,10 @@ pub struct Body {
 pub const PLAYER_BODY: Body = Body {
     radius: crate::movement::PLAYER_RADIUS,
     foot: 0.5,
-    feet_clr: crate::movement::STEP_UP + 0.5,
+    // The controller's real step-up reach; the planner's low probe is DERIVED as `foot + step_up`
+    // (see `feet_clr`), so it is exactly the height of the controller's raised step-slide contact
+    // ray. Numerically 0.5 + 2.0 = 2.5 (the historical `feet_clr`) — bound now, not coincidental.
+    step_up: crate::movement::STEP_UP,
     chest: 4.0,
     ring: 3.0,
     height: 6.0,
@@ -153,9 +173,17 @@ pub const PLAYER_BODY: Body = Body {
 };
 
 impl Body {
+    /// The PLANNER's LOW probe height (#420): the controller's [`Body::foot`] contact ray lifted by
+    /// its real [`Body::step_up`] reach. NOT a stored constant — derived, so it is exactly the
+    /// height of the controller's raised step-slide contact ray and CANNOT be set to a more
+    /// permissive value. A low obstacle taller than this blocks the planner here AND defeats the
+    /// controller's step-up; a shorter one passes both. That equality is the foot-axis honesty
+    /// guarantee, and it is unrepresentable-as-false because there is one sum, read twice.
+    #[inline]
+    pub const fn feet_clr(&self) -> f32 { self.foot + self.step_up }
     /// The heights the PLANNER sweeps a walk edge at. Derived, not re-declared.
     #[inline]
-    pub const fn planner_probes(&self) -> [f32; 2] { [self.feet_clr, self.chest] }
+    pub const fn planner_probes(&self) -> [f32; 2] { [self.feet_clr(), self.chest] }
     /// The heights the CONTROLLER casts its contact rays at. Derived, not re-declared.
     #[inline]
     pub const fn contact_probes(&self) -> [f32; 2] { [self.foot, self.chest] }
@@ -674,13 +702,86 @@ mod tests {
     /// its cheapest form: if someone re-declares either height locally, the lintel fixture above
     /// catches the behaviour; this catches the structure.
     #[test]
-    fn planner_top_probe_is_the_controllers_chest_ray() {
+    fn planner_probes_are_derived_from_the_controllers_body_on_both_axes() {
         let planner = PLAYER_BODY.planner_probes();
         let contact = PLAYER_BODY.contact_probes();
+        // CHEST axis (#386): the planner's top probe IS the controller's chest contact ray.
         assert_eq!(planner[1], contact[1], "the top probe must be shared (the #386 axis)");
+        // FOOT axis (#420): the planner's low probe is the controller's foot contact ray lifted by
+        // the controller's own step-up reach — DERIVED, not a coincident literal. This is the exact
+        // height of the controller's raised step-slide contact ray, so a low obstacle taller than it
+        // blocks BOTH and a shorter one passes BOTH. Re-declaring either as a bare constant re-opens
+        // the #420 drift; this pins the derivation, and `..._low_wall_...` below pins the behaviour.
+        assert_eq!(PLAYER_BODY.step_up, crate::movement::STEP_UP,
+            "the body's step-up must be the controller's real step-up capability");
+        assert_eq!(planner[0], contact[0] + PLAYER_BODY.step_up,
+            "the planner's low probe must be foot + step_up (the #420 foot-axis binding)");
+        assert_eq!(planner[0], PLAYER_BODY.feet_clr());
+        // ...and it must still clear the step-up band, or every mountable stair reads as a wall
+        // (the over-rejection direction: a body too fat also lies).
         assert!(planner[0] > crate::movement::STEP_UP,
             "the planner's low probe must clear the step-up band, or every stair reads as a wall");
         assert!(PLAYER_BODY.radius >= crate::movement::PLAYER_RADIUS);
+    }
+
+    /// A corridor sealed by a thin LOW WALL 3.0 u tall — taller than the controller's step reach
+    /// (`foot + step_up` = 2.5 u) and with NO walkable top, but shorter than the 4.0 u chest ray.
+    /// The #420 foot-axis twin of [`lintel_corridor`]: the controller's step-up cannot mount it (its
+    /// raised contact ray at 2.5 u hits the wall), and the planner's LOW probe (`feet_clr` = 2.5 u)
+    /// also hits it — so A* refuses the corridor. Drop the low probe (leave only the 4.0 u chest)
+    /// and the wall passes UNDER it: the planner would then route through a wall the walker cannot
+    /// step. That is the mutation this fixture pins.
+    fn low_wall_corridor() -> Collision {
+        col(vec![
+            floor_at(0.0, -40.0, 40.0, -8.0, 8.0),
+            panel(0.0, -8.0, 8.0, 0.0, 3.0), // 3u wall: above the 2.5u step reach, below the 4.0u chest
+            mesh(vec![[-8.0, 0.0, -40.0], [-8.0, 10.0, -40.0], [-8.0, 10.0, 40.0], [-8.0, 0.0, 40.0]]),
+            mesh(vec![[8.0, 0.0, -40.0], [8.0, 10.0, -40.0], [8.0, 10.0, 40.0], [8.0, 0.0, 40.0]]),
+        ])
+    }
+
+    /// **THE #420 FOOT-AXIS FIXTURE (the foot twin of the lintel test).** A low wall the controller's
+    /// step-up cannot mount must ALSO block the planner. Same class as #386, different axis: the
+    /// planner probed the foot band at `feet_clr` = 2.5 u while the controller contacts at `foot` =
+    /// 0.5 u and recovers ≤ `foot + step_up` = 2.5 u via step-up — so an obstacle in (2.5, chest]
+    /// with no walkable top is solid to the walker yet, if the planner ever stopped probing the foot
+    /// band, clear to A*.
+    ///
+    /// Mutation check (verified at authoring time): make the planner skip the foot band — e.g.
+    /// `planner_probes` → `[self.chest, self.chest]`, or `feet_clr()` raised above 3.0 — and the
+    /// `can_traverse_fast` assertion below goes RED, because the 4.0 u chest ray clears the 3.0 u
+    /// wall. The derivation `feet_clr = foot + step_up` is what makes that state unrepresentable.
+    #[test]
+    fn planner_never_routes_over_a_low_wall_the_walker_cant_step() {
+        let c = low_wall_corridor();
+        let start = [-20.0, 0.0, 0.0];
+        let goal = [20.0, 0.0, 0.0];
+
+        // Pin the fixture premise: the controller genuinely cannot cross (step-up tops out at 2.5 u;
+        // default intent has no hop/jump, so a 3 u wall is a hard stop, exactly as a WASD player).
+        let mut ctrl = CharacterController::new(start);
+        ctrl.on_ground = true;
+        for _ in 0..600 {
+            ctrl.step(MoveIntent { wish_dir: [1.0, 0.0], speed: 44.0, ..Default::default() },
+                      1.0 / 60.0, &c);
+        }
+        assert!(ctrl.pos[0] < 0.0,
+            "fixture premise: the controller must be blocked by the low wall (east={})", ctrl.pos[0]);
+
+        // The crisp foot-axis invariant: the planner's OWN edge test refuses the wall-crossing
+        // segment. This is the assertion a reverted foot probe flips to `true`.
+        let t = Traversability::new(&c, PLAYER_RADIUS, 8.0, 0.0, false);
+        let west = Point::new([-6.0, 0.0], 0.0);
+        let east = Point::new([6.0, 0.0], 0.0);
+        assert!(!t.can_traverse_fast(west, east),
+            "planner accepted a segment across a 3u wall the walker's step-up can't mount (#420)");
+
+        // And end to end: an honest "no route" is fine; a route across the wall is the #420 lie.
+        if let Some(route) = c.find_path(start, goal, PLAYER_RADIUS, &[], false) {
+            let crossed = route.iter().any(|w| w[0] > 2.0);
+            assert!(!crossed,
+                "planner routed over a low wall the controller collides with (#420): {route:?}");
+        }
     }
 
     /// **THE FIELD IS DETERMINISTIC AND HISTORY-BLIND (the #394 discipline).** A memoised value is
