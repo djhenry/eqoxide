@@ -145,7 +145,7 @@ pub(crate) mod tests {
             Default::default(), Default::default(), Default::default(), Default::default(),
             Default::default(), Default::default(), Default::default(), Default::default(),
             Default::default(), Default::default(),
-            nav.clone(), lifecycle.clone(), camera.manual_move.clone(),
+            nav.clone(), lifecycle.clone(),
         );
         HttpState {
             camera,

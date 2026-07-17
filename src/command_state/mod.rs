@@ -12,13 +12,32 @@
 //! shared-Arc identity is what lets a domain migrate one file at a time without any behavior change:
 //! a migrated `request_*` and an un-migrated `*slot.lock() = ..` still land in the same slot.
 //!
-//! SCOPE: the **command / action** domains only — Combat, Merchant, Inventory, Interact, Quest,
-//! Group, Guild, Trainer, Social, Chat, plus the movement commands (Nav goto/follow/stop, Camera
-//! manual-move, Lifecycle exit/respawn). It does **not** absorb the read-path published snapshots
-//! (`GameState`, merchant/inventory/group rosters, nav status, …) — those stay on the model/read
-//! side. A few `ipc` bundles physically carry a snapshot field alongside their command slots (e.g.
-//! `MerchantSlots.merchant`); `CommandState` holds the whole bundle for construction convenience but
-//! deliberately exposes methods over the COMMAND slots only. Do NOT add snapshot getters here.
+//! SCOPE: the **view→model command / action** domains only — Combat, Merchant, Inventory, Interact,
+//! Quest, Group, Guild, Trainer, Social, Chat, plus the model-bound movement commands (Nav
+//! goto/follow/stop/zone-cross, Lifecycle exit/respawn). It does **not** absorb the read-path
+//! published snapshots (`GameState`, merchant/inventory/group rosters, nav status, …) — those stay on
+//! the model/read side. A few `ipc` bundles physically carry a snapshot field alongside their command
+//! slots (e.g. `MerchantSlots.merchant`); `CommandState` holds the whole bundle for construction
+//! convenience but deliberately exposes methods over the COMMAND slots only. Do NOT add snapshot
+//! getters here.
+//!
+//! ## MVC C2 boundary (#452) — what this facade DELIBERATELY does NOT hold
+//! C2 tidied the boundary so `CommandState` carries ONLY genuine view→**model** commands. Two things
+//! that are not view→model commands were relocated OUT (each is Arc-shared, wiring unchanged):
+//!   * **Camera / manual-move → view-only.** The manual-move/jump escape hatch (`ManualMoveReq`) is a
+//!     view→**render** command — the render thread's `CharacterController` consumes it, the Model/nav
+//!     thread never does — so it lives on `ipc::CameraSlots` (the render-bound bundle, alongside the
+//!     orbit-camera `cmd_tx`), NOT here. `App` reads it per frame; `CameraSlots::request_manual_move`
+//!     is the typed HTTP write. The orbit **camera angle** itself was already view-only (never on this
+//!     facade). The only movement input that IS a model command — the **derived heading** — is
+//!     computed render-side (`movement::manual_wish` → `heading_target`) and reaches the Model on the
+//!     controller/prediction channel (`ControllerSlots::controller_view.heading`, streamed by
+//!     `ActionLoop::stream_position`); it rides that channel atomically with the predicted position
+//!     (C1's client-prediction split) and is intentionally not carved into a separate slot.
+//!   * **Computed nav path → read-side.** The walker's committed path overlay (`ipc::NavPathView`)
+//!     is Model→View DERIVED render state, not a command, so it moved from the `NavSlots` command
+//!     bundle to `ipc::ControllerSlots` (the render↔nav integration channels). See those two `ipc`
+//!     structs' docs.
 //!
 //! Forward-compatible with A3 (Command-with-result): A3 will add result-returning variants
 //! (`request_*_await`, generalizing the existing `oneshot` reply used by `FrameReq`/`WhoReq`)
@@ -76,17 +95,20 @@ mod trainer;
 mod social;
 mod chat;
 mod nav;
-mod camera;
 mod lifecycle;
 
 /// The typed write-path facade. Holds `.clone()`d handles of the same `ipc` command bundles that
 /// `ActionLoop` and `HttpState` hold; every method is a thin typed read/write of one of their slots.
 ///
-/// (#459 stragglers) nav/camera/lifecycle are migrated too now, so every domain field is read by at
-/// least one `request_*`/`take_*`/`peek_*` method — no field-level `#[allow(dead_code)]` remains.
-/// See `nav.rs`/`camera.rs`/`lifecycle.rs` for the (narrower, non-`ActionLoop`-drain) shape those
-/// three domains ended up with, and their module docs for what was deliberately left un-migrated
-/// (`nav/walker.rs`'s internal goto state machine; `eq_net::gameplay`'s camp/respawn drain).
+/// (#459 stragglers) nav/lifecycle are migrated too now, so every domain field is read by at least
+/// one `request_*`/`take_*`/`peek_*` method — no field-level `#[allow(dead_code)]` remains. See
+/// `nav.rs`/`lifecycle.rs` for the (narrower, non-`ActionLoop`-drain) shape those domains ended up
+/// with, and their module docs for what was deliberately left un-migrated (`nav/walker.rs`'s internal
+/// goto state machine; `eq_net::gameplay`'s camp/respawn drain).
+///
+/// MVC C2 (#452): the lone camera `manual_move` slot that once sat here was relocated to the
+/// render-bound `ipc::CameraSlots` (it is a view→render command, not view→model) — see this module's
+/// doc. Every field below is now a genuine view→model command bundle.
 #[derive(Clone, Default)]
 pub struct CommandState {
     combat:    crate::ipc::CombatSlots,
@@ -101,10 +123,6 @@ pub struct CommandState {
     chat:      crate::ipc::ChatSlots,
     nav:       crate::ipc::NavSlots,
     lifecycle: crate::ipc::LifecycleSlots,
-    /// Camera's ONLY command slot (the manual-move/jump escape hatch). `CameraSlots` as a whole is
-    /// deliberately NOT held here: it has no `Default` (its snapshot's initial value is meaningful)
-    /// and its other fields are read-path. Held as the lone Arc so `CommandState` stays `Default`.
-    camera_manual_move: crate::ipc::ManualMoveReq,
 }
 
 impl CommandState {
@@ -124,11 +142,10 @@ impl CommandState {
         chat:      crate::ipc::ChatSlots,
         nav:       crate::ipc::NavSlots,
         lifecycle: crate::ipc::LifecycleSlots,
-        camera_manual_move: crate::ipc::ManualMoveReq,
     ) -> Self {
         CommandState {
             combat, merchant, inventory, interact, quest, group, guild, trainer, social, chat,
-            nav, lifecycle, camera_manual_move,
+            nav, lifecycle,
         }
     }
 }

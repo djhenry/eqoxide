@@ -425,9 +425,11 @@ pub(crate) fn currency_json(coin: [u32; 4]) -> serde_json::Value {
 /// Arc identity (not two independently-`Default`-constructed bundles) is what keeps this the same
 /// cross-thread channel the nav thread drains. See `ipc.rs` and `main.rs` wiring.
 ///
-/// A few bundle fields are unused on THIS side of a channel (e.g. `nav.nav_path_view` is written by
-/// the nav thread and read by the render thread, never by an HTTP handler) — that's expected: the
-/// bundle boundary is the DOMAIN, not "exactly the fields this struct touches".
+/// A few bundle fields are unused on THIS side of a channel (e.g. `camera.frame_req` is written by an
+/// HTTP handler and read by the render thread, never drained here) — that's expected: the bundle
+/// boundary is the DOMAIN, not "exactly the fields this struct touches". (The walker's draw-only
+/// `nav_path_view` overlay moved off `NavSlots` to `ControllerSlots` in #452 — a render↔nav channel
+/// `HttpState` never held.)
 #[derive(Clone)]
 pub(crate) struct HttpState {
     /// `/v1/camera/*` slots (#M4).
