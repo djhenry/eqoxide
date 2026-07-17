@@ -579,8 +579,12 @@ struct MessagesQuery {
 /// GET /v1/observe/messages — the in-game message log as machine-readable text (oldest→newest, last
 /// ~50 lines), published each tick by the nav thread. This is how an agent reads **NPC dialogue**:
 /// each line has a `kind` ("npc" = NPC say/emote, plus "chat", "combat", "system", "exp", "loot",
-/// "trade", "zone"), the `text`, and any `[bracketed]` quest `keywords` to say back via POST
-/// /v1/interact/say. Filter with `?kind=npc` for dialogue only.
+/// "trade", "zone"), the `text`, any `[bracketed]` quest `keywords` to say back via POST
+/// /v1/interact/say, and any `item_links` embedded in the text. `text` never contains the raw EQ
+/// item/say-link hex body — only the clean display name — and `item_links` carries the resolvable
+/// `item_id` (plus `is_saylink`) behind each link name, so an item mentioned in dialogue (e.g.
+/// "[rat whiskers]") can be looked up rather than only read as text (eqoxide#256). Filter with
+/// `?kind=npc` for dialogue only.
 async fn get_messages(
     State(s): State<HttpState>,
     Query(q): Query<MessagesQuery>,
@@ -1126,7 +1130,7 @@ mod tests {
 
     fn push_message(state: &HttpState, kind: &str, text: &str) {
         state.chat.messages.lock().unwrap().push(MessageEntry {
-            kind: kind.to_string(), text: text.to_string(), keywords: vec![],
+            kind: kind.to_string(), text: text.to_string(), keywords: vec![], item_links: vec![],
         });
     }
 

@@ -57,6 +57,9 @@ pub struct LogEntry {
     pub kind: String,
     pub text: String,
     pub timestamp: std::time::Instant,
+    /// Any item/say links parsed out of `text` — the display text is already clean (hex-free);
+    /// this carries the resolvable `item_id` alongside it (eqoxide#256).
+    pub item_links: Vec<crate::game_state::ItemLink>,
 }
 
 /// All data the renderer needs for one frame.
@@ -323,6 +326,7 @@ impl SceneState {
             kind: m.kind.clone(),
             text: m.text.clone(),
             timestamp: m.timestamp,
+            item_links: m.item_links.clone(),
         }).collect();
 
         SceneState {
@@ -415,6 +419,7 @@ impl Default for LogEntry {
             kind: String::new(),
             text: String::new(),
             timestamp: std::time::Instant::now(),
+            item_links: Vec::new(),
         }
     }
 }

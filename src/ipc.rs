@@ -521,12 +521,16 @@ pub type LootReq = Arc<Mutex<Option<u32>>>;
 /// One machine-readable line from the in-game message log (GET /v1/observe/messages). `kind` is the
 /// channel ("npc" = NPC dialogue/emotes, "chat", "combat", "system", "exp", "loot", "trade",
 /// "zone", …); `keywords` are the `[bracketed]` quest reply words extracted from the text (say them
-/// back via POST /v1/interact/say to advance dialogue quests).
+/// back via POST /v1/interact/say to advance dialogue quests); `item_links` are any EQ item/say
+/// links the text contained — `text` already shows only the clean display name (the raw hex link
+/// body is never sent to an agent), and `item_links` gives the resolvable `item_id` behind each one
+/// (eqoxide#256). Empty when the line had no links.
 #[derive(Clone, serde::Serialize)]
 pub struct MessageEntry {
-    pub kind:     String,
-    pub text:     String,
-    pub keywords: Vec<String>,
+    pub kind:        String,
+    pub text:        String,
+    pub keywords:    Vec<String>,
+    pub item_links:  Vec<crate::game_state::ItemLink>,
 }
 
 /// Live snapshot of the in-game message log, published each tick by the nav thread and read by

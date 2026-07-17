@@ -362,6 +362,29 @@ pub struct DialogueChoice {
     pub icon:      u32,        // ornament_icon from the link body
 }
 
+/// One item/say link parsed out of chat or NPC text (eqoxide#256).
+///
+/// `parse_say_links` already hides the raw 56-hex-char link body from every message render path,
+/// but until this struct existed the underlying `item_id` was thrown away for anything that
+/// WASN'T a dialogue saylink — an agent could read "[Fine Steel Rapier]" but had no id to resolve
+/// it against an item lookup. `ItemLink` is the honest middle ground: clean display `text` (what a
+/// player reads) PLUS the wire `item_id` (what a lookup needs), attached to the message that
+/// contained it.
+///
+/// `is_saylink` is `true` when `item_id == SAYLINK_ITEM_ID` (0xFFFFF) — a clickable dialogue
+/// *phrase*, not a real item (see [`DialogueChoice`], which already exposes the click-to-say
+/// mechanism for these). Confirmed against EQEmu `common/say_link.cpp`/`common/features.h` (via
+/// eq-client-expert): for a saylink, the link body's augment fields are NOT item augments — they're
+/// repurposed as a saylink-table lookup key — so this struct deliberately does not surface them as
+/// if they were. When `is_saylink` is `false`, `item_id` is a genuine item-table id.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+pub struct ItemLink {
+    /// Human-readable label shown between the link delimiters (what a player reads).
+    pub text:       String,
+    pub item_id:    u32,
+    pub is_saylink: bool,
+}
+
 /// One guild member from the guild roster (OP_GuildMemberList). Surfaced via GET /v1/guild/roster
 /// so agents can see who is in the guild and who is online, the way /v1/group/roster works for a
 /// group. (#295)
@@ -788,6 +811,13 @@ impl GameState {
     }
 
     pub fn log_msg(&mut self, kind: &str, text: &str) {
+        self.log_msg_with_item_links(kind, text, Vec::new());
+    }
+
+    /// Same as [`GameState::log_msg`], but also attaches any [`ItemLink`]s found in `text` (parsed
+    /// by `parse_say_links` in `eq_net::packet_handler`) so a caller reading the message log gets a
+    /// resolvable item reference alongside the clean display text (eqoxide#256).
+    pub fn log_msg_with_item_links(&mut self, kind: &str, text: &str, item_links: Vec<ItemLink>) {
         // 400 entries so the chat window has real scrollback (was 50).
         if self.messages.len() >= 400 {
             self.messages.pop_front();
@@ -796,6 +826,7 @@ impl GameState {
             kind: kind.to_string(),
             text: text.to_string(),
             timestamp: std::time::Instant::now(),
+            item_links,
         });
     }
 

@@ -392,6 +392,7 @@ mod tests {
                 kind: "chat".into(),
                 text: format!("chatter line {i} with some width to it"),
                 timestamp: std::time::Instant::now(),
+                item_links: vec![],
             });
         }
 

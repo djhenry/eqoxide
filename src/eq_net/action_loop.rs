@@ -878,8 +878,9 @@ impl ActionLoop {
     }
 
     /// Publish the in-game message log from `gs` into the shared slot (GET /messages), converting
-    /// each LogEntry into a serializable MessageEntry and extracting `[bracketed]` quest keywords
-    /// (the same splitter the HUD dialogue panel uses).
+    /// each LogEntry into a serializable MessageEntry, extracting `[bracketed]` quest keywords
+    /// (the same splitter the HUD dialogue panel uses), and carrying along any item/say links the
+    /// text contained (eqoxide#256) so an agent gets a resolvable `item_id` alongside the clean text.
     pub fn sync_messages(&self, gs: &GameState) {
         let mut out = self.chat.messages.lock().unwrap();
         out.clear();
@@ -889,7 +890,12 @@ impl ActionLoop {
                 .map(|(seg, _)| seg.trim_matches(|c| c == '[' || c == ']').trim().to_string())
                 .filter(|k| !k.is_empty())
                 .collect();
-            crate::ipc::MessageEntry { kind: m.kind.clone(), text: m.text.clone(), keywords }
+            crate::ipc::MessageEntry {
+                kind: m.kind.clone(),
+                text: m.text.clone(),
+                keywords,
+                item_links: m.item_links.clone(),
+            }
         }));
         drop(out);
         // Publish the current clickable NPC-dialogue choices (GET /v1/observe/dialogue, #120).
