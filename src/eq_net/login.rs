@@ -108,16 +108,16 @@ pub async fn run_login_flow(
                 {
                     let mut map = world.entity_positions.lock().unwrap();
                     let mut ids = world.entity_ids.lock().unwrap();
-                    for (&id, e) in &gs.entities {
+                    for (&id, e) in &gs.world.entities {
                         map.insert(e.name.clone(), (e.x, e.y, e.z));
                         ids.insert(e.name.clone(), id);
                     }
                     tracing::info!("NAV: entity map seeded with {} entities", map.len());
                 }
                 // Seed zone points (in case OP_SEND_ZONE_POINTS arrived during login phase).
-                if !gs.zone_points.is_empty() {
-                    *world.zone_points.lock().unwrap() = gs.zone_points.clone();
-                    tracing::info!("NAV: {} zone points seeded", gs.zone_points.len());
+                if !gs.world.zone_points.is_empty() {
+                    *world.zone_points.lock().unwrap() = gs.world.zone_points.clone();
+                    tracing::info!("NAV: {} zone points seeded", gs.world.zone_points.len());
                 }
                 let char_name = config.character_name.clone();
                 let action_loop = ActionLoop::new(
@@ -461,9 +461,9 @@ impl<'a> LoginProtocol<'a> {
             // server re-issue the whole door/object/zone-point stream (#322).
             OP_NEW_ZONE if !self.done_new_zone => {
                 self.done_new_zone = true;
-                // apply_packet already updated gs.zone_name; just send protocol response.
+                // apply_packet already updated gs.world.zone_name; just send protocol response.
                 stream.send_app_packet(OP_REQ_CLIENT_SPAWN, &[]);
-                tracing::info!("EQ: zone: {} — sent ReqClientSpawn", gs.zone_name);
+                tracing::info!("EQ: zone: {} — sent ReqClientSpawn", gs.world.zone_name);
                 PhaseResult::Continue
             }
             OP_WEATHER if !self.done_zone_weather => {

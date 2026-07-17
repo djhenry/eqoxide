@@ -436,6 +436,78 @@ pub struct WhoEntry {
     pub anon:  bool,
 }
 
+/// Server-authoritative, **Model-written-only** world state (MVC increment C1, #451).
+///
+/// This is the *world as the server sees it*: the zone the server placed us in, its environment
+/// (safe point, underworld floor, distance fog), and the live contents of that zone (spawns,
+/// doors, exit points). Every field here is written EXCLUSIVELY by the Model — the `eq-net`
+/// thread — from inbound server packets (OP_NewZone, OP_ZoneSpawns, OP_SpawnDoor,
+/// OP_SEND_ZONE_POINTS, …). No View (render or HTTP) ever writes it.
+///
+/// ## The Model-only invariant (checkable)
+/// A View cannot mutate `WorldState` because a View never holds a `&mut GameState`: the net
+/// thread owns the one mutable pre-publish `GameState`, mutates `world`, and publishes an
+/// **immutable** `Arc<GameState>` snapshot each tick (`gameplay::publish_snapshot` → `ArcSwap`);
+/// render/HTTP read it lock-free via `load_full`, holding only a shared `Arc<GameState>` (#343).
+/// So the ONLY `&mut WorldState` in the program is reachable solely from net-thread code — the
+/// property "WorldState is Model-only" is enforced by ownership, not convention, and is grep-
+/// checkable: every `.world.<field> =` write site is in the `eq_net` module.
+///
+/// ## NOT in here: the client prediction
+/// The local player's *predicted* position is deliberately NOT a `WorldState` field — see the
+/// `player_x/y/z/heading` doc on [`GameState`]. That is client-side prediction owned by the
+/// render `CharacterController`, not server truth.
+///
+/// C2 (#452) migrates the remaining Model-written `GameState` fields (player facts, combat,
+/// spells, tasks, merchants, groups, chat, loot, …) into here using this same boundary; C1
+/// establishes the type + the zone/world-contents cluster + the named prediction split.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct WorldState {
+    // Zone
+    pub zone_name: String,
+    pub zone_id: u16,
+    pub zone_changed: bool,
+    /// #335/agent-honesty: the last zone-entry handshake (an in-game zone change) TIMED OUT — we
+    /// connected to the new zone server and sent OP_ZoneEntry, but never got OP_NewZone → … →
+    /// OP_SendExpZonein back within the deadline (the `zone-entry-handshake-race.md` never-accepted
+    /// case). Set true only on that failure; `zone_name` is CLEARED alongside it so no agent reads the
+    /// OLD zone as the current one. Reset to false at the start of every zone-in by `begin_zone_in`.
+    /// Without this a wedged zone-in kept reporting `connected: true` + the previous `zone_name` — a
+    /// confident falsehood (#343/#470 anti-pattern).
+    pub zone_in_failed: bool,
+    pub safe_x: f32,
+    pub safe_y: f32,
+    pub safe_z: f32,
+    /// Zone "underworld" floor from OP_NewZone (rof2_structs.h @608): the server treats any position
+    /// at or below this Z as fallen-through-the-world and does a ZoneToBindPoint recovery. `None`
+    /// until OP_NewZone is parsed. The movement controller clamps against it so a collision gap
+    /// can't drop us below it and trip the server's below-world drop → CLE linkdead (#150).
+    pub zone_underworld: Option<f32>,
+    /// Zone distance fog, parsed from OP_NewZone slot 0 (eqoxide#517). `None` until OP_NewZone has
+    /// been applied, OR when the zone sends a degenerate/disabled fog range
+    /// (`fog_maxclip <= fog_minclip`) — matching the native client's hard FOGENABLE-off behavior
+    /// (see `~/git/eq_kb/zone-distance-fog.md`). RoF2's `NewZone_Struct` carries
+    /// 4 fog "slots"; only slot 0 (the DB's un-suffixed fog_* columns) is populated by ordinary
+    /// zone content, so we only read that one (see the KB doc's "Semantics of the 4 slots" note).
+    pub zone_fog: Option<ZoneFog>,
+    /// True once OP_NewZone has been applied for the current zone-server session. A RoF2 zone-in
+    /// delivers OP_NewZone TWICE: the server sends it unsolicited while handling OP_ZoneEntry and
+    /// again in reply to our OP_ReqNewZone (EQEmu `Handle_Connect_OP_ReqNewZone`). The second copy
+    /// lands after OP_ReqClientSpawn — i.e. while the spawn/door stream we just asked for is
+    /// arriving — so re-running apply_new_zone's entity/door purge would silently wipe it (#322).
+    /// `begin_zone_in` re-arms this per zone-server session, so a real zone change still purges.
+    pub new_zone_applied: bool,
+
+    // Entities in zone (keyed by spawn_id)
+    pub entities: std::collections::HashMap<u32, Entity>,
+
+    // Doors in zone (keyed by per-zone door_id), from OP_SpawnDoor.
+    pub doors: std::collections::HashMap<u8, Door>,
+
+    // Zone exit points (populated by OP_SEND_ZONE_POINTS on zone entry)
+    pub zone_points: Vec<ZonePoint>,
+}
+
 /// All state the renderer needs for one frame.
 ///
 /// `PartialEq` is load-bearing: `eq_net::gameplay::publish_snapshot` compares the freshly-mutated
@@ -444,11 +516,30 @@ pub struct WhoEntry {
 /// signal — the render loop's `poll_external` (app.rs) wakes on ANY network-thread mutation
 /// (inbound packet OR a client-initiated HTTP request handled by `ActionLoop::tick`), and a
 /// genuinely idle world lets the event loop sleep instead of spinning.
+///
+/// ## MVC structure (increment C1, #451)
+/// `GameState = { world: WorldState (Model-only server truth) , the client PREDICTION , … }`.
+/// `world` (see [`WorldState`]) is the server-authoritative world the Model writes and Views only
+/// read. The `CommandState` write-path facade (Phase A) is the other half of the conceptual
+/// `GameState = { WorldState, CommandState }` split, but it lives OUTSIDE this snapshot on purpose
+/// — it is the View→Model *input* path (held in the `ipc` bundles, drained by `ActionLoop`), not
+/// published render state, so it is intentionally not a field here.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct GameState {
     // Player
     pub player_id: u32,
     pub player_name: String,
+    /// ## CLIENT-SIDE PREDICTION — deliberately NOT [`WorldState`] (MVC C1, #451)
+    /// The local player's position/heading is the render `CharacterController`'s *predicted*
+    /// local state, NOT server-authoritative world truth. The controller (render side, `app.rs`)
+    /// owns the prediction and streams it to the net thread, which MIRRORS it into these fields
+    /// (`ActionLoop::stream_position`). Server truth arrives as a correction: a large server-pushed
+    /// jump is handed back to the controller via `pos_correction` → `CharacterController::teleport`
+    /// (client-side-prediction / server-reconciliation). Because the physics that writes these is
+    /// SPLIT — authoritative (server) vs predicted (render controller the Model reconciles) — they
+    /// stay OUT of `world`, so "`WorldState` is Model-only server truth" is literally true. (In the
+    /// offline `--testzone` path the render loop, as sole owner, writes them from the controller
+    /// directly — see `app.rs`.)
     pub player_x: f32,
     pub player_y: f32,
     pub player_z: f32,
@@ -527,46 +618,10 @@ pub struct GameState {
     /// OP_Animation; the renderer plays clip C0{action} for a short window, then reverts to idle/walk.
     pub combat_anims: std::collections::HashMap<u32, (u8, std::time::Instant)>,
 
-    // Zone
-    pub zone_name: String,
-    pub zone_id: u16,
-    pub zone_changed: bool,
-    /// #335/agent-honesty: the last zone-entry handshake (an in-game zone change) TIMED OUT — we
-    /// connected to the new zone server and sent OP_ZoneEntry, but never got OP_NewZone → … →
-    /// OP_SendExpZonein back within the deadline (the `zone-entry-handshake-race.md` never-accepted
-    /// case). Set true only on that failure; `zone_name` is CLEARED alongside it so no agent reads the
-    /// OLD zone as the current one. Reset to false at the start of every zone-in by `begin_zone_in`.
-    /// Without this a wedged zone-in kept reporting `connected: true` + the previous `zone_name` — a
-    /// confident falsehood (#343/#470 anti-pattern).
-    pub zone_in_failed: bool,
-    pub safe_x: f32,
-    pub safe_y: f32,
-    pub safe_z: f32,
-    /// Zone "underworld" floor from OP_NewZone (rof2_structs.h @608): the server treats any position
-    /// at or below this Z as fallen-through-the-world and does a ZoneToBindPoint recovery. `None`
-    /// until OP_NewZone is parsed. The movement controller clamps against it so a collision gap
-    /// can't drop us below it and trip the server's below-world drop → CLE linkdead (#150).
-    pub zone_underworld: Option<f32>,
-    /// Zone distance fog, parsed from OP_NewZone slot 0 (eqoxide#517). `None` until OP_NewZone has
-    /// been applied, OR when the zone sends a degenerate/disabled fog range
-    /// (`fog_maxclip <= fog_minclip`) — matching the native client's hard FOGENABLE-off behavior
-    /// (see `~/git/eq_kb/zone-distance-fog.md`). RoF2's `NewZone_Struct` carries
-    /// 4 fog "slots"; only slot 0 (the DB's un-suffixed fog_* columns) is populated by ordinary
-    /// zone content, so we only read that one (see the KB doc's "Semantics of the 4 slots" note).
-    pub zone_fog: Option<ZoneFog>,
-    /// True once OP_NewZone has been applied for the current zone-server session. A RoF2 zone-in
-    /// delivers OP_NewZone TWICE: the server sends it unsolicited while handling OP_ZoneEntry and
-    /// again in reply to our OP_ReqNewZone (EQEmu `Handle_Connect_OP_ReqNewZone`). The second copy
-    /// lands after OP_ReqClientSpawn — i.e. while the spawn/door stream we just asked for is
-    /// arriving — so re-running apply_new_zone's entity/door purge would silently wipe it (#322).
-    /// `begin_zone_in` re-arms this per zone-server session, so a real zone change still purges.
-    pub new_zone_applied: bool,
-
-    // Entities in zone (keyed by spawn_id)
-    pub entities: std::collections::HashMap<u32, Entity>,
-
-    // Doors in zone (keyed by per-zone door_id), from OP_SpawnDoor.
-    pub doors: std::collections::HashMap<u8, Door>,
+    /// Server-authoritative, Model-written-only world state — the zone the server placed us in,
+    /// its environment, and its live contents (spawns/doors/exits). See [`WorldState`]. Views read
+    /// it; only the `eq-net` Model writes it. (MVC C1, #451 — this is the WorldState boundary.)
+    pub world: WorldState,
 
     // Target
     pub target_id: Option<u32>,
@@ -593,9 +648,6 @@ pub struct GameState {
     /// compute a difficulty tier and then discard it, leaving no way to learn it without first
     /// targeting the spawn (defeating the whole point of the standalone endpoint).
     pub last_consider: Option<LastConsider>,
-
-    // Zone exit points (populated by OP_SEND_ZONE_POINTS on zone entry)
-    pub zone_points: Vec<ZonePoint>,
 
     // Message log (ring buffer)
     pub messages: VecDeque<LogEntry>,
@@ -800,20 +852,20 @@ impl GameState {
     /// the top of each zone-entry handshake, before OP_ReqClientSpawn asks for the spawn stream, so
     /// the clear can never race the stream it precedes. (#322)
     pub fn begin_zone_in(&mut self) {
-        self.entities.clear();
-        self.doors.clear();
+        self.world.entities.clear();
+        self.world.doors.clear();
         // The target belongs to the zone we just left: its spawn id is meaningless in the new zone
         // and #270 already purges `entities`, so target_id would point at a gone spawn while
         // target_name/target_hp_pct fall back to the stale cached snapshot — /observe/debug then
         // reports a full-HP target from the OLD zone (a confident falsehood an agent may attack /
         // consider). Clear the whole target (id + name + hp + con) here, not just the entity map (#408).
         self.clear_target();
-        self.new_zone_applied = false;
+        self.world.new_zone_applied = false;
         // A fresh zone-in attempt: clear any prior handshake-failure flag so it reflects only THIS
         // attempt (#335). The flag is re-raised by `run_zone_entry_handshake` only if this one times
         // out. `zone_name` is deliberately NOT cleared here — it stays showing the zone we came from
         // for the renderer's loading screen; a FAILED handshake clears it (there, honestly).
-        self.zone_in_failed = false;
+        self.world.zone_in_failed = false;
         // A cast cannot survive a zone change: the spawn ids, the cast bar and every packet that
         // would have explained the cast belong to the zone we just left. Carrying `casting` across
         // would report a cast in flight that can never end, and carrying `suppress_cast_end` would
@@ -870,7 +922,7 @@ impl GameState {
         if !self.player_name.is_empty() && name == self.player_name {
             self.player_level
         } else {
-            self.entities.values().find(|e| e.name == name).map(|e| e.level).unwrap_or(0)
+            self.world.entities.values().find(|e| e.name == name).map(|e| e.level).unwrap_or(0)
         }
     }
 
@@ -991,7 +1043,7 @@ impl GameState {
     }
 
     pub fn upsert_entity(&mut self, e: Entity) {
-        self.entities.insert(e.spawn_id, e);
+        self.world.entities.insert(e.spawn_id, e);
     }
 
     /// Deduct `copper` from on-hand coin and redistribute the remaining total into
@@ -1098,7 +1150,7 @@ impl GameState {
     }
 
     pub fn remove_entity(&mut self, spawn_id: u32) {
-        self.entities.remove(&spawn_id);
+        self.world.entities.remove(&spawn_id);
         if self.target_id == Some(spawn_id) {
             self.clear_target(); // #331: also drops the now-stale name/hp/con, not just the id
         }
@@ -1115,7 +1167,7 @@ impl GameState {
     /// right after a dangerous one rendered with the OLD red con until the next consider
     /// reply landed (or forever, for a spawn — e.g. a corpse — the server never considers).
     /// `target_name`/`target_hp_pct` had the same problem for any id not present in
-    /// `gs.entities` (a corpse, an out-of-range spawn, a stale/bogus id): the previous
+    /// `gs.world.entities` (a corpse, an out-of-range spawn, a stale/bogus id): the previous
     /// target's name/HP just stayed put instead of clearing.
     ///
     /// `target_name`/`target_hp_pct` are seeded from `entities[id]`, except for the F1
@@ -1134,7 +1186,7 @@ impl GameState {
         if id == self.player_id {
             self.target_name = Some(self.player_name.clone());
             self.target_hp_pct = Some(self.hp_pct);
-        } else if let Some(e) = self.entities.get(&id) {
+        } else if let Some(e) = self.world.entities.get(&id) {
             self.target_name = Some(e.name.clone());
             self.target_hp_pct = Some(e.hp_pct);
         } else {
@@ -1160,12 +1212,12 @@ impl GameState {
     }
 
     pub fn upsert_door(&mut self, d: Door) {
-        self.doors.insert(d.door_id, d);
+        self.world.doors.insert(d.door_id, d);
     }
 
     /// Apply a server door-state change. Unknown door ids are ignored.
     pub fn set_door_open(&mut self, door_id: u8, open: bool) {
-        if let Some(d) = self.doors.get_mut(&door_id) {
+        if let Some(d) = self.world.doors.get_mut(&door_id) {
             d.is_open = open;
         }
     }
@@ -1180,7 +1232,7 @@ impl GameState {
                 self.player_dead = false;       // revived / healed above 0
                 self.player_dead_since = None;  // clear the respawn safety-net timer
             }
-        } else if let Some(e) = self.entities.get_mut(&spawn_id) {
+        } else if let Some(e) = self.world.entities.get_mut(&spawn_id) {
             e.cur_hp = cur_hp;
             e.max_hp = max_hp;
             e.hp_pct = (cur_hp as f32 / max_hp.max(1) as f32) * 100.0;
@@ -1191,7 +1243,7 @@ impl GameState {
         // whichever spawn is currently targeted (mob or self via F1). (eqoxide#9, task 6)
         if self.target_id == Some(spawn_id) {
             self.target_hp_pct = Some(self.hp_pct).filter(|_| spawn_id == self.player_id)
-                .or_else(|| self.entities.get(&spawn_id).map(|e| e.hp_pct));
+                .or_else(|| self.world.entities.get(&spawn_id).map(|e| e.hp_pct));
         }
     }
 
@@ -1203,7 +1255,7 @@ impl GameState {
     /// gets a full OP_HPUpdate with real cur/max, which is strictly better. (eqoxide#51)
     pub fn update_hp_pct(&mut self, spawn_id: u32, hp_pct: f32) {
         if spawn_id != self.player_id {
-            if let Some(e) = self.entities.get_mut(&spawn_id) {
+            if let Some(e) = self.world.entities.get_mut(&spawn_id) {
                 e.hp_pct = hp_pct;
             }
             // Same live-refresh as update_hp (this path never fires for the player — see guard
@@ -1235,6 +1287,7 @@ impl GameState {
     #[allow(dead_code)]
     pub fn nearby_npcs(&self, max_dist: f32) -> Vec<&Entity> {
         let mut result: Vec<&Entity> = self
+            .world
             .entities
             .values()
             .filter(|e| {
@@ -1554,9 +1607,9 @@ pub(crate) mod tests {
     fn upsert_then_remove_entity_gone() {
         let mut gs = GameState::new();
         gs.upsert_entity(make_entity(10, "goblin", 0.0, 0.0, 0.0, true));
-        assert!(gs.entities.contains_key(&10));
+        assert!(gs.world.entities.contains_key(&10));
         gs.remove_entity(10);
-        assert!(!gs.entities.contains_key(&10));
+        assert!(!gs.world.entities.contains_key(&10));
     }
 
     #[test]
@@ -1656,7 +1709,7 @@ pub(crate) mod tests {
         gs.player_name = "Aldric".to_string();
         gs.hp_pct = 42.0;
         gs.set_target(1);
-        assert!(!gs.entities.contains_key(&1), "player must never appear in entities");
+        assert!(!gs.world.entities.contains_key(&1), "player must never appear in entities");
         assert_eq!(gs.target_id, Some(1));
         assert_eq!(gs.target_name.as_deref(), Some("Aldric"));
         assert_eq!(gs.target_hp_pct, Some(42.0));
@@ -1687,8 +1740,8 @@ pub(crate) mod tests {
         let mut gs = GameState::new();
         gs.upsert_entity(make_entity(5, "original", 0.0, 0.0, 0.0, true));
         gs.upsert_entity(make_entity(5, "updated", 1.0, 2.0, 3.0, true));
-        assert_eq!(gs.entities.len(), 1);
-        assert_eq!(gs.entities[&5].name, "updated");
+        assert_eq!(gs.world.entities.len(), 1);
+        assert_eq!(gs.world.entities[&5].name, "updated");
     }
 
     // --- GameState::update_hp ---
@@ -1724,7 +1777,7 @@ pub(crate) mod tests {
         let mut gs = GameState::new();
         gs.upsert_entity(make_entity(7, "mob", 0.0, 0.0, 0.0, true));
         gs.update_hp(7, 50, 200);
-        let e = &gs.entities[&7];
+        let e = &gs.world.entities[&7];
         assert_eq!(e.cur_hp, 50);
         assert_eq!(e.max_hp, 200);
         assert!((e.hp_pct - 25.0).abs() < 1e-4, "expected 25.0, got {}", e.hp_pct);
@@ -1737,7 +1790,7 @@ pub(crate) mod tests {
         gs.upsert_entity(make_entity(7, "mob", 0.0, 0.0, 0.0, true));
         gs.update_hp(7, 50, 200); // seed cur/max via a full update first
         gs.update_hp_pct(7, 40.0);
-        let e = &gs.entities[&7];
+        let e = &gs.world.entities[&7];
         assert!((e.hp_pct - 40.0).abs() < 1e-4, "expected 40.0, got {}", e.hp_pct);
         assert_eq!(e.cur_hp, 50, "percent-only update must not touch cur_hp");
         assert_eq!(e.max_hp, 200, "percent-only update must not touch max_hp");
@@ -1769,7 +1822,7 @@ pub(crate) mod tests {
     // ActionLoop::tick), not derived fresh from `entities` on every HUD read, so these HP
     // handlers must refresh it whenever the update is for whichever spawn is currently
     // targeted — including the F1 self-target case, where the player is never present in
-    // `gs.entities` (register_spawn special-cases and skips the self-spawn).
+    // `gs.world.entities` (register_spawn special-cases and skips the self-spawn).
 
     #[test]
     fn update_hp_refreshes_target_hp_pct_for_targeted_entity() {
@@ -1823,7 +1876,7 @@ pub(crate) mod tests {
         gs.player_id = 1;
         gs.target_id = Some(1);
         gs.update_hp(1, 30, 200); // 15%
-        assert!(!gs.entities.contains_key(&1), "player must never appear in entities");
+        assert!(!gs.world.entities.contains_key(&1), "player must never appear in entities");
         let pct = gs.target_hp_pct.expect("target_hp_pct must be set for the self-target case");
         assert!((pct - 15.0).abs() < 1e-4, "expected 15.0, got {pct}");
     }
@@ -1905,12 +1958,12 @@ pub(crate) mod tests {
             is_open: false,
         });
         gs.set_door_open(3, true);
-        assert!(gs.doors.get(&3).unwrap().is_open);
+        assert!(gs.world.doors.get(&3).unwrap().is_open);
         gs.set_door_open(3, false);
-        assert!(!gs.doors.get(&3).unwrap().is_open);
+        assert!(!gs.world.doors.get(&3).unwrap().is_open);
         // Unknown door id is ignored, not a panic.
         gs.set_door_open(99, true);
-        assert!(gs.doors.get(&99).is_none());
+        assert!(gs.world.doors.get(&99).is_none());
     }
 
     // --- TaskStatus and quest structures ---
@@ -1935,6 +1988,41 @@ pub(crate) mod tests {
         assert_eq!(gs.group_member_level("Me"), 12, "self → player_level");
         assert_eq!(gs.group_member_level("Ally"), 47, "other in zone → entity level");
         assert_eq!(gs.group_member_level("OutOfZone"), 0, "unknown member → 0");
+    }
+
+    /// MVC C1 (#451): the WorldState boundary. Server-authoritative zone contents live in
+    /// `gs.world`; the local-player PREDICTION (`player_x/y/z/heading`) is a separate slot that is
+    /// NOT part of `world`. Purging the zone (a Model action) clears `world` but must leave the
+    /// prediction untouched — proving the two are distinct storage, not the same conflated field.
+    /// The "prediction is not in world" half is compile-enforced (there is no `world.player_x`);
+    /// this test pins the runtime behavior of the split.
+    #[test]
+    fn worldstate_holds_zone_contents_and_is_separate_from_the_client_prediction() {
+        let mut gs = GameState::new();
+        // Client-prediction slot (owned by the render controller, mirrored here).
+        gs.player_x = 111.0;
+        gs.player_y = 222.0;
+        gs.player_z = 333.0;
+        gs.player_heading = 44.0;
+        // Server-authoritative world (Model-written).
+        gs.world.zone_name = "qeynos".into();
+        gs.world.new_zone_applied = true;
+        gs.upsert_entity(make_entity(7, "a rat", 0.0, 0.0, 0.0, true));
+        gs.upsert_door(Door {
+            door_id: 3, name: "DOOR1".into(), x: 0.0, y: 0.0, z: 0.0, heading: 0.0,
+            incline: 0, size: 100, opentype: 5, door_param: 0, invert_state: false, is_open: false,
+        });
+        assert!(gs.world.entities.contains_key(&7) && gs.world.doors.contains_key(&3));
+
+        // A zone purge (Model side) wipes the world contents...
+        gs.begin_zone_in();
+        assert!(gs.world.entities.is_empty(), "zone purge clears world entities");
+        assert!(gs.world.doors.is_empty(), "zone purge clears world doors");
+        assert!(!gs.world.new_zone_applied, "zone purge re-arms new_zone_applied");
+        // ...but the client prediction is NOT world state, so it survives the purge untouched.
+        assert_eq!([gs.player_x, gs.player_y, gs.player_z], [111.0, 222.0, 333.0],
+            "predicted position is not WorldState — a zone purge must not touch it");
+        assert_eq!(gs.player_heading, 44.0, "predicted heading is not WorldState");
     }
 
 }

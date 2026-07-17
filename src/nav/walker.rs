@@ -408,7 +408,7 @@ impl Walker {
     pub(crate) fn aggro_avoid(gs: &GameState, goal: (f32, f32, f32), enabled: bool) -> Vec<[f32; 2]> {
         if !enabled { return Vec::new(); }
         const NEAR_GOAL_SQ: f32 = 55.0 * 55.0;
-        gs.entities.values()
+        gs.world.entities.values()
             .filter(|e| e.is_npc && !e.dead)
             .filter(|e| { let (dx, dy) = (e.x - goal.0, e.y - goal.1); dx * dx + dy * dy > NEAR_GOAL_SQ })
             .map(|e| [e.x, e.y])
@@ -422,7 +422,7 @@ impl Walker {
         let c = guard.as_ref()?;
         let pos = [gs.player_x, gs.player_y, gs.player_z];
         let in_zone_idxs: Vec<i32> = self.world.zone_points.lock().unwrap().iter()
-            .filter(|zp| zp.zone_id == gs.zone_id)
+            .filter(|zp| zp.zone_id == gs.world.zone_id)
             .map(|zp| zp.iterator as i32)
             .collect();
         let portal = c.find_reachable_in_zone_line(&in_zone_idxs, pos).map(|(_, l)| (l[0], l[1], l[2]));
@@ -521,7 +521,7 @@ impl Walker {
     /// in `ActionLoop::stream_position`. The only thing this method still does about big drops is the
     /// pre-emptive lethal-fall SAFETY guard (don't walk off a ledge a fall from which would kill us).
     /// Resolve this zone's intra-zone teleport pads (#403) for the planner. Same-zone DRNTP
-    /// translocators from the `OP_SendZonepoints` list — filtered to `zp.zone_id == gs.zone_id` (so a
+    /// translocators from the `OP_SendZonepoints` list — filtered to `zp.zone_id == gs.world.zone_id` (so a
     /// CROSS-zone line is never turned into an intra-zone teleport) and with the keep-position
     /// sentinel (`999999`, relocates nobody) dropped — then honesty-gated by `resolve_teleport_pads`
     /// (only pads whose footprint AND advertised destination land on walkable floor become edges).
@@ -529,7 +529,7 @@ impl Walker {
     fn same_zone_teleport_pads(&self, gs: &GameState, c: &crate::nav::collision::Collision)
         -> Vec<crate::nav::collision::PadEdge> {
         let advertised: Vec<(i32, [f32; 3])> = self.world.zone_points.lock().unwrap().iter()
-            .filter(|zp| zp.zone_id == gs.zone_id
+            .filter(|zp| zp.zone_id == gs.world.zone_id
                 && zp.server_x.abs() < 900_000.0
                 && zp.server_y.abs() < 900_000.0
                 && zp.server_z.abs() < 900_000.0)

@@ -91,7 +91,7 @@ struct TargetNameBody {
 }
 
 /// POST /v1/combat/target/name {"name":"a rat"} — target a mob by (fuzzy) name. The nav thread
-/// resolves the name to a spawn_id via gs.entities and sends OP_TargetCommand.
+/// resolves the name to a spawn_id via gs.world.entities and sends OP_TargetCommand.
 async fn post_target_name(
     State(s): State<HttpState>,
     body: Result<Json<TargetNameBody>, axum::extract::rejection::JsonRejection>,

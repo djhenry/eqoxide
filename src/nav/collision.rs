@@ -1132,7 +1132,7 @@ impl Collision {
 
     /// Resolve advertised intra-zone teleport pads into planner edges (#403). `advertised` =
     /// `(zone_point_index, dest [east, north, z])` for `OP_SendZonepoints` entries whose target is
-    /// THIS zone — the caller (the walker) filters `zone_points` to `zp.zone_id == gs.zone_id` and
+    /// THIS zone — the caller (the walker) filters `zone_points` to `zp.zone_id == gs.world.zone_id` and
     /// drops the keep-position sentinel, so only pads that REALLY relocate the character within the
     /// zone reach here. A cross-zone line is never in this list, so it can never be turned into an
     /// intra-zone teleport.

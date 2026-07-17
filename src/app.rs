@@ -274,8 +274,8 @@ impl App {
             // correctly false throughout — there is genuinely no connection.
             let mut gs = GameState::new();
             gs.player_name = character_name.clone();
-            gs.zone_name = "testzone".to_string();
-            gs.zone_changed = true;
+            gs.world.zone_name = "testzone".to_string();
+            gs.world.zone_changed = true;
             game_state_snapshot.store(std::sync::Arc::new(gs));
             tracing::info!("APP: --testzone mode, will load debug zone");
         }
@@ -406,7 +406,7 @@ impl App {
         let mut best_t = f32::MAX;
         let mut best: Option<PickResult> = None;
 
-        for (&id, e) in &self.game_state_view.entities {
+        for (&id, e) in &self.game_state_view.world.entities {
             if e.dead { continue; }
             // Lift sphere center to entity mid-body height. Entity (x=east, y=north).
             let center = glam::Vec3::new(e.x, e.y, e.z + SPHERE_R * 0.75);
@@ -429,7 +429,7 @@ impl App {
         // T(pos) * Rz(yaw) * S(size/100). Incline is ignored for picking (negligible).
         let door_bounds = self.gpu.as_ref().map(|(_, r)| &r.door_bounds);
         const DEFAULT_DOOR_AABB: ([f32; 3], [f32; 3]) = ([-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]);
-        for d in self.game_state_view.doors.values() {
+        for d in self.game_state_view.world.doors.values() {
             let (bmin, bmax) = door_bounds
                 .and_then(|b| b.get(&d.name.to_uppercase()))
                 .copied()
@@ -800,7 +800,7 @@ impl App {
         }
 
         // Doors still easing toward their open/closed target.
-        if self.game_state_view.doors.iter().any(|(id, d)| {
+        if self.game_state_view.world.doors.iter().any(|(id, d)| {
             let target = if d.is_open { 1.0 } else { 0.0 };
             let frac = self.door_frac.get(id).copied().unwrap_or(target);
             (frac - target).abs() > 0.001
@@ -853,18 +853,18 @@ impl App {
         // one frame. The full reload bookkeeping (collision drop, pending_reload, etc.) still
         // runs later against `self.scene.zone`; this is just the door_frac clear pulled earlier
         // so it beats the read below. See `reset_door_frac_on_zone_change`.
-        reset_door_frac_on_zone_change(&mut self.door_frac, &self.game_state_view.zone_name, &self.current_zone);
+        reset_door_frac_on_zone_change(&mut self.door_frac, &self.game_state_view.world.zone_name, &self.current_zone);
 
         // Ease each door's render-only open fraction toward its server-authoritative open/close
         // target. Lives on App (not GameState) — see `ease_door_frac`. New doors seed at their
         // current state (a door that spawns open renders open immediately, matching the old
         // spawn-time open_frac init) — only subsequent state *changes* animate.
-        for (&id, d) in self.game_state_view.doors.iter() {
+        for (&id, d) in self.game_state_view.world.doors.iter() {
             let entry = self.door_frac.entry(id)
                 .or_insert_with(|| if d.is_open { 1.0 } else { 0.0 });
             *entry = ease_door_frac(*entry, d.is_open, dt, DOOR_TRAVEL_SECS);
         }
-        self.door_frac.retain(|id, _| self.game_state_view.doors.contains_key(id));
+        self.door_frac.retain(|id, _| self.game_state_view.world.doors.contains_key(id));
 
         let prof_scene = crate::profiling::Stopwatch::start();
         self.scene = SceneState::from_game_state(&self.game_state_view, &self.door_frac);
@@ -1200,7 +1200,7 @@ impl App {
                 if let Some(c) = self.collision.as_deref() {
                     // Keep the fall-through guard's threshold current with the zone's underworld
                     // floor (from OP_NewZone), so a collision gap can't drop us below it (#150).
-                    self.controller.set_underworld(self.game_state_view.zone_underworld);
+                    self.controller.set_underworld(self.game_state_view.world.zone_underworld);
                     self.controller.step(intent, dt, c);
                 }
             }
