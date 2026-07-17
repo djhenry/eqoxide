@@ -340,6 +340,71 @@ impl RegionMap {
         }
         Some(hi) // first non-water height ≈ the surface
     }
+
+    /// Height of the water volume's BOTTOM directly below a submerged point `(sx, sy, submerged_z)`
+    /// — the symmetric downward mirror of [`surface_z`] (3D-water-volume nav design §5.2). Binary-
+    /// searches DOWNWARD for the water→(air/solid) boundary. Returns `None` if the point isn't in
+    /// water, or if it's still water `MAX_DOWN` below it (unbounded below — no normal bottom).
+    ///
+    /// This is the one genuinely-new `.wtr` primitive the water-span grid needs: the water volume's
+    /// lower bound. The `.wtr` BSP *is* bounded below (design §3, `region_map.rs` `water_slab` doc:
+    /// "a water volume's lower bound need not meet the floor beneath it — the qcat spawn shaft's
+    /// floor is at -69.97 while its water starts at -69.5"), so this query is well-defined; the
+    /// `None` return is the honest answer for the pathological unbounded case, never a fabricated
+    /// bottom. Same 24-iteration / 200u-cap shape as `surface_z`. No `.wtr` format change.
+    pub fn bottom_z(&self, sx: f32, sy: f32, submerged_z: f32) -> Option<f32> {
+        if !self.is_water(sx, sy, submerged_z) { return None; }
+        const MAX_DOWN: f32 = 200.0;
+        let mut hi = submerged_z;              // in water
+        let mut lo = submerged_z - MAX_DOWN;   // expected dry/solid below the volume
+        if self.is_water(sx, sy, lo) { return None; } // still water at the bottom → unbounded below
+        for _ in 0..24 {
+            let mid = (lo + hi) * 0.5;
+            if self.is_water(sx, sy, mid) { hi = mid; } else { lo = mid; }
+        }
+        Some(lo) // first non-water height below ≈ the bottom
+    }
+
+    /// Server-coord AABBs of every WATER leaf's region (`special ∈ {1, 7}`), for the water-span-grid
+    /// builder (3D-water-volume nav design §5.3). Single-DFS AABB tightening, exactly the
+    /// `zone_line_region_points` pattern (`collect_zone_line_leaves`): each axis-aligned split plane
+    /// tightens the box; an oblique plane leaves it a superset. A loose AABB costs the builder TIME
+    /// (it iterates the 4u lattice inside and confirms each column with `is_water`), never
+    /// correctness — the same argument as `zone_line_region_points`. Returns
+    /// `(east:[min,max], north:[min,max], z:[min,max])` per water leaf. `bounds` =
+    /// `(min_e, max_e, min_n, max_n, zmin, zmax)` (server coords), same shape as
+    /// `zone_line_region_points`.
+    pub fn water_region_aabbs(&self, bounds: (f32, f32, f32, f32, f32, f32)) -> Vec<([f32; 2], [f32; 2], [f32; 2])> {
+        let (min_e, max_e, min_n, max_n, zmin, zmax) = bounds;
+        if self.nodes.is_empty() || min_e > max_e || min_n > max_n || zmin > zmax { return Vec::new(); }
+        // BSP axes (leaf_at swaps to `(sy, sx, sz)`): axis0 = north, axis1 = east, axis2 = z.
+        let root = [[min_n, max_n], [min_e, max_e], [zmin, zmax]];
+        let mut out = Vec::new();
+        self.collect_water_leaves(1, root, 0, &mut out);
+        out
+    }
+
+    /// DFS the BSP once, carrying the AABB tightened by axis-aligned split planes, emitting each
+    /// water leaf's box. Oblique planes leave the AABB a superset (the builder's `is_water` probes
+    /// make that safe). Mirror of `collect_zone_line_leaves`, minus the interior-point search (a box
+    /// is all the builder needs).
+    fn collect_water_leaves(&self, nn: i32, aabb: [[f32; 2]; 3], depth: u32,
+        out: &mut Vec<([f32; 2], [f32; 2], [f32; 2])>) {
+        if nn <= 0 || depth > 256 { return; }
+        let Some(node) = self.nodes.get((nn - 1) as usize) else { return; };
+        if node.left == 0 && node.right == 0 {
+            if matches!(node.special, 1 | 7) {
+                // aabb is [north, east, z]; return server-coord (east, north, z).
+                out.push(([aabb[1][0], aabb[1][1]], [aabb[0][0], aabb[0][1]], [aabb[2][0], aabb[2][1]]));
+            }
+            return;
+        }
+        // left child: dist > 0 (positive side); right child: dist < 0.
+        for (child, positive) in [(node.left, true), (node.right, false)] {
+            let child_aabb = Self::tighten_aabb(aabb, node.normal, node.split, positive);
+            self.collect_water_leaves(child, child_aabb, depth + 1, out);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -441,6 +506,57 @@ mod tests {
         // A water-only map yields no zone-line region points.
         assert!(RegionMap::flat_below(0.0)
             .zone_line_region_points((-100.0, 100.0, -50.0, 50.0, -30.0, 20.0)).is_empty());
+    }
+
+    #[test]
+    fn bottom_z_mirrors_surface_z_on_a_bounded_slab() {
+        // Water slab in [-44, -4]: surface at -4, bottom at -44. Both queries resolve the boundary
+        // by binary search; assert against the HAND-AUTHORED slab bounds, not the model.
+        let rm = RegionMap::water_slab(-44.0, -4.0);
+        let (e, n, probe) = (10.0, 20.0, -24.0); // mid-water
+        assert!(rm.is_water(e, n, probe));
+        let s = rm.surface_z(e, n, probe).expect("bounded surface");
+        let b = rm.bottom_z(e, n, probe).expect("bounded bottom");
+        assert!((s - (-4.0)).abs() < 0.1, "surface ≈ -4, got {s}");
+        assert!((b - (-44.0)).abs() < 0.1, "bottom ≈ -44, got {b}");
+        // Mutation-check: a different slab bottom moves bottom_z but not surface_z.
+        let rm2 = RegionMap::water_slab(-30.0, -4.0);
+        let b2 = rm2.bottom_z(e, n, probe).expect("bounded bottom");
+        assert!((b2 - (-30.0)).abs() < 0.1, "bottom tracks the slab: {b2}");
+        assert!((rm2.surface_z(e, n, probe).unwrap() - (-4.0)).abs() < 0.1);
+        // A dry point has no bottom.
+        assert_eq!(rm.bottom_z(e, n, 10.0), None);
+    }
+
+    #[test]
+    fn bottom_z_is_none_for_water_unbounded_below() {
+        // `flat_below`: everything below top_z is water forever — no bottom exists. bottom_z must
+        // return None (the honest answer), NOT a fabricated floor. This is the design's STOP
+        // condition (§5.2): if real `.wtr` volumes were unbounded below, that would be an owner
+        // finding — this test pins the primitive's behaviour so the harness can count such columns.
+        let rm = RegionMap::flat_below(0.0);
+        assert!(rm.is_water(0.0, 0.0, -100.0));
+        assert_eq!(rm.bottom_z(0.0, 0.0, -100.0), None, "unbounded-below water has no bottom");
+    }
+
+    #[test]
+    fn water_region_aabbs_bounds_a_boxed_pond() {
+        // `box_below`: water only inside north[0,64] × east[0,32] and below top_z=-4. The water leaf
+        // is bounded on all six sides by axis-aligned planes, so the AABB is TIGHT — assert against
+        // the hand-authored box, not the model.
+        let rm = RegionMap::box_below(0.0, 64.0, 0.0, 32.0, -4.0);
+        let boxes = rm.water_region_aabbs((-100.0, 100.0, -100.0, 100.0, -80.0, 40.0));
+        assert_eq!(boxes.len(), 1, "one water leaf");
+        let (ex, ny, zr) = boxes[0];
+        // east ∈ [0,32], north ∈ [0,64], z ∈ [-80, -4] (bottom = the query's zmin here).
+        assert!((ex[0] - 0.0).abs() < 0.5 && (ex[1] - 32.0).abs() < 0.5, "east {ex:?}");
+        assert!((ny[0] - 0.0).abs() < 0.5 && (ny[1] - 64.0).abs() < 0.5, "north {ny:?}");
+        assert!(zr[1] <= -4.0 + 0.5, "z top ≈ -4: {zr:?}");
+        // Every corner-centre of the reported box that tests wet must lie within the box we asked.
+        assert!(rm.is_water((ex[0] + ex[1]) * 0.5, (ny[0] + ny[1]) * 0.5, -20.0));
+        // A dry map yields no water AABBs.
+        assert!(RegionMap::zone_line_below(0.0, 7)
+            .water_region_aabbs((-100.0, 100.0, -100.0, 100.0, -80.0, 40.0)).is_empty());
     }
 
     #[test]

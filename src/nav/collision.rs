@@ -448,6 +448,22 @@ pub struct Collision {
     /// wall/ground distances per (2 u cell, floor bucket), computed on demand and cached until the
     /// zone (and this struct) is dropped. See `traversability::ClearanceField`.
     clearance: crate::traversability::ClearanceField,
+    /// The sparse water-span grid (3D-water-volume nav design §5, Slice 1). `None` until built by
+    /// [`Collision::build_water_grid`] and stored via [`Collision::set_water_grid`]. **Slice 1 never
+    /// reads this in the search/walker** — it is purely additive storage; the water-node generator
+    /// that consumes it is Slice 2. Deliberately NOT built eagerly in `set_water` (that would change
+    /// zone-load timing, a behaviour change, and defeat the point of the Slice-1 build-cost
+    /// measurement that decides eager-vs-lazy, design §5.3 / owner decision #5).
+    water_grid: Option<crate::nav::water_grid::WaterGrid>,
+}
+
+/// Outcome of building one water-span column (design §5.1). Separates "no navigable water here"
+/// (`Dry`) from the design-premise honesty case "water with no queryable bottom" (`UnboundedBelow`,
+/// §5.2), which the builder counts rather than fabricating a floor for.
+enum WaterColumnResult {
+    Column(crate::nav::water_grid::WaterColumn),
+    UnboundedBelow,
+    Dry,
 }
 
 /// The clearance a route is planned at BY DEFAULT — deliberately larger than the character.
@@ -651,7 +667,7 @@ impl Collision {
                 #[cfg(test)]
                 z_min: 0.0,
                 z_max: 0.0, facing_blind_hits: Default::default(), tight_plans: Default::default(),
-                clearance: Default::default(),
+                clearance: Default::default(), water_grid: None,
                 water: None, from_collision_mesh, zone_line_regions: Vec::new() };
         }
         let cols = (((max[0] - min[0]) / cell_size).ceil() as usize + 1).max(1);
@@ -678,7 +694,7 @@ impl Collision {
             z_min,
             z_max,
             facing_blind_hits: Default::default(), tight_plans: Default::default(), water: None, from_collision_mesh, zone_line_regions: Vec::new(),
-            clearance: Default::default() }
+            clearance: Default::default(), water_grid: None }
     }
 
     /// How many times the floor-normal filter's empty-column fallback has fired since zone load, i.e.
@@ -728,6 +744,153 @@ impl Collision {
             tracing::info!("nav: precomputed {} zone-line region point(s) in {ms}ms", regions.len());
         }
         regions
+    }
+
+    /// Store a prebuilt water-span grid on this collision (3D-water-volume nav design §5, Slice 1).
+    /// Purely additive: nothing in the search/walker reads it in Slice 1.
+    pub fn set_water_grid(&mut self, grid: Option<crate::nav::water_grid::WaterGrid>) {
+        self.water_grid = grid;
+    }
+
+    /// The stored water-span grid, if one has been built (`None` until `set_water_grid`).
+    pub fn water_grid(&self) -> Option<&crate::nav::water_grid::WaterGrid> {
+        self.water_grid.as_ref()
+    }
+
+    /// Build the sparse **water-span grid** (3D-water-volume nav design §5.3) for this zone, from the
+    /// attached `.wtr` water map + this collision mesh. Returns an empty grid when the zone has no
+    /// water map. **Does not store or mutate anything** (call `set_water_grid` to keep the result) and
+    /// is NOT wired into `find_path`/`astar` — Slice 1 is purely the representation + its cost.
+    ///
+    /// Method (design §5.3): enumerate water-leaf AABBs from the BSP once (`water_region_aabbs`),
+    /// iterate the 4u XY column lattice (aligned to this grid's `origin`) inside those AABBs, and for
+    /// each candidate column build its navigable spans with [`Self::build_water_column`]. Candidate
+    /// columns are de-duplicated (overlapping AABBs) but each is scanned over the water leaves' z-band
+    /// so stacked water (a pool over a separate flooded tunnel — the qcat case) yields multiple spans.
+    pub fn build_water_grid(&self, body: &crate::traversability::Body) -> crate::nav::water_grid::WaterGrid {
+        const COL: f32 = 4.0; // 4u XY water columns (design §5.1 / owner decision #2, locked)
+        let mut grid = crate::nav::water_grid::WaterGrid::new(self.origin, COL);
+        let Some(water) = self.water.as_ref() else { return grid; };
+        if self.cols == 0 || self.tris.is_empty() { return grid; }
+
+        // Zone z-extent — same source as the zone-line precompute (`precompute_zone_line_regions`).
+        let (mut zmin, mut zmax) = (f32::MAX, f32::MIN);
+        for t in &self.tris { for v in t { zmin = zmin.min(v[2]); zmax = zmax.max(v[2]); } }
+        let bounds = (
+            self.origin[0], self.origin[0] + self.cols as f32 * self.cell_size,
+            self.origin[1], self.origin[1] + self.rows as f32 * self.cell_size,
+            zmin, zmax,
+        );
+        let aabbs = water.water_region_aabbs(bounds);
+        if aabbs.is_empty() { return grid; }
+
+        // The z-band to scan each candidate column over = the UNION of the water leaves' z-ranges,
+        // NOT the whole mesh z-extent (which can dip to invisible-boundary art at z ≈ -32768 and blow
+        // the per-column probe count up by ~10⁴×). Water only exists inside this band, and it still
+        // spans stacked water (a pool over a flooded tunnel) since both bands lie within it.
+        let water_zlo = aabbs.iter().map(|(_, _, zr)| zr[0]).fold(f32::MAX, f32::min);
+        let water_zhi = aabbs.iter().map(|(_, _, zr)| zr[1]).fold(f32::MIN, f32::max);
+
+        // Candidate columns from every water AABB (deduped). A loose (oblique) AABB only widens the
+        // candidate set; `build_water_column`'s `is_water` probes make that safe (design §5.3).
+        let mut seen: std::collections::HashSet<(i32, i32)> = std::collections::HashSet::new();
+        for (ex, ny, _zr) in &aabbs {
+            let ci0 = ((ex[0] - self.origin[0]) / COL).floor() as i32;
+            let ci1 = ((ex[1] - self.origin[0]) / COL).ceil() as i32;
+            let cj0 = ((ny[0] - self.origin[1]) / COL).floor() as i32;
+            let cj1 = ((ny[1] - self.origin[1]) / COL).ceil() as i32;
+            for ci in ci0..=ci1 {
+                for cj in cj0..=cj1 {
+                    if !seen.insert((ci, cj)) { continue; }
+                    let e = self.origin[0] + ci as f32 * COL + COL * 0.5; // column centre
+                    let n = self.origin[1] + cj as f32 * COL + COL * 0.5;
+                    match self.build_water_column(water, body, e, n, (water_zlo, water_zhi)) {
+                        WaterColumnResult::Column(col) => grid.insert(ci, cj, col),
+                        WaterColumnResult::UnboundedBelow => grid.note_unbounded_below(),
+                        WaterColumnResult::Dry => {}
+                    }
+                }
+            }
+        }
+        grid
+    }
+
+    /// Build one 4u column's navigable spans (design §5.1 interval arithmetic), or report why it has
+    /// none. Scans the lattice z-band top→down for water bands (each `[bottom, surface]` from
+    /// `surface_z`/`bottom_z`), then for each band carves the free segments between the collision
+    /// solids inside it (`column_surfaces`, facing-blind, both windings) and applies:
+    ///
+    /// * `nav_hi = min(surface − float_depth, ceiling_above − height − SKIN)`
+    /// * `nav_lo = max(water_bottom, floor_below) + ε`
+    ///
+    /// keeping only spans with `nav_hi ≥ nav_lo`. `UnboundedBelow` when a wet probe's water has no
+    /// bottom (`bottom_z` == None) — surfaced by the caller as a design-premise signal, never
+    /// fabricated into a floor (design §5.2 STOP condition).
+    fn build_water_column(&self, water: &crate::region_map::RegionMap,
+        body: &crate::traversability::Body, e: f32, n: f32, zrange: (f32, f32)) -> WaterColumnResult {
+        use crate::nav::water_grid::{VRES, WaterColumn};
+        const EPS: f32 = 0.05;
+        // = `movement::SKIN` (0.05, private there); the body-top must clear a solid ceiling by this,
+        // exactly as the collided `swim_rise` stops `SKIN` short of the ceiling (design §5.1).
+        const SKIN: f32 = 0.05;
+        let (zlo, zhi) = zrange;
+        if zhi <= zlo { return WaterColumnResult::Dry; }
+
+        // 1. Find the distinct water bands in this column (top→down), deduped by containment. A
+        //    column can hold >1 band (a pool over a flooded tunnel, dry rock between).
+        let mut bands: Vec<(f32, f32)> = Vec::new(); // (water_bottom, water_surface)
+        let mut unbounded = false;
+        let mut z = zhi;
+        while z >= zlo {
+            if water.is_water(e, n, z) && !bands.iter().any(|&(b, s)| z > b - VRES && z < s + VRES) {
+                match (water.surface_z(e, n, z), water.bottom_z(e, n, z)) {
+                    (Some(s), Some(b)) if s > b => bands.push((b, s)),
+                    (Some(_), None) => unbounded = true, // water with no bottom (design §5.2)
+                    _ => {}                              // unbounded above / degenerate — skip
+                }
+            }
+            z -= VRES;
+        }
+        if bands.is_empty() {
+            return if unbounded { WaterColumnResult::UnboundedBelow } else { WaterColumnResult::Dry };
+        }
+
+        // 2. Per band, carve navigable feet-intervals between the collision solids inside it.
+        let mut spans: Vec<(f32, f32)> = Vec::new();
+        let mut surface_top = f32::MIN;
+        for &(wb, ws) in &bands {
+            surface_top = surface_top.max(ws);
+            let mid = (wb + ws) * 0.5;
+            // Every solid surface (both windings) crossing the water band is a barrier plane.
+            let solids = self.column_surfaces(e, n, mid, ws - mid + 1.0, mid - wb + 1.0);
+            let mut inner: Vec<f32> = solids.iter().map(|&(sz, _)| sz)
+                .filter(|&sz| sz > wb + 1e-3 && sz < ws - 1e-3).collect();
+            inner.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)); // desc
+            // Free segments = consecutive pairs of [ws, inner…, wb]. A segment whose TOP is `ws` is
+            // open to the surface (cap = swim plane); a segment capped by a barrier must clear it.
+            let mut boundaries = Vec::with_capacity(inner.len() + 2);
+            boundaries.push(ws);
+            boundaries.extend_from_slice(&inner);
+            boundaries.push(wb);
+            for w in boundaries.windows(2) {
+                let (seg_hi, seg_lo) = (w[0], w[1]);
+                if seg_hi - seg_lo < EPS { continue; }
+                let top_is_surface = (seg_hi - ws).abs() < 1e-3;
+                let ceiling_cap = if top_is_surface { f32::INFINITY }
+                                  else { seg_hi - body.height - SKIN };
+                let nav_hi = (ws - body.float_depth).min(ceiling_cap);
+                let nav_lo = seg_lo.max(wb) + EPS;
+                if nav_hi >= nav_lo {
+                    spans.push((nav_lo, nav_hi));
+                }
+            }
+        }
+        if spans.is_empty() {
+            return if unbounded { WaterColumnResult::UnboundedBelow } else { WaterColumnResult::Dry };
+        }
+        // High band first (mirrors `column_surfaces`' high→low convention).
+        spans.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        WaterColumnResult::Column(WaterColumn { surface_z: surface_top, spans })
     }
 
     /// True if `pos` = [east, north, z] (server coords) lies in a water region.
@@ -3009,6 +3172,87 @@ mod tests {
         }
     }
 
+    // ─── Water-span grid (3D-water-volume nav design §5, Slice 1) ──────────────────────────────
+    //
+    // These assert the built grid against HAND-AUTHORED analytic fixture geometry (the pool/ceiling
+    // bounds written in the test), NEVER against the span grid or `column_surfaces` under test — the
+    // non-circular verification principle (design §10). Every expected number is computed from the
+    // fixture constants + the shared `PLAYER_BODY` geometry.
+
+    /// A walled pool: floor at -44, surface at -4, no submerged geometry. The one navigable span's
+    /// feet-interval must be `[floor + ε, surface − float_depth]` = `[-43.95, -6.0]` (design §5.1).
+    #[test]
+    fn water_grid_pool_span_matches_hand_authored_geometry() {
+        let body = crate::traversability::PLAYER_BODY;
+        // Floor at -44 + two perimeter walls so the collision mesh z-extent spans the water band
+        // [-44, -4] up to the surface (a flat floor alone has ZERO z-extent, which collapses the
+        // water-leaf AABB's z-range — real zones always have vertical geometry around water). The
+        // walls sit at east 0 / 64; the interior probe column (east 30) never crosses them.
+        let assets = ZoneAssets {
+            terrain: vec![
+                slab(-44.0, 0.0, 64.0, 0.0, 64.0, true), // pool floor
+                wall_east(0.0, -44.0, 0.0), wall_east(64.0, -44.0, 0.0), // z-extent walls
+            ],
+            objects: vec![], textures: vec![],
+        };
+        let mut col = Collision::build(&assets, 4.0);
+        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::water_slab(-44.0, -4.0))));
+        let grid = col.build_water_grid(&body);
+
+        let c = grid.column_at(30.0, 30.0).expect("interior column is wet");
+        assert_eq!(c.spans.len(), 1, "open pool = one span, got {:?}", c.spans);
+        let (lo, hi) = c.spans[0];
+        // Expected from fixture constants — NOT read from the grid.
+        let want_lo = -44.0 + 0.05;              // floor + ε
+        let want_hi = -4.0 - body.float_depth;   // surface − float_depth = -6.0
+        assert!((lo - want_lo).abs() < 0.2, "nav_lo {lo} ≈ {want_lo}");
+        assert!((hi - want_hi).abs() < 0.2, "nav_hi {hi} ≈ {want_hi}");
+        assert!((c.surface_z - (-4.0)).abs() < 0.2, "surface {} ≈ -4", c.surface_z);
+        assert_eq!(grid.unbounded_below_count(), 0, "bounded-below water fixture");
+        // No water map ⇒ empty grid (no-regression premise for dry zones, design §10 P-3D-4).
+        let dry = Collision::build(&assets, 4.0);
+        assert_eq!(dry.build_water_grid(&body).wet_column_count(), 0);
+    }
+
+    /// A submerged ceiling at -10 across the pool carves the column into TWO spans: an upper band
+    /// (feet just above the ceiling, up to the swim plane) and a lower band (bottom up to where the
+    /// body-top just clears the ceiling = `ceiling − height − SKIN`). Mutation-checked on body height.
+    #[test]
+    fn water_grid_ceiling_carves_two_spans_and_tracks_body_height() {
+        let mk = |body: &crate::traversability::Body| {
+            let assets = ZoneAssets {
+                terrain: vec![
+                    slab(-44.0, 0.0, 64.0, 0.0, 64.0, true),   // pool floor
+                    slab(-10.0, 0.0, 64.0, 0.0, 64.0, false),  // submerged ceiling (down-facing)
+                    wall_east(0.0, -44.0, 0.0), wall_east(64.0, -44.0, 0.0), // z-extent walls (to surface)
+                ],
+                objects: vec![], textures: vec![],
+            };
+            let mut col = Collision::build(&assets, 4.0);
+            col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::water_slab(-44.0, -4.0))));
+            let grid = col.build_water_grid(body);
+            grid.column_at(30.0, 30.0).cloned().expect("interior column is wet")
+        };
+
+        let body = crate::traversability::PLAYER_BODY;
+        let c = mk(&body);
+        assert_eq!(c.spans.len(), 2, "ceiling carves two spans, got {:?}", c.spans);
+        // Spans are high-band first. Lower span's nav_hi = ceiling − height − SKIN (analytic).
+        let lower = c.spans.iter().min_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
+        let want_lower_hi = -10.0 - body.height - 0.05; // = -16.05 for height 6
+        assert!((lower.1 - want_lower_hi).abs() < 0.2, "lower nav_hi {} ≈ {want_lower_hi}", lower.1);
+
+        // Mutation-check: a shorter body clears the ceiling with more room, so the lower span's
+        // nav_hi RISES to `ceiling − height − SKIN` with the smaller height. Reads a DIFFERENT number.
+        let mut short = crate::traversability::PLAYER_BODY;
+        short.height = 4.0;
+        let c2 = mk(&short);
+        let lower2 = c2.spans.iter().min_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
+        let want2 = -10.0 - 4.0 - 0.05; // = -14.05
+        assert!((lower2.1 - want2).abs() < 0.2, "shorter body lower nav_hi {} ≈ {want2}", lower2.1);
+        assert!(lower2.1 > lower.1 + 1.0, "shorter body → higher navigable ceiling clearance");
+    }
+
     // ─── RETRACTED at D-2 (#375): three old #329 guards whose premise qcat falsified ───
     //
     // `nearest_floor_never_returns_a_ceiling`, `fallback_never_admits_a_ceiling_whose_floor_is_below_
@@ -4552,6 +4796,58 @@ mod tests {
     /// ZONE_DIR=~/.local/share/eqoxide/assets/models \
     ///   cargo test --lib fine_tier_corpus -- --ignored --nocapture
     /// ```
+    /// SLICE-1 MEASUREMENT HARNESS (3D-water-volume nav design §5.4 / §11): for the gate zones, report
+    /// the water-span grid's wet-column count, total span count, resident MEMORY (bytes, design §5.4
+    /// accounting model) and BUILD COST (median wall-clock ms). These are the eager-vs-lazy build
+    /// numbers that decide owner decision #5 (§5.3). `unbounded↓` counts candidate columns whose water
+    /// had no queryable bottom (`bottom_z` == None) — a design-premise signal (§5.2), expected 0.
+    ///
+    /// Collision is built at the PRODUCTION zone-load cell size (32.0, `app.rs`) so the build cost is
+    /// representative of what a real zone load would pay. Run:
+    ///
+    /// ```text
+    /// ZONE_DIR=~/.local/share/eqoxide/assets/models \
+    ///   cargo test --lib water_grid_budget_measurement -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "requires baked zone glbs + .wtr at $ZONE_DIR"]
+    fn water_grid_budget_measurement() {
+        use std::time::Instant;
+        let dir = std::env::var("ZONE_DIR")
+            .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
+        let zones: Vec<String> = std::env::var("ZONES").ok()
+            .map(|z| z.split(',').map(str::to_string).collect())
+            .unwrap_or_else(|| vec!["halas".into(), "blackburrow".into(), "qcat".into()]);
+        let body = crate::traversability::PLAYER_BODY;
+
+        println!("\n{:<12} {:>10} {:>8} {:>12} {:>10} {:>11}",
+            "zone", "wet cols", "spans", "bytes", "build ms", "unbounded↓");
+        for zone in &zones {
+            let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
+            let Ok(za) = ZoneAssets::from_glb(&p) else { println!("{zone:<12}  (no glb — skipped)"); continue };
+            let mut col = Collision::build(&za, 32.0);
+            if col.cols == 0 { println!("{zone:<12}  (no grid — skipped)"); continue; }
+            col.set_water(crate::region_map::RegionMap::load(
+                &std::path::Path::new(&dir).join("maps/water"), zone).map(std::sync::Arc::new));
+            if col.water.is_none() { println!("{zone:<12}  (no .wtr — skipped)"); continue; }
+
+            // BUILD COST: median of 5 timed builds (a warm-up build precedes them). The grid is
+            // deterministic, so all builds are identical — we time the same work the net thread would.
+            let mut grid = col.build_water_grid(&body); // warm-up
+            let mut times: Vec<u128> = Vec::new();
+            for _ in 0..5 {
+                let t0 = Instant::now();
+                grid = col.build_water_grid(&body);
+                times.push(t0.elapsed().as_micros());
+            }
+            times.sort_unstable();
+            let median_ms = times[times.len() / 2] as f64 / 1000.0;
+            println!("{zone:<12} {:>10} {:>8} {:>12} {:>10.1} {:>11}",
+                grid.wet_column_count(), grid.span_count(), grid.resident_bytes(),
+                median_ms, grid.unbounded_below_count());
+        }
+    }
+
     #[test]
     #[ignore = "requires baked zone glbs at $ZONE_DIR"]
     fn fine_tier_corpus_route_success_and_cost() {
