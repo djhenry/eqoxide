@@ -382,6 +382,16 @@ impl EqStream {
             if last_send.elapsed() >= std::time::Duration::from_secs(1) {
                 stream.send_session_request();
                 last_send = std::time::Instant::now();
+                // #477: keep the LIVENESS clock fresh across the handshake. This loop runs on the
+                // gameplay net thread during a zone handoff (the bare `connect()` calls in
+                // gameplay.rs), and on an on-demand server a cold zone can take several seconds to
+                // answer the first SESSION_REQUEST. Only `publish_snapshot` bumps `last_tick`, which
+                // never runs here — so without this bump a healthy, actively-handshaking session would
+                // cross `SESSION_STALE_TICK_MS` and get WRITE commands falsely rejected as "the net
+                // thread has not ticked (it has exited or wedged)". The thread IS alive and
+                // progressing through the handshake; stamping `last_tick` on each retry (and on each
+                // recv below) makes the clock reflect that, even when the cold zone is still silent.
+                stream.net_health.lock().unwrap().last_tick = std::time::Instant::now();
             }
             match tokio::time::timeout(
                 tokio::time::Duration::from_millis(100),
@@ -391,8 +401,14 @@ impl EqStream {
                     // The other socket read. Stamped for the same reason `poll_recv` is, and stamped
                     // here rather than left as a benign exception: the invariant "whoever receives
                     // the datagram owns the clock" is only load-bearing if it has NO exceptions —
-                    // an asterisk on it is how it rots back into #343 (review).
-                    stream.net_health.lock().unwrap().last_datagram = std::time::Instant::now();
+                    // an asterisk on it is how it rots back into #343 (review). `last_tick` is bumped
+                    // alongside it (#477): a datagram arriving mid-handshake is proof the net thread
+                    // is alive and progressing, so the liveness clock must not be allowed to go stale.
+                    let mut h = stream.net_health.lock().unwrap();
+                    let now = std::time::Instant::now();
+                    h.last_datagram = now;
+                    h.last_tick = now;
+                    drop(h);
                     stream.on_raw_recv(&recv_buf[..n]);
                 }
                 Ok(Err(e)) => return Err(e.into()),
@@ -962,6 +978,43 @@ mod tests {
         assert!(age < std::time::Duration::from_secs(1),
             "an inbound datagram must refresh the link clock (age was {age:?}) — otherwise a long \
              world reconnect reports connected:false on a healthy link (#343 review)");
+    }
+
+    /// #477 regression: `EqStream::connect`'s SESSION_REQUEST retry loop must keep `last_tick` fresh
+    /// while it handshakes, even when the peer is SILENT (a cold on-demand zone that hasn't answered
+    /// yet). Only `publish_snapshot` bumps `last_tick`, and it does not run during the bare `connect()`
+    /// calls of a zone handoff — so without the fix, `last_tick` freezes for the whole (up-to-20s)
+    /// handshake while `last_datagram` stays fresh from the prior zone. That fresh-datagram +
+    /// stale-tick state is exactly what the #477 WRITE-command guard rejects as "the net thread has
+    /// exited or wedged" — a DISHONEST 503 against a healthy session mid-transition. This proves the
+    /// retry loop bumps `last_tick` so a mid-handshake session stays under `SESSION_STALE_TICK_MS`.
+    #[tokio::test]
+    async fn connect_keeps_last_tick_fresh_across_a_silent_handshake() {
+        let net_health: crate::ipc::NetHealthShared = Default::default();
+        // Enter the handshake with a STALE tick clock (a full minute), so any freshness afterward can
+        // only have come from the retry loop bumping it — not from the Default::now() seed.
+        net_health.lock().unwrap().last_tick =
+            std::time::Instant::now() - std::time::Duration::from_secs(60);
+
+        // A bound but SILENT peer — it never sends SESSION_RESPONSE, so `connect` stays in its retry
+        // loop (the recv branch never fires; only the per-second retry path can refresh the clock).
+        let silent_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = silent_peer.local_addr().unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        // Drive `connect` for ~1.5s (past the 1s retry cadence), then cancel it by dropping the future.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(1500),
+            EqStream::connect(&addr.ip().to_string(), addr.port(), tx, net_health.clone()),
+        ).await;
+
+        let age = net_health.lock().unwrap().last_tick.elapsed();
+        assert!(
+            (age.as_millis() as u64) < crate::http::SESSION_STALE_TICK_MS,
+            "mid-handshake `last_tick` must stay under SESSION_STALE_TICK_MS ({}ms) so the #477 guard \
+             does not falsely reject a healthy handshaking session; age was {age:?}",
+            crate::http::SESSION_STALE_TICK_MS,
+        );
     }
 
     #[test]

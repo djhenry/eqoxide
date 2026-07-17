@@ -4,7 +4,7 @@
 //! `navigation.rs` and the handlers in `packet_handler.rs`).
 
 use axum::{routing::{get, post}, extract::State, Json, http::StatusCode, Router};
-use crate::http::{HttpState, clean_entity_name};
+use crate::http::{HttpState, clean_entity_name, require_live_session};
 
 pub fn router() -> Router<HttpState> {
     Router::new()
@@ -25,6 +25,7 @@ async fn post_open(
     State(s): State<HttpState>,
     body: Result<Json<OpenBody>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let name = match body {
         Ok(Json(b)) => b.trainer.or(b.name),
         Err(_) => None,
@@ -80,6 +81,7 @@ async fn post_train(
     State(s): State<HttpState>,
     body: Result<Json<TrainBody>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let b = match body {
         Ok(Json(b)) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"skill_id\":N}".into()),
@@ -96,6 +98,7 @@ async fn post_train(
 /// `trainer_open_req` slot's `Some(0)` sentinel (0 is never a real spawn id) so no extra
 /// request slot needs threading through the nav chain (#162).
 async fn post_close(State(s): State<HttpState>) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     s.command.request_open_trainer(0);
     (StatusCode::OK, "closing trainer".into())
 }

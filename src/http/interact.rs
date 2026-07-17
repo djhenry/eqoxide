@@ -61,6 +61,7 @@ async fn post_read(
     State(s): State<HttpState>,
     body: Result<Json<ReadBody>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let b = match body {
         Ok(Json(b)) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"slot\":N}".into()),
@@ -96,6 +97,7 @@ async fn post_dialogue(
     State(s): State<HttpState>,
     body: Result<Json<DialogueBody>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let b = match body {
         Ok(Json(b)) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"index\":N} or {\"text\":\"...\"}".into()),
@@ -136,6 +138,7 @@ async fn post_hail(
     State(s): State<HttpState>,
     OptionalJson(body): OptionalJson<HailBody>,
 ) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let requested = body.and_then(|b| b.name);
     let positions = s.world.entity_positions.lock().unwrap();
 
@@ -193,6 +196,7 @@ async fn post_say(
     State(s): State<HttpState>,
     body: Result<Json<SayBody>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let text = match body {
         Ok(Json(b)) => b.text,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"text\":\"...\"}".into()),
@@ -240,6 +244,7 @@ async fn post_loot(
     State(s): State<HttpState>,
     OptionalJson(body): OptionalJson<LootBody>,
 ) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let b = body.unwrap_or_default();
     if let Some(id) = b.id {
         let ids = s.world.entity_ids.lock().unwrap();
@@ -319,6 +324,7 @@ async fn post_give(
     State(s): State<HttpState>,
     body: Result<Json<GiveBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
     let b = match body {
         Ok(Json(b)) => b,
         Err(_) => return text(StatusCode::BAD_REQUEST, "provide {\"npc\":\"...\",\"from\":N}"),
@@ -385,6 +391,7 @@ async fn post_door_click(
     State(s): State<HttpState>,
     body: axum::extract::Json<DoorClickBody>,
 ) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let id = if let Some(id) = body.door_id {
         Some(id)
     } else if let Some(name) = &body.name {
@@ -407,12 +414,14 @@ async fn post_door_click(
 
 /// POST /v1/interact/sit — sit down (mana/HP regen).
 async fn post_sit(State(s): State<HttpState>) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     s.command.request_sit(true);
     (StatusCode::OK, "sit queued".into())
 }
 
 /// POST /v1/interact/stand — stand up.
 async fn post_stand(State(s): State<HttpState>) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     s.command.request_sit(false);
     (StatusCode::OK, "stand queued".into())
 }

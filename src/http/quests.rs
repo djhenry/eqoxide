@@ -49,6 +49,7 @@ async fn post_accept(
     State(s): State<HttpState>,
     body: Result<Json<TaskIdBody>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let task_id = match body {
         Ok(Json(b)) => b.task_id,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"task_id\":N}".into()),
@@ -64,6 +65,7 @@ async fn post_accept(
 
 /// POST /v1/quests/decline — decline all pending task offers (idempotent no-op if none are open).
 async fn post_decline(State(s): State<HttpState>) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     if s.quest.task_offers_shared.lock().unwrap().is_empty() {
         return (StatusCode::OK, "no pending task offers".into());
     }
@@ -79,6 +81,7 @@ async fn post_cancel(
     State(s): State<HttpState>,
     body: Result<Json<TaskIdBody>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let task_id = match body {
         Ok(Json(b)) => b.task_id,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"task_id\":N}".into()),

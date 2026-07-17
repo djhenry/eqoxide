@@ -68,12 +68,14 @@ async fn post_invite(
     State(s): State<HttpState>,
     body: Result<Json<NameBody>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let name = match extract_name(body) { Ok(n) => n, Err(e) => return e };
     queue(&s, GuildAction::Invite(name))
 }
 
 /// POST /v1/guild/accept — accept a pending guild invite. 400 if none is pending.
 async fn post_accept(State(s): State<HttpState>) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     if s.guild_slots.guild.lock().unwrap().pending_invite.is_none() {
         return (StatusCode::BAD_REQUEST, "no pending guild invite".into());
     }
@@ -82,6 +84,7 @@ async fn post_accept(State(s): State<HttpState>) -> (StatusCode, String) {
 
 /// POST /v1/guild/leave — leave the current guild.
 async fn post_leave(State(s): State<HttpState>) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     if s.guild_slots.guild.lock().unwrap().guild_id == 0 {
         return (StatusCode::BAD_REQUEST, "not in a guild".into());
     }
@@ -93,6 +96,7 @@ async fn post_remove(
     State(s): State<HttpState>,
     body: Result<Json<NameBody>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let name = match extract_name(body) { Ok(n) => n, Err(e) => return e };
     queue(&s, GuildAction::Remove(name))
 }

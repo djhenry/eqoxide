@@ -43,6 +43,7 @@ async fn post_invite(
     State(s): State<HttpState>,
     body: Result<Json<NameBody>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let name = match extract_name(body) { Ok(n) => n, Err(e) => return e };
     s.command.request_group_invite(name.clone());
     tracing::info!("group: queued invite to {name}");
@@ -51,6 +52,7 @@ async fn post_invite(
 
 /// POST /v1/group/accept — accept the current pending invite. 400 if there is none.
 async fn post_accept(State(s): State<HttpState>) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     if s.group_slots.group.lock().unwrap().pending_invite.is_none() {
         return (StatusCode::BAD_REQUEST, "no pending invite".into());
     }
@@ -62,6 +64,7 @@ async fn post_accept(State(s): State<HttpState>) -> (StatusCode, String) {
 /// POST /v1/group/decline — decline the current pending invite (sends a defensive
 /// OP_GroupDisband cleanup — RoF2 has no working OP_GroupCancelInvite). 400 if there is none.
 async fn post_decline(State(s): State<HttpState>) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     if s.group_slots.group.lock().unwrap().pending_invite.is_none() {
         return (StatusCode::BAD_REQUEST, "no pending invite".into());
     }
@@ -73,6 +76,7 @@ async fn post_decline(State(s): State<HttpState>) -> (StatusCode, String) {
 /// POST /v1/group/leave — leave the current group. If leader with < 3 total members, this fully
 /// disbands the group (confirmed EQEmu server behavior — no auto handoff). 400 if not grouped.
 async fn post_leave(State(s): State<HttpState>) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     if s.group_slots.group.lock().unwrap().members.is_empty() {
         return (StatusCode::BAD_REQUEST, "not in a group".into());
     }
@@ -87,6 +91,7 @@ async fn post_kick(
     State(s): State<HttpState>,
     body: Result<Json<NameBody>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let name = match extract_name(body) { Ok(n) => n, Err(e) => return e };
     let g = s.group_slots.group.lock().unwrap();
     if !g.you_are_leader {
@@ -107,6 +112,7 @@ async fn post_makeleader(
     State(s): State<HttpState>,
     body: Result<Json<NameBody>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let name = match extract_name(body) { Ok(n) => n, Err(e) => return e };
     let g = s.group_slots.group.lock().unwrap();
     if !g.you_are_leader {

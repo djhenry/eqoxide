@@ -36,6 +36,7 @@ async fn post_trade_open(
     State(s): State<HttpState>,
     body: Result<Json<TradeOpenBody>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let b = match body {
         Ok(Json(b)) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"merchant\":\"...\"}".into()),
@@ -57,6 +58,7 @@ async fn post_trade_open(
 
 /// POST /v1/merchant/close — close the currently open merchant window (OP_ShopRequest command=Close).
 async fn post_trade_close(State(s): State<HttpState>) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     s.command.request_merchant_trade(TradeCmd::Close);
     (StatusCode::OK, "closing merchant window".into())
 }
@@ -114,6 +116,7 @@ async fn post_buy(
     State(s): State<HttpState>,
     body: Result<Json<BuyBody>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
+    if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
     let b = match body {
         Ok(Json(b)) => b,
         Err(_) => return text(StatusCode::BAD_REQUEST, "provide {\"merchant\":\"...\",\"slot\":N}"),
@@ -191,6 +194,7 @@ async fn post_sell(
     State(s): State<HttpState>,
     body: Result<Json<SellBody>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let b = match body {
         Ok(Json(b)) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"merchant\":\"...\",\"slot\":N,\"quantity\":Q}".into()),
