@@ -1669,7 +1669,7 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
     // NPC dialogue may embed saylink hyperlinks; show the readable label and capture any clickable
     // choices. Only the Say channel (8) is NPC conversation — a saylink arriving on a player chat
     // channel (tell/OOC/etc.) is not a dialogue prompt, so choices are only adopted for `say`.
-    let (msg, choices) = parse_say_links(&msg);
+    let (msg, choices, item_links) = parse_say_links(&msg);
     if chan_num == 8 && !choices.is_empty() { gs.dialogue_choices = choices; }
 
     // Self-echo filter (#325): EQEmu broadcasts channel messages — say/ooc/shout/group/guild/
@@ -1727,10 +1727,10 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
     if !sender.is_empty() {
         // Log under the channel kind (tell/ooc/shout/group) so the chat window
         // can color and tab-filter by channel; plain say stays "chat" (#162).
-        gs.log_msg(event_channel.unwrap_or("chat"), &format!("<{}> {}", sender, msg));
+        gs.log_msg_with_item_links(event_channel.unwrap_or("chat"), &format!("<{}> {}", sender, msg), item_links);
     } else {
         // Zone-wide broadcasts without a sender (server messages like "An earthquake strikes!").
-        gs.log_msg("zone", &msg);
+        gs.log_msg_with_item_links("zone", &msg, item_links);
     }
 }
 
@@ -1835,35 +1835,44 @@ const SAY_LINK_BODY_SIZE: usize = 56;
 /// Strip EQ "saylink" framing from chat text, leaving only the human-readable label.
 ///
 /// Thin wrapper over [`parse_say_links`] for callers that only want the readable text.
-/// (eqoxide#46)
+/// (eqoxide#46) Now test-only: every production render path went through `parse_say_links`
+/// directly once #256 needed the decoded item links too, leaving this as a test convenience.
+#[cfg(test)]
 fn strip_say_links(s: &str) -> String {
     parse_say_links(s).0
 }
 
-/// Parse EQ "saylink" framing out of an NPC message, returning both the human-readable text
-/// (identical to what [`strip_say_links`] produced) and the structured, clickable choices.
+/// Parse EQ "saylink"/item-link framing out of an NPC or chat message, returning the
+/// human-readable text (identical to what [`strip_say_links`] produced), the structured clickable
+/// dialogue choices, and — for EVERY well-formed link, saylink or real item — an [`ItemLink`]
+/// carrying the resolvable `item_id` alongside the same display text (eqoxide#256). Before this,
+/// a REAL item link's `item_id` was decoded only far enough to check it against the saylink
+/// sentinel and then thrown away; an agent reading the clean text had no id to resolve the item
+/// against. `ItemLink::is_saylink` tells a caller which case it's looking at, since a saylink's
+/// body fields mean something different (see [`crate::game_state::ItemLink`] doc).
 ///
-/// On the wire a saylink is `\x12` + a fixed 56-char hex body + the display text + `\x12`
+/// On the wire a link is `\x12` + a fixed 56-char hex body + the display text + `\x12`
 /// (RoF2). Splitting on the `\x12` control byte (as EQEmu's `Strings::Split(msg, '\x12')` does)
 /// yields plain text at even indices and link contents (body+text) at odd indices. For each
 /// well-formed link (odd segment at least `SAY_LINK_BODY_SIZE` long) we drop the body from the
-/// display text and decode the body's hex fields into a [`DialogueChoice`] so the link can later
-/// be re-clicked via `OP_ItemLinkClick`. Only real saylinks (body `item_id == SAYLINK_ITEM_ID`)
-/// become choices; other item links keep their display text but are not offered as choices.
+/// display text and decode the body's hex fields. Only real saylinks (body `item_id ==
+/// SAYLINK_ITEM_ID`) become [`crate::game_state::DialogueChoice`]s (click-to-say); every
+/// well-formed link — saylink or real item — becomes an [`crate::game_state::ItemLink`].
 /// A malformed or short link segment is kept verbatim (minus the control byte) so we never eat
-/// real text.
+/// real text, and produces neither.
 ///
 /// Body field offsets (hex chars), from EQEmu `common/say_link.cpp`
 /// `DegenerateLinkBody` / RoF2 `SAY_LINK_BODY_SIZE == 56`:
 ///   action_id[0..1] item_id[1..6] augment_1[6..11] augment_2[11..16] augment_3[16..21]
 ///   augment_4[21..26] augment_5[26..31] augment_6[31..36] is_evolving[36..37]
 ///   evolve_group[37..41] evolve_level[41..43] ornament_icon[43..48] hash[48..56]
-fn parse_say_links(s: &str) -> (String, Vec<crate::game_state::DialogueChoice>) {
+fn parse_say_links(s: &str) -> (String, Vec<crate::game_state::DialogueChoice>, Vec<crate::game_state::ItemLink>) {
     if !s.contains('\x12') {
-        return (s.to_string(), Vec::new());
+        return (s.to_string(), Vec::new(), Vec::new());
     }
     let mut out = String::with_capacity(s.len());
     let mut choices = Vec::new();
+    let mut item_links = Vec::new();
     for (i, seg) in s.split('\x12').enumerate() {
         if i & 1 == 1 && seg.len() >= SAY_LINK_BODY_SIZE {
             // Link content: drop the fixed-length body, keep the trailing display text.
@@ -1871,7 +1880,14 @@ fn parse_say_links(s: &str) -> (String, Vec<crate::game_state::DialogueChoice>) 
             let (body, display) = seg.split_at(SAY_LINK_BODY_SIZE);
             out.push_str(display);
             let hx = |a: usize, b: usize| u32::from_str_radix(&body[a..b], 16).unwrap_or(0);
-            if hx(1, 6) == SAYLINK_ITEM_ID {
+            let item_id = hx(1, 6);
+            let is_saylink = item_id == SAYLINK_ITEM_ID;
+            item_links.push(crate::game_state::ItemLink {
+                text: display.to_string(),
+                item_id,
+                is_saylink,
+            });
+            if is_saylink {
                 choices.push(crate::game_state::DialogueChoice {
                     text:      display.to_string(),
                     item_id:   SAYLINK_ITEM_ID,
@@ -1885,7 +1901,7 @@ fn parse_say_links(s: &str) -> (String, Vec<crate::game_state::DialogueChoice>) 
             out.push_str(seg);
         }
     }
-    (out, choices)
+    (out, choices, item_links)
 }
 
 /// Item id that marks an EQ item-link body as a "saylink" rather than a real item
@@ -1922,10 +1938,12 @@ fn apply_formatted_message(gs: &mut GameState, payload: &[u8]) {
     // Formatted quest/server text can embed item saylinks in its arguments (e.g. "You need
     // [<56-hex body>rat whiskers]."). Strip the fixed hex link body so only the readable name
     // shows, matching the says/emote paths (#256). apply_channel_message/apply_special_message
-    // already do this; this was the remaining un-stripped message render path.
-    let text = strip_say_links(&text);
+    // already do this; this was the remaining un-stripped message render path. Also surface any
+    // decoded item_id (choices are ignored here: a formatted server/quest message is not a say-
+    // channel dialogue prompt, so it never becomes a clickable dialogue choice).
+    let (text, _choices, item_links) = parse_say_links(&text);
     if !text.trim().is_empty() && !is_debug_spam(&text) {
-        gs.log_msg("system", &text);
+        gs.log_msg_with_item_links("system", &text, item_links);
     }
 }
 
@@ -1936,13 +1954,11 @@ fn apply_emote(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < 5 { return; }
     let etype = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
     if etype == 0xffff_ffff { return; } // /dance, /flip, etc. — animation only
-    let msg = strip_say_links(
-        String::from_utf8_lossy(&payload[4..])
-            .trim_end_matches('\0')
-            .trim(),
-    );
+    let raw_cow = String::from_utf8_lossy(&payload[4..]);
+    let raw = raw_cow.trim_end_matches('\0').trim();
+    let (msg, _choices, item_links) = parse_say_links(raw);
     if !msg.is_empty() && !is_debug_spam(&msg) {
-        gs.log_msg("npc", &msg);
+        gs.log_msg_with_item_links("npc", &msg, item_links);
     }
 }
 
@@ -2211,15 +2227,15 @@ fn apply_special_message(gs: &mut GameState, payload: &[u8]) {
     let msg = String::from_utf8_lossy(&payload[msg_start..])
         .trim_end_matches('\0')
         .to_string();
-    let (msg, choices) = parse_say_links(&msg);
+    let (msg, choices, item_links) = parse_say_links(&msg);
     if msg.trim().is_empty() || is_debug_spam(&msg) { return; }
     // A new NPC line carrying clickable saylinks (e.g. a Soulbinder's "[bind your soul]") replaces
     // the current dialogue choices (#120).
     if !choices.is_empty() { gs.dialogue_choices = choices; }
     if sayer.is_empty() {
-        gs.log_msg("npc", &msg);
+        gs.log_msg_with_item_links("npc", &msg, item_links);
     } else {
-        gs.log_msg("npc", &format!("{} says, '{}'", sayer, msg));
+        gs.log_msg_with_item_links("npc", &format!("{} says, '{}'", sayer, msg), item_links);
     }
 }
 
@@ -5978,7 +5994,7 @@ mod tests {
         use super::{parse_say_links, SAYLINK_ITEM_ID};
         let body = mk_saylink_body(SAYLINK_ITEM_ID, 42, 7, 0xABCD);
         let msg = format!("Do you wish to \x12{body}bind your soul\x12 here?");
-        let (text, choices) = parse_say_links(&msg);
+        let (text, choices, item_links) = parse_say_links(&msg);
         assert_eq!(text, "Do you wish to bind your soul here?");
         assert_eq!(choices.len(), 1);
         let c = &choices[0];
@@ -5987,24 +6003,40 @@ mod tests {
         assert_eq!(c.augments[0], 42, "sayid decoded from augment_1");
         assert_eq!(c.icon, 7);
         assert_eq!(c.link_hash, 0xABCD);
+        // (eqoxide#256) A saylink is ALSO surfaced as an ItemLink, flagged so a caller doesn't
+        // mistake the saylink-table lookup key for a real item id.
+        assert_eq!(item_links.len(), 1);
+        assert_eq!(item_links[0].text, "bind your soul");
+        assert_eq!(item_links[0].item_id, SAYLINK_ITEM_ID);
+        assert!(item_links[0].is_saylink, "SAYLINK_ITEM_ID must be flagged as a saylink, not a real item");
     }
 
     #[test]
     fn parse_say_links_plain_text_has_no_choices() {
         use super::parse_say_links;
-        let (text, choices) = parse_say_links("just a greeting");
+        let (text, choices, item_links) = parse_say_links("just a greeting");
         assert_eq!(text, "just a greeting");
         assert!(choices.is_empty());
+        assert!(item_links.is_empty());
     }
 
+    /// (eqoxide#256) The core fix: a REAL item link (item_id != SAYLINK_ITEM_ID) must render as
+    /// clean text (no 56-hex-char body) AND expose its item_id as a resolvable ItemLink — it is
+    /// NOT a dialogue choice (clicking it doesn't "say" anything back to an NPC), but the id must
+    /// not be silently dropped either. Mutation check: comment out the `item_links.push(...)` call
+    /// in `parse_say_links` and this assertion on `item_links` goes red while `text` still passes —
+    /// proving the id, not just the hex-stripping, is under test.
     #[test]
-    fn parse_say_links_ignores_non_saylink_item_links() {
+    fn parse_say_links_exposes_real_item_id_without_offering_a_choice() {
         use super::parse_say_links;
-        // A real item link (item_id != SAYLINK_ITEM_ID) keeps its display text but is not a choice.
         let body = mk_saylink_body(1001, 0, 0, 0);
-        let (text, choices) = parse_say_links(&format!("\x12{body}Rusty Dagger\x12"));
-        assert_eq!(text, "Rusty Dagger");
-        assert!(choices.is_empty(), "item links are not dialogue choices");
+        let (text, choices, item_links) = parse_say_links(&format!("\x12{body}Rusty Dagger\x12"));
+        assert_eq!(text, "Rusty Dagger", "hex body must be hidden, display text kept");
+        assert!(choices.is_empty(), "a real item link is not a click-to-say dialogue choice");
+        assert_eq!(item_links.len(), 1, "the item_id must be exposed as a resolvable ItemLink");
+        assert_eq!(item_links[0].text, "Rusty Dagger");
+        assert_eq!(item_links[0].item_id, 1001, "real item_id must survive, not be dropped");
+        assert!(!item_links[0].is_saylink, "item_id 1001 is a real item, not the saylink sentinel");
     }
 
     #[test]
@@ -6025,6 +6057,55 @@ mod tests {
         // The logged line shows clean text (no link markup).
         assert!(gs.messages.back().unwrap().text.contains("bind your soul"));
         assert!(!gs.messages.back().unwrap().text.contains('\u{12}'));
+    }
+
+    /// (eqoxide#256) The issue's own reported scenario: NPC quest dialogue embedding a REAL item
+    /// link (e.g. "...find someone to help replenish our stock of [rat whiskers]..."). The message
+    /// text an agent reads must be clean (no 56-hex-char body) AND the item's real id must be
+    /// exposed via `item_links` — not a dialogue choice (this isn't a click-to-say phrase), but not
+    /// silently dropped either.
+    ///
+    /// Mutation check: (a) comment out the `item_links.push` call in `parse_say_links` →
+    /// `item_links` stays empty and the `assert_eq!(logged.item_links.len(), 1)` below goes red;
+    /// (b) revert the hex-strip itself (skip the `split_at`/`out.push_str(display)` step) → the raw
+    /// 56-hex-char body leaks into `logged.text` and the `!contains(&hex_body_marker)` assertion
+    /// goes red. Both failure modes are covered — both verified RED, then restored.
+    #[test]
+    fn special_message_real_item_link_renders_clean_text_and_item_id() {
+        use super::apply_special_message;
+        const RAT_WHISKERS_ITEM_ID: u32 = 758;
+        // SpecialMesg: header[11] | sayer\0 | unknown[12] | message\0
+        let mut p = vec![0u8; 11];
+        p.extend_from_slice(b"Caleah Herblender\0");
+        p.extend_from_slice(&[0u8; 12]);
+        let body = mk_saylink_body(RAT_WHISKERS_ITEM_ID, 0, 0, 0);
+        p.extend_from_slice(
+            format!("Let's see if we can find someone to help replenish our stock of \x12{body}rat whiskers\x12.")
+                .as_bytes(),
+        );
+
+        let mut gs = GameState::new();
+        apply_special_message(&mut gs, &p);
+
+        // No dialogue choice: a real item link is not a click-to-say phrase.
+        assert!(gs.dialogue_choices.is_empty(), "a real item link must not become a dialogue choice");
+
+        let logged = gs.messages.back().expect("a message was logged");
+        // Clean, readable text: the display name is kept, the hex body is gone. The hex-body marker
+        // is the item_id field AS IT ACTUALLY APPEARS on the wire — `{:05x}` (so 758 → "002f6", NOT
+        // "00758"): the link body encodes item_id as 5 hex chars, so a decimal-looking substring
+        // could never leak and asserting against it would be vacuously true (PR #514 review).
+        let hex_body_marker = format!("{:05x}", RAT_WHISKERS_ITEM_ID); // "002f6"
+        assert!(logged.text.contains("rat whiskers"), "display text kept: {:?}", logged.text);
+        assert!(!logged.text.contains('\u{12}'), "control byte stripped: {:?}", logged.text);
+        assert!(!logged.text.contains(&hex_body_marker),
+            "hex body (marker {hex_body_marker:?}) must not leak into the message: {:?}", logged.text);
+
+        // Resolvable item reference: the id must be reachable from the logged entry, not discarded.
+        assert_eq!(logged.item_links.len(), 1, "the real item_id must be exposed as an ItemLink");
+        assert_eq!(logged.item_links[0].item_id, RAT_WHISKERS_ITEM_ID);
+        assert_eq!(logged.item_links[0].text, "rat whiskers");
+        assert!(!logged.item_links[0].is_saylink, "758 is a real item, not the saylink sentinel");
     }
 
     #[test]
