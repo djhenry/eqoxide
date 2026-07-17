@@ -110,6 +110,15 @@ impl CommandState {
     pub fn take_zone_cross(&self) -> Option<u16> {
         self.nav.zone_cross.lock().unwrap().take()
     }
+
+    /// Peek the active `/goto` destination without draining it (the walker holds it continuously).
+    /// A read-only accessor so callers outside this module — and tests — can observe whether a nav
+    /// destination is set, without reaching into the private `nav` slots. `None` = the walker has no
+    /// active goto (idle/stopped).
+    #[cfg(test)]
+    pub(crate) fn goto_target(&self) -> Option<(f32, f32, f32)> {
+        *self.nav.goto_target.lock().unwrap()
+    }
 }
 
 #[cfg(test)]
