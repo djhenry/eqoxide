@@ -305,14 +305,16 @@ struct GiveBody {
 ///
 /// A3 Migration 2 (#448) — Command-with-result: this no longer returns a premature "queued" 200. It
 /// AWAITS the real outcome (up to 8s) and reports it honestly:
-///   • 200 — the server CONFIRMED the turn-in (OP_FinishTrade — the NPC accepted the item). Body:
-///     `{status:"given", item, npc_id}`.
+///   • 200 — the turn-in was CONFIRMED: OP_FinishTrade arrived AND the item actually LEFT inventory
+///     (verify-transfer, #486). Body: `{status:"given", item, npc_id}`.
 ///   • 409 — REFUSED before sending: a give was already in flight (singleton-in-flight). Body:
 ///     `{status:"refused", reason}`. No second trade was started.
-///   • 202 — the outcome is UNKNOWN: no OP_FinishTrade arrived. This covers the no-ack abort AND the
-///     ITEM-MISMATCH case (the server returns the item on the cursor with NO OP_FinishTrade), plus a
-///     lost reply or a zone change mid-give. The body says so explicitly. A 202 MUST NOT be read as
-///     success — that is the whole honesty invariant of A3 (see `crate::command_state::result`).
+///   • 202 — the outcome is UNKNOWN or the item did NOT transfer. This covers the no-ack abort, the
+///     ITEM-MISMATCH case (item returned on the cursor with NO OP_FinishTrade), a lost reply, a zone
+///     change mid-give, AND — the #486 fix — a give where OP_FinishTrade DID arrive but the NPC
+///     REJECTED / was OUT OF RANGE, returning the item to the player (OP_FinishTrade only ends the
+///     trade SESSION; it does NOT prove acceptance). The body says so explicitly. A 202 MUST NOT be
+///     read as success — that is the whole honesty invariant of A3 (see `crate::command_state::result`).
 async fn post_give(
     State(s): State<HttpState>,
     body: Result<Json<GiveBody>, axum::extract::rejection::JsonRejection>,

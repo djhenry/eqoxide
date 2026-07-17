@@ -80,10 +80,25 @@ struct GiveState {
     /// Item name captured from the inventory slot at send time, for the `GiveOk` receipt (the trade
     /// slots are cleared by the time OP_FinishTrade is applied, so it can't be read back then).
     item_name:     String,
+    /// #486 (review): the item_id captured from the give slot at send time — the KEY the verify-transfer
+    /// verdict uses (NOT the name). `None` when the item could not be identified at send time (the
+    /// inventory mirror was desynced — a documented #275 condition — so the give slot held no known
+    /// item): an unidentifiable give can NEVER be a confident success, so it resolves `Unconfirmed`.
+    /// Keying the verdict on `item_id` + the cursor slot (below) is precise where a name-scan was not:
+    /// a returned item comes back specifically to the CURSOR under its REAL id, and a same-named (or
+    /// same-id) duplicate elsewhere in the pack is irrelevant to whether THIS give transferred.
+    item_id:       Option<u32>,
     /// Phase flag: `false` = awaiting OP_TradeRequestAck (phase 1); `true` = OP_TradeAcceptClick sent,
     /// awaiting OP_FinishTrade (phase 2). Only the awaited path enters phase 2 — the fire-and-forget
     /// path clears `give_state` at accept, exactly as before.
     accepted:      bool,
+    /// #486: OP_FinishTrade has been observed for this phase-2 give, but the verdict is DEFERRED to the
+    /// next `tick_give` (which runs AFTER the gameplay drain loop, so the inventory mirror is settled)
+    /// so the give can be VERIFIED instead of trusted. OP_FinishTrade only means the trade SESSION
+    /// ended — a rejected / out-of-range NPC turn-in ALSO produces OP_FinishTrade but RETURNS the item
+    /// to the player (cursor). `tick_give` then checks whether the item actually left inventory before
+    /// resolving `Resolved(GiveOk)` (gone) vs `Unconfirmed` (still held → NOT a success, never a 200).
+    finish_seen:   bool,
 }
 
 /// ~3 second ack timeout, in nav ticks (tick gating is ~150ms → 20 ticks ≈ 3s). Phase 1 (awaiting
@@ -99,6 +114,17 @@ const GIVE_ACK_TIMEOUT_TICKS: u32 = 20;
 /// set GREATER than that so the NET verdict (Resolved/Unconfirmed) is what the caller receives,
 /// never a vaguer HTTP-elapsed 202. See the two-timeout ordering note in `http::interact::post_give`.
 const GIVE_FINISH_TIMEOUT_TICKS: u32 = 20;
+
+/// #486 — the "returned-item watch window", in nav ticks (~150ms each → ~300ms). After OP_FinishTrade
+/// is SEEN we do NOT judge the give immediately: EQEmu queues the 0-byte OP_FinishTrade FIRST, then
+/// `FinishTrade`→`PushItemOnCursor` returns any un-accepted item to the cursor via a SEPARATE
+/// OP_ItemPacket sent STRICTLY AFTER the finish (verified in the server source:
+/// zone/client_packet.cpp:15488 queues the finish before FinishTrade runs). So the return can land in a
+/// later rx-drain than the finish; we wait this settle window (each `tick_give` runs AFTER the full
+/// gameplay drain, so a couple of cadences guarantees the trailing return-item packet has been applied
+/// to the inventory mirror) before verifying whether the item actually left. Kept small — a give is
+/// rare and ~300ms is negligible; correctness (never a fabricated 200) beats latency.
+const GIVE_FINISH_SETTLE_TICKS: u32 = 2;
 
 /// A merchant buy sent via the honest awaited path (A3 Migration 1, #448), parked here until its
 /// resolving packet lands. Holds the `oneshot::Sender` HTTP is awaiting plus the merchant/slot the
@@ -1762,10 +1788,13 @@ impl ActionLoop {
     ///
     /// A3 Migration 2 (#448), SERIALIZED (#475 review): NEITHER path clears at step 3. Both hold
     /// `give_state` through a phase-2 wait for OP_FinishTrade, so at most one trade is ever in flight
-    /// and the 0-byte finish (no trade id) is unambiguous. On finish an awaited give resolves
-    /// `Resolved(GiveOk)` and a fire-and-forget give clears silently (`fulfill_give_ok`); a phase-2
-    /// timeout yields `Unconfirmed`/silent-clear. A NEW give arriving mid-trade is refused (awaited)
-    /// or dropped (fire-and-forget), never started. See `begin_give`/`fulfill_give_ok`.
+    /// and the 0-byte finish (no trade id) is unambiguous. VERIFY-TRANSFER (#486): OP_FinishTrade only
+    /// marks `finish_seen` (via `note_finish_trade`); the verdict is rendered HERE after a short settle,
+    /// checking whether the item actually left inventory — a genuinely-gone item resolves an awaited
+    /// give `Resolved(GiveOk)` (fire-and-forget clears silently), a still-held (returned) item resolves
+    /// `Unconfirmed`/silent-clear (NEVER a fabricated 200). A phase-2 timeout with no finish at all
+    /// yields `Unconfirmed`/silent-clear. A NEW give arriving mid-trade is refused (awaited) or dropped
+    /// (fire-and-forget), never started. See `begin_give`/`note_finish_trade`.
     fn tick_give(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Begin a new give request if one is queued and we're not already mid-trade. Prefer the
         // fire-and-forget UI slot (existing behavior), then the awaited slot (#448). Only one trade
@@ -1820,9 +1849,10 @@ impl ActionLoop {
                 gs.trade_ack_ready = false;
                 // Enter phase 2 for BOTH paths (#475 review): keep `give_state` parked through the
                 // confirming OP_FinishTrade so this give stays the ONLY trade in flight and the 0-byte
-                // finish can't be mis-attributed. `fulfill_give_ok` then resolves it (awaited →
-                // `Resolved(GiveOk)`; fire-and-forget → silent clear). Reset the tick counter to time
-                // the finish wait. (Pre-review, the fire-and-forget path cleared here at accept — which
+                // finish can't be mis-attributed. `note_finish_trade` marks the finish and the deferred
+                // verify (#486) then resolves it (awaited → `Resolved(GiveOk)` if the item left, else
+                // `Unconfirmed`; fire-and-forget → silent clear). Reset the tick counter to time the
+                // finish wait. (Pre-review, the fire-and-forget path cleared here at accept — which
                 // let a late finish resolve a DIFFERENT give that had reached phase 2 meanwhile.)
                 if let Some(g) = self.give_state.as_mut() { g.accepted = true; g.ticks_waiting = 0; }
             } else if let Some(g) = self.give_state.as_mut() {
@@ -1842,15 +1872,69 @@ impl ActionLoop {
                     gs.trade_ack_ready = false;
                 }
             }
+        } else if self.give_state.as_ref().map(|g| g.finish_seen).unwrap_or(false) {
+            // Phase 2, OP_FinishTrade SEEN (#486). WAIT the returned-item watch window first: EQEmu
+            // sends any un-accepted item back to the cursor via a SEPARATE OP_ItemPacket queued STRICTLY
+            // AFTER the 0-byte OP_FinishTrade (server source: zone/client_packet.cpp:15488), so it can
+            // land in a later rx-drain than the finish. Settling for GIVE_FINISH_SETTLE_TICKS cadences
+            // (each tick runs AFTER the full gameplay drain) guarantees any return-item packet is applied
+            // before we judge — without it the verify would race and could still fabricate a 200.
+            let settled = {
+                let g = self.give_state.as_mut().unwrap();
+                g.ticks_waiting += 1;
+                g.ticks_waiting >= GIVE_FINISH_SETTLE_TICKS
+            };
+            if !settled { return; }
+            // Watch window elapsed: every packet in the finish's batch — crucially any returned-item
+            // OP_ItemPacket — is now applied to the inventory mirror. VERIFY the item actually
+            // transferred instead of trusting the finish. OP_FinishTrade only means the trade SESSION
+            // ended; a rejected / out-of-range NPC returns the item SPECIFICALLY TO THE CURSOR (slot 33,
+            // via EQEmu PushItemOnCursor) and STILL sends OP_FinishTrade.
+            //
+            // The verdict keys on the captured `item_id` at the CURSOR — a POSITIVE, precise "was it
+            // returned?" test (review of the first cut):
+            //   • `item_id` is None → the item could not be identified at send time (mirror desync,
+            //     #275). We can NEVER confidently claim success for an unidentifiable give → `Unconfirmed`
+            //     (this closes a residual false-200: the old name-scan fell back to a synthetic
+            //     "item in slot N" name that a real returned item never matches).
+            //   • the captured `item_id` is on the CURSOR (slot 33) → the NPC RETURNED it → `Unconfirmed`.
+            //   • otherwise (not on the cursor — gone) → the turn-in transferred → `Resolved(GiveOk)`.
+            // Keying on cursor+item_id (not an all-slot name-scan) means a same-named/same-id DUPLICATE
+            // sitting elsewhere in the pack (a spare stackable reagent, an equipped copy) does NOT
+            // fabricate a false `Unconfirmed` on a REAL success — which an agent would treat as "retry"
+            // and hand the item over twice. Never a false 200, and no spurious 202 from a duplicate.
+            let g = self.give_state.as_mut().unwrap();
+            let await_tx  = g.await_tx.take();
+            let npc_id    = g.npc_id;
+            let item_name = std::mem::take(&mut g.item_name);
+            let item_id   = g.item_id;
+            self.give_state = None;
+            let confirmed = match item_id {
+                // Identified: transferred iff the captured item is NOT sitting on the cursor.
+                Some(id) => !gs.inventory.iter().any(|i| i.slot == SLOT_CURSOR as i32 && i.item_id == id),
+                // Unidentifiable at send time (mirror desync) → never a confident success.
+                None => false,
+            };
+            if confirmed {
+                tracing::info!("EQ: give: turn-in confirmed — item {:?} (id={:?}) left inventory (npc_id={})", item_name, item_id, npc_id);
+                if let Some(tx) = await_tx {
+                    let _ = tx.send(crate::command_state::CommandResult::Resolved(
+                        crate::command_state::GiveOk { npc_id, item_name }));
+                }
+            } else {
+                tracing::warn!("EQ: give: OP_FinishTrade but item {:?} (id={:?}) NOT transferred (returned to cursor or unidentifiable) — honest Unconfirmed", item_name, item_id);
+                gs.log_msg("trade", "Give not confirmed — the item was returned to you");
+                if let Some(tx) = await_tx {
+                    let _ = tx.send(crate::command_state::CommandResult::Unconfirmed);
+                }
+            }
         } else if let Some(g) = self.give_state.as_mut() {
-            // Phase 2 (both paths): OP_TradeAcceptClick has been sent; we hold the machine, awaiting
-            // OP_FinishTrade — which `fulfill_give_ok` resolves + clears. If none arrives within the
-            // window, the turn-in was either an item mismatch (the server returns the item on the
-            // cursor via OP_ItemPacket with NO OP_FinishTrade) or the reply was lost. The awaited path
-            // reports the HONEST `Unconfirmed` (202), NEVER success; a fire-and-forget give clears
-            // silently. We do NOT try to positively detect the cursor-return (ambiguous), so we never
-            // claim a definitive `Refused` we can't prove. Clearing here is also what frees the machine
-            // for the next give (serialized — one trade at a time).
+            // Phase 2 (both paths), NO finish yet: OP_TradeAcceptClick has been sent; we hold the
+            // machine, awaiting OP_FinishTrade. If none arrives within the window, the turn-in was
+            // either an item mismatch (the server returns the item on the cursor via OP_ItemPacket with
+            // NO OP_FinishTrade) or the reply was lost. The awaited path reports the HONEST `Unconfirmed`
+            // (202), NEVER success; a fire-and-forget give clears silently. Clearing here is also what
+            // frees the machine for the next give (serialized — one trade at a time).
             g.ticks_waiting += 1;
             if g.ticks_waiting >= GIVE_FINISH_TIMEOUT_TICKS {
                 let await_tx = g.await_tx.take();
@@ -1877,12 +1961,17 @@ impl ActionLoop {
         from_slot: u32,
         await_tx: Option<tokio::sync::oneshot::Sender<crate::command_state::CommandResult<crate::command_state::GiveOk>>>,
     ) {
-        // Capture the item name BEFORE it leaves the slot — by the time the confirming OP_FinishTrade
-        // is applied, `clear_trade_slots` has run, so it can't be read back then.
-        let item_name = gs.inventory.iter()
-            .find(|i| i.slot == from_slot as i32)
-            .map(|i| i.name.clone())
+        // Capture the item name AND item_id BEFORE it leaves the slot — by the time the confirming
+        // OP_FinishTrade is applied, `clear_trade_slots` has run, so neither can be read back then. The
+        // `item_id` is the KEY the verify-transfer verdict uses (#486 review); the name is only the
+        // human receipt. If the mirror is desynced and the slot holds no known item, `item_id` is None
+        // (a nonzero id from a real item is required) → an unidentifiable give resolves `Unconfirmed`,
+        // never a confident success. (One `find` for both so the id and name always describe the SAME
+        // slotted item.)
+        let found = gs.inventory.iter().find(|i| i.slot == from_slot as i32);
+        let item_name = found.map(|i| i.name.clone())
             .unwrap_or_else(|| format!("item in slot {from_slot}"));
+        let item_id = found.map(|i| i.item_id).filter(|&id| id != 0);
         // Step 1: put the item on the cursor (skip if it's already there). Use the 28-byte structured
         // MoveItem (possessions→cursor); the old flat 12-byte packet was silently dropped by the
         // server, so the item never reached the cursor (eqoxide#26).
@@ -1896,29 +1985,33 @@ impl ActionLoop {
         req[4..8].copy_from_slice(&gs.player_id.to_le_bytes());
         stream.send_app_packet(OP_TRADE_REQUEST, &req);
         gs.trade_ack_ready = false;
-        self.give_state = Some(GiveState { npc_id, ticks_waiting: 0, await_tx, item_name, accepted: false });
+        self.give_state = Some(GiveState { npc_id, ticks_waiting: 0, await_tx, item_name, item_id, accepted: false, finish_seen: false });
         tracing::info!("EQ: give: OP_TradeRequest to npc_id={} (item slot {})", npc_id, from_slot);
         gs.log_msg("trade", "Offering item to NPC...");
     }
 
-    /// Resolve a parked AWAITED give on OP_FinishTrade (A3 Migration 2, #448). Called from the gameplay
-    /// loop AFTER `apply_packet` (which cleared the trade slots), exactly as the buy fulfils are.
-    /// OP_FinishTrade is a 0-byte packet with NO correlation data (no trade/npc id) — so it can only be
-    /// matched to a give because gives are SERIALIZED (#475 review): at most one trade is in flight, so
-    /// a finish while a give is parked in phase 2 unambiguously belongs to THAT give. It means the NPC
-    /// ACCEPTED the item (a mismatch instead returns the item on the cursor with NO OP_FinishTrade). We
-    /// therefore CONSUME the parked phase-2 give on any finish — resolving `Resolved(GiveOk)` (awaited,
-    /// item name captured at send time) or clearing silently (fire-and-forget: consuming the finish is
-    /// what keeps it from lingering and frees the machine for the next give). No-op unless a phase-2
-    /// give is parked (a finish with nothing in flight, or one still in phase 1, resolves nothing).
-    /// Non-blocking; never `.await`s; a dropped receiver (HTTP already timed out) is ignored.
-    pub fn fulfill_give_ok(&mut self) {
-        let in_phase2 = self.give_state.as_ref().map(|g| g.accepted).unwrap_or(false);
-        if !in_phase2 { return; }
-        let g = self.give_state.take().unwrap();
-        if let Some(tx) = g.await_tx {
-            let _ = tx.send(crate::command_state::CommandResult::Resolved(
-                crate::command_state::GiveOk { npc_id: g.npc_id, item_name: g.item_name }));
+    /// NOTE that OP_FinishTrade landed for the parked AWAITED/fire-and-forget give (A3 Migration 2,
+    /// #448; verify-transfer hardened in #486). Called from the gameplay loop AFTER `apply_packet`
+    /// (which cleared the trade slots AND applied any returned-item OP_ItemPacket), exactly as the buy
+    /// fulfils are. OP_FinishTrade is a 0-byte packet with NO correlation data (no trade/npc id) — so it
+    /// can only be matched to a give because gives are SERIALIZED (#475 review): at most one trade is in
+    /// flight, so a finish while a give is parked in phase 2 unambiguously belongs to THAT give.
+    ///
+    /// #486 — OP_FinishTrade does NOT mean the NPC ACCEPTED the item. It means the trade SESSION ended.
+    /// A rejected or OUT-OF-RANGE NPC turn-in ALSO fires OP_FinishTrade but RETURNS the item to the
+    /// player (cursor slot 33). Resolving `Resolved(GiveOk)` on ANY finish was a fabricated 200 for an
+    /// item that never transferred (live, twice: a give to an 850u NPC returned 200 "given" while the
+    /// stack just shuffled slot 24→33). So this no longer resolves — it merely sets `finish_seen`, and
+    /// the verdict is DEFERRED to `tick_give`, which runs AFTER the whole gameplay drain loop (so the
+    /// inventory mirror is settled) and VERIFIES the item actually left before resolving. No-op unless a
+    /// phase-2 give is parked (a finish with nothing in flight, or one still in phase 1, is ignored).
+    /// Non-blocking; never `.await`s.
+    pub fn note_finish_trade(&mut self) {
+        if let Some(g) = self.give_state.as_mut() {
+            if g.accepted && !g.finish_seen {
+                g.finish_seen = true;
+                g.ticks_waiting = 0; // restart the counter as the returned-item watch window
+            }
         }
     }
 
@@ -2894,14 +2987,20 @@ mod tests {
     // A3 Migration 2 (#448): the honest awaited quest-turn-in (give) path. These drive a give
     // through the real `tick_give` state machine (the loop's own `command` slot is shared with the
     // drain, so a real request→take round-trip runs), advance it with `gs.trade_ack_ready`, and feed
-    // OP_FinishTrade exactly as `gameplay.rs` does (via `fulfill_give_ok`).
+    // OP_FinishTrade exactly as `gameplay.rs` does (via `note_finish_trade`), then tick through the
+    // #486 settle window so the deferred verify-transfer verdict runs.
     // ─────────────────────────────────────────────────────────────────────────────────────────
+
+    /// item_id of the seeded turn-in item. The verify-transfer verdict keys on item_id (#486 review),
+    /// so the seed MUST carry a nonzero id — a zero id reads as "unidentifiable" (mirror desync) and
+    /// would resolve `Unconfirmed`, which is exactly the Finding-1 case tested separately below.
+    const BONE_CHIPS_ID: u32 = 13073;
 
     fn seed_give_gs() -> GameState {
         let mut gs = GameState::new();
         gs.player_id = 42;
         gs.inventory.push(crate::game_state::InvItem {
-            slot: 23, name: "Bone Chips".into(), ..Default::default()
+            slot: 23, item_id: BONE_CHIPS_ID, name: "Bone Chips".into(), ..Default::default()
         });
         gs
     }
@@ -2926,10 +3025,17 @@ mod tests {
         nav.tick_give(&mut stream, &mut gs);
         assert!(nav.give_state.is_some(), "an awaited give must stay parked through phase 2 (await finish)");
 
-        // OP_FinishTrade arrives — apply it (clears trade slots) THEN fulfil, exactly as the gameplay
-        // loop does after `apply_packet`.
+        // OP_FinishTrade arrives — apply it (clears trade slots) THEN note it, exactly as the gameplay
+        // loop does after `apply_packet`. The NPC ACCEPTED the item, so nothing is returned: the item is
+        // GONE from the mirror (the trade slot was cleared and no return-item packet follows).
         apply_packet(&mut gs, &AppPacket { opcode: OP_FINISH_TRADE, payload: vec![] });
-        nav.fulfill_give_ok();
+        nav.note_finish_trade();
+        // #486: the verdict is DEFERRED across the returned-item watch window. Tick through it; the item
+        // never comes back, so the give resolves `Resolved(GiveOk)` — an honest confirmed transfer.
+        for _ in 0..GIVE_FINISH_SETTLE_TICKS {
+            assert!(nav.give_state.is_some(), "the give must stay parked through the settle window");
+            nav.tick_give(&mut stream, &mut gs);
+        }
 
         assert_eq!(
             resp.await.unwrap(),
@@ -2938,6 +3044,131 @@ mod tests {
             }),
         );
         assert!(nav.give_state.is_none(), "give_state must be consumed exactly once");
+    }
+
+    /// #486 — VERIFY-TRANSFER, THE HONESTY PROOF FOR A RETURNED ITEM. A give to a rejecting /
+    /// out-of-range NPC: the server STILL sends OP_FinishTrade (it only means the trade SESSION ended)
+    /// but then RETURNS the item to the CURSOR (slot 33, EQEmu PushItemOnCursor) via a SEPARATE
+    /// OP_ItemPacket sent STRICTLY AFTER the finish. The give machine must NOT trust the finish — it
+    /// checks whether the captured item_id came back on the cursor and, finding it there, resolves
+    /// `Unconfirmed` (→ 202), NEVER `Resolved`/200.
+    ///
+    /// MUTATION CHECK: the pre-#486 code resolved `Resolved(GiveOk)` on ANY OP_FinishTrade. Under that
+    /// behavior this test goes RED — the returned item would be reported as a successful "given".
+    #[tokio::test]
+    async fn awaited_give_finish_but_item_returned_is_unconfirmed_never_success() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_give_gs();
+
+        let (tx, mut resp) = tokio::sync::oneshot::channel();
+        nav.command.request_give_await(11, 23, tx);
+        nav.tick_give(&mut stream, &mut gs);          // begin (phase 1): item 23 → cursor 33, OP_TradeRequest
+        gs.trade_ack_ready = true;
+        nav.tick_give(&mut stream, &mut gs);          // ack → cursor 33 → trade slot 3000, accept, phase 2
+        assert!(nav.give_state.is_some());
+
+        // Server sequence for a NON-accepted turn-in (EQEmu client_packet.cpp:15488 then
+        // FinishTrade→PushItemOnCursor): OP_FinishTrade FIRST (clears the trade slot), then the item is
+        // RETURNED to the cursor via OP_ItemPacket. Replay that exact ORDER.
+        apply_packet(&mut gs, &AppPacket { opcode: OP_FINISH_TRADE, payload: vec![] });
+        nav.note_finish_trade();
+        // The returned item lands on the CURSOR (slot 33) under its REAL item_id, AFTER the finish — the
+        // crux of the bug. The verdict keys on cursor+item_id, so this is the positive "returned" signal.
+        gs.inventory.push(crate::game_state::InvItem {
+            slot: SLOT_CURSOR as i32, item_id: BONE_CHIPS_ID, name: "Bone Chips".into(), ..Default::default()
+        });
+
+        // Tick through the settle window; the verify sees the item on the cursor → Unconfirmed, not success.
+        for _ in 0..GIVE_FINISH_SETTLE_TICKS {
+            assert!(matches!(resp.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
+                "the give must not resolve before the returned-item watch window elapses");
+            nav.tick_give(&mut stream, &mut gs);
+        }
+        assert_eq!(resp.try_recv(), Ok(crate::command_state::CommandResult::Unconfirmed),
+            "a give whose item was RETURNED to the cursor is NOT a success — never a 200");
+        assert!(nav.give_state.is_none(), "give_state must be consumed exactly once");
+    }
+
+    /// #486 (review, Finding 2) — NO FALSE-202 FROM A DUPLICATE ELSEWHERE. A SUCCESSFUL give while a
+    /// DUPLICATE of the same item (same item_id, e.g. a spare stack of reagents) sits in a GENERAL slot:
+    /// the NPC accepts the handed item (nothing returns to the cursor), so the give must resolve
+    /// `Resolved`/200 even though a copy still sits in the pack. The old all-slot name-scan resolved
+    /// `Unconfirmed` here — a false-202 an agent treats as "retry", handing the item over TWICE
+    /// (double turn-in / item loss). Keying the verdict on cursor+item_id fixes it.
+    ///
+    /// MUTATION CHECK: revert the verdict to the all-slot name-scan (`any(slot < TRADE_BEGIN && name ==
+    /// item_name)`) and this goes RED — the duplicate in the general slot forces a bogus `Unconfirmed`.
+    #[tokio::test]
+    async fn awaited_give_success_with_a_duplicate_in_a_bag_slot_still_resolves_200() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_give_gs();
+        // A pre-existing DUPLICATE of the SAME item (same id + name) in another general slot. It is NOT
+        // on the cursor, so it has nothing to do with whether THIS give transferred.
+        gs.inventory.push(crate::game_state::InvItem {
+            slot: 24, item_id: BONE_CHIPS_ID, name: "Bone Chips".into(), ..Default::default()
+        });
+
+        let (tx, resp) = tokio::sync::oneshot::channel();
+        nav.command.request_give_await(11, 23, tx);
+        nav.tick_give(&mut stream, &mut gs);          // begin: slot 23 → cursor, OP_TradeRequest
+        gs.trade_ack_ready = true;
+        nav.tick_give(&mut stream, &mut gs);          // ack → cursor → trade slot 3000, accept, phase 2
+
+        // NPC ACCEPTS: OP_FinishTrade clears the trade slot and NOTHING returns to the cursor. The
+        // duplicate at slot 24 stays put. The cursor holds no Bone Chips → the give transferred.
+        apply_packet(&mut gs, &AppPacket { opcode: OP_FINISH_TRADE, payload: vec![] });
+        nav.note_finish_trade();
+        for _ in 0..GIVE_FINISH_SETTLE_TICKS { nav.tick_give(&mut stream, &mut gs); }
+
+        assert_eq!(
+            resp.await.unwrap(),
+            crate::command_state::CommandResult::Resolved(crate::command_state::GiveOk {
+                npc_id: 11, item_name: "Bone Chips".into(),
+            }),
+            "a real success must be 200 even with a same-item duplicate elsewhere in the pack — no false 202",
+        );
+        // The duplicate is untouched.
+        assert!(gs.inventory.iter().any(|i| i.slot == 24 && i.item_id == BONE_CHIPS_ID));
+        assert!(nav.give_state.is_none());
+    }
+
+    /// #486 (review, Finding 1) — NO FALSE-200 WHEN THE ITEM CAN'T BE IDENTIFIED AT SEND TIME. If the
+    /// inventory mirror is desynced (a documented #275 condition) the give slot holds no known item, so
+    /// item_id can't be captured. The give still goes out on the wire (the server has the real item),
+    /// and a rejecting NPC returns it to the cursor. With the OLD name-scan the captured name fell back
+    /// to a synthetic "item in slot N" that the real returned item never matches → a fabricated 200.
+    /// The fix: an unidentifiable give can NEVER be a confident success → `Unconfirmed`.
+    ///
+    /// MUTATION CHECK: map the `None` (unidentifiable) verdict arm to `true` (confirmed) and this goes
+    /// RED — the unidentifiable, actually-returned give would be reported as a successful "given".
+    #[tokio::test]
+    async fn awaited_give_unidentifiable_at_send_is_unconfirmed_never_false_200() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_give_gs();
+
+        // Give from slot 5, which is EMPTY in the mirror (desync): item_id cannot be captured → None.
+        let (tx, mut resp) = tokio::sync::oneshot::channel();
+        nav.command.request_give_await(11, 5, tx);
+        nav.tick_give(&mut stream, &mut gs);          // begin (phase 1) — nothing at slot 5 in the mirror
+        assert!(nav.give_state.is_some());
+        gs.trade_ack_ready = true;
+        nav.tick_give(&mut stream, &mut gs);          // ack → accept, phase 2
+
+        // The NPC returns the item to the cursor under its REAL id/name (which the mirror only learns
+        // now, from the server) — exactly the case the old name-fallback would have mis-read as success.
+        apply_packet(&mut gs, &AppPacket { opcode: OP_FINISH_TRADE, payload: vec![] });
+        nav.note_finish_trade();
+        gs.inventory.push(crate::game_state::InvItem {
+            slot: SLOT_CURSOR as i32, item_id: BONE_CHIPS_ID, name: "Bone Chips".into(), ..Default::default()
+        });
+        for _ in 0..GIVE_FINISH_SETTLE_TICKS { nav.tick_give(&mut stream, &mut gs); }
+
+        assert_eq!(resp.try_recv(), Ok(crate::command_state::CommandResult::Unconfirmed),
+            "an unidentifiable give (mirror desync at send) can never be a confident 200 — honest 202");
+        assert!(nav.give_state.is_none());
     }
 
     /// NO-ACK SILENCE — THE HONESTY PROOF (net side). The NPC never acks: `tick_give`'s phase-1 abort
@@ -3022,7 +3253,8 @@ mod tests {
         gs.trade_ack_ready = true;
         nav.tick_give(&mut stream, &mut gs); // accept → phase 2
         apply_packet(&mut gs, &AppPacket { opcode: OP_FINISH_TRADE, payload: vec![] });
-        nav.fulfill_give_ok();
+        nav.note_finish_trade();
+        for _ in 0..GIVE_FINISH_SETTLE_TICKS { nav.tick_give(&mut stream, &mut gs); } // #486 settle
         assert!(matches!(resp_a.await.unwrap(), crate::command_state::CommandResult::Resolved(_)),
             "the finish must resolve the FIRST (parked) give, not the rejected second one");
     }
@@ -3100,7 +3332,8 @@ mod tests {
         // C's late OP_FinishTrade lands → it consumes C (silently — no await_tx), and there is no D in
         // the machine to wrongly resolve. No fabricated 200 for D.
         apply_packet(&mut gs, &AppPacket { opcode: OP_FINISH_TRADE, payload: vec![] });
-        nav.fulfill_give_ok();
+        nav.note_finish_trade();
+        for _ in 0..GIVE_FINISH_SETTLE_TICKS { nav.tick_give(&mut stream, &mut gs); } // #486 settle
         assert!(nav.give_state.is_none(), "C's finish must consume C's held state");
     }
 
@@ -3122,7 +3355,8 @@ mod tests {
         assert!(nav.give_state.is_some(), "a fire-and-forget give is now held through the finish");
 
         apply_packet(&mut gs, &AppPacket { opcode: OP_FINISH_TRADE, payload: vec![] });
-        nav.fulfill_give_ok();
+        nav.note_finish_trade();
+        for _ in 0..GIVE_FINISH_SETTLE_TICKS { nav.tick_give(&mut stream, &mut gs); } // #486 settle
         assert!(nav.give_state.is_none(), "the finish clears the completed give — the machine is free again");
     }
 
