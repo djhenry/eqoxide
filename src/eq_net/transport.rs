@@ -28,6 +28,15 @@ const RESEND_MAX_MS:  u64 = 5000;  // clamp ceiling (steady-state cadence on a d
 /// Cap on datagrams resent in a single go-back-N pass (EQEmu MAX_CLIENT_RECV_PACKETS_PER_WINDOW).
 const MAX_RESEND_PER_PASS: usize = 300;
 
+/// How often `connect` re-sends OP_SESSION_REQUEST while waiting for OP_SESSION_RESPONSE. The zone
+/// handoff (#335) removed the blind fixed pre-connect sleeps and now relies on this handshake being
+/// the real event-driven wait: when the target zone is a cold on-demand launcher that has not yet
+/// bound its listener, our first SESSION_REQUEST is dropped, and this cadence is how fast we retry
+/// until it answers. 250ms (was a hard-coded 1s) keeps a too-early connect self-healing quickly so
+/// the removed 800ms cushion is not needed even in the cold-zone case. SESSION_REQUEST is idempotent
+/// (the server dedupes), so a faster cadence is harmless.
+const SESSION_REQUEST_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Backoff before the Nth retransmit of the oldest outstanding reliable packet: `RESEND_BASE_MS`
 /// doubled per prior attempt, clamped to `[RESEND_MIN_MS, RESEND_MAX_MS]`. `retries` is shifted-capped
 /// so the `<<` can't overflow.
@@ -379,7 +388,7 @@ impl EqStream {
             if std::time::Instant::now() > deadline {
                 return Err("Session handshake timeout: no SESSION_RESPONSE from server".into());
             }
-            if last_send.elapsed() >= std::time::Duration::from_secs(1) {
+            if last_send.elapsed() >= SESSION_REQUEST_RETRY {
                 stream.send_session_request();
                 last_send = std::time::Instant::now();
                 // #477: keep the LIVENESS clock fresh across the handshake. This loop runs on the
@@ -1045,7 +1054,8 @@ mod tests {
         let addr = silent_peer.local_addr().unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
 
-        // Drive `connect` for ~1.5s (past the 1s retry cadence), then cancel it by dropping the future.
+        // Drive `connect` for ~1.5s (well past the SESSION_REQUEST_RETRY cadence), then cancel it by
+        // dropping the future.
         let _ = tokio::time::timeout(
             std::time::Duration::from_millis(1500),
             EqStream::connect(&addr.ip().to_string(), addr.port(), tx, net_health.clone()),
@@ -1057,6 +1067,55 @@ mod tests {
             "mid-handshake `last_tick` must stay under SESSION_STALE_TICK_MS ({}ms) so the #477 guard \
              does not falsely reject a healthy handshaking session; age was {age:?}",
             crate::http::SESSION_STALE_TICK_MS,
+        );
+    }
+
+    /// #335: the zone handoff dropped its blind fixed pre-connect sleeps (a 300ms + two 800ms) and
+    /// now leans on `connect`'s SESSION_REQUEST retry loop as the real event-driven wait. For that to
+    /// stay robust against a cold on-demand zone that has not yet bound its listener (our first
+    /// SESSION_REQUEST is dropped), the retry cadence must be sub-second — otherwise a too-early
+    /// connect stalls ~1s and we would have regressed the very case the 800ms cushion protected. This
+    /// counts the SESSION_REQUESTs a SILENT peer receives inside a 600ms window: at the 250ms cadence
+    /// that is 3 sends (t=0, 250, 500); at the old hard-coded 1s it would be just 1. Asserting >= 2
+    /// pins the fast-retry safety net in place.
+    #[tokio::test]
+    async fn connect_retries_session_request_faster_than_once_a_second() {
+        let net_health: crate::ipc::NetHealthShared = Default::default();
+        // A bound but SILENT peer — never answers SESSION_RESPONSE, so `connect` stays retrying.
+        let silent_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = silent_peer.local_addr().unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let host = addr.ip().to_string();
+        let port = addr.port();
+
+        // `connect` loops re-sending SESSION_REQUEST; the counting future tallies the datagrams the
+        // silent peer receives in a 600ms window. `join!` polls both on THIS task so they interleave
+        // deterministically on the current-thread test runtime (a spawned task does not reliably get
+        // scheduled here). `connect` never returns (peer is silent) so its timeout ends the join.
+        let connect_fut = tokio::time::timeout(
+            std::time::Duration::from_millis(800),
+            EqStream::connect(&host, port, tx, net_health.clone()),
+        );
+        let count_fut = async {
+            let mut buf = vec![0u8; 4096];
+            let mut count = 0usize;
+            let window = tokio::time::Instant::now() + std::time::Duration::from_millis(600);
+            while tokio::time::Instant::now() < window {
+                if let Ok(Ok(_)) =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), silent_peer.recv(&mut buf)).await
+                {
+                    count += 1;
+                }
+            }
+            count
+        };
+        let (_, count) = tokio::join!(connect_fut, count_fut);
+        assert!(
+            count >= 2,
+            "connect must re-send SESSION_REQUEST faster than once a second so a too-early connect to \
+             a cold zone self-heals (the #335 replacement for the removed 800ms pre-connect sleep); \
+             saw only {count} in 600ms",
         );
     }
 

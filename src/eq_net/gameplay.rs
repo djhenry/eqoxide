@@ -569,7 +569,11 @@ pub async fn run_gameplay_phase(
             // Drop old connections (Option::take returns the value, dropping it).
             drop(stream.take());
             drop(net_rx.take());
-            sleep(Duration::from_millis(800)).await;
+            // #335: no fixed sleep — same reasoning as `reconnect_via_world`. `EqStream::connect`
+            // waits on OP_SESSION_RESPONSE (retrying OP_SESSION_REQUEST every SESSION_REQUEST_RETRY),
+            // and the OP_ZONE_ENTRY sent right after is a reliable packet that
+            // `run_zone_entry_handshake` retransmits until acked — that is the real event the 800ms
+            // was blindly approximating.
             match EqStream::connect(&zone_ip, zone_port, new_tx, net_health.clone()).await {
                 Ok(new_stream) => {
                     stream = Some(new_stream);
@@ -726,8 +730,11 @@ async fn reconnect_via_world(
 ) -> bool {
     drop(stream.take());
     drop(net_rx.take());
-    sleep(Duration::from_millis(300)).await;
-
+    // #335: no fixed sleep here. Dropping the old zone socket is local (no graceful disconnect is
+    // sent, nothing server-side has to "settle"), and the world server is a separate, always-running
+    // process — connecting to it does not reuse anything from the old zone session. The real wait is
+    // the event-driven one below: `EqStream::connect` blocks on OP_SESSION_RESPONSE, and the
+    // OP_SEND_LOGIN_INFO we then send is a reliable packet retransmitted by `poll_resend` until acked.
     let (world_tx, mut world_rx) = tokio::sync::mpsc::unbounded_channel::<AppPacket>();
     tracing::info!("EQ: reconnecting to world {}:{}", creds.world_host, creds.world_port);
     let mut world_stream = match EqStream::connect(&creds.world_host, creds.world_port, world_tx, net_health.clone()).await {
@@ -800,7 +807,13 @@ async fn reconnect_via_world(
         }
     };
 
-    sleep(Duration::from_millis(800)).await;
+    // #335: no fixed sleep before connecting to the new zone. `EqStream::connect` is the real
+    // event-driven wait — it blocks until the zone answers OP_SESSION_RESPONSE, re-sending
+    // OP_SESSION_REQUEST every SESSION_REQUEST_RETRY so a cold on-demand zone that has not finished
+    // booting its listener is retried quickly rather than padded for. The OP_ZONE_ENTRY sent below is
+    // a reliable packet, so if it reaches the zone before its expected-client bookkeeping is ready,
+    // `run_zone_entry_handshake`'s `poll_resend` retransmits it (up to the 30s deadline) until the
+    // zone accepts and acks — the blind 800ms cushion was approximating exactly this.
     tracing::info!("EQ: zone change: connecting to new zone {}:{}", zone_ip, zone_port);
     let (zone_tx, zone_rx) = tokio::sync::mpsc::unbounded_channel::<AppPacket>();
     let mut zone_stream = match EqStream::connect(&zone_ip, zone_port, zone_tx, net_health.clone()).await {
