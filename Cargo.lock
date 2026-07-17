@@ -848,6 +848,7 @@ dependencies = [
  "image",
  "libc",
  "miniz_oxide",
+ "naga",
  "pollster",
  "rand",
  "serde",

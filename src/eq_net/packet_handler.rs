@@ -946,6 +946,23 @@ fn apply_new_zone(gs: &mut GameState, payload: &[u8]) {
     gs.zone_underworld = Some(f32::from_le_bytes([payload[608], payload[609], payload[610], payload[611]]));
     // zone_id @ 852
     gs.zone_id = u16::from_le_bytes([payload[852], payload[853]]);
+    // Distance fog (eqoxide#517): fog_red/green/blue[4] @471/475/479 (slot 0 only — see the KB doc
+    // on the 4-slot semantics), fog_minclip/maxclip[4] @484/500 (slot 0 = first f32 of each array),
+    // fog_density @916 (single scalar). A degenerate/zero clip range means "no fog" for this zone,
+    // matching the native client's hard FOGENABLE-off toggle — don't invent a fog look (#517 asks
+    // us to respect the zone's actual values, not hardcode one).
+    let fog_minclip = f32::from_le_bytes([payload[484], payload[485], payload[486], payload[487]]);
+    let fog_maxclip = f32::from_le_bytes([payload[500], payload[501], payload[502], payload[503]]);
+    gs.zone_fog = if fog_maxclip > fog_minclip {
+        Some(crate::game_state::ZoneFog {
+            color:   [payload[471], payload[475], payload[479]],
+            minclip: fog_minclip,
+            maxclip: fog_maxclip,
+            density: f32::from_le_bytes([payload[916], payload[917], payload[918], payload[919]]),
+        })
+    } else {
+        None
+    };
     gs.zone_changed = true;
     let entered = format!("Entered {}", gs.zone_name);
     gs.log_msg("zone", &entered);
@@ -2874,6 +2891,50 @@ mod tests {
         p[64..64 + short_name.len()].copy_from_slice(short_name.as_bytes());
         p[852..854].copy_from_slice(&zone_id.to_le_bytes());
         p
+    }
+
+    /// Same as `new_zone_payload` but also stamps slot-0 fog fields (eqoxide#517): color @471/475/479,
+    /// minclip/maxclip @484/500 (slot 0 = first element of each 4-wide array), density @916.
+    fn new_zone_payload_with_fog(
+        short_name: &str, zone_id: u16,
+        color: [u8; 3], minclip: f32, maxclip: f32, density: f32,
+    ) -> Vec<u8> {
+        let mut p = new_zone_payload(short_name, zone_id);
+        p[471] = color[0]; // fog_red[0]
+        p[475] = color[1]; // fog_green[0]
+        p[479] = color[2]; // fog_blue[0]
+        p[484..488].copy_from_slice(&minclip.to_le_bytes()); // fog_minclip[0]
+        p[500..504].copy_from_slice(&maxclip.to_le_bytes()); // fog_maxclip[0]
+        p[916..920].copy_from_slice(&density.to_le_bytes()); // fog_density
+        p
+    }
+
+    #[test]
+    fn new_zone_parses_fog_fields_when_present() {
+        // #517: a zone that sends a real (non-degenerate) fog range must have it parsed into
+        // gs.zone_fog exactly — this is the wire-parse half of the fog feature (the renderer half
+        // isn't unit-testable; see the PR for the live-validation note).
+        let mut gs = GameState::new();
+        let payload = new_zone_payload_with_fog(
+            "gfaydark", 54, [60, 120, 70], 200.0, 900.0, 0.33,
+        );
+        super::apply_new_zone(&mut gs, &payload);
+        let fog = gs.zone_fog.expect("non-degenerate fog range must parse to Some");
+        assert_eq!(fog.color, [60, 120, 70]);
+        assert_eq!(fog.minclip, 200.0);
+        assert_eq!(fog.maxclip, 900.0);
+        assert_eq!(fog.density, 0.33);
+    }
+
+    #[test]
+    fn new_zone_with_zero_fog_range_disables_fog() {
+        // #517: a zone that sends no fog (degenerate/zero minclip==maxclip==0, e.g. most indoor
+        // zones) must render with NO fog rather than inventing one — matching the native client's
+        // hard FOGENABLE-off behavior for that case.
+        let mut gs = GameState::new();
+        let payload = new_zone_payload("qeynos2", 2); // all-zero fields, including fog
+        super::apply_new_zone(&mut gs, &payload);
+        assert_eq!(gs.zone_fog, None, "an all-zero fog range must not produce a fog effect");
     }
 
     /// A 100-byte RoF2 Door_Struct record for `door_id`.

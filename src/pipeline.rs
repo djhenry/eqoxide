@@ -40,7 +40,10 @@ pub fn build_layouts(device: &wgpu::Device) -> Layouts {
         label: Some("camera_bgl"),
         entries: &[wgpu::BindGroupLayoutEntry {
             binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX,
+            // FRAGMENT added alongside VERTEX (eqoxide#517): the fog fields riding along on this
+            // uniform (camera_pos/fog_color/fog_params) are read in every fragment shader's
+            // apply_fog(), not just the vertex stage's view_proj transform.
+            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
                 has_dynamic_offset: false,
@@ -103,12 +106,20 @@ pub fn build_layouts(device: &wgpu::Device) -> Layouts {
     Layouts { camera_bgl, texture_bgl, entity_bgl, joints_bgl }
 }
 
-/// Create the camera uniform buffer and its bind group.
+/// Create the camera uniform buffer and its bind group. Sized for `gpu::CameraUniformData`
+/// (view_proj + camera_pos + fog_color + fog_params, eqoxide#517) — the bind group layout itself
+/// (`camera_bgl`) didn't need to change since it already covers "the whole buffer" at binding 0.
 pub fn build_camera_uniform(device: &wgpu::Device, layouts: &Layouts) -> CameraUniform {
     use wgpu::util::DeviceExt;
+    let init = crate::gpu::CameraUniformData {
+        view_proj:  [[0.0; 4]; 4],
+        camera_pos: [0.0; 4],
+        fog_color:  [0.0; 4],
+        fog_params: [0.0; 4],
+    };
     let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("camera"),
-        contents: bytemuck::cast_slice(&[[0.0f32; 4]; 4]),
+        contents: bytemuck::bytes_of(&init),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -270,7 +281,12 @@ pub fn build_pipelines(
             buffers: std::slice::from_ref(&vbl), compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
-            module: &zone_shader, entry_point: "fs_blend",
+            // Additive glow (lava/fire/torches) must attenuate toward zero as fog deepens, not
+            // mix toward fog_color — the fixed-function blend below is a pure One/One add with
+            // no destination term to mix against. `fs_blend_additive` uses `apply_fog_additive`
+            // for that; `fs_blend` (mix-to-fog_color) is only correct under ALPHA_BLENDING
+            // (review defect on #523 — see zone.wgsl's apply_fog_additive doc comment).
+            module: &zone_shader, entry_point: "fs_blend_additive",
             targets: &[Some(wgpu::ColorTargetState {
                 format, blend: Some(additive_blend),
                 write_mask: wgpu::ColorWrites::ALL,
@@ -316,7 +332,10 @@ pub fn build_pipelines(
             buffers: &[vbl.clone(), instance_vbl.clone()], compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
-            module: &zone_inst_shader, entry_point: "fs_blend",
+            // See zone_additive above: additive glow must attenuate toward zero under the
+            // fixed-function One/One add, so this binds `fs_blend_additive` (review defect on
+            // #523), not the mix-to-fog_color `fs_blend` used by zone_instanced_blend.
+            module: &zone_inst_shader, entry_point: "fs_blend_additive",
             targets: &[Some(wgpu::ColorTargetState {
                 format, blend: Some(additive_blend),
                 write_mask: wgpu::ColorWrites::ALL,

@@ -1739,7 +1739,13 @@ pub struct NewZone_S {
     pub _pad_620_852:         [u8; 232],  // 620..852 (ForageLow…many fields)
     pub zone_id:              u16,        // 852
     pub zone_instance:        u16,        // 854
-    pub _pad_856_948:         [u8; 92],   // 856..948 (remaining fields)
+    pub _pad_856_916:         [u8; 60],   // 856..916 (remaining fields before fog_density)
+    /// Fog blend-intensity cap, applied on top of the linear minclip/maxclip fade (eqoxide#517).
+    /// NOT a D3DFOG_EXP/EXP2 density coefficient — the RoF2 client never wires this field to
+    /// D3DRS_FOGDENSITY (confirmed from the EQGraphicsDX9.dll decompile, `FUN_10096640`); it only
+    /// ever sets D3DRS_FOGVERTEXMODE = D3DFOG_LINEAR. Typical zones ship 0.33 (rof2_structs.h @916).
+    pub fog_density:          f32,        // 916
+    pub _pad_920_948:         [u8; 28],   // 920..948 (remaining fields)
 }
 
 const _: () = assert!(
