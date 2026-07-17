@@ -403,6 +403,17 @@ pub struct ActionLoop {
     maps_dir:         std::path::PathBuf,
     current_zone:     String,
     last_zone_cross:  Instant,
+    /// Set when the auto-cross fires OP_ZoneChange for a SAME-ZONE DRNTP line (an intra-zone
+    /// translocator whose zone-point target is the current zone — legitimate retail content, e.g.
+    /// the 5 qeynos2 teleport pads). The server answers such a zoneID=0 request with a lightweight
+    /// in-zone reposition (`DoZoneSuccess`, `zoning.cpp:536`) and a `success=1` echo naming the
+    /// CURRENT zone — it does NOT tear down the zone session. The receive side must therefore NOT
+    /// run a world reconnect for that echo (doing so reconnects against a live zone and wedges,
+    /// #368). This timestamp lets the OP_ZONE_CHANGE echo handler tell a same-zone reposition (skip
+    /// reconnect) from a genuine cross-zone change or a death/bind respawn (reconnect as normal) —
+    /// the echo's zone id alone can't, since the server names the current zone in the reposition
+    /// case too. `None` once consumed or never set.
+    same_zone_cross_at: Option<Instant>,
     position_seq:     u16,
     last_tick:        Instant,
     /// Whether auto-attack is currently engaged (set by the /attack toggle). While true and a
@@ -482,6 +493,7 @@ impl ActionLoop {
             maps_dir,
             current_zone: String::new(),
             last_zone_cross: Instant::now(),
+            same_zone_cross_at: None,
             position_seq: 0,
             last_tick: Instant::now(),
             auto_attack: false,
@@ -1323,21 +1335,14 @@ impl ActionLoop {
                 let index = self.collision.read().unwrap().as_ref()
                     .and_then(|c| c.zone_line_at([gs.player_x, gs.player_y, gs.player_z]));
                 if let Some(index) = index {
-                    // Resolve destination: the advertised zone point whose iterator matches this
-                    // region's index. A region with no matching zone point (e.g. a WLD index the DB
-                    // doesn't advertise) is left alone rather than crossing blindly.
-                    let dest = self.world.zone_points.lock().unwrap().iter()
-                        .find(|zp| zp.iterator as i32 == index && zp.zone_id != 0)
-                        .map(|zp| zp.zone_id);
-                    match dest {
-                        Some(dest_zone) => {
-                            tracing::info!("zone_cross: in zone-line region index={index} → zone_id={dest_zone}");
-                            gs.log_msg("zone", &format!("Crossing to zone {}", dest_zone));
-                            self.send_zone_change_packet(stream, gs, dest_zone);
-                            self.last_zone_cross = Instant::now();
+                    // Resolve the region's destination zone + arrival coords. `None` = no advertised
+                    // zone point for this index (a data gap) → leave it alone rather than cross blind.
+                    match self.resolve_cross_destination(index) {
+                        Some((dest_zone, dest_pos)) => {
+                            self.perform_cross(stream, gs, index, dest_zone, dest_pos);
                         }
                         None => {
-                            tracing::debug!("zone_cross: zone-line region index={index} has no matching zone point — ignoring");
+                            tracing::debug!("zone_cross: zone-line region index={index} has no advertised zone point — ignoring");
                         }
                     }
                 }
@@ -2418,6 +2423,75 @@ impl ActionLoop {
         stream.send_app_packet_unreliable(OP_CLIENT_UPDATE, &buf);
     }
 
+    /// Resolve a DRNTP zone-line region's `region_index` to its crossing destination — the target
+    /// `(zone_id, [x, y, z])` of the advertised zone point whose `iterator` matches. `None` only
+    /// when NO advertised zone point matches the index (a WLD index the `OP_SendZonepoints` list
+    /// never carried — a `.wtr`/data gap); such a region is left alone rather than crossed blindly.
+    ///
+    /// A destination whose `zone_id == current zone` is NOT suppressed here: same-zone DRNTP lines
+    /// are legitimate retail content (intra-zone translocators — e.g. the 5 qeynos2 teleport pads,
+    /// and 546 such rows DB-wide), and the player stepping on one must be teleported, not stranded.
+    /// The self-zone case is instead handled at the call site: it still sends OP_ZoneChange (so the
+    /// server repositions us in-zone via `DoZoneSuccess`), applies the resolved coords locally so we
+    /// leave the region, and flags the echo to skip the world reconnect (#368). The wedge was never
+    /// the crossing itself — it was the receive side reconnecting on the same-zone reposition echo.
+    fn resolve_cross_destination(&self, region_index: i32) -> Option<(u16, [f32; 3])> {
+        self.world.zone_points.lock().unwrap().iter()
+            .find(|zp| zp.iterator as i32 == region_index && zp.zone_id != 0)
+            .map(|zp| (zp.zone_id, [zp.server_x, zp.server_y, zp.server_z]))
+    }
+
+    /// Fire the crossing for a resolved zone-line destination and arm the re-fire cooldown. Splits
+    /// on same-zone vs cross-zone (#368):
+    ///
+    /// - **Same-zone** (`dest_zone == gs.zone_id`) — an intra-zone translocator. Send OP_ZoneChange
+    ///   (zoneID=0, so the server does a lightweight in-zone `DoZoneSuccess` reposition and does NOT
+    ///   tear down the session), apply the resolved arrival coords LOCALLY so the player leaves the
+    ///   DRNTP region and doesn't re-fire next cooldown, and set `same_zone_cross_at` so the imminent
+    ///   `success=1` echo is recognized by the receive side and its world reconnect is SKIPPED (that
+    ///   reconnect against a still-live zone is the wedge). Returns `true`.
+    /// - **Cross-zone** — a genuine zone change: send OP_ZoneChange and let the normal world
+    ///   reconnect / zone-entry handshake run. Returns `false`.
+    fn perform_cross(&mut self, stream: &mut EqStream, gs: &mut GameState, index: i32, dest_zone: u16, dest_pos: [f32; 3]) -> bool {
+        self.send_zone_change_packet(stream, gs, dest_zone);
+        self.last_zone_cross = Instant::now();
+        if dest_zone == gs.zone_id {
+            self.same_zone_cross_at = Some(Instant::now());
+            // 999999 / 999 sentinel from the zone point = "keep current position" (zoning.cpp:311):
+            // the server keeps us put, so don't teleport to the sentinel — region-leave then relies
+            // on the cooldown alone (a rare case; most same-zone points carry real target coords).
+            if dest_pos.iter().all(|c| c.abs() < 900_000.0) {
+                gs.player_x = dest_pos[0];
+                gs.player_y = dest_pos[1];
+                gs.player_z = dest_pos[2];
+                tracing::info!(
+                    "zone_cross: same-zone translocator index={index} → in-zone reposition to ({:.0},{:.0},{:.0}) (no reconnect)",
+                    dest_pos[0], dest_pos[1], dest_pos[2]);
+            } else {
+                tracing::info!("zone_cross: same-zone translocator index={index} → server keeps position (sentinel)");
+            }
+            gs.log_msg("zone", "Using an in-zone teleport");
+            true
+        } else {
+            tracing::info!("zone_cross: in zone-line region index={index} → zone_id={dest_zone}");
+            gs.log_msg("zone", &format!("Crossing to zone {}", dest_zone));
+            false
+        }
+    }
+
+    /// True if a SAME-ZONE walk-in cross fired recently enough that the next `success=1`
+    /// OP_ZoneChange echo is its in-zone reposition (skip the world reconnect, #368). Consumes the
+    /// flag. Bounded to a short window so a stale flag can never suppress a later genuine cross-zone
+    /// or death/bind reconnect: the reposition echo always returns within the round-trip, far inside
+    /// this window.
+    pub(crate) fn take_same_zone_reposition(&mut self) -> bool {
+        const WINDOW_MS: u128 = 5000;
+        match self.same_zone_cross_at.take() {
+            Some(t) if t.elapsed().as_millis() <= WINDOW_MS => true,
+            _ => false,
+        }
+    }
+
     /// Send OP_ZONE_CHANGE to request crossing a zone line to `target_zone_id`.
     /// ZoneChange_Struct (88 bytes): char_name[64] + zoneID(u16) + instance_id(u16)
     ///   + y(f32) + x(f32) + z(f32) + zone_reason(u32) + success(i32=0)
@@ -2803,6 +2877,89 @@ mod tests {
     // `drain_merchant` (the loop's own `command` slot is shared with the drain, so a real
     // request→take round-trip runs), then feed the resolving packet exactly as `gameplay.rs` does.
     // ─────────────────────────────────────────────────────────────────────────────────────────
+
+    fn zp_at(iterator: u32, zone_id: u16, pos: [f32; 3]) -> crate::game_state::ZonePoint {
+        crate::game_state::ZonePoint {
+            iterator, zone_id,
+            server_x: pos[0], server_y: pos[1], server_z: pos[2], heading: 0.0,
+        }
+    }
+
+    /// #368 — RESOLUTION IS NOT SUPPRESSED FOR SAME-ZONE. A same-zone DRNTP line (an intra-zone
+    /// translocator — legitimate retail content, e.g. the qeynos2 teleport pads) must still resolve
+    /// to a real destination + arrival coords, exactly like a cross-zone line; only an index with no
+    /// advertised zone point resolves to `None`. A regression that re-added a blanket "dest==current
+    /// → None" self-zone suppress (which would strand the player on a valid teleporter) flips the
+    /// first assertion.
+    #[test]
+    fn same_zone_line_still_resolves_to_a_destination() {
+        const QEYNOS2: u16 = 2;
+        const QEYNOS:  u16 = 1;
+        let nav = new_loop();
+        {
+            let mut zps = nav.world.zone_points.lock().unwrap();
+            zps.push(zp_at(100, QEYNOS2, [111.0, 222.0, 33.0])); // same-zone translocator
+            zps.push(zp_at(200, QEYNOS,  [ -5.0,  -6.0,  0.0])); // genuine cross-zone line
+        }
+        assert_eq!(nav.resolve_cross_destination(100), Some((QEYNOS2, [111.0, 222.0, 33.0])),
+            "a same-zone translocator must still resolve to its arrival — never suppressed (#368)");
+        assert_eq!(nav.resolve_cross_destination(200), Some((QEYNOS, [-5.0, -6.0, 0.0])),
+            "a real cross-zone line resolves normally");
+        assert_eq!(nav.resolve_cross_destination(999), None,
+            "an index with no advertised zone point must not cross blindly");
+    }
+
+    /// #368 CORE. A SAME-ZONE crossing must (a) reposition the player to the resolved arrival so it
+    /// LEAVES the DRNTP region (no re-fire), and (b) flag the echo so the receive side SKIPS the
+    /// world reconnect — that reconnect against a still-live zone is the wedge. A genuine CROSS-ZONE
+    /// crossing must do NEITHER (it repositions on zone-in, and it MUST reconnect). Both send exactly
+    /// one OP_ZONE_CHANGE. Mutation-sensitive: dropping the reposition, the flag-set, or the
+    /// same-zone branch condition each flips an assertion.
+    #[tokio::test]
+    async fn same_zone_cross_repositions_and_skips_reconnect_but_cross_zone_does_not() {
+        const HERE: u16 = 2;   // current zone
+        const OTHER: u16 = 1;  // a different zone
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+
+        // ── Same-zone translocator ──────────────────────────────────────────────────────────────
+        let mut nav = new_loop();
+        let mut gs = GameState::new();
+        gs.zone_id = HERE;
+        gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0; // standing on the trigger region
+        let same = nav.perform_cross(&mut stream, &mut gs, 100, HERE, [111.0, 222.0, 33.0]);
+        assert!(same, "dest==current must be handled as a same-zone cross");
+        assert_eq!([gs.player_x, gs.player_y, gs.player_z], [111.0, 222.0, 33.0],
+            "same-zone cross must reposition the player to the arrival so it leaves the region (#368)");
+        assert!(nav.take_same_zone_reposition(),
+            "same-zone cross must flag the echo so the receive side skips the world reconnect (#368)");
+        // Flag is consume-once.
+        assert!(!nav.take_same_zone_reposition(), "the reposition flag is consumed exactly once");
+        assert!(stream.sent_app_packets().iter().any(|(op, _)| *op == crate::eq_net::protocol::OP_ZONE_CHANGE),
+            "a same-zone cross still sends OP_ZONE_CHANGE (so the server repositions us)");
+
+        // ── Genuine cross-zone line ─────────────────────────────────────────────────────────────
+        let mut nav2 = new_loop();
+        let mut gs2 = GameState::new();
+        gs2.zone_id = HERE;
+        gs2.player_x = 7.0; gs2.player_y = 8.0; gs2.player_z = 9.0;
+        let same2 = nav2.perform_cross(&mut stream, &mut gs2, 200, OTHER, [111.0, 222.0, 33.0]);
+        assert!(!same2, "dest!=current must be a cross-zone change");
+        assert_eq!([gs2.player_x, gs2.player_y, gs2.player_z], [7.0, 8.0, 9.0],
+            "a cross-zone cross must NOT locally reposition (the destination is in the other zone)");
+        assert!(!nav2.take_same_zone_reposition(),
+            "a cross-zone cross must NOT flag a reposition — it MUST world-reconnect");
+    }
+
+    /// The reposition flag is bounded: a stale set (older than the echo window) never suppresses a
+    /// later genuine cross-zone / death reconnect.
+    #[test]
+    fn stale_same_zone_flag_does_not_suppress_a_later_reconnect() {
+        let mut nav = new_loop();
+        assert!(!nav.take_same_zone_reposition(), "unset flag → no suppression");
+        nav.same_zone_cross_at = Instant::now().checked_sub(std::time::Duration::from_secs(6));
+        assert!(!nav.take_same_zone_reposition(),
+            "a flag older than the ~5s window must not suppress a reconnect");
+    }
 
     fn new_loop() -> ActionLoop {
         let g: crate::ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::GroupSnapshot::default()));

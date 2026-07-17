@@ -405,14 +405,29 @@ pub async fn run_gameplay_phase(
                     }
                 }
                 OP_ZONE_CHANGE if packet.payload.len() >= 96 => {
-                    // RoF2 ZoneChange_Struct: success is an i32 at offset 92 (was 84 in Titanium).
+                    // RoF2 ZoneChange_Struct: zoneID@64, success is an i32 at offset 92 (was 84 in
+                    // Titanium).
+                    let echo_zone_id = u16::from_le_bytes([packet.payload[64], packet.payload[65]]);
                     let success = i32::from_le_bytes([
                         packet.payload[92], packet.payload[93],
                         packet.payload[94], packet.payload[95],
                     ]);
-                    tracing::info!("EQ: OP_ZONE_CHANGE server response success={success}");
+                    tracing::info!("EQ: OP_ZONE_CHANGE server response success={success} zone_id={echo_zone_id}");
                     if success == 1 {
-                        world_reconnect_needed = true;
+                        // #368: a SAME-ZONE walk-in cross (intra-zone translocator) gets a success=1
+                        // echo naming the CURRENT zone, from the server's lightweight `DoZoneSuccess`
+                        // in-zone reposition — the zone session was NOT torn down, so a world
+                        // reconnect here reconnects against a live zone and wedges the connection.
+                        // The action loop flags exactly that case (and already repositioned us);
+                        // skip the reconnect for it. Every OTHER success=1 echo — a genuine
+                        // cross-zone line, a GM #zone, a death/bind respawn — still reconnects, even
+                        // if it happens to name the current zone (the death path echoes the current
+                        // zone too, but never sets this flag).
+                        if action_loop.take_same_zone_reposition() {
+                            tracing::info!("EQ: same-zone in-zone reposition (zone_id={echo_zone_id}) — no world reconnect (#368)");
+                        } else {
+                            world_reconnect_needed = true;
+                        }
                     }
                 }
                 OP_ZONE_SERVER_INFO
