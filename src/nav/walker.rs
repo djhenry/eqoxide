@@ -46,6 +46,11 @@ pub(crate) struct Walker {
     collision: crate::nav::collision::SharedCollision,
     /// The ONLY movement channel — see the module doc's "intent-only movement boundary".
     nav_intent: crate::ipc::NavIntent,
+    /// The DRAW-ONLY committed-path overlay this walker publishes for the render View (#246). MVC C2
+    /// (#452): this is derived/read state, not a command, so it lives on `ipc::ControllerSlots`
+    /// (a render↔nav channel like `nav_intent`) and is handed in here as its own clone — NOT reached
+    /// through `self.nav` (the command bundle no longer carries it).
+    nav_path_view: crate::ipc::NavPathView,
 
     /// Cached A* waypoints for the current goto goal (routes around walls). `path_i` is the
     /// current waypoint; `path_goal` is the goal these waypoints were computed for (recompute
@@ -95,17 +100,19 @@ pub(crate) struct Walker {
 
 impl Walker {
     /// `nav`/`world`/`collision` must be `.clone()`s of the SAME bundles `ActionLoop` keeps for its
-    /// own (non-walker) uses, and `nav_intent` must be `controller.nav_intent.clone()` — NOT a
-    /// fresh `Default`, or the walker would drive an intent slot nothing reads (see the module
-    /// doc's intent-only boundary and `ActionLoop::new`).
+    /// own (non-walker) uses, and `nav_intent`/`nav_path_view` must be `controller.nav_intent.clone()`
+    /// / `controller.nav_path_view.clone()` — NOT fresh `Default`s, or the walker would drive an
+    /// intent slot nothing reads / publish an overlay `App` never sees (see the module doc's
+    /// intent-only boundary and `ActionLoop::new`).
     pub(crate) fn new(
-        nav:        crate::ipc::NavSlots,
-        world:      crate::ipc::WorldSlots,
-        collision:  crate::nav::collision::SharedCollision,
-        nav_intent: crate::ipc::NavIntent,
+        nav:           crate::ipc::NavSlots,
+        world:         crate::ipc::WorldSlots,
+        collision:     crate::nav::collision::SharedCollision,
+        nav_intent:    crate::ipc::NavIntent,
+        nav_path_view: crate::ipc::NavPathView,
     ) -> Self {
         Walker {
-            nav, world, collision, nav_intent,
+            nav, world, collision, nav_intent, nav_path_view,
             path: Vec::new(),
             path_i: 0,
             path_goal: None,
@@ -158,7 +165,7 @@ impl Walker {
         *self.nav.goto_target.lock().unwrap() = None;
         *self.nav.goto_entity.lock().unwrap() = None;
         *self.nav_intent.lock().unwrap() = None; // stop driving the controller toward the stale aim
-        *self.nav.nav_path_view.lock().unwrap() = (Vec::new(), Vec::new()); // clear the overlay line
+        *self.nav_path_view.lock().unwrap() = (Vec::new(), Vec::new()); // clear the overlay line
         self.path.clear();
         self.local_path.clear();
         self.local_i = 0;
@@ -390,7 +397,7 @@ impl Walker {
         *self.nav.goto_entity.lock().unwrap() = None;      // drop any entity chase
         *self.nav.zone_cross.lock().unwrap() = None;        // drop a queued zone-cross
         *self.nav_intent.lock().unwrap() = None;             // stop driving the controller
-        *self.nav.nav_path_view.lock().unwrap() = (Vec::new(), Vec::new()); // clear the overlay line
+        *self.nav_path_view.lock().unwrap() = (Vec::new(), Vec::new()); // clear the overlay line
         self.path.clear();
         self.local_path.clear();
         self.local_i = 0;
@@ -668,11 +675,11 @@ impl Walker {
 
             let aim = steer_target(&self.path, self.path_i, &self.local_path, &mut self.local_i,
                 [px, py], LOOK_AHEAD, coarse);
-            *self.nav.nav_path_view.lock().unwrap() = (self.path.clone(), self.local_path.clone());
+            *self.nav_path_view.lock().unwrap() = (self.path.clone(), self.local_path.clone());
             (aim[0], aim[1], aim[2])
         } else {
             self.clear_local_plan();
-            *self.nav.nav_path_view.lock().unwrap() = (Vec::new(), Vec::new());
+            *self.nav_path_view.lock().unwrap() = (Vec::new(), Vec::new());
             (goal.0, goal.1, gs.player_z)
         };
 

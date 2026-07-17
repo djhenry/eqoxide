@@ -220,7 +220,6 @@ fn main() {
         zone_cross:    Arc::new(Mutex::new(None)),
         nav_avoid:     Arc::new(Mutex::new(ipc::AggroAvoidOpts::default())),
         nav_state:     Arc::new(Mutex::new(ipc::NavStatus::default())),
-        nav_path_view: Arc::new(Mutex::new((Vec::new(), Vec::new()))),
     };
     let world = ipc::WorldSlots {
         entity_positions: Arc::new(Mutex::new(HashMap::new())),
@@ -295,12 +294,14 @@ fn main() {
     };
     // Single-authority movement (Component A): the render thread owns the CharacterController and
     // publishes `controller_view`; the nav thread streams it and writes `nav_intent` for /goto;
-    // `pos_correction` hands a server correction back to the controller. Consumed by `ActionLoop`
-    // and `App` — NOT by `HttpState` (no /v1/* route reads it directly).
+    // `pos_correction` hands a server correction back to the controller. `nav_path_view` is the
+    // walker's committed path published for the render overlay (#452 — a render↔nav channel, NOT a
+    // command). Consumed by `ActionLoop` and `App` — NOT by `HttpState` (no /v1/* route reads it).
     let controller = ipc::ControllerSlots {
         controller_view: Arc::new(Mutex::new(eqoxide::movement::ControllerView::default())),
         nav_intent:      Arc::new(Mutex::new(None)),
         pos_correction:  Arc::new(Mutex::new(None)),
+        nav_path_view:   Arc::new(Mutex::new((Vec::new(), Vec::new()))),
     };
     // Guild roster/identity published for GET /v1/guild/roster + /observe/debug, and the guild-action
     // request slot for POST /v1/guild/{invite,accept,leave,remove} (#295).
@@ -327,7 +328,7 @@ fn main() {
     let command = eqoxide::command_state::CommandState::new(
         combat.clone(), merchant_slots.clone(), inventory_slots.clone(), interact.clone(),
         quest.clone(), group_slots.clone(), guild_slots.clone(), trainer.clone(), social.clone(),
-        chat.clone(), nav.clone(), lifecycle.clone(), camera.manual_move.clone(),
+        chat.clone(), nav.clone(), lifecycle.clone(),
     );
 
     // spells_us.txt is an EQ data file; default to the configured assets dir,
@@ -505,6 +506,7 @@ fn main() {
         character_name,
         camera.cmd_tx,
         camera.snapshot,
+        camera.manual_move.clone(),
         game_state_snapshot.clone(),
         net_health_shared.clone(),
         camera.frame_req,
@@ -523,7 +525,7 @@ fn main() {
         controller.controller_view,
         controller.nav_intent,
         controller.pos_correction,
-        nav.nav_path_view,
+        controller.nav_path_view,
     );
     event_loop.run_app(&mut application).expect("event loop run");
     // The event loop has now exited gracefully — either the window was closed, or a shutdown was
