@@ -60,6 +60,46 @@ struct GiveState {
 /// ~3 second ack timeout, in nav ticks (tick gating is ~150ms → 20 ticks ≈ 3s).
 const GIVE_ACK_TIMEOUT_TICKS: u32 = 20;
 
+/// A merchant buy sent via the honest awaited path (A3 Migration 1, #448), parked here until its
+/// resolving packet lands. Holds the `oneshot::Sender` HTTP is awaiting plus the merchant/slot the
+/// buy was for, so a fulfil can CORRELATE the OP_ShopPlayerBuy echo (rejecting a stray shop echo
+/// for a different buy) before it `send`s `Resolved`. `sent_at` bounds how long the net side keeps
+/// it (informational; the authoritative timeout is HTTP-side). The `Sender` deliberately lives
+/// ONLY here — never in `GameState`, which is `Clone`d into the ArcSwap snapshot every tick and a
+/// `oneshot::Sender` is not `Clone`. See `crate::command_state::result` for the full flow.
+struct PendingBuy {
+    tx:          tokio::sync::oneshot::Sender<crate::command_state::CommandResult<crate::command_state::BuyOk>>,
+    merchant_id: u32,
+    slot:        u32,
+    #[allow(dead_code)] // informational; the authoritative buy timeout is HTTP-side
+    sent_at:     Instant,
+}
+
+/// Emit the OP_ShopRequest (open) + OP_ShopPlayerBuy (buy `slot`, qty 1) pair and mark the buy
+/// in flight (`begin_shop_open_for` + `begin_shop_buy`). Shared by the fire-and-forget UI buy path
+/// and the honest awaited buy path (#448) so both emit byte-identical wire traffic and identical
+/// in-flight/coin-unverified bookkeeping — the awaited path adds ONLY the parked Sender, no
+/// behavior change to the wire. See `drain_merchant` for the surrounding #345/#360/#361 rationale.
+fn send_shop_buy(stream: &mut EqStream, gs: &mut GameState, merchant_id: u32, slot: u32) {
+    // #360/#361: clear a DIFFERENT stale merchant (but don't flicker an already-open one closed) and
+    // mark coin unverified until a real OP_PlayerProfile reconciles this buy — a silent
+    // inventory-full/LORE refusal sends no echo at all.
+    gs.begin_shop_open_for(merchant_id);
+    gs.begin_shop_buy();
+    let open = merchant_click(merchant_id, gs.player_id, 1);
+    stream.send_app_packet(OP_SHOP_REQUEST, &open);
+    // RoF2 Merchant_Sell_Struct (32b): npcid@0, playerid@4, itemslot@8, unknown12@12, quantity@16,
+    // unknown20@20, price@24, unknown28@28. (The RoF2 server DECODEs an exact 32 bytes, so a short
+    // packet is silently dropped.)
+    let mut buy = [0u8; 32];
+    buy[0..4].copy_from_slice(&merchant_id.to_le_bytes());
+    buy[4..8].copy_from_slice(&gs.player_id.to_le_bytes());
+    buy[8..12].copy_from_slice(&slot.to_le_bytes());
+    buy[16..20].copy_from_slice(&1u32.to_le_bytes()); // quantity = 1 (server sets the price)
+    stream.send_app_packet(OP_SHOP_PLAYER_BUY, &buy);
+    tracing::info!("EQ: shop buy sent — merchant_id={} slot={} qty=1", merchant_id, slot);
+}
+
 // Nav steering math (consts, replan/arrival decisions, pure-pursuit carrot, fast-steering cursor)
 // moved to `crate::nav::steering` (cleanup step 2 — nav must not live inside net); the walker
 // methods that used them live in `crate::nav::walker::Walker` now too (M1 extraction), so this
@@ -107,6 +147,10 @@ pub struct ActionLoop {
     expecting_friends: bool,
     /// `/v1/merchant/*` slots (#M4 — see `ipc::MerchantSlots`).
     merchant_slots:   crate::ipc::MerchantSlots,
+    /// A buy sent via the honest awaited path (A3 Migration 1, #448), parked between send and its
+    /// resolving packet (OP_ShopPlayerBuy echo → `Resolved`, OP_ShopEndConfirm → `Refused`), or
+    /// reaped as `Unconfirmed` on a zone change. Sibling of `pending_who`. See `PendingBuy`.
+    pending_buy:      Option<PendingBuy>,
     /// `/v1/inventory/*` slots (#M4 — see `ipc::InventorySlots`).
     inventory_slots:  crate::ipc::InventorySlots,
     /// In-progress quest turn-in (POST /give), or None when idle. Drives the trade-window
@@ -186,6 +230,7 @@ impl ActionLoop {
             pending_friends: None,
             expecting_friends: false,
             merchant_slots,
+            pending_buy: None,
             inventory_slots,
             give_state: None,
             interact,
@@ -318,6 +363,54 @@ impl ActionLoop {
         self.expecting_friends = false;
     }
 
+    /// Resolve a parked awaited-buy on the OP_ShopPlayerBuy echo (A3 Migration 1, #448). Called from
+    /// the gameplay loop AFTER `apply_packet`, so `gs` already holds the receipt (coin deducted,
+    /// "Bought item" logged). CORRELATES the echo against the parked buy — the echo's npcid@0 and
+    /// itemslot@8 must both match, so a stray shop echo (e.g. a UI fire-and-forget buy of a
+    /// DIFFERENT slot) can't resolve THIS awaited buy. On a match it sends `Resolved(BuyOk{..})`
+    /// read from the applied `gs` (item name from the open ware list, server-recomputed price from
+    /// the echo, coin AFTER the local deduction). The send is non-blocking and never `.await`s, so
+    /// the net tick is never stalled; a dropped receiver (HTTP already timed out) is ignored. No-op
+    /// when nothing is parked or the echo doesn't correlate — leaving an unrelated buy still parked.
+    pub fn fulfill_buy_ok(&mut self, gs: &GameState, payload: &[u8]) {
+        if payload.len() < 32 { return; }
+        let echo_merchant = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let echo_slot     = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
+        let price         = u32::from_le_bytes([payload[24], payload[25], payload[26], payload[27]]);
+        // Correlate BEFORE taking: a non-matching echo must leave the parked buy in place.
+        let correlates = self.pending_buy.as_ref()
+            .is_some_and(|pb| pb.merchant_id == echo_merchant && pb.slot == echo_slot);
+        if !correlates { return; }
+        let pb = self.pending_buy.take().unwrap();
+        let item_name = gs.merchant_items.iter()
+            .find(|m| m.merchant_slot == echo_slot)
+            .map(|m| m.name.clone())
+            .unwrap_or_else(|| format!("merchant slot {echo_slot}"));
+        let _ = pb.tx.send(crate::command_state::CommandResult::Resolved(
+            crate::command_state::BuyOk { item_name, price, coin_after: gs.coin },
+        ));
+    }
+
+    /// Refuse a parked awaited-buy on OP_ShopEndConfirm (A3 Migration 1, #448). That packet is a
+    /// 0-byte body with no correlation data, but for this client it is unambiguously a buy refusal
+    /// (see `packet_handler::apply_shop_end_confirm`), so a refusal while a buy is parked resolves
+    /// THAT buy as `Refused`. No-op when nothing is parked. Non-blocking send; never `.await`s.
+    pub fn fulfill_buy_refused(&mut self) {
+        if let Some(pb) = self.pending_buy.take() {
+            let _ = pb.tx.send(crate::command_state::CommandResult::Refused("merchant refused".into()));
+        }
+    }
+
+    /// Reap a parked awaited-buy as `Unconfirmed` (A3 Migration 1, #448) — fired on a zone change so
+    /// a crossing mid-buy can't strand the `Sender` or let it mis-correlate a shop echo in the new
+    /// zone. The HTTP side maps `Unconfirmed` (and a dropped `Sender` — the disconnect case, handled
+    /// for free when `ActionLoop` is dropped) to a 202 "outcome UNKNOWN". No-op when nothing parked.
+    pub fn reap_pending_buy(&mut self) {
+        if let Some(pb) = self.pending_buy.take() {
+            let _ = pb.tx.send(crate::command_state::CommandResult::Unconfirmed);
+        }
+    }
+
     /// Publish the open-merchant session from `gs` into the shared slot (GET /trade/list + the HUD
     /// merchant window).
     pub fn sync_merchant(&self, gs: &GameState) {
@@ -379,6 +472,12 @@ impl ActionLoop {
             // rest in the new zone; a driver that wants to keep going re-issues /v1/move/* afterward.
             // (This is the zone-boundary sibling of the mid-zone stale-plan bug #246.)
             self.walker.reset_for_zone_change();
+
+            // #448: reap any awaited merchant buy still parked across the crossing as `Unconfirmed`.
+            // The merchant is in the OLD zone, so no echo can ever arrive now; leaving the Sender
+            // parked would let a shop echo in the NEW zone mis-correlate it (or strand it until the
+            // HTTP timeout). Firing Unconfirmed here yields the honest "outcome UNKNOWN" 202 promptly.
+            self.reap_pending_buy();
 
             let mut shared = self.world.zone_points.lock().unwrap();
             // Start fresh with server entries.
@@ -1155,42 +1254,59 @@ impl ActionLoop {
     }
 
     fn drain_merchant(&mut self, stream: &mut EqStream, gs: &mut GameState) {
-        // Merchant buy: open the merchant (OP_ShopRequest) then buy its inventory slot
-        // (OP_ShopPlayerBuy). Sent in sequence — the server processes the open first so the
-        // merchant is open by the time the buy arrives. Must be within ~200u of the merchant.
+        // Merchant buy (FIRE-AND-FORGET UI path): open the merchant (OP_ShopRequest) then buy its
+        // inventory slot (OP_ShopPlayerBuy). Sent in sequence — the server processes the open first
+        // so the merchant is open by the time the buy arrives. Must be within ~200u of the merchant.
+        // The packet-emit + in-flight bookkeeping is shared with the awaited path below via
+        // `send_shop_buy`, so both emit byte-identical wire traffic (#448).
+        //
+        // No optimistic "Bought item" log and no local spend_coin at send time (#345, generalizing
+        // the #269 sell fix): the server can refuse — out-of-range/bad merchant/qty, a stale slot,
+        // or insufficient funds — with NO OP_ShopPlayerBuy echo at all, and the insufficient-funds
+        // case sends nothing whatsoever, so a buy can fail silently server-side. Deducting coin or
+        // logging success at send time would fabricate a purchase that never happened. (KOS is NOT a
+        // refusal path — Handle_OP_ShopPlayerBuy has no faction check; faction only gates opening the
+        // window. A buy from an already-open KOS merchant succeeds.) On success the server echoes
+        // THIS SAME opcode back — apply_shop_player_buy (packet_handler.rs) is the only place that
+        // may deduct coin or log "Bought item", because it's the only place that knows it succeeded.
         let buy_req = self.command.take_merchant_buy();
         if let Some((merchant_id, slot)) = buy_req {
-            // #360/#361: a failed/unanswered OP_ShopRequest must not leave `merchant_open` reporting
-            // a DIFFERENT previous merchant, and the coin balance must read as unverified until this
-            // buy is reconciled against a real OP_PlayerProfile — a silent inventory-full/LORE refusal
-            // sends no echo at all. begin_shop_open_for only clears when re-targeting a different (or
-            // no) merchant, so a routine re-buy from the already-open one doesn't flicker it closed
-            // (#361 review FIX 2). See GameState::begin_shop_open_for/begin_shop_buy for the rationale.
-            gs.begin_shop_open_for(merchant_id);
-            gs.begin_shop_buy();
-            let open = merchant_click(merchant_id, gs.player_id, 1);
-            stream.send_app_packet(OP_SHOP_REQUEST, &open);
-            // RoF2 Merchant_Sell_Struct (32b): npcid@0, playerid@4, itemslot@8, unknown12@12,
-            // quantity@16, unknown20@20, price@24, unknown28@28. (Titanium was 24b with price@20;
-            // the RoF2 server DECODEs an exact 32 bytes, so a short packet was silently dropped.)
-            let mut buy = [0u8; 32];
-            buy[0..4].copy_from_slice(&merchant_id.to_le_bytes());
-            buy[4..8].copy_from_slice(&gs.player_id.to_le_bytes());
-            buy[8..12].copy_from_slice(&slot.to_le_bytes());
-            buy[16..20].copy_from_slice(&1u32.to_le_bytes()); // quantity = 1 (server sets the price)
-            stream.send_app_packet(OP_SHOP_PLAYER_BUY, &buy);
-            tracing::info!("EQ: shop buy sent — merchant_id={} slot={} qty=1", merchant_id, slot);
-            // No optimistic "Bought item" log and no local spend_coin here (#345, generalizing the
-            // #269 sell fix): the server can refuse — out-of-range/bad merchant/qty, a stale slot,
-            // or insufficient funds — with NO OP_ShopPlayerBuy echo at all, and the insufficient-funds
-            // case sends nothing whatsoever, so a buy can fail silently server-side. Deducting coin or
-            // logging success at send time therefore fabricates a purchase that never happened.
-            // (Note: KOS is NOT a refusal path — Handle_OP_ShopPlayerBuy has no faction check at all;
-            // faction only gates opening the window. A buy from an already-open KOS merchant succeeds.)
-            // On success the server echoes THIS SAME opcode back (Merchant_Sell_Struct, price
-            // recomputed server-side) — apply_shop_player_buy (packet_handler.rs) is the only place
-            // that may deduct coin or log "Bought item", because it's the only place that knows the
-            // buy actually succeeded.
+            send_shop_buy(stream, gs, merchant_id, slot);
+        }
+
+        // Merchant buy (AWAITED, honest Command-with-result path — POST /v1/merchant/buy, #448):
+        // emit the SAME wire traffic as the fire-and-forget path above, then PARK the HTTP-side
+        // `oneshot::Sender` in `pending_buy` (with the merchant/slot for echo correlation + a
+        // sent-at instant). We fire NOTHING here — the resolving packet does, after `apply_packet`:
+        // the OP_ShopPlayerBuy echo → `fulfill_buy_ok` (Resolved), OP_ShopEndConfirm →
+        // `fulfill_buy_refused` (Refused), or a zone change / HTTP timeout → Unconfirmed.
+        //
+        // SINGLETON-in-flight (reject-while-parked): awaited buys are serialized — at most ONE may be
+        // parked. The server's OP_ShopPlayerBuy echo carries NO per-request token, so two identical
+        // in-flight buys (same merchant+slot) are INDISTINGUISHABLE at the echo. If we superseded the
+        // parked buy with a newer one, the first buy's echo would resolve the SECOND caller's Sender
+        // using the FIRST buy's receipt — mis-attributing success (a failed second buy would report
+        // 200 on the first's success). So when a buy is already parked we do NOT overwrite it and do
+        // NOT send any wire packets: we immediately answer the NEW request `Refused` ("another buy
+        // is in flight; retry after it resolves"). Because the packets were never sent, the buy
+        // DEFINITIVELY did not happen — `Refused`/409 is honest here, not `Unconfirmed`/202 (which
+        // means "outcome unknown" and would understate our certainty). The server then only ever
+        // processes one awaited buy at a time, keeping the echo correlation unambiguous, and the busy
+        // caller gets an honest 409 rather than a mis-attributed 200. See `crate::command_state::result`
+        // for the discipline
+        // A3.2/A3.3 must copy. (Known residual: a UI fire-and-forget buy of the SAME slot concurrent
+        // with a parked awaited buy could still have its echo resolve the awaited buy, because the
+        // fire-and-forget path does not park — very low likelihood, and it cannot fabricate success.)
+        if let Some((merchant_id, slot, tx)) = self.command.take_buy_await() {
+            if self.pending_buy.is_some() {
+                let _ = tx.send(crate::command_state::CommandResult::Refused(
+                    "another buy is already in flight; retry after it resolves".into()));
+                tracing::info!("EQ: awaited shop buy REJECTED — one already in flight (merchant_id={merchant_id} slot={slot})");
+            } else {
+                send_shop_buy(stream, gs, merchant_id, slot);
+                self.pending_buy = Some(PendingBuy { tx, merchant_id, slot, sent_at: Instant::now() });
+                tracing::info!("EQ: awaited shop buy parked — merchant_id={merchant_id} slot={slot}");
+            }
         }
 
         // Merchant sell: open the merchant (OP_ShopRequest) then sell a player inventory slot
@@ -1836,6 +1952,7 @@ mod fine_tier_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::eq_net::packet_handler::apply_packet;
     use crate::nav::steering::{NAV_LOCAL_STUCK_TICKS, PROACTIVE_REPLAN_CAP};
 
     /// **A GOAL THE CLIENT CHANGED MUST NOT BE REPORTED AS THE GOAL THE AGENT ASKED FOR.**
@@ -1975,6 +2092,195 @@ mod tests {
             Default::default(), // collision
             std::path::PathBuf::new(), // maps_dir
         )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+    // A3 Migration 1 (#448): the honest awaited merchant-buy path. These drive a buy through
+    // `drain_merchant` (the loop's own `command` slot is shared with the drain, so a real
+    // request→take round-trip runs), then feed the resolving packet exactly as `gameplay.rs` does.
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+
+    fn new_loop() -> ActionLoop {
+        let g: crate::ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::GroupSnapshot::default()));
+        test_action_loop(g)
+    }
+
+    /// A 32-byte RoF2 Merchant_Sell_Struct echo: npcid@0, itemslot@8, quantity@16, price@24.
+    fn buy_echo(npcid: u32, slot: u32, price: u32) -> Vec<u8> {
+        let mut e = vec![0u8; 32];
+        e[0..4].copy_from_slice(&npcid.to_le_bytes());
+        e[8..12].copy_from_slice(&slot.to_le_bytes());
+        e[16..20].copy_from_slice(&1u32.to_le_bytes());
+        e[24..28].copy_from_slice(&price.to_le_bytes());
+        e
+    }
+
+    fn seed_buy_gs() -> GameState {
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        gs.coin = [0, 0, 0, 100];
+        gs.coin_confirmed = true; // a real coin reading had landed, so coin_verified() started true
+        gs.merchant_open = Some(11);
+        gs.merchant_items.push(crate::game_state::MerchantItem {
+            merchant_slot: 3, item_id: 1, name: "Rusty Dagger".into(), icon: 0, price: 5, quantity: 1,
+        });
+        gs
+    }
+
+    /// SUCCESS: an awaited buy, driven through the drain and confirmed by the OP_ShopPlayerBuy echo,
+    /// resolves to `Resolved(BuyOk)` carrying the item name, the server price, and the coin AFTER the
+    /// applied deduction. `pending_buy` is consumed exactly once.
+    #[tokio::test]
+    async fn awaited_buy_resolves_on_the_shop_echo_with_the_real_receipt() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_buy_gs();
+
+        let (tx, resp) = tokio::sync::oneshot::channel();
+        nav.command.request_buy_await(11, 3, tx);
+        nav.drain_merchant(&mut stream, &mut gs);
+        assert!(nav.pending_buy.is_some(), "the awaited buy must be parked after the drain");
+        assert!(!gs.coin_verified(), "a buy in flight marks coin unverified until reconciled");
+
+        // The confirming echo arrives — apply it (deducts coin, logs "Bought item") THEN fulfil,
+        // exactly as the gameplay loop does after `apply_packet`.
+        let echo = buy_echo(11, 3, 5);
+        apply_packet(&mut gs, &AppPacket { opcode: OP_SHOP_PLAYER_BUY, payload: echo.clone() });
+        nav.fulfill_buy_ok(&gs, &echo);
+
+        assert_eq!(
+            resp.await.unwrap(),
+            crate::command_state::CommandResult::Resolved(crate::command_state::BuyOk {
+                // 100c − 5c = 95c, which `spend_coin` normalises to 9 silver 5 copper.
+                item_name: "Rusty Dagger".into(), price: 5, coin_after: [0, 0, 9, 5],
+            }),
+        );
+        assert!(nav.pending_buy.is_none(), "pending_buy must be consumed exactly once");
+    }
+
+    /// CORRELATION: a shop echo for a DIFFERENT slot must NOT resolve this buy — it leaves the parked
+    /// buy in place (so the right echo can still resolve it) rather than mis-reporting a stray buy.
+    #[tokio::test]
+    async fn awaited_buy_ignores_a_shop_echo_for_a_different_slot() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_buy_gs();
+
+        let (tx, mut resp) = tokio::sync::oneshot::channel();
+        nav.command.request_buy_await(11, 3, tx);
+        nav.drain_merchant(&mut stream, &mut gs);
+
+        nav.fulfill_buy_ok(&gs, &buy_echo(11, 99, 5)); // wrong slot
+        assert!(nav.pending_buy.is_some(), "an uncorrelated echo must leave the buy parked");
+        assert!(matches!(resp.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
+            "no result must be sent for a buy that did not correlate");
+
+        // The correct echo still resolves it.
+        nav.fulfill_buy_ok(&gs, &buy_echo(11, 3, 5));
+        assert!(matches!(resp.try_recv(), Ok(crate::command_state::CommandResult::Resolved(_))));
+    }
+
+    /// REFUSAL: an OP_ShopEndConfirm while a buy is parked resolves it to `Refused` (a REAL negative
+    /// ack → HTTP 409), and clears `pending_buy`.
+    #[tokio::test]
+    async fn awaited_buy_refused_on_shop_end_confirm() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_buy_gs();
+
+        let (tx, resp) = tokio::sync::oneshot::channel();
+        nav.command.request_buy_await(11, 3, tx);
+        nav.drain_merchant(&mut stream, &mut gs);
+
+        nav.fulfill_buy_refused();
+        assert!(matches!(resp.await.unwrap(), crate::command_state::CommandResult::Refused(_)));
+        assert!(nav.pending_buy.is_none());
+    }
+
+    /// INSUFFICIENT-FUNDS SILENCE — THE HONESTY PROOF. The server sends NOTHING on this path, so no
+    /// fulfil ever runs: the parked buy stays un-fired and `coin_verified` stays false. The client
+    /// therefore CANNOT report success — the only resolution left is the HTTP timeout → `Unconfirmed`
+    /// → 202 (asserted in the http::merchant tests). A version that resolved this to `Resolved`/200
+    /// would have to have SENT on the Sender here; it provably has not.
+    #[tokio::test]
+    async fn silent_buy_never_resolves_and_leaves_coin_unverified() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_buy_gs();
+
+        let (tx, mut resp) = tokio::sync::oneshot::channel();
+        nav.command.request_buy_await(11, 3, tx);
+        nav.drain_merchant(&mut stream, &mut gs);
+
+        // No packet is fed — this is the insufficient-funds silence. The net side must NEVER fabricate
+        // a resolution: the Sender stays un-fired and the buy stays parked (only the HTTP timeout / the
+        // reaper may resolve it, both to a non-success outcome).
+        assert!(nav.pending_buy.is_some(), "a silent buy must remain unresolved, never auto-succeed");
+        assert!(matches!(resp.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
+            "no CommandResult may be sent on silence — 200/Resolved on a silent buy is the lie A3 forbids");
+        assert!(!gs.coin_verified(),
+            "an unreconciled in-flight buy must keep coin unverified — the balance is not trustworthy");
+    }
+
+    /// REAPER: a zone change while a buy is parked fires `Unconfirmed` for the stranded Sender and
+    /// clears `pending_buy`, so a shop echo in the NEW zone can't mis-correlate it. Driven through the
+    /// real `sync_zone_points` zone-change hook.
+    #[tokio::test]
+    async fn zone_change_reaps_a_parked_buy_as_unconfirmed() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_buy_gs();
+
+        let (tx, resp) = tokio::sync::oneshot::channel();
+        nav.command.request_buy_await(11, 3, tx);
+        nav.drain_merchant(&mut stream, &mut gs);
+        assert!(nav.pending_buy.is_some());
+
+        // Cross a zone line: sync_zone_points sees a new zone name and runs its reaper.
+        gs.zone_name = "newzone".into();
+        nav.sync_zone_points(&gs);
+
+        assert!(nav.pending_buy.is_none(), "the parked buy must be cleared on a zone change");
+        assert_eq!(resp.await.unwrap(), crate::command_state::CommandResult::Unconfirmed);
+    }
+
+    /// SINGLETON-IN-FLIGHT / NO MIS-ATTRIBUTION (#448 review). Two awaited buys of the SAME
+    /// merchant+slot, back-to-back before any echo: the SECOND is rejected in-flight (`Refused`, no
+    /// wire packets), the FIRST stays parked, and the single OP_ShopPlayerBuy echo resolves the FIRST
+    /// — never the second. This is the honesty fix: without serialization the first buy's echo would
+    /// resolve the second caller's Sender with the first's receipt (a failed second buy reporting
+    /// success). The server-side echo carries no per-request token, so one-at-a-time is the only
+    /// unambiguous correlation.
+    #[tokio::test]
+    async fn a_second_awaited_buy_is_rejected_in_flight_so_the_echo_cannot_be_mis_attributed() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_buy_gs();
+
+        // Buy A parks.
+        let (tx_a, resp_a) = tokio::sync::oneshot::channel();
+        nav.command.request_buy_await(11, 3, tx_a);
+        nav.drain_merchant(&mut stream, &mut gs);
+        assert!(nav.pending_buy.is_some(), "buy A must be parked");
+
+        // Buy B arrives while A is still in flight → rejected in-flight, A untouched.
+        let (tx_b, resp_b) = tokio::sync::oneshot::channel();
+        nav.command.request_buy_await(11, 3, tx_b);
+        nav.drain_merchant(&mut stream, &mut gs);
+        match resp_b.await.unwrap() {
+            crate::command_state::CommandResult::Refused(reason) =>
+                assert!(reason.contains("already in flight"), "B must be told a buy is in flight, got: {reason}"),
+            other => panic!("a second in-flight buy must be Refused, not {other:?} (mis-attribution risk)"),
+        }
+        assert!(nav.pending_buy.is_some(), "buy A must STILL be the parked buy after B is rejected");
+
+        // The single echo resolves A (the parked buy) — proving no mis-attribution onto B.
+        let echo = buy_echo(11, 3, 5);
+        apply_packet(&mut gs, &AppPacket { opcode: OP_SHOP_PLAYER_BUY, payload: echo.clone() });
+        nav.fulfill_buy_ok(&gs, &echo);
+        assert!(matches!(resp_a.await.unwrap(), crate::command_state::CommandResult::Resolved(_)),
+            "the echo must resolve the FIRST (parked) buy, not the rejected second one");
+        assert!(nav.pending_buy.is_none(), "the parked buy is consumed once");
     }
 
     #[test]

@@ -254,10 +254,11 @@ fn main() {
         friends_req:  Arc::new(Mutex::new(None)),
     };
     let merchant_slots = ipc::MerchantSlots {
-        merchant: Arc::new(Mutex::new(ipc::MerchantSnapshot::default())),
-        buy:      Arc::new(Mutex::new(None)),
-        sell:     Arc::new(Mutex::new(None)),
-        trade:    Arc::new(Mutex::new(None)),
+        merchant:  Arc::new(Mutex::new(ipc::MerchantSnapshot::default())),
+        buy:       Arc::new(Mutex::new(None)),
+        buy_await: Arc::new(Mutex::new(None)),
+        sell:      Arc::new(Mutex::new(None)),
+        trade:     Arc::new(Mutex::new(None)),
     };
     let inventory_slots = ipc::InventorySlots {
         inventory: Arc::new(Mutex::new(Vec::new())),

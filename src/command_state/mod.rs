@@ -56,8 +56,15 @@
 //!    already removed its field — that is the eventual end state, NOT what a Wave-2 domain does.)
 
 mod combat;
+/// A3 Migration 1 (#448): the reusable Command-with-result infra. `CommandResult<T>` is the honest
+/// three-way outcome (Resolved/Refused/Unconfirmed) an HTTP handler awaits so it reports the TRUE
+/// server outcome instead of a premature queued-action 200. THE reference for A3.2/A3.3 — see its
+/// module doc for the full status mapping, invariant, and park→fulfil→timeout flow.
+pub mod result;
+pub use result::CommandResult;
 // Wave-2 fan-out stubs — one file each, empty `impl CommandState {}` shell awaiting migration.
 mod merchant;
+pub use merchant::BuyOk;
 mod inventory;
 mod interact;
 mod quest;
