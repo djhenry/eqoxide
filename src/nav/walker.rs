@@ -500,7 +500,7 @@ impl Walker {
     pub(crate) fn apply_fast_steering(&mut self, gs: &mut GameState) {
         if !self.local_path.is_empty() && self.nav.goto_target.lock().unwrap().is_some() {
             if let Some((wish_dir, heading)) =
-                fast_steer_aim(&self.local_path, &mut self.local_i, [gs.player_x, gs.player_y], 5.0)
+                fast_steer_aim(&self.local_path, &mut self.local_i, [gs.player_x, gs.player_y, gs.player_z], 5.0)
             {
                 if let Some(intent) = self.nav_intent.lock().unwrap().as_mut() {
                     intent.wish_dir = wish_dir;
@@ -624,18 +624,22 @@ impl Walker {
         const LOOK_AHEAD: f32 = 5.0;
         let px = gs.player_x;
         let py = gs.player_y;
+        let pz = gs.player_z;
         while self.path_i + 2 < self.path.len() {
             let (a, b) = (self.path[self.path_i], self.path[self.path_i + 1]);
-            let ab = [b[0] - a[0], b[1] - a[1]];
-            let l2 = ab[0] * ab[0] + ab[1] * ab[1];
-            let t = if l2 < 1e-6 { 1.0 } else { ((px - a[0]) * ab[0] + (py - a[1]) * ab[1]) / l2 };
+            // 3D projection (water-nav Slice 3, §8.1): a near-vertical dive/ascent leg is not skipped
+            // on frame one — path_i advances past it only once the char has actually changed depth.
+            // Near-horizontal land: the z term vanishes, so this is the same advance as before.
+            let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+            let t = if l2 < 1e-6 { 1.0 } else { ((px - a[0]) * ab[0] + (py - a[1]) * ab[1] + (pz - a[2]) * ab[2]) / l2 };
             if t >= 1.0 { self.path_i += 1; } else { break; }
         }
         let have_path = !self.path.is_empty();
         let target: (f32, f32, f32) = if have_path {
             const LOCAL_REACH: f32 = 24.0;   // how far ahead on the coarse route the fine plan aims
             const LOCAL_BOUND: f32 = 40.0;   // the fine search window (keeps it bounded → it terminates)
-            let coarse = carrot_along(&self.path, self.path_i, [px, py], LOOK_AHEAD)
+            let coarse = carrot_along(&self.path, self.path_i, [px, py, pz], LOOK_AHEAD)
                 .unwrap_or([goal.0, goal.1, gs.player_z]);
             if let Some(reply) = self.local_planner.poll() {
                 self.apply_local_plan(reply);
@@ -647,7 +651,7 @@ impl Walker {
                 self.clear_local_plan();
             }
 
-            let local_goal = carrot_along(&self.path, self.path_i, [px, py], LOCAL_REACH).unwrap_or(coarse);
+            let local_goal = carrot_along(&self.path, self.path_i, [px, py, pz], LOCAL_REACH).unwrap_or(coarse);
             if let Some(c) = self.collision.read().unwrap().as_ref().cloned() {
                 self.local_planner.post_if_idle(crate::nav::planner::LocalRequest {
                     gen: 0, // assigned by the planner
@@ -667,7 +671,7 @@ impl Walker {
             }
 
             let aim = steer_target(&self.path, self.path_i, &self.local_path, &mut self.local_i,
-                [px, py], LOOK_AHEAD, coarse);
+                [px, py, pz], LOOK_AHEAD, coarse);
             *self.nav.nav_path_view.lock().unwrap() = (self.path.clone(), self.local_path.clone());
             (aim[0], aim[1], aim[2])
         } else {
@@ -858,13 +862,22 @@ impl Walker {
             }
             _ => false,
         };
-        // Surface-approach for a haul-out (#359 contract, controller half's TRIGGER): when the
-        // waypoint sits above a swimmer, drive the vertical wish so the controller rises — the
-        // controller executes the rise COLLIDED and clamps it at the water surface (feet never
-        // leave the column), leaving a residual riser ≤ PLAYER_BODY.haul_out_up that its swimming
-        // step-up mounts. The planner admits only such exits, from the same Body fields.
-        const SWIM_UP_RATE: f32 = 20.0; // u/s, comfortably under the controller's BUOY_RATE (30)
-        let wish_vspeed = if swim && target.2 > gs.player_z + 1.0 { SWIM_UP_RATE } else { 0.0 };
+        // Vertical swim wish — the water-nav Slice 3 depth controller (design §8.2), replacing the
+        // old up-only rule that could not express a mid-water hold. `swim_vspeed` drives the wish from
+        // the carrot's DEPTH so the swimmer follows the planned route z (dive, hold, tunnel transit)
+        // instead of floating to the surface (#547 live qcat: descended, then surfaced/wedged). It
+        // returns 0 ONLY when the carrot is at/above the swim plane, letting the controller's buoyancy
+        // do the lift — which preserves the #359 haul-out approach (the last water waypoint before an
+        // exit IS the swim-plane node, so the carrot rises there and buoyancy mounts the lip). Below
+        // the plane the wish is always nonzero, which suppresses buoyancy so the hold is not a fight.
+        let swim_plane = if swim {
+            self.collision.read().unwrap().as_ref()
+                .and_then(|c| c.water_surface([gs.player_x, gs.player_y, gs.player_z]))
+                .map(|surf| surf - crate::traversability::PLAYER_BODY.float_depth)
+        } else {
+            None
+        };
+        let wish_vspeed = if swim { swim_vspeed(target.2, gs.player_z, swim_plane) } else { 0.0 };
         *self.nav_intent.lock().unwrap() = Some(MoveIntent {
             wish_dir:    [dx / dist, dy / dist],
             wish_vspeed,

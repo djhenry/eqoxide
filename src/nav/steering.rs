@@ -185,32 +185,91 @@ pub(crate) fn arrival_action(gdist: f32, gdz: f32, following: bool) -> ArrivalAc
     }
 }
 
-/// A pure-pursuit carrot: the point `reach` units along `path` (starting from segment `start_i`),
-/// measured from the projection of `from` onto that segment. Returns `[east, north, z]`, carrying the
-/// z of the segment the carrot lands on. Used at two scales: a far carrot (~LOCAL_REACH) as the fine
-/// plan's goal, and a near carrot (LOOK_AHEAD) along the fine plan as the steering aim.
-pub(crate) fn carrot_along(path: &[[f32; 3]], start_i: usize, from: [f32; 2], reach: f32) -> Option<[f32; 3]> {
+/// A pure-pursuit carrot: the point `reach` units (3D arclength) along `path` (starting from segment
+/// `start_i`), measured from the 3D projection of `from` = `[east, north, z]` onto that segment.
+/// Returns `[east, north, z]` INTERPOLATED at the carrot point. Used at two scales: a far carrot
+/// (~LOCAL_REACH) as the fine plan's goal, and a near carrot (LOOK_AHEAD) along the fine plan as the
+/// steering aim; its z is also the depth target the water-nav depth controller (`swim_vspeed`) holds.
+///
+/// **3D (water-nav Slice 3, design §8.1).** The projection, the arclength, and the returned z are all
+/// 3D. This is load-bearing for a diving/ascending water leg: such a segment is (near-)vertical in XY,
+/// so the OLD XY-only math gave it zero length, jumped the carrot straight to the next waypoint's z,
+/// and (with the cursor) consumed the descent on frame one — the walker would then drive HORIZONTALLY
+/// into the shaft wall instead of swimming DOWN it. On near-horizontal LAND segments 3D ≡ 2D (the z
+/// contribution vanishes) and the interpolated z equals the segment z, so land steering is unchanged.
+pub(crate) fn carrot_along(path: &[[f32; 3]], start_i: usize, from: [f32; 3], reach: f32) -> Option<[f32; 3]> {
     let a = *path.get(start_i)?;
     let b = path.get(start_i + 1).copied().unwrap_or(a);
-    let ab = [b[0] - a[0], b[1] - a[1]];
-    let l2 = ab[0] * ab[0] + ab[1] * ab[1];
-    let t = if l2 < 1e-6 { 0.0 } else { (((from[0] - a[0]) * ab[0] + (from[1] - a[1]) * ab[1]) / l2).clamp(0.0, 1.0) };
-    let mut cur = [a[0] + ab[0] * t, a[1] + ab[1] * t];
-    let (mut rem, mut i, mut cz) = (reach, start_i, b[2]);
+    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+    let t = if l2 < 1e-6 { 0.0 }
+        else { (((from[0] - a[0]) * ab[0] + (from[1] - a[1]) * ab[1] + (from[2] - a[2]) * ab[2]) / l2).clamp(0.0, 1.0) };
+    let mut cur = [a[0] + ab[0] * t, a[1] + ab[1] * t, a[2] + ab[2] * t];
+    let (mut rem, mut i) = (reach, start_i);
     loop {
         match path.get(i + 1).copied() {
             Some(bp) => {
-                cz = bp[2];
-                let d = [bp[0] - cur[0], bp[1] - cur[1]];
-                let dl = (d[0] * d[0] + d[1] * d[1]).sqrt();
+                let d = [bp[0] - cur[0], bp[1] - cur[1], bp[2] - cur[2]];
+                let dl = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
                 if dl >= rem || i + 2 >= path.len() {
-                    let c = if dl < 1e-6 { cur } else { [cur[0] + d[0] * (rem / dl).min(1.0), cur[1] + d[1] * (rem / dl).min(1.0)] };
-                    break Some([c[0], c[1], cz]);
+                    let c = if dl < 1e-6 { cur }
+                        else { let s = (rem / dl).min(1.0); [cur[0] + d[0] * s, cur[1] + d[1] * s, cur[2] + d[2] * s] };
+                    break Some(c);
                 }
-                rem -= dl; cur = [bp[0], bp[1]]; i += 1;
+                rem -= dl; cur = bp; i += 1;
             }
-            None => break Some([cur[0], cur[1], cz]),
+            None => break Some(cur),
         }
+    }
+}
+
+/// Max commanded vertical swim speed (u/s), kept UNDER the controller's `BUOY_RATE` (30) so a carrot
+/// at the swim plane lets buoyancy do the faster lift (see [`swim_vspeed`]). Was the old inline
+/// `SWIM_UP_RATE`.
+pub(crate) const SWIM_VRATE: f32 = 20.0;
+
+/// Signed vertical swim wish (u/s) that makes the walker **HOLD the planned depth** instead of
+/// floating to the surface — the crux of water-nav Slice 3 (design §8.2).
+///
+/// It replaces the old up-only rule (`swim && carrot > z+1 → +20 else 0`), which could only RISE: a
+/// mid-water waypoint was inexpressible, so the instant the wish was 0 the controller's buoyancy —
+/// which fires ONLY on `wish_vspeed == 0` ([`crate::movement`]) — lifted the swimmer back to the swim
+/// plane and the deep route waypoints could never be followed. That is the planner-z-vs-controller-z
+/// fight of design §1, live-proven in qcat (#547: the char descended, then surfaced/wedged).
+///
+/// * `carrot_z` — the z the pursuit carrot wants NOW (from [`carrot_along`], now depth-interpolated).
+/// * `player_z` — the character's feet z (all nav z's are feet-frame).
+/// * `swim_plane` — `surface − float_depth` at the character's column: the depth buoyancy settles at.
+///   `None` for a column with no bounded surface (open / unbounded deep water), where buoyancy also
+///   cannot act.
+///
+/// Rule — **proportional toward the carrot's depth** (`err/τ`, clamped to ±`SWIM_VRATE`): a carrot
+/// above the feet drives a collided rise, one below drives a collided sink, one at the feet drives ~0.
+/// This is what makes a mid-water waypoint followable at all — the retired up-only rule returned 0 for
+/// any waypoint at/below the feet, and 0 hands the swimmer to buoyancy. Note buoyancy alone reaches
+/// only the swim plane, *not* the surface, so a proportional rise (capped at `SWIM_VRATE`, then
+/// collided/surface-clamped by the controller's `swim_rise`) is what actually reaches an above-plane
+/// entry/haul-out waypoint; buoyancy still assists any rise for free.
+///
+/// The one place the wish must be forced nonzero: **at the target while BELOW the swim plane.** There
+/// `err ≈ 0` would give a 0 wish, and a 0 wish lets buoyancy (which fires only on `wish_vspeed == 0`,
+/// [`crate::movement`], at 30 u/s) reclaim the swimmer and float it to the plane — the surfacing that
+/// broke the deep route in #547. So below the plane a zero proportional term is nudged to a tiny
+/// `MIN_HOLD` sink: nonzero enough to suppress buoyancy, tiny enough that the controller's `SKIN`
+/// clamp on `swim_sink` turns it into zero net motion — a true hold. At/above the plane a 0 wish is
+/// safe: buoyancy simply rests the swimmer AT the plane, which is where the route wants it anyway.
+pub(crate) fn swim_vspeed(carrot_z: f32, player_z: f32, swim_plane: Option<f32>) -> f32 {
+    const DEPTH_TAU: f32 = 0.25; // s — proportional time-constant of the depth hold
+    // The tiny nonzero kept below the plane so buoyancy (wish==0) can never reclaim a mid-water hold.
+    // |MIN_HOLD·dt| < movement::SKIN (0.05) at any real frame dt, so it suppresses buoyancy without
+    // itself drifting the depth. `err` is essentially never exactly 0, but pin the invariant anyway.
+    const MIN_HOLD: f32 = 0.1;
+    let err = carrot_z - player_z; // + → carrot above the feet (rise); − → carrot below (sink)
+    let w = (err / DEPTH_TAU).clamp(-SWIM_VRATE, SWIM_VRATE);
+    if w == 0.0 && matches!(swim_plane, Some(plane) if player_z < plane - 0.001) {
+        -MIN_HOLD // holding below the swim plane: keep buoyancy suppressed so we do not surface
+    } else {
+        w
     }
 }
 
@@ -225,7 +284,7 @@ pub(crate) fn carrot_along(path: &[[f32; 3]], start_i: usize, from: [f32; 2], re
 /// RUN_SPEED the projection onto segment 0 saturates at t=1, and for the rest of the gate the aim
 /// is measured from `local_path[1]`, which is now BEHIND the walker. The look-ahead collapses and
 /// can invert on a bend, which is the drawn-path-vs-actual-movement divergence in #311.
-pub(crate) fn fast_steer_aim(path: &[[f32; 3]], local_i: &mut usize, from: [f32; 2], reach: f32) -> Option<([f32; 2], f32)> {
+pub(crate) fn fast_steer_aim(path: &[[f32; 3]], local_i: &mut usize, from: [f32; 3], reach: f32) -> Option<([f32; 2], f32)> {
     advance_cursor(path, local_i, from);
     let aim = carrot_along(path, *local_i, from, reach)?;
     let (dx, dy) = (aim[0] - from[0], aim[1] - from[1]);
@@ -242,7 +301,7 @@ pub(crate) fn fast_steer_aim(path: &[[f32; 3]], local_i: &mut usize, from: [f32;
 /// bend. Since #382 the fine path arrives from a worker a tick or two after it was requested and so
 /// STARTS a few units behind the walker by construction, which makes this advance load-bearing on the
 /// very first use of a fresh plan, not just partway through its life.
-pub(crate) fn advance_cursor(path: &[[f32; 3]], i: &mut usize, from: [f32; 2]) {
+pub(crate) fn advance_cursor(path: &[[f32; 3]], i: &mut usize, from: [f32; 3]) {
     // A cursor can only ever index the path it was advanced along, whatever it held before. The fine
     // path is now REPLACED asynchronously, by a worker, with one that may be SHORTER than the one the
     // cursor was walking — so "the cursor outran the path" is a state this code must simply not have.
@@ -252,9 +311,15 @@ pub(crate) fn advance_cursor(path: &[[f32; 3]], i: &mut usize, from: [f32; 2]) {
     *i = (*i).min(path.len().saturating_sub(1));
     while *i + 2 < path.len() {
         let (a, b) = (path[*i], path[*i + 1]);
-        let ab = [b[0] - a[0], b[1] - a[1]];
-        let l2 = ab[0] * ab[0] + ab[1] * ab[1];
-        let t = if l2 < 1e-6 { 1.0 } else { ((from[0] - a[0]) * ab[0] + (from[1] - a[1]) * ab[1]) / l2 };
+        let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+        // 3D projection (water-nav Slice 3, design §8.1): a purely VERTICAL water leg (l2_xy≈0) is no
+        // longer mistaken for a zero-length segment and skipped on frame one — the cursor advances
+        // past it only once the character has actually descended/ascended it. Near-horizontal land
+        // segments have a vanishing z term, so 3D ≡ 2D and land steering is unchanged. A genuinely
+        // zero-length segment (a==b) still has l2<1e-6 and is skipped, as before.
+        let t = if l2 < 1e-6 { 1.0 }
+            else { ((from[0] - a[0]) * ab[0] + (from[1] - a[1]) * ab[1] + (from[2] - a[2]) * ab[2]) / l2 };
         if t >= 1.0 { *i += 1; } else { break; }
     }
 }
@@ -278,7 +343,7 @@ pub(crate) fn advance_cursor(path: &[[f32; 3]], i: &mut usize, from: [f32; 2]) {
 pub(crate) fn steer_target(
     coarse: &[[f32; 3]], path_i: usize,
     local:  &[[f32; 3]], local_i: &mut usize,
-    from: [f32; 2], look_ahead: f32,
+    from: [f32; 3], look_ahead: f32,
     fallback: [f32; 3],
 ) -> [f32; 3] {
     // The coarse carrot: the aim we ALWAYS have while a route is committed.
@@ -552,7 +617,7 @@ mod tests {
             [6.0, 10.0, 0.0], [6.0, 12.0, 0.0],
         ];
         let mut local_i = 0usize;
-        let mut pos = [0.0f32, 0.0f32];
+        let mut pos = [0.0f32, 0.0f32, 0.0f32]; // flat path (z=0): 3D projection ≡ the 2D it replaced
         const DT: f32 = 0.01; // ~10ms fast-steering tick
         let mut min_forward_dot = f32::MAX;
         for _ in 0..15 { // 150ms — exactly one local_path gate, deliberately NOT rebuilt
@@ -578,5 +643,43 @@ mod tests {
         assert!(travelled > 5.0,
             "walker made almost no net progress over the 150ms gate (ended {travelled:.2}u from \
              start at {pos:?}) — the cursor likely stalled pinned to segment 0 (#311)");
+    }
+
+    /// **Water-nav Slice 3 (§8.2): the depth controller must be able to HOLD a mid-water depth —
+    /// never surface unbidden.** This is the pure-function heart of the qcat fix (#547/#551): the old
+    /// up-only rule returned `0` for any waypoint at/below the swimmer, and `0` hands the swimmer to
+    /// buoyancy, which floats it to the surface — so a deep route could not be followed. `swim_vspeed`
+    /// returns `0` ONLY when the carrot is at/above the swim plane; below it the wish is ALWAYS nonzero
+    /// (buoyancy suppressed) and correctly signed toward the carrot.
+    ///
+    /// Mutation-discriminating: revert `swim_vspeed` to the old `if carrot > z+1 { 20 } else { 0 }`
+    /// and every below-plane assertion here (the ones demanding a nonzero / signed hold) goes RED —
+    /// the old rule returns 0 for a carrot at or below the feet.
+    #[test]
+    fn swim_vspeed_holds_depth_below_the_plane_and_yields_to_buoyancy_at_it() {
+        let plane = Some(-6.0); // surface −4, float_depth 2 → swim plane at −6
+        // Proportional and signed toward the carrot's depth, clamped to ±SWIM_VRATE.
+        assert!(swim_vspeed(-24.0, -20.0, plane) < 0.0, "carrot 4u below the feet → sink (negative)");
+        assert!(swim_vspeed(-24.0, -30.0, plane) > 0.0, "carrot 6u above the feet → rise (positive)");
+        assert_eq!(swim_vspeed(-100.0, -20.0, plane), -SWIM_VRATE, "a big downward error clamps to −SWIM_VRATE");
+        assert_eq!(swim_vspeed(-20.0, -100.0, plane), SWIM_VRATE, "a big upward error clamps to +SWIM_VRATE");
+        // An ABOVE-plane entry/haul-out waypoint (toward the surface) must drive an active RISE — the
+        // whole reason the up-only rule couldn't be replaced by "0 and let buoyancy do it": buoyancy
+        // rests at the plane and never reaches the −4 surface. (Regression: a −4 entry waypoint left
+        // the swimmer stuck at the −6 plane, path_i frozen — the first cut of this fix.)
+        assert!(swim_vspeed(-4.0, -6.0, plane) > 0.0, "a surface entry waypoint above the plane → rise toward it");
+        // THE CRUX (#547): a mid-water hold BELOW the plane must keep a NONZERO wish — a 0 would let
+        // buoyancy float the swimmer to the plane (surfacing). At the target the wish is tiny (a hold).
+        let hold = swim_vspeed(-24.0, -24.0, plane); // resting exactly at a mid-water goal
+        assert!(hold != 0.0, "a mid-water hold must keep a NONZERO wish so buoyancy stays suppressed \
+            (0 would let the swimmer float to the surface — the #547 bug)");
+        assert!(hold.abs() <= 0.5, "…but at the target the wish is tiny (the SKIN clamp makes it a hold): {hold}");
+        // AT/above the plane, a 0 wish is safe — buoyancy simply rests the swimmer at the plane (the
+        // ordinary surface-pool crossing), so no spurious hold nudge there.
+        assert_eq!(swim_vspeed(-6.0, -6.0, plane), 0.0, "resting AT the plane → 0 (buoyancy rests here)");
+        // No bounded surface (open/unbounded water): buoyancy can't act, so a 0 hold is safe there too.
+        assert_eq!(swim_vspeed(-50.0, -50.0, None), 0.0, "no surface → 0 is a safe hold (buoyancy inert)");
+        assert!(swim_vspeed(-40.0, -50.0, None) > 0.0 && swim_vspeed(-60.0, -50.0, None) < 0.0,
+            "no surface → still signed toward the carrot");
     }
 }

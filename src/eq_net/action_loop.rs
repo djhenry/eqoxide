@@ -2636,7 +2636,7 @@ mod fine_tier_tests {
             };
             // ...from anywhere, with ANY cursor value, including ones far past the end of the path (a
             // cursor that outran a plan the worker then replaced with a shorter one).
-            let from = [rng.f32_in(-600.0, 600.0), rng.f32_in(-600.0, 600.0)];
+            let from = [rng.f32_in(-600.0, 600.0), rng.f32_in(-600.0, 600.0), rng.f32_in(-600.0, 600.0)];
             let path_i = rng.usize_below(coarse.len() + 3);
             let mut local_i = rng.usize_below(local.len() + 3);
             let fallback = [rng.f32_in(-600.0, 600.0), rng.f32_in(-600.0, 600.0), 0.0];
