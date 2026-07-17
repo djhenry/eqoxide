@@ -262,6 +262,28 @@ impl SceneState {
                     }.to_string(),
                 }
             };
+            // #418: an NPC mid-swing (`action` == "C0{code}") faces its LAST MOVEMENT heading —
+            // OP_Animation carries no facing data of its own, and a server "face target" position
+            // update may lag behind (or never separately arrive for) a stationary melee fight, so
+            // the rendered body can visibly point away from who it's actually hitting. When we can
+            // independently confirm this swing landed on (or at) the player — `recent_attackers` is
+            // refreshed by every `OP_Damage` hit/miss the player takes (packet_handler.rs) — face the
+            // player instead of trusting the stale wire heading, for rendering only; `e.heading`
+            // itself (and all non-attack actions) is untouched.
+            let heading = if action.starts_with('C')
+                && gs.recent_attackers.get(&e.spawn_id)
+                    .is_some_and(|t| t.elapsed() < COMBAT_SWING_WINDOW)
+            {
+                let d_east  = gs.player_x - e.x;
+                let d_north = gs.player_y - e.y;
+                if d_east != 0.0 || d_north != 0.0 {
+                    crate::coord::eq_heading(d_east, d_north)
+                } else {
+                    e.heading
+                }
+            } else {
+                e.heading
+            };
             Billboard {
                 id:        e.spawn_id,
                 pos:       [e.x, e.y, e.z],
@@ -272,7 +294,7 @@ impl SceneState {
                 name:      e.name.clone(),
                 race:      e.race.clone(),
                 action:    action,
-                heading:   e.heading,
+                heading:   heading,
                 equipment:      e.equipment,
                 equipment_tint: e.equipment_tint,
                 gender:    e.gender,
@@ -638,5 +660,88 @@ mod tests {
         assert_eq!(scene.group_leader, "Aldric");
         assert_eq!(scene.group_members.len(), 2);
         assert_eq!(scene.group_members[1].name, "Sariel");
+    }
+
+    // --- #418: mid-swing NPC facing overrides a stale wire heading with a face-the-player yaw ---
+
+    fn attacker_entity(spawn_id: u32, x: f32, y: f32, heading: f32) -> Entity {
+        Entity {
+            spawn_id, name: "an_orc".into(), level: 5, is_npc: true,
+            x, y, z: 0.0, hp_pct: 90.0, cur_hp: 90, max_hp: 100,
+            race: "ORC".into(), heading, dead: false,
+            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0, floating: false,
+            face: 0, hairstyle: 0, haircolor: 0,
+            animation: 0,
+        }
+    }
+
+    #[test]
+    fn mid_swing_confirmed_attacker_faces_the_player_not_stale_heading() {
+        // NPC is due south of the player (player is due north of the NPC → face-the-player
+        // heading is 0/north), but its last MOVEMENT heading (180=south) points away — the
+        // classic #418 symptom: swinging at the player while visually facing the other way.
+        let mut gs = GameState::new();
+        gs.player_x = 0.0;
+        gs.player_y = 10.0; // player is north of the NPC
+        gs.upsert_entity(attacker_entity(7, 0.0, 0.0, 180.0));
+        gs.combat_anims.insert(7, (5, std::time::Instant::now())); // mid-swing (C05)
+        gs.recent_attackers.insert(7, std::time::Instant::now());  // just hit/missed the player
+
+        let scene = SceneState::from_game_state(&gs, &std::collections::HashMap::new());
+        let b = &scene.billboards[0];
+        assert_eq!(b.action, "C05");
+        assert!((b.heading - 0.0).abs() < 1.0,
+            "confirmed attacker mid-swing should face the player (north=0), got {}", b.heading);
+    }
+
+    #[test]
+    fn mid_swing_without_a_confirmed_hit_keeps_the_wire_heading() {
+        // Same geometry, but this spawn is NOT in `recent_attackers` (e.g. it's swinging at some
+        // other target, or a group-mate) — the override must not fire; trust the wire heading.
+        let mut gs = GameState::new();
+        gs.player_x = 0.0;
+        gs.player_y = 10.0;
+        gs.upsert_entity(attacker_entity(7, 0.0, 0.0, 180.0));
+        gs.combat_anims.insert(7, (5, std::time::Instant::now()));
+
+        let scene = SceneState::from_game_state(&gs, &std::collections::HashMap::new());
+        let b = &scene.billboards[0];
+        assert_eq!(b.action, "C05");
+        assert_eq!(b.heading, 180.0, "no confirmed hit on the player → keep the raw wire heading");
+    }
+
+    #[test]
+    fn stale_attacker_record_does_not_override_a_non_swinging_idle_npc() {
+        // `recent_attackers` alone (no live combat_anims entry) must not force a facing override
+        // outside the swing window — e.g. it hit the player once a while ago and is now idling.
+        let mut gs = GameState::new();
+        gs.player_x = 0.0;
+        gs.player_y = 10.0;
+        gs.upsert_entity(attacker_entity(7, 0.0, 0.0, 180.0));
+        gs.recent_attackers.insert(7, std::time::Instant::now());
+        // No combat_anims entry → action resolves to idle, not "C0N".
+
+        let scene = SceneState::from_game_state(&gs, &std::collections::HashMap::new());
+        let b = &scene.billboards[0];
+        assert_eq!(b.action, "idle");
+        assert_eq!(b.heading, 180.0, "not mid-swing → override must not apply");
+    }
+
+    #[test]
+    fn expired_combat_swing_window_falls_back_to_idle_and_wire_heading() {
+        // A swing recorded long ago (past COMBAT_SWING_WINDOW) must resolve back to idle/idle
+        // heading even if `recent_attackers` is still (separately) populated.
+        let mut gs = GameState::new();
+        gs.player_x = 0.0;
+        gs.player_y = 10.0;
+        gs.upsert_entity(attacker_entity(7, 0.0, 0.0, 180.0));
+        let long_ago = std::time::Instant::now() - (super::COMBAT_SWING_WINDOW + std::time::Duration::from_millis(50));
+        gs.combat_anims.insert(7, (5, long_ago));
+        gs.recent_attackers.insert(7, std::time::Instant::now());
+
+        let scene = SceneState::from_game_state(&gs, &std::collections::HashMap::new());
+        let b = &scene.billboards[0];
+        assert_eq!(b.action, "idle");
+        assert_eq!(b.heading, 180.0, "swing window expired → no facing override");
     }
 }
