@@ -1287,10 +1287,13 @@ impl ActionLoop {
         // parked buy with a newer one, the first buy's echo would resolve the SECOND caller's Sender
         // using the FIRST buy's receipt — mis-attributing success (a failed second buy would report
         // 200 on the first's success). So when a buy is already parked we do NOT overwrite it and do
-        // NOT send any wire packets: we immediately answer the NEW request `Unconfirmed` ("another buy
-        // is in flight; retry after it resolves"). The server then only ever processes one awaited buy
-        // at a time, keeping the echo correlation unambiguous, and the busy caller gets an honest 202
-        // rather than a mis-attributed 200. See `crate::command_state::result` for the discipline
+        // NOT send any wire packets: we immediately answer the NEW request `Refused` ("another buy
+        // is in flight; retry after it resolves"). Because the packets were never sent, the buy
+        // DEFINITIVELY did not happen — `Refused`/409 is honest here, not `Unconfirmed`/202 (which
+        // means "outcome unknown" and would understate our certainty). The server then only ever
+        // processes one awaited buy at a time, keeping the echo correlation unambiguous, and the busy
+        // caller gets an honest 409 rather than a mis-attributed 200. See `crate::command_state::result`
+        // for the discipline
         // A3.2/A3.3 must copy. (Known residual: a UI fire-and-forget buy of the SAME slot concurrent
         // with a parked awaited buy could still have its echo resolve the awaited buy, because the
         // fire-and-forget path does not park — very low likelihood, and it cannot fabricate success.)
