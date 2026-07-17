@@ -117,25 +117,39 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn empty_state() -> HttpState {
+        // `CameraSlots` has no `Default` impl (`CameraSnapshot`'s fields aren't Default-able), so
+        // it's built by hand; every other bundle is plain `Default::default()`. `nav`, `camera`, and
+        // `lifecycle` are bound to locals FIRST (rather than inlined) so `command` below can be
+        // built from `.clone()`s of the SAME Arcs — mirroring the shared-identity wiring `main.rs`
+        // does for real, and required now that nav/camera/lifecycle route their writes through
+        // `command` (#459): an independently-`Default`-constructed `command.nav`/etc. would silently
+        // diverge from the `state.nav`/etc. a test reads back.
+        let camera = crate::ipc::CameraSlots {
+            cmd_tx: Arc::new(Mutex::new(None)),
+            snapshot: Arc::new(Mutex::new(crate::camera_state::CameraSnapshot {
+                mode: crate::camera_state::CameraMode::AutoFollow,
+                azimuth: 0.0,
+                elevation: 0.0,
+                radius: 0.0,
+                focus: [0.0, 0.0, 0.0],
+            })),
+            frame_req: Arc::new(Mutex::new(None)),
+            manual_move: Arc::new(Mutex::new(None)),
+        };
+        let nav: crate::ipc::NavSlots = Default::default();
+        let lifecycle: crate::ipc::LifecycleSlots = Default::default();
+        let command = crate::command_state::CommandState::new(
+            Default::default(), Default::default(), Default::default(), Default::default(),
+            Default::default(), Default::default(), Default::default(), Default::default(),
+            Default::default(), Default::default(),
+            nav.clone(), lifecycle.clone(), camera.manual_move.clone(),
+        );
         HttpState {
-            // `CameraSlots` has no `Default` impl (`CameraSnapshot`'s fields aren't Default-able),
-            // so it's the one bundle built by hand here; every other bundle is plain `Default::default()`.
-            camera: crate::ipc::CameraSlots {
-                cmd_tx: Arc::new(Mutex::new(None)),
-                snapshot: Arc::new(Mutex::new(crate::camera_state::CameraSnapshot {
-                    mode: crate::camera_state::CameraMode::AutoFollow,
-                    azimuth: 0.0,
-                    elevation: 0.0,
-                    radius: 0.0,
-                    focus: [0.0, 0.0, 0.0],
-                })),
-                frame_req: Arc::new(Mutex::new(None)),
-                manual_move: Arc::new(Mutex::new(None)),
-            },
-            nav: Default::default(),
+            camera,
+            nav,
             world: Default::default(),
             shared_collision: Arc::new(std::sync::RwLock::new(None)),
-            command: Default::default(),
+            command,
             social: Default::default(),
             merchant_slots: Default::default(),
             inventory_slots: Default::default(),
@@ -147,7 +161,7 @@ pub(crate) mod tests {
             frame_profile: Arc::new(Mutex::new(crate::profiling::FrameProfile::default())),
             quest: Default::default(),
             group_slots: Default::default(),
-            lifecycle: Default::default(),
+            lifecycle,
             guild_slots: Default::default(),
         }
     }

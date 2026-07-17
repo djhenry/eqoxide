@@ -113,14 +113,14 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
                 let camp = btn(format!("Camping\u{2026} {secs}s (cancel)"))
                     .fill(egui::Color32::from_rgb(0x50, 0x44, 0x20));
                 if ui.add(camp).on_hover_text("Click to cancel camping").clicked() {
-                    *cx.acts.camp.lock().unwrap() = Some(crate::http::CampCmd::Toggle);
+                    cx.acts.command.request_camp(crate::http::CampCmd::Toggle);
                 }
                 // Keep the countdown ticking even when nothing else repaints.
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
             }
             None => {
                 if ui.add(btn("Camp")).on_hover_text("Sit and camp to desktop").clicked() {
-                    *cx.acts.camp.lock().unwrap() = Some(crate::http::CampCmd::Toggle);
+                    cx.acts.command.request_camp(crate::http::CampCmd::Toggle);
                 }
             }
         }

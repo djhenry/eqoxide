@@ -73,11 +73,11 @@ mod lifecycle;
 /// The typed write-path facade. Holds `.clone()`d handles of the same `ipc` command bundles that
 /// `ActionLoop` and `HttpState` hold; every method is a thin typed read/write of one of their slots.
 ///
-/// (#457 cleanup) Combat/merchant/inventory/interact/quest/group/guild/trainer/social/chat are all
-/// migrated now, so the struct-wide `#[allow(dead_code)]` is gone. `nav`, `lifecycle`, and
-/// `camera_manual_move` are still Wave-2 fan-out stubs (see `nav.rs`/`lifecycle.rs`/`camera.rs` —
-/// each is an empty `impl CommandState {}` shell) — narrow field-level allows below until those
-/// domains migrate, per the "HOW TO MIGRATE A DOMAIN" note above.
+/// (#459 stragglers) nav/camera/lifecycle are migrated too now, so every domain field is read by at
+/// least one `request_*`/`take_*`/`peek_*` method — no field-level `#[allow(dead_code)]` remains.
+/// See `nav.rs`/`camera.rs`/`lifecycle.rs` for the (narrower, non-`ActionLoop`-drain) shape those
+/// three domains ended up with, and their module docs for what was deliberately left un-migrated
+/// (`nav/walker.rs`'s internal goto state machine; `eq_net::gameplay`'s camp/respawn drain).
 #[derive(Clone, Default)]
 pub struct CommandState {
     combat:    crate::ipc::CombatSlots,
@@ -90,17 +90,11 @@ pub struct CommandState {
     trainer:   crate::ipc::TrainerSlots,
     social:    crate::ipc::SocialSlots,
     chat:      crate::ipc::ChatSlots,
-    /// Not yet migrated (Wave-2 fan-out stub, see `nav.rs`) — no `request_*`/`take_*` reads this yet.
-    #[allow(dead_code)]
     nav:       crate::ipc::NavSlots,
-    /// Not yet migrated (Wave-2 fan-out stub, see `lifecycle.rs`).
-    #[allow(dead_code)]
     lifecycle: crate::ipc::LifecycleSlots,
     /// Camera's ONLY command slot (the manual-move/jump escape hatch). `CameraSlots` as a whole is
     /// deliberately NOT held here: it has no `Default` (its snapshot's initial value is meaningful)
     /// and its other fields are read-path. Held as the lone Arc so `CommandState` stays `Default`.
-    /// Not yet migrated (Wave-2 fan-out stub, see `camera.rs`).
-    #[allow(dead_code)]
     camera_manual_move: crate::ipc::ManualMoveReq,
 }
 
