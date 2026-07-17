@@ -2477,6 +2477,16 @@ impl ActionLoop {
                 tracing::info!("zone_cross: same-zone translocator index={index} → server keeps position (sentinel)");
             }
             gs.log_msg("zone", "Using an in-zone teleport");
+            // STOP the walker (#508). The crossing we were asked to make already happened: the
+            // translocator repositioned us in-zone. But the walker's `goto_target` still points at
+            // the pre-cross goal (the zone-line coords `drain_zone_cross` walked us to, or a `/goto`
+            // beyond it), and the reposition just TELEPORTED us elsewhere in the zone — so that path
+            // is now stale. Resuming it walks us across a DIFFERENT zone's real DRNTP line and dumps
+            // us in a zone we never requested (qeynos2 → drifts into qeynos). Clear the nav
+            // destination so nav terminates honestly (idle) at the reposition; a caller that wants to
+            // keep moving re-issues a fresh /goto. A genuine CROSS-zone crossing takes the `else`
+            // branch below and is untouched — it zones and its post-zone nav is separate.
+            self.command.request_stop();
             true
         } else {
             tracing::info!("zone_cross: in zone-line region index={index} → zone_id={dest_zone}");
@@ -2921,10 +2931,18 @@ mod tests {
         let mut gs = GameState::new();
         gs.zone_id = HERE;
         gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0; // standing on the trigger region
+        // The walker was walking to the zone-line goal (`drain_zone_cross` issues a /goto to it).
+        nav.command.request_goto((-455.0, -174.0, 30.0));
         let same = nav.perform_cross(&mut stream, &mut gs, 100, HERE, [111.0, 222.0, 33.0]);
         assert!(same, "dest==current must be handled as a same-zone cross");
         assert_eq!([gs.player_x, gs.player_y, gs.player_z], [111.0, 222.0, 33.0],
             "same-zone cross must reposition the player to the arrival so it leaves the region (#368)");
+        // #508: the crossing is DONE — the translocator repositioned us in-zone. The stale zone-line
+        // goal must be cleared so the walker does NOT resume toward it and drift across a DIFFERENT
+        // zone's real line (qeynos2 → qeynos). Mutation check: delete `self.command.request_stop()`
+        // in `perform_cross`'s same-zone branch and this assertion goes RED.
+        assert_eq!(nav.command.goto_target(), None,
+            "a same-zone reposition must STOP nav — leaving the pre-cross goal set drifts into an adjacent zone (#508)");
         assert!(nav.take_same_zone_reposition(),
             "same-zone cross must flag the echo so the receive side skips the world reconnect (#368)");
         // Flag is consume-once.
@@ -2937,10 +2955,15 @@ mod tests {
         let mut gs2 = GameState::new();
         gs2.zone_id = HERE;
         gs2.player_x = 7.0; gs2.player_y = 8.0; gs2.player_z = 9.0;
+        // A genuine cross-zone crossing must NOT be stopped by the #508 same-zone reset: it zones,
+        // and its post-zone nav is a separate concern. Seed a goto and confirm it SURVIVES.
+        nav2.command.request_goto((100.0, 200.0, 5.0));
         let same2 = nav2.perform_cross(&mut stream, &mut gs2, 200, OTHER, [111.0, 222.0, 33.0]);
         assert!(!same2, "dest!=current must be a cross-zone change");
         assert_eq!([gs2.player_x, gs2.player_y, gs2.player_z], [7.0, 8.0, 9.0],
             "a cross-zone cross must NOT locally reposition (the destination is in the other zone)");
+        assert_eq!(nav2.command.goto_target(), Some((100.0, 200.0, 5.0)),
+            "a genuine CROSS-zone crossing must NOT clear nav — only the same-zone reposition does (#508)");
         assert!(!nav2.take_same_zone_reposition(),
             "a cross-zone cross must NOT flag a reposition — it MUST world-reconnect");
     }
