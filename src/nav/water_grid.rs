@@ -124,14 +124,16 @@ impl WaterGrid {
         self.columns.iter()
     }
 
-    /// Resident memory in bytes, using the design's own accounting model (§5.4) so the harness
-    /// numbers are directly comparable to the doc's predicted budgets:
+    /// Estimated memory in bytes from the design's own accounting model (§5.4) so the harness
+    /// numbers are directly comparable to the doc's predicted budgets. This is a DESIGN-MODEL
+    /// ESTIMATE, not measured RSS: it mirrors the doc's derivation rather than
+    /// `size_of::<HashMap>()` internals (which vary by allocator/load-factor and are not what the
+    /// design budgeted against) and so UNDERCOUNTS real heap RSS by ~25–40%. Named `estimated_bytes`
+    /// for exactly that reason — do not read it as a measured resident-set figure.
     ///
     /// per column ≈ 4B surface + 2×8B inline intervals + len/flags ≈ 28B payload, ×2 for
-    /// sparse-hash overhead ⇒ ~56B/column; each span BEYOND the inline 2 adds 8B (also ×2). This
-    /// intentionally mirrors the doc's derivation rather than `size_of::<HashMap>()` internals, which
-    /// vary by allocator/load-factor and are not what the design budgeted against.
-    pub fn resident_bytes(&self) -> usize {
+    /// sparse-hash overhead ⇒ ~56B/column; each span BEYOND the inline 2 adds 8B (also ×2).
+    pub fn estimated_bytes(&self) -> usize {
         const INLINE_SPANS: usize = 2;
         let mut payload = 0usize;
         for c in self.columns.values() {
@@ -160,10 +162,10 @@ mod tests {
         g.insert(1, 1, WaterColumn { surface_z: -4.0, spans: vec![(-40.0, -16.0), (-9.0, -6.0)] });
         assert_eq!(g.wet_column_count(), 4);
         assert_eq!(g.span_count(), 5);
-        assert_eq!(g.resident_bytes(), 4 * (4 + 4 + 16) * 2);
+        assert_eq!(g.estimated_bytes(), 4 * (4 + 4 + 16) * 2);
         // A 3-span column adds one extra span beyond the inline 2 → +8B payload (×2 = +16B).
         g.insert(2, 2, WaterColumn { surface_z: -4.0, spans: vec![(-40.0, -30.0), (-20.0, -15.0), (-9.0, -6.0)] });
-        assert_eq!(g.resident_bytes(), 4 * (4 + 4 + 16) * 2 + (4 + 4 + 16 + 8) * 2);
+        assert_eq!(g.estimated_bytes(), 4 * (4 + 4 + 16) * 2 + (4 + 4 + 16 + 8) * 2);
     }
 
     #[test]

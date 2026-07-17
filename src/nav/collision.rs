@@ -823,8 +823,13 @@ impl Collision {
     /// * `nav_hi = min(surface − float_depth, ceiling_above − height − SKIN)`
     /// * `nav_lo = max(water_bottom, floor_below) + ε`
     ///
-    /// keeping only spans with `nav_hi ≥ nav_lo`. `UnboundedBelow` when a wet probe's water has no
-    /// bottom (`bottom_z` == None) — surfaced by the caller as a design-premise signal, never
+    /// keeping only spans with `nav_hi ≥ nav_lo`. The face-normal winding (`nz`) is KEPT, not
+    /// discarded: a segment whose TOP is an up-facing floor (`nz > 0`) AND whose BOTTOM is a
+    /// down-facing ceiling (`nz < 0`) is the INTERIOR of a solid (a thick submerged slab with
+    /// `.wtr` water painted through it — the water box does not cut holes around collision
+    /// geometry), so no span is emitted there (#534: discarding `nz` reported a node inside solid
+    /// rock as navigable — an agent-honesty defect). `UnboundedBelow` when a wet probe's water has
+    /// no bottom (`bottom_z` == None) — surfaced by the caller as a design-premise signal, never
     /// fabricated into a floor (design §5.2 STOP condition).
     fn build_water_column(&self, water: &crate::region_map::RegionMap,
         body: &crate::traversability::Body, e: f32, n: f32, zrange: (f32, f32)) -> WaterColumnResult {
@@ -861,20 +866,58 @@ impl Collision {
         for &(wb, ws) in &bands {
             surface_top = surface_top.max(ws);
             let mid = (wb + ws) * 0.5;
-            // Every solid surface (both windings) crossing the water band is a barrier plane.
+            // Every solid surface (both windings) crossing the water band is a barrier plane, KEPT
+            // with its face-normal sign (`nz`; see `column_surfaces`): nz>0 up-facing ⇒ solid
+            // immediately BELOW it, nz<0 down-facing ⇒ solid immediately ABOVE it. A free
+            // (navigable) segment is enclosed ABOVE by an "opener" (a ceiling nz<0, or the water
+            // surface) and BELOW by a "closer" (a floor nz>0, or the water bottom); a segment whose
+            // top is up-facing AND whose bottom is down-facing is the INTERIOR of a solid and emits
+            // no span (#534, design §5.1/§5.2). BOTH windings must agree before we suppress — a mere
+            // OR would delete genuine water under EQ's inverted-art normals (the #375 hazard: a
+            // down-facing surface can be a walkable inverted floor, not a ceiling).
             let solids = self.column_surfaces(e, n, mid, ws - mid + 1.0, mid - wb + 1.0);
-            let mut inner: Vec<f32> = solids.iter().map(|&(sz, _)| sz)
-                .filter(|&sz| sz > wb + 1e-3 && sz < ws - 1e-3).collect();
-            inner.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)); // desc
-            // Free segments = consecutive pairs of [ws, inner…, wb]. A segment whose TOP is `ws` is
-            // open to the surface (cap = swim plane); a segment capped by a barrier must clear it.
-            let mut boundaries = Vec::with_capacity(inner.len() + 2);
-            boundaries.push(ws);
+            // Partition by position. A solid FLUSH with a water bound is NOT dropped (that would
+            // replace its real winding with the open-water sentinel and let the enclosed-solid test
+            // misfire at the band edge — #534 review); instead its winding is FOLDED into that
+            // bound. A solid whose top is flush with / protrudes through the SURFACE (up-facing at
+            // ws) caps the band from above → the top bound becomes a closer, not an opener. A mound
+            // RESTING ON the water bottom (down-facing at wb — and water bottoms commonly sit ABOVE
+            // the true floor, so this is not exotic) puts solid above the bottom → the bottom bound
+            // becomes an opener. Inner solids keep their own winding.
+            let mut inner: Vec<(f32, f32)> = Vec::new();
+            let (mut top_capped, mut bottom_open) = (false, false);
+            for (sz, nz) in solids {
+                if sz >= ws - 1e-3 {                    // at / above the surface
+                    if nz > 0.0 { top_capped = true; }  //   up-facing ⇒ solid below the surface
+                } else if sz <= wb + 1e-3 {             // at / below the bottom
+                    if nz < 0.0 { bottom_open = true; } //   down-facing ⇒ solid above the bottom
+                } else {
+                    inner.push((sz, nz));               // genuinely inside the band
+                }
+            }
+            inner.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)); // desc by z
+            // Bound windings, CLAMPED to any flush solid (else the open-water defaults: surface is
+            // an opener, bottom is a closer). NOTE: a solid protruding MORE than the scan margin
+            // (~1u) above the surface is out of range and falls back to the open-water default — the
+            // remaining span is then the #375-accepted inverted-art ambiguity, handled at the
+            // reachability layer, not fabricated here.
+            let ws_nz = if top_capped { 1.0 } else { -1.0 };
+            let wb_nz = if bottom_open { -1.0 } else { 1.0 };
+            // Free segments = consecutive pairs of [(ws, ws_nz), inner…, (wb, wb_nz)]. A segment
+            // whose TOP is `ws` is open to the surface (cap = swim plane); one capped by a barrier
+            // must clear it.
+            let mut boundaries: Vec<(f32, f32)> = Vec::with_capacity(inner.len() + 2);
+            boundaries.push((ws, ws_nz));
             boundaries.extend_from_slice(&inner);
-            boundaries.push(wb);
+            boundaries.push((wb, wb_nz));
             for w in boundaries.windows(2) {
-                let (seg_hi, seg_lo) = (w[0], w[1]);
+                let (seg_hi, hi_nz) = w[0];
+                let (seg_lo, lo_nz) = w[1];
                 if seg_hi - seg_lo < EPS { continue; }
+                // Enclosed solid interior: an up-facing floor on top and a down-facing ceiling below
+                // — no water here (thick submerged slab, surface-flush solid, bottom-resting mound;
+                // #534). Emit nothing.
+                if hi_nz > 0.0 && lo_nz < 0.0 { continue; }
                 let top_is_surface = (seg_hi - ws).abs() < 1e-3;
                 let ceiling_cap = if top_is_surface { f32::INFINITY }
                                   else { seg_hi - body.height - SKIN };
@@ -3253,6 +3296,140 @@ mod tests {
         assert!(lower2.1 > lower.1 + 1.0, "shorter body → higher navigable ceiling clearance");
     }
 
+    /// #534 (agent-honesty): a THICK submerged solid — a slab spanning z −10 → −20 — with `.wtr`
+    /// water painted straight through it (the water box does not cut holes around collision
+    /// geometry, so `is_water` is true even inside the rock). The face-normal windings say the
+    /// −10 → −20 gap is the INTERIOR of the solid, not water: NO navigable span may be emitted
+    /// there (a node inside solid rock is exactly the falsehood the invariant forbids). The genuine
+    /// water ABOVE the slab (−10 → surface) and BELOW it (−44 → −20) MUST still be navigable.
+    ///
+    /// Mutation check: revert the `nz` winding fix in `build_water_column` (discard `nz`, treat
+    /// every inter-solid gap as water) and the false interior span (−19.95, −16.05) — feet inside
+    /// the rock — reappears, tripping the "no span inside the solid" assertion below. The count
+    /// also jumps 2 → 3. Both go RED, so the test cannot pass both ways.
+    #[test]
+    fn water_grid_thick_submerged_solid_emits_no_span_inside_the_rock() {
+        let body = crate::traversability::PLAYER_BODY;
+        // A solid slab from −20 (down-facing underside) to −10 (up-facing top), inside a −44…−4
+        // water band. Same z-extent walls as the pool/ceiling fixtures so the water AABB reaches
+        // the surface. The interior probe column (east 30) never crosses the walls.
+        let assets = ZoneAssets {
+            terrain: vec![
+                slab(-44.0, 0.0, 64.0, 0.0, 64.0, true),   // pool floor (up-facing)
+                slab(-10.0, 0.0, 64.0, 0.0, 64.0, true),   // TOP of the submerged solid (up-facing floor)
+                slab(-20.0, 0.0, 64.0, 0.0, 64.0, false),  // UNDERSIDE of the submerged solid (down-facing)
+                wall_east(0.0, -44.0, 0.0), wall_east(64.0, -44.0, 0.0), // z-extent walls (to surface)
+            ],
+            objects: vec![], textures: vec![],
+        };
+        let mut col = Collision::build(&assets, 4.0);
+        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::water_slab(-44.0, -4.0))));
+        let c = col.build_water_grid(&body).column_at(30.0, 30.0).cloned()
+            .expect("the interior column is wet (water is painted through the slab)");
+
+        // THE #534 INVARIANT: no navigable span may intersect the solid interior [−20, −10].
+        for &(lo, hi) in &c.spans {
+            assert!(hi <= -20.0 + 1e-3 || lo >= -10.0 - 1e-3,
+                "span ({lo}, {hi}) intrudes into the solid interior [−20, −10] — a node inside rock (#534)");
+        }
+        // Water ABOVE the slab is navigable: feet just over the −10 top (−9.95) up to the swim
+        // plane (surface − float_depth = −6). Analytic from fixture constants, NOT read back.
+        let above = c.spans.iter().find(|&&(lo, _)| lo > -10.0 - 0.2)
+            .expect("the water above the slab must be navigable");
+        assert!((above.0 - (-9.95)).abs() < 0.2 && (above.1 - (-6.0)).abs() < 0.2,
+            "above-slab span ≈ (−9.95, −6.0), got {above:?}");
+        // Water BELOW the slab is navigable: feet from the pool floor (−43.95) up to where the
+        // body top clears the −20 underside (ceiling − height − SKIN = −26.05). Mutation-sensitive
+        // to body.height, mirroring the two-span ceiling test.
+        let below = c.spans.iter().find(|&&(_, hi)| hi < -20.0)
+            .expect("the water below the slab must be navigable");
+        assert!((below.0 - (-43.95)).abs() < 0.2 && (below.1 - (-26.05)).abs() < 0.2,
+            "below-slab span ≈ (−43.95, −26.05), got {below:?}");
+        assert_eq!(c.spans.len(), 2, "exactly two spans (above + below the solid), got {:?}", c.spans);
+    }
+
+    /// #534 review, CASE A — a solid whose top is FLUSH WITH THE SURFACE (a rock breaking the
+    /// waterline): slab top at −4 (== surface), underside at −20, in a −44…−4 water band. The
+    /// `sz > wb+ε && sz < ws−ε` filter drops the up-facing top (it sits AT ws), so a naive opener
+    /// sentinel would re-admit the −4…−20 interior as water. The winding of the flush surface must
+    /// be folded into the top bound (up-facing ⇒ solid below ⇒ the surface is a CLOSER), so NO span
+    /// is emitted inside the rock; only the water BELOW the slab (−20…−44) is navigable.
+    ///
+    /// Mutation check: drop the flush-surface clamp (top bound reverts to a plain opener) and the
+    /// false span (−19.95, −6.0) — feet inside the rock, spanning from just below the surface down
+    /// into the slab — reappears, tripping the interior assertion and the count (1 → 2). RED.
+    #[test]
+    fn water_grid_solid_flush_with_surface_emits_no_span_inside_it() {
+        let body = crate::traversability::PLAYER_BODY;
+        let assets = ZoneAssets {
+            terrain: vec![
+                slab(-44.0, 0.0, 64.0, 0.0, 64.0, true),   // pool floor (up-facing)
+                slab(-4.0, 0.0, 64.0, 0.0, 64.0, true),    // solid TOP flush with the surface (up-facing)
+                slab(-20.0, 0.0, 64.0, 0.0, 64.0, false),  // its underside (down-facing)
+                wall_east(0.0, -44.0, 0.0), wall_east(64.0, -44.0, 0.0),
+            ],
+            objects: vec![], textures: vec![],
+        };
+        let mut col = Collision::build(&assets, 4.0);
+        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::water_slab(-44.0, -4.0))));
+        let c = col.build_water_grid(&body).column_at(30.0, 30.0).cloned()
+            .expect("the interior column is wet");
+
+        // No span may intersect the solid interior [−20, −4].
+        for &(lo, hi) in &c.spans {
+            assert!(hi <= -20.0 + 1e-3,
+                "span ({lo}, {hi}) intrudes into the surface-flush solid [−20, −4] — a node inside rock (#534)");
+        }
+        // Only the water below the slab is navigable: floor (−43.95) up to body-top clearance of the
+        // −20 underside (ceiling − height − SKIN = −26.05).
+        let below = c.spans.iter().find(|&&(_, hi)| hi < -20.0)
+            .expect("the water below the surface-flush solid must be navigable");
+        assert!((below.0 - (-43.95)).abs() < 0.2 && (below.1 - (-26.05)).abs() < 0.2,
+            "below-slab span ≈ (−43.95, −26.05), got {below:?}");
+        assert_eq!(c.spans.len(), 1, "exactly one span (below the solid), got {:?}", c.spans);
+    }
+
+    /// #534 review, CASE B — a submerged MOUND resting on the water bottom (a lakebed lump): its
+    /// up-facing top at −20, its underside FLUSH WITH THE BOTTOM at −44 (water bottoms commonly sit
+    /// above the true floor, so a mound bottoms out ON the water floor — the COMMON case). The
+    /// filter drops the down-facing underside (it sits AT wb), so a naive closer sentinel would
+    /// re-admit the −20…−44 mound interior as water. The flush underside's winding must be folded
+    /// into the bottom bound (down-facing ⇒ solid above ⇒ the bottom is an OPENER), so NO span is
+    /// emitted inside the mound; only the water ABOVE it (−4…−20) is navigable.
+    ///
+    /// Mutation check: drop the flush-bottom clamp (bottom bound reverts to a plain closer) and the
+    /// false span (−43.95, −26.05) — feet inside the mound — reappears, tripping the interior
+    /// assertion and the count (1 → 2). RED.
+    #[test]
+    fn water_grid_mound_resting_on_the_bottom_emits_no_span_inside_it() {
+        let body = crate::traversability::PLAYER_BODY;
+        let assets = ZoneAssets {
+            terrain: vec![
+                slab(-20.0, 0.0, 64.0, 0.0, 64.0, true),   // mound TOP (up-facing floor)
+                slab(-44.0, 0.0, 64.0, 0.0, 64.0, false),  // mound underside flush with the bottom (down-facing)
+                wall_east(0.0, -44.0, 0.0), wall_east(64.0, -44.0, 0.0),
+            ],
+            objects: vec![], textures: vec![],
+        };
+        let mut col = Collision::build(&assets, 4.0);
+        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::water_slab(-44.0, -4.0))));
+        let c = col.build_water_grid(&body).column_at(30.0, 30.0).cloned()
+            .expect("the interior column is wet");
+
+        // No span may intersect the mound interior [−44, −20].
+        for &(lo, hi) in &c.spans {
+            assert!(lo >= -20.0 - 1e-3,
+                "span ({lo}, {hi}) intrudes into the mound interior [−44, −20] — a node inside rock (#534)");
+        }
+        // Only the water above the mound is navigable: feet just over the −20 top (−19.95) up to the
+        // swim plane (surface − float_depth = −6).
+        let above = c.spans.iter().find(|&&(lo, _)| lo > -20.0 - 0.2)
+            .expect("the water above the mound must be navigable");
+        assert!((above.0 - (-19.95)).abs() < 0.2 && (above.1 - (-6.0)).abs() < 0.2,
+            "above-mound span ≈ (−19.95, −6.0), got {above:?}");
+        assert_eq!(c.spans.len(), 1, "exactly one span (above the mound), got {:?}", c.spans);
+    }
+
     // ─── RETRACTED at D-2 (#375): three old #329 guards whose premise qcat falsified ───
     //
     // `nearest_floor_never_returns_a_ceiling`, `fallback_never_admits_a_ceiling_whose_floor_is_below_
@@ -4797,8 +4974,8 @@ mod tests {
     ///   cargo test --lib fine_tier_corpus -- --ignored --nocapture
     /// ```
     /// SLICE-1 MEASUREMENT HARNESS (3D-water-volume nav design §5.4 / §11): for the gate zones, report
-    /// the water-span grid's wet-column count, total span count, resident MEMORY (bytes, design §5.4
-    /// accounting model) and BUILD COST (median wall-clock ms). These are the eager-vs-lazy build
+    /// the water-span grid's wet-column count, total span count, ESTIMATED MEMORY (bytes, design §5.4
+    /// accounting model — a model estimate, not measured RSS) and BUILD COST (median wall-clock ms). These are the eager-vs-lazy build
     /// numbers that decide owner decision #5 (§5.3). `unbounded↓` counts candidate columns whose water
     /// had no queryable bottom (`bottom_z` == None) — a design-premise signal (§5.2), expected 0.
     ///
@@ -4821,7 +4998,7 @@ mod tests {
         let body = crate::traversability::PLAYER_BODY;
 
         println!("\n{:<12} {:>10} {:>8} {:>12} {:>10} {:>11}",
-            "zone", "wet cols", "spans", "bytes", "build ms", "unbounded↓");
+            "zone", "wet cols", "spans", "est bytes", "build ms", "unbounded↓");
         for zone in &zones {
             let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
             let Ok(za) = ZoneAssets::from_glb(&p) else { println!("{zone:<12}  (no glb — skipped)"); continue };
@@ -4843,7 +5020,7 @@ mod tests {
             times.sort_unstable();
             let median_ms = times[times.len() / 2] as f64 / 1000.0;
             println!("{zone:<12} {:>10} {:>8} {:>12} {:>10.1} {:>11}",
-                grid.wet_column_count(), grid.span_count(), grid.resident_bytes(),
+                grid.wet_column_count(), grid.span_count(), grid.estimated_bytes(),
                 median_ms, grid.unbounded_below_count());
         }
     }
