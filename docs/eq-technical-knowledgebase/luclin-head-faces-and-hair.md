@@ -81,9 +81,17 @@ generalizes.)
   geometry is generated (the old "hair shell" hack is removed).
 - **Client** (`models.rs`): `HeadPart::Face(F)` / `HeadPart::Hair(Option<F>)`;
   visibility keyed by `spawn.face`; `Hair` prims tinted by
-  `hair_tint(spawn.haircolor)` (>=24 → no tint). We tint ALL races (superset of
-  the real client's race gate — product decision so haircolor is visible;
-  haircolor 0xFF/unset renders the authentic neutral base).
+  `hair_tint(spawn.haircolor)` (>=24 → no tint), **gated to the native client's
+  race subset** (`head::hair_tint_applies`: HIE/DKE/HEF both genders + female
+  DWF). We previously tinted ALL races ("product decision so haircolor is
+  visible") — that superset was #519's root cause: on HUM male, haircolor 0
+  multiplied the skin-toned scalp AND the rigid eye-band triangles (which the
+  converter's all-verts-on-`HEHEAD` split classifies as "hair" because the
+  brow/eye-socket band binds only to the head bone, not any facial bone) by
+  RGB(46,26,12), painting a near-black scalp cap and a dark "raccoon-mask"
+  band across the eyes. With the native gate the misclassification is invisible
+  (hair and face prims share the same hesk texture; the split exists only to
+  carry tint).
 - `hairstyle` is accepted on the wire but intentionally selects nothing.
 
 ## Related

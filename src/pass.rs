@@ -482,7 +482,8 @@ pub fn encode_player_pass(
                         _ => mesh.base_color,
                     };
                     // Runtime-tint synthetic hair shells by the player's hair color (eqoxide#98).
-                    let tint = crate::models::head_part_tint(model.head_parts[i], scene.player_haircolor)
+                    let tint = crate::models::head_part_tint(model.head_parts[i], scene.player_haircolor,
+                        &scene.player_race, scene.player_gender)
                         .unwrap_or(tint);
                     r.queue.write_buffer(
                         &r.entity_uniform_pool[i].0, 0,
@@ -624,7 +625,8 @@ pub fn encode_player_pass(
                         _ => mesh.base_color,
                     };
                     // Runtime-tint synthetic hair shells by the player's hair color (eqoxide#98).
-                    let tint = crate::models::head_part_tint(model.head_parts[i], scene.player_haircolor)
+                    let tint = crate::models::head_part_tint(model.head_parts[i], scene.player_haircolor,
+                        &scene.player_race, scene.player_gender)
                         .unwrap_or(tint);
                     r.queue.write_buffer(
                         &r.entity_uniform_pool[i].0, 0,
@@ -782,7 +784,7 @@ pub fn encode_entity_pass(
             // Runtime-tint synthetic hair shells by the NPC's hair color (eqoxide#98) — unless the
             // whole model is dead-greyed or target-highlighted (those overrides win).
             let tint = if !b.dead && !b.is_target {
-                crate::models::head_part_tint(model.head_parts[mesh_idx], b.haircolor).unwrap_or(tint)
+                crate::models::head_part_tint(model.head_parts[mesh_idx], b.haircolor, &b.race, b.gender).unwrap_or(tint)
             } else { tint };
             r.queue.write_buffer(
                 &r.entity_uniform_pool[slot].0, 0,
@@ -930,7 +932,7 @@ pub fn encode_skinned_entity_pass(
             // Runtime-tint synthetic hair shells by the NPC's hair color (eqoxide#98) — unless the
             // whole model is dead-greyed or target-highlighted (those overrides win).
             let tint = if !b.dead && !b.is_target {
-                crate::models::head_part_tint(model.head_parts[mesh_idx], b.haircolor).unwrap_or(tint)
+                crate::models::head_part_tint(model.head_parts[mesh_idx], b.haircolor, &b.race, b.gender).unwrap_or(tint)
             } else { tint };
             r.queue.write_buffer(
                 &r.entity_uniform_pool[u_slot].0, 0,
