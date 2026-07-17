@@ -3077,6 +3077,80 @@ mod tests {
     use super::*;
     use crate::assets::{MeshData, RenderMode, ZoneAssets};
 
+    /// #522 diagnostic: dump every collision surface in the vertical columns at the two live
+    /// measurement points on the Kelethin plank (Acceptancetest at (-126.375,-15.875) holding
+    /// z=73.97; native Katie at (-138.5,-17.5) reporting z=77.0). Decides fork (a) controller
+    /// floor-selection bug vs (b) collision-model error.
+    /// Run: ZONE_GLB=~/.local/share/eqoxide/assets/models/gfaydark.glb \
+    ///      cargo test --lib diagnose_522_kelethin_plank_columns -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires the cached gfaydark glb at $ZONE_GLB"]
+    fn diagnose_522_kelethin_plank_columns() {
+        let p = std::env::var("ZONE_GLB").expect("set ZONE_GLB to the cached gfaydark glb");
+        let za = ZoneAssets::from_glb(std::path::Path::new(&p)).unwrap();
+        let col = Collision::build(&za, 32.0);
+        eprintln!("collision: from_collision_mesh={} grid {}x{} cell={}",
+            col.from_collision_mesh, col.cols, col.rows, col.cell_size);
+        for (label, e, n) in [
+            ("Acceptancetest (-126.375,-15.875)", -126.375f32, -15.875f32),
+            ("Katie          (-138.5,-17.5)", -138.5f32, -17.5f32),
+        ] {
+            eprintln!("\n=== {label} ===");
+            // ALL surfaces (facing-blind, unfiltered) in a wide band around the plank.
+            let all = col.column_surfaces(e, n, 80.0, 40.0, 120.0);
+            eprintln!("  raw surfaces (z, nz): {:?}", all);
+            // Standable floors only.
+            let floors = col.column_floors(e, n, 80.0, 40.0, 120.0);
+            eprintln!("  standable floors: {:?}", floors);
+            // What the walker's grounded clamp sees from each hypothesis height.
+            for foot in [77.1f32, 77.0, 76.9, 74.0, 73.97] {
+                let g = col.ground_below(e, n, foot + 1.0, 200.0);
+                let nf = col.nearest_floor(e, n, foot, 3.0, 8.0);
+                eprintln!("  foot={foot:>6.2}: ground_below(origin=foot+1)={g:?} nearest_floor(±3/8)={nf:?}");
+            }
+        }
+    }
+
+    /// #522 diagnostic 2: measure wire-z minus collision-floor for a batch of LIVE server
+    /// entities (sampled from /v1/observe/entities in gfaydark, 2026-07-17). EQEmu FixZ places
+    /// NPCs at floor + Mob::GetZOffset(); if the deltas cluster ~3.1, the wire z datum is
+    /// floor+offset, not foot level.
+    #[test]
+    #[ignore = "requires the cached gfaydark glb at $ZONE_GLB"]
+    fn diagnose_522_npc_wire_z_vs_collision_floor() {
+        let p = std::env::var("ZONE_GLB").expect("set ZONE_GLB to the cached gfaydark glb");
+        let za = ZoneAssets::from_glb(std::path::Path::new(&p)).unwrap();
+        let col = Collision::build(&za, 32.0);
+        let samples: &[(&str, f32, f32, f32)] = &[
+            ("Katie(native PC)", -138.5, -17.5, 77.0),
+            ("Merchant_Nildar", 205.0, 867.0, 77.0),
+            ("Zelli_Starsfire", 245.0, -622.0, 77.0),
+            ("Astar_Leafsinger", 294.0, -253.0, 77.0),
+            ("Merchant_Tilluen", 271.0, -85.0, 77.0),
+            ("Serilia_Whistlewind", 268.0, -276.0, 77.0),
+            ("Merchant_Lanin", 329.0, 414.0, 77.0),
+            ("Hendricks", -550.0, -537.0, 161.0),
+            ("Geeda", -145.0, -566.0, 161.0),
+            ("Devin_Ashwood", 395.0, -1.25, 161.0),
+            ("Laren", -333.0, -362.0, 161.0),
+            ("Guard_Treestrider", -528.5, -408.125, 161.0),
+            ("Captain_Silverwind", 63.875, -326.125, 118.125),
+            ("Cerila_Windrider", 477.0, -430.0, 117.5),
+            ("Ran_Sunfire", 496.0, -461.0, 114.875),
+            ("a_black_wolf046", 1460.875, -1403.625, -13.375),
+            ("a_black_wolf050", 1300.125, -661.375, -4.75),
+            ("a_giant_wasp_worker037", 246.5, -891.875, 29.625),
+            ("a_decaying_skeleton007", -613.25, 567.375, -37.125),
+            ("Guard_Sunblaze", -117.5, 776.375, -5.25),
+            ("orc_centurion065", 1575.25, 1706.375, 36.625),
+        ];
+        for &(name, x, y, z) in samples {
+            let nf = col.nearest_floor(x, y, z, 10.0, 20.0);
+            let delta = nf.map(|f| z - f);
+            eprintln!("{name:>24} wire_z={z:>8.3} floor={nf:?} wire-floor={delta:?}");
+        }
+    }
+
     /// Test helper: the HONEST outcome of the default whole-zone plan (#337/#356). Mirrors
     /// [`Collision::find_path`]'s simple signature, but returns the [`PlanOutcome`] that distinguishes
     /// a definitive `Unreachable` ("no route exists") from an `Exhausted` search ("I gave up") — the

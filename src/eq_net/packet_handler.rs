@@ -844,9 +844,16 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
     let Some(upd) = decode_position_update(payload) else { return; };
     let sid = upd.spawn_id as u32;
     if sid == gs.player_id {
+        // The wire z is the MODEL-ORIGIN datum ~3.1u above the feet; our own gs.player_z (mirrored
+        // from the controller) is FOOT level, so convert at this boundary (#522). Without this a
+        // server reposition (`#goto`, translocator) arrives 3.1u above the floor: the controller
+        // then "falls" the offset, re-streams its foot z, and the two datums fight a permanent ~3u
+        // standoff (#516's "contested Z" — both sides were right, in different datums). Entity
+        // positions (the else-branch) stay in wire datum; the render layer floor-snaps them.
+        let z_foot = upd.z - crate::coord::WIRE_Z_OFFSET;
         let dx = upd.x - gs.player_x;
         let dy = upd.y - gs.player_y;
-        let dz = upd.z - gs.player_z;
+        let dz = z_foot - gs.player_z;
         // Small deltas during movement are NORMAL client/server sync lag (≈ run speed × update
         // interval, so up to ~6u) — they only adjust the logical position (the visual is driven by
         // the WASD override / lerp), so they don't jerk the character. Only surface + count GENUINE
@@ -860,13 +867,21 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         }
         gs.player_x = upd.x;
         gs.player_y = upd.y;
-        gs.player_z = upd.z;
+        gs.player_z = z_foot; // foot datum internally (#522)
         // Keep the player's heading live from real server position updates.
         gs.player_heading = upd.heading;
     } else if let Some(e) = gs.entities.get_mut(&sid) {
         e.x = upd.x;
         e.y = upd.y;
-        e.z = upd.z;
+        // Wire→foot datum (#522, see coord::WIRE_Z_OFFSET): the wire z is the model-origin datum
+        // ~3.1u above the feet, so subtract to store FOOT — the one datum everything internal uses
+        // (self gs.player_z, nav, collision) and every agent-facing position reports. Keeping
+        // entities in wire datum while self is foot would make /observe report two entities on one
+        // plank at heights 3u apart, and feed a 3u-high z into goto-by-name's nav goal (a goal-z/
+        // floor-tier mismatch that wedges nav). Floating entities (boats) skip the server's Z-offset
+        // (Mob::FixZ early-returns for boats — GravityBehavior::Floating), so their wire z is already
+        // surface-level; don't shift them or they sink into the water.
+        e.z = if e.floating { upd.z } else { upd.z - crate::coord::WIRE_Z_OFFSET };
         e.heading = upd.heading;
         e.animation = upd.animation;
         tracing::debug!("EQ: npc_pos id={} name={} pos=({:.1},{:.1},{:.1})", sid, e.name, e.x, e.y, e.z);
@@ -2359,7 +2374,7 @@ fn apply_bind_respawn(gs: &mut GameState, payload: &[u8]) {
     r.skip(4); // spawn_id / zone_id header (unused here)
     gs.player_x = r.f32();
     gs.player_y = r.f32();
-    gs.player_z = r.f32();
+    gs.player_z = r.f32() - crate::coord::WIRE_Z_OFFSET; // wire→foot datum (#522)
     // Real EQ revives a bind-respawned character at FULL HP. `apply_death` zeroed hp_pct and left
     // cur_hp/max_hp stale, so without this the HUD/API show a dead-but-full contradiction
     // (hp/hp_max full, hp_pct 0) until some later OP_HPUpdate happens to reconcile it (eqoxide#68).
@@ -2640,7 +2655,10 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
         gs.player_name    = info.name.clone();
         gs.player_x       = info.x;
         gs.player_y       = info.y;
-        gs.player_z       = info.z;
+        // Wire→foot datum conversion (#522, see coord::WIRE_Z_OFFSET): the spawn z is the
+        // model-origin datum ~3.1u above the floor. Converting here seeds the controller at
+        // (approximately) the collision floor, so zone-in no longer starts with a phantom 3u fall.
+        gs.player_z       = info.z - crate::coord::WIRE_Z_OFFSET;
         gs.player_heading = info.heading;
         gs.player_level   = info.level as u32;
         gs.player_race    = eq_race_to_code(info.race).to_string();
@@ -2684,19 +2702,26 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
         tracing::info!("EQ: player pet spawned id={} name='{}'", info.spawn_id, info.name);
     }
 
+    // Wire→foot datum (#522, see coord::WIRE_Z_OFFSET): the spawn z is the model-origin datum
+    // ~3.1u above the feet — subtract to store FOOT, the single datum used internally (self/nav/
+    // collision) and reported by every agent-facing position, so entities and self share one frame
+    // (see the else-branch in apply_position_update for the full rationale). Boats/floating entities
+    // skip the server Z-offset, so their wire z is already surface-level — leave it.
+    let floating = crate::eq_net::protocol::is_boat_race(info.race);
+    let z_foot = if floating { info.z } else { info.z - crate::coord::WIRE_Z_OFFSET };
     gs.upsert_entity(Entity {
         spawn_id:       info.spawn_id,
         name:           info.name,
         level:          info.level as u32,
         is_npc,
-        x: info.x, y: info.y, z: info.z,
+        x: info.x, y: info.y, z: z_foot,
         // curHp in RoF2 Spawn_Struct is an HP percent (0..100), same as Titanium. A corpse is dead —
         // force 0 so the HUD/con logic agrees with the dead pose.
         hp_pct:         if is_corpse { 0.0 } else { (info.cur_hp as f32).min(100.0) },
         cur_hp:         if is_corpse { 0 } else { info.cur_hp as i32 },
         max_hp:         100, // RoF2 spawn has no separate max_hp; treat as percent
         race:           eq_race_to_code(info.race).to_string(),
-        floating:       crate::eq_net::protocol::is_boat_race(info.race),
+        floating,
         heading:        info.heading,
         dead:           is_corpse,
         equipment:      info.equipment,
@@ -5827,7 +5852,10 @@ mod tests {
         assert_eq!(gs.player_id, 12);
         assert!((gs.player_x - 200.0).abs() < 0.2);
         assert!((gs.player_y - (-50.0)).abs() < 0.2);
-        assert!((gs.player_z - 10.0).abs() < 0.2);
+        // The self-spawn z (10.0) is the WIRE (model-origin) datum; register_spawn converts it to
+        // the internal FOOT datum by subtracting WIRE_Z_OFFSET (#522).
+        assert!((gs.player_z - (10.0 - crate::coord::WIRE_Z_OFFSET)).abs() < 0.2,
+            "self-spawn z is stored FOOT-relative (wire − WIRE_Z_OFFSET), got {}", gs.player_z);
     }
 
     #[test]
