@@ -846,7 +846,20 @@ fn apply_task_select_window(gs: &mut GameState, p: &[u8]) {
 // ── Per-opcode helpers ────────────────────────────────────────────────────────
 
 fn apply_new_spawn(gs: &mut GameState, payload: &[u8]) {
-    if let Some((info, _)) = parse_rof2_spawn(payload) {
+    let (info, _) = match parse_rof2_spawn(payload) {
+        Some(v) => v,
+        // AGENT-HONESTY (#407): surface a failed OP_NewSpawn parse instead of silently discarding it.
+        None => {
+            let preview_end = 32.min(payload.len());
+            tracing::warn!(
+                "EQ: OP_NewSpawn FAILED to parse ({} byte payload) — this entity is MISSING from the \
+                 roster (agent-honesty #407). First bytes: {:02x?}",
+                payload.len(), &payload[..preview_end]
+            );
+            return;
+        }
+    };
+    {
         let name = info.name.clone();
         // If this new spawn is an NPC corpse, queue it for auto-looting. (The dead/Lying flagging that
         // lays the corpse down is now done for ALL spawn paths inside `register_spawn` — #253.)
@@ -1009,13 +1022,39 @@ fn apply_new_zone(gs: &mut GameState, payload: &[u8]) {
 fn apply_zone_spawns(gs: &mut GameState, payload: &[u8]) {
     // RoF2 OP_ZoneSpawns: stream of variable-length spawn records.
     let mut offset = 0usize;
+    let mut registered = 0usize;
     while offset < payload.len() {
         match parse_rof2_spawn(&payload[offset..]) {
             Some((info, consumed)) => {
                 register_spawn(gs, info);
                 offset += consumed;
+                registered += 1;
+                // A zero-length parse would spin forever — treat it as a desync and stop loudly.
+                if consumed == 0 {
+                    tracing::warn!(
+                        "EQ: OP_ZoneSpawns parse consumed 0 bytes at offset {offset} — stopping to \
+                         avoid an infinite loop ({registered} spawn(s) registered so far)"
+                    );
+                    break;
+                }
             }
-            None => break,
+            // AGENT-HONESTY (#407): a variable-length record failed to parse. Spawn records have no
+            // length prefix, so we cannot resync to the next record boundary — but we MUST NOT drop
+            // the remaining roster SILENTLY. A silent `break` here is exactly the "world model is
+            // silently incomplete" failure the honesty invariant forbids: an agent asks for an
+            // in-zone NPC and is told it doesn't exist. Surface the drop loudly (with a byte preview)
+            // so a debug run pinpoints the offending record instead of the roster just going short.
+            None => {
+                let rem = payload.len() - offset;
+                let preview_end = (offset + 32).min(payload.len());
+                tracing::warn!(
+                    "EQ: OP_ZoneSpawns parse FAILED on the record at offset {offset} of {} \
+                     ({rem} bytes remain) after registering {registered} spawn(s) — the rest of \
+                     this packet's roster is DROPPED (agent-honesty #407). First bytes: {:02x?}",
+                    payload.len(), &payload[offset..preview_end]
+                );
+                break;
+            }
         }
     }
 }
@@ -1026,10 +1065,24 @@ fn apply_zone_entry(gs: &mut GameState, payload: &[u8]) {
     // one new EQApplicationPacket(OP_ZoneEntry, ...) containing a single Spawn_Struct
     // for each entity in the zone (rof2.cpp:4542/4575/4660). Register every one of
     // them; `register_spawn` handles player-self detection internally.
-    if let Some((info, _)) = parse_rof2_spawn(payload) {
-        tracing::debug!("EQ: ZONE_ENTRY spawn id={} name='{}' npc={} pos=({:.1},{:.1},{:.1})",
-            info.spawn_id, info.name, info.npc, info.x, info.y, info.z);
-        register_spawn(gs, info);
+    match parse_rof2_spawn(payload) {
+        Some((info, _)) => {
+            tracing::debug!("EQ: ZONE_ENTRY spawn id={} name='{}' npc={} pos=({:.1},{:.1},{:.1})",
+                info.spawn_id, info.name, info.npc, info.x, info.y, info.z);
+            register_spawn(gs, info);
+        }
+        // AGENT-HONESTY (#407): each OP_ZoneEntry carries exactly one spawn. If it fails to parse we
+        // used to `if let Some(..)` past it — the entity then vanished from the roster with NO signal
+        // (untargetable/unhailable though it's really in the zone and barking in chat). Log the drop
+        // loudly with a byte preview so it is diagnosable rather than a silent hole in the world model.
+        None => {
+            let preview_end = 32.min(payload.len());
+            tracing::warn!(
+                "EQ: OP_ZoneEntry spawn FAILED to parse ({} byte payload) — this entity is MISSING \
+                 from the roster (agent-honesty #407). First bytes: {:02x?}",
+                payload.len(), &payload[..preview_end]
+            );
+        }
     }
 }
 
@@ -4852,6 +4905,228 @@ mod tests {
         assert_eq!(e.name, "a_gnoll");
         assert!((e.x - 150.0).abs() < 0.2);
         assert!((e.y - (-100.0)).abs() < 0.2);
+    }
+
+    /// Build a minimal valid RoF2 NPC spawn record (non-playable race → 60-byte equipment block).
+    /// Shared by the #407 roster-completeness / honesty tests below.
+    fn build_npc_record(name: &str, id: u32, x: f32, y: f32, z: f32) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(name.as_bytes()); b.push(0);
+        b.extend_from_slice(&id.to_le_bytes());
+        b.push(10); // level
+        b.extend_from_slice(&5.0f32.to_le_bytes()); // bounding
+        b.push(1); // NPC=1
+        b.extend_from_slice(&0u32.to_le_bytes()); // bitfields
+        b.push(0); // OtherData (no title/suffix)
+        b.extend_from_slice(&0.0f32.to_le_bytes()); // unk3
+        b.extend_from_slice(&0.0f32.to_le_bytes()); // unk4
+        b.push(1); b.extend_from_slice(&1u32.to_le_bytes()); // props_count=1, bodytype=1
+        b.push(100); // curHp
+        b.extend_from_slice(&[0u8; 6]); // hair..beard
+        b.extend_from_slice(&[0u8; 12]); // drakkin
+        b.extend_from_slice(&[0, 0, 0, 0]); // equip_chest2..helm
+        b.extend_from_slice(&6.0f32.to_le_bytes()); // size
+        b.push(0); // face
+        b.extend_from_slice(&0.35f32.to_le_bytes()); // walkspeed
+        b.extend_from_slice(&0.7f32.to_le_bytes());  // runspeed
+        b.extend_from_slice(&54u32.to_le_bytes()); // race=54 (gnoll — non-playable, >12)
+        b.push(0); b.extend_from_slice(&[0u8; 12]); // holding, deity, guild, rank
+        b.extend_from_slice(&[1, 0, 100, 0, 0]); // class_, pvp, StandState, light, fly
+        b.push(0); // lastName\0
+        b.extend_from_slice(&[0u8; 6]); // aatitle, guild_show, TempPet
+        b.extend_from_slice(&0u32.to_le_bytes()); // petOwnerId
+        b.push(0); // FindBits
+        b.extend_from_slice(&64u32.to_le_bytes()); // PlayerState
+        b.extend_from_slice(&[0u8; 20]); // NpcTintIndex..unk (5×u32)
+        b.extend_from_slice(&[0u8; 60]); // non-playable equipment block
+        let (yp, xp, zp) = (enc_eq19(y), enc_eq19(x), enc_eq19(z));
+        b.extend_from_slice(&(yp << 12).to_le_bytes()); // word0: y
+        b.extend_from_slice(&0u32.to_le_bytes());        // word1: deltas
+        b.extend_from_slice(&xp.to_le_bytes());          // word2: x
+        b.extend_from_slice(&(zp << 10).to_le_bytes());  // word3: z
+        b.extend_from_slice(&100u32.to_le_bytes());       // word4: animation=100
+        b.extend_from_slice(&[0u8; 8]); // unknown20
+        b.push(0); // IsMercenary
+        b.extend_from_slice(b"0000000000000000\0"); // RealEstateItemGuid (17B)
+        b.extend_from_slice(&0xffffffffu32.to_le_bytes()); // RealEstateID
+        b.extend_from_slice(&0xffffffffu32.to_le_bytes()); // RealEstateItemID
+        b.extend_from_slice(&[0u8; 29]); // padding
+        b
+    }
+
+    /// Build a RoF2 NPC spawn whose `race` selects the PLAYABLE (216-byte) equipment branch:
+    /// 9×u32 tint (36B) + 9×Texture_Struct (20B each = 180B). Named races (guards, "Menkes Tabolet"
+    /// race 7, etc.) that are classic playable races (≤12) take THIS branch on the wire even as NPCs
+    /// — the branch the eq-client-expert flagged for #407. `mat0`/`mat8` seed slot 0 / slot 8 Material.
+    fn build_playable_npc_record(name: &str, id: u32, race: u32, mat0: u32, mat8: u32) -> Vec<u8> {
+        assert!(race <= 12 || matches!(race, 128 | 130 | 330 | 522), "must be a playable race");
+        let mut b = Vec::new();
+        b.extend_from_slice(name.as_bytes()); b.push(0);
+        b.extend_from_slice(&id.to_le_bytes());
+        b.push(15); // level
+        b.extend_from_slice(&5.0f32.to_le_bytes()); // bounding
+        b.push(1); // NPC=1
+        b.extend_from_slice(&0u32.to_le_bytes()); // bitfields
+        b.push(0); // OtherData
+        b.extend_from_slice(&0.0f32.to_le_bytes()); // unk3
+        b.extend_from_slice(&0.0f32.to_le_bytes()); // unk4
+        b.push(1); b.extend_from_slice(&1u32.to_le_bytes()); // props_count=1, bodytype=1
+        b.push(100); // curHp
+        b.extend_from_slice(&[0u8; 6]); // hair..beard
+        b.extend_from_slice(&[0u8; 12]); // drakkin
+        b.extend_from_slice(&[0, 0, 0, 0]); // equip_chest2..helm
+        b.extend_from_slice(&6.0f32.to_le_bytes()); // size
+        b.push(0); // face
+        b.extend_from_slice(&0.35f32.to_le_bytes()); // walkspeed
+        b.extend_from_slice(&0.7f32.to_le_bytes());  // runspeed
+        b.extend_from_slice(&race.to_le_bytes()); // race — selects the 216-byte branch
+        b.push(0); b.extend_from_slice(&[0u8; 12]); // holding, deity, guild, rank
+        b.extend_from_slice(&[1, 0, 100, 0, 0]); // class_, pvp, StandState, light, fly
+        b.push(0); // lastName\0
+        b.extend_from_slice(&[0u8; 6]); // aatitle, guild_show, TempPet
+        b.extend_from_slice(&0u32.to_le_bytes()); // petOwnerId
+        b.push(0); // FindBits
+        b.extend_from_slice(&64u32.to_le_bytes()); // PlayerState
+        b.extend_from_slice(&[0u8; 20]); // NpcTintIndex..unk (5×u32)
+        // PLAYABLE equipment block (216 bytes): 36B tint + 180B equipment.
+        b.extend_from_slice(&[0u8; 36]); // 9×u32 tint
+        for slot in 0..9u32 {
+            let mat = if slot == 0 { mat0 } else if slot == 8 { mat8 } else { 0 };
+            b.extend_from_slice(&mat.to_le_bytes()); // Material
+            b.extend_from_slice(&[0u8; 16]);         // 4×u32 padding
+        }
+        let (yp, xp, zp) = (enc_eq19(-10.0), enc_eq19(20.0), enc_eq19(3.0));
+        b.extend_from_slice(&(yp << 12).to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&xp.to_le_bytes());
+        b.extend_from_slice(&(zp << 10).to_le_bytes());
+        b.extend_from_slice(&100u32.to_le_bytes());
+        b.extend_from_slice(&[0u8; 8]); // unknown20
+        b.push(0); // IsMercenary
+        b.extend_from_slice(b"0000000000000000\0"); // RealEstateItemGuid
+        b.extend_from_slice(&0xffffffffu32.to_le_bytes());
+        b.extend_from_slice(&0xffffffffu32.to_le_bytes());
+        b.extend_from_slice(&[0u8; 29]);
+        b
+    }
+
+    /// #407 crux: a named NPC of a classic PLAYABLE race (e.g. "Menkes Tabolet", race 7 Half-Elf)
+    /// takes the 216-byte equipment branch on the wire, unlike a "citizen"-race merchant (race 71 →
+    /// 60-byte branch). The eq-client-expert suspected this branch was mis-sized and dropping those
+    /// NPCs. This asserts the 216-byte branch parses AND consumes the whole record — proving the
+    /// branch is byte-correct (so a live drop of these NPCs is a DELIVERY problem, not a parse one).
+    #[test]
+    fn playable_race_npc_216_equipment_branch_parses_fully() {
+        use crate::eq_net::protocol::parse_rof2_spawn;
+        use super::apply_zone_entry;
+
+        for (race, name, id) in [(1u32, "Hansl_Bigroon", 501), (3, "Danaria_Hollin", 502),
+                                 (7, "Menkes_Tabolet", 503)] {
+            let buf = build_playable_npc_record(name, id, race, 111, 222);
+            let (info, consumed) = parse_rof2_spawn(&buf)
+                .unwrap_or_else(|| panic!("race {race} NPC must parse (216-byte branch)"));
+            assert_eq!(consumed, buf.len(),
+                "race {race} must consume the WHOLE record — a short consume desyncs a bulk stream");
+            assert_eq!(info.race, race);
+            assert_eq!(info.equipment[0], 111, "slot 0 Material from the 216-byte block");
+            assert_eq!(info.equipment[8], 222, "slot 8 Material from the 216-byte block");
+
+            let mut gs = GameState::new();
+            gs.player_name = "Someone_Else".into();
+            apply_zone_entry(&mut gs, &buf);
+            assert!(gs.entities.contains_key(&id), "{name} (race {race}) must register");
+        }
+    }
+
+    /// #407 completeness: a multi-record OP_ZoneSpawns must register EVERY spawn in the packet, not
+    /// just the head. Guards against a `consumed`-desync or an early `break` silently truncating the
+    /// roster. (Mutation: cap the loop at one record, or mis-size `consumed`, and this goes RED.)
+    #[test]
+    fn zone_spawns_bulk_registers_entire_roster() {
+        use super::apply_zone_spawns;
+        let mut bulk = Vec::new();
+        bulk.extend_from_slice(&build_npc_record("guard_one", 201, 10.0, 20.0, 1.0));
+        bulk.extend_from_slice(&build_npc_record("guard_two", 202, 30.0, 40.0, 2.0));
+        bulk.extend_from_slice(&build_npc_record("guard_three", 203, 50.0, 60.0, 3.0));
+
+        let mut gs = GameState::new();
+        gs.player_name = "Someone_Else".into();
+        apply_zone_spawns(&mut gs, &bulk);
+
+        assert!(gs.entities.contains_key(&201), "first spawn registered");
+        assert!(gs.entities.contains_key(&202), "middle spawn registered");
+        assert!(gs.entities.contains_key(&203), "LAST spawn registered — tail not truncated");
+        assert_eq!(gs.entities.len(), 3, "all three spawns in the roster");
+    }
+
+    /// #407 agent-honesty: when a record in an OP_ZoneSpawns stream fails to parse, the roster is
+    /// truncated (no length prefix → can't resync), but that truncation must be LOUD, never silent.
+    /// This captures tracing output and asserts the drop is logged. (Mutation: revert to the old
+    /// silent `None => break` and the log — and this test — disappears → RED.)
+    #[test]
+    fn zone_spawns_parse_failure_is_logged_not_silent() {
+        use super::apply_zone_spawns;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct BufWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for BufWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
+            type Writer = BufWriter;
+            fn make_writer(&'a self) -> Self::Writer { self.clone() }
+        }
+
+        // Two valid records, then a truncated third that cannot parse.
+        let mut bulk = Vec::new();
+        bulk.extend_from_slice(&build_npc_record("guard_a", 301, 1.0, 2.0, 3.0));
+        bulk.extend_from_slice(&build_npc_record("guard_b", 302, 4.0, 5.0, 6.0));
+        let third = build_npc_record("guard_c", 303, 7.0, 8.0, 9.0);
+        bulk.extend_from_slice(&third[..third.len() - 40]); // truncated → parse returns None
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(BufWriter(log.clone()))
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        let mut gs = GameState::new();
+        gs.player_name = "Someone_Else".into();
+        tracing::subscriber::with_default(subscriber, || {
+            apply_zone_spawns(&mut gs, &bulk);
+        });
+
+        // Head still registered…
+        assert!(gs.entities.contains_key(&301) && gs.entities.contains_key(&302),
+            "records before the failure are registered");
+        assert!(!gs.entities.contains_key(&303), "the unparseable record is not registered");
+        // …and the truncation was surfaced LOUDLY, not swallowed.
+        let logged = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("agent-honesty #407"),
+            "a dropped spawn record MUST be logged, not silently truncated. Captured: {logged:?}");
+    }
+
+    /// #407 live per-packet path: OP_ZoneEntry delivers one spawn per packet, so a single
+    /// unparseable spawn must NOT remove or block the others. A garbage packet is skipped (loudly),
+    /// and spawns before and after it stay in the roster.
+    #[test]
+    fn zone_entry_bad_packet_does_not_truncate_roster() {
+        use super::apply_zone_entry;
+        let mut gs = GameState::new();
+        gs.player_name = "Someone_Else".into();
+
+        apply_zone_entry(&mut gs, &build_npc_record("before", 401, 1.0, 1.0, 1.0));
+        apply_zone_entry(&mut gs, &[0x01, 0x02, 0x03]); // unparseable — must not panic or wipe roster
+        apply_zone_entry(&mut gs, &build_npc_record("after", 402, 2.0, 2.0, 2.0));
+
+        assert!(gs.entities.contains_key(&401), "spawn before the bad packet survives");
+        assert!(gs.entities.contains_key(&402), "spawn after the bad packet still registers");
+        assert_eq!(gs.entities.len(), 2, "only the two valid spawns; the bad one is skipped");
     }
 
     /// A corpse that arrives as a fresh spawn (npc: 2=pc_corpse, 3=npc_corpse) never goes through
