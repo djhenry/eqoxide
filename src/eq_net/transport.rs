@@ -28,13 +28,21 @@ const RESEND_MAX_MS:  u64 = 5000;  // clamp ceiling (steady-state cadence on a d
 /// Cap on datagrams resent in a single go-back-N pass (EQEmu MAX_CLIENT_RECV_PACKETS_PER_WINDOW).
 const MAX_RESEND_PER_PASS: usize = 300;
 
-/// How often `connect` re-sends OP_SESSION_REQUEST while waiting for OP_SESSION_RESPONSE. The zone
-/// handoff (#335) removed the blind fixed pre-connect sleeps and now relies on this handshake being
-/// the real event-driven wait: when the target zone is a cold on-demand launcher that has not yet
-/// bound its listener, our first SESSION_REQUEST is dropped, and this cadence is how fast we retry
-/// until it answers. 250ms (was a hard-coded 1s) keeps a too-early connect self-healing quickly so
-/// the removed 800ms cushion is not needed even in the cold-zone case. SESSION_REQUEST is idempotent
-/// (the server dedupes), so a faster cadence is harmless.
+/// How often `connect` re-sends OP_SESSION_REQUEST while waiting for OP_SESSION_RESPONSE. This
+/// establishes ONLY the UDP session (the transport handshake) — it says nothing about whether the
+/// zone has yet ACCEPTED us at the application layer. That distinction is the whole subject of
+/// `docs/eq-technical-knowledgebase/zone-entry-handshake-race.md`: on the `zoning==1` reconnect path
+/// World fires OP_ZoneServerInfo optimistically and registers our zone auth out-of-band via a
+/// fire-and-forget TCP `ServerOP_ZoneIncClient` → `Zone::AddAuth`. A cold on-demand zone answers
+/// SESSION_RESPONSE as soon as its listener binds — which can be BEFORE that auth lands — so a fast
+/// session handshake here actually pushes OP_ZoneEntry out SOONER and WIDENS the auth race, not
+/// narrows it. This constant does NOT resolve that race, and neither `poll_resend` nor an app-level
+/// re-send can safely recover a lost race once the entry is session-ACKed (see `run_zone_entry_handshake`
+/// in gameplay.rs and zone-entry-duplicate-on-admitted-client.md — a second OP_ZoneEntry self-kicks an
+/// admitted client): a lost auth race is surfaced as an honest zone-in failure at the 30s deadline
+/// instead. This 250ms cadence (was a hard-coded 1s) only makes the SESSION come up promptly when our
+/// first SESSION_REQUEST is dropped; SESSION_REQUEST is idempotent (the server dedupes), so a faster
+/// cadence is harmless at the transport layer.
 const SESSION_REQUEST_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Backoff before the Nth retransmit of the oldest outstanding reliable packet: `RESEND_BASE_MS`
@@ -1070,14 +1078,17 @@ mod tests {
         );
     }
 
-    /// #335: the zone handoff dropped its blind fixed pre-connect sleeps (a 300ms + two 800ms) and
-    /// now leans on `connect`'s SESSION_REQUEST retry loop as the real event-driven wait. For that to
-    /// stay robust against a cold on-demand zone that has not yet bound its listener (our first
-    /// SESSION_REQUEST is dropped), the retry cadence must be sub-second — otherwise a too-early
-    /// connect stalls ~1s and we would have regressed the very case the 800ms cushion protected. This
-    /// counts the SESSION_REQUESTs a SILENT peer receives inside a 600ms window: at the 250ms cadence
-    /// that is 3 sends (t=0, 250, 500); at the old hard-coded 1s it would be just 1. Asserting >= 2
-    /// pins the fast-retry safety net in place.
+    /// #335: the zone handoff dropped its blind fixed pre-connect sleeps (a 300ms + two 800ms). This
+    /// pins the SESSION-layer half of what replaced them — that `connect` re-sends SESSION_REQUEST
+    /// sub-second so a cold on-demand zone whose listener has just bound comes up promptly (our first
+    /// SESSION_REQUEST may be dropped) instead of stalling ~1s. NOTE this is ONLY the transport
+    /// handshake; it does NOT wait for app-layer zone acceptance, and a faster cadence here can even
+    /// WIDEN the app-layer AddAuth race (`zone-entry-handshake-race.md`). That race is NOT rescued by a
+    /// second OP_ZoneEntry (which self-kicks an admitted client — `run_zone_entry_handshake`,
+    /// `zone-entry-duplicate-on-admitted-client.md`); a lost race becomes an honest 30s zone-in failure.
+    /// This counts the SESSION_REQUESTs a SILENT peer
+    /// receives inside a 600ms window: at the 250ms cadence that is 3 sends (t=0, 250, 500); at the old
+    /// hard-coded 1s it would be just 1. Asserting >= 2 pins the fast-retry cadence in place.
     #[tokio::test]
     async fn connect_retries_session_request_faster_than_once_a_second() {
         let net_health: crate::ipc::NetHealthShared = Default::default();
@@ -1114,7 +1125,8 @@ mod tests {
         assert!(
             count >= 2,
             "connect must re-send SESSION_REQUEST faster than once a second so a too-early connect to \
-             a cold zone self-heals (the #335 replacement for the removed 800ms pre-connect sleep); \
+             a cold zone brings its SESSION up promptly (#335 — the app-layer acceptance race is a \
+             separate concern, handled by run_zone_entry_handshake's honest 30s failure, not here); \
              saw only {count} in 600ms",
         );
     }

@@ -116,6 +116,11 @@ pub struct PlayerState {
     /// The player's own character name — so `/v1/observe/debug` identifies which char it drives (#109).
     pub name:         String,
     pub zone:         String,
+    /// #335/agent-honesty: the last in-game zone change FAILED — we connected to the new zone server
+    /// and sent OP_ZoneEntry but the handshake timed out (`zone-entry-handshake-race.md`). When true,
+    /// `zone` is EMPTY on purpose (we are not confidently in any zone) rather than reporting the zone
+    /// we came from, and the net thread is tearing down. Default false on every healthy reading.
+    pub zone_in_failed: bool,
     pub race:         String, // 3-letter race code, e.g. "ELF" (Wood Elf)
     pub class:        String, // class name, e.g. "Cleric"
     pub level:        u32,
@@ -208,6 +213,7 @@ impl PlayerState {
         PlayerState {
             name:       gs.player_name.clone(),
             zone:       gs.zone_name.clone(),
+            zone_in_failed: gs.zone_in_failed,
             race:       gs.player_race.clone(),
             class:      gs.player_class.clone(),
             level:      gs.player_level as u32,

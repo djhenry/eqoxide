@@ -519,6 +519,14 @@ pub struct GameState {
     pub zone_name: String,
     pub zone_id: u16,
     pub zone_changed: bool,
+    /// #335/agent-honesty: the last zone-entry handshake (an in-game zone change) TIMED OUT — we
+    /// connected to the new zone server and sent OP_ZoneEntry, but never got OP_NewZone → … →
+    /// OP_SendExpZonein back within the deadline (the `zone-entry-handshake-race.md` never-accepted
+    /// case). Set true only on that failure; `zone_name` is CLEARED alongside it so no agent reads the
+    /// OLD zone as the current one. Reset to false at the start of every zone-in by `begin_zone_in`.
+    /// Without this a wedged zone-in kept reporting `connected: true` + the previous `zone_name` — a
+    /// confident falsehood (#343/#470 anti-pattern).
+    pub zone_in_failed: bool,
     pub safe_x: f32,
     pub safe_y: f32,
     pub safe_z: f32,
@@ -782,6 +790,11 @@ impl GameState {
         // consider). Clear the whole target (id + name + hp + con) here, not just the entity map (#408).
         self.clear_target();
         self.new_zone_applied = false;
+        // A fresh zone-in attempt: clear any prior handshake-failure flag so it reflects only THIS
+        // attempt (#335). The flag is re-raised by `run_zone_entry_handshake` only if this one times
+        // out. `zone_name` is deliberately NOT cleared here — it stays showing the zone we came from
+        // for the renderer's loading screen; a FAILED handshake clears it (there, honestly).
+        self.zone_in_failed = false;
         // A cast cannot survive a zone change: the spawn ids, the cast bar and every packet that
         // would have explained the cast belong to the zone we just left. Carrying `casting` across
         // would report a cast in flight that can never end, and carrying `suppress_cast_end` would
