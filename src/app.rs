@@ -127,16 +127,14 @@ pub struct App {
     controller_view:  crate::ipc::ControllerShared,
     /// The nav planner's /goto movement intent, consumed when no WASD key is held.
     nav_intent:       crate::ipc::NavIntent,
-    /// HTTP manual-move / jump escape hatch (#188), consumed when no WASD key is held, with
-    /// priority over `nav_intent` while active.
-    manual_move:      crate::ipc::ManualMoveReq,
     /// A large server correction handed over by the nav streamer; applied to the controller.
     pos_correction:   crate::ipc::PosCorrection,
     /// Walker's live plan (coarse, fine), published by the nav thread; drawn by the nav-debug
     /// overlay so it shows what the walker actually follows, not a separate recompute (#246).
     nav_path_view:    crate::ipc::NavPathView,
-    /// Shared goto target — set by HTTP /move; cleared by the render thread on manual WASD
-    /// (so manual movement cancels navigation). WASD no longer writes a target here.
+    /// Shared goto target, kept ONLY as a read handle for the nav-debug overlay (`egui_pass`'s
+    /// `goto_target` param) — the render thread no longer WRITES this directly; cancelling a goto
+    /// goes through `self.acts.command.request_cancel_goto()` (#459), which shares this same Arc.
     goto_target:  crate::ipc::GotoTarget,
     /// All shared request slots UI windows write; the nav/gameplay threads drain
     /// and send them. One struct instead of a dozen fields (#162).
@@ -259,7 +257,6 @@ impl App {
         asset_pass:       String,
         controller_view:  crate::ipc::ControllerShared,
         nav_intent:       crate::ipc::NavIntent,
-        manual_move:      crate::ipc::ManualMoveReq,
         pos_correction:   crate::ipc::PosCorrection,
         nav_path_view:    crate::ipc::NavPathView,
     ) -> Self {
@@ -307,7 +304,7 @@ impl App {
             frame_profile: crate::profiling::FrameProfile::default(),
             keys_held: std::collections::HashSet::new(),
             controller: crate::movement::CharacterController::new([0.0, 0.0, 0.0]),
-            controller_view, nav_intent, manual_move, pos_correction, nav_path_view,
+            controller_view, nav_intent, pos_correction, nav_path_view,
             goto_target,
             acts, spells,
             drag_active: false, last_cursor: winit::dpi::PhysicalPosition::new(0.0, 0.0),
@@ -1124,14 +1121,14 @@ impl App {
             if wasd_active {
                 // Manual movement CANCELS any in-progress /goto (native behavior; fixes the
                 // "can't override a stalled nav" bug) before steering the controller this frame.
-                *self.goto_target.lock().unwrap() = None;
+                self.acts.command.request_cancel_goto();
                 *self.nav_intent.lock().unwrap() = None;
             }
             let space = self.keys_held.contains(&KeyCode::Space);
             // HTTP manual-move / jump escape hatch (#188): drive the controller like WASD when an
             // agent is stuck (A* found no path). Active only while within its deadline; yields to
             // real keyboard input, but takes priority over the nav planner's /goto intent.
-            let manual = { *self.manual_move.lock().unwrap() }
+            let manual = self.acts.command.peek_manual_move()
                 .filter(|m| std::time::Instant::now() < m.until);
             let intent = if wasd_active || space {
                 crate::movement::MoveIntent {
@@ -1145,7 +1142,7 @@ impl App {
                 }
             } else if let Some(m) = manual {
                 // Like WASD, manual drive cancels any in-progress /goto so it doesn't fight us.
-                *self.goto_target.lock().unwrap() = None;
+                self.acts.command.request_cancel_goto();
                 *self.nav_intent.lock().unwrap() = None;
                 let (wish, heading) = crate::movement::manual_wish(m.dir);
                 if let Some(h) = heading { self.heading_target = h; } // face where we walk
@@ -1482,7 +1479,7 @@ impl App {
             // auto-respawns, so a human needs a way to revive. Clicking sets the same respawn
             // request POST /v1/lifecycle/respawn drives.
             if hud::draw_death_overlay(ctx, scene.player_dead, &scene.killed_by) {
-                *acts.respawn.lock().unwrap() = true;
+                acts.command.request_respawn();
             }
             if crate::profiling::enabled() {
                 hud::draw_profile(ctx, frame_profile);
@@ -1799,12 +1796,12 @@ impl ApplicationHandler for App {
                                     if matches!(code, KeyCode::KeyW | KeyCode::KeyA | KeyCode::KeyS
                                         | KeyCode::KeyD | KeyCode::KeyQ | KeyCode::KeyE)
                                     {
-                                        *self.goto_target.lock().unwrap() = None;
+                                        self.acts.command.request_cancel_goto();
                                     }
                                 }
                                 KeyCode::KeyR | KeyCode::F9 => {
                                     self.camera.reset_to_follow();
-                                    *self.goto_target.lock().unwrap() = None;
+                                    self.acts.command.request_cancel_goto();
                                 }
                                 // Self-target (native EQ F1): target your own character (#291).
                                 // Mirrors the click-to-target path — just requests the target;

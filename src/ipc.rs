@@ -377,7 +377,7 @@ pub type TradeReq = Arc<Mutex<Option<TradeCmd>>>;
 /// or cancels the one in progress (used by the button / chat command). A completed camp shuts the
 /// client down cleanly (no linkdead) once the server's ~29s camp timer has elapsed. See
 /// `gameplay::camp_apply`.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CampCmd { Start, Toggle }
 pub type CampReq = Arc<Mutex<Option<CampCmd>>>;
 /// Set true by POST /v1/lifecycle/respawn to release a held-dead character back to its bind point

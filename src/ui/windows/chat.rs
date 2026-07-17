@@ -60,7 +60,7 @@ fn submit(line: &str, cx: &mut UiCtx) {
         "g" | "gsay" | "group" => send(2, "", arg),
         // /camp — same toggle the Actions window's Camp button uses.
         "camp" => {
-            *cx.acts.camp.lock().unwrap() = Some(crate::http::CampCmd::Toggle);
+            cx.acts.command.request_camp(crate::http::CampCmd::Toggle);
         }
         "say" if !arg.is_empty() => {
             cx.acts.command.request_say(arg.to_string());
