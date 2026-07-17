@@ -849,6 +849,15 @@ impl App {
         // network keeps flowing even on idle frames that don't render. `game_state` is already current
         // here.
 
+        // #326: clear any stale door_frac entries from the OLD zone before they're read below.
+        // This must run against the fresh `game_state_view` (not `self.scene`, which isn't
+        // rebuilt until after the easing loop) — otherwise this frame's scene is built from the
+        // old zone's fractions and a door flashes at the previous zone's open/closed state for
+        // one frame. The full reload bookkeeping (collision drop, pending_reload, etc.) still
+        // runs later against `self.scene.zone`; this is just the door_frac clear pulled earlier
+        // so it beats the read below. See `reset_door_frac_on_zone_change`.
+        reset_door_frac_on_zone_change(&mut self.door_frac, &self.game_state_view.zone_name, &self.current_zone);
+
         // Ease each door's render-only open fraction toward its server-authoritative open/close
         // target. Lives on App (not GameState) — see `ease_door_frac`. New doors seed at their
         // current state (a door that spawns open renders open immediately, matching the old
@@ -1003,13 +1012,9 @@ impl App {
             // The new zone's floor may sit above the zone-point spawn z; settle onto it once
             // collision loads (see the reground block in the vertical-physics section below).
             self.needs_reground = true;
-            // Door ids are per-zone u8s that collide across zones (e.g. door_id=3 in zone A and
-            // door_id=3 in zone B are unrelated doors). Without this clear, `door_frac`'s
-            // entry-or-insert-with-current-state seeding (render_frame, below) never fires for a
-            // colliding id, so the new zone's door inherits the PREVIOUS zone's easing fraction —
-            // a door left open in zone A would render open on arrival in zone B and visibly swing
-            // shut (or vice versa).
-            self.door_frac.clear();
+            // `door_frac` is already cleared for this zone change above (#326) — that clear has
+            // to run before the door-easing loop reads the map, which is earlier in this same
+            // function than this reload block, so it isn't repeated here.
         }
 
         // Zone-transition fade (#286): drive `fade` toward black while a zone (re)load is committing
@@ -2258,6 +2263,54 @@ mod tests {
         // No zone yet / transient reset: don't try to fetch `<empty>.glb` over a loaded zone.
         assert!(!zone_needs_reload("", ""));
         assert!(!zone_needs_reload("", "arena"));
+    }
+}
+
+/// Clear `door_frac` if the game state's zone has already moved on from `current_zone`. Door ids
+/// are per-zone `u8`s that collide across zones (door_id=3 in zone A and door_id=3 in zone B are
+/// unrelated doors), so a stale entry left over from the old zone must not survive into the new
+/// one. Extracted as a pure, testable step (#326): the caller MUST run this before `door_frac` is
+/// read to seed/ease the frame's doors, or that frame's scene is built from the old zone's
+/// fraction for one frame — the new zone's door flashes at the previous zone's open/closed state
+/// before snapping shut/open on the following frame.
+fn reset_door_frac_on_zone_change(
+    door_frac: &mut std::collections::HashMap<u8, f32>,
+    incoming_zone: &str,
+    current_zone: &str,
+) {
+    if zone_needs_reload(incoming_zone, current_zone) {
+        door_frac.clear();
+    }
+}
+
+#[cfg(test)]
+mod reset_door_frac_tests {
+    use super::*;
+
+    #[test]
+    fn clears_when_zone_changed() {
+        let mut door_frac = std::collections::HashMap::new();
+        door_frac.insert(3u8, 1.0f32); // door_id=3 left open in the old zone
+        reset_door_frac_on_zone_change(&mut door_frac, "gfaydark", "qeynos");
+        assert!(door_frac.is_empty(), "stale fraction must not survive a zone change");
+    }
+
+    #[test]
+    fn leaves_map_untouched_when_zone_unchanged() {
+        let mut door_frac = std::collections::HashMap::new();
+        door_frac.insert(3u8, 0.42f32);
+        reset_door_frac_on_zone_change(&mut door_frac, "qeynos", "qeynos");
+        assert_eq!(door_frac.get(&3u8).copied(), Some(0.42f32));
+    }
+
+    #[test]
+    fn leaves_map_untouched_when_incoming_zone_empty() {
+        // Matches `zone_needs_reload`'s own guard: an empty zone name means "not loaded yet",
+        // not a real zone change.
+        let mut door_frac = std::collections::HashMap::new();
+        door_frac.insert(3u8, 0.42f32);
+        reset_door_frac_on_zone_change(&mut door_frac, "", "qeynos");
+        assert_eq!(door_frac.get(&3u8).copied(), Some(0.42f32));
     }
 }
 
