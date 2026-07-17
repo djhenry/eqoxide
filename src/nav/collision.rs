@@ -1058,11 +1058,21 @@ impl Collision {
         const STEP_UP: f32 = 20.0;
         const MAX_DROP: f32 = 100.0;
         advertised.iter().filter_map(|&(index, dest)| {
-            // SOURCE: the footprint's reachable, projected floor point. `None` = no DRNTP region in
-            // this zone carries `index`, or none has walkable floor under it that still triggers the
-            // crossing → no edge (never fabricate a source). `near = dest` only breaks ties among
-            // stacked leaves sharing the index (rare); the index filter is what selects the pad.
-            let (_, source) = self.find_zone_line_near(Some(index), dest)?;
+            // SOURCE: a reachable floor point INSIDE the footprint — one a character could actually
+            // STAND on such that the auto-cross would fire. Project every same-index DRNTP region
+            // down to the floor beneath it and KEEP ONLY points that are still inside the region at
+            // standing height (`zone_line_floor_point`, the SAME inside-region gate the movement side
+            // uses via `find_reachable_in_zone_line`). `None` = the footprint FLOATS above its floor
+            // (a #266-style tall translocator) or has no walkable floor at all → NO edge, because a
+            // pad the walker cannot trigger by standing on it would make the planner report a `Route`
+            // the walker can't take (it arrives, nothing teleports, it walks the discontinuity
+            // off-mesh) — the inverse honesty bug. We deliberately do NOT fall back to
+            // `find_zone_line_near`'s raw region point (an interior VOLUME z that is not a standable
+            // trigger), which is exactly the un-gated path #403's review flagged.
+            let source = self.zone_line_regions.iter()
+                .filter(|(idx, _)| *idx == index)
+                .filter_map(|&(idx, p)| self.zone_line_floor_point(idx, p))
+                .next()?;
             // DEST: snap the advertised arrival onto walkable floor. `None` (void — no floor anywhere
             // in the destination column) → no edge, rather than a link that drops the character into
             // nothing.
@@ -2819,9 +2829,21 @@ impl Collision {
         while cur != skey {
             let (c, r, _) = cur;
             let ctr = center(c, r);
-            // Carry each waypoint's actual floor height so the walker moves + collision-checks at
-            // the right z while climbing/descending (instead of the goal's z, which clips walls).
-            path.push([ctr[0], ctr[1], *floor_of.get(&cur).unwrap_or(&goal[2])]);
+            // A TELEPORT-PAD endpoint waypoint (#403) is snapped to its EXACT resolved point, not the
+            // 8u cell centre: the SOURCE must be a point KNOWN to be inside the trigger footprint (a
+            // cell centre can fall just outside a sub-cell footprint, so the auto-cross never fires and
+            // the walker walks the discontinuity off-mesh), and the DEST is the real arrival the route
+            // continues from. Both were resolved+validated by `resolve_teleport_pads`.
+            let wp = ctx.teleport_pads.iter().find_map(|p| {
+                if (c, r) == to_cell(p.dest[0], p.dest[1])        { Some(p.dest) }
+                else if (c, r) == to_cell(p.source[0], p.source[1]) { Some(p.source) }
+                else { None }
+            }).unwrap_or_else(|| {
+                // Carry each waypoint's actual floor height so the walker moves + collision-checks at
+                // the right z while climbing/descending (instead of the goal's z, which clips walls).
+                [ctr[0], ctr[1], *floor_of.get(&cur).unwrap_or(&goal[2])]
+            });
+            path.push(wp);
             match came.get(&cur) { Some(&p) => cur = p, None => break }
         }
         path.reverse();
@@ -3245,6 +3267,43 @@ mod tests {
         let out = col.find_path_ex(start, goal, 1.0, &[], 8.0, None, 0.0, ctx);
         assert!(matches!(out, PlanOutcome::Unreachable { .. }),
             "a void-destination pad must not make the goal reachable, got {out:?}");
+    }
+
+    /// HONESTY GUARD (#403, #266): a DRNTP footprint that FLOATS in a z-slab above its floor — a
+    /// character standing at the XY is BELOW the trigger volume, so the auto-cross never fires — must
+    /// create NO planner edge, even though the region IS present in the map. Otherwise the planner
+    /// reports a `Route` whose pad the walker can't trigger: it arrives, nothing teleports, and it
+    /// walks the discontinuity off-mesh (false reachability). This is exactly the ungated
+    /// `find_zone_line_near` raw-point fallback the review flagged; `resolve_teleport_pads` gates the
+    /// SOURCE through `zone_line_floor_point` (inside-region at standing height) instead.
+    #[test]
+    fn pad_with_a_floating_footprint_creates_no_edge() {
+        let quad = |v: Vec<[f32; 3]>| MeshData {
+            positions: v, normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
+            texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let slab_a = quad(vec![[0.0, 0.0, -120.0], [80.0, 0.0, -120.0], [80.0, 0.0, 0.0], [0.0, 0.0, 0.0]]);
+        let slab_b = quad(vec![[0.0, 0.0, 400.0], [80.0, 0.0, 400.0], [80.0, 0.0, 480.0], [0.0, 0.0, 480.0]]);
+        // A tall thin wall AWAY from the footprint XY (east=-100) only extends the zone's z-extent so
+        // the floating footprint region falls within the precompute bounds — it is NOT a floor under
+        // the pad. Without it the region would be missed for a different reason and the test vacuous.
+        let wall = quad(vec![[0.0, 0.0, -100.0], [80.0, 0.0, -100.0], [80.0, 40.0, -100.0], [0.0, 40.0, -100.0]]);
+        let mut col = Collision::build(
+            &ZoneAssets { terrain: vec![slab_a, slab_b, wall], objects: vec![], textures: vec![] }, 8.0);
+        const IDX: i32 = 42;
+        // Footprint floats in z[30,40] over slab A's z=0 floor — nothing standable is inside it.
+        col.set_water(Some(std::sync::Arc::new(
+            crate::region_map::RegionMap::zone_line_box(30.0, 50.0, -40.0, -16.0, 30.0, 40.0, IDX))));
+        // The region IS present (precompute found it): the OLD ungated resolver would have taken this
+        // raw, non-standable region point as a source. `is_some` here is what makes the assertion
+        // below about the GATE, not about a missing region.
+        assert!(col.find_zone_line_near(Some(IDX), [430.0, 40.0, 0.0]).is_some(),
+            "fixture sanity: the floating footprint region must be present in the map");
+        let pads = col.resolve_teleport_pads(&[(IDX, [430.0, 40.0, 0.0])]);
+        assert!(pads.is_empty(),
+            "a floating footprint with no standable trigger floor must create NO edge (its auto-cross \
+             would never fire — a Route the walker can't take), got {pads:?}");
     }
 
     /// #257: the net-thread wall-clock budget (PLAN_BUDGET_MS) must be generous enough that a
