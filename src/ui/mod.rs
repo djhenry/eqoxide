@@ -31,10 +31,9 @@ pub const REF_H: f32 = 720.0;
 /// `App`; the HTTP handlers and nav/gameplay threads hold the other ends.
 #[derive(Clone)]
 pub struct Actions {
-    /// The typed write-path facade (#446). Combat is fully migrated onto it — the Target/Actions/
-    /// spell-gem/spellbook/pet windows write via `cx.acts.command.request_*` (no direct combat slot
-    /// fields any more); other domains still use the raw slot fields below until Wave-2 migrates
-    /// them. See `crate::command_state`.
+    /// The typed write-path facade (#446, #459). Combat/nav/camera/lifecycle write via
+    /// `cx.acts.command.request_*` — no direct slot fields for those domains any more; the rest
+    /// still use the raw slot fields below until they're migrated. See `crate::command_state`.
     pub command: crate::command_state::CommandState,
     pub hail: crate::http::HailReq,
     pub say: crate::http::SayReq,
@@ -51,11 +50,10 @@ pub struct Actions {
     pub group_leave: crate::http::GroupLeaveReq,
     pub group_kick: crate::http::GroupKickReq,
     pub group_make_leader: crate::http::GroupMakeLeaderReq,
-    pub camp: crate::http::CampReq,
+    /// Published camp deadline (read-path) for the HUD Camp button's countdown/toggle display.
+    /// The camp REQUEST itself (and the HUD death-overlay Respawn button) route through
+    /// `command.request_camp`/`request_respawn` (#459).
     pub camp_until: crate::http::CampUntil,
-    /// Set true by the HUD death-overlay Respawn button (mirrors POST /v1/lifecycle/respawn) so a
-    /// HUMAN player can revive — the client no longer auto-respawns. (#284)
-    pub respawn: crate::http::RespawnReq,
 }
 
 /// Chat window runtime state (input buffer, active tab).
@@ -332,9 +330,7 @@ mod tests {
             group_leave: Arc::new(Mutex::new(None)),
             group_kick: Arc::new(Mutex::new(None)),
             group_make_leader: Arc::new(Mutex::new(None)),
-            camp: Arc::new(Mutex::new(None)),
             camp_until: Arc::new(Mutex::new(None)),
-            respawn: Arc::new(Mutex::new(false)),
         }
     }
 

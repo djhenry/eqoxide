@@ -15,7 +15,7 @@ pub(crate) const RUN_SPEED: f32 = 44.0;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::{AppPacket, EqStream};
 use crate::game_state::{GameState, ZonePoint};
-use crate::ipc::{TradeCmd, CampReq, CampCmd};
+use crate::ipc::{TradeCmd, CampCmd};
 use crate::movement::MoveIntent;
 
 /// Min interval (ms) between OP_ClientUpdate sends while moving (native `0x118` = 280 ms).
@@ -70,7 +70,18 @@ use crate::coord::eq_heading;
 
 
 pub struct ActionLoop {
-    /// `/v1/move/*` slots (#M4 — see `ipc::NavSlots`).
+    /// `/v1/move/*` slots (#M4 — see `ipc::NavSlots`). Production reads/writes were migrated onto
+    /// `self.command.{request_goto,request_follow,request_stop,request_cancel_goto,take_zone_cross}`
+    /// (#459) — this field's only remaining production use is as the source `.clone()`d into
+    /// `Walker::new(...)` below (a move-out, which the dead_code lint doesn't count as a "read").
+    /// It stays a field (rather than a local dropped after construction) because `Walker` keeps its
+    /// OWN clone privately (`nav::walker::Walker::nav` is not even `pub(crate)`), and several unit
+    /// tests below (`dead_player_halts_navigation`, `zone_change_resets_stale_destination_and_path`,
+    /// `a_snapped_goal_z_is_reported_not_silently_performed`, `nav_tier_does_not_survive_...`) need a
+    /// handle on the exact same shared Arc to seed/assert `nav_state`/`goto_target`/`goto_entity`/
+    /// `nav_path_view` directly. `#[cfg(test)]` code doesn't compile under `cargo build --lib`, so the
+    /// lint can't see those reads and flags the field as dead outside `cargo test` — hence the allow.
+    #[allow(dead_code)]
     nav:              crate::ipc::NavSlots,
     /// The live entity registry + zone exit points (#M4 — see `ipc::WorldSlots`).
     world:            crate::ipc::WorldSlots,
@@ -98,12 +109,6 @@ pub struct ActionLoop {
     merchant_slots:   crate::ipc::MerchantSlots,
     /// `/v1/inventory/*` slots (#M4 — see `ipc::InventorySlots`).
     inventory_slots:  crate::ipc::InventorySlots,
-    /// Camp request slot, shared with the gameplay loop. The nav thread only WRITES it — when the
-    /// `/camp` chat keyword is typed it pushes a `Toggle` here instead of sending the text as Say.
-    /// Not part of `ipc::LifecycleSlots`: this is the only lifecycle field the nav thread touches
-    /// (`camp_until`/`respawn` go straight to `eq_net::gameplay::run_gameplay_phase`), so bundling
-    /// the whole triple here would just be a field `ActionLoop` never reads.
-    camp:             CampReq,
     /// In-progress quest turn-in (POST /give), or None when idle. Drives the trade-window
     /// state machine across nav ticks (request → wait for ack → move item + accept).
     give_state:       Option<GiveState>,
@@ -166,7 +171,6 @@ impl ActionLoop {
         guild_slots:     crate::ipc::GuildSlots,
         collision:       crate::nav::collision::SharedCollision,
         maps_dir:        std::path::PathBuf,
-        camp:            CampReq,
     ) -> Self {
         let walker = crate::nav::walker::Walker::new(
             nav.clone(), world.clone(), collision.clone(), controller.nav_intent.clone(),
@@ -183,7 +187,6 @@ impl ActionLoop {
             expecting_friends: false,
             merchant_slots,
             inventory_slots,
-            camp,
             give_state: None,
             interact,
             chat,
@@ -675,7 +678,7 @@ impl ActionLoop {
         // so walking to them lands the player nowhere near the trigger and the server safe-coords /
         // cheat-flags the crossing (the root cause of #174). Resolve the target zone to its
         // zone-point index (iterator), locate that DRNTP region in the zone BSP, and walk there.
-        let cross_req = self.nav.zone_cross.lock().unwrap().take();
+        let cross_req = self.command.take_zone_cross();
         if let Some(want_zone) = cross_req {
             // want_zone != 0 → resolve it to a zone-point index; want_zone == 0 → any nearest line.
             let want_index = if want_zone != 0 {
@@ -734,8 +737,7 @@ impl ActionLoop {
                         } else {
                             tracing::info!("zone_cross: walking {:.0}u to the zone_id={dest_zone} line at ({tx:.0},{ty:.0}) (index={index})", d2.sqrt());
                             gs.log_msg("zone", &format!("Walking to the zone {} line", dest_zone));
-                            *self.nav.goto_target.lock().unwrap() = Some((tx, ty, tz));
-                            *self.nav.goto_entity.lock().unwrap() = None;
+                            self.command.request_goto((tx, ty, tz));
                         }
                     }
                     None => {
@@ -823,7 +825,7 @@ impl ActionLoop {
             // The `/camp` chat keyword is a local command, not Say text: toggle a camp instead of
             // broadcasting it. The gameplay loop drains the camp slot and runs the camp/cancel.
             if text.trim().eq_ignore_ascii_case("/camp") {
-                *self.camp.lock().unwrap() = Some(CampCmd::Toggle);
+                self.command.request_camp(CampCmd::Toggle);
                 tracing::info!("EQ: /camp chat command — toggling camp");
             } else {
                 let pkt = build_say_packet(&gs.player_name, "", &text);
@@ -1416,7 +1418,7 @@ impl ActionLoop {
                             *self.controller.nav_intent.lock().unwrap() = None;
                             self.send_position_update(stream, gs, gs.player_x, gs.player_y, gs.player_z, hdg);
                         }
-                        *self.nav.goto_target.lock().unwrap() = None; // cancel any stale walk
+                        self.command.request_cancel_goto(); // cancel any stale walk
                         return true;
                     }
                 }
@@ -1972,7 +1974,6 @@ mod tests {
             Default::default(), // guild_slots
             Default::default(), // collision
             std::path::PathBuf::new(), // maps_dir
-            Default::default(), // camp
         )
     }
 

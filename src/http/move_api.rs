@@ -55,7 +55,7 @@ async fn post_manual(
     if dir[0] == 0.0 && dir[1] == 0.0 && up == 0.0 && !jump {
         return (StatusCode::BAD_REQUEST, "provide a direction {east,north}, {up:-1..1} (swim), and/or {\"jump\":true}".into());
     }
-    *s.camera.manual_move.lock().unwrap() = Some(ManualMove {
+    s.command.request_manual_move(ManualMove {
         dir, up, jump,
         until: std::time::Instant::now() + std::time::Duration::from_millis(ms),
     });
@@ -66,7 +66,7 @@ async fn post_manual(
 /// `jump`). Clears any `/goto` and pops the character up — on land it's a jump; in water it swims
 /// upward toward the surface (#207), e.g. to lift off a pool floor.
 async fn post_jump(State(s): State<HttpState>) -> (StatusCode, String) {
-    *s.camera.manual_move.lock().unwrap() = Some(ManualMove {
+    s.command.request_manual_move(ManualMove {
         dir: [0.0, 0.0], up: 0.0, jump: true,
         until: std::time::Instant::now() + std::time::Duration::from_millis(400),
     });
@@ -177,8 +177,7 @@ async fn post_goto(
     // Apply aggro-avoidance knobs for this route (#242).
     apply_avoid_opts(&s.nav.nav_avoid, b.avoid_aggro, b.aggro_buffer);
     // Set the position, then clear any chase — goto walks to a fixed point and stops.
-    *s.nav.goto_target.lock().unwrap() = Some(target);
-    *s.nav.goto_entity.lock().unwrap() = None;
+    s.command.request_goto(target);
     tracing::info!("move/goto: target set to ({:.1},{:.1},{:.1})", target.0, target.1, target.2);
     (StatusCode::OK, format!("navigating to ({:.1},{:.1},{:.1})", target.0, target.1, target.2))
 }
@@ -213,8 +212,7 @@ async fn post_follow(
 
     // Position first, then the chase key: the nav thread re-resolves the key's live position each
     // tick (eqoxide#88) and homes in as the entity moves.
-    *s.nav.goto_target.lock().unwrap() = Some(pos);
-    *s.nav.goto_entity.lock().unwrap() = Some(key.clone());
+    s.command.request_follow(key.clone(), pos);
     tracing::info!("move/follow: chasing {:?} from ({:.1},{:.1},{:.1})", key, pos.0, pos.1, pos.2);
     (StatusCode::OK, format!("following {}", clean_entity_name(&key)))
 }
@@ -222,8 +220,7 @@ async fn post_follow(
 /// POST /v1/move/stop — cancel any active goto/follow. Idempotent. Clears goto_target and
 /// goto_entity; the nav thread then clears nav_intent next tick via its "no goto ⇒ no nav" invariant.
 async fn post_stop(State(s): State<HttpState>) -> (StatusCode, String) {
-    *s.nav.goto_target.lock().unwrap() = None;
-    *s.nav.goto_entity.lock().unwrap() = None;
+    s.command.request_stop();
     tracing::info!("move/stop: navigation cancelled");
     (StatusCode::OK, "navigation stopped".into())
 }
@@ -287,7 +284,7 @@ async fn post_zone_cross(
         }
     }
     let zone_id = zone_id as u16; // safe: either 0, or validated above to fit u16 and be reachable
-    *s.nav.zone_cross.lock().unwrap() = Some(zone_id);
+    s.command.request_zone_cross(zone_id);
     tracing::info!("zone_cross: flagged for OP_ZONE_CHANGE (target zone_id={zone_id})");
     // Honest, async-aware response (#267): the client WALKS to the zone line, it does not teleport, so
     // this 200 means "accepted", not "arrived". Tell the caller how to observe the real outcome — a bare
