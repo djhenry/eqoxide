@@ -5998,12 +5998,11 @@ mod tests {
     /// exposed via `item_links` — not a dialogue choice (this isn't a click-to-say phrase), but not
     /// silently dropped either.
     ///
-    /// Mutation check: reverting `parse_say_links` to its pre-#256 form (which only pushed to
-    /// `item_links` — actually, prior to the fix there was no `item_links` at all) reproduces the
-    /// bug two ways: (a) comment out the `item_links.push` call → `item_links` stays empty and this
-    /// test's `assert_eq!(item_links.len(), 1)` goes red; (b) revert the hex-strip itself (skip the
-    /// `split_at`/`out.push_str(display)` step) → the raw hex body leaks into `logged.text` and the
-    /// `!contains("00758")` assertion goes red. Both failure modes are covered.
+    /// Mutation check: (a) comment out the `item_links.push` call in `parse_say_links` →
+    /// `item_links` stays empty and the `assert_eq!(logged.item_links.len(), 1)` below goes red;
+    /// (b) revert the hex-strip itself (skip the `split_at`/`out.push_str(display)` step) → the raw
+    /// 56-hex-char body leaks into `logged.text` and the `!contains(&hex_body_marker)` assertion
+    /// goes red. Both failure modes are covered — both verified RED, then restored.
     #[test]
     fn special_message_real_item_link_renders_clean_text_and_item_id() {
         use super::apply_special_message;
@@ -6025,10 +6024,15 @@ mod tests {
         assert!(gs.dialogue_choices.is_empty(), "a real item link must not become a dialogue choice");
 
         let logged = gs.messages.back().expect("a message was logged");
-        // Clean, readable text: the display name is kept, the hex body is gone.
+        // Clean, readable text: the display name is kept, the hex body is gone. The hex-body marker
+        // is the item_id field AS IT ACTUALLY APPEARS on the wire — `{:05x}` (so 758 → "002f6", NOT
+        // "00758"): the link body encodes item_id as 5 hex chars, so a decimal-looking substring
+        // could never leak and asserting against it would be vacuously true (PR #514 review).
+        let hex_body_marker = format!("{:05x}", RAT_WHISKERS_ITEM_ID); // "002f6"
         assert!(logged.text.contains("rat whiskers"), "display text kept: {:?}", logged.text);
         assert!(!logged.text.contains('\u{12}'), "control byte stripped: {:?}", logged.text);
-        assert!(!logged.text.contains("00758"), "hex body must not leak into the message: {:?}", logged.text);
+        assert!(!logged.text.contains(&hex_body_marker),
+            "hex body (marker {hex_body_marker:?}) must not leak into the message: {:?}", logged.text);
 
         // Resolvable item reference: the id must be reachable from the logged entry, not discarded.
         assert_eq!(logged.item_links.len(), 1, "the real item_id must be exposed as an ItemLink");
