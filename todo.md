@@ -250,7 +250,7 @@ unit tests, but NOT exhaustively live. Still to do:
   we don't send OP_EnvDamage in those cases (currently we always send on a dry controlled-fall).
 - Decide whether WASD (human) ledge-falls should also send OP_EnvDamage (currently only the nav
   controlled-fall path does).
-See docs/eq-technical-knowledgebase/falling-physics.md.
+See ~/git/eq_kb/falling-physics.md.
 
 ## COMPLETE: Clickable & animated doors + agent API (branch worktree-zone-portal-objects)
 
@@ -258,7 +258,7 @@ Parse OP_SpawnDoor on zone-in; render with real models (from `_obj.s3d`) + fallb
 Animate open/close via OP_MoveDoor (server-authoritative, no client-side toggle). Portal doors
 (opentype 57/58) zone the player on open. Click via 3D picker or HTTP API (`GET /v1/observe/doors`,
 `POST /v1/interact/click_door {door_id:N}` or `{name:"DOOR1"}`). Verified live: doors render (untextured),
-click opens (server replies), portal doors trigger zoning. Notes: `docs/http-api.md`, `docs/eq-technical-knowledgebase/doors.md`.
+click opens (server replies), portal doors trigger zoning. Notes: `docs/http-api.md`, `~/git/eq_kb/doors.md`.
 
 **Follow-ups (not blocking):**
 - Door textures (models currently untextured; geometry/placement correct)
@@ -414,7 +414,7 @@ Findings / scope:
   (hesk{F}{L}, F = face 0-7, NOT hairstyle) × runtime haircolor tint. Converter splits
   scalp (head-bone tris, eq_head_part:"hair", tinted) from facial skin (eq_face only);
   client selects by spawn.face + tints by spawn.haircolor. See
-  docs/eq-technical-knowledgebase/luclin-head-faces-and-hair.md.
+  ~/git/eq_kb/luclin-head-faces-and-hair.md.
 - MINOR BUG noticed: when an equip texture falls back to baked (no armor texture for that
   material), the per-mesh TINT is still applied — a missing-helm head can get tinted (e.g. green
   face). Consider skipping tint when the texture falls back to baked skin.

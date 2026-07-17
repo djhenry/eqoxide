@@ -34,8 +34,8 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 
 // RoF2 zone distance fog (eqoxide#517): linear fade between fog_params.x (minclip) and
 // fog_params.y (maxclip), scaled by density as a blend-intensity cap — matches the native
-// client's D3DFOG_LINEAR (confirmed via the REDACTED-CLIENT decompile; fog_density is never
-// wired to D3DRS_FOGDENSITY there, so this is NOT exponential fog). `fog_params.w` is a hard
+// client's D3DFOG_LINEAR (confirmed against the native RoF2 client's graphics code; fog_density is
+// never wired to D3DRS_FOGDENSITY there, so this is NOT exponential fog). `fog_params.w` is a hard
 // enable gate: 0.0 for a zone with no/degenerate fog range, so a fogless zone renders unchanged.
 fn fog_t(world_pos: vec3<f32>) -> f32 {
     let dist  = length(world_pos - camera.camera_pos.xyz);

@@ -80,7 +80,7 @@ stays the single source of truth; egui screens are thin views over shared slots.
 
 ## Section 3 — Native rules data (ground truth from eq-client-expert, cited)
 
-Full detail + citations in `docs/eq-technical-knowledgebase/character-creation.md`. Summary tables:
+Full detail + citations in `~/git/eq_kb/character-creation.md`. Summary tables:
 
 ### Race IDs
 Human=1, Barbarian=2, Erudite=3, Wood Elf=4, High Elf=5, Dark Elf=6, Half Elf=7, Dwarf=8, Troll=9,

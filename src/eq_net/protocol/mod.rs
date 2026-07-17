@@ -183,7 +183,7 @@ pub const OP_INTERRUPT_CAST: u16 = 0x048c;    // RoF2: OP_InterruptCast
 // EQEmu zone/common.h: PET_ATTACK=2, PET_GUARDHERE=5, PET_FOLLOWME=4(GetOwner), PET_BACKOFF=28.
 // Environmental (fall/lava/drown) damage — CLIENT-COMPUTED in native EQ; the server only validates
 // and applies it. EnvDamage2_Struct (31b): id@0, damage(u32)@6, dmgtype(u8)@22 (0xFC=falling),
-// constant(u16)@27=0xFFFF. See docs/eq-technical-knowledgebase/falling-physics.md.
+// constant(u16)@27=0xFFFF. See ~/git/eq_kb/falling-physics.md.
 pub const OP_ENV_DAMAGE: u16 = 0x51fd;        // RoF2: OP_EnvDamage
 pub const DMGTYPE_FALLING: u8 = 0xFC;
 
@@ -252,7 +252,7 @@ pub const OP_ACCEPT_NEW_TASK:      u16 = 0x0a23; // RoF2: OP_AcceptNewTask; Acce
 pub const OP_CANCEL_TASK:          u16 = 0x39f0; // RoF2: OP_CancelTask; CancelTask_Struct (8B, send)
 
 // Group management (invite/leave/kick/roster). Opcodes cross-checked against the live EQEmu
-// server's own utils/patches/patch_RoF2.conf. See docs/eq-technical-knowledgebase/group-protocol.md.
+// server's own utils/patches/patch_RoF2.conf. See ~/git/eq_kb/group-protocol.md.
 pub const OP_GROUP_INVITE: u16        = 0x6110; // C→S send / S→C deliver; GroupInvite_Struct (148B)
 pub const OP_GROUP_FOLLOW: u16        = 0x1649; // C→S accept; GroupFollow_Struct (152B)
 pub const OP_GROUP_FOLLOW2: u16       = 0x2060; // S→C relay of the same struct
@@ -467,7 +467,7 @@ pub fn ccw_to_cw(ccw: f32) -> f32 {
 //
 // EQ packs heading as a 12-bit field. Ground truth (EQEmu `common/misc_functions.cpp`
 // `FloatToEQ12`/`EQ12toFloat`, confirmed against `zone/mob.cpp` and
-// `zone/client_packet.cpp` — see `docs/eq-technical-knowledgebase/position-update-wire-format.md`
+// `zone/client_packet.cpp` — see `~/git/eq_kb/position-update-wire-format.md`
 // §2-3, and issue #521): BOTH the 24-byte `PlayerPositionUpdateServer_Struct`
 // (OP_ClientUpdate relay of other spawns' positions, and the identically-shaped
 // RoF2 spawn-stream position block) and the 46-byte `PlayerPositionUpdateClient_Struct`
@@ -1254,7 +1254,7 @@ mod tests {
     #[test]
     fn eq12_server_to_deg_cw_uses_2048_not_512_scale() {
         // Issue #521: the RoF2 wire heading field is 0..2047 == 0..360° CW
-        // (EQEmu FloatToEQ12/EQ12toFloat, docs/eq-technical-knowledgebase/
+        // (EQEmu FloatToEQ12/EQ12toFloat, ~/git/eq_kb/
         // position-update-wire-format.md §2-3), not 0..511 == 0..360°. The old
         // (buggy) 360/512 scale would alias wire=1024 (true 180°) as 720°,
         // which wraps to 0° — i.e. a due-south spawn would read as due-north.
@@ -1742,7 +1742,7 @@ pub struct NewZone_S {
     pub _pad_856_916:         [u8; 60],   // 856..916 (remaining fields before fog_density)
     /// Fog blend-intensity cap, applied on top of the linear minclip/maxclip fade (eqoxide#517).
     /// NOT a D3DFOG_EXP/EXP2 density coefficient — the RoF2 client never wires this field to
-    /// D3DRS_FOGDENSITY (confirmed from the REDACTED-CLIENT decompile, `FUN_REDACTED`); it only
+    /// D3DRS_FOGDENSITY (confirmed against the native RoF2 client's graphics code); it only
     /// ever sets D3DRS_FOGVERTEXMODE = D3DFOG_LINEAR. Typical zones ship 0.33 (rof2_structs.h @916).
     pub fog_density:          f32,        // 916
     pub _pad_920_948:         [u8; 28],   // 920..948 (remaining fields)

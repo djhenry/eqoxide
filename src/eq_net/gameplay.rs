@@ -46,7 +46,7 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(crate::ipc::PROBE_INTERVAL_
 /// transport layer's `poll_resend` retransmits that ONE datagram verbatim while it is still unacked,
 /// which recovers genuine wire loss). We deliberately do NOT app-level re-send a fresh OP_ZoneEntry
 /// once the session has ACKed the first — see `run_zone_entry_handshake` and
-/// `docs/eq-technical-knowledgebase/zone-entry-duplicate-on-admitted-client.md` for why a second
+/// `~/git/eq_kb/zone-entry-duplicate-on-admitted-client.md` for why a second
 /// ClientZoneEntry on an admitted session self-disconnects the client via EQEmu's antighost check.
 /// Any wedge past this deadline is surfaced as an honest failure, never a confident falsehood.
 const ZONE_ENTRY_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
@@ -596,7 +596,7 @@ pub async fn run_gameplay_phase(
             // runs and may silently drop it if it beat AddAuth. `poll_resend` recovers a genuinely lost
             // (unacked) entry; a wedge past the honest 30s deadline is surfaced as a zone-in failure,
             // NOT papered over with a second OP_ZoneEntry (that would self-kick an admitted-but-slow
-            // session). See docs/eq-technical-knowledgebase/zone-entry-{handshake-race,
+            // session). See ~/git/eq_kb/zone-entry-{handshake-race,
             // duplicate-on-admitted-client}.md.
             match EqStream::connect(&zone_ip, zone_port, new_tx, net_health.clone()).await {
                 Ok(new_stream) => {
@@ -857,7 +857,7 @@ async fn reconnect_via_world(
 
 /// Build and send an OP_ZoneEntry (ClientZoneEntry) for `char_name` on `stream`, as a reliable app
 /// packet. Called EXACTLY ONCE per zone-server session by `run_zone_entry_handshake` — see that
-/// function's doc and `docs/eq-technical-knowledgebase/zone-entry-duplicate-on-admitted-client.md` for
+/// function's doc and `~/git/eq_kb/zone-entry-duplicate-on-admitted-client.md` for
 /// why a second app-level ClientZoneEntry on the same session must never be issued (it self-kicks the
 /// admitted client via EQEmu's antighost check).
 fn send_zone_entry(stream: &mut EqStream, char_name: &str) {
@@ -875,7 +875,7 @@ fn send_zone_entry(stream: &mut EqStream, char_name: &str) {
 /// This function OWNS the OP_ZoneEntry send (both call sites used to send it themselves) and sends it
 /// EXACTLY ONCE. It deliberately does NOT app-level re-send a fresh OP_ZoneEntry while waiting for
 /// OP_NewZone. That is a hard invariant, not an oversight — see
-/// `docs/eq-technical-knowledgebase/zone-entry-duplicate-on-admitted-client.md`: a second
+/// `~/git/eq_kb/zone-entry-duplicate-on-admitted-client.md`: a second
 /// ClientZoneEntry delivered on an ALREADY-ADMITTED session (the common case once the first entry was
 /// accepted and OP_NewZone is merely slow — e.g. a cold/heavy zone whose bulk spawn+DB load exceeds a
 /// couple of seconds) is re-dispatched into `Handle_Connect_OP_ZoneEntry`, whose antighost check
@@ -1174,7 +1174,7 @@ pub fn loot_tick_action(state: &LootTickState, now: std::time::Instant) -> LootT
 ///
 /// #414: this does NOT fully clear the session — `loot_current_corpse` and `loot_session_active`
 /// stay as they were, and `loot_defensive_close_at` is set instead. `OP_MoneyOnCorpse` carries no
-/// corpse id (verified — see docs/eq-technical-knowledgebase/loot-protocol.md), so a "lost" ack
+/// corpse id (verified — see ~/git/eq_kb/loot-protocol.md), so a "lost" ack
 /// might really just be LATE rather than lost; if it turns up right after we naively opened the
 /// next queued corpse, it would land on that corpse's session instead (the exact bug #414 reports).
 /// Leaving `loot_current_corpse` pointing at THIS corpse until the caller's defensive
@@ -1654,7 +1654,7 @@ mod zone_entry_handshake_publish_tests {
     /// already-admitted session is re-dispatched into `Handle_Connect_OP_ZoneEntry`, whose antighost
     /// lookup `entity_list.GetClientByName` then matches ITSELF (no `client != this` guard) and calls
     /// `client->Disconnect()` on the live stream — silently kicking a zone-in that had already
-    /// succeeded (see `docs/eq-technical-knowledgebase/zone-entry-duplicate-on-admitted-client.md`).
+    /// succeeded (see `~/git/eq_kb/zone-entry-duplicate-on-admitted-client.md`).
     /// The hard client-side rule is therefore: send OP_ZoneEntry EXACTLY ONCE per session, never a
     /// second app-level copy while waiting for OP_NewZone — because from session state we cannot tell
     /// "first was app-dropped" from "first admitted, OP_NewZone just slow (cold/heavy zone)".
