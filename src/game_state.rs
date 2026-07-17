@@ -77,6 +77,18 @@ pub struct Door {
     pub is_open: bool,       // authoritative, from server
 }
 
+/// Zone distance fog parameters (RoF2 `NewZone_Struct` slot 0), see `GameState::zone_fog`.
+/// `color` is 0-255 RGB, matching the wire's `uint8 fog_red/green/blue[4]`; `minclip`/`maxclip`
+/// are the linear fog-fade distance range; `density` is a 0..1 blend-intensity cap applied on top
+/// of the linear fade (NOT a D3DFOG_EXP density — see the field's doc comment on `NewZone_S`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ZoneFog {
+    pub color:   [u8; 3],
+    pub minclip: f32,
+    pub maxclip: f32,
+    pub density: f32,
+}
+
 /// One objective/step of a Task-system quest (from OP_TaskActivity). `done_count`/`goal_count`
 /// are the live progress (e.g. "kill 4 gnolls" -> goal 4, done 2).
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
@@ -527,6 +539,13 @@ pub struct GameState {
     /// until OP_NewZone is parsed. The movement controller clamps against it so a collision gap
     /// can't drop us below it and trip the server's below-world drop → CLE linkdead (#150).
     pub zone_underworld: Option<f32>,
+    /// Zone distance fog, parsed from OP_NewZone slot 0 (eqoxide#517). `None` until OP_NewZone has
+    /// been applied, OR when the zone sends a degenerate/disabled fog range
+    /// (`fog_maxclip <= fog_minclip`) — matching the native client's hard FOGENABLE-off behavior
+    /// (see `docs/eq-technical-knowledgebase/zone-distance-fog.md`). RoF2's `NewZone_Struct` carries
+    /// 4 fog "slots"; only slot 0 (the DB's un-suffixed fog_* columns) is populated by ordinary
+    /// zone content, so we only read that one (see the KB doc's "Semantics of the 4 slots" note).
+    pub zone_fog: Option<ZoneFog>,
     /// True once OP_NewZone has been applied for the current zone-server session. A RoF2 zone-in
     /// delivers OP_NewZone TWICE: the server sends it unsolicited while handling OP_ZoneEntry and
     /// again in reply to our OP_ReqNewZone (EQEmu `Handle_Connect_OP_ReqNewZone`). The second copy

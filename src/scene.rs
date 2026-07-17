@@ -157,6 +157,9 @@ pub struct SceneState {
     /// Who last killed the player — shown on the HUD death overlay (#284).
     pub killed_by: String,
     pub zone_id: u16,
+    /// Distance fog for the current zone (eqoxide#517), `None` = no fog (respect the zone's
+    /// actual OP_NewZone values — see `GameState::zone_fog`).
+    pub zone_fog: Option<crate::game_state::ZoneFog>,
 }
 
 impl SceneState {
@@ -409,6 +412,7 @@ impl SceneState {
             player_dead: gs.player_dead,
             killed_by: gs.killed_by.clone(),
             zone_id: gs.zone_id,
+            zone_fog: gs.zone_fog,
         }
     }
 }

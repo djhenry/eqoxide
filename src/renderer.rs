@@ -1047,8 +1047,26 @@ impl EqRenderer {
         let view_proj = crate::camera::look_at_perspective(
             cam_eye, cam_target, [0.0, 0.0, 1.0], 60.0, aspect, 0.5, 5000.0,
         );
+        // Distance fog (eqoxide#517): fold the zone's fog params into the same uniform as the
+        // camera (every pipeline already binds group 0 once per pass). `fog_params.w` is an
+        // explicit 1.0/0.0 enable gate, matching the native client's hard FOGENABLE toggle — a
+        // zone with no (or degenerate) fog range renders with `enabled = 0.0`, never inventing a
+        // fog look (scene.zone_fog is None in that case; see GameState::zone_fog's doc comment).
+        let (fog_color, fog_params) = match scene.zone_fog {
+            Some(fog) => (
+                [fog.color[0] as f32 / 255.0, fog.color[1] as f32 / 255.0, fog.color[2] as f32 / 255.0, 0.0],
+                [fog.minclip, fog.maxclip, fog.density, 1.0],
+            ),
+            None => ([0.0; 4], [0.0; 4]),
+        };
+        let camera_data = crate::gpu::CameraUniformData {
+            view_proj,
+            camera_pos: [cam_eye[0], cam_eye[1], cam_eye[2], 0.0],
+            fog_color,
+            fog_params,
+        };
         self.queue.write_buffer(
-            &self.camera_uniform.buf, 0, bytemuck::cast_slice(&view_proj),
+            &self.camera_uniform.buf, 0, bytemuck::bytes_of(&camera_data),
         );
         self.last_view_proj = view_proj;
         self.last_cam_pos   = cam_eye;

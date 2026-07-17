@@ -84,6 +84,26 @@ pub struct EntityUniform {
     pub tint:  [f32; 4],
 }
 
+/// Byte layout of the camera + zone distance-fog uniform (group 0, binding 0 — shared by every
+/// pipeline that samples `camera`; the GPU-resource wrapper for it is `pipeline::CameraUniform`,
+/// a different type). Fog fields ride along on the camera uniform rather than a separate bind
+/// group since every pipeline already binds group 0 once per pass (eqoxide#517).
+///
+/// `fog_params` = `[minclip, maxclip, density, enabled]`: `enabled` is 1.0/0.0 (not just an
+/// implicit "maxclip <= minclip" test) so the shader-side gate is explicit and matches the native
+/// client's hard FOGENABLE toggle (see `docs/eq-technical-knowledgebase/zone-distance-fog.md`).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct CameraUniformData {
+    pub view_proj:  [[f32; 4]; 4],
+    /// Eye position in render/world space (xyz used, w padding) — fragment shaders compute
+    /// per-fragment distance-to-camera from this for the linear fog fade.
+    pub camera_pos: [f32; 4],
+    /// Fog color, 0..1 (rgb used, a padding).
+    pub fog_color:  [f32; 4],
+    pub fog_params: [f32; 4],
+}
+
 /// Static (non-animated) character model.
 pub struct GpuStaticModel {
     pub meshes:              Vec<GpuMesh>,
@@ -280,6 +300,21 @@ mod tests {
     fn entity_uniform_is_pod() {
         fn _check<T: bytemuck::Pod + bytemuck::Zeroable>() {}
         _check::<EntityUniform>();
+    }
+
+    #[test]
+    fn camera_uniform_data_is_pod() {
+        fn _check<T: bytemuck::Pod + bytemuck::Zeroable>() {}
+        _check::<CameraUniformData>();
+    }
+
+    #[test]
+    fn camera_uniform_data_size_matches_wgsl_camera_struct() {
+        // mat4x4<f32> (64) + 3×vec4<f32> (16 each) = 112 bytes, 16-byte aligned throughout —
+        // must match every shader's `struct Camera { view_proj, camera_pos, fog_color, fog_params }`
+        // (zone.wgsl, zone_instanced.wgsl, character.wgsl, character_skinned.wgsl, billboard.wgsl)
+        // or the uniform buffer read on the GPU side desyncs (eqoxide#517).
+        assert_eq!(std::mem::size_of::<CameraUniformData>(), 112);
     }
 
     #[test]
