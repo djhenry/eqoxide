@@ -146,24 +146,36 @@ impl Default for NetHealth {
 /// even due; kept well above a normal round-trip so ordinary latency never false-alarms.
 pub const PROBE_TIMEOUT_SECS: u64 = 10;
 
+/// #371 resend cadence for an unanswered liveness probe — and, crucially for #470, the interval
+/// before the NEXT probe is due AFTER one is answered. `gameplay.rs`'s `PROBE_INTERVAL` is built from
+/// this (single source of truth), and `PASSIVE_LIVENESS_STALE_SECS` is derived from it. See the note
+/// on the passive bound below for why an ANSWERED probe re-enters the passive branch for a full
+/// interval, which is what makes this value — not the first-probe timing — the one that matters.
+pub const PROBE_INTERVAL_SECS: u64 = 30;
+
 /// #470: passive-liveness staleness bound for the "no probe outstanding" branch of
-/// [`world_responsive`]. It exists to condemn a ZOMBIE session whose active prober is DEAD.
+/// [`world_responsive`]. It exists to condemn a ZOMBIE session whose active prober is DEAD, WITHOUT
+/// ever false-condemning a healthy idle-but-answering session (#343).
 ///
 /// The prober runs inside the gameplay net thread's loop (`gameplay.rs`). A failed world-reconnect
 /// can leave that thread exited: no more probes are ever sent, so `first_unanswered_probe_sent`
 /// stays `None` forever and the active-probe path can NEVER declare a wedge. Pre-#470 the `None`
 /// branch returned `true` unconditionally, so a fully dead session reported `world_responsive: true`
-/// indefinitely — the exact agent-honesty lie #470 is about. This bound lets the passive `last_packet`
+/// indefinitely — the exact agent-honesty lie #470 is about. This bound lets the passive proof-of-life
 /// clock ALONE condemn such a session even with no probe outstanding.
 ///
-/// It MUST sit safely ABOVE the app-silence age at which a LIVE session would already be in the
-/// active-probe path, so a legitimately-idle-but-answering session (#343) never trips it. Derived to
-/// mirror the active path exactly: a live prober fires its first probe after `PROBE_QUIET_THRESHOLD`
-/// (12s) of app-silence and declares a wedge `PROBE_TIMEOUT_SECS` (10s) later — i.e. at ~22s of
-/// app-silence. Set equal to that sum (22s) so a prober-DEAD zombie is condemned at the SAME
-/// app-silence age a still-probing wedged zone is, keeping the two liveness paths symmetric. On any
-/// live session a probe has moved the state to the `Some` branch long before this trips.
-pub const PASSIVE_LIVENESS_STALE_SECS: u64 = 22;
+/// DERIVED FROM THE RESEND CADENCE, not the first-probe timing (the bug the first cut of #470 had).
+/// A HEALTHY idle-but-answering session spends most of its life in the `None` branch: the instant a
+/// probe is answered, `record_probe_reply` clears the unanswered streak back to `None`, and the NEXT
+/// probe is not sent until `PROBE_INTERVAL_SECS` (30s) after the previous SEND. So its freshest
+/// proof-of-life (`probe_reply_ago`) climbs to nearly a FULL interval before the next probe refreshes
+/// it. The bound must therefore exceed one whole probe cycle plus its reply window, or a perfectly
+/// healthy every-probe-answering session would be condemned for the tail of every cycle, forever
+/// (`PROBE_INTERVAL` 30s + `PROBE_TIMEOUT` 10s = 40s; the earlier `PROBE_QUIET + PROBE_TIMEOUT` = 22s
+/// was < 30 and did exactly that). At the same time a genuinely dead-but-connected session is still
+/// condemned: a live prober would have re-probed at 30s and, getting no reply, moved to the Some/
+/// timeout branch by ~40s anyway — so nothing alive is still sitting in the `None` branch past 40s.
+pub const PASSIVE_LIVENESS_STALE_SECS: u64 = PROBE_INTERVAL_SECS + PROBE_TIMEOUT_SECS;
 
 /// #371/#470: decide, at HTTP read time, whether the WORLD (not just the link) is alive, from the
 /// link/probe/app clocks expressed as ages (time since the event; `None` = it never happened). Pure
@@ -991,16 +1003,18 @@ mod world_responsive_tests {
     }
 
     /// The #343-idle guard for the passive path: a CONNECTED session with no probe outstanding must
-    /// stay alive right up to the symmetric staleness bound, so the brief pre-probe app-silence window
-    /// (before a live prober fires at ~12s and moves the state to the `Some` branch) never false-alarms.
-    /// This is the ordering subtlety: the bound MUST exceed that window — matching the standing
-    /// `debug_defaults_world_responsive_true_before_the_first_probe` test's 20s no-probe case.
+    /// stay alive right up to the staleness bound (40s = one full probe cycle + reply window), so an
+    /// answered-idle session — whose proof-of-life climbs to nearly a full `PROBE_INTERVAL` between
+    /// answered probes — never false-alarms. The bound MUST exceed the resend cadence; below it lies
+    /// the regression the reviewer caught. See `gameplay.rs::wedge_timeline_tests` for the end-to-end
+    /// cadence proof over a real probe timeline.
     #[test]
     fn connected_no_probe_defers_below_the_passive_bound() {
-        assert!(world_responsive(true, None, None, s(20), TIMEOUT, STALE),
-            "20s app-silence with a live link and no probe yet must still defer to alive (< 22s bound)");
-        // ...and a live prober would have fired by real staleness this deep, so past the bound with
-        // STILL no probe means the prober is gone (#470) → condemn.
+        assert!(world_responsive(true, None, None, s(30), TIMEOUT, STALE),
+            "30s app-silence (one full probe interval) with a live link must still defer to alive (< 40s bound)");
+        // ...and a live prober would have re-probed at 30s and, unanswered, moved to the Some/timeout
+        // branch by ~40s — so still sitting in the `None` branch past the bound means the prober is
+        // gone (#470) → condemn.
         assert!(!world_responsive(true, None, None, STALE, TIMEOUT, STALE),
             "at/after the passive bound with no probe ever, the prober is dead → zombie (#470)");
     }
