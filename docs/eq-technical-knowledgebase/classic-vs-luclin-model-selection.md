@@ -1,6 +1,27 @@
 # Classic vs Luclin PC Model Selection (RoF2) — HUM Male Case Study
 
-**Status: confirmed by decompile + asset extraction + side-by-side native/eqoxide
+**STATUS: DISPUTED, 2026-07-17 (later pass).** The owner directly inspected the
+native RoF2 client and reports HUM male renders the **Luclin** model — higher
+poly count, and *separate, individually posed eye meshes* (matching
+`HUMEYE_R_DMSPRITEDEF` / `HUMEYE_L_DMSPRITEDEF`, confirmed to exist only in
+`globalhum_chr.s3d`, not in `global_chr.s3d`'s classic HUM head — see finding
+#4 below and `luclin-head-faces-and-hair.md` "2026-07-17 fresh re-verification").
+**Separate eye meshes are a Luclin-only feature; the classic HUM head (finding
+#4 in this doc) has no eye mesh at all, only painted eyes.** The owner's
+observation of movable eye geometry is therefore hard to reconcile with this
+doc's headline "native renders classic" conclusion, and should be treated as
+the stronger evidence pending a fresh side-by-side screenshot re-check. Do
+**not** cite this doc's "render classic for HUM male" recommendation without
+first re ‑verifying live against a current native screenshot — the original
+screenshot comparison (`a7ac6dcf` job, paths below) may itself have been
+misread, or the mismatch may be specific to that one GM character/account. The
+asset-level findings below (texture/mesh CONTENTS of `global_chr.s3d` vs
+`globalhum_chr.s3d`) remain independently verified and correct; only the
+**conclusion about which one native actually renders** is in question.
+
+---
+
+**Original status: confirmed by decompile + asset extraction + side-by-side native/eqoxide
 screenshots, 2026-07-17. Resolves issues #519 (head) and #520 (clothing).**
 
 ## The headline finding
