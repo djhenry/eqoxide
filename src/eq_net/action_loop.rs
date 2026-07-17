@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 /// Nav tick interval (ms). Steps are gated to fire no more often than this.
 const NAV_TICK_MS: u128 = 150;
 /// Native Titanium base run speed in EQ units/second (runspeed 0.7 → 44 u/s; 10 Hz updates of
-/// 4.4 u each). Per eq-client-expert, see docs/eq-technical-knowledgebase/player-movement-speed.md.
+/// 4.4 u each). Per eq-client-expert, see ~/git/eq_kb/player-movement-speed.md.
 /// We must NOT move faster than this: even where THIS server tolerates it, others rubber-band or
 /// reject motion the real client can't produce.
 pub(crate) const RUN_SPEED: f32 = 44.0;
@@ -720,7 +720,7 @@ impl ActionLoop {
     ///
     /// `command==1` (Open) → `Resolved(OpenOk)`: a real merchant confirmed the window opened.
     /// `command==0` (Close) → `Refused`: a REAL negative ack. Per eq-client-expert's research
-    /// against the EQEmu RoF2 source (`docs/eq-technical-knowledgebase/merchant-open-protocol.md`,
+    /// against the EQEmu RoF2 source (`~/git/eq_kb/merchant-open-protocol.md`,
     /// `client_packet.cpp` `Handle_OP_ShopRequest`), FIVE distinct server-side reasons — faction
     /// KOS/dubious, engaged in combat, feigned/invisible, charmed, or the window already busy —
     /// all fall through to this SAME `command=0` echo and are not distinguishable from the opcode

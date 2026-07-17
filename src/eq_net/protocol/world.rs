@@ -7,7 +7,7 @@
 /// sqrt(2·g·h)) converted to the client's internal per-update z-velocity units (~5-13); then
 /// `fall_score = |z_vel| − 4` (char_counter≈0, no safe-fall skill): ≤0 → no damage, ≥9 → lethal
 /// (20000), else a roll in `[0, score²·10]`. Returns (rolled_damage, max_damage). See
-/// docs/eq-technical-knowledgebase/falling-physics.md.
+/// ~/git/eq_kb/falling-physics.md.
 pub fn fall_damage(height: f32) -> (u32, u32) {
     const GRAVITY: f32 = 120.0;   // matches the renderer's fall physics
     const TERMINAL: f32 = 128.0;  // native internal z-velocity clamp

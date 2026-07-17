@@ -91,7 +91,7 @@ pub struct EntityUniform {
 ///
 /// `fog_params` = `[minclip, maxclip, density, enabled]`: `enabled` is 1.0/0.0 (not just an
 /// implicit "maxclip <= minclip" test) so the shader-side gate is explicit and matches the native
-/// client's hard FOGENABLE toggle (see `docs/eq-technical-knowledgebase/zone-distance-fog.md`).
+/// client's hard FOGENABLE toggle (see `~/git/eq_kb/zone-distance-fog.md`).
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CameraUniformData {

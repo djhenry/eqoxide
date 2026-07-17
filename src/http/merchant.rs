@@ -44,7 +44,7 @@ struct TradeOpenBody {
 ///   • 202 — the outcome is UNKNOWN: no resolving packet arrived within 4s. This is what a target
 ///     that is NOT a merchant NPC at all, or one that's out of range, produces — the server sends
 ///     NO packet of any kind on that path (confirmed against the EQEmu RoF2 source; see
-///     `docs/eq-technical-knowledgebase/merchant-open-protocol.md`). The body says so explicitly. A
+///     `~/git/eq_kb/merchant-open-protocol.md`). The body says so explicitly. A
 ///     202 MUST NOT be read as success — that is the whole honesty invariant of A3 (see
 ///     `crate::command_state::result`).
 async fn post_trade_open(

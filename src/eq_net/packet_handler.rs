@@ -250,7 +250,7 @@ fn apply_task_activity(gs: &mut GameState, p: &[u8]) {
 // OP_GroupLeaderChange / OP_GroupAcknowledge) ───────────────────────────────────────────────────
 // Server-authoritative: every inbound packet here is the server confirming or announcing a group
 // change; eqoxide never applies a roster change locally before one of these arrives. See
-// docs/eq-technical-knowledgebase/group-protocol.md for full struct layouts and source citations.
+// ~/git/eq_kb/group-protocol.md for full struct layouts and source citations.
 
 /// OP_GroupUpdateB — full personalized roster snapshot, sent at group founding and on refresh.
 /// Streamed/variable layout (mirrors OP_PlayerProfile's streaming quirk): header
@@ -1537,7 +1537,7 @@ fn apply_exp_update(gs: &mut GameState, payload: &[u8]) {
 // EQEmu's `Mob::Damage` takes `spell_id` as a `uint16` and every melee call site passes
 // SPELL_UNKNOWN explicitly (zone/attack.cpp), which zero-extends onto this wire's `uint32`
 // field as 0x0000FFFF. A bare `spellid != 0` check therefore treats every melee swing as a
-// spell cast. See docs/eq-technical-knowledgebase/combat-damage-struct.md.
+// spell cast. See ~/git/eq_kb/combat-damage-struct.md.
 const SPELL_UNKNOWN: u32 = 0xFFFF;
 fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < 13 { return; }
@@ -2112,10 +2112,10 @@ pub fn attitude_name(faction: u32) -> &'static str {
 /// The native RoF2 client prints ONE line combining an attitude clause (from `faction`) and an
 /// idiomatic difficulty-assessment clause (from `level`'s bracket vs. the player's own level),
 /// entirely colored by the ConsiderColor — e.g. "a decaying skeleton glares at you threateningly --
-/// looks kind of risky, but you might win." (traced to `eqgame.exe.c` `FUN_00522e20`, eqstr template
+/// looks kind of risky, but you might win." (verified against the native RoF2 client; eqstr template
 /// 12239 = "%1 %2 -- %3"). eqoxide does not reproduce that per-bracket retail prose table (its exact
 /// wording per (player-level-bracket × color) combination could not be fully resolved from the
-/// decompile); `consider_message` below covers only the attitude half, and `con_level_name` names
+/// native client); `consider_message` below covers only the attitude half, and `con_level_name` names
 /// the difficulty tier as a plain machine-readable label (used in the chat line's own honestly-
 /// labeled difficulty clause below, and in `target_con_name`/`last_consider.con_name`) rather than
 /// inventing retail sentences we can't verify.
@@ -2425,7 +2425,7 @@ fn loot_refusal_reason(response: u8) -> Option<&'static str> {
 /// #414: `OP_MoneyOnCorpse` carries no corpse/entity id anywhere in its 20 bytes (verified against
 /// the RoF2 wire — `moneyOnCorpseStruct` is response(u8) + 2 fixed per-response-path constants +
 /// 1 true pad byte + pp/gp/sp/cp; no ENCODE/DECODE override exists for RoF2 so it's sent verbatim;
-/// see docs/eq-technical-knowledgebase/loot-protocol.md for full citations). The ONLY correlation
+/// see ~/git/eq_kb/loot-protocol.md for full citations). The ONLY correlation
 /// available to the client is its OWN request state: this ack is only meaningful while we are
 /// ACTUALLY still on the open session we most recently asked to loot — i.e. `loot_session_active`
 /// is true and we haven't given up and started a defensive close (`loot_defensive_close_at`). Any
@@ -3569,7 +3569,7 @@ mod tests {
         // and every melee call site passes SPELL_UNKNOWN, which zero-extends onto this wire's
         // uint32 field as 0x0000FFFF. A `spellid != 0` classification therefore misreports every
         // melee hit as "casts a spell on" / "'s spell hits ... for N damage" — a silent wrong
-        // answer in the combat log. See docs/eq-technical-knowledgebase/combat-damage-struct.md.
+        // answer in the combat log. See ~/git/eq_kb/combat-damage-struct.md.
         use super::apply_combat_damage;
         let spell = |target: u16, source: u16, spellid: u32, damage: i32| -> [u8; 13] {
             let mut b = [0u8; 13];
