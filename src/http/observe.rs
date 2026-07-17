@@ -285,6 +285,16 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // at"; `frontier` is the hazard at the search's CLOSEST APPROACH — one blocking fact, named
         // as such (not `reason`), not necessarily the only one. Top-level (not under `player`) so the
         // large player object stays within serde_json's macro recursion limit.
+        // GOAL IDENTITY (#349). `nav_state`/`nav_reason` (under `player`) are the status *of this
+        // goal* — never of an earlier one. `nav_goal_id` is the monotonic generation stamped by the
+        // accepting POST (echoed in its response body); `nav_goal` is that goal's `[x,y,z]` (null for
+        // idle/stop, or a zone_cross whose concrete line isn't resolved yet). A terminal
+        // `arrived`/`no_path`/`blocked` is trustworthy ONLY for the `nav_goal_id` reported here: a
+        // fresh `POST /goto` bumps this and resets `nav_state` to `pending` atomically, so a read can
+        // never attribute the previous goto's outcome to the new one. Top-level (not under `player`)
+        // because that object is already at serde_json's macro recursion limit.
+        "nav_goal_id": nav.goal_id,
+        "nav_goal": nav.goal,
         "nav_blocked_by": nav_blocked_by,
         // The PER-ROUTE clearance tier the CURRENT route needed (#378 Phase 2 / design §4c):
         // `minimum` (tight, no margin — riskier) | `preferred` (roomy) | null (no route committed).
