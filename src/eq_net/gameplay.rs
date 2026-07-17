@@ -1472,7 +1472,7 @@ mod wedge_timeline_tests {
     //! (true@0, false@22, true@42, false@52, true@72, ... — the exact timeline from the bug report),
     //! because every resend restamped the SAME clock `world_responsive` used for its 10s grace check.
     use super::{record_app_packet, record_probe_sent, should_send_probe, PROBE_INTERVAL};
-    use crate::ipc::{world_responsive, NetHealth, PROBE_TIMEOUT_SECS};
+    use crate::ipc::{world_responsive, NetHealth, PASSIVE_LIVENESS_STALE_SECS, PROBE_TIMEOUT_SECS};
     use std::time::{Duration, Instant};
 
     /// Drives a timeline second-by-second through the REAL `NetHealth` and the real production state
@@ -1514,7 +1514,12 @@ mod wedge_timeline_tests {
             let first_unanswered_ago = h.first_unanswered_probe_sent.map(|s| now_t.duration_since(s));
             let probe_reply_ago      = h.last_probe_reply.map(|s| now_t.duration_since(s));
             let last_packet_ago      = now_t.duration_since(h.last_packet);
-            let responsive = world_responsive(first_unanswered_ago, probe_reply_ago, last_packet_ago, timeout);
+            // These timelines model a WEDGED-BUT-ACKing zone (#371), so the link is alive throughout
+            // (`connected == true`); the #470 passive staleness bound is passed but only governs the
+            // no-probe branch, which these scenarios exit at ~12s of app-silence when the probe fires.
+            let responsive = world_responsive(
+                true, first_unanswered_ago, probe_reply_ago, last_packet_ago, timeout,
+                Duration::from_secs(PASSIVE_LIVENESS_STALE_SECS));
             verdicts.push((t, responsive));
         }
         verdicts

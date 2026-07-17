@@ -433,9 +433,15 @@ impl HttpState {
         // wedged zone re-earn the 10s in-flight grace window forever (the #371-followup bug).
         let probe_sent_ago  = h.first_unanswered_probe_sent.map(|t| t.elapsed());
         let probe_reply_ago = h.last_probe_reply.map(|t| t.elapsed());
+        // #470: `world_responsive` must know the LINK is dead. When a failed world-reconnect kills the
+        // net thread the prober dies too, so no probe is ever outstanding — without this, the "no
+        // probe" branch reported a zombie session alive forever. `connected` here is the SAME value
+        // published in `Health` below (both derived from `last_datagram` vs CONN_STALE_SECS).
+        let connected = link_age.as_secs() < CONN_STALE_SECS;
         let world_responsive = world_responsive(
-            probe_sent_ago, probe_reply_ago, last_packet_ago,
+            connected, probe_sent_ago, probe_reply_ago, last_packet_ago,
             std::time::Duration::from_secs(PROBE_TIMEOUT_SECS),
+            std::time::Duration::from_secs(PASSIVE_LIVENESS_STALE_SECS),
         );
         // Most recent proof the world processed something for us: a probe reply OR spontaneous
         // traffic, whichever is fresher. Falls back to the app clock before any probe has replied.
@@ -449,7 +455,7 @@ impl HttpState {
             // Link liveness, NOT world activity — see `NetHealth`. An idle session goes 40+s with
             // no application packet while the session layer keeps ACKing; calling that "disconnected"
             // would be just as much a lie as #343's frozen `connected: true`.
-            connected:          link_age.as_secs() < CONN_STALE_SECS,
+            connected,
             world_responsive,
             last_world_response_ms,
         }
