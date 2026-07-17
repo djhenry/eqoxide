@@ -56,7 +56,7 @@ async fn post_manual(
     if dir[0] == 0.0 && dir[1] == 0.0 && up == 0.0 && !jump {
         return (StatusCode::BAD_REQUEST, "provide a direction {east,north}, {up:-1..1} (swim), and/or {\"jump\":true}".into());
     }
-    s.command.request_manual_move(ManualMove {
+    s.camera.request_manual_move(ManualMove {
         dir, up, jump,
         until: std::time::Instant::now() + std::time::Duration::from_millis(ms),
     });
@@ -68,7 +68,7 @@ async fn post_manual(
 /// upward toward the surface (#207), e.g. to lift off a pool floor.
 async fn post_jump(State(s): State<HttpState>) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    s.command.request_manual_move(ManualMove {
+    s.camera.request_manual_move(ManualMove {
         dir: [0.0, 0.0], up: 0.0, jump: true,
         until: std::time::Instant::now() + std::time::Duration::from_millis(400),
     });

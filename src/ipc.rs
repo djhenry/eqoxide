@@ -268,6 +268,11 @@ pub type NavAvoidShared = Arc<Mutex<AggroAvoidOpts>>;
 /// exactly what the walker is following instead of an independent per-frame `find_path` recompute
 /// (#246). `.0` = coarse global route (`ActionLoop::path`), `.1` = fine local plan
 /// (`ActionLoop::local_path`). Empty when idle. Draw-only; never steered from.
+///
+/// MVC C2 (#452): this is DERIVED/READ state (the Model's nav thread produces it, the render View
+/// consumes it to draw), NOT a view→model command — so it lives on the render↔nav integration
+/// channel [`ControllerSlots`] alongside the other single-authority movement channels, and NOT in a
+/// command bundle ([`NavSlots`]) / the [`crate::command_state::CommandState`] facade.
 pub type NavPathView = Arc<Mutex<(Vec<[f32; 3]>, Vec<[f32; 3]>)>>;
 
 /// Live entity name → (x, y, z) map, updated by login.rs as packets arrive.
@@ -884,11 +889,14 @@ pub struct ChatSlots {
     pub messages:    MessagesShared,
 }
 
-/// `/v1/move/*`: the `/goto` target (+ chase-entity), zone-crossing, aggro-avoidance knobs, live
-/// nav status, and the walker's draw-only path mirror. Does NOT include the manual-move/jump
-/// escape hatch (`ManualMoveReq`) — that slot is consumed by the RENDER thread, not the nav
-/// thread/`ActionLoop` (see `CameraSlots`), so folding it in here would make `ActionLoop` carry a
-/// field it can never read.
+/// `/v1/move/*`: the `/goto` target (+ chase-entity), zone-crossing, aggro-avoidance knobs, and live
+/// nav status. Does NOT include the manual-move/jump escape hatch (`ManualMoveReq`) — that slot is
+/// consumed by the RENDER thread, not the nav thread/`ActionLoop` (see `CameraSlots`), so folding it
+/// in here would make `ActionLoop` carry a field it can never read.
+///
+/// MVC C2 (#452): the walker's draw-only computed path (`nav_path_view`) was moved OUT of here to
+/// [`ControllerSlots`] — it is Model→View derived render state, not a view→model command, so it does
+/// not belong in a command bundle carried by [`crate::command_state::CommandState`].
 #[derive(Clone, Default)]
 pub struct NavSlots {
     pub goto_target:   GotoTarget,
@@ -896,7 +904,6 @@ pub struct NavSlots {
     pub zone_cross:    ZoneCrossReq,
     pub nav_avoid:     NavAvoidShared,
     pub nav_state:     NavStateShared,
-    pub nav_path_view: NavPathView,
 }
 
 /// The live entity registry (`login.rs` writes it as spawn packets arrive): name → position/id,
@@ -914,11 +921,18 @@ pub struct WorldSlots {
 /// position snapshot streamed to the server, the `/goto` planner's per-frame movement intent, and
 /// a server correction handed back to the controller. `ActionLoop`-only — `HttpState` has no
 /// controller-facing endpoint today, so there is nothing for it to embed here.
+///
+/// MVC C2 (#452): `nav_path_view` — the walker's committed path published for the render overlay —
+/// lives here too. It is another render↔nav integration channel (nav thread → render View), the
+/// same family as `nav_intent`/`pos_correction`, and specifically NOT a view→model command, so it
+/// was relocated here from the `NavSlots` command bundle. The Walker (nav thread) writes it, `App`
+/// (render) reads it to draw; neither the HTTP side nor `CommandState` touches it.
 #[derive(Clone, Default)]
 pub struct ControllerSlots {
     pub controller_view: ControllerShared,
     pub nav_intent:      NavIntent,
     pub pos_correction:  PosCorrection,
+    pub nav_path_view:   NavPathView,
 }
 
 /// `/v1/lifecycle/*`: camp (+ its published deadline) and respawn. `HttpState`-only: `ActionLoop`
@@ -937,12 +951,67 @@ pub struct LifecycleSlots {
 /// and the manual-move/jump escape hatch consumed by the controller alongside WASD. `HttpState`-
 /// only; no `Default` (the camera snapshot's initial value is meaningful — see `App::new`/
 /// `main.rs` — so callers construct this explicitly rather than risk a silently-wrong default).
+///
+/// MVC C2 (#452): the manual-move/jump escape hatch (`manual_move`) is a view→RENDER command — the
+/// render thread's controller consumes it (see `App`), the Model/nav thread never does — so it lives
+/// HERE, on the render-bound camera bundle, and NOT in the view→MODEL [`crate::command_state::
+/// CommandState`] facade. `request_manual_move` is the typed write the HTTP View makes (mirroring
+/// `cmd_tx`'s role for the orbit camera); the render View reads `manual_move` directly per frame.
 #[derive(Clone)]
 pub struct CameraSlots {
     pub cmd_tx:      Arc<Mutex<Option<crate::camera_state::CameraCmd>>>,
     pub snapshot:    Arc<Mutex<crate::camera_state::CameraSnapshot>>,
     pub frame_req:   FrameReq,
     pub manual_move: ManualMoveReq,
+}
+
+impl CameraSlots {
+    /// Queue a manual-move/jump escape-hatch command (POST /v1/move/manual, /v1/move/jump). The
+    /// render thread's `CharacterController` picks it up next frame and drives until `m.until`
+    /// (#188/#207). This is a view→render command; it never reaches the Model/nav thread.
+    pub fn request_manual_move(&self, m: ManualMove) {
+        *self.manual_move.lock().unwrap() = Some(m);
+    }
+}
+
+/// MVC C2 (#452): pin the tidied CommandState boundary at the `ipc` layer.
+#[cfg(test)]
+mod c2_boundary_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// The manual-move/jump escape hatch is a view→RENDER command owned by `CameraSlots` (the
+    /// render-bound bundle), not the view→model `CommandState`. Round-trip its typed write against a
+    /// direct per-frame read, exactly as the HTTP View writes it and the render View consumes it.
+    #[test]
+    fn camera_slots_manual_move_round_trips() {
+        let camera = CameraSlots {
+            cmd_tx:      Arc::new(Mutex::new(None)),
+            snapshot:    Arc::new(Mutex::new(
+                crate::camera_state::CameraState::new([0.0, 0.0, 0.0], 0.0).snapshot(),
+            )),
+            frame_req:   Arc::new(Mutex::new(None)),
+            manual_move: Arc::new(Mutex::new(None)),
+        };
+        assert!(camera.manual_move.lock().unwrap().is_none());
+
+        let m = ManualMove { dir: [1.0, 0.0], up: 0.0, jump: false, until: Instant::now() + Duration::from_millis(400) };
+        camera.request_manual_move(m);
+        // The render thread's per-frame read (see `App`): a non-clearing poll of `Option<ManualMove>`.
+        let seen = camera.manual_move.lock().unwrap().expect("manual move queued");
+        assert_eq!(seen.dir, [1.0, 0.0]);
+    }
+
+    /// The walker's computed path overlay is DERIVED/READ state on the render↔nav integration
+    /// channel (`ControllerSlots`), NOT a command in `NavSlots`. This pins the relocation: the field
+    /// exists on `ControllerSlots` and starts empty (idle). (`NavSlots` no longer carrying it is
+    /// enforced structurally by the type — this file would not compile if it still did.)
+    #[test]
+    fn nav_path_view_lives_on_the_controller_channel() {
+        let controller = ControllerSlots::default();
+        let (coarse, fine) = &*controller.nav_path_view.lock().unwrap();
+        assert!(coarse.is_empty() && fine.is_empty(), "an idle overlay is empty");
+    }
 }
 
 /// #371: the active-liveness-probe state machine, tested as a pure function. These are the exact

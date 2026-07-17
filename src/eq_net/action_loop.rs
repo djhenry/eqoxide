@@ -371,8 +371,9 @@ pub struct ActionLoop {
     /// OWN clone privately (`nav::walker::Walker::nav` is not even `pub(crate)`), and several unit
     /// tests below (`dead_player_halts_navigation`, `zone_change_resets_stale_destination_and_path`,
     /// `a_snapped_goal_z_is_reported_not_silently_performed`, `nav_tier_does_not_survive_...`) need a
-    /// handle on the exact same shared Arc to seed/assert `nav_state`/`goto_target`/`goto_entity`/
-    /// `nav_path_view` directly. `#[cfg(test)]` code doesn't compile under `cargo build --lib`, so the
+    /// handle on the exact same shared Arc to seed/assert `nav_state`/`goto_target`/`goto_entity`
+    /// directly. (The walker's `nav_path_view` overlay moved to `self.controller` in #452.)
+    /// `#[cfg(test)]` code doesn't compile under `cargo build --lib`, so the
     /// lint can't see those reads and flags the field as dead outside `cargo test` — hence the allow.
     #[allow(dead_code)]
     nav:              crate::ipc::NavSlots,
@@ -505,6 +506,7 @@ impl ActionLoop {
     ) -> Self {
         let walker = crate::nav::walker::Walker::new(
             nav.clone(), world.clone(), collision.clone(), controller.nav_intent.clone(),
+            controller.nav_path_view.clone(),
         );
         ActionLoop {
             nav,
@@ -4323,7 +4325,7 @@ mod tests {
             *nav.nav.goto_target.lock().unwrap() = Some((100.0, 200.0, 0.0));
             *nav.nav.goto_entity.lock().unwrap() = Some("a bat".into());
             *nav.controller.nav_intent.lock().unwrap() = Some(crate::movement::MoveIntent::default());
-            *nav.nav.nav_path_view.lock().unwrap() = (vec![[0.0, 0.0, 0.0]], vec![[0.0, 0.0, 0.0]]);
+            *nav.controller.nav_path_view.lock().unwrap() = (vec![[0.0, 0.0, 0.0]], vec![[0.0, 0.0, 0.0]]);
             nav.walker.path = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]];
             nav.walker.local_path = vec![[0.0, 0.0, 0.0]];
             nav.walker.path_goal = Some((100.0, 200.0, 0.0));
@@ -4397,7 +4399,7 @@ mod tests {
         *nav.nav.goto_target.lock().unwrap() = Some((100.0, 200.0, 0.0));
         *nav.nav.goto_entity.lock().unwrap() = Some("a bat".into());
         *nav.controller.nav_intent.lock().unwrap() = Some(crate::movement::MoveIntent::default());
-        *nav.nav.nav_path_view.lock().unwrap() = (vec![[0.0, 0.0, 0.0]], vec![[0.0, 0.0, 0.0]]);
+        *nav.controller.nav_path_view.lock().unwrap() = (vec![[0.0, 0.0, 0.0]], vec![[0.0, 0.0, 0.0]]);
         nav.walker.path = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]];
         nav.walker.local_path = vec![[0.0, 0.0, 0.0]];
         nav.walker.path_goal = Some((100.0, 200.0, 0.0));
@@ -4418,7 +4420,7 @@ mod tests {
         assert!(nav.nav.goto_target.lock().unwrap().is_none(), "goto_target must clear on zone change");
         assert!(nav.nav.goto_entity.lock().unwrap().is_none(), "goto_entity must clear on zone change");
         assert!(nav.controller.nav_intent.lock().unwrap().is_none(), "nav_intent must clear so the controller stops");
-        let (coarse, fine) = &*nav.nav.nav_path_view.lock().unwrap();
+        let (coarse, fine) = &*nav.controller.nav_path_view.lock().unwrap();
         assert!(coarse.is_empty() && fine.is_empty(), "overlay path must clear on zone change");
         assert!(nav.walker.path.is_empty() && nav.walker.local_path.is_empty(), "route must clear on zone change");
         assert_eq!(nav.walker.path_goal, None);

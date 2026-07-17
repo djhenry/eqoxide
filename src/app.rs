@@ -101,6 +101,11 @@ pub struct App {
     camera:             CameraState,
     camera_cmd:         Arc<Mutex<Option<CameraCmd>>>,
     camera_snapshot:    Arc<Mutex<CameraSnapshot>>,
+    /// The HTTP manual-move/jump escape hatch (`POST /v1/move/{manual,jump}`), read directly here
+    /// each frame. MVC C2 (#452): this is a view→RENDER command owned by `ipc::CameraSlots` (not the
+    /// view→model `CommandState`), so `App` holds the slot itself rather than reaching through
+    /// `self.acts.command`. The DERIVED heading it implies is computed render-side (`manual_wish`).
+    manual_move:        crate::ipc::ManualMoveReq,
     camera_initialized: bool,
     /// Set on every zone change. While true, the first frame with loaded collision settles the
     /// player onto the NEAREST floor (above or below), fixing zone-ins where the zone-point z is
@@ -240,6 +245,7 @@ impl App {
         character_name:  String,
         camera_cmd:      Arc<Mutex<Option<CameraCmd>>>,
         camera_snapshot: Arc<Mutex<CameraSnapshot>>,
+        manual_move:     crate::ipc::ManualMoveReq,
         game_state_snapshot: crate::ipc::GameStateSnapshot,
         net_health: crate::ipc::NetHealthShared,
         frame_req:       FrameReq,
@@ -293,7 +299,7 @@ impl App {
             prev_logical_pos:  [0.0, 0.0, 0.0],
             last_moved_at:     std::time::Instant::now(),
             camera: CameraState::new([0.0, 0.0, 0.0], 0.0),
-            camera_cmd, camera_snapshot,
+            camera_cmd, camera_snapshot, manual_move,
             camera_initialized: false,
             needs_reground: false,
             last_frame_time: std::time::Instant::now(),
@@ -1128,7 +1134,10 @@ impl App {
             // HTTP manual-move / jump escape hatch (#188): drive the controller like WASD when an
             // agent is stuck (A* found no path). Active only while within its deadline; yields to
             // real keyboard input, but takes priority over the nav planner's /goto intent.
-            let manual = self.acts.command.peek_manual_move()
+            // Non-clearing per-frame poll of the view→render manual-move slot (#452: owned by
+            // `ipc::CameraSlots`, not `CommandState`). `ManualMove` is `Copy`; the render loop
+            // re-reads it every frame until its `until` deadline, so it must NOT drain.
+            let manual = { *self.manual_move.lock().unwrap() }
                 .filter(|m| std::time::Instant::now() < m.until);
             let intent = if wasd_active || space {
                 crate::movement::MoveIntent {
