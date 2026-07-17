@@ -540,7 +540,7 @@ pub type DialogueShared = Arc<Mutex<Vec<crate::game_state::DialogueChoice>>>;
 /// Live navigation state for the active `/move/goto`, set by the nav thread and read by
 /// GET /v1/observe/debug. `state` is the agent-facing contract documented in `docs/http-api.md`:
 ///
-/// `idle` | `planning` | `navigating` | `navigating_partial` | `following` | `arrived` |
+/// `pending` | `idle` | `planning` | `navigating` | `navigating_partial` | `following` | `arrived` |
 /// `no_path` | `search_exhausted` | `blocked`
 ///
 /// `reason` is the machine-readable WHY behind a terminal state (`goal_not_walkable`,
@@ -551,6 +551,21 @@ pub type DialogueShared = Arc<Mutex<Vec<crate::game_state::DialogueChoice>>>;
 pub struct NavStatus {
     pub state:  String,
     pub reason: Option<String>,
+    /// GOAL IDENTITY (#349): a monotonically increasing generation stamp, bumped every time a NEW
+    /// navigation request (`/move/{goto,follow,zone_cross,stop}`) is accepted. `state` is the status
+    /// *of goal `goal_id`* — never of some earlier goal. Without this, a read right after a fresh
+    /// `POST /goto` could return the PREVIOUS goto's terminal `arrived`/`no_path`/`blocked` (the
+    /// walker only re-labels `state` on its next ~150ms tick), letting an agent conclude the new goto
+    /// already finished. Each accept resets `state` to `pending` and bumps this ATOMICALLY (under the
+    /// same lock), so goal N's terminal value can never be attributed to goal N+1. `0` = no request
+    /// has been issued this session/zone. Surfaced as `nav_goal_id` on GET /v1/observe/debug; echoed
+    /// in each accepting POST's response body.
+    pub goal_id: u64,
+    /// The goal coordinates `[x, y, z]` this `goal_id` is navigating to (server coords), so a caller
+    /// can correlate "this state is for the goal I asked for". `None` for `idle`/`stop` (no goal) and
+    /// for a `zone_cross` before the walker has resolved the concrete zone-line destination. Surfaced
+    /// as `nav_goal` on GET /v1/observe/debug.
+    pub goal: Option<[f32; 3]>,
     /// The agent-honesty payload behind a terminal `no_path` (#378 Phase 2): WHAT is blocking the
     /// goal, and WHERE. `blocked_goal` is the definitive "your goal itself cannot be stood at";
     /// `blocked_frontier` is "I got as close as here and this is the obstruction between me and the
@@ -611,14 +626,16 @@ pub struct NavLocal {
 impl Default for NavStatus {
     fn default() -> Self {
         NavStatus { state: "idle".into(), reason: None, local: None,
-            blocked_goal: None, blocked_frontier: None, tier: None }
+            blocked_goal: None, blocked_frontier: None, tier: None,
+            goal_id: 0, goal: None }
     }
 }
 
 impl From<&str> for NavStatus {
     fn from(state: &str) -> Self {
         NavStatus { state: state.to_string(), reason: None, local: None,
-            blocked_goal: None, blocked_frontier: None, tier: None }
+            blocked_goal: None, blocked_frontier: None, tier: None,
+            goal_id: 0, goal: None }
     }
 }
 

@@ -179,10 +179,14 @@ async fn post_goto(
 
     // Apply aggro-avoidance knobs for this route (#242).
     apply_avoid_opts(&s.nav.nav_avoid, b.avoid_aggro, b.aggro_buffer);
-    // Set the position, then clear any chase — goto walks to a fixed point and stops.
-    s.command.request_goto(target);
-    tracing::info!("move/goto: target set to ({:.1},{:.1},{:.1})", target.0, target.1, target.2);
-    (StatusCode::OK, format!("navigating to ({:.1},{:.1},{:.1})", target.0, target.1, target.2))
+    // Set the position, then clear any chase — goto walks to a fixed point and stops. `request_goto`
+    // stamps a fresh goal identity (state → `pending`, bumped `goal_id`) SYNCHRONOUSLY, so a read
+    // right after this can never return the PREVIOUS goto's terminal state (#349).
+    let goal_id = s.command.request_goto(target);
+    tracing::info!("move/goto: target set to ({:.1},{:.1},{:.1}) [goal #{goal_id}]", target.0, target.1, target.2);
+    // Echo the goal id so the caller can correlate a later `nav_state` read to THIS request: a
+    // terminal state on GET /v1/observe/debug is only about the goal it reports in `nav_goal_id`.
+    (StatusCode::OK, format!("navigating to ({:.1},{:.1},{:.1}) [goal_id={goal_id}] — poll GET /v1/observe/debug; nav_state is honest only for this nav_goal_id", target.0, target.1, target.2))
 }
 
 /// POST /v1/move/follow — walk to a named entity and KEEP FOLLOWING (goto_entity=Some) until
@@ -216,18 +220,20 @@ async fn post_follow(
 
     // Position first, then the chase key: the nav thread re-resolves the key's live position each
     // tick (eqoxide#88) and homes in as the entity moves.
-    s.command.request_follow(key.clone(), pos);
-    tracing::info!("move/follow: chasing {:?} from ({:.1},{:.1},{:.1})", key, pos.0, pos.1, pos.2);
-    (StatusCode::OK, format!("following {}", clean_entity_name(&key)))
+    let goal_id = s.command.request_follow(key.clone(), pos);
+    tracing::info!("move/follow: chasing {:?} from ({:.1},{:.1},{:.1}) [goal #{goal_id}]", key, pos.0, pos.1, pos.2);
+    (StatusCode::OK, format!("following {} [goal_id={goal_id}]", clean_entity_name(&key)))
 }
 
 /// POST /v1/move/stop — cancel any active goto/follow. Idempotent. Clears goto_target and
 /// goto_entity; the nav thread then clears nav_intent next tick via its "no goto ⇒ no nav" invariant.
 async fn post_stop(State(s): State<HttpState>) -> (StatusCode, String) {
     if let Err(e) = require_live_session(&s) { return e; }
-    s.command.request_stop();
-    tracing::info!("move/stop: navigation cancelled");
-    (StatusCode::OK, "navigation stopped".into())
+    // Reset nav_state to `idle` under a fresh goal id SYNCHRONOUSLY (#349): before this, `/stop`
+    // returned "navigation stopped" while nav_state still read the cancelled goal's `arrived`.
+    let goal_id = s.command.request_stop();
+    tracing::info!("move/stop: navigation cancelled [goal #{goal_id}]");
+    (StatusCode::OK, format!("navigation stopped [goal_id={goal_id}]"))
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -290,13 +296,15 @@ async fn post_zone_cross(
         }
     }
     let zone_id = zone_id as u16; // safe: either 0, or validated above to fit u16 and be reachable
-    s.command.request_zone_cross(zone_id);
-    tracing::info!("zone_cross: flagged for OP_ZONE_CHANGE (target zone_id={zone_id})");
+    // Reset nav_state to `pending` under a fresh goal id SYNCHRONOUSLY (#349), so a read right after
+    // this 200 can't see the previous nav's terminal state before the walker drains the request.
+    let goal_id = s.command.request_zone_cross(zone_id);
+    tracing::info!("zone_cross: flagged for OP_ZONE_CHANGE (target zone_id={zone_id}) [goal #{goal_id}]");
     // Honest, async-aware response (#267): the client WALKS to the zone line, it does not teleport, so
     // this 200 means "accepted", not "arrived". Tell the caller how to observe the real outcome — a bare
     // "queued" read as success while a wedged character went nowhere.
     (StatusCode::OK, format!(
-        "zone_cross to zone_id={zone_id} accepted — walking to the zone line (async, not a teleport). \
+        "zone_cross to zone_id={zone_id} accepted [goal_id={goal_id}] — walking to the zone line (async, not a teleport). \
          Poll GET /v1/observe/debug: the `zone` field changes on success. Every failure is now reported \
          honestly in `nav_state` (+`nav_reason`): `no_path` = no route to the line EXISTS (definitive), \
          `search_exhausted` = the planner gave up ('I don't know', not 'no'), `blocked` = a route exists \

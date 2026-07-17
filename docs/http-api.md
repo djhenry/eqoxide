@@ -33,7 +33,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 
 | Route | Description |
 |-------|-------------|
-| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, target `target_id`/`target_name`/`target_hp_pct`) + **navigation** (`nav_state`, `nav_reason`, `nav_blocked_by`, `nav_tier` — see [Navigation state](#navigation-state)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms` — see [Connection health](#connection-health)) + camera state. |
+| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, target `target_id`/`target_name`/`target_hp_pct`) + **navigation** (`nav_state`, `nav_reason`, `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier` — see [Navigation state](#navigation-state)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms` — see [Connection health](#connection-health)) + camera state. |
 | `GET /v1/observe/frame` | Current rendered frame as a PNG (`Content-Type: image/png`). |
 | `GET /v1/observe/entities[?labeled=1]` | Default: `{ "<name>": [x,y,z], ... }` for all known entities, with same-base-name + byte-identical-position duplicates collapsed (#471 — suspected server-side `spawn2` duplication; the model is untouched so each instance is still targetable by its full name). `?labeled=1` returns the richer `{count, entities:{"<name>":[x,y,z]}, deduped, duplicate_groups:[{position,names,kept}], note}` exposing which duplicates were collapsed. |
 | `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency}`. Slots are Titanium **wire** ids (DB general slots 23-30 → wire 22-29). |
@@ -199,6 +199,7 @@ machine-readable *why*, `null` unless a state has one). Together they are how yo
 
 | `nav_state` | Meaning | `nav_reason` |
 |-------------|---------|--------------|
+| `pending` | A `/move/{goto,follow,zone_cross}` was **just accepted** and the walker has not ticked yet. Transient (≤ ~150 ms), then becomes `planning`/`navigating`/`following`. Its purpose is honesty: the instant a new request is accepted the state resets to `pending` (under a fresh `nav_goal_id`), so a read can **never** return the *previous* goal's terminal `arrived`/`no_path`/`blocked` as if it were the new request's outcome (#349). | — |
 | `idle` | Nothing to do. | — |
 | `planning` | A route is being computed on the pathfinding worker thread. The character stands still. Normally < 1 s. | — |
 | `navigating` | Walking a **complete route to your goal**. | `goal_z_snapped` (see below) or — |
@@ -208,6 +209,22 @@ machine-readable *why*, `null` unless a state has one). Together they are how yo
 | `no_path` | **DEFINITIVE: no route exists.** The planner searched to completion. Do not retry the same goal — pick another. | see below |
 | `search_exhausted` | The planner **gave up**. This is **"I don't know", not "no"** — a route may well exist. Try a nearer waypoint. | `search_node_cap` |
 | `blocked` | A route exists, but the walker **could not follow it** (wedged after 8 recovery attempts). Not a routing failure. | `walker_stalled`, `local_no_way_through`, `fall_would_be_lethal` |
+
+### `nav_goal_id` and `nav_goal` — goal identity (#349)
+
+`GET /v1/observe/debug` carries two more top-level fields under `player`:
+
+- **`nav_goal_id`** — a monotonically increasing counter, bumped every time a `POST /v1/move/{goto,follow,zone_cross,stop}` is accepted. It is **echoed in each of those POST's response bodies** (`[goal_id=N]`). `nav_state`/`nav_reason` are the status *of this goal id* — never of an earlier one.
+- **`nav_goal`** — that goal's `[x, y, z]` (server coords), or `null` for `idle`/`stop`, or for a `zone_cross` whose concrete zone-line destination the walker has not resolved yet.
+
+**Why this exists.** `POST /goto` returns `200` and sets the target, but the walker only re-labels `nav_state` on its next ~150 ms tick. Without identity, this canonical loop lied:
+
+```
+POST /v1/move/goto {...}   -> 200 [goal_id=8]
+GET  /v1/observe/debug     -> nav_state: "arrived"   <-- but nav_goal_id: 7, the PREVIOUS goto!
+```
+
+Now the accept **atomically** bumps `nav_goal_id` and resets `nav_state` to `pending`, so the read above returns `nav_state: "pending", nav_goal_id: 8` — honest. **Rule: only trust a terminal `nav_state` (`arrived`/`no_path`/`search_exhausted`/`blocked`) when its `nav_goal_id` matches the `goal_id` the POST you are waiting on returned.** A lower id means you are still seeing an older goal's outcome; a matching id with `pending`/`planning`/`navigating` means your goal is genuinely in flight.
 
 **`goal_z_snapped` — the client CHANGED your goal.** The `z` you gave sits below every floor in the
 goal's column (agents commonly pass `z: 0`, or a map coordinate), so the planner snapped the goal onto
