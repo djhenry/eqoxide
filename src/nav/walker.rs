@@ -687,8 +687,16 @@ impl Walker {
         let gdx = goal.0 - gs.player_x;
         let gdy = goal.1 - gs.player_y;
         let gdist = (gdx * gdx + gdy * gdy).sqrt();
+        // ...and the VERTICAL gap to the goal's FLOOR (#344). Correct x/y at the wrong z — the NPC a
+        // storey up, A* having routed to the floor below it — is NOT arrival. Anchor to the goal's
+        // RESOLVED floor (the tier `astar` plans to), not the caller's raw z: a sloppy z the planner
+        // projected onto a real floor must still count as arrived when the walker reaches that floor.
+        let goal_floor_z = self.collision.read().unwrap().as_ref()
+            .and_then(|c| c.resolve_goal_floor([goal.0, goal.1, goal.2]))
+            .unwrap_or(goal.2);
+        let gdz = goal_floor_z - gs.player_z;
         let following = self.nav.goto_entity.lock().unwrap().is_some();
-        match arrival_action(gdist, following) {
+        match arrival_action(gdist, gdz, following) {
             ArrivalAction::FollowHold => {
                 self.set_nav_state("following");
                 self.path.clear();
@@ -705,7 +713,8 @@ impl Walker {
                     *self.nav_intent.lock().unwrap() = None;
                     return;
                 }
-                tracing::info!("NAV: arrived at ({:.1},{:.1})", goal.0, goal.1);
+                tracing::info!("NAV: arrived at ({:.1},{:.1},z~{:.1}) (goal floor z={:.1}, |dz|={:.1})",
+                    goal.0, goal.1, gs.player_z, goal_floor_z, gdz.abs());
                 if self.goal_snapped {
                     self.set_nav_state_because("arrived", Some("goal_z_snapped"));
                 } else {

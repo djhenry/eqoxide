@@ -505,6 +505,18 @@ pub const NAV_AGENT_HEIGHT: f32 = crate::traversability::PLAYER_BODY.agent_heigh
 /// two ends of a swim plan agree on what "floating" means.
 pub const FOOTING: f32 = 4.0;
 
+/// A reached floor within this of the goal's floor counts as the SAME tier. It is the single
+/// tolerance that has to agree in three places or the nav layer lies to itself: (1) `astar` accepts
+/// a searched cell as the goal only when its floor is within this of `goal_floor`; (2)
+/// `goal_z_was_snapped` uses it to decide the caller's z IS a real tier; and now (3) the arrival
+/// predicate (`steering::arrival_action`) uses it to decide the walker actually reached the goal's
+/// FLOOR, not a floor above/below it (#344). 8u is deliberately narrower than the 20u walk step-up:
+/// a zone-line region point measured 12.9u above its floor (gfaydark→felwithea) was a DIFFERENT tier
+/// than that floor, and the old ±20 window wrongly fused the two into a phantom tier (#229). 8u
+/// rejects that wrong tier while still tolerating standing height, water float, and a single step-up
+/// (the native STEP_UP is 2u). See the long note in `astar` where `goal_floor` is resolved.
+pub const GOAL_TIER_TOL: f32 = 8.0;
+
 /// How the planner is about to CHANGE the goal it was given (#337 honesty / water-nav design §4d).
 /// `Some` means the character will NOT arrive at the z the caller asked for — an accommodation,
 /// and an accommodation presented as compliance is a lie, so it rides `PlanReply` out to the agent
@@ -1409,7 +1421,6 @@ impl Collision {
     /// this function warned "SNAPPING to floor z=<pool bottom>" for a water goal the search was
     /// about to anchor to the surface.
     pub fn goal_z_was_snapped(&self, goal: [f32; 3]) -> Option<GoalSnap> {
-        const GOAL_TIER_TOL: f32 = 8.0;
         const GOAL_DROP: f32 = 400.0;
         // 1. A real tier at the caller's z is honoured as asked (`astar` aims the plan at it) —
         //    UNLESS that floor is UNDERWATER deeper than the arrival tolerance: the walker cannot
@@ -1439,6 +1450,27 @@ impl Collision {
         }
         // 4. No floor near the asked z at all: the dry column snap, reported.
         self.snap_goal_to_column_floor(goal).map(|z| GoalSnap::ToColumnFloor { z })
+    }
+
+    /// The FLOOR TIER the goal resolves to — the z the walker should be standing at when it has
+    /// arrived. Mirrors `astar`'s `goal_floor` resolution order EXACTLY (real tier at the caller's z
+    /// → floating water surface → volume point projected onto the floor beneath → column snap), the
+    /// same chain `goal_z_was_snapped` reports on. Arrival (`steering::arrival_action`) compares the
+    /// walker's z against THIS, not the caller's raw z, so:
+    ///   • a sloppy goal z (0, a map coordinate) that `astar` projected onto a real floor does NOT
+    ///     cause a false "not arrived" — both ends agree on the resolved floor; and
+    ///   • a goal genuinely on a DIFFERENT floor (an NPC one storey up, whose z IS a real tier here)
+    ///     resolves to THAT storey's floor, so the walker standing a storey below is > GOAL_TIER_TOL
+    ///     away in z and is honestly NOT arrived (#344).
+    /// `None` only when there is no walkable floor anywhere in the goal's column — the same
+    /// `GoalNotWalkable` case `astar` fails loudly on; the caller falls back to the raw goal z.
+    pub fn resolve_goal_floor(&self, goal: [f32; 3]) -> Option<f32> {
+        const GOAL_DROP: f32 = 400.0; // a volume point can sit far above its floor
+        let tier = self.nearest_floor(goal[0], goal[1], goal[2], GOAL_TIER_TOL, GOAL_TIER_TOL);
+        let floating = if tier.is_none() { self.floating_goal_surface(goal) } else { None };
+        tier.or(floating)
+            .or_else(|| self.floor_beneath(goal[0], goal[1], goal[2], GOAL_TIER_TOL, GOAL_DROP))
+            .or_else(|| self.snap_goal_to_column_floor(goal))
     }
 
     /// BEST-EFFORT route at an arbitrary grid resolution `cell`, optionally bounded to `max_search`
@@ -1819,7 +1851,7 @@ impl Collision {
                 ..Default::default()
             };
         }
-        const GOAL_TIER_TOL: f32 = 8.0; // reached floor within this of goal_floor == the right tier
+        // GOAL_TIER_TOL (module const): a reached floor within this of goal_floor == the right tier.
         // The goal's TIER: the walkable surface at the goal XY the caller means. On a zone with
         // stacked levels (neriakc, a walkway over a lower floor) the goal cell exists at several
         // heights; A* must finish on the one the caller asked for, else it routes the whole approach

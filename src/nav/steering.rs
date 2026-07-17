@@ -157,8 +157,25 @@ pub(crate) const STOP_DIST: f32 = 2.0;
 /// A /follow settles up to this far behind the leader (a bit behind, still in group range).
 pub(crate) const FOLLOW_DIST: f32 = 10.0;
 
+/// Vertical arrival tolerance — the walker must be on the goal's FLOOR, not a floor above/below it.
+/// This is the SAME tolerance `astar` uses to accept a searched cell as the goal tier, so the
+/// arrival predicate and the pathfinder agree on "the right floor" by construction (#344). See the
+/// const's own doc for why 8u distinguishes floors without rejecting standing height / step-ups.
+pub(crate) const Z_ARRIVAL_TOL: f32 = crate::nav::collision::GOAL_TIER_TOL;
+
 /// Stop within 2u for a one-shot /goto; a /follow settles up to FOLLOW_DIST behind the leader.
-pub(crate) fn arrival_action(gdist: f32, following: bool) -> ArrivalAction {
+///
+/// `gdz` is the SIGNED vertical gap to the goal's resolved floor (`goal_floor_z − player_z`).
+/// Arrival/hold requires being on that floor: `|gdz| ≤ Z_ARRIVAL_TOL`. Correct x/y at the wrong z
+/// (the NPC one storey up, #344) is NOT arrival — it stays `Drive`, so the client keeps navigating
+/// (climbing toward a reachable floor) or, when the floor is unreachable, runs on into the walker's
+/// existing honest `blocked`/`no_path` terminal states — never a false `arrived`/`following`.
+pub(crate) fn arrival_action(gdist: f32, gdz: f32, following: bool) -> ArrivalAction {
+    // Wrong FLOOR: correct horizontally but a storey off. Never report arrival/hold here — the
+    // agent must not be told it reached a goal it is a floor away from (#344, agent-honesty).
+    if gdz.abs() > Z_ARRIVAL_TOL {
+        return ArrivalAction::Drive;
+    }
     if following {
         if gdist <= FOLLOW_DIST { ArrivalAction::FollowHold } else { ArrivalAction::Drive }
     } else if gdist <= STOP_DIST {
@@ -475,16 +492,39 @@ mod tests {
     #[test]
     fn arrival_action_follow_stays_latched_goto_stops() {
         use super::{arrival_action, ArrivalAction};
-        // One-shot /goto (following=false): stops for good only within STOP_DIST(2u).
-        assert_eq!(arrival_action(1.0, false), ArrivalAction::Arrived);
-        assert_eq!(arrival_action(3.0, false), ArrivalAction::Drive);
+        // On the goal's floor (gdz=0). One-shot /goto (following=false): stops for good only within STOP_DIST(2u).
+        assert_eq!(arrival_action(1.0, 0.0, false), ArrivalAction::Arrived);
+        assert_eq!(arrival_action(3.0, 0.0, false), ArrivalAction::Drive);
         // /follow (following=true): HOLDS within FOLLOW_DIST(10u) — keeps the chase, never "arrives" —
         // and drives again once the leader moves past it (#268). A one-shot goto never HoldFollows.
-        assert_eq!(arrival_action(1.0, true),  ArrivalAction::FollowHold);
-        assert_eq!(arrival_action(9.0, true),  ArrivalAction::FollowHold);
-        assert_eq!(arrival_action(12.0, true), ArrivalAction::Drive); // leader walked off → re-engage
+        assert_eq!(arrival_action(1.0, 0.0, true),  ArrivalAction::FollowHold);
+        assert_eq!(arrival_action(9.0, 0.0, true),  ArrivalAction::FollowHold);
+        assert_eq!(arrival_action(12.0, 0.0, true), ArrivalAction::Drive); // leader walked off → re-engage
         // Crucially, a follower within melee range does NOT get the terminal `Arrived` a goto would.
-        assert_ne!(arrival_action(1.0, true), ArrivalAction::Arrived);
+        assert_ne!(arrival_action(1.0, 0.0, true), ArrivalAction::Arrived);
+    }
+
+    /// #344 (agent-honesty): correct x/y at the WRONG floor is NOT arrival — the walker is a storey
+    /// off the goal, and telling the agent `arrived`/`following` there is a confident falsehood.
+    #[test]
+    fn arrival_action_rejects_wrong_floor_z() {
+        use super::{arrival_action, ArrivalAction, Z_ARRIVAL_TOL};
+        // Perfect horizontally (well inside STOP_DIST) but a whole floor (50u) below the goal.
+        assert_eq!(arrival_action(0.5, 50.0, false), ArrivalAction::Drive,
+            "goto: dead-on x/y but a floor below the goal must NOT report Arrived");
+        assert_eq!(arrival_action(0.5, -50.0, false), ArrivalAction::Drive,
+            "goto: a floor ABOVE the goal must NOT report Arrived either (sign-agnostic)");
+        // Same for /follow: a leader one storey up is not "caught up" — keep driving, don't Hold.
+        assert_eq!(arrival_action(0.5, 50.0, true), ArrivalAction::Drive,
+            "follow: leader a floor up must NOT report FollowHold");
+        // Companion: dead-on x/y AND on the goal's floor (within tolerance) DOES arrive / hold.
+        assert_eq!(arrival_action(0.5, 0.0, false), ArrivalAction::Arrived);
+        assert_eq!(arrival_action(0.5, 0.0, true),  ArrivalAction::FollowHold);
+        // Just inside the vertical tolerance (standing height / a step-up) still counts as arrived...
+        assert_eq!(arrival_action(0.5, Z_ARRIVAL_TOL - 0.5, false), ArrivalAction::Arrived);
+        // ...and just outside it does not. (Mutation check: delete the gdz gate in `arrival_action`
+        // and the wrong-floor asserts above flip to Arrived — the test goes RED.)
+        assert_eq!(arrival_action(0.5, Z_ARRIVAL_TOL + 0.5, false), ArrivalAction::Drive);
     }
 
     /// #311 regression: the fast-steering loop re-aims every ~10ms, but `local_path` is only
