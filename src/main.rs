@@ -269,6 +269,7 @@ fn main() {
         say:            Arc::new(Mutex::new(None)),
         loot:           Arc::new(Mutex::new(None)),
         give:           Arc::new(Mutex::new(None)),
+        give_await:     Arc::new(Mutex::new(None)),
         door_click:     Arc::new(Mutex::new(None)),
         doors_shared:   Arc::new(Mutex::new(Vec::new())),
         sit:            Arc::new(Mutex::new(None)),
