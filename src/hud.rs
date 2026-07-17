@@ -313,7 +313,10 @@ pub fn draw_nav_debug(
     const STEP_H: f32 = 20.0;
     const MAX_STEP_DOWN: f32 = 60.0;
     const MAX_WALK_GRADE: f32 = 1.2;
-    const CHEST: f32 = 3.0;
+    // The overlay's edge probe must be the planner's OWN top probe, not a hand-copied literal — an
+    // overlay at a stale 3.0 while A* probes 4.0 lies about what A* accepts (#386/#358). Bound to the
+    // one Body so it cannot drift again.
+    const CHEST: f32 = crate::traversability::PLAYER_BODY.chest;
     let walk_col  = egui::Color32::from_rgba_unmultiplied(60, 230, 90, 170);
     let block_col = egui::Color32::from_rgba_unmultiplied(255, 60, 60, 220);
     let dot_col = |fz: f32| {
