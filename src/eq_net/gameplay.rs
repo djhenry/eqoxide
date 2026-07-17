@@ -40,6 +40,17 @@ const PROBE_QUIET_THRESHOLD: Duration = Duration::from_secs(12);
 /// the #470 passive bound must exceed it — see that constant's doc).
 const PROBE_INTERVAL: Duration = Duration::from_secs(crate::ipc::PROBE_INTERVAL_SECS);
 
+/// #335: how long `run_zone_entry_handshake` waits for the new zone to accept our OP_ZoneEntry
+/// (OP_NewZone → OP_Weather → OP_SendExpZonein) before declaring the zone-in FAILED and surfacing it
+/// honestly. This is a HARD deadline, not a resend cadence: we send OP_ZoneEntry exactly once (the
+/// transport layer's `poll_resend` retransmits that ONE datagram verbatim while it is still unacked,
+/// which recovers genuine wire loss). We deliberately do NOT app-level re-send a fresh OP_ZoneEntry
+/// once the session has ACKed the first — see `run_zone_entry_handshake` and
+/// `docs/eq-technical-knowledgebase/zone-entry-duplicate-on-admitted-client.md` for why a second
+/// ClientZoneEntry on an admitted session self-disconnects the client via EQEmu's antighost check.
+/// Any wedge past this deadline is surfaced as an honest failure, never a confident falsehood.
+const ZONE_ENTRY_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(30);
+
 /// #371: does this OP_Consider reply describe our OWN spawn — i.e. is it the reply to our
 /// self-consider liveness probe, rather than a user `/consider` of another mob? Reads targetid@4
 /// of Consider_Struct.
@@ -546,13 +557,22 @@ pub async fn run_gameplay_phase(
                 &game_state_snapshot,
             ).await;
             if ok {
-                run_zone_entry_handshake(
+                let zoned_in = run_zone_entry_handshake(
                     stream.as_mut().unwrap(),
                     net_rx.as_mut().unwrap(),
                     &mut gs,
+                    &char_name,
                     &net_health,
                     &game_state_snapshot,
+                    ZONE_ENTRY_HANDSHAKE_DEADLINE,
                 ).await;
+                if !zoned_in {
+                    // #335/agent-honesty: the zone never accepted us. run_zone_entry_handshake has
+                    // already flagged zone_in_failed + cleared the stale zone; end the phase (an honest
+                    // teardown) rather than looping on a wedged, mislabelled connection.
+                    tracing::warn!("EQ: zone-in never completed after world reconnect — exiting gameplay");
+                    return;
+                }
                 action_loop.sync_zone_points(&gs);
                 last_keepalive = std::time::Instant::now();
                 reset_probe_clocks(&net_health);
@@ -569,24 +589,35 @@ pub async fn run_gameplay_phase(
             // Drop old connections (Option::take returns the value, dropping it).
             drop(stream.take());
             drop(net_rx.take());
-            sleep(Duration::from_millis(800)).await;
+            // #335: no fixed pre-connect sleep. `EqStream::connect` blocks on OP_SESSION_RESPONSE
+            // (re-sending OP_SESSION_REQUEST every SESSION_REQUEST_RETRY) — but that only brings up the
+            // UDP SESSION. It does NOT wait for the zone to accept us at the app layer: the zone ACKs
+            // our OP_ZoneEntry (sent once, below, in run_zone_entry_handshake) before its app handler
+            // runs and may silently drop it if it beat AddAuth. `poll_resend` recovers a genuinely lost
+            // (unacked) entry; a wedge past the honest 30s deadline is surfaced as a zone-in failure,
+            // NOT papered over with a second OP_ZoneEntry (that would self-kick an admitted-but-slow
+            // session). See docs/eq-technical-knowledgebase/zone-entry-{handshake-race,
+            // duplicate-on-admitted-client}.md.
             match EqStream::connect(&zone_ip, zone_port, new_tx, net_health.clone()).await {
                 Ok(new_stream) => {
                     stream = Some(new_stream);
                     net_rx = Some(new_rx);
-                    let s2 = stream.as_mut().unwrap();
-                    let mut cze = vec![0u8; SIZE_CLIENT_ZONE_ENTRY];
-                    let nb = char_name.as_bytes();
-                    cze[4..4 + nb.len().min(64)].copy_from_slice(&nb[..nb.len().min(64)]);
-                    s2.send_app_packet(OP_ZONE_ENTRY, &cze);
-                    tracing::info!("EQ: sent zone entry for '{}'", char_name);
-                    run_zone_entry_handshake(
+                    // The single OP_ZoneEntry send is owned by run_zone_entry_handshake now.
+                    let zoned_in = run_zone_entry_handshake(
                         stream.as_mut().unwrap(),
                         net_rx.as_mut().unwrap(),
                         &mut gs,
+                        &char_name,
                         &net_health,
                         &game_state_snapshot,
+                        ZONE_ENTRY_HANDSHAKE_DEADLINE,
                     ).await;
+                    if !zoned_in {
+                        // #335/agent-honesty: zone never accepted us; handshake already flagged
+                        // zone_in_failed + cleared the stale zone. End the phase honestly.
+                        tracing::warn!("EQ: zone transition never completed — exiting gameplay");
+                        return;
+                    }
                     action_loop.sync_zone_points(&gs);
                     last_keepalive = std::time::Instant::now();
                     reset_probe_clocks(&net_health);
@@ -726,8 +757,11 @@ async fn reconnect_via_world(
 ) -> bool {
     drop(stream.take());
     drop(net_rx.take());
-    sleep(Duration::from_millis(300)).await;
-
+    // #335: no fixed sleep here. Dropping the old zone socket is local (no graceful disconnect is
+    // sent, nothing server-side has to "settle"), and the world server is a separate, always-running
+    // process — connecting to it does not reuse anything from the old zone session. The real wait is
+    // the event-driven one below: `EqStream::connect` blocks on OP_SESSION_RESPONSE, and the
+    // OP_SEND_LOGIN_INFO we then send is a reliable packet retransmitted by `poll_resend` until acked.
     let (world_tx, mut world_rx) = tokio::sync::mpsc::unbounded_channel::<AppPacket>();
     tracing::info!("EQ: reconnecting to world {}:{}", creds.world_host, creds.world_port);
     let mut world_stream = match EqStream::connect(&creds.world_host, creds.world_port, world_tx, net_health.clone()).await {
@@ -800,57 +834,105 @@ async fn reconnect_via_world(
         }
     };
 
-    sleep(Duration::from_millis(800)).await;
+    // #335: no fixed sleep before connecting to the new zone. `EqStream::connect` re-sends
+    // OP_SESSION_REQUEST every SESSION_REQUEST_RETRY so a cold on-demand zone that has not finished
+    // booting its listener is retried quickly rather than padded for — but note that a FAST session
+    // handshake here actually pushes OP_ZoneEntry out SOONER and can WIDEN the app-layer AddAuth race
+    // (see SESSION_REQUEST_RETRY's doc and `zone-entry-handshake-race.md`). When that race is lost the
+    // zone-in is not rescued by re-sending OP_ZoneEntry (that self-kicks an admitted session — see
+    // zone-entry-duplicate-on-admitted-client.md); it falls through to the honest 30s failure that the
+    // caller's run_zone_entry_handshake raises. This function no longer sends OP_ZoneEntry itself; the
+    // single send lives in run_zone_entry_handshake, on the stream we return here.
     tracing::info!("EQ: zone change: connecting to new zone {}:{}", zone_ip, zone_port);
     let (zone_tx, zone_rx) = tokio::sync::mpsc::unbounded_channel::<AppPacket>();
-    let mut zone_stream = match EqStream::connect(&zone_ip, zone_port, zone_tx, net_health.clone()).await {
+    let zone_stream = match EqStream::connect(&zone_ip, zone_port, zone_tx, net_health.clone()).await {
         Ok(s) => s,
         Err(e) => { tracing::warn!("EQ: zone change: zone connect failed: {e}"); return false; }
     };
-
-    // Send zone entry
-    let mut cze = vec![0u8; SIZE_CLIENT_ZONE_ENTRY];
-    let nb = char_name.as_bytes();
-    cze[4..4 + nb.len().min(64)].copy_from_slice(&nb[..nb.len().min(64)]);
-    zone_stream.send_app_packet(OP_ZONE_ENTRY, &cze);
-    tracing::info!("EQ: zone change: sent OP_ZONE_ENTRY for '{}'", char_name);
 
     *stream = Some(zone_stream);
     *net_rx = Some(zone_rx);
     true
 }
 
-/// Handles the OP_NEW_ZONE → OP_WEATHER → OP_SEND_EXP_ZONE_IN handshake
-/// that completes after connecting to a new zone server.
+/// Build and send an OP_ZoneEntry (ClientZoneEntry) for `char_name` on `stream`, as a reliable app
+/// packet. Called EXACTLY ONCE per zone-server session by `run_zone_entry_handshake` — see that
+/// function's doc and `docs/eq-technical-knowledgebase/zone-entry-duplicate-on-admitted-client.md` for
+/// why a second app-level ClientZoneEntry on the same session must never be issued (it self-kicks the
+/// admitted client via EQEmu's antighost check).
+fn send_zone_entry(stream: &mut EqStream, char_name: &str) {
+    let mut cze = vec![0u8; SIZE_CLIENT_ZONE_ENTRY];
+    let nb = char_name.as_bytes();
+    let n = nb.len().min(64);
+    cze[4..4 + n].copy_from_slice(&nb[..n]);
+    stream.send_app_packet(OP_ZONE_ENTRY, &cze);
+}
+
+/// Drives the OP_ZoneEntry → OP_NewZone → OP_Weather → OP_SendExpZonein handshake after connecting to
+/// a new zone server. Returns `true` once the zone accepts us (OP_SendExpZonein seen and OP_ClientReady
+/// sent); `false` if the deadline elapses first — an HONEST failure the caller must surface, not ignore.
 ///
-/// `net_health.last_packet` is bumped as real inbound packets are drained here, exactly like the gameplay
-/// loop's own drain (`run_gameplay_phase`) does — a slow zone-in (up to the 30s deadline below)
-/// must not falsely report the connection as lost while it's healthy and still zoning in.
+/// This function OWNS the OP_ZoneEntry send (both call sites used to send it themselves) and sends it
+/// EXACTLY ONCE. It deliberately does NOT app-level re-send a fresh OP_ZoneEntry while waiting for
+/// OP_NewZone. That is a hard invariant, not an oversight — see
+/// `docs/eq-technical-knowledgebase/zone-entry-duplicate-on-admitted-client.md`: a second
+/// ClientZoneEntry delivered on an ALREADY-ADMITTED session (the common case once the first entry was
+/// accepted and OP_NewZone is merely slow — e.g. a cold/heavy zone whose bulk spawn+DB load exceeds a
+/// couple of seconds) is re-dispatched into `Handle_Connect_OP_ZoneEntry`, whose antighost check
+/// `entity_list.GetClientByName` then MATCHES ITSELF (no `client != this` guard) and calls
+/// `client->Disconnect()` on the live session — silently kicking a zone-in that had already succeeded.
+/// From client-side session state alone we cannot distinguish "first entry app-dropped, needs a nudge"
+/// from "first entry admitted, OP_NewZone just slow", and the two demand opposite actions, so the safe
+/// rule is: send once, never a second time on this session.
+///
+/// Genuine WIRE loss of that one OP_ZoneEntry (it never reached the zone, so it is still unacked at the
+/// transport layer and no admission happened) is recovered for free by `poll_resend`, which
+/// retransmits the SAME datagram verbatim until the session ACKs it — that cannot trigger the antighost
+/// self-kick because a never-delivered entry never set `this->name` server-side. The only case left
+/// unrecovered is "entry delivered + session-ACKed but app-dropped because AddAuth had not yet landed,
+/// and it then never lands" — per `zone-entry-handshake-race.md` that session may simply never auth, so
+/// it correctly falls through to the honest [`ZONE_ENTRY_HANDSHAKE_DEADLINE`] failure below rather than
+/// being papered over by an unsafe resend.
+///
+/// `net_health.last_packet` is bumped as real inbound packets are drained here, exactly like the
+/// gameplay loop's own drain (`run_gameplay_phase`) does — a slow zone-in (up to `deadline_dur`) must
+/// not falsely report the connection as lost while it's healthy and still zoning in.
 ///
 /// `game_state_snapshot` is published once per drain pass (#324), same cadence as the steady-state
 /// gameplay loop — without this the renderer never observes `OP_NEW_ZONE` / spawns / etc. as they
-/// land here, and stays frozen on the OLD zone's last frame for this entire handshake (up to the
-/// 30s deadline) instead of starting the fade/loading screen the moment `OP_NEW_ZONE` arrives.
+/// land here, and stays frozen on the OLD zone's last frame for this entire handshake instead of
+/// starting the fade/loading screen the moment `OP_NEW_ZONE` arrives.
+///
+/// `deadline_dur` is a parameter (not the module const inlined) so tests can drive the timeout path in
+/// milliseconds instead of the production 30s.
 async fn run_zone_entry_handshake(
     stream:              &mut EqStream,
     net_rx:               &mut UnboundedReceiver<AppPacket>,
     gs:                   &mut GameState,
+    char_name:            &str,
     net_health:           &crate::ipc::NetHealthShared,
     game_state_snapshot:  &crate::ipc::GameStateSnapshot,
-) {
+    deadline_dur:         Duration,
+) -> bool {
     // Purge the previous zone's spawns/doors now, before OP_ReqClientSpawn asks for the new zone's
     // stream, and re-arm the once-per-zone-in OP_NewZone apply so the repeat OP_NewZone this
-    // handshake provokes can't clear again mid-stream (#322).
+    // handshake provokes can't clear again mid-stream (#322). Also clears any prior zone_in_failed.
     gs.begin_zone_in();
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    // The one and ONLY OP_ZoneEntry for this session (see the fn doc — a second one self-kicks).
+    // `poll_resend` retransmits this same datagram if it is lost in flight; nothing here ever issues a
+    // fresh one.
+    send_zone_entry(stream, char_name);
+    tracing::info!("EQ: sent zone entry for '{}'", char_name);
+
+    let deadline = std::time::Instant::now() + deadline_dur;
     let mut done_new_zone     = false;
     let mut done_weather      = false;
     let mut done_client_ready = false;
 
     while std::time::Instant::now() < deadline && !done_client_ready {
         stream.poll_recv();
-        stream.poll_resend(); // retransmit OP_ZONE_ENTRY/ReqClientSpawn during zone-in (#254)
+        stream.poll_resend(); // retransmit the unacked OP_ZoneEntry / ReqClientSpawn during zone-in (#254)
         while let Ok(packet) = net_rx.try_recv() {
             apply_packet(gs, &packet);
             record_app_packet(&mut net_health.lock().unwrap(), std::time::Instant::now());
@@ -874,13 +956,28 @@ async fn run_zone_entry_handshake(
                 _ => {}
             }
         }
+
         publish_snapshot(gs, game_state_snapshot, net_health);
         sleep(Duration::from_millis(10)).await;
     }
 
     if !done_client_ready {
-        tracing::warn!("EQ: zone entry handshake timed out (new_zone={done_new_zone} weather={done_weather})");
+        // HONEST failure (#335/agent-honesty). Do NOT return silently leaving `connected: true` + the
+        // OLD `zone_name` reported as current — that is the #343/#470 confident-falsehood anti-pattern.
+        // Raise an explicit, distinguishable flag AND clear the stale zone so no agent reads the zone
+        // we came from as where we are. The caller tears the session down after this (an honest end).
+        // We do NOT try to "rescue" this with a second OP_ZoneEntry — per the fn doc that would risk
+        // self-disconnecting an admitted-but-slow session; an honest failure is the correct backstop.
+        gs.zone_in_failed = true;
+        gs.zone_name.clear();
+        publish_snapshot(gs, game_state_snapshot, net_health);
+        tracing::warn!(
+            "EQ: zone entry handshake TIMED OUT (new_zone={done_new_zone} weather={done_weather}) — \
+             flagged zone_in_failed, cleared stale zone_name",
+        );
+        return false;
     }
+    true
 }
 
 // ── Camp ────────────────────────────────────────────────────────────────────────
@@ -1518,7 +1615,12 @@ mod zone_entry_handshake_publish_tests {
         let snapshot_bg     = snapshot.clone();
         let last_inbound_bg = last_inbound.clone();
         let handle = tokio::spawn(async move {
-            run_zone_entry_handshake(&mut stream, &mut net_rx, &mut gs, &last_inbound_bg, &snapshot_bg).await;
+            // Long deadline: this test is about the per-pass publish, not the timeout path, so the 30s
+            // deadline is never reached (WEATHER/EXP_ZONE_IN withheld).
+            run_zone_entry_handshake(
+                &mut stream, &mut net_rx, &mut gs, "Tester", &last_inbound_bg, &snapshot_bg,
+                Duration::from_secs(30),
+            ).await;
         });
 
         tx.send(AppPacket { opcode: OP_NEW_ZONE, payload: new_zone_payload("newzone") }).unwrap();
@@ -1536,6 +1638,84 @@ mod zone_entry_handshake_publish_tests {
         }
 
         handle.abort();
+    }
+
+    fn fresh_gs_snapshot() -> (GameState, crate::ipc::GameStateSnapshot, crate::ipc::NetHealthShared) {
+        let mut gs = GameState::new();
+        gs.zone_name = "oldzone".to_string();
+        let snapshot: crate::ipc::GameStateSnapshot =
+            Arc::new(arc_swap::ArcSwap::from_pointee(gs.clone()));
+        let health: crate::ipc::NetHealthShared =
+            Arc::new(std::sync::Mutex::new(crate::ipc::NetHealth::default()));
+        (gs, snapshot, health)
+    }
+
+    /// #335 (the blocker fix): the antighost self-disconnect invariant. A SECOND ClientZoneEntry on an
+    /// already-admitted session is re-dispatched into `Handle_Connect_OP_ZoneEntry`, whose antighost
+    /// lookup `entity_list.GetClientByName` then matches ITSELF (no `client != this` guard) and calls
+    /// `client->Disconnect()` on the live stream — silently kicking a zone-in that had already
+    /// succeeded (see `docs/eq-technical-knowledgebase/zone-entry-duplicate-on-admitted-client.md`).
+    /// The hard client-side rule is therefore: send OP_ZoneEntry EXACTLY ONCE per session, never a
+    /// second app-level copy while waiting for OP_NewZone — because from session state we cannot tell
+    /// "first was app-dropped" from "first admitted, OP_NewZone just slow (cold/heavy zone)".
+    ///
+    /// Drive the handshake against a peer that never sends OP_NewZone, over a window comfortably longer
+    /// than any plausible resend cadence (the KB's cited 2.5s), and assert EXACTLY ONE OP_ZoneEntry
+    /// ever reached the wire. Mutation check: re-introduce ANY app-level `send_zone_entry` retry in the
+    /// loop and the count climbs above 1 → this goes RED. (A retransmit of the SAME unacked datagram by
+    /// `poll_resend` is fine and is not counted here — `sent_app_packets` reports distinct tracked
+    /// sends; a genuine app-level re-send uses a NEW sequence and would appear as a 2nd entry.)
+    #[tokio::test]
+    async fn never_sends_a_second_zone_entry_on_a_single_session() {
+        let (mut stream, _unused_rx) = test_stream(0, 0).await;
+        // A test-owned channel with NO sender activity: OP_NewZone never arrives, modelling BOTH the
+        // app-dropped case AND the admitted-but-slow case (indistinguishable from here — which is the
+        // whole point: the client must behave safely without knowing which it is).
+        let (_tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<AppPacket>();
+        let (mut gs, snapshot, health) = fresh_gs_snapshot();
+
+        let ok = run_zone_entry_handshake(
+            &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
+            Duration::from_millis(3200), // > the 2.5s the KB warns a blind resend could fire at
+        ).await;
+
+        assert!(!ok, "a zone-in that never gets OP_NewZone must report failure, not success");
+        let zone_entries = stream
+            .sent_app_packets()
+            .into_iter()
+            .filter(|(op, _)| *op == OP_ZONE_ENTRY)
+            .count();
+        assert_eq!(
+            zone_entries, 1,
+            "run_zone_entry_handshake must send OP_ZoneEntry EXACTLY ONCE per session — a second \
+             app-level copy self-disconnects an admitted client via EQEmu's antighost check \
+             (zone-entry-duplicate-on-admitted-client.md); saw {zone_entries} in a 3.2s window",
+        );
+    }
+
+    /// #335/agent-honesty: when the handshake times out with no OP_NewZone at all, it must NOT return
+    /// silently leaving `connected: true` + the OLD `zone_name` (the #343/#470 confident-falsehood
+    /// anti-pattern). It must raise the explicit `zone_in_failed` flag AND clear the stale zone, and
+    /// PUBLISH that so an agent reads an honest failure. Mutation check: delete the honest-failure
+    /// block → `zone_in_failed` stays false / `zone_name` stays "oldzone" → RED.
+    #[tokio::test]
+    async fn handshake_timeout_surfaces_honest_failure_not_stale_zone() {
+        let (mut stream, _unused_rx) = test_stream(0, 0).await;
+        let (_tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<AppPacket>();
+        let (mut gs, snapshot, health) = fresh_gs_snapshot();
+
+        let ok = run_zone_entry_handshake(
+            &mut stream, &mut net_rx, &mut gs, "Tester", &health, &snapshot,
+            Duration::from_millis(200),  // deadline — never completes
+        ).await;
+
+        assert!(!ok, "a never-completed zone-in must report failure");
+        assert!(gs.zone_in_failed, "timeout must raise the honest zone_in_failed flag");
+        assert!(gs.zone_name.is_empty(),
+            "timeout must CLEAR the stale OLD zone_name so no agent reads it as current (#343/#470)");
+        let published = snapshot.load();
+        assert!(published.zone_in_failed && published.zone_name.is_empty(),
+            "the honest failure state must be PUBLISHED to the snapshot, not just held locally");
     }
 }
 
