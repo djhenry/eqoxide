@@ -76,9 +76,21 @@ impl CommandState {
     /// Cancel an in-progress goto WITHOUT touching `goto_entity` — used where manual movement
     /// (keyboard WASD, the HTTP manual-move escape hatch, or an auto-melee-engage override) needs to
     /// take over steering this frame/tick but isn't itself a `/stop`. Narrower than
-    /// [`Self::request_stop`] on purpose; preserves the exact pre-migration call sites' behavior.
-    pub fn request_cancel_goto(&self) {
+    /// [`Self::request_stop`] on purpose; preserves the exact pre-migration call sites' behavior
+    /// for `goto_entity` (left alone here — the walker's own `drive_chase` clears it on its next
+    /// tick once it observes `goto_target` is `None`, treating the goto as "cancelled elsewhere").
+    ///
+    /// #497: still stamps a fresh idle identity via [`Self::stamp_new_goal`], exactly like
+    /// [`Self::request_stop`], so `nav_goal` is honestly cleared to `None` the instant the cancel is
+    /// accepted — not left holding the cancelled goal's stale coordinates until the walker's next
+    /// tick relabels `state` (which never touches `goal`; see `Walker::resolve_goal`). Without this,
+    /// a read right after cancel could report `nav_state: idle` alongside a non-null `nav_goal`,
+    /// contradicting the documented contract (`docs/http-api.md`). Returns the new `goal_id` (#349)
+    /// for the same reason `request_stop` does: so a caller can never read the cancelled goal's
+    /// terminal `arrived`/`no_path` under a fresh identity.
+    pub fn request_cancel_goto(&self) -> u64 {
         *self.nav.goto_target.lock().unwrap() = None;
+        self.stamp_new_goal("idle", None)
     }
 
     /// Queue a zone-line crossing (POST /v1/move/zone_cross). `0` = nearest line, `Some(id)` = a
@@ -188,6 +200,33 @@ mod tests {
         assert_eq!(s.state, "idle", "stop resets to idle, not the stale `arrived`");
         assert_eq!(s.goal_id, b);
         assert_eq!(s.goal, None, "a stop has no goal");
+    }
+
+    /// #497: `request_cancel_goto` must be as honest as `request_stop` about `nav_goal`. Goto,
+    /// drive it to `arrived` in place (exactly as the walker would), then cancel — a subsequent
+    /// `nav_state` read must report `idle` with `goal: None`, matching `docs/http-api.md`'s
+    /// "`nav_goal` … `null` for `idle`/`stop`" contract. Before the fix, `request_cancel_goto` only
+    /// cleared `goto_target` and never touched `nav_state.goal`, so this read would see
+    /// `state: "idle"` (set in-place by `Walker::resolve_goal` on its next tick) paired with the
+    /// STALE, non-null coordinates from the cancelled goto.
+    ///
+    /// Mutation check: delete the `self.stamp_new_goal("idle", None)` call in `request_cancel_goto`
+    /// (leave only the `goto_target` clear) and this test goes RED — `s.goal` is still
+    /// `Some([10.0, 20.0, 3.0])` after the cancel, the exact stale-`nav_goal` bug #497 reports.
+    #[test]
+    fn cancel_goto_after_arrived_clears_goal_and_resets_to_idle() {
+        let cs = CommandState::default();
+        let a = cs.request_goto((10.0, 20.0, 3.0));
+        cs.nav.nav_state.lock().unwrap().state = "arrived".into();
+
+        let b = cs.request_cancel_goto();
+        assert!(b > a, "cancel_goto bumps the goal id, same as stop");
+
+        let s = cs.nav.nav_state.lock().unwrap();
+        assert_eq!(s.state, "idle", "cancel resets to idle, not the stale `arrived`");
+        assert_eq!(s.goal_id, b);
+        assert_eq!(s.goal, None,
+            "nav_goal must be null after a cancel — a stale non-null goal alongside idle is #497");
     }
 
     #[test]
