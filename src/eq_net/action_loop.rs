@@ -56,13 +56,22 @@ const CORRECTION_SQ: f32 = 144.0;
 /// A3 Migration 2 (#448): the honest awaited give (POST /v1/interact/give) parks its HTTP-side
 /// `oneshot::Sender` HERE — the existing state machine owns it, so there is no separate `pending_give`
 /// field (cf. buy's `pending_buy`). `await_tx` is `None` for the fire-and-forget UI turn-in (no
-/// result awaited) and `Some` for the awaited path. Because the confirming OP_FinishTrade arrives
-/// AFTER we send OP_TradeAcceptClick (at which point the fire-and-forget path is already done and
-/// clears `give_state`), the awaited path does NOT clear here at accept — it flips `accepted` and
-/// stays parked through a SECOND phase to await OP_FinishTrade, resolving `Resolved(GiveOk)` (accepted)
-/// or `Unconfirmed` (no finish = item mismatch/lost, or no ack). The `Sender` deliberately lives ONLY
-/// here — never in `GameState`, which is `Clone`d into the ArcSwap snapshot every tick and a
-/// `oneshot::Sender` is not `Clone`. See `crate::command_state::result` for the full flow.
+/// result awaited) and `Some` for the awaited path.
+///
+/// SERIALIZED — at most ONE trade may be in flight (#475 review). OP_FinishTrade is a 0-byte packet
+/// with NO trade/npc id, so — unlike buy, which correlates its echo on merchant_id+slot — a finish
+/// cannot be matched to a specific give. The only way it is unambiguous is if exactly ONE give is in
+/// flight when it arrives. So `give_state` is held from `begin_give` all the way through the finish (or
+/// the finish-timeout) for BOTH paths — the fire-and-forget path does NOT clear at accept. `accepted`
+/// splits phase 1 (awaiting OP_TradeRequestAck) from phase 2 (accept sent, awaiting OP_FinishTrade).
+/// On finish: an awaited give resolves `Resolved(GiveOk)`, a fire-and-forget give clears silently
+/// (no `await_tx`); a no-ack / no-finish timeout yields `Unconfirmed` (awaited) or a silent clear.
+/// While a trade is in flight a NEW give is refused (awaited → `Refused`) or dropped (fire-and-forget)
+/// — never allowed to start a second, racing trade that would make a later finish ambiguous. Clearing
+/// at accept (the pre-review bug) let a late finish from a just-completed give resolve a DIFFERENT
+/// give that had since reached phase 2 — a fabricated 200. The `Sender` deliberately lives ONLY here —
+/// never in `GameState`, which is `Clone`d into the ArcSwap snapshot every tick and a `oneshot::Sender`
+/// is not `Clone`. See `crate::command_state::result` for the full flow.
 struct GiveState {
     npc_id:        u32,
     ticks_waiting: u32,
@@ -1591,10 +1600,12 @@ impl ActionLoop {
     /// The server then sends OP_FinishTrade (handled in packet_handler). If no ack arrives within
     /// ~3s we abort and reset. Called every tick (not gated by the 150ms walk throttle).
     ///
-    /// A3 Migration 2 (#448): the AWAITED give (`await_tx` set) does NOT clear at step 3 — it enters a
-    /// phase-2 wait for OP_FinishTrade so `fulfill_give_ok` can resolve `Resolved(GiveOk)` (accepted)
-    /// or a phase-2 timeout can resolve `Unconfirmed` (item mismatch / lost). The FIRE-AND-FORGET give
-    /// (`await_tx` None) still clears at step 3, exactly as before. See `begin_give`/`fulfill_give_ok`.
+    /// A3 Migration 2 (#448), SERIALIZED (#475 review): NEITHER path clears at step 3. Both hold
+    /// `give_state` through a phase-2 wait for OP_FinishTrade, so at most one trade is ever in flight
+    /// and the 0-byte finish (no trade id) is unambiguous. On finish an awaited give resolves
+    /// `Resolved(GiveOk)` and a fire-and-forget give clears silently (`fulfill_give_ok`); a phase-2
+    /// timeout yields `Unconfirmed`/silent-clear. A NEW give arriving mid-trade is refused (awaited)
+    /// or dropped (fire-and-forget), never started. See `begin_give`/`fulfill_give_ok`.
     fn tick_give(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Begin a new give request if one is queued and we're not already mid-trade. Prefer the
         // fire-and-forget UI slot (existing behavior), then the awaited slot (#448). Only one trade
@@ -1608,22 +1619,28 @@ impl ActionLoop {
             return;
         }
 
-        // A trade IS already in flight. SINGLETON-IN-FLIGHT (copy buy's reject-while-parked, #448): a
-        // second AWAITED give is refused OUTRIGHT — no new trade is started and the in-flight one is
-        // untouched. OP_FinishTrade carries no per-request token, so two awaited gives in flight would
-        // be indistinguishable at the ack and the first's finish could resolve the second caller's
-        // Sender (a failed second give reporting success). The packets were never sent, so `Refused`
-        // (409, "we KNOW it didn't happen") is honest here — not `Unconfirmed` (202, "unknown"). (A
-        // fire-and-forget give queued now stays in its `give` slot until this trade clears — the
-        // existing serialization; we do NOT drain `take_give` while a trade is in flight.)
+        // A trade IS already in flight. SINGLETON-IN-FLIGHT (#448, hardened by the #475 review): the
+        // in-flight give owns the machine until its OP_FinishTrade (or timeout), so NO new give may
+        // start — starting a second, racing trade is exactly what would make the next 0-byte
+        // OP_FinishTrade ambiguous (it could resolve the wrong give → a fabricated 200).
+        //   • A second AWAITED give is refused OUTRIGHT with `Refused` (409, "we KNOW it didn't happen"
+        //     — the packets were never sent, so this is honest, not a 202 "unknown"). The in-flight
+        //     give is untouched.
+        //   • A second FIRE-AND-FORGET give has no caller to answer, so it is DROPPED with a log (never
+        //     queued to start later, never started now). Dropping is the honest choice — silently
+        //     starting a racing trade is the bug we are closing.
         if let Some((npc_id, from_slot, tx)) = self.command.take_give_await() {
             let _ = tx.send(crate::command_state::CommandResult::Refused(
                 "a give is already in flight; retry".into()));
             tracing::info!("EQ: give: awaited give REJECTED — one already in flight (npc_id={npc_id} from_slot={from_slot})");
         }
+        if let Some((npc_id, from_slot)) = self.command.take_give() {
+            tracing::warn!("EQ: give: dropping fire-and-forget give — one already in flight (npc_id={npc_id} from_slot={from_slot})");
+            gs.log_msg("trade", "Ignored give — a turn-in is already in progress");
+        }
 
-        // Advance the state machine. `accepted` splits phase 1 (awaiting ack) from phase 2 (awaited
-        // only: accept sent, awaiting OP_FinishTrade). Read it without holding a borrow across sends.
+        // Advance the state machine. `accepted` splits phase 1 (awaiting ack) from phase 2 (accept
+        // sent, awaiting OP_FinishTrade — both paths). Read it without holding a borrow across sends.
         let accepted = self.give_state.as_ref().map(|g| g.accepted).unwrap_or(false);
 
         if !accepted {
@@ -1641,15 +1658,13 @@ impl ActionLoop {
                 stream.send_app_packet(OP_TRADE_ACCEPT_CLICK, &accept);
                 tracing::info!("EQ: give: cursor→trade slot + OP_TradeAcceptClick (npc_id={})", npc_id);
                 gs.trade_ack_ready = false;
-                // Fire-and-forget give: done here, exactly as before. Awaited give: keep `give_state`
-                // parked and enter phase 2 to await the confirming OP_FinishTrade (→ `fulfill_give_ok`
-                // resolves `Resolved(GiveOk)`), resetting the tick counter to time the finish wait.
-                let awaited = self.give_state.as_ref().map(|g| g.await_tx.is_some()).unwrap_or(false);
-                if awaited {
-                    if let Some(g) = self.give_state.as_mut() { g.accepted = true; g.ticks_waiting = 0; }
-                } else {
-                    self.give_state = None;
-                }
+                // Enter phase 2 for BOTH paths (#475 review): keep `give_state` parked through the
+                // confirming OP_FinishTrade so this give stays the ONLY trade in flight and the 0-byte
+                // finish can't be mis-attributed. `fulfill_give_ok` then resolves it (awaited →
+                // `Resolved(GiveOk)`; fire-and-forget → silent clear). Reset the tick counter to time
+                // the finish wait. (Pre-review, the fire-and-forget path cleared here at accept — which
+                // let a late finish resolve a DIFFERENT give that had reached phase 2 meanwhile.)
+                if let Some(g) = self.give_state.as_mut() { g.accepted = true; g.ticks_waiting = 0; }
             } else if let Some(g) = self.give_state.as_mut() {
                 g.ticks_waiting += 1;
                 if g.ticks_waiting >= GIVE_ACK_TIMEOUT_TICKS {
@@ -1668,12 +1683,14 @@ impl ActionLoop {
                 }
             }
         } else if let Some(g) = self.give_state.as_mut() {
-            // Phase 2 (awaited only): OP_TradeAcceptClick has been sent; we await OP_FinishTrade, which
-            // `fulfill_give_ok` resolves + clears. If none arrives within the window, the turn-in was
-            // either an item mismatch (the server returns the item on the cursor via OP_ItemPacket with
-            // NO OP_FinishTrade) or the reply was lost — the HONEST verdict is `Unconfirmed` (202), NOT
-            // success. We do NOT try to positively detect the cursor-return (ambiguous), so we never
-            // claim a definitive `Refused` we can't prove.
+            // Phase 2 (both paths): OP_TradeAcceptClick has been sent; we hold the machine, awaiting
+            // OP_FinishTrade — which `fulfill_give_ok` resolves + clears. If none arrives within the
+            // window, the turn-in was either an item mismatch (the server returns the item on the
+            // cursor via OP_ItemPacket with NO OP_FinishTrade) or the reply was lost. The awaited path
+            // reports the HONEST `Unconfirmed` (202), NEVER success; a fire-and-forget give clears
+            // silently. We do NOT try to positively detect the cursor-return (ambiguous), so we never
+            // claim a definitive `Refused` we can't prove. Clearing here is also what frees the machine
+            // for the next give (serialized — one trade at a time).
             g.ticks_waiting += 1;
             if g.ticks_waiting >= GIVE_FINISH_TIMEOUT_TICKS {
                 let await_tx = g.await_tx.take();
@@ -1726,24 +1743,22 @@ impl ActionLoop {
 
     /// Resolve a parked AWAITED give on OP_FinishTrade (A3 Migration 2, #448). Called from the gameplay
     /// loop AFTER `apply_packet` (which cleared the trade slots), exactly as the buy fulfils are.
-    /// OP_FinishTrade is a 0-byte packet with no correlation data, but for our initiator turn-in it
-    /// unambiguously means the NPC ACCEPTED the item — a mismatch instead returns the item on the
-    /// cursor with NO OP_FinishTrade. So a finish while an awaited give is parked in phase 2 resolves
-    /// THAT give as `Resolved(GiveOk)` carrying the item name captured at send time. No-op unless a
-    /// phase-2 awaited give is parked — a fire-and-forget give already cleared `give_state` at accept
-    /// (it never awaited a result), so its finish correctly resolves nothing. Non-blocking; never
-    /// `.await`s; a dropped receiver (HTTP already timed out) is ignored.
+    /// OP_FinishTrade is a 0-byte packet with NO correlation data (no trade/npc id) — so it can only be
+    /// matched to a give because gives are SERIALIZED (#475 review): at most one trade is in flight, so
+    /// a finish while a give is parked in phase 2 unambiguously belongs to THAT give. It means the NPC
+    /// ACCEPTED the item (a mismatch instead returns the item on the cursor with NO OP_FinishTrade). We
+    /// therefore CONSUME the parked phase-2 give on any finish — resolving `Resolved(GiveOk)` (awaited,
+    /// item name captured at send time) or clearing silently (fire-and-forget: consuming the finish is
+    /// what keeps it from lingering and frees the machine for the next give). No-op unless a phase-2
+    /// give is parked (a finish with nothing in flight, or one still in phase 1, resolves nothing).
+    /// Non-blocking; never `.await`s; a dropped receiver (HTTP already timed out) is ignored.
     pub fn fulfill_give_ok(&mut self) {
-        let resolves = self.give_state.as_ref()
-            .map(|g| g.accepted && g.await_tx.is_some())
-            .unwrap_or(false);
-        if !resolves { return; }
+        let in_phase2 = self.give_state.as_ref().map(|g| g.accepted).unwrap_or(false);
+        if !in_phase2 { return; }
         let g = self.give_state.take().unwrap();
-        let npc_id = g.npc_id;
-        let item_name = g.item_name;
         if let Some(tx) = g.await_tx {
             let _ = tx.send(crate::command_state::CommandResult::Resolved(
-                crate::command_state::GiveOk { npc_id, item_name }));
+                crate::command_state::GiveOk { npc_id: g.npc_id, item_name: g.item_name }));
         }
     }
 
@@ -2602,10 +2617,75 @@ mod tests {
     #[test]
     fn net_give_timeout_is_shorter_than_the_http_await_budget() {
         let net_ms = (GIVE_ACK_TIMEOUT_TICKS + GIVE_FINISH_TIMEOUT_TICKS) as u128 * NAV_TICK_MS;
-        let http_ms = 8_000u128; // GIVE_HTTP_TIMEOUT_SECS (8) in http::interact
+        // Reference the real HTTP constant (not a magic literal) so a future edit to either side is
+        // caught here (#475 review nit).
+        let http_ms = crate::http::interact::GIVE_HTTP_TIMEOUT_SECS as u128 * 1000;
         assert!(net_ms < http_ms,
             "net worst-case verdict ({net_ms}ms) must land before the HTTP timeout ({http_ms}ms) so the \
              net verdict wins — otherwise the caller gets a vague HTTP-elapsed 202 instead of the real outcome");
+    }
+
+    /// MISATTRIBUTION REPRO / THE #475 HONESTY FIX. OP_FinishTrade is a 0-byte packet with no trade id,
+    /// so it can only be matched to a give if gives are SERIALIZED. Pre-fix, a fire-and-forget give
+    /// cleared `give_state` at accept, so a later AWAITED give could reach phase 2 and a LATE finish
+    /// from the first give would resolve the SECOND caller's Sender — a fabricated `Resolved`/200. The
+    /// fix holds the machine through the finish for BOTH paths: a give in flight blocks any new give.
+    /// This pins that a second give is REJECTED, never entering the machine, so the late finish resolves
+    /// only the ORIGINAL give. Mutation-check: revert to clear-at-accept and D is no longer rejected
+    /// (it begins instead) → the `try_recv` Refused assertion goes RED.
+    #[tokio::test]
+    async fn a_late_finish_cannot_misattribute_to_a_second_give() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_give_gs();
+
+        // Fire-and-forget give to NPC C (11) begins and reaches phase 2 (accept sent) — HELD in flight.
+        nav.command.request_give(11, 23);
+        nav.tick_give(&mut stream, &mut gs);         // begin C (phase 1)
+        gs.trade_ack_ready = true;
+        nav.tick_give(&mut stream, &mut gs);         // ack → accept; C now phase 2, HELD (the fix)
+        assert!(nav.give_state.is_some(),
+            "a fire-and-forget give must stay in flight through the finish — serialized, not cleared at accept");
+
+        // An AWAITED give to NPC D (22) arrives while C is still in flight → REJECTED synchronously; D
+        // never enters the machine, so C's finish cannot land on D.
+        let (tx_d, mut resp_d) = tokio::sync::oneshot::channel();
+        nav.command.request_give_await(22, 23, tx_d);
+        nav.tick_give(&mut stream, &mut gs);
+        match resp_d.try_recv() {
+            Ok(crate::command_state::CommandResult::Refused(_)) => {}
+            other => panic!("D must be synchronously Refused while C is in flight (else C's finish \
+                             misattributes to D) — got {other:?}"),
+        }
+        assert!(nav.give_state.is_some(), "C must STILL be the one parked give after D is rejected");
+
+        // C's late OP_FinishTrade lands → it consumes C (silently — no await_tx), and there is no D in
+        // the machine to wrongly resolve. No fabricated 200 for D.
+        apply_packet(&mut gs, &AppPacket { opcode: OP_FINISH_TRADE, payload: vec![] });
+        nav.fulfill_give_ok();
+        assert!(nav.give_state.is_none(), "C's finish must consume C's held state");
+    }
+
+    /// SINGLE-GIVE HAPPY PATH UNCHANGED (fire-and-forget): one give at a time still completes exactly —
+    /// begin, ack → accept (now HELD in phase 2 rather than cleared), then OP_FinishTrade consumes it
+    /// silently. The only change vs. pre-review is the STATE lifetime (extended to the finish); the
+    /// wire traffic and the eventual clear are identical.
+    #[tokio::test]
+    async fn fire_and_forget_single_give_completes_on_finish() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_give_gs();
+
+        nav.command.request_give(11, 23);
+        nav.tick_give(&mut stream, &mut gs);         // begin (phase 1)
+        assert!(nav.give_state.is_some());
+        gs.trade_ack_ready = true;
+        nav.tick_give(&mut stream, &mut gs);         // ack → accept; phase 2, HELD
+        assert!(nav.give_state.is_some(), "a fire-and-forget give is now held through the finish");
+
+        apply_packet(&mut gs, &AppPacket { opcode: OP_FINISH_TRADE, payload: vec![] });
+        nav.fulfill_give_ok();
+        assert!(nav.give_state.is_none(), "the finish clears the completed give — the machine is free again");
     }
 
     #[test]

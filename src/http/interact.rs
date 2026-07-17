@@ -18,7 +18,7 @@ use super::*;
 /// ≈ (GIVE_ACK_TIMEOUT_TICKS + GIVE_FINISH_TIMEOUT_TICKS) × ~150ms ≈ 6s (see `action_loop`). Awaiting
 /// 8s here guarantees the NET verdict (Resolved/Unconfirmed from the state machine) reaches the caller
 /// rather than a vaguer HTTP-elapsed 202 firing first — the two-timeout ordering landmine.
-const GIVE_HTTP_TIMEOUT_SECS: u64 = 8;
+pub(crate) const GIVE_HTTP_TIMEOUT_SECS: u64 = 8;
 
 /// A quick `(StatusCode, String)` plain-text response, so the small error paths stay terse.
 fn text(status: StatusCode, body: impl Into<String>) -> Response {
