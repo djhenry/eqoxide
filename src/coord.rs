@@ -23,6 +23,16 @@
 ///
 /// 3.125 is EQEmu's `Mob::GetZOffset()` default (not size-scaled), correct for playable humanoids;
 /// per-model refinement (e.g. gnome vs ogre) can layer on later without changing the datum rule.
+///
+/// **The datum discipline: FOOT everywhere except the wire.** Everything eqoxide holds and reports —
+/// `gs.player_z`, the controller, nav, collision, every stored ENTITY z (converted wire→foot on
+/// ingest in `packet_handler`), and every agent-facing field (`/player` `pos_up`, `/observe`,
+/// `/observe/entities`) — is FOOT. The `± WIRE_Z_OFFSET` conversion happens ONLY at the packet edge.
+/// One datum end to end means a position the agent READS can be fed straight back into `goto`/coords
+/// with no 3u skew, self reads at the same height as another player on the same plank, and a
+/// goto-by-name goal lands on the floor instead of 3u above it (a goal-z/floor-tier mismatch wedges
+/// nav). Boats/floating entities skip the server's Z-offset (`Mob::FixZ` early-returns for them), so
+/// their wire z is already surface-level and is NOT shifted on ingest.
 pub const WIRE_Z_OFFSET: f32 = 3.125;
 
 /// EQ heading in degrees (0..360) for a movement delta in server axes.

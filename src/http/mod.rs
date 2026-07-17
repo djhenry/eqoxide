@@ -213,12 +213,14 @@ impl PlayerState {
             level:      gs.player_level as u32,
             pos_east:   gs.player_x,
             pos_north:  gs.player_y,
-            // Reported in the WIRE z datum (model origin, ~3.1u above the feet — #522, see
-            // coord::WIRE_Z_OFFSET), NOT the controller's internal foot level. Every other position
-            // the agent sees — /observe/entities, `#goto`/DB safe coords, what other players report
-            // — is wire-datum; reporting foot z here made a level character read 3u BELOW an
-            // adjacent native player (the #522 mis-diagnosis), an agent-honesty inconsistency.
-            pos_up:     gs.player_z + crate::coord::WIRE_Z_OFFSET,
+            // FOOT datum (#522, see coord::WIRE_Z_OFFSET): every agent-facing position reports the
+            // collision-floor/foot height, the SAME datum used internally (controller, gs.player_z,
+            // nav, collision) and by /observe/entities (entities are converted wire→foot at ingest).
+            // One datum end to end means a position the agent READS here can be fed straight back
+            // into goto/coords without a 3u skew, and self reads at the same height as another player
+            // standing on the same plank. The wire↔foot conversion happens ONLY at the packet edge
+            // (outbound adds the offset in OP_ClientUpdate; inbound subtracts it), never here.
+            pos_up:     gs.player_z,
             heading_ccw: gs.player_heading,
             heading_cw:  crate::eq_net::protocol::ccw_to_cw(gs.player_heading),
             server_corrections: gs.server_corrections,
@@ -705,6 +707,24 @@ mod currency_tests {
         let v = currency_json([0, 0, 0, 0]);
         assert_eq!(v["platinum"], 0);
         assert_eq!(v["copper"], 0);
+    }
+}
+
+/// #522: the agent-facing player view reports the FOOT datum, not the wire (model-origin) datum.
+/// `gs.player_z` is FOOT internally; `pos_up` must echo it verbatim so the agent's world model is
+/// one datum end to end. MUTATION CHECK: reintroduce `gs.player_z + WIRE_Z_OFFSET` in
+/// `from_game_state` → this goes RED.
+#[cfg(test)]
+mod player_view_datum_tests {
+    use super::PlayerState;
+
+    #[test]
+    fn pos_up_reports_foot_not_wire() {
+        let mut gs = crate::game_state::GameState::new();
+        gs.player_z = 73.875; // FOOT
+        let view = PlayerState::from_game_state(&gs);
+        assert_eq!(view.pos_up, 73.875,
+            "pos_up must report the internal FOOT datum, not foot + WIRE_Z_OFFSET");
     }
 }
 

@@ -2744,6 +2744,50 @@ mod tests {
     use crate::eq_net::transport::AppPacket;
     use crate::nav::steering::{NAV_LOCAL_STUCK_TICKS, PROACTIVE_REPLAN_CAP};
 
+    /// #522 datum round-trip: the internal FOOT z survives the wire hop unchanged.
+    ///
+    /// The bug was a datum split across ~8 sites (easy to double-apply or drop one). This pins the
+    /// invariant end to end: `foot → OUTBOUND(+offset) → wire → INBOUND(−offset) → foot` is the
+    /// identity, and the byte the client actually writes carries the model-origin (wire) datum.
+    ///
+    /// MUTATION CHECK (each independently turns this RED): drop the `+ WIRE_Z_OFFSET` in
+    /// `encode_client_position_update` → the wire-datum assert fails; flip the inbound `− WIRE_Z_OFFSET`
+    /// (packet_handler self-branch) to `+` or delete it → the identity assert fails; change the
+    /// constant on only one side → both fail.
+    #[test]
+    fn wire_z_datum_round_trips_to_foot() {
+        use crate::coord::WIRE_Z_OFFSET;
+        use crate::eq_net::protocol::{decode_position_update, encode_position_update};
+
+        // Grid-aligned foot z (EQ19 is value/8) so the fixed-point encode stays lossless and the
+        // test isolates the DATUM conversion from wire quantization.
+        let foot = 73.875_f32;
+
+        // OUTBOUND — the client's 46-byte PlayerPositionUpdateClient_Struct. The z the client WRITES
+        // must be the model-origin (wire) datum = foot + offset, or native observers render us sunk
+        // into the floor (the #522 symptom).
+        let buf = encode_client_position_update(7, 42, [10.0, 20.0, foot], [0.0; 3], 0, 0);
+        let wire_z = f32::from_le_bytes([buf[26], buf[27], buf[28], buf[29]]);
+        assert_eq!(wire_z, foot + WIRE_Z_OFFSET, "outbound wire z must carry the model-origin datum");
+
+        // INBOUND — drive the REAL handler: the server rebroadcasts our position as the 24-byte
+        // server struct, and apply_position_update's self-branch must subtract the offset to land
+        // gs.player_z back on FOOT. Going through apply_packet (not a replicated formula) means a
+        // mutation of the actual inbound conversion turns this RED.
+        let server_pkt = encode_position_update(42, 10.0, 20.0, wire_z, 0.0);
+        // (sanity: the decoder recovers the wire datum verbatim)
+        let upd = decode_position_update(&server_pkt).expect("decode server position update");
+        assert!((upd.z - wire_z).abs() < 1e-4, "decoder recovers the wire z");
+        let mut gs = GameState::new();
+        gs.player_id = 42;            // so the packet is treated as OUR OWN position
+        gs.player_z = -999.0;         // poisoned: only the handler's conversion can fix it
+        apply_packet(&mut gs, &AppPacket {
+            opcode: crate::eq_net::protocol::OP_CLIENT_UPDATE, payload: server_pkt });
+        assert!((gs.player_z - foot).abs() < 1e-4,
+            "foot→wire→foot must be the identity through the real handler: sent {foot}, gs.player_z {}",
+            gs.player_z);
+    }
+
     /// **A GOAL THE CLIENT CHANGED MUST NOT BE REPORTED AS THE GOAL THE AGENT ASKED FOR.**
     ///
     /// When the caller's `z` sits below every floor in the goal's column, the planner snaps the goal
@@ -2958,8 +3002,11 @@ mod tests {
         nav.command.request_goto((-455.0, -174.0, 30.0));
         let same = nav.perform_cross(&mut stream, &mut gs, 100, HERE, [111.0, 222.0, 33.0]);
         assert!(same, "dest==current must be handled as a same-zone cross");
-        assert_eq!([gs.player_x, gs.player_y, gs.player_z], [111.0, 222.0, 33.0],
-            "same-zone cross must reposition the player to the arrival so it leaves the region (#368)");
+        // The arrival coords are WIRE datum (DB safe coords, model-origin z); the player's internal
+        // z is FOOT, so z is converted 33.0 → 33.0 − WIRE_Z_OFFSET on the local apply (#522). x/y
+        // are unaffected.
+        assert_eq!([gs.player_x, gs.player_y, gs.player_z], [111.0, 222.0, 33.0 - crate::coord::WIRE_Z_OFFSET],
+            "same-zone cross repositions the player (foot datum) so it leaves the region (#368/#522)");
         // #508: the crossing is DONE — the translocator repositioned us in-zone. The stale zone-line
         // goal must be cleared so the walker does NOT resume toward it and drift across a DIFFERENT
         // zone's real line (qeynos2 → qeynos). Mutation check: delete `self.command.request_stop()`
@@ -4467,7 +4514,10 @@ mod tests {
         assert_eq!(p.len(), 17, "UpdateMovementEntry is 17 packed bytes");
         assert_eq!(&p[0..4], &(-20.0f32).to_le_bytes(), "Y field @0 = server north");
         assert_eq!(&p[4..8], &(10.0f32).to_le_bytes(), "X field @4 = server east");
-        assert_eq!(&p[8..12], &(3.5f32).to_le_bytes(), "Z field @8");
+        // Z crosses the datum boundary: the caller passes FOOT (3.5), the wire carries the
+        // model-origin datum = foot + WIRE_Z_OFFSET (#522).
+        assert_eq!(&p[8..12], &(3.5f32 + crate::coord::WIRE_Z_OFFSET).to_le_bytes(),
+            "Z field @8 = foot + WIRE_Z_OFFSET (wire datum)");
         assert_eq!(p[12], 1, "type = Collision (benign; skips teleport/zoneline cheat checks)");
     }
 }
