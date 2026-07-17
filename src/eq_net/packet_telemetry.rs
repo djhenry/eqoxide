@@ -110,17 +110,62 @@ struct Ring {
     cap: usize,
 }
 
+impl Ring {
+    fn new(cap: usize) -> Self {
+        Ring { epoch: Instant::now(), next_n: 0, buf: VecDeque::with_capacity(cap), cap }
+    }
+
+    /// Build one record from the capture args and push it, evicting the oldest if at capacity.
+    /// This is the ENTIRE bound+evict behavior, factored out of the global hot path so it can be
+    /// exercised against a caller-owned, non-global `Ring` — see the `#[cfg(test)]` note below on
+    /// why that isolation matters (#541).
+    fn push_captured(&mut self, dir: Dir, opcode: u16, payload: &[u8], reliable: bool, rel_seq: Option<u16>) {
+        let summary = summarize(opcode, payload);
+        let op_name = opcode_name(opcode);
+        let n = self.next_n;
+        self.next_n += 1;
+        let t_ms = self.epoch.elapsed().as_millis() as u64;
+        let rec = PacketRecord {
+            n,
+            t_ms,
+            dir,
+            opcode,
+            op_hex: format!("{opcode:#06x}"),
+            op_name,
+            size: payload.len() + 2,
+            reliable,
+            rel_seq,
+            summary,
+        };
+        if self.buf.len() >= self.cap {
+            self.buf.pop_front();
+        }
+        self.buf.push_back(rec);
+    }
+
+    /// Snapshot + filter, same semantics as the module-level [`query`].
+    fn query(&self, q: &Query) -> Vec<PacketRecord> {
+        let mut out: Vec<PacketRecord> = self
+            .buf
+            .iter()
+            .filter(|r| q.since.is_none_or(|s| r.n >= s))
+            .filter(|r| q.dir.is_none_or(|d| r.dir == d))
+            .filter(|r| q.op.is_none_or(|o| r.opcode == o))
+            .cloned()
+            .collect();
+        if let Some(limit) = q.limit {
+            if out.len() > limit {
+                out.drain(0..out.len() - limit);
+            }
+        }
+        out
+    }
+}
+
 static RING: OnceLock<Mutex<Ring>> = OnceLock::new();
 
 fn ring() -> &'static Mutex<Ring> {
-    RING.get_or_init(|| {
-        Mutex::new(Ring {
-            epoch: Instant::now(),
-            next_n: 0,
-            buf: VecDeque::with_capacity(DEFAULT_CAPACITY),
-            cap: DEFAULT_CAPACITY,
-        })
-    })
+    RING.get_or_init(|| Mutex::new(Ring::new(DEFAULT_CAPACITY)))
 }
 
 /// Is capture active? Single relaxed atomic load — safe to call anywhere.
@@ -170,29 +215,8 @@ pub fn capture(dir: Dir, opcode: u16, payload: &[u8], reliable: bool, rel_seq: O
 /// machinery — is inlined into the hot caller, keeping the disabled hook to a bare branch.
 #[inline(never)]
 fn capture_slow(dir: Dir, opcode: u16, payload: &[u8], reliable: bool, rel_seq: Option<u16>) {
-    let summary = summarize(opcode, payload);
-    let rec_op_name = opcode_name(opcode);
-    let ring = ring();
-    let mut g = ring.lock().unwrap();
-    let n = g.next_n;
-    g.next_n += 1;
-    let t_ms = g.epoch.elapsed().as_millis() as u64;
-    let rec = PacketRecord {
-        n,
-        t_ms,
-        dir,
-        opcode,
-        op_hex: format!("{opcode:#06x}"),
-        op_name: rec_op_name,
-        size: payload.len() + 2,
-        reliable,
-        rel_seq,
-        summary,
-    };
-    if g.buf.len() >= g.cap {
-        g.buf.pop_front();
-    }
-    g.buf.push_back(rec);
+    let mut g = ring().lock().unwrap();
+    g.push_captured(dir, opcode, payload, reliable, rel_seq);
 }
 
 /// Drop all captured records and reset the epoch (but leave the enabled flag untouched). Used by the
@@ -221,21 +245,7 @@ pub struct Query {
 /// When `limit` is set and more than `limit` match, the MOST RECENT `limit` are returned (still in
 /// order) — an agent tailing wants the newest, not the oldest.
 pub fn query(q: &Query) -> Vec<PacketRecord> {
-    let g = ring().lock().unwrap();
-    let mut out: Vec<PacketRecord> = g
-        .buf
-        .iter()
-        .filter(|r| q.since.is_none_or(|s| r.n >= s))
-        .filter(|r| q.dir.is_none_or(|d| r.dir == d))
-        .filter(|r| q.op.is_none_or(|o| r.opcode == o))
-        .cloned()
-        .collect();
-    if let Some(limit) = q.limit {
-        if out.len() > limit {
-            out.drain(0..out.len() - limit);
-        }
-    }
-    out
+    ring().lock().unwrap().query(q)
 }
 
 // ── Analysis ────────────────────────────────────────────────────────────────
@@ -511,9 +521,24 @@ pub fn opcode_name(op: u16) -> &'static str {
 
 /// Shared serialization lock for any test that toggles capture. `ENABLED`, `RING`, and the epoch are
 /// process-global, so tests in DIFFERENT modules (this module's unit tests AND the HTTP endpoint
-/// test in `crate::http::observe`) that enable/clear/read capture must hold this SAME lock or they
-/// clobber each other under cargo's parallel test runner. `pub(crate)` so `observe`'s test can reach
-/// it. Poison-tolerant: a panicking test still releases a usable guard.
+/// test in `crate::http::observe`) that enable/clear/read capture must hold this SAME lock — never a
+/// second, independent lock (that was the original #532 hazard) — or they clobber each other under
+/// cargo's parallel test runner. `pub(crate)` so `observe`'s test can reach it. Poison-tolerant: a
+/// panicking test still releases a usable guard.
+///
+/// ONE THING THIS LOCK CANNOT DO (#541): it only serializes tests that explicitly take it. Dozens of
+/// tests elsewhere in the crate (`eq_net::action_loop`, `eq_net::gameplay`, `eq_net::transport`)
+/// drive a real `EqStream` through `send_app_packet` / `on_raw_recv` as ordinary production code —
+/// which calls the SAME global `capture()` this lock guards, gated only by the global `ENABLED`
+/// atomic, with zero awareness this lock exists. Any packet-telemetry test that enables capture and
+/// then asserts an EXACT count/content of the global ring is racing every one of those tests: while
+/// `ENABLED` is true, a concurrently-scheduled one can inject an extra record mid-assertion (this is
+/// exactly how `ring_is_bounded_and_evicts_oldest` flaked — reproduced live as `left: 6, right: 5`).
+/// So: any test that needs to prove behavior of the RING/QUERY LOGIC itself (bound, eviction, filter
+/// semantics) should construct its own private `Ring` (see `Ring::new` + `push_captured` + `query`)
+/// instead of touching the global one — structurally immune, no lock needed. Reserve this lock for
+/// tests that must exercise the real global pipeline end-to-end (e.g. the `/v1/observe/packets` HTTP
+/// endpoint test in `http::observe`, which has no private-ring seam to substitute).
 #[cfg(test)]
 pub(crate) fn test_capture_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());
@@ -553,16 +578,23 @@ mod tests {
         assert!(!enabled());
     }
 
+    // The three tests below (`enabled_captures_...`, `query_filters_...`, `ring_is_bounded_...`)
+    // each construct a PRIVATE `Ring` instead of touching the global one guarded by
+    // `test_capture_lock` — see the long comment on `test_capture_lock` for why: dozens of
+    // unrelated tests elsewhere in the crate call the real, global `capture()` as a side effect of
+    // exercising production `EqStream` code, with no awareness of this lock, so any test asserting
+    // an EXACT count/content of the GLOBAL ring is racing them (#541). `Ring::push_captured` /
+    // `Ring::query` are the exact same logic `capture_slow` / the public `query()` run against the
+    // global ring, so these tests still prove the real behavior — just against state nothing else
+    // can reach.
+
     #[test]
     fn enabled_captures_direction_opcode_size_and_seq() {
-        let _g = test_lock();
-        set_enabled(true);
-        clear();
-        capture(Dir::Out, 0x7dfc, &[0u8; 22], true, Some(42));
-        capture(Dir::In, 0x6097, &[9u8; 10], false, None);
-        set_enabled(false);
+        let mut ring = Ring::new(DEFAULT_CAPACITY);
+        ring.push_captured(Dir::Out, 0x7dfc, &[0u8; 22], true, Some(42));
+        ring.push_captured(Dir::In, 0x6097, &[9u8; 10], false, None);
 
-        let all = query(&Query::default());
+        let all = ring.query(&Query::default());
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].dir, Dir::Out);
         assert_eq!(all[0].opcode, 0x7dfc);
@@ -577,35 +609,38 @@ mod tests {
 
     #[test]
     fn query_filters_by_dir_op_since_and_limit() {
-        let _g = test_lock();
-        set_enabled(true);
-        clear();
-        capture(Dir::In, 0x0001, &[], true, Some(0)); // n=0
-        capture(Dir::Out, 0x0002, &[], true, Some(0)); // n=1
-        capture(Dir::In, 0x0001, &[], true, Some(1)); // n=2
-        set_enabled(false);
+        let mut ring = Ring::new(DEFAULT_CAPACITY);
+        ring.push_captured(Dir::In, 0x0001, &[], true, Some(0)); // n=0
+        ring.push_captured(Dir::Out, 0x0002, &[], true, Some(0)); // n=1
+        ring.push_captured(Dir::In, 0x0001, &[], true, Some(1)); // n=2
 
-        assert_eq!(query(&Query { dir: Some(Dir::In), ..Default::default() }).len(), 2);
-        assert_eq!(query(&Query { op: Some(0x0002), ..Default::default() }).len(), 1);
-        assert_eq!(query(&Query { since: Some(2), ..Default::default() }).len(), 1);
+        assert_eq!(ring.query(&Query { dir: Some(Dir::In), ..Default::default() }).len(), 2);
+        assert_eq!(ring.query(&Query { op: Some(0x0002), ..Default::default() }).len(), 1);
+        assert_eq!(ring.query(&Query { since: Some(2), ..Default::default() }).len(), 1);
         // limit keeps the MOST RECENT
-        let last1 = query(&Query { limit: Some(1), ..Default::default() });
+        let last1 = ring.query(&Query { limit: Some(1), ..Default::default() });
         assert_eq!(last1.len(), 1);
         assert_eq!(last1[0].n, 2);
     }
 
     #[test]
     fn ring_is_bounded_and_evicts_oldest() {
-        let _g = test_lock();
-        set_enabled(true);
-        clear();
+        // #541 root cause, reproduced live as `left: 6, right: 5`: this test used to enable the
+        // GLOBAL capture flag and push DEFAULT_CAPACITY+extra records into the GLOBAL ring under
+        // `test_capture_lock`, then assert an EXACT count and the EXACT `n` of the oldest surviving
+        // record. That lock only serializes tests that explicitly take it — it does not stop the
+        // dozens of unrelated tests in `action_loop`/`gameplay`/`transport` that drive a real
+        // `EqStream` and so call the same global `capture()` as ordinary production code, gated only
+        // by `ENABLED`. Any one of those, scheduled concurrently while this loop had `ENABLED=true`,
+        // could inject an extra record into the same ring and shift the eviction boundary by one.
+        // Fix: don't touch the global ring at all. A private `Ring` is structurally immune.
+        let mut ring = Ring::new(DEFAULT_CAPACITY);
         // Overflow the ring by `extra` past DEFAULT_CAPACITY and check the bound + eviction hold.
         let extra = 5usize;
         for _ in 0..DEFAULT_CAPACITY + extra {
-            capture(Dir::In, 0x0001, &[], false, None);
+            ring.push_captured(Dir::In, 0x0001, &[], false, None);
         }
-        set_enabled(false);
-        let all = query(&Query::default());
+        let all = ring.query(&Query::default());
         assert_eq!(all.len(), DEFAULT_CAPACITY, "ring must not grow past its cap");
         // Oldest `extra` were evicted → the first surviving record's n is `extra`.
         assert_eq!(all[0].n, extra as u64, "oldest records are evicted first");
