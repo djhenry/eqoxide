@@ -135,6 +135,18 @@ pub async fn run_login_flow(
 
 // ── Login phase ───────────────────────────────────────────────────────────────
 
+/// #419: the login handshake drain's per-packet liveness stamp. It MUST go through the canonical
+/// `record_app_packet` recorder rather than writing `NetHealth::last_packet` directly, so there is a
+/// single writer of that liveness field — the one that also clears the wedge-streak clock
+/// (`first_unanswered_probe_sent`). This is defensive/latent hygiene, not an active-bug fix: no code
+/// path re-enters login after gameplay today (so no stale streak can reach this drain), but a
+/// bypassing raw write here would resurrect the #371 false-alive if a relogin-without-restart path is
+/// ever added. Extracted into a named helper so `login_liveness_stamp_goes_through_canonical_recorder`
+/// can pin it: reverting this body to a raw `last_packet = now` write makes that test RED.
+fn record_login_liveness(net_health: &crate::ipc::NetHealthShared, now: std::time::Instant) {
+    record_app_packet(&mut net_health.lock().unwrap(), now);
+}
+
 /// Run the full handshake (login → world → zone entry).
 /// Returns the live zone stream, its packet receiver, accumulated GameState, and world credentials.
 ///
@@ -168,11 +180,7 @@ async fn run_login_phase(
         while let Ok(packet) = net_rx.try_recv() {
             // Apply gameplay side effects.
             apply_packet(&mut gs, &packet);
-            // #419: route through the canonical recorder (was a direct `last_packet = now()`
-            // stamp) so this is not a second writer of the liveness timestamp — see
-            // `record_app_packet`'s doc comment in gameplay.rs for why a bypassing writer is a
-            // false-alive seam.
-            record_app_packet(&mut net_health.lock().unwrap(), std::time::Instant::now());
+            record_login_liveness(&net_health, std::time::Instant::now());
 
             // Handle login-protocol state transitions.
             match proto.handle(&packet, &mut stream, &gs) {
@@ -812,6 +820,38 @@ mod charcreate_tests {
 // world_server_manager.cpp). Each test is written to go RED if the SoD format is reverted to
 // Titanium or the field offsets drift. Live round-trip (server accepts the SoD handshake and
 // hands off to world) is the orchestrator's build-and-verify gate.
+#[cfg(test)]
+mod liveness_stamp_tests {
+    use super::record_login_liveness;
+    use std::time::{Duration, Instant};
+
+    /// Pins the #419 fix at the login call site: the handshake drain's liveness stamp must route
+    /// through `record_app_packet` (the single canonical writer), which clears the wedge-streak clock
+    /// `first_unanswered_probe_sent` in addition to bumping `last_packet`. We seed an outstanding
+    /// streak (as if a probe were in flight), call the exact helper `run_login_phase` calls, and
+    /// assert BOTH effects. Reverting `record_login_liveness`'s body to a raw
+    /// `net_health.lock().unwrap().last_packet = now` write leaves the streak set → this goes RED,
+    /// so a future revert of the fix cannot pass unnoticed (the defect the reviewer flagged).
+    #[test]
+    fn login_liveness_stamp_goes_through_canonical_recorder() {
+        let base = Instant::now();
+        let health = std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::NetHealth {
+            last_datagram: base, last_packet: base, last_tick: base,
+            last_probe_sent: Some(base), last_probe_reply: None,
+            first_unanswered_probe_sent: Some(base),
+        }));
+
+        let stamp_at = base + Duration::from_secs(65);
+        record_login_liveness(&health, stamp_at);
+
+        let h = health.lock().unwrap();
+        assert_eq!(h.last_packet, stamp_at, "the stamp must update last_packet");
+        assert!(h.first_unanswered_probe_sent.is_none(),
+            "the login liveness stamp must go through record_app_packet, which clears the wedge-streak \
+             clock — a raw `last_packet = now` write would leave it set (the #419 seam)");
+    }
+}
+
 #[cfg(test)]
 mod sod_login_tests {
     use super::*;
