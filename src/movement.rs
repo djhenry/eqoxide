@@ -162,6 +162,16 @@ pub struct CharacterController {
     /// fall damage. Height ALWAYS comes from this tracked airborne start, never a nav waypoint z.
     airborne_start_z:   Option<f32>,
     landed_fall_height: Option<f32>,
+    /// #444: set while THIS frame's `swim_sink` produced a GENUINE downward delta (the character
+    /// actually descended through open water — resolved delta `< -SKIN` — not just held a down-wish
+    /// that clamped to ~0 against a submerged floor, and not passive buoyancy). Read at the top of
+    /// the NEXT frame, before being overwritten, to tell a genuine "swam down and out the bottom of a
+    /// suspended water volume" exit apart from water merely disappearing out from under a character
+    /// (a zone/collision swap, walking onto shore, or drifting LATERALLY out of a pond that sits on a
+    /// flush floor) — only the former should re-arm a fresh airborne start; #442 DEFECT-1 ("water
+    /// breaks a fall") must still hold for every other water-exit path. Keying this off actual
+    /// descent (not `wish_vspeed`'s sign) is what keeps a sideways exit from false-arming a fall.
+    swim_sinking: bool,
 }
 
 #[inline]
@@ -172,7 +182,7 @@ impl CharacterController {
         Self { pos, vel_z: 0.0, on_ground: false, in_water: false,
                good: std::collections::VecDeque::new(), good_timer: 0.0, stuck_time: 0.0,
                hop_cooldown: 0.0, underworld: f32::NEG_INFINITY,
-               airborne_start_z: None, landed_fall_height: None }
+               airborne_start_z: None, landed_fall_height: None, swim_sinking: false }
     }
 
     /// Take-and-clear the one-shot fall height (feet dropped during the airborne stretch just
@@ -200,6 +210,7 @@ impl CharacterController {
         // fall landing (§442 hazard 2b — `app.rs` calls this from the `pos_correction` handler).
         self.airborne_start_z = None;
         self.landed_fall_height = None;
+        self.swim_sinking = false; // #444: a teleport isn't a swim-down exit either
     }
 
     /// Advance one frame. Returns the new authoritative position.
@@ -209,6 +220,13 @@ impl CharacterController {
         if self.depenetrate(dt, col) {
             return self.pos;
         }
+        // §444: remember whether we were in water AND actively swim-sinking LAST frame, before
+        // either is overwritten below, so the gravity branch can detect a genuine swim-down-and-exit
+        // (see the re-arm below). `swim_sinking` defaults false again this frame; only the swim_sink
+        // call further down sets it true.
+        let was_in_water = self.in_water;
+        let was_swim_sinking = self.swim_sinking;
+        self.swim_sinking = false;
 
         // Is the character in water? Probe the BODY, not just the origin (#329).
         //
@@ -322,7 +340,18 @@ impl CharacterController {
                     }
                     self.pos[2] += rise;
                 } else {
-                    self.pos[2] += self.swim_sink(want, col);
+                    // #444: track swim_sinking off the ACTUAL descent, not the down-INTENT. A
+                    // down-wish is common while merely swimming FORWARD looking slightly down (the
+                    // WASD `wish_vspeed = dz*speed` couples pitch into vertical), so keying the
+                    // water-exit re-arm off `want < 0` alone false-positives for a character resting
+                    // on / near a submerged floor that drifts LATERALLY out of the water region —
+                    // `swim_sink` clamps to ~0 against the floor, yet the sign said "sinking". Only a
+                    // genuinely negative resolved delta (moved down past the SKIN clamp, i.e. real
+                    // open water below the feet) counts, so the §442 DEFECT-1 invariant still holds
+                    // for a sideways water-exit.
+                    let sink = self.swim_sink(want, col);
+                    self.pos[2] += sink;
+                    if sink < -SKIN { self.swim_sinking = true; }
                 }
             } else if let Some(surf) = col.water_surface(water_at) {
                 // Nav-driven swim with no vertical wish: float toward the swim plane
@@ -360,6 +389,28 @@ impl CharacterController {
             // No bounded surface found: hold position rather than free-fall (a server correction or
             // the #150 underworld guard would otherwise have to recover us).
         } else {
+            // §444: exiting a suspended water volume through its BOTTOM via a deliberate swim_sink
+            // (a floating slab over an open pit — pathological but real `.wtr` geometry) resumes a
+            // normal fall, but the swim branch unconditionally clears `airborne_start_z` (water
+            // breaks a fall, §442 DEFECT-1), and this branch otherwise only re-arms it from
+            // jump/floor-drop-away while GROUNDED. A water exit lands here already `on_ground =
+            // false` (set by the swim branch), so neither of those two arms would ever fire: the
+            // drop to the real floor below was silently untracked (no landing height, no
+            // fall-damage signal — the character would still read as swimming while actually
+            // plummeting). Re-arm a fresh airborne start at the water-exit z the first frame water
+            // reads false while still airborne.
+            //
+            // Gated on `was_swim_sinking` (not just `was_in_water`), so this does NOT reopen §442
+            // DEFECT-1: a character that was merely floating (passive buoyancy, never sank below the
+            // water's own bottom) and then has its water disappear out from under it — e.g. crossing
+            // into shore geometry with no water map, `water_breaks_a_fall_no_phantom_damage_on_shore`
+            // — must still get NO phantom fall height. Only an ACTIVE downward swim through the
+            // volume's floor counts as a genuine new airborne stretch.
+            if was_in_water && was_swim_sinking && !self.in_water && !self.on_ground
+                && self.airborne_start_z.is_none()
+            {
+                self.airborne_start_z = Some(self.pos[2]);
+            }
             if intent.jump && self.on_ground {
                 self.vel_z = JUMP_VELOCITY;
                 self.on_ground = false;
@@ -1107,6 +1158,119 @@ mod tests {
         assert!(ctrl.on_ground, "should have come to rest on the dry shore floor: z={}", ctrl.pos[2]);
         assert!(ctrl.take_landed_fall_height().is_none(),
             "water broke the fall — stepping onto shore must apply NO (phantom) fall damage");
+    }
+
+    /// #444 — exiting the BOTTOM of a SUSPENDED water volume (a floating slab with open air below it,
+    /// e.g. a pathological `.wtr` shape over a pit) must resume normal fall tracking. Pre-fix: the
+    /// swim branch unconditionally clears `airborne_start_z` (§442 DEFECT-1, water breaks a fall) and
+    /// leaves `on_ground = false`; the next frame reads `in_water = false` and falls straight into the
+    /// dry-gravity branch, but that branch only re-arms `airborne_start_z` from GROUNDED transitions
+    /// (jump, floor-drops-away-while-on_ground) — neither of which fires here because we are already
+    /// airborne. The fall through the pit below then lands with no tracked start: no landing height,
+    /// no fall-damage signal, and (agent-honesty) the character would still read as having just been
+    /// swimming rather than plummeting.
+    ///
+    /// MUTATION-CHECK: disabling the `was_in_water && was_swim_sinking && !self.in_water &&
+    /// !self.on_ground && ...` re-arm added for #444 (verified by short-circuiting it to `false`)
+    /// makes this RED — `take_landed_fall_height()` returns `None` instead of `Some(height)`. The
+    /// `was_swim_sinking` gate itself is also load-bearing: swapping it for a bare `was_in_water`
+    /// check turns `water_breaks_a_fall_no_phantom_damage_on_shore` (below) RED instead — a
+    /// passively-floating character whose water vanishes must NOT get a phantom fall height.
+    #[test]
+    fn exiting_the_bottom_of_a_suspended_water_volume_resumes_the_fall() {
+        // A suspended water slab z∈[0,30] floating over an OPEN PIT (no geometry from -50..0) with the
+        // real floor down at z=-50 — the "floating slab over a drop" shape from #444.
+        let c = {
+            let mut c = col(vec![floor(-50.0, -100.0, 100.0)]);
+            c.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::water_slab(0.0, 30.0))));
+            c
+        };
+        // Start submerged near the bottom of the slab, deliberately swimming DOWN and out of it.
+        let mut ctrl = CharacterController::new([0.0, 0.0, 5.0]);
+        ctrl.on_ground = false;
+        let swim_down = MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: -15.0, jump: false,
+            want_swim: true, speed: 0.0, climb: 0.0, hop: false };
+
+        // Drive it down through the water bottom into the pit; stop as soon as we're clearly out of
+        // the water and still above the pit floor, so we can inspect the mid-fall state.
+        let mut exited = false;
+        for _ in 0..600 {
+            ctrl.step(swim_down, 1.0 / 60.0, &c);
+            if !ctrl.in_water && ctrl.pos[2] < -1.0 && ctrl.pos[2] > -45.0 { exited = true; break; }
+        }
+        assert!(exited, "should have exited the water bottom into the open pit: z={}, in_water={}",
+            ctrl.pos[2], ctrl.in_water);
+        assert!(!ctrl.on_ground, "must be airborne in the pit, not grounded: {:?}", ctrl.pos);
+        assert!(ctrl.airborne_start_z.is_some(),
+            "water-bottom exit must re-arm a fresh airborne start, not leave it cleared");
+
+        // Let gravity carry it the rest of the way down to the real floor.
+        for _ in 0..300 { ctrl.step(walk(0.0, [0.0, 0.0]), 1.0 / 60.0, &c); }
+        assert!(ctrl.on_ground, "should have landed on the pit floor at z=-50: {:?}", ctrl.pos);
+        assert!((ctrl.pos[2] + 50.0).abs() < 0.5, "should be resting at z=-50: {}", ctrl.pos[2]);
+        let h = ctrl.take_landed_fall_height();
+        assert!(h.is_some_and(|h| h > 5.0),
+            "the post-exit air-fall must be tracked and reported (nonzero landed height), got {h:?}");
+    }
+
+    /// #444 (PR #511 review) — the water-exit re-arm must key off GENUINE descent, not down-INTENT.
+    /// The `.wtr`-gap shape family: a pond whose lateral edge sits on a floor that continues FLUSH
+    /// outside the water region. A character RESTING on that submerged floor while holding a down-wish
+    /// (extremely common in the real WASD path, where `wish_vspeed = dz·speed` couples the camera
+    /// pitch into a downward vertical component whenever you swim forward looking even slightly down)
+    /// drifts LATERALLY out of the water — never through the bottom. `swim_sink` clamps to ~0 against
+    /// the floor, so there is NO real fall: the character only moved sideways and stayed on the floor.
+    /// It must latch NO fall height. Pre-tightening this false-positived (the gate was `wish_vspeed <
+    /// 0` alone), re-arming `airborne_start_z` and latching a spurious `Some(~0)` — a phantom "fall"
+    /// for a purely lateral exit, violating the §442 DEFECT-1 invariant (inert today only because
+    /// `SAFE_FALL_HEIGHT` discards it, but wrong).
+    ///
+    /// MUTATION-CHECK: reverting the gate to `if want < 0.0 { self.swim_sinking = true; }` (the
+    /// down-intent sign, ignoring the resolved `swim_sink` delta) turns this RED —
+    /// `take_landed_fall_height()` returns `Some(_)` instead of `None`. Keep
+    /// `exiting_the_bottom_of_a_suspended_water_volume_resumes_the_fall` (a REAL bottom-exit) and
+    /// `water_breaks_a_fall_no_phantom_damage_on_shore` green.
+    #[test]
+    fn lateral_swim_exit_over_a_flush_floor_latches_no_fall() {
+        // Flush floor at z=0 spanning the whole scene; a water pond ONLY over east∈[-100,0] up to
+        // z=10, so the SAME floor continues dry outside the pond (the .wtr-gap shape). The floor is
+        // submerged under the pond, so a character on it is fully in water while resting.
+        let c = {
+            let mut c = col(vec![floor(0.0, -100.0, 100.0)]);
+            c.set_water(Some(std::sync::Arc::new(
+                crate::region_map::RegionMap::box_below(-100.0, 100.0, -100.0, 0.0, 10.0),
+            )));
+            c
+        };
+        // Rest a hair above the submerged floor, INSIDE the pond (east=-20), so `swim_sink` clamps
+        // against the floor (~0) — the character never actually descends.
+        let mut ctrl = CharacterController::new([-20.0, 0.0, 0.05]);
+        ctrl.on_ground = false;
+        assert!(c.in_water([ctrl.pos[0], ctrl.pos[1], ctrl.pos[2]]), "must start submerged in the pond");
+        // Swim EAST (lateral) while holding a persistent DOWN wish — the look-slightly-down case.
+        let swim_out = MoveIntent { wish_dir: [1.0, 0.0], wish_vspeed: -15.0, jump: false,
+            want_swim: true, speed: 40.0, climb: 0.0, hop: false };
+
+        // Drive east until we've drifted out of the pond AND settled back onto the (flush, dry)
+        // floor, then stop — running further would walk the character off the finite test floor's
+        // far edge, a genuine (unrelated) fall. Assert on every frame that no fall height is latched.
+        let mut settled = false;
+        for _ in 0..160 {
+            ctrl.step(swim_out, 1.0 / 60.0, &c);
+            // At no point may this purely lateral traversal latch a fall height.
+            assert!(ctrl.take_landed_fall_height().is_none(),
+                "lateral exit over a flush floor must never latch a fall height (e={} z={})",
+                ctrl.pos[0], ctrl.pos[2]);
+            if !ctrl.in_water && ctrl.pos[0] > 1.0 {
+                // Out of the pond: the exit must NOT have re-armed a fall (§442 DEFECT-1 holds).
+                assert!(ctrl.airborne_start_z.is_none(),
+                    "a purely LATERAL water-exit (resting on a flush floor) must NOT re-arm a fall: start={:?}",
+                    ctrl.airborne_start_z);
+                if ctrl.on_ground { settled = true; break; }
+            }
+        }
+        assert!(settled, "the character should have drifted east out of the pond and settled on the dry flush floor: {:?}", ctrl.pos);
+        assert!(ctrl.pos[2].abs() < 0.5, "should be at the flush floor z=0, not sunk/fallen: {}", ctrl.pos[2]);
     }
 
     /// §442 (#442) DEFECT-2 — a nav auto-hop begins an airborne stretch too: the hop-launch path must
