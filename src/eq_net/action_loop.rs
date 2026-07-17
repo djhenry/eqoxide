@@ -3,7 +3,7 @@
 //! toward a `/goto` target in capped steps at 150 ms intervals, sending movement packets and
 //! notifying the render loop.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Nav tick interval (ms). Steps are gated to fire no more often than this.
 const NAV_TICK_MS: u128 = 150;
@@ -126,32 +126,52 @@ const GIVE_FINISH_TIMEOUT_TICKS: u32 = 20;
 /// rare and ~300ms is negligible; correctness (never a fabricated 200) beats latency.
 const GIVE_FINISH_SETTLE_TICKS: u32 = 2;
 
+/// #492 — time-based reap deadline for the parked awaited merchant BUY and OPEN slots. Once a
+/// `pending_buy`/`pending_open` `sent_at` has exceeded this, `reap_expired_pending` (swept every
+/// `tick`) drops it so a subsequent same-type command is ADMITTED instead of 409-blocked by the
+/// in-flight singleton guard. It MUST be `>=` the HTTP-side timeout the caller already gave up on —
+/// both `/v1/merchant/open` and `/v1/merchant/buy` use `tokio::time::timeout(Duration::from_secs(4)`
+/// in `http::merchant` — so a still-waiting caller's GENUINE echo can still fulfil the slot before
+/// the reap. The +2s margin keeps the reap strictly after the HTTP timeout, never racing a caller
+/// that is a hair from resolving. (Buy and open share the same 4s HTTP timeout, hence one const.)
+const SHOP_PENDING_REAP: Duration = Duration::from_secs(6);
+
+/// #492 — same, for the parked awaited self-CAST slot. Its HTTP-side timeout is
+/// `CAST_HTTP_TIMEOUT_SECS` (12s) in `http::combat` (sized to exceed the longest RoF2 cast), so the
+/// reap deadline is 12 + 2 = 14s: `>=` the HTTP timeout so a genuine `last_cast` transition still
+/// fulfils first, +2s so the reap lands strictly after the caller has already received its 202.
+const CAST_PENDING_REAP: Duration = Duration::from_secs(14);
+
 /// A merchant buy sent via the honest awaited path (A3 Migration 1, #448), parked here until its
 /// resolving packet lands. Holds the `oneshot::Sender` HTTP is awaiting plus the merchant/slot the
 /// buy was for, so a fulfil can CORRELATE the OP_ShopPlayerBuy echo (rejecting a stray shop echo
-/// for a different buy) before it `send`s `Resolved`. `sent_at` bounds how long the net side keeps
-/// it (informational; the authoritative timeout is HTTP-side). The `Sender` deliberately lives
-/// ONLY here — never in `GameState`, which is `Clone`d into the ArcSwap snapshot every tick and a
-/// `oneshot::Sender` is not `Clone`. See `crate::command_state::result` for the full flow.
+/// for a different buy) before it `send`s `Resolved`. `sent_at` is the park time — the authoritative
+/// timeout is still HTTP-side, but `reap_expired_pending` (#492) uses it to drop a slot the server
+/// never resolved (`SHOP_PENDING_REAP`) so a later buy isn't stranded behind it. The `Sender`
+/// deliberately lives ONLY here — never in `GameState`, which is `Clone`d into the ArcSwap snapshot
+/// every tick and a `oneshot::Sender` is not `Clone`. See `crate::command_state::result`.
 struct PendingBuy {
     tx:          tokio::sync::oneshot::Sender<crate::command_state::CommandResult<crate::command_state::BuyOk>>,
     merchant_id: u32,
     slot:        u32,
-    #[allow(dead_code)] // informational; the authoritative buy timeout is HTTP-side
+    /// Park time — drives the #492 `reap_expired_pending` sweep (`SHOP_PENDING_REAP`).
     sent_at:     Instant,
 }
 
 /// An awaited merchant open (eqoxide#479), parked between send and the resolving OP_ShopRequest
 /// echo. Holds the `oneshot::Sender` HTTP is awaiting plus the `merchant_id` the open was for, so a
 /// fulfil can CORRELATE the echo's npc_id (rejecting a stray shop-open echo for a DIFFERENT
-/// merchant) before it `send`s `Resolved`/`Refused`. `sent_at` bounds how long the net side keeps
-/// it (informational; the authoritative timeout is HTTP-side). The `Sender` deliberately lives
-/// ONLY here — never in `GameState`, which is `Clone`d into the ArcSwap snapshot every tick and a
-/// `oneshot::Sender` is not `Clone`. See `crate::command_state::result` for the full flow.
+/// merchant) before it `send`s `Resolved`/`Refused`. `sent_at` is the park time; the authoritative
+/// timeout is HTTP-side, but `reap_expired_pending` (#492) uses it to drop a slot the server never
+/// resolved (`SHOP_PENDING_REAP`) — the non-merchant/out-of-range open sends NO echo at all, so
+/// without the reap it would strand this `Sender` and 409-block every later open until a zone
+/// change. The `Sender` deliberately lives ONLY here — never in `GameState`, which is `Clone`d into
+/// the ArcSwap snapshot every tick and a `oneshot::Sender` is not `Clone`. See
+/// `crate::command_state::result` for the full flow.
 struct PendingOpen {
     tx:          tokio::sync::oneshot::Sender<crate::command_state::CommandResult<crate::command_state::OpenOk>>,
     merchant_id: u32,
-    #[allow(dead_code)] // informational; the authoritative open timeout is HTTP-side
+    /// Park time — drives the #492 `reap_expired_pending` sweep (`SHOP_PENDING_REAP`).
     sent_at:     Instant,
 }
 
@@ -709,6 +729,42 @@ impl ActionLoop {
         }
     }
 
+    /// #492 — TIME-BASED reap of stranded A3 pending slots, swept once per `tick`. Buy/open/cast each
+    /// park a `oneshot::Sender` that is otherwise cleared ONLY on (a) its resolving echo (`fulfill_*`)
+    /// or (b) a zone change (`reap_pending_*`). But the exact Unconfirmed/202 case — the server sends
+    /// NO resolving packet (a non-merchant/out-of-range open, an insufficient-funds buy, a cast the
+    /// server silently drops) — hits NEITHER: the HTTP `tokio::time::timeout` fires and returns 202 to
+    /// the caller, yet the parked `Sender` lingers on the net thread indefinitely. The in-flight
+    /// singleton guard (`drain_merchant`/`drain_cast`) then honestly-but-WRONGLY 409s EVERY later
+    /// command of that type ("another <X> already in flight") until the character zones.
+    ///
+    /// Here we drop any slot whose `sent_at` has exceeded its per-command reap deadline
+    /// (`SHOP_PENDING_REAP` for buy/open, `CAST_PENDING_REAP` for cast — each `>=` the HTTP timeout the
+    /// caller already gave up on, so a genuine late echo would have fulfilled the slot BEFORE we reap
+    /// it). HONESTY: the parked receiver has already timed out and returned 202, so we simply DROP the
+    /// `Sender` (dropping closes the channel; no late `Resolved`/`Unconfirmed` is fabricated) — the
+    /// only effect is unblocking the next same-type command. Swept at the TOP of `tick`, before
+    /// `drain_merchant`/`drain_cast`, so the same tick that reaps also admits the waiting command.
+    ///
+    /// The awaited GIVE is NOT swept here: it lives in `give_state` (not a `pending_*` slot) and its
+    /// state machine already SELF-times-out every tick via `GIVE_ACK_TIMEOUT_TICKS` /
+    /// `GIVE_FINISH_TIMEOUT_TICKS` in `tick_give`, resolving the awaited `Sender` to `Unconfirmed` and
+    /// clearing `give_state` — so a stranded give cannot occur.
+    fn reap_expired_pending(&mut self) {
+        if self.pending_buy.as_ref().is_some_and(|p| p.sent_at.elapsed() >= SHOP_PENDING_REAP) {
+            self.pending_buy = None; // drop the Sender — caller already got its 202; no late fulfillment
+            tracing::warn!("EQ: #492 reaped a stranded awaited BUY (no resolving packet within {SHOP_PENDING_REAP:?}) — later buys unblocked");
+        }
+        if self.pending_open.as_ref().is_some_and(|p| p.sent_at.elapsed() >= SHOP_PENDING_REAP) {
+            self.pending_open = None;
+            tracing::warn!("EQ: #492 reaped a stranded awaited OPEN (no resolving packet within {SHOP_PENDING_REAP:?}) — later opens unblocked");
+        }
+        if self.pending_cast.as_ref().is_some_and(|p| p.sent_at.elapsed() >= CAST_PENDING_REAP) {
+            self.pending_cast = None;
+            tracing::warn!("EQ: #492 reaped a stranded awaited CAST (no resolving packet within {CAST_PENDING_REAP:?}) — later casts unblocked");
+        }
+    }
+
     /// Publish the open-merchant session from `gs` into the shared slot (GET /trade/list + the HUD
     /// merchant window).
     pub fn sync_merchant(&self, gs: &GameState) {
@@ -854,6 +910,11 @@ impl ActionLoop {
         stream:  &mut EqStream,
         gs:      &mut GameState,
     ) {
+        // #492: drop any A3 pending slot the server never resolved (buy/open/cast) BEFORE the drains
+        // re-check the in-flight singleton guard, so a stranded slot from a silent Unconfirmed/202
+        // command can't 409-block the next same-type command indefinitely. See `reap_expired_pending`.
+        self.reap_expired_pending();
+
         self.drain_loot(gs);
         self.drain_doors(stream, gs);
         self.drain_quests(stream, gs);
@@ -3245,6 +3306,130 @@ mod tests {
         assert_eq!(resp.await.unwrap(), CommandResult::Unconfirmed,
             "a cast parked across a zone change must be reaped Unconfirmed");
         assert!(nav.pending_cast.is_none());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+    // #492: the time-based reap of stranded A3 pending slots (buy / open / cast). The exact
+    // Unconfirmed/202 case (server sends NO resolving packet) leaves the parked Sender un-fired; the
+    // HTTP timeout returns 202 to the caller but the slot lingers, 409-blocking every later same-type
+    // command until a zone change. These drive the REAL reap-then-drain ordering `tick` uses (reap
+    // first, then the singleton guard in `drain_*`), backdating `sent_at` to simulate elapsed time
+    // (the reap reads wall-clock `Instant::elapsed`, not tokio virtual time). Each test proves BOTH:
+    // before the deadline the singleton guard still holds (a second command is 409-rejected — the
+    // reaper doesn't fire too early and break the guarantee); after the deadline the stranded slot is
+    // reaped and a subsequent command is ADMITTED (parked), never 409. Mutation-check: emptying
+    // `reap_expired_pending` (or dropping its `tick` call) turns the "admitted after timeout" halves RED.
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn buy_stranded_slot_is_reaped_after_the_deadline_and_a_later_buy_is_admitted() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_buy_gs();
+
+        // Park buy A (the silent/insufficient-funds path: no echo will ever come).
+        let (tx_a, _resp_a) = tokio::sync::oneshot::channel();
+        nav.command.request_buy_await(11, 3, tx_a);
+        nav.drain_merchant(&mut stream, &mut gs);
+        assert!(nav.pending_buy.is_some(), "buy A must be parked");
+
+        // BEFORE the deadline: reap is a no-op, so buy B is still correctly 409-rejected in-flight.
+        nav.pending_buy.as_mut().unwrap().sent_at = Instant::now() - (SHOP_PENDING_REAP - Duration::from_secs(1));
+        nav.reap_expired_pending();
+        assert!(nav.pending_buy.is_some(), "an un-expired buy must NOT be reaped — the singleton guard still holds");
+        let (tx_b, resp_b) = tokio::sync::oneshot::channel();
+        nav.command.request_buy_await(11, 3, tx_b);
+        nav.drain_merchant(&mut stream, &mut gs);
+        match resp_b.await.unwrap() {
+            CommandResult::Refused(reason) => assert!(reason.contains("already in flight"),
+                "before the deadline B must be told a buy is in flight, got: {reason}"),
+            other => panic!("before the deadline a second buy must be Refused, got {other:?}"),
+        }
+        assert!(nav.pending_buy.is_some(), "buy A must still be parked before the deadline");
+
+        // AFTER the deadline: the stranded slot is reaped, so buy C is ADMITTED (parked), not 409.
+        nav.pending_buy.as_mut().unwrap().sent_at = Instant::now() - (SHOP_PENDING_REAP + Duration::from_secs(1));
+        nav.reap_expired_pending();
+        assert!(nav.pending_buy.is_none(), "an expired stranded buy must be reaped");
+        let (tx_c, mut resp_c) = tokio::sync::oneshot::channel();
+        nav.command.request_buy_await(11, 3, tx_c);
+        nav.drain_merchant(&mut stream, &mut gs);
+        assert!(nav.pending_buy.is_some(), "buy C must be ADMITTED (parked) once the stranded slot is reaped");
+        assert!(resp_c.try_recv().is_err(), "C must be in flight (awaiting its echo), not 409-refused");
+    }
+
+    #[tokio::test]
+    async fn open_stranded_slot_is_reaped_after_the_deadline_and_a_later_open_is_admitted() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_open_gs();
+
+        // Park open A (the non-merchant/out-of-range path: NO echo of any kind ever arrives).
+        let (tx_a, _resp_a) = tokio::sync::oneshot::channel();
+        nav.command.request_open_await(11, tx_a);
+        nav.drain_merchant(&mut stream, &mut gs);
+        assert!(nav.pending_open.is_some(), "open A must be parked");
+
+        // BEFORE the deadline: open B is still correctly 409-rejected in-flight.
+        nav.pending_open.as_mut().unwrap().sent_at = Instant::now() - (SHOP_PENDING_REAP - Duration::from_secs(1));
+        nav.reap_expired_pending();
+        assert!(nav.pending_open.is_some(), "an un-expired open must NOT be reaped");
+        let (tx_b, resp_b) = tokio::sync::oneshot::channel();
+        nav.command.request_open_await(11, tx_b);
+        nav.drain_merchant(&mut stream, &mut gs);
+        match resp_b.await.unwrap() {
+            CommandResult::Refused(reason) => assert!(reason.contains("already in flight"),
+                "before the deadline B must be told an open is in flight, got: {reason}"),
+            other => panic!("before the deadline a second open must be Refused, got {other:?}"),
+        }
+        assert!(nav.pending_open.is_some(), "open A must still be parked before the deadline");
+
+        // AFTER the deadline: reaped, so open C is ADMITTED (parked), not 409.
+        nav.pending_open.as_mut().unwrap().sent_at = Instant::now() - (SHOP_PENDING_REAP + Duration::from_secs(1));
+        nav.reap_expired_pending();
+        assert!(nav.pending_open.is_none(), "an expired stranded open must be reaped");
+        let (tx_c, mut resp_c) = tokio::sync::oneshot::channel();
+        nav.command.request_open_await(11, tx_c);
+        nav.drain_merchant(&mut stream, &mut gs);
+        assert!(nav.pending_open.is_some(), "open C must be ADMITTED once the stranded slot is reaped");
+        assert!(resp_c.try_recv().is_err(), "C must be in flight, not 409-refused");
+    }
+
+    #[tokio::test]
+    async fn cast_stranded_slot_is_reaped_after_the_deadline_and_a_later_cast_is_admitted() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_cast_gs();
+
+        // Park cast A (the silently-dropped path: no `last_cast` transition ever comes).
+        let (tx_a, _resp_a) = tokio::sync::oneshot::channel();
+        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx_a);
+        nav.drain_cast(&mut stream, &mut gs);
+        assert!(nav.pending_cast.is_some(), "cast A must be parked");
+
+        // BEFORE the deadline (cast uses the longer CAST_PENDING_REAP): cast B is still 409-rejected.
+        nav.pending_cast.as_mut().unwrap().sent_at = Instant::now() - (CAST_PENDING_REAP - Duration::from_secs(1));
+        nav.reap_expired_pending();
+        assert!(nav.pending_cast.is_some(), "an un-expired cast must NOT be reaped");
+        let (tx_b, resp_b) = tokio::sync::oneshot::channel();
+        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx_b);
+        nav.drain_cast(&mut stream, &mut gs);
+        match resp_b.await.unwrap() {
+            CommandResult::Refused(reason) => assert!(reason.contains("already in flight"),
+                "before the deadline B must be told a cast is in flight, got: {reason}"),
+            other => panic!("before the deadline a second cast must be Refused, got {other:?}"),
+        }
+        assert!(nav.pending_cast.is_some(), "cast A must still be parked before the deadline");
+
+        // AFTER the deadline: reaped, so cast C is ADMITTED (parked), not 409.
+        nav.pending_cast.as_mut().unwrap().sent_at = Instant::now() - (CAST_PENDING_REAP + Duration::from_secs(1));
+        nav.reap_expired_pending();
+        assert!(nav.pending_cast.is_none(), "an expired stranded cast must be reaped");
+        let (tx_c, mut resp_c) = tokio::sync::oneshot::channel();
+        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx_c);
+        nav.drain_cast(&mut stream, &mut gs);
+        assert!(nav.pending_cast.is_some(), "cast C must be ADMITTED once the stranded slot is reaped");
+        assert!(resp_c.try_recv().is_err(), "C must be in flight, not 409-refused");
     }
 
     // ─────────────────────────────────────────────────────────────────────────────────────────
