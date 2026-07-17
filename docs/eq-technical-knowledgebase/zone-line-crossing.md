@@ -177,6 +177,137 @@ actually the arrival point in the *other* zone.
      inferred/reconstructed, not independently confirmed — treat as a
      fallback design, not gospel.
 
+## Same-zone (destination == current zone) DRNTP crossings: legitimate, NOT an error (confirmed, resolves #368)
+
+**Do not suppress `OP_ZoneChange` just because the resolved destination zone id
+equals the current zone.** Same-zone zone-line "teleporters" (walk into a
+DRNTP region and land elsewhere in the *same* zone, no loading screen) are
+common, intentional retail content. Verified live against the project's
+EQEmu DB (`podman exec eqemu_mariadb_1 mariadb -u agent -pagentpass peq`):
+**546 rows** in `zone_points` DB-wide have `target_zone_id` equal to their own
+source zone's `zoneidnumber`. `qeynos2` alone has 5: `number` 1, 2, 4, 14, 77
+→ `target_zone_id=2` (qeynos2 itself), `target_instance=0` (same instance),
+with real distinct `target_x/y/z` (e.g. number 14 → `756,893,-82`, a different
+part of North Qeynos — a shortcut/tunnel/trapdoor pattern). This is almost
+certainly the exact class of region eqoxide's bug #368 walked into — the
+qeynos2→qeynos2 resolution is **correct data**, not a bug in the resolution.
+
+**Server side — two totally different code paths, only one of which is a
+reject:**
+- `EQEmu/zone/zoning.cpp:132-136` — **only** reachable when the client's
+  `OP_ZoneChange.zoneID` is **non-zero** and names the current zone explicitly,
+  under `zone_mode == ZoneUnsolicited`: `if (target_zone_id ==
+  zone->GetZoneID()) { SendZoneCancel(zc); return; }`. This is a hard reject
+  (`SendZoneCancel`, `zoning.cpp:382-415`, echoes `OP_ZoneChange` with
+  `success=1`, `zoneID`/`instanceID` = current, **no position fields set**
+  — the packet buffer is zero-inited beyond those three fields, telling the
+  client "stay where you are").
+- `EQEmu/zone/zoning.cpp:536-546` (inside `DoZoneSuccess`) — reachable via the
+  **`zoneID==0`** ("client doesn't know where it's going") path at
+  `zoning.cpp:99-105`, which calls `Zone::GetClosestZonePointWithoutZone`
+  (`zone/zone.cpp:2093-2125`) — a pure XY-nearest-trigger search across **all**
+  zone_points with **no same-zone-id restriction at all** (unlike
+  `GetClosestZonePoint`, used on the non-zero path, which is what feeds the
+  reject at line 133). When the matched zone_point's `target_zone_id` and
+  `target_instance` equal the client's current zone/instance, `DoZoneSuccess`
+  takes a **short-circuit branch**: it does NOT send `ServerOP_ZoneToZoneRequest`
+  to worldserver (no zone teardown, no reconnect, no new `OP_NewZone`/
+  `PlayerProfile`/spawn resend) — it directly writes the destination into
+  `m_Position`/`m_pp.x/y/z` server-side (`zoning.cpp:519-531`, using the
+  matched zone_point's `target_x/y/z/target_heading`, already resolved before
+  this branch) and replies with a **lightweight** `OP_ZoneChange(success=1,
+  zoneID=current, instanceID=current)` — again **no position fields in the
+  reply packet** (`zoning.cpp:539-546`: only `char_name`, `zoneID`,
+  `instanceID`, `success` are set).
+- **The two reply packets are wire-identical in shape** (same struct,
+  `success=1`, `zoneID==instanceID==current`) — a client cannot distinguish
+  "you were rejected, stay put" from "you were legitimately teleported
+  in-zone, stay in this session" by inspecting the reply alone. Both cases
+  correctly resolve to: *do not tear down the zone connection; do not expect
+  a new-zone handshake.* The only behavioral difference is whether the
+  player's position should move — and that information isn't in the reply at
+  all; the client must already know it from the zone_point data it used to
+  decide to cross in the first place.
+- Confirms (and resolves as an "open question" a prior note in this file):
+  **the native client must send `zoneID=0`** for an organic/unsolicited
+  zone-line walk-in — sending the resolved destination zoneID explicitly is
+  *guaranteed* to be rejected outright when it's a same-zone crossing (line
+  133), yet same-zone crossings are real, played content, so the only way to
+  reconcile the two is `zoneID=0` on the outgoing packet. This is inferred
+  from server logic + live DB content, not read out of the (stripped, symbol-
+  free) RoF2 client decompile — `grep -rn "ZonePoint\|ZoneChange"
+  everquest_rof2/decompiled/ghidra/eqgame.exe.c` returns nothing; no opcode-name
+  strings survive in this binary to anchor the search directly.
+
+## eqoxide bug #368 root cause (confirmed against current code)
+
+eqoxide **already sends `zoneID=0`** correctly on every outgoing
+`OP_ZONE_CHANGE` (`src/eq_net/action_loop.rs:2435-2454`, fixed for #199 — the
+MQZoneUnknownDest false positive) — so the *outgoing* half of this bug is
+already right; there is no need for (and no basis for) a "suppress when
+destination==current zone" guard on the send side. **The actual defect is on
+the incoming side**, `src/eq_net/gameplay.rs:407-417`:
+
+```rust
+OP_ZONE_CHANGE if packet.payload.len() >= 96 => {
+    let success = i32::from_le_bytes([...]); // offset 92
+    if success == 1 {
+        world_reconnect_needed = true;   // <-- unconditional
+    }
+}
+```
+
+This treats **every** `success==1` reply — including the same-zone-
+same-instance `DoZoneSuccess` short-circuit echo above — as a full zone
+transfer, and `world_reconnect_needed` (`gameplay.rs:527-549`) drives a full
+`reconnect_via_world` (drops the zone stream, reconnects to world, requests
+`OP_ZoneServerInfo`) + `run_zone_entry_handshake` (waits for a fresh
+`OP_NewZone`/`PlayerProfile`/spawn stream). For a same-zone reply the server
+never tore down anything server-side (no `ServerOP_ZoneToZoneRequest` was
+ever sent, `zoning.cpp:536` branch) — it's the same zone connection, same CLE
+entry — so eqoxide dropping and reconnecting that live stream races against a
+server that thinks nothing happened, plausibly the actual wedge (stale/
+duplicate CLE state, a reconnect handshake the zone server never expected).
+Separately, since `gs.player_x/y/z` are never updated for this reply (unlike
+the sibling `OP_REQUEST_CLIENT_ZONE_CHANGE` same-zone-teleport handler at
+`gameplay.rs:371-380`, which does apply position — but that's the *server-
+solicited* GM-summon path, a different wire opcode/struct/trigger entirely),
+the player's tracked position client-side never leaves the DRNTP trigger
+region, so once the 10s `ZONE_CROSS_COOLDOWN_MS`
+(`action_loop.rs:1319-1345`) lapses the same region is detected again →
+`OP_ZONE_CHANGE` fires again → repeats.
+
+### Recommendation for eqoxide (supersedes any "suppress on same zone" plan)
+
+1. **Do not gate the send side on destination==current-zone.** It's already
+   correct (`zoneID=0`, `action_loop.rs:2435-2454`); adding a suppress-if-same
+   guard there would silently break the ~546 legitimate same-zone zone-line
+   teleporters in the dataset (5 of them in qeynos2 itself — likely exactly
+   what #368 walked into).
+2. **Fix the incoming handler** (`gameplay.rs:407-417`): read `zoneID`
+   (offset 64) and `instanceID` (offset 66) out of the echoed
+   `OP_ZoneChange` payload, same as the outgoing builder writes them. Only set
+   `world_reconnect_needed = true` when `(zoneID, instanceID) != (gs.zone_id,
+   gs.instance_id)` (a genuine cross-zone/cross-instance transfer, the
+   `zoning.cpp:547-563` else-branch). When they match, treat it as the
+   in-place same-zone teleport: apply the destination position **from
+   eqoxide's own previously-resolved zone_point** (the `target_x/y/z/
+   target_heading` used to decide to cross — the reply packet itself carries
+   none, per `zoning.cpp:539-546`) directly to `gs.player_x/y/z`, exactly
+   mirroring the existing same-zone-teleport branch at `gameplay.rs:371-380`,
+   and do **not** touch the zone connection.
+3. **Edge case:** the reject echo (`SendZoneCancel`, guard at
+   `zoning.cpp:132-136`) is wire-identical to the legitimate short-circuit
+   echo and is now unreachable anyway once (1) holds (eqoxide never sends a
+   non-zero same-zone `zoneID`) — no separate handling needed for it, but if
+   eqoxide ever adds a code path that sends a non-zero `zoneID` (e.g. GM
+   `#zone` to the current zone), the same same-zone/no-reconnect handling
+   above is still the correct response.
+4. Keep the existing 10s `ZONE_CROSS_COOLDOWN_MS` re-fire guard
+   (`action_loop.rs:1319`) — it's an appropriate belt-and-suspenders debounce,
+   but it isn't the fix; the wedge is the position never advancing, not the
+   cooldown being too short.
+
 See also: none yet on WLD BSP region fragment format in general (0x29 —
 would be a good follow-up topic: `wld-bsp-regions.md`).
 
