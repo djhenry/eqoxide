@@ -742,7 +742,9 @@ async fn get_zone_entrances(State(s): State<HttpState>) -> Json<Vec<crate::game_
 /// region map (no `.wtr` / v1 map) or no collision is loaded yet.
 async fn get_zone_exits(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let player = s.player();
-    let pos = [player.pos_east, player.pos_north, player.pos_up];
+    // `pos_up` is the agent-facing WIRE z datum (#522); this pos is compared against collision
+    // geometry (zone-line regions), which lives at foot/floor level — convert back.
+    let pos = [player.pos_east, player.pos_north, player.pos_up - crate::coord::WIRE_Z_OFFSET];
     // index -> destination zone_id, from the advertised entrance list.
     let dest_of: std::collections::HashMap<i32, u16> = s
         .world.zone_points

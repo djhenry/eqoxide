@@ -844,9 +844,16 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
     let Some(upd) = decode_position_update(payload) else { return; };
     let sid = upd.spawn_id as u32;
     if sid == gs.player_id {
+        // The wire z is the MODEL-ORIGIN datum ~3.1u above the feet; our own gs.player_z (mirrored
+        // from the controller) is FOOT level, so convert at this boundary (#522). Without this a
+        // server reposition (`#goto`, translocator) arrives 3.1u above the floor: the controller
+        // then "falls" the offset, re-streams its foot z, and the two datums fight a permanent ~3u
+        // standoff (#516's "contested Z" — both sides were right, in different datums). Entity
+        // positions (the else-branch) stay in wire datum; the render layer floor-snaps them.
+        let z_foot = upd.z - crate::coord::WIRE_Z_OFFSET;
         let dx = upd.x - gs.player_x;
         let dy = upd.y - gs.player_y;
-        let dz = upd.z - gs.player_z;
+        let dz = z_foot - gs.player_z;
         // Small deltas during movement are NORMAL client/server sync lag (≈ run speed × update
         // interval, so up to ~6u) — they only adjust the logical position (the visual is driven by
         // the WASD override / lerp), so they don't jerk the character. Only surface + count GENUINE
@@ -860,7 +867,7 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         }
         gs.player_x = upd.x;
         gs.player_y = upd.y;
-        gs.player_z = upd.z;
+        gs.player_z = z_foot; // foot datum internally (#522)
         // Keep the player's heading live from real server position updates.
         gs.player_heading = upd.heading;
     } else if let Some(e) = gs.entities.get_mut(&sid) {
@@ -2359,7 +2366,7 @@ fn apply_bind_respawn(gs: &mut GameState, payload: &[u8]) {
     r.skip(4); // spawn_id / zone_id header (unused here)
     gs.player_x = r.f32();
     gs.player_y = r.f32();
-    gs.player_z = r.f32();
+    gs.player_z = r.f32() - crate::coord::WIRE_Z_OFFSET; // wire→foot datum (#522)
     // Real EQ revives a bind-respawned character at FULL HP. `apply_death` zeroed hp_pct and left
     // cur_hp/max_hp stale, so without this the HUD/API show a dead-but-full contradiction
     // (hp/hp_max full, hp_pct 0) until some later OP_HPUpdate happens to reconcile it (eqoxide#68).
@@ -2640,7 +2647,10 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
         gs.player_name    = info.name.clone();
         gs.player_x       = info.x;
         gs.player_y       = info.y;
-        gs.player_z       = info.z;
+        // Wire→foot datum conversion (#522, see coord::WIRE_Z_OFFSET): the spawn z is the
+        // model-origin datum ~3.1u above the floor. Converting here seeds the controller at
+        // (approximately) the collision floor, so zone-in no longer starts with a phantom 3u fall.
+        gs.player_z       = info.z - crate::coord::WIRE_Z_OFFSET;
         gs.player_heading = info.heading;
         gs.player_level   = info.level as u32;
         gs.player_race    = eq_race_to_code(info.race).to_string();

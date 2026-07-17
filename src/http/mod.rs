@@ -213,7 +213,12 @@ impl PlayerState {
             level:      gs.player_level as u32,
             pos_east:   gs.player_x,
             pos_north:  gs.player_y,
-            pos_up:     gs.player_z,
+            // Reported in the WIRE z datum (model origin, ~3.1u above the feet — #522, see
+            // coord::WIRE_Z_OFFSET), NOT the controller's internal foot level. Every other position
+            // the agent sees — /observe/entities, `#goto`/DB safe coords, what other players report
+            // — is wire-datum; reporting foot z here made a level character read 3u BELOW an
+            // adjacent native player (the #522 mis-diagnosis), an agent-honesty inconsistency.
+            pos_up:     gs.player_z + crate::coord::WIRE_Z_OFFSET,
             heading_ccw: gs.player_heading,
             heading_cw:  crate::eq_net::protocol::ccw_to_cw(gs.player_heading),
             server_corrections: gs.server_corrections,
