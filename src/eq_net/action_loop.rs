@@ -2482,10 +2482,11 @@ impl ActionLoop {
     /// True if a SAME-ZONE walk-in cross fired recently enough that the next `success=1`
     /// OP_ZoneChange echo is its in-zone reposition (skip the world reconnect, #368). Consumes the
     /// flag. Bounded to a short window so a stale flag can never suppress a later genuine cross-zone
-    /// or death/bind reconnect: the reposition echo always returns within the round-trip, far inside
-    /// this window.
+    /// or death/bind reconnect: the reposition echo always returns within the round-trip (tens of
+    /// ms), so 1.5s is a 20-50x safety margin over the observed echo latency while still shrinking
+    /// the wrongly-suppressed-reconnect edge ~3x versus the original 5s window (#504, #503 follow-up).
     pub(crate) fn take_same_zone_reposition(&mut self) -> bool {
-        const WINDOW_MS: u128 = 5000;
+        const WINDOW_MS: u128 = 1500;
         match self.same_zone_cross_at.take() {
             Some(t) if t.elapsed().as_millis() <= WINDOW_MS => true,
             _ => false,
@@ -2938,15 +2939,24 @@ mod tests {
             "a cross-zone cross must NOT flag a reposition — it MUST world-reconnect");
     }
 
-    /// The reposition flag is bounded: a stale set (older than the echo window) never suppresses a
-    /// later genuine cross-zone / death reconnect.
+    /// The reposition flag is bounded: a stale set (older than the ~1.5s echo window, #504) never
+    /// suppresses a later genuine cross-zone / death reconnect, while a flag still inside the window
+    /// (as the real reposition echo — tens of ms — always is) still suppresses correctly. Exercises
+    /// both sides of the boundary so a mutation that widens or removes the window goes RED here.
     #[test]
     fn stale_same_zone_flag_does_not_suppress_a_later_reconnect() {
         let mut nav = new_loop();
         assert!(!nav.take_same_zone_reposition(), "unset flag → no suppression");
-        nav.same_zone_cross_at = Instant::now().checked_sub(std::time::Duration::from_secs(6));
+
+        // Just under the window: still live, must suppress (this is where the real echo lands).
+        nav.same_zone_cross_at = Instant::now().checked_sub(std::time::Duration::from_millis(1400));
+        assert!(nav.take_same_zone_reposition(),
+            "a flag just under the ~1.5s window must still suppress the matching echo");
+
+        // Just over the window: expired, must not suppress.
+        nav.same_zone_cross_at = Instant::now().checked_sub(std::time::Duration::from_millis(1600));
         assert!(!nav.take_same_zone_reposition(),
-            "a flag older than the ~5s window must not suppress a reconnect");
+            "a flag older than the ~1.5s window must not suppress a reconnect");
     }
 
     fn new_loop() -> ActionLoop {
