@@ -549,7 +549,7 @@ struct EntitiesView {
 /// pathing mob has moved off its spawn point, so an exact match is the duplication fingerprint).
 /// Any group with more than one member is collapsed to a single representative, preferring the
 /// un-suffixed spelling. Returns the deduped name→pos map, the count removed, and a description of
-/// every collapsed cluster so the drop is NEVER silent. The underlying `gs.entities`/`entity_ids`
+/// every collapsed cluster so the drop is NEVER silent. The underlying `gs.world.entities`/`entity_ids`
 /// maps are left untouched, so both physical instances stay individually targetable by their full
 /// names — this is a display-layer honesty mitigation, not a change to the world model.
 fn dedup_entities(
@@ -596,7 +596,7 @@ struct EntitiesQuery {
 /// #471 (agent-honesty): live play saw the roster report ~2× duplicate spawns — byte-identical
 /// name+position with consecutive server spawn_ids (e.g. 526/527), including unique named NPCs that
 /// exist once per server, which also leaked into chat as doubled zone-in greetings. The client
-/// cannot manufacture a second spawn_id (`register_spawn` upserts `gs.entities` by the verbatim
+/// cannot manufacture a second spawn_id (`register_spawn` upserts `gs.world.entities` by the verbatim
 /// server id, `packet_handler.rs`), it clears the roster on every zone-in (`apply_new_zone`), and
 /// both name→pos publishers full-replace their maps (`action_loop::sync_entities`, `login.rs`) — so
 /// two distinct ids at one position can only be two genuine server `Mob`s (duplicated `spawn2`
@@ -612,7 +612,7 @@ struct EntitiesQuery {
 ///   `note`) that LABELS the collapse for agents that want to SEE which duplicates were removed —
 ///   nothing is dropped silently (the honesty invariant), just moved off the default shape.
 ///
-/// The underlying `gs.entities`/`entity_ids` model is untouched in either case, so every instance
+/// The underlying `gs.world.entities`/`entity_ids` model is untouched in either case, so every instance
 /// stays targetable by its full (suffixed) name.
 async fn get_entities(State(s): State<HttpState>, Query(q): Query<EntitiesQuery>) -> Response {
     let (entities, deduped, duplicate_groups) = {
@@ -799,7 +799,7 @@ mod tests {
         // The world as it was when the link was still up — a sitting character, full HP.
         set_gs(&state, |gs| {
             gs.player_name = "Gmkblr".into();
-            gs.zone_name   = "qeynos".into();
+            gs.world.zone_name   = "qeynos".into();
             gs.hp_pct      = 100.0;
             gs.sitting     = true;
         });
@@ -1096,14 +1096,14 @@ mod tests {
     async fn debug_clears_target_on_zone_change_408() {
         let state = empty_state();
         set_gs(&state, |gs| {
-            gs.zone_name = "kaladimb".into();
+            gs.world.zone_name = "kaladimb".into();
             gs.upsert_entity(crate::game_state::tests::make_entity(66, "Guard_Dalammer000", 0.0, 0.0, 0.0, true));
             gs.set_target(66);
         });
         assert_eq!(debug_json(state.clone()).await["player"]["target_id"], serde_json::json!(66),
             "precondition: the spawn is the target before zoning");
 
-        set_gs(&state, |gs| { gs.begin_zone_in(); gs.zone_name = "qeynos".into(); });
+        set_gs(&state, |gs| { gs.begin_zone_in(); gs.world.zone_name = "qeynos".into(); });
         let p = debug_json(state).await["player"].clone();
         assert_eq!(p["zone"], serde_json::json!("qeynos"));
         assert_eq!(p["target_id"], serde_json::json!(null),

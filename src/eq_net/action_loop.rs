@@ -319,7 +319,7 @@ fn send_cast(stream: &mut EqStream, gs: &mut GameState, req: crate::ipc::CastReq
             // Keep an explicitly-chosen friendly (PC) target for group heals; otherwise (no target,
             // cleared, or a hostile NPC) land the buff/heal on ourselves.
             let friendly = target == gs.player_id
-                || gs.entities.get(&target).map_or(false, |e| !e.is_npc);
+                || gs.world.entities.get(&target).map_or(false, |e| !e.is_npc);
             if !friendly { target = gs.player_id; }
         }
     }
@@ -554,7 +554,7 @@ impl ActionLoop {
         // Full replace: clear stale entries so positions reflect the current zone only.
         map.clear();
         ids.clear();
-        for (&id, e) in &gs.entities {
+        for (&id, e) in &gs.world.entities {
             map.insert(e.name.clone(), (e.x, e.y, e.z));
             ids.insert(e.name.clone(), id);
         }
@@ -580,10 +580,10 @@ impl ActionLoop {
     }
 
     /// Publish the group roster from `gs` into the shared slot (GET /v1/group/roster + the UI
-    /// roster panel). Looks up each other member's HP% from `gs.entities` by name (group
+    /// roster panel). Looks up each other member's HP% from `gs.world.entities` by name (group
     /// membership is what unlocks receiving another mob's OP_MobHealth percent, so this reuses
     /// existing Entity.hp_pct rather than needing a new opcode); the player's own HP% comes
-    /// directly from `gs.hp_pct` since the player is never in `gs.entities`.
+    /// directly from `gs.hp_pct` since the player is never in `gs.world.entities`.
     pub fn sync_group(&self, gs: &GameState) {
         let mut g = self.group_slots.group.lock().unwrap();
         g.leader = gs.group_leader.clone();
@@ -593,7 +593,7 @@ impl ActionLoop {
             let hp_pct = if m.name == gs.player_name {
                 gs.hp_pct
             } else {
-                gs.entities.values().find(|e| e.name == m.name).map(|e| e.hp_pct).unwrap_or(0.0)
+                gs.world.entities.values().find(|e| e.name == m.name).map(|e| e.hp_pct).unwrap_or(0.0)
             };
             crate::ipc::GroupMemberView {
                 // m.level from OP_GroupUpdateB is a server placeholder (70/65); resolve the real
@@ -951,7 +951,7 @@ impl ActionLoop {
     pub fn sync_doors(&self, gs: &GameState) {
         let mut out = self.interact.doors_shared.lock().unwrap();
         out.clear();
-        out.extend(gs.doors.values().map(|d| crate::ipc::DoorView {
+        out.extend(gs.world.doors.values().map(|d| crate::ipc::DoorView {
             door_id: d.door_id, name: d.name.clone(),
             x: d.x, y: d.y, z: d.z, heading: d.heading,
             opentype: d.opentype, is_open: d.is_open,
@@ -962,8 +962,8 @@ impl ActionLoop {
     /// On zone change, also loads map-label exits from disk as fallback zone points.
     pub fn sync_zone_points(&mut self, gs: &GameState) {
         // On zone change, load map labels from disk as fallback zone points.
-        if gs.zone_name != self.current_zone {
-            self.current_zone = gs.zone_name.clone();
+        if gs.world.zone_name != self.current_zone {
+            self.current_zone = gs.world.zone_name.clone();
 
             // Reset the nav destination + route on a zone change (#248). The old goal/path are in the
             // PREVIOUS zone's coordinate space; kept across a crossing they aim the walker at an
@@ -993,9 +993,9 @@ impl ActionLoop {
             let mut shared = self.world.zone_points.lock().unwrap();
             // Start fresh with server entries.
             shared.clear();
-            shared.extend(gs.zone_points.iter().cloned());
+            shared.extend(gs.world.zone_points.iter().cloned());
             // Load map labels from disk.
-            if let Some(zm) = crate::zone_map::ZoneMap::load(&self.maps_dir, &gs.zone_name) {
+            if let Some(zm) = crate::zone_map::ZoneMap::load(&self.maps_dir, &gs.world.zone_name) {
                 let before = shared.len();
                 for label in &zm.labels {
                     let lower = label.text.to_lowercase();
@@ -1034,7 +1034,7 @@ impl ActionLoop {
             let map_labels: Vec<_> = shared.drain(..)
                 .filter(|zp| zp.iterator == u32::MAX)
                 .collect();
-            shared.extend(gs.zone_points.iter().cloned());
+            shared.extend(gs.world.zone_points.iter().cloned());
             shared.extend(map_labels);
         }
     }
@@ -1495,7 +1495,7 @@ impl ActionLoop {
             // server silently IGNORES an OP_TargetMouse for an unknown id, so calling set_target
             // anyway would leave the client believing in a target the server never set. Say so
             // instead of lying. The player's own spawn is legal and is absent from `entities`. (#348)
-            if id != gs.player_id && !gs.entities.contains_key(&id) {
+            if id != gs.player_id && !gs.world.entities.contains_key(&id) {
                 let text = format!("Cannot target spawn {id}: it is not in this zone.");
                 gs.log_msg("combat", &text);
                 gs.push_event("combat", "target_failed", "", true, &text);
@@ -1939,7 +1939,7 @@ impl ActionLoop {
                 })
             };
             let alive_reachable = |id: u32| -> bool {
-                gs.entities.get(&id).map(|e| !e.dead && e.is_npc && clear_to(e)).unwrap_or(false)
+                gs.world.entities.get(&id).map(|e| !e.dead && e.is_npc && clear_to(e)).unwrap_or(false)
             };
 
             let current = gs.target_id;
@@ -1958,7 +1958,7 @@ impl ActionLoop {
             // Nearest reachable trash, only needed as the fallback (no attacker, no valid current).
             let nearest_trash = if attacker.is_none() && !current_valid {
                 let mut best: Option<(f32, u32)> = None;
-                for (id, e) in &gs.entities {
+                for (id, e) in &gs.world.entities {
                     if e.dead || !e.is_npc { continue; }
                     let nl = e.name.to_ascii_lowercase();
                     if !(nl.starts_with("a_") || nl.starts_with("an_")) { continue; }
@@ -1997,7 +1997,7 @@ impl ActionLoop {
             // wandering off — the previous version left it chasing and it dropped out of view.
             let engage = if self.auto_attack {
                 gs.target_id
-                    .and_then(|tid| gs.entities.get(&tid).map(|e| (tid, e)))
+                    .and_then(|tid| gs.world.entities.get(&tid).map(|e| (tid, e)))
                     .filter(|(_, e)| {
                         let dx = e.x - gs.player_x; let dy = e.y - gs.player_y;
                         !e.dead && dx * dx + dy * dy <= 200.0 * 200.0
@@ -2031,7 +2031,7 @@ impl ActionLoop {
         // far-away face) is what makes melee actually land. Runs regardless of any pending goto.
         if self.auto_attack {
             if let Some(tid) = gs.target_id {
-                if let Some((ex, ey)) = gs.entities.get(&tid).map(|e| (e.x, e.y)) {
+                if let Some((ex, ey)) = gs.world.entities.get(&tid).map(|e| (e.x, e.y)) {
                     let dx = ex - gs.player_x;
                     let dy = ey - gs.player_y;
                     let dist = (dx * dx + dy * dy).sqrt();
@@ -2471,7 +2471,7 @@ impl ActionLoop {
     /// Fire the crossing for a resolved zone-line destination and arm the re-fire cooldown. Splits
     /// on same-zone vs cross-zone (#368):
     ///
-    /// - **Same-zone** (`dest_zone == gs.zone_id`) — an intra-zone translocator. Send OP_ZoneChange
+    /// - **Same-zone** (`dest_zone == gs.world.zone_id`) — an intra-zone translocator. Send OP_ZoneChange
     ///   (zoneID=0, so the server does a lightweight in-zone `DoZoneSuccess` reposition and does NOT
     ///   tear down the session), apply the resolved arrival coords LOCALLY so the player leaves the
     ///   DRNTP region and doesn't re-fire next cooldown, and set `same_zone_cross_at` so the imminent
@@ -2482,7 +2482,7 @@ impl ActionLoop {
     fn perform_cross(&mut self, stream: &mut EqStream, gs: &mut GameState, index: i32, dest_zone: u16, dest_pos: [f32; 3]) -> bool {
         self.send_zone_change_packet(stream, gs, dest_zone);
         self.last_zone_cross = Instant::now();
-        if dest_zone == gs.zone_id {
+        if dest_zone == gs.world.zone_id {
             self.same_zone_cross_at = Some(Instant::now());
             // 999999 / 999 sentinel from the zone point = "keep current position" (zoning.cpp:311):
             // the server keeps us put, so don't teleport to the sentinel — region-leave then relies
@@ -2564,7 +2564,7 @@ impl ActionLoop {
         buf[88..92].copy_from_slice(&0u32.to_le_bytes());             // zone_reason = 0
         buf[92..96].copy_from_slice(&0i32.to_le_bytes());             // success = 0 (request)
         tracing::info!("EQ: sending OP_ZONE_CHANGE target_zone={} from current_zone={} pos=({:.1},{:.1},{:.1})",
-                  target_zone_id, gs.zone_id, gs.player_x, gs.player_y, gs.player_z);
+                  target_zone_id, gs.world.zone_id, gs.player_x, gs.player_y, gs.player_z);
         stream.send_app_packet(OP_ZONE_CHANGE, &buf);
     }
 }
@@ -2996,7 +2996,7 @@ mod tests {
         // ── Same-zone translocator ──────────────────────────────────────────────────────────────
         let mut nav = new_loop();
         let mut gs = GameState::new();
-        gs.zone_id = HERE;
+        gs.world.zone_id = HERE;
         gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0; // standing on the trigger region
         // The walker was walking to the zone-line goal (`drain_zone_cross` issues a /goto to it).
         nav.command.request_goto((-455.0, -174.0, 30.0));
@@ -3023,7 +3023,7 @@ mod tests {
         // ── Genuine cross-zone line ─────────────────────────────────────────────────────────────
         let mut nav2 = new_loop();
         let mut gs2 = GameState::new();
-        gs2.zone_id = HERE;
+        gs2.world.zone_id = HERE;
         gs2.player_x = 7.0; gs2.player_y = 8.0; gs2.player_z = 9.0;
         // A genuine cross-zone crossing must NOT be stopped by the #508 same-zone reset: it zones,
         // and its post-zone nav is a separate concern. Seed a goto and confirm it SURVIVES.
@@ -3195,7 +3195,7 @@ mod tests {
         assert!(nav.pending_buy.is_some());
 
         // Cross a zone line: sync_zone_points sees a new zone name and runs its reaper.
-        gs.zone_name = "newzone".into();
+        gs.world.zone_name = "newzone".into();
         nav.sync_zone_points(&gs);
 
         assert!(nav.pending_buy.is_none(), "the parked buy must be cleared on a zone change");
@@ -3366,7 +3366,7 @@ mod tests {
         nav.drain_merchant(&mut stream, &mut gs);
         assert!(nav.pending_open.is_some());
 
-        gs.zone_name = "newzone".into();
+        gs.world.zone_name = "newzone".into();
         nav.sync_zone_points(&gs);
 
         assert!(nav.pending_open.is_none(), "the parked open must be cleared on a zone change");
@@ -4228,7 +4228,7 @@ mod tests {
         nav.tick_give(&mut stream, &mut gs);
         assert!(nav.give_state.is_some());
 
-        gs.zone_name = "newzone".into();
+        gs.world.zone_name = "newzone".into();
         nav.sync_zone_points(&gs);
 
         assert!(nav.give_state.is_none(), "the parked give must be cleared on a zone change");
@@ -4411,7 +4411,7 @@ mod tests {
 
         // Cross into a NEW zone.
         let mut gs = GameState::new();
-        gs.zone_name = "crushbone".into();
+        gs.world.zone_name = "crushbone".into();
         nav.sync_zone_points(&gs);
 
         // Destination + route + recovery state all cleared; walker comes to rest in the new zone.
@@ -4501,7 +4501,7 @@ mod tests {
         assert_eq!(snap.leader, "Aldric");
         assert!(snap.you_are_leader);
         let aldric = snap.members.iter().find(|m| m.name == "Aldric").unwrap();
-        assert_eq!(aldric.hp_pct, 88.0); // own HP comes from gs.hp_pct, not gs.entities
+        assert_eq!(aldric.hp_pct, 88.0); // own HP comes from gs.hp_pct, not gs.world.entities
         let sariel = snap.members.iter().find(|m| m.name == "Sariel").unwrap();
         assert_eq!(sariel.hp_pct, 42.0); // other member's HP comes from the matching Entity
     }

@@ -22,7 +22,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_NEW_ZONE             => apply_new_zone(gs, p),
         OP_ZONE_SPAWNS          => apply_zone_spawns(gs, p),
         OP_ZONE_ENTRY           => apply_zone_entry(gs, p),
-        OP_WEATHER              => { gs.zone_changed = false; }
+        OP_WEATHER              => { gs.world.zone_changed = false; }
         OP_PLAYER_PROFILE       => apply_player_profile(gs, p),
         OP_DEATH                => apply_death(gs, p),
         OP_EXP_UPDATE           => apply_exp_update(gs, p),
@@ -870,7 +870,7 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         gs.player_z = z_foot; // foot datum internally (#522)
         // Keep the player's heading live from real server position updates.
         gs.player_heading = upd.heading;
-    } else if let Some(e) = gs.entities.get_mut(&sid) {
+    } else if let Some(e) = gs.world.entities.get_mut(&sid) {
         e.x = upd.x;
         e.y = upd.y;
         // Wire→foot datum (#522, see coord::WIRE_Z_OFFSET): the wire z is the model-origin datum
@@ -886,7 +886,7 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         e.animation = upd.animation;
         tracing::debug!("EQ: npc_pos id={} name={} pos=({:.1},{:.1},{:.1})", sid, e.name, e.x, e.y, e.z);
     } else {
-        tracing::debug!("EQ: npc_pos id={} NOT IN ENTITY MAP (known: {})", sid, gs.entities.len());
+        tracing::debug!("EQ: npc_pos id={} NOT IN ENTITY MAP (known: {})", sid, gs.world.entities.len());
     }
 }
 
@@ -938,8 +938,8 @@ fn apply_new_zone(gs: &mut GameState, payload: &[u8]) {
     // it requested is landing. Re-running the clears below would wipe that stream (missing NPCs and
     // doors after zoning), and re-log "Entered <zone>" + a second navigate/zone event. Both copies
     // carry identical zone fields, so there is nothing to redo.
-    if gs.new_zone_applied { return; }
-    gs.new_zone_applied = true;
+    if gs.world.new_zone_applied { return; }
+    gs.world.new_zone_applied = true;
     // DO NOT purge spawns/doors here (#527rc, agent-honesty). Verified against EQEmu's wire ordering
     // (common/patches/rof2.cpp ENCODE(OP_ZoneSpawns):4575-4934 splits the near-bulk into a burst of
     // individual OP_ZoneEntry packets; zone/client_packet.cpp Handle_Connect_OP_ZoneEntry queues the
@@ -957,15 +957,15 @@ fn apply_new_zone(gs: &mut GameState, payload: &[u8]) {
     // to avoid struct-padding issues with the packed 948-byte layout.
     // zone_short_name[128] @ offset 64
     let zs_end = 64 + payload[64..192].iter().position(|&b| b == 0).unwrap_or(128);
-    gs.zone_name = String::from_utf8_lossy(&payload[64..zs_end]).into_owned();
+    gs.world.zone_name = String::from_utf8_lossy(&payload[64..zs_end]).into_owned();
     // safe_y @ 588, safe_x @ 592, safe_z @ 596
-    gs.safe_y = f32::from_le_bytes([payload[588], payload[589], payload[590], payload[591]]);
-    gs.safe_x = f32::from_le_bytes([payload[592], payload[593], payload[594], payload[595]]);
-    gs.safe_z = f32::from_le_bytes([payload[596], payload[597], payload[598], payload[599]]);
+    gs.world.safe_y = f32::from_le_bytes([payload[588], payload[589], payload[590], payload[591]]);
+    gs.world.safe_x = f32::from_le_bytes([payload[592], payload[593], payload[594], payload[595]]);
+    gs.world.safe_z = f32::from_le_bytes([payload[596], payload[597], payload[598], payload[599]]);
     // underworld (min-z floor) @ 608 — below this the server does a ZoneToBindPoint recovery (#150).
-    gs.zone_underworld = Some(f32::from_le_bytes([payload[608], payload[609], payload[610], payload[611]]));
+    gs.world.zone_underworld = Some(f32::from_le_bytes([payload[608], payload[609], payload[610], payload[611]]));
     // zone_id @ 852
-    gs.zone_id = u16::from_le_bytes([payload[852], payload[853]]);
+    gs.world.zone_id = u16::from_le_bytes([payload[852], payload[853]]);
     // Distance fog (eqoxide#517): fog_red/green/blue[4] @471/475/479 (slot 0 only — see the KB doc
     // on the 4-slot semantics), fog_minclip/maxclip[4] @484/500 (slot 0 = first f32 of each array),
     // fog_density @916 (single scalar). A degenerate/zero clip range means "no fog" for this zone,
@@ -973,7 +973,7 @@ fn apply_new_zone(gs: &mut GameState, payload: &[u8]) {
     // us to respect the zone's actual values, not hardcode one).
     let fog_minclip = f32::from_le_bytes([payload[484], payload[485], payload[486], payload[487]]);
     let fog_maxclip = f32::from_le_bytes([payload[500], payload[501], payload[502], payload[503]]);
-    gs.zone_fog = if fog_maxclip > fog_minclip {
+    gs.world.zone_fog = if fog_maxclip > fog_minclip {
         Some(crate::game_state::ZoneFog {
             color:   [payload[471], payload[475], payload[479]],
             minclip: fog_minclip,
@@ -983,8 +983,8 @@ fn apply_new_zone(gs: &mut GameState, payload: &[u8]) {
     } else {
         None
     };
-    gs.zone_changed = true;
-    let entered = format!("Entered {}", gs.zone_name);
+    gs.world.zone_changed = true;
+    let entered = format!("Entered {}", gs.world.zone_name);
     gs.log_msg("zone", &entered);
     // Surface zone changes on the async event feed (GET /v1/events/navigate or /all) so an agent
     // driving the client hears "I just zoned" as soon as it happens — including server-initiated
@@ -1478,7 +1478,7 @@ pub(crate) fn apply_death(gs: &mut GameState, payload: &[u8]) {
         // Capture who killed us + when, and keep it past the respawn so /observe/debug can report a
         // recent death (dead / killed_by / died_ago_secs) — an agent polling state can otherwise not
         // tell it died (#284).
-        gs.killed_by = gs.entities.get(&killer_id).map(|e| e.name.clone())
+        gs.killed_by = gs.world.entities.get(&killer_id).map(|e| e.name.clone())
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| "something".to_string());
         gs.died_at   = Some(std::time::Instant::now());
@@ -1498,9 +1498,9 @@ pub(crate) fn apply_death(gs: &mut GameState, payload: &[u8]) {
         gs.push_event("combat", "slain", &killer, true,
             &format!("You have been slain by {killer} — POST /v1/lifecycle/respawn to revive"));
     } else {
-        let name = gs.entities.get(&d_id).map(|e| e.name.clone());
+        let name = gs.world.entities.get(&d_id).map(|e| e.name.clone());
         if let Some(name) = name {
-            if let Some(e) = gs.entities.get_mut(&d_id) {
+            if let Some(e) = gs.world.entities.get_mut(&d_id) {
                 e.dead      = true;
                 e.hp_pct    = 0.0;
                 e.animation = 115; // Animation::Lying — triggers "dead" clip in scene renderer
@@ -1547,9 +1547,9 @@ fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
     // (heal/buff/nuke/DoT); 0 or SPELL_UNKNOWN (0xFFFF) for a melee swing.
     let spellid   = u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
     let damage    = i32::from_le_bytes([payload[9], payload[10], payload[11], payload[12]]);
-    let target_name = gs.entities.get(&target_id).map(|e| e.name.clone())
+    let target_name = gs.world.entities.get(&target_id).map(|e| e.name.clone())
         .unwrap_or_else(|| if target_id == gs.player_id { gs.player_name.clone() } else { format!("#{target_id}") });
-    let source_name = gs.entities.get(&source_id).map(|e| e.name.clone())
+    let source_name = gs.world.entities.get(&source_id).map(|e| e.name.clone())
         .unwrap_or_else(|| if source_id == gs.player_id { gs.player_name.clone() } else { format!("#{source_id}") });
     // A `CombatDamage_Struct.damage` of 0 is a plain miss; a POSITIVE value is real damage; a
     // NEGATIVE value is an EQEmu special-outcome sentinel (zone/common.h DMG_*), NOT "negative
@@ -1602,7 +1602,7 @@ fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
 
     // Remember who is swinging at us (hit OR miss) so auto-combat can engage an add that aggros
     // mid-fight instead of tanking it unanswered. Only NPC attackers on the player count.
-    if target_id == gs.player_id && source_id != gs.player_id && gs.entities.contains_key(&source_id) {
+    if target_id == gs.player_id && source_id != gs.player_id && gs.world.entities.contains_key(&source_id) {
         // Emit an async "attacked" event only when a NEW mob starts hitting us (not already a recent
         // attacker), so an agent is notified once when something aggros — not on every swing.
         if !gs.recent_attackers.contains_key(&source_id) {
@@ -2143,7 +2143,7 @@ pub(crate) fn apply_consider(gs: &mut GameState, payload: &[u8]) {
     let target_id = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
     let faction   = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
     let level     = u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
-    let entity = gs.entities.get(&target_id);
+    let entity = gs.world.entities.get(&target_id);
     let name = entity.map(|e| e.name.clone())
         .unwrap_or_else(|| "Your target".to_string());
 
@@ -2291,7 +2291,7 @@ fn apply_zone_points(gs: &mut GameState, payload: &[u8]) {
     } else {
         0
     };
-    gs.zone_points.clear();
+    gs.world.zone_points.clear();
     let mut i = offset;
     while i + SIZE_ZONE_POINT_ENTRY <= payload.len() {
         let e = unsafe { safe_read::<ZonePointEntry_S>(&payload[i..]) };
@@ -2306,7 +2306,7 @@ fn apply_zone_points(gs: &mut GameState, payload: &[u8]) {
             tracing::debug!("EQ: ignoring sentinel zone point zone_id={} x={:.0} y={:.0}", zoneid, ex, ey);
             continue;
         }
-        gs.zone_points.push(ZonePoint {
+        gs.world.zone_points.push(ZonePoint {
             iterator,
             server_x: ex,
             server_y: ey,
@@ -2315,8 +2315,8 @@ fn apply_zone_points(gs: &mut GameState, payload: &[u8]) {
             zone_id: zoneid,
         });
     }
-    tracing::info!("EQ: {} zone exit points received:", gs.zone_points.len());
-    for zp in &gs.zone_points {
+    tracing::info!("EQ: {} zone exit points received:", gs.world.zone_points.len());
+    for zp in &gs.world.zone_points {
         tracing::info!("  zone_id={} server_x={:.1} server_y={:.1} z={:.1} heading={:.1}",
                   zp.zone_id, zp.server_x, zp.server_y, zp.server_z, zp.heading);
     }
@@ -2364,7 +2364,7 @@ fn apply_move_door(gs: &mut GameState, p: &[u8]) {
     if p.len() < 2 { return; }
     let door_id = p[0];
     let action_open = p[1] == 0x02;
-    let invert = gs.doors.get(&door_id).map(|d| d.invert_state).unwrap_or(false);
+    let invert = gs.world.doors.get(&door_id).map(|d| d.invert_state).unwrap_or(false);
     gs.set_door_open(door_id, action_open ^ invert);
 }
 
@@ -2401,7 +2401,7 @@ pub fn apply_wear_change(gs: &mut GameState, p: &[u8]) {
     if spawn_id == gs.player_id {
         gs.player_equipment[slot] = material;
         gs.player_equipment_tint[slot] = tint;
-    } else if let Some(e) = gs.entities.get_mut(&spawn_id) {
+    } else if let Some(e) = gs.world.entities.get_mut(&spawn_id) {
         e.equipment[slot] = material;
         e.equipment_tint[slot] = tint;
     }
@@ -2643,7 +2643,7 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
     // value that differs from the server's stored spelling only by case, or by incidental leading/
     // trailing whitespace (a common copy-paste slip in a TOML file), must still be recognized as
     // us — an exact/case-sensitive compare here would leave `gs.player_id` at 0 forever and drop
-    // our own spawn into `gs.entities` as if it were some other player.
+    // our own spawn into `gs.world.entities` as if it were some other player.
     if !is_npc && !gs.player_name.is_empty() && info.name.eq_ignore_ascii_case(gs.player_name.trim()) {
         gs.player_id      = info.spawn_id;
         // Adopt the SERVER's authoritative spelling/casing from here on. Everything downstream
@@ -2686,7 +2686,7 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
     // these in the first place. `race` is unreliable here: these controllers commonly ship a
     // perfectly ordinary race (e.g. 240 "TeleportMan"), not a fixed "invisible" race id, and a
     // coords-only heuristic risks hiding real content that happens to path near (0,0,0). Filter
-    // at registration (never enters `gs.entities`) so it also matches native for by-name lookups
+    // at registration (never enters `gs.world.entities`) so it also matches native for by-name lookups
     // (/goto, /interact) that key off the same entity map.
     if info.body_type == 11 || info.body_type == 60 {
         tracing::debug!(
@@ -2827,7 +2827,7 @@ mod tests {
         // agent can tell it died (and by what) even though it later respawns.
         let mut gs = GameState::new();
         gs.player_id = 7; gs.max_hp = 100; gs.cur_hp = 100;
-        gs.entities.insert(42, test_entity(42, "a_giant_rat", 100.0));
+        gs.world.entities.insert(42, test_entity(42, "a_giant_rat", 100.0));
         let mut p = vec![0u8; SIZE_DEATH];
         p[0..4].copy_from_slice(&7u32.to_le_bytes());  // spawn_id = player
         p[4..8].copy_from_slice(&42u32.to_le_bytes()); // killer_id
@@ -2889,11 +2889,11 @@ mod tests {
         // handshake before OP_ZoneEntry is even sent — NOT `apply_new_zone` (see #527rc: the near-spawn
         // burst arrives before the first OP_NewZone, so purging there wiped live near spawns).
         let mut gs = GameState::new();
-        gs.entities.insert(1, test_entity(1, "Fippy_Darkpaw", 100.0));
-        gs.entities.insert(2, test_entity(2, "a_gnoll_pup", 100.0));
-        assert_eq!(gs.entities.len(), 2);
+        gs.world.entities.insert(1, test_entity(1, "Fippy_Darkpaw", 100.0));
+        gs.world.entities.insert(2, test_entity(2, "a_gnoll_pup", 100.0));
+        assert_eq!(gs.world.entities.len(), 2);
         gs.begin_zone_in();
-        assert!(gs.entities.is_empty(), "prior-zone entities must be cleared at zone entry (#270)");
+        assert!(gs.world.entities.is_empty(), "prior-zone entities must be cleared at zone entry (#270)");
     }
 
     #[test]
@@ -2906,14 +2906,14 @@ mod tests {
         let mut gs = GameState::new();
         gs.begin_zone_in(); // handshake clear, before OP_ZoneEntry is sent
         // Near-bulk spawns arrive (self-spawn + nearby NPCs), registered before OP_NewZone.
-        gs.entities.insert(511, test_entity(511, "Katie", 100.0));
-        gs.entities.insert(1291, test_entity(1291, "Guard_Frostfallen002", 100.0));
-        assert_eq!(gs.entities.len(), 2);
+        gs.world.entities.insert(511, test_entity(511, "Katie", 100.0));
+        gs.world.entities.insert(1291, test_entity(1291, "Guard_Frostfallen002", 100.0));
+        assert_eq!(gs.world.entities.len(), 2);
         super::apply_new_zone(&mut gs, &new_zone_payload("gfaydark", 54));
-        assert_eq!(gs.entities.len(), 2,
+        assert_eq!(gs.world.entities.len(), 2,
             "near spawns that arrived before the first OP_NewZone must survive it (#527rc)");
-        assert!(gs.entities.contains_key(&511), "Katie must not be wiped by OP_NewZone");
-        assert!(gs.entities.contains_key(&1291), "Guard Frostfallen must not be wiped by OP_NewZone");
+        assert!(gs.world.entities.contains_key(&511), "Katie must not be wiped by OP_NewZone");
+        assert!(gs.world.entities.contains_key(&1291), "Guard Frostfallen must not be wiped by OP_NewZone");
     }
 
     #[test]
@@ -2924,16 +2924,16 @@ mod tests {
         // zone-server session — where before the guard the repeat NewZone self-healed it.
         let mut gs = GameState::new();
         gs.begin_zone_in();
-        gs.zone_name = "qeynos2".into();
-        gs.zone_id = 2;
+        gs.world.zone_name = "qeynos2".into();
+        gs.world.zone_id = 2;
 
         super::apply_new_zone(&mut gs, &[0u8; 16]); // truncated — must be ignored outright
-        assert!(!gs.new_zone_applied, "a short OP_NewZone must not latch the one-shot");
+        assert!(!gs.world.new_zone_applied, "a short OP_NewZone must not latch the one-shot");
 
         super::apply_new_zone(&mut gs, &new_zone_payload("freporte", 9)); // the real one
-        assert_eq!(gs.zone_name, "freporte", "the real OP_NewZone must still be applied");
-        assert_eq!(gs.zone_id, 9);
-        assert!(gs.zone_underworld.is_some(), "the #150 underworld clamp must be re-seeded");
+        assert_eq!(gs.world.zone_name, "freporte", "the real OP_NewZone must still be applied");
+        assert_eq!(gs.world.zone_id, 9);
+        assert!(gs.world.zone_underworld.is_some(), "the #150 underworld clamp must be re-seeded");
     }
 
     /// A RoF2 OP_NewZone payload carrying the fields apply_new_zone reads (short name @64, zone_id @852).
@@ -2963,14 +2963,14 @@ mod tests {
     #[test]
     fn new_zone_parses_fog_fields_when_present() {
         // #517: a zone that sends a real (non-degenerate) fog range must have it parsed into
-        // gs.zone_fog exactly — this is the wire-parse half of the fog feature (the renderer half
+        // gs.world.zone_fog exactly — this is the wire-parse half of the fog feature (the renderer half
         // isn't unit-testable; see the PR for the live-validation note).
         let mut gs = GameState::new();
         let payload = new_zone_payload_with_fog(
             "gfaydark", 54, [60, 120, 70], 200.0, 900.0, 0.33,
         );
         super::apply_new_zone(&mut gs, &payload);
-        let fog = gs.zone_fog.expect("non-degenerate fog range must parse to Some");
+        let fog = gs.world.zone_fog.expect("non-degenerate fog range must parse to Some");
         assert_eq!(fog.color, [60, 120, 70]);
         assert_eq!(fog.minclip, 200.0);
         assert_eq!(fog.maxclip, 900.0);
@@ -2985,7 +2985,7 @@ mod tests {
         let mut gs = GameState::new();
         let payload = new_zone_payload("qeynos2", 2); // all-zero fields, including fog
         super::apply_new_zone(&mut gs, &payload);
-        assert_eq!(gs.zone_fog, None, "an all-zero fog range must not produce a fog effect");
+        assert_eq!(gs.world.zone_fog, None, "an all-zero fog range must not produce a fog effect");
     }
 
     /// A 100-byte RoF2 Door_Struct record for `door_id`.
@@ -3009,14 +3009,14 @@ mod tests {
         super::apply_new_zone(&mut gs, &new_zone_payload("qeynos2", 2));
 
         // OP_ReqClientSpawn is out; the stream it asked for starts landing.
-        gs.entities.insert(1, test_entity(1, "Guard_Jordan", 100.0));
+        gs.world.entities.insert(1, test_entity(1, "Guard_Jordan", 100.0));
         super::apply_spawn_doors(&mut gs, &door_record(7));
 
         super::apply_new_zone(&mut gs, &new_zone_payload("qeynos2", 2)); // the ReqNewZone reply
 
-        assert_eq!(gs.entities.len(), 1, "the second OP_NewZone must not wipe inbound spawns (#322)");
-        assert_eq!(gs.doors.len(), 1, "the second OP_NewZone must not wipe inbound doors (#322)");
-        assert_eq!(gs.zone_name, "qeynos2");
+        assert_eq!(gs.world.entities.len(), 1, "the second OP_NewZone must not wipe inbound spawns (#322)");
+        assert_eq!(gs.world.doors.len(), 1, "the second OP_NewZone must not wipe inbound doors (#322)");
+        assert_eq!(gs.world.zone_name, "qeynos2");
         assert_eq!(gs.messages.iter().filter(|m| m.text == "Entered qeynos2").count(), 1,
             "one 'Entered <zone>' message per zone-in");
         assert_eq!(gs.chat_events.iter().filter(|e| e.kind == "zone").count(), 1,
@@ -3033,22 +3033,22 @@ mod tests {
         let mut gs = GameState::new();
         gs.begin_zone_in();
         super::apply_new_zone(&mut gs, &new_zone_payload("qeynos2", 2));
-        gs.entities.insert(1, test_entity(1, "Guard_Jordan", 100.0));
+        gs.world.entities.insert(1, test_entity(1, "Guard_Jordan", 100.0));
         super::apply_spawn_doors(&mut gs, &door_record(7));
 
         gs.begin_zone_in(); // next zone-server session — THIS is the purge of the prior zone
-        assert!(gs.entities.is_empty(), "begin_zone_in must purge the prior zone's entities (#270)");
-        assert!(gs.doors.is_empty(), "begin_zone_in must purge the prior zone's doors (#270)");
+        assert!(gs.world.entities.is_empty(), "begin_zone_in must purge the prior zone's entities (#270)");
+        assert!(gs.world.doors.is_empty(), "begin_zone_in must purge the prior zone's doors (#270)");
 
         // The new zone's own spawns arrive after the handshake clear and before OP_NewZone; they stay.
-        gs.entities.insert(2, test_entity(2, "Guard_Frostfallen", 100.0));
+        gs.world.entities.insert(2, test_entity(2, "Guard_Frostfallen", 100.0));
         super::apply_spawn_doors(&mut gs, &door_record(4));
         super::apply_new_zone(&mut gs, &new_zone_payload("freporte", 9));
 
-        assert_eq!(gs.entities.len(), 1, "new-zone spawns must survive the first OP_NewZone (#527rc)");
-        assert_eq!(gs.doors.len(), 1, "new-zone doors must survive the first OP_NewZone (#527rc)");
-        assert_eq!(gs.zone_name, "freporte");
-        assert_eq!(gs.zone_id, 9);
+        assert_eq!(gs.world.entities.len(), 1, "new-zone spawns must survive the first OP_NewZone (#527rc)");
+        assert_eq!(gs.world.doors.len(), 1, "new-zone doors must survive the first OP_NewZone (#527rc)");
+        assert_eq!(gs.world.zone_name, "freporte");
+        assert_eq!(gs.world.zone_id, 9);
     }
 
     #[test]
@@ -3204,7 +3204,7 @@ mod tests {
         // #273: the server ENCODEs OP_Consider as the 20-byte RoF2 Consider_Struct (targetid@4,
         // faction@8, level@12). apply_consider must produce the attitude line + set the con color.
         let mut gs = GameState::new();
-        gs.entities.insert(450, test_entity(450, "Guard_Phaeton", 100.0));
+        gs.world.entities.insert(450, test_entity(450, "Guard_Phaeton", 100.0));
         gs.set_target(450);
         let mut reply = [0u8; 20];
         reply[4..8].copy_from_slice(&450u32.to_le_bytes());   // targetid
@@ -3229,7 +3229,7 @@ mod tests {
         // agent scraping the log (rather than /observe/debug) had no way to learn the difficulty
         // tier at all. The tier text must come from `level` (con_level_name), never `faction`.
         let mut gs = GameState::new();
-        gs.entities.insert(77, test_entity(77, "a_dragon", 100.0));
+        gs.world.entities.insert(77, test_entity(77, "a_dragon", 100.0));
         let mut reply = [0u8; 20];
         reply[4..8].copy_from_slice(&77u32.to_le_bytes());
         reply[8..12].copy_from_slice(&2u32.to_le_bytes());     // faction 2 -> attitude "warmly"
@@ -3250,7 +3250,7 @@ mod tests {
         // and an agent picks a fight it cannot win. level and faction are chosen so con_color differs
         // between them, so the mutation cannot hide.
         let mut gs = GameState::new();
-        gs.entities.insert(77, test_entity(77, "a_dragon", 100.0));
+        gs.world.entities.insert(77, test_entity(77, "a_dragon", 100.0));
         gs.set_target(77);
         let mut reply = [0u8; 20];
         reply[4..8].copy_from_slice(&77u32.to_le_bytes());     // targetid
@@ -3270,7 +3270,7 @@ mod tests {
         // tier was computed by con_level_name and then discarded: target_con* stay None (correctly,
         // #330) and nothing else carried it.
         let mut gs = GameState::new();
-        gs.entities.insert(450, test_entity(450, "Guard_Phaeton", 100.0));
+        gs.world.entities.insert(450, test_entity(450, "Guard_Phaeton", 100.0));
         // no set_target — nothing is targeted
         let mut reply = [0u8; 20];
         reply[4..8].copy_from_slice(&450u32.to_le_bytes());   // targetid
@@ -3285,7 +3285,7 @@ mod tests {
         assert_eq!(lc.name, "Guard_Phaeton");
         assert_eq!(lc.con_name, "green", "difficulty tier from level=2");
         assert_eq!(lc.attitude, "scowls", "attitude from faction=9");
-        assert_eq!(lc.level, Some(1), "test_entity's level, looked up from gs.entities");
+        assert_eq!(lc.level, Some(1), "test_entity's level, looked up from gs.world.entities");
     }
 
     #[test]
@@ -3294,7 +3294,7 @@ mod tests {
         // a lethal (level=13/red) mob that happens to hash to a safe-looking low faction number must
         // still report `last_consider.con_name == "red"`, never a tier derived from the faction field.
         let mut gs = GameState::new();
-        gs.entities.insert(77, test_entity(77, "a_dragon", 100.0));
+        gs.world.entities.insert(77, test_entity(77, "a_dragon", 100.0));
         // no set_target — this is the standalone path #336 is about.
         let mut reply = [0u8; 20];
         reply[4..8].copy_from_slice(&77u32.to_le_bytes());     // targetid
@@ -3311,7 +3311,7 @@ mod tests {
         // last_consider is unconditional: a TARGETED consider populates it too, alongside the
         // older target_con*/target_con_name/target_attitude fields (#292).
         let mut gs = GameState::new();
-        gs.entities.insert(450, test_entity(450, "Guard_Phaeton", 100.0));
+        gs.world.entities.insert(450, test_entity(450, "Guard_Phaeton", 100.0));
         gs.set_target(450);
         let mut reply = [0u8; 20];
         reply[4..8].copy_from_slice(&450u32.to_le_bytes());
@@ -3333,7 +3333,7 @@ mod tests {
         // still produce its chat line, or the endpoint is a silent no-op (200 OK, then nothing).
         // The con FIELDS are target-scoped, so they must stay untouched here (#330).
         let mut gs = GameState::new();
-        gs.entities.insert(450, test_entity(450, "Guard_Phaeton", 100.0));
+        gs.world.entities.insert(450, test_entity(450, "Guard_Phaeton", 100.0));
         // no set_target — nothing is targeted
         let mut reply = [0u8; 20];
         reply[4..8].copy_from_slice(&450u32.to_le_bytes());   // targetid
@@ -3371,7 +3371,7 @@ mod tests {
         // so this test targets the spawn first — see the standalone-consider test above for the
         // non-target path, where the line is logged but these fields stay untouched (#330).
         let mut gs = GameState::new();
-        gs.entities.insert(450, test_entity(450, "a_guard", 100.0));
+        gs.world.entities.insert(450, test_entity(450, "a_guard", 100.0));
         gs.set_target(450);
         let mut reply = [0u8; 20];
         reply[4..8].copy_from_slice(&450u32.to_le_bytes());   // targetid
@@ -3391,8 +3391,8 @@ mod tests {
         // reply is a legitimate con result for A, and the same code path serves the standalone
         // /v1/combat/consider endpoint, which cons non-target spawns on purpose.
         let mut gs = GameState::new();
-        gs.entities.insert(1, test_entity(1, "mob_a", 80.0));
-        gs.entities.insert(2, test_entity(2, "mob_b", 55.0));
+        gs.world.entities.insert(1, test_entity(1, "mob_a", 80.0));
+        gs.world.entities.insert(2, test_entity(2, "mob_b", 55.0));
         gs.set_target(1); // target A
         gs.set_target(2); // retarget to B before A's consider reply arrives
 
@@ -4482,7 +4482,7 @@ mod tests {
         assert_eq!(gs.player_id, 7, "case-only mismatch must still resolve to our own spawn");
         assert_eq!(gs.player_name, "Aldric",
             "gs.player_name must be corrected to the server's exact spelling, not left as the config value");
-        assert!(gs.entities.is_empty(), "our own spawn must not also land in the generic entity roster");
+        assert!(gs.world.entities.is_empty(), "our own spawn must not also land in the generic entity roster");
 
         // Stray trailing whitespace in the config value (a realistic TOML copy-paste slip).
         let mut gs2 = GameState::new();
@@ -4654,7 +4654,7 @@ mod tests {
         let pkt = [42u8, 0, 17, 0, 1, 2, 3, 0xFF, 1];
         apply_wear_change(&mut gs, &pkt);
 
-        let e = gs.entities.get(&42).unwrap();
+        let e = gs.world.entities.get(&42).unwrap();
         assert_eq!(e.equipment[1], 17);
         assert_eq!(e.equipment_tint[1], [3, 2, 1]); // stored RGB
         assert_eq!(e.equipment[0], 0, "other slots untouched");
@@ -4715,7 +4715,7 @@ mod tests {
         let mut gs = GameState::new();
         gs.player_name = "Someone".into();
         register_spawn(&mut gs, mk(2, "Aldric's corpse378"));
-        let e = gs.entities.get(&7).unwrap();
+        let e = gs.world.entities.get(&7).unwrap();
         assert!(e.dead, "pc corpse (npc=2) must be flagged dead");
         assert_eq!(e.animation, 115, "corpse uses the Lying animation → scene picks the D05 dead clip");
         assert_eq!(e.hp_pct, 0.0, "a corpse is at 0 hp");
@@ -4723,12 +4723,12 @@ mod tests {
         // An NPC corpse (npc=3) likewise.
         let mut gs = GameState::new();
         register_spawn(&mut gs, mk(3, "a_rat_corpse"));
-        assert!(gs.entities.get(&7).unwrap().dead, "npc corpse (npc=3) must be flagged dead");
+        assert!(gs.world.entities.get(&7).unwrap().dead, "npc corpse (npc=3) must be flagged dead");
 
         // A LIVING npc (npc=1) is untouched: not dead, keeps its stand_state animation and hp.
         let mut gs = GameState::new();
         register_spawn(&mut gs, mk(1, "a rat"));
-        let e = gs.entities.get(&7).unwrap();
+        let e = gs.world.entities.get(&7).unwrap();
         assert!(!e.dead, "a living spawn must not be flagged dead");
         assert_eq!(e.animation, 100);
         assert_eq!(e.hp_pct, 100.0);
@@ -4752,23 +4752,23 @@ mod tests {
         };
 
         // campday000-style controller (bodytype 11 = NoTarget) at the exact sentinel (0,0,0)
-        // coords seen live: must never enter gs.entities, matching the native client which never
+        // coords seen live: must never enter gs.world.entities, matching the native client which never
         // lists or lets the player target it.
         let mut gs = GameState::new();
         register_spawn(&mut gs, mk(11, 0.0, 0.0, 0.0, "campday000"));
-        assert!(gs.entities.is_empty(), "bodytype 11 controller must be dropped, not registered");
+        assert!(gs.world.entities.is_empty(), "bodytype 11 controller must be dropped, not registered");
 
         // zone_controller000-style (bodytype 60 = NoTarget2) at its other sentinel coords.
         let mut gs = GameState::new();
         register_spawn(&mut gs, mk(60, 30000.0, 10000.0, -9999.875, "zone_controller000"));
-        assert!(gs.entities.is_empty(), "bodytype 60 controller must be dropped, not registered");
+        assert!(gs.world.entities.is_empty(), "bodytype 60 controller must be dropped, not registered");
 
         // A real NPC with an ordinary bodytype (1 = Humanoid), even sharing the exact sentinel
         // coords a controller might use, must still register — proves the signal is bodytype,
         // not position, so real content near (0,0,0) is never mistakenly hidden.
         let mut gs = GameState::new();
         register_spawn(&mut gs, mk(1, 0.0, 0.0, 0.0, "a_rat"));
-        assert!(gs.entities.contains_key(&1496), "a real NPC must still register even at (0,0,0)");
+        assert!(gs.world.entities.contains_key(&1496), "a real NPC must still register even at (0,0,0)");
     }
 
     #[test]
@@ -4781,7 +4781,7 @@ mod tests {
         apply_wear_change(&mut gs, &pkt);
         assert_eq!(gs.player_equipment[1], 17);
         assert_eq!(gs.player_equipment_tint[1], [3, 2, 1]); // stored RGB
-        assert!(gs.entities.is_empty(), "player must not be added to entities");
+        assert!(gs.world.entities.is_empty(), "player must not be added to entities");
     }
 
     // --- decode/encode position round-trip: NPC-relevant edge cases ---
@@ -4845,7 +4845,7 @@ mod tests {
             equipment, equipment_tint,
         };
         register_spawn(&mut gs, info);
-        let e = gs.entities.get(&7).expect("entity registered");
+        let e = gs.world.entities.get(&7).expect("entity registered");
         assert_eq!(e.equipment[1], 17);
         assert_eq!(e.equipment_tint[1], [30, 20, 10]); // stored RGB
         assert_eq!(e.gender, 1);
@@ -5325,10 +5325,10 @@ mod tests {
 
         let mut gs = GameState::new();
         apply_zone_points(&mut gs, &payload);
-        assert_eq!(gs.zone_points.len(), 2, "the sentinel (x=999999) entry must be dropped");
-        assert!(gs.zone_points.iter().all(|zp| zp.server_x.abs() < 900_000.0),
+        assert_eq!(gs.world.zone_points.len(), 2, "the sentinel (x=999999) entry must be dropped");
+        assert!(gs.world.zone_points.iter().all(|zp| zp.server_x.abs() < 900_000.0),
             "no sentinel coordinate survives");
-        assert!(gs.zone_points.iter().any(|zp| (zp.server_x - 100.0).abs() < 0.5), "kept the real lines");
+        assert!(gs.world.zone_points.iter().any(|zp| (zp.server_x - 100.0).abs() < 0.5), "kept the real lines");
     }
 
     #[test]
@@ -5351,7 +5351,7 @@ mod tests {
         let mut gs = GameState::new();
         apply_spawn_doors(&mut gs, &rec);
 
-        let d = gs.doors.get(&7).expect("door 7 present");
+        let d = gs.world.doors.get(&7).expect("door 7 present");
         assert_eq!(d.name, "DOOR1");
         assert_eq!(d.x, 10.0);   // east  <- xPos
         assert_eq!(d.y, 20.0);   // north <- yPos
@@ -5383,9 +5383,9 @@ mod tests {
         let mut gs = GameState::new();
         apply_spawn_doors(&mut gs, &p);
 
-        assert_eq!(gs.doors.get(&7).expect("door 7 present").name, "DOORONE");
-        assert_eq!(gs.doors.get(&9).expect("door 9 present").name, "DOORTWO");
-        assert_eq!(gs.doors.len(), 2, "exactly two doors, no phantom drifted records");
+        assert_eq!(gs.world.doors.get(&7).expect("door 7 present").name, "DOORONE");
+        assert_eq!(gs.world.doors.get(&9).expect("door 9 present").name, "DOORTWO");
+        assert_eq!(gs.world.doors.len(), 2, "exactly two doors, no phantom drifted records");
     }
 
     #[test]
@@ -5398,9 +5398,9 @@ mod tests {
             opentype:5, door_param:0, invert_state:false, is_open:false,
         });
         apply_move_door(&mut gs, &[1, 0x02]); // action 0x02 = open
-        assert!(gs.doors.get(&1).unwrap().is_open);
+        assert!(gs.world.doors.get(&1).unwrap().is_open);
         apply_move_door(&mut gs, &[1, 0x03]); // action 0x03 = close
-        assert!(!gs.doors.get(&1).unwrap().is_open);
+        assert!(!gs.world.doors.get(&1).unwrap().is_open);
 
         // inverted door: action 0x02 means "close", 0x03 means "open"
         gs.upsert_door(crate::game_state::Door {
@@ -5408,9 +5408,9 @@ mod tests {
             opentype:5, door_param:0, invert_state:true, is_open:true,
         });
         apply_move_door(&mut gs, &[2, 0x02]);
-        assert!(!gs.doors.get(&2).unwrap().is_open);
+        assert!(!gs.world.doors.get(&2).unwrap().is_open);
         apply_move_door(&mut gs, &[2, 0x03]);
-        assert!(gs.doors.get(&2).unwrap().is_open);
+        assert!(gs.world.doors.get(&2).unwrap().is_open);
     }
 
     // ── Phase 2b: OP_ZoneEntry registers spawns + PlayerProfile identity ─────
@@ -5418,7 +5418,7 @@ mod tests {
     /// Reuse the NPC spawn buffer builder from protocol.rs tests via the public
     /// parse_rof2_spawn + register_spawn pipeline. This is the canonical RoF2 test:
     /// each OP_ZoneEntry carries one Spawn_Struct, and every such packet must land
-    /// in gs.entities (or update the player, if name matches).
+    /// in gs.world.entities (or update the player, if name matches).
     #[test]
     fn zone_entry_registers_npc_spawn() {
         use crate::eq_net::protocol::parse_rof2_spawn;
@@ -5489,7 +5489,7 @@ mod tests {
         let mut gs = GameState::new();
         gs.player_name = "Someone_Else".into(); // make sure it's not mistaken for player
         apply_zone_entry(&mut gs, &buf);
-        let e = gs.entities.get(&77).expect("NPC must be in entities after OP_ZoneEntry");
+        let e = gs.world.entities.get(&77).expect("NPC must be in entities after OP_ZoneEntry");
         assert_eq!(e.name, "a_gnoll");
         assert!((e.x - 150.0).abs() < 0.2);
         assert!((e.y - (-100.0)).abs() < 0.2);
@@ -5622,7 +5622,7 @@ mod tests {
             let mut gs = GameState::new();
             gs.player_name = "Someone_Else".into();
             apply_zone_entry(&mut gs, &buf);
-            assert!(gs.entities.contains_key(&id), "{name} (race {race}) must register");
+            assert!(gs.world.entities.contains_key(&id), "{name} (race {race}) must register");
         }
     }
 
@@ -5641,10 +5641,10 @@ mod tests {
         gs.player_name = "Someone_Else".into();
         apply_zone_spawns(&mut gs, &bulk);
 
-        assert!(gs.entities.contains_key(&201), "first spawn registered");
-        assert!(gs.entities.contains_key(&202), "middle spawn registered");
-        assert!(gs.entities.contains_key(&203), "LAST spawn registered — tail not truncated");
-        assert_eq!(gs.entities.len(), 3, "all three spawns in the roster");
+        assert!(gs.world.entities.contains_key(&201), "first spawn registered");
+        assert!(gs.world.entities.contains_key(&202), "middle spawn registered");
+        assert!(gs.world.entities.contains_key(&203), "LAST spawn registered — tail not truncated");
+        assert_eq!(gs.world.entities.len(), 3, "all three spawns in the roster");
     }
 
     /// #407 agent-honesty: when a record in an OP_ZoneSpawns stream fails to parse, the roster is
@@ -5690,9 +5690,9 @@ mod tests {
         });
 
         // Head still registered…
-        assert!(gs.entities.contains_key(&301) && gs.entities.contains_key(&302),
+        assert!(gs.world.entities.contains_key(&301) && gs.world.entities.contains_key(&302),
             "records before the failure are registered");
-        assert!(!gs.entities.contains_key(&303), "the unparseable record is not registered");
+        assert!(!gs.world.entities.contains_key(&303), "the unparseable record is not registered");
         // …and the truncation was surfaced LOUDLY, not swallowed.
         let logged = String::from_utf8(log.lock().unwrap().clone()).unwrap();
         assert!(logged.contains("agent-honesty #407"),
@@ -5712,9 +5712,9 @@ mod tests {
         apply_zone_entry(&mut gs, &[0x01, 0x02, 0x03]); // unparseable — must not panic or wipe roster
         apply_zone_entry(&mut gs, &build_npc_record("after", 402, 2.0, 2.0, 2.0));
 
-        assert!(gs.entities.contains_key(&401), "spawn before the bad packet survives");
-        assert!(gs.entities.contains_key(&402), "spawn after the bad packet still registers");
-        assert_eq!(gs.entities.len(), 2, "only the two valid spawns; the bad one is skipped");
+        assert!(gs.world.entities.contains_key(&401), "spawn before the bad packet survives");
+        assert!(gs.world.entities.contains_key(&402), "spawn after the bad packet still registers");
+        assert_eq!(gs.world.entities.len(), 2, "only the two valid spawns; the bad one is skipped");
     }
 
     /// A corpse that arrives as a fresh spawn (npc: 2=pc_corpse, 3=npc_corpse) never goes through
@@ -5773,7 +5773,7 @@ mod tests {
         let mut gs = GameState::new();
         gs.player_name = "Someone_Else".into();
         apply_new_spawn(&mut gs, &build_spawn("a_gnoll_corpse", 77, 3));
-        let e = gs.entities.get(&77).expect("npc corpse in entities");
+        let e = gs.world.entities.get(&77).expect("npc corpse in entities");
         assert!(e.dead, "npc corpse must be marked dead");
         assert_eq!(e.animation, 115, "npc corpse uses the Lying clip");
         assert_eq!(e.hp_pct, 0.0);
@@ -5782,7 +5782,7 @@ mod tests {
         let mut gs2 = GameState::new();
         gs2.player_name = "Someone_Else".into();
         apply_new_spawn(&mut gs2, &build_spawn("Aldric`s corpse", 88, 2));
-        let e2 = gs2.entities.get(&88).expect("pc corpse in entities");
+        let e2 = gs2.world.entities.get(&88).expect("pc corpse in entities");
         assert!(e2.dead, "pc corpse must be marked dead");
         assert_eq!(e2.animation, 115);
 
@@ -5790,7 +5790,7 @@ mod tests {
         let mut gs3 = GameState::new();
         gs3.player_name = "Someone_Else".into();
         apply_new_spawn(&mut gs3, &build_spawn("a_gnoll", 99, 1));
-        let e3 = gs3.entities.get(&99).expect("live npc in entities");
+        let e3 = gs3.world.entities.get(&99).expect("live npc in entities");
         assert!(!e3.dead, "a live npc must not be marked dead");
         assert_eq!(e3.animation, 100, "a live npc keeps its standing animation");
     }
@@ -5848,7 +5848,7 @@ mod tests {
         apply_zone_entry(&mut gs, &buf);
 
         // Player self-spawn must NOT land in entities
-        assert!(gs.entities.is_empty(), "player self-spawn must not be in entities");
+        assert!(gs.world.entities.is_empty(), "player self-spawn must not be in entities");
         assert_eq!(gs.player_id, 12);
         assert!((gs.player_x - 200.0).abs() < 0.2);
         assert!((gs.player_y - (-50.0)).abs() < 0.2);
@@ -6402,7 +6402,7 @@ mod tests {
         let mut gs = GameState::new();
         gs.player_id = 1;
         // Register an NPC entity with id=42
-        gs.entities.insert(42, Entity {
+        gs.world.entities.insert(42, Entity {
             spawn_id: 42, name: "Orc Pawn".into(),
             x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100, floating: false,
             level: 5, is_npc: true, gender: 0, race: "ORC".into(),
@@ -6417,7 +6417,7 @@ mod tests {
         pkt[0..4].copy_from_slice(&42u32.to_le_bytes());  // spawn_id  (bytes 0-3)
         pkt[4..8].copy_from_slice(&1u32.to_le_bytes());   // killer_id (bytes 4-7)
         apply_death(&mut gs, &pkt);
-        let e = gs.entities.get(&42).expect("entity must remain in map after death");
+        let e = gs.world.entities.get(&42).expect("entity must remain in map after death");
         assert!(e.dead, "entity must be marked dead");
         assert_eq!(e.hp_pct, 0.0, "hp_pct must be zeroed");
         assert_eq!(e.animation, 115, "animation must be set to 115 (Lying) for dead clip");
@@ -6473,7 +6473,7 @@ mod tests {
         pkt[0..4].copy_from_slice(&7u32.to_le_bytes());  // spawn_id = player
         apply_death(&mut gs, &pkt);
         assert_eq!(gs.hp_pct, 0.0, "player hp_pct must be zeroed on self-death");
-        assert!(gs.entities.is_empty(), "entities map must be untouched on player self-death");
+        assert!(gs.world.entities.is_empty(), "entities map must be untouched on player self-death");
     }
 
     fn build_group_update_b(leader: &str, members: &[(&str, u32, bool, bool, bool, bool, bool)]) -> Vec<u8> {

@@ -337,10 +337,10 @@ mod mock {
             gs.player_y = self.self_pos[1];
             gs.player_z = self.self_pos[2];
             gs.player_heading = self.self_heading;
-            gs.zone_id = self.zone_id;
-            gs.zone_name = self.zone_name.clone();
+            gs.world.zone_id = self.zone_id;
+            gs.world.zone_name = self.zone_name.clone();
             for e in &self.entities {
-                gs.entities.insert(e.spawn_id, e.clone());
+                gs.world.entities.insert(e.spawn_id, e.clone());
             }
             ctx.game_state_snapshot.store(std::sync::Arc::new(gs));
         }
@@ -533,12 +533,12 @@ mod tests {
 
         // (b) The publish is observable: a lock-free reader sees the scripted world AND the resolved move.
         let snap = snap_handle.load_full();
-        assert_eq!(snap.zone_id, 9001, "published zone id must match the script");
-        assert_eq!(snap.zone_name, "mockzone", "published zone name must match the script");
+        assert_eq!(snap.world.zone_id, 9001, "published zone id must match the script");
+        assert_eq!(snap.world.zone_name, "mockzone", "published zone name must match the script");
         assert!((snap.player_x - goal.0).abs() < 8.0 && (snap.player_y - goal.1).abs() < 8.0,
             "the published snapshot must show the avatar navigated to the goal, at ({}, {})",
             snap.player_x, snap.player_y);
-        assert_eq!(snap.entities.get(&42).map(|e| e.name.as_str()), Some("Scripted Rat"),
+        assert_eq!(snap.world.entities.get(&42).map(|e| e.name.as_str()), Some("Scripted Rat"),
             "the scripted spawn must be observable in the published snapshot");
     }
 
@@ -586,7 +586,7 @@ mod tests {
         assert!(cmd.take_chat_send().is_empty(), "the command must not remain queued");
 
         let snap = snap_handle.load_full();
-        assert_eq!((snap.zone_id, snap.zone_name.as_str()), (7, "actionzone"));
+        assert_eq!((snap.world.zone_id, snap.world.zone_name.as_str()), (7, "actionzone"));
         assert_eq!([snap.player_x, snap.player_y, snap.player_z], [1.0, 2.0, 3.0]);
         assert_eq!(snap.player_heading, 128.0);
     }

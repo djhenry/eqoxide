@@ -340,7 +340,7 @@ pub async fn run_gameplay_phase(
                     let bx = f32::from_le_bytes([p[4],  p[5],  p[6],  p[7]]);
                     let by = f32::from_le_bytes([p[8],  p[9],  p[10], p[11]]);
                     let bz = f32::from_le_bytes([p[12], p[13], p[14], p[15]]);
-                    let target_zone = if bind_zone_id != 0 { bind_zone_id } else { gs.zone_id };
+                    let target_zone = if bind_zone_id != 0 { bind_zone_id } else { gs.world.zone_id };
                     s.send_app_packet(OP_ZONE_CHANGE,
                         &build_zone_change(&gs.player_name, target_zone, instance_id, bx, by, bz));
                     tracing::info!("EQ: bind respawn — sent OP_ZoneChange to finalize respawn (zone_id={target_zone})");
@@ -379,7 +379,7 @@ pub async fn run_gameplay_phase(
                     // silently breaks every downstream distance/adoption test (the bug above).
                     if !(x.is_finite() && y.is_finite() && z.is_finite()) {
                         tracing::warn!("EQ: OP_REQUEST_CLIENT_ZONE_CHANGE with non-finite coords ({x},{y},{z}) — ignoring");
-                    } else if zone_id == gs.zone_id {
+                    } else if zone_id == gs.world.zone_id {
                         // Same-zone teleport (e.g. #goto x y z, #zone 0).
                         // The server expects the client to just move — it clears zone_mode
                         // before we respond, so sending OP_ZONE_CHANGE would cause a cancel
@@ -940,7 +940,7 @@ async fn run_zone_entry_handshake(
                 OP_NEW_ZONE if !done_new_zone => {
                     done_new_zone = true;
                     stream.send_app_packet(OP_REQ_CLIENT_SPAWN, &[]);
-                    tracing::info!("EQ: new zone '{}' — sent ReqClientSpawn", gs.zone_name);
+                    tracing::info!("EQ: new zone '{}' — sent ReqClientSpawn", gs.world.zone_name);
                 }
                 OP_WEATHER if !done_weather => {
                     done_weather = true;
@@ -951,7 +951,7 @@ async fn run_zone_entry_handshake(
                     done_client_ready = true;
                     stream.send_app_packet(OP_SEND_EXP_ZONE_IN, &[]);
                     stream.send_app_packet(OP_CLIENT_READY, &[]);
-                    tracing::info!("EQ: zone transition complete — now in '{}'", gs.zone_name);
+                    tracing::info!("EQ: zone transition complete — now in '{}'", gs.world.zone_name);
                 }
                 _ => {}
             }
@@ -968,8 +968,8 @@ async fn run_zone_entry_handshake(
         // we came from as where we are. The caller tears the session down after this (an honest end).
         // We do NOT try to "rescue" this with a second OP_ZoneEntry — per the fn doc that would risk
         // self-disconnecting an admitted-but-slow session; an honest failure is the correct backstop.
-        gs.zone_in_failed = true;
-        gs.zone_name.clear();
+        gs.world.zone_in_failed = true;
+        gs.world.zone_name.clear();
         publish_snapshot(gs, game_state_snapshot, net_health);
         tracing::warn!(
             "EQ: zone entry handshake TIMED OUT (new_zone={done_new_zone} weather={done_weather}) — \
@@ -1579,7 +1579,7 @@ mod zone_entry_handshake_publish_tests {
     use crate::eq_net::transport::test_stream;
 
     /// Minimal RoF2 NewZone_Struct payload: everything zeroed except `zone_short_name` at offset 64
-    /// (see `apply_new_zone` in packet_handler.rs) — enough for `apply_packet` to set `gs.zone_name`.
+    /// (see `apply_new_zone` in packet_handler.rs) — enough for `apply_packet` to set `gs.world.zone_name`.
     fn new_zone_payload(name: &str) -> Vec<u8> {
         let mut p = vec![0u8; SIZE_NEW_ZONE];
         let nb = name.as_bytes();
@@ -1606,7 +1606,7 @@ mod zone_entry_handshake_publish_tests {
         let (tx, mut net_rx) = tokio::sync::mpsc::unbounded_channel::<AppPacket>();
 
         let mut gs = GameState::new();
-        gs.zone_name = "oldzone".to_string();
+        gs.world.zone_name = "oldzone".to_string();
         let snapshot: crate::ipc::GameStateSnapshot =
             Arc::new(arc_swap::ArcSwap::from_pointee(gs.clone()));
         let last_inbound: crate::ipc::NetHealthShared =
@@ -1630,7 +1630,7 @@ mod zone_entry_handshake_publish_tests {
         // OP_SEND_EXP_ZONE_IN are withheld on purpose).
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
-            if snapshot.load().zone_name == "newzone" { break; }
+            if snapshot.load().world.zone_name == "newzone" { break; }
             assert!(std::time::Instant::now() < deadline,
                 "snapshot never picked up OP_NEW_ZONE's zone_name — publish_snapshot isn't being \
                  called inside the handshake's drain loop (#324)");
@@ -1642,7 +1642,7 @@ mod zone_entry_handshake_publish_tests {
 
     fn fresh_gs_snapshot() -> (GameState, crate::ipc::GameStateSnapshot, crate::ipc::NetHealthShared) {
         let mut gs = GameState::new();
-        gs.zone_name = "oldzone".to_string();
+        gs.world.zone_name = "oldzone".to_string();
         let snapshot: crate::ipc::GameStateSnapshot =
             Arc::new(arc_swap::ArcSwap::from_pointee(gs.clone()));
         let health: crate::ipc::NetHealthShared =
@@ -1710,11 +1710,11 @@ mod zone_entry_handshake_publish_tests {
         ).await;
 
         assert!(!ok, "a never-completed zone-in must report failure");
-        assert!(gs.zone_in_failed, "timeout must raise the honest zone_in_failed flag");
-        assert!(gs.zone_name.is_empty(),
+        assert!(gs.world.zone_in_failed, "timeout must raise the honest zone_in_failed flag");
+        assert!(gs.world.zone_name.is_empty(),
             "timeout must CLEAR the stale OLD zone_name so no agent reads it as current (#343/#470)");
         let published = snapshot.load();
-        assert!(published.zone_in_failed && published.zone_name.is_empty(),
+        assert!(published.world.zone_in_failed && published.world.zone_name.is_empty(),
             "the honest failure state must be PUBLISHED to the snapshot, not just held locally");
     }
 }

@@ -242,7 +242,7 @@ impl SceneState {
 
     /// Build SceneState from a live GameState snapshot.
     pub fn from_game_state(gs: &GameState, door_frac: &std::collections::HashMap<u8, f32>) -> Self {
-        let billboards = gs.entities.values().map(|e| {
+        let billboards = gs.world.entities.values().map(|e| {
             // Map EQ Animation:: values to action strings for clip resolution.
             // Animation constants from eq_constants.h: Standing=100, Freeze=102,
             // Looting=105, Sitting=110, Crouching=111, Lying=115.
@@ -313,7 +313,7 @@ impl SceneState {
             }
         }).collect();
 
-        let doors = gs.doors.values().map(|d| DoorRender {
+        let doors = gs.world.doors.values().map(|d| DoorRender {
             door_id: d.door_id,
             name:    d.name.clone(),
             // Client convention [east=x, north=y, up=z] — same as entities/player.
@@ -333,8 +333,8 @@ impl SceneState {
         }).collect();
 
         SceneState {
-            zone: gs.zone_name.clone(),
-            zone_changed: gs.zone_changed,
+            zone: gs.world.zone_name.clone(),
+            zone_changed: gs.world.zone_changed,
             // World space is EQ native: [east=server_x, north=server_y, up=server_z].
             // Zone geometry, entities and the player all share this one frame.
             player_pos: [gs.player_x, gs.player_y, gs.player_z],
@@ -411,8 +411,8 @@ impl SceneState {
             loot_active: gs.loot_session_active,
             player_dead: gs.player_dead,
             killed_by: gs.killed_by.clone(),
-            zone_id: gs.zone_id,
-            zone_fog: gs.zone_fog,
+            zone_id: gs.world.zone_id,
+            zone_fog: gs.world.zone_fog,
         }
     }
 }
@@ -435,8 +435,8 @@ mod tests {
 
     fn sample_state() -> GameState {
         let mut gs = GameState::new();
-        gs.zone_name = "qeynoshills".into();
-        gs.zone_changed = false;
+        gs.world.zone_name = "qeynoshills".into();
+        gs.world.zone_changed = false;
         gs.player_name = "Aethas".into();
         gs.player_level = 5;
         gs.hp_pct = 87.3;
