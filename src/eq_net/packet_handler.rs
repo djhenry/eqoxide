@@ -1752,6 +1752,13 @@ fn apply_channel_message(gs: &mut GameState, payload: &[u8]) {
     // message as if some other player said it (agent-honesty violation). The check is keyed on
     // sender identity, not channel number, so it catches the chan-14 tell echo along with every
     // other self-broadcast channel uniformly.
+    //
+    // `gs.player_name` must be the SERVER-authoritative name by the time this runs, not the raw
+    // `config.character_name` login.rs seeds it with before zone-in — `register_spawn` corrects it
+    // to the self-spawn's server-sent spelling the moment our own spawn arrives (#366). Keying this
+    // filter on a stale config value that merely differs in case/whitespace from what the server
+    // actually calls us would silently defeat it: our own message would leak through the filter and
+    // be reported to an agent as if some other player said it.
     let is_self_echo = !gs.player_name.is_empty()
         && !sender.is_empty()
         && sender.eq_ignore_ascii_case(&gs.player_name);
@@ -2512,8 +2519,23 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
     // the earlier fix only patched the single-spawn path, so zone-in corpses still stood (#253/#118).
     let is_corpse = info.npc == 2 || info.npc == 3;
 
-    if !is_npc && !gs.player_name.is_empty() && info.name == gs.player_name {
+    // Self-identification: at this point `gs.player_name` may still be nothing more than
+    // `config.character_name` (login.rs seeds it there before the server has said anything, and
+    // RoF2's OP_PlayerProfile carries no name field at all — see `apply_player_profile` — so this
+    // spawn stream is the ONLY server-authoritative source of our own character's name). A config
+    // value that differs from the server's stored spelling only by case, or by incidental leading/
+    // trailing whitespace (a common copy-paste slip in a TOML file), must still be recognized as
+    // us — an exact/case-sensitive compare here would leave `gs.player_id` at 0 forever and drop
+    // our own spawn into `gs.entities` as if it were some other player.
+    if !is_npc && !gs.player_name.is_empty() && info.name.eq_ignore_ascii_case(gs.player_name.trim()) {
         gs.player_id      = info.spawn_id;
+        // Adopt the SERVER's authoritative spelling/casing from here on. Everything downstream
+        // that treats `gs.player_name` as "who am I" — most importantly the chat self-echo filter
+        // in `apply_channel_message`, which silently drops our own messages bouncing back from the
+        // server — must compare against this corrected value, not the raw config string, or a
+        // config/server name mismatch defeats the filter and our own chat leaks through as if sent
+        // by someone else (agent-honesty bug, #366).
+        gs.player_name    = info.name.clone();
         gs.player_x       = info.x;
         gs.player_y       = info.y;
         gs.player_z       = info.z;
@@ -3985,6 +4007,92 @@ mod tests {
         super::apply_channel_message(&mut gs, &make_chan_payload("MORDETH", 5, "case check"));
         assert!(gs.messages.is_empty(), "sender name case must not defeat the self filter");
         assert!(gs.chat_events.is_empty());
+    }
+
+    // --- config-vs-server player name mismatch (#366, agent-honesty) ---
+    //
+    // login.rs seeds `gs.player_name` from `config.character_name` before the server has said
+    // anything, and RoF2's OP_PlayerProfile carries no name field at all (see
+    // `apply_player_profile`) — so the self-spawn record delivered via `register_spawn` is the
+    // ONLY server-authoritative source for our own name. If a config value that differs from the
+    // server's real spelling (case, stray whitespace from a copy-paste) were left uncorrected,
+    // this filter — keyed on `gs.player_name` — would silently fail to recognize our own chat
+    // bouncing back, and it would be reported to an agent as if some other player had sent it.
+
+    #[test]
+    fn register_spawn_self_match_tolerates_config_mismatch_and_adopts_server_name() {
+        use super::register_spawn;
+        use crate::eq_net::protocol::SpawnInfo;
+        let mk = |name: &str| SpawnInfo {
+            spawn_id: 7, name: name.into(), last_name: String::new(),
+            level: 5, npc: 0, gender: 0, race: 1, class_: 1, guild_id: 0xFFFF_FFFF, guild_rank: 0, body_type: 1,
+            cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0, stand_state: 100,
+            pet_owner_id: 0, player_state: 64,
+            x: 1.0, y: 2.0, z: 3.0, heading: 0.0, animation: 100,
+            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9],
+        };
+
+        // Case mismatch: config says "aldric", the server's real character record is "Aldric".
+        let mut gs = GameState::new();
+        gs.player_name = "aldric".to_string(); // simulates login.rs:162 seeding from config
+        register_spawn(&mut gs, mk("Aldric"));
+        assert_eq!(gs.player_id, 7, "case-only mismatch must still resolve to our own spawn");
+        assert_eq!(gs.player_name, "Aldric",
+            "gs.player_name must be corrected to the server's exact spelling, not left as the config value");
+        assert!(gs.entities.is_empty(), "our own spawn must not also land in the generic entity roster");
+
+        // Stray trailing whitespace in the config value (a realistic TOML copy-paste slip).
+        let mut gs2 = GameState::new();
+        gs2.player_name = "Aldric ".to_string();
+        register_spawn(&mut gs2, mk("Aldric"));
+        assert_eq!(gs2.player_id, 7, "trailing whitespace in the config name must not defeat self-identification");
+        assert_eq!(gs2.player_name, "Aldric", "adopted name must be the server's, with no stray whitespace");
+    }
+
+    #[test]
+    fn apply_channel_message_self_echo_keys_on_server_name_not_stale_config_name() {
+        // The crux of #366: this reproduces the exact sequence that happens live —
+        // 1. login.rs seeds gs.player_name from config (here, with a trailing space that the
+        //    server's real character name does not have — a plausible TOML mistake).
+        // 2. The self-spawn packet arrives; register_spawn is the ONLY place that ever corrects
+        //    gs.player_name to what the server actually calls us.
+        // 3. A later inbound chat message bounces our own "say" back from the server, with the
+        //    sender field set to the server's real (clean) name.
+        //
+        // If the self-echo filter (or gs.player_name) were still keyed on the raw config string,
+        // step 3's `sender.eq_ignore_ascii_case(&gs.player_name)` would compare "Aldric" against
+        // "Aldric " and MISS — the message would leak into the log/event feed as if sent by another
+        // player. Asserting on the corrected name (not the raw config value) is what proves the
+        // filter is keyed on server truth.
+        use super::register_spawn;
+        use crate::eq_net::protocol::SpawnInfo;
+
+        let mut gs = GameState::new();
+        gs.player_name = "Aldric ".to_string(); // config-sourced, stray trailing space
+        assert_ne!(gs.player_name, "Aldric", "test premise: config value must NOT already equal the server name");
+
+        let info = SpawnInfo {
+            spawn_id: 7, name: "Aldric".into(), last_name: String::new(),
+            level: 5, npc: 0, gender: 0, race: 1, class_: 1, guild_id: 0xFFFF_FFFF, guild_rank: 0, body_type: 1,
+            cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0, stand_state: 100,
+            pet_owner_id: 0, player_state: 64,
+            x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100,
+            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9],
+        };
+        register_spawn(&mut gs, info);
+        assert_eq!(gs.player_name, "Aldric", "server-authoritative name must have replaced the config value");
+
+        super::apply_channel_message(&mut gs, &make_chan_payload("Aldric", 8, "self bounce"));
+        assert!(gs.messages.is_empty(),
+            "our own message must be dropped as a self-echo, keyed on the server-authoritative name (#366)");
+        assert!(gs.chat_events.is_empty());
+
+        // Mutation-check, made explicit: had the filter (or gs.player_name) stayed keyed on the raw
+        // config string "Aldric " instead of the corrected "Aldric", this exact comparison is what
+        // would fail — eq_ignore_ascii_case is case-insensitive but does NOT trim whitespace, so
+        // "Aldric" vs "Aldric " would not match and the message above would have leaked.
+        assert!(!"Aldric".eq_ignore_ascii_case("Aldric "),
+            "sanity: the stale config string must genuinely NOT match the server name unaided");
     }
 
     #[test]
