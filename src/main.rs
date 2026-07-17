@@ -6,7 +6,7 @@
 //! loop on the main thread. The request slots are the cross-thread glue — HTTP writes them, the nav
 //! thread drains them. `--testzone` runs the renderer offline (no server) for asset/zone debugging.
 
-use eqoxide::{camera_state, config, eq_net, eqstr, http, ipc};
+use eqoxide::{camera_state, config, eqstr, http, ipc};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -380,6 +380,35 @@ fn main() {
         // dies quietly" risk #380 calls out — identifies itself in the crash log instead of
         // showing up as thread '<unnamed>'. Its own tokio runtime's worker pool is named
         // distinctly from the HTTP server's (see below) for the same reason.
+        // MVC B1 (#449): the `eq-net` thread's world-owner is now a `Model`. `ServerModel` (the real
+        // server connection) holds the login config; `ModelContext` bundles the backend-agnostic seam
+        // (the CommandState it drains + the snapshot/health it publishes + lifecycle signals) from the
+        // SAME Arc clones handed to `HttpState`/`CommandState` above — identity preserved (see
+        // `crate::model`). `ServerModel::run` delegates verbatim to `run_login_flow`; B2 (#450) swaps
+        // in a `MockModel` behind this same trait with no server.
+        let model = eqoxide::model::ServerModel::new(login_cfg, 10);
+        let model_ctx = eqoxide::model::ModelContext {
+            nav:             nav_b,
+            world:           world_b,
+            quest:           quest_b,
+            group_slots:     group_slots_b,
+            command:         command_b,
+            social:          social_b,
+            merchant_slots:  merchant_slots_b,
+            inventory_slots: inventory_slots_b,
+            interact:        interact_b,
+            chat:            chat_b,
+            controller:      controller_b,
+            guild_slots:     guild_slots_b,
+            collision:       sc,
+            maps_dir:        md,
+            shutdown:        sd,
+            camp:            cp,
+            camp_until:      cu,
+            respawn:         rsp,
+            game_state_snapshot: gss,
+            net_health:          nh,
+        };
         std::thread::Builder::new()
             .name("eq-net".into())
             .spawn(move || {
@@ -389,12 +418,8 @@ fn main() {
                     .build()
                     .expect("tokio runtime");
                 rt.block_on(async {
-                    if let Err(e) = eq_net::run_login_flow(
-                        login_cfg, 10,
-                        nav_b, world_b, quest_b, group_slots_b, command_b, social_b,
-                        merchant_slots_b, inventory_slots_b, interact_b, chat_b, controller_b,
-                        guild_slots_b, sc, md, sd, cp, cu, rsp, gss, nh,
-                    ).await {
+                    use eqoxide::model::Model;
+                    if let Err(e) = model.run(model_ctx).await {
                         tracing::error!("EQ: fatal: {e}");
                     }
                 });
