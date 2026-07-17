@@ -490,6 +490,15 @@ pub struct Collision {
     /// zone-load timing, a behaviour change, and defeat the point of the Slice-1 build-cost
     /// measurement that decides eager-vs-lazy, design §5.3 / owner decision #5).
     water_grid: Option<crate::nav::water_grid::WaterGrid>,
+    /// LAZY water-grid cache (Slice 2, owner decision #5 — LOCKED lazy, not eager). The span grid is
+    /// built on the FIRST water plan in a water zone via [`Self::water_grid_active`], not at zone
+    /// load: the measured Slice-1 build cost (357 ms – 1 s) far exceeds the 100 ms eager threshold,
+    /// so paying it once, off the net thread, on demand is the honest trade. `OnceLock` makes the
+    /// build happen exactly once per zone (a new zone builds a new `Collision`, hence a fresh lock),
+    /// and every A* pass / tier / walker sharing the `Arc<Collision>` reads the one result. Distinct
+    /// from `water_grid` above so an explicit [`Self::set_water_grid`] (tests, the measurement
+    /// harness) still wins and is never shadowed by a lazily-built one.
+    water_grid_lazy: std::sync::OnceLock<crate::nav::water_grid::WaterGrid>,
 }
 
 /// Outcome of building one water-span column (design §5.1). Separates "no navigable water here"
@@ -698,7 +707,7 @@ impl Collision {
 
         let cell_size = cell_size.max(1.0);
         if tris.is_empty() || min[0] == f32::MAX {
-            return Collision { tris, tri_nz, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0,
+            return Collision { water_grid_lazy: std::sync::OnceLock::new(), tris, tri_nz, cells: vec![], origin: [0.0, 0.0], cell_size, cols: 0, rows: 0,
                 #[cfg(test)]
                 z_min: 0.0,
                 z_max: 0.0, facing_blind_hits: Default::default(), tight_plans: Default::default(),
@@ -724,7 +733,7 @@ impl Collision {
                 }
             }
         }
-        Collision { tris, tri_nz, cells, origin: min, cell_size, cols, rows,
+        Collision { water_grid_lazy: std::sync::OnceLock::new(), tris, tri_nz, cells, origin: min, cell_size, cols, rows,
             #[cfg(test)]
             z_min,
             z_max,
@@ -790,6 +799,48 @@ impl Collision {
     /// The stored water-span grid, if one has been built (`None` until `set_water_grid`).
     pub fn water_grid(&self) -> Option<&crate::nav::water_grid::WaterGrid> {
         self.water_grid.as_ref()
+    }
+
+    /// The water-span grid the SEARCH consults (Slice 2) — an explicitly-set grid if one exists,
+    /// otherwise the LAZILY-built one (owner decision #5: build on first water plan, not at zone
+    /// load). Returns `None` for a zone with no `.wtr` water map at all, WITHOUT building — so a dry
+    /// zone pays exactly nothing and its A* is byte-for-byte unchanged.
+    ///
+    /// The first call in a water zone runs [`Self::build_water_grid`] (the measured 357 ms – 1 s
+    /// cost) on whatever thread the plan runs on — which is off the network thread for both the
+    /// coarse (#377) and fine (#382) tiers — and caches it; every later call is a pointer read. The
+    /// build is gated on `self.water.is_some()` *before* `get_or_init`, so a grid is never cached for
+    /// a zone whose water map has not been attached yet.
+    fn water_grid_active(&self) -> Option<&crate::nav::water_grid::WaterGrid> {
+        if let Some(g) = self.water_grid.as_ref() { return Some(g); }
+        self.water.as_ref()?;
+        Some(self.water_grid_lazy.get_or_init(|| {
+            let t0 = std::time::Instant::now();
+            let g = self.build_water_grid(&crate::traversability::PLAYER_BODY);
+            let ms = t0.elapsed().as_millis();
+            tracing::info!("nav: built water-span grid lazily on first water plan — {} wet column(s), \
+                {} node(s), {} unbounded-below, in {ms}ms (design §5.3, lazy per owner decision #5)",
+                g.wet_column_count(), g.node_count(), g.unbounded_below_count());
+            g
+        }))
+    }
+
+    /// The interior water-NODE z a mid-water `goal` resolves to, or `None` when the goal is not a
+    /// genuinely navigable point inside a stored water span (design §7.3). This is the single
+    /// authority the three goal-resolution sites share (`astar`, [`Self::resolve_goal_floor`],
+    /// [`Self::goal_z_was_snapped`]) so what A* plans to, what arrival demands, and what the agent is
+    /// told cannot drift apart.
+    ///
+    /// `Some(z)` ONLY when the asked z lies inside a navigable span — i.e. a real mid-water state the
+    /// #534/#540 carving already proved free of solid. A sloppy z above the swim plane (the classic
+    /// `z = 0` over a pool) is NOT in a span → `None` → the caller falls through to the existing
+    /// floating-surface anchor, unchanged. So this REFINES the water-goal chain (a truly submerged,
+    /// navigable ask now arrives at depth instead of being projected to the surface) without
+    /// disturbing the surface-projection path for every non-navigable ask.
+    fn water_node_goal_z(&self, goal: [f32; 3]) -> Option<f32> {
+        let col = self.water_grid_active()?.column_at(goal[0], goal[1])?;
+        col.span_containing(goal[2])?;      // only a genuinely navigable, in-water ask
+        col.nearest_node_z(goal[2])
     }
 
     /// Build the sparse **water-span grid** (3D-water-volume nav design §5.3) for this zone, from the
@@ -1743,6 +1794,10 @@ impl Collision {
             }
             return None;
         }
+        // 1.5 A navigable mid-water NODE at the asked depth is NOT an accommodation — the plan
+        //      arrives THERE, at the asked depth (Slice 2, design §7.3). Report no snap, so the agent
+        //      is never told its goal moved to the surface when the planner honoured the depth.
+        if self.water_node_goal_z(goal).is_some() { return None; }
         // 2. A floating water goal anchors to the surface. Within arrival tolerance of the asked z
         //    that IS the goal the caller named (same ±GOAL_TIER_TOL fuzz a dry tier enjoys);
         //    further away — a point asked for DEEP in open water — it is an accommodation.
@@ -1788,6 +1843,11 @@ impl Collision {
             }
             return Some(f);
         }
+        // 1.5 A navigable mid-water NODE at the asked depth is a real arrival tier (Slice 2, design
+        //     §7.3): the walker's target IS that depth, not the surface projection. Mirrors `astar`'s
+        //     resolution and `goal_z_was_snapped` so plan-target ≡ arrival-anchor ≡ what the agent is
+        //     told — the one-chain contract this function exists to hold.
+        if let Some(z) = self.water_node_goal_z(goal) { return Some(z); }
         // 2. A goal floating in water anchors to the surface it floats on.
         // 3. A volume point over a floor projects DOWN onto that floor.
         // 4. No floor near the asked z: the nearest floor anywhere in the column.
@@ -2220,10 +2280,21 @@ impl Collision {
         // An UNBOUNDED water column (`surface_z` = None) yields no anchor and falls through the
         // same way — the chain tolerates it by shape, nothing to unwrap.
         let goal_tier_floor = self.nearest_floor(goal[0], goal[1], goal[2], GOAL_TIER_TOL, GOAL_TIER_TOL);
+        // MID-WATER GOAL NODE (Slice 2, design §7.3): a goal asked for INSIDE a navigable water span
+        // resolves to its own depth — the nearest interior lattice node — NOT the water surface. This
+        // is the first owner case: "swim to a submerged point". It MUST run before the floating-surface
+        // anchor below, which would otherwise project every sub-surface ask up to the surface (the
+        // legacy projection hack this subsumes). It fires ONLY for a genuinely navigable ask (inside a
+        // stored, carved span, #534/#540), so a sloppy z above the swim plane still falls through to
+        // the surface anchor unchanged.
+        let water_goal = if goal_tier_floor.is_none() { self.water_node_goal_z(goal) } else { None };
         // `Some` = the goal is anchored to the water surface. Kept separate from the chain below
         // because the final waypoint must then carry THIS tier, not the caller's raw z.
-        let floating_goal = if goal_tier_floor.is_none() { self.floating_goal_surface(goal) } else { None };
+        let floating_goal = if goal_tier_floor.is_none() && water_goal.is_none() {
+            self.floating_goal_surface(goal)
+        } else { None };
         let resolved_goal_floor = goal_tier_floor
+            .or(water_goal)
             .or(floating_goal)
             .or_else(|| self.floor_beneath(goal[0], goal[1], goal[2], GOAL_TIER_TOL, GOAL_DROP));
         // AN UNACCEPTABLE GOAL FAILS IMMEDIATELY AND LOUDLY (#337). If there is no walkable floor at
@@ -2496,6 +2567,10 @@ impl Collision {
         // all — the walker's re-path loop then makes further incremental progress from there.
         let mut best_toward: Option<Key> = None;
         let mut best_toward_h = f32::MAX;
+        // Slice 2 (design §6): the water-span grid this search may route THROUGH, lazily built on the
+        // first water plan in this zone. `None` in a dry zone (no `.wtr`) → every water family below
+        // is skipped and land A* is byte-for-byte unchanged. Bound once, read per node.
+        let water_grid = self.water_grid_active();
         while let Some(Node { c, r, fz, .. }) = heap.pop() {
             let ckey = (c, r, qf(fz));
             if !closed.insert(ckey) { continue; } // already expanded
@@ -2515,13 +2590,26 @@ impl Collision {
                 }
             }
             if (c, r) == (gc, gr) {
-                if (fz - goal_floor).abs() <= GOAL_TIER_TOL {
-                    goal_key = Some(ckey); // reached the goal cell on the requested tier — done
-                    break;
+                // HONESTY GATE (Slice 2, #359 contract): a WATER node at the goal cell is NOT arrival
+                // at a LAND goal. A swimmer floating in the water column BELOW a dry goal is within
+                // `GOAL_TIER_TOL` of it, but it has not reached it — it must still HAUL OUT (a route to
+                // the dry tier via the exit edge, whose #359 cap it must satisfy). Accepting the water
+                // node as arrival (or even as a wrong-tier fallback that reports `reached`) would be
+                // exactly the false-`arrived` the haul-out contract forbids. So exclude a water node
+                // from both goal_key AND goal_fallback UNLESS the goal itself resolved to a water node
+                // (`water_goal`), in which case the mid-water depth IS the destination (design §7.3).
+                let node_is_water = water_goal.is_none() && water_grid
+                    .and_then(|g| { let p = center(c, r); g.column_at(p[0], p[1]) })
+                    .is_some_and(|col| col.span_containing(fz).is_some());
+                if !node_is_water {
+                    if (fz - goal_floor).abs() <= GOAL_TIER_TOL {
+                        goal_key = Some(ckey); // reached the goal cell on the requested tier — done
+                        break;
+                    }
+                    // Wrong tier: remember the first (cheapest) one, but keep searching — the right
+                    // tier may be reachable by climbing to it at an adjacent cell. Fall through.
+                    if goal_fallback.is_none() { goal_fallback = Some(ckey); }
                 }
-                // Wrong tier: remember the first (cheapest) one, but keep searching — the right tier
-                // may be reachable by climbing to it at an adjacent cell. Fall through and expand.
-                if goal_fallback.is_none() { goal_fallback = Some(ckey); }
             }
             // The ONE runaway bound, and it is a deterministic, PLAN-WIDE node count (#394 + review).
             // Increment the shared running total (or a local one for a bare unit-test ctx) and stop
@@ -2548,6 +2636,37 @@ impl Collision {
             // than from a cell centre it may not be able to reach. Every other node expands from its
             // cell centre as before.
             let a = if anchor_at_char && ckey == skey { [start[0], start[1]] } else { center(c, r) };
+            // ── WATER-VOLUME NODE (Slice 2, design §6) ──────────────────────────────────────────
+            // Is the node being expanded an INTERIOR water node — a swimmable point inside a stored,
+            // carved span (#534/#540 guarantee it holds no solid)? A land/surface/pool-bottom node is
+            // NEVER in a span by construction (a span's feet-interval sits strictly BETWEEN the floor
+            // and the swim plane, `nav_lo = floor+ε`, `nav_hi = surface−float_depth`), so this test
+            // partitions the graph cleanly: legacy nodes route by the land families, interior nodes by
+            // the water families. The water families are thus purely ADDITIVE — reached only via the
+            // new interior nodes — leaving every existing land / surface-swim / haul-out path intact.
+            let cur_water: Option<(&crate::nav::water_grid::WaterColumn, (f32, f32))> =
+                water_grid.and_then(|g| g.column_at(a[0], a[1]))
+                    .and_then(|col| col.span_containing(cz).map(|s| (col, s)));
+            // VERTICAL swim within the current column: up / down one VRES step, staying in the SAME
+            // carved span. A span is FREE water by construction (bounded by the very solids the carver
+            // removed), so no lateral ray is needed — this is the dive/rise leg a mid-water route needs
+            // and the up-column climb to the swim plane before a haul-out. Once per node (not per dir).
+            if let Some((_, (slo, shi))) = cur_water {
+                use crate::nav::water_grid::VRES;
+                for d in [-1.0f32, 1.0] {
+                    let nz = cz + d * VRES;
+                    if nz < slo - 0.01 || nz > shi + 0.01 { continue; } // stay inside this span
+                    let nkey = (c, r, qf(nz));
+                    if closed.contains(&nkey) { continue; }
+                    let tentative = g_cur + VRES;
+                    if tentative < *g_score.get(&nkey).unwrap_or(&f32::MAX) {
+                        g_score.insert(nkey, tentative);
+                        came.insert(nkey, ckey);
+                        floor_of.insert(nkey, nz);
+                        heap.push(Node { f: tentative + h(c, r), c, r, fz: nz });
+                    }
+                }
+            }
             // TELEPORT-PAD EDGE (#403): if this node sits on a pad footprint (its source cell, at the
             // footprint's floor tier), add the DISCONTINUOUS edge to the pad's arrival cell — the one
             // link terrain-follow neighbours cannot express. This is what lets A* route THROUGH a pad
@@ -2579,6 +2698,74 @@ impl Collision {
                 // cost stays small even when it has to detour around an obstacle (#nav-multires).
                 if let Some(maxr) = max_search {
                     if (b[0] - start[0]).hypot(b[1] - start[1]) > maxr { continue; }
+                }
+                // ── WATER-VOLUME neighbour edges (Slice 2, design §6.2/§7.2) ────────────────────
+                // A water node routes ONLY by water edges (the land families below assume `cz` is a
+                // walkable floor). Emit the 3D interior + haul-out edges for this neighbour, then
+                // `continue` past the land families entirely.
+                if let Some((cur_col, _)) = cur_water {
+                    use crate::nav::water_grid::VRES;
+                    let body = &crate::traversability::PLAYER_BODY;
+                    // HORIZONTAL 26-neighbour (design §6.2): connect to the neighbour column's node at
+                    // z−VRES, z, z+VRES — full 3-DOF, smoother chords than 6-connectivity. Lateral
+                    // clearance is per-edge at TWO body heights (feet + head): a swimmer's blocking
+                    // band is its whole body, not the standing chest band (design §6.3).
+                    if let Some(ncol) = water_grid.and_then(|g| g.column_at(b[0], b[1])) {
+                        for d in [-1.0f32, 0.0, 1.0] {
+                            let nz = cz + d * VRES;
+                            if ncol.span_containing(nz).is_none() { continue; }
+                            let nkey = (nc, nr, qf(nz));
+                            if closed.contains(&nkey) { continue; }
+                            let feet = 0.5;
+                            let head = body.height - 0.5;
+                            if !self.edge_clear([a[0], a[1], cz + feet], [b[0], b[1], nz + feet], radius, cell) { continue; }
+                            if !self.edge_clear([a[0], a[1], cz + head], [b[0], b[1], nz + head], radius, cell) { continue; }
+                            // Cost = full 3D Euclidean length (design §6.3): no depth penalty, no
+                            // surface bonus, so the straight chord to a mid-water goal is optimal and a
+                            // bottom/surface detour is strictly longer (design §6.5). The horizontal-
+                            // only heuristic (design §6.4, LOCKED) stays admissible: every water edge
+                            // costs ≥ its horizontal projection.
+                            let horiz = (((dc * dc + dr * dr) as f32).sqrt()) * cell;
+                            let dz = nz - cz;
+                            let step = (horiz * horiz + dz * dz).sqrt() + aggro_cost(b[0], b[1]);
+                            let tentative = g_cur + step;
+                            if tentative < *g_score.get(&nkey).unwrap_or(&f32::MAX) {
+                                g_score.insert(nkey, tentative);
+                                came.insert(nkey, ckey);
+                                floor_of.insert(nkey, nz);
+                                heap.push(Node { f: tentative + h(nc, nr), c: nc, r: nr, fz: nz });
+                            }
+                        }
+                    }
+                    // EXIT (water → land): ONLY from the column's TOP node, under the #359 haul-out
+                    // contract verbatim (design §7.2). Interior nodes have no land edges — a route out
+                    // of water always rises up-column to the swim plane first, exactly what the
+                    // controller can execute. (The legacy WATER ASCENT family still serves land-
+                    // anchored floaters; it is unreachable from a water node, which `continue`s below.)
+                    if cur_col.top_node_z().is_some_and(|t| (t - cz).abs() < 0.5) {
+                        if let Some(water) = &self.water {
+                            if let Some(surface) = water.surface_z(a[0], a[1], cz).map(|s| s.max(cz)) {
+                                let haul_out_up = crate::traversability::PLAYER_BODY.haul_out_up;
+                                for nf in self.column_floors(b[0], b[1], surface, STEP_H, surface - cz) {
+                                    if nf <= cz + 1.0 { continue; }              // ascents only
+                                    if nf > surface + haul_out_up { continue; }  // too high to haul out
+                                    let nkey = (nc, nr, qf(nf));
+                                    if closed.contains(&nkey) { continue; }
+                                    let ray_z = surface.max(nf - STEP_H);
+                                    if !self.edge_clear([a[0], a[1], ray_z + CHEST], [b[0], b[1], nf + CHEST], radius, cell) { continue; }
+                                    let step = (((dc * dc + dr * dr) as f32).sqrt()) * cell + (nf - cz) * 0.5 + aggro_cost(b[0], b[1]);
+                                    let tentative = g_cur + step;
+                                    if tentative < *g_score.get(&nkey).unwrap_or(&f32::MAX) {
+                                        g_score.insert(nkey, tentative);
+                                        came.insert(nkey, ckey);
+                                        floor_of.insert(nkey, nf);
+                                        heap.push(Node { f: tentative + h(nc, nr), c: nc, r: nr, fz: nf });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue; // a water node routes ONLY by water edges — skip the land families
                 }
                 // Consider EVERY surface in the neighbor column reachable by climbing <=STEP_H or
                 // dropping <=MAX_STEP_DOWN — this is what lets A* descend onto a lower floor under an
@@ -2830,6 +3017,38 @@ impl Collision {
                         }
                     }
                 }
+
+                // ── WATER ENTRY (land → water interior, Slice 2, design §7.1) ───────────────────
+                // From a land floor (this node is not a water node — it fell through the water block
+                // above), step into the neighbour column's TOP swim-plane node, so the 3D interior
+                // volume becomes reachable. WADE when the swim plane is within a step of the floor;
+                // DIVE-in when the water lies below (descents BELOW the top node are then ordinary
+                // interior edges). No chest ray — like the surface-traversal edge, a dry-walk ray from
+                // the shore floor would snag the pool lip; probe at swim height instead.
+                if let Some(ncol) = water_grid.and_then(|g| g.column_at(b[0], b[1])) {
+                    if let Some(top) = ncol.top_node_z() {
+                        let wade = (top - cz).abs() <= STEP_H;
+                        let dive = top < cz - 1.0;
+                        let nkey = (nc, nr, qf(top));
+                        if (wade || dive) && !closed.contains(&nkey)
+                            && self.edge_clear([a[0], a[1], top + 0.5], [b[0], b[1], top + 0.5], radius, cell)
+                        {
+                            let horiz = (((dc * dc + dr * dr) as f32).sqrt()) * cell;
+                            let dz = top - cz;
+                            // Bias toward wading in over leaping into the deep (design §6.5/§7.1): the
+                            // vertical drop is charged at full (not half) rate so A* prefers a shallow
+                            // entry when one exists, while a dive stays available where it is the way in.
+                            let step = (horiz * horiz + dz * dz).sqrt() + dz.abs() * 0.5 + aggro_cost(b[0], b[1]);
+                            let tentative = g_cur + step;
+                            if tentative < *g_score.get(&nkey).unwrap_or(&f32::MAX) {
+                                g_score.insert(nkey, tentative);
+                                came.insert(nkey, ckey);
+                                floor_of.insert(nkey, top);
+                                heap.push(Node { f: tentative + h(nc, nr), c: nc, r: nr, fz: top });
+                            }
+                        }
+                    }
+                }
             }
         }
         // The ANCHORS the whole search hung off. Log them on the SUCCESS path too, not just on
@@ -3000,7 +3219,7 @@ impl Collision {
             // below it. Every water waypoint of a route carries the height the character can
             // actually hold there (design §4d), so the walker's final approach moves and
             // collision-checks at swim height instead of an air/underwater z.
-            let gz = floating_goal.unwrap_or(goal[2]);
+            let gz = water_goal.or(floating_goal).unwrap_or(goal[2]);
             if let Some(last) = path.last_mut() { *last = [goal[0], goal[1], gz]; }
         } else {
             // A PARTIAL route can end inside a submerged dead-end pocket (e.g. a sunken pool whose
@@ -5073,6 +5292,90 @@ mod tests {
         // ...at the SURFACE (~ -8), never diving toward the -92 pool bottom.
         let deepest = path.iter().map(|w| w[2]).fold(f32::MAX, f32::min);
         assert!(deepest > -20.0, "route stays near the surface, not the pool bottom: deepest={deepest} path={path:?}");
+    }
+
+    // ─── 3D water-volume nav (design §6/§7, Slice 2) — the interior water-node families ─────────
+    //
+    // These drive the WIRED search over BOUNDED (`water_slab`) water — the shape real `.wtr` water
+    // has, and the only shape that stores span-grid columns (unbounded `flat_below` water reports
+    // `UnboundedBelow` and stores nothing, so every existing swim test above exercises the legacy
+    // surface/haul-out families untouched). Every expected bound is the FIXTURE's analytic geometry,
+    // never read back from the span grid under test (design §10 non-circular verification).
+
+    /// Slice 2 owner case (a) — a MID-WATER GOAL. A walled pool (floor −44, surface −4) with a goal
+    /// asked for at −24 (20u under the surface, 20u off the bottom). The route must END at the asked
+    /// depth — its interior water node — NOT be projected up to the surface (the legacy hack) NOR
+    /// dive to the −44 bottom. Mutation check: revert the Slice-2 `water_goal` clause and the goal is
+    /// projected to the surface (−4), so the final-depth assertion goes RED (last z ≈ −4). Revert the
+    /// interior edge families and the depth node is unreachable, so the route no longer ends at −24.
+    #[test]
+    fn find_path_reaches_a_mid_water_goal_node_at_depth() {
+        use crate::nav::water_grid::VRES;
+        let assets = ZoneAssets {
+            terrain: vec![
+                slab(-44.0, 0.0, 64.0, 0.0, 64.0, true),                 // pool floor
+                wall_east(0.0, -44.0, 0.0), wall_east(64.0, -44.0, 0.0), // z-extent + confinement
+            ],
+            objects: vec![], textures: vec![],
+        };
+        let mut col = Collision::build(&assets, 8.0);
+        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::water_slab(-44.0, -4.0))));
+
+        let start = [30.0, 10.0, -6.0];   // floating just under the surface (no footing → surface anchor)
+        let goal  = [30.0, 46.0, -24.0];  // MID-WATER: 20u below the surface, 20u above the −44 floor
+        let path = col.find_path(start, goal, crate::movement::PLAYER_RADIUS, &[], false)
+            .expect("a route to the mid-water goal must exist");
+        let last = *path.last().unwrap();
+        assert!((last[0] - goal[0]).abs() < 8.0 && (last[1] - goal[1]).abs() < 8.0,
+            "the route reaches the goal column (last = {last:?})");
+        assert!((last[2] - (-24.0)).abs() <= VRES + 0.01,
+            "the route ENDS at the asked mid-water depth −24, not the surface (final wp z = {})", last[2]);
+        // No bottom detour: the route stays comfortably above the −44 pool bottom.
+        let deepest = path.iter().fold(f32::MAX, |m, w| m.min(w[2]));
+        assert!(deepest > -30.0, "no waypoint dives toward the −44 bottom (deepest = {deepest})");
+        // P-3D-1 in-volume (design §10, non-circular — checked against the FIXTURE geometry, not the
+        // span grid): every waypoint that dropped below the shore sits inside the analytic water
+        // volume (feet above the −44 floor, body below the −4 surface). No node in solid, no node in
+        // air — the #534/#540 honesty guarantee carried into the emitted route.
+        for w in &path[1..] {
+            if w[2] < -4.5 {
+                assert!(w[2] > -44.0 && w[2] < -4.0,
+                    "an in-water waypoint must lie inside the fixture's water volume (wp = {w:?})");
+            }
+        }
+        // Honesty (design §7.3): the depth was HONOURED, not accommodated to the surface, and arrival
+        // anchors to the same depth — the plan/arrival/report one-chain.
+        assert_eq!(col.goal_z_was_snapped(goal), None,
+            "a navigable mid-water goal is planned at depth — no ToWaterSurface accommodation");
+        assert!((col.resolve_goal_floor(goal).unwrap() - (-24.0)).abs() <= VRES + 0.01,
+            "arrival anchors to the mid-water node depth, mirroring the plan");
+    }
+
+    /// Slice 2 honesty NEGATIVE control — a water node near a LAND goal is NOT a false arrival. Same
+    /// walled pool, but the goal is a submerged FLOOR the walker would have to reach by descending/
+    /// hauling, deeper than the swim plane. The planner must NOT report `arrived` by floating a
+    /// swimmer in the water column within `GOAL_TIER_TOL` of the dry floor — that is the #359 lie the
+    /// arrival gate forbids. Here the goal at the −44 floor is honoured as a submerged tier and
+    /// reported via `ToWaterSurface` (the walker floats above it), exactly as before Slice 2 — the
+    /// interior nodes must not quietly turn it into a bogus mid-water "arrival".
+    #[test]
+    fn interior_water_nodes_do_not_fake_arrival_at_a_submerged_floor_goal() {
+        let assets = ZoneAssets {
+            terrain: vec![
+                slab(-44.0, 0.0, 64.0, 0.0, 64.0, true),
+                wall_east(0.0, -44.0, 0.0), wall_east(64.0, -44.0, 0.0),
+            ],
+            objects: vec![], textures: vec![],
+        };
+        let mut col = Collision::build(&assets, 8.0);
+        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::water_slab(-44.0, -4.0))));
+        let goal = [30.0, 46.0, -44.0]; // the pool FLOOR (a dry tier under the water), not a swim node
+        // The floor is a real tier the caller named, but it is > GOAL_TIER_TOL below the surface, so
+        // arrival is the surface accommodation — never a mid-water node masquerading as the floor.
+        assert!((col.resolve_goal_floor(goal).unwrap() - (-4.0)).abs() < 1.0,
+            "a submerged floor goal still resolves to the water surface (walker floats above it)");
+        assert!(matches!(col.goal_z_was_snapped(goal), Some(GoalSnap::ToWaterSurface { .. })),
+            "and reports the surface accommodation — the interior nodes did not fake a depth arrival");
     }
 
     #[test]

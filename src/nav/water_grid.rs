@@ -49,6 +49,62 @@ pub struct WaterColumn {
     pub spans: Vec<(f32, f32)>,
 }
 
+impl WaterColumn {
+    /// The navigable span whose feet-interval contains `z` (a hair of tolerance folds a node sitting
+    /// exactly on a boundary in), or `None` if `z` is above the swim plane / below the floor / inside
+    /// a carved-out solid gap. This is the "is `(x,y,z)` an INTERIOR water node here?" test the
+    /// search uses to tell a water node from a land node at expansion (design §6.1). It is exact
+    /// (real stored bounds), so a node it admits is genuinely inside stored, carved water — the
+    /// #534/#540 honesty guarantee that no node sits in solid.
+    pub fn span_containing(&self, z: f32) -> Option<(f32, f32)> {
+        const TOL: f32 = 0.01;
+        self.spans.iter().copied().find(|&(lo, hi)| z >= lo - TOL && z <= hi + TOL)
+    }
+
+    /// Every materialized water NODE z in this column, high→low: the GLOBAL `VRES` lattice points
+    /// inside each span (design §5.1 — nodes are implicit, materialized during expansion).
+    ///
+    /// A node key is `(col, row, qf(z))` with `qf(z) = round(z / VRES)` (the search's existing
+    /// z-bucket). Anchoring the node lattice to the GLOBAL `VRES` grid — `z ∈ {…, −2, 0, 2, …}` —
+    /// rather than to each column's own `nav_hi`, is a deliberate, documented refinement of the
+    /// design text: it keeps adjacent columns' nodes phase-aligned, so a horizontal "same-z" edge
+    /// lands on a REAL neighbour node and the `qf` key is shared with the land search by
+    /// construction (a per-column `nav_hi` phase would make two adjacent columns' lattices
+    /// incommensurate and the `qf` key ambiguous). The ≤`VRES` offset this trades away from the
+    /// exact swim plane is well within the haul-out (`haul_out_up`) and arrival (`GOAL_TIER_TOL`)
+    /// tolerances; Slice 3 tunes execution against the surface. A span too thin to contain any
+    /// lattice point still yields ONE node, at its swim-plane `hi`, so no navigable water is dropped.
+    pub fn node_zs(&self) -> Vec<f32> {
+        let mut zs = Vec::new();
+        for &(lo, hi) in &self.spans {
+            let top = (hi / VRES).floor() * VRES; // highest global lattice point ≤ hi
+            if top < lo - 1e-4 {
+                zs.push(hi); // span thinner than the lattice spacing: a single node at the swim plane
+                continue;
+            }
+            let mut z = top;
+            while z >= lo - 1e-4 {
+                zs.push(z);
+                z -= VRES;
+            }
+        }
+        zs
+    }
+
+    /// The highest water node in the column — the swim-plane node that land↔water transitions
+    /// (entry from a shore, haul-out to land) attach to (design §7.1/§7.2).
+    pub fn top_node_z(&self) -> Option<f32> {
+        self.node_zs().into_iter().max_by(|a, b| a.total_cmp(b))
+    }
+
+    /// The materialized node z nearest `z` across all spans, or `None` if the column has no nodes.
+    /// Design §6.1: a start/goal in water resolves to the nearest lattice z IN the containing
+    /// interval — no surface or bottom projection.
+    pub fn nearest_node_z(&self, z: f32) -> Option<f32> {
+        self.node_zs().into_iter().min_by(|a, b| (a - z).abs().total_cmp(&(b - z).abs()))
+    }
+}
+
 /// The per-zone sparse water-span grid. Keyed by integer 4u column indices `(ci, cj)` relative to
 /// [`origin`](Self::origin).
 #[derive(Clone, Debug, Default)]
@@ -104,6 +160,13 @@ impl WaterGrid {
     /// Number of wet columns stored.
     pub fn wet_column_count(&self) -> usize {
         self.columns.len()
+    }
+
+    /// Total number of materialized water NODES across all columns (design §5.1 / Slice 2). A cheap
+    /// scalar the lazy-build wiring logs so the first-water-plan cost is attributable to a concrete
+    /// node count, not just a column count.
+    pub fn node_count(&self) -> usize {
+        self.columns.values().map(|c| c.node_zs().len()).sum()
     }
 
     /// Total number of navigable spans across all columns.
@@ -166,6 +229,47 @@ mod tests {
         // A 3-span column adds one extra span beyond the inline 2 → +8B payload (×2 = +16B).
         g.insert(2, 2, WaterColumn { surface_z: -4.0, spans: vec![(-40.0, -30.0), (-20.0, -15.0), (-9.0, -6.0)] });
         assert_eq!(g.estimated_bytes(), 4 * (4 + 4 + 16) * 2 + (4 + 4 + 16 + 8) * 2);
+    }
+
+    #[test]
+    fn node_zs_are_the_global_vres_lattice_inside_the_span() {
+        // Span [-43.95, -6.0]: nodes are the even (VRES=2) z's in it, high→low. Top = floor(-6/2)*2
+        // = -6; bottom-most = -42 (the last even ≥ -43.95). Endpoints -43.95/-6.0 themselves are NOT
+        // nodes unless they land on the lattice — this is what keeps every column phase-aligned.
+        let c = WaterColumn { surface_z: -4.0, spans: vec![(-43.95, -6.0)] };
+        let zs = c.node_zs();
+        assert_eq!(zs.first().copied(), Some(-6.0), "top node is the swim-plane lattice point");
+        assert_eq!(zs.last().copied(), Some(-42.0), "bottom node is the lowest lattice point ≥ nav_lo");
+        assert!(zs.iter().all(|z| (z / VRES).fract().abs() < 1e-4), "every node sits on the VRES lattice");
+        assert!(zs.windows(2).all(|w| (w[0] - w[1] - VRES).abs() < 1e-4), "spaced by VRES, high→low");
+        assert_eq!(c.top_node_z(), Some(-6.0));
+    }
+
+    #[test]
+    fn span_containing_admits_only_the_navigable_interior() {
+        let c = WaterColumn { surface_z: -4.0, spans: vec![(-44.0, -6.0), (-70.0, -55.0)] };
+        assert!(c.span_containing(-24.0).is_some(), "mid-water is interior");
+        assert_eq!(c.span_containing(-24.0), Some((-44.0, -6.0)));
+        assert!(c.span_containing(-4.0).is_none(), "the surface is ABOVE the swim plane — not a node");
+        assert!(c.span_containing(-50.0).is_none(), "the carved gap between spans is solid — not a node");
+        assert_eq!(c.span_containing(-60.0), Some((-70.0, -55.0)), "the lower band is its own interior");
+    }
+
+    #[test]
+    fn nearest_node_z_snaps_to_the_interior_lattice() {
+        let c = WaterColumn { surface_z: -4.0, spans: vec![(-44.0, -6.0)] };
+        // -23.4 → nearest even lattice point -24.
+        assert_eq!(c.nearest_node_z(-23.4), Some(-24.0));
+        // Asked deeper than the deepest node → clamps to the deepest node (-44 → -44 is even, in span).
+        assert_eq!(c.nearest_node_z(-100.0), Some(-44.0));
+    }
+
+    #[test]
+    fn node_count_sums_the_lattice() {
+        let mut g = WaterGrid::new([0.0, 0.0], 4.0);
+        g.insert(0, 0, WaterColumn { surface_z: -4.0, spans: vec![(-10.0, -6.0)] }); // -6,-8,-10 = 3
+        g.insert(1, 0, WaterColumn { surface_z: -4.0, spans: vec![(-8.0, -6.0)] });  // -6,-8 = 2
+        assert_eq!(g.node_count(), 5);
     }
 
     #[test]
