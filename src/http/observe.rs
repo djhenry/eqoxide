@@ -28,6 +28,7 @@ pub(super) fn router() -> Router<HttpState> {
         .route("/zone_points", get(get_zone_entrances))
         .route("/zone_exits", get(get_zone_exits))
         .route("/item_text", get(get_item_text))
+        .route("/packets", get(get_packets))
         .route("/who", get(get_who))
 }
 
@@ -37,6 +38,90 @@ pub(super) fn router() -> Router<HttpState> {
 async fn get_item_text(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let text = s.player().book_text;
     Json(serde_json::json!({ "text": text }))
+}
+
+/// Query params for GET /v1/observe/packets. All optional; every value arrives as a string and is
+/// parsed leniently so an agent can hand-write the URL.
+#[derive(serde::Deserialize, Default)]
+struct PacketsQuery {
+    /// Only records with capture index `n >= since` (page-forward cursor).
+    since: Option<u64>,
+    /// Cap the number of records returned (the most RECENT matching ones).
+    limit: Option<usize>,
+    /// `in` | `out` — filter by direction.
+    dir: Option<String>,
+    /// Filter by opcode. Accepts hex (`0x7dfc`) or decimal.
+    op: Option<String>,
+    /// `?summary=1` → return the analysis (histogram + seq-gaps) instead of the raw record list.
+    summary: Option<String>,
+    /// `?enable=1|0` → toggle capture at runtime before reading. Returned in the payload.
+    enable: Option<String>,
+    /// `?clear=1` → drop the buffered records (and reset the epoch) before reading.
+    clear: Option<String>,
+}
+
+fn truthy(v: &str) -> bool {
+    let v = v.trim().to_ascii_lowercase();
+    v == "1" || v == "true" || v == "on" || v == "yes"
+}
+
+/// Parse an opcode filter as hex (`0x…`) or decimal.
+fn parse_op(v: &str) -> Option<u16> {
+    let v = v.trim();
+    if let Some(hex) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+        u16::from_str_radix(hex, 16).ok()
+    } else {
+        v.parse::<u16>().ok()
+    }
+}
+
+/// GET /v1/observe/packets — dump the packet-telemetry ring as JSON (#525).
+///
+/// Capture is DEFAULT-OFF (enable at startup with `EQOXIDE_PKTLOG=1`, or per-request with
+/// `?enable=1`). Filters: `?since=`, `?limit=`, `?dir=in|out`, `?op=0x7dfc`. `?summary=1` returns
+/// the opcode histogram + reliable-sequence-gap analysis (the #463 diagnostic) instead of raw
+/// records. `?clear=1` resets the buffer. Controls apply BEFORE the read, so
+/// `?enable=1` on a first call just turns capture on (the buffer is still empty).
+async fn get_packets(Query(q): Query<PacketsQuery>) -> Json<serde_json::Value> {
+    use crate::eq_net::packet_telemetry as pkt;
+
+    if let Some(e) = q.enable.as_deref() {
+        pkt::set_enabled(truthy(e));
+    }
+    if q.clear.as_deref().is_some_and(truthy) {
+        pkt::clear();
+    }
+
+    let query = pkt::Query {
+        since: q.since,
+        dir: q.dir.as_deref().and_then(pkt::Dir::parse),
+        op: q.op.as_deref().and_then(parse_op),
+        limit: q.limit,
+    };
+    let records = pkt::query(&query);
+
+    if q.summary.as_deref().is_some_and(truthy) {
+        // Reliable-seq gap detection MUST run over the dir-filtered but NOT op-filtered stream.
+        // `rel_seq` is a single per-direction counter shared across ALL opcodes, so feeding an
+        // op-filtered set to the gap detector would drop the intervening reliable packets of other
+        // opcodes that legitimately consumed sequence numbers and FABRICATE "lost packets" — an
+        // agent-honesty violation, and exactly what `scripts/packet-analysis.py --dir in --op 0x5089`
+        // (its documented #463 example, which defaults to summary=1) would otherwise do during a
+        // zone-in (#532 review). The histogram/rate still honor `op` (the view the caller asked for);
+        // only the gap stream ignores it. `limit` is dropped too so gaps see the full direction.
+        let gap_records = pkt::query(&pkt::Query { op: None, limit: None, ..query.clone() });
+        let analysis = pkt::analyze_with_gaps(&records, &gap_records);
+        Json(serde_json::json!({
+            "enabled": pkt::enabled(),
+            "summary": analysis,
+        }))
+    } else {
+        Json(serde_json::json!({
+            "enabled": pkt::enabled(),
+            "count": records.len(),
+            "packets": records,
+        }))
+    }
 }
 
 async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
@@ -1167,5 +1252,52 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["count"], 1);
         assert_eq!(v["messages"][0]["kind"], "npc");
+    }
+
+    /// #532 review (agent-honesty, BLOCKING): `GET /v1/observe/packets?summary=1&op=` must NOT
+    /// fabricate reliable-seq gaps. `rel_seq` is a single per-direction counter shared across ALL
+    /// opcodes, so the gap detector must see the dir-filtered but NOT op-filtered stream — otherwise
+    /// the intervening reliable packets of other opcodes (which legitimately consumed sequence
+    /// numbers) go missing and it reports phantom "lost packets". This is the exact
+    /// `scripts/packet-analysis.py --dir in --op 0x5089` (#463) workflow, which defaults to summary=1.
+    #[tokio::test]
+    async fn packets_summary_with_op_filter_does_not_fabricate_seq_gaps() {
+        use crate::eq_net::packet_telemetry as pkt;
+        let _guard = pkt::test_capture_lock();
+        pkt::set_enabled(true);
+        pkt::clear();
+        // A CONTIGUOUS inbound reliable stream mixing two opcodes: 0x5089 @seq0, 0x6097 @seq1,
+        // 0x5089 @seq2. Nothing is lost. Filtering to op 0x5089 alone leaves seqs {0, 2}.
+        pkt::capture(pkt::Dir::In, 0x5089, &[], true, Some(0));
+        pkt::capture(pkt::Dir::In, 0x6097, &[], true, Some(1));
+        pkt::capture(pkt::Dir::In, 0x5089, &[], true, Some(2));
+        pkt::set_enabled(false);
+
+        let resp = get(empty_state(), "/packets?summary=1&dir=in&op=0x5089").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        let gaps = v["summary"]["seq_gaps"].as_array().unwrap();
+        assert!(gaps.is_empty(),
+            "op-filtered summary must NOT fabricate a gap over a contiguous stream, got: {gaps:?}");
+        // The histogram still honors the op filter (only 0x5089 shown, count 2).
+        let hist = v["summary"]["histogram"].as_array().unwrap();
+        assert_eq!(hist.len(), 1, "histogram is op-filtered");
+        assert_eq!(hist[0]["opcode"], 0x5089);
+        assert_eq!(hist[0]["count"], 2);
+        assert_eq!(v["summary"]["total"], 2, "totals describe the op-filtered view");
+
+        // Control: a REAL gap in the underlying stream is still reported through the same endpoint.
+        pkt::set_enabled(true);
+        pkt::clear();
+        pkt::capture(pkt::Dir::In, 0x5089, &[], true, Some(0));
+        pkt::capture(pkt::Dir::In, 0x5089, &[], true, Some(2)); // seq 1 genuinely missing
+        pkt::set_enabled(false);
+        let resp = get(empty_state(), "/packets?summary=1&dir=in&op=0x5089").await;
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["summary"]["seq_gaps"].as_array().unwrap().len(), 1,
+            "a real gap in the underlying stream must still be reported");
     }
 }
