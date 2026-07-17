@@ -28,6 +28,7 @@ pub(super) fn router() -> Router<HttpState> {
         .route("/zone_points", get(get_zone_entrances))
         .route("/zone_exits", get(get_zone_exits))
         .route("/item_text", get(get_item_text))
+        .route("/packets", get(get_packets))
         .route("/who", get(get_who))
 }
 
@@ -37,6 +38,81 @@ pub(super) fn router() -> Router<HttpState> {
 async fn get_item_text(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let text = s.player().book_text;
     Json(serde_json::json!({ "text": text }))
+}
+
+/// Query params for GET /v1/observe/packets. All optional; every value arrives as a string and is
+/// parsed leniently so an agent can hand-write the URL.
+#[derive(serde::Deserialize, Default)]
+struct PacketsQuery {
+    /// Only records with capture index `n >= since` (page-forward cursor).
+    since: Option<u64>,
+    /// Cap the number of records returned (the most RECENT matching ones).
+    limit: Option<usize>,
+    /// `in` | `out` — filter by direction.
+    dir: Option<String>,
+    /// Filter by opcode. Accepts hex (`0x7dfc`) or decimal.
+    op: Option<String>,
+    /// `?summary=1` → return the analysis (histogram + seq-gaps) instead of the raw record list.
+    summary: Option<String>,
+    /// `?enable=1|0` → toggle capture at runtime before reading. Returned in the payload.
+    enable: Option<String>,
+    /// `?clear=1` → drop the buffered records (and reset the epoch) before reading.
+    clear: Option<String>,
+}
+
+fn truthy(v: &str) -> bool {
+    let v = v.trim().to_ascii_lowercase();
+    v == "1" || v == "true" || v == "on" || v == "yes"
+}
+
+/// Parse an opcode filter as hex (`0x…`) or decimal.
+fn parse_op(v: &str) -> Option<u16> {
+    let v = v.trim();
+    if let Some(hex) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+        u16::from_str_radix(hex, 16).ok()
+    } else {
+        v.parse::<u16>().ok()
+    }
+}
+
+/// GET /v1/observe/packets — dump the packet-telemetry ring as JSON (#525).
+///
+/// Capture is DEFAULT-OFF (enable at startup with `EQOXIDE_PKTLOG=1`, or per-request with
+/// `?enable=1`). Filters: `?since=`, `?limit=`, `?dir=in|out`, `?op=0x7dfc`. `?summary=1` returns
+/// the opcode histogram + reliable-sequence-gap analysis (the #463 diagnostic) instead of raw
+/// records. `?clear=1` resets the buffer. Controls apply BEFORE the read, so
+/// `?enable=1` on a first call just turns capture on (the buffer is still empty).
+async fn get_packets(Query(q): Query<PacketsQuery>) -> Json<serde_json::Value> {
+    use crate::eq_net::packet_telemetry as pkt;
+
+    if let Some(e) = q.enable.as_deref() {
+        pkt::set_enabled(truthy(e));
+    }
+    if q.clear.as_deref().is_some_and(truthy) {
+        pkt::clear();
+    }
+
+    let query = pkt::Query {
+        since: q.since,
+        dir: q.dir.as_deref().and_then(pkt::Dir::parse),
+        op: q.op.as_deref().and_then(parse_op),
+        limit: q.limit,
+    };
+    let records = pkt::query(&query);
+
+    if q.summary.as_deref().is_some_and(truthy) {
+        let analysis = pkt::analyze(&records);
+        Json(serde_json::json!({
+            "enabled": pkt::enabled(),
+            "summary": analysis,
+        }))
+    } else {
+        Json(serde_json::json!({
+            "enabled": pkt::enabled(),
+            "count": records.len(),
+            "packets": records,
+        }))
+    }
 }
 
 async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {

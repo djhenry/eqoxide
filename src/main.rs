@@ -136,6 +136,14 @@ fn main() {
         || std::env::var("EQ_PROFILE").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
     eqoxide::profiling::set_enabled(profile_mode);
 
+    // Packet telemetry (#525): DEFAULT-OFF capture of the app-packet send/recv boundary into a
+    // bounded ring, dumpable via GET /v1/observe/packets. Enabled at startup only when
+    // EQOXIDE_PKTLOG is truthy; otherwise every capture hook is a single predicted-not-taken branch.
+    // Can also be toggled at runtime via GET /v1/observe/packets?enable=1|0.
+    eqoxide::eq_net::packet_telemetry::set_enabled(
+        eqoxide::eq_net::packet_telemetry::env_enabled(),
+    );
+
     // Resolve the login config. When --config is given the resolved file MUST exist — we never fall
     // back to the default config in that case. The default ~/.config/eqoxide/config.yaml is used
     // only when --config is omitted.
