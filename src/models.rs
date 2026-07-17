@@ -1710,7 +1710,7 @@ mod tests {
     }
 
     /// #519 raccoon-mask regression guard: the native RoF2 client never tints HUM hair
-    /// (or any race outside HIE/DKE/HEF + female DWF). A HUM male hair prim with a dark
+    /// (or any race outside male HIE/DKE/HEF + female DWF). A HUM male hair prim with a dark
     /// haircolor must render WHITE (untinted) — multiplying the skin-toned scalp/eye-band
     /// texels by hair_tint(0) ≈ near-black is exactly what painted the dark band across
     /// the eyes and the black scalp cap.
@@ -1729,6 +1729,12 @@ mod tests {
             Some([1.0, 1.0, 1.0, 1.0]));
         assert_eq!(head_part_tint(Some(HeadPart::Hair(Some(0))), 0, "DWF", 1),
             Some([46.0/255.0, 26.0/255.0, 12.0/255.0, 1.0]));
+        // Elves: only the MALE model is tinted in the native client. A tint on the
+        // FEMALE model would relocate #519's raccoon-mask bug onto her instead of
+        // fixing it (review follow-up on PR #524).
+        assert_eq!(head_part_tint(Some(HeadPart::Hair(Some(0))), 0, "DKE", 1),
+            Some([1.0, 1.0, 1.0, 1.0]),
+            "female DKE hair must be untinted");
         // Untinted races still return Some(white) — hair prims must not fall back to an
         // equipment tint.
         assert_eq!(head_part_tint(Some(HeadPart::Hair(Some(2))), 5, "BAR", 0),
