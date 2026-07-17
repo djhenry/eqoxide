@@ -87,7 +87,11 @@ pub struct PacketRecord {
     pub op_name: &'static str,
     /// Full app-packet size in bytes: the 2-byte opcode + body.
     pub size: usize,
-    /// Whether this went over the reliable ordered stream (vs an unreliable raw datagram).
+    /// True when a reliable transport SEQUENCE is known for this packet (delivered in order on the
+    /// reliable stream). An app packet unbundled from an `OP_Combined` is recorded `false` even if
+    /// the enclosing datagram arrived reliably, because the sub-packet carries no individual
+    /// sequence — so this field tracks "has a usable `rel_seq`", which is exactly what the gap
+    /// detector consumes, rather than a claim about the enclosing datagram's delivery mode.
     pub reliable: bool,
     /// The reliable transport sequence number, when `reliable`. See the module docs for how the
     /// receive-side value relates to fragmentation.
@@ -367,8 +371,22 @@ pub const SEQ_GAP_NOTE: &str =
      (OP_ZoneSpawns/OP_PlayerProfile) may be fragmentation, not loss. Gap analysis is most precise \
      on single-datagram streams (outbound commands, the per-spawn OP_ZoneEntry burst).";
 
-/// Build the [`Analysis`] over `records`.
+/// Build the [`Analysis`] over `records` — histogram/totals AND gaps over the same set.
 pub fn analyze(records: &[PacketRecord]) -> Analysis {
+    analyze_with_gaps(records, records)
+}
+
+/// As [`analyze`], but compute the reliable-seq gaps over a SEPARATE `gap_records` stream while the
+/// histogram/totals describe `records`.
+///
+/// This exists for the HTTP endpoint's `?op=` + `?summary=1` combination. `rel_seq` is a single
+/// per-direction counter shared across ALL opcodes, so if the records fed to [`detect_seq_gaps`]
+/// were narrowed to one opcode, the intervening reliable packets of OTHER opcodes — which
+/// legitimately consumed sequence numbers — would be absent and the detector would report
+/// FABRICATED "lost packets". That is an agent-honesty violation (a confident falsehood), so the
+/// gap stream must stay dir-filtered but NOT op-filtered (#532 review). The histogram still honors
+/// the op filter, because that is the view the caller asked to see.
+pub fn analyze_with_gaps(records: &[PacketRecord], gap_records: &[PacketRecord]) -> Analysis {
     let in_count = records.iter().filter(|r| r.dir == Dir::In).count();
     let out_count = records.len() - in_count;
     let window_ms = match (records.first(), records.last()) {
@@ -381,7 +399,7 @@ pub fn analyze(records: &[PacketRecord]) -> Analysis {
         out_count,
         window_ms,
         histogram: histogram(records),
-        seq_gaps: detect_seq_gaps(records),
+        seq_gaps: detect_seq_gaps(gap_records),
         seq_gap_note: SEQ_GAP_NOTE,
     }
 }
@@ -491,6 +509,17 @@ pub fn opcode_name(op: u16) -> &'static str {
     "OP_Unknown"
 }
 
+/// Shared serialization lock for any test that toggles capture. `ENABLED`, `RING`, and the epoch are
+/// process-global, so tests in DIFFERENT modules (this module's unit tests AND the HTTP endpoint
+/// test in `crate::http::observe`) that enable/clear/read capture must hold this SAME lock or they
+/// clobber each other under cargo's parallel test runner. `pub(crate)` so `observe`'s test can reach
+/// it. Poison-tolerant: a panicking test still releases a usable guard.
+#[cfg(test)]
+pub(crate) fn test_capture_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,12 +539,8 @@ mod tests {
         }
     }
 
-    /// Serialize enabling/disabling across the whole test module: `ENABLED`, `RING`, and the epoch
-    /// are process-global, so two `#[test]`s toggling capture concurrently would clobber each other.
-    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    // Serialize enabling/disabling across ALL tests that touch capture (see `test_capture_lock`).
+    use super::test_capture_lock as test_lock;
 
     #[test]
     fn disabled_is_a_no_op_and_does_not_capture() {
@@ -574,7 +599,7 @@ mod tests {
         let _g = test_lock();
         set_enabled(true);
         clear();
-        // Shrink the cap for the test by pushing DEFAULT_CAPACITY+extra and checking the bound holds.
+        // Overflow the ring by `extra` past DEFAULT_CAPACITY and check the bound + eviction hold.
         let extra = 5usize;
         for _ in 0..DEFAULT_CAPACITY + extra {
             capture(Dir::In, 0x0001, &[], false, None);
@@ -699,6 +724,32 @@ mod tests {
         assert_eq!(a.out_count, 1);
         assert_eq!(a.seq_gaps.len(), 1);
         assert!(!a.seq_gap_note.is_empty());
+    }
+
+    /// The #532-review honesty fix: op-filtering the histogram must NOT fabricate a seq gap. The
+    /// full in-stream is contiguous (op 0x1 @seq0, op 0x2 @seq1, op 0x1 @seq2); an agent asking for
+    /// just op 0x1 would see seqs 0 and 2 — a fake "gap of 1" IF gaps were computed on the filtered
+    /// set. `analyze_with_gaps` computes gaps over the UNFILTERED stream, so there are none.
+    #[test]
+    fn analyze_with_gaps_op_filter_does_not_fabricate_a_gap() {
+        let full = vec![
+            rec(0, Dir::In, 0x1, true, Some(0)),
+            rec(1, Dir::In, 0x2, true, Some(1)), // intervening OTHER opcode consumed seq 1
+            rec(2, Dir::In, 0x1, true, Some(2)),
+        ];
+        let op1_only: Vec<PacketRecord> = full.iter().filter(|r| r.opcode == 0x1).cloned().collect();
+        // Sanity: computing gaps on the OP-FILTERED set alone WOULD fabricate a gap (0→2).
+        assert_eq!(detect_seq_gaps(&op1_only).len(), 1, "filtered-set gap is the trap we avoid");
+        // The real path: histogram over op-filtered, gaps over the full stream → no fabricated gap.
+        let a = analyze_with_gaps(&op1_only, &full);
+        assert!(a.seq_gaps.is_empty(), "op filter must not fabricate a reliable-seq gap");
+        assert_eq!(a.total, 2, "totals still describe the op-filtered view");
+        // And a REAL gap in the full stream is still reported.
+        let full_gapped = vec![
+            rec(0, Dir::In, 0x1, true, Some(0)),
+            rec(1, Dir::In, 0x1, true, Some(2)), // real gap: seq 1 missing entirely
+        ];
+        assert_eq!(analyze_with_gaps(&full_gapped, &full_gapped).seq_gaps.len(), 1);
     }
 
     #[test]
