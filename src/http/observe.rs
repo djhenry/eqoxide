@@ -256,6 +256,9 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         "player": {
             "name":       player.name,
             "zone":       player.zone,
+            // #335/agent-honesty: true means the last zone change timed out and `zone` above is empty
+            // on purpose — we are not confidently in any zone (see PlayerState::zone_in_failed).
+            "zone_in_failed": player.zone_in_failed,
             // Guild identity (#295): empty name / id 0 = not in a guild.
             "guild":      guild_name,
             "guild_id":   guild_id,
