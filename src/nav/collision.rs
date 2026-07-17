@@ -4301,6 +4301,32 @@ mod tests {
         assert!(tot_new_ok >= tot_old_ok, "fine-tier route success must not go down");
     }
 
+    /// The drift-corpus swim-up vertical wish, mirroring the live walker VERBATIM
+    /// (`walker.rs:819-825`): when swimming AND the active waypoint sits >1u above the swimmer, drive
+    /// `SWIM_UP_RATE = 20` u/s (so the controller rises collided and hauls out at the far lip);
+    /// otherwise 0. Shared by the corpus loop and its guard test so the instrument's swim drive can
+    /// never silently diverge from production. The `target_z` passed in MUST be the same carrot the
+    /// walker steers — the FINE local-plan carrot when a fine plan is active, coarse only as fallback
+    /// (see `steer_target`, steering.rs:261-280, and the corpus call site).
+    fn drift_swim_up_wish(swim: bool, target_z: f32, pos_z: f32) -> f32 {
+        const SWIM_UP_RATE: f32 = 20.0; // walker.rs:824
+        if swim && target_z > pos_z + 1.0 { SWIM_UP_RATE } else { 0.0 }
+    }
+
+    /// GUARD (runs in `cargo test --lib`): the drift corpus's swim drive must mirror the live walker,
+    /// or its wedges aren't ground truth and the whole water-nav 3b gate is measuring a phantom
+    /// physics. Pins the vertical-wish rule; a future edit that re-diverges it trips this.
+    #[test]
+    fn drift_sim_swim_drive_mirrors_walker() {
+        // walker.rs:824-825: swim AND waypoint >1u above -> SWIM_UP_RATE (20).
+        assert_eq!(drift_swim_up_wish(true, 10.0, 0.0), 20.0, "swim + waypoint above -> swim-up rate 20");
+        // threshold is +1.0, not >0: a waypoint <=1u above yields no rise.
+        assert_eq!(drift_swim_up_wish(true, 0.5, 0.0), 0.0, "swim + waypoint <=1u above -> no rise");
+        assert_eq!(drift_swim_up_wish(true, 1.0, 0.0), 0.0, "swim + waypoint exactly +1u -> no rise (strict >)");
+        // not swimming -> never a vertical wish, even under a high waypoint (walker.rs:825 gates on swim).
+        assert_eq!(drift_swim_up_wish(false, 100.0, 0.0), 0.0, "not swimming -> no vertical wish");
+    }
+
     /// **THE FAITHFUL WALKER DRIFT SCANNER (the real per-tick recovery loop).** The static scanner
     /// above drove ONE fine plan with naive pure pursuit and no recovery — which over-counts corner
     /// wedges the real walker recovers from, and cannot measure a planner-cell fix's benefit (the real
@@ -4343,10 +4369,9 @@ mod tests {
         const MAX_REPATHS: u32 = 8;
         const DT: f32 = 1.0 / 100.0;          // ~100 Hz controller, per navigation.rs's fast-steer note
         const FRAMES_PER_TICK: u32 = 15;      // 150 ms / 10 ms
-        // Swim-up wish rate, VERBATIM from the real walker (walker.rs:824): when swimming and the
-        // active waypoint sits >1u above the swimmer, drive the vertical wish so the controller
-        // rises (collided) and hauls out at the far lip. Body-probe want_swim mirrors walker.rs:807.
-        const SWIM_UP_RATE: f32 = 20.0;
+        // The swim-up vertical wish is `drift_swim_up_wish` (module fn below), mirroring the walker
+        // (walker.rs:819-825) and pinned by `drift_sim_swim_drive_mirrors_walker` so the instrument
+        // can't silently diverge from production.
 
         // The faithful walk. Returns None on arrival, or Some((wedge_pos, aim, route_wet_near_wedge))
         // on a terminal wedge. `route_wet_near_wedge` = did the COMMITTED coarse route carry a water
@@ -4392,10 +4417,12 @@ mod tests {
                 if backoff_ticks > 0 {
                     backoff_ticks -= 1;
                     for _ in 0..FRAMES_PER_TICK {
-                        let p = ctrl.pos;
-                        let swim = col.in_water(p) || col.in_water([p[0], p[1], p[2] + 3.0]);
+                        // The real walker's downhill-backoff branch drives want_swim: false
+                        // UNCONDITIONALLY (walker.rs:731-742), even while submerged — the backoff is a
+                        // deliberate non-swim recovery. The sim MUST match, or it recovers (swim-mode
+                        // step) where the client sinks (non-swim step): a false pass.
                         ctrl.step(MoveIntent { wish_dir: backoff_dir, wish_vspeed: 0.0, jump: false,
-                            want_swim: swim, speed: RUN_SPEED, climb: 0.0, hop: false }, DT, col);
+                            want_swim: false, speed: RUN_SPEED, climb: 0.0, hop: false }, DT, col);
                     }
                     if backoff_ticks == 0 {
                         if let PlanOutcome::Route(r) = col.find_path_ex(
@@ -4472,11 +4499,20 @@ mod tests {
                         [dx / d, dy / d]
                     });
                     // The REAL walker's swim rule (walker.rs:807-834), driving the SAME controller:
-                    // body-probe want_swim, and swim-up wish toward a waypoint above the swimmer.
+                    // body-probe want_swim, and a swim-up wish toward the active waypoint when it sits
+                    // above the swimmer. CRITICAL faithfulness point (#1b): the vertical-wish target z
+                    // must come from the SAME path the walker steers — `steer_target`
+                    // (steering.rs:261-280) returns the FINE local-plan carrot when local.len() >= 2,
+                    // falling back to the coarse carrot only when there is no fine plan. `local_i` was
+                    // already advanced this frame by `fast_steer_aim` above (when a fine plan exists),
+                    // so this reads the identical carrot the horizontal `aim` used.
                     let p = ctrl.pos;
                     let swim = col.in_water(p) || col.in_water([p[0], p[1], p[2] + 3.0]);
-                    let tz = carrot_along(&coarse, path_i, from, LOOK_AHEAD).map(|c| c[2]).unwrap_or(goal[2]);
-                    let wish_vspeed = if swim && tz > p[2] + 1.0 { SWIM_UP_RATE } else { 0.0 };
+                    let coarse_c = carrot_along(&coarse, path_i, from, LOOK_AHEAD).unwrap_or(goal);
+                    let tz = if local_path.len() >= 2 {
+                        carrot_along(&local_path, local_i, from, LOOK_AHEAD).map(|c| c[2]).unwrap_or(coarse_c[2])
+                    } else { coarse_c[2] };
+                    let wish_vspeed = drift_swim_up_wish(swim, tz, p[2]);
                     ctrl.step(MoveIntent { wish_dir: aim, wish_vspeed, jump: false, want_swim: swim,
                         speed: RUN_SPEED, climb: 0.0, hop: stuck_ticks >= NAV_HOP_TICKS }, DT, col);
                     if (ctrl.pos[0] - goal[0]).hypot(ctrl.pos[1] - goal[1]) < 3.0 { return None; }
@@ -4570,15 +4606,19 @@ mod tests {
                 let no_fall_jump = cr.windows(2).all(|w| {
                     let dz = w[1][2] - w[0][2];
                     let seg = (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]);
-                    // Increment 1: the sim now DRIVES swim legs (body-probe want_swim + swim-up
-                    // vspeed), so in water mode a water-touching segment is no longer an undrivable
-                    // transition — exempt it from the dry fall/jump filter so water crossings are
-                    // actually WALKED, not discarded. A purely-dry big-drop/jump segment stays out.
+                    // Increment 1: the sim now DRIVES surface swim legs (body-probe want_swim +
+                    // swim-up vspeed), so in water mode a water-touching segment is exempt from the
+                    // DRY fall bound — entering water legitimately drops up to the step-in height
+                    // (~STEP_H=20) to the surface, which the dry `dz > -4` would wrongly filter.
+                    // BUT the exemption is NOT unbounded (Hunt 3): the sim never jumps (jump:false at
+                    // both call sites) and can't dive against buoyancy, so a wet segment that is ALSO
+                    // a deep dive or a long jump-span is still undrivable and stays filtered.
                     let wet_seg = include_water && (
                         col.in_water(w[0]) || col.in_water(w[1])
                         || col.in_water([w[0][0], w[0][1], w[0][2] + 3.0])
                         || col.in_water([w[1][0], w[1][1], w[1][2] + 3.0]));
-                    wet_seg || (dz > -4.0 && seg < 12.0)
+                    let drop_cap = if wet_seg { -20.0 } else { -4.0 }; // water step-in may drop to ~STEP_H
+                    dz > drop_cap && seg < 12.0
                 });
                 let no_water = !cr.iter().any(|w| col.in_water(*w) || col.in_water([w[0], w[1], w[2] + 3.0]));
                 if !no_fall_jump { continue; } // the sim cannot drive dry fall/jump edges in EITHER mode
