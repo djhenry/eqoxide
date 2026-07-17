@@ -1,7 +1,41 @@
 //! `/v1/combat/*` — targeting, auto-attack, consider, and spell scribe/memorize/cast.
 
-use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+use axum::{
+    body::Body,
+    extract::State,
+    http::{header, StatusCode},
+    response::Response,
+    routing::post,
+    Json, Router,
+};
+use tokio::sync::oneshot;
+use std::time::Duration;
+use crate::command_state::{CastEnd, CommandResult};
 use super::*;
+
+/// How long POST /v1/combat/cast AWAITS the cast's true outcome before answering `202` "unknown".
+/// This is the SOLE bound on the pure-silence case (the server accepts the cast but never sends a
+/// terminal, so `gs.last_cast` never transitions) — mirroring merchant/buy, whose insufficient-funds
+/// silence likewise resolves only via the HTTP timeout. Sized to comfortably exceed the longest RoF2
+/// cast (~10s for a Complete Heal / gate / port) plus travel and the ~400ms unexplained-end grace, so
+/// a NORMAL long cast always resolves via its outcome transition well within the window; only genuine
+/// silence rides it out. A resolved/refused/unexplained outcome fires far sooner via `fulfill_cast`.
+const CAST_HTTP_TIMEOUT_SECS: u64 = 12;
+
+/// A `text/plain` response (mirrors `http::merchant`'s local helper — combat's cast handler now
+/// returns a `Response`, not `(StatusCode, String)`).
+fn text(status: StatusCode, body: impl Into<String>) -> Response {
+    Response::builder().status(status)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from(body.into())).unwrap()
+}
+
+/// A `application/json` response.
+fn json(status: StatusCode, value: serde_json::Value) -> Response {
+    Response::builder().status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(value.to_string())).unwrap()
+}
 
 pub(super) fn router() -> Router<HttpState> {
     Router::new()
@@ -119,45 +153,93 @@ struct CastBody { gem: Option<u8>, spell_id: Option<u32>, target_id: Option<u32>
 /// POST /v1/combat/cast {"gem":0-8} | {"spell_id":N,"target_id":M?} | {"item_slot":S,"target_id":M?}
 /// `item_slot` activates an inventory item's click ("clicky") effect — a teleport ring / port
 /// potion, etc. — at the given RoF2 wire slot (from GET /v1/observe/inventory). (eqoxide#193)
-async fn post_cast(State(s): State<HttpState>, OptionalJson(body): OptionalJson<CastBody>) -> (StatusCode, String) {
+///
+/// A3 Migration 3 (#448) — Command-with-result: this no longer returns a premature "queued" 200. It
+/// AWAITS the cast's real outcome (up to `CAST_HTTP_TIMEOUT_SECS`) and reports it honestly:
+///   • 200 — the server RESOLVED the cast. Body `{status, spell_id, spell, message}` where `status`
+///     is `"completed"` (the spell LANDED), `"fizzled"`, or `"interrupted"`. A fizzle/interrupt is
+///     STILL a 200 (the cast has a definite outcome) — the caller MUST read `status`, never assume a
+///     200 means the spell took hold. That is the honesty invariant: a non-completed cast can never
+///     falsely present as completed.
+///   • 409 — the cast was REFUSED and definitively did not happen: a pre-send rejection (empty gem /
+///     no clicky / another cast already in flight), or a real server refusal (no mana / no target /
+///     recast timer). Body `{status:"refused", reason}`.
+///   • 202 — the outcome is UNKNOWN: the server ended the cast without explaining it, or never sent a
+///     terminal within the timeout, or a zone change / disconnect intervened. Body says so; MUST NOT
+///     be read as success (see `crate::command_state::result`).
+async fn post_cast(State(s): State<HttpState>, OptionalJson(body): OptionalJson<CastBody>) -> Response {
     let b = body.unwrap_or_default();
-    // Item clicky cast: validate the slot holds a clickable item (for a clear error), then queue it.
-    if let Some(slot) = b.item_slot {
+    // Resolve the CastRequest with the same pre-send validation as before (a clear 4xx before we ever
+    // park/await). Item clicky cast: validate the slot holds a clickable item.
+    let req = if let Some(slot) = b.item_slot {
         let clicky = s.inventory_slots.inventory.lock().unwrap().iter()
             .find(|i| i.slot == slot as i32)
             .map(|i| (i.name.clone(), i.click_spell_id));
         match clicky {
-            None => return (StatusCode::BAD_REQUEST, format!("no item at slot {slot}")),
-            Some((name, 0)) => return (StatusCode::BAD_REQUEST, format!("'{name}' (slot {slot}) has no clicky effect")),
-            Some((name, spell)) => {
-                s.command.request_cast(CastRequest { gem: 0, target_id: b.target_id, item_slot: Some(slot) });
-                return (StatusCode::OK, format!("item cast queued: '{name}' (slot {slot}, spell {spell})"));
-            }
-        }
-    }
-    let mem = s.player().mem_spells;
-    let gem = if let Some(g) = b.gem {
-        g
-    } else if let Some(sid) = b.spell_id {
-        match mem.iter().position(|&x| x == sid) {
-            Some(i) => i as u8,
-            None => return (StatusCode::BAD_REQUEST, format!("spell {sid} is not memorized")),
+            None => return text(StatusCode::BAD_REQUEST, format!("no item at slot {slot}")),
+            Some((name, 0)) => return text(StatusCode::BAD_REQUEST, format!("'{name}' (slot {slot}) has no clicky effect")),
+            Some((_name, _spell)) => CastRequest { gem: 0, target_id: b.target_id, item_slot: Some(slot) },
         }
     } else {
-        return (StatusCode::BAD_REQUEST, "provide {\"gem\":0-8} or {\"spell_id\":N}".into());
-    };
-    if gem > 8 { return (StatusCode::BAD_REQUEST, "gem must be 0-8".into()); }
-    // An EMPTY gem is not a cast. The `spell_id` path above already refuses an un-memorized spell,
-    // but an explicit `gem` used to skip every check: this returned 200 "cast queued" and the nav
-    // drain then dropped it with a `tracing::info!` the agent cannot read — 200-then-absolute-
-    // silence, indistinguishable from a cast that is simply still in flight. 409 (like
-    // /v1/interact/read does for an unreadable slot) says so out loud. (#348)
-    if crate::game_state::gem_is_empty(mem[gem as usize]) {
-        return (StatusCode::CONFLICT,
+        let mem = s.player().mem_spells;
+        let gem = if let Some(g) = b.gem {
+            g
+        } else if let Some(sid) = b.spell_id {
+            match mem.iter().position(|&x| x == sid) {
+                Some(i) => i as u8,
+                None => return text(StatusCode::BAD_REQUEST, format!("spell {sid} is not memorized")),
+            }
+        } else {
+            return text(StatusCode::BAD_REQUEST, "provide {\"gem\":0-8} or {\"spell_id\":N}");
+        };
+        if gem > 8 { return text(StatusCode::BAD_REQUEST, "gem must be 0-8"); }
+        // An EMPTY gem is not a cast — refuse it loudly BEFORE parking, so we never await a cast that
+        // cannot happen. 409 (like /v1/interact/read for an unreadable slot). (#348)
+        if crate::game_state::gem_is_empty(mem[gem as usize]) {
+            return text(StatusCode::CONFLICT,
                 format!("spell gem {gem} is empty — memorize a spell into it first"));
+        }
+        CastRequest { gem, target_id: b.target_id, item_slot: None }
+    };
+
+    // Park the cast with a result channel and await the TRUE outcome (park → fulfil → timeout).
+    let (tx, rx) = oneshot::channel::<CommandResult<CastEnd>>();
+    s.command.request_cast_await(req, tx);
+    tracing::info!("cast: awaited cast queued (gem={} item_slot={:?})", req.gem, req.item_slot);
+
+    match tokio::time::timeout(Duration::from_secs(CAST_HTTP_TIMEOUT_SECS), rx).await {
+        // A RESOLVED cast — the server gave a definite verdict. `outcome` carries whether the spell
+        // landed; a fizzle/interrupt is a 200 with a NON-"completed" status, never a false success.
+        Ok(Ok(CommandResult::Resolved(CastEnd { outcome, spell_id, spell_name, text: line }))) => json(
+            StatusCode::OK,
+            serde_json::json!({
+                "status": outcome,
+                "spell_id": spell_id,
+                "spell": spell_name,
+                "message": line,
+            }),
+        ),
+        // A pre-send rejection (empty gem / no clicky / another cast in flight) or a real server
+        // refusal (no mana / no target / recast) — the cast definitively did not happen.
+        Ok(Ok(CommandResult::Refused(reason))) => json(
+            StatusCode::CONFLICT,
+            serde_json::json!({ "status": "refused", "reason": reason }),
+        ),
+        // Unconfirmed, channel closed (Sender dropped — disconnect / zone change), or elapsed: the
+        // outcome is genuinely UNKNOWN. The server-ended-but-unexplained case (a buff that won't stack)
+        // and pure silence both land here. MUST NOT read as success — 202 with an explicit body.
+        _ => json(
+            StatusCode::ACCEPTED,
+            serde_json::json!({
+                "status": "unconfirmed",
+                "message": "cast sent, but the outcome is UNKNOWN — the server either ended the cast \
+                            without explaining it (e.g. a beneficial spell that would not stack) or \
+                            sent no confirmation within the timeout, or a zone change intervened. \
+                            Re-check GET /v1/observe/debug (last_cast) and your target's state before \
+                            assuming the spell took effect.",
+            }),
+        ),
     }
-    s.command.request_cast(CastRequest { gem, target_id: b.target_id, item_slot: None });
-    (StatusCode::OK, format!("cast queued (gem {gem})"))
 }
 
 #[derive(serde::Deserialize)]
@@ -345,21 +427,97 @@ mod tests {
         assert!(command.take_cast().is_none(), "an empty gem must not be queued as a cast");
     }
 
-    #[tokio::test]
-    async fn cast_memorized_gem_still_works() {
+    // ── A3 Migration 3 (#448): POST /v1/combat/cast reports the TRUE outcome, not a queued 200 ──
+
+    use crate::command_state::{CastEnd, CommandResult};
+
+    /// Drive a `/cast` request, wait for the handler to park its awaited Sender, then deliver
+    /// `outcome` on it and return the finished HTTP response. Mirrors the merchant/buy test harness.
+    async fn cast_and_deliver(gem: u8, outcome: CommandResult<CastEnd>) -> axum::response::Response {
         let state = empty_state();
         set_gs(&state, |gs| {
             gs.mem_spells = [crate::game_state::EMPTY_GEM; 9];
-            gs.mem_spells[2] = 202;
+            gs.mem_spells[gem as usize] = 202;
         });
         let command = state.command.clone();
         let app = router().with_state(state);
-        let req = Request::post("/cast")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"gem":2}"#)).unwrap();
-        let resp = app.oneshot(req).await.unwrap();
+        let body = format!("{{\"gem\":{gem}}}");
+        let task = tokio::spawn(async move {
+            app.oneshot(Request::post("/cast").header("content-type", "application/json")
+                .body(Body::from(body)).unwrap()).await.unwrap()
+        });
+        // The awaited cast must NOT leak into the fire-and-forget slot; it parks `cast_await`.
+        let (req, tx) = loop {
+            assert!(command.take_cast().is_none(), "an awaited cast must not queue the UI fire-and-forget slot");
+            if let Some(p) = command.take_cast_await() { break p; }
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(req.gem, gem);
+        tx.send(outcome).unwrap();
+        task.await.unwrap()
+    }
+
+    /// SUCCESS: a cast the server RESOLVED as completed → 200 with `status:"completed"` and the spell.
+    #[tokio::test]
+    async fn cast_completed_is_200_with_completed_status() {
+        let resp = cast_and_deliver(2, CommandResult::Resolved(CastEnd {
+            outcome: "completed".into(), spell_id: 202, spell_name: "Minor Healing".into(),
+            text: "You have finished casting Minor Healing.".into(),
+        })).await;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(command.take_cast().map(|c| c.gem), Some(2));
+        let text = body_text(resp).await;
+        assert!(text.contains("\"status\":\"completed\""), "body: {text}");
+        assert!(text.contains("\"spell_id\":202"), "body: {text}");
+    }
+
+    /// THE INVARIANT: a fizzle is a 200 (the cast RESOLVED — we know what happened) but its `status`
+    /// is "fizzled", NEVER "completed". A caller that reads `status` can never be told the spell
+    /// landed when it fizzled — a non-completed cast cannot falsely present as completed.
+    #[tokio::test]
+    async fn cast_fizzle_is_200_but_status_is_fizzled_not_completed() {
+        let resp = cast_and_deliver(2, CommandResult::Resolved(CastEnd {
+            outcome: "fizzled".into(), spell_id: 202, spell_name: "Minor Healing".into(),
+            text: "Your spell fizzles!".into(),
+        })).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = body_text(resp).await;
+        assert!(text.contains("\"status\":\"fizzled\""), "a fizzle must report fizzled: {text}");
+        assert!(!text.contains("\"status\":\"completed\""),
+            "a fizzle must NEVER present as completed — the whole honesty invariant: {text}");
+    }
+
+    /// An interrupt likewise: 200, but `status:"interrupted"`, never "completed".
+    #[tokio::test]
+    async fn cast_interrupt_is_200_but_status_is_interrupted_not_completed() {
+        let resp = cast_and_deliver(2, CommandResult::Resolved(CastEnd {
+            outcome: "interrupted".into(), spell_id: 202, spell_name: "Minor Healing".into(),
+            text: "Your spell is interrupted.".into(),
+        })).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = body_text(resp).await;
+        assert!(text.contains("\"status\":\"interrupted\""), "body: {text}");
+        assert!(!text.contains("\"status\":\"completed\""), "an interrupt must not present as completed: {text}");
+    }
+
+    /// A real refusal (no mana / no target / another cast in flight) → 409, never a success.
+    #[tokio::test]
+    async fn cast_refused_is_409() {
+        let resp = cast_and_deliver(2, CommandResult::Refused("Insufficient Mana to cast this spell!".into())).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let text = body_text(resp).await;
+        assert!(text.contains("\"status\":\"refused\""), "body: {text}");
+        assert!(!text.contains("completed"), "a refusal must never read as a completed cast: {text}");
+    }
+
+    /// SILENCE / unexplained end → 202 "unconfirmed". MUST NOT be a 200. This is the honesty invariant
+    /// on the unknown side: a cast whose outcome we don't know can never render as success.
+    #[tokio::test]
+    async fn cast_unconfirmed_is_202_never_200() {
+        let resp = cast_and_deliver(2, CommandResult::Unconfirmed).await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let text = body_text(resp).await;
+        assert!(text.contains("\"status\":\"unconfirmed\""), "body: {text}");
+        assert!(!text.contains("completed"), "an unknown outcome must never read as completed: {text}");
     }
 
     #[tokio::test]

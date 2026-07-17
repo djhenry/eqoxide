@@ -115,6 +115,95 @@ struct PendingBuy {
     sent_at:     Instant,
 }
 
+/// A self-cast sent via the honest awaited path (A3 Migration 3, #448), parked here until the cast
+/// machinery computes its outcome into `gs.last_cast`. Casting is naturally serial (one cast bar) so
+/// this is a SINGLETON — a second awaited cast while one is parked is `Refused` (the singleton
+/// discipline; see `drain_cast`). `sent_at` is the correlation key: the cast's terminal outcome is
+/// the one whose `CastOutcome::at` is strictly AFTER we parked (a stale prior outcome carries an
+/// earlier `at`, and `begin_cast` clears `last_cast` to `None` on our OP_BeginCast echo), so
+/// `fulfill_cast` fires on the `last_cast` TRANSITION rather than on any single opcode — the 3-opcode
+/// cast-end path is de-duped in `GameState`, so keying one opcode would double-fire or miss. The
+/// `Sender` lives ONLY here, never in `GameState` (it is `Clone`d into the ArcSwap snapshot every
+/// tick and a `oneshot::Sender` is not `Clone`). See `crate::command_state::result` for the flow.
+struct PendingCast {
+    tx:      tokio::sync::oneshot::Sender<crate::command_state::CommandResult<crate::command_state::CastEnd>>,
+    sent_at: Instant,
+}
+
+/// The result of emitting a cast on the wire — did the cast actually START, or was it refused before
+/// any packet went out? Shared by the fire-and-forget UI cast path (which ignores it — the outcome is
+/// already logged via `finish_cast`) and the honest awaited path (#448), which maps `NeverStarted`
+/// straight to a `Refused` (the cast DEFINITIVELY did not happen) and parks a `PendingCast` only on
+/// `Started`.
+enum CastSend {
+    /// OP_CastSpell was emitted — the cast is genuinely in flight; await its `last_cast` transition.
+    Started,
+    /// Refused before any packet (empty gem, or a stale/non-clicky item slot). `finish_cast(0,
+    /// "cast_failed", …)` was already recorded; the `String` is the human reason for the 409.
+    NeverStarted(String),
+}
+
+/// Emit the OP_CastSpell for a [`CastRequest`] and report whether the cast STARTED (see [`CastSend`]).
+/// Shared by the fire-and-forget UI cast path and the honest awaited path (#448) so both emit
+/// byte-identical wire traffic and identical `finish_cast` bookkeeping — the awaited path adds ONLY
+/// the parked `Sender`, no behavior change to the wire. Target priority is unchanged: explicit API
+/// target > current target > self, with ST_SELF spells always self-targeted and un-aimed beneficial
+/// spells self-cast (eqoxide#95). A never-started refusal records `finish_cast(cast_failed)` here —
+/// the same honest signal the fire-and-forget path already relied on (#348).
+fn send_cast(stream: &mut EqStream, gs: &mut GameState, req: crate::ipc::CastRequest) -> CastSend {
+    if let Some(item_slot) = req.item_slot {
+        // Item "clicky" cast (teleport ring / port potion, etc.). Resolve the click spell from the
+        // item currently at that wire slot and refuse if it isn't a clicky, so a stale slot can't fire
+        // an unrelated cast. Target: explicit > current > self. (eqoxide#193)
+        let click = gs.inventory.iter().find(|i| i.slot == item_slot as i32)
+            .map(|i| i.click_spell_id).unwrap_or(0);
+        if click == 0 {
+            // POST /v1/combat/cast validated the slot, but the item can move/vanish between the
+            // handler and this drain. Dropping it with only a tracing line meant the agent saw 200 and
+            // then nothing at all — report the failure where the agent can read it (#348).
+            let text = format!("Cannot cast: no clickable item in slot {item_slot}.");
+            gs.finish_cast(0, "cast_failed", &text);
+            tracing::info!("EQ: item cast slot={} ignored — no clicky item at that slot", item_slot);
+            return CastSend::NeverStarted(text);
+        }
+        let target = req.target_id.filter(|&t| t != 0)
+            .or(gs.target_id.filter(|&t| t != 0))
+            .unwrap_or(gs.player_id);
+        stream.send_app_packet(OP_CAST_SPELL, &build_item_cast_packet(item_slot, click, target));
+        tracing::info!("EQ: item cast slot={} spell={} target={}", item_slot, click, target);
+        return CastSend::Started;
+    }
+    let spell_id = gs.mem_spells.get(req.gem as usize).copied()
+        .unwrap_or(crate::game_state::EMPTY_GEM);
+    if crate::game_state::gem_is_empty(spell_id) {
+        // POST /v1/combat/cast now 409s on an empty gem, but the gem can be un-memorized between the
+        // handler and this drain. This arm used to be a bare `tracing::info!` — the agent got 200 and
+        // then ABSOLUTE SILENCE: no packet, no message, no event, no state change, indistinguishable
+        // from a cast still in flight. (#348)
+        let text = format!("Cannot cast: spell gem {} is empty.", req.gem);
+        gs.finish_cast(0, "cast_failed", &text);
+        tracing::info!("EQ: cast gem={} ignored — empty gem", req.gem);
+        return CastSend::NeverStarted(text);
+    }
+    let explicit = req.target_id.filter(|&t| t != 0);
+    let current  = gs.target_id.filter(|&t| t != 0);
+    let mut target = explicit.or(current).unwrap_or(gs.player_id);
+    if let Some(db) = crate::spells::global() {
+        if db.is_self_only(spell_id) {
+            target = gs.player_id; // ST_SELF: always the caster
+        } else if explicit.is_none() && db.is_beneficial(spell_id) {
+            // Keep an explicitly-chosen friendly (PC) target for group heals; otherwise (no target,
+            // cleared, or a hostile NPC) land the buff/heal on ourselves.
+            let friendly = target == gs.player_id
+                || gs.entities.get(&target).map_or(false, |e| !e.is_npc);
+            if !friendly { target = gs.player_id; }
+        }
+    }
+    stream.send_app_packet(OP_CAST_SPELL, &build_cast_packet(req.gem as u32, spell_id, target));
+    tracing::info!("EQ: cast gem={} spell={} target={}", req.gem, spell_id, target);
+    CastSend::Started
+}
+
 /// Emit the OP_ShopRequest (open) + OP_ShopPlayerBuy (buy `slot`, qty 1) pair and mark the buy
 /// in flight (`begin_shop_open_for` + `begin_shop_buy`). Shared by the fire-and-forget UI buy path
 /// and the honest awaited buy path (#448) so both emit byte-identical wire traffic and identical
@@ -191,6 +280,10 @@ pub struct ActionLoop {
     /// resolving packet (OP_ShopPlayerBuy echo → `Resolved`, OP_ShopEndConfirm → `Refused`), or
     /// reaped as `Unconfirmed` on a zone change. Sibling of `pending_who`. See `PendingBuy`.
     pending_buy:      Option<PendingBuy>,
+    /// A self-cast sent via the honest awaited path (A3 Migration 3, #448), parked between send and
+    /// the `gs.last_cast` outcome transition (→ `Resolved(CastEnd)` / `Refused` / `Unconfirmed`), or
+    /// reaped as `Unconfirmed` on a zone change. Singleton — one self-cast at a time. See `PendingCast`.
+    pending_cast:     Option<PendingCast>,
     /// `/v1/inventory/*` slots (#M4 — see `ipc::InventorySlots`).
     inventory_slots:  crate::ipc::InventorySlots,
     /// In-progress quest turn-in (POST /give), or None when idle. Drives the trade-window
@@ -271,6 +364,7 @@ impl ActionLoop {
             expecting_friends: false,
             merchant_slots,
             pending_buy: None,
+            pending_cast: None,
             inventory_slots,
             give_state: None,
             interact,
@@ -451,6 +545,64 @@ impl ActionLoop {
         }
     }
 
+    /// Resolve a parked awaited-cast on its `gs.last_cast` TRANSITION (A3 Migration 3, #448). Called
+    /// from the gameplay loop AFTER `apply_packet` (and after `resolve_pending_cast_end`), so `gs`
+    /// already holds the outcome the cast machinery computed. Deliberately NOT keyed on a single
+    /// opcode: a cast ends via one of THREE opcodes (OP_MemorizeSpell scribing=3 / OP_ManaChange /
+    /// OP_InterruptCast) that are DE-DUPED against each other in `GameState`, so keying one would
+    /// double-fire or miss. Instead we watch `last_cast`: the terminal for THIS cast is the outcome
+    /// whose `at` is strictly after we parked (`begin_cast` cleared it to `None` on our OP_BeginCast,
+    /// and a stale prior outcome carries an earlier `at`). The kind → honest result mapping:
+    ///   • `cast_completed`  → `Resolved(CastEnd{outcome:"completed"})` (the spell LANDED)
+    ///   • `cast_fizzled`    → `Resolved(CastEnd{outcome:"fizzled"})`   (resolved, did NOT land)
+    ///   • `cast_interrupted`→ `Resolved(CastEnd{outcome:"interrupted"})` (resolved, did NOT land)
+    ///   • `cast_failed`     → `Refused` (a real server refusal — no mana / no target / recast — that
+    ///                         reached us AFTER we parked; the cast definitively did not happen → 409)
+    ///   • `cast_ended_unexplained` (or anything else) → `Unconfirmed` (the server ended the cast and
+    ///                         never said why — genuinely UNKNOWN, never rendered as success → 202)
+    /// The send is non-blocking and never `.await`s; a dropped receiver (HTTP already timed out) is
+    /// ignored. No-op when nothing is parked or no fresh outcome is present. Fizzle/interrupt are 200
+    /// (the cast RESOLVED — we know what happened), but `outcome` carries the truth so a 200 can never
+    /// be misread as "the spell took hold". See `crate::command_state::result`.
+    pub fn fulfill_cast(&mut self, gs: &GameState) {
+        let Some(pc) = self.pending_cast.as_ref() else { return };
+        // Correlate BEFORE taking: only a FRESH outcome (strictly after we parked) is this cast's.
+        let Some(outcome) = gs.last_cast.as_ref().filter(|o| o.at > pc.sent_at) else { return };
+        let result = match outcome.kind {
+            "cast_completed" | "cast_fizzled" | "cast_interrupted" => {
+                let verdict = match outcome.kind {
+                    "cast_completed"   => "completed",
+                    "cast_fizzled"     => "fizzled",
+                    _                  => "interrupted",
+                };
+                crate::command_state::CommandResult::Resolved(crate::command_state::CastEnd {
+                    outcome:    verdict.to_string(),
+                    spell_id:   outcome.spell_id,
+                    spell_name: crate::spells::name_of(outcome.spell_id),
+                    text:       outcome.text.clone(),
+                })
+            }
+            // A real server refusal that reached us after we parked — the cast never happened → 409.
+            "cast_failed" => crate::command_state::CommandResult::Refused(outcome.text.clone()),
+            // The server ended the cast without explaining it (buff-won't-stack, or an inferred end) —
+            // genuinely unknown whether the spell had any effect → 202, never a claimed success.
+            _ => crate::command_state::CommandResult::Unconfirmed,
+        };
+        let pc = self.pending_cast.take().unwrap();
+        let _ = pc.tx.send(result);
+    }
+
+    /// Reap a parked awaited-cast as `Unconfirmed` (A3 Migration 3, #448) — fired on a zone change so
+    /// a crossing mid-cast can't strand the `Sender`. `begin_zone_in` already drops all in-flight cast
+    /// tracking (the cast can't survive the crossing), so no `last_cast` transition will ever come for
+    /// it now; reaping yields the honest "outcome UNKNOWN" 202 promptly. Mirrors `reap_pending_buy`.
+    /// (Disconnect is covered for free: dropping `ActionLoop` drops the `Sender` → closed channel → 202.)
+    pub fn reap_pending_cast(&mut self) {
+        if let Some(pc) = self.pending_cast.take() {
+            let _ = pc.tx.send(crate::command_state::CommandResult::Unconfirmed);
+        }
+    }
+
     /// Publish the open-merchant session from `gs` into the shared slot (GET /trade/list + the HUD
     /// merchant window).
     pub fn sync_merchant(&self, gs: &GameState) {
@@ -522,6 +674,10 @@ impl ActionLoop {
             // the NPC is in the OLD zone, no OP_FinishTrade can arrive, and a stray finish in the NEW
             // zone must not mis-resolve it. Reap it to a prompt Unconfirmed/202.
             self.reap_pending_give();
+            // #448 (Migration 3): same for an awaited cast still parked across the crossing — the cast
+            // cannot survive a zone change (`begin_zone_in` drops all cast tracking), so no `last_cast`
+            // transition will ever resolve it now. Reap it to a prompt Unconfirmed/202.
+            self.reap_pending_cast();
 
             let mut shared = self.world.zone_points.lock().unwrap();
             // Start fresh with server entries.
@@ -1181,63 +1337,50 @@ impl ActionLoop {
     }
 
     fn drain_cast(&mut self, stream: &mut EqStream, gs: &mut GameState) {
-        // Cast a memorized spell gem. Target priority: an explicit API target > the current target
-        // > self. `Some(0)` is not a real spawn (the "clear target" sentinel), so collapse it to
-        // "none" here or the self-fallback never fires. For BENEFICIAL spells (heals/buffs) that
-        // aren't aimed at a friendly target, cast on the caster instead of a hostile/stale mob —
-        // matching the real RoF2 client, which self-targets heals/buffs. (eqoxide#95)
-        let cast_req = self.command.take_cast();
-        if let Some(req) = cast_req {
-          if let Some(item_slot) = req.item_slot {
-            // Item "clicky" cast (teleport ring / port potion, etc.). Resolve the click spell from
-            // the item currently at that wire slot and refuse if it isn't a clicky, so a stale slot
-            // can't fire an unrelated cast. Target: explicit > current > self. (eqoxide#193)
-            let click = gs.inventory.iter().find(|i| i.slot == item_slot as i32)
-                .map(|i| i.click_spell_id).unwrap_or(0);
-            if click == 0 {
-                // POST /v1/combat/cast validated the slot, but the item can move/vanish between the
-                // handler and this drain. Dropping it with only a tracing line meant the agent saw
-                // 200 and then nothing at all — report the failure where the agent can read it (#348).
-                let text = format!("Cannot cast: no clickable item in slot {item_slot}.");
-                gs.finish_cast(0, "cast_failed", &text);
-                tracing::info!("EQ: item cast slot={} ignored — no clicky item at that slot", item_slot);
+        // Cast a memorized spell gem (FIRE-AND-FORGET UI path). Target priority, ST_SELF/beneficial
+        // self-targeting, empty-gem / stale-clicky refusal, and the wire packet all live in
+        // `send_cast` now (shared with the awaited path below so both emit byte-identical traffic).
+        // The fire-and-forget path ignores the returned `CastSend`: a never-started refusal already
+        // records `finish_cast(cast_failed)` inside `send_cast`, exactly as before (#348).
+        if let Some(req) = self.command.take_cast() {
+            let _ = send_cast(stream, gs, req);
+        }
+
+        // Cast (AWAITED, honest Command-with-result path — POST /v1/combat/cast, #448): emit the SAME
+        // wire traffic as the fire-and-forget path above via `send_cast`, then act on whether the cast
+        // STARTED. A never-started refusal (empty gem / stale clicky) is `Refused` IMMEDIATELY — the
+        // cast definitively did not happen, so 409 is honest, not a 202 "unknown". A started cast PARKS
+        // the HTTP-side `oneshot::Sender` in `pending_cast`; the resolving outcome is fired later by
+        // `fulfill_cast` when `gs.last_cast` transitions (completed → Resolved(completed), fizzle/
+        // interrupt → Resolved(that outcome), a server refusal after parking → Refused, an unexplained
+        // end → Unconfirmed), or a zone change / HTTP timeout → Unconfirmed.
+        //
+        // SINGLETON-in-flight (reject-while-parked): casting is naturally serial (one cast bar), and a
+        // cast's terminal outcome carries NO per-request token, so two awaited casts in flight at once
+        // would be indistinguishable at the `last_cast` transition — the first's outcome could resolve
+        // the second caller's Sender. So when a cast is already parked we do NOT supersede it and do
+        // NOT send any wire packet: we immediately answer the NEW request `Refused`. Because no packet
+        // went out, the cast DEFINITIVELY did not happen — 409, not a 202 "unknown". See
+        // `crate::command_state::result` for the discipline shared with buy/give. (Known residual: a UI
+        // fire-and-forget cast concurrent with a parked awaited cast could still have its outcome
+        // resolve the awaited cast — but the server serialises the cast bar, so a second cast can't
+        // even start until the first frees it; very low likelihood, and it cannot fabricate success.)
+        if let Some((req, tx)) = self.command.take_cast_await() {
+            if self.pending_cast.is_some() {
+                let _ = tx.send(crate::command_state::CommandResult::Refused(
+                    "a cast is already in flight; retry after it resolves".into()));
+                tracing::info!("EQ: awaited cast REJECTED — one already in flight");
             } else {
-                let target = req.target_id.filter(|&t| t != 0)
-                    .or(gs.target_id.filter(|&t| t != 0))
-                    .unwrap_or(gs.player_id);
-                stream.send_app_packet(OP_CAST_SPELL, &build_item_cast_packet(item_slot, click, target));
-                tracing::info!("EQ: item cast slot={} spell={} target={}", item_slot, click, target);
-            }
-          } else {
-            let spell_id = gs.mem_spells.get(req.gem as usize).copied()
-                .unwrap_or(crate::game_state::EMPTY_GEM);
-            if !crate::game_state::gem_is_empty(spell_id) {
-                let explicit = req.target_id.filter(|&t| t != 0);
-                let current  = gs.target_id.filter(|&t| t != 0);
-                let mut target = explicit.or(current).unwrap_or(gs.player_id);
-                if let Some(db) = crate::spells::global() {
-                    if db.is_self_only(spell_id) {
-                        target = gs.player_id; // ST_SELF: always the caster
-                    } else if explicit.is_none() && db.is_beneficial(spell_id) {
-                        // Keep an explicitly-chosen friendly (PC) target for group heals; otherwise
-                        // (no target, cleared, or a hostile NPC) land the buff/heal on ourselves.
-                        let friendly = target == gs.player_id
-                            || gs.entities.get(&target).map_or(false, |e| !e.is_npc);
-                        if !friendly { target = gs.player_id; }
+                match send_cast(stream, gs, req) {
+                    CastSend::Started => {
+                        self.pending_cast = Some(PendingCast { tx, sent_at: Instant::now() });
+                        tracing::info!("EQ: awaited cast parked — awaiting outcome");
+                    }
+                    CastSend::NeverStarted(reason) => {
+                        let _ = tx.send(crate::command_state::CommandResult::Refused(reason));
                     }
                 }
-                stream.send_app_packet(OP_CAST_SPELL, &build_cast_packet(req.gem as u32, spell_id, target));
-                tracing::info!("EQ: cast gem={} spell={} target={}", req.gem, spell_id, target);
-            } else {
-                // POST /v1/combat/cast now 409s on an empty gem, but the gem can be un-memorized
-                // between the handler and this drain. This arm used to be a bare `tracing::info!` —
-                // the agent got 200 and then ABSOLUTE SILENCE: no packet, no message, no event, no
-                // state change, indistinguishable from a cast still in flight. (#348)
-                let text = format!("Cannot cast: spell gem {} is empty.", req.gem);
-                gs.finish_cast(0, "cast_failed", &text);
-                tracing::info!("EQ: cast gem={} ignored — empty gem", req.gem);
             }
-          }
         }
     }
 
@@ -2450,6 +2593,232 @@ mod tests {
         assert!(matches!(resp_a.await.unwrap(), crate::command_state::CommandResult::Resolved(_)),
             "the echo must resolve the FIRST (parked) buy, not the rejected second one");
         assert!(nav.pending_buy.is_none(), "the parked buy is consumed once");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+    // A3 Migration 3 (#448): the honest awaited self-cast path. These drive a cast through the real
+    // `drain_cast` (the loop's own `command` slot is shared with the drain, so a real request→take
+    // round-trip runs), then transition `gs.last_cast` exactly as the cast machinery does and fulfil
+    // via `fulfill_cast` — the SAME call `gameplay.rs` makes after `apply_packet`.
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+
+    fn seed_cast_gs() -> GameState {
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        gs.mem_spells = [crate::game_state::EMPTY_GEM; 9];
+        gs.mem_spells[2] = 202; // gem 2 holds a real spell so the cast STARTS
+        gs
+    }
+
+    use crate::command_state::{CastEnd, CommandResult};
+
+    /// SUCCESS: an awaited cast, parked by the drain, then RESOLVED as completed when `last_cast`
+    /// transitions → `Resolved(CastEnd{outcome:"completed"})` carrying the real spell. `pending_cast`
+    /// is consumed exactly once. The transition — not any single opcode — is what fulfils it.
+    #[tokio::test]
+    async fn awaited_cast_resolves_completed_on_the_last_cast_transition() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_cast_gs();
+
+        let (tx, resp) = tokio::sync::oneshot::channel();
+        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
+        nav.drain_cast(&mut stream, &mut gs);
+        assert!(nav.pending_cast.is_some(), "the awaited cast must be parked after the drain");
+        // Nothing has resolved yet — fulfil is a no-op while the cast is genuinely in flight.
+        nav.fulfill_cast(&gs);
+        assert!(nav.pending_cast.is_some(), "a cast in flight must not auto-resolve");
+
+        // The cast completes — the machinery records the outcome into `last_cast` (as OP_MemorizeSpell
+        // scribing=3 would), then the gameplay loop calls `fulfill_cast`.
+        gs.finish_cast(202, "cast_completed", "You have finished casting Minor Healing.");
+        nav.fulfill_cast(&gs);
+        match resp.await.unwrap() {
+            CommandResult::Resolved(CastEnd { outcome, spell_id, .. }) => {
+                assert_eq!(outcome, "completed");
+                assert_eq!(spell_id, 202);
+            }
+            other => panic!("a completed cast must Resolve(completed), got {other:?}"),
+        }
+        assert!(nav.pending_cast.is_none(), "pending_cast must be consumed exactly once");
+    }
+
+    /// A fizzle is STILL a resolved outcome (we know what happened) — `Resolved(CastEnd)` — but its
+    /// `outcome` is "fizzled", never "completed". THE INVARIANT: a cast that did not complete-
+    /// successfully can never present as completed.
+    #[tokio::test]
+    async fn awaited_cast_fizzle_resolves_fizzled_never_completed() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_cast_gs();
+
+        let (tx, resp) = tokio::sync::oneshot::channel();
+        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
+        nav.drain_cast(&mut stream, &mut gs);
+        gs.finish_cast(202, "cast_fizzled", "Your spell fizzles!");
+        nav.fulfill_cast(&gs);
+        match resp.await.unwrap() {
+            CommandResult::Resolved(CastEnd { outcome, .. }) => {
+                assert_eq!(outcome, "fizzled", "a fizzle must be reported as fizzled");
+                assert_ne!(outcome, "completed", "a fizzle must NEVER report completed");
+            }
+            other => panic!("a fizzle must Resolve(fizzled), got {other:?}"),
+        }
+    }
+
+    /// An interrupt resolves as "interrupted", never "completed".
+    #[tokio::test]
+    async fn awaited_cast_interrupt_resolves_interrupted() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_cast_gs();
+
+        let (tx, resp) = tokio::sync::oneshot::channel();
+        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
+        nav.drain_cast(&mut stream, &mut gs);
+        gs.finish_cast(202, "cast_interrupted", "Your spell is interrupted.");
+        nav.fulfill_cast(&gs);
+        assert!(matches!(resp.await.unwrap(),
+            CommandResult::Resolved(CastEnd { ref outcome, .. }) if outcome == "interrupted"),
+            "an interrupt must Resolve(interrupted)");
+    }
+
+    /// NEVER-STARTED: an awaited cast on an EMPTY gem is `Refused` IMMEDIATELY from the drain — the
+    /// cast definitively did not happen, so it must not park and must not await. Mutation-check the
+    /// honesty: a cast that never started can never 200-as-completed (it 409s at once).
+    #[tokio::test]
+    async fn awaited_cast_empty_gem_is_refused_immediately_and_never_parks() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_cast_gs(); // gem 5 is empty
+
+        let (tx, resp) = tokio::sync::oneshot::channel();
+        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 5, target_id: None, item_slot: None }, tx);
+        nav.drain_cast(&mut stream, &mut gs);
+        assert!(nav.pending_cast.is_none(), "an empty-gem cast must NOT park — it never started");
+        match resp.await.unwrap() {
+            CommandResult::Refused(reason) => assert!(reason.contains("empty"), "reason: {reason}"),
+            other => panic!("an empty-gem cast must be Refused, not {other:?}"),
+        }
+    }
+
+    /// SILENT DROP: a parked cast whose server never resolves stays parked — `fulfill_cast` never
+    /// invents a success. (The HTTP timeout then yields the honest 202; proven separately.)
+    #[tokio::test]
+    async fn awaited_cast_silent_stays_parked_never_auto_succeeds() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_cast_gs();
+
+        let (tx, mut resp) = tokio::sync::oneshot::channel();
+        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
+        nav.drain_cast(&mut stream, &mut gs);
+        // No outcome recorded. Many fulfil passes must not resolve anything.
+        for _ in 0..5 { nav.fulfill_cast(&gs); }
+        assert!(nav.pending_cast.is_some(), "a silent cast must remain parked, never auto-succeed");
+        assert!(resp.try_recv().is_err(), "no outcome may have been sent for a silent cast");
+    }
+
+    /// SERVER REFUSAL AFTER PARK: a real cast-start refusal that reaches us after we parked
+    /// (`cast_failed` — e.g. insufficient mana, detected server-side) resolves to `Refused` — the cast
+    /// definitively did not happen.
+    #[tokio::test]
+    async fn awaited_cast_server_refusal_after_park_is_refused() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_cast_gs();
+
+        let (tx, resp) = tokio::sync::oneshot::channel();
+        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
+        nav.drain_cast(&mut stream, &mut gs);
+        gs.finish_cast(0, "cast_failed", "Insufficient Mana to cast this spell!");
+        nav.fulfill_cast(&gs);
+        assert!(matches!(resp.await.unwrap(), CommandResult::Refused(_)),
+            "a server cast_failed after parking must be Refused, never a completed 200");
+    }
+
+    /// UNEXPLAINED END: the server ended the cast and never said why (`cast_ended_unexplained`, the
+    /// buff-won't-stack case) → `Unconfirmed`. Genuinely unknown whether the spell had an effect;
+    /// never a claimed success.
+    #[tokio::test]
+    async fn awaited_cast_unexplained_end_is_unconfirmed() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_cast_gs();
+
+        let (tx, resp) = tokio::sync::oneshot::channel();
+        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
+        nav.drain_cast(&mut stream, &mut gs);
+        gs.finish_cast(202, "cast_ended_unexplained", "The cast ended with no outcome reported.");
+        nav.fulfill_cast(&gs);
+        assert_eq!(resp.await.unwrap(), CommandResult::Unconfirmed,
+            "an unexplained end must be Unconfirmed, never a completed 200");
+    }
+
+    /// SINGLETON: a second awaited cast while one is parked is `Refused` in-flight, and the first cast
+    /// stays parked and resolves normally — its outcome cannot be mis-attributed to the second.
+    #[tokio::test]
+    async fn a_second_awaited_cast_while_parked_is_refused() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_cast_gs();
+
+        let (tx_a, resp_a) = tokio::sync::oneshot::channel();
+        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx_a);
+        nav.drain_cast(&mut stream, &mut gs);
+        assert!(nav.pending_cast.is_some(), "cast A must be parked");
+
+        let (tx_b, resp_b) = tokio::sync::oneshot::channel();
+        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx_b);
+        nav.drain_cast(&mut stream, &mut gs);
+        match resp_b.await.unwrap() {
+            CommandResult::Refused(reason) => assert!(reason.contains("already in flight"), "reason: {reason}"),
+            other => panic!("a second in-flight cast must be Refused, not {other:?}"),
+        }
+        assert!(nav.pending_cast.is_some(), "cast A must STILL be parked after B is rejected");
+
+        gs.finish_cast(202, "cast_completed", "You have finished casting Minor Healing.");
+        nav.fulfill_cast(&gs);
+        assert!(matches!(resp_a.await.unwrap(), CommandResult::Resolved(_)),
+            "the outcome must resolve the FIRST (parked) cast, not the rejected second");
+        assert!(nav.pending_cast.is_none());
+    }
+
+    /// A STALE prior outcome (recorded BEFORE this cast parked) must never resolve it — the `at >
+    /// sent_at` correlation is what keeps a previous cast's verdict from fabricating a result here.
+    #[tokio::test]
+    async fn awaited_cast_ignores_a_stale_prior_outcome() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_cast_gs();
+
+        // A previous cast already left a completed outcome in `last_cast` BEFORE we park.
+        gs.finish_cast(700, "cast_completed", "You have finished casting an earlier spell.");
+
+        let (tx, mut resp) = tokio::sync::oneshot::channel();
+        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
+        nav.drain_cast(&mut stream, &mut gs);
+        nav.fulfill_cast(&gs);
+        assert!(nav.pending_cast.is_some(), "a stale prior outcome must not resolve the new cast");
+        assert!(resp.try_recv().is_err(), "no result may be sent from a stale outcome");
+    }
+
+    /// ZONE CHANGE: a parked cast reaped as `Unconfirmed` — the crossing means no `last_cast`
+    /// transition can ever come for it, so a prompt honest 202 is the only honest answer.
+    #[tokio::test]
+    async fn awaited_cast_reaped_unconfirmed_on_zone_change() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_cast_gs();
+
+        let (tx, resp) = tokio::sync::oneshot::channel();
+        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
+        nav.drain_cast(&mut stream, &mut gs);
+        assert!(nav.pending_cast.is_some());
+        nav.reap_pending_cast();
+        assert_eq!(resp.await.unwrap(), CommandResult::Unconfirmed,
+            "a cast parked across a zone change must be reaped Unconfirmed");
+        assert!(nav.pending_cast.is_none());
     }
 
     // ─────────────────────────────────────────────────────────────────────────────────────────
