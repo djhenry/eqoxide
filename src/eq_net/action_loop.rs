@@ -1279,13 +1279,31 @@ impl ActionLoop {
         // `oneshot::Sender` in `pending_buy` (with the merchant/slot for echo correlation + a
         // sent-at instant). We fire NOTHING here — the resolving packet does, after `apply_packet`:
         // the OP_ShopPlayerBuy echo → `fulfill_buy_ok` (Resolved), OP_ShopEndConfirm →
-        // `fulfill_buy_refused` (Refused), or a zone change / HTTP timeout → Unconfirmed. A newer
-        // awaited buy supersedes an unresolved one (its parked Sender drops → that GET times out to
-        // 202). See `crate::command_state::result` for the full flow.
+        // `fulfill_buy_refused` (Refused), or a zone change / HTTP timeout → Unconfirmed.
+        //
+        // SINGLETON-in-flight (reject-while-parked): awaited buys are serialized — at most ONE may be
+        // parked. The server's OP_ShopPlayerBuy echo carries NO per-request token, so two identical
+        // in-flight buys (same merchant+slot) are INDISTINGUISHABLE at the echo. If we superseded the
+        // parked buy with a newer one, the first buy's echo would resolve the SECOND caller's Sender
+        // using the FIRST buy's receipt — mis-attributing success (a failed second buy would report
+        // 200 on the first's success). So when a buy is already parked we do NOT overwrite it and do
+        // NOT send any wire packets: we immediately answer the NEW request `Unconfirmed` ("another buy
+        // is in flight; retry after it resolves"). The server then only ever processes one awaited buy
+        // at a time, keeping the echo correlation unambiguous, and the busy caller gets an honest 202
+        // rather than a mis-attributed 200. See `crate::command_state::result` for the discipline
+        // A3.2/A3.3 must copy. (Known residual: a UI fire-and-forget buy of the SAME slot concurrent
+        // with a parked awaited buy could still have its echo resolve the awaited buy, because the
+        // fire-and-forget path does not park — very low likelihood, and it cannot fabricate success.)
         if let Some((merchant_id, slot, tx)) = self.command.take_buy_await() {
-            send_shop_buy(stream, gs, merchant_id, slot);
-            self.pending_buy = Some(PendingBuy { tx, merchant_id, slot, sent_at: Instant::now() });
-            tracing::info!("EQ: awaited shop buy parked — merchant_id={merchant_id} slot={slot}");
+            if self.pending_buy.is_some() {
+                let _ = tx.send(crate::command_state::CommandResult::Refused(
+                    "another buy is already in flight; retry after it resolves".into()));
+                tracing::info!("EQ: awaited shop buy REJECTED — one already in flight (merchant_id={merchant_id} slot={slot})");
+            } else {
+                send_shop_buy(stream, gs, merchant_id, slot);
+                self.pending_buy = Some(PendingBuy { tx, merchant_id, slot, sent_at: Instant::now() });
+                tracing::info!("EQ: awaited shop buy parked — merchant_id={merchant_id} slot={slot}");
+            }
         }
 
         // Merchant sell: open the merchant (OP_ShopRequest) then sell a player inventory slot
@@ -2221,6 +2239,45 @@ mod tests {
 
         assert!(nav.pending_buy.is_none(), "the parked buy must be cleared on a zone change");
         assert_eq!(resp.await.unwrap(), crate::command_state::CommandResult::Unconfirmed);
+    }
+
+    /// SINGLETON-IN-FLIGHT / NO MIS-ATTRIBUTION (#448 review). Two awaited buys of the SAME
+    /// merchant+slot, back-to-back before any echo: the SECOND is rejected in-flight (`Refused`, no
+    /// wire packets), the FIRST stays parked, and the single OP_ShopPlayerBuy echo resolves the FIRST
+    /// — never the second. This is the honesty fix: without serialization the first buy's echo would
+    /// resolve the second caller's Sender with the first's receipt (a failed second buy reporting
+    /// success). The server-side echo carries no per-request token, so one-at-a-time is the only
+    /// unambiguous correlation.
+    #[tokio::test]
+    async fn a_second_awaited_buy_is_rejected_in_flight_so_the_echo_cannot_be_mis_attributed() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_buy_gs();
+
+        // Buy A parks.
+        let (tx_a, resp_a) = tokio::sync::oneshot::channel();
+        nav.command.request_buy_await(11, 3, tx_a);
+        nav.drain_merchant(&mut stream, &mut gs);
+        assert!(nav.pending_buy.is_some(), "buy A must be parked");
+
+        // Buy B arrives while A is still in flight → rejected in-flight, A untouched.
+        let (tx_b, resp_b) = tokio::sync::oneshot::channel();
+        nav.command.request_buy_await(11, 3, tx_b);
+        nav.drain_merchant(&mut stream, &mut gs);
+        match resp_b.await.unwrap() {
+            crate::command_state::CommandResult::Refused(reason) =>
+                assert!(reason.contains("already in flight"), "B must be told a buy is in flight, got: {reason}"),
+            other => panic!("a second in-flight buy must be Refused, not {other:?} (mis-attribution risk)"),
+        }
+        assert!(nav.pending_buy.is_some(), "buy A must STILL be the parked buy after B is rejected");
+
+        // The single echo resolves A (the parked buy) — proving no mis-attribution onto B.
+        let echo = buy_echo(11, 3, 5);
+        apply_packet(&mut gs, &AppPacket { opcode: OP_SHOP_PLAYER_BUY, payload: echo.clone() });
+        nav.fulfill_buy_ok(&gs, &echo);
+        assert!(matches!(resp_a.await.unwrap(), crate::command_state::CommandResult::Resolved(_)),
+            "the echo must resolve the FIRST (parked) buy, not the rejected second one");
+        assert!(nav.pending_buy.is_none(), "the parked buy is consumed once");
     }
 
     #[test]
