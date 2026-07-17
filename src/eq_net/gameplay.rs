@@ -111,7 +111,17 @@ fn record_probe_reply(h: &mut crate::ipc::NetHealth, now: std::time::Instant) {
 /// earlier wedge would sit older than every later probe forever, making the answered-clause
 /// `last_packet_ago <= first_unanswered_sent_ago` permanently true → a confident false-ALIVE that
 /// hides the re-wedge (the worst honesty class).
-fn record_app_packet(h: &mut crate::ipc::NetHealth, now: std::time::Instant) {
+///
+/// #419 (defensive hygiene): make this the SOLE writer of `last_packet`. `login.rs`'s handshake
+/// drain used to stamp `last_packet` directly, bypassing the streak-clear above. That is NOT an
+/// active bug today — `first_unanswered_probe_sent` is only ever set in `record_probe_sent` during
+/// gameplay, and login never re-runs after gameplay (`run_login_phase` precedes `run_gameplay_phase`,
+/// which returns and ends the net thread — there is no relogin-without-restart path), so no stale
+/// streak can reach the login drain to be masked. It is a LATENT seam: a *second* writer of
+/// `last_packet` that skips the streak-clear could resurrect the #371 false-alive IF a
+/// relogin-without-restart path is ever added. Routing the login stamp through here keeps a single
+/// canonical writer so that can't happen silently. `pub(crate)` so `login.rs` calls it.
+pub(crate) fn record_app_packet(h: &mut crate::ipc::NetHealth, now: std::time::Instant) {
     h.last_packet = now;
     h.first_unanswered_probe_sent = None;
 }
@@ -1556,3 +1566,4 @@ mod wedge_timeline_tests {
             "timeline too short to confirm the re-wedge verdict holds");
     }
 }
+
