@@ -47,10 +47,11 @@ real RoF2 client.** Bald-looking Luclin heads with painted hair are authentic.
 The hair you "see" on Luclin models is painted into the head textures as a
 NEUTRAL LIGHT base (huf scalp texels avg ≈ RGB(158,116,85); elf ≈ (173,123,90) —
 lighter than the face). The client colors it by multiplying with a 24-entry tint table (see
-`hair-color.md` for the table). In the swap logic the tint pointer is only
-passed for a subset of races (High Elf, Dark Elf, Half Elf, female Dwarf) —
-races whose region layout isolates the hair texels; the visible result is
-neutral/blonde-ish hair for the others.
+`hair-color.md` for the table). In the swap logic (`FUN_0040a240`, `eqgame.exe.c:7166-7197`,
+confirmed 2026-07-17) the tint pointer is only passed for **MALE** High Elf, **MALE** Dark Elf,
+**MALE** Half Elf, and **FEMALE** Dwarf — the elves are male-only, not both genders; see
+`hair-color.md` "Race/model gate" for the exact decompiled condition. The visible result is
+neutral/blonde-ish hair for everyone else (including female elves and male Dwarves).
 
 ## Head polygon regions (huf, verified by bone weights + debug-color renders)
 

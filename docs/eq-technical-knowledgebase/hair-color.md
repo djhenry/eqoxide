@@ -66,20 +66,46 @@ alpha channel is not used). `beardcolor` uses the same table.
 The head material-swap path receives the character appearance object, current hairstyle/face, and
 gates the tint on race and gender.
 
-### Race/model gate
+### Race/model gate — CONFIRMED in the decompiled binary (2026-07-17)
 
-The race/gender gate resolves to one of three cases:
-- **no Luclin / no tint** — race 4, 9, 10, 13+, etc.
-- **classic tintable but NOT in the Luclin subset** — Human=1, Barb=2, Erudite=3, male Dwarf=8,
-  Halfling=11, Gnome=12.
-- **Luclin-style hair tint eligible** — High Elf=5, Dark Elf=6, Half Elf=7, female Dwarf=8.
+The gate is `FUN_0040a240` (`eqgame.exe.c:7166-7197`), `__fastcall FUN_0040a240(int param_1)` where
+`param_1+0x10` = race (dword) and `param_1+0x15` = gender byte (0=male/1=female, matching
+`EQEmu/common/races.h:38-39`). Its return value is a category:
+
+```c
+uVar1 = 0;
+if (*(char *)(param_1 + 0x15) == '\x01') {        // gender == FEMALE
+    if (*(int *)(param_1 + 0x10) == 8) {           // race == Dwarf
+        uVar1 = 2;                                  // -> Luclin-tint-eligible
+    }
+    return uVar1;                                   // any OTHER female race -> 0 (no tint)
+}
+switch(*(undefined4 *)(param_1 + 0x10)) {           // reached only when gender != FEMALE (male)
+case 1: case 2: case 3: case 8: case 0xb: case 0xc:
+    return 1;                                        // classic-tintable, not Luclin (Human/Barb/
+                                                       // Erudite/MALE Dwarf/Halfling/Gnome)
+default:
+    return 0;                                        // no tint (WoodElf=4, Troll=9, Ogre=10, 13+...)
+case 5: case 6: case 7:
+    return 2;                                        // Luclin-tint-eligible — but MALE only
+}
+```
+
+The caller `FUN_0040d1a0` (`eqgame.exe.c:8917`) computes the 24-entry haircolor-tint pointer
+(`&DAT_00ac1a70 + haircolor*4`, `eqgame.exe.c:9006`) only when `FUN_0040a240() == 2` **and**
+`haircolor <= 0x17` (23) **and** a face-derived flag (`eqgame.exe.c:8971-9016`).
 
 **Tint is applied ONLY when all of these hold:**
-1. The race is in the Luclin-eligible subset (High Elf, Dark Elf, Half Elf, or female Dwarf).
-2. The hairstyle-related flag is non-zero.
+1. `FUN_0040a240(actor) == 2`: **(race ∈ {High Elf=5, Dark Elf=6, Half Elf=7} AND gender == MALE)
+   OR (race == Dwarf=8 AND gender == FEMALE)**. The race subset {High Elf, Dark Elf, Half Elf,
+   Dwarf} is exact — no other race ever returns category 2. **The elves are MALE-only, not
+   both-genders** — a female High/Dark/Half Elf returns category 0 (same bucket as Human/Barbarian),
+   so her hair is NOT tinted. This corrects an earlier (unverified) claim in a since-superseded PR
+   that had elves tinted for both genders; only the female-Dwarf half of that claim was right.
+2. The hairstyle/face-derived flag is non-zero (`bVar9`, `eqgame.exe.c:8971-8975`).
 3. `haircolor < 24`.
-4. The **Luclin head model is actually loaded** (a classic head model fails this gate outright, so
-   no tint is applied to classic heads).
+4. The **Luclin head model is actually loaded** (`param_1[0x60]+0x34 != 0`, `eqgame.exe.c:8982`; a
+   classic head model fails this gate outright, so no tint is applied to classic heads).
 
 ---
 
@@ -131,8 +157,10 @@ The textures do NOT use a white/gray hair region that would require runtime tint
 The same applies to Barbarian (2), Erudite (3), male Dwarf (8), Halfling (11), Gnome (12) — none are
 in the Luclin-eligible subset.
 
-**Races that DO use the tint table:** High Elf (5), Dark Elf (6), Half Elf (7), female Dwarf (8) —
-only when the Luclin head model is loaded.
+**Races that DO use the tint table:** MALE High Elf (5), MALE Dark Elf (6), MALE Half Elf (7),
+FEMALE Dwarf (8) — only when the Luclin head model is loaded. Female elves and male Dwarves do
+NOT get the tint (confirmed via `FUN_0040a240`, `eqgame.exe.c:7166-7197` — see "Race/model gate"
+above).
 
 ---
 

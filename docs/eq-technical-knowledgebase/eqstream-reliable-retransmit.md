@@ -77,9 +77,95 @@ OP_Fragment). The receiver also buffers that packet in `packet_queue`
 So semantically: `OP_OutOfOrderAck(seq)` means **"I received your packet #seq,
 but it's ahead of what I actually need next — I've buffered it, don't bother
 resending #seq specifically, but I'm still missing everything between my last
-cumulative ack and #seq."** It is purely a bookkeeping optimization (stop
+cumulative ack and #seq."** At the level of what it directly erases, it is a
+single-entry bookkeeping optimization, not a cumulative ack and not an
+opcode-level NACK naming the missing seq.
+
+**CORRECTION (superseded claim below) — it DOES trigger a near-immediate
+resend of the gap, just indirectly, via a flag, not via being parsed as a NAK.**
+See §2b: any `OP_Ack` *or* `OP_OutOfOrderAck` sets `m_acked_since_last_resend =
+true`, and that flag makes the very next resend tic (≤ ~16.7 ms later, see
+§3) skip the "wait for this packet's own resend_delay" gate and immediately
+go-back-N-resend **everything still outstanding on that stream** — which
+includes the actual lost/gap packet, since it's the one entry `OutOfOrderAck`
+did *not* erase. The original text of this section (kept below the line for
+history) understated this: it is correct that `OutOfOrderAck` doesn't erase
+anything but the named entry and isn't itself a "resend seq X now" command,
+but it is empirically a fast-retransmit trigger in effect, on a ~1-tic delay.
+
+## 2b. `m_acked_since_last_resend` — the real fast-retransmit mechanism (any Ack OR OutOfOrderAck)
+Both `Ack()` (`reliable_stream_connection.cpp:1254-1279`, cumulative) and
+`OutOfOrderAck()` (`:1281-1299`, selective) end with the identical two lines
+`m_acked_since_last_resend = true; m_last_ack = now;` (`:1277-1278`,
+`:1297-1298`). This flag is stream-connection-global (not per-stream — one
+flag covers all 4 stream slots on that connection), and it is read/cleared
+only in `ProcessResend(int stream)` (`:1126-1252`):
+
+```
+if (time_since_first_sent <= first_packet.resend_delay && !m_acked_since_last_resend) {
+    return;   // skip this tic's resend pass
+}
+... (full go-back-N resend loop over every entry in sent_packets) ...
+m_acked_since_last_resend = false;   // :1250, reset after any pass that ran
+```
+(`:1175-1186` skip check, `:1250` reset). Read literally: the pass is skipped
+**only if** the oldest outstanding packet hasn't yet reached its own
+`resend_delay` **and** no ack of any kind has landed since the last pass. If
+*either* condition fails — including "an ack landed" — the skip is bypassed
+and the connection resends **every** currently-outstanding entry on that
+stream immediately, regardless of each entry's individual timer.
+
+`ProcessResend(int stream)` is called for every stream on every connection
+once per manager tic, and the manager's libuv timer runs at
+`tic_rate_hertz = 60.0` (`reliable_stream_connection.h:296`, wired up via
+`uv_timer_start(..., update_rate, update_rate)` where
+`update_rate = 1000.0 / tic_rate_hertz` ≈ 16.7 ms,
+`reliable_stream_connection.cpp:58-71`). So in practice: **receiving any
+`OP_Ack` or `OP_OutOfOrderAck` causes a full resend of everything still
+outstanding on that stream within ~1 tic (≤ ~17 ms), not gated by the
+per-packet exponential-backoff delay at all.** This is *why* losing one
+packet in a burst gets repaired fast in real play: the very next packet that
+*does* arrive triggers its own ack (in-order fast-path `SendAck` or
+future-path `SendOutOfOrderAck`), and that ack — whichever kind — flips the
+sender's flag and forces an immediate resend pass that includes the actual
+gap packet.
+
+Caveats:
+- This is a **connection-wide flag observed per-stream at resend time**, not
+  a targeted "resend seq N" instruction — the resend loop still resends the
+  *entire* outstanding window for that stream (same go-back-N behavior as
+  §3), just triggered earlier than the timer would have.
+- A duplicate/stale-packet `SendAck(sequence_in - 1)` (the `SequencePast`
+  branch) also sets the flag on the sender side when it arrives back — so
+  even a redundant/duplicate ack from a receiver re-processing an
+  already-seen packet will trigger an early resend pass of whatever's still
+  outstanding.
+- There's a second, apparently-dead branch at `:1164-1171`:
+  `if (m_last_ack - now > std::chrono::milliseconds(1000)) { m_acked_since_last_resend = true; }`.
+  Both are `std::chrono::steady_clock::time_point` (`reliable_stream_connection.h:90`);
+  under a monotonic clock `m_last_ack <= now` always holds at this call site
+  (it's set to `now` at the end of the *previous* pass or the last Ack/OOOAck),
+  so `m_last_ack - now` is a non-positive duration and this branch is
+  effectively unreachable/dead in normal operation — looks like reversed
+  operands (probably meant `now - m_last_ack`, a "force a check-in after 1s of
+  ack silence" stall guard). Not load-bearing for the fast-retransmit
+  mechanism above; noted for completeness in case a future EQEmu patch fixes
+  the polarity.
+- If `sent_packets` for that stream is already empty (the common no-loss
+  steady state, since cumulative `Ack()` erases everything ≤ the acked seq),
+  `ProcessResend` returns immediately at the top-of-function empty check
+  (`:1132-1134`) before any of this logic runs — so healthy traffic doesn't
+  cause spurious resends, this only fires when there's a genuine outstanding
+  backlog (e.g. the lost packet itself, or packets sent after it that
+  haven't been acked yet).
+
+### Original (superseded) understanding — kept for history, see 2b above
+It is purely a bookkeeping optimization (stop
 resending the one packet that *did* arrive) — it is **not** a NACK/fast-retransmit
-signal and does not itself cause any immediate resend of the gap.
+signal in the sense of being parsed as one; it does not itself cause any resend of
+a specific named sequence. But empirically, via the shared `m_acked_since_last_resend`
+flag, receiving it (like receiving any ack) does cause an imminent (next-tic)
+resend pass of the whole outstanding window, which happens to include the gap.
 
 ## 3. Actual retransmission is periodic, timer-driven, whole-window ("go-back-N"), not single-packet
 `ProcessResend(stream)` (`reliable_stream_connection.cpp:1126-1252`), called every
@@ -210,17 +296,27 @@ resend state."
    `seq_of_entry <= seq` (wraparound-aware, mirror `CompareSequence`'s
    ±10000 heuristic in u16 space) from the outstanding map — do not treat it
    as "ack exactly this one."
-3. On `OP_OutOfOrderAck(seq)` received: remove **only** the exact entry
-   `seq` if present; take no other action. Do not use it as a fast-retransmit
-   trigger — you don't need to react by immediately resending anything else;
-   your periodic resend timer will naturally catch the real gap.
-4. Run a periodic resend tic (e.g. every ~50-100ms, matching the server's own
-   `tic_rate_hertz=60.0` cadence is unnecessary — any interval smaller than
-   your min resend_delay is fine): if the oldest outstanding entry's age
-   exceeds its own `resend_delay` (seed ≈ 850ms with an initial 500ms RTT
-   guess and default Rule values, doubling per resend, clamped to
-   `[300ms, 5000ms]`), resend **every** currently-outstanding entry for that
-   stream (go-back-N), then double each resent entry's own delay (clamped).
+3. On `OP_OutOfOrderAck(seq)` received: remove the exact entry `seq` if
+   present (matches erase-only semantics, §2), **and** set a connection-wide
+   `acked_since_last_resend = true` flag (§2b) — the same flag `OP_Ack` sets.
+   **Do** treat it as an (indirect) fast-retransmit trigger: this flag is what
+   makes the real server repair a lost packet within ~1 tic of receiving your
+   next ack, so to interoperate/match native repair latency your own sender
+   logic (for reliable app packets you send to the server) should mirror the
+   same mechanism, not skip it.
+4. Run a periodic resend tic (matching the server's own `tic_rate_hertz=60.0`
+   ⇒ ~16.7ms cadence is what makes native repair feel near-instant; a coarser
+   interval like 50-100ms still works but will be visibly slower to recover
+   than a real client/server pair — pick something ≤ your min `resend_delay`).
+   Each tic, per stream: **skip** the resend pass only if the oldest
+   outstanding entry's age is `<= its own resend_delay` **and** no ack (of
+   either kind) has landed since the last pass; otherwise resend **every**
+   currently-outstanding entry for that stream (go-back-N) — including the
+   case where the timer hasn't expired yet but a fresh ack arrived — then
+   double each resent entry's own delay (clamped to `[resend_delay_min,
+   resend_delay_max]`) and clear the flag. Seed `resend_delay` ≈ 850ms with an
+   initial 500ms RTT guess and default Rule values as before; the flag-bypass
+   is what actually fires first in the loss case, well before 850ms elapses.
 5. If the oldest outstanding entry's total age reaches **30000ms**, treat the
    session as dead client-side too (matches server's `resend_timeout`) —
    no point continuing past the point the server will have already dropped you.
