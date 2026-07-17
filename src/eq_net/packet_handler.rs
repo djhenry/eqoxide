@@ -2558,6 +2558,27 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
         return;
     }
 
+    // #478 (agent-honesty): EQEmu controller/utility spawns (zone_controller, campday/campnight,
+    // faction/timer controllers, etc.) leaked into /observe/entities as real targetable NPCs at
+    // null/sentinel coords (e.g. campday000 at (0,0,0), zone_controller000 at
+    // (30000,10000,-9999.875)) even though the native RoF2 client never lists or lets the player
+    // select them. The reliable wire signal is `bodytype`, NOT `race` or the coords: EQEmu marks
+    // these NoTarget (11) / NoTarget2 (60), and its own anti-cheat backstop
+    // (zone/client_packet.cpp) rejects any OP_TargetCommand naming a bodytype in {11, 60, 67} as
+    // POSSIBLE_HACK — the real client's UI is built around never letting the player pick one of
+    // these in the first place. `race` is unreliable here: these controllers commonly ship a
+    // perfectly ordinary race (e.g. 240 "TeleportMan"), not a fixed "invisible" race id, and a
+    // coords-only heuristic risks hiding real content that happens to path near (0,0,0). Filter
+    // at registration (never enters `gs.entities`) so it also matches native for by-name lookups
+    // (/goto, /interact) that key off the same entity map.
+    if info.body_type == 11 || info.body_type == 60 {
+        tracing::debug!(
+            "EQ: dropping untargetable utility spawn id={} name='{}' bodytype={}",
+            info.spawn_id, info.name, info.body_type
+        );
+        return;
+    }
+
     // Track the player's own pet (necro/mage/etc.) via petOwnerId.
     if gs.player_id != 0 && info.pet_owner_id == gs.player_id {
         gs.pet_id = Some(info.spawn_id);
@@ -4292,6 +4313,43 @@ mod tests {
         assert!(!e.dead, "a living spawn must not be flagged dead");
         assert_eq!(e.animation, 100);
         assert_eq!(e.hp_pct, 100.0);
+    }
+
+    #[test]
+    fn register_spawn_filters_untargetable_controller_bodytype() {
+        // #478 (agent-honesty): controller/utility spawns must be dropped by `bodytype`
+        // (EQEmu NoTarget=11 / NoTarget2=60), NOT by race or coords — real content can share the
+        // same sentinel-looking coords these controllers use.
+        use super::register_spawn;
+        use crate::eq_net::protocol::SpawnInfo;
+        let mk = |body_type: u32, x: f32, y: f32, z: f32, name: &str| SpawnInfo {
+            spawn_id: 1496, name: name.into(), last_name: String::new(),
+            level: 1, npc: 1, gender: 0, race: 240, class_: 1, guild_id: 0xFFFF_FFFF, guild_rank: 0,
+            body_type,
+            cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0,
+            stand_state: 100, pet_owner_id: 0, player_state: 64,
+            x, y, z, heading: 0.0, animation: 100,
+            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9],
+        };
+
+        // campday000-style controller (bodytype 11 = NoTarget) at the exact sentinel (0,0,0)
+        // coords seen live: must never enter gs.entities, matching the native client which never
+        // lists or lets the player target it.
+        let mut gs = GameState::new();
+        register_spawn(&mut gs, mk(11, 0.0, 0.0, 0.0, "campday000"));
+        assert!(gs.entities.is_empty(), "bodytype 11 controller must be dropped, not registered");
+
+        // zone_controller000-style (bodytype 60 = NoTarget2) at its other sentinel coords.
+        let mut gs = GameState::new();
+        register_spawn(&mut gs, mk(60, 30000.0, 10000.0, -9999.875, "zone_controller000"));
+        assert!(gs.entities.is_empty(), "bodytype 60 controller must be dropped, not registered");
+
+        // A real NPC with an ordinary bodytype (1 = Humanoid), even sharing the exact sentinel
+        // coords a controller might use, must still register — proves the signal is bodytype,
+        // not position, so real content near (0,0,0) is never mistakenly hidden.
+        let mut gs = GameState::new();
+        register_spawn(&mut gs, mk(1, 0.0, 0.0, 0.0, "a_rat"));
+        assert!(gs.entities.contains_key(&1496), "a real NPC must still register even at (0,0,0)");
     }
 
     #[test]
