@@ -4301,6 +4301,32 @@ mod tests {
         assert!(tot_new_ok >= tot_old_ok, "fine-tier route success must not go down");
     }
 
+    /// The drift-corpus swim-up vertical wish, mirroring the live walker VERBATIM
+    /// (`walker.rs:819-825`): when swimming AND the active waypoint sits >1u above the swimmer, drive
+    /// `SWIM_UP_RATE = 20` u/s (so the controller rises collided and hauls out at the far lip);
+    /// otherwise 0. Shared by the corpus loop and its guard test so the instrument's swim drive can
+    /// never silently diverge from production. The `target_z` passed in MUST be the same carrot the
+    /// walker steers — the FINE local-plan carrot when a fine plan is active, coarse only as fallback
+    /// (see `steer_target`, steering.rs:261-280, and the corpus call site).
+    fn drift_swim_up_wish(swim: bool, target_z: f32, pos_z: f32) -> f32 {
+        const SWIM_UP_RATE: f32 = 20.0; // walker.rs:824
+        if swim && target_z > pos_z + 1.0 { SWIM_UP_RATE } else { 0.0 }
+    }
+
+    /// GUARD (runs in `cargo test --lib`): the drift corpus's swim drive must mirror the live walker,
+    /// or its wedges aren't ground truth and the whole water-nav 3b gate is measuring a phantom
+    /// physics. Pins the vertical-wish rule; a future edit that re-diverges it trips this.
+    #[test]
+    fn drift_sim_swim_drive_mirrors_walker() {
+        // walker.rs:824-825: swim AND waypoint >1u above -> SWIM_UP_RATE (20).
+        assert_eq!(drift_swim_up_wish(true, 10.0, 0.0), 20.0, "swim + waypoint above -> swim-up rate 20");
+        // threshold is +1.0, not >0: a waypoint <=1u above yields no rise.
+        assert_eq!(drift_swim_up_wish(true, 0.5, 0.0), 0.0, "swim + waypoint <=1u above -> no rise");
+        assert_eq!(drift_swim_up_wish(true, 1.0, 0.0), 0.0, "swim + waypoint exactly +1u -> no rise (strict >)");
+        // not swimming -> never a vertical wish, even under a high waypoint (walker.rs:825 gates on swim).
+        assert_eq!(drift_swim_up_wish(false, 100.0, 0.0), 0.0, "not swimming -> no vertical wish");
+    }
+
     /// **THE FAITHFUL WALKER DRIFT SCANNER (the real per-tick recovery loop).** The static scanner
     /// above drove ONE fine plan with naive pure pursuit and no recovery — which over-counts corner
     /// wedges the real walker recovers from, and cannot measure a planner-cell fix's benefit (the real
@@ -4343,9 +4369,14 @@ mod tests {
         const MAX_REPATHS: u32 = 8;
         const DT: f32 = 1.0 / 100.0;          // ~100 Hz controller, per navigation.rs's fast-steer note
         const FRAMES_PER_TICK: u32 = 15;      // 150 ms / 10 ms
+        // The swim-up vertical wish is `drift_swim_up_wish` (module fn below), mirroring the walker
+        // (walker.rs:819-825) and pinned by `drift_sim_swim_drive_mirrors_walker` so the instrument
+        // can't silently diverge from production.
 
-        // The faithful walk. Returns None on arrival, or Some(wedge_pos) on a terminal wedge.
-        let simulate = |col: &Collision, start: [f32; 3], goal: [f32; 3]| -> Option<([f32; 3], [f32; 2])> {
+        // The faithful walk. Returns None on arrival, or Some((wedge_pos, aim, route_wet_near_wedge))
+        // on a terminal wedge. `route_wet_near_wedge` = did the COMMITTED coarse route carry a water
+        // waypoint within 24u of the wedge — the water-routing-vs-#423-clip discriminator (see caller).
+        let simulate = |col: &Collision, start: [f32; 3], goal: [f32; 3]| -> Option<([f32; 3], [f32; 2], bool)> {
             let PlanOutcome::Route(mut coarse) = col.find_path_ex(
                 start, goal, PLAYER_RADIUS, &[], 8.0, None, 0.0, PlanCtx::worker()) else { return None };
             if coarse.len() < 2 { return None; }
@@ -4386,6 +4417,10 @@ mod tests {
                 if backoff_ticks > 0 {
                     backoff_ticks -= 1;
                     for _ in 0..FRAMES_PER_TICK {
+                        // The real walker's downhill-backoff branch drives want_swim: false
+                        // UNCONDITIONALLY (walker.rs:731-742), even while submerged — the backoff is a
+                        // deliberate non-swim recovery. The sim MUST match, or it recovers (swim-mode
+                        // step) where the client sinks (non-swim step): a false pass.
                         ctrl.step(MoveIntent { wish_dir: backoff_dir, wish_vspeed: 0.0, jump: false,
                             want_swim: false, speed: RUN_SPEED, climb: 0.0, hop: false }, DT, col);
                     }
@@ -4441,7 +4476,11 @@ mod tests {
                             backoff_dir = if dl > 1e-3 { [-dx / dl, -dy / dl] } else { [0.0, 0.0] };
                             continue;
                         }
-                        return Some((ctrl.pos, aim)); // terminal wedge (8 re-paths spent)
+                        let wp = ctrl.pos;
+                        let wet_near = coarse.iter().any(|w|
+                            (w[0] - wp[0]).hypot(w[1] - wp[1]) < 24.0
+                            && (col.in_water(*w) || col.in_water([w[0], w[1], w[2] + 3.0])));
+                        return Some((wp, aim, wet_near)); // terminal wedge (8 re-paths spent)
                     }
                 }
 
@@ -4459,12 +4498,31 @@ mod tests {
                         let d = (dx * dx + dy * dy).sqrt().max(1e-3);
                         [dx / d, dy / d]
                     });
-                    ctrl.step(MoveIntent { wish_dir: aim, wish_vspeed: 0.0, jump: false, want_swim: false,
+                    // The REAL walker's swim rule (walker.rs:807-834), driving the SAME controller:
+                    // body-probe want_swim, and a swim-up wish toward the active waypoint when it sits
+                    // above the swimmer. CRITICAL faithfulness point (#1b): the vertical-wish target z
+                    // must come from the SAME path the walker steers — `steer_target`
+                    // (steering.rs:261-280) returns the FINE local-plan carrot when local.len() >= 2,
+                    // falling back to the coarse carrot only when there is no fine plan. `local_i` was
+                    // already advanced this frame by `fast_steer_aim` above (when a fine plan exists),
+                    // so this reads the identical carrot the horizontal `aim` used.
+                    let p = ctrl.pos;
+                    let swim = col.in_water(p) || col.in_water([p[0], p[1], p[2] + 3.0]);
+                    let coarse_c = carrot_along(&coarse, path_i, from, LOOK_AHEAD).unwrap_or(goal);
+                    let tz = if local_path.len() >= 2 {
+                        carrot_along(&local_path, local_i, from, LOOK_AHEAD).map(|c| c[2]).unwrap_or(coarse_c[2])
+                    } else { coarse_c[2] };
+                    let wish_vspeed = drift_swim_up_wish(swim, tz, p[2]);
+                    ctrl.step(MoveIntent { wish_dir: aim, wish_vspeed, jump: false, want_swim: swim,
                         speed: RUN_SPEED, climb: 0.0, hop: stuck_ticks >= NAV_HOP_TICKS }, DT, col);
                     if (ctrl.pos[0] - goal[0]).hypot(ctrl.pos[1] - goal[1]) < 3.0 { return None; }
                 }
             }
-            Some((ctrl.pos, aim)) // ran out of sim time
+            let wp = ctrl.pos;
+            let wet_near = coarse.iter().any(|w|
+                (w[0] - wp[0]).hypot(w[1] - wp[1]) < 24.0
+                && (col.in_water(*w) || col.in_water([w[0], w[1], w[2] + 3.0])));
+            Some((wp, aim, wet_near)) // ran out of sim time
         };
 
         let dir = std::env::var("ZONE_DIR")
@@ -4497,9 +4555,16 @@ mod tests {
         let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as u32 };
 
         let (mut tot_pairs, mut tot_walked, mut tot_wedged) = (0usize, 0usize, 0usize);
-        let (mut tot_height, mut tot_overlap, mut tot_other, mut tot_water) = (0usize, 0usize, 0usize, 0usize);
+        let (mut tot_height, mut tot_overlap, mut tot_other) = (0usize, 0usize, 0usize);
+        // The water column is SPLIT (Increment 1): `wat-route` = a wedge whose committed coarse route
+        // itself carried water waypoints near the wedge — a planner/ROUTING failure, OURS to fix in
+        // later increments; `#423` = the route was DRY near the wedge but the character ended up
+        // wet/wedged — the pre-existing walk-THROUGH-a-wall-into-water collision bug (#423), NOT a
+        // routing failure. They are never lumped.
+        let (mut tot_wr, mut tot_423) = (0usize, 0usize);
         println!("\n=== faithful walker drift: {} mode ===", if include_water { "WATER-INCLUSIVE" } else { "DRY" });
-        println!("{:<12} {:>6} {:>7} {:>8} {:>8} {:>6} {:>6}", "zone", "walked", "wedged", "height", "overlap", "other", "water");
+        println!("{:<12} {:>6} {:>7} {:>8} {:>8} {:>6} {:>9} {:>6}",
+            "zone", "walked", "wedged", "height", "overlap", "other", "wat-route", "#423");
         for zone in &zones {
             let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
             let Ok(za) = ZoneAssets::from_glb(&p) else { println!("{zone:<12}  (no glb — skipped)"); continue };
@@ -4541,27 +4606,89 @@ mod tests {
                 let no_fall_jump = cr.windows(2).all(|w| {
                     let dz = w[1][2] - w[0][2];
                     let seg = (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]);
-                    dz > -4.0 && seg < 12.0 // no controlled fall, no jump-edge span
+                    // Increment 1: the sim now DRIVES surface swim legs (body-probe want_swim +
+                    // swim-up vspeed), so in water mode a water-touching segment is exempt from the
+                    // DRY fall bound — entering water legitimately drops up to the step-in height
+                    // (~STEP_H=20) to the surface, which the dry `dz > -4` would wrongly filter.
+                    // BUT the exemption is NOT unbounded (Hunt 3): the sim never jumps (jump:false at
+                    // both call sites) and can't dive against buoyancy, so a wet segment that is ALSO
+                    // a deep dive or a long jump-span is still undrivable and stays filtered.
+                    let wet_seg = include_water && (
+                        col.in_water(w[0]) || col.in_water(w[1])
+                        || col.in_water([w[0][0], w[0][1], w[0][2] + 3.0])
+                        || col.in_water([w[1][0], w[1][1], w[1][2] + 3.0]));
+                    let drop_cap = if wet_seg { -20.0 } else { -4.0 }; // water step-in may drop to ~STEP_H
+                    dz > drop_cap && seg < 12.0
                 });
                 let no_water = !cr.iter().any(|w| col.in_water(*w) || col.in_water([w[0], w[1], w[2] + 3.0]));
-                if !no_fall_jump { continue; } // the sim cannot drive fall/jump edges in EITHER mode
-                if !include_water && !no_water { continue; }
+                if !no_fall_jump { continue; } // the sim cannot drive dry fall/jump edges in EITHER mode
+                if !include_water && !no_water { continue; } // dry mode still excludes water routes
                 pairs.push((s, g));
             }
+
+            // FIXED bank-to-bank pairs (Increment 1): force water crossings that random sampling
+            // rarely hits (find_path prefers a dry shore when one exists, so sampled pairs seldom
+            // actually cross). Coordinates verified to route THROUGH water via a one-off water-extent
+            // probe. Only injected in water mode; each pair is a real forced crossing in a gate zone.
+            let forced_start = pairs.len();
+            if include_water {
+                let forced: &[([f32; 3], [f32; 3], &str)] = match zone.as_str() {
+                    // halas #197 central pool (surface ~ -3.9). W↔E spans the pool: a 39-wp FULL swim
+                    // (every waypoint wet). N→S dips through the south edge of the pool.
+                    "halas" => &[
+                        ([-150.0, -231.0, -130.94], [150.0, -231.0, -130.94], "#197 pool: W bank -> E bank (full swim across)"),
+                        ([6.0, -70.0, 1.0],         [6.0, -454.0, -30.15],    "#197 pool: N shore -> S shore"),
+                    ],
+                    // qeynos2 moat/canal (surface ~ -2.8): W→E crossings that dip into the moat.
+                    "qeynos2" => &[
+                        ([-400.0, -115.0, 79.97], [-270.0, -115.0, -2.0], "moat: W rampart -> E bank"),
+                        ([-450.0, -115.0, 79.97], [-220.0, -115.0, 0.0],  "moat: wide W -> E"),
+                    ],
+                    // blackburrow lake (surface ~ -148): W→E crossings straight through the lake.
+                    "blackburrow" => &[
+                        ([-118.0, 0.0, -170.94], [361.0, 0.0, -128.94], "lake: W bank -> E bank"),
+                        ([-60.0, 0.0, -227.91],  [300.0, 0.0, -129.12], "lake: near-W -> E bank"),
+                    ],
+                    _ => &[],
+                };
+                for (s, g, what) in forced {
+                    println!("  [FORCED PAIR ] {zone}: {what}  {:?} -> {:?}", s, g);
+                    pairs.push((*s, *g));
+                }
+            }
+            let n_forced = pairs.len() - forced_start;
             if pairs.is_empty() { println!("{zone:<12}  (no routable pairs — skipped)"); continue; }
 
-            let (mut walked, mut wedged, mut n_h, mut n_o, mut n_x, mut n_w) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
-            for (s, g) in &pairs {
+            let (mut walked, mut wedged, mut n_h, mut n_o, mut n_x) = (0usize, 0usize, 0usize, 0usize, 0usize);
+            let (mut n_wr, mut n_423) = (0usize, 0usize);
+            for (i, (s, g)) in pairs.iter().enumerate() {
+                let forced = i >= forced_start;
                 walked += 1;
-                let Some((w, aim)) = simulate(&col, *s, *g) else { continue };
-                // A wedge that ended in/at water. DRY mode drops it (out of scope). WATER mode COUNTS
-                // it in the `water` column (the pre-existing #423 crossing bug, measured not hidden)
-                // and moves on — the height/overlap classifiers below are for dry-ground wedges.
+                let Some((w, aim, route_wet_near)) = simulate(&col, *s, *g) else {
+                    // simulate returned None: either ARRIVED (success) or the coarse route was
+                    // untraversable/too-short. A forced crossing that never routed is itself a
+                    // routing finding — flag it so a silently-dropped forced pair can't hide.
+                    if forced {
+                        let routed = matches!(col.find_path_ex(*s, *g, PLAYER_RADIUS, &[], 8.0, None, 0.0, PlanCtx::worker()), PlanOutcome::Route(_));
+                        if !routed {
+                            walked -= 1;
+                            println!("  [FORCED NOROUTE] {zone}: forced crossing did not route {:?} -> {:?}", s, g);
+                        }
+                    }
+                    continue;
+                };
+                // A wedge that ended in/at water. DRY mode drops it (out of scope). WATER mode splits
+                // it (Increment 1 classifier): if the committed coarse route carried water waypoints
+                // NEAR the wedge, this is a `wat-route` planner/ROUTING failure (ours); otherwise the
+                // route was dry near the wedge and the character ended up wet — a `#423` clip (the
+                // pre-existing walk-through-wall-into-water collision bug). Never lumped together.
                 if col.in_water(w) || col.in_water([w[0], w[1], w[2] + 3.0]) {
                     if include_water {
-                        wedged += 1; n_w += 1;
-                        println!("  [{:<12}] {zone}: WATERLINE wedge ({:.1},{:.1},{:.1}) start ({:.1},{:.1},{:.1}) goal ({:.1},{:.1},{:.1}) (#423, out of scope)",
-                            "WATER #423", w[0], w[1], w[2], s[0], s[1], s[2], g[0], g[1], g[2]);
+                        wedged += 1;
+                        let (lbl, tag) = if route_wet_near { n_wr += 1; ("WAT-ROUTE", "route was WET near wedge = planner/routing failure (OURS)") }
+                            else { n_423 += 1; ("#423 CLIP", "route was DRY near wedge, char ended wet = #423 walk-through-wall (separate)") };
+                        println!("  [{lbl:<12}] {zone}:{} wet wedge ({:.1},{:.1},{:.1}) start ({:.1},{:.1},{:.1}) goal ({:.1},{:.1},{:.1}) — {tag}",
+                            if forced { " [forced]" } else { "" }, w[0], w[1], w[2], s[0], s[1], s[2], g[0], g[1], g[2]);
                     } else {
                         walked -= 1;
                     }
@@ -4588,17 +4715,20 @@ mod tests {
                 println!("  [{kind:<12}] {zone}: wedged ({:.1},{:.1},{:.1}) start ({:.1},{:.1},{:.1}) goal ({:.1},{:.1},{:.1})",
                     w[0], w[1], w[2], s[0], s[1], s[2], g[0], g[1], g[2]);
             }
-            println!("{zone:<12} {walked:>6} {wedged:>7} {n_h:>8} {n_o:>8} {n_x:>6} {n_w:>6}");
+            println!("{zone:<12} {walked:>6} {wedged:>7} {n_h:>8} {n_o:>8} {n_x:>6} {n_wr:>9} {n_423:>6}   ({n_forced} forced)");
             tot_pairs += pairs.len(); tot_walked += walked; tot_wedged += wedged;
-            tot_height += n_h; tot_overlap += n_o; tot_other += n_x; tot_water += n_w;
+            tot_height += n_h; tot_overlap += n_o; tot_other += n_x; tot_wr += n_wr; tot_423 += n_423;
         }
         let rate = if tot_walked > 0 { 100.0 * tot_wedged as f32 / tot_walked as f32 } else { 0.0 };
         println!("\n=== FAITHFUL WALKER DRIFT [{}]: {tot_walked} full journeys walked, {tot_wedged} terminal wedges \
-            ({rate:.2}%) — height #386: {tot_height}, overlap #381: {tot_overlap}, other: {tot_other}, water #423: {tot_water} ===",
+            ({rate:.2}%) — height #386: {tot_height}, overlap #381: {tot_overlap}, other: {tot_other}, \
+            wat-route: {tot_wr}, #423: {tot_423} ===",
             if include_water { "WATER-INCLUSIVE" } else { "DRY" });
         if include_water {
-            println!("(water #423 = wedged at a water crossing — the SEPARATE pre-existing collision bug, \
-                      not a traversability-refactor regression; counted here so the water dimension is measured, not hidden.)");
+            println!("(wat-route = wedge whose COMMITTED coarse route carried water waypoints near the wedge = a \
+                      planner/ROUTING failure, OURS to fix in later water-nav increments. #423 = route dry near the \
+                      wedge but the character ended up wet = the SEPARATE pre-existing walk-through-wall-into-water \
+                      collision bug, not a routing failure. The two are never lumped.)");
         }
         let _ = tot_pairs;
         assert!(tot_walked > 0, "no journeys walked — check $ZONE_DIR");
