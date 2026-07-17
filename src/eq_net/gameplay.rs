@@ -255,10 +255,13 @@ pub async fn run_gameplay_phase(
             match packet.opcode {
                 OP_SHOP_PLAYER_BUY  => action_loop.fulfill_buy_ok(&gs, &packet.payload),
                 OP_SHOP_END_CONFIRM => action_loop.fulfill_buy_refused(),
-                // A3 Migration 2 (#448): OP_FinishTrade confirms an awaited quest turn-in — the NPC
-                // accepted the item → `Resolved(GiveOk)`. Applied above (trade slots cleared) before we
-                // resolve, matching the buy fulfils. No-op unless a phase-2 awaited give is parked.
-                OP_FINISH_TRADE     => action_loop.fulfill_give_ok(),
+                // A3 Migration 2 (#448); verify-transfer (#486): OP_FinishTrade ends the trade SESSION
+                // — it does NOT prove the NPC accepted the item (a rejected / out-of-range turn-in fires
+                // it too, then RETURNS the item). So we only NOTE the finish here (applied above with the
+                // trade slots cleared AND any returned-item packet), and the DEFERRED `tick_give` verdict
+                // verifies the item actually left inventory before resolving. No-op unless a phase-2
+                // awaited/fire-and-forget give is parked.
+                OP_FINISH_TRADE     => action_loop.note_finish_trade(),
                 _ => {}
             }
 

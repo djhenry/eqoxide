@@ -102,14 +102,17 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
             tracing::info!("EQ: OP_TradeRequestAck — trade session open");
         }
         OP_FINISH_TRADE         => {
-            // Server finalized the trade (0-byte packet). For a quest turn-in this means the NPC
-            // accepted the item; if the item didn't match, the server returns it on the cursor
-            // via OP_ItemPacket (handled above), which we treat as a soft failure.
-            // The server consumed the handed-in items via m_inv.PopItem (zone/trading.cpp) with no
-            // per-item packet, so clear our mirrored trade slots now that the turn-in is finalized.
+            // Server finalized the trade SESSION (0-byte packet). This does NOT prove the NPC accepted
+            // the item (#486): a rejected / out-of-range turn-in ALSO sends OP_FinishTrade and then
+            // RETURNS the item to the cursor via a SEPARATE OP_ItemPacket sent STRICTLY AFTER this
+            // (EQEmu zone/client_packet.cpp:15488). The awaited-give verdict is therefore VERIFIED
+            // downstream (action_loop `note_finish_trade` → deferred verify-transfer in `tick_give`),
+            // not decided here. We still clear our mirrored trade slots: the server consumed any KEPT
+            // items via m_inv.PopItem (zone/trading.cpp) with no per-item packet, and any RETURNED item
+            // arrives as its own cursor OP_ItemPacket, so clearing the trade slots is correct either way.
             gs.clear_trade_slots();
-            gs.log_msg("trade", "Trade complete");
-            tracing::info!("EQ: give: turn-in complete (OP_FinishTrade)");
+            gs.log_msg("trade", "Trade session ended");
+            tracing::info!("EQ: give: OP_FinishTrade (trade session ended — acceptance verified downstream)");
         }
         OP_ANIMATION            => apply_animation(gs, p),
         OP_BEGIN_CAST           => apply_begin_cast(gs, p),
