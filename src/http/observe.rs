@@ -4,7 +4,7 @@ use axum::{
     body::Body,
     extract::{Query, State},
     http::{header, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
@@ -465,6 +465,16 @@ fn dedup_entities(
     (out, deduped, dup_groups)
 }
 
+// `deny_unknown_fields`: same rationale as `MessagesQuery` (eqoxide#363) — a typo'd `?labled=1`
+// must fail loudly (400) instead of silently degrading to the default view.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EntitiesQuery {
+    /// `?labeled=1` (or `true`) opts into the rich `EntitiesView` that exposes WHICH duplicates were
+    /// collapsed. Omitted / any other value → the default bare `{name:[x,y,z]}` map (still deduped).
+    labeled: Option<String>,
+}
+
 /// GET /v1/observe/entities — the name→position roster of all known entities.
 ///
 /// #471 (agent-honesty): live play saw the roster report ~2× duplicate spawns — byte-identical
@@ -475,23 +485,39 @@ fn dedup_entities(
 /// both name→pos publishers full-replace their maps (`action_loop::sync_entities`, `login.rs`) — so
 /// two distinct ids at one position can only be two genuine server `Mob`s (duplicated `spawn2`
 /// content, whose names the wire disambiguates with a numeric suffix). A packet capture is still
-/// needed to confirm two distinct spawn_ids on the wire vs. a client artifact. Until then this
-/// endpoint collapses same-base-name + identical-position duplicates to one entry and LABELS the
-/// collapse (`deduped`/`duplicate_groups`/`note`) rather than silently dropping — the underlying
-/// entity model is untouched, so every instance stays targetable by its full name.
-async fn get_entities(State(s): State<HttpState>) -> Json<EntitiesView> {
+/// needed to confirm two distinct spawn_ids on the wire vs. a client artifact.
+///
+/// Two response shapes, so the dedup fixes the doubling for EVERY existing consumer with ZERO shape
+/// change:
+/// - **default** → the historical bare `{ "<name>": [x,y,z], … }` map, now with same-base-name +
+///   byte-identical-position duplicates collapsed. Backward-compatible (e.g. `group_driver.py`'s
+///   `ents.get(name)` / `ents.items()` keep working) and its world model is corrected for free.
+/// - **`?labeled=1`** → the rich `EntitiesView` (`count`/`entities`/`deduped`/`duplicate_groups`/
+///   `note`) that LABELS the collapse for agents that want to SEE which duplicates were removed —
+///   nothing is dropped silently (the honesty invariant), just moved off the default shape.
+///
+/// The underlying `gs.entities`/`entity_ids` model is untouched in either case, so every instance
+/// stays targetable by its full (suffixed) name.
+async fn get_entities(State(s): State<HttpState>, Query(q): Query<EntitiesQuery>) -> Response {
     let (entities, deduped, duplicate_groups) = {
         let positions = s.world.entity_positions.lock().unwrap();
         dedup_entities(&positions)
     };
-    let note = (deduped > 0).then(|| format!(
-        "{deduped} entry(ies) collapsed as same-name + byte-identical-position duplicates \
-         (suspected server-side spawn2 duplication, #471). The underlying entity model is \
-         untouched and every instance is still targetable by its full name; see duplicate_groups. \
-         A live packet capture is still needed to confirm this is server-sent (two distinct \
-         spawn_ids on the wire) rather than a client artifact."
-    ));
-    Json(EntitiesView { count: entities.len(), entities, deduped, duplicate_groups, note })
+    let labeled = q.labeled.as_deref()
+        .is_some_and(|v| v.eq_ignore_ascii_case("1") || v.eq_ignore_ascii_case("true"));
+    if labeled {
+        let note = (deduped > 0).then(|| format!(
+            "{deduped} entry(ies) collapsed as same-name + byte-identical-position duplicates \
+             (suspected server-side spawn2 duplication, #471). The underlying entity model is \
+             untouched and every instance is still targetable by its full name; see duplicate_groups. \
+             A live packet capture is still needed to confirm this is server-sent (two distinct \
+             spawn_ids on the wire) rather than a client artifact."
+        ));
+        Json(EntitiesView { count: entities.len(), entities, deduped, duplicate_groups, note }).into_response()
+    } else {
+        // Default: the bare, backward-compatible name→pos map — deduped, but same shape as before.
+        Json(entities).into_response()
+    }
 }
 
 /// GET /v1/observe/inventory — the player's current inventory + equipment, published each tick by
@@ -980,17 +1006,42 @@ mod tests {
         assert_eq!(out.len(), 2);
     }
 
-    /// End-to-end through the router: /observe/entities must return the labeled shape with a
-    /// non-zero `deduped` and an explanatory `note` when the roster carries a positional duplicate.
+    /// Default `/observe/entities` (no query) must stay the BARE `{name:[x,y,z]}` map so existing
+    /// consumers (e.g. group_driver.py's `ents.get(name)` / `ents.items()`) keep working — but the
+    /// positional duplicate is collapsed, so their world model is corrected with zero shape change.
     #[tokio::test]
-    async fn entities_endpoint_labels_the_dedup_471() {
+    async fn entities_default_returns_bare_deduped_map_471() {
+        let state = empty_state();
+        {
+            let mut pos = state.world.entity_positions.lock().unwrap();
+            pos.insert("Geeda".to_string(),        (100.0, 200.0, 5.0));
+            pos.insert("Geeda00".to_string(),      (100.0, 200.0, 5.0)); // the duplicate
+            pos.insert("Bidl_Frugrin".to_string(), (10.0,  20.0,  3.0));
+        }
+        let resp = get(state, "/entities").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // Bare map: top-level keys are names whose values are [x,y,z] arrays — group_driver's contract.
+        assert!(v.is_object() && v.get("entities").is_none() && v.get("deduped").is_none(),
+            "default must be the historical bare map, not the labeled wrapper, got: {v}");
+        assert!(v["Geeda"].is_array(), "ents.get('Geeda') must still return an [x,y,z] list");
+        assert_eq!(v["Geeda"], serde_json::json!([100.0, 200.0, 5.0]));
+        assert!(v.get("Geeda00").is_none(), "the positional duplicate is collapsed out of the map");
+        assert!(v["Bidl_Frugrin"].is_array());
+        assert_eq!(v.as_object().unwrap().len(), 2, "Geeda + Bidl_Frugrin (duplicate collapsed)");
+    }
+
+    /// `?labeled=1` opts into the rich shape with a non-zero `deduped` and an explanatory `note`.
+    #[tokio::test]
+    async fn entities_labeled_param_returns_rich_shape_471() {
         let state = empty_state();
         {
             let mut pos = state.world.entity_positions.lock().unwrap();
             pos.insert("Geeda".to_string(),   (100.0, 200.0, 5.0));
             pos.insert("Geeda00".to_string(), (100.0, 200.0, 5.0));
         }
-        let resp = get(state, "/entities").await;
+        let resp = get(state, "/entities?labeled=1").await;
         assert_eq!(resp.status(), StatusCode::OK);
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -1000,6 +1051,15 @@ mod tests {
             "the collapse must be labeled with an explanation, got: {}", v["note"]);
         assert_eq!(v["duplicate_groups"][0]["kept"], "Geeda");
         assert!(v["entities"]["Geeda"].is_array());
+    }
+
+    /// A typo'd query param must fail loudly (#363 honesty), not silently fall back to the default.
+    #[tokio::test]
+    async fn entities_typoed_param_is_rejected_471() {
+        let state = empty_state();
+        let resp = get(state, "/entities?labled=1").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST,
+            "an unknown query param must be an explicit 400, not a silent default");
     }
 
     fn push_message(state: &HttpState, kind: &str, text: &str) {
