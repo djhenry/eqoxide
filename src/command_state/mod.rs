@@ -67,6 +67,7 @@ mod merchant;
 pub use merchant::BuyOk;
 mod inventory;
 mod interact;
+pub use interact::GiveOk;
 mod quest;
 mod group;
 mod guild;

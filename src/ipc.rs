@@ -419,7 +419,20 @@ pub type MoveReq = Arc<Mutex<Option<(u32, u32)>>>;
 /// Give request — (npc_spawn_id, item_from_slot), set by POST /v1/interact/give.
 /// Nav thread runs the trade-window turn-in: puts the item on the cursor, sends OP_TradeRequest,
 /// waits for OP_TradeRequestAck, then moves the item into the NPC trade slot + OP_TradeAcceptClick.
+/// This is the FIRE-AND-FORGET give the UI turn-in path uses; the honest awaited variant (POST
+/// /v1/interact/give over HTTP) rides the sibling [`GiveAwaitReq`] instead. (#448)
 pub type GiveReq = Arc<Mutex<Option<(u32, u32)>>>;
+
+/// Command-with-result give request (A3 Migration 2, #448) — `(npc spawn id, item from_slot,
+/// oneshot Sender)`. POST /v1/interact/give writes this and AWAITS the `Sender`; the nav thread's
+/// `tick_give` state machine drives the SAME trade-window turn-in the fire-and-forget [`GiveReq`]
+/// path drives, and PARKS the `Sender` inside its `GiveState` until the resolving packet lands:
+/// OP_FinishTrade (the NPC accepted the item) → `Resolved(GiveOk)`; the no-ack / no-finish abort →
+/// `Unconfirmed`; a second awaited give while one is in flight → `Refused` (singleton-in-flight).
+/// Sibling of [`GiveReq`], NOT a replacement — the two slots coexist so the UI turn-in path is
+/// unchanged. See `crate::command_state::result` for the flow.
+pub type GiveAwaitReq = Arc<Mutex<Option<(u32, u32,
+    oneshot::Sender<crate::command_state::CommandResult<crate::command_state::GiveOk>>)>>>;
 
 /// Live snapshot of the player's inventory + equipment, published each tick by the nav thread
 /// and read by GET /v1/observe/inventory. Slots are Titanium **wire** ids (the same numbers /give
@@ -690,6 +703,8 @@ pub struct InteractSlots {
     pub say:            SayReq,
     pub loot:           LootReq,
     pub give:           GiveReq,
+    /// The honest awaited-give slot (A3 Migration 2, #448) — sibling of `give`. See [`GiveAwaitReq`].
+    pub give_await:     GiveAwaitReq,
     pub door_click:     DoorClickReq,
     pub doors_shared:   DoorsShared,
     pub sit:            SitReq,

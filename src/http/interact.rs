@@ -1,7 +1,38 @@
 //! `/v1/interact/*` — NPC/world interaction: hail, say, loot, give (turn-in), doors, sit/stand.
 
-use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+use axum::{
+    body::Body,
+    extract::State,
+    http::{header, StatusCode},
+    response::Response,
+    routing::post,
+    Json, Router,
+};
+use tokio::sync::oneshot;
+use std::time::Duration;
+use crate::command_state::{CommandResult, GiveOk};
 use super::*;
+
+/// HTTP-side await budget for POST /v1/interact/give (#448). Set GREATER than the net-side worst-case
+/// verdict time — the two `tick_give` timeouts run in SEQUENCE, so the net side delivers a verdict by
+/// ≈ (GIVE_ACK_TIMEOUT_TICKS + GIVE_FINISH_TIMEOUT_TICKS) × ~150ms ≈ 6s (see `action_loop`). Awaiting
+/// 8s here guarantees the NET verdict (Resolved/Unconfirmed from the state machine) reaches the caller
+/// rather than a vaguer HTTP-elapsed 202 firing first — the two-timeout ordering landmine.
+pub(crate) const GIVE_HTTP_TIMEOUT_SECS: u64 = 8;
+
+/// A quick `(StatusCode, String)` plain-text response, so the small error paths stay terse.
+fn text(status: StatusCode, body: impl Into<String>) -> Response {
+    Response::builder().status(status)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from(body.into())).unwrap()
+}
+
+/// A JSON response with an explicit status.
+fn json(status: StatusCode, value: serde_json::Value) -> Response {
+    Response::builder().status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(value.to_string())).unwrap()
+}
 
 pub(super) fn router() -> Router<HttpState> {
     Router::new()
@@ -271,27 +302,75 @@ struct GiveBody {
 /// and complete an EQ quest turn-in (trade-window flow). Must be within trade range. The nav thread
 /// runs a multi-tick state machine: it puts the item on the cursor + sends OP_TradeRequest, waits
 /// for OP_TradeRequestAck, then moves the item into the NPC trade slot + sends OP_TradeAcceptClick.
-/// The server replies OP_FinishTrade on completion; if no ack arrives within ~3s the give is aborted.
+///
+/// A3 Migration 2 (#448) — Command-with-result: this no longer returns a premature "queued" 200. It
+/// AWAITS the real outcome (up to 8s) and reports it honestly:
+///   • 200 — the server CONFIRMED the turn-in (OP_FinishTrade — the NPC accepted the item). Body:
+///     `{status:"given", item, npc_id}`.
+///   • 409 — REFUSED before sending: a give was already in flight (singleton-in-flight). Body:
+///     `{status:"refused", reason}`. No second trade was started.
+///   • 202 — the outcome is UNKNOWN: no OP_FinishTrade arrived. This covers the no-ack abort AND the
+///     ITEM-MISMATCH case (the server returns the item on the cursor with NO OP_FinishTrade), plus a
+///     lost reply or a zone change mid-give. The body says so explicitly. A 202 MUST NOT be read as
+///     success — that is the whole honesty invariant of A3 (see `crate::command_state::result`).
 async fn post_give(
     State(s): State<HttpState>,
     body: Result<Json<GiveBody>, axum::extract::rejection::JsonRejection>,
-) -> (StatusCode, String) {
+) -> Response {
     let b = match body {
         Ok(Json(b)) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"npc\":\"...\",\"from\":N}".into()),
+        Err(_) => return text(StatusCode::BAD_REQUEST, "provide {\"npc\":\"...\",\"from\":N}"),
     };
-    let ids = s.world.entity_ids.lock().unwrap();
-    let nl = b.npc.to_lowercase();
-    let found = ids.iter()
-        .find(|(k, _)| clean_entity_name(k).to_lowercase().contains(&nl) || k.to_lowercase().contains(&nl))
-        .map(|(k, &id)| (k.clone(), id));
-    match found {
-        Some((key, id)) => {
-            s.command.request_give(id, b.from);
-            tracing::info!("give: queued npc {:?} (spawn_id={}) from_slot={}", key, id, b.from);
-            (StatusCode::OK, format!("giving slot {} to {} (spawn_id={})", b.from, clean_entity_name(&key), id))
-        }
-        None => (StatusCode::NOT_FOUND, format!("no NPC matching {:?}", b.npc)),
+    // Resolve the NPC, then DROP the entity map lock before awaiting — never hold a std Mutex across
+    // an `.await`.
+    let found = {
+        let ids = s.world.entity_ids.lock().unwrap();
+        let nl = b.npc.to_lowercase();
+        ids.iter()
+            .find(|(k, _)| clean_entity_name(k).to_lowercase().contains(&nl) || k.to_lowercase().contains(&nl))
+            .map(|(k, &id)| (k.clone(), id))
+    };
+    let (key, id) = match found {
+        Some(hit) => hit,
+        None => return text(StatusCode::NOT_FOUND, format!("no NPC matching {:?}", b.npc)),
+    };
+
+    // Park the give with a result channel and await the TRUE outcome (park → fulfil → timeout).
+    let (tx, rx) = oneshot::channel::<CommandResult<GiveOk>>();
+    s.command.request_give_await(id, b.from, tx);
+    tracing::info!("give: awaited give queued — npc {:?} (spawn_id={}) from_slot={}", key, id, b.from);
+
+    match tokio::time::timeout(Duration::from_secs(GIVE_HTTP_TIMEOUT_SECS), rx).await {
+        // A REAL OP_FinishTrade landed — the NPC accepted the item.
+        Ok(Ok(CommandResult::Resolved(GiveOk { npc_id, item_name }))) => json(
+            StatusCode::OK,
+            serde_json::json!({
+                "status": "given",
+                "item": item_name,
+                "npc_id": npc_id,
+            }),
+        ),
+        // A pre-send rejection: another give was already in flight (singleton-in-flight).
+        Ok(Ok(CommandResult::Refused(reason))) => json(
+            StatusCode::CONFLICT,
+            serde_json::json!({ "status": "refused", "reason": reason }),
+        ),
+        // Unconfirmed, channel closed (Sender dropped — disconnect), or elapsed: the outcome is
+        // genuinely UNKNOWN. The no-ack abort and the ITEM-MISMATCH case (item returned on the cursor,
+        // no OP_FinishTrade) both land here. MUST NOT read as success — 202 with an explicit body.
+        _ => json(
+            StatusCode::ACCEPTED,
+            serde_json::json!({
+                "status": "unconfirmed",
+                "message": "give sent to the NPC, but the outcome is UNKNOWN — no OP_FinishTrade \
+                            confirmation arrived. The NPC may not have accepted the item (a quest \
+                            turn-in the item doesn't match returns it to you with no confirmation), \
+                            the trade may have timed out, or the reply was lost. Re-check GET \
+                            /v1/observe/inventory for the item before assuming it succeeded.",
+                "npc": clean_entity_name(&key),
+                "from": b.from,
+            }),
+        ),
     }
 }
 
@@ -532,5 +611,108 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(command.take_loot(), Some(9));
+    }
+
+    // ── A3 Migration 2 (#448): POST /v1/interact/give reports the TRUE outcome, not a queued 200 ──
+
+    use crate::command_state::{CommandResult, GiveOk};
+
+    /// A give to a nonexistent NPC 404s before parking anything.
+    #[tokio::test]
+    async fn give_unknown_npc_is_404() {
+        let state = empty_state();
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/give").header("content-type", "application/json")
+            .body(Body::from(r#"{"npc":"Nobody","from":23}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(command.take_give_await().is_none(), "a 404 must not park a give");
+    }
+
+    /// SUCCESS: the server confirms the turn-in (OP_FinishTrade, delivered here as `Resolved`) → 200
+    /// with the honest receipt body (item/npc_id).
+    #[tokio::test]
+    async fn give_confirmed_is_200_with_the_receipt() {
+        let state = empty_state();
+        seed_npc(&state, "Priest_of_Mischief000", 11, (1.0, 1.0, 0.0));
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let task = tokio::spawn(async move {
+            app.oneshot(Request::post("/give").header("content-type", "application/json")
+                .body(Body::from(r#"{"npc":"Mischief","from":23}"#)).unwrap()).await.unwrap()
+        });
+        // Wait for the handler to park its Sender, then deliver the confirmed receipt.
+        let (npc_id, from_slot, tx) = loop {
+            if let Some(p) = command.take_give_await() { break p; }
+            tokio::task::yield_now().await;
+        };
+        assert_eq!((npc_id, from_slot), (11, 23));
+        tx.send(CommandResult::Resolved(GiveOk { npc_id: 11, item_name: "Bone Chips".into() })).unwrap();
+
+        let resp = task.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["status"], "given");
+        assert_eq!(v["item"], "Bone Chips");
+        assert_eq!(v["npc_id"], 11);
+    }
+
+    /// REFUSAL: a give already in flight (singleton-in-flight, delivered as `Refused`) → 409.
+    #[tokio::test]
+    async fn give_refused_is_409() {
+        let state = empty_state();
+        seed_npc(&state, "Priest_of_Mischief000", 11, (1.0, 1.0, 0.0));
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let task = tokio::spawn(async move {
+            app.oneshot(Request::post("/give").header("content-type", "application/json")
+                .body(Body::from(r#"{"npc":"Mischief","from":23}"#)).unwrap()).await.unwrap()
+        });
+        let (_n, _s, tx) = loop {
+            if let Some(p) = command.take_give_await() { break p; }
+            tokio::task::yield_now().await;
+        };
+        tx.send(CommandResult::Refused("a give is already in flight; retry".into())).unwrap();
+
+        let resp = task.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["status"], "refused");
+    }
+
+    /// NO-CONFIRMATION SILENCE — THE HONESTY PROOF at the HTTP boundary. Nothing ever fires the parked
+    /// Sender (the net-side `tick_give` verdict is exercised in the action_loop tests); here the 8s
+    /// timeout elapses in virtual time (`start_paused`) → **202**, NOT 200. The body must say the
+    /// outcome is UNKNOWN. The Sender is HELD (not dropped) across the wait, so this exercises the
+    /// genuine ELAPSED branch, not a channel-closed shortcut.
+    #[tokio::test(start_paused = true)]
+    async fn give_with_no_confirmation_is_202_unknown_never_success() {
+        let state = empty_state();
+        seed_npc(&state, "Priest_of_Mischief000", 11, (1.0, 1.0, 0.0));
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let task = tokio::spawn(async move {
+            app.oneshot(Request::post("/give").header("content-type", "application/json")
+                .body(Body::from(r#"{"npc":"Mischief","from":23}"#)).unwrap()).await.unwrap()
+        });
+        // Take the parked Sender and HOLD it — the server's silence, faithfully modelled.
+        let held = loop {
+            if let Some(p) = command.take_give_await() { break p; }
+            tokio::task::yield_now().await;
+        };
+
+        let resp = task.await.unwrap(); // 8s timeout elapses in virtual time
+        assert_ne!(resp.status(), StatusCode::OK,
+            "a give with no OP_FinishTrade MUST NOT be reported as success — the A3 invariant");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["status"], "unconfirmed");
+        let msg = v["message"].as_str().unwrap();
+        assert!(msg.contains("UNKNOWN"), "the body must state the outcome is unknown");
+        drop(held);
     }
 }

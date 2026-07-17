@@ -63,7 +63,7 @@ mod move_api;
 mod trainer;
 mod pet;
 mod combat;
-mod interact;
+pub(crate) mod interact;
 mod merchant;
 mod inventory;
 mod chat;

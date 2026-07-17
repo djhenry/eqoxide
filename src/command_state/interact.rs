@@ -11,8 +11,25 @@
 //! /v1/observe/dialogue) are read-path/published snapshots, not commands — deliberately NOT
 //! exposed here (see `mod.rs`).
 
-use super::CommandState;
+use super::{CommandResult, CommandState};
 use crate::game_state::DialogueChoice;
+use tokio::sync::oneshot;
+
+/// The honest receipt of a confirmed NPC turn-in (A3 Migration 2, #448) — the `T` in
+/// `CommandResult<GiveOk>` and the JSON body of a 200 from POST /v1/interact/give. It records WHAT
+/// was handed in (`item_name`, captured from the inventory slot at send time — the trade slots are
+/// already cleared by the time the confirming OP_FinishTrade is applied, so it cannot be read back
+/// then) and to WHOM (`npc_id`). Unlike a merchant buy there is no server-recomputed receipt to
+/// mirror: OP_FinishTrade is a 0-byte "the NPC accepted it" ack, so `GiveOk` is the honest statement
+/// "this item's turn-in to this NPC was ACCEPTED" — only ever sent on a real OP_FinishTrade, never a
+/// send-time guess. See `crate::command_state::result`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GiveOk {
+    /// Spawn id of the NPC the item was handed to (the give's target).
+    pub npc_id: u32,
+    /// Name of the item that was turned in, captured from the inventory slot at send time.
+    pub item_name: String,
+}
 
 impl CommandState {
     // ── request_* : the VIEW (UI click-handlers + HTTP handlers) makes these writes ──────────────
@@ -36,10 +53,26 @@ impl CommandState {
         *self.interact.loot.lock().unwrap() = Some(corpse_id);
     }
 
-    /// Give (quest turn-in) inventory slot `from_slot` to NPC `npc_id` (POST /v1/interact/give).
-    /// The drain runs the multi-tick trade-window state machine.
+    /// Give (quest turn-in) inventory slot `from_slot` to NPC `npc_id` — FIRE-AND-FORGET (the UI
+    /// turn-in path). The drain runs the multi-tick trade-window state machine. HTTP's POST
+    /// /v1/interact/give uses the awaited [`request_give_await`](Self::request_give_await) instead.
     pub fn request_give(&self, npc_id: u32, from_slot: u32) {
         *self.interact.give.lock().unwrap() = Some((npc_id, from_slot));
+    }
+
+    /// Command-with-result give (A3 Migration 2, #448): queue the SAME turn-in as `request_give` but
+    /// hand in a `oneshot::Sender<CommandResult<GiveOk>>` the net thread fulfils with the TRUE
+    /// outcome. POST /v1/interact/give awaits the matching receiver under a timeout so it reports the
+    /// real result (OP_FinishTrade → 200, no-ack/no-finish → 202, a give already in flight → 409)
+    /// instead of a premature queued-action 200. Writes the sibling `give_await` slot — the
+    /// fire-and-forget `give` slot (UI path) is left untouched. See `crate::command_state::result`.
+    pub fn request_give_await(
+        &self,
+        npc_id: u32,
+        from_slot: u32,
+        tx: oneshot::Sender<CommandResult<GiveOk>>,
+    ) {
+        *self.interact.give_await.lock().unwrap() = Some((npc_id, from_slot, tx));
     }
 
     /// Click a door by id (POST /v1/interact/click_door, or a human click in the 3D view). The
@@ -86,6 +119,15 @@ impl CommandState {
     /// Drain a pending give request as `(npc_id, from_slot)`.
     pub fn take_give(&self) -> Option<(u32, u32)> {
         self.interact.give.lock().unwrap().take()
+    }
+
+    /// Drain a pending awaited-give request as `(npc_id, from_slot, Sender)` (A3 Migration 2, #448).
+    /// `ActionLoop::tick_give` takes this, parks the `Sender` inside its `GiveState`, and runs the
+    /// turn-in until the resolving packet lands. Sibling of `take_give`.
+    pub fn take_give_await(
+        &self,
+    ) -> Option<(u32, u32, oneshot::Sender<CommandResult<GiveOk>>)> {
+        self.interact.give_await.lock().unwrap().take()
     }
 
     /// Drain a pending door-click request (door id).
@@ -167,5 +209,33 @@ mod tests {
         assert_eq!(cs.take_sit(), None);
         assert!(cs.take_dialogue_click().is_none());
         assert_eq!(cs.take_read_book(), None);
+        assert!(cs.take_give_await().is_none());
+    }
+
+    /// A3 Migration 2 (#448): the awaited-give slot round-trips the `(npc_id, from_slot, Sender)`
+    /// tuple, the drain removes it, and the drained `Sender` still reaches its receiver — proving
+    /// `give_await` is a genuine sibling of the fire-and-forget `give` slot and does NOT disturb it.
+    #[tokio::test]
+    async fn request_give_await_round_trips_the_sender_and_leaves_give_untouched() {
+        use super::{CommandResult, GiveOk};
+        let cs = CommandState::default();
+        let (tx, rx) = tokio::sync::oneshot::channel::<CommandResult<GiveOk>>();
+
+        cs.request_give_await(11, 23, tx);
+        // The fire-and-forget UI slot is a genuinely separate cell — an awaited give must not queue it.
+        assert_eq!(cs.take_give(), None,
+            "the awaited give must not leak into the fire-and-forget UI slot");
+
+        let (npc_id, slot, drained_tx) = cs.take_give_await().expect("awaited give must drain");
+        assert_eq!((npc_id, slot), (11, 23));
+        assert!(cs.take_give_await().is_none(), "a drained awaited give must not re-fire");
+
+        drained_tx.send(CommandResult::Resolved(GiveOk {
+            npc_id: 11, item_name: "Bone Chips".into(),
+        })).unwrap();
+        assert_eq!(
+            rx.await.unwrap(),
+            CommandResult::Resolved(GiveOk { npc_id: 11, item_name: "Bone Chips".into() }),
+        );
     }
 }
