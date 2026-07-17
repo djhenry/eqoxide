@@ -520,6 +520,25 @@ impl Walker {
     /// collided gravity path descends off the edge; the landing damage is applied driver-agnostically
     /// in `ActionLoop::stream_position`. The only thing this method still does about big drops is the
     /// pre-emptive lethal-fall SAFETY guard (don't walk off a ledge a fall from which would kill us).
+    /// Resolve this zone's intra-zone teleport pads (#403) for the planner. Same-zone DRNTP
+    /// translocators from the `OP_SendZonepoints` list — filtered to `zp.zone_id == gs.zone_id` (so a
+    /// CROSS-zone line is never turned into an intra-zone teleport) and with the keep-position
+    /// sentinel (`999999`, relocates nobody) dropped — then honesty-gated by `resolve_teleport_pads`
+    /// (only pads whose footprint AND advertised destination land on walkable floor become edges).
+    /// Empty in the common case (a zone with no same-zone pads), so ordinary plans pay nothing.
+    fn same_zone_teleport_pads(&self, gs: &GameState, c: &crate::nav::collision::Collision)
+        -> Vec<crate::nav::collision::PadEdge> {
+        let advertised: Vec<(i32, [f32; 3])> = self.world.zone_points.lock().unwrap().iter()
+            .filter(|zp| zp.zone_id == gs.zone_id
+                && zp.server_x.abs() < 900_000.0
+                && zp.server_y.abs() < 900_000.0
+                && zp.server_z.abs() < 900_000.0)
+            .map(|zp| (zp.iterator as i32, [zp.server_x, zp.server_y, zp.server_z]))
+            .collect();
+        if advertised.is_empty() { return Vec::new(); }
+        c.resolve_teleport_pads(&advertised)
+    }
+
     pub(crate) fn drive_walk(&mut self, gs: &mut GameState, goal: (f32, f32, f32)) {
         if self.replan_cooldown > 0 { self.replan_cooldown -= 1; }
         let is_chase = self.nav.goto_entity.lock().unwrap().is_some();
@@ -552,6 +571,7 @@ impl Walker {
             match col {
                 Some(c) => {
                     let goal_region = c.zone_line_at([goal.0, goal.1, goal.2 + 1.0]);
+                    let teleport_pads = self.same_zone_teleport_pads(gs, &c);
                     let t0 = std::time::Instant::now();
                     let gen = self.planner.request(crate::nav::planner::PlanRequest {
                         gen: 0, // assigned by the planner
@@ -560,6 +580,7 @@ impl Walker {
                         avoid,
                         aggro_buffer: av.buffer,
                         goal_region,
+                        teleport_pads,
                         collision: c,
                     });
                     self.path_goal = Some(goal); // the goal the committed/incoming route is FOR
@@ -765,6 +786,7 @@ impl Walker {
                 let col = self.collision.read().unwrap().as_ref().cloned();
                 if let Some(c) = col {
                     let goal_region = c.zone_line_at([goal.0, goal.1, goal.2 + 1.0]);
+                    let teleport_pads = self.same_zone_teleport_pads(gs, &c);
                     let gen = self.planner.request(crate::nav::planner::PlanRequest {
                         gen: 0,
                         start: [gs.player_x, gs.player_y, gs.player_z],
@@ -772,6 +794,7 @@ impl Walker {
                         avoid,
                         aggro_buffer: av.buffer,
                         goal_region,
+                        teleport_pads,
                         collision: c,
                     });
                     self.stuck_ticks = 0;

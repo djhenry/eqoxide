@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Instant;
 
-use crate::nav::collision::{Collision, LocalOutcome, NoRoute, PlanCtx, PlanOutcome};
+use crate::nav::collision::{Collision, LocalOutcome, NoRoute, PadEdge, PlanCtx, PlanOutcome};
 use crate::movement::PLAYER_RADIUS;
 
 /// One plan the walker wants computed. Carries its own `Arc<Collision>` so the worker never touches
@@ -59,6 +59,11 @@ pub struct PlanRequest {
     pub aggro_buffer: f32,
     /// Zone-point index of the DRNTP region we're routing to, when the goal is a zone line (#229).
     pub goal_region:  Option<i32>,
+    /// Intra-zone teleport-pad edges for this zone (#403): resolved same-zone DRNTP translocators A*
+    /// may route THROUGH. Built by the walker from `OP_SendZonepoints` (`resolve_teleport_pads`), so
+    /// only pads with a real advertised same-zone destination on walkable floor are present. Empty in
+    /// the common case (no same-zone pads).
+    pub teleport_pads: Vec<PadEdge>,
     pub collision:    Arc<Collision>,
 }
 
@@ -300,7 +305,7 @@ fn worker_impl(req_rx: Receiver<PlanRequest>, rep_tx: Sender<PlanReply>, on_dequ
             }
             None => {}
         }
-        let (outcome, tight) = plan_path(&req.collision, req.start, req.goal, &req.avoid, req.aggro_buffer, req.goal_region);
+        let (outcome, tight) = plan_path(&req.collision, req.start, req.goal, &req.avoid, req.aggro_buffer, req.goal_region, &req.teleport_pads);
         let plan_ms = t0.elapsed().as_millis();
         // The headline number for #340: this is the synchronous stall that used to sit on the net
         // thread (capped at 150 ms per A* call, up to ~2 s per plan). It now sits here, where the
@@ -343,6 +348,7 @@ pub fn plan_path(
     avoid: &[[f32; 2]],
     aggro_buffer: f32,
     goal_region: Option<i32>,
+    teleport_pads: &[PadEdge],
 ) -> (PlanOutcome, bool) {
     // ONE node budget for the WHOLE plan, not one per A* call (#340, #394 review). This function makes
     // up to 13 A* calls (the route + a 12-point re-anchor ring), and `search_tiered` makes up to 2
@@ -353,7 +359,8 @@ pub fn plan_path(
     // one plan's worth (~28 s worst case, measured). Nothing real-time waits on this thread, but a
     // plan that runs for minutes still blocks the NEXT goal (the worker coalesces only between plans),
     // so the plan-wide bound matters.
-    let ctx = PlanCtx::worker().ensure_budget().with_goal_region(goal_region);
+    let ctx = PlanCtx::worker().ensure_budget().with_goal_region(goal_region)
+        .with_teleport_pads(teleport_pads.to_vec());
     plan_path_with_ctx(col, start, goal, avoid, aggro_buffer, ctx)
 }
 
@@ -648,7 +655,7 @@ mod tests {
     #[test]
     fn an_unreachable_goal_reports_unreachable_not_a_partial_route() {
         let col = plane_with_sealed_box(1000.0, 400.0, 400.0);
-        let (out, _tier) = plan_path(&col, [-900.0, -900.0, 0.0], [400.0, 400.0, 0.0], &[], 0.0, None);
+        let (out, _tier) = plan_path(&col, [-900.0, -900.0, 0.0], [400.0, 400.0, 0.0], &[], 0.0, None, &[]);
         match &out {
             PlanOutcome::Unreachable { reason: NoRoute::SearchClosed, .. } => {}
             other => panic!("a walled-off goal must report a DEFINITIVE Unreachable(SearchClosed), got {other:?}"),
@@ -691,7 +698,7 @@ mod tests {
         // (4 iterations, not more: each is a full 62,500-cell frontier close — the point is proven by a
         // handful of repeats under load, and a property test must not itself become a CI time sink.)
         for i in 0..4 {
-            let (out, _tier) = plan_path(&col, [-900.0, -900.0, 0.0], [400.0, 400.0, 0.0], &[], 0.0, None);
+            let (out, _tier) = plan_path(&col, [-900.0, -900.0, 0.0], [400.0, 400.0, 0.0], &[], 0.0, None, &[]);
             assert!(matches!(out, PlanOutcome::Unreachable { reason: NoRoute::SearchClosed, .. }),
                 "run {i} under full CPU load returned {out:?} — the coarse planner's answer must NOT \
                  depend on machine speed. A wall-clock budget would flip this to Exhausted(Deadline); a \
@@ -766,7 +773,7 @@ mod tests {
     #[test]
     fn a_reachable_goal_still_routes() {
         let col = plane_with_sealed_box(1000.0, 400.0, 400.0);
-        let (out, _tier) = plan_path(&col, [-900.0, -900.0, 0.0], [900.0, 900.0, 0.0], &[], 0.0, None);
+        let (out, _tier) = plan_path(&col, [-900.0, -900.0, 0.0], [900.0, 900.0, 0.0], &[], 0.0, None, &[]);
         let route = out.route().unwrap_or_else(|| panic!("an open-plane goal must route, got {out:?}"));
         let last = *route.last().unwrap();
         assert!((last[0] - 900.0).abs() < 8.0 && (last[1] - 900.0).abs() < 8.0,
@@ -805,7 +812,7 @@ mod tests {
         let (mut planner, dequeued) = Planner::spawn_with_dequeue_signal();
         let mk = |goal: [f32; 3], col: &Arc<Collision>| PlanRequest {
             gen: 0, start: [-900.0, -900.0, 0.0], goal,
-            avoid: vec![], aggro_buffer: 0.0, goal_region: None, collision: col.clone(),
+            avoid: vec![], aggro_buffer: 0.0, goal_region: None, teleport_pads: vec![], collision: col.clone(),
         };
         // Plan A: the sealed goal — a full-grid search, hundreds of ms (longer still under load).
         let gen_a = planner.request(mk([400.0, 400.0, 0.0], &col));
@@ -852,7 +859,7 @@ mod tests {
 
         planner.request(PlanRequest {
             gen: 0, start: [-300.0, -300.0, 0.0], goal: [300.0, 300.0, 0.0],
-            avoid: vec![], aggro_buffer: 0.0, goal_region: None, collision: col,
+            avoid: vec![], aggro_buffer: 0.0, goal_region: None, teleport_pads: vec![], collision: col,
         });
         // Poll as the nav tick would. It must NOT sit there pretending a plan is coming.
         for _ in 0..50 {
@@ -882,7 +889,7 @@ mod tests {
         let goal = [300.0, 300.0, 0.0];
         planner.request(PlanRequest {
             gen: 0, start: [-300.0, -300.0, 0.0], goal,
-            avoid: vec![], aggro_buffer: 0.0, goal_region: None, collision: col,
+            avoid: vec![], aggro_buffer: 0.0, goal_region: None, teleport_pads: vec![], collision: col,
         });
         assert_eq!(planner.in_flight_goal(), Some(goal), "the posted goal is in flight");
 
@@ -906,7 +913,7 @@ mod tests {
         let mut planner = Planner::spawn();
         planner.request(PlanRequest {
             gen: 0, start: [-300.0, -300.0, 0.0], goal: [300.0, 300.0, 0.0],
-            avoid: vec![], aggro_buffer: 0.0, goal_region: None, collision: col,
+            avoid: vec![], aggro_buffer: 0.0, goal_region: None, teleport_pads: vec![], collision: col,
         });
         planner.cancel();
         for _ in 0..60 {
@@ -932,7 +939,7 @@ mod tests {
 
         // What the NET THREAD used to pay, synchronously, for this plan:
         let t0 = Instant::now();
-        let (outcome, _tier) = plan_path(&col, start, goal, &[], 0.0, None);
+        let (outcome, _tier) = plan_path(&col, start, goal, &[], 0.0, None, &[]);
         let sync_us = t0.elapsed().as_micros();
         assert!(matches!(outcome, PlanOutcome::Unreachable { .. }), "fixture sanity: this goal is sealed off");
 
@@ -941,7 +948,7 @@ mod tests {
         let t1 = Instant::now();
         planner.request(PlanRequest {
             gen: 0, start, goal, avoid: vec![], aggro_buffer: 0.0, goal_region: None,
-            collision: col.clone(),
+            teleport_pads: vec![], collision: col.clone(),
         });
         let post_us = t1.elapsed().as_micros();
 
