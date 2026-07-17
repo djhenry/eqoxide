@@ -236,8 +236,8 @@ The native client is position-authoritative: it never receives its own position 
 | Step-up height (controller, per-tick) | **2.0 units** | `STEP_UP = 2.0` (`src/movement.rs:17`) | Fixed — matches native exactly |
 | Step-up height (A\* cell-to-cell) | N/A — native has no single "max climb," see §4a | `STEP_H = 20.0` (`src/assets.rs:1062`) | Deliberately larger than the controller's 2.0: represents a *sequence* of native 2.0u steps across an 8u cell, gated by `MAX_WALK_GRADE` below, not a literal per-tick cap |
 | Slope/grade limit | **none — no angle check exists**; emergent from step-height (2.0u) vs per-tick horizontal distance (§4a) | `rise/run > 1.2` (~50°) flat cutoff | eqoxide's constant-grade cutoff is a reasonable approximation, not a client-derived value; the real client's tolerance scales with how far you move per tick, so short steep steps are more forgiving than a long steep grade of the same average angle |
-| Position update interval | **280 ms min** | **150 ms** | eqoxide sends twice as often; server tolerates it but wastes bandwidth |
-| Force-send interval | **1300 ms** | N/A (no keepalive) | Consider adding a keepalive send every ~1–2 s when stationary |
+| Position update interval | **280 ms min** | **280 ms** (`POS_SEND_MOVING_MS`, `action_loop.rs:22`) | UPDATED — matches native now; this row was stale (previously said 150 ms/no keepalive) |
+| Force-send interval | **1300 ms** | **1300 ms** (`POS_SEND_KEEPALIVE_MS`, `action_loop.rs:24`) | UPDATED — matches native now; see `position-update-wire-format.md` for the remaining gap (exact-equality `moving` gate causes delta/anim flicker vs native's 0.001-epsilon gate) |
 | Axis-separated slide | At higher-level caller | `path_clear` x/y retry | Architecture matches |
 | Collision geometry | WLD faces with PASSABLE bit (0x0010) clear, incl. no-material INVIS faces | `__collision__` GLB mesh when baked (falls back to render tris for legacy/un-rebaked zones) | Fixed — see §7; `Collision::build` (`src/assets.rs:519-529`) already prefers `__collision__`; only un-rebaked zones fall back to render-only |
 
