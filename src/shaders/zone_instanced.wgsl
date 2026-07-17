@@ -1,4 +1,9 @@
-struct Camera { view_proj: mat4x4<f32>, };
+struct Camera {
+    view_proj:  mat4x4<f32>,
+    camera_pos: vec4<f32>,
+    fog_color:  vec4<f32>,
+    fog_params: vec4<f32>, // x=minclip, y=maxclip, z=density, w=enabled(0/1)
+};
 @group(0) @binding(0) var<uniform> camera: Camera;
 @group(1) @binding(0) var t_diffuse: texture_2d<f32>;
 @group(1) @binding(1) var s_diffuse: sampler;
@@ -16,6 +21,7 @@ struct VertexOutput {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) normal: vec3<f32>,
     @location(1) uv:     vec2<f32>,
+    @location(2) world_pos: vec3<f32>,
 };
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
@@ -28,8 +34,19 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     let nw = inst3 * in.normal;
     out.normal = vec3<f32>(nw.z, nw.x, nw.y);
     out.uv = in.uv;
+    out.world_pos = render;
     return out;
 }
+
+// See zone.wgsl's apply_fog for the rationale (RoF2 linear distance fog, eqoxide#517).
+fn apply_fog(color: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
+    let dist  = length(world_pos - camera.camera_pos.xyz);
+    let range = max(camera.fog_params.y - camera.fog_params.x, 0.001);
+    let t     = clamp((dist - camera.fog_params.x) / range, 0.0, 1.0)
+                * camera.fog_params.z * camera.fog_params.w;
+    return mix(color, camera.fog_color.rgb, t);
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let light = max(dot(normalize(in.normal), normalize(vec3<f32>(0.5, 1.0, 0.3))), 0.1);
@@ -39,7 +56,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if (texel.a < 0.5) {
         discard;
     }
-    return vec4<f32>(texel.rgb * light, texel.a);
+    let lit = texel.rgb * light;
+    return vec4<f32>(apply_fog(lit, in.world_pos), texel.a);
 }
 
 // Blended/additive instanced surfaces: no alpha-test discard (opacity baked into
@@ -48,5 +66,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 fn fs_blend(in: VertexOutput) -> @location(0) vec4<f32> {
     let light = max(dot(normalize(in.normal), normalize(vec3<f32>(0.5, 1.0, 0.3))), 0.1);
     let texel = textureSample(t_diffuse, s_diffuse, in.uv);
-    return vec4<f32>(texel.rgb * light, texel.a);
+    let lit = texel.rgb * light;
+    return vec4<f32>(apply_fog(lit, in.world_pos), texel.a);
 }

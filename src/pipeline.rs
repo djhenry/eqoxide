@@ -40,7 +40,10 @@ pub fn build_layouts(device: &wgpu::Device) -> Layouts {
         label: Some("camera_bgl"),
         entries: &[wgpu::BindGroupLayoutEntry {
             binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX,
+            // FRAGMENT added alongside VERTEX (eqoxide#517): the fog fields riding along on this
+            // uniform (camera_pos/fog_color/fog_params) are read in every fragment shader's
+            // apply_fog(), not just the vertex stage's view_proj transform.
+            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
                 has_dynamic_offset: false,
@@ -103,12 +106,20 @@ pub fn build_layouts(device: &wgpu::Device) -> Layouts {
     Layouts { camera_bgl, texture_bgl, entity_bgl, joints_bgl }
 }
 
-/// Create the camera uniform buffer and its bind group.
+/// Create the camera uniform buffer and its bind group. Sized for `gpu::CameraUniformData`
+/// (view_proj + camera_pos + fog_color + fog_params, eqoxide#517) — the bind group layout itself
+/// (`camera_bgl`) didn't need to change since it already covers "the whole buffer" at binding 0.
 pub fn build_camera_uniform(device: &wgpu::Device, layouts: &Layouts) -> CameraUniform {
     use wgpu::util::DeviceExt;
+    let init = crate::gpu::CameraUniformData {
+        view_proj:  [[0.0; 4]; 4],
+        camera_pos: [0.0; 4],
+        fog_color:  [0.0; 4],
+        fog_params: [0.0; 4],
+    };
     let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("camera"),
-        contents: bytemuck::cast_slice(&[[0.0f32; 4]; 4]),
+        contents: bytemuck::bytes_of(&init),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
