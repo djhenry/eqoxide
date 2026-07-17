@@ -162,3 +162,61 @@ Related: `spawn-struct-race-equipment-branch.md` (same `Spawn_Struct` field
 layout/decode-order, race-gated equipment block),
 `spawn-struct-level-field.md` (same struct family, documents `zone_controller`
 level/position).
+
+## Addendum (agent-honesty review, 2026-07): `properties_count` is never 0 for these NPCs
+
+Re-verified for a correctness review of a fix that filters on this field. Extra
+findings, confirmed directly in source:
+
+- `properties_count` (the `uint8` immediately before `bodytype` on the wire,
+  `rof2_structs.h:448` docs it as position `/*0000*/` right after this byte) is
+  **hardcoded to `1`** for every non-`DestructibleObject` spawn —
+  `rof2.cpp:4771` `VARSTRUCT_ENCODE_TYPE(uint8, Buffer, 1);` — immediately
+  followed by `rof2.cpp:4772`
+  `VARSTRUCT_ENCODE_TYPE(uint32, Buffer, emu->bodytype);`. It is **not**
+  conditional on the spawn's bodytype value or NPC-ness; it is only `0` in the
+  `else` branch for `emu->DestructibleObject` spawns (`rof2.cpp:4766,4776`),
+  which is a narrow, separate flag for breakable/interactive-object NPCs
+  (`IsNPC() && IsDestructibleObject()`, `zone/mob.cpp:1408-1409`) — LDoN
+  doors/breakables, not controller/utility mobs.
+- `zone_controller` (`zone/npc.cpp:868-906`, `bodytype=11` at line 892) and
+  DB-authored controller NPCs (`campday`, `campnight`, `mischief_controller`,
+  etc.) are ordinary `Mob`-derived NPCs, never `DestructibleObject` — so they
+  always take the `properties_count=1` branch and their real `bodytype` (11,
+  already `< 66` so the `>=66` rewrite doesn't touch it) is written verbatim.
+  **There is no wire path where a controller NPC's `bodytype` is absent or
+  defaults to 0.**
+- Anti-cheat backstop confirmed at **two** sites in the same handler
+  (`zone/client_packet.cpp`, `Handle_OP_TargetCommand`), both checking all
+  three values `{NoTarget=11, NoTarget2=60, Special=67}`:
+  `client_packet.cpp:15100-15102` (gates `can_target` when acquiring a new
+  target) and `client_packet.cpp:15245-15258` (logs `POSSIBLE_HACK` and clears
+  an already-set target). `bodytypes.h` constant line numbers: `NoTarget=11`
+  at line 37, `NoTarget2=60` at line 61, `InvisibleMan=66` at line 64,
+  `Special=67` at line 65.
+- Confirmed no legitimate spawn class can carry `bodytype` 11/60 on the RoF2
+  wire:
+  - **Player characters**: hardcoded `BodyType::Humanoid` at construction,
+    `zone/client.cpp:88` and `:395` — never 11/60.
+  - **Summoned pets**: `bodytype` comes from the pet spawn record, not copied
+    from any source NPC; the one appearance-copy path that does borrow fields
+    from another NPC (`monsterflag` "monster summoning" pets,
+    `zone/pets.cpp:235-253`) copies `race/size/texture/gender/luclinface/
+    helmtexture/herosforgemodel` only, explicitly not `bodytype`, and its
+    candidate-NPC SQL pool already excludes `bodytype IN (11, 33, 66, 67)`
+    (`zone/pets.cpp:222`).
+  - **Charmed pets** keep the source NPC's real `bodytype`, so a charmed
+    `bodytype=11/60` mob is theoretically possible in the data model, but not
+    reachable through the real client: you cannot target such an NPC to cast
+    Charm on it in the first place, per the same `client_packet.cpp:15100-15102`
+    check.
+  - No real/quest-facing targetable NPC content was found using 11/60; both
+    the header comments (`bodytypes.h:37` "no name, can't target this
+    bodytype") and every DB sample queried are hidden utility/controller mobs.
+
+**Conclusion for the fix under review:** filtering RoF2 spawns on
+`bodytype == 11 || bodytype == 60` is safe with no known false-positive class
+(no dropped PC, no dropped real/targetable NPC, no dropped pet), and the
+`properties_count` field can be assumed always-present-and-correct for any
+spawn where `bodytype` matters (i.e. any non-`DestructibleObject` spawn) — no
+additional guard for `properties_count == 0` is needed on this specific check.
