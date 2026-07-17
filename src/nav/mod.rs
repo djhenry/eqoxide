@@ -15,3 +15,4 @@ pub mod collision;
 pub mod planner;
 pub mod steering;
 pub mod walker;
+pub mod water_grid;
