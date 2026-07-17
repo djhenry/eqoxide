@@ -40,10 +40,48 @@ pub fn build_movement_history(x: f32, y: f32, z: f32) -> Vec<u8> {
     let mut b = Vec::with_capacity(17);
     b.extend_from_slice(&y.to_le_bytes()); // Y @0 (server north)
     b.extend_from_slice(&x.to_le_bytes()); // X @4 (server east)
-    b.extend_from_slice(&z.to_le_bytes()); // Z @8
+    // Z crosses the wire-datum boundary: callers pass the FOOT-level position, the wire carries
+    // the model-origin datum (see `coord::WIRE_Z_OFFSET`, #522).
+    b.extend_from_slice(&(z + crate::coord::WIRE_Z_OFFSET).to_le_bytes()); // Z @8 (wire datum)
     b.push(TYPE_COLLISION);                // type @12
     b.extend_from_slice(&ts.to_le_bytes()); // timestamp @13
     b
+}
+
+/// Encode a RoF2 `PlayerPositionUpdateClient_Struct` (46 bytes) — the client's outbound
+/// OP_ClientUpdate. Pure so the wire encoding is unit-testable (#522).
+///
+/// `pos`/`deltas` are `[east, north, up]` with `pos[2]` at the controller's **foot level**; the
+/// z written to the wire is `pos[2] + coord::WIRE_Z_OFFSET`, because EQ's wire z is the MODEL-ORIGIN
+/// datum ~3.1u above the feet (see `coord::WIRE_Z_OFFSET`). Broadcasting raw foot z made native
+/// observers render this character's feet 3.1u below the floor — the #522 "clips through the
+/// Kelethin plank" defect. Deltas are plain differences (the datum offset cancels), so they are
+/// written unconverted.
+///
+/// Layout (rof2_structs.h):
+///   0: sequence(u16)  2: spawn_id(u16)  4: vehicle_id(u16)=0
+///   6: unknown[4]=0   10: delta_x(f32)  14: heading(u32 field, bits 0-11)
+///  18: x_pos(f32)     22: delta_z(f32)  26: z_pos(f32)  30: y_pos(f32)
+///  34: animation(u32 field, bits 0-9)   38: delta_y(f32)
+///  42: delta_heading(u32 field, bits 0-9 signed) = 0
+pub fn encode_client_position_update(
+    seq: u16, spawn_id: u16, pos: [f32; 3], deltas: [f32; 3], eq_heading: u32, anim: i32,
+) -> [u8; 46] {
+    let mut buf = [0u8; 46];
+    buf[0..2].copy_from_slice(&seq.to_le_bytes());        // sequence
+    buf[2..4].copy_from_slice(&spawn_id.to_le_bytes());   // spawn_id
+    // vehicle_id = 0 at [4..6], unknown[4] = 0 at [6..10] (already zeroed)
+    buf[10..14].copy_from_slice(&deltas[0].to_le_bytes()); // delta_x
+    buf[14..18].copy_from_slice(&eq_heading.to_le_bytes()); // heading (12-bit in u32)
+    buf[18..22].copy_from_slice(&pos[0].to_le_bytes());   // x_pos (server east)
+    buf[22..26].copy_from_slice(&deltas[2].to_le_bytes()); // delta_z
+    let z_wire = pos[2] + crate::coord::WIRE_Z_OFFSET;
+    buf[26..30].copy_from_slice(&z_wire.to_le_bytes());   // z_pos (height, WIRE datum — #522)
+    buf[30..34].copy_from_slice(&pos[1].to_le_bytes());   // y_pos (server north)
+    buf[34..38].copy_from_slice(&(anim as u32).to_le_bytes()); // animation (10-bit in u32)
+    buf[38..42].copy_from_slice(&deltas[1].to_le_bytes()); // delta_y
+    // delta_heading at [42..46] = 0 (already zeroed)
+    buf
 }
 /// A >12u jump in the network gs player position between ticks that we did NOT stream is a genuine
 /// server correction (anti-cheat snap / teleport), handed to the render controller to apply.
@@ -2402,26 +2440,9 @@ impl ActionLoop {
         let h_cw = crate::eq_net::protocol::ccw_to_cw(heading);
         let eq_heading = crate::eq_net::protocol::deg_cw_to_eq12_client(h_cw);
 
-        // RoF2 PlayerPositionUpdateClient_Struct (rof2_structs.h, 46 bytes):
-        //   0: sequence(u16)  2: spawn_id(u16)  4: vehicle_id(u16)=0
-        //   6: unknown[4]=0   10: delta_x(f32)  14: heading(u32 field, bits 0-11)
-        //  18: x_pos(f32)     22: delta_z(f32)  26: z_pos(f32)  30: y_pos(f32)
-        //  34: animation(u32 field, bits 0-9)   38: delta_y(f32)
-        //  42: delta_heading(u32 field, bits 0-9 signed) = 0
-        let mut buf = [0u8; 46];
-        buf[0..2].copy_from_slice(&self.position_seq.to_le_bytes()); // sequence
+        let buf = encode_client_position_update(
+            self.position_seq, gs.player_id as u16, [x, y, z], [dx, dy, dz], eq_heading, anim);
         self.position_seq = self.position_seq.wrapping_add(1);
-        buf[2..4].copy_from_slice(&(gs.player_id as u16).to_le_bytes()); // spawn_id
-        // vehicle_id = 0 at [4..6], unknown[4] = 0 at [6..10] (already zeroed)
-        buf[10..14].copy_from_slice(&dx.to_le_bytes());   // delta_x
-        buf[14..18].copy_from_slice(&eq_heading.to_le_bytes()); // heading (12-bit in u32)
-        buf[18..22].copy_from_slice(&x.to_le_bytes());    // x_pos (server east)
-        buf[22..26].copy_from_slice(&dz.to_le_bytes());   // delta_z
-        buf[26..30].copy_from_slice(&z.to_le_bytes());    // z_pos (height)
-        buf[30..34].copy_from_slice(&y.to_le_bytes());    // y_pos (server north)
-        buf[34..38].copy_from_slice(&anim.to_le_bytes()); // animation (10-bit in u32)
-        buf[38..42].copy_from_slice(&dy.to_le_bytes());   // delta_y
-        // delta_heading at [42..46] = 0 (already zeroed)
         // Position is a transient firehose — send it UNRELIABLY (ack_req=false), exactly like the
         // native client and the server's own position broadcasts. Sending it on the reliable stream
         // (which we never retransmit) makes a single dropped datagram an unfillable sequence gap, so
@@ -2469,7 +2490,9 @@ impl ActionLoop {
             if dest_pos.iter().all(|c| c.abs() < 900_000.0) {
                 gs.player_x = dest_pos[0];
                 gs.player_y = dest_pos[1];
-                gs.player_z = dest_pos[2];
+                // Zone-point target coords are wire-datum (DB safe coords, model-origin z ~3.1u
+                // above the floor) — convert to the internal foot datum (#522).
+                gs.player_z = dest_pos[2] - crate::coord::WIRE_Z_OFFSET;
                 tracing::info!(
                     "zone_cross: same-zone translocator index={index} → in-zone reposition to ({:.0},{:.0},{:.0}) (no reconnect)",
                     dest_pos[0], dest_pos[1], dest_pos[2]);
@@ -2537,7 +2560,7 @@ impl ActionLoop {
         // @68..76 Unknown068/Unknown072 left zero.
         buf[76..80].copy_from_slice(&gs.player_y.to_le_bytes());      // y (north)
         buf[80..84].copy_from_slice(&gs.player_x.to_le_bytes());      // x (east)
-        buf[84..88].copy_from_slice(&gs.player_z.to_le_bytes());      // z
+        buf[84..88].copy_from_slice(&(gs.player_z + crate::coord::WIRE_Z_OFFSET).to_le_bytes()); // z (wire datum, #522)
         buf[88..92].copy_from_slice(&0u32.to_le_bytes());             // zone_reason = 0
         buf[92..96].copy_from_slice(&0i32.to_le_bytes());             // success = 0 (request)
         tracing::info!("EQ: sending OP_ZONE_CHANGE target_zone={} from current_zone={} pos=({:.1},{:.1},{:.1})",
@@ -2720,6 +2743,50 @@ mod tests {
     use crate::eq_net::packet_handler::apply_packet;
     use crate::eq_net::transport::AppPacket;
     use crate::nav::steering::{NAV_LOCAL_STUCK_TICKS, PROACTIVE_REPLAN_CAP};
+
+    /// #522 datum round-trip: the internal FOOT z survives the wire hop unchanged.
+    ///
+    /// The bug was a datum split across ~8 sites (easy to double-apply or drop one). This pins the
+    /// invariant end to end: `foot → OUTBOUND(+offset) → wire → INBOUND(−offset) → foot` is the
+    /// identity, and the byte the client actually writes carries the model-origin (wire) datum.
+    ///
+    /// MUTATION CHECK (each independently turns this RED): drop the `+ WIRE_Z_OFFSET` in
+    /// `encode_client_position_update` → the wire-datum assert fails; flip the inbound `− WIRE_Z_OFFSET`
+    /// (packet_handler self-branch) to `+` or delete it → the identity assert fails; change the
+    /// constant on only one side → both fail.
+    #[test]
+    fn wire_z_datum_round_trips_to_foot() {
+        use crate::coord::WIRE_Z_OFFSET;
+        use crate::eq_net::protocol::{decode_position_update, encode_position_update};
+
+        // Grid-aligned foot z (EQ19 is value/8) so the fixed-point encode stays lossless and the
+        // test isolates the DATUM conversion from wire quantization.
+        let foot = 73.875_f32;
+
+        // OUTBOUND — the client's 46-byte PlayerPositionUpdateClient_Struct. The z the client WRITES
+        // must be the model-origin (wire) datum = foot + offset, or native observers render us sunk
+        // into the floor (the #522 symptom).
+        let buf = encode_client_position_update(7, 42, [10.0, 20.0, foot], [0.0; 3], 0, 0);
+        let wire_z = f32::from_le_bytes([buf[26], buf[27], buf[28], buf[29]]);
+        assert_eq!(wire_z, foot + WIRE_Z_OFFSET, "outbound wire z must carry the model-origin datum");
+
+        // INBOUND — drive the REAL handler: the server rebroadcasts our position as the 24-byte
+        // server struct, and apply_position_update's self-branch must subtract the offset to land
+        // gs.player_z back on FOOT. Going through apply_packet (not a replicated formula) means a
+        // mutation of the actual inbound conversion turns this RED.
+        let server_pkt = encode_position_update(42, 10.0, 20.0, wire_z, 0.0);
+        // (sanity: the decoder recovers the wire datum verbatim)
+        let upd = decode_position_update(&server_pkt).expect("decode server position update");
+        assert!((upd.z - wire_z).abs() < 1e-4, "decoder recovers the wire z");
+        let mut gs = GameState::new();
+        gs.player_id = 42;            // so the packet is treated as OUR OWN position
+        gs.player_z = -999.0;         // poisoned: only the handler's conversion can fix it
+        apply_packet(&mut gs, &AppPacket {
+            opcode: crate::eq_net::protocol::OP_CLIENT_UPDATE, payload: server_pkt });
+        assert!((gs.player_z - foot).abs() < 1e-4,
+            "foot→wire→foot must be the identity through the real handler: sent {foot}, gs.player_z {}",
+            gs.player_z);
+    }
 
     /// **A GOAL THE CLIENT CHANGED MUST NOT BE REPORTED AS THE GOAL THE AGENT ASKED FOR.**
     ///
@@ -2935,8 +3002,11 @@ mod tests {
         nav.command.request_goto((-455.0, -174.0, 30.0));
         let same = nav.perform_cross(&mut stream, &mut gs, 100, HERE, [111.0, 222.0, 33.0]);
         assert!(same, "dest==current must be handled as a same-zone cross");
-        assert_eq!([gs.player_x, gs.player_y, gs.player_z], [111.0, 222.0, 33.0],
-            "same-zone cross must reposition the player to the arrival so it leaves the region (#368)");
+        // The arrival coords are WIRE datum (DB safe coords, model-origin z); the player's internal
+        // z is FOOT, so z is converted 33.0 → 33.0 − WIRE_Z_OFFSET on the local apply (#522). x/y
+        // are unaffected.
+        assert_eq!([gs.player_x, gs.player_y, gs.player_z], [111.0, 222.0, 33.0 - crate::coord::WIRE_Z_OFFSET],
+            "same-zone cross repositions the player (foot datum) so it leaves the region (#368/#522)");
         // #508: the crossing is DONE — the translocator repositioned us in-zone. The stale zone-line
         // goal must be cleared so the walker does NOT resume toward it and drift across a DIFFERENT
         // zone's real line (qeynos2 → qeynos). Mutation check: delete `self.command.request_stop()`
@@ -4444,7 +4514,10 @@ mod tests {
         assert_eq!(p.len(), 17, "UpdateMovementEntry is 17 packed bytes");
         assert_eq!(&p[0..4], &(-20.0f32).to_le_bytes(), "Y field @0 = server north");
         assert_eq!(&p[4..8], &(10.0f32).to_le_bytes(), "X field @4 = server east");
-        assert_eq!(&p[8..12], &(3.5f32).to_le_bytes(), "Z field @8");
+        // Z crosses the datum boundary: the caller passes FOOT (3.5), the wire carries the
+        // model-origin datum = foot + WIRE_Z_OFFSET (#522).
+        assert_eq!(&p[8..12], &(3.5f32 + crate::coord::WIRE_Z_OFFSET).to_le_bytes(),
+            "Z field @8 = foot + WIRE_Z_OFFSET (wire datum)");
         assert_eq!(p[12], 1, "type = Collision (benign; skips teleport/zoneline cheat checks)");
     }
 }
