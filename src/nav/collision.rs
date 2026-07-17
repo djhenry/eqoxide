@@ -2715,6 +2715,16 @@ mod tests {
     use super::*;
     use crate::assets::{MeshData, RenderMode, ZoneAssets};
 
+    /// Test helper: the HONEST outcome of the default whole-zone plan (#337/#356). Mirrors
+    /// [`Collision::find_path`]'s simple signature, but returns the [`PlanOutcome`] that distinguishes
+    /// a definitive `Unreachable` ("no route exists") from an `Exhausted` search ("I gave up") — the
+    /// distinction a bare `Option<Vec<_>>` throws away. A negative assertion phrased as
+    /// `plan(..).is_none()` passes for the WRONG REASON on a cut-short search AND gives zero protection
+    /// against an over-restrictive A* regression; asserting the variant fixes both.
+    fn plan(col: &Collision, start: [f32; 3], goal: [f32; 3], radius: f32) -> PlanOutcome {
+        col.find_path_ex(start, goal, radius, &[], 8.0, None, 0.0, PlanCtx::default())
+    }
+
     /// A flooded pit must be exitable by SWIMMING UP: pit floor at z=0, a cliff wall
     /// up to the bank at z=10, water filling the pit to z=9. Without water the chest
     /// ray for the climb crosses the cliff face and the pit is sealed (qeynos2 moat,
@@ -2737,10 +2747,12 @@ mod tests {
         let start = [8.0, 12.0, 0.0];   // pit floor
         let goal  = [40.0, 12.0, 10.0]; // bank
 
-        // Dry pit: sealed — the climb's chest ray crosses the cliff face.
+        // Dry pit: sealed — the climb's chest ray crosses the cliff face. This is a DEFINITIVE
+        // Unreachable (frontier closed), NOT an Exhausted "I gave up" — a bare `.is_none()` here
+        // could not tell the two apart and would pass even on a cut-short search (#356).
         let dry = Collision::build(&assets, 4.0);
-        assert!(dry.find_path(start, goal, 1.0, &[], false).is_none(),
-            "dry pit should be sealed (no walkable exit)");
+        assert!(matches!(plan(&dry, start, goal, 1.0), PlanOutcome::Unreachable { .. }),
+            "dry pit should be sealed (Unreachable — no walkable exit), got {:?}", plan(&dry, start, goal, 1.0));
 
         // Flooded to z=9: swim up and haul out onto the bank.
         let mut wet = Collision::build(&assets, 4.0);
@@ -2859,8 +2871,11 @@ mod tests {
         // the plateau is unreachable (no partial route reaches the top tier).
         let steep = Collision::build(&scene(16.0), 4.0);
         let goal_s = [16.0 + 20.0, 20.0, 30.0];
-        let full = steep.find_path(start, goal_s, 1.0, &[], false);
-        assert!(full.is_none(), "a 1.875-grade ramp is too steep — A* must not route up it");
+        // Unreachable, NOT a bare None: the plateau's tier is genuinely sealed off (frontier closed),
+        // and asserting the variant guards against an over-restrictive A* regression too (#356).
+        assert!(matches!(plan(&steep, start, goal_s, 1.0), PlanOutcome::Unreachable { .. }),
+            "a 1.875-grade ramp is too steep — A* must refuse it (Unreachable), got {:?}",
+            plan(&steep, start, goal_s, 1.0));
     }
 
     /// #257: the net-thread wall-clock budget (PLAN_BUDGET_MS) must be generous enough that a
@@ -2879,8 +2894,16 @@ mod tests {
         };
         let col = Collision::build(&ZoneAssets { terrain: vec![big], objects: vec![], textures: vec![] }, 32.0);
         // World [east, north, up]: opposite corners of the plane, ~800u apart (~100 nav cells).
-        let path = col.find_path([-300.0, -300.0, 0.0], [300.0, 300.0, 0.0], 1.0, &[], false)
-            .expect("a large open plane must route fully corner-to-corner within the time budget");
+        // Assert the HONEST outcome (#356): a COMPLETE `Route`, never an `Exhausted` truncated
+        // partial. The old `.expect()` on a bare `Option` could not tell "the route reached the far
+        // corner" from "the search gave up and handed back a stub" — under load the deterministic
+        // node cap will not fire here, but a bare Option would still hide an over-restrictive A*
+        // regression that downgraded this full route to a partial.
+        let path = match plan(&col, [-300.0, -300.0, 0.0], [300.0, 300.0, 0.0], 1.0) {
+            PlanOutcome::Route(p) => p,
+            other => panic!("a large open plane must route fully corner-to-corner as a complete \
+                Route (not truncated by any cap), got {other:?}"),
+        };
         let last = *path.last().unwrap();
         assert!((last[0] - 300.0).abs() < 8.0 && (last[1] - 300.0).abs() < 8.0,
             "route must reach the far corner (not a truncated partial), got {last:?}");
@@ -2920,8 +2943,9 @@ mod tests {
         let wide = Collision::build(
             &ZoneAssets { terrain: vec![platform(-48.0, 8.0), platform(40.0, 88.0)], objects: vec![], textures: vec![] },
             4.0);
-        assert!(wide.find_path([-20.0, 0.0, 0.0], [60.0, 0.0, 0.0], 1.0, &[], false).is_none(),
-            "a 32u gap exceeds jump reach — A* must not route across it");
+        assert!(matches!(plan(&wide, [-20.0, 0.0, 0.0], [60.0, 0.0, 0.0], 1.0), PlanOutcome::Unreachable { .. }),
+            "a 32u gap exceeds jump reach — A* must refuse it (Unreachable), got {:?}",
+            plan(&wide, [-20.0, 0.0, 0.0], [60.0, 0.0, 0.0], 1.0));
     }
 
     /// A single horizontal floor quad + one vertical wall: the floor raycast must
@@ -4141,8 +4165,11 @@ mod tests {
         let col = Collision::build(&ZoneAssets { terrain: vec![floor, wall], objects: vec![], textures: vec![] }, 8.0);
         let start = [20.0, 100.0, 0.0];
         let goal  = [180.0, 100.0, 0.0]; // sealed behind the wall at east=100
-        // No full route exists.
-        assert!(col.find_path(start, goal, 1.0, &[], false).is_none(), "goal is walled off — no full route");
+        // No full route exists — and it is DEFINITIVELY Unreachable (the frontier closed with the
+        // goal sealed behind the wall), not an `Exhausted` "I gave up". The honest API says so; the
+        // steering partial below rides on `find_path_res`, never on this answer (#337/#356).
+        assert!(matches!(plan(&col, start, goal, 1.0), PlanOutcome::Unreachable { .. }),
+            "goal is walled off — Unreachable, got {:?}", plan(&col, start, goal, 1.0));
         // But a partial route toward the goal does (#188): it advances east toward the wall and
         // stops on the near side (never crossing east=100) instead of returning "no route".
         let partial = col.find_path(start, goal, 1.0, &[], true).expect("partial route toward the goal");
@@ -5698,18 +5725,24 @@ mod tests {
             crate::region_map::RegionMap::box_below(70.0, 130.0, 70.0, 130.0, -30.0))));
 
         // Sanity: the pit is reachable (a legal drop) but NOT climbable back out — a genuine
-        // one-way trap, the real structural bug independent of the fix under test.
-        let into_pit = col.find_path([60.0, 100.0, 0.0], [100.0, 100.0, -40.0], 1.0, &[], false);
-        assert!(into_pit.is_some(), "the pit floor must be a legal drop from the rim");
-        let out_of_pit = col.find_path([100.0, 100.0, -40.0], [60.0, 100.0, 0.0], 1.0, &[], false);
-        assert!(out_of_pit.is_none(), "the pit must have no walkable exit — a one-way trap");
+        // one-way trap, the real structural bug independent of the fix under test. Asserted as the
+        // HONEST outcomes (#356): the drop-in is a complete `Route`; the climb-out is a DEFINITIVE
+        // `Unreachable` (frontier closed — no walkable exit), NOT an `Exhausted` "I gave up". A bare
+        // `.is_none()` on the exit could not tell those apart and would pass on a cut-short search.
+        assert!(matches!(plan(&col, [60.0, 100.0, 0.0], [100.0, 100.0, -40.0], 1.0), PlanOutcome::Route(_)),
+            "the pit floor must be a legal drop from the rim (a complete Route), got {:?}",
+            plan(&col, [60.0, 100.0, 0.0], [100.0, 100.0, -40.0], 1.0));
+        assert!(matches!(plan(&col, [100.0, 100.0, -40.0], [60.0, 100.0, 0.0], 1.0), PlanOutcome::Unreachable { .. }),
+            "the pit must have no walkable exit — a one-way trap (Unreachable), got {:?}",
+            plan(&col, [100.0, 100.0, -40.0], [60.0, 100.0, 0.0], 1.0));
 
         // A full route DOES exist by going around the hole (north or south corridor) — confirms
         // this is a solvable street layout, not a sealed level.
         let start = [60.0f32, 100.0, 0.0];
         let goal  = [140.0f32, 100.0, 0.0];
-        assert!(col.find_path(start, goal, 1.0, &[], false).is_some(),
-            "a full route around the pit must exist when the search isn't radius-bounded");
+        assert!(matches!(plan(&col, start, goal, 1.0), PlanOutcome::Route(_)),
+            "a full route around the pit must exist when the search isn't radius-bounded (Route), got {:?}",
+            plan(&col, start, goal, 1.0));
 
         // Radius-bound the search (as the real fallback does) so neither the goal nor the
         // walk-around is reachable — forcing a genuine PARTIAL route toward the goal.
