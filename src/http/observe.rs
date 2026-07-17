@@ -157,6 +157,16 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         "text":       o.text,
         "ago_secs":   o.at.elapsed().as_secs(),
     }));
+    // #336: the last consider of ANY spawn (target or not) — see `last_consider` field doc on
+    // `LastConsiderView`. `ago_secs` measured at read time, same rule as `casting`/`last_cast`.
+    let last_consider = player.last_consider.as_ref().map(|c| serde_json::json!({
+        "spawn_id": c.spawn_id,
+        "name":     c.name,
+        "con_name": c.con_name,
+        "attitude": c.attitude,
+        "level":    c.level,
+        "ago_secs": c.at.elapsed().as_secs(),
+    }));
     let mut out = serde_json::json!({
         "player": {
             "name":       player.name,
@@ -296,6 +306,14 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         "nav_goal_id": nav.goal_id,
         "nav_goal": nav.goal,
         "nav_blocked_by": nav_blocked_by,
+        // #336: the last consider of ANY spawn (target or not) — `{spawn_id, name, con_name
+        // (difficulty tier), attitude, level, ago_secs}`, or null if nothing has been considered
+        // this session. Top-level (not under `player`, which is already at serde_json's macro
+        // recursion limit) — same reason as `nav_blocked_by` above. This is what lets a standalone
+        // `POST /v1/combat/consider {"id":N}` on a spawn that is deliberately NOT the current target
+        // be read back: `player.target_con`/`target_attitude`/`target_level` only ever describe the
+        // CURRENT target (#330) and stay null for a non-target consider.
+        "last_consider": last_consider,
         // The PER-ROUTE clearance tier the CURRENT route needed (#378 Phase 2 / design §4c):
         // `minimum` (tight, no margin — riskier) | `preferred` (roomy) | null (no route committed).
         // Distinct from the zone-lifetime `nav_tight` counter — this is the route being walked now.
@@ -918,6 +936,40 @@ mod tests {
             "target_attitude must reach /observe/debug after a successful consider (#409)");
         assert_eq!(p["target_level"], serde_json::json!(12),
             "target_level must reach /observe/debug (#409)");
+    }
+
+    /// #336: a STANDALONE consider (POST /v1/combat/consider {"id":N} on a spawn that is
+    /// deliberately NOT the current target) must be readable from `/observe/debug` too. The
+    /// target-scoped `player.target_con`/`target_attitude`/`target_level` stay null (correctly,
+    /// #330 — nothing is targeted), so the top-level `last_consider` object is the only surface
+    /// that can carry the result. RED before this fix (the tier was computed and discarded), GREEN
+    /// after.
+    #[tokio::test]
+    async fn debug_surfaces_last_consider_for_non_target_spawn_336() {
+        let state = empty_state();
+        set_gs(&state, |gs| {
+            gs.player_id = 1;
+            let mut npc = crate::game_state::tests::make_entity(450, "Guard_Phaeton", 0.0, 0.0, 0.0, true);
+            npc.level = 20;
+            gs.upsert_entity(npc);
+            // no set_target — the whole point of the standalone endpoint.
+            // faction 9 = "scowls", ConsiderColor 13 = "red".
+            crate::eq_net::packet_handler::apply_consider(gs, &consider_reply(gs.player_id, 450, 9, 13));
+        });
+        let v = debug_json(state).await;
+        let p = v["player"].clone();
+        assert_eq!(p["target_con"], serde_json::json!(null),
+            "target_con must stay null — nothing is targeted (#330)");
+        assert_eq!(p["target_attitude"], serde_json::json!(null));
+
+        let lc = v["last_consider"].clone();
+        assert_eq!(lc["spawn_id"], serde_json::json!(450),
+            "last_consider must reach /observe/debug for a non-target spawn (#336)");
+        assert_eq!(lc["con_name"], serde_json::json!("red"),
+            "difficulty tier must be readable without targeting the spawn (#336)");
+        assert_eq!(lc["attitude"], serde_json::json!("scowls"));
+        assert_eq!(lc["level"], serde_json::json!(20));
+        assert!(lc["ago_secs"].is_number(), "ago_secs must be present and numeric");
     }
 
     /// #406: after the character is slain (OP_Death for our own spawn), `/observe/debug` must report

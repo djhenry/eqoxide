@@ -33,7 +33,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 
 | Route | Description |
 |-------|-------------|
-| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, target `target_id`/`target_name`/`target_hp_pct`) + **navigation** (`nav_state`, `nav_reason`, `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier` — see [Navigation state](#navigation-state)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms` — see [Connection health](#connection-health)) + camera state. |
+| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation** (`nav_state`, `nav_reason`, `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier` — see [Navigation state](#navigation-state)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms` — see [Connection health](#connection-health)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + camera state. |
 | `GET /v1/observe/frame` | Current rendered frame as a PNG (`Content-Type: image/png`). |
 | `GET /v1/observe/entities[?labeled=1]` | Default: `{ "<name>": [x,y,z], ... }` for all known entities, with same-base-name + byte-identical-position duplicates collapsed (#471 — suspected server-side `spawn2` duplication; the model is untouched so each instance is still targetable by its full name). `?labeled=1` returns the richer `{count, entities:{"<name>":[x,y,z]}, deduped, duplicate_groups:[{position,names,kept}], note}` exposing which duplicates were collapsed. |
 | `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency}`. Slots are Titanium **wire** ids (DB general slots 23-30 → wire 22-29). |
@@ -63,7 +63,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 | `POST /v1/combat/target/name` | `{"name":"a rat"}` | Target a mob by fuzzy name. |
 | `POST /v1/combat/attack` | — | Enable auto-attack. |
 | `DELETE /v1/combat/attack` | — | Disable auto-attack. |
-| `POST /v1/combat/consider` | `{"id":N}` (default current target) | Consider a spawn (con color/faction). |
+| `POST /v1/combat/consider` | `{"id":N}` (default current target) | Consider a spawn (difficulty tier + faction attitude). Result: `target_con`/`target_attitude`/`target_level` on `/observe/debug` if the spawn IS the current target, always `last_consider` regardless — see [Consider results](#consider-results). |
 | `POST /v1/combat/cast` | `{"gem":0-8}` \| `{"spell_id":N,"target_id":M?}` | Cast a memorized gem (on target, else current, else self). |
 | `POST /v1/combat/memorize` | `{"spell_id":N,"gem":0-8}` | Memorize a known spell into a gem. |
 | `POST /v1/combat/scribe` | `{"spell_id":N,"slot":B?}` | Scribe a spell scroll into the spellbook. |
@@ -403,3 +403,55 @@ their facing, so `nav_support` counts each query answered from one.
 `queries` counts how many nav queries have been answered from down-facing ground since the zone
 loaded. Read `nav_support != null` as *"footing here is unverified-winding"* — not an error and not a
 routing failure (the ground is walkable), just an honest "this footing's facing is unconfirmed."
+
+## Consider results
+
+A consider (`POST /v1/combat/consider {"id":N}`, default current target) tells you two independent
+things about a spawn: its **attitude** (faction-derived — how it feels about you) and its
+**difficulty tier** (level-derived — how tough the fight would be). `GET /v1/observe/debug` surfaces
+both, on two different fields depending on whether the considered spawn IS your current target:
+
+- **`player.target_con` / `player.target_attitude` / `player.target_level`** (#292) — describe the
+  **CURRENT target only**. These are `null` whenever nothing is targeted, or when the consider reply
+  was about a *different* spawn (#330 — a stale reply can never overwrite the current target's con).
+- **`last_consider`** (#336, top-level, not under `player`) — describes the **most recently
+  considered spawn, target or not**. This is what makes a *standalone* consider (a spawn deliberately
+  NOT your target) readable: `POST /v1/combat/consider {"id":N}` for a non-target spawn always
+  populates this, even though it leaves `target_con`/`target_attitude`/`target_level` untouched.
+
+```json
+"last_consider": {
+  "spawn_id": 450,
+  "name": "Guard_Phaeton",
+  "con_name": "red",
+  "attitude": "scowls",
+  "level": 20,
+  "ago_secs": 2
+}
+```
+
+`con_name` — the **difficulty tier**, from the RoF2 `Consider_Struct`'s `level` field (an EQEmu
+`ConsiderColor` enum value, not a literal level number):
+
+Ordered from safest to deadliest (by the mob's level relative to yours — `gray`/`green`/`light_blue`/
+`blue` are all **beneath** you, `white` is **even**, `yellow`/`red` are **above** you):
+
+| `con_name`   | ConsiderColor | Meaning |
+|--------------|---------------|---------|
+| `gray`       | 6             | Far beneath you — trivial, no experience for the kill. |
+| `green`      | 2             | Well beneath you — safe. |
+| `light_blue` | 18            | Beneath you (further below than `blue`, closer to `green`). |
+| `blue`       | 4             | Just beneath you — nearly even, but still below your level. |
+| `white`      | 10 / 20       | Even con — same level as you. |
+| `yellow`     | 15            | Above you — noticeably higher, dangerous. |
+| `red`        | 13            | Well above you — much higher, likely lethal. |
+
+`attitude` — the spawn's **faction disposition**, from the reply's `faction` field (`1..=9`): `ally`,
+`warmly`, `kindly`, `amiable`, `indifferent`, `apprehensive`, `dubious`, `threatening`, `scowls`
+(ready to attack / KOS). This is entirely independent of `con_name` — a low-level mob can still
+`scowls` at you (hostile *and* trivial), and a high-level mob can be `ally` (friendly *and* lethal if
+it ever turned on you). Never infer one from the other.
+
+`level` is the spawn's actual character level (from its spawn record), when known — `null` is an
+honest "unknown" (e.g. it had already left the entity table by the time the reply arrived), never a
+guessed number.
