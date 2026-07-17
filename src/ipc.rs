@@ -656,7 +656,23 @@ pub struct CastRequest {
     pub item_slot: Option<u32>,
 }
 /// Cast a memorized gem (0-8) on an explicit target, else current target, else self.
+/// This is the FIRE-AND-FORGET cast the UI spell-gem click uses; the honest awaited variant
+/// (POST /v1/combat/cast over HTTP) rides the sibling [`CastAwaitReq`] instead. (#448)
 pub type CastReq = Arc<Mutex<Option<CastRequest>>>;
+
+/// Command-with-result cast request (A3 Migration 3, #448) — `(CastRequest, oneshot Sender)`. POST
+/// /v1/combat/cast writes this and AWAITS the `Sender`; the nav thread drains it, emits the SAME
+/// OP_CastSpell the fire-and-forget [`CastReq`] path sends, and PARKS the `Sender` in
+/// `ActionLoop::pending_cast` until the cast's TRUE outcome is known. The cast outcome is already
+/// computed by the existing cast machinery into `gs.last_cast` (completed / fizzled / interrupted /
+/// failed) — the net thread fulfils by detecting that `last_cast` TRANSITION (NOT a single opcode:
+/// the 3-opcode cast-end path is deliberately de-duped, so keying one opcode would double-fire or
+/// miss). A cast that never started (empty gem / stale clicky) fires `Refused` immediately from the
+/// drain; a truly silent cast resolves to `Unconfirmed` via the HTTP timeout / a zone-change reaper.
+/// Sibling of [`CastReq`], NOT a replacement: the UI click path is unchanged. One self-cast at a
+/// time → a singleton park suffices. See `crate::command_state::result` for the flow.
+pub type CastAwaitReq = Arc<Mutex<Option<(CastRequest,
+    oneshot::Sender<crate::command_state::CommandResult<crate::command_state::CastEnd>>)>>>;
 /// Scribe/memorize request — (slot, spell_id, scribing): scribing 0 = scribe a scroll into the
 /// spellbook at book `slot`; 1 = memorize a known spell into gem `slot` (0-8). Set by POST
 /// /v1/combat/scribe and POST /v1/combat/memorize; the nav thread sends OP_MemorizeSpell.
@@ -725,6 +741,8 @@ pub type ZoneInfo = Arc<Mutex<(String, u16)>>;
 pub struct CombatSlots {
     pub attack:   AttackReq,
     pub cast:     CastReq,
+    /// The honest awaited-cast slot (A3 Migration 3, #448) — sibling of `cast`. See [`CastAwaitReq`].
+    pub cast_await: CastAwaitReq,
     pub mem_spell: MemSpellReq,
     pub consider: ConsiderReq,
     pub target:   TargetReq,

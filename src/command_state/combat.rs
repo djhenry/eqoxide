@@ -5,8 +5,33 @@
 //! thin typed read/write of a slot in `self.combat`; validation and packet-building stay where they
 //! were (the HTTP handler and `ActionLoop::tick`). No behavior change — just one typed surface.
 
-use super::CommandState;
+use super::{CommandResult, CommandState};
 use crate::ipc::CastRequest;
+use tokio::sync::oneshot;
+
+/// The honest terminal outcome of an awaited self-cast (A3 Migration 3, #448) — the `T` in
+/// `CommandResult<CastEnd>` and the JSON body of a 200 from POST /v1/combat/cast. Read back from the
+/// APPLIED cast machinery's `gs.last_cast`, never guessed at send time.
+///
+/// A `Resolved(CastEnd)` means the server gave a DEFINITE verdict on the cast — but "definite" is not
+/// the same as "the spell landed". `outcome` carries that truth: only `"completed"` is a success;
+/// `"fizzled"` and `"interrupted"` are resolved NON-successes. This is the whole honesty point of
+/// carrying the outcome in a field rather than in the HTTP status: a 200 can never be misread as
+/// "the spell took hold" — an agent MUST branch on `outcome`. A cast whose outcome is unknown
+/// (silent server, timeout, zone change) is `Unconfirmed`/202, never a `CastEnd`; a cast that never
+/// started (empty gem, no mana, no target) is `Refused`/409. See `crate::command_state::result`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CastEnd {
+    /// The honest terminal verdict: `"completed"` (the spell landed) | `"fizzled"` | `"interrupted"`.
+    /// NEVER `"completed"` unless the server actually reported completion.
+    pub outcome: String,
+    /// The spell id that ended, or 0 when the server never named it (an honest unknown, not a guess).
+    pub spell_id: u32,
+    /// The spell's name (resolved from `spell_id`; a placeholder when the id is 0/unknown).
+    pub spell_name: String,
+    /// The human-readable line the cast machinery recorded (also in the message log).
+    pub text: String,
+}
 
 impl CommandState {
     // ── request_* : the VIEW (UI click-handlers + HTTP handlers) makes these writes ──────────────
@@ -31,6 +56,16 @@ impl CommandState {
     /// spellbook windows). The handler builds the [`CastRequest`]; the drain resolves the target.
     pub fn request_cast(&self, req: CastRequest) {
         *self.combat.cast.lock().unwrap() = Some(req);
+    }
+
+    /// Command-with-result cast (A3 Migration 3, #448): queue the SAME cast as `request_cast` but hand
+    /// in a `oneshot::Sender<CommandResult<CastEnd>>` the net thread fulfils with the TRUE outcome.
+    /// POST /v1/combat/cast awaits the matching receiver under a timeout so it reports the real result
+    /// (completed / fizzled / interrupted / refused / unconfirmed) instead of a premature queued 200.
+    /// Writes the sibling `cast_await` slot — the fire-and-forget `cast` slot (UI path) is left
+    /// untouched. See `crate::command_state::result`.
+    pub fn request_cast_await(&self, req: CastRequest, tx: oneshot::Sender<CommandResult<CastEnd>>) {
+        *self.combat.cast_await.lock().unwrap() = Some((req, tx));
     }
 
     /// Memorize a known spell (`scribing = 1`) or scribe a scroll (`scribing = 0`) into a book/gem
@@ -66,6 +101,14 @@ impl CommandState {
     /// Drain a pending cast request.
     pub fn take_cast(&self) -> Option<CastRequest> {
         self.combat.cast.lock().unwrap().take()
+    }
+
+    /// Drain a pending awaited-cast request as `(CastRequest, Sender)` (A3 Migration 3, #448).
+    /// `ActionLoop::drain_cast` takes this, sends the cast, and parks the `Sender` in `pending_cast`
+    /// until the cast's outcome transition lands (or fires `Refused` immediately if it never started).
+    /// Sibling of `take_cast`.
+    pub fn take_cast_await(&self) -> Option<(CastRequest, oneshot::Sender<CommandResult<CastEnd>>)> {
+        self.combat.cast_await.lock().unwrap().take()
     }
 
     /// Drain a pending memorize/scribe request as `(slot, spell_id, scribing, from)`.

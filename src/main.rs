@@ -240,8 +240,9 @@ fn main() {
         trainer_train_req: Arc::new(Mutex::new(None)),
     };
     let combat = ipc::CombatSlots {
-        attack:    Arc::new(Mutex::new(None)),
-        cast:      Arc::new(Mutex::new(None)),
+        attack:     Arc::new(Mutex::new(None)),
+        cast:       Arc::new(Mutex::new(None)),
+        cast_await: Arc::new(Mutex::new(None)),
         mem_spell: Arc::new(Mutex::new(None)),
         consider:  Arc::new(Mutex::new(None)),
         target:    Arc::new(Mutex::new(None)),
