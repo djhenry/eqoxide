@@ -113,8 +113,13 @@ just clearing local state and hoping the late ack never arrives.
 ### Implemented (eqoxide fix)
 
 Both `apply_money_on_corpse` and `apply_loot_complete` (`src/eq_net/packet_handler.rs`) now
-gate on `GameState`'s own request-state flags (`loot_session_active` / `loot_confirmed` /
-`loot_defensive_close_at`) rather than applying an inbound ack unconditionally. On
+gate on `GameState`'s own request-state flags rather than applying an inbound ack
+unconditionally. The `apply_money_on_corpse` gate is `!loot_session_active ||
+loot_defensive_close_at.is_some()` — deliberately NOT including `loot_confirmed`, because
+Normal(1)/Normal2(3)/LootAll(6) are all "accepted" for ONE still-open session and LootAll(6)
+is a legitimate trailing OP_MoneyOnCorpse on an already-confirmed session; gating on
+`loot_confirmed` would swallow that legit same-session trailer (and mask the LootAll
+regression tests). On
 `OpenTimedOut`/`TimedOut` the gameplay loop (`src/eq_net/gameplay.rs`) sends a defensive/
 idempotent `OP_EndLootRequest` for the abandoned corpse and withholds the next corpse's
 `OP_LootRequest` until that resolves (`loot_defensive_close_at`), narrowing — not eliminating,

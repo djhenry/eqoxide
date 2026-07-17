@@ -2372,16 +2372,21 @@ fn loot_refusal_reason(response: u8) -> Option<&'static str> {
 /// 1 true pad byte + pp/gp/sp/cp; no ENCODE/DECODE override exists for RoF2 so it's sent verbatim;
 /// see docs/eq-technical-knowledgebase/loot-protocol.md for full citations). The ONLY correlation
 /// available to the client is its OWN request state: this ack is only meaningful while we are
-/// ACTUALLY awaiting one for the corpse we most recently asked to loot — i.e. `loot_session_active`
-/// is true, we have not already been `loot_confirmed`, and we haven't given up and started a
-/// defensive close (`loot_defensive_close_at`). Any other state means this packet cannot be a
-/// timely answer to the current request: applying it anyway would misattribute a late ack for a
-/// corpse we've moved on from onto whatever session happens to be open now. Drop it and say so
-/// instead of guessing (agent-honesty).
+/// ACTUALLY still on the open session we most recently asked to loot — i.e. `loot_session_active`
+/// is true and we haven't given up and started a defensive close (`loot_defensive_close_at`). Any
+/// other state means this packet cannot belong to the current request: applying it anyway would
+/// misattribute a late ack for a corpse we've moved on from onto whatever session happens to be
+/// open now. Drop it and say so instead of guessing (agent-honesty).
+///
+/// NOTE: we deliberately do NOT gate on `loot_confirmed`. Normal(1)/Normal2(3)/LootAll(6) are all
+/// "the server accepted" for ONE still-open session, and LootAll(6) is a documented SECOND, trailing
+/// OP_MoneyOnCorpse that legitimately arrives on an already-`loot_confirmed` session (see below).
+/// Gating on `loot_confirmed` would swallow that legit same-session trailer as "stale" and — worse —
+/// mask the existing regression tests that prove LootAll(6) is not treated as a refusal (#414 review).
 fn apply_money_on_corpse(gs: &mut GameState, payload: &[u8]) {
     // MoneyOnCorpse_Struct: response(u8) + 3×pad + platinum(u32) + gold(u32) + silver(u32) + copper(u32)
     if payload.len() < 20 { return; }
-    if !gs.loot_session_active || gs.loot_confirmed || gs.loot_defensive_close_at.is_some() {
+    if !gs.loot_session_active || gs.loot_defensive_close_at.is_some() {
         tracing::info!(
             "EQ: stale OP_MoneyOnCorpse discarded (session_active={}, confirmed={}, \
              defensive_close_pending={}, current_corpse={:?}) — not applied to any session (#414)",
@@ -2481,7 +2486,12 @@ fn apply_money_on_corpse(gs: &mut GameState, payload: &[u8]) {
 /// `OP_MoneyOnCorpse`. `TimedOut` and `OpenTimedOut` now both enter a defensive-close quarantine
 /// (`loot_defensive_close_at`, withholding the next `Open` until it resolves) instead of clearing
 /// immediately — branch 0 below drains a reply that arrives during that quarantine silently,
-/// closing this gap for both directions with the one mechanism.
+/// NARROWING (not eliminating) this gap with the same mechanism used for the coin ack. Symmetric to
+/// the acknowledged `OP_MoneyOnCorpse` residual: a very-late OP_LootComplete for an abandoned corpse
+/// arriving AFTER `DefensiveCloseTimedOut` has fired and the next corpse is confirmed still reaches
+/// branch 2 and would be misreported as an abort of that healthy new corpse. The packet is 0-byte
+/// and carries no corpse id, so once the quarantine window closes the two are indistinguishable —
+/// the window shrinks the race, it does not close it.
 fn apply_loot_complete(gs: &mut GameState) {
     // (0) #414: a reply to OUR speculative/defensive OP_EndLootRequest, sent after we already gave
     // up on this corpse (`OpenTimedOut` — never confirmed open — or `TimedOut` — confirmed but its
