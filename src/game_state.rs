@@ -245,6 +245,28 @@ pub struct CastOutcome {
     pub at: std::time::Instant,
 }
 
+/// The most recent consider result for AN ARBITRARY spawn (#336) — spawn-scoped, independent of the
+/// current target. See `GameState::last_consider` for why this exists alongside the older
+/// target-scoped `target_con*` fields.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LastConsider {
+    /// The spawn that was considered (the reply's `targetid`, NOT necessarily `target_id`).
+    pub spawn_id: u32,
+    /// Display name at the time of the consider (best-effort; "Your target" if the spawn had
+    /// already left `entities` by the time the reply arrived).
+    pub name: String,
+    /// Difficulty tier derived from the reply's ConsiderColor `level` field — see `con_level_name`.
+    /// gray (trivial/no exp) | green | light_blue | blue | white (even) | yellow | red (dangerous).
+    pub con_name: String,
+    /// Attitude enum derived from the reply's `faction` field — see `attitude_name`. ally … scowls.
+    pub attitude: String,
+    /// The spawn's actual character level, if it was in `entities` at consider time. `None` is an
+    /// honest "unknown" (e.g. a corpse, or a spawn that despawned between the request and the
+    /// reply) — never a fabricated number.
+    pub level: Option<u32>,
+    pub at: std::time::Instant,
+}
+
 /// How long [`GameState::resolve_pending_cast_end`] waits for a packet that EXPLAINS a cast the
 /// server has already ended, before reporting the end as unexplained.
 ///
@@ -513,6 +535,14 @@ pub struct GameState {
     /// exposed on /observe/debug so agents can read "how tough" without scraping chat.
     pub target_con_name: Option<String>,
     pub target_attitude: Option<String>,
+    /// #336: the result of the MOST RECENT consider of ANY spawn — target or not. Unlike
+    /// `target_con*` above (gated on the reply being about the CURRENT target, #330), this is set
+    /// unconditionally by every `apply_consider` and is never touched by `set_target`/`clear_target`
+    /// — it is spawn-scoped, not target-scoped. This is what closes the standalone-consider gap:
+    /// `POST /v1/combat/consider {"id":N}` on a spawn that is deliberately NOT your target used to
+    /// compute a difficulty tier and then discard it, leaving no way to learn it without first
+    /// targeting the spawn (defeating the whole point of the standalone endpoint).
+    pub last_consider: Option<LastConsider>,
 
     // Zone exit points (populated by OP_SEND_ZONE_POINTS on zone entry)
     pub zone_points: Vec<ZonePoint>,
