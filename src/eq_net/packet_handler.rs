@@ -2367,9 +2367,34 @@ fn loot_refusal_reason(response: u8) -> Option<&'static str> {
     }
 }
 
+/// #414: `OP_MoneyOnCorpse` carries no corpse/entity id anywhere in its 20 bytes (verified against
+/// the RoF2 wire — `moneyOnCorpseStruct` is response(u8) + 2 fixed per-response-path constants +
+/// 1 true pad byte + pp/gp/sp/cp; no ENCODE/DECODE override exists for RoF2 so it's sent verbatim;
+/// see docs/eq-technical-knowledgebase/loot-protocol.md for full citations). The ONLY correlation
+/// available to the client is its OWN request state: this ack is only meaningful while we are
+/// ACTUALLY still on the open session we most recently asked to loot — i.e. `loot_session_active`
+/// is true and we haven't given up and started a defensive close (`loot_defensive_close_at`). Any
+/// other state means this packet cannot belong to the current request: applying it anyway would
+/// misattribute a late ack for a corpse we've moved on from onto whatever session happens to be
+/// open now. Drop it and say so instead of guessing (agent-honesty).
+///
+/// NOTE: we deliberately do NOT gate on `loot_confirmed`. Normal(1)/Normal2(3)/LootAll(6) are all
+/// "the server accepted" for ONE still-open session, and LootAll(6) is a documented SECOND, trailing
+/// OP_MoneyOnCorpse that legitimately arrives on an already-`loot_confirmed` session (see below).
+/// Gating on `loot_confirmed` would swallow that legit same-session trailer as "stale" and — worse —
+/// mask the existing regression tests that prove LootAll(6) is not treated as a refusal (#414 review).
 fn apply_money_on_corpse(gs: &mut GameState, payload: &[u8]) {
     // MoneyOnCorpse_Struct: response(u8) + 3×pad + platinum(u32) + gold(u32) + silver(u32) + copper(u32)
     if payload.len() < 20 { return; }
+    if !gs.loot_session_active || gs.loot_defensive_close_at.is_some() {
+        tracing::info!(
+            "EQ: stale OP_MoneyOnCorpse discarded (session_active={}, confirmed={}, \
+             defensive_close_pending={}, current_corpse={:?}) — not applied to any session (#414)",
+            gs.loot_session_active, gs.loot_confirmed, gs.loot_defensive_close_at.is_some(),
+            gs.loot_current_corpse,
+        );
+        return;
+    }
     let response = payload[0];
     if let Some(reason) = loot_refusal_reason(response) {
         // The corpse never opened — say so honestly (distinct from "Looting complete") instead of
@@ -2452,7 +2477,41 @@ fn apply_money_on_corpse(gs: &mut GameState, payload: &[u8]) {
 ///   - anything else (no session, or a session that hasn't been accepted yet) → a stray/late
 ///     packet (e.g. arriving after our own TimedOut, while the NEXT corpse is already opening).
 ///     It must not be attributed to that corpse — leave the session untouched.
+///
+/// #414 REVIEW. That third bucket used to be reached by simply falling through — but "TimedOut"
+/// (giving up on branch 1's own close-ack) used to fully clear the session immediately, so once
+/// the next corpse was confirmed, a truly-late reply to the PREVIOUS corpse's close would land in
+/// branch 2 instead (`session_active && confirmed`, now true for the NEW corpse) and get reported
+/// as an "aborted" outcome for it — a misattribution of the exact same shape #414 reports for
+/// `OP_MoneyOnCorpse`. `TimedOut` and `OpenTimedOut` now both enter a defensive-close quarantine
+/// (`loot_defensive_close_at`, withholding the next `Open` until it resolves) instead of clearing
+/// immediately — branch 0 below drains a reply that arrives during that quarantine silently,
+/// NARROWING (not eliminating) this gap with the same mechanism used for the coin ack. Symmetric to
+/// the acknowledged `OP_MoneyOnCorpse` residual: a very-late OP_LootComplete for an abandoned corpse
+/// arriving AFTER `DefensiveCloseTimedOut` has fired and the next corpse is confirmed still reaches
+/// branch 2 and would be misreported as an abort of that healthy new corpse. The packet is 0-byte
+/// and carries no corpse id, so once the quarantine window closes the two are indistinguishable —
+/// the window shrinks the race, it does not close it.
 fn apply_loot_complete(gs: &mut GameState) {
+    // (0) #414: a reply to OUR speculative/defensive OP_EndLootRequest, sent after we already gave
+    // up on this corpse (`OpenTimedOut` — never confirmed open — or `TimedOut` — confirmed but its
+    // own close-ack never arrived). The definitive failure was already reported at that point; this
+    // just confirms the server released the lock. Checked FIRST, before either "real" branch below,
+    // so a late reply here can never be mistaken for a genuine close (1) or misfire as an abort of
+    // whatever corpse the queue opens next (2) — exactly the branch-2 misattribution #414 reports.
+    if gs.loot_defensive_close_at.is_some() {
+        let corpse_id = gs.loot_current_corpse.take();
+        gs.loot_session_active = false;
+        gs.loot_confirmed = false;
+        gs.loot_defensive_close_at = None;
+        tracing::info!(
+            "EQ: defensive OP_EndLootRequest acked for corpse_id={:?} — lock released, resuming queue (#414)",
+            corpse_id
+        );
+        gs.loot_queued_at = gs.pending_loot.front().map(|_| std::time::Instant::now());
+        return;
+    }
+
     // (1) Genuine close — this is the ONLY place "Looting complete" may be emitted.
     if gs.loot_end_requested_at.is_some() {
         let corpse_id = gs.loot_current_corpse.take();
@@ -3474,6 +3533,7 @@ mod tests {
     #[test]
     fn money_on_corpse_normal2_response_also_confirms() {
         let mut gs = GameState::new();
+        gs.loot_session_active = true; // #414: must be awaiting an ack, or it's dropped as stale
         let p = money_on_corpse_payload(3, 0, 0, 0, 0);
         apply_money_on_corpse(&mut gs, &p);
         assert!(gs.loot_confirmed, "Normal2(3) is documented as behaving exactly like Normal(1)");
@@ -3505,6 +3565,7 @@ mod tests {
     #[test]
     fn money_on_corpse_too_far_response_is_also_a_refusal() {
         let mut gs = GameState::new();
+        gs.loot_session_active = true; // #414: must be awaiting an ack, or it's dropped as stale
         let p = money_on_corpse_payload(5, 0, 0, 0, 0); // TooFar
         apply_money_on_corpse(&mut gs, &p);
         assert!(!gs.loot_session_active);
@@ -3550,6 +3611,79 @@ mod tests {
         assert_eq!(gs.messages.len(), before, "and it must not announce looted coins");
         // It is still an accept, not a refusal: the session stays open and confirmed.
         assert!(gs.loot_session_active);
+        assert!(gs.loot_confirmed);
+    }
+
+    /// #414. `OP_MoneyOnCorpse` carries no session/corpse id, so the ONLY thing that tells a late
+    /// ack apart from a fresh one is our own request state. If a session is not ACTUALLY awaiting
+    /// its first accept/refuse — idle, already confirmed, or defensively closing — any
+    /// `OP_MoneyOnCorpse` that shows up must be dropped as stale, never applied.
+    #[test]
+    fn money_on_corpse_with_no_session_open_is_dropped_not_applied() {
+        let mut gs = GameState::new();
+        gs.coin = [10, 0, 5, 0];
+        // loot_session_active defaults to false: nothing is currently awaiting an ack at all.
+        let before = gs.messages.len();
+        let p = money_on_corpse_payload(1, 5, 5, 5, 5); // a real, coin-bearing accept
+        apply_money_on_corpse(&mut gs, &p);
+        assert_eq!(gs.coin, [10, 0, 5, 0], "no session was open — nothing to credit this coin to");
+        assert!(!gs.loot_confirmed, "must not fabricate a confirmed session from a stray ack");
+        assert_eq!(gs.messages.len(), before, "a dropped stale ack must not announce anything");
+    }
+
+    /// #414 THE HEADLINE FIX. Corpse A's `OP_LootRequest` goes unanswered, we give up
+    /// (`OpenTimedOut`) and start defensively closing it — the exact state `apply_loot_open_timeout`
+    /// leaves behind, per `defensive_close_pending_withholds_the_next_open` in gameplay.rs: session
+    /// still active, NOT confirmed, `loot_current_corpse` still naming corpse A, and
+    /// `loot_defensive_close_at` set. The queue has NOT been allowed to open corpse B yet (that's
+    /// the whole point of the quarantine) — but if corpse A's ack was merely LATE rather than lost,
+    /// it can still arrive during this exact window. Before #414 there was no gate at all, so this
+    /// would have been silently treated as answering "the current session" and credited/confirmed.
+    /// It must be dropped instead.
+    #[test]
+    fn late_money_on_corpse_during_defensive_close_quarantine_is_not_credited() {
+        let mut gs = GameState::new();
+        gs.coin = [10, 0, 5, 0];
+        gs.loot_session_active = true;
+        gs.loot_confirmed = false;
+        gs.loot_current_corpse = Some(7); // corpse A
+        gs.loot_defensive_close_at = Some(std::time::Instant::now()); // #414 quarantine pending
+        let before = gs.messages.len();
+
+        // Corpse A's real, coin-bearing accept ack finally arrives — late.
+        let p = money_on_corpse_payload(1, 3, 2, 1, 0);
+        apply_money_on_corpse(&mut gs, &p);
+
+        assert_eq!(gs.coin, [10, 0, 5, 0], "a late ack during the defensive-close quarantine must credit nothing");
+        assert!(!gs.loot_confirmed, "must not retroactively confirm a session we already gave up on");
+        assert_eq!(gs.messages.len(), before, "a dropped stale ack must not announce anything");
+        // The quarantine itself is untouched — only apply_loot_complete's branch 0 (a genuine
+        // OP_LootComplete reply to our defensive close) may resolve it.
+        assert!(gs.loot_defensive_close_at.is_some());
+        assert_eq!(gs.loot_current_corpse, Some(7));
+    }
+
+    /// #414 mutation-check companion: without the stale-ack gate, the SAME late accept ack from the
+    /// previous test would be applied to whatever session is "current" — which, immediately after
+    /// the defensive-close quarantine resolves, is corpse B's brand-new, unconfirmed session. This
+    /// pins that exact misattribution shape once the quarantine has resolved and corpse B has
+    /// opened: a late ack arriving in a state that is —byte-for-byte— indistinguishable from "corpse
+    /// B's own genuine accept" would, without the gate, always be accepted as B's. The gate cannot
+    /// (and #414's fix direction does not claim to) resolve THIS exact overlap from packet content
+    /// alone — it is closed structurally instead, by never opening corpse B until corpse A's
+    /// defensive close has resolved (see `defensive_close_pending_withholds_the_next_open`), which
+    /// bounds how late corpse A's ack would have to be for this overlap to still occur (past BOTH
+    /// `LOOT_OPEN_TIMEOUT_SECS` and `LOOT_DEFENSIVE_CLOSE_TIMEOUT_SECS`, not just one).
+    #[test]
+    fn happy_path_accept_while_genuinely_awaiting_is_still_credited() {
+        let mut gs = GameState::new();
+        gs.coin = [10, 0, 5, 0];
+        gs.loot_session_active = true;
+        gs.loot_confirmed = false;
+        gs.loot_current_corpse = Some(11); // corpse B, freshly opened, defensive_close_at = None
+        let p = money_on_corpse_payload(1, 0, 0, 0, 7);
+        apply_money_on_corpse(&mut gs, &p);
+        assert_eq!(gs.coin, [10, 0, 5, 7], "a timely accept for the corpse we're actually awaiting must still be credited");
         assert!(gs.loot_confirmed);
     }
 
@@ -3662,6 +3796,57 @@ mod tests {
         let before = gs.messages.len();
         super::apply_loot_complete(&mut gs);
         assert_eq!(gs.messages.len(), before, "no session was open — nothing to announce");
+    }
+
+    /// #414. A genuine `OP_LootComplete` reply to our OWN defensive `OP_EndLootRequest` (sent after
+    /// `OpenTimedOut`/`TimedOut` gave up on a corpse) must be drained silently — the failure was
+    /// already reported when the timeout fired, so this is not a second "complete"/"aborted"
+    /// message — and it must release the quarantine so the queue can resume.
+    #[test]
+    fn defensive_close_ack_is_drained_silently_and_resumes_the_queue() {
+        let mut gs = GameState::new();
+        gs.loot_session_active = true;
+        gs.loot_confirmed = false;
+        gs.loot_current_corpse = Some(7);
+        gs.loot_defensive_close_at = Some(std::time::Instant::now());
+        gs.pending_loot.push_back(11);
+        let before = gs.messages.len();
+
+        super::apply_loot_complete(&mut gs);
+
+        assert_eq!(gs.messages.len(), before, "the outcome was already reported at timeout — no new message");
+        assert!(!gs.loot_session_active);
+        assert!(!gs.loot_confirmed);
+        assert_eq!(gs.loot_current_corpse, None);
+        assert_eq!(gs.loot_defensive_close_at, None, "the quarantine must be released");
+        assert!(gs.loot_queued_at.is_some(), "the queue must resume toward the next corpse");
+    }
+
+    /// #414 branch-2 misattribution this whole mechanism exists to close: without the defensive
+    /// quarantine, a late `OP_LootComplete` reply to corpse A's close (after we gave up via
+    /// `TimedOut`) landing once corpse B is ALREADY confirmed would hit branch 2
+    /// (`session_active && confirmed`) and get reported as corpse B being "aborted by the server" —
+    /// while corpse B's session is still perfectly healthy. This test pins that, while the
+    /// quarantine is pending, a stray `OP_LootComplete` reply cannot reach that branch at all —
+    /// branch 0 is checked first and wins regardless of what `loot_confirmed` happens to read
+    /// (defense in depth: the tick loop always clears `confirmed` before setting the quarantine,
+    /// but the ordering must hold even if that ever changes).
+    #[test]
+    fn defensive_close_pending_takes_priority_over_the_abort_branch() {
+        let mut gs = GameState::new();
+        gs.loot_session_active = true;
+        gs.loot_confirmed = true; // looks exactly like a healthy, confirmed session
+        gs.loot_current_corpse = Some(11);
+        gs.loot_defensive_close_at = Some(std::time::Instant::now()); // #414 quarantine pending
+        let before = gs.messages.len();
+
+        super::apply_loot_complete(&mut gs);
+
+        // Must NOT be reported as an abort — that would misattribute corpse A's late close-ack to
+        // corpse B's still-open, still-healthy session. Branch 0 drains it silently instead.
+        assert_eq!(gs.messages.len(), before,
+            "a defensive-close reply must never be reported as an abort of the current corpse");
+        assert_eq!(gs.loot_defensive_close_at, None, "the quarantine must still resolve");
     }
 
     use crate::eq_net::item::tests::{fixture, fixture2};

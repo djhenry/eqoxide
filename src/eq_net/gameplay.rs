@@ -442,6 +442,7 @@ pub async fn run_gameplay_phase(
             pending_front:    gs.pending_loot.front().copied(),
             last_activity:    gs.loot_last_activity,
             end_requested_at: gs.loot_end_requested_at,
+            defensive_close_at: gs.loot_defensive_close_at,
         }, std::time::Instant::now()) {
             LootTickAction::None => {}
             LootTickAction::Open(corpse_id) => {
@@ -471,16 +472,31 @@ pub async fn run_gameplay_phase(
             }
             LootTickAction::OpenTimedOut(corpse_id) => {
                 apply_loot_open_timeout(&mut gs, corpse_id);
+                // #414: release the server-side loot lock speculatively even though this corpse
+                // never confirmed open — `Corpse::EndLoot` doesn't check ownership (verified
+                // against EQEmu zone/corpse.cpp:1787-1802 via eq-client-expert), so this is safe.
+                // Waiting for it to resolve (loot_defensive_close_at, set inside
+                // apply_loot_open_timeout) before opening the next corpse narrows the window in
+                // which a late OP_MoneyOnCorpse for THIS corpse could land on a later session.
+                s.send_app_packet(OP_END_LOOT_REQUEST, &corpse_id.to_le_bytes());
+                tracing::info!(
+                    "EQ: auto-loot: sent defensive OP_EndLootRequest for corpse_id={} after open-timeout",
+                    corpse_id
+                );
             }
             LootTickAction::TimedOut => {
                 // OP_EndLootRequest got no OP_LootComplete ack in time. Say so honestly instead of
-                // fabricating "Looting complete", and unwedge the queue so later corpses aren't
-                // blocked forever.
-                let corpse = gs.loot_current_corpse.take();
-                gs.loot_session_active = false;
+                // fabricating "Looting complete". #414: don't unwedge the queue immediately either
+                // — a genuinely-late OP_LootComplete for THIS corpse is still possible, and letting
+                // the next corpse open right away is exactly what would let that late reply get
+                // misattributed as an "aborted" outcome for the NEXT corpse's still-legitimate
+                // session (apply_loot_complete's branch-2 misfire). Enter the same defensive-close
+                // quarantine `OpenTimedOut` uses instead; the queue resumes once it resolves.
+                let corpse = gs.loot_current_corpse;
                 gs.loot_confirmed = false;
                 gs.loot_last_activity = None;
                 gs.loot_end_requested_at = None;
+                gs.loot_defensive_close_at = Some(std::time::Instant::now());
                 let msg = format!(
                     "Loot failed — no close confirmation from the server (corpse_id={:?})",
                     corpse
@@ -488,7 +504,22 @@ pub async fn run_gameplay_phase(
                 gs.log_msg("loot", &msg);
                 gs.push_event("loot", "failed", "system", true, &msg);
                 tracing::warn!("EQ: auto-loot: {}", msg);
-                // Reset queued_at so the next corpse gets its own delay window.
+                // loot_session_active and loot_current_corpse are deliberately left as-is: the
+                // quarantine (loot_tick_action's defensive_close_at branch) needs session_active
+                // to stay true so it keeps withholding the next Open() until this resolves.
+            }
+            LootTickAction::DefensiveCloseTimedOut => {
+                // #414: the defensive OP_EndLootRequest itself got no ack either — give up on this
+                // corpse entirely. The failure was already reported when OpenTimedOut/TimedOut
+                // fired, so there's nothing new to tell the agent; just free the slot.
+                let corpse = gs.loot_current_corpse.take();
+                gs.loot_session_active = false;
+                gs.loot_confirmed = false;
+                gs.loot_defensive_close_at = None;
+                tracing::warn!(
+                    "EQ: auto-loot: defensive OP_EndLootRequest for corpse_id={:?} never acked — giving up, resuming queue",
+                    corpse
+                );
                 gs.loot_queued_at = gs.pending_loot.front().map(|_| std::time::Instant::now());
             }
         }
@@ -906,6 +937,11 @@ const LOOT_END_TIMEOUT_SECS: f32 = 5.0;
 /// confirmed session) — both bound "waiting on one specific server ack" and both fire well after
 /// any real round trip but long before an agent would give up waiting on its own.
 const LOOT_OPEN_TIMEOUT_SECS: f32 = 5.0;
+/// #414: how long to wait for the server to ack our defensive `OP_EndLootRequest` (sent after
+/// giving up on a corpse via `OpenTimedOut` or `TimedOut`) before giving up on THAT too and
+/// letting the queue advance regardless. Bounds the window a stray, still-outstanding ack for the
+/// abandoned corpse can be safely absorbed rather than risking it land on the next corpse instead.
+const LOOT_DEFENSIVE_CLOSE_TIMEOUT_SECS: f32 = 5.0;
 
 /// What the gameplay loop should do this tick for the auto-loot pipeline.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -925,6 +961,12 @@ pub enum LootTickAction {
     /// `OP_EndLootRequest` was sent but no `OP_LootComplete` arrived within the timeout — report a
     /// failure and unwedge the queue; never silently claim "complete".
     TimedOut,
+    /// #414: the defensive `OP_EndLootRequest` we sent after giving up on a corpse (via
+    /// `OpenTimedOut` or `TimedOut`) itself got no `OP_LootComplete` ack within
+    /// `LOOT_DEFENSIVE_CLOSE_TIMEOUT_SECS`. Give up entirely and let the queue advance — the
+    /// failure was already reported when the original timeout fired, so this carries no new
+    /// user-facing message.
+    DefensiveCloseTimedOut,
 }
 
 /// The bits of loot state `loot_tick_action` needs, gathered by value so the decision is pure and
@@ -945,6 +987,10 @@ pub struct LootTickState {
     pub last_activity: Option<std::time::Instant>,
     /// `gs.loot_end_requested_at` — when OP_EndLootRequest was sent, awaiting OP_LootComplete.
     pub end_requested_at: Option<std::time::Instant>,
+    /// `gs.loot_defensive_close_at` — #414: when a defensive/give-up `OP_EndLootRequest` was sent
+    /// for a corpse we're abandoning (via `OpenTimedOut` or `TimedOut`); withholds the next
+    /// corpse's `Open` until this resolves or itself times out.
+    pub defensive_close_at: Option<std::time::Instant>,
 }
 
 /// Pure decision for one gameplay tick of the auto-loot pipeline. See `LootTickAction` for what
@@ -963,6 +1009,18 @@ pub fn loot_tick_action(state: &LootTickState, now: std::time::Instant) -> LootT
         return LootTickAction::None;
     }
     if !state.confirmed {
+        // #414: we've given up on this corpse (OpenTimedOut, or TimedOut on the confirmed-close
+        // side re-entering here after clearing `confirmed`) and sent a defensive/idempotent
+        // OP_EndLootRequest to release its server-side lock. Wait for that to resolve — bounded,
+        // so a lost defensive ack can't wedge the queue either — before letting the next corpse
+        // open. This withholding is what keeps a still-outstanding stray ack for THIS corpse from
+        // ever landing on a session for a different one.
+        if let Some(sent) = state.defensive_close_at {
+            if now.duration_since(sent).as_secs_f32() > LOOT_DEFENSIVE_CLOSE_TIMEOUT_SECS {
+                return LootTickAction::DefensiveCloseTimedOut;
+            }
+            return LootTickAction::None;
+        }
         // Sent but not yet accepted/refused by the server — normally wait. A refusal closes
         // `session_active` immediately (see apply_money_on_corpse), so reaching here just means
         // the accept/refuse ack hasn't landed *yet*. But if OP_MoneyOnCorpse is lost entirely on
@@ -995,19 +1053,26 @@ pub fn loot_tick_action(state: &LootTickState, now: std::time::Instant) -> LootT
 
 /// Apply a `LootTickAction::OpenTimedOut` outcome to `GameState`: the server never acked our
 /// OP_LootRequest with an OP_MoneyOnCorpse accept/refuse (lost on the wire, #370). Report it
-/// honestly — never a silent forever-wait, never a fabricated success — and clear the session so
-/// the queue can drain to the next corpse.
+/// honestly — never a silent forever-wait, never a fabricated success.
 ///
 /// The event's `kind` is **`loot_open_timeout`**, deliberately DISTINCT from the confirmed-side
 /// `TimedOut` arm's `failed` kind (and from success/abort/normal-close). `/v1/events/loot` exposes
 /// `kind` as the field agents dispatch on, so "corpse never opened" (here) must be machine-
 /// separable from "corpse opened but never closed" — not merely different free text (#370 review).
+///
+/// #414: this does NOT fully clear the session — `loot_current_corpse` and `loot_session_active`
+/// stay as they were, and `loot_defensive_close_at` is set instead. `OP_MoneyOnCorpse` carries no
+/// corpse id (verified — see docs/eq-technical-knowledgebase/loot-protocol.md), so a "lost" ack
+/// might really just be LATE rather than lost; if it turns up right after we naively opened the
+/// next queued corpse, it would land on that corpse's session instead (the exact bug #414 reports).
+/// Leaving `loot_current_corpse` pointing at THIS corpse until the caller's defensive
+/// `OP_EndLootRequest` resolves (see `loot_tick_action`'s `defensive_close_at` branch) keeps
+/// `apply_money_on_corpse`'s stale-ack gate correctly closed until then.
 fn apply_loot_open_timeout(gs: &mut GameState, corpse_id: u32) {
-    gs.loot_current_corpse = None;
-    gs.loot_session_active = false;
     gs.loot_confirmed = false;
     gs.loot_last_activity = None;
     gs.loot_end_requested_at = None;
+    gs.loot_defensive_close_at = Some(std::time::Instant::now());
     let msg = format!(
         "Loot failed — no response from the server opening corpse_id={}",
         corpse_id
@@ -1015,8 +1080,8 @@ fn apply_loot_open_timeout(gs: &mut GameState, corpse_id: u32) {
     gs.log_msg("loot", &msg);
     gs.push_event("loot", "loot_open_timeout", "system", true, &msg);
     tracing::warn!("EQ: auto-loot: {}", msg);
-    // Reset queued_at so the next corpse gets its own delay window.
-    gs.loot_queued_at = gs.pending_loot.front().map(|_| std::time::Instant::now());
+    // Do NOT reset queued_at / advance the queue here — the defensive-close quarantine
+    // (loot_defensive_close_at) withholds the next Open() until it resolves.
 }
 
 /// Publish the network thread's `GameState` for lock-free reads by the render/HTTP threads. Called
@@ -1203,12 +1268,49 @@ mod loot_tick_tests {
              separate it from the confirmed-side `failed`/`complete`/`aborted` outcomes");
         assert_ne!(ev.kind, "failed", "must not collide with the confirmed-side TimedOut kind");
 
-        // The session is fully torn down so `pending_loot` can drain to the next corpse.
-        assert!(!gs.loot_session_active);
         assert!(!gs.loot_confirmed);
-        assert_eq!(gs.loot_current_corpse, None);
         assert_eq!(gs.loot_last_activity, None);
         assert_eq!(gs.loot_end_requested_at, None);
+        // #414: the session is NOT fully torn down yet — `loot_current_corpse`/`loot_session_active`
+        // stay put and a defensive-close quarantine begins, so a still-outstanding late
+        // OP_MoneyOnCorpse for corpse 9 can't be misattributed to whatever corpse opens next.
+        assert!(gs.loot_session_active, "stays active to withhold the next corpse's Open (#414)");
+        assert_eq!(gs.loot_current_corpse, Some(9), "retained until the defensive close resolves (#414)");
+        assert!(gs.loot_defensive_close_at.is_some(), "a defensive close-and-wait must begin (#414)");
+    }
+
+    /// #414. Once a corpse's open-ack has timed out and a defensive close is pending, the queue
+    /// must NOT open the next corpse — otherwise a still-outstanding late ack for the abandoned
+    /// corpse could land on the new one's session instead.
+    #[test]
+    fn defensive_close_pending_withholds_the_next_open() {
+        let now = Instant::now();
+        let st = LootTickState {
+            session_active: true,
+            confirmed: false,
+            current_corpse: Some(9),
+            defensive_close_at: Some(now - Dur::from_secs(1)),
+            pending_front: Some(11), // corpse B queued right behind corpse A (9)
+            ..Default::default()
+        };
+        assert_eq!(loot_tick_action(&st, now), LootTickAction::None,
+            "must not open corpse 11 while corpse 9's defensive close is still outstanding");
+    }
+
+    /// #414. If the defensive close itself never gets acked either, give up rather than wedge the
+    /// queue forever.
+    #[test]
+    fn defensive_close_past_timeout_gives_up() {
+        let now = Instant::now();
+        let st = LootTickState {
+            session_active: true,
+            confirmed: false,
+            current_corpse: Some(9),
+            defensive_close_at: Some(now - Dur::from_secs(6)),
+            pending_front: Some(11),
+            ..Default::default()
+        };
+        assert_eq!(loot_tick_action(&st, now), LootTickAction::DefensiveCloseTimedOut);
     }
 
     #[test]

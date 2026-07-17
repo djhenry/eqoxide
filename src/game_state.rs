@@ -574,6 +574,20 @@ pub struct GameState {
     /// When the first corpse was pushed to pending_loot; used to delay LootRequest by
     /// 500 ms so the server has time to register the corpse as lootable.
     pub loot_queued_at: Option<std::time::Instant>,
+    /// #414: set when we've given up waiting on a loot-ack for the CURRENT corpse — either
+    /// `OP_MoneyOnCorpse` never arrived (`OpenTimedOut`) or `OP_LootComplete` never arrived
+    /// after we asked to close (`TimedOut`) — and have sent (or, for the close-side, already
+    /// sent) a defensive/idempotent `OP_EndLootRequest` to release the server-side lock
+    /// (`Corpse::EndLoot` doesn't check ownership — safe even for a never-confirmed corpse; see
+    /// docs/eq-technical-knowledgebase/loot-protocol.md). While this is `Some`, `loot_current_corpse`
+    /// and `loot_session_active` are deliberately left untouched so `loot_tick_action` withholds
+    /// the NEXT corpse's `OP_LootRequest` until this one's fate is truly settled — narrowing (not
+    /// eliminating; neither `OP_MoneyOnCorpse` nor `OP_LootComplete` carries a corpse id at all)
+    /// the window in which a late ack for THIS corpse could otherwise land on a different, later
+    /// session and be misattributed to it. A reply that arrives while this is `Some` is drained
+    /// silently (the definitive failure was already reported when this was set) — see
+    /// `apply_loot_complete`'s branch 0 and `apply_money_on_corpse`'s stale-ack gate.
+    pub loot_defensive_close_at: Option<std::time::Instant>,
 
     // Quest log (native EQ Task system) — server-pushed via OP_TaskDescription / OP_TaskActivity.
     /// All task quests keyed by task_id (any status), with their objectives + live progress.
