@@ -29,6 +29,15 @@ pub struct BuyOk {
     pub coin_after: [u32; 4],
 }
 
+/// The honest receipt of a confirmed merchant open (eqoxide#479) — the `T` in
+/// `CommandResult<OpenOk>` and the JSON body of a 200 from POST /v1/merchant/open. `merchant_id` is
+/// read back from the APPLIED OP_ShopRequest echo (`command==1`), never guessed at send time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct OpenOk {
+    /// The spawn id of the merchant that confirmed the open (echoed npc_id).
+    pub merchant_id: u32,
+}
+
 impl CommandState {
     // ── request_* : the VIEW (UI click-handlers + HTTP handlers) makes these writes ──────────────
 
@@ -65,6 +74,20 @@ impl CommandState {
         *self.merchant.trade.lock().unwrap() = Some(cmd);
     }
 
+    /// Command-with-result open (eqoxide#479): queue the SAME open as
+    /// `request_merchant_trade(TradeCmd::Open(..))` but hand in a `oneshot::Sender<CommandResult<OpenOk>>`
+    /// the net thread fulfils with the TRUE outcome. POST /v1/merchant/open awaits the matching
+    /// receiver under a timeout so it reports the real result instead of a premature queued-action
+    /// 200. Writes the sibling `open_await` slot — the fire-and-forget `trade` slot (UI path) is left
+    /// untouched. See `crate::command_state::result`.
+    pub fn request_open_await(
+        &self,
+        merchant_id: u32,
+        tx: oneshot::Sender<CommandResult<OpenOk>>,
+    ) {
+        *self.merchant.open_await.lock().unwrap() = Some((merchant_id, tx));
+    }
+
     // ── take_* : the MODEL (`ActionLoop::drain_merchant`) drains these once per tick ─────────────
 
     /// Drain a pending buy request as `(merchant_id, slot)`.
@@ -89,6 +112,13 @@ impl CommandState {
     /// Drain a pending open/close request.
     pub fn take_merchant_trade(&self) -> Option<TradeCmd> {
         self.merchant.trade.lock().unwrap().take()
+    }
+
+    /// Drain a pending awaited-open request as `(merchant_id, Sender)` (eqoxide#479).
+    /// `ActionLoop::drain_merchant` takes this, sends the open, and parks the `Sender` in
+    /// `pending_open` until the resolving packet lands. Sibling of `take_merchant_trade`.
+    pub fn take_open_await(&self) -> Option<(u32, oneshot::Sender<CommandResult<OpenOk>>)> {
+        self.merchant.open_await.lock().unwrap().take()
     }
 }
 
@@ -129,6 +159,29 @@ mod tests {
         assert_eq!(cs.take_merchant_sell(), None);
         assert!(cs.take_merchant_trade().is_none());
         assert!(cs.take_buy_await().is_none());
+        assert!(cs.take_open_await().is_none());
+    }
+
+    /// eqoxide#479: the awaited-open slot round-trips the `(merchant_id, Sender)` tuple, the drain
+    /// removes it, and the drained `Sender` still reaches its receiver — proving `open_await` is a
+    /// genuine sibling of the fire-and-forget `trade` slot and does NOT disturb it.
+    #[tokio::test]
+    async fn request_open_await_round_trips_the_sender_and_leaves_trade_untouched() {
+        use super::{OpenOk, CommandResult};
+        let cs = CommandState::default();
+        let (tx, rx) = tokio::sync::oneshot::channel::<CommandResult<OpenOk>>();
+
+        cs.request_open_await(11, tx);
+        // The fire-and-forget UI slot is a genuinely separate cell — an awaited open must not queue it.
+        assert!(cs.take_merchant_trade().is_none(),
+            "the awaited open must not leak into the fire-and-forget UI slot");
+
+        let (mid, drained_tx) = cs.take_open_await().expect("awaited open must drain");
+        assert_eq!(mid, 11);
+        assert!(cs.take_open_await().is_none(), "a drained awaited open must not re-fire");
+
+        drained_tx.send(CommandResult::Resolved(OpenOk { merchant_id: 11 })).unwrap();
+        assert_eq!(rx.await.unwrap(), CommandResult::Resolved(OpenOk { merchant_id: 11 }));
     }
 
     /// A3 Migration 1 (#448): the awaited-buy slot round-trips the `(merchant_id, slot, Sender)`

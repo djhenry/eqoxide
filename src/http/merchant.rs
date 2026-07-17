@@ -10,7 +10,7 @@ use axum::{
 };
 use tokio::sync::oneshot;
 use std::time::Duration;
-use crate::command_state::{BuyOk, CommandResult};
+use crate::command_state::{BuyOk, CommandResult, OpenOk};
 use super::*;
 
 pub(super) fn router() -> Router<HttpState> {
@@ -30,29 +30,77 @@ struct TradeOpenBody {
 }
 
 /// POST /v1/merchant/open {"merchant":"<name>"} — open the named merchant's window (OP_ShopRequest).
-/// Must be within ~200u. The server replies Open (window opens, items arrive) or Close (refused,
-/// e.g. KOS faction); watch GET /v1/merchant/list `open` to see the result.
+/// Must be within ~200u.
+///
+/// A3 migration (eqoxide#479) — Command-with-result: this no longer returns a premature "queued"
+/// 200 that lied about a non-merchant NPC's window having opened. It AWAITS the real outcome (up to
+/// 4s) and reports it honestly:
+///   • 200 — the server CONFIRMED the open (OP_ShopRequest echo, command=1). Body: `{status:"open",
+///     merchant_id}`. Watch GET /v1/merchant/list for the item list arriving.
+///   • 409 — the server REFUSED it (OP_ShopRequest echo, command=0) — a real negative ack covering
+///     faction KOS/dubious, engaged in combat, feigned/invisible, charmed, or an already-busy
+///     window (RoF2's server collapses all of these into the same echo). Body: `{status:"refused",
+///     reason}`.
+///   • 202 — the outcome is UNKNOWN: no resolving packet arrived within 4s. This is what a target
+///     that is NOT a merchant NPC at all, or one that's out of range, produces — the server sends
+///     NO packet of any kind on that path (confirmed against the EQEmu RoF2 source; see
+///     `docs/eq-technical-knowledgebase/merchant-open-protocol.md`). The body says so explicitly. A
+///     202 MUST NOT be read as success — that is the whole honesty invariant of A3 (see
+///     `crate::command_state::result`).
 async fn post_trade_open(
     State(s): State<HttpState>,
     body: Result<Json<TradeOpenBody>, axum::extract::rejection::JsonRejection>,
-) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
+) -> Response {
+    if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
     let b = match body {
         Ok(Json(b)) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"merchant\":\"...\"}".into()),
+        Err(_) => return text(StatusCode::BAD_REQUEST, "provide {\"merchant\":\"...\"}"),
     };
-    let ids = s.world.entity_ids.lock().unwrap();
-    let nl = b.merchant.to_lowercase();
-    let found = ids.iter()
-        .find(|(k, _)| clean_entity_name(k).to_lowercase().contains(&nl) || k.to_lowercase().contains(&nl))
-        .map(|(k, &id)| (k.clone(), id));
-    match found {
-        Some((key, id)) => {
-            s.command.request_merchant_trade(TradeCmd::Open(id));
-            tracing::info!("trade: queued open merchant {:?} (spawn_id={})", key, id);
-            (StatusCode::OK, format!("opening merchant {} (spawn_id={})", clean_entity_name(&key), id))
-        }
-        None => (StatusCode::NOT_FOUND, format!("no merchant matching {:?}", b.merchant)),
+    // Resolve the merchant, then DROP the entity map lock before awaiting — never hold a std Mutex
+    // across an `.await`.
+    let found = {
+        let ids = s.world.entity_ids.lock().unwrap();
+        let nl = b.merchant.to_lowercase();
+        ids.iter()
+            .find(|(k, _)| clean_entity_name(k).to_lowercase().contains(&nl) || k.to_lowercase().contains(&nl))
+            .map(|(k, &id)| (k.clone(), id))
+    };
+    let (key, id) = match found {
+        Some(hit) => hit,
+        None => return text(StatusCode::NOT_FOUND, format!("no merchant matching {:?}", b.merchant)),
+    };
+
+    // Park the open with a result channel and await the TRUE outcome (park → fulfil → timeout).
+    let (tx, rx) = oneshot::channel::<CommandResult<OpenOk>>();
+    s.command.request_open_await(id, tx);
+    tracing::info!("trade: awaited open queued — merchant {:?} (spawn_id={})", key, id);
+
+    match tokio::time::timeout(Duration::from_secs(4), rx).await {
+        // A REAL confirmation echo landed — honest success.
+        Ok(Ok(CommandResult::Resolved(OpenOk { merchant_id }))) => json(
+            StatusCode::OK,
+            serde_json::json!({ "status": "open", "merchant_id": merchant_id }),
+        ),
+        // A REAL refusal echo landed (OP_ShopRequest command=0).
+        Ok(Ok(CommandResult::Refused(reason))) => json(
+            StatusCode::CONFLICT,
+            serde_json::json!({ "status": "refused", "reason": reason }),
+        ),
+        // Unconfirmed, channel closed (Sender dropped — disconnect/superseded), or elapsed: the
+        // outcome is genuinely UNKNOWN. A non-merchant NPC or an out-of-range target is exactly this
+        // case (the server is totally silent). MUST NOT read as success — 202 with an explicit
+        // "re-check state" body.
+        _ => json(
+            StatusCode::ACCEPTED,
+            serde_json::json!({
+                "status": "unconfirmed",
+                "message": "open sent to the NPC, but the outcome is UNKNOWN — no confirmation \
+                            arrived within 4s. It may not be a merchant, or may be out of range, \
+                            both of which the server never acknowledges. Re-check GET \
+                            /v1/merchant/list (open:true/false) before assuming it opened.",
+                "merchant": clean_entity_name(&key),
+            }),
+        ),
     }
 }
 
@@ -363,6 +411,110 @@ mod tests {
         let msg = v["message"].as_str().unwrap();
         assert!(msg.contains("UNKNOWN"), "the body must state the outcome is unknown");
         assert!(msg.contains("insufficient funds"), "and point at the likely silent-failure cause");
+        drop(held);
+    }
+
+    // ── eqoxide#479: POST /v1/merchant/open reports the TRUE outcome, not a queued 200 ──────────
+
+    use crate::command_state::OpenOk;
+
+    /// An open that resolves nowhere-to-target still 404s before parking anything.
+    #[tokio::test]
+    async fn open_unknown_merchant_is_404() {
+        let state = empty_state();
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/open").header("content-type", "application/json")
+            .body(Body::from(r#"{"merchant":"Nobody"}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(command.take_open_await().is_none(), "a 404 must not park an open");
+    }
+
+    /// SUCCESS: the server confirms the open (OP_ShopRequest echo command=1, delivered here as
+    /// `Resolved`) → 200 with the honest merchant_id.
+    #[tokio::test]
+    async fn open_confirmed_is_200() {
+        let state = empty_state();
+        seed_merchant(&state, "Innkeeper_Beek000", 11);
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let task = tokio::spawn(async move {
+            app.oneshot(Request::post("/open").header("content-type", "application/json")
+                .body(Body::from(r#"{"merchant":"Beek"}"#)).unwrap()).await.unwrap()
+        });
+        let (mid, tx) = loop {
+            if let Some(p) = command.take_open_await() { break p; }
+            tokio::task::yield_now().await;
+        };
+        assert_eq!(mid, 11);
+        tx.send(CommandResult::Resolved(OpenOk { merchant_id: 11 })).unwrap();
+
+        let resp = task.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["status"], "open");
+        assert_eq!(v["merchant_id"], 11);
+    }
+
+    /// REFUSAL: a real negative ack (OP_ShopRequest echo command=0 → `Refused`) → 409. This is the
+    /// KOS-faction / engaged / feigned / charmed / busy case — a definite "no", not a "don't know".
+    #[tokio::test]
+    async fn open_refused_is_409() {
+        let state = empty_state();
+        seed_merchant(&state, "Innkeeper_Beek000", 11);
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let task = tokio::spawn(async move {
+            app.oneshot(Request::post("/open").header("content-type", "application/json")
+                .body(Body::from(r#"{"merchant":"Beek"}"#)).unwrap()).await.unwrap()
+        });
+        let (_mid, tx) = loop {
+            if let Some(p) = command.take_open_await() { break p; }
+            tokio::task::yield_now().await;
+        };
+        tx.send(CommandResult::Refused("merchant refused to open the window".into())).unwrap();
+
+        let resp = task.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["status"], "refused");
+    }
+
+    /// THE #479 HONESTY PROOF at the HTTP boundary — a NON-MERCHANT NPC (or an out-of-range one)
+    /// sends the server NO packet of any kind, so nothing ever fires the parked Sender; the 4s
+    /// timeout elapses (virtual time under `start_paused`, so the test is instant) → **202**, NOT
+    /// 200. Before the A3 migration this endpoint returned an unconditional 200 the instant the
+    /// request was queued — this is the exact regression the fix closes. The Sender is HELD (not
+    /// dropped) across the wait, so this exercises the genuine ELAPSED branch, not a channel-closed
+    /// shortcut.
+    #[tokio::test(start_paused = true)]
+    async fn open_on_non_merchant_is_202_unknown_never_success() {
+        let state = empty_state();
+        seed_merchant(&state, "Morty_Prysmith", 291);
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let task = tokio::spawn(async move {
+            app.oneshot(Request::post("/open").header("content-type", "application/json")
+                .body(Body::from(r#"{"merchant":"Morty"}"#)).unwrap()).await.unwrap()
+        });
+        // Take the parked Sender and HOLD it — the non-merchant's total silence, faithfully modelled.
+        let held = loop {
+            if let Some(p) = command.take_open_await() { break p; }
+            tokio::task::yield_now().await;
+        };
+
+        let resp = task.await.unwrap(); // 4s timeout elapses in virtual time
+        assert_ne!(resp.status(), StatusCode::OK,
+            "opening a non-merchant NPC MUST NOT be reported as success — the exact #479 bug");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["status"], "unconfirmed");
+        let msg = v["message"].as_str().unwrap();
+        assert!(msg.contains("UNKNOWN"), "the body must state the outcome is unknown");
         drop(held);
     }
 }
