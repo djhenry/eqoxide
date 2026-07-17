@@ -256,6 +256,9 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         "player": {
             "name":       player.name,
             "zone":       player.zone,
+            // #335/agent-honesty: true means the last zone change timed out and `zone` above is empty
+            // on purpose — we are not confidently in any zone (see PlayerState::zone_in_failed).
+            "zone_in_failed": player.zone_in_failed,
             // Guild identity (#295): empty name / id 0 = not in a guild.
             "guild":      guild_name,
             "guild_id":   guild_id,
@@ -742,6 +745,8 @@ async fn get_zone_entrances(State(s): State<HttpState>) -> Json<Vec<crate::game_
 /// region map (no `.wtr` / v1 map) or no collision is loaded yet.
 async fn get_zone_exits(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let player = s.player();
+    // `pos_up` is already the FOOT datum (#522), the same datum as the collision geometry
+    // (zone-line regions) it's tested against — no conversion needed.
     let pos = [player.pos_east, player.pos_north, player.pos_up];
     // index -> destination zone_id, from the advertised entrance list.
     let dest_of: std::collections::HashMap<i32, u16> = s

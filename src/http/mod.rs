@@ -116,6 +116,11 @@ pub struct PlayerState {
     /// The player's own character name — so `/v1/observe/debug` identifies which char it drives (#109).
     pub name:         String,
     pub zone:         String,
+    /// #335/agent-honesty: the last in-game zone change FAILED — we connected to the new zone server
+    /// and sent OP_ZoneEntry but the handshake timed out (`zone-entry-handshake-race.md`). When true,
+    /// `zone` is EMPTY on purpose (we are not confidently in any zone) rather than reporting the zone
+    /// we came from, and the net thread is tearing down. Default false on every healthy reading.
+    pub zone_in_failed: bool,
     pub race:         String, // 3-letter race code, e.g. "ELF" (Wood Elf)
     pub class:        String, // class name, e.g. "Cleric"
     pub level:        u32,
@@ -208,11 +213,19 @@ impl PlayerState {
         PlayerState {
             name:       gs.player_name.clone(),
             zone:       gs.zone_name.clone(),
+            zone_in_failed: gs.zone_in_failed,
             race:       gs.player_race.clone(),
             class:      gs.player_class.clone(),
             level:      gs.player_level as u32,
             pos_east:   gs.player_x,
             pos_north:  gs.player_y,
+            // FOOT datum (#522, see coord::WIRE_Z_OFFSET): every agent-facing position reports the
+            // collision-floor/foot height, the SAME datum used internally (controller, gs.player_z,
+            // nav, collision) and by /observe/entities (entities are converted wire→foot at ingest).
+            // One datum end to end means a position the agent READS here can be fed straight back
+            // into goto/coords without a 3u skew, and self reads at the same height as another player
+            // standing on the same plank. The wire↔foot conversion happens ONLY at the packet edge
+            // (outbound adds the offset in OP_ClientUpdate; inbound subtracts it), never here.
             pos_up:     gs.player_z,
             heading_ccw: gs.player_heading,
             heading_cw:  crate::eq_net::protocol::ccw_to_cw(gs.player_heading),
@@ -700,6 +713,24 @@ mod currency_tests {
         let v = currency_json([0, 0, 0, 0]);
         assert_eq!(v["platinum"], 0);
         assert_eq!(v["copper"], 0);
+    }
+}
+
+/// #522: the agent-facing player view reports the FOOT datum, not the wire (model-origin) datum.
+/// `gs.player_z` is FOOT internally; `pos_up` must echo it verbatim so the agent's world model is
+/// one datum end to end. MUTATION CHECK: reintroduce `gs.player_z + WIRE_Z_OFFSET` in
+/// `from_game_state` → this goes RED.
+#[cfg(test)]
+mod player_view_datum_tests {
+    use super::PlayerState;
+
+    #[test]
+    fn pos_up_reports_foot_not_wire() {
+        let mut gs = crate::game_state::GameState::new();
+        gs.player_z = 73.875; // FOOT
+        let view = PlayerState::from_game_state(&gs);
+        assert_eq!(view.pos_up, 73.875,
+            "pos_up must report the internal FOOT datum, not foot + WIRE_Z_OFFSET");
     }
 }
 

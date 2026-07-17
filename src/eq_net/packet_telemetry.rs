@@ -120,7 +120,7 @@ impl Ring {
     /// exercised against a caller-owned, non-global `Ring` — see the `#[cfg(test)]` note below on
     /// why that isolation matters (#541).
     fn push_captured(&mut self, dir: Dir, opcode: u16, payload: &[u8], reliable: bool, rel_seq: Option<u16>) {
-        let summary = summarize(opcode, payload);
+        let summary = summarize(dir, opcode, payload);
         let op_name = opcode_name(opcode);
         let n = self.next_n;
         self.next_n += 1;
@@ -425,15 +425,32 @@ fn cstr_at(buf: &[u8], off: usize) -> Option<String> {
 
 /// Short decoded one-liner for the highest-value opcodes (position/spawn/zone/delete). Returns
 /// `None` for opcodes with no decoder, or when the body is too short to decode — never a guess.
-fn summarize(opcode: u16, payload: &[u8]) -> Option<String> {
+fn summarize(dir: Dir, opcode: u16, payload: &[u8]) -> Option<String> {
     use super::protocol;
     match opcode {
         protocol::OP_CLIENT_UPDATE => {
-            let p = protocol::decode_position_update(payload)?;
-            Some(format!(
-                "spawn={} x={:.1} y={:.1} z={:.1} h={:.0}",
-                p.spawn_id, p.x, p.y, p.z, p.heading
-            ))
+            // OP_ClientUpdate is TWO different structs by direction: the server broadcasts the
+            // 24-byte bit-packed PlayerPositionUpdateServer_Struct, but the client SENDS the 46-byte
+            // plain-f32 PlayerPositionUpdateClient_Struct. Decoding an outbound packet with the
+            // server bit-unpacker (as this used to, unconditionally) reported confidently-wrong
+            // x/y/z — an agent-honesty violation, and it hid the #522 wire-Z datum during live
+            // validation. Decode each with its own layout.
+            if dir == Dir::Out {
+                // PlayerPositionUpdateClient_Struct: seq@0(u16) spawn_id@2(u16) x@18 z@26 y@30 (f32).
+                if payload.len() < 46 { return None; }
+                let f = |o: usize| f32::from_le_bytes([payload[o], payload[o+1], payload[o+2], payload[o+3]]);
+                let spawn_id = u16::from_le_bytes([payload[2], payload[3]]);
+                Some(format!(
+                    "spawn={} x={:.1} y={:.1} z={:.1} (client wire datum)",
+                    spawn_id, f(18), f(30), f(26)
+                ))
+            } else {
+                let p = protocol::decode_position_update(payload)?;
+                Some(format!(
+                    "spawn={} x={:.1} y={:.1} z={:.1} h={:.0}",
+                    p.spawn_id, p.x, p.y, p.z, p.heading
+                ))
+            }
         }
         protocol::OP_NEW_SPAWN | protocol::OP_ZONE_ENTRY => {
             let (s, _) = protocol::parse_rof2_spawn(payload)?;

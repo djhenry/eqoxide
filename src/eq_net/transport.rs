@@ -28,6 +28,23 @@ const RESEND_MAX_MS:  u64 = 5000;  // clamp ceiling (steady-state cadence on a d
 /// Cap on datagrams resent in a single go-back-N pass (EQEmu MAX_CLIENT_RECV_PACKETS_PER_WINDOW).
 const MAX_RESEND_PER_PASS: usize = 300;
 
+/// How often `connect` re-sends OP_SESSION_REQUEST while waiting for OP_SESSION_RESPONSE. This
+/// establishes ONLY the UDP session (the transport handshake) — it says nothing about whether the
+/// zone has yet ACCEPTED us at the application layer. That distinction is the whole subject of
+/// `docs/eq-technical-knowledgebase/zone-entry-handshake-race.md`: on the `zoning==1` reconnect path
+/// World fires OP_ZoneServerInfo optimistically and registers our zone auth out-of-band via a
+/// fire-and-forget TCP `ServerOP_ZoneIncClient` → `Zone::AddAuth`. A cold on-demand zone answers
+/// SESSION_RESPONSE as soon as its listener binds — which can be BEFORE that auth lands — so a fast
+/// session handshake here actually pushes OP_ZoneEntry out SOONER and WIDENS the auth race, not
+/// narrows it. This constant does NOT resolve that race, and neither `poll_resend` nor an app-level
+/// re-send can safely recover a lost race once the entry is session-ACKed (see `run_zone_entry_handshake`
+/// in gameplay.rs and zone-entry-duplicate-on-admitted-client.md — a second OP_ZoneEntry self-kicks an
+/// admitted client): a lost auth race is surfaced as an honest zone-in failure at the 30s deadline
+/// instead. This 250ms cadence (was a hard-coded 1s) only makes the SESSION come up promptly when our
+/// first SESSION_REQUEST is dropped; SESSION_REQUEST is idempotent (the server dedupes), so a faster
+/// cadence is harmless at the transport layer.
+const SESSION_REQUEST_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Backoff before the Nth retransmit of the oldest outstanding reliable packet: `RESEND_BASE_MS`
 /// doubled per prior attempt, clamped to `[RESEND_MIN_MS, RESEND_MAX_MS]`. `retries` is shifted-capped
 /// so the `<<` can't overflow.
@@ -379,7 +396,7 @@ impl EqStream {
             if std::time::Instant::now() > deadline {
                 return Err("Session handshake timeout: no SESSION_RESPONSE from server".into());
             }
-            if last_send.elapsed() >= std::time::Duration::from_secs(1) {
+            if last_send.elapsed() >= SESSION_REQUEST_RETRY {
                 stream.send_session_request();
                 last_send = std::time::Instant::now();
                 // #477: keep the LIVENESS clock fresh across the handshake. This loop runs on the
@@ -578,6 +595,18 @@ impl EqStream {
     fn send_ack(&mut self, seq: u16) {
         let seq_bytes = seq.to_be_bytes();
         self.send_raw(OP_ACK, &self.encode(&seq_bytes.to_vec()));
+    }
+
+    /// Send an OP_OutOfOrderAck for a buffered out-of-order sequence — the client-side mirror of the
+    /// server's `SendOutOfOrderAck` (EQEmu `reliable_stream_connection.cpp:1320`). Framed IDENTICALLY
+    /// to `send_ack`: the seq body is ENCODED with the negotiated passes, because the server decodes
+    /// the bytes after the `[0x00, opcode]` header before reading the sequence (`:476-493`). Tells the
+    /// server we received this future seq (it drops it from its resend window) and, via the server's
+    /// `m_acked_since_last_resend` flag, triggers an immediate go-back-N resend of the still-missing
+    /// gap on its next tic. (#463)
+    fn send_out_of_order(&mut self, seq: u16) {
+        let seq_bytes = seq.to_be_bytes();
+        self.send_raw(OP_OUT_OF_ORDER, &self.encode(&seq_bytes.to_vec()));
     }
 
     fn send_reliable(&mut self, app_data: &[u8]) {
@@ -828,7 +857,21 @@ impl EqStream {
             }
             SeqClass::Future => {
                 self.recv_buf.insert(seq, (data, is_fragment));
-                self.send_raw(OP_OUT_OF_ORDER, &seq.to_be_bytes());
+                // Mirror the server's own receive path (EQEmu `reliable_stream_connection.cpp:715`,
+                // `SendOutOfOrderAck(stream_id, sequence)`): on a gap, immediately OutOfOrderAck the
+                // out-of-order packet we just BUFFERED. The server's `OutOfOrderAck` handler drops that
+                // exact seq from its resend window AND sets `m_acked_since_last_resend`, which makes its
+                // next 60 Hz tic bypass each packet's `resend_delay` and go-back-N resend the whole
+                // outstanding window — i.e. FAST-retransmit the still-missing gap packet, rather than
+                // waiting out its ~850 ms+ per-packet timer. The seq body must be ENCODED exactly like
+                // OP_ACK (`send_ack`): the server decodes the bytes after the `[0x00, opcode]` header
+                // with the negotiated passes before reading the sequence
+                // (`reliable_stream_connection.cpp:476-493`). Sending it RAW only survived because the
+                // live zone stream is compression-encoded and the server's `Decompress` passes a
+                // non-flag lead byte through unchanged (`:1089`) — true for low zone-in seqs (hi byte
+                // 0x00) but WRONG under an XOR stream (login/world) or when the seq high byte is
+                // 0x5a/0xa5. Encode it so the ACK and OutOfOrderAck framings are identical. (#463)
+                self.send_out_of_order(seq);
             }
             SeqClass::Duplicate => {
                 // A retransmit of an ALREADY-DELIVERED reliable packet: our original OP_ACK for it
@@ -836,7 +879,16 @@ impl EqStream {
                 // re-deliver — we already dispatched it). Without this the packet stays "un-ACKed"
                 // on the server and its `resend_timeout` (30s) closes the whole session, a spurious
                 // linkdead on an otherwise idle client (#158).
-                self.send_ack(seq);
+                //
+                // Re-ACK the CUMULATIVE high-water (`next_recv_seq - 1`, the last in-order seq), NOT
+                // this duplicate's own (lower) seq — matching the server's own duplicate path,
+                // `SendAck(stream_id, stream->sequence_in - 1)` (`reliable_stream_connection.cpp:719`).
+                // A cumulative ACK of the high-water acknowledges this duplicate (it is ≤ high-water)
+                // and re-advances the server's ack pointer as far as we actually have, where an ACK of
+                // the lower duplicate seq would under-acknowledge. (`Duplicate` only arises after at
+                // least one in-order delivery, so `next_recv_seq >= 1` and the `wrapping_sub(1)` is a
+                // real prior seq, never a bogus 0xFFFF.) (#463)
+                self.send_ack(self.next_recv_seq.wrapping_sub(1));
             }
         }
     }
@@ -993,6 +1045,36 @@ pub(crate) async fn test_stream_with_peer(
     (stream, rx, peer_sock, stream_addr)
 }
 
+/// Like `test_stream_with_peer` but with a negotiated encode pass (e.g. `ENCODE_XOR`) and key, so a
+/// test can assert that outbound reliability control packets (OP_ACK / OP_OutOfOrderAck) put an
+/// ENCODED sequence on the wire — not a raw one. (#463)
+#[cfg(test)]
+pub(crate) async fn test_stream_with_peer_encoded(
+    pass1: u8,
+    key: u32,
+    net_health: crate::ipc::NetHealthShared,
+) -> (EqStream, mpsc::UnboundedReceiver<AppPacket>, UdpSocket, SocketAddr) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer_sock.local_addr().unwrap();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let stream_addr = socket.local_addr().unwrap();
+    socket.connect(peer_addr).await.unwrap();
+    let stream = EqStream {
+        session: SessionInfo { encode_pass1: pass1, encode_key: key, ..SessionInfo::default() },
+        socket,
+        peer: peer_addr,
+        send_seq: 0,
+        next_recv_seq: 0,
+        recv_buf: HashMap::new(),
+        sent: VecDeque::new(),
+        frags: FragmentBuffer::new(),
+        net_health,
+        app_tx: tx,
+    };
+    (stream, rx, peer_sock, stream_addr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1045,7 +1127,8 @@ mod tests {
         let addr = silent_peer.local_addr().unwrap();
         let (tx, _rx) = mpsc::unbounded_channel();
 
-        // Drive `connect` for ~1.5s (past the 1s retry cadence), then cancel it by dropping the future.
+        // Drive `connect` for ~1.5s (well past the SESSION_REQUEST_RETRY cadence), then cancel it by
+        // dropping the future.
         let _ = tokio::time::timeout(
             std::time::Duration::from_millis(1500),
             EqStream::connect(&addr.ip().to_string(), addr.port(), tx, net_health.clone()),
@@ -1057,6 +1140,59 @@ mod tests {
             "mid-handshake `last_tick` must stay under SESSION_STALE_TICK_MS ({}ms) so the #477 guard \
              does not falsely reject a healthy handshaking session; age was {age:?}",
             crate::http::SESSION_STALE_TICK_MS,
+        );
+    }
+
+    /// #335: the zone handoff dropped its blind fixed pre-connect sleeps (a 300ms + two 800ms). This
+    /// pins the SESSION-layer half of what replaced them — that `connect` re-sends SESSION_REQUEST
+    /// sub-second so a cold on-demand zone whose listener has just bound comes up promptly (our first
+    /// SESSION_REQUEST may be dropped) instead of stalling ~1s. NOTE this is ONLY the transport
+    /// handshake; it does NOT wait for app-layer zone acceptance, and a faster cadence here can even
+    /// WIDEN the app-layer AddAuth race (`zone-entry-handshake-race.md`). That race is NOT rescued by a
+    /// second OP_ZoneEntry (which self-kicks an admitted client — `run_zone_entry_handshake`,
+    /// `zone-entry-duplicate-on-admitted-client.md`); a lost race becomes an honest 30s zone-in failure.
+    /// This counts the SESSION_REQUESTs a SILENT peer
+    /// receives inside a 600ms window: at the 250ms cadence that is 3 sends (t=0, 250, 500); at the old
+    /// hard-coded 1s it would be just 1. Asserting >= 2 pins the fast-retry cadence in place.
+    #[tokio::test]
+    async fn connect_retries_session_request_faster_than_once_a_second() {
+        let net_health: crate::ipc::NetHealthShared = Default::default();
+        // A bound but SILENT peer — never answers SESSION_RESPONSE, so `connect` stays retrying.
+        let silent_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = silent_peer.local_addr().unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let host = addr.ip().to_string();
+        let port = addr.port();
+
+        // `connect` loops re-sending SESSION_REQUEST; the counting future tallies the datagrams the
+        // silent peer receives in a 600ms window. `join!` polls both on THIS task so they interleave
+        // deterministically on the current-thread test runtime (a spawned task does not reliably get
+        // scheduled here). `connect` never returns (peer is silent) so its timeout ends the join.
+        let connect_fut = tokio::time::timeout(
+            std::time::Duration::from_millis(800),
+            EqStream::connect(&host, port, tx, net_health.clone()),
+        );
+        let count_fut = async {
+            let mut buf = vec![0u8; 4096];
+            let mut count = 0usize;
+            let window = tokio::time::Instant::now() + std::time::Duration::from_millis(600);
+            while tokio::time::Instant::now() < window {
+                if let Ok(Ok(_)) =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), silent_peer.recv(&mut buf)).await
+                {
+                    count += 1;
+                }
+            }
+            count
+        };
+        let (_, count) = tokio::join!(connect_fut, count_fut);
+        assert!(
+            count >= 2,
+            "connect must re-send SESSION_REQUEST faster than once a second so a too-early connect to \
+             a cold zone brings its SESSION up promptly (#335 — the app-layer acceptance race is a \
+             separate concern, handled by run_zone_entry_handshake's honest 30s failure, not here); \
+             saw only {count} in 600ms",
         );
     }
 
@@ -1134,6 +1270,89 @@ mod tests {
         let app = rx.try_recv().expect("combined reliable sub must deliver its app packet (no double-decode)");
         assert_eq!(app.opcode, 0x1234);
         assert_eq!(app.payload, vec![0xAA, 0xBB]);
+    }
+
+    /// #463: an inbound reliable GAP must (a) emit an OP_OutOfOrderAck whose sequence is ENCODED with
+    /// the negotiated passes — identical framing to OP_ACK, since the server decodes the bytes after
+    /// the `[0x00, opcode]` header before reading the seq (EQEmu `reliable_stream_connection.cpp:476`)
+    /// — so the server can act on it and go-back-N fast-retransmit the missing packet; and (b) once the
+    /// gap-filling packet arrives, DRAIN the buffered tail and deliver the stranded spawns IN ORDER.
+    ///
+    /// Under an XOR stream (login/world) an unencoded OutOfOrderAck decodes to a WRONG sequence, so the
+    /// server drops the wrong entry from its resend window — the exact fragility this test guards. The
+    /// encoded-body assertion is the mutation check: revert `send_out_of_order` to `send_raw(.., &seq
+    /// .to_be_bytes())` and the decoded-seq assertion fails (the raw bytes XOR-decode to garbage).
+    #[tokio::test]
+    async fn inbound_gap_emits_encoded_out_of_order_then_drains_tail_in_order() {
+        let key = 0xA1B2_C3D4u32;
+        let net_health: crate::ipc::NetHealthShared = Default::default();
+        let (mut stream, mut rx, peer, _addr) =
+            test_stream_with_peer_encoded(ENCODE_XOR, key, net_health).await;
+
+        // Build an inbound reliable OP_Packet exactly as the server frames it: [0x00, OP_PACKET] then
+        // the XOR-encoded (seq(BE) + app-packet). App packet = opcode(LE u16) + payload. crc_bytes = 0.
+        let reliable = |seq: u16, opcode: u16, payload: &[u8]| -> Vec<u8> {
+            let mut inner = seq.to_be_bytes().to_vec();
+            inner.extend_from_slice(&opcode.to_le_bytes());
+            inner.extend_from_slice(payload);
+            let enc = encode_passes(&inner, ENCODE_XOR, ENCODE_NONE, key);
+            let mut dgram = vec![0x00u8, OP_PACKET];
+            dgram.extend_from_slice(&enc);
+            dgram
+        };
+
+        // Warm the stream socket's write registration with one async send so the synchronous
+        // `try_send`s inside `on_raw_recv` (our ACK / OutOfOrderAck) reliably transmit to the peer in
+        // this single-threaded test runtime. The peer's drain loop skips this <2-byte primer.
+        stream.socket.send(&[0u8]).await.unwrap();
+
+        // seq 0 arrives in order → delivered, next_recv_seq advances to 1.
+        stream.on_raw_recv(&reliable(0, 0x1000, &[0xA0]));
+        // seq 2 arrives with a GAP at 1 → buffered as Future, and an OP_OutOfOrderAck(2) is sent.
+        stream.on_raw_recv(&reliable(2, 0x1002, &[0xA2]));
+
+        // Let the just-sent datagrams settle on the peer socket before draining.
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        // Drain every datagram the stream sent to the peer and locate the OP_OutOfOrderAck.
+        let mut ooo_seq: Option<u16> = None;
+        let mut ooo_body_raw: Option<Vec<u8>> = None;
+        let mut buf = [0u8; 256];
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(80), peer.recv_from(&mut buf)).await {
+                Ok(Ok((n, _))) => {
+                    let d = &buf[..n];
+                    if d.len() >= 2 && d[0] == 0x00 && d[1] == OP_OUT_OF_ORDER {
+                        ooo_body_raw = Some(d[2..].to_vec());
+                        let dec = decode_passes(&d[2..], ENCODE_XOR, ENCODE_NONE, key).unwrap();
+                        ooo_seq = Some(u16::from_be_bytes([dec[0], dec[1]]));
+                    }
+                }
+                _ => break, // timed out: no more datagrams
+            }
+        }
+
+        let raw = ooo_body_raw.expect("a gap must put an OP_OutOfOrderAck on the wire (#463)");
+        // It must be ENCODED, not raw: under a non-zero XOR key the encoded body differs from the
+        // plain BE seq bytes. (Mutation guard: the pre-fix `send_raw(.., &seq.to_be_bytes())` fails.)
+        assert_ne!(raw, 2u16.to_be_bytes().to_vec(),
+            "OP_OutOfOrderAck seq must be ENCODED like OP_ACK, not sent raw (#463)");
+        assert_eq!(ooo_seq, Some(2),
+            "the encoded OP_OutOfOrderAck must decode to the buffered future seq 2 (#463)");
+
+        // The tail is still stranded (seq 1 missing): only seq 0's app packet delivered so far.
+        let first = rx.try_recv().expect("seq 0 delivered");
+        assert_eq!(first.opcode, 0x1000);
+        assert!(rx.try_recv().is_err(), "seq 2 must stay buffered until the gap fills");
+
+        // The server fast-retransmits seq 1 → the gap fills, and the buffered tail (seq 2) drains
+        // IN ORDER right behind it.
+        stream.on_raw_recv(&reliable(1, 0x1001, &[0xA1]));
+        let a1 = rx.try_recv().expect("gap-filler seq 1 delivered");
+        assert_eq!(a1.opcode, 0x1001);
+        let a2 = rx.try_recv().expect("buffered seq 2 must drain right after the gap fills (#463)");
+        assert_eq!(a2.opcode, 0x1002);
+        assert!(rx.try_recv().is_err(), "nothing beyond the drained tail");
     }
 
     #[test]
