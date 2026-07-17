@@ -295,12 +295,21 @@ impl Walker {
     ) -> bool {
         use crate::nav::collision::PlanOutcome;
         self.awaiting_first_plan = false;
-        let snapped = reply.goal_snapped_z;
+        let snapped = reply.goal_snapped;
         self.goal_snapped = snapped.is_some();
-        if let Some(z) = snapped {
-            gs.log_msg("zone", &format!(
+        match snapped {
+            Some(crate::nav::collision::GoalSnap::ToColumnFloor { z }) => gs.log_msg("zone", &format!(
                 "Goal z={:.0} is not on any floor — routing to the floor at z={:.0} instead (the client \
-                 CHANGED your goal; it is not the one you gave).", goal.2, z));
+                 CHANGED your goal; it is not the one you gave).", goal.2, z)),
+            // The water qualifier (design §4d): "arrived" at a submerged goal without this line
+            // would claim a depth the walker never reached — buoyancy only rises, so it floats at
+            // the surface above the goal XY. Reported here AND carried to arrival via
+            // `goal_snapped` (`nav_reason: goal_z_snapped`).
+            Some(crate::nav::collision::GoalSnap::ToWaterSurface { surface_z }) => gs.log_msg("zone", &format!(
+                "Goal z={:.0} is submerged — the walker cannot dive and hold that depth; navigating to \
+                 the WATER SURFACE at z={:.0} above it. Arrival will be at the surface, not the asked depth.",
+                goal.2, surface_z)),
+            None => {}
         }
         match reply.outcome {
             // A real, complete route to the goal. The only outcome the walker may treat as a plan.
@@ -311,9 +320,10 @@ impl Walker {
                 self.path_i = 0;
                 self.stuck_i = 0;
                 self.clear_local_plan();
-                match snapped {
-                    Some(_) => self.set_nav_state_because("navigating", Some("goal_z_snapped")),
-                    None    => self.set_nav_state("navigating"),
+                if self.goal_snapped {
+                    self.set_nav_state_because("navigating", Some("goal_z_snapped"));
+                } else {
+                    self.set_nav_state("navigating");
                 }
                 self.nav.nav_state.lock().unwrap().tier =
                     Some(if reply.tight { "minimum" } else { "preferred" });
