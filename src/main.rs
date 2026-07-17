@@ -421,9 +421,7 @@ fn main() {
         group_leave: group_slots.group_leave.clone(),
         group_kick: group_slots.group_kick.clone(),
         group_make_leader: group_slots.group_make_leader.clone(),
-        camp: lifecycle.camp.clone(),
         camp_until: lifecycle.camp_until.clone(),
-        respawn: lifecycle.respawn.clone(),
     };
     let app_spells  = spells.clone();
     let app_frame_profile = frame_profile_shared.clone();
@@ -487,7 +485,6 @@ fn main() {
         asset_pass,
         controller.controller_view,
         controller.nav_intent,
-        camera.manual_move,
         controller.pos_correction,
         nav.nav_path_view,
     );

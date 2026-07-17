@@ -123,7 +123,7 @@ pub async fn run_login_flow(
                 let action_loop = ActionLoop::new(
                     nav, world, quest, group_slots, command, social,
                     merchant_slots, inventory_slots, interact, chat, controller, guild_slots,
-                    collision, maps_dir, camp.clone(),
+                    collision, maps_dir,
                 );
                 run_gameplay_phase(stream, net_rx, gs, char_name, action_loop, world_creds, shutdown.clone(), camp.clone(), camp_until.clone(), respawn.clone(), game_state_snapshot, net_health).await;
                 return Ok(());
