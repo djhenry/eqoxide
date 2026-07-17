@@ -262,6 +262,14 @@ pub async fn run_gameplay_phase(
                 _ => {}
             }
 
+            // A3 Migration 3 (#448): resolve an awaited self-cast the moment its outcome is APPLIED.
+            // Unlike buy/give (keyed on a specific resolving opcode), a cast ends via one of THREE
+            // de-duped opcodes, so we fulfil on the `gs.last_cast` TRANSITION instead — checked here,
+            // per packet, so the terminal is caught before any subsequent OP_BeginCast in this same
+            // drain could clear `last_cast`. No-op unless an awaited cast is parked and a fresh outcome
+            // is present. See `ActionLoop::fulfill_cast`.
+            action_loop.fulfill_cast(&gs);
+
             match packet.opcode {
                 // Another player is asking to trade with us: the server forwards their
                 // OP_TradeRequest { to_mob_id = us, from_mob_id = initiator }. Our give/turn-in
@@ -598,6 +606,10 @@ pub async fn run_gameplay_phase(
         // StopCasting sends that ManaChange and NOTHING else. Report the unexplained end once the
         // grace window lapses, instead of leaving the agent with no outcome at all. (#348)
         gs.resolve_pending_cast_end();
+        // #448 (Migration 3): the unexplained-end above sets `gs.last_cast` from a TIMER, not a packet,
+        // so catch that transition here too — an awaited cast whose server-end is never explained
+        // resolves to `Unconfirmed` promptly instead of waiting for the next inbound packet.
+        action_loop.fulfill_cast(&gs);
 
         action_loop.tick(s, &mut gs);
 
