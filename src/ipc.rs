@@ -436,9 +436,26 @@ pub type PetCmdReq = Arc<Mutex<Option<u8>>>;
 
 /// Open/close a merchant window. `Open(merchant_id)` from POST /v1/merchant/open; `Close` from
 /// POST /v1/merchant/close. The nav thread sends OP_ShopRequest (command 1/0).
+/// This is the FIRE-AND-FORGET open/close the UI merchant-window click uses; the honest awaited
+/// open (POST /v1/merchant/open over HTTP) rides the sibling [`OpenAwaitReq`] instead. (#479)
 #[derive(Clone, Copy)]
 pub enum TradeCmd { Open(u32), Close }
 pub type TradeReq = Arc<Mutex<Option<TradeCmd>>>;
+
+/// Command-with-result merchant-open request (A3 migration, eqoxide#479) — `(merchant spawn id,
+/// oneshot Sender)`. POST /v1/merchant/open writes this and AWAITS the `Sender`; the nav thread's
+/// `drain_merchant` drains it, sends the SAME OP_ShopRequest(command=1) the fire-and-forget
+/// [`TradeReq`] `Open` path sends, and PARKS the `Sender` in `ActionLoop::pending_open` until the
+/// resolving OP_ShopRequest echo lands: `command==1` → `Resolved(OpenOk)` (a real merchant opened
+/// the window); `command==0` → `Refused` (a REAL negative ack — RoF2's Handle_OP_ShopRequest
+/// collapses faction-KOS/engaged/feigned-invis/charmed/already-busy into this same echo). A target
+/// that is not a merchant at all, or out of range, sends NO echo whatsoever (confirmed against the
+/// EQEmu RoF2 source — see `docs/eq-technical-knowledgebase/merchant-open-protocol.md`) — that path
+/// resolves to `Unconfirmed` via the HTTP timeout / a zone-change reaper, never a fabricated 200.
+/// Sibling of [`TradeReq`], NOT a replacement: the UI open/close click path is unchanged. See
+/// `crate::command_state::result` for the flow.
+pub type OpenAwaitReq = Arc<Mutex<Option<(u32,
+    oneshot::Sender<crate::command_state::CommandResult<crate::command_state::OpenOk>>)>>>;
 
 /// Camp command, written by POST /v1/lifecycle/exit, POST /v1/lifecycle/camp, the HUD Camp button,
 /// and the `/camp` chat keyword. The gameplay loop drains it: `Start` begins a camp if one isn't
@@ -758,6 +775,8 @@ pub struct MerchantSlots {
     pub buy_await: BuyAwaitReq,
     pub sell:     SellReq,
     pub trade:    TradeReq,
+    /// The honest awaited-open slot (eqoxide#479) — sibling of `trade`. See [`OpenAwaitReq`].
+    pub open_await: OpenAwaitReq,
 }
 
 /// `/v1/inventory/*`: the live snapshot plus the one move/equip/unequip request slot.

@@ -141,6 +141,20 @@ struct PendingBuy {
     sent_at:     Instant,
 }
 
+/// An awaited merchant open (eqoxide#479), parked between send and the resolving OP_ShopRequest
+/// echo. Holds the `oneshot::Sender` HTTP is awaiting plus the `merchant_id` the open was for, so a
+/// fulfil can CORRELATE the echo's npc_id (rejecting a stray shop-open echo for a DIFFERENT
+/// merchant) before it `send`s `Resolved`/`Refused`. `sent_at` bounds how long the net side keeps
+/// it (informational; the authoritative timeout is HTTP-side). The `Sender` deliberately lives
+/// ONLY here — never in `GameState`, which is `Clone`d into the ArcSwap snapshot every tick and a
+/// `oneshot::Sender` is not `Clone`. See `crate::command_state::result` for the full flow.
+struct PendingOpen {
+    tx:          tokio::sync::oneshot::Sender<crate::command_state::CommandResult<crate::command_state::OpenOk>>,
+    merchant_id: u32,
+    #[allow(dead_code)] // informational; the authoritative open timeout is HTTP-side
+    sent_at:     Instant,
+}
+
 /// A self-cast sent via the honest awaited path (A3 Migration 3, #448), parked here until the cast
 /// machinery computes its outcome into `gs.last_cast`. Casting is naturally serial (one cast bar) so
 /// this is a SINGLETON — a second awaited cast while one is parked is `Refused` (the singleton
@@ -316,6 +330,11 @@ pub struct ActionLoop {
     /// resolving packet (OP_ShopPlayerBuy echo → `Resolved`, OP_ShopEndConfirm → `Refused`), or
     /// reaped as `Unconfirmed` on a zone change. Sibling of `pending_who`. See `PendingBuy`.
     pending_buy:      Option<PendingBuy>,
+    /// A merchant open sent via the honest awaited path (eqoxide#479), parked between send and its
+    /// resolving OP_ShopRequest echo (`command==1` → `Resolved`, `command==0` → `Refused`), or
+    /// reaped as `Unconfirmed` on a zone change. A non-merchant/out-of-range target sends NO echo at
+    /// all, so that path resolves purely via the HTTP timeout. See `PendingOpen`.
+    pending_open:     Option<PendingOpen>,
     /// A self-cast sent via the honest awaited path (A3 Migration 3, #448), parked between send and
     /// the `gs.last_cast` outcome transition (→ `Resolved(CastEnd)` / `Refused` / `Unconfirmed`), or
     /// reaped as `Unconfirmed` on a zone change. Singleton — one self-cast at a time. See `PendingCast`.
@@ -400,6 +419,7 @@ impl ActionLoop {
             expecting_friends: false,
             merchant_slots,
             pending_buy: None,
+            pending_open: None,
             pending_cast: None,
             inventory_slots,
             give_state: None,
@@ -581,6 +601,56 @@ impl ActionLoop {
         }
     }
 
+    /// Resolve a parked awaited-open on the OP_ShopRequest echo (eqoxide#479). Called from the
+    /// gameplay loop AFTER `apply_packet`, so `gs.merchant_open` already reflects the applied echo
+    /// (not read here — the echo payload itself carries everything needed). CORRELATES on the
+    /// echo's npc_id — a stray shop-open echo for a DIFFERENT merchant (e.g. a UI fire-and-forget
+    /// open fired while an awaited open is parked) must not resolve THIS awaited open.
+    ///
+    /// `command==1` (Open) → `Resolved(OpenOk)`: a real merchant confirmed the window opened.
+    /// `command==0` (Close) → `Refused`: a REAL negative ack. Per eq-client-expert's research
+    /// against the EQEmu RoF2 source (`docs/eq-technical-knowledgebase/merchant-open-protocol.md`,
+    /// `client_packet.cpp` `Handle_OP_ShopRequest`), FIVE distinct server-side reasons — faction
+    /// KOS/dubious, engaged in combat, feigned/invisible, charmed, or the window already busy —
+    /// all fall through to this SAME `command=0` echo and are not distinguishable from the opcode
+    /// alone.
+    ///
+    /// A target that is not a merchant NPC at all, or out of range, sends NO echo whatsoever
+    /// (confirmed early `return` in `Handle_OP_ShopRequest`, no packet of any kind) — that path
+    /// never reaches this function; it resolves to `Unconfirmed` via the HTTP timeout / a
+    /// zone-change reaper instead, exactly the honest signal eqoxide#479 asks for.
+    ///
+    /// The send is non-blocking and never `.await`s, so the net tick is never stalled; a dropped
+    /// receiver (HTTP already timed out) is ignored. No-op when nothing is parked or the echo
+    /// doesn't correlate — leaving an unrelated open still parked.
+    pub fn fulfill_open(&mut self, payload: &[u8]) {
+        if payload.len() < 12 { return; }
+        let echo_npc = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let command  = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
+        let correlates = self.pending_open.as_ref().is_some_and(|po| po.merchant_id == echo_npc);
+        if !correlates { return; }
+        let po = self.pending_open.take().unwrap();
+        if command == 1 {
+            let _ = po.tx.send(crate::command_state::CommandResult::Resolved(
+                crate::command_state::OpenOk { merchant_id: echo_npc },
+            ));
+        } else {
+            let _ = po.tx.send(crate::command_state::CommandResult::Refused(
+                "merchant refused to open the window (faction, engaged, feigned/invisible, \
+                 charmed, or busy)".into(),
+            ));
+        }
+    }
+
+    /// Reap a parked awaited-open as `Unconfirmed` (eqoxide#479) — fired on a zone change so a
+    /// crossing mid-open can't strand the `Sender` or let it mis-correlate a shop-open echo in the
+    /// new zone. Mirrors `reap_pending_buy`. No-op when nothing parked.
+    pub fn reap_pending_open(&mut self) {
+        if let Some(po) = self.pending_open.take() {
+            let _ = po.tx.send(crate::command_state::CommandResult::Unconfirmed);
+        }
+    }
+
     /// Resolve a parked awaited-cast on its `gs.last_cast` TRANSITION (A3 Migration 3, #448). Called
     /// from the gameplay loop AFTER `apply_packet` (and after `resolve_pending_cast_end`), so `gs`
     /// already holds the outcome the cast machinery computed. Deliberately NOT keyed on a single
@@ -706,6 +776,9 @@ impl ActionLoop {
             // parked would let a shop echo in the NEW zone mis-correlate it (or strand it until the
             // HTTP timeout). Firing Unconfirmed here yields the honest "outcome UNKNOWN" 202 promptly.
             self.reap_pending_buy();
+            // eqoxide#479: same reasoning for an awaited merchant open still parked across the
+            // crossing — the merchant is in the OLD zone, no OP_ShopRequest echo can ever arrive now.
+            self.reap_pending_open();
             // #448 (Migration 2): same reasoning for an awaited give still parked across the crossing —
             // the NPC is in the OLD zone, no OP_FinishTrade can arrive, and a stray finish in the NEW
             // zone must not mis-resolve it. Reap it to a prompt Unconfirmed/202.
@@ -1591,6 +1664,33 @@ impl ActionLoop {
             stream.send_app_packet(OP_SHOP_REQUEST, &open);
             tracing::info!("EQ: shop {} — merchant_id={}", if command == 1 { "open" } else { "close" }, merchant_id);
             if command == 0 { gs.merchant_open = None; gs.merchant_items.clear(); }
+        }
+
+        // Merchant open (AWAITED, honest Command-with-result path — POST /v1/merchant/open,
+        // eqoxide#479): emit the SAME OP_ShopRequest(command=1) the fire-and-forget `TradeCmd::Open`
+        // path above sends, then PARK the HTTP-side `oneshot::Sender` in `pending_open` (with the
+        // merchant_id for echo correlation + a sent-at instant). We fire NOTHING here — the
+        // resolving packet does, after `apply_packet`: the OP_ShopRequest echo → `fulfill_open`
+        // (Resolved on command=1, Refused on command=0), or a non-merchant/out-of-range target's
+        // total silence → the HTTP timeout / a zone-change reaper → Unconfirmed.
+        //
+        // SINGLETON-in-flight (reject-while-parked), same discipline as awaited buy: the echo
+        // carries no per-request token, so two identical in-flight opens are indistinguishable.
+        // When an open is already parked we do NOT overwrite it and send NO wire packets — we
+        // immediately answer the NEW request `Refused` (packets never sent, so the open
+        // DEFINITIVELY did not happen — 409 is honest here, not 202).
+        if let Some((merchant_id, tx)) = self.command.take_open_await() {
+            if self.pending_open.is_some() {
+                let _ = tx.send(crate::command_state::CommandResult::Refused(
+                    "another open is already in flight; retry after it resolves".into()));
+                tracing::info!("EQ: awaited shop open REJECTED — one already in flight (merchant_id={merchant_id})");
+            } else {
+                gs.begin_shop_open_for(merchant_id);
+                let open = merchant_click(merchant_id, gs.player_id, 1);
+                stream.send_app_packet(OP_SHOP_REQUEST, &open);
+                self.pending_open = Some(PendingOpen { tx, merchant_id, sent_at: Instant::now() });
+                tracing::info!("EQ: awaited shop open parked — merchant_id={merchant_id}");
+            }
         }
     }
 
@@ -2720,6 +2820,170 @@ mod tests {
         assert!(matches!(resp_a.await.unwrap(), crate::command_state::CommandResult::Resolved(_)),
             "the echo must resolve the FIRST (parked) buy, not the rejected second one");
         assert!(nav.pending_buy.is_none(), "the parked buy is consumed once");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+    // eqoxide#479: the honest awaited merchant-open path. These drive an open through
+    // `drain_merchant` (the loop's own `command` slot is shared with the drain, so a real
+    // request→take round-trip runs), then feed the resolving echo exactly as `gameplay.rs` does.
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+
+    /// A 12+-byte RoF2 MerchantClick_Struct echo: npc_id@0, command@8 (1=open confirmed, 0=refused).
+    fn open_echo(npc_id: u32, command: u32) -> Vec<u8> {
+        let mut e = vec![0u8; 24];
+        e[0..4].copy_from_slice(&npc_id.to_le_bytes());
+        e[8..12].copy_from_slice(&command.to_le_bytes());
+        e
+    }
+
+    fn seed_open_gs() -> GameState {
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        gs
+    }
+
+    /// SUCCESS: an awaited open, driven through the drain and confirmed by the OP_ShopRequest echo
+    /// (command=1), resolves to `Resolved(OpenOk)`. `pending_open` is consumed exactly once.
+    #[tokio::test]
+    async fn awaited_open_resolves_on_the_shop_echo_command_1() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_open_gs();
+
+        let (tx, resp) = tokio::sync::oneshot::channel();
+        nav.command.request_open_await(11, tx);
+        nav.drain_merchant(&mut stream, &mut gs);
+        assert!(nav.pending_open.is_some(), "the awaited open must be parked after the drain");
+
+        let echo = open_echo(11, 1);
+        apply_packet(&mut gs, &AppPacket { opcode: OP_SHOP_REQUEST, payload: echo.clone() });
+        nav.fulfill_open(&echo);
+
+        assert_eq!(
+            resp.await.unwrap(),
+            crate::command_state::CommandResult::Resolved(crate::command_state::OpenOk { merchant_id: 11 }),
+        );
+        assert!(nav.pending_open.is_none(), "pending_open must be consumed exactly once");
+    }
+
+    /// CORRELATION: a shop-open echo for a DIFFERENT merchant must NOT resolve this open — it leaves
+    /// the parked open in place rather than mis-reporting a stray echo.
+    #[tokio::test]
+    async fn awaited_open_ignores_a_shop_echo_for_a_different_merchant() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_open_gs();
+
+        let (tx, mut resp) = tokio::sync::oneshot::channel();
+        nav.command.request_open_await(11, tx);
+        nav.drain_merchant(&mut stream, &mut gs);
+
+        nav.fulfill_open(&open_echo(99, 1)); // wrong merchant
+        assert!(nav.pending_open.is_some(), "an uncorrelated echo must leave the open parked");
+        assert!(matches!(resp.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
+            "no result must be sent for an open that did not correlate");
+
+        // The correct echo still resolves it.
+        nav.fulfill_open(&open_echo(11, 1));
+        assert!(matches!(resp.try_recv(), Ok(crate::command_state::CommandResult::Resolved(_))));
+    }
+
+    /// REFUSAL: an OP_ShopRequest echo with command=0 while an open is parked resolves it to
+    /// `Refused` (a REAL negative ack → HTTP 409, covering faction/engaged/feigned/charmed/busy),
+    /// and clears `pending_open`.
+    #[tokio::test]
+    async fn awaited_open_refused_on_shop_echo_command_0() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_open_gs();
+
+        let (tx, resp) = tokio::sync::oneshot::channel();
+        nav.command.request_open_await(11, tx);
+        nav.drain_merchant(&mut stream, &mut gs);
+
+        let echo = open_echo(11, 0);
+        apply_packet(&mut gs, &AppPacket { opcode: OP_SHOP_REQUEST, payload: echo.clone() });
+        nav.fulfill_open(&echo);
+        assert!(matches!(resp.await.unwrap(), crate::command_state::CommandResult::Refused(_)));
+        assert!(nav.pending_open.is_none());
+    }
+
+    /// NON-MERCHANT/OUT-OF-RANGE SILENCE — THE #479 HONESTY PROOF. The server sends NO echo at all on
+    /// this path (confirmed against the EQEmu RoF2 source), so no fulfil ever runs: the parked open
+    /// stays un-fired. The client therefore CANNOT report success — the only resolution left is the
+    /// HTTP timeout → `Unconfirmed` → 202 (asserted in the http::merchant tests). A version that
+    /// resolved this to `Resolved`/200 would have to have SENT on the Sender here; it provably has
+    /// not. This is the mutation-check boundary: neuter the fix (e.g. resolve on send, or default
+    /// to `Resolved` on any non-correlating echo) and this test goes RED.
+    #[tokio::test]
+    async fn silent_open_never_resolves() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_open_gs();
+
+        let (tx, mut resp) = tokio::sync::oneshot::channel();
+        nav.command.request_open_await(11, tx);
+        nav.drain_merchant(&mut stream, &mut gs);
+
+        // No packet is fed — this is the non-merchant/out-of-range silence. The net side must NEVER
+        // fabricate a resolution: the Sender stays un-fired and the open stays parked (only the HTTP
+        // timeout / the reaper may resolve it, both to a non-success outcome).
+        assert!(nav.pending_open.is_some(), "a silent open must remain unresolved, never auto-succeed");
+        assert!(matches!(resp.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
+            "no CommandResult may be sent on silence — 200/Resolved on a silent open is the lie #479 forbids");
+    }
+
+    /// REAPER: a zone change while an open is parked fires `Unconfirmed` for the stranded Sender and
+    /// clears `pending_open`, so a shop echo in the NEW zone can't mis-correlate it. Driven through
+    /// the real `sync_zone_points` zone-change hook.
+    #[tokio::test]
+    async fn zone_change_reaps_a_parked_open_as_unconfirmed() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_open_gs();
+
+        let (tx, resp) = tokio::sync::oneshot::channel();
+        nav.command.request_open_await(11, tx);
+        nav.drain_merchant(&mut stream, &mut gs);
+        assert!(nav.pending_open.is_some());
+
+        gs.zone_name = "newzone".into();
+        nav.sync_zone_points(&gs);
+
+        assert!(nav.pending_open.is_none(), "the parked open must be cleared on a zone change");
+        assert_eq!(resp.await.unwrap(), crate::command_state::CommandResult::Unconfirmed);
+    }
+
+    /// SINGLETON-IN-FLIGHT / NO MIS-ATTRIBUTION. Two awaited opens of the SAME merchant, back-to-back
+    /// before any echo: the SECOND is rejected in-flight (`Refused`, no wire packets), the FIRST
+    /// stays parked, and the single OP_ShopRequest echo resolves the FIRST — never the second.
+    #[tokio::test]
+    async fn a_second_awaited_open_is_rejected_in_flight_so_the_echo_cannot_be_mis_attributed() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_open_gs();
+
+        let (tx_a, resp_a) = tokio::sync::oneshot::channel();
+        nav.command.request_open_await(11, tx_a);
+        nav.drain_merchant(&mut stream, &mut gs);
+        assert!(nav.pending_open.is_some(), "open A must be parked");
+
+        let (tx_b, resp_b) = tokio::sync::oneshot::channel();
+        nav.command.request_open_await(11, tx_b);
+        nav.drain_merchant(&mut stream, &mut gs);
+        match resp_b.await.unwrap() {
+            crate::command_state::CommandResult::Refused(reason) =>
+                assert!(reason.contains("already in flight"), "B must be told an open is in flight, got: {reason}"),
+            other => panic!("a second in-flight open must be Refused, not {other:?} (mis-attribution risk)"),
+        }
+        assert!(nav.pending_open.is_some(), "open A must STILL be the parked open after B is rejected");
+
+        let echo = open_echo(11, 1);
+        apply_packet(&mut gs, &AppPacket { opcode: OP_SHOP_REQUEST, payload: echo.clone() });
+        nav.fulfill_open(&echo);
+        assert!(matches!(resp_a.await.unwrap(), crate::command_state::CommandResult::Resolved(_)),
+            "the echo must resolve the FIRST (parked) open, not the rejected second one");
+        assert!(nav.pending_open.is_none(), "the parked open is consumed once");
     }
 
     // ─────────────────────────────────────────────────────────────────────────────────────────
