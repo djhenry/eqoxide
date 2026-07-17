@@ -233,6 +233,18 @@ pub async fn run_gameplay_phase(
                 }
             }
 
+            // A3 Migration 1 (#448): resolve an awaited merchant buy on its RESOLVING packet, AFTER
+            // `apply_packet` so `gs` already holds the receipt (coin deducted, item name in the ware
+            // list). The OP_ShopPlayerBuy echo (correlated on merchant/slot) → `Resolved(BuyOk)`; the
+            // OP_ShopEndConfirm refusal → `Refused`. Insufficient funds sends NEITHER — that buy stays
+            // parked and resolves to `Unconfirmed` via the HTTP timeout (the honesty invariant). Both
+            // fulfils are non-blocking sends; the net tick never `.await`s. See `command_state::result`.
+            match packet.opcode {
+                OP_SHOP_PLAYER_BUY  => action_loop.fulfill_buy_ok(&gs, &packet.payload),
+                OP_SHOP_END_CONFIRM => action_loop.fulfill_buy_refused(),
+                _ => {}
+            }
+
             match packet.opcode {
                 // Another player is asking to trade with us: the server forwards their
                 // OP_TradeRequest { to_mob_id = us, from_mob_id = initiator }. Our give/turn-in
