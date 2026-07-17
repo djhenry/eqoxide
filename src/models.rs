@@ -55,14 +55,27 @@ pub fn head_part_visible(
 
 /// Runtime tint for a head primitive, as a multiplicative RGBA (1.0 = no change), or `None` to
 /// keep the mesh's own base/equipment tint. Only painted-hair scalp parts ([`HeadPart::Hair`])
-/// are tinted — by the character's `haircolor` via [`crate::head::hair_tint`] (`haircolor >= 24`
-/// → white / no tint, leaving the neutral light base = the authentic untinted look). Facial skin
-/// and body parts are never tinted.
-pub fn head_part_tint(part: Option<HeadPart>, haircolor: u8) -> Option<[f32; 4]> {
+/// are ever tinted — by the character's `haircolor` via [`crate::head::hair_tint`] — and only
+/// for the race/gender subset the native RoF2 client tints
+/// ([`crate::head::hair_tint_applies`]: HIE/DKE/HEF + female DWF). For every other race a hair
+/// prim returns explicit WHITE (drawn untinted, and never inheriting an equipment tint):
+/// tinting e.g. HUM multiplied the skin-toned scalp/eye-band texels by a near-black brown and
+/// produced #519's "raccoon-mask". `haircolor >= 24` → white for tinted races too (the
+/// authentic neutral base). Facial skin and body parts are never tinted (`None`).
+pub fn head_part_tint(
+    part: Option<HeadPart>,
+    haircolor: u8,
+    race: &str,
+    gender: u8,
+) -> Option<[f32; 4]> {
     match part {
         Some(HeadPart::Hair(_)) => {
-            let t = crate::head::hair_tint(haircolor);
-            Some([t[0] as f32 / 255.0, t[1] as f32 / 255.0, t[2] as f32 / 255.0, 1.0])
+            if crate::head::hair_tint_applies(race, gender) {
+                let t = crate::head::hair_tint(haircolor);
+                Some([t[0] as f32 / 255.0, t[1] as f32 / 255.0, t[2] as f32 / 255.0, 1.0])
+            } else {
+                Some([1.0, 1.0, 1.0, 1.0])
+            }
         }
         _ => None,
     }
@@ -1682,15 +1695,49 @@ mod tests {
 
     #[test]
     fn only_hair_parts_are_tinted_by_haircolor() {
-        // Painted-hair scalp → tinted by hair_tint(haircolor); index 0 = [46,26,12].
-        assert_eq!(head_part_tint(Some(HeadPart::Hair(Some(1))), 0),
+        // Tint-eligible race (Dark Elf): painted-hair scalp → hair_tint(haircolor);
+        // index 0 = [46,26,12].
+        assert_eq!(head_part_tint(Some(HeadPart::Hair(Some(1))), 0, "DKE", 0),
             Some([46.0/255.0, 26.0/255.0, 12.0/255.0, 1.0]));
-        assert_eq!(head_part_tint(Some(HeadPart::Hair(None)), 0),
+        assert_eq!(head_part_tint(Some(HeadPart::Hair(None)), 0, "DKE", 0),
             Some([46.0/255.0, 26.0/255.0, 12.0/255.0, 1.0]));
         // haircolor >= 24 → white (no visible tint) but still Some for hair.
-        assert_eq!(head_part_tint(Some(HeadPart::Hair(Some(1))), 24), Some([1.0, 1.0, 1.0, 1.0]));
+        assert_eq!(head_part_tint(Some(HeadPart::Hair(Some(1))), 24, "DKE", 0),
+            Some([1.0, 1.0, 1.0, 1.0]));
         // facial skin + untagged prims are never tinted.
-        assert_eq!(head_part_tint(Some(HeadPart::Face(1)), 0), None);
-        assert_eq!(head_part_tint(None, 0), None);
+        assert_eq!(head_part_tint(Some(HeadPart::Face(1)), 0, "DKE", 0), None);
+        assert_eq!(head_part_tint(None, 0, "DKE", 0), None);
+    }
+
+    /// #519 raccoon-mask regression guard: the native RoF2 client never tints HUM hair
+    /// (or any race outside male HIE/DKE/HEF + female DWF). A HUM male hair prim with a dark
+    /// haircolor must render WHITE (untinted) — multiplying the skin-toned scalp/eye-band
+    /// texels by hair_tint(0) ≈ near-black is exactly what painted the dark band across
+    /// the eyes and the black scalp cap.
+    #[test]
+    fn hum_hair_is_never_tinted_native_gate() {
+        for hc in [0u8, 1, 18, 23] {
+            assert_eq!(head_part_tint(Some(HeadPart::Hair(Some(0))), hc, "HUM", 0),
+                Some([1.0, 1.0, 1.0, 1.0]),
+                "HUM male hair must be untinted for haircolor {hc}");
+            assert_eq!(head_part_tint(Some(HeadPart::Hair(None)), hc, "HUM", 1),
+                Some([1.0, 1.0, 1.0, 1.0]),
+                "HUM female fixed-crown hair must be untinted for haircolor {hc}");
+        }
+        // Dwarf: only the FEMALE model is tinted in the native client.
+        assert_eq!(head_part_tint(Some(HeadPart::Hair(Some(0))), 0, "DWF", 0),
+            Some([1.0, 1.0, 1.0, 1.0]));
+        assert_eq!(head_part_tint(Some(HeadPart::Hair(Some(0))), 0, "DWF", 1),
+            Some([46.0/255.0, 26.0/255.0, 12.0/255.0, 1.0]));
+        // Elves: only the MALE model is tinted in the native client. A tint on the
+        // FEMALE model would relocate #519's raccoon-mask bug onto her instead of
+        // fixing it (review follow-up on PR #524).
+        assert_eq!(head_part_tint(Some(HeadPart::Hair(Some(0))), 0, "DKE", 1),
+            Some([1.0, 1.0, 1.0, 1.0]),
+            "female DKE hair must be untinted");
+        // Untinted races still return Some(white) — hair prims must not fall back to an
+        // equipment tint.
+        assert_eq!(head_part_tint(Some(HeadPart::Hair(Some(2))), 5, "BAR", 0),
+            Some([1.0, 1.0, 1.0, 1.0]));
     }
 }

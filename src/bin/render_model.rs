@@ -525,8 +525,7 @@ fn main() {
     }
 
     let event_loop = EventLoop::new().expect("event loop");
-    let _ = gender;
-    let mut app = ModelViewerApp::new(model_path, arch_name, race, shared_camera, shared_wire, frame_req, shared_window, show_markers, parts_mode);
+    let mut app = ModelViewerApp::new(model_path, arch_name, race, gender, shared_camera, shared_wire, frame_req, shared_window, show_markers, parts_mode);
     event_loop.run_app(&mut app).expect("event loop run");
 }
 
@@ -607,6 +606,9 @@ struct SkinnedView {
     joints_buf: wgpu::Buffer,
     joints_bg:  wgpu::BindGroup,
     race:       String,
+    /// 0 = male, 1 = female — with `race`, drives the native hair-tint race gate
+    /// exactly like the live client (`head::hair_tint_applies`, #519).
+    gender:     u8,
     arch:       String,
     anim_time:  f32,
     last:       std::time::Instant,
@@ -623,6 +625,8 @@ struct ModelViewerApp {
     /// When set, render skinned with the client's race-driven scale (matches the live
     /// client). The 3-letter race code (e.g. "HUM") drives target_height_for.
     race:           Option<String>,
+    /// 0 = male, 1 = female (from `--gender`); feeds the hair-tint race gate.
+    gender:         u8,
     shared_camera:  SharedCamera,
     shared_wire:    SharedWireframe,
     frame_req:      FrameReq,
@@ -677,11 +681,11 @@ struct ViewerState {
 
 impl ModelViewerApp {
     fn new(
-        model_path: PathBuf, arch_name: String, race: Option<String>,
+        model_path: PathBuf, arch_name: String, race: Option<String>, gender: u8,
         shared_camera: SharedCamera, shared_wire: SharedWireframe, frame_req: FrameReq,
         shared_window: SharedWindow, show_markers: bool, parts_mode: bool,
     ) -> Self {
-        Self { model_path, arch_name, race, shared_camera, shared_wire, frame_req, shared_window, show_markers, parts_mode, state: None }
+        Self { model_path, arch_name, race, gender, shared_camera, shared_wire, frame_req, shared_window, show_markers, parts_mode, state: None }
     }
 }
 
@@ -964,6 +968,7 @@ impl ApplicationHandler for ModelViewerApp {
                             gpu_ext, smodel.true_height, gpu_ext * scale);
                     }
                     Some(SkinnedView { model: smodel, joints_buf, joints_bg, race: r,
+                        gender: self.gender,
                         arch: self.arch_name.clone(), anim_time: 0.0, last: std::time::Instant::now(),
                         cpu_verts, dbg_done: false })
                 }
@@ -1301,7 +1306,7 @@ fn render_frame(s: &mut ViewerState) {
         let haircolor = SEL_HAIRCOLOR.load(std::sync::atomic::Ordering::Relaxed);
         for (i, (mesh, (buf, _))) in sk.model.meshes.iter().zip(s.uniform_pool.iter()).enumerate() {
             let tint = sk.model.head_parts.get(i).copied().flatten()
-                .and_then(|p| eqoxide::models::head_part_tint(Some(p), haircolor))
+                .and_then(|p| eqoxide::models::head_part_tint(Some(p), haircolor, &sk.race, sk.gender))
                 .unwrap_or(mesh.base_color);
             s.queue.write_buffer(buf, 0, bytemuck::bytes_of(&EntityUniform {
                 model: mat, tint,
