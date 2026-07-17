@@ -30,10 +30,35 @@ pub fn build_move_item_to_trade(from_slot: u32, to_trade_slot: u32) -> [u8; 28] 
     buf
 }
 
+/// RoF2 `CancelTrade_Struct` (8 bytes) — sent C->S to abort the trade session mid-trade (OP_CancelTrade,
+/// 0x354c). The server (`EQEmu/zone/client_packet.cpp:4317`) size-validates against
+/// `sizeof(CancelTrade_Struct)` (8) and DROPS anything else with a LogError — so a 0-byte send is a
+/// silent no-op and never ends the trade. Layout `{ fromid: u32, action: u32 }`
+/// (`EQEmu/common/eq_packet_structs.h:2598`; RoF2 `rof2_structs.h:2712`). The server OVERWRITES `fromid`
+/// with the trade partner's id before relaying, and never interprets `action`, so both fields are
+/// effectively opaque to the server logic — only the exact 8-byte SIZE is load-bearing. We populate
+/// `fromid` with our own player id (matching the OP_TradeAcceptClick convention) and `action = 0`.
+pub fn build_cancel_trade(player_id: u32) -> [u8; 8] {
+    let mut buf = [0u8; 8];
+    buf[0..4].copy_from_slice(&player_id.to_le_bytes()); // fromid (server overwrites)
+    // action = 0 (already zeroed; server ignores it)
+    buf
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::eq_net::protocol::SLOT_CURSOR;
+
+    #[test]
+    fn build_cancel_trade_is_eight_bytes_with_player_id() {
+        // The server drops any OP_CancelTrade whose size != sizeof(CancelTrade_Struct) (8) — a 0-byte
+        // send never ends the trade. Guard the exact size and the fromid field.
+        let pkt = build_cancel_trade(0x1234_5678);
+        assert_eq!(pkt.len(), 8, "CancelTrade_Struct must be exactly 8 bytes or the server drops it");
+        assert_eq!(u32::from_le_bytes(pkt[0..4].try_into().unwrap()), 0x1234_5678, "fromid=player_id");
+        assert_eq!(u32::from_le_bytes(pkt[4..8].try_into().unwrap()), 0, "action=0");
+    }
 
     #[test]
     fn build_move_item_to_trade_encodes_typetrade_slot() {

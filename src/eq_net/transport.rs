@@ -617,6 +617,26 @@ impl EqStream {
         seq
     }
 
+    /// TEST ONLY: decode every reliable (`OP_PACKET`) app packet still tracked in the resend window
+    /// into `(app_opcode, payload)` pairs, in send order. Assumes the identity encode used by
+    /// `test_stream` (pass1 = pass2 = 0, key = 0) so the tracked datagram is the plain wire framing
+    /// `[0x00, OP_PACKET, seq(2 BE), opcode(2 LE), payload.., crc(crc_bytes)]`. The trailing CRC width
+    /// is `session.crc_bytes` (0 in `test_stream`). Used to assert that a state machine actually put a
+    /// given opcode on the wire (e.g. the #480 phase-2 OP_CancelTrade). Skips fragmented sends (our
+    /// small control packets never fragment).
+    #[cfg(test)]
+    pub(crate) fn sent_app_packets(&self) -> Vec<(u16, Vec<u8>)> {
+        let crc = self.session.crc_bytes as usize;
+        self.sent.iter().filter_map(|s| {
+            let d = &s.datagram;
+            // [0x00, OP_PACKET, seq_hi, seq_lo, op_lo, op_hi, payload.., crc(crc_bytes)]
+            if d.len() < 6 + crc || d[1] != OP_PACKET { return None; }
+            let opcode = u16::from_le_bytes([d[4], d[5]]);
+            let payload = d[6..d.len() - crc].to_vec();
+            Some((opcode, payload))
+        }).collect()
+    }
+
     /// Process an inbound OP_ACK. EQStream ACKs are CUMULATIVE — `acked` acknowledges every reliable
     /// sequence up to and including it — so drop every buffered send at or before it from the front of
     /// the resend window. A stale/duplicate ACK (behind the window base) pops nothing. (#254)
