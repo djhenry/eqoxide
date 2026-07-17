@@ -65,7 +65,7 @@ pub mod result;
 pub use result::CommandResult;
 // Wave-2 fan-out stubs — one file each, empty `impl CommandState {}` shell awaiting migration.
 mod merchant;
-pub use merchant::BuyOk;
+pub use merchant::{BuyOk, OpenOk};
 mod inventory;
 mod interact;
 pub use interact::GiveOk;

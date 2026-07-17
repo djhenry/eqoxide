@@ -255,6 +255,12 @@ pub async fn run_gameplay_phase(
             match packet.opcode {
                 OP_SHOP_PLAYER_BUY  => action_loop.fulfill_buy_ok(&gs, &packet.payload),
                 OP_SHOP_END_CONFIRM => action_loop.fulfill_buy_refused(),
+                // eqoxide#479: resolve an awaited merchant open on its OP_ShopRequest echo. Both a
+                // confirmed open (command=1) and a real refusal (command=0) share this one opcode —
+                // `fulfill_open` reads the echoed `command` field to tell them apart. A non-merchant
+                // / out-of-range target sends NO echo at all, so that case never reaches here — it
+                // resolves via the HTTP timeout instead (the honesty invariant).
+                OP_SHOP_REQUEST     => action_loop.fulfill_open(&packet.payload),
                 // A3 Migration 2 (#448); verify-transfer (#486): OP_FinishTrade ends the trade SESSION
                 // — it does NOT prove the NPC accepted the item (a rejected / out-of-range turn-in fires
                 // it too, then RETURNS the item). So we only NOTE the finish here (applied above with the
