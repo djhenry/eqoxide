@@ -34,8 +34,11 @@ const RESPAWN_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 /// Only sent once the world has been application-silent this long — during active play spontaneous
 /// packets already prove the world is processing, so the probe adds no load there.
 const PROBE_QUIET_THRESHOLD: Duration = Duration::from_secs(12);
-/// Minimum gap between probes while the world stays quiet, so we poke at most ~twice a minute.
-const PROBE_INTERVAL: Duration = Duration::from_secs(30);
+/// Minimum gap between probes while the world stays quiet, so we poke at most ~twice a minute. Single
+/// source of truth is `ipc::PROBE_INTERVAL_SECS`, because `ipc::PASSIVE_LIVENESS_STALE_SECS` is
+/// derived from this cadence (an answered-idle session refreshes proof-of-life once per interval, so
+/// the #470 passive bound must exceed it — see that constant's doc).
+const PROBE_INTERVAL: Duration = Duration::from_secs(crate::ipc::PROBE_INTERVAL_SECS);
 
 /// #371: does this OP_Consider reply describe our OWN spawn — i.e. is it the reply to our
 /// self-consider liveness probe, rather than a user `/consider` of another mob? Reads targetid@4
@@ -1475,8 +1478,8 @@ mod wedge_timeline_tests {
     //! matter how many more 30s resend cycles elapse. Before the fix this oscillated forever
     //! (true@0, false@22, true@42, false@52, true@72, ... — the exact timeline from the bug report),
     //! because every resend restamped the SAME clock `world_responsive` used for its 10s grace check.
-    use super::{record_app_packet, record_probe_sent, should_send_probe, PROBE_INTERVAL};
-    use crate::ipc::{world_responsive, NetHealth, PROBE_TIMEOUT_SECS};
+    use super::{record_app_packet, record_probe_reply, record_probe_sent, should_send_probe, PROBE_INTERVAL};
+    use crate::ipc::{world_responsive, NetHealth, PASSIVE_LIVENESS_STALE_SECS, PROBE_TIMEOUT_SECS};
     use std::time::{Duration, Instant};
 
     /// Drives a timeline second-by-second through the REAL `NetHealth` and the real production state
@@ -1518,7 +1521,12 @@ mod wedge_timeline_tests {
             let first_unanswered_ago = h.first_unanswered_probe_sent.map(|s| now_t.duration_since(s));
             let probe_reply_ago      = h.last_probe_reply.map(|s| now_t.duration_since(s));
             let last_packet_ago      = now_t.duration_since(h.last_packet);
-            let responsive = world_responsive(first_unanswered_ago, probe_reply_ago, last_packet_ago, timeout);
+            // These timelines model a WEDGED-BUT-ACKing zone (#371), so the link is alive throughout
+            // (`connected == true`); the #470 passive staleness bound is passed but only governs the
+            // no-probe branch, which these scenarios exit at ~12s of app-silence when the probe fires.
+            let responsive = world_responsive(
+                true, first_unanswered_ago, probe_reply_ago, last_packet_ago, timeout,
+                Duration::from_secs(PASSIVE_LIVENESS_STALE_SECS));
             verdicts.push((t, responsive));
         }
         verdicts
@@ -1580,6 +1588,70 @@ mod wedge_timeline_tests {
         // And the timeline must run well past that re-wedge so this isn't a boundary fluke.
         assert!(run_secs - re_wedge.unwrap() > PROBE_TIMEOUT_SECS,
             "timeline too short to confirm the re-wedge verdict holds");
+    }
+
+    /// #470 REGRESSION (reviewer-found): the textbook #343 shape — a healthy idle session with NO
+    /// spontaneous app traffic after t=0 whose every probe is answered INSTANTLY — must read
+    /// `world_responsive: true` at EVERY step across many probe cycles. The subtlety this guards: an
+    /// answered probe clears the unanswered streak (`record_probe_reply` → `first_unanswered = None`),
+    /// so the session sits in `world_responsive`'s passive (`None`) branch, and the NEXT probe is not
+    /// due until `PROBE_INTERVAL` (30s) after the previous SEND — so `probe_reply_ago` climbs to nearly
+    /// a full interval before it is refreshed. The passive bound MUST survive that whole cycle. With
+    /// the first-cut 22s bound this test goes RED in the t=[35..41], [65..71], … windows (proof-of-life
+    /// aged 23–29s > 22); with the cadence-derived 40s bound (`PROBE_INTERVAL + PROBE_TIMEOUT`) it is
+    /// green throughout. Drives the REAL production transitions, exactly as `HttpState::health` reads.
+    #[test]
+    fn answered_idle_session_stays_responsive_across_probe_cycles() {
+        let base = Instant::now();
+        let mut h = NetHealth {
+            last_datagram: base, last_packet: base, last_tick: base,
+            last_probe_sent: None, last_probe_reply: None, first_unanswered_probe_sent: None,
+        };
+        let timeout       = Duration::from_secs(PROBE_TIMEOUT_SECS);
+        let passive_stale = Duration::from_secs(PASSIVE_LIVENESS_STALE_SECS);
+        let run_secs = PROBE_INTERVAL.as_secs() * 4 + 10; // several full 30s answered cycles
+
+        // Sanity: the run must actually cross the danger window a too-small bound fails in, or the
+        // test would pass vacuously without exercising the near-full-interval proof-of-life age.
+        assert!(run_secs > PROBE_INTERVAL.as_secs() + PROBE_TIMEOUT_SECS,
+            "timeline too short to reach the late-cycle proof-of-life ages this test is about");
+
+        let mut probe_cycles = 0;
+        for t in 0..=run_secs {
+            let now_t = base + Duration::from_secs(t);
+
+            // 1. Spontaneous traffic ONLY at t=0 (the textbook idle shape: silent thereafter).
+            if t == 0 {
+                record_app_packet(&mut h, now_t);
+            }
+
+            // 2. Resend policy, and the zone ANSWERS every probe the same tick (instant reply).
+            let last_packet_ago     = now_t.duration_since(h.last_packet);
+            let last_probe_sent_ago = h.last_probe_sent.map(|s| now_t.duration_since(s));
+            if should_send_probe(last_packet_ago, last_probe_sent_ago) {
+                record_probe_sent(&mut h, now_t);
+                record_probe_reply(&mut h, now_t); // answered → clears the streak back to None
+                probe_cycles += 1;
+            }
+
+            // 3. HTTP-read verdict, computed exactly as `HttpState::health()` does (link ALIVE).
+            let first_unanswered_ago = h.first_unanswered_probe_sent.map(|s| now_t.duration_since(s));
+            let probe_reply_ago      = h.last_probe_reply.map(|s| now_t.duration_since(s));
+            let last_packet_ago      = now_t.duration_since(h.last_packet);
+            let responsive = world_responsive(
+                true, first_unanswered_ago, probe_reply_ago, last_packet_ago, timeout, passive_stale);
+
+            assert!(responsive,
+                "a healthy every-probe-answering idle session read world_responsive=FALSE at t={t}s \
+                 (proof-of-life aged {}s, bound {}s) — the #343 regression the reviewer caught",
+                probe_reply_ago.map_or(last_packet_ago, |r| r.min(last_packet_ago)).as_secs(),
+                PASSIVE_LIVENESS_STALE_SECS);
+        }
+
+        // Guard the guard: we must have actually gone through multiple answered probe cycles, or the
+        // near-full-interval proof-of-life age was never reached and the test proved nothing.
+        assert!(probe_cycles >= 3,
+            "expected several answered probe cycles over the run, got {probe_cycles}");
     }
 }
 
