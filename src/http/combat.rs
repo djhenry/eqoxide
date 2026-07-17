@@ -67,6 +67,7 @@ async fn post_target(
     State(s): State<HttpState>,
     body: Result<Json<TargetBody>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let id = match body {
         Ok(Json(b)) => b.id,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"id\":<spawn_id>}".into()),
@@ -95,6 +96,7 @@ async fn post_target_name(
     State(s): State<HttpState>,
     body: Result<Json<TargetNameBody>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let name = match body {
         Ok(Json(b)) => b.name,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"name\":\"...\"}".into()),
@@ -121,6 +123,7 @@ async fn post_target_name(
 
 /// POST /v1/combat/attack — enable auto-attack (sends OP_AUTO_ATTACK 1).
 async fn post_attack_on(State(s): State<HttpState>) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     s.command.request_attack(true);
     tracing::info!("attack: queued auto-attack ON");
     (StatusCode::OK, "auto-attack ON".into())
@@ -128,6 +131,7 @@ async fn post_attack_on(State(s): State<HttpState>) -> (StatusCode, String) {
 
 /// DELETE /v1/combat/attack — disable auto-attack (sends OP_AUTO_ATTACK 0).
 async fn post_attack_off(State(s): State<HttpState>) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     s.command.request_attack(false);
     tracing::info!("attack: queued auto-attack OFF");
     (StatusCode::OK, "auto-attack OFF".into())
@@ -139,6 +143,7 @@ struct ConsiderBody { id: Option<u32> }
 
 /// POST /v1/combat/consider {"id":N?} — consider a spawn (con color/faction), default current target.
 async fn post_consider(State(s): State<HttpState>, OptionalJson(body): OptionalJson<ConsiderBody>) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let id = body.and_then(|b| b.id).or(s.player().target_id);
     match id {
         Some(id) => { s.command.request_consider(id); (StatusCode::OK, format!("consider {id} queued")) }
@@ -168,6 +173,7 @@ struct CastBody { gem: Option<u8>, spell_id: Option<u32>, target_id: Option<u32>
 ///     terminal within the timeout, or a zone change / disconnect intervened. Body says so; MUST NOT
 ///     be read as success (see `crate::command_state::result`).
 async fn post_cast(State(s): State<HttpState>, OptionalJson(body): OptionalJson<CastBody>) -> Response {
+    if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
     let b = body.unwrap_or_default();
     // Resolve the CastRequest with the same pre-send validation as before (a clear 4xx before we ever
     // park/await). Item clicky cast: validate the slot holds a clickable item.
@@ -257,6 +263,7 @@ async fn post_memorize(
     State(s): State<HttpState>,
     body: Result<Json<MemorizeBody>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let b = match body { Ok(Json(b)) => b, Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"spell_id\":N,\"gem\":0-8}".into()) };
     if b.gem > 8 { return (StatusCode::BAD_REQUEST, "gem must be 0-8".into()); }
     s.command.request_mem_spell(b.gem, b.spell_id, 1, None);
@@ -276,6 +283,7 @@ async fn post_scribe(
     State(s): State<HttpState>,
     body: Result<Json<ScribeBody>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let b = match body { Ok(Json(b)) => b, Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"spell_id\":N,\"from\":S,\"slot\":B?}".into()) };
     let slot = b.slot.unwrap_or(0);
     s.command.request_mem_spell(slot, b.spell_id, 0, b.from);

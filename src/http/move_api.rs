@@ -47,6 +47,7 @@ async fn post_manual(
     State(s): State<HttpState>,
     OptionalJson(body): OptionalJson<ManualBody>,
 ) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let b = body.unwrap_or_default();
     let dir = [b.east.unwrap_or(0.0), b.north.unwrap_or(0.0)];
     let up = b.up.unwrap_or(0.0).clamp(-1.0, 1.0);
@@ -66,6 +67,7 @@ async fn post_manual(
 /// `jump`). Clears any `/goto` and pops the character up — on land it's a jump; in water it swims
 /// upward toward the surface (#207), e.g. to lift off a pool floor.
 async fn post_jump(State(s): State<HttpState>) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     s.command.request_manual_move(ManualMove {
         dir: [0.0, 0.0], up: 0.0, jump: true,
         until: std::time::Instant::now() + std::time::Duration::from_millis(400),
@@ -151,6 +153,7 @@ async fn post_goto(
     State(s): State<HttpState>,
     OptionalJson(body): OptionalJson<MoveBody>,
 ) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let b = body.unwrap_or_default();
 
     let target: (f32, f32, f32) = if let Some(name) = &b.name {
@@ -188,6 +191,7 @@ async fn post_follow(
     State(s): State<HttpState>,
     OptionalJson(body): OptionalJson<MoveBody>,
 ) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let b = body.unwrap_or_default();
 
     if b.has_coords() {
@@ -220,6 +224,7 @@ async fn post_follow(
 /// POST /v1/move/stop — cancel any active goto/follow. Idempotent. Clears goto_target and
 /// goto_entity; the nav thread then clears nav_intent next tick via its "no goto ⇒ no nav" invariant.
 async fn post_stop(State(s): State<HttpState>) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     s.command.request_stop();
     tracing::info!("move/stop: navigation cancelled");
     (StatusCode::OK, "navigation stopped".into())
@@ -263,6 +268,7 @@ async fn post_zone_cross(
     State(s): State<HttpState>,
     OptionalJson(body): OptionalJson<ZoneCrossBody>,
 ) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let b = body.unwrap_or_default();
     apply_avoid_opts(&s.nav.nav_avoid, b.avoid_aggro, b.aggro_buffer);
     let zone_id = b.zone_id.unwrap_or(0);

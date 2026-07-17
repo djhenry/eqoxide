@@ -24,6 +24,7 @@ async fn post_move(
     State(s): State<HttpState>,
     body: Result<Json<MoveBody>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, String) {
+    if let Err(e) = require_live_session(&s) { return e; }
     let b = match body {
         Ok(Json(b)) => b,
         Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"from\":N,\"to\":M}".into()),

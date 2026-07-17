@@ -86,6 +86,17 @@ pub use crate::ipc::*;
 /// dead/frozen server is caught within a few seconds (eqoxide#8).
 pub const CONN_STALE_SECS: u64 = 15;
 
+/// #477: milliseconds without a network-thread tick after which a WRITE command treats the session
+/// as dead. The gameplay net thread republishes the snapshot every ~10ms (see
+/// `gameplay::publish_snapshot`, which bumps `NetHealth::last_tick` UNCONDITIONALLY every loop even
+/// on an idle world), so a healthy session — including a fully IDLE one — keeps `snapshot_age_ms`
+/// near zero and never approaches this. Only a wedged or EXITED net thread (a failed world-reconnect
+/// that killed the gameplay thread while the HTTP server kept serving — the #470/#477 zombie) lets
+/// `snapshot_age_ms` climb this high. Kept comfortably below `CONN_STALE_SECS * 1000` so a thread
+/// that died WITHOUT the link having gone stale yet (datagrams may briefly keep arriving after the
+/// thread exits) is still caught here, faster than `connected` would flip.
+pub const SESSION_STALE_TICK_MS: u64 = 5_000;
+
 /// How long after a death `killed_by` / `died_ago_secs` keep being reported (through a respawn), so
 /// an infrequently-polling agent still learns that it died and what killed it (#284).
 pub const DEATH_STICKY_SECS: u64 = 300;
@@ -462,6 +473,62 @@ impl HttpState {
     }
 }
 
+/// #477: reject a WRITE command when the game SESSION is not live, so an agent never gets a false
+/// `200 OK` for an action that goes nowhere. This is the other half of the #470 zombie: when a failed
+/// world-reconnect exits the gameplay NET THREAD, the HTTP server keeps running and every WRITE
+/// handler still writes its request slot and returns 200 — but the net thread that DRAINS those slots
+/// is gone, so the action silently never happens. This turns that into an immediate, explicit failure.
+///
+/// A WRITE handler is one that only enqueues a request the gameplay net thread must later drain
+/// (`move/*`, `combat/*`, `interact/*`, `merchant/*`, `inventory/*`, `quests/*`, `trainer/*`,
+/// `group/*`, `guild/*`, `chat/*`, `pet/*`, `lifecycle/{respawn,camp}`). READ/observe handlers are
+/// deliberately NOT gated: they honestly report last-known state and already carry `connected` /
+/// `world_responsive`, so an agent can see the session is dead without being lied to. `lifecycle/exit`
+/// is also NOT gated — it must always work, and its own watchdog force-exits the process even if the
+/// loop is wedged.
+///
+/// The "dead" verdict is keyed on two INDEPENDENT net-thread-liveness signals, never on transient
+/// quiet, so a healthy idle session (connected + ticking, but no application traffic for tens of
+/// seconds) always passes (#343):
+///   - `connected == false` — no server datagram (not even a session-layer ACK) for `CONN_STALE_SECS`.
+///     The clearest "the link/thread is gone" signal; an idle-but-alive session keeps ACKing so stays
+///     `true`.
+///   - `snapshot_age_ms >= SESSION_STALE_TICK_MS` — the net thread stopped ticking. Catches the window
+///     where the thread died but the link has not gone stale yet, and does so faster than `connected`.
+///     An idle-but-alive session ticks every ~10ms, so this never fires on it.
+///
+/// Deliberately NOT keyed on `world_responsive`: that reads `false` on a WEDGED-but-ALIVE zone (#371)
+/// whose net thread is fine and where a queued command WILL eventually drain once the world unwedges —
+/// rejecting there would be dishonest in the other direction. This guard is strictly about "is the net
+/// THREAD that drains commands still running", which `connected` + tick-staleness answer without any
+/// false positive on a healthy idle session.
+pub(crate) fn require_live_session(s: &HttpState) -> Result<(), (axum::http::StatusCode, String)> {
+    let h = s.health();
+    if !h.connected {
+        return Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "not connected — the game session is not live (no server datagram for over \
+                 {CONN_STALE_SECS}s; the network thread has disconnected or exited). This command \
+                 was NOT sent and will not take effect. See GET /v1/observe/debug \
+                 (`connected`/`world_responsive`)."
+            ),
+        ));
+    }
+    if h.snapshot_age_ms >= SESSION_STALE_TICK_MS {
+        return Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "the game session is not live — the network thread has not ticked in {}ms (it has \
+                 exited or wedged). This command was NOT sent and will not take effect. See GET \
+                 /v1/observe/debug (`snapshot_age_ms`).",
+                h.snapshot_age_ms
+            ),
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_camera_server(
     camera:          crate::ipc::CameraSlots,
@@ -595,6 +662,115 @@ mod currency_tests {
         let v = currency_json([0, 0, 0, 0]);
         assert_eq!(v["platinum"], 0);
         assert_eq!(v["copper"], 0);
+    }
+}
+
+/// #477: the dead-session guard for WRITE-command handlers. These prove the guard turns a dead net
+/// thread into an honest 503 (never a false 200), that a live/idle session passes, and — via a
+/// route-level test — that a gated handler returns 503 AND does NOT enqueue the action.
+#[cfg(test)]
+mod live_session_guard_tests {
+    use super::*;
+    use crate::http::quests::tests::{ago, empty_state};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    /// Overwrite the three net-health clocks (ages in seconds) to model a given liveness state; the
+    /// probe clocks are left at their `Default` (`None`), which is what the guard reads through
+    /// `health()` but never keys its verdict on.
+    fn set_clocks(s: &HttpState, datagram_ago: u64, tick_ago: u64, packet_ago: u64) {
+        *s.net_health.lock().unwrap() = NetHealth {
+            last_datagram: ago(datagram_ago),
+            last_packet:   ago(packet_ago),
+            last_tick:     ago(tick_ago),
+            ..NetHealth::default()
+        };
+    }
+
+    /// A freshly-built state (all clocks = now) is LIVE — the guard must pass. This is why every
+    /// pre-existing handler test (which uses `empty_state`) keeps its status unchanged.
+    #[test]
+    fn fresh_state_is_live() {
+        assert!(require_live_session(&empty_state()).is_ok());
+    }
+
+    /// A healthy but IDLE session — connected + ticking, yet the WORLD has been quiet for a full
+    /// minute (`last_packet` 60s stale) — must NOT be rejected. This is the #343 over-rejection guard:
+    /// keying the verdict on `last_packet` (world quiet) instead of `connected`/`last_tick` (thread
+    /// alive) would fail here.
+    #[test]
+    fn healthy_idle_session_is_not_rejected() {
+        let s = empty_state();
+        set_clocks(&s, 0, 0, 60);
+        assert!(require_live_session(&s).is_ok(),
+            "a connected, ticking session must pass even after 60s of world silence");
+    }
+
+    /// A dead LINK (no datagram for > CONN_STALE_SECS) → 503, regardless of the tick clock.
+    #[test]
+    fn disconnected_link_is_503() {
+        let s = empty_state();
+        set_clocks(&s, CONN_STALE_SECS + 5, 0, CONN_STALE_SECS + 5);
+        let (code, msg) = require_live_session(&s).unwrap_err();
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(msg.contains("not connected"), "message: {msg}");
+    }
+
+    /// The net thread stopped TICKING while the link is still fresh (a thread that died before the
+    /// datagram clock went stale) → 503 via the snapshot-staleness bound, faster than `connected`.
+    #[test]
+    fn stale_tick_with_live_link_is_503() {
+        let s = empty_state();
+        // Datagram fresh (connected == true), but no tick for > SESSION_STALE_TICK_MS.
+        set_clocks(&s, 0, SESSION_STALE_TICK_MS / 1000 + 1, 0);
+        let (code, msg) = require_live_session(&s).unwrap_err();
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(msg.contains("has not ticked"), "message: {msg}");
+    }
+
+    /// Mutation guard on the tick bound: a tick just UNDER the staleness bound must still pass, so the
+    /// `>=` comparison can't be silently loosened/tightened without a test failing.
+    #[test]
+    fn tick_just_under_bound_passes() {
+        let s = empty_state();
+        // ~1s of no tick on a connected link is well within a healthy loop's tolerance.
+        set_clocks(&s, 0, 1, 0);
+        assert!(require_live_session(&s).is_ok());
+    }
+
+    /// Route-level: a WRITE handler (`/v1/move/goto`) on a DEAD session returns 503 and does NOT
+    /// enqueue the nav action — the whole point of #477 (no false 200, and nothing left in the slot
+    /// for a net thread that will never drain it).
+    #[tokio::test]
+    async fn write_handler_on_dead_session_is_503_and_does_not_enqueue() {
+        let state = empty_state();
+        set_clocks(&state, CONN_STALE_SECS + 5, CONN_STALE_SECS + 5, CONN_STALE_SECS + 5);
+        let goto_target = state.nav.goto_target.clone();
+        let app = super::move_api::router().with_state(state);
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"x":1.0,"y":2.0,"z":3.0}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE,
+            "a WRITE command on a dead session must be an honest 503, never a false 200");
+        assert!(goto_target.lock().unwrap().is_none(),
+            "a dead-session command must NOT be enqueued — nothing will ever drain it");
+    }
+
+    /// Route-level companion: the SAME request on a live session proceeds normally (200 + enqueued),
+    /// proving the guard doesn't block the happy path.
+    #[tokio::test]
+    async fn write_handler_on_live_session_proceeds() {
+        let state = empty_state(); // fresh clocks = live
+        let goto_target = state.nav.goto_target.clone();
+        let app = super::move_api::router().with_state(state);
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"x":1.0,"y":2.0,"z":3.0}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(*goto_target.lock().unwrap(), Some((1.0, 2.0, 3.0)));
     }
 }
 
