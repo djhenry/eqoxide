@@ -45,9 +45,90 @@ pub fn build_movement_history(x: f32, y: f32, z: f32) -> Vec<u8> {
     b.extend_from_slice(&ts.to_le_bytes()); // timestamp @13
     b
 }
+
+/// Build the 46-byte RoF2 `PlayerPositionUpdateClient_Struct` outgoing payload for OP_ClientUpdate.
+///
+/// Pure — the #516 epsilon gate + payload scrub is here (not at the send decision) so the exact
+/// wire bytes are unit-testable, and so the 1300 ms idle keepalive carries the SAME scrubbed bytes.
+/// `cur` is the position being reported; `prev` is the last-streamed position, from which the
+/// deltas `cur − prev` are computed. When every axis delta is at/below `POS_DELTA_EPSILON` the
+/// character is "standing still": delta_x/y/z are forced to EXACT `0.0` and the animation to idle
+/// (0), matching the native client. Only a genuine (> epsilon) move rides with its real nonzero
+/// deltas and the moving animation (1). Reverting this to the old exact `!= 0.0` test lets sub-
+/// visual controller jitter emit tiny nonzero deltas + a flickering anim, which the server force-
+/// relays to observers as the SLIDE + BLIP of #516.
+fn build_position_update_payload(
+    seq:      u16,
+    spawn_id: u16,
+    cur:      [f32; 3],
+    prev:     [f32; 3],
+    heading:  f32,
+) -> [u8; 46] {
+    let raw_dx = cur[0] - prev[0]; // east  delta (server_x)
+    let raw_dy = cur[1] - prev[1]; // north delta (server_y)
+    let raw_dz = cur[2] - prev[2];
+    let moving = raw_dx.abs() > POS_DELTA_EPSILON
+        || raw_dy.abs() > POS_DELTA_EPSILON
+        || raw_dz.abs() > POS_DELTA_EPSILON;
+    // Below the native epsilon: scrub the deltas to EXACT zero and the animation to idle — the very
+    // payload a stationary native client sends. This is what stops the EQEmu server force-relaying
+    // idle jitter to observers (#516).
+    let (dx, dy, dz) = if moving { (raw_dx, raw_dy, raw_dz) } else { (0.0, 0.0, 0.0) };
+    let anim: i32 = if moving { 1 } else { 0 };
+
+    // Internal heading is CCW (0=north, 90=west). EQ wire expects CW (0=north, 90=east). EQEmu
+    // decodes wire heading via EQ12toFloat = wire/4; full circle = 512 EQ units. So
+    // wire = cw_degrees * 512/360 * 4 = cw_degrees * 2048/360.
+    let h_cw = crate::eq_net::protocol::ccw_to_cw(heading);
+    let eq_heading = crate::eq_net::protocol::deg_cw_to_eq12_client(h_cw);
+
+    // RoF2 PlayerPositionUpdateClient_Struct (rof2_structs.h, 46 bytes):
+    //   0: sequence(u16)  2: spawn_id(u16)  4: vehicle_id(u16)=0
+    //   6: unknown[4]=0   10: delta_x(f32)  14: heading(u32 field, bits 0-11)
+    //  18: x_pos(f32)     22: delta_z(f32)  26: z_pos(f32)  30: y_pos(f32)
+    //  34: animation(u32 field, bits 0-9)   38: delta_y(f32)
+    //  42: delta_heading(u32 field, bits 0-9 signed) = 0
+    let mut buf = [0u8; 46];
+    buf[0..2].copy_from_slice(&seq.to_le_bytes());          // sequence
+    buf[2..4].copy_from_slice(&spawn_id.to_le_bytes());     // spawn_id
+    // vehicle_id = 0 at [4..6], unknown[4] = 0 at [6..10] (already zeroed)
+    buf[10..14].copy_from_slice(&dx.to_le_bytes());         // delta_x
+    buf[14..18].copy_from_slice(&eq_heading.to_le_bytes()); // heading (12-bit in u32)
+    buf[18..22].copy_from_slice(&cur[0].to_le_bytes());     // x_pos (server east)
+    buf[22..26].copy_from_slice(&dz.to_le_bytes());         // delta_z
+    buf[26..30].copy_from_slice(&cur[2].to_le_bytes());     // z_pos (height)
+    buf[30..34].copy_from_slice(&cur[1].to_le_bytes());     // y_pos (server north)
+    buf[34..38].copy_from_slice(&anim.to_le_bytes());       // animation (10-bit in u32)
+    buf[38..42].copy_from_slice(&dy.to_le_bytes());         // delta_y
+    // delta_heading at [42..46] = 0 (already zeroed)
+    buf
+}
 /// A >12u jump in the network gs player position between ticks that we did NOT stream is a genuine
 /// server correction (anti-cheat snap / teleport), handed to the render controller to apply.
 const CORRECTION_SQ: f32 = 144.0;
+
+/// Native RoF2 position-delta epsilon (units). At or below this magnitude on EVERY axis the client
+/// is "standing still": the built OP_ClientUpdate payload carries delta_x/y/z == EXACT 0 and
+/// animation == idle, exactly like the native client (#516). The render controller's gravity /
+/// ground-snap / depenetration produce sub-visual float jitter while a character stands on uneven
+/// geometry; the exact `!= 0.0` test we used before let that jitter emit tiny nonzero deltas AND a
+/// flickering animation field. The EQEmu server force-relays a player's position to nearby
+/// observers whenever `m_Delta != 0` OR the animation changed (`client_packet.cpp`), so every
+/// jitter packet was rebroadcast — observers dead-reckoned the tiny delta then snapped back (SLIDE)
+/// and saw the animation flicker idle↔moving (BLIP). Scrubbing the PAYLOAD (not merely gating the
+/// send) matters because the 1300 ms idle keepalive MUST also carry clean zero deltas + idle anim.
+const POS_DELTA_EPSILON: f32 = 0.001;
+
+/// Contested-Z reconcile (#516 part 2). A Z disagreement (units) between the server's asserted
+/// player position and the render controller's collision-floor Z that exceeds this — while the
+/// character is GROUNDED and horizontally still — is a genuine standoff (e.g. a #goto floor-snap
+/// drift of ~3u the controller keeps re-asserting), not idle float noise. Below this the two agree.
+const POS_Z_RECONCILE_UNITS: f32 = 1.0;
+/// How many consecutive stream ticks (~10 ms each) a contested-Z standoff must PERSIST before we
+/// adopt the server's position. A debounce so a single stray packet never rubber-bands the
+/// controller; the `!view.moving` gate (false only when grounded AND no horizontal wish) already
+/// excludes every airborne/falling frame, so this only ever counts a genuinely-stuck standoff.
+const POS_Z_RECONCILE_TICKS: u32 = 10;
 
 /// Pending state of a quest turn-in (POST /give). The trade window spans multiple nav ticks:
 /// we send OP_TradeRequest, then must wait for the server's OP_TradeRequestAck before moving the
@@ -441,6 +522,15 @@ pub struct ActionLoop {
     last_streamed:    [f32; 3],
     last_pos_send:    Instant,
     streamed_init:    bool,
+    /// #516 part 2: the server's most recently asserted player position (an inbound OP_ClientUpdate
+    /// for our own spawn wrote `gs` between ticks). Held across ticks — the Normal path clobbers
+    /// `gs` with the controller position every tick, so a one-shot server reposition would vanish;
+    /// tracking it here lets us measure how long the controller's Z contests the server's Z.
+    last_server_pos:  Option<[f32; 3]>,
+    /// #516 part 2: consecutive stream ticks the grounded/idle controller's Z has contested
+    /// `last_server_pos` beyond `POS_Z_RECONCILE_UNITS`. Reset on convergence/movement; once it
+    /// reaches `POS_Z_RECONCILE_TICKS` we adopt the server position (see `stream_position`).
+    contested_z_ticks: u32,
 }
 
 impl ActionLoop {
@@ -505,6 +595,8 @@ impl ActionLoop {
             last_pos_send: Instant::now(),
             last_movement_history_send: Instant::now(),
             streamed_init: false,
+            last_server_pos: None,
+            contested_z_ticks: 0,
         }
     }
 
@@ -2345,6 +2437,14 @@ impl ActionLoop {
             self.streamed_init = true;
             return;
         }
+        // A correction handed to the controller (hard or contested-Z, below) is not applied until the
+        // render thread `take()`s `pos_correction` on its next frame. Until then, do NOT re-mirror the
+        // controller's PRE-correction position over `gs` or stream it — that would re-assert the very Z
+        // we just corrected away, re-opening the #516 bounce. Hold this tick; `gs` keeps the adopted
+        // value we already wrote and the walker's other work still ran above.
+        if self.controller.pos_correction.lock().unwrap().is_some() {
+            return;
+        }
         // Genuine server correction: the network gs player jumped (an incoming server packet moved
         // us) far from what we last mirrored. Hand it to the controller; adopt and re-stream it.
         let cd = [gp[0] - self.last_streamed[0], gp[1] - self.last_streamed[1]];
@@ -2354,7 +2454,64 @@ impl ActionLoop {
             self.send_position_update(stream, gs, gp[0], gp[1], gp[2], gs.player_heading);
             self.last_streamed = gp;
             self.last_pos_send = Instant::now();
+            self.contested_z_ticks = 0;
+            self.last_server_pos = None;
             return;
+        }
+        // ── Contested-Z reconcile (#516 part 2) ──────────────────────────────────────────────────
+        // A server reposition whose horizontal component is < 12u (so it slips under the hard
+        // correction above) — in particular a Z-ONLY floor-snap after a #goto (e.g. the controller
+        // asserts z=76.9 while the server holds 73.97) — is otherwise clobbered every tick by the
+        // Normal path below, which re-mirrors the controller's own collision-floor Z over `gs`.
+        // eqoxide then keeps broadcasting its Z while the server holds a different one, so observers
+        // see the player's Z bounce between the two: the nameplate drops to the waist and pops back
+        // (#516's headline symptom). Detect the server's asserted position and, once the standoff has
+        // PERSISTED while the character is GROUNDED and horizontally still (`!view.moving` is false
+        // for every airborne/falling frame, so a fall/stair sync-lag delta is never rubber-banded),
+        // adopt it via the controller teleport path so eqoxide converges to the server floor and
+        // broadcasts a stable, server-matching Z.
+        //
+        // NOTE (deeper cause, tracked separately): if the controller's collision-floor Z on the
+        // platform is GENUINELY ~3u above the server's floor, there is a collision-mesh/platform-
+        // height discrepancy under this — the teleport won't fully stick and this reconcile becomes a
+        // slow (per-`POS_Z_RECONCILE_TICKS`) convergence rather than instant. For #516 the client-side
+        // reconcile is the right fix (broadcast matches server → observer stops bouncing); a confirmed
+        // mesh-height bug belongs in its own issue.
+        if (gp[0] - self.last_streamed[0]).abs() > POS_DELTA_EPSILON
+            || (gp[1] - self.last_streamed[1]).abs() > POS_DELTA_EPSILON
+            || (gp[2] - self.last_streamed[2]).abs() > POS_DELTA_EPSILON
+        {
+            // `gs` diverged from what we last streamed → the server pushed a position this tick.
+            self.last_server_pos = Some(gp);
+        }
+        if let Some(sp) = self.last_server_pos {
+            let hgap2 = (sp[0] - view.pos[0]).powi(2) + (sp[1] - view.pos[1]).powi(2);
+            let vgap = (sp[2] - view.pos[2]).abs();
+            if !view.moving && hgap2 <= CORRECTION_SQ && vgap > POS_Z_RECONCILE_UNITS {
+                self.contested_z_ticks = self.contested_z_ticks.saturating_add(1);
+                if self.contested_z_ticks >= POS_Z_RECONCILE_TICKS {
+                    tracing::info!("#516: adopting contested server pos (z {:.2}→{:.2}) after {} idle ticks",
+                                   view.pos[2], sp[2], self.contested_z_ticks);
+                    *self.controller.pos_correction.lock().unwrap() = Some(sp);
+                    // Broadcast the reconciled position (delta derives from the still-old gs, below).
+                    self.send_position_update(stream, gs, sp[0], sp[1], sp[2], view.heading);
+                    gs.player_x = sp[0];
+                    gs.player_y = sp[1];
+                    gs.player_z = sp[2];
+                    gs.player_heading = view.heading;
+                    self.last_streamed = sp;
+                    self.last_pos_send = Instant::now();
+                    self.contested_z_ticks = 0;
+                    self.last_server_pos = None;
+                    return;
+                }
+            } else {
+                // Moving, converged, or only a horizontal disagreement — not a standing Z standoff.
+                self.contested_z_ticks = 0;
+                // Once the controller has converged onto the server Z, drop the target so a stale
+                // server position can never re-trigger a reconcile.
+                if vgap <= POS_Z_RECONCILE_UNITS { self.last_server_pos = None; }
+            }
         }
         // Normal: stream the controller's position at cadence, then mirror into gs for game logic.
         let pos = view.pos;
@@ -2380,42 +2537,16 @@ impl ActionLoop {
         x: f32, y: f32, z: f32,
         heading: f32,
     ) {
-        let dx = x - gs.player_x; // east  delta (server_x)
-        let dy = y - gs.player_y; // north delta (server_y)
-        let dz = z - gs.player_z;
-        let moving = dx != 0.0 || dy != 0.0 || dz != 0.0;
-        let anim: i32 = if moving { 1 } else { 0 };
-        // Internal heading is CCW (0=north, 90=west). The EQ wire (and server) expects
-        // CW (0=north, 90=east). The server decodes the wire heading via EQ12toFloat = wire/4,
-        // and EQ headings run 0..512 (= 0..360deg), so wire = EQ_units * 4 = deg_cw * 512/360 * 4
-        // = deg_cw * 2048/360. (Previously this used 4096/360 = 2x too large, so the server saw
-        // the wrong facing and melee never landed — IsFacingMob failed.)
-        // Internal heading is CCW (0=north, 90=west). EQ wire expects CW (0=north, 90=east).
-        // EQEmu decodes wire heading via EQ12toFloat = wire/4; full circle = 512 EQ units.
-        // So wire = cw_degrees * 512/360 * 4 = cw_degrees * 2048/360.
-        let h_cw = crate::eq_net::protocol::ccw_to_cw(heading);
-        let eq_heading = crate::eq_net::protocol::deg_cw_to_eq12_client(h_cw);
-
-        // RoF2 PlayerPositionUpdateClient_Struct (rof2_structs.h, 46 bytes):
-        //   0: sequence(u16)  2: spawn_id(u16)  4: vehicle_id(u16)=0
-        //   6: unknown[4]=0   10: delta_x(f32)  14: heading(u32 field, bits 0-11)
-        //  18: x_pos(f32)     22: delta_z(f32)  26: z_pos(f32)  30: y_pos(f32)
-        //  34: animation(u32 field, bits 0-9)   38: delta_y(f32)
-        //  42: delta_heading(u32 field, bits 0-9 signed) = 0
-        let mut buf = [0u8; 46];
-        buf[0..2].copy_from_slice(&self.position_seq.to_le_bytes()); // sequence
+        // Deltas derive from the still-old gs.player_* (the last-mirrored position); the epsilon gate
+        // + payload scrub live in the pure builder so the #516 wire guarantee is unit-testable.
+        let buf = build_position_update_payload(
+            self.position_seq,
+            gs.player_id as u16,
+            [x, y, z],
+            [gs.player_x, gs.player_y, gs.player_z],
+            heading,
+        );
         self.position_seq = self.position_seq.wrapping_add(1);
-        buf[2..4].copy_from_slice(&(gs.player_id as u16).to_le_bytes()); // spawn_id
-        // vehicle_id = 0 at [4..6], unknown[4] = 0 at [6..10] (already zeroed)
-        buf[10..14].copy_from_slice(&dx.to_le_bytes());   // delta_x
-        buf[14..18].copy_from_slice(&eq_heading.to_le_bytes()); // heading (12-bit in u32)
-        buf[18..22].copy_from_slice(&x.to_le_bytes());    // x_pos (server east)
-        buf[22..26].copy_from_slice(&dz.to_le_bytes());   // delta_z
-        buf[26..30].copy_from_slice(&z.to_le_bytes());    // z_pos (height)
-        buf[30..34].copy_from_slice(&y.to_le_bytes());    // y_pos (server north)
-        buf[34..38].copy_from_slice(&anim.to_le_bytes()); // animation (10-bit in u32)
-        buf[38..42].copy_from_slice(&dy.to_le_bytes());   // delta_y
-        // delta_heading at [42..46] = 0 (already zeroed)
         // Position is a transient firehose — send it UNRELIABLY (ack_req=false), exactly like the
         // native client and the server's own position broadcasts. Sending it on the reliable stream
         // (which we never retransmit) makes a single dropped datagram an unfillable sequence gap, so
@@ -2872,6 +3003,117 @@ mod tests {
             iterator, zone_id,
             server_x: pos[0], server_y: pos[1], server_z: pos[2], heading: 0.0,
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+    // #516 — outbound position sync. Observers saw the eqoxide player SLIDE + BLIP while it stood
+    // still (idle controller jitter emitted as tiny nonzero deltas + a flickering anim), and its
+    // nameplate BOUNCE to the waist and back (a contested-Z standoff the client re-fought forever).
+    // ─────────────────────────────────────────────────────────────────────────────────────────
+
+    fn read_f32(buf: &[u8; 46], at: usize) -> f32 { f32::from_le_bytes(buf[at..at + 4].try_into().unwrap()) }
+    fn read_i32(buf: &[u8; 46], at: usize) -> i32 { i32::from_le_bytes(buf[at..at + 4].try_into().unwrap()) }
+    // OP_ClientUpdate field offsets (see build_position_update_payload): delta_x@10, x_pos@18,
+    // delta_z@22, z_pos@26, y_pos@30, animation@34, delta_y@38.
+    const DX: usize = 10; const XP: usize = 18; const DZ: usize = 22; const ZP: usize = 26;
+    const YP: usize = 30; const ANIM: usize = 34; const DY: usize = 38;
+
+    /// **#516 PRIMARY — sub-epsilon controller jitter MUST be UNREPRESENTABLE on the wire.** The
+    /// render controller's gravity/ground-snap/depenetration jitters the "stationary" position by
+    /// ~1e-4 units. The OUTGOING payload for such a frame must carry EXACT-zero deltas and the idle
+    /// animation — because the EQEmu server force-relays any packet with `m_Delta != 0` OR a changed
+    /// anim to observers, and that is precisely the idle SLIDE + BLIP of #516. A genuine (> epsilon)
+    /// move must still carry its real nonzero deltas + the moving anim.
+    ///
+    /// MUTATION-CHECK: revert `build_position_update_payload`'s gate to the old exact `!= 0.0` test
+    /// and the jitter half goes RED — the 1e-4 deltas are copied onto the wire and the anim reads 1.
+    #[test]
+    fn sub_epsilon_jitter_is_scrubbed_to_zero_deltas_and_idle_anim() {
+        // A "standing still" frame that jitters by 1e-4 on every axis (well below POS_DELTA_EPSILON).
+        let prev = [100.0f32, 200.0, 76.9];
+        let cur  = [100.0 + 1e-4, 200.0 - 1e-4, 76.9 + 1e-4];
+        let jit = build_position_update_payload(7, 42, cur, prev, 0.0);
+
+        assert_eq!(read_f32(&jit, DX), 0.0, "idle jitter must emit EXACT-zero delta_x (#516)");
+        assert_eq!(read_f32(&jit, DY), 0.0, "idle jitter must emit EXACT-zero delta_y (#516)");
+        assert_eq!(read_f32(&jit, DZ), 0.0, "idle jitter must emit EXACT-zero delta_z (#516)");
+        assert_eq!(read_i32(&jit, ANIM), 0, "idle jitter must emit the IDLE animation (#516)");
+        // The POSITION itself is always the true current value — only the deltas/anim are scrubbed.
+        assert_eq!(read_f32(&jit, XP), cur[0], "x_pos is the real position, never scrubbed");
+        assert_eq!(read_f32(&jit, YP), cur[1], "y_pos is the real position, never scrubbed");
+        assert_eq!(read_f32(&jit, ZP), cur[2], "z_pos is the real position, never scrubbed");
+
+        // A genuine move (> epsilon) rides with its real nonzero deltas + the moving animation.
+        let moved = build_position_update_payload(8, 42, [105.0, 200.0, 76.9], prev, 0.0);
+        assert_eq!(read_f32(&moved, DX), 5.0, "a real move keeps its true delta_x");
+        assert_eq!(read_i32(&moved, ANIM), 1, "a real move reports the MOVING animation");
+        // A single axis over the threshold is enough to count as moving.
+        let z_only = build_position_update_payload(9, 42, [100.0, 200.0, 78.0], prev, 0.0);
+        assert_eq!(read_f32(&z_only, DZ), 78.0 - 76.9, "a real vertical move keeps its true delta_z");
+        assert_eq!(read_i32(&z_only, ANIM), 1, "a real vertical move reports the MOVING animation");
+    }
+
+    /// **#516 SECONDARY — a contested Z-only server correction MUST be ADOPTED, not re-fought.**
+    /// After a #goto floor-snap the server holds z≈73.97 while the controller keeps re-asserting its
+    /// collision-floor z≈76.9. The old streamer only adopted a >12u HORIZONTAL correction, so this
+    /// ~3u Z-only disagreement was clobbered every tick — eqoxide broadcast a Z that bounced between
+    /// the two, and observers saw the nameplate drop to the waist and pop back. The reconcile must
+    /// adopt the server position (via the controller teleport path) once the standoff PERSISTS while
+    /// GROUNDED, then broadcast the STABLE server Z.
+    ///
+    /// Gate (rubber-band safety): `!view.moving` is false for every airborne/falling frame, so a fall
+    /// or stair sync-lag delta is never adopted — the second half pins that a MOVING contest never
+    /// reconciles no matter how long it persists.
+    #[tokio::test]
+    async fn contested_z_only_server_correction_is_adopted_and_broadcast_stable() {
+        const SERVER_Z: f32 = 73.97; // server floor-snapped here after a #goto
+        const CTRL_Z:   f32 = 76.9;  // controller keeps re-asserting its collision floor
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+
+        // ── Grounded/idle standoff → ADOPTED after POS_Z_RECONCILE_TICKS ──
+        let mut nav = new_loop();
+        {
+            let mut v = nav.controller.controller_view.lock().unwrap();
+            v.initialized = true; v.moving = false; v.pos = [10.0, 20.0, CTRL_Z]; v.heading = 0.0;
+        }
+        nav.streamed_init = true;
+        nav.last_streamed = [10.0, 20.0, CTRL_Z];
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        gs.player_x = 10.0; gs.player_y = 20.0; gs.player_z = SERVER_Z; // the server's asserted Z
+
+        // Before the debounce elapses, nothing is adopted (mutation-sensitive to the tick threshold).
+        for _ in 0..(POS_Z_RECONCILE_TICKS - 1) { nav.stream_position(&mut stream, &mut gs); }
+        assert!(nav.controller.pos_correction.lock().unwrap().is_none(),
+            "a contested Z must NOT be adopted before it has persisted POS_Z_RECONCILE_TICKS");
+
+        // The tick that trips the threshold adopts the server position and re-mirrors gs onto it.
+        nav.stream_position(&mut stream, &mut gs);
+        assert_eq!(*nav.controller.pos_correction.lock().unwrap(), Some([10.0, 20.0, SERVER_Z]),
+            "the persistent contested-Z standoff must be handed to the controller (adopt server Z)");
+        assert_eq!(nav.last_streamed[2], SERVER_Z,
+            "after adoption eqoxide streams the SERVER Z, not its own collision-floor Z");
+        assert_eq!(gs.player_z, SERVER_Z, "game state converges onto the adopted server Z");
+
+        // And the payload it now broadcasts carries the stable server Z (not the old 76.9).
+        let payload = build_position_update_payload(0, 42, nav.last_streamed, nav.last_streamed, 0.0);
+        assert_eq!(read_f32(&payload, ZP), SERVER_Z, "the broadcast Z is the stable server value");
+        assert_eq!(read_f32(&payload, DZ), 0.0, "a settled char broadcasts a zero delta_z — no bounce");
+
+        // ── A MOVING contest is NEVER adopted (fall/stair rubber-band guard) ──
+        let mut nav2 = new_loop();
+        {
+            let mut v = nav2.controller.controller_view.lock().unwrap();
+            v.initialized = true; v.moving = true; v.pos = [10.0, 20.0, CTRL_Z]; v.heading = 0.0;
+        }
+        nav2.streamed_init = true;
+        nav2.last_streamed = [10.0, 20.0, CTRL_Z];
+        let mut gs2 = GameState::new();
+        gs2.player_id = 42;
+        gs2.player_x = 10.0; gs2.player_y = 20.0; gs2.player_z = SERVER_Z;
+        for _ in 0..(POS_Z_RECONCILE_TICKS * 3) { nav2.stream_position(&mut stream, &mut gs2); }
+        assert!(nav2.controller.pos_correction.lock().unwrap().is_none(),
+            "a MOVING (airborne) Z disagreement is fall/stair lag — it must NEVER be reconciled");
     }
 
     /// #368 — RESOLUTION IS NOT SUPPRESSED FOR SAME-ZONE. A same-zone DRNTP line (an intra-zone
