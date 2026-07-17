@@ -214,6 +214,10 @@ async fn post_cast(State(s): State<HttpState>, OptionalJson(body): OptionalJson<
             StatusCode::OK,
             serde_json::json!({
                 "status": outcome,
+                // Top-level unambiguous "did the spell land?" so a consumer that only checks the HTTP
+                // status can't mistake a fizzle/interrupt 200 for a successful land — `landed` is true
+                // ONLY for a completed cast (#448 review, Hunt 2).
+                "landed": outcome == "completed",
                 "spell_id": spell_id,
                 "spell": spell_name,
                 "message": line,
@@ -223,7 +227,7 @@ async fn post_cast(State(s): State<HttpState>, OptionalJson(body): OptionalJson<
         // refusal (no mana / no target / recast) — the cast definitively did not happen.
         Ok(Ok(CommandResult::Refused(reason))) => json(
             StatusCode::CONFLICT,
-            serde_json::json!({ "status": "refused", "reason": reason }),
+            serde_json::json!({ "status": "refused", "landed": false, "reason": reason }),
         ),
         // Unconfirmed, channel closed (Sender dropped — disconnect / zone change), or elapsed: the
         // outcome is genuinely UNKNOWN. The server-ended-but-unexplained case (a buff that won't stack)
@@ -232,6 +236,7 @@ async fn post_cast(State(s): State<HttpState>, OptionalJson(body): OptionalJson<
             StatusCode::ACCEPTED,
             serde_json::json!({
                 "status": "unconfirmed",
+                "landed": false,
                 "message": "cast sent, but the outcome is UNKNOWN — the server either ended the cast \
                             without explaining it (e.g. a beneficial spell that would not stack) or \
                             sent no confirmation within the timeout, or a zone change intervened. \
@@ -467,6 +472,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let text = body_text(resp).await;
         assert!(text.contains("\"status\":\"completed\""), "body: {text}");
+        assert!(text.contains("\"landed\":true"), "a completed cast must report landed:true: {text}");
         assert!(text.contains("\"spell_id\":202"), "body: {text}");
     }
 
@@ -482,6 +488,8 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let text = body_text(resp).await;
         assert!(text.contains("\"status\":\"fizzled\""), "a fizzle must report fizzled: {text}");
+        assert!(text.contains("\"landed\":false"),
+            "a fizzle must report landed:false so a status-code-only consumer can't read it as a land: {text}");
         assert!(!text.contains("\"status\":\"completed\""),
             "a fizzle must NEVER present as completed — the whole honesty invariant: {text}");
     }

@@ -149,8 +149,18 @@ enum CastSend {
 /// the parked `Sender`, no behavior change to the wire. Target priority is unchanged: explicit API
 /// target > current target > self, with ST_SELF spells always self-targeted and un-aimed beneficial
 /// spells self-cast (eqoxide#95). A never-started refusal records `finish_cast(cast_failed)` here —
-/// the same honest signal the fire-and-forget path already relied on (#348).
-fn send_cast(stream: &mut EqStream, gs: &mut GameState, req: crate::ipc::CastRequest) -> CastSend {
+/// the same honest signal the fire-and-forget path relied on (#348) — but ONLY when
+/// `record_never_started` is set.
+///
+/// `record_never_started` closes a false-Refused residual (#448 review): `finish_cast(cast_failed)`
+/// is a CLIENT-SIDE write to `gs.last_cast` (it never touches the server), so a UI fire-and-forget
+/// never-started cast, fired while an AWAITED cast is parked, would advance `last_cast` to
+/// `cast_failed` with a fresh `at` and let the next `fulfill_cast` resolve the AWAITED cast as a bogus
+/// `Refused` (with an unrelated "gem empty" reason). So the caller passes `false` whenever that write
+/// could reach a parked awaited cast (the awaited path itself, which reports via its `Sender` and does
+/// not need the write; and the UI path while a cast is parked). Safe-direction either way — it can
+/// never fabricate a success — but suppressing the stray write keeps the awaited result honest.
+fn send_cast(stream: &mut EqStream, gs: &mut GameState, req: crate::ipc::CastRequest, record_never_started: bool) -> CastSend {
     if let Some(item_slot) = req.item_slot {
         // Item "clicky" cast (teleport ring / port potion, etc.). Resolve the click spell from the
         // item currently at that wire slot and refuse if it isn't a clicky, so a stale slot can't fire
@@ -162,7 +172,7 @@ fn send_cast(stream: &mut EqStream, gs: &mut GameState, req: crate::ipc::CastReq
             // handler and this drain. Dropping it with only a tracing line meant the agent saw 200 and
             // then nothing at all — report the failure where the agent can read it (#348).
             let text = format!("Cannot cast: no clickable item in slot {item_slot}.");
-            gs.finish_cast(0, "cast_failed", &text);
+            if record_never_started { gs.finish_cast(0, "cast_failed", &text); }
             tracing::info!("EQ: item cast slot={} ignored — no clicky item at that slot", item_slot);
             return CastSend::NeverStarted(text);
         }
@@ -181,7 +191,7 @@ fn send_cast(stream: &mut EqStream, gs: &mut GameState, req: crate::ipc::CastReq
         // then ABSOLUTE SILENCE: no packet, no message, no event, no state change, indistinguishable
         // from a cast still in flight. (#348)
         let text = format!("Cannot cast: spell gem {} is empty.", req.gem);
-        gs.finish_cast(0, "cast_failed", &text);
+        if record_never_started { gs.finish_cast(0, "cast_failed", &text); }
         tracing::info!("EQ: cast gem={} ignored — empty gem", req.gem);
         return CastSend::NeverStarted(text);
     }
@@ -1340,10 +1350,14 @@ impl ActionLoop {
         // Cast a memorized spell gem (FIRE-AND-FORGET UI path). Target priority, ST_SELF/beneficial
         // self-targeting, empty-gem / stale-clicky refusal, and the wire packet all live in
         // `send_cast` now (shared with the awaited path below so both emit byte-identical traffic).
-        // The fire-and-forget path ignores the returned `CastSend`: a never-started refusal already
-        // records `finish_cast(cast_failed)` inside `send_cast`, exactly as before (#348).
+        // The fire-and-forget path ignores the returned `CastSend`: a never-started refusal records
+        // `finish_cast(cast_failed)` inside `send_cast` for the agent to read (#348) — but ONLY when no
+        // awaited cast is parked. That write lands in `gs.last_cast`, and a parked awaited cast's
+        // `fulfill_cast` correlates on `last_cast`, so a UI never-started write during a park would
+        // resolve the awaited cast as a bogus `Refused` (#448 review). `pending_cast.is_none()`
+        // gates the write off exactly when it could cross-talk; the wire packet is unaffected.
         if let Some(req) = self.command.take_cast() {
-            let _ = send_cast(stream, gs, req);
+            let _ = send_cast(stream, gs, req, self.pending_cast.is_none());
         }
 
         // Cast (AWAITED, honest Command-with-result path — POST /v1/combat/cast, #448): emit the SAME
@@ -1371,7 +1385,10 @@ impl ActionLoop {
                     "a cast is already in flight; retry after it resolves".into()));
                 tracing::info!("EQ: awaited cast REJECTED — one already in flight");
             } else {
-                match send_cast(stream, gs, req) {
+                // `record_never_started = false`: the awaited path reports a never-started refusal via
+                // its own `Sender` (below), so it does not need — and must not make — the `last_cast`
+                // write, keeping the cast machinery's published outcome untouched by a queued refusal.
+                match send_cast(stream, gs, req, false) {
                     CastSend::Started => {
                         self.pending_cast = Some(PendingCast { tx, sent_at: Instant::now() });
                         tracing::info!("EQ: awaited cast parked — awaiting outcome");
@@ -2717,6 +2734,41 @@ mod tests {
         for _ in 0..5 { nav.fulfill_cast(&gs); }
         assert!(nav.pending_cast.is_some(), "a silent cast must remain parked, never auto-succeed");
         assert!(resp.try_recv().is_err(), "no outcome may have been sent for a silent cast");
+    }
+
+    /// FALSE-REFUSED GUARD (#448 review, DEFECT 2): a UI fire-and-forget cast that never starts
+    /// (empty gem) writes `cast_failed` to `gs.last_cast` CLIENT-SIDE. While an awaited cast is parked,
+    /// that stray write must NOT resolve the awaited cast as a bogus `Refused` — the fire-and-forget
+    /// never-started `finish_cast` is suppressed while a park exists. The awaited cast stays parked and
+    /// only its OWN real outcome resolves it.
+    #[tokio::test]
+    async fn a_ui_never_started_cast_does_not_resolve_a_parked_awaited_cast() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_cast_gs(); // gem 2 real, gem 5 empty
+
+        // Awaited cast parks (gem 2 starts).
+        let (tx, mut resp) = tokio::sync::oneshot::channel();
+        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
+        nav.drain_cast(&mut stream, &mut gs);
+        assert!(nav.pending_cast.is_some(), "the awaited cast must be parked");
+
+        // A UI fire-and-forget cast of an EMPTY gem arrives on the same tick's next drain. Its
+        // client-side never-started write must be suppressed so it can't cross-talk into the park.
+        nav.command.request_cast(crate::ipc::CastRequest { gem: 5, target_id: None, item_slot: None });
+        nav.drain_cast(&mut stream, &mut gs);
+        nav.fulfill_cast(&gs);
+        assert!(nav.pending_cast.is_some(),
+            "a UI empty-gem cast must NOT resolve the parked awaited cast");
+        assert!(resp.try_recv().is_err(),
+            "no bogus Refused may be sent to the awaited cast by the UI never-started write");
+
+        // The awaited cast still resolves normally on its OWN real completion.
+        gs.finish_cast(202, "cast_completed", "You have finished casting Minor Healing.");
+        nav.fulfill_cast(&gs);
+        assert!(matches!(resp.try_recv(), Ok(CommandResult::Resolved(CastEnd { ref outcome, .. })) if outcome == "completed"),
+            "the awaited cast must still resolve completed on its own outcome");
+        assert!(nav.pending_cast.is_none());
     }
 
     /// SERVER REFUSAL AFTER PARK: a real cast-start refusal that reaches us after we parked
