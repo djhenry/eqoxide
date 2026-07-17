@@ -353,7 +353,19 @@ pub type AttackReq = Arc<Mutex<Option<bool>>>;
 
 /// Buy request — (merchant spawn id, merchant inventory slot), set by POST /v1/merchant/buy.
 /// Nav thread reads it and sends OP_ShopRequest (open) + OP_ShopPlayerBuy (buy that slot).
+/// This is the FIRE-AND-FORGET buy the UI merchant-window click uses; the honest awaited variant
+/// (POST /v1/merchant/buy over HTTP) rides the sibling [`BuyAwaitReq`] instead. (#448)
 pub type BuyReq = Arc<Mutex<Option<(u32, u32)>>>;
+
+/// Command-with-result buy request (A3 Migration 1, #448) — `(merchant spawn id, merchant slot,
+/// oneshot Sender)`. POST /v1/merchant/buy writes this and AWAITS the `Sender`; the nav thread
+/// drains it, sends the same OP_ShopRequest + OP_ShopPlayerBuy the fire-and-forget [`BuyReq`] path
+/// sends, and PARKS the `Sender` in `ActionLoop::pending_buy` until the resolving packet
+/// (OP_ShopPlayerBuy echo → `Resolved`, OP_ShopEndConfirm → `Refused`) is applied — or the HTTP
+/// timeout / a reaper yields `Unconfirmed`. Sibling of [`BuyReq`], NOT a replacement: the two slots
+/// coexist so the UI click path is unchanged. See `crate::command_state::result` for the flow.
+pub type BuyAwaitReq = Arc<Mutex<Option<(u32, u32,
+    oneshot::Sender<crate::command_state::CommandResult<crate::command_state::BuyOk>>)>>>;
 
 /// Sell request — (merchant spawn id, player inventory slot, quantity), set by POST /v1/merchant/sell.
 /// Nav thread reads it and sends OP_ShopRequest (open) + OP_ShopPlayerSell (sell that slot).
@@ -654,6 +666,8 @@ pub struct CombatSlots {
 pub struct MerchantSlots {
     pub merchant: MerchantShared,
     pub buy:      BuyReq,
+    /// The honest awaited-buy slot (A3 Migration 1, #448) — sibling of `buy`. See [`BuyAwaitReq`].
+    pub buy_await: BuyAwaitReq,
     pub sell:     SellReq,
     pub trade:    TradeReq,
 }
