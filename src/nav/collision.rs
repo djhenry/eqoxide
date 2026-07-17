@@ -505,6 +505,18 @@ pub const NAV_AGENT_HEIGHT: f32 = crate::traversability::PLAYER_BODY.agent_heigh
 /// two ends of a swim plan agree on what "floating" means.
 pub const FOOTING: f32 = 4.0;
 
+/// A reached floor within this of the goal's floor counts as the SAME tier. It is the single
+/// tolerance that has to agree in three places or the nav layer lies to itself: (1) `astar` accepts
+/// a searched cell as the goal only when its floor is within this of `goal_floor`; (2)
+/// `goal_z_was_snapped` uses it to decide the caller's z IS a real tier; and now (3) the arrival
+/// predicate (`steering::arrival_action`) uses it to decide the walker actually reached the goal's
+/// FLOOR, not a floor above/below it (#344). 8u is deliberately narrower than the 20u walk step-up:
+/// a zone-line region point measured 12.9u above its floor (gfaydark→felwithea) was a DIFFERENT tier
+/// than that floor, and the old ±20 window wrongly fused the two into a phantom tier (#229). 8u
+/// rejects that wrong tier while still tolerating standing height, water float, and a single step-up
+/// (the native STEP_UP is 2u). See the long note in `astar` where `goal_floor` is resolved.
+pub const GOAL_TIER_TOL: f32 = 8.0;
+
 /// How the planner is about to CHANGE the goal it was given (#337 honesty / water-nav design §4d).
 /// `Some` means the character will NOT arrive at the z the caller asked for — an accommodation,
 /// and an accommodation presented as compliance is a lie, so it rides `PlanReply` out to the agent
@@ -1409,7 +1421,6 @@ impl Collision {
     /// this function warned "SNAPPING to floor z=<pool bottom>" for a water goal the search was
     /// about to anchor to the surface.
     pub fn goal_z_was_snapped(&self, goal: [f32; 3]) -> Option<GoalSnap> {
-        const GOAL_TIER_TOL: f32 = 8.0;
         const GOAL_DROP: f32 = 400.0;
         // 1. A real tier at the caller's z is honoured as asked (`astar` aims the plan at it) —
         //    UNLESS that floor is UNDERWATER deeper than the arrival tolerance: the walker cannot
@@ -1439,6 +1450,43 @@ impl Collision {
         }
         // 4. No floor near the asked z at all: the dry column snap, reported.
         self.snap_goal_to_column_floor(goal).map(|z| GoalSnap::ToColumnFloor { z })
+    }
+
+    /// The z the walker PHYSICALLY comes to rest at when it has arrived at `goal` — the anchor the
+    /// arrival test (`steering::arrival_action`) compares the walker's z against, NOT the caller's
+    /// raw z. Its resolution order mirrors [`Collision::goal_z_was_snapped`] EXACTLY (the same chain
+    /// reported to the agent as `goal_z_snapped`), so what the planner PROMISED the agent and what
+    /// arrival DEMANDS cannot drift apart:
+    ///   • a sloppy goal z (0, a map coordinate) that `astar` projected onto a real floor does NOT
+    ///     cause a false "not arrived" — both ends agree on the resolved floor;
+    ///   • a goal genuinely on a DIFFERENT dry floor (an NPC one storey up, whose z IS a real tier
+    ///     here) resolves to THAT storey's floor, so the walker standing a storey below is
+    ///     > GOAL_TIER_TOL away in z and is honestly NOT arrived (#344); and
+    ///   • a goal on a SUBMERGED floor deeper than GOAL_TIER_TOL below the surface resolves to the
+    ///     WATER SURFACE, because the walker cannot dive and hold that depth — buoyancy floats it at
+    ///     the surface (design §4d). This is the `ToWaterSurface` accommodation `goal_z_was_snapped`
+    ///     reports; anchoring arrival to the submerged floor instead would demand a depth the walker
+    ///     physically never reaches, turning §4d's honest "arrived at the surface" into a permanent
+    ///     false "not arrived" / dishonest `blocked` (#344 review).
+    /// `None` only when there is no walkable floor anywhere in the goal's column — the same
+    /// `GoalNotWalkable` case `astar` fails loudly on; the caller falls back to the raw goal z.
+    pub fn resolve_goal_floor(&self, goal: [f32; 3]) -> Option<f32> {
+        const GOAL_DROP: f32 = 400.0; // a volume point can sit far above its floor
+        // 1. A real tier at the caller's z — but a tier submerged deeper than the arrival tolerance
+        //    is one the walker floats above, so arrival is at the SURFACE (mirrors clause 1 of
+        //    `goal_z_was_snapped`). `surface_z` is `None` for a dry tier or an unbounded column.
+        if let Some(f) = self.nearest_floor(goal[0], goal[1], goal[2], GOAL_TIER_TOL, GOAL_TIER_TOL) {
+            if let Some(s) = self.water.as_ref().and_then(|w| w.surface_z(goal[0], goal[1], f + 1.0)) {
+                if s - f > GOAL_TIER_TOL { return Some(s); }
+            }
+            return Some(f);
+        }
+        // 2. A goal floating in water anchors to the surface it floats on.
+        // 3. A volume point over a floor projects DOWN onto that floor.
+        // 4. No floor near the asked z: the nearest floor anywhere in the column.
+        self.floating_goal_surface(goal)
+            .or_else(|| self.floor_beneath(goal[0], goal[1], goal[2], GOAL_TIER_TOL, GOAL_DROP))
+            .or_else(|| self.snap_goal_to_column_floor(goal))
     }
 
     /// BEST-EFFORT route at an arbitrary grid resolution `cell`, optionally bounded to `max_search`
@@ -1819,7 +1867,7 @@ impl Collision {
                 ..Default::default()
             };
         }
-        const GOAL_TIER_TOL: f32 = 8.0; // reached floor within this of goal_floor == the right tier
+        // GOAL_TIER_TOL (module const): a reached floor within this of goal_floor == the right tier.
         // The goal's TIER: the walkable surface at the goal XY the caller means. On a zone with
         // stacked levels (neriakc, a walkway over a lower floor) the goal cell exists at several
         // heights; A* must finish on the one the caller asked for, else it routes the whole approach
@@ -3192,6 +3240,50 @@ mod tests {
         let dry = Collision::build(&assets, 8.0); // no water map at all
         assert_eq!(dry.goal_z_was_snapped(goal), None,
             "with no water the same goal is an ordinary honoured tier — no report");
+    }
+
+    /// #344 REVIEW: the arrival anchor must be the walker's PHYSICAL rest point, not `astar`'s
+    /// routing target. A goal on a submerged floor deeper than GOAL_TIER_TOL below the surface is
+    /// one the walker floats ABOVE (buoyancy rises; it cannot dive and hold depth). `astar` still
+    /// routes toward the submerged tier, but the walker comes to rest at `surface − float_depth`.
+    /// So `resolve_goal_floor` must yield the SURFACE, and arrival there must read `Arrived` — the
+    /// §4d "arrived at the surface, not the asked depth" promise. Anchoring to the submerged floor
+    /// instead makes a deep pool an eternal `Drive`, then a FALSE `blocked` claiming the goal "IS
+    /// reachable" — the exact honesty regression this test locks out. Mutation check: return the
+    /// submerged tier `f` from `resolve_goal_floor` (drop the `s − f > GOAL_TIER_TOL` clause) and
+    /// this goes RED (gdz ≈ 38 → Drive).
+    #[test]
+    fn deep_water_goal_arrives_at_the_surface_not_the_submerged_floor() {
+        use crate::nav::steering::{arrival_action, ArrivalAction};
+        let assets = ZoneAssets {
+            terrain: vec![slab(-40.0, 0.0, 64.0, 0.0, 48.0, true),   // pool bottom, 40u under water
+                          slab(0.0, 0.0, 64.0, 48.0, 96.0, true)],   // dry bank at the waterline
+            objects: vec![], textures: vec![],
+        };
+        let mut col = Collision::build(&assets, 8.0);
+        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::flat_below(0.0))));
+        let goal = [40.0, 24.0, -40.0]; // the caller NAMES the pool bottom, 40u down
+
+        // The anchor is the SURFACE (~0), never the -40 bottom.
+        let anchor = col.resolve_goal_floor(goal).expect("a submerged goal still resolves a floor");
+        assert!(anchor.abs() < 1.0,
+            "arrival must anchor to the waterline surface, not the -40 pool bottom (got {anchor})");
+
+        // The walker floats at surface − float_depth (2.0). With the surface anchor it has ARRIVED.
+        let walker_z = 0.0 - crate::traversability::PLAYER_BODY.float_depth;
+        let gdz = anchor - walker_z;
+        assert!(gdz.abs() <= crate::nav::collision::GOAL_TIER_TOL,
+            "floating at the surface is within the arrival tolerance of the surface anchor (gdz={gdz})");
+        assert_eq!(arrival_action(0.5, gdz, false), ArrivalAction::Arrived,
+            "a swimmer at the surface of a deep pool must ARRIVE, not churn to a false 'blocked'");
+
+        // And `goal_z_was_snapped` reports the very same surface — the two agree by construction.
+        match col.goal_z_was_snapped(goal) {
+            Some(GoalSnap::ToWaterSurface { surface_z }) =>
+                assert!((surface_z - anchor).abs() < 1e-3,
+                    "resolve_goal_floor and goal_z_was_snapped must name the same surface"),
+            other => panic!("a deep submerged goal must report ToWaterSurface, got {other:?}"),
+        }
     }
 
     /// `surface_z` returns `None` for an UNBOUNDED water column (still water 200u+ up). The goal
