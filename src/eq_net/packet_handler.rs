@@ -925,14 +925,19 @@ fn apply_new_zone(gs: &mut GameState, payload: &[u8]) {
     // carry identical zone fields, so there is nothing to redo.
     if gs.new_zone_applied { return; }
     gs.new_zone_applied = true;
-    // Purge the previous zone's spawns and doors (#270): OP_NewZone fires on EVERY server-driven zone
-    // entry — normal travel, a same-zone #zone, AND a death-respawn — and each one arrives on a fresh
-    // zone-server session, whose handshake re-arms the flag above via `begin_zone_in`. Without the
-    // purge, respawns and re-zones accumulate stale + duplicate cross-zone entities, so name→position
-    // resolution (goto/follow/merchant/target-by-name) picks ghosts. The spawn/door stream that
-    // follows OP_ReqClientSpawn repopulates the new zone; sync_entities full-replaces the HTTP maps.
-    gs.doors.clear();
-    gs.entities.clear();
+    // DO NOT purge spawns/doors here (#527rc, agent-honesty). Verified against EQEmu's wire ordering
+    // (common/patches/rof2.cpp ENCODE(OP_ZoneSpawns):4575-4934 splits the near-bulk into a burst of
+    // individual OP_ZoneEntry packets; zone/client_packet.cpp Handle_Connect_OP_ZoneEntry queues the
+    // self-spawn + every ≤600u near spawn via default-arg FastQueuePacket — i.e. sent IMMEDIATELY —
+    // and only THEN queues the first OP_NewZone): the near spawns (Katie, the guards standing next to
+    // you) arrive on the reliable stream STRICTLY BEFORE this first OP_NewZone. A purge here therefore
+    // wiped every already-registered near spawn, leaving only the far/delayed spawns (held server-side
+    // until after OP_ClientReady) — a silently-incomplete world where nearby entities are invisible.
+    // The correct, race-free purge is `begin_zone_in`, called at the TOP of every zone-entry handshake
+    // (login.rs ReconnectZone; gameplay.rs run_zone_entry_handshake) BEFORE we even send OP_ZoneEntry,
+    // so no NEW-zone spawn can arrive before it and nothing STALE from the prior zone can arrive after
+    // it (each zone-in is a fresh zone-server session). #270's stale-entity concern is fully covered
+    // there; re-clearing here only ever destroyed live data. sync_entities full-replaces the HTTP maps.
     // RoF2 NewZone_Struct (rof2_structs.h, 948 bytes). Use direct byte offsets
     // to avoid struct-padding issues with the packed 948-byte layout.
     // zone_short_name[128] @ offset 64
@@ -2852,17 +2857,38 @@ mod tests {
     }
 
     #[test]
-    fn new_zone_clears_stale_entities_from_prior_zone() {
-        // #270: OP_NewZone fires on every server-driven zone entry (travel, same-zone #zone,
-        // death-respawn) and must purge the previous zone's spawns, or respawns/re-zones leak
-        // stale + duplicate cross-zone entities into name→position resolution. The spawn stream
-        // that follows repopulates the map for the new zone.
+    fn begin_zone_in_clears_stale_entities_from_prior_zone() {
+        // #270: a server-driven zone entry (travel, same-zone #zone, death-respawn) must purge the
+        // previous zone's spawns, or respawns/re-zones leak stale + duplicate cross-zone entities into
+        // name→position resolution. That purge is `begin_zone_in`, run at the TOP of every zone-entry
+        // handshake before OP_ZoneEntry is even sent — NOT `apply_new_zone` (see #527rc: the near-spawn
+        // burst arrives before the first OP_NewZone, so purging there wiped live near spawns).
         let mut gs = GameState::new();
         gs.entities.insert(1, test_entity(1, "Fippy_Darkpaw", 100.0));
         gs.entities.insert(2, test_entity(2, "a_gnoll_pup", 100.0));
         assert_eq!(gs.entities.len(), 2);
-        super::apply_new_zone(&mut gs, &new_zone_payload("qeynos2", 2));
-        assert!(gs.entities.is_empty(), "prior-zone entities must be cleared on zone entry (#270)");
+        gs.begin_zone_in();
+        assert!(gs.entities.is_empty(), "prior-zone entities must be cleared at zone entry (#270)");
+    }
+
+    #[test]
+    fn first_new_zone_does_not_wipe_near_spawns_that_preceded_it() {
+        // #527rc regression (agent-honesty): the real EQEmu wire order at zone-in is self-spawn +
+        // every ≤600u near spawn (each an individual OP_ZoneEntry) FIRST, then the first OP_NewZone.
+        // apply_new_zone must NOT purge, or those already-registered near spawns (the player standing
+        // next to you, the guards) vanish while only far/delayed spawns survive — a silently incomplete
+        // world. Models the true order: begin_zone_in (handshake clear) → near spawns land → OP_NewZone.
+        let mut gs = GameState::new();
+        gs.begin_zone_in(); // handshake clear, before OP_ZoneEntry is sent
+        // Near-bulk spawns arrive (self-spawn + nearby NPCs), registered before OP_NewZone.
+        gs.entities.insert(511, test_entity(511, "Katie", 100.0));
+        gs.entities.insert(1291, test_entity(1291, "Guard_Frostfallen002", 100.0));
+        assert_eq!(gs.entities.len(), 2);
+        super::apply_new_zone(&mut gs, &new_zone_payload("gfaydark", 54));
+        assert_eq!(gs.entities.len(), 2,
+            "near spawns that arrived before the first OP_NewZone must survive it (#527rc)");
+        assert!(gs.entities.contains_key(&511), "Katie must not be wiped by OP_NewZone");
+        assert!(gs.entities.contains_key(&1291), "Guard Frostfallen must not be wiped by OP_NewZone");
     }
 
     #[test]
@@ -2973,24 +2999,29 @@ mod tests {
     }
 
     #[test]
-    fn new_zone_still_clears_on_the_next_zone_in() {
+    fn next_zone_in_purges_the_prior_zone_via_begin_zone_in() {
         // The once-per-zone-in guard (#322) is re-armed by begin_zone_in at the top of each
-        // zone-entry handshake, so a real zone change still purges the previous zone (#270) —
-        // including a spawn that lands between the handshake's clear and OP_NewZone.
+        // zone-entry handshake, and begin_zone_in is what purges the previous zone (#270). A real
+        // zone change therefore still drops the prior zone's spawns/doors — via the handshake clear,
+        // NOT via apply_new_zone (which must never purge, #527rc). Spawns that land AFTER that clear
+        // (this zone's own near/far spawns) survive OP_NewZone.
         let mut gs = GameState::new();
         gs.begin_zone_in();
         super::apply_new_zone(&mut gs, &new_zone_payload("qeynos2", 2));
         gs.entities.insert(1, test_entity(1, "Guard_Jordan", 100.0));
         super::apply_spawn_doors(&mut gs, &door_record(7));
 
-        gs.begin_zone_in(); // next zone-server session
-        // Stale arrivals between the handshake's clear and OP_NewZone must still be purged by it.
-        gs.entities.insert(2, test_entity(2, "Guard_Jordan", 100.0));
+        gs.begin_zone_in(); // next zone-server session — THIS is the purge of the prior zone
+        assert!(gs.entities.is_empty(), "begin_zone_in must purge the prior zone's entities (#270)");
+        assert!(gs.doors.is_empty(), "begin_zone_in must purge the prior zone's doors (#270)");
+
+        // The new zone's own spawns arrive after the handshake clear and before OP_NewZone; they stay.
+        gs.entities.insert(2, test_entity(2, "Guard_Frostfallen", 100.0));
         super::apply_spawn_doors(&mut gs, &door_record(4));
         super::apply_new_zone(&mut gs, &new_zone_payload("freporte", 9));
 
-        assert!(gs.entities.is_empty(), "a real zone change must still purge entities (#270)");
-        assert!(gs.doors.is_empty(), "a real zone change must still purge doors (#270)");
+        assert_eq!(gs.entities.len(), 1, "new-zone spawns must survive the first OP_NewZone (#527rc)");
+        assert_eq!(gs.doors.len(), 1, "new-zone doors must survive the first OP_NewZone (#527rc)");
         assert_eq!(gs.zone_name, "freporte");
         assert_eq!(gs.zone_id, 9);
     }
