@@ -1045,41 +1045,61 @@ impl Collision {
     ///
     /// **HONESTY GUARD (#403).** A pad becomes a [`PadEdge`] ONLY when BOTH ends resolve to walkable
     /// floor:
-    /// * the footprint has a reachable interior floor point (the same projection zone-line goals use,
-    ///   [`find_zone_line_near`] → `zone_line_floor_point`, which also confirms standing there is
-    ///   INSIDE the region so the crossing would actually fire), AND
+    /// * a footprint LEAF has a standable trigger floor — a floor in its column a character could
+    ///   stand on such that the auto-cross would fire ([`teleport_pad_source`], which validates the
+    ///   SAME `zone_line_at`-at-standing-height condition the mover uses), AND
     /// * the advertised destination snaps to a floor.
     ///
-    /// An `index` that is not a DRNTP region in this zone's `.wtr`, or a destination out over the
-    /// void (no floor in its column), yields NO edge — the planner must never invent a link that
-    /// would strand the character, which would be the inverse honesty bug (unreachable reported
-    /// reachable). O(pads) cache reads + a couple of floor probes each; pads are a handful per zone.
+    /// **One edge PER LEAF (#403 review A).** A same-index DRNTP footprint can be baked as several
+    /// horizontally-separated leaves, and A* may only be able to reach SOME of them; emitting an edge
+    /// for every leaf with a standable trigger (all sharing the one destination) means a leaf in the
+    /// character's own reachable component always fires — a single arbitrary leaf could sit in a
+    /// component A* can't reach and give a FALSE `Unreachable`.
+    ///
+    /// An `index` that is not a DRNTP region in this zone's `.wtr`, a leaf whose trigger volume FLOATS
+    /// above its floor (no standable point fires the cross — a #266-style translocator), or a
+    /// destination out over the void (no floor in its column), yields NO edge for that case — the
+    /// planner must never invent a link that would strand the character (the inverse honesty bug:
+    /// unreachable reported reachable). O(leaves) cache reads + a couple of floor probes each.
     pub fn resolve_teleport_pads(&self, advertised: &[(i32, [f32; 3])]) -> Vec<PadEdge> {
         const STEP_UP: f32 = 20.0;
         const MAX_DROP: f32 = 100.0;
-        advertised.iter().filter_map(|&(index, dest)| {
-            // SOURCE: a reachable floor point INSIDE the footprint — one a character could actually
-            // STAND on such that the auto-cross would fire. Project every same-index DRNTP region
-            // down to the floor beneath it and KEEP ONLY points that are still inside the region at
-            // standing height (`zone_line_floor_point`, the SAME inside-region gate the movement side
-            // uses via `find_reachable_in_zone_line`). `None` = the footprint FLOATS above its floor
-            // (a #266-style tall translocator) or has no walkable floor at all → NO edge, because a
-            // pad the walker cannot trigger by standing on it would make the planner report a `Route`
-            // the walker can't take (it arrives, nothing teleports, it walks the discontinuity
-            // off-mesh) — the inverse honesty bug. We deliberately do NOT fall back to
-            // `find_zone_line_near`'s raw region point (an interior VOLUME z that is not a standable
-            // trigger), which is exactly the un-gated path #403's review flagged.
-            let source = self.zone_line_regions.iter()
-                .filter(|(idx, _)| *idx == index)
-                .filter_map(|&(idx, p)| self.zone_line_floor_point(idx, p))
-                .next()?;
+        let mut out = Vec::new();
+        for &(index, dest) in advertised {
             // DEST: snap the advertised arrival onto walkable floor. `None` (void — no floor anywhere
-            // in the destination column) → no edge, rather than a link that drops the character into
-            // nothing.
-            let dz = self.nearest_floor(dest[0], dest[1], dest[2], STEP_UP, MAX_DROP)
-                .or_else(|| self.snap_goal_to_column_floor(dest))?;
-            Some(PadEdge { index, source, dest: [dest[0], dest[1], dz] })
-        }).collect()
+            // in the destination column) → no edge for this pad, rather than a link that drops the
+            // character into nothing.
+            let Some(dz) = self.nearest_floor(dest[0], dest[1], dest[2], STEP_UP, MAX_DROP)
+                .or_else(|| self.snap_goal_to_column_floor(dest)) else { continue };
+            let dest_floor = [dest[0], dest[1], dz];
+            // SOURCE: one edge per footprint LEAF of this index that has a standable trigger floor.
+            for &(idx, p) in self.zone_line_regions.iter().filter(|(i, _)| *i == index) {
+                if let Some(source) = self.teleport_pad_source(idx, p) {
+                    out.push(PadEdge { index, source, dest: dest_floor });
+                }
+            }
+        }
+        out
+    }
+
+    /// The standable trigger floor point inside a DRNTP footprint leaf whose representative interior
+    /// point is `p` (server coords), or `None` if no floor a character could stand on is inside the
+    /// region (a floating / #266 leaf).
+    ///
+    /// This mirrors the MOVER's auto-cross condition — `zone_line_at` at the character's STANDING
+    /// height (`action_loop.rs`) — so the planner and mover CANNOT diverge (a divergence would be a
+    /// false `Unreachable`, exactly #403's bug class). It scans the footprint's whole COLUMN for a
+    /// walkable floor (not the tight 2u probe `zone_line_floor_point` uses — that helper serves a
+    /// zone-line GOAL, and its ±2u window can miss the real trigger floor of a footprint whose
+    /// representative point sits low in a tall straddling volume, #403 review C) and keeps the first
+    /// (highest) floor where standing (feet + 1u) is still inside the region.
+    fn teleport_pad_source(&self, index: i32, p: [f32; 3]) -> Option<[f32; 3]> {
+        const STEP_H: f32 = 20.0;
+        const REGION_DROP: f32 = 400.0;
+        self.column_floors(p[0], p[1], p[2], STEP_H, REGION_DROP).into_iter()
+            .find(|&fz| self.water.as_ref()
+                .and_then(|w| w.zone_line_at(p[0], p[1], fz + 1.0)) == Some(index))
+            .map(|fz| [p[0], p[1], fz])
     }
 
     #[inline]
@@ -2827,16 +2847,21 @@ impl Collision {
         let mut path = Vec::new();
         let mut cur = goal_key;
         while cur != skey {
-            let (c, r, _) = cur;
+            let (c, r, fb) = cur;
             let ctr = center(c, r);
             // A TELEPORT-PAD endpoint waypoint (#403) is snapped to its EXACT resolved point, not the
             // 8u cell centre: the SOURCE must be a point KNOWN to be inside the trigger footprint (a
             // cell centre can fall just outside a sub-cell footprint, so the auto-cross never fires and
             // the walker walks the discontinuity off-mesh), and the DEST is the real arrival the route
-            // continues from. Both were resolved+validated by `resolve_teleport_pads`.
+            // continues from. Both were resolved+validated by `resolve_teleport_pads`. Match the FULL
+            // key — cell AND floor bucket (#403 review B): a multi-level zone can route through the
+            // pad's (col,row) at an UNRELATED z-tier, and snapping that waypoint to the pad endpoint's
+            // z would inject a spurious vertical jump the walker clips/falls on.
             let wp = ctx.teleport_pads.iter().find_map(|p| {
-                if (c, r) == to_cell(p.dest[0], p.dest[1])        { Some(p.dest) }
-                else if (c, r) == to_cell(p.source[0], p.source[1]) { Some(p.source) }
+                let dc = to_cell(p.dest[0], p.dest[1]);
+                let sc = to_cell(p.source[0], p.source[1]);
+                if (c, r) == dc && fb == qf(p.dest[2])        { Some(p.dest) }
+                else if (c, r) == sc && fb == qf(p.source[2]) { Some(p.source) }
                 else { None }
             }).unwrap_or_else(|| {
                 // Carry each waypoint's actual floor height so the walker moves + collision-checks at
@@ -2899,6 +2924,11 @@ impl Collision {
         let inset_trav = crate::traversability::Traversability::new(self, radius, cell, 0.0, false);
         for i in 0..path.len() {
             let [x, y, z] = path[i];
+            // A TELEPORT-PAD endpoint (#403 review D) must NOT be inset: near a footprint/ledge the
+            // inset could nudge the SOURCE back OUT of the trigger volume (so the auto-cross never
+            // fires) or move the DEST off its resolved arrival. These points were already validated
+            // occupiable/standable by `resolve_teleport_pads`; leave them exactly where they are.
+            if ctx.teleport_pads.iter().any(|p| path[i] == p.source || path[i] == p.dest) { continue; }
             let mut push = [0.0f32, 0.0f32];
             // A side is a hazard if the FLOOR runs out there (edge) OR a WALL stands there. Both
             // push away; opposing hazards (a corridor's two walls, a bridge's two rails) CANCEL, so
@@ -3304,6 +3334,36 @@ mod tests {
         assert!(pads.is_empty(),
             "a floating footprint with no standable trigger floor must create NO edge (its auto-cross \
              would never fire — a Route the walker can't take), got {pads:?}");
+    }
+
+    /// HONESTY (#403 review A): a same-index footprint baked as SEVERAL horizontally-separated leaves
+    /// must emit an edge for EVERY standable leaf, not just the first — else A* could be handed the
+    /// one leaf sitting in a component it can't reach and report a FALSE `Unreachable` while a
+    /// reachable leaf of the SAME pad exists.
+    #[test]
+    fn pad_emits_one_edge_per_footprint_leaf() {
+        let quad = |v: Vec<[f32; 3]>| MeshData {
+            positions: v, normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
+            texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        // One big walkable slab (east[-120,0] × north[0,80]) so both footprint bands sit on floor.
+        let slab = quad(vec![[0.0, 0.0, -120.0], [80.0, 0.0, -120.0], [80.0, 0.0, 0.0], [0.0, 0.0, 0.0]]);
+        let mut col = Collision::build(
+            &ZoneAssets { terrain: vec![slab], objects: vec![], textures: vec![] }, 8.0);
+        const IDX: i32 = 42;
+        // Two footprint leaves of the SAME index: north[10,25] and north[45,60], both east[-40,-16].
+        col.set_water(Some(std::sync::Arc::new(
+            crate::region_map::RegionMap::zone_line_two_boxes(10.0, 25.0, 45.0, 60.0, -40.0, -16.0, -5.0, 5.0, IDX))));
+        // Destination on the same slab (a walkable floor) so the DEST guard is satisfied and the test
+        // isolates the SOURCE per-leaf behaviour.
+        let edges = col.resolve_teleport_pads(&[(IDX, [-70.0, 40.0, 0.0])]);
+        assert_eq!(edges.len(), 2,
+            "a two-leaf footprint must yield one PadEdge PER leaf (both standable), got {edges:?}");
+        // The two sources sit in the two distinct north bands; both share the one destination.
+        let norths: Vec<f32> = edges.iter().map(|e| e.source[1]).collect();
+        assert!(norths.iter().any(|&n| (10.0..=25.0).contains(&n)), "a source in band A: {norths:?}");
+        assert!(norths.iter().any(|&n| (45.0..=60.0).contains(&n)), "a source in band B: {norths:?}");
     }
 
     /// #257: the net-thread wall-clock budget (PLAN_BUDGET_MS) must be generous enough that a

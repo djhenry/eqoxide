@@ -126,6 +126,32 @@ impl RegionMap {
         ]}
     }
 
+    /// Test-only: TWO same-`index` zone-line (`DRNTP`) footprint leaves — one in each north band
+    /// `[na0,na1]` and `[nb0,nb1]`, both over east `[e0,e1]` and z-slab `[zbot,ztop]`. Models a pad
+    /// footprint baked as several horizontally-separated leaves (#403 review A): the planner must
+    /// emit an edge for EACH standable leaf, not just the first.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn zone_line_two_boxes(na0: f32, na1: f32, nb0: f32, nb1: f32,
+        e0: f32, e1: f32, zbot: f32, ztop: f32, index: i32) -> RegionMap {
+        let dry = BspNode { normal: [0.0; 3], split: 0.0, special: 0, left: 0, right: 0, zone_line_index: 0 };
+        let zl  = BspNode { normal: [0.0; 3], split: 0.0, special: REGION_ZONE_LINE, left: 0, right: 0, zone_line_index: index };
+        // Leaves: dry=9, zl_a=10, zl_b=11 (two distinct zone-line leaves, same index).
+        RegionMap { nodes: vec![
+            BspNode { normal: [ 0.0, 1.0, 0.0], split: -e0,  special: 0, left: 2,  right: 9, zone_line_index: 0 }, // east >= e0
+            BspNode { normal: [ 0.0,-1.0, 0.0], split:  e1,  special: 0, left: 3,  right: 9, zone_line_index: 0 }, // east <= e1
+            BspNode { normal: [ 0.0, 0.0, 1.0], split: -zbot,special: 0, left: 4,  right: 9, zone_line_index: 0 }, // z    >= zbot
+            BspNode { normal: [ 0.0, 0.0,-1.0], split:  ztop,special: 0, left: 5,  right: 9, zone_line_index: 0 }, // z    <= ztop
+            BspNode { normal: [ 1.0, 0.0, 0.0], split: -na0, special: 0, left: 6,  right: 9, zone_line_index: 0 }, // north >= na0 ? : dry
+            BspNode { normal: [-1.0, 0.0, 0.0], split:  na1, special: 0, left: 10, right: 7, zone_line_index: 0 }, // north <= na1 → box A, else box B?
+            BspNode { normal: [ 1.0, 0.0, 0.0], split: -nb0, special: 0, left: 8,  right: 9, zone_line_index: 0 }, // north >= nb0 ?
+            BspNode { normal: [-1.0, 0.0, 0.0], split:  nb1, special: 0, left: 11, right: 9, zone_line_index: 0 }, // north <= nb1 → box B
+            dry, // 9
+            zl,  // 10 (box A)
+            zl,  // 11 (box B)
+        ]}
+    }
+
     /// Load `<dir>/<zone>.wtr` (v1 or v2 BSP). Returns None if missing or unparseable (nav then just
     /// behaves as before — no water descents, no region-based zone crossing).
     pub fn load(dir: &Path, zone: &str) -> Option<RegionMap> {
