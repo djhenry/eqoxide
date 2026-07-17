@@ -111,7 +111,13 @@ fn record_probe_reply(h: &mut crate::ipc::NetHealth, now: std::time::Instant) {
 /// earlier wedge would sit older than every later probe forever, making the answered-clause
 /// `last_packet_ago <= first_unanswered_sent_ago` permanently true → a confident false-ALIVE that
 /// hides the re-wedge (the worst honesty class).
-fn record_app_packet(h: &mut crate::ipc::NetHealth, now: std::time::Instant) {
+///
+/// #419: this is the SOLE writer of `last_packet`. `login.rs`'s handshake drain used to stamp
+/// `last_packet` directly (bypassing the streak-clear above), which was a latent false-alive seam —
+/// any code path that sets `last_packet` without also clearing `first_unanswered_probe_sent` can
+/// make `world_responsive` report alive from a timestamp the canonical health machinery never
+/// vetted. `pub(crate)` so `login.rs` routes its stamp through here too.
+pub(crate) fn record_app_packet(h: &mut crate::ipc::NetHealth, now: std::time::Instant) {
     h.last_packet = now;
     h.first_unanswered_probe_sent = None;
 }
@@ -1554,5 +1560,85 @@ mod wedge_timeline_tests {
         // And the timeline must run well past that re-wedge so this isn't a boundary fluke.
         assert!(run_secs - re_wedge.unwrap() > PROBE_TIMEOUT_SECS,
             "timeline too short to confirm the re-wedge verdict holds");
+    }
+}
+
+/// #419: proves *why* `login.rs`'s handshake drain must route its `last_packet` stamp through
+/// `record_app_packet` instead of writing the field directly.
+///
+/// `NetHealthShared` is a single `Arc` held across the WHOLE client lifetime — `run_login_phase` is
+/// called in a retry loop over the same handle (see `login.rs`), and the same handle is later handed
+/// into `run_gameplay_phase`. So a probe streak left outstanding by an EARLIER gameplay session (a
+/// real wedge that led to a camp/disconnect/relogin) can still be sitting in `NetHealth` when the
+/// client reconnects and re-enters the login handshake. These tests drive that exact reconnect
+/// timeline through both the old bypassing write and the fixed `record_app_packet` call, to show the
+/// bypass produces a PERMANENT false-alive (masking a brand new wedge forever) while routing through
+/// the canonical recorder does not.
+#[cfg(test)]
+mod login_reconnect_liveness_tests {
+    use super::record_app_packet;
+    use crate::ipc::{world_responsive, NetHealth, PROBE_TIMEOUT_SECS};
+    use std::time::{Duration, Instant};
+
+    /// Build the "just reconnected" starting state: a prior gameplay session's probe streak has been
+    /// outstanding since `base` (already well past timeout), and the login handshake's first inbound
+    /// packet arrives 65s later.
+    fn reconnect_state() -> (NetHealth, Instant, Instant) {
+        let base = Instant::now();
+        let h = NetHealth {
+            last_datagram: base, last_packet: base, last_tick: base,
+            last_probe_sent: Some(base), last_probe_reply: None,
+            first_unanswered_probe_sent: Some(base),
+        };
+        let login_packet_at = base + Duration::from_secs(65);
+        (h, base, login_packet_at)
+    }
+
+    /// The bug: a raw `h.last_packet = now()` (what `login.rs` used to do) leaves the stale
+    /// pre-reconnect `first_unanswered_probe_sent` in place. Because the new `last_packet` timestamp
+    /// is strictly newer than that stale streak-start, `last_packet_ago <= first_unanswered_sent_ago`
+    /// (the answered-clause) becomes true for ALL future reads — so a brand new wedge that begins the
+    /// moment gameplay resumes, with no further app traffic ever again, still reads as alive.
+    #[test]
+    fn a_raw_last_packet_write_would_permanently_hide_a_post_reconnect_wedge() {
+        let timeout = Duration::from_secs(PROBE_TIMEOUT_SECS);
+        let (mut h, _base, login_packet_at) = reconnect_state();
+        h.last_packet = login_packet_at; // the bypassing write this test proves is dangerous
+
+        // A brand new wedge starts right after login; no further app traffic ever arrives. Check the
+        // verdict long past PROBE_TIMEOUT_SECS into that silence.
+        let check_at   = login_packet_at + Duration::from_secs(PROBE_TIMEOUT_SECS * 3);
+        let sent_ago   = check_at.duration_since(h.first_unanswered_probe_sent.unwrap());
+        let packet_ago = check_at.duration_since(h.last_packet);
+        let verdict    = world_responsive(Some(sent_ago), None, packet_ago, timeout);
+
+        assert!(verdict, "bypassing write: the stale pre-reconnect streak makes a brand-new, \
+            never-ending wedge read as alive forever — the exact false-alive seam #419 closes");
+    }
+
+    /// The fix: routing the same handshake stamp through `record_app_packet` clears the stale streak,
+    /// so a genuine new wedge after reconnect is detected instead of being permanently hidden.
+    #[test]
+    fn routing_through_record_app_packet_lets_a_post_reconnect_wedge_be_detected() {
+        let timeout = Duration::from_secs(PROBE_TIMEOUT_SECS);
+        let (mut h, _base, login_packet_at) = reconnect_state();
+        record_app_packet(&mut h, login_packet_at); // the fixed login.rs call
+
+        assert!(h.first_unanswered_probe_sent.is_none(),
+            "record_app_packet must clear the stale pre-reconnect streak, not just stamp last_packet");
+
+        // Gameplay resumes and, after its own quiet threshold, sends its own fresh probe — which is
+        // never answered (a genuine new wedge).
+        let probe_start = login_packet_at + Duration::from_secs(5);
+        h.first_unanswered_probe_sent = Some(probe_start);
+        h.last_probe_sent = Some(probe_start);
+
+        let check_at   = probe_start + Duration::from_secs(PROBE_TIMEOUT_SECS * 3);
+        let sent_ago   = check_at.duration_since(probe_start);
+        let packet_ago = check_at.duration_since(h.last_packet);
+        let verdict    = world_responsive(Some(sent_ago), None, packet_ago, timeout);
+
+        assert!(!verdict, "with the stale streak cleared on reconnect, the new wedge is detected on \
+            its own timeline instead of being masked by the old one");
     }
 }
