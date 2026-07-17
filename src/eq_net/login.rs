@@ -14,7 +14,7 @@ use des::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::No
 use des::Des;
 
 use crate::config::{CharacterCreate, LoginConfig};
-use crate::eq_net::gameplay::{run_gameplay_phase};
+use crate::eq_net::gameplay::{record_app_packet, run_gameplay_phase};
 use crate::eq_net::action_loop::ActionLoop;
 use crate::eq_net::packet_handler::apply_packet;
 use crate::eq_net::protocol::*;
@@ -168,7 +168,11 @@ async fn run_login_phase(
         while let Ok(packet) = net_rx.try_recv() {
             // Apply gameplay side effects.
             apply_packet(&mut gs, &packet);
-            net_health.lock().unwrap().last_packet = std::time::Instant::now();
+            // #419: route through the canonical recorder (was a direct `last_packet = now()`
+            // stamp) so this is not a second writer of the liveness timestamp — see
+            // `record_app_packet`'s doc comment in gameplay.rs for why a bypassing writer is a
+            // false-alive seam.
+            record_app_packet(&mut net_health.lock().unwrap(), std::time::Instant::now());
 
             // Handle login-protocol state transitions.
             match proto.handle(&packet, &mut stream, &gs) {
