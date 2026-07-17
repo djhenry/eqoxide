@@ -68,11 +68,12 @@ pub struct PlanReply {
     pub outcome: PlanOutcome,
     /// How long the search actually took. This is the stall that used to land on the NET THREAD.
     pub plan_ms: u128,
-    /// `Some(z)` when the caller's goal z could not be resolved to any tier and the planner SNAPPED
-    /// the goal to the nearest floor in its column. The client has changed the agent's goal, so the
-    /// agent is told (`nav_reason: goal_z_snapped`) — an accommodation presented as compliance is a
-    /// lie, and this one would otherwise report `arrived` at a z nobody asked for (#377 review).
-    pub goal_snapped_z: Option<f32>,
+    /// `Some` when the planner is CHANGING the caller's goal: the asked z resolves to no tier and
+    /// gets snapped to the column's floor, or it is SUBMERGED and the walker will arrive floating
+    /// at the water surface instead (design §4d). The agent is told (`nav_reason: goal_z_snapped`
+    /// + the message log) — an accommodation presented as compliance is a lie, and this one would
+    /// otherwise report `arrived` at a z nobody asked for / never reached (#377 review).
+    pub goal_snapped: Option<crate::nav::collision::GoalSnap>,
     /// The per-route TIER (#378 Phase 2 / design §4c): `true` = this route only existed at the
     /// MINIMUM clearance (a tight door/bridge threaded with no margin — a riskier path). Published
     /// as `nav_tier` on /v1/observe/debug so an agent sees the risk of the route it is walking, a
@@ -281,14 +282,23 @@ fn worker_impl(req_rx: Receiver<PlanRequest>, rep_tx: Sender<PlanReply>, on_dequ
         let t0 = Instant::now();
         // Is the planner about to change the goal it was given? (A zone-line goal is a VOLUME, not a
         // floor point — it is not "snapped" and must not be reported as such.)
-        let goal_snapped_z = req.goal_region
+        let goal_snapped = req.goal_region
             .is_none()
             .then(|| req.collision.goal_z_was_snapped(req.goal))
             .flatten();
-        if let Some(z) = goal_snapped_z {
-            tracing::warn!("nav-planner: goal ({:.0},{:.0},{:.1}) has no floor at the z you asked for — \
-                SNAPPING it to the floor at z={:.1}. The client is changing your goal; it is not the one \
-                you specified.", req.goal[0], req.goal[1], req.goal[2], z);
+        match goal_snapped {
+            Some(crate::nav::collision::GoalSnap::ToColumnFloor { z }) => {
+                tracing::warn!("nav-planner: goal ({:.0},{:.0},{:.1}) has no floor at the z you asked for — \
+                    SNAPPING it to the floor at z={:.1}. The client is changing your goal; it is not the one \
+                    you specified.", req.goal[0], req.goal[1], req.goal[2], z);
+            }
+            Some(crate::nav::collision::GoalSnap::ToWaterSurface { surface_z }) => {
+                tracing::warn!("nav-planner: goal ({:.0},{:.0},{:.1}) is SUBMERGED — the walker cannot dive \
+                    and hold that depth (buoyancy rises); it will arrive FLOATING at the water surface \
+                    z={:.1} above it, not at the z you specified.",
+                    req.goal[0], req.goal[1], req.goal[2], surface_z);
+            }
+            None => {}
         }
         let (outcome, tight) = plan_path(&req.collision, req.start, req.goal, &req.avoid, req.aggro_buffer, req.goal_region);
         let plan_ms = t0.elapsed().as_millis();
@@ -298,7 +308,7 @@ fn worker_impl(req_rx: Receiver<PlanRequest>, rep_tx: Sender<PlanReply>, on_dequ
         tracing::info!("nav-planner: plan #{} ({:.0},{:.0})->({:.0},{:.0}) took {}ms OFF the net thread → {}",
             req.gen, req.start[0], req.start[1], req.goal[0], req.goal[1], plan_ms,
             describe(&outcome));
-        if rep_tx.send(PlanReply { gen: req.gen, outcome, plan_ms, goal_snapped_z, tight }).is_err() {
+        if rep_tx.send(PlanReply { gen: req.gen, outcome, plan_ms, goal_snapped, tight }).is_err() {
             break; // ActionLoop gone (zone change / shutdown)
         }
     }
