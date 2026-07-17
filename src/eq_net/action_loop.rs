@@ -13,7 +13,7 @@ const NAV_TICK_MS: u128 = 150;
 /// reject motion the real client can't produce.
 pub(crate) const RUN_SPEED: f32 = 44.0;
 use crate::eq_net::protocol::*;
-use crate::eq_net::transport::{AppPacket, EqStream};
+use crate::eq_net::transport::EqStream;
 use crate::game_state::{GameState, ZonePoint};
 use crate::ipc::{TradeCmd, CampCmd};
 use crate::movement::MoveIntent;
@@ -2529,19 +2529,6 @@ impl ActionLoop {
     }
 }
 
-/// Build a synthetic OP_CLIENT_UPDATE packet so the render loop can update
-/// `scene.player_pos` and keep the camera attached during navigation. Uses the real
-/// Titanium bit-packed wire format so it decodes the same way as server updates.
-/// `heading` (EQ-CCW degrees) carries the nav step direction so the render loop faces
-/// the player along the path — server position updates for the player carry no usable
-/// heading, so this synthetic packet is the only channel that delivers it.
-pub fn make_position_packet(spawn_id: u32, x: f32, y: f32, z: f32, heading: f32) -> AppPacket {
-    AppPacket {
-        opcode: OP_CLIENT_UPDATE,
-        payload: encode_position_update(spawn_id as u16, x, y, z, heading),
-    }
-}
-
 #[cfg(test)]
 mod fine_tier_tests {
     use crate::nav::steering::*;
@@ -2714,6 +2701,7 @@ mod fine_tier_tests {
 mod tests {
     use super::*;
     use crate::eq_net::packet_handler::apply_packet;
+    use crate::eq_net::transport::AppPacket;
     use crate::nav::steering::{NAV_LOCAL_STUCK_TICKS, PROACTIVE_REPLAN_CAP};
 
     /// **A GOAL THE CLIENT CHANGED MUST NOT BE REPORTED AS THE GOAL THE AGENT ASKED FOR.**

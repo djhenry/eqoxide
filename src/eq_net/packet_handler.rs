@@ -18,8 +18,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_CLIENT_UPDATE        => apply_position_update(gs, p),
         OP_HP_UPDATE            => apply_hp_update(gs, p),
         OP_MOB_HEALTH           => apply_mob_health(gs, p),
-        OP_TARGET_MOUSE         => apply_set_target(gs, p), // synthetic (nav → render gs); see fn doc
-        OP_MOVE_ITEM            => apply_move_item(gs, p),  // synthetic (nav → render gs); see fn doc
+        OP_MOVE_ITEM            => apply_move_item(gs, p),  // real 28-byte inbound only now; see fn doc
         OP_NEW_ZONE             => apply_new_zone(gs, p),
         OP_ZONE_SPAWNS          => apply_zone_spawns(gs, p),
         OP_ZONE_ENTRY           => apply_zone_entry(gs, p),
@@ -64,11 +63,6 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_COMPLETED_TASKS      => apply_completed_tasks(gs, p),
         OP_TASK_SELECT_WINDOW   => apply_task_select_window(gs, p),
         OP_GM_TRAINING          => apply_gm_training(gs, p),
-        OP_GM_END_TRAINING      => apply_gm_end_training(gs, p),  // synthetic (nav → render gs); see fn doc
-        OP_AUTO_ATTACK          => apply_auto_attack(gs, p),      // synthetic (nav → render gs); see fn doc
-        OP_UI_LOCAL_ECHO        => apply_ui_local_echo(gs, p),    // internal-only; see protocol.rs
-        OP_UI_LOOT_STATE        => apply_ui_loot_state(gs, p),    // internal-only; see protocol.rs
-        OP_UI_CLEAR_INVITE      => { gs.pending_invite = None; }  // internal-only; see protocol.rs
         OP_SKILL_UPDATE         => apply_skill_update(gs, p),
         OP_GROUP_UPDATE_B       => apply_group_update_b(gs, p),
         OP_GROUP_UPDATE         => apply_group_join(gs, p),
@@ -384,48 +378,6 @@ fn apply_gm_training(gs: &mut GameState, p: &[u8]) {
     gs.trainer_open = Some(npcid);
     gs.trainer_skills = caps;
     gs.log_msg("trainer", "Training window opened");
-}
-
-/// OP_GMEndTraining — SYNTHETIC mirror only. The wire packet is client→server (the server never
-/// echoes it), so this arm fires only for the copy navigation.rs sends over app_tx after ending a
-/// training session: it closes the RENDER GameState's trainer window (the transient Trainer window
-/// gates on `scene.trainer_open`, which otherwise stayed Some forever).
-fn apply_gm_end_training(gs: &mut GameState, _p: &[u8]) {
-    gs.trainer_open = None;
-    gs.trainer_skills.clear();
-    gs.log_msg("trainer", "Training window closed");
-}
-
-/// OP_AutoAttack — SYNTHETIC mirror only (client→server on the wire; never received). The nav
-/// thread mirrors its own OP_AutoAttack sends over app_tx so the RENDER GameState's `auto_attack`
-/// tracks the toggle (the Actions/Target windows' Attack button reads `scene.auto_attack`).
-/// Payload: 4 bytes, byte[0] = 1 enables / 0 disables — the same buffer sent to the server.
-fn apply_auto_attack(gs: &mut GameState, p: &[u8]) {
-    gs.auto_attack = p.first().copied().unwrap_or(0) != 0;
-}
-
-/// OP_UI_LOCAL_ECHO (internal-only, never on the wire) — local echo of the player's own outgoing
-/// chat. Payload: `kind` NUL `text`; logs as gs.log_msg(kind, text) so the chat window shows it.
-fn apply_ui_local_echo(gs: &mut GameState, p: &[u8]) {
-    let Some(nul) = p.iter().position(|&b| b == 0) else { return; };
-    let kind = String::from_utf8_lossy(&p[..nul]).into_owned();
-    let text = String::from_utf8_lossy(&p[nul + 1..]).into_owned();
-    if kind.is_empty() || text.is_empty() { return; }
-    gs.log_msg(&kind, &text);
-}
-
-/// OP_UI_LOOT_STATE (internal-only, never on the wire) — mirror of the gameplay loop's auto-loot
-/// session, which runs entirely on the NAV GameState. Byte 0: 1 = session active, 0 = idle. On the
-/// RENDER GameState `pending_loot` is filled by inbound corpse packets but never drained (only the
-/// gameplay loop drains its copy), so going idle also clears it — otherwise `scene.loot_active`
-/// would gate the Loot window open forever after the first corpse.
-fn apply_ui_loot_state(gs: &mut GameState, p: &[u8]) {
-    let active = p.first().copied().unwrap_or(0) != 0;
-    gs.loot_session_active = active;
-    if !active {
-        gs.pending_loot.clear();
-        gs.loot_queued_at = None;
-    }
 }
 
 /// OP_SkillUpdate — one skill's new value (after training or skill-ups). SkillUpdate_Struct:
@@ -908,9 +860,7 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         gs.player_x = upd.x;
         gs.player_y = upd.y;
         gs.player_z = upd.z;
-        // Keep the player's heading live. The nav thread's synthetic position packets carry the
-        // step direction here (make_position_packet); without this the render loop's Block B
-        // (app.rs) snaps facing back to the stale spawn heading during /goto.
+        // Keep the player's heading live from real server position updates.
         gs.player_heading = upd.heading;
     } else if let Some(e) = gs.entities.get_mut(&sid) {
         e.x = upd.x;
@@ -942,41 +892,23 @@ fn apply_mob_health(gs: &mut GameState, payload: &[u8]) {
     }
 }
 
-/// Synthetic packet (OP_TARGET_MOUSE on the app_tx channel, NOT from the server): the nav thread
-/// emits this when a /v1/combat/target request sets the target, so the render GameState — which
-/// backs the HUD and HTTP API — learns the target_id (a client-initiated change that otherwise
-/// only reaches the network GameState). Payload is the 4-byte LE spawn_id (build_target_packet).
-/// target_name/_hp_pct are seeded from the entity here and kept live in app.rs from the entity list.
-/// See the two-GameState split note. (eqoxide#9)
-/// Synthetic OP_MoveItem (nav → render gs). `/v1/inventory/move` sends the real 28-byte move to the
-/// server (which applies it silently, no echo for a client-initiated move) and updates the network
-/// gs; the render gs would otherwise only learn of it on the next OP_CharInventory (relog/zone),
-/// leaving held-item models stale. The nav thread mirrors the move here via app_tx so
-/// `scene.*_weapon_idfile` refresh within a frame. Payload is a synthetic 8 bytes: from_slot(i32
-/// LE) + to_slot(i32 LE).
-///
-/// IMPORTANT: the server DOES send `OP_MoveItem` to the client in other flows (trade, autostack,
-/// resync — EQEmu `zone/trading.cpp`, `zone/inventory.cpp`, `zone/client.cpp`), as a 28-byte
-/// `MoveItem_Struct`. Those inbound packets are dispatched through this same `apply_packet` on both
-/// gamestates, so they reach this handler too — and decoding the wire struct's first 8 bytes as
-/// (from,to) would relocate slot 0 into a garbage slot and corrupt the inventory. Guard on the
-/// EXACT synthetic length (8) so only our own synthetic packet is applied; the 28-byte wire form is
-/// ignored here (real inventory changes arrive via OP_CharInventory / OP_ItemPacket).
-/// (eqoxide#141, same render/network GameState split as #9.)
+/// OP_MoveItem inbound handler. Historically (pre-#320 dual-GameState split) `/v1/inventory/move`
+/// also looped a synthetic 8-byte `from_slot(i32 LE) + to_slot(i32 LE)` copy of the move through
+/// this same dispatch to mirror it into a separate render-thread GameState. That channel is gone —
+/// today `/v1/inventory/move` calls `gs.move_item()` directly at the send site (see
+/// `action_loop::drain_move_item`), so the 8-byte branch below is unreachable. It's kept rather than
+/// deleted because the length guard is doing real, still-needed work for the OTHER caller of this
+/// arm: the server DOES send `OP_MoveItem` to the client in other flows (trade, autostack, resync —
+/// EQEmu `zone/trading.cpp`, `zone/inventory.cpp`, `zone/client.cpp`) as a 28-byte `MoveItem_Struct`,
+/// which reaches this same handler via `apply_packet`. Decoding that wire struct's first 8 bytes as
+/// (from,to) would relocate slot 0 into a garbage slot and corrupt the inventory, so the exact-length
+/// guard below intentionally ignores it (real inventory changes for those flows arrive via
+/// OP_CharInventory / OP_ItemPacket instead). (eqoxide#141, #321)
 fn apply_move_item(gs: &mut GameState, payload: &[u8]) {
-    if payload.len() != 8 { return; } // synthetic is exactly 8; ignore the 28-byte inbound wire MoveItem_Struct
+    if payload.len() != 8 { return; } // unreachable in production (see doc above); guards the real 28-byte case
     let from = i32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
     let to   = i32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
     gs.move_item(from, to);
-}
-
-fn apply_set_target(gs: &mut GameState, payload: &[u8]) {
-    if payload.len() < 4 { return; }
-    let id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-    // GameState::set_target also clears target_con_name/target_attitude (not just target_con)
-    // and resolves the F1 self-target case — this handler used to duplicate a partial copy of
-    // that logic inline, which is exactly how the con_name/attitude clear got missed (#323).
-    gs.set_target(id);
 }
 
 fn apply_new_zone(gs: &mut GameState, payload: &[u8]) {
@@ -2199,12 +2131,10 @@ pub(crate) fn apply_consider(gs: &mut GameState, payload: &[u8]) {
 /// OP_SpawnAppearance render-side handler: `{ id: u16, kind: u16, param: u32 }`.
 ///
 /// We only consume the ANIMATION appearance (kind 14) for OUR OWN player, mapping param 110→sitting,
-/// 100→standing. A client-initiated sit/stand is issued on the nav thread, which sets the *nav*
-/// GameState's `sitting` and mirrors the same appearance packet here through `app_tx` (like the
-/// target/money bridges) — without this handler the render GameState's `sitting` never flips, so the
-/// player's own sit animation never plays (#53, the two-GameState split). Server broadcasts of the
-/// same opcode also land here. Other kinds / other spawns are ignored (their pose comes from spawn
-/// and scene state).
+/// 100→standing. A client-initiated sit/stand sets `gs.sitting` directly at the send site
+/// (gameplay.rs), so this handler's own job is to keep it in sync with SERVER broadcasts of the
+/// same opcode (e.g. a GM-forced sit, or another client's action reflected back) (#53). Other kinds
+/// / other spawns are ignored (their pose comes from spawn and scene state).
 fn apply_spawn_appearance(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < 8 { return; }
     let id    = u16::from_le_bytes([payload[0], payload[1]]) as u32;
@@ -2715,7 +2645,7 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
 mod tests {
     use super::{apply_emote, apply_death, apply_who_all, class_name, con_color, consider_message, parse_player_profile,
                 parse_begin_cast, apply_begin_cast, parse_memorize_spell, apply_char_inventory,
-                apply_money_update, apply_money_on_corpse, apply_set_target, apply_move_item, apply_spawn_appearance,
+                apply_money_update, apply_money_on_corpse, apply_move_item, apply_spawn_appearance,
                 extract_saylink_text, apply_task_description, apply_completed_tasks, apply_task_select_window,
                 strip_say_links, SAY_LINK_BODY_SIZE, SIZE_DEATH, SIZE_NEW_ZONE,
                 apply_group_update_b, apply_group_join, apply_group_disband_you,
@@ -3545,16 +3475,16 @@ mod tests {
 
     #[test]
     fn apply_spawn_appearance_toggles_player_sitting() {
-        // The synthetic bridge (nav -> render gs) for a client-initiated sit must flip the RENDER
-        // gs.sitting so the player's own sit animation plays. (eqoxide#53, two-GameState split)
+        // A server-broadcast sit/stand appearance for our own spawn must flip gs.sitting so the
+        // player's own sit animation plays. (eqoxide#53)
         let mut gs = GameState::new();
         gs.player_id = 77;
         // kind 14 (Animation), param 110 (sit) for our own id -> sitting.
         apply_spawn_appearance(&mut gs, &crate::eq_net::protocol::build_spawn_appearance_packet(77, 14, 110));
-        assert!(gs.sitting, "sit appearance for our player must set render sitting");
+        assert!(gs.sitting, "sit appearance for our player must set sitting");
         // param 100 (stand) -> not sitting.
         apply_spawn_appearance(&mut gs, &crate::eq_net::protocol::build_spawn_appearance_packet(77, 14, 100));
-        assert!(!gs.sitting, "stand appearance clears render sitting");
+        assert!(!gs.sitting, "stand appearance clears sitting");
         // Another spawn's sit must NOT change our flag.
         apply_spawn_appearance(&mut gs, &crate::eq_net::protocol::build_spawn_appearance_packet(77, 14, 110));
         apply_spawn_appearance(&mut gs, &crate::eq_net::protocol::build_spawn_appearance_packet(999, 14, 100));
@@ -3562,21 +3492,11 @@ mod tests {
     }
 
     #[test]
-    fn apply_set_target_sets_render_target_from_entity() {
-        // Synthetic OP_TARGET_MOUSE (nav -> render gs) carries the 4-byte LE spawn_id; the render
-        // gs should adopt the target and seed name/hp from the entity list. (eqoxide#9)
-        let mut gs = GameState::new();
-        gs.upsert_entity(test_entity(332, "Merchant Kwein", 80.0));
-        apply_set_target(&mut gs, &332u32.to_le_bytes());
-        assert_eq!(gs.target_id, Some(332));
-        assert_eq!(gs.target_name.as_deref(), Some("Merchant Kwein"));
-        assert_eq!(gs.target_hp_pct, Some(80.0));
-    }
-
-    #[test]
-    fn apply_move_item_equips_held_weapon_in_render_gs() {
-        // Synthetic OP_MoveItem (nav -> render gs): 8-byte from(i32 LE) + to(i32 LE). Equipping a
-        // weapon from the cursor (33) to the off hand (14) must move it in the render gs so the
+    fn apply_move_item_equips_held_weapon() {
+        // 8-byte from(i32 LE) + to(i32 LE), historically fed via a synthetic bridge that #320
+        // removed (nothing produces this shape in production anymore — see fn doc) but still
+        // exercised directly here as a regression test for the length-guard behavior below.
+        // Equipping a weapon from the cursor (33) to the off hand (14) must move it in gs so the
         // scene derives the held model from slot 14 without a relog. (eqoxide#141)
         let mut gs = GameState::new();
         gs.inventory.push(crate::game_state::InvItem {
@@ -3609,15 +3529,6 @@ mod tests {
             "28-byte inbound wire MoveItem must be ignored — slot 0 must not be relocated");
         assert_eq!(gs.inventory.iter().find(|i| i.slot == 14).map(|i| i.idfile.as_str()), Some("IT63"),
             "the equipped weapon is untouched by the ignored wire packet");
-    }
-
-    #[test]
-    fn apply_set_target_unknown_entity_sets_id_only() {
-        let mut gs = GameState::new();
-        apply_set_target(&mut gs, &7u32.to_le_bytes());
-        assert_eq!(gs.target_id, Some(7));
-        assert_eq!(gs.target_name, None);
-        assert_eq!(gs.target_hp_pct, None);
     }
 
     #[test]
@@ -6469,75 +6380,6 @@ mod tests {
         let mut gs = GameState::new();
         apply_group_acknowledge(&mut gs, &[]);
         assert_eq!(gs.chat_events.back().unwrap().kind, "joined");
-    }
-
-    // ── Synthetic nav→render mirror packets (two-GameState split) ────────────
-
-    #[test]
-    fn apply_ui_local_echo_logs_kind_and_text() {
-        let mut gs = GameState::new();
-        let p = crate::eq_net::protocol::build_ui_local_echo("tell", "You told Sariel, 'on my way'");
-        super::apply_ui_local_echo(&mut gs, &p);
-        assert!(gs.messages.iter().any(|m| m.kind == "tell"
-            && m.text == "You told Sariel, 'on my way'"));
-    }
-
-    #[test]
-    fn apply_ui_local_echo_ignores_malformed_payloads() {
-        let mut gs = GameState::new();
-        super::apply_ui_local_echo(&mut gs, b"no-nul-separator");
-        super::apply_ui_local_echo(&mut gs, b"\0text-without-kind");
-        super::apply_ui_local_echo(&mut gs, b"chat\0");
-        assert!(gs.messages.is_empty(), "malformed echoes must log nothing");
-    }
-
-    #[test]
-    fn apply_gm_end_training_clears_trainer_state() {
-        // The end-training packet is client→server; the synthetic mirror must close the RENDER
-        // GameState's trainer window or the transient Trainer window never closes (bug #1).
-        let mut gs = GameState::new();
-        gs.trainer_open = Some(77);
-        gs.trainer_skills = vec![100; crate::skills::NUM_SKILLS];
-        super::apply_gm_end_training(&mut gs, &[0u8; 8]);
-        assert!(gs.trainer_open.is_none());
-        assert!(gs.trainer_skills.is_empty());
-    }
-
-    #[test]
-    fn apply_auto_attack_mirrors_toggle_from_payload() {
-        let mut gs = GameState::new();
-        super::apply_auto_attack(&mut gs, &[1, 0, 0, 0]);
-        assert!(gs.auto_attack, "byte[0]=1 must switch auto-attack ON");
-        super::apply_auto_attack(&mut gs, &[0, 0, 0, 0]);
-        assert!(!gs.auto_attack, "byte[0]=0 must switch auto-attack OFF");
-        super::apply_auto_attack(&mut gs, &[]);
-        assert!(!gs.auto_attack, "empty payload is treated as OFF, not a panic");
-    }
-
-    #[test]
-    fn apply_ui_loot_state_sets_and_clears_session() {
-        let mut gs = GameState::new();
-        super::apply_ui_loot_state(&mut gs, &[1]);
-        assert!(gs.loot_session_active);
-        // Render-side pending_loot is filled by corpse packets but never drained there — the
-        // idle mirror must clear it or scene.loot_active would stay true forever (bug #4).
-        gs.pending_loot.push_back(42);
-        gs.loot_queued_at = Some(std::time::Instant::now());
-        super::apply_ui_loot_state(&mut gs, &[0]);
-        assert!(!gs.loot_session_active);
-        assert!(gs.pending_loot.is_empty());
-        assert!(gs.loot_queued_at.is_none());
-    }
-
-    #[test]
-    fn apply_packet_ui_clear_invite_clears_pending_invite() {
-        use crate::eq_net::transport::AppPacket;
-        let mut gs = GameState::new();
-        gs.pending_invite = Some("Sariel".into());
-        super::apply_packet(&mut gs, &AppPacket {
-            opcode: crate::eq_net::protocol::OP_UI_CLEAR_INVITE, payload: Vec::new(),
-        });
-        assert!(gs.pending_invite.is_none());
     }
 
     #[test]
