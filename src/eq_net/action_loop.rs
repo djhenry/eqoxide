@@ -130,6 +130,14 @@ const POS_Z_RECONCILE_UNITS: f32 = 1.0;
 /// excludes every airborne/falling frame, so this only ever counts a genuinely-stuck standoff.
 const POS_Z_RECONCILE_TICKS: u32 = 10;
 
+/// #526 — collision-floor probe the contested-Z reconcile uses to REFUSE adopting a server Z that
+/// sits below the controller's own standable floor. Mirror the render controller's own ground clamp
+/// (`movement::GROUND_ORIGIN` = 1.0 above the foot, `movement::GROUND_DEPTH` = 200 down) so the two
+/// resolve the SAME floor: the reconcile asks "is there a standable surface at my feet that the
+/// server's Z is BELOW?" using exactly the geometry the controller stands on.
+const POS_FLOOR_PROBE_UP: f32 = 1.0;
+const POS_FLOOR_PROBE_DOWN: f32 = 200.0;
+
 /// Pending state of a quest turn-in (POST /give). The trade window spans multiple nav ticks:
 /// we send OP_TradeRequest, then must wait for the server's OP_TradeRequestAck before moving the
 /// item into the NPC trade slot. `ticks_waiting` counts nav ticks (~150ms each) for the timeout.
@@ -2471,12 +2479,14 @@ impl ActionLoop {
         // adopt it via the controller teleport path so eqoxide converges to the server floor and
         // broadcasts a stable, server-matching Z.
         //
-        // NOTE (deeper cause, tracked separately): if the controller's collision-floor Z on the
-        // platform is GENUINELY ~3u above the server's floor, there is a collision-mesh/platform-
-        // height discrepancy under this — the teleport won't fully stick and this reconcile becomes a
-        // slow (per-`POS_Z_RECONCILE_TICKS`) convergence rather than instant. For #516 the client-side
-        // reconcile is the right fix (broadcast matches server → observer stops bouncing); a confirmed
-        // mesh-height bug belongs in its own issue.
+        // #526 RESOLVED the "deeper cause" this note used to flag: on the Kelethin plank the
+        // controller's collision floor (~77) is CORRECT (it matches where the native client renders
+        // the plank) and the server's asserted Z (~73.97) is ~3u BELOW the plank. Adopting the server
+        // Z there dragged the char under its own floor; the controller re-lifted; the reconcile
+        // re-adopted → the DOWN-clip. So the adopt is now GUARDED by `below_own_floor` (see the check
+        // just below): the reconcile only ever adopts a server Z that is AT or ABOVE the controller's
+        // standable collision floor — it lifts a controller that sank below a floor, but never drags
+        // one below the floor it is legitimately standing on.
         if (gp[0] - self.last_streamed[0]).abs() > POS_DELTA_EPSILON
             || (gp[1] - self.last_streamed[1]).abs() > POS_DELTA_EPSILON
             || (gp[2] - self.last_streamed[2]).abs() > POS_DELTA_EPSILON
@@ -2487,7 +2497,26 @@ impl ActionLoop {
         if let Some(sp) = self.last_server_pos {
             let hgap2 = (sp[0] - view.pos[0]).powi(2) + (sp[1] - view.pos[1]).powi(2);
             let vgap = (sp[2] - view.pos[2]).abs();
-            if !view.moving && hgap2 <= CORRECTION_SQ && vgap > POS_Z_RECONCILE_UNITS {
+            // #526 — NEVER adopt a server Z that sits BELOW the controller's own standable collision
+            // floor. On an elevated platform (the Kelethin plank) the controller stands on a real
+            // baked surface (~77) while the server asserts a below-plank Z (~73.97). Part 2's adopt
+            // would teleport the char UNDER the plank; the controller's ground-snap/depenetration then
+            // re-lifts it to the collision floor, and the next reconcile re-adopts the below-floor Z —
+            // that alternation IS the multi-second DOWN-clip observers see (#526). Here the collision
+            // floor is authoritative: refuse the adopt and let the Normal path keep broadcasting the
+            // stable collision-floor Z. (`ground_below` returns None when no zone geometry is loaded —
+            // e.g. a unit test with an empty collision — so this guard is inert there and a server Z is
+            // still adopted, exactly the pre-#526 behaviour; the guard only bites when a real standable
+            // floor exists ABOVE the server's asserted Z.)
+            let below_own_floor = self
+                .collision
+                .read()
+                .unwrap()
+                .as_ref()
+                .and_then(|c| c.ground_below(view.pos[0], view.pos[1],
+                                             view.pos[2] + POS_FLOOR_PROBE_UP, POS_FLOOR_PROBE_DOWN))
+                .is_some_and(|floor| sp[2] < floor - POS_Z_RECONCILE_UNITS);
+            if !view.moving && hgap2 <= CORRECTION_SQ && vgap > POS_Z_RECONCILE_UNITS && !below_own_floor {
                 self.contested_z_ticks = self.contested_z_ticks.saturating_add(1);
                 if self.contested_z_ticks >= POS_Z_RECONCILE_TICKS {
                     tracing::info!("#516: adopting contested server pos (z {:.2}→{:.2}) after {} idle ticks",
@@ -2506,11 +2535,13 @@ impl ActionLoop {
                     return;
                 }
             } else {
-                // Moving, converged, or only a horizontal disagreement — not a standing Z standoff.
+                // Moving, converged, only a horizontal disagreement, or a below-collision-floor server
+                // Z we refuse to adopt (#526) — not a standing Z standoff we can reconcile.
                 self.contested_z_ticks = 0;
-                // Once the controller has converged onto the server Z, drop the target so a stale
-                // server position can never re-trigger a reconcile.
-                if vgap <= POS_Z_RECONCILE_UNITS { self.last_server_pos = None; }
+                // Drop the target when the controller has converged onto the server Z, OR when the
+                // server Z is below our own collision floor (#526): in both cases no future tick should
+                // accumulate toward an adopt off this stale/invalid target.
+                if vgap <= POS_Z_RECONCILE_UNITS || below_own_floor { self.last_server_pos = None; }
             }
         }
         // Normal: stream the controller's position at cadence, then mirror into gs for game logic.
@@ -3114,6 +3145,72 @@ mod tests {
         for _ in 0..(POS_Z_RECONCILE_TICKS * 3) { nav2.stream_position(&mut stream, &mut gs2); }
         assert!(nav2.controller.pos_correction.lock().unwrap().is_none(),
             "a MOVING (airborne) Z disagreement is fall/stair lag — it must NEVER be reconciled");
+    }
+
+    /// A two-tier collision fixture for #526: a lower ledge at `low` and an upper plank at `high`
+    /// occupying the SAME (east, north) footprint (~`high - low` apart) — the Kelethin plank over a
+    /// beam. `ground_below` at that footprint resolves the UPPER plank (open headroom above it), so a
+    /// character standing there stands on `high`. Cell size 2.0 matches the nav corpus fixtures.
+    fn two_tier_floor(low: f32, high: f32) -> crate::nav::collision::Collision {
+        // GLB axes -> world: east = p[2], north = p[0], height = p[1] (see Collision::build). A
+        // horizontal, up-facing quad at height `h` spanning east/north [0,40].
+        let quad = |h: f32| crate::assets::MeshData {
+            positions: vec![[0.0, h, 0.0], [40.0, h, 0.0], [40.0, h, 40.0], [0.0, h, 40.0]],
+            normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
+            indices: vec![0, 1, 2, 0, 2, 3], texture_name: None, base_color: [1.0; 4],
+            center: [0.0; 3], render_mode: crate::assets::RenderMode::Opaque, anim: None,
+        };
+        crate::nav::collision::Collision::build(&crate::assets::ZoneAssets {
+            terrain: vec![quad(low), quad(high)], objects: vec![], textures: vec![],
+        }, 2.0)
+    }
+
+    /// **#526 — the reconcile MUST NOT adopt a server Z BELOW the controller's own collision floor.**
+    /// On the Kelethin plank the controller stands on a real baked surface (~77) while the server
+    /// asserts a below-plank Z (~73.97). Part 2's contested-Z adopt used to teleport the char UNDER
+    /// the plank; the controller re-lifted to the collision floor; the next reconcile re-adopted the
+    /// below-floor Z — an oscillation between the two tiers that observers see as a multi-second
+    /// DOWN-clip. With a real standable floor at (x,y), the reconcile must HOLD it: never adopt, and
+    /// keep broadcasting the stable collision-floor Z across every tick.
+    ///
+    /// MUTATION-CHECK: delete the `&& !below_own_floor` guard on the adopt (or force `below_own_floor`
+    /// to `false`) and this goes RED — the below-floor server Z is adopted, `pos_correction` is set,
+    /// and `last_streamed[2]` drops to 73.97, reintroducing the #526 clip. The contrasting
+    /// `contested_z_only_server_correction_is_adopted_and_broadcast_stable` (empty collision → no
+    /// floor knowledge) still adopts, so the guard cannot be neutered by always-refusing either.
+    #[tokio::test]
+    async fn reconcile_never_adopts_a_server_z_below_the_controllers_collision_floor() {
+        const PLANK_Z:  f32 = 77.0;  // controller's collision floor — where the native client renders
+        const SERVER_Z: f32 = 73.97; // server's asserted (below-plank) Z, ~3u under the plank
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+
+        let mut nav = new_loop();
+        // Load the two-tier collision so `ground_below` resolves the plank at PLANK_Z under the char.
+        *nav.collision.write().unwrap() =
+            Some(std::sync::Arc::new(two_tier_floor(SERVER_Z, PLANK_Z)));
+        {
+            let mut v = nav.controller.controller_view.lock().unwrap();
+            // Foot at (east=10, north=20) — inside the [0,40] plank footprint — standing on the plank.
+            v.initialized = true; v.moving = false; v.pos = [10.0, 20.0, PLANK_Z]; v.heading = 0.0;
+        }
+        nav.streamed_init = true;
+        nav.last_streamed = [10.0, 20.0, PLANK_Z];
+        let mut gs = GameState::new();
+        gs.player_id = 42;
+        gs.player_x = 10.0; gs.player_y = 20.0; gs.player_z = SERVER_Z; // server keeps asserting below-plank
+
+        // Drive far past the debounce: a below-floor server Z must be refused every single tick.
+        for _ in 0..(POS_Z_RECONCILE_TICKS * 4) {
+            gs.player_z = SERVER_Z; // the server re-asserts the below-plank Z each tick
+            nav.stream_position(&mut stream, &mut gs);
+            assert!(nav.controller.pos_correction.lock().unwrap().is_none(),
+                "a server Z below the controller's collision floor must NEVER be adopted (#526)");
+        }
+        // eqoxide holds its authoritative collision-floor Z on the wire — a STABLE plank height, no clip.
+        assert_eq!(nav.last_streamed[2], PLANK_Z,
+            "eqoxide must keep broadcasting the collision-floor Z (plank), never the below-plank server Z");
+        assert_eq!(gs.player_z, PLANK_Z,
+            "the Normal path re-mirrors the controller's collision-floor Z into gs — no below-floor drag");
     }
 
     /// #368 — RESOLUTION IS NOT SUPPRESSED FOR SAME-ZONE. A same-zone DRNTP line (an intra-zone
