@@ -50,6 +50,7 @@ pub mod game_state;
 pub mod http;
 pub mod hud;
 pub mod ipc;
+pub mod model;
 pub mod spells;
 pub mod ui;
 pub mod zone_map;
