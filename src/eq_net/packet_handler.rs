@@ -34,6 +34,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_SIMPLE_MESSAGE       => apply_simple_message(gs, p),
         OP_EMOTE                => apply_emote(gs, p),
         OP_CONSIDER             => apply_consider(gs, p),
+        OP_TARGET_COMMAND       => apply_target_command(gs, p),
         OP_SPAWN_APPEARANCE     => apply_spawn_appearance(gs, p),
         OP_SEND_ZONE_POINTS           => apply_zone_points(gs, p),
         OP_SPAWN_DOOR           => apply_spawn_doors(gs, p),
@@ -2128,6 +2129,38 @@ pub(crate) fn apply_consider(gs: &mut GameState, payload: &[u8]) {
     gs.log_msg("combat", &msg);
 }
 
+/// OP_TargetCommand (server→client) — the server FORCING our target (eqoxide#506).
+///
+/// Payload is `ClientTarget_Struct`: a single `u32 new_target` spawn id, 4 bytes LE, no RoF2
+/// encode/decode (rof2_structs.h:1316; sent by `Client::SendTargetCommand`, zone/client.cpp:7004).
+/// The same opcode is ALSO sent client→server (our own `OP_TargetMouse`/target request path lives
+/// in action_loop.rs) and echoed back as an accept-ack, but eqoxide never emits OP_TargetCommand
+/// outbound, so every inbound one is a genuine server force-target: corpse-locate, the Sense
+/// Undead/Summoned/Animal spell effects (spell_effects.cpp:896), merc-hire clear, or a Perl/Lua
+/// `$client->SendTargetCommand`.
+///
+/// Honesty (#506): before this handler existed, a server force-target never reached GameState, so
+/// `gs.target_id`/`target_name`/con etc. stayed on the OLD target while the server (and real client)
+/// pointed elsewhere — `/observe/debug` reported a confident-but-wrong target. We mirror the
+/// client-initiated target path (action_loop.rs `gs.set_target(id)`) so a forced target updates the
+/// same fields the same way. `new_target == 0` is EQEmu's "clear target" sentinel (merc-hire clear,
+/// client_packet.cpp:10670 `SendTargetCommand(0)`) — route it through `clear_target` so no stale
+/// target survives.
+pub(crate) fn apply_target_command(gs: &mut GameState, payload: &[u8]) {
+    if payload.len() < 4 {
+        tracing::warn!("EQ: OP_TargetCommand runt ({} bytes, need 4) — ignored", payload.len());
+        return;
+    }
+    let new_target = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    if new_target == 0 {
+        gs.clear_target();
+        tracing::info!("EQ: OP_TargetCommand — server cleared our target");
+    } else {
+        gs.set_target(new_target);
+        tracing::info!("EQ: OP_TargetCommand — server forced target to spawn {new_target}");
+    }
+}
+
 /// OP_SpawnAppearance render-side handler: `{ id: u16, kind: u16, param: u32 }`.
 ///
 /// We only consume the ANIMATION appearance (kind 14) for OUR OWN player, mapping param 110→sitting,
@@ -3761,6 +3794,40 @@ mod tests {
         assert!(!gs.loot_session_active, "the inbound packet must close the session");
         let last = gs.messages.back().expect("must log a message");
         assert_eq!(last.text, "Looting complete");
+    }
+
+    /// #506 (agent-honesty). A server FORCE-TARGET arrives as OP_TargetCommand (server→client:
+    /// corpse-locate, Sense Undead/Summoned/Animal, Perl SetTarget). It must be dispatched through
+    /// `apply_packet` and land on `gs` via the SAME `set_target` path a client-initiated target
+    /// takes, so `/observe/debug`'s `target_id`/`target_name` reflect the NEW server-chosen target
+    /// instead of a stale one. This is a RESULT test: deleting the `apply_target_command` dispatch
+    /// arm leaves the target stale and turns it RED (mutation-checked).
+    #[test]
+    fn apply_packet_op_target_command_forces_target_honestly() {
+        use crate::eq_net::transport::AppPacket;
+        let mut gs = GameState::new();
+        // Start on an OLD target so a no-op handler would leave a detectable stale value.
+        gs.upsert_entity(crate::game_state::tests::make_entity(10, "an old rat", 0.0, 0.0, 0.0, true));
+        gs.set_target(10);
+        gs.upsert_entity(crate::game_state::tests::make_entity(42, "a decaying skeleton", 1.0, 0.0, 0.0, true));
+        assert_eq!(gs.target_id, Some(10));
+
+        // Server force-targets spawn 42 (e.g. Sense Undead points us at the nearest undead).
+        super::apply_packet(&mut gs, &AppPacket {
+            opcode: crate::eq_net::protocol::OP_TARGET_COMMAND,
+            payload: 42u32.to_le_bytes().to_vec(), // ClientTarget_Struct = single u32 new_target
+        });
+        assert_eq!(gs.target_id, Some(42), "server force-target must update target_id");
+        assert_eq!(gs.target_name.as_deref(), Some("a decaying skeleton"),
+            "target_name must reflect the NEW server-chosen target, not the stale one");
+
+        // new_target == 0 is EQEmu's clear-target sentinel (merc-hire clear).
+        super::apply_packet(&mut gs, &AppPacket {
+            opcode: crate::eq_net::protocol::OP_TARGET_COMMAND,
+            payload: 0u32.to_le_bytes().to_vec(),
+        });
+        assert_eq!(gs.target_id, None, "OP_TargetCommand(0) must clear the target");
+        assert_eq!(gs.target_name, None, "a cleared target must not leave a stale name");
     }
 
     /// #346 REVIEW REGRESSION. EQEmu's `Corpse::LootCorpseItem` (zone/corpse.cpp:1419) answers our
