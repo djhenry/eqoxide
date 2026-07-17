@@ -175,6 +175,13 @@ pub struct PlayerState {
     pub target_attitude: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_level:    Option<u32>,
+    /// #336: the result of the most recent consider of ANY spawn — target or not. `target_con`/
+    /// `target_attitude`/`target_level` above are target-scoped (only populated while that spawn IS
+    /// the current target); `last_consider` is spawn-scoped, so a standalone
+    /// `POST /v1/combat/consider {"id":N}` on a non-target spawn is readable here without first
+    /// targeting it. `None` until a consider reply has been received this session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_consider:   Option<LastConsiderView>,
     /// Text of the most recently read book/note (OP_ReadBook reply), newline-decoded. None until a
     /// book is read. Surfaced via GET /v1/observe/item_text so an agent can read a quest note (#288).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -249,6 +256,16 @@ impl PlayerState {
             target_con:      gs.target_id.and(gs.target_con_name.clone()),
             target_attitude: gs.target_id.and(gs.target_attitude.clone()),
             target_level:    gs.target_id.and_then(|id| gs.entities.get(&id)).map(|e| e.level),
+            // #336: spawn-scoped, unlike target_con*/target_level above — populated for the LAST
+            // consider of any spawn, not gated on that spawn being the current target.
+            last_consider: gs.last_consider.as_ref().map(|c| LastConsiderView {
+                spawn_id: c.spawn_id,
+                name:     c.name.clone(),
+                con_name: c.con_name.clone(),
+                attitude: c.attitude.clone(),
+                level:    c.level,
+                at:       c.at,
+            }),
             book_text:       gs.last_book_text.clone(),
             // Spellcasting (#348). The live cast bar and how the last cast ended, straight from the
             // server's own packets (OP_BeginCast / OP_InterruptCast / OP_MemorizeSpell scribing=3 /
@@ -345,6 +362,27 @@ pub struct LastCastView {
     /// server-sounding prose we invented, which an agent could not tell from a real server line.
     pub text:       String,
     /// When the outcome landed. Not serialized — `ago_secs` is computed from it on read.
+    #[serde(skip)]
+    pub at:         std::time::Instant,
+}
+
+/// The most recent consider result for ANY spawn (target or not), for `/v1/observe/debug` →
+/// `last_consider` (#336). `ago_secs` is derived at read time from `at` — see [`CastingView`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LastConsiderView {
+    pub spawn_id:   u32,
+    pub name:       String,
+    /// Difficulty tier: gray (trivial/no exp) | green | light_blue | blue | white (even) | yellow |
+    /// red (dangerous). See `con_level_name`.
+    pub con_name:   String,
+    /// Attitude enum: ally | warmly | kindly | amiable | indifferent | apprehensive | dubious |
+    /// threatening | scowls (KOS). See `attitude_name`.
+    pub attitude:   String,
+    /// The spawn's actual character level, when known. `None` is an honest "unknown" (the spawn had
+    /// already left `entities` by the time the reply arrived) — never a fabricated number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level:      Option<u32>,
+    /// When the consider reply landed. Not serialized — `ago_secs` is computed from it on read.
     #[serde(skip)]
     pub at:         std::time::Instant,
 }

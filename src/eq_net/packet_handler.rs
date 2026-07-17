@@ -2113,8 +2113,26 @@ pub fn attitude_name(faction: u32) -> &'static str {
     }
 }
 
-/// OP_Consider reply — the server's con of a spawn. Consider_Struct: playerid(u32) +
-/// targetid(u32) + faction(u32) + level(u32 = con color) + cur_hp + ...
+/// OP_Consider reply — the server's con of a spawn. RoF2 `Consider_Struct` (confirmed ground truth,
+/// eqoxide#336 — EQEmu `common/patches/rof2_structs.h`, `Consider_Struct`; `ENCODE`/`DECODE` are
+/// `*_LENGTH_EXACT`, i.e. the struct is exactly this and nothing more):
+///   playerid(u32)@0 + targetid(u32)@4 + faction(u32)@8 (`FACTION_VALUE`, 1..=9) +
+///   level(u32)@12 (an EQEmu `ConsiderColor` enum value — Green=2, DarkBlue=4, Gray=6, White=10,
+///   Red=13, Yellow=15, LightBlue=18, WhiteTitanium=20 — NOT the target's literal character level)
+///   + pvpcon(u8)@16 (0 normal / 1 pvp-flagged / 4 raid target, unused here) + 3 unused bytes = 20.
+///   There is no HP data in this struct (an earlier revision of this comment guessed cur_hp/max_hp
+///   fields here; ground truth shows none exist).
+///
+/// The native RoF2 client prints ONE line combining an attitude clause (from `faction`) and an
+/// idiomatic difficulty-assessment clause (from `level`'s bracket vs. the player's own level),
+/// entirely colored by the ConsiderColor — e.g. "a decaying skeleton glares at you threateningly --
+/// looks kind of risky, but you might win." (traced to `REDACTED-CLIENT.c` `FUN_REDACTED`, eqstr template
+/// 12239 = "%1 %2 -- %3"). eqoxide does not reproduce that per-bracket retail prose table (its exact
+/// wording per (player-level-bracket × color) combination could not be fully resolved from the
+/// decompile); `consider_message` below covers only the attitude half, and `con_level_name` names
+/// the difficulty tier as a plain machine-readable label (used in the chat line's own honestly-
+/// labeled difficulty clause below, and in `target_con_name`/`last_consider.con_name`) rather than
+/// inventing retail sentences we can't verify.
 ///
 /// A consider reply is data ABOUT a spawn, never a target-select (eqoxide#330). It used to write
 /// `gs.target_id`, which made it a 5th (uncounted) writer alongside the 4 that PR #327 routed
@@ -2139,7 +2157,8 @@ pub(crate) fn apply_consider(gs: &mut GameState, payload: &[u8]) {
     let target_id = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
     let faction   = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]);
     let level     = u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
-    let name = gs.entities.get(&target_id).map(|e| e.name.clone())
+    let entity = gs.entities.get(&target_id);
+    let name = entity.map(|e| e.name.clone())
         .unwrap_or_else(|| "Your target".to_string());
 
     // Con fields describe the CURRENT target — only apply them when this reply is about it (#330).
@@ -2151,8 +2170,28 @@ pub(crate) fn apply_consider(gs: &mut GameState, payload: &[u8]) {
         gs.target_attitude = Some(attitude_name(faction).to_string());
     }
 
+    // #336: record the spawn-scoped result UNCONDITIONALLY (target or not) — this is what closes
+    // the standalone-consider gap. The `if gs.target_id == Some(target_id)` gate above exists
+    // because `target_con*` describe the CURRENT target; `last_consider` describes THIS spawn, so
+    // it has no such gate and is never touched by set_target/clear_target. The structured name
+    // falls back to a stable "spawn_<id>" (not the chat line's "Your target" prose) so an agent
+    // reading `last_consider.name` for a non-target spawn never sees a lie baked into the label.
+    gs.last_consider = Some(crate::game_state::LastConsider {
+        spawn_id: target_id,
+        name: entity.map(|e| e.name.clone()).unwrap_or_else(|| format!("spawn_{target_id}")),
+        con_name: con_level_name(level).to_string(),
+        attitude: attitude_name(faction).to_string(),
+        level: entity.map(|e| e.level),
+        at: std::time::Instant::now(),
+    });
+
     // Always logged — a standalone consider of a non-target spawn must still report its result.
-    let msg = format!("{} {}.", name, consider_message(faction));
+    // #336: the native client's one consider line always carries BOTH an attitude clause and a
+    // difficulty clause (see the struct doc above) — attitude-only was a fidelity gap. This appends
+    // our own plain, machine-readable tier label rather than the retail per-level-bracket prose
+    // (which eqoxide does not claim to reproduce verbatim), so an agent scraping the chat log gets
+    // both halves without the client inventing sentences it can't verify against retail.
+    let msg = format!("{} {} -- con: {}.", name, consider_message(faction), con_level_name(level));
     tracing::info!("EQ: consider: {msg}");
     gs.log_msg("combat", &msg);
 }
@@ -3087,6 +3126,27 @@ mod tests {
     }
 
     #[test]
+    fn apply_consider_chat_line_carries_both_attitude_and_difficulty_336() {
+        // #336: the native RoF2 client's consider line always carries BOTH halves (attitude clause
+        // + difficulty clause, see the eq-client-expert citation on apply_consider's struct doc) —
+        // eqoxide's chat line used to report attitude only, which was a fidelity gap AND meant an
+        // agent scraping the log (rather than /observe/debug) had no way to learn the difficulty
+        // tier at all. The tier text must come from `level` (con_level_name), never `faction`.
+        let mut gs = GameState::new();
+        gs.entities.insert(77, test_entity(77, "a_dragon", 100.0));
+        let mut reply = [0u8; 20];
+        reply[4..8].copy_from_slice(&77u32.to_le_bytes());
+        reply[8..12].copy_from_slice(&2u32.to_le_bytes());     // faction 2 -> attitude "warmly"
+        reply[12..16].copy_from_slice(&13u32.to_le_bytes());   // level 13 -> tier "red"
+        super::apply_consider(&mut gs, &reply);
+        let m = gs.messages.back().unwrap().text.clone();
+        assert!(m.contains("warmly"), "attitude clause must be present: {m}");
+        assert!(m.contains("red"), "difficulty clause must name the tier from LEVEL (red), not faction: {m}");
+        assert!(!m.contains("green") && !m.contains("gray"),
+            "must not report the WRONG tier: {m}");
+    }
+
+    #[test]
     fn apply_consider_con_color_comes_from_level_not_faction() {
         // #355 M1, the lethal-mob scenario made explicit: a red-con (much higher level, would kill
         // you) mob that also happens to hash to a low faction number must still tint RED. If the con
@@ -3104,6 +3164,69 @@ mod tests {
         assert_ne!(con_color(2), con_color(13), "test premise: the two inputs must map to different colors");
         assert_eq!(gs.target_con, Some(con_color(13)),
             "a lethal (level-13/red) mob must tint RED from its level, never GREEN from its faction (#355 M1)");
+    }
+
+    #[test]
+    fn apply_consider_standalone_sets_last_consider_for_non_target_spawn_336() {
+        // #336: a standalone consider (POST /v1/combat/consider {"id":N} on a spawn that is
+        // deliberately NOT the current target) must still surface the difficulty tier + attitude
+        // somewhere addressable — `last_consider` is that spawn-scoped surface. Before this fix the
+        // tier was computed by con_level_name and then discarded: target_con* stay None (correctly,
+        // #330) and nothing else carried it.
+        let mut gs = GameState::new();
+        gs.entities.insert(450, test_entity(450, "Guard_Phaeton", 100.0));
+        // no set_target — nothing is targeted
+        let mut reply = [0u8; 20];
+        reply[4..8].copy_from_slice(&450u32.to_le_bytes());   // targetid
+        reply[8..12].copy_from_slice(&9u32.to_le_bytes());     // faction 9 = scowls
+        reply[12..16].copy_from_slice(&2u32.to_le_bytes());    // level 2 = green
+        super::apply_consider(&mut gs, &reply);
+
+        assert_eq!(gs.target_con_name, None, "con fields stay target-scoped; nothing is targeted (#330)");
+
+        let lc = gs.last_consider.expect("last_consider must be set for a standalone consider (#336)");
+        assert_eq!(lc.spawn_id, 450);
+        assert_eq!(lc.name, "Guard_Phaeton");
+        assert_eq!(lc.con_name, "green", "difficulty tier from level=2");
+        assert_eq!(lc.attitude, "scowls", "attitude from faction=9");
+        assert_eq!(lc.level, Some(1), "test_entity's level, looked up from gs.entities");
+    }
+
+    #[test]
+    fn apply_consider_last_consider_con_name_comes_from_level_not_faction_336() {
+        // Mutation guard mirroring `apply_consider_con_color_comes_from_level_not_faction` (#355 M1):
+        // a lethal (level=13/red) mob that happens to hash to a safe-looking low faction number must
+        // still report `last_consider.con_name == "red"`, never a tier derived from the faction field.
+        let mut gs = GameState::new();
+        gs.entities.insert(77, test_entity(77, "a_dragon", 100.0));
+        // no set_target — this is the standalone path #336 is about.
+        let mut reply = [0u8; 20];
+        reply[4..8].copy_from_slice(&77u32.to_le_bytes());     // targetid
+        reply[8..12].copy_from_slice(&2u32.to_le_bytes());      // faction 2 -> attitude "warmly"
+        reply[12..16].copy_from_slice(&13u32.to_le_bytes());    // level 13 -> con_name "red"
+        super::apply_consider(&mut gs, &reply);
+        let lc = gs.last_consider.expect("last_consider must be set");
+        assert_eq!(lc.con_name, "red", "tier must come from level (13/red), never faction (2/warmly)");
+        assert_eq!(lc.attitude, "warmly");
+    }
+
+    #[test]
+    fn apply_consider_targeted_also_sets_last_consider_336() {
+        // last_consider is unconditional: a TARGETED consider populates it too, alongside the
+        // older target_con*/target_con_name/target_attitude fields (#292).
+        let mut gs = GameState::new();
+        gs.entities.insert(450, test_entity(450, "Guard_Phaeton", 100.0));
+        gs.set_target(450);
+        let mut reply = [0u8; 20];
+        reply[4..8].copy_from_slice(&450u32.to_le_bytes());
+        reply[8..12].copy_from_slice(&9u32.to_le_bytes());     // scowls
+        reply[12..16].copy_from_slice(&13u32.to_le_bytes());   // red
+        super::apply_consider(&mut gs, &reply);
+        assert_eq!(gs.target_con_name.as_deref(), Some("red"));
+        let lc = gs.last_consider.expect("last_consider must also be set for a targeted consider");
+        assert_eq!(lc.spawn_id, 450);
+        assert_eq!(lc.con_name, "red");
+        assert_eq!(lc.attitude, "scowls");
     }
 
     #[test]
