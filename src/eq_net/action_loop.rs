@@ -2113,7 +2113,9 @@ impl ActionLoop {
                     // but never acked — the awaited path reports `Unconfirmed` (202, outcome UNKNOWN),
                     // NEVER success.
                     let await_tx = g.await_tx.take();
-                    stream.send_app_packet(OP_CANCEL_TRADE, &[]);
+                    // 8-byte CancelTrade_Struct — the server DROPS a 0-byte OP_CancelTrade on a size
+                    // check (client_packet.cpp:4319), so a bare `&[]` never actually ended the session.
+                    stream.send_app_packet(OP_CANCEL_TRADE, &build_cancel_trade(gs.player_id));
                     tracing::warn!("EQ: give: no trade ack (timed out)");
                     gs.log_msg("trade", "Trade timed out (no NPC ack)");
                     if let Some(tx) = await_tx {
@@ -2189,10 +2191,22 @@ impl ActionLoop {
             g.ticks_waiting += 1;
             if g.ticks_waiting >= GIVE_FINISH_TIMEOUT_TICKS {
                 let await_tx = g.await_tx.take();
+                // #480: end the trade session server-side before we clear `give_state`. The verdict is
+                // still genuinely UNKNOWN at this timeout, so the caller MUST get an honest `Unconfirmed`
+                // — OP_CancelTrade does NOT retroactively make this a success or a clean refusal, it only
+                // FORECLOSES a late OP_FinishTrade for THIS give from mis-attributing to a SUBSEQUENT
+                // give/trade (`Client::FinishTrade`+`Trade::Reset`, client_packet.cpp:4337). If the trade
+                // already completed server-side (the finish was merely delayed/lost) the cancel is a
+                // harmless no-op (trade->With() is null; server just closes our UI). Either way the
+                // outcome we report is unchanged — narrowed, not fabricated. (Residual: if the real
+                // OP_FinishTrade is already IN FLIGHT when we cancel, the cancel can't recall it — see
+                // #498; serialization keeps at most one give parked, but a next give could still be
+                // reached by a finish that crossed the cancel on the wire. Narrowed, not eliminated.)
+                stream.send_app_packet(OP_CANCEL_TRADE, &build_cancel_trade(gs.player_id));
                 if let Some(tx) = await_tx {
                     let _ = tx.send(crate::command_state::CommandResult::Unconfirmed);
                 }
-                tracing::warn!("EQ: give: no OP_FinishTrade after accept — outcome UNKNOWN (item mismatch or lost)");
+                tracing::warn!("EQ: give: no OP_FinishTrade after accept — outcome UNKNOWN (item mismatch or lost); sent OP_CancelTrade to end the session");
                 gs.log_msg("trade", "Trade not confirmed (item may have been returned)");
                 self.give_state = None;
             }
@@ -3864,6 +3878,49 @@ mod tests {
         assert_eq!(resp.try_recv(), Ok(crate::command_state::CommandResult::Unconfirmed),
             "an item-mismatch turn-in (no OP_FinishTrade) is honestly UNKNOWN, not success");
         assert!(nav.give_state.is_none());
+    }
+
+    /// #480: the PHASE-2 finish-timeout sends OP_CancelTrade to end the trade session server-side
+    /// (shrinking the late-OP_FinishTrade misattribution window), WITHOUT fabricating an outcome — the
+    /// give still resolves the honest `Unconfirmed`. Two independent asserts guard against opposite
+    /// regressions: (1) an 8-byte OP_CancelTrade (0x354c) reaches the wire — mutation-check: deleting
+    /// the `send_app_packet(OP_CANCEL_TRADE, ..)` fails this; a 0-byte send (the old phase-1 bug the
+    /// server drops on a size check) fails the length assert; (2) the result is `Unconfirmed`, NOT a
+    /// fabricated `Resolved`/`Refused` — the cancel doesn't retroactively decide the unknown outcome.
+    #[tokio::test]
+    async fn awaited_give_phase2_timeout_cancels_trade_and_is_unconfirmed() {
+        let mut nav = new_loop();
+        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let mut gs = seed_give_gs(); // player_id = 42
+
+        let (tx, mut resp) = tokio::sync::oneshot::channel();
+        nav.command.request_give_await(11, 23, tx);
+        nav.tick_give(&mut stream, &mut gs);          // begin (phase 1)
+        gs.trade_ack_ready = true;
+        nav.tick_give(&mut stream, &mut gs);          // ack → accept sent, enter phase 2
+        assert!(nav.give_state.is_some());
+
+        // No OP_FinishTrade ever arrives. Tick until the phase-2 abort fires.
+        for _ in 0..GIVE_FINISH_TIMEOUT_TICKS {
+            assert!(matches!(resp.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
+                "a give awaiting finish must not resolve before the timeout");
+            nav.tick_give(&mut stream, &mut gs);
+        }
+
+        // (2) Honest outcome: still UNKNOWN — the cancel does not manufacture a success or a refusal.
+        assert_eq!(resp.try_recv(), Ok(crate::command_state::CommandResult::Unconfirmed),
+            "a phase-2 finish-timeout is honestly UNKNOWN even though we cancel the trade");
+        assert!(nav.give_state.is_none(), "the timed-out give must clear its state");
+
+        // (1) The trade session was ended server-side: an 8-byte OP_CancelTrade reached the wire.
+        let cancels: Vec<_> = stream.sent_app_packets().into_iter()
+            .filter(|(op, _)| *op == OP_CANCEL_TRADE).collect();
+        assert_eq!(cancels.len(), 1,
+            "the phase-2 finish-timeout must send exactly one OP_CancelTrade to end the session (#480)");
+        assert_eq!(cancels[0].1.len(), 8,
+            "OP_CancelTrade must carry an 8-byte CancelTrade_Struct — the server DROPS any other size");
+        assert_eq!(u32::from_le_bytes(cancels[0].1[0..4].try_into().unwrap()), gs.player_id,
+            "fromid must be our player id");
     }
 
     /// SINGLETON-IN-FLIGHT: a second awaited give while one is in flight is rejected `Refused` with no
