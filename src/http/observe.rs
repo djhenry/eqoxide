@@ -386,13 +386,112 @@ async fn get_who(State(s): State<HttpState>) -> Response {
     }
 }
 
-/// GET /v1/observe/entities — returns {name: [x,y,z], ...} for all known entities.
-async fn get_entities(State(s): State<HttpState>) -> Json<HashMap<String, [f32; 3]>> {
-    let positions = s.world.entity_positions.lock().unwrap();
-    let out: HashMap<_, _> = positions.iter()
-        .map(|(k, &(x, y, z))| (k.clone(), [x, y, z]))
-        .collect();
-    Json(out)
+/// Strip a trailing run of ASCII digits off an EQEmu spawn name. When two mobs in a zone share a
+/// name the server disambiguates them by appending a zero-padded numeric index — "a_bat" becomes
+/// "a_bat00","a_bat01"…, and a duplicated *unique* NPC "Geeda" becomes "Geeda"/"Geeda00". So two
+/// placements of the SAME underlying mob differ only by this suffix; grouping on the digit-stripped
+/// base name is what lets the observe-boundary dedup (#471) recognize them as one logical entity
+/// while leaving genuinely different names (which have different bases) untouched.
+fn base_name(name: &str) -> &str {
+    name.trim_end_matches(|c: char| c.is_ascii_digit())
+}
+
+/// One cluster of same-base-name entities the server placed at a byte-identical position (#471).
+/// Surfaced (not silently dropped) so an agent can see the collapse happened and still knows the
+/// full set of names — each remains individually targetable via the other APIs (`entity_ids` is
+/// NOT deduped, only this read-only view is).
+#[derive(serde::Serialize)]
+struct DuplicateGroup {
+    position: [f32; 3],
+    /// Every full (suffixed) name the server reported at this exact position, sorted.
+    names: Vec<String>,
+    /// Which of `names` survives in the `entities` map (the un-suffixed spelling when present).
+    kept: String,
+}
+
+/// Response for GET /v1/observe/entities. `entities` is the name→pos roster with same-name +
+/// identical-position duplicates collapsed; `deduped`/`duplicate_groups`/`note` LABEL any collapse
+/// so nothing is hidden silently (agent-honesty invariant, #471).
+#[derive(serde::Serialize)]
+struct EntitiesView {
+    /// Number of entries in `entities` after the dedup.
+    count: usize,
+    /// name → [x,y,z] for all known entities, positional duplicates collapsed to one.
+    entities: HashMap<String, [f32; 3]>,
+    /// How many entries were collapsed out. 0 = the roster had no positional duplicates.
+    deduped: usize,
+    /// The collapsed clusters (empty when `deduped == 0`).
+    duplicate_groups: Vec<DuplicateGroup>,
+    /// Human-readable explanation, present only when `deduped > 0`.
+    note: Option<String>,
+}
+
+/// Collapse suspected server-side duplicate spawns (#471) for the read-only /observe/entities view.
+///
+/// Groups entries that share BOTH the same digit-stripped base name AND a byte-identical position
+/// (exact f32 bits — independently-placed mobs practically never collide exactly, and a live
+/// pathing mob has moved off its spawn point, so an exact match is the duplication fingerprint).
+/// Any group with more than one member is collapsed to a single representative, preferring the
+/// un-suffixed spelling. Returns the deduped name→pos map, the count removed, and a description of
+/// every collapsed cluster so the drop is NEVER silent. The underlying `gs.entities`/`entity_ids`
+/// maps are left untouched, so both physical instances stay individually targetable by their full
+/// names — this is a display-layer honesty mitigation, not a change to the world model.
+fn dedup_entities(
+    positions: &HashMap<String, (f32, f32, f32)>,
+) -> (HashMap<String, [f32; 3]>, usize, Vec<DuplicateGroup>) {
+    // key: (base name, position bit-pattern) → all full names placed there.
+    let mut groups: HashMap<(String, (u32, u32, u32)), Vec<String>> = HashMap::new();
+    for (name, &(x, y, z)) in positions {
+        let key = (base_name(name).to_string(), (x.to_bits(), y.to_bits(), z.to_bits()));
+        groups.entry(key).or_default().push(name.clone());
+    }
+    let mut out: HashMap<String, [f32; 3]> = HashMap::new();
+    let mut deduped = 0usize;
+    let mut dup_groups = Vec::new();
+    for ((_, (xb, yb, zb)), mut names) in groups {
+        let pos = [f32::from_bits(xb), f32::from_bits(yb), f32::from_bits(zb)];
+        names.sort();
+        // Prefer the un-suffixed spelling (e.g. "Geeda" over "Geeda00") as the survivor, else the
+        // lexicographically-first name — deterministic regardless of HashMap iteration order.
+        let kept = names.iter().find(|n| base_name(n) == n.as_str())
+            .cloned().unwrap_or_else(|| names[0].clone());
+        out.insert(kept.clone(), pos);
+        if names.len() > 1 {
+            deduped += names.len() - 1;
+            dup_groups.push(DuplicateGroup { position: pos, names, kept });
+        }
+    }
+    dup_groups.sort_by(|a, b| a.kept.cmp(&b.kept));
+    (out, deduped, dup_groups)
+}
+
+/// GET /v1/observe/entities — the name→position roster of all known entities.
+///
+/// #471 (agent-honesty): live play saw the roster report ~2× duplicate spawns — byte-identical
+/// name+position with consecutive server spawn_ids (e.g. 526/527), including unique named NPCs that
+/// exist once per server, which also leaked into chat as doubled zone-in greetings. The client
+/// cannot manufacture a second spawn_id (`register_spawn` upserts `gs.entities` by the verbatim
+/// server id, `packet_handler.rs`), it clears the roster on every zone-in (`apply_new_zone`), and
+/// both name→pos publishers full-replace their maps (`action_loop::sync_entities`, `login.rs`) — so
+/// two distinct ids at one position can only be two genuine server `Mob`s (duplicated `spawn2`
+/// content, whose names the wire disambiguates with a numeric suffix). A packet capture is still
+/// needed to confirm two distinct spawn_ids on the wire vs. a client artifact. Until then this
+/// endpoint collapses same-base-name + identical-position duplicates to one entry and LABELS the
+/// collapse (`deduped`/`duplicate_groups`/`note`) rather than silently dropping — the underlying
+/// entity model is untouched, so every instance stays targetable by its full name.
+async fn get_entities(State(s): State<HttpState>) -> Json<EntitiesView> {
+    let (entities, deduped, duplicate_groups) = {
+        let positions = s.world.entity_positions.lock().unwrap();
+        dedup_entities(&positions)
+    };
+    let note = (deduped > 0).then(|| format!(
+        "{deduped} entry(ies) collapsed as same-name + byte-identical-position duplicates \
+         (suspected server-side spawn2 duplication, #471). The underlying entity model is \
+         untouched and every instance is still targetable by its full name; see duplicate_groups. \
+         A live packet capture is still needed to confirm this is server-sent (two distinct \
+         spawn_ids on the wire) rather than a client artifact."
+    ));
+    Json(EntitiesView { count: entities.len(), entities, deduped, duplicate_groups, note })
 }
 
 /// GET /v1/observe/inventory — the player's current inventory + equipment, published each tick by
@@ -831,6 +930,76 @@ mod tests {
             "stale target_name must not leak into the new zone (#408)");
         assert_eq!(p["target_hp_pct"], serde_json::json!(null),
             "stale target_hp_pct must not leak into the new zone (#408)");
+    }
+
+    /// #471 (agent-honesty): the server placed two Mobs (consecutive spawn_ids, e.g. 526/527) at a
+    /// byte-identical position; the wire disambiguates their names with a numeric suffix
+    /// ("Geeda"/"Geeda00"), so in the name-keyed roster they survive as TWO entries. The observe
+    /// boundary must collapse them to one AND say it did — never silently drop (the honesty
+    /// invariant). A no-op dedup leaves two entries with deduped==0, so this pins the collapse.
+    #[test]
+    fn dedup_collapses_consecutive_id_name_position_pair_471() {
+        let mut m = HashMap::new();
+        m.insert("Geeda".to_string(),        (100.0f32, 200.0, 5.0)); // spawn_id 526
+        m.insert("Geeda00".to_string(),      (100.0f32, 200.0, 5.0)); // spawn_id 527, identical pos
+        m.insert("Bidl_Frugrin".to_string(), (10.0f32,  20.0,  3.0)); // a genuine singleton
+        let (out, deduped, groups) = dedup_entities(&m);
+        assert_eq!(deduped, 1, "the duplicate pair must collapse to exactly one removed entry");
+        assert_eq!(out.len(), 2, "Geeda (one of two) + Bidl_Frugrin");
+        assert!(out.contains_key("Geeda"), "the un-suffixed spelling is kept as the representative");
+        assert!(!out.contains_key("Geeda00"), "the suffixed duplicate is collapsed out of the view");
+        assert!(out.contains_key("Bidl_Frugrin"), "the singleton is untouched");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].names, vec!["Geeda".to_string(), "Geeda00".to_string()],
+            "the collapsed cluster surfaces BOTH names — nothing is hidden");
+        assert_eq!(groups[0].kept, "Geeda");
+        assert_eq!(groups[0].position, [100.0, 200.0, 5.0]);
+    }
+
+    /// Same base name at DIFFERENT positions = two real mobs; never collapse them.
+    #[test]
+    fn dedup_keeps_same_name_at_distinct_positions_471() {
+        let mut m = HashMap::new();
+        m.insert("a_bat00".to_string(), (1.0f32, 2.0, 3.0));
+        m.insert("a_bat01".to_string(), (9.0f32, 8.0, 7.0));
+        let (out, deduped, groups) = dedup_entities(&m);
+        assert_eq!(deduped, 0);
+        assert_eq!(out.len(), 2);
+        assert!(groups.is_empty());
+    }
+
+    /// Two genuinely-different mobs sharing an exact position (astronomically rare) must NOT merge —
+    /// different base names, so collapsing them would hide a real entity.
+    #[test]
+    fn dedup_keeps_different_names_sharing_a_position_471() {
+        let mut m = HashMap::new();
+        m.insert("a_rat00".to_string(),   (5.0f32, 5.0, 5.0));
+        m.insert("a_snake00".to_string(), (5.0f32, 5.0, 5.0));
+        let (out, deduped, _groups) = dedup_entities(&m);
+        assert_eq!(deduped, 0);
+        assert_eq!(out.len(), 2);
+    }
+
+    /// End-to-end through the router: /observe/entities must return the labeled shape with a
+    /// non-zero `deduped` and an explanatory `note` when the roster carries a positional duplicate.
+    #[tokio::test]
+    async fn entities_endpoint_labels_the_dedup_471() {
+        let state = empty_state();
+        {
+            let mut pos = state.world.entity_positions.lock().unwrap();
+            pos.insert("Geeda".to_string(),   (100.0, 200.0, 5.0));
+            pos.insert("Geeda00".to_string(), (100.0, 200.0, 5.0));
+        }
+        let resp = get(state, "/entities").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["count"], 1);
+        assert_eq!(v["deduped"], 1, "the duplicate must be surfaced as a count, not silently dropped");
+        assert!(v["note"].as_str().unwrap().contains("#471"),
+            "the collapse must be labeled with an explanation, got: {}", v["note"]);
+        assert_eq!(v["duplicate_groups"][0]["kept"], "Geeda");
+        assert!(v["entities"]["Geeda"].is_array());
     }
 
     fn push_message(state: &HttpState, kind: &str, text: &str) {
