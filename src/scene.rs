@@ -2,7 +2,7 @@
 //! pose/position, recent messages, target info, …). Copied from the network-owned `GameState` once
 //! per frame so the render loop never blocks on or shares locks with the EQ network thread.
 
-use crate::game_state::GameState;
+use crate::game_state::{GameState, LogEntry};
 
 /// How long a one-shot combat swing (OP_Animation) plays before reverting to idle/walk. ~one swing.
 pub const COMBAT_SWING_WINDOW: std::time::Duration = std::time::Duration::from_millis(600);
@@ -49,17 +49,6 @@ pub struct DoorRender {
     pub size:      u16,
     pub opentype:  u8,
     pub open_frac: f32,
-}
-
-/// A single entry in the message log.
-#[derive(Debug, Clone, PartialEq)]
-pub struct LogEntry {
-    pub kind: String,
-    pub text: String,
-    pub timestamp: std::time::Instant,
-    /// Any item/say links parsed out of `text` — the display text is already clean (hex-free);
-    /// this carries the resolvable `item_id` alongside it (eqoxide#256).
-    pub item_links: Vec<crate::game_state::ItemLink>,
 }
 
 /// All data the renderer needs for one frame.
@@ -413,17 +402,6 @@ impl SceneState {
             killed_by: gs.killed_by.clone(),
             zone_id: gs.world.zone_id,
             zone_fog: gs.world.zone_fog,
-        }
-    }
-}
-
-impl Default for LogEntry {
-    fn default() -> Self {
-        LogEntry {
-            kind: String::new(),
-            text: String::new(),
-            timestamp: std::time::Instant::now(),
-            item_links: Vec::new(),
         }
     }
 }
