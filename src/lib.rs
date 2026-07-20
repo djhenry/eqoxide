@@ -30,9 +30,15 @@ pub use eqoxide_core::{config, coord, eqstr, game_state, region_map, skills, spe
 // `CameraMode`, `FrameProfile`/`FrameSample`) so their `crate::<mod>::<Type>` paths are unaffected too.
 pub use eqoxide_ipc as ipc;
 
+// The zone-geometry types + GLB loader (`ZoneAssets`, `MeshData`, `RenderMode`, `expand_objects`,
+// `COLLISION_MESH_TAG`) now live in the `eqoxide-assets` workspace crate (#544 Step 2e), depending
+// only on `eqoxide-core` + external crates (gltf/glam/anyhow/serde_json/tracing) — a clean leaf
+// `eqoxide-nav` can depend on next. Alias it as this crate's `assets` module so every existing
+// `crate::assets::…` / `eqoxide::assets::…` path keeps resolving unchanged.
+pub use eqoxide_assets as assets;
+
 pub mod anim;
 pub mod app;
-pub mod assets;
 pub mod asset_sync;
 pub mod billboard;
 pub mod camera;

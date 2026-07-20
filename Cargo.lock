@@ -843,6 +843,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "eqoxide-assets",
  "eqoxide-core",
  "eqoxide-ipc",
  "glam",
@@ -867,6 +868,18 @@ dependencies = [
  "ureq",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "eqoxide-assets"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "eqoxide-core",
+ "glam",
+ "gltf",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

@@ -1,4 +1,8 @@
-//! Zone + texture asset loading.
+//! `eqoxide-assets` — zone + texture asset loading, extracted as a workspace crate above
+//! `eqoxide-core` (`core ← assets`, #544 Step 2e) so `eqoxide-nav` can depend on it next. The app
+//! crate re-exports this crate as its `assets` module (`pub use eqoxide_assets as assets;`), so
+//! every existing `crate::assets::…` / `eqoxide::assets::…` path across the tree keeps resolving
+//! unchanged.
 //!
 //! Loads EQ zone GLB/PNG assets into CPU-side `MeshData`/`TextureData`, instances
 //! placed objects (buildings, etc.) from the zone's ActorInstance fragments, and indexes equipment
@@ -7,7 +11,8 @@
 //! The collision grid built from this data (`Collision::build`) and its A* pathfinding model — the
 //! `floor_z`/`nearest_floor` (grounding), `nearest_hit_t`/`segment_blocked` (camera + nameplate
 //! occlusion), `path_clear` (movement gating), and `find_path` (A* routing) queries — live in
-//! [`crate::nav::collision`] (cleanup step 4). See `docs/collision-system.md`.
+//! `nav::collision` (cleanup step 4) in the app crate, ONE LAYER UP — this crate has no reference
+//! back into it. See `docs/collision-system.md`.
 
 use anyhow::Context;
 
