@@ -1016,7 +1016,7 @@ mod tests {
             gs.player_id = 1;
             // The target's REAL level (12) comes from the spawn — deliberately different from the
             // consider reply's ConsiderColor field (13 = red) to prove the two are sourced separately.
-            let mut npc = crate::game_state::tests::make_entity(136, "Caleah_Herblender000", 0.0, 0.0, 0.0, true);
+            let mut npc = crate::game_state::make_entity(136, "Caleah_Herblender000", 0.0, 0.0, 0.0, true);
             npc.level = 12;
             gs.upsert_entity(npc);
             gs.set_target(136);
@@ -1043,7 +1043,7 @@ mod tests {
         let state = empty_state();
         set_gs(&state, |gs| {
             gs.player_id = 1;
-            let mut npc = crate::game_state::tests::make_entity(450, "Guard_Phaeton", 0.0, 0.0, 0.0, true);
+            let mut npc = crate::game_state::make_entity(450, "Guard_Phaeton", 0.0, 0.0, 0.0, true);
             npc.level = 20;
             gs.upsert_entity(npc);
             // no set_target — the whole point of the standalone endpoint.
@@ -1076,7 +1076,7 @@ mod tests {
         set_gs(&state, |gs| {
             gs.player_id = 42;
             gs.max_hp = 34;
-            gs.upsert_entity(crate::game_state::tests::make_entity(66, "Guard_Doradek000", 0.0, 0.0, 0.0, true));
+            gs.upsert_entity(crate::game_state::make_entity(66, "Guard_Doradek000", 0.0, 0.0, 0.0, true));
             crate::eq_net::packet_handler::apply_death(gs, &death_reply(42, 66)); // our spawn, killed by 66
         });
         let p = debug_json(state).await["player"].clone();
@@ -1097,7 +1097,7 @@ mod tests {
         let state = empty_state();
         set_gs(&state, |gs| {
             gs.world.zone_name = "kaladimb".into();
-            gs.upsert_entity(crate::game_state::tests::make_entity(66, "Guard_Dalammer000", 0.0, 0.0, 0.0, true));
+            gs.upsert_entity(crate::game_state::make_entity(66, "Guard_Dalammer000", 0.0, 0.0, 0.0, true));
             gs.set_target(66);
         });
         assert_eq!(debug_json(state.clone()).await["player"]["target_id"], serde_json::json!(66),

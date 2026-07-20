@@ -688,7 +688,9 @@ pub struct GameState {
     pub next_chat_id: u64,
 
     // UCS (chat server) connection params from OP_SetChatServer; Some once received at zone-in.
-    pub ucs: Option<crate::eq_net::ucs::UcsInfo>,
+    // `UcsInfo` is a core-local POD (moved down in #544 Step 2b); the wire parser lives in
+    // `eq_net::ucs`, which re-exports this same type.
+    pub ucs: Option<crate::ucs::UcsInfo>,
 
     // Strategy text for HUD
     pub strategy: String,
@@ -1353,9 +1355,35 @@ pub fn split_keywords(text: &str) -> Vec<(String, bool)> {
     out
 }
 
+/// Test-only entity constructor. Gated on `test-fixtures` (not bare `#[cfg(test)]`) and `pub` so the
+/// app crate's own tests can build fixture entities across the crate boundary — core's `#[cfg(test)]`
+/// is invisible downstream (#544 Step 2b; the region_map fixture pattern). Call it as
+/// `eqoxide::game_state::make_entity(...)` (i.e. `crate::game_state::make_entity` in the app crate).
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn make_entity(id: u32, name: &str, x: f32, y: f32, z: f32, is_npc: bool) -> Entity {
+    Entity {
+        spawn_id: id,
+        name: name.to_string(),
+        level: 1,
+        is_npc,
+        x,
+        y,
+        z,
+        hp_pct: 100.0,
+        cur_hp: 100,
+        max_hp: 100,
+        race: String::new(),
+        heading: 0.0,
+        dead: false,
+        equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
+        face: 0, hairstyle: 0, haircolor: 0,
+        animation: 0, floating: false,
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{Door, Entity, GameState, MerchantItem};
+    use super::{Door, GameState, MerchantItem, make_entity};
 
     /// eqoxide#201: the flat bag-slot mapping must round-trip and match the RoF2 numbering
     /// (GENERAL_BAGS_BEGIN=251, stride 10, parent general slots 23-32).
@@ -1382,27 +1410,6 @@ pub(crate) mod tests {
         assert_eq!(bag_wire_parent(33), None);
         assert_eq!(bag_wire_parent(250), None);
         assert_eq!(bag_wire_parent(351), None);
-    }
-
-    pub(crate) fn make_entity(id: u32, name: &str, x: f32, y: f32, z: f32, is_npc: bool) -> Entity {
-        Entity {
-            spawn_id: id,
-            name: name.to_string(),
-            level: 1,
-            is_npc,
-            x,
-            y,
-            z,
-            hp_pct: 100.0,
-            cur_hp: 100,
-            max_hp: 100,
-            race: String::new(),
-            heading: 0.0,
-            dead: false,
-            equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
-            face: 0, hairstyle: 0, haircolor: 0,
-            animation: 0, floating: false,
-        }
     }
 
     // --- Entity::dist_to ---

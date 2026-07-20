@@ -15,11 +15,12 @@
 //!
 //! `assets`/`game_state`/`camera_state`/`config`/`eqstr`/`zone_map` are shared support modules.
 
-// The dependency-free leaf modules now live in the `eqoxide-core` workspace crate (#544 Step 2a).
+// The dependency-free leaf modules now live in the `eqoxide-core` workspace crate (#544 Step 2a/2b).
 // Re-export them at this crate's root so existing `crate::<mod>` / `eqoxide::<mod>` paths across the
-// tree keep resolving unchanged. (`game_state`/`spells` stay in this crate for now — `game_state`
-// still up-references `eq_net::ucs::UcsInfo`, which transitively pins `spells`; see PR notes.)
-pub use eqoxide_core::{config, coord, eqstr, region_map, skills, zone_map};
+// tree keep resolving unchanged. Step 2b added `game_state`/`spells`/`ucs`: `UcsInfo` was relocated
+// DOWN into core (`eq_net::ucs` re-exports it), which let `game_state` — and the `spells` it pins —
+// follow it down without any up-reference into a higher layer.
+pub use eqoxide_core::{config, coord, eqstr, game_state, region_map, skills, spells, zone_map};
 
 pub mod anim;
 pub mod app;
@@ -47,10 +48,8 @@ pub mod command_state;
 pub mod crash;
 pub mod eq_net;
 pub mod frame_capture;
-pub mod game_state;
 pub mod http;
 pub mod hud;
 pub mod ipc;
 pub mod model;
-pub mod spells;
 pub mod ui;

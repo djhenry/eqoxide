@@ -6,15 +6,10 @@
 //!
 //! See bugs/cross-zone-chat-needs-ucs.md and EQEmu ucs/clientlist.cpp for the server side.
 
-/// Connection parameters parsed from `OP_SetChatServer`, everything needed to reach the UCS.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct UcsInfo {
-    pub host:      String, // UCS server host
-    pub port:      u16,    // UCS server port
-    pub mailbox:   String, // "<shortname>.<charname>" — sent verbatim as the OP_MailLogin MailBox
-    pub conn_type: char,   // 1-char connection-type indicator (e.g. RoF2 combined)
-    pub key:       String, // mail key (8 chars) the UCS verifies via VerifyMailKey
-}
+// The `UcsInfo` POD moved DOWN into `eqoxide-core` (#544 Step 2b) so `game_state` (now also in
+// core) no longer up-references this `eq_net` layer. Re-export it here so every existing
+// `crate::eq_net::ucs::UcsInfo` path — and this module's own parser/tests — keep resolving.
+pub use eqoxide_core::ucs::UcsInfo;
 
 /// Parse the `OP_SetChatServer` payload, a NUL-terminated comma string:
 /// `"<host>,<port>,<shortname>.<charname>,<connTypeChar><key>"`. The mailbox contains a '.', not a
