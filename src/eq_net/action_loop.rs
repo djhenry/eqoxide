@@ -10,8 +10,9 @@ const NAV_TICK_MS: u128 = 150;
 /// Native Titanium base run speed in EQ units/second (runspeed 0.7 → 44 u/s; 10 Hz updates of
 /// 4.4 u each). Per eq-client-expert, see ~/git/eq_kb/player-movement-speed.md.
 /// We must NOT move faster than this: even where THIS server tolerates it, others rubber-band or
-/// reject motion the real client can't produce.
-pub(crate) const RUN_SPEED: f32 = 44.0;
+/// reject motion the real client can't produce. Defined in `eqoxide-core::physics` (#544 Step 2d)
+/// and re-exported here so `crate::eq_net::action_loop::RUN_SPEED` keeps resolving.
+pub(crate) use eqoxide_core::physics::RUN_SPEED;
 use crate::eq_net::protocol::*;
 use crate::eq_net::transport::EqStream;
 use crate::game_state::{GameState, ZonePoint};

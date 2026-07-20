@@ -622,7 +622,8 @@ mod tests {
     use super::*;
     use crate::assets::{MeshData, RenderMode, ZoneAssets};
     use crate::nav::collision::Collision;
-    use crate::movement::{CharacterController, MoveIntent, PLAYER_RADIUS};
+    use crate::movement::{CharacterController, PLAYER_RADIUS};
+    use eqoxide_ipc::MoveIntent;
 
     fn mesh(positions: Vec<[f32; 3]>) -> MeshData {
         MeshData {

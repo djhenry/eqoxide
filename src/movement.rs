@@ -16,42 +16,20 @@ use crate::nav::collision::Collision;
 // `crate::movement::{MoveIntent,ControllerView}` path across the tree keeps resolving unchanged.
 pub use eqoxide_ipc::{ControllerView, MoveIntent};
 
-/// Wall-collision sphere radius, matched to the reference RoF2 client.
-pub const PLAYER_RADIUS: f32 = 1.0;
+// Pure physics constants + kinematics moved DOWN into `eqoxide-core::physics` (#544 Step 2d) so nav
+// stops up-referencing this app-layer module for them. Re-exported here so every existing
+// `crate::movement::{PLAYER_RADIUS,STEP_UP,JUMP_VELOCITY,running_jump_reach}` path keeps resolving.
+// `GRAVITY` was module-private (used only by `step` below) so it is `use`d, not re-exported.
+pub use eqoxide_core::physics::{running_jump_reach, JUMP_VELOCITY, PLAYER_RADIUS, STEP_UP};
+use eqoxide_core::physics::GRAVITY;
+
 /// Skin width kept between the cylinder and the surface after a swept hit.
 const SKIN: f32 = 0.05;
-/// Step-up height, matched to the reference RoF2 client. This is a HARD cap: the
-/// native client can auto-step a ledge at most 2.0u tall; anything taller is a wall (jump or go
-/// around) — there is no larger climb and no separate slope check. It is the single source of truth
-/// for how high nav may climb, so `find_path` derives its edge-climb cap (`STEP_H`) from it. Both
-/// free WASD and the nav walker are clamped to this — navigation must never climb what a WASD player
-/// can't (#239). (Was decoupled from a super-human `NAV_CLIMB = 20.0`, which teleported the walker up
-/// 20u ridges/invisible walls and stranded it on the high side of boundaries.)
-pub const STEP_UP: f32 = 2.0;
 /// Ground-probe origin above the feet.
 const GROUND_ORIGIN: f32 = 1.0;
 /// Ground-probe downward range.
 const GROUND_DEPTH: f32 = 200.0;
-/// Gravity / terminal fall (matches the renderer's prior physics + falling-physics.md).
-const GRAVITY: f32 = 120.0;
 const MAX_FALL: f32 = 128.0;
-/// Jump impulse for the free-WASD Space jump. Peak height = v²/(2·GRAVITY); at 31 that's ~4.0u —
-/// enough to clear/mount low ledges, steps and small crates (well above the 2u step-up), matching
-/// the reference RoF2 client's usable jump. The old value (13 → only ~0.7u peak, "barely leaves
-/// the ground") was a placeholder carried over from the pre-controller WASD block (eqoxide#92).
-/// (Exact RoF2 parity of the impulse is worth a live check; 4u restores a usable jump.)
-pub const JUMP_VELOCITY: f32 = 31.0;
-
-/// Horizontal distance a *running* jump clears to a landing at roughly takeoff height, at
-/// `run_speed` (u/s). The character leaves the ground at `JUMP_VELOCITY` and, ignoring the small
-/// landing-height difference, is airborne for `2·JUMP_VELOCITY/GRAVITY` seconds (up then back to
-/// takeoff height); horizontal reach = airborne_time · run_speed. `find_path` uses this to add
-/// jump-edges across genuine floor gaps no wider than a jump can bridge (eqoxide#190). A landing
-/// that is LOWER than takeoff gives more airborne time, so this is a conservative (minimum) reach.
-pub fn running_jump_reach(run_speed: f32) -> f32 {
-    let air_time = 2.0 * JUMP_VELOCITY / GRAVITY;
-    air_time * run_speed
-}
 
 /// Vertical impulse for a nav auto-hop over a low fence/cart rail. Peak height = v²/(2·GRAVITY);
 /// at 44 that clears ~8u, enough for the low pen fences that block `/goto` (#41). Only used in nav
