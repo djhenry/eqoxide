@@ -3,7 +3,7 @@
 //! ────────────────────────────────────────────────────────────────────────────────────────────
 //! WHY THIS EXISTS  (the agent-honesty gap it closes)
 //! ────────────────────────────────────────────────────────────────────────────────────────────
-//! A plain `request_*` command (see `crate::command_state::mod`) is fire-and-forget: the HTTP
+//! A plain `request_*` command (see the app crate's `command_state` module) is fire-and-forget: the HTTP
 //! handler queues the action into an `ipc` slot and immediately returns `200 OK`. But `200` there
 //! means "the request was ACCEPTED into the queue", NOT "the action SUCCEEDED". For an action whose
 //! real outcome is only knowable from a later server packet — a merchant buy that the server may
@@ -110,7 +110,7 @@
 //! and so MUST reference these types. `command_state` depends on `ipc` (the slot bundles), so
 //! having these result types live in `command_state` while `ipc` referenced them back would be an
 //! illegal dependency cycle once the two split into separate crates (`eqoxide-ipc`,
-//! `eqoxide-command`). `command_state` re-exports these types (`pub use crate::ipc::{...}`) so every
+//! `eqoxide-command`). `command_state` re-exports these types (`pub use eqoxide_ipc::{...}`) so every
 //! existing `crate::command_state::CommandResult`/`BuyOk`/`OpenOk`/`GiveOk`/`CastEnd` call site is
 //! unaffected — this was a pure code-motion, not a rename.
 

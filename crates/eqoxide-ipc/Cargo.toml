@@ -1,0 +1,18 @@
+[package]
+name = "eqoxide-ipc"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "eqoxide_ipc"
+path = "src/lib.rs"
+
+[dependencies]
+# ipc is the "inter-thread contracts" crate: it sits directly above `eqoxide-core` and below
+# everything else (core ← ipc ← {net, render, http, command, …}). It depends ONLY on core plus
+# the low-level channel/serde primitives its slot types are literally made of — NEVER on
+# wgpu/winit/egui/eq_net/renderer/app (#544 Step 2c).
+eqoxide-core = { path = "../eqoxide-core" }
+serde = { version = "1", features = ["derive"] }  # Serialize derives on the API-visible slot payloads
+tokio = { version = "1", features = ["sync"] }    # tokio::sync::oneshot — the await-slot reply channel
+arc-swap = "1"                                     # GameStateSnapshot = Arc<ArcSwap<GameState>>

@@ -1,14 +1,34 @@
-//! IPC channel "request-slot" types shared between the HTTP API thread, the network
-//! (login/gameplay/navigation) thread, and the render/app loop.
+//! `eqoxide-ipc` — the "inter-thread contracts" crate: the request-slot types shared between the
+//! HTTP API thread, the network (login/gameplay/navigation) thread, and the render/app loop.
+//!
+//! Extracted as the second member of the Cargo workspace (#544 Step 2c). It sits directly above
+//! `eqoxide-core` and below everything else — the layering is `core ← ipc ← {net, render, http,
+//! command, …}` — and depends ONLY on `eqoxide-core` plus the low-level channel/serde primitives
+//! (`tokio::sync::oneshot`, `arc-swap`, `serde`) its slot types are literally made of. It never
+//! reaches up into wgpu/winit/egui/eq_net/renderer/app. The app crate re-exports this crate as its
+//! `ipc` module (`pub use eqoxide_ipc as ipc`), so existing `crate::ipc::…` paths across the tree
+//! keep resolving unchanged.
 //!
 //! These are `Arc<Mutex<Option<T>>>`-style shared cells an HTTP handler writes a request into and
 //! the network action loop (or, for a few render-owned values, the app loop) drains each tick, plus
 //! the matching "published snapshot" direction (`Arc<Mutex<T>>` / `Arc<ArcSwap<T>>`) the network
 //! thread writes and HTTP/render read. They are neither genuine HTTP types (route state, request/
-//! response bodies — those stay in `crate::http`) nor genuine network-protocol types — this module
-//! is the neutral third party both sides depend on, so the network loop no longer has to reach into
-//! `crate::http` for its own inter-thread plumbing. Relocated out of `src/http/mod.rs` (cleanup; pure
-//! code motion, no behavior change) — see that module's docs for the HTTP-side half of this split.
+//! response bodies — those stay in the app crate's `http`) nor genuine network-protocol types — this
+//! crate is the neutral third party both sides depend on, so the network loop no longer has to reach
+//! into `http` for its own inter-thread plumbing.
+//!
+//! ## Relocated shared type definitions (#544 Step 2c)
+//! Several of this crate's slots wrap type *definitions* that used to live in higher app-crate
+//! modules, forcing an up-reference out of `ipc`. Those pure-data definitions moved DOWN here (their
+//! BEHAVIOR stayed in the app crate, which now `use`s these types — the correct app → ipc direction):
+//! - `MoveIntent`, `ControllerView` — from `movement` (the `CharacterController` stepping logic stays).
+//! - `CameraMode`, `CameraCmd`, `CameraSnapshot` — from `camera_state` (the `CameraState` update logic stays).
+//! - `FrameProfile`, `FrameSample` — from `profiling` (the `Stopwatch`/`enabled` collection helpers stay).
+//!
+//! Each origin module re-exports its moved types (`pub use eqoxide_ipc::…`) so every existing
+//! `crate::movement::MoveIntent` / `crate::camera_state::CameraCmd` / `crate::profiling::FrameProfile`
+//! path is unaffected. Serde derives/attrs/field names were preserved verbatim (several are
+//! serialized to the HTTP JSON API — the wire form must not change).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -20,6 +40,152 @@ use tokio::sync::oneshot;
 pub mod result;
 pub use result::{BuyOk, CastEnd, CommandResult, GiveOk, OpenOk};
 
+// ── Relocated shared type definitions (#544 Step 2c) ─────────────────────────────────────────────
+// Pure-data types the slots above/below wrap, moved down out of the app crate so `ipc` no longer
+// up-references `movement`/`camera_state`/`profiling`. Definitions only — the behavior that operates
+// on them (controller stepping, camera update, frame-profile collection) stays in those app modules,
+// which re-export these. Derives/serde attrs/field visibility are byte-identical to the originals.
+
+/// What the driver wants this frame. `wish_dir` is a horizontal direction in server axes
+/// (east, north); magnitude is treated as a throttle (clamped to 1). `speed` is run speed (u/s).
+///
+/// Relocated from `movement` (#544 Step 2c); `movement::CharacterController::step` consumes it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MoveIntent {
+    pub wish_dir:    [f32; 2],
+    pub wish_vspeed: f32,
+    pub jump:        bool,
+    pub want_swim:   bool,
+    pub speed:       f32,
+    /// Max step-up height the controller may climb this move, in EQ units. `0` (default) uses the
+    /// native `movement::STEP_UP` (2.0) — correct for free WASD, which must NOT be able to scale
+    /// walls. The `/goto` planner raises it so the controller can surmount the small lips
+    /// (fences/cart edges) that `find_path` already routed over (its edge-climb cap is the same).
+    /// Without this the path leads over a lip the 2u step can't clear and the player wedges (#41).
+    pub climb:       f32,
+    /// One-shot request to hop a low barrier (fence/cart) this tick. The `/goto` planner sets it once
+    /// its own net-progress stall detection fires (the controller can't see net progress — sliding
+    /// ALONG a fence looks like good per-frame motion). The controller hops only if it's grounded,
+    /// off cooldown, and a near-level landing exists just beyond (`movement::CharacterController::can_hop`).
+    /// Free WASD leaves it `false` (a player walking into a wall shouldn't auto-jump). Fixes the Halas
+    /// sled-pen (#41).
+    pub hop:         bool,
+}
+
+/// A read-only snapshot of the controller the render thread publishes each frame for the nav
+/// thread to stream to the server (design §2 "Threading"). `heading` is EQ-CCW degrees.
+///
+/// Relocated from `movement` (#544 Step 2c); the render thread produces it, the nav thread reads it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ControllerView {
+    pub pos:     [f32; 3],
+    pub heading: f32,
+    pub moving:  bool,
+    /// False until the render thread has spawned and seeded the controller. The nav streamer must
+    /// not mirror/stream a default (origin) position before this is set.
+    pub initialized: bool,
+    /// One-shot fall height (feet dropped) latched by the render thread the frame the controller
+    /// LANDS from an airborne stretch, for the nav thread to apply driver-agnostic fall damage (§442,
+    /// #442). `None` except right after a landing; the nav streamer take-and-clears it exactly once.
+    /// Respects the init gate — default `None`, only ever set after `initialized`.
+    pub landed_fall_height: Option<f32>,
+}
+
+/// Which mode the orbit/follow camera is in. Relocated from `camera_state` (#544 Step 2c).
+/// Serialized to the `/v1/camera` JSON — `rename_all = "snake_case"` is part of that wire form.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CameraMode { AutoFollow, ManualOrbit }
+
+/// An HTTP `/camera` command the render loop applies to the `camera_state::CameraState`. Relocated
+/// from `camera_state` (#544 Step 2c).
+#[derive(Debug, Clone)]
+pub enum CameraCmd {
+    Set {
+        azimuth:   Option<f32>,
+        elevation: Option<f32>,
+        radius:    Option<f32>,
+        focus:     Option<[f32; 3]>,
+    },
+    Reset,
+}
+
+/// Snapshot of the current camera state for the HTTP GET `/camera` response. Relocated from
+/// `camera_state` (#544 Step 2c); `camera_state::CameraState::snapshot` produces it. Serde form
+/// preserved verbatim (it is the JSON body).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CameraSnapshot {
+    pub mode:      CameraMode,
+    pub azimuth:   f32,
+    pub elevation: f32,
+    pub radius:    f32,
+    pub focus:     [f32; 3],
+}
+
+/// Smoothed per-phase timings (milliseconds) for the HUD overlay. All zero until the first profiled
+/// frame. Each field is an exponential moving average so the on-screen numbers are readable rather
+/// than flickering frame-to-frame.
+///
+/// Relocated from `profiling` (#544 Step 2c). Serialized to `/v1/observe/debug` (`frame_profile`) —
+/// the serde form is part of that wire contract. Its `blend` companion + the `FrameSample` it reads
+/// moved with it (an inherent impl must be co-located with its type); the `Stopwatch`/`enabled`
+/// collection helpers stayed in `profiling`.
+#[derive(Debug, Default, Clone, Copy, serde::Serialize)]
+pub struct FrameProfile {
+    pub update_ms: f32,
+    /// Update sub-phase: rebuilding `SceneState` from `GameState` (per-frame snapshot clone).
+    pub scene_ms:  f32,
+    /// Update sub-phase: per-entity motion smoothing + floor snap.
+    pub smooth_ms: f32,
+    pub render_ms: f32,
+    pub egui_ms:   f32,
+    pub submit_ms: f32,
+    pub total_ms:  f32,
+    /// Instantaneous frames-per-second derived from `total` + idle wait (wall-clock between frames).
+    pub frame_ms:  f32,
+}
+
+impl FrameProfile {
+    /// Blend a fresh per-frame sample into the running average.
+    pub fn blend(&mut self, s: &FrameSample, frame_ms: f32) {
+        const A: f32 = 0.12; // EMA weight — ~0.5s settling at 60fps
+        self.update_ms += (s.update_ms() - self.update_ms) * A;
+        self.scene_ms  += (s.scene_ms()  - self.scene_ms)  * A;
+        self.smooth_ms += (s.smooth_ms() - self.smooth_ms) * A;
+        self.render_ms += (s.render_ms() - self.render_ms) * A;
+        self.egui_ms   += (s.egui_ms()   - self.egui_ms)   * A;
+        self.submit_ms += (s.submit_ms() - self.submit_ms) * A;
+        self.total_ms  += (s.total_ms()  - self.total_ms)  * A;
+        self.frame_ms  += (frame_ms      - self.frame_ms)  * A;
+    }
+}
+
+/// Raw per-phase durations captured during one `render_frame`. Built only when profiling is enabled.
+/// Relocated from `profiling` (#544 Step 2c) alongside `FrameProfile::blend`, which consumes it.
+#[derive(Default)]
+pub struct FrameSample {
+    pub update: std::time::Duration,
+    /// Sub-span of `update`: `SceneState::from_game_state`.
+    pub scene:  std::time::Duration,
+    /// Sub-span of `update`: entity motion smoothing + floor snap.
+    pub smooth: std::time::Duration,
+    pub render: std::time::Duration,
+    pub egui:   std::time::Duration,
+    pub submit: std::time::Duration,
+    pub total:  std::time::Duration,
+}
+
+impl FrameSample {
+    pub fn update_ms(&self) -> f32 { self.update.as_secs_f32() * 1000.0 }
+    pub fn scene_ms(&self)  -> f32 { self.scene.as_secs_f32()  * 1000.0 }
+    pub fn smooth_ms(&self) -> f32 { self.smooth.as_secs_f32() * 1000.0 }
+    pub fn render_ms(&self) -> f32 { self.render.as_secs_f32() * 1000.0 }
+    pub fn egui_ms(&self)   -> f32 { self.egui.as_secs_f32()   * 1000.0 }
+    pub fn submit_ms(&self) -> f32 { self.submit.as_secs_f32() * 1000.0 }
+    pub fn total_ms(&self)  -> f32 { self.total.as_secs_f32()  * 1000.0 }
+}
+// ── end relocated definitions ────────────────────────────────────────────────────────────────────
+
 /// A pending frame capture: the render loop drains this, captures a PNG,
 /// and sends the bytes back through the channel.
 pub type FrameReq = Arc<Mutex<Option<oneshot::Sender<Vec<u8>>>>>;
@@ -27,7 +193,7 @@ pub type FrameReq = Arc<Mutex<Option<oneshot::Sender<Vec<u8>>>>>;
 /// A pending `/who all` request: GET /v1/observe/who registers a oneshot sender here; the nav thread
 /// drains it, sends OP_WhoAllRequest, and fires it with the parsed roster when OP_WhoAllResponse
 /// arrives. (#300)
-pub type WhoReq = Arc<Mutex<Option<oneshot::Sender<Vec<crate::game_state::WhoEntry>>>>>;
+pub type WhoReq = Arc<Mutex<Option<oneshot::Sender<Vec<eqoxide_core::game_state::WhoEntry>>>>>;
 
 /// The client-local friends list (names). Edited by POST /v1/social/friends {add|remove}; read by the
 /// nav thread to build the OP_FriendsWho poll and by GET /v1/social/friends to annotate online. (#301)
@@ -35,7 +201,7 @@ pub type FriendsListShared = Arc<Mutex<Vec<String>>>;
 /// A pending friends-presence poll: GET /v1/social/friends registers a oneshot here; the nav thread
 /// drains it, sends OP_FriendsWho, and fires it with the online-friends roster (the OP_WhoAllResponse
 /// the server sends back) — mirrors [`WhoReq`]. (#301)
-pub type FriendsReq = Arc<Mutex<Option<oneshot::Sender<Vec<crate::game_state::WhoEntry>>>>>;
+pub type FriendsReq = Arc<Mutex<Option<oneshot::Sender<Vec<eqoxide_core::game_state::WhoEntry>>>>>;
 
 /// Target position for the navigation system. Set by /goto, cleared on arrival.
 pub type GotoTarget = Arc<Mutex<Option<(f32, f32, f32)>>>;
@@ -49,11 +215,11 @@ pub type GotoEntity = Arc<Mutex<Option<String>>>;
 
 /// Authoritative controller snapshot published by the render thread each frame and read by the nav
 /// thread to stream OP_ClientUpdate (design §2). Single source of position truth.
-pub type ControllerShared = Arc<Mutex<crate::movement::ControllerView>>;
+pub type ControllerShared = Arc<Mutex<ControllerView>>;
 
 /// The `/goto` planner's per-frame movement intent. The nav planner writes `Some` while walking a
 /// path and `None` when idle/arrived; the render controller consumes it when no WASD key is held.
-pub type NavIntent = Arc<Mutex<Option<crate::movement::MoveIntent>>>;
+pub type NavIntent = Arc<Mutex<Option<MoveIntent>>>;
 
 /// A large (>12u) server position correction the nav thread hands to the render controller to apply
 /// (teleport). Small deltas are ignored — the controller is authoritative (design §3.4).
@@ -64,7 +230,7 @@ pub type PosCorrection = Arc<Mutex<Option<[f32; 3]>>>;
 /// the sole writer of `GameState`; it publishes an immutable clone here after every gameplay tick
 /// via `eq_net::gameplay::publish_snapshot`. Render/HTTP consumers read it lock-free via `.load()`
 /// (borrowed) or `.load_full()` (owned `Arc<GameState>`).
-pub type GameStateSnapshot = std::sync::Arc<arc_swap::ArcSwap<crate::game_state::GameState>>;
+pub type GameStateSnapshot = std::sync::Arc<arc_swap::ArcSwap<eqoxide_core::game_state::GameState>>;
 
 /// The three clocks that answer "can I trust anything else in this payload?", owned and stamped by
 /// the network thread and turned into `Health` **at HTTP read time** (`HttpState::health`), never
@@ -253,7 +419,7 @@ pub type NetHealthShared = std::sync::Arc<std::sync::Mutex<NetHealth>>;
 
 /// Smoothed per-frame phase timings, published by the **render** thread (the only agent-visible
 /// value the renderer legitimately owns — see `PlayerState`'s note on the network/render split).
-pub type FrameProfileShared = std::sync::Arc<std::sync::Mutex<crate::profiling::FrameProfile>>;
+pub type FrameProfileShared = std::sync::Arc<std::sync::Mutex<FrameProfile>>;
 
 /// Aggro-avoidance knobs the `/v1/move/*` handlers set and the nav walker reads (#242). `enabled`
 /// gates the always-on NPC-camp avoidance (#67) — `false` routes straight through (e.g. to reach a
@@ -278,7 +444,7 @@ pub type NavAvoidShared = Arc<Mutex<AggroAvoidOpts>>;
 /// MVC C2 (#452): this is DERIVED/READ state (the Model's nav thread produces it, the render View
 /// consumes it to draw), NOT a view→model command — so it lives on the render↔nav integration
 /// channel [`ControllerSlots`] alongside the other single-authority movement channels, and NOT in a
-/// command bundle ([`NavSlots`]) / the [`crate::command_state::CommandState`] facade.
+/// command bundle ([`NavSlots`]) / the `command_state::CommandState` facade.
 pub type NavPathView = Arc<Mutex<(Vec<[f32; 3]>, Vec<[f32; 3]>)>>;
 
 /// Live entity name → (x, y, z) map, updated by login.rs as packets arrive.
@@ -288,14 +454,14 @@ pub type EntityPositions = Arc<Mutex<HashMap<String, (f32, f32, f32)>>>;
 pub type EntityIds = Arc<Mutex<HashMap<String, u32>>>;
 
 /// Zone exit points received in OP_SEND_ZONE_POINTS, exposed via GET /v1/observe/zone_points.
-pub type ZonePoints = Arc<Mutex<Vec<crate::game_state::ZonePoint>>>;
+pub type ZonePoints = Arc<Mutex<Vec<eqoxide_core::game_state::ZonePoint>>>;
 /// Native Task-system quest log, published from GameState.tasks each tick (GET /v1/observe/quests/log).
-pub type TaskLog = Arc<Mutex<Vec<crate::game_state::ActiveTask>>>;
+pub type TaskLog = Arc<Mutex<Vec<eqoxide_core::game_state::ActiveTask>>>;
 
 /// Pending offers from an open task-selector window, published each tick (GET /v1/quests/offers).
-pub type TaskOffersShared = Arc<Mutex<Vec<crate::game_state::TaskOffer>>>;
+pub type TaskOffersShared = Arc<Mutex<Vec<eqoxide_core::game_state::TaskOffer>>>;
 /// Completed-task history with titles, published each tick (GET /v1/quests/completed).
-pub type CompletedTasksShared = Arc<Mutex<Vec<crate::game_state::CompletedTaskEntry>>>;
+pub type CompletedTasksShared = Arc<Mutex<Vec<eqoxide_core::game_state::CompletedTaskEntry>>>;
 /// Accept/decline a pending task offer, set by POST /v1/quests/accept ({"task_id":N}) or
 /// POST /v1/quests/decline (task_id=0). The nav thread reads it once and sends
 /// OP_AcceptNewTask (AcceptNewTask_Struct), looking up the offering NPC's id from gs.task_offers.
@@ -345,7 +511,7 @@ pub struct GuildSnapshot {
     pub guild_id:   u32,
     pub guild_name: String,
     pub guild_rank: u32,
-    pub members:    Vec<crate::game_state::GuildMember>,
+    pub members:    Vec<eqoxide_core::game_state::GuildMember>,
     /// Name of whoever has a pending guild invite out to us (for GET /v1/guild/roster), or None.
     pub pending_invite: Option<String>,
 }
@@ -492,7 +658,7 @@ pub type CampUntil = Arc<Mutex<Option<std::time::Instant>>>;
 pub struct MerchantSnapshot {
     pub open: bool,
     pub merchant_id: Option<u32>,
-    pub items: Vec<crate::game_state::MerchantItem>,
+    pub items: Vec<eqoxide_core::game_state::MerchantItem>,
 }
 pub type MerchantShared = Arc<Mutex<MerchantSnapshot>>;
 
@@ -523,7 +689,7 @@ pub type GiveAwaitReq = Arc<Mutex<Option<(u32, u32,
 /// and read by GET /v1/observe/inventory. Slots are Titanium **wire** ids (the same numbers /give
 /// and /inventory/move take — note these are one less than the EQEmu DB `inventory.slot_id` for
 /// general slots: DB 23-30 → wire 22-29).
-pub type InventoryShared = Arc<Mutex<Vec<crate::game_state::InvItem>>>;
+pub type InventoryShared = Arc<Mutex<Vec<eqoxide_core::game_state::InvItem>>>;
 
 /// Loot request — a corpse spawn id, set by POST /v1/interact/loot. The nav thread reads it once and
 /// pushes the corpse onto the auto-loot queue (OP_LootRequest → OP_LootItem echoes → OP_EndLootRequest).
@@ -541,7 +707,7 @@ pub struct MessageEntry {
     pub kind:        String,
     pub text:        String,
     pub keywords:    Vec<String>,
-    pub item_links:  Vec<crate::game_state::ItemLink>,
+    pub item_links:  Vec<eqoxide_core::game_state::ItemLink>,
 }
 
 /// Live snapshot of the in-game message log, published each tick by the nav thread and read by
@@ -550,7 +716,7 @@ pub type MessagesShared = Arc<Mutex<Vec<MessageEntry>>>;
 
 /// Live snapshot of the current clickable NPC-dialogue choices (saylinks from the most recent NPC
 /// message), published each tick by the nav thread and read by GET /v1/observe/dialogue. (#120)
-pub type DialogueShared = Arc<Mutex<Vec<crate::game_state::DialogueChoice>>>;
+pub type DialogueShared = Arc<Mutex<Vec<eqoxide_core::game_state::DialogueChoice>>>;
 
 /// Live navigation state for the active `/move/goto`, set by the nav thread and read by
 /// GET /v1/observe/debug. `state` is the agent-facing contract documented in `docs/http-api.md`:
@@ -662,7 +828,7 @@ pub type NavStateShared = Arc<Mutex<NavStatus>>;
 
 /// Pending "click a dialogue choice" request (POST /v1/interact/dialogue or a GUI click): the nav
 /// thread drains it and sends an OP_ItemLinkClick for the chosen saylink. (#120)
-pub type DialogueClickReq = Arc<Mutex<Option<crate::game_state::DialogueChoice>>>;
+pub type DialogueClickReq = Arc<Mutex<Option<eqoxide_core::game_state::DialogueChoice>>>;
 
 /// One async game event exposed by the `GET /v1/events/*` feed. `category` is the top-level bucket
 /// the events API filters on (chat/combat/navigate/system); `kind` is the sub-type
@@ -795,7 +961,7 @@ pub struct CombatSlots {
     pub mem_spell: MemSpellReq,
     pub consider: ConsiderReq,
     pub target:   TargetReq,
-    pub pet_cmd:  crate::ipc::PetCmdReq,
+    pub pet_cmd:  PetCmdReq,
 }
 
 /// `/v1/merchant/*`: open/close a vendor window, list wares, buy, sell.
@@ -902,7 +1068,7 @@ pub struct ChatSlots {
 ///
 /// MVC C2 (#452): the walker's draw-only computed path (`nav_path_view`) was moved OUT of here to
 /// [`ControllerSlots`] — it is Model→View derived render state, not a view→model command, so it does
-/// not belong in a command bundle carried by [`crate::command_state::CommandState`].
+/// not belong in a command bundle carried by `command_state::CommandState`.
 #[derive(Clone, Default)]
 pub struct NavSlots {
     pub goto_target:   GotoTarget,
@@ -960,13 +1126,13 @@ pub struct LifecycleSlots {
 ///
 /// MVC C2 (#452): the manual-move/jump escape hatch (`manual_move`) is a view→RENDER command — the
 /// render thread's controller consumes it (see `App`), the Model/nav thread never does — so it lives
-/// HERE, on the render-bound camera bundle, and NOT in the view→MODEL [`crate::command_state::
-/// CommandState`] facade. `request_manual_move` is the typed write the HTTP View makes (mirroring
+/// HERE, on the render-bound camera bundle, and NOT in the view→MODEL `command_state::CommandState`
+/// facade. `request_manual_move` is the typed write the HTTP View makes (mirroring
 /// `cmd_tx`'s role for the orbit camera); the render View reads `manual_move` directly per frame.
 #[derive(Clone)]
 pub struct CameraSlots {
-    pub cmd_tx:      Arc<Mutex<Option<crate::camera_state::CameraCmd>>>,
-    pub snapshot:    Arc<Mutex<crate::camera_state::CameraSnapshot>>,
+    pub cmd_tx:      Arc<Mutex<Option<CameraCmd>>>,
+    pub snapshot:    Arc<Mutex<CameraSnapshot>>,
     pub frame_req:   FrameReq,
     pub manual_move: ManualMoveReq,
 }
@@ -991,11 +1157,18 @@ mod c2_boundary_tests {
     /// direct per-frame read, exactly as the HTTP View writes it and the render View consumes it.
     #[test]
     fn camera_slots_manual_move_round_trips() {
+        // Build a plain snapshot directly — the `camera_state::CameraState` that normally produces
+        // one lives in the app crate (this crate owns only the `CameraSnapshot` type), and the
+        // manual-move round-trip under test does not depend on the snapshot's contents.
         let camera = CameraSlots {
             cmd_tx:      Arc::new(Mutex::new(None)),
-            snapshot:    Arc::new(Mutex::new(
-                crate::camera_state::CameraState::new([0.0, 0.0, 0.0], 0.0).snapshot(),
-            )),
+            snapshot:    Arc::new(Mutex::new(CameraSnapshot {
+                mode:      CameraMode::AutoFollow,
+                azimuth:   0.0,
+                elevation: 0.0,
+                radius:    0.0,
+                focus:     [0.0, 0.0, 0.0],
+            })),
             frame_req:   Arc::new(Mutex::new(None)),
             manual_move: Arc::new(Mutex::new(None)),
         };

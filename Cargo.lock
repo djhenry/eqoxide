@@ -844,6 +844,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "eqoxide-core",
+ "eqoxide-ipc",
  "glam",
  "gltf",
  "image",
@@ -878,6 +879,16 @@ dependencies = [
  "shellexpand",
  "tempfile",
  "tracing",
+]
+
+[[package]]
+name = "eqoxide-ipc"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "eqoxide-core",
+ "serde",
+ "tokio",
 ]
 
 [[package]]

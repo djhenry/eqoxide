@@ -9,6 +9,13 @@
 
 use crate::nav::collision::Collision;
 
+// `MoveIntent` (the driver's per-frame wish) and `ControllerView` (the render→nav position snapshot)
+// are pure inter-thread contract data — they moved DOWN into `eqoxide-ipc` (#544 Step 2c) so that
+// crate's `NavIntent`/`ControllerShared` slots no longer up-reference `movement`. The BEHAVIOR that
+// operates on them (`CharacterController::step`) stays here. Re-exported so every existing
+// `crate::movement::{MoveIntent,ControllerView}` path across the tree keeps resolving unchanged.
+pub use eqoxide_ipc::{ControllerView, MoveIntent};
+
 /// Wall-collision sphere radius, matched to the reference RoF2 client.
 pub const PLAYER_RADIUS: f32 = 1.0;
 /// Skin width kept between the cylinder and the surface after a swept hit.
@@ -78,28 +85,7 @@ const PUSHOUT_DIRS: usize = 16;
 /// so the two sides cannot drift apart again). Was two duplicated locals in the two swim branches.
 const BUOY_RATE: f32 = 30.0;
 
-/// What the driver wants this frame. `wish_dir` is a horizontal direction in server axes
-/// (east, north); magnitude is treated as a throttle (clamped to 1). `speed` is run speed (u/s).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct MoveIntent {
-    pub wish_dir:    [f32; 2],
-    pub wish_vspeed: f32,
-    pub jump:        bool,
-    pub want_swim:   bool,
-    pub speed:       f32,
-    /// Max step-up height the controller may climb this move, in EQ units. `0` (default) uses the
-    /// native [`STEP_UP`] (2.0) — correct for free WASD, which must NOT be able to scale walls. The
-    /// `/goto` planner raises it to [`NAV_CLIMB`] so the controller can surmount the small lips
-    /// (fences/cart edges) that `find_path` already routed over (its edge-climb cap is the same).
-    /// Without this the path leads over a lip the 2u step can't clear and the player wedges (#41).
-    pub climb:       f32,
-    /// One-shot request to hop a low barrier (fence/cart) this tick. The `/goto` planner sets it once
-    /// its own net-progress stall detection fires (the controller can't see net progress — sliding
-    /// ALONG a fence looks like good per-frame motion). The controller hops only if it's grounded,
-    /// off cooldown, and a near-level landing exists just beyond ([`can_hop`]). Free WASD leaves it
-    /// `false` (a player walking into a wall shouldn't auto-jump). Fixes the Halas sled-pen (#41).
-    pub hop:         bool,
-}
+// `MoveIntent` moved to `eqoxide-ipc` (#544 Step 2c) — re-exported at the top of this module.
 
 /// Convert a world `(east, north)` movement request into a unit `wish_dir` plus the EQ heading
 /// (CCW degrees, 0 = north) to face while moving it. Returns `None` heading when the request is
@@ -117,22 +103,7 @@ pub fn manual_wish(dir: [f32; 2]) -> ([f32; 2], Option<f32>) {
     }
 }
 
-/// A read-only snapshot of the controller the render thread publishes each frame for the nav
-/// thread to stream to the server (design §2 "Threading"). `heading` is EQ-CCW degrees.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ControllerView {
-    pub pos:     [f32; 3],
-    pub heading: f32,
-    pub moving:  bool,
-    /// False until the render thread has spawned and seeded the controller. The nav streamer must
-    /// not mirror/stream a default (origin) position before this is set.
-    pub initialized: bool,
-    /// One-shot fall height (feet dropped) latched by the render thread the frame the controller
-    /// LANDS from an airborne stretch, for the nav thread to apply driver-agnostic fall damage (§442,
-    /// #442). `None` except right after a landing; the nav streamer take-and-clears it exactly once.
-    /// Respects the init gate — default `None`, only ever set after `initialized`.
-    pub landed_fall_height: Option<f32>,
-}
+// `ControllerView` moved to `eqoxide-ipc` (#544 Step 2c) — re-exported at the top of this module.
 
 /// Sole owner of the local player's physical state. Position is `[east, north, z]` (server coords,
 /// `z` = feet).
