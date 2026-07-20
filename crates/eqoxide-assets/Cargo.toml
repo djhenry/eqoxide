@@ -1,0 +1,19 @@
+[package]
+name = "eqoxide-assets"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "eqoxide_assets"
+path = "src/lib.rs"
+
+[dependencies]
+# eqoxide-assets sits directly above eqoxide-core (core ← assets ← nav next, #544 Step 2e). It
+# depends ONLY on core plus the external crates the zone-geometry loader genuinely needs — never on
+# wgpu/winit/egui/tokio/axum/eq_net/renderer/app/nav/ipc.
+eqoxide-core = { path = "../eqoxide-core" }
+anyhow = "1"          # from_glb/object_models_from_glb error context
+gltf = { version = "1", features = ["import", "extras"] }  # zone/door GLB parsing
+glam = "0.29"         # expand_objects instance-matrix math
+serde_json = "1"      # material `extras` (eqAdditive/eqAnim) JSON parsing
+tracing = "0.1"       # info! logging in from_glb
