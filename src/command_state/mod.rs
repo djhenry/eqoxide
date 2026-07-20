@@ -75,19 +75,25 @@
 //!    already removed its field — that is the eventual end state, NOT what a Wave-2 domain does.)
 
 mod combat;
-pub use combat::CastEnd;
 /// A3 Migration 1 (#448): the reusable Command-with-result infra. `CommandResult<T>` is the honest
 /// three-way outcome (Resolved/Refused/Unconfirmed) an HTTP handler awaits so it reports the TRUE
-/// server outcome instead of a premature queued-action 200. THE reference for A3.2/A3.3 — see its
-/// module doc for the full status mapping, invariant, and park→fulfil→timeout flow.
-pub mod result;
-pub use result::CommandResult;
+/// server outcome instead of a premature queued-action 200. See `crate::ipc::result`'s module doc
+/// for the full status mapping, invariant, and park→fulfil→timeout flow.
+///
+/// (#557) `CommandResult<T>` and its payload types (`BuyOk`, `OpenOk`, `GiveOk`, `CastEnd`) live in
+/// `crate::ipc::result` now, NOT here — `ipc`'s own await-slot types reference them, so keeping them
+/// in `command_state` (which depends on `ipc`) would be a dependency cycle once the two split into
+/// separate crates. Re-exported below so every existing `crate::command_state::CommandResult`/
+/// `BuyOk`/`OpenOk`/`GiveOk`/`CastEnd` call site is unaffected — pure code motion, no behavior change.
+pub use crate::ipc::result;
+pub use crate::ipc::CastEnd;
+pub use crate::ipc::CommandResult;
 // Wave-2 fan-out stubs — one file each, empty `impl CommandState {}` shell awaiting migration.
 mod merchant;
-pub use merchant::{BuyOk, OpenOk};
+pub use crate::ipc::{BuyOk, OpenOk};
 mod inventory;
 mod interact;
-pub use interact::GiveOk;
+pub use crate::ipc::GiveOk;
 mod quest;
 mod group;
 mod guild;

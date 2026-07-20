@@ -10,33 +10,9 @@
 //! `self.merchant.merchant` (the live `MerchantSnapshot` for GET /v1/merchant/list) is a
 //! read-path/published field, not a command — deliberately NOT exposed here (see `mod.rs`).
 
-use super::{CommandResult, CommandState};
-use crate::ipc::TradeCmd;
+use super::CommandState;
+use crate::ipc::{BuyOk, CommandResult, OpenOk, TradeCmd};
 use tokio::sync::oneshot;
-
-/// The honest receipt of a confirmed merchant buy (A3 Migration 1, #448) — the `T` in
-/// `CommandResult<BuyOk>` and the JSON body of a 200 from POST /v1/merchant/buy. Every field is
-/// read back from the APPLIED OP_ShopPlayerBuy echo (`gs` after `apply_packet`), never guessed at
-/// send time: `price` is the server-recomputed price from the echo, `coin_after` is the balance
-/// AFTER the server's deduction was mirrored locally. See `crate::command_state::result`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct BuyOk {
-    /// The purchased item's name, resolved from the open merchant's ware list by the echoed slot.
-    pub item_name: String,
-    /// Price the server actually charged (from the echo — the server recomputes it).
-    pub price: u32,
-    /// Coin on hand (platinum, gold, silver, copper) AFTER the buy was applied locally.
-    pub coin_after: [u32; 4],
-}
-
-/// The honest receipt of a confirmed merchant open (eqoxide#479) — the `T` in
-/// `CommandResult<OpenOk>` and the JSON body of a 200 from POST /v1/merchant/open. `merchant_id` is
-/// read back from the APPLIED OP_ShopRequest echo (`command==1`), never guessed at send time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-pub struct OpenOk {
-    /// The spawn id of the merchant that confirmed the open (echoed npc_id).
-    pub merchant_id: u32,
-}
 
 impl CommandState {
     // ── request_* : the VIEW (UI click-handlers + HTTP handlers) makes these writes ──────────────
