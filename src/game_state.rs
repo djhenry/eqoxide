@@ -1,7 +1,6 @@
 //! In-game state — player, entities, zone info, message log.
 
 use std::collections::VecDeque;
-use crate::scene::LogEntry;
 
 /// A zone exit point received in OP_SEND_ZONE_POINTS.
 /// Stored in EQ server convention: server_x = east, server_y = north, server_z = up.
@@ -395,6 +394,28 @@ pub struct ItemLink {
     pub text:       String,
     pub item_id:    u32,
     pub is_saylink: bool,
+}
+
+/// A single entry in the message log.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogEntry {
+    pub kind: String,
+    pub text: String,
+    pub timestamp: std::time::Instant,
+    /// Any item/say links parsed out of `text` — the display text is already clean (hex-free);
+    /// this carries the resolvable `item_id` alongside it (eqoxide#256).
+    pub item_links: Vec<ItemLink>,
+}
+
+impl Default for LogEntry {
+    fn default() -> Self {
+        LogEntry {
+            kind: String::new(),
+            text: String::new(),
+            timestamp: std::time::Instant::now(),
+            item_links: Vec::new(),
+        }
+    }
 }
 
 /// One guild member from the guild roster (OP_GuildMemberList). Surfaced via GET /v1/guild/roster

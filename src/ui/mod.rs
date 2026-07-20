@@ -388,7 +388,7 @@ mod tests {
         scene.player_name = "Testy".into();
         scene.merchant_open = Some(42); // exercise the merchant transient too
         for i in 0..80 {
-            scene.messages.push(crate::scene::LogEntry {
+            scene.messages.push(crate::game_state::LogEntry {
                 kind: "chat".into(),
                 text: format!("chatter line {i} with some width to it"),
                 timestamp: std::time::Instant::now(),
