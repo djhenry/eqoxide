@@ -5,33 +5,9 @@
 //! thin typed read/write of a slot in `self.combat`; validation and packet-building stay where they
 //! were (the HTTP handler and `ActionLoop::tick`). No behavior change — just one typed surface.
 
-use super::{CommandResult, CommandState};
-use crate::ipc::CastRequest;
+use super::CommandState;
+use crate::ipc::{CastEnd, CastRequest, CommandResult};
 use tokio::sync::oneshot;
-
-/// The honest terminal outcome of an awaited self-cast (A3 Migration 3, #448) — the `T` in
-/// `CommandResult<CastEnd>` and the JSON body of a 200 from POST /v1/combat/cast. Read back from the
-/// APPLIED cast machinery's `gs.last_cast`, never guessed at send time.
-///
-/// A `Resolved(CastEnd)` means the server gave a DEFINITE verdict on the cast — but "definite" is not
-/// the same as "the spell landed". `outcome` carries that truth: only `"completed"` is a success;
-/// `"fizzled"` and `"interrupted"` are resolved NON-successes. This is the whole honesty point of
-/// carrying the outcome in a field rather than in the HTTP status: a 200 can never be misread as
-/// "the spell took hold" — an agent MUST branch on `outcome`. A cast whose outcome is unknown
-/// (silent server, timeout, zone change) is `Unconfirmed`/202, never a `CastEnd`; a cast that never
-/// started (empty gem, no mana, no target) is `Refused`/409. See `crate::command_state::result`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct CastEnd {
-    /// The honest terminal verdict: `"completed"` (the spell landed) | `"fizzled"` | `"interrupted"`.
-    /// NEVER `"completed"` unless the server actually reported completion.
-    pub outcome: String,
-    /// The spell id that ended, or 0 when the server never named it (an honest unknown, not a guess).
-    pub spell_id: u32,
-    /// The spell's name (resolved from `spell_id`; a placeholder when the id is 0/unknown).
-    pub spell_name: String,
-    /// The human-readable line the cast machinery recorded (also in the message log).
-    pub text: String,
-}
 
 impl CommandState {
     // ── request_* : the VIEW (UI click-handlers + HTTP handlers) makes these writes ──────────────

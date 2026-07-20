@@ -11,25 +11,10 @@
 //! /v1/observe/dialogue) are read-path/published snapshots, not commands — deliberately NOT
 //! exposed here (see `mod.rs`).
 
-use super::{CommandResult, CommandState};
+use super::CommandState;
 use crate::game_state::DialogueChoice;
+use crate::ipc::{CommandResult, GiveOk};
 use tokio::sync::oneshot;
-
-/// The honest receipt of a confirmed NPC turn-in (A3 Migration 2, #448) — the `T` in
-/// `CommandResult<GiveOk>` and the JSON body of a 200 from POST /v1/interact/give. It records WHAT
-/// was handed in (`item_name`, captured from the inventory slot at send time — the trade slots are
-/// already cleared by the time the confirming OP_FinishTrade is applied, so it cannot be read back
-/// then) and to WHOM (`npc_id`). Unlike a merchant buy there is no server-recomputed receipt to
-/// mirror: OP_FinishTrade is a 0-byte "the NPC accepted it" ack, so `GiveOk` is the honest statement
-/// "this item's turn-in to this NPC was ACCEPTED" — only ever sent on a real OP_FinishTrade, never a
-/// send-time guess. See `crate::command_state::result`.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct GiveOk {
-    /// Spawn id of the NPC the item was handed to (the give's target).
-    pub npc_id: u32,
-    /// Name of the item that was turned in, captured from the inventory slot at send time.
-    pub item_name: String,
-}
 
 impl CommandState {
     // ── request_* : the VIEW (UI click-handlers + HTTP handlers) makes these writes ──────────────

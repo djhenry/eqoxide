@@ -3,14 +3,14 @@
 //! ────────────────────────────────────────────────────────────────────────────────────────────
 //! WHY THIS EXISTS  (the agent-honesty gap it closes)
 //! ────────────────────────────────────────────────────────────────────────────────────────────
-//! A plain `request_*` command (see `mod.rs`) is fire-and-forget: the HTTP handler queues the
-//! action into an `ipc` slot and immediately returns `200 OK`. But `200` there means "the request
-//! was ACCEPTED into the queue", NOT "the action SUCCEEDED". For an action whose real outcome is
-//! only knowable from a later server packet — a merchant buy that the server may silently refuse
-//! (insufficient funds sends NO packet at all), a trade the merchant may reject, a spell that may
-//! fizzle — a premature `200` is the client telling the agent "you bought it" when it does not know
-//! whether anything happened. That is a silent wrong answer: the top-priority honesty bug class
-//! (see MEMORY `eq-agent-honesty-invariant`).
+//! A plain `request_*` command (see `crate::command_state::mod`) is fire-and-forget: the HTTP
+//! handler queues the action into an `ipc` slot and immediately returns `200 OK`. But `200` there
+//! means "the request was ACCEPTED into the queue", NOT "the action SUCCEEDED". For an action whose
+//! real outcome is only knowable from a later server packet — a merchant buy that the server may
+//! silently refuse (insufficient funds sends NO packet at all), a trade the merchant may reject, a
+//! spell that may fizzle — a premature `200` is the client telling the agent "you bought it" when it
+//! does not know whether anything happened. That is a silent wrong answer: the top-priority honesty
+//! bug class (see MEMORY `eq-agent-honesty-invariant`).
 //!
 //! `CommandResult<T>` is the type an HTTP handler AWAITS (over a `oneshot` channel, under a
 //! timeout) so it can report the TRUE outcome instead of a queued-action `200`. It mirrors the
@@ -100,6 +100,19 @@
 //! NOTE (verified constraint): a `Sender` CANNOT live in `GameState` — it is `Clone`d into the
 //! ArcSwap snapshot every tick, and a `oneshot::Sender` is not `Clone`. Park it ONLY in
 //! `ActionLoop`.
+//!
+//! ────────────────────────────────────────────────────────────────────────────────────────────
+//! LOCATION  (#557 — Step 1b of the #544 modularity hybrid path)
+//! ────────────────────────────────────────────────────────────────────────────────────────────
+//! `CommandResult<T>` and its payload types (`BuyOk`, `OpenOk`, `GiveOk`, `CastEnd`) live HERE, in
+//! `ipc`, not in `command_state` — because `ipc`'s own await-slot types (`BuyAwaitReq`,
+//! `OpenAwaitReq`, `GiveAwaitReq`, `CastAwaitReq`) hold `oneshot::Sender<CommandResult<T>>` fields
+//! and so MUST reference these types. `command_state` depends on `ipc` (the slot bundles), so
+//! having these result types live in `command_state` while `ipc` referenced them back would be an
+//! illegal dependency cycle once the two split into separate crates (`eqoxide-ipc`,
+//! `eqoxide-command`). `command_state` re-exports these types (`pub use crate::ipc::{...}`) so every
+//! existing `crate::command_state::CommandResult`/`BuyOk`/`OpenOk`/`GiveOk`/`CastEnd` call site is
+//! unaffected — this was a pure code-motion, not a rename.
 
 /// The honest three-way outcome of a command whose success is only knowable from a later server
 /// packet. See the module doc for the HTTP status mapping and the never-render-`Unconfirmed`-as-
@@ -113,4 +126,68 @@ pub enum CommandResult<T> {
     /// No resolving packet arrived in time — the outcome is genuinely UNKNOWN. → HTTP 202, with a
     /// body that says so. MUST NOT ever be presented as success.
     Unconfirmed,
+}
+
+/// The honest receipt of a confirmed merchant buy (A3 Migration 1, #448) — the `T` in
+/// `CommandResult<BuyOk>` and the JSON body of a 200 from POST /v1/merchant/buy. Every field is
+/// read back from the APPLIED OP_ShopPlayerBuy echo (`gs` after `apply_packet`), never guessed at
+/// send time: `price` is the server-recomputed price from the echo, `coin_after` is the balance
+/// AFTER the server's deduction was mirrored locally. See this module's doc.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BuyOk {
+    /// The purchased item's name, resolved from the open merchant's ware list by the echoed slot.
+    pub item_name: String,
+    /// Price the server actually charged (from the echo — the server recomputes it).
+    pub price: u32,
+    /// Coin on hand (platinum, gold, silver, copper) AFTER the buy was applied locally.
+    pub coin_after: [u32; 4],
+}
+
+/// The honest receipt of a confirmed merchant open (eqoxide#479) — the `T` in
+/// `CommandResult<OpenOk>` and the JSON body of a 200 from POST /v1/merchant/open. `merchant_id` is
+/// read back from the APPLIED OP_ShopRequest echo (`command==1`), never guessed at send time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct OpenOk {
+    /// The spawn id of the merchant that confirmed the open (echoed npc_id).
+    pub merchant_id: u32,
+}
+
+/// The honest receipt of a confirmed NPC turn-in (A3 Migration 2, #448) — the `T` in
+/// `CommandResult<GiveOk>` and the JSON body of a 200 from POST /v1/interact/give. It records WHAT
+/// was handed in (`item_name`, captured from the inventory slot at send time — the trade slots are
+/// already cleared by the time the confirming OP_FinishTrade is applied, so it cannot be read back
+/// then) and to WHOM (`npc_id`). Unlike a merchant buy there is no server-recomputed receipt to
+/// mirror: OP_FinishTrade is a 0-byte "the NPC accepted it" ack, so `GiveOk` is the honest statement
+/// "this item's turn-in to this NPC was ACCEPTED" — only ever sent on a real OP_FinishTrade, never a
+/// send-time guess. See this module's doc.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct GiveOk {
+    /// Spawn id of the NPC the item was handed to (the give's target).
+    pub npc_id: u32,
+    /// Name of the item that was turned in, captured from the inventory slot at send time.
+    pub item_name: String,
+}
+
+/// The honest terminal outcome of an awaited self-cast (A3 Migration 3, #448) — the `T` in
+/// `CommandResult<CastEnd>` and the JSON body of a 200 from POST /v1/combat/cast. Read back from the
+/// APPLIED cast machinery's `gs.last_cast`, never guessed at send time.
+///
+/// A `Resolved(CastEnd)` means the server gave a DEFINITE verdict on the cast — but "definite" is not
+/// the same as "the spell landed". `outcome` carries that truth: only `"completed"` is a success;
+/// `"fizzled"` and `"interrupted"` are resolved NON-successes. This is the whole honesty point of
+/// carrying the outcome in a field rather than in the HTTP status: a 200 can never be misread as
+/// "the spell took hold" — an agent MUST branch on `outcome`. A cast whose outcome is unknown
+/// (silent server, timeout, zone change) is `Unconfirmed`/202, never a `CastEnd`; a cast that never
+/// started (empty gem, no mana, no target) is `Refused`/409. See this module's doc.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CastEnd {
+    /// The honest terminal verdict: `"completed"` (the spell landed) | `"fizzled"` | `"interrupted"`.
+    /// NEVER `"completed"` unless the server actually reported completion.
+    pub outcome: String,
+    /// The spell id that ended, or 0 when the server never named it (an honest unknown, not a guess).
+    pub spell_id: u32,
+    /// The spell's name (resolved from `spell_id`; a placeholder when the id is 0/unknown).
+    pub spell_name: String,
+    /// The human-readable line the cast machinery recorded (also in the message log).
+    pub text: String,
 }

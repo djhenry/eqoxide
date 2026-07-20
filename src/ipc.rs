@@ -14,6 +14,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
+/// The A3 Command-with-result outcome types (#557 — `ipc` owns them because its own await-slot
+/// aliases below reference them; see `result`'s module doc for why they moved down out of
+/// `command_state`, and `command_state`'s re-export for why every existing call site is unaffected).
+pub mod result;
+pub use result::{BuyOk, CastEnd, CommandResult, GiveOk, OpenOk};
+
 /// A pending frame capture: the render loop drains this, captures a PNG,
 /// and sends the bytes back through the channel.
 pub type FrameReq = Arc<Mutex<Option<oneshot::Sender<Vec<u8>>>>>;
@@ -425,9 +431,9 @@ pub type BuyReq = Arc<Mutex<Option<(u32, u32)>>>;
 /// sends, and PARKS the `Sender` in `ActionLoop::pending_buy` until the resolving packet
 /// (OP_ShopPlayerBuy echo → `Resolved`, OP_ShopEndConfirm → `Refused`) is applied — or the HTTP
 /// timeout / a reaper yields `Unconfirmed`. Sibling of [`BuyReq`], NOT a replacement: the two slots
-/// coexist so the UI click path is unchanged. See `crate::command_state::result` for the flow.
+/// coexist so the UI click path is unchanged. See [`result`] for the flow.
 pub type BuyAwaitReq = Arc<Mutex<Option<(u32, u32,
-    oneshot::Sender<crate::command_state::CommandResult<crate::command_state::BuyOk>>)>>>;
+    oneshot::Sender<CommandResult<BuyOk>>)>>>;
 
 /// Sell request — (merchant spawn id, player inventory slot, quantity), set by POST /v1/merchant/sell.
 /// Nav thread reads it and sends OP_ShopRequest (open) + OP_ShopPlayerSell (sell that slot).
@@ -458,9 +464,9 @@ pub type TradeReq = Arc<Mutex<Option<TradeCmd>>>;
 /// EQEmu RoF2 source — see `~/git/eq_kb/merchant-open-protocol.md`) — that path
 /// resolves to `Unconfirmed` via the HTTP timeout / a zone-change reaper, never a fabricated 200.
 /// Sibling of [`TradeReq`], NOT a replacement: the UI open/close click path is unchanged. See
-/// `crate::command_state::result` for the flow.
+/// [`result`] for the flow.
 pub type OpenAwaitReq = Arc<Mutex<Option<(u32,
-    oneshot::Sender<crate::command_state::CommandResult<crate::command_state::OpenOk>>)>>>;
+    oneshot::Sender<CommandResult<OpenOk>>)>>>;
 
 /// Camp command, written by POST /v1/lifecycle/exit, POST /v1/lifecycle/camp, the HUD Camp button,
 /// and the `/camp` chat keyword. The gameplay loop drains it: `Start` begins a camp if one isn't
@@ -509,9 +515,9 @@ pub type GiveReq = Arc<Mutex<Option<(u32, u32)>>>;
 /// OP_FinishTrade (the NPC accepted the item) → `Resolved(GiveOk)`; the no-ack / no-finish abort →
 /// `Unconfirmed`; a second awaited give while one is in flight → `Refused` (singleton-in-flight).
 /// Sibling of [`GiveReq`], NOT a replacement — the two slots coexist so the UI turn-in path is
-/// unchanged. See `crate::command_state::result` for the flow.
+/// unchanged. See [`result`] for the flow.
 pub type GiveAwaitReq = Arc<Mutex<Option<(u32, u32,
-    oneshot::Sender<crate::command_state::CommandResult<crate::command_state::GiveOk>>)>>>;
+    oneshot::Sender<CommandResult<GiveOk>>)>>>;
 
 /// Live snapshot of the player's inventory + equipment, published each tick by the nav thread
 /// and read by GET /v1/observe/inventory. Slots are Titanium **wire** ids (the same numbers /give
@@ -713,9 +719,9 @@ pub type CastReq = Arc<Mutex<Option<CastRequest>>>;
 /// miss). A cast that never started (empty gem / stale clicky) fires `Refused` immediately from the
 /// drain; a truly silent cast resolves to `Unconfirmed` via the HTTP timeout / a zone-change reaper.
 /// Sibling of [`CastReq`], NOT a replacement: the UI click path is unchanged. One self-cast at a
-/// time → a singleton park suffices. See `crate::command_state::result` for the flow.
+/// time → a singleton park suffices. See [`result`] for the flow.
 pub type CastAwaitReq = Arc<Mutex<Option<(CastRequest,
-    oneshot::Sender<crate::command_state::CommandResult<crate::command_state::CastEnd>>)>>>;
+    oneshot::Sender<CommandResult<CastEnd>>)>>>;
 /// Scribe/memorize request — (slot, spell_id, scribing): scribing 0 = scribe a scroll into the
 /// spellbook at book `slot`; 1 = memorize a known spell into gem `slot` (0-8). Set by POST
 /// /v1/combat/scribe and POST /v1/combat/memorize; the nav thread sends OP_MemorizeSpell.
