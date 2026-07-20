@@ -17,6 +17,7 @@ path = "src/bin/render_model.rs"
 
 [dependencies]
 eqoxide-core = { path = "crates/eqoxide-core" }
+eqoxide-ipc = { path = "crates/eqoxide-ipc" }
 anyhow = "1"
 arc-swap = "1"
 image = { version = "0.25", default-features = false, features = ["bmp", "png", "dds", "tga"] }
@@ -65,4 +66,4 @@ tokio = { version = "1", features = ["full", "test-util"] }
 tower = "0.5"
 
 [workspace]
-members = ["tools", "crates/eqoxide-core"]
+members = ["tools", "crates/eqoxide-core", "crates/eqoxide-ipc"]

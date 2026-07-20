@@ -22,6 +22,14 @@
 // follow it down without any up-reference into a higher layer.
 pub use eqoxide_core::{config, coord, eqstr, game_state, region_map, skills, spells, zone_map};
 
+// The inter-thread request-slot types now live in the `eqoxide-ipc` workspace crate (#544 Step 2c),
+// which depends only on `eqoxide-core`. Alias it as this crate's `ipc` module so every existing
+// `crate::ipc::…` / `eqoxide::ipc::…` path (and `command_state`'s `pub use crate::ipc::…`
+// re-exports) keeps resolving unchanged. `movement`/`camera_state`/`profiling` re-export the pure
+// type definitions that moved down into it (`MoveIntent`, `ControllerView`, `CameraCmd`/`CameraSnapshot`/
+// `CameraMode`, `FrameProfile`/`FrameSample`) so their `crate::<mod>::<Type>` paths are unaffected too.
+pub use eqoxide_ipc as ipc;
+
 pub mod anim;
 pub mod app;
 pub mod assets;
@@ -50,6 +58,5 @@ pub mod eq_net;
 pub mod frame_capture;
 pub mod http;
 pub mod hud;
-pub mod ipc;
 pub mod model;
 pub mod ui;

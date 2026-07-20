@@ -1,6 +1,13 @@
 //! Orbit/follow camera state: azimuth/elevation/radius with smoothing toward the player, mouse-drag
 //! and scroll input, and the `CameraCmd`/`CameraSnapshot` types shared with the HTTP `/camera`
 //! endpoint (the agent sets a command; the render loop applies it and publishes a snapshot back).
+//!
+//! `CameraMode`/`CameraCmd`/`CameraSnapshot` are pure inter-thread contract data — they moved DOWN
+//! into `eqoxide-ipc` (#544 Step 2c) so that crate's `CameraSlots` no longer up-references
+//! `camera_state`. The BEHAVIOR (`CameraState` and its update/snapshot logic) stays here and `use`s
+//! those types. Re-exported so every existing `crate::camera_state::{CameraMode,CameraCmd,
+//! CameraSnapshot}` path across the tree keeps resolving unchanged.
+pub use eqoxide_ipc::{CameraCmd, CameraMode, CameraSnapshot};
 
 pub const ELEVATION_MIN: f32 = 0.08727; // 5°
 pub const ELEVATION_MAX: f32 = 1.39626; // 80°
@@ -54,29 +61,8 @@ pub fn heading_deg_from_azimuth(azimuth: f32) -> f32 {
     (azimuth + std::f32::consts::FRAC_PI_2).to_degrees().rem_euclid(360.0)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CameraMode { AutoFollow, ManualOrbit }
-
-#[derive(Debug, Clone)]
-pub enum CameraCmd {
-    Set {
-        azimuth:   Option<f32>,
-        elevation: Option<f32>,
-        radius:    Option<f32>,
-        focus:     Option<[f32; 3]>,
-    },
-    Reset,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct CameraSnapshot {
-    pub mode:      CameraMode,
-    pub azimuth:   f32,
-    pub elevation: f32,
-    pub radius:    f32,
-    pub focus:     [f32; 3],
-}
+// `CameraMode`, `CameraCmd`, and `CameraSnapshot` moved to `eqoxide-ipc` (#544 Step 2c) — re-exported
+// at the top of this module.
 
 pub struct CameraState {
     pub azimuth:         f32,
