@@ -1,26 +1,11 @@
 //! Environmental damage, translocate, pet command, spawn appearance, and door-click packet
-//! builders. Moved out of `navigation.rs` (cleanup step 1) — pure `args -> Vec<u8>` builders
-//! (plus the pure `fall_damage` calculation) with no navigation state.
+//! builders. Moved out of `navigation.rs` (cleanup step 1) — pure `args -> Vec<u8>` builders with
+//! no navigation state.
 
-/// Native Titanium fall damage for a fall of `height` EQ units. Fall damage is CLIENT-computed in
-/// EQ (the server only validates OP_EnvDamage). Model: impact velocity = min(terminal,
-/// sqrt(2·g·h)) converted to the client's internal per-update z-velocity units (~5-13); then
-/// `fall_score = |z_vel| − 4` (char_counter≈0, no safe-fall skill): ≤0 → no damage, ≥9 → lethal
-/// (20000), else a roll in `[0, score²·10]`. Returns (rolled_damage, max_damage). See
-/// ~/git/eq_kb/falling-physics.md.
-pub fn fall_damage(height: f32) -> (u32, u32) {
-    const GRAVITY: f32 = 120.0;   // matches the renderer's fall physics
-    const TERMINAL: f32 = 128.0;  // native internal z-velocity clamp
-    const HZ: f32 = 10.0;         // native position-update rate the formula is calibrated to
-    let v = (2.0 * GRAVITY * height.max(0.0)).sqrt().min(TERMINAL);
-    let score = v / HZ - 4.0;
-    if score <= 0.0 { return (0, 0); }
-    if score >= 9.0 { return (20_000, 20_000); }
-    let max = (score * score * 10.0) as u32;
-    let roll = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos()).unwrap_or(0);
-    (if max == 0 { 0 } else { roll % (max + 1) }, max)
-}
+// The pure `fall_damage` calculation moved DOWN into `eqoxide-core::physics` (#544 Step 2d) so nav
+// depends on core for it, not on eq_net. Re-exported here so `crate::eq_net::protocol::fall_damage`
+// (via `pub use world::*` in mod.rs) keeps resolving for existing eq_net callers.
+pub use eqoxide_core::physics::fall_damage;
 
 /// RoF2 `EnvDamage2_Struct` (39 bytes): id@0, damage(u32)@6, dmgtype(u8)@26, constant(u16)@33.
 /// The RoF2 server's DECODE reads only id/damage/dmgtype (it forces `constant = 0xFFFF` itself); the

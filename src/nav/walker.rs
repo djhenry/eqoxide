@@ -23,7 +23,7 @@
 //! the controller — it writes only the per-frame `nav_intent`.
 
 use crate::coord::eq_heading;
-use crate::eq_net::protocol::fall_damage;
+use eqoxide_core::physics::fall_damage;
 use crate::game_state::GameState;
 use eqoxide_ipc::MoveIntent;
 use crate::nav::steering::*;
