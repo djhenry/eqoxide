@@ -37,6 +37,16 @@ pub use eqoxide_ipc as ipc;
 // `crate::assets::…` / `eqoxide::assets::…` path keeps resolving unchanged.
 pub use eqoxide_assets as assets;
 
+// The navigation domain (`collision`, `planner`, `steering`, `walker`, `water_grid`) and the
+// planner's `traversability` clearance abstraction now live in the `eqoxide-nav` workspace crate
+// (#544 Step 2f), depending only on `eqoxide-core` + `eqoxide-ipc` + `eqoxide-assets` (+ `tracing`).
+// Alias it as this crate's `nav` module and re-export `traversability` at the root so every existing
+// `crate::nav::…` / `eqoxide::nav::…` and `crate::traversability::…` path keeps resolving unchanged.
+// The nav+movement walker-sim integration tests (which step the app-layer `CharacterController` that
+// stays in `movement`) live in this crate's `tests/walker_sim.rs`.
+pub use eqoxide_nav as nav;
+pub use eqoxide_nav::traversability;
+
 pub mod anim;
 pub mod app;
 pub mod asset_sync;
@@ -48,9 +58,7 @@ pub mod head;
 pub mod logging;
 pub mod models;
 pub mod movement;
-pub mod nav;
 pub mod profiling;
-pub mod traversability;
 pub mod pass;
 pub mod pipeline;
 pub mod renderer;

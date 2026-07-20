@@ -70,7 +70,7 @@
 //! [`Body::agent_height`]. That is consistent, not a lie — the planner never PROMISES a pose the
 //! controller then rejects.
 
-use crate::nav::collision::Collision;
+use crate::collision::Collision;
 
 /// The character's collision volume. THE single source of truth (#386 / design §2a-iv).
 ///
@@ -148,12 +148,12 @@ pub struct Body {
 /// the controller landed). The planner moved UP to it (from 3.0) — the conservative direction:
 /// the planner may only refuse more than the controller collides with, never less.
 pub const PLAYER_BODY: Body = Body {
-    radius: crate::movement::PLAYER_RADIUS,
+    radius: eqoxide_core::physics::PLAYER_RADIUS,
     foot: 0.5,
     // The controller's real step-up reach; the planner's low probe is DERIVED as `foot + step_up`
     // (see `feet_clr`), so it is exactly the height of the controller's raised step-slide contact
     // ray. Numerically 0.5 + 2.0 = 2.5 (the historical `feet_clr`) — bound now, not coincidental.
-    step_up: crate::movement::STEP_UP,
+    step_up: eqoxide_core::physics::STEP_UP,
     chest: 4.0,
     ring: 3.0,
     height: 6.0,
@@ -169,7 +169,7 @@ pub const PLAYER_BODY: Body = Body {
     // 2.5 u capability with 0.5 u margin, and covers the qcat spawn-shaft ledge at
     // surface + 1.03 u (#329). Raising it beyond 2.0 requires a genuine mantle capability the
     // controller does not have — that would be its own design, not a constant tweak.
-    haul_out_up: crate::movement::STEP_UP,
+    haul_out_up: eqoxide_core::physics::STEP_UP,
 };
 
 impl Body {
@@ -217,8 +217,8 @@ impl Tier {
     #[inline]
     pub fn units(self) -> f32 {
         match self {
-            Tier::Preferred => crate::nav::collision::NAV_PREFERRED_CLEARANCE,
-            Tier::Minimum => crate::movement::PLAYER_RADIUS,
+            Tier::Preferred => crate::collision::NAV_PREFERRED_CLEARANCE,
+            Tier::Minimum => eqoxide_core::physics::PLAYER_RADIUS,
         }
     }
     /// The retry ladder, in order. Exactly two rungs, forever.
@@ -346,7 +346,7 @@ impl ClearanceField {
     /// Only called from `#[cfg(test)]` (its sole caller lives in `mod tests`, stripped from a
     /// plain build) — gated to match, else it reads as dead code outside `cargo test`.
     #[cfg(test)]
-    pub(crate) fn set_cap_for_test(&self, n: usize) {
+    pub fn set_cap_for_test(&self, n: usize) {
         self.cap.store(n, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -417,7 +417,7 @@ impl ClearanceField {
 // zero-on-success assertion.
 #[cfg(test)]
 thread_local! {
-    pub(crate) static DIAGNOSE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub static DIAGNOSE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[inline]
@@ -620,10 +620,9 @@ impl<'a> Traversability<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assets::{MeshData, RenderMode, ZoneAssets};
-    use crate::nav::collision::Collision;
-    use crate::movement::{CharacterController, PLAYER_RADIUS};
-    use eqoxide_ipc::MoveIntent;
+    use eqoxide_assets::{MeshData, RenderMode, ZoneAssets};
+    use crate::collision::Collision;
+    use eqoxide_core::physics::PLAYER_RADIUS;
 
     fn mesh(positions: Vec<[f32; 3]>) -> MeshData {
         MeshData {
@@ -665,38 +664,6 @@ mod tests {
         ])
     }
 
-    /// **THE #386 DRIFT FIXTURE (RED on pre-Body main).** Every route the planner emits must be one
-    /// the real controller can actually walk. On main the planner (probes 2.5/3.0) routed straight
-    /// under the 3.5–6.5 lintel that the controller's 4.0 chest ray refuses — the walker pressed
-    /// into it forever. With the shared [`Body`] the planner probes at the controller's own chest
-    /// height and refuses the corridor, so it emits no un-walkable route.
-    ///
-    /// Mutation check: set the planner's chest probe back below 3.5 (e.g. the old 3.0) and this
-    /// MUST go red — verified at authoring time.
-    #[test]
-    fn planner_never_routes_under_a_lintel_the_walker_collides_with() {
-        let c = lintel_corridor();
-        let start = [-20.0, 0.0, 0.0];
-        let goal = [20.0, 0.0, 0.0];
-
-        // Pin the fixture premise: the controller genuinely cannot cross the lintel.
-        let mut ctrl = CharacterController::new(start);
-        ctrl.on_ground = true;
-        for _ in 0..600 {
-            ctrl.step(MoveIntent { wish_dir: [1.0, 0.0], speed: 44.0, ..Default::default() },
-                      1.0 / 60.0, &c);
-        }
-        assert!(ctrl.pos[0] < 0.0,
-            "fixture premise: the controller must be blocked by the lintel (east={})", ctrl.pos[0]);
-
-        // The invariant: whatever the planner answers, it must not be a route through the lintel.
-        // (An honest "no route" is fine; a confident route the walker cannot walk is the #386 lie.)
-        if let Some(route) = c.find_path(start, goal, PLAYER_RADIUS, &[], false) {
-            let crossed = route.iter().any(|w| w[0] > 2.0);
-            assert!(!crossed,
-                "planner routed through a lintel the controller collides with (#386): {route:?}");
-        }
-    }
 
     /// The planner's probe heights and the controller's contact heights come from ONE body, and the
     /// planner's top probe is the controller's chest ray. This is the drift-direction invariant in
@@ -713,16 +680,16 @@ mod tests {
         // height of the controller's raised step-slide contact ray, so a low obstacle taller than it
         // blocks BOTH and a shorter one passes BOTH. Re-declaring either as a bare constant re-opens
         // the #420 drift; this pins the derivation, and `..._low_wall_...` below pins the behaviour.
-        assert_eq!(PLAYER_BODY.step_up, crate::movement::STEP_UP,
+        assert_eq!(PLAYER_BODY.step_up, eqoxide_core::physics::STEP_UP,
             "the body's step-up must be the controller's real step-up capability");
         assert_eq!(planner[0], contact[0] + PLAYER_BODY.step_up,
             "the planner's low probe must be foot + step_up (the #420 foot-axis binding)");
         assert_eq!(planner[0], PLAYER_BODY.feet_clr());
         // ...and it must still clear the step-up band, or every mountable stair reads as a wall
         // (the over-rejection direction: a body too fat also lies).
-        assert!(planner[0] > crate::movement::STEP_UP,
+        assert!(planner[0] > eqoxide_core::physics::STEP_UP,
             "the planner's low probe must clear the step-up band, or every stair reads as a wall");
-        assert!(PLAYER_BODY.radius >= crate::movement::PLAYER_RADIUS);
+        assert!(PLAYER_BODY.radius >= eqoxide_core::physics::PLAYER_RADIUS);
     }
 
     /// A corridor sealed by a thin LOW WALL 3.0 u tall — taller than the controller's step reach
@@ -741,49 +708,6 @@ mod tests {
         ])
     }
 
-    /// **THE #420 FOOT-AXIS FIXTURE (the foot twin of the lintel test).** A low wall the controller's
-    /// step-up cannot mount must ALSO block the planner. Same class as #386, different axis: the
-    /// planner probed the foot band at `feet_clr` = 2.5 u while the controller contacts at `foot` =
-    /// 0.5 u and recovers ≤ `foot + step_up` = 2.5 u via step-up — so an obstacle in (2.5, chest]
-    /// with no walkable top is solid to the walker yet, if the planner ever stopped probing the foot
-    /// band, clear to A*.
-    ///
-    /// Mutation check (verified at authoring time): make the planner skip the foot band — e.g.
-    /// `planner_probes` → `[self.chest, self.chest]`, or `feet_clr()` raised above 3.0 — and the
-    /// `can_traverse_fast` assertion below goes RED, because the 4.0 u chest ray clears the 3.0 u
-    /// wall. The derivation `feet_clr = foot + step_up` is what makes that state unrepresentable.
-    #[test]
-    fn planner_never_routes_over_a_low_wall_the_walker_cant_step() {
-        let c = low_wall_corridor();
-        let start = [-20.0, 0.0, 0.0];
-        let goal = [20.0, 0.0, 0.0];
-
-        // Pin the fixture premise: the controller genuinely cannot cross (step-up tops out at 2.5 u;
-        // default intent has no hop/jump, so a 3 u wall is a hard stop, exactly as a WASD player).
-        let mut ctrl = CharacterController::new(start);
-        ctrl.on_ground = true;
-        for _ in 0..600 {
-            ctrl.step(MoveIntent { wish_dir: [1.0, 0.0], speed: 44.0, ..Default::default() },
-                      1.0 / 60.0, &c);
-        }
-        assert!(ctrl.pos[0] < 0.0,
-            "fixture premise: the controller must be blocked by the low wall (east={})", ctrl.pos[0]);
-
-        // The crisp foot-axis invariant: the planner's OWN edge test refuses the wall-crossing
-        // segment. This is the assertion a reverted foot probe flips to `true`.
-        let t = Traversability::new(&c, PLAYER_RADIUS, 8.0, 0.0, false);
-        let west = Point::new([-6.0, 0.0], 0.0);
-        let east = Point::new([6.0, 0.0], 0.0);
-        assert!(!t.can_traverse_fast(west, east),
-            "planner accepted a segment across a 3u wall the walker's step-up can't mount (#420)");
-
-        // And end to end: an honest "no route" is fine; a route across the wall is the #420 lie.
-        if let Some(route) = c.find_path(start, goal, PLAYER_RADIUS, &[], false) {
-            let crossed = route.iter().any(|w| w[0] > 2.0);
-            assert!(!crossed,
-                "planner routed over a low wall the controller collides with (#420): {route:?}");
-        }
-    }
 
     /// **THE FIELD IS DETERMINISTIC AND HISTORY-BLIND (the #394 discipline).** A memoised value is
     /// a pure function of its key: two queries anywhere inside one 2 u key cell get the identical
@@ -949,7 +873,7 @@ mod tests {
     #[test]
     fn tier_ladder_floors_at_player_radius() {
         assert_eq!(Tier::LADDER, [Tier::Preferred, Tier::Minimum]);
-        assert_eq!(Tier::Minimum.units(), crate::movement::PLAYER_RADIUS);
+        assert_eq!(Tier::Minimum.units(), eqoxide_core::physics::PLAYER_RADIUS);
         assert!(Tier::Preferred.units() > Tier::Minimum.units());
     }
 
@@ -966,7 +890,7 @@ mod tests {
             floor_at(0.0, -30.0, 20.0, -60.0, 30.0),
             panel(-10.0, -30.0, 0.0, 0.0, 10.0),
         ]);
-        c.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::flat_below(-5.0))));
+        c.set_water(Some(std::sync::Arc::new(eqoxide_core::region_map::RegionMap::flat_below(-5.0))));
 
         let mut seed: u64 = 0xB0D1_C0DE;
         let mut rnd = || {
@@ -1001,7 +925,7 @@ mod tests {
             floor_at(0.0, -30.0, 20.0, -60.0, 30.0),
             panel(-10.0, -30.0, 0.0, 0.0, 10.0),
         ]);
-        c.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::flat_below(-5.0))));
+        c.set_water(Some(std::sync::Arc::new(eqoxide_core::region_map::RegionMap::flat_below(-5.0))));
 
         // Wall: traversing east through the panel at east=-10.
         let t = Traversability::new(&c, PLAYER_RADIUS, 2.0, 0.0, false);

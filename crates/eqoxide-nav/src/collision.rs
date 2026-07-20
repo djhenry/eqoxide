@@ -2,17 +2,17 @@
 //! nav domain no longer lives inside the mesh/texture loader).
 //!
 //! [`Collision`] is the zone's flattened-triangle spatial grid: `build` consumes a loaded
-//! [`crate::assets::ZoneAssets`] (mesh/texture loading stays in `assets.rs`; this module only
+//! [`eqoxide_assets::ZoneAssets`] (mesh/texture loading stays in `assets.rs`; this module only
 //! reads its output), and its methods answer every spatial query the nav/render/movement code
 //! needs — `floor_z`/`nearest_floor` (grounding), `nearest_hit_t`/`segment_blocked` (camera +
 //! nameplate occlusion), `path_clear`/`footprint_clear` (movement gating), and `find_path`/
 //! `find_path_ex`/`find_path_res` (A* routing around walls). See `docs/zone-rendering.md` and
 //! `docs/collision-system.md`.
 //!
-//! This is a ONE-WAY dependency: this module depends on `crate::assets` for its mesh input
+//! This is a ONE-WAY dependency: this module depends on `eqoxide_assets` for its mesh input
 //! types, but `assets.rs` does not depend back on this module for any non-test code.
 
-use crate::assets::{expand_objects, MeshData, ZoneAssets, COLLISION_MESH_TAG};
+use eqoxide_assets::{expand_objects, MeshData, ZoneAssets, COLLISION_MESH_TAG};
 
 /// Precomputed collision geometry for fast spatial queries against a zone.
 ///
@@ -402,7 +402,7 @@ impl LocalOutcome {
 
 /// The raw result of ONE A* run, before it is turned into an honest [`PlanOutcome`].
 #[derive(Debug, Default)]
-pub(crate) struct Search {
+pub struct Search {
     /// `(route, reached_goal)`. `reached_goal == false` = a PARTIAL route toward the frontier.
     path:     Option<(Vec<[f32; 3]>, bool)>,
     /// `Some` = the search was CUT SHORT and its frontier is NOT closed, so "the goal was not
@@ -443,10 +443,14 @@ pub struct Collision {
     /// (#329). Computed once at build; the ray tests filter on it. (~4 bytes/tri.)
     tri_nz:    Vec<f32>,
     cells:     Vec<Vec<u32>>,
-    origin:    [f32; 2], // (east, north) of cell (0,0) corner
-    cell_size: f32,
-    cols:      usize,
-    rows:      usize,
+    // Grid geometry. `pub` so the app-crate walker-sim corpus integration test
+    // (`tests/walker_sim.rs::faithful_walker_drift_corpus`) can sample random floor points across the
+    // grid — it steps the app-layer `CharacterController`, so it lives outside this crate (#544 Step 2f)
+    // and can only reach these dimensions if they are public. Read-only dimension accessors; no writer.
+    pub origin:    [f32; 2], // (east, north) of cell (0,0) corner
+    pub cell_size: f32,
+    pub cols:      usize,
+    pub rows:      usize,
     /// Z extent of the whole mesh. The floor-normal filter's safety valve (`column_hits`) has to ask
     /// "is there anything BENEATH this surface?" of the FULL COLUMN, not of the caller's query
     /// window — a window is only ~100u tall and a cavern roof's floor is often further down than
@@ -455,7 +459,8 @@ pub struct Collision {
     /// production code only ever needs the upper bound, so it's test-only to avoid a dead-code warning.
     #[cfg(test)]
     z_min:     f32,
-    z_max:     f32,
+    // `pub` for the same relocated corpus integration test (it scans from the mesh's top z downward).
+    pub z_max:     f32,
     /// How many times `is_standable` has admitted a **DOWN-facing** (inverted-art) surface as ground
     /// since zone load — i.e. answered a nav query from winding-blind ground whose true facing the
     /// mesh does not confirm (D-2, #375). It is not wrong (qcat proves inverted-art floor is walkable),
@@ -470,7 +475,7 @@ pub struct Collision {
     tight_plans: std::sync::atomic::AtomicU64,
     /// Optional water-region map (from the zone's `.wtr`). When present, find_path may DESCEND
     /// through water (swim down a canal/shaft) to a lower floor that has no walkable connection.
-    water:     Option<std::sync::Arc<crate::region_map::RegionMap>>,
+    water:     Option<std::sync::Arc<eqoxide_core::region_map::RegionMap>>,
     /// True when the terrain triangles came from a dedicated `__collision__` mesh (SOLID +
     /// INVIS faces, PASSABLE excluded). False for legacy zones with no baked collision mesh,
     /// where the rendered terrain is used as a fallback. Diagnostic/provenance only.
@@ -489,7 +494,7 @@ pub struct Collision {
     /// that consumes it is Slice 2. Deliberately NOT built eagerly in `set_water` (that would change
     /// zone-load timing, a behaviour change, and defeat the point of the Slice-1 build-cost
     /// measurement that decides eager-vs-lazy, design §5.3 / owner decision #5).
-    water_grid: Option<crate::nav::water_grid::WaterGrid>,
+    water_grid: Option<crate::water_grid::WaterGrid>,
     /// LAZY water-grid cache (Slice 2, owner decision #5 — LOCKED lazy, not eager). The span grid is
     /// built on the FIRST water plan in a water zone via [`Self::water_grid_active`], not at zone
     /// load: the measured Slice-1 build cost (357 ms – 1 s) far exceeds the 100 ms eager threshold,
@@ -498,14 +503,14 @@ pub struct Collision {
     /// and every A* pass / tier / walker sharing the `Arc<Collision>` reads the one result. Distinct
     /// from `water_grid` above so an explicit [`Self::set_water_grid`] (tests, the measurement
     /// harness) still wins and is never shadowed by a lazily-built one.
-    water_grid_lazy: std::sync::OnceLock<crate::nav::water_grid::WaterGrid>,
+    water_grid_lazy: std::sync::OnceLock<crate::water_grid::WaterGrid>,
 }
 
 /// Outcome of building one water-span column (design §5.1). Separates "no navigable water here"
 /// (`Dry`) from the design-premise honesty case "water with no queryable bottom" (`UnboundedBelow`,
 /// §5.2), which the builder counts rather than fabricating a floor for.
 enum WaterColumnResult {
-    Column(crate::nav::water_grid::WaterColumn),
+    Column(crate::water_grid::WaterColumn),
     UnboundedBelow,
     Dry,
 }
@@ -533,7 +538,7 @@ enum WaterColumnResult {
 /// open and city zones; by 3× the fallback is close to a coin-flip in the tight indoor ones
 /// (Ak'Anon's gnome tunnels), which is two searches to answer what one could. 2× buys a full
 /// body-width of standing room without making the exception the rule.
-pub const NAV_PREFERRED_CLEARANCE: f32 = crate::movement::PLAYER_RADIUS * 2.0;
+pub const NAV_PREFERRED_CLEARANCE: f32 = eqoxide_core::physics::PLAYER_RADIUS * 2.0;
 
 /// **D-2 (`is_standable`, #375): the two knobs of the shared floor predicate.** A surface is standable
 /// ground, FACING-BLIND, iff `|nz| >= NAV_NEAR_HORIZONTAL` (flat enough to stand on) AND it has
@@ -620,7 +625,7 @@ fn generous_node_cap(caller: Option<usize>) -> Option<usize> {
 /// collision volume instead of casting a centre ray — see `Collision::edge_clear` for the measured
 /// reason this is not simply "always". Sits above `nav::steering::LOCAL_CELL` (2u, the fine tier) and
 /// below the coarse whole-zone grid (8u).
-pub(crate) const SWEPT_EDGE_MAX_CELL: f32 = 4.0;
+pub const SWEPT_EDGE_MAX_CELL: f32 = 4.0;
 
 impl Collision {
     /// Build the grid from zone geometry. `cell_size` is in EQ units.
@@ -759,7 +764,7 @@ impl Collision {
     }
 
     /// Attach a zone water map so find_path can route swim descents. Call after `build`.
-    pub fn set_water(&mut self, water: Option<std::sync::Arc<crate::region_map::RegionMap>>) {
+    pub fn set_water(&mut self, water: Option<std::sync::Arc<eqoxide_core::region_map::RegionMap>>) {
         self.water = water;
         // Precompute zone-line region points now (zone load, off the net thread) so the runtime
         // find_zone_line_near is an O(1) cache read (#204).
@@ -792,12 +797,12 @@ impl Collision {
 
     /// Store a prebuilt water-span grid on this collision (3D-water-volume nav design §5, Slice 1).
     /// Purely additive: nothing in the search/walker reads it in Slice 1.
-    pub fn set_water_grid(&mut self, grid: Option<crate::nav::water_grid::WaterGrid>) {
+    pub fn set_water_grid(&mut self, grid: Option<crate::water_grid::WaterGrid>) {
         self.water_grid = grid;
     }
 
     /// The stored water-span grid, if one has been built (`None` until `set_water_grid`).
-    pub fn water_grid(&self) -> Option<&crate::nav::water_grid::WaterGrid> {
+    pub fn water_grid(&self) -> Option<&crate::water_grid::WaterGrid> {
         self.water_grid.as_ref()
     }
 
@@ -811,7 +816,7 @@ impl Collision {
     /// coarse (#377) and fine (#382) tiers — and caches it; every later call is a pointer read. The
     /// build is gated on `self.water.is_some()` *before* `get_or_init`, so a grid is never cached for
     /// a zone whose water map has not been attached yet.
-    fn water_grid_active(&self) -> Option<&crate::nav::water_grid::WaterGrid> {
+    fn water_grid_active(&self) -> Option<&crate::water_grid::WaterGrid> {
         if let Some(g) = self.water_grid.as_ref() { return Some(g); }
         self.water.as_ref()?;
         Some(self.water_grid_lazy.get_or_init(|| {
@@ -853,9 +858,9 @@ impl Collision {
     /// each candidate column build its navigable spans with [`Self::build_water_column`]. Candidate
     /// columns are de-duplicated (overlapping AABBs) but each is scanned over the water leaves' z-band
     /// so stacked water (a pool over a separate flooded tunnel — the qcat case) yields multiple spans.
-    pub fn build_water_grid(&self, body: &crate::traversability::Body) -> crate::nav::water_grid::WaterGrid {
+    pub fn build_water_grid(&self, body: &crate::traversability::Body) -> crate::water_grid::WaterGrid {
         const COL: f32 = 4.0; // 4u XY water columns (design §5.1 / owner decision #2, locked)
-        let mut grid = crate::nav::water_grid::WaterGrid::new(self.origin, COL);
+        let mut grid = crate::water_grid::WaterGrid::new(self.origin, COL);
         let Some(water) = self.water.as_ref() else { return grid; };
         if self.cols == 0 || self.tris.is_empty() { return grid; }
 
@@ -917,9 +922,9 @@ impl Collision {
     /// rock as navigable — an agent-honesty defect). `UnboundedBelow` when a wet probe's water has
     /// no bottom (`bottom_z` == None) — surfaced by the caller as a design-premise signal, never
     /// fabricated into a floor (design §5.2 STOP condition).
-    fn build_water_column(&self, water: &crate::region_map::RegionMap,
+    fn build_water_column(&self, water: &eqoxide_core::region_map::RegionMap,
         body: &crate::traversability::Body, e: f32, n: f32, zrange: (f32, f32)) -> WaterColumnResult {
-        use crate::nav::water_grid::{VRES, WaterColumn};
+        use crate::water_grid::{VRES, WaterColumn};
         const EPS: f32 = 0.05;
         // = `movement::SKIN` (0.05, private there); the body-top must clear a solid ceiling by this,
         // exactly as the collided `swim_rise` stops `SKIN` short of the ceiling (design §5.1).
@@ -1683,7 +1688,7 @@ impl Collision {
     }
 
     #[cfg(test)]
-    pub(crate) fn clearance_field_for_test(&self) -> &crate::traversability::ClearanceField {
+    pub fn clearance_field_for_test(&self) -> &crate::traversability::ClearanceField {
         &self.clearance
     }
 
@@ -1988,7 +1993,7 @@ impl Collision {
     /// same class that caused the #257/#302 linkdead bugs (measured, release, akanon: mean 15.3 ms,
     /// worst **358 ms**), and, worse, a budget that made its answer unfalsifiable: a search that ran
     /// out of clock and one that proved the corridor impassable came back as the same short
-    /// `Option<Vec<_>>`. It now runs on `crate::nav::planner::LocalPlanner`, where nothing real-time waits on
+    /// `Option<Vec<_>>`. It now runs on `crate::planner::LocalPlanner`, where nothing real-time waits on
     /// it, so it can afford the truth.
     ///
     /// Termination is **spatial, not temporal**: `max_search = Some(bound)` confines the frontier to a
@@ -2020,7 +2025,7 @@ impl Collision {
         // backstop; the 40u `bound` is what really terminates this search.
         let ctx = PlanCtx { node_cap: Some(NET_TIER_NODE_CAP), ..PlanCtx::default() }.ensure_budget();
         let (s, _tight) = self.search_tiered(
-            start, goal, crate::movement::PLAYER_RADIUS, &[], cell, Some(bound), 0.0, ctx);
+            start, goal, eqoxide_core::physics::PLAYER_RADIUS, &[], cell, Some(bound), 0.0, ctx);
         // The partial rides along in EVERY variant — it is a steering hint, not a route proposal.
         let steer: Vec<[f32; 3]> = s.path.map(|(p, _)| p).unwrap_or_default();
         let reached = steer.last()
@@ -2063,7 +2068,7 @@ impl Collision {
     /// knows whether a route exists at all.
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn search_tiered_for_test(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]],
+    pub fn search_tiered_for_test(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]],
         cell: f32, max_search: Option<f32>, aggro_buffer: f32, ctx: PlanCtx) -> (Search, bool) {
         self.search_tiered(start, goal, radius, avoid, cell, max_search, aggro_buffer, ctx)
     }
@@ -2072,7 +2077,7 @@ impl Collision {
     fn search_tiered(&self, start: [f32; 3], goal: [f32; 3], radius: f32, avoid: &[[f32; 2]],
         cell: f32, max_search: Option<f32>, aggro_buffer: f32, ctx: PlanCtx) -> (Search, bool) {
         // The hard floor (#310). Never search below the radius the controller actually moves with.
-        let minimum = radius.max(crate::movement::PLAYER_RADIUS);
+        let minimum = radius.max(eqoxide_core::physics::PLAYER_RADIUS);
         // Tiering is a ROUTE-CHOICE mechanism, and only a plan that actually chooses a route should
         // pay for it. A BOUNDED plan (`max_search: Some`) is the fine local tier: it follows a carrot
         // on a coarse route that was ALREADY chosen with room, inside a 40u window where there is no
@@ -2470,7 +2475,7 @@ impl Collision {
         // bridge, gangplank or catwalk routable at all — and the GENEROUS tier layers standing room
         // on top of it (`search_tiered`). A swim plan is exempt outright: a floating character has no
         // ground under it by definition, so the probe would reject every cell it must cross.
-        let ledge_margin = if radius > crate::movement::PLAYER_RADIUS && floating_surface.is_none() {
+        let ledge_margin = if radius > eqoxide_core::physics::PLAYER_RADIUS && floating_surface.is_none() {
             radius
         } else {
             0.0
@@ -2644,7 +2649,7 @@ impl Collision {
             // partitions the graph cleanly: legacy nodes route by the land families, interior nodes by
             // the water families. The water families are thus purely ADDITIVE — reached only via the
             // new interior nodes — leaving every existing land / surface-swim / haul-out path intact.
-            let cur_water: Option<(&crate::nav::water_grid::WaterColumn, (f32, f32))> =
+            let cur_water: Option<(&crate::water_grid::WaterColumn, (f32, f32))> =
                 water_grid.and_then(|g| g.column_at(a[0], a[1]))
                     .and_then(|col| col.span_containing(cz).map(|s| (col, s)));
             // VERTICAL swim within the current column: up / down one VRES step, staying in the SAME
@@ -2652,7 +2657,7 @@ impl Collision {
             // removed), so no lateral ray is needed — this is the dive/rise leg a mid-water route needs
             // and the up-column climb to the swim plane before a haul-out. Once per node (not per dir).
             if let Some((_, (slo, shi))) = cur_water {
-                use crate::nav::water_grid::VRES;
+                use crate::water_grid::VRES;
                 for d in [-1.0f32, 1.0] {
                     let nz = cz + d * VRES;
                     if nz < slo - 0.01 || nz > shi + 0.01 { continue; } // stay inside this span
@@ -2704,7 +2709,7 @@ impl Collision {
                 // walkable floor). Emit the 3D interior + haul-out edges for this neighbour, then
                 // `continue` past the land families entirely.
                 if let Some((cur_col, _)) = cur_water {
-                    use crate::nav::water_grid::VRES;
+                    use crate::water_grid::VRES;
                     let body = &crate::traversability::PLAYER_BODY;
                     // HORIZONTAL 26-neighbour (design §6.2): connect to the neighbour column's node at
                     // z−VRES, z, z+VRES — full 3-DOF, smoother chords than 6-connectivity. Lateral
@@ -2817,7 +2822,7 @@ impl Collision {
                             .into_iter().any(|f| f - cz <= STEP_H && cz - f <= MAX_STEP_DOWN)
                     };
                     if !walkable_at(b[0], b[1]) {
-                        let reach = crate::movement::running_jump_reach(NAV_RUN_SPEED);
+                        let reach = eqoxide_core::physics::running_jump_reach(NAV_RUN_SPEED);
                         let max_k = (reach / cell).floor() as i32;
                         for k in 2..=max_k.max(2) {
                             let (jc, jr) = (c + dc * k, r + dr * k);
@@ -3264,7 +3269,7 @@ impl Collision {
 #[cfg(test)]
 mod b2_glb_tests {
     use super::*;
-    use crate::assets::{ZoneAssets, COLLISION_MESH_TAG};
+    use eqoxide_assets::{ZoneAssets, COLLISION_MESH_TAG};
 
     /// End-to-end: a zone GLB baked with the Component-B pipeline (containing a `__collision__`
     /// mesh) must be ingested so `Collision::build` reports collision-mesh provenance, the
@@ -3294,7 +3299,7 @@ mod b2_glb_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assets::{MeshData, RenderMode, ZoneAssets};
+    use eqoxide_assets::{MeshData, RenderMode, ZoneAssets};
 
     /// #522 diagnostic: dump every collision surface in the vertical columns at the two live
     /// measurement points on the Kelethin plank (Acceptancetest at (-126.375,-15.875) holding
@@ -3411,7 +3416,7 @@ mod tests {
 
         // Flooded to z=9: swim up and haul out onto the bank.
         let mut wet = Collision::build(&assets, 4.0);
-        wet.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::flat_below(9.0))));
+        wet.set_water(Some(std::sync::Arc::new(eqoxide_core::region_map::RegionMap::flat_below(9.0))));
         let path = wet.find_path(start, goal, 1.0, &[], false);
         assert!(path.is_some(), "flooded pit must be exitable by swimming up to the bank");
         let last = *path.unwrap().last().unwrap();
@@ -3419,80 +3424,6 @@ mod tests {
             "path should end at the bank goal, got {last:?}");
     }
 
-    /// P1 — the #359 drift-apart property (THE HAUL-OUT CONTRACT, water design §9 gate): sweep the
-    /// exit-ledge height `h` above the water surface in 0.25 u steps over `[0, 2 × haul_out_up]`
-    /// and pin, for every `h`, that
-    ///     planner admits the water→land exit  ⟺  h ≤ PLAYER_BODY.haul_out_up
-    /// AND that every ADMITTED exit is actually EXECUTABLE by the real `CharacterController`,
-    /// driven exactly the way the nav walker drives a swim leg (start floating at
-    /// `surface − float_depth`, swim-up wish when the waypoint is above, the swimming step-up at
-    /// the lip). A planner-legal haul-out the controller cannot climb is the #359 wedge (the
-    /// character bobbed at the waterline forever); a refused exit at `h ≤ haul_out_up` is the
-    /// false-`no_path` the exact-surface sizing prevents. The two sides must never disagree.
-    ///
-    /// (The controller deliberately keeps ~0.5 u of capability margin ABOVE the cap
-    /// (`STEP_UP + GROUND_SNAP_TOL = 2.5` vs `haul_out_up = 2.0`, design §4c E3) — the planner may
-    /// only under-promise, never over-promise, so the property tested is admission ⟹ execution
-    /// plus the exact admission boundary, not capability ⟺ admission.)
-    #[test]
-    fn p1_haul_out_admission_matches_controller_execution() {
-        let mesh = |positions: Vec<[f32; 3]>| MeshData {
-            positions, normals: vec![], uvs: vec![],
-            indices: vec![0, 1, 2, 0, 2, 3],
-            texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
-            render_mode: RenderMode::Opaque, anim: None,
-        };
-        let body = &crate::traversability::PLAYER_BODY;
-        let surf = 9.0_f32;
-        // Pit floor z=0 (east 0..24), cliff face at east=24 up to the bank lip, bank at
-        // z = surf + h (east 24..48). EQ WLD pos = [north, height, east]. Water is a SLAB
-        // 0.5..surf — bounded below like real `.wtr` volumes — so there is no water beneath the
-        // pit floor and the surface-traversal edge cannot open a side door: admission is decided
-        // by the WATER ASCENT haul-out edge alone.
-        let scene = |bank_z: f32| {
-            let pit_floor = mesh(vec![[0.0, 0.0, 0.0], [0.0, 0.0, 24.0], [24.0, 0.0, 24.0], [24.0, 0.0, 0.0]]);
-            let cliff = mesh(vec![[0.0, 0.0, 24.0], [24.0, 0.0, 24.0], [24.0, bank_z, 24.0], [0.0, bank_z, 24.0]]);
-            let bank = mesh(vec![[0.0, bank_z, 24.0], [0.0, bank_z, 48.0], [24.0, bank_z, 48.0], [24.0, bank_z, 24.0]]);
-            ZoneAssets { terrain: vec![pit_floor, cliff, bank], objects: vec![], textures: vec![] }
-        };
-        let mut h = 0.0_f32;
-        while h <= 2.0 * body.haul_out_up + 1e-3 {
-            let bank_z = surf + h;
-            let mut col = Collision::build(&scene(bank_z), 4.0);
-            col.set_water(Some(std::sync::Arc::new(
-                crate::region_map::RegionMap::water_slab(0.5, surf))));
-            let admitted = col.find_path([8.0, 12.0, 0.0], [40.0, 12.0, bank_z], 1.0, &[], false).is_some();
-            assert_eq!(admitted, h <= body.haul_out_up,
-                "planner admission must be exactly 'lip ≤ haul_out_up above the surface': \
-                 h={h}, admitted={admitted}");
-            if admitted {
-                // Execute the admitted exit with the real controller, driven like the walker:
-                // horizontal wish at the bank, the walker's swim-up rule for the vertical, its
-                // body-probe want_swim. Success = standing on the bank, past the lip.
-                let mut ctrl = crate::movement::CharacterController::new(
-                    [18.0, 12.0, surf - body.float_depth]);
-                let mut out = false;
-                for _ in 0..1200 {
-                    let p = ctrl.pos;
-                    let swim = col.in_water(p) || col.in_water([p[0], p[1], p[2] + 3.0]);
-                    let intent = eqoxide_ipc::MoveIntent {
-                        wish_dir: [1.0, 0.0],
-                        wish_vspeed: if swim && bank_z > p[2] + 1.0 { 20.0 } else { 0.0 },
-                        jump: false, want_swim: swim, speed: 35.0, climb: 0.0, hop: false,
-                    };
-                    ctrl.step(intent, 1.0 / 60.0, &col);
-                    if ctrl.on_ground && ctrl.pos[0] > 24.0 && (ctrl.pos[2] - bank_z).abs() < 0.6 {
-                        out = true;
-                        break;
-                    }
-                }
-                assert!(out,
-                    "the controller must execute every planner-admitted haul-out (#359): \
-                     h={h}, ended at {:?}", ctrl.pos);
-            }
-            h += 0.25;
-        }
-    }
 
     /// eqoxide#212: A* must refuse a ramp too steep to walk (it slides/wedges), while taking a
     /// gentle ramp of the same rise. Same geometry, only the ramp's run (steepness) differs.
@@ -3566,7 +3497,7 @@ mod tests {
         // the z=0 floor so standing on it — feet at z≈1 — is inside the region and would fire the
         // crossing). set_water precomputes its representative floor point (centroid ≈ east -28, north 40).
         col.set_water(Some(std::sync::Arc::new(
-            crate::region_map::RegionMap::zone_line_box(30.0, 50.0, -40.0, -16.0, -5.0, 5.0, PAD_INDEX))));
+            eqoxide_core::region_map::RegionMap::zone_line_box(30.0, 50.0, -40.0, -16.0, -5.0, 5.0, PAD_INDEX))));
         let start = [-112.0, 40.0, 0.0]; // slab A, clear of the footprint
         let goal  = [450.0, 40.0, 0.0];  // slab B
         (col, start, goal, PAD_INDEX, [-28.0, 40.0])
@@ -3660,7 +3591,7 @@ mod tests {
         const IDX: i32 = 42;
         // Footprint floats in z[30,40] over slab A's z=0 floor — nothing standable is inside it.
         col.set_water(Some(std::sync::Arc::new(
-            crate::region_map::RegionMap::zone_line_box(30.0, 50.0, -40.0, -16.0, 30.0, 40.0, IDX))));
+            eqoxide_core::region_map::RegionMap::zone_line_box(30.0, 50.0, -40.0, -16.0, 30.0, 40.0, IDX))));
         // The region IS present (precompute found it): the OLD ungated resolver would have taken this
         // raw, non-standable region point as a source. `is_some` here is what makes the assertion
         // below about the GATE, not about a missing region.
@@ -3690,7 +3621,7 @@ mod tests {
         const IDX: i32 = 42;
         // Two footprint leaves of the SAME index: north[10,25] and north[45,60], both east[-40,-16].
         col.set_water(Some(std::sync::Arc::new(
-            crate::region_map::RegionMap::zone_line_two_boxes(10.0, 25.0, 45.0, 60.0, -40.0, -16.0, -5.0, 5.0, IDX))));
+            eqoxide_core::region_map::RegionMap::zone_line_two_boxes(10.0, 25.0, 45.0, 60.0, -40.0, -16.0, -5.0, 5.0, IDX))));
         // Destination on the same slab (a walkable floor) so the DEST guard is satisfied and the test
         // isolates the SOURCE per-leaf behaviour.
         let edges = col.resolve_teleport_pads(&[(IDX, [-70.0, 40.0, 0.0])]);
@@ -3857,7 +3788,7 @@ mod tests {
             objects: vec![], textures: vec![],
         };
         let mut col = Collision::build(&assets, 4.0);
-        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::water_slab(-44.0, -4.0))));
+        col.set_water(Some(std::sync::Arc::new(eqoxide_core::region_map::RegionMap::water_slab(-44.0, -4.0))));
         let grid = col.build_water_grid(&body);
 
         let c = grid.column_at(30.0, 30.0).expect("interior column is wet");
@@ -3890,7 +3821,7 @@ mod tests {
                 objects: vec![], textures: vec![],
             };
             let mut col = Collision::build(&assets, 4.0);
-            col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::water_slab(-44.0, -4.0))));
+            col.set_water(Some(std::sync::Arc::new(eqoxide_core::region_map::RegionMap::water_slab(-44.0, -4.0))));
             let grid = col.build_water_grid(body);
             grid.column_at(30.0, 30.0).cloned().expect("interior column is wet")
         };
@@ -3941,7 +3872,7 @@ mod tests {
             objects: vec![], textures: vec![],
         };
         let mut col = Collision::build(&assets, 4.0);
-        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::water_slab(-44.0, -4.0))));
+        col.set_water(Some(std::sync::Arc::new(eqoxide_core::region_map::RegionMap::water_slab(-44.0, -4.0))));
         let c = col.build_water_grid(&body).column_at(30.0, 30.0).cloned()
             .expect("the interior column is wet (water is painted through the slab)");
 
@@ -3989,7 +3920,7 @@ mod tests {
             objects: vec![], textures: vec![],
         };
         let mut col = Collision::build(&assets, 4.0);
-        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::water_slab(-44.0, -4.0))));
+        col.set_water(Some(std::sync::Arc::new(eqoxide_core::region_map::RegionMap::water_slab(-44.0, -4.0))));
         let c = col.build_water_grid(&body).column_at(30.0, 30.0).cloned()
             .expect("the interior column is wet");
 
@@ -4030,7 +3961,7 @@ mod tests {
             objects: vec![], textures: vec![],
         };
         let mut col = Collision::build(&assets, 4.0);
-        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::water_slab(-44.0, -4.0))));
+        col.set_water(Some(std::sync::Arc::new(eqoxide_core::region_map::RegionMap::water_slab(-44.0, -4.0))));
         let c = col.build_water_grid(&body).column_at(30.0, 30.0).cloned()
             .expect("the interior column is wet");
 
@@ -4166,7 +4097,7 @@ mod tests {
             objects: vec![], textures: vec![],
         };
         let mut col = Collision::build(&assets, 8.0);
-        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::flat_below(0.0))));
+        col.set_water(Some(std::sync::Arc::new(eqoxide_core::region_map::RegionMap::flat_below(0.0))));
 
         // Floating 2u under the surface, 98u above the only solid floor.
         let start = [8.0, 32.0, -2.0];
@@ -4185,7 +4116,7 @@ mod tests {
     fn wading_character_is_still_anchored_to_the_ground() {
         let assets = ZoneAssets { terrain: vec![slab(0.0, 0.0, 64.0, 0.0, 64.0, true)], objects: vec![], textures: vec![] };
         let mut col = Collision::build(&assets, 8.0);
-        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::flat_below(3.0))));
+        col.set_water(Some(std::sync::Arc::new(eqoxide_core::region_map::RegionMap::flat_below(3.0))));
         // Standing on the floor in 3u of water: there IS footing, so no surface anchor.
         let path = col.find_path([8.0, 32.0, 0.0], [56.0, 32.0, 0.0], 1.0, &[], false)
             .expect("a wader must still route across the shallows");
@@ -4210,7 +4141,7 @@ mod tests {
 
         // Case 1: the goal z is IN the water, just under the surface (surface at 0).
         let mut col = Collision::build(&assets, 8.0);
-        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::flat_below(0.0))));
+        col.set_water(Some(std::sync::Arc::new(eqoxide_core::region_map::RegionMap::flat_below(0.0))));
         let start = [8.0, 72.0, 0.0];  // on the bank
         let goal  = [40.0, 24.0, -2.0]; // floating mid-pool, 98u above the only solid floor
         let path = col.find_path(start, goal, 1.0, &[], false).expect("a route into the pool must exist");
@@ -4225,7 +4156,7 @@ mod tests {
         // Case 2: the goal z is ABOVE the water — the agent passed z=0 over a pool whose surface
         // sits at −8 (the short downward probe must still find and anchor to that surface).
         let mut col = Collision::build(&assets, 8.0);
-        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::flat_below(-8.0))));
+        col.set_water(Some(std::sync::Arc::new(eqoxide_core::region_map::RegionMap::flat_below(-8.0))));
         let goal = [40.0, 24.0, 0.0];
         let path = col.find_path(start, goal, 1.0, &[], false)
             .expect("a z-above-the-surface water goal must still route");
@@ -4254,7 +4185,7 @@ mod tests {
             objects: vec![], textures: vec![],
         };
         let mut col = Collision::build(&assets, 8.0);
-        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::flat_below(0.0))));
+        col.set_water(Some(std::sync::Arc::new(eqoxide_core::region_map::RegionMap::flat_below(0.0))));
         let start = [256.0, 480.0, 0.0];  // on the bank
         let goal  = [256.0, 224.0, -2.0]; // floating mid-lake, 248u above the unreachable floor
         // Ask the raw search so the expansion count is observable. With the surface anchor, A*
@@ -4285,7 +4216,7 @@ mod tests {
             objects: vec![], textures: vec![],
         };
         let mut col = Collision::build(&assets, 8.0);
-        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::flat_below(0.0))));
+        col.set_water(Some(std::sync::Arc::new(eqoxide_core::region_map::RegionMap::flat_below(0.0))));
         let goal = [40.0, 24.0, -20.0]; // the caller NAMES the pool bottom
         // The tier logic honours the asked floor: the plan aims at the bottom tier...
         let path = col.find_path([8.0, 72.0, 0.0], goal, 1.0, &[], false)
@@ -4317,14 +4248,14 @@ mod tests {
     /// this goes RED (gdz ≈ 38 → Drive).
     #[test]
     fn deep_water_goal_arrives_at_the_surface_not_the_submerged_floor() {
-        use crate::nav::steering::{arrival_action, ArrivalAction};
+        use crate::steering::{arrival_action, ArrivalAction};
         let assets = ZoneAssets {
             terrain: vec![slab(-40.0, 0.0, 64.0, 0.0, 48.0, true),   // pool bottom, 40u under water
                           slab(0.0, 0.0, 64.0, 48.0, 96.0, true)],   // dry bank at the waterline
             objects: vec![], textures: vec![],
         };
         let mut col = Collision::build(&assets, 8.0);
-        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::flat_below(0.0))));
+        col.set_water(Some(std::sync::Arc::new(eqoxide_core::region_map::RegionMap::flat_below(0.0))));
         let goal = [40.0, 24.0, -40.0]; // the caller NAMES the pool bottom, 40u down
 
         // The anchor is the SURFACE (~0), never the -40 bottom.
@@ -4335,7 +4266,7 @@ mod tests {
         // The walker floats at surface − float_depth (2.0). With the surface anchor it has ARRIVED.
         let walker_z = 0.0 - crate::traversability::PLAYER_BODY.float_depth;
         let gdz = anchor - walker_z;
-        assert!(gdz.abs() <= crate::nav::collision::GOAL_TIER_TOL,
+        assert!(gdz.abs() <= crate::collision::GOAL_TIER_TOL,
             "floating at the surface is within the arrival tolerance of the surface anchor (gdz={gdz})");
         assert_eq!(arrival_action(0.5, gdz, false), ArrivalAction::Arrived,
             "a swimmer at the surface of a deep pool must ARRIVE, not churn to a false 'blocked'");
@@ -4359,7 +4290,7 @@ mod tests {
             objects: vec![], textures: vec![],
         };
         let mut col = Collision::build(&assets, 8.0);
-        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::flat_below(0.0))));
+        col.set_water(Some(std::sync::Arc::new(eqoxide_core::region_map::RegionMap::flat_below(0.0))));
         // Goal 280u deep: in water, no footing within FOOTING — but the surface is 280u up, past
         // `surface_z`'s 200u bound → None. The anchor must yield and let `floor_beneath` project
         // the goal onto the abyss floor (the pre-existing volume-point behaviour).
@@ -4389,7 +4320,7 @@ mod tests {
             objects: vec![], textures: vec![],
         };
         let mut col = Collision::build(&assets, 8.0);
-        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::flat_below(0.0))));
+        col.set_water(Some(std::sync::Arc::new(eqoxide_core::region_map::RegionMap::flat_below(0.0))));
         // From the bank, a carrot 28u out over the deep water at the coarse route's z.
         match col.find_path_local([56.0, 52.0, 0.0], [56.0, 24.0, 0.0], 2.0, 60.0, 4.0) {
             LocalOutcome::Threaded(p) => {
@@ -4658,7 +4589,7 @@ mod tests {
         let mut col = Collision::build(&assets, 8.0);
         // A zone-line region filling everything below z=50 — its representative point is up in the
         // volume, tens of units above the floor at 0 (exactly the shipped-asset shape).
-        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::zone_line_below(50.0, 7))));
+        col.set_water(Some(std::sync::Arc::new(eqoxide_core::region_map::RegionMap::zone_line_below(50.0, 7))));
 
         let (idx, p) = col.find_zone_line_near(Some(7), [8.0, 8.0, 0.0]).expect("the zone line is found");
         assert_eq!(idx, 7);
@@ -4772,7 +4703,7 @@ mod tests {
     /// overrun the budget (blackburrow 17 -> 30 of 240) while buying nothing (#382).
     #[test]
     fn the_bounded_local_tier_plans_at_the_minimum_clearance_not_the_generous_one() {
-        let r = crate::movement::PLAYER_RADIUS;
+        let r = eqoxide_core::physics::PLAYER_RADIUS;
         let col = slotted_wall(2.0 * r + 0.5); // fits the character, not the preferred margin
         let (start, goal) = ([5.0, 9.0, 0.0], [15.0, 9.0, 0.0]);
 
@@ -4824,7 +4755,7 @@ mod tests {
     /// `path_clear` must answer for the character's real volume, not for a line.
     #[test]
     fn path_clear_rejects_a_slot_the_ray_fits_through_but_the_character_does_not() {
-        let r = crate::movement::PLAYER_RADIUS;
+        let r = eqoxide_core::physics::PLAYER_RADIUS;
         let col = slotted_wall(1.5); // < 2 * PLAYER_RADIUS -> the character cannot fit
         let (from, to) = ([5.0, 9.0, 3.0], [15.0, 9.0, 3.0]); // dead down the middle of the slot
         // The LINE really is unobstructed — that is exactly why the old ray test said "clear".
@@ -4844,7 +4775,7 @@ mod tests {
     /// sub-capsule gap at all, and the tier the walker actually steers along.)
     #[test]
     fn find_path_refuses_a_gap_narrower_than_the_character() {
-        let r = crate::movement::PLAYER_RADIUS;
+        let r = eqoxide_core::physics::PLAYER_RADIUS;
         let narrow = slotted_wall(1.5);
         let route = narrow.find_path_res([5.0, 9.0, 0.0], [15.0, 9.0, 0.0], r, &[], false, 2.0,
             None, 0.0, PlanCtx::default());
@@ -4868,7 +4799,7 @@ mod tests {
     /// before — so the push is also checked against the character's own collision volume.
     #[test]
     fn the_waypoint_inset_never_nudges_the_character_into_a_wall() {
-        let r = crate::movement::PLAYER_RADIUS;
+        let r = eqoxide_core::physics::PLAYER_RADIUS;
         // A corridor with a DROP on one side and a WALL on the other. The floor runs out at
         // north 13.5; a wall stands on the floor at north 10. The route runs east between them, so
         // the inset — pushing away from the drop, the only hazard `edge_ok` can see — is aimed
@@ -4933,10 +4864,10 @@ mod tests {
     /// fall back to ray clearance and #358 would be un-fixed with every test still green.
     #[test]
     fn the_swept_edge_test_covers_the_tier_the_walker_actually_steers_along() {
-        assert!(crate::nav::steering::LOCAL_CELL <= SWEPT_EDGE_MAX_CELL,
+        assert!(crate::steering::LOCAL_CELL <= SWEPT_EDGE_MAX_CELL,
             "the local tier ({}) is not covered by the swept edge test (<= {}) — the walker would \
              be steered along ray-validated edges again (#358)",
-            crate::nav::steering::LOCAL_CELL, SWEPT_EDGE_MAX_CELL);
+            crate::steering::LOCAL_CELL, SWEPT_EDGE_MAX_CELL);
         // ...and the coarse whole-zone grid (8u) must stay OUTSIDE it — sweeping an 8u lattice line
         // seals corridors (Ak'Anon: 90/120 routable pairs -> 55/120).
         assert!(SWEPT_EDGE_MAX_CELL < 8.0, "the coarse tier must remain a ray-validated selector");
@@ -4949,7 +4880,7 @@ mod tests {
     /// place.
     #[test]
     fn edge_clear_sweeps_the_volume_at_the_resolution_the_walker_steers_along() {
-        let r = crate::movement::PLAYER_RADIUS;
+        let r = eqoxide_core::physics::PLAYER_RADIUS;
         let col = slotted_wall(1.5); // narrower than the character (2 * PLAYER_RADIUS)
         let (from, to) = ([5.0, 9.0, 3.0], [15.0, 9.0, 3.0]);
         // FINE tier (2u = nav::steering::LOCAL_CELL): the plan the walker actually steers along. The
@@ -4993,7 +4924,7 @@ mod tests {
     /// route that skims a wall is a route the walker slides into.
     #[test]
     fn find_path_prefers_the_route_with_room_when_one_exists() {
-        let r = crate::movement::PLAYER_RADIUS;
+        let r = eqoxide_core::physics::PLAYER_RADIUS;
         // Narrow: passable by the character (> 2r) but NOT with the preferred margin (< 2 * 2r).
         // Wide: comfortably passable with the preferred margin.
         let col = two_slot_wall(2.0 * r + 0.5, 2.0 * NAV_PREFERRED_CLEARANCE + 2.0);
@@ -5009,7 +4940,7 @@ mod tests {
     /// minimum clearance and say so — a tight route is walkable, just riskier.
     #[test]
     fn find_path_falls_back_to_the_minimum_clearance_when_only_a_tight_route_exists() {
-        let r = crate::movement::PLAYER_RADIUS;
+        let r = eqoxide_core::physics::PLAYER_RADIUS;
         let col = slotted_wall(2.0 * r + 0.5); // fits the character, not the preferred margin
         let before = col.tight_plans();
         let (path, tight) = tiered_route(&col, [5.0, 9.0, 0.0], [15.0, 9.0, 0.0], r, 2.0)
@@ -5026,7 +4957,7 @@ mod tests {
     /// the whole point of #358.
     #[test]
     fn find_path_never_plans_below_the_player_radius() {
-        let r = crate::movement::PLAYER_RADIUS;
+        let r = eqoxide_core::physics::PLAYER_RADIUS;
         let col = slotted_wall(2.0 * r - 0.5); // narrower than the character
         for asked in [r, r * 0.5, r * 0.25, 0.0] {
             let route = tiered_route(&col, [5.0, 9.0, 0.0], [15.0, 9.0, 0.0], asked, 2.0);
@@ -5063,7 +4994,7 @@ mod tests {
         // The straight line (4,4) -> (16,16) runs clean through the void, so A* must round the
         // inside corner at (8,12) — the exact place a route hugs a drop.
         let (path, _) = tiered_route(&col, [4.0, 4.0, 0.0], [16.0, 16.0, 0.0],
-            crate::movement::PLAYER_RADIUS, 2.0).expect("a route around the void exists");
+            eqoxide_core::physics::PLAYER_RADIUS, 2.0).expect("a route around the void exists");
         // Every waypoint the walker is asked to stand on has a body-width of ground around it.
         // (The final waypoint is snapped to the caller's exact goal, which is the caller's problem.)
         for p in &path[..path.len() - 1] {
@@ -5082,7 +5013,7 @@ mod tests {
     /// search can fix it, by going round.
     #[test]
     fn find_path_takes_the_long_wide_bridge_over_the_short_narrow_catwalk() {
-        let r = crate::movement::PLAYER_RADIUS;
+        let r = eqoxide_core::physics::PLAYER_RADIUS;
         let quad = |e0: f32, e1: f32, n0: f32, n1: f32| MeshData {
             positions: vec![[n0, 0.0, e0], [n1, 0.0, e0], [n1, 0.0, e1], [n0, 0.0, e1]],
             normals: vec![[0.0, 1.0, 0.0]; 4], uvs: vec![[0.0, 0.0]; 4],
@@ -5354,11 +5285,11 @@ mod tests {
             &ZoneAssets { terrain: vec![pool_bottom, near_shore, far_shore], objects: vec![], textures: vec![] }, 8.0);
         // SUNKEN pool: water surface at z=-8, a few units BELOW the z=0 shores you wade in from
         // (like Halas's central pool under the ice) — so the swim edge has to probe down to find it.
-        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::flat_below(-8.0))));
+        col.set_water(Some(std::sync::Arc::new(eqoxide_core::region_map::RegionMap::flat_below(-8.0))));
 
         let start = [20.0, 20.0, 0.0];   // near shore
         let goal  = [140.0, 20.0, 0.0];  // far shore, across the pool
-        let path = col.find_path(start, goal, crate::movement::PLAYER_RADIUS, &[], false)
+        let path = col.find_path(start, goal, eqoxide_core::physics::PLAYER_RADIUS, &[], false)
             .expect("a swim route across the surface pool should exist");
         // It reaches the far shore...
         let last = *path.last().unwrap();
@@ -5384,7 +5315,7 @@ mod tests {
     /// interior edge families and the depth node is unreachable, so the route no longer ends at −24.
     #[test]
     fn find_path_reaches_a_mid_water_goal_node_at_depth() {
-        use crate::nav::water_grid::VRES;
+        use crate::water_grid::VRES;
         let assets = ZoneAssets {
             terrain: vec![
                 slab(-44.0, 0.0, 64.0, 0.0, 64.0, true),                 // pool floor
@@ -5393,11 +5324,11 @@ mod tests {
             objects: vec![], textures: vec![],
         };
         let mut col = Collision::build(&assets, 8.0);
-        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::water_slab(-44.0, -4.0))));
+        col.set_water(Some(std::sync::Arc::new(eqoxide_core::region_map::RegionMap::water_slab(-44.0, -4.0))));
 
         let start = [30.0, 10.0, -6.0];   // floating just under the surface (no footing → surface anchor)
         let goal  = [30.0, 46.0, -24.0];  // MID-WATER: 20u below the surface, 20u above the −44 floor
-        let path = col.find_path(start, goal, crate::movement::PLAYER_RADIUS, &[], false)
+        let path = col.find_path(start, goal, eqoxide_core::physics::PLAYER_RADIUS, &[], false)
             .expect("a route to the mid-water goal must exist");
         let last = *path.last().unwrap();
         assert!((last[0] - goal[0]).abs() < 8.0 && (last[1] - goal[1]).abs() < 8.0,
@@ -5442,7 +5373,7 @@ mod tests {
             objects: vec![], textures: vec![],
         };
         let mut col = Collision::build(&assets, 8.0);
-        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::water_slab(-44.0, -4.0))));
+        col.set_water(Some(std::sync::Arc::new(eqoxide_core::region_map::RegionMap::water_slab(-44.0, -4.0))));
         let goal = [30.0, 46.0, -44.0]; // the pool FLOOR (a dry tier under the water), not a swim node
         // The floor is a real tier the caller named, but it is > GOAL_TIER_TOL below the surface, so
         // arrival is the surface accommodation — never a mid-water node masquerading as the floor.
@@ -5452,108 +5383,6 @@ mod tests {
             "and reports the surface accommodation — the interior nodes did not fake a depth arrival");
     }
 
-    /// **Water-nav Slice 3 (§8, §9a, §10-tier-2): the walker EXECUTES a mid-water route — it swims
-    /// DOWN to the planned depth and HOLDS it, never surfacing.** This is the end-to-end proof the
-    /// #547 boundary demanded: Slice 2 proved the route is *planned* to −24; here the REAL
-    /// `CharacterController` is stepped along it under the REAL depth controller (`swim_vspeed`) and
-    /// must arrive at, and hold, that depth.
-    ///
-    /// Faithful to the live walker's rate split (the thing that makes depth-hold non-trivial): the
-    /// vertical wish + `want_swim` are latched on the 150 ms NAV TICK and held for 15 frames, while
-    /// the horizontal aim refreshes every ~10 ms frame (fast-steering). So during a hold the wish is
-    /// FIXED for 150 ms — and it must stay nonzero the whole time, or the controller's buoyancy
-    /// (which fires only on `wish_vspeed == 0`, at 30 u/s) would lift the swimmer ~4.5 u toward the
-    /// −6 swim plane before the next tick could correct. The hold survives because below the plane
-    /// `swim_vspeed` is never 0 and the controller's `SKIN` clamp zeroes the residual motion.
-    ///
-    /// Mutation check: revert `swim_vspeed` to the old up-only rule (`carrot > z+1 ? 20 : 0`) and the
-    /// dive wish becomes 0 → buoyancy floats the char to ~−6 → it never reaches −24 → the arrival
-    /// `expect` panics RED. (This is exactly the #547 live failure, reproduced offline.)
-    #[test]
-    fn walker_sim_swims_to_and_holds_a_mid_water_depth() {
-        use crate::nav::steering::{carrot_along, swim_vspeed};
-        use crate::movement::{CharacterController, PLAYER_RADIUS};
-        use eqoxide_ipc::MoveIntent;
-        use crate::traversability::PLAYER_BODY;
-
-        // The §9a fixture: a walled pool, surface −4, floor −44, water_slab between.
-        let assets = ZoneAssets {
-            terrain: vec![
-                slab(-44.0, 0.0, 64.0, 0.0, 64.0, true),
-                wall_east(0.0, -44.0, 0.0), wall_east(64.0, -44.0, 0.0),
-            ],
-            objects: vec![], textures: vec![],
-        };
-        let mut col = Collision::build(&assets, 8.0);
-        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::water_slab(-44.0, -4.0))));
-
-        let start = [30.0, 10.0, -4.0];    // at the surface (where a floating start anchors)
-        let goal  = [30.0, 46.0, -24.0];   // MID-WATER: 20u below the surface, 20u above the −44 floor
-        let route = col.find_path(start, goal, PLAYER_RADIUS, &[], false)
-            .expect("Slice 2 plans a route to the mid-water goal");
-        // The line the walker steers = start + the planned waypoints (as the real walker does).
-        let line: Vec<[f32; 3]> = std::iter::once(start).chain(route.iter().copied()).collect();
-
-        let mut ctrl = CharacterController::new(start);
-        const DT: f32 = 0.01;              // ~100 Hz controller
-        const FRAMES_PER_TICK: usize = 15; // 150 ms nav tick
-        const TOTAL: usize = 1200;         // 12 s
-        let mut path_i = 0usize;
-        let mut wish_vspeed = 0.0f32;
-        let mut want_swim = false;
-        let mut arrived_frame: Option<usize> = None;
-        let mut max_depth_err_after_arrival = 0.0f32;
-
-        for frame in 0..TOTAL {
-            let p = ctrl.pos;
-            // ── 150 ms NAV TICK: advance path_i (3D) and LATCH the vertical wish + want_swim ──
-            if frame % FRAMES_PER_TICK == 0 {
-                while path_i + 2 < line.len() {
-                    let (a, b) = (line[path_i], line[path_i + 1]);
-                    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-                    let l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
-                    let t = if l2 < 1e-6 { 1.0 }
-                        else { ((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1] + (p[2] - a[2]) * ab[2]) / l2 };
-                    if t >= 1.0 { path_i += 1; } else { break; }
-                }
-                let carrot = carrot_along(&line, path_i, p, 5.0).unwrap_or(goal);
-                want_swim = col.in_water(p) || col.in_water([p[0], p[1], p[2] + 3.0]);
-                let swim_plane = if want_swim {
-                    col.water_surface(p).map(|s| s - PLAYER_BODY.float_depth)
-                } else { None };
-                wish_vspeed = if want_swim { swim_vspeed(carrot[2], p[2], swim_plane) } else { 0.0 };
-            }
-            // ── ~100 Hz FAST-STEER: refresh only the horizontal aim ──
-            let carrot = carrot_along(&line, path_i, p, 5.0).unwrap_or(goal);
-            let (dx, dy) = (carrot[0] - p[0], carrot[1] - p[1]);
-            let d = (dx * dx + dy * dy).sqrt();
-            let wish_dir = if d > 1e-3 { [dx / d, dy / d] } else { [0.0, 0.0] };
-            ctrl.step(MoveIntent { wish_dir, wish_vspeed, jump: false, want_swim,
-                speed: 44.0, climb: 0.0, hop: false }, DT, &col);
-
-            let at_goal = (ctrl.pos[0] - goal[0]).hypot(ctrl.pos[1] - goal[1]) < 3.0
-                && (ctrl.pos[2] - (-24.0)).abs() < 2.0;
-            if arrived_frame.is_none() && at_goal { arrived_frame = Some(frame); }
-            if arrived_frame.is_some() {
-                max_depth_err_after_arrival = max_depth_err_after_arrival.max((ctrl.pos[2] - (-24.0)).abs());
-            }
-        }
-
-        let arr = arrived_frame.unwrap_or_else(|| panic!(
-            "the swimmer must SWIM to the mid-water goal depth −24 and hold it — instead it ended at \
-             {:?} ({:.1}u off the −24 depth). With the retired up-only rule the dive wish is 0, so \
-             buoyancy floats it to the ~−6 swim plane and it never arrives at depth (the #547 wedge).",
-            ctrl.pos, (ctrl.pos[2] - (-24.0)).abs()));
-        assert!(TOTAL - arr >= 500,
-            "arrived at frame {arr} — too late to prove a ≥5 s hold in the remaining sim");
-        assert!(max_depth_err_after_arrival < 2.5,
-            "after arriving, the swimmer DRIFTED off the mid-water depth (max err \
-             {max_depth_err_after_arrival:.1}u). A hold must neither surface nor sink — buoyancy must \
-             stay suppressed by the nonzero below-plane wish (§8.3), even across the 150 ms latch.");
-        assert!(ctrl.pos[2] < -20.0,
-            "final feet z {:.1} must be at the mid-water goal, NOT floated back to the ~−6 swim plane",
-            ctrl.pos[2]);
-    }
 
     #[test]
     fn find_path_skirts_npc_camps_when_given_avoid_points() {
@@ -5741,7 +5570,7 @@ mod tests {
                     let Some(gz) = col.nearest_floor(ge, gn, col.z_max, 10.0, 4000.0) else { continue };
                     let t = Instant::now();
                     let (sr, _t) = col.search_tiered_for_test(
-                        [e, n, z], [ge, gn, gz], crate::movement::PLAYER_RADIUS, &[], 8.0, None, 0.0,
+                        [e, n, z], [ge, gn, gz], eqoxide_core::physics::PLAYER_RADIUS, &[], 8.0, None, 0.0,
                         PlanCtx { node_cap: Some(8_000_000), ..PlanCtx::default() });
                     let ms = t.elapsed().as_millis();
                     if sr.closed_n > max_closed { max_closed = sr.closed_n; max_ms = ms; }
@@ -5809,7 +5638,7 @@ mod tests {
             let Ok(za) = ZoneAssets::from_glb(&p) else { println!("{zone:<12}  (no glb — skipped)"); continue };
             let mut col = Collision::build(&za, 32.0);
             if col.cols == 0 { println!("{zone:<12}  (no grid — skipped)"); continue; }
-            col.set_water(crate::region_map::RegionMap::load(
+            col.set_water(eqoxide_core::region_map::RegionMap::load(
                 &std::path::Path::new(&dir).join("maps/water"), zone).map(std::sync::Arc::new));
             if col.water.is_none() { println!("{zone:<12}  (no .wtr — skipped)"); continue; }
 
@@ -5899,7 +5728,7 @@ mod tests {
                 let Some(gz) = col.nearest_floor(ge, gn, z, 400.0, 400.0) else { continue };
                 // A real coarse route (8u, the off-thread contract), then carrots along it.
                 let PlanOutcome::Route(route) = col.find_path_ex(
-                    s, [ge, gn, gz], crate::movement::PLAYER_RADIUS, &[], 8.0, None, 0.0, PlanCtx::worker())
+                    s, [ge, gn, gz], eqoxide_core::physics::PLAYER_RADIUS, &[], 8.0, None, 0.0, PlanCtx::worker())
                     else { continue };
                 if route.len() < 3 { continue; }
                 // Take a spread of carrots along the route, not just its head, so the sample covers the
@@ -5907,7 +5736,7 @@ mod tests {
                 for i in (0..route.len().saturating_sub(2)).step_by(3) {
                     if pairs.len() >= 240 { break; }
                     let from = route[i];
-                    let Some(carrot) = crate::nav::steering::carrot_along(&route, i, from, LOCAL_REACH)
+                    let Some(carrot) = crate::steering::carrot_along(&route, i, from, LOCAL_REACH)
                         else { continue };
                     pairs.push((from, carrot));
                 }
@@ -5919,7 +5748,7 @@ mod tests {
             for (s, c) in &pairs {
                 // OLD: exactly the call navigation.rs made inline on the net thread (node-capped).
                 let t0 = Instant::now();
-                let old = col.find_path_res(*s, *c, crate::movement::PLAYER_RADIUS, &[], true,
+                let old = col.find_path_res(*s, *c, eqoxide_core::physics::PLAYER_RADIUS, &[], true,
                     LOCAL_CELL, Some(LOCAL_BOUND), 0.0, PlanCtx::net_tier());
                 let ot = t0.elapsed().as_micros();
                 // The old API cannot say whether it reached the carrot — it returns partials as routes.
@@ -5980,417 +5809,6 @@ mod tests {
     // in the sim; that duplication is gone, and `swim_vspeed`'s own behaviour is pinned by
     // `steering::tests::swim_vspeed_holds_depth_below_the_plane_and_yields_to_buoyancy_at_it`.
 
-    /// **THE FAITHFUL WALKER DRIFT SCANNER (the real per-tick recovery loop).** The static scanner
-    /// above drove ONE fine plan with naive pure pursuit and no recovery — which over-counts corner
-    /// wedges the real walker recovers from, and cannot measure a planner-cell fix's benefit (the real
-    /// walker re-anchors its fine plan every tick, so cleaner cells help it even when a single static
-    /// plan wedges). This one mirrors `navigation.rs`'s ACTUAL two-rate loop (post-#399):
-    ///
-    ///   * a COARSE route committed at goal-change (`find_path_ex`), re-planned on stall/backoff;
-    ///   * a ~100 Hz FAST-STEER aim: `fast_steer_aim` toward a 5u carrot on `local_path` (cursor
-    ///     `local_i`), refreshed EVERY controller frame — the thing that hugs a bend;
-    ///   * a 150 ms NAV TICK that advances `path_i`, RE-POSTS a fresh `find_path_local` from the
-    ///     walker's CURRENT position (1-tick lag, as #399's worker introduces), and runs stall
-    ///     detection → downhill backoff → coarse re-plan (capped at 8 attempts), plus the #246/#379
-    ///     proactive coarse re-plan when the fine tier reports `NoWayThrough`.
-    ///
-    /// Then it classifies terminal wedges (never arrived, 8 re-paths spent) by face. THIS is the
-    /// number that gates a planner-cell fix — run it before/after PR-B.
-    ///
-    /// ```text
-    /// ZONE_DIR=~/.local/share/eqoxide/assets/models \
-    ///   cargo test --release --lib faithful_walker_drift_corpus -- --ignored --nocapture
-    /// ```
-    #[test]
-    #[ignore = "requires baked zone glbs at $ZONE_DIR; the faithful per-tick-recovery drift baseline"]
-    fn faithful_walker_drift_corpus() {
-        use crate::nav::steering::{carrot_along, fast_steer_aim, swim_vspeed};
-        use crate::movement::{CharacterController, PLAYER_RADIUS};
-        use eqoxide_ipc::MoveIntent;
-
-        // Production constants, verbatim from navigation.rs (kept in sync — if these drift, the scanner
-        // stops modelling the real walker).
-        const RUN_SPEED: f32 = 44.0;
-        const LOOK_AHEAD: f32 = 5.0;
-        const LOCAL_REACH: f32 = 24.0;
-        const LOCAL_BOUND: f32 = 40.0;
-        const LOCAL_CELL:  f32 = 2.0;
-        const NAV_STUCK_TICKS: u32 = 20;
-        const NAV_HOP_TICKS: u32 = 6;
-        const NAV_BACKOFF_TICKS: u32 = 3;
-        const NAV_LOCAL_STUCK_TICKS: u32 = 3;
-        const REPLAN_COOLDOWN_TICKS: u32 = 6;
-        const MAX_REPATHS: u32 = 8;
-        const DT: f32 = 1.0 / 100.0;          // ~100 Hz controller, per navigation.rs's fast-steer note
-        const FRAMES_PER_TICK: u32 = 15;      // 150 ms / 10 ms
-        // The swim-up vertical wish is `drift_swim_up_wish` (module fn below), mirroring the walker
-        // (walker.rs:819-825) and pinned by `drift_sim_swim_drive_mirrors_walker` so the instrument
-        // can't silently diverge from production.
-
-        // The faithful walk. Returns None on arrival, or Some((wedge_pos, aim, route_wet_near_wedge))
-        // on a terminal wedge. `route_wet_near_wedge` = did the COMMITTED coarse route carry a water
-        // waypoint within 24u of the wedge — the water-routing-vs-#423-clip discriminator (see caller).
-        let simulate = |col: &Collision, start: [f32; 3], goal: [f32; 3]| -> Option<([f32; 3], [f32; 2], bool)> {
-            let PlanOutcome::Route(mut coarse) = col.find_path_ex(
-                start, goal, PLAYER_RADIUS, &[], 8.0, None, 0.0, PlanCtx::worker()) else { return None };
-            if coarse.len() < 2 { return None; }
-            let mut ctrl = CharacterController::new(start);
-            ctrl.on_ground = true;
-            let mut path_i = 0usize;
-            let mut local_path: Vec<[f32; 3]> = Vec::new();
-            let mut local_i = 0usize;
-            // Fine plan requested LAST tick, applied THIS tick (models #399's ~1-tick worker lag).
-            let mut pending_local: Option<Vec<[f32; 3]>> = None;
-            let mut pending_nwt = false;
-            let (mut stuck_i, mut stuck_ticks, mut repaths) = (0usize, 0u32, 0u32);
-            let (mut local_stuck, mut replan_cd) = (0u32, 0u32);
-            let (mut backoff_ticks, mut backoff_dir) = (0u32, [0.0f32, 0.0]);
-            let mut aim = [0.0f32, 0.0];
-
-            // A journey either arrives, or spends its 8 re-paths (~8·NAV_STUCK_TICKS ticks) and wedges.
-            // 200 ticks (~30 s sim) is well past both for a ≤400u route at RUN_SPEED — a journey still
-            // going at 200 is not making progress and counts as wedged.
-            let nav_ticks_budget = 200;
-            for _ in 0..nav_ticks_budget {
-                let (px, py, pz) = (ctrl.pos[0], ctrl.pos[1], ctrl.pos[2]);
-                // ── arrival on the FINAL goal ──
-                if (px - goal[0]).hypot(py - goal[1]) < 3.0 { return None; }
-
-                // ── the 150 ms NAV TICK (planning / recovery) ──
-                // advance path_i along the coarse route (3D, water-nav Slice 3 — mirrors walker.rs)
-                while path_i + 2 < coarse.len() {
-                    let (a, b) = (coarse[path_i], coarse[path_i + 1]);
-                    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-                    let l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
-                    let t = if l2 < 1e-6 { 1.0 } else { ((px - a[0]) * ab[0] + (py - a[1]) * ab[1] + (pz - a[2]) * ab[2]) / l2 };
-                    if t >= 1.0 { path_i += 1; } else { break; }
-                }
-                if replan_cd > 0 { replan_cd -= 1; }
-
-                // downhill backoff in progress → drive reverse aim, then re-plan when it ends
-                if backoff_ticks > 0 {
-                    backoff_ticks -= 1;
-                    for _ in 0..FRAMES_PER_TICK {
-                        // The real walker's downhill-backoff branch drives want_swim: false
-                        // UNCONDITIONALLY (walker.rs:731-742), even while submerged — the backoff is a
-                        // deliberate non-swim recovery. The sim MUST match, or it recovers (swim-mode
-                        // step) where the client sinks (non-swim step): a false pass.
-                        ctrl.step(MoveIntent { wish_dir: backoff_dir, wish_vspeed: 0.0, jump: false,
-                            want_swim: false, speed: RUN_SPEED, climb: 0.0, hop: false }, DT, col);
-                    }
-                    if backoff_ticks == 0 {
-                        if let PlanOutcome::Route(r) = col.find_path_ex(
-                            [ctrl.pos[0], ctrl.pos[1], ctrl.pos[2]], goal, PLAYER_RADIUS, &[], 8.0, None, 0.0, PlanCtx::worker()) {
-                            coarse = r; path_i = 0; local_path.clear(); local_i = 0;
-                        }
-                        stuck_ticks = 0;
-                    }
-                    continue;
-                }
-
-                // apply the fine plan requested last tick (1-tick lag)
-                if let Some(lp) = pending_local.take() {
-                    local_path = lp; local_i = 0;
-                    if pending_nwt {
-                        local_stuck += 1;
-                        if local_stuck >= NAV_LOCAL_STUCK_TICKS && replan_cd == 0 {
-                            if let PlanOutcome::Route(r) = col.find_path_ex(
-                                [px, py, ctrl.pos[2]], goal, PLAYER_RADIUS, &[], 8.0, None, 0.0, PlanCtx::worker()) {
-                                coarse = r; path_i = 0; local_path.clear(); local_i = 0;
-                            }
-                            local_stuck = 0; replan_cd = REPLAN_COOLDOWN_TICKS;
-                        }
-                    } else {
-                        local_stuck = 0;
-                    }
-                    // pending_nwt is reassigned by the match below every tick, no reset needed here.
-                }
-                // post a fresh fine plan for NOW (lands next tick)
-                let coarse_carrot = carrot_along(&coarse, path_i, [px, py, pz], LOCAL_REACH)
-                    .unwrap_or([goal[0], goal[1], ctrl.pos[2]]);
-                match col.find_path_local([px, py, ctrl.pos[2]], coarse_carrot, LOCAL_CELL, LOCAL_BOUND, LOCAL_CELL * 2.0) {
-                    LocalOutcome::Threaded(s)     => { pending_local = Some(s); pending_nwt = false; }
-                    LocalOutcome::NoWayThrough{steer, ..} => { pending_local = Some(steer); pending_nwt = true; }
-                    LocalOutcome::Exhausted{steer, ..}    => { pending_local = Some(steer); pending_nwt = false; }
-                }
-
-                // stall detection on coarse path_i progress
-                if path_i > stuck_i { stuck_i = path_i; stuck_ticks = 0; }
-                else {
-                    stuck_ticks += 1;
-                    if stuck_ticks >= NAV_STUCK_TICKS {
-                        stuck_ticks = 0;
-                        if repaths < MAX_REPATHS {
-                            repaths += 1;
-                            backoff_ticks = NAV_BACKOFF_TICKS;
-                            let carrot = carrot_along(&coarse, path_i, [px, py, pz], LOOK_AHEAD)
-                                .unwrap_or([goal[0], goal[1], ctrl.pos[2]]);
-                            let (dx, dy) = (carrot[0] - px, carrot[1] - py);
-                            let dl = (dx * dx + dy * dy).sqrt();
-                            backoff_dir = if dl > 1e-3 { [-dx / dl, -dy / dl] } else { [0.0, 0.0] };
-                            continue;
-                        }
-                        let wp = ctrl.pos;
-                        let wet_near = coarse.iter().any(|w|
-                            (w[0] - wp[0]).hypot(w[1] - wp[1]) < 24.0
-                            && (col.in_water(*w) || col.in_water([w[0], w[1], w[2] + 3.0])));
-                        return Some((wp, aim, wet_near)); // terminal wedge (8 re-paths spent)
-                    }
-                }
-
-                // ── the ~100 Hz FAST-STEER + controller stepping for this tick ──
-                for _ in 0..FRAMES_PER_TICK {
-                    let from = [ctrl.pos[0], ctrl.pos[1], ctrl.pos[2]];
-                    // fast-steer aim on the fine plan if present, else the coarse carrot
-                    let steer_aim = if local_path.len() >= 2 {
-                        fast_steer_aim(&local_path, &mut local_i, from, LOOK_AHEAD).map(|(d, _)| d)
-                    } else { None };
-                    aim = steer_aim.unwrap_or_else(|| {
-                        let c = carrot_along(&coarse, path_i, from, LOOK_AHEAD)
-                            .unwrap_or([goal[0], goal[1], ctrl.pos[2]]);
-                        let (dx, dy) = (c[0] - from[0], c[1] - from[1]);
-                        let d = (dx * dx + dy * dy).sqrt().max(1e-3);
-                        [dx / d, dy / d]
-                    });
-                    // The REAL walker's swim rule (walker.rs §8.2), driving the SAME controller:
-                    // body-probe want_swim, and the water-nav Slice 3 depth controller `swim_vspeed`
-                    // toward the active waypoint's DEPTH. CRITICAL faithfulness point (#1b): the
-                    // vertical-wish target z must come from the SAME path the walker steers —
-                    // `steer_target` returns the FINE local-plan carrot when local.len() >= 2, falling
-                    // back to the coarse carrot only when there is no fine plan. `local_i` was already
-                    // advanced this frame by `fast_steer_aim` above (when a fine plan exists), so this
-                    // reads the identical carrot the horizontal `aim` used.
-                    let p = ctrl.pos;
-                    let swim = col.in_water(p) || col.in_water([p[0], p[1], p[2] + 3.0]);
-                    let coarse_c = carrot_along(&coarse, path_i, from, LOOK_AHEAD).unwrap_or(goal);
-                    let tz = if local_path.len() >= 2 {
-                        carrot_along(&local_path, local_i, from, LOOK_AHEAD).map(|c| c[2]).unwrap_or(coarse_c[2])
-                    } else { coarse_c[2] };
-                    // Same depth controller as the walker (calls the production fn directly).
-                    let swim_plane = if swim {
-                        col.water_surface(p).map(|s| s - crate::traversability::PLAYER_BODY.float_depth)
-                    } else { None };
-                    let wish_vspeed = if swim { swim_vspeed(tz, p[2], swim_plane) } else { 0.0 };
-                    ctrl.step(MoveIntent { wish_dir: aim, wish_vspeed, jump: false, want_swim: swim,
-                        speed: RUN_SPEED, climb: 0.0, hop: stuck_ticks >= NAV_HOP_TICKS }, DT, col);
-                    if (ctrl.pos[0] - goal[0]).hypot(ctrl.pos[1] - goal[1]) < 3.0 { return None; }
-                }
-            }
-            let wp = ctrl.pos;
-            let wet_near = coarse.iter().any(|w|
-                (w[0] - wp[0]).hypot(w[1] - wp[1]) < 24.0
-                && (col.in_water(*w) || col.in_water([w[0], w[1], w[2] + 3.0])));
-            Some((wp, aim, wet_near)) // ran out of sim time
-        };
-
-        let dir = std::env::var("ZONE_DIR")
-            .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
-
-        // `DRIFT_INCLUDE_WATER=1` runs the water-inclusive variant (#378 Phase 2 validation): keep
-        // water-adjacent journeys and COUNT waterline wedges (the separate #423 crossing bug) in a
-        // `water` column, so the water dimension is measured rather than silently dropped. Default
-        // (unset) is the DRY gate that skips water.
-        let include_water = std::env::var("DRIFT_INCLUDE_WATER").is_ok();
-
-        // The DRY acceptance corpus is clean dry dungeons/cities. **qcat is deliberately NOT a dry
-        // gate zone**: it is confounded by known bugs (#423 walk-through-walls-into-water, #329
-        // spawn-pocket dead-end, and unimplemented water nav #359/#197), so a pass/fail there is not
-        // clean evidence about this refactor — the owner's call. qcat is added ONLY in the
-        // water-inclusive VISIBILITY run (never a pass/fail gate), where measuring water-adjacent
-        // behaviour is the whole point and its waterline wedges land in the `water`/#423 column.
-        let zones: Vec<String> = std::env::var("ZONES").ok()
-            .map(|z| z.split(',').map(str::to_string).collect())
-            .unwrap_or_else(|| {
-                let mut z: Vec<String> = vec![
-                    "akanon", "blackburrow", "qeynos2", "gfaydark", "crushbone", "neriaka",
-                    "felwithea", "highpass", "everfrost", "butcher",
-                ].into_iter().map(str::to_string).collect();
-                if include_water { z.push("qcat".to_string()); }
-                z
-            });
-
-        let mut seed: u64 = 0xD21F_7A3E; // same seed family as the static scanner
-        let mut rnd = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (seed >> 33) as u32 };
-
-        let (mut tot_pairs, mut tot_walked, mut tot_wedged) = (0usize, 0usize, 0usize);
-        let (mut tot_height, mut tot_overlap, mut tot_other) = (0usize, 0usize, 0usize);
-        // The water column is SPLIT (Increment 1): `wat-route` = a wedge whose committed coarse route
-        // itself carried water waypoints near the wedge — a planner/ROUTING failure, OURS to fix in
-        // later increments; `#423` = the route was DRY near the wedge but the character ended up
-        // wet/wedged — the pre-existing walk-THROUGH-a-wall-into-water collision bug (#423), NOT a
-        // routing failure. They are never lumped.
-        let (mut tot_wr, mut tot_423) = (0usize, 0usize);
-        println!("\n=== faithful walker drift: {} mode ===", if include_water { "WATER-INCLUSIVE" } else { "DRY" });
-        println!("{:<12} {:>6} {:>7} {:>8} {:>8} {:>6} {:>9} {:>6}",
-            "zone", "walked", "wedged", "height", "overlap", "other", "wat-route", "#423");
-        for zone in &zones {
-            let p = std::path::Path::new(&dir).join(format!("{zone}.glb"));
-            let Ok(za) = ZoneAssets::from_glb(&p) else { println!("{zone:<12}  (no glb — skipped)"); continue };
-            let mut col = Collision::build(&za, 32.0);
-            if col.cols == 0 { println!("{zone:<12}  (no grid — skipped)"); continue; }
-            col.set_water(crate::region_map::RegionMap::load(&std::path::Path::new(&dir).join("maps/water"), zone).map(std::sync::Arc::new));
-
-            // Sample full (start, goal) pairs: a random floor point and a goal 120-400u away that a
-            // coarse route actually reaches (so we simulate real journeys, not un-routable noise).
-            let mut pairs: Vec<([f32; 3], [f32; 3])> = Vec::new();
-            let mut tries = 0;
-            while pairs.len() < 60 && tries < 2000 {
-                tries += 1;
-                let e = col.origin[0] + (rnd() as f32 / u32::MAX as f32) * (col.cols as f32 * col.cell_size);
-                let n = col.origin[1] + (rnd() as f32 / u32::MAX as f32) * (col.rows as f32 * col.cell_size);
-                let Some(z) = col.nearest_floor(e, n, col.z_max, 10.0, 4000.0) else { continue };
-                let ang = (rnd() as f32 / u32::MAX as f32) * std::f32::consts::TAU;
-                let d = 120.0 + (rnd() as f32 / u32::MAX as f32) * 280.0;
-                let (ge, gn) = (e + d * ang.cos(), n + d * ang.sin());
-                let Some(gz) = col.nearest_floor(ge, gn, z, 400.0, 400.0) else { continue };
-                // WATER MODE (#378 Phase 2 validation): `DRIFT_INCLUDE_WATER=1` KEEPS water-adjacent
-                // journeys so the water dimension is MEASURED, not silently dropped — the lesson from
-                // the earlier miss. The water CROSSING itself is a separate pre-existing bug (#423,
-                // out of scope), so those journeys are expected to wedge at the waterline and are
-                // COUNTED in a `water` column, never hidden. Dry mode (default) is the original gate.
-                let s = [e, n, z]; let g = [ge, gn, gz];
-                if !include_water && (col.in_water(s) || col.in_water(g)) { continue; }
-                // DRIVABILITY FILTER. This pure-pursuit sim faithfully drives WALK legs only. It does
-                // NOT execute A*'s controlled-fall, jump-edge, or swim edges (those need the walker's
-                // fall/jump/swim intents, out of scope here — the static scanner skipped them per-PLAN
-                // for the same reason). So only accept a journey whose COARSE route is all-walkable: no
-                // segment with a big z-drop (controlled fall / jump landing) and (dry mode) no waypoint
-                // in water. Without this, multi-level dungeons (blackburrow, neriaka) flood the count
-                // with wedges at fall/swim TRANSITIONS the sim structurally cannot cross — a sim
-                // artifact, not a walker drift.
-                let PlanOutcome::Route(cr) = col.find_path_ex(
-                    s, g, crate::movement::PLAYER_RADIUS, &[], 8.0, None, 0.0, PlanCtx::worker()) else { continue };
-                if cr.len() < 3 { continue; }
-                let no_fall_jump = cr.windows(2).all(|w| {
-                    let dz = w[1][2] - w[0][2];
-                    let seg = (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]);
-                    // Increment 1: the sim now DRIVES surface swim legs (body-probe want_swim +
-                    // swim-up vspeed), so in water mode a water-touching segment is exempt from the
-                    // DRY fall bound — entering water legitimately drops up to the step-in height
-                    // (~STEP_H=20) to the surface, which the dry `dz > -4` would wrongly filter.
-                    // BUT the exemption is NOT unbounded (Hunt 3): the sim never jumps (jump:false at
-                    // both call sites) and can't dive against buoyancy, so a wet segment that is ALSO
-                    // a deep dive or a long jump-span is still undrivable and stays filtered.
-                    let wet_seg = include_water && (
-                        col.in_water(w[0]) || col.in_water(w[1])
-                        || col.in_water([w[0][0], w[0][1], w[0][2] + 3.0])
-                        || col.in_water([w[1][0], w[1][1], w[1][2] + 3.0]));
-                    let drop_cap = if wet_seg { -20.0 } else { -4.0 }; // water step-in may drop to ~STEP_H
-                    dz > drop_cap && seg < 12.0
-                });
-                let no_water = !cr.iter().any(|w| col.in_water(*w) || col.in_water([w[0], w[1], w[2] + 3.0]));
-                if !no_fall_jump { continue; } // the sim cannot drive dry fall/jump edges in EITHER mode
-                if !include_water && !no_water { continue; } // dry mode still excludes water routes
-                pairs.push((s, g));
-            }
-
-            // FIXED bank-to-bank pairs (Increment 1): force water crossings that random sampling
-            // rarely hits (find_path prefers a dry shore when one exists, so sampled pairs seldom
-            // actually cross). Coordinates verified to route THROUGH water via a one-off water-extent
-            // probe. Only injected in water mode; each pair is a real forced crossing in a gate zone.
-            let forced_start = pairs.len();
-            if include_water {
-                let forced: &[([f32; 3], [f32; 3], &str)] = match zone.as_str() {
-                    // halas #197 central pool (surface ~ -3.9). W↔E spans the pool: a 39-wp FULL swim
-                    // (every waypoint wet). N→S dips through the south edge of the pool.
-                    "halas" => &[
-                        ([-150.0, -231.0, -130.94], [150.0, -231.0, -130.94], "#197 pool: W bank -> E bank (full swim across)"),
-                        ([6.0, -70.0, 1.0],         [6.0, -454.0, -30.15],    "#197 pool: N shore -> S shore"),
-                    ],
-                    // qeynos2 moat/canal (surface ~ -2.8): W→E crossings that dip into the moat.
-                    "qeynos2" => &[
-                        ([-400.0, -115.0, 79.97], [-270.0, -115.0, -2.0], "moat: W rampart -> E bank"),
-                        ([-450.0, -115.0, 79.97], [-220.0, -115.0, 0.0],  "moat: wide W -> E"),
-                    ],
-                    // blackburrow lake (surface ~ -148): W→E crossings straight through the lake.
-                    "blackburrow" => &[
-                        ([-118.0, 0.0, -170.94], [361.0, 0.0, -128.94], "lake: W bank -> E bank"),
-                        ([-60.0, 0.0, -227.91],  [300.0, 0.0, -129.12], "lake: near-W -> E bank"),
-                    ],
-                    _ => &[],
-                };
-                for (s, g, what) in forced {
-                    println!("  [FORCED PAIR ] {zone}: {what}  {:?} -> {:?}", s, g);
-                    pairs.push((*s, *g));
-                }
-            }
-            let n_forced = pairs.len() - forced_start;
-            if pairs.is_empty() { println!("{zone:<12}  (no routable pairs — skipped)"); continue; }
-
-            let (mut walked, mut wedged, mut n_h, mut n_o, mut n_x) = (0usize, 0usize, 0usize, 0usize, 0usize);
-            let (mut n_wr, mut n_423) = (0usize, 0usize);
-            for (i, (s, g)) in pairs.iter().enumerate() {
-                let forced = i >= forced_start;
-                walked += 1;
-                let Some((w, aim, route_wet_near)) = simulate(&col, *s, *g) else {
-                    // simulate returned None: either ARRIVED (success) or the coarse route was
-                    // untraversable/too-short. A forced crossing that never routed is itself a
-                    // routing finding — flag it so a silently-dropped forced pair can't hide.
-                    if forced {
-                        let routed = matches!(col.find_path_ex(*s, *g, PLAYER_RADIUS, &[], 8.0, None, 0.0, PlanCtx::worker()), PlanOutcome::Route(_));
-                        if !routed {
-                            walked -= 1;
-                            println!("  [FORCED NOROUTE] {zone}: forced crossing did not route {:?} -> {:?}", s, g);
-                        }
-                    }
-                    continue;
-                };
-                // A wedge that ended in/at water. DRY mode drops it (out of scope). WATER mode splits
-                // it (Increment 1 classifier): if the committed coarse route carried water waypoints
-                // NEAR the wedge, this is a `wat-route` planner/ROUTING failure (ours); otherwise the
-                // route was dry near the wedge and the character ended up wet — a `#423` clip (the
-                // pre-existing walk-through-wall-into-water collision bug). Never lumped together.
-                if col.in_water(w) || col.in_water([w[0], w[1], w[2] + 3.0]) {
-                    if include_water {
-                        wedged += 1;
-                        let (lbl, tag) = if route_wet_near { n_wr += 1; ("WAT-ROUTE", "route was WET near wedge = planner/routing failure (OURS)") }
-                            else { n_423 += 1; ("#423 CLIP", "route was DRY near wedge, char ended wet = #423 walk-through-wall (separate)") };
-                        println!("  [{lbl:<12}] {zone}:{} wet wedge ({:.1},{:.1},{:.1}) start ({:.1},{:.1},{:.1}) goal ({:.1},{:.1},{:.1}) — {tag}",
-                            if forced { " [forced]" } else { "" }, w[0], w[1], w[2], s[0], s[1], s[2], g[0], g[1], g[2]);
-                    } else {
-                        walked -= 1;
-                    }
-                    continue;
-                }
-                wedged += 1;
-                let to = [w[0] + aim[0] * 4.0, w[1] + aim[1] * 4.0];
-                // Classify against the heights each side ACTUALLY uses, read from the shared Body —
-                // not re-hardcoded copies that would themselves drift. HEIGHT counts a wedge where
-                // the controller's contact ray is blocked but the planner's probes are clear; with
-                // both derived from PLAYER_BODY the class should be structurally empty, so any
-                // nonzero count here is a regression alarm (#386).
-                let body = &crate::traversability::PLAYER_BODY;
-                let ctrl_chest_blocked = !col.line_clear(
-                    [w[0], w[1], w[2] + body.contact_probes()[1]],
-                    [to[0], to[1], w[2] + body.contact_probes()[1]], PLAYER_RADIUS);
-                let planner_clear = body.planner_probes().iter().all(|&hz|
-                    col.path_clear([w[0], w[1], w[2] + hz], [to[0], to[1], w[2] + hz], PLAYER_RADIUS));
-                let overlap = !col.footprint_clear(w[0], w[1], w[2], PLAYER_RADIUS, 8)
-                    || !col.footprint_clear(w[0] + aim[0], w[1] + aim[1], w[2], PLAYER_RADIUS, 8);
-                let kind = if ctrl_chest_blocked && planner_clear { n_h += 1; "HEIGHT #386" }
-                    else if overlap { n_o += 1; "OVERLAP #381" }
-                    else { n_x += 1; "OTHER" };
-                println!("  [{kind:<12}] {zone}: wedged ({:.1},{:.1},{:.1}) start ({:.1},{:.1},{:.1}) goal ({:.1},{:.1},{:.1})",
-                    w[0], w[1], w[2], s[0], s[1], s[2], g[0], g[1], g[2]);
-            }
-            println!("{zone:<12} {walked:>6} {wedged:>7} {n_h:>8} {n_o:>8} {n_x:>6} {n_wr:>9} {n_423:>6}   ({n_forced} forced)");
-            tot_pairs += pairs.len(); tot_walked += walked; tot_wedged += wedged;
-            tot_height += n_h; tot_overlap += n_o; tot_other += n_x; tot_wr += n_wr; tot_423 += n_423;
-        }
-        let rate = if tot_walked > 0 { 100.0 * tot_wedged as f32 / tot_walked as f32 } else { 0.0 };
-        println!("\n=== FAITHFUL WALKER DRIFT [{}]: {tot_walked} full journeys walked, {tot_wedged} terminal wedges \
-            ({rate:.2}%) — height #386: {tot_height}, overlap #381: {tot_overlap}, other: {tot_other}, \
-            wat-route: {tot_wr}, #423: {tot_423} ===",
-            if include_water { "WATER-INCLUSIVE" } else { "DRY" });
-        if include_water {
-            println!("(wat-route = wedge whose COMMITTED coarse route carried water waypoints near the wedge = a \
-                      planner/ROUTING failure, OURS to fix in later water-nav increments. #423 = route dry near the \
-                      wedge but the character ended up wet = the SEPARATE pre-existing walk-through-wall-into-water \
-                      collision bug, not a routing failure. The two are never lumped.)");
-        }
-        let _ = tot_pairs;
-        assert!(tot_walked > 0, "no journeys walked — check $ZONE_DIR");
-    }
 
     /// **D-2 SHAPE PROBE (temporary): is the qcat inverted-floor structurally distinguishable from the
     /// D-1 open-air-ceiling fixture?** Dumps every surface in the qcat wedge column facing-blind, with
@@ -6404,7 +5822,7 @@ mod tests {
             .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
         let za = ZoneAssets::from_glb(&std::path::Path::new(&dir).join("qcat.glb")).unwrap();
         let mut col = Collision::build(&za, 32.0);
-        col.set_water(crate::region_map::RegionMap::load(&std::path::Path::new(&dir).join("maps/water"), "qcat").map(std::sync::Arc::new));
+        col.set_water(eqoxide_core::region_map::RegionMap::load(&std::path::Path::new(&dir).join("maps/water"), "qcat").map(std::sync::Arc::new));
         let (x, y) = (4.0f32, 809.8);
         println!("qcat column at ({x},{y}):  z_min={:.1} z_max={:.1}", col.z_min, col.z_max);
         // Enumerate surfaces facing-blind, top→down, via ground_below stepping.
@@ -6620,7 +6038,7 @@ mod tests {
             "ACCEPTED (#375, owner 2026-07-15): an open-topped mid-height down-facing surface IS \
              standable — indistinguishable from qcat's walkable inverted floor. Set: {floors:?}");
         // And A* can route onto it (a character on the floor can climb to it via the accepted admission).
-        let path = col.find_path([0.0, -20.0, 0.0], [0.0, 20.0, 10.0], crate::movement::PLAYER_RADIUS, &[], true);
+        let path = col.find_path([0.0, -20.0, 0.0], [0.0, 20.0, 10.0], eqoxide_core::physics::PLAYER_RADIUS, &[], true);
         assert!(path.is_some(),
             "A* routing onto the mid-height surface is the ACCEPTED cost of facing-blindness — NOT a bug. \
              Do not add a per-surface rule to block it (proven impossible); mitigate at the reachability \
@@ -6678,7 +6096,7 @@ mod tests {
              {from_source:?}) — is_standable must judge the destination on its own column, not veto it \
              for distance from ref_z (that would delete the fall edge AND seal ramps).");
         // And the controlled-fall edge actually forms: A* routes the high floor → low floor.
-        let path = col.find_path([-20.0, 0.0, 0.0], [20.0, 0.0, -40.0], crate::movement::PLAYER_RADIUS, &[], true);
+        let path = col.find_path([-20.0, 0.0, 0.0], [20.0, 0.0, -40.0], eqoxide_core::physics::PLAYER_RADIUS, &[], true);
         assert!(path.is_some(), "A* must route the 40u drop (high floor → low floor); the fall edge must survive D-2");
     }
 
@@ -6733,7 +6151,7 @@ mod tests {
                 let surfs = col.column_surfaces(e, n, 0.5 * (col.z_min + col.z_max),
                     0.5 * (col.z_max - col.z_min) + 1.0, 0.5 * (col.z_max - col.z_min) + 1.0);
                 for &(z, nz) in &surfs {
-                    if !col.footprint_clear(e, n, z, crate::movement::PLAYER_RADIUS, 8) { continue; }
+                    if !col.footprint_clear(e, n, z, eqoxide_core::physics::PLAYER_RADIUS, 8) { continue; }
                     fits += 1;
                     // Recompute is_standable's verdict + reason for this surface.
                     if nz.abs() < NAV_NEAR_HORIZONTAL { steep_rej += 1; continue; }
@@ -6790,7 +6208,7 @@ mod tests {
     fn floor_model_disagreement_scan() {
         const TOL: f32 = 1.5;      // a planner floor within this of the controller's ground = agreement
         const HEADROOM: f32 = 5.0;  // open space (to next SOLID surface) a standable spot needs above it
-        const RADIUS: f32 = crate::movement::PLAYER_RADIUS;
+        const RADIUS: f32 = eqoxide_core::physics::PLAYER_RADIUS;
         let dir = std::env::var("ZONE_DIR")
             .unwrap_or_else(|_| format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap()));
         // The inverted-art zones #375 names, plus a few normal zones as a clean-art control (their
@@ -6862,7 +6280,7 @@ mod tests {
         // Attach the zone's water map like production does (app.rs) — the earlier run of
         // this diagnostic skipped it and mis-reported the moat as having no water volume.
         let wtr_dir = std::path::Path::new(&p).parent().unwrap().join("maps/water");
-        col.set_water(crate::region_map::RegionMap::load(&wtr_dir, "qeynos2").map(std::sync::Arc::new));
+        col.set_water(eqoxide_core::region_map::RegionMap::load(&wtr_dir, "qeynos2").map(std::sync::Arc::new));
         eprintln!("collision: from_collision_mesh={} grid {}x{} cell={} origin={:?}",
             col.from_collision_mesh, col.cols, col.rows, col.cell_size, col.origin);
 
@@ -6880,7 +6298,7 @@ mod tests {
             eprintln!("  start cell center=({ccx:.1},{ccy:.1}) floor@refz={:?}  column={:?}",
                 col.nearest_floor(ccx, ccy, start[2], 20.0, 100.0),
                 col.column_floors(ccx, ccy, start[2], 20.0, 100.0));
-            match col.find_path(start, goal, crate::movement::PLAYER_RADIUS, &[], false) {
+            match col.find_path(start, goal, eqoxide_core::physics::PLAYER_RADIUS, &[], false) {
                 Some(path) => {
                     eprintln!("  find_path: {} waypoints", path.len());
                     for (i, w) in path.iter().enumerate().take(6) {
@@ -6904,11 +6322,11 @@ mod tests {
         // street goal below still probes NONE because that west-gate strip is disconnected from
         // the city center even street→street (B6) — an unreachable GOAL, not a moat problem.
         probe("B moat → west-gate street (goal itself disconnected, see B6)", [-502.3, -141.3, -16.0], [-600.0, -141.0, -5.0]);
-        let within = col.find_path([-502.3, -141.3, -16.0], [-490.0, -100.0, -16.0], crate::movement::PLAYER_RADIUS, &[], false);
+        let within = col.find_path([-502.3, -141.3, -16.0], [-490.0, -100.0, -16.0], eqoxide_core::physics::PLAYER_RADIUS, &[], false);
         eprintln!("  moat floor traversable (start → 40u north @z=-16): {}",
             within.map(|p| format!("{} waypoints", p.len())).unwrap_or_else(|| "NONE".into()));
         for gx in [-560.0f32, -580.0, -600.0] {
-            let r = col.find_path([-502.3, -141.3, -16.0], [gx, -141.0, -8.0], crate::movement::PLAYER_RADIUS, &[], false);
+            let r = col.find_path([-502.3, -141.3, -16.0], [gx, -141.0, -8.0], eqoxide_core::physics::PLAYER_RADIUS, &[], false);
             eprintln!("  moat → street x={gx}: {}",
                 r.map(|p| format!("{} waypoints", p.len())).unwrap_or_else(|| "NONE".into()));
         }
@@ -6932,7 +6350,7 @@ mod tests {
                             for nf in col.column_floors(bx, by, surface, 20.0, 4.0) {
                                 if nf > surface + 20.0 || nf <= -15.0 { continue; }
                                 let ray_z = surface.max(nf - 20.0);
-                                if col.path_clear([x, y, ray_z + 3.0], [bx, by, nf + 3.0], crate::movement::PLAYER_RADIUS) {
+                                if col.path_clear([x, y, ray_z + 3.0], [bx, by, nf + 3.0], eqoxide_core::physics::PLAYER_RADIUS) {
                                     eprintln!("  EXIT candidate: swim ({x:.0},{y:.0}) surface {surface:.1} -> floor {nf:.1} at ({bx:.0},{by:.0})");
                                     found += 1;
                                 }
@@ -6986,7 +6404,7 @@ mod tests {
         // surface. Bounded to the pit's XY box (unlike `flat_below`, which is a global z-split) so
         // the "swim across the surface" edge can't misfire against the dry street elsewhere.
         col.set_water(Some(std::sync::Arc::new(
-            crate::region_map::RegionMap::box_below(70.0, 130.0, 70.0, 130.0, -30.0))));
+            eqoxide_core::region_map::RegionMap::box_below(70.0, 130.0, 70.0, 130.0, -30.0))));
 
         // Sanity: the pit is reachable (a legal drop) but NOT climbable back out — a genuine
         // one-way trap, the real structural bug independent of the fix under test. Asserted as the

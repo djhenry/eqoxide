@@ -7,7 +7,7 @@
 //! **This module is PURELY ADDITIVE (Slice 1).** Nothing in the A* search, the walker, or the
 //! steering reads it yet — wiring the water-node generator into `astar`/`find_path` is Slice 2, and
 //! 3D execution is Slice 3 (design §11). Building this grid changes no existing nav behaviour; it is
-//! constructed on demand via [`crate::nav::collision::Collision::build_water_grid`].
+//! constructed on demand via [`crate::collision::Collision::build_water_grid`].
 //!
 //! ## Representation (design §5.1)
 //!

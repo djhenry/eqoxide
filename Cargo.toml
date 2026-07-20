@@ -19,6 +19,7 @@ path = "src/bin/render_model.rs"
 eqoxide-core = { path = "crates/eqoxide-core" }
 eqoxide-ipc = { path = "crates/eqoxide-ipc" }
 eqoxide-assets = { path = "crates/eqoxide-assets" }
+eqoxide-nav = { path = "crates/eqoxide-nav" }
 anyhow = "1"
 arc-swap = "1"
 image = { version = "0.25", default-features = false, features = ["bmp", "png", "dds", "tga"] }
@@ -67,4 +68,4 @@ tokio = { version = "1", features = ["full", "test-util"] }
 tower = "0.5"
 
 [workspace]
-members = ["tools", "crates/eqoxide-core", "crates/eqoxide-ipc", "crates/eqoxide-assets"]
+members = ["tools", "crates/eqoxide-core", "crates/eqoxide-ipc", "crates/eqoxide-assets", "crates/eqoxide-nav"]

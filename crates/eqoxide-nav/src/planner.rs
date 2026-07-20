@@ -44,8 +44,8 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Instant;
 
-use crate::nav::collision::{Collision, LocalOutcome, NoRoute, PadEdge, PlanCtx, PlanOutcome};
-use crate::movement::PLAYER_RADIUS;
+use crate::collision::{Collision, LocalOutcome, NoRoute, PadEdge, PlanCtx, PlanOutcome};
+use eqoxide_core::physics::PLAYER_RADIUS;
 
 /// One plan the walker wants computed. Carries its own `Arc<Collision>` so the worker never touches
 /// the `SharedCollision` lock the net + render threads use.
@@ -78,7 +78,7 @@ pub struct PlanReply {
     /// at the water surface instead (design §4d). The agent is told (`nav_reason: goal_z_snapped`
     /// + the message log) — an accommodation presented as compliance is a lie, and this one would
     /// otherwise report `arrived` at a z nobody asked for / never reached (#377 review).
-    pub goal_snapped: Option<crate::nav::collision::GoalSnap>,
+    pub goal_snapped: Option<crate::collision::GoalSnap>,
     /// The per-route TIER (#378 Phase 2 / design §4c): `true` = this route only existed at the
     /// MINIMUM clearance (a tight door/bridge threaded with no margin — a riskier path). Published
     /// as `nav_tier` on /v1/observe/debug so an agent sees the risk of the route it is walking, a
@@ -292,12 +292,12 @@ fn worker_impl(req_rx: Receiver<PlanRequest>, rep_tx: Sender<PlanReply>, on_dequ
             .then(|| req.collision.goal_z_was_snapped(req.goal))
             .flatten();
         match goal_snapped {
-            Some(crate::nav::collision::GoalSnap::ToColumnFloor { z }) => {
+            Some(crate::collision::GoalSnap::ToColumnFloor { z }) => {
                 tracing::warn!("nav-planner: goal ({:.0},{:.0},{:.1}) has no floor at the z you asked for — \
                     SNAPPING it to the floor at z={:.1}. The client is changing your goal; it is not the one \
                     you specified.", req.goal[0], req.goal[1], req.goal[2], z);
             }
-            Some(crate::nav::collision::GoalSnap::ToWaterSurface { surface_z }) => {
+            Some(crate::collision::GoalSnap::ToWaterSurface { surface_z }) => {
                 tracing::warn!("nav-planner: goal ({:.0},{:.0},{:.1}) is SUBMERGED — the walker cannot dive \
                     and hold that depth (buoyancy rises); it will arrive FLOATING at the water surface \
                     z={:.1} above it, not at the z you specified.",
@@ -366,7 +366,7 @@ pub fn plan_path(
 
 /// The body of [`plan_path`], taking the (already budgeted) `ctx` so a test can supply a small-capped
 /// budget and observe that all 13 A* calls draw from its ONE shared counter (#394 review, FIX 1).
-pub(crate) fn plan_path_with_ctx(
+pub fn plan_path_with_ctx(
     col: &Collision,
     start: [f32; 3],
     goal: [f32; 3],
@@ -466,7 +466,7 @@ pub struct LocalReply {
 /// # The contract that makes this safe
 ///
 /// **The walker never waits on this.** There is no `awaiting_first_local_plan`, and there is
-/// deliberately no way to add one: the steering aim is chosen by `crate::nav::steering::steer_target`, a TOTAL
+/// deliberately no way to add one: the steering aim is chosen by `crate::steering::steer_target`, a TOTAL
 /// pure function of (coarse route, whatever the fine tier last produced). Every state this planner
 /// can be in — never asked, in flight, dead, answered with nothing — is just "the fine path is
 /// empty", and an empty fine path steers on the coarse carrot. A stall here would be worse than the
@@ -516,7 +516,7 @@ impl LocalPlanner {
     ///
     /// So the "is one in flight?" question is not askable from outside. Posting is idempotent (a second
     /// post while one is in flight is a no-op), and there is nothing to wait on because there is nothing
-    /// to ask. Callers get an aim from `crate::nav::steering::steer_target`, which is total.
+    /// to ask. Callers get an aim from `crate::steering::steer_target`, which is total.
     pub fn post_if_idle(&mut self, mut req: LocalRequest) -> bool {
         if self.pending.is_some() || self.dead { return false; }
         let gen = self.next_gen;
@@ -606,8 +606,8 @@ fn local_worker(req_rx: Receiver<LocalRequest>, rep_tx: Sender<LocalReply>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assets::{MeshData, RenderMode, ZoneAssets};
-    use crate::nav::collision::{Collision, LocalOutcome, PlanOutcome};
+    use eqoxide_assets::{MeshData, RenderMode, ZoneAssets};
+    use crate::collision::{Collision, LocalOutcome, PlanOutcome};
 
     /// GLB-space quad (`positions` are `[north, up, east]`).
     fn quad(v: Vec<[f32; 3]>) -> MeshData {
@@ -748,7 +748,7 @@ mod tests {
         // than the small cap, so per-call budgeting would blow ~13× past it.
         let col = two_boxes(1000.0, 400.0, 400.0, -400.0, -400.0);
         let cap = 10_000usize;
-        let ctx = crate::nav::collision::PlanCtx::with_node_cap(cap).ensure_budget();
+        let ctx = crate::collision::PlanCtx::with_node_cap(cap).ensure_budget();
         let counter = ctx.expanded.clone().unwrap();
 
         // Drive the REAL plan_path fan-out (primary + 12-point ring) against the shared budget.
@@ -1127,6 +1127,6 @@ mod tests {
         assert!(!lp.is_planning(),
             "and it must not claim a plan is in flight: `tick` only skips POSTING while one is — if that \
              stuck true, the fine tier would never be re-posted even after a restart");
-        // The walker's aim does not depend on it at all — see `crate::nav::steering::steer_target`, which is total.
+        // The walker's aim does not depend on it at all — see `crate::steering::steer_target`, which is total.
     }
 }
