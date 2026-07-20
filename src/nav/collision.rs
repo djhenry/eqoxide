@@ -3475,7 +3475,7 @@ mod tests {
                 for _ in 0..1200 {
                     let p = ctrl.pos;
                     let swim = col.in_water(p) || col.in_water([p[0], p[1], p[2] + 3.0]);
-                    let intent = crate::movement::MoveIntent {
+                    let intent = eqoxide_ipc::MoveIntent {
                         wish_dir: [1.0, 0.0],
                         wish_vspeed: if swim && bank_z > p[2] + 1.0 { 20.0 } else { 0.0 },
                         jump: false, want_swim: swim, speed: 35.0, climb: 0.0, hop: false,
@@ -5472,7 +5472,8 @@ mod tests {
     #[test]
     fn walker_sim_swims_to_and_holds_a_mid_water_depth() {
         use crate::nav::steering::{carrot_along, swim_vspeed};
-        use crate::movement::{CharacterController, MoveIntent, PLAYER_RADIUS};
+        use crate::movement::{CharacterController, PLAYER_RADIUS};
+        use eqoxide_ipc::MoveIntent;
         use crate::traversability::PLAYER_BODY;
 
         // The §9a fixture: a walled pool, surface −4, floor −44, water_slab between.
@@ -6004,7 +6005,8 @@ mod tests {
     #[ignore = "requires baked zone glbs at $ZONE_DIR; the faithful per-tick-recovery drift baseline"]
     fn faithful_walker_drift_corpus() {
         use crate::nav::steering::{carrot_along, fast_steer_aim, swim_vspeed};
-        use crate::movement::{CharacterController, MoveIntent, PLAYER_RADIUS};
+        use crate::movement::{CharacterController, PLAYER_RADIUS};
+        use eqoxide_ipc::MoveIntent;
 
         // Production constants, verbatim from navigation.rs (kept in sync — if these drift, the scanner
         // stops modelling the real walker).

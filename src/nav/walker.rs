@@ -9,7 +9,7 @@
 //!
 //! **`Walker` cannot move the player.** It does not hold `ControllerSlots` (no
 //! `controller_view`, no `pos_correction`) — only [`crate::ipc::NavIntent`], the same per-frame
-//! [`crate::movement::MoveIntent`] slot native WASD input writes in `app.rs`. The render-thread
+//! [`eqoxide_ipc::MoveIntent`] slot native WASD input writes in `app.rs`. The render-thread
 //! `CharacterController` (`src/movement.rs`) is the ONLY thing that ever integrates a position from
 //! that intent (collide-and-slide, step-up, gravity, buoyancy). `Walker` reads the player's
 //! position from `GameState` (published by `ActionLoop::stream_position`, which mirrors the
@@ -25,7 +25,7 @@
 use crate::coord::eq_heading;
 use crate::eq_net::protocol::fall_damage;
 use crate::game_state::GameState;
-use crate::movement::MoveIntent;
+use eqoxide_ipc::MoveIntent;
 use crate::nav::steering::*;
 
 /// Native Titanium base run speed — see `eq_net::action_loop::RUN_SPEED` for the derivation. Kept
