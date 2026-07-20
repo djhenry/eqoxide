@@ -725,12 +725,12 @@ mod tests {
             // Advance the active segment as we pass it (mirrors the walker's path_i logic).
             while path_i + 2 < line.len() {
                 let (a, b) = (line[path_i], line[path_i + 1]);
-                let ab = [b[0] - a[0], b[1] - a[1]];
-                let l2 = ab[0] * ab[0] + ab[1] * ab[1];
-                let t = if l2 < 1e-6 { 1.0 } else { ((ctrl.pos[0] - a[0]) * ab[0] + (ctrl.pos[1] - a[1]) * ab[1]) / l2 };
+                let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                let l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+                let t = if l2 < 1e-6 { 1.0 } else { ((ctrl.pos[0] - a[0]) * ab[0] + (ctrl.pos[1] - a[1]) * ab[1] + (ctrl.pos[2] - a[2]) * ab[2]) / l2 };
                 if t >= 1.0 { path_i += 1; } else { break; }
             }
-            let carrot = carrot_along(&line, path_i, [ctrl.pos[0], ctrl.pos[1]], 5.0).unwrap();
+            let carrot = carrot_along(&line, path_i, [ctrl.pos[0], ctrl.pos[1], ctrl.pos[2]], 5.0).unwrap();
             let (dx, dy) = (carrot[0] - ctrl.pos[0], carrot[1] - ctrl.pos[1]);
             let d = (dx * dx + dy * dy).sqrt().max(1e-3);
             let intent = MoveIntent { wish_dir: [dx / d, dy / d], wish_vspeed: 0.0, jump: false,

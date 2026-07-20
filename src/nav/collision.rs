@@ -5452,6 +5452,108 @@ mod tests {
             "and reports the surface accommodation — the interior nodes did not fake a depth arrival");
     }
 
+    /// **Water-nav Slice 3 (§8, §9a, §10-tier-2): the walker EXECUTES a mid-water route — it swims
+    /// DOWN to the planned depth and HOLDS it, never surfacing.** This is the end-to-end proof the
+    /// #547 boundary demanded: Slice 2 proved the route is *planned* to −24; here the REAL
+    /// `CharacterController` is stepped along it under the REAL depth controller (`swim_vspeed`) and
+    /// must arrive at, and hold, that depth.
+    ///
+    /// Faithful to the live walker's rate split (the thing that makes depth-hold non-trivial): the
+    /// vertical wish + `want_swim` are latched on the 150 ms NAV TICK and held for 15 frames, while
+    /// the horizontal aim refreshes every ~10 ms frame (fast-steering). So during a hold the wish is
+    /// FIXED for 150 ms — and it must stay nonzero the whole time, or the controller's buoyancy
+    /// (which fires only on `wish_vspeed == 0`, at 30 u/s) would lift the swimmer ~4.5 u toward the
+    /// −6 swim plane before the next tick could correct. The hold survives because below the plane
+    /// `swim_vspeed` is never 0 and the controller's `SKIN` clamp zeroes the residual motion.
+    ///
+    /// Mutation check: revert `swim_vspeed` to the old up-only rule (`carrot > z+1 ? 20 : 0`) and the
+    /// dive wish becomes 0 → buoyancy floats the char to ~−6 → it never reaches −24 → the arrival
+    /// `expect` panics RED. (This is exactly the #547 live failure, reproduced offline.)
+    #[test]
+    fn walker_sim_swims_to_and_holds_a_mid_water_depth() {
+        use crate::nav::steering::{carrot_along, swim_vspeed};
+        use crate::movement::{CharacterController, MoveIntent, PLAYER_RADIUS};
+        use crate::traversability::PLAYER_BODY;
+
+        // The §9a fixture: a walled pool, surface −4, floor −44, water_slab between.
+        let assets = ZoneAssets {
+            terrain: vec![
+                slab(-44.0, 0.0, 64.0, 0.0, 64.0, true),
+                wall_east(0.0, -44.0, 0.0), wall_east(64.0, -44.0, 0.0),
+            ],
+            objects: vec![], textures: vec![],
+        };
+        let mut col = Collision::build(&assets, 8.0);
+        col.set_water(Some(std::sync::Arc::new(crate::region_map::RegionMap::water_slab(-44.0, -4.0))));
+
+        let start = [30.0, 10.0, -4.0];    // at the surface (where a floating start anchors)
+        let goal  = [30.0, 46.0, -24.0];   // MID-WATER: 20u below the surface, 20u above the −44 floor
+        let route = col.find_path(start, goal, PLAYER_RADIUS, &[], false)
+            .expect("Slice 2 plans a route to the mid-water goal");
+        // The line the walker steers = start + the planned waypoints (as the real walker does).
+        let line: Vec<[f32; 3]> = std::iter::once(start).chain(route.iter().copied()).collect();
+
+        let mut ctrl = CharacterController::new(start);
+        const DT: f32 = 0.01;              // ~100 Hz controller
+        const FRAMES_PER_TICK: usize = 15; // 150 ms nav tick
+        const TOTAL: usize = 1200;         // 12 s
+        let mut path_i = 0usize;
+        let mut wish_vspeed = 0.0f32;
+        let mut want_swim = false;
+        let mut arrived_frame: Option<usize> = None;
+        let mut max_depth_err_after_arrival = 0.0f32;
+
+        for frame in 0..TOTAL {
+            let p = ctrl.pos;
+            // ── 150 ms NAV TICK: advance path_i (3D) and LATCH the vertical wish + want_swim ──
+            if frame % FRAMES_PER_TICK == 0 {
+                while path_i + 2 < line.len() {
+                    let (a, b) = (line[path_i], line[path_i + 1]);
+                    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                    let l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+                    let t = if l2 < 1e-6 { 1.0 }
+                        else { ((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1] + (p[2] - a[2]) * ab[2]) / l2 };
+                    if t >= 1.0 { path_i += 1; } else { break; }
+                }
+                let carrot = carrot_along(&line, path_i, p, 5.0).unwrap_or(goal);
+                want_swim = col.in_water(p) || col.in_water([p[0], p[1], p[2] + 3.0]);
+                let swim_plane = if want_swim {
+                    col.water_surface(p).map(|s| s - PLAYER_BODY.float_depth)
+                } else { None };
+                wish_vspeed = if want_swim { swim_vspeed(carrot[2], p[2], swim_plane) } else { 0.0 };
+            }
+            // ── ~100 Hz FAST-STEER: refresh only the horizontal aim ──
+            let carrot = carrot_along(&line, path_i, p, 5.0).unwrap_or(goal);
+            let (dx, dy) = (carrot[0] - p[0], carrot[1] - p[1]);
+            let d = (dx * dx + dy * dy).sqrt();
+            let wish_dir = if d > 1e-3 { [dx / d, dy / d] } else { [0.0, 0.0] };
+            ctrl.step(MoveIntent { wish_dir, wish_vspeed, jump: false, want_swim,
+                speed: 44.0, climb: 0.0, hop: false }, DT, &col);
+
+            let at_goal = (ctrl.pos[0] - goal[0]).hypot(ctrl.pos[1] - goal[1]) < 3.0
+                && (ctrl.pos[2] - (-24.0)).abs() < 2.0;
+            if arrived_frame.is_none() && at_goal { arrived_frame = Some(frame); }
+            if arrived_frame.is_some() {
+                max_depth_err_after_arrival = max_depth_err_after_arrival.max((ctrl.pos[2] - (-24.0)).abs());
+            }
+        }
+
+        let arr = arrived_frame.unwrap_or_else(|| panic!(
+            "the swimmer must SWIM to the mid-water goal depth −24 and hold it — instead it ended at \
+             {:?} ({:.1}u off the −24 depth). With the retired up-only rule the dive wish is 0, so \
+             buoyancy floats it to the ~−6 swim plane and it never arrives at depth (the #547 wedge).",
+            ctrl.pos, (ctrl.pos[2] - (-24.0)).abs()));
+        assert!(TOTAL - arr >= 500,
+            "arrived at frame {arr} — too late to prove a ≥5 s hold in the remaining sim");
+        assert!(max_depth_err_after_arrival < 2.5,
+            "after arriving, the swimmer DRIFTED off the mid-water depth (max err \
+             {max_depth_err_after_arrival:.1}u). A hold must neither surface nor sink — buoyancy must \
+             stay suppressed by the nonzero below-plane wish (§8.3), even across the 150 ms latch.");
+        assert!(ctrl.pos[2] < -20.0,
+            "final feet z {:.1} must be at the mid-water goal, NOT floated back to the ~−6 swim plane",
+            ctrl.pos[2]);
+    }
+
     #[test]
     fn find_path_skirts_npc_camps_when_given_avoid_points() {
         // Big open floor (no walls) so routing is driven purely by the aggro cost (#67).
@@ -5804,7 +5906,7 @@ mod tests {
                 for i in (0..route.len().saturating_sub(2)).step_by(3) {
                     if pairs.len() >= 240 { break; }
                     let from = route[i];
-                    let Some(carrot) = crate::nav::steering::carrot_along(&route, i, [from[0], from[1]], LOCAL_REACH)
+                    let Some(carrot) = crate::nav::steering::carrot_along(&route, i, from, LOCAL_REACH)
                         else { continue };
                     pairs.push((from, carrot));
                 }
@@ -5870,31 +5972,12 @@ mod tests {
         assert!(tot_new_ok >= tot_old_ok, "fine-tier route success must not go down");
     }
 
-    /// The drift-corpus swim-up vertical wish, mirroring the live walker VERBATIM
-    /// (`walker.rs:819-825`): when swimming AND the active waypoint sits >1u above the swimmer, drive
-    /// `SWIM_UP_RATE = 20` u/s (so the controller rises collided and hauls out at the far lip);
-    /// otherwise 0. Shared by the corpus loop and its guard test so the instrument's swim drive can
-    /// never silently diverge from production. The `target_z` passed in MUST be the same carrot the
-    /// walker steers — the FINE local-plan carrot when a fine plan is active, coarse only as fallback
-    /// (see `steer_target`, steering.rs:261-280, and the corpus call site).
-    fn drift_swim_up_wish(swim: bool, target_z: f32, pos_z: f32) -> f32 {
-        const SWIM_UP_RATE: f32 = 20.0; // walker.rs:824
-        if swim && target_z > pos_z + 1.0 { SWIM_UP_RATE } else { 0.0 }
-    }
-
-    /// GUARD (runs in `cargo test --lib`): the drift corpus's swim drive must mirror the live walker,
-    /// or its wedges aren't ground truth and the whole water-nav 3b gate is measuring a phantom
-    /// physics. Pins the vertical-wish rule; a future edit that re-diverges it trips this.
-    #[test]
-    fn drift_sim_swim_drive_mirrors_walker() {
-        // walker.rs:824-825: swim AND waypoint >1u above -> SWIM_UP_RATE (20).
-        assert_eq!(drift_swim_up_wish(true, 10.0, 0.0), 20.0, "swim + waypoint above -> swim-up rate 20");
-        // threshold is +1.0, not >0: a waypoint <=1u above yields no rise.
-        assert_eq!(drift_swim_up_wish(true, 0.5, 0.0), 0.0, "swim + waypoint <=1u above -> no rise");
-        assert_eq!(drift_swim_up_wish(true, 1.0, 0.0), 0.0, "swim + waypoint exactly +1u -> no rise (strict >)");
-        // not swimming -> never a vertical wish, even under a high waypoint (walker.rs:825 gates on swim).
-        assert_eq!(drift_swim_up_wish(false, 100.0, 0.0), 0.0, "not swimming -> no vertical wish");
-    }
+    // The drift corpus's swim vertical wish is now the PRODUCTION `steering::swim_vspeed` itself
+    // (water-nav Slice 3), called directly at the corpus site below — so the instrument's depth drive
+    // cannot diverge from the walker by construction. The old `drift_swim_up_wish` mirror helper +
+    // `drift_sim_swim_drive_mirrors_walker` guard existed only because the up-only rule was duplicated
+    // in the sim; that duplication is gone, and `swim_vspeed`'s own behaviour is pinned by
+    // `steering::tests::swim_vspeed_holds_depth_below_the_plane_and_yields_to_buoyancy_at_it`.
 
     /// **THE FAITHFUL WALKER DRIFT SCANNER (the real per-tick recovery loop).** The static scanner
     /// above drove ONE fine plan with naive pure pursuit and no recovery — which over-counts corner
@@ -5920,7 +6003,7 @@ mod tests {
     #[test]
     #[ignore = "requires baked zone glbs at $ZONE_DIR; the faithful per-tick-recovery drift baseline"]
     fn faithful_walker_drift_corpus() {
-        use crate::nav::steering::{carrot_along, fast_steer_aim};
+        use crate::nav::steering::{carrot_along, fast_steer_aim, swim_vspeed};
         use crate::movement::{CharacterController, MoveIntent, PLAYER_RADIUS};
 
         // Production constants, verbatim from navigation.rs (kept in sync — if these drift, the scanner
@@ -5967,17 +6050,17 @@ mod tests {
             // going at 200 is not making progress and counts as wedged.
             let nav_ticks_budget = 200;
             for _ in 0..nav_ticks_budget {
-                let (px, py) = (ctrl.pos[0], ctrl.pos[1]);
+                let (px, py, pz) = (ctrl.pos[0], ctrl.pos[1], ctrl.pos[2]);
                 // ── arrival on the FINAL goal ──
                 if (px - goal[0]).hypot(py - goal[1]) < 3.0 { return None; }
 
                 // ── the 150 ms NAV TICK (planning / recovery) ──
-                // advance path_i along the coarse route
+                // advance path_i along the coarse route (3D, water-nav Slice 3 — mirrors walker.rs)
                 while path_i + 2 < coarse.len() {
                     let (a, b) = (coarse[path_i], coarse[path_i + 1]);
-                    let ab = [b[0] - a[0], b[1] - a[1]];
-                    let l2 = ab[0] * ab[0] + ab[1] * ab[1];
-                    let t = if l2 < 1e-6 { 1.0 } else { ((px - a[0]) * ab[0] + (py - a[1]) * ab[1]) / l2 };
+                    let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                    let l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+                    let t = if l2 < 1e-6 { 1.0 } else { ((px - a[0]) * ab[0] + (py - a[1]) * ab[1] + (pz - a[2]) * ab[2]) / l2 };
                     if t >= 1.0 { path_i += 1; } else { break; }
                 }
                 if replan_cd > 0 { replan_cd -= 1; }
@@ -6021,7 +6104,7 @@ mod tests {
                     // pending_nwt is reassigned by the match below every tick, no reset needed here.
                 }
                 // post a fresh fine plan for NOW (lands next tick)
-                let coarse_carrot = carrot_along(&coarse, path_i, [px, py], LOCAL_REACH)
+                let coarse_carrot = carrot_along(&coarse, path_i, [px, py, pz], LOCAL_REACH)
                     .unwrap_or([goal[0], goal[1], ctrl.pos[2]]);
                 match col.find_path_local([px, py, ctrl.pos[2]], coarse_carrot, LOCAL_CELL, LOCAL_BOUND, LOCAL_CELL * 2.0) {
                     LocalOutcome::Threaded(s)     => { pending_local = Some(s); pending_nwt = false; }
@@ -6038,7 +6121,7 @@ mod tests {
                         if repaths < MAX_REPATHS {
                             repaths += 1;
                             backoff_ticks = NAV_BACKOFF_TICKS;
-                            let carrot = carrot_along(&coarse, path_i, [px, py], LOOK_AHEAD)
+                            let carrot = carrot_along(&coarse, path_i, [px, py, pz], LOOK_AHEAD)
                                 .unwrap_or([goal[0], goal[1], ctrl.pos[2]]);
                             let (dx, dy) = (carrot[0] - px, carrot[1] - py);
                             let dl = (dx * dx + dy * dy).sqrt();
@@ -6055,7 +6138,7 @@ mod tests {
 
                 // ── the ~100 Hz FAST-STEER + controller stepping for this tick ──
                 for _ in 0..FRAMES_PER_TICK {
-                    let from = [ctrl.pos[0], ctrl.pos[1]];
+                    let from = [ctrl.pos[0], ctrl.pos[1], ctrl.pos[2]];
                     // fast-steer aim on the fine plan if present, else the coarse carrot
                     let steer_aim = if local_path.len() >= 2 {
                         fast_steer_aim(&local_path, &mut local_i, from, LOOK_AHEAD).map(|(d, _)| d)
@@ -6067,21 +6150,25 @@ mod tests {
                         let d = (dx * dx + dy * dy).sqrt().max(1e-3);
                         [dx / d, dy / d]
                     });
-                    // The REAL walker's swim rule (walker.rs:807-834), driving the SAME controller:
-                    // body-probe want_swim, and a swim-up wish toward the active waypoint when it sits
-                    // above the swimmer. CRITICAL faithfulness point (#1b): the vertical-wish target z
-                    // must come from the SAME path the walker steers — `steer_target`
-                    // (steering.rs:261-280) returns the FINE local-plan carrot when local.len() >= 2,
-                    // falling back to the coarse carrot only when there is no fine plan. `local_i` was
-                    // already advanced this frame by `fast_steer_aim` above (when a fine plan exists),
-                    // so this reads the identical carrot the horizontal `aim` used.
+                    // The REAL walker's swim rule (walker.rs §8.2), driving the SAME controller:
+                    // body-probe want_swim, and the water-nav Slice 3 depth controller `swim_vspeed`
+                    // toward the active waypoint's DEPTH. CRITICAL faithfulness point (#1b): the
+                    // vertical-wish target z must come from the SAME path the walker steers —
+                    // `steer_target` returns the FINE local-plan carrot when local.len() >= 2, falling
+                    // back to the coarse carrot only when there is no fine plan. `local_i` was already
+                    // advanced this frame by `fast_steer_aim` above (when a fine plan exists), so this
+                    // reads the identical carrot the horizontal `aim` used.
                     let p = ctrl.pos;
                     let swim = col.in_water(p) || col.in_water([p[0], p[1], p[2] + 3.0]);
                     let coarse_c = carrot_along(&coarse, path_i, from, LOOK_AHEAD).unwrap_or(goal);
                     let tz = if local_path.len() >= 2 {
                         carrot_along(&local_path, local_i, from, LOOK_AHEAD).map(|c| c[2]).unwrap_or(coarse_c[2])
                     } else { coarse_c[2] };
-                    let wish_vspeed = drift_swim_up_wish(swim, tz, p[2]);
+                    // Same depth controller as the walker (calls the production fn directly).
+                    let swim_plane = if swim {
+                        col.water_surface(p).map(|s| s - crate::traversability::PLAYER_BODY.float_depth)
+                    } else { None };
+                    let wish_vspeed = if swim { swim_vspeed(tz, p[2], swim_plane) } else { 0.0 };
                     ctrl.step(MoveIntent { wish_dir: aim, wish_vspeed, jump: false, want_swim: swim,
                         speed: RUN_SPEED, climb: 0.0, hop: stuck_ticks >= NAV_HOP_TICKS }, DT, col);
                     if (ctrl.pos[0] - goal[0]).hypot(ctrl.pos[1] - goal[1]) < 3.0 { return None; }
