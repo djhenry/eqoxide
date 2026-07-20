@@ -873,6 +873,7 @@ name = "eqoxide-core"
 version = "0.1.0"
 dependencies = [
  "dirs 5.0.1",
+ "serde",
  "serde_yaml",
  "shellexpand",
  "tempfile",

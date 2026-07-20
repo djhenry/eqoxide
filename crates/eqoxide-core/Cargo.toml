@@ -18,10 +18,11 @@ test-fixtures = []
 [dependencies]
 # Only what the leaf modules actually use. NO wgpu/winit/tokio/egui/net — core is a pure
 # dependency-free leaf the app crate depends on (#544 Step 2a).
+serde = { version = "1", features = ["derive"] }  # game_state.rs — Serialize derives on the world snapshot
 serde_yaml = "0.9"   # config.rs — dynamic YAML Value parsing
 shellexpand = "3"    # config.rs — ~ expansion in configured paths
 dirs = "5"           # config.rs — locating the platform config dir
-tracing = "0.1"      # info!/warn! logging in config/eqstr/region_map/zone_map
+tracing = "0.1"      # info!/warn! logging in config/eqstr/region_map/zone_map/spells
 
 [dev-dependencies]
 tempfile = "3"       # region_map.rs tests write .wtr fixtures to a temp dir

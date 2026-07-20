@@ -10,13 +10,19 @@
 //! - `config`      — client config (YAML) loading
 //! - `coord`       — EQ coordinate-space math (deliberately dependency-free)
 //! - `eqstr`       — EQ string-table (`eqstr_us.txt`) lookups
+//! - `game_state`  — server-authoritative world snapshot the render/net/http layers share (#544 Step 2b)
 //! - `region_map`  — zone `.wtr` region/water map parsing
 //! - `skills`      — skill id ↔ name tables
+//! - `spells`      — `spells_us.txt` id→{name,icon} tables (#544 Step 2b)
+//! - `ucs`         — UCS (chat-server) connection-params POD (#544 Step 2b)
 //! - `zone_map`    — zone short-name / id maps
 
 pub mod config;
 pub mod coord;
 pub mod eqstr;
+pub mod game_state;
 pub mod region_map;
 pub mod skills;
+pub mod spells;
+pub mod ucs;
 pub mod zone_map;

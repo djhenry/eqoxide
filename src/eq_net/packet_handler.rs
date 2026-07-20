@@ -3940,9 +3940,9 @@ mod tests {
         use crate::eq_net::transport::AppPacket;
         let mut gs = GameState::new();
         // Start on an OLD target so a no-op handler would leave a detectable stale value.
-        gs.upsert_entity(crate::game_state::tests::make_entity(10, "an old rat", 0.0, 0.0, 0.0, true));
+        gs.upsert_entity(crate::game_state::make_entity(10, "an old rat", 0.0, 0.0, 0.0, true));
         gs.set_target(10);
-        gs.upsert_entity(crate::game_state::tests::make_entity(42, "a decaying skeleton", 1.0, 0.0, 0.0, true));
+        gs.upsert_entity(crate::game_state::make_entity(42, "a decaying skeleton", 1.0, 0.0, 0.0, true));
         assert_eq!(gs.target_id, Some(10));
 
         // Server force-targets spawn 42 (e.g. Sense Undead points us at the nearest undead).
