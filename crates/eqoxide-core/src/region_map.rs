@@ -41,7 +41,7 @@ pub struct RegionMap {
 impl RegionMap {
     /// Test-only: a map where everything below `top_z` is water (two-leaf BSP split on z).
     /// Lets nav tests exercise swim edges without a real `.wtr` file.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn flat_below(top_z: f32) -> RegionMap {
         RegionMap { nodes: vec![
             // node 1: dist = z - top_z; above → leaf 2 (dry), below → leaf 3 (water)
@@ -55,7 +55,7 @@ impl RegionMap {
     /// else (including below `top_z` outside the box) reads as dry. Unlike `flat_below` (a single
     /// z-split, water at that depth EVERYWHERE), this lets a nav test build a spatially bounded
     /// pond so swim edges can't misfire against unrelated dry terrain elsewhere in the scene.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn box_below(n0: f32, n1: f32, e0: f32, e1: f32, top_z: f32) -> RegionMap {
         let dry   = BspNode { normal: [0.0; 3], split: 0.0, special: 0, left: 0, right: 0, zone_line_index: 0 };
         let water = BspNode { normal: [0.0; 3], split: 0.0, special: 1, left: 0, right: 0, zone_line_index: 0 };
@@ -81,7 +81,7 @@ impl RegionMap {
     /// water starts at -69.5), so a character standing on that floor has its FEET outside the water
     /// while its body is submerged. `flat_below` cannot express that — it makes everything below the
     /// surface wet, which silently hides the bug (#329).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn water_slab(bottom_z: f32, top_z: f32) -> RegionMap {
         RegionMap { nodes: vec![
             // 1: z < top_z → 2, else dry(3)
@@ -94,7 +94,7 @@ impl RegionMap {
     }
 
     /// Test-only: a map where everything below `top_z` is a zone-line region carrying `index`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn zone_line_below(top_z: f32, index: i32) -> RegionMap {
         RegionMap { nodes: vec![
             BspNode { normal: [0.0, 0.0, 1.0], split: -top_z, special: 0, left: 2, right: 3, zone_line_index: 0 },
@@ -108,7 +108,7 @@ impl RegionMap {
     /// Normal. Unlike [`zone_line_below`] (a single z-split, so the WHOLE zone below it is a zone
     /// line), this places a spatially-bounded pad footprint on ONE part of a scene, which is what an
     /// intra-zone teleport pad (#403) actually is — a small trigger volume you can walk onto and off.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-fixtures"))]
     pub fn zone_line_box(n0: f32, n1: f32, e0: f32, e1: f32, zbot: f32, ztop: f32, index: i32) -> RegionMap {
         let dry = BspNode { normal: [0.0; 3], split: 0.0, special: 0, left: 0, right: 0, zone_line_index: 0 };
         let zl  = BspNode { normal: [0.0; 3], split: 0.0, special: REGION_ZONE_LINE, left: 0, right: 0, zone_line_index: index };
@@ -130,7 +130,7 @@ impl RegionMap {
     /// `[na0,na1]` and `[nb0,nb1]`, both over east `[e0,e1]` and z-slab `[zbot,ztop]`. Models a pad
     /// footprint baked as several horizontally-separated leaves (#403 review A): the planner must
     /// emit an edge for EACH standable leaf, not just the first.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-fixtures"))]
     #[allow(clippy::too_many_arguments)]
     pub fn zone_line_two_boxes(na0: f32, na1: f32, nb0: f32, nb1: f32,
         e0: f32, e1: f32, zbot: f32, ztop: f32, index: i32) -> RegionMap {

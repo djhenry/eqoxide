@@ -16,6 +16,7 @@ name = "render_model"
 path = "src/bin/render_model.rs"
 
 [dependencies]
+eqoxide-core = { path = "crates/eqoxide-core" }
 anyhow = "1"
 arc-swap = "1"
 image = { version = "0.25", default-features = false, features = ["bmp", "png", "dds", "tga"] }
@@ -50,6 +51,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Enable eqoxide-core's test-fixture constructors (RegionMap::flat_below/water_slab/…) for THIS
+# crate's test build — they're `#[cfg(test)]` in core, so invisible across the crate boundary
+# otherwise. Dev-deps' features don't activate in normal release builds.
+eqoxide-core = { path = "crates/eqoxide-core", features = ["test-fixtures"] }
 # Pinned to the exact version wgpu 22 already pulls in transitively (see Cargo.lock) so this
 # doesn't add a second naga to the dependency graph. Used only to parse+validate the zone
 # shaders' WGSL source in tests/fog_shader.rs — no GPU device required.
@@ -60,4 +65,4 @@ tokio = { version = "1", features = ["full", "test-util"] }
 tower = "0.5"
 
 [workspace]
-members = ["tools"]
+members = ["tools", "crates/eqoxide-core"]

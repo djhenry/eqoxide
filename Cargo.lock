@@ -843,6 +843,7 @@ dependencies = [
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "eqoxide-core",
  "glam",
  "gltf",
  "image",
@@ -865,6 +866,17 @@ dependencies = [
  "ureq",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "eqoxide-core"
+version = "0.1.0"
+dependencies = [
+ "dirs 5.0.1",
+ "serde_yaml",
+ "shellexpand",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]

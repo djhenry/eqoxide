@@ -1,0 +1,27 @@
+[package]
+name = "eqoxide-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "eqoxide_core"
+path = "src/lib.rs"
+
+[features]
+# Exposes the `RegionMap::{flat_below,box_below,water_slab,zone_line_*}` test-fixture
+# constructors (otherwise `#[cfg(test)]`, so invisible across the crate boundary) to
+# DOWNSTREAM test builds. The app crate enables this in its [dev-dependencies] so nav/
+# traversability tests can keep building synthetic maps. Off in normal builds — the release
+# binary never contains these fixtures.
+test-fixtures = []
+
+[dependencies]
+# Only what the leaf modules actually use. NO wgpu/winit/tokio/egui/net — core is a pure
+# dependency-free leaf the app crate depends on (#544 Step 2a).
+serde_yaml = "0.9"   # config.rs — dynamic YAML Value parsing
+shellexpand = "3"    # config.rs — ~ expansion in configured paths
+dirs = "5"           # config.rs — locating the platform config dir
+tracing = "0.1"      # info!/warn! logging in config/eqstr/region_map/zone_map
+
+[dev-dependencies]
+tempfile = "3"       # region_map.rs tests write .wtr fixtures to a temp dir
