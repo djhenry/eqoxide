@@ -36,7 +36,9 @@ The login config (which account/character to log in as) defaults to
 ```
 
 Per-character config files (`config-durgan.yaml`, `config-claude.yaml`, `config-aiquestbot.yaml`)
-live in `~/.config/eqoxide/` and carry just the `server:` + `account:` blocks. They are **not**
+live in `~/.config/eqoxide/` and usually carry just the `server:` + `account:` blocks — but they
+may also carry a `renderer:` block, which overrides the global `config.yaml` key by key (see
+[Config](#config) below for the precedence rule and the startup disclosure). They are **not**
 checked into source control (they hold credentials). This lets multiple worktrees/agents each run
 their own character from a shared, per-user config dir (pairs with the auto-port + `/v1/lifecycle/exit`
 multi-instance support — see `http-api.md`).
@@ -179,18 +181,74 @@ Key test modules:
 
 ## Config
 
-`config.yaml` in the repo root:
+The global config is `~/.config/eqoxide/config.yaml` (falling back to `./config.yaml`
+in the working directory for back-compat):
 
 ```yaml
-login_host: "127.0.0.1"
-login_port: 5999
-assets_path: "~/eq_assets/everquest_rof2"
-models_path: "assets/models"
-character_name: "Aiquestbot"
+renderer:
+  assets_path: ~/eq_assets/EQ_Files      # EQ .s3d zone files
+  models_path: assets/models             # GLTF models: <archetype>/<archetype>.glb
+  asset_server_url: http://localhost:8088
+  eq_ui_dir: ~/eq_client/uifiles/default   # optional (#162 icon atlases)
+http_port: 8765                          # BASE port for the agent HTTP API (top level!)
+
+server:                                  # login settings
+  login_host: 127.0.0.1
+  login_port: 5999
+  world_port: 9000
+account:
+  username: ...
+  password: ...
+  character_name: Aiquestbot
 ```
 
-`assets_path` must contain the EQ `.s3d` zone files. `models_path` contains
-GLTF character models organized as `assets/models/<archetype>/<archetype>.glb`.
+### Precedence: per-character config overrides the global one, key by key (#597)
+
+`--config <name|path>` selects a per-character file — and it selects **both** the login
+settings *and* the renderer/HTTP settings. The two files are merged into one effective
+config, **key by key**, with the per-character file winning:
+
+1. `~/.config/eqoxide/config.yaml` (or `./config.yaml`) — the base layer;
+2. the file `--config` resolved to — layered on top, when it is a *different* file.
+
+A per-character file that sets only `renderer.asset_server_url` therefore still inherits
+`assets_path`, `models_path`, `eq_ui_dir` and `http_port` from the global file. With no
+`--config` there is only layer (1), which is exactly the historical behavior.
+
+Before #597 the renderer block of a per-character file was read by nobody: the client
+accepted the config, reported no error, and talked to whatever asset server the *global*
+file named. The symptom was a world with no geometry and no collision, with nothing
+saying the configured URL had been discarded.
+
+Two guardrails keep that from recurring:
+
+- **Startup disclosure.** The client logs the effective `asset_server_url`, `http_port`,
+  `assets_path`, `models_path` and `eq_ui_dir` together with the file each one came from:
+  `config: effective asset_server_url=http://prod-assets:8088 (from ~/.config/eqoxide/config-x.yaml)`.
+  A wrong value is readable in the log rather than inferred later from an empty world.
+- **No silent drops.** Every way a renderer setting can fail to take effect warns by key,
+  file and reason instead of vanishing:
+  - an unknown key under `renderer:` (`unknown key 'renderer.asset_serve_url' is IGNORED`);
+  - `http_port` nested under `renderer:` — it is a **top-level** key;
+  - a renderer key at the **top level** — it belongs under `renderer:`. (Older docs showed
+    that layout, so configs written against them hit this.)
+  - a key that is present but unusable: a non-string path/URL (`asset_server_url:` with no
+    value), a non-integer or out-of-range `http_port`. Such a value is **not** treated as a
+    hit — the previous layer or the built-in default stands, and the disclosure attributes
+    the value to the file that actually contains it.
+
+  An explicitly empty string (`asset_server_url: ""`) *is* a value: it overrides and is
+  disclosed as such.
+
+One caveat the disclosure states inline: `eq_ui_dir` has a consumer that can override it —
+`eqoxide-ui`'s icon loader prefers `$EQ_UI_DIR` (and `$EQ_SPELL_ICONS_DIR` when nothing else
+is set) and falls back to a default atlas dir when all are unset. The `eq_ui_dir` disclosure
+line says which of those is in force; the dir finally chosen is logged as `ui icons: using
+atlas dir …`. The other four keys have no such override.
+
+`http_port` remains only the *base* port: the HTTP server scans upward from it for a free
+port so several clients can run at once, and prints the port it actually bound as
+`API_PORT=<n>`. `--api-port N` still overrides everything and binds exactly N.
 
 ---
 

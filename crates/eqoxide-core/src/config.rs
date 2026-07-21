@@ -16,7 +16,48 @@ pub fn config_dir() -> PathBuf {
     dir
 }
 
-/// Renderer / HTTP server settings from `config.yaml`.
+/// Keys understood inside a `renderer:` block. Anything else is reported at
+/// startup rather than silently dropped (#597) — a config value that is quietly
+/// discarded is exactly the defect this module was fixed for.
+pub const KNOWN_RENDERER_KEYS: &[&str] =
+    &["assets_path", "models_path", "asset_server_url", "eq_ui_dir"];
+
+/// Where an effective setting came from: the label of the config layer that
+/// supplied it, or `None` when nothing did and the built-in default is in force.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// Supplied by a config file (label = its path, or `<inline>` in tests).
+    File(String),
+    /// No config file set this key; the compiled-in default is in force.
+    Default,
+}
+
+impl std::fmt::Display for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Source::File(p) => write!(f, "{p}"),
+            Source::Default => write!(f, "<built-in default>"),
+        }
+    }
+}
+
+/// Renderer / HTTP server settings.
+///
+/// # Precedence (#597)
+///
+/// Values are merged **key by key** from up to two layers, later wins:
+///
+/// 1. the global `~/.config/eqoxide/config.yaml` (falling back to `./config.yaml`);
+/// 2. the per-character file selected by `--config <name|path>`, when that
+///    resolves to a *different* file than (1).
+///
+/// So a per-character file that sets only `renderer.asset_server_url` still
+/// inherits `assets_path`/`models_path`/`eq_ui_dir`/`http_port` from the global
+/// file. With no `--config` there is only layer (1) and behavior is unchanged.
+///
+/// [`AppConfig::sources`] records which file supplied each effective value and
+/// [`AppConfig::disclose`] logs that at startup, so a wrong value is *visible*
+/// rather than inferred later from an empty world.
 pub struct AppConfig {
     pub assets_path: PathBuf,
     pub models_path: PathBuf,
@@ -26,56 +67,337 @@ pub struct AppConfig {
     /// for item/spell icons in the window system. Optional — UI falls back to
     /// text when unset and the default location is absent (#162).
     pub eq_ui_dir: Option<String>,
+    /// Provenance of each effective value: `(field name, source)`. Logged by
+    /// [`AppConfig::disclose`].
+    pub sources: Vec<(&'static str, Source)>,
+    /// Problems found while merging (unreadable file, unknown `renderer:` key,
+    /// misplaced `http_port`). Emitted by [`AppConfig::disclose`]; collected
+    /// rather than logged inline so tests can assert on them.
+    pub warnings: Vec<String>,
 }
 
 impl AppConfig {
-    pub fn load() -> Self {
-        // Prefer ~/.config/eqoxide/config.yaml; fall back to ./config.yaml for back-compat.
+    /// Load renderer/HTTP settings, honoring `--config`.
+    ///
+    /// `config_path` is `Some(path)` **only when the user actually passed
+    /// `--config`** (the path being what [`LoginConfig::resolve_path`] resolved it
+    /// to); that file is layered on top of the global `config.yaml`. `None` means
+    /// no `--config` was given: only the global file is read, with no second layer
+    /// and no warning about one — byte-for-byte the pre-#597 behavior, including
+    /// the `./config.yaml` fallback.
+    pub fn load(config_path: Option<&Path>) -> Self {
+        let mut layers: Vec<(String, String)> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
+
+        // Layer 1: the global config. Prefer ~/.config/eqoxide/config.yaml; fall
+        // back to ./config.yaml for back-compat.
         let primary = config_dir().join("config.yaml");
-        let cfg_text = std::fs::read_to_string(&primary)
-            .or_else(|_| std::fs::read_to_string("config.yaml"))
-            .unwrap_or_else(|e| {
-                tracing::warn!("renderer: no config.yaml in {} or cwd ({}), using defaults",
-                    primary.display(), e);
-                String::new()
-            });
-        Self::from_yaml_str(&cfg_text)
+        let fallback = PathBuf::from("config.yaml");
+        let mut global_path: Option<PathBuf> = None;
+        if let Ok(t) = std::fs::read_to_string(&primary) {
+            global_path = Some(primary.clone());
+            layers.push((primary.display().to_string(), t));
+        } else if let Ok(t) = std::fs::read_to_string(&fallback) {
+            global_path = Some(fallback.clone());
+            layers.push((fallback.display().to_string(), t));
+        }
+
+        // Layer 2: the per-character file from --config. Skipped entirely when
+        // --config was absent (`None`), and when it resolved to the very file that
+        // already supplied layer 1 (otherwise we'd read the same file twice).
+        if let Some(config_path) = config_path {
+            let is_global = global_path.as_deref().is_some_and(|g| same_file(g, config_path));
+            if !is_global {
+                match std::fs::read_to_string(config_path) {
+                    Ok(t) => layers.push((config_path.display().to_string(), t)),
+                    Err(e) => warnings.push(format!(
+                        "config: --config named {} but it could not be read ({e}) — renderer \
+                         settings come from the global config only",
+                        config_path.display()
+                    )),
+                }
+            }
+        }
+
+        if layers.is_empty() {
+            warnings.push(format!(
+                "config: no config.yaml in {} or cwd — using built-in renderer defaults",
+                primary.display()
+            ));
+        }
+
+        let mut cfg = Self::from_layers(&layers);
+        // Load-level warnings come first, then per-layer parse warnings.
+        warnings.append(&mut cfg.warnings);
+        cfg.warnings = warnings;
+        cfg
     }
 
+    /// Parse a single YAML document as the only layer. Used by tests and by
+    /// callers that already hold the text.
     pub fn from_yaml_str(cfg_text: &str) -> Self {
-        let cfg: serde_yaml::Value =
-            serde_yaml::from_str(cfg_text).unwrap_or(serde_yaml::Value::Null);
-        let r = cfg.get("renderer");
+        Self::from_layers(&[("<inline>".to_string(), cfg_text.to_string())])
+    }
 
-        let assets_path = r
-            .and_then(|v| v.get("assets_path"))
-            .and_then(|v| v.as_str())
-            .map(|p| PathBuf::from(shellexpand::tilde(p).into_owned()))
+    /// Merge layers key by key; the LAST layer that supplies a key wins.
+    pub fn from_layers(layers: &[(String, String)]) -> Self {
+        let mut warnings = Vec::new();
+        let parsed: Vec<(&str, serde_yaml::Value)> = layers
+            .iter()
+            .map(|(label, text)| {
+                let v = match serde_yaml::from_str::<serde_yaml::Value>(text) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warnings.push(format!("config {label}: YAML parse error ({e}) — file ignored"));
+                        serde_yaml::Value::Null
+                    }
+                };
+                (label.as_str(), v)
+            })
+            .collect();
+
+        // Report MISPLACED and UNKNOWN keys instead of dropping them. Three shapes,
+        // all of which used to vanish without a trace:
+        //   renderer.<unknown>   — a typo'd or unsupported renderer key
+        //   renderer.http_port   — a top-level key nested one level too deep
+        //   <renderer key> at top level — the pre-#597 docs showed exactly this
+        //                          layout, so configs written against them have it
+        for (label, cfg) in &parsed {
+            if let Some(serde_yaml::Value::Mapping(m)) = cfg.get("renderer") {
+                for k in m.keys().filter_map(|k| k.as_str()) {
+                    if KNOWN_RENDERER_KEYS.contains(&k) {
+                        continue;
+                    }
+                    if k == "http_port" {
+                        warnings.push(format!(
+                            "config {label}: 'http_port' must be a TOP-LEVEL key, not under 'renderer:' \
+                             — this one is IGNORED"
+                        ));
+                    } else {
+                        warnings.push(format!(
+                            "config {label}: unknown key 'renderer.{k}' is IGNORED (known keys: {})",
+                            KNOWN_RENDERER_KEYS.join(", ")
+                        ));
+                    }
+                }
+            }
+            if let serde_yaml::Value::Mapping(m) = cfg {
+                for k in m.keys().filter_map(|k| k.as_str()) {
+                    if KNOWN_RENDERER_KEYS.contains(&k) {
+                        warnings.push(format!(
+                            "config {label}: '{k}' must be nested under 'renderer:', not at the top \
+                             level — this one is IGNORED"
+                        ));
+                    }
+                }
+            }
+        }
+
+        // `pick` walks the layers in order and keeps the last hit, so a later
+        // (per-character) layer overrides an earlier (global) one key by key.
+        //
+        // A key that is PRESENT but UNUSABLE (wrong YAML type, out of range) is
+        // deliberately NOT a hit: it warns and the previous layer stands. That
+        // keeps the disclosed source honest — the value we print and the file we
+        // attribute it to always come from the same layer (#597 F1: recording the
+        // hit before parsing let `disclose()` blame a file for a value it did not
+        // contain).
+        fn pick<T>(
+            parsed: &[(&str, serde_yaml::Value)],
+            warnings: &mut Vec<String>,
+            get: impl Fn(&serde_yaml::Value, &str, &mut Vec<String>) -> Option<T>,
+        ) -> Option<(T, Source)> {
+            let mut found = None;
+            for (label, cfg) in parsed {
+                if let Some(v) = get(cfg, label, warnings) {
+                    found = Some((v, Source::File((*label).to_string())));
+                }
+            }
+            found
+        }
+
+        // A `renderer.<key>` that exists but is not a string (null, a number, a
+        // nested map) is a silent drop waiting to happen — warn and skip the layer.
+        // An explicitly EMPTY string is a real value: it overrides and is disclosed.
+        fn renderer_str(
+            key: &'static str,
+        ) -> impl Fn(&serde_yaml::Value, &str, &mut Vec<String>) -> Option<String> {
+            move |cfg, label, warns| {
+                let v = cfg.get("renderer")?.get(key)?;
+                match v.as_str() {
+                    Some(s) => Some(s.to_string()),
+                    None => {
+                        warns.push(format!(
+                            "config {label}: 'renderer.{key}' is present but is {}, not a string \
+                             — IGNORED (the previous layer or the built-in default stands)",
+                            yaml_type(v)
+                        ));
+                        None
+                    }
+                }
+            }
+        }
+
+        let mut sources: Vec<(&'static str, Source)> = Vec::new();
+        let mut src = |field: &'static str, s: Option<Source>| {
+            sources.push((field, s.unwrap_or(Source::Default)));
+        };
+
+        let assets_path_hit = pick(&parsed, &mut warnings, renderer_str("assets_path"));
+        let assets_path = assets_path_hit
+            .as_ref()
+            .map(|(p, _)| PathBuf::from(shellexpand::tilde(p).into_owned()))
             .unwrap_or_else(|| PathBuf::from("eq_assets"));
+        src("assets_path", assets_path_hit.map(|(_, s)| s));
 
-        let models_path = r
-            .and_then(|v| v.get("models_path"))
-            .and_then(|v| v.as_str())
-            .map(|p| PathBuf::from(shellexpand::tilde(p).into_owned()))
+        let models_path_hit = pick(&parsed, &mut warnings, renderer_str("models_path"));
+        let models_path = models_path_hit
+            .as_ref()
+            .map(|(p, _)| PathBuf::from(shellexpand::tilde(p).into_owned()))
             .unwrap_or_else(|| PathBuf::from("eqoxide/assets/models"));
+        src("models_path", models_path_hit.map(|(_, s)| s));
 
-        let http_port = cfg
-            .get("http_port")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(8765) as u16;
+        // `http_port` is a TOP-LEVEL key (not under `renderer:`), and is only the
+        // BASE port: the HTTP server still scans upward for a free port and prints
+        // `API_PORT=<bound>`, and `--api-port N` still overrides it exactly.
+        // Parsed to u16 INSIDE the picker so an out-of-range or non-integer value
+        // is not a hit (see the note on `pick`).
+        let http_port_hit = pick(&parsed, &mut warnings, |cfg, label, warns| {
+            let v = cfg.get("http_port")?;
+            match v.as_u64() {
+                Some(n) if (1..=u16::MAX as u64).contains(&n) => Some(n as u16),
+                Some(n) => {
+                    warns.push(format!(
+                        "config {label}: 'http_port: {n}' is out of range (1..=65535) — IGNORED \
+                         (the previous layer or the built-in default stands)"
+                    ));
+                    None
+                }
+                None => {
+                    warns.push(format!(
+                        "config {label}: 'http_port' is present but is {}, not an integer — IGNORED \
+                         (the previous layer or the built-in default stands)",
+                        yaml_type(v)
+                    ));
+                    None
+                }
+            }
+        });
+        let http_port = http_port_hit.as_ref().map(|(v, _)| *v).unwrap_or(8765);
+        src("http_port", http_port_hit.map(|(_, s)| s));
 
-        let asset_server_url = r
-            .and_then(|v| v.get("asset_server_url"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("http://localhost:8088")
-            .to_string();
+        let url_hit = pick(&parsed, &mut warnings, renderer_str("asset_server_url"));
+        let asset_server_url = url_hit
+            .as_ref()
+            .map(|(v, _)| v.clone())
+            .unwrap_or_else(|| "http://localhost:8088".to_string());
+        src("asset_server_url", url_hit.map(|(_, s)| s));
 
-        let eq_ui_dir = r
-            .and_then(|v| v.get("eq_ui_dir"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        let ui_hit = pick(&parsed, &mut warnings, renderer_str("eq_ui_dir"));
+        let eq_ui_dir = ui_hit.as_ref().map(|(v, _)| v.clone());
+        src("eq_ui_dir", ui_hit.map(|(_, s)| s));
 
-        AppConfig { assets_path, models_path, http_port, asset_server_url, eq_ui_dir }
+        AppConfig {
+            assets_path,
+            models_path,
+            http_port,
+            asset_server_url,
+            eq_ui_dir,
+            sources,
+            warnings,
+        }
+    }
+
+    /// Look up where an effective field came from (for logging/tests).
+    pub fn source_of(&self, field: &str) -> Source {
+        self.sources
+            .iter()
+            .find(|(f, _)| *f == field)
+            .map(|(_, s)| s.clone())
+            .unwrap_or(Source::Default)
+    }
+
+    /// The exact disclosure lines [`disclose`](Self::disclose) logs, in order.
+    /// Split out so the disclosure itself is testable: a snapshot over this makes
+    /// a swapped/mislabelled field a RED test rather than a silent lie in a log.
+    pub fn disclose_lines(&self) -> Vec<String> {
+        // `eq_ui_dir` is the one key with a consumer that can override it after the
+        // fact: `eqoxide-ui`'s icon loader prefers $EQ_UI_DIR (and $EQ_SPELL_ICONS_DIR
+        // when nothing else is set) over the config value, and falls back to a default
+        // atlas dir when all are unset. Say so rather than let the line imply the
+        // config value is necessarily what the UI uses (#597 F5). The atlas dir
+        // actually chosen is logged by that loader as `ui icons: using atlas dir …`.
+        let ui_note = match (std::env::var("EQ_UI_DIR"), self.eq_ui_dir.is_some()) {
+            (Ok(v), _) => format!(" — OVERRIDDEN by $EQ_UI_DIR={v}; the UI uses that"),
+            (Err(_), true) => String::new(),
+            (Err(_), false) => match std::env::var("EQ_SPELL_ICONS_DIR") {
+                Ok(v) => format!(" — $EQ_SPELL_ICONS_DIR={v} is in force instead"),
+                Err(_) => " — the UI may still fall back to a default atlas dir; \
+                            see the 'ui icons:' line"
+                    .to_string(),
+            },
+        };
+        vec![
+            format!(
+                "config: effective asset_server_url={} (from {})",
+                self.asset_server_url,
+                self.source_of("asset_server_url")
+            ),
+            format!(
+                "config: effective http_port={} (from {}) — base port; actual bound port is logged as API_PORT=",
+                self.http_port,
+                self.source_of("http_port")
+            ),
+            format!(
+                "config: effective assets_path={} (from {})",
+                self.assets_path.display(),
+                self.source_of("assets_path")
+            ),
+            format!(
+                "config: effective models_path={} (from {})",
+                self.models_path.display(),
+                self.source_of("models_path")
+            ),
+            format!(
+                "config: effective eq_ui_dir={} (from {}){ui_note}",
+                self.eq_ui_dir.as_deref().unwrap_or("<unset>"),
+                self.source_of("eq_ui_dir")
+            ),
+        ]
+    }
+
+    /// Log the effective renderer/HTTP settings and the file each came from, plus
+    /// any merge warnings. Called once at startup: a wrong `asset_server_url` must
+    /// be readable in the log, never inferred later from a world with no geometry.
+    pub fn disclose(&self) {
+        for w in &self.warnings {
+            tracing::warn!("{w}");
+        }
+        for line in self.disclose_lines() {
+            tracing::info!("{line}");
+        }
+    }
+}
+
+/// Human name for a YAML value's type, for "present but wrong type" warnings.
+fn yaml_type(v: &serde_yaml::Value) -> &'static str {
+    match v {
+        serde_yaml::Value::Null => "null",
+        serde_yaml::Value::Bool(_) => "a boolean",
+        serde_yaml::Value::Number(_) => "a number",
+        serde_yaml::Value::String(_) => "a string",
+        serde_yaml::Value::Sequence(_) => "a list",
+        serde_yaml::Value::Mapping(_) => "a map",
+        _ => "an unsupported value",
+    }
+}
+
+/// True when both paths denote the same existing file (falls back to a literal
+/// comparison when either cannot be canonicalized).
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
     }
 }
 
@@ -216,5 +538,331 @@ mod b1_config_tests {
         let yaml_set = "renderer:\n  asset_server_url: http://host:9999\n";
         let cfg = AppConfig::from_yaml_str(yaml_set);
         assert_eq!(cfg.asset_server_url, "http://host:9999");
+    }
+}
+
+/// #597: `--config` must select the renderer/HTTP settings too. Before the fix the
+/// per-character `renderer:` block was read from disk by nobody — the client accepted
+/// the config, reported no error, and used the global file's asset server instead.
+#[cfg(test)]
+mod config_precedence_tests_597 {
+    use super::*;
+
+    fn layers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(l, t)| (l.to_string(), t.to_string())).collect()
+    }
+
+    const GLOBAL: &str = "\
+renderer:
+  assets_path: /global/assets
+  models_path: /global/models
+  asset_server_url: http://localhost:8088
+  eq_ui_dir: /global/ui
+http_port: 8765
+";
+
+    #[test]
+    fn per_character_layer_overrides_global_key_by_key() {
+        let cfg = AppConfig::from_layers(&layers(&[
+            ("global.yaml", GLOBAL),
+            ("config-x.yaml", "renderer:\n  asset_server_url: http://prod-assets:8088\n"),
+        ]));
+        // Overridden key comes from the per-character file...
+        assert_eq!(cfg.asset_server_url, "http://prod-assets:8088");
+        assert_eq!(cfg.source_of("asset_server_url"), Source::File("config-x.yaml".into()));
+        // ...and every key it does NOT mention still comes from the global file.
+        assert_eq!(cfg.assets_path, PathBuf::from("/global/assets"));
+        assert_eq!(cfg.source_of("assets_path"), Source::File("global.yaml".into()));
+        assert_eq!(cfg.models_path, PathBuf::from("/global/models"));
+        assert_eq!(cfg.eq_ui_dir.as_deref(), Some("/global/ui"));
+        assert_eq!(cfg.http_port, 8765);
+        assert_eq!(cfg.source_of("http_port"), Source::File("global.yaml".into()));
+    }
+
+    #[test]
+    fn every_key_is_independently_overridable() {
+        let over = "\
+renderer:
+  assets_path: /char/assets
+  models_path: /char/models
+  asset_server_url: http://char:1234
+  eq_ui_dir: /char/ui
+http_port: 8795
+";
+        let cfg = AppConfig::from_layers(&layers(&[("global.yaml", GLOBAL), ("char.yaml", over)]));
+        assert_eq!(cfg.assets_path, PathBuf::from("/char/assets"));
+        assert_eq!(cfg.models_path, PathBuf::from("/char/models"));
+        assert_eq!(cfg.asset_server_url, "http://char:1234");
+        assert_eq!(cfg.eq_ui_dir.as_deref(), Some("/char/ui"));
+        assert_eq!(cfg.http_port, 8795);
+        for f in ["assets_path", "models_path", "asset_server_url", "eq_ui_dir", "http_port"] {
+            assert_eq!(cfg.source_of(f), Source::File("char.yaml".into()), "field {f}");
+        }
+    }
+
+    /// Property: for every subset of keys the per-character file sets, the result is
+    /// exactly "per-character where present, global otherwise" — no key leaks the wrong way.
+    #[test]
+    fn prop_merge_is_per_key_choice_over_all_subsets() {
+        let keys = ["assets_path", "models_path", "asset_server_url", "eq_ui_dir"];
+        for mask in 0u8..16 {
+            let mut over = String::from("renderer:\n");
+            for (i, k) in keys.iter().enumerate() {
+                if mask & (1 << i) != 0 {
+                    over.push_str(&format!("  {k}: /char/{k}\n"));
+                }
+            }
+            let cfg = AppConfig::from_layers(&layers(&[("g.yaml", GLOBAL), ("c.yaml", &over)]));
+            let got = |k: &str| -> String {
+                match k {
+                    "assets_path" => cfg.assets_path.display().to_string(),
+                    "models_path" => cfg.models_path.display().to_string(),
+                    "asset_server_url" => cfg.asset_server_url.clone(),
+                    _ => cfg.eq_ui_dir.clone().unwrap_or_default(),
+                }
+            };
+            for (i, k) in keys.iter().enumerate() {
+                let overridden = mask & (1 << i) != 0;
+                let want_val = if overridden {
+                    format!("/char/{k}")
+                } else if *k == "asset_server_url" {
+                    "http://localhost:8088".to_string()
+                } else if *k == "eq_ui_dir" {
+                    "/global/ui".to_string()
+                } else {
+                    format!("/global/{}", k.trim_end_matches("_path"))
+                };
+                assert_eq!(got(k), want_val, "mask {mask:04b} key {k}");
+                let want_src = if overridden { "c.yaml" } else { "g.yaml" };
+                assert_eq!(cfg.source_of(k), Source::File(want_src.into()), "mask {mask:04b} key {k}");
+            }
+        }
+    }
+
+    #[test]
+    fn single_layer_matches_legacy_behavior_and_defaults() {
+        // No --config: one layer only, identical to the pre-#597 single-file load.
+        let cfg = AppConfig::from_layers(&layers(&[("global.yaml", GLOBAL)]));
+        assert_eq!(cfg.asset_server_url, "http://localhost:8088");
+        assert_eq!(cfg.assets_path, PathBuf::from("/global/assets"));
+        assert!(cfg.warnings.is_empty(), "unexpected warnings: {:?}", cfg.warnings);
+
+        // No layers at all → built-in defaults, marked as such.
+        let cfg = AppConfig::from_layers(&[]);
+        assert_eq!(cfg.asset_server_url, "http://localhost:8088");
+        assert_eq!(cfg.http_port, 8765);
+        assert_eq!(cfg.assets_path, PathBuf::from("eq_assets"));
+        assert_eq!(cfg.source_of("asset_server_url"), Source::Default);
+    }
+
+    #[test]
+    fn unknown_renderer_key_warns_instead_of_being_dropped_silently() {
+        let cfg = AppConfig::from_layers(&layers(&[
+            ("g.yaml", GLOBAL),
+            ("c.yaml", "renderer:\n  asset_serve_url: http://typo:1\n  http_port: 9\n"),
+        ]));
+        let joined = cfg.warnings.join("\n");
+        assert!(joined.contains("asset_serve_url"), "no warning naming the typo key: {joined}");
+        assert!(joined.contains("c.yaml"), "warning must name the file: {joined}");
+        assert!(joined.contains("http_port") && joined.contains("TOP-LEVEL"),
+            "renderer.http_port must be called out: {joined}");
+        // ...and the misplaced key genuinely did not take effect.
+        assert_eq!(cfg.http_port, 8765);
+        assert_eq!(cfg.asset_server_url, "http://localhost:8088");
+    }
+
+    // ── End-to-end through the real file loader (isolated XDG_CONFIG_HOME) ──────────────
+    // These mutate process env, so they share a mutex and never run concurrently.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `f` with the given env vars set (`Some`) or removed (`None`), restoring
+    /// the previous values afterwards. Shares ENV_LOCK with `with_config_home`.
+    fn with_env<R>(vars: &[(&str, Option<&str>)], f: impl FnOnce() -> R) -> R {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev: Vec<_> = vars.iter().map(|(k, _)| (*k, std::env::var_os(k))).collect();
+        for (k, v) in vars {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        let out = f();
+        for (k, v) in prev {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        out
+    }
+
+    fn with_config_home<R>(dir: &Path, f: impl FnOnce() -> R) -> R {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", dir);
+        let out = f();
+        match prev {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        out
+    }
+
+    #[test]
+    fn load_honors_config_flag_and_names_the_source_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfgdir = tmp.path().join("eqoxide");
+        std::fs::create_dir_all(&cfgdir).unwrap();
+        std::fs::write(cfgdir.join("config.yaml"),
+            "renderer:\n  assets_path: /global/assets\n  asset_server_url: http://localhost:8088\n").unwrap();
+        let per_char = cfgdir.join("config-prod.yaml");
+        std::fs::write(&per_char, "renderer:\n  asset_server_url: http://prod-assets:8088\n").unwrap();
+
+        with_config_home(tmp.path(), || {
+            // --config prod → per-character URL wins, global assets_path inherited.
+            let path = LoginConfig::resolve_path(Some("prod"));
+            assert_eq!(path, per_char);
+            let cfg = AppConfig::load(Some(path.as_path()));
+            assert_eq!(cfg.asset_server_url, "http://prod-assets:8088");
+            assert_eq!(cfg.source_of("asset_server_url"),
+                Source::File(per_char.display().to_string()));
+            assert_eq!(cfg.assets_path, PathBuf::from("/global/assets"));
+
+            // No --config → global only, exactly as before the fix.
+            let cfg = AppConfig::load(None);
+            assert_eq!(cfg.asset_server_url, "http://localhost:8088");
+            assert!(cfg.warnings.is_empty(), "unexpected warnings: {:?}", cfg.warnings);
+        });
+    }
+
+    /// F2: with no `--config` and the global config living at the documented
+    /// `./config.yaml` fallback (no file in the XDG dir), `load()` must be SILENT.
+    /// Exercises the fallback branch through the real loader — `from_layers` cannot
+    /// reach it, so `single_layer_matches_legacy_behavior_and_defaults` never did.
+    #[test]
+    fn load_with_no_config_flag_uses_the_cwd_fallback_silently() {
+        let tmp = tempfile::tempdir().unwrap();          // empty XDG_CONFIG_HOME
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("config.yaml"),
+            "renderer:\n  asset_server_url: http://fallback:8088\n").unwrap();
+
+        with_config_home(tmp.path(), || {
+            let prev_cwd = std::env::current_dir().unwrap();
+            std::env::set_current_dir(cwd.path()).unwrap();
+            let cfg = AppConfig::load(None);
+            std::env::set_current_dir(prev_cwd).unwrap();
+
+            assert_eq!(cfg.asset_server_url, "http://fallback:8088");
+            assert_eq!(cfg.source_of("asset_server_url"), Source::File("config.yaml".into()));
+            assert!(cfg.warnings.is_empty(),
+                "the ./config.yaml fallback must not warn (it IS the global config): {:?}",
+                cfg.warnings);
+        });
+    }
+
+    /// F1: a `http_port` the loader cannot use must not be recorded as a hit. Before
+    /// the fix, global 9000 + per-character 70000 produced 8765 — a value in NEITHER
+    /// layer — attributed to the per-character file, with no warning: `disclose()`
+    /// emitting exactly the kind of confident falsehood this PR exists to remove.
+    #[test]
+    fn unusable_http_port_does_not_steal_the_source_attribution() {
+        let cfg = AppConfig::from_layers(&layers(&[
+            ("g.yaml", "http_port: 9000\n"),
+            ("c.yaml", "http_port: 70000\n"),
+        ]));
+        assert_eq!(cfg.http_port, 9000, "the usable layer must stand");
+        assert_eq!(cfg.source_of("http_port"), Source::File("g.yaml".into()),
+            "the disclosed source must be the file the disclosed VALUE came from");
+        let joined = cfg.warnings.join("\n");
+        assert!(joined.contains("70000") && joined.contains("c.yaml") && joined.contains("out of range"),
+            "out-of-range port must warn by file and value: {joined}");
+
+        // Same rule for a non-integer, and for a lone unusable layer (default stands).
+        let cfg = AppConfig::from_layers(&layers(&[("only.yaml", "http_port: \"8765\"\n")]));
+        assert_eq!(cfg.http_port, 8765);
+        assert_eq!(cfg.source_of("http_port"), Source::Default,
+            "a quoted string is not a hit — the default must be disclosed as the default");
+        assert!(cfg.warnings.join("\n").contains("not an integer"), "{:?}", cfg.warnings);
+
+        // Every disclosed source names a file that really contains that value.
+        for (val, want) in [("9000", true), ("70000", false)] {
+            let cfg = AppConfig::from_layers(&layers(&[("x.yaml", &format!("http_port: {val}\n"))]));
+            assert_eq!(cfg.source_of("http_port") == Source::File("x.yaml".into()), want);
+        }
+    }
+
+    /// F3: the pre-#597 docs showed `assets_path:` at the TOP level, so configs
+    /// written against them have keys the loader ignores. Ignoring is fine; ignoring
+    /// them silently is the bug this PR is about.
+    #[test]
+    fn top_level_renderer_keys_warn_instead_of_being_dropped_silently() {
+        let cfg = AppConfig::from_layers(&layers(&[(
+            "old-style.yaml",
+            "assets_path: /old/assets\nasset_server_url: http://old:8088\ncharacter_name: X\n",
+        )]));
+        assert_eq!(cfg.assets_path, PathBuf::from("eq_assets"), "top-level key must NOT take effect");
+        assert_eq!(cfg.asset_server_url, "http://localhost:8088");
+        let joined = cfg.warnings.join("\n");
+        for k in ["assets_path", "asset_server_url"] {
+            assert!(joined.contains(&format!("'{k}' must be nested under 'renderer:'")),
+                "no warning for top-level {k}: {joined}");
+        }
+        assert!(joined.contains("old-style.yaml"), "warning must name the file: {joined}");
+        // Unrelated top-level keys (login config lives here too) stay quiet.
+        assert!(!joined.contains("character_name"), "{joined}");
+    }
+
+    /// F4: a renderer key that is PRESENT but unusable (null, a number, a map) fell
+    /// back to the previous layer with no warning — a value-shaped silent drop.
+    #[test]
+    fn wrong_typed_renderer_values_warn_and_leave_the_previous_layer_standing() {
+        let cfg = AppConfig::from_layers(&layers(&[
+            ("g.yaml", GLOBAL),
+            ("c.yaml", "renderer:\n  asset_server_url:\n  assets_path: 42\n"),
+        ]));
+        assert_eq!(cfg.asset_server_url, "http://localhost:8088");
+        assert_eq!(cfg.source_of("asset_server_url"), Source::File("g.yaml".into()));
+        assert_eq!(cfg.assets_path, PathBuf::from("/global/assets"));
+        let joined = cfg.warnings.join("\n");
+        assert!(joined.contains("'renderer.asset_server_url' is present but is null"), "{joined}");
+        assert!(joined.contains("'renderer.assets_path' is present but is a number"), "{joined}");
+
+        // An explicitly EMPTY string is a real value: it overrides, and is disclosed.
+        let cfg = AppConfig::from_layers(&layers(&[
+            ("g.yaml", GLOBAL),
+            ("c.yaml", "renderer:\n  asset_server_url: \"\"\n"),
+        ]));
+        assert_eq!(cfg.asset_server_url, "");
+        assert_eq!(cfg.source_of("asset_server_url"), Source::File("c.yaml".into()));
+        assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+    }
+
+    /// F6: pin the disclosure text itself. Without this, swapping two fields inside
+    /// `disclose()` — printing one key's value under another key's name — stays green.
+    #[test]
+    fn disclose_lines_are_pinned_field_by_field() {
+        let cfg = AppConfig::from_layers(&layers(&[("g.yaml", GLOBAL), ("c.yaml",
+            "renderer:\n  asset_server_url: http://char:1\n")]));
+        let lines = with_env(&[("EQ_UI_DIR", None), ("EQ_SPELL_ICONS_DIR", None)],
+            || cfg.disclose_lines());
+        assert_eq!(lines, vec![
+            "config: effective asset_server_url=http://char:1 (from c.yaml)".to_string(),
+            "config: effective http_port=8765 (from g.yaml) — base port; actual bound port is logged as API_PORT=".to_string(),
+            "config: effective assets_path=/global/assets (from g.yaml)".to_string(),
+            "config: effective models_path=/global/models (from g.yaml)".to_string(),
+            "config: effective eq_ui_dir=/global/ui (from g.yaml)".to_string(),
+        ]);
+
+        // F5: $EQ_UI_DIR beats the config value in `eqoxide-ui`, so the line must say so
+        // rather than let the reader believe the config value is what the UI uses.
+        let lines = with_env(&[("EQ_UI_DIR", Some("/env/ui")), ("EQ_SPELL_ICONS_DIR", None)],
+            || cfg.disclose_lines());
+        assert!(lines[4].contains("OVERRIDDEN by $EQ_UI_DIR=/env/ui"), "{}", lines[4]);
+
+        // ...and an unset key must not read as "nothing is in force".
+        let bare = AppConfig::from_layers(&[]);
+        let lines = with_env(&[("EQ_UI_DIR", None), ("EQ_SPELL_ICONS_DIR", None)],
+            || bare.disclose_lines());
+        assert!(lines[4].contains("<unset>") && lines[4].contains("default atlas dir"), "{}", lines[4]);
     }
 }
