@@ -8,7 +8,7 @@
 
 // The `UcsInfo` POD moved DOWN into `eqoxide-core` (#544 Step 2b) so `game_state` (now also in
 // core) no longer up-references this `eq_net` layer. Re-export it here so every existing
-// `crate::eq_net::ucs::UcsInfo` path — and this module's own parser/tests — keep resolving.
+// `crate::ucs::UcsInfo` path — and this module's own parser/tests — keep resolving.
 pub use eqoxide_core::ucs::UcsInfo;
 
 /// Parse the `OP_SetChatServer` payload, a NUL-terminated comma string:

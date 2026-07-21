@@ -13,14 +13,14 @@ use cbc::{Decryptor, Encryptor};
 use des::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::NoPadding};
 use des::Des;
 
-use crate::config::{CharacterCreate, LoginConfig};
-use crate::eq_net::gameplay::{record_app_packet, run_gameplay_phase};
-use crate::eq_net::action_loop::ActionLoop;
-use crate::eq_net::packet_handler::apply_packet;
-use crate::eq_net::protocol::*;
-use crate::eq_net::transport::{AppPacket, EqStream};
-use crate::game_state::GameState;
-use crate::ipc::{CampReq, CampUntil, RespawnReq};
+use eqoxide_core::config::{CharacterCreate, LoginConfig};
+use crate::gameplay::{record_app_packet, run_gameplay_phase};
+use crate::action_loop::ActionLoop;
+use crate::packet_handler::apply_packet;
+use crate::protocol::*;
+use crate::transport::{AppPacket, EqStream};
+use eqoxide_core::game_state::GameState;
+use eqoxide_ipc::{CampReq, CampUntil, RespawnReq};
 
 type DesCbcEnc = Encryptor<Des>;
 type DesCbcDec = Decryptor<Des>;
@@ -72,26 +72,26 @@ pub struct WorldCredentials {
 pub async fn run_login_flow(
     config:          LoginConfig,
     max_retries:     u32,
-    nav:             crate::ipc::NavSlots,
-    world:           crate::ipc::WorldSlots,
-    quest:           crate::ipc::QuestSlots,
-    group_slots:     crate::ipc::GroupSlots,
-    command:         crate::command_state::CommandState,
-    social:          crate::ipc::SocialSlots,
-    merchant_slots:  crate::ipc::MerchantSlots,
-    inventory_slots: crate::ipc::InventorySlots,
-    interact:        crate::ipc::InteractSlots,
-    chat:            crate::ipc::ChatSlots,
-    controller:      crate::ipc::ControllerSlots,
-    guild_slots:     crate::ipc::GuildSlots,
-    collision:       crate::nav::collision::SharedCollision,
+    nav:             eqoxide_ipc::NavSlots,
+    world:           eqoxide_ipc::WorldSlots,
+    quest:           eqoxide_ipc::QuestSlots,
+    group_slots:     eqoxide_ipc::GroupSlots,
+    command:         eqoxide_command::CommandState,
+    social:          eqoxide_ipc::SocialSlots,
+    merchant_slots:  eqoxide_ipc::MerchantSlots,
+    inventory_slots: eqoxide_ipc::InventorySlots,
+    interact:        eqoxide_ipc::InteractSlots,
+    chat:            eqoxide_ipc::ChatSlots,
+    controller:      eqoxide_ipc::ControllerSlots,
+    guild_slots:     eqoxide_ipc::GuildSlots,
+    collision:       eqoxide_nav::collision::SharedCollision,
     maps_dir:        std::path::PathBuf,
     shutdown:        Arc<AtomicBool>,
     camp:            CampReq,
     camp_until:      CampUntil,
     respawn:         RespawnReq,
-    game_state_snapshot: crate::ipc::GameStateSnapshot,
-    net_health:          crate::ipc::NetHealthShared,
+    game_state_snapshot: eqoxide_ipc::GameStateSnapshot,
+    net_health:          eqoxide_ipc::NetHealthShared,
 ) -> Result<(), String> {
     for attempt in 1..=max_retries {
         if attempt > 1 {
@@ -143,7 +143,7 @@ pub async fn run_login_flow(
 /// bypassing raw write here would resurrect the #371 false-alive if a relogin-without-restart path is
 /// ever added. Extracted into a named helper so `login_liveness_stamp_goes_through_canonical_recorder`
 /// can pin it: reverting this body to a raw `last_packet = now` write makes that test RED.
-fn record_login_liveness(net_health: &crate::ipc::NetHealthShared, now: std::time::Instant) {
+fn record_login_liveness(net_health: &eqoxide_ipc::NetHealthShared, now: std::time::Instant) {
     record_app_packet(&mut net_health.lock().unwrap(), now);
 }
 
@@ -157,7 +157,7 @@ fn record_login_liveness(net_health: &crate::ipc::NetHealthShared, now: std::tim
 /// and simply still in progress.
 async fn run_login_phase(
     config: &LoginConfig,
-    net_health: &crate::ipc::NetHealthShared,
+    net_health: &eqoxide_ipc::NetHealthShared,
 ) -> Result<(EqStream, UnboundedReceiver<AppPacket>, GameState, WorldCredentials), LoginError> {
     let (net_tx, mut net_rx) = mpsc::unbounded_channel::<AppPacket>();
 
@@ -835,7 +835,7 @@ mod liveness_stamp_tests {
     #[test]
     fn login_liveness_stamp_goes_through_canonical_recorder() {
         let base = Instant::now();
-        let health = std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::NetHealth {
+        let health = std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::NetHealth {
             last_datagram: base, last_packet: base, last_tick: base,
             last_probe_sent: Some(base), last_probe_reply: None,
             first_unanswered_probe_sent: Some(base),

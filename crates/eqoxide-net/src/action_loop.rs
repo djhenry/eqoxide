@@ -11,13 +11,13 @@ const NAV_TICK_MS: u128 = 150;
 /// 4.4 u each). Per eq-client-expert, see ~/git/eq_kb/player-movement-speed.md.
 /// We must NOT move faster than this: even where THIS server tolerates it, others rubber-band or
 /// reject motion the real client can't produce. Defined in `eqoxide-core::physics` (#544 Step 2d)
-/// and re-exported here so `crate::eq_net::action_loop::RUN_SPEED` keeps resolving.
+/// and re-exported here so `crate::action_loop::RUN_SPEED` keeps resolving.
 pub(crate) use eqoxide_core::physics::RUN_SPEED;
-use crate::eq_net::protocol::*;
-use crate::eq_net::transport::EqStream;
-use crate::game_state::{GameState, ZonePoint};
-use crate::ipc::{TradeCmd, CampCmd};
-use crate::movement::MoveIntent;
+use crate::protocol::*;
+use crate::transport::EqStream;
+use eqoxide_core::game_state::{GameState, ZonePoint};
+use eqoxide_ipc::{TradeCmd, CampCmd};
+use eqoxide_ipc::MoveIntent;
 
 /// Min interval (ms) between OP_ClientUpdate sends while moving (native `0x118` = 280 ms).
 const POS_SEND_MOVING_MS: u128 = 280;
@@ -43,7 +43,7 @@ pub fn build_movement_history(x: f32, y: f32, z: f32) -> Vec<u8> {
     b.extend_from_slice(&x.to_le_bytes()); // X @4 (server east)
     // Z crosses the wire-datum boundary: callers pass the FOOT-level position, the wire carries
     // the model-origin datum (see `coord::WIRE_Z_OFFSET`, #522).
-    b.extend_from_slice(&(z + crate::coord::WIRE_Z_OFFSET).to_le_bytes()); // Z @8 (wire datum)
+    b.extend_from_slice(&(z + eqoxide_core::coord::WIRE_Z_OFFSET).to_le_bytes()); // Z @8 (wire datum)
     b.push(TYPE_COLLISION);                // type @12
     b.extend_from_slice(&ts.to_le_bytes()); // timestamp @13
     b
@@ -76,7 +76,7 @@ pub fn encode_client_position_update(
     buf[14..18].copy_from_slice(&eq_heading.to_le_bytes()); // heading (12-bit in u32)
     buf[18..22].copy_from_slice(&pos[0].to_le_bytes());   // x_pos (server east)
     buf[22..26].copy_from_slice(&deltas[2].to_le_bytes()); // delta_z
-    let z_wire = pos[2] + crate::coord::WIRE_Z_OFFSET;
+    let z_wire = pos[2] + eqoxide_core::coord::WIRE_Z_OFFSET;
     buf[26..30].copy_from_slice(&z_wire.to_le_bytes());   // z_pos (height, WIRE datum — #522)
     buf[30..34].copy_from_slice(&pos[1].to_le_bytes());   // y_pos (server north)
     buf[34..38].copy_from_slice(&(anim as u32).to_le_bytes()); // animation (10-bit in u32)
@@ -110,12 +110,12 @@ const CORRECTION_SQ: f32 = 144.0;
 /// at accept (the pre-review bug) let a late finish from a just-completed give resolve a DIFFERENT
 /// give that had since reached phase 2 — a fabricated 200. The `Sender` deliberately lives ONLY here —
 /// never in `GameState`, which is `Clone`d into the ArcSwap snapshot every tick and a `oneshot::Sender`
-/// is not `Clone`. See `crate::command_state::result` for the full flow.
+/// is not `Clone`. See `eqoxide_command::result` for the full flow.
 struct GiveState {
     npc_id:        u32,
     ticks_waiting: u32,
     /// The parked HTTP `Sender` for the awaited path (#448); `None` for the fire-and-forget UI give.
-    await_tx:      Option<tokio::sync::oneshot::Sender<crate::command_state::CommandResult<crate::command_state::GiveOk>>>,
+    await_tx:      Option<tokio::sync::oneshot::Sender<eqoxide_command::CommandResult<eqoxide_command::GiveOk>>>,
     /// Item name captured from the inventory slot at send time, for the `GiveOk` receipt (the trade
     /// slots are cleared by the time OP_FinishTrade is applied, so it can't be read back then).
     item_name:     String,
@@ -204,9 +204,9 @@ const ECHO_QUARANTINE: Duration = Duration::from_secs(30);
 /// timeout is still HTTP-side, but `reap_expired_pending` (#492) uses it to drop a slot the server
 /// never resolved (`SHOP_PENDING_REAP`) so a later buy isn't stranded behind it. The `Sender`
 /// deliberately lives ONLY here — never in `GameState`, which is `Clone`d into the ArcSwap snapshot
-/// every tick and a `oneshot::Sender` is not `Clone`. See `crate::command_state::result`.
+/// every tick and a `oneshot::Sender` is not `Clone`. See `eqoxide_command::result`.
 struct PendingBuy {
-    tx:          tokio::sync::oneshot::Sender<crate::command_state::CommandResult<crate::command_state::BuyOk>>,
+    tx:          tokio::sync::oneshot::Sender<eqoxide_command::CommandResult<eqoxide_command::BuyOk>>,
     merchant_id: u32,
     slot:        u32,
     /// Park time — drives the #492 `reap_expired_pending` sweep (`SHOP_PENDING_REAP`).
@@ -222,9 +222,9 @@ struct PendingBuy {
 /// without the reap it would strand this `Sender` and 409-block every later open until a zone
 /// change. The `Sender` deliberately lives ONLY here — never in `GameState`, which is `Clone`d into
 /// the ArcSwap snapshot every tick and a `oneshot::Sender` is not `Clone`. See
-/// `crate::command_state::result` for the full flow.
+/// `eqoxide_command::result` for the full flow.
 struct PendingOpen {
-    tx:          tokio::sync::oneshot::Sender<crate::command_state::CommandResult<crate::command_state::OpenOk>>,
+    tx:          tokio::sync::oneshot::Sender<eqoxide_command::CommandResult<eqoxide_command::OpenOk>>,
     merchant_id: u32,
     /// Park time — drives the #492 `reap_expired_pending` sweep (`SHOP_PENDING_REAP`).
     sent_at:     Instant,
@@ -239,9 +239,9 @@ struct PendingOpen {
 /// `fulfill_cast` fires on the `last_cast` TRANSITION rather than on any single opcode — the 3-opcode
 /// cast-end path is de-duped in `GameState`, so keying one opcode would double-fire or miss. The
 /// `Sender` lives ONLY here, never in `GameState` (it is `Clone`d into the ArcSwap snapshot every
-/// tick and a `oneshot::Sender` is not `Clone`). See `crate::command_state::result` for the flow.
+/// tick and a `oneshot::Sender` is not `Clone`). See `eqoxide_command::result` for the flow.
 struct PendingCast {
-    tx:      tokio::sync::oneshot::Sender<crate::command_state::CommandResult<crate::command_state::CastEnd>>,
+    tx:      tokio::sync::oneshot::Sender<eqoxide_command::CommandResult<eqoxide_command::CastEnd>>,
     sent_at: Instant,
 }
 
@@ -275,7 +275,7 @@ enum CastSend {
 /// could reach a parked awaited cast (the awaited path itself, which reports via its `Sender` and does
 /// not need the write; and the UI path while a cast is parked). Safe-direction either way — it can
 /// never fabricate a success — but suppressing the stray write keeps the awaited result honest.
-fn send_cast(stream: &mut EqStream, gs: &mut GameState, req: crate::ipc::CastRequest, record_never_started: bool) -> CastSend {
+fn send_cast(stream: &mut EqStream, gs: &mut GameState, req: eqoxide_ipc::CastRequest, record_never_started: bool) -> CastSend {
     if let Some(item_slot) = req.item_slot {
         // Item "clicky" cast (teleport ring / port potion, etc.). Resolve the click spell from the
         // item currently at that wire slot and refuse if it isn't a clicky, so a stale slot can't fire
@@ -299,8 +299,8 @@ fn send_cast(stream: &mut EqStream, gs: &mut GameState, req: crate::ipc::CastReq
         return CastSend::Started;
     }
     let spell_id = gs.mem_spells.get(req.gem as usize).copied()
-        .unwrap_or(crate::game_state::EMPTY_GEM);
-    if crate::game_state::gem_is_empty(spell_id) {
+        .unwrap_or(eqoxide_core::game_state::EMPTY_GEM);
+    if eqoxide_core::game_state::gem_is_empty(spell_id) {
         // POST /v1/combat/cast now 409s on an empty gem, but the gem can be un-memorized between the
         // handler and this drain. This arm used to be a bare `tracing::info!` — the agent got 200 and
         // then ABSOLUTE SILENCE: no packet, no message, no event, no state change, indistinguishable
@@ -313,7 +313,7 @@ fn send_cast(stream: &mut EqStream, gs: &mut GameState, req: crate::ipc::CastReq
     let explicit = req.target_id.filter(|&t| t != 0);
     let current  = gs.target_id.filter(|&t| t != 0);
     let mut target = explicit.or(current).unwrap_or(gs.player_id);
-    if let Some(db) = crate::spells::global() {
+    if let Some(db) = eqoxide_core::spells::global() {
         if db.is_self_only(spell_id) {
             target = gs.player_id; // ST_SELF: always the caster
         } else if explicit.is_none() && db.is_beneficial(spell_id) {
@@ -355,12 +355,12 @@ fn send_shop_buy(stream: &mut EqStream, gs: &mut GameState, merchant_id: u32, sl
 }
 
 // Nav steering math (consts, replan/arrival decisions, pure-pursuit carrot, fast-steering cursor)
-// moved to `crate::nav::steering` (cleanup step 2 — nav must not live inside net); the walker
-// methods that used them live in `crate::nav::walker::Walker` now too (M1 extraction), so this
+// moved to `eqoxide_nav::steering` (cleanup step 2 — nav must not live inside net); the walker
+// methods that used them live in `eqoxide_nav::walker::Walker` now too (M1 extraction), so this
 // module only needs `eq_heading` for its own remaining melee-approach/position-packet code below
 // (the tests module still exercises a couple of `nav::steering` consts directly — see its own
 // `use`).
-use crate::coord::eq_heading;
+use eqoxide_core::coord::eq_heading;
 
 
 pub struct ActionLoop {
@@ -377,31 +377,31 @@ pub struct ActionLoop {
     /// `#[cfg(test)]` code doesn't compile under `cargo build --lib`, so the
     /// lint can't see those reads and flags the field as dead outside `cargo test` — hence the allow.
     #[allow(dead_code)]
-    nav:              crate::ipc::NavSlots,
+    nav:              eqoxide_ipc::NavSlots,
     /// The live entity registry + zone exit points (#M4 — see `ipc::WorldSlots`).
-    world:            crate::ipc::WorldSlots,
+    world:            eqoxide_ipc::WorldSlots,
     /// `/v1/quests/*` slots (#M4 — see `ipc::QuestSlots`).
-    quest:            crate::ipc::QuestSlots,
+    quest:            eqoxide_ipc::QuestSlots,
     /// `/v1/group/*` slots (#M4 — see `ipc::GroupSlots`).
-    group_slots:      crate::ipc::GroupSlots,
+    group_slots:      eqoxide_ipc::GroupSlots,
     /// The typed write-path facade (#446). Combat is fully migrated onto it — this thread drains
     /// combat commands via `self.command.take_*` (no direct `ipc::CombatSlots` field any more);
     /// other domains still use their own bundle fields until Wave-2 migrates them. See
-    /// `crate::command_state`.
-    command:          crate::command_state::CommandState,
+    /// `eqoxide_command`.
+    command:          eqoxide_command::CommandState,
     /// GET /v1/observe/who registers a oneshot here; drained in `tick` to send OP_WhoAllRequest.
     /// Client-local friends list + a pending friends-presence poll mirror the same shape (#300/#301,
     /// #M4 — see `ipc::SocialSlots`).
-    social:           crate::ipc::SocialSlots,
+    social:           eqoxide_ipc::SocialSlots,
     /// Held between sending the `/who` request and receiving OP_WhoAllResponse; fired by
     /// `fulfill_who`. (#300)
-    pending_who:      Option<tokio::sync::oneshot::Sender<Vec<crate::game_state::WhoEntry>>>,
+    pending_who:      Option<tokio::sync::oneshot::Sender<Vec<eqoxide_core::game_state::WhoEntry>>>,
     /// The OP_FriendsWho reply arrives on the SAME opcode as /who all (OP_WhoAllResponse), so
     /// `expecting_friends` records that the next such reply is a friends poll, not a /who all. (#301)
-    pending_friends:  Option<tokio::sync::oneshot::Sender<Vec<crate::game_state::WhoEntry>>>,
+    pending_friends:  Option<tokio::sync::oneshot::Sender<Vec<eqoxide_core::game_state::WhoEntry>>>,
     expecting_friends: bool,
     /// `/v1/merchant/*` slots (#M4 — see `ipc::MerchantSlots`).
-    merchant_slots:   crate::ipc::MerchantSlots,
+    merchant_slots:   eqoxide_ipc::MerchantSlots,
     /// A buy sent via the honest awaited path (A3 Migration 1, #448), parked between send and its
     /// resolving packet (OP_ShopPlayerBuy echo → `Resolved`, OP_ShopEndConfirm → `Refused`), or
     /// reaped as `Unconfirmed` on a zone change. Sibling of `pending_who`. See `PendingBuy`.
@@ -430,16 +430,16 @@ pub struct ActionLoop {
     /// cast reaps to an honest `Unconfirmed` rather than absorbing an unrelated spell's outcome.
     cast_quarantine_until: Option<Instant>,
     /// `/v1/inventory/*` slots (#M4 — see `ipc::InventorySlots`).
-    inventory_slots:  crate::ipc::InventorySlots,
+    inventory_slots:  eqoxide_ipc::InventorySlots,
     /// In-progress quest turn-in (POST /give), or None when idle. Drives the trade-window
     /// state machine across nav ticks (request → wait for ack → move item + accept).
     give_state:       Option<GiveState>,
     /// `/v1/interact/*` slots — hail, say, loot, give, doors, sit/stand, dialogue, read (#M4 — see
     /// `ipc::InteractSlots`).
-    interact:         crate::ipc::InteractSlots,
+    interact:         eqoxide_ipc::InteractSlots,
     /// Outgoing chat + async events + the message log (#M4 — see `ipc::ChatSlots`).
-    chat:             crate::ipc::ChatSlots,
-    collision:        crate::nav::collision::SharedCollision,
+    chat:             eqoxide_ipc::ChatSlots,
+    collision:        eqoxide_nav::collision::SharedCollision,
     maps_dir:         std::path::PathBuf,
     current_zone:     String,
     last_zone_cross:  Instant,
@@ -462,9 +462,9 @@ pub struct ActionLoop {
     /// The path-walker (M1 extraction, #eq-dev-process) — the `/goto` route, stall/backoff/
     /// oscillation recovery, and arrival. Holds its OWN clones of `nav`/`world`/`collision` (the
     /// same shared state as this struct's own fields, not a copy of it) plus the pathfinding
-    /// workers, which it owns exclusively. See `crate::nav::walker` for the intent-only movement
+    /// workers, which it owns exclusively. See `eqoxide_nav::walker` for the intent-only movement
     /// boundary: `Walker` writes ONLY `controller.nav_intent`, never a position or the controller.
-    walker:           crate::nav::walker::Walker,
+    walker:           eqoxide_nav::walker::Walker,
     /// The spawn id the pet was last ordered to attack (avoids re-spamming OP_PetCommands every
     /// tick). Reset when the target changes; see the auto-pet-combat block.
     last_pet_target:  Option<u32>,
@@ -472,9 +472,9 @@ pub struct ActionLoop {
     /// thread's authoritative position snapshot we stream to the server; `nav_intent` is the
     /// `/goto` planner's per-frame wish written for the render controller; `pos_correction` hands a
     /// genuine server correction back to the controller (#M4 — see `ipc::ControllerSlots`).
-    controller:       crate::ipc::ControllerSlots,
+    controller:       eqoxide_ipc::ControllerSlots,
     /// `/v1/guild/*` slots (#M4 — see `ipc::GuildSlots`).
-    guild_slots:      crate::ipc::GuildSlots,
+    guild_slots:      eqoxide_ipc::GuildSlots,
     /// Last time we sent OP_FloatListThing (movement history) — the anti-MQGhost keepalive (#105).
     last_movement_history_send: Instant,
     /// Last position we streamed, and the last-send timestamp (for the 280 ms / 1300 ms cadence).
@@ -490,22 +490,22 @@ impl ActionLoop {
     /// same cross-thread channel the HTTP/agent side writes into. See `ipc.rs` module docs.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        nav:             crate::ipc::NavSlots,
-        world:           crate::ipc::WorldSlots,
-        quest:           crate::ipc::QuestSlots,
-        group_slots:     crate::ipc::GroupSlots,
-        command:         crate::command_state::CommandState,
-        social:          crate::ipc::SocialSlots,
-        merchant_slots:  crate::ipc::MerchantSlots,
-        inventory_slots: crate::ipc::InventorySlots,
-        interact:        crate::ipc::InteractSlots,
-        chat:            crate::ipc::ChatSlots,
-        controller:      crate::ipc::ControllerSlots,
-        guild_slots:     crate::ipc::GuildSlots,
-        collision:       crate::nav::collision::SharedCollision,
+        nav:             eqoxide_ipc::NavSlots,
+        world:           eqoxide_ipc::WorldSlots,
+        quest:           eqoxide_ipc::QuestSlots,
+        group_slots:     eqoxide_ipc::GroupSlots,
+        command:         eqoxide_command::CommandState,
+        social:          eqoxide_ipc::SocialSlots,
+        merchant_slots:  eqoxide_ipc::MerchantSlots,
+        inventory_slots: eqoxide_ipc::InventorySlots,
+        interact:        eqoxide_ipc::InteractSlots,
+        chat:            eqoxide_ipc::ChatSlots,
+        controller:      eqoxide_ipc::ControllerSlots,
+        guild_slots:     eqoxide_ipc::GuildSlots,
+        collision:       eqoxide_nav::collision::SharedCollision,
         maps_dir:        std::path::PathBuf,
     ) -> Self {
-        let walker = crate::nav::walker::Walker::new(
+        let walker = eqoxide_nav::walker::Walker::new(
             nav.clone(), world.clone(), collision.clone(), controller.nav_intent.clone(),
             controller.nav_path_view.clone(),
         );
@@ -598,7 +598,7 @@ impl ActionLoop {
             } else {
                 gs.world.entities.values().find(|e| e.name == m.name).map(|e| e.hp_pct).unwrap_or(0.0)
             };
-            crate::ipc::GroupMemberView {
+            eqoxide_ipc::GroupMemberView {
                 // m.level from OP_GroupUpdateB is a server placeholder (70/65); resolve the real
                 // level from our profile / the member's spawn instead. (eqoxide#104)
                 name: m.name.clone(), level: gs.group_member_level(&m.name),
@@ -690,8 +690,8 @@ impl ActionLoop {
             .find(|m| m.merchant_slot == echo_slot)
             .map(|m| m.name.clone())
             .unwrap_or_else(|| format!("merchant slot {echo_slot}"));
-        let _ = pb.tx.send(crate::command_state::CommandResult::Resolved(
-            crate::command_state::BuyOk { item_name, price, coin_after: gs.coin },
+        let _ = pb.tx.send(eqoxide_command::CommandResult::Resolved(
+            eqoxide_command::BuyOk { item_name, price, coin_after: gs.coin },
         ));
     }
 
@@ -701,7 +701,7 @@ impl ActionLoop {
     /// THAT buy as `Refused`. No-op when nothing is parked. Non-blocking send; never `.await`s.
     pub fn fulfill_buy_refused(&mut self) {
         if let Some(pb) = self.pending_buy.take() {
-            let _ = pb.tx.send(crate::command_state::CommandResult::Refused("merchant refused".into()));
+            let _ = pb.tx.send(eqoxide_command::CommandResult::Refused("merchant refused".into()));
         }
     }
 
@@ -711,7 +711,7 @@ impl ActionLoop {
     /// for free when `ActionLoop` is dropped) to a 202 "outcome UNKNOWN". No-op when nothing parked.
     pub fn reap_pending_buy(&mut self) {
         if let Some(pb) = self.pending_buy.take() {
-            let _ = pb.tx.send(crate::command_state::CommandResult::Unconfirmed);
+            let _ = pb.tx.send(eqoxide_command::CommandResult::Unconfirmed);
         }
     }
 
@@ -752,11 +752,11 @@ impl ActionLoop {
         if !correlates { return; }
         let po = self.pending_open.take().unwrap();
         if command == 1 {
-            let _ = po.tx.send(crate::command_state::CommandResult::Resolved(
-                crate::command_state::OpenOk { merchant_id: echo_npc },
+            let _ = po.tx.send(eqoxide_command::CommandResult::Resolved(
+                eqoxide_command::OpenOk { merchant_id: echo_npc },
             ));
         } else {
-            let _ = po.tx.send(crate::command_state::CommandResult::Refused(
+            let _ = po.tx.send(eqoxide_command::CommandResult::Refused(
                 "merchant refused to open the window (faction, engaged, feigned/invisible, \
                  charmed, or busy)".into(),
             ));
@@ -768,7 +768,7 @@ impl ActionLoop {
     /// new zone. Mirrors `reap_pending_buy`. No-op when nothing parked.
     pub fn reap_pending_open(&mut self) {
         if let Some(po) = self.pending_open.take() {
-            let _ = po.tx.send(crate::command_state::CommandResult::Unconfirmed);
+            let _ = po.tx.send(eqoxide_command::CommandResult::Unconfirmed);
         }
     }
 
@@ -790,7 +790,7 @@ impl ActionLoop {
     /// The send is non-blocking and never `.await`s; a dropped receiver (HTTP already timed out) is
     /// ignored. No-op when nothing is parked or no fresh outcome is present. Fizzle/interrupt are 200
     /// (the cast RESOLVED — we know what happened), but `outcome` carries the truth so a 200 can never
-    /// be misread as "the spell took hold". See `crate::command_state::result`.
+    /// be misread as "the spell took hold". See `eqoxide_command::result`.
     pub fn fulfill_cast(&mut self, gs: &GameState) {
         // #492/#475: after a cast is TIME-reaped, cast echoes carry NO content key (`fulfill_cast`
         // keys only on `outcome.at`), so ANY cast outcome within the resend window could belong to the
@@ -808,18 +808,18 @@ impl ActionLoop {
                     "cast_fizzled"     => "fizzled",
                     _                  => "interrupted",
                 };
-                crate::command_state::CommandResult::Resolved(crate::command_state::CastEnd {
+                eqoxide_command::CommandResult::Resolved(eqoxide_command::CastEnd {
                     outcome:    verdict.to_string(),
                     spell_id:   outcome.spell_id,
-                    spell_name: crate::spells::name_of(outcome.spell_id),
+                    spell_name: eqoxide_core::spells::name_of(outcome.spell_id),
                     text:       outcome.text.clone(),
                 })
             }
             // A real server refusal that reached us after we parked — the cast never happened → 409.
-            "cast_failed" => crate::command_state::CommandResult::Refused(outcome.text.clone()),
+            "cast_failed" => eqoxide_command::CommandResult::Refused(outcome.text.clone()),
             // The server ended the cast without explaining it (buff-won't-stack, or an inferred end) —
             // genuinely unknown whether the spell had any effect → 202, never a claimed success.
-            _ => crate::command_state::CommandResult::Unconfirmed,
+            _ => eqoxide_command::CommandResult::Unconfirmed,
         };
         let pc = self.pending_cast.take().unwrap();
         let _ = pc.tx.send(result);
@@ -832,7 +832,7 @@ impl ActionLoop {
     /// (Disconnect is covered for free: dropping `ActionLoop` drops the `Sender` → closed channel → 202.)
     pub fn reap_pending_cast(&mut self) {
         if let Some(pc) = self.pending_cast.take() {
-            let _ = pc.tx.send(crate::command_state::CommandResult::Unconfirmed);
+            let _ = pc.tx.send(eqoxide_command::CommandResult::Unconfirmed);
         }
     }
 
@@ -926,12 +926,12 @@ impl ActionLoop {
         let mut out = self.chat.messages.lock().unwrap();
         out.clear();
         out.extend(gs.messages.iter().map(|m| {
-            let keywords = crate::game_state::split_keywords(&m.text).into_iter()
+            let keywords = eqoxide_core::game_state::split_keywords(&m.text).into_iter()
                 .filter(|(_, is_kw)| *is_kw)
                 .map(|(seg, _)| seg.trim_matches(|c| c == '[' || c == ']').trim().to_string())
                 .filter(|k| !k.is_empty())
                 .collect();
-            crate::ipc::MessageEntry {
+            eqoxide_ipc::MessageEntry {
                 kind: m.kind.clone(),
                 text: m.text.clone(),
                 keywords,
@@ -944,7 +944,7 @@ impl ActionLoop {
         // Publish async events (GET /v1/events/*), preserving their stable monotonic ids.
         let mut ev = self.chat.chat_events.lock().unwrap();
         ev.clear();
-        ev.extend(gs.chat_events.iter().map(|e| crate::ipc::Event {
+        ev.extend(gs.chat_events.iter().map(|e| eqoxide_ipc::Event {
             id: e.id, category: e.category.clone(), kind: e.kind.clone(),
             from: e.from.clone(), directed: e.directed, text: e.text.clone(),
         }));
@@ -954,7 +954,7 @@ impl ActionLoop {
     pub fn sync_doors(&self, gs: &GameState) {
         let mut out = self.interact.doors_shared.lock().unwrap();
         out.clear();
-        out.extend(gs.world.doors.values().map(|d| crate::ipc::DoorView {
+        out.extend(gs.world.doors.values().map(|d| eqoxide_ipc::DoorView {
             door_id: d.door_id, name: d.name.clone(),
             x: d.x, y: d.y, z: d.z, heading: d.heading,
             opentype: d.opentype, is_open: d.is_open,
@@ -998,7 +998,7 @@ impl ActionLoop {
             shared.clear();
             shared.extend(gs.world.zone_points.iter().cloned());
             // Load map labels from disk.
-            if let Some(zm) = crate::zone_map::ZoneMap::load(&self.maps_dir, &gs.world.zone_name) {
+            if let Some(zm) = eqoxide_core::zone_map::ZoneMap::load(&self.maps_dir, &gs.world.zone_name) {
                 let before = shared.len();
                 for label in &zm.labels {
                     let lower = label.text.to_lowercase();
@@ -1049,7 +1049,7 @@ impl ActionLoop {
     ///   | no_path | search_exhausted | blocked
     ///
     // `set_nav_state`/`stop_nav`/`apply_plan`/`apply_local_plan`/`is_player_dead`/`nav_halt_if_dead`/
-    // `find_in_zone_portal`/`aggro_avoid` moved to `crate::nav::walker::Walker` (M1 extraction).
+    // `find_in_zone_portal`/`aggro_avoid` moved to `eqoxide_nav::walker::Walker` (M1 extraction).
     // `is_player_dead` itself moved further, to `GameState::is_player_dead` — both `Walker` and
     // `drain_zone_cross` (below) need it, and it depends only on `GameState`.
 
@@ -1129,7 +1129,7 @@ impl ActionLoop {
         };
 
         // `Walker::drive_walk` never touches position/`EqStream` itself (intent-only boundary — see
-        // `crate::nav::walker`'s module doc): it only writes the per-frame `nav_intent`. A big drop
+        // `eqoxide_nav::walker`'s module doc): it only writes the per-frame `nav_intent`. A big drop
         // is no longer a special handoff — the walker just keeps walking toward the goal and the
         // render controller's ONE collided gravity path descends off the edge (§442, #442); the
         // landing damage is applied driver-agnostically in `stream_position`.
@@ -1281,7 +1281,7 @@ impl ActionLoop {
             if let Some(npc_id) = gs.trainer_open {
                 stream.send_app_packet(OP_GM_TRAIN_SKILL, &build_gm_train_skill(npc_id, skill_id));
                 tracing::info!("EQ: trainer: training skill {skill_id} at npc {npc_id}");
-                gs.log_msg("trainer", &format!("Training {}", crate::skills::skill_name(skill_id).unwrap_or("?")));
+                gs.log_msg("trainer", &format!("Training {}", eqoxide_core::skills::skill_name(skill_id).unwrap_or("?")));
             } else {
                 gs.log_msg("trainer", "Cannot train — no trainer window open");
             }
@@ -1463,7 +1463,7 @@ impl ActionLoop {
         // #446: both the Chat window and the POST handlers write through the shared
         // `CommandState::request_chat_send` verb now; this drains the whole FIFO queue at once via
         // `take_chat_send` (same `std::mem::take` behavior the raw slot drain had).
-        let outgoing: Vec<crate::ipc::ChatSend> = self.command.take_chat_send();
+        let outgoing: Vec<eqoxide_ipc::ChatSend> = self.command.take_chat_send();
         for c in outgoing {
             let pkt = build_channel_message(&gs.player_name, &c.to, c.chan, &c.text);
             stream.send_app_packet(OP_CHANNEL_MESSAGE, &pkt);
@@ -1616,26 +1616,26 @@ impl ActionLoop {
         if let Some(action) = guild_action {
             const GUILD_RECRUIT: u32 = 8; // default rank for a fresh invite (RoF2 0-8 scale)
             match action {
-                crate::ipc::GuildAction::Invite(name) => {
+                eqoxide_ipc::GuildAction::Invite(name) => {
                     let pkt = build_guild_command(&name, &gs.player_name, gs.player_guild_id, GUILD_RECRUIT);
                     stream.send_app_packet(OP_GUILD_INVITE, &pkt);
                     gs.log_msg("guild", &format!("Inviting {name} to the guild"));
                     tracing::info!("EQ: guild invite -> {name}");
                 }
-                crate::ipc::GuildAction::Remove(name) => {
+                eqoxide_ipc::GuildAction::Remove(name) => {
                     let pkt = build_guild_command(&name, &gs.player_name, gs.player_guild_id, 0);
                     stream.send_app_packet(OP_GUILD_REMOVE, &pkt);
                     gs.log_msg("guild", &format!("Removing {name} from the guild"));
                     tracing::info!("EQ: guild remove -> {name}");
                 }
-                crate::ipc::GuildAction::Leave => {
+                eqoxide_ipc::GuildAction::Leave => {
                     // Self-leave: othername == myname.
                     let pkt = build_guild_command(&gs.player_name, &gs.player_name, gs.player_guild_id, 0);
                     stream.send_app_packet(OP_GUILD_REMOVE, &pkt);
                     gs.log_msg("guild", "Leaving guild");
                     tracing::info!("EQ: guild leave");
                 }
-                crate::ipc::GuildAction::Accept => match gs.pending_guild_invite.take() {
+                eqoxide_ipc::GuildAction::Accept => match gs.pending_guild_invite.take() {
                     Some((inviter, guild_id, rank)) => {
                         let pkt = build_guild_invite_accept(&inviter, &gs.player_name, rank, guild_id);
                         stream.send_app_packet(OP_GUILD_INVITE_ACCEPT, &pkt);
@@ -1677,13 +1677,13 @@ impl ActionLoop {
         // the second caller's Sender. So when a cast is already parked we do NOT supersede it and do
         // NOT send any wire packet: we immediately answer the NEW request `Refused`. Because no packet
         // went out, the cast DEFINITIVELY did not happen — 409, not a 202 "unknown". See
-        // `crate::command_state::result` for the discipline shared with buy/give. (Known residual: a UI
+        // `eqoxide_command::result` for the discipline shared with buy/give. (Known residual: a UI
         // fire-and-forget cast concurrent with a parked awaited cast could still have its outcome
         // resolve the awaited cast — but the server serialises the cast bar, so a second cast can't
         // even start until the first frees it; very low likelihood, and it cannot fabricate success.)
         if let Some((req, tx)) = self.command.take_cast_await() {
             if self.pending_cast.is_some() {
-                let _ = tx.send(crate::command_state::CommandResult::Refused(
+                let _ = tx.send(eqoxide_command::CommandResult::Refused(
                     "a cast is already in flight; retry after it resolves".into()));
                 tracing::info!("EQ: awaited cast REJECTED — one already in flight");
             } else {
@@ -1696,7 +1696,7 @@ impl ActionLoop {
                         tracing::info!("EQ: awaited cast parked — awaiting outcome");
                     }
                     CastSend::NeverStarted(reason) => {
-                        let _ = tx.send(crate::command_state::CommandResult::Refused(reason));
+                        let _ = tx.send(eqoxide_command::CommandResult::Refused(reason));
                     }
                 }
             }
@@ -1798,14 +1798,14 @@ impl ActionLoop {
         // DEFINITIVELY did not happen — `Refused`/409 is honest here, not `Unconfirmed`/202 (which
         // means "outcome unknown" and would understate our certainty). The server then only ever
         // processes one awaited buy at a time, keeping the echo correlation unambiguous, and the busy
-        // caller gets an honest 409 rather than a mis-attributed 200. See `crate::command_state::result`
+        // caller gets an honest 409 rather than a mis-attributed 200. See `eqoxide_command::result`
         // for the discipline
         // A3.2/A3.3 must copy. (Known residual: a UI fire-and-forget buy of the SAME slot concurrent
         // with a parked awaited buy could still have its echo resolve the awaited buy, because the
         // fire-and-forget path does not park — very low likelihood, and it cannot fabricate success.)
         if let Some((merchant_id, slot, tx)) = self.command.take_buy_await() {
             if self.pending_buy.is_some() {
-                let _ = tx.send(crate::command_state::CommandResult::Refused(
+                let _ = tx.send(eqoxide_command::CommandResult::Refused(
                     "another buy is already in flight; retry after it resolves".into()));
                 tracing::info!("EQ: awaited shop buy REJECTED — one already in flight (merchant_id={merchant_id} slot={slot})");
             } else {
@@ -1884,7 +1884,7 @@ impl ActionLoop {
         // DEFINITIVELY did not happen — 409 is honest here, not 202).
         if let Some((merchant_id, tx)) = self.command.take_open_await() {
             if self.pending_open.is_some() {
-                let _ = tx.send(crate::command_state::CommandResult::Refused(
+                let _ = tx.send(eqoxide_command::CommandResult::Refused(
                     "another open is already in flight; retry after it resolves".into()));
                 tracing::info!("EQ: awaited shop open REJECTED — one already in flight (merchant_id={merchant_id})");
             } else {
@@ -1917,7 +1917,7 @@ impl ActionLoop {
         }
     }
 
-    // `apply_fast_steering` moved to `crate::nav::walker::Walker` (M1 extraction).
+    // `apply_fast_steering` moved to `eqoxide_nav::walker::Walker` (M1 extraction).
 
     fn drive_auto_target(&mut self, stream: &mut EqStream, gs: &mut GameState) {
         // Auto-target: while auto-attacking, pick who to fight each tick. Priority (see
@@ -1936,7 +1936,7 @@ impl ActionLoop {
             // to drop targets behind a wall. `line_clear` (a centre ray) is the right primitive —
             // `path_clear` now sweeps the player's whole collision volume (#358), which would also
             // reject a perfectly attackable NPC standing in a doorway.
-            let clear_to = |e: &crate::game_state::Entity| -> bool {
+            let clear_to = |e: &eqoxide_core::game_state::Entity| -> bool {
                 col.as_ref().map_or(true, |c| {
                     c.line_clear([gs.player_x, gs.player_y, e.z + 3.0], [e.x, e.y, e.z + 3.0], 2.0)
                 })
@@ -2077,7 +2077,7 @@ impl ActionLoop {
     }
 
     // `drive_chase`/`drive_teleport_detect`/`resolve_goal`/`drive_walk` moved to
-    // `crate::nav::walker::Walker` (M1 extraction) — see `tick`'s `self.walker.*` calls above.
+    // `eqoxide_nav::walker::Walker` (M1 extraction) — see `tick`'s `self.walker.*` calls above.
 
     /// Advance the quest turn-in (POST /give) trade-window flow. The full sequence is:
     ///   1. New give request: put the item on the cursor (OP_MoveItem from_slot→30, skip if it's
@@ -2122,7 +2122,7 @@ impl ActionLoop {
         //     queued to start later, never started now). Dropping is the honest choice — silently
         //     starting a racing trade is the bug we are closing.
         if let Some((npc_id, from_slot, tx)) = self.command.take_give_await() {
-            let _ = tx.send(crate::command_state::CommandResult::Refused(
+            let _ = tx.send(eqoxide_command::CommandResult::Refused(
                 "a give is already in flight; retry".into()));
             tracing::info!("EQ: give: awaited give REJECTED — one already in flight (npc_id={npc_id} from_slot={from_slot})");
         }
@@ -2171,7 +2171,7 @@ impl ActionLoop {
                     tracing::warn!("EQ: give: no trade ack (timed out)");
                     gs.log_msg("trade", "Trade timed out (no NPC ack)");
                     if let Some(tx) = await_tx {
-                        let _ = tx.send(crate::command_state::CommandResult::Unconfirmed);
+                        let _ = tx.send(eqoxide_command::CommandResult::Unconfirmed);
                     }
                     self.give_state = None;
                     gs.trade_ack_ready = false;
@@ -2223,14 +2223,14 @@ impl ActionLoop {
             if confirmed {
                 tracing::info!("EQ: give: turn-in confirmed — item {:?} (id={:?}) left inventory (npc_id={})", item_name, item_id, npc_id);
                 if let Some(tx) = await_tx {
-                    let _ = tx.send(crate::command_state::CommandResult::Resolved(
-                        crate::command_state::GiveOk { npc_id, item_name }));
+                    let _ = tx.send(eqoxide_command::CommandResult::Resolved(
+                        eqoxide_command::GiveOk { npc_id, item_name }));
                 }
             } else {
                 tracing::warn!("EQ: give: OP_FinishTrade but item {:?} (id={:?}) NOT transferred (returned to cursor or unidentifiable) — honest Unconfirmed", item_name, item_id);
                 gs.log_msg("trade", "Give not confirmed — the item was returned to you");
                 if let Some(tx) = await_tx {
-                    let _ = tx.send(crate::command_state::CommandResult::Unconfirmed);
+                    let _ = tx.send(eqoxide_command::CommandResult::Unconfirmed);
                 }
             }
         } else if let Some(g) = self.give_state.as_mut() {
@@ -2256,7 +2256,7 @@ impl ActionLoop {
                 // reached by a finish that crossed the cancel on the wire. Narrowed, not eliminated.)
                 stream.send_app_packet(OP_CANCEL_TRADE, &build_cancel_trade(gs.player_id));
                 if let Some(tx) = await_tx {
-                    let _ = tx.send(crate::command_state::CommandResult::Unconfirmed);
+                    let _ = tx.send(eqoxide_command::CommandResult::Unconfirmed);
                 }
                 tracing::warn!("EQ: give: no OP_FinishTrade after accept — outcome UNKNOWN (item mismatch or lost); sent OP_CancelTrade to end the session");
                 gs.log_msg("trade", "Trade not confirmed (item may have been returned)");
@@ -2276,7 +2276,7 @@ impl ActionLoop {
         gs: &mut GameState,
         npc_id: u32,
         from_slot: u32,
-        await_tx: Option<tokio::sync::oneshot::Sender<crate::command_state::CommandResult<crate::command_state::GiveOk>>>,
+        await_tx: Option<tokio::sync::oneshot::Sender<eqoxide_command::CommandResult<eqoxide_command::GiveOk>>>,
     ) {
         // Capture the item name AND item_id BEFORE it leaves the slot — by the time the confirming
         // OP_FinishTrade is applied, `clear_trade_slots` has run, so neither can be read back then. The
@@ -2341,7 +2341,7 @@ impl ActionLoop {
         if !awaited { return; }
         if let Some(mut g) = self.give_state.take() {
             if let Some(tx) = g.await_tx.take() {
-                let _ = tx.send(crate::command_state::CommandResult::Unconfirmed);
+                let _ = tx.send(eqoxide_command::CommandResult::Unconfirmed);
             }
         }
     }
@@ -2440,8 +2440,8 @@ impl ActionLoop {
         // Internal heading is CCW (0=north, 90=west). EQ wire expects CW (0=north, 90=east).
         // EQEmu decodes wire heading via EQ12toFloat = wire/4; full circle = 512 EQ units.
         // So wire = cw_degrees * 512/360 * 4 = cw_degrees * 2048/360.
-        let h_cw = crate::eq_net::protocol::ccw_to_cw(heading);
-        let eq_heading = crate::eq_net::protocol::deg_cw_to_eq12_client(h_cw);
+        let h_cw = crate::protocol::ccw_to_cw(heading);
+        let eq_heading = crate::protocol::deg_cw_to_eq12_client(h_cw);
 
         let buf = encode_client_position_update(
             self.position_seq, gs.player_id as u16, [x, y, z], [dx, dy, dz], eq_heading, anim);
@@ -2495,7 +2495,7 @@ impl ActionLoop {
                 gs.player_y = dest_pos[1];
                 // Zone-point target coords are wire-datum (DB safe coords, model-origin z ~3.1u
                 // above the floor) — convert to the internal foot datum (#522).
-                gs.player_z = dest_pos[2] - crate::coord::WIRE_Z_OFFSET;
+                gs.player_z = dest_pos[2] - eqoxide_core::coord::WIRE_Z_OFFSET;
                 tracing::info!(
                     "zone_cross: same-zone translocator index={index} → in-zone reposition to ({:.0},{:.0},{:.0}) (no reconnect)",
                     dest_pos[0], dest_pos[1], dest_pos[2]);
@@ -2563,7 +2563,7 @@ impl ActionLoop {
         // @68..76 Unknown068/Unknown072 left zero.
         buf[76..80].copy_from_slice(&gs.player_y.to_le_bytes());      // y (north)
         buf[80..84].copy_from_slice(&gs.player_x.to_le_bytes());      // x (east)
-        buf[84..88].copy_from_slice(&(gs.player_z + crate::coord::WIRE_Z_OFFSET).to_le_bytes()); // z (wire datum, #522)
+        buf[84..88].copy_from_slice(&(gs.player_z + eqoxide_core::coord::WIRE_Z_OFFSET).to_le_bytes()); // z (wire datum, #522)
         buf[88..92].copy_from_slice(&0u32.to_le_bytes());             // zone_reason = 0
         buf[92..96].copy_from_slice(&0i32.to_le_bytes());             // success = 0 (request)
         tracing::info!("EQ: sending OP_ZONE_CHANGE target_zone={} from current_zone={} pos=({:.1},{:.1},{:.1})",
@@ -2574,8 +2574,8 @@ impl ActionLoop {
 
 #[cfg(test)]
 mod fine_tier_tests {
-    use crate::nav::steering::*;
-    use crate::nav::collision::{LocalOutcome, NoRoute, PlanLimit};
+    use eqoxide_nav::steering::*;
+    use eqoxide_nav::collision::{LocalOutcome, NoRoute, PlanLimit};
 
     /// A tiny deterministic LCG. No new dependency, and a seeded generator means a failure is
     /// reproducible — which a `rand`-seeded property test would not be.
@@ -2743,9 +2743,9 @@ mod fine_tier_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eq_net::packet_handler::apply_packet;
-    use crate::eq_net::transport::AppPacket;
-    use crate::nav::steering::{NAV_LOCAL_STUCK_TICKS, PROACTIVE_REPLAN_CAP};
+    use crate::packet_handler::apply_packet;
+    use crate::transport::AppPacket;
+    use eqoxide_nav::steering::{NAV_LOCAL_STUCK_TICKS, PROACTIVE_REPLAN_CAP};
 
     /// #522 datum round-trip: the internal FOOT z survives the wire hop unchanged.
     ///
@@ -2759,8 +2759,8 @@ mod tests {
     /// constant on only one side → both fail.
     #[test]
     fn wire_z_datum_round_trips_to_foot() {
-        use crate::coord::WIRE_Z_OFFSET;
-        use crate::eq_net::protocol::{decode_position_update, encode_position_update};
+        use eqoxide_core::coord::WIRE_Z_OFFSET;
+        use crate::protocol::{decode_position_update, encode_position_update};
 
         // Grid-aligned foot z (EQ19 is value/8) so the fixed-point encode stays lossless and the
         // test isolates the DATUM conversion from wire quantization.
@@ -2785,7 +2785,7 @@ mod tests {
         gs.player_id = 42;            // so the packet is treated as OUR OWN position
         gs.player_z = -999.0;         // poisoned: only the handler's conversion can fix it
         apply_packet(&mut gs, &AppPacket {
-            opcode: crate::eq_net::protocol::OP_CLIENT_UPDATE, payload: server_pkt });
+            opcode: crate::protocol::OP_CLIENT_UPDATE, payload: server_pkt });
         assert!((gs.player_z - foot).abs() < 1e-4,
             "foot→wire→foot must be the identity through the real handler: sent {foot}, gs.player_z {}",
             gs.player_z);
@@ -2801,8 +2801,8 @@ mod tests {
     /// `nav_reason: goal_z_snapped`, all the way through to ARRIVAL, plus the message log.
     #[test]
     fn a_snapped_goal_z_is_reported_not_silently_performed() {
-        use crate::nav::planner::PlanReply;
-        let g: crate::ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::GroupSnapshot::default()));
+        use eqoxide_nav::planner::PlanReply;
+        let g: eqoxide_ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
         let mut nav = test_action_loop(g);
         let mut gs = GameState::new();
         let goal = (100.0f32, 100.0f32, 0.0f32); // the agent asked for z = 0
@@ -2810,9 +2810,9 @@ mod tests {
         // The planner routed there — but only by moving the goal onto the floor at z = 47.
         nav.walker.apply_plan(PlanReply {
             gen: 1,
-            outcome: crate::nav::collision::PlanOutcome::Route(vec![[0.0, 0.0, 47.0], [100.0, 100.0, 47.0]]),
+            outcome: eqoxide_nav::collision::PlanOutcome::Route(vec![[0.0, 0.0, 47.0], [100.0, 100.0, 47.0]]),
             plan_ms: 5,
-            goal_snapped: Some(crate::nav::collision::GoalSnap::ToColumnFloor { z: 47.0 }),
+            goal_snapped: Some(eqoxide_nav::collision::GoalSnap::ToColumnFloor { z: 47.0 }),
             tight: false,
         }, &mut gs, goal);
 
@@ -2830,7 +2830,7 @@ mod tests {
         // A goal whose z WAS honoured reports nothing — the accommodation must not be cried wolf.
         nav.walker.apply_plan(PlanReply {
             gen: 2,
-            outcome: crate::nav::collision::PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]]),
+            outcome: eqoxide_nav::collision::PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]]),
             plan_ms: 5,
             goal_snapped: None,
             tight: false,
@@ -2844,9 +2844,9 @@ mod tests {
         // surface with no qualifier would claim a depth never reached.
         nav.walker.apply_plan(PlanReply {
             gen: 3,
-            outcome: crate::nav::collision::PlanOutcome::Route(vec![[0.0, 0.0, -20.0], [100.0, 100.0, -20.0]]),
+            outcome: eqoxide_nav::collision::PlanOutcome::Route(vec![[0.0, 0.0, -20.0], [100.0, 100.0, -20.0]]),
             plan_ms: 5,
-            goal_snapped: Some(crate::nav::collision::GoalSnap::ToWaterSurface { surface_z: 0.0 }),
+            goal_snapped: Some(eqoxide_nav::collision::GoalSnap::ToWaterSurface { surface_z: 0.0 }),
             tight: false,
         }, &mut gs, (100.0, 100.0, -20.0));
         let st = nav.nav.nav_state.lock().unwrap().clone();
@@ -2864,9 +2864,9 @@ mod tests {
     /// pins that an ARRIVED and an Exhausted `navigating_partial` state carry no stale tier.
     #[test]
     fn nav_tier_does_not_survive_into_a_later_no_path_or_arrived() {
-        use crate::nav::collision::{NoRoute, PlanLimit, PlanOutcome};
-        use crate::nav::planner::PlanReply;
-        let group: crate::ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::GroupSnapshot::default()));
+        use eqoxide_nav::collision::{NoRoute, PlanLimit, PlanOutcome};
+        use eqoxide_nav::planner::PlanReply;
+        let group: eqoxide_ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
         let mut nav = test_action_loop(group);
         let mut gs = GameState::new();
         let goal = (100.0f32, 100.0f32, 0.0f32);
@@ -2925,15 +2925,15 @@ mod tests {
 
     /// Build a minimal ActionLoop for unit tests that only exercise a single `sync_*`/tick method —
     /// every other shared slot gets an empty/default placeholder.
-    fn test_action_loop(group: crate::ipc::GroupShared) -> ActionLoop {
+    fn test_action_loop(group: eqoxide_ipc::GroupShared) -> ActionLoop {
         ActionLoop::new(
-            crate::ipc::NavSlots {
-                nav_state: std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::NavStatus::default())),
+            eqoxide_ipc::NavSlots {
+                nav_state: std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::NavStatus::default())),
                 ..Default::default()
             },
             Default::default(), // world
             Default::default(), // quest
-            crate::ipc::GroupSlots { group, ..Default::default() },
+            eqoxide_ipc::GroupSlots { group, ..Default::default() },
             Default::default(), // command (CommandState)
             Default::default(), // social
             Default::default(), // merchant_slots
@@ -2953,8 +2953,8 @@ mod tests {
     // request→take round-trip runs), then feed the resolving packet exactly as `gameplay.rs` does.
     // ─────────────────────────────────────────────────────────────────────────────────────────
 
-    fn zp_at(iterator: u32, zone_id: u16, pos: [f32; 3]) -> crate::game_state::ZonePoint {
-        crate::game_state::ZonePoint {
+    fn zp_at(iterator: u32, zone_id: u16, pos: [f32; 3]) -> eqoxide_core::game_state::ZonePoint {
+        eqoxide_core::game_state::ZonePoint {
             iterator, zone_id,
             server_x: pos[0], server_y: pos[1], server_z: pos[2], heading: 0.0,
         }
@@ -2994,7 +2994,7 @@ mod tests {
     async fn same_zone_cross_repositions_and_skips_reconnect_but_cross_zone_does_not() {
         const HERE: u16 = 2;   // current zone
         const OTHER: u16 = 1;  // a different zone
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
 
         // ── Same-zone translocator ──────────────────────────────────────────────────────────────
         let mut nav = new_loop();
@@ -3008,7 +3008,7 @@ mod tests {
         // The arrival coords are WIRE datum (DB safe coords, model-origin z); the player's internal
         // z is FOOT, so z is converted 33.0 → 33.0 − WIRE_Z_OFFSET on the local apply (#522). x/y
         // are unaffected.
-        assert_eq!([gs.player_x, gs.player_y, gs.player_z], [111.0, 222.0, 33.0 - crate::coord::WIRE_Z_OFFSET],
+        assert_eq!([gs.player_x, gs.player_y, gs.player_z], [111.0, 222.0, 33.0 - eqoxide_core::coord::WIRE_Z_OFFSET],
             "same-zone cross repositions the player (foot datum) so it leaves the region (#368/#522)");
         // #508: the crossing is DONE — the translocator repositioned us in-zone. The stale zone-line
         // goal must be cleared so the walker does NOT resume toward it and drift across a DIFFERENT
@@ -3020,7 +3020,7 @@ mod tests {
             "same-zone cross must flag the echo so the receive side skips the world reconnect (#368)");
         // Flag is consume-once.
         assert!(!nav.take_same_zone_reposition(), "the reposition flag is consumed exactly once");
-        assert!(stream.sent_app_packets().iter().any(|(op, _)| *op == crate::eq_net::protocol::OP_ZONE_CHANGE),
+        assert!(stream.sent_app_packets().iter().any(|(op, _)| *op == crate::protocol::OP_ZONE_CHANGE),
             "a same-zone cross still sends OP_ZONE_CHANGE (so the server repositions us)");
 
         // ── Genuine cross-zone line ─────────────────────────────────────────────────────────────
@@ -3062,7 +3062,7 @@ mod tests {
     }
 
     fn new_loop() -> ActionLoop {
-        let g: crate::ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::GroupSnapshot::default()));
+        let g: eqoxide_ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
         test_action_loop(g)
     }
 
@@ -3082,7 +3082,7 @@ mod tests {
         gs.coin = [0, 0, 0, 100];
         gs.coin_confirmed = true; // a real coin reading had landed, so coin_verified() started true
         gs.merchant_open = Some(11);
-        gs.merchant_items.push(crate::game_state::MerchantItem {
+        gs.merchant_items.push(eqoxide_core::game_state::MerchantItem {
             merchant_slot: 3, item_id: 1, name: "Rusty Dagger".into(), icon: 0, price: 5, quantity: 1,
         });
         gs
@@ -3094,7 +3094,7 @@ mod tests {
     #[tokio::test]
     async fn awaited_buy_resolves_on_the_shop_echo_with_the_real_receipt() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_buy_gs();
 
         let (tx, resp) = tokio::sync::oneshot::channel();
@@ -3111,7 +3111,7 @@ mod tests {
 
         assert_eq!(
             resp.await.unwrap(),
-            crate::command_state::CommandResult::Resolved(crate::command_state::BuyOk {
+            eqoxide_command::CommandResult::Resolved(eqoxide_command::BuyOk {
                 // 100c − 5c = 95c, which `spend_coin` normalises to 9 silver 5 copper.
                 item_name: "Rusty Dagger".into(), price: 5, coin_after: [0, 0, 9, 5],
             }),
@@ -3124,7 +3124,7 @@ mod tests {
     #[tokio::test]
     async fn awaited_buy_ignores_a_shop_echo_for_a_different_slot() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_buy_gs();
 
         let (tx, mut resp) = tokio::sync::oneshot::channel();
@@ -3138,7 +3138,7 @@ mod tests {
 
         // The correct echo still resolves it.
         nav.fulfill_buy_ok(&gs, &buy_echo(11, 3, 5));
-        assert!(matches!(resp.try_recv(), Ok(crate::command_state::CommandResult::Resolved(_))));
+        assert!(matches!(resp.try_recv(), Ok(eqoxide_command::CommandResult::Resolved(_))));
     }
 
     /// REFUSAL: an OP_ShopEndConfirm while a buy is parked resolves it to `Refused` (a REAL negative
@@ -3146,7 +3146,7 @@ mod tests {
     #[tokio::test]
     async fn awaited_buy_refused_on_shop_end_confirm() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_buy_gs();
 
         let (tx, resp) = tokio::sync::oneshot::channel();
@@ -3154,7 +3154,7 @@ mod tests {
         nav.drain_merchant(&mut stream, &mut gs);
 
         nav.fulfill_buy_refused();
-        assert!(matches!(resp.await.unwrap(), crate::command_state::CommandResult::Refused(_)));
+        assert!(matches!(resp.await.unwrap(), eqoxide_command::CommandResult::Refused(_)));
         assert!(nav.pending_buy.is_none());
     }
 
@@ -3166,7 +3166,7 @@ mod tests {
     #[tokio::test]
     async fn silent_buy_never_resolves_and_leaves_coin_unverified() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_buy_gs();
 
         let (tx, mut resp) = tokio::sync::oneshot::channel();
@@ -3189,7 +3189,7 @@ mod tests {
     #[tokio::test]
     async fn zone_change_reaps_a_parked_buy_as_unconfirmed() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_buy_gs();
 
         let (tx, resp) = tokio::sync::oneshot::channel();
@@ -3202,7 +3202,7 @@ mod tests {
         nav.sync_zone_points(&gs);
 
         assert!(nav.pending_buy.is_none(), "the parked buy must be cleared on a zone change");
-        assert_eq!(resp.await.unwrap(), crate::command_state::CommandResult::Unconfirmed);
+        assert_eq!(resp.await.unwrap(), eqoxide_command::CommandResult::Unconfirmed);
     }
 
     /// SINGLETON-IN-FLIGHT / NO MIS-ATTRIBUTION (#448 review). Two awaited buys of the SAME
@@ -3215,7 +3215,7 @@ mod tests {
     #[tokio::test]
     async fn a_second_awaited_buy_is_rejected_in_flight_so_the_echo_cannot_be_mis_attributed() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_buy_gs();
 
         // Buy A parks.
@@ -3229,7 +3229,7 @@ mod tests {
         nav.command.request_buy_await(11, 3, tx_b);
         nav.drain_merchant(&mut stream, &mut gs);
         match resp_b.await.unwrap() {
-            crate::command_state::CommandResult::Refused(reason) =>
+            eqoxide_command::CommandResult::Refused(reason) =>
                 assert!(reason.contains("already in flight"), "B must be told a buy is in flight, got: {reason}"),
             other => panic!("a second in-flight buy must be Refused, not {other:?} (mis-attribution risk)"),
         }
@@ -3239,7 +3239,7 @@ mod tests {
         let echo = buy_echo(11, 3, 5);
         apply_packet(&mut gs, &AppPacket { opcode: OP_SHOP_PLAYER_BUY, payload: echo.clone() });
         nav.fulfill_buy_ok(&gs, &echo);
-        assert!(matches!(resp_a.await.unwrap(), crate::command_state::CommandResult::Resolved(_)),
+        assert!(matches!(resp_a.await.unwrap(), eqoxide_command::CommandResult::Resolved(_)),
             "the echo must resolve the FIRST (parked) buy, not the rejected second one");
         assert!(nav.pending_buy.is_none(), "the parked buy is consumed once");
     }
@@ -3269,7 +3269,7 @@ mod tests {
     #[tokio::test]
     async fn awaited_open_resolves_on_the_shop_echo_command_1() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_open_gs();
 
         let (tx, resp) = tokio::sync::oneshot::channel();
@@ -3283,7 +3283,7 @@ mod tests {
 
         assert_eq!(
             resp.await.unwrap(),
-            crate::command_state::CommandResult::Resolved(crate::command_state::OpenOk { merchant_id: 11 }),
+            eqoxide_command::CommandResult::Resolved(eqoxide_command::OpenOk { merchant_id: 11 }),
         );
         assert!(nav.pending_open.is_none(), "pending_open must be consumed exactly once");
     }
@@ -3293,7 +3293,7 @@ mod tests {
     #[tokio::test]
     async fn awaited_open_ignores_a_shop_echo_for_a_different_merchant() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_open_gs();
 
         let (tx, mut resp) = tokio::sync::oneshot::channel();
@@ -3307,7 +3307,7 @@ mod tests {
 
         // The correct echo still resolves it.
         nav.fulfill_open(&open_echo(11, 1));
-        assert!(matches!(resp.try_recv(), Ok(crate::command_state::CommandResult::Resolved(_))));
+        assert!(matches!(resp.try_recv(), Ok(eqoxide_command::CommandResult::Resolved(_))));
     }
 
     /// REFUSAL: an OP_ShopRequest echo with command=0 while an open is parked resolves it to
@@ -3316,7 +3316,7 @@ mod tests {
     #[tokio::test]
     async fn awaited_open_refused_on_shop_echo_command_0() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_open_gs();
 
         let (tx, resp) = tokio::sync::oneshot::channel();
@@ -3326,7 +3326,7 @@ mod tests {
         let echo = open_echo(11, 0);
         apply_packet(&mut gs, &AppPacket { opcode: OP_SHOP_REQUEST, payload: echo.clone() });
         nav.fulfill_open(&echo);
-        assert!(matches!(resp.await.unwrap(), crate::command_state::CommandResult::Refused(_)));
+        assert!(matches!(resp.await.unwrap(), eqoxide_command::CommandResult::Refused(_)));
         assert!(nav.pending_open.is_none());
     }
 
@@ -3340,7 +3340,7 @@ mod tests {
     #[tokio::test]
     async fn silent_open_never_resolves() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_open_gs();
 
         let (tx, mut resp) = tokio::sync::oneshot::channel();
@@ -3361,7 +3361,7 @@ mod tests {
     #[tokio::test]
     async fn zone_change_reaps_a_parked_open_as_unconfirmed() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_open_gs();
 
         let (tx, resp) = tokio::sync::oneshot::channel();
@@ -3373,7 +3373,7 @@ mod tests {
         nav.sync_zone_points(&gs);
 
         assert!(nav.pending_open.is_none(), "the parked open must be cleared on a zone change");
-        assert_eq!(resp.await.unwrap(), crate::command_state::CommandResult::Unconfirmed);
+        assert_eq!(resp.await.unwrap(), eqoxide_command::CommandResult::Unconfirmed);
     }
 
     /// SINGLETON-IN-FLIGHT / NO MIS-ATTRIBUTION. Two awaited opens of the SAME merchant, back-to-back
@@ -3382,7 +3382,7 @@ mod tests {
     #[tokio::test]
     async fn a_second_awaited_open_is_rejected_in_flight_so_the_echo_cannot_be_mis_attributed() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_open_gs();
 
         let (tx_a, resp_a) = tokio::sync::oneshot::channel();
@@ -3394,7 +3394,7 @@ mod tests {
         nav.command.request_open_await(11, tx_b);
         nav.drain_merchant(&mut stream, &mut gs);
         match resp_b.await.unwrap() {
-            crate::command_state::CommandResult::Refused(reason) =>
+            eqoxide_command::CommandResult::Refused(reason) =>
                 assert!(reason.contains("already in flight"), "B must be told an open is in flight, got: {reason}"),
             other => panic!("a second in-flight open must be Refused, not {other:?} (mis-attribution risk)"),
         }
@@ -3403,7 +3403,7 @@ mod tests {
         let echo = open_echo(11, 1);
         apply_packet(&mut gs, &AppPacket { opcode: OP_SHOP_REQUEST, payload: echo.clone() });
         nav.fulfill_open(&echo);
-        assert!(matches!(resp_a.await.unwrap(), crate::command_state::CommandResult::Resolved(_)),
+        assert!(matches!(resp_a.await.unwrap(), eqoxide_command::CommandResult::Resolved(_)),
             "the echo must resolve the FIRST (parked) open, not the rejected second one");
         assert!(nav.pending_open.is_none(), "the parked open is consumed once");
     }
@@ -3418,12 +3418,12 @@ mod tests {
     fn seed_cast_gs() -> GameState {
         let mut gs = GameState::new();
         gs.player_id = 42;
-        gs.mem_spells = [crate::game_state::EMPTY_GEM; 9];
+        gs.mem_spells = [eqoxide_core::game_state::EMPTY_GEM; 9];
         gs.mem_spells[2] = 202; // gem 2 holds a real spell so the cast STARTS
         gs
     }
 
-    use crate::command_state::{CastEnd, CommandResult};
+    use eqoxide_command::{CastEnd, CommandResult};
 
     /// SUCCESS: an awaited cast, parked by the drain, then RESOLVED as completed when `last_cast`
     /// transitions → `Resolved(CastEnd{outcome:"completed"})` carrying the real spell. `pending_cast`
@@ -3431,11 +3431,11 @@ mod tests {
     #[tokio::test]
     async fn awaited_cast_resolves_completed_on_the_last_cast_transition() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_cast_gs();
 
         let (tx, resp) = tokio::sync::oneshot::channel();
-        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
+        nav.command.request_cast_await(eqoxide_ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
         nav.drain_cast(&mut stream, &mut gs);
         assert!(nav.pending_cast.is_some(), "the awaited cast must be parked after the drain");
         // Nothing has resolved yet — fulfil is a no-op while the cast is genuinely in flight.
@@ -3462,11 +3462,11 @@ mod tests {
     #[tokio::test]
     async fn awaited_cast_fizzle_resolves_fizzled_never_completed() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_cast_gs();
 
         let (tx, resp) = tokio::sync::oneshot::channel();
-        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
+        nav.command.request_cast_await(eqoxide_ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
         nav.drain_cast(&mut stream, &mut gs);
         gs.finish_cast(202, "cast_fizzled", "Your spell fizzles!");
         nav.fulfill_cast(&gs);
@@ -3483,11 +3483,11 @@ mod tests {
     #[tokio::test]
     async fn awaited_cast_interrupt_resolves_interrupted() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_cast_gs();
 
         let (tx, resp) = tokio::sync::oneshot::channel();
-        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
+        nav.command.request_cast_await(eqoxide_ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
         nav.drain_cast(&mut stream, &mut gs);
         gs.finish_cast(202, "cast_interrupted", "Your spell is interrupted.");
         nav.fulfill_cast(&gs);
@@ -3502,11 +3502,11 @@ mod tests {
     #[tokio::test]
     async fn awaited_cast_empty_gem_is_refused_immediately_and_never_parks() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_cast_gs(); // gem 5 is empty
 
         let (tx, resp) = tokio::sync::oneshot::channel();
-        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 5, target_id: None, item_slot: None }, tx);
+        nav.command.request_cast_await(eqoxide_ipc::CastRequest { gem: 5, target_id: None, item_slot: None }, tx);
         nav.drain_cast(&mut stream, &mut gs);
         assert!(nav.pending_cast.is_none(), "an empty-gem cast must NOT park — it never started");
         match resp.await.unwrap() {
@@ -3520,11 +3520,11 @@ mod tests {
     #[tokio::test]
     async fn awaited_cast_silent_stays_parked_never_auto_succeeds() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_cast_gs();
 
         let (tx, mut resp) = tokio::sync::oneshot::channel();
-        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
+        nav.command.request_cast_await(eqoxide_ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
         nav.drain_cast(&mut stream, &mut gs);
         // No outcome recorded. Many fulfil passes must not resolve anything.
         for _ in 0..5 { nav.fulfill_cast(&gs); }
@@ -3540,18 +3540,18 @@ mod tests {
     #[tokio::test]
     async fn a_ui_never_started_cast_does_not_resolve_a_parked_awaited_cast() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_cast_gs(); // gem 2 real, gem 5 empty
 
         // Awaited cast parks (gem 2 starts).
         let (tx, mut resp) = tokio::sync::oneshot::channel();
-        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
+        nav.command.request_cast_await(eqoxide_ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
         nav.drain_cast(&mut stream, &mut gs);
         assert!(nav.pending_cast.is_some(), "the awaited cast must be parked");
 
         // A UI fire-and-forget cast of an EMPTY gem arrives on the same tick's next drain. Its
         // client-side never-started write must be suppressed so it can't cross-talk into the park.
-        nav.command.request_cast(crate::ipc::CastRequest { gem: 5, target_id: None, item_slot: None });
+        nav.command.request_cast(eqoxide_ipc::CastRequest { gem: 5, target_id: None, item_slot: None });
         nav.drain_cast(&mut stream, &mut gs);
         nav.fulfill_cast(&gs);
         assert!(nav.pending_cast.is_some(),
@@ -3573,11 +3573,11 @@ mod tests {
     #[tokio::test]
     async fn awaited_cast_server_refusal_after_park_is_refused() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_cast_gs();
 
         let (tx, resp) = tokio::sync::oneshot::channel();
-        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
+        nav.command.request_cast_await(eqoxide_ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
         nav.drain_cast(&mut stream, &mut gs);
         gs.finish_cast(0, "cast_failed", "Insufficient Mana to cast this spell!");
         nav.fulfill_cast(&gs);
@@ -3591,11 +3591,11 @@ mod tests {
     #[tokio::test]
     async fn awaited_cast_unexplained_end_is_unconfirmed() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_cast_gs();
 
         let (tx, resp) = tokio::sync::oneshot::channel();
-        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
+        nav.command.request_cast_await(eqoxide_ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
         nav.drain_cast(&mut stream, &mut gs);
         gs.finish_cast(202, "cast_ended_unexplained", "The cast ended with no outcome reported.");
         nav.fulfill_cast(&gs);
@@ -3608,16 +3608,16 @@ mod tests {
     #[tokio::test]
     async fn a_second_awaited_cast_while_parked_is_refused() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_cast_gs();
 
         let (tx_a, resp_a) = tokio::sync::oneshot::channel();
-        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx_a);
+        nav.command.request_cast_await(eqoxide_ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx_a);
         nav.drain_cast(&mut stream, &mut gs);
         assert!(nav.pending_cast.is_some(), "cast A must be parked");
 
         let (tx_b, resp_b) = tokio::sync::oneshot::channel();
-        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx_b);
+        nav.command.request_cast_await(eqoxide_ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx_b);
         nav.drain_cast(&mut stream, &mut gs);
         match resp_b.await.unwrap() {
             CommandResult::Refused(reason) => assert!(reason.contains("already in flight"), "reason: {reason}"),
@@ -3637,14 +3637,14 @@ mod tests {
     #[tokio::test]
     async fn awaited_cast_ignores_a_stale_prior_outcome() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_cast_gs();
 
         // A previous cast already left a completed outcome in `last_cast` BEFORE we park.
         gs.finish_cast(700, "cast_completed", "You have finished casting an earlier spell.");
 
         let (tx, mut resp) = tokio::sync::oneshot::channel();
-        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
+        nav.command.request_cast_await(eqoxide_ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
         nav.drain_cast(&mut stream, &mut gs);
         nav.fulfill_cast(&gs);
         assert!(nav.pending_cast.is_some(), "a stale prior outcome must not resolve the new cast");
@@ -3656,11 +3656,11 @@ mod tests {
     #[tokio::test]
     async fn awaited_cast_reaped_unconfirmed_on_zone_change() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_cast_gs();
 
         let (tx, resp) = tokio::sync::oneshot::channel();
-        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
+        nav.command.request_cast_await(eqoxide_ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx);
         nav.drain_cast(&mut stream, &mut gs);
         assert!(nav.pending_cast.is_some());
         nav.reap_pending_cast();
@@ -3685,7 +3685,7 @@ mod tests {
     #[tokio::test]
     async fn buy_stranded_slot_is_reaped_after_the_deadline_and_a_later_buy_is_admitted() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_buy_gs();
 
         // Park buy A (the silent/insufficient-funds path: no echo will ever come).
@@ -3722,7 +3722,7 @@ mod tests {
     #[tokio::test]
     async fn open_stranded_slot_is_reaped_after_the_deadline_and_a_later_open_is_admitted() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_open_gs();
 
         // Park open A (the non-merchant/out-of-range path: NO echo of any kind ever arrives).
@@ -3759,12 +3759,12 @@ mod tests {
     #[tokio::test]
     async fn cast_stranded_slot_is_reaped_after_the_deadline_and_a_later_cast_is_admitted() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_cast_gs();
 
         // Park cast A (the silently-dropped path: no `last_cast` transition ever comes).
         let (tx_a, _resp_a) = tokio::sync::oneshot::channel();
-        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx_a);
+        nav.command.request_cast_await(eqoxide_ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx_a);
         nav.drain_cast(&mut stream, &mut gs);
         assert!(nav.pending_cast.is_some(), "cast A must be parked");
 
@@ -3773,7 +3773,7 @@ mod tests {
         nav.reap_expired_pending();
         assert!(nav.pending_cast.is_some(), "an un-expired cast must NOT be reaped");
         let (tx_b, resp_b) = tokio::sync::oneshot::channel();
-        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx_b);
+        nav.command.request_cast_await(eqoxide_ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx_b);
         nav.drain_cast(&mut stream, &mut gs);
         match resp_b.await.unwrap() {
             CommandResult::Refused(reason) => assert!(reason.contains("already in flight"),
@@ -3787,7 +3787,7 @@ mod tests {
         nav.reap_expired_pending();
         assert!(nav.pending_cast.is_none(), "an expired stranded cast must be reaped");
         let (tx_c, mut resp_c) = tokio::sync::oneshot::channel();
-        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx_c);
+        nav.command.request_cast_await(eqoxide_ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx_c);
         nav.drain_cast(&mut stream, &mut gs);
         assert!(nav.pending_cast.is_some(), "cast C must be ADMITTED once the stranded slot is reaped");
         assert!(resp_c.try_recv().is_err(), "C must be in flight, not 409-refused");
@@ -3805,7 +3805,7 @@ mod tests {
     #[tokio::test]
     async fn a_stale_buy_echo_after_reap_is_not_mis_credited_to_a_readmitted_same_key_buy() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_buy_gs();
 
         // Buy A (merchant 11, slot 3) parks, then is time-reaped past the deadline.
@@ -3844,7 +3844,7 @@ mod tests {
     #[tokio::test]
     async fn a_stale_open_echo_after_reap_is_not_mis_credited_to_a_readmitted_same_merchant_open() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_open_gs();
 
         // Open A (merchant 11) parks, then is time-reaped.
@@ -3872,12 +3872,12 @@ mod tests {
     #[tokio::test]
     async fn a_cast_outcome_after_reap_is_not_mis_credited_to_a_readmitted_cast() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_cast_gs();
 
         // Cast A parks, then is time-reaped (cast has NO content key).
         let (tx_a, _resp_a) = tokio::sync::oneshot::channel();
-        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx_a);
+        nav.command.request_cast_await(eqoxide_ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx_a);
         nav.drain_cast(&mut stream, &mut gs);
         nav.pending_cast.as_mut().unwrap().sent_at = Instant::now() - (CAST_PENDING_REAP + Duration::from_secs(1));
         nav.reap_expired_pending();
@@ -3885,7 +3885,7 @@ mod tests {
 
         // Cast B is admitted and parks.
         let (tx_b, mut resp_b) = tokio::sync::oneshot::channel();
-        nav.command.request_cast_await(crate::ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx_b);
+        nav.command.request_cast_await(eqoxide_ipc::CastRequest { gem: 2, target_id: None, item_slot: None }, tx_b);
         nav.drain_cast(&mut stream, &mut gs);
         assert!(nav.pending_cast.is_some(), "B must be admitted");
 
@@ -3914,7 +3914,7 @@ mod tests {
     fn seed_give_gs() -> GameState {
         let mut gs = GameState::new();
         gs.player_id = 42;
-        gs.inventory.push(crate::game_state::InvItem {
+        gs.inventory.push(eqoxide_core::game_state::InvItem {
             slot: 23, item_id: BONE_CHIPS_ID, name: "Bone Chips".into(), ..Default::default()
         });
         gs
@@ -3926,7 +3926,7 @@ mod tests {
     #[tokio::test]
     async fn awaited_give_resolves_on_finish_trade_with_the_receipt() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_give_gs();
 
         let (tx, resp) = tokio::sync::oneshot::channel();
@@ -3954,7 +3954,7 @@ mod tests {
 
         assert_eq!(
             resp.await.unwrap(),
-            crate::command_state::CommandResult::Resolved(crate::command_state::GiveOk {
+            eqoxide_command::CommandResult::Resolved(eqoxide_command::GiveOk {
                 npc_id: 11, item_name: "Bone Chips".into(),
             }),
         );
@@ -3973,7 +3973,7 @@ mod tests {
     #[tokio::test]
     async fn awaited_give_finish_but_item_returned_is_unconfirmed_never_success() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_give_gs();
 
         let (tx, mut resp) = tokio::sync::oneshot::channel();
@@ -3990,7 +3990,7 @@ mod tests {
         nav.note_finish_trade();
         // The returned item lands on the CURSOR (slot 33) under its REAL item_id, AFTER the finish — the
         // crux of the bug. The verdict keys on cursor+item_id, so this is the positive "returned" signal.
-        gs.inventory.push(crate::game_state::InvItem {
+        gs.inventory.push(eqoxide_core::game_state::InvItem {
             slot: SLOT_CURSOR as i32, item_id: BONE_CHIPS_ID, name: "Bone Chips".into(), ..Default::default()
         });
 
@@ -4000,7 +4000,7 @@ mod tests {
                 "the give must not resolve before the returned-item watch window elapses");
             nav.tick_give(&mut stream, &mut gs);
         }
-        assert_eq!(resp.try_recv(), Ok(crate::command_state::CommandResult::Unconfirmed),
+        assert_eq!(resp.try_recv(), Ok(eqoxide_command::CommandResult::Unconfirmed),
             "a give whose item was RETURNED to the cursor is NOT a success — never a 200");
         assert!(nav.give_state.is_none(), "give_state must be consumed exactly once");
     }
@@ -4017,11 +4017,11 @@ mod tests {
     #[tokio::test]
     async fn awaited_give_success_with_a_duplicate_in_a_bag_slot_still_resolves_200() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_give_gs();
         // A pre-existing DUPLICATE of the SAME item (same id + name) in another general slot. It is NOT
         // on the cursor, so it has nothing to do with whether THIS give transferred.
-        gs.inventory.push(crate::game_state::InvItem {
+        gs.inventory.push(eqoxide_core::game_state::InvItem {
             slot: 24, item_id: BONE_CHIPS_ID, name: "Bone Chips".into(), ..Default::default()
         });
 
@@ -4039,7 +4039,7 @@ mod tests {
 
         assert_eq!(
             resp.await.unwrap(),
-            crate::command_state::CommandResult::Resolved(crate::command_state::GiveOk {
+            eqoxide_command::CommandResult::Resolved(eqoxide_command::GiveOk {
                 npc_id: 11, item_name: "Bone Chips".into(),
             }),
             "a real success must be 200 even with a same-item duplicate elsewhere in the pack — no false 202",
@@ -4061,7 +4061,7 @@ mod tests {
     #[tokio::test]
     async fn awaited_give_unidentifiable_at_send_is_unconfirmed_never_false_200() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_give_gs();
 
         // Give from slot 5, which is EMPTY in the mirror (desync): item_id cannot be captured → None.
@@ -4076,12 +4076,12 @@ mod tests {
         // now, from the server) — exactly the case the old name-fallback would have mis-read as success.
         apply_packet(&mut gs, &AppPacket { opcode: OP_FINISH_TRADE, payload: vec![] });
         nav.note_finish_trade();
-        gs.inventory.push(crate::game_state::InvItem {
+        gs.inventory.push(eqoxide_core::game_state::InvItem {
             slot: SLOT_CURSOR as i32, item_id: BONE_CHIPS_ID, name: "Bone Chips".into(), ..Default::default()
         });
         for _ in 0..GIVE_FINISH_SETTLE_TICKS { nav.tick_give(&mut stream, &mut gs); }
 
-        assert_eq!(resp.try_recv(), Ok(crate::command_state::CommandResult::Unconfirmed),
+        assert_eq!(resp.try_recv(), Ok(eqoxide_command::CommandResult::Unconfirmed),
             "an unidentifiable give (mirror desync at send) can never be a confident 200 — honest 202");
         assert!(nav.give_state.is_none());
     }
@@ -4093,7 +4093,7 @@ mod tests {
     #[tokio::test]
     async fn awaited_give_with_no_ack_times_out_to_unconfirmed_never_success() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_give_gs();
 
         let (tx, mut resp) = tokio::sync::oneshot::channel();
@@ -4105,7 +4105,7 @@ mod tests {
                 "the give must not resolve before the timeout — never a fabricated success");
             nav.tick_give(&mut stream, &mut gs);
         }
-        assert_eq!(resp.try_recv(), Ok(crate::command_state::CommandResult::Unconfirmed),
+        assert_eq!(resp.try_recv(), Ok(eqoxide_command::CommandResult::Unconfirmed),
             "a give that was never acked is honestly UNKNOWN, never success");
         assert!(nav.give_state.is_none(), "the aborted give must clear its state");
     }
@@ -4117,7 +4117,7 @@ mod tests {
     #[tokio::test]
     async fn awaited_give_item_mismatch_no_finish_is_unconfirmed() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_give_gs();
 
         let (tx, mut resp) = tokio::sync::oneshot::channel();
@@ -4132,7 +4132,7 @@ mod tests {
                 "a give awaiting finish must not resolve early");
             nav.tick_give(&mut stream, &mut gs);
         }
-        assert_eq!(resp.try_recv(), Ok(crate::command_state::CommandResult::Unconfirmed),
+        assert_eq!(resp.try_recv(), Ok(eqoxide_command::CommandResult::Unconfirmed),
             "an item-mismatch turn-in (no OP_FinishTrade) is honestly UNKNOWN, not success");
         assert!(nav.give_state.is_none());
     }
@@ -4147,7 +4147,7 @@ mod tests {
     #[tokio::test]
     async fn awaited_give_phase2_timeout_cancels_trade_and_is_unconfirmed() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_give_gs(); // player_id = 42
 
         let (tx, mut resp) = tokio::sync::oneshot::channel();
@@ -4165,7 +4165,7 @@ mod tests {
         }
 
         // (2) Honest outcome: still UNKNOWN — the cancel does not manufacture a success or a refusal.
-        assert_eq!(resp.try_recv(), Ok(crate::command_state::CommandResult::Unconfirmed),
+        assert_eq!(resp.try_recv(), Ok(eqoxide_command::CommandResult::Unconfirmed),
             "a phase-2 finish-timeout is honestly UNKNOWN even though we cancel the trade");
         assert!(nav.give_state.is_none(), "the timed-out give must clear its state");
 
@@ -4187,7 +4187,7 @@ mod tests {
     #[tokio::test]
     async fn a_second_awaited_give_is_rejected_in_flight_and_leaves_the_first() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_give_gs();
 
         // Give A parks.
@@ -4201,7 +4201,7 @@ mod tests {
         nav.command.request_give_await(11, 23, tx_b);
         nav.tick_give(&mut stream, &mut gs);
         match resp_b.await.unwrap() {
-            crate::command_state::CommandResult::Refused(reason) =>
+            eqoxide_command::CommandResult::Refused(reason) =>
                 assert!(reason.contains("already in flight"), "B must be told a give is in flight, got: {reason}"),
             other => panic!("a second in-flight give must be Refused, not {other:?}"),
         }
@@ -4213,7 +4213,7 @@ mod tests {
         apply_packet(&mut gs, &AppPacket { opcode: OP_FINISH_TRADE, payload: vec![] });
         nav.note_finish_trade();
         for _ in 0..GIVE_FINISH_SETTLE_TICKS { nav.tick_give(&mut stream, &mut gs); } // #486 settle
-        assert!(matches!(resp_a.await.unwrap(), crate::command_state::CommandResult::Resolved(_)),
+        assert!(matches!(resp_a.await.unwrap(), eqoxide_command::CommandResult::Resolved(_)),
             "the finish must resolve the FIRST (parked) give, not the rejected second one");
     }
 
@@ -4223,7 +4223,7 @@ mod tests {
     #[tokio::test]
     async fn zone_change_reaps_a_parked_give_as_unconfirmed() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_give_gs();
 
         let (tx, resp) = tokio::sync::oneshot::channel();
@@ -4235,7 +4235,7 @@ mod tests {
         nav.sync_zone_points(&gs);
 
         assert!(nav.give_state.is_none(), "the parked give must be cleared on a zone change");
-        assert_eq!(resp.await.unwrap(), crate::command_state::CommandResult::Unconfirmed);
+        assert_eq!(resp.await.unwrap(), eqoxide_command::CommandResult::Unconfirmed);
     }
 
     /// THE TWO-TIMEOUT ORDERING LANDMINE (#448): the net-side worst-case verdict time (phase 1 + phase
@@ -4247,7 +4247,7 @@ mod tests {
         let net_ms = (GIVE_ACK_TIMEOUT_TICKS + GIVE_FINISH_TIMEOUT_TICKS) as u128 * NAV_TICK_MS;
         // Reference the real HTTP constant (not a magic literal) so a future edit to either side is
         // caught here (#475 review nit).
-        let http_ms = crate::http::interact::GIVE_HTTP_TIMEOUT_SECS as u128 * 1000;
+        let http_ms = eqoxide_http::interact::GIVE_HTTP_TIMEOUT_SECS as u128 * 1000;
         assert!(net_ms < http_ms,
             "net worst-case verdict ({net_ms}ms) must land before the HTTP timeout ({http_ms}ms) so the \
              net verdict wins — otherwise the caller gets a vague HTTP-elapsed 202 instead of the real outcome");
@@ -4264,7 +4264,7 @@ mod tests {
     #[tokio::test]
     async fn a_late_finish_cannot_misattribute_to_a_second_give() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_give_gs();
 
         // Fire-and-forget give to NPC C (11) begins and reaches phase 2 (accept sent) — HELD in flight.
@@ -4281,7 +4281,7 @@ mod tests {
         nav.command.request_give_await(22, 23, tx_d);
         nav.tick_give(&mut stream, &mut gs);
         match resp_d.try_recv() {
-            Ok(crate::command_state::CommandResult::Refused(_)) => {}
+            Ok(eqoxide_command::CommandResult::Refused(_)) => {}
             other => panic!("D must be synchronously Refused while C is in flight (else C's finish \
                              misattributes to D) — got {other:?}"),
         }
@@ -4302,7 +4302,7 @@ mod tests {
     #[tokio::test]
     async fn fire_and_forget_single_give_completes_on_finish() {
         let mut nav = new_loop();
-        let (mut stream, _rx) = crate::eq_net::transport::test_stream(0, 0).await;
+        let (mut stream, _rx) = crate::transport::test_stream(0, 0).await;
         let mut gs = seed_give_gs();
 
         nav.command.request_give(11, 23);
@@ -4325,7 +4325,7 @@ mod tests {
         let seed_nav = |nav: &mut ActionLoop| {
             *nav.nav.goto_target.lock().unwrap() = Some((100.0, 200.0, 0.0));
             *nav.nav.goto_entity.lock().unwrap() = Some("a bat".into());
-            *nav.controller.nav_intent.lock().unwrap() = Some(crate::movement::MoveIntent::default());
+            *nav.controller.nav_intent.lock().unwrap() = Some(eqoxide_ipc::MoveIntent::default());
             *nav.controller.nav_path_view.lock().unwrap() = (vec![[0.0, 0.0, 0.0]], vec![[0.0, 0.0, 0.0]]);
             nav.walker.path = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]];
             nav.walker.local_path = vec![[0.0, 0.0, 0.0]];
@@ -4346,7 +4346,7 @@ mod tests {
             assert_eq!(*nav.nav.nav_state.lock().unwrap(), "idle");
         };
         let new_nav = || {
-            let g: crate::ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::GroupSnapshot::default()));
+            let g: eqoxide_ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
             test_action_loop(g)
         };
 
@@ -4392,14 +4392,14 @@ mod tests {
         // #248: a destination + route left over from the PREVIOUS zone must not survive a crossing —
         // in the new zone's coordinate space they aim the walker at a corner near the arrival point
         // and wedge it there. sync_zone_points must clear the goal, path, and recovery state.
-        let group: crate::ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::GroupSnapshot::default()));
+        let group: eqoxide_ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
         let mut nav = test_action_loop(group);
 
         // Simulate an in-progress nav in the OLD zone.
         nav.current_zone = "gfaydark".into();
         *nav.nav.goto_target.lock().unwrap() = Some((100.0, 200.0, 0.0));
         *nav.nav.goto_entity.lock().unwrap() = Some("a bat".into());
-        *nav.controller.nav_intent.lock().unwrap() = Some(crate::movement::MoveIntent::default());
+        *nav.controller.nav_intent.lock().unwrap() = Some(eqoxide_ipc::MoveIntent::default());
         *nav.controller.nav_path_view.lock().unwrap() = (vec![[0.0, 0.0, 0.0]], vec![[0.0, 0.0, 0.0]]);
         nav.walker.path = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]];
         nav.walker.local_path = vec![[0.0, 0.0, 0.0]];
@@ -4445,11 +4445,11 @@ mod tests {
     /// budget — only real journey progress (in `tick`) does that.
     #[test]
     fn proactive_replan_arms_and_counts_toward_the_oscillation_budget() {
-        use crate::nav::collision::{LocalOutcome, NoRoute};
-        let group: crate::ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::GroupSnapshot::default()));
+        use eqoxide_nav::collision::{LocalOutcome, NoRoute};
+        let group: eqoxide_ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
         let mut nav = test_action_loop(group);
 
-        let nwt = |start: [f32; 3]| crate::nav::planner::LocalReply {
+        let nwt = |start: [f32; 3]| eqoxide_nav::planner::LocalReply {
             gen: 1, start, goal: [start[0] + 40.0, start[1], start[2]],
             outcome: LocalOutcome::NoWayThrough { steer: vec![start], why: NoRoute::SearchClosed },
             plan_us: 100,
@@ -4467,7 +4467,7 @@ mod tests {
 
         // A Threaded plan ends the local-stuck run but must not forgive the budget (only tick's
         // progress reset does): the fine tier finding one way through does not prove the wedge gone.
-        nav.walker.apply_local_plan(crate::nav::planner::LocalReply {
+        nav.walker.apply_local_plan(eqoxide_nav::planner::LocalReply {
             gen: 2, start: [0.0, 0.0, 0.0], goal: [40.0, 0.0, 0.0],
             outcome: LocalOutcome::Threaded(vec![[0.0, 0.0, 0.0], [40.0, 0.0, 0.0]]), plan_us: 100,
         });
@@ -4480,7 +4480,7 @@ mod tests {
 
     #[test]
     fn sync_group_publishes_own_and_other_member_hp_pct() {
-        use crate::game_state::{Entity, GroupMember};
+        use eqoxide_core::game_state::{Entity, GroupMember};
         let mut gs = GameState::new();
         gs.player_name = "Aldric".into();
         gs.hp_pct = 88.0;
@@ -4496,7 +4496,7 @@ mod tests {
             gender: 0, helm: 0, showhelm: 0, face: 0, hairstyle: 0, haircolor: 0, animation: 100, floating: false,
         });
 
-        let group: crate::ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(crate::ipc::GroupSnapshot::default()));
+        let group: eqoxide_ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
         let nav = test_action_loop(group.clone());
         nav.sync_group(&gs);
 
@@ -4519,7 +4519,7 @@ mod tests {
         assert_eq!(&p[4..8], &(10.0f32).to_le_bytes(), "X field @4 = server east");
         // Z crosses the datum boundary: the caller passes FOOT (3.5), the wire carries the
         // model-origin datum = foot + WIRE_Z_OFFSET (#522).
-        assert_eq!(&p[8..12], &(3.5f32 + crate::coord::WIRE_Z_OFFSET).to_le_bytes(),
+        assert_eq!(&p[8..12], &(3.5f32 + eqoxide_core::coord::WIRE_Z_OFFSET).to_le_bytes(),
             "Z field @8 = foot + WIRE_Z_OFFSET (wire datum)");
         assert_eq!(p[12], 1, "type = Collision (benign; skips teleport/zoneline cheat checks)");
     }

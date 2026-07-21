@@ -359,7 +359,7 @@ pub struct EqStream {
     /// remember to mirror it. That discipline is exactly what failed in review of #343: two of the
     /// four loops didn't mirror, so a >15s world reconnect reported `connected: false` on a healthy
     /// link. Whoever receives the datagram owns the clock — a future loop gets this for free.
-    net_health: crate::ipc::NetHealthShared,
+    net_health: eqoxide_ipc::NetHealthShared,
 }
 
 impl EqStream {
@@ -367,7 +367,7 @@ impl EqStream {
         host: &str,
         port: u16,
         app_tx: mpsc::UnboundedSender<AppPacket>,
-        net_health: crate::ipc::NetHealthShared,
+        net_health: eqoxide_ipc::NetHealthShared,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let peer: SocketAddr = format!("{}:{}", host, port).parse()?;
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
@@ -997,7 +997,7 @@ pub(crate) async fn test_stream(pass1: u8, key: u32) -> (EqStream, mpsc::Unbound
 pub(crate) async fn test_stream_with_health(
     pass1: u8,
     key: u32,
-    net_health: crate::ipc::NetHealthShared,
+    net_health: eqoxide_ipc::NetHealthShared,
 ) -> (EqStream, mpsc::UnboundedReceiver<AppPacket>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1022,7 +1022,7 @@ pub(crate) async fn test_stream_with_health(
 /// peer socket, and the address to send to. (#343)
 #[cfg(test)]
 pub(crate) async fn test_stream_with_peer(
-    net_health: crate::ipc::NetHealthShared,
+    net_health: eqoxide_ipc::NetHealthShared,
 ) -> (EqStream, mpsc::UnboundedReceiver<AppPacket>, UdpSocket, SocketAddr) {
     let (tx, rx) = mpsc::unbounded_channel();
     let peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1052,7 +1052,7 @@ pub(crate) async fn test_stream_with_peer(
 pub(crate) async fn test_stream_with_peer_encoded(
     pass1: u8,
     key: u32,
-    net_health: crate::ipc::NetHealthShared,
+    net_health: eqoxide_ipc::NetHealthShared,
 ) -> (EqStream, mpsc::UnboundedReceiver<AppPacket>, UdpSocket, SocketAddr) {
     let (tx, rx) = mpsc::unbounded_channel();
     let peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1087,7 +1087,7 @@ mod tests {
     /// so that a session-layer ACK — which never becomes an application packet — still counts.
     #[tokio::test]
     async fn poll_recv_stamps_link_liveness_for_any_datagram_even_undecodable_ones() {
-        let net_health: crate::ipc::NetHealthShared = Default::default();
+        let net_health: eqoxide_ipc::NetHealthShared = Default::default();
         // Pretend the link has been quiet for a minute — well past CONN_STALE_SECS.
         net_health.lock().unwrap().last_datagram =
             std::time::Instant::now() - std::time::Duration::from_secs(60);
@@ -1115,7 +1115,7 @@ mod tests {
     /// retry loop bumps `last_tick` so a mid-handshake session stays under `SESSION_STALE_TICK_MS`.
     #[tokio::test]
     async fn connect_keeps_last_tick_fresh_across_a_silent_handshake() {
-        let net_health: crate::ipc::NetHealthShared = Default::default();
+        let net_health: eqoxide_ipc::NetHealthShared = Default::default();
         // Enter the handshake with a STALE tick clock (a full minute), so any freshness afterward can
         // only have come from the retry loop bumping it — not from the Default::now() seed.
         net_health.lock().unwrap().last_tick =
@@ -1136,10 +1136,10 @@ mod tests {
 
         let age = net_health.lock().unwrap().last_tick.elapsed();
         assert!(
-            (age.as_millis() as u64) < crate::http::SESSION_STALE_TICK_MS,
+            (age.as_millis() as u64) < eqoxide_http::SESSION_STALE_TICK_MS,
             "mid-handshake `last_tick` must stay under SESSION_STALE_TICK_MS ({}ms) so the #477 guard \
              does not falsely reject a healthy handshaking session; age was {age:?}",
-            crate::http::SESSION_STALE_TICK_MS,
+            eqoxide_http::SESSION_STALE_TICK_MS,
         );
     }
 
@@ -1156,7 +1156,7 @@ mod tests {
     /// hard-coded 1s it would be just 1. Asserting >= 2 pins the fast-retry cadence in place.
     #[tokio::test]
     async fn connect_retries_session_request_faster_than_once_a_second() {
-        let net_health: crate::ipc::NetHealthShared = Default::default();
+        let net_health: eqoxide_ipc::NetHealthShared = Default::default();
         // A bound but SILENT peer — never answers SESSION_RESPONSE, so `connect` stays retrying.
         let silent_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = silent_peer.local_addr().unwrap();
@@ -1285,7 +1285,7 @@ mod tests {
     #[tokio::test]
     async fn inbound_gap_emits_encoded_out_of_order_then_drains_tail_in_order() {
         let key = 0xA1B2_C3D4u32;
-        let net_health: crate::ipc::NetHealthShared = Default::default();
+        let net_health: eqoxide_ipc::NetHealthShared = Default::default();
         let (mut stream, mut rx, peer, _addr) =
             test_stream_with_peer_encoded(ENCODE_XOR, key, net_health).await;
 
