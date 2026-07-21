@@ -878,10 +878,12 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         // (self gs.player_z, nav, collision) and every agent-facing position reports. Keeping
         // entities in wire datum while self is foot would make /observe report two entities on one
         // plank at heights 3u apart, and feed a 3u-high z into goto-by-name's nav goal (a goal-z/
-        // floor-tier mismatch that wedges nav). Floating entities (boats) skip the server's Z-offset
-        // (Mob::FixZ early-returns for boats — GravityBehavior::Floating), so their wire z is already
-        // surface-level; don't shift them or they sink into the water.
-        e.z = if e.floating { upd.z } else { upd.z - eqoxide_core::coord::WIRE_Z_OFFSET };
+        // floor-tier mismatch that wedges nav). Floating entities — boats AND Flying mobs — skip the
+        // server's Z-offset (Mob::FixZ early-returns for GetIsBoat + flymode==Flying), so their wire
+        // z is already at the reported datum; don't shift them (boats would sink; flying NPCs would
+        // read 3u low — #548). `e.floating` was classified at spawn from flymode/race and persists
+        // here because position updates carry no flymode.
+        e.z = eqoxide_core::coord::wire_z_to_foot(upd.z, e.floating);
         e.heading = upd.heading;
         e.animation = upd.animation;
         tracing::debug!("EQ: npc_pos id={} name={} pos=({:.1},{:.1},{:.1})", sid, e.name, e.x, e.y, e.z);
@@ -2701,10 +2703,14 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
     // Wire→foot datum (#522, see coord::WIRE_Z_OFFSET): the spawn z is the model-origin datum
     // ~3.1u above the feet — subtract to store FOOT, the single datum used internally (self/nav/
     // collision) and reported by every agent-facing position, so entities and self share one frame
-    // (see the else-branch in apply_position_update for the full rationale). Boats/floating entities
-    // skip the server Z-offset, so their wire z is already surface-level — leave it.
-    let floating = crate::protocol::is_boat_race(info.race);
-    let z_foot = if floating { info.z } else { info.z - eqoxide_core::coord::WIRE_Z_OFFSET };
+    // (see the else-branch in apply_position_update for the full rationale). Boats AND Flying mobs
+    // skip the server Z-offset (Mob::FixZ early-returns for both — GetIsBoat + flymode==Flying), so
+    // their wire z is already at the reported datum — leave it (#548: flying NPCs were 3u low because
+    // only boats were excepted). Classified once here and persisted on the Entity, because ongoing
+    // position updates carry no flymode.
+    let floating = eqoxide_core::coord::skips_wire_z_offset(
+        crate::protocol::is_boat_race(info.race), info.flymode);
+    let z_foot = eqoxide_core::coord::wire_z_to_foot(info.z, floating);
     gs.upsert_entity(Entity {
         spawn_id:       info.spawn_id,
         name:           info.name,
@@ -4466,7 +4472,7 @@ mod tests {
             spawn_id: 7, name: name.into(), last_name: String::new(),
             level: 5, npc: 0, gender: 0, race: 1, class_: 1, guild_id: 0xFFFF_FFFF, guild_rank: 0, body_type: 1,
             cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0, stand_state: 100,
-            pet_owner_id: 0, player_state: 64,
+            flymode: 0, pet_owner_id: 0, player_state: 64,
             x: 1.0, y: 2.0, z: 3.0, heading: 0.0, animation: 100,
             equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9],
         };
@@ -4514,7 +4520,7 @@ mod tests {
             spawn_id: 7, name: "Aldric".into(), last_name: String::new(),
             level: 5, npc: 0, gender: 0, race: 1, class_: 1, guild_id: 0xFFFF_FFFF, guild_rank: 0, body_type: 1,
             cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0, stand_state: 100,
-            pet_owner_id: 0, player_state: 64,
+            flymode: 0, pet_owner_id: 0, player_state: 64,
             x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100,
             equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9],
         };
@@ -4640,7 +4646,7 @@ mod tests {
             spawn_id: 42, name: "a".into(), last_name: String::new(),
             level: 5, npc: 1, gender: 0, race: 54, class_: 1, guild_id: 0xFFFF_FFFF, guild_rank: 0, body_type: 1,
             cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0, stand_state: 100,
-            pet_owner_id: 0, player_state: 64,
+            flymode: 0, pet_owner_id: 0, player_state: 64,
             x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100,
             equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9],
         };
@@ -4701,7 +4707,7 @@ mod tests {
             spawn_id: 7, name: name.into(), last_name: String::new(),
             level: 2, npc, gender: 0, race: 1, class_: 1, guild_id: 0xFFFF_FFFF, guild_rank: 0, body_type: 1,
             cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0,
-            stand_state: 100, pet_owner_id: 0, player_state: 64,
+            stand_state: 100, flymode: 0, pet_owner_id: 0, player_state: 64,
             x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100,
             equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9],
         };
@@ -4742,7 +4748,7 @@ mod tests {
             level: 1, npc: 1, gender: 0, race: 240, class_: 1, guild_id: 0xFFFF_FFFF, guild_rank: 0,
             body_type,
             cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0,
-            stand_state: 100, pet_owner_id: 0, player_state: 64,
+            stand_state: 100, flymode: 0, pet_owner_id: 0, player_state: 64,
             x, y, z, heading: 0.0, animation: 100,
             equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9],
         };
@@ -4765,6 +4771,55 @@ mod tests {
         let mut gs = GameState::new();
         register_spawn(&mut gs, mk(1, 0.0, 0.0, 0.0, "a_rat"));
         assert!(gs.world.entities.contains_key(&1496), "a real NPC must still register even at (0,0,0)");
+    }
+
+    #[test]
+    fn flying_npc_z_not_shifted_on_ingest() {
+        // #548 (agent-honesty): a Flying (flymode==1) NPC skips the server's Z-offset (Mob::FixZ
+        // early-returns for it, exactly like a boat), so its wire z is already at the reported datum
+        // and must NOT have WIRE_Z_OFFSET subtracted — otherwise the client reports it ~3u too LOW,
+        // a position falsehood the agent can't detect. A grounded (flymode==0) NPC keeps the shift.
+        use super::{register_spawn, apply_position_update};
+        use crate::protocol::{SpawnInfo, encode_position_update};
+        const OFF: f32 = eqoxide_core::coord::WIRE_Z_OFFSET;
+        let mk = |spawn_id: u32, flymode: u8| SpawnInfo {
+            spawn_id, name: "a_bat".into(), last_name: String::new(),
+            level: 5, npc: 1, gender: 0, race: 54, class_: 1, guild_id: 0xFFFF_FFFF, guild_rank: 0,
+            body_type: 1,
+            cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0,
+            stand_state: 100, flymode, pet_owner_id: 0, player_state: 64,
+            x: 50.0, y: -60.0, z: 100.0, heading: 0.0, animation: 100,
+            equipment: [0u32; 9], equipment_tint: [[0u8; 3]; 9],
+        };
+
+        let mut gs = GameState::new();
+        register_spawn(&mut gs, mk(1, 0)); // grounded
+        register_spawn(&mut gs, mk(2, eqoxide_core::coord::FLYMODE_FLYING)); // flying
+        register_spawn(&mut gs, mk(3, eqoxide_core::coord::FLYMODE_LEVITATING)); // levitating
+
+        let ground = gs.world.entities.get(&1).expect("grounded NPC registered");
+        assert!(!ground.floating, "flymode 0 → not floating");
+        assert!((ground.z - (100.0 - OFF)).abs() < 1e-3,
+            "grounded spawn z must be wire−WIRE_Z_OFFSET (FOOT), got {}", ground.z);
+
+        // The load-bearing #548 assertion: airborne (Flying AND Levitating) z is passed through, NOT
+        // lowered by the offset. Reverting the fix (subtracting for these) turns these RED.
+        for (id, kind) in [(2u32, "flying"), (3u32, "levitating")] {
+            let e = gs.world.entities.get(&id).unwrap_or_else(|| panic!("{kind} NPC registered"));
+            assert!(e.floating, "{kind} → floating (skips server Z-offset)");
+            assert!((e.z - 100.0).abs() < 1e-3,
+                "{kind} spawn z must be the wire z unshifted (#548), got {} (bug would give {})",
+                e.z, 100.0 - OFF);
+        }
+
+        // The classification persists to position updates (which carry no flymode).
+        apply_position_update(&mut gs, &encode_position_update(1, 50.0, -60.0, 120.0, 0.0));
+        apply_position_update(&mut gs, &encode_position_update(2, 50.0, -60.0, 120.0, 0.0));
+        assert!((gs.world.entities[&1].z - (120.0 - OFF)).abs() < 0.2,
+            "grounded position update stays FOOT (wire−offset), got {}", gs.world.entities[&1].z);
+        assert!((gs.world.entities[&2].z - 120.0).abs() < 0.2,
+            "flying position update passes wire z through unshifted (#548), got {}",
+            gs.world.entities[&2].z);
     }
 
     #[test]
@@ -4836,7 +4891,7 @@ mod tests {
             spawn_id: 7, name: "Orc".into(), last_name: String::new(),
             level: 10, npc: 1, gender: 1, race: 54, class_: 1, guild_id: 0xFFFF_FFFF, guild_rank: 0, body_type: 1,
             cur_hp: 100, helm: 0, show_helm: false, face: 0, hairstyle: 0, haircolor: 0, stand_state: 100,
-            pet_owner_id: 0, player_state: 64,
+            flymode: 0, pet_owner_id: 0, player_state: 64,
             x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100,
             equipment, equipment_tint,
         };

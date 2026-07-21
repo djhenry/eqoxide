@@ -609,6 +609,10 @@ pub struct SpawnInfo {
     /// (the app crate's `models::HeadPart::Hair`); classic textured hair ignores it (eqoxide#98).
     pub haircolor:       u8,
     pub stand_state:     u8,   // 0x64 = normal standing
+    /// EQ `flymode` (GravityBehavior) wire code: Ground=0, Flying=1, Levitating=2, Water=3,
+    /// Floating=4. Only `Flying` (1) matters to eqoxide: the server skips its Z-offset, so it must
+    /// not be shifted on the wire→foot datum conversion (see `coord::skips_wire_z_offset`, #548).
+    pub flymode:         u8,
     pub pet_owner_id:    u32,
     pub player_state:    u32,
     pub x:               f32,
@@ -762,8 +766,11 @@ pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
     skip!(1);
     // 37. StandState (u8)
     let stand_state = rd_u8!();
-    // 38-39. light flymode (2×u8)
-    skip!(2);
+    // 38. light (u8)
+    skip!(1);
+    // 39. flymode (u8) — GravityBehavior wire code; Flying(1) makes the server skip its Z-offset,
+    // so eqoxide must not shift such an entity on ingest (#548). Captured for register_spawn.
+    let flymode = rd_u8!();
 
     // 40. lastName (null-terminated)
     let last_name = rd_cstr!();
@@ -879,7 +886,7 @@ pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
     Some((SpawnInfo {
         spawn_id, name, last_name, level, npc, gender, race, class_, guild_id, guild_rank,
         body_type, cur_hp, helm, show_helm, face, hairstyle, haircolor, stand_state,
-        pet_owner_id, player_state,
+        flymode, pet_owner_id, player_state,
         x, y, z, heading, animation,
         equipment, equipment_tint,
     }, r.pos()))
@@ -1095,7 +1102,7 @@ mod tests {
         // 1024*360/512=720 -> mod 360 = 0 (aliased to due-NORTH); the fix
         // must decode it to the true 180° (due south).
         use super::parse_rof2_spawn;
-        let mut buf = build_npc_spawn_buf("Orc_Guard", 42, 54, 100.0, -200.0, 12.5);
+        let mut buf = build_npc_spawn_buf("Orc_Guard", 42, 54, 100.0, -200.0, 12.5, 0);
         // Spawn_Struct_Position word2 = x:19 | heading:12 << 19 | pad:1.
         // build_npc_spawn_buf lays out the 20-byte position block and then
         // appends 63 trailing bytes (unknown20[8] + IsMercenary[1] +
@@ -1167,7 +1174,7 @@ mod tests {
 
     /// Build a minimal valid RoF2 spawn byte buffer for a non-playable NPC.
     fn build_npc_spawn_buf(name: &str, spawn_id: u32, race: u32,
-                            x: f32, y: f32, z: f32) -> Vec<u8> {
+                            x: f32, y: f32, z: f32, flymode: u8) -> Vec<u8> {
         let mut b = Vec::new();
         // name\0
         b.extend_from_slice(name.as_bytes()); b.push(0);
@@ -1199,8 +1206,8 @@ mod tests {
         b.extend_from_slice(&race.to_le_bytes());
         // holding(u8), deity(u32), guildID(u32), guildrank(u32)
         b.push(0); b.extend_from_slice(&[0u8; 12]);
-        // class_(u8)=1, pvp(u8)=0, StandState(u8)=100, light(u8)=0, flymode(u8)=0
-        b.extend_from_slice(&[1, 0, 100, 0, 0]);
+        // class_(u8)=1, pvp(u8)=0, StandState(u8)=100, light(u8)=0, flymode(u8)
+        b.extend_from_slice(&[1, 0, 100, 0, flymode]);
         // lastName\0 (empty)
         b.push(0);
         // aatitle(u32)=0, guild_show(u8)=0, TempPet(u8)=0
@@ -1248,7 +1255,7 @@ mod tests {
     #[test]
     fn parse_rof2_spawn_npc_round_trip() {
         use super::parse_rof2_spawn;
-        let buf = build_npc_spawn_buf("Orc_Guard", 42, 54, 100.0, -200.0, 12.5);
+        let buf = build_npc_spawn_buf("Orc_Guard", 42, 54, 100.0, -200.0, 12.5, 0);
         let (info, consumed) = parse_rof2_spawn(&buf).expect("parse must succeed");
         assert_eq!(consumed, buf.len(), "must consume exactly the full buffer");
         assert_eq!(info.spawn_id, 42);
@@ -1260,6 +1267,7 @@ mod tests {
         assert_eq!(info.helm, 5);
         assert!(info.show_helm, "bit23 in bitfields → showhelm=true");
         assert_eq!(info.stand_state, 100);
+        assert_eq!(info.flymode, 0, "grounded NPC → flymode Ground(0)");
         // Coordinates (EQ19 precision, 1/8 unit)
         assert!((info.x - 100.0).abs() < 0.125, "x={}", info.x);
         assert!((info.y - (-200.0)).abs() < 0.125, "y={}", info.y);
@@ -1273,9 +1281,19 @@ mod tests {
     }
 
     #[test]
+    fn parse_rof2_spawn_captures_flymode() {
+        // #548: the flymode byte must be decoded (not skipped) so ingest can except Flying mobs from
+        // the wire→foot Z-offset. Flying(1) here proves the byte lands at the right wire offset.
+        use super::parse_rof2_spawn;
+        let buf = build_npc_spawn_buf("Bat", 7, 54, 0.0, 0.0, 0.0, 1);
+        let (info, _) = parse_rof2_spawn(&buf).expect("parse must succeed");
+        assert_eq!(info.flymode, 1, "Flying flymode byte must be captured from the wire");
+    }
+
+    #[test]
     fn parse_rof2_spawn_rejects_truncated() {
         use super::parse_rof2_spawn;
-        let buf = build_npc_spawn_buf("Orc", 1, 54, 0.0, 0.0, 0.0);
+        let buf = build_npc_spawn_buf("Orc", 1, 54, 0.0, 0.0, 0.0, 0);
         // Every truncation of the buffer must return None.
         for trunc in 0..buf.len() - 1 {
             assert!(parse_rof2_spawn(&buf[..trunc]).is_none(),
