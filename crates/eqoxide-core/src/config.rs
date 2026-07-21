@@ -2,6 +2,19 @@
 
 use std::path::{Path, PathBuf};
 
+/// Test-only override for the directory [`AppConfig::load`]'s `./config.yaml`
+/// fallback searches (see [`AppConfig::load_fallback_dir`]). `thread_local`, not a
+/// process-global: each test thread gets its own cell, so a test can drive the
+/// real `load()` call site end-to-end without `std::env::set_current_dir` — which
+/// mutates every relative-path lookup in the whole process — and without any risk
+/// of leaking into another test running concurrently on a different thread (#604
+/// F1, review of PR #611).
+#[cfg(test)]
+thread_local! {
+    static LOAD_FALLBACK_DIR_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        std::cell::RefCell::new(None);
+}
+
 /// Directory where eqoxide stores its config and cached per-character login
 /// credentials: `~/.config/eqoxide/` (honoring `XDG_CONFIG_HOME` via the `dirs`
 /// crate). Created on demand; on failure we fall back to the working directory.
@@ -83,19 +96,61 @@ impl AppConfig {
     /// `--config`** (the path being what [`LoginConfig::resolve_path`] resolved it
     /// to); that file is layered on top of the global `config.yaml`. `None` means
     /// no `--config` was given: only the global file is read, with no second layer
-    /// and no warning about one — byte-for-byte the pre-#597 behavior, including
-    /// the `./config.yaml` fallback.
+    /// and no warning about one — the same merge/warning behavior as pre-#597,
+    /// including the `./config.yaml` fallback. One cosmetic difference from
+    /// pre-#604: the fallback's disclosed source string is now `./config.yaml`
+    /// rather than bare `config.yaml` (see [`load_fallback_dir`](Self::load_fallback_dir));
+    /// that string's only consumer is the startup disclosure log line, and
+    /// [`same_file`] is unaffected because it canonicalizes both sides before
+    /// comparing.
     pub fn load(config_path: Option<&Path>) -> Self {
-        Self::load_with_fallback_dir(config_path, Path::new("."))
+        Self::load_with_fallback_dir(config_path, &Self::load_fallback_dir())
     }
 
-    /// Same as [`load`](Self::load), but takes the directory searched for the
-    /// `./config.yaml` fallback as an explicit parameter instead of always using
-    /// the process's current working directory. `load()` always passes `.`, so
-    /// production behavior is unchanged; this lets tests exercise the fallback
-    /// branch by pointing it at an isolated temp dir, without ever calling
-    /// `std::env::set_current_dir` — a process-global mutation that would flake
-    /// against any other cwd-sensitive test later added to this crate (#604).
+    /// The directory [`load`](Self::load) searches for the `./config.yaml`
+    /// back-compat fallback: always `.` (the real process cwd) in production.
+    ///
+    /// `load_with_fallback_dir`'s own tests (below) exercise the merge/fallback
+    /// logic thoroughly by calling it directly — but none of them called `load()`
+    /// itself, so a mutation of *its* hardcoded fallback argument went completely
+    /// undetected (#604 F1, review of PR #611: reverting this to a hardcoded `.`
+    /// literal left the whole `eqoxide-core` suite green, 113/113). This method is
+    /// the fix: the ONLY thing that changes between production and test is this one
+    /// call, via a `thread_local` override (`LOAD_FALLBACK_DIR_OVERRIDE`) rather
+    /// than `std::env::set_current_dir` — so `load_wires_the_fallback_dir_through_
+    /// to_load_with_fallback_dir` below can drive the real `load()` call site
+    /// end-to-end without mutating the process's actual working directory.
+    #[cfg(test)]
+    fn load_fallback_dir() -> PathBuf {
+        LOAD_FALLBACK_DIR_OVERRIDE
+            .with(|o| o.borrow().clone())
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// Non-test build: always the real process cwd. See the `#[cfg(test)]` overload
+    /// above for why this indirection exists.
+    #[cfg(not(test))]
+    fn load_fallback_dir() -> PathBuf {
+        PathBuf::from(".")
+    }
+
+    /// Test-only: run `f` with [`load`](Self::load)'s fallback directory overridden
+    /// to `dir`, on this thread only (see [`load_fallback_dir`](Self::load_fallback_dir)
+    /// and the `LOAD_FALLBACK_DIR_OVERRIDE` thread_local above it).
+    #[cfg(test)]
+    fn with_load_fallback_dir_for_test<R>(dir: &Path, f: impl FnOnce() -> R) -> R {
+        LOAD_FALLBACK_DIR_OVERRIDE.with(|o| *o.borrow_mut() = Some(dir.to_path_buf()));
+        let out = f();
+        LOAD_FALLBACK_DIR_OVERRIDE.with(|o| *o.borrow_mut() = None);
+        out
+    }
+
+    /// Same as [`load`](Self::load), but takes the `./config.yaml` fallback
+    /// directory as an explicit parameter instead of resolving it via
+    /// [`load_fallback_dir`](Self::load_fallback_dir). Behaviourally identical to
+    /// `load()` for the merge/warning logic; tests use this directly to exercise
+    /// that logic with an isolated temp dir standing in for the fallback
+    /// directory, without touching the real process cwd.
     fn load_with_fallback_dir(config_path: Option<&Path>, fallback_dir: &Path) -> Self {
         let mut layers: Vec<(String, String)> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
@@ -766,10 +821,13 @@ http_port: 8795
     /// Exercises the fallback branch through the real loader — `from_layers` cannot
     /// reach it, so `single_layer_matches_legacy_behavior_and_defaults` never did.
     ///
-    /// Uses `load_with_fallback_dir` (production `load()` is `load_with_fallback_dir(_, ".")`)
-    /// so the fallback directory is passed explicitly rather than via
-    /// `std::env::set_current_dir`, which is process-global and would race any other
-    /// cwd-sensitive test later added to this crate (#604).
+    /// Calls the REAL public `load()` (not `load_with_fallback_dir` directly) via
+    /// `with_load_fallback_dir_for_test`, so this drives production's actual call
+    /// site end-to-end. `std::env::set_current_dir` is process-global and would
+    /// race any other cwd-sensitive test later added to this crate; the
+    /// thread-local override does not (#604 F1, review of PR #611 — the earlier
+    /// version of this test called `load_with_fallback_dir` directly, which left
+    /// `load()`'s own hardcoded fallback argument completely uncovered).
     #[test]
     fn load_with_no_config_flag_uses_the_cwd_fallback_silently() {
         let tmp = tempfile::tempdir().unwrap();          // empty XDG_CONFIG_HOME
@@ -778,14 +836,16 @@ http_port: 8795
             "renderer:\n  asset_server_url: http://fallback:8088\n").unwrap();
 
         with_config_home(tmp.path(), || {
-            let cfg = AppConfig::load_with_fallback_dir(None, cwd.path());
+            AppConfig::with_load_fallback_dir_for_test(cwd.path(), || {
+                let cfg = AppConfig::load(None);
 
-            assert_eq!(cfg.asset_server_url, "http://fallback:8088");
-            assert_eq!(cfg.source_of("asset_server_url"),
-                Source::File(cwd.path().join("config.yaml").display().to_string()));
-            assert!(cfg.warnings.is_empty(),
-                "the ./config.yaml fallback must not warn (it IS the global config): {:?}",
-                cfg.warnings);
+                assert_eq!(cfg.asset_server_url, "http://fallback:8088");
+                assert_eq!(cfg.source_of("asset_server_url"),
+                    Source::File(cwd.path().join("config.yaml").display().to_string()));
+                assert!(cfg.warnings.is_empty(),
+                    "the ./config.yaml fallback must not warn (it IS the global config): {:?}",
+                    cfg.warnings);
+            });
         });
     }
 

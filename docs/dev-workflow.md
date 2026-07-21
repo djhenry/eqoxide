@@ -207,10 +207,12 @@ account:
 `account:`, loaded by `LoginConfig`) have **no such fallback** — with no `--config` flag
 they are read only from `~/.config/eqoxide/config.yaml`, never from a `./config.yaml` in
 the working directory. So a `config.yaml` that exists only in the cwd silently supplies
-renderer settings and *no* login settings: the client falls back to its built-in login
-defaults (`127.0.0.1:5999`, empty credentials) with no warning, which looks like a login
-failure rather than a config-location mistake. Put the file in `~/.config/eqoxide/` (or
-pass `--config`) if it needs to carry `server:`/`account:`.
+renderer settings and *no* login settings: the client connects to `127.0.0.1:5999` as
+username `testuser`, password `REDACTED`, character `Aiquestbot` — the compiled-in
+placeholder defaults, not blanks — with no warning. That looks like a login/account
+problem (wrong password, unknown character) rather than a config-location mistake. Put
+the file in `~/.config/eqoxide/` (or pass `--config`) if it needs to carry
+`server:`/`account:`.
 
 ### Precedence: per-character config overrides the global one, key by key (#597)
 
