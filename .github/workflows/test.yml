@@ -57,8 +57,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       # Caches ~/.cargo/registry, ~/.cargo/git, and target/ keyed on Cargo.lock. The test suite
-      # itself is fast (569 tests in ~0.73s on a quiet box) — the release build is the slow part,
-      # so this cache is the whole cost story for this workflow.
+      # itself is fast (the full workspace runs in well under a minute of actual test time on a
+      # quiet box) — compiling is the slow part, so this cache is the whole cost story for this
+      # workflow. Note `tools` pulls `libeq_*` from a git dependency, so the ~/.cargo/git half of
+      # this cache matters now that `--workspace` builds it.
       - uses: Swatinem/rust-cache@v2
 
       # No extra apt packages needed: wgpu/winit's Linux backends (x11-dl, xkbcommon-dl,
@@ -69,25 +71,69 @@ jobs:
       # dependency bump changes this and the build step below starts failing on missing system
       # libraries, add the relevant `apt-get install` step here rather than reaching for
       # `--no-default-features` — see the fallback note below.
-      - name: cargo build --release
-        run: cargo build --release --locked
+      # `--workspace` is load-bearing here, not decoration. A bare `cargo build --release` builds
+      # only the ROOT package (the `eqoxide` lib + its `eqoxide`/`render_model` bins) and whatever
+      # it depends on. Two workspace members are NOT root dependencies and were therefore never
+      # release-built by CI: `tools` (the `s3d_to_gltf`/`validate_glb`/`diagnose_glb` binaries) and
+      # `crates/eqoxide-crash`'s `crash_probe` bin. `--workspace` covers every member's every
+      # target. See #605.
+      - name: cargo build --release --workspace
+        run: cargo build --release --workspace --locked
 
-      # `cargo test --lib` only runs the library's unit/integration tests, which are pure logic
-      # (game_state, movement, http handlers, pathfinding, etc.) — none of them construct a
-      # wgpu::Instance or winit::EventLoop (that code lives in main.rs/app.rs/render_model.rs,
-      # which are binaries, not part of the `--lib` target), so this is safe to run headless with
-      # no display/GPU present on the runner.
+      # `cargo test --workspace` — NOT `--lib`. This is the #605 fix, and the reason it matters is
+      # worth stating plainly: `--lib` runs only the ROOT package's lib target. That was correct
+      # when it was written (#354/#355), because the whole codebase WAS the root lib. The #544
+      # crate extraction then moved ~92% of the suite into `crates/*`, and CI silently went from
+      # testing everything to testing 88 of 1145 tests (1 test binary of 25) — green the entire
+      # time. `--lib` also excludes every integration target under `tests/`, including
+      # `walker_sim.rs`.
       #
-      # 17 tests are #[ignore]d because they gate on baked asset fixtures (zone/model .glb files
-      # under assets/) that are gitignored and absent on a fresh clone. They stay ignored here —
-      # see #357 for giving them their own optional/asset-backed job.
+      # Do NOT "improve" this to `--all-targets`: that would be a REGRESSION here. The repo has no
+      # `benches/` and no `examples/`, so `--all-targets` adds zero coverage, and it silently DROPS
+      # the doc-test targets. (Those targets do run today and report 0 tests — all 22 doc fences in
+      # the repo are ```text/```bash, so no Rust doctest exists yet. The targets are what would
+      # catch the first real one.)
       #
-      # Known flake risk: find_path_does_not_drive_a_partial_route_into_a_sunken_water_pit
-      # (src/assets.rs:2269) asserts on a 150ms wall-clock A* budget and fails under heavy CPU
-      # contention (measured ~8/10 failures at load 16 on a shared dev box); it passes reliably
-      # on a quiet box, and a GitHub-hosted runner is quiet, so this job should stay green. If it
-      # ever flakes red here, that is this known issue (not a new regression) — see #356 for the
-      # real fix (surface PlanOutcome::TimedOut instead of racing the CPU scheduler with a
-      # wall-clock budget). Do not silence it by adding #[ignore] here; #356 tracks the fix.
-      - name: cargo test --lib
-        run: cargo test --lib --locked
+      # Headless-safety still holds under `--workspace`: no test in any crate constructs a
+      # `wgpu::Instance` or a `winit::EventLoop` (those call sites are `src/app.rs:772` — in the
+      # *lib*, not a binary — plus `src/main.rs:519` and `src/bin/render_model.rs:527`/`:700`; all
+      # are startup paths no test invokes. Being in the lib target is fine: the old `--lib` gate
+      # already compiled and linked `src/app.rs` headless for months, and two green
+      # `ubuntu-latest` runs confirm it empirically). The renderer crate's
+      # shader tests parse WGSL as text. The net-crate tests bind only `127.0.0.1:0`/`0.0.0.0:0`
+      # UDP loopback sockets, which need no external network. `eqoxide-crash`'s tests exec the
+      # `crash_probe` bin via `CARGO_BIN_EXE_*` (cargo builds and locates it; no display needed).
+      # The `tests/asset_sync_live.rs` integration test is the only one that wants the network,
+      # and it is already `#[ignore]`d.
+      #
+      # 29 tests are `#[ignore]`d, each for a stated environment reason, in three categories:
+      #   - baked asset fixtures — zone `.glb` + `.wtr` under `$ZONE_GLB`/`$ZONE_DIR`, bundled
+      #     model `.glb` under `assets/models/`; gitignored and absent on a fresh clone (27)
+      #   - extracted SOURCE assets — `tools`' `skinned_conversion_is_centered_grounded` needs
+      #     `globalhum_chr.s3d` under `$EQ_ASSETS_DIR` (1)
+      #   - a running asset server at `$ASSET_URL` — `tests/asset_sync_live.rs` (1)
+      # They stay ignored here — see #357 for giving them their own optional/asset-backed job.
+      #
+      # BE PRECISE ABOUT WHAT THIS DOES *NOT* COVER — do not read "nav is now tested in CI" into
+      # the numbers above. Among those 29 ignored are the ENTIRE 12-test nav real-zone corpus in
+      # `crates/eqoxide-nav/src/collision.rs` and `walker_sim.rs`'s real-zone drift baseline
+      # (`faithful_walker_drift_corpus`). What runs here is the synthetic-geometry half: nav's 127
+      # unit tests and walker_sim's 4 hand-built-mesh cases (lintel, low wall, haul-out, swim
+      # depth). Nav's deepest verification — against real baked zones — still runs NOWHERE
+      # automatic (#357). Misreading a nav gate as broader than it is has already cost this
+      # project once: #411/D-2 passed nav QA and regressed live.
+      #
+      # THE ONE PLACE A FLAKE COULD COME FROM, so a future red run gets diagnosed instead of
+      # papered over: `crates/eqoxide-nav/src/planner.rs` has two ABSOLUTE wall-clock assertions
+      # that reach CI for the first time with this change — `post_us < 1_000` (:958) and
+      # `post_us < 500` (:1011). Both measured ~2-3us here, a 150-500x margin, so the risk is low.
+      # But note their doc comment's claim that "the assertions only get SAFER under CPU load" is
+      # true only of the `sync_us > …` fixture-sanity halves; a >500us deschedule of the posting
+      # thread on a 2-vCPU runner is rare, NOT impossible. If one of those two goes red in
+      # isolation, that is this — a scheduling artifact, not a nav regression. Fix it by making
+      # the assertion relative (post_us vs sync_us) rather than by narrowing the gate.
+      #
+      # If a test fails here, fix it or `#[ignore]` it WITH A SPECIFIC REASON. Do not narrow this
+      # command back down to make it green — that is exactly the failure #605 documents.
+      - name: cargo test --workspace
+        run: cargo test --workspace --locked
