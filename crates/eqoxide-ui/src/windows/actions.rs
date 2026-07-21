@@ -5,8 +5,8 @@
 //! the old HUD control bar + action grid; buttons write the same shared
 //! request slots the HTTP API uses.
 
-use crate::scene::{Billboard, SceneState};
-use crate::ui::{theme, UiCtx};
+use eqoxide_renderer::scene::{Billboard, SceneState};
+use crate::{theme, UiCtx};
 
 /// The nearest *living* NPC billboard. Skips corpses and the off-map zone
 /// controller.
@@ -35,7 +35,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
 
     // Resolve the nearest living NPC once (id for targeting, clean name for labels).
-    let nearest = nearest_living_npc(s).map(|b| (b.id, crate::http::clean_entity_name(&b.name)));
+    let nearest = nearest_living_npc(s).map(|b| (b.id, eqoxide_core::game_state::clean_entity_name(&b.name)));
 
     ui.horizontal_wrapped(|ui| {
         // Attack toggle — highlighted red while auto-attack is on.
@@ -75,7 +75,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
         // Passing the id too makes the nav thread target first (the server
         // only fires EVENT_SAY on the current target, #130).
         let hail_who = match (s.target_id, &s.target_name) {
-            (Some(id), Some(name)) => Some((id, crate::http::clean_entity_name(name))),
+            (Some(id), Some(name)) => Some((id, eqoxide_core::game_state::clean_entity_name(name))),
             _ => nearest.clone(),
         };
         let hail_label = match &hail_who {
@@ -113,14 +113,14 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
                 let camp = btn(format!("Camping\u{2026} {secs}s (cancel)"))
                     .fill(egui::Color32::from_rgb(0x50, 0x44, 0x20));
                 if ui.add(camp).on_hover_text("Click to cancel camping").clicked() {
-                    cx.acts.command.request_camp(crate::http::CampCmd::Toggle);
+                    cx.acts.command.request_camp(eqoxide_ipc::CampCmd::Toggle);
                 }
                 // Keep the countdown ticking even when nothing else repaints.
                 ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
             }
             None => {
                 if ui.add(btn("Camp")).on_hover_text("Sit and camp to desktop").clicked() {
-                    cx.acts.command.request_camp(crate::http::CampCmd::Toggle);
+                    cx.acts.command.request_camp(eqoxide_ipc::CampCmd::Toggle);
                 }
             }
         }

@@ -114,4 +114,10 @@ pub use eqoxide_net as eq_net;
 pub mod camera_state;
 pub mod hud;
 pub mod model;
-pub mod ui;
+
+// The egui window system (registry/chrome/persist + per-window bodies, issue #162) now lives in the
+// `eqoxide-ui` workspace crate (#544 Step 2o), depending only on `eqoxide-core`/`ipc`/`command`/
+// `renderer` + egui — never on this app crate, eq_net, or http. Alias it as this crate's `ui` module
+// so every existing `crate::ui::…` / `eqoxide::ui::…` call site (app.rs, main.rs, hud.rs) keeps
+// resolving unchanged.
+pub use eqoxide_ui as ui;

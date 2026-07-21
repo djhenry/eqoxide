@@ -4,7 +4,7 @@
 //! Spell icon + name, time remaining, and a CAST-tinted progress gauge that
 //! fills as `started.elapsed()` approaches `cast_ms`.
 
-use crate::ui::{theme, widgets, UiCtx};
+use crate::{theme, widgets, UiCtx};
 
 pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     let Some(c) = &cx.scene.casting else {
@@ -26,11 +26,11 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     ui.horizontal(|ui| {
         // Spell icon when the atlas is available; the name is the fallback.
         if let Some(ic) = info.and_then(|i| {
-            let (sheet0, col, row) = crate::spells::icon_cell(i.icon_id);
+            let (sheet0, col, row) = eqoxide_core::spells::icon_cell(i.icon_id);
             cx.icons.spell(
                 ui.ctx(),
                 sheet0 as u32 + 1,
-                (row * crate::spells::ICON_COLS + col) as u32,
+                (row * eqoxide_core::spells::ICON_COLS + col) as u32,
             )
         }) {
             ui.add(egui::Image::new((ic.tex, egui::Vec2::splat(16.0))).uv(ic.uv));

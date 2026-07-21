@@ -2,7 +2,7 @@
 //! Interface: UI scale, window lock, window fading, reset-all. Info: fps,
 //! zone, character, and where the per-character layout persists.
 
-use crate::ui::{theme, UiCmd, UiCtx};
+use crate::{theme, UiCmd, UiCtx};
 
 fn section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(2.0);

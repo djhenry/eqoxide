@@ -2,7 +2,7 @@
 //! memorized spell gems. Click a gem to cast it (writes the same request slot
 //! the `/cast` HTTP API uses). Gems grey out while a cast is in flight.
 
-use crate::ui::{theme, UiCtx};
+use crate::{theme, UiCtx};
 
 /// Native gem size (the RoF2 gem art is ~34 px; we match the old HUD's 36).
 const GEM: f32 = 36.0;
@@ -23,11 +23,11 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
             .map(|i| i.name.clone())
             .unwrap_or_else(|| format!("Spell {spell_id}"));
         let icon = info.and_then(|i| {
-            let (sheet0, col, row) = crate::spells::icon_cell(i.icon_id);
+            let (sheet0, col, row) = eqoxide_core::spells::icon_cell(i.icon_id);
             cx.icons.spell(
                 ui.ctx(),
                 sheet0 as u32 + 1,
-                (row * crate::spells::ICON_COLS + col) as u32,
+                (row * eqoxide_core::spells::ICON_COLS + col) as u32,
             )
         });
 
@@ -50,7 +50,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
             }
         };
         if resp.clicked() {
-            cx.acts.command.request_cast(crate::http::CastRequest {
+            cx.acts.command.request_cast(eqoxide_ipc::CastRequest {
                 gem: gem as u8,
                 target_id: None,
                 item_slot: None,

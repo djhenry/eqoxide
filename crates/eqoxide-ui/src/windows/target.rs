@@ -2,7 +2,7 @@
 //! HP gauge (`-?-` when unknown, like the native client), level when the
 //! target's spawn is known, and Attack / Consider actions.
 
-use crate::ui::{theme, widgets, UiCtx};
+use crate::{theme, widgets, UiCtx};
 
 pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     let s = cx.scene;

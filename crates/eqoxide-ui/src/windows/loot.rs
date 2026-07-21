@@ -3,7 +3,7 @@
 //! OP_EndLootRequest); this body shows the in-progress session, recent loot
 //! messages, and a "loot nearest corpse" trigger.
 
-use crate::ui::{theme, UiCtx};
+use crate::{theme, UiCtx};
 
 /// Max distance (world units) at which "Loot nearest corpse" engages.
 /// Matches the server's loot range (~25u): offering corpses beyond it would

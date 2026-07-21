@@ -6,7 +6,7 @@
 //! offered cap exceeds the player's current value. Clicking Train stores the
 //! skill id into the shared `trainer_train` slot (→ OP_GMTrainSkill).
 
-use crate::ui::{theme, UiCtx};
+use crate::{theme, UiCtx};
 
 pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     let s = cx.scene;
@@ -32,7 +32,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
         .enumerate()
         .filter_map(|(id, &cap)| {
             let id = id as u32;
-            crate::skills::skill_name(id)?;
+            eqoxide_core::skills::skill_name(id)?;
             let cur = s.player_skills.get(id as usize).copied().unwrap_or(0);
             (cap > cur).then_some((id, cur, cap))
         })
@@ -56,7 +56,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
                     .show(ui, |ui| {
                         for (id, cur, cap) in &trainable {
                             let name =
-                                crate::skills::skill_name(*id).unwrap_or("Unknown Skill");
+                                eqoxide_core::skills::skill_name(*id).unwrap_or("Unknown Skill");
                             ui.label(egui::RichText::new(name).size(11.0));
                             ui.label(
                                 egui::RichText::new(format!("{cur} \u{2192} {cap}"))

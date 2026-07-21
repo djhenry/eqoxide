@@ -2,8 +2,8 @@
 //! input line (native `ChatWindow`). Slash commands route to the EQ chat
 //! channels via the shared `chat_send` queue; bare text goes out on Say.
 
-use crate::http::ChatSend;
-use crate::ui::{theme, UiCtx};
+use eqoxide_ipc::ChatSend;
+use crate::{theme, UiCtx};
 
 /// Tab order matches the native default chat filters.
 const TABS: [&str; 5] = ["All", "Chat", "Combat", "System", "Loot"];
@@ -60,7 +60,7 @@ fn submit(line: &str, cx: &mut UiCtx) {
         "g" | "gsay" | "group" => send(2, "", arg),
         // /camp — same toggle the Actions window's Camp button uses.
         "camp" => {
-            cx.acts.command.request_camp(crate::http::CampCmd::Toggle);
+            cx.acts.command.request_camp(eqoxide_ipc::CampCmd::Toggle);
         }
         "say" if !arg.is_empty() => {
             cx.acts.command.request_say(arg.to_string());

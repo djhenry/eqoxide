@@ -8,7 +8,7 @@
 //! `scene.player_heading` is in **degrees**, 0 = north, increasing clockwise
 //! (screen-x = sin, screen-y = −cos).
 
-use crate::ui::{theme, UiCtx};
+use crate::{theme, UiCtx};
 use egui::{Align2, FontId, Pos2, Rounding, Sense, Stroke, Vec2};
 
 /// Height of the heading strip in points.

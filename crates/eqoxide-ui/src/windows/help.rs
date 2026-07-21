@@ -2,7 +2,7 @@
 //! The hotkey table is built live from the registry (via `cx.window_list`) so
 //! it never drifts from the actual bindings.
 
-use crate::ui::{theme, UiCtx};
+use crate::{theme, UiCtx};
 
 /// Fixed (non-window) bindings that don't live in the registry.
 const FIXED_KEYS: [(&str, &str); 8] = [

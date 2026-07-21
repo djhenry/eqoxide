@@ -2,7 +2,7 @@
 //! One toggle per window plus the global UI controls. Requirement: this window
 //! is always available; the registry marks it `closeable: false`.
 
-use crate::ui::{UiCmd, UiCtx};
+use crate::{UiCmd, UiCtx};
 
 pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     ui.horizontal_wrapped(|ui| {
@@ -18,7 +18,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
         }
         // Transient windows open from game state, not from here — listed
         // greyed so the catalog is complete (native SelectorWindow parity).
-        for def in crate::ui::registry::REGISTRY.iter().filter(|d| d.transient) {
+        for def in crate::registry::REGISTRY.iter().filter(|d| d.transient) {
             ui.add_enabled(false, egui::SelectableLabel::new(false, def.title))
                 .on_disabled_hover_text("Opens automatically in game (merchant, trainer, loot…)");
         }
