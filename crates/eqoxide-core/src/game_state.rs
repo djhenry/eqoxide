@@ -576,26 +576,45 @@ pub struct GameState {
     pub player_x: f32,
     pub player_y: f32,
     pub player_z: f32,
-    /// #513 (agent-honesty): has the SERVER actually told us where we are yet, this zone?
+    /// #513 (agent-honesty): has our position for the CURRENT zone actually been established yet?
     ///
-    /// `player_x/y/z` are plain `f32` and read `0.0` from construction until a server position
-    /// packet lands — so anything derived from them before that (notably the `distance` a
-    /// name-resolution endpoint reports) would be measured from the zone ORIGIN and be a
-    /// confident wrong number, in exactly the just-zoned-in window where #513's original
-    /// wrong-target near-miss happened. Consumers that would otherwise publish a fabricated
-    /// figure must gate on this and report an honest "unknown" instead.
+    /// `player_x/y/z` are plain `f32`, so they always hold SOME number — that number just isn't
+    /// always trustworthy. On the very first zone-in of a session they read the struct's
+    /// construction-time `0.0`. On every zone change after that, [`GameState::begin_zone_in`]
+    /// deliberately does **NOT** reset them (see that fn's doc) — they keep holding the PREVIOUS
+    /// zone's last-known coordinates until something in the new zone overwrites them. That second
+    /// case is the more dangerous falsehood: a `distance` computed from a stale
+    /// old-zone position is a *plausible*-looking number, unlike an obviously-absurd
+    /// origin-relative one, so a consumer has no way to smell it out without this flag. Consumers
+    /// that would otherwise publish a fabricated figure must gate on this and report an honest
+    /// "unknown" instead — exactly the just-zoned-in window where #513's original wrong-target
+    /// near-miss happened.
     ///
-    /// Set once the position-streaming path (`ActionLoop::stream_position`) has actually placed
-    /// `player_x/y/z` for the CURRENT zone — either a server correction it adopted, or the
-    /// controller's own predicted position once the controller has been placed there. (An earlier
-    /// version of this flag was keyed only on a self `OP_ClientUpdate`, which the server rarely
-    /// sends — that made `distance` omitted ALWAYS instead of only while genuinely unknown; live
-    /// E2E caught it. Keying on the controller mirror instead is deliberate.) Before that, and
-    /// immediately after a zone change, `player_x/y/z` are still the struct's zeroes: anything
-    /// derived from them — notably a name-resolution endpoint's `distance` — would be measured
-    /// from the zone ORIGIN and be a confident wrong number. Reset to false by
-    /// [`GameState::begin_zone_in`]: on a zone change the old zone's coordinates say nothing about
-    /// where we now are.
+    /// Set by any path that establishes `player_x/y/z` for the CURRENT zone — ALL of the
+    /// following, not just one:
+    ///   - self `OP_ClientUpdate` (`packet_handler.rs`) — server-authoritative.
+    ///   - bind-point respawn (`apply_bind_respawn`, `packet_handler.rs`) — server-authoritative.
+    ///   - a same-zone teleport (`gameplay.rs`) — server-driven destination.
+    ///   - `MockModel::publish_snapshot` (`model.rs`) — offline/testzone, where the Model itself
+    ///     IS the position authority, so its published position is real by definition.
+    ///   - the controller mirror in `ActionLoop::stream_position` (`action_loop.rs`) — the
+    ///     controller's own PREDICTED position, on the normal (non-correction) path, once the
+    ///     controller has actually been placed in this zone. (An earlier version of this flag was
+    ///     keyed ONLY on self `OP_ClientUpdate`, which the server rarely sends — that made
+    ///     `distance` omitted ALWAYS instead of only while genuinely unknown; live E2E caught it.
+    ///     Setting it from the controller mirror too is deliberate, not a regression: the
+    ///     player_x/y/z doc above already establishes that these fields are legitimately
+    ///     controller-predicted, not exclusively server-authoritative.)
+    ///
+    /// A genuine server correction inside `stream_position` hands the new position to the
+    /// controller and returns WITHOUT setting this flag — it only flips once a later tick adopts
+    /// that position on the normal path. If a new zone's spawn point happens to land within the
+    /// correction threshold of the last-streamed old-zone position, the correction is skipped
+    /// entirely and the flag flips on that stale-but-close controller position instead; the
+    /// resulting `distance` error is bounded by that same threshold — see #593(c) for why that
+    /// residual window is harmless rather than a falsehood.
+    ///
+    /// Reset to false by [`GameState::begin_zone_in`] on every zone change.
     pub player_pos_known: bool,
     pub player_heading: f32,
     pub player_level: u32,
@@ -913,6 +932,11 @@ impl GameState {
     /// previous zone's spawns and doors and re-arm the once-per-zone-in OP_NewZone apply. Called at
     /// the top of each zone-entry handshake, before OP_ReqClientSpawn asks for the spawn stream, so
     /// the clear can never race the stream it precedes. (#322)
+    ///
+    /// Does **NOT** reset `player_x/y/z` — they keep holding the previous zone's last-known
+    /// coordinates (there is nothing else to set them to yet). What it DOES do is clear
+    /// [`GameState::player_pos_known`] to `false`, so consumers know those stale numbers are not
+    /// yet trustworthy for the new zone — see that field's doc.
     pub fn begin_zone_in(&mut self) {
         self.world.entities.clear();
         self.world.doors.clear();

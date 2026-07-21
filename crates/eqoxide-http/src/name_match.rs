@@ -430,8 +430,20 @@ mod tests {
                 stop.store(true, Ordering::Relaxed);
                 net.join().expect("net-thread stand-in must not have panicked");
             }
-            Err(_) => panic!(
+            // Timeout: the hammer thread never reached the `tx.send`, and it's still out there
+            // (never join a thread we suspect is deadlocked) — this is the lock-order inversion
+            // this test exists to catch.
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!(
                 "lock-order inversion: resolve_in_world deadlocked against sync_entities' order"
+            ),
+            // Disconnected: `tx` was dropped WITHOUT sending, which only happens if the hammer
+            // thread's own body panicked first (e.g. the `assert!` above) — a real deadlock can
+            // never produce this, since a wedged thread still holds `tx` alive. Report the true
+            // failure instead of the lock-order message, which would send a maintainer hunting an
+            // inversion that doesn't exist.
+            Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
+                "hammer thread died before completing (see its panic above) — this is NOT a \
+                 lock-order inversion, something else broke resolve_in_world"
             ),
         }
     }

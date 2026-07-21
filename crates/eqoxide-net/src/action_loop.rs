@@ -2441,6 +2441,14 @@ impl ActionLoop {
         }
         // Genuine server correction: the network gs player jumped (an incoming server packet moved
         // us) far from what we last mirrored. Hand it to the controller; adopt and re-stream it.
+        // NOTE (#593): this branch does NOT set `player_pos_known` — it hands the position to the
+        // controller and returns immediately, before the controller has actually adopted it. The
+        // flag only flips once a LATER tick reaches the normal path below with `view.pos` mirroring
+        // the adopted position. The one gap this leaves: if a new zone's spawn point lands within
+        // `CORRECTION_SQ` (144 = 12u²) of the last-streamed old-zone position, this branch is
+        // skipped entirely and the flag flips on that stale-but-close controller position on the
+        // very next normal-path tick instead — bounded to ≤12u, same as `player_x/y/z` already
+        // carries elsewhere; see #593(c) for why that residual window isn't a meaningful falsehood.
         let cd = [gp[0] - self.last_streamed[0], gp[1] - self.last_streamed[1]];
         if cd[0] * cd[0] + cd[1] * cd[1] > CORRECTION_SQ {
             tracing::info!("NAV: server correction → handing controller new pos ({:.1},{:.1},{:.1})", gp[0], gp[1], gp[2]);
@@ -2464,11 +2472,15 @@ impl ActionLoop {
         gs.player_y = pos[1];
         gs.player_z = pos[2];
         // #513: our position is now ESTABLISHED — this is the controller's real placement for the
-        // current zone, the very value we stream to the server. Before the first tick of this
-        // (i.e. between `begin_zone_in` and the controller being placed in the new zone)
-        // `player_x/y/z` are still the struct's zeroes, and anything derived from them — notably
-        // the `distance` a name-resolution endpoint reports — would be measured from the zone
-        // ORIGIN and be a confident wrong number. Consumers gate on this via
+        // current zone, the very value we stream to the server. Before this normal-path tick runs
+        // for the new zone (i.e. between `begin_zone_in` and the controller being placed here),
+        // `player_x/y/z` still hold whatever they held before: the OLD zone's last-known
+        // coordinates on every zone change after the first, or the struct's construction-time
+        // zeroes on the very first zone-in of the session. Either way `GameState::player_pos_known`
+        // is false during that window (see its doc), so anything derived from `player_x/y/z` —
+        // notably the `distance` a name-resolution endpoint reports — would be a confident wrong
+        // number (a stale-but-plausible old position is the more dangerous case, since it doesn't
+        // look absurd the way an origin-relative one would). Consumers gate on this via
         // `HttpState::player_pos()` and report an honest "unknown" until it flips.
         gs.player_pos_known = true;
         gs.player_heading = view.heading;

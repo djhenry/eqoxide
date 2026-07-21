@@ -19,6 +19,9 @@ jobs:
   # for the exact patterns and the (temporary) exclusions.
   no-local-detail:
     runs-on: ubuntu-latest
+    # A ~5-second script — this is generous headroom for consistency with the `test` job below,
+    # not because this job has any known hang risk.
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - name: check for local-system detail / proprietary-derived content
