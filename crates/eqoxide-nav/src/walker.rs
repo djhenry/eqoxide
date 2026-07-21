@@ -222,8 +222,9 @@ impl Walker {
         self.set_nav_state("idle");
         self.nav.nav_state.lock().unwrap().tier = None; // no route committed → no per-route tier
         // Publish the cleared snapshot so no consumer keeps drawing the previous zone's state.
-        // (The position is the last one the walker saw; the next tick republishes the real one.)
-        self.publish_debug(self.last_walk_pos, None);
+        // Position: None — the old zone's coordinates would be a confident wrong answer in the
+        // new zone's space (#615 review F1); the next tick republishes the real one.
+        self.publish_debug(None, None);
     }
 
     /// Publish the current `/move/goto` navigation state for GET /v1/observe/debug (#166, #337).
@@ -261,12 +262,19 @@ impl Walker {
         if s.local != local { s.local = local; }
     }
 
+    /// The player's position for the snapshot — **`None` until the server has told us where we
+    /// are** (#615 review F1: a fresh login published a confident `[0,0,0]`, 985 units from the
+    /// character; "unknown" must be representable, never a fabricated origin).
+    fn known_pos(gs: &GameState) -> Option<[f32; 3]> {
+        gs.player_pos_known.then(|| [gs.player_x, gs.player_y, gs.player_z])
+    }
+
     /// Publish the nav diagnostics snapshot (#608). **This is the one place the snapshot is
     /// written**, and every field is copied from the walker's OWN state — `self.path` /
     /// `self.local_path` verbatim (the #246 committed-route property), the planner's own trace,
     /// the pad knowledge the last plan was given. Consumers (the 3D overlay, the HTTP endpoint)
     /// render this and nothing else; there is no second derivation for them to disagree with.
-    fn publish_debug(&mut self, player: [f32; 3], water: Option<crate::diagnostics::WaterDebug>) {
+    fn publish_debug(&mut self, player: Option<[f32; 3]>, water: Option<crate::diagnostics::WaterDebug>) {
         self.debug_seq += 1;
         let (state, reason) = {
             let s = self.nav.nav_state.lock().unwrap();
@@ -279,6 +287,7 @@ impl Walker {
             nav_state: state,
             nav_reason: reason,
             player,
+            published_at: std::time::Instant::now(),
             goal,
             committed_coarse: self.path.clone(),
             committed_fine: self.local_path.clone(),
@@ -293,16 +302,31 @@ impl Walker {
     /// Read handle for consumers/tests. The walker remains the only WRITER.
     pub fn debug_view(&self) -> &crate::diagnostics::NavDebugView { &self.nav_debug }
 
-    /// Is the published snapshot already the settled no-goto state (routes empty, state/reason in
-    /// sync with the live nav_state)? Used by `resolve_goal` so the no-goto tick publishes ONCE
-    /// when a goto ends rather than every idle tick.
-    fn debug_is_settled(&self) -> bool {
+    /// Is the published snapshot already the settled no-goto state? Used by `resolve_goal` so the
+    /// no-goto tick republishes only when something drifted, not every idle tick.
+    ///
+    /// #615 review F1: this comparison MUST cover every published field that can change while no
+    /// goto is active — `player` (WASD / server-pushed movement) and `zone_model_loaded` (assets
+    /// finishing their load) drift on an idle walker, and comparing only routes/state left a
+    /// fresh-login snapshot claiming `[0,0,0]` + "no world model" forever, 985 units from the
+    /// character, while the `zone_assets` object beside it said "ready".
+    fn debug_is_settled(&self, gs: &GameState) -> bool {
         let snap = self.nav_debug.lock().unwrap();
         match snap.as_ref() {
             None => false,
             Some(s) => {
                 let live = self.nav.nav_state.lock().unwrap();
-                s.committed_coarse.is_empty() && s.committed_fine.is_empty() && s.goal.is_none()
+                let pos_settled = match (s.player, Self::known_pos(gs)) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) =>
+                        // A small tolerance so idle float jitter doesn't republish every tick;
+                        // real movement (even one step) exceeds it and republishes.
+                        (a[0] - b[0]).abs() < 0.5 && (a[1] - b[1]).abs() < 0.5 && (a[2] - b[2]).abs() < 0.5,
+                    _ => false,
+                };
+                pos_settled
+                    && s.zone_model_loaded == self.collision.read().unwrap().is_some()
+                    && s.committed_coarse.is_empty() && s.committed_fine.is_empty() && s.goal.is_none()
                     && s.nav_state == live.state && s.nav_reason == live.reason
             }
         }
@@ -362,7 +386,7 @@ impl Walker {
         *self.nav_intent.lock().unwrap() = None;
         // Publish the terminal state. `last_plan` is deliberately KEPT: its trace is the
         // diagnostic OF this failure — exactly what a consumer needs to see now (#608).
-        self.publish_debug([gs.player_x, gs.player_y, gs.player_z], None);
+        self.publish_debug(Self::known_pos(gs), None);
     }
 
     /// Apply a finished FINE plan from the local worker (#382). See the pre-extraction doc comment
@@ -461,7 +485,7 @@ impl Walker {
                 }
                 self.nav.nav_state.lock().unwrap().tier =
                     Some(if reply.tight { "minimum" } else { "preferred" });
-                self.publish_debug([gs.player_x, gs.player_y, gs.player_z], None);
+                self.publish_debug(Self::known_pos(gs), None);
                 false
             }
             // The search was CUT SHORT — "I don't know", not "no route".
@@ -475,7 +499,7 @@ impl Walker {
                 self.stuck_i = 0;
                 self.clear_local_plan();
                 self.set_nav_state_because("navigating_partial", Some(limit.as_str()));
-                self.publish_debug([gs.player_x, gs.player_y, gs.player_z], None);
+                self.publish_debug(Self::known_pos(gs), None);
                 false
             }
             // Gave up with nothing usable. Honest "I DON'T KNOW".
@@ -535,7 +559,7 @@ impl Walker {
         self.planner.cancel();
         self.awaiting_first_plan = false;
         self.set_nav_state("idle");
-        self.publish_debug([gs.player_x, gs.player_y, gs.player_z], None);
+        self.publish_debug(Self::known_pos(gs), None);
         true
     }
 
@@ -607,7 +631,7 @@ impl Walker {
 
     /// Resolves the active `/goto` target for this tick, or performs the "no active goto"
     /// stop-and-reset and returns `None` when there is none (caller must stop the tick).
-    pub fn resolve_goal(&mut self) -> Option<(f32, f32, f32)> {
+    pub fn resolve_goal(&mut self, gs: &GameState) -> Option<(f32, f32, f32)> {
         let goto = *self.nav.goto_target.lock().unwrap(); // copy out so the lock is released
         let goal = match goto {
             Some(t) => t,
@@ -625,11 +649,12 @@ impl Walker {
                     self.set_nav_state("idle");
                 }
                 // Publish the cleared/terminal state so the snapshot does not keep saying
-                // "arrived"/"navigating" with a route after the goto ended (#608: the snapshot is
-                // as-of-publish, so the end of a goto must BE a publish). Only once per clear —
-                // when there was still a route or a live nav state to retire — not every idle tick.
-                if !self.debug_is_settled() {
-                    self.publish_debug(self.last_walk_pos, None);
+                // "arrived"/"navigating" with a route after the goto ended, and REPUBLISH whenever
+                // an idle field drifts — the player moved (WASD / server push), the zone model
+                // loaded — so a consumer can never read a stale confident position (#615 review
+                // F1). `debug_is_settled` gates it to actual drift, not every idle tick.
+                if !self.debug_is_settled(gs) {
+                    self.publish_debug(Self::known_pos(gs), None);
                 }
                 return None;
             }
@@ -709,7 +734,7 @@ impl Walker {
     /// `nav_state: "navigating"` and steered in a dead-straight line at the goal, so an agent
     /// observing mid-load saw a confident walkable route through geometry that had not been built
     /// (the "700u unobstructed" of the false #560 report).
-    fn halt_no_world(&mut self) {
+    fn halt_no_world(&mut self, player: Option<[f32; 3]>) {
         self.path.clear();
         self.path_i = 0;
         self.path_goal = None;      // force a REAL plan the moment collision appears
@@ -719,8 +744,9 @@ impl Walker {
         *self.nav_intent.lock().unwrap() = None;
         self.set_nav_state_because(NAV_STATE_ZONE_LOADING, Some("zone_assets_not_loaded"));
         // Publish honestly: `zone_model_loaded: false`, no routes — "I have no model of this
-        // world", never a route through unloaded geometry (#579).
-        self.publish_debug(self.last_walk_pos, None);
+        // world", never a route through unloaded geometry (#579). `player` comes from the caller's
+        // GameState (None until the server placed us — never a fabricated position, #615 F1).
+        self.publish_debug(player, None);
     }
 
     pub fn drive_walk(&mut self, gs: &mut GameState, goal: (f32, f32, f32)) {
@@ -728,7 +754,7 @@ impl Walker {
         // geometry as a route (#579). Checked BEFORE any planning/steering so the walker cannot
         // move the character on a world it does not have.
         if self.collision.read().unwrap().is_none() {
-            self.halt_no_world();
+            self.halt_no_world(Self::known_pos(gs));
             return;
         }
         if self.replan_cooldown > 0 { self.replan_cooldown -= 1; }
@@ -788,7 +814,7 @@ impl Walker {
                 }
                 // The collision grid vanished between the gate at the top of this fn and here (a
                 // zone change landing mid-tick). Same honest answer, never a bare "navigating".
-                None => { self.halt_no_world(); return; }
+                None => { self.halt_no_world(Self::known_pos(gs)); return; }
             }
         }
 
@@ -806,7 +832,7 @@ impl Walker {
 
         if self.awaiting_first_plan {
             *self.nav_intent.lock().unwrap() = None;
-            self.publish_debug([gs.player_x, gs.player_y, gs.player_z], None); // "planning", no route yet
+            self.publish_debug(Self::known_pos(gs), None); // "planning", no route yet
             return;
         }
 
@@ -893,7 +919,7 @@ impl Walker {
                 *self.nav.goto_target.lock().unwrap() = None;
                 *self.nav_intent.lock().unwrap() = None; // else the controller keeps walking the last
                 // wish_dir forever — drifting 1000s of units with no nav activity (eqoxide#71).
-                self.publish_debug([gs.player_x, gs.player_y, gs.player_z], None);
+                self.publish_debug(Self::known_pos(gs), None);
                 return;
             }
             // Non-lethal: fall through to normal walking — the controller descends off the edge.
@@ -919,7 +945,7 @@ impl Walker {
                 self.path_goal = None;
                 *self.nav_intent.lock().unwrap() = None; // stand still until the leader moves
                 gs.player_heading = eq_heading(gdx, gdy);
-                self.publish_debug([gs.player_x, gs.player_y, gs.player_z], None);
+                self.publish_debug(Self::known_pos(gs), None);
                 return;
             }
             ArrivalAction::Arrived => {
@@ -940,7 +966,7 @@ impl Walker {
                 *self.nav.goto_target.lock().unwrap() = None;
                 *self.nav_intent.lock().unwrap() = None; // stop driving the controller
                 gs.player_heading = eq_heading(gdx, gdy);
-                self.publish_debug([gs.player_x, gs.player_y, gs.player_z], None);
+                self.publish_debug(Self::known_pos(gs), None);
                 return;
             }
             ArrivalAction::Drive => {} // not there yet — keep walking / re-plan below
@@ -998,7 +1024,7 @@ impl Walker {
                     tracing::warn!("NAV: backed off downhill — posted re-plan #{gen} (attempt {})", self.nav_repaths);
                 }
             }
-            self.publish_debug([gs.player_x, gs.player_y, gs.player_z], None);
+            self.publish_debug(Self::known_pos(gs), None);
             return;
         }
 
@@ -1085,7 +1111,7 @@ impl Walker {
         // the swim state it just acted on — the same `swim`/`swim_plane` that went into the intent
         // above, not a recompute (#608).
         self.publish_debug(
-            [gs.player_x, gs.player_y, gs.player_z],
+            Self::known_pos(gs),
             Some(crate::diagnostics::WaterDebug { swimming: swim, swim_plane }),
         );
     }
@@ -1160,8 +1186,50 @@ mod tests {
         w.drive_walk(&mut gs, (700.0, 0.0, 0.0));
         assert_eq!(nav.nav_state.lock().unwrap().state, NAV_STATE_ZONE_LOADING);
         *nav.goto_target.lock().unwrap() = None;
-        assert!(w.resolve_goal().is_none());
+        assert!(w.resolve_goal(&gs).is_none());
         assert_eq!(nav.nav_state.lock().unwrap().state, "idle");
+    }
+
+    /// **#615 review F1 — the idle snapshot must TRACK reality, never fabricate it.** The live
+    /// finding: a fresh login published `player: [0,0,0]` (985 units from the character) with
+    /// `zone_model_loaded: false`, and the idle walker never republished — a confident wrong
+    /// position with no age and no hedge, forever. Pins all four halves of the fix:
+    /// unknown position publishes `None` (never an invented origin); a known position republishes
+    /// on movement; `zone_model_loaded` republishes when assets land; and a genuinely idle walker
+    /// does NOT churn (seq stable).
+    #[test]
+    fn idle_snapshot_tracks_player_and_world_and_never_fabricates_a_position() {
+        let (mut w, _nav, _intent, view) = walker_with(open_plane(200.0));
+        let mut gs = eqoxide_core::game_state::GameState::new();
+        assert!(!gs.player_pos_known, "fixture premise: a fresh GameState has no known position");
+
+        // 1. No goto, position UNKNOWN: the settled publish must say None — not [0,0,0].
+        assert!(w.resolve_goal(&gs).is_none());
+        let snap = view.lock().unwrap().clone().expect("the idle state must be published");
+        assert_eq!(snap.player, None,
+            "an unknown position must publish as None — [0,0,0] was the #615-F1 confident lie");
+        assert!(snap.zone_model_loaded, "the collision grid is loaded and must be reported so");
+
+        // 2. The server places us: the next idle tick must republish the REAL position.
+        gs.player_pos_known = true;
+        gs.player_x = 398.9; gs.player_y = 899.1; gs.player_z = 12.0;
+        assert!(w.resolve_goal(&gs).is_none());
+        let snap = view.lock().unwrap().clone().unwrap();
+        assert_eq!(snap.player, Some([398.9, 899.1, 12.0]),
+            "the idle snapshot must track where the character actually is");
+
+        // 3. Genuinely idle: no republish churn.
+        let seq_before = snap.seq;
+        for _ in 0..3 { assert!(w.resolve_goal(&gs).is_none()); }
+        assert_eq!(view.lock().unwrap().clone().unwrap().seq, seq_before,
+            "an unchanged idle state must not republish every tick");
+
+        // 4. The character moves (WASD / server push — no goto involved): republish.
+        gs.player_x = 350.0;
+        assert!(w.resolve_goal(&gs).is_none());
+        let snap = view.lock().unwrap().clone().unwrap();
+        assert!(snap.seq > seq_before, "movement must republish");
+        assert_eq!(snap.player, Some([350.0, 899.1, 12.0]));
     }
 
     /// GLB-space quad (`positions` are `[north, up, east]`) — the synthetic-fixture pattern the

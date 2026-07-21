@@ -219,6 +219,11 @@ impl PlanCtx {
             t.lock().unwrap().outcome_calls = range;
         }
     }
+    /// The call index of the most recent `find_path_ex_tiered` invocation's ANSWERING search
+    /// (the winning tier/anchor retry — see `Search::trace_call`). `None` when untraced.
+    pub fn trace_last_answer(&self) -> Option<usize> {
+        self.trace.as_ref().and_then(|t| t.lock().unwrap().last_answer)
+    }
 }
 
 /// Why a search stopped WITHOUT closing its frontier: it hit its node cap. Means "I don't know",
@@ -444,6 +449,12 @@ pub struct Search {
     /// the obstruction that ended the journey — the wall between the frontier and the goal (#378
     /// Phase 2, design §5a). `None` when the search closed nothing useful.
     best_toward: Option<[f32; 3]>,
+    /// The diagnostic-trace call index THIS search recorded into (#608 / #615 review F4). Because
+    /// tier retries (`search_tiered`) and anchor retries (`search`) each run their own `astar`
+    /// call, the `Search` that wins carries the id of ITS OWN call — so `plan_path_with_ctx` can
+    /// stamp `outcome_calls` to exactly the DECIDING call, never a losing pass whose rejections
+    /// would then be drawn over the route the walker is successfully walking. `None` when untraced.
+    trace_call: Option<usize>,
 }
 
 impl Search {
@@ -1988,7 +1999,12 @@ impl Collision {
         // Plan owner (when called standalone). When `plan_path` drives this, `ctx` already carries a
         // shared counter, so `ensure_budget` is a no-op and all 13 calls keep sharing the one budget.
         let ctx = ctx.ensure_budget();
-        let (s, tight) = self.search_tiered(start, goal, radius, avoid, cell, max_search, aggro_buffer, ctx);
+        let (s, tight) = self.search_tiered(start, goal, radius, avoid, cell, max_search, aggro_buffer, ctx.clone());
+        // Report which trace call ANSWERED (the winning tier/anchor retry) so the plan owner can
+        // stamp `outcome_calls` to exactly the deciding call (#615 review F4).
+        if let Some(t) = &ctx.trace {
+            t.lock().unwrap().last_answer = s.trace_call;
+        }
         let best_toward = s.best_toward;
         let outcome = match s.path {
             Some((p, true)) => PlanOutcome::Route(p),
@@ -2284,7 +2300,12 @@ impl Collision {
         use crate::diagnostics::{EdgeKind, EdgeVerdict, RejectReason};
         let mut tr = ctx.trace.as_ref().map(|t| t.lock().unwrap());
         if let Some(t) = tr.as_deref_mut() { t.begin_call(radius, cell.max(1.0), prefer_char_anchor); }
-        if self.cols == 0 || self.rows == 0 { return Search::no_route(NoRoute::NoGeometry); }
+        // The call THIS search records into — carried out on the Search so the winning tier/anchor
+        // retry can be identified as THE deciding call (#615 review F4).
+        let trace_call = tr.as_deref().map(|t| t.calls.len() - 1);
+        if self.cols == 0 || self.rows == 0 {
+            return Search { trace_call, ..Search::no_route(NoRoute::NoGeometry) };
+        }
         // Navigate on a FINER grid than the collision broad-phase buckets (self.cell_size, ~32u).
         // At 32u, cell centers fall inside walls in tight corridors, so A* sees a fragmented graph,
         // finds no route, and the caller straight-lines into walls. An 8u nav grid keeps cell
@@ -2322,6 +2343,7 @@ impl Collision {
         if (sc, sr) == (gc, gr) {
             return Search {
                 path: Some((vec![[start[0], start[1], start[2]], [goal[0], goal[1], goal[2]]], true)),
+                trace_call,
                 ..Default::default()
             };
         }
@@ -2417,7 +2439,7 @@ impl Collision {
             None if ctx.goal_region.is_none() => {
                 tracing::info!("find_path: goal ({:.0},{:.0},{:.1}) has NO walkable floor anywhere in its column \
                     — unreachable by construction (not searching)", goal[0], goal[1], goal[2]);
-                return Search::no_route(NoRoute::GoalNotWalkable);
+                return Search { trace_call, ..Search::no_route(NoRoute::GoalNotWalkable) };
             }
             None => goal[2],
         };
@@ -2813,7 +2835,16 @@ impl Collision {
                     if let Some(ncol) = water_grid.and_then(|g| g.column_at(b[0], b[1])) {
                         for d in [-1.0f32, 0.0, 1.0] {
                             let nz = cz + d * VRES;
-                            if ncol.span_containing(nz).is_none() { continue; }
+                            if ncol.span_containing(nz).is_none() {
+                                // Evaluated and REFUSED: the neighbour column holds no navigable
+                                // water span at that depth. Record it (#615 review F5) — leaving
+                                // it silent would make an evaluated refusal read as unevaluated.
+                                if let Some(t) = tr.as_deref_mut() {
+                                    t.edge([a[0], a[1], cz], [b[0], b[1], nz],
+                                        EdgeVerdict::Rejected { reason: RejectReason::Water });
+                                }
+                                continue;
+                            }
                             let nkey = (nc, nr, qf(nz));
                             if closed.contains(&nkey) { continue; }
                             let feet = 0.5;
@@ -3040,7 +3071,15 @@ impl Collision {
                             // handles same-level/climbs; a walkable shallow drop it already added)
                             // require the column at/just above this floor to be water (a real swim
                             // landing, not a dry lethal fall)
-                            if !water.is_water(b[0], b[1], nf + 3.0) && !water.is_water(b[0], b[1], nf + 12.0) { continue; }
+                            if !water.is_water(b[0], b[1], nf + 3.0) && !water.is_water(b[0], b[1], nf + 12.0) {
+                                // Evaluated and REFUSED: the candidate landing is DRY — a lethal
+                                // fall, not a swim landing. Record the refusal (#615 review F5).
+                                if let Some(t) = tr.as_deref_mut() {
+                                    t.edge([a[0], a[1], cz], [b[0], b[1], nf],
+                                        EdgeVerdict::Rejected { reason: RejectReason::Water });
+                                }
+                                continue;
+                            }
                             let nkey = (nc, nr, qf(nf));
                             if closed.contains(&nkey) { continue; }
                             if let Some(t) = tr.as_deref_mut() {
@@ -3166,6 +3205,15 @@ impl Collision {
                         // pushed A* to dive to the bottom instead. Cheaper than the descent, so A*
                         // now prefers crossing at the top; the controller collide-and-slides off any
                         // wall that happens to sit in the water.
+                        // The out-of-step-range refusal records as Water (#615 review F5): the
+                        // neighbour IS water, but its surface sits beyond a step from here —
+                        // evaluated and refused, not unevaluated.
+                        if (surf - cz).abs() > STEP_H {
+                            if let Some(t) = tr.as_deref_mut() {
+                                t.edge([a[0], a[1], cz], [b[0], b[1], surf],
+                                    EdgeVerdict::Rejected { reason: RejectReason::Water });
+                            }
+                        }
                         if (surf - cz).abs() <= STEP_H && !closed.contains(&nkey) {
                             if let Some(t) = tr.as_deref_mut() {
                                 t.edge([a[0], a[1], cz], [b[0], b[1], surf],
@@ -3230,25 +3278,41 @@ impl Collision {
                         let wade = (top - cz).abs() <= STEP_H;
                         let dive = top < cz - 1.0;
                         let nkey = (nc, nr, qf(top));
-                        if (wade || dive) && !closed.contains(&nkey)
-                            && self.edge_clear([a[0], a[1], top + 0.5], [b[0], b[1], top + 0.5], radius, cell)
-                        {
+                        // The old single combined condition is split so each REFUSAL records its
+                        // own reason (#615 review F5): an unenterable swim plane (too far above
+                        // to wade onto, not below to dive to) is Water; a blocked swim-height ray
+                        // is Clearance. `closed` stays silent (that node's own expansion recorded
+                        // its edges), and the ray is still cast exactly once.
+                        if !(wade || dive) {
                             if let Some(t) = tr.as_deref_mut() {
                                 t.edge([a[0], a[1], cz], [b[0], b[1], top],
-                                    EdgeVerdict::Accepted { kind: EdgeKind::WaterEntry });
+                                    EdgeVerdict::Rejected { reason: RejectReason::Water });
                             }
-                            let horiz = (((dc * dc + dr * dr) as f32).sqrt()) * cell;
-                            let dz = top - cz;
-                            // Bias toward wading in over leaping into the deep (design §6.5/§7.1): the
-                            // vertical drop is charged at full (not half) rate so A* prefers a shallow
-                            // entry when one exists, while a dive stays available where it is the way in.
-                            let step = (horiz * horiz + dz * dz).sqrt() + dz.abs() * 0.5 + aggro_cost(b[0], b[1]);
-                            let tentative = g_cur + step;
-                            if tentative < *g_score.get(&nkey).unwrap_or(&f32::MAX) {
-                                g_score.insert(nkey, tentative);
-                                came.insert(nkey, ckey);
-                                floor_of.insert(nkey, top);
-                                heap.push(Node { f: tentative + h(nc, nr), c: nc, r: nr, fz: top });
+                        } else if !closed.contains(&nkey) {
+                            if !self.edge_clear([a[0], a[1], top + 0.5], [b[0], b[1], top + 0.5], radius, cell) {
+                                if let Some(t) = tr.as_deref_mut() {
+                                    t.edge([a[0], a[1], cz], [b[0], b[1], top],
+                                        EdgeVerdict::Rejected { reason: RejectReason::Clearance });
+                                }
+                            } else {
+                                if let Some(t) = tr.as_deref_mut() {
+                                    t.edge([a[0], a[1], cz], [b[0], b[1], top],
+                                        EdgeVerdict::Accepted { kind: EdgeKind::WaterEntry });
+                                }
+                                let horiz = (((dc * dc + dr * dr) as f32).sqrt()) * cell;
+                                let dz = top - cz;
+                                // Bias toward wading in over leaping into the deep (design §6.5/§7.1):
+                                // the vertical drop is charged at full (not half) rate so A* prefers a
+                                // shallow entry when one exists, while a dive stays available where it
+                                // is the way in.
+                                let step = (horiz * horiz + dz * dz).sqrt() + dz.abs() * 0.5 + aggro_cost(b[0], b[1]);
+                                let tentative = g_cur + step;
+                                if tentative < *g_score.get(&nkey).unwrap_or(&f32::MAX) {
+                                    g_score.insert(nkey, tentative);
+                                    came.insert(nkey, ckey);
+                                    floor_of.insert(nkey, top);
+                                    heap.push(Node { f: tentative + h(nc, nr), c: nc, r: nr, fz: top });
+                                }
                             }
                         }
                     }
@@ -3305,7 +3369,7 @@ impl Collision {
                             None => tracing::info!("find_path: NO ROUTE — frontier closed after {} nodes \
                                 (start_floor={start_floor}, goal_floor={goal_floor})", closed.len()),
                         }
-                        return Search { limit, progress, closed_n: closed.len(), best_toward: best_toward_xyz, ..Default::default() };
+                        return Search { limit, progress, closed_n: closed.len(), best_toward: best_toward_xyz, trace_call, ..Default::default() };
                     }
                 }
             }
@@ -3437,7 +3501,7 @@ impl Collision {
                 path.pop();
             }
             if path.is_empty() {
-                return Search { limit, progress, closed_n: closed.len(), ..Default::default() };
+                return Search { limit, progress, closed_n: closed.len(), trace_call, ..Default::default() };
             }
         }
         // THE ROUTE BEGINS AT THE CHARACTER (#229's last mile, part 2). The walker follows the route
@@ -3461,6 +3525,7 @@ impl Collision {
             progress: if reached_goal { 0.0 } else { progress },
             closed_n: closed.len(),
             best_toward: best_toward_xyz,
+            trace_call,
         }
     }
 }

@@ -56,6 +56,9 @@ pub const COL_GOAL:           [f32; 4] = [1.00, 1.00, 0.20, 1.00];
 pub const COL_PLAYER:         [f32; 4] = [1.00, 1.00, 1.00, 1.00];
 pub const COL_RING_OK:        [f32; 4] = [0.20, 0.80, 0.40, 0.80];
 pub const COL_RING_BLOCKED:   [f32; 4] = [1.00, 0.20, 0.20, 0.95];
+/// Trace-recording-truncated warning (#615 review F2): drawn wherever a call's edge recording was
+/// cut short, so a human never reads the recording boundary as the planner's real frontier.
+pub const COL_TRUNCATED:      [f32; 4] = [1.00, 0.30, 0.00, 1.00];
 
 /// The color for an ACCEPTED edge of the given kind.
 pub fn accept_color(kind: EdgeKind) -> [f32; 4] {
@@ -93,6 +96,18 @@ fn push_cross(v: &mut Vec<OverlayVertex>, p: [f32; 3], half: f32, color: [f32; 4
     push_line(v, [p[0], p[1], p[2] - half], [p[0], p[1], p[2] + half], color);
 }
 
+/// A horizontal ring of `segs` line segments around `p`.
+fn push_ring(v: &mut Vec<OverlayVertex>, p: [f32; 3], radius: f32, segs: usize, color: [f32; 4]) {
+    for i in 0..segs {
+        let a0 = (i as f32) / (segs as f32) * std::f32::consts::TAU;
+        let a1 = ((i + 1) as f32) / (segs as f32) * std::f32::consts::TAU;
+        push_line(v,
+            [p[0] + a0.cos() * radius, p[1] + a0.sin() * radius, p[2]],
+            [p[0] + a1.cos() * radius, p[1] + a1.sin() * radius, p[2]],
+            color);
+    }
+}
+
 /// Encode the snapshot as world-space LINE-LIST vertices (pairs). Pure: the snapshot in, the
 /// vertices out — see the module docs for why this signature is the anti-drift property itself.
 ///
@@ -122,6 +137,21 @@ pub fn trace_vertices(snap: &NavDebugSnapshot) -> Vec<OverlayVertex> {
                 };
                 push_line(&mut v, lift(e.from), lift(e.to), color);
             }
+            // TRUNCATION MUST BE VISIBLE (#615 review F2): if this call's recording was cut
+            // short, the abrupt end of the drawn field is the RECORDING boundary, not the
+            // planner's frontier — an unmarked one reads as "this is where nav stopped looking",
+            // a wrong triage conclusion in exactly the whole-zone-flood/no-path case this overlay
+            // exists for. Mark the spot recording stopped (the last recorded edge; the player /
+            // plan start when the call recorded nothing) with an unmissable double ring + beacon.
+            if call.truncated {
+                let anchor = call.edges.last().map(|e| e.to)
+                    .or(snap.player)
+                    .unwrap_or(plan.start);
+                let p = lift(anchor);
+                push_ring(&mut v, [p[0], p[1], p[2] + 1.0], 4.0, 16, COL_TRUNCATED);
+                push_ring(&mut v, [p[0], p[1], p[2] + 1.0], 6.0, 16, COL_TRUNCATED);
+                push_line(&mut v, p, [p[0], p[1], p[2] + 40.0], COL_TRUNCATED);
+            }
         }
     }
     v
@@ -145,8 +175,11 @@ pub fn live_vertices(snap: &NavDebugSnapshot) -> Vec<OverlayVertex> {
         push_cross(&mut v, lift(g), 2.0, COL_GOAL);
     }
 
-    // Player marker.
-    push_cross(&mut v, lift(snap.player), 1.5, COL_PLAYER);
+    // Player marker — ONLY when the position was known at publish time (#615 review F1: a
+    // fabricated `[0,0,0]` drew the marker 985 units from the character; unknown draws nothing).
+    if let Some(p) = snap.player {
+        push_cross(&mut v, lift(p), 1.5, COL_PLAYER);
+    }
 
     // The live clearance sample, drawn AT its own recorded position (`at` — where the probe was
     //    really taken, which may lag the player by a few ticks): wall spokes shaded by distance
@@ -305,7 +338,8 @@ mod tests {
             zone_model_loaded: true,
             nav_state: "navigating".into(),
             nav_reason: None,
-            player: [0.0, 0.0, 0.0],
+            player: Some([0.0, 0.0, 0.0]),
+            published_at: std::time::Instant::now(),
             goal: None,
             committed_coarse: vec![],
             committed_fine: vec![],
@@ -388,6 +422,48 @@ mod tests {
         assert_eq!(segments_of(COL_COARSE_ROUTE, &verts), 2, "2 segments for 3 committed waypoints");
         assert_eq!(segments_of(COL_FINE_ROUTE, &verts), 1);
         assert!(segments_of(COL_GOAL, &verts) >= 1, "the goal beacon is drawn");
+    }
+
+    /// **Truncated recording is VISIBLY marked (#615 review F2).** A call whose edge budget ran
+    /// out draws the double-ring + beacon at the point recording stopped, so the abrupt end of
+    /// the field cannot be mistaken for the planner's real frontier. An untruncated trace draws
+    /// no such marker (no crying wolf). Also pins the marker when the truncated call recorded
+    /// ZERO edges (the reviewer's live case: the deciding call starved to nothing) — it anchors
+    /// at the player instead of vanishing.
+    #[test]
+    fn truncated_recording_is_visibly_marked() {
+        // Untruncated: no marker.
+        let mut t = SearchTrace::with_budget(64);
+        t.begin_call(1.0, 8.0, true);
+        t.edge([0.0; 3], [8.0, 0.0, 0.0], EdgeVerdict::Accepted { kind: EdgeKind::Walk });
+        t.outcome_calls = (0, 1);
+        let verts = overlay_vertices(&snap_with(t));
+        assert_eq!(segments_of(COL_TRUNCATED, &verts), 0, "no truncation → no warning marker");
+
+        // Truncated with edges: rings (2×16 segments) + beacon (1) at the last recorded edge.
+        let mut t = SearchTrace::with_budget(2); // per-call cap 1
+        t.begin_call(1.0, 8.0, true);
+        t.edge([0.0; 3], [8.0, 0.0, 0.0], EdgeVerdict::Accepted { kind: EdgeKind::Walk });
+        t.edge([0.0; 3], [16.0, 0.0, 0.0], EdgeVerdict::Accepted { kind: EdgeKind::Walk }); // refused → truncated
+        t.outcome_calls = (0, 1);
+        let verts = overlay_vertices(&snap_with(t));
+        assert_eq!(segments_of(COL_TRUNCATED, &verts), 33,
+            "a truncated call must draw the double ring + beacon where recording stopped");
+
+        // Truncated with ZERO recorded edges (budget exhausted before the deciding call — the
+        // reviewer's live shape): the marker must still appear, anchored at the player.
+        let mut t = SearchTrace::with_budget(1); // per-call cap 1, global budget 1
+        t.begin_call(2.0, 8.0, true);
+        t.edge([0.0; 3], [8.0, 0.0, 0.0], EdgeVerdict::Accepted { kind: EdgeKind::Walk });
+        t.edge([0.0; 3], [16.0, 0.0, 0.0], EdgeVerdict::Accepted { kind: EdgeKind::Walk }); // budget gone
+        t.begin_call(1.0, 8.0, true); // deciding call
+        t.edge([0.0; 3], [24.0, 0.0, 0.0], EdgeVerdict::Accepted { kind: EdgeKind::Walk }); // refused
+        t.outcome_calls = (1, 2);
+        assert!(t.calls[1].truncated && t.calls[1].edges.is_empty(),
+            "fixture: the deciding call must be starved to zero recorded edges");
+        let verts = overlay_vertices(&snap_with(t));
+        assert!(segments_of(COL_TRUNCATED, &verts) >= 33,
+            "a starved deciding call must still be marked — silence would read as 'nothing more to see'");
     }
 
     /// The vertex type is what the GPU pipeline expects: 28 bytes, pos then color.

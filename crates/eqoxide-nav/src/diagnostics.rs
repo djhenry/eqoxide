@@ -141,42 +141,75 @@ pub struct CallTrace {
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct SearchTrace {
     pub calls: Vec<CallTrace>,
-    /// Half-open range `[start, end)` into `calls`: the call(s) made by the `find_path_ex_tiered`
-    /// invocation whose outcome `plan_path` actually RETURNED (the ring retries that lost, or a
-    /// generous pass a minimum pass superseded, sit outside it). Stamped by `plan_path_with_ctx`.
+    /// Half-open range `[start, end)` into `calls`: **the DECIDING call** — the one A* call whose
+    /// `Search` result actually became the plan's returned outcome. Tier retries (a generous pass a
+    /// minimum pass superseded), anchor retries, and ring retries that lost sit OUTSIDE this range,
+    /// so a consumer drawing "the answer" never paints a losing pass's rejections over the route
+    /// the walker is successfully walking (#615 review F4). Stamped by `plan_path_with_ctx` from
+    /// the per-call id the search itself reported (`Search::trace_call`); falls back to the whole
+    /// invocation's call range only when that id is unavailable.
     pub outcome_calls: (usize, usize),
     /// Remaining shared edge budget (not serialized — an internal bound, surfaced per call as
     /// `truncated`).
     #[serde(skip)]
     budget: usize,
+    /// Per-call recording cap (half the original budget — see [`SearchTrace::with_budget`]).
+    #[serde(skip)]
+    call_cap: usize,
+    /// Edges recorded into the CURRENT call (reset by `begin_call`).
+    #[serde(skip)]
+    cur_call_edges: usize,
+    /// Scratch: the call id of the most recent `search_tiered` answer, reported by
+    /// `find_path_ex_tiered` for `plan_path_with_ctx` to stamp into `outcome_calls`. Not part of
+    /// the published record.
+    #[serde(skip)]
+    pub last_answer: Option<usize>,
 }
 
 impl SearchTrace {
+    /// A trace with `budget` total edge records, and a PER-CALL cap of half that budget.
+    ///
+    /// The per-call cap is the #615-review F3 fix: with only a shared pool drawn down in call
+    /// order, a whole-zone generous-tier flood consumed the ENTIRE budget and the minimum-tier
+    /// call — the one that actually decides `no_path` — recorded zero edges, every time (the
+    /// generous pass always runs first). Capping any single call at half the budget guarantees
+    /// the second (deciding) call always has at least half the pool available — the same shape as
+    /// `generous_node_cap`'s slice of the node budget.
     pub fn with_budget(budget: usize) -> Self {
-        SearchTrace { budget, ..Default::default() }
+        SearchTrace { budget, call_cap: (budget / 2).max(1), ..Default::default() }
     }
 
     /// Open a new per-call record. Called by `astar` at entry (so even a call that evaluates
     /// nothing — `NoGeometry`, an immediately-unwalkable goal — leaves an honest empty record).
     pub fn begin_call(&mut self, clearance: f32, cell: f32, char_anchor: bool) {
+        self.cur_call_edges = 0;
         self.calls.push(CallTrace { clearance, cell, char_anchor, truncated: false, edges: Vec::new() });
     }
 
-    /// Record one edge verdict into the current call, honoring the plan-wide budget.
+    /// Record one edge verdict into the current call, honoring the plan-wide budget AND the
+    /// per-call cap (see [`SearchTrace::with_budget`]).
     #[inline]
     pub fn edge(&mut self, from: [f32; 3], to: [f32; 3], verdict: EdgeVerdict) {
         let Some(call) = self.calls.last_mut() else { return };
-        if self.budget == 0 {
+        if self.budget == 0 || self.cur_call_edges >= self.call_cap {
             call.truncated = true;
             return;
         }
         self.budget -= 1;
+        self.cur_call_edges += 1;
         call.edges.push(EdgeEval { from, to, verdict });
     }
 
     /// Total recorded edges across all calls.
     pub fn edge_count(&self) -> usize {
         self.calls.iter().map(|c| c.edges.len()).sum()
+    }
+
+    /// Did ANY call's recording get cut short? Consumers must surface this — a truncated trace
+    /// rendered without a marker reads its recording boundary as the planner's real frontier
+    /// (#615 review F2), a wrong conclusion about where nav stopped looking.
+    pub fn truncated(&self) -> bool {
+        self.calls.iter().any(|c| c.truncated)
     }
 }
 
@@ -232,11 +265,20 @@ pub enum PadKnowledge {
     /// The server advertised a same-zone destination but the honesty gate REFUSED it (footprint or
     /// destination not on walkable floor) — the planner fabricates no edge for it.
     AdvertisedUnusable,
-    /// Reserved for the #543 learning loop: one server-driven resolution was OBSERVED to stay in
-    /// this zone, landing at `dest`.
-    LearnedSameZone { dest: [f32; 3] },
-    /// Reserved for the #543 learning loop: observed to actually cross zones.
-    LearnedCrossZone { target_zone: u16 },
+    /// Reserved for the #543 learning loop: one or more server-driven resolutions were OBSERVED to
+    /// stay in this zone, landing at `dest`.
+    ///
+    /// PROVENANCE is part of the type from day one (#607 §3: every learned fact needs provenance
+    /// and a defined invalidation rule, visible to the agent): `observations` = how many times
+    /// this resolution was observed; `last_observed_ms` = unix-epoch ms of the most recent one.
+    /// Invalidation rule (enforced by the #543 learning loop when it lands, stated here so the
+    /// type carries the contract): a contradicting observation or a zone-geometry change resets
+    /// the entry to `Unknown` — a stale learned value presented as fact is worse than the
+    /// original unverifiable guess.
+    LearnedSameZone { dest: [f32; 3], observations: u32, last_observed_ms: u64 },
+    /// Reserved for the #543 learning loop: observed to actually cross zones. Same provenance +
+    /// invalidation contract as [`PadKnowledge::LearnedSameZone`].
+    LearnedCrossZone { target_zone: u16, observations: u32, last_observed_ms: u64 },
 }
 
 /// One pad's knowledge state, keyed by its DRNTP zone-point index.
@@ -298,8 +340,17 @@ pub struct NavDebugSnapshot {
     /// `/v1/observe/debug`'s `nav_state`/`nav_reason`).
     pub nav_state: String,
     pub nav_reason: Option<String>,
-    /// Player position when published `[east, north, up]`.
-    pub player: [f32; 3],
+    /// Player position when published `[east, north, up]` — **`None` when the position was not
+    /// known at publish time** (fresh login before the first server position, a zone reset). Never
+    /// a made-up `[0,0,0]`: a confident wrong position put the overlay's player marker 985 units
+    /// from the character (#615 review F1), which is exactly the falsehood class this snapshot
+    /// exists to remove.
+    pub player: Option<[f32; 3]>,
+    /// When this snapshot was published (monotonic). Not serialized — the HTTP layer computes
+    /// `published_age_ms` from it AT READ TIME (the #343 discipline: never cache an age), so a
+    /// consumer can always tell a stale snapshot from a fresh one.
+    #[serde(skip)]
+    pub published_at: std::time::Instant,
     /// The active `/goto` goal, if any.
     pub goal: Option<[f32; 3]>,
     /// **The walker's ACTUAL committed coarse route** (`Walker::path`, verbatim — the #246
@@ -329,19 +380,31 @@ mod tests {
     use super::*;
 
     /// The budget is shared across calls, bites exactly at the cap, and truncation is EXPLICIT.
+    /// **The per-call cap (#615 review F3) reserves room for the DECIDING call**: a first
+    /// (generous-tier) flood may record at most half the budget, so the second (minimum-tier,
+    /// deciding) call can never be starved to zero by call order.
     #[test]
-    fn trace_budget_is_shared_and_truncation_is_explicit() {
-        let mut t = SearchTrace::with_budget(3);
-        t.begin_call(2.0, 8.0, true);
-        t.edge([0.0; 3], [1.0; 3], EdgeVerdict::Accepted { kind: EdgeKind::Walk });
-        t.edge([0.0; 3], [2.0; 3], EdgeVerdict::Rejected { reason: RejectReason::Grade });
-        t.begin_call(1.0, 8.0, false);
-        t.edge([0.0; 3], [3.0; 3], EdgeVerdict::Accepted { kind: EdgeKind::Walk });
-        // Budget (3) exhausted: this one must NOT be recorded, and must flag truncation.
-        t.edge([0.0; 3], [4.0; 3], EdgeVerdict::Accepted { kind: EdgeKind::Walk });
-        assert_eq!(t.edge_count(), 3, "the cap bounds the recorded edges");
-        assert!(!t.calls[0].truncated, "the first call finished inside the budget");
-        assert!(t.calls[1].truncated, "the call that hit the cap must say so — silence would be a gap that lies");
+    fn trace_budget_is_shared_capped_per_call_and_truncation_is_explicit() {
+        // Budget 4 → per-call cap 2.
+        let mut t = SearchTrace::with_budget(4);
+        t.begin_call(2.0, 8.0, true); // "the generous flood"
+        for i in 0..10 {
+            t.edge([0.0; 3], [i as f32; 3], EdgeVerdict::Accepted { kind: EdgeKind::Walk });
+        }
+        assert_eq!(t.calls[0].edges.len(), 2,
+            "a single call may consume at most HALF the budget — the F3 reserve");
+        assert!(t.calls[0].truncated, "hitting the per-call cap must be explicit");
+
+        t.begin_call(1.0, 8.0, false); // "the deciding minimum pass"
+        t.edge([0.0; 3], [20.0; 3], EdgeVerdict::Rejected { reason: RejectReason::Clearance });
+        t.edge([0.0; 3], [21.0; 3], EdgeVerdict::Accepted { kind: EdgeKind::Walk });
+        assert_eq!(t.calls[1].edges.len(), 2,
+            "the deciding call must still have its reserved half of the budget");
+        // Global budget (4) now exhausted: further records refuse, explicitly.
+        t.edge([0.0; 3], [22.0; 3], EdgeVerdict::Accepted { kind: EdgeKind::Walk });
+        assert_eq!(t.edge_count(), 4, "the global budget still bounds the total");
+        assert!(t.calls[1].truncated, "the call that hit the global cap must say so — silence would be a gap that lies");
+        assert!(t.truncated(), "the whole-trace flag consumers must surface (F2)");
     }
 
     /// The JSON encoding of a verdict is the tagged form consumers rely on ("verdict" +
@@ -370,8 +433,8 @@ mod tests {
             PadKnowledge::Unknown,
             PadKnowledge::AdvertisedUsable { source: [0.0; 3], dest: [1.0; 3] },
             PadKnowledge::AdvertisedUnusable,
-            PadKnowledge::LearnedSameZone { dest: [1.0; 3] },
-            PadKnowledge::LearnedCrossZone { target_zone: 2 },
+            PadKnowledge::LearnedSameZone { dest: [1.0; 3], observations: 1, last_observed_ms: 1_700_000_000_000 },
+            PadKnowledge::LearnedCrossZone { target_zone: 2, observations: 1, last_observed_ms: 1_700_000_000_000 },
         ];
         let tags: Vec<String> = states.iter()
             .map(|k| serde_json::to_value(k).unwrap()["knowledge"].as_str().unwrap().to_string())
@@ -379,5 +442,9 @@ mod tests {
         let unique: std::collections::HashSet<&String> = tags.iter().collect();
         assert_eq!(unique.len(), states.len(), "every knowledge state must be distinguishable: {tags:?}");
         assert!(tags.contains(&"unknown".to_string()));
+        // #607 §3: learned facts carry their PROVENANCE on the wire, from day one.
+        let learned = serde_json::to_value(&states[3]).unwrap();
+        assert_eq!(learned["observations"], 1, "a learned fact must say how often it was observed");
+        assert!(learned["last_observed_ms"].is_u64(), "…and when it was last observed");
     }
 }

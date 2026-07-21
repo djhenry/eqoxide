@@ -1174,7 +1174,7 @@ impl ActionLoop {
 
         self.walker.drive_teleport_detect(gs);
 
-        let goal = match self.walker.resolve_goal() {
+        let goal = match self.walker.resolve_goal(gs) {
             Some(g) => g,
             None => return,
         };

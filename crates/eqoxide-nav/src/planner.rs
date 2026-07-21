@@ -330,9 +330,10 @@ fn worker_impl(req_rx: Receiver<PlanRequest>, rep_tx: Sender<PlanReply>, on_dequ
         // The headline number for #340: this is the synchronous stall that used to sit on the net
         // thread (capped at 150 ms per A* call, up to ~2 s per plan). It now sits here, where the
         // only thing waiting on it is the walker.
-        tracing::info!("nav-planner: plan #{} ({:.0},{:.0})->({:.0},{:.0}) took {}ms OFF the net thread → {} ({} edges traced)",
+        tracing::info!("nav-planner: plan #{} ({:.0},{:.0})->({:.0},{:.0}) took {}ms OFF the net thread → {} ({} edges traced{})",
             req.gen, req.start[0], req.start[1], req.goal[0], req.goal[1], plan_ms,
-            describe(&outcome), trace.edge_count());
+            describe(&outcome), trace.edge_count(),
+            if trace.truncated() { ", trace TRUNCATED — the recording boundary is NOT the search frontier" } else { "" });
         if rep_tx.send(PlanReply { gen: req.gen, start: req.start, goal: req.goal, outcome, plan_ms,
             goal_snapped, tight, trace }).is_err() {
             break; // ActionLoop gone (zone change / shutdown)
@@ -397,12 +398,17 @@ pub fn plan_path_with_ctx(
 ) -> (PlanOutcome, bool) {
     let radius = PLAYER_RADIUS;
 
-    // TRACE (#608): remember which A* calls each invocation contributes, and stamp the range whose
-    // outcome is actually RETURNED — so the published trace can say "these calls are the answer;
-    // the rest are the retries that lost". No-ops when the ctx carries no trace.
+    // TRACE (#608 / #615 review F4): stamp `outcome_calls` to exactly THE DECIDING CALL — the one
+    // A* call whose `Search` became the returned outcome, reported up through
+    // `Search::trace_call` → `ctx.trace_last_answer()`. Tier retries (a generous pass a minimum
+    // pass superseded) and anchor/ring retries that lost stay OUT of the stamped range, so a
+    // consumer drawing "the answer" never paints a losing pass's rejections over the committed
+    // route. The whole-invocation range is only a fallback for the (untraced-answer) edge case.
     let mark0 = ctx.trace_calls_len();
     let (first, first_tier) = col.find_path_ex_tiered(start, goal, radius, avoid, 8.0, None, aggro_buffer, ctx.clone());
-    let primary_range = (mark0, ctx.trace_calls_len());
+    let primary_range = ctx.trace_last_answer()
+        .map(|i| (i, i + 1))
+        .unwrap_or((mark0, ctx.trace_calls_len()));
     match first {
         // A real route, or an honest limit — either way, that's the answer (with its tier).
         PlanOutcome::Route(_) | PlanOutcome::Exhausted { .. } => {
@@ -446,7 +452,10 @@ pub fn plan_path_with_ctx(
         if usable {
             tracing::warn!("nav: start isolated at ({:.0},{:.0},{:.0}) — re-anchored to clean floor ({:.0},{:.0},{:.0})",
                 start[0], start[1], start[2], ax, ay, af);
-            ctx.trace_stamp_outcome((ring_mark, ctx.trace_calls_len()));
+            let ring_range = ctx.trace_last_answer()
+                .map(|i| (i, i + 1))
+                .unwrap_or((ring_mark, ctx.trace_calls_len()));
+            ctx.trace_stamp_outcome(ring_range);
             return (out, out_tier);
         }
     }
@@ -877,6 +886,77 @@ mod tests {
             .count();
         assert!(grade_rejects > 0,
             "a 2.5-grade face must appear in the trace as grade rejections (found none)");
+    }
+
+    /// **#615 review F4: `outcome_calls` is THE DECIDING CALL, not every call of the winning
+    /// invocation.** On a TIGHT route the generous (preferred-clearance) pass runs first, fails,
+    /// and records `Rejected {{ Clearance }}` all along the corridor; the minimum-tier pass then
+    /// threads it and IS the answer. Before this fix the stamped range covered both, so the
+    /// overlay drew the losing pass's rejections over the very route the walker was successfully
+    /// walking — an overlay visibly disagreeing with the committed plan, the exact failure class
+    /// this rebuild exists to remove. Mutation-checked at authoring time: stamping the whole
+    /// invocation range again turns this RED.
+    #[test]
+    fn outcome_calls_is_the_deciding_minimum_call_on_a_tight_route() {
+        use crate::diagnostics::{SearchTrace, TRACE_EDGE_CAP};
+        // Two plateaus joined ONLY by a 3u-wide catwalk over a 24u void (too wide to jump). The
+        // coarse generous pass requires `ledge_margin` (2u) of ground around every destination
+        // cell — the catwalk has ~1.5u — so it refuses the crossing and CLOSES; the minimum pass
+        // (margin 0, the character fits) threads it and IS the answer: the `search_tiered`
+        // two-pass tight shape at the coarse tier.
+        let terrain = vec![
+            quad(vec![[-40.0, 0.0, -60.0], [40.0, 0.0, -60.0], [40.0, 0.0, -12.0], [-40.0, 0.0, -12.0]]),
+            quad(vec![[-40.0, 0.0, 12.0], [40.0, 0.0, 12.0], [40.0, 0.0, 60.0], [-40.0, 0.0, 60.0]]),
+            quad(vec![[2.5, 0.0, -12.0], [5.5, 0.0, -12.0], [5.5, 0.0, 12.0], [2.5, 0.0, 12.0]]),
+        ];
+        let col = Collision::build(&ZoneAssets { terrain, objects: vec![], textures: vec![] }, 32.0);
+        let trace = Arc::new(std::sync::Mutex::new(SearchTrace::with_budget(TRACE_EDGE_CAP)));
+        let ctx = crate::collision::PlanCtx::worker().ensure_budget().with_trace(trace.clone());
+        let (out, tight) = plan_path_with_ctx(&col, [-50.0, 4.0, 0.0], [50.0, 4.0, 0.0], &[], 0.0, ctx);
+        assert!(matches!(out, PlanOutcome::Route(_)), "the slot must route: {out:?}");
+        assert!(tight, "fixture: the route must only exist at the minimum tier");
+
+        let t = trace.lock().unwrap();
+        let (o0, o1) = t.outcome_calls;
+        assert_eq!(o1 - o0, 1, "the outcome range is ONE call — the deciding one: {:?}", t.outcome_calls);
+        let deciding = &t.calls[o0];
+        assert!(deciding.clearance <= eqoxide_core::physics::PLAYER_RADIUS + 0.01,
+            "the deciding call on a tight route is the MINIMUM-tier pass (clearance {}), \
+             not the generous pass that lost", deciding.clearance);
+        // The losing generous pass is present in the record (the agent can still see it)…
+        assert!(t.calls.iter().enumerate()
+            .any(|(i, c)| (i < o0 || i >= o1) && c.clearance > deciding.clearance),
+            "the generous pass must still be recorded, OUTSIDE the outcome range");
+        // …and the deciding call itself contains the accepted corridor.
+        use crate::diagnostics::{EdgeKind, EdgeVerdict};
+        assert!(deciding.edges.iter().any(|e|
+            matches!(e.verdict, EdgeVerdict::Accepted { kind: EdgeKind::Walk })),
+            "the deciding call carries the accepted route edges");
+    }
+
+    /// **#615 review F5: `RejectReason::Water` is LIVE, not advertised-only.** A water-family
+    /// refusal must be recorded as evaluated-and-refused — under the endpoint's own semantics,
+    /// silence would make it read as *unevaluated*. Fixture: a walkable plane submerged under a
+    /// deep water column (surface 30u above the floor) — every surface-traversal probe finds
+    /// water whose surface is beyond step range, which is exactly the guard that used to `continue`
+    /// silently. Mutation-checked at authoring time: removing the record turns this RED.
+    #[test]
+    fn trace_records_water_rejections_when_water_refuses_an_edge() {
+        use crate::diagnostics::{EdgeVerdict, RejectReason, SearchTrace, TRACE_EDGE_CAP};
+        let terrain = vec![
+            quad(vec![[-60.0, 0.0, -60.0], [60.0, 0.0, -60.0], [60.0, 0.0, 60.0], [-60.0, 0.0, 60.0]]),
+        ];
+        let mut col = Collision::build(&ZoneAssets { terrain, objects: vec![], textures: vec![] }, 32.0);
+        col.set_water(Some(Arc::new(eqoxide_core::region_map::RegionMap::flat_below(30.0))));
+        let trace = Arc::new(std::sync::Mutex::new(SearchTrace::with_budget(TRACE_EDGE_CAP)));
+        let ctx = crate::collision::PlanCtx::worker().ensure_budget().with_trace(trace.clone());
+        let _ = plan_path_with_ctx(&col, [-40.0, 0.0, 0.0], [40.0, 0.0, 0.0], &[], 0.0, ctx);
+        let t = trace.lock().unwrap();
+        let water_rejects = t.calls.iter().flat_map(|c| &c.edges)
+            .filter(|e| matches!(e.verdict, EdgeVerdict::Rejected { reason: RejectReason::Water }))
+            .count();
+        assert!(water_rejects > 0,
+            "a water refusal must be RECORDED — silent, it reads as unevaluated, which is the F5 lie");
     }
 
     /// An untraced plan records nothing and costs nothing — the legacy path is unchanged.
