@@ -202,6 +202,16 @@ account:
   character_name: Aiquestbot
 ```
 
+**The `./config.yaml` fallback above applies only to the renderer/HTTP settings**
+(`renderer:` and `http_port`, loaded by `AppConfig`). The login settings (`server:` /
+`account:`, loaded by `LoginConfig`) have **no such fallback** — with no `--config` flag
+they are read only from `~/.config/eqoxide/config.yaml`, never from a `./config.yaml` in
+the working directory. So a `config.yaml` that exists only in the cwd silently supplies
+renderer settings and *no* login settings: the client falls back to its built-in login
+defaults (`127.0.0.1:5999`, empty credentials) with no warning, which looks like a login
+failure rather than a config-location mistake. Put the file in `~/.config/eqoxide/` (or
+pass `--config`) if it needs to carry `server:`/`account:`.
+
 ### Precedence: per-character config overrides the global one, key by key (#597)
 
 `--config <name|path>` selects a per-character file — and it selects **both** the login
@@ -236,6 +246,9 @@ Two guardrails keep that from recurring:
     value), a non-integer or out-of-range `http_port`. Such a value is **not** treated as a
     hit — the previous layer or the built-in default stands, and the disclosure attributes
     the value to the file that actually contains it.
+  - `renderer:` itself being the wrong shape, e.g. a list (`renderer: [1, 2]`) instead of a
+    map. (`renderer:` with no value, and `renderer: {}`, are legitimate no-ops and stay
+    silent — there is nothing to warn about.)
 
   An explicitly empty string (`asset_server_url: ""`) *is* a value: it overrides and is
   disclosed as such.
