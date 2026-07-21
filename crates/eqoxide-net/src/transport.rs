@@ -43,6 +43,17 @@ const MAX_RESEND_PER_PASS: usize = 300;
 /// instead. This 250ms cadence (was a hard-coded 1s) only makes the SESSION come up promptly when our
 /// first SESSION_REQUEST is dropped; SESSION_REQUEST is idempotent (the server dedupes), so a faster
 /// cadence is harmless at the transport layer.
+///
+/// This value is a LOWER BOUND on the interval actually observed on the wire, not the interval itself
+/// (#603): the retry loop in `connect` only re-evaluates `session_request_due` once per iteration of
+/// its `recv` call, which has a 100ms timeout — so a retry that becomes due partway through a `recv`
+/// wait sits out the remainder of that tick before firing. Measured effective interval: ~250-350ms
+/// (i.e. up to +100ms of quantization jitter per retry), not a clean 250ms. Documented rather than
+/// "fixed" (making the wait wake exactly at the due instant instead of polling every 100ms) because
+/// this is a live network path whose regression test (`connect_does_not_flood_session_request_faster_
+/// than_the_cadence`) just had a real flakiness problem removed (#549) — the added complexity and
+/// retest burden of an exact-wake timer isn't worth it for jitter that only ever makes the retry later,
+/// never faster/floodier.
 const SESSION_REQUEST_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Pure cadence predicate for the `connect` retry loop (#549): true once `now` is at least
@@ -398,9 +409,25 @@ impl EqStream {
             app_tx,
         };
 
+        // The very first send on a freshly connect()ed UDP socket reliably returns WouldBlock and is
+        // silently dropped by `send_raw`'s `let _ = try_send(..)` (verified empirically for #603: 50/50
+        // trials WouldBlocked, 0/50 succeeded). Cause: tokio only learns a socket is writable from an
+        // edge-triggered epoll event, and nothing between `bind`/`connect` above (neither does real I/O)
+        // ever gives its reactor a chance to observe one before we'd otherwise call `try_send` here. Before
+        // this fix that made the loop below do 100% of the work of getting a SESSION_REQUEST onto the
+        // wire, roughly one `SESSION_REQUEST_RETRY` interval after connect — this call looked like the
+        // primary attempt but never fired. Awaiting `writable()` once (measured: <30µs over 50 trials — a
+        // UDP send buffer is practically always free) primes that readiness so this send genuinely
+        // transmits, shaving up to one retry interval off connect time. The retry loop's own sends don't
+        // need this: once readiness has been observed, tokio keeps it marked ready.
+        let _ = stream.socket.writable().await;
         stream.send_session_request();
 
-        // Wait for SESSION_RESPONSE. Re-send SESSION_REQUEST every 1s in case of UDP loss.
+        // Wait for SESSION_RESPONSE, re-sending SESSION_REQUEST on the `session_request_due` cadence
+        // below in case of UDP loss. NOTE (#603): that cadence is only re-checked once per iteration of
+        // this loop's `recv` (100ms timeout, below), so a retry that becomes due mid-recv waits out the
+        // rest of that tick before firing — see `SESSION_REQUEST_RETRY`'s doc comment for the measured
+        // effective interval this produces.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         let mut last_send = std::time::Instant::now();
         let mut recv_buf = vec![0u8; 4096];
