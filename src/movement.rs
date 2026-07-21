@@ -111,6 +111,12 @@ pub struct CharacterController {
     /// fall damage. Height ALWAYS comes from this tracked airborne start, never a nav waypoint z.
     airborne_start_z:   Option<f32>,
     landed_fall_height: Option<f32>,
+    /// #529: the self-player currently has a Levitate effect — gravity is OFF and the character
+    /// HOVERS at altitude, free-floating over land/gaps/water instead of falling. Set each frame
+    /// from the server-authoritative buff/appearance state via [`Self::set_levitating`] (like
+    /// `underworld`), so EVERY driver — WASD, manual, nav — gets gravity-off with no per-`MoveIntent`
+    /// plumbing. Non-levitate physics is byte-identical (this only adds a branch when the flag is set).
+    levitating: bool,
     /// #444: set while THIS frame's `swim_sink` produced a GENUINE downward delta (the character
     /// actually descended through open water — resolved delta `< -SKIN` — not just held a down-wish
     /// that clamped to ~0 against a submerged floor, and not passive buoyancy). Read at the top of
@@ -131,7 +137,8 @@ impl CharacterController {
         Self { pos, vel_z: 0.0, on_ground: false, in_water: false,
                good: std::collections::VecDeque::new(), good_timer: 0.0, stuck_time: 0.0,
                hop_cooldown: 0.0, underworld: f32::NEG_INFINITY,
-               airborne_start_z: None, landed_fall_height: None, swim_sinking: false }
+               airborne_start_z: None, landed_fall_height: None, levitating: false,
+               swim_sinking: false }
     }
 
     /// Take-and-clear the one-shot fall height (feet dropped during the airborne stretch just
@@ -146,6 +153,15 @@ impl CharacterController {
     /// Called on zone load so the fall-through guard in `step` uses the current zone's threshold (#150).
     pub fn set_underworld(&mut self, underworld: Option<f32>) {
         self.underworld = underworld.unwrap_or(f32::NEG_INFINITY);
+    }
+
+    /// #529: set the self-player's Levitate state (from the server-authoritative buff/appearance
+    /// state, mirrored into `GameState::player_levitating`). Called each frame from the render loop,
+    /// like [`Self::set_underworld`], so the gravity-off hover branch in `step` follows the live buff
+    /// as it is cast and fades. Toggling it does NOT teleport or zero velocity — the next `step`
+    /// simply stops (or resumes) applying gravity; a buff fading mid-air resumes a normal fall.
+    pub fn set_levitating(&mut self, levitating: bool) {
+        self.levitating = levitating;
     }
 
     /// Hard-set the position (zone-in, teleport, large server correction). Clears velocity & stuck.
@@ -337,6 +353,25 @@ impl CharacterController {
             }
             // No bounded surface found: hold position rather than free-fall (a server correction or
             // the #150 underworld guard would otherwise have to recover us).
+        } else if self.levitating {
+            // §529: Levitate — gravity OFF. The self-player HOVERS at altitude and free-floats over
+            // land, gaps, and water instead of being pulled down. A floor that has risen to/above the
+            // feet (walking UP a slope) still lifts us so we don't clip into terrain; a floor that
+            // dropped away, or a gap/void with no floor below, is glided OVER at height, never fallen.
+            // Hovering is not a fall — clear any airborne tracking so no phantom fall damage latches
+            // when the buff fades. Jump / vertical input is ignored (native levitate has no vertical
+            // control). Reconciliation is unaffected: our hover Z is truthful and the server (which set
+            // the buff) agrees, and the nav streamer's correction keys off HORIZONTAL delta only.
+            self.vel_z = 0.0;
+            self.airborne_start_z = None;
+            let foot = self.pos[2];
+            let floor = col.ground_below(self.pos[0], self.pos[1], foot + GROUND_ORIGIN, GROUND_DEPTH);
+            match floor {
+                // Terrain at/above the feet: rest on it (standing, or walking up a ramp while levitating).
+                Some(f) if f >= foot - GROUND_SNAP_TOL => { self.pos[2] = f; self.on_ground = true; }
+                // Terrain below, or none at all: hold altitude — hover.
+                _ => { self.on_ground = false; }
+            }
         } else {
             // §444: exiting a suspended water volume through its BOTTOM via a deliberate swim_sink
             // (a floating slab over an open pit — pathological but real `.wtr` geometry) resumes a
@@ -835,6 +870,65 @@ mod tests {
         ctrl.on_ground = false;
         ctrl.step(walk(0.0, [0.0, 0.0]), 0.1, &c);
         assert!(ctrl.pos[2] < 50.0 && ctrl.vel_z < 0.0, "should fall under gravity: z={} vz={}", ctrl.pos[2], ctrl.vel_z);
+    }
+
+    /// #529 Levitate: a levitating self-player has gravity OFF — it HOVERS at altitude and
+    /// free-floats over land instead of falling, while a normal (non-levitate) character falls
+    /// exactly as before. MUTATION-CHECK: delete the `else if self.levitating` hover branch in
+    /// `step` (so gravity applies unconditionally) and the levitating assertion goes RED — the
+    /// hovering character falls all the way to the floor.
+    #[test]
+    fn levitating_player_hovers_instead_of_falling() {
+        // Floor at z=0; character suspended 50u above it with no horizontal input.
+        let c = col(vec![floor(0.0, -100.0, 100.0)]);
+        let start = [0.0, 0.0, 50.0];
+
+        // Levitating: gravity off → holds altitude (hovers), never sinks to the floor 50u below.
+        let mut lev = CharacterController::new(start);
+        lev.set_levitating(true);
+        for _ in 0..600 { lev.step(walk(0.0, [0.0, 0.0]), 1.0 / 60.0, &c); }
+        assert!((lev.pos[2] - 50.0).abs() < 0.5,
+            "levitating player must hover at altitude (~50), got {}", lev.pos[2]);
+        assert!(!lev.on_ground, "hovering over ground 50u below is not grounded");
+        assert_eq!(lev.vel_z, 0.0, "no fall velocity accumulates while levitating");
+
+        // Control: NOT levitating (default) → normal gravity pulls it down onto the floor. This is
+        // the byte-identical baseline the fix must not disturb.
+        let mut fall = CharacterController::new(start);
+        for _ in 0..600 { fall.step(walk(0.0, [0.0, 0.0]), 1.0 / 60.0, &c); }
+        assert!((fall.pos[2] - 0.0).abs() < 0.5,
+            "non-levitating player must fall to the floor (~0), got {}", fall.pos[2]);
+        assert!(fall.on_ground, "landed on the floor");
+    }
+
+    /// #529 nav-awareness: a levitating player driven horizontally off a ledge GLIDES over the gap
+    /// at hover height instead of dropping onto the lower floor below — the controller no longer
+    /// floor-snaps/falls it, so it traverses small gaps/water at altitude. (Having the `/goto`
+    /// PLANNER deliberately ROUTE a levitator across otherwise-impassable water is a larger
+    /// nav-model change, filed as a Slice-2 follow-up.)
+    #[test]
+    fn levitating_player_glides_over_a_lower_gap() {
+        // High ledge at z=0 over east[-50,0]; a lower floor at z=-40 over east[0,300] (the gap/water
+        // bed — a real gap has geometry below, unlike a bottomless void the unstuck net would fight).
+        // The lower floor spans the whole ~190u eastward run so neither character ever leaves the
+        // floored region (past the floor edge the depenetration net grabs a hoverer to the nearest
+        // floor — a separate bottomless-void edge case, not what this test measures).
+        let c = col(vec![floor(0.0, -50.0, 0.0), floor(-40.0, 0.0, 300.0)]);
+
+        // Levitating: glides east out over the gap, holding ~ledge height, not dropping to -40.
+        let mut lev = CharacterController::new([-10.0, 0.0, 0.0]);
+        lev.on_ground = true;
+        lev.set_levitating(true);
+        for _ in 0..400 { lev.step(walk(30.0, [1.0, 0.0]), 1.0 / 60.0, &c); }
+        assert!(lev.pos[0] > 5.0, "levitator should glide east out over the gap, got {}", lev.pos[0]);
+        assert!(lev.pos[2] > -5.0,
+            "must hover near ledge height (~0) over the gap, not drop to the -40 floor, got {}", lev.pos[2]);
+
+        // Control: a non-levitating walker falls onto the -40 gap floor.
+        let mut fall = CharacterController::new([-10.0, 0.0, 0.0]);
+        fall.on_ground = true;
+        for _ in 0..400 { fall.step(walk(30.0, [1.0, 0.0]), 1.0 / 60.0, &c); }
+        assert!(fall.pos[2] < -35.0, "non-levitating walker falls to the -40 gap floor, got {}", fall.pos[2]);
     }
 
     #[test]

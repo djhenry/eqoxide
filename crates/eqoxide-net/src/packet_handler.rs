@@ -2247,10 +2247,22 @@ fn apply_spawn_appearance(gs: &mut GameState, payload: &[u8]) {
     if id == gs.player_id {
         const GUILD_ID: u16 = 22;
         const GUILD_RANK: u16 = 23;
+        // #529: AppearanceType::FlyMode (EQEmu AT value 19) about our OWN spawn carries the
+        // GravityBehavior code in `param`: 0=off, 2=Levitating, 5=LevitateWhileRunning. The server
+        // sends this to self for zone-in-already-levitating AND for buff FADE/off, so it flips our
+        // gravity-off hover state on and off. KNOWN GAP (Slice-1 follow-up): a mid-zone cast-ON is
+        // deliberately NOT sent to self (`ignore_self=true`, EQEmu spell_effects.cpp) — self is meant
+        // to learn from OP_Buff's spellid cross-referenced to SPA 57, which requires a spell/SPA table
+        // eqoxide does not yet have. So an in-zone Levitate cast is only reflected at the next zone-in
+        // or on fade, not the instant it lands. Verified against the RoF2 patch / EQEmu server.
+        const FLY_MODE: u16 = 19;
         match kind {
             GUILD_ID   => { gs.player_guild_id = param;
                             tracing::info!("EQ: guild membership changed → guild_id={}", param); }
             GUILD_RANK => { gs.player_guild_rank = param; }
+            FLY_MODE   => { gs.player_levitating = eqoxide_core::coord::is_levitating_flymode(param as u8);
+                            tracing::info!("EQ: self FlyMode appearance param={} → levitating={}",
+                                           param, gs.player_levitating); }
             _ => {}
         }
     }
@@ -2679,6 +2691,10 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
         // Our own guild identity, from the self-spawn stream (#295). 0xFFFFFFFF/0 = no guild.
         gs.player_guild_id       = info.guild_id;
         gs.player_guild_rank     = info.guild_rank;
+        // #529: zoning in ALREADY levitating — the self-spawn's flymode carries Levitating(2) or
+        // LevitateWhileRunning(5). Seed the controller's gravity-off hover from it (mid-zone cast/
+        // fade is handled separately by the OP_SpawnAppearance Levitate toggle about our own id).
+        gs.player_levitating     = eqoxide_core::coord::is_levitating_flymode(info.flymode);
         tracing::info!("EQ: player spawn id={} pos=({:.1},{:.1},{:.1}) equip={:?} guild_id={}",
             info.spawn_id, info.x, info.y, info.z, gs.player_equipment, info.guild_id);
         return;
@@ -3668,6 +3684,25 @@ mod tests {
         apply_spawn_appearance(&mut gs, &crate::protocol::build_spawn_appearance_packet(77, 14, 110));
         apply_spawn_appearance(&mut gs, &crate::protocol::build_spawn_appearance_packet(999, 14, 100));
         assert!(gs.sitting, "another spawn's stand must not clear our sitting");
+    }
+
+    #[test]
+    fn apply_spawn_appearance_toggles_self_levitate() {
+        // #529: AppearanceType::FlyMode (19) about our OWN spawn flips gs.player_levitating —
+        // param 2 (Levitating) / 5 (LevitateWhileRunning) → on, param 0 → off. This is the wire
+        // signal for zone-in-already-levitating and for buff fade.
+        let mut gs = GameState::new();
+        gs.player_id = 77;
+        assert!(!gs.player_levitating, "default not levitating");
+        apply_spawn_appearance(&mut gs, &crate::protocol::build_spawn_appearance_packet(77, 19, 2));
+        assert!(gs.player_levitating, "FlyMode param 2 (Levitating) sets self levitating");
+        apply_spawn_appearance(&mut gs, &crate::protocol::build_spawn_appearance_packet(77, 19, 0));
+        assert!(!gs.player_levitating, "FlyMode param 0 (off, buff fade) clears self levitating");
+        apply_spawn_appearance(&mut gs, &crate::protocol::build_spawn_appearance_packet(77, 19, 5));
+        assert!(gs.player_levitating, "FlyMode param 5 (LevitateWhileRunning) sets self levitating");
+        // Another spawn's FlyMode must NOT change our own flag.
+        apply_spawn_appearance(&mut gs, &crate::protocol::build_spawn_appearance_packet(999, 19, 0));
+        assert!(gs.player_levitating, "another spawn's FlyMode must not clear our levitate state");
     }
 
     #[test]

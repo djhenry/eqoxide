@@ -51,6 +51,15 @@ pub const WIRE_Z_OFFSET: f32 = 3.125;
 pub const FLYMODE_FLYING: u8 = 1;
 /// See [`FLYMODE_FLYING`]. Levitating airborne mobs are excepted from the Z-offset the same way.
 pub const FLYMODE_LEVITATING: u8 = 2;
+/// `LevitateWhileRunning=5` (EQEmu `common/emu_constants.h:297`) — a second levitating variant.
+pub const FLYMODE_LEVITATE_WHILE_RUNNING: u8 = 5;
+
+/// True when a `flymode`/GravityBehavior wire code means "levitating" for gravity purposes: either
+/// plain `Levitating(2)` or `LevitateWhileRunning(5)`. Used for the SELF-player levitate model
+/// (#529: gravity-off hover) — a levitating self-spawn zones in with one of these codes.
+pub fn is_levitating_flymode(flymode: u8) -> bool {
+    flymode == FLYMODE_LEVITATING || flymode == FLYMODE_LEVITATE_WHILE_RUNNING
+}
 
 /// True when an entity's wire z is already at the reported datum (no server `GetZOffset` baked in),
 /// so it must be stored as-is on ingest (no `WIRE_Z_OFFSET` shift) and not floor-snapped by the
