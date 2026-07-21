@@ -293,6 +293,21 @@ impl Walker {
     /// Read handle for consumers/tests. The walker remains the only WRITER.
     pub fn debug_view(&self) -> &crate::diagnostics::NavDebugView { &self.nav_debug }
 
+    /// Is the published snapshot already the settled no-goto state (routes empty, state/reason in
+    /// sync with the live nav_state)? Used by `resolve_goal` so the no-goto tick publishes ONCE
+    /// when a goto ends rather than every idle tick.
+    fn debug_is_settled(&self) -> bool {
+        let snap = self.nav_debug.lock().unwrap();
+        match snap.as_ref() {
+            None => false,
+            Some(s) => {
+                let live = self.nav.nav_state.lock().unwrap();
+                s.committed_coarse.is_empty() && s.committed_fine.is_empty() && s.goal.is_none()
+                    && s.nav_state == live.state && s.nav_reason == live.reason
+            }
+        }
+    }
+
     /// Refresh the live clearance sample at a throttled cadence: the probe is ~48 raycasts, and
     /// the walker ticks on the net thread, so it is sampled every [`CLEARANCE_REFRESH_TICKS`]th
     /// tick rather than every tick — a diagnostic must not perturb the behaviour it observes. The
@@ -608,6 +623,13 @@ impl Walker {
                     || self.nav_state_is("planning") || self.nav_state_is(NAV_STATE_ZONE_LOADING)
                 {
                     self.set_nav_state("idle");
+                }
+                // Publish the cleared/terminal state so the snapshot does not keep saying
+                // "arrived"/"navigating" with a route after the goto ended (#608: the snapshot is
+                // as-of-publish, so the end of a goto must BE a publish). Only once per clear —
+                // when there was still a route or a live nav state to retire — not every idle tick.
+                if !self.debug_is_settled() {
+                    self.publish_debug(self.last_walk_pos, None);
                 }
                 return None;
             }
