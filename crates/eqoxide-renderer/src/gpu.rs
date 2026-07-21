@@ -1,7 +1,7 @@
 //! Low-level wgpu building blocks: vertex formats (`Vertex`, `SkinnedVertex`), GPU-side mesh/model/
 //! texture wrappers, and helpers to upload textures, build the depth buffer, and create bind groups.
 
-use crate::assets::TextureData;
+use eqoxide_assets::TextureData;
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -24,7 +24,7 @@ pub struct GpuMesh {
     pub texture_idx: Option<usize>,
     pub base_color:  [f32; 4],
     /// Transparency/blend mode — selects which zone pipeline draws this mesh.
-    pub render_mode: crate::assets::RenderMode,
+    pub render_mode: eqoxide_assets::RenderMode,
     /// Animated texture: `(interval_ms, frame texture-bind-group indices)`. The pass
     /// binds `frames[(now_ms/interval) % frames.len()]` instead of `texture_idx`.
     pub anim: Option<(u32, Vec<usize>)>,
@@ -41,7 +41,7 @@ pub struct GpuInstancedMesh {
     pub instance_count: u32,
     pub texture_idx:    Option<usize>,
     /// Transparency/blend mode — selects which instanced zone pipeline draws this.
-    pub render_mode:    crate::assets::RenderMode,
+    pub render_mode:    eqoxide_assets::RenderMode,
     /// Animated texture: `(interval_ms, frame texture-bind-group indices)`.
     pub anim:           Option<(u32, Vec<usize>)>,
 }

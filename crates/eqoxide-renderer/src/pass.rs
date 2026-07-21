@@ -18,11 +18,11 @@ fn anim_now_ms() -> u64 {
 /// Entity draw distance (EQ units, measured from the player). Beyond this an NPC's 3D
 /// model is not drawn — it's a distant speck. Combined with a frustum test, this caps
 /// the per-frame entity work in densely-populated zones (e.g. gfaydark, ~400 spawns).
-pub(crate) const ENTITY_DRAW_DIST: f32 = 500.0;
+pub const ENTITY_DRAW_DIST: f32 = 500.0;
 /// NDC slack for the frustum test so a tall model whose feet sit just off-screen still
 /// draws (the culled position is the feet; the body extends upward). Shared with the HUD so
 /// nameplates cull on the exact same distance+frustum test as models (#177).
-pub(crate) const ENTITY_CULL_MARGIN: f32 = 0.5;
+pub const ENTITY_CULL_MARGIN: f32 = 0.5;
 
 /// Vestigial: this used to HIDE an armor mesh whose exact material+variant texture was
 /// missing (e.g. the variant-03 main chest torso for an armor material that only ships
@@ -180,7 +180,7 @@ pub fn encode_zone_pass(
         occlusion_query_set: None,
     });
 
-    use crate::assets::RenderMode;
+    use eqoxide_assets::RenderMode;
     let tex_bg = |idx: Option<usize>| -> &wgpu::BindGroup {
         match idx {
             Some(i) if i < r.texture_bind_groups.len() => &r.texture_bind_groups[i],

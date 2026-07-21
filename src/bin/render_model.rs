@@ -571,7 +571,7 @@ fn gpu_skin_y_extent(
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("skin_probe"),
-        source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/skin_probe.wgsl").into()) });
+        source: wgpu::ShaderSource::Wgsl(eqoxide::pipeline::SKIN_PROBE_WGSL.into()) });
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("skin_probe"), layout: None, module: &module, entry_point: "main",
         compilation_options: Default::default(), cache: None });
@@ -739,7 +739,7 @@ impl ApplicationHandler for ModelViewerApp {
         let wireframe_pipeline = {
             let vert = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("wireframe_vert"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/character.wgsl").into()),
+                source: wgpu::ShaderSource::Wgsl(eqoxide::pipeline::CHARACTER_WGSL.into()),
             });
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("wireframe_layout"),
