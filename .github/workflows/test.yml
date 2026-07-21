@@ -19,6 +19,9 @@ jobs:
   # for the exact patterns and the (temporary) exclusions.
   no-local-detail:
     runs-on: ubuntu-latest
+    # A ~5-second script — this is generous headroom for consistency with the `test` job below,
+    # not because this job has any known hang risk.
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
       - name: check for local-system detail / proprietary-derived content
@@ -26,6 +29,11 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    # Bound the job explicitly instead of relying on GitHub's 6-hour default. The full build+test
+    # suite runs in ~1.5 minutes on this runner; 20 minutes is generous headroom while still
+    # catching a wedged process (e.g. a reintroduced lock-order deadlock, #593) in minutes instead
+    # of silently burning most of a day and reporting nothing.
+    timeout-minutes: 20
     # The repo's tracked .cargo/config.toml sets `rustc-wrapper = "sccache"` and
     # `rustflags = ["-C", "link-arg=-fuse-ld=mold"]` — a local-dev speed-up for the shared dev
     # box where both tools are installed. Neither exists on a bare `ubuntu-latest` runner, and

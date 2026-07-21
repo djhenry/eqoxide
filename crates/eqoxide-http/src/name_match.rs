@@ -199,7 +199,9 @@ pub(crate) fn resolve_entity(
 /// linkdead, while the HTTP request never returns. Found by review on the first cut of #513, which
 /// had put the inverted order on the two endpoints an agent hits hardest.
 ///
-/// Keep this the ONLY place in the HTTP layer that holds both at once.
+/// This is not the only place in the HTTP layer that holds both at once — `move_api::
+/// current_target_match` also does, in the same canonical order. The invariant that actually
+/// matters: **every site that holds both must take `entity_positions` BEFORE `entity_ids`.**
 pub(crate) fn resolve_in_world(
     world: &eqoxide_ipc::WorldSlots,
     name: &str,
@@ -378,13 +380,17 @@ mod tests {
     /// other wants: a permanent deadlock on `std::sync::Mutex` (no timeout, no recovery) that
     /// wedges the client and goes linkdead.
     ///
-    /// This hammers `resolve_in_world` against a thread replaying the net thread's exact order.
-    /// **The failure mode of a reintroduced inversion is a HANG, not an assertion** — if this test
-    /// ever stops terminating, someone flipped the order back.
+    /// This hammers `resolve_in_world` against a thread replaying the net thread's exact order,
+    /// on a SEPARATE thread from the test's main thread, so a reintroduced inversion turns into a
+    /// bounded, diagnostic test failure instead of wedging the whole `cargo test` process (and, in
+    /// CI, silently burning GitHub Actions' 6-hour default job timeout while reporting nothing —
+    /// see #593). A deadlocked hammer thread can never be joined, so on timeout we deliberately do
+    /// NOT try to join or kill it — we panic from the main thread and let the process exit.
     #[test]
     fn resolve_in_world_uses_the_net_threads_lock_order_and_cannot_deadlock() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
 
         let world = eqoxide_ipc::WorldSlots::default();
         for i in 0..20u32 {
@@ -404,12 +410,42 @@ mod tests {
             }
         });
 
-        for _ in 0..5_000 {
-            let m = resolve_in_world(&world, "a rat", Some((0.0, 0.0, 0.0)));
-            assert!(m.is_some(), "the seeded entities must always resolve");
+        // The hammer runs on its OWN thread so the main thread is free to bound it with a timeout
+        // instead of blocking on it directly — a reintroduced ABBA inversion deadlocks this thread
+        // permanently, and only a thread that ISN'T stuck can detect that and fail loudly.
+        let (tx, rx) = mpsc::channel();
+        let world2 = world.clone();
+        std::thread::spawn(move || {
+            for _ in 0..5_000 {
+                let m = resolve_in_world(&world2, "a rat", Some((0.0, 0.0, 0.0)));
+                assert!(m.is_some(), "the seeded entities must always resolve");
+            }
+            // Ignore a failed send: if the receiver already gave up (timed out and panicked), there
+            // is nothing left to notify — the process is exiting via that panic regardless.
+            let _ = tx.send(());
+        });
+
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(()) => {
+                stop.store(true, Ordering::Relaxed);
+                net.join().expect("net-thread stand-in must not have panicked");
+            }
+            // Timeout: the hammer thread never reached the `tx.send`, and it's still out there
+            // (never join a thread we suspect is deadlocked) — this is the lock-order inversion
+            // this test exists to catch.
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!(
+                "lock-order inversion: resolve_in_world deadlocked against sync_entities' order"
+            ),
+            // Disconnected: `tx` was dropped WITHOUT sending, which only happens if the hammer
+            // thread's own body panicked first (e.g. the `assert!` above) — a real deadlock can
+            // never produce this, since a wedged thread still holds `tx` alive. Report the true
+            // failure instead of the lock-order message, which would send a maintainer hunting an
+            // inversion that doesn't exist.
+            Err(mpsc::RecvTimeoutError::Disconnected) => panic!(
+                "hammer thread died before completing (see its panic above) — this is NOT a \
+                 lock-order inversion, something else broke resolve_in_world"
+            ),
         }
-        stop.store(true, Ordering::Relaxed);
-        net.join().expect("net-thread stand-in must not have panicked");
     }
 
     #[test]
