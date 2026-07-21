@@ -590,6 +590,12 @@ pub struct GameState {
     pub player_guild_id: u32,
     /// Player's rank within the guild (guildrank): 0 member, 1 officer, 2 leader (RoF2). (#295)
     pub player_guild_rank: u32,
+    /// #529: the self-player currently has a Levitate effect active (gravity off — the character
+    /// free-floats/hovers over land rather than falling). Server-authoritative: set from the
+    /// self-spawn's `flymode` (zone-in already levitating) and toggled by OP_SpawnAppearance
+    /// Levitate updates about our own spawn id (mid-zone cast/fade). The render controller mirrors
+    /// this each frame via `CharacterController::set_levitating` so it stops applying gravity.
+    pub player_levitating: bool,
     /// guild id → guild name, built from OP_GuildsList (the server's guild-name table). Used to
     /// resolve `player_guild_id` and each roster member's guild to a display name. (#295)
     pub guild_names: std::collections::HashMap<u32, String>,

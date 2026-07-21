@@ -2247,10 +2247,28 @@ fn apply_spawn_appearance(gs: &mut GameState, payload: &[u8]) {
     if id == gs.player_id {
         const GUILD_ID: u16 = 22;
         const GUILD_RANK: u16 = 23;
+        // #529: AppearanceType::FlyMode (EQEmu AT value 19) about our OWN spawn carries the
+        // GravityBehavior code in `param`. In practice this handler is our levitate-CLEAR channel:
+        // per EQEmu source (#587 review, verified against zone/spell_effects.cpp + zone/mob.cpp), the
+        // server sends FlyMode to self ONLY on buff FADE / forced cancel — with `param=0` (gravity
+        // back on). Both the mid-zone CAST-on (spell_effects.cpp:~1451) and the zone-in buff-reapply
+        // (client_packet.cpp:~714) call SendAppearancePacket(FlyMode, .., ignore_self=true), so self
+        // NEVER receives a `param=2/5` SET on this opcode. Levitate is therefore SET elsewhere — from
+        // the self-SPAWN-STRUCT `flymode` byte at zone-in (see the self-spawn branch in
+        // `register_spawn`, baked 2/0) — and CLEARED here when `param==0` arrives. Routing `param`
+        // through `is_levitating_flymode` keeps the (dead-on-this-path) 2/5 arm defensively correct.
+        // KNOWN GAP (Slice-1 follow-up #586): a mid-zone cast-ON is not observable to self on any
+        // opcode we decode — the real client infers it from OP_Buff's spellid × SPA 57, which needs a
+        // spell/SPA table eqoxide lacks — so an in-zone Levitate cast is only reflected at the next
+        // zone-in, not the instant it lands.
+        const FLY_MODE: u16 = 19;
         match kind {
             GUILD_ID   => { gs.player_guild_id = param;
                             tracing::info!("EQ: guild membership changed → guild_id={}", param); }
             GUILD_RANK => { gs.player_guild_rank = param; }
+            FLY_MODE   => { gs.player_levitating = eqoxide_core::coord::is_levitating_flymode(param as u8);
+                            tracing::info!("EQ: self FlyMode appearance param={} → levitating={}",
+                                           param, gs.player_levitating); }
             _ => {}
         }
     }
@@ -2679,6 +2697,13 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
         // Our own guild identity, from the self-spawn stream (#295). 0xFFFFFFFF/0 = no guild.
         gs.player_guild_id       = info.guild_id;
         gs.player_guild_rank     = info.guild_rank;
+        // #529: zoning in ALREADY levitating — the self-spawn's `flymode` byte is the ONLY channel
+        // that delivers the levitate SET to self (EQEmu FillSpawnStruct bakes it `2` for a levitating
+        // client, `0` otherwise — never `5`; the zone-in FlyMode appearance is ignore_self, #587
+        // review). Seed the controller's gravity-off hover from it. CLEAR (mid-zone fade) arrives
+        // separately as OP_SpawnAppearance FlyMode param=0 about our own id; a mid-zone cast-ON is not
+        // observable to self until the next zone-in (known gap #586).
+        gs.player_levitating     = eqoxide_core::coord::is_levitating_flymode(info.flymode);
         tracing::info!("EQ: player spawn id={} pos=({:.1},{:.1},{:.1}) equip={:?} guild_id={}",
             info.spawn_id, info.x, info.y, info.z, gs.player_equipment, info.guild_id);
         return;
@@ -3668,6 +3693,27 @@ mod tests {
         apply_spawn_appearance(&mut gs, &crate::protocol::build_spawn_appearance_packet(77, 14, 110));
         apply_spawn_appearance(&mut gs, &crate::protocol::build_spawn_appearance_packet(999, 14, 100));
         assert!(gs.sitting, "another spawn's stand must not clear our sitting");
+    }
+
+    #[test]
+    fn apply_spawn_appearance_toggles_self_levitate() {
+        // #529: AppearanceType::FlyMode (19) about our OWN spawn routes through the handler:
+        // param 0 → CLEAR (the real self path — the server sends FlyMode to self only on buff
+        // fade/cancel, param=0), while param 2/5 → set exercises the defensive routing (those never
+        // actually reach self on this opcode — cast-on & zone-in reapply are ignore_self; the SET
+        // comes from the self-spawn flymode byte instead). Another spawn's FlyMode must not touch us.
+        let mut gs = GameState::new();
+        gs.player_id = 77;
+        assert!(!gs.player_levitating, "default not levitating");
+        apply_spawn_appearance(&mut gs, &crate::protocol::build_spawn_appearance_packet(77, 19, 2));
+        assert!(gs.player_levitating, "FlyMode param 2 (Levitating) sets self levitating");
+        apply_spawn_appearance(&mut gs, &crate::protocol::build_spawn_appearance_packet(77, 19, 0));
+        assert!(!gs.player_levitating, "FlyMode param 0 (off, buff fade) clears self levitating");
+        apply_spawn_appearance(&mut gs, &crate::protocol::build_spawn_appearance_packet(77, 19, 5));
+        assert!(gs.player_levitating, "FlyMode param 5 (LevitateWhileRunning) sets self levitating");
+        // Another spawn's FlyMode must NOT change our own flag.
+        apply_spawn_appearance(&mut gs, &crate::protocol::build_spawn_appearance_packet(999, 19, 0));
+        assert!(gs.player_levitating, "another spawn's FlyMode must not clear our levitate state");
     }
 
     #[test]

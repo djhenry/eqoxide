@@ -1210,6 +1210,10 @@ impl App {
                     // Keep the fall-through guard's threshold current with the zone's underworld
                     // floor (from OP_NewZone), so a collision gap can't drop us below it (#150).
                     self.controller.set_underworld(self.game_state_view.world.zone_underworld);
+                    // #529: mirror the self-player's Levitate state so the controller floats (gravity
+                    // off) instead of falling while the buff is up. Tracks the live buff as it is cast
+                    // and fades; false for a normal grounded character (physics byte-identical).
+                    self.controller.set_levitating(self.game_state_view.player_levitating);
                     self.controller.step(intent, dt, c);
                 }
             }
