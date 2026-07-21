@@ -2,6 +2,19 @@
 
 use std::path::{Path, PathBuf};
 
+/// Test-only override for the directory [`AppConfig::load`]'s `./config.yaml`
+/// fallback searches (see [`AppConfig::load_fallback_dir`]). `thread_local`, not a
+/// process-global: each test thread gets its own cell, so a test can drive the
+/// real `load()` call site end-to-end without `std::env::set_current_dir` — which
+/// mutates every relative-path lookup in the whole process — and without any risk
+/// of leaking into another test running concurrently on a different thread (#604
+/// F1, review of PR #611).
+#[cfg(test)]
+thread_local! {
+    static LOAD_FALLBACK_DIR_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        std::cell::RefCell::new(None);
+}
+
 /// Directory where eqoxide stores its config and cached per-character login
 /// credentials: `~/.config/eqoxide/` (honoring `XDG_CONFIG_HOME` via the `dirs`
 /// crate). Created on demand; on failure we fall back to the working directory.
@@ -83,16 +96,69 @@ impl AppConfig {
     /// `--config`** (the path being what [`LoginConfig::resolve_path`] resolved it
     /// to); that file is layered on top of the global `config.yaml`. `None` means
     /// no `--config` was given: only the global file is read, with no second layer
-    /// and no warning about one — byte-for-byte the pre-#597 behavior, including
-    /// the `./config.yaml` fallback.
+    /// and no warning about one — the same merge/warning behavior as pre-#597,
+    /// including the `./config.yaml` fallback. One cosmetic difference from
+    /// pre-#604: the fallback's disclosed source string is now `./config.yaml`
+    /// rather than bare `config.yaml` (see [`load_fallback_dir`](Self::load_fallback_dir));
+    /// that string's only consumer is the startup disclosure log line, and
+    /// [`same_file`] is unaffected because it canonicalizes both sides before
+    /// comparing.
     pub fn load(config_path: Option<&Path>) -> Self {
+        Self::load_with_fallback_dir(config_path, &Self::load_fallback_dir())
+    }
+
+    /// The directory [`load`](Self::load) searches for the `./config.yaml`
+    /// back-compat fallback: always `.` (the real process cwd) in production.
+    ///
+    /// `load_with_fallback_dir`'s own tests (below) exercise the merge/fallback
+    /// logic thoroughly by calling it directly — but none of them called `load()`
+    /// itself, so a mutation of *its* hardcoded fallback argument went completely
+    /// undetected (#604 F1, review of PR #611: reverting this to a hardcoded `.`
+    /// literal left the whole `eqoxide-core` suite green, 113/113). This method is
+    /// the fix: the ONLY thing that changes between production and test is this one
+    /// call, via a `thread_local` override (`LOAD_FALLBACK_DIR_OVERRIDE`) rather
+    /// than `std::env::set_current_dir` — so `load_wires_the_fallback_dir_through_
+    /// to_load_with_fallback_dir` below can drive the real `load()` call site
+    /// end-to-end without mutating the process's actual working directory.
+    #[cfg(test)]
+    fn load_fallback_dir() -> PathBuf {
+        LOAD_FALLBACK_DIR_OVERRIDE
+            .with(|o| o.borrow().clone())
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// Non-test build: always the real process cwd. See the `#[cfg(test)]` overload
+    /// above for why this indirection exists.
+    #[cfg(not(test))]
+    fn load_fallback_dir() -> PathBuf {
+        PathBuf::from(".")
+    }
+
+    /// Test-only: run `f` with [`load`](Self::load)'s fallback directory overridden
+    /// to `dir`, on this thread only (see [`load_fallback_dir`](Self::load_fallback_dir)
+    /// and the `LOAD_FALLBACK_DIR_OVERRIDE` thread_local above it).
+    #[cfg(test)]
+    fn with_load_fallback_dir_for_test<R>(dir: &Path, f: impl FnOnce() -> R) -> R {
+        LOAD_FALLBACK_DIR_OVERRIDE.with(|o| *o.borrow_mut() = Some(dir.to_path_buf()));
+        let out = f();
+        LOAD_FALLBACK_DIR_OVERRIDE.with(|o| *o.borrow_mut() = None);
+        out
+    }
+
+    /// Same as [`load`](Self::load), but takes the `./config.yaml` fallback
+    /// directory as an explicit parameter instead of resolving it via
+    /// [`load_fallback_dir`](Self::load_fallback_dir). Behaviourally identical to
+    /// `load()` for the merge/warning logic; tests use this directly to exercise
+    /// that logic with an isolated temp dir standing in for the fallback
+    /// directory, without touching the real process cwd.
+    fn load_with_fallback_dir(config_path: Option<&Path>, fallback_dir: &Path) -> Self {
         let mut layers: Vec<(String, String)> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
 
         // Layer 1: the global config. Prefer ~/.config/eqoxide/config.yaml; fall
-        // back to ./config.yaml for back-compat.
+        // back to <fallback_dir>/config.yaml for back-compat (`.` in production).
         let primary = config_dir().join("config.yaml");
-        let fallback = PathBuf::from("config.yaml");
+        let fallback = fallback_dir.join("config.yaml");
         let mut global_path: Option<PathBuf> = None;
         if let Ok(t) = std::fs::read_to_string(&primary) {
             global_path = Some(primary.clone());
@@ -156,29 +222,44 @@ impl AppConfig {
             })
             .collect();
 
-        // Report MISPLACED and UNKNOWN keys instead of dropping them. Three shapes,
-        // all of which used to vanish without a trace:
+        // Report MISPLACED and UNKNOWN keys instead of dropping them. Four shapes,
+        // all of which used to (or would) vanish without a trace:
         //   renderer.<unknown>   — a typo'd or unsupported renderer key
         //   renderer.http_port   — a top-level key nested one level too deep
         //   <renderer key> at top level — the pre-#597 docs showed exactly this
         //                          layout, so configs written against them have it
+        //   renderer: <not a map> — e.g. `renderer: [1, 2]`. `renderer:` null and
+        //                          `renderer: {}` are legitimate no-ops (nothing to
+        //                          merge) and stay silent; any OTHER shape is a
+        //                          config author's mistake and warns (#604).
         for (label, cfg) in &parsed {
-            if let Some(serde_yaml::Value::Mapping(m)) = cfg.get("renderer") {
-                for k in m.keys().filter_map(|k| k.as_str()) {
-                    if KNOWN_RENDERER_KEYS.contains(&k) {
-                        continue;
+            match cfg.get("renderer") {
+                Some(serde_yaml::Value::Mapping(m)) => {
+                    for k in m.keys().filter_map(|k| k.as_str()) {
+                        if KNOWN_RENDERER_KEYS.contains(&k) {
+                            continue;
+                        }
+                        if k == "http_port" {
+                            warnings.push(format!(
+                                "config {label}: 'http_port' must be a TOP-LEVEL key, not under 'renderer:' \
+                                 — this one is IGNORED"
+                            ));
+                        } else {
+                            warnings.push(format!(
+                                "config {label}: unknown key 'renderer.{k}' is IGNORED (known keys: {})",
+                                KNOWN_RENDERER_KEYS.join(", ")
+                            ));
+                        }
                     }
-                    if k == "http_port" {
-                        warnings.push(format!(
-                            "config {label}: 'http_port' must be a TOP-LEVEL key, not under 'renderer:' \
-                             — this one is IGNORED"
-                        ));
-                    } else {
-                        warnings.push(format!(
-                            "config {label}: unknown key 'renderer.{k}' is IGNORED (known keys: {})",
-                            KNOWN_RENDERER_KEYS.join(", ")
-                        ));
-                    }
+                }
+                Some(serde_yaml::Value::Null) | None => {}
+                Some(other) => {
+                    warnings.push(format!(
+                        "config {label}: 'renderer:' is present but is {}, not a map — IGNORED \
+                         (no renderer settings come from this layer; known keys: {})",
+                        yaml_type(other),
+                        KNOWN_RENDERER_KEYS.join(", ")
+                    ));
                 }
             }
             if let serde_yaml::Value::Mapping(m) = cfg {
@@ -739,6 +820,14 @@ http_port: 8795
     /// `./config.yaml` fallback (no file in the XDG dir), `load()` must be SILENT.
     /// Exercises the fallback branch through the real loader — `from_layers` cannot
     /// reach it, so `single_layer_matches_legacy_behavior_and_defaults` never did.
+    ///
+    /// Calls the REAL public `load()` (not `load_with_fallback_dir` directly) via
+    /// `with_load_fallback_dir_for_test`, so this drives production's actual call
+    /// site end-to-end. `std::env::set_current_dir` is process-global and would
+    /// race any other cwd-sensitive test later added to this crate; the
+    /// thread-local override does not (#604 F1, review of PR #611 — the earlier
+    /// version of this test called `load_with_fallback_dir` directly, which left
+    /// `load()`'s own hardcoded fallback argument completely uncovered).
     #[test]
     fn load_with_no_config_flag_uses_the_cwd_fallback_silently() {
         let tmp = tempfile::tempdir().unwrap();          // empty XDG_CONFIG_HOME
@@ -747,16 +836,16 @@ http_port: 8795
             "renderer:\n  asset_server_url: http://fallback:8088\n").unwrap();
 
         with_config_home(tmp.path(), || {
-            let prev_cwd = std::env::current_dir().unwrap();
-            std::env::set_current_dir(cwd.path()).unwrap();
-            let cfg = AppConfig::load(None);
-            std::env::set_current_dir(prev_cwd).unwrap();
+            AppConfig::with_load_fallback_dir_for_test(cwd.path(), || {
+                let cfg = AppConfig::load(None);
 
-            assert_eq!(cfg.asset_server_url, "http://fallback:8088");
-            assert_eq!(cfg.source_of("asset_server_url"), Source::File("config.yaml".into()));
-            assert!(cfg.warnings.is_empty(),
-                "the ./config.yaml fallback must not warn (it IS the global config): {:?}",
-                cfg.warnings);
+                assert_eq!(cfg.asset_server_url, "http://fallback:8088");
+                assert_eq!(cfg.source_of("asset_server_url"),
+                    Source::File(cwd.path().join("config.yaml").display().to_string()));
+                assert!(cfg.warnings.is_empty(),
+                    "the ./config.yaml fallback must not warn (it IS the global config): {:?}",
+                    cfg.warnings);
+            });
         });
     }
 
@@ -835,6 +924,35 @@ http_port: 8795
         assert_eq!(cfg.asset_server_url, "");
         assert_eq!(cfg.source_of("asset_server_url"), Source::File("c.yaml".into()));
         assert!(cfg.warnings.is_empty(), "{:?}", cfg.warnings);
+    }
+
+    /// #604: `renderer:` itself can be the wrong shape — a sequence where a map is
+    /// expected. `renderer:` null and `renderer: {}` are legitimate no-ops and must
+    /// stay silent; anything else (a list, a scalar) must warn like every other
+    /// wrong-typed renderer value, not vanish.
+    #[test]
+    fn list_shaped_renderer_block_warns_instead_of_being_dropped_silently() {
+        let cfg = AppConfig::from_layers(&layers(&[
+            ("g.yaml", GLOBAL),
+            ("c.yaml", "renderer:\n  - 1\n  - 2\n"),
+        ]));
+        // The malformed layer contributes nothing; the previous layer stands.
+        assert_eq!(cfg.asset_server_url, "http://localhost:8088");
+        assert_eq!(cfg.source_of("asset_server_url"), Source::File("g.yaml".into()));
+        let joined = cfg.warnings.join("\n");
+        assert!(joined.contains("c.yaml") && joined.contains("'renderer:'")
+            && joined.contains("a list") && joined.contains("not a map"),
+            "no warning for list-shaped renderer: block: {joined}");
+
+        // A scalar under `renderer:` warns the same way.
+        let cfg = AppConfig::from_layers(&layers(&[("s.yaml", "renderer: 5\n")]));
+        assert!(cfg.warnings.join("\n").contains("is a number"), "{:?}", cfg.warnings);
+
+        // `renderer: null` and `renderer: {}` are legitimate no-ops and stay silent.
+        let cfg = AppConfig::from_layers(&layers(&[("n.yaml", "renderer:\n")]));
+        assert!(cfg.warnings.is_empty(), "renderer: null must stay silent: {:?}", cfg.warnings);
+        let cfg = AppConfig::from_layers(&layers(&[("e.yaml", "renderer: {}\n")]));
+        assert!(cfg.warnings.is_empty(), "renderer: {{}} must stay silent: {:?}", cfg.warnings);
     }
 
     /// F6: pin the disclosure text itself. Without this, swapping two fields inside
