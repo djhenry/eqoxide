@@ -2543,13 +2543,18 @@ impl ActionLoop {
                 // Zone-point target coords are wire-datum (DB safe coords, model-origin z ~3.1u
                 // above the floor) — convert to the internal foot datum (#522).
                 gs.player_z = dest_pos[2] - eqoxide_core::coord::WIRE_Z_OFFSET;
+                // PROVISIONAL: this is the client's OPTIMISTIC local guess from the advertised
+                // zone_id, NOT a confirmed outcome. Same-vs-cross is decided ONLY by the server's
+                // echoed zone_id (#554) — the server resolves the crossing index-blind by nearest-XY
+                // trigger and can return a DIFFERENT zone (qeynos2 index=2 → qcat, #543). So do NOT
+                // claim "(no reconnect)" here: if the echo disagrees, the receive side reconnects.
                 tracing::info!(
-                    "zone_cross: same-zone translocator index={index} → in-zone reposition to ({:.0},{:.0},{:.0}) (no reconnect)",
+                    "zone_cross: index={index} → PROVISIONAL in-zone reposition to ({:.0},{:.0},{:.0}) (server echo decides same-vs-cross, #554)",
                     dest_pos[0], dest_pos[1], dest_pos[2]);
             } else {
-                tracing::info!("zone_cross: same-zone translocator index={index} → server keeps position (sentinel)");
+                tracing::info!("zone_cross: index={index} → PROVISIONAL same-zone (sentinel keep-position); server echo decides (#554)");
             }
-            gs.log_msg("zone", "Using an in-zone teleport");
+            gs.log_msg("zone", "Crossing a zone line");
             // STOP the walker (#508). The crossing we were asked to make already happened: the
             // translocator repositioned us in-zone. But the walker's `goto_target` still points at
             // the pre-cross goal (the zone-line coords `drain_zone_cross` walked us to, or a `/goto`
