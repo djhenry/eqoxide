@@ -26,3 +26,4 @@ pub mod steering;
 pub mod traversability;
 pub mod walker;
 pub mod water_grid;
+pub mod zone_assets;

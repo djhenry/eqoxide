@@ -25,6 +25,9 @@ struct PendingLoad {
     zone_name: String,
     /// None means the S3D failed to load; use the fallback ground plane instead.
     assets:    Option<assets::ZoneAssets>,
+    /// Why `assets` is None, verbatim from the loader (#579). Carried through so the observable
+    /// `zone_assets` state can report a real FAILED reason instead of an eternal "pending".
+    load_error: Option<String>,
     collision: Option<Arc<collision::Collision>>,
     zone_map:  Option<zone_map::ZoneMap>,
     zone_min:  [f32; 2],
@@ -193,6 +196,11 @@ pub struct App {
     collision:    Option<Arc<collision::Collision>>,
     /// Shared slot the nav thread reads to gate /goto movement against walls.
     shared_collision: collision::SharedCollision,
+    /// The zone terrain+collision LOAD STATE published for `/v1/observe/debug` (#579). This app
+    /// (which owns the zone loader) is its only writer; it goes `Pending` on every zone change —
+    /// in the very same block that drops the old collision — and only reaches `Ready` in
+    /// `maybe_finish_load`, where the meshes are uploaded and the collision grid exists to hand it.
+    zone_assets: crate::nav::zone_assets::ZoneAssetStateShared,
     /// Most recent floor_z result. Used as the anchor for the next frame's floor_z query
     /// so the player's visual height is self-consistent and can't be pulled up to a bridge
     /// or ceiling just because the server placed them there.
@@ -253,6 +261,7 @@ impl App {
         acts:            crate::ui::Actions,
         spells:          std::sync::Arc<crate::spells::SpellDb>,
         shared_collision: collision::SharedCollision,
+        zone_assets:      crate::nav::zone_assets::ZoneAssetStateShared,
         frame_profile_shared: crate::ipc::FrameProfileShared,
         testzone_mode:   bool,
         nav_debug:       bool,
@@ -325,7 +334,7 @@ impl App {
             pick_screen_w: 800,
             pick_screen_h: 600,
             scene: SceneState::default(), last_inbound: std::time::Instant::now(), frame_req,
-            frame_profile_shared, shutdown, collision: None, shared_collision,
+            frame_profile_shared, shutdown, collision: None, shared_collision, zone_assets,
             last_grounded_z: 0.0,
             prev_render_pos: [0.0, 0.0, 0.0],
             entity_motion: std::collections::HashMap::new(),
@@ -478,6 +487,12 @@ impl App {
                 renderer.upload_zone_assets(&debug_zone::make_debug_zone());
                 tracing::info!("renderer: debug zone loaded ({} meshes)", renderer.gpu_meshes.len());
             }
+            // NOT `Ready`: the debug zone builds no collision grid at all, so every nav/collision
+            // answer here is unavailable — reporting "ready" would be the #579 lie in miniature.
+            *self.zone_assets.lock().unwrap() = crate::nav::zone_assets::ZoneAssetState::failed(
+                "testzone",
+                "testzone is an in-memory DEBUG zone: its terrain is synthetic and NO collision \
+                 grid is built, so nav/collision answers are unavailable (not empty).");
             self.loading = false;
             return;
         }
@@ -487,6 +502,8 @@ impl App {
         let maps_dir    = crate::asset_sync::CacheDirs::resolve().models_dir().join("maps");
         let load_status = self.load_status.clone();
         let pending     = self.pending_load.clone();
+        // #579: the loader thread is the LIVE writer of the pending progress line an agent polls.
+        let za_state    = self.zone_assets.clone();
         let url  = self.asset_server_url.clone();
         let user = self.asset_user.clone();
         let pass = self.asset_pass.clone();
@@ -495,7 +512,19 @@ impl App {
 
         // Named for the #380 crash-log panic hook — see `crash` module docs.
         std::thread::Builder::new().name("zone-asset-loader".into()).spawn(move || {
-            let set_status = |s: &str| { *load_status.lock().unwrap() = s.to_string(); };
+            // Mirrors the loading-screen text into the agent-observable `zone_assets` state (#579),
+            // but ONLY while that state is still Pending for THIS zone — a loader left over from a
+            // previous zone must never overwrite the current zone's state with its own progress.
+            let publish_pending = |zone: &str, s: &str| {
+                let mut st = za_state.lock().unwrap();
+                if matches!(&*st, crate::nav::zone_assets::ZoneAssetState::Pending { zone: z, .. } if z == zone) {
+                    *st = crate::nav::zone_assets::ZoneAssetState::pending(zone, s);
+                }
+            };
+            let set_status = |s: &str| {
+                *load_status.lock().unwrap() = s.to_string();
+                publish_pending(&zone_name, s);
+            };
 
             let cache = crate::asset_sync::CacheDirs::resolve();
             set_status("Connecting to asset server…");
@@ -517,12 +546,15 @@ impl App {
                 set_status("Reading zone geometry…");
                 assets::ZoneAssets::from_glb(&cache.models_dir().join(format!("{zone_name}.glb")))
             })();
-            let (opt_assets, zone_min, zone_max) = match loaded {
+            let (opt_assets, load_error, zone_min, zone_max) = match loaded {
                 Ok(za) => {
                     let (mn, mx) = za.bounds_xy().unwrap_or(([0.0f32;2],[0.0f32;2]));
-                    (Some(za), mn, mx)
+                    (Some(za), None, mn, mx)
                 }
-                Err(e) => { tracing::warn!("renderer: zone '{}' load failed: {}", zone_name, e); (None, [0.0f32;2],[0.0f32;2]) }
+                Err(e) => {
+                    tracing::warn!("renderer: zone '{}' load failed: {}", zone_name, e);
+                    (None, Some(e.to_string()), [0.0f32;2], [0.0f32;2])
+                }
             };
 
             set_status("Building collision grid…");
@@ -540,7 +572,7 @@ impl App {
 
             set_status("Uploading to GPU…");
             *pending.lock().unwrap() = Some(PendingLoad {
-                zone_name, assets: opt_assets, collision, zone_map, zone_min, zone_max,
+                zone_name, assets: opt_assets, load_error, collision, zone_map, zone_min, zone_max,
             });
         }).expect("spawn zone-asset-loader thread");
     }
@@ -572,8 +604,25 @@ impl App {
 
         self.zone_min  = load.zone_min;
         self.zone_max  = load.zone_max;
-        self.collision = load.collision.clone();
-        *self.shared_collision.write().unwrap() = load.collision;
+        // #579: publish the collision grid and the observable verdict TOGETHER (they are derived
+        // from the same value inside `finish_zone_load`, so `ready` and the world it describes can
+        // never disagree). `ZoneAssetState::ready` refuses to build a `Ready` without terrain
+        // meshes AND a collision grid with geometry — a failed/empty load comes out as an explicit
+        // `Failed`, never an eternal "pending". A reply for a zone we have since LEFT is dropped
+        // entirely: its geometry belongs to a zone the character is no longer standing in, and the
+        // current zone is still pending its own load.
+        if load.zone_name == self.current_zone {
+            crate::nav::zone_assets::finish_zone_load(
+                &self.shared_collision, &self.zone_assets, &load.zone_name,
+                load.collision.clone(),
+                load.assets.as_ref().map(|za| za.terrain.len()).unwrap_or(0),
+                load.load_error.as_deref());
+            self.collision = self.shared_collision.read().unwrap().clone();
+            tracing::info!("APP: zone_assets → {:?}", self.zone_assets.lock().unwrap());
+        } else {
+            tracing::warn!("APP: dropping a finished load for '{}' — the character is in '{}' now",
+                load.zone_name, self.current_zone);
+        }
         self.zone_map  = load.zone_map;
         self.loading   = false;
         *self.load_status.lock().unwrap() = String::new();
@@ -1010,8 +1059,13 @@ impl App {
             // Drop the OLD zone's collision immediately so nothing grounds against or collides with
             // stale geometry while the new zone loads (the player is already at new-zone coords).
             // The new collision is swapped in atomically when the load completes.
+            // …and say so (#579): `begin_zone_load` drops the shared collision AND publishes
+            // `Pending` for the new zone in one call, so the observable state can never sit
+            // stale-`Ready` from the previous zone while the client stands in a terrain-less one.
             self.collision = None;
-            *self.shared_collision.write().unwrap() = None;
+            crate::nav::zone_assets::begin_zone_load(
+                &self.shared_collision, &self.zone_assets,
+                &self.current_zone, "Zone change — starting asset load…");
             // The new zone's floor may sit above the zone-point spawn z; settle onto it once
             // collision loads (see the reground block in the vertical-physics section below).
             self.needs_reground = true;

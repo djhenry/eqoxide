@@ -244,11 +244,21 @@ async fn post_goto(
         target.0, target.1, target.2, matched.as_ref().map(|m| (&m.name, m.id, m.quality)));
     // Echo the goal id so the caller can correlate a later `nav_state` read to THIS request: a
     // terminal state on GET /v1/observe/debug is only about the goal it reports in `nav_goal_id`.
+    // #579: if the zone's collision grid isn't built yet, NO route can be planned — say so here
+    // rather than letting the caller read "navigating" as "a walkable route was found". The goal is
+    // still accepted: the walker holds it at `nav_state: "zone_loading"` and plans for real the
+    // moment the assets land.
+    let assets_pending = (!s.zone_assets.lock().unwrap().is_ready()).then(|| {
+        "the zone's terrain/collision are NOT loaded yet, so nothing has been routed — nav_state \
+         will read \"zone_loading\" until GET /v1/observe/debug reports zone_assets.state == \
+         \"ready\", then this goal is planned normally. (If it reads \"failed\", it never will.)"
+    });
     json(StatusCode::OK, serde_json::json!({
         "status": "navigating",
         "goal": [target.0, target.1, target.2],
         "goal_id": goal_id,
         "matched": matched.map(|m| m.to_json()),
+        "zone_assets_pending": assets_pending,
         "note": "poll GET /v1/observe/debug; nav_state is honest only for this nav_goal_id (goal_id)",
     }))
 }

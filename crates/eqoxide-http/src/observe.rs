@@ -12,6 +12,43 @@ use std::collections::HashMap;
 use tokio::sync::oneshot;
 use super::*;
 
+/// The `zone_assets` object served on `/v1/observe/debug` (#579) — see the call site for why it
+/// exists. Built from the typed [`eqoxide_nav::zone_assets::ZoneAssetState`], so `state: "ready"`
+/// is only ever produced by a state that owns a real collision grid.
+pub(crate) fn zone_assets_json(s: &HttpState) -> serde_json::Value {
+    let st = s.zone_assets.lock().unwrap().clone();
+    serde_json::json!({
+        "state":  st.tag(),
+        "zone":   st.zone(),
+        "status": st.status(),
+        "terrain_meshes": match &st {
+            eqoxide_nav::zone_assets::ZoneAssetState::Ready { terrain_meshes, .. } => Some(*terrain_meshes),
+            _ => None,
+        },
+        "collision_loaded": st.collision().is_some(),
+        "detail": st.detail(),
+    })
+}
+
+/// The refusal every WORLD-shaped endpoint returns while the zone's terrain + collision are not
+/// loaded (#579). An explicit, machine-readable failure the caller can distinguish — never a
+/// plausible answer about a world this client does not have.
+fn zone_assets_not_ready(s: &HttpState) -> Option<Response> {
+    let st = s.zone_assets.lock().unwrap().clone();
+    if st.is_ready() { return None; }
+    Some((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error":        "zone_assets_not_ready",
+            "zone_assets":  zone_assets_json(s),
+            "message":      "the current zone's terrain and collision are not loaded, so this \
+                             endpoint cannot describe the world without inventing it. Poll GET \
+                             /v1/observe/debug until `zone_assets.state` is \"ready\" (or handle \
+                             \"failed\", which will never become ready).",
+        })),
+    ).into_response())
+}
+
 pub(super) fn router() -> Router<HttpState> {
     Router::new()
         .route("/debug", get(get_debug))
@@ -222,6 +259,15 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     // `preferred` = the roomy tier carried it. Distinct from the zone-lifetime `nav_tight` counter:
     // this is the fact for the route the character is walking RIGHT NOW.
     let nav_tier = nav.tier;
+    // #579 (agent-honesty): is the world this response describes actually LOADED? A zone's terrain
+    // GLB (freportw: ~30 MB) decodes + collides on a background thread for several seconds, during
+    // which the client stands on a placeholder ground plane with no collision. Without this field an
+    // observer in that window reads a flat, exit-less, unobstructed void as the truth (the false
+    // #560 report). `state` is `idle` | `pending` | `ready` | `failed` — `failed` is deliberately
+    // NOT folded into `pending`: a permanent failure reported as "pending" would make an agent wait
+    // forever. `ready` cannot be published without a terrain mesh count AND a collision grid with
+    // geometry (see `ZoneAssetState::ready`), so it always carries its own evidence.
+    let zone_assets = zone_assets_json(&s);
     let (guild_name, guild_id, guild_rank) = {
         let g = s.guild_slots.guild.lock().unwrap();
         (g.guild_name.clone(), g.guild_id, g.guild_rank)
@@ -361,6 +407,9 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // `nav_degraded`/`inverted_floor_art`, whose mechanism (the column_bottom valve) D-2 deleted.
         "nav_support": nav_support,
         "nav_tight": nav_tight,
+        // Is this client's model of the CURRENT ZONE actually loaded? Gate every world-shaped
+        // conclusion on `zone_assets.state == "ready"` (#579). See the comment where it's built.
+        "zone_assets": zone_assets,
         // The FINE 2u STEERING tier (#382). `null` while it is healthy (a complete fine route to its
         // carrot) or has not yet answered. Non-null when the tier that is actually steering the
         // character cannot see a way through the next 40u — and it says WHICH kind of cannot:
@@ -446,7 +495,21 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
 }
 
 /// GET /v1/observe/frame — returns the current rendered frame as a PNG.
-async fn get_frame(State(s): State<HttpState>) -> Response {
+/// Query params for GET /v1/observe/frame.
+#[derive(serde::Deserialize, Default)]
+struct FrameQuery {
+    /// Opt in to a frame captured while the zone's assets are still loading (#579). Without it, a
+    /// mid-load capture is refused with 503 rather than handed over as if it were the zone — a
+    /// placeholder ground plane in a PNG is indistinguishable from a genuinely empty zone, and an
+    /// agent acted on exactly that confusion in #560. Pass `?allow_pending=1` when the loading
+    /// screen itself is what you want to see.
+    allow_pending: Option<String>,
+}
+
+async fn get_frame(State(s): State<HttpState>, Query(q): Query<FrameQuery>) -> Response {
+    if !q.allow_pending.as_deref().is_some_and(truthy) {
+        if let Some(refusal) = zone_assets_not_ready(&s) { return refusal; }
+    }
     let (tx, rx) = oneshot::channel::<Vec<u8>>();
     *s.camera.frame_req.lock().unwrap() = Some(tx);
 
@@ -749,8 +812,14 @@ async fn get_zone_entrances(State(s): State<HttpState>) -> Json<Vec<eqoxide_core
 /// the player — position-relative), `zone_id` (destination, or `null` if the WLD region's index
 /// isn't advertised in the entrance list), and `index` (the link to the matching entrance's
 /// `iterator`). Advertised entrances with no WLD region are omitted. Empty when the zone has no
-/// region map (no `.wtr` / v1 map) or no collision is loaded yet.
-async fn get_zone_exits(State(s): State<HttpState>) -> Json<serde_json::Value> {
+/// region map (no `.wtr` / v1 map).
+///
+/// **503 `zone_assets_not_ready` while the zone's assets are still loading (#579)** — the exits come
+/// out of the collision grid, so before it is built this returned a confident `[]`, i.e. "this zone
+/// has no exits at all". That is a falsehood an agent cannot detect; an explicit refusal is the
+/// honest answer. Poll `/v1/observe/debug` → `zone_assets` until it reads `ready`.
+async fn get_zone_exits(State(s): State<HttpState>) -> Response {
+    if let Some(refusal) = zone_assets_not_ready(&s) { return refusal; }
     let player = s.player();
     // `pos_up` is already the FOOT datum (#522), the same datum as the collision geometry
     // (zone-line regions) it's tested against — no conversion needed.
@@ -776,7 +845,7 @@ async fn get_zone_exits(State(s): State<HttpState>) -> Json<serde_json::Value> {
             }));
         }
     }
-    Json(serde_json::json!(exits))
+    Json(serde_json::json!(exits)).into_response()
 }
 
 #[cfg(test)]
@@ -1202,5 +1271,125 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["summary"]["seq_gaps"].as_array().unwrap().len(), 1,
             "a real gap in the underlying stream must still be reported");
+    }
+}
+
+/// #579 — the zone-assets loading gate. A mid-load observation must be an explicit *pending*,
+/// never a confident *empty world*.
+#[cfg(test)]
+mod zone_asset_gate_tests {
+    use super::*;
+    use crate::testkit::empty_state;
+    use axum::body::Body;
+    use axum::http::Request;
+    use eqoxide_nav::zone_assets::ZoneAssetState;
+    use tower::ServiceExt;
+
+    async fn get(state: HttpState, uri: &str) -> (StatusCode, serde_json::Value) {
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::get(uri).body(Body::empty()).unwrap()).await.unwrap();
+        let code = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (code, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Every state that is NOT ready — including `Idle` and the terminal `Failed` — must be
+    /// reported as such, and must never be mistaken for a loaded world.
+    fn not_ready_states() -> Vec<ZoneAssetState> {
+        vec![
+            ZoneAssetState::Idle,
+            ZoneAssetState::pending("freportw", "Downloading zone 3/7 (12.4 MB)…"),
+            ZoneAssetState::failed("freportw", "asset server unreachable"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn debug_reports_the_live_pending_progress_while_the_zone_loads() {
+        let s = empty_state();
+        *s.zone_assets.lock().unwrap() =
+            ZoneAssetState::pending("freportw", "Downloading zone 3/7 (12.4 MB)…");
+        let (_, j) = get(s, "/debug").await;
+        assert_eq!(j["zone_assets"]["state"], "pending");
+        assert_eq!(j["zone_assets"]["zone"], "freportw");
+        assert_eq!(j["zone_assets"]["status"], "Downloading zone 3/7 (12.4 MB)…");
+        assert_eq!(j["zone_assets"]["collision_loaded"], false);
+        assert!(j["zone_assets"]["detail"].as_str().unwrap().contains("STILL LOADING"));
+    }
+
+    /// A permanent failure must be distinguishable from "still loading" — reported as pending, an
+    /// agent would wait forever for a load that is never coming.
+    #[tokio::test]
+    async fn debug_distinguishes_a_failed_load_from_a_pending_one() {
+        let s = empty_state();
+        *s.zone_assets.lock().unwrap() = ZoneAssetState::failed("freportw", "GLB is corrupt");
+        let (_, j) = get(s, "/debug").await;
+        assert_eq!(j["zone_assets"]["state"], "failed");
+        assert_eq!(j["zone_assets"]["status"], "GLB is corrupt");
+        assert!(j["zone_assets"]["detail"].as_str().unwrap().contains("terminal"));
+    }
+
+    #[tokio::test]
+    async fn debug_reports_ready_with_the_evidence_once_the_zone_is_loaded() {
+        let s = empty_state();
+        *s.zone_assets.lock().unwrap() = ZoneAssetState::test_ready();
+        let (_, j) = get(s, "/debug").await;
+        assert_eq!(j["zone_assets"]["state"], "ready");
+        assert_eq!(j["zone_assets"]["collision_loaded"], true);
+        assert_eq!(j["zone_assets"]["terrain_meshes"], 1);
+    }
+
+    /// THE #560 falsehood: mid-load, `/zone_exits` answered out of a collision grid that did not
+    /// exist yet and returned `[]` — "this zone has no exits at all". It must refuse instead.
+    #[tokio::test]
+    async fn zone_exits_refuses_instead_of_claiming_the_zone_has_none() {
+        for st in not_ready_states() {
+            let tag = st.tag();
+            let s = empty_state();
+            *s.zone_assets.lock().unwrap() = st;
+            let (code, j) = get(s, "/zone_exits").await;
+            assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE,
+                "{tag}: an empty exit list here is a confident falsehood, not an answer");
+            assert_eq!(j["error"], "zone_assets_not_ready");
+            assert_eq!(j["zone_assets"]["state"], tag);
+        }
+    }
+
+    #[tokio::test]
+    async fn zone_exits_answers_normally_once_ready() {
+        let s = empty_state();
+        *s.zone_assets.lock().unwrap() = ZoneAssetState::test_ready();
+        let (code, j) = get(s, "/zone_exits").await;
+        assert_eq!(code, StatusCode::OK);
+        assert!(j.is_array(), "a ready zone must still get the plain exits array");
+    }
+
+    /// A PNG of the placeholder ground plane is indistinguishable from a genuinely empty zone, so
+    /// a mid-load capture is refused rather than handed over as if it were the world.
+    #[tokio::test]
+    async fn frame_refuses_a_mid_load_capture() {
+        for st in not_ready_states() {
+            let tag = st.tag();
+            let s = empty_state();
+            *s.zone_assets.lock().unwrap() = st;
+            let (code, j) = get(s, "/frame").await;
+            assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{tag}: a mid-load frame is not the zone");
+            assert_eq!(j["error"], "zone_assets_not_ready");
+        }
+    }
+
+    /// …but the loading screen is still reachable on purpose, for a caller that asks for it
+    /// explicitly. (No renderer is attached here, so this 503s from the capture timeout instead —
+    /// what matters is that it is NOT the `zone_assets_not_ready` refusal.)
+    #[tokio::test(start_paused = true)] // no renderer is attached; elapse the capture timeout instantly
+    async fn frame_allow_pending_opts_past_the_gate() {
+        let s = empty_state();
+        *s.zone_assets.lock().unwrap() = ZoneAssetState::pending("freportw", "loading…");
+        let app = router().with_state(s);
+        let resp = app.oneshot(Request::get("/frame?allow_pending=1").body(Body::empty()).unwrap())
+            .await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(!body.contains("zone_assets_not_ready"),
+            "?allow_pending must bypass the #579 gate, got: {body}");
     }
 }

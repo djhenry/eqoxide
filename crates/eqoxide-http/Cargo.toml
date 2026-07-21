@@ -14,7 +14,8 @@ path = "src/lib.rs"
 # `tests/http_observe_apply.rs` (the relocated `apply_consider`/`apply_death` → `/observe/debug`
 # tests, which need `eq_net::packet_handler` — an app-crate module BELOW which http sits) can build
 # an `HttpState` and hit the observe router. Off in normal builds; the release binary never has it.
-test-fixtures = []
+# Forwards to eqoxide-nav so `testkit::empty_state` can build a real `ZoneAssetState::Ready`.
+test-fixtures = ["eqoxide-nav/test-fixtures"]
 
 [dependencies]
 # eqoxide-http is the agent-facing REST API (axum). It sits at the TOP of the extracted-crate stack:
@@ -58,3 +59,6 @@ tokio = { version = "1", features = ["full", "test-util"] }
 # lock, otherwise `#[cfg(test)]`) so `observe.rs`'s `/observe/packets` tests don't race the ring
 # against other crates' capture tests (#544 Step 2k).
 eqoxide-telemetry = { path = "../eqoxide-telemetry", features = ["test-fixtures"] }
+# `test_ready()` — see eqoxide-nav's `test-fixtures` feature. Needed by this crate's own tests
+# (testkit is `#[cfg(test)]` here when the feature is off).
+eqoxide-nav = { path = "../eqoxide-nav", features = ["test-fixtures"] }
