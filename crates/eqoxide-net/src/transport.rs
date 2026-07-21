@@ -45,6 +45,18 @@ const MAX_RESEND_PER_PASS: usize = 300;
 /// cadence is harmless at the transport layer.
 const SESSION_REQUEST_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Pure cadence predicate for the `connect` retry loop (#549): true once `now` is at least
+/// `SESSION_REQUEST_RETRY` past `last_send`. Extracted from the loop body so the retry cadence can
+/// be pinned by a fast, deterministic test that constructs synthetic `Instant`s (`Instant + Duration`
+/// needs no real sleeping) instead of measuring real elapsed wall-clock time — the previous test drove
+/// an actual `connect()` over a real UDP socket and counted datagrams inside a real-time window, which
+/// went red under `--test-threads=8` contention purely from scheduler delay, not a transport defect.
+/// `connect` calls this exact function with `Instant::now()`, so testing it *is* testing production
+/// logic — there is no separate/duplicated cadence check that could drift from what ships.
+fn session_request_due(last_send: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_send) >= SESSION_REQUEST_RETRY
+}
+
 /// Backoff before the Nth retransmit of the oldest outstanding reliable packet: `RESEND_BASE_MS`
 /// doubled per prior attempt, clamped to `[RESEND_MIN_MS, RESEND_MAX_MS]`. `retries` is shifted-capped
 /// so the `<<` can't overflow.
@@ -396,7 +408,7 @@ impl EqStream {
             if std::time::Instant::now() > deadline {
                 return Err("Session handshake timeout: no SESSION_RESPONSE from server".into());
             }
-            if last_send.elapsed() >= SESSION_REQUEST_RETRY {
+            if session_request_due(last_send, std::time::Instant::now()) {
                 stream.send_session_request();
                 last_send = std::time::Instant::now();
                 // #477: keep the LIVENESS clock fresh across the handshake. This loop runs on the
@@ -1151,49 +1163,56 @@ mod tests {
     /// WIDEN the app-layer AddAuth race (`zone-entry-handshake-race.md`). That race is NOT rescued by a
     /// second OP_ZoneEntry (which self-kicks an admitted client — `run_zone_entry_handshake`,
     /// `zone-entry-duplicate-on-admitted-client.md`); a lost race becomes an honest 30s zone-in failure.
-    /// This counts the SESSION_REQUESTs a SILENT peer
-    /// receives inside a 600ms window: at the 250ms cadence that is 3 sends (t=0, 250, 500); at the old
-    /// hard-coded 1s it would be just 1. Asserting >= 2 pins the fast-retry cadence in place.
-    #[tokio::test]
-    async fn connect_retries_session_request_faster_than_once_a_second() {
-        let net_health: eqoxide_ipc::NetHealthShared = Default::default();
-        // A bound but SILENT peer — never answers SESSION_RESPONSE, so `connect` stays retrying.
-        let silent_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = silent_peer.local_addr().unwrap();
-        let (tx, _rx) = mpsc::unbounded_channel();
+    ///
+    /// #549: this used to drive a real `connect()` over a real UDP socket and count SESSION_REQUEST
+    /// datagrams received by a silent peer inside a real-time 600ms window. It passed in isolation but
+    /// went red under `--test-threads=8` contention — the assertion depended on this thread actually
+    /// getting scheduled every ~50ms, which a loaded CI box does not guarantee, so it was measuring
+    /// scheduler luck, not the transport. `connect`'s retry decision is `session_request_due(last_send,
+    /// now)` (see its doc), which needs no real waiting to exercise — `Instant + Duration` builds a
+    /// synthetic timeline instantly. This drives that exact production function over a virtual 600ms
+    /// timeline sampled every 10ms (no sleeping, no sockets, no scheduler dependence) and asserts the
+    /// same property the old test asserted over real time: at the 250ms cadence that is 3 retries
+    /// (~t=250, 500, 600ms boundary catches the 3rd only if sampled finely enough — assert >= 2, exactly
+    /// mirroring the old real-time threshold); at the old hard-coded 1s cadence it would be 0.
+    #[test]
+    fn connect_retries_session_request_faster_than_once_a_second() {
+        let base = Instant::now();
+        let step = std::time::Duration::from_millis(10);
+        let window = std::time::Duration::from_millis(600);
 
-        let host = addr.ip().to_string();
-        let port = addr.port();
-
-        // `connect` loops re-sending SESSION_REQUEST; the counting future tallies the datagrams the
-        // silent peer receives in a 600ms window. `join!` polls both on THIS task so they interleave
-        // deterministically on the current-thread test runtime (a spawned task does not reliably get
-        // scheduled here). `connect` never returns (peer is silent) so its timeout ends the join.
-        let connect_fut = tokio::time::timeout(
-            std::time::Duration::from_millis(800),
-            EqStream::connect(&host, port, tx, net_health.clone()),
-        );
-        let count_fut = async {
-            let mut buf = vec![0u8; 4096];
-            let mut count = 0usize;
-            let window = tokio::time::Instant::now() + std::time::Duration::from_millis(600);
-            while tokio::time::Instant::now() < window {
-                if let Ok(Ok(_)) =
-                    tokio::time::timeout(std::time::Duration::from_millis(50), silent_peer.recv(&mut buf)).await
-                {
-                    count += 1;
-                }
+        let mut last_send = base; // `connect` sends once before entering the retry loop.
+        let mut retries = 0usize;
+        let mut t = base;
+        while t <= base + window {
+            if session_request_due(last_send, t) {
+                retries += 1;
+                last_send = t;
             }
-            count
-        };
-        let (_, count) = tokio::join!(connect_fut, count_fut);
+            t += step;
+        }
+
         assert!(
-            count >= 2,
+            retries >= 2,
             "connect must re-send SESSION_REQUEST faster than once a second so a too-early connect to \
              a cold zone brings its SESSION up promptly (#335 — the app-layer acceptance race is a \
              separate concern, handled by run_zone_entry_handshake's honest 30s failure, not here); \
-             saw only {count} in 600ms",
+             saw only {retries} retries over a virtual 600ms window at the {:?} cadence",
+            SESSION_REQUEST_RETRY,
         );
+    }
+
+    /// #549: pins the exact cadence boundary of `session_request_due` (the predicate `connect` calls
+    /// on every retry-loop iteration) — not due a moment before `SESSION_REQUEST_RETRY` has elapsed,
+    /// due at and after it. Complements the timeline test above, which exercises it over a window;
+    /// this isolates the single-comparison edge case.
+    #[test]
+    fn session_request_due_boundary() {
+        let base = Instant::now();
+        assert!(!session_request_due(base, base));
+        assert!(!session_request_due(base, base + SESSION_REQUEST_RETRY - std::time::Duration::from_millis(1)));
+        assert!(session_request_due(base, base + SESSION_REQUEST_RETRY));
+        assert!(session_request_due(base, base + SESSION_REQUEST_RETRY + std::time::Duration::from_millis(1)));
     }
 
     #[test]
