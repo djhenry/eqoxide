@@ -92,32 +92,41 @@ struct TargetNameBody {
 
 /// POST /v1/combat/target/name {"name":"a rat"} — target a mob by (fuzzy) name. The nav thread
 /// resolves the name to a spawn_id via gs.world.entities and sends OP_TargetCommand.
+///
+/// #513 (agent-honesty): the response now DISCLOSES the matched entity — `matched:{id, name,
+/// quality, distance?}` — so the caller can confirm the resolution picked the intended spawn.
+/// `quality` is `"exact"` (a case-insensitive name match) or `"fuzzy"` (only a partial/substring
+/// match existed); an exact match is ALWAYS preferred over a nearer fuzzy one, and the disclosed
+/// id/name always describe the SAME spawn that was targeted (both derive from one `NameMatch`).
+/// A name that doesn't even fuzzy-match is an honest 404, not a distant wrong target.
 async fn post_target_name(
     State(s): State<HttpState>,
     body: Result<Json<TargetNameBody>, axum::extract::rejection::JsonRejection>,
-) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
+) -> Response {
+    if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
     let name = match body {
         Ok(Json(b)) => b.name,
-        Err(_) => return (StatusCode::BAD_REQUEST, "provide {\"name\":\"...\"}".into()),
+        Err(_) => return text(StatusCode::BAD_REQUEST, "provide {\"name\":\"...\"}"),
     };
-    let ids = s.world.entity_ids.lock().unwrap();
-    let nl = name.to_lowercase();
-    let exact = ids.iter()
-        .find(|(k, _)| clean_entity_name(k).to_lowercase() == nl)
-        .map(|(k, &id)| (k.clone(), id));
-    let found = exact.or_else(|| {
-        ids.iter()
-            .find(|(k, _)| clean_entity_name(k).to_lowercase().contains(&nl) || k.to_lowercase().contains(&nl))
-            .map(|(k, &id)| (k.clone(), id))
-    });
+    let player_pos = { let p = s.player(); Some((p.pos_east, p.pos_north, p.pos_up)) };
+    let found = {
+        let ids = s.world.entity_ids.lock().unwrap();
+        let positions = s.world.entity_positions.lock().unwrap();
+        crate::name_match::resolve_entity(&name, &ids, &positions, player_pos)
+    };
     match found {
-        Some((key, id)) => {
-            s.command.request_target(id);
-            tracing::info!("target_name: {:?} → spawn_id={}", key, id);
-            (StatusCode::OK, format!("targeting {} (spawn_id={})", clean_entity_name(&key), id))
+        Some(m) => {
+            s.command.request_target(m.id);
+            tracing::info!("target_name: {:?} → {:?} spawn_id={} ({:?})", name, m.name, m.id, m.quality);
+            json(StatusCode::OK, serde_json::json!({
+                "status": "targeting",
+                "matched": m.to_json(),
+            }))
         }
-        None => (StatusCode::NOT_FOUND, format!("no entity matching {:?}", name)),
+        None => json(StatusCode::NOT_FOUND, serde_json::json!({
+            "status": "not_found",
+            "message": format!("no entity matching {name:?}"),
+        })),
     }
 }
 
@@ -534,6 +543,89 @@ mod tests {
         let text = body_text(resp).await;
         assert!(text.contains("\"status\":\"unconfirmed\""), "body: {text}");
         assert!(!text.contains("completed"), "an unknown outcome must never read as completed: {text}");
+    }
+
+    // ── #513: /combat/target/name discloses the MATCHED entity (id + name + quality) ────────────
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        serde_json::from_str(&body_text(resp).await).unwrap()
+    }
+
+    /// An exact (case-insensitive) name match: 200, `matched.quality == "exact"`, and the disclosed
+    /// id is the one actually queued for targeting — the agent can confirm the resolution.
+    #[tokio::test]
+    async fn target_name_exact_discloses_matched_id_name_quality() {
+        let state = empty_state();
+        state.world.entity_ids.lock().unwrap().insert("a_rat003".into(), 55);
+        state.world.entity_positions.lock().unwrap().insert("a_rat003".into(), (3.0, 4.0, 0.0));
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/target/name")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"a rat"}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        assert_eq!(j["matched"]["id"], 55);
+        assert_eq!(j["matched"]["name"], "a rat");
+        assert_eq!(j["matched"]["quality"], "exact");
+        assert_eq!(command.take_target(), Some(55),
+            "the disclosed id must be the one actually targeted — they can't disagree");
+    }
+
+    /// THE #513 INVARIANT: given an EXACT match and a nearer FUZZY decoy, resolution must pick the
+    /// exact one — and disclose it — never the fuzzy neighbour. MUTATION CHECK: make `resolve_entity`
+    /// take the fuzzy branch first (drop the exact preference) → this asserts id 55 / quality "exact"
+    /// and goes RED (it would return the decoy's id with quality "fuzzy").
+    #[tokio::test]
+    async fn target_name_prefers_exact_over_fuzzy_decoy() {
+        let state = empty_state();
+        {
+            let mut ids = state.world.entity_ids.lock().unwrap();
+            ids.insert("a_rat003".into(), 55);          // exact "a rat"
+            ids.insert("a_rat_hunter004".into(), 66);   // fuzzy: contains "a rat"
+        }
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/target/name")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"a rat"}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        assert_eq!(j["matched"]["quality"], "exact");
+        assert_eq!(command.take_target(), Some(55), "must target the EXACT match, not the fuzzy decoy");
+    }
+
+    /// A partial-only name is a fuzzy match — signalled so the agent can gate on it — not a 404.
+    #[tokio::test]
+    async fn target_name_partial_only_is_flagged_fuzzy() {
+        let state = empty_state();
+        state.world.entity_ids.lock().unwrap().insert("Astaed_Wemor007".into(), 77);
+        let app = router().with_state(state);
+        let req = Request::post("/target/name")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"Wemor"}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        assert_eq!(j["matched"]["quality"], "fuzzy");
+        assert_eq!(j["matched"]["id"], 77);
+    }
+
+    /// The honest-404 path must survive: a truly-nonexistent name 404s and queues nothing.
+    #[tokio::test]
+    async fn target_name_nonexistent_is_404_and_queues_nothing() {
+        let state = empty_state();
+        state.world.entity_ids.lock().unwrap().insert("a_rat003".into(), 55);
+        let command = state.command.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/target/name")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"a dragon"}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(command.take_target().is_none(), "a nonexistent name must not target a wrong entity");
     }
 
     #[tokio::test]

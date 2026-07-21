@@ -7,9 +7,32 @@
 //! parse (bad syntax, or a field out of range like `zone_id: 99999`) always 400s naming the problem;
 //! it is never downgraded to "no body" (bodyless requests like `/stop`, `/jump` are unaffected either way).
 
-use axum::{extract::State, http::StatusCode, routing::post, Router};
+use axum::{
+    body::Body,
+    extract::State,
+    http::{header, StatusCode},
+    response::Response,
+    routing::post,
+    Router,
+};
 use std::collections::HashMap;
 use super::*;
+use crate::name_match::{resolve_entity, MatchQuality, NameMatch};
+
+/// A `text/plain` response (for require_live_session errors and malformed-body 4xx). Mirrors
+/// `http::combat`'s local helper — `/goto` and `/follow` now answer with JSON on success (#513).
+fn text(status: StatusCode, body: impl Into<String>) -> Response {
+    Response::builder().status(status)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from(body.into())).unwrap()
+}
+
+/// An `application/json` response.
+fn json(status: StatusCode, value: serde_json::Value) -> Response {
+    Response::builder().status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(value.to_string())).unwrap()
+}
 
 pub(super) fn router() -> Router<HttpState> {
     Router::new()
@@ -149,31 +172,75 @@ fn resolve_current_target(
 
 /// POST /v1/move/goto — walk to a target and STOP on arrival; never chases (goto_entity=None).
 /// Body: {"name":...} | {"x","y","z"} | {"map_x","map_y"} | {} (default: current target).
+///
+/// #513 (agent-honesty): when the goal is resolved from a NAME (or defaults to the current target),
+/// the response DISCLOSES the matched entity — `matched:{id, name, quality, distance?}` — so the
+/// caller can confirm the fuzzy name-resolution picked the intended spawn. The routed goal and the
+/// disclosed `matched` derive from ONE `NameMatch`, so the coordinates the character walks to can
+/// never disagree with the entity named in the response. `quality` is `"exact"` (a case-insensitive
+/// name match, always preferred over any nearer partial one) or `"fuzzy"` (only a substring match
+/// existed — the agent should verify before trusting it). For a raw-coordinate goal there is no
+/// entity, so `matched` is `null`.
 async fn post_goto(
     State(s): State<HttpState>,
     OptionalJson(body): OptionalJson<MoveBody>,
-) -> (StatusCode, String) {
-    if let Err(e) = require_live_session(&s) { return e; }
+) -> Response {
+    if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
     let b = body.unwrap_or_default();
+    let player_pos = { let p = s.player(); Some((p.pos_east, p.pos_north, p.pos_up)) };
 
-    let target: (f32, f32, f32) = if let Some(name) = &b.name {
-        match resolve_name(name, &s.world.entity_positions.lock().unwrap()) {
-            Some((_key, pos)) => pos,
-            None => return (StatusCode::NOT_FOUND, format!("No entity named {name:?}")),
+    // Resolve the goal to `(coords, Option<NameMatch>)`. The matched entity (when any) is the SAME
+    // value the goal coordinates come from, so the disclosure can't drift from the routed target.
+    let (target, matched): ((f32, f32, f32), Option<NameMatch>) = if let Some(name) = &b.name {
+        let m = {
+            let ids = s.world.entity_ids.lock().unwrap();
+            let positions = s.world.entity_positions.lock().unwrap();
+            resolve_entity(name, &ids, &positions, player_pos)
+        };
+        match m {
+            Some(m) => match m.pos {
+                Some(pos) => (pos, Some(m)),
+                // Matched an entity that has an id but no known position — can't navigate to it.
+                // Honest failure rather than a bogus goal (lockstep tables make this unreachable in
+                // practice, but never silently invent coordinates).
+                None => return json(StatusCode::NOT_FOUND, serde_json::json!({
+                    "status": "not_found",
+                    "message": format!("entity {:?} has no known position to navigate to", m.name),
+                })),
+            },
+            None => return json(StatusCode::NOT_FOUND, serde_json::json!({
+                "status": "not_found",
+                "message": format!("No entity named {name:?}"),
+            })),
         }
     } else if let (Some(mx), Some(my)) = (b.map_x, b.map_y) {
-        // map_x = -server_x, map_y = -server_y (Brewall map coords).
-        (-mx, -my, b.z.unwrap_or(3.75))
+        // map_x = -server_x, map_y = -server_y (Brewall map coords). Raw coords → no matched entity.
+        ((-mx, -my, b.z.unwrap_or(3.75)), None)
     } else if let (Some(x), Some(y), Some(z)) = (b.x, b.y, b.z) {
-        (x, y, z)
+        ((x, y, z), None)
     } else {
-        // No name/coords → default to the player's current target (one-time snapshot).
+        // No name/coords → default to the player's current target (one-time snapshot). Disclose it
+        // too: the agent should still be able to confirm WHICH spawn "the current target" resolved to.
         let target_id = s.player().target_id;
-        let ids = s.world.entity_ids.lock().unwrap();
-        let positions = s.world.entity_positions.lock().unwrap();
-        match resolve_current_target(target_id, &ids, &positions) {
-            Ok((_key, pos)) => pos,
-            Err(e) => return e,
+        let resolved = {
+            let ids = s.world.entity_ids.lock().unwrap();
+            let positions = s.world.entity_positions.lock().unwrap();
+            resolve_current_target(target_id, &ids, &positions)
+        };
+        match resolved {
+            Ok((key, pos)) => {
+                let distance = player_pos.map(|p| {
+                    ((p.0 - pos.0).powi(2) + (p.1 - pos.1).powi(2) + (p.2 - pos.2).powi(2)).sqrt()
+                });
+                // The target was chosen by a definite spawn id — an exact resolution by construction.
+                let m = NameMatch {
+                    id: target_id.expect("resolve_current_target Ok implies a target_id"),
+                    name: clean_entity_name(&key), key, quality: MatchQuality::Exact,
+                    pos: Some(pos), distance,
+                };
+                (pos, Some(m))
+            }
+            Err((code, msg)) => return text(code, msg),
         }
     };
 
@@ -183,10 +250,17 @@ async fn post_goto(
     // stamps a fresh goal identity (state → `pending`, bumped `goal_id`) SYNCHRONOUSLY, so a read
     // right after this can never return the PREVIOUS goto's terminal state (#349).
     let goal_id = s.command.request_goto(target);
-    tracing::info!("move/goto: target set to ({:.1},{:.1},{:.1}) [goal #{goal_id}]", target.0, target.1, target.2);
+    tracing::info!("move/goto: target set to ({:.1},{:.1},{:.1}) [goal #{goal_id}] matched={:?}",
+        target.0, target.1, target.2, matched.as_ref().map(|m| (&m.name, m.id, m.quality)));
     // Echo the goal id so the caller can correlate a later `nav_state` read to THIS request: a
     // terminal state on GET /v1/observe/debug is only about the goal it reports in `nav_goal_id`.
-    (StatusCode::OK, format!("navigating to ({:.1},{:.1},{:.1}) [goal_id={goal_id}] — poll GET /v1/observe/debug; nav_state is honest only for this nav_goal_id", target.0, target.1, target.2))
+    json(StatusCode::OK, serde_json::json!({
+        "status": "navigating",
+        "goal": [target.0, target.1, target.2],
+        "goal_id": goal_id,
+        "matched": matched.map(|m| m.to_json()),
+        "note": "poll GET /v1/observe/debug; nav_state is honest only for this nav_goal_id (goal_id)",
+    }))
 }
 
 /// POST /v1/move/follow — walk to a named entity and KEEP FOLLOWING (goto_entity=Some) until
@@ -543,6 +617,94 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST,
             "a typo'd key must 400, not fall through to the current-target default");
+        assert!(goto_target.lock().unwrap().is_none());
+    }
+
+    // ── #513: /move/goto discloses the MATCHED entity so the caller can confirm the resolution ───
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        serde_json::from_str(&body_text(resp).await).unwrap()
+    }
+
+    /// goto by an EXACT name: 200, and `matched` discloses the resolved id/name/quality. The routed
+    /// goal (`goto_target`) equals the matched entity's position — disclosure can't disagree with
+    /// where the character actually walks.
+    #[tokio::test]
+    async fn goto_by_name_discloses_matched_entity() {
+        let state = empty_state();
+        state.world.entity_ids.lock().unwrap().insert("a_rat003".into(), 55);
+        state.world.entity_positions.lock().unwrap().insert("a_rat003".into(), (10.0, 20.0, 3.0));
+        let goto_target = state.nav.goto_target.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"a rat"}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        assert_eq!(j["matched"]["id"], 55);
+        assert_eq!(j["matched"]["name"], "a rat");
+        assert_eq!(j["matched"]["quality"], "exact");
+        assert_eq!(*goto_target.lock().unwrap(), Some((10.0, 20.0, 3.0)),
+            "the goal must be the disclosed entity's position");
+    }
+
+    /// #513 INVARIANT under the near-miss shape: an exact match beside a nearer fuzzy decoy must
+    /// route to — and disclose — the EXACT entity. MUTATION CHECK: drop the exact preference in
+    /// `resolve_entity` and this goes RED (goal + matched id become the decoy's).
+    #[tokio::test]
+    async fn goto_by_name_prefers_exact_over_fuzzy_decoy() {
+        let state = empty_state();
+        {
+            let mut ids = state.world.entity_ids.lock().unwrap();
+            ids.insert("a_rat003".into(), 55);
+            ids.insert("dire_a_rat004".into(), 66); // fuzzy: contains "a rat"
+        }
+        {
+            let mut pos = state.world.entity_positions.lock().unwrap();
+            pos.insert("a_rat003".into(), (10.0, 20.0, 3.0));
+            pos.insert("dire_a_rat004".into(), (999.0, 999.0, 3.0));
+        }
+        let goto_target = state.nav.goto_target.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"a rat"}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        assert_eq!(j["matched"]["id"], 55);
+        assert_eq!(*goto_target.lock().unwrap(), Some((10.0, 20.0, 3.0)),
+            "must route to the exact match, never the distant fuzzy decoy");
+    }
+
+    /// A raw-coordinate goal has no entity: `matched` is null (honest — not a fabricated match).
+    #[tokio::test]
+    async fn goto_by_coords_has_null_matched() {
+        let state = empty_state();
+        let app = router().with_state(state);
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"x":1.0,"y":2.0,"z":3.0}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        assert!(j["matched"].is_null(), "raw coords have no matched entity: {j}");
+    }
+
+    /// Honest-404 preserved: goto to a nonexistent name 404s and queues no nav goal.
+    #[tokio::test]
+    async fn goto_by_nonexistent_name_is_404_and_queues_nothing() {
+        let state = empty_state();
+        state.world.entity_ids.lock().unwrap().insert("a_rat003".into(), 55);
+        state.world.entity_positions.lock().unwrap().insert("a_rat003".into(), (10.0, 20.0, 3.0));
+        let goto_target = state.nav.goto_target.clone();
+        let app = router().with_state(state);
+        let req = Request::post("/goto")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"name":"a dragon"}"#)).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert!(goto_target.lock().unwrap().is_none());
     }
 

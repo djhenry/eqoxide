@@ -56,6 +56,7 @@ where
     }
 }
 
+mod name_match;
 mod observe;
 mod quests;
 mod group;
