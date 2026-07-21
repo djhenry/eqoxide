@@ -57,6 +57,12 @@ pub const FLYMODE_LEVITATE_WHILE_RUNNING: u8 = 5;
 /// True when a `flymode`/GravityBehavior wire code means "levitating" for gravity purposes: either
 /// plain `Levitating(2)` or `LevitateWhileRunning(5)`. Used for the SELF-player levitate model
 /// (#529: gravity-off hover) — a levitating self-spawn zones in with one of these codes.
+///
+/// NOTE (#587 review): on the SPAWN-STRUCT path (`FillSpawnStruct`) a *client's* `flymode` byte is
+/// only ever baked as `0` or `2` — `LevitateWhileRunning(5)` is a movement/anim distinction the
+/// server does not serialize into the spawn struct — so the `== 5` arm is effectively dead there.
+/// It is kept because this helper is shared with any wire path that CAN carry 5 (and because
+/// treating 5 as levitating is never wrong for gravity), not because a self-spawn will present it.
 pub fn is_levitating_flymode(flymode: u8) -> bool {
     flymode == FLYMODE_LEVITATING || flymode == FLYMODE_LEVITATE_WHILE_RUNNING
 }

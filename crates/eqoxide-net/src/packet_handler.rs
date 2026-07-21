@@ -2248,13 +2248,19 @@ fn apply_spawn_appearance(gs: &mut GameState, payload: &[u8]) {
         const GUILD_ID: u16 = 22;
         const GUILD_RANK: u16 = 23;
         // #529: AppearanceType::FlyMode (EQEmu AT value 19) about our OWN spawn carries the
-        // GravityBehavior code in `param`: 0=off, 2=Levitating, 5=LevitateWhileRunning. The server
-        // sends this to self for zone-in-already-levitating AND for buff FADE/off, so it flips our
-        // gravity-off hover state on and off. KNOWN GAP (Slice-1 follow-up): a mid-zone cast-ON is
-        // deliberately NOT sent to self (`ignore_self=true`, EQEmu spell_effects.cpp) — self is meant
-        // to learn from OP_Buff's spellid cross-referenced to SPA 57, which requires a spell/SPA table
-        // eqoxide does not yet have. So an in-zone Levitate cast is only reflected at the next zone-in
-        // or on fade, not the instant it lands. Verified against the RoF2 patch / EQEmu server.
+        // GravityBehavior code in `param`. In practice this handler is our levitate-CLEAR channel:
+        // per EQEmu source (#587 review, verified against zone/spell_effects.cpp + zone/mob.cpp), the
+        // server sends FlyMode to self ONLY on buff FADE / forced cancel — with `param=0` (gravity
+        // back on). Both the mid-zone CAST-on (spell_effects.cpp:~1451) and the zone-in buff-reapply
+        // (client_packet.cpp:~714) call SendAppearancePacket(FlyMode, .., ignore_self=true), so self
+        // NEVER receives a `param=2/5` SET on this opcode. Levitate is therefore SET elsewhere — from
+        // the self-SPAWN-STRUCT `flymode` byte at zone-in (see the self-spawn branch in
+        // `register_spawn`, baked 2/0) — and CLEARED here when `param==0` arrives. Routing `param`
+        // through `is_levitating_flymode` keeps the (dead-on-this-path) 2/5 arm defensively correct.
+        // KNOWN GAP (Slice-1 follow-up #586): a mid-zone cast-ON is not observable to self on any
+        // opcode we decode — the real client infers it from OP_Buff's spellid × SPA 57, which needs a
+        // spell/SPA table eqoxide lacks — so an in-zone Levitate cast is only reflected at the next
+        // zone-in, not the instant it lands.
         const FLY_MODE: u16 = 19;
         match kind {
             GUILD_ID   => { gs.player_guild_id = param;
@@ -2691,9 +2697,12 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
         // Our own guild identity, from the self-spawn stream (#295). 0xFFFFFFFF/0 = no guild.
         gs.player_guild_id       = info.guild_id;
         gs.player_guild_rank     = info.guild_rank;
-        // #529: zoning in ALREADY levitating — the self-spawn's flymode carries Levitating(2) or
-        // LevitateWhileRunning(5). Seed the controller's gravity-off hover from it (mid-zone cast/
-        // fade is handled separately by the OP_SpawnAppearance Levitate toggle about our own id).
+        // #529: zoning in ALREADY levitating — the self-spawn's `flymode` byte is the ONLY channel
+        // that delivers the levitate SET to self (EQEmu FillSpawnStruct bakes it `2` for a levitating
+        // client, `0` otherwise — never `5`; the zone-in FlyMode appearance is ignore_self, #587
+        // review). Seed the controller's gravity-off hover from it. CLEAR (mid-zone fade) arrives
+        // separately as OP_SpawnAppearance FlyMode param=0 about our own id; a mid-zone cast-ON is not
+        // observable to self until the next zone-in (known gap #586).
         gs.player_levitating     = eqoxide_core::coord::is_levitating_flymode(info.flymode);
         tracing::info!("EQ: player spawn id={} pos=({:.1},{:.1},{:.1}) equip={:?} guild_id={}",
             info.spawn_id, info.x, info.y, info.z, gs.player_equipment, info.guild_id);
@@ -3688,9 +3697,11 @@ mod tests {
 
     #[test]
     fn apply_spawn_appearance_toggles_self_levitate() {
-        // #529: AppearanceType::FlyMode (19) about our OWN spawn flips gs.player_levitating —
-        // param 2 (Levitating) / 5 (LevitateWhileRunning) → on, param 0 → off. This is the wire
-        // signal for zone-in-already-levitating and for buff fade.
+        // #529: AppearanceType::FlyMode (19) about our OWN spawn routes through the handler:
+        // param 0 → CLEAR (the real self path — the server sends FlyMode to self only on buff
+        // fade/cancel, param=0), while param 2/5 → set exercises the defensive routing (those never
+        // actually reach self on this opcode — cast-on & zone-in reapply are ignore_self; the SET
+        // comes from the self-spawn flymode byte instead). Another spawn's FlyMode must not touch us.
         let mut gs = GameState::new();
         gs.player_id = 77;
         assert!(!gs.player_levitating, "default not levitating");

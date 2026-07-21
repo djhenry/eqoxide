@@ -367,9 +367,17 @@ impl CharacterController {
             let foot = self.pos[2];
             let floor = col.ground_below(self.pos[0], self.pos[1], foot + GROUND_ORIGIN, GROUND_DEPTH);
             match floor {
-                // Terrain at/above the feet: rest on it (standing, or walking up a ramp while levitating).
-                Some(f) if f >= foot - GROUND_SNAP_TOL => { self.pos[2] = f; self.on_ground = true; }
-                // Terrain below, or none at all: hold altitude — hover.
+                // RISING floor ONLY (walking UP a slope/ramp): stand on it so we rise with the
+                // terrain instead of clipping through it. Strictly `f > foot` — a floor at OR BELOW
+                // the feet must NOT snap us down. This is the #587 fix: the old `f >= foot -
+                // GROUND_SNAP_TOL` reused the 0.5u DOWNWARD ground-snap allowance, so on any gentle
+                // downslope (per-frame descent < 0.5u — i.e. essentially all walkable terrain at run
+                // speed) it found the floor just below the feet and snapped the feet DOWN to it every
+                // frame. The levitator then tracked the hill down, indistinguishable from walking; only
+                // a >0.5u/frame cliff or a true no-floor gap ever "held altitude".
+                Some(f) if f > foot => { self.pos[2] = f; self.on_ground = true; }
+                // Floor at/below the feet, or none at all (downslope, drop, gap, void): HOLD altitude —
+                // hover. The levitator floats out over the descent and only lands when levitate ends.
                 _ => { self.on_ground = false; }
             }
         } else {
@@ -929,6 +937,45 @@ mod tests {
         fall.on_ground = true;
         for _ in 0..400 { fall.step(walk(30.0, [1.0, 0.0]), 1.0 / 60.0, &c); }
         assert!(fall.pos[2] < -35.0, "non-levitating walker falls to the -40 gap floor, got {}", fall.pos[2]);
+    }
+
+    /// #587 shallow-slope regression — the defect the flat/cliff hover tests missed. A levitator
+    /// walked DOWN a GENTLE ramp must HOLD altitude, not track the ground down. The original hover
+    /// branch reused the 0.5u DOWNWARD ground-snap tolerance (`f >= foot - GROUND_SNAP_TOL`), so on
+    /// any slope whose per-frame descent was < 0.5u — i.e. essentially ALL walkable terrain at run
+    /// speed — it snapped the feet to the floor every frame and the levitator followed the hill down,
+    /// indistinguishable from walking (live-caught on a Qeynos-Hills ridge: z −1.9 → −7.5). Only a
+    /// >0.5u/frame cliff or a true no-floor gap ever held altitude — which is exactly why the earlier
+    /// flat-ground + single sharp-ledge tests passed while ordinary sloped terrain was broken.
+    /// MUTATION-CHECK: restore `Some(f) if f >= foot - GROUND_SNAP_TOL` (the buggy down-snap) and this
+    /// goes RED — the levitator's Z tracks the ramp down to ~−7.5 instead of holding ~−2.5.
+    #[test]
+    fn levitating_player_holds_altitude_down_a_shallow_slope() {
+        // A single planar ramp descending in +east: height 0 at east=-100 down to −10 at east=+100
+        // (a 5% grade → ~0.025u/frame vertical at the run speed below, FAR under GROUND_SNAP_TOL's
+        // 0.5u). Vertex = [north, height, east] (libeq axes, as in the `floor` helper).
+        let ramp = mesh(vec![
+            [-100.0, 0.0, -100.0], [100.0, 0.0, -100.0],
+            [100.0, -10.0, 100.0], [-100.0, -10.0, 100.0],
+        ]);
+        let c = col(vec![ramp]);
+        // Ramp height at east=-50 is −2.5; start resting there and walk EAST (downhill).
+        let start = [-50.0, 0.0, -2.5];
+
+        let mut lev = CharacterController::new(start);
+        lev.on_ground = true;
+        lev.set_levitating(true);
+        for _ in 0..200 { lev.step(walk(30.0, [1.0, 0.0]), 1.0 / 60.0, &c); }
+        assert!(lev.pos[0] > 30.0, "levitator should travel well east downhill, got {}", lev.pos[0]);
+        assert!(lev.pos[2] > -3.5,
+            "levitator must HOLD altitude (~-2.5) down the shallow slope, not track it down; got {}", lev.pos[2]);
+
+        // Control: a non-levitating walker DOES track the ramp down (ground-snapped every frame).
+        let mut walker = CharacterController::new(start);
+        walker.on_ground = true;
+        for _ in 0..200 { walker.step(walk(30.0, [1.0, 0.0]), 1.0 / 60.0, &c); }
+        assert!(walker.pos[2] < -6.0,
+            "non-levitating walker follows the slope down toward ~-7.5, got {}", walker.pos[2]);
     }
 
     #[test]
