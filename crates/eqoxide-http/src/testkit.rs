@@ -64,6 +64,9 @@ pub fn empty_state() -> HttpState {
         nav,
         world: Default::default(),
         shared_collision: Arc::new(std::sync::RwLock::new(None)),
+        // Handler tests are about the handler, not about zone loading: default to a state that
+        // does NOT gate world endpoints. Tests that exercise the #579 gate set it explicitly.
+        zone_assets: Arc::new(Mutex::new(eqoxide_nav::zone_assets::ZoneAssetState::test_ready())),
         command,
         social: Default::default(),
         merchant_slots: Default::default(),

@@ -456,6 +456,12 @@ pub struct HttpState {
     pub(crate) world:           eqoxide_ipc::WorldSlots,
     /// Zone collision + region map (shared with the nav thread); read-only here, for zone_exits.
     pub(crate) shared_collision: eqoxide_nav::collision::SharedCollision,
+    /// The zone terrain+collision LOAD STATE (#579, agent-honesty). Written only by the app thread
+    /// that owns the zone loader. Every endpoint that describes the WORLD (as opposed to the
+    /// character or the session) must consult this first: while it is `Pending`, the client is
+    /// standing on a placeholder ground plane with no collision, and reporting that as the zone is
+    /// the false-empty that produced the bogus #560 report.
+    pub(crate) zone_assets: eqoxide_nav::zone_assets::ZoneAssetStateShared,
     /// The typed write-path facade (#446). Combat is fully migrated onto it — combat/pet handlers
     /// write via `s.command.request_*` (no direct `ipc::CombatSlots` field any more); other domains
     /// still use their own bundle fields until Wave-2 migrates them. See `eqoxide_command`.
@@ -620,6 +626,7 @@ pub fn spawn_camera_server(
     nav:             eqoxide_ipc::NavSlots,
     world:           eqoxide_ipc::WorldSlots,
     shared_collision: eqoxide_nav::collision::SharedCollision,
+    zone_assets:      eqoxide_nav::zone_assets::ZoneAssetStateShared,
     command:         eqoxide_command::CommandState,
     social:          eqoxide_ipc::SocialSlots,
     merchant_slots:  eqoxide_ipc::MerchantSlots,
@@ -651,7 +658,7 @@ pub fn spawn_camera_server(
             .expect("http tokio runtime");
         rt.block_on(async move {
             let state = HttpState {
-                camera, nav, world, shared_collision, command, social, merchant_slots,
+                camera, nav, world, shared_collision, zone_assets, command, social, merchant_slots,
                 inventory_slots, interact, chat, spells, game_state, net_health, frame_profile,
                 quest, group_slots, lifecycle, guild_slots,
             };

@@ -34,7 +34,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 | Route | Description |
 |-------|-------------|
 | `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation** (`nav_state`, `nav_reason`, `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier` — see [Navigation state](#navigation-state)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms` — see [Connection health](#connection-health)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + camera state. |
-| `GET /v1/observe/frame` | Current rendered frame as a PNG (`Content-Type: image/png`). |
+| `GET /v1/observe/frame` | Current rendered frame as a PNG (`Content-Type: image/png`). **503 while the zone's assets are still loading** — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579); `?allow_pending=1` opts past it. |
 | `GET /v1/observe/entities[?labeled=1]` | Default: `{ "<name>": [x,y,z], ... }` for all known entities, with same-base-name + byte-identical-position duplicates collapsed (#471 — suspected server-side `spawn2` duplication; the model is untouched so each instance is still targetable by its full name). `?labeled=1` returns the richer `{count, entities:{"<name>":[x,y,z]}, deduped, duplicate_groups:[{position,names,kept}], note}` exposing which duplicates were collapsed. |
 | `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency}`. Slots are Titanium **wire** ids (DB general slots 23-30 → wire 22-29). |
 | `GET /v1/observe/messages[?kind=npc]` | Machine-readable message log (oldest→newest). Each line `{kind, text, keywords}`; `kind` ∈ npc/chat/combat/system/exp/loot/trade/zone. This is how you read NPC dialogue. |
@@ -209,6 +209,84 @@ machine-readable *why*, `null` unless a state has one). Together they are how yo
 | `no_path` | **DEFINITIVE: no route exists.** The planner searched to completion. Do not retry the same goal — pick another. | see below |
 | `search_exhausted` | The planner **gave up**. This is **"I don't know", not "no"** — a route may well exist. Try a nearer waypoint. | `search_node_cap` |
 | `blocked` | A route exists, but the walker **could not follow it** (wedged after 8 recovery attempts). Not a routing failure. | `walker_stalled`, `local_no_way_through`, `fall_would_be_lethal` |
+| `zone_loading` | **This client has no model of the zone yet** — its terrain/collision are still loading, or their load failed (#579). No search was run and no route exists to report; the goal is kept and planned for real once the assets land. Read `zone_assets` (below) to tell *pending* from *terminally failed*. | `zone_assets_not_loaded` |
+
+### `zone_assets` — is the world this response describes actually loaded? (#579)
+
+A zone's terrain arrives from the asset server as one large GLB (freportw: ~30 MB) and is decoded,
+collided and uploaded on a background thread over **several seconds**. During that window the client
+stands on a placeholder ground plane with **no collision at all**. Before this field existed the
+client reported that as if it were the zone — a flat empty plain, an empty exit list, and a walker
+that said `navigating` while steering a dead-straight line through geometry that had not been built.
+That is exactly what produced the false #560 report ("flat plain, 0 collision, 700u unobstructed"),
+which a later load on the same code refuted.
+
+`GET /v1/observe/debug` therefore carries:
+
+```jsonc
+"zone_assets": {
+  "state": "pending",            // "idle" | "pending" | "ready" | "failed" | "stale" | "unknown_zone"
+  "reason": "zone_assets_pending",   // machine-readable why; null when ready
+  "zone": "freportw",            // the zone the loaded/loading assets are FOR
+  "player_zone": "freportw",     // the zone the client believes the character is in
+  "status": "Downloading zone 3/7 (12.4 MB)…",   // live loader progress; failure reason when failed
+  "terrain_meshes": null,        // mesh count, only when ready
+  "collision_loaded": false,
+  "detail": "…what this state means for anything the client says about the world…"
+}
+```
+
+- **`ready`** is the only state in which the client's answers about zone geometry, exits, or
+  navigability are about the real zone. It requires **both** that a terrain mesh count and a
+  collision grid with geometry exist (`Ready` cannot be constructed without them) **and** that
+  `zone == player_zone`.
+- **`pending`** — keep polling. It is published on every zone change, in the same call that drops the
+  previous zone's collision.
+- **`failed`** is deliberately *not* folded into `pending`: the load is over and will not retry, so
+  waiting for `ready` would hang forever. `status` says why. The client also declares a load failed
+  if its loader thread panicked or its result was lost, so `pending` cannot persist with nothing
+  behind it.
+- **`stale`** — *the assets that are loaded belong to a different zone than the one the character is
+  in.* `player.zone` is published by the network thread the instant `OP_NewZone` arrives, while the
+  render thread starts the new zone's load on its next frame; in between (~66 ms, measured live) the
+  previous zone's assets are still fully loaded. Answering then would describe the zone you just
+  **left** — a wrong world, which is the same lie class as an empty one. Transient; poll on.
+- **`unknown_zone`** — the client does not know which zone the character is in (before the first
+  zone-in, or a zone-in that timed out — see `player.zone_in_failed`), so no assets can be matched
+  to it.
+- **`idle`** — no zone loaded and none loading.
+
+> **The guarantee, and how it is verified.** *A `ready` observation is never about a zone the
+> character is not in.* This is a universal, so it is held by a **property test**, not by a live run
+> (a live run is an existence proof over one trajectory): `eqoxide_nav::zone_assets::usability` is
+> the single decision function every consumer goes through, and
+> `usable_iff_ready_for_the_zone_the_player_is_actually_in` asserts over the full cross product of
+> state shapes × player-zone values that it returns "usable" **iff** the state is `Ready` and its
+> zone equals the player's non-empty zone, while
+> `no_interleaving_of_the_two_writers_yields_a_usable_wrong_zone` does the same across every
+> interleaving of the two threads that write those values.
+
+**Two endpoints refuse rather than answer while this is not `ready`,** with
+`503 {"error": "zone_assets_not_ready", "reason": "…", "zone_assets": {…}}`:
+
+| Endpoint | Why |
+|---|---|
+| `GET /v1/observe/zone_exits` | Exits come out of the collision grid; before it exists this returned a confident `[]` — "this zone has no exits at all" — and during `stale` it returned the *previous* zone's exits. |
+| `GET /v1/observe/frame` | A PNG of the placeholder ground plane is indistinguishable from a genuinely empty zone, and a `stale` frame shows the zone you left. Pass **`?allow_pending=1`** if the loading screen is what you actually want. |
+
+Every `200` from `/v1/observe/frame` also carries **`X-Zone-Assets-State:`** with the same word as
+`zone_assets.state`, so a PNG fetched with `?allow_pending=1` cannot be mistaken downstream for one
+of the real zone. Only `ready` means the image shows the zone the character is in.
+
+**Endpoints that are deliberately NOT gated**, because they do not read zone geometry or collision
+and are honest during a load: `/v1/observe/doors` and `/v1/observe/zone_entrances` (both are
+server-pushed lists, not derived from the collision grid), and `/v1/move/manual` and `/v1/move/jump`
+(they drive the controller directly and make no routing claim — though with no collision loaded the
+character is moving through a world the client has not built, so prefer waiting for `ready`).
+
+`POST /v1/move/goto` still accepts the goal, but its response carries a non-null
+**`zone_assets_pending`** note while the assets are missing, and `nav_state` reads `zone_loading`
+until they land.
 
 ### `matched` — which entity a name actually resolved to (#513)
 

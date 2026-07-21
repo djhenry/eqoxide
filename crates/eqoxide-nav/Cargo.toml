@@ -7,6 +7,13 @@ edition = "2021"
 name = "eqoxide_nav"
 path = "src/lib.rs"
 
+[features]
+# Exposes `zone_assets::ZoneAssetState::test_ready()` — a real `Ready` (flat-floor collision grid)
+# — to DOWNSTREAM test builds. `eqoxide-http`'s testkit needs one to build an `HttpState` whose
+# world endpoints aren't gated by the #579 loading check, and `Ready` is deliberately impossible to
+# fabricate without a collision grid. Off in normal builds.
+test-fixtures = []
+
 [dependencies]
 # eqoxide-nav sits directly above eqoxide-assets (core ← ipc ← assets ← nav, #544 Step 2f). It
 # depends ONLY on those three internal crates plus `tracing` — never on wgpu/winit/egui/tokio/axum/

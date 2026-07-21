@@ -34,6 +34,13 @@ use crate::steering::*;
 /// test fixtures).
 use eqoxide_core::physics::RUN_SPEED;
 
+/// The nav state published while this client has NO collision grid for the current zone — the
+/// terrain assets are still loading, or their load failed (#579). It is NOT `blocked` (there is no
+/// obstacle), NOT `no_path` (no search was ever run) and above all NOT `navigating`: the honest
+/// answer is "I have no model of this world yet, so I cannot tell you anything about routes here."
+/// Read `zone_assets` on GET /v1/observe/debug to tell *pending* from *failed*.
+pub const NAV_STATE_ZONE_LOADING: &str = "zone_loading";
+
 /// The path-walker: (re)plans the coarse/fine route toward the active `/goto` goal, steers
 /// pure-pursuit along it, and drives arrival/stall/fall-edge/portal-escape handling.
 ///
@@ -194,7 +201,11 @@ impl Walker {
     /// The value set is an AGENT-FACING CONTRACT — every value is documented in `docs/http-api.md`:
     ///
     ///   idle | planning | navigating | navigating_partial | following | arrived
-    ///   | no_path | search_exhausted | blocked
+    ///   | no_path | search_exhausted | blocked | zone_loading
+    ///
+    /// `zone_loading` (#579) means the zone's collision grid is not built (assets still loading, or
+    /// their load failed) — the client has no world model to route in, and no route claim of any
+    /// kind should be read from it. See [`NAV_STATE_ZONE_LOADING`].
     ///
     /// `reason` is the machine-readable WHY behind a terminal state.
     pub fn set_nav_state(&self, state: &str) { self.set_nav_state_because(state, None); }
@@ -491,7 +502,7 @@ impl Walker {
                 self.awaiting_first_plan = false;
                 *self.nav_intent.lock().unwrap() = None;
                 if self.nav_state_is("navigating") || self.nav_state_is("navigating_partial")
-                    || self.nav_state_is("planning")
+                    || self.nav_state_is("planning") || self.nav_state_is(NAV_STATE_ZONE_LOADING)
                 {
                     self.set_nav_state("idle");
                 }
@@ -546,7 +557,35 @@ impl Walker {
         c.resolve_teleport_pads(&advertised)
     }
 
+    /// #579 (agent-honesty): there is no collision grid, so this client has NO model of the world —
+    /// the zone's terrain GLB is still loading, or its load failed. Abandon any route, stop driving
+    /// the controller, and say so. The `/goto` target is deliberately KEPT: once the assets land,
+    /// `replan_decision` posts a real plan and navigation resumes on its own.
+    ///
+    /// This replaces the old behaviour, which is the bug: with no collision the walker published
+    /// `nav_state: "navigating"` and steered in a dead-straight line at the goal, so an agent
+    /// observing mid-load saw a confident walkable route through geometry that had not been built
+    /// (the "700u unobstructed" of the false #560 report).
+    fn halt_no_world(&mut self) {
+        self.path.clear();
+        self.path_i = 0;
+        self.path_goal = None;      // force a REAL plan the moment collision appears
+        self.clear_local_plan();
+        self.planner.cancel();
+        self.awaiting_first_plan = false;
+        *self.nav_intent.lock().unwrap() = None;
+        *self.nav_path_view.lock().unwrap() = (Vec::new(), Vec::new());
+        self.set_nav_state_because(NAV_STATE_ZONE_LOADING, Some("zone_assets_not_loaded"));
+    }
+
     pub fn drive_walk(&mut self, gs: &mut GameState, goal: (f32, f32, f32)) {
+        // No collision grid → no world model. Never present a straight line through unloaded
+        // geometry as a route (#579). Checked BEFORE any planning/steering so the walker cannot
+        // move the character on a world it does not have.
+        if self.collision.read().unwrap().is_none() {
+            self.halt_no_world();
+            return;
+        }
         if self.replan_cooldown > 0 { self.replan_cooldown -= 1; }
         let is_chase = self.nav.goto_entity.lock().unwrap().is_some();
         let in_flight = self.planner.in_flight_goal().map(|g| (g[0], g[1], g[2]));
@@ -600,13 +639,9 @@ impl Walker {
                         *self.nav_intent.lock().unwrap() = None;
                     }
                 }
-                None => {
-                    self.planner.cancel();
-                    self.path_goal = Some(goal);
-                    self.awaiting_first_plan = false;
-                    self.path = Vec::new();
-                    self.set_nav_state("navigating");
-                }
+                // The collision grid vanished between the gate at the top of this fn and here (a
+                // zone change landing mid-tick). Same honest answer, never a bare "navigating".
+                None => { self.halt_no_world(); return; }
             }
         }
 
@@ -894,5 +929,76 @@ impl Walker {
             climb:       0.0, // nav uses the native step-up now (#239); fences handled by hop
             hop:         self.stuck_ticks >= NAV_HOP_TICKS,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn walker_with(collision: crate::collision::SharedCollision)
+        -> (Walker, eqoxide_ipc::NavSlots, eqoxide_ipc::NavIntent, eqoxide_ipc::NavPathView)
+    {
+        let nav: eqoxide_ipc::NavSlots = Default::default();
+        let world: eqoxide_ipc::WorldSlots = Default::default();
+        let intent: eqoxide_ipc::NavIntent = Default::default();
+        let view: eqoxide_ipc::NavPathView = Default::default();
+        let w = Walker::new(nav.clone(), world, collision, intent.clone(), view.clone());
+        (w, nav, intent, view)
+    }
+
+    /// **#579, the agent-honesty regression.** With no collision grid — the zone's terrain GLB is
+    /// still downloading/decoding, which for freportw (~30 MB) is a multi-second window — the walker
+    /// used to publish `nav_state: "navigating"` and steer in a dead-straight line at the goal. An
+    /// agent polling in that window read a confident walkable route through geometry that had not
+    /// been built: the "700u unobstructed" of the false #560 report.
+    ///
+    /// The honest answer is `zone_loading` / `zone_assets_not_loaded`, with NO movement intent and
+    /// NO route overlay — "I have no model of this world", not "the way is clear".
+    #[test]
+    fn no_collision_reports_zone_loading_and_never_a_route() {
+        let (mut w, nav, intent, view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+        let mut gs = eqoxide_core::game_state::GameState::new();
+        gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0;
+
+        w.drive_walk(&mut gs, (700.0, 0.0, 0.0));
+
+        let s = nav.nav_state.lock().unwrap().clone();
+        assert_eq!(s.state, NAV_STATE_ZONE_LOADING,
+            "with no collision the walker must NOT claim to be navigating — that is the #579 lie");
+        assert_eq!(s.reason.as_deref(), Some("zone_assets_not_loaded"));
+        assert!(intent.lock().unwrap().is_none(),
+            "the walker must not drive the controller through a world it has not loaded");
+        let (coarse, fine) = view.lock().unwrap().clone();
+        assert!(coarse.is_empty() && fine.is_empty(), "no route may be published without collision");
+        assert!(w.path.is_empty());
+    }
+
+    /// The state must not be terminal-sticky: it is a fact about right now, and the goal is KEPT so
+    /// navigation resumes by itself once the assets land. Repeated ticks keep saying the same thing.
+    #[test]
+    fn zone_loading_is_stable_across_ticks_and_keeps_the_goal() {
+        let (mut w, nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+        let mut gs = eqoxide_core::game_state::GameState::new();
+        *nav.goto_target.lock().unwrap() = Some((700.0, 0.0, 0.0));
+        for _ in 0..5 { w.drive_walk(&mut gs, (700.0, 0.0, 0.0)); }
+        assert_eq!(nav.nav_state.lock().unwrap().state, NAV_STATE_ZONE_LOADING);
+        assert!(nav.goto_target.lock().unwrap().is_some(),
+            "the goal must survive the load window so the walker can plan it for real afterwards");
+        assert!(w.path_goal.is_none(), "no goal may be recorded as routed while there is no world");
+    }
+
+    /// Cancelling the `/goto` during the load window must return to plain `idle`, not leave
+    /// `zone_loading` stuck on a walker that is no longer trying to go anywhere.
+    #[test]
+    fn cancelling_the_goto_while_loading_returns_to_idle() {
+        let (mut w, nav, _intent, _view) = walker_with(Arc::new(std::sync::RwLock::new(None)));
+        let mut gs = eqoxide_core::game_state::GameState::new();
+        w.drive_walk(&mut gs, (700.0, 0.0, 0.0));
+        assert_eq!(nav.nav_state.lock().unwrap().state, NAV_STATE_ZONE_LOADING);
+        *nav.goto_target.lock().unwrap() = None;
+        assert!(w.resolve_goal().is_none());
+        assert_eq!(nav.nav_state.lock().unwrap().state, "idle");
     }
 }

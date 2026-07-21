@@ -340,6 +340,12 @@ fn main() {
     // Publish globally so the nav thread can resolve spell target types for self-cast (eqoxide#95).
     eqoxide::spells::set_global(spells.clone());
     let shared_collision: eqoxide::nav::collision::SharedCollision = Arc::new(std::sync::RwLock::new(None));
+    // #579 (agent-honesty): the zone terrain+collision LOAD STATE. The app thread (which owns the
+    // zone loader) is its only writer; the HTTP layer reads it so a mid-load observation is an
+    // explicit `pending`, never a false "empty world". Starts `Idle` — nothing loaded, nothing
+    // loading — which is itself distinct from both.
+    let zone_assets: eqoxide::nav::zone_assets::ZoneAssetStateShared =
+        Arc::new(Mutex::new(eqoxide::nav::zone_assets::ZoneAssetState::Idle));
     // Single-owner GameState snapshot (see
     // docs/superpowers/plans/2026-07-12-gamestate-single-owner-snapshot.md). The network thread is
     // the sole writer of GameState; it publishes here every tick. `last_inbound` is a separate,
@@ -481,6 +487,7 @@ fn main() {
         nav.clone(),
         world,
         shared_collision.clone(),
+        zone_assets.clone(),
         command.clone(),
         social,
         merchant_slots,
@@ -514,6 +521,7 @@ fn main() {
         app_actions,
         app_spells,
         shared_collision,
+        zone_assets,
         app_frame_profile,
         testzone_mode,
         nav_debug_flag,
