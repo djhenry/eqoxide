@@ -11,7 +11,9 @@
 //! - `coord`       — EQ coordinate-space math (deliberately dependency-free)
 //! - `eqstr`       — EQ string-table (`eqstr_us.txt`) lookups
 //! - `game_state`  — server-authoritative world snapshot the render/net/http layers share (#544 Step 2b)
+//! - `pet`         — RoF2 `PetCommand_Struct` command constants (#544 Step 2h)
 //! - `physics`     — pure movement/physics constants + kinematics shared by movement/nav (#544 Step 2d)
+//! - `race_class`  — EQ class-id→name / race-id→archetype-code lookup tables (#544 Step 2h)
 //! - `region_map`  — zone `.wtr` region/water map parsing
 //! - `skills`      — skill id ↔ name tables
 //! - `spells`      — `spells_us.txt` id→{name,icon} tables (#544 Step 2b)
@@ -22,7 +24,9 @@ pub mod config;
 pub mod coord;
 pub mod eqstr;
 pub mod game_state;
+pub mod pet;
 pub mod physics;
+pub mod race_class;
 pub mod region_map;
 pub mod skills;
 pub mod spells;
