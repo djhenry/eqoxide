@@ -41,10 +41,16 @@ fn shadow_factor(world_pos: vec3<f32>) -> f32 {
     return sum / 9.0;
 }
 
-// Darken a lit color by the shadow term. A shadowed fragment keeps 45% brightness (ambient fill)
-// rather than going black, matching the soft look of the native client's blob/ground shadow.
+// Darken a lit color by the shadow term. A shadowed fragment keeps 25% brightness (ambient fill)
+// rather than going black — darkened from the original 45% per eqoxide#614 (owner: "I'd like them
+// to be a little darker and more noticeable, I can barely see it"). Chosen from a live A/B of
+// 0.45/0.35/0.25/0.15 at identical camera/zone/hour: 0.25 reads clearly on mixed light/dark ground
+// without flattening the shadowed area's texture detail into a silhouette the way 0.15 started to.
+// MUST match zone_instanced.wgsl's `apply_shadow` — placed objects (instanced meshes) would
+// otherwise shadow at a visibly different darkness than terrain. Enforced by
+// shadow_shader.rs::ambient_floor_matches_between_zone_and_zone_instanced (fails if they drift).
 fn apply_shadow(color: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
-    return color * mix(0.45, 1.0, shadow_factor(world_pos));
+    return color * mix(0.25, 1.0, shadow_factor(world_pos));
 }
 
 struct VertexInput {
