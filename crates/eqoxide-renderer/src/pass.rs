@@ -1256,6 +1256,71 @@ pub fn encode_shadow_pass(
     }
 }
 
+/// Weather precipitation pass (eqoxide#542). Draws an instanced billboard particle field (rain
+/// streaks or snow flakes) around the camera, density scaled by the server weather intensity. When
+/// weather is clear the plan's count is 0 and the pass is skipped entirely — the clean on/off
+/// transition. Alpha-blended, depth-tested against the scene (so precipitation is occluded by
+/// geometry in front of it) but depth-write off. Drawn after the world/entity passes.
+///
+/// `cam_right`/`cam_up` are the world-space camera basis (for billboarding); `time_sec` drives the
+/// fall animation. The per-frame uniform is written here (like `encode_door_pass`): queue writes
+/// are applied before the command buffer runs, so this ordering is safe.
+pub fn encode_weather_pass(
+    r:         &EqRenderer,
+    encoder:   &mut wgpu::CommandEncoder,
+    view:      &wgpu::TextureView,
+    scene:     &SceneState,
+    cam_right: [f32; 3],
+    cam_up:    [f32; 3],
+) {
+    use eqoxide_core::weather::{particle_plan, WeatherKind};
+    let plan = particle_plan(&scene.weather);
+    if plan.count == 0 {
+        return; // clear weather → nothing to draw (on/off transition handled by the count)
+    }
+
+    // Per-kind look: snow falls slowly with larger soft flakes; rain falls fast as thin streaks.
+    // Box sizes (EQ units) span the near field around the third-person camera (~80 back / 40 up).
+    let snow = plan.kind == WeatherKind::Snow;
+    let (fall, psize, box_xy, box_h) = if snow {
+        (22.0f32, 1.6f32, 220.0f32, 180.0f32)
+    } else {
+        (150.0f32, 6.0f32, 200.0f32, 170.0f32)
+    };
+    // Mild alpha ramp with intensity on top of the density ramp (both read as "heavier weather").
+    let intensity = scene.weather.intensity.max(1) as f32;
+    let alpha = (0.55 + 0.12 * (intensity - 1.0)).min(1.0);
+    let time_sec = anim_now_ms() as f32 / 1000.0;
+
+    let data = crate::gpu::WeatherUniformData {
+        right:   [cam_right[0], cam_right[1], cam_right[2], 0.0],
+        up:      [cam_up[0], cam_up[1], cam_up[2], 0.0],
+        params:  [time_sec, if snow { 1.0 } else { 0.0 }, box_xy, box_h],
+        params2: [fall, psize, alpha, 0.0],
+    };
+    r.queue.write_buffer(&r.weather.uniform_buf, 0, bytemuck::bytes_of(&data));
+
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("weather"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view, resolve_target: None,
+            ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+        })],
+        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+            view: &r.depth_view,
+            depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+            stencil_ops: None,
+        }),
+        timestamp_writes: None, occlusion_query_set: None,
+    });
+    pass.set_pipeline(&r.pipelines.weather);
+    pass.set_bind_group(0, &r.camera_uniform.bind_group, &[]);
+    pass.set_bind_group(1, &r.weather.bind_group, &[]);
+    pass.set_vertex_buffer(0, r.weather.quad_buf.slice(..));
+    pass.set_vertex_buffer(1, r.weather.instance_buf.slice(..));
+    pass.draw(0..6, 0..plan.count);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1268,6 +1333,18 @@ mod tests {
             &crate::scene::SceneState,
             [f32; 3],
         ) = encode_shadow_pass;
+    }
+
+    #[test]
+    fn encode_weather_pass_has_correct_signature() {
+        let _: fn(
+            &EqRenderer,
+            &mut wgpu::CommandEncoder,
+            &wgpu::TextureView,
+            &SceneState,
+            [f32; 3],
+            [f32; 3],
+        ) = encode_weather_pass;
     }
 
     #[test]

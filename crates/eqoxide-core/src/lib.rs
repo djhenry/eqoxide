@@ -32,4 +32,5 @@ pub mod skills;
 pub mod sky;
 pub mod spells;
 pub mod ucs;
+pub mod weather;
 pub mod zone_map;

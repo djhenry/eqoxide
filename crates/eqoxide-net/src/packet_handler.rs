@@ -22,7 +22,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_NEW_ZONE             => apply_new_zone(gs, p),
         OP_ZONE_SPAWNS          => apply_zone_spawns(gs, p),
         OP_ZONE_ENTRY           => apply_zone_entry(gs, p),
-        OP_WEATHER              => { gs.world.zone_changed = false; }
+        OP_WEATHER              => apply_weather(gs, p),
         OP_PLAYER_PROFILE       => apply_player_profile(gs, p),
         OP_DEATH                => apply_death(gs, p),
         OP_EXP_UPDATE           => apply_exp_update(gs, p),
@@ -142,6 +142,23 @@ fn apply_read_book(gs: &mut GameState, p: &[u8]) {
 fn apply_time_of_day(gs: &mut GameState, p: &[u8]) {
     if let Some(clock) = eqoxide_core::sky::EqClock::from_wire(p) {
         gs.world.eq_clock = Some(clock);
+    }
+}
+
+/// OP_Weather (0x661e) — the server's authoritative weather for this zone (eqoxide#542). Sent once
+/// during the zone-in handshake and again whenever weather changes mid-zone (the GM `#weather`
+/// command, or the zone's own weather engine). We decode the precipitation type + intensity into
+/// `WorldState.weather`; the renderer draws a rain/snow particle field scaled by intensity, nothing
+/// when clear. A short/invalid packet is dropped rather than snapping the sky to a fabricated storm
+/// (honesty: reflect the REAL server weather or keep the last known state).
+///
+/// `gs.world.zone_changed = false` is preserved from the previous inline handler: OP_Weather also
+/// marks the end of the zone-in packet burst here, and other code keys off that reset — decoding
+/// weather must not drop it.
+fn apply_weather(gs: &mut GameState, p: &[u8]) {
+    gs.world.zone_changed = false;
+    if let Some(weather) = eqoxide_core::weather::WeatherState::from_wire(p) {
+        gs.world.weather = weather;
     }
 }
 

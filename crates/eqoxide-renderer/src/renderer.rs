@@ -112,6 +112,9 @@ pub struct EqRenderer {
     pub camera_uniform:      crate::pipeline::CameraUniform,
     /// Time-of-day sky-gradient uniform (eqoxide#561), rewritten each frame from the world clock.
     pub sky_uniform:         crate::pipeline::SkyUniform,
+    /// Weather precipitation resources (eqoxide#542): per-frame uniform + static particle buffers.
+    /// The particle field is drawn only when the server weather is active (rain/snow).
+    pub weather:             crate::pipeline::WeatherResources,
     pub gpu_meshes:          Vec<crate::gpu::GpuMesh>,
     /// GPU-instanced placed-object models: each model mesh uploaded once + an instance-transform
     /// buffer, drawn with the `zone_instanced` pipeline.
@@ -207,6 +210,7 @@ impl EqRenderer {
         let layouts             = crate::pipeline::build_layouts(&device);
         let camera_uniform      = crate::pipeline::build_camera_uniform(&device, &layouts);
         let sky_uniform         = crate::pipeline::build_sky_uniform(&device, &layouts);
+        let weather             = crate::pipeline::build_weather(&device, &layouts);
         let fallback_texture_bg = build_fallback_texture_bg(
             &device, &queue, &layouts.texture_bgl,
         );
@@ -368,6 +372,7 @@ impl EqRenderer {
             pipelines,
             camera_uniform,
             sky_uniform,
+            weather,
             gpu_meshes: vec![],
             gpu_instanced: vec![],
             gpu_textures: vec![],
@@ -1232,6 +1237,9 @@ impl EqRenderer {
         crate::pass::encode_player_pass(self, encoder, view, scene);
         crate::pass::encode_entity_pass(self, encoder, view, scene, cam_eye);
         crate::pass::encode_skinned_entity_pass(self, encoder, view, scene, cam_eye);
+        // Weather precipitation (eqoxide#542) — drawn last over the world/entities: a camera-centered
+        // rain/snow particle field, density from the server weather intensity, skipped when clear.
+        crate::pass::encode_weather_pass(self, encoder, view, scene, right.to_array(), up.to_array());
     }
 
     /// Recreate the depth texture to match new surface dimensions.

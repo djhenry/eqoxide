@@ -153,6 +153,9 @@ pub struct SceneState {
     /// first OP_TimeOfDay; drives the time-of-day sky gradient (the renderer extrapolates the live
     /// hour each frame from this — see `eqoxide_core::sky`).
     pub eq_clock: Option<eqoxide_core::sky::EqClock>,
+    /// Server weather (eqoxide#542), copied from `GameState::world.weather`. Drives the
+    /// precipitation particle pass — rain/snow scaled by intensity, nothing when clear.
+    pub weather: eqoxide_core::weather::WeatherState,
 }
 
 impl SceneState {
@@ -407,6 +410,7 @@ impl SceneState {
             zone_id: gs.world.zone_id,
             zone_fog: gs.world.zone_fog,
             eq_clock: gs.world.eq_clock,
+            weather: gs.world.weather,
         }
     }
 }

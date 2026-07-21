@@ -517,6 +517,12 @@ pub struct WorldState {
     /// to drive the sky gradient. Honest: never a faked value — while `None`, the sky renders a
     /// documented daytime default rather than inventing a "current" time. See `eqoxide_core::sky`.
     pub eq_clock: Option<crate::sky::EqClock>,
+    /// Server-authoritative weather from OP_Weather (eqoxide#542). Defaults to clear; the renderer
+    /// draws a rain/snow particle field around the camera scaled by intensity, and nothing at all
+    /// when clear. Model-only, single-writer (the net thread's OP_Weather handler). Honest: reflects
+    /// the REAL server weather — a short/invalid packet is dropped, never a fabricated storm. See
+    /// `eqoxide_core::weather`.
+    pub weather: crate::weather::WeatherState,
     /// True once OP_NewZone has been applied for the current zone-server session. A RoF2 zone-in
     /// delivers OP_NewZone TWICE: the server sends it unsolicited while handling OP_ZoneEntry and
     /// again in reply to our OP_ReqNewZone (EQEmu `Handle_Connect_OP_ReqNewZone`). The second copy

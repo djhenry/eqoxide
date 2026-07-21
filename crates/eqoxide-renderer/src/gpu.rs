@@ -116,6 +116,24 @@ pub struct SkyUniformData {
     pub horizon: [f32; 4],
 }
 
+/// Per-frame weather-particle parameters (eqoxide#542), written to the weather pipeline's uniform
+/// each frame the field is active. Camera basis + animation params for the rain/snow particle field
+/// centered on the camera. `.xyz` used, `.w` is padding / an extra scalar as noted. `camera_pos`
+/// and `view_proj` come from the shared camera uniform (group 0); this is group 1.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct WeatherUniformData {
+    /// Camera right vector (xyz), for billboarding particle quads. w = padding.
+    pub right:   [f32; 4],
+    /// Camera up vector (xyz), for billboarding snow flakes. w = padding.
+    pub up:      [f32; 4],
+    /// x = time (sec, for the fall animation), y = kind (0.0 = rain, 1.0 = snow),
+    /// z = horizontal box size, w = vertical box height (the field volume around the camera).
+    pub params:  [f32; 4],
+    /// x = fall speed (units/sec), y = particle size, z = alpha scale (intensity), w = reserved.
+    pub params2: [f32; 4],
+}
+
 /// Static (non-animated) character model.
 pub struct GpuStaticModel {
     pub meshes:              Vec<GpuMesh>,
