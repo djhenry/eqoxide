@@ -86,7 +86,13 @@ jobs:
       # crate extraction then moved ~92% of the suite into `crates/*`, and CI silently went from
       # testing everything to testing 88 of 1145 tests (1 test binary of 25) — green the entire
       # time. `--lib` also excludes every integration target under `tests/`, including
-      # `walker_sim.rs`, the simulation that would catch a walker clipping through a wall.
+      # `walker_sim.rs`.
+      #
+      # Do NOT "improve" this to `--all-targets`: that would be a REGRESSION here. The repo has no
+      # `benches/` and no `examples/`, so `--all-targets` adds zero coverage, and it silently DROPS
+      # the doc-test targets. (Those targets do run today and report 0 tests — all 22 doc fences in
+      # the repo are ```text/```bash, so no Rust doctest exists yet. The targets are what would
+      # catch the first real one.)
       #
       # Headless-safety still holds under `--workspace`: no test in any crate constructs a
       # `wgpu::Instance` or a `winit::EventLoop` (grep confirms both appear only in
@@ -97,11 +103,32 @@ jobs:
       # The `tests/asset_sync_live.rs` integration test is the only one that wants the network,
       # and it is already `#[ignore]`d.
       #
-      # 29 tests are `#[ignore]`d, every one of them for a stated environment reason: they gate on
-      # baked asset fixtures (zone `.glb` + `.wtr` under `$ZONE_GLB`/`$ZONE_DIR`, bundled model
-      # `.glb` under `assets/models/`) that are gitignored and absent on a fresh clone, or on a
-      # running asset server. They stay ignored here — see #357 for giving them their own
-      # optional/asset-backed job with cached assets.
+      # 29 tests are `#[ignore]`d, each for a stated environment reason, in three categories:
+      #   - baked asset fixtures — zone `.glb` + `.wtr` under `$ZONE_GLB`/`$ZONE_DIR`, bundled
+      #     model `.glb` under `assets/models/`; gitignored and absent on a fresh clone (27)
+      #   - extracted SOURCE assets — `tools`' `skinned_conversion_is_centered_grounded` needs
+      #     `globalhum_chr.s3d` under `$EQ_ASSETS_DIR` (1)
+      #   - a running asset server at `$ASSET_URL` — `tests/asset_sync_live.rs` (1)
+      # They stay ignored here — see #357 for giving them their own optional/asset-backed job.
+      #
+      # BE PRECISE ABOUT WHAT THIS DOES *NOT* COVER — do not read "nav is now tested in CI" into
+      # the numbers above. Among those 29 ignored are the ENTIRE 12-test nav real-zone corpus in
+      # `crates/eqoxide-nav/src/collision.rs` and `walker_sim.rs`'s real-zone drift baseline
+      # (`faithful_walker_drift_corpus`). What runs here is the synthetic-geometry half: nav's 127
+      # unit tests and walker_sim's 4 hand-built-mesh cases (lintel, low wall, haul-out, swim
+      # depth). Nav's deepest verification — against real baked zones — still runs NOWHERE
+      # automatic (#357). Misreading a nav gate as broader than it is has already cost this
+      # project once: #411/D-2 passed nav QA and regressed live.
+      #
+      # THE ONE PLACE A FLAKE COULD COME FROM, so a future red run gets diagnosed instead of
+      # papered over: `crates/eqoxide-nav/src/planner.rs` has two ABSOLUTE wall-clock assertions
+      # that reach CI for the first time with this change — `post_us < 1_000` (:958) and
+      # `post_us < 500` (:1011). Both measured ~2-3us here, a 150-500x margin, so the risk is low.
+      # But note their doc comment's claim that "the assertions only get SAFER under CPU load" is
+      # true only of the `sync_us > …` fixture-sanity halves; a >500us deschedule of the posting
+      # thread on a 2-vCPU runner is rare, NOT impossible. If one of those two goes red in
+      # isolation, that is this — a scheduling artifact, not a nav regression. Fix it by making
+      # the assertion relative (post_us vs sync_us) rather than by narrowing the gate.
       #
       # If a test fails here, fix it or `#[ignore]` it WITH A SPECIFIC REASON. Do not narrow this
       # command back down to make it green — that is exactly the failure #605 documents.
