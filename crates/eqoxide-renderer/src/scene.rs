@@ -149,6 +149,10 @@ pub struct SceneState {
     /// Distance fog for the current zone (eqoxide#517), `None` = no fog (respect the zone's
     /// actual OP_NewZone values — see `GameState::zone_fog`).
     pub zone_fog: Option<eqoxide_core::game_state::ZoneFog>,
+    /// Server world clock (eqoxide#561), copied from `GameState::world.eq_clock`. `None` until the
+    /// first OP_TimeOfDay; drives the time-of-day sky gradient (the renderer extrapolates the live
+    /// hour each frame from this — see `eqoxide_core::sky`).
+    pub eq_clock: Option<eqoxide_core::sky::EqClock>,
 }
 
 impl SceneState {
@@ -402,6 +406,7 @@ impl SceneState {
             killed_by: gs.killed_by.clone(),
             zone_id: gs.world.zone_id,
             zone_fog: gs.world.zone_fog,
+            eq_clock: gs.world.eq_clock,
         }
     }
 }

@@ -104,6 +104,18 @@ pub struct CameraUniformData {
     pub fog_params: [f32; 4],
 }
 
+/// Per-frame sky-gradient colors (eqoxide#561), written to the sky pipeline's uniform each frame
+/// from the time-of-day clock. Two stops; `.xyz` is the color, `.w` is padding (a `vec3` in a WGSL
+/// uniform still occupies 16 bytes, so both stops are stored as `vec4` to match std140 alignment).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SkyUniformData {
+    /// Zenith (top-of-sky) color, rgb in 0..1, a = padding.
+    pub zenith:  [f32; 4],
+    /// Horizon (bottom-of-sky) color, rgb in 0..1, a = padding.
+    pub horizon: [f32; 4],
+}
+
 /// Static (non-animated) character model.
 pub struct GpuStaticModel {
     pub meshes:              Vec<GpuMesh>,

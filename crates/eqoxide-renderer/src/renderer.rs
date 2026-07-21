@@ -110,6 +110,8 @@ pub struct EqRenderer {
     pub layouts:             crate::pipeline::Layouts,
     pub pipelines:           crate::pipeline::Pipelines,
     pub camera_uniform:      crate::pipeline::CameraUniform,
+    /// Time-of-day sky-gradient uniform (eqoxide#561), rewritten each frame from the world clock.
+    pub sky_uniform:         crate::pipeline::SkyUniform,
     pub gpu_meshes:          Vec<crate::gpu::GpuMesh>,
     /// GPU-instanced placed-object models: each model mesh uploaded once + an instance-transform
     /// buffer, drawn with the `zone_instanced` pipeline.
@@ -185,6 +187,7 @@ impl EqRenderer {
     ) -> Self {
         let layouts             = crate::pipeline::build_layouts(&device);
         let camera_uniform      = crate::pipeline::build_camera_uniform(&device, &layouts);
+        let sky_uniform         = crate::pipeline::build_sky_uniform(&device, &layouts);
         let fallback_texture_bg = build_fallback_texture_bg(
             &device, &queue, &layouts.texture_bgl,
         );
@@ -279,6 +282,7 @@ impl EqRenderer {
             layouts,
             pipelines,
             camera_uniform,
+            sky_uniform,
             gpu_meshes: vec![],
             gpu_instanced: vec![],
             gpu_textures: vec![],
@@ -1089,6 +1093,27 @@ impl EqRenderer {
             .map(|(key, _bone)| key)
             .collect();
         for key in entity_keys { self.ensure_weapon(&key); }
+
+        // Time-of-day sky gradient (eqoxide#561). Compute the live hour-of-day from the world clock
+        // (extrapolated fresh each frame — the snapshot's `received_at` only moves on a packet, so
+        // the sky advances smoothly between the rare OP_TimeOfDay packets), map it to a 2-stop
+        // phase gradient, and lerp the horizon partway toward the zone fog color so the sky/terrain
+        // seam at the bottom of the screen isn't a hard edge. No clock yet → documented daytime
+        // default (never a faked time).
+        let mut sky = eqoxide_core::sky::SkyColors::for_clock(scene.eq_clock.as_ref());
+        if let Some(fog) = scene.zone_fog {
+            let fog_rgb = [
+                fog.color[0] as f32 / 255.0,
+                fog.color[1] as f32 / 255.0,
+                fog.color[2] as f32 / 255.0,
+            ];
+            sky = sky.with_horizon_fog(fog_rgb, 0.35);
+        }
+        let sky_data = crate::gpu::SkyUniformData {
+            zenith:  [sky.zenith[0], sky.zenith[1], sky.zenith[2], 0.0],
+            horizon: [sky.horizon[0], sky.horizon[1], sky.horizon[2], 0.0],
+        };
+        self.queue.write_buffer(&self.sky_uniform.buf, 0, bytemuck::bytes_of(&sky_data));
 
         crate::pass::encode_sky_pass(self, encoder, view);
         crate::pass::encode_zone_pass(self, encoder, view, scene);

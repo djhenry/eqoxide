@@ -148,6 +148,8 @@ pub fn encode_sky_pass(
         occlusion_query_set: None,
     });
     pass.set_pipeline(&r.pipelines.sky);
+    // Time-of-day gradient colors (eqoxide#561), written to this buffer earlier in the frame.
+    pass.set_bind_group(0, &r.sky_uniform.bind_group, &[]);
     pass.draw(0..6, 0..1);
 }
 

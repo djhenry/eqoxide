@@ -120,6 +120,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_GUILD_MEMBER_UPDATE  => apply_guild_member_update(gs, p),
         OP_GUILD_INVITE         => apply_guild_invite(gs, p),
         OP_WHO_ALL_RESPONSE     => apply_who_all(gs, p),
+        OP_TIME_OF_DAY          => apply_time_of_day(gs, p),
         _                       => {}
     }
 }
@@ -131,6 +132,16 @@ fn apply_read_book(gs: &mut GameState, p: &[u8]) {
     if let Some(text) = crate::protocol::parse_read_book_reply(p) {
         gs.log_msg("book", &text);
         gs.last_book_text = Some(text);
+    }
+}
+
+/// OP_TimeOfDay (0x5070) — the server's world clock (eqoxide#561). Sent once during zone-entry and
+/// again on any GM/quest world-time change; carries no epoch, so we snap the clock to the received
+/// value and extrapolate locally (see `eqoxide_core::sky::EqClock`). A short/invalid packet is
+/// dropped rather than moving the clock to a bogus time (honesty: never a faked value).
+fn apply_time_of_day(gs: &mut GameState, p: &[u8]) {
+    if let Some(clock) = eqoxide_core::sky::EqClock::from_wire(p) {
+        gs.world.eq_clock = Some(clock);
     }
 }
 
