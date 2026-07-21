@@ -1213,7 +1213,7 @@ impl App {
                     // #529: mirror the self-player's Levitate state so the controller floats (gravity
                     // off) instead of falling while the buff is up. Tracks the live buff as it is cast
                     // and fades; false for a normal grounded character (physics byte-identical).
-                    self.controller.set_levitating(self.game_state_view.player_levitating);
+                    self.controller.set_levitating(self.game_state_view.player_levitating());
                     self.controller.step(intent, dt, c);
                 }
             }

@@ -396,6 +396,100 @@ pub struct ItemLink {
     pub is_saylink: bool,
 }
 
+/// The self-player's Levitate (gravity-off) state, reconstructed from the TWO independent server
+/// channels that carry it. (#529 Slice 1, extended by #586.)
+///
+/// ## Why this is a struct and not a `bool`
+/// A plain `bool` had two unrelated writers racing on it, and the "bad" state (one writer's stale
+/// belief clobbering the other's fresh truth) was trivially representable. Here each channel owns
+/// its OWN field, nothing outside this type can write the answer, and the answer is *derived*:
+///
+/// - [`by_flymode`](Self::by_flymode) — the GravityBehavior channel. Set at zone-in from the
+///   self-spawn's `flymode` byte (EQEmu `FillSpawnStruct` bakes `2` for a levitating client), and
+///   cleared mid-zone by `OP_SpawnAppearance` type 19 (`AppearanceType::FlyMode`) `param=0` on buff
+///   fade. This channel NEVER delivers a mid-zone SET: both the cast-on and the zone-in reapply call
+///   `SendAppearancePacket(FlyMode, …, ignore_self=true)`.
+/// - `by_buff` — the buff channel (#586). The buff slots that currently hold a spell our
+///   `spells_us.txt` table says carries **SPA 57 (SE_Levitate)**. This is the channel the real RoF2
+///   client uses for a mid-zone cast-on, and the only one that reports it promptly.
+///
+/// ## Precedence: OR, never overwrite
+/// [`active`](Self::active) is `by_flymode || !by_buff.is_empty()`. Both channels are
+/// server-authoritative and each only ever asserts what the server told us, so they cannot
+/// disagree about a *positive*; OR means neither channel's silence can erase the other's evidence.
+/// A fade clears both (the fade sends an `OP_Buff` fade AND the type-19 `param=0`), and a zone-in
+/// [resyncs](Self::resync_on_zone_in) the buff channel from scratch so nothing carries over stale.
+///
+/// ## What is deliberately NOT modelled
+/// Only "does this spell id carry SPA 57". No buff durations, no other SPA behavior, no bonus math.
+/// An unknown spell id (not in the table, or no table loaded) leaves this state **unchanged** — it
+/// is never guessed to be "not levitate". See [`crate::spells::SpellDb::has_effect`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LevitateState {
+    /// Latest reading of the GravityBehavior channel (self-spawn `flymode` / type-19 appearance).
+    by_flymode: bool,
+    /// Buff slot ids currently known to hold a SPA-57 spell.
+    by_buff: std::collections::BTreeSet<u32>,
+}
+
+impl LevitateState {
+    /// The one answer: is the self-player levitating right now?
+    pub fn active(&self) -> bool { self.by_flymode || !self.by_buff.is_empty() }
+
+    /// Mid-zone `OP_SpawnAppearance` type 19 about our own spawn. In practice only ever the CLEAR
+    /// (`param=0` on fade) — the 2/5 SET arm is defensive.
+    pub fn set_flymode(&mut self, levitating: bool) { self.by_flymode = levitating; }
+
+    /// Zone-in full resync from the self-spawn's `flymode` byte. That byte is the server's complete
+    /// answer for this moment, so the buff channel is dropped rather than carried across the zone
+    /// boundary (the zone-in buff snapshot repopulates it).
+    pub fn resync_on_zone_in(&mut self, levitating: bool) {
+        self.by_flymode = levitating;
+        self.by_buff.clear();
+    }
+
+    /// One buff slot changed. `is_levitate` is the three-valued SPA-57 answer for the spell now in
+    /// `slot` (`None` = we have no row for that spell id). `fading` = the server said this buff is
+    /// going away.
+    ///
+    /// `None` is a NO-OP by design: an unknown spell must never clear a slot we positively know
+    /// holds a levitate (that would report "not levitating" while the character floats).
+    pub fn buff_slot_changed(&mut self, slot: u32, is_levitate: Option<bool>, fading: bool) {
+        if fading {
+            // A fade names the slot being vacated. Removing it is safe whatever the spell was: if
+            // the slot wasn't in the set, this is a no-op.
+            self.by_buff.remove(&slot);
+            return;
+        }
+        match is_levitate {
+            Some(true)  => { self.by_buff.insert(slot); }
+            Some(false) => { self.by_buff.remove(&slot); }
+            None        => {}
+        }
+    }
+
+    /// A FULL buff-list snapshot (`OP_BuffCreate` with `all_buffs=1`): `(slot, is_levitate)` for
+    /// every occupied slot. Slots absent from the snapshot, or holding a spell we KNOW is not
+    /// levitate, drop out. A slot holding an UNKNOWN spell keeps whatever we already believed about
+    /// it — the snapshot is only as complete as our spell table, and we do not pretend otherwise.
+    pub fn resync_from_snapshot(&mut self, slots: &[(u32, Option<bool>)]) {
+        let mut next = std::collections::BTreeSet::new();
+        for &(slot, is_levitate) in slots {
+            match is_levitate {
+                Some(true)  => { next.insert(slot); }
+                Some(false) => {}
+                None        => { if self.by_buff.contains(&slot) { next.insert(slot); } }
+            }
+        }
+        self.by_buff = next;
+    }
+
+    /// Diagnostics: which channel(s) currently assert levitate. Not wire state — for logs/tests.
+    pub fn from_flymode(&self) -> bool { self.by_flymode }
+    /// Diagnostics: number of buff slots believed to hold a SPA-57 spell.
+    pub fn levitate_buff_slots(&self) -> usize { self.by_buff.len() }
+}
+
 /// A single entry in the message log.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogEntry {
@@ -638,12 +732,11 @@ pub struct GameState {
     pub player_guild_id: u32,
     /// Player's rank within the guild (guildrank): 0 member, 1 officer, 2 leader (RoF2). (#295)
     pub player_guild_rank: u32,
-    /// #529: the self-player currently has a Levitate effect active (gravity off — the character
-    /// free-floats/hovers over land rather than falling). Server-authoritative: set from the
-    /// self-spawn's `flymode` (zone-in already levitating) and toggled by OP_SpawnAppearance
-    /// Levitate updates about our own spawn id (mid-zone cast/fade). The render controller mirrors
-    /// this each frame via `CharacterController::set_levitating` so it stops applying gravity.
-    pub player_levitating: bool,
+    /// #529/#586: the self-player's Levitate (gravity off — the character free-floats/hovers over
+    /// land rather than falling). Server-authoritative and derived from two independent wire
+    /// channels; read it via [`GameState::player_levitating`], never by poking at a bool. The render
+    /// controller mirrors it each frame via `CharacterController::set_levitating`.
+    pub levitate: LevitateState,
     /// guild id → guild name, built from OP_GuildsList (the server's guild-name table). Used to
     /// resolve `player_guild_id` and each roster member's guild to a display name. (#295)
     pub guild_names: std::collections::HashMap<u32, String>,
@@ -1194,6 +1287,9 @@ impl GameState {
         self.coin_confirmed && self.unverified_buys == 0
     }
 
+    /// Is the self-player levitating (gravity off)? The single read path for [`LevitateState`].
+    pub fn player_levitating(&self) -> bool { self.levitate.active() }
+
     /// Reconcile the local coin snapshot against the server's authoritative figure, carried by
     /// every OP_PlayerProfile (#361). Two merchant-buy refusal paths — inventory-full and a LORE
     /// conflict — send no echo of any kind, and for inventory-full the server takes the coin
@@ -1468,6 +1564,63 @@ pub fn make_entity(id: u32, name: &str, x: f32, y: f32, z: f32, is_npc: bool) ->
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{Door, GameState, MerchantItem, make_entity};
+
+    /// #586: exhaustive property over every ordering of the two levitate channels' events. The
+    /// invariant that matters for agent-honesty is that `active()` is EXACTLY "some channel
+    /// currently holds evidence" — never a stale `true` after all evidence is withdrawn, never a
+    /// `false` while evidence stands, and never dependent on which channel spoke last.
+    #[test]
+    fn levitate_state_is_exactly_the_union_of_its_two_channels() {
+        use super::LevitateState;
+        #[derive(Clone, Copy, Debug)]
+        enum Ev { Fly(bool), BuffOn(u32), BuffOff(u32), BuffKnownOther(u32), BuffUnknown(u32), ZoneIn(bool) }
+        let alphabet = [
+            Ev::Fly(true), Ev::Fly(false),
+            Ev::BuffOn(1), Ev::BuffOff(1), Ev::BuffKnownOther(1), Ev::BuffUnknown(1),
+            Ev::BuffOn(2), Ev::BuffOff(2),
+            Ev::ZoneIn(true), Ev::ZoneIn(false),
+        ];
+        // Every sequence of length 3 over the alphabet (1000 orderings), replayed against an
+        // independent reference model.
+        for a in alphabet { for b in alphabet { for c in alphabet {
+            let seq = [a, b, c];
+            let mut st = LevitateState::default();
+            let mut ref_fly = false;
+            let mut ref_slots: std::collections::BTreeSet<u32> = Default::default();
+            for ev in seq {
+                match ev {
+                    Ev::Fly(v)   => { st.set_flymode(v); ref_fly = v; }
+                    Ev::ZoneIn(v) => { st.resync_on_zone_in(v); ref_fly = v; ref_slots.clear(); }
+                    Ev::BuffOn(s) => { st.buff_slot_changed(s, Some(true), false); ref_slots.insert(s); }
+                    Ev::BuffKnownOther(s) => { st.buff_slot_changed(s, Some(false), false); ref_slots.remove(&s); }
+                    Ev::BuffOff(s) => { st.buff_slot_changed(s, None, true); ref_slots.remove(&s); }
+                    // The honesty rule: an UNKNOWN spell id changes nothing at all.
+                    Ev::BuffUnknown(_) => { st.buff_slot_changed(1, None, false); }
+                }
+                assert_eq!(st.active(), ref_fly || !ref_slots.is_empty(),
+                           "levitate mismatch after {seq:?} (fly={ref_fly} slots={ref_slots:?})");
+            }
+        }}}
+    }
+
+    /// #586: a full buff-list snapshot may only conclude "no levitate" from spells it actually
+    /// knows. A slot holding an id absent from our table keeps whatever we already believed.
+    #[test]
+    fn levitate_snapshot_never_erases_belief_on_an_unknown_spell() {
+        use super::LevitateState;
+        let mut st = LevitateState::default();
+        st.buff_slot_changed(3, Some(true), false);
+        assert!(st.active());
+        // Snapshot lists slot 3 with a spell we cannot resolve → belief preserved.
+        st.resync_from_snapshot(&[(3, None)]);
+        assert!(st.active(), "unknown spell in a snapshot must not erase a known-true levitate");
+        // Snapshot lists slot 3 with a spell we KNOW is not levitate → cleared.
+        st.resync_from_snapshot(&[(3, Some(false))]);
+        assert!(!st.active(), "a known non-levitate spell in that slot does clear it");
+        // A slot we never believed in, holding an unknown spell, is not invented as levitate.
+        st.resync_from_snapshot(&[(9, None)]);
+        assert!(!st.active(), "an unknown spell must never be guessed as levitate either");
+    }
 
     /// eqoxide#201: the flat bag-slot mapping must round-trip and match the RoF2 numbering
     /// (GENERAL_BAGS_BEGIN=251, stride 10, parent general slots 23-32).

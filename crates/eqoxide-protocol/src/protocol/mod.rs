@@ -178,6 +178,12 @@ pub const OP_BEGIN_CAST: u16 = 0x318f;        // RoF2: OP_BeginCast
 pub const OP_MANA_CHANGE: u16 = 0x5467;       // RoF2: OP_ManaChange
 pub const OP_MEMORIZE_SPELL: u16 = 0x217c;    // RoF2: OP_MemorizeSpell
 pub const OP_INTERRUPT_CAST: u16 = 0x048c;    // RoF2: OP_InterruptCast
+// Buff state (#586). Both carry a buff's SPELL ID for a given entity — the only channel on which a
+// mid-zone buff cast on OURSELF is observable to us (the type-19 FlyMode appearance is ignore_self).
+// OP_Buff: SpellBuffPacket_Struct, EXACTLY 100 bytes on the RoF2 wire (see `apply_buff`).
+pub const OP_BUFF: u16 = 0x659c;              // RoF2: OP_Buff
+// OP_BuffCreate: variable-length buff-icon list (see `apply_buff_create`).
+pub const OP_BUFF_CREATE: u16 = 0x3377;       // RoF2: OP_BuffCreate
 
 // Pet control: PetCommand_Struct { command:u32, target:u32 }. Command values from
 // EQEmu zone/common.h: PET_ATTACK=2, PET_GUARDHERE=5, PET_FOLLOWME=4(GetOwner), PET_BACKOFF=28.

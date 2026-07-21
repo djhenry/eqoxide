@@ -36,6 +36,8 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
         OP_CONSIDER             => apply_consider(gs, p),
         OP_TARGET_COMMAND       => apply_target_command(gs, p),
         OP_SPAWN_APPEARANCE     => apply_spawn_appearance(gs, p),
+        OP_BUFF                 => apply_buff(gs, p),
+        OP_BUFF_CREATE          => apply_buff_create(gs, p),
         OP_SEND_ZONE_POINTS           => apply_zone_points(gs, p),
         OP_SPAWN_DOOR           => apply_spawn_doors(gs, p),
         OP_MOVE_DOOR            => apply_move_door(gs, p),
@@ -2277,20 +2279,137 @@ fn apply_spawn_appearance(gs: &mut GameState, payload: &[u8]) {
         // the self-SPAWN-STRUCT `flymode` byte at zone-in (see the self-spawn branch in
         // `register_spawn`, baked 2/0) — and CLEARED here when `param==0` arrives. Routing `param`
         // through `is_levitating_flymode` keeps the (dead-on-this-path) 2/5 arm defensively correct.
-        // KNOWN GAP (Slice-1 follow-up #586): a mid-zone cast-ON is not observable to self on any
-        // opcode we decode — the real client infers it from OP_Buff's spellid × SPA 57, which needs a
-        // spell/SPA table eqoxide lacks — so an in-zone Levitate cast is only reflected at the next
-        // zone-in, not the instant it lands.
+        // The mid-zone cast-ON is NOT observable here — it arrives on the buff channel instead and
+        // is decoded by `apply_buff` / `apply_buff_create` via SPA 57 (#586). The two channels are
+        // separate fields inside `GameState::levitate`; neither can clobber the other.
         const FLY_MODE: u16 = 19;
         match kind {
             GUILD_ID   => { gs.player_guild_id = param;
                             tracing::info!("EQ: guild membership changed → guild_id={}", param); }
             GUILD_RANK => { gs.player_guild_rank = param; }
-            FLY_MODE   => { gs.player_levitating = eqoxide_core::coord::is_levitating_flymode(param as u8);
+            FLY_MODE   => { gs.levitate.set_flymode(eqoxide_core::coord::is_levitating_flymode(param as u8));
                             tracing::info!("EQ: self FlyMode appearance param={} → levitating={}",
-                                           param, gs.player_levitating); }
+                                           param, gs.player_levitating()); }
             _ => {}
         }
+    }
+}
+
+/// Resolve "does this spell id carry SPA 57 (SE_Levitate)?" against the loaded `spells_us.txt`.
+/// Three-valued: `None` = we have no row for that id (or no table loaded) — NEVER "no". (#586)
+fn spell_is_levitate(spell_id: u32) -> Option<bool> {
+    eqoxide_core::spells::has_effect(spell_id, eqoxide_core::spells::SPA_LEVITATE)
+}
+
+/// Spell-id sentinel both buff opcodes use for "this slot is being emptied" (not a real spell).
+const BUFF_SPELL_NONE: u32 = 0xFFFF_FFFF;
+
+/// OP_Buff — a single buff slot's state for one entity (EQEmu `SpellBuffPacket_Struct`).
+///
+/// **Why we decode this at all (#586, agent-honesty).** A Levitate cast that lands on us mid-zone is
+/// invisible on the appearance channel: EQEmu's `zone/spell_effects.cpp` sends the type-19 FlyMode
+/// appearance with `ignore_self=true` ("this sends the levitate packet to everybody else who does
+/// not otherwise receive the buff packet"). The real RoF2 client is expected to notice its own
+/// levitate by cross-referencing the buff's spell id against **SPA 57** in its spell table. Without
+/// this handler `player_levitating` stayed `false` while the character genuinely floated, until the
+/// next zone-in — a state the client reported as truth and wasn't.
+///
+/// RoF2 wire layout, EXACTLY 100 bytes (`common/patches/rof2_structs.h`, `ENCODE(OP_Buff)`):
+/// ```text
+///   000 entityid u32          — whose buff this is
+///   004 effect_type u8 | 005 level u8 | 006..007 padding
+///   008 bard_modifier f32
+///   012 spellid u32           — 0xFFFFFFFF = "slot emptied" sentinel
+///   016 duration u32 | 020 caster player_id u32 | 024 num_hits u32
+///   028 y f32 | 032 x f32 | 036 z f32 | 040 unknown | 044..091 slot_data[12] i32
+///   092 slotid u32
+///   096 bufffade u32          — 1 = FADING, 2 = active (the ENCODE maps emu 0 → 2)
+/// ```
+fn apply_buff(gs: &mut GameState, payload: &[u8]) {
+    apply_buff_with(gs, payload, spell_is_levitate)
+}
+
+/// [`apply_buff`] with the SPA lookup injected (so tests need no process-global spell table).
+fn apply_buff_with(gs: &mut GameState, payload: &[u8], is_levitate: impl Fn(u32) -> Option<bool>) {
+    const SPELL_BUFF_PACKET_LEN: usize = 100;
+    if payload.len() < SPELL_BUFF_PACKET_LEN { return; }
+    let entity_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    // Only OUR OWN buffs bear on our levitate state. A buff on a target/group member arrives on the
+    // same opcode and must not touch us.
+    if entity_id != gs.player_id { return; }
+    let spell_id = u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]);
+    let slot_id  = u32::from_le_bytes([payload[92], payload[93], payload[94], payload[95]]);
+    let bufffade = u32::from_le_bytes([payload[96], payload[97], payload[98], payload[99]]);
+    const FADING: u32 = 1;
+    let fading = bufffade == FADING || spell_id == BUFF_SPELL_NONE;
+    let lev = if fading { None } else { is_levitate(spell_id) };
+    let before = gs.player_levitating();
+    gs.levitate.buff_slot_changed(slot_id, lev, fading);
+    if gs.player_levitating() != before {
+        tracing::info!("EQ: self buff slot {slot_id} spell {spell_id} fading={fading} → levitating={}",
+                       gs.player_levitating());
+    }
+}
+
+/// OP_BuffCreate — the buff-icon list for one entity. Sent when a buff is ADDED (RoF2 takes the
+/// SoD-and-later path in `Mob::AddBuff` → `MakeBuffsPacket`), when the whole bar is resynced
+/// (`all_buffs=1`, e.g. at zone-in), and to remove a single icon.
+///
+/// RoF2 wire layout (`ENCODE(OP_BuffCreate)`), variable length:
+/// ```text
+///   000 entity_id u32
+///   004 tic_timer u32
+///   008 all_buffs u8   — 1 = this IS the complete buff list; 0 = one slot added/removed
+///   009 count u16
+///   011 count × { buff_slot u32, spell_id u32, tics_remaining u32, num_hits u32, caster CSTRING }
+///   ... type u8
+/// ```
+fn apply_buff_create(gs: &mut GameState, payload: &[u8]) {
+    apply_buff_create_with(gs, payload, spell_is_levitate)
+}
+
+/// [`apply_buff_create`] with the SPA lookup injected (so tests need no process-global spell table).
+fn apply_buff_create_with(gs: &mut GameState, payload: &[u8], is_levitate: impl Fn(u32) -> Option<bool>) {
+    const HEADER_LEN: usize = 11;
+    if payload.len() < HEADER_LEN { return; }
+    let entity_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    if entity_id != gs.player_id { return; }
+    let all_buffs = payload[8] == 1;
+    let count     = u16::from_le_bytes([payload[9], payload[10]]) as usize;
+
+    // (slot, spell_id) for every entry we could fully decode. A truncated/garbled tail aborts the
+    // whole packet rather than applying a partial list: a partial list read as a SNAPSHOT would
+    // silently drop real buffs.
+    let mut entries: Vec<(u32, u32)> = Vec::with_capacity(count);
+    let mut off = HEADER_LEN;
+    for _ in 0..count {
+        if off + 16 > payload.len() { return; }
+        let slot     = u32::from_le_bytes([payload[off],      payload[off + 1],  payload[off + 2],  payload[off + 3]]);
+        let spell_id = u32::from_le_bytes([payload[off + 4],  payload[off + 5],  payload[off + 6],  payload[off + 7]]);
+        off += 16;
+        // caster name: NUL-terminated, variable length (often empty).
+        let Some(nul) = payload[off..].iter().position(|&b| b == 0) else { return; };
+        off += nul + 1;
+        entries.push((slot, spell_id));
+    }
+
+    let before = gs.player_levitating();
+    if all_buffs {
+        let resolved: Vec<(u32, Option<bool>)> = entries.iter()
+            .filter(|&&(_, spell_id)| spell_id != BUFF_SPELL_NONE)
+            .map(|&(slot, spell_id)| (slot, is_levitate(spell_id)))
+            .collect();
+        gs.levitate.resync_from_snapshot(&resolved);
+    } else {
+        for (slot, spell_id) in entries {
+            let fading = spell_id == BUFF_SPELL_NONE;
+            let lev = if fading { None } else { is_levitate(spell_id) };
+            gs.levitate.buff_slot_changed(slot, lev, fading);
+        }
+    }
+    if gs.player_levitating() != before {
+        tracing::info!("EQ: self buff list (all={all_buffs}, {count} entries) → levitating={}",
+                       gs.player_levitating());
     }
 }
 
@@ -2722,9 +2841,12 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
         // that delivers the levitate SET to self (EQEmu FillSpawnStruct bakes it `2` for a levitating
         // client, `0` otherwise — never `5`; the zone-in FlyMode appearance is ignore_self, #587
         // review). Seed the controller's gravity-off hover from it. CLEAR (mid-zone fade) arrives
-        // separately as OP_SpawnAppearance FlyMode param=0 about our own id; a mid-zone cast-ON is not
-        // observable to self until the next zone-in (known gap #586).
-        gs.player_levitating     = eqoxide_core::coord::is_levitating_flymode(info.flymode);
+        // separately as OP_SpawnAppearance FlyMode param=0 about our own id; a mid-zone cast-ON now
+        // arrives on the buff channel (SPA 57 — see `apply_buff`, #586).
+        // This byte is the server's COMPLETE answer at this instant, so it also resyncs the buff
+        // channel: nothing believed about buff slots in the previous zone carries over. The zone-in
+        // OP_BuffCreate snapshot repopulates it.
+        gs.levitate.resync_on_zone_in(eqoxide_core::coord::is_levitating_flymode(info.flymode));
         tracing::info!("EQ: player spawn id={} pos=({:.1},{:.1},{:.1}) equip={:?} guild_id={}",
             info.spawn_id, info.x, info.y, info.z, gs.player_equipment, info.guild_id);
         return;
@@ -2800,7 +2922,7 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
 mod tests {
     use super::{apply_emote, apply_death, apply_who_all, class_name, con_color, consider_message, parse_player_profile,
                 parse_begin_cast, apply_begin_cast, parse_memorize_spell, apply_char_inventory,
-                apply_money_update, apply_money_on_corpse, apply_move_item, apply_spawn_appearance,
+                apply_money_update, apply_money_on_corpse, apply_move_item, apply_spawn_appearance, apply_buff_with, apply_buff_create_with,
                 extract_saylink_text, apply_task_description, apply_completed_tasks, apply_task_select_window,
                 strip_say_links, SAY_LINK_BODY_SIZE, SIZE_DEATH, SIZE_NEW_ZONE,
                 apply_group_update_b, apply_group_join, apply_group_disband_you,
@@ -3725,16 +3847,167 @@ mod tests {
         // comes from the self-spawn flymode byte instead). Another spawn's FlyMode must not touch us.
         let mut gs = GameState::new();
         gs.player_id = 77;
-        assert!(!gs.player_levitating, "default not levitating");
+        assert!(!gs.player_levitating(), "default not levitating");
         apply_spawn_appearance(&mut gs, &crate::protocol::build_spawn_appearance_packet(77, 19, 2));
-        assert!(gs.player_levitating, "FlyMode param 2 (Levitating) sets self levitating");
+        assert!(gs.player_levitating(), "FlyMode param 2 (Levitating) sets self levitating");
         apply_spawn_appearance(&mut gs, &crate::protocol::build_spawn_appearance_packet(77, 19, 0));
-        assert!(!gs.player_levitating, "FlyMode param 0 (off, buff fade) clears self levitating");
+        assert!(!gs.player_levitating(), "FlyMode param 0 (off, buff fade) clears self levitating");
         apply_spawn_appearance(&mut gs, &crate::protocol::build_spawn_appearance_packet(77, 19, 5));
-        assert!(gs.player_levitating, "FlyMode param 5 (LevitateWhileRunning) sets self levitating");
+        assert!(gs.player_levitating(), "FlyMode param 5 (LevitateWhileRunning) sets self levitating");
         // Another spawn's FlyMode must NOT change our own flag.
         apply_spawn_appearance(&mut gs, &crate::protocol::build_spawn_appearance_packet(999, 19, 0));
-        assert!(gs.player_levitating, "another spawn's FlyMode must not clear our levitate state");
+        assert!(gs.player_levitating(), "another spawn's FlyMode must not clear our levitate state");
+    }
+
+    // ---- #586: in-zone Levitate cast via OP_Buff / OP_BuffCreate × SPA 57 --------------------
+
+    /// Build a RoF2 `SpellBuffPacket_Struct` (exactly 100 bytes). `bufffade`: 1 = fading, 2 = active.
+    fn buff_packet(entity_id: u32, spell_id: u32, slot_id: u32, bufffade: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 100];
+        b[0..4].copy_from_slice(&entity_id.to_le_bytes());
+        b[4] = 2; // effect_type
+        b[12..16].copy_from_slice(&spell_id.to_le_bytes());
+        b[92..96].copy_from_slice(&slot_id.to_le_bytes());
+        b[96..100].copy_from_slice(&bufffade.to_le_bytes());
+        b
+    }
+
+    /// Build a RoF2 OP_BuffCreate icon list. `all_buffs` = this is the COMPLETE buff list.
+    fn buff_create_packet(entity_id: u32, all_buffs: bool, entries: &[(u32, u32)]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&entity_id.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());                 // tic_timer
+        b.push(if all_buffs { 1 } else { 0 });
+        b.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for &(slot, spell_id) in entries {
+            b.extend_from_slice(&slot.to_le_bytes());
+            b.extend_from_slice(&spell_id.to_le_bytes());
+            b.extend_from_slice(&0u32.to_le_bytes());             // tics_remaining
+            b.extend_from_slice(&0u32.to_le_bytes());             // num_hits
+            b.push(0);                                            // caster name (empty cstring)
+        }
+        b.push(0);                                                // trailing `type`
+        b
+    }
+
+    /// Stand-in SPA-57 table: 261 (Levitate) yes, 15 (Clarity) no, everything else UNKNOWN.
+    fn spa57(spell_id: u32) -> Option<bool> {
+        match spell_id { 261 => Some(true), 15 => Some(false), _ => None }
+    }
+
+    #[test]
+    fn op_buff_levitate_sets_levitating_immediately_in_zone() {
+        // THE #586 BUG: mid-zone the server sends the type-19 FlyMode appearance with
+        // ignore_self=true, so the ONLY self-observable signal for a Levitate that lands while we
+        // are already in-zone is the buff's spell id × SPA 57. Before this handler existed the
+        // client reported "not levitating" while the character genuinely floated.
+        let mut gs = GameState::new();
+        gs.player_id = 77;
+        assert!(!gs.player_levitating());
+        apply_buff_with(&mut gs, &buff_packet(77, 261, 3, 2), spa57);
+        assert!(gs.player_levitating(), "an in-zone OP_Buff carrying a SPA-57 spell must set levitating NOW");
+
+        // Fade of that same slot clears it.
+        apply_buff_with(&mut gs, &buff_packet(77, 261, 3, 1), spa57);
+        assert!(!gs.player_levitating(), "OP_Buff bufffade=1 on the levitate slot clears it");
+    }
+
+    #[test]
+    fn op_buff_ignores_other_entities_and_non_levitate_spells() {
+        let mut gs = GameState::new();
+        gs.player_id = 77;
+        // Someone else's levitate (same opcode, different entity) must not touch us.
+        apply_buff_with(&mut gs, &buff_packet(999, 261, 3, 2), spa57);
+        assert!(!gs.player_levitating(), "another entity's buff must not set OUR levitate");
+        // A known non-levitate buff on us does not set it.
+        apply_buff_with(&mut gs, &buff_packet(77, 15, 1, 2), spa57);
+        assert!(!gs.player_levitating(), "a known non-SPA-57 buff must not set levitating");
+    }
+
+    #[test]
+    fn unknown_spell_id_never_overwrites_a_known_true_levitate() {
+        // Agent-honesty core of #586: our SPA table is only as complete as spells_us.txt. "I have no
+        // row for this spell" is NOT evidence the spell isn't levitate, so an unknown id must leave
+        // the state exactly as it was — in particular it must never flip a KNOWN-TRUE levitate to
+        // false, which would report the character as grounded while it floats.
+        let mut gs = GameState::new();
+        gs.player_id = 77;
+        apply_buff_with(&mut gs, &buff_packet(77, 261, 3, 2), spa57);
+        assert!(gs.player_levitating());
+        // An unrelated unknown buff lands in ANOTHER slot…
+        apply_buff_with(&mut gs, &buff_packet(77, 40404, 4, 2), spa57);
+        assert!(gs.player_levitating(), "unknown spell in another slot must not clear levitate");
+        // …and even an unknown spell reported in the SAME slot leaves our belief untouched.
+        apply_buff_with(&mut gs, &buff_packet(77, 40404, 3, 2), spa57);
+        assert!(gs.player_levitating(), "unknown spell id must never be guessed as 'not levitate'");
+        // Only a real fade (or a KNOWN non-levitate spell taking the slot) clears it.
+        apply_buff_with(&mut gs, &buff_packet(77, 15, 3, 2), spa57);
+        assert!(!gs.player_levitating(), "a KNOWN non-levitate spell taking that slot does clear it");
+    }
+
+    #[test]
+    fn op_buff_create_add_and_snapshot_drive_levitate() {
+        let mut gs = GameState::new();
+        gs.player_id = 77;
+        // Single-buff add (all_buffs = 0) — the RoF2 AddBuff path.
+        apply_buff_create_with(&mut gs, &buff_create_packet(77, false, &[(3, 261)]), spa57);
+        assert!(gs.player_levitating(), "OP_BuffCreate add of a SPA-57 spell sets levitating");
+        // A full snapshot that no longer lists it clears it.
+        apply_buff_create_with(&mut gs, &buff_create_packet(77, true, &[(1, 15)]), spa57);
+        assert!(!gs.player_levitating(), "a complete buff list without levitate clears it");
+        // A full snapshot that lists it sets it.
+        apply_buff_create_with(&mut gs, &buff_create_packet(77, true, &[(1, 15), (3, 261)]), spa57);
+        assert!(gs.player_levitating(), "a complete buff list containing levitate sets it");
+        // A snapshot whose only entry is an UNKNOWN spell in the levitate slot keeps our belief:
+        // the snapshot is only as complete as our table.
+        apply_buff_create_with(&mut gs, &buff_create_packet(77, true, &[(3, 40404)]), spa57);
+        assert!(gs.player_levitating(), "an unknown spell in a snapshot must not erase a known-true state");
+        // Another entity's snapshot never touches us.
+        apply_buff_create_with(&mut gs, &buff_create_packet(999, true, &[]), spa57);
+        assert!(gs.player_levitating(), "another entity's buff list must not clear ours");
+    }
+
+    #[test]
+    fn buff_channel_and_flymode_channel_do_not_fight() {
+        // Two writers, explicit precedence (OR over independent fields). Neither channel's silence
+        // can erase the other's evidence, and the pre-#586 signals still work unchanged.
+        let mut gs = GameState::new();
+        gs.player_id = 77;
+
+        // (a) buff channel ON, then an unrelated type-19 param=0 arrives BEFORE the buff faded:
+        //     the appearance only speaks for its own channel, so we stay levitating.
+        apply_buff_with(&mut gs, &buff_packet(77, 261, 3, 2), spa57);
+        apply_spawn_appearance(&mut gs, &crate::protocol::build_spawn_appearance_packet(77, 19, 0));
+        assert!(gs.player_levitating(), "flymode channel going quiet must not erase a live levitate buff");
+        // The real fade sends BOTH → now false.
+        apply_buff_with(&mut gs, &buff_packet(77, 261, 3, 1), spa57);
+        assert!(!gs.player_levitating(), "buff fade + flymode clear → not levitating");
+
+        // (b) flymode channel ON (zone-in), buff channel silent: still levitating.
+        gs.levitate.set_flymode(true);
+        assert!(gs.player_levitating());
+        apply_buff_with(&mut gs, &buff_packet(77, 15, 1, 2), spa57);
+        assert!(gs.player_levitating(), "a non-levitate buff must not clear the flymode channel");
+        apply_spawn_appearance(&mut gs, &crate::protocol::build_spawn_appearance_packet(77, 19, 0));
+        assert!(!gs.player_levitating(), "type-19 param=0 clears the flymode channel");
+    }
+
+    #[test]
+    fn short_or_truncated_buff_packets_leave_state_unchanged() {
+        let mut gs = GameState::new();
+        gs.player_id = 77;
+        apply_buff_with(&mut gs, &buff_packet(77, 261, 3, 2), spa57);
+        assert!(gs.player_levitating());
+        // Runt OP_Buff (99 bytes) — no partial decode.
+        let mut short = buff_packet(77, 261, 3, 1); short.truncate(99);
+        apply_buff_with(&mut gs, &short, spa57);
+        assert!(gs.player_levitating(), "a runt OP_Buff must not mutate state");
+        // OP_BuffCreate claiming 2 entries but carrying one: aborts, does NOT apply a partial
+        // snapshot (a partial list read as complete would silently drop the levitate).
+        let mut lying = buff_create_packet(77, true, &[(3, 261)]);
+        lying[9..11].copy_from_slice(&2u16.to_le_bytes());
+        apply_buff_create_with(&mut gs, &lying, spa57);
+        assert!(gs.player_levitating(), "a truncated buff list must be dropped, not applied partially");
     }
 
     #[test]
