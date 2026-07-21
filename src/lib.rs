@@ -47,6 +47,13 @@ pub use eqoxide_assets as assets;
 pub use eqoxide_nav as nav;
 pub use eqoxide_nav::traversability;
 
+// `CommandState` — the typed write-path facade over the view→model command IPC slots — now lives
+// in the `eqoxide-command` workspace crate (#544 Step 2g), depending only on `eqoxide-core` +
+// `eqoxide-ipc`. Alias it as this crate's `command_state` module so every existing
+// `crate::command_state::…` / `eqoxide::command_state::…` call site (http/*, app.rs,
+// eq_net/action_loop.rs, ui/*) keeps resolving unchanged.
+pub use eqoxide_command as command_state;
+
 pub mod anim;
 pub mod app;
 pub mod asset_sync;
@@ -66,7 +73,6 @@ pub mod scene;
 
 // Modules only needed by the full client binary.
 pub mod camera_state;
-pub mod command_state;
 pub mod crash;
 pub mod eq_net;
 pub mod frame_capture;

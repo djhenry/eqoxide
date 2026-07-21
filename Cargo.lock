@@ -844,6 +844,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "eqoxide-assets",
+ "eqoxide-command",
  "eqoxide-core",
  "eqoxide-ipc",
  "eqoxide-nav",
@@ -881,6 +882,15 @@ dependencies = [
  "gltf",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "eqoxide-command"
+version = "0.1.0"
+dependencies = [
+ "eqoxide-core",
+ "eqoxide-ipc",
+ "tokio",
 ]
 
 [[package]]

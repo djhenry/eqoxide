@@ -11,7 +11,7 @@
 //! read-path/published field, not a command — deliberately NOT exposed here (see `mod.rs`).
 
 use super::CommandState;
-use crate::ipc::{BuyOk, CommandResult, OpenOk, TradeCmd};
+use eqoxide_ipc::{BuyOk, CommandResult, OpenOk, TradeCmd};
 use tokio::sync::oneshot;
 
 impl CommandState {
@@ -101,7 +101,7 @@ impl CommandState {
 #[cfg(test)]
 mod tests {
     use super::CommandState;
-    use crate::ipc::TradeCmd;
+    use eqoxide_ipc::TradeCmd;
 
     /// The core invariant of the facade: a `request_*` write and the matching `take_*` drain touch
     /// the SAME slot, the drain removes it, and a second drain sees nothing. Proven for every

@@ -7,7 +7,7 @@
 //! deliberately NOT exposed here — that's read-path, not a command (see `mod.rs`).
 
 use super::CommandState;
-use crate::ipc::GuildAction;
+use eqoxide_ipc::GuildAction;
 
 impl CommandState {
     // ── request_* : the VIEW (the HTTP handlers) makes this write ─────────────────────────────────
@@ -36,7 +36,7 @@ impl CommandState {
 #[cfg(test)]
 mod tests {
     use super::CommandState;
-    use crate::ipc::GuildAction;
+    use eqoxide_ipc::GuildAction;
 
     /// A `request_guild_action` write and the matching `take_guild_action` drain touch the SAME
     /// slot, the drain removes it, and a second drain sees nothing.

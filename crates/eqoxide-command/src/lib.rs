@@ -1,7 +1,16 @@
-//! `CommandState` — the single typed facade over the **view → model COMMAND** (write-path) IPC slots.
+//! `eqoxide-command` — `CommandState`, the single typed facade over the **view → model COMMAND**
+//! (write-path) IPC slots, extracted into its own workspace crate (#544 Step 2g).
+//!
+//! Depends ONLY on `eqoxide-core` (`game_state::DialogueChoice`/`WhoEntry`) and `eqoxide-ipc` (the
+//! `*Slots` bundles, `CommandResult`/`BuyOk`/`OpenOk`/`GiveOk`/`CastEnd`) plus `tokio::sync::oneshot`
+//! for the await-slot reply channels — never on any app-layer crate (no wgpu/winit/egui/eq_net/http/
+//! app/renderer/nav/assets). The app crate re-exports this crate as `crate::command_state`
+//! (`pub use eqoxide_command as command_state;`) so every existing `crate::command_state::…` call
+//! site (`http/*`, `app.rs`, `eq_net/action_loop.rs`, `ui/*`) keeps resolving unchanged. Pure code
+//! motion — no behavior change; see the module docs below for the facade's actual contract.
 //!
 //! The write path today is untyped: a UI click-handler or an HTTP handler reaches into a raw
-//! request slot (`Arc<Mutex<Option<T>>>`, grouped by domain in [`crate::ipc`]) with
+//! request slot (`Arc<Mutex<Option<T>>>`, grouped by domain in [`eqoxide_ipc`]) with
 //! `*slot.lock().unwrap() = Some(..)`, and the `eq-net` thread's `ActionLoop::tick` drains it with
 //! `slot.lock().unwrap().take()`. `CommandState` puts ONE typed method in front of each of those
 //! slots so no call site pokes an `Arc<Mutex<..>>` by hand.
@@ -77,23 +86,23 @@
 mod combat;
 /// A3 Migration 1 (#448): the reusable Command-with-result infra. `CommandResult<T>` is the honest
 /// three-way outcome (Resolved/Refused/Unconfirmed) an HTTP handler awaits so it reports the TRUE
-/// server outcome instead of a premature queued-action 200. See `crate::ipc::result`'s module doc
+/// server outcome instead of a premature queued-action 200. See `eqoxide_ipc::result`'s module doc
 /// for the full status mapping, invariant, and park→fulfil→timeout flow.
 ///
 /// (#557) `CommandResult<T>` and its payload types (`BuyOk`, `OpenOk`, `GiveOk`, `CastEnd`) live in
-/// `crate::ipc::result` now, NOT here — `ipc`'s own await-slot types reference them, so keeping them
+/// `eqoxide_ipc::result` now, NOT here — `ipc`'s own await-slot types reference them, so keeping them
 /// in `command_state` (which depends on `ipc`) would be a dependency cycle once the two split into
 /// separate crates. Re-exported below so every existing `crate::command_state::CommandResult`/
 /// `BuyOk`/`OpenOk`/`GiveOk`/`CastEnd` call site is unaffected — pure code motion, no behavior change.
-pub use crate::ipc::result;
-pub use crate::ipc::CastEnd;
-pub use crate::ipc::CommandResult;
+pub use eqoxide_ipc::result;
+pub use eqoxide_ipc::CastEnd;
+pub use eqoxide_ipc::CommandResult;
 // Wave-2 fan-out stubs — one file each, empty `impl CommandState {}` shell awaiting migration.
 mod merchant;
-pub use crate::ipc::{BuyOk, OpenOk};
+pub use eqoxide_ipc::{BuyOk, OpenOk};
 mod inventory;
 mod interact;
-pub use crate::ipc::GiveOk;
+pub use eqoxide_ipc::GiveOk;
 mod quest;
 mod group;
 mod guild;
@@ -117,18 +126,18 @@ mod lifecycle;
 /// doc. Every field below is now a genuine view→model command bundle.
 #[derive(Clone, Default)]
 pub struct CommandState {
-    combat:    crate::ipc::CombatSlots,
-    merchant:  crate::ipc::MerchantSlots,
-    inventory: crate::ipc::InventorySlots,
-    interact:  crate::ipc::InteractSlots,
-    quest:     crate::ipc::QuestSlots,
-    group:     crate::ipc::GroupSlots,
-    guild:     crate::ipc::GuildSlots,
-    trainer:   crate::ipc::TrainerSlots,
-    social:    crate::ipc::SocialSlots,
-    chat:      crate::ipc::ChatSlots,
-    nav:       crate::ipc::NavSlots,
-    lifecycle: crate::ipc::LifecycleSlots,
+    combat:    eqoxide_ipc::CombatSlots,
+    merchant:  eqoxide_ipc::MerchantSlots,
+    inventory: eqoxide_ipc::InventorySlots,
+    interact:  eqoxide_ipc::InteractSlots,
+    quest:     eqoxide_ipc::QuestSlots,
+    group:     eqoxide_ipc::GroupSlots,
+    guild:     eqoxide_ipc::GuildSlots,
+    trainer:   eqoxide_ipc::TrainerSlots,
+    social:    eqoxide_ipc::SocialSlots,
+    chat:      eqoxide_ipc::ChatSlots,
+    nav:       eqoxide_ipc::NavSlots,
+    lifecycle: eqoxide_ipc::LifecycleSlots,
 }
 
 impl CommandState {
@@ -136,18 +145,18 @@ impl CommandState {
     /// `main.rs` — the SAME Arcs `ActionLoop`/`HttpState` receive, so the facade shares their slots.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        combat:    crate::ipc::CombatSlots,
-        merchant:  crate::ipc::MerchantSlots,
-        inventory: crate::ipc::InventorySlots,
-        interact:  crate::ipc::InteractSlots,
-        quest:     crate::ipc::QuestSlots,
-        group:     crate::ipc::GroupSlots,
-        guild:     crate::ipc::GuildSlots,
-        trainer:   crate::ipc::TrainerSlots,
-        social:    crate::ipc::SocialSlots,
-        chat:      crate::ipc::ChatSlots,
-        nav:       crate::ipc::NavSlots,
-        lifecycle: crate::ipc::LifecycleSlots,
+        combat:    eqoxide_ipc::CombatSlots,
+        merchant:  eqoxide_ipc::MerchantSlots,
+        inventory: eqoxide_ipc::InventorySlots,
+        interact:  eqoxide_ipc::InteractSlots,
+        quest:     eqoxide_ipc::QuestSlots,
+        group:     eqoxide_ipc::GroupSlots,
+        guild:     eqoxide_ipc::GuildSlots,
+        trainer:   eqoxide_ipc::TrainerSlots,
+        social:    eqoxide_ipc::SocialSlots,
+        chat:      eqoxide_ipc::ChatSlots,
+        nav:       eqoxide_ipc::NavSlots,
+        lifecycle: eqoxide_ipc::LifecycleSlots,
     ) -> Self {
         CommandState {
             combat, merchant, inventory, interact, quest, group, guild, trainer, social, chat,

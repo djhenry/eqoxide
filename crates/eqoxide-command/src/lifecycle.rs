@@ -18,7 +18,7 @@
 //! `/camp` chat keyword (`ui/windows/chat.rs`, `eq_net/action_loop.rs::drain_chat`).
 
 use super::CommandState;
-use crate::ipc::CampCmd;
+use eqoxide_ipc::CampCmd;
 
 impl CommandState {
     /// Start or toggle a camp (POST /v1/lifecycle/exit uses `Start`; POST /v1/lifecycle/camp, the
@@ -38,7 +38,7 @@ impl CommandState {
 #[cfg(test)]
 mod tests {
     use super::CommandState;
-    use crate::ipc::CampCmd;
+    use eqoxide_ipc::CampCmd;
 
     #[test]
     fn request_camp_sets_the_slot() {

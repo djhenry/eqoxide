@@ -6,7 +6,7 @@
 //! were (the HTTP handler and `ActionLoop::tick`). No behavior change — just one typed surface.
 
 use super::CommandState;
-use crate::ipc::{CastEnd, CastRequest, CommandResult};
+use eqoxide_ipc::{CastEnd, CastRequest, CommandResult};
 use tokio::sync::oneshot;
 
 impl CommandState {
@@ -122,7 +122,7 @@ mod tests {
         assert_eq!(cs.take_consider(), Some(7));
         assert_eq!(cs.take_consider(), None);
 
-        cs.request_cast(crate::ipc::CastRequest { gem: 3, target_id: Some(9), item_slot: None });
+        cs.request_cast(eqoxide_ipc::CastRequest { gem: 3, target_id: Some(9), item_slot: None });
         let cast = cs.take_cast().expect("cast queued");
         assert_eq!((cast.gem, cast.target_id, cast.item_slot), (3, Some(9), None));
         assert!(cs.take_cast().is_none());

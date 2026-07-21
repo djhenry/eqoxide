@@ -11,7 +11,7 @@
 //! fire-once command (see `mod.rs`).
 
 use super::CommandState;
-use crate::game_state::WhoEntry;
+use eqoxide_core::game_state::WhoEntry;
 use tokio::sync::oneshot::Sender;
 
 impl CommandState {
