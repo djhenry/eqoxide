@@ -35,6 +35,42 @@
 /// their wire z is already surface-level and is NOT shifted on ingest.
 pub const WIRE_Z_OFFSET: f32 = 3.125;
 
+/// EQ `flymode` (GravityBehavior) wire codes (EQEmu `common/emu_constants.h:297`):
+/// Ground=0, Flying=1, Levitating=2, Water=3, Floating=4, LevitateWhileRunning=5.
+///
+/// A grounded mob's wire z carries the server's `GetZOffset` (+3.125, the model-origin datum) — it
+/// is baked in by `Mob::FixZ`/`UpdatePathGround` (EQEmu `zone/waypoints.cpp`,
+/// `zone/mob_movement_manager.cpp`). But an **airborne** mob's wire z does NOT: a spawn's z is
+/// serialized straight from its DB row with no offset (`Spawn2::Process` / `Mob::FillSpawnStruct`),
+/// `Mob::FixZ` early-returns for `flymode==Flying`, and the dominant real-world authoring pattern for
+/// both Flying and Levitating NPCs is a stationary hover that never routes through the offset-adding
+/// path at all. So Flying(1) and Levitating(2) wire z is already at the reported datum and must NOT
+/// have `WIRE_Z_OFFSET` subtracted on ingest — otherwise they decode ~3u LOW (#548, an agent-honesty
+/// falsehood). (Residual: a rare *patrolling* Levitating NPC does get the offset baked in mid-route,
+/// so the static rule under-corrects for that case — accepted, per the EQEmu source review.)
+pub const FLYMODE_FLYING: u8 = 1;
+/// See [`FLYMODE_FLYING`]. Levitating airborne mobs are excepted from the Z-offset the same way.
+pub const FLYMODE_LEVITATING: u8 = 2;
+
+/// True when an entity's wire z is already at the reported datum (no server `GetZOffset` baked in),
+/// so it must be stored as-is on ingest (no `WIRE_Z_OFFSET` shift) and not floor-snapped by the
+/// renderer: boats (`is_boat`, keyed off race — `Mob::FixZ` early-returns for `GetIsBoat`) and
+/// airborne mobs (`flymode` Flying/Levitating — see [`FLYMODE_FLYING`]). This is the
+/// `Entity.floating` classification — computed once at spawn and reused for every later position
+/// update, which carry no flymode of their own.
+pub fn skips_wire_z_offset(is_boat: bool, flymode: u8) -> bool {
+    is_boat || flymode == FLYMODE_FLYING || flymode == FLYMODE_LEVITATING
+}
+
+/// Convert an inbound wire z (model-origin datum, `foot + WIRE_Z_OFFSET`) to eqoxide's internal FOOT
+/// datum. Entities that skip the server Z-offset (`floating`: boats/flying — see
+/// [`skips_wire_z_offset`]) already sit at the correct datum on the wire and pass through unchanged;
+/// a non-floating (grounded) entity has the offset subtracted. Centralizing the sign here keeps the
+/// spawn and position-update ingest paths from ever diverging.
+pub fn wire_z_to_foot(wire_z: f32, floating: bool) -> f32 {
+    if floating { wire_z } else { wire_z - WIRE_Z_OFFSET }
+}
+
 /// EQ heading in degrees (0..360) for a movement delta in server axes.
 /// EQ convention: heading 0 faces +Y (north) and increases counter-clockwise
 /// (90 = -X = west, 180 = -Y = south, 270 = +X = east). A point at heading θ lies
