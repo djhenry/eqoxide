@@ -532,6 +532,39 @@ mod sync_tests {
     }
 
     #[test]
+    fn old_format_synced_json_is_discarded_not_trusted_or_fatal() {
+        // Before #601, `synced.json` stored `{set: "digest-string"}` — every dev box and jimbo
+        // already have files in that shape on disk. The new format is `{set: {digest, files}}`.
+        // A schema change to a persisted file must not paper over the mismatch: an old record must
+        // not be silently (mis)trusted as valid new-format data, and reading it must not panic or
+        // error out the client on first launch after upgrade. It must read as "never synced" and
+        // let the set re-sync once — a one-time slow, self-healing recovery, not a crash and not a
+        // silent partial state.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = CacheDirs::with_root(dir.path());
+        std::fs::create_dir_all(&cache.root).unwrap();
+        std::fs::write(
+            cache.root.join("synced.json"),
+            r#"{"common": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}"#,
+        )
+        .unwrap();
+
+        // The old-shaped record must not surface as a trusted digest...
+        assert_eq!(
+            cache.synced_digest("common"),
+            None,
+            "an old-format (pre-#601) record must not be mistaken for a valid new-format digest"
+        );
+
+        // ...and a sync against it must not panic/error — it must simply treat the set as
+        // never-synced and do a full (one-time) re-sync.
+        let t = fixture();
+        sync_set(&t, "common", &cache, &mut |_| {}).unwrap();
+        assert!(cache.models_dir().join("humanoid.glb").exists());
+        assert_eq!(cache.synced_digest("common").as_deref(), Some(t.manifest.digest.as_str()));
+    }
+
+    #[test]
     fn unchanged_digest_with_intact_artifact_still_skips() {
         // The short-circuit exists for good reason (no redundant chunk fetches/rewrites on every
         // launch) and must be preserved when the artifact really is fine.
