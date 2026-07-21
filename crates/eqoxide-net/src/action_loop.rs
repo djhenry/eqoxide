@@ -2445,10 +2445,11 @@ impl ActionLoop {
         // controller and returns immediately, before the controller has actually adopted it. The
         // flag only flips once a LATER tick reaches the normal path below with `view.pos` mirroring
         // the adopted position. The one gap this leaves: if a new zone's spawn point lands within
-        // `CORRECTION_SQ` (144 = 12u²) of the last-streamed old-zone position, this branch is
-        // skipped entirely and the flag flips on that stale-but-close controller position on the
-        // very next normal-path tick instead — bounded to ≤12u, same as `player_x/y/z` already
-        // carries elsewhere; see #593(c) for why that residual window isn't a meaningful falsehood.
+        // `CORRECTION_SQ` (a squared distance equal to (12u)²) of the last-streamed old-zone
+        // position, this branch is skipped entirely and the flag flips on that stale-but-close
+        // controller position on the very next normal-path tick instead — bounded to ≤12u
+        // horizontally — the check is 2D (`cd` omits `dz`), so a stale Z is not bounded by it; see
+        // #593(c) for why the horizontal residual window isn't a meaningful falsehood.
         let cd = [gp[0] - self.last_streamed[0], gp[1] - self.last_streamed[1]];
         if cd[0] * cd[0] + cd[1] * cd[1] > CORRECTION_SQ {
             tracing::info!("NAV: server correction → handing controller new pos ({:.1},{:.1},{:.1})", gp[0], gp[1], gp[2]);

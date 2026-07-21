@@ -607,12 +607,14 @@ pub struct GameState {
     ///     controller-predicted, not exclusively server-authoritative.)
     ///
     /// A genuine server correction inside `stream_position` hands the new position to the
-    /// controller and returns WITHOUT setting this flag — it only flips once a later tick adopts
-    /// that position on the normal path. If a new zone's spawn point happens to land within the
-    /// correction threshold of the last-streamed old-zone position, the correction is skipped
-    /// entirely and the flag flips on that stale-but-close controller position instead; the
-    /// resulting `distance` error is bounded by that same threshold — see #593(c) for why that
-    /// residual window is harmless rather than a falsehood.
+    /// controller and returns WITHOUT setting this flag — within `stream_position`, it only flips
+    /// once a later tick adopts that position on the normal path (though another handler entirely
+    /// — self `OP_ClientUpdate`, respawn, same-zone teleport — may already have set it first). If a
+    /// new zone's spawn point happens to land within the correction threshold of the last-streamed
+    /// old-zone position, the correction is skipped entirely and the flag flips on that
+    /// stale-but-close controller position instead; the resulting `distance` error is bounded by
+    /// that same threshold in X/Y only (the correction check ignores Z) — see #593(c) for why that
+    /// horizontal residual window is harmless rather than a falsehood.
     ///
     /// Reset to false by [`GameState::begin_zone_in`] on every zone change.
     pub player_pos_known: bool,
