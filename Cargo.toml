@@ -22,6 +22,7 @@ eqoxide-assets = { path = "crates/eqoxide-assets" }
 eqoxide-nav = { path = "crates/eqoxide-nav" }
 eqoxide-command = { path = "crates/eqoxide-command" }
 eqoxide-crash = { path = "crates/eqoxide-crash" }
+eqoxide-protocol = { path = "crates/eqoxide-protocol" }
 anyhow = "1"
 arc-swap = "1"
 image = { version = "0.25", default-features = false, features = ["bmp", "png", "dds", "tga"] }
@@ -71,4 +72,4 @@ tokio = { version = "1", features = ["full", "test-util"] }
 tower = "0.5"
 
 [workspace]
-members = ["tools", "crates/eqoxide-core", "crates/eqoxide-ipc", "crates/eqoxide-assets", "crates/eqoxide-nav", "crates/eqoxide-command", "crates/eqoxide-crash"]
+members = ["tools", "crates/eqoxide-core", "crates/eqoxide-ipc", "crates/eqoxide-assets", "crates/eqoxide-nav", "crates/eqoxide-command", "crates/eqoxide-crash", "crates/eqoxide-protocol"]

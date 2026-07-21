@@ -1,7 +1,7 @@
 //! Spell-cast, memorize, and book-reading packet builders. Moved out of `navigation.rs`
 //! (cleanup step 1) — pure `args -> Vec<u8>` builders with no navigation state.
 
-use crate::eq_net::protocol::rof2_possessions_slot;
+use crate::protocol::rof2_possessions_slot;
 
 /// RoF2 `BookRequest_Struct` (fixed 8216 bytes, rof2_structs.h:2899) for OP_ReadBook — reads a
 /// book/note item's text (#288). Fixed-size: the server's DECODE_LENGTH_EXACT rejects any other

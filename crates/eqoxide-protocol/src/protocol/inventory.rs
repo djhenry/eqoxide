@@ -35,7 +35,7 @@ pub(crate) fn rof2_possessions_slot(slot: u32) -> [u8; 12] {
 /// `GENERAL_BAGS_BEGIN + (Slot-GENERAL_BEGIN)*SLOT_COUNT + SubIndex`). This is what makes bagged
 /// items movable. (eqoxide#201)
 pub(crate) fn rof2_inventory_slot(flat: u32) -> [u8; 12] {
-    let Some((parent, sub_index)) = crate::game_state::bag_wire_parent(flat as i32) else {
+    let Some((parent, sub_index)) = eqoxide_core::game_state::bag_wire_parent(flat as i32) else {
         return rof2_possessions_slot(flat);
     };
     inventory_slot_struct(0, parent as i16, sub_index as i16)
@@ -59,7 +59,7 @@ pub fn build_move_item(from_slot: u32, to_slot: u32) -> [u8; 28] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eq_net::protocol::SLOT_CURSOR;
+    use crate::protocol::SLOT_CURSOR;
 
     #[test]
     fn move_item_is_rof2_28byte_structured_slots() {

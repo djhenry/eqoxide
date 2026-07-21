@@ -1,0 +1,20 @@
+[package]
+name = "eqoxide-protocol"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "eqoxide_protocol"
+path = "src/lib.rs"
+
+[dependencies]
+# eqoxide-protocol is the wire-format decode layer, sitting directly above eqoxide-core
+# (core ← protocol, #544 Step 2j). It bundles `wire` (the `WireReader` cursor) and `protocol`
+# (every RoF2 packet decoder/struct/const). Its ONLY workspace dependency is eqoxide-core:
+# protocol reads `eqoxide_core::game_state::bag_wire_parent` and re-exports
+# `eqoxide_core::{pet,race_class}` constants; `wire` is pure std. Verified against the modules'
+# own `use`/path sites — there are NO external-crate uses (no byteorder/des/…; every decode goes
+# through `WireReader`, which is std-only) and NO app-layer dependency (no wgpu/winit/egui/eq_net/
+# http/app/ipc/nav/assets/command). This is a behavior-preserving pure move: every decoder,
+# struct, and constant is byte-identical.
+eqoxide-core = { path = "../eqoxide-core" }
