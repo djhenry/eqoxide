@@ -1,0 +1,27 @@
+[package]
+name = "eqoxide-telemetry"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "eqoxide_telemetry"
+path = "src/lib.rs"
+
+[features]
+# Exposes `test_capture_lock` (otherwise `#[cfg(test)]`, so invisible across the crate boundary)
+# to DOWNSTREAM test builds. The app crate enables this in its [dev-dependencies] so
+# `src/http/observe.rs`'s `/v1/observe/packets` tests can serialize against the same global
+# capture lock this crate's own unit tests use. Off in normal builds — the release binary never
+# contains it.
+test-fixtures = []
+
+[dependencies]
+# eqoxide-telemetry is the packet-capture ring (#544 Step 2k), sitting directly above
+# eqoxide-protocol (core ← protocol ← telemetry). `summarize`'s decoders
+# (`decode_position_update`/`parse_rof2_spawn`) and `opcode_name`'s `OP_*` constants come from
+# `eqoxide_protocol::protocol` — the crate's only workspace dependency. Everything else the ring
+# itself uses (`VecDeque`, `AtomicBool`, `Mutex`, `OnceLock`, `Instant`) is std. NO eqoxide-core
+# dependency: `SpawnInfo`/`PositionUpdate` (the decoded structs this module reads fields off of)
+# are defined IN eqoxide-protocol, not re-exported from core.
+eqoxide-protocol = { path = "../eqoxide-protocol" }
+serde = { version = "1", features = ["derive"] }
