@@ -29,6 +29,7 @@ pub mod physics;
 pub mod race_class;
 pub mod region_map;
 pub mod skills;
+pub mod sky;
 pub mod spells;
 pub mod ucs;
 pub mod zone_map;

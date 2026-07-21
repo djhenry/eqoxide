@@ -511,6 +511,12 @@ pub struct WorldState {
     /// 4 fog "slots"; only slot 0 (the DB's un-suffixed fog_* columns) is populated by ordinary
     /// zone content, so we only read that one (see the KB doc's "Semantics of the 4 slots" note).
     pub zone_fog: Option<ZoneFog>,
+    /// Server world clock from OP_TimeOfDay (eqoxide#561). `None` until the first OP_TimeOfDay of
+    /// the session arrives (sent once during zone-entry, and again on a GM/quest world-time change);
+    /// the render side extrapolates the live time-of-day from it each frame (1 EQ-min = 3 real sec)
+    /// to drive the sky gradient. Honest: never a faked value — while `None`, the sky renders a
+    /// documented daytime default rather than inventing a "current" time. See `eqoxide_core::sky`.
+    pub eq_clock: Option<crate::sky::EqClock>,
     /// True once OP_NewZone has been applied for the current zone-server session. A RoF2 zone-in
     /// delivers OP_NewZone TWICE: the server sends it unsolicited while handling OP_ZoneEntry and
     /// again in reply to our OP_ReqNewZone (EQEmu `Handle_Connect_OP_ReqNewZone`). The second copy

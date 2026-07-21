@@ -16,9 +16,18 @@ pub struct Layouts {
     pub texture_bgl: wgpu::BindGroupLayout,
     pub entity_bgl:  wgpu::BindGroupLayout,
     pub joints_bgl:  wgpu::BindGroupLayout,
+    /// Time-of-day sky-gradient uniform (eqoxide#561): a single fragment-visible uniform buffer.
+    pub sky_bgl:     wgpu::BindGroupLayout,
 }
 
 pub struct CameraUniform {
+    pub buf:        wgpu::Buffer,
+    pub bind_group: wgpu::BindGroup,
+}
+
+/// The sky-gradient uniform (eqoxide#561): zenith/horizon colors, rewritten each frame from the
+/// time-of-day clock. Same shape as `CameraUniform` — a buffer plus its bind group.
+pub struct SkyUniform {
     pub buf:        wgpu::Buffer,
     pub bind_group: wgpu::BindGroup,
 }
@@ -111,7 +120,46 @@ pub fn build_layouts(device: &wgpu::Device) -> Layouts {
         }],
     });
 
-    Layouts { camera_bgl, texture_bgl, entity_bgl, joints_bgl }
+    let sky_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("sky_bgl"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+
+    Layouts { camera_bgl, texture_bgl, entity_bgl, joints_bgl, sky_bgl }
+}
+
+/// Create the sky-gradient uniform buffer + bind group (eqoxide#561). Initialized to the daytime
+/// default so the very first frame (before any `write_buffer`) still renders a sane sky.
+pub fn build_sky_uniform(device: &wgpu::Device, layouts: &Layouts) -> SkyUniform {
+    use wgpu::util::DeviceExt;
+    let day = eqoxide_core::sky::sky_colors(eqoxide_core::sky::DEFAULT_HOUR);
+    let init = crate::gpu::SkyUniformData {
+        zenith:  [day.zenith[0], day.zenith[1], day.zenith[2], 0.0],
+        horizon: [day.horizon[0], day.horizon[1], day.horizon[2], 0.0],
+    };
+    let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("sky"),
+        contents: bytemuck::bytes_of(&init),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("sky_bg"),
+        layout: &layouts.sky_bgl,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: buf.as_entire_binding(),
+        }],
+    });
+    SkyUniform { buf, bind_group }
 }
 
 /// Create the camera uniform buffer and its bind group. Sized for `gpu::CameraUniformData`
@@ -527,7 +575,7 @@ pub fn build_pipelines(
     });
     let sky_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("sky_layout"),
-        bind_group_layouts: &[],
+        bind_group_layouts: &[&layouts.sky_bgl],
         push_constant_ranges: &[],
     });
     let sky = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
