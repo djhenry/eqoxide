@@ -1,9 +1,9 @@
 //! NPC trade-window packet builders (quest hand-ins). Moved out of `navigation.rs`
 //! (cleanup step 1) — pure `args -> Vec<u8>` builders with no navigation state.
 
-use crate::eq_net::protocol::SLOT_TRADE_BEGIN;
-use crate::eq_net::protocol::rof2_possessions_slot;
-use crate::eq_net::protocol::inventory_slot_struct;
+use crate::protocol::SLOT_TRADE_BEGIN;
+use crate::protocol::rof2_possessions_slot;
+use crate::protocol::inventory_slot_struct;
 
 /// Encode one RoF2 `InventorySlot_Struct` (12 bytes) for a *trade-window* slot (handing an item to
 /// an NPC / another player). Trade slots are NOT possessions slots: the server decodes typeTrade via
@@ -19,7 +19,7 @@ pub(crate) fn rof2_trade_slot(server_slot: u32) -> [u8; 12] {
 /// RoF2 `MoveItem_Struct` (28 bytes) for moving a *possessions* item (e.g. the cursor) INTO an NPC
 /// trade-window slot — the cursor→trade step of a quest hand-in. `from_slot` is a possessions slot
 /// (cursor/general); `to_trade_slot` is the absolute trade slot (SLOT_TRADE_BEGIN = first NPC slot).
-/// Like [`crate::eq_net::protocol::build_move_item`], a flat 12-byte packet would fail
+/// Like [`crate::protocol::build_move_item`], a flat 12-byte packet would fail
 /// DECODE_LENGTH_EXACT and be dropped — that was the eqoxide#26 turn-in failure (the cursor→trade
 /// move never reached the server). (#26)
 pub fn build_move_item_to_trade(from_slot: u32, to_trade_slot: u32) -> [u8; 28] {
@@ -48,7 +48,7 @@ pub fn build_cancel_trade(player_id: u32) -> [u8; 8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eq_net::protocol::SLOT_CURSOR;
+    use crate::protocol::SLOT_CURSOR;
 
     #[test]
     fn build_cancel_trade_is_eight_bytes_with_player_id() {

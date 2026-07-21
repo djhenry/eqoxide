@@ -12,7 +12,7 @@
 #![allow(dead_code)]
 
 use std::mem;
-use crate::eq_net::wire::WireReader;
+use crate::wire::WireReader;
 
 mod combat;
 mod spells;
@@ -30,7 +30,7 @@ pub use combat::*;
 pub use spells::*;
 pub use inventory::*;
 pub use trade::*;
-pub(crate) use merchant::*;
+pub use merchant::*;
 pub use group::*;
 pub use guild::*;
 pub use tasks::*;
@@ -606,7 +606,7 @@ pub struct SpawnInfo {
     /// 0 = bald (all hair primitives hidden).
     pub hairstyle:       u8,
     /// Hair color index (0-23; >=24 → no tint). Only used to runtime-tint synthetic hair shells
-    /// ([`crate::models::HeadPart::Hair`]); classic textured hair ignores it (eqoxide#98).
+    /// (the app crate's `models::HeadPart::Hair`); classic textured hair ignores it (eqoxide#98).
     pub haircolor:       u8,
     pub stand_state:     u8,   // 0x64 = normal standing
     pub pet_owner_id:    u32,
@@ -725,8 +725,8 @@ pub fn parse_rof2_spawn(buf: &[u8]) -> Option<(SpawnInfo, usize)> {
     let cur_hp = rd_u8!();
     // haircolor is consumed to runtime-tint the synthetic hair SHELLS asset-server #8 emits
     // (eqoxide#98) — those grey shells are NOT baked-color like classic humhe* hair, so the client
-    // must tint them. Classic textured scalp regions remain untinted regardless (see crate::head
-    // and HeadPart::HairstyleVariant vs Hair). beardcolor/eyecolor1/2 stay unused.
+    // must tint them. Classic textured scalp regions remain untinted regardless (see the app
+    // crate's head module and HeadPart::HairstyleVariant vs Hair). beardcolor/eyecolor1/2 stay unused.
     let haircolor = rd_u8!();
     skip!(3); // beardcolor eyecolor1 eyecolor2
     let hairstyle = rd_u8!(); // hairstyle (0-indexed; 0=bald)
@@ -1411,7 +1411,7 @@ fn sext(v: u32, bits: u32) -> i32 {
 /// decode (`sext(bits, 19) as f32 / 8.0`). Was duplicated at every position-encode call site;
 /// pulled out to keep them in lockstep (identical expression, no behavior change).
 #[inline]
-pub(crate) fn enc_eq19(v: f32) -> u32 {
+pub fn enc_eq19(v: f32) -> u32 {
     ((v * 8.0) as i32 as u32) & 0x7FFFF
 }
 
