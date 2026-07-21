@@ -424,17 +424,21 @@ impl EqStream {
         //   - multi_thread (`Builder::new_multi_thread()`, production's actual shape — `src/main.rs`):
         //     a RACE — a worker thread parked in `epoll_wait` can independently service the readiness
         //     event while this call is in flight, so it sometimes already succeeds. Measured WouldBlock
-        //     rate 67-90/100 across two independently measured environments (i.e. in production this send
-        //     was ALREADY reaching the wire something like 10-33% of the time — not reliably, but not
-        //     never either; the earlier claim that this line "never" worked and the loop did "100%" of
-        //     the work was itself an overstated universal, corrected here).
+        //     rate roughly 60-90/100 depending on machine and load (three independent measurements: two
+        //     in the 84-90 range, one at 67, one clustered 63-68; worker-count sensitivity pushed it as
+        //     low as 35/100 at 2 workers in one run) — i.e. in production this send was sometimes already
+        //     reaching the wire, not reliably, but not never either; the earlier claim that this line
+        //     "never" worked and the loop did "100%" of the work was itself an overstated universal,
+        //     corrected here. Don't treat any single number above as precise — the point is that it's a
+        //     RACE, not a constant, and no fixed percentage is true across machines.
         // Either way the outcome the code wants — the datagram genuinely on the wire — was never
         // guaranteed, only sometimes true by luck of scheduling. Awaiting `writable()` once removes the
         // luck: it forces a real readiness event to be observed before the send, converting the
-        // nondeterministic race (67-90% failure in production's own runtime shape) into a deterministic
-        // 100/100 success, at negligible cost (measured on production's multi_thread shape: max 55µs /
-        // mean 16µs over 100 cold trials this session; reviewer independently measured max 484µs / mean
-        // 14.5µs in a different environment — both negligible next to the ~300ms retry cadence below).
+        // nondeterministic race (a majority-but-not-universal failure rate in production's own runtime
+        // shape, see above) into a deterministic 100/100 success, at negligible cost (measured on
+        // production's multi_thread shape: max 55µs / mean 16µs over 100 cold trials this session;
+        // reviewer independently measured max 484µs / mean 14.5µs in a different environment — both
+        // negligible next to the ~300ms retry cadence below).
         // The retry loop's own sends don't need this: once readiness has been observed once, tokio keeps
         // it marked ready for the life of the socket.
         //
@@ -1143,8 +1147,9 @@ mod tests {
 
     /// #603 review follow-up (F2): the `writable().await` line above `stream.send_session_request()`
     /// in `connect` is load-bearing — remove it and the pre-loop send goes back to being a
-    /// nondeterministic WouldBlock race (deterministic drop on a current_thread runtime; a 67-90%
-    /// drop rate even on production's multi_thread runtime, see the doc comment on that call site) —
+    /// nondeterministic WouldBlock race (deterministic drop on a current_thread runtime; a majority
+    /// but not universal drop rate even on production's multi_thread runtime — see the doc comment on
+    /// that call site for the range across independent measurements) —
     /// but nothing about the code *looks* wrong without it, and no timing-based test can safely pin
     /// this without becoming exactly the runtime/scheduler-coupled flaky-test class #549 already had
     /// to remove once (virtual time auto-advances past real socket I/O; real-time is contention-flaky
@@ -1318,13 +1323,14 @@ mod tests {
     /// contention). The direction matters: scheduler contention can only ever DELAY a send, never
     /// conjure an extra one, so contention can only push this count DOWN, never up — a ceiling cannot
     /// flake from load the way a floor did. At the correct 250ms cadence a 700ms window sees ~3 sends
-    /// (t≈0, 250, 500); a wiring bug firing every ~100ms sees ~7. Do NOT tighten this bound "for
-    /// precision" — the slack between 3 and 7 is what makes it contention-proof; a tighter ceiling
-    /// would reintroduce exactly the flake #549 fixed.
+    /// (nominal t≈0, 250, 500 — measured effective arrivals cluster more like 0, 303, 607 per
+    /// `SESSION_REQUEST_RETRY`'s doc comment, still inside the window); a wiring bug firing every
+    /// ~100ms sees ~7. Do NOT tighten this bound "for precision" — the slack between 3 and 7 is what
+    /// makes it contention-proof; a tighter ceiling would reintroduce exactly the flake #549 fixed.
     ///
     /// #603 review follow-up: the pre-loop send now awaits `writable()` before firing, so the nominal
-    /// count is exactly 3 (t≈0, 250, 500) rather than the ~2 it could land on before (when the first
-    /// send was a coin-flip that sometimes silently missed the wire). Detection power only improved —
+    /// count is exactly 3 rather than the ~2 it could land on before (when the first send was a
+    /// coin-flip that sometimes silently missed the wire). Detection power only improved —
     /// a wiring bug that degrades the cadence to ~200ms produced 3 sends in this window before (passing,
     /// indistinguishable from correct) and produces 4 now (failing).
     #[tokio::test]
