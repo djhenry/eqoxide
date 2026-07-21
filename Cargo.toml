@@ -20,6 +20,7 @@ eqoxide-core = { path = "crates/eqoxide-core" }
 eqoxide-ipc = { path = "crates/eqoxide-ipc" }
 eqoxide-assets = { path = "crates/eqoxide-assets" }
 eqoxide-nav = { path = "crates/eqoxide-nav" }
+eqoxide-command = { path = "crates/eqoxide-command" }
 anyhow = "1"
 arc-swap = "1"
 image = { version = "0.25", default-features = false, features = ["bmp", "png", "dds", "tga"] }
@@ -58,6 +59,8 @@ tempfile = "3"
 # crate's test build — they're `#[cfg(test)]` in core, so invisible across the crate boundary
 # otherwise. Dev-deps' features don't activate in normal release builds.
 eqoxide-core = { path = "crates/eqoxide-core", features = ["test-fixtures"] }
+# Same reasoning as eqoxide-core above, for `CommandState::goto_target` (#544 Step 2g).
+eqoxide-command = { path = "crates/eqoxide-command", features = ["test-fixtures"] }
 # Pinned to the exact version wgpu 22 already pulls in transitively (see Cargo.lock) so this
 # doesn't add a second naga to the dependency graph. Used only to parse+validate the zone
 # shaders' WGSL source in tests/fog_shader.rs — no GPU device required.
@@ -68,4 +71,4 @@ tokio = { version = "1", features = ["full", "test-util"] }
 tower = "0.5"
 
 [workspace]
-members = ["tools", "crates/eqoxide-core", "crates/eqoxide-ipc", "crates/eqoxide-assets", "crates/eqoxide-nav"]
+members = ["tools", "crates/eqoxide-core", "crates/eqoxide-ipc", "crates/eqoxide-assets", "crates/eqoxide-nav", "crates/eqoxide-command"]

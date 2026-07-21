@@ -12,8 +12,8 @@
 //! exposed here (see `mod.rs`).
 
 use super::CommandState;
-use crate::game_state::DialogueChoice;
-use crate::ipc::{CommandResult, GiveOk};
+use eqoxide_core::game_state::DialogueChoice;
+use eqoxide_ipc::{CommandResult, GiveOk};
 use tokio::sync::oneshot;
 
 impl CommandState {
@@ -139,7 +139,7 @@ impl CommandState {
 #[cfg(test)]
 mod tests {
     use super::CommandState;
-    use crate::game_state::DialogueChoice;
+    use eqoxide_core::game_state::DialogueChoice;
 
     /// The core invariant of the facade: a `request_*` write and the matching `take_*` drain touch
     /// the SAME slot, the drain removes it (so a stale command can't fire twice), and a second

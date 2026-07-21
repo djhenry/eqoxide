@@ -9,7 +9,7 @@
 //! `/v1/observe/messages`), not writes the view makes — see `mod.rs`.
 
 use super::CommandState;
-use crate::ipc::ChatSend;
+use eqoxide_ipc::ChatSend;
 
 impl CommandState {
     // ── request_* : the VIEW (the Chat window + HTTP handlers) makes this write ────────────────────
@@ -31,7 +31,7 @@ impl CommandState {
 #[cfg(test)]
 mod tests {
     use super::CommandState;
-    use crate::ipc::ChatSend;
+    use eqoxide_ipc::ChatSend;
 
     /// `request_chat_send` pushes are FIFO-preserved, and `take_chat_send` drains the whole queue
     /// at once, leaving it empty for the next drain — the same `std::mem::take` behavior the raw

@@ -1,0 +1,32 @@
+[package]
+name = "eqoxide-command"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "eqoxide_command"
+path = "src/lib.rs"
+
+[features]
+# Exposes `CommandState::goto_target` (otherwise `#[cfg(test)]`, so invisible across the crate
+# boundary) to DOWNSTREAM test builds. The app crate enables this in its [dev-dependencies] so
+# `src/model.rs`'s `MockModel` and `src/eq_net/action_loop.rs`'s nav tests can keep peeking the
+# active goto without draining it. Off in normal builds — the release binary never contains it.
+test-fixtures = []
+
+[dependencies]
+# eqoxide-command is the typed write-path facade (`CommandState`) sitting directly above
+# `eqoxide-ipc` (core ← ipc ← command, #544 Step 2g). It depends ONLY on `eqoxide-core`
+# (`game_state::DialogueChoice`/`WhoEntry`) and `eqoxide-ipc` (the `*Slots` bundles plus
+# `CommandResult`/`BuyOk`/`OpenOk`/`GiveOk`/`CastEnd`, relocated there in #557) — never on any
+# app-layer crate (wgpu/winit/egui/eq_net/http/app/renderer/nav/assets).
+eqoxide-core = { path = "../eqoxide-core" }
+eqoxide-ipc = { path = "../eqoxide-ipc" }
+# tokio::sync::oneshot — the awaited-command reply channel (`request_open_await`/`request_buy_await`/
+# `request_who`/`request_friends`), mirroring the same `Sender<T>` shape `ipc`'s await slots hold.
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+# `#[tokio::test]` (merchant/interact await round-trip tests) needs the macro + a runtime; the
+# awaited channel itself only needs `sync` (already a normal dependency above).
+tokio = { version = "1", features = ["macros", "rt"] }

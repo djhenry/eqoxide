@@ -115,8 +115,17 @@ impl CommandState {
     /// A read-only accessor so callers outside this module — and tests — can observe whether a nav
     /// destination is set, without reaching into the private `nav` slots. `None` = the walker has no
     /// active goto (idle/stopped).
-    #[cfg(test)]
-    pub(crate) fn goto_target(&self) -> Option<(f32, f32, f32)> {
+    ///
+    /// Gated on `test-fixtures` (not bare `#[cfg(test)]`) and `pub` (not `pub(crate)`) — since
+    /// #544 Step 2g this method lives in the separate `eqoxide-command` crate, and the app crate's
+    /// own test code (`src/model.rs`'s `MockModel`, `src/eq_net/action_loop.rs`'s nav tests) calls
+    /// it across that crate boundary. A bare `#[cfg(test)]` here would only apply when
+    /// `eqoxide-command` itself is compiled as the crate under test, which never happens for a
+    /// downstream dependent's `cargo test` — mirrors `eqoxide-core`'s `RegionMap::flat_below`-style
+    /// fixtures. Off (and `pub(crate)`-equivalent in effect) in normal builds — the release binary
+    /// never exposes this accessor.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn goto_target(&self) -> Option<(f32, f32, f32)> {
         *self.nav.goto_target.lock().unwrap()
     }
 }
