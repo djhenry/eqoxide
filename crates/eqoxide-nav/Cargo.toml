@@ -23,9 +23,13 @@ eqoxide-core = { path = "../eqoxide-core" }
 eqoxide-ipc = { path = "../eqoxide-ipc" }
 eqoxide-assets = { path = "../eqoxide-assets" }
 tracing = "0.1"
+# The debug-snapshot types (`diagnostics`, #608) derive Serialize so the HTTP consumer is a
+# structural 1:1 serde projection — no hand-mapped fields that could drift from what nav published.
+serde = { version = "1", features = ["derive", "rc"] } # "rc": the snapshot shares its PlanDebug via Arc
 
 [dev-dependencies]
 # Enable eqoxide-core's test-fixture constructors (RegionMap::flat_below/water_slab/zone_line_box/…)
 # for THIS crate's test build — they're `#[cfg(any(test, feature = "test-fixtures"))]` in core, so
 # invisible across the crate boundary otherwise. Dev-deps' features don't activate in release builds.
 eqoxide-core = { path = "../eqoxide-core", features = ["test-fixtures"] }
+serde_json = "1"

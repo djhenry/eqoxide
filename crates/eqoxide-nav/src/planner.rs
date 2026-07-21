@@ -70,6 +70,11 @@ pub struct PlanRequest {
 /// A finished plan, tagged with the generation it answers.
 pub struct PlanReply {
     pub gen:     u64,
+    /// The START and GOAL this plan was computed FOR (copied from the request, like `LocalReply`):
+    /// by the time the reply lands the character has moved, and the debug record must describe the
+    /// question the planner actually answered — not the question we would ask now (#608).
+    pub start:   [f32; 3],
+    pub goal:    [f32; 3],
     pub outcome: PlanOutcome,
     /// How long the search actually took. This is the stall that used to land on the NET THREAD.
     pub plan_ms: u128,
@@ -84,6 +89,10 @@ pub struct PlanReply {
     /// as `nav_tier` on /v1/observe/debug so an agent sees the risk of the route it is walking, a
     /// PER-ROUTE fact the zone-lifetime `nav_tight` counter cannot give.
     pub tight: bool,
+    /// The plan's per-edge diagnostic trace (#608): every accept/reject the search recorded, as it
+    /// made them. Carried to the walker, which publishes it in the `NavDebugSnapshot` — the
+    /// consumers' ONLY source for "what did the planner evaluate, and why did it refuse".
+    pub trace: crate::diagnostics::SearchTrace,
 }
 
 /// The ActionLoop's handle on the worker: post requests, poll for the one reply that still matters.
@@ -305,15 +314,27 @@ fn worker_impl(req_rx: Receiver<PlanRequest>, rep_tx: Sender<PlanReply>, on_dequ
             }
             None => {}
         }
-        let (outcome, tight) = plan_path(&req.collision, req.start, req.goal, &req.avoid, req.aggro_buffer, req.goal_region, &req.teleport_pads);
+        // Arm the diagnostic edge trace (#608): the search records its per-edge verdicts into this
+        // as it runs, and the whole record rides back on the reply for the walker to publish. The
+        // recording cost sits HERE, on the worker thread — never on the net thread — and is bounded
+        // by `TRACE_EDGE_CAP`.
+        let trace = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::diagnostics::SearchTrace::with_budget(crate::diagnostics::TRACE_EDGE_CAP)));
+        let ctx = PlanCtx::worker().ensure_budget()
+            .with_goal_region(req.goal_region)
+            .with_teleport_pads(req.teleport_pads.clone())
+            .with_trace(trace.clone());
+        let (outcome, tight) = plan_path_with_ctx(&req.collision, req.start, req.goal, &req.avoid, req.aggro_buffer, ctx);
+        let trace = trace.lock().unwrap().clone();
         let plan_ms = t0.elapsed().as_millis();
         // The headline number for #340: this is the synchronous stall that used to sit on the net
         // thread (capped at 150 ms per A* call, up to ~2 s per plan). It now sits here, where the
         // only thing waiting on it is the walker.
-        tracing::info!("nav-planner: plan #{} ({:.0},{:.0})->({:.0},{:.0}) took {}ms OFF the net thread → {}",
+        tracing::info!("nav-planner: plan #{} ({:.0},{:.0})->({:.0},{:.0}) took {}ms OFF the net thread → {} ({} edges traced)",
             req.gen, req.start[0], req.start[1], req.goal[0], req.goal[1], plan_ms,
-            describe(&outcome));
-        if rep_tx.send(PlanReply { gen: req.gen, outcome, plan_ms, goal_snapped, tight }).is_err() {
+            describe(&outcome), trace.edge_count());
+        if rep_tx.send(PlanReply { gen: req.gen, start: req.start, goal: req.goal, outcome, plan_ms,
+            goal_snapped, tight, trace }).is_err() {
             break; // ActionLoop gone (zone change / shutdown)
         }
     }
@@ -376,13 +397,24 @@ pub fn plan_path_with_ctx(
 ) -> (PlanOutcome, bool) {
     let radius = PLAYER_RADIUS;
 
+    // TRACE (#608): remember which A* calls each invocation contributes, and stamp the range whose
+    // outcome is actually RETURNED — so the published trace can say "these calls are the answer;
+    // the rest are the retries that lost". No-ops when the ctx carries no trace.
+    let mark0 = ctx.trace_calls_len();
     let (first, first_tier) = col.find_path_ex_tiered(start, goal, radius, avoid, 8.0, None, aggro_buffer, ctx.clone());
+    let primary_range = (mark0, ctx.trace_calls_len());
     match first {
         // A real route, or an honest limit — either way, that's the answer (with its tier).
-        PlanOutcome::Route(_) | PlanOutcome::Exhausted { .. } => return (first, first_tier),
+        PlanOutcome::Route(_) | PlanOutcome::Exhausted { .. } => {
+            ctx.trace_stamp_outcome(primary_range);
+            return (first, first_tier);
+        }
         // A definitive no... unless the START is what's broken, which we can still fix.
         PlanOutcome::Unreachable { reason: NoRoute::StartIsolated, .. } => {}
-        PlanOutcome::Unreachable { .. } => return (first, first_tier),
+        PlanOutcome::Unreachable { .. } => {
+            ctx.trace_stamp_outcome(primary_range);
+            return (first, first_tier);
+        }
     }
 
     // Isolated start (#205): A* couldn't leave the start cell. A clean walkable floor is almost
@@ -401,6 +433,7 @@ pub fn plan_path_with_ctx(
         // Same shared budget (`ctx.clone()` shares the `Arc`): the ring retries draw down the SAME 8M,
         // so 13 calls cost one plan's budget, not 13. The last retry may find the budget already spent
         // by earlier ones and return `Exhausted(NodeCap)` — honest, and bounded.
+        let ring_mark = ctx.trace_calls_len();
         let (out, out_tier) = col.find_path_ex_tiered(anchor, goal, radius, avoid, 8.0, None, aggro_buffer, ctx.clone());
         // Only worthwhile if the re-anchored start could actually MOVE (more than the lone start
         // cell A* was stuck on). `> 2`, not `> 1`: every route begins AT its start point (find_path
@@ -413,10 +446,12 @@ pub fn plan_path_with_ctx(
         if usable {
             tracing::warn!("nav: start isolated at ({:.0},{:.0},{:.0}) — re-anchored to clean floor ({:.0},{:.0},{:.0})",
                 start[0], start[1], start[2], ax, ay, af);
+            ctx.trace_stamp_outcome((ring_mark, ctx.trace_calls_len()));
             return (out, out_tier);
         }
     }
     // The start is sealed in and no nearby floor gets us out. That IS a definitive no.
+    ctx.trace_stamp_outcome(primary_range);
     (first, first_tier)
 }
 
@@ -766,6 +801,92 @@ mod tests {
         assert!(total <= cap + 8192,
             "plan_path expanded {total} nodes against a {cap}-node PLAN-WIDE cap — a per-call cap would \
              allow ~{} across the ~13 calls. The budget is not shared.", cap * 13);
+    }
+
+    /// **THE #608 TRACE PROPERTIES**, on a synthetic fixture with known-correct answers:
+    ///
+    /// 1. The trace records the planner's OWN decisions: a plan toward a walled-off goal must
+    ///    contain `Rejected { Clearance }` edges AT the sealing walls (the same `continue` that
+    ///    refused the edge wrote the record) and `Accepted { Walk }` edges on the open floor.
+    /// 2. **Absence means unevaluated**: the sealed box's deep interior is unreachable, so NO
+    ///    recorded edge may ORIGINATE inside it — the trace must not invent coverage there.
+    /// 3. Cells beyond the plane's rim have no floor: `Rejected { NoFloor }` records exist.
+    ///
+    /// Mutation-checked at authoring time (see PR #608): recording `Accepted { Walk }` at the
+    /// clearance-reject branch turns assertion 1 RED.
+    #[test]
+    fn trace_records_planner_decisions_and_absence_means_unevaluated() {
+        use crate::diagnostics::{EdgeKind, EdgeVerdict, RejectReason, SearchTrace, TRACE_EDGE_CAP};
+        // Small plane (2 500 coarse cells) so the full flood fits inside the trace budget.
+        let col = plane_with_sealed_box(200.0, 100.0, 100.0);
+        let trace = Arc::new(std::sync::Mutex::new(SearchTrace::with_budget(TRACE_EDGE_CAP)));
+        let ctx = crate::collision::PlanCtx::worker().ensure_budget().with_trace(trace.clone());
+        let (out, _tier) = plan_path_with_ctx(&col, [-150.0, -150.0, 0.0], [100.0, 100.0, 0.0], &[], 0.0, ctx);
+        assert!(matches!(out, PlanOutcome::Unreachable { .. }), "the boxed goal stays unreachable: {out:?}");
+
+        let t = trace.lock().unwrap();
+        assert!(!t.calls.is_empty(), "the traced plan must record its calls");
+        let edges: Vec<_> = t.calls.iter().flat_map(|c| &c.edges).collect();
+        assert!(!edges.is_empty());
+
+        // 1a. Clearance rejections AT the box walls (walls at 100±24; probe a band around them).
+        let near_wall = |p: [f32; 3]| {
+            let (dx, dy) = ((p[0] - 100.0).abs(), (p[1] - 100.0).abs());
+            dx <= 32.0 && dy <= 32.0 && (dx >= 16.0 || dy >= 16.0)
+        };
+        let wall_rejects = edges.iter().filter(|e|
+            matches!(e.verdict, EdgeVerdict::Rejected { reason: RejectReason::Clearance })
+                && near_wall(e.to)).count();
+        assert!(wall_rejects > 0, "the sealing walls must appear as recorded Clearance rejections");
+        // 1b. Accepted walk edges on the open floor.
+        assert!(edges.iter().any(|e| matches!(e.verdict, EdgeVerdict::Accepted { kind: EdgeKind::Walk })));
+
+        // 2. UNEVALUATED STAYS ABSENT: nothing may originate inside the sealed interior.
+        let interior = |p: [f32; 3]| (p[0] - 100.0).abs() < 16.0 && (p[1] - 100.0).abs() < 16.0;
+        assert!(edges.iter().all(|e| !interior(e.from)),
+            "no recorded edge may ORIGINATE inside the sealed (unreachable, unevaluated) interior — \
+             the trace must not invent coverage");
+
+        // 3. The rim of the world reads as NoFloor, not as silence.
+        assert!(edges.iter().any(|e| matches!(e.verdict, EdgeVerdict::Rejected { reason: RejectReason::NoFloor })),
+            "cells beyond the plane's rim must be recorded as no_floor evaluations");
+
+        // The outcome range covers the calls that produced the returned verdict.
+        let (o0, o1) = t.outcome_calls;
+        assert!(o0 < o1 && o1 <= t.calls.len(), "outcome_calls {:?} of {}", t.outcome_calls, t.calls.len());
+    }
+
+    /// A climb too steep to walk is recorded as `Rejected {{ Grade }}` — the same branch that
+    /// routes A* around the face writes the record (eqoxide#212 → #608).
+    #[test]
+    fn trace_records_grade_rejections_on_a_steep_ramp() {
+        use crate::diagnostics::{EdgeVerdict, RejectReason, SearchTrace, TRACE_EDGE_CAP};
+        // Low floor (east < 0), a 2.5-grade ramp east 0..8 rising 0→20, high plateau east 8..100.
+        let terrain = vec![
+            quad(vec![[-40.0, 0.0, -100.0], [40.0, 0.0, -100.0], [40.0, 0.0, 0.0], [-40.0, 0.0, 0.0]]),
+            quad(vec![[-40.0, 0.0, 0.0], [40.0, 0.0, 0.0], [40.0, 20.0, 8.0], [-40.0, 20.0, 8.0]]),
+            quad(vec![[-40.0, 20.0, 8.0], [40.0, 20.0, 8.0], [40.0, 20.0, 100.0], [-40.0, 20.0, 100.0]]),
+        ];
+        let col = Collision::build(&ZoneAssets { terrain, objects: vec![], textures: vec![] }, 32.0);
+        let trace = Arc::new(std::sync::Mutex::new(SearchTrace::with_budget(TRACE_EDGE_CAP)));
+        let ctx = crate::collision::PlanCtx::worker().ensure_budget().with_trace(trace.clone());
+        let _ = plan_path_with_ctx(&col, [-50.0, 0.0, 0.0], [50.0, 0.0, 20.0], &[], 0.0, ctx);
+        let t = trace.lock().unwrap();
+        let grade_rejects = t.calls.iter().flat_map(|c| &c.edges)
+            .filter(|e| matches!(e.verdict, EdgeVerdict::Rejected { reason: RejectReason::Grade }))
+            .count();
+        assert!(grade_rejects > 0,
+            "a 2.5-grade face must appear in the trace as grade rejections (found none)");
+    }
+
+    /// An untraced plan records nothing and costs nothing — the legacy path is unchanged.
+    #[test]
+    fn an_untraced_plan_records_nothing() {
+        let col = plane_with_sealed_box(200.0, 100.0, 100.0);
+        let ctx = crate::collision::PlanCtx::worker().ensure_budget();
+        assert_eq!(ctx.trace_calls_len(), 0);
+        let _ = plan_path_with_ctx(&col, [-150.0, -150.0, 0.0], [150.0, 150.0, 0.0], &[], 0.0, ctx.clone());
+        assert_eq!(ctx.trace_calls_len(), 0, "no trace armed → nothing recorded");
     }
 
     /// A reachable goal on the same fixture still routes (the honesty change must not make the

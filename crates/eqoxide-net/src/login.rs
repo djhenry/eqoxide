@@ -86,6 +86,7 @@ pub async fn run_login_flow(
     guild_slots:     eqoxide_ipc::GuildSlots,
     collision:       eqoxide_nav::collision::SharedCollision,
     maps_dir:        std::path::PathBuf,
+    nav_debug:       eqoxide_nav::diagnostics::NavDebugView,
     shutdown:        Arc<AtomicBool>,
     camp:            CampReq,
     camp_until:      CampUntil,
@@ -123,7 +124,7 @@ pub async fn run_login_flow(
                 let action_loop = ActionLoop::new(
                     nav, world, quest, group_slots, command, social,
                     merchant_slots, inventory_slots, interact, chat, controller, guild_slots,
-                    collision, maps_dir,
+                    collision, maps_dir, nav_debug,
                 );
                 run_gameplay_phase(stream, net_rx, gs, char_name, action_loop, world_creds, shutdown.clone(), camp.clone(), camp_until.clone(), respawn.clone(), game_state_snapshot, net_health).await;
                 return Ok(());

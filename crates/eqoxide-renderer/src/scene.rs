@@ -54,6 +54,10 @@ pub struct DoorRender {
 /// All data the renderer needs for one frame.
 #[derive(Debug, Default, Clone)]
 pub struct SceneState {
+    /// The published nav diagnostics snapshot to draw as the depth-tested 3D overlay (#608).
+    /// `None` = overlay off (F11/--nav-debug) or nothing published. A cheap `Arc` clone of what
+    /// the walker published — the renderer draws it verbatim (see `nav_overlay`).
+    pub nav_debug: Option<std::sync::Arc<eqoxide_nav::diagnostics::NavDebugSnapshot>>,
     pub zone: String,
     pub zone_changed: bool,
     pub player_pos: [f32; 3],
@@ -329,6 +333,9 @@ impl SceneState {
         }).collect();
 
         SceneState {
+            // Attached by `App` AFTER this snapshot copy, from the walker's published view and only
+            // while the overlay is toggled on (#608) — GameState carries no nav diagnostics.
+            nav_debug: None,
             zone: gs.world.zone_name.clone(),
             zone_changed: gs.world.zone_changed,
             // World space is EQ native: [east=server_x, north=server_y, up=server_z].

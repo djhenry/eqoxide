@@ -43,10 +43,10 @@
 //!     controller/prediction channel (`ControllerSlots::controller_view.heading`, streamed by
 //!     `ActionLoop::stream_position`); it rides that channel atomically with the predicted position
 //!     (C1's client-prediction split) and is intentionally not carved into a separate slot.
-//!   * **Computed nav path → read-side.** The walker's committed path overlay (`ipc::NavPathView`)
-//!     is Model→View DERIVED render state, not a command, so it moved from the `NavSlots` command
-//!     bundle to `ipc::ControllerSlots` (the render↔nav integration channels). See those two `ipc`
-//!     structs' docs.
+//!   * **Computed nav path → read-side.** The walker's committed-path overlay is Model→View
+//!     DERIVED render state, not a command, so it never belongs on this facade. (It moved from the
+//!     `NavSlots` command bundle to `ipc::ControllerSlots` in #452, and in #608 became part of the
+//!     published `eqoxide_nav::diagnostics::NavDebugSnapshot` — see that module's docs.)
 //!
 //! Forward-compatible with A3 (Command-with-result): A3 will add result-returning variants
 //! (`request_*_await`, generalizing the existing `oneshot` reply used by `FrameReq`/`WhoReq`)

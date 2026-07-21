@@ -160,6 +160,13 @@ pub struct PlanCtx {
     /// with no destination creates no edge, so the planner never fabricates reachability). Empty for
     /// the vast majority of plans (zones with no same-zone pads), which pay nothing.
     pub teleport_pads: Vec<PadEdge>,
+    /// The plan's DIAGNOSTIC edge trace (#608): when present, every A* call records the per-edge
+    /// accept/reject verdicts it actually made into this shared trace (locked ONCE per call, never
+    /// per edge). `None` (the default — every legacy caller and the fine local tier) records
+    /// nothing and pays one `Option` check per recording site. The coarse worker
+    /// (`planner::worker_impl`) arms it so the published `NavDebugSnapshot` carries what the
+    /// planner DID rather than a consumer's re-derivation — see `crate::diagnostics`.
+    pub trace: Option<crate::diagnostics::SearchTraceHandle>,
 }
 
 impl PlanCtx {
@@ -195,6 +202,22 @@ impl PlanCtx {
     pub fn with_teleport_pads(mut self, pads: Vec<PadEdge>) -> Self {
         self.teleport_pads = pads;
         self
+    }
+    /// Arm the plan's diagnostic edge trace (#608). See [`PlanCtx::trace`].
+    pub fn with_trace(mut self, trace: crate::diagnostics::SearchTraceHandle) -> Self {
+        self.trace = Some(trace);
+        self
+    }
+    /// How many A* calls the trace has recorded so far (0 when untraced). Used by
+    /// `planner::plan_path_with_ctx` to stamp which calls produced the RETURNED outcome.
+    pub fn trace_calls_len(&self) -> usize {
+        self.trace.as_ref().map_or(0, |t| t.lock().unwrap().calls.len())
+    }
+    /// Stamp the half-open call range whose outcome the plan returned. No-op when untraced.
+    pub fn trace_stamp_outcome(&self, range: (usize, usize)) {
+        if let Some(t) = &self.trace {
+            t.lock().unwrap().outcome_calls = range;
+        }
     }
 }
 
@@ -1705,6 +1728,49 @@ impl Collision {
         &self.clearance
     }
 
+    /// A LIVE sample of the traversability model around one standing point, for the published nav
+    /// diagnostics snapshot (#608): the 16 radial wall spokes (the same rays
+    /// `ClearanceField::wall_at` aggregates, cast here at the ACTUAL point rather than a memo-key
+    /// centre, so the sample is honest about where it was taken), the 8-direction footprint ring
+    /// (`footprint_clear`'s rays, per direction), and the two graded field values the planner's
+    /// hug cost / standing-room margin actually consult. This is NAV sampling its OWN model —
+    /// consumers draw the sample verbatim and never re-cast these rays.
+    pub fn clearance_probe(&self, east: f32, north: f32, ref_z: f32) -> crate::diagnostics::ClearanceProbe {
+        use crate::traversability::PLAYER_BODY;
+        const SPOKES: usize = 16;
+        const RING: usize = 8;
+        const CAP: f32 = 4.0; // the ClearanceField's WALL_CAP horizon
+        let floor_z = self.nearest_floor(east, north, ref_z, 3.0, 8.0).unwrap_or(ref_z);
+        let mut wall_spokes = Vec::with_capacity(SPOKES);
+        for i in 0..SPOKES {
+            let a = (i as f32) / (SPOKES as f32) * std::f32::consts::TAU;
+            let (dx, dy) = (a.cos(), a.sin());
+            let mut best = CAP;
+            for hz in PLAYER_BODY.planner_probes() {
+                let from = [east, north, floor_z + hz];
+                let to = [east + dx * CAP, north + dy * CAP, floor_z + hz];
+                if let Some(t) = self.nearest_hit_t(from, to) { best = best.min(t * CAP); }
+            }
+            wall_spokes.push(best);
+        }
+        let radius = eqoxide_core::physics::PLAYER_RADIUS;
+        let ring_z = floor_z + PLAYER_BODY.ring;
+        let footprint_ok = (0..RING).map(|i| {
+            let a = (i as f32) / (RING as f32) * std::f32::consts::TAU;
+            let to = [east + a.cos() * radius, north + a.sin() * radius, ring_z];
+            self.nearest_hit_t([east, north, ring_z], to).is_none()
+        }).collect();
+        crate::diagnostics::ClearanceProbe {
+            at: [east, north, floor_z],
+            wall_spokes,
+            cap: CAP,
+            footprint_ok,
+            footprint_radius: radius,
+            field_wall: self.wall_clearance(east, north, floor_z),
+            field_ground: self.ground_clearance(east, north, floor_z),
+        }
+    }
+
     /// ALL distinct walkable surface heights at `(east, north)` within `[ref_z - down, ref_z + up]`,
     /// sorted high→low with near-duplicates (within 1u) merged. Unlike `nearest_floor` (one surface),
     /// this exposes every floor in the column — essential for multi-level pathfinding where a ramp or
@@ -2211,6 +2277,13 @@ impl Collision {
         prefer_char_anchor: bool) -> Search {
         use std::collections::BinaryHeap;
         use std::cmp::Ordering;
+        // DIAGNOSTIC TRACE (#608): when the plan armed one, this call records the per-edge verdicts
+        // it makes, AT the branch that makes them — never a re-derivation. Locked ONCE for the whole
+        // call (every A* call of a plan runs sequentially on one worker thread, so this never
+        // contends); untraced callers (`tr == None`) pay a single Option check per recording site.
+        use crate::diagnostics::{EdgeKind, EdgeVerdict, RejectReason};
+        let mut tr = ctx.trace.as_ref().map(|t| t.lock().unwrap());
+        if let Some(t) = tr.as_deref_mut() { t.begin_call(radius, cell.max(1.0), prefer_char_anchor); }
         if self.cols == 0 || self.rows == 0 { return Search::no_route(NoRoute::NoGeometry); }
         // Navigate on a FINER grid than the collision broad-phase buckets (self.cell_size, ~32u).
         // At 32u, cell centers fall inside walls in tight corridors, so A* sees a fragmented graph,
@@ -2676,6 +2749,10 @@ impl Collision {
                     if nz < slo - 0.01 || nz > shi + 0.01 { continue; } // stay inside this span
                     let nkey = (c, r, qf(nz));
                     if closed.contains(&nkey) { continue; }
+                    if let Some(t) = tr.as_deref_mut() {
+                        t.edge([a[0], a[1], cz], [a[0], a[1], nz],
+                            EdgeVerdict::Accepted { kind: EdgeKind::SwimVertical });
+                    }
                     let tentative = g_cur + VRES;
                     if tentative < *g_score.get(&nkey).unwrap_or(&f32::MAX) {
                         g_score.insert(nkey, tentative);
@@ -2699,6 +2776,11 @@ impl Collision {
                     const PAD_PENALTY: f32 = 100.0;
                     let dkey = (pdc, pdr, qf(pdz));
                     if closed.contains(&dkey) { continue; }
+                    if let Some(t) = tr.as_deref_mut() {
+                        let dcen = center(pdc, pdr);
+                        t.edge([a[0], a[1], fz], [dcen[0], dcen[1], pdz],
+                            EdgeVerdict::Accepted { kind: EdgeKind::Pad });
+                    }
                     let tentative = g_cur + PAD_PENALTY;
                     if tentative < *g_score.get(&dkey).unwrap_or(&f32::MAX) {
                         g_score.insert(dkey, tentative);
@@ -2736,8 +2818,18 @@ impl Collision {
                             if closed.contains(&nkey) { continue; }
                             let feet = 0.5;
                             let head = body.height - 0.5;
-                            if !self.edge_clear([a[0], a[1], cz + feet], [b[0], b[1], nz + feet], radius, cell) { continue; }
-                            if !self.edge_clear([a[0], a[1], cz + head], [b[0], b[1], nz + head], radius, cell) { continue; }
+                            if !self.edge_clear([a[0], a[1], cz + feet], [b[0], b[1], nz + feet], radius, cell)
+                                || !self.edge_clear([a[0], a[1], cz + head], [b[0], b[1], nz + head], radius, cell) {
+                                if let Some(t) = tr.as_deref_mut() {
+                                    t.edge([a[0], a[1], cz], [b[0], b[1], nz],
+                                        EdgeVerdict::Rejected { reason: RejectReason::Clearance });
+                                }
+                                continue;
+                            }
+                            if let Some(t) = tr.as_deref_mut() {
+                                t.edge([a[0], a[1], cz], [b[0], b[1], nz],
+                                    EdgeVerdict::Accepted { kind: EdgeKind::SwimInterior });
+                            }
                             // Cost = full 3D Euclidean length (design §6.3): no depth penalty, no
                             // surface bonus, so the straight chord to a mid-water goal is optimal and a
                             // bottom/surface detour is strictly longer (design §6.5). The horizontal-
@@ -2766,11 +2858,27 @@ impl Collision {
                                 let haul_out_up = crate::traversability::PLAYER_BODY.haul_out_up;
                                 for nf in self.column_floors(b[0], b[1], surface, STEP_H, surface - cz) {
                                     if nf <= cz + 1.0 { continue; }              // ascents only
-                                    if nf > surface + haul_out_up { continue; }  // too high to haul out
+                                    if nf > surface + haul_out_up {              // too high to haul out
+                                        if let Some(t) = tr.as_deref_mut() {
+                                            t.edge([a[0], a[1], cz], [b[0], b[1], nf],
+                                                EdgeVerdict::Rejected { reason: RejectReason::HaulOutTooHigh });
+                                        }
+                                        continue;
+                                    }
                                     let nkey = (nc, nr, qf(nf));
                                     if closed.contains(&nkey) { continue; }
                                     let ray_z = surface.max(nf - STEP_H);
-                                    if !self.edge_clear([a[0], a[1], ray_z + CHEST], [b[0], b[1], nf + CHEST], radius, cell) { continue; }
+                                    if !self.edge_clear([a[0], a[1], ray_z + CHEST], [b[0], b[1], nf + CHEST], radius, cell) {
+                                        if let Some(t) = tr.as_deref_mut() {
+                                            t.edge([a[0], a[1], cz], [b[0], b[1], nf],
+                                                EdgeVerdict::Rejected { reason: RejectReason::Clearance });
+                                        }
+                                        continue;
+                                    }
+                                    if let Some(t) = tr.as_deref_mut() {
+                                        t.edge([a[0], a[1], cz], [b[0], b[1], nf],
+                                            EdgeVerdict::Accepted { kind: EdgeKind::HaulOut });
+                                    }
                                     let step = (((dc * dc + dr * dr) as f32).sqrt()) * cell + (nf - cz) * 0.5 + aggro_cost(b[0], b[1]);
                                     let tentative = g_cur + step;
                                     if tentative < *g_score.get(&nkey).unwrap_or(&f32::MAX) {
@@ -2788,14 +2896,46 @@ impl Collision {
                 // Consider EVERY surface in the neighbor column reachable by climbing <=STEP_H or
                 // dropping <=MAX_STEP_DOWN — this is what lets A* descend onto a lower floor under an
                 // overhang (the multi-level connection) instead of staying on the upper surface.
-                for nf in self.column_floors(b[0], b[1], cz, STEP_H, MAX_STEP_DOWN) {
-                    if nf - cz > STEP_H || cz - nf > MAX_STEP_DOWN { continue; }
+                //
+                // TRACE (#608): each reject `continue` below records ITS OWN reason first — the
+                // record IS the branch taken, so trace and decision cannot disagree. An empty
+                // candidate list records `no_floor` (the edge WAS evaluated: the answer was "no
+                // floor there"). A neighbour skipped because it is already CLOSED records nothing —
+                // that node's own expansion recorded its edges; absence stays "unevaluated".
+                let land_floors = self.column_floors(b[0], b[1], cz, STEP_H, MAX_STEP_DOWN);
+                if land_floors.is_empty() {
+                    if let Some(t) = tr.as_deref_mut() {
+                        t.edge([a[0], a[1], cz], [b[0], b[1], cz],
+                            EdgeVerdict::Rejected { reason: RejectReason::NoFloor });
+                    }
+                }
+                for nf in land_floors {
+                    if nf - cz > STEP_H {
+                        if let Some(t) = tr.as_deref_mut() {
+                            t.edge([a[0], a[1], cz], [b[0], b[1], nf],
+                                EdgeVerdict::Rejected { reason: RejectReason::StepUp });
+                        }
+                        continue;
+                    }
+                    if cz - nf > MAX_STEP_DOWN {
+                        if let Some(t) = tr.as_deref_mut() {
+                            t.edge([a[0], a[1], cz], [b[0], b[1], nf],
+                                EdgeVerdict::Rejected { reason: RejectReason::StepDown });
+                        }
+                        continue;
+                    }
                     // Grade limit: skip a climb too steep to walk (rise/run > MAX_WALK_GRADE) —
                     // A* then routes around the slope face instead of wedging on it. (eqoxide#212)
                     let rise = nf - cz;
                     if rise > 0.0 {
                         let run = (((dc * dc + dr * dr) as f32).sqrt()) * cell; // 8u orth / ~11.3u diag
-                        if rise / run > MAX_WALK_GRADE { continue; }
+                        if rise / run > MAX_WALK_GRADE {
+                            if let Some(t) = tr.as_deref_mut() {
+                                t.edge([a[0], a[1], cz], [b[0], b[1], nf],
+                                    EdgeVerdict::Rejected { reason: RejectReason::Grade });
+                            }
+                            continue;
+                        }
                     }
                     let nkey = (nc, nr, qf(nf));
                     if closed.contains(&nkey) { continue; }
@@ -2811,7 +2951,17 @@ impl Collision {
                     // — and is memoised per (cell, floor) inside `trav` for this plan.
                     if !trav.can_traverse_fast(
                         crate::traversability::Point::new([a[0], a[1]], cz),
-                        crate::traversability::Point::new([b[0], b[1]], nf)) { continue; }
+                        crate::traversability::Point::new([b[0], b[1]], nf)) {
+                        if let Some(t) = tr.as_deref_mut() {
+                            t.edge([a[0], a[1], cz], [b[0], b[1], nf],
+                                EdgeVerdict::Rejected { reason: RejectReason::Clearance });
+                        }
+                        continue;
+                    }
+                    if let Some(t) = tr.as_deref_mut() {
+                        t.edge([a[0], a[1], cz], [b[0], b[1], nf],
+                            EdgeVerdict::Accepted { kind: EdgeKind::Walk });
+                    }
                     let step = (((dc * dc + dr * dr) as f32).sqrt()) * cell + (nf - cz).abs() * 0.5
                         + aggro_cost(b[0], b[1]) + hug_cost(b[0], b[1], nf);
                     let tentative = g_cur + step;
@@ -2861,6 +3011,10 @@ impl Collision {
                             }
                             let nkey = (jc, jr, qf(nf));
                             if closed.contains(&nkey) { continue; }
+                            if let Some(t) = tr.as_deref_mut() {
+                                t.edge([a[0], a[1], cz], [land[0], land[1], nf],
+                                    EdgeVerdict::Accepted { kind: EdgeKind::Jump });
+                            }
                             let tentative = g_cur + (k as f32) * cell + JUMP_PENALTY;
                             if tentative < *g_score.get(&nkey).unwrap_or(&f32::MAX) {
                                 g_score.insert(nkey, tentative);
@@ -2889,6 +3043,10 @@ impl Collision {
                             if !water.is_water(b[0], b[1], nf + 3.0) && !water.is_water(b[0], b[1], nf + 12.0) { continue; }
                             let nkey = (nc, nr, qf(nf));
                             if closed.contains(&nkey) { continue; }
+                            if let Some(t) = tr.as_deref_mut() {
+                                t.edge([a[0], a[1], cz], [b[0], b[1], nf],
+                                    EdgeVerdict::Accepted { kind: EdgeKind::WaterDescent });
+                            }
                             // Steep per-depth cost so descending to a pool BOTTOM is a last resort:
                             // A* should cross a surface pool at the top (cheap surface-traversal edge
                             // above) and only dive when reaching a genuinely lower level is the only
@@ -2945,14 +3103,30 @@ impl Collision {
                         let haul_out_up = crate::traversability::PLAYER_BODY.haul_out_up;
                         for nf in self.column_floors(b[0], b[1], surface, STEP_H, surface - cz) {
                             if nf <= cz + 1.0 { continue; }              // ascents only
-                            if nf > surface + haul_out_up { continue; } // too high to haul out of water
+                            if nf > surface + haul_out_up {              // too high to haul out of water
+                                if let Some(t) = tr.as_deref_mut() {
+                                    t.edge([a[0], a[1], cz], [b[0], b[1], nf],
+                                        EdgeVerdict::Rejected { reason: RejectReason::HaulOutTooHigh });
+                                }
+                                continue;
+                            }
                             let nkey = (nc, nr, qf(nf));
                             if closed.contains(&nkey) { continue; }
                             // Swim at the surface, then the usual chest clearance for the
                             // step out — the ray starts at swim height, so it passes over
                             // the pit lip that blocks the ground-level climb ray.
                             let ray_z = surface.max(nf - STEP_H);
-                            if !self.edge_clear([a[0], a[1], ray_z + CHEST], [b[0], b[1], nf + CHEST], radius, cell) { continue; }
+                            if !self.edge_clear([a[0], a[1], ray_z + CHEST], [b[0], b[1], nf + CHEST], radius, cell) {
+                                if let Some(t) = tr.as_deref_mut() {
+                                    t.edge([a[0], a[1], cz], [b[0], b[1], nf],
+                                        EdgeVerdict::Rejected { reason: RejectReason::Clearance });
+                                }
+                                continue;
+                            }
+                            if let Some(t) = tr.as_deref_mut() {
+                                t.edge([a[0], a[1], cz], [b[0], b[1], nf],
+                                    EdgeVerdict::Accepted { kind: EdgeKind::HaulOut });
+                            }
                             let step = (((dc * dc + dr * dr) as f32).sqrt()) * cell + (nf - cz) * 0.5
                                 + aggro_cost(b[0], b[1]);
                             let tentative = g_cur + step;
@@ -2993,6 +3167,10 @@ impl Collision {
                         // now prefers crossing at the top; the controller collide-and-slides off any
                         // wall that happens to sit in the water.
                         if (surf - cz).abs() <= STEP_H && !closed.contains(&nkey) {
+                            if let Some(t) = tr.as_deref_mut() {
+                                t.edge([a[0], a[1], cz], [b[0], b[1], surf],
+                                    EdgeVerdict::Accepted { kind: EdgeKind::SwimSurface });
+                            }
                             let step = (((dc * dc + dr * dr) as f32).sqrt()) * cell + (surf - cz).abs() * 0.5;
                             let tentative = g_cur + step;
                             if tentative < *g_score.get(&nkey).unwrap_or(&f32::MAX) {
@@ -3020,6 +3198,10 @@ impl Collision {
                     {
                         let nkey = (nc, nr, qf(nf));
                         if !closed.contains(&nkey) {
+                            if let Some(t) = tr.as_deref_mut() {
+                                t.edge([a[0], a[1], cz], [b[0], b[1], nf],
+                                    EdgeVerdict::Accepted { kind: EdgeKind::Fall });
+                            }
                             // Huge flat cost: a controlled fall is a LAST RESORT. A* will only take
                             // it when there's no walkable route to the goal (e.g. a sealed lower
                             // level), never as a 2D "shortcut" that dives into a pit and climbs back.
@@ -3051,6 +3233,10 @@ impl Collision {
                         if (wade || dive) && !closed.contains(&nkey)
                             && self.edge_clear([a[0], a[1], top + 0.5], [b[0], b[1], top + 0.5], radius, cell)
                         {
+                            if let Some(t) = tr.as_deref_mut() {
+                                t.edge([a[0], a[1], cz], [b[0], b[1], top],
+                                    EdgeVerdict::Accepted { kind: EdgeKind::WaterEntry });
+                            }
                             let horiz = (((dc * dc + dr * dr) as f32).sqrt()) * cell;
                             let dz = top - cz;
                             // Bias toward wading in over leaping into the deep (design §6.5/§7.1): the

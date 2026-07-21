@@ -439,9 +439,7 @@ pub(crate) fn currency_json(coin: [u32; 4]) -> serde_json::Value {
 ///
 /// A few bundle fields are unused on THIS side of a channel (e.g. `camera.frame_req` is written by an
 /// HTTP handler and read by the render thread, never drained here) — that's expected: the bundle
-/// boundary is the DOMAIN, not "exactly the fields this struct touches". (The walker's draw-only
-/// `nav_path_view` overlay moved off `NavSlots` to `ControllerSlots` in #452 — a render↔nav channel
-/// `HttpState` never held.)
+/// boundary is the DOMAIN, not "exactly the fields this struct touches".
 // `pub` (not `pub(crate)`) only so downstream integration tests can NAME the type that
 // `testkit::empty_state`/`debug_json` hand back (they can't otherwise hold a value of it across the
 // crate boundary). Its fields stay `pub(crate)`, so it remains un-constructible outside this crate —
@@ -492,6 +490,10 @@ pub struct HttpState {
     pub(crate) lifecycle:       eqoxide_ipc::LifecycleSlots,
     /// `/v1/guild/*` slots (#M4).
     pub(crate) guild_slots:     eqoxide_ipc::GuildSlots,
+    /// The nav diagnostics snapshot the walker publishes (#608), served STRUCTURALLY (serde on the
+    /// nav-owned types — no hand-mapped fields to drift) on `GET /v1/observe/nav_debug`. This
+    /// layer only reads and encodes it; it computes no floor height and no walkability verdict.
+    pub(crate) nav_debug_view:  eqoxide_nav::diagnostics::NavDebugView,
 }
 
 impl HttpState {
@@ -641,6 +643,7 @@ pub fn spawn_camera_server(
     group_slots:     eqoxide_ipc::GroupSlots,
     lifecycle:       eqoxide_ipc::LifecycleSlots,
     guild_slots:     eqoxide_ipc::GuildSlots,
+    nav_debug_view:  eqoxide_nav::diagnostics::NavDebugView,
     port:             u16,
     // When `Some`, an already-bound listener from `--api-port` (exact port, no scan).
     // When `None`, scan upward from `port` for the first free port.
@@ -660,7 +663,7 @@ pub fn spawn_camera_server(
             let state = HttpState {
                 camera, nav, world, shared_collision, zone_assets, command, social, merchant_slots,
                 inventory_slots, interact, chat, spells, game_state, net_health, frame_profile,
-                quest, group_slots, lifecycle, guild_slots,
+                quest, group_slots, lifecycle, guild_slots, nav_debug_view,
             };
             // Versioned + grouped routes: /v1/<group>/<action>. Each group's `router()` defines
             // relative paths; nesting prefixes them. Shared state is applied once at the end.

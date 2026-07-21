@@ -21,6 +21,7 @@
 //! `tests/walker_sim.rs`, not here (that controller is the one dependency this crate must not have).
 
 pub mod collision;
+pub mod diagnostics;
 pub mod planner;
 pub mod steering;
 pub mod traversability;

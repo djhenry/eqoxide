@@ -11,6 +11,7 @@
 //! `crate::renderer::…` / `crate::scene::…` call site across app.rs/ui/main.rs keeps resolving.
 
 pub mod gpu;
+pub mod nav_overlay;
 pub mod pass;
 pub mod pipeline;
 pub mod renderer;

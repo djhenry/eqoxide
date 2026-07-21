@@ -304,15 +304,17 @@ fn main() {
     };
     // Single-authority movement (Component A): the render thread owns the CharacterController and
     // publishes `controller_view`; the nav thread streams it and writes `nav_intent` for /goto;
-    // `pos_correction` hands a server correction back to the controller. `nav_path_view` is the
-    // walker's committed path published for the render overlay (#452 — a render↔nav channel, NOT a
-    // command). Consumed by `ActionLoop` and `App` — NOT by `HttpState` (no /v1/* route reads it).
+    // `pos_correction` hands a server correction back to the controller.
     let controller = ipc::ControllerSlots {
         controller_view: Arc::new(Mutex::new(eqoxide::movement::ControllerView::default())),
         nav_intent:      Arc::new(Mutex::new(None)),
         pos_correction:  Arc::new(Mutex::new(None)),
-        nav_path_view:   Arc::new(Mutex::new((Vec::new(), Vec::new()))),
     };
+    // The nav diagnostics snapshot slot (#608): the walker (nav thread) is the ONLY writer; the
+    // render overlay (`App` → `scene.nav_debug`) and `GET /v1/observe/nav_debug` (`HttpState`)
+    // read it. Defined in `eqoxide-nav` (it names nav types, which `eqoxide-ipc` sits below) and
+    // constructed ONCE here like every other cross-thread slot.
+    let nav_debug_view: eqoxide::nav::diagnostics::NavDebugView = Default::default();
     // Guild roster/identity published for GET /v1/guild/roster + /observe/debug, and the guild-action
     // request slot for POST /v1/guild/{invite,accept,leave,remove} (#295).
     let guild_slots = ipc::GuildSlots {
@@ -426,6 +428,7 @@ fn main() {
             controller:      controller_b,
             guild_slots:     guild_slots_b,
             collision:       sc,
+            nav_debug:       nav_debug_view.clone(),
             maps_dir:        md,
             shutdown:        sd,
             camp:            cp,
@@ -453,7 +456,6 @@ fn main() {
     }
 
     // HTTP server
-    let app_goto = nav.goto_target.clone();
     // All the request slots UI windows can write, bundled (#162). These are the
     // same slots the HTTP API and nav/gameplay threads share. This is a PRE-EXISTING bundle
     // (separate from the M4 domain bundles above); its fields are individual `.clone()`s pulled
@@ -512,6 +514,7 @@ fn main() {
         group_slots,
         lifecycle.clone(),
         guild_slots,
+        nav_debug_view.clone(),
         app_cfg.http_port,
         exact_listener,
     );
@@ -527,7 +530,6 @@ fn main() {
         game_state_snapshot.clone(),
         net_health_shared.clone(),
         camera.frame_req,
-        app_goto,
         app_actions,
         app_spells,
         shared_collision,
@@ -543,7 +545,7 @@ fn main() {
         controller.controller_view,
         controller.nav_intent,
         controller.pos_correction,
-        controller.nav_path_view,
+        nav_debug_view,
     );
     event_loop.run_app(&mut application).expect("event loop run");
     // The event loop has now exited gracefully — either the window was closed, or a shutdown was

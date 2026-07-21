@@ -373,7 +373,8 @@ pub struct ActionLoop {
     /// tests below (`dead_player_halts_navigation`, `zone_change_resets_stale_destination_and_path`,
     /// `a_snapped_goal_z_is_reported_not_silently_performed`, `nav_tier_does_not_survive_...`) need a
     /// handle on the exact same shared Arc to seed/assert `nav_state`/`goto_target`/`goto_entity`
-    /// directly. (The walker's `nav_path_view` overlay moved to `self.controller` in #452.)
+    /// directly. (The walker's published diagnostics moved to `eqoxide_nav::diagnostics::NavDebugView`
+    /// in #608; tests reach it via `walker.debug_view()`.)
     /// `#[cfg(test)]` code doesn't compile under `cargo build --lib`, so the
     /// lint can't see those reads and flags the field as dead outside `cargo test` — hence the allow.
     #[allow(dead_code)]
@@ -551,10 +552,13 @@ impl ActionLoop {
         guild_slots:     eqoxide_ipc::GuildSlots,
         collision:       eqoxide_nav::collision::SharedCollision,
         maps_dir:        std::path::PathBuf,
+        // The published nav diagnostics view (#608): a `.clone()` of the SAME slot `main.rs` hands
+        // to the render + HTTP consumers. The Walker is its only writer.
+        nav_debug:       eqoxide_nav::diagnostics::NavDebugView,
     ) -> Self {
         let walker = eqoxide_nav::walker::Walker::new(
             nav.clone(), world.clone(), collision.clone(), controller.nav_intent.clone(),
-            controller.nav_path_view.clone(),
+            nav_debug,
         );
         ActionLoop {
             nav,
@@ -2890,6 +2894,7 @@ mod tests {
         nav.walker.apply_plan(PlanReply {
             gen: 1,
             outcome: eqoxide_nav::collision::PlanOutcome::Route(vec![[0.0, 0.0, 47.0], [100.0, 100.0, 47.0]]),
+            start: [0.0; 3], goal: [0.0; 3], trace: Default::default(),
             plan_ms: 5,
             goal_snapped: Some(eqoxide_nav::collision::GoalSnap::ToColumnFloor { z: 47.0 }),
             tight: false,
@@ -2910,6 +2915,7 @@ mod tests {
         nav.walker.apply_plan(PlanReply {
             gen: 2,
             outcome: eqoxide_nav::collision::PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]]),
+            start: [0.0; 3], goal: [0.0; 3], trace: Default::default(),
             plan_ms: 5,
             goal_snapped: None,
             tight: false,
@@ -2924,6 +2930,7 @@ mod tests {
         nav.walker.apply_plan(PlanReply {
             gen: 3,
             outcome: eqoxide_nav::collision::PlanOutcome::Route(vec![[0.0, 0.0, -20.0], [100.0, 100.0, -20.0]]),
+            start: [0.0; 3], goal: [0.0; 3], trace: Default::default(),
             plan_ms: 5,
             goal_snapped: Some(eqoxide_nav::collision::GoalSnap::ToWaterSurface { surface_z: 0.0 }),
             tight: false,
@@ -2954,6 +2961,7 @@ mod tests {
         nav.walker.apply_plan(PlanReply {
             gen: 1,
             outcome: PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]]),
+            start: [0.0; 3], goal: [0.0; 3], trace: Default::default(),
             plan_ms: 5, goal_snapped: None, tight: false,
         }, &mut gs, goal);
         assert_eq!(nav.nav.nav_state.lock().unwrap().tier, Some("preferred"),
@@ -2964,6 +2972,7 @@ mod tests {
             gen: 2,
             outcome: PlanOutcome::Unreachable {
                 reason: NoRoute::SearchClosed, goal_blocked_by: None, frontier_blocked_by: None },
+            start: [0.0; 3], goal: [0.0; 3], trace: Default::default(),
             plan_ms: 5, goal_snapped: None, tight: false,
         }, &mut gs, goal);
         let st = nav.nav.nav_state.lock().unwrap().clone();
@@ -2976,6 +2985,7 @@ mod tests {
         nav.walker.apply_plan(PlanReply {
             gen: 3,
             outcome: PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [50.0, 50.0, 0.0]]),
+            start: [0.0; 3], goal: [0.0; 3], trace: Default::default(),
             plan_ms: 5, goal_snapped: None, tight: true,
         }, &mut gs, goal);
         assert_eq!(nav.nav.nav_state.lock().unwrap().tier, Some("minimum"));
@@ -2984,6 +2994,7 @@ mod tests {
             outcome: PlanOutcome::Exhausted {
                 limit: PlanLimit::NodeCap,
                 progress: Some(vec![[0.0, 0.0, 0.0], [60.0, 60.0, 0.0], [90.0, 90.0, 0.0]]) },
+            start: [0.0; 3], goal: [0.0; 3], trace: Default::default(),
             plan_ms: 5, goal_snapped: None, tight: false,
         }, &mut gs, goal);
         let st = nav.nav.nav_state.lock().unwrap().clone();
@@ -2994,6 +3005,7 @@ mod tests {
         nav.walker.apply_plan(PlanReply {
             gen: 5,
             outcome: PlanOutcome::Route(vec![[0.0, 0.0, 0.0], [100.0, 100.0, 0.0]]),
+            start: [0.0; 3], goal: [0.0; 3], trace: Default::default(),
             plan_ms: 5, goal_snapped: None, tight: false,
         }, &mut gs, goal);
         assert_eq!(nav.nav.nav_state.lock().unwrap().tier, Some("preferred"));
@@ -3023,6 +3035,7 @@ mod tests {
             Default::default(), // guild_slots
             Default::default(), // collision
             std::path::PathBuf::new(), // maps_dir
+            Default::default(), // nav_debug (#608)
         )
     }
 
@@ -4460,7 +4473,6 @@ mod tests {
             *nav.nav.goto_target.lock().unwrap() = Some((100.0, 200.0, 0.0));
             *nav.nav.goto_entity.lock().unwrap() = Some("a bat".into());
             *nav.controller.nav_intent.lock().unwrap() = Some(eqoxide_ipc::MoveIntent::default());
-            *nav.controller.nav_path_view.lock().unwrap() = (vec![[0.0, 0.0, 0.0]], vec![[0.0, 0.0, 0.0]]);
             nav.walker.path = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]];
             nav.walker.local_path = vec![[0.0, 0.0, 0.0]];
             nav.walker.path_goal = Some((100.0, 200.0, 0.0));
@@ -4473,6 +4485,12 @@ mod tests {
             assert!(nav.nav.goto_entity.lock().unwrap().is_none(), "goto_entity must clear on death");
             assert!(nav.controller.nav_intent.lock().unwrap().is_none(), "nav_intent must clear so the controller stops");
             assert!(nav.walker.path.is_empty() && nav.walker.local_path.is_empty(), "route must clear on death");
+            // The PUBLISHED snapshot (#608) must reflect the halt too — a consumer keeps whatever
+            // was last published, so an unrefreshed route here would draw a dead player walking.
+            let snap = nav.walker.debug_view().lock().unwrap().clone()
+                .expect("halting must publish a snapshot");
+            assert!(snap.committed_coarse.is_empty() && snap.committed_fine.is_empty(),
+                "the published committed routes must clear on death");
             // The fast-steering cursor must reset with the path it indexes (#311) — a stale local_i
             // left over a cleared/rebuilt local_path aims the walker at the wrong segment.
             assert_eq!(nav.walker.local_i, 0, "local_i must reset with local_path on death");
@@ -4534,7 +4552,6 @@ mod tests {
         *nav.nav.goto_target.lock().unwrap() = Some((100.0, 200.0, 0.0));
         *nav.nav.goto_entity.lock().unwrap() = Some("a bat".into());
         *nav.controller.nav_intent.lock().unwrap() = Some(eqoxide_ipc::MoveIntent::default());
-        *nav.controller.nav_path_view.lock().unwrap() = (vec![[0.0, 0.0, 0.0]], vec![[0.0, 0.0, 0.0]]);
         nav.walker.path = vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0]];
         nav.walker.local_path = vec![[0.0, 0.0, 0.0]];
         nav.walker.path_goal = Some((100.0, 200.0, 0.0));
@@ -4555,8 +4572,14 @@ mod tests {
         assert!(nav.nav.goto_target.lock().unwrap().is_none(), "goto_target must clear on zone change");
         assert!(nav.nav.goto_entity.lock().unwrap().is_none(), "goto_entity must clear on zone change");
         assert!(nav.controller.nav_intent.lock().unwrap().is_none(), "nav_intent must clear so the controller stops");
-        let (coarse, fine) = &*nav.controller.nav_path_view.lock().unwrap();
-        assert!(coarse.is_empty() && fine.is_empty(), "overlay path must clear on zone change");
+        // The PUBLISHED snapshot (#608): routes cleared AND the old zone's plan/pads dropped —
+        // they describe the previous zone's geometry.
+        let snap = nav.walker.debug_view().lock().unwrap().clone()
+            .expect("the zone change must publish a cleared snapshot");
+        assert!(snap.committed_coarse.is_empty() && snap.committed_fine.is_empty(),
+            "published routes must clear on zone change");
+        assert!(snap.plan.is_none(), "the old zone's plan trace must not survive the crossing");
+        assert!(snap.pads.is_empty(), "the old zone's pad knowledge must not survive the crossing");
         assert!(nav.walker.path.is_empty() && nav.walker.local_path.is_empty(), "route must clear on zone change");
         assert_eq!(nav.walker.path_goal, None);
         assert_eq!(nav.walker.path_i, 0);
