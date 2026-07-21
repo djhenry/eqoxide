@@ -483,6 +483,53 @@ pub struct ActionLoop {
     streamed_init:    bool,
 }
 
+/// The single, server-authoritative disposition of an inbound OP_ZoneChange `success` echo.
+/// One echo maps to EXACTLY one of these — see [`classify_zone_change_echo`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ZoneChangeEcho {
+    /// `success != 1` — the server rejected/ignored the request. Do nothing.
+    Ignored,
+    /// A SAME-ZONE in-zone reposition (an intra-zone translocator's lightweight `DoZoneSuccess`):
+    /// the zone session was NOT torn down, so the receive side must NOT world-reconnect (#368).
+    SameZoneReposition,
+    /// A genuine zone handoff — reconnect to world for the new zone. Covers a real cross-zone
+    /// line, a GM `#zone`, a death/bind respawn, AND (the #554 fix) a translocator the SERVER
+    /// resolved to a DIFFERENT zone than the client locally guessed.
+    CrossZoneReconnect,
+}
+
+/// Classify an OP_ZoneChange server echo into its ONE disposition — the whole same-zone-vs-cross
+/// decision, as a single total function of the echo. **Server-authoritative** (#554): the client's
+/// local pre-resolution of a translocator's destination is NOT trusted here; only the server's
+/// echoed `zone_id` (against the still-current zone) plus the "I just fired a same-zone
+/// translocator" pending flag decide.
+///
+/// - `SameZoneReposition` requires BOTH the server to echo the CURRENT zone AND a same-zone
+///   translocator to be pending. A translocator the server resolved to a different zone (#554
+///   qeynos2 vault: `echo=1`, `current=2`) fails the `echo == current` test and reconnects — this
+///   is the core fix for the bounce.
+/// - A death/bind respawn also echoes the current zone but sets NO pending flag, so it correctly
+///   reconnects (full re-entry), not repositions.
+///
+/// Because the disposition is a pure function of the echo (and `same_zone_pending` is read
+/// non-consuming, see [`ActionLoop::same_zone_reposition_pending`]), a duplicate / retransmitted
+/// echo classifies IDENTICALLY. That makes the #554 double-cross — first echo → reposition,
+/// duplicate echo → reconnect, so the char did BOTH and bounced — structurally unrepresentable.
+pub(crate) fn classify_zone_change_echo(
+    success: i32,
+    echo_zone_id: u16,
+    current_zone_id: u16,
+    same_zone_pending: bool,
+) -> ZoneChangeEcho {
+    if success != 1 {
+        ZoneChangeEcho::Ignored
+    } else if echo_zone_id == current_zone_id && same_zone_pending {
+        ZoneChangeEcho::SameZoneReposition
+    } else {
+        ZoneChangeEcho::CrossZoneReconnect
+    }
+}
+
 impl ActionLoop {
     /// Takes the M4 domain bundles (see `ipc.rs`) rather than ~59 flat slot params. Each bundle
     /// passed here MUST be a `.clone()` of the SAME bundle `main.rs` also hands to `HttpState` —
@@ -2521,18 +2568,29 @@ impl ActionLoop {
         }
     }
 
-    /// True if a SAME-ZONE walk-in cross fired recently enough that the next `success=1`
-    /// OP_ZoneChange echo is its in-zone reposition (skip the world reconnect, #368). Consumes the
-    /// flag. Bounded to a short window so a stale flag can never suppress a later genuine cross-zone
-    /// or death/bind reconnect: the reposition echo always returns within the round-trip (tens of
-    /// ms), so 1.5s is a 20-50x safety margin over the observed echo latency while still shrinking
-    /// the wrongly-suppressed-reconnect edge ~3x versus the original 5s window (#504, #503 follow-up).
-    pub(crate) fn take_same_zone_reposition(&mut self) -> bool {
+    /// True if a SAME-ZONE walk-in cross fired recently enough that a `success=1` OP_ZoneChange
+    /// echo is its in-zone reposition (skip the world reconnect, #368). **NON-consuming** (#554):
+    /// a duplicate / retransmitted echo must classify the SAME way as the first, so this is a peek,
+    /// not a take — consuming it on the first echo was exactly what let a duplicate fall through to
+    /// a spurious reconnect (the bounce). Bounded to a short window so a stale flag can never
+    /// suppress a later genuine cross-zone or death/bind reconnect: the reposition echo always
+    /// returns within the round-trip (tens of ms), so 1.5s is a 20-50x safety margin over the
+    /// observed echo latency while still shrinking the wrongly-suppressed-reconnect edge ~3x versus
+    /// the original 5s window (#504, #503 follow-up). The window is the only clear; there is no
+    /// consume.
+    pub(crate) fn same_zone_reposition_pending(&self) -> bool {
         const WINDOW_MS: u128 = 1500;
-        match self.same_zone_cross_at.take() {
-            Some(t) if t.elapsed().as_millis() <= WINDOW_MS => true,
-            _ => false,
-        }
+        matches!(self.same_zone_cross_at, Some(t) if t.elapsed().as_millis() <= WINDOW_MS)
+    }
+
+    /// Classify an inbound OP_ZoneChange `success` echo, supplying this loop's live same-zone
+    /// pending flag. The receive side (`gameplay.rs`) calls this ONCE per echo and dispatches on the
+    /// result — a single classify→dispatch, so the #554 double-cross is unrepresentable. See
+    /// [`classify_zone_change_echo`].
+    pub(crate) fn classify_zone_change_echo(
+        &self, success: i32, echo_zone_id: u16, current_zone_id: u16,
+    ) -> ZoneChangeEcho {
+        classify_zone_change_echo(success, echo_zone_id, current_zone_id, self.same_zone_reposition_pending())
     }
 
     /// Send OP_ZONE_CHANGE to request crossing a zone line to `target_zone_id`.
@@ -3016,10 +3074,18 @@ mod tests {
         // in `perform_cross`'s same-zone branch and this assertion goes RED.
         assert_eq!(nav.command.goto_target(), None,
             "a same-zone reposition must STOP nav — leaving the pre-cross goal set drifts into an adjacent zone (#508)");
-        assert!(nav.take_same_zone_reposition(),
+        // The echo (server keeps us in zone HERE) classifies as a same-zone reposition — no
+        // reconnect. NON-consuming (#554): a duplicate/retransmitted echo classifies IDENTICALLY,
+        // so both the peek and the classification stay stable across repeated calls. Mutation check:
+        // making `same_zone_reposition_pending` consume (revert to the old `take`) flips the second
+        // classify to CrossZoneReconnect and this assertion goes RED.
+        assert!(nav.same_zone_reposition_pending(),
             "same-zone cross must flag the echo so the receive side skips the world reconnect (#368)");
-        // Flag is consume-once.
-        assert!(!nav.take_same_zone_reposition(), "the reposition flag is consumed exactly once");
+        assert_eq!(nav.classify_zone_change_echo(1, HERE, HERE), ZoneChangeEcho::SameZoneReposition,
+            "the server echo (current zone) + pending flag → same-zone reposition, no reconnect");
+        assert_eq!(nav.classify_zone_change_echo(1, HERE, HERE), ZoneChangeEcho::SameZoneReposition,
+            "a DUPLICATE echo must classify the SAME — the flag is peeked, never consumed (#554)");
+        assert!(nav.same_zone_reposition_pending(), "the reposition flag is NOT consumed by classifying");
         assert!(stream.sent_app_packets().iter().any(|(op, _)| *op == crate::protocol::OP_ZONE_CHANGE),
             "a same-zone cross still sends OP_ZONE_CHANGE (so the server repositions us)");
 
@@ -3037,8 +3103,10 @@ mod tests {
             "a cross-zone cross must NOT locally reposition (the destination is in the other zone)");
         assert_eq!(nav2.command.goto_target(), Some((100.0, 200.0, 5.0)),
             "a genuine CROSS-zone crossing must NOT clear nav — only the same-zone reposition does (#508)");
-        assert!(!nav2.take_same_zone_reposition(),
+        assert!(!nav2.same_zone_reposition_pending(),
             "a cross-zone cross must NOT flag a reposition — it MUST world-reconnect");
+        assert_eq!(nav2.classify_zone_change_echo(1, OTHER, HERE), ZoneChangeEcho::CrossZoneReconnect,
+            "a genuine cross-zone echo (echo != current) reconnects");
     }
 
     /// The reposition flag is bounded: a stale set (older than the ~1.5s echo window, #504) never
@@ -3048,17 +3116,62 @@ mod tests {
     #[test]
     fn stale_same_zone_flag_does_not_suppress_a_later_reconnect() {
         let mut nav = new_loop();
-        assert!(!nav.take_same_zone_reposition(), "unset flag → no suppression");
+        assert!(!nav.same_zone_reposition_pending(), "unset flag → no suppression");
 
         // Just under the window: still live, must suppress (this is where the real echo lands).
         nav.same_zone_cross_at = Instant::now().checked_sub(std::time::Duration::from_millis(1400));
-        assert!(nav.take_same_zone_reposition(),
+        assert!(nav.same_zone_reposition_pending(),
             "a flag just under the ~1.5s window must still suppress the matching echo");
 
         // Just over the window: expired, must not suppress.
         nav.same_zone_cross_at = Instant::now().checked_sub(std::time::Duration::from_millis(1600));
-        assert!(!nav.take_same_zone_reposition(),
+        assert!(!nav.same_zone_reposition_pending(),
             "a flag older than the ~1.5s window must not suppress a reconnect");
+    }
+
+    /// #554 — the vault double-cross, at the classification boundary. The qeynos2 Knights-of-Truth
+    /// waterfall translocator (index=2) fires: the client locally GUESSED same-zone (dest zone_id=2
+    /// == current), so the same-zone pending flag IS set. But the server resolves the zone point to
+    /// zone_id=1 (South Qeynos) and echoes `success=1 zone_id=1` — TWICE (a retransmit). The old
+    /// code consumed the flag on the first echo (→ reposition, no reconnect) and let the DUPLICATE
+    /// fall through to a world reconnect, so the char did BOTH → bounced to the wrong zone.
+    ///
+    /// Server-authoritative classification fixes it two ways at once:
+    ///   1. the echoed zone_id (1) != current (2) → CrossZoneReconnect even though the client's
+    ///      local guess (and the pending flag) said same-zone;
+    ///   2. the flag is peeked, not consumed, so the duplicate echo classifies IDENTICALLY.
+    /// So BOTH echoes → CrossZoneReconnect, and `world_reconnect_needed` (a set-once bool on the
+    /// receive side) reconnects exactly once. Mutation checks: (a) drop the `echo == current` guard
+    /// (classify same-zone purely on the pending flag) → the first assertion goes RED (it would
+    /// SameZoneReposition and never zone to South Qeynos); (b) revert `same_zone_reposition_pending`
+    /// to a consuming `take` → the duplicate assertion goes RED (duplicate would SameZoneReposition,
+    /// the exact old split-interpretation bounce).
+    #[test]
+    fn vault_translocator_server_resolves_cross_zone_no_double_cross() {
+        const CURRENT: u16 = 2; // qeynos2 (North Qeynos), where we stand
+        const SERVER_DEST: u16 = 1; // qeynos (South Qeynos), what the server actually resolved
+
+        let mut nav = new_loop();
+        // Client locally guessed the translocator was same-zone, so the pending flag is set (as
+        // `perform_cross`'s same-zone branch would).
+        nav.same_zone_cross_at = Some(Instant::now());
+        assert!(nav.same_zone_reposition_pending(), "precondition: the client guessed same-zone");
+
+        // First echo: server says zone_id=1 (a real cross), NOT the current zone 2. Server truth wins.
+        assert_eq!(nav.classify_zone_change_echo(1, SERVER_DEST, CURRENT), ZoneChangeEcho::CrossZoneReconnect,
+            "#554: a translocator the server resolved to a DIFFERENT zone must reconnect, not reposition");
+        // Duplicate/retransmitted echo: MUST classify identically — no split interpretation, no bounce.
+        assert_eq!(nav.classify_zone_change_echo(1, SERVER_DEST, CURRENT), ZoneChangeEcho::CrossZoneReconnect,
+            "#554: the duplicate echo classifies IDENTICALLY (peek, not consume) — no double-cross");
+
+        // Pure-function corners, independent of any ActionLoop state:
+        // A genuine same-zone reposition (server echoes the current zone) with the flag set → skip.
+        assert_eq!(classify_zone_change_echo(1, CURRENT, CURRENT, true), ZoneChangeEcho::SameZoneReposition);
+        // A death/bind respawn also echoes the current zone but sets NO pending flag → reconnect.
+        assert_eq!(classify_zone_change_echo(1, CURRENT, CURRENT, false), ZoneChangeEcho::CrossZoneReconnect,
+            "death/bind respawn echoes the current zone yet must reconnect (no pending flag)");
+        // A failed request is ignored regardless of the flag.
+        assert_eq!(classify_zone_change_echo(0, CURRENT, CURRENT, true), ZoneChangeEcho::Ignored);
     }
 
     fn new_loop() -> ActionLoop {

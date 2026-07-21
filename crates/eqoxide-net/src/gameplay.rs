@@ -9,7 +9,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::{Duration, sleep};
 
 use crate::login::WorldCredentials;
-use crate::action_loop::ActionLoop;
+use crate::action_loop::{ActionLoop, ZoneChangeEcho};
 use crate::packet_handler::apply_packet;
 use crate::protocol::*;
 use crate::transport::{AppPacket, EqStream};
@@ -424,19 +424,22 @@ pub async fn run_gameplay_phase(
                         packet.payload[94], packet.payload[95],
                     ]);
                     tracing::info!("EQ: OP_ZONE_CHANGE server response success={success} zone_id={echo_zone_id}");
-                    if success == 1 {
-                        // #368: a SAME-ZONE walk-in cross (intra-zone translocator) gets a success=1
-                        // echo naming the CURRENT zone, from the server's lightweight `DoZoneSuccess`
-                        // in-zone reposition — the zone session was NOT torn down, so a world
-                        // reconnect here reconnects against a live zone and wedges the connection.
-                        // The action loop flags exactly that case (and already repositioned us);
-                        // skip the reconnect for it. Every OTHER success=1 echo — a genuine
-                        // cross-zone line, a GM #zone, a death/bind respawn — still reconnects, even
-                        // if it happens to name the current zone (the death path echoes the current
-                        // zone too, but never sets this flag).
-                        if action_loop.take_same_zone_reposition() {
+                    // Single, server-authoritative classify→dispatch (#554). The SERVER's echoed
+                    // zone_id (against the still-current zone) — NOT the client's local guess of a
+                    // translocator's destination — decides same-zone-vs-cross. A same-zone
+                    // reposition (#368 intra-zone translocator `DoZoneSuccess`, session NOT torn
+                    // down) skips the world reconnect; every genuine handoff reconnects. Because the
+                    // classification is a total function of the echo and reads the pending flag
+                    // NON-consuming, a duplicate/retransmitted echo classifies IDENTICALLY — so the
+                    // old double-cross (first echo → reposition, duplicate → reconnect → bounce to
+                    // the wrong zone) can no longer happen. `world_reconnect_needed` is set-once
+                    // idempotent, so N duplicate cross echoes still reconnect exactly once.
+                    match action_loop.classify_zone_change_echo(success, echo_zone_id, gs.world.zone_id) {
+                        ZoneChangeEcho::Ignored => {}
+                        ZoneChangeEcho::SameZoneReposition => {
                             tracing::info!("EQ: same-zone in-zone reposition (zone_id={echo_zone_id}) — no world reconnect (#368)");
-                        } else {
+                        }
+                        ZoneChangeEcho::CrossZoneReconnect => {
                             world_reconnect_needed = true;
                         }
                     }
