@@ -1060,15 +1060,11 @@ fn apply_zone_entry(gs: &mut GameState, payload: &[u8]) {
 }
 
 /// EQ class id (1..=16) → name. From EQEmu common/classes.h.
-pub fn class_name(id: u32) -> &'static str {
-    match id {
-        1 => "Warrior", 2 => "Cleric", 3 => "Paladin", 4 => "Ranger",
-        5 => "Shadow Knight", 6 => "Druid", 7 => "Monk", 8 => "Bard",
-        9 => "Rogue", 10 => "Shaman", 11 => "Necromancer", 12 => "Wizard",
-        13 => "Magician", 14 => "Enchanter", 15 => "Beastlord", 16 => "Berserker",
-        _ => "",
-    }
-}
+///
+/// Definition moved DOWN into `eqoxide-core` (#544 Step 2h) so the http layer can resolve it
+/// without up-referencing `eq_net`; re-exported here so `crate::eq_net::packet_handler::class_name`
+/// keeps resolving unchanged.
+pub use eqoxide_core::race_class::class_name;
 
 /// Useful fields parsed from the RoF2 PlayerProfile_Struct wire packet.
 pub struct ProfileInfo {
