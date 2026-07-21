@@ -1436,6 +1436,19 @@ impl Collision {
     /// skip collision/depenetration entirely when no zone mesh is present.
     pub fn has_geometry(&self) -> bool { self.cols != 0 }
 
+    /// The grid has real BOUNDS **and** at least one triangle in it — the same pair of conditions
+    /// [`build_water_grid`] already guards itself with, and what
+    /// `zone_assets::ZoneAssetState::ready` requires before it will call a zone loaded (#579).
+    ///
+    /// **Honest scope:** today this is *equivalent* to [`has_geometry`], because [`Collision::build`]
+    /// already returns `cols: 0` whenever `tris` is empty — so switching `ready()` onto it changed
+    /// no behaviour. It is stated as its own predicate so the "there is a world here" test does not
+    /// silently depend on that internal coupling (`has_geometry` is a *bounds* proxy; this is the
+    /// property actually meant), and so a future change to `build` cannot quietly weaken it. It does
+    /// NOT reject a grid whose only triangles are degenerate — no cheap check distinguishes those,
+    /// and no observed load produces them.
+    pub fn has_triangles(&self) -> bool { self.cols != 0 && !self.tris.is_empty() }
+
     /// Like [`nearest_hit_t`] but also returns the hit triangle's **unit normal**, flipped to
     /// oppose the segment direction (so it faces back toward `from`). Used by [`sweep`] to provide
     /// the slide plane for collide-and-slide. Möller–Trumbore over the broad-phase cells.

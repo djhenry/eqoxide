@@ -74,7 +74,10 @@ impl ZoneAssetState {
                          report as ready".to_string(),
             };
         }
-        if !collision.has_geometry() {
+        // `has_triangles`, NOT `has_geometry`: the latter is `cols != 0`, a BOUNDS proxy that a
+        // single degenerate triangle satisfies. "There is a world here" must not be satisfiable by
+        // a grid that can answer nothing (#595 review).
+        if !collision.has_triangles() {
             return Self::Failed {
                 zone: zone.to_string(),
                 reason: "the zone's collision grid was built but contains NO geometry — nav and \
@@ -171,6 +174,115 @@ impl ZoneAssetState {
     }
 }
 
+/// Why the loaded assets may not be used to describe the world the character is standing in.
+/// `None` from [`usability`] means they may. Every variant's `as_str` is the machine-readable
+/// `reason` an agent reads off the refusal / off `/v1/observe/debug`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NotUsable {
+    /// No zone has been loaded and none is loading.
+    Idle,
+    /// A load is in flight.
+    Pending,
+    /// The load ended without a usable world. Terminal.
+    Failed,
+    /// **The loaded world is a DIFFERENT zone than the one the character is in.**
+    ///
+    /// This is a real, reproducible window, not a theoretical one (#595 review F1): `player.zone`
+    /// is published by the NETWORK thread the moment `OP_NewZone` lands, while the render thread
+    /// only runs [`begin_zone_load`] on its next frame. In between, the client is in zone B while
+    /// the assets — and the collision grid, and the uploaded meshes — are still zone A's, fully
+    /// `Ready`. Reporting `ready` there is worse than reporting nothing: it actively vouches for a
+    /// confident answer about the WRONG WORLD (exit lists and frames of the zone you just left).
+    StaleForPreviousZone,
+    /// The client does not know which zone the character is in (pre-zone-in, or a zone-in that
+    /// timed out — see `PlayerState::zone_in_failed`), so no assets can be matched to it.
+    PlayerZoneUnknown,
+}
+
+impl NotUsable {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle                 => "zone_assets_idle",
+            Self::Pending              => "zone_assets_pending",
+            Self::Failed               => "zone_assets_failed",
+            Self::StaleForPreviousZone => "zone_assets_stale_for_previous_zone",
+            Self::PlayerZoneUnknown    => "player_zone_unknown",
+        }
+    }
+
+    /// The observable `state` word this verdict produces. Deliberately NOT the raw state tag:
+    /// `ready` must never appear for assets that cannot describe the world the character is in.
+    pub fn state_word(self) -> &'static str {
+        match self {
+            Self::Idle                 => "idle",
+            Self::Pending              => "pending",
+            Self::Failed               => "failed",
+            Self::StaleForPreviousZone => "stale",
+            Self::PlayerZoneUnknown    => "unknown_zone",
+        }
+    }
+
+    /// What this verdict means for anything the client says about the world right now.
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::Idle => "no zone has been loaded in this client yet, and no load is running. \
+                           Anything reported about zone geometry, collision or navigability is \
+                           about NOTHING — do not read it as an empty world.",
+            Self::Pending => "the zone's terrain GLB and collision grid are STILL LOADING. The \
+                           frame currently shows a placeholder ground plane and there is no \
+                           collision, so a flat/empty view, an empty exit list, or an unobstructed \
+                           path right now is an artefact of the load — NOT the real zone (#560). \
+                           Poll until this reads `ready`.",
+            Self::Failed => "the zone's assets FAILED to load and no retry is running. The client \
+                           is showing a fallback ground plane with no collision. This is terminal \
+                           for this zone — waiting for `ready` will hang. Nav and geometry answers \
+                           here are unavailable, not empty.",
+            Self::StaleForPreviousZone => "the assets that are loaded belong to a DIFFERENT zone \
+                           than the one the character is in (`zone` vs `player_zone` below). The \
+                           zone change has been received but this client has not started loading \
+                           the new zone's assets yet, so any geometry, exit list or frame right now \
+                           would describe the zone you just LEFT. Transient (one render frame); \
+                           poll until `state` is `ready` and `zone` == `player_zone`.",
+            Self::PlayerZoneUnknown => "this client does not know which zone the character is in \
+                           (before the first zone-in, or a zone-in that timed out — see \
+                           `player.zone_in_failed`), so the loaded assets cannot be matched to it. \
+                           Nothing about the world can be answered honestly here.",
+        }
+    }
+}
+
+/// **The one decision function.** May the loaded assets be used to answer questions about the world
+/// the character is standing in? `None` = yes; `Some(reason)` = no, and here is the machine-readable
+/// why.
+///
+/// It is pure and takes the player's zone explicitly, so the zone-identity check can never be
+/// forgotten by a caller that only had the state handy — and so the universal claim ("a `ready`
+/// observation is never about a zone you are not in") is a property test, not a live run.
+pub fn usability(state: &ZoneAssetState, player_zone: &str) -> Option<NotUsable> {
+    let loaded = match state {
+        ZoneAssetState::Idle       => return Some(NotUsable::Idle),
+        ZoneAssetState::Pending {..} => return Some(NotUsable::Pending),
+        ZoneAssetState::Failed {..}  => return Some(NotUsable::Failed),
+        ZoneAssetState::Ready { zone, .. } => zone.as_str(),
+    };
+    if player_zone.is_empty() { return Some(NotUsable::PlayerZoneUnknown); }
+    // Zone short-names are ASCII and case-insensitive on the wire; compare accordingly rather than
+    // letting a case difference read as "a different zone".
+    if !loaded.eq_ignore_ascii_case(player_zone) { return Some(NotUsable::StaleForPreviousZone); }
+    None
+}
+
+/// Lock a [`ZoneAssetStateShared`], **recovering from poisoning**.
+///
+/// A panic in the zone-asset loader while it holds this lock must not turn every later read into a
+/// panic of its own: the HTTP thread answering `/v1/observe/debug` would then die on the `unwrap`
+/// and the agent would get a connection error in place of the honest `failed` this whole type
+/// exists to deliver. The state behind a poisoned lock is a plain enum with no broken invariant to
+/// protect, so reading it through is safe.
+pub fn lock_state(shared: &ZoneAssetStateShared) -> std::sync::MutexGuard<'_, ZoneAssetState> {
+    shared.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Begin loading `zone`: drop the world model everything else reads AND publish `Pending` for the
 /// new zone, in one call.
 ///
@@ -185,7 +297,7 @@ pub fn begin_zone_load(
     status: &str,
 ) {
     *collision_slot.write().unwrap() = None;
-    *state.lock().unwrap() = ZoneAssetState::pending(zone, status);
+    *lock_state(state) = ZoneAssetState::pending(zone, status);
 }
 
 /// Commit a finished zone load: publish the collision grid and the observable verdict together.
@@ -211,7 +323,7 @@ pub fn finish_zone_load(
     // A load that did not produce a usable world must not leave a collision grid behind for
     // readers to answer from — `Failed` and "here is your collision" cannot both be true.
     *collision_slot.write().unwrap() = verdict.collision().cloned();
-    *state.lock().unwrap() = verdict;
+    *lock_state(state) = verdict;
 }
 
 impl Default for ZoneAssetState {
@@ -291,6 +403,18 @@ mod tests {
         assert!(st.status().unwrap().contains("ZERO terrain meshes"));
     }
 
+    /// Documents the coupling `has_triangles` is stated independently of: `Collision::build`
+    /// currently forces `cols == 0` whenever there are no triangles, so the strict predicate and the
+    /// bounds proxy agree. If a future `build` breaks that, `ready()` is already on the strict one —
+    /// and this test says so out loud rather than leaving the equivalence as folklore.
+    #[test]
+    fn has_triangles_and_has_geometry_agree_for_everything_build_produces() {
+        for col in [floor_collision(), empty_collision()] {
+            assert_eq!(col.has_geometry(), col.has_triangles(),
+                "build() is expected to keep these in step; ready() uses the strict one regardless");
+        }
+    }
+
     /// `Failed` must be distinguishable from `Pending` — a permanent failure reported as "pending
     /// forever" would make an agent wait for something that is never coming.
     #[test]
@@ -366,6 +490,111 @@ mod tests {
         assert_eq!(st.lock().unwrap().tag(), "failed");
         assert!(col.read().unwrap().is_none(),
             "a Failed verdict must not leave a collision grid for nav to answer from");
+    }
+
+    // ─────────── the zone-identity rule (#595 review F1) ───────────
+    //
+    // `docs/http-api.md` claims a `ready` observation is NEVER about a zone you are not in. That is
+    // a universal, so per the verification hierarchy it needs a PROPERTY test — a live run is an
+    // existence proof over one trajectory and cannot discharge a "never". These exercise the single
+    // decision function every consumer goes through.
+
+    /// EXHAUSTIVE over the cross product of every state shape × every player-zone value:
+    /// `usability` returns `None` (= may describe the world) **if and only if** the state is `Ready`
+    /// AND its zone equals the player's non-empty zone. No ordering, no timing, no exceptions.
+    #[test]
+    fn usable_iff_ready_for_the_zone_the_player_is_actually_in() {
+        let zones = ["qeynos", "freporte", "FREPORTE", "gfaydark", ""];
+        let states: Vec<(&str, ZoneAssetState)> = vec![
+            ("idle",    ZoneAssetState::Idle),
+            ("pendA",   ZoneAssetState::pending("qeynos", "loading…")),
+            ("pendB",   ZoneAssetState::pending("freporte", "loading…")),
+            ("failA",   ZoneAssetState::failed("qeynos", "boom")),
+            ("readyA",  ZoneAssetState::ready("qeynos", 3, floor_collision())),
+            ("readyB",  ZoneAssetState::ready("freporte", 3, floor_collision())),
+        ];
+        for (name, st) in &states {
+            for pz in zones {
+                let usable = usability(st, pz).is_none();
+                let expected = matches!(st, ZoneAssetState::Ready { zone, .. }
+                    if !pz.is_empty() && zone.eq_ignore_ascii_case(pz));
+                assert_eq!(usable, expected,
+                    "state {name} with player_zone {pz:?}: usable={usable}, expected={expected}");
+            }
+        }
+    }
+
+    /// The specific F1 capture, as an assertion: standing in qeynos while the previous zone's
+    /// assets are still fully `Ready` must NOT read as ready — and must name the reason, so an
+    /// agent can tell "wrong world" from "no world".
+    #[test]
+    fn ready_for_the_previous_zone_is_never_usable_in_the_new_one() {
+        let st = ZoneAssetState::ready("freporte", 412, floor_collision());
+        assert!(st.is_ready(), "the state itself IS ready — that is exactly the trap");
+        assert_eq!(usability(&st, "qeynos"), Some(NotUsable::StaleForPreviousZone));
+        assert_eq!(NotUsable::StaleForPreviousZone.as_str(), "zone_assets_stale_for_previous_zone");
+        assert_eq!(NotUsable::StaleForPreviousZone.state_word(), "stale");
+        assert_eq!(usability(&st, "freporte"), None, "…and honest once the zones agree");
+    }
+
+    /// The window is created by two independent writers (the NET thread publishes `player.zone` on
+    /// OP_NewZone; the RENDER thread calls `begin_zone_load` on its next frame). Simulate EVERY
+    /// interleaving of those two writes around a zone change and assert no ordering can produce a
+    /// usable verdict for a zone the character is not in.
+    #[test]
+    fn no_interleaving_of_the_two_writers_yields_a_usable_wrong_zone() {
+        for net_first in [true, false] {
+            for render_lag_frames in 0..4 {
+                let (col, st) = slots();
+                finish_zone_load(&col, &st, "freporte", Some(floor_collision()), 9, None);
+                let mut player_zone = "freporte".to_string();
+
+                let mut apply_net    = |pz: &mut String| *pz = "qeynos".to_string();
+                let apply_render = |st: &ZoneAssetStateShared, col: &crate::collision::SharedCollision| {
+                    begin_zone_load(col, st, "qeynos", "loading…");
+                };
+                if net_first {
+                    apply_net(&mut player_zone);
+                    // The render thread lags by N frames; the agent may poll in ANY of them.
+                    for _ in 0..render_lag_frames {
+                        let s = lock_state(&st).clone();
+                        assert!(usability(&s, &player_zone).is_some(),
+                            "net-first, lag {render_lag_frames}: reported usable while the loaded \
+                             zone is still the one we LEFT");
+                    }
+                    apply_render(&st, &col);
+                } else {
+                    apply_render(&st, &col);
+                    for _ in 0..render_lag_frames {
+                        let s = lock_state(&st).clone();
+                        assert!(usability(&s, &player_zone).is_some(),
+                            "render-first, lag {render_lag_frames}: reported usable mid-change");
+                    }
+                    apply_net(&mut player_zone);
+                }
+                let s = lock_state(&st).clone();
+                assert!(usability(&s, &player_zone).is_some(), "still loading the new zone");
+                finish_zone_load(&col, &st, "qeynos", Some(floor_collision()), 5, None);
+                let s = lock_state(&st).clone();
+                assert!(usability(&s, &player_zone).is_none(), "…and usable once it lands");
+            }
+        }
+    }
+
+    /// A poisoned state mutex (a loader panicked holding it) must still be READABLE — otherwise the
+    /// HTTP thread panics on the `unwrap` and the agent gets a connection error in place of the
+    /// honest `failed` this type exists to deliver (#595 review F3).
+    #[test]
+    fn a_poisoned_state_lock_is_still_readable() {
+        let st: ZoneAssetStateShared =
+            Arc::new(std::sync::Mutex::new(ZoneAssetState::pending("qeynos", "loading…")));
+        let poisoner = st.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = poisoner.lock().unwrap();
+            panic!("loader died holding the state lock");
+        }).join();
+        assert!(st.is_poisoned(), "precondition: the lock really is poisoned");
+        assert_eq!(lock_state(&st).tag(), "pending", "a poisoned lock must not become a second failure");
     }
 
     #[test]

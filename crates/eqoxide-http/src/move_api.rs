@@ -248,11 +248,14 @@ async fn post_goto(
     // rather than letting the caller read "navigating" as "a walkable route was found". The goal is
     // still accepted: the walker holds it at `nav_state: "zone_loading"` and plans for real the
     // moment the assets land.
-    let assets_pending = (!s.zone_assets.lock().unwrap().is_ready()).then(|| {
-        "the zone's terrain/collision are NOT loaded yet, so nothing has been routed — nav_state \
-         will read \"zone_loading\" until GET /v1/observe/debug reports zone_assets.state == \
-         \"ready\", then this goal is planned normally. (If it reads \"failed\", it never will.)"
-    });
+    let assets_pending = {
+        let st = eqoxide_nav::zone_assets::lock_state(&s.zone_assets).clone();
+        eqoxide_nav::zone_assets::usability(&st, &s.player().zone).map(|why| format!(
+            "the zone's terrain/collision are NOT usable here ({}), so nothing has been routed — \
+             nav_state will read \"zone_loading\" until GET /v1/observe/debug reports \
+             zone_assets.state == \"ready\", then this goal is planned normally. (If it reads \
+             \"failed\", it never will.)", why.as_str()))
+    };
     json(StatusCode::OK, serde_json::json!({
         "status": "navigating",
         "goal": [target.0, target.1, target.2],

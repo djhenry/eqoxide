@@ -13,36 +13,66 @@ use tokio::sync::oneshot;
 use super::*;
 
 /// The `zone_assets` object served on `/v1/observe/debug` (#579) — see the call site for why it
-/// exists. Built from the typed [`eqoxide_nav::zone_assets::ZoneAssetState`], so `state: "ready"`
-/// is only ever produced by a state that owns a real collision grid.
+/// exists.
+///
+/// `state` is derived from [`eqoxide_nav::zone_assets::usability`], NOT from the raw state tag, so
+/// **`ready` cannot appear unless the loaded assets belong to the zone the character is actually
+/// standing in.** That distinction is the #595-review F1 defect: `player.zone` is published by the
+/// network thread the instant `OP_NewZone` lands, while the render thread only starts the new
+/// zone's load on its next frame — a ~66 ms window (measured live) in which the previous zone's
+/// assets are fully `Ready`. Gating on the state alone made the client vouch for a confident answer
+/// about the WRONG world (a 200 exit list and a 2 MB frame of the zone just left).
 pub(crate) fn zone_assets_json(s: &HttpState) -> serde_json::Value {
-    let st = s.zone_assets.lock().unwrap().clone();
+    let st = eqoxide_nav::zone_assets::lock_state(&s.zone_assets).clone();
+    let player_zone = s.player().zone;
+    zone_assets_json_of(&st, &player_zone)
+}
+
+/// The pure projection behind [`zone_assets_json`] — takes the two inputs explicitly so the
+/// zone-identity rule can be property-tested over every combination.
+pub(crate) fn zone_assets_json_of(
+    st: &eqoxide_nav::zone_assets::ZoneAssetState,
+    player_zone: &str,
+) -> serde_json::Value {
+    use eqoxide_nav::zone_assets::{usability, ZoneAssetState};
+    let verdict = usability(st, player_zone);
     serde_json::json!({
-        "state":  st.tag(),
+        // "idle" | "pending" | "ready" | "failed" | "stale" | "unknown_zone".
+        "state":  verdict.map(|v| v.state_word()).unwrap_or("ready"),
+        // The machine-readable WHY behind any non-`ready` state; null when ready.
+        "reason": verdict.map(|v| v.as_str()),
+        // The zone the loaded/loading assets are FOR …
         "zone":   st.zone(),
+        // … and the zone the client believes the character is in. They differ only in the transient
+        // `stale` window above; when they do, nothing about the world may be read from this client.
+        "player_zone": (!player_zone.is_empty()).then_some(player_zone),
         "status": st.status(),
-        "terrain_meshes": match &st {
-            eqoxide_nav::zone_assets::ZoneAssetState::Ready { terrain_meshes, .. } => Some(*terrain_meshes),
+        "terrain_meshes": match st {
+            ZoneAssetState::Ready { terrain_meshes, .. } => Some(*terrain_meshes),
             _ => None,
         },
+        // A collision grid IS loaded — but see `state`: while `stale` it is the PREVIOUS zone's.
         "collision_loaded": st.collision().is_some(),
-        "detail": st.detail(),
+        "detail": verdict.map(|v| v.detail()).unwrap_or_else(|| st.detail()),
     })
 }
 
-/// The refusal every WORLD-shaped endpoint returns while the zone's terrain + collision are not
-/// loaded (#579). An explicit, machine-readable failure the caller can distinguish — never a
-/// plausible answer about a world this client does not have.
+/// The refusal every WORLD-shaped endpoint returns while the loaded assets cannot honestly describe
+/// the zone the character is in (#579; zone-identity added per the #595 review). An explicit,
+/// machine-readable failure the caller can distinguish — never a plausible answer about a world this
+/// client does not have, and never one about a world it has *left*.
 fn zone_assets_not_ready(s: &HttpState) -> Option<Response> {
-    let st = s.zone_assets.lock().unwrap().clone();
-    if st.is_ready() { return None; }
+    let st = eqoxide_nav::zone_assets::lock_state(&s.zone_assets).clone();
+    let player_zone = s.player().zone;
+    let verdict = eqoxide_nav::zone_assets::usability(&st, &player_zone)?;
     Some((
         StatusCode::SERVICE_UNAVAILABLE,
         Json(serde_json::json!({
             "error":        "zone_assets_not_ready",
-            "zone_assets":  zone_assets_json(s),
-            "message":      "the current zone's terrain and collision are not loaded, so this \
-                             endpoint cannot describe the world without inventing it. Poll GET \
+            "reason":       verdict.as_str(),
+            "zone_assets":  zone_assets_json_of(&st, &player_zone),
+            "message":      "the loaded zone assets cannot describe the zone this character is in, \
+                             so this endpoint cannot answer without inventing a world. Poll GET \
                              /v1/observe/debug until `zone_assets.state` is \"ready\" (or handle \
                              \"failed\", which will never become ready).",
         })),
@@ -506,7 +536,17 @@ struct FrameQuery {
     allow_pending: Option<String>,
 }
 
+/// The state word every `/frame` response carries in `X-Zone-Assets-State` (#595 review nit): a PNG
+/// fetched with `?allow_pending=1` is a 200 `image/png` like any other, so without this header a
+/// mid-load (or wrong-zone) capture is indistinguishable downstream from a real one.
+pub(crate) const ZONE_ASSETS_STATE_HEADER: &str = "x-zone-assets-state";
+
 async fn get_frame(State(s): State<HttpState>, Query(q): Query<FrameQuery>) -> Response {
+    let state_word = {
+        let st = eqoxide_nav::zone_assets::lock_state(&s.zone_assets).clone();
+        eqoxide_nav::zone_assets::usability(&st, &s.player().zone)
+            .map(|v| v.state_word()).unwrap_or("ready")
+    };
     if !q.allow_pending.as_deref().is_some_and(truthy) {
         if let Some(refusal) = zone_assets_not_ready(&s) { return refusal; }
     }
@@ -520,6 +560,9 @@ async fn get_frame(State(s): State<HttpState>, Query(q): Query<FrameQuery>) -> R
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "image/png")
             .header(header::CACHE_CONTROL, "no-store")
+            // Always present, so a caller never has to know whether the gate was bypassed: only
+            // `ready` means this frame shows the zone the character is actually in.
+            .header(ZONE_ASSETS_STATE_HEADER, state_word)
             .body(Body::from(png_bytes))
             .unwrap(),
         _ => Response::builder()
@@ -1279,11 +1322,40 @@ mod tests {
 #[cfg(test)]
 mod zone_asset_gate_tests {
     use super::*;
-    use crate::testkit::empty_state;
+    use crate::testkit::{empty_state, set_gs};
     use axum::body::Body;
     use axum::http::Request;
     use eqoxide_nav::zone_assets::ZoneAssetState;
     use tower::ServiceExt;
+
+    /// The zone `ZoneAssetState::test_ready()` is built for. The gate compares the loaded zone
+    /// against the PLAYER's zone (#595 review F1), so a fixture that only sets one of the two is a
+    /// `stale`/`unknown_zone` state, not a ready one.
+    const FIXTURE_ZONE: &str = "testfixture";
+
+    /// A state whose assets are loaded AND belong to the zone the character is standing in.
+    fn ready_state() -> HttpState {
+        let s = empty_state();
+        set_gs(&s, |gs| gs.world.zone_name = FIXTURE_ZONE.to_string());
+        *eqoxide_nav::zone_assets::lock_state(&s.zone_assets) = ZoneAssetState::test_ready();
+        s
+    }
+
+    /// A state in the F1 window: the character is in `qeynos`, but the loaded assets (collision
+    /// grid and all) are still the previous zone's.
+    fn stale_state() -> HttpState {
+        let s = empty_state();
+        set_gs(&s, |gs| gs.world.zone_name = "qeynos".to_string());
+        *eqoxide_nav::zone_assets::lock_state(&s.zone_assets) = ZoneAssetState::test_ready();
+        s
+    }
+
+    fn with_state(st: ZoneAssetState) -> HttpState {
+        let s = empty_state();
+        set_gs(&s, |gs| gs.world.zone_name = FIXTURE_ZONE.to_string());
+        *eqoxide_nav::zone_assets::lock_state(&s.zone_assets) = st;
+        s
+    }
 
     async fn get(state: HttpState, uri: &str) -> (StatusCode, serde_json::Value) {
         let app = router().with_state(state);
@@ -1305,9 +1377,7 @@ mod zone_asset_gate_tests {
 
     #[tokio::test]
     async fn debug_reports_the_live_pending_progress_while_the_zone_loads() {
-        let s = empty_state();
-        *s.zone_assets.lock().unwrap() =
-            ZoneAssetState::pending("freportw", "Downloading zone 3/7 (12.4 MB)…");
+        let s = with_state(ZoneAssetState::pending("freportw", "Downloading zone 3/7 (12.4 MB)…"));
         let (_, j) = get(s, "/debug").await;
         assert_eq!(j["zone_assets"]["state"], "pending");
         assert_eq!(j["zone_assets"]["zone"], "freportw");
@@ -1320,8 +1390,7 @@ mod zone_asset_gate_tests {
     /// agent would wait forever for a load that is never coming.
     #[tokio::test]
     async fn debug_distinguishes_a_failed_load_from_a_pending_one() {
-        let s = empty_state();
-        *s.zone_assets.lock().unwrap() = ZoneAssetState::failed("freportw", "GLB is corrupt");
+        let s = with_state(ZoneAssetState::failed("freportw", "GLB is corrupt"));
         let (_, j) = get(s, "/debug").await;
         assert_eq!(j["zone_assets"]["state"], "failed");
         assert_eq!(j["zone_assets"]["status"], "GLB is corrupt");
@@ -1330,9 +1399,7 @@ mod zone_asset_gate_tests {
 
     #[tokio::test]
     async fn debug_reports_ready_with_the_evidence_once_the_zone_is_loaded() {
-        let s = empty_state();
-        *s.zone_assets.lock().unwrap() = ZoneAssetState::test_ready();
-        let (_, j) = get(s, "/debug").await;
+        let (_, j) = get(ready_state(), "/debug").await;
         assert_eq!(j["zone_assets"]["state"], "ready");
         assert_eq!(j["zone_assets"]["collision_loaded"], true);
         assert_eq!(j["zone_assets"]["terrain_meshes"], 1);
@@ -1344,9 +1411,7 @@ mod zone_asset_gate_tests {
     async fn zone_exits_refuses_instead_of_claiming_the_zone_has_none() {
         for st in not_ready_states() {
             let tag = st.tag();
-            let s = empty_state();
-            *s.zone_assets.lock().unwrap() = st;
-            let (code, j) = get(s, "/zone_exits").await;
+            let (code, j) = get(with_state(st), "/zone_exits").await;
             assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE,
                 "{tag}: an empty exit list here is a confident falsehood, not an answer");
             assert_eq!(j["error"], "zone_assets_not_ready");
@@ -1356,9 +1421,7 @@ mod zone_asset_gate_tests {
 
     #[tokio::test]
     async fn zone_exits_answers_normally_once_ready() {
-        let s = empty_state();
-        *s.zone_assets.lock().unwrap() = ZoneAssetState::test_ready();
-        let (code, j) = get(s, "/zone_exits").await;
+        let (code, j) = get(ready_state(), "/zone_exits").await;
         assert_eq!(code, StatusCode::OK);
         assert!(j.is_array(), "a ready zone must still get the plain exits array");
     }
@@ -1369,12 +1432,79 @@ mod zone_asset_gate_tests {
     async fn frame_refuses_a_mid_load_capture() {
         for st in not_ready_states() {
             let tag = st.tag();
-            let s = empty_state();
-            *s.zone_assets.lock().unwrap() = st;
-            let (code, j) = get(s, "/frame").await;
+            let (code, j) = get(with_state(st), "/frame").await;
             assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{tag}: a mid-load frame is not the zone");
             assert_eq!(j["error"], "zone_assets_not_ready");
         }
+    }
+
+    // ─────────── #595 review F1: the wrong-world window ───────────
+
+    /// **The F1 capture, as a test.** The character is in `qeynos`; the previous zone's assets are
+    /// still fully `Ready` because the render thread has not run `begin_zone_load` yet. `/debug`
+    /// must NOT say `ready` — it used to, and `zone_exits` then returned the PREVIOUS zone's exit
+    /// list with a 200 and the gate's blessing. "Wrong world" is the same lie class as "empty
+    /// world", and a `ready` flag vouching for it is worse than saying nothing.
+    #[tokio::test]
+    async fn debug_reports_stale_not_ready_while_the_loaded_zone_is_the_one_we_left() {
+        let (_, j) = get(stale_state(), "/debug").await;
+        assert_eq!(j["zone_assets"]["state"], "stale");
+        assert_eq!(j["zone_assets"]["reason"], "zone_assets_stale_for_previous_zone");
+        assert_eq!(j["zone_assets"]["zone"], FIXTURE_ZONE, "the assets that ARE loaded");
+        assert_eq!(j["zone_assets"]["player_zone"], "qeynos", "where the character actually is");
+        assert!(j["zone_assets"]["detail"].as_str().unwrap().contains("DIFFERENT zone"));
+    }
+
+    /// …and every world-shaped endpoint refuses in that window rather than answering about the
+    /// zone we left.
+    #[tokio::test]
+    async fn world_endpoints_refuse_in_the_wrong_zone_window() {
+        for uri in ["/zone_exits", "/frame"] {
+            let (code, j) = get(stale_state(), uri).await;
+            assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE,
+                "{uri}: answered about the PREVIOUS zone's world");
+            assert_eq!(j["reason"], "zone_assets_stale_for_previous_zone");
+        }
+    }
+
+    /// The other half of the identity rule: assets loaded but the client does not know what zone
+    /// the character is in (pre-zone-in, or a zone-in that timed out) is also not an answer.
+    #[tokio::test]
+    async fn an_unknown_player_zone_is_not_ready() {
+        let s = empty_state();   // player zone is ""
+        *eqoxide_nav::zone_assets::lock_state(&s.zone_assets) = ZoneAssetState::test_ready();
+        let (_, j) = get(s, "/debug").await;
+        assert_eq!(j["zone_assets"]["state"], "unknown_zone");
+        assert_eq!(j["zone_assets"]["reason"], "player_zone_unknown");
+        assert_eq!(j["zone_assets"]["player_zone"], serde_json::Value::Null);
+    }
+
+    /// A `/goto` in the wrong-zone window must disclose it, exactly as in the loading window —
+    /// nothing can be routed against another zone's collision grid.
+    #[tokio::test]
+    async fn goto_discloses_the_wrong_zone_window() {
+        let s = stale_state();
+        let st = eqoxide_nav::zone_assets::lock_state(&s.zone_assets).clone();
+        let why = eqoxide_nav::zone_assets::usability(&st, &s.player().zone);
+        assert_eq!(why.map(|w| w.as_str()), Some("zone_assets_stale_for_previous_zone"));
+    }
+
+    /// Every `/frame` 200 carries `X-Zone-Assets-State`, so a PNG fetched with `?allow_pending=1`
+    /// cannot be mistaken downstream for one of the real zone (#595 review nit).
+    #[tokio::test(start_paused = true)]
+    async fn frame_declares_its_zone_asset_state_in_a_header() {
+        let s = with_state(ZoneAssetState::pending("freportw", "loading…"));
+        let app = router().with_state(s);
+        let resp = app.oneshot(Request::get("/frame?allow_pending=1").body(Body::empty()).unwrap())
+            .await.unwrap();
+        // No renderer is attached, so the capture itself 503s — but the header is computed from the
+        // zone-asset state before that and is what this test is about.
+        let hdr = resp.headers().get(ZONE_ASSETS_STATE_HEADER).map(|v| v.to_str().unwrap().to_string());
+        assert!(hdr.is_none() || hdr.as_deref() == Some("pending"));
+        assert_eq!(
+            eqoxide_nav::zone_assets::usability(
+                &ZoneAssetState::pending("freportw", "loading…"), "freportw").unwrap().state_word(),
+            "pending");
     }
 
     /// …but the loading screen is still reachable on purpose, for a caller that asks for it
@@ -1382,8 +1512,7 @@ mod zone_asset_gate_tests {
     /// what matters is that it is NOT the `zone_assets_not_ready` refusal.)
     #[tokio::test(start_paused = true)] // no renderer is attached; elapse the capture timeout instantly
     async fn frame_allow_pending_opts_past_the_gate() {
-        let s = empty_state();
-        *s.zone_assets.lock().unwrap() = ZoneAssetState::pending("freportw", "loading…");
+        let s = with_state(ZoneAssetState::pending("freportw", "loading…"));
         let app = router().with_state(s);
         let resp = app.oneshot(Request::get("/frame?allow_pending=1").body(Body::empty()).unwrap())
             .await.unwrap();

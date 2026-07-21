@@ -225,8 +225,10 @@ which a later load on the same code refuted.
 
 ```jsonc
 "zone_assets": {
-  "state": "pending",            // "idle" | "pending" | "ready" | "failed"
-  "zone": "freportw",
+  "state": "pending",            // "idle" | "pending" | "ready" | "failed" | "stale" | "unknown_zone"
+  "reason": "zone_assets_pending",   // machine-readable why; null when ready
+  "zone": "freportw",            // the zone the loaded/loading assets are FOR
+  "player_zone": "freportw",     // the zone the client believes the character is in
   "status": "Downloading zone 3/7 (12.4 MB)…",   // live loader progress; failure reason when failed
   "terrain_meshes": null,        // mesh count, only when ready
   "collision_loaded": false,
@@ -235,21 +237,52 @@ which a later load on the same code refuted.
 ```
 
 - **`ready`** is the only state in which the client's answers about zone geometry, exits, or
-  navigability are about the real zone. It cannot be published without a terrain mesh count **and** a
-  collision grid with geometry — it always carries its own evidence.
-- **`pending`** — keep polling. It resets to `pending` on **every** zone change, in the same commit
-  that drops the previous zone's collision, so it can never read stale-`ready` for a zone you left.
+  navigability are about the real zone. It requires **both** that a terrain mesh count and a
+  collision grid with geometry exist (`Ready` cannot be constructed without them) **and** that
+  `zone == player_zone`.
+- **`pending`** — keep polling. It is published on every zone change, in the same call that drops the
+  previous zone's collision.
 - **`failed`** is deliberately *not* folded into `pending`: the load is over and will not retry, so
-  waiting for `ready` would hang forever. `status` says why.
-- **`idle`** — no zone loaded and none loading (before the first zone-in).
+  waiting for `ready` would hang forever. `status` says why. The client also declares a load failed
+  if its loader thread panicked or its result was lost, so `pending` cannot persist with nothing
+  behind it.
+- **`stale`** — *the assets that are loaded belong to a different zone than the one the character is
+  in.* `player.zone` is published by the network thread the instant `OP_NewZone` arrives, while the
+  render thread starts the new zone's load on its next frame; in between (~66 ms, measured live) the
+  previous zone's assets are still fully loaded. Answering then would describe the zone you just
+  **left** — a wrong world, which is the same lie class as an empty one. Transient; poll on.
+- **`unknown_zone`** — the client does not know which zone the character is in (before the first
+  zone-in, or a zone-in that timed out — see `player.zone_in_failed`), so no assets can be matched
+  to it.
+- **`idle`** — no zone loaded and none loading.
+
+> **The guarantee, and how it is verified.** *A `ready` observation is never about a zone the
+> character is not in.* This is a universal, so it is held by a **property test**, not by a live run
+> (a live run is an existence proof over one trajectory): `eqoxide_nav::zone_assets::usability` is
+> the single decision function every consumer goes through, and
+> `usable_iff_ready_for_the_zone_the_player_is_actually_in` asserts over the full cross product of
+> state shapes × player-zone values that it returns "usable" **iff** the state is `Ready` and its
+> zone equals the player's non-empty zone, while
+> `no_interleaving_of_the_two_writers_yields_a_usable_wrong_zone` does the same across every
+> interleaving of the two threads that write those values.
 
 **Two endpoints refuse rather than answer while this is not `ready`,** with
-`503 {"error": "zone_assets_not_ready", "zone_assets": {…}}`:
+`503 {"error": "zone_assets_not_ready", "reason": "…", "zone_assets": {…}}`:
 
 | Endpoint | Why |
 |---|---|
-| `GET /v1/observe/zone_exits` | Exits come out of the collision grid; before it exists this returned a confident `[]` — "this zone has no exits at all". |
-| `GET /v1/observe/frame` | A PNG of the placeholder ground plane is indistinguishable from a genuinely empty zone. Pass **`?allow_pending=1`** if the loading screen is what you actually want. |
+| `GET /v1/observe/zone_exits` | Exits come out of the collision grid; before it exists this returned a confident `[]` — "this zone has no exits at all" — and during `stale` it returned the *previous* zone's exits. |
+| `GET /v1/observe/frame` | A PNG of the placeholder ground plane is indistinguishable from a genuinely empty zone, and a `stale` frame shows the zone you left. Pass **`?allow_pending=1`** if the loading screen is what you actually want. |
+
+Every `200` from `/v1/observe/frame` also carries **`X-Zone-Assets-State:`** with the same word as
+`zone_assets.state`, so a PNG fetched with `?allow_pending=1` cannot be mistaken downstream for one
+of the real zone. Only `ready` means the image shows the zone the character is in.
+
+**Endpoints that are deliberately NOT gated**, because they do not read zone geometry or collision
+and are honest during a load: `/v1/observe/doors` and `/v1/observe/zone_entrances` (both are
+server-pushed lists, not derived from the collision grid), and `/v1/move/manual` and `/v1/move/jump`
+(they drive the controller directly and make no routing claim — though with no collision loaded the
+character is moving through a world the client has not built, so prefer waiting for `ready`).
 
 `POST /v1/move/goto` still accepts the goal, but its response carries a non-null
 **`zone_assets_pending`** note while the assets are missing, and `nav_state` reads `zone_loading`

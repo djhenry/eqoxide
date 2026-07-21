@@ -22,6 +22,9 @@ use crate::{assets, debug_zone, hud, zone_map};
 
 /// Data produced by the background zone-load thread, ready for GPU upload on the main thread.
 struct PendingLoad {
+    /// Monotonic id of the load that produced this result (#595 review F3), so a slow OLD loader
+    /// cannot overwrite a NEWER one's reply in the single handoff slot.
+    gen: u64,
     zone_name: String,
     /// None means the S3D failed to load; use the fallback ground plane instead.
     assets:    Option<assets::ZoneAssets>,
@@ -32,6 +35,33 @@ struct PendingLoad {
     zone_map:  Option<zone_map::ZoneMap>,
     zone_min:  [f32; 2],
     zone_max:  [f32; 2],
+}
+
+/// Hand a finished load to the main thread, refusing to displace a NEWER load's result (#595
+/// review F3). The handoff is a SINGLE slot shared by every loader, so an unconditional write let a
+/// slow OLD loader clobber a newer zone's already-published reply; the main thread then dropped the
+/// stale one on its zone check and nothing ever arrived for the zone the character was in — an
+/// eternal `Pending`.
+fn publish_load(slot: &Arc<Mutex<Option<PendingLoad>>>, gen: u64, load: PendingLoad) {
+    let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+    match slot.as_ref() {
+        Some(existing) if existing.gen > gen => tracing::warn!(
+            "APP: load #{gen} ('{}') finished after newer load #{} — discarding it rather than \
+             overwriting the newer result", load.zone_name, existing.gen),
+        _ => *slot = Some(load),
+    }
+}
+
+/// The `watch_for_lost_load` decision, pure so it can be tested (#595 review F3). `Some(zone)` means
+/// the state is stuck `Pending` for `zone` and no loader is left that could ever report it — a
+/// panic, or a reply clobbered in the handoff slot. `None` means leave it alone: either a loader is
+/// still working (however slow) or the state is already terminal.
+fn lost_load_zone(any_loader_alive: bool, st: &crate::nav::zone_assets::ZoneAssetState) -> Option<String> {
+    if any_loader_alive { return None; }
+    match st {
+        crate::nav::zone_assets::ZoneAssetState::Pending { zone, .. } => Some(zone.clone()),
+        _ => None,
+    }
 }
 
 /// Result of a left-click pick test: the nearest entity or door the ray hit, if any.
@@ -201,6 +231,13 @@ pub struct App {
     /// in the very same block that drops the old collision — and only reaches `Ready` in
     /// `maybe_finish_load`, where the meshes are uploaded and the collision grid exists to hand it.
     zone_assets: crate::nav::zone_assets::ZoneAssetStateShared,
+    /// Live handles to the spawned zone-asset loader threads (#595 review F3). Kept ONLY so
+    /// `watch_for_lost_load` can tell "the download is slow" (thread still running — leave it
+    /// alone, however long it takes) from "the result can never arrive" (every loader has exited
+    /// and nothing was published — a panic, or a clobbered handoff slot). Pruned as they finish.
+    load_threads: Vec<std::thread::JoinHandle<()>>,
+    /// Monotonic zone-load counter handed to each loader — see `PendingLoad::gen`.
+    load_gen: u64,
     /// Most recent floor_z result. Used as the anchor for the next frame's floor_z query
     /// so the player's visual height is self-consistent and can't be pulled up to a bridge
     /// or ceiling just because the server placed them there.
@@ -335,6 +372,7 @@ impl App {
             pick_screen_h: 600,
             scene: SceneState::default(), last_inbound: std::time::Instant::now(), frame_req,
             frame_profile_shared, shutdown, collision: None, shared_collision, zone_assets,
+            load_threads: Vec::new(), load_gen: 0,
             last_grounded_z: 0.0,
             prev_render_pos: [0.0, 0.0, 0.0],
             entity_motion: std::collections::HashMap::new(),
@@ -476,7 +514,16 @@ impl App {
 
     fn reload_zone(&mut self) {
         let zone_name = self.scene.zone.clone();
-        if self.gpu.is_none() { self.loading = false; return; }
+        if self.gpu.is_none() {
+            // No renderer yet, so no load will be started — and nothing else will ever move the
+            // state off `Pending`. Say so terminally rather than leaving an agent to poll forever.
+            *crate::nav::zone_assets::lock_state(&self.zone_assets) =
+                crate::nav::zone_assets::ZoneAssetState::failed(&zone_name,
+                    "the renderer was not initialised when this zone change arrived, so no asset \
+                     load was started. No retry is running.");
+            self.loading = false;
+            return;
+        }
 
         self.vert_vel  = 0.0;
         self.on_ground = true;
@@ -489,7 +536,7 @@ impl App {
             }
             // NOT `Ready`: the debug zone builds no collision grid at all, so every nav/collision
             // answer here is unavailable — reporting "ready" would be the #579 lie in miniature.
-            *self.zone_assets.lock().unwrap() = crate::nav::zone_assets::ZoneAssetState::failed(
+            *crate::nav::zone_assets::lock_state(&self.zone_assets) = crate::nav::zone_assets::ZoneAssetState::failed(
                 "testzone",
                 "testzone is an in-memory DEBUG zone: its terrain is synthetic and NO collision \
                  grid is built, so nav/collision answers are unavailable (not empty).");
@@ -504,6 +551,12 @@ impl App {
         let pending     = self.pending_load.clone();
         // #579: the loader thread is the LIVE writer of the pending progress line an agent polls.
         let za_state    = self.zone_assets.clone();
+        // Monotonic load id (#595 review F3). The handoff is a SINGLE slot shared by every loader,
+        // so an older loader finishing late could overwrite a newer one's already-published result;
+        // the newer zone's reply was then gone for good and the state hung on `Pending`. A loader
+        // may only write the slot if it is not displacing a NEWER load.
+        self.load_gen += 1;
+        let load_gen = self.load_gen;
         let url  = self.asset_server_url.clone();
         let user = self.asset_user.clone();
         let pass = self.asset_pass.clone();
@@ -511,7 +564,18 @@ impl App {
         *load_status.lock().unwrap() = "Connecting to asset server…".to_string();
 
         // Named for the #380 crash-log panic hook — see `crash` module docs.
-        std::thread::Builder::new().name("zone-asset-loader".into()).spawn(move || {
+        let handle = std::thread::Builder::new().name("zone-asset-loader".into()).spawn(move || {
+            // #595 review F3: a panic anywhere below (a corrupt GLB in `from_glb`, an arithmetic
+            // trap in `Collision::build`) used to unwind past the ONLY write to `pending_load`,
+            // leaving the observable state on `Pending` with a frozen status line FOREVER — the
+            // exact "waiting for a `ready` that is never coming" this type exists to prevent. Catch
+            // it and hand back a normal failed result so the usual path publishes an honest
+            // `Failed` (with the panic message) and clears the loading screen.
+            let zone_for_panic = zone_name.clone();
+            let pending_for_panic = pending.clone();
+            let load_status_for_panic = load_status.clone();
+            let za_for_panic = za_state.clone();
+            let body = std::panic::AssertUnwindSafe(move || {
             // Mirrors the loading-screen text into the agent-observable `zone_assets` state (#579),
             // but ONLY while that state is still Pending for THIS zone — a loader left over from a
             // previous zone must never overwrite the current zone's state with its own progress.
@@ -571,17 +635,47 @@ impl App {
             let zone_map = zone_map::ZoneMap::load(&maps_dir, &zone_name);
 
             set_status("Uploading to GPU…");
-            *pending.lock().unwrap() = Some(PendingLoad {
-                zone_name, assets: opt_assets, load_error, collision, zone_map, zone_min, zone_max,
+            publish_load(&pending, load_gen, PendingLoad {
+                gen: load_gen, zone_name, assets: opt_assets, load_error, collision, zone_map,
+                zone_min, zone_max,
             });
+            });
+            if std::panic::catch_unwind(body).is_err() {
+                let reason = "the zone-asset loader thread PANICKED while loading this zone \
+                              (see the crash log). No retry is running.";
+                tracing::error!("APP: zone-asset loader panicked for '{zone_for_panic}'");
+                // Route it through the normal handoff so the main thread publishes `Failed`, drops
+                // the loading screen and shows the fallback ground — one code path, one verdict.
+                *load_status_for_panic.lock().unwrap_or_else(|e| e.into_inner()) = String::new();
+                let _ = &za_for_panic; // the verdict is published by `finish_zone_load` on the main thread
+                publish_load(&pending_for_panic, load_gen, PendingLoad {
+                    gen: load_gen, zone_name: zone_for_panic, assets: None,
+                    load_error: Some(reason.to_string()), collision: None, zone_map: None,
+                    zone_min: [0.0; 2], zone_max: [0.0; 2],
+                });
+            }
         }).expect("spawn zone-asset-loader thread");
+        self.load_threads.push(handle);
     }
+
 
     /// Called each frame to check whether the background load thread has finished.
     /// If so, does the GPU upload (must be on the main thread) and clears `loading`.
     fn maybe_finish_load(&mut self) {
         let result = self.pending_load.lock().unwrap().take();
-        let Some(load) = result else { return };
+        let Some(load) = result else { return self.watch_for_lost_load() };
+
+        // A reply for a zone we have since LEFT is dropped ENTIRELY — nothing of it may touch the
+        // renderer, the minimap, the collision grid or the observable state (#595 review F2). The
+        // GPU upload and the `zone_min`/`zone_max`/`zone_map` assignments used to run BEFORE this
+        // check, so a slow load landing after a second zone change repainted the terrain and swapped
+        // the minimap bounds to the WRONG zone while `zone_assets` read `ready` for the right one —
+        // and `/observe/frame` then served a 200 PNG of another zone with the gate's blessing.
+        if load.zone_name != self.current_zone {
+            tracing::warn!("APP: dropping a finished load for '{}' — the character is in '{}' now; \
+                its terrain/minimap/collision are NOT applied", load.zone_name, self.current_zone);
+            return;   // `loading` stays true: the CURRENT zone's own load is still in flight.
+        }
 
         // Path for this zone's door/object models — from the asset-server cache ("zonedoors/<zone>"
         // set), as a pre-baked GLB. Best-effort: if absent, load_door_models falls back to boxes.
@@ -608,23 +702,42 @@ impl App {
         // from the same value inside `finish_zone_load`, so `ready` and the world it describes can
         // never disagree). `ZoneAssetState::ready` refuses to build a `Ready` without terrain
         // meshes AND a collision grid with geometry — a failed/empty load comes out as an explicit
-        // `Failed`, never an eternal "pending". A reply for a zone we have since LEFT is dropped
-        // entirely: its geometry belongs to a zone the character is no longer standing in, and the
-        // current zone is still pending its own load.
-        if load.zone_name == self.current_zone {
-            crate::nav::zone_assets::finish_zone_load(
-                &self.shared_collision, &self.zone_assets, &load.zone_name,
-                load.collision.clone(),
-                load.assets.as_ref().map(|za| za.terrain.len()).unwrap_or(0),
-                load.load_error.as_deref());
-            self.collision = self.shared_collision.read().unwrap().clone();
-            tracing::info!("APP: zone_assets → {:?}", self.zone_assets.lock().unwrap());
-        } else {
-            tracing::warn!("APP: dropping a finished load for '{}' — the character is in '{}' now",
-                load.zone_name, self.current_zone);
-        }
+        // `Failed`, never an eternal "pending".
+        crate::nav::zone_assets::finish_zone_load(
+            &self.shared_collision, &self.zone_assets, &load.zone_name,
+            load.collision.clone(),
+            load.assets.as_ref().map(|za| za.terrain.len()).unwrap_or(0),
+            load.load_error.as_deref());
+        self.collision = self.shared_collision.read().unwrap().clone();
+        tracing::info!("APP: zone_assets → {:?}", crate::nav::zone_assets::lock_state(&self.zone_assets));
         self.zone_map  = load.zone_map;
         self.loading   = false;
+        *self.load_status.lock().unwrap() = String::new();
+    }
+
+    /// #595 review F3 — the "stuck in `pending` forever" backstop.
+    ///
+    /// `Failed` exists so an agent is never left waiting for a `ready` that is not coming, but two
+    /// paths used to terminate in NO state at all: a loader thread that **panicked** (it writes
+    /// `pending_load` only at the very end, so nothing was ever published), and a loader whose
+    /// result was **clobbered** in the single-slot handoff by a second loader and then dropped by
+    /// the zone check above. Both leave `zone_assets` on `Pending` with a frozen status line.
+    ///
+    /// The detector is exact rather than a timeout guess: a loader writes `pending_load` *before* it
+    /// returns, so if every spawned loader thread has finished and the slot is still empty while we
+    /// are `Pending`, that result can never arrive. (A slow-but-alive download keeps its thread
+    /// running and is untouched, however long it takes.)
+    fn watch_for_lost_load(&mut self) {
+        self.load_threads.retain(|h| !h.is_finished());
+        let mut st = crate::nav::zone_assets::lock_state(&self.zone_assets);
+        let Some(stuck_zone) = lost_load_zone(!self.load_threads.is_empty(), &st) else { return };
+        tracing::error!("APP: zone-asset loader for '{stuck_zone}' exited without reporting a result");
+        *st = crate::nav::zone_assets::ZoneAssetState::failed(&stuck_zone,
+            "the zone-asset loader thread exited WITHOUT reporting a result (it panicked, or its \
+             result was overwritten by a later load). No retry is running — this will never become \
+             `ready`. Re-enter the zone or restart the client.");
+        drop(st);
+        self.loading = false;
         *self.load_status.lock().unwrap() = String::new();
     }
 
@@ -2141,7 +2254,56 @@ fn smooth_entity_motion(
 #[cfg(test)]
 mod tests {
     use super::{smooth_entity_motion, zone_needs_reload, next_fade, EntityMotion, MOTION_SMOOTH_DIST};
+    use super::{lost_load_zone, publish_load, PendingLoad};
     use std::collections::HashMap;
+
+    fn load(gen: u64, zone: &str) -> PendingLoad {
+        PendingLoad {
+            gen, zone_name: zone.to_string(), assets: None, load_error: Some("x".into()),
+            collision: None, zone_map: None, zone_min: [0.0; 2], zone_max: [0.0; 2],
+        }
+    }
+
+    /// #595 review F3 — the single handoff slot is shared by every loader. A slow OLD loader
+    /// finishing after a newer one must NOT overwrite the newer reply: the main thread would then
+    /// drop the stale result on its zone check and the zone the character is actually in would
+    /// never get a result at all — an eternal `Pending`.
+    #[test]
+    fn an_older_load_never_clobbers_a_newer_result() {
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        publish_load(&slot, 7, load(7, "qeynos"));      // the newer load lands first
+        publish_load(&slot, 3, load(3, "freporte"));    // the older one finishes late
+        let held = slot.lock().unwrap().as_ref().map(|l| (l.gen, l.zone_name.clone()));
+        assert_eq!(held, Some((7, "qeynos".to_string())),
+            "the newer zone's result must survive an older loader finishing after it");
+    }
+
+    #[test]
+    fn a_newer_load_does_replace_an_older_result() {
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        publish_load(&slot, 3, load(3, "freporte"));
+        publish_load(&slot, 7, load(7, "qeynos"));
+        let held = slot.lock().unwrap().as_ref().map(|l| l.gen);
+        assert_eq!(held, Some(7));
+    }
+
+    /// #595 review F3 — the "stuck in `pending` forever" backstop. `Failed` exists so an agent is
+    /// never left waiting for a `ready` that is not coming; a loader that panicked (or whose reply
+    /// was clobbered) published nothing at all, which used to leave `Pending` frozen forever.
+    #[test]
+    fn a_pending_load_with_no_live_loader_is_declared_lost() {
+        use crate::nav::zone_assets::ZoneAssetState;
+        let pending = ZoneAssetState::pending("freportw", "Reading zone geometry…");
+        assert_eq!(lost_load_zone(false, &pending).as_deref(), Some("freportw"),
+            "no loader can ever report this — it must become terminal, not hang");
+        assert_eq!(lost_load_zone(true, &pending), None,
+            "a slow-but-alive download must be left alone however long it takes");
+        // Terminal states are never re-declared lost.
+        assert_eq!(lost_load_zone(false, &ZoneAssetState::Idle), None);
+        assert_eq!(lost_load_zone(false, &ZoneAssetState::failed("f", "boom")), None);
+        assert_eq!(lost_load_zone(false, &ZoneAssetState::test_ready()), None);
+    }
+
 
     fn bb(id: u32, pos: [f32; 3]) -> crate::scene::Billboard {
         crate::scene::Billboard {
