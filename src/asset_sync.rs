@@ -68,6 +68,19 @@ impl CacheDirs {
         self.root.join("synced.json")
     }
 
+    /// Migration note (#601 D-4): `SyncedSet` gained a `files` field alongside the pre-existing
+    /// `digest`. An old-format `synced.json` (written before this change, `files` absent) fails
+    /// `serde_json::from_slice` — `files: Vec<FileEntry>` has no `#[serde(default)]`, so a missing
+    /// field is a hard deserialize error, not a partial load. That error is swallowed by `.ok()`
+    /// below, so the outcome is: every existing record is silently DISCARDED (not trusted, not
+    /// fatal) and `load_synced` returns an empty map, exactly as if the cache were cold. The next
+    /// sync for every previously-synced set therefore sends no `If-None-Match`, costing one
+    /// unconditional manifest fetch per set — but zero extra chunk downloads, since `cas_put` is
+    /// idempotent on hashes already on disk and `missing_chunks` finds them all still present.
+    /// One re-verification pass on first launch after upgrade, then the new-format record takes
+    /// over and subsequent launches short-circuit exactly as before. See
+    /// `old_format_synced_json_is_discarded_not_trusted_or_fatal` and
+    /// `warm_cache_upgrade_costs_no_chunk_refetch` for the pinned behavior.
     fn load_synced(&self) -> std::collections::HashMap<String, SyncedSet> {
         std::fs::read(self.synced_path())
             .ok()
@@ -98,6 +111,21 @@ impl CacheDirs {
         if let Ok(bytes) = serde_json::to_vec_pretty(&map) {
             let _ = std::fs::create_dir_all(&self.root);
             let _ = std::fs::write(self.synced_path(), bytes);
+        }
+    }
+
+    /// Drop the recorded synced identity for `set`, forcing the next sync to treat it as never
+    /// synced (unconditional manifest fetch, no `If-None-Match`). Used when a recorded file list
+    /// turns out to be unrepairable — e.g. the server has since re-chunked the same content under
+    /// different chunk ids, which the digest alone can't detect (#601 D-2) — so the only way
+    /// forward is to forget the stale record and re-derive everything from a fresh manifest.
+    fn clear_synced(&self, set: &str) {
+        let mut map = self.load_synced();
+        if map.remove(set).is_some() {
+            if let Ok(bytes) = serde_json::to_vec_pretty(&map) {
+                let _ = std::fs::create_dir_all(&self.root);
+                let _ = std::fs::write(self.synced_path(), bytes);
+            }
         }
     }
 }
@@ -204,6 +232,21 @@ pub fn reassemble(cache: &CacheDirs, entry: &FileEntry) -> anyhow::Result<()> {
             .cas_get(h)
             .map_err(|e| anyhow::anyhow!("missing chunk {h} for {}: {e}", entry.path))?;
         bytes.extend_from_slice(&chunk);
+    }
+    // `artifacts_intact` treats a length mismatch against `entry.size` as "not there" and
+    // triggers a repair — but pre-#601, `size` was never actually verified here, only used as a
+    // `Vec::with_capacity` hint. A manifest whose `size` disagrees with the real assembled length
+    // (server bug, hand-edited manifest, ...) would keep "succeeding" here while never satisfying
+    // `artifacts_intact`, so every future launch would repair it again — forever, silently,
+    // without ever converging or surfacing an error (#601 D-5). Reject it loudly and immediately
+    // instead of building a state that can never be recognized as intact.
+    if bytes.len() as u64 != entry.size {
+        anyhow::bail!(
+            "size mismatch for {}: manifest says {}, assembled {} bytes",
+            entry.path,
+            entry.size,
+            bytes.len()
+        );
     }
     let got = blake3_hex(&bytes);
     if got != entry.blake3 {
@@ -329,7 +372,7 @@ pub fn sync_set(
     // gracefully re-syncs once if the on-disk record ever fails to parse.)
     let if_none_match = prev.as_ref().map(|(d, _)| d.as_str());
 
-    let manifest = match t.get_manifest(set, if_none_match)? {
+    match t.get_manifest(set, if_none_match)? {
         ManifestFetch::Unchanged => {
             // The server saying "unchanged" is a claim about ITS content identity — it says
             // nothing about whether our own assembled artifact is still on disk. Trusting the
@@ -338,21 +381,62 @@ pub fn sync_set(
             // so the client would report "up to date" forever and clearing the local cache (the
             // obvious recovery move) would not help, because the digest — not the artifact — is
             // what gets consulted. Verify the artifacts before honoring the short-circuit.
-            let (_, files) = prev.expect(
-                "get_manifest only returns Unchanged in response to a digest we sent, \
-                 and we only send one when `prev` (digest+files) is Some",
-            );
+            //
+            // `Unchanged` is only a valid reply to a request that carried an `If-None-Match` — if
+            // we sent none (no prior record), a server/intermediary claiming Unchanged anyway is
+            // a protocol violation, not a state this code can trust or repair from (there is no
+            // recorded file list to check). Fail loudly rather than assume: `prev` being `None`
+            // here must surface as an ordinary `Err`, never a panic — `sync_set` runs on
+            // background threads (see `src/app.rs`'s zone/common/model loaders) inside a closure
+            // whose `Err` arm is what publishes an honest `zone_assets: failed`; a panic unwinds
+            // past that arm entirely and the client would sit on "Verifying..." forever, the exact
+            // pending-forever falsehood #579 exists to prevent (#601 D-1).
+            let Some((_, files)) = prev else {
+                anyhow::bail!(
+                    "server reported set {set} as unchanged but we hold no prior synced record \
+                     for it (no If-None-Match was sent) — protocol violation by the server or an \
+                     intermediary, cannot verify or repair"
+                );
+            };
             if artifacts_intact(cache, &files) {
                 return Ok(()); // content AND local artifacts both unchanged — genuine no-op
             }
             progress(SyncProgress { phase: Phase::Verifying, done: 0, total: 0, bytes: 0 });
-            fetch_and_reassemble(t, cache, &files, progress)?;
-            // digest and file list are unchanged from what's already recorded — nothing new to
-            // persist, the repair just restored what the record already claimed was true.
-            return Ok(());
+            if let Err(repair_err) = fetch_and_reassemble(t, cache, &files, progress) {
+                // The recorded chunk list can itself be stale even though the digest is not: the
+                // digest (`set_digest`) hashes only `path\0<file-blake3>`, never chunk ids, so a
+                // server that re-chunks a file (different FastCDC params, a re-bake, ...) while
+                // its *content* is unchanged produces an identical digest with entirely different
+                // chunk hashes. Retrying the SAME recorded chunk list would then fail on every
+                // future launch, permanently (#601 D-2). Drop the stale record and fall through to
+                // one fresh, unconditional manifest fetch — the server's CURRENT chunk ids — rather
+                // than keep repairing with data the server can no longer serve.
+                cache.clear_synced(set);
+                return match t.get_manifest(set, None)? {
+                    ManifestFetch::Changed(m) => sync_changed_manifest(t, set, cache, m, progress),
+                    ManifestFetch::Unchanged => Err(repair_err.context(format!(
+                        "repair of set {set} failed, and a fresh (unconditional) manifest fetch \
+                         still reports Unchanged — server cannot supply working chunk data"
+                    ))),
+                };
+            }
+            Ok(()) // digest/file-list unchanged from what's already recorded — nothing new to persist
         }
-        ManifestFetch::Changed(m) => m,
-    };
+        ManifestFetch::Changed(m) => sync_changed_manifest(t, set, cache, m, progress),
+    }
+}
+
+/// Verifies a freshly-fetched manifest against its own claimed digest, downloads/reassembles its
+/// files, and records the new synced state. Shared by the normal (digest Changed) path and the
+/// repair-failure fallback above (#601 D-2), both of which end up with a manifest they need to
+/// fully (re)apply.
+fn sync_changed_manifest(
+    t: &dyn Transport,
+    set: &str,
+    cache: &CacheDirs,
+    manifest: Manifest,
+    progress: &mut dyn FnMut(SyncProgress),
+) -> anyhow::Result<()> {
     // Defense against a lying/corrupt server: the manifest must hash to its claimed digest.
     let recomputed = set_digest(&manifest.files);
     if recomputed != manifest.digest {
@@ -464,6 +548,32 @@ mod manifest_tests {
         m.files[0].blake3 = "0".repeat(64); // wrong expected hash
         assert!(reassemble(&cache, &m.files[0]).is_err());
     }
+
+    #[test]
+    fn reassemble_rejects_size_mismatch_instead_of_looping_forever() {
+        // #601 D-5: pre-fix, `entry.size` was only ever used as a `Vec::with_capacity` hint here —
+        // never actually checked against the assembled length. But `artifacts_intact` (this same
+        // PR) DOES compare the on-disk file's length against `entry.size`. A manifest whose `size`
+        // disagrees with the true assembled length (server bug, hand-edited manifest, a chunk
+        // that's the wrong length for its hash slot, ...) would then "succeed" here while never
+        // satisfying `artifacts_intact` — silently repairing the same set again on every future
+        // launch, forever, with no error ever surfacing. `reassemble` must instead reject a
+        // size-mismatched manifest loudly, immediately, so the failure is visible instead of an
+        // invisible non-converging loop.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = CacheDirs::with_root(dir.path());
+        let (mut m, _) = manifest_with(&cache);
+        m.files[0].size += 1; // claims one byte more than the chunks actually assemble to
+        let err = reassemble(&cache, &m.files[0]).unwrap_err();
+        assert!(
+            err.to_string().contains("size mismatch"),
+            "expected a size-mismatch error, got: {err}"
+        );
+        assert!(
+            !cache.models_dir().join("humanoid.glb").exists(),
+            "a size-mismatched artifact must not be written at all"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -475,10 +585,12 @@ mod sync_tests {
         manifest: Manifest,
         chunks: HashMap<String, Vec<u8>>,
         chunk_calls: std::cell::RefCell<usize>,
+        manifest_calls: std::cell::RefCell<usize>,
     }
     impl Transport for FakeTransport {
         // Mirrors the real server: 304 (Unchanged) when the client's If-None-Match equals the digest.
         fn get_manifest(&self, _set: &str, inm: Option<&str>) -> anyhow::Result<ManifestFetch> {
+            *self.manifest_calls.borrow_mut() += 1;
             if inm == Some(self.manifest.digest.as_str()) {
                 return Ok(ManifestFetch::Unchanged);
             }
@@ -508,6 +620,7 @@ mod sync_tests {
             manifest: Manifest { set: "common".into(), digest: set_digest(&files), files },
             chunks,
             chunk_calls: std::cell::RefCell::new(0),
+            manifest_calls: std::cell::RefCell::new(0),
         }
     }
 
@@ -565,18 +678,91 @@ mod sync_tests {
     }
 
     #[test]
+    fn warm_cache_upgrade_costs_no_chunk_refetch() {
+        // #601 D-4: quantifies the migration cost documented on `load_synced`. A warm cache (CAS
+        // chunks + assembled artifact already present, from before an upgrade) that happens to
+        // still carry an OLD-FORMAT synced.json must re-verify via exactly one extra manifest
+        // fetch, but must NOT re-download any chunk — they're already in the local CAS,
+        // content-addressed by hash and entirely independent of what synced.json records.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = CacheDirs::with_root(dir.path());
+        let t = fixture();
+
+        // Establish a fully-synced, new-format state first (this is the pre-upgrade state).
+        sync_set(&t, "common", &cache, &mut |_| {}).unwrap();
+        assert_eq!(*t.chunk_calls.borrow(), 2);
+
+        // Simulate what an upgrade finds on disk: overwrite the record with the pre-#601 shape,
+        // leaving the CAS and the assembled artifact untouched — a real upgrade changes only the
+        // code reading synced.json, never the CAS or models/ contents.
+        std::fs::write(
+            cache.root.join("synced.json"),
+            format!(r#"{{"common": "{}"}}"#, t.manifest.digest),
+        )
+        .unwrap();
+
+        let chunk_calls_before = *t.chunk_calls.borrow();
+        let manifest_calls_before = *t.manifest_calls.borrow();
+        sync_set(&t, "common", &cache, &mut |_| {}).unwrap();
+
+        assert_eq!(
+            *t.chunk_calls.borrow(),
+            chunk_calls_before,
+            "an upgrade must not re-download any chunk — they're already content-addressed in the local CAS"
+        );
+        assert_eq!(
+            *t.manifest_calls.borrow(),
+            manifest_calls_before + 1,
+            "an upgrade costs exactly one extra manifest fetch (the old-format record can't be \
+             trusted, so no If-None-Match is sent, so the server can't reply 304)"
+        );
+        let mut whole = vec![1u8; 10];
+        whole.extend_from_slice(&[2u8; 20]);
+        assert_eq!(
+            std::fs::read(cache.models_dir().join("humanoid.glb")).unwrap(),
+            whole,
+            "the artifact is byte-identical after the migration re-sync"
+        );
+        assert_eq!(
+            cache.synced_digest("common").as_deref(),
+            Some(t.manifest.digest.as_str()),
+            "the new-format record is restored after the one-time re-verification"
+        );
+    }
+
+    #[test]
     fn unchanged_digest_with_intact_artifact_still_skips() {
         // The short-circuit exists for good reason (no redundant chunk fetches/rewrites on every
         // launch) and must be preserved when the artifact really is fine.
+        //
+        // #601 D-3: a `chunk_calls` count alone is NOT sufficient to prove the short-circuit ran —
+        // it stays flat even if the whole `artifacts_intact` check were deleted and `reassemble`
+        // were called unconditionally, because `reassemble` never fetches chunks on its own (it
+        // only reads whatever's already in the local CAS, which is still fully populated from the
+        // first sync). So also assert the artifact's inode is untouched across the second
+        // `sync_set` call: `reassemble` always writes through a temp file + `rename` (for atomicity
+        // — see eqoxide#223), and a `rename`-over-an-existing-path always allocates a fresh inode
+        // even when the resulting bytes and mtime happen to coincide with the old file. An
+        // unchanged inode is therefore proof `reassemble` did not run a second time, not just proof
+        // no *chunks* were fetched.
+        use std::os::unix::fs::MetadataExt;
         let dir = tempfile::tempdir().unwrap();
         let cache = CacheDirs::with_root(dir.path());
         let t = fixture();
         sync_set(&t, "common", &cache, &mut |_| {}).unwrap();
         assert_eq!(cache.synced_digest("common").as_deref(), Some(t.manifest.digest.as_str()));
 
+        let artifact_path = cache.models_dir().join("humanoid.glb");
+        let ino_before = std::fs::metadata(&artifact_path).unwrap().ino();
+
         let before = *t.chunk_calls.borrow();
         sync_set(&t, "common", &cache, &mut |_| {}).unwrap();
         assert_eq!(*t.chunk_calls.borrow(), before, "Unchanged + intact artifact must not fetch chunks");
+        let ino_after = std::fs::metadata(&artifact_path).unwrap().ino();
+        assert_eq!(
+            ino_before, ino_after,
+            "Unchanged + intact artifact must not rewrite the artifact at all (same inode)"
+        );
     }
 
     #[test]
@@ -659,5 +845,149 @@ mod sync_tests {
         let key = t.manifest.files[0].chunks[0].clone();
         t.chunks.insert(key, vec![9u8; 10]);
         assert!(sync_set(&t, "common", &cache, &mut |_| {}).is_err());
+    }
+
+    #[test]
+    fn unchanged_with_no_prior_record_is_an_honest_error_not_a_panic() {
+        // #601 D-1: `Unchanged` is only a legitimate reply to a request that carried an
+        // `If-None-Match` derived from a prior record. A transport (misbehaving server, broken
+        // proxy, ...) that claims Unchanged even when we sent NO If-None-Match at all is lying
+        // about the protocol, and `sync_set` has no recorded file list to verify or repair from in
+        // that case. This must surface as an ordinary `Err`, never a panic: `sync_set` runs inside
+        // a background-thread closure (see src/app.rs's zone/common/model loaders) whose `Err` arm
+        // is what publishes an honest failure to the UI; a panic unwinds past that arm entirely and
+        // leaves the client stuck on "Verifying..." forever — the exact pending-forever falsehood
+        // this project treats as worse than a crash.
+        struct LyingUnchangedTransport;
+        impl Transport for LyingUnchangedTransport {
+            fn get_manifest(&self, _set: &str, _inm: Option<&str>) -> anyhow::Result<ManifestFetch> {
+                Ok(ManifestFetch::Unchanged) // lies even on a bare (no If-None-Match) request
+            }
+            fn get_chunk(&self, hash: &str) -> anyhow::Result<Vec<u8>> {
+                anyhow::bail!("should never be called: {hash}")
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cache = CacheDirs::with_root(dir.path()); // cold cache: no prior record for "common"
+        let t = LyingUnchangedTransport;
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sync_set(&t, "common", &cache, &mut |_| {})
+        }));
+
+        let returned = match result {
+            Ok(r) => r,
+            Err(_) => panic!(
+                "sync_set panicked instead of returning an Err — this is exactly the #601 D-1 \
+                 pending-forever hazard (a panic escapes the background-thread Err arm in src/app.rs)"
+            ),
+        };
+        assert!(
+            returned.is_err(),
+            "a lying Unchanged reply with no prior record must be a hard Err, not Ok(())"
+        );
+    }
+
+    #[test]
+    fn repair_failure_recovers_via_fresh_manifest_after_rechunk() {
+        // #601 D-2: the recorded file list can go stale even though the digest stays the same,
+        // because `set_digest` hashes only `path\0<whole-file-blake3>` — it never covers chunk ids.
+        // If the server re-chunks a file (different FastCDC params, a re-bake, ...) while the
+        // file's *content* is unchanged, the digest the client already has on record is still
+        // correct, but the specific chunk hashes recorded alongside it may no longer be servable.
+        // If a local repair is then needed (artifact deleted/evicted) and the ONLY thing tried is
+        // re-fetching those exact stale chunk hashes, it fails — and since the digest never
+        // changes, it would fail again on every future launch, forever, with no path to recovery.
+        // The fix: on repair failure, drop the stale record and fall through to one fresh,
+        // unconditional manifest fetch (current chunk ids), then fully apply that.
+        use std::cell::Cell;
+
+        struct RechunkingTransport {
+            digest: String,
+            v1_files: Vec<FileEntry>,
+            v2_files: Vec<FileEntry>,
+            v1_chunks: HashMap<String, Vec<u8>>,
+            v2_chunks: HashMap<String, Vec<u8>>,
+            rechunked: Cell<bool>,
+        }
+        impl Transport for RechunkingTransport {
+            fn get_manifest(&self, _set: &str, inm: Option<&str>) -> anyhow::Result<ManifestFetch> {
+                if inm == Some(self.digest.as_str()) {
+                    return Ok(ManifestFetch::Unchanged);
+                }
+                let files = if self.rechunked.get() { self.v2_files.clone() } else { self.v1_files.clone() };
+                Ok(ManifestFetch::Changed(Manifest { set: "common".into(), digest: self.digest.clone(), files }))
+            }
+            fn get_chunk(&self, hash: &str) -> anyhow::Result<Vec<u8>> {
+                let map = if self.rechunked.get() { &self.v2_chunks } else { &self.v1_chunks };
+                map.get(hash).cloned().ok_or_else(|| anyhow::anyhow!("no chunk {hash}"))
+            }
+        }
+
+        let whole = { let mut w = vec![1u8; 10]; w.extend_from_slice(&[2u8; 20]); w }; // 30 bytes
+        let whole_blake3 = blake3_hex(&whole);
+
+        // v1 chunking: [0..10] / [10..30]
+        let (a1, b1) = (whole[0..10].to_vec(), whole[10..30].to_vec());
+        let (ha1, hb1) = (blake3_hex(&a1), blake3_hex(&b1));
+        let v1_files = vec![FileEntry {
+            path: "humanoid.glb".into(), size: whole.len() as u64,
+            blake3: whole_blake3.clone(), chunks: vec![ha1.clone(), hb1.clone()],
+        }];
+        let mut v1_chunks = HashMap::new();
+        v1_chunks.insert(ha1, a1);
+        v1_chunks.insert(hb1, b1);
+
+        // v2 chunking: [0..15] / [15..30] — same content, different chunk boundaries/hashes.
+        let (a2, b2) = (whole[0..15].to_vec(), whole[15..30].to_vec());
+        let (ha2, hb2) = (blake3_hex(&a2), blake3_hex(&b2));
+        let v2_files = vec![FileEntry {
+            path: "humanoid.glb".into(), size: whole.len() as u64,
+            blake3: whole_blake3.clone(), chunks: vec![ha2.clone(), hb2.clone()],
+        }];
+        let mut v2_chunks = HashMap::new();
+        v2_chunks.insert(ha2, a2);
+        v2_chunks.insert(hb2, b2);
+
+        let digest_v1 = set_digest(&v1_files);
+        let digest_v2 = set_digest(&v2_files);
+        assert_eq!(
+            digest_v1, digest_v2,
+            "set_digest must be chunk-agnostic (path+file-blake3 only) for this scenario to be real"
+        );
+
+        let t = RechunkingTransport {
+            digest: digest_v1,
+            v1_files,
+            v2_files,
+            v1_chunks,
+            v2_chunks,
+            rechunked: Cell::new(false),
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = CacheDirs::with_root(dir.path());
+
+        // Cold sync using v1 chunking — establishes the record with the (soon to be stale) v1
+        // chunk hashes.
+        sync_set(&t, "common", &cache, &mut |_| {}).unwrap();
+        assert_eq!(std::fs::read(cache.models_dir().join("humanoid.glb")).unwrap(), whole);
+
+        // Simulate: the local CAS gets evicted/cleared (independent recovery action, or just disk
+        // pressure) AND the assembled artifact goes missing — so a repair is needed — AND, at the
+        // same time, the server has since re-chunked (its old chunk ids are no longer servable).
+        std::fs::remove_dir_all(cache.cas_dir()).unwrap();
+        std::fs::remove_file(cache.models_dir().join("humanoid.glb")).unwrap();
+        t.rechunked.set(true);
+
+        // The digest is unchanged, so the server still (correctly) reports Unchanged. Without the
+        // D-2 fix, `sync_set` would try to repair using the stale v1 chunk hashes, get an Err from
+        // `get_chunk` (the server only serves v2 hashes now), and propagate that Err — permanently,
+        // since the digest never changes to trigger a normal re-sync.
+        sync_set(&t, "common", &cache, &mut |_| {}).unwrap();
+
+        let out = std::fs::read(cache.models_dir().join("humanoid.glb")).unwrap();
+        assert_eq!(out, whole, "content is identical post-recovery even though it was re-chunked");
+        assert!(cache.cas_has(&blake3_hex(&whole[0..15])), "recovered via the NEW (v2) chunk ids");
     }
 }
