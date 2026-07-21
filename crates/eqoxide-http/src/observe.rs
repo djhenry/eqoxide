@@ -252,6 +252,7 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         "level":    c.level,
         "ago_secs": c.at.elapsed().as_secs(),
     }));
+    let player_levitating = player.levitating;
     let mut out = serde_json::json!({
         "player": {
             "name":       player.name,
@@ -434,6 +435,12 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     if let Some(player) = out.get_mut("player").and_then(|p| p.as_object_mut()) {
         player.insert("world_responsive".into(),       serde_json::json!(health.world_responsive));
         player.insert("last_world_response_ms".into(), serde_json::json!(health.last_world_response_ms));
+        // #529/#586: Levitate up = gravity off. It changes what movement means (`pos` is a height
+        // the character will NOT fall from, and the controller stops applying gravity), so it must
+        // be readable here — a projection field that never reaches the JSON is the #409 failure
+        // mode all over again. Attached here, not in the literal above, which is at the json!
+        // recursion limit.
+        player.insert("levitating".into(),             serde_json::json!(player_levitating));
     }
     Json(out)
 }
