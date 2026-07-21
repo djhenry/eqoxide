@@ -378,12 +378,19 @@ mod tests {
         let _ = std::fs::remove_file(eqoxide_core::config::config_dir().join("ui_layout___uitest__.json"));
     }
 
-    /// Regression: window sizes must STABILIZE across frames. A body that
-    /// sizes its canvas from `available - <hardcoded footer>` and then draws a
-    /// taller footer overflows its allotment; the window grows to fit, the
-    /// body re-derives from the new size, and the window creeps across the
-    /// screen forever while pinning the render loop (chat grew right, map grew
-    /// down). Bodies must let bottom panels measure themselves.
+    /// Regression: window sizes must STABILIZE across frames WITHIN ONE
+    /// SESSION. A body that sizes its canvas from `available - <hardcoded
+    /// footer>` and then draws a taller footer overflows its allotment; the
+    /// window grows to fit, the body re-derives from the new size, and the
+    /// window creeps across the screen forever while pinning the render loop
+    /// (chat grew right, map grew down). Bodies must let bottom panels
+    /// measure themselves.
+    ///
+    /// This does NOT cover the #613 bug (growth across a client *restart*,
+    /// where the persisted "content size" silently included the title
+    /// strip) — that needs a fresh `egui::Context` and a fresh persisted
+    /// layout each cycle to simulate a real restart, which this in-session
+    /// test never does. See `chrome::tests::round_trip_size_is_idempotent_across_reloads`.
     #[test]
     fn window_sizes_do_not_creep() {
         let mut ui = UiState::new("__uitest_growth__", None);
