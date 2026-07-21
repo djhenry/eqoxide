@@ -1,0 +1,28 @@
+[package]
+name = "eqoxide-crash"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "eqoxide_crash"
+path = "src/lib.rs"
+
+# `tests/crash_signals.rs` runs this as a real subprocess via `env!("CARGO_BIN_EXE_crash_probe")` —
+# the properties under test ("does the binary start", "does a stack overflow still print std's loud
+# message", "does a segfault leave a record and still core-dump") are only observable from OUTSIDE
+# the test process, so the probe has to be a real binary in this same package (#544 Step 2i).
+[[bin]]
+name = "crash_probe"
+path = "src/bin/crash_probe.rs"
+
+[dependencies]
+# A self-contained leaf crate (#544 Step 2i): depends on NO workspace crate, only the external
+# crates crash.rs actually calls. Verified against the module's own `use`/`libc::`/`dirs::`/
+# `tracing::` call sites — `signal-hook` is discussed in the module docs (explaining why it is
+# deliberately NOT used for fatal signals — see the doc comment "Why we don't use `signal-hook`")
+# but is never actually called from this file, so it is intentionally NOT a dependency here. The
+# app crate still depends on `signal-hook` directly for its own SIGTERM/SIGINT handling
+# (`src/main.rs`), which is unrelated to this module.
+libc = "0.2"
+dirs = "5"
+tracing = "0.1"

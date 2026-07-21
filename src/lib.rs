@@ -54,6 +54,15 @@ pub use eqoxide_nav::traversability;
 // eq_net/action_loop.rs, ui/*) keeps resolving unchanged.
 pub use eqoxide_command as command_state;
 
+// Crash/shutdown observability (#380: signal handlers, `exit`, `log_instance`, crash-dump logging)
+// now lives in the `eqoxide-crash` workspace crate (#544 Step 2i), depending only on external
+// crates (libc/dirs/tracing) — never on any workspace crate. Alias it as this crate's `crash`
+// module so every existing `crate::crash::…` / `eqoxide::crash::…` call site (main.rs, app.rs,
+// http/lifecycle.rs, http/mod.rs) keeps resolving unchanged. The subprocess-level tests
+// (`tests/crash_signals.rs`, the `crash_probe` binary) moved WITH the module into that crate's own
+// `tests/`/`src/bin/`, since they exercise only crash-module internals and need no app-crate code.
+pub use eqoxide_crash as crash;
+
 pub mod anim;
 pub mod app;
 pub mod asset_sync;
@@ -73,7 +82,6 @@ pub mod scene;
 
 // Modules only needed by the full client binary.
 pub mod camera_state;
-pub mod crash;
 pub mod eq_net;
 pub mod frame_capture;
 pub mod http;

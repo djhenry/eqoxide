@@ -846,12 +846,12 @@ dependencies = [
  "eqoxide-assets",
  "eqoxide-command",
  "eqoxide-core",
+ "eqoxide-crash",
  "eqoxide-ipc",
  "eqoxide-nav",
  "glam",
  "gltf",
  "image",
- "libc",
  "miniz_oxide",
  "naga",
  "pollster",
@@ -902,6 +902,15 @@ dependencies = [
  "serde_yaml",
  "shellexpand",
  "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "eqoxide-crash"
+version = "0.1.0"
+dependencies = [
+ "dirs 5.0.1",
+ "libc",
  "tracing",
 ]
 
