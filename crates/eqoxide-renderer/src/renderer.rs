@@ -1081,10 +1081,17 @@ impl EqRenderer {
 
         self.ensure_equipment_textures(scene);
         self.note_missing_door_models(scene);
-        // Ensure the player's equipped weapon models are loaded (cached by IDFile).
-        let (wp, ws) = (scene.primary_weapon_idfile.clone(), scene.secondary_weapon_idfile.clone());
-        if !wp.is_empty() { self.ensure_weapon(&wp); }
-        if !ws.is_empty() { self.ensure_weapon(&ws); }
+        // Ensure the player's equipped weapon models are loaded. Source is unified with every
+        // other spawn: the equipment material array (slots 7/8), with the inventory IDFile
+        // preferred when present — so an off-hand held item broadcast only via material still
+        // loads for the self player (eqoxide#515).
+        let self_keys: Vec<String> = crate::models::self_held_item_keys(
+                &scene.player_equipment,
+                &scene.primary_weapon_idfile,
+                &scene.secondary_weapon_idfile,
+                false,
+            ).into_iter().flatten().map(|(key, _bone)| key).collect();
+        for key in self_keys { self.ensure_weapon(&key); }
         // Same for every entity's held items (spawn equipment slots 7/8; both hit the
         // per-IDFile cache, including a negative cache, so this is cheap after first sight).
         let entity_keys: Vec<String> = scene.billboards.iter()
