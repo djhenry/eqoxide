@@ -2463,6 +2463,14 @@ impl ActionLoop {
         gs.player_x = pos[0];
         gs.player_y = pos[1];
         gs.player_z = pos[2];
+        // #513: our position is now ESTABLISHED — this is the controller's real placement for the
+        // current zone, the very value we stream to the server. Before the first tick of this
+        // (i.e. between `begin_zone_in` and the controller being placed in the new zone)
+        // `player_x/y/z` are still the struct's zeroes, and anything derived from them — notably
+        // the `distance` a name-resolution endpoint reports — would be measured from the zone
+        // ORIGIN and be a confident wrong number. Consumers gate on this via
+        // `HttpState::player_pos()` and report an honest "unknown" until it flips.
+        gs.player_pos_known = true;
         gs.player_heading = view.heading;
         self.last_streamed = pos;
     }
