@@ -4,10 +4,10 @@
 //! render loop (to update the scene).  No I/O or logging here — just pure state
 //! mutation.
 
-use crate::eq_net::protocol::*;
-use crate::eq_net::transport::AppPacket;
-use crate::eq_net::wire::WireReader;
-use crate::game_state::{GameState, Entity, ZonePoint};
+use crate::protocol::*;
+use crate::transport::AppPacket;
+use crate::wire::WireReader;
+use eqoxide_core::game_state::{GameState, Entity, ZonePoint};
 
 /// Apply one EQ server packet to `gs`.
 pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
@@ -128,7 +128,7 @@ pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
 /// (#288). Store the readable text so the observer API can surface it. The trailing empty
 /// OP_FinishWindow the server also sends is a no-op for us (not dispatched).
 fn apply_read_book(gs: &mut GameState, p: &[u8]) {
-    if let Some(text) = crate::eq_net::protocol::parse_read_book_reply(p) {
+    if let Some(text) = crate::protocol::parse_read_book_reply(p) {
         gs.log_msg("book", &text);
         gs.last_book_text = Some(text);
     }
@@ -206,7 +206,7 @@ fn apply_task_description(gs: &mut GameState, p: &[u8]) {
         task.xp_reward = xp_reward;
         task.coin_reward = coin_reward;
         task.reward_item_text = reward_item_text;
-        task.status = crate::game_state::TaskStatus::Active;
+        task.status = eqoxide_core::game_state::TaskStatus::Active;
     }
     gs.log_msg("quest", &format!("Quest accepted: {}", title_for_log));
 }
@@ -237,7 +237,7 @@ fn apply_task_activity(gs: &mut GameState, p: &[u8]) {
         else { item_name };
     let task = gs.tasks.entry(task_id).or_default();
     task.task_id = task_id;
-    let act = crate::game_state::TaskActivity { activity_id, activity_type, target, done_count, goal_count };
+    let act = eqoxide_core::game_state::TaskActivity { activity_id, activity_type, target, done_count, goal_count };
     if let Some(existing) = task.activities.iter_mut().find(|a| a.activity_id == activity_id) {
         *existing = act; // progress update
     } else {
@@ -280,7 +280,7 @@ fn apply_group_update_b(gs: &mut GameState, p: &[u8]) {
         let _timestamp = r.try_u32().unwrap_or(0);
         if member_name.is_empty() { continue; }
         let is_leader = !leader_name.is_empty() && member_name == leader_name;
-        members.push(crate::game_state::GroupMember {
+        members.push(eqoxide_core::game_state::GroupMember {
             name: member_name, level, is_leader, is_merc, tank, assist, puller, offline,
         });
     }
@@ -304,7 +304,7 @@ fn apply_group_join(gs: &mut GameState, p: &[u8]) {
     let level = r.u32();
     if member_name.is_empty() { return; }
     if gs.group_members.iter().any(|m| m.name == member_name) { return; } // already known
-    gs.group_members.push(crate::game_state::GroupMember {
+    gs.group_members.push(eqoxide_core::game_state::GroupMember {
         name: member_name.clone(), level, is_merc, ..Default::default()
     });
     gs.push_event("group", "member_joined", &member_name, false, &format!("{member_name} joined the group"));
@@ -372,7 +372,7 @@ fn apply_gm_training(gs: &mut GameState, p: &[u8]) {
     let npcid = r.u32();
     r.skip(4); // playerid (unused)
     // skills[100] are optional trailing (a short packet just leaves later caps at 0) — non-panicking.
-    let mut caps = vec![0u32; crate::skills::NUM_SKILLS];
+    let mut caps = vec![0u32; eqoxide_core::skills::NUM_SKILLS];
     for c in caps.iter_mut() {
         match r.try_u32() { Some(v) => *c = v, None => break }
     }
@@ -389,12 +389,12 @@ fn apply_skill_update(gs: &mut GameState, p: &[u8]) {
     let mut r = WireReader::new(p, "OP_SkillUpdate");
     let id = r.u32() as usize;
     let val = r.u32();
-    if gs.player_skills.len() < crate::skills::NUM_SKILLS {
-        gs.player_skills = vec![0u32; crate::skills::NUM_SKILLS];
+    if gs.player_skills.len() < eqoxide_core::skills::NUM_SKILLS {
+        gs.player_skills = vec![0u32; eqoxide_core::skills::NUM_SKILLS];
     }
     if id < gs.player_skills.len() {
         gs.player_skills[id] = val;
-        gs.log_msg("trainer", &format!("Skill {} raised to {}", crate::skills::skill_name(id as u32).unwrap_or("?"), val));
+        gs.log_msg("trainer", &format!("Skill {} raised to {}", eqoxide_core::skills::skill_name(id as u32).unwrap_or("?"), val));
     }
 }
 
@@ -422,7 +422,7 @@ fn apply_group_acknowledge(gs: &mut GameState, _p: &[u8]) {
 // OP_CharInventory wire format (rof2.cpp:1043 ENCODE(OP_CharInventory)):
 //   uint32 item_count  — 0 → 4-byte zero packet
 //   [item_count × SerializeItem output back-to-back, no padding]
-// Each item is parsed by crate::eq_net::item::parse_rof2_item which returns (RoF2Item, consumed).
+// Each item is parsed by crate::item::parse_rof2_item which returns (RoF2Item, consumed).
 // Slot numbers are RoF2 wire slots: equipment 0-22, general-inv 23-32, cursor 33 (rof2_limits.h).
 // We store them directly in InvItem.slot, consistent with how apply_item_packet already works.
 
@@ -430,10 +430,10 @@ fn apply_group_acknowledge(gs: &mut GameState, _p: &[u8]) {
 /// InvItems at the flat wire slot `bag_wire_slot(parent, sub_index)`. Bagged items thus appear in
 /// gs.inventory (and `/v1/observe/inventory`) and are movable via the same MoveItem path as any
 /// other slot. RoF2 bags don't nest, so one level is enough. (eqoxide#201)
-fn push_item_and_contents(out: &mut Vec<crate::game_state::InvItem>, item: crate::eq_net::item::RoF2Item) {
+fn push_item_and_contents(out: &mut Vec<eqoxide_core::game_state::InvItem>, item: crate::item::RoF2Item) {
     let parent_slot = item.main_slot as i32;
     let bag_contents = item.bag_contents; // move the Vec out before consuming the rest of `item`
-    out.push(crate::game_state::InvItem {
+    out.push(eqoxide_core::game_state::InvItem {
         slot:    parent_slot,
         item_id: item.id,
         name:    item.name,
@@ -444,8 +444,8 @@ fn push_item_and_contents(out: &mut Vec<crate::game_state::InvItem>, item: crate
         filename: item.filename,
     });
     for (sub_index, sub) in bag_contents {
-        let Some(flat) = crate::game_state::bag_wire_slot(parent_slot, sub_index) else { continue };
-        out.push(crate::game_state::InvItem {
+        let Some(flat) = eqoxide_core::game_state::bag_wire_slot(parent_slot, sub_index) else { continue };
+        out.push(eqoxide_core::game_state::InvItem {
             slot:    flat,
             item_id: sub.id,
             name:    sub.name,
@@ -468,7 +468,7 @@ fn apply_char_inventory(gs: &mut GameState, p: &[u8]) {
     let mut items = Vec::with_capacity(item_count);
     for _ in 0..item_count {
         if off >= p.len() { break; }
-        let Some((item, consumed)) = crate::eq_net::item::parse_rof2_item(&p[off..]) else {
+        let Some((item, consumed)) = crate::item::parse_rof2_item(&p[off..]) else {
             tracing::warn!("EQ: OP_CharInventory: failed to parse item at offset {off}; stopping");
             break;
         };
@@ -491,13 +491,13 @@ fn apply_char_inventory(gs: &mut GameState, p: &[u8]) {
 fn apply_item_packet(gs: &mut GameState, p: &[u8]) {
     // RoF2 OP_ItemPacket: ItemPacket_Struct = PacketType (u32) + one binary-serialized item.
     // (Titanium sent pipe-delimited text; RoF2 uses the packed SerializeItem format — see
-    // crate::eq_net::item.) 0x64 = Merchant, others (0x66 Loot, 0x69 CharInventory…) are items.
+    // crate::item.) 0x64 = Merchant, others (0x66 Loot, 0x69 CharInventory…) are items.
     const ITEM_PACKET_MERCHANT: u32 = 0x64;
     if p.len() < 4 { return; }
     let packet_type = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
-    let Some((item, _)) = crate::eq_net::item::parse_rof2_item(&p[4..]) else { return; };
+    let Some((item, _)) = crate::item::parse_rof2_item(&p[4..]) else { return; };
     if packet_type == ITEM_PACKET_MERCHANT {
-        let mi = crate::game_state::MerchantItem {
+        let mi = eqoxide_core::game_state::MerchantItem {
             merchant_slot: item.main_slot as u32,
             item_id:       item.id,
             name:          item.name,
@@ -513,7 +513,7 @@ fn apply_item_packet(gs: &mut GameState, p: &[u8]) {
         if packet_type == ITEM_PACKET_LOOT {
             // A Loot item's `main_slot` is NOT a safe inventory destination — it collides with
             // occupied general-inventory wire slots and would evict a real item (eqoxide#56).
-            let it = crate::game_state::InvItem {
+            let it = eqoxide_core::game_state::InvItem {
                 slot:    item.main_slot as i32,
                 item_id: item.id,
                 name:    item.name,
@@ -578,7 +578,7 @@ const GENERAL_END:   i32 = 32;
 /// `main_slot` (eqoxide#56). Merge into an existing stack of the same item in general inventory, else
 /// drop it into the first free general slot. The server holds the authoritative inventory and a
 /// resync (OP_CharInventory on relog / next sync) reconciles anything approximate here.
-fn apply_looted_item(gs: &mut GameState, mut it: crate::game_state::InvItem) {
+fn apply_looted_item(gs: &mut GameState, mut it: eqoxide_core::game_state::InvItem) {
     // Stack-merge: same item already sitting in a general-inventory slot → add to its quantity.
     // Restricted to general slots so we never merge into an EQUIPPED item that shares the id.
     if let Some(stack) = gs.inventory.iter_mut()
@@ -740,16 +740,16 @@ fn apply_completed_tasks(gs: &mut GameState, p: &[u8]) {
         let Some(title) = r.try_cstr() else { break; };
         let Some(completed_time) = r.try_u32() else { break; };
         if task_id == 0 { continue; }
-        let task = gs.tasks.entry(task_id).or_insert_with(|| crate::game_state::ActiveTask {
+        let task = gs.tasks.entry(task_id).or_insert_with(|| eqoxide_core::game_state::ActiveTask {
             task_id, ..Default::default()
         });
-        task.status = crate::game_state::TaskStatus::Completed;
+        task.status = eqoxide_core::game_state::TaskStatus::Completed;
         if task.title.is_empty() { task.title = title.clone(); }
         if let Some(existing) = gs.completed_task_history.iter_mut().find(|e| e.task_id == task_id) {
             existing.title = title;
             existing.completed_time = completed_time;
         } else {
-            gs.completed_task_history.push(crate::game_state::CompletedTaskEntry { task_id, title, completed_time });
+            gs.completed_task_history.push(eqoxide_core::game_state::CompletedTaskEntry { task_id, title, completed_time });
         }
     }
 }
@@ -794,7 +794,7 @@ fn apply_task_select_window(gs: &mut GameState, p: &[u8]) {
             );
             return;
         }
-        offers.push(crate::game_state::TaskOffer { task_id, npc_id: task_giver, title, description, has_rewards });
+        offers.push(eqoxide_core::game_state::TaskOffer { task_id, npc_id: task_giver, title, description, has_rewards });
     }
     gs.task_offers = offers;
 }
@@ -850,7 +850,7 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         // then "falls" the offset, re-streams its foot z, and the two datums fight a permanent ~3u
         // standoff (#516's "contested Z" — both sides were right, in different datums). Entity
         // positions (the else-branch) stay in wire datum; the render layer floor-snaps them.
-        let z_foot = upd.z - crate::coord::WIRE_Z_OFFSET;
+        let z_foot = upd.z - eqoxide_core::coord::WIRE_Z_OFFSET;
         let dx = upd.x - gs.player_x;
         let dy = upd.y - gs.player_y;
         let dz = z_foot - gs.player_z;
@@ -881,7 +881,7 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         // floor-tier mismatch that wedges nav). Floating entities (boats) skip the server's Z-offset
         // (Mob::FixZ early-returns for boats — GravityBehavior::Floating), so their wire z is already
         // surface-level; don't shift them or they sink into the water.
-        e.z = if e.floating { upd.z } else { upd.z - crate::coord::WIRE_Z_OFFSET };
+        e.z = if e.floating { upd.z } else { upd.z - eqoxide_core::coord::WIRE_Z_OFFSET };
         e.heading = upd.heading;
         e.animation = upd.animation;
         tracing::debug!("EQ: npc_pos id={} name={} pos=({:.1},{:.1},{:.1})", sid, e.name, e.x, e.y, e.z);
@@ -974,7 +974,7 @@ fn apply_new_zone(gs: &mut GameState, payload: &[u8]) {
     let fog_minclip = f32::from_le_bytes([payload[484], payload[485], payload[486], payload[487]]);
     let fog_maxclip = f32::from_le_bytes([payload[500], payload[501], payload[502], payload[503]]);
     gs.world.zone_fog = if fog_maxclip > fog_minclip {
-        Some(crate::game_state::ZoneFog {
+        Some(eqoxide_core::game_state::ZoneFog {
             color:   [payload[471], payload[475], payload[479]],
             minclip: fog_minclip,
             maxclip: fog_maxclip,
@@ -1062,7 +1062,7 @@ fn apply_zone_entry(gs: &mut GameState, payload: &[u8]) {
 /// EQ class id (1..=16) → name. From EQEmu common/classes.h.
 ///
 /// Definition moved DOWN into `eqoxide-core` (#544 Step 2h) so the http layer can resolve it
-/// without up-referencing `eq_net`; re-exported here so `crate::eq_net::packet_handler::class_name`
+/// without up-referencing `eq_net`; re-exported here so `crate::packet_handler::class_name`
 /// keeps resolving unchanged.
 pub use eqoxide_core::race_class::class_name;
 
@@ -1298,7 +1298,7 @@ fn apply_player_profile(gs: &mut GameState, payload: &[u8]) {
     // ── Skills @04616 (rof2 PlayerProfile_Struct skills[100]) ──────────────────────
     // Only the first NUM_SKILLS ids are real; the rest is wire padding. Exposed via
     // GET /v1/observe/skills and raised by the trainer API (eqoxide#99).
-    let mut sk = vec![0u32; crate::skills::NUM_SKILLS];
+    let mut sk = vec![0u32; eqoxide_core::skills::NUM_SKILLS];
     for (i, slot) in sk.iter_mut().enumerate() {
         let so = 4616 + i * 4;
         if so + 4 <= payload.len() {
@@ -1359,7 +1359,7 @@ pub fn apply_mana_change(gs: &mut GameState, p: &[u8]) {
     // `casting_spell_id`, SendSpellBarEnable sends the spell it was called with. The sentinel only
     // ever appears in OP_MemorizeSpell.)
     if let Some(spell_id) = spell_id {
-        if !crate::game_state::gem_is_empty(spell_id) {
+        if !eqoxide_core::game_state::gem_is_empty(spell_id) {
             gs.ended_cast_spell = Some((spell_id, std::time::Instant::now()));
         }
     }
@@ -1374,7 +1374,7 @@ pub fn apply_memorize_spell(gs: &mut GameState, p: &[u8]) {
     if let Some((slot, spell_id, scribing)) = parse_memorize_spell(p) {
         match scribing {
             1 => { if (slot as usize) < 9 { gs.mem_spells[slot as usize] = spell_id; } }
-            2 => { if (slot as usize) < 9 { gs.mem_spells[slot as usize] = crate::game_state::EMPTY_GEM; } }
+            2 => { if (slot as usize) < 9 { gs.mem_spells[slot as usize] = eqoxide_core::game_state::EMPTY_GEM; } }
             // memSpellSpellbar (zone/client.h:105) — the server re-enables the spell bar only from
             // the tail of Mob::SpellFinished (zone/spells.cpp:1803/1824), i.e. the cast COMPLETED.
             // An interrupt/fizzle never sends it (InterruptSpell → OP_InterruptCast + OP_ManaChange
@@ -1397,7 +1397,7 @@ pub fn apply_memorize_spell(gs: &mut GameState, p: &[u8]) {
                 if is_sentinel {
                     gs.casting = None;
                 } else {
-                    let text = format!("You have finished casting {}.", crate::spells::name_of(spell_id));
+                    let text = format!("You have finished casting {}.", eqoxide_core::spells::name_of(spell_id));
                     gs.finish_cast(spell_id, "cast_completed", &text);
                 }
             }
@@ -1420,7 +1420,7 @@ pub fn apply_interrupt_cast(gs: &mut GameState, p: &[u8]) {
     // vague one. (eqoxide#348)
     if gs.casting.is_none() { return; }
     let (kind, text) = match messageid {
-        crate::game_state::SPELL_FIZZLE | crate::game_state::MISS_NOTE =>
+        eqoxide_core::game_state::SPELL_FIZZLE | eqoxide_core::game_state::MISS_NOTE =>
             ("cast_fizzled", "Your spell fizzles!".to_string()),
         _ => ("cast_interrupted", "Your spell is interrupted.".to_string()),
     };
@@ -1433,7 +1433,7 @@ pub fn apply_interrupt_cast(gs: &mut GameState, p: &[u8]) {
 /// A server eqstr id that means the player's cast ended badly (or never started). Returns the event
 /// `kind` to publish, or None if the message has nothing to do with casting. (eqoxide#348)
 fn cast_outcome_for_string_id(string_id: u32) -> Option<&'static str> {
-    use crate::game_state::{CAST_FAILED_STRING_IDS, MISS_NOTE, SPELL_FIZZLE};
+    use eqoxide_core::game_state::{CAST_FAILED_STRING_IDS, MISS_NOTE, SPELL_FIZZLE};
     match string_id {
         // A player fizzle reaches us ONLY as this bare message: Client::CheckFizzle fails inside
         // DoCastSpell, which calls StopCasting() + MessageString(Chat::SpellFailure, SPELL_FIZZLE)
@@ -1554,7 +1554,7 @@ fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
         // A SPELL landed via OP_Damage — NOT a melee swing. A heal on a full-HP target arrives with
         // damage==0, which previously fell into the "tries to hit … misses" branch (#272). Resolve the
         // spell name and word it as a spell: beneficial (heal/buff) → "lands on", damaging → "hits for".
-        let db = crate::spells::global();
+        let db = eqoxide_core::spells::global();
         let sname = db.and_then(|d| d.get(spellid)).map(|s| s.name.clone());
         let beneficial = db.is_some_and(|d| d.is_beneficial(spellid));
         match sname {
@@ -1590,7 +1590,7 @@ fn apply_combat_damage(gs: &mut GameState, payload: &[u8]) {
     // subtracted from HP — that would drain the player on every heal (#272); the OP_HPUpdate carries
     // the true post-heal HP.
     let beneficial_spell = spellid != 0 && spellid != SPELL_UNKNOWN
-        && crate::spells::global().is_some_and(|d| d.is_beneficial(spellid));
+        && eqoxide_core::spells::global().is_some_and(|d| d.is_beneficial(spellid));
     if target_id == gs.player_id && damage > 0 && gs.max_hp > 0 && !beneficial_spell {
         gs.cur_hp = (gs.cur_hp - damage).max(0);
         gs.hp_pct = (gs.cur_hp as f32 / gs.max_hp.max(1) as f32) * 100.0;
@@ -1620,7 +1620,7 @@ fn apply_level_update(gs: &mut GameState, payload: &[u8]) {
 /// OP_SetChatServer — the UCS (chat server) address + mail key, sent at zone-in. Capture it so the
 /// UCS link can connect for cross-zone tells/OOC. (Connection/login is built on top of this.)
 fn apply_set_chat_server(gs: &mut GameState, payload: &[u8]) {
-    match crate::eq_net::ucs::parse_set_chat_server(payload) {
+    match crate::ucs::parse_set_chat_server(payload) {
         Some(info) => {
             tracing::info!("UCS: chat server {}:{} mailbox='{}' type='{}'",
                 info.host, info.port, info.mailbox, info.conn_type);
@@ -1648,7 +1648,7 @@ fn apply_who_all(gs: &mut GameState, p: &[u8]) {
     // VARIABLE-LENGTH: `count` records; on truncation keep what we already parsed rather than
     // dropping all — non-panicking `try_*` path, break on the first short field.
     let mut r = WireReader::new(&p[64..], "OP_WhoAllResponse");
-    let mut roster: Vec<crate::game_state::WhoEntry> = Vec::with_capacity(count.min(4096));
+    let mut roster: Vec<eqoxide_core::game_state::WhoEntry> = Vec::with_capacity(count.min(4096));
     for _ in 0..count {
         let parsed = (|| {
             let _fmt = r.try_u32()?;
@@ -1667,7 +1667,7 @@ fn apply_who_all(gs: &mut GameState, p: &[u8]) {
             let _acct = r.try_cstr()?;
             let _u100 = r.try_u32()?;
             let anon = zonestr == 0xFFFF_FFFF || (class == 0 && level == 0 && race == 0);
-            Some(crate::game_state::WhoEntry { name, level, class, race, zone_id: zone, guild, anon })
+            Some(eqoxide_core::game_state::WhoEntry { name, level, class, race, zone_id: zone, guild, anon })
         })();
         match parsed {
             Some(entry) => roster.push(entry),
@@ -1816,7 +1816,7 @@ fn apply_guild_member_list(gs: &mut GameState, payload: &[u8]) {
         r.skip(2);                 // zoneinstance (skipped)
         let zone_id = r.u16_be() as u32;
         r.skip(8);                 // trailing u32 + u32
-        members.push(crate::game_state::GuildMember {
+        members.push(eqoxide_core::game_state::GuildMember {
             name, rank, level, class, zone_id, online: zone_id != 0, public_note,
         });
     }
@@ -1882,15 +1882,15 @@ fn strip_say_links(s: &str) -> String {
 /// a REAL item link's `item_id` was decoded only far enough to check it against the saylink
 /// sentinel and then thrown away; an agent reading the clean text had no id to resolve the item
 /// against. `ItemLink::is_saylink` tells a caller which case it's looking at, since a saylink's
-/// body fields mean something different (see [`crate::game_state::ItemLink`] doc).
+/// body fields mean something different (see [`eqoxide_core::game_state::ItemLink`] doc).
 ///
 /// On the wire a link is `\x12` + a fixed 56-char hex body + the display text + `\x12`
 /// (RoF2). Splitting on the `\x12` control byte (as EQEmu's `Strings::Split(msg, '\x12')` does)
 /// yields plain text at even indices and link contents (body+text) at odd indices. For each
 /// well-formed link (odd segment at least `SAY_LINK_BODY_SIZE` long) we drop the body from the
 /// display text and decode the body's hex fields. Only real saylinks (body `item_id ==
-/// SAYLINK_ITEM_ID`) become [`crate::game_state::DialogueChoice`]s (click-to-say); every
-/// well-formed link — saylink or real item — becomes an [`crate::game_state::ItemLink`].
+/// SAYLINK_ITEM_ID`) become [`eqoxide_core::game_state::DialogueChoice`]s (click-to-say); every
+/// well-formed link — saylink or real item — becomes an [`eqoxide_core::game_state::ItemLink`].
 /// A malformed or short link segment is kept verbatim (minus the control byte) so we never eat
 /// real text, and produces neither.
 ///
@@ -1899,7 +1899,7 @@ fn strip_say_links(s: &str) -> String {
 ///   action_id[0..1] item_id[1..6] augment_1[6..11] augment_2[11..16] augment_3[16..21]
 ///   augment_4[21..26] augment_5[26..31] augment_6[31..36] is_evolving[36..37]
 ///   evolve_group[37..41] evolve_level[41..43] ornament_icon[43..48] hash[48..56]
-fn parse_say_links(s: &str) -> (String, Vec<crate::game_state::DialogueChoice>, Vec<crate::game_state::ItemLink>) {
+fn parse_say_links(s: &str) -> (String, Vec<eqoxide_core::game_state::DialogueChoice>, Vec<eqoxide_core::game_state::ItemLink>) {
     if !s.contains('\x12') {
         return (s.to_string(), Vec::new(), Vec::new());
     }
@@ -1915,13 +1915,13 @@ fn parse_say_links(s: &str) -> (String, Vec<crate::game_state::DialogueChoice>, 
             let hx = |a: usize, b: usize| u32::from_str_radix(&body[a..b], 16).unwrap_or(0);
             let item_id = hx(1, 6);
             let is_saylink = item_id == SAYLINK_ITEM_ID;
-            item_links.push(crate::game_state::ItemLink {
+            item_links.push(eqoxide_core::game_state::ItemLink {
                 text: display.to_string(),
                 item_id,
                 is_saylink,
             });
             if is_saylink {
-                choices.push(crate::game_state::DialogueChoice {
+                choices.push(eqoxide_core::game_state::DialogueChoice {
                     text:      display.to_string(),
                     item_id:   SAYLINK_ITEM_ID,
                     augments:  [hx(6, 11), hx(11, 16), hx(16, 21), hx(21, 26), hx(26, 31), hx(31, 36)],
@@ -1966,7 +1966,7 @@ fn apply_formatted_message(gs: &mut GameState, payload: &[u8]) {
         .map(|s| String::from_utf8_lossy(s).to_string())
         .collect();
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let text = crate::eqstr::format_id(string_id, &arg_refs)
+    let text = eqoxide_core::eqstr::format_id(string_id, &arg_refs)
         .unwrap_or_else(|| arg_refs.join(" "));
     // Formatted quest/server text can embed item saylinks in its arguments (e.g. "You need
     // [<56-hex body>rat whiskers]."). Strip the fixed hex link body so only the readable name
@@ -2007,7 +2007,7 @@ fn apply_simple_message(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < 8 { return; }
     let string_id = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
     if let Some(kind) = cast_outcome_for_string_id(string_id) {
-        let text = crate::eqstr::format_id(string_id, &[])
+        let text = eqoxide_core::eqstr::format_id(string_id, &[])
             .unwrap_or_else(|| "Your spell failed.".to_string());
         gs.finish_cast(0, kind, &text); // finish_cast logs the line too
         // A cast-start/mid-cast REFUSAL ("Insufficient Mana", "Spell recast time not yet met", …)
@@ -2024,7 +2024,7 @@ fn apply_simple_message(gs: &mut GameState, payload: &[u8]) {
         }
         return;
     }
-    if let Some(text) = crate::eqstr::format_id(string_id, &[]) {
+    if let Some(text) = eqoxide_core::eqstr::format_id(string_id, &[]) {
         if !text.trim().is_empty() && !is_debug_spam(&text) {
             gs.log_msg("system", &text);
         }
@@ -2158,7 +2158,7 @@ pub fn apply_consider(gs: &mut GameState, payload: &[u8]) {
     // it has no such gate and is never touched by set_target/clear_target. The structured name
     // falls back to a stable "spawn_<id>" (not the chat line's "Your target" prose) so an agent
     // reading `last_consider.name` for a non-target spawn never sees a lie baked into the label.
-    gs.last_consider = Some(crate::game_state::LastConsider {
+    gs.last_consider = Some(eqoxide_core::game_state::LastConsider {
         spawn_id: target_id,
         name: entity.map(|e| e.name.clone()).unwrap_or_else(|| format!("spawn_{target_id}")),
         con_name: con_level_name(level).to_string(),
@@ -2334,7 +2334,7 @@ fn apply_spawn_doors(gs: &mut GameState, p: &[u8]) {
         let r = &p[off..off + REC];
         let name_end = r[..32].iter().position(|&c| c == 0).unwrap_or(32);
         let name = String::from_utf8_lossy(&r[..name_end]).into_owned();
-        let door = crate::game_state::Door {
+        let door = eqoxide_core::game_state::Door {
             door_id: r[60],
             name,
             y: rd_f32(r, 32),   // north (yPos)
@@ -2370,7 +2370,7 @@ fn apply_bind_respawn(gs: &mut GameState, payload: &[u8]) {
     r.skip(4); // spawn_id / zone_id header (unused here)
     gs.player_x = r.f32();
     gs.player_y = r.f32();
-    gs.player_z = r.f32() - crate::coord::WIRE_Z_OFFSET; // wire→foot datum (#522)
+    gs.player_z = r.f32() - eqoxide_core::coord::WIRE_Z_OFFSET; // wire→foot datum (#522)
     // Real EQ revives a bind-respawned character at FULL HP. `apply_death` zeroed hp_pct and left
     // cur_hp/max_hp stale, so without this the HUD/API show a dead-but-full contradiction
     // (hp/hp_max full, hp_pct 0) until some later OP_HPUpdate happens to reconcile it (eqoxide#68).
@@ -2382,7 +2382,7 @@ fn apply_bind_respawn(gs: &mut GameState, payload: &[u8]) {
 
 /// Apply a WearChange: update one equipment slot's material + tint on an entity.
 pub fn apply_wear_change(gs: &mut GameState, p: &[u8]) {
-    use crate::eq_net::protocol::{WearChange_S, SIZE_WEAR_CHANGE, safe_read};
+    use crate::protocol::{WearChange_S, SIZE_WEAR_CHANGE, safe_read};
     if p.len() < SIZE_WEAR_CHANGE { return; }
     let wc: WearChange_S = unsafe { safe_read(p) };
     let slot = wc.wear_slot_id as usize;
@@ -2654,7 +2654,7 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
         // Wire→foot datum conversion (#522, see coord::WIRE_Z_OFFSET): the spawn z is the
         // model-origin datum ~3.1u above the floor. Converting here seeds the controller at
         // (approximately) the collision floor, so zone-in no longer starts with a phantom 3u fall.
-        gs.player_z       = info.z - crate::coord::WIRE_Z_OFFSET;
+        gs.player_z       = info.z - eqoxide_core::coord::WIRE_Z_OFFSET;
         gs.player_heading = info.heading;
         gs.player_level   = info.level as u32;
         gs.player_race    = eq_race_to_code(info.race).to_string();
@@ -2703,8 +2703,8 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
     // collision) and reported by every agent-facing position, so entities and self share one frame
     // (see the else-branch in apply_position_update for the full rationale). Boats/floating entities
     // skip the server Z-offset, so their wire z is already surface-level — leave it.
-    let floating = crate::eq_net::protocol::is_boat_race(info.race);
-    let z_foot = if floating { info.z } else { info.z - crate::coord::WIRE_Z_OFFSET };
+    let floating = crate::protocol::is_boat_race(info.race);
+    let z_foot = if floating { info.z } else { info.z - eqoxide_core::coord::WIRE_Z_OFFSET };
     gs.upsert_entity(Entity {
         spawn_id:       info.spawn_id,
         name:           info.name,
@@ -2742,8 +2742,8 @@ mod tests {
                 strip_say_links, SAY_LINK_BODY_SIZE, SIZE_DEATH, SIZE_NEW_ZONE,
                 apply_group_update_b, apply_group_join, apply_group_disband_you,
                 apply_group_disband_other, apply_group_leader_change, apply_group_invite, apply_group_acknowledge};
-    use crate::eq_net::protocol::enc_eq19;
-    use crate::game_state::{GameState, Entity, TaskStatus};
+    use crate::protocol::enc_eq19;
+    use eqoxide_core::game_state::{GameState, Entity, TaskStatus};
 
     /// Build a RoF2 saylink: 0x12 + 56-char body + display text + 0x12.
     fn saylink(body_seed: char, text: &str) -> String {
@@ -3179,7 +3179,7 @@ mod tests {
         // and never removed the item, so a sale looked failed. A correct echo for slot 28 must
         // drop the item and log the payout.
         let mut gs = GameState::new();
-        gs.inventory.push(crate::game_state::InvItem {
+        gs.inventory.push(eqoxide_core::game_state::InvItem {
             slot: 28, item_id: 13007, name: "Bone Chips".into(), icon: 0, charges: 1,
             idfile: String::new(), click_spell_id: 0, filename: String::new(),
         });
@@ -3410,8 +3410,8 @@ mod tests {
             "the con result for A must still be logged, not silently swallowed: {m}");
     }
 
-    fn inv_item(slot: i32, item_id: u32, charges: i32) -> crate::game_state::InvItem {
-        crate::game_state::InvItem {
+    fn inv_item(slot: i32, item_id: u32, charges: i32) -> eqoxide_core::game_state::InvItem {
+        eqoxide_core::game_state::InvItem {
             slot, item_id, name: format!("item{item_id}"), icon: 0, charges,
             idfile: String::new(), click_spell_id: 0, filename: String::new(),
         }
@@ -3607,7 +3607,7 @@ mod tests {
     fn looted_item_places_in_free_slot_and_stacks_never_overwrites() {
         // eqoxide#56: loot must not evict an occupied slot, and stackable loot should merge.
         use super::apply_looted_item;
-        use crate::game_state::InvItem;
+        use eqoxide_core::game_state::InvItem;
         let inv = |slot: i32, id: u32, ch: i32| InvItem {
             slot, item_id: id, name: String::new(), icon: 0, charges: ch, idfile: String::new(),
             click_spell_id: 0, filename: String::new(),
@@ -3642,14 +3642,14 @@ mod tests {
         let mut gs = GameState::new();
         gs.player_id = 77;
         // kind 14 (Animation), param 110 (sit) for our own id -> sitting.
-        apply_spawn_appearance(&mut gs, &crate::eq_net::protocol::build_spawn_appearance_packet(77, 14, 110));
+        apply_spawn_appearance(&mut gs, &crate::protocol::build_spawn_appearance_packet(77, 14, 110));
         assert!(gs.sitting, "sit appearance for our player must set sitting");
         // param 100 (stand) -> not sitting.
-        apply_spawn_appearance(&mut gs, &crate::eq_net::protocol::build_spawn_appearance_packet(77, 14, 100));
+        apply_spawn_appearance(&mut gs, &crate::protocol::build_spawn_appearance_packet(77, 14, 100));
         assert!(!gs.sitting, "stand appearance clears sitting");
         // Another spawn's sit must NOT change our flag.
-        apply_spawn_appearance(&mut gs, &crate::eq_net::protocol::build_spawn_appearance_packet(77, 14, 110));
-        apply_spawn_appearance(&mut gs, &crate::eq_net::protocol::build_spawn_appearance_packet(999, 14, 100));
+        apply_spawn_appearance(&mut gs, &crate::protocol::build_spawn_appearance_packet(77, 14, 110));
+        apply_spawn_appearance(&mut gs, &crate::protocol::build_spawn_appearance_packet(999, 14, 100));
         assert!(gs.sitting, "another spawn's stand must not clear our sitting");
     }
 
@@ -3661,7 +3661,7 @@ mod tests {
         // Equipping a weapon from the cursor (33) to the off hand (14) must move it in gs so the
         // scene derives the held model from slot 14 without a relog. (eqoxide#141)
         let mut gs = GameState::new();
-        gs.inventory.push(crate::game_state::InvItem {
+        gs.inventory.push(eqoxide_core::game_state::InvItem {
             slot: 33, item_id: 9023, name: "Qeynos Kite Shield".into(), idfile: "IT63".into(),
             ..Default::default()
         });
@@ -3678,7 +3678,7 @@ mod tests {
         // A REAL 28-byte inbound wire MoveItem_Struct (server sends these on trade/autostack/resync)
         // is dispatched through the same apply_packet and reaches this handler — it must be IGNORED,
         // not decoded as (from=0, to=garbage), which would relocate slot 0 and corrupt inventory.
-        gs.inventory.push(crate::game_state::InvItem {
+        gs.inventory.push(eqoxide_core::game_state::InvItem {
             slot: 0, item_id: 1234, name: "Charm".into(), ..Default::default()
         });
         // Mirror a real Worn/Normal wire move: from_slot = Type(0)|Unknown02(0) → first 4 bytes 0;
@@ -3910,14 +3910,14 @@ mod tests {
     /// Without the dispatch arm, "Looting complete" would be unreachable in the field (#346).
     #[test]
     fn apply_packet_dispatches_op_loot_complete_to_the_completion_handler() {
-        use crate::eq_net::transport::AppPacket;
+        use crate::transport::AppPacket;
         let mut gs = GameState::new();
         gs.loot_session_active = true;
         gs.loot_confirmed = true;
         gs.loot_current_corpse = Some(7);
         gs.loot_end_requested_at = Some(std::time::Instant::now());
         super::apply_packet(&mut gs, &AppPacket {
-            opcode: crate::eq_net::protocol::OP_LOOT_COMPLETE,
+            opcode: crate::protocol::OP_LOOT_COMPLETE,
             payload: Vec::new(), // OP_LootComplete is a 0-byte packet (corpse.cpp EndLoot)
         });
         assert!(!gs.loot_session_active, "the inbound packet must close the session");
@@ -3933,17 +3933,17 @@ mod tests {
     /// arm leaves the target stale and turns it RED (mutation-checked).
     #[test]
     fn apply_packet_op_target_command_forces_target_honestly() {
-        use crate::eq_net::transport::AppPacket;
+        use crate::transport::AppPacket;
         let mut gs = GameState::new();
         // Start on an OLD target so a no-op handler would leave a detectable stale value.
-        gs.upsert_entity(crate::game_state::make_entity(10, "an old rat", 0.0, 0.0, 0.0, true));
+        gs.upsert_entity(eqoxide_core::game_state::make_entity(10, "an old rat", 0.0, 0.0, 0.0, true));
         gs.set_target(10);
-        gs.upsert_entity(crate::game_state::make_entity(42, "a decaying skeleton", 1.0, 0.0, 0.0, true));
+        gs.upsert_entity(eqoxide_core::game_state::make_entity(42, "a decaying skeleton", 1.0, 0.0, 0.0, true));
         assert_eq!(gs.target_id, Some(10));
 
         // Server force-targets spawn 42 (e.g. Sense Undead points us at the nearest undead).
         super::apply_packet(&mut gs, &AppPacket {
-            opcode: crate::eq_net::protocol::OP_TARGET_COMMAND,
+            opcode: crate::protocol::OP_TARGET_COMMAND,
             payload: 42u32.to_le_bytes().to_vec(), // ClientTarget_Struct = single u32 new_target
         });
         assert_eq!(gs.target_id, Some(42), "server force-target must update target_id");
@@ -3952,7 +3952,7 @@ mod tests {
 
         // new_target == 0 is EQEmu's clear-target sentinel (merc-hire clear).
         super::apply_packet(&mut gs, &AppPacket {
-            opcode: crate::eq_net::protocol::OP_TARGET_COMMAND,
+            opcode: crate::protocol::OP_TARGET_COMMAND,
             payload: 0u32.to_le_bytes().to_vec(),
         });
         assert_eq!(gs.target_id, None, "OP_TargetCommand(0) must clear the target");
@@ -4079,7 +4079,7 @@ mod tests {
         assert_eq!(gs.loot_defensive_close_at, None, "the quarantine must still resolve");
     }
 
-    use crate::eq_net::item::tests::{fixture, fixture2};
+    use crate::item::tests::{fixture, fixture2};
 
     #[test]
     fn class_name_maps_ids() {
@@ -4092,7 +4092,7 @@ mod tests {
 
     #[test]
     fn who_all_request_is_156_bytes_with_filters() {
-        let p = crate::eq_net::protocol::build_who_all_request(3);
+        let p = crate::protocol::build_who_all_request(3);
         assert_eq!(p.len(), 156, "RoF2 Who_All_Struct must be exactly 156 bytes (DECODE_LENGTH_EXACT)");
         // whom[0..64] and unknown088[64..128] are zero.
         assert!(p[0..128].iter().all(|&b| b == 0), "whom + unknown088 pad are empty/zero");
@@ -4461,7 +4461,7 @@ mod tests {
     #[test]
     fn register_spawn_self_match_tolerates_config_mismatch_and_adopts_server_name() {
         use super::register_spawn;
-        use crate::eq_net::protocol::SpawnInfo;
+        use crate::protocol::SpawnInfo;
         let mk = |name: &str| SpawnInfo {
             spawn_id: 7, name: name.into(), last_name: String::new(),
             level: 5, npc: 0, gender: 0, race: 1, class_: 1, guild_id: 0xFFFF_FFFF, guild_rank: 0, body_type: 1,
@@ -4504,7 +4504,7 @@ mod tests {
         // player. Asserting on the corrected name (not the raw config value) is what proves the
         // filter is keyed on server truth.
         use super::register_spawn;
-        use crate::eq_net::protocol::SpawnInfo;
+        use crate::protocol::SpawnInfo;
 
         let mut gs = GameState::new();
         gs.player_name = "Aldric ".to_string(); // config-sourced, stray trailing space
@@ -4617,7 +4617,7 @@ mod tests {
     #[test]
     fn apply_guild_member_update_patches_presence() {
         let mut gs = GameState::new();
-        gs.guild_members = vec![crate::game_state::GuildMember {
+        gs.guild_members = vec![eqoxide_core::game_state::GuildMember {
             name: "Bob".into(), rank: 5, level: 3, class: 1, zone_id: 22, online: true,
             public_note: String::new(),
         }];
@@ -4633,7 +4633,7 @@ mod tests {
     #[test]
     fn apply_wear_change_updates_one_slot() {
         use super::{register_spawn, apply_wear_change};
-        use crate::eq_net::protocol::SpawnInfo;
+        use crate::protocol::SpawnInfo;
         let mut gs = GameState::new();
         gs.player_name = "Nobody".into();
         let info = SpawnInfo {
@@ -4659,7 +4659,7 @@ mod tests {
     #[test]
     fn apply_wear_change_ignores_short_packet() {
         use super::apply_wear_change;
-        use crate::eq_net::protocol::SIZE_WEAR_CHANGE;
+        use crate::protocol::SIZE_WEAR_CHANGE;
         let mut gs = GameState::new();
         // Craft a packet whose bytes, if the short-packet length guard were removed, would
         // zero-pad (via `safe_read`) into a VALID-looking WearChange for the local player:
@@ -4696,7 +4696,7 @@ mod tests {
     #[test]
     fn register_spawn_lays_down_zone_in_corpses() {
         use super::register_spawn;
-        use crate::eq_net::protocol::SpawnInfo;
+        use crate::protocol::SpawnInfo;
         let mk = |npc: u8, name: &str| SpawnInfo {
             spawn_id: 7, name: name.into(), last_name: String::new(),
             level: 2, npc, gender: 0, race: 1, class_: 1, guild_id: 0xFFFF_FFFF, guild_rank: 0, body_type: 1,
@@ -4736,7 +4736,7 @@ mod tests {
         // (EQEmu NoTarget=11 / NoTarget2=60), NOT by race or coords — real content can share the
         // same sentinel-looking coords these controllers use.
         use super::register_spawn;
-        use crate::eq_net::protocol::SpawnInfo;
+        use crate::protocol::SpawnInfo;
         let mk = |body_type: u32, x: f32, y: f32, z: f32, name: &str| SpawnInfo {
             spawn_id: 1496, name: name.into(), last_name: String::new(),
             level: 1, npc: 1, gender: 0, race: 240, class_: 1, guild_id: 0xFFFF_FFFF, guild_rank: 0,
@@ -4784,7 +4784,7 @@ mod tests {
 
     #[test]
     fn position_roundtrip_negative_z() {
-        use crate::eq_net::protocol::{decode_position_update, encode_position_update};
+        use crate::protocol::{decode_position_update, encode_position_update};
         let pkt = encode_position_update(42, 100.0, 200.0, -15.5, 0.0);
         let d = decode_position_update(&pkt).expect("decode negative z");
         assert_eq!(d.spawn_id, 42);
@@ -4795,7 +4795,7 @@ mod tests {
 
     #[test]
     fn position_roundtrip_heading_near_360() {
-        use crate::eq_net::protocol::{decode_position_update, encode_position_update};
+        use crate::protocol::{decode_position_update, encode_position_update};
         // A heading near a full circle should survive encode/decode (CCW convention).
         let pkt = encode_position_update(7, -250.0, 80.0, 3.0, 359.0);
         let d = decode_position_update(&pkt).expect("decode heading near 360");
@@ -4824,7 +4824,7 @@ mod tests {
 
     #[test]
     fn register_spawn_parses_equipment_le() {
-        use crate::eq_net::protocol::SpawnInfo;
+        use crate::protocol::SpawnInfo;
         use super::register_spawn;
         let mut gs = GameState::new();
         gs.player_name = "Someone Else".into();
@@ -4850,7 +4850,7 @@ mod tests {
     #[test]
     fn begin_cast_sets_casting_state() {
         // The player's OWN cast (caster_id == player_id) sets the cast bar. RoF2 10-byte layout.
-        let mut gs = crate::game_state::GameState::new(); // player_id defaults to 0
+        let mut gs = eqoxide_core::game_state::GameState::new(); // player_id defaults to 0
         let mut b = [0u8; 10];
         b[0..4].copy_from_slice(&200u32.to_le_bytes());               // spell_id
         b[4..6].copy_from_slice(&(gs.player_id as u16).to_le_bytes()); // caster = self
@@ -4991,11 +4991,11 @@ mod tests {
         super::apply_begin_cast(&mut gs, &begin_cast_pkt(42, 202, 2500));
         // Another caster's interrupt is broadcast to everyone nearby (zone/spells.cpp:1339): it must
         // neither clear OUR cast bar nor emit an outcome for us.
-        super::apply_interrupt_cast(&mut gs, &interrupt_pkt(999, crate::game_state::INTERRUPT_SPELL));
+        super::apply_interrupt_cast(&mut gs, &interrupt_pkt(999, eqoxide_core::game_state::INTERRUPT_SPELL));
         assert!(gs.casting.is_some(), "a passing NPC's interrupt must not clear our cast bar");
         assert_eq!(event_kinds(&gs), ["cast_begin"]);
         // Ours does.
-        super::apply_interrupt_cast(&mut gs, &interrupt_pkt(42, crate::game_state::INTERRUPT_SPELL));
+        super::apply_interrupt_cast(&mut gs, &interrupt_pkt(42, eqoxide_core::game_state::INTERRUPT_SPELL));
         assert!(gs.casting.is_none());
         assert_eq!(event_kinds(&gs), ["cast_begin", "cast_interrupted"]);
         let last = gs.last_cast.as_ref().unwrap();
@@ -5011,7 +5011,7 @@ mod tests {
         let mut gs = GameState::new();
         gs.player_id = 42;
         super::apply_mana_change(&mut gs, &mana_change_pkt(90, 202, 0));
-        super::apply_simple_message(&mut gs, &simple_msg_pkt(crate::game_state::SPELL_FIZZLE));
+        super::apply_simple_message(&mut gs, &simple_msg_pkt(eqoxide_core::game_state::SPELL_FIZZLE));
         assert_eq!(event_kinds(&gs), ["cast_fizzled"],
             "a fizzle must be its own outcome — not silence, and not 'interrupted'");
         let last = gs.last_cast.as_ref().expect("fizzle recorded");
@@ -5029,7 +5029,7 @@ mod tests {
         gs.player_id = 42;
         super::apply_begin_cast(&mut gs, &begin_cast_pkt(42, 202, 2500));
         super::apply_simple_message(&mut gs, &simple_msg_pkt(199)); // INSUFFICIENT_MANA
-        super::apply_interrupt_cast(&mut gs, &interrupt_pkt(42, crate::game_state::INTERRUPT_SPELL));
+        super::apply_interrupt_cast(&mut gs, &interrupt_pkt(42, eqoxide_core::game_state::INTERRUPT_SPELL));
         assert_eq!(event_kinds(&gs), ["cast_begin", "cast_failed"]);
         assert_eq!(gs.last_cast.as_ref().unwrap().kind, "cast_failed");
     }
@@ -5041,7 +5041,7 @@ mod tests {
         let mut gs = GameState::new();
         gs.player_id = 42;
         super::apply_mana_change(&mut gs, &mana_change_pkt(90, 202, 0));
-        super::apply_simple_message(&mut gs, &simple_msg_pkt(crate::game_state::SPELL_FIZZLE));
+        super::apply_simple_message(&mut gs, &simple_msg_pkt(eqoxide_core::game_state::SPELL_FIZZLE));
         assert_eq!(gs.last_cast.as_ref().unwrap().spell_id, 202);
         // A later refusal the server never attached a spell to → 0 ("we don't know"), NOT 202.
         super::apply_simple_message(&mut gs, &simple_msg_pkt(236)); // SPELL_RECAST
@@ -5061,7 +5061,7 @@ mod tests {
         let mut gs = GameState::new();
         gs.player_id = 42;
         super::apply_begin_cast(&mut gs, &begin_cast_pkt(42, 202, 2500));
-        super::apply_interrupt_cast(&mut gs, &interrupt_pkt(42, crate::game_state::INTERRUPT_SPELL));
+        super::apply_interrupt_cast(&mut gs, &interrupt_pkt(42, eqoxide_core::game_state::INTERRUPT_SPELL));
         assert_eq!(gs.last_cast.as_ref().unwrap().kind, "cast_interrupted");
         super::apply_mana_change(&mut gs, &mana_change_pkt(90, 202, 0)); // <-- the trailing one
         assert!(gs.ended_cast_spell.is_none(), "the trailing ManaChange must not re-arm the hint");
@@ -5094,7 +5094,7 @@ mod tests {
         gs.resolve_pending_cast_end();
         assert!(gs.last_cast.is_none());
         // Once it lapses with no explanation, say so out loud rather than stay silent.
-        gs.pending_cast_end = Some(std::time::Instant::now() - crate::game_state::CAST_END_GRACE);
+        gs.pending_cast_end = Some(std::time::Instant::now() - eqoxide_core::game_state::CAST_END_GRACE);
         gs.resolve_pending_cast_end();
         let last = gs.last_cast.as_ref().expect("an unexplained end is still an outcome");
         assert_eq!(last.kind, "cast_ended_unexplained");
@@ -5130,7 +5130,7 @@ mod tests {
         assert!(gs.casting.is_none(),
             "a stale suppression must not eat this cast's terminal — that hangs `casting` forever");
         assert!(gs.pending_cast_end.is_some(), "the unexplained end must still be tracked");
-        gs.pending_cast_end = Some(std::time::Instant::now() - crate::game_state::CAST_END_GRACE);
+        gs.pending_cast_end = Some(std::time::Instant::now() - eqoxide_core::game_state::CAST_END_GRACE);
         gs.resolve_pending_cast_end();
         let last = gs.last_cast.as_ref().expect("the later cast still reports an outcome");
         assert_eq!(last.kind, "cast_ended_unexplained");
@@ -5168,7 +5168,7 @@ mod tests {
         // Dead ids are not harmless: each one is a latent UNBALANCED arm of suppress_cast_end (it
         // can never be matched by a terminal the server never sends for it). 106 and 237 exist in
         // zone/string_ids.h but nothing in zone/*.cpp sends them, so they were removed.
-        use crate::game_state::CAST_FAILED_STRING_IDS as IDS;
+        use eqoxide_core::game_state::CAST_FAILED_STRING_IDS as IDS;
         assert_eq!(IDS, [197, 199, 214, 236]);
         assert!(!IDS.contains(&106), "SPELL_DOES_NOT_WORK_HERE has no sender in zone/*.cpp");
         assert!(!IDS.contains(&237), "SPELL_RECOVERY has no sender in zone/*.cpp");
@@ -5199,7 +5199,7 @@ mod tests {
         gs2.player_id = 42;
         super::apply_begin_cast(&mut gs2, &begin_cast_pkt(42, 202, 2500));
         super::apply_mana_change(&mut gs2, &mana_change_pkt(90, 202, 0));
-        gs2.pending_cast_end = Some(std::time::Instant::now() - crate::game_state::CAST_END_GRACE);
+        gs2.pending_cast_end = Some(std::time::Instant::now() - eqoxide_core::game_state::CAST_END_GRACE);
         gs2.resolve_pending_cast_end();
         let inferred = gs2.last_cast.clone().expect("unexplained end recorded");
 
@@ -5243,7 +5243,7 @@ mod tests {
         for spell in [202u32, 203, 204] {
             super::apply_mana_change(&mut gs, &mana_change_pkt(300, spell, 0));
         }
-        gs.pending_cast_end = gs.pending_cast_end.map(|_| std::time::Instant::now() - crate::game_state::CAST_END_GRACE);
+        gs.pending_cast_end = gs.pending_cast_end.map(|_| std::time::Instant::now() - eqoxide_core::game_state::CAST_END_GRACE);
         gs.resolve_pending_cast_end();
         assert!(gs.last_cast.is_none(), "no cast was in flight — inventing an outcome is a lie");
         assert!(event_kinds(&gs).is_empty());
@@ -5278,7 +5278,7 @@ mod tests {
         super::apply_mana_change(&mut gs, &mana_change_pkt(300, 202, 0)); // cooldown-reset burst
         // Age the hint past its freshness window.
         gs.ended_cast_spell = gs.ended_cast_spell
-            .map(|(id, _)| (id, std::time::Instant::now() - crate::game_state::CAST_HINT_FRESH));
+            .map(|(id, _)| (id, std::time::Instant::now() - eqoxide_core::game_state::CAST_HINT_FRESH));
         super::apply_simple_message(&mut gs, &simple_msg_pkt(236)); // SPELL_RECAST, names no spell
         let last = gs.last_cast.as_ref().unwrap();
         assert_eq!(last.kind, "cast_failed");
@@ -5301,7 +5301,7 @@ mod tests {
     #[test]
     fn zone_points_drop_sentinel_entries() {
         use super::apply_zone_points;
-        use crate::eq_net::protocol::SIZE_ZONE_POINT_ENTRY;
+        use crate::protocol::SIZE_ZONE_POINT_ENTRY;
         // Build one 32-byte RoF2 ZonePoint_Entry: iterator@0, y@4, x@8, z@12, heading@16,
         // zoneid(u16)@20, zoneinstance@22, then two trailing u32s.
         let entry = |iter: u32, y: f32, x: f32, z: f32, zoneid: u16| -> Vec<u8> {
@@ -5389,7 +5389,7 @@ mod tests {
         use super::apply_move_door;
         let mut gs = GameState::new();
         // normal door (invert_state = false)
-        gs.upsert_door(crate::game_state::Door {
+        gs.upsert_door(eqoxide_core::game_state::Door {
             door_id: 1, name: "D".into(), x:0.0,y:0.0,z:0.0,heading:0.0,incline:0,size:100,
             opentype:5, door_param:0, invert_state:false, is_open:false,
         });
@@ -5399,7 +5399,7 @@ mod tests {
         assert!(!gs.world.doors.get(&1).unwrap().is_open);
 
         // inverted door: action 0x02 means "close", 0x03 means "open"
-        gs.upsert_door(crate::game_state::Door {
+        gs.upsert_door(eqoxide_core::game_state::Door {
             door_id: 2, name: "D".into(), x:0.0,y:0.0,z:0.0,heading:0.0,incline:0,size:100,
             opentype:5, door_param:0, invert_state:true, is_open:true,
         });
@@ -5417,7 +5417,7 @@ mod tests {
     /// in gs.world.entities (or update the player, if name matches).
     #[test]
     fn zone_entry_registers_npc_spawn() {
-        use crate::eq_net::protocol::parse_rof2_spawn;
+        use crate::protocol::parse_rof2_spawn;
         use super::apply_zone_entry;
 
         // Build a minimal NPC spawn buffer (same as protocol.rs helper).
@@ -5601,7 +5601,7 @@ mod tests {
     /// branch is byte-correct (so a live drop of these NPCs is a DELIVERY problem, not a parse one).
     #[test]
     fn playable_race_npc_216_equipment_branch_parses_fully() {
-        use crate::eq_net::protocol::parse_rof2_spawn;
+        use crate::protocol::parse_rof2_spawn;
         use super::apply_zone_entry;
 
         for (race, name, id) in [(1u32, "Hansl_Bigroon", 501), (3, "Danaria_Hollin", 502),
@@ -5850,7 +5850,7 @@ mod tests {
         assert!((gs.player_y - (-50.0)).abs() < 0.2);
         // The self-spawn z (10.0) is the WIRE (model-origin) datum; register_spawn converts it to
         // the internal FOOT datum by subtracting WIRE_Z_OFFSET (#522).
-        assert!((gs.player_z - (10.0 - crate::coord::WIRE_Z_OFFSET)).abs() < 0.2,
+        assert!((gs.player_z - (10.0 - eqoxide_core::coord::WIRE_Z_OFFSET)).abs() < 0.2,
             "self-spawn z is stored FOOT-relative (wire − WIRE_Z_OFFSET), got {}", gs.player_z);
     }
 
@@ -6037,7 +6037,7 @@ mod tests {
     fn apply_char_inventory_ignores_zero_count() {
         let mut gs = GameState::new();
         // Push a dummy item so we can verify inventory is untouched
-        gs.inventory.push(crate::game_state::InvItem {
+        gs.inventory.push(eqoxide_core::game_state::InvItem {
             slot: 99, item_id: 1, name: "existing".into(), icon: 1, charges: 1, idfile: "IT1".into(),
             click_spell_id: 0, filename: String::new(),
         });
@@ -6226,7 +6226,7 @@ mod tests {
 
     #[test]
     fn build_item_link_click_lays_out_struct() {
-        use crate::eq_net::protocol::{build_item_link_click, OP_ITEM_LINK_CLICK};
+        use crate::protocol::{build_item_link_click, OP_ITEM_LINK_CLICK};
         assert_eq!(OP_ITEM_LINK_CLICK, 0x4cef);
         let p = build_item_link_click(0xF_FFFF, &[42, 0, 0, 0, 0, 0], 0xABCD, 7);
         assert_eq!(p.len(), 52);
@@ -6302,7 +6302,7 @@ mod tests {
     fn apply_completed_tasks_parses_title_and_flips_status() {
         let mut gs = GameState::new();
         // Task 500 was already in the journal (arrived via OP_TaskDescription earlier).
-        gs.tasks.insert(500, crate::game_state::ActiveTask {
+        gs.tasks.insert(500, eqoxide_core::game_state::ActiveTask {
             task_id: 500, title: "Kill Rats".into(), status: TaskStatus::Active, ..Default::default()
         });
         let p = build_completed_tasks(&[(500, "Kill Rats", 1_700_000_000), (501, "Deliver Note", 1_700_000_100)]);
@@ -6394,7 +6394,7 @@ mod tests {
     #[test]
     fn apply_death_marks_npc_dead_and_sets_lying_animation() {
         use super::apply_death;
-        use crate::game_state::Entity;
+        use eqoxide_core::game_state::Entity;
         let mut gs = GameState::new();
         gs.player_id = 1;
         // Register an NPC entity with id=42
@@ -6551,8 +6551,8 @@ mod tests {
         // leaving her blind to everyone who joined after her.
         let mut gs = GameState::new();
         gs.group_members = vec![
-            crate::game_state::GroupMember { name: "Sylvaris".into(), is_leader: true, ..Default::default() },
-            crate::game_state::GroupMember { name: "Elaria".into(), ..Default::default() },
+            eqoxide_core::game_state::GroupMember { name: "Sylvaris".into(), is_leader: true, ..Default::default() },
+            eqoxide_core::game_state::GroupMember { name: "Elaria".into(), ..Default::default() },
         ];
         apply_group_join(&mut gs, &build_group_join("Sylvaris", "Fenwick", 12));
         let names: Vec<_> = gs.group_members.iter().map(|m| m.name.as_str()).collect();
@@ -6573,8 +6573,8 @@ mod tests {
     #[test]
     fn apply_group_disband_other_removes_whichever_name_is_a_current_member() {
         let mut gs = GameState::new();
-        gs.group_members.push(crate::game_state::GroupMember { name: "Sariel".into(), ..Default::default() });
-        gs.group_members.push(crate::game_state::GroupMember { name: "Aldric".into(), ..Default::default() });
+        gs.group_members.push(eqoxide_core::game_state::GroupMember { name: "Sariel".into(), ..Default::default() });
+        gs.group_members.push(eqoxide_core::game_state::GroupMember { name: "Aldric".into(), ..Default::default() });
         // name1 = the departing member, name2 = something unrelated.
         let p = fixed_name_pair("Sariel", "Unrelated");
         apply_group_disband_other(&mut gs, &p);
@@ -6585,7 +6585,7 @@ mod tests {
     #[test]
     fn apply_group_disband_other_no_op_when_neither_name_matches() {
         let mut gs = GameState::new();
-        gs.group_members.push(crate::game_state::GroupMember { name: "Aldric".into(), ..Default::default() });
+        gs.group_members.push(eqoxide_core::game_state::GroupMember { name: "Aldric".into(), ..Default::default() });
         let p = fixed_name_pair("Nobody", "AlsoNobody");
         apply_group_disband_other(&mut gs, &p);
         assert_eq!(gs.group_members.len(), 1);
@@ -6594,7 +6594,7 @@ mod tests {
     #[test]
     fn apply_group_disband_you_clears_group_state() {
         let mut gs = GameState::new();
-        gs.group_members.push(crate::game_state::GroupMember { name: "Aldric".into(), ..Default::default() });
+        gs.group_members.push(eqoxide_core::game_state::GroupMember { name: "Aldric".into(), ..Default::default() });
         gs.group_leader = "Aldric".into();
         gs.pending_invite = Some("Someone".into());
         apply_group_disband_you(&mut gs, &[]);
@@ -6606,8 +6606,8 @@ mod tests {
     #[test]
     fn apply_group_leader_change_updates_leader_and_flags() {
         let mut gs = GameState::new();
-        gs.group_members.push(crate::game_state::GroupMember { name: "Aldric".into(), is_leader: true, ..Default::default() });
-        gs.group_members.push(crate::game_state::GroupMember { name: "Sariel".into(), ..Default::default() });
+        gs.group_members.push(eqoxide_core::game_state::GroupMember { name: "Aldric".into(), is_leader: true, ..Default::default() });
+        gs.group_members.push(eqoxide_core::game_state::GroupMember { name: "Sariel".into(), ..Default::default() });
         let mut p = vec![0u8; 148];
         let name = b"Sariel";
         p[64..64 + name.len()].copy_from_slice(name); // LeaderName at offset 64
@@ -6651,7 +6651,7 @@ mod tests {
         // navigation.rs mirrors an accept/decline by sending an EMPTY OP_TaskSelectWindow, which
         // must clear the render-side offers so the Task selector window closes (bug #5).
         let mut gs = GameState::new();
-        gs.task_offers.push(crate::game_state::TaskOffer {
+        gs.task_offers.push(eqoxide_core::game_state::TaskOffer {
             task_id: 9, npc_id: 3, title: "T".into(), description: "D".into(), has_rewards: false,
         });
         apply_task_select_window(&mut gs, &[]);

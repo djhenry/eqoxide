@@ -68,7 +68,7 @@ const PROC_LEN:         usize = 30;  // sizeof(ProcEffectStruct)           rof2_
 const WORN_LEN:         usize = 30;  // sizeof(WornEffectStruct)           rof2_structs.h:4962
 const QUATERNARY_LEN:   usize = 171; // sizeof(ItemQuaternaryBodyStruct)   rof2_structs.h:4977
 
-use crate::eq_net::wire::WireReader;
+use crate::wire::WireReader;
 
 /// Deserialize one RoF2-serialized item.
 ///

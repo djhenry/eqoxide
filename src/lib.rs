@@ -92,9 +92,20 @@ pub mod scene;
 // builder). See the crate's module docs.
 pub use eqoxide_http as http;
 
+// The EQ network client / MVC Model (the net thread that decodes the RoF2 wire and is the SOLE
+// writer of the shared GameState — login flow, zone gameplay loop, packet apply, server
+// reconciliation, the nav/action thread draining the request slots) now lives in the `eqoxide-net`
+// workspace crate (#544 Step 2m), depending only on the lower structural crates
+// (`eqoxide-core`/`ipc`/`command`/`nav`/`protocol`/`telemetry`) + externals (tokio/des/…) — never on
+// this app crate, the renderer, gpu, or ui. Its one app-side type, `MoveIntent`, it references from
+// `eqoxide-ipc` directly. Alias it as this crate's `eq_net` module so every existing
+// `crate::eq_net::…` / `eqoxide::eq_net::…` call site (main.rs spawns the net thread; app.rs, ui/*,
+// model.rs, and `tests/http_observe_apply.rs`'s `eq_net::packet_handler` apply-fn calls) keeps
+// resolving unchanged.
+pub use eqoxide_net as eq_net;
+
 // Modules only needed by the full client binary.
 pub mod camera_state;
-pub mod eq_net;
 pub mod frame_capture;
 pub mod hud;
 pub mod model;

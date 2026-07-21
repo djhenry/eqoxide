@@ -1,0 +1,56 @@
+[package]
+name = "eqoxide-net"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "eqoxide_net"
+path = "src/lib.rs"
+
+[dependencies]
+# eqoxide-net is the MVC Model — the net thread that decodes the RoF2 wire and is the SOLE writer of
+# the shared GameState (login flow, zone gameplay loop, packet apply, server reconciliation, the
+# nav/action thread that drains the request slots). It depends ONLY on the lower structural crates
+# — never on the app crate, renderer, gpu, wgpu, winit, egui, models, anim, ui, movement, or http.
+# The single app-side type it needs (`MoveIntent`) it takes from eqoxide-ipc directly, not the
+# app crate's `movement` re-export.
+eqoxide-core = { path = "../eqoxide-core" }          # game_state / coord / physics / spells / skills / eqstr / zone_map / config / ucs
+eqoxide-ipc = { path = "../eqoxide-ipc" }            # the Arc<Mutex<…>> IPC request slots + MoveIntent / NetHealthShared / AppPacket peers
+eqoxide-command = { path = "../eqoxide-command" }    # CommandState — the typed write-path facade the action loop drains
+eqoxide-nav = { path = "../eqoxide-nav" }            # collision / planner / steering / walker the action loop drives
+eqoxide-protocol = { path = "../eqoxide-protocol" }  # protocol (RoF2 decoders/structs/consts) + wire (WireReader), re-exported at crate root
+eqoxide-telemetry = { path = "../eqoxide-telemetry" }  # packet_telemetry capture ring (re-exported via the `packet_telemetry` module shim)
+tokio = { version = "1", features = ["full"] }
+des = "0.8"
+cbc = "0.1"
+byteorder = "1.5"
+miniz_oxide = "0.8"
+rand = "0.8"
+arc-swap = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+# `CommandState::goto_target` — gated behind `test-fixtures` (not bare `#[cfg(test)]`) in
+# eqoxide-command, so invisible across the crate boundary otherwise. action_loop's death/zone-clear
+# tests read it.
+eqoxide-command = { path = "../eqoxide-command", features = ["test-fixtures"] }
+# `game_state::make_entity` — a `#[cfg(test)]` fixture constructor in eqoxide-core, exposed to this
+# crate's test build via `test-fixtures`. packet_handler's loot/target tests seed entities with it.
+eqoxide-core = { path = "../eqoxide-core", features = ["test-fixtures"] }
+# TEST-ONLY. Two eq_net tests deliberately reference the REAL http-side constants instead of magic
+# literals so a future edit to either side of a cross-layer timing invariant is caught here:
+#   - transport.rs `connect_keeps_last_tick_fresh_across_a_silent_handshake` → `SESSION_STALE_TICK_MS`
+#     (the #477 stale-tick WRITE-guard threshold).
+#   - action_loop.rs `net_give_timeout_is_shorter_than_the_http_await_budget` → `interact::
+#     GIVE_HTTP_TIMEOUT_SECS` (the #448/#475 two-timeout ordering landmine).
+# Both are plain `pub const`s (no feature needed). This is a DEV-dependency only — eqoxide-http does
+# not appear in this crate's normal dependency tree, and eqoxide-http never depends on eqoxide-net,
+# so there is no cycle.
+eqoxide-http = { path = "../eqoxide-http" }
+# `test-util` (not in tokio's `full`) enables `#[tokio::test(start_paused = true)]` for the give
+# two-timeout / reconciliation tests to elapse real timeouts in virtual time — instantly.
+tokio = { version = "1", features = ["full", "test-util"] }
+# packet_handler's `zone_spawns_parse_failure_is_logged_not_silent` test installs a scoped
+# `tracing_subscriber::fmt()` capture subscriber to assert the parse-failure WARN is emitted (not
+# silently swallowed). Test-only; the release binary's subscriber is wired up in the app crate.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
