@@ -95,12 +95,23 @@ fn push_cross(v: &mut Vec<OverlayVertex>, p: [f32; 3], half: f32, color: [f32; 4
 
 /// Encode the snapshot as world-space LINE-LIST vertices (pairs). Pure: the snapshot in, the
 /// vertices out — see the module docs for why this signature is the anti-drift property itself.
+///
+/// (The GPU path splits this into [`trace_vertices`] + [`live_vertices`] so the potentially-large
+/// plan trace is only re-encoded when the PLAN changes, not on every per-tick publish — the
+/// "diagnostic must not perturb what it observes" budget. This function stays the single
+/// definition the property tests pin: it is exactly the concatenation of the two.)
 pub fn overlay_vertices(snap: &NavDebugSnapshot) -> Vec<OverlayVertex> {
-    let mut v: Vec<OverlayVertex> = Vec::new();
+    let mut v = trace_vertices(snap);
+    v.extend(live_vertices(snap));
+    v
+}
 
-    // 1. The plan's evaluated edges — the calls whose outcome was RETURNED (`outcome_calls`), so
-    //    what you see is the answer the walker acted on, not a retry that lost. Each edge drawn
-    //    exactly as recorded; absent edges (unevaluated) draw NOTHING.
+/// The plan-trace part: the evaluated edges of the calls whose outcome was RETURNED
+/// (`outcome_calls`) — the answer the walker acted on, not a retry that lost. Each edge drawn
+/// exactly as recorded; absent edges (unevaluated) draw NOTHING. Changes only when a new plan
+/// lands, so the GPU path caches it keyed on the plan's `gen`.
+pub fn trace_vertices(snap: &NavDebugSnapshot) -> Vec<OverlayVertex> {
+    let mut v: Vec<OverlayVertex> = Vec::new();
     if let Some(plan) = &snap.plan {
         let (o0, o1) = plan.trace.outcome_calls;
         for call in plan.trace.calls.get(o0..o1).unwrap_or(&[]) {
@@ -113,8 +124,14 @@ pub fn overlay_vertices(snap: &NavDebugSnapshot) -> Vec<OverlayVertex> {
             }
         }
     }
+    v
+}
 
-    // 2. The COMMITTED coarse route (#246: the walker's actual plan, verbatim) + the fine plan.
+/// The small per-tick part: committed routes, goal, player, clearance sample, pads.
+pub fn live_vertices(snap: &NavDebugSnapshot) -> Vec<OverlayVertex> {
+    let mut v: Vec<OverlayVertex> = Vec::new();
+
+    // The COMMITTED coarse route (#246: the walker's actual plan, verbatim) + the fine plan.
     for w in snap.committed_coarse.windows(2) {
         push_line(&mut v, lift(w[0]), lift(w[1]), COL_COARSE_ROUTE);
     }
@@ -122,16 +139,16 @@ pub fn overlay_vertices(snap: &NavDebugSnapshot) -> Vec<OverlayVertex> {
         push_line(&mut v, lift(w[0]), lift(w[1]), COL_FINE_ROUTE);
     }
 
-    // 3. Goal beacon: a tall vertical line + a cross, so the destination is findable at range.
+    // Goal beacon: a tall vertical line + a cross, so the destination is findable at range.
     if let Some(g) = snap.goal {
         push_line(&mut v, g, [g[0], g[1], g[2] + 30.0], COL_GOAL);
         push_cross(&mut v, lift(g), 2.0, COL_GOAL);
     }
 
-    // 4. Player marker.
+    // Player marker.
     push_cross(&mut v, lift(snap.player), 1.5, COL_PLAYER);
 
-    // 5. The live clearance sample, drawn AT its own recorded position (`at` — where the probe was
+    // The live clearance sample, drawn AT its own recorded position (`at` — where the probe was
     //    really taken, which may lag the player by a few ticks): wall spokes shaded by distance
     //    (red = wall at touch range, green = roomy), and the footprint ring per direction.
     if let Some(c) = &snap.clearance {
@@ -157,7 +174,7 @@ pub fn overlay_vertices(snap: &NavDebugSnapshot) -> Vec<OverlayVertex> {
         }
     }
 
-    // 6. Pads with a usable advertised destination: source → dest link + markers. Pads whose state
+    // Pads with a usable advertised destination: source → dest link + markers. Pads whose state
     //    is Unknown/AdvertisedUnusable carry no drawable geometry (their positions are unknown or
     //    refused) — honesty by omission, matching the endpoint's full report.
     for pad in &snap.pads {
@@ -173,14 +190,47 @@ pub fn overlay_vertices(snap: &NavDebugSnapshot) -> Vec<OverlayVertex> {
 
 // ─────────────────────────────── GPU side ───────────────────────────────
 
-/// The overlay's GPU state: a growable vertex buffer re-encoded only when the published snapshot's
-/// `seq` changes (not per frame).
+/// One growable line-list vertex buffer + the cache key of its current contents.
 #[derive(Default)]
-pub struct NavOverlayGpu {
+pub struct OverlayBuf {
     pub vbuf:     Option<wgpu::Buffer>,
     pub capacity: usize, // vertices the buffer can hold
     pub count:    u32,   // vertices to draw this frame
-    pub last_seq: u64,
+    pub key:      u64,   // cache key of the encoded contents (0 = empty/stale)
+}
+
+impl OverlayBuf {
+    /// Upload `verts` if `key` differs from what the buffer holds, growing it as needed.
+    fn refresh(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, label: &str,
+               key: u64, verts: &[OverlayVertex]) {
+        if self.key == key { return; }
+        self.key = key;
+        self.count = verts.len() as u32;
+        if verts.is_empty() { return; }
+        if self.vbuf.is_none() || self.capacity < verts.len() {
+            let capacity = verts.len().next_power_of_two().max(1024);
+            self.vbuf = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: (capacity * std::mem::size_of::<OverlayVertex>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+            self.capacity = capacity;
+        }
+        queue.write_buffer(self.vbuf.as_ref().unwrap(), 0, bytemuck::cast_slice(verts));
+    }
+}
+
+/// The overlay's GPU state, split so the DIAGNOSTIC never perturbs what it observes (#608's
+/// frame-rate regression requirement):
+/// * `trace`: the plan's evaluated edges — potentially tens of thousands of lines, re-encoded
+///   only when a NEW PLAN lands (keyed on the plan's `gen`), not on every per-tick publish;
+/// * `live`: routes/goal/player/clearance/pads — a few hundred vertices, re-encoded per publish
+///   (keyed on the snapshot's `seq`).
+#[derive(Default)]
+pub struct NavOverlayGpu {
+    pub trace: OverlayBuf,
+    pub live:  OverlayBuf,
 }
 
 /// Encode the overlay pass. No-op when the scene carries no snapshot (overlay toggled off, or
@@ -193,31 +243,30 @@ pub fn encode_nav_overlay_pass(
     scene:   &crate::scene::SceneState,
 ) {
     let Some(snap) = &scene.nav_debug else {
-        r.nav_overlay.count = 0;
-        r.nav_overlay.last_seq = 0; // force a re-encode when toggled back on
+        // Toggled off: draw nothing and force a re-encode when toggled back on.
+        r.nav_overlay.trace.key = 0;
+        r.nav_overlay.trace.count = 0;
+        r.nav_overlay.live.key = 0;
+        r.nav_overlay.live.count = 0;
         return;
     };
-    if r.nav_overlay.last_seq != snap.seq {
-        let verts = overlay_vertices(snap);
-        r.nav_overlay.last_seq = snap.seq;
-        r.nav_overlay.count = verts.len() as u32;
-        if !verts.is_empty() {
-            if r.nav_overlay.vbuf.is_none() || r.nav_overlay.capacity < verts.len() {
-                let capacity = verts.len().next_power_of_two().max(1024);
-                r.nav_overlay.vbuf = Some(r.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("nav_overlay_vertices"),
-                    size: (capacity * std::mem::size_of::<OverlayVertex>()) as u64,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }));
-                r.nav_overlay.capacity = capacity;
-            }
-            r.queue.write_buffer(
-                r.nav_overlay.vbuf.as_ref().unwrap(), 0, bytemuck::cast_slice(&verts));
-        }
+    // The trace buffer is keyed on the PLAN's generation (0 = no plan): the expensive encode runs
+    // once per plan. The live buffer is keyed on the publish seq (never 0: seq starts at 1).
+    let plan_key = snap.plan.as_ref().map(|p| p.gen.max(1)).unwrap_or(0);
+    if plan_key == 0 {
+        r.nav_overlay.trace.key = 0;
+        r.nav_overlay.trace.count = 0;
+    } else {
+        let (device, queue) = (&r.device, &r.queue);
+        r.nav_overlay.trace.refresh(device, queue, "nav_overlay_trace", plan_key,
+            &trace_vertices(snap));
     }
-    let (Some(vbuf), count) = (&r.nav_overlay.vbuf, r.nav_overlay.count) else { return };
-    if count == 0 { return; }
+    {
+        let (device, queue) = (&r.device, &r.queue);
+        r.nav_overlay.live.refresh(device, queue, "nav_overlay_live", snap.seq.max(1),
+            &live_vertices(snap));
+    }
+    if r.nav_overlay.trace.count == 0 && r.nav_overlay.live.count == 0 { return; }
 
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("nav_overlay"),
@@ -234,8 +283,14 @@ pub fn encode_nav_overlay_pass(
     });
     pass.set_pipeline(&r.pipelines.nav_debug);
     pass.set_bind_group(0, &r.camera_uniform.bind_group, &[]);
-    pass.set_vertex_buffer(0, vbuf.slice(..));
-    pass.draw(0..count, 0..1);
+    for buf in [&r.nav_overlay.trace, &r.nav_overlay.live] {
+        if let (Some(vbuf), count) = (&buf.vbuf, buf.count) {
+            if count > 0 {
+                pass.set_vertex_buffer(0, vbuf.slice(..));
+                pass.draw(0..count, 0..1);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
