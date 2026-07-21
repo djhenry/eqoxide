@@ -2,7 +2,7 @@
 //! server into a cwd-independent XDG cache. Pure logic here is unit-tested; the
 //! HTTP transport is a trait (see UreqTransport).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub fn blake3_hex(bytes: &[u8]) -> String {
@@ -58,14 +58,17 @@ impl CacheDirs {
         Ok(hash)
     }
 
-    // ── per-set synced digest (the staleness cursor) ──────────────────────────
-    // Stored in the same cache root as the reassembled files, so clearing the cache clears both —
-    // a recorded digest therefore always corresponds to files that are actually present.
+    // ── per-set synced state (the staleness cursor) ───────────────────────────
+    // Stored in the same cache root as the reassembled files, so clearing the whole cache clears
+    // both together. But the digest alone is not proof the files are present: this record also
+    // carries the file list from the last successful sync, so an "unchanged digest" response can
+    // be checked against what's actually in `models/` before being trusted (#601) — a digest is a
+    // claim about the SERVER's content identity, not about the state of our local disk.
     fn synced_path(&self) -> PathBuf {
         self.root.join("synced.json")
     }
 
-    fn load_synced(&self) -> std::collections::HashMap<String, String> {
+    fn load_synced(&self) -> std::collections::HashMap<String, SyncedSet> {
         std::fs::read(self.synced_path())
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
@@ -74,13 +77,24 @@ impl CacheDirs {
 
     /// The digest last successfully synced for `set`, if any (missing/malformed file → `None`).
     pub fn synced_digest(&self, set: &str) -> Option<String> {
-        self.load_synced().get(set).cloned()
+        self.load_synced().get(set).map(|s| s.digest.clone())
     }
 
-    /// Record `digest` as the last-synced identity for `set` (call only after a successful sync).
-    pub fn set_synced_digest(&self, set: &str, digest: &str) {
+    /// The digest and file list recorded at the last successful sync for `set`, if any. The file
+    /// list is what lets `sync_set` verify a server-reported "unchanged" against the real
+    /// contents of `models/` instead of trusting the digest blindly.
+    fn synced(&self, set: &str) -> Option<(String, Vec<FileEntry>)> {
+        self.load_synced().get(set).map(|s| (s.digest.clone(), s.files.clone()))
+    }
+
+    /// Record `digest` and `files` as the last-synced identity for `set` (call only after a
+    /// successful sync or repair).
+    fn set_synced(&self, set: &str, digest: &str, files: &[FileEntry]) {
         let mut map = self.load_synced();
-        map.insert(set.to_string(), digest.to_string());
+        map.insert(
+            set.to_string(),
+            SyncedSet { digest: digest.to_string(), files: files.to_vec() },
+        );
         if let Ok(bytes) = serde_json::to_vec_pretty(&map) {
             let _ = std::fs::create_dir_all(&self.root);
             let _ = std::fs::write(self.synced_path(), bytes);
@@ -88,7 +102,15 @@ impl CacheDirs {
     }
 }
 
-#[derive(Deserialize, Clone, Debug)]
+/// On-disk record for one synced set: the server digest it corresponds to, plus the file list
+/// used to verify (and, if needed, rebuild) the assembled artifacts on a later "unchanged" fetch.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+struct SyncedSet {
+    digest: String,
+    files: Vec<FileEntry>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct FileEntry {
     pub path: String,
     pub size: u64,
@@ -120,9 +142,9 @@ pub fn set_digest(files: &[FileEntry]) -> String {
     h.finalize().to_hex().to_string()
 }
 
-pub fn missing_chunks(manifest: &Manifest, cache: &CacheDirs) -> Vec<String> {
+pub fn missing_chunks(files: &[FileEntry], cache: &CacheDirs) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for f in &manifest.files {
+    for f in files {
         for h in &f.chunks {
             if !cache.cas_has(h) && !out.contains(h) {
                 out.push(h.clone());
@@ -130,6 +152,49 @@ pub fn missing_chunks(manifest: &Manifest, cache: &CacheDirs) -> Vec<String> {
         }
     }
     out
+}
+
+/// Whether every entry in `files` has an assembled artifact in `models_dir` whose size matches
+/// what the (last-synced) manifest recorded. This is a cheap, stat-only check — not a full re-hash
+/// of potentially large GLBs on every launch — so it catches the case this issue is about (the
+/// file deleted/evicted entirely) and gross corruption (truncated/resized), at the cost of not
+/// catching a same-size bit-flip. A same-size corruption would need a whole-file hash, which the
+/// client doesn't otherwise compute at startup; not worth adding here for that narrower case.
+fn artifacts_intact(cache: &CacheDirs, files: &[FileEntry]) -> bool {
+    files.iter().all(|f| {
+        std::fs::metadata(cache.models_dir().join(&f.path))
+            .map(|m| m.len() == f.size)
+            .unwrap_or(false)
+    })
+}
+
+/// Downloads whatever chunks in `files` aren't already in the CAS, then reassembles every file.
+/// Shared by both the normal (server digest Changed) sync path and the repair path taken when an
+/// unchanged digest's own artifacts turn out to be missing/corrupt (#601).
+fn fetch_and_reassemble(
+    t: &dyn Transport,
+    cache: &CacheDirs,
+    files: &[FileEntry],
+    progress: &mut dyn FnMut(SyncProgress),
+) -> anyhow::Result<()> {
+    let missing = missing_chunks(files, cache);
+    let total = missing.len();
+    let mut bytes = 0u64;
+    for (i, hash) in missing.iter().enumerate() {
+        let data = t.get_chunk(hash)?;
+        // The server is content-addressed: a chunk's bytes must hash to its id.
+        let got = blake3_hex(&data);
+        if &got != hash {
+            anyhow::bail!("chunk {hash} content mismatch (got {got})");
+        }
+        cache.cas_put(&data)?;
+        bytes += data.len() as u64;
+        progress(SyncProgress { phase: Phase::Downloading, done: i + 1, total, bytes });
+    }
+    for entry in files {
+        reassemble(cache, entry)?;
+    }
+    Ok(())
 }
 
 pub fn reassemble(cache: &CacheDirs, entry: &FileEntry) -> anyhow::Result<()> {
@@ -257,9 +322,35 @@ pub fn sync_set(
     cache: &CacheDirs,
     progress: &mut dyn FnMut(SyncProgress),
 ) -> anyhow::Result<()> {
-    let prev = cache.synced_digest(set);
-    let manifest = match t.get_manifest(set, prev.as_deref())? {
-        ManifestFetch::Unchanged => return Ok(()), // identical to what we already have — skip
+    let prev = cache.synced(set);
+    // Only offer the server our digest when we also still have the file list it refers to — that
+    // list is what lets an "Unchanged" reply be checked locally. (In practice the two are always
+    // recorded together, so this is really just "do we have a prior sync at all", but it also
+    // gracefully re-syncs once if the on-disk record ever fails to parse.)
+    let if_none_match = prev.as_ref().map(|(d, _)| d.as_str());
+
+    let manifest = match t.get_manifest(set, if_none_match)? {
+        ManifestFetch::Unchanged => {
+            // The server saying "unchanged" is a claim about ITS content identity — it says
+            // nothing about whether our own assembled artifact is still on disk. Trusting the
+            // digest alone here is exactly the #601 bug: if the file is deleted/evicted (or
+            // corrupted) while the server digest stays put, the digest never changes on its own,
+            // so the client would report "up to date" forever and clearing the local cache (the
+            // obvious recovery move) would not help, because the digest — not the artifact — is
+            // what gets consulted. Verify the artifacts before honoring the short-circuit.
+            let (_, files) = prev.expect(
+                "get_manifest only returns Unchanged in response to a digest we sent, \
+                 and we only send one when `prev` (digest+files) is Some",
+            );
+            if artifacts_intact(cache, &files) {
+                return Ok(()); // content AND local artifacts both unchanged — genuine no-op
+            }
+            progress(SyncProgress { phase: Phase::Verifying, done: 0, total: 0, bytes: 0 });
+            fetch_and_reassemble(t, cache, &files, progress)?;
+            // digest and file list are unchanged from what's already recorded — nothing new to
+            // persist, the repair just restored what the record already claimed was true.
+            return Ok(());
+        }
         ManifestFetch::Changed(m) => m,
     };
     // Defense against a lying/corrupt server: the manifest must hash to its claimed digest.
@@ -269,26 +360,10 @@ pub fn sync_set(
     }
     progress(SyncProgress { phase: Phase::Verifying, done: 0, total: 0, bytes: 0 });
 
-    let missing = missing_chunks(&manifest, cache);
-    let total = missing.len();
-    let mut bytes = 0u64;
-    for (i, hash) in missing.iter().enumerate() {
-        let data = t.get_chunk(hash)?;
-        // The server is content-addressed: a chunk's bytes must hash to its id.
-        let got = blake3_hex(&data);
-        if &got != hash {
-            anyhow::bail!("chunk {hash} content mismatch (got {got})");
-        }
-        cache.cas_put(&data)?;
-        bytes += data.len() as u64;
-        progress(SyncProgress { phase: Phase::Downloading, done: i + 1, total, bytes });
-    }
+    fetch_and_reassemble(t, cache, &manifest.files, progress)?;
 
-    for entry in &manifest.files {
-        reassemble(cache, entry)?;
-    }
     // Record the synced identity so a future unchanged fetch (304) can skip the whole set.
-    cache.set_synced_digest(set, &manifest.digest);
+    cache.set_synced(set, &manifest.digest, &manifest.files);
     Ok(())
 }
 
@@ -344,12 +419,12 @@ mod manifest_tests {
         let cache = CacheDirs::with_root(dir.path());
         let (m, _) = manifest_with(&cache);
         // both chunks were just put -> nothing missing
-        assert!(missing_chunks(&m, &cache).is_empty());
+        assert!(missing_chunks(&m.files, &cache).is_empty());
 
         // a manifest referencing an absent chunk
         let mut m2 = m.clone();
         m2.files[0].chunks.push("absenthash".into());
-        assert_eq!(missing_chunks(&m2, &cache), vec!["absenthash".to_string()]);
+        assert_eq!(missing_chunks(&m2.files, &cache), vec!["absenthash".to_string()]);
     }
 
     #[test]
@@ -450,25 +525,69 @@ mod sync_tests {
         let dir = tempfile::tempdir().unwrap();
         let c = CacheDirs::with_root(dir.path());
         assert_eq!(c.synced_digest("zone/qeynos"), None);
-        c.set_synced_digest("zone/qeynos", "abc123");
-        c.set_synced_digest("gamedata", "def456");
+        c.set_synced("zone/qeynos", "abc123", &[]);
+        c.set_synced("gamedata", "def456", &[]);
         assert_eq!(c.synced_digest("zone/qeynos").as_deref(), Some("abc123"));
         assert_eq!(c.synced_digest("gamedata").as_deref(), Some("def456"));
     }
 
     #[test]
-    fn unchanged_after_first_sync_skips() {
+    fn unchanged_digest_with_intact_artifact_still_skips() {
+        // The short-circuit exists for good reason (no redundant chunk fetches/rewrites on every
+        // launch) and must be preserved when the artifact really is fine.
         let dir = tempfile::tempdir().unwrap();
         let cache = CacheDirs::with_root(dir.path());
         let t = fixture();
         sync_set(&t, "common", &cache, &mut |_| {}).unwrap();
         assert_eq!(cache.synced_digest("common").as_deref(), Some(t.manifest.digest.as_str()));
-        // Delete the reassembled file; an Unchanged (304) sync must NOT touch it (true skip).
-        std::fs::remove_file(cache.models_dir().join("humanoid.glb")).unwrap();
+
         let before = *t.chunk_calls.borrow();
         sync_set(&t, "common", &cache, &mut |_| {}).unwrap();
-        assert_eq!(*t.chunk_calls.borrow(), before, "Unchanged must not fetch chunks");
-        assert!(!cache.models_dir().join("humanoid.glb").exists(), "Unchanged must skip reassembly");
+        assert_eq!(*t.chunk_calls.borrow(), before, "Unchanged + intact artifact must not fetch chunks");
+    }
+
+    #[test]
+    fn unchanged_digest_with_missing_artifact_rebuilds() {
+        // #601: an unchanged server digest is a claim about server-side content identity only —
+        // it says nothing about whether OUR assembled artifact is still on disk. Simulates the
+        // "obvious" recovery move (delete the reassembled file, expect a relaunch to fix it) while
+        // the server-side content hasn't changed; that recovery must actually work, not wedge
+        // forever behind a digest that will never change on its own.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = CacheDirs::with_root(dir.path());
+        let t = fixture();
+        sync_set(&t, "common", &cache, &mut |_| {}).unwrap();
+        assert!(cache.models_dir().join("humanoid.glb").exists());
+
+        std::fs::remove_file(cache.models_dir().join("humanoid.glb")).unwrap();
+        assert_eq!(
+            cache.synced_digest("common").as_deref(),
+            Some(t.manifest.digest.as_str()),
+            "the recorded digest is untouched by deleting the artifact"
+        );
+
+        sync_set(&t, "common", &cache, &mut |_| {}).unwrap();
+        assert!(
+            cache.models_dir().join("humanoid.glb").exists(),
+            "an unchanged digest must not be trusted over a missing artifact — it must be rebuilt"
+        );
+    }
+
+    #[test]
+    fn unchanged_digest_with_wrong_sized_artifact_rebuilds() {
+        // A same-name-but-corrupt (here: truncated) artifact must also be treated as "not there"
+        // rather than trusted just because the path exists.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = CacheDirs::with_root(dir.path());
+        let t = fixture();
+        sync_set(&t, "common", &cache, &mut |_| {}).unwrap();
+        let path = cache.models_dir().join("humanoid.glb");
+        std::fs::write(&path, b"corrupt").unwrap(); // right name, wrong size
+
+        sync_set(&t, "common", &cache, &mut |_| {}).unwrap();
+        let out = std::fs::read(&path).unwrap();
+        assert_eq!(out.len(), 30, "the correctly-sized artifact (10+20 bytes) must be restored");
+        assert_ne!(out, b"corrupt", "the corrupt bytes must not survive the sync");
     }
 
     #[test]
