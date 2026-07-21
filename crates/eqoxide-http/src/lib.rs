@@ -175,6 +175,12 @@ pub struct PlayerState {
     pub cur_mana:      i32,
     pub max_mana:      i32,
     pub xp_pct:        f32,
+    /// #529/#586: the character currently has Levitate up (gravity off — it free-floats instead of
+    /// falling, and the controller stops applying gravity). Derived from BOTH server channels: the
+    /// self-spawn `flymode` byte / `OP_SpawnAppearance` type 19, and the buff list cross-referenced
+    /// to SPA 57. Exposed because it changes what movement commands do: an agent that reads
+    /// `pos_up` while levitating is reading a height it will NOT fall from.
+    pub levitating:    bool,
     /// Current target's display name and HP percent (0–100), or None when nothing is targeted.
     pub target_name:   Option<String>,
     pub target_hp_pct: Option<f32>,
@@ -260,6 +266,7 @@ impl PlayerState {
             died_ago_secs: gs.died_at
                                .filter(|t| t.elapsed().as_secs() < DEATH_STICKY_SECS)
                                .map(|t| t.elapsed().as_secs()),
+            levitating: gs.player_levitating(),
             mana_pct:   gs.mana_pct,
             cur_mana:   gs.cur_mana,
             max_mana:   gs.max_mana,
