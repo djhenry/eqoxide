@@ -25,6 +25,9 @@ pub struct Layouts {
     /// What the lit zone shaders read to receive shadows (group 2 on the zone pipelines): the light
     /// view-proj uniform + the shadow depth texture + a comparison sampler. (#518)
     pub shadow_sample_bgl: wgpu::BindGroupLayout,
+    /// Weather-particle uniform (eqoxide#542): per-frame camera basis + fall params, visible to
+    /// both stages (vertex animates the field, fragment shades rain vs snow).
+    pub weather_bgl: wgpu::BindGroupLayout,
 }
 
 pub struct CameraUniform {
@@ -37,6 +40,20 @@ pub struct CameraUniform {
 pub struct SkyUniform {
     pub buf:        wgpu::Buffer,
     pub bind_group: wgpu::BindGroup,
+}
+
+/// GPU resources for the weather-particle field (eqoxide#542): a per-frame uniform (camera basis +
+/// fall params), a static instance buffer of per-particle base positions, and the shared quad
+/// vertex buffer. The particle count actually drawn is chosen per frame from the server weather
+/// (see `eqoxide_core::weather::particle_plan`); the buffers are sized once for `MAX_PARTICLES`.
+pub struct WeatherResources {
+    pub uniform_buf:  wgpu::Buffer,
+    pub bind_group:   wgpu::BindGroup,
+    /// `MAX_PARTICLES` instances, each a vec4 (base xyz in [0,1) + phase). Generated once,
+    /// deterministically — the shader recycles them around the moving camera every frame.
+    pub instance_buf: wgpu::Buffer,
+    /// 6 vertices (two triangles) of a unit quad, corners in [-1,1]^2, billboarded in the shader.
+    pub quad_buf:     wgpu::Buffer,
 }
 
 pub struct Pipelines {
@@ -63,6 +80,9 @@ pub struct Pipelines {
     pub shadow_static:    wgpu::RenderPipeline,
     pub shadow_skinned:   wgpu::RenderPipeline,
     pub shadow_instanced: wgpu::RenderPipeline,
+    /// Weather precipitation particles (eqoxide#542): instanced billboard quads, alpha-blended,
+    /// depth-tested against the scene but depth-write off. Drawn only when weather is active.
+    pub weather: wgpu::RenderPipeline,
 }
 
 /// Create the three bind group layouts used across all pipelines.
@@ -163,6 +183,20 @@ pub fn build_layouts(device: &wgpu::Device) -> Layouts {
         }],
     });
 
+    let weather_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("weather_bgl"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+
     // What the lit shaders sample: light view-proj (fragment uniform) + depth texture + comparison
     // sampler. Depth32Float is sampled as a non-filtering depth texture with a comparison sampler.
     let shadow_sample_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -197,7 +231,64 @@ pub fn build_layouts(device: &wgpu::Device) -> Layouts {
         ],
     });
 
-    Layouts { camera_bgl, texture_bgl, entity_bgl, joints_bgl, sky_bgl, shadow_light_bgl, shadow_sample_bgl }
+    Layouts { camera_bgl, texture_bgl, entity_bgl, joints_bgl, sky_bgl, shadow_light_bgl, shadow_sample_bgl, weather_bgl }
+}
+
+/// Create the weather-particle GPU resources (eqoxide#542): the per-frame uniform + bind group, the
+/// static per-particle instance buffer (deterministically generated base positions), and the shared
+/// billboard quad. The particle buffer is sized once for `weather::MAX_PARTICLES`; the renderer
+/// draws a subset each frame based on the server weather intensity.
+pub fn build_weather(device: &wgpu::Device, layouts: &Layouts) -> WeatherResources {
+    use wgpu::util::DeviceExt;
+
+    // Per-frame uniform, zero-initialized (the first active frame overwrites it; when weather is
+    // clear the pass is skipped, so stale contents are never drawn).
+    let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("weather_uniform"),
+        size: std::mem::size_of::<crate::gpu::WeatherUniformData>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("weather_bg"),
+        layout: &layouts.weather_bgl,
+        entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniform_buf.as_entire_binding() }],
+    });
+
+    // Instance data: MAX_PARTICLES base positions in the unit cube [0,1)^3 plus a per-particle
+    // phase, from a small deterministic PRNG (xorshift32) so the field is identical every run and
+    // needs no RNG crate. The shader maps these into the camera-centered box each frame.
+    let n = eqoxide_core::weather::MAX_PARTICLES as usize;
+    let mut instances: Vec<[f32; 4]> = Vec::with_capacity(n);
+    let mut state: u32 = 0x9E3779B9; // fixed seed → deterministic field
+    let mut next = || {
+        // xorshift32
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        (state as f32) / (u32::MAX as f32)
+    };
+    for _ in 0..n {
+        instances.push([next(), next(), next(), next()]);
+    }
+    let instance_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("weather_instances"),
+        contents: bytemuck::cast_slice(&instances),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+
+    // Static billboard quad: two triangles, corners in [-1,1]^2.
+    let quad: [[f32; 2]; 6] = [
+        [-1.0, -1.0], [1.0, -1.0], [1.0, 1.0],
+        [-1.0, -1.0], [1.0, 1.0], [-1.0, 1.0],
+    ];
+    let quad_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("weather_quad"),
+        contents: bytemuck::cast_slice(&quad),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+
+    WeatherResources { uniform_buf, bind_group, instance_buf, quad_buf }
 }
 
 /// Create the sky-gradient uniform buffer + bind group (eqoxide#561). Initialized to the daytime
@@ -763,10 +854,58 @@ pub fn build_pipelines(
         multiview: None, cache: None,
     });
 
+    // ── Weather particle pipeline (eqoxide#542) ────────────────────────────
+    // Instanced billboard quads: group 0 = camera (view_proj + camera_pos), group 1 = weather
+    // params. vbuf 0 = the static quad corner (vec2, per-vertex); vbuf 1 = per-particle instance
+    // (vec4 base+phase, per-instance). Alpha-blended and depth-tested against the scene but with
+    // depth-write OFF (reuses `transparent_depth`), so precipitation is occluded by geometry in
+    // front of it without polluting depth for later passes.
+    let weather_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("weather"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/weather.wgsl").into()),
+    });
+    let weather_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("weather_layout"),
+        bind_group_layouts: &[&layouts.camera_bgl, &layouts.weather_bgl],
+        push_constant_ranges: &[],
+    });
+    let weather_quad_vbl = wgpu::VertexBufferLayout {
+        array_stride: 8, // vec2<f32>
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &wgpu::vertex_attr_array![0 => Float32x2],
+    };
+    let weather_inst_vbl = wgpu::VertexBufferLayout {
+        array_stride: 16, // vec4<f32> base+phase
+        step_mode: wgpu::VertexStepMode::Instance,
+        attributes: &wgpu::vertex_attr_array![1 => Float32x4],
+    };
+    let weather = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("weather"),
+        layout: Some(&weather_layout),
+        vertex: wgpu::VertexState {
+            module: &weather_shader, entry_point: "vs_main",
+            buffers: &[weather_quad_vbl, weather_inst_vbl], compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &weather_shader, entry_point: "fs_main",
+            targets: &[Some(wgpu::ColorTargetState {
+                format, blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default()
+        },
+        depth_stencil: Some(transparent_depth.clone()),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None, cache: None,
+    });
+
     Pipelines {
         sky, zone, zone_instanced,
         zone_blend, zone_additive, zone_instanced_blend, zone_instanced_additive,
-        billboard, character, skinned, skinned_overlay,
+        billboard, character, skinned, skinned_overlay, weather,
         shadow_static, shadow_skinned, shadow_instanced,
     }
 }
