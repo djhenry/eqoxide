@@ -3553,6 +3553,40 @@ mod tests {
         assert!(near(&last, goal[0], goal[1]), "route must end at the goal on slab B, got {last:?}");
     }
 
+    /// #543/#554 — the walker must NEVER route THROUGH an advertised same-zone teleport pad, because
+    /// the client cannot verify a pad is genuinely same-zone: the server resolves an organic crossing
+    /// index-BLIND by nearest-XY trigger (never on the wire), so an advertised `zone_id == current`
+    /// pad can be a real cross-zone line (qeynos2 index=2 → qcat). This test proves the low-level
+    /// resolver WOULD build a usable edge from the advertised pad, yet the policy gate
+    /// (`same_zone_pad_edges`) refuses it — so a goal reachable only across the pad is honestly
+    /// `no_path`, never a silent drift into the wrong zone.
+    ///
+    /// Mutation check: flip `TRUST_ADVERTISED_SAME_ZONE_CROSSINGS` to `true` → `same_zone_pad_edges`
+    /// returns the edge (non-empty) and this goes RED. (That same gate also re-enables the #266
+    /// in-zone escape, the other path that would walk the char onto the line.)
+    #[test]
+    fn advertised_same_zone_pads_are_never_routed_through_543() {
+        use eqoxide_core::game_state::ZonePoint;
+        const CURRENT: u16 = 2; // the zone we are standing in (qeynos2)
+        let (col, _start, _goal, index, _fp) = pad_scene();
+        let dest = [430.0, 40.0, 0.0]; // a real floor point on slab B
+
+        // Precondition: the honesty-gated RESOLVER turns this advertised same-zone pad into exactly
+        // one usable edge — so the pad scene is genuinely routable-through at the mechanism level.
+        assert_eq!(col.resolve_teleport_pads(&[(index, dest)]).len(), 1,
+            "precondition: the advertised pad resolves to one edge at the mechanism level");
+
+        // But the POLICY refuses to feed it to the planner: an advertised `zone_id == current` pad is
+        // not trustworthy as same-zone, so no edge is produced and A* cannot route through it.
+        let zps = vec![ZonePoint {
+            iterator: index as u32, server_x: dest[0], server_y: dest[1], server_z: dest[2],
+            heading: 0.0, zone_id: CURRENT,
+        }];
+        assert!(crate::walker::same_zone_pad_edges(&zps, CURRENT, &col).is_empty(),
+            "#543: eqoxide must NOT route the walker through an advertised same-zone pad it cannot \
+             verify — the char must stay put (no_path), not drift across a real zone line");
+    }
+
     /// HONESTY GUARD (#403): a pad edge must never FABRICATE reachability. An advertised pad whose
     /// destination is out over the void (no floor anywhere in its column) resolves to NO edge, so a
     /// goal reachable only via that (non-existent) link stays honestly `Unreachable` — the inverse

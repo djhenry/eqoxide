@@ -24,9 +24,53 @@
 
 use eqoxide_core::coord::eq_heading;
 use eqoxide_core::physics::fall_damage;
-use eqoxide_core::game_state::GameState;
+use eqoxide_core::game_state::{GameState, ZonePoint};
 use eqoxide_ipc::MoveIntent;
 use crate::steering::*;
+
+/// **The #543/#554 honesty gate.** Whether eqoxide TRUSTS an advertised same-zone crossing enough to
+/// AUTO-ROUTE the walker onto it — as a #403 teleport-pad planner edge OR a #266 sealed-area escape.
+///
+/// It is `false`, and for a protocol-generic client it must stay `false`. An `OP_SendZonepoints`
+/// entry's `zone_id` is the honest `target_zone_id` of one DB row, but it does NOT tell the client
+/// whether physically entering the matching DRNTP region will trigger a SAME-zone reposition or a
+/// real CROSS-zone handoff. The server resolves an organic `OP_ZoneChange(zoneID=0)` by
+/// `GetClosestZonePointWithoutZone` — an index-BLIND, nearest-XY match over EVERY zone_point's
+/// **trigger** coordinates, which the wire NEVER carries (verified against EQEmu
+/// `zoning.cpp`/`zone.cpp`/`client.cpp`). So an advertised "same-zone" pad (`zone_id == current`) can,
+/// and in qeynos2 provably does (its three same-zone rows have placeholder `0,0,0` triggers that can
+/// never win the race), resolve server-side to a DIFFERENT zone. Routing the walker onto such a pad
+/// walks the character across whatever real zone line the server picks — silently dumping it in a zone
+/// the `/goto` never targeted (qeynos2 → qcat, #543). That is the top-priority bug class: a silent
+/// wrong-place result the agent cannot detect.
+///
+/// Because same-vs-cross can ONLY be known from the server's echoed `(zoneID, instanceID)` (the #554
+/// receive-side authority), the client must NOT pre-classify a crossing as a safe same-zone teleport
+/// and must NOT auto-route onto one. A goal reachable only across such a pad is honestly `no_path`;
+/// a DELIBERATE/incidental crossing still works — the auto-cross stays server-authoritative (#554).
+pub(crate) const TRUST_ADVERTISED_SAME_ZONE_CROSSINGS: bool = false;
+
+/// The #403 intra-zone teleport-pad edges the planner may route THROUGH — gated by
+/// [`TRUST_ADVERTISED_SAME_ZONE_CROSSINGS`]. Currently ALWAYS empty (#543): the client cannot verify
+/// an advertised same-zone pad is genuinely same-zone (see the gate's doc), so it must not fabricate a
+/// walkable shortcut across what may be a real cross-zone line. Free function (not a method) so the
+/// gate is unit-testable against a real pad scene without standing up a whole `Walker`.
+pub(crate) fn same_zone_pad_edges(
+    zone_points: &[ZonePoint], current_zone: u16, c: &crate::collision::Collision,
+) -> Vec<crate::collision::PadEdge> {
+    if !TRUST_ADVERTISED_SAME_ZONE_CROSSINGS {
+        return Vec::new();
+    }
+    let advertised: Vec<(i32, [f32; 3])> = zone_points.iter()
+        .filter(|zp| zp.zone_id == current_zone
+            && zp.server_x.abs() < 900_000.0
+            && zp.server_y.abs() < 900_000.0
+            && zp.server_z.abs() < 900_000.0)
+        .map(|zp| (zp.iterator as i32, [zp.server_x, zp.server_y, zp.server_z]))
+        .collect();
+    if advertised.is_empty() { return Vec::new(); }
+    c.resolve_teleport_pads(&advertised)
+}
 
 /// Native Titanium base run speed — see `eq_net::action_loop::RUN_SPEED` for the derivation. Kept
 /// as one constant there (both `Walker` and `ActionLoop::drive_auto_engage_melee` need it) rather
@@ -436,6 +480,14 @@ impl Walker {
     /// The nearest FLOOR-REACHABLE in-zone translocator region (a zone-line region whose
     /// destination is THIS zone), as a goto target the char can walk INTO to teleport out (#266).
     pub fn find_in_zone_portal(&self, gs: &GameState) -> Option<(f32, f32, f32)> {
+        // #543/#266: gated off by the same honesty gate as the #403 pad edges. The client cannot
+        // verify an advertised in-zone teleport is genuinely same-zone (the server resolves crossings
+        // index-blind by nearest-XY trigger, never on the wire — see the gate's doc), so auto-escaping
+        // a "sealed" area through one risks walking the char across a real cross-zone line (qeynos2 →
+        // qcat). A goal reachable only across such a portal is honestly no_path instead.
+        if !TRUST_ADVERTISED_SAME_ZONE_CROSSINGS {
+            return None;
+        }
         let guard = self.collision.read().unwrap();
         let c = guard.as_ref()?;
         let pos = [gs.player_x, gs.player_y, gs.player_z];
@@ -546,15 +598,7 @@ impl Walker {
     /// Empty in the common case (a zone with no same-zone pads), so ordinary plans pay nothing.
     fn same_zone_teleport_pads(&self, gs: &GameState, c: &crate::collision::Collision)
         -> Vec<crate::collision::PadEdge> {
-        let advertised: Vec<(i32, [f32; 3])> = self.world.zone_points.lock().unwrap().iter()
-            .filter(|zp| zp.zone_id == gs.world.zone_id
-                && zp.server_x.abs() < 900_000.0
-                && zp.server_y.abs() < 900_000.0
-                && zp.server_z.abs() < 900_000.0)
-            .map(|zp| (zp.iterator as i32, [zp.server_x, zp.server_y, zp.server_z]))
-            .collect();
-        if advertised.is_empty() { return Vec::new(); }
-        c.resolve_teleport_pads(&advertised)
+        same_zone_pad_edges(&self.world.zone_points.lock().unwrap(), gs.world.zone_id, c)
     }
 
     /// #579 (agent-honesty): there is no collision grid, so this client has NO model of the world —
