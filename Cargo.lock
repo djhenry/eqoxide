@@ -850,6 +850,7 @@ dependencies = [
  "eqoxide-ipc",
  "eqoxide-nav",
  "eqoxide-protocol",
+ "eqoxide-telemetry",
  "glam",
  "gltf",
  "image",
@@ -940,6 +941,14 @@ name = "eqoxide-protocol"
 version = "0.1.0"
 dependencies = [
  "eqoxide-core",
+]
+
+[[package]]
+name = "eqoxide-telemetry"
+version = "0.1.0"
+dependencies = [
+ "eqoxide-protocol",
+ "serde",
 ]
 
 [[package]]

@@ -23,6 +23,7 @@ eqoxide-nav = { path = "crates/eqoxide-nav" }
 eqoxide-command = { path = "crates/eqoxide-command" }
 eqoxide-crash = { path = "crates/eqoxide-crash" }
 eqoxide-protocol = { path = "crates/eqoxide-protocol" }
+eqoxide-telemetry = { path = "crates/eqoxide-telemetry" }
 anyhow = "1"
 arc-swap = "1"
 image = { version = "0.25", default-features = false, features = ["bmp", "png", "dds", "tga"] }
@@ -62,6 +63,10 @@ tempfile = "3"
 eqoxide-core = { path = "crates/eqoxide-core", features = ["test-fixtures"] }
 # Same reasoning as eqoxide-core above, for `CommandState::goto_target` (#544 Step 2g).
 eqoxide-command = { path = "crates/eqoxide-command", features = ["test-fixtures"] }
+# Same reasoning as eqoxide-core above, for `test_capture_lock` — `src/http/observe.rs`'s
+# `/v1/observe/packets` tests need the same global capture-serialization lock the telemetry
+# crate's own unit tests use (#544 Step 2k).
+eqoxide-telemetry = { path = "crates/eqoxide-telemetry", features = ["test-fixtures"] }
 # Pinned to the exact version wgpu 22 already pulls in transitively (see Cargo.lock) so this
 # doesn't add a second naga to the dependency graph. Used only to parse+validate the zone
 # shaders' WGSL source in tests/fog_shader.rs — no GPU device required.
@@ -72,4 +77,4 @@ tokio = { version = "1", features = ["full", "test-util"] }
 tower = "0.5"
 
 [workspace]
-members = ["tools", "crates/eqoxide-core", "crates/eqoxide-ipc", "crates/eqoxide-assets", "crates/eqoxide-nav", "crates/eqoxide-command", "crates/eqoxide-crash", "crates/eqoxide-protocol"]
+members = ["tools", "crates/eqoxide-core", "crates/eqoxide-ipc", "crates/eqoxide-assets", "crates/eqoxide-nav", "crates/eqoxide-command", "crates/eqoxide-crash", "crates/eqoxide-protocol", "crates/eqoxide-telemetry"]
