@@ -19,7 +19,7 @@
 use std::hint::black_box;
 
 fn main() {
-    eqoxide::crash::install();
+    eqoxide_crash::install();
 
     let mode = std::env::args().nth(1).unwrap_or_default();
     match mode.as_str() {

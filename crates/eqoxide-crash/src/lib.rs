@@ -90,7 +90,7 @@
 //!
 //! By default a panic on a **non-main** thread kills only that thread. Escalating that to a whole-
 //! process exit would regress graceful degradation this codebase ships deliberately:
-//! [`crate::nav::planner::Planner`] documents that its worker thread panicking used to
+//! `eqoxide_nav::planner::Planner` (in the app crate's nav layer) documents that its worker thread panicking used to
 //! freeze `nav_state` forever — and the fix was not to prevent the crash but to *detect* the dead
 //! worker (`Planner::is_dead`) and report it honestly while the rest of the session keeps running.
 //! tokio likewise isolates a panicking task so one bad HTTP request doesn't take the server down.
