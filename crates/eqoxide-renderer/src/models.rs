@@ -993,6 +993,37 @@ pub fn held_item_keys(equipment: &[u32; 9], dead: bool) -> [Option<(String, &'st
     [key(equipment[7], "R_POINT"), key(equipment[8], sec_bone)]
 }
 
+/// Numeric IT id from a held-item IDFile string ("IT10649" -> 10649). Empty / unparseable -> 0.
+fn it_id_from_idfile(idfile: &str) -> u32 {
+    idfile.trim().trim_start_matches(['I', 'T', 'i', 't']).parse::<u32>().unwrap_or(0)
+}
+
+/// Held-item model keys + attach bones for the **self player**, unified onto the SAME
+/// server-authoritative source every other spawn uses: the equipment material array
+/// (slots 7=primary, 8=secondary — the values the real client's `mob_appearance` derives
+/// held models from, and the values eqoxide's billboard path already renders via
+/// [`held_item_keys`]). The self player additionally has the inventory item's own IDFile
+/// (worn slots 13/14); we prefer it when present so the working primary can't regress, and
+/// fall back to the broadcast material when it is absent — an off-hand held item (e.g. a
+/// cup/light-source) whose inventory item carries no IDFile still renders, matching the real
+/// client, where it previously vanished for the self player only (eqoxide#515).
+///
+/// Primary → R_POINT (right hand), secondary → L_POINT (left hand) or SHIELD_POINT (shield):
+/// the exact mapping [`held_item_keys`] applies, proven correct against the RoF2 skeleton
+/// (do NOT swap the hands — #515's "wrong hand" half was a false report; the attach bones,
+/// wire slots, and deployed asset were all verified correct).
+pub fn self_held_item_keys(
+    equipment: &[u32; 9], primary_idfile: &str, secondary_idfile: &str, dead: bool,
+) -> [Option<(String, &'static str)>; 2] {
+    let mut eff = *equipment;
+    // IDFile takes precedence (non-empty); otherwise keep the broadcast material.
+    let prim = it_id_from_idfile(primary_idfile);
+    let sec  = it_id_from_idfile(secondary_idfile);
+    if prim != 0 { eff[7] = prim; }
+    if sec  != 0 { eff[8] = sec; }
+    held_item_keys(&eff, dead)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1006,6 +1037,50 @@ mod tests {
                    [Some(("IT10649".into(), "R_POINT")), Some(("IT7".into(), "L_POINT"))]);
         assert_eq!(held_item_keys(&eq, true), [None, None]);
         assert_eq!(held_item_keys(&[0; 9], false), [None, None]);
+    }
+
+    #[test]
+    fn self_held_prefers_idfile_and_falls_back_to_material() {
+        // Primary maps to R_POINT, secondary to L_POINT — the SAME mapping as other spawns.
+        // IDFile present → used verbatim.
+        let eq = [0u32; 9];
+        assert_eq!(
+            self_held_item_keys(&eq, "IT10649", "IT7", false),
+            [Some(("IT10649".into(), "R_POINT")), Some(("IT7".into(), "L_POINT"))],
+            "primary -> right hand, secondary -> left hand"
+        );
+
+        // eqoxide#515: off-hand item with NO inventory IDFile but a broadcast material
+        // (equipment[8]) now renders — previously the self path skipped it and the cup vanished.
+        let mut eq = [0u32; 9];
+        eq[7] = 10649; // dagger material broadcast
+        eq[8] = 7;     // cup/off-hand material broadcast
+        assert_eq!(
+            self_held_item_keys(&eq, "", "", false),
+            [Some(("IT10649".into(), "R_POINT")), Some(("IT7".into(), "L_POINT"))],
+            "empty idfiles fall back to the server-authoritative equipment materials"
+        );
+
+        // IDFile precedence: a present IDFile wins over a (possibly stale) material.
+        let mut eq = [0u32; 9];
+        eq[7] = 999;
+        assert_eq!(
+            self_held_item_keys(&eq, "IT10649", "", false)[0],
+            Some(("IT10649".into(), "R_POINT")),
+            "inventory IDFile takes precedence over the broadcast material"
+        );
+
+        // A shield in the off hand routes to SHIELD_POINT whether it came from the idfile or material.
+        let mut eq = [0u32; 9];
+        eq[8] = 210; // shield material, no idfile
+        assert_eq!(self_held_item_keys(&eq, "", "", false)[1],
+                   Some(("IT210".into(), "SHIELD_POINT")));
+        assert_eq!(self_held_item_keys(&[0; 9], "IT200", "IT210", false)[1],
+                   Some(("IT210".into(), "SHIELD_POINT")));
+
+        // Nothing equipped, or dead, draws no held items.
+        assert_eq!(self_held_item_keys(&[0; 9], "", "", false), [None, None]);
+        assert_eq!(self_held_item_keys(&eq, "IT10649", "IT7", true), [None, None]);
     }
 
     #[test]

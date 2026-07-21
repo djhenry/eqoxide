@@ -558,11 +558,18 @@ pub fn encode_player_pass(
                     scene.player_pos, scene.player_heading, visual_scale, dominant_mesh_scale,
                     [0.0, 0.0], true, 0.0, crate::models::archetype_correction(archetype)));
                 let hx = crate::models::held_item_xform();
-                let held = [
-                    (scene.primary_weapon_idfile.to_uppercase(), "R_POINT", 0usize),
-                    (scene.secondary_weapon_idfile.to_uppercase(),
-                     crate::models::secondary_attach_bone(&scene.secondary_weapon_idfile), 1usize),
-                ];
+                // Held-item source unified with every other spawn (equipment materials 7/8),
+                // inventory IDFile preferred when present. Primary → R_POINT (right), secondary →
+                // L_POINT (left) / SHIELD_POINT — the mapping verified correct against the RoF2
+                // skeleton; #515's "wrong hand" was a false report, so the hands are NOT swapped.
+                let held: Vec<(String, &'static str, usize)> = crate::models::self_held_item_keys(
+                        &scene.player_equipment,
+                        &scene.primary_weapon_idfile,
+                        &scene.secondary_weapon_idfile,
+                        false,
+                    ).into_iter().enumerate()
+                     .filter_map(|(i, k)| k.map(|(key, bone)| (key, bone, i)))
+                     .collect();
                 let mut weapon_draws: Vec<(&crate::gpu::GpuWeapon, usize)> = Vec::new();
                 for (wkey, bone, wslot) in &held {
                     let Some(Some(weapon)) = r.weapon_cache.get(wkey) else { continue };
