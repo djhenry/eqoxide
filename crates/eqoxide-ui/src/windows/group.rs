@@ -6,7 +6,7 @@
 //! (matched into `scene.billboards` by name), so it lags real HP by up to one
 //! server health tick; the player's own row uses `player_hp_pct` directly.
 
-use crate::ui::{theme, widgets, UiCtx};
+use crate::{theme, widgets, UiCtx};
 
 pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     let s = cx.scene;

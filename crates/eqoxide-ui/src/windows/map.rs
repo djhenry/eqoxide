@@ -2,7 +2,7 @@
 //! fullscreen map pair in hud.rs). One resizable window: the painter fills the
 //! body, centered on the player, north-up. Scroll or the bottom slider zooms.
 
-use crate::ui::{theme, UiCtx};
+use crate::{theme, UiCtx};
 use egui::{Color32, Pos2, Stroke, Vec2};
 
 /// Zoom range (1.0 = whole zone fits the view).

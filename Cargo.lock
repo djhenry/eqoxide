@@ -854,6 +854,7 @@ dependencies = [
  "eqoxide-protocol",
  "eqoxide-renderer",
  "eqoxide-telemetry",
+ "eqoxide-ui",
  "glam",
  "gltf",
  "image",
@@ -1011,6 +1012,23 @@ version = "0.1.0"
 dependencies = [
  "eqoxide-protocol",
  "serde",
+]
+
+[[package]]
+name = "eqoxide-ui"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "eqoxide-command",
+ "eqoxide-core",
+ "eqoxide-ipc",
+ "eqoxide-renderer",
+ "image",
+ "serde",
+ "serde_json",
+ "shellexpand",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]

@@ -5,8 +5,8 @@
 //! saylink choices as link-style buttons, and a Hail button aimed at the
 //! nearest living NPC. Ported from the old HUD's `draw_quest_dialogue`.
 
-use crate::scene::{Billboard, SceneState};
-use crate::ui::{theme, UiCtx};
+use eqoxide_renderer::scene::{Billboard, SceneState};
+use crate::{theme, UiCtx};
 
 /// How long an NPC message stays on the panel (seconds).
 const MSG_TTL_SECS: u64 = 45;
@@ -76,7 +76,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     ui.separator();
     match nearest_hailable(s) {
         Some(b) => {
-            let name = crate::http::clean_entity_name(&b.name);
+            let name = eqoxide_core::game_state::clean_entity_name(&b.name);
             if ui
                 .button(egui::RichText::new(format!("Hail, {name}")).size(12.0))
                 .on_hover_text("Greet the nearest NPC")
@@ -121,7 +121,7 @@ fn keyword_link(ui: &mut egui::Ui, cx: &mut UiCtx, seg: &str) {
 
 // `[keyword]` parsing lives in game_state::split_keywords (shared with the
 // HTTP message feed).
-use crate::game_state::split_keywords;
+use eqoxide_core::game_state::split_keywords;
 
 /// The nearest living NPC within [`HAIL_RANGE`] (2D distance). Skips corpses and
 /// the off-map zone controller.

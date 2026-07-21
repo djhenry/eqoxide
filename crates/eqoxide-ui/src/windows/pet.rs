@@ -5,8 +5,8 @@
 //! buttons write the shared `pet_cmd` slot (same as POST /v1/pet/command); the
 //! nav thread drains it and sends OP_PetCommands.
 
-use crate::eq_net::protocol::{PET_ATTACK, PET_BACKOFF, PET_FOLLOWME, PET_GUARDHERE, PET_SIT};
-use crate::ui::{theme, widgets, UiCtx};
+use eqoxide_core::pet::{PET_ATTACK, PET_BACKOFF, PET_FOLLOWME, PET_GUARDHERE, PET_SIT};
+use crate::{theme, widgets, UiCtx};
 
 /// Compact button with an 11 pt label (matches the Actions window's bar style).
 fn btn(text: impl Into<String>) -> egui::Button<'static> {

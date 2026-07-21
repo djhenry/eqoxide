@@ -4,7 +4,7 @@
 //! quantity picker + Sell. Footer: coin row + Done. All buttons write the same
 //! request slots the `/v1/merchant/*` HTTP API uses, so HUD and API stay in sync.
 
-use crate::ui::{theme, widgets, UiCtx};
+use crate::{theme, widgets, UiCtx};
 
 /// RoF2 wire slots for the general inventory (rof2_limits.h): 23..=32.
 const GENERAL_SLOTS: std::ops::RangeInclusive<i32> = 23..=32;
@@ -27,7 +27,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
                 widgets::coin_row(ui, cx.scene.coin);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button(egui::RichText::new("Done").size(11.0)).clicked() {
-                        cx.acts.command.request_merchant_trade(crate::http::TradeCmd::Close);
+                        cx.acts.command.request_merchant_trade(eqoxide_ipc::TradeCmd::Close);
                     }
                 });
             });

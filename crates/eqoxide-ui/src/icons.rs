@@ -10,7 +10,7 @@
 //!   `idx = icon - 500; sheet = idx/36 + 1; cell = idx%36`. Cells are **column-major**
 //!   (RoF2 `A_DragItem` `<Vertical>true</Vertical>`) — see `cell_uv`.
 //! - **Spell icons**: `spells01..07.tga`, sheets of 6×6 40 px cells, **row-major**
-//!   (`A_SpellIcons` `<Vertical>false</Vertical>`; `crate::spells::icon_cell` maps a
+//!   (`A_SpellIcons` `<Vertical>false</Vertical>`; `eqoxide_core::spells::icon_cell` maps a
 //!   spell's icon id to sheet/cell).
 
 use std::collections::HashMap;

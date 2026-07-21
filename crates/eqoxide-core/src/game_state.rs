@@ -1355,6 +1355,20 @@ pub fn split_keywords(text: &str) -> Vec<(String, bool)> {
     out
 }
 
+/// Turn an entity key like "Guard_Phaeton000" into a display name "Guard Phaeton". Relocated from
+/// `eqoxide-http` (#544 Step 2o): it's a pure string helper with zero deps, used both by the HTTP
+/// layer (targeting/looting/merchant/trainer replies) and by `eqoxide-ui` (NPC dialogue, nearby-NPC
+/// action labels) — putting it here, in the leaf both already depend on, lets `eqoxide-ui` avoid an
+/// up-reference into `eqoxide-http` for a single display-formatting function. `eqoxide-http`
+/// re-exports it (`pub use eqoxide_core::game_state::clean_entity_name;`) so every existing
+/// `crate::clean_entity_name` / `crate::http::clean_entity_name` call site keeps resolving unchanged.
+pub fn clean_entity_name(raw: &str) -> String {
+    raw.trim_end_matches(|c: char| c.is_ascii_digit())
+        .replace('_', " ")
+        .trim()
+        .to_string()
+}
+
 /// Test-only entity constructor. Gated on `test-fixtures` (not bare `#[cfg(test)]`) and `pub` so the
 /// app crate's own tests can build fixture entities across the crate boundary — core's `#[cfg(test)]`
 /// is invisible downstream (#544 Step 2b; the region_map fixture pattern). Call it as

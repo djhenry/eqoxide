@@ -1,4 +1,4 @@
-//! The eqoxide window system (issue #162).
+//! `eqoxide-ui` — the egui window system (issue #162).
 //!
 //! One registry of windows ([`registry`]), chromed + persisted per character
 //! ([`chrome`], [`persist`]), themed after the native RoF2 client ([`theme`]),
@@ -7,6 +7,16 @@
 //! Windows are dumb views: they read the per-frame [`SceneState`] snapshot and
 //! write user actions into the same shared request slots the HTTP API uses
 //! ([`Actions`]).
+//!
+//! Extracted as its own workspace crate (#544 Step 2o). It is the View half of the app's egui
+//! surface: it depends on `eqoxide-core` (game_state/spells/skills/config/zone_map/pet),
+//! `eqoxide-ipc` (the request-slot types `Actions` writes into, plus the `enabled` profiling
+//! toggle), `eqoxide-command` (`CommandState`, the typed write-path facade), and `eqoxide-renderer`
+//! (`SceneState`/`Billboard`, the per-frame render snapshot windows read) — plus egui/image/
+//! shellexpand/serde/tracing. It has ZERO up-refs into the app crate (never `app`/`movement`/
+//! `model`/`eq_net`/`http`). The app crate re-exports this crate as its `ui` module
+//! (`pub use eqoxide_ui as ui;`), so every existing `crate::ui::…` / `eqoxide::ui::…` call site
+//! (app.rs, main.rs, hud.rs) keeps resolving unchanged.
 
 pub mod chrome;
 pub mod icons;
@@ -16,8 +26,8 @@ pub mod theme;
 pub mod widgets;
 pub mod windows;
 
-use crate::scene::SceneState;
-use crate::zone_map::ZoneMap;
+use eqoxide_renderer::scene::SceneState;
+use eqoxide_core::zone_map::ZoneMap;
 use chrome::WinSys;
 use registry::REGISTRY;
 
@@ -33,27 +43,27 @@ pub const REF_H: f32 = 720.0;
 pub struct Actions {
     /// The typed write-path facade (#446, #459). Combat/nav/camera/lifecycle write via
     /// `cx.acts.command.request_*` — no direct slot fields for those domains any more; the rest
-    /// still use the raw slot fields below until they're migrated. See `crate::command_state`.
-    pub command: crate::command_state::CommandState,
-    pub hail: crate::http::HailReq,
-    pub say: crate::http::SayReq,
-    pub chat_send: crate::http::ChatSendShared,
-    pub dialogue_click: crate::http::DialogueClickReq,
-    pub sit: crate::http::SitReq,
-    pub move_item: crate::http::MoveReq,
-    pub loot: crate::http::LootReq,
-    pub accept_task: crate::http::AcceptTaskReq,
-    pub cancel_task: crate::http::CancelTaskReq,
-    pub group_invite: crate::http::GroupInviteReq,
-    pub group_accept: crate::http::GroupAcceptReq,
-    pub group_decline: crate::http::GroupDeclineReq,
-    pub group_leave: crate::http::GroupLeaveReq,
-    pub group_kick: crate::http::GroupKickReq,
-    pub group_make_leader: crate::http::GroupMakeLeaderReq,
+    /// still use the raw slot fields below until they're migrated. See `eqoxide_command`.
+    pub command: eqoxide_command::CommandState,
+    pub hail: eqoxide_ipc::HailReq,
+    pub say: eqoxide_ipc::SayReq,
+    pub chat_send: eqoxide_ipc::ChatSendShared,
+    pub dialogue_click: eqoxide_ipc::DialogueClickReq,
+    pub sit: eqoxide_ipc::SitReq,
+    pub move_item: eqoxide_ipc::MoveReq,
+    pub loot: eqoxide_ipc::LootReq,
+    pub accept_task: eqoxide_ipc::AcceptTaskReq,
+    pub cancel_task: eqoxide_ipc::CancelTaskReq,
+    pub group_invite: eqoxide_ipc::GroupInviteReq,
+    pub group_accept: eqoxide_ipc::GroupAcceptReq,
+    pub group_decline: eqoxide_ipc::GroupDeclineReq,
+    pub group_leave: eqoxide_ipc::GroupLeaveReq,
+    pub group_kick: eqoxide_ipc::GroupKickReq,
+    pub group_make_leader: eqoxide_ipc::GroupMakeLeaderReq,
     /// Published camp deadline (read-path) for the HUD Camp button's countdown/toggle display.
     /// The camp REQUEST itself (and the HUD death-overlay Respawn button) route through
     /// `command.request_camp`/`request_respawn` (#459).
-    pub camp_until: crate::http::CampUntil,
+    pub camp_until: eqoxide_ipc::CampUntil,
 }
 
 /// Chat window runtime state (input buffer, active tab).
@@ -80,7 +90,7 @@ pub enum UiCmd {
 /// Everything a window body may read or write while drawing.
 pub struct UiCtx<'a> {
     pub scene: &'a SceneState,
-    pub spells: &'a crate::spells::SpellDb,
+    pub spells: &'a eqoxide_core::spells::SpellDb,
     pub icons: &'a mut icons::Icons,
     pub acts: &'a Actions,
     pub chat: &'a mut ChatState,
@@ -174,7 +184,7 @@ impl UiState {
         ctx: &egui::Context,
         screen_pts: [f32; 2],
         scene: &SceneState,
-        spells: &crate::spells::SpellDb,
+        spells: &eqoxide_core::spells::SpellDb,
         acts: &Actions,
         zone_min: [f32; 2],
         zone_max: [f32; 2],
@@ -255,7 +265,7 @@ impl UiState {
                 minimap_zoom: &mut self.minimap_zoom,
                 fps,
             };
-            let win_t0 = crate::profiling::enabled().then(std::time::Instant::now);
+            let win_t0 = eqoxide_ipc::enabled().then(std::time::Instant::now);
             let result = chrome::eq_window(ctx, &mut self.sys, def, screen, |ui| {
                 windows::draw(def.id, ui, &mut cx)
             });
@@ -272,7 +282,7 @@ impl UiState {
                     self.dismissed.insert(def.id);
                     match def.id {
                         registry::MERCHANT => {
-                            acts.command.request_merchant_trade(crate::http::TradeCmd::Close);
+                            acts.command.request_merchant_trade(eqoxide_ipc::TradeCmd::Close);
                         }
                         // Some(0) = end-training sentinel (see navigation.rs).
                         registry::TRAINER => {
@@ -314,7 +324,7 @@ mod tests {
     fn actions() -> Actions {
         use std::sync::{Arc, Mutex};
         Actions {
-            command: crate::command_state::CommandState::default(),
+            command: eqoxide_command::CommandState::default(),
             hail: Arc::new(Mutex::new(None)),
             say: Arc::new(Mutex::new(None)),
             chat_send: Arc::new(Mutex::new(Vec::new())),
@@ -340,7 +350,7 @@ mod tests {
     fn all_windows_draw_headless() {
         let mut ui = UiState::new("__uitest__", None);
         let acts = actions();
-        let spells = crate::spells::SpellDb::empty();
+        let spells = eqoxide_core::spells::SpellDb::empty();
         // Force every non-transient window open.
         for def in REGISTRY {
             if !def.transient {
@@ -365,7 +375,7 @@ mod tests {
         let _ = ctx.run(Default::default(), |ctx| {
             ui.draw_all(ctx, [1280.0, 720.0], &scene, &spells, &acts, [0.0; 2], [100.0; 2], None, 60.0);
         });
-        let _ = std::fs::remove_file(crate::config::config_dir().join("ui_layout___uitest__.json"));
+        let _ = std::fs::remove_file(eqoxide_core::config::config_dir().join("ui_layout___uitest__.json"));
     }
 
     /// Regression: window sizes must STABILIZE across frames. A body that
@@ -378,7 +388,7 @@ mod tests {
     fn window_sizes_do_not_creep() {
         let mut ui = UiState::new("__uitest_growth__", None);
         let acts = actions();
-        let spells = crate::spells::SpellDb::empty();
+        let spells = eqoxide_core::spells::SpellDb::empty();
         for def in REGISTRY {
             if !def.transient {
                 ui.sys.layout.set_open(def.id, true);
@@ -388,7 +398,7 @@ mod tests {
         scene.player_name = "Testy".into();
         scene.merchant_open = Some(42); // exercise the merchant transient too
         for i in 0..80 {
-            scene.messages.push(crate::game_state::LogEntry {
+            scene.messages.push(eqoxide_core::game_state::LogEntry {
                 kind: "chat".into(),
                 text: format!("chatter line {i} with some width to it"),
                 timestamp: std::time::Instant::now(),
@@ -432,7 +442,7 @@ mod tests {
             );
         }
         let _ = std::fs::remove_file(
-            crate::config::config_dir().join("ui_layout___uitest_growth__.json"),
+            eqoxide_core::config::config_dir().join("ui_layout___uitest_growth__.json"),
         );
     }
 
@@ -444,7 +454,7 @@ mod tests {
         assert!(ui.layout().is_open(registry::INVENTORY, false));
         assert!(!ui.hotkey(egui::Key::F35));
         let _ = std::fs::remove_file(
-            crate::config::config_dir().join("ui_layout___uitest_hotkey__.json"),
+            eqoxide_core::config::config_dir().join("ui_layout___uitest_hotkey__.json"),
         );
     }
 }

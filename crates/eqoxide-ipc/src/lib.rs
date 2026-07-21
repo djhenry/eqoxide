@@ -23,7 +23,10 @@
 //! BEHAVIOR stayed in the app crate, which now `use`s these types — the correct app → ipc direction):
 //! - `MoveIntent`, `ControllerView` — from `movement` (the `CharacterController` stepping logic stays).
 //! - `CameraMode`, `CameraCmd`, `CameraSnapshot` — from `camera_state` (the `CameraState` update logic stays).
-//! - `FrameProfile`, `FrameSample` — from `profiling` (the `Stopwatch`/`enabled` collection helpers stay).
+//! - `FrameProfile`, `FrameSample` — from `profiling` (the `Stopwatch` collection helper stays).
+//! - `enabled`/`set_enabled` (the profiling on/off toggle) — from `profiling` (#544 Step 2o), so the
+//!   new `eqoxide-ui` crate (which reads it once per window to gate a timing log) does not need an
+//!   up-reference into the app crate just for a boolean flag. `Stopwatch` stays in `profiling`.
 //!
 //! Each origin module re-exports its moved types (`pub use eqoxide_ipc::…`) so every existing
 //! `crate::movement::MoveIntent` / `crate::camera_state::CameraCmd` / `crate::profiling::FrameProfile`
@@ -128,8 +131,8 @@ pub struct CameraSnapshot {
 ///
 /// Relocated from `profiling` (#544 Step 2c). Serialized to `/v1/observe/debug` (`frame_profile`) —
 /// the serde form is part of that wire contract. Its `blend` companion + the `FrameSample` it reads
-/// moved with it (an inherent impl must be co-located with its type); the `Stopwatch`/`enabled`
-/// collection helpers stayed in `profiling`.
+/// moved with it (an inherent impl must be co-located with its type); the `Stopwatch` collection
+/// helper stayed in `profiling`.
 #[derive(Debug, Default, Clone, Copy, serde::Serialize)]
 pub struct FrameProfile {
     pub update_ms: f32,
@@ -183,6 +186,23 @@ impl FrameSample {
     pub fn egui_ms(&self)   -> f32 { self.egui.as_secs_f32()   * 1000.0 }
     pub fn submit_ms(&self) -> f32 { self.submit.as_secs_f32() * 1000.0 }
     pub fn total_ms(&self)  -> f32 { self.total.as_secs_f32()  * 1000.0 }
+}
+
+/// The `--profile` / `EQ_PROFILE=1` on/off flag. Relocated from `profiling` (#544 Step 2o) — a
+/// process-wide toggle read by both the app crate (`app::render_frame`'s phase timers) and
+/// `eqoxide-ui` (gating its per-window timing log), so it lives beside the `FrameProfile`/
+/// `FrameSample` data it gates rather than forcing either reader to depend on the other.
+static PROFILING_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turn frame profiling on/off (set once at startup from the `--profile` flag / `EQ_PROFILE` env).
+pub fn set_enabled(on: bool) {
+    PROFILING_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the `--profile` overlay/timing is active.
+#[inline]
+pub fn enabled() -> bool {
+    PROFILING_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 // ── end relocated definitions ────────────────────────────────────────────────────────────────────
 

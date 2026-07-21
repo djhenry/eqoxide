@@ -1,0 +1,27 @@
+[package]
+name = "eqoxide-ui"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "eqoxide_ui"
+path = "src/lib.rs"
+
+[dependencies]
+# eqoxide-ui is the View's egui window system (window registry/chrome/persist + per-window bodies,
+# #544 Step 2o). It is a clean LOWER layer: app.rs/main.rs/hud.rs depend UP on it, and it has ZERO
+# up-refs into the app loop (app/main/movement/model/eq_net/http). Its downward deps are the
+# already-extracted structural crates plus egui — never eq_net/http/nav/assets/protocol/telemetry.
+eqoxide-core     = { path = "../eqoxide-core" }     # game_state/spells/skills/config/zone_map/pet
+eqoxide-ipc      = { path = "../eqoxide-ipc" }      # Actions' request-slot types + the profiling `enabled` toggle
+eqoxide-command  = { path = "../eqoxide-command" }  # CommandState — the typed write-path facade
+eqoxide-renderer = { path = "../eqoxide-renderer" } # SceneState/Billboard — the per-frame render snapshot
+egui = "0.29"                                       # windows are egui immediate-mode UI
+image = { version = "0.25", default-features = false, features = ["bmp", "png", "dds", "tga"] } # icons.rs atlas decode (dds/tga)
+serde = { version = "1", features = ["derive"] }    # persist.rs — window layout JSON
+serde_json = "1"                                    # persist.rs — window layout JSON
+shellexpand = "3"                                   # icons.rs — ~ expansion for the UI atlas dir
+tracing = "0.1"                                     # info!/warn! logging in icons/mod.rs
+
+[dev-dependencies]
+tempfile = "3"                                      # persist.rs tests write layout JSON fixtures to a temp dir

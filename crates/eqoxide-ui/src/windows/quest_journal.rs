@@ -6,8 +6,8 @@
 //! surface in a highlighted "Offered" strip with Accept/Decline — decline is
 //! the accept slot with task_id 0, mirroring POST /v1/quests/decline.
 
-use crate::game_state::TaskActivity;
-use crate::ui::{theme, widgets, UiCtx};
+use eqoxide_core::game_state::TaskActivity;
+use crate::{theme, widgets, UiCtx};
 
 /// Objective-complete green (matches the old HUD task window).
 const DONE_GREEN: egui::Color32 = egui::Color32::from_rgb(120, 220, 120);

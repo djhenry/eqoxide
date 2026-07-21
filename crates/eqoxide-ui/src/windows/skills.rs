@@ -1,7 +1,7 @@
 //! Skills window (native `SkillsWindow`) — alphabetical name/value list of the
 //! player's skills, hiding untrained (0) entries unless "Show untrained" is on.
 
-use crate::ui::{theme, UiCtx};
+use crate::{theme, UiCtx};
 
 pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     let skills = &cx.scene.player_skills;
@@ -10,7 +10,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     let mut rows: Vec<(&'static str, u32)> = skills
         .iter()
         .enumerate()
-        .filter_map(|(id, &val)| crate::skills::skill_name(id as u32).map(|n| (n, val)))
+        .filter_map(|(id, &val)| eqoxide_core::skills::skill_name(id as u32).map(|n| (n, val)))
         .collect();
     rows.sort_unstable_by_key(|&(name, _)| name);
     let trained = rows.iter().filter(|&&(_, v)| v > 0).count();

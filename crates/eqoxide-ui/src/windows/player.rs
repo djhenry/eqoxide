@@ -1,7 +1,7 @@
 //! Player window — native `PlayerWindow` + the stats block of `Inventory`.
 //! HP/mana/XP gauges with the native FillTints, name/level/class, STR–WIS, coin.
 
-use crate::ui::{theme, widgets, UiCtx};
+use crate::{theme, widgets, UiCtx};
 
 pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     let s = cx.scene;

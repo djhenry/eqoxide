@@ -3,7 +3,7 @@
 //! the memorized gems (click to cast) and any spell scrolls sitting in the
 //! inventory, rather than the full 400-slot book.
 
-use crate::ui::{theme, UiCtx};
+use crate::{theme, UiCtx};
 
 /// Row icon size (small list rows, not the 36 px gem bar).
 const ICON: f32 = 22.0;
@@ -21,11 +21,11 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
                 .unwrap_or_else(|| format!("Spell {spell_id}"))
         };
         let icon = info.and_then(|i| {
-            let (sheet0, col, row) = crate::spells::icon_cell(i.icon_id);
+            let (sheet0, col, row) = eqoxide_core::spells::icon_cell(i.icon_id);
             cx.icons.spell(
                 ui.ctx(),
                 sheet0 as u32 + 1,
-                (row * crate::spells::ICON_COLS + col) as u32,
+                (row * eqoxide_core::spells::ICON_COLS + col) as u32,
             )
         });
 
@@ -37,7 +37,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
         if !empty {
             let resp = resp.on_hover_text(format!("Cast {name} (gem {})", gem + 1));
             if resp.clicked() {
-                cx.acts.command.request_cast(crate::http::CastRequest {
+                cx.acts.command.request_cast(eqoxide_ipc::CastRequest {
                     gem: gem as u8,
                     target_id: None,
                     item_slot: None,
@@ -48,7 +48,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
 
     ui.add_space(4.0);
     section(ui, "Spell scrolls in inventory");
-    let scrolls: Vec<&crate::game_state::InvItem> = cx
+    let scrolls: Vec<&eqoxide_core::game_state::InvItem> = cx
         .scene
         .inventory
         .iter()
@@ -117,7 +117,7 @@ fn section(ui: &mut egui::Ui, title: &str) {
 fn gem_row(
     ui: &mut egui::Ui,
     gem: usize,
-    icon: Option<crate::ui::icons::IconRef>,
+    icon: Option<crate::icons::IconRef>,
     name: &str,
     empty: bool,
 ) -> egui::Response {

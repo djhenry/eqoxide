@@ -407,13 +407,10 @@ pub struct LastConsiderView {
     pub at:         std::time::Instant,
 }
 
-/// Turn an entity key like "Guard_Phaeton000" into a display name "Guard Phaeton".
-pub fn clean_entity_name(raw: &str) -> String {
-    raw.trim_end_matches(|c: char| c.is_ascii_digit())
-        .replace('_', " ")
-        .trim()
-        .to_string()
-}
+/// Relocated to `eqoxide-core::game_state` (#544 Step 2o) so `eqoxide-ui` can use it without an
+/// up-reference into this crate. Re-exported so every existing `crate::clean_entity_name` /
+/// `eqoxide_http::clean_entity_name` call site keeps resolving unchanged.
+pub use eqoxide_core::game_state::clean_entity_name;
 
 /// Render coin `[platinum, gold, silver, copper]` as a JSON object for the API.
 pub(crate) fn currency_json(coin: [u32; 4]) -> serde_json::Value {

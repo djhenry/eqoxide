@@ -121,7 +121,7 @@ pub(crate) fn sanitize(name: &str) -> String {
 impl Layout {
     pub fn load(character_name: &str) -> Self {
         let file = format!("ui_layout_{}.json", sanitize(character_name));
-        Self::from_path(crate::config::config_dir().join(file))
+        Self::from_path(eqoxide_core::config::config_dir().join(file))
     }
 
     pub fn from_path(path: PathBuf) -> Self {

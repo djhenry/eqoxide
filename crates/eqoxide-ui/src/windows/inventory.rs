@@ -6,8 +6,8 @@
 //! modeled and shown grouped under their parent bag; they are movable like any
 //! other slot (the move encoder sets the RoF2 SubIndex). (eqoxide#201)
 
-use crate::game_state::InvItem;
-use crate::ui::{theme, widgets, UiCtx};
+use eqoxide_core::game_state::InvItem;
+use crate::{theme, widgets, UiCtx};
 
 /// RoF2 worn-equipment wire slots → display labels (rof2_limits.h 0-22).
 const WORN_SLOTS: [(i32, &str); 23] = [
@@ -60,7 +60,7 @@ fn inv_slot(ui: &mut egui::Ui, cx: &mut UiCtx, slot: i32, label: &str, item: Opt
             if it.charges > 1 {
                 tip.push_str(&format!("\nQty: {}", it.charges));
             }
-            if let Some((parent, sub)) = crate::game_state::bag_wire_parent(slot) {
+            if let Some((parent, sub)) = eqoxide_core::game_state::bag_wire_parent(slot) {
                 tip.push_str(&format!("\nin bag {} slot {}", parent - GENERAL_FIRST + 1, sub + 1));
             }
             (cx.icons.item(ui.ctx(), it.icon), it.name.clone(), tip)
@@ -89,7 +89,7 @@ fn inv_slot(ui: &mut egui::Ui, cx: &mut UiCtx, slot: i32, label: &str, item: Opt
 
     // OP_MoveItem addresses possessions wire slots 0..=33 (worn + general + cursor) and
     // general-bag content slots (251-350), which encode as the parent slot + SubIndex. (eqoxide#201)
-    let movable = (0..=33).contains(&slot) || crate::game_state::bag_wire_parent(slot).is_some();
+    let movable = (0..=33).contains(&slot) || eqoxide_core::game_state::bag_wire_parent(slot).is_some();
     if resp.clicked() && movable {
         match selected_slot(ui) {
             // Click the selected slot again → deselect.
@@ -146,7 +146,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     for parent in GENERAL_FIRST..=GENERAL_LAST {
         let mut contents: Vec<&InvItem> = inv
             .iter()
-            .filter(|i| crate::game_state::bag_wire_parent(i.slot).map_or(false, |(p, _)| p == parent))
+            .filter(|i| eqoxide_core::game_state::bag_wire_parent(i.slot).map_or(false, |(p, _)| p == parent))
             .collect();
         if contents.is_empty() {
             continue;
@@ -171,7 +171,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     // never silently vanish (e.g. cursor-bag slots the server streamed).
     let mut other: Vec<&InvItem> = inv
         .iter()
-        .filter(|i| !(0..=CURSOR_SLOT).contains(&i.slot) && crate::game_state::bag_wire_parent(i.slot).is_none())
+        .filter(|i| !(0..=CURSOR_SLOT).contains(&i.slot) && eqoxide_core::game_state::bag_wire_parent(i.slot).is_none())
         .collect();
     if !other.is_empty() {
         other.sort_by_key(|i| i.slot);
