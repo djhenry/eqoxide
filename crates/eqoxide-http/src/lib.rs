@@ -56,6 +56,7 @@ where
     }
 }
 
+mod name_match;
 mod observe;
 mod quests;
 mod group;
@@ -485,6 +486,22 @@ impl HttpState {
     /// snapshot. There is no cached `PlayerState` anywhere, so there is nothing to go stale (#343).
     pub(crate) fn player(&self) -> PlayerState {
         PlayerState::from_game_state(&self.game_state.load())
+    }
+
+    /// The player's world position, or `None` if the SERVER has not told us where we are yet
+    /// (#513 review, F4).
+    ///
+    /// `PlayerState::pos_*` are plain `f32` that read `0.0` from construction until the first
+    /// server position packet, so anything derived from them before that is measured from the zone
+    /// ORIGIN. That is fine for a raw position readout (which is honestly "what we last knew") but
+    /// NOT for a derived figure like the `distance` a name-resolution endpoint publishes: a
+    /// confident wrong distance is precisely the falsehood #513 exists to remove, and the
+    /// just-zoned-in window is where its original wrong-target near-miss happened. Callers that
+    /// would publish such a figure must use THIS, not `player()`, so an unknown position becomes an
+    /// omitted field rather than a number measured from nowhere.
+    pub(crate) fn player_pos(&self) -> Option<(f32, f32, f32)> {
+        let gs = self.game_state.load();
+        gs.player_pos_known.then(|| (gs.player_x, gs.player_y, gs.player_z))
     }
 
     /// Connection + snapshot freshness, computed from the two shared clocks **on every read**.

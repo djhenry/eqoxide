@@ -576,6 +576,20 @@ pub struct GameState {
     pub player_x: f32,
     pub player_y: f32,
     pub player_z: f32,
+    /// #513 (agent-honesty): has the SERVER actually told us where we are yet, this zone?
+    ///
+    /// `player_x/y/z` are plain `f32` and read `0.0` from construction until a server position
+    /// packet lands — so anything derived from them before that (notably the `distance` a
+    /// name-resolution endpoint reports) would be measured from the zone ORIGIN and be a
+    /// confident wrong number, in exactly the just-zoned-in window where #513's original
+    /// wrong-target near-miss happened. Consumers that would otherwise publish a fabricated
+    /// figure must gate on this and report an honest "unknown" instead.
+    ///
+    /// Set ONLY by server-authoritative position paths (self OP_ClientUpdate, bind respawn,
+    /// same-zone teleport) — never by our own client-side prediction, which is not evidence the
+    /// server placed us anywhere. Reset to false by [`GameState::begin_zone_in`]: on a zone change
+    /// the old zone's coordinates say nothing about where we now are.
+    pub player_pos_known: bool,
     pub player_heading: f32,
     pub player_level: u32,
     pub player_race: String,
@@ -895,6 +909,11 @@ impl GameState {
     pub fn begin_zone_in(&mut self) {
         self.world.entities.clear();
         self.world.doors.clear();
+        // #513: the previous zone's coordinates say nothing about where we are in the new one, so
+        // our position is UNKNOWN again until the new zone server tells us. Anything deriving a
+        // distance from it must report an honest unknown until then, not a figure measured from
+        // the old zone's numbers or the origin.
+        self.player_pos_known = false;
         // The target belongs to the zone we just left: its spawn id is meaningless in the new zone
         // and #270 already purges `entities`, so target_id would point at a gone spawn while
         // target_name/target_hp_pct fall back to the stale cached snapshot — /observe/debug then

@@ -48,8 +48,8 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 
 | Route | Body | Description |
 |-------|------|-------------|
-| `POST /v1/move/goto` | `{"name":"Guard Phaeton"}` \| `{"x":,"y":,"z":}` \| `{"map_x":,"map_y":}` \| `{}` | Walk to an entity (fuzzy name, one-time snapshot) or coordinates and **stop** on arrival. Empty body → the player's current target. `map_*` are Brewall map coords (= negated server x/y). |
-| `POST /v1/move/follow` | `{"name":"a rat"}` \| `{}` | Walk to a named entity and **keep following** it until canceled. Empty body → current target. Coordinates are rejected (400). |
+| `POST /v1/move/goto` | `{"name":"Guard Phaeton"}` \| `{"x":,"y":,"z":}` \| `{"map_x":,"map_y":}` \| `{}` | Walk to an entity (fuzzy name, one-time snapshot) or coordinates and **stop** on arrival. Empty body → the player's current target. `map_*` are Brewall map coords (= negated server x/y). **Returns JSON**, including [`matched`](#matched--which-entity-a-name-actually-resolved-to) when the goal came from a name/target. |
+| `POST /v1/move/follow` | `{"name":"a rat"}` \| `{}` | Walk to a named entity and **keep following** it until canceled. Empty body → current target. Coordinates are rejected (400). **Returns JSON** with [`matched`](#matched--which-entity-a-name-actually-resolved-to). |
 | `POST /v1/move/stop` | — | Cancel any active goto/follow. |
 | `POST /v1/move/zone_cross` | `{"zone_id":N}` \| `{}` | Cross a zone line and send OP_ZoneChange (specific zone, or nearest line). |
 
@@ -60,7 +60,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 | Route | Body | Description |
 |-------|------|-------------|
 | `POST /v1/combat/target` | `{"id":<spawn_id>}` | Target a spawn + auto-consider it. |
-| `POST /v1/combat/target/name` | `{"name":"a rat"}` | Target a mob by fuzzy name. |
+| `POST /v1/combat/target/name` | `{"name":"a rat"}` | Target a mob by fuzzy name. **Returns JSON** with [`matched`](#matched--which-entity-a-name-actually-resolved-to) — always check it before acting on the target. |
 | `POST /v1/combat/attack` | — | Enable auto-attack. |
 | `DELETE /v1/combat/attack` | — | Disable auto-attack. |
 | `POST /v1/combat/consider` | `{"id":N}` (default current target) | Consider a spawn (difficulty tier + faction attitude). Result: `target_con`/`target_attitude`/`target_level` on `/observe/debug` if the spawn IS the current target, always `last_consider` regardless — see [Consider results](#consider-results). |
@@ -210,17 +210,57 @@ machine-readable *why*, `null` unless a state has one). Together they are how yo
 | `search_exhausted` | The planner **gave up**. This is **"I don't know", not "no"** — a route may well exist. Try a nearer waypoint. | `search_node_cap` |
 | `blocked` | A route exists, but the walker **could not follow it** (wedged after 8 recovery attempts). Not a routing failure. | `walker_stalled`, `local_no_way_through`, `fall_would_be_lethal` |
 
+### `matched` — which entity a name actually resolved to (#513)
+
+Name-resolving endpoints — `POST /v1/move/goto {name}`, `POST /v1/move/follow {name}`, and
+`POST /v1/combat/target/name` — return a **`matched`** object naming the entity they actually
+picked. **Check it.** A name is fuzzy-matched against the live spawn table, and before #513 these
+endpoints returned only coordinates / a bare success, so a resolution that silently landed on a
+*different* spawn than you meant was undetectable (a live near-miss routed `"a_rodent020"` to a
+distant NPC named `Astaed_Wemor`).
+
+```jsonc
+POST /v1/move/goto {"name": "a gnoll"}
+{
+  "status": "navigating",
+  "goal": [-41.1, 3157.1, -3.1],
+  "goal_id": 12,
+  "matched": {
+    "id": 437,           // spawn id actually routed to / targeted
+    "name": "a gnoll",   // its canonical (cleaned) name
+    "quality": "exact",  // "exact" | "fuzzy"
+    "candidates": 5,     // how many spawns matched EQUALLY well
+    "distance": 1163.2   // units from you; OMITTED when not known
+  },
+  "note": "..."
+}
+```
+
+| Field | Meaning / how to gate on it |
+|-------|------------------------------|
+| `id`, `name` | The entity actually routed to / targeted. Guaranteed to describe the same spawn as `goal` — they are derived from one value and cannot drift apart. |
+| `quality` | `"exact"` = a case-insensitive match on the full name. `"fuzzy"` = **no exact match existed**; this is only a substring hit, so verify it before acting. An exact match is never passed over for a nearer fuzzy one. |
+| `candidates` | How many spawns matched at that same quality. `1` = unambiguous. **`> 1` means the name was ambiguous** (e.g. 17 spawns all named "a large field rat"); the **nearest** of them was chosen. Gate on this if you need a specific spawn — target by `id` instead. |
+| `distance` | Units from the player. **Omitted** — not zero — when the entity has no known position or the server has not told us our own yet (just after zone-in). Never a figure measured from the zone origin. |
+
+`matched` is `null` only for a `/goto` given raw coordinates (there is no entity). A name that
+matches nothing at all — not even fuzzily — is an honest **404**, never a distant wrong match.
+
+> **Content type:** `/v1/move/goto`, `/v1/move/follow` and `/v1/combat/target/name` return
+> `application/json`. The other `move` routes (`/stop`, `/zone_cross`, `/manual`, `/jump`) still
+> return `text/plain`.
+
 ### `nav_goal_id` and `nav_goal` — goal identity (#349)
 
 `GET /v1/observe/debug` carries two more top-level fields under `player`:
 
-- **`nav_goal_id`** — a monotonically increasing counter, bumped every time a `POST /v1/move/{goto,follow,zone_cross,stop}` is accepted. It is **echoed in each of those POST's response bodies** (`[goal_id=N]`). `nav_state`/`nav_reason` are the status *of this goal id* — never of an earlier one.
+- **`nav_goal_id`** — a monotonically increasing counter, bumped every time a `POST /v1/move/{goto,follow,zone_cross,stop}` is accepted. It is **echoed in each of those POST's response bodies**: as a JSON `"goal_id": N` field on `/goto` and `/follow`, and as `[goal_id=N]` in the text body of `/stop` and `/zone_cross`. `nav_state`/`nav_reason` are the status *of this goal id* — never of an earlier one.
 - **`nav_goal`** — that goal's `[x, y, z]` (server coords), or `null` for `idle`/`stop`, or for a `zone_cross` whose concrete zone-line destination the walker has not resolved yet.
 
 **Why this exists.** `POST /goto` returns `200` and sets the target, but the walker only re-labels `nav_state` on its next ~150 ms tick. Without identity, this canonical loop lied:
 
 ```
-POST /v1/move/goto {...}   -> 200 [goal_id=8]
+POST /v1/move/goto {...}   -> 200 {"goal_id": 8, ...}
 GET  /v1/observe/debug     -> nav_state: "arrived"   <-- but nav_goal_id: 7, the PREVIOUS goto!
 ```
 
