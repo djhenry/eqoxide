@@ -1215,6 +1215,64 @@ mod tests {
         assert!(session_request_due(base, base + SESSION_REQUEST_RETRY + std::time::Duration::from_millis(1)));
     }
 
+    /// #549 review follow-up: the two tests above exercise `session_request_due` in isolation — they
+    /// pass unchanged even if `connect()` is WIRED to it incorrectly, e.g. `let _ =
+    /// session_request_due(...); if true { ... }` (ignoring its return value), or `if
+    /// session_request_due(...) { send(); /* forgot */ last_send = Instant::now(); }` (never resets
+    /// `last_send`, so the predicate free-runs `true` forever after the first fire). Either wiring bug
+    /// makes `connect()` flood a cold zone's UDP listener with SESSION_REQUEST roughly every ~100ms
+    /// (bounded only by the loop's inner `recv` timeout) instead of every `SESSION_REQUEST_RETRY`
+    /// (250ms) — and neither pure-function test above would notice, because neither calls `connect()`.
+    ///
+    /// This drives the REAL `connect()` over a REAL silent UDP peer and puts an UPPER bound on
+    /// datagrams received in a real-time window — deliberately the mirror image of the OLD flaky test
+    /// this file used to have (which asserted a LOWER bound and flaked under `--test-threads=8`
+    /// contention). The direction matters: scheduler contention can only ever DELAY a send, never
+    /// conjure an extra one, so contention can only push this count DOWN, never up — a ceiling cannot
+    /// flake from load the way a floor did. At the correct 250ms cadence a 700ms window sees ~3 sends
+    /// (t≈0, 250, 500); a wiring bug firing every ~100ms sees ~7. Do NOT tighten this bound "for
+    /// precision" — the slack between 3 and 7 is what makes it contention-proof; a tighter ceiling
+    /// would reintroduce exactly the flake #549 fixed.
+    #[tokio::test]
+    async fn connect_does_not_flood_session_request_faster_than_the_cadence() {
+        let net_health: eqoxide_ipc::NetHealthShared = Default::default();
+        // A bound but SILENT peer — never answers SESSION_RESPONSE, so `connect` stays retrying.
+        let silent_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = silent_peer.local_addr().unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let host = addr.ip().to_string();
+        let port = addr.port();
+
+        let connect_fut = tokio::time::timeout(
+            std::time::Duration::from_millis(900),
+            EqStream::connect(&host, port, tx, net_health.clone()),
+        );
+        let count_fut = async {
+            let mut buf = vec![0u8; 4096];
+            let mut count = 0usize;
+            let window = tokio::time::Instant::now() + std::time::Duration::from_millis(700);
+            while tokio::time::Instant::now() < window {
+                if let Ok(Ok(_)) =
+                    tokio::time::timeout(std::time::Duration::from_millis(20), silent_peer.recv(&mut buf)).await
+                {
+                    count += 1;
+                }
+            }
+            count
+        };
+        let (_, count) = tokio::join!(connect_fut, count_fut);
+
+        assert!(
+            count <= 3,
+            "connect must not send SESSION_REQUEST faster than its {:?} cadence — saw {count} in a \
+             700ms real-time window (expected ~3 at the correct cadence; a wiring bug that ignores \
+             the retry predicate's return value, or forgets to reset `last_send` after sending, fires \
+             roughly every 100ms instead — ~7 in this window)",
+            SESSION_REQUEST_RETRY,
+        );
+    }
+
     #[test]
     fn test_crc32_zero_key() {
         let data = b"hello world";
