@@ -95,8 +95,11 @@ jobs:
       # catch the first real one.)
       #
       # Headless-safety still holds under `--workspace`: no test in any crate constructs a
-      # `wgpu::Instance` or a `winit::EventLoop` (grep confirms both appear only in
-      # `src/bin/render_model.rs`, a binary whose `main` no test calls). The renderer crate's
+      # `wgpu::Instance` or a `winit::EventLoop` (those call sites are `src/app.rs:772` — in the
+      # *lib*, not a binary — plus `src/main.rs:519` and `src/bin/render_model.rs:527`/`:700`; all
+      # are startup paths no test invokes. Being in the lib target is fine: the old `--lib` gate
+      # already compiled and linked `src/app.rs` headless for months, and two green
+      # `ubuntu-latest` runs confirm it empirically). The renderer crate's
       # shader tests parse WGSL as text. The net-crate tests bind only `127.0.0.1:0`/`0.0.0.0:0`
       # UDP loopback sockets, which need no external network. `eqoxide-crash`'s tests exec the
       # `crash_probe` bin via `CARGO_BIN_EXE_*` (cargo builds and locates it; no display needed).
