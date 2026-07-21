@@ -8,12 +8,13 @@
 //! HTTP-only pieces: request/response body types (`PlayerState`, `Health`, …), `HttpState`, and the
 //! server task. Most handlers just write a shared request slot (the `*Req` aliases) that the
 //! navigation thread drains each tick; reads come from snapshots the render/network threads
-//! publish — those `Arc<Mutex<…>>` IPC channel types themselves live in [`crate::ipc`] (re-exported
+//! publish — those `Arc<Mutex<…>>` IPC channel types themselves live in [`eqoxide_ipc`] (re-exported
 //! here for the handler submodules below) since they are shared with the network/render threads,
 //! not genuine HTTP types. See `docs/http-api.md`.
 
 use axum::Router;
-use crate::camera_state::{CameraCmd, CameraSnapshot};
+// `CameraCmd`/`CameraSnapshot` (and every other `eqoxide_ipc` type the handlers reference) come in
+// via the `pub use eqoxide_ipc::*;` glob below — a separate private `use` here would only shadow it.
 
 /// Extracts an optional JSON body, distinguishing "no body was sent" (→ `.0 == None`, so the
 /// handler applies its own defaults) from "a body was sent but didn't parse" (→ a 400 naming
@@ -63,7 +64,7 @@ mod move_api;
 mod trainer;
 mod pet;
 mod combat;
-pub(crate) mod interact;
+pub mod interact;
 mod merchant;
 mod inventory;
 mod chat;
@@ -72,14 +73,20 @@ mod social;
 mod camera;
 mod lifecycle;
 
+// Shared test fixtures (`HttpState` builder + snapshot-seeding helpers). Available to this crate's
+// own unit tests and, via the `test-fixtures` feature, to the app crate's integration tests — see
+// the module docs. Never compiled into a release build.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod testkit;
+
 // The `Arc<Mutex<…>>` request/snapshot ("IPC channel") types used to live here, but they are shared
 // state between this thread, the network thread, and the render/app loop — not genuine HTTP types —
-// so they were relocated to the neutral `crate::ipc` (cleanup; pure code motion). This glob re-export
+// so they were relocated to the neutral `eqoxide_ipc` (cleanup; pure code motion). This glob re-export
 // is a compatibility shim: every handler submodule below still just does `use super::*;` and every
 // name it expects (the `*Req`/`*Shared` aliases, `HttpState`'s field types, `NetHealth`, …) keeps
-// resolving unqualified. New cross-thread code should `use crate::ipc::…` directly instead of routing
-// through here — see `crate::ipc` for the authoritative definitions.
-pub use crate::ipc::*;
+// resolving unqualified. New cross-thread code should `use eqoxide_ipc::…` directly instead of routing
+// through here — see `eqoxide_ipc` for the authoritative definitions.
+pub use eqoxide_ipc::*;
 
 /// Seconds without any inbound server packet after which the session is reported disconnected
 /// (`connected: false`). Generous enough to ride out normal quiet spells; short enough that a
@@ -209,7 +216,7 @@ impl PlayerState {
     /// mirrors `controller_view` into them every tick in `ActionLoop::stream_position` (and the
     /// controlled-fall branch writes `player_z` itself), so this is exactly the position the client
     /// streams to the server — no need to reach into the render thread's controller (#343).
-    pub fn from_game_state(gs: &crate::game_state::GameState) -> Self {
+    pub fn from_game_state(gs: &eqoxide_core::game_state::GameState) -> Self {
         PlayerState {
             name:       gs.player_name.clone(),
             zone:       gs.world.zone_name.clone(),
@@ -228,7 +235,7 @@ impl PlayerState {
             // (outbound adds the offset in OP_ClientUpdate; inbound subtracts it), never here.
             pos_up:     gs.player_z,
             heading_ccw: gs.player_heading,
-            heading_cw:  crate::eq_net::protocol::ccw_to_cw(gs.player_heading),
+            heading_cw:  eqoxide_protocol::protocol::ccw_to_cw(gs.player_heading),
             server_corrections: gs.server_corrections,
             mem_spells: gs.mem_spells,
             skills:     gs.player_skills.clone(),
@@ -291,13 +298,13 @@ impl PlayerState {
             // moment it is read.
             casting:         gs.casting.as_ref().map(|c| CastingView {
                                  spell_id:   c.spell_id,
-                                 spell_name: crate::spells::name_of(c.spell_id),
+                                 spell_name: eqoxide_core::spells::name_of(c.spell_id),
                                  cast_ms:    c.cast_ms,
                                  started:    c.started,
                              }),
             last_cast:       gs.last_cast.as_ref().map(|o| LastCastView {
                                  spell_id:   o.spell_id,
-                                 spell_name: crate::spells::name_of(o.spell_id),
+                                 spell_name: eqoxide_core::spells::name_of(o.spell_id),
                                  outcome:    o.kind.to_string(),
                                  text:       o.text.clone(),
                                  at:         o.at,
@@ -418,7 +425,7 @@ pub(crate) fn currency_json(coin: [u32; 4]) -> serde_json::Value {
     })
 }
 
-/// **M4 domain bundles** (see `crate::ipc` module docs): the ~62 flat request/snapshot slots this
+/// **M4 domain bundles** (see `eqoxide_ipc` module docs): the ~62 flat request/snapshot slots this
 /// struct used to hold individually are now grouped by domain, mirroring the `/v1/<group>/*` router
 /// nesting below — prefiguring a future shared controller-verb API (Phase 2). Each bundle here MUST
 /// be a `.clone()` of the SAME bundle instance handed to `ActionLoop::new` in `main.rs`; that shared
@@ -430,31 +437,35 @@ pub(crate) fn currency_json(coin: [u32; 4]) -> serde_json::Value {
 /// boundary is the DOMAIN, not "exactly the fields this struct touches". (The walker's draw-only
 /// `nav_path_view` overlay moved off `NavSlots` to `ControllerSlots` in #452 — a render↔nav channel
 /// `HttpState` never held.)
+// `pub` (not `pub(crate)`) only so downstream integration tests can NAME the type that
+// `testkit::empty_state`/`debug_json` hand back (they can't otherwise hold a value of it across the
+// crate boundary). Its fields stay `pub(crate)`, so it remains un-constructible outside this crate —
+// only `spawn_camera_server` / `testkit::empty_state` build one. (#544 Step 2l)
 #[derive(Clone)]
-pub(crate) struct HttpState {
+pub struct HttpState {
     /// `/v1/camera/*` slots (#M4).
-    pub(crate) camera:          crate::ipc::CameraSlots,
+    pub(crate) camera:          eqoxide_ipc::CameraSlots,
     /// `/v1/move/*` slots (#M4).
-    pub(crate) nav:             crate::ipc::NavSlots,
+    pub(crate) nav:             eqoxide_ipc::NavSlots,
     /// The live entity registry + zone exit points (#M4).
-    pub(crate) world:           crate::ipc::WorldSlots,
+    pub(crate) world:           eqoxide_ipc::WorldSlots,
     /// Zone collision + region map (shared with the nav thread); read-only here, for zone_exits.
-    pub(crate) shared_collision: crate::nav::collision::SharedCollision,
+    pub(crate) shared_collision: eqoxide_nav::collision::SharedCollision,
     /// The typed write-path facade (#446). Combat is fully migrated onto it — combat/pet handlers
     /// write via `s.command.request_*` (no direct `ipc::CombatSlots` field any more); other domains
-    /// still use their own bundle fields until Wave-2 migrates them. See `crate::command_state`.
-    pub(crate) command:         crate::command_state::CommandState,
+    /// still use their own bundle fields until Wave-2 migrates them. See `eqoxide_command`.
+    pub(crate) command:         eqoxide_command::CommandState,
     /// `/v1/social/*` (who/friends) slots (#M4).
-    pub(crate) social:          crate::ipc::SocialSlots,
+    pub(crate) social:          eqoxide_ipc::SocialSlots,
     /// `/v1/merchant/*` slots (#M4).
-    pub(crate) merchant_slots:  crate::ipc::MerchantSlots,
+    pub(crate) merchant_slots:  eqoxide_ipc::MerchantSlots,
     /// `/v1/inventory/*` slots (#M4).
-    pub(crate) inventory_slots: crate::ipc::InventorySlots,
+    pub(crate) inventory_slots: eqoxide_ipc::InventorySlots,
     /// `/v1/interact/*` slots (#M4).
-    pub(crate) interact:        crate::ipc::InteractSlots,
+    pub(crate) interact:        eqoxide_ipc::InteractSlots,
     /// Outgoing chat + async events + the message log (#M4).
-    pub(crate) chat:            crate::ipc::ChatSlots,
-    pub(crate) spells:           std::sync::Arc<crate::spells::SpellDb>,
+    pub(crate) chat:            eqoxide_ipc::ChatSlots,
+    pub(crate) spells:           std::sync::Arc<eqoxide_core::spells::SpellDb>,
     /// The network thread's authoritative `GameState`. Every agent-facing player field is projected
     /// from HERE at read time (`HttpState::player`) — the render loop is no longer in the path (#343).
     pub(crate) game_state:       GameStateSnapshot,
@@ -463,13 +474,13 @@ pub(crate) struct HttpState {
     /// Render-owned frame timings (the ONLY agent-visible value the render loop publishes).
     pub(crate) frame_profile:    FrameProfileShared,
     /// `/v1/quests/*` slots (#M4).
-    pub(crate) quest:           crate::ipc::QuestSlots,
+    pub(crate) quest:           eqoxide_ipc::QuestSlots,
     /// `/v1/group/*` slots (#M4).
-    pub(crate) group_slots:     crate::ipc::GroupSlots,
+    pub(crate) group_slots:     eqoxide_ipc::GroupSlots,
     /// `/v1/lifecycle/*` slots (#M4).
-    pub(crate) lifecycle:       crate::ipc::LifecycleSlots,
+    pub(crate) lifecycle:       eqoxide_ipc::LifecycleSlots,
     /// `/v1/guild/*` slots (#M4).
-    pub(crate) guild_slots:     crate::ipc::GuildSlots,
+    pub(crate) guild_slots:     eqoxide_ipc::GuildSlots,
 }
 
 impl HttpState {
@@ -584,24 +595,24 @@ pub(crate) fn require_live_session(s: &HttpState) -> Result<(), (axum::http::Sta
 
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_camera_server(
-    camera:          crate::ipc::CameraSlots,
-    nav:             crate::ipc::NavSlots,
-    world:           crate::ipc::WorldSlots,
-    shared_collision: crate::nav::collision::SharedCollision,
-    command:         crate::command_state::CommandState,
-    social:          crate::ipc::SocialSlots,
-    merchant_slots:  crate::ipc::MerchantSlots,
-    inventory_slots: crate::ipc::InventorySlots,
-    interact:        crate::ipc::InteractSlots,
-    chat:            crate::ipc::ChatSlots,
-    spells:           std::sync::Arc<crate::spells::SpellDb>,
+    camera:          eqoxide_ipc::CameraSlots,
+    nav:             eqoxide_ipc::NavSlots,
+    world:           eqoxide_ipc::WorldSlots,
+    shared_collision: eqoxide_nav::collision::SharedCollision,
+    command:         eqoxide_command::CommandState,
+    social:          eqoxide_ipc::SocialSlots,
+    merchant_slots:  eqoxide_ipc::MerchantSlots,
+    inventory_slots: eqoxide_ipc::InventorySlots,
+    interact:        eqoxide_ipc::InteractSlots,
+    chat:            eqoxide_ipc::ChatSlots,
+    spells:           std::sync::Arc<eqoxide_core::spells::SpellDb>,
     game_state:       GameStateSnapshot,
     net_health:       NetHealthShared,
     frame_profile:    FrameProfileShared,
-    quest:           crate::ipc::QuestSlots,
-    group_slots:     crate::ipc::GroupSlots,
-    lifecycle:       crate::ipc::LifecycleSlots,
-    guild_slots:     crate::ipc::GuildSlots,
+    quest:           eqoxide_ipc::QuestSlots,
+    group_slots:     eqoxide_ipc::GroupSlots,
+    lifecycle:       eqoxide_ipc::LifecycleSlots,
+    guild_slots:     eqoxide_ipc::GuildSlots,
     port:             u16,
     // When `Some`, an already-bound listener from `--api-port` (exact port, no scan).
     // When `None`, scan upward from `port` for the first free port.
@@ -687,7 +698,7 @@ pub fn spawn_camera_server(
             // the listener ever got here (#392). If none of that happens — the port never binds, or
             // this task panics first — the fallback stamp is still on record; this call just adds
             // the more specific `api_port=` line on top of it once the listener is actually up.
-            crate::crash::log_instance(&format!("api_port={bound_port}"));
+            eqoxide_crash::log_instance(&format!("api_port={bound_port}"));
             tracing::info!("camera HTTP: http://127.0.0.1:{bound_port}");
             if let Err(e) = axum::serve(listener, app).await {
                 tracing::error!("camera HTTP: server error: {e}");
@@ -728,7 +739,7 @@ mod player_view_datum_tests {
 
     #[test]
     fn pos_up_reports_foot_not_wire() {
-        let mut gs = crate::game_state::GameState::new();
+        let mut gs = eqoxide_core::game_state::GameState::new();
         gs.player_z = 73.875; // FOOT
         let view = PlayerState::from_game_state(&gs);
         assert_eq!(view.pos_up, 73.875,
@@ -742,7 +753,7 @@ mod player_view_datum_tests {
 #[cfg(test)]
 mod live_session_guard_tests {
     use super::*;
-    use crate::http::quests::tests::{ago, empty_state};
+    use crate::testkit::{ago, empty_state};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;

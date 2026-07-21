@@ -1,0 +1,60 @@
+[package]
+name = "eqoxide-http"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "eqoxide_http"
+path = "src/lib.rs"
+
+[features]
+# Exposes the `testkit` module (otherwise `#[cfg(test)]`-only) to DOWNSTREAM test builds — the
+# `HttpState` builder + `set_gs`/`ago`/`debug_json` helpers the app crate's integration tests need
+# to exercise the routers. The app crate enables this in its [dev-dependencies] so
+# `tests/http_observe_apply.rs` (the relocated `apply_consider`/`apply_death` → `/observe/debug`
+# tests, which need `eq_net::packet_handler` — an app-crate module BELOW which http sits) can build
+# an `HttpState` and hit the observe router. Off in normal builds; the release binary never has it.
+test-fixtures = []
+
+[dependencies]
+# eqoxide-http is the agent-facing REST API (axum). It sits at the TOP of the extracted-crate stack:
+# it reads the model's published read-side snapshots and writes the view→model command IPC slots,
+# but it holds no app/renderer/gpu/eq_net-transport state itself. It depends ONLY on the lower
+# structural crates — never on the app crate, renderer, models, gpu, wgpu, winit, egui, or the
+# eq_net transport/action-loop (the two packet-apply gameplay fns its tests touched live in the app
+# crate; those tests were relocated up into an app-crate integration test — see the `test-fixtures`
+# feature above).
+eqoxide-core = { path = "../eqoxide-core" }        # game_state / spells / skills / race_class / pet
+eqoxide-ipc = { path = "../eqoxide-ipc" }          # the Arc<Mutex<…>> IPC slot bundles + snapshot aliases
+eqoxide-command = { path = "../eqoxide-command" }  # CommandState — the typed write-path facade
+eqoxide-nav = { path = "../eqoxide-nav" }          # collision::SharedCollision + NavBlockage projections
+eqoxide-telemetry = { path = "../eqoxide-telemetry" }  # packet_telemetry: /observe/packets capture ring
+eqoxide-crash = { path = "../eqoxide-crash" }      # crash::log_instance — stamps the per-pid crash log
+eqoxide-protocol = { path = "../eqoxide-protocol" }  # protocol::ccw_to_cw — heading CCW→CW for /debug
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_path_to_error = "0.1"
+arc-swap = "1"
+tracing = "0.1"
+# `tower::ServiceExt::oneshot` drives a `Router` in-process (no bound socket). Used by the handler
+# tests AND by `testkit::debug_json` — which the `test-fixtures` feature exposes to the app crate's
+# integration tests, so it must be a NORMAL (not dev) dependency to be present in that feature build.
+# Costs nothing in the release tree: axum already pulls tower in transitively.
+tower = "0.5"
+
+[dev-dependencies]
+# Enable eqoxide-core's `test-fixtures` constructors (`game_state::make_entity`, `#[cfg(test)]` in
+# core so invisible across the crate boundary) for THIS crate's test build — `observe.rs`'s
+# `debug_clears_target_on_zone_change_408` test seeds an entity with it. Without this, a standalone
+# `cargo test -p eqoxide-http` fails (the `--workspace` run only passed via feature unification).
+eqoxide-core = { path = "../eqoxide-core", features = ["test-fixtures"] }
+# `test-util` (not in tokio's `full`) enables `#[tokio::test(start_paused = true)]` so the A3
+# merchant-buy / interact-give / cast timeout tests (#448) exercise the real timeout elapse in
+# virtual time — instantly.
+tokio = { version = "1", features = ["full", "test-util"] }
+# `test-fixtures` exposes eqoxide-telemetry's `test_capture_lock` (its global capture-serialization
+# lock, otherwise `#[cfg(test)]`) so `observe.rs`'s `/observe/packets` tests don't race the ring
+# against other crates' capture tests (#544 Step 2k).
+eqoxide-telemetry = { path = "../eqoxide-telemetry", features = ["test-fixtures"] }

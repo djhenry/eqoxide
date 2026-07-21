@@ -68,7 +68,7 @@ async fn post_exit(State(s): State<HttpState>) -> (StatusCode, &'static str) {
         // panic, no signal, fresh heartbeat" — which the crash module documents as meaning
         // OOM-kill. A wedge would then be confidently misreported as an OOM: an agent-honesty
         // violation inside the agent-honesty fix. The reason string is the whole point.
-        crate::crash::exit("render-loop-wedged", 0);
+        eqoxide_crash::exit("render-loop-wedged", 0);
     });
     (StatusCode::OK, "camping out, then shutting down (~30s)")
 }

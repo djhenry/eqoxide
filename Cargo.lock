@@ -847,6 +847,7 @@ dependencies = [
  "eqoxide-command",
  "eqoxide-core",
  "eqoxide-crash",
+ "eqoxide-http",
  "eqoxide-ipc",
  "eqoxide-nav",
  "eqoxide-protocol",
@@ -913,6 +914,27 @@ version = "0.1.0"
 dependencies = [
  "dirs 5.0.1",
  "libc",
+ "tracing",
+]
+
+[[package]]
+name = "eqoxide-http"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "axum",
+ "eqoxide-command",
+ "eqoxide-core",
+ "eqoxide-crash",
+ "eqoxide-ipc",
+ "eqoxide-nav",
+ "eqoxide-protocol",
+ "eqoxide-telemetry",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "tokio",
+ "tower",
  "tracing",
 ]
 

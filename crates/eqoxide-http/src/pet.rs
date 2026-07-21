@@ -1,10 +1,10 @@
 //! `/v1/pet/*` — manual pet commands (Pet window / agent API). One endpoint: POST `/command`
 //! queues an OP_PetCommands command byte into the shared `PetCmdReq` slot; the nav thread drains
 //! it and sends the packet (attack aims at the current target). Command values are the EQEmu
-//! zone/common.h PET_* constants — see `crate::eq_net::protocol`.
+//! zone/common.h PET_* constants — see `eqoxide_core::pet`.
 
 use axum::{routing::post, extract::State, Json, http::StatusCode, Router};
-use crate::http::{HttpState, require_live_session};
+use crate::{HttpState, require_live_session};
 
 pub fn router() -> Router<HttpState> {
     Router::new().route("/command", post(post_command))
@@ -27,7 +27,7 @@ async fn post_command(
     State(s): State<HttpState>,
     body: Result<Json<CommandBody>, axum::extract::rejection::JsonRejection>,
 ) -> (StatusCode, String) {
-    use crate::eq_net::protocol::{PET_ATTACK, PET_BACKOFF, PET_FOLLOWME, PET_GUARDHERE, PET_SIT};
+    use eqoxide_core::pet::{PET_ATTACK, PET_BACKOFF, PET_FOLLOWME, PET_GUARDHERE, PET_SIT};
     if let Err(e) = require_live_session(&s) { return e; }
     let Ok(Json(b)) = body else {
         return (StatusCode::BAD_REQUEST, "provide {\"command\":N} or {\"name\":\"attack|backoff|follow|guard|sit\"}".into());

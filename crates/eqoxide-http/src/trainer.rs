@@ -4,7 +4,7 @@
 //! `navigation.rs` and the handlers in `packet_handler.rs`).
 
 use axum::{routing::{get, post}, extract::State, Json, http::StatusCode, Router};
-use crate::http::{HttpState, clean_entity_name, require_live_session};
+use crate::{HttpState, clean_entity_name, require_live_session};
 
 pub fn router() -> Router<HttpState> {
     Router::new()
@@ -60,11 +60,11 @@ async fn get_list(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let caps = pi.trainer_skills.clone();
     let cur  = pi.skills.clone();
     drop(pi);
-    let list: Vec<_> = (0..crate::skills::NUM_SKILLS).filter_map(|id| {
+    let list: Vec<_> = (0..eqoxide_core::skills::NUM_SKILLS).filter_map(|id| {
         let cap = caps.get(id).copied().unwrap_or(0);
         let current = cur.get(id).copied().unwrap_or(0);
         (cap > current).then(|| serde_json::json!({
-            "id": id, "name": crate::skills::skill_name(id as u32), "current": current, "cap": cap,
+            "id": id, "name": eqoxide_core::skills::skill_name(id as u32), "current": current, "cap": cap,
         }))
     }).collect();
     Json(serde_json::json!({ "open": true, "skills": list }))
@@ -90,7 +90,7 @@ async fn post_train(
         return (StatusCode::BAD_REQUEST, "no trainer window open — call /v1/trainer/open first".into());
     }
     s.command.request_train_skill(b.skill_id);
-    let name = crate::skills::skill_name(b.skill_id).unwrap_or("?");
+    let name = eqoxide_core::skills::skill_name(b.skill_id).unwrap_or("?");
     (StatusCode::OK, format!("training {} (skill_id={})", name, b.skill_id))
 }
 

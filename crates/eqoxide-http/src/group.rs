@@ -135,7 +135,7 @@ mod tests {
     use tower::ServiceExt;
 
     fn empty_state() -> HttpState {
-        crate::http::quests::tests::empty_state()
+        crate::testkit::empty_state()
     }
 
     #[tokio::test]
