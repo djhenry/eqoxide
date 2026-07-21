@@ -1,0 +1,24 @@
+[package]
+name = "eqoxide-nav"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "eqoxide_nav"
+path = "src/lib.rs"
+
+[dependencies]
+# eqoxide-nav sits directly above eqoxide-assets (core ← ipc ← assets ← nav, #544 Step 2f). It
+# depends ONLY on those three internal crates plus `tracing` — never on wgpu/winit/egui/tokio/axum/
+# eq_net/renderer/app/movement/http/ui/model. The pathfinding math is all plain `[f32; 3]` arrays,
+# so it needs no glam; gltf comes in transitively via eqoxide-assets' `ZoneAssets::from_glb`.
+eqoxide-core = { path = "../eqoxide-core" }
+eqoxide-ipc = { path = "../eqoxide-ipc" }
+eqoxide-assets = { path = "../eqoxide-assets" }
+tracing = "0.1"
+
+[dev-dependencies]
+# Enable eqoxide-core's test-fixture constructors (RegionMap::flat_below/water_slab/zone_line_box/…)
+# for THIS crate's test build — they're `#[cfg(any(test, feature = "test-fixtures"))]` in core, so
+# invisible across the crate boundary otherwise. Dev-deps' features don't activate in release builds.
+eqoxide-core = { path = "../eqoxide-core", features = ["test-fixtures"] }

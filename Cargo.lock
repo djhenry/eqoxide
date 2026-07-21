@@ -846,6 +846,7 @@ dependencies = [
  "eqoxide-assets",
  "eqoxide-core",
  "eqoxide-ipc",
+ "eqoxide-nav",
  "glam",
  "gltf",
  "image",
@@ -902,6 +903,16 @@ dependencies = [
  "eqoxide-core",
  "serde",
  "tokio",
+]
+
+[[package]]
+name = "eqoxide-nav"
+version = "0.1.0"
+dependencies = [
+ "eqoxide-assets",
+ "eqoxide-core",
+ "eqoxide-ipc",
+ "tracing",
 ]
 
 [[package]]

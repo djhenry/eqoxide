@@ -4,7 +4,7 @@
 //! not live inside net). The `ActionLoop` god-struct and its `tick()`/`sync_*`/`apply_*plan`
 //! methods (the net action loop) are a later step and still live in `eq_net::action_loop`.
 
-use crate::coord::eq_heading;
+use eqoxide_core::coord::eq_heading;
 
 // NOTE: `slide_move` — a second, divergent collision-slide implementation (chest ray at z+3, its
 // own axis-drop logic) — was DELETED in Phase 2 (#378). It had ZERO production callers: the walker
@@ -23,24 +23,24 @@ pub const LOCAL_CELL: f32 = 2.0;
 
 /// Consecutive no-progress nav ticks (~150 ms each) before the pure-pursuit walker is declared
 /// stuck and re-paths. ~3 s — long enough to ride out a brief wall-slide, short enough to recover.
-pub(crate) const NAV_STUCK_TICKS: u32 = 20;
+pub const NAV_STUCK_TICKS: u32 = 20;
 /// After this many consecutive no-progress ticks (well before the `NAV_STUCK_TICKS` give-up), the
 /// walker commands the controller to hop — net progress has stalled, which is the real "wedged
 /// against a fence/cart" signal (sliding along it still looks like motion frame-to-frame). (#41)
-pub(crate) const NAV_HOP_TICKS: u32 = 6;
+pub const NAV_HOP_TICKS: u32 = 6;
 /// On a hard stall (NAV_STUCK_TICKS), drive the reverse (downhill) direction for this many ticks
 /// before re-pathing — long enough to clear a wedged slope-face start (~150 ms/tick). (eqoxide#212)
-pub(crate) const NAV_BACKOFF_TICKS: u32 = 3;
+pub const NAV_BACKOFF_TICKS: u32 = 3;
 /// Proactive re-plan (#246): after this many consecutive ticks where the fine 2u plan can't REACH its
 /// carrot on the committed coarse route, the route is treated as blocked ahead and re-planned from the
 /// current position — long before the ~3 s NAV_STUCK_TICKS give-up, so the walker detours instead of
 /// pressing into the obstacle. Small so the reaction is quick (~0.5 s) but > 1 to ride out a carrot
 /// that momentarily lands on a fine-impassable lip.
-pub(crate) const NAV_LOCAL_STUCK_TICKS: u32 = 3;
+pub const NAV_LOCAL_STUCK_TICKS: u32 = 3;
 /// Minimum ticks between two proactive coarse re-plans, so a persistently-awkward carrot can't thrash
 /// the coarse planner every tick (~1 s). The existing stall/back-off recovery still handles a genuine
 /// wedge the fresh coarse plan can't route around.
-pub(crate) const REPLAN_COOLDOWN_TICKS: u32 = 6;
+pub const REPLAN_COOLDOWN_TICKS: u32 = 6;
 /// How many PROACTIVE coarse re-plans (#246) may fire at ONE spot — without the journey getting
 /// meaningfully closer to the goal — before the walker stops honestly (#378 Phase 2). Each proactive
 /// re-plan reinstalls a fresh coarse route and so resets the stall clock, which is why the ~3 s
@@ -49,19 +49,19 @@ pub(crate) const REPLAN_COOLDOWN_TICKS: u32 = 6;
 /// ≈ 9 ticks per proactive re-plan, 8 of them is ~11 s of trying to detour before the honest
 /// `blocked / local_no_way_through`. Resets on real goal-ward progress (like `nav_repaths`), so a
 /// long multi-corner journey that keeps progressing never trips it.
-pub(crate) const PROACTIVE_REPLAN_CAP: u32 = 8;
+pub const PROACTIVE_REPLAN_CAP: u32 = 8;
 /// After auto-escaping a sealed interior through an in-zone teleport (#266), block another escape for
 /// this long (~10 s at 150 ms/tick) so a goal that's STILL unreachable after the teleport can't
 /// ping-pong the char back and forth through the portal. One escape attempt, then it walks/stalls.
-pub(crate) const PORTAL_COOLDOWN_TICKS: u32 = 66;
+pub const PORTAL_COOLDOWN_TICKS: u32 = 66;
 /// A path segment longer than this (horizontal) is a find_path JUMP-EDGE, not a walk — normal
 /// adjacent nav cells are ≤ 8·√2 ≈ 11.3u apart, jump-edges span ≥ 16u across a real gap. The walker
 /// asks the controller to jump when traversing such a segment. (eqoxide#190)
-pub(crate) const JUMP_SEG_MIN: f32 = 12.0;
+pub const JUMP_SEG_MIN: f32 = 12.0;
 /// Only fire the jump while within this of the takeoff waypoint — so the leap starts grounded at
 /// the near edge and does NOT re-trigger after landing (just under the 8u nav cell). (eqoxide#190)
-pub(crate) const JUMP_TAKEOFF_DIST: f32 = 7.0;
-// The planner itself now lives on its own thread — see `crate::nav::planner`. `plan_path`
+pub const JUMP_TAKEOFF_DIST: f32 = 7.0;
+// The planner itself now lives on its own thread — see `crate::planner`. `plan_path`
 // moved there wholesale: it used to run SYNCHRONOUSLY here, on the network thread, which is the
 // single root cause of #340 (up to ~2 s of net-thread stall → linkdead) and #337 (the 150 ms budget
 // forced A* to give up, and a give-up was indistinguishable from "no route", so the walker silently
@@ -70,15 +70,15 @@ pub(crate) const JUMP_TAKEOFF_DIST: f32 = 7.0;
 /// A chase goal must move at least this far (one nav cell) before it counts as a different goal
 /// worth re-planning for. `/follow` and `/goto <entity>` rewrite the goal with the leader's LIVE
 /// position EVERY TICK, so an exact compare called it "changed" ~every tick (#377 review, B1).
-pub(crate) const GOAL_REPLAN_DIST: f32 = 8.0;
+pub const GOAL_REPLAN_DIST: f32 = 8.0;
 /// A goal that moves further than this is a different DESTINATION, not a drifting one: the committed
 /// route is thrown away, the journey counters reset, and any in-flight plan is superseded.
-pub(crate) const GOAL_RESET_DIST: f32 = 40.0;
+pub const GOAL_RESET_DIST: f32 = 40.0;
 
 /// What a tick should do about (re)planning. Pure, so the `/follow` freeze below is unit-testable
 /// without a live `EqStream`.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(crate) struct Replan {
+pub struct Replan {
     /// Post a fresh plan request to the worker.
     pub post: bool,
     /// The goal is somewhere else entirely — drop the committed route and the recovery budget.
@@ -106,7 +106,7 @@ pub(crate) struct Replan {
 /// point. That distinction is what makes this sound: a leader who runs 500u away is still the SAME
 /// goal, so its route must never be thrown away for "moving too far" — whereas a fresh `/goto` to a
 /// point 500u away IS a different destination and the old route must go.
-pub(crate) fn replan_decision(
+pub fn replan_decision(
     planned_goal: Option<(f32, f32, f32)>,
     goal: (f32, f32, f32),
     in_flight: Option<(f32, f32, f32)>,
@@ -140,8 +140,8 @@ pub(crate) fn replan_decision(
 /// character itself is boxed in (`StartIsolated`). A goal with no walkable floor under it is not
 /// somewhere any portal leads — redirecting there is nonsense, and worse, it replaces the agent's
 /// real reason (`goal_not_walkable` — *fix your coordinates*) with the portal's.
-pub(crate) fn portal_escape_applies(why: crate::nav::collision::NoRoute) -> bool {
-    use crate::nav::collision::NoRoute;
+pub fn portal_escape_applies(why: crate::collision::NoRoute) -> bool {
+    use crate::collision::NoRoute;
     matches!(why, NoRoute::SearchClosed | NoRoute::StartIsolated)
 }
 
@@ -150,18 +150,18 @@ pub(crate) fn portal_escape_applies(why: crate::nav::collision::NoRoute) -> bool
 /// /follow chase has caught up → stand near the leader but STAY latched so it re-engages when the
 /// leader moves (#268). `Drive` = not there yet → keep walking.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ArrivalAction { Drive, Arrived, FollowHold }
+pub enum ArrivalAction { Drive, Arrived, FollowHold }
 
 /// Arrival radius for a one-shot /goto (melee range is ~14u, so 2u keeps us well inside it).
-pub(crate) const STOP_DIST: f32 = 2.0;
+pub const STOP_DIST: f32 = 2.0;
 /// A /follow settles up to this far behind the leader (a bit behind, still in group range).
-pub(crate) const FOLLOW_DIST: f32 = 10.0;
+pub const FOLLOW_DIST: f32 = 10.0;
 
 /// Vertical arrival tolerance — the walker must be on the goal's FLOOR, not a floor above/below it.
 /// This is the SAME tolerance `astar` uses to accept a searched cell as the goal tier, so the
 /// arrival predicate and the pathfinder agree on "the right floor" by construction (#344). See the
 /// const's own doc for why 8u distinguishes floors without rejecting standing height / step-ups.
-pub(crate) const Z_ARRIVAL_TOL: f32 = crate::nav::collision::GOAL_TIER_TOL;
+pub const Z_ARRIVAL_TOL: f32 = crate::collision::GOAL_TIER_TOL;
 
 /// Stop within 2u for a one-shot /goto; a /follow settles up to FOLLOW_DIST behind the leader.
 ///
@@ -170,7 +170,7 @@ pub(crate) const Z_ARRIVAL_TOL: f32 = crate::nav::collision::GOAL_TIER_TOL;
 /// (the NPC one storey up, #344) is NOT arrival — it stays `Drive`, so the client keeps navigating
 /// (climbing toward a reachable floor) or, when the floor is unreachable, runs on into the walker's
 /// existing honest `blocked`/`no_path` terminal states — never a false `arrived`/`following`.
-pub(crate) fn arrival_action(gdist: f32, gdz: f32, following: bool) -> ArrivalAction {
+pub fn arrival_action(gdist: f32, gdz: f32, following: bool) -> ArrivalAction {
     // Wrong FLOOR: correct horizontally but a storey off. Never report arrival/hold here — the
     // agent must not be told it reached a goal it is a floor away from (#344, agent-honesty).
     if gdz.abs() > Z_ARRIVAL_TOL {
@@ -197,7 +197,7 @@ pub(crate) fn arrival_action(gdist: f32, gdz: f32, following: bool) -> ArrivalAc
 /// and (with the cursor) consumed the descent on frame one — the walker would then drive HORIZONTALLY
 /// into the shaft wall instead of swimming DOWN it. On near-horizontal LAND segments 3D ≡ 2D (the z
 /// contribution vanishes) and the interpolated z equals the segment z, so land steering is unchanged.
-pub(crate) fn carrot_along(path: &[[f32; 3]], start_i: usize, from: [f32; 3], reach: f32) -> Option<[f32; 3]> {
+pub fn carrot_along(path: &[[f32; 3]], start_i: usize, from: [f32; 3], reach: f32) -> Option<[f32; 3]> {
     let a = *path.get(start_i)?;
     let b = path.get(start_i + 1).copied().unwrap_or(a);
     let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
@@ -226,14 +226,14 @@ pub(crate) fn carrot_along(path: &[[f32; 3]], start_i: usize, from: [f32; 3], re
 /// Max commanded vertical swim speed (u/s), kept UNDER the controller's `BUOY_RATE` (30) so a carrot
 /// at the swim plane lets buoyancy do the faster lift (see [`swim_vspeed`]). Was the old inline
 /// `SWIM_UP_RATE`.
-pub(crate) const SWIM_VRATE: f32 = 20.0;
+pub const SWIM_VRATE: f32 = 20.0;
 
 /// Signed vertical swim wish (u/s) that makes the walker **HOLD the planned depth** instead of
 /// floating to the surface — the crux of water-nav Slice 3 (design §8.2).
 ///
 /// It replaces the old up-only rule (`swim && carrot > z+1 → +20 else 0`), which could only RISE: a
 /// mid-water waypoint was inexpressible, so the instant the wish was 0 the controller's buoyancy —
-/// which fires ONLY on `wish_vspeed == 0` ([`crate::movement`]) — lifted the swimmer back to the swim
+/// which fires ONLY on `wish_vspeed == 0` (`movement`) — lifted the swimmer back to the swim
 /// plane and the deep route waypoints could never be followed. That is the planner-z-vs-controller-z
 /// fight of design §1, live-proven in qcat (#547: the char descended, then surfaced/wedged).
 ///
@@ -253,12 +253,12 @@ pub(crate) const SWIM_VRATE: f32 = 20.0;
 ///
 /// The one place the wish must be forced nonzero: **at the target while BELOW the swim plane.** There
 /// `err ≈ 0` would give a 0 wish, and a 0 wish lets buoyancy (which fires only on `wish_vspeed == 0`,
-/// [`crate::movement`], at 30 u/s) reclaim the swimmer and float it to the plane — the surfacing that
+/// `movement`, at 30 u/s) reclaim the swimmer and float it to the plane — the surfacing that
 /// broke the deep route in #547. So below the plane a zero proportional term is nudged to a tiny
 /// `MIN_HOLD` sink: nonzero enough to suppress buoyancy, tiny enough that the controller's `SKIN`
 /// clamp on `swim_sink` turns it into zero net motion — a true hold. At/above the plane a 0 wish is
 /// safe: buoyancy simply rests the swimmer AT the plane, which is where the route wants it anyway.
-pub(crate) fn swim_vspeed(carrot_z: f32, player_z: f32, swim_plane: Option<f32>) -> f32 {
+pub fn swim_vspeed(carrot_z: f32, player_z: f32, swim_plane: Option<f32>) -> f32 {
     const DEPTH_TAU: f32 = 0.25; // s — proportional time-constant of the depth hold
     // The tiny nonzero kept below the plane so buoyancy (wish==0) can never reclaim a mid-water hold.
     // |MIN_HOLD·dt| < movement::SKIN (0.05) at any real frame dt, so it suppresses buoyancy without
@@ -284,7 +284,7 @@ pub(crate) fn swim_vspeed(carrot_z: f32, player_z: f32, swim_plane: Option<f32>)
 /// RUN_SPEED the projection onto segment 0 saturates at t=1, and for the rest of the gate the aim
 /// is measured from `local_path[1]`, which is now BEHIND the walker. The look-ahead collapses and
 /// can invert on a bend, which is the drawn-path-vs-actual-movement divergence in #311.
-pub(crate) fn fast_steer_aim(path: &[[f32; 3]], local_i: &mut usize, from: [f32; 3], reach: f32) -> Option<([f32; 2], f32)> {
+pub fn fast_steer_aim(path: &[[f32; 3]], local_i: &mut usize, from: [f32; 3], reach: f32) -> Option<([f32; 2], f32)> {
     advance_cursor(path, local_i, from);
     let aim = carrot_along(path, *local_i, from, reach)?;
     let (dx, dy) = (aim[0] - from[0], aim[1] - from[1]);
@@ -301,7 +301,7 @@ pub(crate) fn fast_steer_aim(path: &[[f32; 3]], local_i: &mut usize, from: [f32;
 /// bend. Since #382 the fine path arrives from a worker a tick or two after it was requested and so
 /// STARTS a few units behind the walker by construction, which makes this advance load-bearing on the
 /// very first use of a fresh plan, not just partway through its life.
-pub(crate) fn advance_cursor(path: &[[f32; 3]], i: &mut usize, from: [f32; 3]) {
+pub fn advance_cursor(path: &[[f32; 3]], i: &mut usize, from: [f32; 3]) {
     // A cursor can only ever index the path it was advanced along, whatever it held before. The fine
     // path is now REPLACED asynchronously, by a worker, with one that may be SHORTER than the one the
     // cursor was walking — so "the cursor outran the path" is a state this code must simply not have.
@@ -340,7 +340,7 @@ pub(crate) fn advance_cursor(path: &[[f32; 3]], i: &mut usize, from: [f32; 3]) {
 ///
 /// `local` is whatever the fine tier last produced (empty = nothing to steer on). `fallback` is the
 /// aim of last resort when even the coarse route yields nothing (the straight line to the goal).
-pub(crate) fn steer_target(
+pub fn steer_target(
     coarse: &[[f32; 3]], path_i: usize,
     local:  &[[f32; 3]], local_i: &mut usize,
     from: [f32; 3], look_ahead: f32,
@@ -374,8 +374,8 @@ pub(crate) fn steer_target(
 /// so it re-proposed the same corridor forever.
 ///
 /// `Threaded` obviously does not: the walker is threading it right now.
-pub(crate) fn arms_coarse_replan(outcome: &crate::nav::collision::LocalOutcome) -> bool {
-    matches!(outcome, crate::nav::collision::LocalOutcome::NoWayThrough { .. })
+pub fn arms_coarse_replan(outcome: &crate::collision::LocalOutcome) -> bool {
+    matches!(outcome, crate::collision::LocalOutcome::NoWayThrough { .. })
 }
 
 #[cfg(test)]
@@ -441,7 +441,7 @@ mod tests {
     /// reached them. Same family of lie as everything else this PR exists to kill.
     #[test]
     fn only_a_walled_off_goal_may_be_escaped_via_a_portal() {
-        use crate::nav::collision::NoRoute;
+        use crate::collision::NoRoute;
         // Walled off from a perfectly good goal, or boxed in ourselves → a teleport might genuinely
         // be the way out. That is what #266 is for.
         assert!(portal_escape_applies(NoRoute::SearchClosed), "a walled-off goal may be escaped to");
@@ -632,8 +632,8 @@ mod tests {
                 let dot = (wish_dir[0] * seg[0] + wish_dir[1] * seg[1]) / seg_len;
                 min_forward_dot = min_forward_dot.min(dot);
             }
-            pos[0] += wish_dir[0] * crate::eq_net::action_loop::RUN_SPEED * DT;
-            pos[1] += wish_dir[1] * crate::eq_net::action_loop::RUN_SPEED * DT;
+            pos[0] += wish_dir[0] * eqoxide_core::physics::RUN_SPEED * DT;
+            pos[1] += wish_dir[1] * eqoxide_core::physics::RUN_SPEED * DT;
         }
         assert!(min_forward_dot > 0.3,
             "fast-steer aim pointed backward along its tracked segment (dot={min_forward_dot:.2}) \

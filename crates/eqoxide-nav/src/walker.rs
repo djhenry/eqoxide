@@ -8,7 +8,7 @@
 //! # The intent-only movement boundary
 //!
 //! **`Walker` cannot move the player.** It does not hold `ControllerSlots` (no
-//! `controller_view`, no `pos_correction`) — only [`crate::ipc::NavIntent`], the same per-frame
+//! `controller_view`, no `pos_correction`) — only [`eqoxide_ipc::NavIntent`], the same per-frame
 //! [`eqoxide_ipc::MoveIntent`] slot native WASD input writes in `app.rs`. The render-thread
 //! `CharacterController` (`src/movement.rs`) is the ONLY thing that ever integrates a position from
 //! that intent (collide-and-slide, step-up, gravity, buoyancy). `Walker` reads the player's
@@ -22,17 +22,17 @@
 //! controller's own tracked airborne height. `Walker` never touches `gs.player_*`, `EqStream`, or
 //! the controller — it writes only the per-frame `nav_intent`.
 
-use crate::coord::eq_heading;
+use eqoxide_core::coord::eq_heading;
 use eqoxide_core::physics::fall_damage;
-use crate::game_state::GameState;
+use eqoxide_core::game_state::GameState;
 use eqoxide_ipc::MoveIntent;
-use crate::nav::steering::*;
+use crate::steering::*;
 
 /// Native Titanium base run speed — see `eq_net::action_loop::RUN_SPEED` for the derivation. Kept
 /// as one constant there (both `Walker` and `ActionLoop::drive_auto_engage_melee` need it) rather
 /// than duplicated; `nav::steering` already reaches into it the same way (see its `advance_cursor`
 /// test fixtures).
-use crate::eq_net::action_loop::RUN_SPEED;
+use eqoxide_core::physics::RUN_SPEED;
 
 /// The path-walker: (re)plans the coarse/fine route toward the active `/goto` goal, steers
 /// pure-pursuit along it, and drives arrival/stall/fall-edge/portal-escape handling.
@@ -40,62 +40,62 @@ use crate::eq_net::action_loop::RUN_SPEED;
 /// Holds its own clones of the `NavSlots`/`WorldSlots`/`SharedCollision` bundles `ActionLoop` also
 /// holds — cheap `Arc` clones of the SAME shared state, not a second copy of it (see
 /// `ActionLoop::new`) — plus the two pathfinding worker handles, which `Walker` owns exclusively.
-pub(crate) struct Walker {
-    nav:       crate::ipc::NavSlots,
-    world:     crate::ipc::WorldSlots,
-    collision: crate::nav::collision::SharedCollision,
+pub struct Walker {
+    nav:       eqoxide_ipc::NavSlots,
+    world:     eqoxide_ipc::WorldSlots,
+    collision: crate::collision::SharedCollision,
     /// The ONLY movement channel — see the module doc's "intent-only movement boundary".
-    nav_intent: crate::ipc::NavIntent,
+    nav_intent: eqoxide_ipc::NavIntent,
     /// The DRAW-ONLY committed-path overlay this walker publishes for the render View (#246). MVC C2
     /// (#452): this is derived/read state, not a command, so it lives on `ipc::ControllerSlots`
     /// (a render↔nav channel like `nav_intent`) and is handed in here as its own clone — NOT reached
     /// through `self.nav` (the command bundle no longer carries it).
-    nav_path_view: crate::ipc::NavPathView,
+    nav_path_view: eqoxide_ipc::NavPathView,
 
     /// Cached A* waypoints for the current goto goal (routes around walls). `path_i` is the
     /// current waypoint; `path_goal` is the goal these waypoints were computed for (recompute
     /// when the goal changes). Empty path = straight-line fallback.
-    pub(crate) path:             Vec<[f32; 3]>,  // [east, north, floor_z] per waypoint
-    pub(crate) path_i:           usize,
-    pub(crate) path_goal:        Option<(f32, f32, f32)>,
+    pub path:             Vec<[f32; 3]>,  // [east, north, floor_z] per waypoint
+    pub path_i:           usize,
+    pub path_goal:        Option<(f32, f32, f32)>,
     /// Fine LOCAL A* plan (2u grid, bounded) the walker actually steers along — see the field of
     /// the same name on the pre-extraction `ActionLoop` for the full #nav-multires/#382 rationale.
-    pub(crate) local_path:       Vec<[f32; 3]>,
-    pub(crate) local_from:       [f32; 3],
-    pub(crate) local_i:          usize,
+    pub local_path:       Vec<[f32; 3]>,
+    pub local_from:       [f32; 3],
+    pub local_i:          usize,
     /// No-progress detector for the path walker (see `nav_progress`). `stuck_best` is the
     /// closest distance reached toward the current aim, `stuck_ticks` the consecutive
     /// no-progress ticks, and `stuck_i` the `path_i` the detector is tracking.
-    pub(crate) stuck_best:       f32,
-    pub(crate) stuck_ticks:      u32,
-    pub(crate) stuck_i:          usize,
+    pub stuck_best:       f32,
+    pub stuck_ticks:      u32,
+    pub stuck_i:          usize,
     /// Stall-recovery re-paths WITHOUT forward progress; capped (#229 resets it on real progress).
-    pub(crate) nav_repaths:      u32,
+    pub nav_repaths:      u32,
     /// Closest straight-line distance to the current goal reached so far.
-    pub(crate) nav_best_gdist:   f32,
+    pub nav_best_gdist:   f32,
     /// Downhill back-off (#212): drive the reverse direction for this many ticks before re-pathing.
-    pub(crate) backoff_ticks:    u32,
-    pub(crate) backoff_dir:      [f32; 2],
+    pub backoff_ticks:    u32,
+    pub backoff_dir:      [f32; 2],
     /// Proactive coarse re-plan (#246) bookkeeping — see the pre-extraction field docs for
     /// `local_stuck_ticks`/`replan_coarse`/`replan_cooldown`/`proactive_replans` (#378 Phase 2).
-    pub(crate) local_stuck_ticks: u32,
-    pub(crate) replan_coarse:     bool,
-    pub(crate) replan_cooldown:   u32,
-    pub(crate) proactive_replans: u32,
+    pub local_stuck_ticks: u32,
+    pub replan_coarse:     bool,
+    pub replan_cooldown:   u32,
+    pub proactive_replans: u32,
     /// Auto-escape a SEALED interior via an in-zone teleport (#266) — see the pre-extraction
     /// field docs for `escape_return`/`last_walk_pos`/`portal_cooldown`.
-    pub(crate) escape_return:     Option<(f32, f32, f32)>,
-    pub(crate) last_walk_pos:     [f32; 3],
-    pub(crate) portal_cooldown:   u32,
+    pub escape_return:     Option<(f32, f32, f32)>,
+    pub last_walk_pos:     [f32; 3],
+    pub portal_cooldown:   u32,
     /// The PATHFINDING WORKER (#340) — posted to; the net thread never blocks on a search.
-    planner:          crate::nav::planner::Planner,
+    planner:          crate::planner::Planner,
     /// The FINE-TIER WORKER (#382) — posted every nav tick, never waited on.
-    local_planner:    crate::nav::planner::LocalPlanner,
+    local_planner:    crate::planner::LocalPlanner,
     /// The planner SNAPPED the current goal's z to a floor the caller never named. Carried to
     /// ARRIVAL so the agent is not told `arrived` as though it got the goal it asked for.
-    pub(crate) goal_snapped: bool,
+    pub goal_snapped: bool,
     /// True while a plan is in flight for a goal we have NO route for yet.
-    pub(crate) awaiting_first_plan: bool,
+    pub awaiting_first_plan: bool,
 }
 
 impl Walker {
@@ -104,12 +104,12 @@ impl Walker {
     /// / `controller.nav_path_view.clone()` — NOT fresh `Default`s, or the walker would drive an
     /// intent slot nothing reads / publish an overlay `App` never sees (see the module doc's
     /// intent-only boundary and `ActionLoop::new`).
-    pub(crate) fn new(
-        nav:           crate::ipc::NavSlots,
-        world:         crate::ipc::WorldSlots,
-        collision:     crate::nav::collision::SharedCollision,
-        nav_intent:    crate::ipc::NavIntent,
-        nav_path_view: crate::ipc::NavPathView,
+    pub fn new(
+        nav:           eqoxide_ipc::NavSlots,
+        world:         eqoxide_ipc::WorldSlots,
+        collision:     crate::collision::SharedCollision,
+        nav_intent:    eqoxide_ipc::NavIntent,
+        nav_path_view: eqoxide_ipc::NavPathView,
     ) -> Self {
         Walker {
             nav, world, collision, nav_intent, nav_path_view,
@@ -133,8 +133,8 @@ impl Walker {
             escape_return: None,
             last_walk_pos: [0.0, 0.0, 0.0],
             portal_cooldown: 0,
-            planner: crate::nav::planner::Planner::spawn(),
-            local_planner: crate::nav::planner::LocalPlanner::spawn(),
+            planner: crate::planner::Planner::spawn(),
+            local_planner: crate::planner::LocalPlanner::spawn(),
             goal_snapped: false,
             awaiting_first_plan: false,
         }
@@ -142,7 +142,7 @@ impl Walker {
 
     /// Drop the fine plan and forget the fine tier's last word. Called wherever the ground the plan
     /// describes stops being ground we are standing on — a new destination, a teleport, a stop.
-    pub(crate) fn clear_local_plan(&mut self) {
+    pub fn clear_local_plan(&mut self) {
         self.local_path.clear();
         self.local_i = 0;
         self.local_stuck_ticks = 0;
@@ -153,7 +153,7 @@ impl Walker {
     /// Did the FINE tier last say the corridor ahead is genuinely not threadable? Read from the
     /// published field rather than a shadow copy, so what steers the walker and what the agent is
     /// told cannot drift apart.
-    pub(crate) fn local_says_no_way_through(&self) -> bool {
+    pub fn local_says_no_way_through(&self) -> bool {
         self.nav.nav_state.lock().unwrap().local.as_ref().is_some_and(|l| l.state == "no_way_through")
     }
 
@@ -161,7 +161,7 @@ impl Walker {
     /// (which separately clears its own `falling` — see the module doc for why that field stays
     /// outside `Walker`). The old goal/path are in the PREVIOUS zone's coordinate space; kept
     /// across a crossing they aim the walker at an arbitrary spot and wedge it there.
-    pub(crate) fn reset_for_zone_change(&mut self) {
+    pub fn reset_for_zone_change(&mut self) {
         *self.nav.goto_target.lock().unwrap() = None;
         *self.nav.goto_entity.lock().unwrap() = None;
         *self.nav_intent.lock().unwrap() = None; // stop driving the controller toward the stale aim
@@ -197,11 +197,11 @@ impl Walker {
     ///   | no_path | search_exhausted | blocked
     ///
     /// `reason` is the machine-readable WHY behind a terminal state.
-    pub(crate) fn set_nav_state(&self, state: &str) { self.set_nav_state_because(state, None); }
+    pub fn set_nav_state(&self, state: &str) { self.set_nav_state_because(state, None); }
 
     /// Set the walker's state + reason. **Deliberately does NOT touch `local`** — the fine tier's
     /// last word is an independent fact about a different tier (#382).
-    pub(crate) fn set_nav_state_because(&self, state: &str, reason: Option<&str>) {
+    pub fn set_nav_state_because(&self, state: &str, reason: Option<&str>) {
         let mut s = self.nav.nav_state.lock().unwrap();
         let reason = reason.map(str::to_string);
         if s.state != state || s.reason != reason {
@@ -216,24 +216,24 @@ impl Walker {
     }
 
     /// Publish the FINE tier's last honest outcome (#382). Never touches `state`/`reason`.
-    pub(crate) fn set_nav_local(&self, local: Option<crate::ipc::NavLocal>) {
+    pub fn set_nav_local(&self, local: Option<eqoxide_ipc::NavLocal>) {
         let mut s = self.nav.nav_state.lock().unwrap();
         if s.local != local { s.local = local; }
     }
 
     /// Read the current nav state word (without the reason).
-    pub(crate) fn nav_state_is(&self, state: &str) -> bool {
+    pub fn nav_state_is(&self, state: &str) -> bool {
         self.nav.nav_state.lock().unwrap().state == state
     }
 
     /// Stop navigating and report WHY, loudly, in every channel an agent can see.
-    pub(crate) fn stop_nav(&mut self, gs: &mut GameState, state: &str, reason: &str, msg: &str) {
+    pub fn stop_nav(&mut self, gs: &mut GameState, state: &str, reason: &str, msg: &str) {
         self.stop_nav_blocked(gs, state, reason, None, None, msg);
     }
 
     /// [`Walker::stop_nav`], additionally publishing the agent-honesty blockage payload (#378
     /// Phase 2).
-    pub(crate) fn stop_nav_blocked(&mut self, gs: &mut GameState, state: &str, reason: &str,
+    pub fn stop_nav_blocked(&mut self, gs: &mut GameState, state: &str, reason: &str,
         goal_blk: Option<crate::traversability::Blockage>,
         frontier_blk: Option<crate::traversability::Blockage>, msg: &str)
     {
@@ -241,7 +241,7 @@ impl Walker {
         gs.log_msg("zone", msg);
         self.set_nav_state_because(state, Some(reason));
         // Publish the blockage AFTER the state (set_nav_state_because clears it on transition).
-        let to_nav = |b: crate::traversability::Blockage| crate::ipc::NavBlockage {
+        let to_nav = |b: crate::traversability::Blockage| eqoxide_ipc::NavBlockage {
             hazard: b.hazard.as_str(), at: b.at };
         {
             let mut s = self.nav.nav_state.lock().unwrap();
@@ -264,7 +264,7 @@ impl Walker {
     /// Apply a finished FINE plan from the local worker (#382). See the pre-extraction doc comment
     /// (three things happen: install the steer path, arm the proactive re-plan ONLY on a CLOSED
     /// window, and publish what the fine tier actually said).
-    pub(crate) fn apply_local_plan(&mut self, reply: crate::nav::planner::LocalReply) {
+    pub fn apply_local_plan(&mut self, reply: crate::planner::LocalReply) {
         let outcome = reply.outcome;
         self.local_path = outcome.steer().to_vec();
         self.local_from = reply.start;
@@ -284,7 +284,7 @@ impl Walker {
             self.local_stuck_ticks = 0;
         }
 
-        self.set_nav_local(Some(crate::ipc::NavLocal {
+        self.set_nav_local(Some(eqoxide_ipc::NavLocal {
             state:       outcome.state().to_string(),
             reason:      outcome.reason().to_string(),
             stuck_ticks: self.local_stuck_ticks,
@@ -294,25 +294,25 @@ impl Walker {
 
     /// Apply a finished plan from the worker thread. Returns `true` when the tick must STOP here —
     /// the plan was terminal (no route / gave up) or redirected the goto through a portal.
-    pub(crate) fn apply_plan(
+    pub fn apply_plan(
         &mut self,
-        reply: crate::nav::planner::PlanReply,
+        reply: crate::planner::PlanReply,
         gs: &mut GameState,
         goal: (f32, f32, f32),
     ) -> bool {
-        use crate::nav::collision::PlanOutcome;
+        use crate::collision::PlanOutcome;
         self.awaiting_first_plan = false;
         let snapped = reply.goal_snapped;
         self.goal_snapped = snapped.is_some();
         match snapped {
-            Some(crate::nav::collision::GoalSnap::ToColumnFloor { z }) => gs.log_msg("zone", &format!(
+            Some(crate::collision::GoalSnap::ToColumnFloor { z }) => gs.log_msg("zone", &format!(
                 "Goal z={:.0} is not on any floor — routing to the floor at z={:.0} instead (the client \
                  CHANGED your goal; it is not the one you gave).", goal.2, z)),
             // The water qualifier (design §4d): "arrived" at a submerged goal without this line
             // would claim a depth the walker never reached — buoyancy only rises, so it floats at
             // the surface above the goal XY. Reported here AND carried to arrival via
             // `goal_snapped` (`nav_reason: goal_z_snapped`).
-            Some(crate::nav::collision::GoalSnap::ToWaterSurface { surface_z }) => gs.log_msg("zone", &format!(
+            Some(crate::collision::GoalSnap::ToWaterSurface { surface_z }) => gs.log_msg("zone", &format!(
                 "Goal z={:.0} is submerged — the walker cannot dive and hold that depth; navigating to \
                  the WATER SURFACE at z={:.0} above it. Arrival will be at the surface, not the asked depth.",
                 goal.2, surface_z)),
@@ -387,7 +387,7 @@ impl Walker {
     /// Stop all navigation the instant the player is slain (#238): abandon the destination + route +
     /// controller intent so a corpse doesn't keep walking toward the goal, and clear the overlay
     /// line. Returns true when the player is dead (the caller returns early from the tick).
-    pub(crate) fn nav_halt_if_dead(&mut self, gs: &GameState) -> bool {
+    pub fn nav_halt_if_dead(&mut self, gs: &GameState) -> bool {
         if !gs.is_player_dead() {
             return false;
         }
@@ -412,7 +412,7 @@ impl Walker {
 
     /// Live NPC-camp positions to route AROUND (aggro-avoidance, #67), excluding NPCs near the
     /// goal (you're walking TO the destination, often a target mob, so its own camp isn't avoided).
-    pub(crate) fn aggro_avoid(gs: &GameState, goal: (f32, f32, f32), enabled: bool) -> Vec<[f32; 2]> {
+    pub fn aggro_avoid(gs: &GameState, goal: (f32, f32, f32), enabled: bool) -> Vec<[f32; 2]> {
         if !enabled { return Vec::new(); }
         const NEAR_GOAL_SQ: f32 = 55.0 * 55.0;
         gs.world.entities.values()
@@ -424,7 +424,7 @@ impl Walker {
 
     /// The nearest FLOOR-REACHABLE in-zone translocator region (a zone-line region whose
     /// destination is THIS zone), as a goto target the char can walk INTO to teleport out (#266).
-    pub(crate) fn find_in_zone_portal(&self, gs: &GameState) -> Option<(f32, f32, f32)> {
+    pub fn find_in_zone_portal(&self, gs: &GameState) -> Option<(f32, f32, f32)> {
         let guard = self.collision.read().unwrap();
         let c = guard.as_ref()?;
         let pos = [gs.player_x, gs.player_y, gs.player_z];
@@ -445,7 +445,7 @@ impl Walker {
 
     /// Chase (eqoxide#88): when /goto targets a named ENTITY, re-resolve its CURRENT position each
     /// tick and follow it, instead of pathing to a one-time snapshot.
-    pub(crate) fn drive_chase(&mut self) {
+    pub fn drive_chase(&mut self) {
         let chase = self.nav.goto_entity.lock().unwrap().clone();
         if let Some(name) = chase {
             if self.nav.goto_target.lock().unwrap().is_none() {
@@ -462,7 +462,7 @@ impl Walker {
     /// Teleport detection (#266): a position jump far bigger than one tick of walking means we
     /// were repositioned. If mid portal-escape, RESTORE the real goal and re-plan; any other jump
     /// just forces a re-plan off the stale path.
-    pub(crate) fn drive_teleport_detect(&mut self, gs: &mut GameState) {
+    pub fn drive_teleport_detect(&mut self, gs: &mut GameState) {
         let jumped = (gs.player_x - self.last_walk_pos[0]).hypot(gs.player_y - self.last_walk_pos[1]) > 40.0;
         self.last_walk_pos = [gs.player_x, gs.player_y, gs.player_z];
         if jumped {
@@ -478,7 +478,7 @@ impl Walker {
 
     /// Resolves the active `/goto` target for this tick, or performs the "no active goto"
     /// stop-and-reset and returns `None` when there is none (caller must stop the tick).
-    pub(crate) fn resolve_goal(&mut self) -> Option<(f32, f32, f32)> {
+    pub fn resolve_goal(&mut self) -> Option<(f32, f32, f32)> {
         let goto = *self.nav.goto_target.lock().unwrap(); // copy out so the lock is released
         let goal = match goto {
             Some(t) => t,
@@ -504,7 +504,7 @@ impl Walker {
     /// FAST STEERING (#nav-multires). Re-projects the CURRENT position onto the stable fine path
     /// every ~10ms (far more often than the 150ms plan gate) and refreshes ONLY `nav_intent`'s
     /// `wish_dir` (+ facing) — the flags/speed the walker set stay.
-    pub(crate) fn apply_fast_steering(&mut self, gs: &mut GameState) {
+    pub fn apply_fast_steering(&mut self, gs: &mut GameState) {
         if !self.local_path.is_empty() && self.nav.goto_target.lock().unwrap().is_some() {
             if let Some((wish_dir, heading)) =
                 fast_steer_aim(&self.local_path, &mut self.local_i, [gs.player_x, gs.player_y, gs.player_z], 5.0)
@@ -533,8 +533,8 @@ impl Walker {
     /// sentinel (`999999`, relocates nobody) dropped — then honesty-gated by `resolve_teleport_pads`
     /// (only pads whose footprint AND advertised destination land on walkable floor become edges).
     /// Empty in the common case (a zone with no same-zone pads), so ordinary plans pay nothing.
-    fn same_zone_teleport_pads(&self, gs: &GameState, c: &crate::nav::collision::Collision)
-        -> Vec<crate::nav::collision::PadEdge> {
+    fn same_zone_teleport_pads(&self, gs: &GameState, c: &crate::collision::Collision)
+        -> Vec<crate::collision::PadEdge> {
         let advertised: Vec<(i32, [f32; 3])> = self.world.zone_points.lock().unwrap().iter()
             .filter(|zp| zp.zone_id == gs.world.zone_id
                 && zp.server_x.abs() < 900_000.0
@@ -546,7 +546,7 @@ impl Walker {
         c.resolve_teleport_pads(&advertised)
     }
 
-    pub(crate) fn drive_walk(&mut self, gs: &mut GameState, goal: (f32, f32, f32)) {
+    pub fn drive_walk(&mut self, gs: &mut GameState, goal: (f32, f32, f32)) {
         if self.replan_cooldown > 0 { self.replan_cooldown -= 1; }
         let is_chase = self.nav.goto_entity.lock().unwrap().is_some();
         let in_flight = self.planner.in_flight_goal().map(|g| (g[0], g[1], g[2]));
@@ -580,7 +580,7 @@ impl Walker {
                     let goal_region = c.zone_line_at([goal.0, goal.1, goal.2 + 1.0]);
                     let teleport_pads = self.same_zone_teleport_pads(gs, &c);
                     let t0 = std::time::Instant::now();
-                    let gen = self.planner.request(crate::nav::planner::PlanRequest {
+                    let gen = self.planner.request(crate::planner::PlanRequest {
                         gen: 0, // assigned by the planner
                         start: [gs.player_x, gs.player_y, gs.player_z],
                         goal:  [goal.0, goal.1, goal.2],
@@ -660,7 +660,7 @@ impl Walker {
 
             let local_goal = carrot_along(&self.path, self.path_i, [px, py, pz], LOCAL_REACH).unwrap_or(coarse);
             if let Some(c) = self.collision.read().unwrap().as_ref().cloned() {
-                self.local_planner.post_if_idle(crate::nav::planner::LocalRequest {
+                self.local_planner.post_if_idle(crate::planner::LocalRequest {
                     gen: 0, // assigned by the planner
                     start: [px, py, gs.player_z],
                     goal:  local_goal,
@@ -671,7 +671,7 @@ impl Walker {
                 });
             }
             if self.local_planner.is_dead() {
-                self.set_nav_local(Some(crate::ipc::NavLocal {
+                self.set_nav_local(Some(eqoxide_ipc::NavLocal {
                     state: "planner_dead".into(), reason: "local_planner_dead".into(),
                     stuck_ticks: 0, plan_us: 0,
                 }));
@@ -798,7 +798,7 @@ impl Walker {
                 if let Some(c) = col {
                     let goal_region = c.zone_line_at([goal.0, goal.1, goal.2 + 1.0]);
                     let teleport_pads = self.same_zone_teleport_pads(gs, &c);
-                    let gen = self.planner.request(crate::nav::planner::PlanRequest {
+                    let gen = self.planner.request(crate::planner::PlanRequest {
                         gen: 0,
                         start: [gs.player_x, gs.player_y, gs.player_z],
                         goal:  [goal.0, goal.1, goal.2],
