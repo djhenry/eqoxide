@@ -585,10 +585,17 @@ pub struct GameState {
     /// wrong-target near-miss happened. Consumers that would otherwise publish a fabricated
     /// figure must gate on this and report an honest "unknown" instead.
     ///
-    /// Set ONLY by server-authoritative position paths (self OP_ClientUpdate, bind respawn,
-    /// same-zone teleport) — never by our own client-side prediction, which is not evidence the
-    /// server placed us anywhere. Reset to false by [`GameState::begin_zone_in`]: on a zone change
-    /// the old zone's coordinates say nothing about where we now are.
+    /// Set once the position-streaming path (`ActionLoop::stream_position`) has actually placed
+    /// `player_x/y/z` for the CURRENT zone — either a server correction it adopted, or the
+    /// controller's own predicted position once the controller has been placed there. (An earlier
+    /// version of this flag was keyed only on a self `OP_ClientUpdate`, which the server rarely
+    /// sends — that made `distance` omitted ALWAYS instead of only while genuinely unknown; live
+    /// E2E caught it. Keying on the controller mirror instead is deliberate.) Before that, and
+    /// immediately after a zone change, `player_x/y/z` are still the struct's zeroes: anything
+    /// derived from them — notably a name-resolution endpoint's `distance` — would be measured
+    /// from the zone ORIGIN and be a confident wrong number. Reset to false by
+    /// [`GameState::begin_zone_in`]: on a zone change the old zone's coordinates say nothing about
+    /// where we now are.
     pub player_pos_known: bool,
     pub player_heading: f32,
     pub player_level: u32,
