@@ -931,10 +931,21 @@ mod tests {
     /// Note the `sync_us >` fixture-sanity half only gets SAFER under CPU load (a slow box makes
     /// the synchronous plan slower, not faster) — unlike the wall-clock-budget test this replaces,
     /// which flipped red under contention (#356). The `post_us <` half is NOT safe under load on
-    /// its own — a channel send can be descheduled just like anything else — which is why it's
-    /// expressed as a RATIO against `sync_us` rather than an absolute bound (#620): both halves
-    /// are measured on the same thread under the same contention, so a slow/busy runner inflates
-    /// them together and the ratio stays roughly constant even though neither absolute number does.
+    /// its own — a channel send can be descheduled just like anything else.
+    ///
+    /// It's expressed as `post_us < FLOOR || post_us * FACTOR < sync_us` (#620), because there are
+    /// TWO distinct failure modes a slow/loaded machine can produce, and only one of them is a
+    /// ratio: a genuinely CPU-bound slowdown (this box is busy, everything takes proportionally
+    /// longer) inflates `sync_us` and `post_us` together — that's what the ratio catches. But the
+    /// actual #620 CI failure (2265us) was NOT that: `Sender::send` on an unbounded channel is a
+    /// handful of instructions, so its wall-clock cost is dominated by whether the OS/hypervisor
+    /// happens to DESCHEDULE this thread mid-send (scheduler quantum, vCPU steal-time, cgroup CFS
+    /// throttling on a shared CI runner) — a roughly FIXED-latency stall, independent of how much
+    /// work the thread is doing. A fixed stall is cheap to absorb when `sync_us` is huge (as here)
+    /// but can blow a pure ratio when `sync_us` is small (see the fine-tier test below, where it
+    /// does). The floor forgives exactly that fixed-latency jitter; the ratio still catches a real
+    /// regression, because "posting became a search" costs on the order of `sync_us` itself —
+    /// nowhere near the floor.
     #[test]
     fn posting_a_plan_does_not_block_the_caller() {
         let col = Arc::new(plane_with_sealed_box(1000.0, 400.0, 400.0));
@@ -959,12 +970,12 @@ mod tests {
         eprintln!("NET-THREAD STALL PER PLAN: synchronous {sync_us}us  ->  posted {post_us}us");
         assert!(sync_us > 5_000,
             "fixture sanity: the synchronous plan must be genuinely expensive ({sync_us}us) or this proves nothing");
-        // A ratio, not an absolute bound (#620): posting must stay a tiny fraction of what the
-        // synchronous search costs. Locally the ratio is ~900,000x-1,800,000x; 50x leaves generous
-        // headroom (the real CI deschedule that motivated this, 2265us, is still ~47x inside the
-        // 50x budget against the smallest sync_us observed here) while still failing loudly if
-        // posting ever becomes a search.
-        assert!(post_us * 50 < sync_us,
+        // Floor OR ratio (#620) — see the doc comment above for why both are needed. The 5ms floor
+        // forgives a fixed-latency scheduler stall (the real CI spike was 2265us); the 50x ratio
+        // catches a proportional CPU-bound regression. Locally the ratio is ~900,000x-1,800,000x,
+        // so 50x leaves generous headroom (sync_us / 50 ≈ 107ms allowed against the smallest
+        // sync_us observed here) while still failing loudly if posting ever becomes a search.
+        assert!(post_us < 5_000 || post_us * 50 < sync_us,
             "posting a plan must NOT block the net thread — it must be a channel send, not a \
              search (posted {post_us}us vs synchronous {sync_us}us)");
     }
@@ -995,9 +1006,13 @@ mod tests {
     ///
     /// Like its coarse counterpart above, the `sync_us >` fixture-sanity half only gets SAFER under
     /// CPU load — a busy box makes the synchronous search slower, not faster. The `post_us <` half
-    /// does not share that property on its own (a busy 2-vCPU CI runner can deschedule a channel
-    /// send just as it can any other operation), so it's expressed as a ratio against `sync_us`
-    /// rather than an absolute bound (#620) — see the coarse test above for the full reasoning.
+    /// uses the same `post_us < FLOOR || post_us * FACTOR < sync_us` shape as the coarse test above
+    /// (#620) — see its doc comment for the full floor-vs-ratio reasoning. It matters MORE here: this
+    /// fixture's `sync_us` (tens of thousands of us) is ~100x smaller in absolute terms than the
+    /// coarse test's (millions of us), so a fixed-latency scheduler stall — the actual #620 failure
+    /// mode, NOT a proportional slowdown — can blow a pure ratio here even though it can't at the
+    /// coarse site. The floor is what actually saves this assertion; the ratio remains as the
+    /// regression detector.
     #[test]
     fn posting_a_fine_plan_does_not_block_the_caller() {
         let col = plane_with_a_solid_wall();
@@ -1021,13 +1036,13 @@ mod tests {
         eprintln!("NET-THREAD STALL PER NAV TICK (fine tier): synchronous {sync_us}us  ->  posted {post_us}us");
         assert!(sync_us > 1_000,
             "fixture sanity: the synchronous fine plan must cost real time ({sync_us}us) or this proves nothing");
-        // A ratio, not an absolute bound (#620): local ratio here is ~3,700x-17,500x, much smaller
-        // in absolute terms than the coarse test's (tens of thousands of us vs millions), so a
-        // smaller factor is used to keep real headroom over the same class of scheduler jitter that
-        // hit the coarse test in CI (2265us) — 10x still leaves ~2.3x margin against the smallest
-        // sync_us observed here, while catching a real regression (posting costing >10% of a full
-        // search is already wrong).
-        assert!(post_us * 10 < sync_us,
+        // Floor OR ratio (#620) — see the doc comment above. The 5ms floor is what actually protects
+        // this assertion: this fixture's smallest observed sync_us (~51,871us) only leaves a ~5.2ms
+        // ratio budget at 10x, which a single fixed-latency scheduler stall (the real CI spike was
+        // 2265us) can approach — so the floor absorbs that class of jitter outright, and the 10x
+        // ratio is kept as the regression detector (posting costing >10% of a full search is wrong
+        // regardless of the floor).
+        assert!(post_us < 5_000 || post_us * 10 < sync_us,
             "posting the fine plan must NOT block the net thread — it must be a channel send, not a \
              search (posted {post_us}us vs synchronous {sync_us}us). This is the ONE assertion that \
              #382 exists to make.");
