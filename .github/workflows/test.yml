@@ -57,8 +57,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       # Caches ~/.cargo/registry, ~/.cargo/git, and target/ keyed on Cargo.lock. The test suite
-      # itself is fast (569 tests in ~0.73s on a quiet box) — the release build is the slow part,
-      # so this cache is the whole cost story for this workflow.
+      # itself is fast (the full workspace runs in well under a minute of actual test time on a
+      # quiet box) — compiling is the slow part, so this cache is the whole cost story for this
+      # workflow. Note `tools` pulls `libeq_*` from a git dependency, so the ~/.cargo/git half of
+      # this cache matters now that `--workspace` builds it.
       - uses: Swatinem/rust-cache@v2
 
       # No extra apt packages needed: wgpu/winit's Linux backends (x11-dl, xkbcommon-dl,
@@ -69,25 +71,39 @@ jobs:
       # dependency bump changes this and the build step below starts failing on missing system
       # libraries, add the relevant `apt-get install` step here rather than reaching for
       # `--no-default-features` — see the fallback note below.
-      - name: cargo build --release
-        run: cargo build --release --locked
+      # `--workspace` is load-bearing here, not decoration. A bare `cargo build --release` builds
+      # only the ROOT package (the `eqoxide` lib + its `eqoxide`/`render_model` bins) and whatever
+      # it depends on. Two workspace members are NOT root dependencies and were therefore never
+      # release-built by CI: `tools` (the `s3d_to_gltf`/`validate_glb`/`diagnose_glb` binaries) and
+      # `crates/eqoxide-crash`'s `crash_probe` bin. `--workspace` covers every member's every
+      # target. See #605.
+      - name: cargo build --release --workspace
+        run: cargo build --release --workspace --locked
 
-      # `cargo test --lib` only runs the library's unit/integration tests, which are pure logic
-      # (game_state, movement, http handlers, pathfinding, etc.) — none of them construct a
-      # wgpu::Instance or winit::EventLoop (that code lives in main.rs/app.rs/render_model.rs,
-      # which are binaries, not part of the `--lib` target), so this is safe to run headless with
-      # no display/GPU present on the runner.
+      # `cargo test --workspace` — NOT `--lib`. This is the #605 fix, and the reason it matters is
+      # worth stating plainly: `--lib` runs only the ROOT package's lib target. That was correct
+      # when it was written (#354/#355), because the whole codebase WAS the root lib. The #544
+      # crate extraction then moved ~92% of the suite into `crates/*`, and CI silently went from
+      # testing everything to testing 88 of 1145 tests (1 test binary of 25) — green the entire
+      # time. `--lib` also excludes every integration target under `tests/`, including
+      # `walker_sim.rs`, the simulation that would catch a walker clipping through a wall.
       #
-      # 17 tests are #[ignore]d because they gate on baked asset fixtures (zone/model .glb files
-      # under assets/) that are gitignored and absent on a fresh clone. They stay ignored here —
-      # see #357 for giving them their own optional/asset-backed job.
+      # Headless-safety still holds under `--workspace`: no test in any crate constructs a
+      # `wgpu::Instance` or a `winit::EventLoop` (grep confirms both appear only in
+      # `src/bin/render_model.rs`, a binary whose `main` no test calls). The renderer crate's
+      # shader tests parse WGSL as text. The net-crate tests bind only `127.0.0.1:0`/`0.0.0.0:0`
+      # UDP loopback sockets, which need no external network. `eqoxide-crash`'s tests exec the
+      # `crash_probe` bin via `CARGO_BIN_EXE_*` (cargo builds and locates it; no display needed).
+      # The `tests/asset_sync_live.rs` integration test is the only one that wants the network,
+      # and it is already `#[ignore]`d.
       #
-      # Known flake risk: find_path_does_not_drive_a_partial_route_into_a_sunken_water_pit
-      # (src/assets.rs:2269) asserts on a 150ms wall-clock A* budget and fails under heavy CPU
-      # contention (measured ~8/10 failures at load 16 on a shared dev box); it passes reliably
-      # on a quiet box, and a GitHub-hosted runner is quiet, so this job should stay green. If it
-      # ever flakes red here, that is this known issue (not a new regression) — see #356 for the
-      # real fix (surface PlanOutcome::TimedOut instead of racing the CPU scheduler with a
-      # wall-clock budget). Do not silence it by adding #[ignore] here; #356 tracks the fix.
-      - name: cargo test --lib
-        run: cargo test --lib --locked
+      # 29 tests are `#[ignore]`d, every one of them for a stated environment reason: they gate on
+      # baked asset fixtures (zone `.glb` + `.wtr` under `$ZONE_GLB`/`$ZONE_DIR`, bundled model
+      # `.glb` under `assets/models/`) that are gitignored and absent on a fresh clone, or on a
+      # running asset server. They stay ignored here — see #357 for giving them their own
+      # optional/asset-backed job with cached assets.
+      #
+      # If a test fails here, fix it or `#[ignore]` it WITH A SPECIFIC REASON. Do not narrow this
+      # command back down to make it green — that is exactly the failure #605 documents.
+      - name: cargo test --workspace
+        run: cargo test --workspace --locked
