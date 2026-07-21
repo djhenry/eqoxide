@@ -388,6 +388,7 @@ pub async fn run_gameplay_phase(
                         gs.player_x = x;
                         gs.player_y = y;
                         gs.player_z = z;
+                        gs.player_pos_known = true; // server-driven teleport destination (#513)
                         tracing::info!("EQ: same-zone teleport → pos=({:.1},{:.1},{:.1})", x, y, z);
                     } else {
                         // Cross-zone transition (#zone <name>): send OP_ZONE_CHANGE to

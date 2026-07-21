@@ -896,6 +896,9 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         gs.player_x = upd.x;
         gs.player_y = upd.y;
         gs.player_z = z_foot; // foot datum internally (#522)
+        // #513: the server has now told us where we are — distances derived from our position are
+        // real from here on (before this they'd be measured from the origin).
+        gs.player_pos_known = true;
         // Keep the player's heading live from real server position updates.
         gs.player_heading = upd.heading;
     } else if let Some(e) = gs.world.entities.get_mut(&sid) {
@@ -2419,6 +2422,7 @@ fn apply_bind_respawn(gs: &mut GameState, payload: &[u8]) {
     gs.player_x = r.f32();
     gs.player_y = r.f32();
     gs.player_z = r.f32() - eqoxide_core::coord::WIRE_Z_OFFSET; // wire→foot datum (#522)
+    gs.player_pos_known = true; // server-authoritative respawn point (#513)
     // Real EQ revives a bind-respawned character at FULL HP. `apply_death` zeroed hp_pct and left
     // cur_hp/max_hp stale, so without this the HUD/API show a dead-but-full contradiction
     // (hp/hp_max full, hp_pct 0) until some later OP_HPUpdate happens to reconcile it (eqoxide#68).

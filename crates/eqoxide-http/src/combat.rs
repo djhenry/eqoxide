@@ -108,12 +108,10 @@ async fn post_target_name(
         Ok(Json(b)) => b.name,
         Err(_) => return text(StatusCode::BAD_REQUEST, "provide {\"name\":\"...\"}"),
     };
-    let player_pos = { let p = s.player(); Some((p.pos_east, p.pos_north, p.pos_up)) };
-    let found = {
-        let ids = s.world.entity_ids.lock().unwrap();
-        let positions = s.world.entity_positions.lock().unwrap();
-        crate::name_match::resolve_entity(&name, &ids, &positions, player_pos)
-    };
+    // `player_pos()` (not `player()`) so an unknown position yields NO distance rather than one
+    // measured from the zone origin (#513 review, F4). `resolve_in_world` owns the canonical
+    // positions→ids lock order — never lock these two tables here (#513 review, F1).
+    let found = crate::name_match::resolve_in_world(&s.world, &name, s.player_pos());
     match found {
         Some(m) => {
             s.command.request_target(m.id);

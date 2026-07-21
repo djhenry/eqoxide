@@ -336,6 +336,9 @@ mod mock {
             gs.player_x = self.self_pos[0];
             gs.player_y = self.self_pos[1];
             gs.player_z = self.self_pos[2];
+            // Offline/testzone: this Model IS the position authority (no server), so the position
+            // it publishes is by definition known — distances derived from it are real (#513).
+            gs.player_pos_known = true;
             gs.player_heading = self.self_heading;
             gs.world.zone_id = self.zone_id;
             gs.world.zone_name = self.zone_name.clone();
