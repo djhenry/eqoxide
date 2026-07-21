@@ -161,7 +161,11 @@ fn main() {
     // per-character config actually takes effect instead of being silently discarded. `disclose()`
     // logs the effective values and the file each came from — a wrong asset server must be visible
     // in the log, not inferred later from a world with no geometry.
-    let app_cfg   = config::AppConfig::load(&login_cfg_path);
+    // `Some(path)` ONLY when --config was actually passed: with no --config there is no second
+    // layer at all, so the `./config.yaml` fallback stays as silent as it was pre-#597.
+    let app_cfg   = config::AppConfig::load(
+        cli.config.as_ref().map(|_| login_cfg_path.as_path()),
+    );
     app_cfg.disclose();
 
     // Game data (string table, spell DB, zone maps + water regions) is delivered by the asset

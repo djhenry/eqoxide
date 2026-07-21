@@ -226,10 +226,25 @@ Two guardrails keep that from recurring:
   `assets_path`, `models_path` and `eq_ui_dir` together with the file each one came from:
   `config: effective asset_server_url=http://prod-assets:8088 (from ~/.config/eqoxide/config-x.yaml)`.
   A wrong value is readable in the log rather than inferred later from an empty world.
-- **No silent drops.** A key under `renderer:` that the loader does not understand is
-  warned about by name and file (`unknown key 'renderer.asset_serve_url' is IGNORED`).
-  `http_port` is a **top-level** key; placing it under `renderer:` is called out explicitly
-  and does not take effect.
+- **No silent drops.** Every way a renderer setting can fail to take effect warns by key,
+  file and reason instead of vanishing:
+  - an unknown key under `renderer:` (`unknown key 'renderer.asset_serve_url' is IGNORED`);
+  - `http_port` nested under `renderer:` — it is a **top-level** key;
+  - a renderer key at the **top level** — it belongs under `renderer:`. (Older docs showed
+    that layout, so configs written against them hit this.)
+  - a key that is present but unusable: a non-string path/URL (`asset_server_url:` with no
+    value), a non-integer or out-of-range `http_port`. Such a value is **not** treated as a
+    hit — the previous layer or the built-in default stands, and the disclosure attributes
+    the value to the file that actually contains it.
+
+  An explicitly empty string (`asset_server_url: ""`) *is* a value: it overrides and is
+  disclosed as such.
+
+One caveat the disclosure states inline: `eq_ui_dir` has a consumer that can override it —
+`eqoxide-ui`'s icon loader prefers `$EQ_UI_DIR` (and `$EQ_SPELL_ICONS_DIR` when nothing else
+is set) and falls back to a default atlas dir when all are unset. The `eq_ui_dir` disclosure
+line says which of those is in force; the dir finally chosen is logged as `ui icons: using
+atlas dir …`. The other four keys have no such override.
 
 `http_port` remains only the *base* port: the HTTP server scans upward from it for a free
 port so several clients can run at once, and prints the port it actually bound as
