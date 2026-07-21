@@ -386,11 +386,14 @@ pub fn sync_set(
             // we sent none (no prior record), a server/intermediary claiming Unchanged anyway is
             // a protocol violation, not a state this code can trust or repair from (there is no
             // recorded file list to check). Fail loudly rather than assume: `prev` being `None`
-            // here must surface as an ordinary `Err`, never a panic — `sync_set` runs on
-            // background threads (see `src/app.rs`'s zone/common/model loaders) inside a closure
-            // whose `Err` arm is what publishes an honest `zone_assets: failed`; a panic unwinds
-            // past that arm entirely and the client would sit on "Verifying..." forever, the exact
-            // pending-forever falsehood #579 exists to prevent (#601 D-1).
+            // here must surface as an ordinary `Err`, never a panic. `sync_set` is called from
+            // three background threads in `src/app.rs`; only the zone-asset loader is backstopped
+            // against a panic (`catch_unwind` around its body at src/app.rs:643, added by #595) —
+            // the common-asset-loader (src/app.rs:846-884) and the model-sync-worker
+            // (src/app.rs:820-833) have no such guard, so a panic there unwinds the whole thread:
+            // the `Err`-publishing code after the `sync_set` call (which sets `self.sync_done` /
+            // logs via the model_rx loop) never runs, and the client sits on "Verifying..."/loading
+            // forever — the exact pending-forever falsehood #579 exists to prevent (#601 D-1).
             let Some((_, files)) = prev else {
                 anyhow::bail!(
                     "server reported set {set} as unchanged but we hold no prior synced record \
@@ -853,11 +856,14 @@ mod sync_tests {
         // `If-None-Match` derived from a prior record. A transport (misbehaving server, broken
         // proxy, ...) that claims Unchanged even when we sent NO If-None-Match at all is lying
         // about the protocol, and `sync_set` has no recorded file list to verify or repair from in
-        // that case. This must surface as an ordinary `Err`, never a panic: `sync_set` runs inside
-        // a background-thread closure (see src/app.rs's zone/common/model loaders) whose `Err` arm
-        // is what publishes an honest failure to the UI; a panic unwinds past that arm entirely and
-        // leaves the client stuck on "Verifying..." forever — the exact pending-forever falsehood
-        // this project treats as worse than a crash.
+        // that case. This must surface as an ordinary `Err`, never a panic: of the three
+        // background threads in src/app.rs that call `sync_set`, only the zone-asset loader is
+        // backstopped against a panic (`catch_unwind` around its body, added by #595, src/app.rs:643)
+        // — the common-asset-loader (src/app.rs:846-884) and the model-sync-worker
+        // (src/app.rs:820-833) have no such guard, so a panic there unwinds the whole thread and
+        // the code that would otherwise publish an honest failure never runs, leaving the client
+        // stuck on "Verifying..."/loading forever — the exact pending-forever falsehood this
+        // project treats as worse than a crash.
         struct LyingUnchangedTransport;
         impl Transport for LyingUnchangedTransport {
             fn get_manifest(&self, _set: &str, _inm: Option<&str>) -> anyhow::Result<ManifestFetch> {
