@@ -97,7 +97,7 @@ struct MoveBody {
 
 /// Apply the request's aggro-avoidance knobs to the shared nav setting the walker reads (#242). Only
 /// overrides a field when the request provides it, so omitting them leaves the current setting.
-fn apply_avoid_opts(nav_avoid: &crate::http::NavAvoidShared, avoid_aggro: Option<bool>, aggro_buffer: Option<f32>) {
+fn apply_avoid_opts(nav_avoid: &crate::NavAvoidShared, avoid_aggro: Option<bool>, aggro_buffer: Option<f32>) {
     let mut o = nav_avoid.lock().unwrap();
     if let Some(e) = avoid_aggro  { o.enabled = e; }
     if let Some(b) = aggro_buffer { o.buffer  = b.clamp(0.0, 500.0); }
@@ -252,7 +252,7 @@ struct ZoneCrossBody {
 }
 
 /// Sorted, de-duplicated set of zone_ids reachable via a zone line from the current zone.
-fn reachable_zone_ids(zps: &[crate::game_state::ZonePoint]) -> Vec<u16> {
+fn reachable_zone_ids(zps: &[eqoxide_core::game_state::ZonePoint]) -> Vec<u16> {
     let mut ids: Vec<u16> = zps.iter().map(|zp| zp.zone_id).filter(|&z| z != 0).collect();
     ids.sort_unstable();
     ids.dedup();
@@ -319,8 +319,8 @@ mod tests {
     use axum::http::Request;
     use std::collections::HashMap;
     use tower::ServiceExt;
-    use crate::game_state::ZonePoint;
-    use crate::http::quests::tests::{empty_state, set_gs};
+    use eqoxide_core::game_state::ZonePoint;
+    use crate::testkit::{empty_state, set_gs};
 
     async fn body_text(resp: axum::response::Response) -> String {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();

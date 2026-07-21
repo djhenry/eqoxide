@@ -10,7 +10,7 @@ use axum::{
 };
 use tokio::sync::oneshot;
 use std::time::Duration;
-use crate::command_state::{CastEnd, CommandResult};
+use eqoxide_command::{CastEnd, CommandResult};
 use super::*;
 
 /// How long POST /v1/combat/cast AWAITS the cast's true outcome before answering `202` "unknown".
@@ -171,7 +171,7 @@ struct CastBody { gem: Option<u8>, spell_id: Option<u32>, target_id: Option<u32>
 ///     recast timer). Body `{status:"refused", reason}`.
 ///   • 202 — the outcome is UNKNOWN: the server ended the cast without explaining it, or never sent a
 ///     terminal within the timeout, or a zone change / disconnect intervened. Body says so; MUST NOT
-///     be read as success (see `crate::command_state::result`).
+///     be read as success (see `eqoxide_command::result`).
 async fn post_cast(State(s): State<HttpState>, OptionalJson(body): OptionalJson<CastBody>) -> Response {
     if let Err((code, msg)) = require_live_session(&s) { return text(code, msg); }
     let b = body.unwrap_or_default();
@@ -201,7 +201,7 @@ async fn post_cast(State(s): State<HttpState>, OptionalJson(body): OptionalJson<
         if gem > 8 { return text(StatusCode::BAD_REQUEST, "gem must be 0-8"); }
         // An EMPTY gem is not a cast — refuse it loudly BEFORE parking, so we never await a cast that
         // cannot happen. 409 (like /v1/interact/read for an unreadable slot). (#348)
-        if crate::game_state::gem_is_empty(mem[gem as usize]) {
+        if eqoxide_core::game_state::gem_is_empty(mem[gem as usize]) {
             return text(StatusCode::CONFLICT,
                 format!("spell gem {gem} is empty — memorize a spell into it first"));
         }
@@ -299,7 +299,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
-    use crate::http::quests::tests::{empty_state, set_gs};
+    use crate::testkit::{empty_state, set_gs};
 
     async fn body_text(resp: axum::response::Response) -> String {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
@@ -425,7 +425,7 @@ mod tests {
         // indistinguishable from a cast that is still in flight.
         let state = empty_state();
         set_gs(&state, |gs| {
-            gs.mem_spells = [crate::game_state::EMPTY_GEM; 9];
+            gs.mem_spells = [eqoxide_core::game_state::EMPTY_GEM; 9];
             gs.mem_spells[0] = 202; // only gem 0 is memorized
         });
         let command = state.command.clone();
@@ -442,14 +442,14 @@ mod tests {
 
     // ── A3 Migration 3 (#448): POST /v1/combat/cast reports the TRUE outcome, not a queued 200 ──
 
-    use crate::command_state::{CastEnd, CommandResult};
+    use eqoxide_command::{CastEnd, CommandResult};
 
     /// Drive a `/cast` request, wait for the handler to park its awaited Sender, then deliver
     /// `outcome` on it and return the finished HTTP response. Mirrors the merchant/buy test harness.
     async fn cast_and_deliver(gem: u8, outcome: CommandResult<CastEnd>) -> axum::response::Response {
         let state = empty_state();
         set_gs(&state, |gs| {
-            gs.mem_spells = [crate::game_state::EMPTY_GEM; 9];
+            gs.mem_spells = [eqoxide_core::game_state::EMPTY_GEM; 9];
             gs.mem_spells[gem as usize] = 202;
         });
         let command = state.command.clone();

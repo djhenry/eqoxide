@@ -83,7 +83,7 @@ fn parse_op(v: &str) -> Option<u16> {
 /// records. `?clear=1` resets the buffer. Controls apply BEFORE the read, so
 /// `?enable=1` on a first call just turns capture on (the buffer is still empty).
 async fn get_packets(Query(q): Query<PacketsQuery>) -> Json<serde_json::Value> {
-    use crate::eq_net::packet_telemetry as pkt;
+    use eqoxide_telemetry as pkt;
 
     if let Some(e) = q.enable.as_deref() {
         pkt::set_enabled(truthy(e));
@@ -205,7 +205,7 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     // honest silence, never a fabricated hazard). `goal` is the DEFINITIVE "your goal itself cannot
     // be stood at"; `frontier` is "I got as close as here and THIS is the obstruction between me and
     // the goal" — ONE blocking fact, not necessarily the only one, and named as such (not `reason`).
-    let blk_json = |b: &crate::http::NavBlockage| serde_json::json!({
+    let blk_json = |b: &crate::NavBlockage| serde_json::json!({
         "hazard": b.hazard, "at": b.at });
     let nav_blocked_by = (nav.blocked_goal.is_some() || nav.blocked_frontier.is_some()).then(|| {
         serde_json::json!({
@@ -480,13 +480,13 @@ struct WhoView {
 /// are online before coordinating). Returns `{online: [{name, level, class, race, zone_id, guild,
 /// anon}]}`. 503 if no response arrives in time. (#300)
 async fn get_who(State(s): State<HttpState>) -> Response {
-    let (tx, rx) = oneshot::channel::<Vec<crate::game_state::WhoEntry>>();
+    let (tx, rx) = oneshot::channel::<Vec<eqoxide_core::game_state::WhoEntry>>();
     s.command.request_who(tx);
     match tokio::time::timeout(std::time::Duration::from_secs(6), rx).await {
         Ok(Ok(roster)) => {
             let online: Vec<WhoView> = roster.into_iter().map(|e| WhoView {
-                class:   if e.anon { String::new() } else { crate::eq_net::packet_handler::class_name(e.class).to_string() },
-                race:    if e.anon { String::new() } else { crate::eq_net::protocol::eq_race_to_code(e.race).to_string() },
+                class:   if e.anon { String::new() } else { eqoxide_core::race_class::class_name(e.class).to_string() },
+                race:    if e.anon { String::new() } else { eqoxide_core::race_class::eq_race_to_code(e.race).to_string() },
                 name: e.name, level: e.level, zone_id: e.zone_id, guild: e.guild, anon: e.anon,
             }).collect();
             Response::builder()
@@ -711,13 +711,13 @@ async fn get_spells(State(s): State<HttpState>) -> Json<serde_json::Value> {
 }
 
 /// GET /v1/observe/skills — the player's skills with current values (eqoxide#99). `value == 0`
-/// means untrained. Ids/names are the RoF2 skill enum (`crate::skills`); an agent uses this to
+/// means untrained. Ids/names are the RoF2 skill enum (`eqoxide_core::skills`); an agent uses this to
 /// decide what to train at a guildmaster and to notice when a skill is capped.
 async fn get_skills(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let skills = s.player().skills;
-    let list: Vec<_> = (0..crate::skills::NUM_SKILLS).map(|id| {
+    let list: Vec<_> = (0..eqoxide_core::skills::NUM_SKILLS).map(|id| {
         let value = skills.get(id).copied().unwrap_or(0);
-        serde_json::json!({ "id": id, "name": crate::skills::skill_name(id as u32), "value": value })
+        serde_json::json!({ "id": id, "name": eqoxide_core::skills::skill_name(id as u32), "value": value })
     }).collect();
     Json(serde_json::json!({ "skills": list }))
 }
@@ -732,7 +732,7 @@ async fn get_doors(State(s): State<HttpState>) -> Json<Vec<DoorView>> {
 /// heading when you cross into a zone, keyed by destination `zone_id` + `iterator`. This is NOT
 /// where you go to *leave* the current zone — for that, see `/zone_exits`. (Also served at the
 /// deprecated alias `/zone_points`.)
-async fn get_zone_entrances(State(s): State<HttpState>) -> Json<Vec<crate::game_state::ZonePoint>> {
+async fn get_zone_entrances(State(s): State<HttpState>) -> Json<Vec<eqoxide_core::game_state::ZonePoint>> {
     Json(s.world.zone_points.lock().unwrap().clone())
 }
 
@@ -775,7 +775,7 @@ async fn get_zone_exits(State(s): State<HttpState>) -> Json<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::quests::tests::{ago, empty_state, set_gs};
+    use crate::testkit::{ago, empty_state, set_gs};
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -979,115 +979,6 @@ mod tests {
         assert_eq!(v["player"]["target_name"], serde_json::json!(null));
     }
 
-    // --- Target / death STATE must reach /observe/debug, not just the GameState (#409/#406/#408) ---
-    //
-    // These exercise the REAL projection path the live bugs slip through: apply the actual packet
-    // (OP_Consider / OP_Death / a target then a zone-in) to a GameState, then hit the axum /debug
-    // route and assert the JSON. The unit tests in packet_handler.rs mutate+read ONE GameState and
-    // so never see that the hand-built /debug JSON dropped the field on the floor — that gap is
-    // exactly what #400 skipped and what these close.
-
-    /// OP_Consider reply (RoF2 Consider_Struct): playerid@0, targetid@4, faction@8, level@12.
-    fn consider_reply(player_id: u32, target_id: u32, faction: u32, level: u32) -> Vec<u8> {
-        let mut p = vec![0u8; 20];
-        p[0..4].copy_from_slice(&player_id.to_le_bytes());
-        p[4..8].copy_from_slice(&target_id.to_le_bytes());
-        p[8..12].copy_from_slice(&faction.to_le_bytes());
-        p[12..16].copy_from_slice(&level.to_le_bytes());
-        p
-    }
-
-    /// OP_Death (Death_S): spawn_id@0 (the dying entity), killer_id@4.
-    fn death_reply(spawn_id: u32, killer_id: u32) -> Vec<u8> {
-        let mut p = vec![0u8; 32];
-        p[0..4].copy_from_slice(&spawn_id.to_le_bytes());
-        p[4..8].copy_from_slice(&killer_id.to_le_bytes());
-        p
-    }
-
-    /// #409: after a successful consider of the CURRENT target, `/observe/debug` must expose the
-    /// structured con result — difficulty tier, attitude enum, and the target's level. On main these
-    /// are computed by the projection but NEVER serialized by `get_debug`, so an agent reads `null`
-    /// though `apply_consider` ran and the con succeeded. RED on main (fields absent), GREEN after.
-    #[tokio::test]
-    async fn debug_surfaces_consider_result_for_current_target_409() {
-        let state = empty_state();
-        set_gs(&state, |gs| {
-            gs.player_id = 1;
-            // The target's REAL level (12) comes from the spawn — deliberately different from the
-            // consider reply's ConsiderColor field (13 = red) to prove the two are sourced separately.
-            let mut npc = crate::game_state::make_entity(136, "Caleah_Herblender000", 0.0, 0.0, 0.0, true);
-            npc.level = 12;
-            gs.upsert_entity(npc);
-            gs.set_target(136);
-            // faction 8 = "threatening", ConsiderColor 13 = "red".
-            crate::eq_net::packet_handler::apply_consider(gs, &consider_reply(gs.player_id, 136, 8, 13));
-        });
-        let p = debug_json(state).await["player"].clone();
-        assert_eq!(p["target_con"], serde_json::json!("red"),
-            "target_con must reach /observe/debug after a successful consider (#409)");
-        assert_eq!(p["target_attitude"], serde_json::json!("threatening"),
-            "target_attitude must reach /observe/debug after a successful consider (#409)");
-        assert_eq!(p["target_level"], serde_json::json!(12),
-            "target_level must reach /observe/debug (#409)");
-    }
-
-    /// #336: a STANDALONE consider (POST /v1/combat/consider {"id":N} on a spawn that is
-    /// deliberately NOT the current target) must be readable from `/observe/debug` too. The
-    /// target-scoped `player.target_con`/`target_attitude`/`target_level` stay null (correctly,
-    /// #330 — nothing is targeted), so the top-level `last_consider` object is the only surface
-    /// that can carry the result. RED before this fix (the tier was computed and discarded), GREEN
-    /// after.
-    #[tokio::test]
-    async fn debug_surfaces_last_consider_for_non_target_spawn_336() {
-        let state = empty_state();
-        set_gs(&state, |gs| {
-            gs.player_id = 1;
-            let mut npc = crate::game_state::make_entity(450, "Guard_Phaeton", 0.0, 0.0, 0.0, true);
-            npc.level = 20;
-            gs.upsert_entity(npc);
-            // no set_target — the whole point of the standalone endpoint.
-            // faction 9 = "scowls", ConsiderColor 13 = "red".
-            crate::eq_net::packet_handler::apply_consider(gs, &consider_reply(gs.player_id, 450, 9, 13));
-        });
-        let v = debug_json(state).await;
-        let p = v["player"].clone();
-        assert_eq!(p["target_con"], serde_json::json!(null),
-            "target_con must stay null — nothing is targeted (#330)");
-        assert_eq!(p["target_attitude"], serde_json::json!(null));
-
-        let lc = v["last_consider"].clone();
-        assert_eq!(lc["spawn_id"], serde_json::json!(450),
-            "last_consider must reach /observe/debug for a non-target spawn (#336)");
-        assert_eq!(lc["con_name"], serde_json::json!("red"),
-            "difficulty tier must be readable without targeting the spawn (#336)");
-        assert_eq!(lc["attitude"], serde_json::json!("scowls"));
-        assert_eq!(lc["level"], serde_json::json!(20));
-        assert!(lc["ago_secs"].is_number(), "ago_secs must be present and numeric");
-    }
-
-    /// #406: after the character is slain (OP_Death for our own spawn), `/observe/debug` must report
-    /// `dead: true` + `killed_by` + `died_ago_secs`. On main the death message fires (log path) but
-    /// these STATE fields are never serialized by `get_debug`, so a held corpse reports `dead: null`
-    /// forever. RED on main (fields absent → null), GREEN after.
-    #[tokio::test]
-    async fn debug_surfaces_death_state_after_slain_406() {
-        let state = empty_state();
-        set_gs(&state, |gs| {
-            gs.player_id = 42;
-            gs.max_hp = 34;
-            gs.upsert_entity(crate::game_state::make_entity(66, "Guard_Doradek000", 0.0, 0.0, 0.0, true));
-            crate::eq_net::packet_handler::apply_death(gs, &death_reply(42, 66)); // our spawn, killed by 66
-        });
-        let p = debug_json(state).await["player"].clone();
-        assert_eq!(p["dead"], serde_json::json!(true),
-            "a slain character must report dead:true on /observe/debug (#406)");
-        assert_eq!(p["killed_by"], serde_json::json!("Guard_Doradek000"),
-            "killed_by must be surfaced so an agent knows to respawn (#406)");
-        assert!(p["died_ago_secs"].as_u64().is_some(),
-            "died_ago_secs must be present after a death (#406)");
-    }
-
     /// #408: the target pointer must clear on a zone change. Target a spawn in kaladimb, then zone
     /// (death-respawn to qeynos → `begin_zone_in`). On main `begin_zone_in` purges the entity map but
     /// NOT the target, so `/observe/debug` reports the old zone's spawn (id 66, cached name, 100% HP)
@@ -1097,7 +988,7 @@ mod tests {
         let state = empty_state();
         set_gs(&state, |gs| {
             gs.world.zone_name = "kaladimb".into();
-            gs.upsert_entity(crate::game_state::make_entity(66, "Guard_Dalammer000", 0.0, 0.0, 0.0, true));
+            gs.upsert_entity(eqoxide_core::game_state::make_entity(66, "Guard_Dalammer000", 0.0, 0.0, 0.0, true));
             gs.set_target(66);
         });
         assert_eq!(debug_json(state.clone()).await["player"]["target_id"], serde_json::json!(66),
@@ -1267,7 +1158,7 @@ mod tests {
     /// `scripts/packet-analysis.py --dir in --op 0x5089` (#463) workflow, which defaults to summary=1.
     #[tokio::test]
     async fn packets_summary_with_op_filter_does_not_fabricate_seq_gaps() {
-        use crate::eq_net::packet_telemetry as pkt;
+        use eqoxide_telemetry as pkt;
         let _guard = pkt::test_capture_lock();
         pkt::set_enabled(true);
         pkt::clear();

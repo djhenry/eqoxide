@@ -19,7 +19,7 @@ pub(super) fn router() -> Router<HttpState> {
 /// reward, and objectives with live progress (done_count/goal_count).
 async fn get_log(State(s): State<HttpState>) -> Json<serde_json::Value> {
     let tasks: Vec<_> = s.quest.task_log.lock().unwrap().iter()
-        .filter(|t| t.status == crate::game_state::TaskStatus::Active)
+        .filter(|t| t.status == eqoxide_core::game_state::TaskStatus::Active)
         .cloned()
         .collect();
     Json(serde_json::json!({ "active_count": tasks.len(), "tasks": tasks }))
@@ -98,76 +98,11 @@ async fn post_cancel(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
 
-    /// An `Instant` `secs` in the past (saturating — a just-booted host can't go below its epoch).
-    pub(crate) fn ago(secs: u64) -> std::time::Instant {
-        std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(secs))
-            .expect("monotonic clock older than the test window")
-    }
-
-    /// Mutate the network thread's published `GameState` — the single source of truth every
-    /// agent-facing player field is projected from (#343). Tests that used to poke `player_info`
-    /// directly now seed the snapshot the network thread would have published.
-    pub(crate) fn set_gs(state: &HttpState, f: impl FnOnce(&mut crate::game_state::GameState)) {
-        let mut gs = (**state.game_state.load()).clone();
-        f(&mut gs);
-        state.game_state.store(Arc::new(gs));
-    }
-
-    pub(crate) fn empty_state() -> HttpState {
-        // `CameraSlots` has no `Default` impl (`CameraSnapshot`'s fields aren't Default-able), so
-        // it's built by hand; every other bundle is plain `Default::default()`. `nav`, `camera`, and
-        // `lifecycle` are bound to locals FIRST (rather than inlined) so `command` below can be
-        // built from `.clone()`s of the SAME Arcs — mirroring the shared-identity wiring `main.rs`
-        // does for real, and required now that nav/camera/lifecycle route their writes through
-        // `command` (#459): an independently-`Default`-constructed `command.nav`/etc. would silently
-        // diverge from the `state.nav`/etc. a test reads back.
-        let camera = crate::ipc::CameraSlots {
-            cmd_tx: Arc::new(Mutex::new(None)),
-            snapshot: Arc::new(Mutex::new(crate::camera_state::CameraSnapshot {
-                mode: crate::camera_state::CameraMode::AutoFollow,
-                azimuth: 0.0,
-                elevation: 0.0,
-                radius: 0.0,
-                focus: [0.0, 0.0, 0.0],
-            })),
-            frame_req: Arc::new(Mutex::new(None)),
-            manual_move: Arc::new(Mutex::new(None)),
-        };
-        let nav: crate::ipc::NavSlots = Default::default();
-        let lifecycle: crate::ipc::LifecycleSlots = Default::default();
-        let command = crate::command_state::CommandState::new(
-            Default::default(), Default::default(), Default::default(), Default::default(),
-            Default::default(), Default::default(), Default::default(), Default::default(),
-            Default::default(), Default::default(),
-            nav.clone(), lifecycle.clone(),
-        );
-        HttpState {
-            camera,
-            nav,
-            world: Default::default(),
-            shared_collision: Arc::new(std::sync::RwLock::new(None)),
-            command,
-            social: Default::default(),
-            merchant_slots: Default::default(),
-            inventory_slots: Default::default(),
-            interact: Default::default(),
-            chat: Default::default(),
-            spells: std::sync::Arc::new(crate::spells::SpellDb::default()),
-            game_state: Arc::new(arc_swap::ArcSwap::from_pointee(crate::game_state::GameState::new())),
-            net_health: Arc::new(Mutex::new(crate::http::NetHealth::default())),
-            frame_profile: Arc::new(Mutex::new(crate::profiling::FrameProfile::default())),
-            quest: Default::default(),
-            group_slots: Default::default(),
-            lifecycle,
-            guild_slots: Default::default(),
-        }
-    }
+    use crate::testkit::empty_state;
 
     #[tokio::test]
     async fn accept_unknown_task_id_is_400() {
@@ -183,7 +118,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn accept_known_offer_is_200_and_queues_request() {
         let state = empty_state();
-        state.quest.task_offers_shared.lock().unwrap().push(crate::game_state::TaskOffer {
+        state.quest.task_offers_shared.lock().unwrap().push(eqoxide_core::game_state::TaskOffer {
             task_id: 42, npc_id: 7, title: "Offer".into(), description: String::new(), has_rewards: false,
         });
         let command = state.command.clone();
@@ -218,7 +153,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn cancel_known_task_is_200_and_queues_request() {
         let state = empty_state();
-        state.quest.task_log.lock().unwrap().push(crate::game_state::ActiveTask {
+        state.quest.task_log.lock().unwrap().push(eqoxide_core::game_state::ActiveTask {
             task_id: 42, sequence_number: 3, ..Default::default()
         });
         let command = state.command.clone();
@@ -235,8 +170,8 @@ pub(crate) mod tests {
     async fn log_filters_out_completed_tasks() {
         let state = empty_state();
         state.quest.task_log.lock().unwrap().extend([
-            crate::game_state::ActiveTask { task_id: 1, status: crate::game_state::TaskStatus::Active, ..Default::default() },
-            crate::game_state::ActiveTask { task_id: 2, status: crate::game_state::TaskStatus::Completed, ..Default::default() },
+            eqoxide_core::game_state::ActiveTask { task_id: 1, status: eqoxide_core::game_state::TaskStatus::Active, ..Default::default() },
+            eqoxide_core::game_state::ActiveTask { task_id: 2, status: eqoxide_core::game_state::TaskStatus::Completed, ..Default::default() },
         ]);
         let app = router().with_state(state);
         let resp = app.oneshot(Request::get("/log").body(Body::empty()).unwrap()).await.unwrap();

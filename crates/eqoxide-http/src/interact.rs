@@ -10,7 +10,7 @@ use axum::{
 };
 use tokio::sync::oneshot;
 use std::time::Duration;
-use crate::command_state::{CommandResult, GiveOk};
+use eqoxide_command::{CommandResult, GiveOk};
 use super::*;
 
 /// HTTP-side await budget for POST /v1/interact/give (#448). Set GREATER than the net-side worst-case
@@ -18,7 +18,7 @@ use super::*;
 /// ≈ (GIVE_ACK_TIMEOUT_TICKS + GIVE_FINISH_TIMEOUT_TICKS) × ~150ms ≈ 6s (see `action_loop`). Awaiting
 /// 8s here guarantees the NET verdict (Resolved/Unconfirmed from the state machine) reaches the caller
 /// rather than a vaguer HTTP-elapsed 202 firing first — the two-timeout ordering landmine.
-pub(crate) const GIVE_HTTP_TIMEOUT_SECS: u64 = 8;
+pub const GIVE_HTTP_TIMEOUT_SECS: u64 = 8;
 
 /// A quick `(StatusCode, String)` plain-text response, so the small error paths stay terse.
 fn text(status: StatusCode, body: impl Into<String>) -> Response {
@@ -319,7 +319,7 @@ struct GiveBody {
 ///     change mid-give, AND — the #486 fix — a give where OP_FinishTrade DID arrive but the NPC
 ///     REJECTED / was OUT OF RANGE, returning the item to the player (OP_FinishTrade only ends the
 ///     trade SESSION; it does NOT prove acceptance). The body says so explicitly. A 202 MUST NOT be
-///     read as success — that is the whole honesty invariant of A3 (see `crate::command_state::result`).
+///     read as success — that is the whole honesty invariant of A3 (see `eqoxide_command::result`).
 async fn post_give(
     State(s): State<HttpState>,
     body: Result<Json<GiveBody>, axum::extract::rejection::JsonRejection>,
@@ -432,9 +432,9 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
-    use crate::http::quests::tests::empty_state;
+    use crate::testkit::empty_state;
 
-    fn seed_npc(state: &crate::http::HttpState, key: &str, id: u32, pos: (f32, f32, f32)) {
+    fn seed_npc(state: &crate::HttpState, key: &str, id: u32, pos: (f32, f32, f32)) {
         state.world.entity_positions.lock().unwrap().insert(key.to_string(), pos);
         state.world.entity_ids.lock().unwrap().insert(key.to_string(), id);
     }
@@ -626,7 +626,7 @@ mod tests {
 
     // ── A3 Migration 2 (#448): POST /v1/interact/give reports the TRUE outcome, not a queued 200 ──
 
-    use crate::command_state::{CommandResult, GiveOk};
+    use eqoxide_command::{CommandResult, GiveOk};
 
     /// A give to a nonexistent NPC 404s before parking anything.
     #[tokio::test]

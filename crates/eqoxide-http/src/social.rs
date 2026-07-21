@@ -71,12 +71,12 @@ async fn get_friends(State(s): State<HttpState>) -> (StatusCode, Json<serde_json
     if friends.is_empty() {
         return (StatusCode::OK, Json(serde_json::json!({ "friends": [] })));
     }
-    let (tx, rx) = oneshot::channel::<Vec<crate::game_state::WhoEntry>>();
+    let (tx, rx) = oneshot::channel::<Vec<eqoxide_core::game_state::WhoEntry>>();
     s.command.request_friends_who(tx);
     match tokio::time::timeout(std::time::Duration::from_secs(6), rx).await {
         Ok(Ok(online_roster)) => {
             // Index the online subset by lowercased name for annotation.
-            let online: std::collections::HashMap<String, crate::game_state::WhoEntry> =
+            let online: std::collections::HashMap<String, eqoxide_core::game_state::WhoEntry> =
                 online_roster.into_iter().map(|e| (e.name.to_lowercase(), e)).collect();
             let list: Vec<FriendView> = friends.into_iter().map(|name| {
                 match online.get(&name.to_lowercase()) {
@@ -84,7 +84,7 @@ async fn get_friends(State(s): State<HttpState>) -> (StatusCode, Json<serde_json
                         name, online: true,
                         zone_id: Some(e.zone_id),
                         level:   if e.anon { None } else { Some(e.level) },
-                        class:   if e.anon { None } else { Some(crate::eq_net::packet_handler::class_name(e.class).to_string()) },
+                        class:   if e.anon { None } else { Some(eqoxide_core::race_class::class_name(e.class).to_string()) },
                     },
                     None => FriendView { name, online: false, zone_id: None, level: None, class: None },
                 }

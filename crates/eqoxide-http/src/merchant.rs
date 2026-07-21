@@ -10,7 +10,7 @@ use axum::{
 };
 use tokio::sync::oneshot;
 use std::time::Duration;
-use crate::command_state::{BuyOk, CommandResult, OpenOk};
+use eqoxide_command::{BuyOk, CommandResult, OpenOk};
 use super::*;
 
 pub(super) fn router() -> Router<HttpState> {
@@ -46,7 +46,7 @@ struct TradeOpenBody {
 ///     NO packet of any kind on that path (confirmed against the EQEmu RoF2 source; see
 ///     `~/git/eq_kb/merchant-open-protocol.md`). The body says so explicitly. A
 ///     202 MUST NOT be read as success — that is the whole honesty invariant of A3 (see
-///     `crate::command_state::result`).
+///     `eqoxide_command::result`).
 async fn post_trade_open(
     State(s): State<HttpState>,
     body: Result<Json<TradeOpenBody>, axum::extract::rejection::JsonRejection>,
@@ -159,7 +159,7 @@ fn json(status: StatusCode, value: serde_json::Value) -> Response {
 ///     INSUFFICIENT-FUNDS buy produces, because the server sends NOTHING at all on that path (it
 ///     also covers a lost reply or a zone change mid-buy). The body says so explicitly and points at
 ///     the state to re-check. A 202 MUST NOT be read as success — that is the whole honesty
-///     invariant of A3 (see `crate::command_state::result`).
+///     invariant of A3 (see `eqoxide_command::result`).
 async fn post_buy(
     State(s): State<HttpState>,
     body: Result<Json<BuyBody>, axum::extract::rejection::JsonRejection>,
@@ -269,9 +269,9 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
-    use crate::http::quests::tests::empty_state;
+    use crate::testkit::empty_state;
 
-    fn seed_merchant(state: &crate::http::HttpState, key: &str, id: u32) {
+    fn seed_merchant(state: &crate::HttpState, key: &str, id: u32) {
         state.world.entity_ids.lock().unwrap().insert(key.to_string(), id);
     }
 
@@ -309,7 +309,7 @@ mod tests {
 
     // ── A3 Migration 1 (#448): POST /v1/merchant/buy reports the TRUE outcome, not a queued 200 ──
 
-    use crate::command_state::{BuyOk, CommandResult};
+    use eqoxide_command::{BuyOk, CommandResult};
 
     /// A buy that resolves nowhere-to-target still 404s before parking anything.
     #[tokio::test]
@@ -416,7 +416,7 @@ mod tests {
 
     // ── eqoxide#479: POST /v1/merchant/open reports the TRUE outcome, not a queued 200 ──────────
 
-    use crate::command_state::OpenOk;
+    use eqoxide_command::OpenOk;
 
     /// An open that resolves nowhere-to-target still 404s before parking anything.
     #[tokio::test]

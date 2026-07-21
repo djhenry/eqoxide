@@ -99,8 +99,8 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
-    use crate::http::quests::tests::empty_state;
-    use crate::http::Event;
+    use crate::testkit::empty_state;
+    use crate::Event;
 
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();

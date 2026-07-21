@@ -80,11 +80,22 @@ pub mod pipeline;
 pub mod renderer;
 pub mod scene;
 
+// The agent-facing HTTP/REST API now lives in the `eqoxide-http` workspace crate (#544 Step 2l),
+// depending only on the lower structural crates (`eqoxide-core`/`ipc`/`command`/`nav`/`telemetry`/
+// `crash`/`protocol`) + axum/tokio/serde — never on this app crate, the renderer, gpu, or the
+// eq_net transport. Alias it as this crate's `http` module so every existing `crate::http::…` /
+// `eqoxide::http::…` call site (`main.rs`'s `http::spawn_camera_server`) keeps resolving unchanged.
+// The two packet-apply gameplay fns its `/observe/debug` tests exercised (`eq_net::packet_handler::
+// apply_consider`/`apply_death`) stay in THIS crate; those three tests moved up into
+// `tests/http_observe_apply.rs`, where both `eqoxide_http` and `eq_net::packet_handler` are in scope
+// (the app crate enables `eqoxide-http/test-fixtures` in its dev-deps for the shared `HttpState`
+// builder). See the crate's module docs.
+pub use eqoxide_http as http;
+
 // Modules only needed by the full client binary.
 pub mod camera_state;
 pub mod eq_net;
 pub mod frame_capture;
-pub mod http;
 pub mod hud;
 pub mod model;
 pub mod ui;
