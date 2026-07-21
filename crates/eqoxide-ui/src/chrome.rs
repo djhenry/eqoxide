@@ -18,6 +18,36 @@ const FADE_TO: f32 = 100.0;
 /// Mouse must be off the window this long before it fades.
 const FADE_DELAY: f32 = 2.0;
 
+/// The manual gap `title_strip` adds after its own bar (via `ui.add_space`),
+/// on top of the automatic `item_spacing` egui inserts before the next
+/// widget. Named so the restore-side footprint math below can never drift
+/// out of sync with what `title_strip` actually draws — see
+/// `title_footprint`.
+const TITLE_STRIP_TRAILING_SPACE: f32 = 2.0;
+
+/// The title strip's total live footprint (height): `TITLE_H` (the bar
+/// itself) + `TITLE_STRIP_TRAILING_SPACE` (its own `add_space`) + one
+/// automatic `item_spacing` gap (egui inserts this before the next widget
+/// laid out after the strip — i.e. before `add_contents`'s first item).
+///
+/// Unlike a cosmetic estimate, this MUST equal the strip's actual measured
+/// footprint exactly for a self-filling body (one that calls
+/// `ui.available_size()`, e.g. `windows/map.rs`'s canvas) to round-trip
+/// idempotently: such a body's measured bottom always lands at the
+/// container's bottom edge regardless of where the title strip's cursor
+/// left off, so `content_size = after_content - after_title` only cancels
+/// the `+ title_footprint(ctx)` added below (in `size`) when the two match
+/// bit-for-bit. A mismatch of even a few px does NOT self-correct — it
+/// reproduces #613's own bug shape (a constant per-cycle drift), just at a
+/// smaller magnitude. (This was caught by `round_trip_size_is_idempotent_across_reloads`
+/// during development: an earlier hardcoded `TITLE_H + 3.0` — missing the
+/// `add_space` term — drifted by -2.0px/cycle instead of the pre-fix
+/// +21.0px/cycle. Fixed windows and natural-height bodies are unaffected
+/// either way, since their content bottom doesn't depend on container size.)
+fn title_footprint(ctx: &egui::Context) -> f32 {
+    theme::TITLE_H + TITLE_STRIP_TRAILING_SPACE + ctx.style().spacing.item_spacing.y
+}
+
 /// Runtime window-system state that isn't persisted.
 pub struct WinSys {
     pub layout: Layout,
@@ -106,14 +136,25 @@ pub fn eq_window(
     let stored = sys.layout.win(id).cloned();
     let observed = sys.layout.observed(id);
 
-    // Stored size is the CONTENT size (what default_size/fixed_size control);
-    // persisting the outer rect here would grow windows by the chrome overhead
-    // every session.
-    let size = stored
-        .as_ref()
-        .and_then(|s| s.size)
-        .filter(|_| def.resizable)
-        .unwrap_or(def.default_size);
+    // Stored size is CONTENT-ONLY — what `add_contents` itself draws,
+    // EXCLUDING the custom title strip (see the capture at the bottom of
+    // this function). The strip lives in the SAME `ui` as `add_contents`,
+    // so before #613 was fixed, "content size" silently included it: the
+    // saved total got fed straight back in below as the window's content
+    // area, the strip drew AGAIN inside that area on the next session, and
+    // the measured union kept growing by the strip's own footprint every
+    // single save/reload cycle. (Egui's OWN window chrome — the guard this
+    // comment used to describe — is genuinely excluded by `.title_bar(false)`
+    // and was never the problem; this code's OWN title bar, drawn inline as
+    // regular content, was.) Reconstructing the container we hand to egui
+    // therefore means adding the strip's footprint back on; see
+    // `title_footprint` for why that value must match the strip's actual
+    // measured height exactly, not just approximately.
+    let stored_content_size = stored.as_ref().and_then(|s| s.size).filter(|_| def.resizable);
+    let size = match stored_content_size {
+        Some(c) => [c[0], c[1] + title_footprint(ctx)],
+        None => def.default_size,
+    };
     let dpos = default_pos(def, screen, size);
 
     let opacity = sys.effective_alpha(ctx, id, false);
@@ -155,9 +196,24 @@ pub fn eq_window(
     let resp = win.show(ctx, |ui| {
         ui.set_opacity(opacity);
         result.close_clicked = title_strip(ui, def, locked);
+        // Union bbox after JUST the title strip — its own footprint
+        // (TITLE_H plus the spacing egui inserts before the next item),
+        // measured LIVE so it's exactly right regardless of theme tweaks.
+        let after_title = ui.min_rect().size();
         add_contents(ui);
-        // Content size — the space default_size/fixed_size actually control.
-        content_size = ui.min_rect().size();
+        // Union bbox after strip + body. They stack vertically in the same
+        // `ui`, so the strip's height is baked into this total — but width
+        // is a "max" across siblings, not a sum, so the strip never
+        // inflates it (this matches the #613 report: width never drifted).
+        let after_content = ui.min_rect().size();
+        // #613 fix: persist only what `add_contents` itself needed, by
+        // subtracting the strip's own (live-measured) footprint back out.
+        // The OLD code stored `after_content` directly — title strip
+        // included — which is exactly the number that then got fed back in
+        // above as next session's content area, drawing the strip again on
+        // top of it. This is the invariant that must hold now: the number
+        // we save means the same thing `size` above applies it to.
+        content_size = egui::vec2(after_content.x, (after_content.y - after_title.y).max(0.0));
     });
 
     if let Some(resp) = resp {
@@ -290,6 +346,97 @@ fn title_strip(ui: &mut egui::Ui, def: &WindowDef, locked: bool) -> bool {
         // Native behavior: the action fires on release over the same box.
         closed = resp.clicked();
     }
-    ui.add_space(2.0);
+    ui.add_space(TITLE_STRIP_TRAILING_SPACE);
     closed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A body shaped like the real culprit (`windows/map.rs`): a
+    /// self-measuring bottom panel, then a central canvas that fills
+    /// whatever's left via `ui.available_size()`. This is the exact pattern
+    /// #613's root cause bit — the panel divides up the ui's `max_rect`
+    /// (the container we handed it), not what the title strip already
+    /// consumed by advancing the cursor — so it's the most faithful
+    /// reproduction available for a mutation-discriminating test.
+    fn self_filling_body(ui: &mut egui::Ui) {
+        egui::TopBottomPanel::bottom(ui.id().with("footer"))
+            .show_separator_line(false)
+            .show_inside(ui, |ui| {
+                ui.label("footer");
+            });
+        egui::CentralPanel::default().frame(egui::Frame::none()).show_inside(ui, |ui| {
+            let size = ui.available_size().max(egui::vec2(50.0, 50.0));
+            ui.allocate_space(size);
+        });
+    }
+
+    fn test_def() -> WindowDef {
+        WindowDef {
+            id: "rt_test_win",
+            title: "RT Test",
+            hotkey: None,
+            default_anchor: egui::Align2::LEFT_TOP,
+            default_offset: [40.0, 40.0],
+            default_size: [240.0, 240.0],
+            resizable: true,
+            closeable: true,
+            default_open: true,
+            transient: false,
+        }
+    }
+
+    /// #613 regression: save -> load -> save (simulating a client restart,
+    /// including a FRESH `egui::Context` each cycle — egui's own per-window
+    /// Resize memory lives in `ctx.data`, which does not survive a real
+    /// restart any more than our own `persist::Layout` file would if we
+    /// didn't write it) must reproduce the EXACT same stored size, not
+    /// merely "close to" it. Before the fix this drifted by exactly
+    /// `TITLE_H + item_spacing` (21.0 px) per cycle, matching the owner's
+    /// measured field data.
+    #[test]
+    fn round_trip_size_is_idempotent_across_reloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ui_layout_test.json");
+        let def = test_def();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
+        let raw = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+
+        // Seed a baseline "already used once" layout — a brand-new window
+        // (no stored size at all) isn't where this bug lives; it only bites
+        // once a size has actually been persisted at least once, exactly
+        // like the owner's real files.
+        {
+            let mut sys = WinSys::new(Layout::from_path(path.clone()));
+            sys.layout.set_geometry(def.id, [40.0, 40.0], Some([240.0, 261.0]));
+            sys.layout.save_now();
+        }
+
+        let mut sizes = Vec::new();
+        for _ in 0..6 {
+            // Fresh Layout (reload from disk) AND fresh egui::Context
+            // (simulated restart) each cycle.
+            let mut sys = WinSys::new(Layout::from_path(path.clone()));
+            let ctx = egui::Context::default();
+            // A few settle frames per "session" — the layout saves
+            // continuously while the app runs, not only on exit.
+            for _ in 0..3 {
+                let _ = ctx.run(raw.clone(), |ctx| {
+                    eq_window(ctx, &mut sys, &def, screen, self_filling_body);
+                });
+            }
+            sys.layout.save_now();
+            let size = sys.layout.win(def.id).and_then(|w| w.size).expect("size not persisted");
+            sizes.push(size);
+        }
+
+        for pair in sizes.windows(2) {
+            assert_eq!(
+                pair[0], pair[1],
+                "persisted size drifted across a reload cycle — full history: {sizes:?}"
+            );
+        }
+    }
 }
