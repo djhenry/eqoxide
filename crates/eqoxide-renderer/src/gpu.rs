@@ -246,6 +246,26 @@ pub fn upload_textures(
     (gpu_textures, bind_groups)
 }
 
+/// Sun shadow-map resolution (square). One cascade covering the area around the player (#518).
+/// 2048² is a good visible-quality/VRAM trade for a single-map slice; tuning is a follow-up.
+pub const SHADOW_MAP_SIZE: u32 = 2048;
+
+/// Create the sun shadow-map depth texture view (#518). Depth32Float, sampled by the lit zone
+/// shaders through a comparison sampler. `RENDER_ATTACHMENT` (the shadow depth pass writes it) +
+/// `TEXTURE_BINDING` (the zone pass samples it). Fixed size — independent of the window, so it is
+/// NOT recreated on resize.
+pub fn create_shadow_map(device: &wgpu::Device) -> wgpu::TextureView {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("shadow_map"),
+        size: wgpu::Extent3d { width: SHADOW_MAP_SIZE, height: SHADOW_MAP_SIZE, depth_or_array_layers: 1 },
+        mip_level_count: 1, sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    }).create_view(&wgpu::TextureViewDescriptor::default())
+}
+
 /// Create a Depth32Float texture view for the given dimensions.
 /// Call once at startup and again on resize.
 pub fn create_depth_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {

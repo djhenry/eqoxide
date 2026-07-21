@@ -111,6 +111,35 @@ pub fn entity_model_matrix_heading(
     .to_cols_array_2d()
 }
 
+/// Directional (sun) light view-projection for shadow mapping (#518).
+///
+/// Builds an orthographic light camera that looks at `center` (typically the player position, in
+/// render/world space) from the direction the sun light comes FROM — `light_dir_to` is the unit
+/// vector pointing TOWARD the sun, the same convention the lit shaders use for their sun term. The
+/// ortho frustum covers a `radius` half-extent box around `center` and `depth` units along the
+/// light axis, so casters within that region are captured into the shadow map.
+///
+/// Right-handed with wgpu 0..1 clip depth (`orthographic_rh`). Unlike the display camera
+/// (`look_at_perspective`), there is NO clip-space X flip: the shadow depth pass and the sampling
+/// in the lit shaders both use this exact matrix, so the convention only has to be self-consistent,
+/// not un-mirrored for display. The `up` axis is chosen off the light direction's dominant
+/// component so `look_at` never degenerates when the sun is near-overhead (view axis ≈ vertical).
+pub fn sun_light_view_proj(
+    center: [f32; 3], light_dir_to: [f32; 3], radius: f32, depth: f32,
+) -> [[f32; 4]; 4] {
+    let mut ldir = glam::Vec3::from(light_dir_to).normalize_or_zero();
+    if ldir.length_squared() < 1e-6 { ldir = glam::Vec3::Z; }
+    let c   = glam::Vec3::from(center);
+    let eye = c + ldir * (depth * 0.5);
+    // Pick an up axis not aligned with the light direction: if the sun is overhead (Z dominant),
+    // use world Y (horizontal); otherwise world Z is fine and keeps the shadow frame upright.
+    let a  = ldir.abs();
+    let up = if a.z >= a.x && a.z >= a.y { glam::Vec3::Y } else { glam::Vec3::Z };
+    let view = glam::Mat4::look_at_rh(eye, c, up);
+    let proj = glam::Mat4::orthographic_rh(-radius, radius, -radius, radius, 0.0, depth);
+    (proj * view).to_cols_array_2d()
+}
+
 /// Project world-space position to screen pixels. None if behind camera or outside depth.
 pub fn project_to_screen(
     world_pos: [f32; 3],
@@ -405,6 +434,60 @@ mod tests {
         // Close in distance but way off to the side (outside frustum x).
         let side = [50.0, 0.0, 0.0];
         assert!(!entity_in_view(side, [0.0, 0.0, 0.0], cull_vp(), 500.0, 0.5));
+    }
+
+    /// Project a world point through a column-major view-proj matrix to NDC (x,y,z), or None if w<=0.
+    fn to_ndc(m: &[[f32; 4]; 4], v: [f32; 3]) -> Option<[f32; 3]> {
+        let cx = m[0][0]*v[0] + m[1][0]*v[1] + m[2][0]*v[2] + m[3][0];
+        let cy = m[0][1]*v[0] + m[1][1]*v[1] + m[2][1]*v[2] + m[3][1];
+        let cz = m[0][2]*v[0] + m[1][2]*v[1] + m[2][2]*v[2] + m[3][2];
+        let cw = m[0][3]*v[0] + m[1][3]*v[1] + m[2][3]*v[2] + m[3][3];
+        if cw <= 0.0 { return None; }
+        Some([cx/cw, cy/cw, cz/cw])
+    }
+
+    #[test]
+    fn sun_light_view_proj_centers_the_target() {
+        // The look-at target (center) must land at the middle of the light frustum: NDC xy ≈ 0
+        // and NDC z inside [0,1] (roughly mid-depth), so the covered region is centered on it.
+        let ldir = [0.3, -0.5, 1.0];
+        let vp = sun_light_view_proj([100.0, 200.0, 10.0], ldir, 150.0, 600.0);
+        let ndc = to_ndc(&vp, [100.0, 200.0, 10.0]).expect("center in front of light");
+        assert!(ndc[0].abs() < 1e-3 && ndc[1].abs() < 1e-3, "center off-axis: {ndc:?}");
+        assert!(ndc[2] > 0.0 && ndc[2] < 1.0, "center depth not in 0..1: {}", ndc[2]);
+    }
+
+    #[test]
+    fn sun_light_view_proj_depth_increases_away_from_light() {
+        // A point moved AWAY from the sun (opposite the light-to vector) must be deeper in the
+        // shadow map (larger NDC z) than one moved toward it — the ordering shadow tests rely on
+        // (a caster nearer the sun occludes the ground behind it).
+        let ldir = glam::Vec3::from([0.3f32, -0.5, 1.0]).normalize();
+        let center = [0.0, 0.0, 0.0];
+        let vp = sun_light_view_proj(center, ldir.to_array(), 150.0, 600.0);
+        let toward = (ldir * 50.0).to_array();               // closer to the sun
+        let away   = (ldir * -50.0).to_array();              // farther from the sun
+        let z_near = to_ndc(&vp, toward).unwrap()[2];
+        let z_far  = to_ndc(&vp, away).unwrap()[2];
+        assert!(z_near < z_far, "toward-light z {z_near} should be < away-light z {z_far}");
+    }
+
+    #[test]
+    fn sun_light_view_proj_covers_radius_but_not_far_outside() {
+        // A point at the coverage radius (perpendicular to the light axis) stays inside the NDC
+        // box; one well beyond it falls outside — so the ortho half-extent is honored.
+        let vp = sun_light_view_proj([0.0, 0.0, 0.0], [0.0, 0.0, 1.0], 100.0, 400.0);
+        let inside  = to_ndc(&vp, [90.0, 0.0, 0.0]).unwrap();
+        let outside = to_ndc(&vp, [300.0, 0.0, 0.0]).unwrap();
+        assert!(inside[0].abs() <= 1.0, "in-radius point outside NDC: {inside:?}");
+        assert!(outside[0].abs() > 1.0, "far point should be outside NDC: {outside:?}");
+    }
+
+    #[test]
+    fn sun_light_view_proj_handles_degenerate_direction() {
+        // A zero light vector must not produce NaNs (falls back to straight-down).
+        let vp = sun_light_view_proj([1.0, 2.0, 3.0], [0.0, 0.0, 0.0], 50.0, 200.0);
+        assert!(vp.iter().flatten().all(|x| x.is_finite()), "degenerate light produced non-finite matrix");
     }
 
     #[test]

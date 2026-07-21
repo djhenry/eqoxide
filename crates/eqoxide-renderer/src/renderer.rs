@@ -177,7 +177,26 @@ pub struct EqRenderer {
     warned_missing_doors: std::collections::HashSet<String>,
     /// Unit cube (~2 units) drawn at a door's position when its model is missing.
     pub door_fallback: Option<crate::gpu::GpuMesh>,
+
+    // ── Sun shadow map (#518) ───────────────────────────────────────────────
+    /// Depth texture rendered from the sun's POV by the shadow pass; sampled by the zone shaders.
+    pub shadow_map_view: wgpu::TextureView,
+    /// Light view-proj uniform buffer (single mat4). Rewritten each frame from the player position.
+    pub light_buf: wgpu::Buffer,
+    /// Group 0 for the shadow DEPTH pipelines — the light view-proj as a vertex uniform.
+    pub light_depth_bg: wgpu::BindGroup,
+    /// Group 2 for the lit zone pipelines — light view-proj + shadow depth texture + comparison sampler.
+    pub shadow_sample_bg: wgpu::BindGroup,
+    /// Dedicated per-caster model-matrix uniforms (entity_bgl layout). Separate from the color
+    /// passes' `entity_uniform_pool` so the shadow pass (encoded first) never aliases their writes.
+    pub shadow_uniform_pool: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
+    /// Dedicated per-skinned-caster joint palettes (joints_bgl layout).
+    pub shadow_joint_pool: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
 }
+
+/// Max shadow casters drawn per frame (nearest-first). Bounds the extra skinning/draw cost of the
+/// depth pass in crowded zones; farther casters simply don't cast this frame. (#518)
+pub const SHADOW_CASTER_SLOTS: usize = 64;
 
 impl EqRenderer {
     pub fn new(
@@ -275,6 +294,72 @@ impl EqRenderer {
         // Build the fallback door cube once (~2 units to a side, centered at origin).
         let door_fallback = Some(build_unit_cube(&device));
 
+        // ── Sun shadow map (#518) ───────────────────────────────────────────
+        let shadow_map_view = crate::gpu::create_shadow_map(&device);
+        // Light view-proj uniform: one mat4 (64 bytes), rewritten each frame.
+        let light_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("shadow_light_vp"),
+            size: 64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let light_depth_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow_light_depth_bg"),
+            layout: &layouts.shadow_light_bgl,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: light_buf.as_entire_binding() }],
+        });
+        // Comparison sampler for PCF shadow lookups (clamp so out-of-frustum reads hit the edge;
+        // the shader already treats out-of-frustum fragments as fully lit before sampling).
+        let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("shadow_cmp_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            ..Default::default()
+        });
+        let shadow_sample_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow_sample_bg"),
+            layout: &layouts.shadow_sample_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: light_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&shadow_map_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&shadow_sampler) },
+            ],
+        });
+        let shadow_uniform_pool: Vec<(wgpu::Buffer, wgpu::BindGroup)> =
+            (0..SHADOW_CASTER_SLOTS).map(|_| {
+                let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("shadow_uniform_pool"),
+                    size: std::mem::size_of::<crate::gpu::EntityUniform>() as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("shadow_uniform_pool_bg"),
+                    layout: &layouts.entity_bgl,
+                    entries: &[wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() }],
+                });
+                (buf, bg)
+            }).collect();
+        let shadow_joint_pool: Vec<(wgpu::Buffer, wgpu::BindGroup)> =
+            (0..SHADOW_CASTER_SLOTS).map(|_| {
+                let buf = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("shadow_joint_pool"),
+                    size: JOINT_BUF_BYTES,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("shadow_joint_pool_bg"),
+                    layout: &layouts.joints_bgl,
+                    entries: &[wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() }],
+                });
+                (buf, bg)
+            }).collect();
+
         Self {
             device,
             queue,
@@ -317,6 +402,12 @@ impl EqRenderer {
             door_uniform_pool,
             warned_missing_doors: std::collections::HashSet::new(),
             door_fallback,
+            shadow_map_view,
+            light_buf,
+            light_depth_bg,
+            shadow_sample_bg,
+            shadow_uniform_pool,
+            shadow_joint_pool,
         }
     }
 
@@ -1122,7 +1213,18 @@ impl EqRenderer {
         };
         self.queue.write_buffer(&self.sky_uniform.buf, 0, bytemuck::bytes_of(&sky_data));
 
+        // Sun shadow map (#518): aim an orthographic light camera at the player and render the
+        // nearby shadow casters into the shadow map before the color passes (which sample it). The
+        // sun direction is FIXED for Slice 1 — the same vector the lit shaders use for the sun term
+        // (`normalize(0.3,-0.5,1.0)`, render space, Z-up). Pointing it at the time-of-day sun is a
+        // documented follow-up. `radius`/`depth` bound the covered area around the player.
+        let light_center = if scene.player_race.is_empty() { cam_target } else { scene.player_pos };
+        let light_vp = crate::camera::sun_light_view_proj(
+            light_center, [0.3, -0.5, 1.0], 160.0, 700.0);
+        self.queue.write_buffer(&self.light_buf, 0, bytemuck::bytes_of(&light_vp));
+
         crate::pass::encode_sky_pass(self, encoder, view);
+        crate::pass::encode_shadow_pass(self, encoder, scene, light_center);
         crate::pass::encode_zone_pass(self, encoder, view, scene);
         crate::pass::encode_door_pass(self, encoder, view, scene);
         crate::pass::encode_billboard_pass(self, encoder, view, scene,
