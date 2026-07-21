@@ -9,6 +9,44 @@ struct Camera {
 @group(1) @binding(0) var t_diffuse: texture_2d<f32>;
 @group(1) @binding(1) var s_diffuse: sampler;
 
+// Sun shadow map (#518): the light view-proj + the depth map rendered from the sun's POV, sampled
+// through a comparison sampler. Terrain (and masked foliage) receive shadows cast by characters +
+// placed objects. See shadow.wgsl for the depth pass that fills the map.
+struct ShadowLight { light_vp: mat4x4<f32> };
+@group(2) @binding(0) var<uniform> shadow_light: ShadowLight;
+@group(2) @binding(1) var shadow_map: texture_depth_2d;
+@group(2) @binding(2) var shadow_samp: sampler_comparison;
+
+// Returns 1.0 = fully lit, 0.0 = fully shadowed. Projects the world fragment into light clip space,
+// then does a 3×3 PCF comparison against the shadow map for a soft edge. A small depth bias avoids
+// self-shadow acne; fragments outside the light frustum are treated as lit. Uses
+// `textureSampleCompareLevel` (level 0, no derivatives) so it is valid in non-uniform control flow.
+fn shadow_factor(world_pos: vec3<f32>) -> f32 {
+    let lp = shadow_light.light_vp * vec4<f32>(world_pos, 1.0);
+    if (lp.w <= 0.0) { return 1.0; }
+    let ndc = lp.xyz / lp.w;
+    if (ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0 || ndc.z < 0.0 || ndc.z > 1.0) {
+        return 1.0;
+    }
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, ndc.y * -0.5 + 0.5);
+    let cur = ndc.z - 0.0015;
+    let texel = 1.0 / 2048.0; // must track gpu::SHADOW_MAP_SIZE
+    var sum = 0.0;
+    for (var dx = -1; dx <= 1; dx++) {
+        for (var dy = -1; dy <= 1; dy++) {
+            let off = vec2<f32>(f32(dx), f32(dy)) * texel;
+            sum += textureSampleCompareLevel(shadow_map, shadow_samp, uv + off, cur);
+        }
+    }
+    return sum / 9.0;
+}
+
+// Darken a lit color by the shadow term. A shadowed fragment keeps 45% brightness (ambient fill)
+// rather than going black, matching the soft look of the native client's blob/ground shadow.
+fn apply_shadow(color: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
+    return color * mix(0.45, 1.0, shadow_factor(world_pos));
+}
+
 struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) normal:   vec3<f32>,
@@ -68,7 +106,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if (texel.a < 0.5) {
         discard;
     }
-    let lit = texel.rgb * light;
+    let lit = apply_shadow(texel.rgb * light, in.world_pos);
     return vec4<f32>(apply_fog(lit, in.world_pos), texel.a);
 }
 

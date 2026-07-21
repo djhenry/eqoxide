@@ -215,6 +215,7 @@ pub fn encode_zone_pass(
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, &r.camera_uniform.bind_group, &[]);
                 pass.set_bind_group(1, tex_bg(etex), &[]);
+                pass.set_bind_group(2, &r.shadow_sample_bg, &[]); // sun shadow map (#518)
                 current_tex = etex;
                 bound = true;
             } else if etex != current_tex {
@@ -239,6 +240,7 @@ pub fn encode_zone_pass(
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, &r.camera_uniform.bind_group, &[]);
                 pass.set_bind_group(1, tex_bg(etex), &[]);
+                pass.set_bind_group(2, &r.shadow_sample_bg, &[]); // sun shadow map (#518)
                 current_tex = etex;
                 bound = true;
             } else if etex != current_tex {
@@ -1062,9 +1064,211 @@ pub fn encode_skinned_entity_pass(
     }
 }
 
+/// Sun shadow-map DEPTH pass (#518). Renders the nearby shadow casters — the player, nearby
+/// character models (skinned + static), and the zone's placed objects (instanced) — from the
+/// directional light's POV into `r.shadow_map_view`. The lit zone shaders then sample that map so
+/// characters/objects cast shadows onto the terrain. Depth-only: no color target.
+///
+/// Casters write their model matrices/joints to the DEDICATED `shadow_uniform_pool`/
+/// `shadow_joint_pool` (never the color passes' pools), so encoding this pass first can't alias
+/// their per-frame writes. The matrices are computed with the SAME `entity_model_matrix_heading` +
+/// placement calls the color passes use, so a caster's shadow lines up with its rendered body.
+/// The pass always runs (even with no casters) to clear the map to "fully lit".
+pub fn encode_shadow_pass(
+    r:            &EqRenderer,
+    encoder:      &mut wgpu::CommandEncoder,
+    scene:        &SceneState,
+    light_center: [f32; 3],
+) {
+    use crate::renderer::SHADOW_CASTER_SLOTS;
+    use crate::models::{race_to_archetype, character_model_key, archetype_scale, target_height_for,
+                        archetype_correction, humanoid_placement};
+    use crate::gpu::{EntityUniform, GpuModel};
+
+    enum Caster<'a> {
+        Skinned { model: &'a crate::gpu::GpuSkinnedModel, u_slot: usize, j_slot: usize },
+        Static  { model: &'a crate::gpu::GpuStaticModel,  u_slot: usize },
+    }
+    let id4 = [[1f32,0.,0.,0.],[0.,1.,0.,0.],[0.,0.,1.,0.],[0.,0.,0.,1.]];
+
+    let mut casters: Vec<Caster> = Vec::new();
+    let mut u_slot = 0usize; // shadow_uniform_pool index
+    let mut j_slot = 0usize; // shadow_joint_pool index
+
+    // Write a padded 128-joint palette to shadow_joint_pool[slot], returning nothing.
+    let write_joints = |slot: usize, mats: &[[[f32;4];4]]| {
+        let mut joint_array = [id4; 128];
+        for (i, m) in mats.iter().enumerate().take(128) { joint_array[i] = *m; }
+        r.queue.write_buffer(&r.shadow_joint_pool[slot].0, 0, bytemuck::cast_slice(&joint_array));
+    };
+    let write_model = |slot: usize, mat: [[f32;4];4]| {
+        r.queue.write_buffer(&r.shadow_uniform_pool[slot].0, 0,
+            bytemuck::bytes_of(&EntityUniform { model: mat, tint: [1.0; 4] }));
+    };
+
+    // ── Player (id 0) ───────────────────────────────────────────────────────
+    if !scene.player_race.is_empty() {
+        let archetype = race_to_archetype(&scene.player_race);
+        match r.character_model_for(&scene.player_race, scene.player_gender) {
+            Some(GpuModel::Skinned(model)) => {
+                let matrices = match r.anim_states.get(&0) {
+                    Some(s) if !model.skin.clips.is_empty() => model.skin.evaluate(s.clip_idx, s.time),
+                    _ => model.skin.bind_pose(),
+                };
+                write_joints(j_slot, &matrices);
+                let target = target_height_for(&scene.player_race, archetype);
+                let p = humanoid_placement(model.true_height, model.feet_offset, target);
+                let mat = crate::camera::entity_model_matrix_heading(
+                    scene.player_pos, scene.player_heading, p.visual_scale, p.mesh_scale,
+                    [0.0, 0.0], true, 0.0, archetype_correction(archetype));
+                write_model(u_slot, mat);
+                casters.push(Caster::Skinned { model, u_slot, j_slot });
+                u_slot += 1; j_slot += 1;
+            }
+            Some(GpuModel::Static(model)) => {
+                let arch_scale   = archetype_scale(archetype);
+                let visual_scale = 2.0 * model.y_extent * arch_scale;
+                let mat = crate::camera::entity_model_matrix_heading(
+                    scene.player_pos, scene.player_heading, visual_scale, arch_scale,
+                    [model.x_center, model.z_center], true, model.y_bottom, archetype_correction(archetype));
+                write_model(u_slot, mat);
+                casters.push(Caster::Static { model, u_slot });
+                u_slot += 1;
+            }
+            None => {}
+        }
+    }
+
+    // ── Nearby character casters (nearest-first, bounded) ────────────────────
+    let pp = light_center;
+    let mut order: Vec<&crate::scene::Billboard> = scene.billboards.iter().collect();
+    order.sort_by(|a, b| {
+        let da = (a.pos[0]-pp[0]).powi(2) + (a.pos[1]-pp[1]).powi(2) + (a.pos[2]-pp[2]).powi(2);
+        let db = (b.pos[0]-pp[0]).powi(2) + (b.pos[1]-pp[1]).powi(2) + (b.pos[2]-pp[2]).powi(2);
+        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for b in order {
+        if u_slot >= SHADOW_CASTER_SLOTS { break; }
+        if !crate::camera::entity_in_view(b.pos, scene.player_pos, r.last_view_proj,
+                                          ENTITY_DRAW_DIST, ENTITY_CULL_MARGIN) { continue; }
+        let archetype = race_to_archetype(&b.race);
+        let (key, slot) = character_model_key(&b.race, b.gender);
+        match r.model_by_key(key, slot) {
+            Some(GpuModel::Skinned(model)) => {
+                if j_slot >= SHADOW_CASTER_SLOTS { continue; }
+                let matrices = match r.anim_states.get(&b.id) {
+                    Some(s) if !model.skin.clips.is_empty() && s.clip_idx < model.skin.clips.len() =>
+                        model.skin.evaluate(s.clip_idx, s.time),
+                    _ => model.skin.bind_pose(),
+                };
+                write_joints(j_slot, &matrices);
+                let target = target_height_for(&b.race, archetype);
+                let height = if model.true_height > 0.001 { model.true_height } else { 1.0 };
+                let dominant_scale = target / height;
+                let visual_scale   = -2.0 * model.feet_offset * dominant_scale;
+                let mat = crate::camera::entity_model_matrix_heading(
+                    b.pos, b.heading, visual_scale, dominant_scale,
+                    [0.0, 0.0], true, 0.0, archetype_correction(archetype));
+                write_model(u_slot, mat);
+                casters.push(Caster::Skinned { model, u_slot, j_slot });
+                u_slot += 1; j_slot += 1;
+            }
+            Some(GpuModel::Static(model)) => {
+                let arch_scale   = archetype_scale(archetype);
+                let visual_scale = 2.0 * model.y_extent * arch_scale;
+                let mat = crate::camera::entity_model_matrix_heading(
+                    b.pos, b.heading, visual_scale, arch_scale,
+                    [model.x_center, model.z_center], true, model.y_bottom, archetype_correction(archetype));
+                write_model(u_slot, mat);
+                casters.push(Caster::Static { model, u_slot });
+                u_slot += 1;
+            }
+            None => {}
+        }
+    }
+
+    // ── Encode the depth pass (always, to clear the map to "lit") ────────────
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("sun_shadow"),
+        color_attachments: &[],
+        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+            view: &r.shadow_map_view,
+            depth_ops: Some(wgpu::Operations {
+                load: wgpu::LoadOp::Clear(1.0),
+                store: wgpu::StoreOp::Store,
+            }),
+            stencil_ops: None,
+        }),
+        timestamp_writes: None, occlusion_query_set: None,
+    });
+
+    // Placed objects (opaque/masked instanced meshes) cast shadows.
+    use eqoxide_assets::RenderMode;
+    let mut inst_bound = false;
+    for mesh in &r.gpu_instanced {
+        if !matches!(mesh.render_mode, RenderMode::Opaque | RenderMode::Masked) { continue; }
+        if !inst_bound {
+            pass.set_pipeline(&r.pipelines.shadow_instanced);
+            pass.set_bind_group(0, &r.light_depth_bg, &[]);
+            inst_bound = true;
+        }
+        pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+        pass.set_vertex_buffer(1, mesh.instance_buf.slice(..));
+        pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..mesh.index_count, 0, 0..mesh.instance_count);
+    }
+
+    // Skinned casters.
+    let mut skinned_bound = false;
+    for c in &casters {
+        if let Caster::Skinned { model, u_slot, j_slot } = c {
+            if !skinned_bound {
+                pass.set_pipeline(&r.pipelines.shadow_skinned);
+                pass.set_bind_group(0, &r.light_depth_bg, &[]);
+                skinned_bound = true;
+            }
+            pass.set_bind_group(1, &r.shadow_uniform_pool[*u_slot].1, &[]);
+            pass.set_bind_group(2, &r.shadow_joint_pool[*j_slot].1, &[]);
+            for mesh in &model.meshes {
+                pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
+        }
+    }
+
+    // Static casters.
+    let mut static_bound = false;
+    for c in &casters {
+        if let Caster::Static { model, u_slot } = c {
+            if !static_bound {
+                pass.set_pipeline(&r.pipelines.shadow_static);
+                pass.set_bind_group(0, &r.light_depth_bg, &[]);
+                static_bound = true;
+            }
+            pass.set_bind_group(1, &r.shadow_uniform_pool[*u_slot].1, &[]);
+            for mesh in &model.meshes {
+                pass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+                pass.set_index_buffer(mesh.index_buf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encode_shadow_pass_has_correct_signature() {
+        let _: fn(
+            &crate::renderer::EqRenderer,
+            &mut wgpu::CommandEncoder,
+            &crate::scene::SceneState,
+            [f32; 3],
+        ) = encode_shadow_pass;
+    }
 
     #[test]
     fn encode_sky_pass_has_correct_signature() {

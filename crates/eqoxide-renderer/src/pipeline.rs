@@ -18,6 +18,13 @@ pub struct Layouts {
     pub joints_bgl:  wgpu::BindGroupLayout,
     /// Time-of-day sky-gradient uniform (eqoxide#561): a single fragment-visible uniform buffer.
     pub sky_bgl:     wgpu::BindGroupLayout,
+    /// Sun shadow map: the light view-proj uniform bound as a VERTEX uniform in the shadow DEPTH
+    /// pass (group 0). Separate from `shadow_sample_bgl` (which the lit shaders read) so each side
+    /// declares only what it needs. (#518)
+    pub shadow_light_bgl: wgpu::BindGroupLayout,
+    /// What the lit zone shaders read to receive shadows (group 2 on the zone pipelines): the light
+    /// view-proj uniform + the shadow depth texture + a comparison sampler. (#518)
+    pub shadow_sample_bgl: wgpu::BindGroupLayout,
 }
 
 pub struct CameraUniform {
@@ -49,6 +56,13 @@ pub struct Pipelines {
     /// depth_compare = LessEqual and depth_write = false so the alpha-blended overlay composites
     /// on top of the already-drawn opaque skin base at the same depth (Luclin two-layer body art).
     pub skinned_overlay: wgpu::RenderPipeline,
+    /// Sun shadow-map DEPTH pipelines (#518) — render casters from the light's POV into the shadow
+    /// map (depth-only, no fragment/color target). One per geometry kind, mirroring the color
+    /// passes: `shadow_static` (static mesh), `shadow_skinned` (skinned), `shadow_instanced`
+    /// (placed objects).
+    pub shadow_static:    wgpu::RenderPipeline,
+    pub shadow_skinned:   wgpu::RenderPipeline,
+    pub shadow_instanced: wgpu::RenderPipeline,
 }
 
 /// Create the three bind group layouts used across all pipelines.
@@ -134,7 +148,56 @@ pub fn build_layouts(device: &wgpu::Device) -> Layouts {
         }],
     });
 
-    Layouts { camera_bgl, texture_bgl, entity_bgl, joints_bgl, sky_bgl }
+    // Sun shadow map (#518). The depth pass binds only the light view-proj (vertex uniform).
+    let shadow_light_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("shadow_light_bgl"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+
+    // What the lit shaders sample: light view-proj (fragment uniform) + depth texture + comparison
+    // sampler. Depth32Float is sampled as a non-filtering depth texture with a comparison sampler.
+    let shadow_sample_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("shadow_sample_bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                count: None,
+            },
+        ],
+    });
+
+    Layouts { camera_bgl, texture_bgl, entity_bgl, joints_bgl, sky_bgl, shadow_light_bgl, shadow_sample_bgl }
 }
 
 /// Create the sky-gradient uniform buffer + bind group (eqoxide#561). Initialized to the daytime
@@ -214,9 +277,10 @@ pub fn build_pipelines(
         label: Some("zone"),
         source: wgpu::ShaderSource::Wgsl(include_str!("shaders/zone.wgsl").into()),
     });
+    // group 2 = shadow sampling (#518): terrain + placed objects receive sun shadows.
     let zone_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("zone_layout"),
-        bind_group_layouts: &[&layouts.camera_bgl, &layouts.texture_bgl],
+        bind_group_layouts: &[&layouts.camera_bgl, &layouts.texture_bgl, &layouts.shadow_sample_bgl],
         push_constant_ranges: &[],
     });
     let zone = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -603,10 +667,107 @@ pub fn build_pipelines(
         multiview: None, cache: None,
     });
 
+    // ── Sun shadow-map depth pipelines (#518) ──────────────────────────────
+    // Depth-only: no fragment stage, no color target. A slope-scaled depth bias in hardware pushes
+    // caster depths away from receivers to fight shadow acne (paired with the small shader-side
+    // epsilon). Casters draw with cull_mode:None to match the color passes (EQ meshes aren't
+    // consistently wound). Vertex buffer layouts reuse the color passes' formats.
+    let shadow_depth = wgpu::DepthStencilState {
+        format: wgpu::TextureFormat::Depth32Float,
+        depth_write_enabled: true,
+        depth_compare: wgpu::CompareFunction::Less,
+        stencil: wgpu::StencilState::default(),
+        bias: wgpu::DepthBiasState { constant: 2, slope_scale: 2.0, clamp: 0.0 },
+    };
+    let shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("shadow"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/shadow.wgsl").into()),
+    });
+
+    // Reuse the color passes' vertex layouts so casters feed the same buffers.
+    let shadow_vbl = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<Vertex>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
+    };
+    let shadow_skinned_vbl = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<SkinnedVertex>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &wgpu::vertex_attr_array![
+            0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Uint32x4, 4 => Float32x4],
+    };
+
+    // Static caster: group 0 = light vp, group 1 = model uniform (entity_bgl).
+    let shadow_static_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("shadow_static_layout"),
+        bind_group_layouts: &[&layouts.shadow_light_bgl, &layouts.entity_bgl],
+        push_constant_ranges: &[],
+    });
+    let shadow_static = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("shadow_static"),
+        layout: Some(&shadow_static_layout),
+        vertex: wgpu::VertexState {
+            module: &shadow_shader, entry_point: "vs_static",
+            buffers: std::slice::from_ref(&shadow_vbl), compilation_options: Default::default(),
+        },
+        fragment: None,
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default()
+        },
+        depth_stencil: Some(shadow_depth.clone()),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None, cache: None,
+    });
+
+    // Skinned caster: adds group 2 = joint palette.
+    let shadow_skinned_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("shadow_skinned_layout"),
+        bind_group_layouts: &[&layouts.shadow_light_bgl, &layouts.entity_bgl, &layouts.joints_bgl],
+        push_constant_ranges: &[],
+    });
+    let shadow_skinned = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("shadow_skinned"),
+        layout: Some(&shadow_skinned_layout),
+        vertex: wgpu::VertexState {
+            module: &shadow_shader, entry_point: "vs_skinned",
+            buffers: std::slice::from_ref(&shadow_skinned_vbl), compilation_options: Default::default(),
+        },
+        fragment: None,
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default()
+        },
+        depth_stencil: Some(shadow_depth.clone()),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None, cache: None,
+    });
+
+    // Instanced caster: group 0 = light vp only; per-instance matrix via the instance vertex buffer.
+    let shadow_instanced_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("shadow_instanced_layout"),
+        bind_group_layouts: &[&layouts.shadow_light_bgl],
+        push_constant_ranges: &[],
+    });
+    let shadow_instanced = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("shadow_instanced"),
+        layout: Some(&shadow_instanced_layout),
+        vertex: wgpu::VertexState {
+            module: &shadow_shader, entry_point: "vs_instanced",
+            buffers: &[shadow_vbl.clone(), instance_vbl.clone()], compilation_options: Default::default(),
+        },
+        fragment: None,
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList, cull_mode: None, ..Default::default()
+        },
+        depth_stencil: Some(shadow_depth.clone()),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None, cache: None,
+    });
+
     Pipelines {
         sky, zone, zone_instanced,
         zone_blend, zone_additive, zone_instanced_blend, zone_instanced_additive,
         billboard, character, skinned, skinned_overlay,
+        shadow_static, shadow_skinned, shadow_instanced,
     }
 }
 
@@ -674,5 +835,25 @@ mod tests {
     #[test]
     fn build_skinned_pipeline_has_correct_signature() {
         let _: fn(&wgpu::Device, wgpu::TextureFormat, &Layouts) -> Pipelines = build_pipelines;
+    }
+
+    #[test]
+    fn layouts_has_shadow_bgls() {
+        // The two shadow bind-group layouts (#518) must exist: one for the depth pass (vertex-side
+        // light matrix), one for the lit shaders (light matrix + depth texture + comparison sampler).
+        fn _check(l: &Layouts) {
+            let _: &wgpu::BindGroupLayout = &l.shadow_light_bgl;
+            let _: &wgpu::BindGroupLayout = &l.shadow_sample_bgl;
+        }
+    }
+
+    #[test]
+    fn pipelines_has_shadow_pipelines() {
+        // All three shadow-map depth pipelines (#518) must be present on the Pipelines struct.
+        fn _check(p: &Pipelines) {
+            let _: &wgpu::RenderPipeline = &p.shadow_static;
+            let _: &wgpu::RenderPipeline = &p.shadow_skinned;
+            let _: &wgpu::RenderPipeline = &p.shadow_instanced;
+        }
     }
 }
