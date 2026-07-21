@@ -850,13 +850,14 @@ dependencies = [
  "eqoxide-http",
  "eqoxide-ipc",
  "eqoxide-nav",
+ "eqoxide-net",
  "eqoxide-protocol",
+ "eqoxide-renderer",
  "eqoxide-telemetry",
  "glam",
  "gltf",
  "image",
  "miniz_oxide",
- "naga",
  "pollster",
  "rand",
  "serde",
@@ -959,10 +960,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "eqoxide-net"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "byteorder",
+ "cbc",
+ "des",
+ "eqoxide-command",
+ "eqoxide-core",
+ "eqoxide-http",
+ "eqoxide-ipc",
+ "eqoxide-nav",
+ "eqoxide-protocol",
+ "eqoxide-telemetry",
+ "miniz_oxide",
+ "rand",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "eqoxide-protocol"
 version = "0.1.0"
 dependencies = [
  "eqoxide-core",
+]
+
+[[package]]
+name = "eqoxide-renderer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "eqoxide-assets",
+ "eqoxide-core",
+ "glam",
+ "gltf",
+ "image",
+ "naga",
+ "serde_json",
+ "tracing",
+ "wgpu",
 ]
 
 [[package]]

@@ -2,7 +2,7 @@
 //! pose/position, recent messages, target info, …). Copied from the network-owned `GameState` once
 //! per frame so the render loop never blocks on or shares locks with the EQ network thread.
 
-use crate::game_state::{GameState, LogEntry};
+use eqoxide_core::game_state::{GameState, LogEntry};
 
 /// How long a one-shot combat swing (OP_Animation) plays before reverting to idle/walk. ~one swing.
 pub const COMBAT_SWING_WINDOW: std::time::Duration = std::time::Duration::from_millis(600);
@@ -88,18 +88,18 @@ pub struct SceneState {
     pub messages: Vec<LogEntry>,
     /// Clickable NPC-dialogue choices (saylinks) from the most recent NPC message, for the HUD's
     /// clickable dialogue (#120).
-    pub dialogue_choices: Vec<crate::game_state::DialogueChoice>,
+    pub dialogue_choices: Vec<eqoxide_core::game_state::DialogueChoice>,
     /// Active native Task-system tasks (from OP_TaskDescription/OP_TaskActivity), sorted by the
     /// server's journal display order, for the Task Window (#144).
-    pub tasks: Vec<crate::game_state::ActiveTask>,
+    pub tasks: Vec<eqoxide_core::game_state::ActiveTask>,
     /// Completed-task history (from OP_CompletedTasks), for the Task Window's history tab (#144).
-    pub completed_tasks: Vec<crate::game_state::CompletedTaskEntry>,
+    pub completed_tasks: Vec<eqoxide_core::game_state::CompletedTaskEntry>,
     /// Item material IDs for each equipment slot (0..9), from the player profile.
     pub player_equipment: [u32; 9],
     /// RGB tint for each equipment slot (0..9), from the player profile.
     pub player_equipment_tint: [[u8; 3]; 9],
     /// Player inventory + equipment items (for the inventory UI window).
-    pub inventory: Vec<crate::game_state::InvItem>,
+    pub inventory: Vec<eqoxide_core::game_state::InvItem>,
     /// Equipped weapon held-model ids (IDFile, e.g. "IT10649"), for rendering weapons in hand.
     /// Empty = nothing equipped in that slot. Primary = worn slot 13, secondary = slot 14.
     pub primary_weapon_idfile: String,
@@ -107,7 +107,7 @@ pub struct SceneState {
     /// Memorized spell gem IDs (9 slots); 0xFFFF_FFFF = empty slot.
     pub mem_spells: [u32; 9],
     /// Active cast in progress (Some) or idle (None).
-    pub casting: Option<crate::game_state::CastState>,
+    pub casting: Option<eqoxide_core::game_state::CastState>,
     /// True when the player is sitting.
     pub sitting: bool,
     /// True when auto-attack is enabled.
@@ -117,9 +117,9 @@ pub struct SceneState {
     /// `Some(merchant_entity_id)` while a merchant window is open; drives the HUD merchant window.
     pub merchant_open: Option<u32>,
     /// Items the open merchant offers (for the merchant window's buy list).
-    pub merchant_items: Vec<crate::game_state::MerchantItem>,
+    pub merchant_items: Vec<eqoxide_core::game_state::MerchantItem>,
     /// Current group roster (empty = not grouped), for the always-on roster panel.
-    pub group_members: Vec<crate::game_state::GroupMember>,
+    pub group_members: Vec<eqoxide_core::game_state::GroupMember>,
     /// Current group leader's name ("" if unknown/not grouped).
     pub group_leader: String,
     // ── UI-overhaul additions (#162) ──
@@ -128,7 +128,7 @@ pub struct SceneState {
     pub max_hp: i32,
     pub cur_mana: i32,
     pub max_mana: i32,
-    /// Player skill values indexed by skill id (see `crate::skills`), from the profile.
+    /// Player skill values indexed by skill id (see `eqoxide_core::skills`), from the profile.
     pub player_skills: Vec<u32>,
     /// `Some(trainer_entity_id)` while a GM-trainer session is open.
     pub trainer_open: Option<u32>,
@@ -139,7 +139,7 @@ pub struct SceneState {
     /// Pending group invite from this player name (accept/decline dialog).
     pub pending_invite: Option<String>,
     /// Tasks offered by an open task-select window.
-    pub task_offers: Vec<crate::game_state::TaskOffer>,
+    pub task_offers: Vec<eqoxide_core::game_state::TaskOffer>,
     /// True while the auto-loot session is working a corpse (loot window).
     pub loot_active: bool,
     pub player_dead: bool,
@@ -148,7 +148,7 @@ pub struct SceneState {
     pub zone_id: u16,
     /// Distance fog for the current zone (eqoxide#517), `None` = no fog (respect the zone's
     /// actual OP_NewZone values — see `GameState::zone_fog`).
-    pub zone_fog: Option<crate::game_state::ZoneFog>,
+    pub zone_fog: Option<eqoxide_core::game_state::ZoneFog>,
 }
 
 impl SceneState {
@@ -272,7 +272,7 @@ impl SceneState {
                 let d_east  = gs.player_x - e.x;
                 let d_north = gs.player_y - e.y;
                 if d_east != 0.0 || d_north != 0.0 {
-                    crate::coord::eq_heading(d_east, d_north)
+                    eqoxide_core::coord::eq_heading(d_east, d_north)
                 } else {
                     e.heading
                 }
@@ -353,7 +353,7 @@ impl SceneState {
             dialogue_choices: gs.dialogue_choices.clone(),
             tasks: {
                 let mut t: Vec<_> = gs.tasks.values()
-                    .filter(|t| t.status == crate::game_state::TaskStatus::Active)
+                    .filter(|t| t.status == eqoxide_core::game_state::TaskStatus::Active)
                     .cloned().collect();
                 t.sort_by_key(|t| t.sequence_number);
                 t
@@ -380,7 +380,7 @@ impl SceneState {
             merchant_items: gs.merchant_items.clone(),
             // Override the OP_GroupUpdateB placeholder level (70/65) with the real level resolved
             // from the profile / entity list, so the HUD roster shows true levels. (eqoxide#104)
-            group_members: gs.group_members.iter().map(|m| crate::game_state::GroupMember {
+            group_members: gs.group_members.iter().map(|m| eqoxide_core::game_state::GroupMember {
                 level: gs.group_member_level(&m.name), ..m.clone()
             }).collect(),
             group_leader: gs.group_leader.clone(),
@@ -409,7 +409,7 @@ impl SceneState {
 #[cfg(test)]
 mod tests {
     use super::SceneState;
-    use crate::game_state::{Entity, GameState};
+    use eqoxide_core::game_state::{Entity, GameState};
 
     fn sample_state() -> GameState {
         let mut gs = GameState::new();
@@ -635,7 +635,7 @@ mod tests {
 
     #[test]
     fn from_game_state_copies_group_roster() {
-        use crate::game_state::GroupMember;
+        use eqoxide_core::game_state::GroupMember;
         let mut gs = sample_state();
         gs.player_name = "Aldric".into();
         gs.group_leader = "Aldric".into();

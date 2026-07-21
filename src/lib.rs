@@ -63,22 +63,25 @@ pub use eqoxide_command as command_state;
 // `tests/`/`src/bin/`, since they exercise only crash-module internals and need no app-crate code.
 pub use eqoxide_crash as crash;
 
-pub mod anim;
+// The GPU/render core (the View's rendering layer — wgpu device/pipelines/passes, vertex+uniform
+// structs, zone/character/billboard draw code, model+animation building, view/projection camera
+// math, and the /frame PNG encoder) now lives in the `eqoxide-renderer` workspace crate (#544 Step
+// 2n). It is a clean LOWER layer with ZERO up-refs into this app loop; it depends only on
+// `eqoxide-core`/`eqoxide-assets` + the GPU/math externals (wgpu/glam/bytemuck/gltf/image) — never
+// on eq_net/http/command/nav/ipc/app/movement/ui. Re-export its modules as this crate's own so every
+// existing `crate::renderer::…` / `crate::scene::…` / `crate::gpu::…` etc. call site (app.rs, ui/*,
+// hud.rs, model.rs, main.rs, the render_model bin) keeps resolving unchanged. The render-side WGSL
+// validation test moved WITH the shaders into that crate's `tests/fog_shader.rs`.
+pub use eqoxide_renderer::{
+    anim, billboard, camera, frame_capture, gpu, head, models, pass, pipeline, renderer, scene,
+};
+
 pub mod app;
 pub mod asset_sync;
-pub mod billboard;
-pub mod camera;
 pub mod debug_zone;
-pub mod gpu;
-pub mod head;
 pub mod logging;
-pub mod models;
 pub mod movement;
 pub mod profiling;
-pub mod pass;
-pub mod pipeline;
-pub mod renderer;
-pub mod scene;
 
 // The agent-facing HTTP/REST API now lives in the `eqoxide-http` workspace crate (#544 Step 2l),
 // depending only on the lower structural crates (`eqoxide-core`/`ipc`/`command`/`nav`/`telemetry`/
@@ -104,9 +107,11 @@ pub use eqoxide_http as http;
 // resolving unchanged.
 pub use eqoxide_net as eq_net;
 
-// Modules only needed by the full client binary.
+// Modules only needed by the full client binary. `camera_state` (orbit/follow input state, driven by
+// mouse/scroll in the app loop) and `profiling` (frame-timing instrumentation) stay in this app crate:
+// each depends only on `eqoxide-ipc` (its inter-thread contract types) + std, the render core does not
+// reference either, and moving them would push an ipc dep onto the renderer that its GPU code never uses.
 pub mod camera_state;
-pub mod frame_capture;
 pub mod hud;
 pub mod model;
 pub mod ui;

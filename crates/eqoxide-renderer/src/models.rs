@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use std::path::Path;
-use crate::assets::{MeshData, TextureData};
+use eqoxide_assets::{MeshData, TextureData};
 use crate::anim::{AnimClip, GroundProbe, JointChannel, JointProperty, SkinData};
 
 /// A head primitive belonging to a Luclin head-region variant. RoF2 swaps the head regions
@@ -413,7 +413,7 @@ impl ModelAsset {
                 meshes.push(MeshData {
                     positions, normals, uvs, indices, texture_name, base_color,
                     center: [0.0, 0.0, 0.0],
-                    render_mode: crate::assets::RenderMode::Opaque, anim: None,
+                    render_mode: eqoxide_assets::RenderMode::Opaque, anim: None,
                 });
                 skin_meshes.push(sd_opt);
                 skinned_mesh_scales.push(this_mesh_scale);
@@ -1202,7 +1202,7 @@ mod tests {
     /// table (Skeleton/Zombie/Wasp/Rat/Gnoll/Fish/Kobold were mapped to wrong creatures).
     #[test]
     fn npc_race_ids_map_to_sensible_archetypes() {
-        use crate::eq_net::protocol::eq_race_to_code;
+        use eqoxide_core::race_class::eq_race_to_code;
         let arch = |id: u32| race_to_archetype(eq_race_to_code(id));
         assert_eq!(arch(60), "skeleton");  // Skeleton (was fish)
         assert_eq!(arch(70), "zombie");    // Zombie (was bear)

@@ -2,7 +2,7 @@
 //! character models, and textures into wgpu buffers/bind-groups and holds per-entity animation
 //! state. The actual per-frame draw calls live in `pass.rs`; pipelines/layouts in `pipeline.rs`.
 
-use crate::assets::ZoneAssets;
+use eqoxide_assets::ZoneAssets;
 use crate::gpu::{
     Vertex, GpuMesh, GpuModel, GpuStaticModel, GpuSkinnedModel, GpuSkinnedMesh, SkinnedVertex,
     upload_textures, create_depth_texture, build_fallback_texture_bg,
@@ -43,7 +43,7 @@ pub const JOINT_BUF_SLOTS: usize = 512;
 /// gets DRAWN also gets its clock advanced — otherwise a drawn entity would freeze. The small margin
 /// beyond the draw distance keeps a ring of just-out-of-range entities warm so panning/approach never
 /// reveals a frozen pose.
-pub(crate) const ANIM_ADVANCE_DIST: f32 = crate::pass::ENTITY_DRAW_DIST + 48.0;
+pub const ANIM_ADVANCE_DIST: f32 = crate::pass::ENTITY_DRAW_DIST + 48.0;
 /// Held-item uniform slots: 0-1 = player primary/secondary, 2.. = entity held items
 /// (up to two per drawn skinned entity, nearest-first; overflow entities skip weapons).
 pub const WEAPON_UNIFORM_SLOTS: usize = 512;
@@ -96,7 +96,7 @@ fn build_unit_cube(device: &wgpu::Device) -> GpuMesh {
     GpuMesh {
         vertex_buf, index_buf, index_count: indices.len() as u32,
         texture_idx: None, base_color: [0.8, 0.2, 0.2, 1.0], // reddish so it's obviously a marker
-        render_mode: crate::assets::RenderMode::Opaque, anim: None,
+        render_mode: eqoxide_assets::RenderMode::Opaque, anim: None,
     }
 }
 
@@ -138,7 +138,7 @@ pub struct EqRenderer {
     pub last_cam_pos:        [f32; 3],
     pub depth_view:          wgpu::TextureView,
     /// CPU-side zone mesh data retained for terrain height queries.
-    pub zone_assets:         Option<crate::assets::ZoneAssets>,
+    pub zone_assets:         Option<eqoxide_assets::ZoneAssets>,
     /// Pre-allocated entity uniform buffers (reused every frame via write_buffer).
     pub entity_uniform_pool: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
     /// Pre-allocated joint matrix buffers (reused every frame via write_buffer).
@@ -157,9 +157,9 @@ pub struct EqRenderer {
     /// clobbers that mesh's transform (a body part drawn at the weapon matrix).
     pub weapon_uniform_pool: Vec<(wgpu::Buffer, wgpu::BindGroup)>,
     /// Pre-decoded weapon meshes by UPPERCASE IDFile key, loaded once from weapons.glb.
-    pub weapon_lib: std::collections::HashMap<String, Vec<crate::assets::MeshData>>,
+    pub weapon_lib: std::collections::HashMap<String, Vec<eqoxide_assets::MeshData>>,
     /// CPU-decoded textures for all weapons, loaded once from weapons.glb.
-    pub weapon_tex: Vec<crate::assets::TextureData>,
+    pub weapon_tex: Vec<eqoxide_assets::TextureData>,
     /// Door object models, keyed by UPPERCASE base name (e.g. "DOOR1"). Rebuilt per zone load.
     pub door_models: std::collections::HashMap<String, crate::gpu::GpuWeapon>,
     /// Shared decoded textures for ALL door models in the current zone. A door mesh's
@@ -335,9 +335,9 @@ impl EqRenderer {
             // (texture_idx, render_mode) → (accumulated vertices, accumulated indices).
             // render_mode is part of the key so each draw call has a single blend mode
             // (opaque/masked/blend/additive) and routes to the matching pipeline.
-            let mut groups: HashMap<(Option<usize>, crate::assets::RenderMode), (Vec<Vertex>, Vec<u32>)> = HashMap::new();
+            let mut groups: HashMap<(Option<usize>, eqoxide_assets::RenderMode), (Vec<Vertex>, Vec<u32>)> = HashMap::new();
             // Resolved animated-texture frames per group (same texture ⇒ same anim).
-            let mut anim_by_group: HashMap<(Option<usize>, crate::assets::RenderMode), Option<(u32, Vec<usize>)>> = HashMap::new();
+            let mut anim_by_group: HashMap<(Option<usize>, eqoxide_assets::RenderMode), Option<(u32, Vec<usize>)>> = HashMap::new();
 
             // Terrain only — placed objects now go to the GPU-instanced path below
             // (collision still uses terrain + expand_objects, unchanged).
@@ -346,7 +346,7 @@ impl EqRenderer {
                 if mesh.positions.is_empty() || mesh.indices.is_empty() { continue; }
                 // The dedicated `__collision__` mesh is invisible collision geometry, not
                 // drawable terrain — skip uploading it (it has no real texture).
-                if mesh.texture_name.as_deref() == Some(crate::assets::COLLISION_MESH_TAG) { continue; }
+                if mesh.texture_name.as_deref() == Some(eqoxide_assets::COLLISION_MESH_TAG) { continue; }
 
                 let texture_idx = mesh.texture_name.as_ref()
                     .and_then(|n| self.texture_names.iter().position(|t| t == n));
@@ -485,7 +485,7 @@ impl EqRenderer {
 
         let weapons_glb = models_dir.join("weapons.glb");
         if weapons_glb.exists() {
-            match crate::assets::ZoneAssets::object_models_from_glb(&weapons_glb) {
+            match eqoxide_assets::ZoneAssets::object_models_from_glb(&weapons_glb) {
                 Ok((m, t)) => { self.weapon_tex = t; self.weapon_lib = m; }
                 Err(e) => tracing::warn!("weapons: load {} failed: {}", weapons_glb.display(), e),
             }
@@ -638,7 +638,7 @@ impl EqRenderer {
                 meshes.push(GpuMesh { vertex_buf: vbuf, index_buf: ibuf,
                            index_count: mesh.indices.len() as u32, texture_idx,
                            base_color: mesh.base_color,
-                           render_mode: crate::assets::RenderMode::Opaque, anim: None });
+                           render_mode: eqoxide_assets::RenderMode::Opaque, anim: None });
                 static_slots.push(slot);
                 static_head_parts.push(hp);
                 static_head_hidden.push(dh);
@@ -679,7 +679,7 @@ impl EqRenderer {
         let img = image::load_from_memory(&bytes).ok()?;
         let rgba = img.to_rgba8();
         let (width, height) = rgba.dimensions();
-        let tex = crate::assets::TextureData {
+        let tex = eqoxide_assets::TextureData {
             name: base_name.to_lowercase(),
             width,
             height,
@@ -707,7 +707,7 @@ impl EqRenderer {
         let referenced: std::collections::HashSet<String> = weapon_meshes.iter()
             .filter_map(|m| m.texture_name.as_ref().map(|n| n.to_lowercase()))
             .collect();
-        let want_tex: Vec<crate::assets::TextureData> = self.weapon_tex.iter()
+        let want_tex: Vec<eqoxide_assets::TextureData> = self.weapon_tex.iter()
             .filter(|t| referenced.contains(&t.name.to_lowercase()))
             .cloned()
             .collect();
@@ -741,7 +741,7 @@ impl EqRenderer {
             meshes.push(crate::gpu::GpuMesh {
                 vertex_buf, index_buf, index_count: m.indices.len() as u32,
                 texture_idx, base_color: [1.0; 4],
-                render_mode: crate::assets::RenderMode::Opaque, anim: None });
+                render_mode: eqoxide_assets::RenderMode::Opaque, anim: None });
         }
         tracing::info!("weapon: cached '{}' — {} gpu meshes, {} textures", key, meshes.len(), bgs.len());
         self.weapon_cache.insert(key, Some(crate::gpu::GpuWeapon { meshes, texture_bind_groups: bgs }));
@@ -814,7 +814,7 @@ impl EqRenderer {
         self.door_bounds.clear();
         self.warned_missing_doors.clear();
 
-        let (models, textures) = match crate::assets::ZoneAssets::object_models_from_glb(doors_glb) {
+        let (models, textures) = match eqoxide_assets::ZoneAssets::object_models_from_glb(doors_glb) {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!("doors: load {} failed ({}); fallback boxes", doors_glb.display(), e);
@@ -860,7 +860,7 @@ impl EqRenderer {
                 gpu_meshes.push(GpuMesh {
                     vertex_buf, index_buf, index_count: m.indices.len() as u32,
                     texture_idx, base_color: m.base_color,
-                    render_mode: crate::assets::RenderMode::Opaque, anim: None });
+                    render_mode: eqoxide_assets::RenderMode::Opaque, anim: None });
             }
             if gpu_meshes.is_empty() { continue; }
             self.door_bounds.insert(name.clone(), (bmin, bmax));

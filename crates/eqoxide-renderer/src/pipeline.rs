@@ -3,6 +3,14 @@
 
 use crate::gpu::Vertex;
 
+// Raw WGSL source for the character + skin-probe shaders, exposed so the `render_model` dev bin (in
+// the app crate) can build its own probe pipelines from the SAME shader text the renderer uses,
+// instead of reaching through the filesystem into this crate's private `shaders/` dir now that the
+// shaders live here (#544 Step 2n). `CHARACTER_WGSL` is also the source `character_pipeline` binds
+// below; `SKIN_PROBE_WGSL` is used only by the dev bin's GPU-skinning readback probe.
+pub const CHARACTER_WGSL:  &str = include_str!("shaders/character.wgsl");
+pub const SKIN_PROBE_WGSL: &str = include_str!("shaders/skin_probe.wgsl");
+
 pub struct Layouts {
     pub camera_bgl:  wgpu::BindGroupLayout,
     pub texture_bgl: wgpu::BindGroupLayout,

@@ -1,0 +1,29 @@
+[package]
+name = "eqoxide-renderer"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "eqoxide_renderer"
+path = "src/lib.rs"
+
+[dependencies]
+# eqoxide-renderer is the GPU/render core (the View's rendering layer, #544 Step 2n). It is a clean
+# LOWER layer: app.rs and ui/* depend UP on it, and it has ZERO up-refs into the app loop
+# (app/main/movement/model/ui/hud/debug_zone). Its downward deps are the already-extracted lower
+# crates plus the GPU/math externals — never eq_net/http/command/nav/ipc/app/movement.
+eqoxide-core   = { path = "../eqoxide-core" }   # game_state/coord/skills/race_class
+eqoxide-assets = { path = "../eqoxide-assets" } # MeshData/TextureData/ZoneAssets/RenderMode
+wgpu = "22"                                                    # device/queue/pipelines/passes
+glam = "0.29"                                                  # view/projection + skinning math
+bytemuck = { version = "1", features = ["derive"] }           # Pod/Zeroable vertex+uniform structs
+gltf = { version = "1", features = ["import", "extras"] }     # skinned-model GLB loading (models.rs)
+image = { version = "0.25", default-features = false, features = ["bmp", "png", "dds", "tga"] } # texture decode + /frame PNG encode
+serde_json = "1"                                              # gltf material `extras` JSON (models.rs)
+anyhow = "1"                                                  # model-load error context (models.rs)
+tracing = "0.1"                                               # info!/warn! in scene/renderer/models
+
+[dev-dependencies]
+# tests/fog_shader.rs validates the zone shaders' WGSL without a GPU. Pinned to the exact version
+# wgpu 22 pulls in transitively (see Cargo.lock) so it doesn't add a second naga to the graph.
+naga = { version = "=22.1.0", features = ["wgsl-in"] }

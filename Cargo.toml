@@ -26,6 +26,7 @@ eqoxide-protocol = { path = "crates/eqoxide-protocol" }
 eqoxide-telemetry = { path = "crates/eqoxide-telemetry" }
 eqoxide-http = { path = "crates/eqoxide-http" }
 eqoxide-net = { path = "crates/eqoxide-net" }
+eqoxide-renderer = { path = "crates/eqoxide-renderer" }
 anyhow = "1"
 arc-swap = "1"
 image = { version = "0.25", default-features = false, features = ["bmp", "png", "dds", "tga"] }
@@ -74,14 +75,10 @@ eqoxide-telemetry = { path = "crates/eqoxide-telemetry", features = ["test-fixtu
 # build an `HttpState` and hit the observe router while calling this crate's `eq_net::packet_handler`
 # apply fns (the app crate sits ABOVE eqoxide-http, so those tests can't live inside it) (#544 Step 2l).
 eqoxide-http = { path = "crates/eqoxide-http", features = ["test-fixtures"] }
-# Pinned to the exact version wgpu 22 already pulls in transitively (see Cargo.lock) so this
-# doesn't add a second naga to the dependency graph. Used only to parse+validate the zone
-# shaders' WGSL source in tests/fog_shader.rs — no GPU device required.
-naga = { version = "=22.1.0", features = ["wgsl-in"] }
 # `test-util` (not in tokio's `full`) enables `#[tokio::test(start_paused = true)]` so the A3
 # merchant-buy timeout test (#448) exercises the real 4s elapse in virtual time — instantly.
 tokio = { version = "1", features = ["full", "test-util"] }
 tower = "0.5"
 
 [workspace]
-members = ["tools", "crates/eqoxide-core", "crates/eqoxide-ipc", "crates/eqoxide-assets", "crates/eqoxide-nav", "crates/eqoxide-command", "crates/eqoxide-crash", "crates/eqoxide-protocol", "crates/eqoxide-telemetry", "crates/eqoxide-http", "crates/eqoxide-net"]
+members = ["tools", "crates/eqoxide-core", "crates/eqoxide-ipc", "crates/eqoxide-assets", "crates/eqoxide-nav", "crates/eqoxide-command", "crates/eqoxide-crash", "crates/eqoxide-protocol", "crates/eqoxide-telemetry", "crates/eqoxide-http", "crates/eqoxide-net", "crates/eqoxide-renderer"]
