@@ -28,8 +28,10 @@ OPTIONS:
                            Omit to use the default ~/.config/eqoxide/config.yaml.
     --testzone             Run the renderer offline (no server) for asset/zone debugging.
     --profile              Enable the per-phase frame-timing HUD overlay.
-    --nav-debug            Show the navmesh/pathfinding debug overlay at startup (collision floor
-                           grid + live A* path to the current goal). Toggle at runtime with F11.
+    --nav-debug            Show the nav diagnostics overlay at startup (#608): a depth-tested 3D
+                           pass drawing the snapshot navigation PUBLISHES — the planner's own
+                           per-edge accept/reject trace, the walker's committed route, clearance
+                           spokes, pads. Same data as GET /v1/observe/nav_debug. Toggle with F11.
     --api-port <N>         Bind the agent HTTP API to exactly TCP port N (1-65535), instead of
                            scanning upward from the config base port. The launch's API is
                            disabled if N is already in use. Use a port you've reserved via a
