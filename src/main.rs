@@ -156,7 +156,13 @@ fn main() {
     tracing::info!("renderer: loading login config from {}", login_cfg_path.display());
 
     let login_cfg = config::LoginConfig::load(&login_cfg_path);
-    let app_cfg   = config::AppConfig::load();
+    // Renderer/HTTP settings honor --config too (#597): the per-character file is merged OVER the
+    // global ~/.config/eqoxide/config.yaml key by key, so `renderer: { asset_server_url: ... }` in a
+    // per-character config actually takes effect instead of being silently discarded. `disclose()`
+    // logs the effective values and the file each came from — a wrong asset server must be visible
+    // in the log, not inferred later from a world with no geometry.
+    let app_cfg   = config::AppConfig::load(&login_cfg_path);
+    app_cfg.disclose();
 
     // Game data (string table, spell DB, zone maps + water regions) is delivered by the asset
     // server's "gamedata" set and synced into the local cache — NOT read from ~/eq_assets. This

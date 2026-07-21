@@ -549,7 +549,7 @@ mod tests {
                 finish_zone_load(&col, &st, "freporte", Some(floor_collision()), 9, None);
                 let mut player_zone = "freporte".to_string();
 
-                let mut apply_net    = |pz: &mut String| *pz = "qeynos".to_string();
+                let apply_net    = |pz: &mut String| *pz = "qeynos".to_string();
                 let apply_render = |st: &ZoneAssetStateShared, col: &crate::collision::SharedCollision| {
                     begin_zone_load(col, st, "qeynos", "loading…");
                 };
