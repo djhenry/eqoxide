@@ -387,10 +387,12 @@ mod tests {
     /// measure themselves.
     ///
     /// This does NOT cover the #613 bug (growth across a client *restart*,
-    /// where the persisted "content size" silently included the title
-    /// strip) — that needs a fresh `egui::Context` and a fresh persisted
-    /// layout each cycle to simulate a real restart, which this in-session
-    /// test never does. See `chrome::tests::round_trip_size_is_idempotent_across_reloads`.
+    /// driven by egui's own per-window/per-panel state in `ctx.data`, which
+    /// doesn't survive a real restart any more than it survives this
+    /// in-session test's persistent `egui::Context`) — that needs a fresh
+    /// `egui::Context` and a fresh persisted layout each cycle to simulate a
+    /// real restart, which this in-session test never does. See
+    /// `map_window_size_is_idempotent_across_reloads` below.
     #[test]
     fn window_sizes_do_not_creep() {
         let mut ui = UiState::new("__uitest_growth__", None);
@@ -451,6 +453,112 @@ mod tests {
         let _ = std::fs::remove_file(
             eqoxide_core::config::config_dir().join("ui_layout___uitest_growth__.json"),
         );
+    }
+
+    /// #613 regression: save -> load -> save (simulating a client restart,
+    /// including a FRESH `egui::Context` and a FRESH `persist::Layout`
+    /// loaded from an isolated temp file each cycle — NOT the real
+    /// `~/.config/eqoxide` dir; egui's own per-window Resize memory lives in
+    /// `ctx.data`, which does not survive a real restart any more than our
+    /// own layout file would if we didn't write it) must reproduce the
+    /// EXACT same stored size, not merely "close to" it.
+    ///
+    /// This drives the REAL `windows/map.rs` body — via `windows::draw`, the
+    /// exact dispatch `UiState::draw_all` uses in production — rather than a
+    /// synthetic stand-in. An earlier version of this test used a synthetic
+    /// `self_filling_body` fixture (a bottom panel + a central canvas
+    /// allocating `ui.available_size()`) modeled on map.rs's own pattern,
+    /// but it measured ZERO drift even under the ORIGINAL pre-fix bug — so
+    /// it silently could not detect #613 despite looking like a faithful
+    /// reproduction. Driving the actual production body through the actual
+    /// production dispatch function closes that gap: there is no fixture
+    /// left to get wrong.
+    ///
+    /// The bug itself has NOTHING to do with the title strip or with
+    /// `chrome::eq_window`'s own size bookkeeping (an earlier fix attempt
+    /// assumed it did, and turned out to be algebraically vacuous — see
+    /// `windows/map.rs`'s `MAP_FOOTER_HEIGHT` doc comment for the real
+    /// mechanism and why the fix lives there instead).
+    #[test]
+    fn map_window_size_is_idempotent_across_reloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ui_layout_test.json");
+        let map_def = REGISTRY.iter().find(|d| d.id == registry::MAP).expect("map window registered");
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 720.0));
+        let raw = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+
+        let spells = eqoxide_core::spells::SpellDb::empty();
+        let acts = actions();
+        let mut scene = SceneState::default();
+        scene.player_name = "Testy".into();
+        scene.zone = "qeytoqrg".into();
+        scene.player_pos = [100.0, 200.0, 0.0];
+
+        // Seed a baseline "already used once" layout — a brand-new window
+        // (no stored size at all) isn't where this bug lives; it only bites
+        // once a size has actually been persisted at least once, exactly
+        // like the owner's real files.
+        {
+            let mut sys = WinSys::new(persist::Layout::from_path(path.clone()));
+            sys.layout.set_geometry(map_def.id, [40.0, 40.0], Some([240.0, 261.0]));
+            sys.layout.save_now();
+        }
+
+        let window_list: Vec<(&'static str, &'static str, bool, Option<egui::Key>)> = Vec::new();
+        let mut sizes = Vec::new();
+        // 25 simulated restarts — comfortably past the coordinator's ≥20
+        // requirement (and matching the reviewer's own validation count).
+        for _ in 0..25 {
+            // Fresh Layout (reload from disk), fresh egui::Context (simulated
+            // restart), and fresh runtime UI state (icons/chat/zoom) each
+            // cycle — nothing survives a restart except the persisted file.
+            let mut sys = WinSys::new(persist::Layout::from_path(path.clone()));
+            let ctx = egui::Context::default();
+            let mut icons = icons::Icons::new(None);
+            let mut chat = ChatState::default();
+            let mut minimap_zoom = 1.0f32;
+            // A few settle frames per "session": with the `MAP_FOOTER_HEIGHT`
+            // fix in `windows/map.rs`, the map body's measured size already
+            // matches what it was given on frame 0 (no settling actually
+            // needed any more) — kept at 5 anyway as margin, so this test
+            // stays a faithful "several real frames elapse before a save"
+            // simulation rather than a single-frame best case.
+            for _ in 0..5 {
+                let mut cmds = Vec::new();
+                let _ = ctx.run(raw.clone(), |ctx| {
+                    let mut cx = UiCtx {
+                        scene: &scene,
+                        spells: &spells,
+                        icons: &mut icons,
+                        acts: &acts,
+                        chat: &mut chat,
+                        cmds: &mut cmds,
+                        locked: false,
+                        ui_scale: 1.0,
+                        fades: false,
+                        window_list: &window_list,
+                        zone_min: [0.0, 0.0],
+                        zone_max: [100.0, 100.0],
+                        zone_map: None,
+                        minimap_zoom: &mut minimap_zoom,
+                        fps: 60.0,
+                    };
+                    chrome::eq_window(ctx, &mut sys, map_def, screen, |ui| {
+                        windows::draw(registry::MAP, ui, &mut cx)
+                    });
+                });
+            }
+            sys.layout.save_now();
+            let size = sys.layout.win(map_def.id).and_then(|w| w.size).expect("size not persisted");
+            sizes.push(size);
+        }
+
+        for pair in sizes.windows(2) {
+            assert_eq!(
+                pair[0], pair[1],
+                "map window's persisted size drifted across a reload cycle — full history: {sizes:?}"
+            );
+        }
     }
 
     #[test]

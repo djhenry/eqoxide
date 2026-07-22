@@ -9,6 +9,32 @@ use egui::{Color32, Pos2, Stroke, Vec2};
 const ZOOM_MIN: f32 = 0.5;
 const ZOOM_MAX: f32 = 8.0;
 
+/// Footer height: two content rows (zoom slider, zone/position) plus the 3px
+/// top inner margin below, matching this footer's actual layout.
+///
+/// `TopBottomPanel`'s built-in cold-start height guess
+/// (`interact_size.y + frame.inner_margin.sum().y`, egui 0.29.1
+/// `containers/panel.rs`) assumes a SINGLE content row. This footer has two,
+/// so on every fresh `egui::Context` (i.e. every client restart) the guess
+/// undershoots the true content height, the panel's measured rect overflows
+/// past the resizable window's given size, and the enclosing `Window`'s
+/// auto-grow-to-fit-content ratchet (`egui::containers::resize::State`,
+/// which never shrinks) permanently bakes that overflow into the window's
+/// size for the rest of the session — this is the root cause of #613
+/// ("resizable windows grow ~21px taller per reload").
+///
+/// A `.default_height()` hint is not enough: it only seeds the FIRST cold
+/// frame's guess, but the panel's own measured rect from that first frame
+/// then becomes the seed for the second frame regardless (egui persists
+/// `PanelState` in `ctx.data`, in-memory only, so this repeats every
+/// restart) — and empirically this footer's own first-frame content
+/// measurement (37px) still undershoots its steady-state value (42px) by
+/// itself, cascading a second, smaller overflow. `.exact_height()` sidesteps
+/// both effects: it pins the panel to exactly this height on every frame
+/// (not just the cold one), so there is never anything for the window to
+/// auto-grow into, on the first frame of any session or any later one.
+const MAP_FOOTER_HEIGHT: f32 = 42.0;
+
 pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     let s = cx.scene;
 
@@ -19,6 +45,7 @@ pub fn draw(ui: &mut egui::Ui, cx: &mut UiCtx) {
     // window-growth feedback loop).
     egui::TopBottomPanel::bottom(ui.id().with("map_footer"))
         .frame(egui::Frame::none().inner_margin(egui::Margin { top: 3.0, ..Default::default() }))
+        .exact_height(MAP_FOOTER_HEIGHT)
         .show_separator_line(false)
         .show_inside(ui, |ui| {
             ui.horizontal(|ui| {
