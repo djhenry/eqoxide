@@ -645,23 +645,11 @@ impl ActionLoop {
     /// Copy all entity positions from `gs` into the shared entity map
     /// (used by the HTTP /entities endpoint and /goto by-name lookup).
     pub fn sync_entities(&self, gs: &GameState) {
-        let mut map = self.world.entity_positions.lock().unwrap();
-        let mut ids = self.world.entity_ids.lock().unwrap();
-        // #643: pose/gait rides the SAME full-replace as the roster, so it shares the roster's
-        // lifetime exactly — an entity can never keep a pose after it has left `entity_positions`.
-        let mut poses = self.world.entity_poses.lock().unwrap();
-        // Full replace: clear stale entries so positions reflect the current zone only.
-        map.clear();
-        ids.clear();
-        poses.clear();
-        for (&id, e) in &gs.world.entities {
-            map.insert(e.name.clone(), (e.x, e.y, e.z));
-            ids.insert(e.name.clone(), id);
-            poses.insert(e.name.clone(), eqoxide_ipc::EntityPoseView {
-                pose: e.pose.label(),
-                gait: e.gait.map(|g| g.raw()),
-            });
-        }
+        // #643: positions, ids AND pose/gait are published together by `WorldSlots::publish_entities`
+        // — the single roster writer, which owns the "all three maps always agree" invariant and the
+        // canonical lock order. Do NOT hand-roll the three inserts here again: that is exactly how
+        // the login-path seed silently stopped publishing poses. See that method's doc comment.
+        self.world.publish_entities(&gs.world.entities);
     }
 
     /// Publish the native Task-system quest log from `gs` into the shared slot (GET /quests/log).

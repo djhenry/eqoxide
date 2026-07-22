@@ -1247,6 +1247,67 @@ pub struct WorldSlots {
     pub zone_points:      ZonePoints,
 }
 
+impl WorldSlots {
+    /// **The one and only way to publish the entity roster.** Full-replaces `entity_positions`,
+    /// `entity_ids` and `entity_poses` from `entities`, holding all three locks for the whole
+    /// swap. Returns the number of entities published.
+    ///
+    /// # Why this exists (#643 review round 2)
+    ///
+    /// `/v1/observe/entities?labeled=1` promises that `poses` is keyed EXACTLY like `entities`, so
+    /// an agent may write `body["poses"][name]` without a `KeyError`. That promise is only as good
+    /// as its weakest publisher, and it was already broken once: this crate has **two** roster
+    /// publishers — `eqoxide_net::action_loop::sync_entities` (every nav tick) and
+    /// `eqoxide_net::login`'s zone-in seed — and when `entity_poses` was added, only the first one
+    /// was updated. The seed kept writing positions and ids without poses, so every entity's
+    /// `poses` key was missing for the whole window between login and the first nav tick.
+    ///
+    /// The first fix was to add the missing lines to the second loop. That left the invariant as a
+    /// *convention duplicated across two hand-written loops*, which a reviewer falsified by simply
+    /// deleting the new lines again: the entire workspace suite stayed green. A third publisher
+    /// would reintroduce the bug by omission exactly as the second one did.
+    ///
+    /// So the invariant moved into a type, next to the fields it constrains: there is now one
+    /// function that writes these maps, it cannot write one without the others, and a new publisher
+    /// gets the guarantee by construction rather than by remembering. (Same move as `Pose`/`Gait`
+    /// in `eqoxide-core`, one level up: make the broken state unrepresentable rather than
+    /// documenting a rule and hoping.) `entity_roster_has_exactly_one_publisher` in this module's
+    /// tests fails if a future call site starts writing these maps directly again.
+    ///
+    /// # ⚠️ Lock order
+    ///
+    /// `entity_positions` → `entity_ids` → `entity_poses`. This is the canonical order every other
+    /// site must follow (see `eqoxide_http::name_match`'s `resolve_in_world` and its ABBA regression
+    /// guard). Centralising the write path here means the *writer* half of that discipline now
+    /// exists in exactly one place and cannot drift.
+    ///
+    /// # Full replace, deliberately
+    ///
+    /// Both callers want current-zone truth, so stale entries from a previous zone (or a previous
+    /// login attempt) are cleared rather than merged. `sync_entities` already did this; the login
+    /// seed did not, and inherits the stricter, more correct behaviour here.
+    pub fn publish_entities<'a, I>(&self, entities: I) -> usize
+    where
+        I: IntoIterator<Item = (&'a u32, &'a eqoxide_core::game_state::Entity)>,
+    {
+        let mut positions = self.entity_positions.lock().unwrap(); // 1st — canonical order
+        let mut ids       = self.entity_ids.lock().unwrap();       // 2nd
+        let mut poses     = self.entity_poses.lock().unwrap();     // 3rd
+        positions.clear();
+        ids.clear();
+        poses.clear();
+        for (&id, e) in entities {
+            positions.insert(e.name.clone(), (e.x, e.y, e.z));
+            ids.insert(e.name.clone(), id);
+            poses.insert(e.name.clone(), EntityPoseView {
+                pose: e.pose.label(),
+                gait: e.gait.map(|g| g.raw()),
+            });
+        }
+        positions.len()
+    }
+}
+
 /// Single-authority controller integration (design §2): the render thread's authoritative
 /// position snapshot streamed to the server, the `/goto` planner's per-frame movement intent, and
 /// a server correction handed back to the controller. `ActionLoop`-only — `HttpState` has no
@@ -1493,5 +1554,140 @@ mod world_responsive_tests {
         // gone (#470) → condemn.
         assert!(!world_responsive(true, None, None, STALE, TIMEOUT, STALE),
             "at/after the passive bound with no probe ever, the prober is dead → zombie (#470)");
+    }
+}
+
+/// #643 review round 2 — the roster-publisher invariant.
+#[cfg(test)]
+mod world_roster_tests_643 {
+    use super::WorldSlots;
+    use eqoxide_core::game_state::{make_entity, Gait, Pose};
+
+    /// `publish_entities` writes all three maps or none — the guarantee
+    /// `/v1/observe/entities?labeled=1` makes to agents. MUTATION CHECK: delete any one of the
+    /// three `insert`s (or any one `clear`) in `publish_entities` and this goes RED.
+    #[test]
+    fn publish_entities_writes_all_three_maps_with_identical_keys() {
+        let world = WorldSlots::default();
+
+        let mut sitter = make_entity(1, "a_sitter", 1.0, 2.0, 3.0, true);
+        sitter.pose = Pose::Sitting;
+        sitter.gait = Some(Gait::from_wire_10bit(12));
+        let mut walker = make_entity(2, "a_walker", 4.0, 5.0, 6.0, true);
+        walker.gait = Some(Gait::from_wire_10bit(1012)); // backing up: -12
+        let entities: std::collections::HashMap<u32, _> =
+            [(1u32, sitter), (2u32, walker)].into_iter().collect();
+
+        assert_eq!(world.publish_entities(&entities), 2);
+
+        let positions = world.entity_positions.lock().unwrap();
+        let ids       = world.entity_ids.lock().unwrap();
+        let poses     = world.entity_poses.lock().unwrap();
+
+        fn sorted<V>(m: &std::collections::HashMap<String, V>) -> Vec<String> {
+            let mut v: Vec<String> = m.keys().cloned().collect();
+            v.sort();
+            v
+        }
+        assert_eq!(sorted(&positions), sorted(&ids),
+            "positions and ids must have identical key sets");
+        assert_eq!(sorted(&positions), sorted(&poses),
+            "positions and poses must have identical key sets — an agent indexes `poses` by a name \
+             it read from `entities`");
+
+        assert_eq!(positions["a_sitter"], (1.0, 2.0, 3.0));
+        assert_eq!(ids["a_sitter"], 1);
+        assert_eq!(poses["a_sitter"].pose, "sitting");
+        assert_eq!(poses["a_sitter"].gait, Some(12));
+        assert_eq!(poses["a_walker"].pose, "standing");
+        assert_eq!(poses["a_walker"].gait, Some(-12), "a backing-up mob's gait stays negative");
+    }
+
+    /// A second publish must FULL-REPLACE, not merge: an entity from the previous zone (or the
+    /// previous login attempt) must not survive in any of the three maps.
+    #[test]
+    fn publish_entities_full_replaces_so_no_stale_entity_survives() {
+        let world = WorldSlots::default();
+        let first: std::collections::HashMap<u32, _> =
+            [(1u32, make_entity(1, "old_zone_mob", 0.0, 0.0, 0.0, true))].into_iter().collect();
+        world.publish_entities(&first);
+        let second: std::collections::HashMap<u32, _> =
+            [(2u32, make_entity(2, "new_zone_mob", 0.0, 0.0, 0.0, true))].into_iter().collect();
+        world.publish_entities(&second);
+
+        assert!(!world.entity_positions.lock().unwrap().contains_key("old_zone_mob"));
+        assert!(!world.entity_ids.lock().unwrap().contains_key("old_zone_mob"));
+        assert!(!world.entity_poses.lock().unwrap().contains_key("old_zone_mob"),
+            "a stale pose is worse than a stale position — it is a confident claim about a body \
+             state that no longer exists");
+    }
+
+    /// **The structural guard the review asked for.** `publish_entities` only helps if it is the
+    /// only writer; a third publisher that hand-rolls the inserts reintroduces the bug by omission
+    /// exactly as `login.rs` did when `entity_poses` was added.
+    ///
+    /// This scans the workspace's tracked Rust sources for a MUTABLE acquisition of any of the
+    /// three roster maps (`.entity_positions.lock()` etc. bound with `let mut`) outside this
+    /// module. Read-only `.lock()`s are untouched — there are many, they are correct, and they
+    /// cannot break the invariant. Test code is exempt: seeding a fixture directly is legitimate,
+    /// and several existing tests do it deliberately (including one that seeds a DELIBERATELY
+    /// mismatched roster).
+    ///
+    /// If this fails, the fix is to call `WorldSlots::publish_entities`, not to add an exemption.
+    #[test]
+    fn entity_roster_has_exactly_one_publisher() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent().unwrap()   // crates/
+            .parent().unwrap();  // workspace root
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            for entry in rd.flatten() {
+                let p = entry.path();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if p.is_dir() {
+                    // Skip build output, VCS, and the (gitignored) agent scratch tree.
+                    if !matches!(name.as_ref(), "target" | ".git" | ".claude" | "assets") {
+                        stack.push(p);
+                    }
+                    continue;
+                }
+                if p.extension().is_none_or(|e| e != "rs") { continue; }
+                let Ok(text) = std::fs::read_to_string(&p) else { continue };
+                scanned += 1;
+                // This file defines the publisher and this guard, so it is the one legitimate site.
+                if p.ends_with("crates/eqoxide-ipc/src/lib.rs") { continue; }
+                // Integration tests (`<crate>/tests/*.rs`) and benches are wholly test code and
+                // carry no `#[cfg(test)]` marker for the scan below to key on. Seeding a fixture
+                // roster directly is legitimate there — indeed one test seeds a DELIBERATELY
+                // mismatched one. Production code never lives under these directories.
+                if p.components().any(|c| matches!(c.as_os_str().to_string_lossy().as_ref(),
+                                                   "tests" | "benches" | "examples")) { continue; }
+                let mut in_test_mod = false;
+                for (i, line) in text.lines().enumerate() {
+                    // Crude but sufficient: everything after the first `#[cfg(test)]` in a file is
+                    // test code. Every roster map in this tree is written either in production code
+                    // above that marker, or in a test module below it.
+                    if line.trim_start().starts_with("#[cfg(test)]") { in_test_mod = true; }
+                    if in_test_mod { continue; }
+                    let touches_roster = ["entity_positions", "entity_ids", "entity_poses"]
+                        .iter().any(|f| line.contains(&format!(".{f}.lock()")));
+                    if touches_roster && line.contains("let mut") {
+                        offenders.push(format!("{}:{}: {}", p.display(), i + 1, line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(scanned > 50, "the source scan found only {scanned} .rs files — it is not actually \
+                               walking the workspace, so a green result here would be meaningless");
+        assert!(offenders.is_empty(),
+            "the entity roster must have exactly ONE publisher (`WorldSlots::publish_entities`), \
+             because a hand-rolled loop can write positions without poses and break the key-set \
+             guarantee `/v1/observe/entities?labeled=1` makes to agents (#643). Call \
+             `publish_entities` instead of adding an exemption. Offending sites:\n  {}",
+            offenders.join("\n  "));
     }
 }

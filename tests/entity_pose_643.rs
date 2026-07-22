@@ -296,18 +296,10 @@ async fn entities_labeled_body_reports_pose_and_gait_separately_643() {
     feed(&mut gs, OP_SPAWN_APPEARANCE, &build_spawn_appearance_packet(43, 14, 199));
 
     let state = empty_state();
-    {
-        let world = world_slots(&state);
-        let mut pos = world.entity_positions.lock().unwrap();
-        let mut poses = world.entity_poses.lock().unwrap();
-        for e in gs.world.entities.values() {
-            pos.insert(e.name.clone(), (e.x, e.y, e.z));
-            poses.insert(
-                e.name.clone(),
-                eqoxide::ipc::EntityPoseView { pose: e.pose.label(), gait: e.gait.map(|g| g.raw()) },
-            );
-        }
-    }
+    // Publish through the REAL production roster publisher (`WorldSlots::publish_entities`, the
+    // single writer both the nav tick and the login seed go through) rather than hand-seeding the
+    // maps — so this test exercises the same projection the live client does.
+    world_slots(&state).publish_entities(&gs.world.entities);
 
     let body = observe_json(state, "/entities?labeled=1").await;
     let poses = &body["poses"];
@@ -351,18 +343,20 @@ async fn entities_and_poses_have_identical_key_sets_643() {
 
     let state = empty_state();
     {
-        let world = world_slots(&state);
-        let mut pos = world.entity_positions.lock().unwrap();
-        let mut poses = world.entity_poses.lock().unwrap();
-        let mk = |p: &str, g: Option<i32>| eqoxide::ipc::EntityPoseView { pose: p.into(), gait: g };
+        use eqoxide::game_state::{make_entity, Gait, Pose};
+        let mut gs = eqoxide::game_state::GameState::new();
         // Two byte-identical same-base-name spawns: the #471 dedup collapses these, so the
         // surviving key must still resolve in `poses`.
-        pos.insert("a_rat000".into(), (1.0, 2.0, 3.0));
-        pos.insert("a_rat001".into(), (1.0, 2.0, 3.0));
-        pos.insert("Guard_Buce".into(), (9.0, 9.0, 9.0));
-        poses.insert("a_rat000".into(), mk("standing", Some(0)));
-        poses.insert("a_rat001".into(), mk("sitting", None));
-        poses.insert("Guard_Buce".into(), mk("looting", Some(-12)));
+        let mut r0 = make_entity(1, "a_rat000", 1.0, 2.0, 3.0, true);
+        r0.gait = Some(Gait::from_wire_10bit(0));
+        let mut r1 = make_entity(2, "a_rat001", 1.0, 2.0, 3.0, true);
+        r1.pose = Pose::Sitting;
+        let mut guard = make_entity(3, "Guard_Buce", 9.0, 9.0, 9.0, true);
+        guard.pose = Pose::Looting;
+        guard.gait = Some(Gait::from_wire_10bit(1012)); // backing up: -12
+        for e in [r0, r1, guard] { gs.upsert_entity(e); }
+        // Same real publisher the live client uses.
+        world_slots(&state).publish_entities(&gs.world.entities);
     }
 
     let body = observe_json(state, "/entities?labeled=1").await;
