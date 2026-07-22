@@ -417,8 +417,12 @@ no-route state (`no_path` / `search_exhausted`) **and** it declined at least one
   "pads": [
     {
       "index": 2,
-      "footprint": [-615.0, -83.0, -14.0],
+      "footprint": [-611.2, -76.3, -14.0],
+      "footprint_count": 58,
+      "alternates": [[-606.1, -69.5, -14.0], [-729.1, -70.2, -14.0]],
+      "region_at": [-611.2, -76.3, -14.0],
       "advertised_dest": [-153.0, -30.0, 9.0],
+      "advertised_dest_floor": [-153.0, -30.0, 6.0],
       "advertised_same_zone": true,
       "destination_verified": false
     }
@@ -427,10 +431,28 @@ no-route state (`no_path` / `search_exhausted`) **and** it declined at least one
 }
 ```
 
-- **`footprint`** — measured geometry from this client's own collision mesh: walk here (`/v1/move/goto`)
-  to take the pad. This part is verified.
-- **`advertised_dest`** — the server's **advertisement**, snapped to floor. **Not** where the pad goes.
+- **`footprint`** — the spot to **try** (`/v1/move/goto`): the standable point inside the pad's trigger
+  region nearest you, measured in this client's own collision mesh and re-picked as you move.
+  **A candidate, not a promise** — verified live that walking to one spot on a pad fired nothing while
+  another spot on the *same* pad crossed immediately, and a `goto` stops within its arrival tolerance,
+  which can leave you just outside a small trigger. `null` means no standable spot was found in the
+  region at all; walking to `region_at` may then do nothing. Either way it is a warning, not a
+  disqualification — the region is really there, and the standability probe is this client's model.
+- **`footprint_count`** / **`alternates`** — how many standable spots this pad has in total, and the
+  next few (nearest-first, up to 7) to try if the first fires nothing. A DRNTP region is a BSP and one
+  pad routinely has dozens of spots (58 for the North Qeynos pad above), so you get **one offer per
+  pad**, not one per spot. **If nothing happens, work through `alternates` before concluding the pad
+  is inert.**
+- **`region_at`** — where the region itself is, present even when nothing in it is standable, so a pad
+  is never reduced to "somewhere in this zone".
+- **`advertised_dest`** — the server's **advertisement, verbatim off the wire** (wire z datum). **Not**
+  where the pad goes. `null` means the pad advertises no arrival at all (the keep-position sentinel) —
+  which does **not** make it un-takeable, you simply have no claim to compare your observation against.
   There is deliberately no unqualified `dest` key.
+- **`advertised_dest_floor`** — where that advertisement lands on **this client's** floor model, or
+  `null` if it found no floor in that column. This is a client derivation, reported separately so it can
+  never be mistaken for the server's claim. **`null` here is not a reason to skip the pad** — it is a
+  fact about the advertisement, and the advertisement is the untrustworthy part.
 - **`destination_verified`** — always `false`, in machine-readable form. Nothing the client can observe
   from the wire ever makes it `true`.
 
@@ -438,8 +460,24 @@ no-route state (`no_path` / `search_exhausted`) **and** it declined at least one
 `player.zone` and `player.pos` afterwards to find out where it actually went — that observation is
 the only thing that establishes a pad's real destination, and only you keep it.
 
-The full per-pad record (including pads in the `unknown` and `advertised_unusable` states, which
+> ⚠️ **`player.pos` / `player.zone` are PROVISIONAL for a moment right after any crossing.** To make
+> the character leave the pad's trigger region, the client applies the *advertised* arrival to its own
+> position immediately, before the server has said anything. If the server then resolves the crossing
+> to a different place — the whole reason this pad was declined — the real position arrives with its
+> echo and supersedes it. So **re-read until they settle** before concluding where a pad goes. The
+> in-game message log (`/v1/observe/messages`, channel `zone`) says the same thing at the moment of
+> the crossing.
+
+**A pad is offered whenever it exists in this client's loaded map.** That is the only bar, and it is
+answered from geometry the client measured — never from the advertised destination, which is the part
+it cannot trust. `advertised_unusable` means something narrower than it sounds: the server advertised
+an index this client's map has **no region for at all** (a `.wtr` data gap), so there is nothing to
+point you at. The full per-pad record (including the `unknown` and `advertised_unusable` states, which
 carry no offer) is on `GET /v1/observe/nav_debug` under `pads`, keyed by `knowledge`.
+
+**Nav declines to route through these on its own initiative; it does not stop you.** `POST
+/v1/move/zone_cross` and walking onto a footprint yourself both still work — that is the point of
+disclosing them.
 
 ---
 

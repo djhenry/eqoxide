@@ -358,14 +358,30 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         let pads: Vec<serde_json::Value> = snap.iter().flat_map(|snap| snap.pads.iter()).filter_map(|p| {
             match p.knowledge {
                 eqoxide_nav::diagnostics::PadKnowledge::AdvertisedSameZoneDeclined {
-                    footprint, advertised_dest,
+                    footprint, footprint_count, ref alternates, region_at, advertised_dest,
+                    advertised_dest_floor,
                 } => Some(serde_json::json!({
                     "index": p.index,
-                    // Walk HERE to take the pad. This part IS verified — it is geometry the client
-                    // measured in its own collision mesh, not something the server claimed.
+                    // The spot to TRY first: the nearest standable point inside the pad's trigger
+                    // region, measured in this client's own collision mesh. A CANDIDATE, not a
+                    // promise — verified live that one leaf of a pad fired nothing while another
+                    // leaf of the same pad crossed immediately. `null` = no standable point found at
+                    // all: a warning, not a reason to withhold the pad (#660 review B1).
                     "footprint": footprint,
-                    // What the server ADVERTISED. NOT where the pad goes; the client cannot know that.
+                    // How many standable spots exist in total, and the next few to try — a count
+                    // without the alternates is a number the agent cannot act on (#660 review NB2).
+                    "footprint_count": footprint_count,
+                    "alternates": alternates,
+                    // Where the region IS, standable or not — a pad is never reduced to "somewhere".
+                    "region_at": region_at,
+                    // What the server ADVERTISED, VERBATIM off the wire (wire z datum). NOT where the
+                    // pad goes; the client cannot know that. `null` = the pad advertises no arrival
+                    // at all (keep-position sentinel) — which does NOT make it un-takeable.
                     "advertised_dest": advertised_dest,
+                    // Our own floor model's answer for that advertised column, or `null` if it has no
+                    // floor. Kept separate from the verbatim value so a client derivation is never
+                    // passed off as the server's claim (#660 review NB3).
+                    "advertised_dest_floor": advertised_dest_floor,
                     "advertised_same_zone": true,
                     "destination_verified": false,
                 })),
@@ -384,8 +400,19 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
                        no such thing as a VERIFIED same-zone pad here, and this client does not \
                        remember where any pad landed before. `footprint` is measured geometry: walk \
                        there to take the pad. `advertised_dest` is the server's ADVERTISEMENT, not a \
-                       known destination. Taking one is YOUR decision — after arriving, read \
-                       `player.zone` and `player.pos` to find out where it actually went.",
+                       known destination, and `advertised_dest_floor` is this client's own snap of \
+                       it, not a second source. Taking one is YOUR decision — after arriving, read \
+                       `player.zone` and `player.pos` to find out where it actually went, and note \
+                       that both are PROVISIONAL for a moment after a crossing (the client applies \
+                       the advertised arrival locally so you leave the pad, and the server's echo \
+                       supersedes it) — so re-read them until they settle before concluding \
+                       anything. A pad with `advertised_dest: null` advertises no arrival at all; \
+                       it is still takeable, you just have no claim to compare against. \
+                       `footprint` is the spot to TRY, not a promise: walking to one spot on a pad \
+                       can fire nothing while another spot on the SAME pad crosses immediately, and \
+                       a goto stops within its arrival tolerance, which can leave you just outside \
+                       a small trigger. If nothing happens, try `alternates` before concluding the \
+                       pad is inert.",
         }))
     }).flatten();
     // The PER-ROUTE clearance tier the CURRENT route was found at (#378 Phase 2 / design §4c).
@@ -1291,7 +1318,12 @@ mod tests {
         let declined = || vec![PadDebug {
             index: 2,
             knowledge: PadKnowledge::AdvertisedSameZoneDeclined {
-                footprint: [-615.0, -83.0, -14.0], advertised_dest: [-153.0, -30.0, 9.0],
+                footprint: Some([-615.0, -83.0, -14.0]),
+                footprint_count: 58,
+                alternates: vec![[-606.0, -70.0, -14.0]],
+                region_at: [-615.0, -83.0, -14.0],
+                advertised_dest: Some([-153.0, -30.0, 9.0]),
+                advertised_dest_floor: Some([-153.0, -30.0, 6.0]),
             },
         }];
 
@@ -1305,6 +1337,16 @@ mod tests {
         let v = debug_json(state.clone()).await;
         assert!(v["nav_declined_pads"].is_null(),
             "a pad nav never declined must not be dressed up as an offer — got {v:#}");
+
+        // ── ON: the OTHER terminal no-route state. `search_exhausted` ("I don't know") is just as
+        //    much a failure to find a verifiable route as `no_path`, and the pad is just as relevant
+        //    — arguably more so. This leg was UNPINNED in the first revision: dropping
+        //    "search_exhausted" from the terminal predicate stayed green (#660 review NB1).
+        publish_pads(&state, "search_exhausted", declined());
+        let v = debug_json(state.clone()).await;
+        assert!(!v["nav_declined_pads"].is_null(),
+            "search_exhausted is also 'no verifiable route' — the pad must be offered there too");
+        assert_eq!(v["nav_declined_pads"]["pads"][0]["index"], 2);
 
         // ── ON: nav failed AND declined a real pad. This is the #543 case. ──
         publish_pads(&state, "no_path", declined());
@@ -1320,7 +1362,16 @@ mod tests {
         assert_eq!(pad["index"], 2);
         assert_eq!(pad["footprint"], serde_json::json!([-615.0, -83.0, -14.0]),
             "the agent needs the measured footprint to be able to walk onto the pad at all");
-        assert_eq!(pad["advertised_dest"], serde_json::json!([-153.0, -30.0, 9.0]));
+        assert_eq!(pad["footprint_count"], 58,
+            "a real DRNTP index has many leaves — ONE offer, and say how many spots it has (#660 NB2)");
+        assert_eq!(pad["alternates"], serde_json::json!([[-606.0, -70.0, -14.0]]),
+            "…and hand over the OTHER spots to try: verified live that one leaf of a pad fires \
+             nothing while another leaf of the same pad crosses, so a bare count is unactionable");
+        assert_eq!(pad["advertised_dest"], serde_json::json!([-153.0, -30.0, 9.0]),
+            "the ADVERTISED destination must be the VERBATIM wire value (z=9.0), not the client's \
+             floor snap of it — a derivation presented as the server's claim is a second source");
+        assert_eq!(pad["advertised_dest_floor"], serde_json::json!([-153.0, -30.0, 6.0]),
+            "the client's own snap (z=6.0) is reported, and reported SEPARATELY (#660 review NB3)");
 
         // THE FRAMING. An agent must be able to tell "advertised same-zone" from "verified
         // same-zone" — and the latter does not exist. A field named `dest`, or a
@@ -1336,10 +1387,36 @@ mod tests {
         assert!(detail.contains("does not remember"),
             "the client keeps NO memory of where a pad landed (owner decision) — say so, so the \
              agent knows the remembering is its job: {detail}");
+        assert!(detail.contains("try `alternates`"),
+            "a spot that fires nothing must not read as 'this pad is inert' — point at the rest");
         assert!(detail.contains("YOUR decision"),
             "the pad is offered as an OPTION for the agent to weigh, not a route nav is taking");
+        assert!(detail.contains("PROVISIONAL"),
+            "#660 review B2: this disclosure tells the agent to verify with player.zone/player.pos, \
+             and those two fields are briefly the client's optimistic guess right after a crossing. \
+             Sending an agent to read them without saying so routes it straight into the lie: {detail}");
+
+        // A pad with NO advertised arrival at all (keep-position sentinel) is still TAKEABLE, and is
+        // still offered — with an explicit `null`, never omitted and never a fabricated destination.
+        publish_pads(&state, "no_path", vec![PadDebug {
+            index: 1,
+            knowledge: PadKnowledge::AdvertisedSameZoneDeclined {
+                footprint: None, footprint_count: 0, alternates: vec![],
+                region_at: [-476.0, -161.0, 33.5],
+                advertised_dest: None, advertised_dest_floor: None,
+            },
+        }]);
+        let v = debug_json(state.clone()).await;
+        let pad = &v["nav_declined_pads"]["pads"][0];
+        assert!(pad["footprint"].is_null() && pad["footprint_count"] == 0,
+            "no standable point was found — say so with an explicit null, never invent one");
+        assert_eq!(pad["region_at"], serde_json::json!([-476.0, -161.0, 33.5]),
+            "…but the pad is still LOCATED: a pad in the map is never reduced to 'somewhere here'");
+        assert!(pad["advertised_dest"].is_null() && pad["advertised_dest_floor"].is_null(),
+            "an unadvertised arrival is an explicit null — never omitted, never invented");
 
         // The full per-pad record is also on /nav_debug, verbatim — one published source, two views.
+        publish_pads(&state, "no_path", declined());
         let n = nav_debug_json(state).await;
         assert_eq!(n["pads"][0]["knowledge"], "advertised_same_zone_declined");
         assert_eq!(n["pads"][0]["advertised_dest"], serde_json::json!([-153.0, -30.0, 9.0]));

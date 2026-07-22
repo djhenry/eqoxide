@@ -264,7 +264,10 @@ pub struct PlanDebug {
 #[serde(tag = "knowledge", rename_all = "snake_case")]
 pub enum PadKnowledge {
     /// Nothing known: the pad advertises no usable same-zone destination (e.g. the keep-position
-    /// sentinel). Its true behaviour has never been observed.
+    /// sentinel) **and** it has no standable footprint leaf either, so there is nothing the agent
+    /// could act on. Its true behaviour has never been observed. (A sentinel pad the agent CAN
+    /// stand on is [`PadKnowledge::AdvertisedSameZoneDeclined`] with `advertised_dest: None` — the
+    /// footprint is a real, usable fact even when the arrival is not advertised at all.)
     Unknown,
     /// The server ADVERTISED this same-zone destination and it passed the honesty gate
     /// (`resolve_teleport_pads`: footprint + destination on walkable floor) — so A* may route
@@ -276,23 +279,70 @@ pub enum PadKnowledge {
     /// planner is allowed to route through this" would mean; today every such pad is
     /// [`PadKnowledge::AdvertisedSameZoneDeclined`] instead.
     AdvertisedUsable { source: [f32; 3], dest: [f32; 3] },
-    /// The server advertised a same-zone destination but the honesty gate REFUSED it (footprint or
-    /// destination not on walkable floor) — the planner fabricates no edge for it.
+    /// The server advertised this pad, but **this client's loaded map has no DRNTP region for that
+    /// index at all** — a `.wtr`/map-data gap. There is nothing to point the agent at: no footprint,
+    /// no position, nothing that can be walked to. The planner fabricates no edge for it.
     ///
-    /// This is a GEOMETRY verdict ("the client cannot stand on the footprint / there is no floor at
-    /// the advertised arrival"), NOT the #543 policy decline — do not read one as the other.
+    /// Strictly a verdict about what is (not) in the client's own map. It is **not** a verdict about
+    /// the advertised destination, and it is not the #543 policy decline. Deciding "the agent cannot
+    /// use this pad" from the advertised *destination*, or from whether anything inside the region
+    /// is standable, would hide a pad the agent could actually take — see
+    /// [`PadKnowledge::AdvertisedSameZoneDeclined`], which carries both of those as facts rather
+    /// than using them as a reason to go quiet.
     AdvertisedUnusable,
-    /// **The #543 disclosure state.** The pad is REAL and physically usable — its footprint is at
-    /// `footprint` and the server ADVERTISED `advertised_dest` as a destination inside this same
-    /// zone — but the client DECLINED to auto-route the walker through it, because whether entering
-    /// it keeps you in-zone is **unverifiable from the wire** (see
+    /// **The #543 disclosure state.** The pad is REAL and the agent CAN take it — its footprint is
+    /// at `footprint`, a point this client measured in its own collision mesh and knows a character
+    /// can stand on — but the client DECLINED to auto-route the walker through it, because whether
+    /// entering it keeps you in-zone is **unverifiable from the wire** (see
     /// [`crate::walker::TRUST_ADVERTISED_SAME_ZONE_CROSSINGS`] for the mechanism).
     ///
+    /// **One entry per pad INDEX, not per leaf.** A DRNTP region is baked as a BSP and a single
+    /// index routinely has dozens of leaves (qeynos2 index 2: 58, measured live) — emitting one
+    /// offer each buries the agent in near-identical points instead of informing it. So `footprint`
+    /// is the leaf NEAREST the character (the actionable "walk here") and `footprint_count` says how
+    /// many there are, which is what the multiplicity actually means to a caller.
+    ///
     /// The honest reading, and the only one an agent may take: *a pad exists here; the server said
-    /// it leads to `advertised_dest` in this zone; the client does not know whether that is true,
+    /// it leads to `advertised_dest`, in this zone; the client does not know whether that is true,
     /// and does not remember where this pad landed last time.* Taking it is the agent's call, and
     /// only the agent's own observation after arriving establishes where it actually goes.
-    AdvertisedSameZoneDeclined { footprint: [f32; 3], advertised_dest: [f32; 3] },
+    AdvertisedSameZoneDeclined {
+        /// The nearest point inside the pad's trigger region that this client measured as standable
+        /// — the spot to TRY first. Nearest to the character, so it is re-picked as the character
+        /// moves.
+        ///
+        /// **This is a candidate, not a guarantee.** Verified live (#660): walking to one leaf of
+        /// qeynos2's pad fired nothing, while another leaf of the SAME pad crossed immediately. Two
+        /// reasons, both real: the client's model of which points trigger can disagree with the
+        /// server's, and `/goto` stops within its arrival tolerance, which can leave the character
+        /// just outside a small region. So "nothing happened" does not mean the pad is inert — see
+        /// `alternates`. Claiming otherwise here would be a fresh confident falsehood in the field
+        /// this whole disclosure exists to make honest.
+        ///
+        /// **`None` = this client found no standable point inside the region at all.** Still not a
+        /// reason to hide the pad: the region is genuinely there, and this probe is a model.
+        footprint: Option<[f32; 3]>,
+        /// How many separate standable spots this pad has in total (`0` exactly when `footprint` is
+        /// `None`). Real pads have many — 58 for qeynos2's, measured live.
+        footprint_count: usize,
+        /// Up to 7 MORE standable spots, nearest-first, excluding `footprint` itself. Without these,
+        /// `footprint_count: 58` tells the agent 57 other options exist while giving it no way to
+        /// reach any of them — a count it cannot act on. Bounded because a pad's full leaf list is
+        /// diagnostics, not an offer.
+        alternates: Vec<[f32; 3]>,
+        /// Where the DRNTP region itself is, nearest the character — reported even when nothing in
+        /// it is standable, so a pad is never reduced to "somewhere in this zone".
+        region_at: [f32; 3],
+        /// The server's advertised arrival, **verbatim from the wire** (wire z datum, not the
+        /// client's foot datum). `None` when the pad carries the keep-position sentinel, i.e. it
+        /// advertises no arrival at all — which does not make the pad un-takeable, only unadvertised.
+        advertised_dest: Option<[f32; 3]>,
+        /// Where that advertisement lands on this client's floor model, when a floor exists in its
+        /// column. `None` = no floor was found there. **`None` is not a reason to withhold the pad**
+        /// — it is a fact about the ADVERTISEMENT, and the advertisement is the untrustworthy part.
+        /// The agent can still walk onto `footprint` and see where it actually goes.
+        advertised_dest_floor: Option<[f32; 3]>,
+    },
     /// Reserved for the #543 learning loop: one or more server-driven resolutions were OBSERVED to
     /// stay in this zone, landing at `dest`.
     ///

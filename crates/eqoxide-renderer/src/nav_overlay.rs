@@ -222,16 +222,25 @@ pub fn live_vertices(snap: &NavDebugSnapshot) -> Vec<OverlayVertex> {
     //    a pad nav refuses to route through because it cannot verify where it lands — it is drawn
     //    because it is a real option the AGENT may choose, not because nav will take it. Drawing the
     //    declined one in the accept colour would show a route that does not exist.
+    //
+    //    A declined pad's DESTINATION end is drawn only from `advertised_dest_floor` — this client's
+    //    own floor snap. When that is `None` the client found no floor there, so there is no point to
+    //    draw: the footprint marker stands alone rather than a line reaching to a fabricated spot.
+    //
+    //    A declined pad with no standable footprint is drawn at `region_at` — where the region IS —
+    //    so it is never silently missing from the overlay just because nothing in it can be stood on.
     for pad in &snap.pads {
         let (source, dest, col) = match pad.knowledge {
-            PadKnowledge::AdvertisedUsable { source, dest } => (source, dest, COL_ACCEPT_PAD),
-            PadKnowledge::AdvertisedSameZoneDeclined { footprint, advertised_dest } =>
-                (footprint, advertised_dest, COL_DECLINED_PAD),
+            PadKnowledge::AdvertisedUsable { source, dest } => (source, Some(dest), COL_ACCEPT_PAD),
+            PadKnowledge::AdvertisedSameZoneDeclined { footprint, advertised_dest_floor, region_at, .. } =>
+                (footprint.unwrap_or(region_at), advertised_dest_floor, COL_DECLINED_PAD),
             _ => continue,
         };
-        push_line(&mut v, lift(source), lift(dest), col);
         push_cross(&mut v, lift(source), 1.5, col);
-        push_cross(&mut v, lift(dest), 1.5, col);
+        if let Some(dest) = dest {
+            push_line(&mut v, lift(source), lift(dest), col);
+            push_cross(&mut v, lift(dest), 1.5, col);
+        }
     }
 
     v

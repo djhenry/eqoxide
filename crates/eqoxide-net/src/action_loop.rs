@@ -2636,6 +2636,18 @@ impl ActionLoop {
     ///   reconnect against a still-live zone is the wedge). Returns `true`.
     /// - **Cross-zone** — a genuine zone change: send OP_ZoneChange and let the normal world
     ///   reconnect / zone-entry handshake run. Returns `false`.
+    /// The agent-facing message-log line for a crossing (#543). It used to read "Using an in-zone
+    /// teleport" — a confident claim that the crossing stayed in this zone, asserted at the one
+    /// moment the client cannot know it (the server resolves same-vs-cross from trigger data the
+    /// wire never carries, and its echo has not arrived yet).
+    ///
+    /// It must NOT assert the outcome, and it must warn that the position/zone the client is
+    /// reporting are its own optimistic guess until the echo lands — because `nav_declined_pads`
+    /// tells an agent to read exactly those two fields to find out where a pad went.
+    pub(crate) const CROSSING_MSG: &str =
+        "Crossing a zone line — position is PROVISIONAL until the server confirms; re-read \
+         player.zone / player.pos before trusting them";
+
     fn perform_cross(&mut self, stream: &mut EqStream, gs: &mut GameState, index: i32, dest_zone: u16, dest_pos: [f32; 3]) -> bool {
         self.send_zone_change_packet(stream, gs, dest_zone);
         self.last_zone_cross = Instant::now();
@@ -2650,13 +2662,28 @@ impl ActionLoop {
                 // Zone-point target coords are wire-datum (DB safe coords, model-origin z ~3.1u
                 // above the floor) — convert to the internal foot datum (#522).
                 gs.player_z = dest_pos[2] - eqoxide_core::coord::WIRE_Z_OFFSET;
+                // PROVISIONAL — carried forward from #582, and the other half of #543. The position
+                // just written is the client's OPTIMISTIC guess taken from the ADVERTISED zone point;
+                // it is NOT a confirmed outcome. Same-vs-cross is decided only by the server's echoed
+                // zone_id (#554): the server resolves the crossing index-blind by nearest-XY trigger
+                // and can return a DIFFERENT zone. So this must not claim "(no reconnect)" — if the
+                // echo disagrees, the receive side reconnects and the real position arrives with it.
+                //
+                // Why the write stays: it is what makes the character LEAVE the DRNTP region so the
+                // cross does not re-fire next cooldown. What was wrong was presenting it as settled.
                 tracing::info!(
-                    "zone_cross: same-zone translocator index={index} → in-zone reposition to ({:.0},{:.0},{:.0}) (no reconnect)",
+                    "zone_cross: index={index} → PROVISIONAL in-zone reposition to ({:.0},{:.0},{:.0}) \
+                     — the server echo decides same-vs-cross (#554/#543)",
                     dest_pos[0], dest_pos[1], dest_pos[2]);
             } else {
-                tracing::info!("zone_cross: same-zone translocator index={index} → server keeps position (sentinel)");
+                tracing::info!("zone_cross: index={index} → PROVISIONAL same-zone (sentinel keep-position); server echo decides (#554)");
             }
-            gs.log_msg("zone", "Using an in-zone teleport");
+            // The agent-facing line (#543). It used to say "Using an in-zone teleport" — a confident
+            // claim the crossing stayed in-zone, made at the one moment the client cannot know that.
+            // An agent that took a DISCLOSED pad is told to verify with `player.zone`/`player.pos`,
+            // so this must not assert the answer, and must warn that those two fields are provisional
+            // until the server's echo lands.
+            gs.log_msg("zone", Self::CROSSING_MSG);
             // STOP the walker (#508). The crossing we were asked to make already happened: the
             // translocator repositioned us in-zone. But the walker's `goto_target` still points at
             // the pre-cross goal (the zone-line coords `drain_zone_cross` walked us to, or a `/goto`
@@ -2907,6 +2934,32 @@ mod fine_tier_tests {
 
 #[cfg(test)]
 mod tests {
+    /// **#543 / #660 review B2 — the workflow must not end in a lie.**
+    ///
+    /// `nav_declined_pads` offers the agent a pad it cannot verify and tells it to take the pad and
+    /// then read `player.zone`/`player.pos` to learn where it went. Taking it runs `perform_cross`,
+    /// which writes the ADVERTISED arrival into those very fields before the server has said
+    /// anything — and which used to announce "Using an in-zone teleport", asserting the same-zone
+    /// outcome at the exact moment it is unknowable. A disclosure that routes the agent into that is
+    /// not finished.
+    ///
+    /// The write itself stays (it is what makes the character leave the trigger region and not
+    /// re-fire), so the honest fix is that nothing may PRESENT it as settled. Mutation: restore
+    /// "Using an in-zone teleport" → RED.
+    #[test]
+    fn a_crossing_never_claims_it_stayed_in_zone_543() {
+        let m = super::ActionLoop::CROSSING_MSG;
+        assert!(m.contains("PROVISIONAL"),
+            "the agent is sent to read player.zone/player.pos — say they are not settled yet: {m}");
+        assert!(m.contains("re-read"),
+            "…and say what to do about it, or 'provisional' is just a mood: {m}");
+        for claim in ["in-zone", "in zone", "same-zone", "same zone", "no reconnect"] {
+            assert!(!m.to_lowercase().contains(claim),
+                "the client cannot know the crossing stayed in this zone at the moment it fires, so \
+                 this line must not claim {claim:?}: {m}");
+        }
+    }
+
     use super::*;
     use crate::packet_handler::apply_packet;
     use crate::transport::AppPacket;

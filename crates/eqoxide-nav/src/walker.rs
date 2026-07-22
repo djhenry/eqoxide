@@ -67,9 +67,15 @@ pub const NAV_STATE_ZONE_LOADING: &str = "zone_loading";
 /// where a pad landed** — that memory is the agent's, by owner decision; nothing here caches,
 /// learns, or invalidates a pad destination.
 ///
-/// A DELIBERATE crossing is unaffected: the auto-cross that fires when the character physically
-/// stands on a footprint stays server-authoritative (#554). This gate is only about whether *nav*
-/// steers the character there on its own initiative.
+/// **What this gate does NOT cover, deliberately.** There are three doors onto a same-zone line;
+/// this gate closes the two nav opens *on its own initiative*, and leaves the one the AGENT opens:
+/// 1. #403 planner pad edges (`same_zone_teleport_pads`) — GATED.
+/// 2. #266 sealed-area escape (`find_in_zone_portal`) — GATED.
+/// 3. `ActionLoop::drain_zone_cross` (`POST /v1/move/zone_cross`) — **NOT gated, by design.** That
+///    door is the agent explicitly asking to cross, which is exactly the choice this PR exists to
+///    hand back to it; and the auto-cross that fires when the character physically stands on a
+///    footprint stays server-authoritative (#554). Closing it would take away the option the
+///    disclosure offers.
 pub(crate) const TRUST_ADVERTISED_SAME_ZONE_CROSSINGS: bool = false;
 
 /// How many nav ticks between live clearance-probe refreshes for the diagnostics snapshot (#608).
@@ -758,30 +764,81 @@ impl Walker {
                 unknown_idxs.push(zp.iterator as i32);
             }
         }
-        // Resolve unconditionally: the resolution is what the DISCLOSURE is made of (footprint +
-        // advertised arrival), and it is also the geometry gate that separates a pad the character
-        // could physically take from one it could not.
+        // The PLANNER's question — "may A* route THROUGH this pad?" — needs BOTH ends to resolve.
         let resolved = if advertised.is_empty() { Vec::new() } else { c.resolve_teleport_pads(&advertised) };
-        // Publish what nav KNOWS about each pad (#608/#543):
-        //   * resolved + trusted   → `AdvertisedUsable`   (an A* edge exists; gated OFF today)
-        //   * resolved + declined  → `AdvertisedSameZoneDeclined` — the #543 disclosure: the pad is
-        //                            real and takeable, the client just will not route you through
-        //                            it, and it does NOT know where it goes
-        //   * not resolved         → `AdvertisedUnusable`  (a GEOMETRY verdict, not the policy one)
-        //   * no usable advertised destination at all → `Unknown`
-        // The `Learned*` states stay unused: the agent owns pad memory (owner decision, #543).
-        self.last_pads = advertised.iter().map(|&(idx, _)| {
-            let knowledge = match resolved.iter().find(|e| e.index == idx) {
-                Some(e) if TRUST_ADVERTISED_SAME_ZONE_CROSSINGS =>
-                    PadKnowledge::AdvertisedUsable { source: e.source, dest: e.dest },
-                Some(e) => PadKnowledge::AdvertisedSameZoneDeclined {
-                    footprint: e.source, advertised_dest: e.dest },
-                None => PadKnowledge::AdvertisedUnusable,
+
+        // The DISCLOSURE's question is a DIFFERENT one — "can the AGENT take this pad?" — and it
+        // must not be answered from the advertised destination (#660 review B1). The first revision
+        // classified from `resolved`, which needs BOTH ends, so a pad with a perfectly standable
+        // footprint whose ADVERTISED arrival had no floor collapsed into `AdvertisedUnusable` and
+        // was withheld — a pad the agent can walk onto, hidden on the strength of the one datum this
+        // whole gate exists because the client cannot trust. That is the #266 pad class exactly:
+        // `find_in_zone_portal` never required a resolvable destination.
+        //
+        // So the ONLY thing that silences a pad now is having no DRNTP region in the loaded map at
+        // all — nothing to point at. Everything else is reported as a fact, including "I found no
+        // standable point inside it" (`footprint: None`), which is a warning to the agent, not a
+        // reason to go quiet. `Unknown` keeps its #607 meaning: nothing advertised AND nothing to
+        // point at. The `Learned*` states stay unused — the agent owns pad memory (owner, #543).
+        //
+        // ONE ENTRY PER INDEX, not per leaf. A DRNTP region is a BSP and one index routinely has
+        // dozens of leaves (qeynos2 index 2: 58, measured live) — an offer each is noise, not
+        // disclosure. `footprint` is the leaf NEAREST the character (the actionable "walk here") and
+        // `footprint_count` carries what the multiplicity actually means to a caller (#660 NB2).
+        let here = [gs.player_x, gs.player_y, gs.player_z];
+        /// How many standable spots an offer carries in total (the one to try + `alternates`).
+        /// Bounded: a pad's full leaf list is diagnostics, not an offer.
+        const OFFERED_SPOTS: usize = 8;
+        let by_distance = |mut ps: Vec<[f32; 3]>| {
+            let d2 = |p: &[f32; 3]| (p[0] - here[0]).powi(2) + (p[1] - here[1]).powi(2) + (p[2] - here[2]).powi(2);
+            ps.sort_by(|a, b| d2(a).total_cmp(&d2(b)));
+            ps
+        };
+        let mut pads: Vec<PadDebug> = Vec::new();
+        let mut classify = |idx: i32, wire_dest: Option<[f32; 3]>| {
+            // Is there a region for this index in the map AT ALL? (`find_zone_line_near` does not
+            // require standability — it answers "where is it", not "can you use it".)
+            let Some((_, region_at)) = c.find_zone_line_near(Some(idx), here) else {
+                pads.push(PadDebug { index: idx, knowledge: match wire_dest {
+                    Some(_) => PadKnowledge::AdvertisedUnusable, // advertised, but absent from our map
+                    None    => PadKnowledge::Unknown,            // nothing advertised, nothing to point at
+                }});
+                return;
             };
-            PadDebug { index: idx, knowledge }
-        }).chain(unknown_idxs.into_iter().map(|idx| PadDebug {
-            index: idx, knowledge: PadKnowledge::Unknown,
-        })).collect();
+            let footprints = c.teleport_pad_footprints(idx);
+            // Where the ADVERTISEMENT lands on our floor model, if anywhere. Reported separately from
+            // the verbatim wire value so neither is passed off as the other (#660 review NB3): the
+            // wire datum is the server's claim, the snap is our derivation from it. Derived through
+            // `resolve_teleport_pads` so the number disclosed here and the number the planner would
+            // have used cannot drift; `.map(dest)` because we want only its destination half.
+            let dest_floor = wire_dest
+                .and_then(|d| c.resolve_teleport_pads(&[(idx, d)]).first().map(|e| e.dest));
+            let sorted = by_distance(footprints.clone());
+            let footprint = sorted.first().copied();
+            // The rest of the offer: the next few spots to TRY if the first fires nothing. Verified
+            // live (#660) that leaves of one pad genuinely differ in whether they trigger, so a bare
+            // count without the alternates would be a number the agent cannot act on.
+            let alternates = sorted.iter().skip(1).take(OFFERED_SPOTS - 1).copied().collect();
+            let usable = match (TRUST_ADVERTISED_SAME_ZONE_CROSSINGS, footprint) {
+                (true, Some(fp)) => resolved.iter().find(|e| e.index == idx && e.source == fp),
+                _ => None,
+            };
+            pads.push(PadDebug { index: idx, knowledge: match usable {
+                Some(e) => PadKnowledge::AdvertisedUsable { source: e.source, dest: e.dest },
+                None => PadKnowledge::AdvertisedSameZoneDeclined {
+                    footprint,
+                    footprint_count: footprints.len(),
+                    alternates,
+                    region_at,
+                    advertised_dest: wire_dest,
+                    advertised_dest_floor: dest_floor,
+                },
+            }});
+        };
+        for &(idx, dest) in &advertised { classify(idx, Some(dest)); }
+        for idx in unknown_idxs { classify(idx, None); }
+        self.last_pads = pads;
+
         // THE GATE. Nothing reaches A*: a goal reachable only across an unverifiable pad is an
         // honest `no_path` plus the disclosure above, never a silent drift into another zone (#543).
         if !TRUST_ADVERTISED_SAME_ZONE_CROSSINGS {
@@ -1209,7 +1266,12 @@ mod tests {
     /// footprint on the near slab, advertised as landing on the far one. Mirrors `collision.rs`'s
     /// `pad_scene` (the #403 fixture) — duplicated here rather than shared so this test does not
     /// have to widen `collision.rs`'s private test module.
-    fn pad_scene() -> crate::collision::Collision {
+    fn pad_scene() -> crate::collision::Collision { pad_scene_leaves(false) }
+
+    /// `two_leaves` bakes the SAME DRNTP index as two horizontally-separated footprint boxes — the
+    /// real shape a pad can have, and the case where naming only one leaf sends the agent to a
+    /// footprint it may not be able to reach (#660 review NB2).
+    fn pad_scene_leaves(two_leaves: bool) -> crate::collision::Collision {
         use eqoxide_assets::{MeshData, RenderMode, ZoneAssets};
         let quad = |v: Vec<[f32; 3]>| MeshData {
             positions: v, normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
@@ -1223,24 +1285,33 @@ mod tests {
             &ZoneAssets { terrain: vec![slab_a, slab_b], objects: vec![], textures: vec![] }, 8.0);
         // Pad footprint: a DRNTP box on slab A straddling the z=0 floor, so a character standing on
         // it is inside the region and the crossing would fire.
-        col.set_water(Some(std::sync::Arc::new(
-            eqoxide_core::region_map::RegionMap::zone_line_box(30.0, 50.0, -40.0, -16.0, -5.0, 5.0, PAD_INDEX))));
+        col.set_water(Some(std::sync::Arc::new(if two_leaves {
+            eqoxide_core::region_map::RegionMap::zone_line_two_boxes(
+                10.0, 25.0, 45.0, 60.0, -40.0, -16.0, -5.0, 5.0, PAD_INDEX)
+        } else {
+            eqoxide_core::region_map::RegionMap::zone_line_box(30.0, 50.0, -40.0, -16.0, -5.0, 5.0, PAD_INDEX)
+        })));
         col
     }
 
     /// A walker standing on slab A, with the pad advertised as a SAME-ZONE teleport.
     fn pad_walker() -> (Walker, eqoxide_ipc::WorldSlots, eqoxide_core::game_state::GameState) {
+        pad_walker_with(PAD_ADVERTISED_DEST, false)
+    }
+
+    /// As `pad_walker`, but the pad advertises `dest` (use a column with no floor to model a pad
+    /// whose ADVERTISEMENT cannot be resolved) and optionally has two footprint leaves.
+    fn pad_walker_with(dest: [f32; 3], two_leaves: bool)
+        -> (Walker, eqoxide_ipc::WorldSlots, eqoxide_core::game_state::GameState) {
         let nav: eqoxide_ipc::NavSlots = Default::default();
         let world: eqoxide_ipc::WorldSlots = Default::default();
         let intent: eqoxide_ipc::NavIntent = Default::default();
         let view: crate::diagnostics::NavDebugView = Default::default();
-        let col = Arc::new(std::sync::RwLock::new(Some(Arc::new(pad_scene()))));
+        let col = Arc::new(std::sync::RwLock::new(Some(Arc::new(pad_scene_leaves(two_leaves)))));
         let w = Walker::new(nav, world.clone(), col, intent, view);
         *world.zone_points.lock().unwrap() = vec![eqoxide_core::game_state::ZonePoint {
             iterator:  PAD_INDEX as u32,
-            server_x:  PAD_ADVERTISED_DEST[0],
-            server_y:  PAD_ADVERTISED_DEST[1],
-            server_z:  PAD_ADVERTISED_DEST[2],
+            server_x:  dest[0], server_y: dest[1], server_z: dest[2],
             heading:   0.0,
             zone_id:   PAD_ZONE, // "same zone" — as ADVERTISED, which is all the client ever gets
         }];
@@ -1285,15 +1356,171 @@ mod tests {
         let pad = &w.last_pads[0];
         assert_eq!(pad.index, PAD_INDEX);
         match pad.knowledge {
-            crate::diagnostics::PadKnowledge::AdvertisedSameZoneDeclined { footprint, advertised_dest } => {
-                assert_eq!(advertised_dest, resolved[0].dest,
-                    "the ADVERTISED destination must be disclosed verbatim, not re-derived");
-                assert_eq!(footprint, resolved[0].source,
+            crate::diagnostics::PadKnowledge::AdvertisedSameZoneDeclined {
+                footprint, advertised_dest, advertised_dest_floor, ..
+            } => {
+                assert_eq!(footprint, Some(resolved[0].source),
                     "the footprint is measured geometry — the agent needs it to walk onto the pad");
+                assert_eq!(advertised_dest, Some(PAD_ADVERTISED_DEST),
+                    "the ADVERTISED destination must be the VERBATIM wire value — the client's floor \
+                     snap of it is a DERIVATION and must not stand in for the server's claim");
+                assert_eq!(advertised_dest_floor, Some(resolved[0].dest),
+                    "…and the client's own snap is reported alongside it, as its own field");
             }
             ref other => panic!(
                 "a policy-declined pad must be disclosed as AdvertisedSameZoneDeclined — not \
                  withheld, and not mislabelled as a geometry verdict or as usable. Got {other:?}"),
+        }
+    }
+
+    /// **#660 review B1 — the disclosure had a hole in exactly the #266 pad class.**
+    ///
+    /// The first revision classified a pad by whether `resolve_teleport_pads` produced an EDGE, which
+    /// requires the footprint AND the advertised destination to resolve. So a pad with a perfectly
+    /// standable footprint whose ADVERTISED arrival has no floor collapsed into `AdvertisedUnusable`
+    /// and was withheld entirely — a pad the agent can walk onto and take, hidden on the strength of
+    /// the one datum this entire PR argues the client cannot trust. `find_in_zone_portal` (the #266
+    /// door) never required a resolvable destination, so pads only that door could reach were newly
+    /// refused AND undisclosed. Live: qeynos2 index 1 has a real DRNTP region and was silent.
+    ///
+    /// The question the DISCLOSURE asks is "can the agent take this pad?" — footprint only. The
+    /// question the PLANNER asks is "may A* route through it?" — both ends. They are different
+    /// questions and must not share an answer.
+    ///
+    /// Mutation check: classify from `resolved` instead of `teleport_pad_footprints` (i.e. restore
+    /// the first revision) → the pad becomes `AdvertisedUnusable` and vanishes from the offer → RED.
+    #[test]
+    fn a_pad_whose_advertised_destination_does_not_resolve_is_still_disclosed_543() {
+        // Advertise an arrival out over the 400u gap between the slabs: no floor anywhere in that
+        // column, so the ADVERTISEMENT cannot be resolved — but the footprint is untouched.
+        const VOID_DEST: [f32; 3] = [200.0, 40.0, 0.0];
+        let (mut w, _world, gs) = pad_walker_with(VOID_DEST, false);
+        let c = w.collision.read().unwrap().clone().unwrap();
+
+        // PRECONDITIONS, both halves — this is exactly the case the two questions disagree about.
+        assert!(c.resolve_teleport_pads(&[(PAD_INDEX, VOID_DEST)]).is_empty(),
+            "fixture: the ADVERTISED destination must NOT resolve (that is the whole point)");
+        assert_eq!(c.teleport_pad_footprints(PAD_INDEX).len(), 1,
+            "fixture: …while the FOOTPRINT is standable, so the agent genuinely can take this pad");
+
+        assert!(w.same_zone_teleport_pads(&gs, &c).is_empty(), "still no A* edge, of course");
+
+        assert_eq!(w.last_pads.len(), 1, "got {:?}", w.last_pads);
+        match w.last_pads[0].knowledge {
+            crate::diagnostics::PadKnowledge::AdvertisedSameZoneDeclined {
+                footprint, advertised_dest, advertised_dest_floor, ..
+            } => {
+                assert_eq!(footprint, Some(c.teleport_pad_footprints(PAD_INDEX)[0]),
+                    "the agent is told WHERE to stand — the part the client actually measured");
+                assert_eq!(advertised_dest, Some(VOID_DEST),
+                    "the server's claim is still reported verbatim, unresolvable or not");
+                assert_eq!(advertised_dest_floor, None,
+                    "and the client says plainly that it found no floor there — never invents one");
+            }
+            ref other => panic!(
+                "#660 B1: a pad the agent CAN take must be OFFERED. Withholding it because its \
+                 ADVERTISED destination did not resolve decides the agent's options from the very \
+                 datum this gate exists because the client cannot trust. Got {other:?}"),
+        }
+    }
+
+    /// A pad whose region has **no standable point** (the #266 "floating leaf": the DRNTP box sits
+    /// above the floor, so walking to its XY never fires the crossing) is STILL offered — with
+    /// `footprint: None` and `footprint_count: 0`, plus where the region actually is. That is the
+    /// honest shape: "this pad is here, and I could not find anywhere in it you can stand" is a
+    /// warning the agent can act on; silence is not, and the client's standability probe is its own
+    /// model, not ground truth. Only a pad ABSENT from the loaded map is silenced.
+    ///
+    /// Mutation: withhold a pad with no standable footprint (the previous revision's behaviour) → RED.
+    #[test]
+    fn a_pad_with_no_standable_footprint_is_still_offered_with_an_explicit_null_543() {
+        use eqoxide_assets::{MeshData, RenderMode, ZoneAssets};
+        let (mut w, _world, gs) = pad_walker_with(PAD_ADVERTISED_DEST, false);
+        // A DRNTP box FLOATING 100u above the floor: the region exists, nothing in it is standable.
+        // (The zone needs real vertical extent for the region precompute to reach that height, so
+        // this scene has a high roof quad as well as the ground slab.)
+        let quad = |v: Vec<[f32; 3]>| MeshData {
+            positions: v, normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
+            texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: RenderMode::Opaque, anim: None,
+        };
+        let ground = quad(vec![[0.0, 0.0, -120.0], [80.0, 0.0, -120.0], [80.0, 0.0, 0.0], [0.0, 0.0, 0.0]]);
+        let roof   = quad(vec![[0.0, 300.0, -120.0], [80.0, 300.0, -120.0], [80.0, 300.0, 0.0], [0.0, 300.0, 0.0]]);
+        let mut col = crate::collision::Collision::build(
+            &ZoneAssets { terrain: vec![ground, roof], objects: vec![], textures: vec![] }, 8.0);
+        col.set_water(Some(std::sync::Arc::new(
+            eqoxide_core::region_map::RegionMap::zone_line_box(30.0, 50.0, -40.0, -16.0, 100.0, 120.0, PAD_INDEX))));
+        let col = Arc::new(col);
+        *w.collision.write().unwrap() = Some(col.clone());
+        assert!(col.teleport_pad_footprints(PAD_INDEX).is_empty(), "fixture: nothing standable");
+        assert!(col.find_zone_line_near(Some(PAD_INDEX), [0.0; 3]).is_some(),
+            "fixture: …but the region is genuinely in the map");
+
+        assert!(w.same_zone_teleport_pads(&gs, &col).is_empty());
+        assert_eq!(w.last_pads.len(), 1);
+        match w.last_pads[0].knowledge {
+            crate::diagnostics::PadKnowledge::AdvertisedSameZoneDeclined {
+                footprint, footprint_count, .. } => {
+                assert_eq!(footprint, None,
+                    "no standable point was found — say so explicitly, never invent one");
+                assert_eq!(footprint_count, 0);
+            }
+            ref other => panic!(
+                "a pad that IS in the map must still be disclosed, with the standability failure as \
+                 a FACT rather than as a reason to go silent. Got {other:?}"),
+        }
+    }
+
+    /// The one case that is genuinely silent: the server advertises an index this client's loaded map
+    /// has no DRNTP region for (a `.wtr` data gap). There is nothing to point the agent at, so
+    /// `advertised_unusable` — and it must NOT be dressed up as an offer with a fabricated position.
+    #[test]
+    fn a_pad_absent_from_the_loaded_map_is_not_offered_543() {
+        let (mut w, world, gs) = pad_walker_with(PAD_ADVERTISED_DEST, false);
+        let c = w.collision.read().unwrap().clone().unwrap();
+        // Advertise an index the map has no region for.
+        world.zone_points.lock().unwrap()[0].iterator = 4242;
+        assert!(c.find_zone_line_near(Some(4242), [0.0; 3]).is_none(), "fixture: no such region");
+
+        assert!(w.same_zone_teleport_pads(&gs, &c).is_empty());
+        assert_eq!(w.last_pads[0].knowledge, crate::diagnostics::PadKnowledge::AdvertisedUnusable,
+            "nothing in the map to walk to — do not manufacture an offer");
+    }
+
+    /// Multi-leaf pads (#660 review NB2). ONE offer per pad index — a real DRNTP index has dozens of
+    /// BSP leaves and an offer each is noise — but the offer must name the leaf NEAREST the
+    /// character (the actionable one) and say how many exist, so a failed goto does not read as
+    /// "this pad is out of options".
+    ///
+    /// Mutation: report `footprints[0]` instead of the nearest, or hard-code `footprint_count: 1` → RED.
+    #[test]
+    fn a_multi_leaf_pad_offers_the_nearest_leaf_and_says_how_many_543() {
+        let (mut w, _world, mut gs) = pad_walker_with(PAD_ADVERTISED_DEST, true);
+        let c = w.collision.read().unwrap().clone().unwrap();
+        let leaves = c.teleport_pad_footprints(PAD_INDEX);
+        assert_eq!(leaves.len(), 2, "fixture: this scene must really have two standable leaves");
+
+        // Stand next to each leaf in turn: the offer must FOLLOW the character, not name a fixed one.
+        for want in [0usize, 1] {
+            gs.player_x = leaves[want][0]; gs.player_y = leaves[want][1] - 6.0; gs.player_z = leaves[want][2];
+            let _ = w.same_zone_teleport_pads(&gs, &c);
+            assert_eq!(w.last_pads.len(), 1,
+                "one offer per pad INDEX, not per leaf — 58 near-identical points is noise: {:?}", w.last_pads);
+            match w.last_pads[0].knowledge {
+                crate::diagnostics::PadKnowledge::AdvertisedSameZoneDeclined {
+                    footprint, footprint_count, ref alternates, .. } => {
+                    assert_eq!(footprint, Some(leaves[want]),
+                        "the offer must name the leaf NEAREST the character — the one it can act on");
+                    assert_eq!(footprint_count, 2,
+                        "…and say that another exists, so a failed goto is not read as 'no options'");
+                    // Verified live (#660): one leaf of a pad can fire nothing while another leaf of
+                    // the SAME pad crosses. A count the agent cannot act on is not a disclosure, so
+                    // the other spots must be handed over, not just tallied.
+                    assert_eq!(alternates.as_slice(), &[leaves[1 - want]],
+                        "the OTHER spot must be offered too, or `footprint_count` is unactionable");
+                }
+                ref other => panic!("expected an offer, got {other:?}"),
+            }
         }
     }
 
