@@ -1,35 +1,48 @@
-name: asset-gated tests (nightly)
+name: asset-gated tests (manual)
 
 # Runs the `water_capability.rs` suite (#654, #648, #357) — three `#[ignore]`d tests that pin
 # PHYSICAL truths about the character controller (what a swimmer can actually do) against REAL
 # baked zone geometry. Nobody ran `cargo test -- --ignored` across two adversarial review rounds
 # of #648, and the tests were merged unexecuted by anyone but their author. This job exists so
-# that stops happening: it fetches ONLY the ~41 MB the three tests need (two zones' baked
+# that stops happening: it fetches ONLY the ~42 MiB the three tests need (two zones' baked
 # `.glb` + `.wtr`, not the whole asset catalogue — see the `fetch_ci_assets` step) and reports a
-# real, distinguishable pass/fail.
+# real, distinguishable pass/fail — see the "run the water_capability suite" step for how it also
+# refuses to report green when zero tests actually ran (#657 review finding: `-- --ignored` alone
+# would exit 0 with "0 passed ... 3 filtered out" the day these tests lose their `#[ignore]`, which
+# is #654's own intended end state and the single most likely future edit to this suite).
 #
-# WHY SELF-HOSTED, AND WHY schedule/workflow_dispatch ONLY (never push/pull_request):
+# NOTE (#659): the owner is separately exploring synthetic mini-zone fixtures that would let these
+# tests run on an ordinary GitHub-hosted runner with no asset server at all. If that lands, this
+# self-hosted job may become unnecessary. Until then, it's the only way to actually execute this
+# suite anywhere but a developer's own machine, so it's kept — but deliberately with no further
+# polish invested beyond fixing the two defects #657 review found blocking (see below).
+#
+# WHY SELF-HOSTED, AND WHY workflow_dispatch ONLY, NEVER push/pull_request/schedule:
 #   The asset server these tests need is reachable only on the maintainer's own network
 #   (see the asset-server-stack docs) — a GitHub-hosted `ubuntu-latest` runner has no route to it,
 #   so this job targets a maintainer-registered self-hosted runner (label `eqoxide-assets`).
 #   A self-hosted runner attached to a PUBLIC repo must NEVER execute code from an arbitrary
 #   incoming pull request (GitHub's own stated risk for self-hosted runners on public repos) — so
-#   this workflow deliberately has no `push`/`pull_request` trigger. `schedule` only ever runs the
-#   workflow exactly as committed on the default branch; `workflow_dispatch` requires someone with
-#   write access to invoke it. Neither can be reached from a fork's PR content, so adding this job
-#   does not reopen that hole even once a runner exists.
+#   this workflow deliberately has no `push`/`pull_request` trigger, `workflow_dispatch: {}` takes
+#   no inputs (nothing untrusted to interpolate), and no `${{ }}` appears in any `run:` step — the
+#   only three are in `env:`, referencing write-access-gated `vars.*`/`secrets.*`. Only someone
+#   with write access can invoke this at all, and nothing in it can be reached from fork PR content.
 #
-# STATUS AS OF THIS PR: no such runner is registered yet, so until one is, a scheduled or manually
-# dispatched run of this job will sit queued/waiting in the Actions UI rather than complete — that
-# is an honest "not wired up yet", not a silent no-op (see `fetch_ci_assets`'s doc comment and the
-# PR body for what's needed to finish wiring it up, and for the real local run — green, then
-# deliberately broken RED, then green again — using these exact commands against the exact asset
-# server this job would use).
+# `schedule` IS DELIBERATELY NOT ENABLED (#657 review finding): with no runner registered yet
+# (see STATUS below), a nightly `schedule` trigger would queue a job every night that GitHub fails
+# outright for having no matching runner — a daily red X on a public repo for a job nobody asked to
+# run, which is worse than no signal at all. Once a runner exists, re-add a `schedule:` block here.
+#
+# STATUS AS OF THIS PR: no self-hosted runner is registered yet, so `workflow_dispatch` on this
+# workflow will sit queued/waiting in the Actions UI rather than complete — that is an honest "not
+# wired up yet", not a silent no-op (see `fetch_ci_assets`'s doc comment and the PR body for what's
+# needed to finish wiring it up, and for the real local run — green, then deliberately broken RED,
+# then green again — using these exact commands against the exact asset server this job would use).
 on:
   workflow_dispatch: {}
-  schedule:
-    # Nightly, off the top of the hour to avoid the scheduled-workflow crush GitHub sees at :00.
-    - cron: '17 9 * * *'
+
+permissions:
+  contents: read
 
 jobs:
   water-capability:
@@ -44,6 +57,8 @@ jobs:
       ASSET_PASS: ${{ secrets.EQOXIDE_ASSET_PASS || 'ci' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       # No sccache/mold override here (unlike the ubuntu-latest `test` job in test.yml): this job
       # only ever runs on a maintainer-registered self-hosted runner, which is expected to have the
@@ -54,17 +69,37 @@ jobs:
         run: cargo build --release --workspace --locked
 
       # Fetches ONLY the two zones these three tests reference (qcat + freportw), not the full
-      # asset catalogue — measured at ~41 MB total, not the ~283 MB it would be to sync the whole
-      # `gamedata` set plus both zones' full `zone/*` sets. See src/bin/fetch_ci_assets.rs. A
-      # missing/unreachable asset server fails THIS step, loudly, with its own red X distinct from
-      # a test failure below — that is what keeps "assets missing" from ever looking like "passed".
-      - name: fetch water-capability test assets (qcat + freportw, ~41 MB)
+      # asset catalogue — declared size 44,028,236 B = 42.0 MiB total (confirmed against the
+      # server's own manifest API), not the ~243 MiB the `gamedata` set alone would cost to sync
+      # whole. See src/bin/fetch_ci_assets.rs. A missing/unreachable asset server fails THIS step,
+      # loudly, with its own red X distinct from a test failure below — that is what keeps "assets
+      # missing" from ever looking like "passed".
+      - name: fetch water-capability test assets (qcat + freportw, ~42 MiB)
         run: cargo run --release --bin fetch_ci_assets --locked -- qcat freportw
 
       # `--ignored`: these three are `#[ignore]`d for every OTHER job (they need the assets just
       # fetched above, which no other job provides). Do not add `--workspace` here — this job is
-      # scoped to exactly the tests #654 is about; the other ~29 asset-gated tests elsewhere in the
+      # scoped to exactly the tests #654 is about; the other 29 asset-gated tests elsewhere in the
       # workspace need different assets (other zones, bundled character models, a live asset-server
       # process, or raw extracted S3D) not fetched here. See the PR body for the full inventory.
+      #
+      # #657 review finding, BLOCKING: `-- --ignored` runs ONLY tests still carrying `#[ignore]`.
+      # If all three ever lose that attribute — #654's own intended end state, and the single most
+      # likely future edit to this file — this line alone would print "running 0 tests" / "0
+      # passed ... 3 filtered out" and still exit 0: a defense that never executes, one level up
+      # from the exact problem this whole workflow exists to catch. So: capture the summary line
+      # and fail loudly unless exactly 3 tests actually ran and passed.
       - name: run the water_capability capability suite (--ignored)
-        run: cargo test --release --test water_capability --locked -- --ignored --nocapture
+        run: |
+          set -o pipefail
+          cargo test --release --test water_capability --locked -- --ignored --nocapture \
+            2>&1 | tee /tmp/water_capability_output.txt
+          summary="$(grep -E '^test result: ' /tmp/water_capability_output.txt | tail -1)"
+          echo "asset-gated-tests: summary line: $summary"
+          passed="$(echo "$summary" | grep -oE '[0-9]+ passed' | grep -oE '^[0-9]+')"
+          if [ "$passed" != "3" ]; then
+            echo "::error::expected exactly 3 water_capability tests to run and pass; got: $summary"
+            echo "::error::(0 passed usually means --ignored found nothing to run — e.g. the"
+            echo "::error:: #[ignore] attributes were removed without updating this workflow)"
+            exit 1
+          fi
