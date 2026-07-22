@@ -423,10 +423,23 @@ fn is_transient(e: &std::io::Error) -> bool {
 /// Send a datagram on an already-`connect()`ed tokio `UdpSocket` via a direct `send(2)`, bypassing
 /// tokio's cached-readiness gate (#641).
 ///
-/// This exists for exactly one caller — `EqStream::transmit`'s `WouldBlock` rescue — and it is the
-/// only way to tell tokio's SYNTHETIC `WouldBlock` (readiness bit empty, no syscall attempted) from
-/// a real kernel `EAGAIN`/`ENOBUFS`. `try_send`/`try_io` cannot: both consult the same cache and
-/// short-circuit before reaching the kernel.
+/// This exists for exactly one caller — `EqStream::transmit`'s `WouldBlock` rescue. It reaches the
+/// kernel when `try_send`/`try_io` would not: both consult tokio's cached readiness bit first and
+/// short-circuit on an empty one without issuing the syscall.
+///
+/// **It does NOT prove which mechanism refused the original `try_send`** (#641 review, finding 3).
+/// An earlier version of this comment claimed it was "the only way to tell tokio's synthetic
+/// `WouldBlock` from a real kernel `EAGAIN`", and that claim is withdrawn — it survived three
+/// rounds of review here, on the very function that implements the discrimination it overstates.
+/// A `try_send` that returns `WouldBlock` may have short-circuited on an empty readiness bit, OR
+/// issued the syscall and been refused by the kernel (which also clears the bit). If this call then
+/// succeeds microseconds later, both stories fit — a burst is exactly when the transmit buffer is
+/// full and draining hard. So a success here is an UPPER bound on the synthetic case, not a
+/// measurement of it. A FAILURE here is the hard evidence: this is a real syscall, so its `EAGAIN`
+/// is genuinely the kernel's answer. See `NetHealth::send_wouldblock_rescued`.
+///
+/// None of that changes what this function is FOR: recovering a datagram that would otherwise be
+/// dropped. The fix does not depend on knowing which mechanism refused it.
 ///
 /// The fd is borrowed, never owned: `ManuallyDrop` means the temporary `std::net::UdpSocket` is not
 /// closed when it drops, so tokio keeps sole ownership of the descriptor. The socket is non-blocking
@@ -2721,7 +2734,8 @@ mod tests {
             // i.e. it took the permanent path, not the deferral one.
             let kind = h.last_send_error_kind.expect("the failure must be reported");
             assert_ne!(kind, std::io::ErrorKind::WouldBlock,
-                "a 70,000-byte datagram fails with EMSGSIZE from the real sendto — if this is                  WouldBlock the test is exercising the deferral path, not the permanent one");
+                "a 70,000-byte datagram fails with EMSGSIZE from the real sendto — if this is \
+                 WouldBlock the test is exercising the deferral path, not the permanent one");
             assert_eq!(h.send_deferred, 1,
                 "`defer_control` queued it once; the permanent failure must not add to that");
         }
@@ -2777,18 +2791,34 @@ mod tests {
         let at = gameplay_src.find("OP_GMKICK =>")
             .expect("gameplay.rs: the OP_GMKICK match arm was not found");
         // The arm ends at its own closing brace; the park loop is the last statement in it.
-        let arm_end = gameplay_src[at..].find("\n                }\n")
+        // The 16 spaces below are the match arm's indentation in gameplay.rs, so that needle really
+        // is a code SHAPE and not a wrapped message — hence the opt-out marker on the line itself.
+        let arm_end = gameplay_src[at..].find("\n                }\n") // check-wrapped-literals: allow
             .expect("unterminated OP_GMKICK arm") + at;
         let arm = &gameplay_src[at..arm_end];
         assert!(arm.contains("abandon_outstanding()"),
             "the OP_GMKick arm must call `abandon_outstanding()` (#641 review R3): it parks in \
              `loop {{ sleep }}` forever and is never unwound, so `Drop` cannot account for the \
              control-retry queue or the reliable window there");
+        // The ordering half of this guard was defeatable (#641 review N1, the reviewer's mutation
+        // M): `unwrap_or(arm.len())` meant that respelling the park — `std::future::pending().await`
+        // instead of `loop { sleep }` — made `park_at` the end of the arm, so the assert below
+        // became vacuously true and the accounting could be moved after the park, where it provably
+        // never runs. GREEN, on a genuine regression. Same shape as #652.
+        //
+        // So: recognise the park by ANY of the ways it can be spelled, and if none is found, FAIL
+        // rather than assume there is no park. A guard that cannot find the thing it orders against
+        // must say so — silently passing is the failure mode being fixed here.
         let abandon_at = arm.find("abandon_outstanding()").unwrap();
-        let park_at = arm.find("loop {").unwrap_or(arm.len());
+        const PARK_SPELLINGS: &[&str] = &["loop {", "pending::<", "pending()", "park()"];
+        let park_at = PARK_SPELLINGS.iter().filter_map(|p| arm.find(p)).min().unwrap_or_else(|| {
+            panic!("the OP_GMKick arm no longer contains a recognisable park ({PARK_SPELLINGS:?}). \
+                    If the park was respelled, add it above — do NOT delete this check: without a \
+                    park position the ordering assert below cannot mean anything (#641 review N1)")
+        });
         assert!(abandon_at < park_at,
-            "the accounting must happen BEFORE the park — nothing after `loop {{ sleep }}` ever \
-             runs (#641 review R3)");
+            "the accounting must happen BEFORE the park — nothing after it ever runs (#641 review \
+             R3/N1)");
     }
 
     /// #641 structural guard, in the same spirit as
