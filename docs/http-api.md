@@ -33,7 +33,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 
 | Route | Description |
 |-------|-------------|
-| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation** (`nav_state`, `nav_reason`, `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier` — see [Navigation state](#navigation-state)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms` — see [Connection health](#connection-health)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + camera state. |
+| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation** (`nav_state`, `nav_reason`, `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier` — see [Navigation state](#navigation-state)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms` — see [Connection health](#connection-health)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + camera state. |
 | `GET /v1/observe/frame` | Current rendered frame as a PNG (`Content-Type: image/png`). **503 while the zone's assets are still loading** — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579); `?allow_pending=1` opts past it. |
 | `GET /v1/observe/entities[?labeled=1]` | Default: `{ "<name>": [x,y,z], ... }` for all known entities, with same-base-name + byte-identical-position duplicates collapsed (#471 — suspected server-side `spawn2` duplication; the model is untouched so each instance is still targetable by its full name). `?labeled=1` returns the richer `{count, entities:{"<name>":[x,y,z]}, deduped, duplicate_groups:[{position,names,kept}], note}` exposing which duplicates were collapsed. |
 | `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency}`. Slots are Titanium **wire** ids (DB general slots 23-30 → wire 22-29). |
@@ -444,8 +444,9 @@ corridor is not threadable" from "the steering planner hasn't caught up." `nav_l
 
 ## Connection health
 
-`GET /v1/observe/debug` carries six fields that tell you **whether the rest of the payload can be
-trusted at all**. They are computed when you ask — not cached — so nothing has to be running inside
+`GET /v1/observe/debug` carries ten fields that tell you **whether the rest of the payload can be
+trusted at all**. Six are about what the SERVER did (below); four are about what the client itself
+failed to send (see [Outbound send failures](#outbound-send-failures)). They are computed when you ask — not cached — so nothing has to be running inside
 the client for them to be right (#343).
 
 | Field | Meaning |
@@ -456,6 +457,10 @@ the client for them to be right (#343).
 | `snapshot_age_ms` | ms since the client's network thread last ticked. |
 | `world_responsive` | **Is the WORLD alive, not just the socket?** `false` only when an active liveness probe went unanswered past its bound while the link kept ACKing — a wedged zone. `true` for a healthy zone, including a legitimately idle one (the probe is answered). `true` before the first probe fires. See below. |
 | `last_world_response_ms` | ms since the world last *proved* it processed something for us — a probe reply or a spontaneous packet, whichever is fresher. The companion to `world_responsive`. |
+| `send_failures` | **Datagrams this client BUILT but could not put on the wire** — `try_send` returned an error. Cumulative since process start. `0` on a healthy client. |
+| `send_failures_unretried` | The subset of `send_failures` with no client-side retransmit of that datagram. |
+| `last_send_error` | `ErrorKind` name of the most recent send failure (`"WouldBlock"`, `"Uncategorized"`, …), or `null`. |
+| `last_send_error_age_ms` | ms since that failure, measured at read time, or `null`. Distinguishes an old blip from an ongoing failure. |
 
 **`last_packet_age_ms` is not a disconnect signal.** An idle EQ session — a character sitting alone
 in a quiet zone — routinely goes **40+ seconds with no application packet** while the link is
@@ -466,6 +471,32 @@ as *"the world is quiet"*, and use `connected` to decide whether the link is gon
 > **Changed in #343.** `connected` previously derived from application traffic and was recomputed
 > only when a frame rendered — so a dead connection (no packets → no render) reported
 > `connected: true`, frozen, forever. It now derives from link liveness, at read time.
+
+### Outbound send failures
+
+Every other health field is about what the *server* did. These four are about what *we* failed to
+do. Until #612 the client's send path ended in `let _ = self.socket.try_send(&raw)` — **every** send
+error, for **every** packet it ever transmitted (`WouldBlock`, `ENOBUFS`, `EMSGSIZE`, `ENETUNREACH`,
+a dead socket), was discarded. A datagram that never left the machine was therefore
+indistinguishable from one the server received, and an agent issuing a command had no way, even in
+principle, to learn that the command had not gone out.
+
+Every send now funnels through one place that records its own failure, so:
+
+- **`send_failures: 0` is the healthy reading.** Nonzero means the client hit a send error that many
+  times since it started.
+- **`send_failures_unretried` is the sharper number.** The complement (`send_failures -
+  send_failures_unretried`) is the *reliable* stream: a failed reliable datagram is kept verbatim in
+  the resend window and retransmitted until the server ACKs it, so it is delayed, not lost. The
+  `unretried` ones — unreliable position updates, ACKs, keepalives, session control — are not
+  re-sent by this client.
+- **`send_failures_unretried > 0` does not by itself mean a command was lost.** Agent commands
+  travel on the reliable path. What a climbing `unretried` count *does* mean is that the position
+  firehose is dropping updates, i.e. the server's idea of where you are may have stopped tracking
+  yours.
+- **Use `last_send_error_age_ms` to tell "one blip at login" from "failing right now."** A count
+  alone cannot distinguish them.
+- Reported as `null` / `0`, never omitted, so absence of trouble is stated rather than inferred.
 
 **If `snapshot_age_ms` is large, distrust the whole payload.** It means the client's own network
 thread has stopped publishing, so every other field is a stale snapshot regardless of what

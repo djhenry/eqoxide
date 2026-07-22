@@ -347,6 +347,35 @@ pub struct Health {
     /// life" companion to `world_responsive`, and unlike `last_packet_age_ms` it is NOT reset by
     /// probe traffic being suppressed, because probe replies legitimately count as proof of life here.
     pub last_world_response_ms: u64,
+    /// #612: how many outbound datagrams the client BUILT but could not put on the wire (`try_send`
+    /// returned an error). Cumulative since process start. `0` on a healthy client. Before #612 this
+    /// was unobservable — every send error was discarded, so a packet that never left the machine
+    /// looked exactly like one the server received.
+    pub send_failures:          u64,
+    /// #612: the subset of `send_failures` that the client does not retransmit itself (unreliable
+    /// position updates, ACKs, keepalives, session control). The complement is the reliable stream,
+    /// which recovers structurally via the resend window. See [`eqoxide_ipc::NetHealth`] for the
+    /// precise contract — in particular, this is NOT "a command was lost".
+    pub send_failures_unretried: u64,
+    /// #612: `ErrorKind` of the most recent send failure. `None` if no send has ever failed.
+    /// Kept as the `ErrorKind` (not a `String`) so `Health` stays `Copy` like the rest of this
+    /// struct; it serializes as its `Debug` name (`"WouldBlock"`, `"Uncategorized"`, …).
+    #[serde(serialize_with = "ser_error_kind")]
+    pub last_send_error:        Option<std::io::ErrorKind>,
+    /// #612: ms since the most recent send failure, measured at READ time (#343). `None` if none.
+    /// Lets an agent tell "one WouldBlock at login an hour ago" from "failing right now".
+    pub last_send_error_age_ms: Option<u64>,
+}
+
+/// Serializes an `io::ErrorKind` as its `Debug` name so `Health::last_send_error` can stay `Copy`
+/// while still reaching the agent as a readable string (#612).
+fn ser_error_kind<S: serde::Serializer>(
+    k: &Option<std::io::ErrorKind>, s: S,
+) -> Result<S::Ok, S::Error> {
+    match k {
+        Some(k) => s.serialize_some(&format!("{k:?}")),
+        None => s.serialize_none(),
+    }
 }
 
 /// A cast in flight, for `/v1/observe/debug` → `casting` (#348).
@@ -576,6 +605,13 @@ impl HttpState {
             connected,
             world_responsive,
             last_world_response_ms,
+            // #612: outbound send failures. Counters are read straight off `NetHealth` (the net
+            // thread's `EqStream::transmit` is their sole writer); the AGE is measured here, at read
+            // time, like every other duration in this projection (#343).
+            send_failures:           h.send_failures,
+            send_failures_unretried: h.send_failures_unretried,
+            last_send_error:         h.last_send_error_kind,
+            last_send_error_age_ms:  h.last_send_error_at.map(|t| t.elapsed().as_millis() as u64),
         }
     }
 }

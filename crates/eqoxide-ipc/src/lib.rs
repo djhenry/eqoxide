@@ -319,6 +319,40 @@ pub struct NetHealth {
     /// one continuous silence it stays `false` until real proof of life, no matter how many resends
     /// happen in between.
     pub first_unanswered_probe_sent: Option<std::time::Instant>,
+
+    // ── Outbound send failures (#612) ──────────────────────────────────────────────────────────
+    //
+    // Every clock above is about what the SERVER did. These four are about what WE failed to do:
+    // a datagram the client built but that never left the machine, because `try_send` returned an
+    // error (`WouldBlock`, `ENOBUFS`, `EMSGSIZE`, `ENETUNREACH`, a dead socket…). Before #612 that
+    // error was discarded (`let _ = self.socket.try_send(&raw)`), so a packet that never reached
+    // the wire was indistinguishable from one that did — the agent-honesty failure the invariant
+    // exists to prevent, one layer below #513/#347. `EqStream::transmit` is now the ONLY place in
+    // the client that touches the socket's send path, and it stamps these on every failure, so a
+    // send cannot fail without being counted.
+    /// Cumulative count of outbound datagrams whose `try_send` failed — i.e. that were BUILT but
+    /// never put on the wire. Since process start; never reset (a zone change does not un-drop a
+    /// packet). `0` is the healthy value.
+    pub send_failures: u64,
+    /// The subset of `send_failures` for datagrams the client does **not** retransmit itself:
+    /// unreliable app packets (the `OP_ClientUpdate` position firehose), session-layer control
+    /// (ACK / OutOfOrderAck / keepalive / SessionRequest / SessionDisconnect). The complement
+    /// (`send_failures - send_failures_unretried`) is the reliable stream, where the failed
+    /// datagram is retained verbatim in the resend window and re-sent by `poll_resend` until the
+    /// server ACKs it — those recover structurally.
+    ///
+    /// Do NOT read a nonzero value here as "a command was lost": several of these datagrams have a
+    /// recovery path one level up (a fresh position update follows ~50ms later; a lost ACK is
+    /// re-solicited by the server's own resend). It means "this exact datagram is gone, and the
+    /// client will not re-send THAT datagram" — which is a real, previously invisible fact.
+    pub send_failures_unretried: u64,
+    /// `ErrorKind` of the most recent send failure (`None` if there has never been one). Kept as an
+    /// `ErrorKind` rather than a `String` so `NetHealth` stays `Copy` (it is read by value under the
+    /// mutex, like every other field here).
+    pub last_send_error_kind: Option<std::io::ErrorKind>,
+    /// When the most recent send failure happened. Measured into an age at HTTP READ time, never
+    /// stored as a duration — same rule as every other clock in this struct (#343).
+    pub last_send_error_at: Option<std::time::Instant>,
 }
 
 impl Default for NetHealth {
@@ -328,6 +362,8 @@ impl Default for NetHealth {
             last_datagram: now, last_packet: now, last_tick: now,
             last_probe_sent: None, last_probe_reply: None,
             first_unanswered_probe_sent: None,
+            send_failures: 0, send_failures_unretried: 0,
+            last_send_error_kind: None, last_send_error_at: None,
         }
     }
 }

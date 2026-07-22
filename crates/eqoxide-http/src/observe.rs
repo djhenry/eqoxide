@@ -593,6 +593,27 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // mode all over again. Attached here, not in the literal above, which is at the json!
         // recursion limit.
         player.insert("levitating".into(),             serde_json::json!(player_levitating));
+        // #612 — OUTBOUND honesty. Everything else in this payload is about what the server told us;
+        // these four are about what WE failed to say. Every send error used to be discarded
+        // (`let _ = self.socket.try_send(..)`), so a datagram that never left the machine was
+        // indistinguishable from one the server received — an agent issuing a command had no way,
+        // even in principle, to learn that it had not gone out.
+        //   send_failures            — datagrams BUILT but not put on the wire, since process start.
+        //                              0 on a healthy client. Nonzero = the client hit WouldBlock /
+        //                              ENOBUFS / EMSGSIZE / a dead socket at least that many times.
+        //   send_failures_unretried  — the subset with no client-side retransmit of that datagram
+        //                              (position updates, ACKs, keepalives, session control). The
+        //                              complement is the reliable stream, which `poll_resend` re-sends
+        //                              verbatim until ACKed. NOT the same as "a command was lost":
+        //                              agent commands travel on the RELIABLE path, which recovers.
+        //   last_send_error          — ErrorKind of the most recent one ("WouldBlock", …), or null.
+        //   last_send_error_age_ms   — ms since it, measured at read time. Distinguishes a single
+        //                              old blip from an ongoing failure.
+        player.insert("send_failures".into(),           serde_json::json!(health.send_failures));
+        player.insert("send_failures_unretried".into(), serde_json::json!(health.send_failures_unretried));
+        player.insert("last_send_error".into(),
+            serde_json::json!(health.last_send_error.map(|k| format!("{k:?}"))));
+        player.insert("last_send_error_age_ms".into(),  serde_json::json!(health.last_send_error_age_ms));
     }
     Json(out)
 }

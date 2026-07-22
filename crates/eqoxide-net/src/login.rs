@@ -840,6 +840,7 @@ mod liveness_stamp_tests {
             last_datagram: base, last_packet: base, last_tick: base,
             last_probe_sent: Some(base), last_probe_reply: None,
             first_unanswered_probe_sent: Some(base),
+            ..eqoxide_ipc::NetHealth::default()
         }));
 
         let stamp_at = base + Duration::from_secs(65);
