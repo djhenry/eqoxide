@@ -878,15 +878,21 @@ impl EqStream {
     /// including the ones the kernel would happily have taken.
     ///
     /// So on `WouldBlock` we re-attempt the datagram once through `send(2)` on the same fd,
-    /// bypassing the readiness cache. That is BOTH the fix and the discriminator:
-    ///   - the raw send succeeds → the `WouldBlock` was synthetic, the datagram is genuinely on the
-    ///     wire now, and it is counted in `send_wouldblock_rescued` (not in `send_failures`, which
-    ///     means "never reached the wire" and must not be inflated by a send that did);
-    ///   - the raw send fails → the kernel really refused it. It is NOT all synthetic: one measured
-    ///     `qeynos` zone-in split 141 rescued / 107 genuinely refused. The genuinely-refused ones
+    /// bypassing the readiness cache. That is the fix. **It is NOT a discriminator** — an earlier
+    /// version of this comment called it one and that claim is withdrawn (#641 review, finding 3):
+    ///   - the raw send succeeds → the datagram is genuinely on the wire now, and it is counted in
+    ///     `send_wouldblock_rescued` (not in `send_failures`, which means "never reached the wire"
+    ///     and must not be inflated by a send that did). This does NOT establish that the original
+    ///     `WouldBlock` was synthetic: the kernel may simply have refused it and the transmit buffer
+    ///     drained in the microseconds since. An UPPER bound on the synthetic case, nothing more.
+    ///   - the raw send fails → the kernel really refused it, and *that* is hard evidence, because
+    ///     this attempt is a real syscall. It is what refutes "it is all synthetic". Those datagrams
     ///     are handled a layer up — `send_raw` queues control datagrams in `pending_control` and
     ///     re-sends them on the next tick — and anything not deferrable falls through to the
     ///     unchanged failure accounting.
+    ///
+    /// The fix does not depend on knowing which mechanism fired; it recovers both. See
+    /// `NetHealth::send_wouldblock_rescued` for the bounds argument in full.
     ///
     /// It is deliberately ONE retry, not a loop: a genuine `EAGAIN` must stay observable rather
     /// than being spun on inside a non-blocking send path, and the tick retry is the recovery.
@@ -1574,6 +1580,33 @@ impl EqStream {
     ///
     /// Clearing the window is what makes it safe to call from both: a second call (the eventual
     /// `Drop`, if it ever runs) sees an empty window and does nothing, so no double count.
+    /// Account the outstanding windows, then park forever. Never returns.
+    ///
+    /// This exists to make "park on a session-ending path without accounting" **inexpressible**
+    /// rather than merely guarded (#641 review N1-b). Three source-level guards were defeated in one
+    /// night — a `let mut` scanner (#652), an ordering assert that went vacuous when the park was
+    /// respelled (mutation M), and a multi-spelling park matcher that fell to
+    /// `let _cleanup = || s.abandon_outstanding();` (mutation N — the text is present, it precedes
+    /// the park, every spelling matches, and the closure is never called). A string match can only
+    /// ever pin that the characters are there, never that the code RUNS, and each round of smarter
+    /// matching buys exactly one more evasion.
+    ///
+    /// Folding the two into one call removes the ordering entirely: there is no "before" to get
+    /// wrong, and the closure trick cannot work because the closure would have to be *called* to
+    /// park at all. What remains for a guard to assert — "the arm calls this" — is the one thing a
+    /// string match can honestly assert.
+    ///
+    /// Scope, stated honestly: this does not make every park in the crate safe. Other `loop { sleep }`
+    /// parks exist on paths that have already accounted (`perform_clean_shutdown` calls
+    /// `abandon_outstanding` itself and is guarded separately, #612 R1). What it makes impossible is
+    /// reaching a park on the `OP_GMKick` path with the accounting skipped or reordered past it.
+    pub(crate) async fn abandon_and_park(&mut self) -> ! {
+        self.abandon_outstanding();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+
     pub(crate) fn abandon_outstanding(&mut self) {
         // #641: control datagrams still queued for retry when the session ends are never sent — the
         // next stream is a different socket. Same honesty rule as the reliable window below: a
@@ -2449,10 +2482,11 @@ mod tests {
     /// #641, the OTHER half — the half the raw-`send(2)` rescue does NOT cover.
     ///
     /// Live measurement refuted "it's all synthetic": one instrumented `qeynos` zone-in recorded
-    /// **141 rescued** (synthetic — the kernel took them on the direct retry) alongside **107 the
-    /// kernel genuinely refused**. Nothing in the rescue helps the second group; those ACKs were
-    /// still going on the floor. So a transiently-refused control datagram is now queued and re-sent
-    /// on the next tick.
+    /// **141 rescued** (the direct `send(2)` retry got them onto the wire — which bounds the
+    /// synthetic case from above but does not prove it, see `transmit`) alongside **107 the kernel
+    /// refused a second time**, which IS hard evidence since that retry is a real syscall. Nothing
+    /// in the rescue helps the second group; those ACKs were still going on the floor. So a
+    /// transiently-refused control datagram is now queued and re-sent on the next tick.
     ///
     /// The refusal is injected (`force_send_refusals`) because there is no portable, deterministic
     /// way to make a real `send(2)` on a connected UDP socket return `EAGAIN` from a unit test —
@@ -2782,43 +2816,37 @@ mod tests {
     /// The practical consequence is nil (we are already kicked); the point is that a counter which
     /// is honest *except on one path* is a counter nobody can reason with.
     ///
-    /// Source-level, and comments stripped first, for exactly the reasons written on the
-    /// clean-shutdown guard above — a previous version of that one was satisfied by commenting the
-    /// call out.
+    /// **This guard is deliberately weak, because the STRUCTURE now carries the weight** (#641
+    /// review N1-b). Earlier versions tried to pin an ORDERING — accounting before the park — and
+    /// were defeated twice by ordinary refactors: respelling the park as
+    /// `std::future::pending::<()>().await` made the ordering assert vacuous (mutation M), and
+    /// `let _cleanup = || s.abandon_outstanding();` satisfied every textual check while never
+    /// running the code (mutation N). Three source guards fell in one night the same way: a string
+    /// match pins that the characters are present, never that the code RUNS, and each round of
+    /// smarter matching buys exactly one more evasion.
+    ///
+    /// So `abandon_and_park()` does both in one call that never returns, and there is no ordering
+    /// left to guard. This asserts only that the arm parks THROUGH it — which is the one thing a
+    /// string match can honestly assert here, because after the fold there is no way to reach a park
+    /// on this path with the accounting skipped, and an uncalled closure cannot satisfy it (the
+    /// closure would have to be called to park at all).
     #[test]
-    fn the_gmkick_path_accounts_its_outstanding_windows_before_parking_forever() {
+    fn the_gmkick_path_parks_through_the_accounting_call() {
         let gameplay_src = strip_comments(include_str!("gameplay.rs"));
         let at = gameplay_src.find("OP_GMKICK =>")
             .expect("gameplay.rs: the OP_GMKICK match arm was not found");
-        // The arm ends at its own closing brace; the park loop is the last statement in it.
-        // The 16 spaces below are the match arm's indentation in gameplay.rs, so that needle really
-        // is a code SHAPE and not a wrapped message — hence the opt-out marker on the line itself.
-        let arm_end = gameplay_src[at..].find("\n                }\n") // check-wrapped-literals: allow
-            .expect("unterminated OP_GMKICK arm") + at;
+        // The arm runs to the next match arm at the same nesting.
+        let arm_end = gameplay_src[at + 1..].find("\n                OP_")
+            .map(|p| p + at + 1).unwrap_or(gameplay_src.len());
         let arm = &gameplay_src[at..arm_end];
-        assert!(arm.contains("abandon_outstanding()"),
-            "the OP_GMKick arm must call `abandon_outstanding()` (#641 review R3): it parks in \
-             `loop {{ sleep }}` forever and is never unwound, so `Drop` cannot account for the \
-             control-retry queue or the reliable window there");
-        // The ordering half of this guard was defeatable (#641 review N1, the reviewer's mutation
-        // M): `unwrap_or(arm.len())` meant that respelling the park — `std::future::pending().await`
-        // instead of `loop { sleep }` — made `park_at` the end of the arm, so the assert below
-        // became vacuously true and the accounting could be moved after the park, where it provably
-        // never runs. GREEN, on a genuine regression. Same shape as #652.
-        //
-        // So: recognise the park by ANY of the ways it can be spelled, and if none is found, FAIL
-        // rather than assume there is no park. A guard that cannot find the thing it orders against
-        // must say so — silently passing is the failure mode being fixed here.
-        let abandon_at = arm.find("abandon_outstanding()").unwrap();
-        const PARK_SPELLINGS: &[&str] = &["loop {", "pending::<", "pending()", "park()"];
-        let park_at = PARK_SPELLINGS.iter().filter_map(|p| arm.find(p)).min().unwrap_or_else(|| {
-            panic!("the OP_GMKick arm no longer contains a recognisable park ({PARK_SPELLINGS:?}). \
-                    If the park was respelled, add it above — do NOT delete this check: without a \
-                    park position the ordering assert below cannot mean anything (#641 review N1)")
-        });
-        assert!(abandon_at < park_at,
-            "the accounting must happen BEFORE the park — nothing after it ever runs (#641 review \
-             R3/N1)");
+        assert!(arm.contains("abandon_and_park()"),
+            "the OP_GMKick arm must park via `abandon_and_park()` (#641 review R3/N1-b): it parks \
+             forever and is never unwound, so `Drop` cannot account for the control-retry queue or \
+             the reliable window there. A separate `abandon_outstanding()` beside a separate park \
+             is what was defeated twice — do not split them apart again.");
+        assert!(!arm.contains("loop {"),
+            "the OP_GMKick arm must not park by hand: `abandon_and_park()` IS the park, and a \
+             second one beside it would resurrect the ordering hole the fold removed (#641 N1-b)");
     }
 
     /// #641 structural guard, in the same spirit as

@@ -43,8 +43,19 @@ aligned tuple tables, aligned map inserts, `///` doc comments containing quoted 
 blocks. A guard that cries wolf gets disabled, so it is tuned to catch the mechanism that actually
 bit us and to stay silent otherwise. Run `--self-test` to confirm it still discriminates.
 
+KNOWN FALSE NEGATIVES — stated so nobody over-trusts a green run:
+
+  * A corruption at SHALLOW nesting slips under the threshold, e.g.
+    `warn!("lost the backslash        and continues")` with an 8-space indent. Threshold 12 buys a
+    quiet guard at the cost of the shallow cases; the three that actually bit us were 14/18/18.
+  * A continuation lost IMMEDIATELY after an embedded `\\n` escape, because indentation there is
+    exempt (see the `\\n` handling below).
+  * Anything spanning lines: this is a per-line check.
+
 OPT-OUT: `check-wrapped-literals: allow` in a comment on the same line. Prefer a format spec
-(`{:>8}`) over the opt-out if the padding really is deliberate.
+(`{:>8}`) over the opt-out if the padding really is deliberate. The tree currently has ZERO
+opt-outs, and `MAX_OPTOUTS` below keeps it that way — a blanket sprinkling of the marker would
+otherwise disable this check silently, one line at a time.
 
 Exit 0 = clean, 1 = a suspect literal was found (prints file:line:content).
 """
@@ -53,6 +64,9 @@ import sys
 
 THRESHOLD = 12
 ALLOW = "check-wrapped-literals: allow"
+# Raising this is a reviewable act. Each opt-out disables the check for one line, so an unbudgeted
+# marker is how a guard like this dies quietly (#641 review N2-b).
+MAX_OPTOUTS = 0
 
 
 def suspect_runs(line: str) -> bool:
@@ -67,18 +81,52 @@ def suspect_runs(line: str) -> bool:
             # Comments end the code portion of the line; quoted text inside them is prose.
             if c == "/" and i + 1 < n and line[i + 1] == "/":
                 return False
-            # Raw strings (r"..", r#".."#) intentionally preserve whitespace — skip the whole line
-            # rather than mis-parse the hashes.
+            # A CHAR literal containing a quote — `'"'` — used to flip string parity for the rest of
+            # the line, in BOTH directions: a false positive on padding that was outside any string,
+            # and (the dangerous one) a false negative that hid a real corruption sharing the line.
+            # Skip `'X'` and `'\X'`; a lifetime (`&'a str`) has no closing quote, so fall through and
+            # advance one char. (#641 review N2-b defect 1)
+            if c == "'":
+                for width in (3, 4):  # 'X'  and  '\X'
+                    if i + width <= n and line[i + width - 1] == "'":
+                        i += width
+                        break
+                else:
+                    i += 1
+                continue
+            # Raw strings (r"..", r#"..."#): skip exactly the literal, by counting its hashes and
+            # finding the matching terminator. Previously the whole LINE was skipped, which silently
+            # disabled the check for any real corruption sharing it. (#641 review N2-b defect 3)
             if c == "r" and i + 1 < n and line[i + 1] in ('"', "#"):
-                return False
+                j = i + 1
+                hashes = 0
+                while j < n and line[j] == "#":
+                    hashes += 1
+                    j += 1
+                if j < n and line[j] == '"':
+                    close = line.find('"' + "#" * hashes, j + 1)
+                    if close == -1:
+                        return False  # unterminated on this line — nothing more to say about it
+                    i = close + 1 + hashes
+                    continue
+                i += 1
+                continue
             if c == '"':
                 in_str, run, seen_text = True, 0, False
             i += 1
             continue
         # Inside a string.
         if c == "\\":
-            i += 2  # an escape; consumes the next char
-            run, seen_text = 0, True
+            # An embedded `\n` starts a fresh visual line inside the literal, and indenting after it
+            # is the same normal idiom the `seen_text` gate already exempts at the literal's START
+            # (`eprintln!("Usage:\n            eqoxide --config NAME")`). Treat it the same way.
+            # Cost, stated rather than hidden: a continuation lost IMMEDIATELY after a `\n` escape
+            # is now invisible to this check. (#641 review N2-b defect 2 — this also retired the
+            # tree's only opt-out.)
+            escaped = line[i + 1] if i + 1 < n else ""
+            i += 2  # an escape consumes the next char
+            run = 0
+            seen_text = escaped not in ("n", "r")
             continue
         if c == '"':
             in_str = False
@@ -104,6 +152,12 @@ def self_test() -> int:
         'assert!(x, "still queued for retry —                  these are NOT sent (#641)");',
         'warn!("besides its definition —              expected 3 mentions (definition + two)");',
         'assert_ne!(k, W, "fails with EMSGSIZE from the real sendto — if this is                  WouldBlock");',
+        # N2-b defect 1, the SILENT direction: a char literal holding a quote used to flip string
+        # parity for the rest of the line, hiding a real corruption after it.
+        'let q = \'"\'; warn!("lost the backslash              and then continues");',
+        # N2-b defect 3: a raw string earlier on the line used to disable the check for the WHOLE
+        # line, hiding a real corruption sharing it.
+        'let re = r"x"; warn!("lost the backslash              and then continues");',
     ]
     fine = [
         '("ELF", "elf",       "Elf"),',                      # aligned tuple table (padding outside)
@@ -114,6 +168,14 @@ def self_test() -> int:
         '/// 199 "Insufficient Mana"                 (spells.cpp:490)',  # doc comment, not code
         'let s = "a normal message with single spaces";',
         'let s = "wrapped correctly \\',                     # a real continuation: no run at all
+        # N2-b defect 1, the NOISY direction: the padding here is between literals, not inside one.
+        'let q = \'"\'; let t = [("a",              "b")];',
+        # N2-b defect 2: indenting after an embedded \n is the same idiom as indenting at the start.
+        r'eprintln!("Usage:\n            eqoxide --config NAME");',
+        # A lifetime is not a char literal and must not eat the following quote.
+        'fn f<\'a>(s: &\'a str) { warn!("plain message"); }',
+        # A raw string must be skipped precisely, not swallow the rest of the line.
+        'let re = r#"a"b"#; let t = [("a",              "b")];',
     ]
     bad = [s for s in corrupt if not suspect_runs(s)]
     noisy = [s for s in fine if suspect_runs(s)]
@@ -136,17 +198,28 @@ def main() -> int:
     files = subprocess.run(["git", "-C", root, "ls-files", "*.rs"],
                            capture_output=True, text=True, check=True).stdout.split()
     hits = []
+    optouts = []
     for f in files:
         try:
             with open(f"{root}/{f}", encoding="utf-8") as fh:
                 for lineno, line in enumerate(fh, 1):
                     line = line.rstrip("\n")
                     if ALLOW in line:
+                        optouts.append(f"{f}:{lineno}")
                         continue
                     if suspect_runs(line):
                         hits.append(f"{f}:{lineno}: {line.strip()[:160]}")
         except (OSError, UnicodeDecodeError):
             continue
+
+    if len(optouts) > MAX_OPTOUTS:
+        print(f"check-wrapped-literals: FAILED — {len(optouts)} opt-out marker(s), budget is "
+              f"{MAX_OPTOUTS}:", file=sys.stderr)
+        print("\n".join(f"  {o}" for o in optouts), file=sys.stderr)
+        print("Each marker disables this check for one line. If the new one is genuinely deliberate "
+              "padding,\nraise MAX_OPTOUTS in this script so the decision is reviewed rather than "
+              "absorbed silently.", file=sys.stderr)
+        return 1
 
     if hits:
         print("\n".join(hits))

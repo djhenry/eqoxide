@@ -355,21 +355,20 @@ pub async fn run_gameplay_phase(
                     // a failed disconnect changes nothing we can act on — the session is gone either
                     // way and we shut down next.
                     let _ = s.send_session_disconnect();
-                    // #641 review R3: account the outstanding windows BEFORE parking. This task
-                    // never returns and is never unwound, so `Drop` never runs here — without this
-                    // call, ACKs still queued in `pending_control` (and un-ACKed reliables) would be
-                    // counted in `send_deferred` and never in `send_failures`, making
-                    // `NetHealth::send_deferred`'s "a deferred datagram that is later abandoned is
-                    // counted in both" true everywhere except this one path. Synchronous, so it
-                    // completes before the park below. Practical consequence is nil — we are already
-                    // kicked — but a counter that is honest "except on one path" decays into a
-                    // counter nobody trusts. Mirrors what `perform_clean_shutdown` does explicitly.
-                    s.abandon_outstanding();
                     // We're already booted, so no OP_Logout. Request shutdown: the render loop's
                     // `about_to_wait` exits the winit event loop on the main thread, which tears
                     // down cleanly and exits the process. Idle here; do NOT return (avoids reconnect).
                     shutdown.store(true, Ordering::Relaxed);
-                    loop { sleep(Duration::from_millis(200)).await; }
+                    // #641 review R3/N1-b: accounts the outstanding windows, THEN parks, in one
+                    // call that never returns. This task is never unwound, so `Drop` never runs
+                    // here — without the accounting, ACKs still queued in `pending_control` (and
+                    // un-ACKed reliables) would sit in `send_deferred` and never reach
+                    // `send_failures`, making that counter honest on every path but this one.
+                    // Folded into a single call because the separate-call version was defeated
+                    // twice by ordinary refactors (respelling the park; extracting the cleanup into
+                    // an uncalled closure) while every source-level guard stayed green. There is now
+                    // no ordering to get wrong: parking here IS accounting.
+                    s.abandon_and_park().await;
                 }
                 OP_REQUEST_CLIENT_ZONE_CHANGE if packet.payload.len() >= 24 => {
                     // Server wants us to move — either a zone transition or a same-zone teleport
