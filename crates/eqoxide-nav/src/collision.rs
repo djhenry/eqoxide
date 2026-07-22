@@ -1840,6 +1840,16 @@ impl Collision {
     /// direction: the fixed probe spacing is what removes the diagonal's extra permissiveness (its
     /// longer run no longer launders the same face).
     ///
+    /// **Where the rejection actually happens — read this before editing the loop.** No INTERMEDIATE
+    /// probe ever returns `false`. The envelope is applied to them as the CAP on how far `prev_z` may
+    /// climb at each step (`column_floors` is windowed to `prev_z + allow`), so a probe whose only
+    /// floor sits above the envelope simply finds nothing and leaves `prev_z` where it was — exactly
+    /// like a probe over a void. The single verdict is the FINAL comparison, `bz - prev_z <= allow`:
+    /// a face too tall to be climbed en route shows up as a `prev_z` that never got off the low
+    /// ground, and the hop is refused at its destination. This is deliberate (it is what makes the
+    /// greedy walk equivalent to the exhaustive search over floor sequences); a per-segment
+    /// early-`false` would reject legal profiles whose floors are simply sampled unevenly.
+    ///
     /// Callers gate on `rise > step_up` — a hop whose endpoint rise the controller can plainly step
     /// has nothing to launder, and flat terrain pays zero extra queries.
     pub fn walk_profile_ok(&self, a: [f32; 2], az: f32, b: [f32; 2], bz: f32,

@@ -765,9 +765,20 @@ use eqoxide_ipc::MoveIntent;
     /// the SAME total rise (z = 0.8·(e−36) + 0.8·(n−36); steepest ascent, along the hop diagonal,
     /// is grade 1.13): the profile the controller genuinely CAN walk. The pair pins the fix from
     /// both sides — same hop, same rise, only the PROFILE differs, and only the profile may decide.
+    ///
+    /// **The plain is L-shaped: it deliberately does NOT extend under the mesa** (no floor at z = 0
+    /// over east > 42.8 ∧ north > 42.8). That is what makes the goal column `(60, 60)` contain the
+    /// mesa top and nothing else, so *the only floor sequence to the goal is the profile under
+    /// test.* An earlier revision of this fixture ran the plain under the mesa and sealed it with
+    /// walls in the vertical-face branch only; the ramp branch was then routable at z = 0 the whole
+    /// way, and its `route.is_some()` assertion passed even with `walk_profile_ok` hard-wired to
+    /// reject every rising walk edge — a vacuous over-tightening guard. Keep the goal column
+    /// single-floored, or the guard silently stops guarding.
     fn mesa_scene(ramp: bool) -> Collision {
         let mut terrain = vec![
-            floor_at(0.0, 0.0, 80.0, 0.0, 80.0),     // the plain
+            // The plain, L-shaped — open ground everywhere EXCEPT under the mesa (see above).
+            floor_at(0.0, 0.0, 42.8, 0.0, 80.0),
+            floor_at(0.0, 42.8, 80.0, 0.0, 42.8),
             floor_at(12.8, 42.8, 80.0, 42.8, 80.0),  // the mesa top
         ];
         if ramp {
@@ -843,6 +854,13 @@ use eqoxide_ipc::MoveIntent;
     /// line): the controller CAN walk this (pinned below), so the planner must still admit it.
     /// A fix that turned this into `no_path` would trade the #617 wedge for a "can't leave spawn"
     /// regression — honest, but a different lie about the world.
+    ///
+    /// The guard only bites because the plain does not run under the mesa (see `mesa_scene`), so
+    /// the goal column holds the mesa top alone and a route MUST climb the ramp. `route.is_some()`
+    /// on its own would not be enough even so — it cannot tell a climb from a detour — so the
+    /// route is also required to contain an intermediate altitude, i.e. to have used the ramp.
+    /// Mutation-verified: hard-wiring `walk_profile_ok` to `return false` (reject every rising
+    /// walk edge — maximal over-tightening) turns this test RED.
     #[test]
     fn planner_still_routes_up_a_genuinely_walkable_ramp_of_the_same_rise() {
         let c = mesa_scene(true);
@@ -868,5 +886,8 @@ use eqoxide_ipc::MoveIntent;
         let route = c.find_path(start, goal, PLAYER_RADIUS, &[], false);
         assert!(route.is_some(),
             "planner refused a ramp the controller demonstrably walks (#630 over-tightening)");
+        assert!(route.as_ref().unwrap().iter().any(|w| w[2] > 0.5 && w[2] < 12.5),
+            "route must climb the RAMP (an intermediate z), not sneak to the goal on the flat: \
+             {route:?}");
     }
 
