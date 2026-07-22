@@ -1660,6 +1660,10 @@ mod zone_asset_gate_tests {
     #[tokio::test]
     async fn debug_reports_a_live_net_thread_as_null() {
         let (_, j) = get(ready_state(), "/debug").await;
+        // PRESENT-and-null, not merely absent: `j["missing_key"]` also renders as `Null`, so without
+        // this the test would stay green if the field were dropped from the payload entirely
+        // (#647 review, F3). Absence of trouble must be STATED, not inferred from a missing key.
+        assert!(j.get("net_thread_dead").is_some(), "the field must be present, not omitted");
         assert_eq!(j["net_thread_dead"], serde_json::Value::Null);
     }
 

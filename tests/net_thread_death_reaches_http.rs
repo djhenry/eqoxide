@@ -7,11 +7,18 @@
 //!
 //!   1. a REAL `std::thread` runs the REAL production wrapper (`eqoxide::model::run_net_thread`),
 //!      the exact function `src/main.rs` spawns `eq-net` through, with a body that panics;
-//!   2. the SAME `Arc` that thread wrote is the one handed to `HttpState`, mirroring `main.rs`'s
-//!      single-construction wiring (a second `Arc` would sever them and this test would fail —
-//!      which is the point);
+//!   2. the SAME `Arc` that thread wrote is the one handed to `HttpState` — the wiring shape
+//!      `main.rs` uses;
 //!   3. the assertion is on the decoded body of `GET /v1/observe/debug` served by the real axum
 //!      observe router.
+//!
+//! ⚠️ WHAT THIS DOES **NOT** COVER (#647 review, F1 — an earlier version of this comment claimed it
+//! did, and was wrong): this test constructs its own `Arc` and never executes `src/main.rs`. Nothing
+//! in the suite does. So if `main.rs` ever handed `spawn_camera_server` a FRESHLY constructed
+//! `Arc::new(Mutex::new(None))` instead of a clone of the one the thread writes — the #616-F1
+//! severing trap — every test here would still pass while the endpoint reported `null` forever. The
+//! reviewer verified that empirically. That wiring is held by inspection and by live validation
+//! ONLY. Do not read a green suite as proof of it.
 //!
 //! It lives in the APP crate because `run_net_thread` is app-layer (`src/model.rs`, above
 //! `eqoxide-http` in the crate graph) while the `HttpState` builder + `/debug` driver come from
@@ -70,6 +77,9 @@ async fn a_panicking_eq_net_thread_is_visible_at_v1_observe_debug() {
 async fn a_live_eq_net_thread_reports_null() {
     let dead: NetThreadDeadShared = Arc::new(Mutex::new(None));
     let j = debug_json(empty_state_with_net_thread_dead(dead)).await;
+    // PRESENT-and-null, not merely absent — `j["missing_key"]` is also `Null`, so this assertion is
+    // what stops the test passing on a payload that dropped the field (#647 review, F3).
+    assert!(j.get("net_thread_dead").is_some(), "the field must be present, not omitted");
     assert_eq!(j["net_thread_dead"], serde_json::Value::Null);
 }
 

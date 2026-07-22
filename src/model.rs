@@ -56,10 +56,14 @@ use crate::config::LoginConfig;
 
 /// The `eq-net` thread's terminal-death observable (#634, agent-honesty).
 ///
-/// `None` = the thread is running (or, before `main.rs` spawns it, is about to be). `Some(reason)` =
-/// **it is gone and will not come back this session** — nothing will ever drain a command slot or
-/// publish a `GameState` snapshot again. Written exactly once, by [`run_net_thread`]; read by
-/// `eqoxide_http` and served on `GET /v1/observe/debug` as `net_thread_dead`.
+/// `None` = the thread **has not ended** — which is NOT the same as "is healthy". A wedged,
+/// deadlocked or livelocked net thread has not unwound, so it still reads `None` here while
+/// publishing nothing; cross-check `snapshot_age_ms` for that case. This field is deliberately about
+/// TERMINALITY only, and conflating the two is exactly the distinction the whole change exists to
+/// draw. `Some(reason)` = **it is gone and will not come back this session** — nothing will ever
+/// drain a command slot or publish a `GameState` snapshot again. Written exactly once, by
+/// [`run_net_thread`]; read by `eqoxide_http` and served on `GET /v1/observe/debug` as
+/// `net_thread_dead`.
 ///
 /// Same shared-`Arc`-identity discipline as `common_assets_failed` / `model_sync_dead` (#616): the
 /// ONE `Arc` constructed in `main.rs` is cloned into both the thread closure and `spawn_camera_server`.
@@ -117,6 +121,14 @@ fn panic_payload_text(p: &(dyn std::any::Any + Send)) -> String {
 /// `tokio::spawn` in `eqoxide-net` is inside a `#[cfg(test)]` module), so every panic in the net
 /// path unwinds through this frame. A panic on a `eq-net-tokio-worker` pool thread would NOT be
 /// caught here — tokio catches those itself — but nothing production runs there today.
+///
+/// ⚠️ ORDERING, for whoever adds the first production `tokio::spawn` (#647 review, F6): the tokio
+/// `Runtime` is constructed INSIDE `body` (see `main.rs`), so it is dropped during the unwind —
+/// BEFORE this function reaches its publish. `Runtime::drop` blocks until spawned tasks wind down,
+/// so a task that refuses to would stall the unwind here and the death report would never be
+/// written, silently restoring the exact bug this function removes. It cannot happen today (no
+/// production `tokio::spawn` exists on this path). If you add one, either construct the runtime
+/// OUTSIDE `body` or publish before it drops.
 pub fn run_net_thread<F>(
     dead:     &NetThreadDeadShared,
     shutdown: &std::sync::atomic::AtomicBool,
