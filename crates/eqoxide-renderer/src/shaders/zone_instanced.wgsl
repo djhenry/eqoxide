@@ -34,8 +34,11 @@ fn shadow_factor(world_pos: vec3<f32>) -> f32 {
     return sum / 9.0;
 }
 
+// Ambient floor for shadowed instanced (placed-object) surfaces — MUST match zone.wgsl's
+// `apply_shadow` (see that file for the eqoxide#614 rationale behind 0.25). Enforced by
+// shadow_shader.rs::ambient_floor_matches_between_zone_and_zone_instanced (fails if they drift).
 fn apply_shadow(color: vec3<f32>, world_pos: vec3<f32>) -> vec3<f32> {
-    return color * mix(0.45, 1.0, shadow_factor(world_pos));
+    return color * mix(0.25, 1.0, shadow_factor(world_pos));
 }
 
 struct VertexInput {
