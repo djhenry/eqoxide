@@ -440,9 +440,24 @@ mod tests {
         // gradient (not just the raw color constants) so a breakpoint regression that moved hour
         // 5/17 back into night/day would also fail this: at 05:00 native red exceeds green (pink
         // dawn); at 17:00 native blue exceeds red exceeds green (purple dusk).
+        //
+        // Dawn asserts the FULL R>B>G chain, not just R>G (PR #637 review, F1): R>G alone lets a
+        // wrong-hue-family mutation through — e.g. a genuinely BLUE dawn `(61,60,136)` still has
+        // R(61)>G(60) by a single 8-bit step, and in fact satisfies dusk's B>R>G signature instead
+        // of dawn's own. R>B>G is what actually distinguishes "pink dawn" from "purple dusk" (both
+        // have R>G in this palette); this was mutation-checked against that exact triple (see the
+        // PR body) and confirmed the un-tightened version passed it while this one fails it.
         let dawn = sky_colors(5.0);
-        assert!(dawn.horizon[0] > dawn.horizon[1], "dawn horizon should have R>G: {:?}", dawn.horizon);
-        assert!(dawn.zenith[0] > dawn.zenith[1], "dawn zenith should have R>G: {:?}", dawn.zenith);
+        assert!(
+            dawn.horizon[0] > dawn.horizon[2] && dawn.horizon[2] > dawn.horizon[1],
+            "dawn horizon should have R>B>G: {:?}",
+            dawn.horizon
+        );
+        assert!(
+            dawn.zenith[0] > dawn.zenith[2] && dawn.zenith[2] > dawn.zenith[1],
+            "dawn zenith should have R>B>G: {:?}",
+            dawn.zenith
+        );
 
         let dusk = sky_colors(17.0);
         assert!(
@@ -457,24 +472,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn eleven_sampled_hours_show_more_than_three_distinct_colors_eqoxide_628() {
-        // eqoxide#628 defect 2: "eqoxide has only three distinct sky values across 11 sampled
-        // hours where native grades continuously". Assert the fix produces strictly more than
-        // three distinct SkyColors across the issue's exact 11 sampled hours (night, dawn, day,
-        // dusk = 4, the minimum that actually reflects a 4-phase cycle).
-        let hours = [0.0, 4.0, 5.0, 6.0, 7.0, 13.0, 17.0, 18.0, 19.0, 20.0, 22.0];
-        let mut distinct: Vec<SkyColors> = Vec::new();
-        for h in hours {
-            let c = sky_colors(h);
-            if !distinct.contains(&c) {
-                distinct.push(c);
-            }
-        }
-        assert!(
-            distinct.len() > 3,
-            "expected more than 3 distinct sky colors across the 11 native-sampled hours, got {}",
-            distinct.len()
-        );
-    }
+    // NOTE (PR #637 review, F2): this file previously had
+    // `eleven_sampled_hours_show_more_than_three_distinct_colors_eqoxide_628`, asserting >3
+    // distinct `SkyColors` values across the 11 native-sampled hours (eqoxide#628 defect 2: "only
+    // three distinct sky values across 11 sampled hours"). The independent reviewer confirmed it
+    // is non-discriminating: grafted onto unmodified main, it passes there too, because main's old
+    // (too-late) breakpoints still produce several hours mid-transition-blend, and any two
+    // distinct-but-arbitrary blended floats count as "distinct" regardless of whether a genuine
+    // dawn/dusk phase was ever reached. Raw distinct-color counting can't tell a real 4-phase cycle
+    // apart from a handful of incidental blend artifacts. Deleted rather than patched: the actual
+    // "no dawn/no dusk" defect is already conclusively covered by
+    // `native_hour_table_matches_measured_luma_eqoxide_628` (fails on main's flat night-at-hour-5
+    // and near-day-at-hour-17 values) and `dawn_and_dusk_hue_ordering_matches_native_eqoxide_628`
+    // (fails on main because hours 5/17 never reach the dawn/dusk phase at all), so no coverage is
+    // lost by removing a test that could not detect its own bug.
 }
