@@ -40,6 +40,18 @@ pub fn empty_state_with_net_health(net_health: eqoxide_ipc::NetHealthShared) -> 
     HttpState { net_health, ..empty_state() }
 }
 
+/// As [`empty_state`], but wired to a CALLER-OWNED `net_thread_dead` slot — the same `Arc` the
+/// `eq-net` thread's `run_net_thread` wrapper writes on its way out (#634). Exposed for the
+/// cross-crate proof: the app crate panics a REAL thread through the REAL production wrapper and
+/// then asserts the death is visible in THIS crate's `/v1/observe/debug` JSON, i.e. that it reaches
+/// something an agent can poll rather than merely landing in an internal field. Same shape, and same
+/// reason, as [`empty_state_with_net_health`] above (#612).
+pub fn empty_state_with_net_thread_dead(
+    net_thread_dead: Arc<Mutex<Option<String>>>,
+) -> HttpState {
+    HttpState { net_thread_dead, ..empty_state() }
+}
+
 pub fn empty_state() -> HttpState {
     // `CameraSlots` has no `Default` impl (`CameraSnapshot`'s fields aren't Default-able), so
     // it's built by hand; every other bundle is plain `Default::default()`. `nav`, `camera`, and
@@ -80,6 +92,8 @@ pub fn empty_state() -> HttpState {
         // failure set these explicitly.
         common_assets_failed: Arc::new(Mutex::new(None)),
         model_sync_dead: Arc::new(Mutex::new(None)),
+        // #634: healthy by default — the net thread is alive. Tests that exercise its death set it.
+        net_thread_dead: Arc::new(Mutex::new(None)),
         command,
         social: Default::default(),
         merchant_slots: Default::default(),

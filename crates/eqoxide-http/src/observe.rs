@@ -367,6 +367,14 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     //     is over.
     let common_assets_failed = s.common_assets_failed.lock().unwrap().clone();
     let model_sync_dead = s.model_sync_dead.lock().unwrap().clone();
+    // #634 (agent-honesty): the `eq-net` thread — the Model, and the sole writer of every world field
+    // in this response — has ended. `null` while it is running. Non-null means the `player`/`zone`/
+    // entity/health values above are a FROZEN snapshot that will never update again, no matter how
+    // plausible they look. `snapshot_age_ms` already exposes the staleness; this exposes its
+    // TERMINALITY, which no age can: a 5-second-old tick is equally consistent with a busy loop and
+    // with a thread that no longer exists. Read them together — age says "is this stale?",
+    // `net_thread_dead` says "will it ever un-stale?" (no).
+    let net_thread_dead = s.net_thread_dead.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let (guild_name, guild_id, guild_rank) = {
         let g = s.guild_slots.guild.lock().unwrap();
         (g.guild_name.clone(), g.guild_id, g.guild_rank)
@@ -513,6 +521,9 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // these are built, above.
         "common_assets_failed": common_assets_failed,
         "model_sync_dead": model_sync_dead,
+        // #634: the network thread itself is dead — `null` while it is alive. When this is non-null,
+        // EVERY other field in this payload is a frozen final snapshot. See where it is built.
+        "net_thread_dead": net_thread_dead,
         // The FINE 2u STEERING tier (#382). `null` while it is healthy (a complete fine route to its
         // carrot) or has not yet answered. Non-null when the tier that is actually steering the
         // character cannot see a way through the next 40u — and it says WHICH kind of cannot:
@@ -1641,6 +1652,35 @@ mod zone_asset_gate_tests {
             Some("the model-sync-worker thread PANICKED".to_string());
         let (_, j) = get(s, "/debug").await;
         assert_eq!(j["model_sync_dead"], "the model-sync-worker thread PANICKED");
+    }
+
+    /// #634 (agent-honesty): the `eq-net` thread's death must be visible in the REAL `/debug` body.
+    /// Healthy-by-default first — if this field were non-null on a live session it could not
+    /// discriminate anything.
+    #[tokio::test]
+    async fn debug_reports_a_live_net_thread_as_null() {
+        let (_, j) = get(ready_state(), "/debug").await;
+        assert_eq!(j["net_thread_dead"], serde_json::Value::Null);
+    }
+
+    /// The whole point of #634: the world fields are still fully populated and plausible, and the
+    /// ONLY thing distinguishing this response from a healthy one is `net_thread_dead`. The assertion
+    /// on `player.zone` is deliberate — it pins that the frozen-but-plausible payload is exactly what
+    /// an agent would otherwise have believed.
+    #[tokio::test]
+    async fn debug_surfaces_a_dead_net_thread_alongside_the_frozen_world_it_invalidates() {
+        let s = ready_state();
+        set_gs(&s, |gs| gs.player_x = 100.0);
+        *s.net_thread_dead.lock().unwrap() = Some(
+            "the eq-net thread PANICKED (boom) — the client is no longer talking to the server."
+                .to_string(),
+        );
+        let (_, j) = get(s, "/debug").await;
+        assert_eq!(j["player"]["zone"], FIXTURE_ZONE, "the stale world is still served, as before");
+        assert!(
+            j["net_thread_dead"].as_str().unwrap().contains("PANICKED"),
+            "…but it is now explicitly marked dead: {}", j["net_thread_dead"]
+        );
     }
 
     #[tokio::test]
