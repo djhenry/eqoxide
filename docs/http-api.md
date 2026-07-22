@@ -461,7 +461,7 @@ the client for them to be right (#343).
 | `send_failures_unretried` | The subset of `send_failures` with no client-side retransmit of that datagram. |
 | `last_send_error` | `ErrorKind` name of the most recent send failure (`"WouldBlock"`, `"Uncategorized"`, …), or `null`. |
 | `last_send_error_age_ms` | ms since that failure, measured at read time, or `null`. Distinguishes an old blip from an ongoing failure. |
-| `reliable_abandoned` | **Un-ACKed reliable datagrams left outstanding when a session ENDED** — the loss `send_failures_unretried` cannot see. Cumulative. Measured `0` across three clean zone handoffs, so **any nonzero value is signal**. Does not cover a server-side session drop — see below. |
+| `reliable_abandoned` | **Un-ACKed reliable datagrams left outstanding when a session ENDED** — the loss `send_failures_unretried` cannot see. Cumulative. Measured `0` across three clean zone handoffs, so **a nonzero value during play is signal** (clean shutdown is the measured exception). Does not cover a server-side session drop — see below. |
 
 **`last_packet_age_ms` is not a disconnect signal.** An idle EQ session — a character sitting alone
 in a quiet zone — routinely goes **40+ seconds with no application packet** while the link is
@@ -504,11 +504,17 @@ Every send now funnels through one place that records its own failure, so:
   moment is genuinely lost while `send_failures_unretried` reads `0` for all of them.
   `reliable_abandoned` counts exactly those. It is an **upper bound** on abandoned reliable payload:
   a datagram that reached the wire and whose ACK merely had not arrived yet is counted too.
-- **`reliable_abandoned` is measured at 0 in normal play, so treat any nonzero value as signal.**
-  Three consecutive clean handoffs (`qeynos → qeytoqrg → qeynos → freportw`) left it at `0` — the
-  resend window was empty at every handoff. (An earlier draft of this page predicted, from reasoning
-  and unmeasured, that clean handoffs "routinely leave a small number"; measurement said otherwise
-  and the claim is withdrawn.)
+- **`reliable_abandoned` is measured at 0 across zone handoffs, so treat a nonzero value DURING PLAY
+  as signal.** Three consecutive clean handoffs (`qeynos → qeytoqrg → qeynos → freportw`) left it at
+  `0` — the resend window was empty at every handoff. (An earlier draft of this page predicted, from
+  reasoning and unmeasured, that clean handoffs "routinely leave a small number"; measurement said
+  otherwise and the claim is withdrawn.)
+- **Clean shutdown is the one measured exception, and is expected to be nonzero.** Two live
+  `POST /v1/lifecycle/exit` runs measured `4` and `8`: the closing OP_Logout / SessionDisconnect are
+  still un-ACKed when the process leaves. That is by construction, and no agent can observe it
+  anyway — the process is exiting. Do not generalise the handoff-measured `0` to this path. (The
+  handoff figure was measured before the shutdown path existed; stating both is what keeps the two
+  bullets from contradicting each other, which round-3 review N1 caught them doing.)
 - **What `reliable_abandoned` does and does not cover.** It rises on: zone handoff, world reconnect,
   zone-in failure, and clean shutdown. It does **not** rise on a **server-side session drop** (the
   ~30s `resend_timeout` case), because the client currently never notices one — inbound

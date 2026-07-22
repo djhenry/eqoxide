@@ -564,15 +564,18 @@ impl EqStream {
         // (see `send_tracked`), so `poll_resend` re-sends it verbatim until the server ACKs it —
         // FOR AS LONG AS THE SESSION LIVES. Returning "failed" here would be a lie in the opposite
         // direction while that holds: the packet is delayed by one backoff, not lost.
-        // It does NOT hold across a session end (#612 review F1): if the server's ~30s
-        // resend_timeout drops us, or a zone handoff replaces the stream, whatever is still
-        // outstanding is abandoned — which `EqStream::drop` counts into
-        // `NetHealth::reliable_abandoned` precisely so that case is not a silent hole in this claim.
+        // It does NOT hold across a session end (#612 review F1): when a zone handoff or world
+        // reconnect replaces the stream, whatever is still outstanding is abandoned — which
+        // `EqStream::drop` counts into `NetHealth::reliable_abandoned`, and clean shutdown accounts
+        // explicitly (see `abandon_outstanding`). A SERVER-side ~30s `resend_timeout` drop is NOT
+        // covered by that counter: the client never notices one today, so the stream is never torn
+        // down and nothing counts it (#642). Do not read `reliable_abandoned == 0` as proof that
+        // case did not happen. (Round-3 review B2 caught this comment claiming the opposite.)
         // What the agent needs is (a) the fact recorded, which `transmit` does in
         // `NetHealth::send_failures` (pollable at /v1/observe/debug), (b) `reliable_abandoned` for
-        // the session-end case, and (c) `connected: false` if the socket is dead for good — which
-        // the 15s link clock raises BEFORE the server's 30s drop, so the agent is never left
-        // believing a healthy session swallowed its command.
+        // the session-ends-under-our-control case, and (c) `connected: false` — which the 15s link
+        // clock raises BEFORE the server's 30s drop, and which is therefore the ONLY honest signal
+        // for the uncovered case.
         if let Err(e) = self.send_reliable(&app_data) {
             tracing::debug!(
                 "NET: reliable opcode 0x{:04X} failed its first send ({:?}); retained in the resend \
@@ -1376,6 +1379,22 @@ pub(crate) async fn test_stream_with_peer_encoded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Strip whole-line `//` comments from Rust source before a source-level guard searches it
+    /// (#612 round-3 review, B1).
+    ///
+    /// Every guard in this file that asserts "this call exists" or "this call appears exactly N
+    /// times" MUST run its source through here first. Without it a guard is satisfied by a mention
+    /// in a comment — and, worse, `contains("foo()")` on raw source is defeated by simply COMMENTING
+    /// OUT the call, which is the realistic way such a call regresses (a review mutation did exactly
+    /// that and the suite stayed green). Whether a nearby doc comment happens to match is then pure
+    /// accident, which is not a property a guard may depend on.
+    fn strip_comments(src: &str) -> String {
+        src.lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     /// #603 review follow-up (F2): the `writable().await` line above `stream.send_session_request()`
     /// in `connect` is load-bearing — remove it and the pre-loop send goes back to being a
@@ -2190,17 +2209,23 @@ mod tests {
             "the subsequent Drop must NOT double-count (#612 R1)");
 
         // And the shutdown path must actually call it. `perform_clean_shutdown` lives in gameplay.rs.
-        const GAMEPLAY_RS_SRC: &str = include_str!("gameplay.rs");
-        let at = GAMEPLAY_RS_SRC.find("async fn perform_clean_shutdown(")
+        // COMMENTS STRIPPED FIRST (#612 round-3 review, B1). The previous version searched raw
+        // source, so COMMENTING OUT the call left the guard green — the accounting was dead on the
+        // one path `Drop` cannot reach and nothing failed. It only discriminated against outright
+        // DELETION, and even that was accidental: the doc comment above the call happens to omit the
+        // parentheses. A guard must not depend on that kind of luck.
+        let gameplay_src = strip_comments(include_str!("gameplay.rs"));
+        let at = gameplay_src.find("async fn perform_clean_shutdown(")
             .expect("gameplay.rs: perform_clean_shutdown not found");
         // Scan from the fn to the end of the file's next top-level item boundary — the function is
         // short and ends at the first column-0 `}`.
-        let body_end = GAMEPLAY_RS_SRC[at..].find("\n}\n").expect("unterminated fn") + at;
-        let body = &GAMEPLAY_RS_SRC[at..body_end];
+        let body_end = gameplay_src[at..].find("\n}\n").expect("unterminated fn") + at;
+        let body = &gameplay_src[at..body_end];
         assert!(body.contains("abandon_outstanding()"),
             "perform_clean_shutdown must call `abandon_outstanding()` explicitly (#612 R1): its \
              task parks forever after returning, so `Drop` never runs and the outstanding reliable \
-             window would go unaccounted on the clean-shutdown path.");
+             window would go unaccounted on the clean-shutdown path. (Commenting the call out counts \
+             as removing it — comments are stripped before this check.)");
     }
 
     /// #612 structural guard. The fix is only durable if there stays exactly ONE place in this CRATE
@@ -2227,14 +2252,11 @@ mod tests {
             ("lib.rs",           include_str!("lib.rs")),
         ];
         let needle = concat!("socket.try_", "send(");
-        // Comment lines are excluded: several doc comments quote the old
+        // Comment lines are excluded (`strip_comments`): several doc comments quote the old
         // `let _ = self.socket.try_send(..)` line precisely to explain what #612 fixed, and counting
         // those would make this guard unmaintainable (and, worse, satisfiable by deleting a comment).
-        let strip = |src: &str| -> String {
-            src.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
-        };
         let per_file: Vec<(&str, usize, String)> = SRCS.iter()
-            .map(|(name, src)| { let c = strip(src); (*name, c.matches(needle).count(), c) })
+            .map(|(name, src)| { let c = strip_comments(src); (*name, c.matches(needle).count(), c) })
             .collect();
         let hits: usize = per_file.iter().map(|(_, n, _)| n).sum();
         let counts: Vec<String> = per_file.iter().map(|(n, c, _)| format!("{n}={c}")).collect();

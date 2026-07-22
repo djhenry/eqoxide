@@ -624,8 +624,11 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         //                              shutdown). The next session's window starts empty, so these
         //                              are not retransmitted. This is the reliable stream's loss
         //                              channel, and the one `send_failures_unretried` cannot see.
-        //                              MEASURED 0 across three clean zone handoffs → any nonzero
-        //                              value is signal, not routine noise.
+        //                              MEASURED 0 across three clean zone handoffs → a nonzero value
+        //                              DURING PLAY is signal, not routine noise. Clean shutdown is
+        //                              the measured exception (4 and 8 on two live exits): the final
+        //                              OP_Logout/SessionDisconnect are still un-ACKed when the
+        //                              process leaves, which no agent can observe anyway.
         //                              DOES NOT cover a server-side resend_timeout drop: the client
         //                              never notices one today (#642), so use `connected` for that.
         //   last_send_error          — ErrorKind of the most recent one ("WouldBlock", …), or null.

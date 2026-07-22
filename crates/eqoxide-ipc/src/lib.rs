@@ -391,8 +391,14 @@ pub struct NetHealth {
     /// → freportw) left this at 0, with zero abandonment WARNs** — the resend window was empty at
     /// every handoff. An earlier version of this doc predicted, from reasoning and explicitly
     /// unmeasured, that a clean handoff "routinely leaves a small number"; that was WRONG and would
-    /// have trained an agent to ignore the counter's most likely true positive. **Treat any nonzero
-    /// value as signal, not noise.**
+    /// have trained an agent to ignore the counter's most likely true positive. **Treat a nonzero
+    /// value DURING PLAY as signal, not noise.**
+    ///
+    /// **Clean shutdown is the one measured exception, and it is expected to be nonzero.** Two
+    /// live `/v1/lifecycle/exit` runs measured 4 and 8 (#612 round 3) — the OP_Logout and
+    /// SessionDisconnect at the end of a session are still un-ACKed when the process leaves. That
+    /// is by construction, not a defect, and it is invisible to an agent anyway because the process
+    /// is exiting. Scope the "0 is normal" reading to play, not to exit.
     ///
     /// **COVERAGE — read this before relying on a 0.** It is written where the abandonment can be
     /// observed, which is not everywhere a session can end:

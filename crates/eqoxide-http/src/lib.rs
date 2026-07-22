@@ -371,7 +371,8 @@ pub struct Health {
     pub last_send_error_age_ms: Option<u64>,
     /// #612 (review F1): un-ACKed RELIABLE datagrams abandoned when a session ended — the case the
     /// resend window does NOT cover, because the next session's window starts empty. Measured 0
-    /// across three clean zone handoffs, so treat any nonzero value as signal. Does NOT cover a
+    /// across three clean zone handoffs, so treat a nonzero value DURING PLAY as signal (clean
+    /// shutdown is the measured exception — 4 and 8 on two live exits). Does NOT cover a
     /// server-side `resend_timeout` drop (#642). See
     /// [`eqoxide_ipc::NetHealth::reliable_abandoned`] for the full contract and coverage list (it is
     /// an upper bound on abandoned reliable payload, not a proven count of lost commands).
