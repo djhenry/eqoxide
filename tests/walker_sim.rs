@@ -803,9 +803,10 @@ use eqoxide_ipc::MoveIntent;
     /// must show the laundered hop rejected as `local_rise`, and must show NO accepted walk edge
     /// climbing more than the controller's envelope onto the mesa.
     ///
-    /// Mutation checks (verified at authoring time, see PR): (1) removing the `walk_profile_ok`
-    /// call (unmodified main) → a route up the face is returned → RED; (2) loosening the envelope's
-    /// step term to the old STEP_H = 20 → RED.
+    /// Mutation checks (see PR): (1) removing the `walk_profile_ok` call (unmodified main) → a route
+    /// up the face is returned → RED; (2) loosening the envelope's step term to the old STEP_H = 20
+    /// → RED. Re-derived after the scene was reshaped (`walk_profile_ok` → `return true`, the
+    /// main-equivalent, still RED here) — the earlier evidence was collected on the old scene.
     #[test]
     fn planner_never_routes_up_a_vertical_face_a_diagonal_hop_launders() {
         let c = mesa_scene(false);
