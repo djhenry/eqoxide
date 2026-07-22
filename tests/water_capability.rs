@@ -20,8 +20,8 @@
 //! ```
 //!
 //! Two of them pin capability (what a swimmer CAN do, so a future gate cannot quietly forbid it);
-//! the third pins the #649 strand, offline and deterministically, at the coordinate the live client
-//! wedges on.
+//! the third pins the still-open #329 strand, offline and deterministically, at the coordinate the
+//! live client wedges on (its mechanism changed when #649 landed — see its doc comment).
 
 use eqoxide::assets::ZoneAssets;
 use eqoxide::movement::CharacterController;
@@ -73,25 +73,26 @@ fn swim_plane(col: &Collision, p: [f32; 3]) -> f32 {
 /// The qcat spawn pocket tops out at −55.978 (a ceiling slab at −55.969 caps it); the shaft one cell
 /// away tops out at −42.982 — a 12.996 u difference, and the edge #329's triage flagged as
 /// impossible. From anywhere in the pocket's water below the swim plane the controller swims across
-/// and buoyancy lifts it onto the SHAFT's plane, performing rises of **+15 u to +23 u** with no
+/// and buoyancy lifts it onto the SHAFT's plane, performing rises of **+17 u to +23 u** with no
 /// vertical input at all.
 ///
 /// Any future cap on water-edge rise must keep this green. A gate keyed on the source column's
 /// surface cannot: `haul_out_up` is 2.0.
 ///
-/// # ⚠️ This test is ENTANGLED with #649 — expect it to flip when that lands
+/// # Start depths re-derived when #649 landed (the entanglement is resolved)
 ///
-/// Its green currently *depends on* the very defect #649 tracks. The route from these start depths
-/// passes through the water-blind depenetration push-out, which drops the swimmer to a lower
-/// passage on the way (the same `nearest_floor(up = STEP_UP + GROUND_ORIGIN, down = 200)` that
-/// strands it on the lid from 2 u higher — one mechanism, both directions). Mutating the push-out
-/// out therefore takes this test RED **with a message blaming the withdrawn #648 premise**, which
-/// would be a misleading failure for whoever is fixing #649.
+/// This test used to run from −60, −62, −65 and −68, and its green at −59/−60 DEPENDED on the very
+/// defect #649 tracked: the water-blind depenetration push-out DROPPED the swimmer ~10 u to the
+/// pool floor on frame 0, and it crossed into the shaft from down there. With the push-out fixed a
+/// swimmer holds its own depth, so from −59/−60 ordinary buoyancy lifts it to the pocket's OWN swim
+/// plane (−57.978) *before* it reaches the shaft, where the swimming step-up mounts it on the
+/// −55.969 tile floor beside the pocket — the second, separate mechanism at that coordinate, still
+/// open (see the strand test below). The start depths were therefore re-derived against the fixed
+/// controller, exactly as this note used to instruct.
 ///
-/// So: if this goes red while you are working on #649, do NOT read it as "a swimmer can no longer
-/// rise" — re-derive the start depths against the fixed controller and re-record them. The
-/// CAPABILITY claim (buoyancy lifts a swimmer to the DESTINATION column's swim plane, unbounded by
-/// the source column's surface) is what must survive; these particular z values are not sacred.
+/// The CAPABILITY claim is unchanged and is what must survive: buoyancy lifts a swimmer to the
+/// DESTINATION column's swim plane, unbounded by the source column's surface (+17 to +23 u here
+/// against a `haul_out_up` of 2.0). The particular z values are not sacred.
 #[test]
 #[ignore = "asset-gated: needs baked qcat.glb + qcat.wtr at $EQZONES (#357)"]
 fn a_swimmer_rises_to_the_destination_columns_surface_not_its_own() {
@@ -103,7 +104,7 @@ fn a_swimmer_rises_to_the_destination_columns_surface_not_its_own() {
     assert!((pocket_surface - (-55.978)).abs() < 0.01, "fixture: pocket surface {pocket_surface}");
     assert!((shaft_plane - (-44.982)).abs() < 0.01, "fixture: shaft swim plane {shaft_plane}");
 
-    for z in [-60.0f32, -62.0, -65.0, -68.0] {
+    for z in [-62.0f32, -65.0, -68.0] {
         let from = [pocket_xy[0], pocket_xy[1], z];
         let end = swim_toward(&col, from, shaft, 12.0);
         assert!((end[2] - shaft_plane).abs() < 0.05,
@@ -148,29 +149,37 @@ fn stepped_canal_surfaces_are_swimmable_between() {
     }
 }
 
-/// **THE #329 / #649 STRAND, REPRODUCED OFFLINE TO FOUR DECIMALS.**
+/// **THE #329 STRAND, REPRODUCED OFFLINE TO FOUR DECIMALS — STILL OPEN.**
 ///
-/// Starting at the POCKET's own swim plane (−57.978) — two units above the depths that succeed
-/// above — the character is placed on the ceiling slab at **−55.9687** within ONE frame. That is
+/// Starting at the POCKET's own swim plane (−57.978) the character ends up on the tile floor at
+/// **−55.9687**, the coordinate the live client wedges on in the original #329 report. That floor is
 /// 0.009 u ABOVE the −55.978 waterline, so `in_water` is false, `swimming` is false, buoyancy never
-/// fires again, and it cannot sink back through the slab it was just placed on.
+/// fires again, and it cannot sink back through the slab it is standing on.
 ///
-/// The mechanism is the **depenetration push-out** (`CharacterController::depenetrate`), not the
-/// swimming step-up. In the ~12 u pocket the swimmer's `footprint_clear` fails, which reads as
-/// `embedded`; the ring push-out then looks for `nearest_floor(…, up = STEP_UP + GROUND_ORIGIN, …)`,
-/// finds the lid 2.009 u ABOVE, and sets `pos = [e, n, f]` with `on_ground = true`. It is
-/// water-blind: it hunts for a FLOOR rather than for a position a swimmer can occupy. Established by
-/// mutation, not by reading — disabling the swimming step-up (`(self.on_ground || false)`) leaves
-/// this test GREEN and the frame trace identical (+2.0092 u in frame 1 either way), while skipping
-/// the push-out for a body in water takes it RED and the swimmer proceeds laterally instead.
+/// # The mechanism CHANGED when #649 was fixed — read this before touching it
 ///
-/// −55.9687 is the coordinate the live client wedges on in the original #329 report. This is a
-/// one-way transition, and it is the real cause of that wedge — NOT a rise-capability limit, which
-/// the two tests above disprove. Tracked as #649; when that is fixed, this test's expectation flips
-/// and should be rewritten to assert the escape rather than the strand.
+/// #649 was the water-blind **depenetration push-out**: `footprint_clear` fails for any swimmer in a
+/// ~12 u pocket, which the net read as "embedded in rock" and recovered with
+/// `nearest_floor(up = STEP_UP + GROUND_ORIGIN, down = GROUND_DEPTH)` — the NEARER floor in either
+/// direction. It mounted the character here in ONE frame (dz +2.0092, `on_ground = true`). That is
+/// fixed: an afloat body now holds its own depth (`movement::Recovery`), and the frame-1 teleport is
+/// gone — verified by driving this controller (frame 1 now holds −57.97798).
+///
+/// The end coordinate did **not** change, because a SECOND, independent mechanism reaches it: with
+/// the swimmer left in the water, it swims laterally until (frame ~33) the **swimming step-up** —
+/// the #191 haul-out branch, `(self.on_ground || swimming) && low_hit → try_step_up` — climbs the
+/// 2.009 u onto that tile floor, whose footprint IS clear and which has open headroom. It looks
+/// locally identical to hauling out onto a bank, and A* routes out of it to 11 of 12 sampled far
+/// goals, so it is not obviously refusable on local geometry alone. That half is deliberately NOT
+/// fixed here (it is the issue-body's "angle 1" and needs its own blast-radius pass against #191).
+///
+/// So: this test is NOT a pin on #649's defect — the #649 pins are the asset-free
+/// `movement::tests::depenetration_never_{mounts,drops}_a_swimmer_*` unit tests, which fail on the
+/// unfixed controller. This one pins the remaining #329 live wedge, and when the haul-out half is
+/// fixed its expectation flips to asserting the escape.
 #[test]
 #[ignore = "asset-gated: needs baked qcat.glb + qcat.wtr at $EQZONES (#357)"]
-fn qcat_pocket_swim_plane_strands_the_swimmer_on_the_ceiling_lid() {
+fn qcat_pocket_swim_plane_strands_the_swimmer_on_the_tile_floor() {
     let col = zone("qcat");
     let pocket_xy = [-42.3f32, 1036.8];
     let shaft = [-45.75f32, 1030.0625, -42.98];
@@ -179,12 +188,40 @@ fn qcat_pocket_swim_plane_strands_the_swimmer_on_the_ceiling_lid() {
 
     let end = swim_toward(&col, [pocket_xy[0], pocket_xy[1], plane], shaft, 12.0);
     assert!((end[2] - (-55.9687)).abs() < 0.01,
-        "#649: from the pocket's own swim plane ({plane:.4}) the depenetration push-out (NOT the \
-         swimming step-up — see this test's doc comment) places the character on the ceiling lid at \
-         −55.9687, the live #329 wedge coordinate; got {end:?}");
+        "#329: from the pocket's own swim plane ({plane:.4}) the character ends on the tile floor at \
+         −55.9687, the live wedge coordinate — since #649 landed this is the SWIMMING STEP-UP, not \
+         the depenetration push-out (see this test's doc comment); got {end:?}");
     assert!(!col.in_water(end),
-        "#649: and the mounted position is DRY (surface {surface:.5}), which is why buoyancy never \
+        "#329: and the mounted position is DRY (surface {surface:.5}), which is why buoyancy never \
          recovers it — got in_water=true at {end:?}");
     assert!((end[0] - shaft[0]).hypot(end[1] - shaft[1]) > 5.0,
-        "#649: it never reaches the shaft — that is the strand; got {end:?}");
+        "#329: it never reaches the shaft — that is the strand; got {end:?}");
+}
+
+/// **#649 AT THE REAL COORDINATE: the push-out no longer teleports a swimmer vertically.**
+///
+/// One frame, from the exact position the #649 comment thread measured — the qcat pocket swim plane,
+/// where `footprint_clear` is FALSE and `ground_below` is `Some(−69.969)`, so the depenetration net
+/// runs and (on the unfixed controller) recovers with the NEARER floor: the tile floor 2.009 u ABOVE,
+/// producing `(−42.252, 1037.071, −55.96875)`, `on_ground = true`, DRY. Here the same frame must end
+/// at the SAME DEPTH it started, still afloat.
+///
+/// The asset-free pins for this are `movement::tests::depenetration_never_{mounts,drops}_a_swimmer_*`
+/// (they run in CI); this one proves the same thing on the real baked geometry that produced the bug.
+#[test]
+#[ignore = "asset-gated: needs baked qcat.glb + qcat.wtr at $EQZONES (#357)"]
+fn the_depenetration_push_out_holds_a_qcat_swimmer_at_its_own_depth() {
+    let col = zone("qcat");
+    let start = [-42.634235f32, 1036.1473, -57.977985];
+    let mut c = CharacterController::new(start);
+    // The walker's intent at a water waypoint: horizontal only, no vertical wish (so any vertical
+    // motion observed is the controller's, not a drive's).
+    c.step(MoveIntent { wish_dir: [0.55, -0.83], wish_vspeed: 0.0, jump: false, want_swim: true,
+                        speed: 44.0, climb: 0.0, hop: false }, 1.0 / 60.0, &col);
+    assert!((c.pos[2] - start[2]).abs() < 1e-3,
+        "#649: frame 1 must hold the swim plane {:.5}; got {:?} (dz {:+.4} — the unfixed push-out \
+         mounts the tile floor at −55.96875, dz +2.0092, which is the live #329 wedge coordinate)",
+        start[2], c.pos, c.pos[2] - start[2]);
+    assert!(!c.on_ground, "#649: a floating body must not be marked grounded: {:?}", c.pos);
+    assert!(col.in_water(c.pos), "#649: and it must still be in the water: {:?}", c.pos);
 }

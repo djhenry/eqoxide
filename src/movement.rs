@@ -132,6 +132,103 @@ pub struct CharacterController {
 #[inline]
 fn hlen(d: [f32; 3]) -> f32 { (d[0] * d[0] + d[1] * d[1]).sqrt() }
 
+/// Chest height above the feet — where a body is probed for water when its FEET are dry.
+const WATER_BODY: f32 = 3.0;
+
+/// The point every water query about a body whose feet are at `p` must use: the feet when they are
+/// already in water (so wading is unchanged), else chest height (#329).
+///
+/// `pos` is the character's FEET. A character standing on the bottom of a pool can have its feet a
+/// hair BELOW the water region's lower bound while its whole body is submerged — the water volume is
+/// baked from the `.wtr` BSP and does not have to meet the floor exactly. The qcat spawn shaft is
+/// exactly this: the floor is at z=-69.97 and the water spans -69.5 … -43.0, so a character standing
+/// there is under 26 UNITS of water while a feet-only probe reports it bone dry.
+#[inline]
+fn water_probe(col: &Collision, p: [f32; 3]) -> [f32; 3] {
+    if col.in_water(p) { p } else { [p[0], p[1], p[2] + WATER_BODY] }
+}
+
+/// Is the BODY (not just the feet) at `p` in water? The single predicate `step` and the
+/// depenetration net share, so the two cannot disagree about who is swimming (#649).
+#[inline]
+fn body_in_water(col: &Collision, p: [f32; 3]) -> bool {
+    col.in_water(water_probe(col, p))
+}
+
+/// The depenetration net's OWN definition of "this body is not in a legal place": its footprint is
+/// pierced by geometry, or there is no floor anywhere in the column beneath it (it has fallen out of
+/// the world). Hoisted out of [`CharacterController::depenetrate`] so the net and the RECOVERY it
+/// picks are decided by the same predicate.
+///
+/// That sharing is load-bearing, not tidiness (#649 review, finding 1). A recovery that is itself
+/// embedded is not a recovery: the next frame re-enters the net from the new position and picks the
+/// next candidate, and the body walks off across the zone one ring-radius at a time, ignoring input.
+/// The `floor.is_none()` half is how that happened — a swimmer in deep water with a CLEAR footprint
+/// and no floor within `GROUND_DEPTH` below is "embedded" by this predicate, and every ring candidate
+/// around it is equally so.
+fn is_embedded(col: &Collision, p: [f32; 3]) -> bool {
+    !col.footprint_clear(p[0], p[1], p[2], PLAYER_RADIUS, PUSHOUT_DIRS / 2)
+        || col.ground_below(p[0], p[1], p[2] + GROUND_ORIGIN, GROUND_DEPTH).is_none()
+}
+
+/// Where the depenetration net is allowed to put a body — **and in what support state**.
+///
+/// The net used to write `pos` and `on_ground` inline, which made an illegal state trivially
+/// expressible and, in qcat, actually expressed: a body IN WATER placed on a FLOOR and marked
+/// `on_ground` (#649). A swimmer in a ~12 u flooded pocket fails `footprint_clear` as a matter of
+/// course — geometry is within a body radius on every side — which the net read as "embedded in
+/// rock" and recovered by hunting the NEAREST floor with
+/// `nearest_floor(up = STEP_UP + GROUND_ORIGIN, down = GROUND_DEPTH)`. That search takes whichever
+/// floor is closer, not one the character can occupy, so it teleported swimmers in BOTH directions:
+/// UP onto the tile floor 2.009 u above the pocket's swim plane (0.009 u above the waterline, hence
+/// dry, hence buoyancy never fires again — the live #329 wedge coordinate), and DOWN 10–12 u onto
+/// the pool floor from anywhere below it.
+///
+/// So the state is made unrepresentable instead of guarded: constructing a `Recovery` is the ONLY
+/// way the net moves the character, [`Recovery::at_column`] is the ONLY constructor, and it picks the
+/// variant from the MEDIUM. A future caller cannot forget a `if in_water` check, because there is no
+/// check to forget — `Afloat` carries "feet unsupported" with it and [`CharacterController::recover`]
+/// writes the matching flags.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Recovery {
+    /// Standing on solid floor at this z. Feet supported: `on_ground = true`.
+    Grounded(f32),
+    /// Floating in a water column at this z — the body's OWN depth, unchanged. Feet unsupported
+    /// (`on_ground = false`), so the next frame's swim/buoyancy branch still owns the body and can
+    /// carry it to the surface or across into the next column.
+    Afloat(f32),
+}
+
+impl Recovery {
+    /// The recovery available in the candidate column `(e, n)` for a body whose feet are at `z`.
+    /// `afloat` is the medium the body being recovered is IN, measured once at its own position.
+    ///
+    /// An afloat body is recovered **at its own depth**, never onto a floor, whenever the candidate
+    /// column is still water there: a swimmer is not embedded in the sense the net assumes, so the
+    /// only thing wrong with its position is the horizontal overlap the ring push-out is already
+    /// resolving. Moving it vertically as well is what produced both #649 symptoms.
+    ///
+    /// Everything else — every dry body, and an afloat body whose candidate column is NOT water
+    /// (it left the water laterally) — takes the original floor search, byte-identical.
+    ///
+    /// An `Afloat` candidate must ALSO be non-[`is_embedded`], which for a clear footprint means "a
+    /// floor exists somewhere below". Without that clause the net hands back a spot it would flag
+    /// again on the very next frame, and a swimmer over unbounded water drifts one ring-radius per
+    /// frame for ever (#649 review, finding 1). When no candidate qualifies the ring simply runs out
+    /// and the existing stuck / last-good machinery takes over, exactly as it does today for a dry
+    /// body with nowhere to go — an afloat body is never quietly handed the floor search as a
+    /// consolation prize, because that IS the water-blind behaviour this change removes.
+    fn at_column(col: &Collision, e: f32, n: f32, z: f32, afloat: bool) -> Option<Self> {
+        if afloat && body_in_water(col, [e, n, z]) {
+            return (!is_embedded(col, [e, n, z])).then_some(Recovery::Afloat(z));
+        }
+        col.nearest_floor(e, n, z, STEP_UP + GROUND_ORIGIN, GROUND_DEPTH).map(Recovery::Grounded)
+    }
+
+    fn z(self) -> f32 { match self { Recovery::Grounded(z) | Recovery::Afloat(z) => z } }
+    fn on_ground(self) -> bool { matches!(self, Recovery::Grounded(_)) }
+}
+
 impl CharacterController {
     pub fn new(pos: [f32; 3]) -> Self {
         Self { pos, vel_z: 0.0, on_ground: false, in_water: false,
@@ -207,13 +304,10 @@ impl CharacterController {
         //
         // Probe the feet first (so wading is unchanged), then chest height. `water_at` is then used
         // for every water query in this step, so the surface we float toward is the one above the
-        // BODY rather than one that doesn't exist at the feet.
-        const WATER_BODY: f32 = 3.0; // chest height above the feet
-        let water_at = if col.in_water(self.pos) {
-            self.pos
-        } else {
-            [self.pos[0], self.pos[1], self.pos[2] + WATER_BODY]
-        };
+        // BODY rather than one that doesn't exist at the feet. The probe itself is the module-level
+        // [`water_probe`] so the depenetration net asks the SAME question (#649) — it used to be
+        // inlined here, and the net's water-blindness is exactly what that private copy allowed.
+        let water_at = water_probe(col, self.pos);
         self.in_water = col.in_water(water_at);
         let swimming = intent.want_swim && self.in_water;
         if self.hop_cooldown > 0.0 { self.hop_cooldown = (self.hop_cooldown - dt).max(0.0); }
@@ -582,10 +676,7 @@ impl CharacterController {
             return false;
         }
         let p = self.pos;
-        let clear = col.footprint_clear(p[0], p[1], p[2], PLAYER_RADIUS, PUSHOUT_DIRS / 2);
-        let floor = col.ground_below(p[0], p[1], p[2] + GROUND_ORIGIN, GROUND_DEPTH);
-        let embedded = !clear || floor.is_none();
-        if !embedded {
+        if !is_embedded(col, p) {
             self.stuck_time = 0.0;
             self.good_timer += dt;
             if self.on_ground && self.good_timer >= GOOD_SAMPLE_SECS {
@@ -595,20 +686,20 @@ impl CharacterController {
             }
             return false;
         }
-        // Embedded: try a ring push-out to the nearest clear, floored spot.
+        // Embedded: try a ring push-out to the nearest clear spot the body can OCCUPY. What
+        // "occupy" means depends on the medium, which is measured ONCE here, at the body's own
+        // position, and handed to `Recovery::at_column` — see `Recovery` for why a swimmer must not
+        // be recovered onto a floor in either direction (#649).
+        let afloat = body_in_water(col, p);
         for &r in &PUSHOUT_RADII {
             for i in 0..PUSHOUT_DIRS {
                 let a = (i as f32) / (PUSHOUT_DIRS as f32) * std::f32::consts::TAU;
                 let (e, n) = (p[0] + a.cos() * r, p[1] + a.sin() * r);
                 if !col.footprint_clear(e, n, p[2], PLAYER_RADIUS, PUSHOUT_DIRS / 2) { continue; }
-                if let Some(f) = col.nearest_floor(e, n, p[2], STEP_UP + GROUND_ORIGIN, GROUND_DEPTH) {
-                    self.pos = [e, n, f];
-                    self.vel_z = 0.0;
-                    self.on_ground = true;
-                    self.stuck_time = 0.0;
-                    self.airborne_start_z = None; // push-out recovery, not a fall landing (§442 hazard 2a)
-                    tracing::debug!("depenetrate: pushed out from ({:.1},{:.1}) to ({:.1},{:.1},{:.1})",
-                        p[0], p[1], e, n, f);
+                if let Some(rec) = Recovery::at_column(col, e, n, p[2], afloat) {
+                    self.recover(e, n, rec);
+                    tracing::debug!("depenetrate: pushed out from ({:.1},{:.1},{:.1}) to ({:.1},{:.1},{:?})",
+                        p[0], p[1], p[2], e, n, rec);
                     return true;
                 }
             }
@@ -618,14 +709,24 @@ impl CharacterController {
         if self.stuck_time >= STUCK_FALLBACK_SECS {
             if let Some(&g) = self.good.back() {
                 tracing::info!("depenetrate: stuck {:.1}s, falling back to last good pos {:?}", self.stuck_time, g);
-                self.pos = g;
-                self.vel_z = 0.0;
-                self.on_ground = true;
-                self.stuck_time = 0.0;
-                self.airborne_start_z = None; // last-good recovery, not a fall landing (§442 hazard 2a)
+                // The ring buffer only ever samples GROUNDED positions (see the `!embedded` arm
+                // above), so this fallback is a `Grounded` recovery by construction — routed through
+                // the same single writer so the net has exactly one place that sets the support flags.
+                self.recover(g[0], g[1], Recovery::Grounded(g[2]));
             }
         }
         true
+    }
+
+    /// Apply a [`Recovery`] — the ONLY place the depenetration net writes position and support
+    /// state, so the variant's meaning ("feet on floor" vs "floating") cannot be contradicted by a
+    /// caller that forgets a flag (#649).
+    fn recover(&mut self, east: f32, north: f32, rec: Recovery) {
+        self.pos = [east, north, rec.z()];
+        self.vel_z = 0.0;
+        self.on_ground = rec.on_ground();
+        self.stuck_time = 0.0;
+        self.airborne_start_z = None; // a push-out / last-good recovery is not a fall landing (§442 hazard 2a)
     }
 }
 
@@ -1096,6 +1197,306 @@ mod tests {
         assert!(ctrl.on_ground, "should be grounded on the pushed-out floor");
     }
 
+    // ── #649: the depenetration net must not teleport a SWIMMER vertically ──────────────────────
+    //
+    // A body in water that fails `footprint_clear` is NOT "embedded in rock" in the sense the net
+    // assumes — a swimmer in a narrow flooded pocket has geometry within a body radius as a matter
+    // of course. The net used to recover it with `nearest_floor(up = STEP_UP + GROUND_ORIGIN = 3,
+    // down = GROUND_DEPTH = 200)`, which takes whichever floor is NEARER rather than one the body
+    // can occupy, and then declared `on_ground = true`. One mechanism, two symptoms, both pinned
+    // below: it MOUNTS a swimmer on a slab above it, and it DROPS one onto the pool floor below.
+    //
+    // The scene mirrors the qcat spawn pocket at 1/10 scale: a flooded corridor too narrow for a
+    // clear footprint (walls 0.8 u either side vs `PLAYER_RADIUS` 1.0), water to z = 0.5, and — in
+    // the first test — a dry slab 2 u overhead, just inside the 3 u upward search.
+
+    /// Water everywhere below `top`; the corridor walls that make the footprint fail.
+    fn flooded_corridor(meshes: Vec<MeshData>, bottom: f32, top: f32) -> Collision {
+        let mut c = col(meshes);
+        c.set_water(Some(std::sync::Arc::new(
+            crate::region_map::RegionMap::water_slab(bottom, top))));
+        c
+    }
+    fn swim_still() -> MoveIntent {
+        MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: 0.0, jump: false, want_swim: true,
+                     speed: 0.0, climb: 0.0, hop: false }
+    }
+
+    #[test]
+    fn depenetration_never_mounts_a_swimmer_onto_the_slab_above_it() {
+        // Pool floor 12 u down, a dry slab 2 u UP (nearer, so the old search preferred it), water to
+        // z = 0.5 so the feet at z = 0 are wet and the slab at z = 2 is DRY.
+        let c = flooded_corridor(
+            vec![floor(-12.0, -100.0, 100.0), floor(2.0, -100.0, 100.0),
+                 wall(0.8, -12.0, 10.0), wall(-0.8, -12.0, 10.0)],
+            -12.0, 0.5);
+        let mut ctrl = CharacterController::new([0.0, 0.0, 0.0]);
+        assert!(!c.footprint_clear(0.0, 0.0, 0.0, PLAYER_RADIUS, 8),
+            "fixture: the swimmer's footprint must FAIL here, else the net never runs and this test \
+             proves nothing");
+        assert!(c.in_water([0.0, 0.0, 0.0]) && !c.in_water([0.0, 0.0, 2.0]),
+            "fixture: feet wet at z=0, slab at z=2 dry — that asymmetry is the whole bug");
+
+        ctrl.step(swim_still(), 1.0 / 60.0, &c);
+
+        assert!(ctrl.pos[2].abs() < 1e-3,
+            "#649: the push-out may move a swimmer sideways, never VERTICALLY — it was mounted onto \
+             the slab at z={:.4} (main lifts it to 2.0, the qcat −55.9687 wedge at 1/10 scale)",
+            ctrl.pos[2]);
+        assert!(!ctrl.on_ground,
+            "#649: a floating body is not standing on anything — `on_ground` must stay false, or the \
+             next frame's swim/buoyancy branch never runs again");
+        assert!(c.in_water(ctrl.pos),
+            "#649: and it must still be IN THE WATER it was swimming in; got {:?}", ctrl.pos);
+        assert!(c.footprint_clear(ctrl.pos[0], ctrl.pos[1], ctrl.pos[2], PLAYER_RADIUS, 8),
+            "the push-out must still have resolved the horizontal overlap: {:?}", ctrl.pos);
+    }
+
+    #[test]
+    fn depenetration_never_drops_a_swimmer_to_the_pool_floor() {
+        // The same defect pointing DOWN: no slab overhead, so the only floor the search can find is
+        // the pool bottom 12 u below — and the old code sank the swimmer onto it and grounded it.
+        let c = flooded_corridor(
+            vec![floor(-12.0, -100.0, 100.0), wall(0.8, -12.0, 10.0), wall(-0.8, -12.0, 10.0)],
+            -12.0, 0.5);
+        let mut ctrl = CharacterController::new([0.0, 0.0, 0.0]);
+        assert!(!c.footprint_clear(0.0, 0.0, 0.0, PLAYER_RADIUS, 8), "fixture: footprint must fail");
+
+        ctrl.step(swim_still(), 1.0 / 60.0, &c);
+
+        assert!(ctrl.pos[2].abs() < 1e-3,
+            "#649 (the other direction): the swimmer must hold its own depth, not be dropped to the \
+             pool floor — got z={:.4} (main sinks it to −12)", ctrl.pos[2]);
+        assert!(!ctrl.on_ground, "#649: and it is not standing on the pool floor");
+    }
+
+    #[test]
+    fn depenetration_still_grounds_a_DRY_body_exactly_as_before() {
+        // THE BLAST-RADIUS PIN. The net exists because characters genuinely DO get embedded in
+        // geometry; over-narrowing it strands them on land — a new bug in the same family. The same
+        // scene with NO water must behave exactly as `depenetrates_embedded_point_to_clear_floor`:
+        // pushed out AND mounted on the nearest floor AND grounded.
+        let c = col(vec![floor(-12.0, -100.0, 100.0), floor(2.0, -100.0, 100.0),
+                         wall(0.8, -12.0, 10.0), wall(-0.8, -12.0, 10.0)]);
+        let mut ctrl = CharacterController::new([0.0, 0.0, 0.0]);
+        ctrl.step(swim_still(), 1.0 / 60.0, &c);
+        assert!((ctrl.pos[2] - 2.0).abs() < 1e-3,
+            "a DRY embedded body must still be recovered onto the nearest floor (z=2): {:?}", ctrl.pos);
+        assert!(ctrl.on_ground, "…and still be grounded there");
+    }
+
+    #[test]
+    fn depenetration_grounds_a_swimmer_pushed_out_of_the_water_entirely() {
+        // The other arm of the medium test: a body that IS afloat but whose only clear neighbour is
+        // OUTSIDE the water takes the ordinary floor recovery, unchanged. Water is a 4 u-wide box
+        // around the corridor; the push-out's first clear ring point (east ±2) is outside it.
+        let mut c = col(vec![floor(-12.0, -100.0, 100.0), floor(2.0, -100.0, 100.0),
+                             wall(0.8, -12.0, 10.0), wall(-0.8, -12.0, 10.0)]);
+        c.set_water(Some(std::sync::Arc::new(
+            crate::region_map::RegionMap::box_below(-100.0, 100.0, -1.0, 1.0, 0.5))));
+        let mut ctrl = CharacterController::new([0.0, 0.0, 0.0]);
+        assert!(c.in_water([0.0, 0.0, 0.0]) && !c.in_water([2.0, 0.0, 0.0]),
+            "fixture: afloat at the centre, dry two units east — else this arm is never exercised");
+        ctrl.step(swim_still(), 1.0 / 60.0, &c);
+        assert!((ctrl.pos[2] - 2.0).abs() < 1e-3 && ctrl.on_ground,
+            "leaving the water laterally must still recover onto a floor and ground: {:?}", ctrl.pos);
+    }
+
+    #[test]
+    fn an_afloat_body_with_no_floor_below_is_never_pushed_out_into_a_drift() {
+        // #649 REVIEW FINDING 1 — a REGRESSION PIN, not a fails-on-main pin: `main` passes this too.
+        // `is_embedded` counts `floor.is_none()` as embedded, so a swimmer in deep water with a
+        // perfectly CLEAR footprint and no floor within GROUND_DEPTH below still enters the net. The
+        // first cut of this fix answered that with `Recovery::Afloat` at the first ring candidate —
+        // which is *equally* embedded, so the next frame re-entered the net from there and the body
+        // walked east one ring radius per frame (60 u/s), ignoring the wish input, reporting a stale
+        // `in_water`. A recovery that is itself embedded is not a recovery.
+        //
+        // Geometry: floor only far to the east (so `has_geometry` is true and `ground_below` at the
+        // origin is None), water everywhere. Nothing must move.
+        let mut c = col(vec![floor(-50.0, 100.0, 200.0)]);
+        c.set_water(Some(std::sync::Arc::new(
+            crate::region_map::RegionMap::water_slab(-1000.0, 10.0))));
+        let mut ctrl = CharacterController::new([0.0, 0.0, 0.0]);
+        assert!(c.footprint_clear(0.0, 0.0, 0.0, PLAYER_RADIUS, 8)
+                && c.ground_below(0.0, 0.0, 1.0, GROUND_DEPTH).is_none(),
+            "fixture: clear footprint but NO floor below — that combination is the whole case");
+        assert!(c.in_water([0.0, 0.0, 0.0]), "fixture: and the body is afloat");
+
+        for _ in 0..60 { ctrl.step(swim_still(), 1.0 / 60.0, &c); }
+
+        assert!(hlen([ctrl.pos[0], ctrl.pos[1], 0.0]) < 1e-3,
+            "the net must not walk an afloat body across the zone one ring radius at a time — it \
+             drifted to {:?} in 60 frames with ZERO wish input (the first cut reached [60,0,0])",
+            ctrl.pos);
+    }
+
+    #[test]
+    fn the_nets_water_probe_is_the_BODY_not_the_feet() {
+        // #649 REVIEW FINDING 5 — the reviewer's own mutation: `body_in_water(col, p)` →
+        // `col.in_water(p)` (feet-only) inside the net left the whole suite green. This pins the
+        // reason the hoisted chest probe exists, which is the case `water_probe`'s doc describes: a
+        // body can be submerged while its FEET are a hair outside the baked water region, because
+        // the `.wtr` volume does not have to meet the floor. A feet-only probe calls that body dry
+        // and mounts it on the slab above — the #649 defect, reachable again by "simplification".
+        let mut c = col(vec![floor(-12.0, -100.0, 100.0), floor(2.0, -100.0, 100.0),
+                             wall(0.8, -12.0, 10.0), wall(-0.8, -12.0, 10.0)]);
+        // Water from 0.5 up: the feet at z=0 are OUTSIDE it, the chest at z=3 is inside.
+        c.set_water(Some(std::sync::Arc::new(
+            crate::region_map::RegionMap::water_slab(0.5, 10.0))));
+        let mut ctrl = CharacterController::new([0.0, 0.0, 0.0]);
+        assert!(!c.in_water([0.0, 0.0, 0.0]) && c.in_water([0.0, 0.0, 3.0]),
+            "fixture: feet dry, chest wet — else this is not the case that distinguishes the probes");
+
+        ctrl.step(swim_still(), 1.0 / 60.0, &c);
+
+        assert!(ctrl.pos[2].abs() < 1e-3 && !ctrl.on_ground,
+            "a submerged body whose FEET are outside the water volume is still afloat: a feet-only \
+             probe in the net calls it dry and mounts it on the slab at z=2 — got {:?}", ctrl.pos);
+    }
+
+    /// **THE DEPENETRATION CORPUS — the blast-radius harness, committed so its numbers are
+    /// reproducible (#649 review, finding 6).**
+    ///
+    /// Two things at once, over every baked zone found at `$EQZONES`:
+    ///
+    /// 1. **An ITERATION invariant, driven through the real controller.** The first cut of the #649
+    ///    fix shipped a recovery that was itself embedded, and no one-shot harness could see it —
+    ///    the failure only appears when the net is re-entered from its own answer (review finding 1).
+    ///    So every embedded sample is driven for two input-free seconds and must have COME TO REST
+    ///    by the end unless it is no longer embedded. "Still moving AND still embedded" is the drift
+    ///    signature and fails the test; a body that merely came to rest somewhere embedded is the
+    ///    pre-existing "the push-out gave up" state `main` produces too, and is not flagged.
+    /// 2. **The recovery diff vs the pre-#649 rule**, reproduced inline as `legacy_recovery`, split
+    ///    by medium so the partition is explicit: a body is bucketed by whether its FEET are dry and
+    ///    whether its CHEST is wet. The dry/dry bucket must show ZERO changes — that is the
+    ///    "dry depenetration is untouched" claim, and it is drawn with feet-dry-and-chest-dry, not
+    ///    with the new predicate (which would make it partly definitional).
+    ///
+    /// ```text
+    /// EQZONES=~/eqzones cargo test --release --lib depenetration_corpus -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "asset-gated: needs baked zone glbs + maps/water at $EQZONES (#357)"]
+    fn depenetration_corpus_over_baked_zones() {
+        let dir = std::path::PathBuf::from(std::env::var("EQZONES").unwrap_or_else(|_| {
+            format!("{}/.local/share/eqoxide/assets/models", std::env::var("HOME").unwrap())
+        }));
+        /// The pre-#649 rule, verbatim: nearest floor in EITHER direction, always grounded.
+        fn legacy_recovery(col: &Collision, p: [f32; 3]) -> Option<([f32; 3], bool)> {
+            for &r in &PUSHOUT_RADII {
+                for i in 0..PUSHOUT_DIRS {
+                    let a = (i as f32) / (PUSHOUT_DIRS as f32) * std::f32::consts::TAU;
+                    let (e, n) = (p[0] + a.cos() * r, p[1] + a.sin() * r);
+                    if !col.footprint_clear(e, n, p[2], PLAYER_RADIUS, PUSHOUT_DIRS / 2) { continue; }
+                    if let Some(f) = col.nearest_floor(e, n, p[2], STEP_UP + GROUND_ORIGIN, GROUND_DEPTH) {
+                        return Some(([e, n, f], true));
+                    }
+                }
+            }
+            None
+        }
+        /// This branch's rule, expressed through the production `Recovery` (no second copy of it).
+        fn new_recovery(col: &Collision, p: [f32; 3]) -> Option<([f32; 3], bool)> {
+            let afloat = body_in_water(col, p);
+            for &r in &PUSHOUT_RADII {
+                for i in 0..PUSHOUT_DIRS {
+                    let a = (i as f32) / (PUSHOUT_DIRS as f32) * std::f32::consts::TAU;
+                    let (e, n) = (p[0] + a.cos() * r, p[1] + a.sin() * r);
+                    if !col.footprint_clear(e, n, p[2], PLAYER_RADIUS, PUSHOUT_DIRS / 2) { continue; }
+                    if let Some(rec) = Recovery::at_column(col, e, n, p[2], afloat) {
+                        return Some(([e, n, rec.z()], rec.on_ground()));
+                    }
+                }
+            }
+            None
+        }
+
+        let mut zones: Vec<String> = std::fs::read_dir(&dir).expect("$EQZONES").filter_map(|e| {
+            let path = e.ok()?.path();
+            let n = path.file_name()?.to_str()?.strip_suffix(".glb")?.to_string();
+            (!n.ends_with("_doors") && !n.ends_with("_obj")).then_some(n)
+        }).collect();
+        zones.sort();
+        assert!(!zones.is_empty(), "no baked zones at {dir:?}");
+
+        let (mut t_zones, mut t_emb) = (0usize, 0u64);
+        let (mut ch_dry, mut ch_chest, mut ch_wet) = (0u64, 0u64, 0u64);
+        let (mut same_dry, mut same_chest, mut same_wet) = (0u64, 0u64, 0u64);
+        let (mut none_legacy, mut none_new) = (0u64, 0u64);
+        let mut drifters: Vec<(String, [f32; 3], [f32; 3])> = Vec::new();
+        for name in &zones {
+            let Ok(za) = crate::assets::ZoneAssets::from_glb(&dir.join(format!("{name}.glb"))) else { continue };
+            let mut col = Collision::build(&za, 32.0);
+            if col.cols == 0 { continue; }
+            col.set_water(crate::region_map::RegionMap::load(&dir.join("maps/water"), name)
+                .map(std::sync::Arc::new));
+            t_zones += 1;
+            let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+            let mut rnd = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17;
+                               (seed >> 11) as f64 / (1u64 << 53) as f64 };
+            let mut zone_emb = 0u32;
+            for _ in 0..500 {
+                let e = col.origin[0] + rnd() as f32 * (col.cols as f32 * col.cell_size);
+                let n = col.origin[1] + rnd() as f32 * (col.rows as f32 * col.cell_size);
+                let Some(fz) = col.nearest_floor(e, n, col.z_max, 10.0, 4000.0) else { continue };
+                // A ladder of z around the column's floor (below it = embedded in rock, above =
+                // open air), plus, when the column holds water, a ladder of depths inside it.
+                let mut zs: Vec<f32> = [-16.0f32, -8.0, -4.0, -2.0, -1.0, -0.25, 0.0, 0.5, 2.0, 6.0, 15.0]
+                    .iter().map(|o| fz + o).collect();
+                if let Some(surf) = col.water_surface([e, n, fz + 1.0]) {
+                    for d in [0.5f32, 1.0, 2.0, 3.0, 5.0, 9.0, 15.0] { zs.push(surf - d); }
+                }
+                for z in zs {
+                    let p = [e, n, z];
+                    if !is_embedded(&col, p) { continue; }
+                    t_emb += 1; zone_emb += 1;
+                    // (2) recovery diff, bucketed by an EXPLICIT medium partition
+                    let (a, b) = (legacy_recovery(&col, p), new_recovery(&col, p));
+                    if a.is_none() { none_legacy += 1; }
+                    if b.is_none() { none_new += 1; }
+                    let feet_wet = col.in_water(p);
+                    let chest_wet = col.in_water([p[0], p[1], p[2] + WATER_BODY]);
+                    let bucket = if feet_wet { 2 } else if chest_wet { 1 } else { 0 };
+                    match (a == b, bucket) {
+                        (true, 0) => same_dry += 1, (true, 1) => same_chest += 1, (true, _) => same_wet += 1,
+                        (false, 0) => ch_dry += 1, (false, 1) => ch_chest += 1, (false, _) => ch_wet += 1,
+                    }
+                    // (1) the ITERATION invariant — only for a bounded sample per zone, since it
+                    // steps the real controller 120 times per point.
+                    if zone_emb <= 400 {
+                        let mut ctrl = CharacterController::new(p);
+                        let idle = MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: 0.0, jump: false,
+                                                want_swim: true, speed: 0.0, climb: 0.0, hop: false };
+                        for _ in 0..110 { ctrl.step(idle, 1.0 / 60.0, &col); }
+                        let settle_from = ctrl.pos;
+                        for _ in 0..10 { ctrl.step(idle, 1.0 / 60.0, &col); }
+                        // The drift signature is STILL MOVING while STILL EMBEDDED after two input-free
+                        // seconds: the net answering itself, frame after frame. A body that came to
+                        // rest is fine even if the rest position is technically embedded — that is the
+                        // pre-existing "push-out gave up" state `main` also produces.
+                        let still_moving = hlen([ctrl.pos[0] - settle_from[0], ctrl.pos[1] - settle_from[1], 0.0])
+                            > 1e-3 || (ctrl.pos[2] - settle_from[2]).abs() > 1e-3;
+                        if still_moving && is_embedded(&col, ctrl.pos) && drifters.len() < 20 {
+                            drifters.push((name.clone(), p, ctrl.pos));
+                        }
+                    }
+                }
+            }
+            println!("{name:>12}: embedded={zone_emb}");
+        }
+        println!("\nzones={t_zones} embedded={t_emb}\n  changed: dry-body={ch_dry} wet-chest-dry-feet={ch_chest} \
+                  submerged={ch_wet}\n  unchanged: dry-body={same_dry} wet-chest-dry-feet={same_chest} \
+                  submerged={same_wet}\n  no recovery: legacy={none_legacy} new={none_new}");
+        assert!(drifters.is_empty(),
+            "a recovery must never itself be embedded — {} sample(s) were STILL MOVING and STILL \
+             EMBEDDED after two input-free seconds (the review's finding-1 drift signature): {:?}",
+            drifters.len(), drifters);
+        assert_eq!(ch_dry, 0,
+            "DRY depenetration must be untouched: {ch_dry} of {} recoveries for bodies whose feet AND \
+             chest are dry changed", same_dry + ch_dry);
+    }
+
     #[test]
     fn last_good_fallback_after_being_stuck() {
         let good = col(vec![floor(0.0, -100.0, 100.0)]);
@@ -1111,6 +1512,10 @@ mod tests {
         for _ in 0..20 { ctrl.step(walk(0.0, [0.0, 0.0]), 0.05, &bad); }
         assert!((ctrl.pos[0]).abs() < 1e-2 && (ctrl.pos[1]).abs() < 1e-2,
             "should have rubber-banded to the last good grounded position (origin): {:?}", ctrl.pos);
+        // The ring buffer only ever samples GROUNDED positions, so the fallback recovers a body that
+        // IS standing — pinned here because #649 routed this write through the shared `recover`
+        // (`Recovery::Grounded`) and an unpinned refactor is an unnoticed behaviour change.
+        assert!(ctrl.on_ground, "the last-good position is a grounded one: {:?}", ctrl.pos);
     }
 
     #[test]
