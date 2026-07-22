@@ -249,6 +249,7 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     // Projected from the network thread's GameState, and freshness measured RIGHT NOW — not read
     // out of a struct some other loop published whenever it last felt like running (#343).
     let player = s.player();
+    let prov = player.position_provisional_since;
     let health = s.health();
     let frame_profile = *s.frame_profile.lock().unwrap();
     let nav = s.nav.nav_state.lock().unwrap().clone();
@@ -398,8 +399,8 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
                        wire never carries — so a pad advertised as same-zone may in fact be a real \
                        cross-zone line, and walking onto it can land you in another zone. There is \
                        no such thing as a VERIFIED same-zone pad here, and this client does not \
-                       remember where any pad landed before. `footprint` is measured geometry: walk \
-                       there to take the pad. `advertised_dest` is the server's ADVERTISEMENT, not a \
+                       remember where any pad landed before. `footprint` is measured geometry: the spot \
+                       to TRY. `advertised_dest` is the server's ADVERTISEMENT, not a \
                        known destination, and `advertised_dest_floor` is this client's own snap of \
                        it, not a second source. Taking one is YOUR decision — after arriving, read \
                        `player.zone` and `player.pos` to find out where it actually went, and note \
@@ -680,6 +681,26 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     //   last_world_response_ms  — since the world last PROVED it processed something for us (a probe
     //                             reply or spontaneous packet), whichever is fresher.
     if let Some(player) = out.get_mut("player").and_then(|p| p.as_object_mut()) {
+        // #543/#660 B2 — is `pos` (and, during a crossing, `zone`) actually the SERVER's word?
+        // `false` normally. `true` from the moment a zone-line crossing applies a locally-derived
+        // position — the advertised arrival, written before the server has said anything so the
+        // character leaves the trigger region — until the server tells us where we really are.
+        //
+        // This exists because the crossing window served a well-formed, confident, mutually
+        // inconsistent answer: `zone: "qeynos"` beside a qeynos2 `pos`, with nothing marking it. The
+        // OP_ZoneChange echo settles WHICH ZONE (and flips `zone` there); the position does not
+        // arrive until the new zone's first update, and that gap is the falsehood. A prose warning in
+        // the message log is not enough — one was watched being evicted from the ring by ambient
+        // chatter while the fields stayed wrong and unmarked.
+        //
+        // `nav_declined_pads` tells an agent to take a pad and then read `zone`/`pos` to find out
+        // where it went. THIS is the field that says "not yet". `crossing_pending_ms` is measured
+        // HERE, at read time (#343: never cache an age); `null` when not provisional.
+        // (Attached by insert, not in the literal above, which is at serde_json's recursion limit.)
+        player.insert("position_provisional".into(),
+            serde_json::json!(prov.is_some()));
+        player.insert("crossing_pending_ms".into(),
+            serde_json::json!(prov.map(|t| t.elapsed().as_millis() as u64)));
         player.insert("world_responsive".into(),       serde_json::json!(health.world_responsive));
         player.insert("last_world_response_ms".into(), serde_json::json!(health.last_world_response_ms));
         // #529/#586: Levitate up = gravity off. It changes what movement means (`pos` is a height
@@ -1420,6 +1441,43 @@ mod tests {
         let n = nav_debug_json(state).await;
         assert_eq!(n["pads"][0]["knowledge"], "advertised_same_zone_declined");
         assert_eq!(n["pads"][0]["advertised_dest"], serde_json::json!([-153.0, -30.0, 9.0]));
+    }
+
+    /// **#660 review B2 — the caveat must live on the FIELD, not in prose.**
+    ///
+    /// Polling `/debug` through a crossing caught `zone: "qeynos"` beside a qeynos2 `pos`:
+    /// well-formed, confident, mutually inconsistent, on the exact endpoint `nav_declined_pads`
+    /// sends the agent to, with nothing marking it. The prose warning was not enough — it lives in
+    /// the message-log ring and was observed being evicted by ambient chatter ~10s later, while the
+    /// fields stayed wrong.
+    ///
+    /// So `/debug` carries `position_provisional` + `crossing_pending_ms`, and BOTH directions are
+    /// pinned: a settled client must not cry provisional, or the marker becomes noise an agent
+    /// learns to ignore.
+    #[tokio::test]
+    async fn debug_marks_the_position_provisional_through_a_crossing_543() {
+        let state = empty_state();
+
+        // Settled: no marker, and no age to misread.
+        set_gs(&state, |gs| { gs.position_provisional_since = None; });
+        let v = debug_json(state.clone()).await;
+        assert_eq!(v["player"]["position_provisional"], false,
+            "a settled position must NOT be flagged — a marker that is always on is not a marker");
+        assert!(v["player"]["crossing_pending_ms"].is_null());
+
+        // Mid-crossing: the client applied its own guess and the server has not placed us yet.
+        set_gs(&state, |gs| {
+            gs.position_provisional_since = Some(std::time::Instant::now());
+            gs.world.zone_name = "qeynos".into();   // the echo already flipped the zone…
+            gs.player_x = -142.4; gs.player_y = -25.8; gs.player_z = 5.1; // …but this is qeynos2
+        });
+        let v = debug_json(state.clone()).await;
+        assert_eq!(v["player"]["position_provisional"], true,
+            "#660 B2: `zone` and `pos` can disagree here — the response must SAY so, on the field");
+        assert!(v["player"]["crossing_pending_ms"].as_u64().is_some_and(|ms| ms < 60_000),
+            "…and how long it has been unsettled, measured at read time (#343), not cached");
+        // The inconsistency itself is still served — marking it is the fix, hiding it is not.
+        assert_eq!(v["player"]["zone"], "qeynos");
     }
 
     /// #343 regression — THE lie. The connection is dead: no packet has arrived for a minute, and

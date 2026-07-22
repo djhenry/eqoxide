@@ -135,6 +135,14 @@ pub struct PlayerState {
     pub pos_east:     f32,
     pub pos_north:    f32,
     pub pos_up:       f32,
+    /// **#543/#660: when `pos` and `zone` may disagree.** `Some(when)` while the position above is
+    /// the client's own GUESS from a zone-line crossing (the advertised arrival, applied locally so
+    /// the character leaves the trigger region) and the server has not yet said where we are.
+    ///
+    /// Carried as the raw `Instant`, never as a pre-measured age — the age is computed at READ time
+    /// in the handler (the #343 discipline: a cached age is a lie by the time it is read).
+    #[serde(skip)]
+    pub position_provisional_since: Option<std::time::Instant>,
     pub heading_ccw:  f32, // 0=north CCW
     pub heading_cw:   f32, // 0=north CW (wire format)
     pub server_corrections: u32,
@@ -233,6 +241,7 @@ impl PlayerState {
             level:      gs.player_level as u32,
             pos_east:   gs.player_x,
             pos_north:  gs.player_y,
+            position_provisional_since: gs.position_provisional_since,
             // FOOT datum (#522, see coord::WIRE_Z_OFFSET): every agent-facing position reports the
             // collision-floor/foot height, the SAME datum used internally (controller, gs.player_z,
             // nav, collision) and by /observe/entities (entities are converted wire→foot at ingest).

@@ -330,8 +330,14 @@ pub enum PadKnowledge {
         /// reach any of them — a count it cannot act on. Bounded because a pad's full leaf list is
         /// diagnostics, not an offer.
         alternates: Vec<[f32; 3]>,
-        /// Where the DRNTP region itself is, nearest the character — reported even when nothing in
-        /// it is standable, so a pad is never reduced to "somewhere in this zone".
+        /// Where the pad's region is, nearest the character — reported even when nothing in it is
+        /// standable, so a pad is never reduced to "somewhere in this zone".
+        ///
+        /// Precisely: the region's representative point **projected down onto the floor beneath it**
+        /// (`Collision::find_zone_line_near`), not the raw region point. For a region that floats
+        /// above the ground that is the ground UNDER it — which is where a character walking there
+        /// would end up standing, and therefore the useful answer — but it is not the region's own
+        /// position, and nothing here should be read as "the trigger is at this height".
         region_at: [f32; 3],
         /// The server's advertised arrival, **verbatim from the wire** (wire z datum, not the
         /// client's foot datum). `None` when the pad carries the keep-position sentinel, i.e. it

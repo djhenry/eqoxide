@@ -826,6 +826,22 @@ pub struct GameState {
     ///
     /// Reset to false by [`GameState::begin_zone_in`] on every zone change.
     pub player_pos_known: bool,
+    /// **#543/#660: `player_x/y/z` (and possibly `world.zone_id`) are the client's own GUESS.**
+    /// `Some(when)` from the moment a zone-line crossing applies a locally-derived position — the
+    /// ADVERTISED arrival of the zone point we walked into, written before the server has said
+    /// anything, so the character leaves the trigger region and the cross does not re-fire.
+    ///
+    /// Cleared the instant the SERVER tells us where we are (`player_pos_known` set from a server
+    /// packet — a self-position update, a respawn, a server-driven teleport). Deliberately NOT
+    /// cleared by the OP_ZoneChange echo: the echo settles WHICH ZONE, and `world.zone_id` flips
+    /// there, but the position does not arrive until the new zone's first update. That gap is
+    /// exactly the observed falsehood (#660 review B2): `/v1/observe/debug` served
+    /// `zone: "qeynos"` with a qeynos2 `pos` — well-formed, confident, mutually inconsistent, and
+    /// unmarked. It is marked now.
+    ///
+    /// Client-side writers (nav, the HTTP move API) do NOT clear it — they are not evidence about
+    /// where the server thinks we are.
+    pub position_provisional_since: Option<std::time::Instant>,
     pub player_heading: f32,
     pub player_level: u32,
     pub player_race: String,
@@ -1154,6 +1170,14 @@ impl GameState {
         // distance from it must report an honest unknown until then, not a figure measured from
         // the old zone's numbers or the origin.
         self.player_pos_known = false;
+        // #543/#660 B2: a crossing marks the position PROVISIONAL (the advertised guess). When the
+        // crossing turned out to be a real zone change, we are now zoning in and the new zone's
+        // handshake will bring an authoritative position — the prior guess is moot, and the
+        // provisional state is `player_pos_known = false` (unknown), not "provisional guess". Clear
+        // the marker so it does not stick `true` across the reconnect (a false marker is as much a
+        // lie as a missing one — verified live that without this it stayed true in the new zone for
+        // 30s+ while `pos` was actually the correct zone-in point).
+        self.position_provisional_since = None;
         // The target belongs to the zone we just left: its spawn id is meaningless in the new zone
         // and #270 already purges `entities`, so target_id would point at a gone spawn while
         // target_name/target_hp_pct fall back to the stale cached snapshot — /observe/debug then
@@ -2477,6 +2501,28 @@ pub(crate) mod tests {
         assert_eq!([gs.player_x, gs.player_y, gs.player_z], [111.0, 222.0, 333.0],
             "predicted position is not WorldState — a zone purge must not touch it");
         assert_eq!(gs.player_heading, 44.0, "predicted heading is not WorldState");
+    }
+
+    /// #543/#660 B2 — the provisional-position marker must NOT survive a zone-in.
+    ///
+    /// A crossing marks the position provisional (the advertised guess). When that crossing was a
+    /// real zone change, we zone into a new zone whose handshake brings an authoritative position,
+    /// so the guess is moot. Verified LIVE that without this the marker stuck `true` in the new zone
+    /// for 30s+ while `pos` was actually the correct zone-in point — a false marker, which is as
+    /// much a lie as a missing one. The honest post-zone-in state is `player_pos_known = false`
+    /// (unknown), not "provisional guess".
+    #[test]
+    fn begin_zone_in_clears_the_provisional_position_marker_660() {
+        let mut gs = GameState::new();
+        gs.position_provisional_since = Some(std::time::Instant::now());
+        gs.player_pos_known = true;
+
+        gs.begin_zone_in();
+
+        assert!(gs.position_provisional_since.is_none(),
+            "a zone-in makes the crossing guess moot — the marker must not stick true across it");
+        assert!(!gs.player_pos_known,
+            "…and the honest post-zone-in position state is UNKNOWN, not a provisional guess");
     }
 
 }

@@ -41,6 +41,30 @@ use eqoxide_core::physics::RUN_SPEED;
 /// Read `zone_assets` on GET /v1/observe/debug to tell *pending* from *failed*.
 pub const NAV_STATE_ZONE_LOADING: &str = "zone_loading";
 
+/// How many standable spots one pad offer carries in total (the one to try + its `alternates`).
+/// Bounded: a pad's full leaf list is diagnostics, not an offer.
+const OFFERED_SPOTS: usize = 8;
+
+/// Minimum separation between offered spots (#660 review NB). Nearest-first ALONE is not enough: a
+/// DRNTP region is a BSP, so one physical spot is split into many leaves, and the eight nearest
+/// leaves of qeynos2's pad collapsed onto ~3 real places — one offered pair was **0.0005u** apart.
+/// Live, five of six retry attempts landed in the same two spots, which is not six attempts. One
+/// nav cell of separation makes the alternates genuinely different places to try.
+const SPOT_SEPARATION: f32 = 8.0;
+
+/// Thin `sorted` (nearest-first) down to at most `max` spots that are each at least `min_sep` from
+/// every spot already kept. Order is preserved, so the first element stays the nearest.
+fn spread_spots(sorted: Vec<[f32; 3]>, max: usize, min_sep: f32) -> Vec<[f32; 3]> {
+    let mut out: Vec<[f32; 3]> = Vec::new();
+    for p in sorted {
+        if out.len() == max { break; }
+        if out.iter().all(|q| (p[0] - q[0]).hypot(p[1] - q[1]).max((p[2] - q[2]).abs()) >= min_sep) {
+            out.push(p);
+        }
+    }
+    out
+}
+
 /// **The #543 honesty gate.** Whether nav TRUSTS an advertised same-zone crossing enough to
 /// AUTO-ROUTE the walker onto it — as a #403 teleport-pad planner edge, or as a #266 sealed-area
 /// escape. It is `false`, and for a client that only has the wire to go on it must stay `false`.
@@ -764,8 +788,6 @@ impl Walker {
                 unknown_idxs.push(zp.iterator as i32);
             }
         }
-        // The PLANNER's question — "may A* route THROUGH this pad?" — needs BOTH ends to resolve.
-        let resolved = if advertised.is_empty() { Vec::new() } else { c.resolve_teleport_pads(&advertised) };
 
         // The DISCLOSURE's question is a DIFFERENT one — "can the AGENT take this pad?" — and it
         // must not be answered from the advertised destination (#660 review B1). The first revision
@@ -786,9 +808,7 @@ impl Walker {
         // disclosure. `footprint` is the leaf NEAREST the character (the actionable "walk here") and
         // `footprint_count` carries what the multiplicity actually means to a caller (#660 NB2).
         let here = [gs.player_x, gs.player_y, gs.player_z];
-        /// How many standable spots an offer carries in total (the one to try + `alternates`).
-        /// Bounded: a pad's full leaf list is diagnostics, not an offer.
-        const OFFERED_SPOTS: usize = 8;
+
         let by_distance = |mut ps: Vec<[f32; 3]>| {
             let d2 = |p: &[f32; 3]| (p[0] - here[0]).powi(2) + (p[1] - here[1]).powi(2) + (p[2] - here[2]).powi(2);
             ps.sort_by(|a, b| d2(a).total_cmp(&d2(b)));
@@ -813,18 +833,23 @@ impl Walker {
             // have used cannot drift; `.map(dest)` because we want only its destination half.
             let dest_floor = wire_dest
                 .and_then(|d| c.resolve_teleport_pads(&[(idx, d)]).first().map(|e| e.dest));
-            let sorted = by_distance(footprints.clone());
-            let footprint = sorted.first().copied();
+            // Nearest-first, then thinned so each offered spot is a genuinely DIFFERENT place.
+            let spread = spread_spots(by_distance(footprints.clone()), OFFERED_SPOTS, SPOT_SEPARATION);
+            let footprint = spread.first().copied();
             // The rest of the offer: the next few spots to TRY if the first fires nothing. Verified
-            // live (#660) that leaves of one pad genuinely differ in whether they trigger, so a bare
-            // count without the alternates would be a number the agent cannot act on.
-            let alternates = sorted.iter().skip(1).take(OFFERED_SPOTS - 1).copied().collect();
-            let usable = match (TRUST_ADVERTISED_SAME_ZONE_CROSSINGS, footprint) {
-                (true, Some(fp)) => resolved.iter().find(|e| e.index == idx && e.source == fp),
+            // live (#660) that leaves of one pad genuinely differ in whether they trigger — one spot
+            // fired nothing while another on the same pad crossed — so a bare count without the
+            // alternates would be a number the agent cannot act on.
+            let alternates: Vec<[f32; 3]> = spread.iter().skip(1).copied().collect();
+            // Only computed when the gate is ON — under the gate no edge can ever be produced, so
+            // running the batch resolve for a value nothing reads was pure waste (#660 review NB).
+            let usable = match (TRUST_ADVERTISED_SAME_ZONE_CROSSINGS, footprint, wire_dest) {
+                (true, Some(fp), Some(d)) => c.resolve_teleport_pads(&[(idx, d)]).into_iter()
+                    .find(|e| e.source == fp),
                 _ => None,
             };
             pads.push(PadDebug { index: idx, knowledge: match usable {
-                Some(e) => PadKnowledge::AdvertisedUsable { source: e.source, dest: e.dest },
+                Some(ref e) => PadKnowledge::AdvertisedUsable { source: e.source, dest: e.dest },
                 None => PadKnowledge::AdvertisedSameZoneDeclined {
                     footprint,
                     footprint_count: footprints.len(),
@@ -844,7 +869,9 @@ impl Walker {
         if !TRUST_ADVERTISED_SAME_ZONE_CROSSINGS {
             return Vec::new();
         }
-        resolved
+        // Only reached with the gate ON. The batch resolve lives HERE, not above, so the gated-off
+        // path does not compute a value nothing reads (#660 review NB).
+        if advertised.is_empty() { Vec::new() } else { c.resolve_teleport_pads(&advertised) }
     }
 
     /// #579 (agent-honesty): there is no collision grid, so this client has NO model of the world —
@@ -1371,6 +1398,42 @@ mod tests {
                 "a policy-declined pad must be disclosed as AdvertisedSameZoneDeclined — not \
                  withheld, and not mislabelled as a geometry verdict or as usable. Got {other:?}"),
         }
+    }
+
+    /// **#660 review NB — nearest-first is not "different places".**
+    ///
+    /// Live, the eight nearest leaves of qeynos2's pad collapsed onto about three real spots,
+    /// including a pair **0.0005u** apart, and five of six retry attempts landed in the same two
+    /// places. Offering eight near-duplicates is one option wearing eight hats — the same
+    /// over-claim as the `footprint` wording, in list form.
+    ///
+    /// Mutation: drop the separation filter (take the nearest N) → RED.
+    #[test]
+    fn offered_spots_are_spread_not_eight_names_for_one_place_543() {
+        // Nearest-first, and deliberately degenerate: a near-exact duplicate pair, a cluster, and
+        // two genuinely distant spots.
+        let sorted = vec![
+            [0.0, 0.0, 0.0],
+            [0.0005, 0.0, 0.0],   // the observed duplicate
+            [1.0, 1.0, 0.0],      // same place, really
+            [40.0, 0.0, 0.0],     // a different place
+            [40.2, 0.3, 0.0],     // …and its duplicate
+            [90.0, 0.0, 0.0],     // another different place
+        ];
+        let got = spread_spots(sorted, OFFERED_SPOTS, SPOT_SEPARATION);
+        assert_eq!(got, vec![[0.0, 0.0, 0.0], [40.0, 0.0, 0.0], [90.0, 0.0, 0.0]],
+            "six leaves are three PLACES — offer the three, nearest first, not six names for three");
+        for (i, a) in got.iter().enumerate() {
+            for b in got.iter().skip(i + 1) {
+                assert!((a[0] - b[0]).hypot(a[1] - b[1]).max((a[2] - b[2]).abs()) >= SPOT_SEPARATION,
+                    "every offered spot must be somewhere else: {a:?} vs {b:?}");
+            }
+        }
+        // The cap still binds, and the nearest is still first.
+        let many: Vec<[f32; 3]> = (0..40).map(|i| [i as f32 * 20.0, 0.0, 0.0]).collect();
+        let capped = spread_spots(many, OFFERED_SPOTS, SPOT_SEPARATION);
+        assert_eq!(capped.len(), OFFERED_SPOTS, "an offer is bounded — the full leaf list is diagnostics");
+        assert_eq!(capped[0], [0.0, 0.0, 0.0], "…and the nearest spot stays the one to try first");
     }
 
     /// **#660 review B1 — the disclosure had a hole in exactly the #266 pad class.**

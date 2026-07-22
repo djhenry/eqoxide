@@ -438,8 +438,10 @@ no-route state (`no_path` / `search_exhausted`) **and** it declined at least one
   which can leave you just outside a small trigger. `null` means no standable spot was found in the
   region at all; walking to `region_at` may then do nothing. Either way it is a warning, not a
   disqualification — the region is really there, and the standability probe is this client's model.
-- **`footprint_count`** / **`alternates`** — how many standable spots this pad has in total, and the
-  next few (nearest-first, up to 7) to try if the first fires nothing. A DRNTP region is a BSP and one
+- **`footprint_count`** / **`alternates`** — how many standable spots this pad has in total, and up to
+  7 more to try if the first fires nothing. Nearest-first, and **thinned so each is a genuinely
+  different place** (at least one nav cell apart): a pad's region is a BSP, so its nearest leaves are
+  often many names for the same spot — one observed pair was 0.0005 units apart. A DRNTP region is a BSP and one
   pad routinely has dozens of spots (58 for the North Qeynos pad above), so you get **one offer per
   pad**, not one per spot. **If nothing happens, work through `alternates` before concluding the pad
   is inert.**
@@ -460,13 +462,22 @@ no-route state (`no_path` / `search_exhausted`) **and** it declined at least one
 `player.zone` and `player.pos` afterwards to find out where it actually went — that observation is
 the only thing that establishes a pad's real destination, and only you keep it.
 
-> ⚠️ **`player.pos` / `player.zone` are PROVISIONAL for a moment right after any crossing.** To make
-> the character leave the pad's trigger region, the client applies the *advertised* arrival to its own
-> position immediately, before the server has said anything. If the server then resolves the crossing
-> to a different place — the whole reason this pad was declined — the real position arrives with its
-> echo and supersedes it. So **re-read until they settle** before concluding where a pad goes. The
-> in-game message log (`/v1/observe/messages`, channel `zone`) says the same thing at the moment of
-> the crossing.
+> ⚠️ **`player.pos` / `player.zone` are PROVISIONAL for a moment right after any crossing — and
+> `player.position_provisional` tells you exactly when.** To make the character leave the pad's trigger
+> region, the client applies the *advertised* arrival to its own position immediately, before the
+> server has said anything. The zone echo then settles **which zone** (and `zone` flips there) while
+> the position does not arrive until the new zone's first update — so in that window `zone` and `pos`
+> can genuinely disagree. Do not read them as settled until:
+>
+> ```
+> "position_provisional": false,   // true while pos/zone are the client's own guess
+> "crossing_pending_ms": null      // ms it has been unsettled (measured at read time)
+> ```
+>
+> Both are under `player` on `GET /v1/observe/debug`. `position_provisional` clears only when the
+> **server** says where you are — never on the zone echo alone. The message log says the same thing at
+> the moment of the crossing, but **do not rely on it**: it is a ring buffer and ambient chatter can
+> evict the line within seconds. The field is the observable.
 
 **A pad is offered whenever it exists in this client's loaded map.** That is the only bar, and it is
 answered from geometry the client measured — never from the advertised destination, which is the part

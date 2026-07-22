@@ -901,6 +901,11 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         // #513: the server has now told us where we are — distances derived from our position are
         // real from here on (before this they'd be measured from the origin).
         gs.player_pos_known = true;
+        // #660 B2: the SERVER has now told us where we are, so the position is no longer the
+        // client's crossing guess. This is the ONLY kind of event that clears it — the zone echo
+        // settles which ZONE, not where in it.
+        gs.position_provisional_since = None;
+
         // Keep the player's heading live from real server position updates.
         gs.player_heading = upd.heading;
     } else if let Some(e) = gs.world.entities.get_mut(&sid) {
@@ -2580,6 +2585,11 @@ fn apply_bind_respawn(gs: &mut GameState, payload: &[u8]) {
     gs.player_y = r.f32();
     gs.player_z = r.f32() - eqoxide_core::coord::WIRE_Z_OFFSET; // wire→foot datum (#522)
     gs.player_pos_known = true; // server-authoritative respawn point (#513)
+    // #660 B2: the SERVER has now told us where we are, so the position is no longer the
+    // client's crossing guess. This is the ONLY kind of event that clears it — the zone echo
+    // settles which ZONE, not where in it.
+    gs.position_provisional_since = None;
+
     // Real EQ revives a bind-respawned character at FULL HP. `apply_death` zeroed hp_pct and left
     // cur_hp/max_hp stale, so without this the HUD/API show a dead-but-full contradiction
     // (hp/hp_max full, hp_pct 0) until some later OP_HPUpdate happens to reconcile it (eqoxide#68).
@@ -5164,6 +5174,37 @@ mod tests {
         let mut gs = GameState::new();
         register_spawn(&mut gs, mk(1, 0.0, 0.0, 0.0, "a_rat"));
         assert!(gs.world.entities.contains_key(&1496), "a real NPC must still register even at (0,0,0)");
+    }
+
+    /// **#543/#660 review B2 — the provisional marker must clear HERE, on the real handler.**
+    ///
+    /// A crossing marks `player.pos`/`player.zone` as the client's own guess; a stuck `true` would
+    /// be its own falsehood, and an agent that never sees it clear can never conclude where a pad
+    /// went. The clear belongs to the moment the SERVER places us — which is this function.
+    ///
+    /// Driven through the real `apply_position_update` on a real wire payload, deliberately, because
+    /// the sibling test in `action_loop` sets the field by hand: removing the clear from THIS
+    /// handler left that one green (the #660 NB1 bug class, in the fix for #660 NB1). A hand-set
+    /// field proves the type works; only the handler proves the client does.
+    #[test]
+    fn a_server_position_update_clears_the_provisional_crossing_marker_543() {
+        use super::apply_position_update;
+        use crate::protocol::encode_position_update;
+        let mut gs = GameState::new();
+        gs.player_id = 1;
+        gs.position_provisional_since = Some(std::time::Instant::now());
+
+        // Somebody ELSE moving is not evidence about where WE are.
+        apply_position_update(&mut gs, &encode_position_update(2, 10.0, 20.0, 30.0, 0.0));
+        assert!(gs.position_provisional_since.is_some(),
+            "another spawn's position says nothing about ours — the marker must survive it");
+
+        // The server places US: the guess is over.
+        apply_position_update(&mut gs, &encode_position_update(1, 50.0, -60.0, 120.0, 0.0));
+        assert!(gs.position_provisional_since.is_none(),
+            "#660 B2: once the server has told us where we are, `pos` is no longer provisional — a \
+             marker that never clears is as useless as one that never sets");
+        assert!(gs.player_pos_known);
     }
 
     #[test]
