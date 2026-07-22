@@ -351,6 +351,22 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
     // forever. `ready` cannot be published without a terrain mesh count AND a collision grid with
     // geometry (see `ZoneAssetState::ready`), so it always carries its own evidence.
     let zone_assets = zone_assets_json(&s);
+    // #616 (agent-honesty): terminal background-worker failures. `null` while healthy. Before this
+    // wiring, a panic in either worker was made honest INTERNALLY (App stopped lying to itself about
+    // its own state) but never reached this endpoint — so a driving agent polling here saw nothing
+    // different from a worker that was still quietly working, exactly the failure mode #616 exists to
+    // remove, just one hop further out. These are the SAME `Arc`s the app thread writes (see their
+    // doc comments on `HttpState`), not a re-derivation — nothing here computes a verdict, it only
+    // relays the one the app already reached.
+    //   - `common_assets_failed`: a panic in the common-asset-loader, OR (independent of #616,
+    //     pre-existing behavior) the loader finishing normally with no usable asset set and no cached
+    //     fallback. Either way the client is stuck showing this on the loading screen — see
+    //     `poll_sync` in `src/app.rs` for why only the panic case additionally clears `loading`.
+    //   - `model_sync_dead`: the model-sync worker has stopped for any reason (panic, login failure,
+    //     or its channel closing) and will not run again this session — on-demand race-model syncing
+    //     is over.
+    let common_assets_failed = s.common_assets_failed.lock().unwrap().clone();
+    let model_sync_dead = s.model_sync_dead.lock().unwrap().clone();
     let (guild_name, guild_id, guild_rank) = {
         let g = s.guild_slots.guild.lock().unwrap();
         (g.guild_name.clone(), g.guild_id, g.guild_rank)
@@ -493,6 +509,10 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // Is this client's model of the CURRENT ZONE actually loaded? Gate every world-shaped
         // conclusion on `zone_assets.state == "ready"` (#579). See the comment where it's built.
         "zone_assets": zone_assets,
+        // Terminal background-worker failures (#616). `null` while healthy — see the comment where
+        // these are built, above.
+        "common_assets_failed": common_assets_failed,
+        "model_sync_dead": model_sync_dead,
         // The FINE 2u STEERING tier (#382). `null` while it is healthy (a complete fine route to its
         // carrot) or has not yet answered. Non-null when the tier that is actually steering the
         // character cannot see a way through the next 40u — and it says WHICH kind of cannot:
@@ -1542,6 +1562,37 @@ mod zone_asset_gate_tests {
         assert_eq!(j["zone_assets"]["state"], "failed");
         assert_eq!(j["zone_assets"]["status"], "GLB is corrupt");
         assert!(j["zone_assets"]["detail"].as_str().unwrap().contains("terminal"));
+    }
+
+    /// #616 (agent-honesty): a terminal background-worker failure must reach the agent through this
+    /// endpoint, not just flip an internal `App` field nothing ever reads. Healthy-by-default first —
+    /// the field must not appear as a failure when nothing has gone wrong.
+    #[tokio::test]
+    async fn debug_reports_no_worker_failures_when_healthy() {
+        let (_, j) = get(ready_state(), "/debug").await;
+        assert_eq!(j["common_assets_failed"], serde_json::Value::Null);
+        assert_eq!(j["model_sync_dead"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn debug_surfaces_a_common_asset_loader_failure() {
+        let s = ready_state();
+        *s.common_assets_failed.lock().unwrap() =
+            Some("the common-asset-loader thread PANICKED while syncing assets".to_string());
+        let (_, j) = get(s, "/debug").await;
+        assert_eq!(
+            j["common_assets_failed"],
+            "the common-asset-loader thread PANICKED while syncing assets"
+        );
+    }
+
+    #[tokio::test]
+    async fn debug_surfaces_a_dead_model_sync_worker() {
+        let s = ready_state();
+        *s.model_sync_dead.lock().unwrap() =
+            Some("the model-sync-worker thread PANICKED".to_string());
+        let (_, j) = get(s, "/debug").await;
+        assert_eq!(j["model_sync_dead"], "the model-sync-worker thread PANICKED");
     }
 
     #[tokio::test]

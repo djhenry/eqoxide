@@ -460,6 +460,20 @@ pub struct HttpState {
     /// standing on a placeholder ground plane with no collision, and reporting that as the zone is
     /// the false-empty that produced the bogus #560 report.
     pub(crate) zone_assets: eqoxide_nav::zone_assets::ZoneAssetStateShared,
+    /// Terminal common-asset-loader failure (#616, agent-honesty). `None` while healthy; a reason
+    /// string once the loader has reached a state it cannot recover from this session — either it
+    /// panicked, or it finished normally with no usable asset set and no cached fallback. Written
+    /// only by the app thread (see `run_common_asset_loader` / `poll_sync` in `src/app.rs`); this is
+    /// the SAME `Arc` handed to `App::new`, not a second copy, so nothing can drift between what the
+    /// app sees and what this endpoint reports (the shared-Arc-identity trap noted against #616
+    /// review F1: constructing the state twice, once here and once in `App::new`, would silently
+    /// sever the two and this field would read `None` forever no matter what the app published).
+    pub(crate) common_assets_failed: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// Terminal model-sync-worker failure (#616, agent-honesty). `None` while the worker is alive;
+    /// a reason string once it has stopped for any reason (panic, login failure, or its request
+    /// channel closing) — this worker never restarts once dead, so the field is never cleared once
+    /// set. Same shared-`Arc`-identity discipline as `common_assets_failed` above.
+    pub(crate) model_sync_dead: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// The typed write-path facade (#446). Combat is fully migrated onto it — combat/pet handlers
     /// write via `s.command.request_*` (no direct `ipc::CombatSlots` field any more); other domains
     /// still use their own bundle fields until Wave-2 migrates them. See `eqoxide_command`.
@@ -629,6 +643,8 @@ pub fn spawn_camera_server(
     world:           eqoxide_ipc::WorldSlots,
     shared_collision: eqoxide_nav::collision::SharedCollision,
     zone_assets:      eqoxide_nav::zone_assets::ZoneAssetStateShared,
+    common_assets_failed: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    model_sync_dead:      std::sync::Arc<std::sync::Mutex<Option<String>>>,
     command:         eqoxide_command::CommandState,
     social:          eqoxide_ipc::SocialSlots,
     merchant_slots:  eqoxide_ipc::MerchantSlots,
@@ -661,7 +677,8 @@ pub fn spawn_camera_server(
             .expect("http tokio runtime");
         rt.block_on(async move {
             let state = HttpState {
-                camera, nav, world, shared_collision, zone_assets, command, social, merchant_slots,
+                camera, nav, world, shared_collision, zone_assets, common_assets_failed,
+                model_sync_dead, command, social, merchant_slots,
                 inventory_slots, interact, chat, spells, game_state, net_health, frame_profile,
                 quest, group_slots, lifecycle, guild_slots, nav_debug_view,
             };

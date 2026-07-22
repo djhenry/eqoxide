@@ -360,6 +360,16 @@ fn main() {
     // loading — which is itself distinct from both.
     let zone_assets: eqoxide::nav::zone_assets::ZoneAssetStateShared =
         Arc::new(Mutex::new(eqoxide::nav::zone_assets::ZoneAssetState::Idle));
+    // Terminal background-worker failures (#616, agent-honesty). Constructed ONCE here, exactly like
+    // `zone_assets` above, and the SAME `Arc` cloned into both `App::new` (the sole writer — see
+    // `run_common_asset_loader` / `run_model_sync_worker` in `src/app.rs`) and `spawn_camera_server`
+    // (the reader, on `/v1/observe/debug`). Constructing a second, independent `Arc` on either side
+    // would silently sever that identity: the app would keep publishing into ITS copy and this
+    // endpoint would read `None` forever no matter what happened (the exact shared-Arc trap the #616
+    // review caught — see that PR's F1). `None` = healthy; `Some(reason)` = terminal for the rest of
+    // the session (neither worker restarts once it reaches this state).
+    let common_assets_failed: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let model_sync_dead: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // Single-owner GameState snapshot (see
     // docs/superpowers/plans/2026-07-12-gamestate-single-owner-snapshot.md). The network thread is
     // the sole writer of GameState; it publishes here every tick. `last_inbound` is a separate,
@@ -502,6 +512,8 @@ fn main() {
         world,
         shared_collision.clone(),
         zone_assets.clone(),
+        common_assets_failed.clone(),
+        model_sync_dead.clone(),
         command.clone(),
         social,
         merchant_slots,
@@ -536,6 +548,8 @@ fn main() {
         app_spells,
         shared_collision,
         zone_assets,
+        common_assets_failed,
+        model_sync_dead,
         app_frame_profile,
         testzone_mode,
         nav_debug_flag,
