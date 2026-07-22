@@ -7,6 +7,13 @@ edition = "2021"
 name = "eqoxide_ipc"
 path = "src/lib.rs"
 
+[features]
+# Exposes `Roster::insert_for_test` so a downstream crate's unit tests can seed a partial or
+# deliberately-mismatched entity roster. Enable it as a DEV-dependency feature only — it is what
+# keeps a roster writable at all, and production must have exactly one writer (#643). See the
+# `Roster` doc comment.
+test-fixtures = []
+
 [dependencies]
 # ipc is the "inter-thread contracts" crate: it sits directly above `eqoxide-core` and below
 # everything else (core ← ipc ← {net, render, http, command, …}). It depends ONLY on core plus
@@ -16,3 +23,9 @@ eqoxide-core = { path = "../eqoxide-core" }
 serde = { version = "1", features = ["derive"] }  # Serialize derives on the API-visible slot payloads
 tokio = { version = "1", features = ["sync"] }    # tokio::sync::oneshot — the await-slot reply channel
 arc-swap = "1"                                     # GameStateSnapshot = Arc<ArcSwap<GameState>>
+
+[dev-dependencies]
+# `game_state::make_entity` is gated behind core's `test-fixtures` feature (not bare `#[cfg(test)]`,
+# which is invisible downstream — see its doc comment). This crate's own tests build fixture
+# entities to exercise `WorldSlots::publish_entities`, so they need it enabled for the test build.
+eqoxide-core = { path = "../eqoxide-core", features = ["test-fixtures"] }

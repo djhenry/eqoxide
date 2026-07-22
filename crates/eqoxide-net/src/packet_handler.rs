@@ -7,7 +7,7 @@
 use crate::protocol::*;
 use crate::transport::AppPacket;
 use crate::wire::WireReader;
-use eqoxide_core::game_state::{GameState, Entity, ZonePoint};
+use eqoxide_core::game_state::{GameState, Entity, Gait, Pose, ZonePoint};
 
 /// Apply one EQ server packet to `gs`.
 pub fn apply_packet(gs: &mut GameState, packet: &AppPacket) {
@@ -918,7 +918,10 @@ fn apply_position_update(gs: &mut GameState, payload: &[u8]) {
         // here because position updates carry no flymode.
         e.z = eqoxide_core::coord::wire_z_to_foot(upd.z, e.floating);
         e.heading = upd.heading;
-        e.animation = upd.animation;
+        // #643: a position update carries GAIT (a speed code), NOT a pose. It goes in its own
+        // typed field; `e.pose` is deliberately left alone here. Before the split these shared
+        // one `u32`, so the first position update permanently destroyed the pose value.
+        e.gait = Some(Gait::from_wire_10bit(upd.animation));
         tracing::debug!("EQ: npc_pos id={} name={} pos=({:.1},{:.1},{:.1})", sid, e.name, e.x, e.y, e.z);
     } else {
         tracing::debug!("EQ: npc_pos id={} NOT IN ENTITY MAP (known: {})", sid, gs.world.entities.len());
@@ -1534,7 +1537,7 @@ pub fn apply_death(gs: &mut GameState, payload: &[u8]) {
             if let Some(e) = gs.world.entities.get_mut(&d_id) {
                 e.dead      = true;
                 e.hp_pct    = 0.0;
-                e.animation = 115; // Animation::Lying — triggers "dead" clip in scene renderer
+                e.pose      = Pose::Lying; // triggers "dead" clip in scene renderer
             }
             tracing::info!("EQ: combat: {} has been slain", name);
             gs.log_msg("combat", &format!("{} has been slain", name));
@@ -2247,11 +2250,25 @@ pub(crate) fn apply_target_command(gs: &mut GameState, payload: &[u8]) {
 
 /// OP_SpawnAppearance render-side handler: `{ id: u16, kind: u16, param: u32 }`.
 ///
-/// We only consume the ANIMATION appearance (kind 14) for OUR OWN player, mapping param 110→sitting,
-/// 100→standing. A client-initiated sit/stand sets `gs.sitting` directly at the send site
-/// (gameplay.rs), so this handler's own job is to keep it in sync with SERVER broadcasts of the
-/// same opcode (e.g. a GM-forced sit, or another client's action reflected back) (#53). Other kinds
-/// / other spawns are ignored (their pose comes from spawn and scene state).
+/// The ANIMATION appearance (kind 14) is the server's POSE-CHANGE BROADCAST, and it is consumed for
+/// **every** spawn — ours and everyone else's:
+///
+/// - **Our own player** → `gs.sitting` (param 110→sitting, 100→standing). A client-initiated
+///   sit/stand sets `gs.sitting` directly at the send site (gameplay.rs), so this half's job is to
+///   keep it in sync with SERVER broadcasts of the same opcode (e.g. a GM-forced sit, or another
+///   client's action reflected back) (#53).
+/// - **Any other spawn** → that entity's `pose` (#643). This is the ONLY channel by which an NPC's
+///   or another player's pose change reaches us after it spawns; every server-side pose transition
+///   funnels through `Mob::SetAppearance` → `SendAppearancePacket`, and the spawn struct's
+///   `StandState` only ever describes the pose at spawn time.
+///
+/// ⚠️ This doc comment previously said "Other kinds / other spawns are ignored (their pose comes
+/// from spawn and scene state)" — which was the FALSE MODEL that produced #643. It was not merely
+/// stale: it asserted that a pose could be reconstructed without this opcode, and on that basis the
+/// non-self branch was never written, so no entity could change pose after spawning. Do not
+/// reintroduce that claim; there is no other source.
+///
+/// Other appearance KINDS (guild id/rank, flymode) are handled below for our own spawn only.
 fn apply_spawn_appearance(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < 8 { return; }
     let id    = u16::from_le_bytes([payload[0], payload[1]]) as u32;
@@ -2261,6 +2278,27 @@ fn apply_spawn_appearance(gs: &mut GameState, payload: &[u8]) {
     const SITTING:   u32 = 110;
     if kind == ANIMATION && id == gs.player_id {
         gs.sitting = param == SITTING;
+    }
+    // #643: AT_Anim (14) about ANOTHER spawn is the server's pose-change broadcast — it is how a
+    // client learns that an NPC sat down, stood up, crouched, or lay down after it spawned. Before
+    // #643 this branch did not exist at all: the ONLY pose writers were the spawn packet and
+    // `apply_death`, so an NPC that sat down after spawning could never be rendered sitting.
+    // (Compounding that, the pose value shared a field with the position update's gait code, so
+    // even the spawn-time pose was destroyed by the entity's first step.) Unrecognised parameters
+    // become `Pose::Unknown(raw)` rather than a plausible default.
+    if kind == ANIMATION && id != gs.player_id {
+        if let Some(e) = gs.world.entities.get_mut(&id) {
+            // A dead entity stays Lying — a stray appearance packet must not stand a corpse up.
+            if !e.dead {
+                let pose = Pose::from_wire(param);
+                if let Pose::Unknown(v) = pose {
+                    tracing::warn!(
+                        "EQ: spawn {} sent an unrecognised pose code {} (OP_SpawnAppearance type 14); \
+                         reporting it as unknown({}) rather than guessing (#643)", id, v, v);
+                }
+                e.pose = pose;
+            }
+        }
     }
     // Guild membership reflect (#295): the server pushes our own guild id/rank as SpawnAppearance
     // kinds when membership changes (e.g. a GM `#guild add/remove`), with no client action. Applying
@@ -2913,13 +2951,17 @@ pub fn register_spawn(gs: &mut GameState, info: SpawnInfo) {
         face:           info.face,
         hairstyle:      info.hairstyle,
         haircolor:      info.haircolor,
-        // Corpses use the Lying animation (115) so the scene renderer picks the "dead"/D05 clip.
-        animation:      if is_corpse { 115 } else { info.stand_state as u32 },
+        // Corpses use the Lying pose so the scene renderer picks the "dead"/D05 clip.
+        pose:           if is_corpse { Pose::Lying } else { Pose::from_wire(info.stand_state as u32) },
+        // #643: no gait until this entity actually sends a position update. `None` means
+        // "the server has not told us", which is NOT the same as "standing still".
+        gait:           None,
     });
 }
 
 #[cfg(test)]
 mod tests {
+    use eqoxide_core::game_state::Pose;
     use super::{apply_emote, apply_death, apply_who_all, class_name, con_color, consider_message, parse_player_profile,
                 parse_begin_cast, apply_begin_cast, parse_memorize_spell, apply_char_inventory,
                 apply_money_update, apply_money_on_corpse, apply_move_item, apply_spawn_appearance, apply_buff_with, apply_buff_create_with,
@@ -3058,7 +3100,7 @@ mod tests {
             x: 0.0, y: 0.0, z: 0.0, hp_pct, cur_hp: 100, max_hp: 100,
             race: String::new(), heading: 0.0, dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
-            face: 0, hairstyle: 0, haircolor: 0, animation: 0, floating: false,
+            face: 0, hairstyle: 0, haircolor: 0, pose: Pose::Standing, gait: None, floating: false,
         }
     }
 
@@ -5070,7 +5112,7 @@ mod tests {
         register_spawn(&mut gs, mk(2, "Aldric's corpse378"));
         let e = gs.world.entities.get(&7).unwrap();
         assert!(e.dead, "pc corpse (npc=2) must be flagged dead");
-        assert_eq!(e.animation, 115, "corpse uses the Lying animation → scene picks the D05 dead clip");
+        assert_eq!(e.pose, Pose::Lying, "corpse uses the Lying animation → scene picks the D05 dead clip");
         assert_eq!(e.hp_pct, 0.0, "a corpse is at 0 hp");
 
         // An NPC corpse (npc=3) likewise.
@@ -5083,7 +5125,7 @@ mod tests {
         register_spawn(&mut gs, mk(1, "a rat"));
         let e = gs.world.entities.get(&7).unwrap();
         assert!(!e.dead, "a living spawn must not be flagged dead");
-        assert_eq!(e.animation, 100);
+        assert_eq!(e.pose, Pose::Standing);
         assert_eq!(e.hp_pct, 100.0);
     }
 
@@ -6177,7 +6219,7 @@ mod tests {
         apply_new_spawn(&mut gs, &build_spawn("a_gnoll_corpse", 77, 3));
         let e = gs.world.entities.get(&77).expect("npc corpse in entities");
         assert!(e.dead, "npc corpse must be marked dead");
-        assert_eq!(e.animation, 115, "npc corpse uses the Lying clip");
+        assert_eq!(e.pose, Pose::Lying, "npc corpse uses the Lying clip");
         assert_eq!(e.hp_pct, 0.0);
 
         // PC corpse (npc=2) → another player's corpse lies down too (not auto-looted, but dead).
@@ -6186,7 +6228,7 @@ mod tests {
         apply_new_spawn(&mut gs2, &build_spawn("Aldric`s corpse", 88, 2));
         let e2 = gs2.world.entities.get(&88).expect("pc corpse in entities");
         assert!(e2.dead, "pc corpse must be marked dead");
-        assert_eq!(e2.animation, 115);
+        assert_eq!(e2.pose, Pose::Lying);
 
         // A live NPC (npc=1) must NOT be marked dead.
         let mut gs3 = GameState::new();
@@ -6194,7 +6236,7 @@ mod tests {
         apply_new_spawn(&mut gs3, &build_spawn("a_gnoll", 99, 1));
         let e3 = gs3.world.entities.get(&99).expect("live npc in entities");
         assert!(!e3.dead, "a live npc must not be marked dead");
-        assert_eq!(e3.animation, 100, "a live npc keeps its standing animation");
+        assert_eq!(e3.pose, Pose::Standing, "a live npc keeps its standing animation");
     }
 
     #[test]
@@ -6806,7 +6848,7 @@ mod tests {
         // Register an NPC entity with id=42
         gs.world.entities.insert(42, Entity {
             spawn_id: 42, name: "Orc Pawn".into(),
-            x: 0.0, y: 0.0, z: 0.0, heading: 0.0, animation: 100, floating: false,
+            x: 0.0, y: 0.0, z: 0.0, heading: 0.0, pose: Pose::Standing, gait: None, floating: false,
             level: 5, is_npc: true, gender: 0, race: "ORC".into(),
             cur_hp: 50, max_hp: 100, hp_pct: 50.0,
             dead: false,
@@ -6822,7 +6864,7 @@ mod tests {
         let e = gs.world.entities.get(&42).expect("entity must remain in map after death");
         assert!(e.dead, "entity must be marked dead");
         assert_eq!(e.hp_pct, 0.0, "hp_pct must be zeroed");
-        assert_eq!(e.animation, 115, "animation must be set to 115 (Lying) for dead clip");
+        assert_eq!(e.pose, Pose::Lying, "animation must be set to 115 (Lying) for dead clip");
         // Auto-loot queued for player's own kill
         assert!(gs.pending_loot.contains(&42), "corpse id must be queued for auto-loot");
     }

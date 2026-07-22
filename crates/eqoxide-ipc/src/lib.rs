@@ -582,11 +582,161 @@ pub type NavAvoidShared = Arc<Mutex<AggroAvoidOpts>>;
 // `eqoxide-nav` and wired alongside `ControllerSlots` in `main.rs`. One published source; a second
 // copy of the committed route here would be a drift channel.)
 
-/// Live entity name → (x, y, z) map, updated by login.rs as packets arrive.
-pub type EntityPositions = Arc<Mutex<HashMap<String, (f32, f32, f32)>>>;
+/// A name-keyed roster map that **cannot be mutated from outside this crate** (#643 review r3).
+///
+/// It derefs to `HashMap<String, V>`, so every existing read — `get`, `len`, `iter`, `keys`,
+/// `contains_key`, `&*guard` into a `&HashMap` — works exactly as before, with no call-site
+/// changes. What it deliberately does NOT implement is `DerefMut`, and it exposes no public
+/// mutators. The only way to write one is [`WorldSlots::publish_entities`], which writes all three
+/// roster maps together.
+///
+/// # Why a newtype instead of a plain `HashMap`
+///
+/// `/v1/observe/entities?labeled=1` promises an agent that `poses` is keyed exactly like
+/// `entities`, so `body["poses"][name]` cannot `KeyError`. That promise is only as strong as its
+/// weakest writer, and this repo has already broken it once: two publishers existed
+/// (`eqoxide_net::action_loop::sync_entities` and `eqoxide_net::login`'s zone-in seed), and when
+/// `entity_poses` was added only the first was updated.
+///
+/// Two weaker fixes were tried first and both were falsified by a reviewer:
+///
+/// 1. *Add the missing lines to the second loop.* The reviewer deleted them again; the whole
+///    workspace suite stayed green. The invariant was a convention duplicated across two
+///    hand-written loops.
+/// 2. *Add a source scanner asserting there is only one publisher.* The reviewer wrote a third
+///    publisher in the most idiomatic Rust form — `world.entity_positions.lock().unwrap()
+///    .insert(..)`, mutation through a temporary guard with no binding at all — and the suite
+///    stayed green, because the scanner keyed on `let mut` on the same line. It was pinned against
+///    the bug that had already happened rather than the one that would happen next, which is the
+///    same shape as the original defect. (That scanner had a second, independent hole too: its
+///    "skip test modules" logic latched at the first `#[cfg(test)]` and never reset, so most of
+///    several large production files went unscanned.)
+///
+/// So the rule moved into the type system, where a grep does not belong: a third publisher is now
+/// a **compile error**, not a test failure and not a review catch. This is the same
+/// make-the-bad-state-unrepresentable move `Pose`/`Gait` make one layer down.
+///
+/// # Test seeding
+///
+/// [`Roster::insert_for_test`] is gated on `#[cfg(any(test, feature = "test-fixtures"))]` so unit
+/// tests can still seed a partial or deliberately-mismatched roster (several existing tests rely on
+/// that, e.g. an ids-only fixture). Downstream crates enable `eqoxide-ipc/test-fixtures` as a
+/// **dev-dependency** feature, so it is absent from `cargo build --release` entirely. It is named
+/// `insert_for_test` rather than `insert` on purpose: if that feature ever did get enabled for a
+/// normal dependency, a production call site would still read `insert_for_test` and be obvious in
+/// review, instead of silently looking like ordinary map access.
+///
+/// # The exact strength of this guarantee (measured, not asserted)
+///
+/// - A production publisher written the idiomatic way — `world.entity_positions.lock().unwrap()
+///   .insert(..)` — fails to compile under **both** `cargo test --workspace` and
+///   `cargo build --release`, because [`Roster::insert`] is `pub(crate)` to this crate. That is the
+///   shape a reviewer used to defeat the previous revision's source scanner.
+/// - The same code written with `insert_for_test` fails `cargo build --release` (dev-dependency
+///   features are absent there) but *does* compile under `cargo test --workspace`, where Cargo
+///   unifies the workspace's dev-dependency features. CI runs `cargo build --release --locked`
+///   BEFORE the test job, so it is still caught — but it is caught at build time, not by a test.
+///   **That containment rests on CI's shape, and nothing durable pins it:** the build and test steps
+///   are steps of the SAME job, steps run sequentially, and a failing step fails the job — so today
+///   the release build genuinely gates the tests. Split them into separate jobs, reorder them, or
+///   add `continue-on-error`, and this hatch silently reopens with no test noticing. If you touch
+///   `.github/workflows/test.yml`, keep `cargo build --release` ahead of `cargo test` in one job.
+///
+/// That residual is deliberate and bounded: closing it entirely would mean giving up in-crate test
+/// fixtures that seed partial rosters on purpose. It is recorded here so nobody has to rediscover
+/// it, and so "a third publisher cannot compile" is read with its one qualification attached.
+/// `Debug`/`PartialEq` only. **Every other derive or impl on this type is deliberately absent** —
+/// see "The sealed surface" in the doc comment above.
+#[derive(Debug, PartialEq)]
+pub struct Roster<V>(HashMap<String, V>);
+
+impl<V> std::ops::Deref for Roster<V> {
+    type Target = HashMap<String, V>;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+// ── The seal ─────────────────────────────────────────────────────────────────────────────────
+// NOT implemented, each one deliberately, each one a way to write a roster from outside this crate:
+//
+//   DerefMut     — would re-expose every `HashMap` mutator (`insert`, `remove`, `clear`, `entry`,
+//                  `get_mut`, …) through the `MutexGuard`.
+//   Default      — `*guard = Roster::default()` wipes a map. Replaced by `pub(crate) fn new()`.
+//   FromIterator — `*guard = pairs.into_iter().collect()` REPLACES the whole map. This is the one
+//                  that defeated the first version of this seal: it blocked per-entry mutation but
+//                  left whole-value assignment open, and a complete third publisher written that
+//                  way compiled clean in release. (The `DerefMut` in play there is `MutexGuard`'s,
+//                  not `Roster`'s, so the missing impl below was simply routed around.)
+//   Clone        — `*guard = kept_earlier.clone()` restores a stale roster into one map and not the
+//                  others. Found while enumerating this list rather than by a failing build; with
+//                  `Clone` gone, `.clone()` on a `Roster` resolves through `Deref` to
+//                  `HashMap::clone`, which yields a `HashMap` that cannot be assigned back.
+//   serde        — no `Deserialize`, so no deserialize-into-place either.
+//
+// What that list does and does not establish. It establishes exactly one thing: an outside crate
+// cannot CONSTRUCT a `Roster<V>`. So every write that needs a freshly-built value is closed —
+// `*guard = pairs.collect()`, `*guard = Default::default()`, `*guard = kept.clone()`,
+// `mem::take(&mut *guard)`, `mem::replace(&mut *guard, ..)` — because each of them has to name a
+// producer, and there is none.
+//
+// It does NOT establish that no `Roster` value can be named or moved, and an earlier revision of
+// this comment claimed that it did. That was false. `WorldSlots`' fields are `pub`, `publish_entities`
+// is `pub`, and `MutexGuard` supplies `DerefMut` — so an outside crate can legitimately populate a
+// SCRATCH `WorldSlots` and then `mem::swap` one of its maps into a live one, MOVING an existing
+// `Roster` without ever constructing one. That compiles clean in release today (verified, #665) and
+// desyncs `entity_ids` from `entity_positions`, which `combat.rs`'s "is this spawn known?" answers
+// from alone. Closing the producer set was necessary and is not sufficient: the remaining leak is
+// that the CONTAINER hands out mutable access to what it protects. Tracked in #665; deliberately
+// not bolted onto this change.
+//
+// The reason to close CONSTRUCTORS rather than call-site shapes is that producers are finite and
+// enumerable, so "each member is closed" is a claim that can be checked. Two earlier attempts here
+// guessed at shapes instead (`let mut` in a source scanner; then per-entry mutation) and each
+// survived only the shapes someone happened to try.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+
+impl<V> Roster<V> {
+    /// The only constructor. `pub(crate)` — hand-written rather than `Default` so it does not
+    /// appear in this type's public API, and so it needs no `V: Default` bound (`EntityPoseView`
+    /// has no meaningful default; there is no such thing as a default body pose).
+    pub(crate) fn new() -> Self { Roster(HashMap::new()) }
+
+    /// Drop every entry. `pub(crate)` — only the single publisher may write a roster.
+    pub(crate) fn clear(&mut self) { self.0.clear(); }
+    /// Insert one entry. `pub(crate)` — only the single publisher may write a roster.
+    pub(crate) fn insert(&mut self, k: String, v: V) -> Option<V> { self.0.insert(k, v) }
+
+    /// **Test fixtures only.** Seed one entry directly, bypassing the all-three-maps guarantee —
+    /// which is exactly what a test wants when it needs a partial or intentionally-mismatched
+    /// roster. Never available in a release build; see the type's doc comment.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn insert_for_test(&mut self, k: String, v: V) -> Option<V> { self.0.insert(k, v) }
+}
+
+/// Live entity name → (x, y, z) map, published by `WorldSlots::publish_entities`.
+pub type EntityPositions = Arc<Mutex<Roster<(f32, f32, f32)>>>;
 
 /// Live entity name → spawn_id map (same keys as EntityPositions).
-pub type EntityIds = Arc<Mutex<HashMap<String, u32>>>;
+pub type EntityIds = Arc<Mutex<Roster<u32>>>;
+
+/// One entity's server-published body state, as exposed by `/v1/observe/entities?labeled=1` (#643).
+///
+/// Both halves are the wire's own signals, kept in their OWN domains — before #643 they shared a
+/// single `u32` on `Entity`, so whichever packet arrived last silently decided what the number
+/// meant. `pose` is the discrete body state; `gait` is the locomotion speed code.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct EntityPoseView {
+    /// `standing` / `freeze` / `looting` / `sitting` / `crouching` / `lying`, or
+    /// **`unknown(<raw>)`** when the server sent a code this client does not recognise. An
+    /// unrecognised code is reported verbatim rather than guessed at (agent-honesty).
+    pub pose: String,
+    /// The most recent `OP_ClientUpdate` gait (locomotion speed) code, or `null` when this entity
+    /// has not sent a position update yet. `null` means **"not reported"**, NOT "standing still".
+    pub gait: Option<i32>,
+}
+
+/// Live entity name → pose/gait map (same keys as `EntityPositions`), published each tick by the
+/// net thread and read by `GET /v1/observe/entities?labeled=1` (#643).
+pub type EntityPoses = Arc<Mutex<Roster<EntityPoseView>>>;
 
 /// Zone exit points received in OP_SEND_ZONE_POINTS, exposed via GET /v1/observe/zone_points.
 pub type ZonePoints = Arc<Mutex<Vec<eqoxide_core::game_state::ZonePoint>>>;
@@ -1217,11 +1367,98 @@ pub struct NavSlots {
 /// plus the zone's exit points. Read by nearly every domain to resolve a name/target to a spawn
 /// id (merchant buy/sell, combat target, trainer open, `/goto` by name, …) — it is genuinely a
 /// shared world index, not particular to navigation, even though nav is its biggest reader.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct WorldSlots {
     pub entity_positions: EntityPositions,
     pub entity_ids:       EntityIds,
+    /// name → pose/gait (#643). Same keys as `entity_positions`; published by the same
+    /// `sync_entities` full-replace so it can never go stale independently of the roster.
+    pub entity_poses:     EntityPoses,
     pub zone_points:      ZonePoints,
+}
+
+// Hand-written rather than `#[derive(Default)]`: `Roster` deliberately has NO public constructor
+// (#643 — see its doc comment), so only this crate can build the empty maps. A derive would have
+// required `Roster: Default`, which is exactly the public value-producer that let an outside crate
+// assign a whole roster through the guard and bypass the single-publisher rule.
+impl Default for WorldSlots {
+    fn default() -> Self {
+        WorldSlots {
+            entity_positions: Arc::new(Mutex::new(Roster::new())),
+            entity_ids:       Arc::new(Mutex::new(Roster::new())),
+            entity_poses:     Arc::new(Mutex::new(Roster::new())),
+            zone_points:      Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+}
+
+impl WorldSlots {
+    /// **The one and only way to publish the entity roster.** Full-replaces `entity_positions`,
+    /// `entity_ids` and `entity_poses` from `entities`, holding all three locks for the whole
+    /// swap. Returns the number of entities published.
+    ///
+    /// # Why this exists (#643 review round 2)
+    ///
+    /// `/v1/observe/entities?labeled=1` promises that `poses` is keyed EXACTLY like `entities`, so
+    /// an agent may write `body["poses"][name]` without a `KeyError`. That promise is only as good
+    /// as its weakest publisher, and it was already broken once: this crate has **two** roster
+    /// publishers — `eqoxide_net::action_loop::sync_entities` (every nav tick) and
+    /// `eqoxide_net::login`'s zone-in seed — and when `entity_poses` was added, only the first one
+    /// was updated. The seed kept writing positions and ids without poses, so every entity's
+    /// `poses` key was missing for the whole window between login and the first nav tick.
+    ///
+    /// The first fix was to add the missing lines to the second loop. That left the invariant as a
+    /// *convention duplicated across two hand-written loops*, which a reviewer falsified by simply
+    /// deleting the new lines again: the entire workspace suite stayed green. A third publisher
+    /// would reintroduce the bug by omission exactly as the second one did.
+    ///
+    /// So the invariant moved into a type, next to the fields it constrains: there is now one
+    /// function that writes these maps, it cannot write one without the others, and a new publisher
+    /// gets the guarantee by construction rather than by remembering. (Same move as `Pose`/`Gait`
+    /// in `eqoxide-core`, one level up: make the broken state unrepresentable rather than
+    /// documenting a rule and hoping.)
+    ///
+    /// A source-scanning test was tried here first and a reviewer defeated it in one line — see
+    /// [`Roster`], which now makes a second publisher a COMPILE ERROR instead.
+    ///
+    /// # ⚠️ Lock order
+    ///
+    /// `entity_positions` → `entity_ids` → `entity_poses`. This is the canonical order every other
+    /// site must follow (see `eqoxide_http::name_match`'s `resolve_in_world` and its ABBA regression
+    /// guard). Centralising the write path here means the *writer* half of that discipline now
+    /// exists in exactly one place and cannot drift.
+    ///
+    /// # Full replace, deliberately
+    ///
+    /// Both callers want current-zone truth, so stale entries from a previous zone are cleared
+    /// rather than merged. `sync_entities` already did this; the login seed did not, and inherits
+    /// the stricter behaviour here.
+    ///
+    /// For the login seed this is **latent hardening, not a bug that was reachable**: on current
+    /// control flow the seed runs exactly once against still-empty maps (it sits in the `Ok(..)`
+    /// arm, so a failed attempt never seeds and a successful one never returns to the retry loop),
+    /// and `sync_entities` full-replaces from authoritative state on the next tick regardless. An
+    /// earlier revision of this PR described it as a second live bug; that was an overclaim.
+    pub fn publish_entities<'a, I>(&self, entities: I) -> usize
+    where
+        I: IntoIterator<Item = (&'a u32, &'a eqoxide_core::game_state::Entity)>,
+    {
+        let mut positions = self.entity_positions.lock().unwrap(); // 1st — canonical order
+        let mut ids       = self.entity_ids.lock().unwrap();       // 2nd
+        let mut poses     = self.entity_poses.lock().unwrap();     // 3rd
+        positions.clear();
+        ids.clear();
+        poses.clear();
+        for (&id, e) in entities {
+            positions.insert(e.name.clone(), (e.x, e.y, e.z));
+            ids.insert(e.name.clone(), id);
+            poses.insert(e.name.clone(), EntityPoseView {
+                pose: e.pose.label(),
+                gait: e.gait.map(|g| g.raw()),
+            });
+        }
+        positions.len()
+    }
 }
 
 /// Single-authority controller integration (design §2): the render thread's authoritative
@@ -1471,4 +1708,71 @@ mod world_responsive_tests {
         assert!(!world_responsive(true, None, None, STALE, TIMEOUT, STALE),
             "at/after the passive bound with no probe ever, the prober is dead → zombie (#470)");
     }
+}
+
+/// #643 review round 2 — the roster-publisher invariant.
+#[cfg(test)]
+mod world_roster_tests_643 {
+    use super::WorldSlots;
+    use eqoxide_core::game_state::{make_entity, Gait, Pose};
+
+    /// `publish_entities` writes all three maps or none — the guarantee
+    /// `/v1/observe/entities?labeled=1` makes to agents. MUTATION CHECK: delete any one of the
+    /// three `insert`s (or any one `clear`) in `publish_entities` and this goes RED.
+    #[test]
+    fn publish_entities_writes_all_three_maps_with_identical_keys() {
+        let world = WorldSlots::default();
+
+        let mut sitter = make_entity(1, "a_sitter", 1.0, 2.0, 3.0, true);
+        sitter.pose = Pose::Sitting;
+        sitter.gait = Some(Gait::from_wire_10bit(12));
+        let mut walker = make_entity(2, "a_walker", 4.0, 5.0, 6.0, true);
+        walker.gait = Some(Gait::from_wire_10bit(1012)); // backing up: -12
+        let entities: std::collections::HashMap<u32, _> =
+            [(1u32, sitter), (2u32, walker)].into_iter().collect();
+
+        assert_eq!(world.publish_entities(&entities), 2);
+
+        let positions = world.entity_positions.lock().unwrap();
+        let ids       = world.entity_ids.lock().unwrap();
+        let poses     = world.entity_poses.lock().unwrap();
+
+        fn sorted<V>(m: &std::collections::HashMap<String, V>) -> Vec<String> {
+            let mut v: Vec<String> = m.keys().cloned().collect();
+            v.sort();
+            v
+        }
+        assert_eq!(sorted(&positions), sorted(&ids),
+            "positions and ids must have identical key sets");
+        assert_eq!(sorted(&positions), sorted(&poses),
+            "positions and poses must have identical key sets — an agent indexes `poses` by a name \
+             it read from `entities`");
+
+        assert_eq!(positions["a_sitter"], (1.0, 2.0, 3.0));
+        assert_eq!(ids["a_sitter"], 1);
+        assert_eq!(poses["a_sitter"].pose, "sitting");
+        assert_eq!(poses["a_sitter"].gait, Some(12));
+        assert_eq!(poses["a_walker"].pose, "standing");
+        assert_eq!(poses["a_walker"].gait, Some(-12), "a backing-up mob's gait stays negative");
+    }
+
+    /// A second publish must FULL-REPLACE, not merge: an entity from the previous zone (or the
+    /// previous login attempt) must not survive in any of the three maps.
+    #[test]
+    fn publish_entities_full_replaces_so_no_stale_entity_survives() {
+        let world = WorldSlots::default();
+        let first: std::collections::HashMap<u32, _> =
+            [(1u32, make_entity(1, "old_zone_mob", 0.0, 0.0, 0.0, true))].into_iter().collect();
+        world.publish_entities(&first);
+        let second: std::collections::HashMap<u32, _> =
+            [(2u32, make_entity(2, "new_zone_mob", 0.0, 0.0, 0.0, true))].into_iter().collect();
+        world.publish_entities(&second);
+
+        assert!(!world.entity_positions.lock().unwrap().contains_key("old_zone_mob"));
+        assert!(!world.entity_ids.lock().unwrap().contains_key("old_zone_mob"));
+        assert!(!world.entity_poses.lock().unwrap().contains_key("old_zone_mob"),
+            "a stale pose is worse than a stale position — it is a confident claim about a body \
+             state that no longer exists");
+    }
+
 }

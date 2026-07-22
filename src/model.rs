@@ -429,7 +429,8 @@ mod mock {
                 equipment: [0; 9],
                 equipment_tint: [[0; 3]; 9],
                 gender: 0, helm: 0, showhelm: 0, face: 0, hairstyle: 0, haircolor: 0,
-                animation: 100, // Standing
+                pose: eqoxide_core::game_state::Pose::Standing,
+                gait: None,
                 floating: false,
             })
         }

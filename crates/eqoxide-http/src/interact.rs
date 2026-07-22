@@ -435,8 +435,8 @@ mod tests {
     use crate::testkit::empty_state;
 
     fn seed_npc(state: &crate::HttpState, key: &str, id: u32, pos: (f32, f32, f32)) {
-        state.world.entity_positions.lock().unwrap().insert(key.to_string(), pos);
-        state.world.entity_ids.lock().unwrap().insert(key.to_string(), id);
+        state.world.entity_positions.lock().unwrap().insert_for_test(key.to_string(), pos);
+        state.world.entity_ids.lock().unwrap().insert_for_test(key.to_string(), id);
     }
 
     // --- hail: a malformed name must not silently fall back to "nearest NPC" -------------------

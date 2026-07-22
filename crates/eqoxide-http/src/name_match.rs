@@ -375,10 +375,18 @@ mod tests {
 
     /// #513 review F1 — LOCK-ORDER REGRESSION GUARD (ABBA deadlock).
     ///
-    /// The net thread (`ActionLoop::sync_entities`) locks `entity_positions` → `entity_ids`. If the
-    /// HTTP resolver takes them the other way round, the two threads can each hold the lock the
-    /// other wants: a permanent deadlock on `std::sync::Mutex` (no timeout, no recovery) that
-    /// wedges the client and goes linkdead.
+    /// The net thread locks `entity_positions` → `entity_ids` → `entity_poses`. If an HTTP handler
+    /// takes any two of them the other way round, the two threads can each hold the lock the other
+    /// wants: a permanent deadlock on `std::sync::Mutex` (no timeout, no recovery) that wedges the
+    /// client and goes linkdead.
+    ///
+    /// **#643 extended this to the third lock and to the real writer.** The simulated net thread
+    /// below no longer imitates `sync_entities` with a hand-written two-lock sequence — it calls
+    /// the actual production publisher, `WorldSlots::publish_entities`, which is now the single
+    /// writer of all three maps and takes them in the canonical order. So this guard can no longer
+    /// drift away from what the net thread really does. A second hammer replays
+    /// `observe::get_entities`' `entity_positions` → `entity_poses` read order, which #643 added:
+    /// that order was documented with a "do not reverse these" comment and enforced by nothing.
     ///
     /// This hammers `resolve_in_world` against a thread replaying the net thread's exact order,
     /// on a SEPARATE thread from the test's main thread, so a reintroduced inversion turns into a
@@ -395,18 +403,35 @@ mod tests {
         let world = eqoxide_ipc::WorldSlots::default();
         for i in 0..20u32 {
             world.entity_positions.lock().unwrap()
-                .insert(format!("a_rat{i:03}"), (i as f32, 0.0, 0.0));
-            world.entity_ids.lock().unwrap().insert(format!("a_rat{i:03}"), i);
+                .insert_for_test(format!("a_rat{i:03}"), (i as f32, 0.0, 0.0));
+            world.entity_ids.lock().unwrap().insert_for_test(format!("a_rat{i:03}"), i);
         }
 
         let stop = Arc::new(AtomicBool::new(false));
-        // The "net thread": positions → ids, exactly as `sync_entities` does.
+        // The "net thread": the REAL publisher, which locks positions → ids → poses (#643). Using
+        // the production function rather than an imitation means this guard cannot go stale if the
+        // writer's lock order ever changes.
+        let mut roster = std::collections::HashMap::new();
+        for i in 0..20u32 {
+            roster.insert(i, eqoxide_core::game_state::make_entity(
+                i, &format!("a_rat{i:03}"), i as f32, 0.0, 0.0, true));
+        }
         let (w2, s2) = (world.clone(), stop.clone());
         let net = std::thread::spawn(move || {
             while !s2.load(Ordering::Relaxed) {
-                let positions = w2.entity_positions.lock().unwrap();
-                let ids = w2.entity_ids.lock().unwrap();
-                std::hint::black_box((positions.len(), ids.len()));
+                std::hint::black_box(w2.publish_entities(&roster));
+            }
+        });
+
+        // A second reader replaying `observe::get_entities`' order: positions → poses (#643). An
+        // inversion HERE deadlocks against the publisher above just as surely as one in the
+        // resolver, and until now nothing enforced it.
+        let (w3, s3) = (world.clone(), stop.clone());
+        let observe = std::thread::spawn(move || {
+            while !s3.load(Ordering::Relaxed) {
+                let positions = w3.entity_positions.lock().unwrap(); // 1st — canonical order
+                let poses = w3.entity_poses.lock().unwrap();         // 2nd
+                std::hint::black_box((positions.len(), poses.len()));
             }
         });
 
@@ -429,6 +454,7 @@ mod tests {
             Ok(()) => {
                 stop.store(true, Ordering::Relaxed);
                 net.join().expect("net-thread stand-in must not have panicked");
+                observe.join().expect("observe-reader stand-in must not have panicked");
             }
             // Timeout: the hammer thread never reached the `tx.send`, and it's still out there
             // (never join a thread we suspect is deadlocked) — this is the lock-order inversion

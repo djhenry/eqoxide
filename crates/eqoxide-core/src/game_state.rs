@@ -14,6 +14,114 @@ pub struct ZonePoint {
     pub zone_id:   u16,
 }
 
+/// An entity's **pose** — the discrete body-state the server publishes for a spawn
+/// (`eq_constants.h` `Animation`: `Standing=100, Freeze=102, Looting=105, Sitting=110,
+/// `Crouching=111, Lying=115`).
+///
+/// **#643 — why this is a type and not a `u32`.** `Entity` used to carry a single
+/// `animation: u32` that was written from TWO semantically incompatible wire fields:
+/// the spawn struct's pose byte (`stand_state`, values in the 100s) and the position
+/// update's 10-bit **gait** sub-field (a speed code, roughly 0-40). Whichever packet
+/// arrived last decided what the number meant, and the renderer's `_ => "idle"` catch-all
+/// silently turned every unrecognised value into a plausible-looking default. Splitting
+/// the two domains into two fields of two *different types* ([`Pose`] and [`Gait`]) makes
+/// the mixed state unrepresentable: the gait writer cannot assign into a `Pose`, and the
+/// pose writers cannot assign into a `Gait`, so neither can be misread as the other.
+///
+/// [`Pose::Unknown`] is deliberately explicit rather than being folded into `Standing`:
+/// an unrecognised wire value is a thing the client genuinely does not know, and the
+/// agent-honesty invariant says an observable "I don't know" beats a confident guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pose {
+    /// `Animation::Standing` (100) — the ordinary upright state.
+    Standing,
+    /// `Animation::Freeze` (102) — held/frozen; renders as a still upright figure.
+    Freeze,
+    /// `Animation::Looting` (105) — kneeling over a corpse.
+    Looting,
+    /// `Animation::Sitting` (110).
+    Sitting,
+    /// `Animation::Crouching` (111) — ducked.
+    Crouching,
+    /// `Animation::Lying` (115) — prone / dead.
+    Lying,
+    /// A wire value outside the known enum. Carries the raw value so it can be reported
+    /// verbatim instead of being guessed at. NEVER silently coerced to `Standing`.
+    Unknown(u32),
+}
+
+impl Pose {
+    /// Decode a wire pose code (spawn `stand_state`, or an `OP_SpawnAppearance` type-14
+    /// `parameter`). Unrecognised values become [`Pose::Unknown`] — never a plausible default.
+    pub fn from_wire(v: u32) -> Self {
+        match v {
+            100 => Pose::Standing,
+            102 => Pose::Freeze,
+            105 => Pose::Looting,
+            110 => Pose::Sitting,
+            111 => Pose::Crouching,
+            115 => Pose::Lying,
+            other => Pose::Unknown(other),
+        }
+    }
+
+    /// The wire code this pose came from (round-trips `from_wire`).
+    pub fn to_wire(self) -> u32 {
+        match self {
+            Pose::Standing  => 100,
+            Pose::Freeze    => 102,
+            Pose::Looting   => 105,
+            Pose::Sitting   => 110,
+            Pose::Crouching => 111,
+            Pose::Lying     => 115,
+            Pose::Unknown(v) => v,
+        }
+    }
+
+    /// A stable, machine-readable label for API output. An unrecognised value is reported
+    /// as `unknown(<raw>)` so a caller can SEE that the client could not interpret it.
+    pub fn label(self) -> String {
+        match self {
+            Pose::Standing  => "standing".to_string(),
+            Pose::Freeze    => "freeze".to_string(),
+            Pose::Looting   => "looting".to_string(),
+            Pose::Sitting   => "sitting".to_string(),
+            Pose::Crouching => "crouching".to_string(),
+            Pose::Lying     => "lying".to_string(),
+            Pose::Unknown(v) => format!("unknown({v})"),
+        }
+    }
+}
+
+impl Default for Pose {
+    fn default() -> Self { Pose::Standing }
+}
+
+/// An entity's **gait** — the 10-bit `animation` sub-field of `OP_ClientUpdate`, a
+/// speed-derived locomotion code (this client's own encoder is
+/// `eqoxide_net::action_loop::speed_to_wire_animation`: ~12 at walk, 28 at full run).
+///
+/// A distinct newtype from [`Pose`] on purpose (#643) — see [`Pose`]'s doc comment. It is
+/// `Option`al on [`Entity`] because an entity that has not yet sent a position update has
+/// NO gait; `None` is "not reported yet", not "standing still".
+/// The field is **signed** on the wire (`signed animation:10` in the RoF2 position bitfield), so a
+/// mob backing up carries a negative gait. The decoder hands us the raw 10 bits unsigned, so
+/// [`Gait::from_wire_10bit`] sign-extends: without it, gait `-12` (walking backwards) would be
+/// reported as `1012`, a confident falsehood.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Gait(i32);
+
+impl Gait {
+    /// Sign-extend a raw unsigned 10-bit wire value into the signed gait it actually encodes.
+    pub fn from_wire_10bit(raw: u32) -> Self {
+        let v = (raw & 0x3FF) as i32;
+        Gait(if v >= 512 { v - 1024 } else { v })
+    }
+
+    /// The signed gait code. Divide by 40 for units/second (see `speed_to_wire_animation`).
+    pub fn raw(self) -> i32 { self.0 }
+}
+
 /// A single entity in the zone (NPC or PC, not the player themselves).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entity {
@@ -44,8 +152,14 @@ pub struct Entity {
     pub hairstyle: u8,
     /// Hair color index (Spawn_Struct `haircolor`, 0-23). Runtime-tints synthetic hair shells only.
     pub haircolor: u8,
-    /// Server animation state (Animation::Standing=100, Sitting=110, Crouching=111, etc.)
-    pub animation: u32,
+    /// Server-published body POSE (`Animation::Standing`, `Sitting`, `Crouching`, …).
+    /// Written at spawn from `stand_state`, by `OP_SpawnAppearance` type 14 (the server's
+    /// pose-change broadcast), and by `apply_death`. **Never** written from a position
+    /// update — that carries [`Gait`], a different domain (#643).
+    pub pose: Pose,
+    /// Server-published GAIT (locomotion speed code) from the most recent `OP_ClientUpdate`.
+    /// `None` until this entity has sent one — "not reported", not "stationary" (#643).
+    pub gait: Option<Gait>,
     /// True for boat/ship races: they float on the water surface and are exempt from the render
     /// floor-snap (matching the server's `Mob::FixZ` boat skip) so they don't sink (#194).
     pub floating: bool,
@@ -1557,7 +1671,82 @@ pub fn make_entity(id: u32, name: &str, x: f32, y: f32, z: f32, is_npc: bool) ->
         dead: false,
         equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0,
         face: 0, hairstyle: 0, haircolor: 0,
-        animation: 0, floating: false,
+        pose: Pose::Standing, gait: None, floating: false,
+    }
+}
+
+#[cfg(test)]
+mod pose_tests_643 {
+    use super::{Gait, Pose};
+
+    /// #643: every `Animation::*` value from `eq_constants.h` must round-trip, and anything else
+    /// must land in `Unknown` carrying its raw value — NOT be folded into a plausible default.
+    #[test]
+    fn pose_round_trips_and_keeps_unknown_values_verbatim() {
+        for v in [100u32, 102, 105, 110, 111, 115] {
+            assert_eq!(Pose::from_wire(v).to_wire(), v, "pose {v} must round-trip");
+            assert!(!matches!(Pose::from_wire(v), Pose::Unknown(_)), "{v} is a known pose");
+        }
+        assert_eq!(Pose::from_wire(199), Pose::Unknown(199));
+        assert_eq!(Pose::from_wire(199).label(), "unknown(199)");
+        assert_eq!(Pose::from_wire(12).label(), "unknown(12)",
+            "a GAIT value arriving on the pose channel reads as unknown, never as 'standing'");
+    }
+
+    /// #643 review: EVERY label is pinned individually, and they are pinned to be pairwise
+    /// DISTINCT. Without this, collapsing two poses onto one label is invisible — the reviewer
+    /// demonstrated exactly that by making `Freeze` and `Looting` both report `"standing"` and
+    /// watching the whole suite stay green. That is this PR's own bug class one layer up: `label`
+    /// is the agent-facing string, so a collapsed label is the client confidently reporting a
+    /// state that is not true, on the very field added for honesty. `Looting` (105) in particular
+    /// is reachable in ordinary play — a looting character must never read as `standing`.
+    ///
+    /// The label is also deliberately NOT the renderer's clip name: `crouching` and `sitting`
+    /// happen to coincide today, but `looting`/`freeze` report themselves while `scene.rs` draws
+    /// them with the idle clip, and `lying` reports itself while the clip is `dead`. Asserting the
+    /// full table here keeps that separation explicit instead of accidental.
+    #[test]
+    fn every_pose_label_is_exact_and_pairwise_distinct() {
+        let table = [
+            (Pose::Standing,  "standing"),
+            (Pose::Freeze,    "freeze"),
+            (Pose::Looting,   "looting"),
+            (Pose::Sitting,   "sitting"),
+            (Pose::Crouching, "crouching"),
+            (Pose::Lying,     "lying"),
+        ];
+        for (pose, want) in table {
+            assert_eq!(pose.label(), want, "{pose:?} must report exactly {want:?}");
+        }
+        // Wire-code → label, through the real decode path an agent's value actually takes.
+        assert_eq!(Pose::from_wire(100).label(), "standing");
+        assert_eq!(Pose::from_wire(102).label(), "freeze");
+        assert_eq!(Pose::from_wire(105).label(), "looting");
+        assert_eq!(Pose::from_wire(110).label(), "sitting");
+        assert_eq!(Pose::from_wire(111).label(), "crouching");
+        assert_eq!(Pose::from_wire(115).label(), "lying");
+
+        let mut labels: Vec<String> = table.iter().map(|(p, _)| p.label()).collect();
+        labels.push(Pose::Unknown(7).label());
+        let n = labels.len();
+        labels.sort();
+        labels.dedup();
+        assert_eq!(labels.len(), n,
+            "two poses collapsed onto one label — an agent could not tell them apart");
+    }
+
+    /// The wire field is `signed animation:10` (RoF2 position bitfield), and the decoder hands us
+    /// raw unsigned bits. Without sign extension a mob walking BACKWARDS at -12 would be reported
+    /// as 1012 — a well-formed, confident falsehood.
+    #[test]
+    fn gait_sign_extends_the_signed_10bit_wire_field() {
+        assert_eq!(Gait::from_wire_10bit(0).raw(), 0);
+        assert_eq!(Gait::from_wire_10bit(12).raw(), 12);   // native walkspeed
+        assert_eq!(Gait::from_wire_10bit(28).raw(), 28);   // full run
+        assert_eq!(Gait::from_wire_10bit(511).raw(), 511); // max positive
+        assert_eq!(Gait::from_wire_10bit(512).raw(), -512); // min negative
+        assert_eq!(Gait::from_wire_10bit(1012).raw(), -12); // walking backwards
+        assert_eq!(Gait::from_wire_10bit(1023).raw(), -1);
     }
 }
 

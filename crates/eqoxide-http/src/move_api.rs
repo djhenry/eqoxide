@@ -614,8 +614,8 @@ mod tests {
     #[tokio::test]
     async fn goto_unknown_key_is_400_not_silently_defaulted() {
         let state = empty_state();
-        state.world.entity_ids.lock().unwrap().insert("a_rat00".into(), 42);
-        state.world.entity_positions.lock().unwrap().insert("a_rat00".into(), (10.0, 20.0, 3.0));
+        state.world.entity_ids.lock().unwrap().insert_for_test("a_rat00".into(), 42);
+        state.world.entity_positions.lock().unwrap().insert_for_test("a_rat00".into(), (10.0, 20.0, 3.0));
         set_gs(&state, |gs| gs.target_id = Some(42));
         let goto_target = state.nav.goto_target.clone();
         let app = router().with_state(state);
@@ -640,8 +640,8 @@ mod tests {
     #[tokio::test]
     async fn goto_by_name_discloses_matched_entity() {
         let state = empty_state();
-        state.world.entity_ids.lock().unwrap().insert("a_rat003".into(), 55);
-        state.world.entity_positions.lock().unwrap().insert("a_rat003".into(), (10.0, 20.0, 3.0));
+        state.world.entity_ids.lock().unwrap().insert_for_test("a_rat003".into(), 55);
+        state.world.entity_positions.lock().unwrap().insert_for_test("a_rat003".into(), (10.0, 20.0, 3.0));
         let goto_target = state.nav.goto_target.clone();
         let app = router().with_state(state);
         let req = Request::post("/goto")
@@ -665,13 +665,13 @@ mod tests {
         let state = empty_state();
         {
             let mut ids = state.world.entity_ids.lock().unwrap();
-            ids.insert("a_rat003".into(), 55);
-            ids.insert("dire_a_rat004".into(), 66); // fuzzy: contains "a rat"
+            ids.insert_for_test("a_rat003".into(), 55);
+            ids.insert_for_test("dire_a_rat004".into(), 66); // fuzzy: contains "a rat"
         }
         {
             let mut pos = state.world.entity_positions.lock().unwrap();
-            pos.insert("a_rat003".into(), (10.0, 20.0, 3.0));
-            pos.insert("dire_a_rat004".into(), (999.0, 999.0, 3.0));
+            pos.insert_for_test("a_rat003".into(), (10.0, 20.0, 3.0));
+            pos.insert_for_test("dire_a_rat004".into(), (999.0, 999.0, 3.0));
         }
         let goto_target = state.nav.goto_target.clone();
         let app = router().with_state(state);
@@ -720,8 +720,8 @@ mod tests {
                 let mut pos = state.world.entity_positions.lock().unwrap();
                 let mut ids = state.world.entity_ids.lock().unwrap();
                 for (k, id, p) in rows {
-                    pos.insert(k.into(), p);
-                    ids.insert(k.into(), id);
+                    pos.insert_for_test(k.into(), p);
+                    ids.insert_for_test(k.into(), id);
                 }
             };
             // Player position must be KNOWN for a distance-based pick (#513 F4).
@@ -764,8 +764,8 @@ mod tests {
     #[tokio::test]
     async fn goto_omits_distance_when_player_position_is_unknown() {
         let state = empty_state(); // player_pos_known defaults to false
-        state.world.entity_ids.lock().unwrap().insert("a_rat003".into(), 55);
-        state.world.entity_positions.lock().unwrap().insert("a_rat003".into(), (300.0, 400.0, 0.0));
+        state.world.entity_ids.lock().unwrap().insert_for_test("a_rat003".into(), 55);
+        state.world.entity_positions.lock().unwrap().insert_for_test("a_rat003".into(), (300.0, 400.0, 0.0));
         let app = router().with_state(state);
         let resp = app.oneshot(Request::post("/goto")
             .header("content-type", "application/json")
@@ -780,8 +780,8 @@ mod tests {
     #[tokio::test]
     async fn goto_reports_distance_once_player_position_is_known() {
         let state = empty_state();
-        state.world.entity_ids.lock().unwrap().insert("a_rat003".into(), 55);
-        state.world.entity_positions.lock().unwrap().insert("a_rat003".into(), (300.0, 400.0, 0.0));
+        state.world.entity_ids.lock().unwrap().insert_for_test("a_rat003".into(), 55);
+        state.world.entity_positions.lock().unwrap().insert_for_test("a_rat003".into(), (300.0, 400.0, 0.0));
         set_gs(&state, |gs| {
             gs.player_x = 0.0; gs.player_y = 0.0; gs.player_z = 0.0;
             gs.player_pos_known = true;
@@ -798,8 +798,8 @@ mod tests {
     #[tokio::test]
     async fn goto_by_nonexistent_name_is_404_and_queues_nothing() {
         let state = empty_state();
-        state.world.entity_ids.lock().unwrap().insert("a_rat003".into(), 55);
-        state.world.entity_positions.lock().unwrap().insert("a_rat003".into(), (10.0, 20.0, 3.0));
+        state.world.entity_ids.lock().unwrap().insert_for_test("a_rat003".into(), 55);
+        state.world.entity_positions.lock().unwrap().insert_for_test("a_rat003".into(), (10.0, 20.0, 3.0));
         let goto_target = state.nav.goto_target.clone();
         let app = router().with_state(state);
         let req = Request::post("/goto")
@@ -813,8 +813,8 @@ mod tests {
     #[tokio::test]
     async fn goto_no_body_falls_back_to_current_target() {
         let state = empty_state();
-        state.world.entity_ids.lock().unwrap().insert("a_rat00".into(), 42);
-        state.world.entity_positions.lock().unwrap().insert("a_rat00".into(), (10.0, 20.0, 3.0));
+        state.world.entity_ids.lock().unwrap().insert_for_test("a_rat00".into(), 42);
+        state.world.entity_positions.lock().unwrap().insert_for_test("a_rat00".into(), (10.0, 20.0, 3.0));
         set_gs(&state, |gs| gs.target_id = Some(42));
         let goto_target = state.nav.goto_target.clone();
         let app = router().with_state(state);
@@ -828,8 +828,8 @@ mod tests {
     #[tokio::test]
     async fn follow_malformed_name_is_400_not_silently_defaulted() {
         let state = empty_state();
-        state.world.entity_ids.lock().unwrap().insert("a_rat00".into(), 42);
-        state.world.entity_positions.lock().unwrap().insert("a_rat00".into(), (10.0, 20.0, 3.0));
+        state.world.entity_ids.lock().unwrap().insert_for_test("a_rat00".into(), 42);
+        state.world.entity_positions.lock().unwrap().insert_for_test("a_rat00".into(), (10.0, 20.0, 3.0));
         // A current target IS set — the old Option<Json<T>> bug would silently chase IT instead of
         // reporting the malformed "name" field.
         set_gs(&state, |gs| gs.target_id = Some(42));
@@ -849,8 +849,8 @@ mod tests {
     #[tokio::test]
     async fn follow_no_body_falls_back_to_current_target() {
         let state = empty_state();
-        state.world.entity_ids.lock().unwrap().insert("a_rat00".into(), 42);
-        state.world.entity_positions.lock().unwrap().insert("a_rat00".into(), (10.0, 20.0, 3.0));
+        state.world.entity_ids.lock().unwrap().insert_for_test("a_rat00".into(), 42);
+        state.world.entity_positions.lock().unwrap().insert_for_test("a_rat00".into(), (10.0, 20.0, 3.0));
         set_gs(&state, |gs| gs.target_id = Some(42));
         let goto_entity = state.nav.goto_entity.clone();
         let app = router().with_state(state);

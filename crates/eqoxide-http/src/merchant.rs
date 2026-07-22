@@ -272,7 +272,7 @@ mod tests {
     use crate::testkit::empty_state;
 
     fn seed_merchant(state: &crate::HttpState, key: &str, id: u32) {
-        state.world.entity_ids.lock().unwrap().insert(key.to_string(), id);
+        state.world.entity_ids.lock().unwrap().insert_for_test(key.to_string(), id);
     }
 
     /// eqoxide#341: a typo'd key ("quantitiy" instead of "quantity") must 400 — not be silently
