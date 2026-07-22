@@ -8,8 +8,9 @@
 //!
 //! **What is pinned here is the PHYSICAL CLAIM, not a shipped zone's coordinates.** The
 //! asset-gated tests assert things like "the qcat pocket surface is −55.978"; these assert "a
-//! swimmer is lifted to the DESTINATION column's swim plane" and "the water-blind push-out mounts
-//! a swimmer onto a lid and strands it dry". Both are worth having; neither replaces the other.
+//! swimmer is lifted to the DESTINATION column's swim plane" and (since #658) "the depenetration
+//! push-out recovers an afloat swimmer AT ITS OWN DEPTH rather than mounting it onto a lid". Both
+//! are worth having; neither replaces the other.
 
 mod synthetic_scenes;
 
@@ -50,41 +51,50 @@ fn try_to_sink(col: &Collision, from: [f32; 3], secs: f32) -> [f32; 3] {
 
 // ───────────────────────────── scene 1: the lid mount ─────────────────────────────
 
-/// **THE #649 STRAND, ON SYNTHETIC GEOMETRY: the push-out mounts a swimmer onto a lid.**
+/// **#649 FIXED, ON SYNTHETIC GEOMETRY: the push-out holds an afloat swimmer at its own depth
+/// instead of mounting it onto the lid.**
 ///
-/// A sealed flooded chamber whose ceiling quad sits **0.009 u above the waterline**. A
-/// swimmer floating at the chamber's own swim plane presses into a wall; `footprint_clear` fails,
-/// which the controller reads as embedded; the depenetration push-out then hunts for a FLOOR
-/// within `STEP_UP + GROUND_ORIGIN = 3.0` u — and the lid is 2.009 u up. It is placed there,
-/// `on_ground`, and the position is DRY, so `in_water` is false, buoyancy never fires again, and
-/// nothing puts it back.
+/// A sealed flooded chamber whose ceiling quad sits **0.009 u above the waterline**. A swimmer
+/// floating at the chamber's own swim plane swims into the sealed chamber's east wall (there is
+/// nowhere else to go); `footprint_clear` fails there, which the controller's depenetration net
+/// reads as embedded, and its ring push-out runs.
+///
+/// Before #658, that push-out hunted for the nearest FLOOR within `STEP_UP + GROUND_ORIGIN = 3.0`
+/// u of the body regardless of medium — water-blind — found the lid 2.009 u up, and placed the
+/// swimmer there: `on_ground = true`, DRY, buoyancy never firing again. Since #658 the net measures
+/// the medium once, at the body's own position (`movement::Recovery::at_column`): an afloat body is
+/// recovered **at its own depth** in any ring candidate whose column is still water, never onto a
+/// floor. Here every candidate at the swim plane's height is still water (the lid is 2 u higher),
+/// so the ring finds a nearby clear spot along the same wall and returns `Recovery::Afloat` at the
+/// UNCHANGED z — the swimmer ends up nudged into a corner of the chamber, still floating at its own
+/// swim plane, never touching the lid.
 ///
 /// # How this compares to the baked-`qcat` twin, precisely
 ///
-/// `tests/water_capability.rs`'s `qcat_pocket_swim_plane_strands_the_swimmer_on_the_ceiling_lid`
-/// pins the same mechanism against baked geometry. This test reproduces **two of its three
-/// assertions** — mounted on the lid, and dry above the waterline — and replaces the third.
-/// qcat's third assertion is *"and it never reaches the shaft"*; this chamber is sealed and has no
-/// shaft, so that claim is not merely unasserted here, it is **not expressible**. What stands in
-/// its place is the weaker "it ends above the waterline it was floating in".
+/// `tests/water_capability.rs`'s `qcat_pocket_swim_plane_strands_the_swimmer_on_the_tile_floor`
+/// (renamed alongside #658) shows the identical push-out fix at the real coordinate — one frame
+/// from the qcat swim plane now holds depth (`the_depenetration_push_out_holds_a_qcat_swimmer_at_
+/// its_own_depth`) instead of mounting the tile floor as it did pre-fix. But driven for the full
+/// 12 s toward the shaft, qcat's swimmer STILL ends up dry at −55.9687 — not through this
+/// mechanism, but through a SECOND, independent one: the swimming step-up (the #191 haul-out
+/// branch) climbs the same 2.009 u once the swimmer has drifted onto the tile floor's own
+/// footprint. That residual live wedge is tracked separately as **#661**.
 ///
-/// The SUB-MECHANISM was confirmed identical across the two layers by mutation, not by
-/// resemblance: removing only the push-out's UPWARD reach (`nearest_floor(e, n, p[2], 0.0,
-/// GROUND_DEPTH)` — leaving depenetration otherwise intact) turns BOTH tests red. So it is
-/// specifically the `STEP_UP + GROUND_ORIGIN` upward probe inside `depenetrate` that performs the
-/// mount, in the synthetic chamber and in baked `qcat` alike. The two layers then diverge in the
-/// downstream consequence, exactly as their geometry dictates: synthetic falls to the wet chamber
-/// floor (−69.0) because the chamber is sealed, while qcat swims on and settles on the shaft's
-/// swim plane (−44.982) — which is #649's own "OK" outcome for the deeper start depths.
+/// This synthetic chamber has no bank for that second mechanism to reach — it is sealed on all six
+/// sides with nothing at swim-plane height but water and the wall it presses into (see
+/// `synthetic_scenes`'s module doc for why the swimming step-up has zero coverage in this layer),
+/// so this test is not expected to flip again when #661 is fixed.
 ///
-/// What this test does NOT pin is qcat's own −55.9687, and the near-agreement of the two numbers
-/// is arithmetic rather than evidence: `POCKET_LID_Z` was copied from that file (see its doc).
+/// The SUB-MECHANISM fixed here was confirmed identical to qcat's by mutation, not by resemblance:
+/// removing only the push-out's UPWARD reach (`nearest_floor(e, n, p[2], 0.0, GROUND_DEPTH)` —
+/// leaving depenetration otherwise intact) used to turn both this test and its qcat twin red for
+/// the same reason; #658's fix is what makes both hold depth instead.
 ///
-/// **The push-out is water-blind, and that is the defect (#649, open).** This test therefore
-/// asserts the CURRENT behaviour, exactly like its asset-gated twin — when #649 is fixed, both
-/// flip together and should be rewritten to assert the escape.
+/// What this test does NOT pin is qcat's own coordinates — `POCKET_LID_Z` was copied from that file
+/// (see its doc) purely so this chamber's geometry sits in the same band; the near-agreement of the
+/// two numbers was always arithmetic, not evidence.
 #[test]
-fn a_swimmer_at_the_pocket_swim_plane_is_mounted_onto_the_lid_and_stranded_dry() {
+fn a_swimmer_at_the_pocket_swim_plane_holds_its_own_depth_not_the_lid() {
     let col = scenes::sealed_pocket_with_lid();
     let start = [-20.0, 0.0, scenes::POCKET_SWIM_PLANE];
     assert!(col.in_water(start), "fixture: the start must be in water");
@@ -93,27 +103,33 @@ fn a_swimmer_at_the_pocket_swim_plane_is_mounted_onto_the_lid_and_stranded_dry()
 
     let end = swim_toward(&col, start, [40.0, 0.0, scenes::POCKET_SWIM_PLANE], 6.0);
 
-    assert!((end[2] - scenes::POCKET_LID_Z).abs() < 0.01,
-        "#649: the depenetration push-out must have placed the swimmer on the LID at {:.4}; got \
-         {end:?}. The push-out hunts for a floor within STEP_UP + GROUND_ORIGIN = 3.0 u and is \
-         WATER-BLIND — it does not ask whether the position it picks is one a swimmer can occupy.",
-        scenes::POCKET_LID_Z);
-    assert!(!col.in_water(end),
-        "#649: and the mounted position is DRY (surface {:.3}) — which is why buoyancy never \
-         recovers it. Got in_water=true at {end:?}", scenes::POCKET_SURFACE);
-    assert!(end[2] > scenes::POCKET_SURFACE,
-        "#649: the character is ABOVE the waterline it was floating in — got {end:?}");
+    assert!((end[2] - scenes::POCKET_SWIM_PLANE).abs() < 0.05,
+        "#649 (fixed): an afloat body recovered by the depenetration push-out must hold ITS OWN \
+         DEPTH ({:.3}) — the only thing wrong with its position was the horizontal overlap the ring \
+         is already resolving, and moving it vertically too was the withdrawn defect; got {end:?}",
+        scenes::POCKET_SWIM_PLANE);
+    assert!(col.in_water(end),
+        "#649 (fixed): and it must still be IN WATER — the push-out must never carry an afloat body \
+         dry above the waterline (surface {:.3}); got {end:?}", scenes::POCKET_SURFACE);
+    assert!((end[2] - scenes::POCKET_LID_Z).abs() > 1.0,
+        "#649 (fixed): sanity — this must not have landed back on the OLD strand coordinate, the \
+         lid at {:.3}; got {end:?}", scenes::POCKET_LID_Z);
 }
 
-/// **AND THE MOUNT IS ONE-WAY: it cannot swim back down through the lid it was placed on.**
+/// **A DRY MOUNT ON THE LID, IF ONE EVER HAPPENS, IS ONE-WAY: nothing swims back down through it.**
 ///
-/// The live #649 evidence was `POST /v1/move/manual {"up":-1,"duration_ms":3000}` moving the
-/// character **0.00 u**. Same here: a full-strength downward swim wish for 3 s from the mounted
-/// position changes `z` by less than a tenth of a unit, because `want_swim` only does anything
-/// when `in_water`, and the mounted position is dry. That is what makes this a strand rather than
-/// a stumble.
+/// This no longer builds on the test above: since #658, ordinary swimming in this chamber never
+/// puts a character on the lid (see `a_swimmer_at_the_pocket_swim_plane_holds_its_own_depth_not_
+/// the_lid`), so the position here is manually authored rather than reached by driving the
+/// controller. What survives is the property that used to make the pre-#658 push-out mount
+/// permanent — and would make any FUTURE dry mount on this lid equally permanent, whether from a
+/// regression in #658, from #661's separate swimming-step-up mechanism reaching this height in some
+/// other geometry, or from a GM teleport: `want_swim` only does anything when `in_water`, so a
+/// downward swim wish from a DRY position moves nothing. The live #649 evidence was
+/// `POST /v1/move/manual {"up":-1,"duration_ms":3000}` moving the character **0.00 u**; reproduced
+/// here to a tenth of a unit.
 #[test]
-fn the_lid_mount_is_one_way_a_downward_swim_wish_cannot_recover_it() {
+fn a_dry_mount_on_the_lid_is_one_way_a_downward_swim_wish_cannot_recover_it() {
     let col = scenes::sealed_pocket_with_lid();
     let mounted = [-20.0, 0.0, scenes::POCKET_LID_Z];
     assert!(!col.in_water(mounted), "fixture: the mounted position must be dry");
@@ -125,27 +141,28 @@ fn the_lid_mount_is_one_way_a_downward_swim_wish_cannot_recover_it() {
         end[2] - mounted[2]);
 }
 
-/// **THE CONTROL: remove ONLY the lid, and the character never goes dry.**
+/// **THE CONTROL: remove ONLY the lid, and the character still never goes dry.**
 ///
 /// Same chamber, same walls, same floor, same water volume and surface — no ceiling slab. The
-/// character presses into the same wall at the same frames and the push-out fires identically:
-/// measured frame-by-frame, the XY trajectories of the two scenes are **the same to the last
-/// decimal**, and only `z` differs. With the lid, `nearest_floor` finds it 2.009 u UP and the
-/// character is mounted dry. Without it, the nearest floor is the chamber floor 12 u DOWN, so the
-/// character is slammed there instead — still submerged, still recoverable in principle.
+/// character presses into the same wall at the same frames and the push-out fires identically.
 ///
-/// **A finding worth stating plainly:** the character does NOT then float back to the swim plane.
-/// It oscillates between the chamber floor and ~1 u above it, because the same water-blind
-/// push-out re-fires every frame it presses the wall and re-slams it down. That is the *same*
-/// defect (#649) in its other direction — `nearest_floor` hunting for a floor a swimmer has no
-/// business standing on — and `tests/water_capability.rs` documents exactly this downward form
-/// against baked `qcat`. The control's claim is therefore the narrower, true one: **the character
-/// stays submerged and never ends up above the waterline.**
+/// # This control's own claim changed when #658 landed — read this before touching it
 ///
-/// This is what makes the two tests above load-bearing rather than incidental: the lid is the
-/// single element that turns a wet, in-principle-recoverable push-out into a dry, permanent strand.
-/// (And it is height-driven, not tuned to one value: the mount happens for any lid within the
-/// push-out's 3.0 u upward reach of the swim plane, and reads dry for any lid above the surface.)
+/// Before #658 the two scenes (with/without the lid) diverged sharply, because the water-blind
+/// push-out always hunted for the NEARER floor regardless of medium: with the lid it found the
+/// lid 2.009 u UP and mounted the swimmer dry; without it, the nearer floor was the chamber floor
+/// 12 u DOWN, so the swimmer was slammed there instead and oscillated between the floor and roughly
+/// 1 u above it every time it pressed the wall again — still submerged, but by the same defective
+/// mechanism in its other direction.
+///
+/// Since #658 the push-out no longer hunts a floor for an afloat body at all when the ring
+/// candidate is still water — it recovers the body AT ITS OWN DEPTH instead (`movement::Recovery::
+/// Afloat`). So removing the lid no longer changes the outcome: measured here, this scene now ends
+/// at essentially the SAME z as the with-lid scene above (-57.978, its own swim plane), not at the
+/// chamber floor. The control's claim is unchanged in substance — **the character stays submerged
+/// and never ends up above the waterline** — but the reason it holds is no longer "the nearer floor
+/// happens to be below the surface too"; it is that the push-out stopped moving an afloat body
+/// vertically at all.
 #[test]
 fn without_the_lid_the_same_pocket_never_strands_the_swimmer_above_the_waterline() {
     let col = scenes::sealed_pocket_without_lid();
