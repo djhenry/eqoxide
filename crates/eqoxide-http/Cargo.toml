@@ -51,6 +51,10 @@ tower = "0.5"
 # `debug_clears_target_on_zone_change_408` test seeds an entity with it. Without this, a standalone
 # `cargo test -p eqoxide-http` fails (the `--workspace` run only passed via feature unification).
 eqoxide-core = { path = "../eqoxide-core", features = ["test-fixtures"] }
+# #643: `Roster::insert_for_test` — this crate's unit tests seed partial/mismatched entity rosters
+# (an ids-only fixture, a deliberately mismatched one). DEV-dependency only, so a release build has
+# no way to write a roster except `WorldSlots::publish_entities`.
+eqoxide-ipc = { path = "../eqoxide-ipc", features = ["test-fixtures"] }
 # `test-util` (not in tokio's `full`) enables `#[tokio::test(start_paused = true)]` so the A3
 # merchant-buy / interact-give / cast timeout tests (#448) exercise the real timeout elapse in
 # virtual time — instantly.

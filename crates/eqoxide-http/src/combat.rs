@@ -381,7 +381,7 @@ mod tests {
         // ignores an unknown OP_TargetMouse) kept the REAL target. The bogus id then propagated
         // into /move/goto, /combat/cast and /pet/command, which all default to "the target".
         let state = empty_state();
-        state.world.entity_ids.lock().unwrap().insert("a rat000".into(), 7);
+        state.world.entity_ids.lock().unwrap().insert_for_test("a rat000".into(), 7);
         let command = state.command.clone();
         let app = router().with_state(state);
         let req = Request::post("/target")
@@ -396,7 +396,7 @@ mod tests {
     #[tokio::test]
     async fn target_known_spawn_id_still_works() {
         let state = empty_state();
-        state.world.entity_ids.lock().unwrap().insert("a rat000".into(), 7);
+        state.world.entity_ids.lock().unwrap().insert_for_test("a rat000".into(), 7);
         let command = state.command.clone();
         let app = router().with_state(state);
         let req = Request::post("/target")
@@ -554,8 +554,8 @@ mod tests {
     #[tokio::test]
     async fn target_name_exact_discloses_matched_id_name_quality() {
         let state = empty_state();
-        state.world.entity_ids.lock().unwrap().insert("a_rat003".into(), 55);
-        state.world.entity_positions.lock().unwrap().insert("a_rat003".into(), (3.0, 4.0, 0.0));
+        state.world.entity_ids.lock().unwrap().insert_for_test("a_rat003".into(), 55);
+        state.world.entity_positions.lock().unwrap().insert_for_test("a_rat003".into(), (3.0, 4.0, 0.0));
         let command = state.command.clone();
         let app = router().with_state(state);
         let req = Request::post("/target/name")
@@ -580,8 +580,8 @@ mod tests {
         let state = empty_state();
         {
             let mut ids = state.world.entity_ids.lock().unwrap();
-            ids.insert("a_rat003".into(), 55);          // exact "a rat"
-            ids.insert("a_rat_hunter004".into(), 66);   // fuzzy: contains "a rat"
+            ids.insert_for_test("a_rat003".into(), 55);          // exact "a rat"
+            ids.insert_for_test("a_rat_hunter004".into(), 66);   // fuzzy: contains "a rat"
         }
         let command = state.command.clone();
         let app = router().with_state(state);
@@ -599,7 +599,7 @@ mod tests {
     #[tokio::test]
     async fn target_name_partial_only_is_flagged_fuzzy() {
         let state = empty_state();
-        state.world.entity_ids.lock().unwrap().insert("Astaed_Wemor007".into(), 77);
+        state.world.entity_ids.lock().unwrap().insert_for_test("Astaed_Wemor007".into(), 77);
         let app = router().with_state(state);
         let req = Request::post("/target/name")
             .header("content-type", "application/json")
@@ -615,7 +615,7 @@ mod tests {
     #[tokio::test]
     async fn target_name_nonexistent_is_404_and_queues_nothing() {
         let state = empty_state();
-        state.world.entity_ids.lock().unwrap().insert("a_rat003".into(), 55);
+        state.world.entity_ids.lock().unwrap().insert_for_test("a_rat003".into(), 55);
         let command = state.command.clone();
         let app = router().with_state(state);
         let req = Request::post("/target/name")

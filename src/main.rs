@@ -234,9 +234,11 @@ fn main() {
         nav_state:     Arc::new(Mutex::new(ipc::NavStatus::default())),
     };
     let world = ipc::WorldSlots {
-        entity_positions: Arc::new(Mutex::new(HashMap::new())),
-        entity_ids:       Arc::new(Mutex::new(HashMap::new())),
-        entity_poses:     Arc::new(Mutex::new(HashMap::new())),
+        // `Roster::default()` — the roster maps are a write-restricted newtype (#643); only
+        // `WorldSlots::publish_entities` can fill them.
+        entity_positions: Arc::new(Mutex::new(Default::default())),
+        entity_ids:       Arc::new(Mutex::new(Default::default())),
+        entity_poses:     Arc::new(Mutex::new(Default::default())),
         zone_points:      Arc::new(Mutex::new(Vec::new())),
     };
     let quest = ipc::QuestSlots {

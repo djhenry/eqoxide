@@ -403,8 +403,8 @@ mod tests {
         let world = eqoxide_ipc::WorldSlots::default();
         for i in 0..20u32 {
             world.entity_positions.lock().unwrap()
-                .insert(format!("a_rat{i:03}"), (i as f32, 0.0, 0.0));
-            world.entity_ids.lock().unwrap().insert(format!("a_rat{i:03}"), i);
+                .insert_for_test(format!("a_rat{i:03}"), (i as f32, 0.0, 0.0));
+            world.entity_ids.lock().unwrap().insert_for_test(format!("a_rat{i:03}"), i);
         }
 
         let stop = Arc::new(AtomicBool::new(false));

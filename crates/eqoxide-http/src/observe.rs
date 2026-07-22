@@ -1441,9 +1441,9 @@ mod tests {
         let state = empty_state();
         {
             let mut pos = state.world.entity_positions.lock().unwrap();
-            pos.insert("Geeda".to_string(),        (100.0, 200.0, 5.0));
-            pos.insert("Geeda00".to_string(),      (100.0, 200.0, 5.0)); // the duplicate
-            pos.insert("Bidl_Frugrin".to_string(), (10.0,  20.0,  3.0));
+            pos.insert_for_test("Geeda".to_string(),        (100.0, 200.0, 5.0));
+            pos.insert_for_test("Geeda00".to_string(),      (100.0, 200.0, 5.0)); // the duplicate
+            pos.insert_for_test("Bidl_Frugrin".to_string(), (10.0,  20.0,  3.0));
         }
         let resp = get(state, "/entities").await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1465,8 +1465,8 @@ mod tests {
         let state = empty_state();
         {
             let mut pos = state.world.entity_positions.lock().unwrap();
-            pos.insert("Geeda".to_string(),   (100.0, 200.0, 5.0));
-            pos.insert("Geeda00".to_string(), (100.0, 200.0, 5.0));
+            pos.insert_for_test("Geeda".to_string(),   (100.0, 200.0, 5.0));
+            pos.insert_for_test("Geeda00".to_string(), (100.0, 200.0, 5.0));
         }
         let resp = get(state, "/entities?labeled=1").await;
         assert_eq!(resp.status(), StatusCode::OK);

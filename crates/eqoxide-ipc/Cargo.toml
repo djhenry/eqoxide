@@ -7,6 +7,13 @@ edition = "2021"
 name = "eqoxide_ipc"
 path = "src/lib.rs"
 
+[features]
+# Exposes `Roster::insert_for_test` so a downstream crate's unit tests can seed a partial or
+# deliberately-mismatched entity roster. Enable it as a DEV-dependency feature only — it is what
+# keeps a roster writable at all, and production must have exactly one writer (#643). See the
+# `Roster` doc comment.
+test-fixtures = []
+
 [dependencies]
 # ipc is the "inter-thread contracts" crate: it sits directly above `eqoxide-core` and below
 # everything else (core ← ipc ← {net, render, http, command, …}). It depends ONLY on core plus
