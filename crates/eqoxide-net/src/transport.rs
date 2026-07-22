@@ -1580,33 +1580,6 @@ impl EqStream {
     ///
     /// Clearing the window is what makes it safe to call from both: a second call (the eventual
     /// `Drop`, if it ever runs) sees an empty window and does nothing, so no double count.
-    /// Account the outstanding windows, then park forever. Never returns.
-    ///
-    /// This exists to make "park on a session-ending path without accounting" **inexpressible**
-    /// rather than merely guarded (#641 review N1-b). Three source-level guards were defeated in one
-    /// night — a `let mut` scanner (#652), an ordering assert that went vacuous when the park was
-    /// respelled (mutation M), and a multi-spelling park matcher that fell to
-    /// `let _cleanup = || s.abandon_outstanding();` (mutation N — the text is present, it precedes
-    /// the park, every spelling matches, and the closure is never called). A string match can only
-    /// ever pin that the characters are there, never that the code RUNS, and each round of smarter
-    /// matching buys exactly one more evasion.
-    ///
-    /// Folding the two into one call removes the ordering entirely: there is no "before" to get
-    /// wrong, and the closure trick cannot work because the closure would have to be *called* to
-    /// park at all. What remains for a guard to assert — "the arm calls this" — is the one thing a
-    /// string match can honestly assert.
-    ///
-    /// Scope, stated honestly: this does not make every park in the crate safe. Other `loop { sleep }`
-    /// parks exist on paths that have already accounted (`perform_clean_shutdown` calls
-    /// `abandon_outstanding` itself and is guarded separately, #612 R1). What it makes impossible is
-    /// reaching a park on the `OP_GMKick` path with the accounting skipped or reordered past it.
-    pub(crate) async fn abandon_and_park(&mut self) -> ! {
-        self.abandon_outstanding();
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-    }
-
     pub(crate) fn abandon_outstanding(&mut self) {
         // #641: control datagrams still queued for retry when the session ends are never sent — the
         // next stream is a different socket. Same honesty rule as the reliable window below: a
@@ -1641,6 +1614,40 @@ impl EqStream {
              (#612); see /v1/observe/debug reliable_abandoned",
             abandoned, oldest,
         );
+    }
+
+    /// Account the outstanding windows (via `abandon_outstanding`), then park forever. Never returns.
+    ///
+    /// This exists to make "park on a session-ending path without accounting" **inexpressible**
+    /// rather than merely guarded (#641 review N1-b). Three source-level guards were defeated in one
+    /// night — a `let mut` scanner (#652), an ordering assert that went vacuous when the park was
+    /// respelled (mutation M), and a multi-spelling park matcher that fell to
+    /// `let _cleanup = || s.abandon_outstanding();` (mutation N — the text is present, it precedes
+    /// the park, every spelling matches, and the closure is never called). A string match can only
+    /// ever pin that the characters are there, never that the code RUNS, and each round of smarter
+    /// matching buys exactly one more evasion.
+    ///
+    /// Folding the two into one call removes the ordering entirely: there is no "before" to get
+    /// wrong, and the closure refactor no longer compiles — it would need `&mut self` to escape an
+    /// `FnMut` body. What remains for a guard to assert is only that the arm parks THROUGH this
+    /// call, which is the one thing a string match can honestly assert.
+    ///
+    /// Scope, stated honestly: this does not make every park in the crate safe. Other
+    /// `loop { sleep }` parks exist on paths that have already accounted (`perform_clean_shutdown`
+    /// calls `abandon_outstanding` itself and is guarded separately, #612 R1). What it makes
+    /// impossible is reaching a park on the `OP_GMKick` path with the accounting skipped or
+    /// reordered past it. It does NOT make an unreachable call detectable — see the guard's own
+    /// doc for the residual `if false { … }` hole (#641 review N1-c).
+    ///
+    /// NOTE this is a separate function from `abandon_outstanding` above, which `Drop` and
+    /// `perform_clean_shutdown` call directly and which must keep its own #612 rationale. An earlier
+    /// revision spliced this one INTO that doc comment, leaving `abandon_outstanding` undocumented
+    /// and this function claiming "Called from `Drop`", which is false of it (#641 review R5-a).
+    pub(crate) async fn abandon_and_park(&mut self) -> ! {
+        self.abandon_outstanding();
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
     }
 }
 
@@ -2844,9 +2851,42 @@ mod tests {
              forever and is never unwound, so `Drop` cannot account for the control-retry queue or \
              the reliable window there. A separate `abandon_outstanding()` beside a separate park \
              is what was defeated twice — do not split them apart again.");
-        assert!(!arm.contains("loop {"),
-            "the OP_GMKick arm must not park by hand: `abandon_and_park()` IS the park, and a \
-             second one beside it would resurrect the ordering hole the fold removed (#641 N1-b)");
+
+        // No OTHER park may appear in the arm. `abandon_and_park()` is the park; anything beside it
+        // either races it or (mutation P) replaces it while the call sits unreachable in an
+        // `if false { … }`.
+        //
+        // The spelling list is back to FOUR. Round 4 needed four to close mutation M, and round 5
+        // then shrank the negative assert to just `loop {` — reintroducing the same hole one round
+        // after closing it, in the opposite polarity, which is how mutation P got in. Same hole,
+        // same PR, both directions. If a fifth spelling of "park forever" appears, add it HERE
+        // rather than narrowing this list.
+        //
+        // `park()` is deliberately NOT a needle: it is a substring of `abandon_and_park()` and would
+        // make this assert fire on the correct code.
+        const OTHER_PARKS: &[&str] = &["loop {", "pending::<", "pending()", "park_timeout"];
+        for spelling in OTHER_PARKS {
+            assert!(!arm.contains(spelling),
+                "the OP_GMKick arm must not park by hand (found {spelling:?}): \
+                 `abandon_and_park()` IS the park, and a second one beside it resurrects the hole \
+                 the fold removed — including the case where the accounting call is left present \
+                 but unreachable (#641 review N1-b/N1-c)");
+        }
+
+        // …and the call must be the arm's LAST statement, so it cannot sit behind `if false`
+        // with the real park after it. This closes mutation P.
+        //
+        // Honest about what this is: still a string match, and still only able to pin where the
+        // characters sit. It is worth having because it is three lines and it closes a demonstrated
+        // hole — but the load-bearing defence is structural (mutation N does not COMPILE), and this
+        // assert should not be mistaken for a proof that the call is reachable.
+        let tail = arm.trim_end().trim_end_matches(['}', ' ', '\n', '\t']).trim_end();
+        assert!(tail.ends_with("s.abandon_and_park().await;"),
+            "`abandon_and_park()` must be the LAST statement of the OP_GMKick arm — otherwise it \
+             can be left present but unreachable (`if false {{ … }}`) with a real park after it, \
+             which passes every containment check while parking without accounting (#641 review \
+             N1-c, mutation P). Arm tail was: {:?}",
+            &tail[tail.len().saturating_sub(80)..]);
     }
 
     /// #641 structural guard, in the same spirit as
