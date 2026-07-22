@@ -1138,8 +1138,8 @@ impl ActionLoop {
     /// Publish the current `/move/goto` navigation state for GET /v1/observe/debug (#166, #337).
     /// The value set is an AGENT-FACING CONTRACT — every value is documented in `docs/http-api.md`:
     ///
-    ///   idle | planning | navigating | navigating_partial | following | arrived
-    ///   | no_path | search_exhausted | blocked
+    ///   pending | idle | planning | navigating | navigating_partial | following | arrived
+    ///   | no_path | search_exhausted | blocked | zone_loading
     ///
     // `set_nav_state`/`stop_nav`/`apply_plan`/`apply_local_plan`/`is_player_dead`/`nav_halt_if_dead`/
     // `find_in_zone_portal`/`aggro_avoid` moved to `eqoxide_nav::walker::Walker` (M1 extraction).

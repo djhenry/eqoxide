@@ -230,7 +230,7 @@ impl Walker {
     /// Publish the current `/move/goto` navigation state for GET /v1/observe/debug (#166, #337).
     /// The value set is an AGENT-FACING CONTRACT — every value is documented in `docs/http-api.md`:
     ///
-    ///   idle | planning | navigating | navigating_partial | following | arrived
+    ///   pending | idle | planning | navigating | navigating_partial | following | arrived
     ///   | no_path | search_exhausted | blocked | zone_loading
     ///
     /// `zone_loading` (#579) means the zone's collision grid is not built (assets still loading, or

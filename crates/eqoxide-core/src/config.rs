@@ -2,13 +2,13 @@
 
 use std::path::{Path, PathBuf};
 
-/// Test-only override for the directory [`AppConfig::load`]'s `./config.yaml`
-/// fallback searches (see [`AppConfig::load_fallback_dir`]). `thread_local`, not a
-/// process-global: each test thread gets its own cell, so a test can drive the
-/// real `load()` call site end-to-end without `std::env::set_current_dir` — which
-/// mutates every relative-path lookup in the whole process — and without any risk
-/// of leaking into another test running concurrently on a different thread (#604
-/// F1, review of PR #611).
+// Test-only override for the directory [`AppConfig::load`]'s `./config.yaml`
+// fallback searches (see [`AppConfig::load_fallback_dir`]). `thread_local`, not a
+// process-global: each test thread gets its own cell, so a test can drive the
+// real `load()` call site end-to-end without `std::env::set_current_dir` — which
+// mutates every relative-path lookup in the whole process — and without any risk
+// of leaking into another test running concurrently on a different thread (#604
+// F1, review of PR #611).
 #[cfg(test)]
 thread_local! {
     static LOAD_FALLBACK_DIR_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =

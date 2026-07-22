@@ -362,6 +362,13 @@ is not snapped: it fails as `no_path` / `goal_not_walkable`.)
 | `no_geometry` | No collision mesh loaded yet (still zoning). |
 | `planner_dead` | The pathfinding worker thread has **died**. No route can be planned for the rest of the session — a **client fault**, not an unreachable goal. Movement must be driven manually, or the client restarted. This is reported loudly and terminally rather than leaving `nav_state` stuck at `planning` forever. |
 
+`POST /v1/move/zone_cross` reports two further `no_path` reasons, both specific to zone-line crossing (#267):
+
+| Reason | Meaning |
+|--------|---------|
+| `no_zone_line_to_zone` | The server never advertised (`OP_SendZonepoints`) any zone line from here to the requested `zone_id` — it will not appear in `/v1/observe/zone_exits` either. A genuinely invalid request: pick a `zone_id` that's actually one of this zone's exits. |
+| `zone_line_not_in_map` | The requested `zone_id` **is** advertised by the server as a real exit, but the locally loaded zone geometry has no matching WLD zone-line (DRNTP) trigger region for it — a client-side `.wtr` map-data gap, not proof the exit doesn't exist in the real game. It is also omitted from `/v1/observe/zone_exits` (which only lists regions actually found in the loaded map), so "absent from `zone_exits`" does not by itself distinguish this from `no_zone_line_to_zone` — only `nav_reason` does. |
+
 `nav_reason` for `blocked`:
 
 | Reason | Meaning |

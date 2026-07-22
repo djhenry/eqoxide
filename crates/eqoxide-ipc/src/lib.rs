@@ -739,7 +739,7 @@ pub type DialogueShared = Arc<Mutex<Vec<eqoxide_core::game_state::DialogueChoice
 /// GET /v1/observe/debug. `state` is the agent-facing contract documented in `docs/http-api.md`:
 ///
 /// `pending` | `idle` | `planning` | `navigating` | `navigating_partial` | `following` | `arrived` |
-/// `no_path` | `search_exhausted` | `blocked`
+/// `no_path` | `search_exhausted` | `blocked` | `zone_loading`
 ///
 /// `reason` is the machine-readable WHY behind a terminal state (`goal_not_walkable`,
 /// `search_closed`, `search_node_cap`, …). The whole point of the split (#337): a driver must be
