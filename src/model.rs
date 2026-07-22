@@ -54,6 +54,125 @@ use std::sync::Arc;
 use crate::command_state::CommandState;
 use crate::config::LoginConfig;
 
+/// The `eq-net` thread's terminal-death observable (#634, agent-honesty).
+///
+/// `None` = the thread **has not ended** — which is NOT the same as "is healthy". A wedged,
+/// deadlocked or livelocked net thread has not unwound, so it still reads `None` here while
+/// publishing nothing; cross-check `snapshot_age_ms` for that case. This field is deliberately about
+/// TERMINALITY only, and conflating the two is exactly the distinction the whole change exists to
+/// draw. `Some(reason)` = **it is gone and will not come back this session** — nothing will ever
+/// drain a command slot or publish a `GameState` snapshot again. Written exactly once, by
+/// [`run_net_thread`]; read by `eqoxide_http` and served on `GET /v1/observe/debug` as
+/// `net_thread_dead`.
+///
+/// Same shared-`Arc`-identity discipline as `common_assets_failed` / `model_sync_dead` (#616): the
+/// ONE `Arc` constructed in `main.rs` is cloned into both the thread closure and `spawn_camera_server`.
+/// Constructing a second one on either side severs the two and the endpoint reads `None` forever.
+pub type NetThreadDeadShared = Arc<std::sync::Mutex<Option<String>>>;
+
+/// Best-effort human-readable text out of a `catch_unwind` payload. Rust boxes the panic argument as
+/// `&'static str` for `panic!("literal")` and `String` for `panic!("{fmt}")`; anything else is opaque.
+fn panic_payload_text(p: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = p.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = p.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+/// Runs the `eq-net` thread body at its thread boundary and **always** publishes an explicit terminal
+/// state into `dead` when it ends, however it ends (#634).
+///
+/// ## Why this exists
+/// `eq-net` is the client's Model: the sole writer of `GameState`, the sole drainer of the command
+/// slots, and the sole stamper of the `NetHealth` clocks. Before this wrapper, all three of its exit
+/// paths — a panic, a fatal `Err`, and a plain `Ok` return — simply ended the thread, and `main.rs`
+/// published NOTHING. The process keeps running, the HTTP server keeps serving, and every cached
+/// observable keeps reporting its last known value: position, zone, entities, health, all frozen at
+/// plausible pre-death values. That is the agent-honesty failure this project ranks above crashes,
+/// because the frozen state is *plausible* rather than empty.
+///
+/// ## What was ALREADY honest before this (do not oversell the fix)
+/// The staleness was not literally invisible: `NetHealth`'s clocks are measured at HTTP READ time
+/// (#343), so with the thread gone `snapshot_age_ms` climbs without bound, `connected` flips false
+/// after `CONN_STALE_SECS`, and `require_live_session` (#477) starts 503-ing WRITE commands once
+/// `snapshot_age_ms` passes `SESSION_STALE_TICK_MS`. What none of those can say is **why**, and —
+/// the load-bearing part — whether it is **terminal**: a 5-second-old tick is equally consistent
+/// with a busy loop about to recover and with a thread that no longer exists. An age answers "is
+/// this stale?"; only this field answers "will it ever un-stale?". They are complementary, and an
+/// agent that reads `net_thread_dead != null` can stop retrying immediately instead of polling a
+/// corpse.
+///
+/// ## Exit paths, all four published
+/// * **panic** — caught here (`catch_unwind` at the thread boundary, mirroring the zone loader
+///   `src/app.rs` #595 and the two #616 workers rather than inventing a new shape).
+/// * **`Err(e)`** — a fatal login failure / retries exhausted. Previously logged (`EQ: fatal:`) and
+///   otherwise silent.
+/// * **`Ok(())` with `shutdown` set** — the ordinary `/v1/lifecycle/exit` teardown. Still published,
+///   because "the net thread is gone" is TRUE in that window too and an agent polling during it
+///   deserves the truth rather than a healthy-looking null.
+/// * **`Ok(())` without `shutdown`** — the gameplay phase returned on its own. Called out separately
+///   in the reason text because it is unexpected.
+///
+/// SCOPE — what `catch_unwind` here does and does not cover: `ServerModel::run` is awaited directly
+/// inside `block_on` on this thread, and the production net path spawns no tokio tasks (the only
+/// `tokio::spawn` in `eqoxide-net` is inside a `#[cfg(test)]` module), so every panic in the net
+/// path unwinds through this frame. A panic on a `eq-net-tokio-worker` pool thread would NOT be
+/// caught here — tokio catches those itself — but nothing production runs there today.
+///
+/// ⚠️ ORDERING, for whoever adds the first production `tokio::spawn` (#647 review, F6): the tokio
+/// `Runtime` is constructed INSIDE `body` (see `main.rs`), so it is dropped during the unwind —
+/// BEFORE this function reaches its publish. `Runtime::drop` blocks until spawned tasks wind down,
+/// so a task that refuses to would stall the unwind here and the death report would never be
+/// written, silently restoring the exact bug this function removes. It cannot happen today (no
+/// production `tokio::spawn` exists on this path). If you add one, either construct the runtime
+/// OUTSIDE `body` or publish before it drops.
+pub fn run_net_thread<F>(
+    dead:     &NetThreadDeadShared,
+    shutdown: &std::sync::atomic::AtomicBool,
+    body:     F,
+) where
+    F: FnOnce() -> Result<(), String>,
+{
+    let reason = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Err(p) => {
+            let msg = panic_payload_text(&*p);
+            tracing::error!("EQ: eq-net thread panicked: {msg}");
+            format!(
+                "the eq-net thread PANICKED ({msg}) — the client is no longer talking to the \
+                 server. Every world field in this response is a FROZEN pre-panic snapshot and \
+                 will never update again. No reconnect is running; restart the client."
+            )
+        }
+        Ok(Err(e)) => {
+            tracing::error!("EQ: fatal: {e}");
+            format!(
+                "the eq-net thread exited with a fatal error ({e}) — the client is no longer \
+                 talking to the server. Every world field in this response is a FROZEN snapshot \
+                 and will never update again. No reconnect is running; restart the client."
+            )
+        }
+        Ok(Ok(())) if shutdown.load(std::sync::atomic::Ordering::Relaxed) => {
+            "the eq-net thread exited normally after a shutdown was requested — the session is \
+             over and the process is shutting down. World fields are a frozen final snapshot."
+                .to_string()
+        }
+        Ok(Ok(())) => {
+            tracing::error!("EQ: eq-net thread returned without a shutdown request");
+            "the eq-net thread returned WITHOUT a shutdown being requested — the client is no \
+             longer talking to the server. Every world field in this response is a FROZEN \
+             snapshot and will never update again. No reconnect is running; restart the client."
+                .to_string()
+        }
+    };
+    // `unwrap_or_else(into_inner)` for the same reason #616's workers do it: this runs on a death
+    // path, and refusing to publish the death because some other thread poisoned the mutex would be
+    // the exact silence the field exists to remove.
+    *dead.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
+}
+
 /// The backend-agnostic Model seam: the command slots a backend DRAINS and the snapshot/health it
 /// PUBLISHES, plus the lifecycle signals it obeys. Constructed once in `main.rs` (the Controller /
 /// wiring role) from `.clone()`s of the bundles it also hands to `HttpState`/`CommandState`, then
@@ -624,5 +743,103 @@ mod tests {
         assert_eq!(gs_a, gs_b, "same script must publish an identical GameState");
         assert_eq!(plan_a, plan_b, "same script must resolve an identical PlanOutcome");
         assert!(matches!(plan_a, Some(PlanOutcome::Route(_))), "sanity: the scripted goal is reachable");
+    }
+
+    // ── #634: the eq-net thread's terminal-death observable ──────────────────────────────────
+    //
+    // These drive the REAL production wrapper (`run_net_thread`) with deliberately misbehaving
+    // bodies. They are the mutation target: replacing this wrapper's
+    // `catch_unwind(AssertUnwindSafe(body))` with a bare `body()` makes the panic test RED (the
+    // panic escapes the test), and deleting the final `*dead.lock() = Some(reason)` makes ALL of
+    // them RED. On unmodified `origin/main` `run_net_thread` does not exist at all: main spawns the
+    // thread with a bare closure whose only failure handling is `if let Err(e) = ... { error!() }`,
+    // so all four exit paths below publish nothing anywhere.
+
+    fn dead_slot() -> NetThreadDeadShared {
+        Arc::new(std::sync::Mutex::new(None))
+    }
+
+    /// The headline #634 case: the thread panics and the agent must be able to SEE it, not infer it.
+    #[test]
+    fn net_thread_panic_publishes_an_explicit_terminal_reason() {
+        let dead = dead_slot();
+        let shutdown = AtomicBool::new(false);
+        run_net_thread(&dead, &shutdown, || panic!("simulated eq-net panic"));
+        let published = dead.lock().unwrap().clone().expect("a panicked net thread must publish");
+        assert!(published.contains("PANICKED"), "reason must name the panic: {published}");
+        assert!(published.contains("simulated eq-net panic"),
+            "the panic's own message must survive into the observable: {published}");
+        assert!(published.contains("FROZEN"),
+            "the reason must warn that the rest of the payload is stale: {published}");
+    }
+
+    /// A fatal `Err` (login retries exhausted / server-rejected create) ends the thread just as
+    /// permanently as a panic, and was equally unobservable before #634 — it only reached a log line.
+    #[test]
+    fn net_thread_fatal_error_publishes_an_explicit_terminal_reason() {
+        let dead = dead_slot();
+        let shutdown = AtomicBool::new(false);
+        run_net_thread(&dead, &shutdown, || Err("Login failed after 10 attempts".to_string()));
+        let published = dead.lock().unwrap().clone().expect("a fatally-erroring net thread must publish");
+        assert!(published.contains("Login failed after 10 attempts"),
+            "the fatal error text must survive into the observable: {published}");
+    }
+
+    /// An `Ok` return with no shutdown requested is the "gameplay phase just... ended" case. It is
+    /// still terminal, and must be published — and distinguishable from the clean-shutdown case.
+    #[test]
+    fn net_thread_unexpected_clean_return_is_published_and_distinguishable() {
+        let dead = dead_slot();
+        let shutdown = AtomicBool::new(false);
+        run_net_thread(&dead, &shutdown, || Ok(()));
+        let published = dead.lock().unwrap().clone().expect("an unexpectedly-returning net thread must publish");
+        assert!(published.contains("WITHOUT a shutdown"), "reason: {published}");
+
+        let dead2 = dead_slot();
+        let shutdown2 = AtomicBool::new(true);
+        run_net_thread(&dead2, &shutdown2, || Ok(()));
+        let clean = dead2.lock().unwrap().clone().expect("even a clean exit publishes the truth");
+        assert!(clean.contains("shutdown was requested"), "reason: {clean}");
+        assert_ne!(clean, published,
+            "a requested shutdown and an unexplained return must not read identically");
+    }
+
+    /// The slot must NOT be pre-written: a healthy, still-running thread has to read `null`, or the
+    /// field would be a constant and could never discriminate anything.
+    #[test]
+    fn net_thread_slot_stays_none_while_the_body_is_still_running() {
+        let dead = dead_slot();
+        let d = dead.clone();
+        std::thread::spawn(move || {
+            let shutdown = AtomicBool::new(false);
+            let observed = d.clone();
+            run_net_thread(&d, &shutdown, move || {
+                // Observed from INSIDE the body, i.e. while the thread is alive.
+                assert!(observed.lock().unwrap().is_none(),
+                    "net_thread_dead must be null while the net thread is running");
+                Ok(())
+            });
+        })
+        .join()
+        .unwrap();
+        assert!(dead.lock().unwrap().is_some(), "…and Some once it has ended");
+    }
+
+    /// A poisoned mutex must not swallow the death report — the one moment publishing matters most
+    /// is also a moment other threads may have panicked while holding locks.
+    #[test]
+    fn net_thread_death_is_published_even_through_a_poisoned_mutex() {
+        let dead = dead_slot();
+        let d = dead.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = d.lock().unwrap();
+            panic!("poison it");
+        })
+        .join();
+        assert!(dead.is_poisoned(), "precondition: the slot's mutex is poisoned");
+        run_net_thread(&dead, &AtomicBool::new(false), || panic!("boom"));
+        let published = dead.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(published.is_some_and(|r| r.contains("PANICKED")),
+            "a poisoned slot must still receive the death reason");
     }
 }

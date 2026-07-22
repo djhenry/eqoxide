@@ -370,6 +370,12 @@ fn main() {
     // the session (neither worker restarts once it reaches this state).
     let common_assets_failed: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let model_sync_dead: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // #634 (agent-honesty): the `eq-net` thread's own terminal-death observable, constructed here for
+    // exactly the same shared-`Arc` reason as the two above — ONE cell, cloned into the thread that
+    // writes it and into `spawn_camera_server` which reads it for `/v1/observe/debug`. `None` = the
+    // Model is running; `Some(reason)` = it is gone for good and every world field served by this
+    // process is a frozen snapshot. See `eqoxide::model::run_net_thread`.
+    let net_thread_dead: eqoxide::model::NetThreadDeadShared = Arc::new(Mutex::new(None));
     // Single-owner GameState snapshot (see
     // docs/superpowers/plans/2026-07-12-gamestate-single-owner-snapshot.md). The network thread is
     // the sole writer of GameState; it publishes here every tick. `last_inbound` is a separate,
@@ -449,22 +455,37 @@ fn main() {
             game_state_snapshot: gss,
             net_health:          nh,
         };
+        // #634: the thread body runs inside `run_net_thread`, which catches a panic AND publishes an
+        // explicit terminal reason into `net_thread_dead` on EVERY exit path (panic, fatal `Err`,
+        // clean return). Before this, all three paths just ended the thread while the HTTP server
+        // kept serving a plausible, permanently frozen world.
+        let ntd = net_thread_dead.clone();
+        let sd_exit = shutdown.clone();
         std::thread::Builder::new()
             .name("eq-net".into())
             .spawn(move || {
-                let rt = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .thread_name("eq-net-tokio-worker")
-                    .build()
-                    .expect("tokio runtime");
-                rt.block_on(async {
-                    use eqoxide::model::Model;
-                    if let Err(e) = model.run(model_ctx).await {
-                        tracing::error!("EQ: fatal: {e}");
-                    }
+                eqoxide::model::run_net_thread(&ntd, &sd_exit, move || {
+                    let rt = tokio::runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .thread_name("eq-net-tokio-worker")
+                        .build()
+                        .expect("tokio runtime");
+                    rt.block_on(async {
+                        use eqoxide::model::Model;
+                        model.run(model_ctx).await
+                    })
                 });
             })
             .expect("spawn eq-net thread");
+    } else {
+        // Offline `--testzone`: no `eq-net` thread is ever started, so there is no server connection
+        // and never will be one. Publishing that up front keeps `net_thread_dead` from reading
+        // `null` (which means "the Model is running") in a mode where the Model does not exist.
+        *net_thread_dead.lock().unwrap() = Some(
+            "--testzone: the eq-net thread was never started (offline renderer mode). There is no \
+             server connection; every world field is local test data, not the game."
+                .to_string(),
+        );
     }
 
     // HTTP server
@@ -514,6 +535,7 @@ fn main() {
         zone_assets.clone(),
         common_assets_failed.clone(),
         model_sync_dead.clone(),
+        net_thread_dead,
         command.clone(),
         social,
         merchant_slots,

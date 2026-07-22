@@ -515,6 +515,13 @@ pub struct HttpState {
     /// channel closing) — this worker never restarts once dead, so the field is never cleared once
     /// set. Same shared-`Arc`-identity discipline as `common_assets_failed` above.
     pub(crate) model_sync_dead: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// The `eq-net` thread's terminal death (#634, agent-honesty). `None` while the Model — the sole
+    /// writer of `GameState`, sole drainer of the command slots, sole stamper of `NetHealth` — is
+    /// running; `Some(reason)` once it has ended for ANY reason (panic, fatal error, clean shutdown)
+    /// and therefore will never publish again. This is the field that tells an agent the frozen world
+    /// it is reading is frozen FOREVER, which no age can say. Written only by
+    /// `eqoxide::model::run_net_thread`; same shared-`Arc`-identity discipline as the two above.
+    pub(crate) net_thread_dead: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// The typed write-path facade (#446). Combat is fully migrated onto it — combat/pet handlers
     /// write via `s.command.request_*` (no direct `ipc::CombatSlots` field any more); other domains
     /// still use their own bundle fields until Wave-2 migrates them. See `eqoxide_command`.
@@ -643,9 +650,12 @@ impl HttpState {
 /// is also NOT gated — it must always work, and its own watchdog force-exits the process even if the
 /// loop is wedged.
 ///
-/// The "dead" verdict is keyed on two INDEPENDENT net-thread-liveness signals, never on transient
+/// The "dead" verdict is keyed on three INDEPENDENT net-thread-liveness signals, never on transient
 /// quiet, so a healthy idle session (connected + ticking, but no application traffic for tens of
 /// seconds) always passes (#343):
+///   - `net_thread_dead != None` (#634) — the net thread PUBLISHED its own death on the way out
+///     (panic / fatal error / clean exit). Unlike the two clocks below this is immediate and
+///     unambiguous: it cannot fire on a merely slow loop, and it can never clear.
 ///   - `connected == false` — no server datagram (not even a session-layer ACK) for `CONN_STALE_SECS`.
 ///     The clearest "the link/thread is gone" signal; an idle-but-alive session keeps ACKing so stays
 ///     `true`.
@@ -659,6 +669,19 @@ impl HttpState {
 /// THREAD that drains commands still running", which `connected` + tick-staleness answer without any
 /// false positive on a healthy idle session.
 pub(crate) fn require_live_session(s: &HttpState) -> Result<(), (axum::http::StatusCode, String)> {
+    // #634: the net thread has published its own death. This is checked FIRST because it is both
+    // IMMEDIATE (no 5s tick-staleness or 15s link-staleness wait) and TERMINAL (the two clock-based
+    // verdicts below are ambiguous between "wedged, may recover" and "gone"; this one is not).
+    if let Some(reason) = s.net_thread_dead.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return Err((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "the network thread is dead — {reason} This command was NOT sent and will not \
+                 take effect. Do not retry: nothing will drain it. See GET /v1/observe/debug \
+                 (`net_thread_dead`)."
+            ),
+        ));
+    }
     let h = s.health();
     if !h.connected {
         return Err((
@@ -694,6 +717,7 @@ pub fn spawn_camera_server(
     zone_assets:      eqoxide_nav::zone_assets::ZoneAssetStateShared,
     common_assets_failed: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     model_sync_dead:      std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    net_thread_dead:      std::sync::Arc<std::sync::Mutex<Option<String>>>,
     command:         eqoxide_command::CommandState,
     social:          eqoxide_ipc::SocialSlots,
     merchant_slots:  eqoxide_ipc::MerchantSlots,
@@ -727,7 +751,7 @@ pub fn spawn_camera_server(
         rt.block_on(async move {
             let state = HttpState {
                 camera, nav, world, shared_collision, zone_assets, common_assets_failed,
-                model_sync_dead, command, social, merchant_slots,
+                model_sync_dead, net_thread_dead, command, social, merchant_slots,
                 inventory_slots, interact, chat, spells, game_state, net_health, frame_profile,
                 quest, group_slots, lifecycle, guild_slots, nav_debug_view,
             };
@@ -884,6 +908,24 @@ mod live_session_guard_tests {
         set_clocks(&s, 0, 0, 60);
         assert!(require_live_session(&s).is_ok(),
             "a connected, ticking session must pass even after 60s of world silence");
+    }
+
+    /// #634: the net thread published its own death. Every clock is FRESH — this is the window
+    /// immediately after the thread dies, before `snapshot_age_ms` has had 5s to climb and before
+    /// `connected` has had 15s to flip — so both pre-existing signals still say "live". Only the
+    /// explicit terminal state can reject here, and it must, because nothing will ever drain the
+    /// command. Delete the `net_thread_dead` check in `require_live_session` and this goes RED.
+    #[test]
+    fn dead_net_thread_is_503_immediately_even_with_perfectly_fresh_clocks() {
+        let s = empty_state();
+        assert!(require_live_session(&s).is_ok(), "precondition: fresh clocks are otherwise live");
+        *s.net_thread_dead.lock().unwrap() =
+            Some("the eq-net thread PANICKED (boom).".to_string());
+        let (code, msg) = require_live_session(&s).unwrap_err();
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(msg.contains("network thread is dead"), "message: {msg}");
+        assert!(msg.contains("PANICKED"), "the published reason must be relayed verbatim: {msg}");
+        assert!(msg.contains("Do not retry"), "a terminal failure must say so: {msg}");
     }
 
     /// A dead LINK (no datagram for > CONN_STALE_SECS) → 503, regardless of the tick clock.

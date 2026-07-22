@@ -33,7 +33,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 
 | Route | Description |
 |-------|-------------|
-| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation** (`nav_state`, `nav_reason`, `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier` — see [Navigation state](#navigation-state)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + camera state. |
+| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation** (`nav_state`, `nav_reason`, `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier` — see [Navigation state](#navigation-state)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + camera state. |
 | `GET /v1/observe/frame` | Current rendered frame as a PNG (`Content-Type: image/png`). **503 while the zone's assets are still loading** — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579); `?allow_pending=1` opts past it. |
 | `GET /v1/observe/entities[?labeled=1]` | Default: `{ "<name>": [x,y,z], ... }` for all known entities, with same-base-name + byte-identical-position duplicates collapsed (#471 — suspected server-side `spawn2` duplication; the model is untouched so each instance is still targetable by its full name). `?labeled=1` returns the richer `{count, entities:{"<name>":[x,y,z]}, deduped, duplicate_groups:[{position,names,kept}], note}` exposing which duplicates were collapsed. |
 | `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency}`. Slots are Titanium **wire** ids (DB general slots 23-30 → wire 22-29). |
@@ -545,6 +545,35 @@ Every send now funnels through one place that records its own failure, so:
 **If `snapshot_age_ms` is large, distrust the whole payload.** It means the client's own network
 thread has stopped publishing, so every other field is a stale snapshot regardless of what
 `connected` says.
+
+### `net_thread_dead` — the frozen world's terminality (#634)
+
+Top-level on `GET /v1/observe/debug`, beside `zone_assets` / `common_assets_failed` /
+`model_sync_dead`. `null` while the `eq-net` thread — the client's sole writer of world state, sole
+drainer of command slots, sole stamper of the health clocks — is running. A **reason string** once it
+has ended, for any reason:
+
+| Cause | Reported |
+|-------|----------|
+| the thread PANICKED | `"the eq-net thread PANICKED (<message>) — …"` |
+| a fatal error (login retries exhausted, server-rejected create) | `"the eq-net thread exited with a fatal error (<e>) — …"` |
+| it returned with no shutdown requested | `"…returned WITHOUT a shutdown being requested — …"` |
+| ordinary `/v1/lifecycle/exit` teardown | `"…exited normally after a shutdown was requested — …"` |
+| `--testzone` (offline renderer; no thread was ever started) | `"--testzone: the eq-net thread was never started …"` |
+
+**Read it together with `snapshot_age_ms`, not instead of it.** They answer different questions:
+
+- `snapshot_age_ms` answers *"is this stale?"* — and it is the more general signal, because it also
+  catches a thread that is merely wedged, and failure modes nobody enumerated.
+- `net_thread_dead` answers *"will it ever un-stale?"* — which no age can, because a 5-second-old
+  tick is equally consistent with a busy loop about to recover and with a thread that no longer
+  exists. It is also **immediate**: it is set the instant the thread unwinds, whereas
+  `snapshot_age_ms` needs 5s to cross the staleness bound and `connected` needs 15s to flip.
+
+When it is non-null, **every world field in the payload is a final frozen snapshot** — position,
+zone, entities, vitals — and it will never change again. Stop polling; do not retry commands.
+Write commands are refused with `503` naming this field (the reason string is relayed verbatim), so
+an agent that ignores it still cannot get a false `200`.
 
 **A live socket does not prove a live world — that's what `world_responsive` is for (#371).** A
 wedged zone (its main loop stalled on a script/DB call/deadlock, or merely severely slow) keeps
