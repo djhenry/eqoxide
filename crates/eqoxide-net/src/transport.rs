@@ -906,8 +906,11 @@ impl EqStream {
                         h.send_wouldblock_rescued = h.send_wouldblock_rescued.saturating_add(1);
                         Ok(n)
                     }
-                    // The kernel refused it too. Report the KERNEL's error, not tokio's cached-
-                    // readiness stand-in, so `last_send_error` names what actually happened.
+                    // A DOUBLE refusal: the direct `send(2)` is a real syscall, so this one is the
+                    // kernel's own answer, not tokio's cached-readiness stand-in — the only hard
+                    // evidence either way about which mechanism refused the original `try_send`
+                    // (#641 review, finding 3). Report the kernel's error so `last_send_error` names
+                    // what actually happened.
                     Err(real) => Err(real),
                 }
             }
@@ -2680,6 +2683,112 @@ mod tests {
         assert_eq!((h.send_failures, h.send_failures_unretried), (3, 3),
             "queued-but-never-sent control datagrams must be reported as the loss they are once \
              the session that would have retried them is gone (#641)");
+    }
+
+    /// #641 review R2 (mutation J) — a PERMANENT error on a queued datagram must drop it after
+    /// counting it once, not re-attempt it forever.
+    ///
+    /// `flush_pending_control` runs on every ~10ms tick. If a queued datagram fails with something
+    /// no retry can fix, leaving it at the head of the queue mints a fresh `send_failures` every
+    /// tick for the life of the session — a counter climbing without bound while nothing new is
+    /// actually being lost, which is as dishonest as under-counting and considerably noisier. It is
+    /// also a head-of-line block: nothing behind it would ever go out.
+    ///
+    /// This was a fix made without a test in the previous round; the reviewer's mutation J (revert
+    /// to `Err(_) => return`) was GREEN. It is RED now.
+    ///
+    /// The error is a REAL errno from a real `sendto` — a 70,000-byte datagram is past the
+    /// 65,507-byte IPv4 UDP ceiling, so `EMSGSIZE` — not an injected one.
+    #[tokio::test]
+    async fn a_permanently_failing_queued_datagram_is_dropped_after_one_count_not_retried_forever() {
+        let net_health: eqoxide_ipc::NetHealthShared = Default::default();
+        let (mut stream, _rx, _peer, _addr) = test_stream_with_peer(net_health.clone()).await;
+        stream.socket.writable().await.unwrap();
+
+        stream.defer_control(vec![0x5A; 70_000]);
+        assert_eq!(stream.pending_control.len(), 1);
+
+        stream.poll_recv();
+        assert!(stream.pending_control.is_empty(),
+            "a datagram that can NEVER be sent must leave the queue — otherwise it blocks every \
+             datagram behind it forever (#641 review R2)");
+        {
+            let h = *net_health.lock().unwrap();
+            assert_eq!((h.send_failures, h.send_failures_unretried), (1, 1),
+                "counted exactly once, as the loss it is");
+            // EMSGSIZE has no stable `ErrorKind` (it maps to the unstable `Uncategorized`), so what
+            // is pinned is the discrimination that matters here: this was NOT a transient refusal,
+            // i.e. it took the permanent path, not the deferral one.
+            let kind = h.last_send_error_kind.expect("the failure must be reported");
+            assert_ne!(kind, std::io::ErrorKind::WouldBlock,
+                "a 70,000-byte datagram fails with EMSGSIZE from the real sendto — if this is                  WouldBlock the test is exercising the deferral path, not the permanent one");
+            assert_eq!(h.send_deferred, 1,
+                "`defer_control` queued it once; the permanent failure must not add to that");
+        }
+
+        // The tick that matters: with the datagram still queued, this one would count a SECOND
+        // failure, and so would every tick after it, forever.
+        stream.poll_recv();
+        stream.poll_recv();
+        assert_eq!(net_health.lock().unwrap().send_failures, 1,
+            "`send_failures` must not climb once per tick for a single dropped datagram — a counter \
+             that grows without anything new being lost is exactly the kind of number an agent \
+             cannot act on (#641 review R2, mutation J)");
+    }
+
+    /// #641 review R2 (mutation K) — `connect()`'s handshake loop must drain the deferral queue.
+    ///
+    /// That loop is the one place a stream ticks without calling `poll_recv` (it reads the socket
+    /// directly), so the "every loop drains the queue every ~10ms" property the design leans on has
+    /// a hole there: without this call the queue drains only as a side effect of the next
+    /// `SESSION_REQUEST` retry, ~250ms away. Source-level for the same reason as
+    /// `connect_awaits_writable_before_the_first_session_request` above — `connect()` needs a real
+    /// server handshake to exercise, and the property being pinned is "this call is in that loop".
+    #[test]
+    fn connect_handshake_loop_drains_the_control_retry_queue() {
+        const SRC: &str = include_str!("transport.rs");
+        let loop_start = SRC.find("while !stream.session.connected {")
+            .expect("transport.rs: couldn't find connect()'s handshake loop");
+        let loop_src = &SRC[loop_start..];
+        let loop_end = loop_src.find("\n        }\n").expect("couldn't find the end of the loop");
+        assert!(loop_src[..loop_end].contains("stream.flush_pending_control();"),
+            "connect()'s handshake loop must call `flush_pending_control()` itself (#641 review, \
+             finding 8): it reads the socket directly instead of via `poll_recv`, so it is the one \
+             tick loop where a deferred control datagram would otherwise wait on the ~250ms \
+             SESSION_REQUEST cadence instead of the next ~100ms iteration");
+    }
+
+    /// #641 review R3 — the `OP_GMKick` path must account its outstanding windows too.
+    ///
+    /// It is the second path (after `perform_clean_shutdown`, guarded above) that ends a session by
+    /// parking forever rather than unwinding, so `Drop` never runs there either. Without an explicit
+    /// `abandon_outstanding()`, control datagrams still queued when the kick arrives are counted in
+    /// `send_deferred` and never in `send_failures` — making `NetHealth::send_deferred`'s "a
+    /// deferred datagram that is later abandoned is counted in both" true everywhere except there.
+    /// The practical consequence is nil (we are already kicked); the point is that a counter which
+    /// is honest *except on one path* is a counter nobody can reason with.
+    ///
+    /// Source-level, and comments stripped first, for exactly the reasons written on the
+    /// clean-shutdown guard above — a previous version of that one was satisfied by commenting the
+    /// call out.
+    #[test]
+    fn the_gmkick_path_accounts_its_outstanding_windows_before_parking_forever() {
+        let gameplay_src = strip_comments(include_str!("gameplay.rs"));
+        let at = gameplay_src.find("OP_GMKICK =>")
+            .expect("gameplay.rs: the OP_GMKICK match arm was not found");
+        // The arm ends at its own closing brace; the park loop is the last statement in it.
+        let arm_end = gameplay_src[at..].find("\n                }\n")
+            .expect("unterminated OP_GMKICK arm") + at;
+        let arm = &gameplay_src[at..arm_end];
+        assert!(arm.contains("abandon_outstanding()"),
+            "the OP_GMKick arm must call `abandon_outstanding()` (#641 review R3): it parks in \
+             `loop {{ sleep }}` forever and is never unwound, so `Drop` cannot account for the \
+             control-retry queue or the reliable window there");
+        let abandon_at = arm.find("abandon_outstanding()").unwrap();
+        let park_at = arm.find("loop {").unwrap_or(arm.len());
+        assert!(abandon_at < park_at,
+            "the accounting must happen BEFORE the park — nothing after `loop {{ sleep }}` ever \
+             runs (#641 review R3)");
     }
 
     /// #641 structural guard, in the same spirit as

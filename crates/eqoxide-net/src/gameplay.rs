@@ -355,6 +355,16 @@ pub async fn run_gameplay_phase(
                     // a failed disconnect changes nothing we can act on — the session is gone either
                     // way and we shut down next.
                     let _ = s.send_session_disconnect();
+                    // #641 review R3: account the outstanding windows BEFORE parking. This task
+                    // never returns and is never unwound, so `Drop` never runs here — without this
+                    // call, ACKs still queued in `pending_control` (and un-ACKed reliables) would be
+                    // counted in `send_deferred` and never in `send_failures`, making
+                    // `NetHealth::send_deferred`'s "a deferred datagram that is later abandoned is
+                    // counted in both" true everywhere except this one path. Synchronous, so it
+                    // completes before the park below. Practical consequence is nil — we are already
+                    // kicked — but a counter that is honest "except on one path" decays into a
+                    // counter nobody trusts. Mirrors what `perform_clean_shutdown` does explicitly.
+                    s.abandon_outstanding();
                     // We're already booted, so no OP_Logout. Request shutdown: the render loop's
                     // `about_to_wait` exits the winit event loop on the main thread, which tears
                     // down cleanly and exits the process. Idle here; do NOT return (avoids reconnect).

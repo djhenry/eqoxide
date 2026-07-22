@@ -364,9 +364,10 @@ pub struct NetHealth {
     /// established. Telling them apart properly would need something like `ioctl(SIOCOUTQ)` at the
     /// moment of refusal (≈0 queued bytes ⇒ genuinely synthetic); nobody has done that.
     ///
-    /// Read it as a LOAD signal — the socket is refusing sends here — not as a diagnosis. Two
-    /// instrumented zone-ins: `qeynos` 141 rescued / 107 refused again; `gfaydark` **0** rescued /
-    /// 138 deferred. Neither generalises.
+    /// Read it as a LOAD signal — the socket is refusing sends here — not as a diagnosis. The split
+    /// varies RUN TO RUN, not by zone: `gfaydark` measured 0 rescued / 138 deferred on one run and
+    /// 175 / 147 on another, same recipe and same binary; `qeynos` measured 141/107, 166/106 and
+    /// 119/114. Nothing observable predicts it.
     ///
     /// Before #641 every one of these was a datagram silently dropped on the floor — mostly ACKs,
     /// which the server then had to re-solicit by retransmitting the packets it had not seen
@@ -389,6 +390,11 @@ pub struct NetHealth {
     /// still queued — and that loss is counted in `send_failures`/`send_failures_unretried` too, so
     /// the same datagram appears in both. `send_failures` stays the honest "was anything lost?"
     /// number; this one answers "how many datagrams did the socket make us delay?".
+    ///
+    /// That holds on EVERY path that ends a session, including the `OP_GMKick` one that parks
+    /// forever without ever unwinding: it calls `abandon_outstanding` explicitly (#641 review R3),
+    /// because a `Drop` that never runs cannot account for anything. A counter that is honest
+    /// "except on one path" decays into a counter nobody trusts.
     ///
     /// A lower bound on genuine kernel refusals, for the reason given on `send_wouldblock_rescued`.
     /// Before #641 every one of these was a silently dropped ACK, which the server answered by

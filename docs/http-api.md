@@ -457,7 +457,7 @@ the client for them to be right (#343).
 | `snapshot_age_ms` | ms since the client's network thread last ticked. |
 | `world_responsive` | **Is the WORLD alive, not just the socket?** `false` only when an active liveness probe went unanswered past its bound while the link kept ACKing — a wedged zone. `true` for a healthy zone, including a legitimately idle one (the probe is answered). `true` before the first probe fires. See below. |
 | `last_world_response_ms` | ms since the world last *proved* it processed something for us — a probe reply or a spontaneous packet, whichever is fresher. The companion to `world_responsive`. |
-| `send_failures` | **Datagrams this client BUILT but could not put on the wire** — the send was attempted and the KERNEL refused it. Cumulative since process start. **`0` is the expected healthy reading** (since #641 — see below). |
+| `send_failures` | **Datagrams this client BUILT but could not put on the wire** — the datagram never reached the wire and **nothing will re-send it**. Covers more than a kernel refusal: non-transient errors (`EMSGSIZE`, a dead socket), queue-overflow evictions, and datagrams still queued when a session ends all land here. Cumulative since process start. **`0` is the expected healthy reading** (since #641 — see below). |
 | `send_wouldblock_rescued` | Datagrams whose `try_send` returned `WouldBlock` and which an **immediate direct `send(2)` on the same fd then accepted**. They reached the wire, so they are not failures. Cumulative. An **upper bound** on tokio's synthetic-`WouldBlock` case — see below for why it is a bound and not a measurement (#641). |
 | `send_deferred` | Count of **datagrams** (not refusal events) that a transient send refusal caused to be QUEUED for retry on a later ~10ms tick, rather than dropped. Only session-layer control (ACKs, keepalives, session setup) is deferrable. A **lower bound** on genuine kernel refusals. **Not disjoint from `send_failures`** — see below (#641). |
 | `send_failures_unretried` | The subset of `send_failures` with no client-side retransmit of that datagram. |
@@ -510,11 +510,14 @@ Every send now funnels through one place that records its own failure, so:
   A double refusal (both the `try_send` and the direct `send(2)`) *is* hard evidence of (2).
   Distinguishing them properly would need something like `ioctl(SIOCOUTQ)` on the fd at the moment of
   the refusal (≈0 queued bytes ⇒ genuinely synthetic); that has not been done.
-- **Both mechanisms occur, and neither dominates.** Two instrumented single-core-pinned zone-ins:
-  `qeynos` split **141 rescued / 107 refused-again**, while `gfaydark` was **0 rescued / 138
-  deferred** — in that zone the synthetic path contributed nothing at all. Do not generalise from
-  either. What is established is that "it is all synthetic" is FALSE (the double refusals prove it),
-  and that the fix is agnostic: it recovers both.
+- **Both mechanisms occur, and the split varies RUN TO RUN — not by zone, not by machine.**
+  Instrumented single-core-pinned zone-ins: `qeynos` **141 rescued / 107 refused-again**, then
+  **166/106** and **119/114** on later runs; `gfaydark` **0 rescued / 138 deferred** on one run and
+  **175/147** on another — *same zone, same recipe, same binary*. An earlier draft of this page
+  attributed that `0` to the zone; the second `gfaydark` run refutes that, and the real conclusion is
+  stronger: you cannot predict the split from anything observable, so do not try. What IS
+  established is that "it is all synthetic" is FALSE (the double refusals prove it), and that the fix
+  is agnostic — it recovers both.
 - **`send_wouldblock_rescued` and `send_deferred` are load signals, not loss signals.** Every
   datagram counted by `send_wouldblock_rescued` reached the wire; every datagram counted by
   `send_deferred` was queued and, in the normal case, went out on a later tick. Both climb under CPU

@@ -610,12 +610,19 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // indistinguishable from one the server received — an agent issuing a command had no way,
         // even in principle, to learn that it had not gone out.
         //   send_failures            — datagrams BUILT but not put on the wire, since process start.
-        //                              0 IS the expected healthy reading since #641. The qeynos
-        //                              zone-in burst of 283 this comment used to warn about was
-        //                              tokio returning a SYNTHETIC WouldBlock (cached readiness bit
-        //                              empty → no syscall attempted); those are now retried through
-        //                              send(2) and counted in send_wouldblock_rescued. A nonzero
-        //                              value here now means the KERNEL refused a send.
+        //                              0 IS the expected healthy reading since #641, which gave the
+        //                              qeynos zone-in burst of 283 two recovery paths (an immediate
+        //                              direct send(2) retry, and a deferral queue for control
+        //                              datagrams), both counted BELOW rather than here. So this now
+        //                              means what its name says: THE DATAGRAM NEVER REACHED THE WIRE
+        //                              AND NOTHING WILL RE-SEND IT. That covers more than a kernel
+        //                              refusal — non-transient errors (EMSGSIZE, a dead socket),
+        //                              queue-overflow evictions, and datagrams still queued when a
+        //                              session ends all land here too.
+        //                              WHICH mechanism refused a send is NOT knowable from these
+        //                              counters — see send_wouldblock_rescued below. What IS
+        //                              established is the trigger: CPU starvation of the client's
+        //                              tokio io driver.
         //   send_wouldblock_rescued  — datagrams a WouldBlock refused that an immediate direct
         //                              send(2) then accepted (#641). NOT failures — they reached the
         //                              wire. An UPPER BOUND on tokio's synthetic-WouldBlock case,
