@@ -64,6 +64,86 @@ fn lost_load_zone(any_loader_alive: bool, st: &crate::nav::zone_assets::ZoneAsse
     }
 }
 
+/// The two ways the common-asset-loader thread can end in failure (#616 review F2). They read alike
+/// (both are `Err(String)`-shaped) but call for OPPOSITE `poll_sync` treatment, so they must be told
+/// apart rather than folded into one `Err(String)`:
+///
+/// - `Ordinary` — the loader's body ran to completion and reached a state with no usable asset set
+///   (sync failed and no cached fallback exists). This predates #616 and `poll_sync` has always held
+///   the loading screen up FOREVER for it — `self.loading` stays `true`, the error stays on screen,
+///   and the client deliberately never proceeds into a broken game with no character models. That is
+///   a real, actionable, LOUD block, not a silent degrade, and #616 does not touch it.
+/// - `Panicked` — the wrapper's `catch_unwind` caught an unwind; the body never finished, so there is
+///   nothing more for the loading screen to usefully hold open on. This is the NEW case #616 adds:
+///   `poll_sync` clears `loading` and hands the reason to the persistent `common_assets_failed`
+///   field instead (see its doc on `App`) so the failure is not lost the instant the loading screen
+///   stops drawing.
+///
+/// The #616 review caught an EARLIER version of this fix that used a bare `Result<(), String>` for
+/// both and unconditionally cleared `loading` in `poll_sync`'s `Err` arm — which silently reintroduced
+/// the very "proceed as if fine" bug #616 exists to remove, one layer up, for the `Ordinary` case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LoaderFailure {
+    Ordinary(String),
+    Panicked(String),
+}
+
+/// The pure decision behind `poll_sync`'s `Err` arm (#616 review F2): the message to publish (to
+/// both the transient loading-screen text and the persistent `common_assets_failed` observable,
+/// which are the same for both variants) and whether `self.loading` should be cleared (which is NOT
+/// the same for both — see `LoaderFailure`'s doc). Extracted, like `lost_load_zone` /
+/// `publish_load` above, so the panic-vs-ordinary distinction is directly unit-testable without
+/// constructing a full GPU-backed `App`.
+fn common_asset_loader_failure_outcome(f: LoaderFailure) -> (String, bool) {
+    match f {
+        LoaderFailure::Panicked(msg) => (msg, true),
+        LoaderFailure::Ordinary(msg) => (msg, false),
+    }
+}
+
+/// Runs the common-asset-loader thread body under `catch_unwind`; if it panics, publishes an
+/// explicit `Err(LoaderFailure::Panicked(_))` — see `LoaderFailure` for why that variant, not
+/// `Ordinary`, matters (#616 review F2). Before this wrapper, `done` was written only by `body`'s
+/// own last line, so a panic anywhere above it (a corrupt manifest, an I/O panic mid-reassembly)
+/// left `done` `None` forever: `poll_sync` never sees a result, `self.loading` never clears, and the
+/// loading screen (showing whatever status text was last set before the panic) is frozen for the
+/// rest of the session — the exact "waiting for a result that can never arrive" #579/#595 exist to
+/// prevent, just via a different worker. Mirrors the zone-asset loader's `catch_unwind` (src/app.rs,
+/// added by #595) rather than inventing a new shape.
+fn run_common_asset_loader<F>(body: F, done: &Arc<Mutex<Option<Result<(), LoaderFailure>>>>)
+where
+    F: FnOnce() + std::panic::UnwindSafe,
+{
+    if std::panic::catch_unwind(body).is_err() {
+        let reason = "the common-asset-loader thread PANICKED while syncing assets (see the \
+                       crash log). No retry is running.".to_string();
+        tracing::error!("APP: common-asset-loader thread panicked");
+        *done.lock().unwrap_or_else(|e| e.into_inner()) = Some(Err(LoaderFailure::Panicked(reason)));
+    }
+}
+
+/// Runs the model-sync-worker thread body under `catch_unwind`, always leaving `dead` with the
+/// reason the worker stopped — success is impossible for this worker (it only stops by dying), so
+/// `body` returns why (#616). Before this wrapper a panic just ended the thread with NOTHING
+/// published: the renderer keeps sending on-demand race-model requests down a channel whose
+/// receiver is now gone, `let _ = tx.send(..)` silently swallows the resulting error, and on-demand
+/// character-model syncing never happens again for the rest of the session with no signal anywhere
+/// that it died — model syncing degrades silently instead of failing loud.
+fn run_model_sync_worker<F>(body: F, dead: &Arc<Mutex<Option<String>>>)
+where
+    F: FnOnce() -> String + std::panic::UnwindSafe,
+{
+    let reason = match std::panic::catch_unwind(body) {
+        Ok(reason) => reason,
+        Err(_) => {
+            tracing::error!("APP: model-sync-worker thread panicked");
+            "the model-sync-worker thread PANICKED — on-demand race-model syncing will not \
+             happen again this session (see the crash log). No retry is running.".to_string()
+        }
+    };
+    *dead.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
+}
+
 /// Result of a left-click pick test: the nearest entity or door the ray hit, if any.
 #[derive(Clone, Copy)]
 pub enum PickResult {
@@ -268,10 +348,37 @@ pub struct App {
     ui_state: crate::ui::UiState,
     /// Asset-sync progress fraction (0.0–1.0) shown on the loading screen; None when not syncing.
     sync_progress: std::sync::Arc<std::sync::Mutex<Option<f32>>>,
-    /// Set to Some(Ok(())) when the common-model sync finishes, Some(Err(msg)) on failure.
-    sync_done: std::sync::Arc<std::sync::Mutex<Option<Result<(), String>>>>,
+    /// Set to Some(Ok(())) when the common-model sync finishes, Some(Err(LoaderFailure)) on failure
+    /// — see `LoaderFailure` for why the failure is typed rather than a bare `String` (#616 review
+    /// F2: `poll_sync` must tell a panic apart from the pre-existing "no cached fallback" failure).
+    sync_done: std::sync::Arc<std::sync::Mutex<Option<Result<(), LoaderFailure>>>>,
     /// True once character models have been loaded from the cache (guards one-time load).
     models_loaded: bool,
+    /// Observable health of the background model-sync worker (#616): `None` while it is alive,
+    /// `Some(reason)` once it has stopped for any reason (a panic, a login failure, its channel
+    /// closing) — see `run_model_sync_worker`. The worker never restarts once dead, so this is a
+    /// terminal, persistent signal rather than a transient status line: it is never cleared once
+    /// set. Written only by the model-sync-worker thread via `run_model_sync_worker`.
+    ///
+    /// SHARED by `Arc` identity with `HttpState::model_sync_dead` (#616 review F1) — constructed
+    /// once in `main.rs`, not here, and handed in through `App::new`. Serves on
+    /// `GET /v1/observe/debug` as `model_sync_dead`.
+    model_sync_dead: Arc<Mutex<Option<String>>>,
+    /// Terminal common-asset-loader failure, PERSISTENT unlike `load_status` (#616). `load_status`
+    /// is a transient line the loading screen shows only while `loading == true`; `poll_sync` clears
+    /// `loading` for a PANIC (mirroring how the zone loader's `maybe_finish_load` unconditionally
+    /// clears `loading` and hands the real verdict to the separate, persistent `zone_assets` state)
+    /// but deliberately NOT for the pre-existing "sync failed, no cached fallback" ordinary failure
+    /// — that one keeps holding the loading screen up with the error on screen rather than silently
+    /// proceeding into gameplay with no character models (#616 review F2; see `LoaderFailure` and
+    /// `poll_sync`). Either way the reason living only in `load_status` would vanish from view the
+    /// instant the loading screen stops drawing, so this field is the persistent verdict for the
+    /// common-asset path: `None` until a terminal failure, `Some(reason)` forever after.
+    ///
+    /// SHARED by `Arc` identity with `HttpState::common_assets_failed` (#616 review F1) —
+    /// constructed once in `main.rs`, not here, and handed in through `App::new`. Serves on
+    /// `GET /v1/observe/debug` as `common_assets_failed`.
+    common_assets_failed: Arc<Mutex<Option<String>>>,
     asset_server_url: String,
     asset_user: String,
     asset_pass: String,
@@ -297,6 +404,13 @@ impl App {
         spells:          std::sync::Arc<crate::spells::SpellDb>,
         shared_collision: collision::SharedCollision,
         zone_assets:      crate::nav::zone_assets::ZoneAssetStateShared,
+        // #616 review F1: constructed ONCE in main.rs (mirroring `zone_assets` above) and shared —
+        // by identity, not by value — with `HttpState`, which is this app's ONLY writer. Do not
+        // construct a fresh `Arc::new(Mutex::new(None))` for either of these inside this function;
+        // that would sever the identity `main.rs` set up and `/v1/observe/debug` would read `None`
+        // forever no matter what this app publishes into its own (unreachable) copy.
+        common_assets_failed: Arc<Mutex<Option<String>>>,
+        model_sync_dead:      Arc<Mutex<Option<String>>>,
         frame_profile_shared: crate::ipc::FrameProfileShared,
         testzone_mode:   bool,
         nav_debug:       bool,
@@ -386,6 +500,8 @@ impl App {
             sync_progress: Arc::new(Mutex::new(None)),
             sync_done:     Arc::new(Mutex::new(None)),
             models_loaded: false,
+            model_sync_dead,
+            common_assets_failed,
             asset_server_url, asset_user, asset_pass,
             window_title,
             game_state_snapshot, game_state_view, net_health,
@@ -755,9 +871,27 @@ impl App {
                     self.loading = false;
                     *self.sync_progress.lock().unwrap() = None;
                 }
-                Err(msg) => {
-                    *self.load_status.lock().unwrap() = msg;
-                    // stay on the loading screen showing the error; do not load blob fallback.
+                Err(f) => {
+                    // #616 review F2: `Panicked` and `Ordinary` publish the SAME message (both to
+                    // the transient loading-screen text and the persistent `common_assets_failed`
+                    // observable — new since the review, so `/v1/observe/debug` shows either kind of
+                    // failure) but must NOT clear `self.loading` alike. `Ordinary` is the
+                    // PRE-EXISTING "sync failed, no cached models" case: the loader's body ran to
+                    // completion and reached this verdict itself, and `poll_sync` has always held the
+                    // loading screen up FOREVER for it — a real, actionable, on-screen block, not a
+                    // silent degrade. An earlier version of this fix cleared `loading` for both cases
+                    // alike, which silently let the client proceed into gameplay with
+                    // `models_loaded` still false and nothing else gating rendering on that —
+                    // reintroducing, one layer up, exactly the "silently degraded" failure mode #616
+                    // exists to remove. Only `Panicked` — the NEW case #616 adds, where the body
+                    // never finished so there is nothing more useful to hold the loading screen open
+                    // on — clears `loading`. See `common_asset_loader_failure_outcome`.
+                    let (msg, clear_loading) = common_asset_loader_failure_outcome(f);
+                    *self.load_status.lock().unwrap() = msg.clone();
+                    *self.common_assets_failed.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg);
+                    if clear_loading {
+                        self.loading = false;
+                    }
                 }
             }
         }
@@ -814,19 +948,30 @@ impl App {
             let url = self.asset_server_url.clone();
             let user = self.asset_user.clone();
             let pass = self.asset_pass.clone();
+            let dead = self.model_sync_dead.clone();
             std::thread::Builder::new().name("model-sync-worker".into()).spawn(move || {
-                let wcache = crate::asset_sync::CacheDirs::resolve(); // same XDG path; cheap
-                let sync = match crate::asset_sync::AssetSync::login(&url, &user, &pass) {
-                    Ok(s) => s,
-                    Err(e) => { tracing::warn!("model-sync worker: login failed: {e}"); return; }
-                };
-                while let Ok(key) = model_rx.recv() {
-                    let set = format!("charmodel/{key}");
-                    match crate::asset_sync::sync_set(&sync, &set, &wcache, &mut |_| {}) {
-                        Ok(()) => tracing::debug!("model-sync worker: synced {set}"),
-                        Err(e) => tracing::warn!("model-sync worker: sync {set} failed: {e}"),
+                // #616: catch_unwind so a panic anywhere below leaves an honest `dead` reason
+                // instead of just killing the thread with nothing published — see
+                // `run_model_sync_worker`.
+                run_model_sync_worker(std::panic::AssertUnwindSafe(move || -> String {
+                    let wcache = crate::asset_sync::CacheDirs::resolve(); // same XDG path; cheap
+                    let sync = match crate::asset_sync::AssetSync::login(&url, &user, &pass) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let reason = format!("model-sync worker: login failed: {e}");
+                            tracing::warn!("{reason}");
+                            return reason;
+                        }
+                    };
+                    while let Ok(key) = model_rx.recv() {
+                        let set = format!("charmodel/{key}");
+                        match crate::asset_sync::sync_set(&sync, &set, &wcache, &mut |_| {}) {
+                            Ok(()) => tracing::debug!("model-sync worker: synced {set}"),
+                            Err(e) => tracing::warn!("model-sync worker: sync {set} failed: {e}"),
+                        }
                     }
-                }
+                    "model-sync worker: request channel closed (renderer/sender dropped)".to_string()
+                }), &dead);
             }).expect("spawn model-sync-worker thread");
             renderer.set_model_sync_tx(model_tx);
         }
@@ -841,43 +986,55 @@ impl App {
         let progress = self.sync_progress.clone();
         let done = self.sync_done.clone();
         std::thread::Builder::new().name("common-asset-loader".into()).spawn(move || {
-            let result = (|| -> anyhow::Result<()> {
-                let sync = crate::asset_sync::AssetSync::login(&url, &user, &pass)?;
-                *status.lock().unwrap() = "Verifying assets…".to_string();
-                crate::asset_sync::sync_set(&sync, "common", &cache, &mut |p| {
-                    match p.phase {
-                        crate::asset_sync::Phase::Verifying => {
-                            *status.lock().unwrap() = "Verifying assets…".to_string();
-                            *progress.lock().unwrap() = None;
+            // #616: catch_unwind so a panic anywhere in the body publishes an honest terminal
+            // `Err` into `done` instead of leaving it `None` forever — see
+            // `run_common_asset_loader`. `done_for_body` is what the body itself writes on a
+            // normal finish (success or an ordinary sync error); `done` (the outer clone) is what
+            // the wrapper writes ONLY if the body never got that far.
+            let done_for_body = done.clone();
+            run_common_asset_loader(std::panic::AssertUnwindSafe(move || {
+                let result = (|| -> anyhow::Result<()> {
+                    let sync = crate::asset_sync::AssetSync::login(&url, &user, &pass)?;
+                    *status.lock().unwrap() = "Verifying assets…".to_string();
+                    crate::asset_sync::sync_set(&sync, "common", &cache, &mut |p| {
+                        match p.phase {
+                            crate::asset_sync::Phase::Verifying => {
+                                *status.lock().unwrap() = "Verifying assets…".to_string();
+                                *progress.lock().unwrap() = None;
+                            }
+                            crate::asset_sync::Phase::Downloading => {
+                                let mb = p.bytes as f64 / 1_048_576.0;
+                                *status.lock().unwrap() =
+                                    format!("Downloading {}/{} ({:.1} MB)…", p.done, p.total, mb);
+                                let frac = if p.total > 0 { p.done as f32 / p.total as f32 } else { 1.0 };
+                                *progress.lock().unwrap() = Some(frac);
+                            }
                         }
-                        crate::asset_sync::Phase::Downloading => {
-                            let mb = p.bytes as f64 / 1_048_576.0;
-                            *status.lock().unwrap() =
-                                format!("Downloading {}/{} ({:.1} MB)…", p.done, p.total, mb);
-                            let frac = if p.total > 0 { p.done as f32 / p.total as f32 } else { 1.0 };
-                            *progress.lock().unwrap() = Some(frac);
-                        }
-                    }
-                })?;
-                Ok(())
-            })();
-
-            // Fail loud unless the cache already satisfies us: if reassembled models
-            // exist, proceed; otherwise surface the error.
-            let satisfied = cache.models_dir().exists()
-                && std::fs::read_dir(cache.models_dir())
-                    .map(|mut d| d.any(|e| e.map(|e| e.path().extension().map_or(false, |x| x == "glb")).unwrap_or(false)))
-                    .unwrap_or(false);
-            let final_result = match result {
-                Ok(()) => Ok(()),
-                Err(e) if satisfied => {
-                    *status.lock().unwrap() =
-                        format!("Asset server unavailable ({e}); using cached models.");
+                    })?;
                     Ok(())
-                }
-                Err(e) => Err(format!("Asset sync failed and no cached models: {e}")),
-            };
-            *done.lock().unwrap() = Some(final_result);
+                })();
+
+                // Fail loud unless the cache already satisfies us: if reassembled models
+                // exist, proceed; otherwise surface the error.
+                let satisfied = cache.models_dir().exists()
+                    && std::fs::read_dir(cache.models_dir())
+                        .map(|mut d| d.any(|e| e.map(|e| e.path().extension().map_or(false, |x| x == "glb")).unwrap_or(false)))
+                        .unwrap_or(false);
+                let final_result = match result {
+                    Ok(()) => Ok(()),
+                    Err(e) if satisfied => {
+                        *status.lock().unwrap() =
+                            format!("Asset server unavailable ({e}); using cached models.");
+                        Ok(())
+                    }
+                    // #616 review F2: `Ordinary`, not `Panicked` — the body ran to completion and
+                    // reached this verdict itself; `poll_sync` must hold the loading screen open on
+                    // it exactly as it did before #616, not treat it like the new panic case.
+                    Err(e) => Err(LoaderFailure::Ordinary(
+                        format!("Asset sync failed and no cached models: {e}"))),
+                };
+                *done_for_body.lock().unwrap() = Some(final_result);
+            }), &done);
         }).expect("spawn common-asset-loader thread");
         self.egui_ctx      = Some(egui_ctx);
         self.egui_state    = Some(egui_state);
@@ -2576,5 +2733,110 @@ mod door_frac_tests {
     fn dt_larger_than_full_travel_snaps_immediately() {
         let frac = ease_door_frac(0.0, true, 10.0, 0.5);
         assert_eq!(frac, 1.0);
+    }
+}
+
+/// #616: neither background worker had the zone-asset loader's `catch_unwind` protection (added by
+/// #595, `src/app.rs`), so a panic in either one just killed the thread with NOTHING published —
+/// the observable each worker owns stayed on its last value forever, indistinguishable from "still
+/// working". These tests exercise the actual production wrapper functions (`run_common_asset_loader`
+/// / `run_model_sync_worker`) with a deliberately panicking body and assert the observable flips to
+/// an explicit failure instead. Mutation check: replacing either wrapper's `std::panic::catch_unwind`
+/// call with a bare `body()`/`body(...)` call turns both panic tests RED (the panic escapes the test
+/// function itself instead of being caught and asserted on).
+#[cfg(test)]
+mod worker_panic_protection_tests {
+    use super::{
+        common_asset_loader_failure_outcome, run_common_asset_loader, run_model_sync_worker,
+        LoaderFailure,
+    };
+    use std::sync::{Arc, Mutex};
+
+    /// A panic anywhere in the common-asset-loader body used to unwind straight past the ONLY write
+    /// to `done` (the real body's last line), leaving it `None` forever: `poll_sync` never sees a
+    /// result, `self.loading` never clears, and the loading screen is frozen on whatever status text
+    /// happened to be set right before the panic (e.g. "Verifying assets…", implying progress that
+    /// will never come). Must publish `LoaderFailure::Panicked`, specifically — NOT `Ordinary` (#616
+    /// review F2): `poll_sync` gives the two variants opposite `self.loading` treatment, so a wrapper
+    /// that got the variant wrong would still turn this test green under the earlier (bare-`String`)
+    /// version of the check but silently produce the wrong runtime behavior. See
+    /// `common_asset_loader_failure_outcome`'s tests below for that half of the contract.
+    #[test]
+    fn common_asset_loader_panic_publishes_explicit_failure_not_none() {
+        let done: Arc<Mutex<Option<Result<(), LoaderFailure>>>> = Arc::new(Mutex::new(None));
+        run_common_asset_loader(
+            // Simulates a panic partway through the body, BEFORE its own final `*done_for_body.lock()
+            // = Some(final_result);` write — the corrupt-manifest/arithmetic-trap shape #616 describes.
+            std::panic::AssertUnwindSafe(|| panic!("simulated corrupt manifest mid-sync")),
+            &done,
+        );
+        let got = done.lock().unwrap().clone();
+        assert!(
+            matches!(got, Some(Err(LoaderFailure::Panicked(_)))),
+            "a panic must publish an explicit Err(LoaderFailure::Panicked(_)), not leave `done` at \
+             {got:?} — `None` is the original #616 pending-forever hazard (`self.loading` never \
+             clears); `Ordinary` would make `poll_sync` treat a real panic like the pre-existing \
+             \"no cached models\" case and leave the loading screen stuck forever instead of \
+             surfacing the failure"
+        );
+        let msg = match got { Some(Err(LoaderFailure::Panicked(m))) => m, other => panic!("{other:?}") };
+        assert!(msg.to_lowercase().contains("panic"), "failure reason should say it panicked: {msg}");
+    }
+
+    /// #616 review F2: `poll_sync` must clear `self.loading` for a panic (nothing more useful for the
+    /// loading screen to hold open on) but leave it alone for the pre-existing "sync failed, no
+    /// cached models" ordinary failure (the loading screen staying up FOREVER with the error visible
+    /// is deliberate, predates #616, and must not be disturbed by this fix — see the doc on
+    /// `LoaderFailure`). This test is the direct proof of that distinction: it does not touch a real
+    /// `App`, but the pure decision function `poll_sync` calls IS the actual production logic
+    /// (`poll_sync` was refactored to delegate to it precisely so this is testable without one).
+    #[test]
+    fn ordinary_failure_does_not_clear_loading_but_panic_does() {
+        let (msg, clear) = common_asset_loader_failure_outcome(
+            LoaderFailure::Ordinary("Asset sync failed and no cached models: connection refused".into()),
+        );
+        assert_eq!(msg, "Asset sync failed and no cached models: connection refused");
+        assert!(!clear, "an ordinary sync failure (no cached fallback) must keep holding the loading \
+                          screen open — clearing `loading` here would silently let the client proceed \
+                          into gameplay with no character models (#616 review F2)");
+
+        let (msg, clear) = common_asset_loader_failure_outcome(
+            LoaderFailure::Panicked("the common-asset-loader thread PANICKED".into()),
+        );
+        assert_eq!(msg, "the common-asset-loader thread PANICKED");
+        assert!(clear, "a panic must clear `loading` — the body never finished, so there is nothing \
+                         left for the loading screen to usefully hold open on");
+    }
+
+    /// A panic in the model-sync-worker used to just kill the thread with NOTHING published — `dead`
+    /// stayed `None` forever, identical to "still alive and working" from any caller's perspective, so
+    /// on-demand race-model syncing silently stopped forever with no signal anywhere that it died.
+    #[test]
+    fn model_sync_worker_panic_publishes_explicit_dead_state() {
+        let dead: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        run_model_sync_worker(
+            std::panic::AssertUnwindSafe(|| -> String { panic!("simulated panic mid-sync") }),
+            &dead,
+        );
+        let got = dead.lock().unwrap().clone();
+        assert!(
+            got.is_some(),
+            "a panic must publish an explicit dead reason, not leave `dead` at None forever — \
+             indistinguishable from a healthy, still-running worker"
+        );
+        assert!(got.unwrap().to_lowercase().contains("panic"));
+    }
+
+    /// The non-panic path still works correctly: `run_model_sync_worker` must publish whatever
+    /// `body` returns verbatim when it returns normally, not swallow or override a real stop reason
+    /// (e.g. "login failed: …") with a generic one.
+    #[test]
+    fn model_sync_worker_normal_exit_publishes_bodys_reason_verbatim() {
+        let dead: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        run_model_sync_worker(
+            std::panic::AssertUnwindSafe(|| -> String { "login failed: boom".to_string() }),
+            &dead,
+        );
+        assert_eq!(dead.lock().unwrap().as_deref(), Some("login failed: boom"));
     }
 }
