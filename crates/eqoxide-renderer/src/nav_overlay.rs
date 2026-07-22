@@ -45,6 +45,11 @@ pub const COL_ACCEPT_WALK:    [f32; 4] = [0.15, 0.85, 0.30, 0.85];
 pub const COL_ACCEPT_SWIM:    [f32; 4] = [0.15, 0.70, 0.95, 0.85];
 pub const COL_ACCEPT_AIR:     [f32; 4] = [1.00, 0.62, 0.10, 0.90]; // jump / controlled fall
 pub const COL_ACCEPT_PAD:     [f32; 4] = [0.75, 0.35, 1.00, 0.95];
+/// A same-zone teleport pad nav DECLINED to route through (#543) — dim, because its destination is
+/// the server's ADVERTISEMENT, not a link this client can vouch for. Deliberately not
+/// `COL_ACCEPT_PAD`: that colour means "the planner may traverse this", which is exactly the claim
+/// a declined pad does not support.
+pub const COL_DECLINED_PAD:   [f32; 4] = [0.45, 0.25, 0.55, 0.60];
 pub const COL_REJECT_STEP:    [f32; 4] = [0.95, 0.15, 0.15, 0.90];
 pub const COL_REJECT_GRADE:   [f32; 4] = [1.00, 0.42, 0.05, 0.90];
 pub const COL_REJECT_CLEAR:   [f32; 4] = [1.00, 0.15, 0.65, 0.90];
@@ -208,14 +213,33 @@ pub fn live_vertices(snap: &NavDebugSnapshot) -> Vec<OverlayVertex> {
         }
     }
 
-    // Pads with a usable advertised destination: source → dest link + markers. Pads whose state
-    //    is Unknown/AdvertisedUnusable carry no drawable geometry (their positions are unknown or
+    // Pads with drawable geometry: footprint → destination link + markers. Pads whose state is
+    //    Unknown/AdvertisedUnusable carry no drawable geometry (their positions are unknown or
     //    refused) — honesty by omission, matching the endpoint's full report.
+    //
+    //    Two drawable states, in DIFFERENT colours, because they mean different things (#543):
+    //    `AdvertisedUsable` is a link the planner may route THROUGH; `AdvertisedSameZoneDeclined` is
+    //    a pad nav refuses to route through because it cannot verify where it lands — it is drawn
+    //    because it is a real option the AGENT may choose, not because nav will take it. Drawing the
+    //    declined one in the accept colour would show a route that does not exist.
+    //
+    //    A declined pad's DESTINATION end is drawn only from `advertised_dest_floor` — this client's
+    //    own floor snap. When that is `None` the client found no floor there, so there is no point to
+    //    draw: the footprint marker stands alone rather than a line reaching to a fabricated spot.
+    //
+    //    A declined pad with no standable footprint is drawn at `region_at` — where the region IS —
+    //    so it is never silently missing from the overlay just because nothing in it can be stood on.
     for pad in &snap.pads {
-        if let PadKnowledge::AdvertisedUsable { source, dest } = pad.knowledge {
-            push_line(&mut v, lift(source), lift(dest), COL_ACCEPT_PAD);
-            push_cross(&mut v, lift(source), 1.5, COL_ACCEPT_PAD);
-            push_cross(&mut v, lift(dest), 1.5, COL_ACCEPT_PAD);
+        let (source, dest, col) = match pad.knowledge {
+            PadKnowledge::AdvertisedUsable { source, dest } => (source, Some(dest), COL_ACCEPT_PAD),
+            PadKnowledge::AdvertisedSameZoneDeclined { footprint, advertised_dest_floor, region_at, .. } =>
+                (footprint.unwrap_or(region_at), advertised_dest_floor, COL_DECLINED_PAD),
+            _ => continue,
+        };
+        push_cross(&mut v, lift(source), 1.5, col);
+        if let Some(dest) = dest {
+            push_line(&mut v, lift(source), lift(dest), col);
+            push_cross(&mut v, lift(dest), 1.5, col);
         }
     }
 

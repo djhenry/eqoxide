@@ -33,7 +33,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 
 | Route | Description |
 |-------|-------------|
-| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation** (`nav_state`, `nav_reason`, `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier` — see [Navigation state](#navigation-state)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_wouldblock_rescued`, `send_deferred`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + camera state. |
+| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation** (`nav_state`, `nav_reason`, `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier`, `nav_declined_pads`, `position_provisional`/`crossing_pending_ms` — see [Navigation state](#navigation-state) and [`nav_declined_pads`](#nav_declined_pads--the-teleport-pads-nav-refused-offered-back-to-you-543--266)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_wouldblock_rescued`, `send_deferred`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + camera state. |
 | `GET /v1/observe/frame` | Current rendered frame as a PNG (`Content-Type: image/png`). **503 while the zone's assets are still loading** — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579); `?allow_pending=1` opts past it. |
 | `GET /v1/observe/entities[?labeled=1]` | Default: `{ "<name>": [x,y,z], ... }` for all known entities, with same-base-name + byte-identical-position duplicates collapsed (#471 — suspected server-side `spawn2` duplication; the model is untouched so each instance is still targetable by its full name). `?labeled=1` returns the richer `{count, entities:{"<name>":[x,y,z]}, deduped, duplicate_groups:[{position,names,kept}], note, poses}` exposing which duplicates were collapsed, plus **`poses`** (#643): `{"<name>": {pose, gait}}`, keyed **exactly** like `entities` — the two are projected under one lock, so indexing `poses` by any name in `entities` is safe. `pose` is the server-published body state — `standing`/`freeze`/`looting`/`sitting`/`crouching`/`lying`, or **`unknown(<raw>)`** when the server sent a code this client does not recognise (reported verbatim, never guessed at). `gait` is the signed locomotion-speed code from the entity's last position update (~12 at walk, 28 at full run, negative when backing up); **`null` means "no position update yet", NOT "standing still"**. |
 | `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency}`. Slots are Titanium **wire** ids (DB general slots 23-30 → wire 22-29). |
@@ -390,6 +390,105 @@ is not snapped: it fails as `no_path` / `goal_not_walkable`.)
   ```
   `goal` is **definitive** — the goal itself cannot be stood at (pairs with `goal_not_walkable`); if it is present, no search could ever have succeeded. `frontier` is the hazard at the search's **closest approach** to the goal (pairs with `search_closed`, the common sealed-corridor wedge where the goal is fine but you are walled off from it). `hazard` is `floor` | `wall` | `water`. **`frontier` is ONE blocking fact — not necessarily the only one, and not necessarily the one to fix.** It is computed only on a FAILED plan (never on a successful one), and only when even the character's own collision radius does not fit, so it never over-claims a wall the walker could have squeezed past. Computed by the same `Traversability` authority the planner uses, so it cannot disagree with what the planner actually refused.
 - **`nav_tier`** — which clearance tier the CURRENT route was found at: `"minimum"` (threaded a tight gap at the character's own collision radius — riskier, no margin from walls/drops), `"preferred"` (the roomy tier carried it), or `null` (no route committed). This is the **per-route** fact for the route being walked right now — distinct from the zone-lifetime `nav_tight` counter, which aggregates over the whole zone and cannot answer "is *my* route tight?".
+
+---
+
+## `nav_declined_pads` — the teleport pads nav refused, offered back to you (#543 / #266)
+
+Some zones advertise **teleport pads**: DRNTP regions you walk onto and get repositioned. When a
+pad's advertised `target_zone_id` equals the zone you are standing in, it *looks* like an intra-zone
+shortcut — and the planner used to route through it.
+
+**It cannot be trusted, and nav will not route you through one.** The advertised `zone_id` is one
+zone-point row's target, but the server resolves an organic crossing by an index-blind, nearest-XY
+match over **every** row's *trigger* coordinates — data the wire never carries. So a pad advertised
+as same-zone can resolve server-side to a **different zone**, and in North Qeynos it does exactly
+that: a `/goto` across such a pad silently landed the character in another zone entirely. **There is
+no such thing as a *verified* same-zone pad here.** A goal reachable only across one is therefore an
+honest `no_path`.
+
+But a bare `no_path` next to a perfectly real pad would be its own quiet falsehood, so
+`GET /v1/observe/debug` **discloses** what nav declined. `null` unless nav is in a terminal
+no-route state (`no_path` / `search_exhausted`) **and** it declined at least one pad:
+
+```json
+"nav_declined_pads": {
+  "reason": "advertised_same_zone_unverifiable",
+  "pads": [
+    {
+      "index": 2,
+      "footprint": [-611.2, -76.3, -14.0],
+      "footprint_count": 58,
+      "alternates": [[-606.1, -69.5, -14.0], [-729.1, -70.2, -14.0]],
+      "region_at": [-611.2, -76.3, -14.0],
+      "advertised_dest": [-153.0, -30.0, 9.0],
+      "advertised_dest_floor": [-153.0, -30.0, 6.0],
+      "advertised_same_zone": true,
+      "destination_verified": false
+    }
+  ],
+  "detail": "..."
+}
+```
+
+- **`footprint`** — the spot to **try** (`/v1/move/goto`): the standable point inside the pad's trigger
+  region nearest you, measured in this client's own collision mesh and re-picked as you move.
+  **A candidate, not a promise** — verified live that walking to one spot on a pad fired nothing while
+  another spot on the *same* pad crossed immediately, and a `goto` stops within its arrival tolerance,
+  which can leave you just outside a small trigger. `null` means no standable spot was found in the
+  region at all; walking to `region_at` may then do nothing. Either way it is a warning, not a
+  disqualification — the region is really there, and the standability probe is this client's model.
+- **`footprint_count`** / **`alternates`** — how many standable spots this pad has in total, and up to
+  7 more to try if the first fires nothing. Nearest-first, and **thinned so each is a genuinely
+  different place** (at least one nav cell apart): a pad's region is a BSP, so its nearest leaves are
+  often many names for the same spot — one observed pair was 0.0005 units apart. A DRNTP region is a BSP and one
+  pad routinely has dozens of spots (58 for the North Qeynos pad above), so you get **one offer per
+  pad**, not one per spot. **If nothing happens, work through `alternates` before concluding the pad
+  is inert.**
+- **`region_at`** — where the region itself is, present even when nothing in it is standable, so a pad
+  is never reduced to "somewhere in this zone".
+- **`advertised_dest`** — the server's **advertisement, verbatim off the wire** (wire z datum). **Not**
+  where the pad goes. `null` means the pad advertises no arrival at all (the keep-position sentinel) —
+  which does **not** make it un-takeable, you simply have no claim to compare your observation against.
+  There is deliberately no unqualified `dest` key.
+- **`advertised_dest_floor`** — where that advertisement lands on **this client's** floor model, or
+  `null` if it found no floor in that column. This is a client derivation, reported separately so it can
+  never be mistaken for the server's claim. **`null` here is not a reason to skip the pad** — it is a
+  fact about the advertisement, and the advertisement is the untrustworthy part.
+- **`destination_verified`** — always `false`, in machine-readable form. Nothing the client can observe
+  from the wire ever makes it `true`.
+
+**The client does not remember where a pad landed.** That memory is yours. If you take one, read
+`player.zone` and `player.pos` afterwards to find out where it actually went — that observation is
+the only thing that establishes a pad's real destination, and only you keep it.
+
+> ⚠️ **`player.pos` / `player.zone` are PROVISIONAL for a moment right after any crossing — and
+> `player.position_provisional` tells you exactly when.** To make the character leave the pad's trigger
+> region, the client applies the *advertised* arrival to its own position immediately, before the
+> server has said anything. The zone echo then settles **which zone** (and `zone` flips there) while
+> the position does not arrive until the new zone's first update — so in that window `zone` and `pos`
+> can genuinely disagree. Do not read them as settled until:
+>
+> ```
+> "position_provisional": false,   // true while pos/zone are the client's own guess
+> "crossing_pending_ms": null      // ms it has been unsettled (measured at read time)
+> ```
+>
+> Both are under `player` on `GET /v1/observe/debug`. `position_provisional` clears only when the
+> **server** says where you are — never on the zone echo alone. The message log says the same thing at
+> the moment of the crossing, but **do not rely on it**: it is a ring buffer and ambient chatter can
+> evict the line within seconds. The field is the observable.
+
+**A pad is offered whenever it exists in this client's loaded map.** That is the only bar, and it is
+answered from geometry the client measured — never from the advertised destination, which is the part
+it cannot trust. `advertised_unusable` means something narrower than it sounds: the server advertised
+an index this client's map has **no region for at all** (a `.wtr` data gap), so there is nothing to
+point you at. The full per-pad record (including the `unknown` and `advertised_unusable` states, which
+carry no offer) is on `GET /v1/observe/nav_debug` under `pads`, keyed by `knowledge`.
+
+**Nav declines to route through these on its own initiative; it does not stop you.** `POST
+/v1/move/zone_cross` and walking onto a footprint yourself both still work — that is the point of
+disclosing them.
 
 ---
 

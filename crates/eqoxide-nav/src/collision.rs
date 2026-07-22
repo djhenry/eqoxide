@@ -1220,6 +1220,23 @@ impl Collision {
         out
     }
 
+    /// **Every standable footprint leaf of one DRNTP index — independent of any advertised
+    /// destination (#543).** One point per leaf a character could actually stand on such that the
+    /// crossing fires; empty when the index has no standable leaf at all (a floating / #266 region).
+    ///
+    /// This is the "can the agent physically take this pad?" question, and it is deliberately
+    /// separate from [`Collision::resolve_teleport_pads`], which answers the different question "may
+    /// A* route THROUGH this pad?" and needs BOTH ends to resolve. Conflating them hides a pad the
+    /// agent could take behind a verdict about the advertised *destination* — which is precisely the
+    /// datum #543 established the client cannot trust. The disclosure path uses this; the planner
+    /// path uses `resolve_teleport_pads`.
+    pub fn teleport_pad_footprints(&self, index: i32) -> Vec<[f32; 3]> {
+        self.zone_line_regions.iter()
+            .filter(|(i, _)| *i == index)
+            .filter_map(|&(idx, p)| self.teleport_pad_source(idx, p))
+            .collect()
+    }
+
     /// The standable trigger floor point inside a DRNTP footprint leaf whose representative interior
     /// point is `p` (server coords), or `None` if no floor a character could stand on is inside the
     /// region (a floating / #266 leaf).

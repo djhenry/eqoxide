@@ -2625,6 +2625,18 @@ impl ActionLoop {
             .map(|zp| (zp.zone_id, [zp.server_x, zp.server_y, zp.server_z]))
     }
 
+    /// The agent-facing message-log line for a crossing (#543). It used to read "Using an in-zone
+    /// teleport" — a confident claim that the crossing stayed in this zone, asserted at the one
+    /// moment the client cannot know it (the server resolves same-vs-cross from trigger data the
+    /// wire never carries, and its echo has not arrived yet).
+    ///
+    /// It must NOT assert the outcome, and it must warn that the position/zone the client is
+    /// reporting are its own optimistic guess until the echo lands — because `nav_declined_pads`
+    /// tells an agent to read exactly those two fields to find out where a pad went.
+    pub(crate) const CROSSING_MSG: &str =
+        "Crossing a zone line — position is PROVISIONAL until the server confirms; re-read \
+         player.zone / player.pos before trusting them";
+
     /// Fire the crossing for a resolved zone-line destination and arm the re-fire cooldown. Splits
     /// on same-zone vs cross-zone (#368):
     ///
@@ -2636,27 +2648,49 @@ impl ActionLoop {
     ///   reconnect against a still-live zone is the wedge). Returns `true`.
     /// - **Cross-zone** — a genuine zone change: send OP_ZoneChange and let the normal world
     ///   reconnect / zone-entry handshake run. Returns `false`.
+    /// Everything a crossing does to `GameState` — extracted from `perform_cross` so it can be
+    /// TESTED (#660 review NB1). The previous revision asserted only on [`Self::CROSSING_MSG`]'s
+    /// text, so restoring the old literal AT THE CALL SITE left the whole suite green: the lie was
+    /// one line away with nothing watching. Everything here is network-free, so the call site is
+    /// now exercised directly.
+    ///
+    /// Applies the ADVERTISED arrival locally (that write is what makes the character leave the
+    /// DRNTP region so the cross does not re-fire next cooldown), and MARKS it as the guess it is:
+    /// `position_provisional_since`. Same-vs-cross is the server echo's call (#554) — the server
+    /// resolves the crossing index-blind by nearest-XY trigger and can land us in a different zone
+    /// (#543) — so nothing here may present the position, or the outcome, as settled.
+    fn apply_provisional_crossing(gs: &mut GameState, index: i32, dest_pos: [f32; 3]) {
+        // 999999 / 999 sentinel from the zone point = "keep current position" (zoning.cpp:311):
+        // the server keeps us put, so don't teleport to the sentinel — region-leave then relies
+        // on the cooldown alone (a rare case; most same-zone points carry real target coords).
+        if dest_pos.iter().all(|c| c.abs() < 900_000.0) {
+            gs.player_x = dest_pos[0];
+            gs.player_y = dest_pos[1];
+            // Zone-point target coords are wire-datum (DB safe coords, model-origin z ~3.1u
+            // above the floor) — convert to the internal foot datum (#522).
+            gs.player_z = dest_pos[2] - eqoxide_core::coord::WIRE_Z_OFFSET;
+            tracing::info!(
+                "zone_cross: index={index} → PROVISIONAL in-zone reposition to ({:.0},{:.0},{:.0}) \
+                 — the server echo decides same-vs-cross (#554/#543)",
+                dest_pos[0], dest_pos[1], dest_pos[2]);
+        } else {
+            tracing::info!("zone_cross: index={index} → PROVISIONAL same-zone (sentinel keep-position); server echo decides (#554)");
+        }
+        // THE MARKER (#660 review B2). A log line is not an observable — the reviewer watched the
+        // warning get evicted from the message ring by ambient chatter ~10s later, while
+        // `/v1/observe/debug` served `zone: "qeynos"` beside a qeynos2 `pos` with nothing saying so.
+        // The caveat belongs on the FIELD the agent reads. Cleared only when the SERVER says where
+        // we are; the zone echo alone does not clear it (it settles the zone, not the position).
+        gs.position_provisional_since = Some(std::time::Instant::now());
+        gs.log_msg("zone", Self::CROSSING_MSG);
+    }
+
     fn perform_cross(&mut self, stream: &mut EqStream, gs: &mut GameState, index: i32, dest_zone: u16, dest_pos: [f32; 3]) -> bool {
         self.send_zone_change_packet(stream, gs, dest_zone);
         self.last_zone_cross = Instant::now();
         if dest_zone == gs.world.zone_id {
             self.same_zone_cross_at = Some(Instant::now());
-            // 999999 / 999 sentinel from the zone point = "keep current position" (zoning.cpp:311):
-            // the server keeps us put, so don't teleport to the sentinel — region-leave then relies
-            // on the cooldown alone (a rare case; most same-zone points carry real target coords).
-            if dest_pos.iter().all(|c| c.abs() < 900_000.0) {
-                gs.player_x = dest_pos[0];
-                gs.player_y = dest_pos[1];
-                // Zone-point target coords are wire-datum (DB safe coords, model-origin z ~3.1u
-                // above the floor) — convert to the internal foot datum (#522).
-                gs.player_z = dest_pos[2] - eqoxide_core::coord::WIRE_Z_OFFSET;
-                tracing::info!(
-                    "zone_cross: same-zone translocator index={index} → in-zone reposition to ({:.0},{:.0},{:.0}) (no reconnect)",
-                    dest_pos[0], dest_pos[1], dest_pos[2]);
-            } else {
-                tracing::info!("zone_cross: same-zone translocator index={index} → server keeps position (sentinel)");
-            }
-            gs.log_msg("zone", "Using an in-zone teleport");
+            Self::apply_provisional_crossing(gs, index, dest_pos);
             // STOP the walker (#508). The crossing we were asked to make already happened: the
             // translocator repositioned us in-zone. But the walker's `goto_target` still points at
             // the pre-cross goal (the zone-line coords `drain_zone_cross` walked us to, or a `/goto`
@@ -2907,6 +2941,77 @@ mod fine_tier_tests {
 
 #[cfg(test)]
 mod tests {
+    /// **#543 / #660 review B2 + NB1 — the workflow must not end in a lie, and the CALL SITE is
+    /// what has to be honest.**
+    ///
+    /// `nav_declined_pads` offers the agent a pad it cannot verify and tells it to take the pad and
+    /// then read `player.zone`/`player.pos` to learn where it went. Taking it writes the ADVERTISED
+    /// arrival into those very fields before the server has said anything, and it used to announce
+    /// "Using an in-zone teleport" — asserting the same-zone outcome at the exact moment it is
+    /// unknowable. A disclosure that routes the agent into that is not finished.
+    ///
+    /// **NB1**: the previous revision asserted only on the CONSTANT's text, so restoring the old
+    /// literal at the call site left the whole suite green — the lie was one line away with nothing
+    /// watching. This drives `apply_provisional_crossing`, which IS the call site.
+    ///
+    /// The position write itself stays (it is what makes the character leave the trigger region and
+    /// not re-fire), so the honest fix is that nothing may PRESENT it as settled: the marker goes on
+    /// the state the agent reads, and the message must not claim an outcome.
+    #[test]
+    fn a_crossing_marks_its_position_provisional_and_never_claims_it_stayed_in_zone_543() {
+        let mut gs = GameState::new();
+        gs.player_x = -615.0; gs.player_y = -83.0; gs.player_z = -14.0;
+        assert!(gs.position_provisional_since.is_none(), "precondition: not provisional yet");
+
+        ActionLoop::apply_provisional_crossing(&mut gs, 2, [-153.0, -30.0, 9.0]);
+
+        // 1. The advertised arrival IS applied (it is what makes us leave the trigger region)…
+        assert_eq!(gs.player_x, -153.0);
+        // 2. …and is MARKED as the client's own guess, on the state `/v1/observe/debug` publishes.
+        //    A log line is not an observable: the reviewer watched the warning get evicted from the
+        //    message ring by ambient chatter while `zone`/`pos` stayed inconsistent and unmarked.
+        assert!(gs.position_provisional_since.is_some(),
+            "#660 B2: the position the agent is sent to read is a GUESS — mark it on the field");
+
+        // 3. The agent-facing message must not assert the outcome.
+        let m = ActionLoop::CROSSING_MSG;
+        assert!(m.contains("PROVISIONAL"), "say the fields are not settled yet: {m}");
+        assert!(m.contains("re-read"), "…and what to do about it, or 'provisional' is just a mood: {m}");
+        for claim in ["in-zone", "in zone", "same-zone", "same zone", "no reconnect"] {
+            assert!(!m.to_lowercase().contains(claim),
+                "the client cannot know the crossing stayed in this zone at the moment it fires, so \
+                 this line must not claim {claim:?}: {m}");
+        }
+        // …and the call site must actually USE it. (NB1: asserting only on the constant let the old
+        // literal come back here unnoticed.)
+        assert!(gs.messages.iter().any(|x| x.text == m),
+            "the honest line must be the one actually logged by the crossing, not just a constant \
+             sitting unused next to it: {:?}", gs.messages.iter().map(|x| &x.text).collect::<Vec<_>>());
+    }
+
+    /// The marker must CLEAR — a stuck `position_provisional: true` would be its own falsehood, and
+    /// an agent that never sees it clear can never conclude anything. Only the SERVER clears it.
+    /// Pins that the zone echo alone does NOT: that settles which zone, not where in it, and the gap
+    /// between the two is exactly the observed `zone: "qeynos"` + qeynos2 `pos` (#660 review B2).
+    #[test]
+    fn only_a_server_position_clears_the_provisional_marker_543() {
+        let mut gs = GameState::new();
+        ActionLoop::apply_provisional_crossing(&mut gs, 2, [-153.0, -30.0, 9.0]);
+        assert!(gs.position_provisional_since.is_some());
+
+        // The zone echo lands and the zone flips — the position is still our guess.
+        gs.world.zone_id = 1;
+        gs.world.zone_name = "qeynos".into();
+        assert!(gs.position_provisional_since.is_some(),
+            "the echo settles the ZONE, not the position — this is the window that served a qeynos2 \
+             pos labelled `zone: qeynos`, and it must stay marked through it");
+
+        // The server finally says where we are. (Same statement the position handlers run.)
+        gs.player_pos_known = true;
+        gs.position_provisional_since = None;
+        assert!(gs.position_provisional_since.is_none(), "…and then, and only then, it clears");
+    }
+
     use super::*;
     use crate::packet_handler::apply_packet;
     use crate::transport::AppPacket;
