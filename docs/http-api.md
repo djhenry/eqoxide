@@ -33,7 +33,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 
 | Route | Description |
 |-------|-------------|
-| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation** (`nav_state`, `nav_reason`, `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier` — see [Navigation state](#navigation-state)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_wouldblock_rescued`, `send_deferred`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + camera state. |
+| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation** (`nav_state`, `nav_reason`, `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier`, `nav_declined_pads`, `position_provisional`/`crossing_pending_ms` — see [Navigation state](#navigation-state) and [`nav_declined_pads`](#nav_declined_pads--the-teleport-pads-nav-refused-offered-back-to-you-543--266)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_wouldblock_rescued`, `send_deferred`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`net_thread_dead`** (`null` while the network thread is alive; a reason string once it has died and the whole payload is a frozen final snapshot — see [net_thread_dead](#net_thread_dead--the-frozen-worlds-terminality-634)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + camera state. |
 | `GET /v1/observe/frame` | Current rendered frame as a PNG (`Content-Type: image/png`). **503 while the zone's assets are still loading** — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579); `?allow_pending=1` opts past it. |
 | `GET /v1/observe/entities[?labeled=1]` | Default: `{ "<name>": [x,y,z], ... }` for all known entities, with same-base-name + byte-identical-position duplicates collapsed (#471 — suspected server-side `spawn2` duplication; the model is untouched so each instance is still targetable by its full name). `?labeled=1` returns the richer `{count, entities:{"<name>":[x,y,z]}, deduped, duplicate_groups:[{position,names,kept}], note, poses}` exposing which duplicates were collapsed, plus **`poses`** (#643): `{"<name>": {pose, gait}}`, keyed **exactly** like `entities` — the two are projected under one lock, so indexing `poses` by any name in `entities` is safe. `pose` is the server-published body state — `standing`/`freeze`/`looting`/`sitting`/`crouching`/`lying`, or **`unknown(<raw>)`** when the server sent a code this client does not recognise (reported verbatim, never guessed at). `gait` is the signed locomotion-speed code from the entity's last position update (~12 at walk, 28 at full run, negative when backing up); **`null` means "no position update yet", NOT "standing still"**. |
 | `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency}`. Slots are Titanium **wire** ids (DB general slots 23-30 → wire 22-29). |
@@ -390,6 +390,56 @@ is not snapped: it fails as `no_path` / `goal_not_walkable`.)
   ```
   `goal` is **definitive** — the goal itself cannot be stood at (pairs with `goal_not_walkable`); if it is present, no search could ever have succeeded. `frontier` is the hazard at the search's **closest approach** to the goal (pairs with `search_closed`, the common sealed-corridor wedge where the goal is fine but you are walled off from it). `hazard` is `floor` | `wall` | `water`. **`frontier` is ONE blocking fact — not necessarily the only one, and not necessarily the one to fix.** It is computed only on a FAILED plan (never on a successful one), and only when even the character's own collision radius does not fit, so it never over-claims a wall the walker could have squeezed past. Computed by the same `Traversability` authority the planner uses, so it cannot disagree with what the planner actually refused.
 - **`nav_tier`** — which clearance tier the CURRENT route was found at: `"minimum"` (threaded a tight gap at the character's own collision radius — riskier, no margin from walls/drops), `"preferred"` (the roomy tier carried it), or `null` (no route committed). This is the **per-route** fact for the route being walked right now — distinct from the zone-lifetime `nav_tight` counter, which aggregates over the whole zone and cannot answer "is *my* route tight?".
+
+---
+
+## `nav_declined_pads` — the teleport pads nav refused, offered back to you (#543 / #266)
+
+Some zones advertise **teleport pads**: DRNTP regions you walk onto and get repositioned. When a
+pad's advertised `target_zone_id` equals the zone you are standing in, it *looks* like an intra-zone
+shortcut — and the planner used to route through it.
+
+**It cannot be trusted, and nav will not route you through one.** The advertised `zone_id` is one
+zone-point row's target, but the server resolves an organic crossing by an index-blind, nearest-XY
+match over **every** row's *trigger* coordinates — data the wire never carries. So a pad advertised
+as same-zone can resolve server-side to a **different zone**, and in North Qeynos it does exactly
+that: a `/goto` across such a pad silently landed the character in another zone entirely. **There is
+no such thing as a *verified* same-zone pad here.** A goal reachable only across one is therefore an
+honest `no_path`.
+
+But a bare `no_path` next to a perfectly real pad would be its own quiet falsehood, so
+`GET /v1/observe/debug` **discloses** what nav declined. `null` unless nav is in a terminal
+no-route state (`no_path` / `search_exhausted`) **and** it declined at least one pad:
+
+```json
+"nav_declined_pads": {
+  "reason": "advertised_same_zone_unverifiable",
+  "pads": [
+    {
+      "index": 2,
+      "footprint": [-615.0, -83.0, -14.0],
+      "advertised_dest": [-153.0, -30.0, 9.0],
+      "advertised_same_zone": true,
+      "destination_verified": false
+    }
+  ],
+  "detail": "..."
+}
+```
+
+- **`footprint`** — measured geometry from this client's own collision mesh: walk here (`/v1/move/goto`)
+  to take the pad. This part is verified.
+- **`advertised_dest`** — the server's **advertisement**, snapped to floor. **Not** where the pad goes.
+  There is deliberately no unqualified `dest` key.
+- **`destination_verified`** — always `false`, in machine-readable form. Nothing the client can observe
+  from the wire ever makes it `true`.
+
+**The client does not remember where a pad landed.** That memory is yours. If you take one, read
+`player.zone` and `player.pos` afterwards to find out where it actually went — that observation is
+the only thing that establishes a pad's real destination, and only you keep it.
+
+The full per-pad record (including pads in the `unknown` and `advertised_unusable` states, which
+carry no offer) is on `GET /v1/observe/nav_debug` under `pads`, keyed by `knowledge`.
 
 ---
 

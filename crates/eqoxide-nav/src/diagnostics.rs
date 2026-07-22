@@ -257,6 +257,9 @@ pub struct PlanDebug {
 /// wire-advertised destination is labelled as exactly that — advertised, NOT verified (#543: a
 /// same-zone pad's true resolution cannot be verified from the wire; the owner-decided learning
 /// loop will upgrade entries to the `Learned*` variants when it lands).
+///
+/// **There is deliberately no "verified same-zone" state.** Nothing the client can observe from
+/// the wire promotes an advertisement into a verified destination, so no variant may claim one.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "knowledge", rename_all = "snake_case")]
 pub enum PadKnowledge {
@@ -267,10 +270,29 @@ pub enum PadKnowledge {
     /// (`resolve_teleport_pads`: footprint + destination on walkable floor) — so A* may route
     /// through it. Advertised is not verified: no observation confirms the pad actually lands
     /// there (#543).
+    ///
+    /// **Unreachable while [`crate::walker::TRUST_ADVERTISED_SAME_ZONE_CROSSINGS`] is `false`** —
+    /// which is the current, owner-decided policy. Kept because the variant states what "the
+    /// planner is allowed to route through this" would mean; today every such pad is
+    /// [`PadKnowledge::AdvertisedSameZoneDeclined`] instead.
     AdvertisedUsable { source: [f32; 3], dest: [f32; 3] },
     /// The server advertised a same-zone destination but the honesty gate REFUSED it (footprint or
     /// destination not on walkable floor) — the planner fabricates no edge for it.
+    ///
+    /// This is a GEOMETRY verdict ("the client cannot stand on the footprint / there is no floor at
+    /// the advertised arrival"), NOT the #543 policy decline — do not read one as the other.
     AdvertisedUnusable,
+    /// **The #543 disclosure state.** The pad is REAL and physically usable — its footprint is at
+    /// `footprint` and the server ADVERTISED `advertised_dest` as a destination inside this same
+    /// zone — but the client DECLINED to auto-route the walker through it, because whether entering
+    /// it keeps you in-zone is **unverifiable from the wire** (see
+    /// [`crate::walker::TRUST_ADVERTISED_SAME_ZONE_CROSSINGS`] for the mechanism).
+    ///
+    /// The honest reading, and the only one an agent may take: *a pad exists here; the server said
+    /// it leads to `advertised_dest` in this zone; the client does not know whether that is true,
+    /// and does not remember where this pad landed last time.* Taking it is the agent's call, and
+    /// only the agent's own observation after arriving establishes where it actually goes.
+    AdvertisedSameZoneDeclined { footprint: [f32; 3], advertised_dest: [f32; 3] },
     /// Reserved for the #543 learning loop: one or more server-driven resolutions were OBSERVED to
     /// stay in this zone, landing at `dest`.
     ///

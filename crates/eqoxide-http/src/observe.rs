@@ -337,6 +337,57 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
                        and not necessarily the one to fix.",
         })
     });
+    // THE #543 DISCLOSURE. Nav found no verifiable route AND it declined one or more teleport pads
+    // that are physically right here (see `walker::TRUST_ADVERTISED_SAME_ZONE_CROSSINGS`). Reporting
+    // only the `no_path` would be its own quiet falsehood — "there is nothing here" — when what the
+    // client actually knows is "there is something here and I cannot vouch for it". So the declined
+    // pads ride out with the failure, on the SAME response the driver already polls for
+    // `nav_state`/`nav_reason`: an agent must not have to know to ask a second endpoint for a fact
+    // the client withheld from the first (the full per-pad record is also on /v1/observe/nav_debug).
+    //
+    // The wording is load-bearing. Every destination here is ADVERTISED, never verified — the client
+    // has no way to confirm one and does NOT remember where any pad landed before, so nothing in this
+    // payload may read as knowledge of where a pad goes. Taking one is the AGENT's decision.
+    //
+    // Not folded into `nav_reason`: that is a single machine token with an established vocabulary
+    // drivers already branch on (#337), and the reason for the failure is genuinely unchanged — the
+    // route really is unreachable by walking. This is an additional fact ALONGSIDE it.
+    let nav_terminal_no_route = matches!(nav.state.as_str(), "no_path" | "search_exhausted");
+    let nav_declined_pads = nav_terminal_no_route.then(|| {
+        let snap = s.nav_debug_view.lock().unwrap().clone();
+        let pads: Vec<serde_json::Value> = snap.iter().flat_map(|snap| snap.pads.iter()).filter_map(|p| {
+            match p.knowledge {
+                eqoxide_nav::diagnostics::PadKnowledge::AdvertisedSameZoneDeclined {
+                    footprint, advertised_dest,
+                } => Some(serde_json::json!({
+                    "index": p.index,
+                    // Walk HERE to take the pad. This part IS verified — it is geometry the client
+                    // measured in its own collision mesh, not something the server claimed.
+                    "footprint": footprint,
+                    // What the server ADVERTISED. NOT where the pad goes; the client cannot know that.
+                    "advertised_dest": advertised_dest,
+                    "advertised_same_zone": true,
+                    "destination_verified": false,
+                })),
+                _ => None,
+            }
+        }).collect();
+        (!pads.is_empty()).then(|| serde_json::json!({
+            "reason": "advertised_same_zone_unverifiable",
+            "pads": pads,
+            "detail": "nav found no verifiable route, but these teleport pads are within this zone's \
+                       loaded geometry and nav DECLINED to route you through them. The server \
+                       ADVERTISED each as leading somewhere inside THIS zone; the client cannot \
+                       verify that, because the server resolves a crossing from trigger data the \
+                       wire never carries — so a pad advertised as same-zone may in fact be a real \
+                       cross-zone line, and walking onto it can land you in another zone. There is \
+                       no such thing as a VERIFIED same-zone pad here, and this client does not \
+                       remember where any pad landed before. `footprint` is measured geometry: walk \
+                       there to take the pad. `advertised_dest` is the server's ADVERTISEMENT, not a \
+                       known destination. Taking one is YOUR decision — after arriving, read \
+                       `player.zone` and `player.pos` to find out where it actually went.",
+        }))
+    }).flatten();
     // The PER-ROUTE clearance tier the CURRENT route was found at (#378 Phase 2 / design §4c).
     // `minimum` = threaded a tight gap at the character's own collision radius (riskier — no margin);
     // `preferred` = the roomy tier carried it. Distinct from the zone-lifetime `nav_tight` counter:
@@ -558,6 +609,12 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         "nav_goal_id": nav.goal_id,
         "nav_goal": nav.goal,
         "nav_blocked_by": nav_blocked_by,
+        // #543 — the pads nav DECLINED to route through, disclosed alongside the failure that made
+        // them relevant. `null` unless nav is in a terminal no-route state AND there is at least one
+        // such pad. Every destination in it is ADVERTISED, never verified, and the client keeps no
+        // memory of where a pad landed: this is an OPTION offered to the agent, not a route. See the
+        // comment where it is built for why it is not folded into `nav_reason`.
+        "nav_declined_pads": nav_declined_pads,
         // #336: the last consider of ANY spawn (target or not) — `{spawn_id, name, con_name
         // (difficulty tier), attitude, level, ago_secs}`, or null if nothing has been considered
         // this session. Top-level (not under `player`, which is already at serde_json's macro
@@ -1185,6 +1242,107 @@ mod tests {
         *state.shared_collision.write().unwrap() = ready.collision().cloned();
         let v = nav_debug_json(state).await;
         assert_verbatim(&v);
+    }
+
+    /// Publish a nav snapshot whose `pads` are exactly `pads`, and set the walker's nav state.
+    fn publish_pads(state: &HttpState, nav_state: &str, pads: Vec<eqoxide_nav::diagnostics::PadDebug>) {
+        {
+            let mut s = state.nav.nav_state.lock().unwrap();
+            s.state = nav_state.into();
+            s.reason = Some("search_closed".into());
+        }
+        *state.nav_debug_view.lock().unwrap() = Some(std::sync::Arc::new(
+            eqoxide_nav::diagnostics::NavDebugSnapshot {
+                seq: 1,
+                zone_model_loaded: true,
+                nav_state: nav_state.into(),
+                nav_reason: Some("search_closed".into()),
+                player: Some([-677.0, -187.0, -14.0]),
+                published_at: std::time::Instant::now(),
+                goal: Some([-74.0, 428.0, 0.0]),
+                committed_coarse: vec![],
+                committed_fine: vec![],
+                plan: None,
+                pads,
+                clearance: None,
+                water: None,
+            }));
+    }
+
+    /// **#543 — the disclosure, on the REAL response body an agent polls.**
+    ///
+    /// Nav will not auto-route through an advertised same-zone teleport pad, because it cannot
+    /// verify one (the server picks a crossing's destination from trigger data the wire never
+    /// carries). That refusal is correct. But answering a bare `no_path` while a usable pad sits
+    /// right there is the same agent-honesty failure in a new place — the client would be implying
+    /// "there is nothing here" when what it knows is "there is something here I cannot vouch for".
+    ///
+    /// So `/v1/observe/debug` — the SAME response the driver already polls for `nav_state` — must
+    /// carry the declined pads, and must frame them as ADVERTISED, never verified. This pins both
+    /// the presence and the framing; getting the wording wrong recreates the original bug.
+    ///
+    /// The fixture moves BOTH ways: the identical pad list under a non-terminal nav state, and a
+    /// terminal state with no declined pad, must both report `null` — so the assertion cannot be
+    /// satisfied by a field that is simply always populated.
+    #[tokio::test]
+    async fn debug_discloses_the_pads_nav_declined_to_route_through_543() {
+        use eqoxide_nav::diagnostics::{PadDebug, PadKnowledge};
+        let state = empty_state();
+        let declined = || vec![PadDebug {
+            index: 2,
+            knowledge: PadKnowledge::AdvertisedSameZoneDeclined {
+                footprint: [-615.0, -83.0, -14.0], advertised_dest: [-153.0, -30.0, 9.0],
+            },
+        }];
+
+        // ── OFF: nav is walking fine. There is no failure to disclose against. ──
+        publish_pads(&state, "navigating", declined());
+        assert!(debug_json(state.clone()).await["nav_declined_pads"].is_null(),
+            "the disclosure belongs to a nav FAILURE — it must not ride along on a healthy route");
+
+        // ── OFF: nav failed, but nothing was declined (the ordinary unreachable goal). ──
+        publish_pads(&state, "no_path", vec![PadDebug { index: 9, knowledge: PadKnowledge::Unknown }]);
+        let v = debug_json(state.clone()).await;
+        assert!(v["nav_declined_pads"].is_null(),
+            "a pad nav never declined must not be dressed up as an offer — got {v:#}");
+
+        // ── ON: nav failed AND declined a real pad. This is the #543 case. ──
+        publish_pads(&state, "no_path", declined());
+        let v = debug_json(state.clone()).await;
+        let d = &v["nav_declined_pads"];
+        assert!(!d.is_null(),
+            "#543: a no_path with a declined pad right there must DISCLOSE it, not withhold it");
+        assert_eq!(d["reason"], "advertised_same_zone_unverifiable");
+        assert_eq!(v["player"]["nav_state"], "no_path",
+            "the disclosure is ADDITIONAL — the honest no_path itself must be unchanged");
+
+        let pad = &d["pads"][0];
+        assert_eq!(pad["index"], 2);
+        assert_eq!(pad["footprint"], serde_json::json!([-615.0, -83.0, -14.0]),
+            "the agent needs the measured footprint to be able to walk onto the pad at all");
+        assert_eq!(pad["advertised_dest"], serde_json::json!([-153.0, -30.0, 9.0]));
+
+        // THE FRAMING. An agent must be able to tell "advertised same-zone" from "verified
+        // same-zone" — and the latter does not exist. A field named `dest`, or a
+        // `destination_verified: true`, would be the original lie wearing a new label.
+        assert_eq!(pad["advertised_same_zone"], true);
+        assert_eq!(pad["destination_verified"], false,
+            "the client cannot verify where a pad lands and must say so in machine-readable form");
+        assert!(pad.get("dest").is_none(),
+            "no unqualified `dest`: every destination here is an ADVERTISEMENT, and the key must say so");
+        let detail = d["detail"].as_str().unwrap();
+        assert!(detail.contains("ADVERTISED") && detail.contains("cannot verify"),
+            "the prose must state that the destination is advertised and unverifiable: {detail}");
+        assert!(detail.contains("does not remember"),
+            "the client keeps NO memory of where a pad landed (owner decision) — say so, so the \
+             agent knows the remembering is its job: {detail}");
+        assert!(detail.contains("YOUR decision"),
+            "the pad is offered as an OPTION for the agent to weigh, not a route nav is taking");
+
+        // The full per-pad record is also on /nav_debug, verbatim — one published source, two views.
+        let n = nav_debug_json(state).await;
+        assert_eq!(n["pads"][0]["knowledge"], "advertised_same_zone_declined");
+        assert_eq!(n["pads"][0]["advertised_dest"], serde_json::json!([-153.0, -30.0, 9.0]));
     }
 
     /// #343 regression — THE lie. The connection is dead: no packet has arrived for a minute, and
