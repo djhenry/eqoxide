@@ -636,28 +636,56 @@ pub type NavAvoidShared = Arc<Mutex<AggroAvoidOpts>>;
 ///   features are absent there) but *does* compile under `cargo test --workspace`, where Cargo
 ///   unifies the workspace's dev-dependency features. CI runs `cargo build --release --locked`
 ///   BEFORE the test job, so it is still caught — but it is caught at build time, not by a test.
+///   **That containment rests on CI's shape, and nothing durable pins it:** the build and test steps
+///   are steps of the SAME job, steps run sequentially, and a failing step fails the job — so today
+///   the release build genuinely gates the tests. Split them into separate jobs, reorder them, or
+///   add `continue-on-error`, and this hatch silently reopens with no test noticing. If you touch
+///   `.github/workflows/test.yml`, keep `cargo build --release` ahead of `cargo test` in one job.
 ///
 /// That residual is deliberate and bounded: closing it entirely would mean giving up in-crate test
 /// fixtures that seed partial rosters on purpose. It is recorded here so nobody has to rediscover
 /// it, and so "a third publisher cannot compile" is read with its one qualification attached.
-#[derive(Debug, Clone, PartialEq)]
+/// `Debug`/`PartialEq` only. **Every other derive or impl on this type is deliberately absent** —
+/// see "The sealed surface" in the doc comment above.
+#[derive(Debug, PartialEq)]
 pub struct Roster<V>(HashMap<String, V>);
-
-// Hand-written so an empty roster needs no `V: Default` — `#[derive(Default)]` would add that bound
-// and `EntityPoseView` has no meaningful default (there is no such thing as a default body pose).
-impl<V> Default for Roster<V> {
-    fn default() -> Self { Roster(HashMap::new()) }
-}
 
 impl<V> std::ops::Deref for Roster<V> {
     type Target = HashMap<String, V>;
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 
-// NOTE: `DerefMut` is deliberately NOT implemented. See the type's doc comment — that omission is
-// the entire enforcement mechanism, not an oversight.
+// ── The seal ─────────────────────────────────────────────────────────────────────────────────
+// NOT implemented, each one deliberately, each one a way to write a roster from outside this crate:
+//
+//   DerefMut     — would re-expose every `HashMap` mutator (`insert`, `remove`, `clear`, `entry`,
+//                  `get_mut`, …) through the `MutexGuard`.
+//   Default      — `*guard = Roster::default()` wipes a map. Replaced by `pub(crate) fn new()`.
+//   FromIterator — `*guard = pairs.into_iter().collect()` REPLACES the whole map. This is the one
+//                  that defeated the first version of this seal: it blocked per-entry mutation but
+//                  left whole-value assignment open, and a complete third publisher written that
+//                  way compiled clean in release. (The `DerefMut` in play there is `MutexGuard`'s,
+//                  not `Roster`'s, so the missing impl below was simply routed around.)
+//   Clone        — `*guard = kept_earlier.clone()` restores a stale roster into one map and not the
+//                  others. Found while enumerating this list rather than by a failing build; with
+//                  `Clone` gone, `.clone()` on a `Roster` resolves through `Deref` to
+//                  `HashMap::clone`, which yields a `HashMap` that cannot be assigned back.
+//   serde        — no `Deserialize`, so no deserialize-into-place either.
+//
+// With no public constructor and no public mutator there is no expression of type `Roster<V>` an
+// outside crate can name, so `*guard = …` has nothing to assign and `mem::take`/`mem::replace`
+// have nothing to supply. That is the argument for completeness: the surface is CONSTRUCTORS, which
+// is finite and enumerable, rather than call-site shapes, which are not. Two earlier attempts here
+// guessed at shapes (`let mut` in a scanner; then per-entry mutation) and each survived only the
+// shapes someone thought to try.
+// ─────────────────────────────────────────────────────────────────────────────────────────────
 
 impl<V> Roster<V> {
+    /// The only constructor. `pub(crate)` — hand-written rather than `Default` so it does not
+    /// appear in this type's public API, and so it needs no `V: Default` bound (`EntityPoseView`
+    /// has no meaningful default; there is no such thing as a default body pose).
+    pub(crate) fn new() -> Self { Roster(HashMap::new()) }
+
     /// Drop every entry. `pub(crate)` — only the single publisher may write a roster.
     pub(crate) fn clear(&mut self) { self.0.clear(); }
     /// Insert one entry. `pub(crate)` — only the single publisher may write a roster.
@@ -668,12 +696,6 @@ impl<V> Roster<V> {
     /// roster. Never available in a release build; see the type's doc comment.
     #[cfg(any(test, feature = "test-fixtures"))]
     pub fn insert_for_test(&mut self, k: String, v: V) -> Option<V> { self.0.insert(k, v) }
-}
-
-impl<V> FromIterator<(String, V)> for Roster<V> {
-    fn from_iter<I: IntoIterator<Item = (String, V)>>(iter: I) -> Self {
-        Roster(iter.into_iter().collect())
-    }
 }
 
 /// Live entity name → (x, y, z) map, published by `WorldSlots::publish_entities`.
@@ -1331,7 +1353,7 @@ pub struct NavSlots {
 /// plus the zone's exit points. Read by nearly every domain to resolve a name/target to a spawn
 /// id (merchant buy/sell, combat target, trainer open, `/goto` by name, …) — it is genuinely a
 /// shared world index, not particular to navigation, even though nav is its biggest reader.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct WorldSlots {
     pub entity_positions: EntityPositions,
     pub entity_ids:       EntityIds,
@@ -1339,6 +1361,21 @@ pub struct WorldSlots {
     /// `sync_entities` full-replace so it can never go stale independently of the roster.
     pub entity_poses:     EntityPoses,
     pub zone_points:      ZonePoints,
+}
+
+// Hand-written rather than `#[derive(Default)]`: `Roster` deliberately has NO public constructor
+// (#643 — see its doc comment), so only this crate can build the empty maps. A derive would have
+// required `Roster: Default`, which is exactly the public value-producer that let an outside crate
+// assign a whole roster through the guard and bypass the single-publisher rule.
+impl Default for WorldSlots {
+    fn default() -> Self {
+        WorldSlots {
+            entity_positions: Arc::new(Mutex::new(Roster::new())),
+            entity_ids:       Arc::new(Mutex::new(Roster::new())),
+            entity_poses:     Arc::new(Mutex::new(Roster::new())),
+            zone_points:      Arc::new(Mutex::new(Vec::new())),
+        }
+    }
 }
 
 impl WorldSlots {

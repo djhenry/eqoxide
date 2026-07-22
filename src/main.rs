@@ -7,7 +7,6 @@
 //! thread drains them. `--testzone` runs the renderer offline (no server) for asset/zone debugging.
 
 use eqoxide::{camera_state, config, eqstr, http, ipc};
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use winit::event_loop::EventLoop;
@@ -233,14 +232,10 @@ fn main() {
         nav_avoid:     Arc::new(Mutex::new(ipc::AggroAvoidOpts::default())),
         nav_state:     Arc::new(Mutex::new(ipc::NavStatus::default())),
     };
-    let world = ipc::WorldSlots {
-        // `Roster::default()` — the roster maps are a write-restricted newtype (#643); only
-        // `WorldSlots::publish_entities` can fill them.
-        entity_positions: Arc::new(Mutex::new(Default::default())),
-        entity_ids:       Arc::new(Mutex::new(Default::default())),
-        entity_poses:     Arc::new(Mutex::new(Default::default())),
-        zone_points:      Arc::new(Mutex::new(Vec::new())),
-    };
+    // #643: built via `Default` rather than field-by-field, because `Roster` has no public
+    // constructor — only `eqoxide-ipc` can produce the empty roster maps, which is what makes
+    // `WorldSlots::publish_entities` the sole writer. All four fields are empty here either way.
+    let world = ipc::WorldSlots::default();
     let quest = ipc::QuestSlots {
         task_log:               Arc::new(Mutex::new(Vec::new())),
         task_offers_shared:     Arc::new(Mutex::new(Vec::new())),
