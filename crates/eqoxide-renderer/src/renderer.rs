@@ -802,7 +802,7 @@ impl EqRenderer {
         if key.is_empty() || self.weapon_cache.contains_key(&key) { return; }
         // Clone the mesh list so we can release the borrow on self.weapon_lib before
         // mutably borrowing self.device / self.queue / self.weapon_cache below.
-        let weapon_meshes = match self.weapon_lib.get(&key) {
+        let weapon_meshes = match weapon_lib_lookup(&self.weapon_lib, &key) {
             Some(m) => m.clone(),
             None => { self.weapon_cache.insert(key, None); return; }
         };
@@ -1260,6 +1260,33 @@ impl EqRenderer {
     }
 }
 
+/// Look up `key` (an uppercased weapon IDFile, e.g. `"IT10728"`) in the pre-loaded weapon mesh
+/// library. On a miss this is a **content-coverage failure, not "not holding anything"**: the
+/// character IS equipped with the item, but no baked mesh exists for it, so the hand will render
+/// empty with nothing in the log to say why (agent-honesty #618 — a live demo lost the off-hand
+/// Rusty Battle Axe `IT10728` this way with zero trace). An agent asking "am I wielding my
+/// weapon?" has no other channel to catch a confidently-wrong "yes", so the miss must be loud.
+///
+/// A free function (no `&self`/GPU) so this path is unit-testable without a wgpu device — see
+/// `weapon_lib_miss_is_logged_not_silent` below. `ensure_weapon`'s caller negative-caches the key
+/// in `weapon_cache` before ever reaching this function again for the same key, so the WARN fires
+/// once per distinct missing key, not once per frame.
+fn weapon_lib_lookup<'a>(
+    weapon_lib: &'a std::collections::HashMap<String, Vec<eqoxide_assets::MeshData>>,
+    key: &str,
+) -> Option<&'a Vec<eqoxide_assets::MeshData>> {
+    match weapon_lib.get(key) {
+        Some(m) => Some(m),
+        None => {
+            tracing::warn!(
+                "weapon: no baked mesh for '{key}' — equipped item will render empty-handed \
+                 (agent-honesty #618)"
+            );
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1303,5 +1330,79 @@ mod tests {
         let billboard_s = crate::billboard::npc_size(1);
         assert_ne!(archetype_s, billboard_s,
             "archetype_scale and npc_size(1) must differ so the change is observable");
+    }
+
+    /// #618 agent-honesty: a weapon-library miss (an equipped item with no baked mesh) must be
+    /// logged, not silently negative-cached. This captures tracing output the same way
+    /// eqoxide-net's `zone_spawns_parse_failure_is_logged_not_silent` (#407) does, and calls the
+    /// pure `weapon_lib_lookup` helper directly — no wgpu device required. (Mutation: delete the
+    /// `tracing::warn!` call in `weapon_lib_lookup`, leaving the `None` return — this test goes
+    /// RED because nothing is captured.)
+    #[test]
+    fn weapon_lib_miss_is_logged_not_silent() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct BufWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for BufWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
+            type Writer = BufWriter;
+            fn make_writer(&'a self) -> Self::Writer { self.clone() }
+        }
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(BufWriter(log.clone()))
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        // Empty library: any key is a guaranteed miss — mirrors the live IT10728 case (a real
+        // weapons.glb with 472 baked meshes that still doesn't have this one).
+        let weapon_lib: std::collections::HashMap<String, Vec<eqoxide_assets::MeshData>> =
+            std::collections::HashMap::new();
+
+        let result = tracing::subscriber::with_default(subscriber, || {
+            weapon_lib_lookup(&weapon_lib, "IT10728")
+        });
+
+        assert!(result.is_none(), "an absent key must return None (unchanged miss behavior)");
+
+        let logged = String::from_utf8(log.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("IT10728"),
+            "the missing key must be named in the log, or a driving agent can't diagnose which \
+             item failed. Captured: {logged:?}");
+        assert!(logged.to_lowercase().contains("empty-handed") || logged.contains("#618"),
+            "the WARN must explain the consequence (an equipped item rendering empty-handed), not \
+             just print the key. Captured: {logged:?}");
+    }
+
+    /// Companion to the miss test: a library HIT must still return the mesh list (i.e. the fix
+    /// only added logging to the miss branch, it did not change hit behavior).
+    #[test]
+    fn weapon_lib_hit_returns_meshes_unchanged() {
+        let mesh = eqoxide_assets::MeshData {
+            positions: vec![[0.0, 0.0, 0.0]],
+            normals: vec![[0.0, 0.0, 1.0]],
+            uvs: vec![[0.0, 0.0]],
+            indices: vec![0],
+            texture_name: None,
+            base_color: [1.0; 4],
+            center: [0.0; 3],
+            render_mode: eqoxide_assets::RenderMode::Opaque,
+            anim: None,
+        };
+        let mut weapon_lib: std::collections::HashMap<String, Vec<eqoxide_assets::MeshData>> =
+            std::collections::HashMap::new();
+        weapon_lib.insert("IT10649".to_string(), vec![mesh]);
+
+        let result = weapon_lib_lookup(&weapon_lib, "IT10649");
+        assert!(result.is_some(), "a present key must still resolve to its mesh list");
+        assert_eq!(result.unwrap().len(), 1);
     }
 }

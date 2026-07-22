@@ -30,3 +30,6 @@ tracing = "0.1"                                               # info!/warn! in s
 # tests/fog_shader.rs validates the zone shaders' WGSL without a GPU. Pinned to the exact version
 # wgpu 22 pulls in transitively (see Cargo.lock) so it doesn't add a second naga to the graph.
 naga = { version = "=22.1.0", features = ["wgsl-in"] }
+# #618: `tracing_subscriber::fmt()` capture subscriber to assert the weapon-miss WARN is emitted
+# (not silently swallowed) — same pattern as eqoxide-net's zone_spawns_parse_failure_is_logged_not_silent.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

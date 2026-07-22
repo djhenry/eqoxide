@@ -1006,6 +1006,7 @@ dependencies = [
  "naga",
  "serde_json",
  "tracing",
+ "tracing-subscriber",
  "wgpu",
 ]
 
