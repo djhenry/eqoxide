@@ -610,18 +610,36 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         // indistinguishable from one the server received — an agent issuing a command had no way,
         // even in principle, to learn that it had not gone out.
         //   send_failures            — datagrams BUILT but not put on the wire, since process start.
-        //                              NOT 0 on a healthy client today: a measured fresh login into
-        //                              qeynos read 283, all WouldBlock on session-layer ACKs during
-        //                              the zone-in burst (a real pre-existing bug, #641, that this
-        //                              counter made visible for the first time). A quieter zone read
-        //                              0. Read a CLIMBING value, not a nonzero one, as trouble.
+        //                              0 IS the expected healthy reading since #641, which gave the
+        //                              qeynos zone-in burst of 283 two recovery paths (an immediate
+        //                              direct send(2) retry, and a deferral queue for control
+        //                              datagrams), both counted BELOW rather than here. So this now
+        //                              means what its name says: THE DATAGRAM NEVER REACHED THE WIRE
+        //                              AND NOTHING WILL RE-SEND IT. That covers more than a kernel
+        //                              refusal — non-transient errors (EMSGSIZE, a dead socket),
+        //                              queue-overflow evictions, and datagrams still queued when a
+        //                              session ends all land here too.
+        //                              WHICH mechanism refused a send is NOT knowable from these
+        //                              counters — see send_wouldblock_rescued below. What IS
+        //                              established is the trigger: CPU starvation of the client's
+        //                              tokio io driver.
+        //   send_wouldblock_rescued  — datagrams a WouldBlock refused that an immediate direct
+        //                              send(2) then accepted (#641). NOT failures — they reached the
+        //                              wire. An UPPER BOUND on tokio's synthetic-WouldBlock case,
+        //                              NOT a measurement of it: a kernel refusal whose transmit
+        //                              buffer drained in between looks identical. Load signal.
+        //   send_deferred            — how many DATAGRAMS (not refusal events) a transient refusal
+        //                              caused to be queued for retry on a later tick instead of
+        //                              being dropped; control datagrams only (#641). Normally they
+        //                              go out ~10ms late — but this is NOT disjoint from
+        //                              send_failures: one later abandoned (queue overflow, session
+        //                              end) is counted in both. send_failures stays the loss number.
         //   send_failures_unretried  — the subset with no client-side retransmit of that datagram.
-        //                              TWO very different classes share it, and the measurement above
-        //                              says which one you are actually looking at:
+        //                              TWO very different classes share it:
         //                                * session-layer control (ACK / OutOfOrderAck / keepalive /
-        //                                  SessionRequest / SessionDisconnect) — 7-byte datagrams;
-        //                                  this is what the qeynos zone-in burst was (#641). Lost
-        //                                  ACKs stall the server's ordered window, not our position.
+        //                                  SessionRequest / SessionDisconnect) — 7-byte datagrams.
+        //                                  Lost ACKs stall the server's ordered window, not our
+        //                                  position. (This was the whole of the #641 burst.)
         //                                * unreliable OP_ClientUpdate position updates — only these
         //                                  mean the server's idea of where you are may be stale.
         //                              The size distribution is the discriminator; the counter alone
@@ -647,6 +665,8 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         //   last_send_error_age_ms   — ms since it, measured at read time. Distinguishes a single
         //                              old blip from an ongoing failure.
         player.insert("send_failures".into(),           serde_json::json!(health.send_failures));
+        player.insert("send_wouldblock_rescued".into(), serde_json::json!(health.send_wouldblock_rescued));
+        player.insert("send_deferred".into(),           serde_json::json!(health.send_deferred));
         player.insert("send_failures_unretried".into(), serde_json::json!(health.send_failures_unretried));
         player.insert("last_send_error".into(),
             serde_json::json!(health.last_send_error.map(|k| format!("{k:?}"))));

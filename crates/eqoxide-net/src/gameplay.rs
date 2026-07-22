@@ -359,7 +359,16 @@ pub async fn run_gameplay_phase(
                     // `about_to_wait` exits the winit event loop on the main thread, which tears
                     // down cleanly and exits the process. Idle here; do NOT return (avoids reconnect).
                     shutdown.store(true, Ordering::Relaxed);
-                    loop { sleep(Duration::from_millis(200)).await; }
+                    // #641 review R3/N1-b: accounts the outstanding windows, THEN parks, in one
+                    // call that never returns. This task is never unwound, so `Drop` never runs
+                    // here — without the accounting, ACKs still queued in `pending_control` (and
+                    // un-ACKed reliables) would sit in `send_deferred` and never reach
+                    // `send_failures`, making that counter honest on every path but this one.
+                    // Folded into a single call because the separate-call version was defeated
+                    // twice by ordinary refactors (respelling the park; extracting the cleanup into
+                    // an uncalled closure) while every source-level guard stayed green. There is now
+                    // no ordering to get wrong: parking here IS accounting.
+                    s.abandon_and_park().await;
                 }
                 OP_REQUEST_CLIENT_ZONE_CHANGE if packet.payload.len() >= 24 => {
                     // Server wants us to move — either a zone transition or a same-zone teleport

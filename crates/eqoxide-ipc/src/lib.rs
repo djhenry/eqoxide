@@ -334,14 +334,72 @@ pub struct NetHealth {
     /// never put on the wire. Since process start; never reset (a zone change does not un-drop a
     /// packet).
     ///
-    /// **`0` is NOT the healthy reading today.** Measured on this branch's release binary (#612
-    /// round-2 review): a fresh, healthy login into `qeynos` read **283** — all `WouldBlock`, all
-    /// 7-byte datagrams (session-layer control via `send_raw`, i.e. ACKs/keepalives, not app
-    /// traffic), all accrued in a burst during zone-in and then flat for the 40s sampled after. A
-    /// second client in a quieter zone read 0, so it is load-dependent, not universal. That is a
-    /// real pre-existing bug — our ACKs failing to reach the wire during a zone-in burst — filed as
-    /// #641; it is not an artifact of this counter, it is the first time anything could see it.
+    /// **`0` IS the expected healthy reading since #641.** History, because the previous text here
+    /// said the opposite and an agent reading it would have learned to ignore this counter: the
+    /// #612 round-2 review measured **283** on a fresh, healthy login into `qeynos` — all
+    /// `WouldBlock`, all 7-byte session-layer control datagrams (ACKs), in a burst during zone-in
+    /// and then flat. #641 gave those two recovery paths (an immediate direct `send(2)` retry, and
+    /// a deferral queue for control datagrams), and both are counted elsewhere —
+    /// `send_wouldblock_rescued` and `send_deferred`. So this counter now means what its name says:
+    /// the datagram never reached the wire, and nothing will re-send it.
+    ///
+    /// The TRIGGER is established — CPU starvation of the client's tokio io driver, reproducible by
+    /// pinning the client to one core. The MECHANISM is not: see `send_wouldblock_rescued` for why
+    /// neither counter can tell a tokio-synthetic refusal from a kernel one.
     pub send_failures: u64,
+    /// Datagrams whose `try_send` returned `WouldBlock` and which an immediate direct `send(2)` on
+    /// the same fd then ACCEPTED (#641). They reached the wire, which is why they are counted here
+    /// and not in `send_failures`.
+    ///
+    /// **This is an UPPER BOUND on tokio's synthetic-`WouldBlock` case, not a measurement of it**
+    /// (#641 review, finding 3). Two mechanisms produce the same `WouldBlock`:
+    ///   1. tokio short-circuits on an empty cached readiness bit and returns `WouldBlock` *without
+    ///      issuing the syscall* (the bit is refilled only by its io driver); or
+    ///   2. the bit is set, the syscall IS issued, and the kernel returns `EAGAIN`/`ENOBUFS` (which
+    ///      also clears the bit).
+    /// A direct `send(2)` succeeding microseconds later fits (1) — but fits (2)-then-the-buffer-
+    /// drained just as well, and a burst is exactly when the buffer is full and draining hard. So
+    /// the error is systematic in one direction. A DOUBLE refusal (the direct `send(2)` fails too)
+    /// is hard evidence of (2); that is what refutes "it is all synthetic", and it is all that is
+    /// established. Telling them apart properly would need something like `ioctl(SIOCOUTQ)` at the
+    /// moment of refusal (≈0 queued bytes ⇒ genuinely synthetic); nobody has done that.
+    ///
+    /// Read it as a LOAD signal — the socket is refusing sends here — not as a diagnosis. The split
+    /// varies RUN TO RUN, not by zone: `gfaydark` measured 0 rescued / 138 deferred on one run and
+    /// 175 / 147 on another, same recipe and same binary; `qeynos` measured 141/107, 166/106 and
+    /// 119/114. Nothing observable predicts it.
+    ///
+    /// Before #641 every one of these was a datagram silently dropped on the floor — mostly ACKs,
+    /// which the server then had to re-solicit by retransmitting the packets it had not seen
+    /// acknowledged.
+    pub send_wouldblock_rescued: u64,
+    /// How many **datagrams** a transient send refusal (`EAGAIN`/`ENOBUFS`) caused to be QUEUED for
+    /// retry on a later net-thread tick instead of being dropped (#641). Only session-layer control
+    /// is deferrable — ACK / OutOfOrderAck / keepalive / SessionRequest. (`SessionDisconnect` is
+    /// deliberately NOT: there is no "next tick" at shutdown. See `send_session_disconnect`.)
+    ///
+    /// **Datagrams, not refusal events.** Counted exactly once, in `defer_control`, at the moment
+    /// the datagram is queued. It is *not* incremented again when a queued datagram is re-attempted
+    /// and refused again, so the number tracks how many datagrams were delayed, not how long the
+    /// outage lasted. The first cut of #641 got this wrong in the other direction and its docs and
+    /// its code disagreed (#641 review, finding 1).
+    ///
+    /// **Not a loss counter, and NOT disjoint from `send_failures`** (#641 review, finding 1b). In
+    /// the normal case each of these datagrams goes out on a later tick, ~10ms late. But a deferred
+    /// datagram can still be lost afterwards — the queue overflows, or the session ends while it is
+    /// still queued — and that loss is counted in `send_failures`/`send_failures_unretried` too, so
+    /// the same datagram appears in both. `send_failures` stays the honest "was anything lost?"
+    /// number; this one answers "how many datagrams did the socket make us delay?".
+    ///
+    /// That holds on EVERY path that ends a session, including the `OP_GMKick` one that parks
+    /// forever without ever unwinding: it calls `abandon_outstanding` explicitly (#641 review R3),
+    /// because a `Drop` that never runs cannot account for anything. A counter that is honest
+    /// "except on one path" decays into a counter nobody trusts.
+    ///
+    /// A lower bound on genuine kernel refusals, for the reason given on `send_wouldblock_rescued`.
+    /// Before #641 every one of these was a silently dropped ACK, which the server answered by
+    /// retransmitting everything it had not seen acknowledged — the road to a `resend_timeout` drop.
+    pub send_deferred: u64,
     /// The subset of `send_failures` for datagrams the client does **not** retransmit itself:
     /// unreliable app packets (the `OP_ClientUpdate` position firehose), session-layer control
     /// (ACK / OutOfOrderAck / keepalive / SessionRequest / SessionDisconnect). The complement
@@ -443,7 +501,8 @@ impl Default for NetHealth {
             last_datagram: now, last_packet: now, last_tick: now,
             last_probe_sent: None, last_probe_reply: None,
             first_unanswered_probe_sent: None,
-            send_failures: 0, send_failures_unretried: 0,
+            send_failures: 0, send_wouldblock_rescued: 0, send_deferred: 0,
+            send_failures_unretried: 0,
             last_send_error_kind: None, last_send_error_at: None,
             reliable_abandoned: 0,
         }

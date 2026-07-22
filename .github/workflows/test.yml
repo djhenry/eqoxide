@@ -26,6 +26,15 @@ jobs:
       - uses: actions/checkout@v4
       - name: check for local-system detail / proprietary-derived content
         run: bash scripts/check-no-local-detail.sh
+      # Catches a string literal whose line-continuation backslash was lost while the code was
+      # written, which bakes the source indentation into the message. It compiles and tests pass,
+      # so only a reader of the WARN/assert text ever notices — it regressed three times on #641,
+      # twice after a manual sweep was reported clean. `--self-test` runs first so a guard that has
+      # stopped discriminating fails loudly instead of passing everything.
+      - name: check for corrupted wrapped string literals
+        run: |
+          python3 scripts/check-wrapped-literals.py --self-test
+          python3 scripts/check-wrapped-literals.py
 
   test:
     runs-on: ubuntu-latest
