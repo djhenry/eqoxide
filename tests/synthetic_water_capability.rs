@@ -14,11 +14,31 @@
 
 mod synthetic_scenes;
 
-use eqoxide::movement::CharacterController;
+use eqoxide::movement::{CharacterController, PLAYER_RADIUS};
 use eqoxide::nav::collision::Collision;
 use eqoxide::traversability::PLAYER_BODY;
 use eqoxide_ipc::MoveIntent;
 use synthetic_scenes as scenes;
+
+/// Mirrors `movement.rs`'s private `GROUND_ORIGIN` (probe origin above the feet) — that module
+/// keeps it `const`-private, so the fixture checks below (which must ask the exact same question
+/// the depenetration net asks) restate the value here rather than duplicate the whole predicate as
+/// a public API surface just for a test. If `movement.rs`'s value ever changes, the corresponding
+/// in-crate test (`movement::tests::an_afloat_body_with_no_floor_below_is_never_pushed_out_into_a_drift`)
+/// changes with it and this one does not automatically follow — that drift risk is accepted in
+/// exchange for not widening `movement`'s public surface for a test-only constant.
+const GROUND_ORIGIN: f32 = 1.0;
+/// Mirrors `movement.rs`'s private `GROUND_DEPTH` (ground-probe downward range). See `GROUND_ORIGIN` above.
+const GROUND_DEPTH: f32 = 200.0;
+
+/// The depenetration net's own "is this body embedded" question (`movement::is_embedded`,
+/// private), restated here from its two PUBLIC halves (`Collision::footprint_clear`,
+/// `Collision::ground_below`) so the fixture checks and the iteration-invariant assertion below ask
+/// the identical question the net asks, not an approximation of it.
+fn embedded(col: &Collision, p: [f32; 3]) -> bool {
+    !col.footprint_clear(p[0], p[1], p[2], PLAYER_RADIUS, 8)
+        || col.ground_below(p[0], p[1], p[2] + GROUND_ORIGIN, GROUND_DEPTH).is_none()
+}
 
 /// Drive the controller from `from` toward the XY of `to` for `secs`, with exactly the intent the
 /// walker sends at a water waypoint: `want_swim`, a horizontal wish, and **no vertical wish** — so
@@ -239,4 +259,83 @@ fn the_stepped_scene_really_has_two_surfaces_and_no_climbable_geometry() {
              could be a step-up rather than buoyancy; got {floors:?}");
         assert!((floors[0] - scenes::BASIN_FLOOR_Z).abs() < 0.01, "fixture: {floors:?}");
     }
+}
+
+// ─────────────── scene 4: an afloat body with no floor within reach (#664) ───────────────
+
+/// **#664 / #649 REVIEW FINDING 1 — AN AFLOAT BODY WITH NO FLOOR BELOW MUST NEVER DRIFT.**
+///
+/// This is the ITERATION invariant a one-shot harness structurally cannot see (#664): the withdrawn
+/// first cut of the #649 fix answered a clear-footprint-but-no-floor-below body with an `Afloat`
+/// recovery at the FIRST ring candidate the push-out tried — which is itself equally embedded
+/// (still afloat, still no floor below at the new spot), so the NEXT frame re-entered the net from
+/// that position and picked the next candidate, and so on: the body walked east one ring radius
+/// (1.0 u) per embedded frame — 60 u/s at 60 fps — ignoring wish input entirely, with `in_water`
+/// reporting stale-false the whole time (the net's early-return freezes the rest of `step`, so the
+/// real water probe never runs). `Recovery::at_column`'s `!is_embedded` guard on the afloat arm is
+/// the fix that shipped instead: a recovery must ALSO not be embedded, or by definition it is not a
+/// recovery — it is the next frame's starting point for exactly the same failure.
+///
+/// Driven for two input-free seconds (110 frames to let anything that is going to happen settle,
+/// then 10 more to check it has actually stopped) with a completely idle intent — no wish direction,
+/// no vertical wish, `speed: 0.0`. The fail condition mirrors
+/// `movement::tests::depenetration_corpus_over_baked_zones`'s (both pin the SAME mechanism, one on
+/// hand-authored geometry that runs in ordinary CI, one on baked zones that only runs under
+/// `--ignored`): "still moving AND still embedded" after the settle checkpoint is the drift
+/// signature and fails the test. A body that came to rest — even somewhere still technically
+/// embedded — is the separate, pre-existing "the push-out gave up, last-good fallback had nothing to
+/// fall back to" state and is deliberately NOT flagged by that half of the assertion; the second,
+/// stricter assertion below closes that gap for THIS specific scene, where the correct behaviour is
+/// not merely "stops eventually" but "never moves at all".
+#[test]
+fn an_afloat_body_with_no_floor_in_reach_never_drifts() {
+    let col = scenes::open_water_no_floor_in_reach();
+    let start = [0.0, 0.0, 0.0];
+
+    // CHECK THE FIXTURE, not just the assertion below — confirm this scene actually presents the
+    // exact case #664 is about, on both halves of `embedded`'s OR independently, or a scene that
+    // silently drifted into testing something else (e.g. a blocked footprint) would still pass this
+    // test for the wrong reason.
+    assert!(col.footprint_clear(start[0], start[1], start[2], PLAYER_RADIUS, 8),
+        "fixture: the footprint at the origin must be CLEAR — nothing pierces it, so the ONLY thing \
+         that can call this body embedded is the missing floor below, not an overlap");
+    assert!(col.ground_below(start[0], start[1], start[2] + GROUND_ORIGIN, GROUND_DEPTH).is_none(),
+        "fixture: there must be NO floor within GROUND_DEPTH below the origin — that absence, \
+         combined with the clear footprint just above, is the whole #664 case");
+    assert!(embedded(&col, start), "fixture: consequently the body starts EMBEDDED by the net's own \
+        predicate — if it didn't, `step` would never even enter the ring search and this test would \
+        prove nothing");
+    assert!(col.in_water(start), "fixture: and the body is afloat");
+    // The paired control: move the SAME floor directly under the origin and confirm the identical
+    // start point is then NOT embedded — i.e. it really is the floor's distance, not the water slab
+    // or some other property of the scene, that makes the case above hold.
+    let with_floor = scenes::open_water_with_floor_in_reach();
+    assert!(!embedded(&with_floor, start),
+        "control: the SAME start point, with a floor in vertical reach instead of 500 u away, must \
+         NOT be embedded — otherwise scene 4 isn't testing the no-floor-in-reach case specifically");
+
+    let mut ctrl = CharacterController::new(start);
+    let idle = MoveIntent { wish_dir: [0.0, 0.0], wish_vspeed: 0.0, jump: false, want_swim: true,
+                            speed: 0.0, climb: 0.0, hop: false };
+    let dt = 1.0 / 60.0;
+    for _ in 0..110 { ctrl.step(idle, dt, &col); }
+    let settle_from = ctrl.pos;
+    for _ in 0..10 { ctrl.step(idle, dt, &col); }
+    let end = ctrl.pos;
+
+    let still_moving = ((end[0] - settle_from[0]).powi(2) + (end[1] - settle_from[1]).powi(2)).sqrt() > 1e-3
+        || (end[2] - settle_from[2]).abs() > 1e-3;
+    assert!(!(still_moving && embedded(&col, end)),
+        "#664: the net must never walk an afloat body across open water one ring radius at a time — \
+         started at {start:?}, settled-checkpoint (after 110 frames) {settle_from:?}, ended {end:?} \
+         after two input-free seconds of ZERO wish input (the withdrawn first cut reached [60,0,0] \
+         after 60 frames — 60 u/s)");
+
+    // The stricter, scene-specific floor under that invariant: here the correct behaviour is not
+    // merely "eventually stops", it is "never moves at all" (no last-good grounded sample exists to
+    // fall back to either, since the body has never once been grounded) — so pin that directly too.
+    let total_drift = ((end[0] - start[0]).powi(2) + (end[1] - start[1]).powi(2)).sqrt();
+    assert!(total_drift < 1e-3,
+        "#664: zero wish input, on a body with a clear footprint and no floor below, must produce \
+         ZERO horizontal displacement over two seconds — got {total_drift:.3} u, ending at {end:?}");
 }
