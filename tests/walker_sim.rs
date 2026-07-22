@@ -750,3 +750,123 @@ use eqoxide_ipc::MoveIntent;
         }
     }
 
+// ── #630: walk-edge acceptance must reflect the MAXIMUM local rise along the hop, not the
+//    average grade — the #617 canal bank / #309 moat wall fixture ──
+
+    /// The laundering geometry, synthetic (#630): a plain at z = 0 and a 12.8u mesa whose corner
+    /// sits in the last ~15% of a DIAGONAL coarse hop (~11.31u run), so the hop's floor profile is
+    /// flat-then-vertical. The whole-hop AVERAGE grade is 12.8/11.31 = 1.13 < MAX_WALK_GRADE = 1.2
+    /// (the exact #617 numbers — the same face is rejected orthogonally at 12.8/8 = 1.6), and the
+    /// planner's interpolated feet/chest rays have already climbed above the face by the time they
+    /// reach it, so on unmodified main this admits a walk edge the controller's 2u step-up cannot
+    /// climb. Verified to FAIL on unmodified origin/main (a route is returned) — see PR.
+    ///
+    /// `ramp` swaps the vertical faces for a planar ramp over [36..44]² with the SAME endpoints and
+    /// the SAME total rise (z = 0.8·(e−36) + 0.8·(n−36); steepest ascent, along the hop diagonal,
+    /// is grade 1.13): the profile the controller genuinely CAN walk. The pair pins the fix from
+    /// both sides — same hop, same rise, only the PROFILE differs, and only the profile may decide.
+    fn mesa_scene(ramp: bool) -> Collision {
+        let mut terrain = vec![
+            floor_at(0.0, 0.0, 80.0, 0.0, 80.0),     // the plain
+            floor_at(12.8, 42.8, 80.0, 42.8, 80.0),  // the mesa top
+        ];
+        if ramp {
+            // Planar corner ramp [36..44]², rising 0 → 12.8 toward the mesa corner (same traversal
+            // order as floor_at, so the winding — and thus the face normal — is up-facing).
+            terrain.push(mesh(vec![
+                [36.0, 0.0, 36.0], [44.0, 6.4, 36.0], [44.0, 12.8, 44.0], [36.0, 6.4, 44.0]]));
+        } else {
+            // Vertical 12.8u faces sealing the mesa's low-side edges (east-facing at east = 42.8,
+            // north-facing at north = 42.8) — the canal-bank / moat-wall profile.
+            terrain.push(panel(42.8, 42.8, 80.0, 0.0, 12.8));
+            terrain.push(mesh(vec![
+                [42.8, 0.0, 42.8], [42.8, 0.0, 80.0], [42.8, 12.8, 80.0], [42.8, 12.8, 42.8]]));
+        }
+        col(terrain)
+    }
+
+    /// **The #630 regression fixture, rejecting half.** The controller cannot climb the 12.8u face
+    /// (pinned below — capability is the ground truth the planner was contradicting), so the honest
+    /// planner answer is `None`/no_path — NOT a confident route up the face that wedges the walker
+    /// after 8 re-paths (#617's `blocked`/`walker_stalled`). Also pins the diagnostic: the trace
+    /// must show the laundered hop rejected as `local_rise`, and must show NO accepted walk edge
+    /// climbing more than the controller's envelope onto the mesa.
+    ///
+    /// Mutation checks (verified at authoring time, see PR): (1) removing the `walk_profile_ok`
+    /// call (unmodified main) → a route up the face is returned → RED; (2) loosening the envelope's
+    /// step term to the old STEP_H = 20 → RED.
+    #[test]
+    fn planner_never_routes_up_a_vertical_face_a_diagonal_hop_launders() {
+        let c = mesa_scene(false);
+        let start = [12.0, 12.0, 0.0];
+        let goal = [60.0, 60.0, 12.8];
+
+        // Pin the fixture premise: the controller genuinely cannot climb the face. Drive it
+        // straight at the mesa corner exactly like the laundered hop would (diagonal wish).
+        let mut ctrl = CharacterController::new([36.0, 36.0, 0.0]);
+        ctrl.on_ground = true;
+        for _ in 0..600 {
+            ctrl.step(MoveIntent { wish_dir: [0.7071, 0.7071], speed: 44.0, ..Default::default() },
+                      1.0 / 60.0, &c);
+        }
+        assert!(ctrl.pos[2] < 6.0,
+            "fixture premise: the controller must be stopped at the 12.8u face (pos={:?})", ctrl.pos);
+
+        // The invariant: no route. Every entry onto the mesa concentrates 12.8u of rise into a
+        // near-vertical face; a planner that admits one is lying about walkability (#617/#309).
+        let route = c.find_path(start, goal, PLAYER_RADIUS, &[], false);
+        assert!(route.is_none(),
+            "planner routed up a 12.8u vertical face via a diagonal hop (#630): {route:?}");
+
+        // And the honest WHY (#608 diagnostics): the laundered hop is rejected as `local_rise`,
+        // and no accepted walk edge climbs past the controller's envelope onto the mesa.
+        use eqoxide::nav::diagnostics::{EdgeKind, EdgeVerdict, RejectReason, SearchTrace, TRACE_EDGE_CAP};
+        let trace = std::sync::Arc::new(std::sync::Mutex::new(SearchTrace::with_budget(TRACE_EDGE_CAP)));
+        let ctx = PlanCtx::worker().ensure_budget().with_trace(trace.clone());
+        let _ = c.find_path_res(start, goal, PLAYER_RADIUS, &[], false, 8.0, None, 0.0, ctx);
+        let t = trace.lock().unwrap();
+        let local_rise_rejects = t.calls.iter().flat_map(|call| &call.edges)
+            .filter(|e| matches!(e.verdict, EdgeVerdict::Rejected { reason: RejectReason::LocalRise }))
+            .count();
+        assert!(local_rise_rejects > 0,
+            "the laundered face hop must be rejected as local_rise (found none in the trace)");
+        let bad_walk_accepts: Vec<_> = t.calls.iter().flat_map(|call| &call.edges)
+            .filter(|e| matches!(e.verdict, EdgeVerdict::Accepted { kind: EdgeKind::Walk })
+                && e.to[2] - e.from[2] > 6.9) // > spacing·MAX_WALK_GRADE + step_up, the envelope cap
+            .collect();
+        assert!(bad_walk_accepts.is_empty(),
+            "walk edges accepted past the controller's climb envelope: {bad_walk_accepts:?}");
+    }
+
+    /// **The #630 fixture, accepting half — the over-tightening guard.** Same mesa, same hop, same
+    /// 12.8u total rise, but spread uniformly along a planar ramp (grade 1.13 on the steepest
+    /// line): the controller CAN walk this (pinned below), so the planner must still admit it.
+    /// A fix that turned this into `no_path` would trade the #617 wedge for a "can't leave spawn"
+    /// regression — honest, but a different lie about the world.
+    #[test]
+    fn planner_still_routes_up_a_genuinely_walkable_ramp_of_the_same_rise() {
+        let c = mesa_scene(true);
+        let start = [12.0, 12.0, 0.0];
+        let goal = [60.0, 60.0, 12.8];
+
+        // Pin the capability premise: the controller walks the grade-1.13 ramp to the top.
+        let mut ctrl = CharacterController::new([36.0, 36.0, 0.0]);
+        ctrl.on_ground = true;
+        let mut topped = false;
+        for _ in 0..900 {
+            ctrl.step(MoveIntent { wish_dir: [0.7071, 0.7071], speed: 44.0, ..Default::default() },
+                      1.0 / 60.0, &c);
+            if ctrl.on_ground && ctrl.pos[2] > 12.0 {
+                topped = true;
+                break;
+            }
+        }
+        assert!(topped,
+            "capability premise: the controller must walk the grade-1.13 ramp (ended at {:?})", ctrl.pos);
+
+        // The invariant: the planner still admits the walkable profile — no over-tightening.
+        let route = c.find_path(start, goal, PLAYER_RADIUS, &[], false);
+        assert!(route.is_some(),
+            "planner refused a ramp the controller demonstrably walks (#630 over-tightening)");
+    }
+
