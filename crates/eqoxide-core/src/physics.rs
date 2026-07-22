@@ -86,21 +86,32 @@ mod windowed_speed_sample_tests {
 
     #[test]
     fn returns_none_before_window_elapses() {
-        assert_eq!(windowed_speed_sample([1.0, 0.0], [0.0, 0.0], 0.05, 0.15), None);
-        assert_eq!(windowed_speed_sample([1.0, 0.0], [0.0, 0.0], 0.0, 0.15), None);
+        // Reference NAV_SPEED_SAMPLE_WINDOW itself, not a hardcoded 0.15 literal (#623 PR review):
+        // a hardcoded literal here would keep passing even if the constant were changed to
+        // something else entirely, since it would no longer be testing the constant actually in
+        // use anywhere — it would just be re-verifying the function's generic `<` behavior for an
+        // arbitrary fixed number. Referencing the constant means shrinking/growing
+        // NAV_SPEED_SAMPLE_WINDOW is reflected here automatically.
+        assert_eq!(
+            windowed_speed_sample([1.0, 0.0], [0.0, 0.0], NAV_SPEED_SAMPLE_WINDOW - 0.001, NAV_SPEED_SAMPLE_WINDOW),
+            None
+        );
+        assert_eq!(windowed_speed_sample([1.0, 0.0], [0.0, 0.0], 0.0, NAV_SPEED_SAMPLE_WINDOW), None);
     }
 
     #[test]
     fn samples_correct_speed_once_window_elapses() {
-        // 10 units over exactly the window -> 10 / 0.15 u/s.
-        let got = windowed_speed_sample([10.0, 0.0], [0.0, 0.0], 0.15, 0.15).unwrap();
-        assert!((got - 10.0 / 0.15).abs() < 1e-4, "got {got}");
+        // 10 units over exactly the window -> 10 / window u/s.
+        let got = windowed_speed_sample([10.0, 0.0], [0.0, 0.0], NAV_SPEED_SAMPLE_WINDOW, NAV_SPEED_SAMPLE_WINDOW).unwrap();
+        assert!((got - 10.0 / NAV_SPEED_SAMPLE_WINDOW).abs() < 1e-4, "got {got}");
     }
 
     #[test]
     fn diagonal_distance_uses_euclidean_norm() {
-        // 3-4-5 triangle over a 1s window -> speed 5.
-        let got = windowed_speed_sample([3.0, 4.0], [0.0, 0.0], 1.0, 0.15).unwrap();
+        // 3-4-5 triangle over a 1s window -> speed 5. Window itself is incidental to this test (it
+        // only needs to be small enough that 1s clears it), but reference the constant anyway for
+        // consistency with the rest of this module.
+        let got = windowed_speed_sample([3.0, 4.0], [0.0, 0.0], 1.0, NAV_SPEED_SAMPLE_WINDOW).unwrap();
         assert!((got - 5.0).abs() < 1e-4, "got {got}");
     }
 
@@ -166,6 +177,102 @@ mod windowed_speed_sample_tests {
              threshold {WALK_RUN_THRESHOLD} for a true {RUN_SPEED} u/s run"
         );
     }
+
+    /// Simulates a run of `windowed_speed_sample` calls at `render_tick_dt` cadence against a
+    /// position source that only actually CHANGES at `backend_tick_dt` cadence (a staircase, not a
+    /// smooth ramp), with the two clocks phase-offset from each other by `backend_phase_offset` —
+    /// i.e. NOT lockstep. Returns every non-`None` sample taken.
+    fn simulate_staircase_samples(
+        render_tick_dt: f32,
+        backend_tick_dt: f32,
+        backend_phase_offset: f32,
+        min_window_s: f32,
+        total_time_s: f32,
+    ) -> Vec<f32> {
+        let mut backend_pos = [0.0_f32, 0.0];
+        let mut backend_next_tick = backend_phase_offset;
+        let mut backend_elapsed = 0.0_f32;
+
+        let mut anchor_pos = [0.0_f32, 0.0];
+        let mut elapsed_since_anchor = 0.0_f32;
+        let mut samples = Vec::new();
+
+        let mut t = 0.0_f32;
+        while t < total_time_s {
+            t += render_tick_dt;
+            backend_elapsed += render_tick_dt;
+            // The backend's own position step always uses its REAL elapsed dt for that tick (not a
+            // fixed assumed value), so total distance / total real time converges to the true speed
+            // — but only over a window wide enough to span at least one full backend tick. A window
+            // narrower than backend_tick_dt can straddle zero tick boundaries and read zero motion.
+            while backend_elapsed >= backend_next_tick {
+                backend_pos[0] += RUN_SPEED * backend_tick_dt;
+                backend_next_tick += backend_tick_dt;
+            }
+            elapsed_since_anchor += render_tick_dt;
+            if let Some(speed) =
+                windowed_speed_sample(backend_pos, anchor_pos, elapsed_since_anchor, min_window_s)
+            {
+                samples.push(speed);
+                anchor_pos = backend_pos;
+                elapsed_since_anchor = 0.0;
+            }
+        }
+        samples
+    }
+
+    /// Reproduces the review finding directly (rather than asserting it in prose): shrinking
+    /// `min_window_s` down to a single render frame (~1/60s, the literal the reviewer mutated
+    /// `NAV_SPEED_SAMPLE_WINDOW` to) reintroduces the ORIGINAL failure mode — misclassifying a
+    /// genuinely sustained `RUN_SPEED` run as "walking" — even though `windowed_speed_sample` itself
+    /// has no clamp bug. `sixty_fps_mirroring_still_reports_true_run_speed` above cannot show this:
+    /// it mirrors position into the SAME clock that drives its own sampling loop, in perfect
+    /// lockstep, and uniform motion sampled by its own clock is mathematically exact for ANY window
+    /// size — so that test is structurally incapable of distinguishing window sizes.
+    ///
+    /// The real system does not have that guarantee: `game_state_view.player_x/y/z` is mirrored by
+    /// the NETWORK thread's own tick loop (`gameplay.rs`'s `sleep(Duration::from_millis(10))`),
+    /// while the render loop samples it on its OWN, independently-scheduled clock
+    /// (`Instant::now()` in `render_frame`). `tokio::time::sleep` is a *minimum* delay, not a
+    /// real-time guarantee — under system load (mutex contention, GC-like pauses, scheduling
+    /// noise) the network thread's actual tick period can and does drift above its nominal 10ms.
+    /// This simulates that: a backend tick period of 20ms (a realistic delayed/jittered cadence)
+    /// mirrored into a position sampled by a render loop at a 1/60s cadence, with the two clocks
+    /// NOT phase-aligned. A window narrower than the backend's tick period can and does land
+    /// entirely inside a "the backend hasn't ticked yet" gap, reading zero distance.
+    #[test]
+    fn phase_misaligned_backend_tick_needs_the_real_window_not_one_frame() {
+        let render_tick_dt = 1.0_f32 / 60.0; // one render frame — the reviewer's literal mutation
+        let backend_tick_dt = 0.020_f32;     // jittered/delayed backend cadence (nominal 10ms + drift)
+        let backend_phase_offset = 0.007_f32; // not phase-locked to the render clock
+        let total_time_s = 1.0_f32;          // one full second of sustained running
+
+        let shrunk_window_samples = simulate_staircase_samples(
+            render_tick_dt, backend_tick_dt, backend_phase_offset, render_tick_dt, total_time_s,
+        );
+        assert!(
+            shrunk_window_samples.iter().any(|&s| s <= WALK_RUN_THRESHOLD),
+            "expected shrinking the window to a single render frame to misclassify at least one \
+             sample of a sustained {RUN_SPEED} u/s run as walking against a phase-misaligned \
+             backend clock — got samples: {shrunk_window_samples:?} (if this fails, the fixture's \
+             parameters no longer reproduce the aliasing this test exists to catch — do not just \
+             delete the assertion)"
+        );
+
+        let real_window_samples = simulate_staircase_samples(
+            render_tick_dt, backend_tick_dt, backend_phase_offset, NAV_SPEED_SAMPLE_WINDOW, total_time_s,
+        );
+        assert!(
+            !real_window_samples.is_empty(),
+            "NAV_SPEED_SAMPLE_WINDOW should have elapsed at least once in {total_time_s}s"
+        );
+        assert!(
+            real_window_samples.iter().all(|&s| s > WALK_RUN_THRESHOLD),
+            "NAV_SPEED_SAMPLE_WINDOW must stay clear of WALK_RUN_THRESHOLD against the SAME \
+             phase-misaligned backend clock that breaks a 1-frame window — got samples: \
+             {real_window_samples:?}"
+        );
+    }
 }
 
 /// Chooses the walk-vs-run locomotion clip **purely from forward speed**, per the native rule
@@ -181,9 +288,19 @@ mod windowed_speed_sample_tests {
 /// movement-direction-relative-to-heading signal (self-player's action is computed from
 /// server-authoritative position deltas, not WASD keys; remote entities always face their travel
 /// direction, so they can never appear to move "backward" in this client's model), and
-/// `eqoxide_renderer::anim::Skin::clip_for_action` has no back-walk clip resolution. That is a
-/// pre-existing gap, out of scope for this fix (#623's confirmed bug and required Fix A/B/C is
-/// walk-vs-run only) — noted here rather than silently ignored.
+/// `eqoxide_renderer::anim::Skin::clip_for_action` has no `_ if action == "walking_backward"`-style
+/// arm that would ever request a back-walk clip — it is **not wired up**, not because the clip data
+/// is absent (baked GLBs DO carry clips whose name contains `walk_back`, e.g.
+/// `L07A_walk_back`/`L07B_walk_back` in `humanoid.glb`/`elf.glb`; `clip_for_action`'s `"running"` arm
+/// even explicitly excludes any clip name containing `"back"` so it can't be mis-picked as a run
+/// clip). Whether that `walk_back` label is itself correct is a separate, pre-existing question:
+/// `eqoxide_asset_server::convert::anim_label` (src/convert/mod.rs:1176) currently maps WLD code
+/// `L07` to `"walk_back"`, but `eq_kb/animation-codes.md` (cross-checked against literal strings
+/// pulled from `eqgame.exe`, `L07: CLIMB`) says `L07` is CLIMB, not a walk-backward loop, and lists
+/// no confirmed retail code for backward walking at all. Regardless of which side of that dispute is
+/// right, wiring a "backward" action through `clip_for_action` is out of scope for this fix (#623's
+/// confirmed bug and required Fix A/B/C is walk-vs-run only) — noted here rather than silently
+/// ignored, and left for whoever resolves the L07 labeling question.
 pub fn walk_or_run(speed_u_per_s: f32) -> &'static str {
     if speed_u_per_s > WALK_RUN_THRESHOLD { "running" } else { "walking" }
 }
