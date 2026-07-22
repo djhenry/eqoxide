@@ -26,6 +26,17 @@
 //! specific argument, and the control scenes (`sealed_pocket_without_lid`, …) that hold everything
 //! else fixed and remove only the feature under test.
 //!
+//! # What this layer does NOT cover — the swimming step-up
+//!
+//! **There is zero synthetic coverage of the swimming step-up** (`movement.rs`'s
+//! `if (self.on_ground || swimming) && low_hit …` branch, the one that exists so a swimmer can
+//! haul OUT onto a bank, #191). Disabling it leaves every test in this layer green — that is a
+//! deliberately-recorded observation about the LID STRAND's mechanism (it is the depenetration
+//! push-out, not the step-up), and it is NOT a statement that the step-up is untested: the tree's
+//! coverage of it lives in `tests/walker_sim.rs`
+//! (`p1_haul_out_admission_matches_controller_execution`), which does go RED when it is disabled.
+//! A future reader must not infer from "these tests stayed green" that the step-up is unprotected.
+//!
 //! # Coordinates
 //!
 //! Scene builders take and return **server coords** `[east, north, up]`, the same frame the
@@ -56,7 +67,9 @@ fn quad(v: [[f32; 3]; 4]) -> MeshData {
     }
 }
 
-/// A horizontal slab at height `z` spanning east `[e0,e1]` × north `[n0,n1]`.
+/// A horizontal, ZERO-THICKNESS quad at height `z` spanning east `[e0,e1]` × north `[n0,n1]`.
+/// Collision is triangles, so a single quad is a fully solid surface from both sides; nothing in
+/// this file has a thickness, and no scene depends on one.
 pub fn floor(z: f32, e0: f32, e1: f32, n0: f32, n1: f32) -> MeshData {
     quad([[n0, z, e0], [n1, z, e0], [n1, z, e1], [n0, z, e1]])
 }
@@ -94,7 +107,16 @@ pub fn collision(meshes: Vec<MeshData>, water: Option<RegionMap>) -> Collision {
 /// The water surface of the lidded pocket. Chosen so the lid sits a hair ABOVE it (below), which
 /// is the whole geometry of the #649 strand: the mounted position is DRY by a fraction of a unit.
 pub const POCKET_SURFACE: f32 = -55.978;
-/// The lid: a ceiling slab whose TOP face is 0.009 u above the pocket's waterline.
+/// The lid: a single zero-thickness ceiling quad, 0.009 u above the pocket's waterline.
+///
+/// **This value and [`POCKET_SURFACE`] were COPIED from `tests/water_capability.rs`'s baked-qcat
+/// numbers.** They are authored inputs, not measurements, so the fact that a run here ends at
+/// −55.969 and a run against baked qcat ends at −55.9687 is arithmetic, not corroboration — do
+/// not read it as two independent measurements agreeing. What carries evidential weight is the
+/// MECHANISM holding across a band of lid heights rather than at one tuned value: the mount
+/// happens iff the lid is within the push-out's `STEP_UP + GROUND_ORIGIN` = 3.0 u upward reach of
+/// the swim plane, and the result is dry iff the lid is above the surface. The 0.009 u gap is
+/// cosmetic; the strand reproduces anywhere in the ~1 u dry band above the waterline.
 pub const POCKET_LID_Z: f32 = -55.969;
 /// The pocket floor.
 pub const POCKET_FLOOR_Z: f32 = -70.0;
@@ -104,7 +126,7 @@ pub const POCKET_SWIM_PLANE: f32 = POCKET_SURFACE - 2.0;
 /// **SCENE 1 — A DEEP FLOODED POCKET WITH A LID OVER IT (#649 / #329).**
 ///
 /// A sealed rectangular chamber, floor at [`POCKET_FLOOR_Z`], flooded to [`POCKET_SURFACE`], with
-/// a ceiling slab (the "lid") whose top face is [`POCKET_LID_Z`] — **0.009 u above the waterline**.
+/// a ceiling quad (the "lid") at [`POCKET_LID_Z`] — **0.009 u above the waterline**.
 /// A swimmer floating at the pocket's own swim plane is 2.009 u below that lid: inside the
 /// `STEP_UP + GROUND_ORIGIN = 3.0` reach of the depenetration push-out's `nearest_floor` probe.
 ///
@@ -128,7 +150,7 @@ pub fn sealed_pocket_with_lid() -> Collision {
     collision(m, Some(RegionMap::water_boxes(&[[n0, n1, e0, e1, POCKET_FLOOR_Z + 0.5, POCKET_SURFACE]])))
 }
 
-/// **THE CONTROL FOR SCENE 1** — byte-identical to [`sealed_pocket_with_lid`] except the lid slab
+/// **THE CONTROL FOR SCENE 1** — byte-identical to [`sealed_pocket_with_lid`] except the lid quad
 /// is not placed. Everything else (walls, floor, water volume, surface height) is the same. If the
 /// strand were produced by the walls, the depth, or the water map rather than by the lid, it would
 /// reproduce here too.

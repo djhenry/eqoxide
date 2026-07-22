@@ -52,17 +52,33 @@ fn try_to_sink(col: &Collision, from: [f32; 3], secs: f32) -> [f32; 3] {
 
 /// **THE #649 STRAND, ON SYNTHETIC GEOMETRY: the push-out mounts a swimmer onto a lid.**
 ///
-/// A sealed flooded chamber whose ceiling slab's top face sits **0.009 u above the waterline**. A
+/// A sealed flooded chamber whose ceiling quad sits **0.009 u above the waterline**. A
 /// swimmer floating at the chamber's own swim plane presses into a wall; `footprint_clear` fails,
 /// which the controller reads as embedded; the depenetration push-out then hunts for a FLOOR
 /// within `STEP_UP + GROUND_ORIGIN = 3.0` u — and the lid is 2.009 u up. It is placed there,
 /// `on_ground`, and the position is DRY, so `in_water` is false, buoyancy never fires again, and
 /// nothing puts it back.
 ///
-/// This is the same mechanism `tests/water_capability.rs`'s
-/// `qcat_pocket_swim_plane_strands_the_swimmer_on_the_ceiling_lid` pins against baked `qcat`, and
-/// it reproduces the same three facts (mounted on the lid / dry / stranded) on geometry that
-/// contains nothing game-derived. What it does NOT pin is qcat's own −55.9687.
+/// # How this compares to the baked-`qcat` twin, precisely
+///
+/// `tests/water_capability.rs`'s `qcat_pocket_swim_plane_strands_the_swimmer_on_the_ceiling_lid`
+/// pins the same mechanism against baked geometry. This test reproduces **two of its three
+/// assertions** — mounted on the lid, and dry above the waterline — and replaces the third.
+/// qcat's third assertion is *"and it never reaches the shaft"*; this chamber is sealed and has no
+/// shaft, so that claim is not merely unasserted here, it is **not expressible**. What stands in
+/// its place is the weaker "it ends above the waterline it was floating in".
+///
+/// The SUB-MECHANISM was confirmed identical across the two layers by mutation, not by
+/// resemblance: removing only the push-out's UPWARD reach (`nearest_floor(e, n, p[2], 0.0,
+/// GROUND_DEPTH)` — leaving depenetration otherwise intact) turns BOTH tests red. So it is
+/// specifically the `STEP_UP + GROUND_ORIGIN` upward probe inside `depenetrate` that performs the
+/// mount, in the synthetic chamber and in baked `qcat` alike. The two layers then diverge in the
+/// downstream consequence, exactly as their geometry dictates: synthetic falls to the wet chamber
+/// floor (−69.0) because the chamber is sealed, while qcat swims on and settles on the shaft's
+/// swim plane (−44.982) — which is #649's own "OK" outcome for the deeper start depths.
+///
+/// What this test does NOT pin is qcat's own −55.9687, and the near-agreement of the two numbers
+/// is arithmetic rather than evidence: `POCKET_LID_Z` was copied from that file (see its doc).
 ///
 /// **The push-out is water-blind, and that is the defect (#649, open).** This test therefore
 /// asserts the CURRENT behaviour, exactly like its asset-gated twin — when #649 is fixed, both
@@ -128,6 +144,8 @@ fn the_lid_mount_is_one_way_a_downward_swim_wish_cannot_recover_it() {
 ///
 /// This is what makes the two tests above load-bearing rather than incidental: the lid is the
 /// single element that turns a wet, in-principle-recoverable push-out into a dry, permanent strand.
+/// (And it is height-driven, not tuned to one value: the mount happens for any lid within the
+/// push-out's 3.0 u upward reach of the swim plane, and reads dry for any lid above the surface.)
 #[test]
 fn without_the_lid_the_same_pocket_never_strands_the_swimmer_above_the_waterline() {
     let col = scenes::sealed_pocket_without_lid();
