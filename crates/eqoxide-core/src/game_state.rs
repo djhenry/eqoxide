@@ -1691,7 +1691,48 @@ mod pose_tests_643 {
         assert_eq!(Pose::from_wire(199).label(), "unknown(199)");
         assert_eq!(Pose::from_wire(12).label(), "unknown(12)",
             "a GAIT value arriving on the pose channel reads as unknown, never as 'standing'");
+    }
+
+    /// #643 review: EVERY label is pinned individually, and they are pinned to be pairwise
+    /// DISTINCT. Without this, collapsing two poses onto one label is invisible — the reviewer
+    /// demonstrated exactly that by making `Freeze` and `Looting` both report `"standing"` and
+    /// watching the whole suite stay green. That is this PR's own bug class one layer up: `label`
+    /// is the agent-facing string, so a collapsed label is the client confidently reporting a
+    /// state that is not true, on the very field added for honesty. `Looting` (105) in particular
+    /// is reachable in ordinary play — a looting character must never read as `standing`.
+    ///
+    /// The label is also deliberately NOT the renderer's clip name: `crouching` and `sitting`
+    /// happen to coincide today, but `looting`/`freeze` report themselves while `scene.rs` draws
+    /// them with the idle clip, and `lying` reports itself while the clip is `dead`. Asserting the
+    /// full table here keeps that separation explicit instead of accidental.
+    #[test]
+    fn every_pose_label_is_exact_and_pairwise_distinct() {
+        let table = [
+            (Pose::Standing,  "standing"),
+            (Pose::Freeze,    "freeze"),
+            (Pose::Looting,   "looting"),
+            (Pose::Sitting,   "sitting"),
+            (Pose::Crouching, "crouching"),
+            (Pose::Lying,     "lying"),
+        ];
+        for (pose, want) in table {
+            assert_eq!(pose.label(), want, "{pose:?} must report exactly {want:?}");
+        }
+        // Wire-code → label, through the real decode path an agent's value actually takes.
+        assert_eq!(Pose::from_wire(100).label(), "standing");
+        assert_eq!(Pose::from_wire(102).label(), "freeze");
+        assert_eq!(Pose::from_wire(105).label(), "looting");
         assert_eq!(Pose::from_wire(110).label(), "sitting");
+        assert_eq!(Pose::from_wire(111).label(), "crouching");
+        assert_eq!(Pose::from_wire(115).label(), "lying");
+
+        let mut labels: Vec<String> = table.iter().map(|(p, _)| p.label()).collect();
+        labels.push(Pose::Unknown(7).label());
+        let n = labels.len();
+        labels.sort();
+        labels.dedup();
+        assert_eq!(labels.len(), n,
+            "two poses collapsed onto one label — an agent could not tell them apart");
     }
 
     /// The wire field is `signed animation:10` (RoF2 position bitfield), and the decoder hands us

@@ -785,7 +785,10 @@ struct EntitiesView {
     duplicate_groups: Vec<DuplicateGroup>,
     /// Human-readable explanation, present only when `deduped > 0`.
     note: Option<String>,
-    /// #643 — name → server-published `{pose, gait}` for every entity in `entities`.
+    /// #643 — name → server-published `{pose, gait}`. Its key set is **exactly** `entities`'s:
+    /// both are projected inside one critical section over the shared world tables, and every
+    /// publisher of `entity_positions` (`ActionLoop::sync_entities` and `login.rs`'s zone-in seed)
+    /// writes both maps together, so `body["poses"][name]` is safe for any `name` in `entities`.
     ///
     /// `pose` is the discrete body state (`standing`/`sitting`/`crouching`/`lying`/`looting`/
     /// `freeze`) and `gait` is the locomotion speed code from the last position update (`null`
@@ -872,22 +875,33 @@ struct EntitiesQuery {
 /// The underlying `gs.world.entities`/`entity_ids` model is untouched in either case, so every instance
 /// stays targetable by its full (suffixed) name.
 async fn get_entities(State(s): State<HttpState>, Query(q): Query<EntitiesQuery>) -> Response {
-    let (entities, deduped, duplicate_groups) = {
-        let positions = s.world.entity_positions.lock().unwrap();
-        dedup_entities(&positions)
-    };
     let labeled = q.labeled.as_deref()
         .is_some_and(|v| v.eq_ignore_ascii_case("1") || v.eq_ignore_ascii_case("true"));
-    if labeled {
-        // #643: pose/gait for exactly the names that survived the dedup, so `poses` and `entities`
-        // always have the same key set. LOCK ORDER: taken after `entity_positions` has been
-        // released above, so this never nests inside the canonical positions→ids order.
-        let poses = {
+    // #643: `entities` and `poses` are read under ONE critical section, so a concurrent
+    // `sync_entities` (which full-replaces positions/ids/poses together while holding all three)
+    // cannot interleave between them. An earlier revision took the two locks sequentially and then
+    // documented that the key sets "always" match — which was not true: a zone change landing in
+    // the gap would have produced a `poses` map missing keys that `entities` still had, so an agent
+    // doing `body["poses"][name]` could KeyError on a race it had been told could not happen.
+    //
+    // ⚠️ LOCK ORDER is `entity_positions` → `entity_poses`, matching `sync_entities`'
+    // `entity_positions` → `entity_ids` → `entity_poses` (poses last in both, positions first in
+    // both). See the canonical-order note in `name_match.rs`. Do not reverse these.
+    let (entities, deduped, duplicate_groups, poses) = {
+        let positions = s.world.entity_positions.lock().unwrap();
+        let (entities, deduped, duplicate_groups) = dedup_entities(&positions);
+        // Only pay for the pose projection on the labeled shape; the bare map does not carry it.
+        let poses = if labeled {
             let all = s.world.entity_poses.lock().unwrap();
             entities.keys()
                 .filter_map(|n| all.get(n).map(|p| (n.clone(), p.clone())))
                 .collect::<HashMap<_, _>>()
+        } else {
+            HashMap::new()
         };
+        (entities, deduped, duplicate_groups, poses)
+    };
+    if labeled {
         let note = (deduped > 0).then(|| format!(
             "{deduped} entry(ies) collapsed as same-name + byte-identical-position duplicates \
              (suspected server-side spawn2 duplication, #471). The underlying entity model is \

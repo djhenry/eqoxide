@@ -148,21 +148,64 @@ fn spawn_appearance_anim_sits_another_entity_643() {
     );
 }
 
-/// The other pose codes on the same channel resolve to their own clips, and an unrecognised code
-/// does NOT silently become standing/idle-with-no-trace: it is retained as `unknown(<raw>)` and
-/// surfaced through the API (asserted in the HTTP test below).
+/// The full pose-code table -> RENDERED CLIP, on the same channel. Every one of the six
+/// `Animation` values plus an unrecognised code.
+///
+/// Main-compatible on purpose (no post-#643 symbols), so it is one of the four tests in this file
+/// that were copied onto unmodified `origin/main` and observed FAILING. The label half of the same
+/// table is pinned separately below, because that half necessarily names new symbols.
 #[test]
 fn spawn_appearance_anim_covers_the_other_pose_codes_643() {
-    let mut gs = eqoxide::game_state::GameState::new();
-    gs.player_name = "Somebody_Else".into();
-    gs.player_id = 1;
-    register_spawn(&mut gs, npc_spawn(42, "a_gnoll_pup", 100));
+    for &(code, want_clip) in &[
+        (100u32, "idle"),
+        (102,    "idle"),
+        (105,    "idle"),
+        (110,    "sitting"),
+        (111,    "crouching"),
+        (115,    "dead"),
+        (199,    "idle"),   // unrecognised -> idle CLIP (but never an idle LABEL, see below)
+    ] {
+        let mut gs = eqoxide::game_state::GameState::new();
+        gs.player_name = "Somebody_Else".into();
+        gs.player_id = 1;
+        register_spawn(&mut gs, npc_spawn(42, "a_gnoll_pup", 100));
+        feed(&mut gs, OP_SPAWN_APPEARANCE, &build_spawn_appearance_packet(42, 14, code));
+        assert_eq!(rendered_action(&gs, 42), want_clip,
+            "pose code {code} must draw the {want_clip:?} clip");
+    }
+}
 
-    feed(&mut gs, OP_SPAWN_APPEARANCE, &build_spawn_appearance_packet(42, 14, 111)); // Crouching
-    assert_eq!(rendered_action(&gs, 42), "crouching");
-
-    feed(&mut gs, OP_SPAWN_APPEARANCE, &build_spawn_appearance_packet(42, 14, 100)); // Standing
-    assert_eq!(rendered_action(&gs, 42), "idle");
+/// The same table -> REPORTED LABEL, the agent-facing half.
+///
+/// Exhaustive because of a review finding on this PR: collapsing two poses onto one label
+/// (`Freeze` and `Looting` both reporting `"standing"`) produced ZERO failures across the whole
+/// suite. `Looting` (105) is reachable in ordinary play, so that mutation is the client
+/// confidently reporting `standing` for a looting character — this PR's own bug class, one layer
+/// up, on the very field it adds for honesty.
+///
+/// Pinned SEPARATELY from the clip table above because the two intentionally differ:
+/// `looting`/`freeze` report themselves but draw with the idle clip, and `lying` reports itself
+/// but draws the `dead` clip. A single combined assertion would let one drift into the other.
+#[test]
+fn pose_codes_reach_the_agent_with_distinct_labels_643() {
+    for &(code, want_label) in &[
+        (100u32, "standing"),
+        (102,    "freeze"),
+        (105,    "looting"),
+        (110,    "sitting"),
+        (111,    "crouching"),
+        (115,    "lying"),
+        (199,    "unknown(199)"),
+    ] {
+        let mut gs = eqoxide::game_state::GameState::new();
+        gs.player_name = "Somebody_Else".into();
+        gs.player_id = 1;
+        register_spawn(&mut gs, npc_spawn(42, "a_gnoll_pup", 100));
+        feed(&mut gs, OP_SPAWN_APPEARANCE, &build_spawn_appearance_packet(42, 14, code));
+        assert_eq!(gs.world.entities[&42].pose.label(), want_label,
+            "pose code {code} must be REPORTED as {want_label:?} — a label shared with another \
+             pose is the client telling an agent something that is not true");
+    }
 }
 
 /// A dead entity must stay lying down: a stray appearance packet must not stand a corpse up.
@@ -289,4 +332,50 @@ async fn entities_labeled_body_reports_pose_and_gait_separately_643() {
         serde_json::json!(null),
         "no position update yet => gait null ('not reported'), NOT 0 ('standing still')"
     );
+}
+
+/// #643 review: the handler and `docs/http-api.md` both promise that `poses` is keyed EXACTLY like
+/// `entities`, so an agent may write `body["poses"][name]` for any `name` in `entities` without a
+/// KeyError. An earlier revision took the two locks sequentially and made that claim anyway, which
+/// was false — a zone change landing in the gap would have dropped keys.
+///
+/// What this test can and cannot show: it pins that the projection does not drop keys for the
+/// entities it is given (including through the #471 dedup, which is where a mismatch would be
+/// easiest to introduce). The RACE itself is excluded structurally, not by this test — both maps
+/// are now read under one critical section, and both publishers (`sync_entities` and `login.rs`'s
+/// zone-in seed) write positions and poses together. Per the verification hierarchy, a passing
+/// example test does not discharge a "cannot" claim; the single lock scope is what does.
+#[tokio::test]
+async fn entities_and_poses_have_identical_key_sets_643() {
+    use eqoxide::http::testkit::{empty_state, observe_json, world_slots};
+
+    let state = empty_state();
+    {
+        let world = world_slots(&state);
+        let mut pos = world.entity_positions.lock().unwrap();
+        let mut poses = world.entity_poses.lock().unwrap();
+        let mk = |p: &str, g: Option<i32>| eqoxide::ipc::EntityPoseView { pose: p.into(), gait: g };
+        // Two byte-identical same-base-name spawns: the #471 dedup collapses these, so the
+        // surviving key must still resolve in `poses`.
+        pos.insert("a_rat000".into(), (1.0, 2.0, 3.0));
+        pos.insert("a_rat001".into(), (1.0, 2.0, 3.0));
+        pos.insert("Guard_Buce".into(), (9.0, 9.0, 9.0));
+        poses.insert("a_rat000".into(), mk("standing", Some(0)));
+        poses.insert("a_rat001".into(), mk("sitting", None));
+        poses.insert("Guard_Buce".into(), mk("looting", Some(-12)));
+    }
+
+    let body = observe_json(state, "/entities?labeled=1").await;
+    let entities = body["entities"].as_object().unwrap();
+    let poses = body["poses"].as_object().unwrap();
+    assert!(body["deduped"].as_u64().unwrap() >= 1, "test premise: the dedup actually fired");
+    let mut ek: Vec<_> = entities.keys().collect();
+    let mut pk: Vec<_> = poses.keys().collect();
+    ek.sort();
+    pk.sort();
+    assert_eq!(ek, pk,
+        "every name in `entities` must be indexable in `poses` and vice versa — the handler and \
+         docs/http-api.md both promise it");
+    assert_eq!(poses["Guard_Buce"]["gait"], serde_json::json!(-12),
+        "a negative (backing-up) gait survives serialization as a negative number");
 }

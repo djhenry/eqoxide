@@ -109,9 +109,20 @@ pub async fn run_login_flow(
                 {
                     let mut map = world.entity_positions.lock().unwrap();
                     let mut ids = world.entity_ids.lock().unwrap();
+                    // #643: pose/gait is seeded HERE TOO, not only by `ActionLoop::sync_entities`.
+                    // This is the second publisher of `entity_positions`; if it seeded positions
+                    // without poses, `/v1/observe/entities?labeled=1` would report entities whose
+                    // `poses` key is missing for the whole window between login and the first nav
+                    // tick — the exact KeyError-on-a-race the handler now promises cannot happen.
+                    // Same lock order as `sync_entities`: positions → ids → poses.
+                    let mut poses = world.entity_poses.lock().unwrap();
                     for (&id, e) in &gs.world.entities {
                         map.insert(e.name.clone(), (e.x, e.y, e.z));
                         ids.insert(e.name.clone(), id);
+                        poses.insert(e.name.clone(), eqoxide_ipc::EntityPoseView {
+                            pose: e.pose.label(),
+                            gait: e.gait.map(|g| g.raw()),
+                        });
                     }
                     tracing::info!("NAV: entity map seeded with {} entities", map.len());
                 }

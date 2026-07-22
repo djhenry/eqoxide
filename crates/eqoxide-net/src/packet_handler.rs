@@ -2250,11 +2250,25 @@ pub(crate) fn apply_target_command(gs: &mut GameState, payload: &[u8]) {
 
 /// OP_SpawnAppearance render-side handler: `{ id: u16, kind: u16, param: u32 }`.
 ///
-/// We only consume the ANIMATION appearance (kind 14) for OUR OWN player, mapping param 110→sitting,
-/// 100→standing. A client-initiated sit/stand sets `gs.sitting` directly at the send site
-/// (gameplay.rs), so this handler's own job is to keep it in sync with SERVER broadcasts of the
-/// same opcode (e.g. a GM-forced sit, or another client's action reflected back) (#53). Other kinds
-/// / other spawns are ignored (their pose comes from spawn and scene state).
+/// The ANIMATION appearance (kind 14) is the server's POSE-CHANGE BROADCAST, and it is consumed for
+/// **every** spawn — ours and everyone else's:
+///
+/// - **Our own player** → `gs.sitting` (param 110→sitting, 100→standing). A client-initiated
+///   sit/stand sets `gs.sitting` directly at the send site (gameplay.rs), so this half's job is to
+///   keep it in sync with SERVER broadcasts of the same opcode (e.g. a GM-forced sit, or another
+///   client's action reflected back) (#53).
+/// - **Any other spawn** → that entity's `pose` (#643). This is the ONLY channel by which an NPC's
+///   or another player's pose change reaches us after it spawns; every server-side pose transition
+///   funnels through `Mob::SetAppearance` → `SendAppearancePacket`, and the spawn struct's
+///   `StandState` only ever describes the pose at spawn time.
+///
+/// ⚠️ This doc comment previously said "Other kinds / other spawns are ignored (their pose comes
+/// from spawn and scene state)" — which was the FALSE MODEL that produced #643. It was not merely
+/// stale: it asserted that a pose could be reconstructed without this opcode, and on that basis the
+/// non-self branch was never written, so no entity could change pose after spawning. Do not
+/// reintroduce that claim; there is no other source.
+///
+/// Other appearance KINDS (guild id/rank, flymode) are handled below for our own spawn only.
 fn apply_spawn_appearance(gs: &mut GameState, payload: &[u8]) {
     if payload.len() < 8 { return; }
     let id    = u16::from_le_bytes([payload[0], payload[1]]) as u32;
