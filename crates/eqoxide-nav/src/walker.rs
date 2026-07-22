@@ -41,6 +41,11 @@ use eqoxide_core::physics::RUN_SPEED;
 /// Read `zone_assets` on GET /v1/observe/debug to tell *pending* from *failed*.
 pub const NAV_STATE_ZONE_LOADING: &str = "zone_loading";
 
+/// How many nav ticks between live clearance-probe refreshes for the diagnostics snapshot (#608).
+/// The probe is ~48 short raycasts and the walker ticks on the net thread — sampling every Nth
+/// tick keeps the diagnostic from perturbing what it observes.
+const CLEARANCE_REFRESH_TICKS: u32 = 8;
+
 /// The path-walker: (re)plans the coarse/fine route toward the active `/goto` goal, steers
 /// pure-pursuit along it, and drives arrival/stall/fall-edge/portal-escape handling.
 ///
@@ -53,11 +58,23 @@ pub struct Walker {
     collision: crate::collision::SharedCollision,
     /// The ONLY movement channel — see the module doc's "intent-only movement boundary".
     nav_intent: eqoxide_ipc::NavIntent,
-    /// The DRAW-ONLY committed-path overlay this walker publishes for the render View (#246). MVC C2
-    /// (#452): this is derived/read state, not a command, so it lives on `ipc::ControllerSlots`
-    /// (a render↔nav channel like `nav_intent`) and is handed in here as its own clone — NOT reached
-    /// through `self.nav` (the command bundle no longer carries it).
-    nav_path_view: eqoxide_ipc::NavPathView,
+    /// The published nav diagnostics snapshot (#608, replacing the old `NavPathView` pair): the
+    /// walker is the ONLY writer, the renderer's 3D overlay and `/v1/observe/nav_debug` are the
+    /// readers. It carries the walker's ACTUAL committed routes (`self.path`/`self.local_path`,
+    /// verbatim — the #246 property), the last plan's per-edge trace, pad knowledge, and the live
+    /// clearance sample. ONE published source: a second copy of any of these would be a channel
+    /// that could drift. See `crate::diagnostics`.
+    nav_debug: crate::diagnostics::NavDebugView,
+    /// Monotonic snapshot publish counter (consumers key their caching on it).
+    debug_seq: u64,
+    /// The last coarse plan's debug record (kept across route clears — it is the diagnostic OF a
+    /// failure; cleared on zone change, when it would describe the wrong zone's geometry).
+    last_plan: Option<std::sync::Arc<crate::diagnostics::PlanDebug>>,
+    /// Same-zone pad knowledge as of the last plan post (#543/#266/#403).
+    last_pads: Vec<crate::diagnostics::PadDebug>,
+    /// Throttled live clearance sample near the player (see `CLEARANCE_REFRESH_TICKS`).
+    last_clearance: Option<crate::diagnostics::ClearanceProbe>,
+    clearance_countdown: u32,
 
     /// Cached A* waypoints for the current goto goal (routes around walls). `path_i` is the
     /// current waypoint; `path_goal` is the goal these waypoints were computed for (recompute
@@ -107,19 +124,24 @@ pub struct Walker {
 
 impl Walker {
     /// `nav`/`world`/`collision` must be `.clone()`s of the SAME bundles `ActionLoop` keeps for its
-    /// own (non-walker) uses, and `nav_intent`/`nav_path_view` must be `controller.nav_intent.clone()`
-    /// / `controller.nav_path_view.clone()` — NOT fresh `Default`s, or the walker would drive an
-    /// intent slot nothing reads / publish an overlay `App` never sees (see the module doc's
-    /// intent-only boundary and `ActionLoop::new`).
+    /// own (non-walker) uses, `nav_intent` must be `controller.nav_intent.clone()`, and `nav_debug`
+    /// must be a clone of the SAME `NavDebugView` `main.rs` hands to the render/HTTP consumers —
+    /// NOT fresh `Default`s, or the walker would drive an intent slot nothing reads / publish a
+    /// snapshot nothing sees (see the module doc's intent-only boundary and `ActionLoop::new`).
     pub fn new(
-        nav:           eqoxide_ipc::NavSlots,
-        world:         eqoxide_ipc::WorldSlots,
-        collision:     crate::collision::SharedCollision,
-        nav_intent:    eqoxide_ipc::NavIntent,
-        nav_path_view: eqoxide_ipc::NavPathView,
+        nav:        eqoxide_ipc::NavSlots,
+        world:      eqoxide_ipc::WorldSlots,
+        collision:  crate::collision::SharedCollision,
+        nav_intent: eqoxide_ipc::NavIntent,
+        nav_debug:  crate::diagnostics::NavDebugView,
     ) -> Self {
         Walker {
-            nav, world, collision, nav_intent, nav_path_view,
+            nav, world, collision, nav_intent, nav_debug,
+            debug_seq: 0,
+            last_plan: None,
+            last_pads: Vec::new(),
+            last_clearance: None,
+            clearance_countdown: 0,
             path: Vec::new(),
             path_i: 0,
             path_goal: None,
@@ -172,7 +194,11 @@ impl Walker {
         *self.nav.goto_target.lock().unwrap() = None;
         *self.nav.goto_entity.lock().unwrap() = None;
         *self.nav_intent.lock().unwrap() = None; // stop driving the controller toward the stale aim
-        *self.nav_path_view.lock().unwrap() = (Vec::new(), Vec::new()); // clear the overlay line
+        // The debug snapshot's plan/pads/clearance describe the PREVIOUS zone's geometry — keeping
+        // them would present the old zone's trace over the new zone's world (#608 honesty).
+        self.last_plan = None;
+        self.last_pads.clear();
+        self.last_clearance = None;
         self.path.clear();
         self.local_path.clear();
         self.local_i = 0;
@@ -195,6 +221,10 @@ impl Walker {
         self.awaiting_first_plan = false;
         self.set_nav_state("idle");
         self.nav.nav_state.lock().unwrap().tier = None; // no route committed → no per-route tier
+        // Publish the cleared snapshot so no consumer keeps drawing the previous zone's state.
+        // Position: None — the old zone's coordinates would be a confident wrong answer in the
+        // new zone's space (#615 review F1); the next tick republishes the real one.
+        self.publish_debug(None, None);
     }
 
     /// Publish the current `/move/goto` navigation state for GET /v1/observe/debug (#166, #337).
@@ -230,6 +260,90 @@ impl Walker {
     pub fn set_nav_local(&self, local: Option<eqoxide_ipc::NavLocal>) {
         let mut s = self.nav.nav_state.lock().unwrap();
         if s.local != local { s.local = local; }
+    }
+
+    /// The player's position for the snapshot — **`None` until the server has told us where we
+    /// are** (#615 review F1: a fresh login published a confident `[0,0,0]`, 985 units from the
+    /// character; "unknown" must be representable, never a fabricated origin).
+    fn known_pos(gs: &GameState) -> Option<[f32; 3]> {
+        gs.player_pos_known.then(|| [gs.player_x, gs.player_y, gs.player_z])
+    }
+
+    /// Publish the nav diagnostics snapshot (#608). **This is the one place the snapshot is
+    /// written**, and every field is copied from the walker's OWN state — `self.path` /
+    /// `self.local_path` verbatim (the #246 committed-route property), the planner's own trace,
+    /// the pad knowledge the last plan was given. Consumers (the 3D overlay, the HTTP endpoint)
+    /// render this and nothing else; there is no second derivation for them to disagree with.
+    fn publish_debug(&mut self, player: Option<[f32; 3]>, water: Option<crate::diagnostics::WaterDebug>) {
+        self.debug_seq += 1;
+        let (state, reason) = {
+            let s = self.nav.nav_state.lock().unwrap();
+            (s.state.clone(), s.reason.clone())
+        };
+        let goal = self.nav.goto_target.lock().unwrap().map(|(x, y, z)| [x, y, z]);
+        let snap = crate::diagnostics::NavDebugSnapshot {
+            seq: self.debug_seq,
+            zone_model_loaded: self.collision.read().unwrap().is_some(),
+            nav_state: state,
+            nav_reason: reason,
+            player,
+            published_at: std::time::Instant::now(),
+            goal,
+            committed_coarse: self.path.clone(),
+            committed_fine: self.local_path.clone(),
+            plan: self.last_plan.clone(),
+            pads: self.last_pads.clone(),
+            clearance: self.last_clearance.clone(),
+            water,
+        };
+        *self.nav_debug.lock().unwrap() = Some(std::sync::Arc::new(snap));
+    }
+
+    /// Read handle for consumers/tests. The walker remains the only WRITER.
+    pub fn debug_view(&self) -> &crate::diagnostics::NavDebugView { &self.nav_debug }
+
+    /// Is the published snapshot already the settled no-goto state? Used by `resolve_goal` so the
+    /// no-goto tick republishes only when something drifted, not every idle tick.
+    ///
+    /// #615 review F1: this comparison MUST cover every published field that can change while no
+    /// goto is active — `player` (WASD / server-pushed movement) and `zone_model_loaded` (assets
+    /// finishing their load) drift on an idle walker, and comparing only routes/state left a
+    /// fresh-login snapshot claiming `[0,0,0]` + "no world model" forever, 985 units from the
+    /// character, while the `zone_assets` object beside it said "ready".
+    fn debug_is_settled(&self, gs: &GameState) -> bool {
+        let snap = self.nav_debug.lock().unwrap();
+        match snap.as_ref() {
+            None => false,
+            Some(s) => {
+                let live = self.nav.nav_state.lock().unwrap();
+                let pos_settled = match (s.player, Self::known_pos(gs)) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) =>
+                        // A small tolerance so idle float jitter doesn't republish every tick;
+                        // real movement (even one step) exceeds it and republishes.
+                        (a[0] - b[0]).abs() < 0.5 && (a[1] - b[1]).abs() < 0.5 && (a[2] - b[2]).abs() < 0.5,
+                    _ => false,
+                };
+                pos_settled
+                    && s.zone_model_loaded == self.collision.read().unwrap().is_some()
+                    && s.committed_coarse.is_empty() && s.committed_fine.is_empty() && s.goal.is_none()
+                    && s.nav_state == live.state && s.nav_reason == live.reason
+            }
+        }
+    }
+
+    /// Refresh the live clearance sample at a throttled cadence: the probe is ~48 raycasts, and
+    /// the walker ticks on the net thread, so it is sampled every [`CLEARANCE_REFRESH_TICKS`]th
+    /// tick rather than every tick — a diagnostic must not perturb the behaviour it observes. The
+    /// sample carries its own `at`, so a consumer always knows where it was taken.
+    fn refresh_clearance(&mut self, player: [f32; 3]) {
+        if self.clearance_countdown > 0 {
+            self.clearance_countdown -= 1;
+            return;
+        }
+        self.clearance_countdown = CLEARANCE_REFRESH_TICKS;
+        self.last_clearance = self.collision.read().unwrap().as_ref()
+            .map(|c| c.clearance_probe(player[0], player[1], player[2]));
     }
 
     /// Read the current nav state word (without the reason).
@@ -270,6 +384,9 @@ impl Walker {
         self.awaiting_first_plan = false;
         *self.nav.goto_target.lock().unwrap() = None;
         *self.nav_intent.lock().unwrap() = None;
+        // Publish the terminal state. `last_plan` is deliberately KEPT: its trace is the
+        // diagnostic OF this failure — exactly what a consumer needs to see now (#608).
+        self.publish_debug(Self::known_pos(gs), None);
     }
 
     /// Apply a finished FINE plan from the local worker (#382). See the pre-extraction doc comment
@@ -315,6 +432,29 @@ impl Walker {
         self.awaiting_first_plan = false;
         let snapped = reply.goal_snapped;
         self.goal_snapped = snapped.is_some();
+        // Record the plan's debug record (#608) from the WORKER'S OWN reply — the outcome, the
+        // reason, and the per-edge trace it recorded while searching. Published at the end of this
+        // method, once the nav_state it belongs with has been set.
+        {
+            let (outcome_str, route_len) = match &reply.outcome {
+                PlanOutcome::Route(p) => ("route", p.len()),
+                PlanOutcome::Unreachable { .. } => ("unreachable", 0),
+                PlanOutcome::Exhausted { progress, .. } =>
+                    ("exhausted", progress.as_ref().map_or(0, |p| p.len())),
+            };
+            self.last_plan = Some(std::sync::Arc::new(crate::diagnostics::PlanDebug {
+                gen: reply.gen,
+                start: reply.start,
+                goal: reply.goal,
+                outcome: outcome_str.to_string(),
+                reason: reply.outcome.reason().to_string(),
+                route_len,
+                plan_ms: reply.plan_ms as u64,
+                tight: reply.tight,
+                goal_snapped: snapped.is_some(),
+                trace: reply.trace.clone(),
+            }));
+        }
         match snapped {
             Some(crate::collision::GoalSnap::ToColumnFloor { z }) => gs.log_msg("zone", &format!(
                 "Goal z={:.0} is not on any floor — routing to the floor at z={:.0} instead (the client \
@@ -345,6 +485,7 @@ impl Walker {
                 }
                 self.nav.nav_state.lock().unwrap().tier =
                     Some(if reply.tight { "minimum" } else { "preferred" });
+                self.publish_debug(Self::known_pos(gs), None);
                 false
             }
             // The search was CUT SHORT — "I don't know", not "no route".
@@ -358,6 +499,7 @@ impl Walker {
                 self.stuck_i = 0;
                 self.clear_local_plan();
                 self.set_nav_state_because("navigating_partial", Some(limit.as_str()));
+                self.publish_debug(Self::known_pos(gs), None);
                 false
             }
             // Gave up with nothing usable. Honest "I DON'T KNOW".
@@ -408,7 +550,6 @@ impl Walker {
         *self.nav.goto_entity.lock().unwrap() = None;      // drop any entity chase
         *self.nav.zone_cross.lock().unwrap() = None;        // drop a queued zone-cross
         *self.nav_intent.lock().unwrap() = None;             // stop driving the controller
-        *self.nav_path_view.lock().unwrap() = (Vec::new(), Vec::new()); // clear the overlay line
         self.path.clear();
         self.local_path.clear();
         self.local_i = 0;
@@ -418,6 +559,7 @@ impl Walker {
         self.planner.cancel();
         self.awaiting_first_plan = false;
         self.set_nav_state("idle");
+        self.publish_debug(Self::known_pos(gs), None);
         true
     }
 
@@ -489,7 +631,7 @@ impl Walker {
 
     /// Resolves the active `/goto` target for this tick, or performs the "no active goto"
     /// stop-and-reset and returns `None` when there is none (caller must stop the tick).
-    pub fn resolve_goal(&mut self) -> Option<(f32, f32, f32)> {
+    pub fn resolve_goal(&mut self, gs: &GameState) -> Option<(f32, f32, f32)> {
         let goto = *self.nav.goto_target.lock().unwrap(); // copy out so the lock is released
         let goal = match goto {
             Some(t) => t,
@@ -505,6 +647,14 @@ impl Walker {
                     || self.nav_state_is("planning") || self.nav_state_is(NAV_STATE_ZONE_LOADING)
                 {
                     self.set_nav_state("idle");
+                }
+                // Publish the cleared/terminal state so the snapshot does not keep saying
+                // "arrived"/"navigating" with a route after the goto ended, and REPUBLISH whenever
+                // an idle field drifts — the player moved (WASD / server push), the zone model
+                // loaded — so a consumer can never read a stale confident position (#615 review
+                // F1). `debug_is_settled` gates it to actual drift, not every idle tick.
+                if !self.debug_is_settled(gs) {
+                    self.publish_debug(Self::known_pos(gs), None);
                 }
                 return None;
             }
@@ -544,17 +694,35 @@ impl Walker {
     /// sentinel (`999999`, relocates nobody) dropped — then honesty-gated by `resolve_teleport_pads`
     /// (only pads whose footprint AND advertised destination land on walkable floor become edges).
     /// Empty in the common case (a zone with no same-zone pads), so ordinary plans pay nothing.
-    fn same_zone_teleport_pads(&self, gs: &GameState, c: &crate::collision::Collision)
+    fn same_zone_teleport_pads(&mut self, gs: &GameState, c: &crate::collision::Collision)
         -> Vec<crate::collision::PadEdge> {
-        let advertised: Vec<(i32, [f32; 3])> = self.world.zone_points.lock().unwrap().iter()
-            .filter(|zp| zp.zone_id == gs.world.zone_id
-                && zp.server_x.abs() < 900_000.0
-                && zp.server_y.abs() < 900_000.0
-                && zp.server_z.abs() < 900_000.0)
-            .map(|zp| (zp.iterator as i32, [zp.server_x, zp.server_y, zp.server_z]))
-            .collect();
-        if advertised.is_empty() { return Vec::new(); }
-        c.resolve_teleport_pads(&advertised)
+        use crate::diagnostics::{PadDebug, PadKnowledge};
+        let mut advertised: Vec<(i32, [f32; 3])> = Vec::new();
+        // Same-zone pads with NO usable advertised destination (the keep-position sentinel): their
+        // true behaviour has never been observed — `Unknown`, first-class, in the debug record.
+        let mut unknown_idxs: Vec<i32> = Vec::new();
+        for zp in self.world.zone_points.lock().unwrap().iter() {
+            if zp.zone_id != gs.world.zone_id { continue; }
+            if zp.server_x.abs() < 900_000.0 && zp.server_y.abs() < 900_000.0 && zp.server_z.abs() < 900_000.0 {
+                advertised.push((zp.iterator as i32, [zp.server_x, zp.server_y, zp.server_z]));
+            } else {
+                unknown_idxs.push(zp.iterator as i32);
+            }
+        }
+        let edges = if advertised.is_empty() { Vec::new() } else { c.resolve_teleport_pads(&advertised) };
+        // Publish what nav KNOWS about each pad (#608/#543): advertised-and-usable (an A* edge
+        // exists), advertised-but-refused by the honesty gate, or unknown. The `Learned*` states
+        // arrive with the #543 learning loop.
+        self.last_pads = advertised.iter().map(|&(idx, _)| {
+            match edges.iter().find(|e| e.index == idx) {
+                Some(e) => PadDebug { index: idx, knowledge: PadKnowledge::AdvertisedUsable {
+                    source: e.source, dest: e.dest } },
+                None => PadDebug { index: idx, knowledge: PadKnowledge::AdvertisedUnusable },
+            }
+        }).chain(unknown_idxs.into_iter().map(|idx| PadDebug {
+            index: idx, knowledge: PadKnowledge::Unknown,
+        })).collect();
+        edges
     }
 
     /// #579 (agent-honesty): there is no collision grid, so this client has NO model of the world —
@@ -566,7 +734,7 @@ impl Walker {
     /// `nav_state: "navigating"` and steered in a dead-straight line at the goal, so an agent
     /// observing mid-load saw a confident walkable route through geometry that had not been built
     /// (the "700u unobstructed" of the false #560 report).
-    fn halt_no_world(&mut self) {
+    fn halt_no_world(&mut self, player: Option<[f32; 3]>) {
         self.path.clear();
         self.path_i = 0;
         self.path_goal = None;      // force a REAL plan the moment collision appears
@@ -574,8 +742,11 @@ impl Walker {
         self.planner.cancel();
         self.awaiting_first_plan = false;
         *self.nav_intent.lock().unwrap() = None;
-        *self.nav_path_view.lock().unwrap() = (Vec::new(), Vec::new());
         self.set_nav_state_because(NAV_STATE_ZONE_LOADING, Some("zone_assets_not_loaded"));
+        // Publish honestly: `zone_model_loaded: false`, no routes — "I have no model of this
+        // world", never a route through unloaded geometry (#579). `player` comes from the caller's
+        // GameState (None until the server placed us — never a fabricated position, #615 F1).
+        self.publish_debug(player, None);
     }
 
     pub fn drive_walk(&mut self, gs: &mut GameState, goal: (f32, f32, f32)) {
@@ -583,10 +754,12 @@ impl Walker {
         // geometry as a route (#579). Checked BEFORE any planning/steering so the walker cannot
         // move the character on a world it does not have.
         if self.collision.read().unwrap().is_none() {
-            self.halt_no_world();
+            self.halt_no_world(Self::known_pos(gs));
             return;
         }
         if self.replan_cooldown > 0 { self.replan_cooldown -= 1; }
+        // Throttled live clearance sample for the diagnostics snapshot (#608).
+        self.refresh_clearance([gs.player_x, gs.player_y, gs.player_z]);
         let is_chase = self.nav.goto_entity.lock().unwrap().is_some();
         let in_flight = self.planner.in_flight_goal().map(|g| (g[0], g[1], g[2]));
         let decision = replan_decision(self.path_goal, goal, in_flight, self.replan_coarse, is_chase);
@@ -641,7 +814,7 @@ impl Walker {
                 }
                 // The collision grid vanished between the gate at the top of this fn and here (a
                 // zone change landing mid-tick). Same honest answer, never a bare "navigating".
-                None => { self.halt_no_world(); return; }
+                None => { self.halt_no_world(Self::known_pos(gs)); return; }
             }
         }
 
@@ -659,6 +832,7 @@ impl Walker {
 
         if self.awaiting_first_plan {
             *self.nav_intent.lock().unwrap() = None;
+            self.publish_debug(Self::known_pos(gs), None); // "planning", no route yet
             return;
         }
 
@@ -714,13 +888,13 @@ impl Walker {
 
             let aim = steer_target(&self.path, self.path_i, &self.local_path, &mut self.local_i,
                 [px, py, pz], LOOK_AHEAD, coarse);
-            *self.nav_path_view.lock().unwrap() = (self.path.clone(), self.local_path.clone());
             (aim[0], aim[1], aim[2])
         } else {
             self.clear_local_plan();
-            *self.nav_path_view.lock().unwrap() = (Vec::new(), Vec::new());
             (goal.0, goal.1, gs.player_z)
         };
+        // (The committed coarse/fine routes are published in the snapshot at the end of this tick —
+        // the old separate `nav_path_view` pair is gone: ONE published source, #608.)
 
         let dx   = target.0 - gs.player_x; // east  delta (server_x)
         let dy   = target.1 - gs.player_y; // north delta (server_y)
@@ -745,6 +919,7 @@ impl Walker {
                 *self.nav.goto_target.lock().unwrap() = None;
                 *self.nav_intent.lock().unwrap() = None; // else the controller keeps walking the last
                 // wish_dir forever — drifting 1000s of units with no nav activity (eqoxide#71).
+                self.publish_debug(Self::known_pos(gs), None);
                 return;
             }
             // Non-lethal: fall through to normal walking — the controller descends off the edge.
@@ -770,6 +945,7 @@ impl Walker {
                 self.path_goal = None;
                 *self.nav_intent.lock().unwrap() = None; // stand still until the leader moves
                 gs.player_heading = eq_heading(gdx, gdy);
+                self.publish_debug(Self::known_pos(gs), None);
                 return;
             }
             ArrivalAction::Arrived => {
@@ -790,6 +966,7 @@ impl Walker {
                 *self.nav.goto_target.lock().unwrap() = None;
                 *self.nav_intent.lock().unwrap() = None; // stop driving the controller
                 gs.player_heading = eq_heading(gdx, gdy);
+                self.publish_debug(Self::known_pos(gs), None);
                 return;
             }
             ArrivalAction::Drive => {} // not there yet — keep walking / re-plan below
@@ -847,6 +1024,7 @@ impl Walker {
                     tracing::warn!("NAV: backed off downhill — posted re-plan #{gen} (attempt {})", self.nav_repaths);
                 }
             }
+            self.publish_debug(Self::known_pos(gs), None);
             return;
         }
 
@@ -929,6 +1107,13 @@ impl Walker {
             climb:       0.0, // nav uses the native step-up now (#239); fences handled by hop
             hop:         self.stuck_ticks >= NAV_HOP_TICKS,
         });
+        // Publish this tick's snapshot: the committed routes the walker is ACTUALLY following and
+        // the swim state it just acted on — the same `swim`/`swim_plane` that went into the intent
+        // above, not a recompute (#608).
+        self.publish_debug(
+            Self::known_pos(gs),
+            Some(crate::diagnostics::WaterDebug { swimming: swim, swim_plane }),
+        );
     }
 }
 
@@ -938,12 +1123,12 @@ mod tests {
     use std::sync::Arc;
 
     fn walker_with(collision: crate::collision::SharedCollision)
-        -> (Walker, eqoxide_ipc::NavSlots, eqoxide_ipc::NavIntent, eqoxide_ipc::NavPathView)
+        -> (Walker, eqoxide_ipc::NavSlots, eqoxide_ipc::NavIntent, crate::diagnostics::NavDebugView)
     {
         let nav: eqoxide_ipc::NavSlots = Default::default();
         let world: eqoxide_ipc::WorldSlots = Default::default();
         let intent: eqoxide_ipc::NavIntent = Default::default();
-        let view: eqoxide_ipc::NavPathView = Default::default();
+        let view: crate::diagnostics::NavDebugView = Default::default();
         let w = Walker::new(nav.clone(), world, collision, intent.clone(), view.clone());
         (w, nav, intent, view)
     }
@@ -970,8 +1155,11 @@ mod tests {
         assert_eq!(s.reason.as_deref(), Some("zone_assets_not_loaded"));
         assert!(intent.lock().unwrap().is_none(),
             "the walker must not drive the controller through a world it has not loaded");
-        let (coarse, fine) = view.lock().unwrap().clone();
-        assert!(coarse.is_empty() && fine.is_empty(), "no route may be published without collision");
+        let snap = view.lock().unwrap().clone().expect("the honest no-world state must be published");
+        assert!(!snap.zone_model_loaded, "the snapshot must say there is NO world model");
+        assert!(snap.committed_coarse.is_empty() && snap.committed_fine.is_empty(),
+            "no route may be published without collision");
+        assert_eq!(snap.nav_state, NAV_STATE_ZONE_LOADING);
         assert!(w.path.is_empty());
     }
 
@@ -998,7 +1186,118 @@ mod tests {
         w.drive_walk(&mut gs, (700.0, 0.0, 0.0));
         assert_eq!(nav.nav_state.lock().unwrap().state, NAV_STATE_ZONE_LOADING);
         *nav.goto_target.lock().unwrap() = None;
-        assert!(w.resolve_goal().is_none());
+        assert!(w.resolve_goal(&gs).is_none());
         assert_eq!(nav.nav_state.lock().unwrap().state, "idle");
+    }
+
+    /// **#615 review F1 — the idle snapshot must TRACK reality, never fabricate it.** The live
+    /// finding: a fresh login published `player: [0,0,0]` (985 units from the character) with
+    /// `zone_model_loaded: false`, and the idle walker never republished — a confident wrong
+    /// position with no age and no hedge, forever. Pins all four halves of the fix:
+    /// unknown position publishes `None` (never an invented origin); a known position republishes
+    /// on movement; `zone_model_loaded` republishes when assets land; and a genuinely idle walker
+    /// does NOT churn (seq stable).
+    #[test]
+    fn idle_snapshot_tracks_player_and_world_and_never_fabricates_a_position() {
+        let (mut w, _nav, _intent, view) = walker_with(open_plane(200.0));
+        let mut gs = eqoxide_core::game_state::GameState::new();
+        assert!(!gs.player_pos_known, "fixture premise: a fresh GameState has no known position");
+
+        // 1. No goto, position UNKNOWN: the settled publish must say None — not [0,0,0].
+        assert!(w.resolve_goal(&gs).is_none());
+        let snap = view.lock().unwrap().clone().expect("the idle state must be published");
+        assert_eq!(snap.player, None,
+            "an unknown position must publish as None — [0,0,0] was the #615-F1 confident lie");
+        assert!(snap.zone_model_loaded, "the collision grid is loaded and must be reported so");
+
+        // 2. The server places us: the next idle tick must republish the REAL position.
+        gs.player_pos_known = true;
+        gs.player_x = 398.9; gs.player_y = 899.1; gs.player_z = 12.0;
+        assert!(w.resolve_goal(&gs).is_none());
+        let snap = view.lock().unwrap().clone().unwrap();
+        assert_eq!(snap.player, Some([398.9, 899.1, 12.0]),
+            "the idle snapshot must track where the character actually is");
+
+        // 3. Genuinely idle: no republish churn.
+        let seq_before = snap.seq;
+        for _ in 0..3 { assert!(w.resolve_goal(&gs).is_none()); }
+        assert_eq!(view.lock().unwrap().clone().unwrap().seq, seq_before,
+            "an unchanged idle state must not republish every tick");
+
+        // 4. The character moves (WASD / server push — no goto involved): republish.
+        gs.player_x = 350.0;
+        assert!(w.resolve_goal(&gs).is_none());
+        let snap = view.lock().unwrap().clone().unwrap();
+        assert!(snap.seq > seq_before, "movement must republish");
+        assert_eq!(snap.player, Some([350.0, 899.1, 12.0]));
+    }
+
+    /// GLB-space quad (`positions` are `[north, up, east]`) — the synthetic-fixture pattern the
+    /// planner/traversability tests use: hand-built geometry with known-correct answers, no baked
+    /// assets, CI-safe.
+    fn quad(v: Vec<[f32; 3]>) -> eqoxide_assets::MeshData {
+        eqoxide_assets::MeshData {
+            positions: v, normals: vec![], uvs: vec![], indices: vec![0, 1, 2, 0, 2, 3],
+            texture_name: None, base_color: [1.0; 4], center: [0.0; 3],
+            render_mode: eqoxide_assets::RenderMode::Opaque, anim: None,
+        }
+    }
+
+    fn open_plane(half: f32) -> crate::collision::SharedCollision {
+        let terrain = vec![quad(vec![
+            [-half, 0.0, -half], [half, 0.0, -half], [half, 0.0, half], [-half, 0.0, half],
+        ])];
+        let col = crate::collision::Collision::build(
+            &eqoxide_assets::ZoneAssets { terrain, objects: vec![], textures: vec![] }, 32.0);
+        Arc::new(std::sync::RwLock::new(Some(Arc::new(col))))
+    }
+
+    /// **THE #246/#608 PUBLISH PROPERTY.** Once a real plan lands, the published snapshot's
+    /// `committed_coarse` IS the walker's own `path` — the route it actually follows — and the
+    /// snapshot carries the planner's own record of the plan (outcome + a trace whose accepted
+    /// edges exist). No consumer input goes anywhere near this: the walker is the only writer.
+    ///
+    /// Mutation-checked at authoring time: publishing an empty/fabricated route in
+    /// `publish_debug` instead of `self.path` turns this RED.
+    #[test]
+    fn published_snapshot_carries_the_walkers_actual_committed_route_and_the_plan_trace() {
+        use crate::diagnostics::{EdgeKind, EdgeVerdict};
+        let (mut w, nav, _intent, view) = walker_with(open_plane(400.0));
+        let mut gs = eqoxide_core::game_state::GameState::new();
+        gs.player_x = -300.0; gs.player_y = 0.0; gs.player_z = 0.0;
+        gs.player_pos_known = true;
+        *nav.goto_target.lock().unwrap() = Some((300.0, 0.0, 0.0));
+
+        // Tick until the worker's plan lands and the walker commits a route.
+        let mut committed = false;
+        for _ in 0..2000 {
+            w.drive_walk(&mut gs, (300.0, 0.0, 0.0));
+            if !w.path.is_empty() { committed = true; break; }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(committed, "an open-plane goal must plan and commit a route");
+
+        let snap = view.lock().unwrap().clone().expect("a snapshot must be published");
+        assert!(snap.zone_model_loaded);
+        assert_eq!(snap.committed_coarse, w.path,
+            "the published committed route must BE the walker's own path — byte-for-byte (#246)");
+        assert_eq!(snap.goal, Some([300.0, 0.0, 0.0]));
+
+        let plan = snap.plan.as_ref().expect("the plan record must be published");
+        assert_eq!(plan.outcome, "route");
+        assert_eq!(plan.reason, "route");
+        assert!(plan.route_len >= 2);
+        assert_eq!(plan.goal, [300.0, 0.0, 0.0]);
+        // The planner's own trace: at least one call, accepted Walk edges present, and the
+        // outcome-call range points into `calls`.
+        assert!(!plan.trace.calls.is_empty(), "the coarse worker must arm the edge trace");
+        let (o0, o1) = plan.trace.outcome_calls;
+        assert!(o0 < o1 && o1 <= plan.trace.calls.len(),
+            "outcome_calls {:?} must be a valid range into {} calls", plan.trace.outcome_calls, plan.trace.calls.len());
+        let accepted_walks = plan.trace.calls[o0..o1].iter()
+            .flat_map(|c| &c.edges)
+            .filter(|e| matches!(e.verdict, EdgeVerdict::Accepted { kind: EdgeKind::Walk }))
+            .count();
+        assert!(accepted_walks > 0, "an open-plane route must have accepted walk edges in its trace");
     }
 }

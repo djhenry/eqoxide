@@ -167,13 +167,11 @@ pub struct App {
     nav_intent:       crate::ipc::NavIntent,
     /// A large server correction handed over by the nav streamer; applied to the controller.
     pos_correction:   crate::ipc::PosCorrection,
-    /// Walker's live plan (coarse, fine), published by the nav thread; drawn by the nav-debug
-    /// overlay so it shows what the walker actually follows, not a separate recompute (#246).
-    nav_path_view:    crate::ipc::NavPathView,
-    /// Shared goto target, kept ONLY as a read handle for the nav-debug overlay (`egui_pass`'s
-    /// `goto_target` param) — the render thread no longer WRITES this directly; cancelling a goto
-    /// goes through `self.acts.command.request_cancel_goto()` (#459), which shares this same Arc.
-    goto_target:  crate::ipc::GotoTarget,
+    /// The walker's PUBLISHED nav diagnostics snapshot (#608). While the overlay is toggled on
+    /// (`nav_debug`), an `Arc` clone is attached to `scene.nav_debug` each frame and the renderer
+    /// draws it verbatim as a depth-tested 3D pass (`eqoxide_renderer::nav_overlay`). The render
+    /// thread only READS this — the walker (nav thread) is the sole writer.
+    nav_debug_view:   crate::nav::diagnostics::NavDebugView,
     /// All shared request slots UI windows write; the nav/gameplay threads drain
     /// and send them. One struct instead of a dozen fields (#162).
     acts:         crate::ui::Actions,
@@ -261,8 +259,9 @@ pub struct App {
     on_ground:  bool,
     /// F10 toggles an on-screen debug overlay (heading values, coords, corrections).
     show_debug: bool,
-    /// Navmesh/pathfinding debug overlay (collision floor grid + live A* path). Initial
-    /// state from `--nav-debug`; F11 toggles at runtime. See `hud::draw_nav_debug`.
+    /// Nav diagnostics overlay toggle (#608): while on, the walker's published
+    /// `NavDebugSnapshot` is attached to the scene and drawn as a depth-tested 3D pass
+    /// (`eqoxide_renderer::nav_overlay`). Initial state from `--nav-debug`; F11 toggles at runtime.
     nav_debug: bool,
     /// The window system: registry-driven windows, per-character layout
     /// persistence, icon atlases, chat state (#162).
@@ -294,7 +293,6 @@ impl App {
         game_state_snapshot: crate::ipc::GameStateSnapshot,
         net_health: crate::ipc::NetHealthShared,
         frame_req:       FrameReq,
-        goto_target:     crate::ipc::GotoTarget,
         acts:            crate::ui::Actions,
         spells:          std::sync::Arc<crate::spells::SpellDb>,
         shared_collision: collision::SharedCollision,
@@ -310,7 +308,7 @@ impl App {
         controller_view:  crate::ipc::ControllerShared,
         nav_intent:       crate::ipc::NavIntent,
         pos_correction:   crate::ipc::PosCorrection,
-        nav_path_view:    crate::ipc::NavPathView,
+        nav_debug_view:   crate::nav::diagnostics::NavDebugView,
     ) -> Self {
         let ui_state = crate::ui::UiState::new(&character_name, eq_ui_dir);
         // Distinct per-client window title (#297): "{account} {character} - EQOxide".
@@ -356,8 +354,7 @@ impl App {
             frame_profile: crate::profiling::FrameProfile::default(),
             keys_held: std::collections::HashSet::new(),
             controller: crate::movement::CharacterController::new([0.0, 0.0, 0.0]),
-            controller_view, nav_intent, pos_correction, nav_path_view,
-            goto_target,
+            controller_view, nav_intent, pos_correction, nav_debug_view,
             acts, spells,
             drag_active: false, last_cursor: winit::dpi::PhysicalPosition::new(0.0, 0.0),
             click_start: None,
@@ -1504,6 +1501,15 @@ impl App {
         }
         if let Ok(mut snap) = self.camera_snapshot.lock() { *snap = self.camera.snapshot(); }
 
+        // Nav diagnostics overlay (#608): while toggled on (--nav-debug / F11), attach the
+        // walker's PUBLISHED snapshot to the scene — a cheap Arc clone — and the renderer draws
+        // it verbatim as a depth-tested pass. No nav state is derived here: this is wiring only.
+        self.scene.nav_debug = if self.nav_debug {
+            self.nav_debug_view.lock().unwrap().clone()
+        } else {
+            None
+        };
+
         let dur_update = prof_update.elapsed();
 
         // ── GPU work: renderer + egui share a command encoder ─────────────────
@@ -1549,9 +1555,6 @@ impl App {
             &self.acts, &self.spells,
             self.show_debug, self.game_state_view.server_corrections,
             &self.frame_profile,
-            self.nav_debug,
-            self.goto_target.lock().unwrap().map(|(x, y, z)| [x, y, z]),
-            self.nav_path_view.lock().unwrap().clone(),
         );
         let dur_egui = prof_egui.elapsed();
 
@@ -1615,9 +1618,6 @@ impl App {
         show_debug:    bool,
         corrections:   u32,
         frame_profile: &crate::profiling::FrameProfile,
-        nav_debug:     bool,               // navmesh overlay on? (--nav-debug / F11)
-        nav_goal:      Option<[f32; 3]>,   // current A* goal for the navmesh overlay
-        nav_paths:     (Vec<[f32; 3]>, Vec<[f32; 3]>), // walker's live (coarse, fine) plan (#246)
     ) -> bool {
         let (Some(egui_state), Some(egui_renderer), Some(egui_ctx), Some(window)) =
             (egui_state, egui_renderer, egui_ctx, window) else { return false };
@@ -1668,9 +1668,9 @@ impl App {
                 hud::draw_loading(ctx, current_zone, load_status, sync_progress);
             } else {
                 hud::draw_labels(ctx, scene, view_proj, screen_w, screen_h, cam_eye, collision);
-                if nav_debug {
-                    hud::draw_nav_debug(ctx, scene, view_proj, screen_w, screen_h, collision, nav_goal, &nav_paths);
-                }
+                // (#608: the old egui `draw_nav_debug` screen-space overlay is GONE. The nav
+                // diagnostics overlay is now a depth-tested 3D pass inside the renderer
+                // (`eqoxide_renderer::nav_overlay`), fed from `scene.nav_debug` — see render_frame.)
                 ui_state.draw_all(ctx, screen_pts, scene, spells, acts, zone_min, zone_max, zone_map, current_fps);
                 if show_debug {
                     hud::draw_debug_overlay(ctx, scene.player_pos, scene.player_heading, current_zone, corrections);
@@ -2001,7 +2001,7 @@ impl ApplicationHandler for App {
                                 }
                                 KeyCode::F11 => {
                                     self.nav_debug = !self.nav_debug;
-                                    tracing::info!("NAV DEBUG: navmesh overlay {}", if self.nav_debug { "ON" } else { "OFF" });
+                                    tracing::info!("NAV DEBUG: nav diagnostics overlay {}", if self.nav_debug { "ON" } else { "OFF" });
                                 }
                                 KeyCode::KeyL
                                     if self.keys_held.contains(&KeyCode::ControlLeft)

@@ -78,6 +78,10 @@ pub struct ModelContext {
     pub controller:      crate::ipc::ControllerSlots,
     pub guild_slots:     crate::ipc::GuildSlots,
     pub collision:       crate::nav::collision::SharedCollision,
+    /// The published nav diagnostics snapshot slot (#608): the walker (inside the owner's
+    /// ActionLoop) writes it; the render overlay and `/v1/observe/nav_debug` read it. Defined in
+    /// `eqoxide-nav` (it names nav types, which `eqoxide-ipc` sits below).
+    pub nav_debug:       crate::nav::diagnostics::NavDebugView,
     pub maps_dir:        PathBuf,
     pub shutdown:        Arc<AtomicBool>,
     pub camp:            crate::ipc::CampReq,
@@ -142,6 +146,7 @@ impl Model for ServerModel {
             ctx.guild_slots,
             ctx.collision,
             ctx.maps_dir,
+            ctx.nav_debug,
             ctx.shutdown,
             ctx.camp,
             ctx.camp_until,
@@ -423,6 +428,7 @@ mod tests {
             controller:      Default::default(),
             guild_slots:     Default::default(),
             collision:       Default::default(),
+            nav_debug:       Default::default(),
             maps_dir:        PathBuf::new(),
             shutdown:        Arc::new(AtomicBool::new(false)),
             camp:            Default::default(),

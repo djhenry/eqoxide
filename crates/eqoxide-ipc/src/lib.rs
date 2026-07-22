@@ -456,16 +456,13 @@ impl Default for AggroAvoidOpts {
 }
 pub type NavAvoidShared = Arc<Mutex<AggroAvoidOpts>>;
 
-/// The walker's ACTUAL committed plan, published each nav tick so the `--nav-debug` overlay can draw
-/// exactly what the walker is following instead of an independent per-frame `find_path` recompute
-/// (#246). `.0` = coarse global route (`ActionLoop::path`), `.1` = fine local plan
-/// (`ActionLoop::local_path`). Empty when idle. Draw-only; never steered from.
-///
-/// MVC C2 (#452): this is DERIVED/READ state (the Model's nav thread produces it, the render View
-/// consumes it to draw), NOT a view→model command — so it lives on the render↔nav integration
-/// channel [`ControllerSlots`] alongside the other single-authority movement channels, and NOT in a
-/// command bundle ([`NavSlots`]) / the `command_state::CommandState` facade.
-pub type NavPathView = Arc<Mutex<(Vec<[f32; 3]>, Vec<[f32; 3]>)>>;
+// (#608: the old `NavPathView` pair — the walker's committed coarse/fine plan for the 2D overlay —
+// is GONE. The walker now publishes the full `eqoxide_nav::diagnostics::NavDebugSnapshot` (which
+// carries the committed routes, the plan's per-edge trace, pad knowledge and more) through
+// `eqoxide_nav::diagnostics::NavDebugView`. That slot cannot live in this crate: it names nav
+// types, and `eqoxide-ipc` sits BELOW `eqoxide-nav` in the crate graph — so it is defined in
+// `eqoxide-nav` and wired alongside `ControllerSlots` in `main.rs`. One published source; a second
+// copy of the committed route here would be a drift channel.)
 
 /// Live entity name → (x, y, z) map, updated by login.rs as packets arrive.
 pub type EntityPositions = Arc<Mutex<HashMap<String, (f32, f32, f32)>>>;
@@ -1114,17 +1111,15 @@ pub struct WorldSlots {
 /// a server correction handed back to the controller. `ActionLoop`-only — `HttpState` has no
 /// controller-facing endpoint today, so there is nothing for it to embed here.
 ///
-/// MVC C2 (#452): `nav_path_view` — the walker's committed path published for the render overlay —
-/// lives here too. It is another render↔nav integration channel (nav thread → render View), the
-/// same family as `nav_intent`/`pos_correction`, and specifically NOT a view→model command, so it
-/// was relocated here from the `NavSlots` command bundle. The Walker (nav thread) writes it, `App`
-/// (render) reads it to draw; neither the HTTP side nor `CommandState` touches it.
+/// (#608: the walker's draw-only `nav_path_view` overlay pair that #452 moved here is gone — the
+/// walker now publishes the full `eqoxide_nav::diagnostics::NavDebugSnapshot`, whose view slot is
+/// defined in `eqoxide-nav` because this crate sits below it. See the note above
+/// `EntityPositions`.)
 #[derive(Clone, Default)]
 pub struct ControllerSlots {
     pub controller_view: ControllerShared,
     pub nav_intent:      NavIntent,
     pub pos_correction:  PosCorrection,
-    pub nav_path_view:   NavPathView,
 }
 
 /// `/v1/lifecycle/*`: camp (+ its published deadline) and respawn. `HttpState`-only: `ActionLoop`
@@ -1201,15 +1196,14 @@ mod c2_boundary_tests {
         assert_eq!(seen.dir, [1.0, 0.0]);
     }
 
-    /// The walker's computed path overlay is DERIVED/READ state on the render↔nav integration
-    /// channel (`ControllerSlots`), NOT a command in `NavSlots`. This pins the relocation: the field
-    /// exists on `ControllerSlots` and starts empty (idle). (`NavSlots` no longer carrying it is
-    /// enforced structurally by the type — this file would not compile if it still did.)
+    /// #608: the walker's path overlay no longer flows through `ControllerSlots` at all — the
+    /// published `NavDebugSnapshot` (in `eqoxide-nav`) is the ONE channel for committed routes.
+    /// This pins that the controller bundle stayed a pure movement-integration channel.
     #[test]
-    fn nav_path_view_lives_on_the_controller_channel() {
+    fn controller_slots_carry_only_movement_integration() {
         let controller = ControllerSlots::default();
-        let (coarse, fine) = &*controller.nav_path_view.lock().unwrap();
-        assert!(coarse.is_empty() && fine.is_empty(), "an idle overlay is empty");
+        assert!(controller.nav_intent.lock().unwrap().is_none());
+        assert!(controller.pos_correction.lock().unwrap().is_none());
     }
 }
 

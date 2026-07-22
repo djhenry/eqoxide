@@ -41,6 +41,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 | `GET /v1/observe/spells` | The 9 memorized gems `{gem, spell_id, name}` (empty = null). |
 | `GET /v1/observe/doors` | Current zone's doors `{door_id,name,x,y,z,heading,opentype,is_open}`. |
 | `GET /v1/observe/zone_points` | Zone exit points received from the server. |
+| `GET /v1/observe/nav_debug` | The nav diagnostics snapshot navigation **publishes** (#608) — see [Nav diagnostics](#nav-diagnostics-get-v1observenav_debug--608). |
 
 ---
 
@@ -489,6 +490,70 @@ world hung", read `world_responsive`, not `last_packet_age_ms`.**
 > if future server content adds one, it would silently turn every idle session `world_responsive:
 > false`. If that signal ever misfires on a known-healthy idle zone, check for a global consider hook
 > before trusting it.
+
+---
+
+## Nav diagnostics (`GET /v1/observe/nav_debug`) — #608
+
+The full nav diagnostics snapshot navigation **publishes** — the same single source of truth the
+in-client depth-tested 3D overlay (F11 / `--nav-debug`) draws. The driving agent has no eyes, so
+the snapshot is served here in structured form; the JSON body is a structural serde projection of
+the nav-owned snapshot type (`eqoxide_nav::diagnostics::NavDebugSnapshot`), so a field cannot
+silently diverge from what nav published. **Nothing in this endpoint (or the overlay) re-derives
+nav state** — no floor queries, no clearance re-checks; consumers render what the planner and
+walker actually decided.
+
+Top-level shape (`available: false` + a `note` until the walker first publishes):
+
+- **`seq`** — monotonic publish counter.
+- **`published_age_ms`** — ms since the walker published this snapshot, computed AT READ TIME
+  (like `/debug`'s `snapshot_age_ms`). The idle walker republishes whenever a published fact
+  drifts (the player moves, the zone model loads), so a growing age on a live client means the
+  state genuinely has not changed.
+- **`zone_model_loaded`** — whether the walker HAS a collision grid for this zone. `false` = no
+  world model: nothing here is a claim about geometry (#579). The composed **`zone_assets`**
+  object (same source as `/debug`'s) rides along for the pending/failed/stale detail.
+- **`nav_state` / `nav_reason`** — the walker's published state at publish time (same vocabulary
+  as `/debug`).
+- **`player`**, **`goal`** — position `[east,north,up]` at publish (**`null` when the position was
+  not known** — fresh login before the first server placement, a zone reset; never a fabricated
+  `[0,0,0]`); the active `/goto` goal.
+- **`committed_coarse` / `committed_fine`** — the walker's **actual committed** coarse route and
+  fine/local steering plan, verbatim (`Walker::path`/`local_path` — the #246 property; never a
+  recompute).
+- **`plan`** — the last coarse plan's record, from the planner's own reply: `gen`, `start`,
+  `goal` (the question actually asked), `outcome` (`route`/`unreachable`/`exhausted`), `reason`
+  (the `nav_reason` vocabulary), `route_len`, `plan_ms`, `tight`, `goal_snapped`, and **`trace`**:
+  - `trace.calls[]` — one entry per A* call (clearance tier × anchor attempt), each with
+    `clearance`, `cell`, `char_anchor`, `truncated`, and `edges[]`;
+  - each edge: `{from, to, verdict: "accepted", kind}` or `{from, to, verdict: "rejected",
+    reason}` with reasons `no_floor | step_up | step_down | grade | clearance | water |
+    haul_out_too_high` — recorded **at the branch that made the decision**, in the search itself;
+  - `trace.outcome_calls` — the `[i, i+1)` range of **the DECIDING call**: the one A* call whose
+    result became the returned outcome. Tier retries (a generous pass a minimum pass superseded),
+    anchor retries and re-anchor-ring attempts that lost are still present in `calls[]` (with
+    their `clearance`/`char_anchor` metadata) but sit OUTSIDE this range — the overlay draws only
+    the deciding call, so a losing pass's rejections are never painted over the committed route;
+  - `truncated: true` on a call = the RECORDING budget ran out (total per plan, and at most half
+    per call so the deciding call is never starved by an earlier flood) — **the search itself was
+    not cut short**, and the recording boundary is NOT the planner's frontier. The overlay marks
+    the spot recording stopped with an orange double-ring + beacon.
+
+  **Honesty contract: absence means UNEVALUATED.** A cell or edge missing from the trace was
+  never evaluated by the planner. It is neither walkable nor blocked; consumers must not fill in
+  gaps, and the response's `semantics` field restates this on the wire.
+- **`pads[]`** — same-zone teleport-pad knowledge (#543/#266): `{index, knowledge}` where
+  `knowledge` ∈ `unknown` (no usable advertised destination; never observed) /
+  `advertised_usable` (+`source`,`dest`; wire-advertised and honesty-gated onto walkable floor —
+  **advertised, not verified**) / `advertised_unusable` (advertised but refused by the gate) /
+  `learned_same_zone` / `learned_cross_zone` (reserved for the #543 learning loop). "Not yet
+  observed" is first-class and never collapses into an answer.
+- **`clearance`** — a throttled live sample of nav's own traversability model at `at` (which may
+  lag the player a few ticks): 16 radial `wall_spokes` (saturating at `cap`), the 8-direction
+  `footprint_ok` ring at `footprint_radius`, and the zone-lifetime field values `field_wall` /
+  `field_ground` the planner's hug-cost/margin actually consult.
+- **`water`** — the swim state the walker acted on this tick (`swimming`, `swim_plane`), i.e. the
+  values that went into its MoveIntent — not a recomputation.
 
 ---
 

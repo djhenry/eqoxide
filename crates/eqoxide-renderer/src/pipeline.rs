@@ -83,6 +83,11 @@ pub struct Pipelines {
     /// Weather precipitation particles (eqoxide#542): instanced billboard quads, alpha-blended,
     /// depth-tested against the scene but depth-write off. Drawn only when weather is active.
     pub weather: wgpu::RenderPipeline,
+    /// Nav diagnostics overlay (#608): world-space colored LINE LIST, alpha-blended, depth-tested
+    /// against the scene (LessEqual) with depth-write off — so the overlay is correctly OCCLUDED by
+    /// geometry (the whole point of replacing the screen-space egui painter) without disturbing the
+    /// depth buffer. Drawn only when a `SceneState::nav_debug` snapshot is present (F11).
+    pub nav_debug: wgpu::RenderPipeline,
 }
 
 /// Create the three bind group layouts used across all pipelines.
@@ -902,11 +907,53 @@ pub fn build_pipelines(
         multiview: None, cache: None,
     });
 
+    // ── Nav diagnostics overlay pipeline (#608) ────────────────────────────
+    // World-space colored lines. Depth: `transparent_depth` (LessEqual test, write OFF) — the
+    // overlay is occluded by walls/floors exactly like any world geometry, but never occludes
+    // anything itself. Colors pass straight through from the vertex data (see nav_overlay.rs).
+    let nav_debug_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("nav_debug"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("shaders/nav_debug.wgsl").into()),
+    });
+    let nav_debug_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("nav_debug_layout"),
+        bind_group_layouts: &[&layouts.camera_bgl],
+        push_constant_ranges: &[],
+    });
+    let nav_debug_vbl = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<crate::nav_overlay::OverlayVertex>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x4],
+    };
+    let nav_debug = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("nav_debug"),
+        layout: Some(&nav_debug_layout),
+        vertex: wgpu::VertexState {
+            module: &nav_debug_shader, entry_point: "vs_main",
+            buffers: std::slice::from_ref(&nav_debug_vbl), compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &nav_debug_shader, entry_point: "fs_main",
+            targets: &[Some(wgpu::ColorTargetState {
+                format, blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::LineList, cull_mode: None, ..Default::default()
+        },
+        depth_stencil: Some(transparent_depth.clone()),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None, cache: None,
+    });
+
     Pipelines {
         sky, zone, zone_instanced,
         zone_blend, zone_additive, zone_instanced_blend, zone_instanced_additive,
         billboard, character, skinned, skinned_overlay, weather,
         shadow_static, shadow_skinned, shadow_instanced,
+        nav_debug,
     }
 }
 

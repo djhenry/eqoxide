@@ -81,6 +81,7 @@ pub fn empty_state() -> HttpState {
         group_slots: Default::default(),
         lifecycle,
         guild_slots: Default::default(),
+        nav_debug_view: Default::default(),
     }
 }
 

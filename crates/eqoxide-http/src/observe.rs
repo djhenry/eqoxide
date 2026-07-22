@@ -97,6 +97,59 @@ pub(super) fn router() -> Router<HttpState> {
         .route("/item_text", get(get_item_text))
         .route("/packets", get(get_packets))
         .route("/who", get(get_who))
+        .route("/nav_debug", get(get_nav_debug))
+}
+
+/// GET /v1/observe/nav_debug (#608) — the nav diagnostics snapshot the walker PUBLISHES, in
+/// structured form. The driving agent has no eyes: this is the same single source of truth the
+/// depth-tested 3D overlay draws, in the agent's encoding. **This layer encodes; it derives
+/// nothing** — the JSON body is a structural serde projection of
+/// `eqoxide_nav::diagnostics::NavDebugSnapshot` (nav-owned types), so a field cannot silently
+/// diverge from what nav published. The only additions are the composed `zone_assets` load-state
+/// object (the same published #579 source `/debug` serves) and the `semantics` note.
+///
+/// Honesty contract, verbatim from the snapshot's docs: **absence means unevaluated** — a cell or
+/// edge missing from `plan.trace` was never evaluated by the planner, and must not be treated as
+/// walkable OR blocked.
+/// ⚠️ No-re-derivation hazard (#615 review F6): unlike the renderer's encoder — whose signature
+/// cannot even NAME the collision grid — this handler runs inside `HttpState`, which carries
+/// `shared_collision` for other endpoints. The no-second-derivation property here is therefore a
+/// CONVENTION this function must keep, not a structural impossibility: do not consult
+/// `s.shared_collision` (or any other world source) to "check" or "fix" a published value. The
+/// verbatim test below runs with BOTH an absent and a PRESENT collision grid, so a re-derivation
+/// hidden behind `if let Some(col) = …` cannot pass as a no-op.
+async fn get_nav_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
+    let snap = s.nav_debug_view.lock().unwrap().clone();
+    match snap {
+        None => Json(serde_json::json!({
+            "available": false,
+            "note": "no nav diagnostics snapshot published yet (the walker has not ticked — \
+                     no /goto issued and no zone loaded since launch)",
+            "zone_assets": zone_assets_json(&s),
+        })),
+        Some(snap) => {
+            let mut v = serde_json::to_value(&*snap)
+                .unwrap_or_else(|e| serde_json::json!({ "encode_error": e.to_string() }));
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("available".into(), serde_json::json!(true));
+                // Freshness, computed AT READ TIME (the #343 discipline — an age must never be
+                // cached): how long ago the walker published this snapshot. A consumer must treat
+                // a large value as stale-as-of-then, exactly like `snapshot_age_ms` on /debug.
+                obj.insert("published_age_ms".into(),
+                    serde_json::json!(snap.published_at.elapsed().as_millis() as u64));
+                obj.insert("zone_assets".into(), zone_assets_json(&s));
+                obj.insert("semantics".into(), serde_json::json!(
+                    "plan.trace records what the planner EVALUATED, with per-edge verdicts \
+                     (accepted kind / rejected reason). Absence means UNEVALUATED — never walkable, \
+                     never blocked. trace.outcome_calls marks the DECIDING call; calls outside it \
+                     are tier/anchor retries that lost. A call with truncated:true stopped RECORDING \
+                     (not searching) at its edge budget. committed_coarse/committed_fine are the \
+                     walker's actual committed routes, verbatim; player is null when the position \
+                     was unknown at publish time."));
+            }
+            Json(v)
+        }
+    }
 }
 
 /// GET /v1/observe/item_text — the text of the most recently read book/note (from
@@ -904,6 +957,100 @@ mod tests {
         let resp = app.oneshot(Request::get("/debug").body(Body::empty()).unwrap()).await.unwrap();
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn nav_debug_json(state: HttpState) -> serde_json::Value {
+        let app = router().with_state(state);
+        let resp = app.oneshot(Request::get("/nav_debug").body(Body::empty()).unwrap()).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// **#608, the no-second-derivation pin for the AGENT consumer.** `/nav_debug` is a structural
+    /// serde projection of whatever nav PUBLISHED — verbatim. The fabricated snapshot below is
+    /// deliberately inconsistent with any geometry (the state holds NO collision at all, and the
+    /// "accepted" edge goes somewhere no floor exists): the endpoint must serve it AS PUBLISHED,
+    /// because it has no way to re-derive or "correct" a verdict. If someone reintroduces a
+    /// derivation in this layer (consulting `shared_collision` to fix up edges), the verbatim
+    /// assertions here go RED.
+    ///
+    /// Also pins: nothing published yet → an EXPLICIT `available: false`, never an empty-but-
+    /// plausible snapshot; and the unevaluated-semantics note is present.
+    #[tokio::test]
+    async fn nav_debug_serves_the_published_snapshot_verbatim_and_absence_is_explicit() {
+        use eqoxide_nav::diagnostics::*;
+        let state = empty_state();
+
+        // 1. Nothing published: explicit unavailability.
+        let v = nav_debug_json(state.clone()).await;
+        assert_eq!(v["available"], false, "no snapshot yet must be an explicit 'not available'");
+        assert!(v.get("committed_coarse").is_none(), "no fields may be invented for an absent snapshot");
+
+        // 2. A fabricated snapshot, inconsistent with any real geometry, served verbatim.
+        let mut trace = SearchTrace::with_budget(16);
+        trace.begin_call(2.0, 8.0, true);
+        trace.edge([0.0, 0.0, 0.0], [8.0, 0.0, 0.0], EdgeVerdict::Accepted { kind: EdgeKind::Walk });
+        trace.edge([0.0, 0.0, 0.0], [0.0, 8.0, 4.0], EdgeVerdict::Rejected { reason: RejectReason::Grade });
+        trace.outcome_calls = (0, 1);
+        let snap = NavDebugSnapshot {
+            seq: 7,
+            zone_model_loaded: true,
+            nav_state: "navigating".into(),
+            nav_reason: None,
+            player: Some([1.0, 2.0, 3.0]),
+            published_at: std::time::Instant::now(),
+            goal: Some([100.0, 0.0, 0.0]),
+            committed_coarse: vec![[0.0, 0.0, 0.0], [8.0, 0.0, 0.0]],
+            committed_fine: vec![[0.0, 0.0, 0.0]],
+            plan: Some(std::sync::Arc::new(PlanDebug {
+                gen: 3, start: [0.0; 3], goal: [100.0, 0.0, 0.0],
+                outcome: "route".into(), reason: "route".into(), route_len: 2,
+                plan_ms: 4, tight: false, goal_snapped: false, trace,
+            })),
+            pads: vec![PadDebug { index: 9, knowledge: PadKnowledge::Unknown }],
+            clearance: None,
+            water: None,
+        };
+        *state.nav_debug_view.lock().unwrap() = Some(std::sync::Arc::new(snap));
+
+        let assert_verbatim = |v: &serde_json::Value| {
+            assert_eq!(v["available"], true);
+            assert_eq!(v["seq"], 7);
+            assert_eq!(v["nav_state"], "navigating");
+            assert_eq!(v["player"], serde_json::json!([1.0, 2.0, 3.0]));
+            assert_eq!(v["committed_coarse"], serde_json::json!([[0.0, 0.0, 0.0], [8.0, 0.0, 0.0]]),
+                "the committed route must be served verbatim — it is the walker's actual path (#246)");
+            let edges = &v["plan"]["trace"]["calls"][0]["edges"];
+            assert_eq!(edges[0]["verdict"], "accepted");
+            assert_eq!(edges[0]["kind"], "walk");
+            assert_eq!(edges[1]["verdict"], "rejected");
+            assert_eq!(edges[1]["reason"], "grade",
+                "the published reject reason must be served verbatim — corrupting it in the publisher \
+                 (the #608 mutation check) must surface HERE");
+            assert_eq!(v["plan"]["trace"]["outcome_calls"], serde_json::json!([0, 1]));
+            assert_eq!(v["pads"][0]["index"], 9);
+            assert_eq!(v["pads"][0]["knowledge"], "unknown",
+                "a pad's 'not yet observed' must reach the agent as exactly that");
+            assert!(v["semantics"].as_str().unwrap().contains("UNEVALUATED"),
+                "the absence-means-unevaluated contract must be stated on the wire");
+            // Freshness is computed at read time and present (#615 review F1).
+            assert!(v["published_age_ms"].is_u64(), "the snapshot's age must be reported");
+            assert!(v["published_age_ms"].as_u64().unwrap() < 60_000, "…and computed from now");
+            // The composed zone-assets load state rides along (same published #579 source as /debug).
+            assert!(v["zone_assets"]["state"].is_string());
+        };
+        let v = nav_debug_json(state.clone()).await;
+        assert_verbatim(&v);
+
+        // #615 review F6: repeat with a COLLISION GRID PRESENT in the state. The renderer's
+        // encoder cannot re-derive by signature; this handler could (HttpState carries
+        // `shared_collision` for other endpoints), so the verbatim property must hold when the
+        // grid is actually there — a re-derivation hidden behind `if let Some(col) = …` was a
+        // silent no-op in the empty-state run above.
+        let ready = eqoxide_nav::zone_assets::ZoneAssetState::test_ready();
+        *state.shared_collision.write().unwrap() = ready.collision().cloned();
+        let v = nav_debug_json(state).await;
+        assert_verbatim(&v);
     }
 
     /// #343 regression — THE lie. The connection is dead: no packet has arrived for a minute, and

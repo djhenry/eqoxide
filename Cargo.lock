@@ -957,6 +957,8 @@ dependencies = [
  "eqoxide-assets",
  "eqoxide-core",
  "eqoxide-ipc",
+ "serde",
+ "serde_json",
  "tracing",
 ]
 
@@ -997,6 +999,7 @@ dependencies = [
  "bytemuck",
  "eqoxide-assets",
  "eqoxide-core",
+ "eqoxide-nav",
  "glam",
  "gltf",
  "image",
