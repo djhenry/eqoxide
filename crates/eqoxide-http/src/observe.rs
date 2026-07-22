@@ -604,8 +604,14 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         //   send_failures_unretried  — the subset with no client-side retransmit of that datagram
         //                              (position updates, ACKs, keepalives, session control). The
         //                              complement is the reliable stream, which `poll_resend` re-sends
-        //                              verbatim until ACKed. NOT the same as "a command was lost":
-        //                              agent commands travel on the RELIABLE path, which recovers.
+        //                              verbatim until ACKed — but ONLY while the session lives; see
+        //                              reliable_abandoned. So this is NOT a complete count of lost
+        //                              commands, and must not be read as one.
+        //   reliable_abandoned       — un-ACKed reliables left outstanding when a session ENDED
+        //                              (server resend_timeout drop, zone handoff, reconnect,
+        //                              shutdown). The next session's window starts empty, so these
+        //                              are not retransmitted. This is the reliable stream's loss
+        //                              channel, and the one `send_failures_unretried` cannot see.
         //   last_send_error          — ErrorKind of the most recent one ("WouldBlock", …), or null.
         //   last_send_error_age_ms   — ms since it, measured at read time. Distinguishes a single
         //                              old blip from an ongoing failure.
@@ -614,6 +620,7 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         player.insert("last_send_error".into(),
             serde_json::json!(health.last_send_error.map(|k| format!("{k:?}"))));
         player.insert("last_send_error_age_ms".into(),  serde_json::json!(health.last_send_error_age_ms));
+        player.insert("reliable_abandoned".into(),      serde_json::json!(health.reliable_abandoned));
     }
     Json(out)
 }

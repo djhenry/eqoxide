@@ -33,7 +33,7 @@ working. The implementation lives in `src/http/<group>.rs`, each exposing a `rou
 
 | Route | Description |
 |-------|-------------|
-| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation** (`nav_state`, `nav_reason`, `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier` — see [Navigation state](#navigation-state)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms` — see [Connection health](#connection-health)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + camera state. |
+| `GET /v1/observe/debug` | Player (zone, race, class, level, pos `[east,north,up]`, heading ccw/cw, `currency`, server_corrections, vitals `hp_pct`/`hp`/`hp_max`/`mana_pct`/`xp_pct`, target `target_id`/`target_name`/`target_hp_pct`/`target_con`/`target_attitude`/`target_level`) + **navigation** (`nav_state`, `nav_reason`, `nav_goal_id`, `nav_goal`, `nav_blocked_by`, `nav_tier` — see [Navigation state](#navigation-state)) + **connection health** (`connected`, `link_age_ms`, `last_packet_age_ms`, `snapshot_age_ms`, `world_responsive`, `last_world_response_ms`, `send_failures`, `send_failures_unretried`, `last_send_error`, `last_send_error_age_ms`, `reliable_abandoned` — see [Connection health](#connection-health)) + **`last_consider`** (spawn-scoped result of the most recent consider of ANY spawn, target or not — see [Consider results](#consider-results)) + camera state. |
 | `GET /v1/observe/frame` | Current rendered frame as a PNG (`Content-Type: image/png`). **503 while the zone's assets are still loading** — see [`zone_assets`](#zone_assets--is-the-world-this-response-describes-actually-loaded-579); `?allow_pending=1` opts past it. |
 | `GET /v1/observe/entities[?labeled=1]` | Default: `{ "<name>": [x,y,z], ... }` for all known entities, with same-base-name + byte-identical-position duplicates collapsed (#471 — suspected server-side `spawn2` duplication; the model is untouched so each instance is still targetable by its full name). `?labeled=1` returns the richer `{count, entities:{"<name>":[x,y,z]}, deduped, duplicate_groups:[{position,names,kept}], note}` exposing which duplicates were collapsed. |
 | `GET /v1/observe/inventory` | `{count, items:[{slot,item_id,name,charges,icon,idfile}], currency}`. Slots are Titanium **wire** ids (DB general slots 23-30 → wire 22-29). |
@@ -445,7 +445,7 @@ corridor is not threadable" from "the steering planner hasn't caught up." `nav_l
 ## Connection health
 
 `GET /v1/observe/debug` carries ten fields that tell you **whether the rest of the payload can be
-trusted at all**. Six are about what the SERVER did (below); four are about what the client itself
+trusted at all**. Six are about what the SERVER did (below); five are about what the client itself
 failed to send (see [Outbound send failures](#outbound-send-failures)). They are computed when you ask — not cached — so nothing has to be running inside
 the client for them to be right (#343).
 
@@ -461,6 +461,7 @@ the client for them to be right (#343).
 | `send_failures_unretried` | The subset of `send_failures` with no client-side retransmit of that datagram. |
 | `last_send_error` | `ErrorKind` name of the most recent send failure (`"WouldBlock"`, `"Uncategorized"`, …), or `null`. |
 | `last_send_error_age_ms` | ms since that failure, measured at read time, or `null`. Distinguishes an old blip from an ongoing failure. |
+| `reliable_abandoned` | **Un-ACKed reliable datagrams left outstanding when a session ENDED** — the loss `send_failures_unretried` cannot see. Cumulative. A clean zone handoff routinely leaves a small number here. |
 
 **`last_packet_age_ms` is not a disconnect signal.** An idle EQ session — a character sitting alone
 in a quiet zone — routinely goes **40+ seconds with no application packet** while the link is
@@ -487,13 +488,26 @@ Every send now funnels through one place that records its own failure, so:
   times since it started.
 - **`send_failures_unretried` is the sharper number.** The complement (`send_failures -
   send_failures_unretried`) is the *reliable* stream: a failed reliable datagram is kept verbatim in
-  the resend window and retransmitted until the server ACKs it, so it is delayed, not lost. The
+  the resend window and retransmitted until the server ACKs it — **for as long as the session
+  lives** (see the next bullet; this is a conditional guarantee, not an absolute one). The
   `unretried` ones — unreliable position updates, ACKs, keepalives, session control — are not
-  re-sent by this client.
-- **`send_failures_unretried > 0` does not by itself mean a command was lost.** Agent commands
-  travel on the reliable path. What a climbing `unretried` count *does* mean is that the position
-  firehose is dropping updates, i.e. the server's idea of where you are may have stopped tracking
-  yours.
+  re-sent by this client at all.
+- **The reliable stream's guarantee ends when the session does — that is what `reliable_abandoned`
+  is for.** `poll_resend` retries indefinitely, but EQEmu drops the session at its ~30s
+  `resend_timeout`, and the reconnect builds a fresh stream whose resend window starts **empty**.
+  Every reliable datagram still outstanding at that moment is genuinely lost, and
+  `send_failures_unretried` reads `0` for all of them. `reliable_abandoned` counts exactly those.
+  It is an **upper bound** on abandoned reliable payload: a datagram that reached the wire and whose
+  ACK merely had not arrived yet when we handed off is counted too. It rises on any session end —
+  server drop, zone handoff, world reconnect, shutdown — so a small nonzero value after zoning is
+  normal, and a large or rapidly climbing one is not.
+- **`send_failures_unretried > 0` does not by itself mean a command was lost, and neither number is
+  a complete loss count.** Agent commands travel on the reliable path. What a climbing `unretried`
+  count *does* mean is that the position firehose is dropping updates, i.e. the server's idea of
+  where you are may have stopped tracking yours. For "did my command get there", the honest reading
+  is the pair `connected` + `reliable_abandoned` — and note `connected` goes `false` at 15s of
+  silence, **before** the server's 30s drop, so a session heading for a resend_timeout announces
+  itself as disconnected first rather than looking healthy.
 - **Use `last_send_error_age_ms` to tell "one blip at login" from "failing right now."** A count
   alone cannot distinguish them.
 - Reported as `null` / `0`, never omitted, so absence of trouble is stated rather than inferred.

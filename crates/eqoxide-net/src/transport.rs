@@ -241,6 +241,11 @@ fn decode_raw_app(body: &[u8], pass1: u8, pass2: u8, key: u32) -> Option<(u16, V
 
 // ── Session info ───────────────────────────────────────────────────────────
 
+/// #612 review (F5): after a send failure is WARNed, further failures log at debug for this long.
+/// A 30s outage otherwise emits ~10^3 WARN lines (20Hz position firehose + go-back-N retransmits).
+/// The COUNTERS are never suppressed — only the log line is.
+const SEND_FAIL_WARN_QUIET: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Whether a datagram handed to [`EqStream::transmit`] is retained by the reliable resend window,
 /// i.e. whether THIS EXACT datagram will be re-sent if the send fails (#612).
 ///
@@ -556,11 +561,18 @@ impl EqStream {
         // DELIBERATE (#612) — the call-site decision for the RELIABLE app path, which is what every
         // agent-issued command travels on. The error is NOT propagated to the ~90 call sites, and
         // that is not a discard: a failed reliable send leaves the datagram in the resend window
-        // (see `send_tracked`), so `poll_resend` re-sends it verbatim until the server ACKs it.
-        // Returning "failed" here would itself be a lie in the opposite direction — the packet has
-        // not been lost, only delayed by one backoff. What the agent needs is (a) the fact recorded,
-        // which `transmit` does in `NetHealth::send_failures` (pollable at /v1/observe/debug), and
-        // (b) `connected: false` if the socket is dead for good, which the 15s link clock gives.
+        // (see `send_tracked`), so `poll_resend` re-sends it verbatim until the server ACKs it —
+        // FOR AS LONG AS THE SESSION LIVES. Returning "failed" here would be a lie in the opposite
+        // direction while that holds: the packet is delayed by one backoff, not lost.
+        // It does NOT hold across a session end (#612 review F1): if the server's ~30s
+        // resend_timeout drops us, or a zone handoff replaces the stream, whatever is still
+        // outstanding is abandoned — which `EqStream::drop` counts into
+        // `NetHealth::reliable_abandoned` precisely so that case is not a silent hole in this claim.
+        // What the agent needs is (a) the fact recorded, which `transmit` does in
+        // `NetHealth::send_failures` (pollable at /v1/observe/debug), (b) `reliable_abandoned` for
+        // the session-end case, and (c) `connected: false` if the socket is dead for good — which
+        // the 15s link clock raises BEFORE the server's 30s drop, so the agent is never left
+        // believing a healthy session swallowed its command.
         if let Err(e) = self.send_reliable(&app_data) {
             tracing::debug!(
                 "NET: reliable opcode 0x{:04X} failed its first send ({:?}); retained in the resend \
@@ -704,23 +716,41 @@ impl EqStream {
         match self.socket.try_send(datagram) {
             Ok(_) => Ok(()),
             Err(e) => {
-                {
+                let now = Instant::now();
+                // Rate-limit decision is made from the SAME locked snapshot that updates the
+                // counters, so it costs no extra lock and cannot race itself (#612 review, F5).
+                let (loud, total) = {
                     let mut h = self.net_health.lock().unwrap();
+                    // First failure of a burst is always loud; after that, at most one WARN per
+                    // `SEND_FAIL_WARN_QUIET`. A sustained outage otherwise produces ~10^3 WARN lines
+                    // in 30s (the 20Hz position firehose plus go-back-N retransmits), which buries
+                    // the very signal it is meant to raise.
+                    let loud = h.last_send_error_at
+                        .is_none_or(|t| now.saturating_duration_since(t) >= SEND_FAIL_WARN_QUIET);
                     h.send_failures = h.send_failures.saturating_add(1);
                     if retry == SendRetry::None {
                         h.send_failures_unretried = h.send_failures_unretried.saturating_add(1);
                     }
                     h.last_send_error_kind = Some(e.kind());
-                    h.last_send_error_at = Some(Instant::now());
+                    h.last_send_error_at = Some(now);
+                    (loud, h.send_failures)
+                };
+                // The log is only the OPERATOR's copy; `NetHealth` is the AGENT's, and it is stamped
+                // unconditionally above. Suppressing a log line therefore never suppresses a fact —
+                // that separation is what makes rate-limiting safe here (#612).
+                if loud {
+                    tracing::warn!(
+                        "NET: send failed ({:?}, {} bytes, retransmitted={:?}) — this datagram did \
+                         NOT reach the wire; {} total since start (#612). Further failures logged at \
+                         debug for the next {}s; see /v1/observe/debug send_failures",
+                        e.kind(), datagram.len(), retry, total, SEND_FAIL_WARN_QUIET.as_secs(),
+                    );
+                } else {
+                    tracing::debug!(
+                        "NET: send failed ({:?}, {} bytes, retransmitted={:?}); {} total (#612)",
+                        e.kind(), datagram.len(), retry, total,
+                    );
                 }
-                // WARN, not debug: a datagram the client built and could not send is never routine.
-                // The log is the operator's copy; `NetHealth` is the AGENT's copy — a failure that is
-                // only logged is still invisible to the thing driving this client (#612).
-                tracing::warn!(
-                    "NET: send failed ({:?}, {} bytes, retransmitted={:?}) — this datagram did NOT \
-                     reach the wire (#612); see /v1/observe/debug send_failures",
-                    e.kind(), datagram.len(), retry,
-                );
                 Err(e)
             }
         }
@@ -1191,6 +1221,38 @@ impl EqStream {
 /// ACKs go nowhere (try_send to a closed local port is a harmless no-op). `pub(crate)` (rather than
 /// nested in `mod tests`) so other modules' tests — e.g. `eq_net::gameplay`'s zone-handshake
 /// publish-cadence test (#324) — can drive a real `EqStream` without a live UDP session handshake.
+/// #612 (review F1): account for reliable datagrams abandoned when a session ends.
+///
+/// `send_failures_unretried` excludes the reliable stream because `poll_resend` re-sends a failed
+/// reliable datagram until the server ACKs it — but that is only true WHILE THE SESSION LIVES. The
+/// server drops the session at its ~30s `resend_timeout`, and the reconnect at `gameplay.rs`'s
+/// `EqStream::connect` builds a fresh stream whose `sent` window starts EMPTY. Everything still
+/// outstanding at that instant is genuinely gone.
+///
+/// Doing this in `Drop` rather than at the reconnect call site is deliberate: FOUR different paths
+/// end a session (server drop + reconnect, zone handoff, world reconnect, clean shutdown), and the
+/// #343 review's lesson was that "every loop remembers to mirror it" is exactly the discipline that
+/// fails. Whoever drops the stream owns the accounting, so a future fifth path gets it for free.
+impl Drop for EqStream {
+    fn drop(&mut self) {
+        if self.sent.is_empty() {
+            return;
+        }
+        let abandoned = self.sent.len() as u64;
+        // `Drop` can run while a panic is unwinding, and a poisoned mutex must not turn a bad
+        // situation into a double panic — so this is the one place that tolerates a failed lock.
+        if let Ok(mut h) = self.net_health.lock() {
+            h.reliable_abandoned = h.reliable_abandoned.saturating_add(abandoned);
+        }
+        tracing::warn!(
+            "NET: session ended with {} un-ACKed reliable datagram(s) still outstanding (oldest \
+             seq={}) — the next session's resend window starts empty, so these are NOT retransmitted \
+             (#612); see /v1/observe/debug reliable_abandoned",
+            abandoned, self.sent[0].seq,
+        );
+    }
+}
+
 #[cfg(test)]
 pub(crate) async fn test_stream(pass1: u8, key: u32) -> (EqStream, mpsc::UnboundedReceiver<AppPacket>) {
     test_stream_with_health(pass1, key, Default::default()).await
@@ -1943,7 +2005,121 @@ mod tests {
              — that retention is what makes 'counted but not lost' true (#612)");
     }
 
-    /// #612 structural guard. The fix is only durable if there stays exactly ONE place in this file
+    /// #612 review (F2) — pins the `SendRetry` CLASSIFICATION, which was previously unpinned.
+    ///
+    /// The reviewer's own mutation proved the hole: flipping `send_raw`'s `SendRetry::None` to
+    /// `Retransmitted` — misclassifying SESSION_REQUEST / ACK / OutOfOrderAck / keepalive /
+    /// SessionDisconnect / StatResponse as covered by a resend window that does not retain them —
+    /// passed all 1195 tests. `send_failures_unretried` is the field an agent would trust to decide
+    /// whether a datagram is really gone, so its discrimination must not rest on review alone.
+    ///
+    /// Drives all three classes through the SAME forced failure (an oversized datagram → EMSGSIZE)
+    /// and asserts each one's effect on the two counters SEPARATELY, so a wrong classification in
+    /// either direction is red:
+    ///   - `send_raw` (all session-layer control)      → unretried MUST increment
+    ///   - `send_app_packet_unreliable` (position)     → unretried MUST increment
+    ///   - `send_app_packet` (reliable)                → unretried MUST NOT increment
+    ///   - `poll_resend` (retransmit of a tracked one) → unretried MUST NOT increment
+    #[tokio::test]
+    async fn send_retry_classification_is_pinned_per_send_class() {
+        // Big enough to blow past the 65_507-byte IPv4 UDP payload ceiling in every framing below.
+        let huge = vec![0x5Au8; 70_000];
+
+        // ── session-layer control (`send_raw`): NOT retained by the resend window ──────────────
+        {
+            let net_health: eqoxide_ipc::NetHealthShared = Default::default();
+            let (mut stream, _rx, _peer, _addr) = test_stream_with_peer(net_health.clone()).await;
+            stream.socket.writable().await.unwrap();
+            // `send_raw` is the single framing path for OP_SESSION_REQUEST, OP_ACK,
+            // OP_OUT_OF_ORDER, OP_KEEPALIVE, OP_SESSION_DISC and OP_STAT_RESPONSE, so classifying
+            // it once classifies all six.
+            stream.send_raw(OP_KEEPALIVE, &huge).expect_err("oversized control send must fail");
+            let h = *net_health.lock().unwrap();
+            assert_eq!(h.send_failures, 1);
+            assert_eq!(h.send_failures_unretried, 1,
+                "session-layer control (`send_raw`) is NOT retained in the resend window, so a \
+                 failed one MUST count as unretried (#612 review F2). Classifying it as \
+                 `Retransmitted` would tell an agent a datagram will be re-sent that never will be.");
+        }
+
+        // ── unreliable app packets: NOT retained ──────────────────────────────────────────────
+        {
+            let net_health: eqoxide_ipc::NetHealthShared = Default::default();
+            let (mut stream, _rx, _peer, _addr) = test_stream_with_peer(net_health.clone()).await;
+            stream.socket.writable().await.unwrap();
+            stream.send_app_packet_unreliable(0x1234, &huge).expect_err("must fail");
+            let h = *net_health.lock().unwrap();
+            assert_eq!((h.send_failures, h.send_failures_unretried), (1, 1),
+                "an unreliable app packet has no retransmit at all (#612 review F2)");
+        }
+
+        // ── reliable app packets AND their retransmits: retained ──────────────────────────────
+        {
+            let net_health: eqoxide_ipc::NetHealthShared = Default::default();
+            let (mut stream, _rx, _peer, _addr) = test_stream_with_peer(net_health.clone()).await;
+            stream.socket.writable().await.unwrap();
+            stream.session.max_packet_size = u16::MAX;
+            stream.send_app_packet(0x1234, &vec![0x5Au8; 65_520]);
+            {
+                let h = *net_health.lock().unwrap();
+                assert_eq!((h.send_failures, h.send_failures_unretried), (1, 0),
+                    "a reliable datagram IS retained and retransmitted, so it must NOT be counted \
+                     as unretried (#612 review F2)");
+            }
+            // …and the retransmit itself is classified the same way. Age the window entry past its
+            // backoff so `poll_resend` fires now (no sleeping, no timing dependence).
+            stream.sent[0].sent_at = Instant::now() - std::time::Duration::from_secs(60);
+            stream.poll_resend();
+            let h = *net_health.lock().unwrap();
+            assert_eq!(h.send_failures, 2, "the failed retransmit must be counted too");
+            assert_eq!(h.send_failures_unretried, 0,
+                "a retransmit of a still-tracked datagram is by definition retransmitted (#612 F2)");
+            assert_eq!(stream.sent.len(), 1, "and it stays in the window for the next pass");
+        }
+    }
+
+    /// #612 review (F1) — the session-end hole in "reliable sends recover structurally".
+    ///
+    /// `poll_resend` retries forever, but only while the SESSION lives. EQEmu drops the session at
+    /// its ~30s `resend_timeout`, and the reconnect builds a fresh `EqStream` whose `sent` window
+    /// starts EMPTY — so every still-outstanding reliable is genuinely lost, and
+    /// `send_failures_unretried` reads 0 for all of them. Left unobserved that is the #612 bug one
+    /// level up: a contract telling the agent a class of loss cannot have happened when it can.
+    ///
+    /// Asserts the accounting happens on DROP, which is what makes it path-independent — server
+    /// drop, zone handoff, world reconnect and clean shutdown all end in a dropped stream.
+    #[tokio::test]
+    async fn reliables_outstanding_when_a_session_ends_are_counted_as_abandoned() {
+        let net_health: eqoxide_ipc::NetHealthShared = Default::default();
+        {
+            let (mut stream, _rx, _peer, _addr) = test_stream_with_peer(net_health.clone()).await;
+            stream.socket.writable().await.unwrap();
+            // Two reliables that SUCCEED on the wire but are never ACKed — the ordinary case, and
+            // the one the counter is about: nothing here failed to send.
+            stream.send_app_packet(0x1234, &[0xAA]);
+            stream.send_app_packet(0x1234, &[0xBB]);
+            assert_eq!(stream.sent.len(), 2, "both are outstanding, awaiting ACK");
+            let h = *net_health.lock().unwrap();
+            assert_eq!((h.send_failures, h.reliable_abandoned), (0, 0),
+                "nothing is abandoned while the session is still alive");
+        } // ← the session ends here (this is what a resend_timeout drop / zone handoff does)
+
+        let h = *net_health.lock().unwrap();
+        assert_eq!(h.reliable_abandoned, 2,
+            "un-ACKed reliables outstanding when the session ended are ABANDONED — the next \
+             session's resend window starts empty, so nothing retransmits them (#612 review F1)");
+        assert_eq!(h.send_failures, 0,
+            "these were not send FAILURES — they reached the wire; conflating the two would make \
+             both numbers useless");
+
+        // And it must reach the agent, not just NetHealth.
+        let state = eqoxide_http::testkit::empty_state_with_net_health(net_health.clone());
+        let json = eqoxide_http::testkit::debug_json(state).await;
+        assert_eq!(json["player"]["reliable_abandoned"].as_u64(), Some(2),
+            "GET /v1/observe/debug must report abandoned reliables (#612 review F1). Body: {json}");
+    }
+
+    /// #612 structural guard. The fix is only durable if there stays exactly ONE place in this CRATE
     /// that touches the socket's send path — `EqStream::transmit`, which cannot fail without
     /// stamping `NetHealth`. Four separate `let _ = self.socket.try_send(..)` calls are what made the
     /// bug possible; a fifth added later would silently re-open it. Source-level assertion, in the
@@ -1951,22 +2127,39 @@ mod tests {
     ///
     /// The needle is split so this test's own source doesn't match it.
     #[test]
-    fn there_is_exactly_one_socket_send_call_and_it_records_failures() {
-        const TRANSPORT_RS_SRC: &str = include_str!("transport.rs");
+    fn there_is_exactly_one_socket_send_call_in_the_crate_and_it_records_failures() {
+        // EVERY module of this crate, not just transport.rs (#612 review, F4): the claim being
+        // pinned is "one send call in the crate", so the scan has to cover the crate. `include_str!`
+        // is compile-time, so a module that is added but not listed here is NOT covered — that
+        // residual gap is real and is why the message below says which files were scanned.
+        const SRCS: &[(&str, &str)] = &[
+            ("transport.rs",     include_str!("transport.rs")),
+            ("gameplay.rs",      include_str!("gameplay.rs")),
+            ("action_loop.rs",   include_str!("action_loop.rs")),
+            ("login.rs",         include_str!("login.rs")),
+            ("packet_handler.rs",include_str!("packet_handler.rs")),
+            ("item.rs",          include_str!("item.rs")),
+            ("ucs.rs",           include_str!("ucs.rs")),
+            ("lib.rs",           include_str!("lib.rs")),
+        ];
         let needle = concat!("socket.try_", "send(");
-        // Comment lines are excluded: several doc comments in this file quote the old
+        // Comment lines are excluded: several doc comments quote the old
         // `let _ = self.socket.try_send(..)` line precisely to explain what #612 fixed, and counting
         // those would make this guard unmaintainable (and, worse, satisfiable by deleting a comment).
-        let code_only: String = TRANSPORT_RS_SRC
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let hits = code_only.matches(needle).count();
+        let strip = |src: &str| -> String {
+            src.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
+        };
+        let per_file: Vec<(&str, usize, String)> = SRCS.iter()
+            .map(|(name, src)| { let c = strip(src); (*name, c.matches(needle).count(), c) })
+            .collect();
+        let hits: usize = per_file.iter().map(|(_, n, _)| n).sum();
+        let counts: Vec<String> = per_file.iter().map(|(n, c, _)| format!("{n}={c}")).collect();
         assert_eq!(hits, 1,
-            "transport.rs must funnel EVERY send through `EqStream::transmit` (#612) — found {hits} \
-             direct `socket.try_send` calls. A send that bypasses `transmit` cannot record its own \
-             failure, which is precisely the discarded-error bug this file used to have.");
+            "eqoxide-net must funnel EVERY send through `EqStream::transmit` (#612) — found {hits} \
+             direct `socket.try_send` calls across the crate's modules ({}). A send that bypasses \
+             `transmit` cannot record its own failure, which is precisely the discarded-error bug \
+             this crate used to have.", counts.join(", "));
+        let code_only = &per_file.iter().find(|(_, c, _)| *c == 1).unwrap().2;
         let at = code_only.find(needle).unwrap();
         let enclosing = &code_only[..at];
         let fn_start = enclosing.rfind("    fn ").expect("the call must live inside a method");

@@ -339,7 +339,13 @@ pub struct NetHealth {
     /// (ACK / OutOfOrderAck / keepalive / SessionRequest / SessionDisconnect). The complement
     /// (`send_failures - send_failures_unretried`) is the reliable stream, where the failed
     /// datagram is retained verbatim in the resend window and re-sent by `poll_resend` until the
-    /// server ACKs it — those recover structurally.
+    /// server ACKs it — **for as long as the session lives**.
+    ///
+    /// That qualifier is load-bearing (#612 review F1) and this counter must NOT be read as a
+    /// complete count of lost payload: if the server's ~30s `resend_timeout` drops the session (or
+    /// a zone handoff/reconnect replaces the stream) while reliables are still outstanding, the new
+    /// stream's window starts EMPTY and those datagrams are genuinely lost while this counter reads
+    /// 0 for all of them. That case has its own counter — see `reliable_abandoned`.
     ///
     /// Do NOT read a nonzero value here as "a command was lost": several of these datagrams have a
     /// recovery path one level up (a fresh position update follows ~50ms later; a lost ACK is
@@ -353,6 +359,25 @@ pub struct NetHealth {
     /// When the most recent send failure happened. Measured into an age at HTTP READ time, never
     /// stored as a duration — same rule as every other clock in this struct (#343).
     pub last_send_error_at: Option<std::time::Instant>,
+    /// Un-ACKed RELIABLE datagrams that were abandoned when a session ended (#612, review F1).
+    ///
+    /// `send_failures_unretried` deliberately excludes the reliable stream, because `poll_resend`
+    /// re-sends a failed reliable datagram verbatim until the server ACKs it. That guarantee holds
+    /// only **while the session lives**. EQEmu drops the session at its ~30s `resend_timeout`, and
+    /// the reconnect builds a FRESH `EqStream` whose resend window starts EMPTY — every datagram
+    /// still outstanding at that moment is genuinely lost, and no amount of "it will be
+    /// retransmitted" is true of it any more.
+    ///
+    /// Without this counter that loss would be exactly the bug #612 fixed, one level up: a
+    /// documented contract telling the agent a class of loss cannot have happened when it can.
+    /// `EqStream`'s `Drop` impl adds its outstanding window here, so the abandonment is counted no
+    /// matter WHICH path ended the session (server drop, zone handoff, world reconnect, shutdown).
+    ///
+    /// Note this counts abandonment, not necessarily *loss of an unsent packet*: a datagram that
+    /// reached the wire and whose ACK simply had not arrived yet when we handed off is also counted.
+    /// It is an upper bound on "reliable payload this client stopped trying to deliver", which is
+    /// the honest direction to err in. A clean zone handoff routinely leaves a small number here.
+    pub reliable_abandoned: u64,
 }
 
 impl Default for NetHealth {
@@ -364,6 +389,7 @@ impl Default for NetHealth {
             first_unanswered_probe_sent: None,
             send_failures: 0, send_failures_unretried: 0,
             last_send_error_kind: None, last_send_error_at: None,
+            reliable_abandoned: 0,
         }
     }
 }

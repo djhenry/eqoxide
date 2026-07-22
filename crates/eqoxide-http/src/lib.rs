@@ -365,6 +365,11 @@ pub struct Health {
     /// #612: ms since the most recent send failure, measured at READ time (#343). `None` if none.
     /// Lets an agent tell "one WouldBlock at login an hour ago" from "failing right now".
     pub last_send_error_age_ms: Option<u64>,
+    /// #612 (review F1): un-ACKed RELIABLE datagrams abandoned when a session ended — the case the
+    /// resend window does NOT cover, because the next session's window starts empty. See
+    /// [`eqoxide_ipc::NetHealth::reliable_abandoned`] for the exact contract (it is an upper bound
+    /// on abandoned reliable payload, not a proven count of lost commands).
+    pub reliable_abandoned:     u64,
 }
 
 /// Serializes an `io::ErrorKind` as its `Debug` name so `Health::last_send_error` can stay `Copy`
@@ -612,6 +617,7 @@ impl HttpState {
             send_failures_unretried: h.send_failures_unretried,
             last_send_error:         h.last_send_error_kind,
             last_send_error_age_ms:  h.last_send_error_at.map(|t| t.elapsed().as_millis() as u64),
+            reliable_abandoned:      h.reliable_abandoned,
         }
     }
 }
@@ -940,3 +946,33 @@ mod live_session_guard_tests {
     }
 }
 
+
+#[cfg(test)]
+mod health_serde_tests {
+    /// #612 review (F6): `Health` derives `Serialize` and its `last_send_error` field needs
+    /// `ser_error_kind` to do so (an `io::ErrorKind` is not `Serialize`, and the field is kept as an
+    /// `ErrorKind` so `Health` stays `Copy`). No production path serializes `Health` directly today
+    /// — `/v1/observe/debug` projects the fields individually — so without this test the helper is
+    /// dead code that would rot silently and break the derive the day something does serialize it.
+    /// Kept rather than deleted because the alternative is dropping `Serialize` from a public type.
+    #[test]
+    fn health_serializes_its_send_error_kind_as_a_name_and_null_when_absent() {
+        let h = super::Health {
+            link_age_ms: 0, last_packet_age_ms: 0, snapshot_age_ms: 0,
+            connected: true, world_responsive: true, last_world_response_ms: 0,
+            send_failures: 3, send_failures_unretried: 1,
+            last_send_error: Some(std::io::ErrorKind::WouldBlock),
+            last_send_error_age_ms: Some(42), reliable_abandoned: 7,
+        };
+        let v: serde_json::Value = serde_json::to_value(h).unwrap();
+        assert_eq!(v["last_send_error"], serde_json::json!("WouldBlock"),
+            "an ErrorKind must serialize as its readable name, not as a struct or an integer");
+        assert_eq!(v["send_failures"], serde_json::json!(3));
+        assert_eq!(v["reliable_abandoned"], serde_json::json!(7));
+
+        let none = super::Health { last_send_error: None, ..h };
+        let v: serde_json::Value = serde_json::to_value(none).unwrap();
+        assert!(v["last_send_error"].is_null(),
+            "absence must serialize as an explicit null, not be omitted (#612)");
+    }
+}
