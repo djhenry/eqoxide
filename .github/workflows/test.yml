@@ -106,13 +106,20 @@ jobs:
       # The `tests/asset_sync_live.rs` integration test is the only one that wants the network,
       # and it is already `#[ignore]`d.
       #
-      # 29 tests are `#[ignore]`d, each for a stated environment reason, in three categories:
+      # 32 tests are `#[ignore]`d, each for a stated environment reason, in three categories:
       #   - baked asset fixtures — zone `.glb` + `.wtr` under `$ZONE_GLB`/`$ZONE_DIR`, bundled
-      #     model `.glb` under `assets/models/`; gitignored and absent on a fresh clone (27)
+      #     model `.glb` under `assets/models/`; gitignored and absent on a fresh clone (30)
       #   - extracted SOURCE assets — `tools`' `skinned_conversion_is_centered_grounded` needs
       #     `globalhum_chr.s3d` under `$EQ_ASSETS_DIR` (1)
       #   - a running asset server at `$ASSET_URL` — `tests/asset_sync_live.rs` (1)
-      # They stay ignored here — see #357 for giving them their own optional/asset-backed job.
+      # They ALL stay ignored HERE (this job never fetches assets) — but as of #654, three of the
+      # 30 baked-fixture tests (`tests/water_capability.rs`) are no longer merely ignored-and-
+      # unexecuted: `.github/workflows/asset-gated-tests.yml` fetches their two zones (~41 MB,
+      # measured) and actually runs them with `--ignored`, nightly + on demand, on a self-hosted
+      # runner with asset-server access. The other 29 (the nav real-zone corpus, walker_sim's
+      # drift baseline, the renderer's bundled-model tests, the tools/S3D test, and
+      # asset_sync_live) still run NOWHERE automatic — see #654 for the inventory and what each
+      # remaining one needs before it could join that job.
       #
       # BE PRECISE ABOUT WHAT THIS DOES *NOT* COVER — do not read "nav is now tested in CI" into
       # the numbers above. Among those 29 ignored are the ENTIRE 12-test nav real-zone corpus in

@@ -15,6 +15,10 @@ path = "src/main.rs"
 name = "render_model"
 path = "src/bin/render_model.rs"
 
+[[bin]]
+name = "fetch_ci_assets"
+path = "src/bin/fetch_ci_assets.rs"
+
 [dependencies]
 eqoxide-core = { path = "crates/eqoxide-core" }
 eqoxide-ipc = { path = "crates/eqoxide-ipc" }

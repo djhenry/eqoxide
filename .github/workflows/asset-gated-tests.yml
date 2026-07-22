@@ -1,0 +1,70 @@
+name: asset-gated tests (nightly)
+
+# Runs the `water_capability.rs` suite (#654, #648, #357) — three `#[ignore]`d tests that pin
+# PHYSICAL truths about the character controller (what a swimmer can actually do) against REAL
+# baked zone geometry. Nobody ran `cargo test -- --ignored` across two adversarial review rounds
+# of #648, and the tests were merged unexecuted by anyone but their author. This job exists so
+# that stops happening: it fetches ONLY the ~41 MB the three tests need (two zones' baked
+# `.glb` + `.wtr`, not the whole asset catalogue — see the `fetch_ci_assets` step) and reports a
+# real, distinguishable pass/fail.
+#
+# WHY SELF-HOSTED, AND WHY schedule/workflow_dispatch ONLY (never push/pull_request):
+#   The asset server these tests need is reachable only on the maintainer's own network
+#   (see the asset-server-stack docs) — a GitHub-hosted `ubuntu-latest` runner has no route to it,
+#   so this job targets a maintainer-registered self-hosted runner (label `eqoxide-assets`).
+#   A self-hosted runner attached to a PUBLIC repo must NEVER execute code from an arbitrary
+#   incoming pull request (GitHub's own stated risk for self-hosted runners on public repos) — so
+#   this workflow deliberately has no `push`/`pull_request` trigger. `schedule` only ever runs the
+#   workflow exactly as committed on the default branch; `workflow_dispatch` requires someone with
+#   write access to invoke it. Neither can be reached from a fork's PR content, so adding this job
+#   does not reopen that hole even once a runner exists.
+#
+# STATUS AS OF THIS PR: no such runner is registered yet, so until one is, a scheduled or manually
+# dispatched run of this job will sit queued/waiting in the Actions UI rather than complete — that
+# is an honest "not wired up yet", not a silent no-op (see `fetch_ci_assets`'s doc comment and the
+# PR body for what's needed to finish wiring it up, and for the real local run — green, then
+# deliberately broken RED, then green again — using these exact commands against the exact asset
+# server this job would use).
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Nightly, off the top of the hour to avoid the scheduled-workflow crush GitHub sees at :00.
+    - cron: '17 9 * * *'
+
+jobs:
+  water-capability:
+    runs-on: [self-hosted, eqoxide-assets]
+    timeout-minutes: 15
+    env:
+      # Point at the maintainer's own asset server; a plain loopback default matches the existing
+      # convention in tests/asset_sync_live.rs. Override via repo/environment vars & secrets if the
+      # runner's asset server ever needs real credentials or a non-default host.
+      ASSET_URL: ${{ vars.EQOXIDE_ASSET_URL || 'http://localhost:8088' }}
+      ASSET_USER: ${{ secrets.EQOXIDE_ASSET_USER || 'ci' }}
+      ASSET_PASS: ${{ secrets.EQOXIDE_ASSET_PASS || 'ci' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # No sccache/mold override here (unlike the ubuntu-latest `test` job in test.yml): this job
+      # only ever runs on a maintainer-registered self-hosted runner, which is expected to have the
+      # same toolchain as the local dev box the repo's tracked .cargo/config.toml targets. If a
+      # runner without sccache/mold is ever registered, add the same
+      # CARGO_BUILD_RUSTC_WRAPPER=""/RUSTFLAGS="" override test.yml uses.
+      - name: cargo build --release (workspace)
+        run: cargo build --release --workspace --locked
+
+      # Fetches ONLY the two zones these three tests reference (qcat + freportw), not the full
+      # asset catalogue — measured at ~41 MB total, not the ~283 MB it would be to sync the whole
+      # `gamedata` set plus both zones' full `zone/*` sets. See src/bin/fetch_ci_assets.rs. A
+      # missing/unreachable asset server fails THIS step, loudly, with its own red X distinct from
+      # a test failure below — that is what keeps "assets missing" from ever looking like "passed".
+      - name: fetch water-capability test assets (qcat + freportw, ~41 MB)
+        run: cargo run --release --bin fetch_ci_assets --locked -- qcat freportw
+
+      # `--ignored`: these three are `#[ignore]`d for every OTHER job (they need the assets just
+      # fetched above, which no other job provides). Do not add `--workspace` here — this job is
+      # scoped to exactly the tests #654 is about; the other ~29 asset-gated tests elsewhere in the
+      # workspace need different assets (other zones, bundled character models, a live asset-server
+      # process, or raw extracted S3D) not fetched here. See the PR body for the full inventory.
+      - name: run the water_capability capability suite (--ignored)
+        run: cargo test --release --test water_capability --locked -- --ignored --nocapture
