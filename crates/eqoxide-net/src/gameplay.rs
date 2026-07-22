@@ -351,7 +351,10 @@ pub async fn run_gameplay_phase(
                 OP_GMKICK => {
                     tracing::info!("EQ: OP_GMKick — disconnected (character logged in elsewhere)");
                     gs.log_msg("system", "Disconnected: this character was logged in from another location.");
-                    s.send_session_disconnect();
+                    // DELIBERATE (#612): counted + WARNed by `transmit`. We are already kicked, so
+                    // a failed disconnect changes nothing we can act on — the session is gone either
+                    // way and we shut down next.
+                    let _ = s.send_session_disconnect();
                     // We're already booted, so no OP_Logout. Request shutdown: the render loop's
                     // `about_to_wait` exits the winit event loop on the main thread, which tears
                     // down cleanly and exits the process. Idle here; do NOT return (avoids reconnect).
@@ -637,7 +640,10 @@ pub async fn run_gameplay_phase(
 
         let s = stream.as_mut().unwrap();
         if last_keepalive.elapsed() > KEEPALIVE_INTERVAL {
-            s.send_keepalive();
+            // DELIBERATE (#612): counted + WARNed by `transmit`. The next keepalive is due in one
+            // KEEPALIVE_INTERVAL, and a link that really is gone shows up as `connected: false`
+            // (15s, no inbound datagram) — which is the honest signal, not a keepalive send error.
+            let _ = s.send_keepalive();
             last_keepalive = std::time::Instant::now();
         }
 
@@ -731,7 +737,16 @@ async fn perform_clean_shutdown(
         while rx.try_recv().is_ok() {}
         sleep(Duration::from_millis(10)).await;
     }
-    s.send_session_disconnect();
+    // DELIBERATE (#612): counted + WARNed by `transmit`. This is the last thing we do before the
+    // process exits; a failed disconnect only costs the server its linkdead timer.
+    let _ = s.send_session_disconnect();
+    // #612 review R1: account the outstanding reliable window HERE rather than relying on `Drop`.
+    // This function borrows the stream and returns; its caller then parks in `loop { sleep }` while
+    // the process exits from the MAIN thread, so this task is never unwound and no destructor ever
+    // runs. That was measured by the round-2 reviewer, not reasoned — the counter genuinely read 0
+    // on this path. `abandon_outstanding` clears the window, so if a `Drop` ever does run later it
+    // sees an empty one and cannot double-count.
+    s.abandon_outstanding();
     tracing::info!("EQ: sent OP_Logout + OP_SessionDisconnect (process exits on the main thread)");
 }
 
@@ -1821,6 +1836,7 @@ mod wedge_timeline_tests {
         let mut h = NetHealth {
             last_datagram: base, last_packet: base, last_tick: base,
             last_probe_sent: None, last_probe_reply: None, first_unanswered_probe_sent: None,
+            ..NetHealth::default()
         };
         let mut verdicts = Vec::with_capacity(run_secs as usize + 1);
 
@@ -1928,6 +1944,7 @@ mod wedge_timeline_tests {
         let mut h = NetHealth {
             last_datagram: base, last_packet: base, last_tick: base,
             last_probe_sent: None, last_probe_reply: None, first_unanswered_probe_sent: None,
+            ..NetHealth::default()
         };
         let timeout       = Duration::from_secs(PROBE_TIMEOUT_SECS);
         let passive_stale = Duration::from_secs(PASSIVE_LIVENESS_STALE_SECS);

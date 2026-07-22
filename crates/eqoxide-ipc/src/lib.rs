@@ -319,6 +319,121 @@ pub struct NetHealth {
     /// one continuous silence it stays `false` until real proof of life, no matter how many resends
     /// happen in between.
     pub first_unanswered_probe_sent: Option<std::time::Instant>,
+
+    // ── Outbound send failures (#612) ──────────────────────────────────────────────────────────
+    //
+    // Every clock above is about what the SERVER did. These four are about what WE failed to do:
+    // a datagram the client built but that never left the machine, because `try_send` returned an
+    // error (`WouldBlock`, `ENOBUFS`, `EMSGSIZE`, `ENETUNREACH`, a dead socket…). Before #612 that
+    // error was discarded (`let _ = self.socket.try_send(&raw)`), so a packet that never reached
+    // the wire was indistinguishable from one that did — the agent-honesty failure the invariant
+    // exists to prevent, one layer below #513/#347. `EqStream::transmit` is now the ONLY place in
+    // the client that touches the socket's send path, and it stamps these on every failure, so a
+    // send cannot fail without being counted.
+    /// Cumulative count of outbound datagrams whose `try_send` failed — i.e. that were BUILT but
+    /// never put on the wire. Since process start; never reset (a zone change does not un-drop a
+    /// packet).
+    ///
+    /// **`0` is NOT the healthy reading today.** Measured on this branch's release binary (#612
+    /// round-2 review): a fresh, healthy login into `qeynos` read **283** — all `WouldBlock`, all
+    /// 7-byte datagrams (session-layer control via `send_raw`, i.e. ACKs/keepalives, not app
+    /// traffic), all accrued in a burst during zone-in and then flat for the 40s sampled after. A
+    /// second client in a quieter zone read 0, so it is load-dependent, not universal. That is a
+    /// real pre-existing bug — our ACKs failing to reach the wire during a zone-in burst — filed as
+    /// #641; it is not an artifact of this counter, it is the first time anything could see it.
+    pub send_failures: u64,
+    /// The subset of `send_failures` for datagrams the client does **not** retransmit itself:
+    /// unreliable app packets (the `OP_ClientUpdate` position firehose), session-layer control
+    /// (ACK / OutOfOrderAck / keepalive / SessionRequest / SessionDisconnect). The complement
+    /// (`send_failures - send_failures_unretried`) is the reliable stream, where the failed
+    /// datagram is retained verbatim in the resend window and re-sent by `poll_resend` until the
+    /// server ACKs it — **for as long as the session lives**.
+    ///
+    /// That qualifier is load-bearing (#612 review F1) and this counter must NOT be read as a
+    /// complete count of lost payload: when a session ends while reliables are still outstanding,
+    /// the next stream's window starts EMPTY and those datagrams are genuinely lost while this
+    /// counter reads 0 for all of them.
+    ///
+    /// **Two different endings, and only one of them is counted anywhere:**
+    ///   - A zone handoff / world reconnect / clean shutdown — counted by `reliable_abandoned`.
+    ///   - **A server-side ~30s `resend_timeout` drop — counted by NOTHING.** The client never
+    ///     notices such a drop today (#642), so the stream is never torn down and
+    ///     `reliable_abandoned` does not rise either. `connected: false` (15s of link silence,
+    ///     which precedes the server's 30s drop) is the ONLY honest signal for it.
+    ///
+    /// This paragraph has now regenerated the wrong way four times across #612's reviews — most
+    /// recently right here, under a field whose name does not contain "abandoned", which is exactly
+    /// why greps keyed on `reliable_abandoned` kept missing it. `docs/http-api.md` and
+    /// `eqoxide_http::Health` both point readers HERE for the coverage list, so if this doc is wrong
+    /// the whole chain is. If you edit it, grep `resend_timeout` across the workspace, not this
+    /// field's neighbourhood.
+    ///
+    /// Do NOT read a nonzero value here as "a command was lost": several of these datagrams have a
+    /// recovery path one level up (a fresh position update follows ~50ms later; a lost ACK is
+    /// re-solicited by the server's own resend). It means "this exact datagram is gone, and the
+    /// client will not re-send THAT datagram" — which is a real, previously invisible fact.
+    pub send_failures_unretried: u64,
+    /// `ErrorKind` of the most recent send failure (`None` if there has never been one). Kept as an
+    /// `ErrorKind` rather than a `String` so `NetHealth` stays `Copy` (it is read by value under the
+    /// mutex, like every other field here).
+    pub last_send_error_kind: Option<std::io::ErrorKind>,
+    /// When the most recent send failure happened. Measured into an age at HTTP READ time, never
+    /// stored as a duration — same rule as every other clock in this struct (#343).
+    pub last_send_error_at: Option<std::time::Instant>,
+    /// Un-ACKed RELIABLE datagrams that were abandoned when a session ended (#612, review F1).
+    ///
+    /// `send_failures_unretried` deliberately excludes the reliable stream, because `poll_resend`
+    /// re-sends a failed reliable datagram verbatim until the server ACKs it. That guarantee holds
+    /// only **while the session lives**. EQEmu drops the session at its ~30s `resend_timeout`, and
+    /// the reconnect builds a FRESH `EqStream` whose resend window starts EMPTY — every datagram
+    /// still outstanding at that moment is genuinely lost, and no amount of "it will be
+    /// retransmitted" is true of it any more.
+    ///
+    /// Without this counter that loss would be exactly the bug #612 fixed, one level up: a
+    /// documented contract telling the agent a class of loss cannot have happened when it can.
+    /// `EqStream`'s `Drop` impl adds its outstanding window here, so every path that TEARS THE
+    /// STREAM DOWN is counted without each one remembering to mirror it. See the COVERAGE note
+    /// below for the paths that do not tear it down — one of them is not covered at all.
+    ///
+    /// Note this counts abandonment, not necessarily *loss of an unsent packet*: a datagram that
+    /// reached the wire and whose ACK simply had not arrived yet when we handed off is also counted.
+    /// It is an upper bound on "reliable payload this client stopped trying to deliver", which is
+    /// the honest direction to err in.
+    ///
+    /// **MEASURED (#612 round 2): three consecutive clean zone handoffs (qeynos → qeytoqrg → qeynos
+    /// → freportw) left this at 0, with zero abandonment WARNs** — the resend window was empty at
+    /// every handoff. An earlier version of this doc predicted, from reasoning and explicitly
+    /// unmeasured, that a clean handoff "routinely leaves a small number"; that was WRONG and would
+    /// have trained an agent to ignore the counter's most likely true positive. **Treat a nonzero
+    /// value DURING PLAY as signal, not noise.**
+    ///
+    /// **Clean shutdown is the one measured exception, and it is expected to be nonzero.** Two live
+    /// `/v1/lifecycle/exit` runs measured 4 and 8 (#612 round 3/4). It is invisible to an agent
+    /// either way — the process is exiting — so scope the "0 is normal" reading to play, not to exit.
+    ///
+    /// **The CAUSE of that count is NOT established.** What is known structurally: `OP_Logout` is a
+    /// single reliable datagram, so it can account for at most 1; and `OP_SessionDisconnect` cannot
+    /// contribute at all, because it is framed by `send_raw` (`SendRetry::None`) and the only
+    /// `self.sent.push_back` in the client is in `send_tracked`. What is known empirically: the two
+    /// runs INVERT the naive prediction — 4 with reliable traffic injected, 8 on a control run with
+    /// none. An earlier version of this doc asserted the "closing OP_Logout/SessionDisconnect are
+    /// still un-ACKed" mechanism; it was wrong on both counts and is withdrawn. The remaining count
+    /// is most likely reliables left over from earlier in the session, but that is a HYPOTHESIS,
+    /// not a traced fact — do not repeat it as one.
+    ///
+    /// **COVERAGE — read this before relying on a 0.** It is written where the abandonment can be
+    /// observed, which is not everywhere a session can end:
+    ///   - **Covered:** zone handoff and world reconnect (both `drop` the old stream), zone-in
+    ///     failure returns, and clean shutdown (which calls `abandon_outstanding` explicitly,
+    ///     because its task parks and is never unwound).
+    ///   - **NOT covered: a server-side session drop** — the ~30s `resend_timeout` case. The client
+    ///     currently never notices one: inbound `OP_SessionDisconnect` is unhandled, `poll_recv`'s
+    ///     "socket closed" return is discarded at every call site, and the gameplay loop has no
+    ///     link-staleness exit, so the stream is never dropped and this stays 0 for exactly those
+    ///     datagrams. Detecting a server-side drop is #642, deliberately out of scope for #612.
+    ///     Until then, `connected: false` (15s of link silence, which precedes the server's 30s
+    ///     drop) is the signal for that case — not this counter.
+    pub reliable_abandoned: u64,
 }
 
 impl Default for NetHealth {
@@ -328,6 +443,9 @@ impl Default for NetHealth {
             last_datagram: now, last_packet: now, last_tick: now,
             last_probe_sent: None, last_probe_reply: None,
             first_unanswered_probe_sent: None,
+            send_failures: 0, send_failures_unretried: 0,
+            last_send_error_kind: None, last_send_error_at: None,
+            reliable_abandoned: 0,
         }
     }
 }

@@ -2597,7 +2597,18 @@ impl ActionLoop {
         // native client and the server's own position broadcasts. Sending it on the reliable stream
         // (which we never retransmit) makes a single dropped datagram an unfillable sequence gap, so
         // long continuous runs — which send the most position packets — reliably linkdead (eqoxide#127).
-        stream.send_app_packet_unreliable(OP_CLIENT_UPDATE, &buf);
+        // DELIBERATE (#612): the position firehose is the one send with NO retransmit of any kind,
+        // so a failure here is a genuinely lost update. It is counted in BOTH
+        // `NetHealth::send_failures` and `send_failures_unretried` by `transmit` (pollable at
+        // /v1/observe/debug), which is what an agent needs: a run of unretried failures means the
+        // server's idea of where we are has stopped tracking ours. Not escalated further here — the
+        // next update ~50ms later supersedes this one, and aborting the loop on a transient
+        // WouldBlock would be worse than the drop.
+        if let Err(e) = stream.send_app_packet_unreliable(OP_CLIENT_UPDATE, &buf) {
+            tracing::debug!("NET: position update seq {} did not reach the wire ({:?}) — no \
+                             retransmit; the next update supersedes it (#612)",
+                            self.position_seq.wrapping_sub(1), e.kind());
+        }
     }
 
     /// Resolve a DRNTP zone-line region's `region_index` to its crossing destination — the target

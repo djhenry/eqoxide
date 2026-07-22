@@ -347,6 +347,47 @@ pub struct Health {
     /// life" companion to `world_responsive`, and unlike `last_packet_age_ms` it is NOT reset by
     /// probe traffic being suppressed, because probe replies legitimately count as proof of life here.
     pub last_world_response_ms: u64,
+    /// #612: how many outbound datagrams the client BUILT but could not put on the wire (`try_send`
+    /// returned an error). Cumulative since process start. Before #612 this was unobservable — every
+    /// send error was discarded, so a packet that never left the machine looked exactly like one the
+    /// server received.
+    ///
+    /// **NOT 0 on a healthy client today** — a measured fresh login into `qeynos` read 283, all
+    /// `WouldBlock` on session-layer ACKs during the zone-in burst (#641). See
+    /// [`eqoxide_ipc::NetHealth::send_failures`] for the measurement and the caveat.
+    pub send_failures:          u64,
+    /// #612: the subset of `send_failures` that the client does not retransmit itself (unreliable
+    /// position updates, ACKs, keepalives, session control). The complement is the reliable stream,
+    /// which recovers structurally via the resend window. See [`eqoxide_ipc::NetHealth`] for the
+    /// precise contract — in particular, this is NOT "a command was lost".
+    pub send_failures_unretried: u64,
+    /// #612: `ErrorKind` of the most recent send failure. `None` if no send has ever failed.
+    /// Kept as the `ErrorKind` (not a `String`) so `Health` stays `Copy` like the rest of this
+    /// struct; it serializes as its `Debug` name (`"WouldBlock"`, `"Uncategorized"`, …).
+    #[serde(serialize_with = "ser_error_kind")]
+    pub last_send_error:        Option<std::io::ErrorKind>,
+    /// #612: ms since the most recent send failure, measured at READ time (#343). `None` if none.
+    /// Lets an agent tell "one WouldBlock at login an hour ago" from "failing right now".
+    pub last_send_error_age_ms: Option<u64>,
+    /// #612 (review F1): un-ACKed RELIABLE datagrams abandoned when a session ended — the case the
+    /// resend window does NOT cover, because the next session's window starts empty. Measured 0
+    /// across three clean zone handoffs, so treat a nonzero value DURING PLAY as signal (clean
+    /// shutdown is the measured exception — 4 and 8 on two live exits, cause not established).
+    /// Does NOT cover a server-side `resend_timeout` drop (#642), which nothing counts. See
+    /// [`eqoxide_ipc::NetHealth::reliable_abandoned`] for the full contract and coverage list (it is
+    /// an upper bound on abandoned reliable payload, not a proven count of lost commands).
+    pub reliable_abandoned:     u64,
+}
+
+/// Serializes an `io::ErrorKind` as its `Debug` name so `Health::last_send_error` can stay `Copy`
+/// while still reaching the agent as a readable string (#612).
+fn ser_error_kind<S: serde::Serializer>(
+    k: &Option<std::io::ErrorKind>, s: S,
+) -> Result<S::Ok, S::Error> {
+    match k {
+        Some(k) => s.serialize_some(&format!("{k:?}")),
+        None => s.serialize_none(),
+    }
 }
 
 /// A cast in flight, for `/v1/observe/debug` → `casting` (#348).
@@ -576,6 +617,14 @@ impl HttpState {
             connected,
             world_responsive,
             last_world_response_ms,
+            // #612: outbound send failures. Counters are read straight off `NetHealth` (the net
+            // thread's `EqStream::transmit` is their sole writer); the AGE is measured here, at read
+            // time, like every other duration in this projection (#343).
+            send_failures:           h.send_failures,
+            send_failures_unretried: h.send_failures_unretried,
+            last_send_error:         h.last_send_error_kind,
+            last_send_error_age_ms:  h.last_send_error_at.map(|t| t.elapsed().as_millis() as u64),
+            reliable_abandoned:      h.reliable_abandoned,
         }
     }
 }
@@ -904,3 +953,33 @@ mod live_session_guard_tests {
     }
 }
 
+
+#[cfg(test)]
+mod health_serde_tests {
+    /// #612 review (F6): `Health` derives `Serialize` and its `last_send_error` field needs
+    /// `ser_error_kind` to do so (an `io::ErrorKind` is not `Serialize`, and the field is kept as an
+    /// `ErrorKind` so `Health` stays `Copy`). No production path serializes `Health` directly today
+    /// — `/v1/observe/debug` projects the fields individually — so without this test the helper is
+    /// dead code that would rot silently and break the derive the day something does serialize it.
+    /// Kept rather than deleted because the alternative is dropping `Serialize` from a public type.
+    #[test]
+    fn health_serializes_its_send_error_kind_as_a_name_and_null_when_absent() {
+        let h = super::Health {
+            link_age_ms: 0, last_packet_age_ms: 0, snapshot_age_ms: 0,
+            connected: true, world_responsive: true, last_world_response_ms: 0,
+            send_failures: 3, send_failures_unretried: 1,
+            last_send_error: Some(std::io::ErrorKind::WouldBlock),
+            last_send_error_age_ms: Some(42), reliable_abandoned: 7,
+        };
+        let v: serde_json::Value = serde_json::to_value(h).unwrap();
+        assert_eq!(v["last_send_error"], serde_json::json!("WouldBlock"),
+            "an ErrorKind must serialize as its readable name, not as a struct or an integer");
+        assert_eq!(v["send_failures"], serde_json::json!(3));
+        assert_eq!(v["reliable_abandoned"], serde_json::json!(7));
+
+        let none = super::Health { last_send_error: None, ..h };
+        let v: serde_json::Value = serde_json::to_value(none).unwrap();
+        assert!(v["last_send_error"].is_null(),
+            "absence must serialize as an explicit null, not be omitted (#612)");
+    }
+}
