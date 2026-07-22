@@ -325,9 +325,16 @@ pub struct App {
     /// Per-entity motion smoothing state, keyed by spawn id. See [`EntityMotion`].
     entity_motion: std::collections::HashMap<u32, EntityMotion>,
     /// Estimated nav-driven speed for the visual player position glide (units/s).
-    /// Measured from consecutive logical position changes; defaults to RUN_SPEED.
+    /// Measured via `eqoxide_core::physics::windowed_speed_sample` (#623 live-validation fix —
+    /// see that function's doc for why a naive per-frame re-anchor systematically understates
+    /// speed); defaults to RUN_SPEED.
     player_nav_speed: f32,
-    /// When the logical player position last changed, for speed estimation.
+    /// Real-time anchor for the current `player_nav_speed` sampling window: position and
+    /// timestamp of the last time the window elapsed and a new sample was taken. Deliberately
+    /// separate from `prev_logical_pos` (below), which still updates every frame for the
+    /// unrelated per-frame "did we move at all" latch.
+    nav_speed_anchor_pos: [f32; 2],
+    /// When `nav_speed_anchor_pos` was last set, for speed estimation.
     last_player_nav_update: std::time::Instant,
     /// Where the player should face (EQ degrees, 0=north) — set from movement direction.
     heading_target:  f32,
@@ -488,6 +495,7 @@ impl App {
             prev_render_pos: [0.0, 0.0, 0.0],
             entity_motion: std::collections::HashMap::new(),
             player_nav_speed: 44.0, // default to RUN_SPEED until first measurement
+            nav_speed_anchor_pos: [0.0, 0.0],
             last_player_nav_update: std::time::Instant::now(),
             heading_target:  0.0,
             visual_heading:  0.0,
@@ -1246,11 +1254,20 @@ impl App {
             let dy = lp[1] - self.prev_logical_pos[1];
             let dz = lp[2] - self.prev_logical_pos[2];
             let nav_dist = (dx * dx + dy * dy).sqrt();
-            if nav_dist > 0.01 {
-                // Estimate nav-driven speed from the distance moved over the elapsed interval.
-                // Clamped to [50ms, 500ms] so a stale first frame doesn't spike the estimate.
-                let dt_upd = (now - self.last_player_nav_update).as_secs_f32().clamp(0.05, 0.5);
-                self.player_nav_speed = nav_dist / dt_upd;
+            // Estimate nav-driven speed over a real elapsed window, anchored SEPARATELY from
+            // `prev_logical_pos` above (#623 live-validation finding — see
+            // `eqoxide_core::physics::windowed_speed_sample`'s doc): `game_state_view.player_x/y/z`
+            // is mirrored on essentially every render tick, not just discrete nav steps, so
+            // re-anchoring the speed calc every frame (the old code) understated a true 44 u/s run
+            // as ~14 u/s and never crossed WALK_RUN_THRESHOLD.
+            if let Some(speed) = eqoxide_core::physics::windowed_speed_sample(
+                [lp[0], lp[1]],
+                self.nav_speed_anchor_pos,
+                (now - self.last_player_nav_update).as_secs_f32(),
+                eqoxide_core::physics::NAV_SPEED_SAMPLE_WINDOW,
+            ) {
+                self.player_nav_speed = speed;
+                self.nav_speed_anchor_pos = [lp[0], lp[1]];
                 self.last_player_nav_update = now;
             }
             // `last_moved_at` latches "moving" for the animation. Count VERTICAL swim too (in water)
@@ -1263,27 +1280,28 @@ impl App {
             // Priority: dead > combat swing > walking > sitting > idle. Combat and
             // movement override sitting (classic EQ stands you up when you attack or
             // move); sitting only replaces the plain idle clip. (eqoxide#53)
+            //
+            // The chain itself lives in `select_player_action` (pure, unit-tested below) rather
+            // than inline here: `App`/`render_frame` require wgpu+winit and cannot be exercised by
+            // `cargo test`, so an inline walk/run branch here is MUTATION-UNDETECTABLE — reverting
+            // it to a hardcoded `"walking"` (the exact #623 bug) would leave the whole suite green.
+            // Extracting the decision into a free function with primitive inputs makes it directly
+            // callable (and therefore red-on-revert) from a unit test (#623 PR review).
             let pid = self.game_state_view.player_id;
             let player_dead = self.game_state_view.cur_hp <= 0 && self.game_state_view.max_hp > 0;
             let swinging = self.game_state_view.combat_anims.get(&pid)
                 .map_or(false, |(_, t)| t.elapsed() < crate::scene::COMBAT_SWING_WINDOW);
-            self.scene.player_action = if player_dead {
-                "dead".to_string()
-            } else if let Some((code, _)) = self.game_state_view.combat_anims.get(&pid).filter(|_| swinging) {
-                format!("C{:02}", code)
-            } else if self.controller.in_water {
-                // In water we always swim, never stand: the forward stroke (P06 "swim") while moving,
-                // and treading water in place (L09 "swim_idle") when holding position — so a still
-                // character doesn't appear to stand on the surface (#198/#207). in_water is the
-                // controller's per-step check.
-                if self.last_moved_at.elapsed().as_millis() < 250 { "swimming".to_string() } else { "treading".to_string() }
-            } else if self.last_moved_at.elapsed().as_millis() < 250 {
-                "walking".to_string()
-            } else if self.game_state_view.sitting {
-                "sitting".to_string()
-            } else {
-                "idle".to_string()
-            };
+            let combat_code = self.game_state_view.combat_anims.get(&pid)
+                .filter(|_| swinging).map(|(code, _)| *code);
+            let moving = self.last_moved_at.elapsed().as_millis() < 250;
+            self.scene.player_action = select_player_action(
+                player_dead,
+                combat_code,
+                self.controller.in_water,
+                moving,
+                self.player_nav_speed,
+                self.game_state_view.sitting,
+            );
         }
 
         // Snap camera to player on first valid spawn.
@@ -2241,6 +2259,46 @@ fn next_fade(current: f32, transitioning: bool, dt: f32) -> f32 {
     }
 }
 
+/// Selects the self-player's rendered action/clip. Priority: dead > combat swing > swim/tread >
+/// walk/run > sitting > idle. Combat and movement override sitting (classic EQ stands you up when
+/// you attack or move); sitting only replaces the plain idle clip (eqoxide#53). Pure and
+/// unit-tested directly (see `mod tests` below) — this is the ONLY thing standing between the
+/// walk/run branch and being mutation-undetectable, since the call site in `render_frame` lives on
+/// `App`, which needs wgpu+winit and cannot run under `cargo test` (#623 PR review).
+///
+/// `moving` is the caller's `last_moved_at.elapsed() < 250ms` latch (nav steps fire every ~150ms;
+/// latching "moving" for 250ms keeps the walk/run clip continuous between steps instead of
+/// flickering to idle). `combat_code` is `Some` only while a swing animation window is active.
+fn select_player_action(
+    player_dead: bool,
+    combat_code: Option<u8>,
+    in_water: bool,
+    moving: bool,
+    nav_speed: f32,
+    sitting: bool,
+) -> String {
+    if player_dead {
+        "dead".to_string()
+    } else if let Some(code) = combat_code {
+        format!("C{:02}", code)
+    } else if in_water {
+        // In water we always swim, never stand: the forward stroke (P06 "swim") while moving, and
+        // treading water in place (L09 "swim_idle") when holding position — so a still character
+        // doesn't appear to stand on the surface (#198/#207).
+        if moving { "swimming".to_string() } else { "treading".to_string() }
+    } else if moving {
+        // Walk vs run is chosen purely by comparing measured speed against WALK_RUN_THRESHOLD
+        // (native rule: `speed > walkspeed -> run`, strict). Previously this arm always rendered
+        // "walking" regardless of speed, so the run clip (`clip_for_action("running")`) was never
+        // requested at any speed (#623).
+        eqoxide_core::physics::walk_or_run(nav_speed).to_string()
+    } else if sitting {
+        "sitting".to_string()
+    } else {
+        "idle".to_string()
+    }
+}
+
 /// Distance (units from the player) within which entity billboards get per-frame motion smoothing
 /// (dead-reckoned gliding). Same rationale as [`crate::renderer::ANIM_ADVANCE_DIST`] (#152,
 /// PR #161): the skinned entity pass culls everything past [`crate::pass::ENTITY_DRAW_DIST`], so
@@ -2361,7 +2419,10 @@ fn smooth_entity_motion(
                 if in_water {
                     b.action = if moving { "swimming" } else { "treading" }.to_string();
                 } else if moving {
-                    b.action = "walking".to_string();
+                    // Same walk-vs-run rule as the self-player (#623): `m.speed` is already
+                    // units/s (computed above from the server position-update cadence), so we
+                    // can apply the same threshold instead of hardcoding "walking" at every speed.
+                    b.action = eqoxide_core::physics::walk_or_run(m.speed).to_string();
                 }
             }
 
@@ -2410,7 +2471,7 @@ fn smooth_entity_motion(
 
 #[cfg(test)]
 mod tests {
-    use super::{smooth_entity_motion, zone_needs_reload, next_fade, EntityMotion, MOTION_SMOOTH_DIST};
+    use super::{smooth_entity_motion, zone_needs_reload, next_fade, select_player_action, EntityMotion, MOTION_SMOOTH_DIST};
     use super::{lost_load_zone, publish_load, PendingLoad};
     use std::collections::HashMap;
 
@@ -2533,6 +2594,121 @@ mod tests {
         let x = bbs[0].pos[0];
         assert!(x > 10.0 && x < 12.0, "expected a small glide step from 10 toward 20, got {x}");
         assert_eq!(bbs[0].action, "walking", "gliding entity overrides idle with walking");
+    }
+
+    /// #623 — a remote entity moving faster than `WALK_RUN_THRESHOLD` must render the run clip,
+    /// not walk. Exercises the REAL `smooth_entity_motion` path (the same function production code
+    /// calls), asserting the actual `b.action` string the renderer will look up via
+    /// `Skin::clip_for_action`, not a proxy over the speed math.
+    ///
+    /// Before the #623 fix this test FAILS: `b.action` was hardcoded to `"walking".to_string()`
+    /// whenever `moving` was true, at every speed — verified by reverting the fix locally and
+    /// re-running (see the PR body for the exact mutation and its result).
+    #[test]
+    fn fast_moving_entity_renders_running_not_walking() {
+        let mut motion: HashMap<u32, EntityMotion> = HashMap::new();
+        let t0 = std::time::Instant::now();
+        // Frame 1: seed state at the server pos.
+        let mut bbs = vec![bb(7, [0.0, 0.0, 0.0])];
+        smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], None, t0, 1.0 / 60.0);
+        // Frame 2 (~1s later): server pos moved 30u east -> implied speed 30u/s, comfortably
+        // above WALK_RUN_THRESHOLD (20u/s) and below RUN_SPEED (44u/s) — a clear "running" case.
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        let mut bbs = vec![bb(7, [30.0, 0.0, 0.0])];
+        smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], None, t1, 1.0 / 60.0);
+        assert_eq!(bbs[0].action, "running",
+            "entity moving at ~30u/s (> WALK_RUN_THRESHOLD) must render the run clip");
+    }
+
+    /// #623 companion — the pre-existing submerged override must still win regardless of speed:
+    /// a fast-moving entity IN water renders "swimming", never "running". Guards the priority
+    /// order (submerged check happens before the walk/run threshold at the call site) against a
+    /// future edit that reorders the two.
+    #[test]
+    fn fast_moving_submerged_entity_still_swims_not_runs() {
+        let mut motion: HashMap<u32, EntityMotion> = HashMap::new();
+        let mut collision = flat_collision_at(-10.0);
+        // A real water region spanning z in [-10, 10], well above the floor, so [0,0,0] is wet.
+        collision.set_water(Some(std::sync::Arc::new(
+            eqoxide_core::region_map::RegionMap::water_slab(-10.0, 10.0))));
+        let t0 = std::time::Instant::now();
+        let mut bbs = vec![bb(7, [0.0, 0.0, 0.0])];
+        smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], Some(&collision), t0, 1.0 / 60.0);
+        // Same 30u/1s = 30u/s fast-move case as `fast_moving_entity_renders_running_not_walking`,
+        // now inside the water region — must still be "swimming", never "running".
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        let mut bbs = vec![bb(7, [30.0, 0.0, 0.0])];
+        smooth_entity_motion(&mut motion, &mut bbs, [0.0; 3], Some(&collision), t1, 1.0 / 60.0);
+        assert_eq!(bbs[0].action, "swimming",
+            "submerged entity must swim regardless of speed, never fall through to running");
+    }
+
+    // --- select_player_action (#623 PR review: this is the self-player half of the fix. Nothing
+    // in `App::render_frame` is unit-testable — it needs wgpu+winit — so before `select_player_action`
+    // was extracted, reverting its walk/run branch to a hardcoded "walking" (the exact reported bug)
+    // was mutation-UNDETECTABLE: the whole suite stayed green. These tests call the extracted
+    // function directly, so that exact revert is now caught red. Verified: reverting the `moving`
+    // arm in `select_player_action` to `"walking".to_string()` (unconditionally) fails
+    // `self_player_runs_above_threshold` and `self_player_sitting_only_applies_when_not_moving`
+    // (`self_player_walks_below_threshold` asserts `"walking"` and stays green under this specific
+    // mutation — it is the other two tests that catch it) — see the PR body for the mutation-check
+    // transcript.) ---
+
+    #[test]
+    fn self_player_walks_below_threshold() {
+        let action = select_player_action(false, None, false, true, 5.0, false);
+        assert_eq!(action, "walking");
+    }
+
+    #[test]
+    fn self_player_runs_above_threshold() {
+        let action = select_player_action(false, None, false, true, 44.0, false);
+        assert_eq!(action, "running",
+            "moving at RUN_SPEED (44 u/s, well above WALK_RUN_THRESHOLD) must select the run clip \
+             — this is the exact #623 bug: this arm used to always return \"walking\"");
+    }
+
+    #[test]
+    fn self_player_dead_overrides_everything() {
+        // Dead outranks even a fast-moving, in-combat, submerged, sitting state — all set to what
+        // would otherwise select a different action, to prove "dead" really is checked first.
+        let action = select_player_action(true, Some(3), true, true, 44.0, true);
+        assert_eq!(action, "dead");
+    }
+
+    #[test]
+    fn self_player_combat_swing_outranks_movement() {
+        let action = select_player_action(false, Some(7), false, true, 44.0, false);
+        assert_eq!(action, "C07");
+    }
+
+    #[test]
+    fn self_player_submerged_swims_regardless_of_speed_moving() {
+        let action = select_player_action(false, None, true, true, 44.0, false);
+        assert_eq!(action, "swimming",
+            "submerged + moving must swim, never fall through to the walk/run branch");
+    }
+
+    #[test]
+    fn self_player_submerged_treads_when_still() {
+        let action = select_player_action(false, None, true, false, 0.0, false);
+        assert_eq!(action, "treading");
+    }
+
+    #[test]
+    fn self_player_sitting_only_applies_when_not_moving() {
+        let sitting_still = select_player_action(false, None, false, false, 0.0, true);
+        assert_eq!(sitting_still, "sitting");
+        // Movement stands the player up (classic EQ behavior, eqoxide#53) even while `sitting` is
+        // still latched true server-side.
+        let sitting_but_moving = select_player_action(false, None, false, true, 44.0, true);
+        assert_eq!(sitting_but_moving, "running");
+    }
+
+    #[test]
+    fn self_player_idle_when_still_and_not_sitting() {
+        let action = select_player_action(false, None, false, false, 0.0, false);
+        assert_eq!(action, "idle");
     }
 
     #[test]
