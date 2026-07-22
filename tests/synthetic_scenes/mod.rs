@@ -255,6 +255,56 @@ pub fn flat_run_into_a_vertical_face() -> Collision {
     collision(m, None)
 }
 
+// ─────── scene 4: open water with no floor within the push-out's reach (#664) ───────
+
+/// Depth of the scene's only floor — irrelevant to the case, it just needs to exist so
+/// [`Collision::has_geometry`](eqoxide::nav::collision::Collision::has_geometry) is true (an empty
+/// scene short-circuits the depenetration net entirely, which would test nothing).
+pub const FAR_FLOOR_Z: f32 = -50.0;
+/// East coordinate where the scene's only floor begins — **far** outside the depenetration
+/// push-out's widest search ring (`movement::PUSHOUT_RADII`'s last entry is 32 u) and outside
+/// `PUSHOUT_RADII` doubled several times over, so no ring candidate anywhere near the origin can
+/// ever reach it, at any radius the net tries.
+pub const FAR_FLOOR_EAST: f32 = 500.0;
+
+/// **SCENE 4 — OPEN WATER, NO FLOOR ANYWHERE NEAR (#649 review finding 1 / #664).**
+///
+/// Water everywhere (an unbounded [`RegionMap::water_slab`]); the scene's only floor is a strip
+/// starting [`FAR_FLOOR_EAST`] units east — far outside anywhere the depenetration push-out's ring
+/// search or its `GROUND_DEPTH` vertical probe can reach from the origin. At the origin (and at
+/// every ring candidate the push-out tries near it), `footprint_clear` is trivially true — there is
+/// no geometry anywhere nearby to pierce it — yet `ground_below` finds nothing at all: the OTHER
+/// clause of the net's `is_embedded` predicate (`floor.is_none()`) is what calls this body
+/// "embedded" despite its clear footprint. That is the exact combination #664 is about: a body
+/// whose only problem is the medium's own geometry, not an overlap the ring push-out could resolve
+/// by moving it sideways.
+///
+/// # Why there is no bypass
+///
+/// There is no wall, no floor, no ceiling, and no ledge within any ring radius the push-out
+/// searches (max 32 u) or any distance a body could walk with wish input in the couple of seconds
+/// the tests here drive it (the tests drive ZERO wish input). The only thing in this scene able to
+/// move the body from the origin at all is the depenetration net handing back a recovery. A
+/// character that ends up displaced can only have gotten there through the net.
+pub fn open_water_no_floor_in_reach() -> Collision {
+    let m = vec![floor(FAR_FLOOR_Z, FAR_FLOOR_EAST, FAR_FLOOR_EAST + 100.0, -1000.0, 1000.0)];
+    collision(m, Some(RegionMap::water_slab(-1000.0, 10.0)))
+}
+
+/// **THE CONTROL FOR SCENE 4** — the SAME floor, moved directly under the origin instead of 500 u
+/// away, everything else identical (same water slab, same body start point). With a floor in
+/// vertical reach the net's `is_embedded` predicate is false at the very first check (nothing to
+/// recover from at all) — `step` never even enters the ring search. This is the "nothing happens
+/// because there was nothing to fix" baseline scene 4's own case is contrasted against; it is not
+/// used to assert a shared numeric outcome, since the two scenes are supposed to diverge (one has a
+/// floor below the origin, one does not) — it exists so a future edit that accidentally left a floor
+/// under the origin in [`open_water_no_floor_in_reach`] would be easy to tell apart from this one by
+/// diffing the two functions.
+pub fn open_water_with_floor_in_reach() -> Collision {
+    let m = vec![floor(FAR_FLOOR_Z, -50.0, 50.0, -1000.0, 1000.0)];
+    collision(m, Some(RegionMap::water_slab(-1000.0, 10.0)))
+}
+
 /// **THE CONTROL FOR SCENE 3** — the same two levels joined by a genuine walkable RAMP instead of
 /// a vertical face. `FACE_RISE` over a 16 u run is grade 0.8, comfortably inside
 /// `MAX_WALK_GRADE = 1.2`, and the profile check has nothing to reject. This is the
