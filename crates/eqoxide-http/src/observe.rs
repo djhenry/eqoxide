@@ -626,9 +626,10 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         //                              channel, and the one `send_failures_unretried` cannot see.
         //                              MEASURED 0 across three clean zone handoffs → a nonzero value
         //                              DURING PLAY is signal, not routine noise. Clean shutdown is
-        //                              the measured exception (4 and 8 on two live exits): the final
-        //                              OP_Logout/SessionDisconnect are still un-ACKed when the
-        //                              process leaves, which no agent can observe anyway.
+        //                              the measured exception (4 and 8 on two live exits), which no
+        //                              agent can observe anyway. The CAUSE of that count is not
+        //                              established — see NetHealth::reliable_abandoned; do not
+        //                              invent one.
         //                              DOES NOT cover a server-side resend_timeout drop: the client
         //                              never notices one today (#642), so use `connected` for that.
         //   last_send_error          — ErrorKind of the most recent one ("WouldBlock", …), or null.

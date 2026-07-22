@@ -350,10 +350,23 @@ pub struct NetHealth {
     /// server ACKs it — **for as long as the session lives**.
     ///
     /// That qualifier is load-bearing (#612 review F1) and this counter must NOT be read as a
-    /// complete count of lost payload: if the server's ~30s `resend_timeout` drops the session (or
-    /// a zone handoff/reconnect replaces the stream) while reliables are still outstanding, the new
-    /// stream's window starts EMPTY and those datagrams are genuinely lost while this counter reads
-    /// 0 for all of them. That case has its own counter — see `reliable_abandoned`.
+    /// complete count of lost payload: when a session ends while reliables are still outstanding,
+    /// the next stream's window starts EMPTY and those datagrams are genuinely lost while this
+    /// counter reads 0 for all of them.
+    ///
+    /// **Two different endings, and only one of them is counted anywhere:**
+    ///   - A zone handoff / world reconnect / clean shutdown — counted by `reliable_abandoned`.
+    ///   - **A server-side ~30s `resend_timeout` drop — counted by NOTHING.** The client never
+    ///     notices such a drop today (#642), so the stream is never torn down and
+    ///     `reliable_abandoned` does not rise either. `connected: false` (15s of link silence,
+    ///     which precedes the server's 30s drop) is the ONLY honest signal for it.
+    ///
+    /// This paragraph has now regenerated the wrong way four times across #612's reviews — most
+    /// recently right here, under a field whose name does not contain "abandoned", which is exactly
+    /// why greps keyed on `reliable_abandoned` kept missing it. `docs/http-api.md` and
+    /// `eqoxide_http::Health` both point readers HERE for the coverage list, so if this doc is wrong
+    /// the whole chain is. If you edit it, grep `resend_timeout` across the workspace, not this
+    /// field's neighbourhood.
     ///
     /// Do NOT read a nonzero value here as "a command was lost": several of these datagrams have a
     /// recovery path one level up (a fresh position update follows ~50ms later; a lost ACK is
@@ -394,11 +407,19 @@ pub struct NetHealth {
     /// have trained an agent to ignore the counter's most likely true positive. **Treat a nonzero
     /// value DURING PLAY as signal, not noise.**
     ///
-    /// **Clean shutdown is the one measured exception, and it is expected to be nonzero.** Two
-    /// live `/v1/lifecycle/exit` runs measured 4 and 8 (#612 round 3) — the OP_Logout and
-    /// SessionDisconnect at the end of a session are still un-ACKed when the process leaves. That
-    /// is by construction, not a defect, and it is invisible to an agent anyway because the process
-    /// is exiting. Scope the "0 is normal" reading to play, not to exit.
+    /// **Clean shutdown is the one measured exception, and it is expected to be nonzero.** Two live
+    /// `/v1/lifecycle/exit` runs measured 4 and 8 (#612 round 3/4). It is invisible to an agent
+    /// either way — the process is exiting — so scope the "0 is normal" reading to play, not to exit.
+    ///
+    /// **The CAUSE of that count is NOT established.** What is known structurally: `OP_Logout` is a
+    /// single reliable datagram, so it can account for at most 1; and `OP_SessionDisconnect` cannot
+    /// contribute at all, because it is framed by `send_raw` (`SendRetry::None`) and the only
+    /// `self.sent.push_back` in the client is in `send_tracked`. What is known empirically: the two
+    /// runs INVERT the naive prediction — 4 with reliable traffic injected, 8 on a control run with
+    /// none. An earlier version of this doc asserted the "closing OP_Logout/SessionDisconnect are
+    /// still un-ACKed" mechanism; it was wrong on both counts and is withdrawn. The remaining count
+    /// is most likely reliables left over from earlier in the session, but that is a HYPOTHESIS,
+    /// not a traced fact — do not repeat it as one.
     ///
     /// **COVERAGE — read this before relying on a 0.** It is written where the abandonment can be
     /// observed, which is not everywhere a session can end:

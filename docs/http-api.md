@@ -510,11 +510,18 @@ Every send now funnels through one place that records its own failure, so:
   reasoning and unmeasured, that clean handoffs "routinely leave a small number"; measurement said
   otherwise and the claim is withdrawn.)
 - **Clean shutdown is the one measured exception, and is expected to be nonzero.** Two live
-  `POST /v1/lifecycle/exit` runs measured `4` and `8`: the closing OP_Logout / SessionDisconnect are
-  still un-ACKed when the process leaves. That is by construction, and no agent can observe it
-  anyway — the process is exiting. Do not generalise the handoff-measured `0` to this path. (The
-  handoff figure was measured before the shutdown path existed; stating both is what keeps the two
-  bullets from contradicting each other, which round-3 review N1 caught them doing.)
+  `POST /v1/lifecycle/exit` runs measured `4` and `8`. No agent can observe this anyway — the
+  process is exiting — so do not generalise the handoff-measured `0` to this path, and do not read
+  the exit value as a fault. (The handoff figure was measured before the shutdown path existed;
+  stating both is what keeps these two bullets from contradicting each other, which round-3 review
+  N1 caught them doing.)
+- **The cause of the exit-time count is NOT established, and this page will not guess at one.** An
+  earlier draft claimed the closing OP_Logout / SessionDisconnect were still un-ACKed. That was
+  wrong: OP_Logout is a single datagram (so it explains at most 1 of 4-8), and OP_SessionDisconnect
+  can never enter the resend window at all — it is framed by the unreliable control path. The two
+  measured runs also invert the naive prediction (4 *with* injected reliable traffic, 8 on a control
+  run with none). Leftover reliables from earlier in the session are the obvious hypothesis; nobody
+  has traced it.
 - **What `reliable_abandoned` does and does not cover.** It rises on: zone handoff, world reconnect,
   zone-in failure, and clean shutdown. It does **not** rise on a **server-side session drop** (the
   ~30s `resend_timeout` case), because the client currently never notices one — inbound

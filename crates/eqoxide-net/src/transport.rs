@@ -1389,6 +1389,15 @@ mod tests {
     /// OUT the call, which is the realistic way such a call regresses (a review mutation did exactly
     /// that and the suite stayed green). Whether a nearby doc comment happens to match is then pure
     /// accident, which is not a property a guard may depend on.
+    ///
+    /// **KNOWN LIMIT (#612 round-4 review, C3): this handles whole-line `//` comments ONLY. A
+    /// `/* … */` block comment around a guarded call still defeats every guard built on it** — the
+    /// reviewer probed exactly that and the suite stayed green. Deliberately not fixed here: a
+    /// span-stripper that does not understand string literals could over-strip and produce a FALSE
+    /// RED across the eight modules the `try_send` guard scans, several of which contain `/*` tokens
+    /// inside code and prose. A guard that occasionally fails for the wrong reason is worse than one
+    /// with a documented hole, so the hole is documented and the assert messages are worded to claim
+    /// only what is actually checked. If you close it, do it with a real lexer, not a regex.
     fn strip_comments(src: &str) -> String {
         src.lines()
             .filter(|l| !l.trim_start().starts_with("//"))
@@ -2224,8 +2233,10 @@ mod tests {
         assert!(body.contains("abandon_outstanding()"),
             "perform_clean_shutdown must call `abandon_outstanding()` explicitly (#612 R1): its \
              task parks forever after returning, so `Drop` never runs and the outstanding reliable \
-             window would go unaccounted on the clean-shutdown path. (Commenting the call out counts \
-             as removing it — comments are stripped before this check.)");
+             window would go unaccounted on the clean-shutdown path. (Whole-line `//` comments are \
+             stripped before this check, so line-commenting the call counts as removing it. A \
+             `/* … */` block comment is NOT stripped and would defeat this guard — see \
+             `strip_comments`.)");
     }
 
     /// #612 structural guard. The fix is only durable if there stays exactly ONE place in this CRATE
