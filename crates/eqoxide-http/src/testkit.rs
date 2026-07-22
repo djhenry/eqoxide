@@ -52,6 +52,13 @@ pub fn empty_state_with_net_thread_dead(
     HttpState { net_thread_dead, ..empty_state() }
 }
 
+/// The shared world tables (`entity_positions` / `entity_ids` / `entity_poses`) behind an
+/// [`HttpState`]. `HttpState.world` is private, so downstream integration tests that need to seed
+/// the roster the way the net thread's `sync_entities` does go through this (#643).
+pub fn world_slots(state: &HttpState) -> eqoxide_ipc::WorldSlots {
+    state.world.clone()
+}
+
 pub fn empty_state() -> HttpState {
     // `CameraSlots` has no `Default` impl (`CameraSnapshot`'s fields aren't Default-able), so
     // it's built by hand; every other bundle is plain `Default::default()`. `nav`, `camera`, and
@@ -116,10 +123,18 @@ pub fn empty_state() -> HttpState {
 /// downstream integration test can assert the observe projection without needing the crate-private
 /// `observe` module or naming `HttpState`.
 pub async fn debug_json(state: HttpState) -> serde_json::Value {
+    observe_json(state, "/debug").await
+}
+
+/// GET an arbitrary observe `path` (e.g. `"/entities?labeled=1"`) against a throwaway REAL observe
+/// router built from `state`, decoded to JSON. Same rationale as [`debug_json`]: a downstream
+/// integration test must be able to assert on the ACTUAL serialized HTTP body, not on an internal
+/// struct that might never reach the wire (#643).
+pub async fn observe_json(state: HttpState, path: &str) -> serde_json::Value {
     use tower::ServiceExt;
     let app = crate::observe::router().with_state(state);
     let resp = app
-        .oneshot(axum::http::Request::get("/debug").body(axum::body::Body::empty()).unwrap())
+        .oneshot(axum::http::Request::get(path).body(axum::body::Body::empty()).unwrap())
         .await
         .unwrap();
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();

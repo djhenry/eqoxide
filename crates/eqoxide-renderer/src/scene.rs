@@ -2,7 +2,7 @@
 //! pose/position, recent messages, target info, …). Copied from the network-owned `GameState` once
 //! per frame so the render loop never blocks on or shares locks with the EQ network thread.
 
-use eqoxide_core::game_state::{GameState, LogEntry};
+use eqoxide_core::game_state::{GameState, LogEntry, Pose};
 
 /// How long a one-shot combat swing (OP_Animation) plays before reverting to idle/walk. ~one swing.
 pub const COMBAT_SWING_WINDOW: std::time::Duration = std::time::Duration::from_millis(600);
@@ -247,7 +247,7 @@ impl SceneState {
             // Animation constants from eq_constants.h: Standing=100, Freeze=102,
             // Looting=105, Sitting=110, Crouching=111, Lying=115.
             // Dead entities always use the "dead" clip — no combat swing can override.
-            // (apply_death sets e.animation=115, but guard here in case the animation
+            // (apply_death sets e.pose=Lying, but guard here in case the animation
             // field is stale from a race or a future code path that forgets to update it.)
             let action: String = if e.dead {
                 "dead".to_string()
@@ -257,14 +257,25 @@ impl SceneState {
                 // weapon, …).
                 match gs.combat_anims.get(&e.spawn_id) {
                     Some((code, start)) if start.elapsed() < COMBAT_SWING_WINDOW => format!("C{:02}", code),
-                    _ => match e.animation {
-                        100 => "idle",       // Animation::Standing
-                        102 => "idle",       // Animation::Freeze
-                        110 => "sitting",    // Animation::Sitting
-                        111 => "crouching",  // Animation::Crouching
-                        105 => "idle",       // Animation::Looting (treat as idle)
-                        115 => "dead",       // Animation::Lying
-                        _   => "idle",       // default / standing / safe default
+                    // #643: match the POSE type EXHAUSTIVELY — no `_` catch-all. The old code
+                    // matched a bare `u32` that also carried gait codes, so every unrecognised
+                    // value (including every legitimate gait value) fell into `_ => "idle"` and
+                    // the client silently reported a moving or sitting entity as idle. With
+                    // `Pose` there is no value that can arrive here from the gait domain, and the
+                    // one genuinely-unknown case is named rather than guessed at: it still has to
+                    // pick SOME clip to draw, but the raw code is preserved on the entity and
+                    // published verbatim by `/v1/observe/entities?labeled=1` as `unknown(<raw>)`,
+                    // so an agent can see that the client did not understand it. Adding a new
+                    // `Pose` variant now fails to compile here instead of silently becoming idle.
+                    _ => match e.pose {
+                        Pose::Standing  => "idle",
+                        Pose::Freeze    => "idle",
+                        Pose::Looting   => "idle",     // no looting clip yet; drawn as idle
+                        Pose::Sitting   => "sitting",
+                        Pose::Crouching => "crouching",
+                        Pose::Lying     => "dead",
+                        // Fallback CLIP only — the unknown-ness itself is reported, not hidden.
+                        Pose::Unknown(_) => "idle",
                     }.to_string(),
                 }
             };
@@ -425,7 +436,7 @@ impl SceneState {
 #[cfg(test)]
 mod tests {
     use super::SceneState;
-    use eqoxide_core::game_state::{Entity, GameState};
+    use eqoxide_core::game_state::{Entity, GameState, Pose};
 
     fn sample_state() -> GameState {
         let mut gs = GameState::new();
@@ -461,7 +472,7 @@ mod tests {
             dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0, floating: false,
             face: 0, hairstyle: 0, haircolor: 0,
-            animation: 0,
+            pose: Pose::Standing, gait: None,
         });
 
         gs
@@ -546,7 +557,7 @@ mod tests {
             dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0, floating: false,
             face: 0, hairstyle: 0, haircolor: 0,
-            animation: 0,
+            pose: Pose::Standing, gait: None,
         });
         let scene = SceneState::from_game_state(&gs, &std::collections::HashMap::new());
         assert_eq!(scene.billboards.len(), 1);
@@ -585,7 +596,7 @@ mod tests {
             dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0, floating: false,
             face: 0, hairstyle: 0, haircolor: 0,
-            animation: 0,
+            pose: Pose::Standing, gait: None,
         });
         gs.target_id = Some(42);
         let scene = SceneState::from_game_state(&gs, &std::collections::HashMap::new());
@@ -607,7 +618,7 @@ mod tests {
             race: "HUM".into(), heading: 0.0, dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0, floating: false,
             face: 0, hairstyle: 0, haircolor: 0,
-            animation: 0,
+            pose: Pose::Standing, gait: None,
         };
         e.equipment[1] = 17;
         e.equipment_tint[1] = [9, 8, 7];
@@ -627,7 +638,7 @@ mod tests {
             race: "HUM".into(), heading: 0.0, dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 1, helm: 0, showhelm: 0, floating: false,
             face: 0, hairstyle: 0, haircolor: 0,
-            animation: 0,
+            pose: Pose::Standing, gait: None,
         };
         gs.upsert_entity(e);
         let scene = SceneState::from_game_state(&gs, &std::collections::HashMap::new());
@@ -674,7 +685,7 @@ mod tests {
             race: "ORC".into(), heading, dead: false,
             equipment: [0; 9], equipment_tint: [[0; 3]; 9], gender: 0, helm: 0, showhelm: 0, floating: false,
             face: 0, hairstyle: 0, haircolor: 0,
-            animation: 0,
+            pose: Pose::Standing, gait: None,
         }
     }
 

@@ -588,6 +588,26 @@ pub type EntityPositions = Arc<Mutex<HashMap<String, (f32, f32, f32)>>>;
 /// Live entity name → spawn_id map (same keys as EntityPositions).
 pub type EntityIds = Arc<Mutex<HashMap<String, u32>>>;
 
+/// One entity's server-published body state, as exposed by `/v1/observe/entities?labeled=1` (#643).
+///
+/// Both halves are the wire's own signals, kept in their OWN domains — before #643 they shared a
+/// single `u32` on `Entity`, so whichever packet arrived last silently decided what the number
+/// meant. `pose` is the discrete body state; `gait` is the locomotion speed code.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct EntityPoseView {
+    /// `standing` / `freeze` / `looting` / `sitting` / `crouching` / `lying`, or
+    /// **`unknown(<raw>)`** when the server sent a code this client does not recognise. An
+    /// unrecognised code is reported verbatim rather than guessed at (agent-honesty).
+    pub pose: String,
+    /// The most recent `OP_ClientUpdate` gait (locomotion speed) code, or `null` when this entity
+    /// has not sent a position update yet. `null` means **"not reported"**, NOT "standing still".
+    pub gait: Option<i32>,
+}
+
+/// Live entity name → pose/gait map (same keys as `EntityPositions`), published each tick by the
+/// net thread and read by `GET /v1/observe/entities?labeled=1` (#643).
+pub type EntityPoses = Arc<Mutex<HashMap<String, EntityPoseView>>>;
+
 /// Zone exit points received in OP_SEND_ZONE_POINTS, exposed via GET /v1/observe/zone_points.
 pub type ZonePoints = Arc<Mutex<Vec<eqoxide_core::game_state::ZonePoint>>>;
 /// Native Task-system quest log, published from GameState.tasks each tick (GET /v1/observe/quests/log).
@@ -1221,6 +1241,9 @@ pub struct NavSlots {
 pub struct WorldSlots {
     pub entity_positions: EntityPositions,
     pub entity_ids:       EntityIds,
+    /// name → pose/gait (#643). Same keys as `entity_positions`; published by the same
+    /// `sync_entities` full-replace so it can never go stale independently of the roster.
+    pub entity_poses:     EntityPoses,
     pub zone_points:      ZonePoints,
 }
 

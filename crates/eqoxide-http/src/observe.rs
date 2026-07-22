@@ -785,6 +785,18 @@ struct EntitiesView {
     duplicate_groups: Vec<DuplicateGroup>,
     /// Human-readable explanation, present only when `deduped > 0`.
     note: Option<String>,
+    /// #643 — name → server-published `{pose, gait}` for every entity in `entities`.
+    ///
+    /// `pose` is the discrete body state (`standing`/`sitting`/`crouching`/`lying`/`looting`/
+    /// `freeze`) and `gait` is the locomotion speed code from the last position update (`null`
+    /// = the entity has not sent one, which is NOT "standing still"). A pose code this client
+    /// does not recognise is reported as **`unknown(<raw>)`** — never silently defaulted.
+    ///
+    /// Before #643 these two wire signals shared ONE `u32` on the entity, so whichever packet
+    /// arrived last decided what it meant, and the renderer's catch-all turned everything it
+    /// could not classify into "idle". Nothing agent-visible reported the pose at all, so the
+    /// confusion was completely invisible to a driving agent; this field is that missing channel.
+    poses: HashMap<String, eqoxide_ipc::EntityPoseView>,
 }
 
 /// Collapse suspected server-side duplicate spawns (#471) for the read-only /observe/entities view.
@@ -867,6 +879,15 @@ async fn get_entities(State(s): State<HttpState>, Query(q): Query<EntitiesQuery>
     let labeled = q.labeled.as_deref()
         .is_some_and(|v| v.eq_ignore_ascii_case("1") || v.eq_ignore_ascii_case("true"));
     if labeled {
+        // #643: pose/gait for exactly the names that survived the dedup, so `poses` and `entities`
+        // always have the same key set. LOCK ORDER: taken after `entity_positions` has been
+        // released above, so this never nests inside the canonical positions→ids order.
+        let poses = {
+            let all = s.world.entity_poses.lock().unwrap();
+            entities.keys()
+                .filter_map(|n| all.get(n).map(|p| (n.clone(), p.clone())))
+                .collect::<HashMap<_, _>>()
+        };
         let note = (deduped > 0).then(|| format!(
             "{deduped} entry(ies) collapsed as same-name + byte-identical-position duplicates \
              (suspected server-side spawn2 duplication, #471). The underlying entity model is \
@@ -874,7 +895,7 @@ async fn get_entities(State(s): State<HttpState>, Query(q): Query<EntitiesQuery>
              A live packet capture is still needed to confirm this is server-sent (two distinct \
              spawn_ids on the wire) rather than a client artifact."
         ));
-        Json(EntitiesView { count: entities.len(), entities, deduped, duplicate_groups, note }).into_response()
+        Json(EntitiesView { count: entities.len(), entities, deduped, duplicate_groups, note, poses }).into_response()
     } else {
         // Default: the bare, backward-compatible name→pos map — deduped, but same shape as before.
         Json(entities).into_response()

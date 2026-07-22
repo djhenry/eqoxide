@@ -236,6 +236,7 @@ fn main() {
     let world = ipc::WorldSlots {
         entity_positions: Arc::new(Mutex::new(HashMap::new())),
         entity_ids:       Arc::new(Mutex::new(HashMap::new())),
+        entity_poses:     Arc::new(Mutex::new(HashMap::new())),
         zone_points:      Arc::new(Mutex::new(Vec::new())),
     };
     let quest = ipc::QuestSlots {

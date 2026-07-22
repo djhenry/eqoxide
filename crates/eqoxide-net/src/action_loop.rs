@@ -647,12 +647,20 @@ impl ActionLoop {
     pub fn sync_entities(&self, gs: &GameState) {
         let mut map = self.world.entity_positions.lock().unwrap();
         let mut ids = self.world.entity_ids.lock().unwrap();
+        // #643: pose/gait rides the SAME full-replace as the roster, so it shares the roster's
+        // lifetime exactly — an entity can never keep a pose after it has left `entity_positions`.
+        let mut poses = self.world.entity_poses.lock().unwrap();
         // Full replace: clear stale entries so positions reflect the current zone only.
         map.clear();
         ids.clear();
+        poses.clear();
         for (&id, e) in &gs.world.entities {
             map.insert(e.name.clone(), (e.x, e.y, e.z));
             ids.insert(e.name.clone(), id);
+            poses.insert(e.name.clone(), eqoxide_ipc::EntityPoseView {
+                pose: e.pose.label(),
+                gait: e.gait.map(|g| g.raw()),
+            });
         }
     }
 
@@ -3233,6 +3241,43 @@ mod tests {
 
     /// Build a minimal ActionLoop for unit tests that only exercise a single `sync_*`/tick method —
     /// every other shared slot gets an empty/default placeholder.
+    /// #643: `sync_entities` is the ONLY publisher of the agent-facing world tables, so if it does
+    /// not carry pose/gait, `/v1/observe/entities?labeled=1` can only ever report nothing. This
+    /// pins the publisher half of the net→HTTP path (the HTTP half is pinned by the app crate's
+    /// `tests/entity_pose_643.rs`). It also pins the SIGN of the gait field: `animation` is
+    /// `signed animation:10` on the wire, so a mob backing up carries a negative gait — reporting
+    /// the raw unsigned bits would turn -12 into a confident, wrong 1012.
+    #[test]
+    fn sync_entities_publishes_pose_and_gait_643() {
+        use eqoxide_core::game_state::{Gait, Pose};
+        let mut gs = GameState::new();
+        let mut sitter = eqoxide_core::game_state::make_entity(1, "a_sitter", 1.0, 2.0, 3.0, true);
+        sitter.pose = Pose::Sitting;
+        sitter.gait = Some(Gait::from_wire_10bit(12));
+        gs.upsert_entity(sitter);
+        let mut backer = eqoxide_core::game_state::make_entity(2, "a_backpedaller", 4.0, 5.0, 6.0, true);
+        backer.gait = Some(Gait::from_wire_10bit(1012)); // 10-bit two's complement for -12
+        gs.upsert_entity(backer);
+        let mut weird = eqoxide_core::game_state::make_entity(3, "a_weirdo", 7.0, 8.0, 9.0, true);
+        weird.pose = Pose::from_wire(199);
+        gs.upsert_entity(weird);
+
+        let group: eqoxide_ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
+        let nav = test_action_loop(group);
+        nav.sync_entities(&gs);
+
+        let poses = nav.world.entity_poses.lock().unwrap();
+        assert_eq!(poses["a_sitter"].pose, "sitting");
+        assert_eq!(poses["a_sitter"].gait, Some(12));
+        assert_eq!(poses["a_backpedaller"].pose, "standing");
+        assert_eq!(poses["a_backpedaller"].gait, Some(-12),
+            "a backing-up mob's gait is NEGATIVE (signed 10-bit); the raw bits 1012 would be a lie");
+        assert_eq!(poses["a_weirdo"].pose, "unknown(199)",
+            "an unrecognised pose code reaches the agent as unknown, not as a plausible default");
+        assert_eq!(poses["a_weirdo"].gait, None,
+            "no position update yet => null ('not reported'), not 0 ('stationary')");
+    }
+
     fn test_action_loop(group: eqoxide_ipc::GroupShared) -> ActionLoop {
         ActionLoop::new(
             eqoxide_ipc::NavSlots {
@@ -4867,7 +4912,7 @@ mod tests {
             spawn_id: 99, name: "Sariel".into(), level: 8, is_npc: false,
             x: 0.0, y: 0.0, z: 0.0, hp_pct: 42.0, cur_hp: 42, max_hp: 100, race: "HUM".into(),
             heading: 0.0, dead: false, equipment: [0; 9], equipment_tint: [[0; 3]; 9],
-            gender: 0, helm: 0, showhelm: 0, face: 0, hairstyle: 0, haircolor: 0, animation: 100, floating: false,
+            gender: 0, helm: 0, showhelm: 0, face: 0, hairstyle: 0, haircolor: 0, pose: eqoxide_core::game_state::Pose::Standing, gait: None, floating: false,
         });
 
         let group: eqoxide_ipc::GroupShared = std::sync::Arc::new(std::sync::Mutex::new(eqoxide_ipc::GroupSnapshot::default()));
