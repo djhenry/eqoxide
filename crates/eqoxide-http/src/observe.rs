@@ -616,13 +616,17 @@ async fn get_debug(State(s): State<HttpState>) -> Json<serde_json::Value> {
         //                              empty → no syscall attempted); those are now retried through
         //                              send(2) and counted in send_wouldblock_rescued. A nonzero
         //                              value here now means the KERNEL refused a send.
-        //   send_wouldblock_rescued  — synthetic-WouldBlock datagrams the direct send(2) retry DID
-        //                              put on the wire (#641). NOT failures — nothing was lost. A
-        //                              large/growing value means tokio's io driver is starved of CPU.
-        //   send_deferred            — session-layer control datagrams the KERNEL refused
-        //                              transiently, queued and re-sent on a later ~10ms tick (#641).
-        //                              Also NOT failures: they went out, late. Nonzero means the
-        //                              socket is refusing sends under load.
+        //   send_wouldblock_rescued  — datagrams a WouldBlock refused that an immediate direct
+        //                              send(2) then accepted (#641). NOT failures — they reached the
+        //                              wire. An UPPER BOUND on tokio's synthetic-WouldBlock case,
+        //                              NOT a measurement of it: a kernel refusal whose transmit
+        //                              buffer drained in between looks identical. Load signal.
+        //   send_deferred            — how many DATAGRAMS (not refusal events) a transient refusal
+        //                              caused to be queued for retry on a later tick instead of
+        //                              being dropped; control datagrams only (#641). Normally they
+        //                              go out ~10ms late — but this is NOT disjoint from
+        //                              send_failures: one later abandoned (queue overflow, session
+        //                              end) is counted in both. send_failures stays the loss number.
         //   send_failures_unretried  — the subset with no client-side retransmit of that datagram.
         //                              TWO very different classes share it:
         //                                * session-layer control (ACK / OutOfOrderAck / keepalive /

@@ -458,8 +458,8 @@ the client for them to be right (#343).
 | `world_responsive` | **Is the WORLD alive, not just the socket?** `false` only when an active liveness probe went unanswered past its bound while the link kept ACKing — a wedged zone. `true` for a healthy zone, including a legitimately idle one (the probe is answered). `true` before the first probe fires. See below. |
 | `last_world_response_ms` | ms since the world last *proved* it processed something for us — a probe reply or a spontaneous packet, whichever is fresher. The companion to `world_responsive`. |
 | `send_failures` | **Datagrams this client BUILT but could not put on the wire** — the send was attempted and the KERNEL refused it. Cumulative since process start. **`0` is the expected healthy reading** (since #641 — see below). |
-| `send_wouldblock_rescued` | Datagrams tokio refused with a **synthetic** `WouldBlock` (its cached readiness bit was empty, so no syscall was attempted) that the client then put on the wire with a direct `send(2)` retry. **Not failures — nothing was lost.** A large or growing value means tokio's io driver is being starved of CPU (#641). |
-| `send_deferred` | Session-layer control datagrams (ACKs, keepalives, session setup) whose send the **kernel** refused transiently, which were queued and re-sent on a later ~10ms tick instead of being dropped. **Not failures — they went out, late.** Nonzero means the socket is refusing sends under load (#641). |
+| `send_wouldblock_rescued` | Datagrams whose `try_send` returned `WouldBlock` and which an **immediate direct `send(2)` on the same fd then accepted**. They reached the wire, so they are not failures. Cumulative. An **upper bound** on tokio's synthetic-`WouldBlock` case — see below for why it is a bound and not a measurement (#641). |
+| `send_deferred` | Count of **datagrams** (not refusal events) that a transient send refusal caused to be QUEUED for retry on a later ~10ms tick, rather than dropped. Only session-layer control (ACKs, keepalives, session setup) is deferrable. A **lower bound** on genuine kernel refusals. **Not disjoint from `send_failures`** — see below (#641). |
 | `send_failures_unretried` | The subset of `send_failures` with no client-side retransmit of that datagram. |
 | `last_send_error` | `ErrorKind` name of the most recent send failure (`"WouldBlock"`, `"Uncategorized"`, …), or `null`. |
 | `last_send_error_age_ms` | ms since that failure, measured at read time, or `null`. Distinguishes an old blip from an ongoing failure. |
@@ -486,25 +486,46 @@ principle, to learn that the command had not gone out.
 
 Every send now funnels through one place that records its own failure, so:
 
-- **`send_failures: 0` IS the expected healthy reading, and a nonzero value means the kernel
-  refused a send.** This bullet used to say the opposite, and the reversal is #641. The measurement
-  that prompted it: a fresh, healthy login into `qeynos` read **`send_failures: 283`** — all
-  `WouldBlock`, all 7-byte session-layer control datagrams (ACKs), in a burst during zone-in and then
-  flat. Those ACKs never reached the wire, so the server kept retransmitting datagrams it had not
-  seen acknowledged. **Cause, established by measurement:** tokio gates every `try_*` call on a
-  cached readiness bit and returns a **synthetic** `WouldBlock` *without attempting the syscall*
-  while that bit is empty; the bit is refilled only by tokio's io driver, so when the driver is
-  starved of CPU it can stay empty across a whole receive-drain and every ACK in that drain is
-  dropped. Reproduced on demand by pinning the client to one core. The client now retries such a
-  datagram through `send(2)` directly and counts it in `send_wouldblock_rescued`.
+- **`send_failures: 0` IS the expected healthy reading, and a nonzero value means a send was
+  refused and not recovered.** This bullet used to say the opposite; the reversal is #641. The
+  measurement that prompted it: a fresh, healthy login into `qeynos` read **`send_failures: 283`** —
+  all `WouldBlock`, all 7-byte session-layer control datagrams (ACKs), in a burst during zone-in and
+  then flat. Those ACKs never reached the wire, so the server kept retransmitting datagrams it had
+  not seen acknowledged. The client now (a) re-attempts any `WouldBlock` datagram immediately via a
+  direct `send(2)`, and (b) queues a transiently-refused *control* datagram and re-sends it on the
+  next tick. Both outcomes are counted separately from `send_failures`, which is again reserved for
+  "this datagram never reached the wire and nothing will re-send it".
+- **What triggers it: CPU starvation of the client's io driver.** Pinning the whole client to one
+  core reproduces a burst on roughly 1 login in 6, on two different machines and two different zones;
+  an unloaded client reads 0. That is the reproducible part.
+- **What the two new counters do NOT tell you: which mechanism refused the send.** Two mechanisms
+  can produce the same `WouldBlock` from `try_send`:
+  1. tokio short-circuits on an empty cached readiness bit and returns a **synthetic** `WouldBlock`
+     *without issuing the syscall at all*; or
+  2. the readiness bit is set, the syscall IS issued, and the **kernel** returns `EAGAIN`/`ENOBUFS`
+     (which also clears the bit).
+  A direct `send(2)` that succeeds microseconds later is consistent with (1) — but equally with (2)
+  followed by the transmit buffer draining in between. So `send_wouldblock_rescued` is an **upper
+  bound** on (1) and `send_deferred` a **lower bound** on (2); neither is a measurement of either.
+  A double refusal (both the `try_send` and the direct `send(2)`) *is* hard evidence of (2).
+  Distinguishing them properly would need something like `ioctl(SIOCOUTQ)` on the fd at the moment of
+  the refusal (≈0 queued bytes ⇒ genuinely synthetic); that has not been done.
+- **Both mechanisms occur, and neither dominates.** Two instrumented single-core-pinned zone-ins:
+  `qeynos` split **141 rescued / 107 refused-again**, while `gfaydark` was **0 rescued / 138
+  deferred** — in that zone the synthetic path contributed nothing at all. Do not generalise from
+  either. What is established is that "it is all synthetic" is FALSE (the double refusals prove it),
+  and that the fix is agnostic: it recovers both.
 - **`send_wouldblock_rescued` and `send_deferred` are load signals, not loss signals.** Every
-  datagram either counts DID reach the wire (`send_deferred` ~10ms late). They are disjoint from
-  `send_failures` by construction; do not add them together and call the result loss. Both climb
-  under CPU pressure and are `0` on an unloaded client.
-- **Both mechanisms are real, and the split was measured, not assumed.** One instrumented `qeynos`
-  zone-in on a single-core-pinned client recorded **141 rescued** (tokio synthesised the
-  `WouldBlock`; the kernel accepted the datagram on the direct retry) alongside **107 the kernel
-  genuinely refused** (queued and re-sent on the next tick). The pre-#641 client dropped all 248.
+  datagram counted by `send_wouldblock_rescued` reached the wire; every datagram counted by
+  `send_deferred` was queued and, in the normal case, went out on a later tick. Both climb under CPU
+  pressure and are `0` on an unloaded client.
+- **`send_deferred` is NOT disjoint from `send_failures`, and must not be read as "all of these were
+  delivered".** A deferred datagram is counted once, when it is queued. If it is *later* lost — the
+  queue overflows (bounded at 1024; the oldest is evicted, since `OP_ACK` is cumulative), or the
+  session ends while it is still queued — that loss is counted in `send_failures` /
+  `send_failures_unretried` as well, so the same datagram appears in both. `send_failures` remains
+  the honest "was anything lost?" number; `send_deferred` answers "how many datagrams did the socket
+  make us delay?".
 - **`send_failures_unretried` is the sharper number.** The complement (`send_failures -
   send_failures_unretried`) is the *reliable* stream: a failed reliable datagram is kept verbatim in
   the resend window and retransmitted until the server ACKs it — **for as long as the session

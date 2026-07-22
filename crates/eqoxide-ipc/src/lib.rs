@@ -338,39 +338,61 @@ pub struct NetHealth {
     /// said the opposite and an agent reading it would have learned to ignore this counter: the
     /// #612 round-2 review measured **283** on a fresh, healthy login into `qeynos` — all
     /// `WouldBlock`, all 7-byte session-layer control datagrams (ACKs), in a burst during zone-in
-    /// and then flat. #641 established that those were tokio SYNTHETIC `WouldBlock`s — a cached
-    /// readiness bit that the io driver had not refilled, so no syscall was ever attempted — and
-    /// `transmit` now re-attempts such a datagram through `send(2)` directly, counting it in
-    /// `send_wouldblock_rescued` instead. A nonzero value here now means a send the KERNEL refused.
-    pub send_failures: u64,
-    /// Datagrams that `try_send` rejected with a SYNTHETIC `WouldBlock` — tokio's cached readiness
-    /// bit was empty, so no syscall was attempted — and that `transmit`'s direct `send(2)` retry
-    /// then put on the wire successfully (#641).
+    /// and then flat. #641 gave those two recovery paths (an immediate direct `send(2)` retry, and
+    /// a deferral queue for control datagrams), and both are counted elsewhere —
+    /// `send_wouldblock_rescued` and `send_deferred`. So this counter now means what its name says:
+    /// the datagram never reached the wire, and nothing will re-send it.
     ///
-    /// These are **not** failures: the datagram reached the wire, which is why they are counted here
-    /// and not in `send_failures`. They are still worth publishing, because a large or growing value
-    /// is a true statement about the process: tokio's io driver is not being scheduled promptly
-    /// enough to keep the socket's readiness bit warm. Measured driver: CPU starvation — pinning the
-    /// whole client to one core reproduces a burst of hundreds during a `qeynos` zone-in on demand,
-    /// while an unloaded run of the same binary reads 0.
+    /// The TRIGGER is established — CPU starvation of the client's tokio io driver, reproducible by
+    /// pinning the client to one core. The MECHANISM is not: see `send_wouldblock_rescued` for why
+    /// neither counter can tell a tokio-synthetic refusal from a kernel one.
+    pub send_failures: u64,
+    /// Datagrams whose `try_send` returned `WouldBlock` and which an immediate direct `send(2)` on
+    /// the same fd then ACCEPTED (#641). They reached the wire, which is why they are counted here
+    /// and not in `send_failures`.
+    ///
+    /// **This is an UPPER BOUND on tokio's synthetic-`WouldBlock` case, not a measurement of it**
+    /// (#641 review, finding 3). Two mechanisms produce the same `WouldBlock`:
+    ///   1. tokio short-circuits on an empty cached readiness bit and returns `WouldBlock` *without
+    ///      issuing the syscall* (the bit is refilled only by its io driver); or
+    ///   2. the bit is set, the syscall IS issued, and the kernel returns `EAGAIN`/`ENOBUFS` (which
+    ///      also clears the bit).
+    /// A direct `send(2)` succeeding microseconds later fits (1) — but fits (2)-then-the-buffer-
+    /// drained just as well, and a burst is exactly when the buffer is full and draining hard. So
+    /// the error is systematic in one direction. A DOUBLE refusal (the direct `send(2)` fails too)
+    /// is hard evidence of (2); that is what refutes "it is all synthetic", and it is all that is
+    /// established. Telling them apart properly would need something like `ioctl(SIOCOUTQ)` at the
+    /// moment of refusal (≈0 queued bytes ⇒ genuinely synthetic); nobody has done that.
+    ///
+    /// Read it as a LOAD signal — the socket is refusing sends here — not as a diagnosis. Two
+    /// instrumented zone-ins: `qeynos` 141 rescued / 107 refused again; `gfaydark` **0** rescued /
+    /// 138 deferred. Neither generalises.
     ///
     /// Before #641 every one of these was a datagram silently dropped on the floor — mostly ACKs,
     /// which the server then had to re-solicit by retransmitting the packets it had not seen
     /// acknowledged.
     pub send_wouldblock_rescued: u64,
-    /// Session-layer control datagrams (ACK / OutOfOrderAck / keepalive / SessionRequest /
-    /// SessionDisconnect) whose send was refused transiently (`WouldBlock`, kernel included) and
-    /// which were therefore QUEUED and re-sent on a later net-thread tick rather than dropped
-    /// (#641).
+    /// How many **datagrams** a transient send refusal (`EAGAIN`/`ENOBUFS`) caused to be QUEUED for
+    /// retry on a later net-thread tick instead of being dropped (#641). Only session-layer control
+    /// is deferrable — ACK / OutOfOrderAck / keepalive / SessionRequest. (`SessionDisconnect` is
+    /// deliberately NOT: there is no "next tick" at shutdown. See `send_session_disconnect`.)
     ///
-    /// **Not a loss counter.** Each of these datagrams did go out, ~10ms late. It is published
-    /// because the delay is real and the pressure that caused it is real: this is the honest signal
-    /// that the socket is refusing sends under load. Before #641 every one of these was a silently
-    /// dropped ACK, which the server answered by retransmitting everything it had not seen
-    /// acknowledged — the road to a `resend_timeout` session drop.
+    /// **Datagrams, not refusal events.** Counted exactly once, in `defer_control`, at the moment
+    /// the datagram is queued. It is *not* incremented again when a queued datagram is re-attempted
+    /// and refused again, so the number tracks how many datagrams were delayed, not how long the
+    /// outage lasted. The first cut of #641 got this wrong in the other direction and its docs and
+    /// its code disagreed (#641 review, finding 1).
     ///
-    /// If a queued datagram is still queued when the session ends, it is never sent; that case
-    /// moves to `send_failures` / `send_failures_unretried` (see `abandon_outstanding`).
+    /// **Not a loss counter, and NOT disjoint from `send_failures`** (#641 review, finding 1b). In
+    /// the normal case each of these datagrams goes out on a later tick, ~10ms late. But a deferred
+    /// datagram can still be lost afterwards — the queue overflows, or the session ends while it is
+    /// still queued — and that loss is counted in `send_failures`/`send_failures_unretried` too, so
+    /// the same datagram appears in both. `send_failures` stays the honest "was anything lost?"
+    /// number; this one answers "how many datagrams did the socket make us delay?".
+    ///
+    /// A lower bound on genuine kernel refusals, for the reason given on `send_wouldblock_rescued`.
+    /// Before #641 every one of these was a silently dropped ACK, which the server answered by
+    /// retransmitting everything it had not seen acknowledged — the road to a `resend_timeout` drop.
     pub send_deferred: u64,
     /// The subset of `send_failures` for datagrams the client does **not** retransmit itself:
     /// unreliable app packets (the `OP_ClientUpdate` position firehose), session-layer control

@@ -353,18 +353,22 @@ pub struct Health {
     /// server received.
     ///
     /// **0 IS the expected healthy reading since #641.** The 283-on-a-healthy-`qeynos`-login this
-    /// doc used to warn about were tokio SYNTHETIC `WouldBlock`s (no syscall attempted); they are
-    /// now retried through `send(2)` and counted in `send_wouldblock_rescued`. A nonzero value here
-    /// means the KERNEL refused a send. See [`eqoxide_ipc::NetHealth::send_failures`].
+    /// doc used to warn about are now recovered by two paths (an immediate direct `send(2)` retry,
+    /// and a deferral queue) and counted in `send_wouldblock_rescued` / `send_deferred`. A nonzero
+    /// value here means a datagram never reached the wire and nothing will re-send it.
+    /// See [`eqoxide_ipc::NetHealth::send_failures`].
     pub send_failures:          u64,
-    /// #641: datagrams `try_send` rejected with a synthetic `WouldBlock` that `transmit`'s direct
-    /// `send(2)` retry then put on the wire. **Not failures** — the datagram was sent. A large or
-    /// growing value means tokio's io driver is being starved of CPU (readiness bit left empty).
+    /// #641: datagrams whose `try_send` returned `WouldBlock` and which an immediate direct
+    /// `send(2)` then accepted. **Not failures** — they reached the wire. An UPPER BOUND on tokio's
+    /// synthetic-`WouldBlock` case, not a measurement of it (a kernel refusal whose buffer drained
+    /// in between is indistinguishable). Read as a load signal.
     /// See [`eqoxide_ipc::NetHealth::send_wouldblock_rescued`].
     pub send_wouldblock_rescued: u64,
-    /// #641: session-layer control datagrams a transient refusal deferred to a later tick instead
-    /// of dropping. **Not failures** — they were sent, ~10ms late. A nonzero value means the socket
-    /// is refusing sends under load. See [`eqoxide_ipc::NetHealth::send_deferred`].
+    /// #641: how many **datagrams** a transient refusal caused to be queued for retry on a later
+    /// tick instead of dropped (control datagrams only). Counted once per datagram, not per refusal.
+    /// **Not a loss counter** — but **not disjoint from `send_failures`** either: a queued datagram
+    /// that is later abandoned (queue overflow, or the session ending) is counted in both.
+    /// See [`eqoxide_ipc::NetHealth::send_deferred`].
     pub send_deferred: u64,
     /// #612: the subset of `send_failures` that the client does not retransmit itself (unreliable
     /// position updates, ACKs, keepalives, session control). The complement is the reliable stream,

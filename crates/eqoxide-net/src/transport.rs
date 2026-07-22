@@ -393,6 +393,33 @@ struct Sent {
     retries: u32,
 }
 
+/// Is this send error transient — i.e. would the very same datagram plausibly go out if we simply
+/// tried again in ~10ms? (#641)
+///
+/// `EAGAIN`/`EWOULDBLOCK` is the obvious one. `ENOBUFS` belongs here too and was missed in the first
+/// cut (#641 review, finding 7): on UDP it means the device/qdisc transmit queue was momentarily
+/// full, which is *exactly* the pressure this fix is about, and it drains on the same timescale.
+/// Rust maps it to `ErrorKind::Uncategorized`, which is unstable to match on, so it is identified by
+/// errno — hence the Linux gate; on any other platform it falls through to "not transient", which
+/// degrades to the pre-#641 behaviour of counting it as a loss rather than mis-deferring something.
+///
+/// Everything else (`EMSGSIZE`, `ENETUNREACH`, a closed socket) is NOT transient: retrying it on
+/// every tick would never deliver it and would hide a real, permanent loss behind a "will be
+/// retried" counter — the #612 bug wearing a different hat.
+fn is_transient(e: &std::io::Error) -> bool {
+    /// `ENOBUFS`. Linux-specific value; other unices differ, which is why this is `cfg`-gated.
+    #[cfg(target_os = "linux")]
+    const ENOBUFS: i32 = 105;
+    if e.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    if e.raw_os_error() == Some(ENOBUFS) {
+        return true;
+    }
+    false
+}
+
 /// Send a datagram on an already-`connect()`ed tokio `UdpSocket` via a direct `send(2)`, bypassing
 /// tokio's cached-readiness gate (#641).
 ///
@@ -451,8 +478,13 @@ pub struct EqStream {
     /// thing to do under load. ACKs are cheap and idempotent, so the honest response to a transient
     /// refusal is to try again ~10ms later, which is what `flush_pending_control` does.
     ///
-    /// Drained FIFO from `poll_recv` (every loop tick, in all four loops that own a stream) and
+    /// Drained FIFO from `poll_recv` (every loop tick, in all four loops that own a stream), from
+    /// `connect()`'s handshake loop (which does not call `poll_recv` — #641 review, finding 8), and
     /// again immediately before any new control send, so ordering on the wire is preserved.
+    ///
+    /// CONTROL ONLY. The unreliable `OP_ClientUpdate` firehose is deliberately not deferred — a
+    /// stale position is arguably worse than a missing one — but that is a judgement, not a
+    /// measurement, and it is tracked as #655 rather than settled here.
     pending_control: VecDeque<Vec<u8>>,
     /// TEST-ONLY fault injection (#641): the next N `transmit` calls behave as though the kernel
     /// refused the datagram with `EAGAIN`, without touching the socket. There is no portable,
@@ -585,6 +617,12 @@ impl EqStream {
                 // recv below) makes the clock reflect that, even when the cold zone is still silent.
                 stream.net_health.lock().unwrap().last_tick = std::time::Instant::now();
             }
+            // #641 review, finding 8: this loop does not call `poll_recv`, so without this the
+            // deferral queue would drain only as a side effect of the next SESSION_REQUEST retry
+            // (~250ms) — the "every loop ticks the queue every ~10ms" property the design leans on
+            // had a hole exactly here. One call per ≤100ms iteration closes it; it is a no-op
+            // whenever the queue is empty, which is almost always.
+            stream.flush_pending_control();
             match tokio::time::timeout(
                 tokio::time::Duration::from_millis(100),
                 stream.socket.recv(&mut recv_buf),
@@ -768,11 +806,32 @@ impl EqStream {
 
     /// Send a session-layer disconnect (`OP_SessionDisconnect`, 0x05). Tells the EQStream peer
     /// we are closing this session. Payload is the negotiated `connect_code` as a big-endian u32;
-    /// `append_crc` (called inside `send_raw`) appends the CRC. Sent as part of clean shutdown.
+    /// `append_crc` appends the CRC. Sent as part of clean shutdown.
+    ///
+    /// **NOT deferrable, deliberately (#641 review, finding 2).** Every other control datagram gets
+    /// queued and re-sent on the next tick when the socket refuses it — but this one is the LAST
+    /// thing a session ever sends, and for it "the next tick" does not exist:
+    ///   - `perform_clean_shutdown` calls `abandon_outstanding` a few lines later, which clears the
+    ///     queue;
+    ///   - the `OP_GMKick` path then parks in `loop { sleep }` forever — it never calls `poll_recv`
+    ///     again and is never unwound, so `Drop` never runs either.
+    /// Deferring it there would have produced the exact failure this PR exists to prevent: a
+    /// datagram that is never sent AND never counted as lost, sitting in `send_deferred`, whose
+    /// documented meaning is "it went out, ~10ms late". Pre-#641 `main` counted it as a failure, so
+    /// that would have been an honesty REGRESSION.
+    ///
+    /// `SendRetry::None` keeps the old accounting exactly: if it does not go out, it is counted as
+    /// the loss it is. The queue is flushed first so anything already waiting still precedes it on
+    /// the wire (best effort — a still-refusing socket keeps them queued, and `abandon_outstanding`
+    /// then counts them lost).
     pub fn send_session_disconnect(&mut self) -> std::io::Result<()> {
         let mut payload = Vec::with_capacity(4);
         payload.write_u32::<BigEndian>(self.session.connect_code).unwrap();
-        self.send_raw(OP_SESSION_DISC, &payload)
+        let mut raw = vec![0x00, OP_SESSION_DISC];
+        raw.extend_from_slice(&payload);
+        raw = self.append_crc(raw);
+        self.flush_pending_control();
+        self.transmit(&raw, SendRetry::None)
     }
 
     // ── Internal send helpers ─────────────────────────────────────────────────
@@ -865,19 +924,23 @@ impl EqStream {
     ) -> std::io::Result<()> {
         let now = Instant::now();
         // A transient refusal of a DEFERRABLE datagram is not a loss: `send_raw` puts it in
-        // `pending_control` and the next tick re-sends it. Counting it in `send_failures` would
+        // `pending_control` and a later tick re-sends it. Counting it in `send_failures` would
         // republish the very number #641 exists to drive to zero, and would be false besides.
         // Anything that is NOT a transient refusal (EMSGSIZE, ENETUNREACH, a dead socket) is a real
         // loss on every path, deferrable or not — retrying those forever would not deliver them.
-        let deferred = retry == SendRetry::Deferred && e.kind() == std::io::ErrorKind::WouldBlock;
+        //
+        // Nothing is COUNTED here for a deferral. `defer_control` owns `send_deferred`, because this
+        // function runs once per refusal EVENT — including every ~10ms re-attempt of the same
+        // datagram from `flush_pending_control` — whereas the counter is documented, and now tested,
+        // as counting DATAGRAMS (#641 review, finding 1: one datagram stuck for three ticks read as
+        // `send_deferred == 3`, and the queue-nonempty path in `send_raw` counted nothing at all).
+        if retry == SendRetry::Deferred && is_transient(&e) {
+            return Err(e);
+        }
         // Rate-limit decision is made from the SAME locked snapshot that updates the
         // counters, so it costs no extra lock and cannot race itself (#612 review, F5).
         let (loud, total) = {
             let mut h = self.net_health.lock().unwrap();
-            if deferred {
-                h.send_deferred = h.send_deferred.saturating_add(1);
-                return Err(e);
-            }
             // First failure of a burst is always loud; after that, at most one WARN per
             // `SEND_FAIL_WARN_QUIET`. A sustained outage otherwise produces ~10^3 WARN lines
             // in 30s (the 20Hz position firehose plus go-back-N retransmits), which buries
@@ -918,25 +981,49 @@ impl EqStream {
     /// the same discipline `poll_resend` relies on — and again before any new control send.
     fn flush_pending_control(&mut self) {
         while let Some(front) = self.pending_control.front() {
-            // A still-refused datagram must stay at the FRONT: popping it and pushing it back would
-            // reorder the queue behind any datagram queued in between.
-            if self.transmit(front, SendRetry::Deferred).is_err() {
-                return;
+            match self.transmit(front, SendRetry::Deferred) {
+                Ok(()) => {}
+                // Still refused. It must stay at the FRONT — popping and re-pushing would reorder it
+                // behind anything queued in between — and we stop, so nothing overtakes it.
+                Err(ref e) if is_transient(e) => return,
+                // A PERMANENT error on a queued datagram (the socket died, say). Retrying it every
+                // tick would never deliver it and would mint a fresh `send_failures` every 10ms
+                // forever, so drop it: `record_send_failure` has already counted it as the loss it
+                // is, exactly once.
+                Err(_) => {
+                    self.pending_control.pop_front();
+                    continue;
+                }
             }
             self.pending_control.pop_front();
         }
     }
 
-    /// Queue a control datagram for retry on a later tick (#641).
+    /// Queue a control datagram for retry on a later tick, and count it (#641).
+    ///
+    /// This is the ONE place `send_deferred` is incremented, and it is called exactly once per
+    /// datagram that gets queued — from both of `send_raw`'s deferral paths (the socket refused it,
+    /// and the queue was already non-empty). Counting in `record_send_failure` instead made the
+    /// number grow with the DURATION of an outage rather than with the number of datagrams delayed:
+    /// one stuck datagram re-attempted on three ticks read as `3` (#641 review, finding 1).
     fn defer_control(&mut self, datagram: Vec<u8>) {
-        if self.pending_control.len() >= MAX_PENDING_CONTROL {
-            // Drop the OLDEST, not the newest: `OP_ACK` is cumulative, so a later ACK supersedes an
-            // earlier one, and the freshest control datagram is the one worth keeping. This one IS a
-            // genuine loss — nothing will ever re-send it — so it is counted as such.
+        // Drop the OLDEST on overflow, not the newest: `OP_ACK` is cumulative, so a later ACK
+        // supersedes an earlier one, and the freshest control datagram is the one worth keeping.
+        // The evicted one IS a genuine loss — nothing will ever re-send it — so it is counted as one.
+        let overflowed = self.pending_control.len() >= MAX_PENDING_CONTROL;
+        if overflowed {
             self.pending_control.pop_front();
+        }
+        {
+            // ONE lock for both counters — taking the guard twice in one expression deadlocks.
             let mut h = self.net_health.lock().unwrap();
-            h.send_failures = h.send_failures.saturating_add(1);
-            h.send_failures_unretried = h.send_failures_unretried.saturating_add(1);
+            h.send_deferred = h.send_deferred.saturating_add(1);
+            if overflowed {
+                h.send_failures = h.send_failures.saturating_add(1);
+                h.send_failures_unretried = h.send_failures_unretried.saturating_add(1);
+            }
+        }
+        if overflowed {
             tracing::warn!(
                 "NET: control-send retry queue full ({} datagrams) — dropped the oldest; the \
                  socket has been refusing sends for an unusually long time (#641)",
@@ -950,10 +1037,13 @@ impl EqStream {
     ///
     /// None of these is retained by the reliable resend window, and before #641 that meant a failed
     /// one was simply gone — measured live at 44–306 dropped ACKs per zone-in on a CPU-starved
-    /// client. They are cheap and idempotent, so a TRANSIENT refusal (`WouldBlock`) now queues the
-    /// datagram in `pending_control` for the next tick instead. `Ok(())` therefore means "accepted
-    /// for delivery", which for a deferred datagram is a claim about the next ~10ms, not about this
-    /// instant; `send_deferred` is what makes that visible. Any other error is returned unchanged.
+    /// client. They are cheap and idempotent, so a TRANSIENT refusal (`EAGAIN`/`ENOBUFS`) now queues
+    /// the datagram in `pending_control` for the next tick instead. `Ok(())` therefore means
+    /// "accepted for delivery", which for a deferred datagram is a claim about the next ~10ms, not
+    /// about this instant; `send_deferred` is what makes that visible. Any non-transient error is
+    /// returned unchanged and counted as a loss.
+    ///
+    /// `send_session_disconnect` deliberately does NOT come through here — see its doc comment.
     fn send_raw(&mut self, opcode: u8, payload: &[u8]) -> std::io::Result<()> {
         let mut raw = vec![0x00, opcode];
         raw.extend_from_slice(payload);
@@ -965,7 +1055,7 @@ impl EqStream {
             return Ok(());
         }
         match self.transmit(&raw, SendRetry::Deferred) {
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(e) if is_transient(&e) => {
                 self.defer_control(raw);
                 Ok(())
             }
@@ -1480,7 +1570,9 @@ impl EqStream {
                 h.send_failures_unretried = h.send_failures_unretried.saturating_add(pending);
             }
             tracing::warn!(
-                "NET: session ended with {} session-control datagram(s) still queued for retry —                  these are NOT sent (#641)", pending,
+                "NET: session ended with {} session-control datagram(s) still queued for retry — \
+                 these are NOT sent (#641)",
+                pending,
             );
         }
         if self.sent.is_empty() {
@@ -2397,6 +2489,104 @@ mod tests {
             "the datagram was delivered; nothing here is a loss (#641)");
     }
 
+    /// #641 review, finding 1 — `send_deferred` counts DATAGRAMS, not refusal events.
+    ///
+    /// The first cut incremented it in `record_send_failure`, which runs once per refusal —
+    /// including every ~10ms re-attempt of the same datagram from `flush_pending_control`. One
+    /// datagram stuck for three ticks therefore read as `3`, while the queue-nonempty path in
+    /// `send_raw` (which defers without ever calling `transmit`) counted **nothing**. The number was
+    /// neither an upper nor a lower bound on datagrams, and grew with the DURATION of an outage —
+    /// yet all three doc sites said "each of these datagrams did go out". Under the honesty
+    /// invariant that is the counter telling the agent something it cannot know.
+    ///
+    /// The reviewer's mutation G — moving the increment to `defer_control` — left the whole suite
+    /// GREEN, i.e. two incompatible definitions were indistinguishable to the tests. This test is
+    /// what makes them distinguishable, so it asserts BOTH halves of the discrimination:
+    ///   - one datagram refused on three separate ticks is `1`, not `3`;
+    ///   - three datagrams are `3`, so the counter is not simply pinned low.
+    #[tokio::test]
+    async fn send_deferred_counts_datagrams_not_refusal_events() {
+        // One datagram, refused again on each of two further ticks.
+        {
+            let net_health: eqoxide_ipc::NetHealthShared = Default::default();
+            let (mut stream, _rx, _peer, _addr) = test_stream_with_peer(net_health.clone()).await;
+            stream.socket.writable().await.unwrap();
+            stream.force_send_refusals.set(3); // the send, then the two flush re-attempts
+            stream.send_ack(0x0001);
+            stream.poll_recv();
+            stream.poll_recv();
+            assert_eq!(stream.pending_control.len(), 1,
+                "the datagram must still be queued — otherwise this is not measuring re-attempts");
+            assert_eq!(net_health.lock().unwrap().send_deferred, 1,
+                "ONE datagram was delayed, however many ticks it took. Counting refusal events \
+                 makes this grow with the duration of an outage and contradicts every doc site \
+                 (#641 review, finding 1)");
+        }
+        // Three distinct datagrams.
+        {
+            let net_health: eqoxide_ipc::NetHealthShared = Default::default();
+            let (mut stream, _rx, _peer, _addr) = test_stream_with_peer(net_health.clone()).await;
+            stream.socket.writable().await.unwrap();
+            stream.force_send_refusals.set(3);
+            stream.send_ack(0x0001);
+            stream.send_ack(0x0002); // deferred via the queue-nonempty short-circuit…
+            stream.send_ack(0x0003); // …which used to count nothing at all
+            assert_eq!(stream.pending_control.len(), 3);
+            assert_eq!(net_health.lock().unwrap().send_deferred, 3,
+                "every datagram that gets queued must be counted, including the ones deferred by \
+                 the queue-nonempty short-circuit in `send_raw` (#641 review, finding 1)");
+        }
+    }
+
+    /// #641 review, finding 2 — session teardown must NEVER be deferred.
+    ///
+    /// `OP_SessionDisconnect` is the last datagram a session ever sends, and for it "the next tick"
+    /// does not exist: `perform_clean_shutdown` clears the queue immediately afterwards, and the
+    /// `OP_GMKick` path then parks in `loop { sleep }` forever — never calling `poll_recv`, never
+    /// unwound, so `Drop` never runs either. Deferring it there produced the precise failure this
+    /// PR exists to prevent: a datagram that is never sent AND never counted as lost, sitting in
+    /// `send_deferred`, whose documented meaning is "it went out, late". Pre-#641 `main` counted it
+    /// as a failure, so that was an honesty REGRESSION against main.
+    #[tokio::test]
+    async fn a_refused_session_disconnect_is_counted_as_lost_never_queued() {
+        let net_health: eqoxide_ipc::NetHealthShared = Default::default();
+        let (mut stream, _rx, _peer, _addr) = test_stream_with_peer(net_health.clone()).await;
+        stream.socket.writable().await.unwrap();
+        stream.force_send_refusals.set(1);
+
+        let err = stream.send_session_disconnect()
+            .expect_err("a refused disconnect must SAY it failed — there is no later tick to fix it");
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+
+        assert!(stream.pending_control.is_empty(),
+            "the disconnect must NOT be queued: nothing after this point ever drains the queue \
+             (#641 review, finding 2)");
+        let h = *net_health.lock().unwrap();
+        assert_eq!((h.send_failures, h.send_failures_unretried), (1, 1),
+            "a datagram nothing will re-send is a LOSS and must be counted as one — pre-#641 main \
+             counted it, so anything less is a regression (#641 review, finding 2)");
+        assert_eq!(h.send_deferred, 0,
+            "`send_deferred` means the datagram was queued for a later tick; claiming that for a \
+             datagram nobody will ever re-send is exactly the lie #641 is about");
+    }
+
+    /// #641 review, finding 7 — `ENOBUFS` is as transient as `EAGAIN` on UDP under this pressure
+    /// (a momentarily full device/qdisc transmit queue), so it must be deferrable too. It maps to
+    /// `ErrorKind::Uncategorized`, which is unstable to match on, so `is_transient` identifies it by
+    /// errno — this pins that, and that a genuinely permanent error is NOT swept into the queue.
+    #[test]
+    fn enobufs_is_transient_but_a_permanent_error_is_not() {
+        use std::io::{Error, ErrorKind};
+        assert!(is_transient(&Error::from(ErrorKind::WouldBlock)));
+        #[cfg(target_os = "linux")]
+        assert!(is_transient(&Error::from_raw_os_error(105)),
+            "ENOBUFS is a momentarily full transmit queue — the very pressure #641 is about");
+        assert!(!is_transient(&Error::from_raw_os_error(90)),
+            "EMSGSIZE can never succeed on retry; queueing it forever would hide a permanent loss \
+             behind a 'will be retried' counter (#641 review, finding 7)");
+        assert!(!is_transient(&Error::from(ErrorKind::BrokenPipe)));
+    }
+
     /// #641 — ordering. The control path is a stream of sequence-bearing datagrams, so a queued one
     /// must never land on the wire AFTER a datagram built later. Both `send_raw` (which drains
     /// before every new send) and `flush_pending_control` (which stops at the first still-refused
@@ -2777,6 +2967,8 @@ mod tests {
             "the one send call must be inside `fn attempt_send` (found: {:?})",
             &enclosing[fn_start..fn_start + 40.min(enclosing.len() - fn_start)]);
         assert_eq!(code_only.matches(attempt).count(), 3,
-            "`attempt_send` must have exactly ONE caller (`transmit`) besides its definition —              expected 3 mentions (definition + the two cfg-gated calls in `transmit`); a second              caller would bypass `transmit`'s accounting exactly as a raw `try_send` would (#641)");
+            "`attempt_send` must have exactly ONE caller (`transmit`) besides its definition — \
+             expected 3 mentions (definition + the two cfg-gated calls in `transmit`). A second \
+             caller would bypass `transmit`'s accounting exactly as a raw `try_send` would (#641)");
     }
 }
